@@ -226,6 +226,62 @@ fn boolLiterals(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
+/// Refuse a predicate in WHERE, a FILTER or a CASE condition whose value side reads a column (`s = t`,
+/// `s IN ('a', t)`, `x BETWEEN 1 AND y`): the filter grammar compares a column with literals only, and before this a
+/// value-side identifier, a column or a misspelt one, could bind as literal text and match incorrect rows.
+fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
+    const Visit = struct {
+        found: ?*c.LpNode = null,
+
+        fn readsColumn(node: ?*c.LpNode) bool {
+            const n = node orelse return false;
+            const Find = struct {
+                hit: bool = false,
+                fn enter(v: [*c]c.LpVisitor, x: [*c]c.LpNode) callconv(.c) c_int {
+                    if (x.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
+                    const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+                    self.hit = true;
+                    return 2;
+                }
+            };
+            var find: Find = .{};
+            var visitor: c.LpVisitor = .{ .user_data = &find, .enter = Find.enter, .leave = null };
+            c.lp_ast_walk(n, &visitor);
+            return find.hit;
+        }
+
+        fn enter(v: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+            const bad = switch (node.*.kind) {
+                c.LP_EXPR_BINARY_OP => switch (node.*.u.binary.op) {
+                    c.LP_OP_EQ, c.LP_OP_NE, c.LP_OP_LT, c.LP_OP_LE, c.LP_OP_GT, c.LP_OP_GE, c.LP_OP_LIKE, c.LP_OP_GLOB,
+                    c.LP_OP_IS, c.LP_OP_ISNOT,
+                    => readsColumn(node.*.u.binary.right) or readsColumn(node.*.u.binary.escape),
+                    else => false,
+                },
+                c.LP_EXPR_BETWEEN => readsColumn(node.*.u.between.low) or readsColumn(node.*.u.between.high),
+                c.LP_EXPR_IN => for (0..@intCast(node.*.u.in.values.count)) |i| {
+                    if (readsColumn(node.*.u.in.values.items[i])) break true;
+                } else false,
+                else => false,
+            };
+            if (!bad) return 0;
+            self.found = node;
+            return 2;
+        }
+    };
+    var state: Visit = .{};
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    if (root.u.select.where) |w| c.lp_ast_walk(w, &visitor);
+    var i: usize = 0;
+    while (state.found == null and i < @as(usize, @intCast(root.u.select.result_columns.count))) : (i += 1) {
+        if (root.u.select.result_columns.items[i]) |rc| c.lp_ast_walk(rc, &visitor);
+    }
+    if (state.found == null) return;
+    diagnosticPrint("sql: a comparison takes a literal on its right, not a column or an expression of one\n", .{});
+    return error.BadValue;
+}
+
 /// Push every NOT down to the leaves (De Morgan; `NOT NOT p` is `p`), in place. liteparser prints a NOT's operand
 /// without parentheses, so `NOT (a AND b)` unparsed as `NOT a AND b`, which the filter grammar (as SQL) reads as
 /// `(NOT a) AND b`: a different predicate. With NOT only above leaves, every unparsed predicate (WHERE, aggregate
@@ -340,6 +396,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     boolLiterals(root);
     quoteWholePaths(root);
     try pushNotsDown(root, lp_arena);
+    try rejectColumnComparisons(root);
     if (root.*.u.select.where) |w| {
         const wi = analyzeExpr(w);
         if (wi.has_window) {
@@ -1100,6 +1157,32 @@ test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" 
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT c", .err = error.LimitNotSupported },
     };
     for (rejected) |case| try std.testing.expectError(case.err, parseSqlQuery(a, case.sql));
+}
+
+test "regression: sql_parser refuses a comparison that reads a column on its value side" {
+    const a = std.testing.allocator;
+    const refused = [_][]const u8{
+        "SELECT id FROM 't' WHERE s = t",
+        "SELECT id FROM 't' WHERE s = x",
+        "SELECT id FROM 't' WHERE s <> \"t\"",
+        "SELECT id FROM 't' WHERE s = -t",
+        "SELECT id FROM 't' WHERE s = upper(t)",
+        "SELECT id FROM 't' WHERE s IN (x, 'z')",
+        "SELECT id FROM 't' WHERE n BETWEEN 1 AND m",
+        "SELECT id FROM 't' WHERE s LIKE t",
+        "SELECT id FROM 't' WHERE NOT (s = t AND n > 1)",
+        "SELECT count(*) FILTER (WHERE s <> t) AS n FROM 't'",
+        "SELECT CASE WHEN s = t THEN 1 ELSE 0 END AS k FROM 't'",
+    };
+    for (refused) |sql| try std.testing.expectError(error.BadValue, parseSqlQuery(a, sql));
+    const kept = [_][]const u8{
+        "SELECT id FROM 't' WHERE s = 'x' AND n > -5 AND flag = true AND d IS NULL",
+        "SELECT id FROM 't' WHERE s IN ('x', 'y') AND n BETWEEN 1 AND 2 AND s LIKE 'a%'",
+    };
+    for (kept) |sql| {
+        var q = try parseSqlQuery(a, sql);
+        q.deinit(a);
+    }
 }
 
 test "sql_parser rejects unsupported aggregate shapes" {

@@ -7904,15 +7904,18 @@ test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for 
     );
 }
 
-test "regression: a V2 page whose levels disagree with its null count is refused" {
+test "regression: a V2 page whose header miscounts its nulls reads by its levels, as other readers read it" {
     const path = "ci/fixtures/parquet/v2_num_nulls_lies.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
-    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
-    // `i64`'s first page header says 8 nulls; its levels hold 9.
-    for ([_]bool{ false, true }) |fast| try std.testing.expectError(
-        error.DefLevelsMismatch,
-        runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(i64) AS n", .fast_levels = fast }),
-    );
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `i64`'s first page header says 8 nulls; its levels hold 9. Writers have miscounted the field, and it was
+    // refused; the levels are the answer.
+    for ([_]bool{ false, true }) |fast| {
+        var r = try runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(i64) AS n", .fast_levels = fast });
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(@as(i128, 271), r.aggregate.output.aggs[0].value.i);
+    }
 }
 
 test "regression: a def-level run claiming bytes past its stream is refused, not read as extra NULLs" {

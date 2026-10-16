@@ -1387,14 +1387,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
             } else if (def_len != 0) {
                 cursor += def_len;
             }
-            // The claim is still checked once the levels are read: a corrupt run inside a short level stream decodes
-            // values past its bytes as levels, and only the header's count says so. Flat columns only, where every
-            // writer counts a null as a level below max_def.
-            if (self.levels.max_rep == 0 and dph.num_nulls != self.pageNulls()) return error.DefLevelsMismatch;
-
             // V2 with nullable cols: the values hold only the non-null entries, which bounds a PLAIN BOOLEAN stream.
-            // The other decoders are streams that consume only what's asked for; decodePageSlice handles the count.
-            try self.installValues(dph.encoding, pg.bytes[cursor..], @intCast(dph.num_values - dph.num_nulls));
+            // Counted from the levels, not the header's `num_nulls`, which writers have miscounted: a lying count is
+            // ignored, as other readers ignore it, and a corrupt level run is caught by the run check
+            // (`hybrid_rle.decodeLevels`). The other decoders are streams that consume only what's asked for.
+            try self.installValues(dph.encoding, pg.bytes[cursor..], num_values - self.pageNulls());
         }
 
         /// Page state shared by both data-page versions, set before either parses its levels.

@@ -397,7 +397,8 @@ pub const MultipartSink = struct {
             var failure: S3Failure = .{ .op = .CompleteMultipartUpload, .phase = .connect };
             const control = self.options.control;
             const etags = self.etags.items;
-            completeMultipartUpload(self.arena, self.creds, self.url, control, id, etags, &failure) catch |err| {
+            const url = self.url;
+            completeMultipartUpload(self.arena, self.creds, url, control, self.io, id, etags, &failure) catch |err| {
                 if (failure.err == null and failure.phase != .response) failure.err = err;
                 // A Complete whose answer was lost may have committed the object: accept it only if the key now holds
                 // exactly this upload.
@@ -634,6 +635,7 @@ fn completeMultipartUpload(
     creds: s3.Credentials,
     url: s3.Url,
     control: Control,
+    io: Io,
     upload_id: []const u8,
     etag_slots: []const *EtagSlot,
     failure: *S3Failure,
@@ -655,7 +657,8 @@ fn completeMultipartUpload(
     }
     try body.appendSlice(arena, "</CompleteMultipartUpload>");
 
-    var conn = try controlConnect(arena, creds, url, control, null, failure);
+    // Every part is uploaded by now: a connect that fails before anything is sent is tried again, as Create's is.
+    var conn = try controlConnect(arena, creds, url, control, io, failure);
     defer conn.deinit();
 
     const signer: sigv4.SigV4 = .{
@@ -1450,4 +1453,39 @@ test "a CreateMultipartUpload answered 200 without an UploadId is sent once, and
     try testing.expectEqual(@as(u32, 1), fake.creates);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
     try expectFailure(&diag, "CreateMultipartUpload was answered 200 (no S3 error code): XmlTagMissing");
+}
+
+/// A control-plane connect that fails at its `fail_call`th call (1-based: Create, Complete, Abort) and works otherwise.
+const NthConnect = struct {
+    var call: u32 = 0;
+    var fail_call: u32 = 0;
+
+    fn arm(n: u32) Control {
+        call = 0;
+        fail_call = n;
+        return .{ .connect = connect, .policy = fast_policy };
+    }
+
+    fn connect(
+        a: std.mem.Allocator,
+        creds: s3.Credentials,
+        addrs: []const tls.Ipv4,
+        host: []const u8,
+    ) s3.Error!tls.Connection {
+        call += 1;
+        if (call == fail_call) return error.ConnectFailed;
+        return s3.connect(a, creds, addrs, host);
+    }
+};
+
+test "regression: one refused connect for CompleteMultipartUpload is tried again, not the upload lost" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    // Every part was uploaded; the Complete's one connect failed and the whole upload was aborted.
+    const options: Options = .{ .target_part_size = 1024, .control = NthConnect.arm(2) };
+    try writeToPort(fake.port, "out.parquet", &test_payload, .{}, options);
+    try testing.expectEqual(@as(u32, 3), NthConnect.call);
+    try testing.expect(fake.object("out.parquet") != null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
 }

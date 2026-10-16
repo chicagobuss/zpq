@@ -1026,7 +1026,9 @@ const WinCtx = struct {
     slots: []Slot,
     /// One per producer that can run at once.
     regions: []WorkRegions,
-    window: *std.Io.Semaphore, // W permits = max row groups in flight
+    window: *std.Io.Semaphore, // the in-flight output budget, in `win_unit` permits (`jobUnits`)
+    win_unit: u64,
+    win_units: usize,
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
     cpu: std.Io.Semaphore = .{}, // producers running at once; sized in runWindowed
 
@@ -1253,7 +1255,7 @@ fn winWriter(w: *WinCtx) void {
         if (enc.bytes.len > 0) w.gpa.free(enc.bytes);
         profile.gauge(prof, .buffered_bytes, -@as(i64, @intCast(enc.bytes.len)));
         _ = w.inflight.fetchSub(enc.bytes.len, .acq_rel);
-        w.window.post(w.io);
+        for (0..windowPermits(WinCtx, w, next)) |_| w.window.post(w.io);
     }
 }
 
@@ -1286,7 +1288,8 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
     defer group.cancel(w.io);
     try group.concurrent(w.io, Ctx.writer, .{w});
     for (0..n_jobs) |i| {
-        w.window.waitUncancelable(w.io);
+        // One dispatching thread takes every permit, so no two producers each hold part of what both need.
+        for (0..windowPermits(Ctx, w, i)) |_| w.window.waitUncancelable(w.io);
         w.cpu.waitUncancelable(w.io);
         group.async(w.io, Run.producer, .{ w, i });
     }
@@ -1314,6 +1317,9 @@ const RecompressCtx = struct {
     bloom_leaves: []const ?f64 = &.{},
     slots: []RecompressSlot,
     window: *std.Io.Semaphore,
+    /// The window's permit size and count (`jobUnits`).
+    win_unit: u64,
+    win_units: usize,
     completions: *std.Io.Semaphore,
     cpu: std.Io.Semaphore = .{},
 
@@ -1430,13 +1436,16 @@ fn recompressWriter(w: *RecompressCtx) void {
         job.leave();
         slot.arena.deinit();
         slot.arena = std.heap.ArenaAllocator.init(w.gpa);
-        w.window.post(w.io);
+        for (0..jobUnits(job, w.win_unit, w.win_units)) |_| w.window.post(w.io);
     }
 }
 
 const WriteWindow = struct {
     workers: usize,
     window: usize,
+    /// The byte budget for buffered output in units of `unit` bytes: a row group in flight holds `jobUnits` of them.
+    unit: u64,
+    units: usize,
     /// The CPU budget `workers` was taken from (they are fewer when the window holds fewer row groups).
     budget: usize,
 };
@@ -1459,7 +1468,31 @@ fn writeWindow(ctx: Context, args: QueryArgs, jobs: []const RGJob) WriteWindow {
     else
         @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8));
     const window = system.windowCapacity(inflight_budget, avg_rg, jobs.len);
-    return .{ .workers = @min(async_budget, window), .window = window, .budget = async_budget };
+    const unit = @max(@as(u64, 1), inflight_budget / window_units);
+    return .{
+        .workers = @min(async_budget, window),
+        .window = window,
+        .unit = unit,
+        .units = @intCast(@max(@as(u64, 1), inflight_budget / unit)),
+        .budget = async_budget,
+    };
+}
+
+/// Permits the write window's byte budget is cut into.
+const window_units = 1024;
+
+/// The window's permits a row group in flight holds: its own size, not the average, so a few large row groups among
+/// many small ones cannot all be buffered at once (they held several times the budget behind a slow sink). Never
+/// more than the whole window, so a row group larger than the budget still runs, alone.
+fn jobUnits(job: RGJob, unit: u64, units: usize) usize {
+    const bytes: u64 = @intCast(@max(@as(i64, 0), job.rg.total_byte_size));
+    return @intCast(std.math.clamp(std.math.divCeil(u64, bytes, unit) catch 1, 1, units));
+}
+
+/// `jobUnits` for job `i` of a write fan-out context; one permit for a context that counts row groups instead.
+fn windowPermits(comptime Ctx: type, w: *const Ctx, i: usize) usize {
+    if (!@hasField(Ctx, "win_unit")) return 1;
+    return jobUnits(w.jobs[i], w.win_unit, w.win_units);
 }
 
 /// True when some kept chunk of some row group is stored in another codec than `codec`.
@@ -2024,9 +2057,11 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             const slots = try arena.alloc(RecompressSlot, jobs.items.len);
             for (slots) |*sl| sl.* = .{ .arena = std.heap.ArenaAllocator.init(ctx.gpa) };
             defer for (slots) |*sl| sl.arena.deinit();
-            var window_sem: std.Io.Semaphore = .{ .permits = window };
+            var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
             var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
             var rw = RecompressCtx{
+                .win_unit = sizing.unit,
+                .win_units = sizing.units,
                 .gpa = ctx.gpa,
                 .jobs = jobs.items,
                 .kept = kept_opt,
@@ -2171,9 +2206,11 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
             const regions = try arena.alloc(WorkRegions, @max(effective_async_budget, 1));
             for (regions) |*r| r.* = .init(ctx.gpa);
             defer for (regions) |*r| r.deinit();
-            var window_sem: std.Io.Semaphore = .{ .permits = window };
+            var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
             var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
             var w = WinCtx{
+                .win_unit = sizing.unit,
+                .win_units = sizing.units,
                 .gpa = ctx.gpa,
                 .jobs = jobs.items,
                 .filter = filter_opt,
@@ -6799,6 +6836,24 @@ test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
     const rgs = metas[0].row_groups.items;
     try std.testing.expectEqual(@as(?[]const bool, null), plan.rowGroupColumns(&rgs[0], &metas[0]));
     try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false, false }, plan.rowGroupColumns(&rgs[7], &metas[0]).?);
+}
+
+test "regression: a row group in flight holds the write window's bytes for its own size, at most the whole window" {
+    var rgs: [4]schema.RowGroup = undefined;
+    for (&rgs, [_]i64{ 0, 1, 33 << 20, 4 << 30 }) |*rg, size| {
+        rg.* = .{ .columns = .empty, .total_byte_size = size, .num_rows = 1 };
+    }
+    const job = struct {
+        fn of(rg: *const schema.RowGroup) RGJob {
+            return .{ .bytes = &.{}, .meta = undefined, .rg = rg };
+        }
+    }.of;
+    const unit: u64 = (256 << 20) / window_units;
+    try std.testing.expectEqual(@as(usize, 1), jobUnits(job(&rgs[0]), unit, window_units));
+    try std.testing.expectEqual(@as(usize, 1), jobUnits(job(&rgs[1]), unit, window_units));
+    try std.testing.expectEqual(@as(usize, 132), jobUnits(job(&rgs[2]), unit, window_units));
+    // Larger than the whole budget: admitted alone, never waiting for permits that do not exist.
+    try std.testing.expectEqual(@as(usize, window_units), jobUnits(job(&rgs[3]), unit, window_units));
 }
 
 test "windowed fan-out runs budget producers at once on pool threads beside a writer that holds its thread" {

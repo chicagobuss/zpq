@@ -24,6 +24,8 @@ pub const Error = error{
     /// List-element predicates need repetition-aware semantics, so this
     /// evaluator rejects them instead of flattening ambiguously.
     NestedFilterNotSupported,
+    /// A DECIMAL leaf met a column decoded without its exact integers (see `ColumnT.unscaled`).
+    DecimalUnavailable,
 } || std.mem.Allocator.Error;
 
 inline fn rejectIfNested(col: anytype) Error!void {
@@ -58,6 +60,31 @@ pub fn evalLeaf(
     switch (op) {
         inline else => |o| filterWords(T, T, o, values, def_levels, max_def, needle, sel.mask),
     }
+}
+
+/// A DECIMAL leaf over unscaled integers of the width they were decoded at. A needle past the lane's range compares
+/// as the wider value would: every stored value is below a positive one and above a negative one.
+fn evalLeafExact(
+    comptime T: type,
+    values: []const T,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    op: ast.Operator,
+    needle: i128,
+    sel: *selection.SelectionVector,
+) void {
+    const n = std.math.cast(T, needle) orelse {
+        const above = needle > 0;
+        const holds = switch (op) {
+            .Eq => false,
+            .NotEq => true,
+            .Lt, .LtEq => above,
+            .Gt, .GtEq => !above,
+        };
+        if (holds) evalNotNull(def_levels, max_def, sel) else @memset(sel.mask, 0);
+        return;
+    };
+    evalLeaf(T, values, def_levels, max_def, op, n, sel);
 }
 
 /// Unsigned predicate over a signed lane. `U` is the lane's unsigned twin: u32 for raw INT32 bits, u64 for an i64
@@ -288,9 +315,9 @@ pub fn ColumnT(comptime T: type) type {
         hist: ?[]const u64 = null,
         /// With `hist`, for a GROUP BY key: each dictionary entry's first row, `maxInt(u32)` for an entry no row holds.
         hist_first: ?[]const u32 = null,
-        /// A DECIMAL column's exact unscaled integers, row for row with `values` (the f64 view filters compare). Only
-        /// set on a decoded decimal; anything that moves rows (gather, selection) must move these too or drop them,
-        /// and exact decimal evaluation refuses a column without them rather than fall back to the f64 view.
+        /// A DECIMAL column's exact unscaled integers, row for row with `values` (the f64 view); filters compare
+        /// these. Only set on a decoded decimal; anything that moves rows (gather, selection) must move these too or
+        /// drop them, and exact decimal evaluation refuses a column without them rather than fall back to the f64 view.
         unscaled: ?Exact = null,
         /// The same for a coded column's dictionary: entry for entry with `dict`.
         dict_unscaled: ?Exact = null,
@@ -365,7 +392,11 @@ pub const Batch = struct {
         /// The dictionary as a column of its own (one row per entry, no nulls), for evaluating per entry.
         pub fn dictColumn(self: Column) Column {
             return switch (self) {
-                inline else => |c, tag| @unionInit(Column, @tagName(tag), .{ .values = c.dict }),
+                inline else => |c, tag| @unionInit(
+                    Column,
+                    @tagName(tag),
+                    .{ .values = c.dict, .unscaled = c.dict_unscaled },
+                ),
             };
         }
 
@@ -442,6 +473,17 @@ pub fn evaluate(
             if (col != .f64) return error.TypeMismatch;
             try rejectIfNested(col.f64);
             evalLeaf(f64, col.f64.values, col.f64.def_levels, col.f64.max_def, leaf.op, leaf.value, sel);
+        },
+        .decimal => |leaf| {
+            const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
+            const col = batch.cols[col_pos];
+            if (col != .f64) return error.TypeMismatch;
+            try rejectIfNested(col.f64);
+            switch (col.f64.unscaled orelse return error.DecimalUnavailable) {
+                inline else => |v| {
+                    evalLeafExact(@TypeOf(v[0]), v, col.f64.def_levels, col.f64.max_def, leaf.op, leaf.value, sel);
+                },
+            }
         },
         .string => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
@@ -563,6 +605,7 @@ fn leafColumn(f: ast.Filter) ?usize {
         .uint64 => |l| l.col_idx,
         .float => |l| l.col_idx,
         .double => |l| l.col_idx,
+        .decimal => |l| l.col_idx,
         .string => |l| l.col_idx,
         .boolean => |l| l.col_idx,
         .like => |l| l.col_idx,
@@ -700,6 +743,51 @@ pub fn applyCodeMatch(
 // ============================================================
 
 const testing = std.testing;
+
+test "regression: a DECIMAL leaf compares the unscaled integers, exact past 2^53 and past the lane's range" {
+    // 2^53 + 1 and 2^53 round to the same f64: compared through it, `= 2^53 + 1` matched both.
+    const big: i64 = (1 << 53) + 1;
+    const vals = [_]i64{ big, big - 1, big + 2, 5 };
+    const f64_view = [_]f64{ @floatFromInt(vals[0]), @floatFromInt(vals[1]), @floatFromInt(vals[2]), 5 };
+    const dl = [_]u32{ 1, 1, 1, 0 };
+    const cols = [_]Batch.Column{.{ .f64 = .{
+        .values = &f64_view,
+        .def_levels = &dl,
+        .max_def = 1,
+        .unscaled = .{ .i64 = &vals },
+    } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = vals.len };
+    const lookup = [_]?usize{0};
+    const Case = struct { op: ast.Operator, value: i128, want: []const bool };
+    const huge: i128 = std.math.maxInt(i64) + @as(i128, 1);
+    for ([_]Case{
+        .{ .op = .Eq, .value = big, .want = &.{ true, false, false, false } },
+        .{ .op = .Gt, .value = big - 1, .want = &.{ true, false, true, false } },
+        .{ .op = .NotEq, .value = big, .want = &.{ false, true, true, false } },
+        .{ .op = .Lt, .value = huge, .want = &.{ true, true, true, false } },
+        .{ .op = .Gt, .value = huge, .want = &.{ false, false, false, false } },
+        .{ .op = .Gt, .value = -huge, .want = &.{ true, true, true, false } },
+        .{ .op = .Eq, .value = -huge, .want = &.{ false, false, false, false } },
+    }) |c| {
+        var sv = try selection.SelectionVector.init(testing.allocator, vals.len);
+        defer sv.deinit();
+        const leaf: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = c.op, .value = c.value } };
+        try evaluate(leaf, &batch, &sv, &lookup, testing.allocator);
+        for (c.want, 0..) |w, i| try testing.expectEqual(w, sv.isActive(i));
+    }
+    // A decimal decoded without its exact integers is refused, never compared through the f64 view.
+    const bare = [_]Batch.Column{.{ .f64 = .{ .values = &f64_view } }};
+    const bare_batch: Batch = .{ .cols = &bare, .num_rows = vals.len };
+    var sv = try selection.SelectionVector.init(testing.allocator, vals.len);
+    defer sv.deinit();
+    try testing.expectError(error.DecimalUnavailable, evaluate(
+        .{ .decimal = .{ .col_idx = 0, .op = .Eq, .value = 5 } },
+        &bare_batch,
+        &sv,
+        &lookup,
+        testing.allocator,
+    ));
+}
 
 test "evalLeaf i32 equality" {
     const data = [_]i32{ 1, 2, 3, 2, 5 };

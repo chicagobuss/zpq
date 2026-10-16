@@ -462,7 +462,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
             const phys = elem.type orelse return error.UnsupportedColumnType;
             // DECIMAL columns are exact: expressions and aggregates read the unscaled integers the consumer decodes
-            // beside the f64 view filters use (see core/parquet/decimal.zig `decodeColumnExact`).
+            // beside the f64 view (see core/parquet/decimal.zig `decodeColumnExact`).
             var dec: ?ast.Dec = null;
             if (decimal_mod.kindFromSchema(&elem)) |k| {
                 if (!ast.Dec.valid(k.precision, k.scale)) return error.InvalidDecimalType;

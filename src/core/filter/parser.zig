@@ -532,7 +532,7 @@ fn constantLeaf(comptime T: type, leaf: ast.Leaf(T)) ?bool {
 fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {
         // Negating keeps the value, so a stored literal stays one (`NOT x != 5` is `x = 5`).
-        inline .int32, .int64, .uint64, .float, .double, .string, .boolean => |l, tag| @unionInit(
+        inline .int32, .int64, .uint64, .float, .double, .decimal, .string, .boolean => |l, tag| @unionInit(
             ast.Filter,
             @tagName(tag),
             .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value, .stored = l.stored },
@@ -652,8 +652,8 @@ fn findComparison(expr: []const u8) Error!?Comparison {
     return null;
 }
 
-/// Build a single typed comparison leaf, honoring DECIMAL columns (decoded
-/// to f64 → the .double lane) and DATE/TIMESTAMP columns (SQL-style literals
+/// Build a single typed comparison leaf, honoring DECIMAL columns (the
+/// exact unscaled lane) and DATE/TIMESTAMP columns (SQL-style literals
 /// → stored epoch ints). Shared by the comparison path and the IN-list
 /// expansion so both get identical type handling.
 fn buildTypedComparison(
@@ -667,9 +667,10 @@ fn buildTypedComparison(
 ) Error!ast.Filter {
     // Every leaf that compares a stored value is marked `stored` here and nowhere else, so what membership pruning
     // hashes (filter/membership.zig) can never drift from what evaluation compares.
-    if (decimal_mod.kindFromSchema(elem) != null) {
-        // Compared after decoding to f64: the literal is no stored value.
-        return buildLeafFilter(col_idx, op, val_str, .DOUBLE);
+    if (decimal_mod.kindFromSchema(elem)) |k| {
+        // Compared on the unscaled integers: through f64, values past 2^53 matched their neighbours.
+        const lit = try scaledLiteral(val_str, k.scale);
+        return .{ .decimal = ast.exactLeaf(i128, col_idx, op, lit.floor, lit.inexact) };
     }
     if (schema.isUnsignedInt(elem.*)) return markStored(try buildUnsignedLeaf(col_idx, op, val_str));
     if (temporalKind(elem)) |tk| {
@@ -811,37 +812,57 @@ fn buildTemporalLeaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8, 
 
 fn bindExact(col_idx: usize, op: ast.Operator, lane: Lane, floor: i128, inexact: bool) ast.Filter {
     return switch (lane) {
-        .int32 => .{ .int32 = exactLeaf(i32, col_idx, op, floor, inexact) },
-        .int64 => .{ .int64 = exactLeaf(i64, col_idx, op, floor, inexact) },
+        .int32 => .{ .int32 = ast.exactLeaf(i32, col_idx, op, floor, inexact) },
+        .int64 => .{ .int64 = ast.exactLeaf(i64, col_idx, op, floor, inexact) },
     };
 }
 
-/// `col op v` as an equivalent comparison against a value of the column's type, where `v` is `floor` when exact and
-/// otherwise lies strictly between `floor` and `floor + 1` (or beyond the type's range). Rounding the literal to the
-/// column's unit changed answers (`>= 0.0995` s on a millisecond column matched 0.099 s), and because the rewrite is
-/// equivalent on every non-null value, eval, page/row-group pruning and the full-match proof stay exact unchanged.
-fn exactLeaf(comptime T: type, col_idx: usize, op: ast.Operator, floor: i128, inexact: bool) ast.Leaf(T) {
-    const lo = std.math.minInt(T);
-    const hi = std.math.maxInt(T);
-    // No stored value equals `v`: `=` matches nothing and `!=` every non-null row. `col > maxInt` and
-    // `col <= maxInt` say exactly that while still rejecting nulls, and negate into each other for NOT.
-    const never: ast.Leaf(T) = .{ .col_idx = col_idx, .op = .Gt, .value = hi };
-    const always: ast.Leaf(T) = .{ .col_idx = col_idx, .op = .LtEq, .value = hi };
-    const o: ast.Operator = if (!inexact) op else switch (op) {
-        .Eq => return never,
-        .NotEq => return always,
-        .Gt, .GtEq => .Gt,
-        .Lt, .LtEq => .LtEq,
+/// A decimal literal (`-12.50`, `7`, `1.5e3`) times 10^`scale`: its floor and whether that dropped a fraction. A
+/// magnitude no DECIMAL holds (past 10^40) stands as ±10^40, which compares with every stored value as it would.
+fn scaledLiteral(text: []const u8, scale: i32) Error!struct { floor: i256, inexact: bool } {
+    var s = text;
+    const neg = s.len > 0 and s[0] == '-';
+    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s = s[1..];
+    var exp: i64 = 0;
+    if (std.mem.indexOfAny(u8, s, "eE")) |e| {
+        exp = std.fmt.parseInt(i32, s[e + 1 ..], 10) catch return error.BadValue;
+        s = s[0..e];
+    }
+    const dot = std.mem.indexOfScalar(u8, s, '.');
+    const int_part = if (dot) |d| s[0..d] else s;
+    const frac_part = if (dot) |d| s[d + 1 ..] else "";
+    if (int_part.len + frac_part.len == 0) return error.BadValue;
+    var mant: i256 = 0;
+    var digits: i64 = 0;
+    for ([_][]const u8{ int_part, frac_part }) |part| for (part) |c| {
+        if (c < '0' or c > '9') return error.BadValue;
+        if (mant == 0 and c == '0') continue;
+        digits += 1;
+        if (digits > 76) return error.BadValue;
+        mant = mant * 10 + (c - '0');
     };
-    if (floor > hi) return switch (o) {
-        .Gt, .GtEq, .Eq => never,
-        .Lt, .LtEq, .NotEq => always,
-    };
-    if (floor < lo) return switch (o) {
-        .Lt, .LtEq, .Eq => never,
-        .Gt, .GtEq, .NotEq => always,
-    };
-    return .{ .col_idx = col_idx, .op = o, .value = @intCast(floor) };
+    if (mant == 0) return .{ .floor = 0, .inexact = false };
+    const shift = exp + scale - @as(i64, @intCast(frac_part.len));
+    const huge = pow10Wide(40);
+    var q: i256 = undefined;
+    var r: i256 = 0;
+    if (shift >= 0) {
+        q = if (digits + shift > 40) huge else mant * pow10Wide(@intCast(shift));
+    } else if (-shift > digits) {
+        q = 0;
+        r = mant;
+    } else {
+        const p = pow10Wide(@intCast(-shift));
+        q = @divTrunc(mant, p);
+        r = @rem(mant, p);
+    }
+    return .{ .floor = if (neg) -q - @intFromBool(r != 0) else q, .inexact = r != 0 };
+}
+
+fn pow10Wide(n: u32) i256 {
+    var p: i256 = 1;
+    for (0..n) |_| p *= 10;
+    return p;
 }
 
 /// A literal as whole nanoseconds; `sub_ns` means a nonzero fraction digit past the ninth put it strictly between
@@ -1544,6 +1565,46 @@ test "regression: a string column compares only with one literal, never a column
     try testing.expectEqualStrings("n1", (try parse(a, "status LIKE 'n1%'", &meta, null)).like.operand);
 }
 
+test "regression: DECIMAL literals bind exactly at the column's scale, a fraction it cannot hold by floor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const Case = struct { text: []const u8, op: ast.Operator, value: i128 };
+    const max = std.math.maxInt(i128);
+    const cases = [_]Case{
+        // `dec` is DECIMAL(20,2): unscaled hundredths, exact past 2^53 where f64 is not.
+        .{ .text = "dec = 90071992547409.93", .op = .Eq, .value = 9007199254740993 },
+        .{ .text = "dec > 1.5e1", .op = .Gt, .value = 1500 },
+        .{ .text = "dec <= -0.07", .op = .LtEq, .value = -7 },
+        .{ .text = "dec > 1.005", .op = .Gt, .value = 100 },
+        .{ .text = "dec >= 1.005", .op = .Gt, .value = 100 },
+        .{ .text = "dec < 1.005", .op = .LtEq, .value = 100 },
+        .{ .text = "dec < -1.005", .op = .LtEq, .value = -101 },
+        .{ .text = "dec >= -0.001", .op = .Gt, .value = -1 },
+        .{ .text = "dec >= 25e-3", .op = .Gt, .value = 2 },
+        .{ .text = "dec = 0.000", .op = .Eq, .value = 0 },
+        // No stored value equals an inexact literal; past every value, the order alone decides.
+        .{ .text = "dec = 1.005", .op = .Gt, .value = max },
+        .{ .text = "dec <> 1.005", .op = .LtEq, .value = max },
+        .{ .text = "dec < 1e50", .op = .LtEq, .value = max },
+        .{ .text = "dec > 1e50", .op = .Gt, .value = max },
+        .{ .text = "dec > -1e50", .op = .LtEq, .value = max },
+        .{ .text = "dec = -1e50", .op = .Gt, .value = max },
+    };
+    for (cases) |c| {
+        const f = try parse(a, c.text, &meta, null);
+        try testing.expectEqual(c.op, f.decimal.op);
+        try testing.expectEqual(c.value, f.decimal.value);
+        try testing.expect(!f.decimal.stored);
+    }
+    for ([_][]const u8{ "dec = 1.2.3", "dec = 1e", "dec = abc", "dec = .", "dec = nan", "dec = 1x" }) |text| {
+        try testing.expectError(error.BadValue, parse(a, text, &meta, null));
+    }
+}
+
 test "parse DATE/TIMESTAMP literals → epoch ints" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2107,11 +2168,11 @@ test "parse BETWEEN binds its bounds like the comparison operators" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // DECIMAL bounds take the f64 lane, not a byte-string compare against the FLBA bytes.
+    // DECIMAL bounds take the exact unscaled lane at the column's scale, not a byte-string compare against the bytes.
     const fd = try parse(a, "dec BETWEEN 1 AND 2.5", &meta, null);
-    try testing.expect(fd.and_filter.children[0] == .double and fd.and_filter.children[1] == .double);
-    try testing.expectEqual(@as(f64, 1), fd.and_filter.children[0].double.value);
-    try testing.expectEqual(@as(f64, 2.5), fd.and_filter.children[1].double.value);
+    try testing.expect(fd.and_filter.children[0] == .decimal and fd.and_filter.children[1] == .decimal);
+    try testing.expectEqual(@as(i128, 100), fd.and_filter.children[0].decimal.value);
+    try testing.expectEqual(@as(i128, 250), fd.and_filter.children[1].decimal.value);
 
     // DATE/TIMESTAMP bounds accept the same SQL literals `>=`/`<=` do.
     const fdt = try parse(a, "d BETWEEN '2024-01-01' AND '2024-01-31'", &meta, null);

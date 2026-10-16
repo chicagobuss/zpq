@@ -590,8 +590,8 @@ fn decodeWriteColumn(
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const n_leaves: usize = @intCast(cm.num_values);
 
-    // DECIMAL columns, whatever their backing: the f64 view filters compare, with the exact unscaled values beside it
-    // for expressions and aggregates (`decodeColumnExact`).
+    // DECIMAL columns, whatever their backing: the f64 view, with the exact unscaled values beside it that filters,
+    // expressions and aggregates read (`decodeColumnExact`).
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
     const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.kindFromSchema(&se) else null;
 
@@ -1959,6 +1959,7 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
                 .uint64 => |l| l.col_idx,
                 .float => |l| l.col_idx,
                 .double => |l| l.col_idx,
+                .decimal => |l| l.col_idx,
                 .string => |l| l.col_idx,
                 .boolean => |l| l.col_idx,
                 .null_check => |l| l.col_idx,
@@ -2974,6 +2975,7 @@ fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
         .uint64 => |l| mark(u.code, l.col_idx),
         .float => |l| mark(u.code, l.col_idx),
         .double => |l| mark(u.code, l.col_idx),
+        .decimal => |l| mark(u.code, l.col_idx),
         .string => |l| mark(u.code, l.col_idx),
         .boolean => |l| mark(u.value, l.col_idx),
         .null_check => |l| mark(u.levels, l.col_idx),

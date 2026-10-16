@@ -83,7 +83,8 @@ pub fn Leaf(comptime T: type) type {
         value: T,
         /// Set by the binder alone, when `value` is exactly a value the column stores in its physical type, so its
         /// PLAIN bytes are what a Bloom filter hashed and a dictionary holds. Lanes that convert on the way in (DECIMAL
-        /// to f64, INT96 to nanoseconds, FLOAT16 to f64) leave it unset, and so does any leaf built elsewhere.
+        /// at the column's scale, INT96 to nanoseconds, FLOAT16 to f64) leave it unset, and so does any leaf built
+        /// elsewhere.
         stored: bool = false,
     };
 }
@@ -202,6 +203,9 @@ pub const Filter = union(enum) {
     uint64: Leaf(u64),
     float: Leaf(f32),
     double: Leaf(f64),
+    /// A DECIMAL column, compared exactly: `value` is the literal's unscaled integer at the column's scale (see
+    /// `exactLeaf` for a literal that scale cannot hold), tested against the decoded `unscaled` integers.
+    decimal: Leaf(i128),
     string: Leaf([]const u8),
     boolean: Leaf(bool),
     null_check: NullCheck,
@@ -218,6 +222,7 @@ pub const Filter = union(enum) {
             .uint64 => |f| try list.append(allocator, f.col_idx),
             .float => |f| try list.append(allocator, f.col_idx),
             .double => |f| try list.append(allocator, f.col_idx),
+            .decimal => |f| try list.append(allocator, f.col_idx),
             .string => |f| try list.append(allocator, f.col_idx),
             .boolean => |f| try list.append(allocator, f.col_idx),
             .null_check => |f| try list.append(allocator, f.col_idx),
@@ -271,11 +276,39 @@ pub fn eql(a: Filter, b: Filter) bool {
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
             std.mem.eql(u8, m.operand, b.like.operand),
-        inline .int32, .int64, .uint64, .boolean => |l, tag| blk: {
+        inline .int32, .int64, .uint64, .decimal, .boolean => |l, tag| blk: {
             const o = @field(b, @tagName(tag));
             break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value;
         },
     };
+}
+
+/// `col op v` as an equivalent comparison against a value of type `T`, where `v` is `floor` when exact and otherwise
+/// lies strictly between `floor` and `floor + 1` (or beyond `T`'s range). Rounding a literal to the column's unit
+/// changed answers (`>= 0.0995` s on a millisecond column matched 0.099 s), and because the rewrite is equivalent on
+/// every non-null value, eval, page/row-group pruning and the full-match proof stay exact unchanged.
+pub fn exactLeaf(comptime T: type, col_idx: usize, op: Operator, floor: i256, inexact: bool) Leaf(T) {
+    const lo = std.math.minInt(T);
+    const hi = std.math.maxInt(T);
+    // No stored value equals `v`: `=` matches nothing and `!=` every non-null row. `col > maxInt` and
+    // `col <= maxInt` say exactly that while still rejecting nulls, and negate into each other for NOT.
+    const never: Leaf(T) = .{ .col_idx = col_idx, .op = .Gt, .value = hi };
+    const always: Leaf(T) = .{ .col_idx = col_idx, .op = .LtEq, .value = hi };
+    const o: Operator = if (!inexact) op else switch (op) {
+        .Eq => return never,
+        .NotEq => return always,
+        .Gt, .GtEq => .Gt,
+        .Lt, .LtEq => .LtEq,
+    };
+    if (floor > hi) return switch (o) {
+        .Gt, .GtEq, .Eq => never,
+        .Lt, .LtEq, .NotEq => always,
+    };
+    if (floor < lo) return switch (o) {
+        .Lt, .LtEq, .Eq => never,
+        .Gt, .GtEq, .NotEq => always,
+    };
+    return .{ .col_idx = col_idx, .op = o, .value = @intCast(floor) };
 }
 
 fn markAllColumns(f: Filter, cols: []bool) void {

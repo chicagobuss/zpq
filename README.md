@@ -202,10 +202,9 @@ from zero as Trino does (DuckDB answers avg in DOUBLE). The JSON prints every di
 (`3344516955134.66`), `-o` writes DECIMAL columns, and a DECIMAL avg's JSON adds `"avg"` beside `{"sum", "count"}`; its
 sum is exact at any width, but `-o`'s `__sum` column is DECIMAL(38, s), so an avg whose sum passes 38 digits answers in
 JSON and errors with `-o`. A value that needs more than its type's digits stops the query with an error rather than
-wrapping or rounding, but only in rows the filter keeps. Two limits remain: filters compare DECIMAL columns as
-doubles (exact while the values and the literal have at most 15 significant digits), and arithmetic over a column
-that holds NULLs is refused (`nullable values are not supported`), as for every type; bare aggregates and GROUP BY
-keys over nullable DECIMAL columns are exact.
+wrapping or rounding, but only in rows the filter keeps. Filters compare a DECIMAL column with a literal exactly, at
+the column's scale. One limit remains: arithmetic over a column that holds NULLs is refused (`nullable values are not
+supported`), as for every type; bare aggregates and GROUP BY keys over nullable DECIMAL columns are exact.
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte

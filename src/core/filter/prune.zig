@@ -57,7 +57,7 @@ pub fn pruneRowGroup(
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
     return switch (filter) {
-        .int32, .int64, .uint64, .float, .double, .string => withMembership(
+        .int32, .int64, .uint64, .float, .double, .decimal, .string => withMembership(
             rg,
             filter,
             valueStats(rg, filter, file_meta),
@@ -87,6 +87,7 @@ fn valueStats(rg: *const schema.RowGroup, leaf: ast.Filter, file_meta: ?*const s
         .uint64 => |l| pruneUnsigned(rg, l.col_idx, l.op, l.value, file_meta),
         .float => |l| pruneNumeric(f32, rg, l.col_idx, l.op, l.value, .FLOAT, file_meta),
         .double => |l| pruneNumeric(f64, rg, l.col_idx, l.op, l.value, .DOUBLE, file_meta),
+        .decimal => |l| pruneDecimal(rg, l.col_idx, l.op, l.value, file_meta),
         .string => |l| pruneBytes(rg, l.col_idx, l.op, l.value, .BYTE_ARRAY, file_meta),
         else => unreachable,
     };
@@ -191,26 +192,10 @@ fn pruneNumeric(
     if (col_idx >= rg.columns.items.len) return .unknown;
     const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
 
-    // DECIMAL path: if the filter is .double against a column whose
-    // physical type doesn't match DOUBLE, we may be looking at a
-    // DECIMAL column (decoded to f64 by decimal_mod). Look up the
-    // schema and decode stat bytes through the same byte → i128 →
-    // f64-with-scale pipeline to get a comparable f64 min/max.
-    if (parquet_type == .DOUBLE and meta.type != .DOUBLE and T == f64) {
-        if (file_meta) |fm| {
-            if (fm.getColumnSchema(meta.path_in_schema.items)) |elem| {
-                if (decimal_mod.kindFromSchema(&elem)) |kind| {
-                    return pruneDecimal(rg, col_idx, op, value, kind, file_meta);
-                }
-            }
-        }
-    }
-
     // Type-mismatch guard: stats bytes are in the column's physical
     // wire format. If the filter leaf was built with a different
-    // parquet type and we didn't take the DECIMAL branch above, the
-    // encoded comparison would compare incompatible byte formats and
-    // silently produce wrong pruning decisions. Bail to .unknown.
+    // parquet type, the encoded comparison would compare incompatible
+    // byte formats and silently produce wrong pruning decisions.
     if (meta.type != parquet_type) return .unknown;
 
     const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
@@ -266,32 +251,30 @@ fn readUnsignedBound(physical: schema.Type, bytes: []const u8) ?u64 {
     };
 }
 
-/// Pruning for DECIMAL columns: stat min/max bytes are in the
-/// column's physical wire format (INT32/INT64 little-endian, FLBA
-/// big-endian two's-complement), and the filter compares against an
-/// f64 value. Decode the bytes to f64 through decimal_mod and then
-/// do a plain f64 range check.
+/// The DECIMAL kind of `col_idx`'s leaf, from the schema: the stat bytes are in its physical wire format (INT32/INT64
+/// little-endian, FLBA and BYTE_ARRAY big-endian two's complement).
+fn decimalKind(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const schema.FileMetaData) ?decimal_mod.Kind {
+    const fm = file_meta orelse return null;
+    if (col_idx >= rg.columns.items.len) return null;
+    const meta = rg.columns.items[col_idx].meta_data orelse return null;
+    const elem = fm.getColumnSchema(meta.path_in_schema.items) orelse return null;
+    return decimal_mod.kindFromSchema(&elem);
+}
+
+/// Pruning for DECIMAL columns, on the exact unscaled bounds the leaf's literal is compared with.
 fn pruneDecimal(
     rg: *const schema.RowGroup,
     col_idx: usize,
     op: ast.Operator,
-    value: f64,
-    kind: decimal_mod.Kind,
+    value: i128,
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
+    const kind = decimalKind(rg, col_idx, file_meta) orelse return .unknown;
     const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
-    const min_f = decimal_mod.statToF64(b.min, kind) orelse return .unknown;
-    const max_f = decimal_mod.statToF64(b.max, kind) orelse return .unknown;
-    if (min_f > max_f) return .unknown; // corrupt stats — be safe
-
-    return switch (op) {
-        .Eq => if (value >= min_f and value <= max_f) .keep else .skip,
-        .NotEq => if (min_f == max_f and min_f == value) .skip else .keep,
-        .Gt => if (max_f > value) .keep else .skip,
-        .GtEq => if (max_f >= value) .keep else .skip,
-        .Lt => if (min_f < value) .keep else .skip,
-        .LtEq => if (min_f <= value) .keep else .skip,
-    };
+    const lo = decimal_mod.statToI128(b.min, kind) orelse return .unknown;
+    const hi = decimal_mod.statToI128(b.max, kind) orelse return .unknown;
+    if (lo > hi) return .unknown; // corrupt stats — be safe
+    return if (encoded.rangeOverlapsValue(i128, op, lo, hi, value)) .keep else .skip;
 }
 
 fn pruneBytes(
@@ -519,15 +502,15 @@ test "pruneRowGroup uses DECIMAL stat decoding when file_meta provided" {
     };
 
     // value > 10.0 → max=24.0 > 10 → keep.
-    const f_keep: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 10.0 } };
+    const f_keep: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = .Gt, .value = 1000 } };
     try testing.expectEqual(Decision.keep, pruneRowGroup(&rg, f_keep, &file_meta));
 
     // value > 100.0 → max=24.0 < 100 → skip.
-    const f_skip: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 100.0 } };
+    const f_skip: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = .Gt, .value = 10000 } };
     try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, f_skip, &file_meta));
 
     // value < 0.5 → min=1.0 >= 0.5 → skip.
-    const f_skip_lt: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = 0.5 } };
+    const f_skip_lt: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = .Lt, .value = 50 } };
     try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, f_skip_lt, &file_meta));
 
     // Without file_meta, DECIMAL recognition is impossible → degrade
@@ -779,11 +762,12 @@ pub fn prunePage(
         inline else => |leaf| if (!statistics.boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,
     }
     return switch (filter) {
-        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, file_meta, trust_stats),
-        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, file_meta, trust_stats),
+        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, trust_stats),
+        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, trust_stats),
         .uint64 => |leaf| prunePageUnsigned(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
-        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, file_meta, trust_stats),
-        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, file_meta, trust_stats),
+        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, trust_stats),
+        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, trust_stats),
+        .decimal => |leaf| prunePageDecimal(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes, file_meta, trust_stats),
         .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
         .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
         .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
@@ -830,24 +814,12 @@ fn prunePageNumeric(
     value: T,
     parquet_type: schema.Type,
     col_indexes: []const ?schema.ColumnIndex,
-    file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
 ) Decision {
     if (col_idx >= col_indexes.len or col_idx >= rg.columns.items.len) return .unknown;
     const ci = col_indexes[col_idx] orelse return .unknown;
     if (page_idx >= ci.null_pages.items.len) return .unknown;
     const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
-
-    // DECIMAL path
-    if (parquet_type == .DOUBLE and meta.type != .DOUBLE and T == f64) {
-        if (file_meta) |fm| {
-            if (fm.getColumnSchema(meta.path_in_schema.items)) |elem| {
-                if (decimal_mod.kindFromSchema(&elem)) |kind| {
-                    return prunePageDecimal(page_idx, ci, op, value, kind, trust_stats);
-                }
-            }
-        }
-    }
 
     if (meta.type != parquet_type) return .unknown;
 
@@ -893,33 +865,27 @@ fn prunePageUnsigned(
 }
 
 fn prunePageDecimal(
+    rg: *const schema.RowGroup,
     page_idx: usize,
-    ci: schema.ColumnIndex,
+    col_idx: usize,
     op: ast.Operator,
-    value: f64,
-    kind: decimal_mod.Kind,
+    value: i128,
+    col_indexes: []const ?schema.ColumnIndex,
+    file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
 ) Decision {
+    if (col_idx >= col_indexes.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    const kind = decimalKind(rg, col_idx, file_meta) orelse return .unknown;
     if (page_idx >= ci.null_pages.items.len) return .unknown;
     if (ci.null_pages.items[page_idx]) return .skip;
 
     if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
-    const min_bytes = ci.min_values.items[page_idx];
-    const max_bytes = ci.max_values.items[page_idx];
+    const lo = decimal_mod.statToI128(ci.min_values.items[page_idx], kind) orelse return .unknown;
+    const hi = decimal_mod.statToI128(ci.max_values.items[page_idx], kind) orelse return .unknown;
+    if (lo > hi) return .unknown; // corrupt stats
 
-    const min_f = decimal_mod.statToF64(min_bytes, kind) orelse return .unknown;
-    const max_f = decimal_mod.statToF64(max_bytes, kind) orelse return .unknown;
-    if (min_f > max_f) return .unknown; // corrupt stats
-
-    const intersects = switch (op) {
-        .Eq => value >= min_f and value <= max_f,
-        .NotEq => !(min_f == max_f and min_f == value),
-        .Gt => max_f > value,
-        .GtEq => max_f >= value,
-        .Lt => min_f < value,
-        .LtEq => min_f <= value,
-    };
-    if (!intersects) return .skip;
+    if (!encoded.rangeOverlapsValue(i128, op, lo, hi, value)) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {
@@ -930,12 +896,12 @@ fn prunePageDecimal(
         };
         if (!has_nulls) {
             const always = switch (op) {
-                .Eq => min_f == max_f and min_f == value,
-                .NotEq => value < min_f or value > max_f,
-                .Gt => min_f > value,
-                .GtEq => min_f >= value,
-                .Lt => max_f < value,
-                .LtEq => max_f <= value,
+                .Eq => lo == hi and lo == value,
+                .NotEq => value < lo or value > hi,
+                .Gt => lo > value,
+                .GtEq => lo >= value,
+                .Lt => hi < value,
+                .LtEq => hi <= value,
             };
             if (always) return .always_match;
         }

@@ -648,8 +648,12 @@ fn executeAggregate(
     };
     if (explain) {
         if (io_mode != .mmap) {
+            // As `startLocalReader` hands the scan its inputs: gated, with the mapped file beside them.
             const gated = try arena.dupe(scan.Input, opened.inputs);
-            for (gated) |*in| in.gate = metadataGate();
+            for (gated, opened.mmaps) |*in, m| {
+                in.gate = metadataGate();
+                if (m != null) in.plan_bytes = in.bytes;
+            }
             scan_args.inputs = gated;
         }
         return .{
@@ -3173,6 +3177,7 @@ fn startLocalReader(
         try rd.planFile(f, per_rg, COALESCE_GAP);
         in.bytes = f.bytes();
         in.gate = f.gate();
+        in.plan_bytes = m.bytes;
     }
     try rd.start();
     return inputs;

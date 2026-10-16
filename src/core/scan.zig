@@ -78,7 +78,27 @@ pub const Input = struct {
     /// Set while `bytes` are still being read in (`io/local_reader.zig`): a worker waits on it before touching a row
     /// group, and reports each finished work item so a done row group's pages can go back.
     gate: ?RowGroupGate = null,
+    /// The whole file as mapped, while `bytes` are read in behind `gate`: what a planning read made before any gate
+    /// opens takes (the NDV union's dictionaries, which read buffers the reader had not filled, so the plan hung on
+    /// I/O progress and read mode), and what a scan run again after a fast path's refusal reads, the reader's window
+    /// having moved on. Null without a gate, and for S3 inputs.
+    plan_bytes: ?[]const u8 = null,
+
+    /// Readable again from the start, as a scan run again after a refusal must read it (`runMultiAggregate`).
+    pub fn rescannable(self: Input) bool {
+        return self.gate == null or self.plan_bytes != null;
+    }
 };
+
+fn allRescannable(inputs: []const Input) bool {
+    for (inputs) |in| if (!in.rescannable()) return false;
+    return true;
+}
+
+/// A fast path that charges its peak to the query's budget where the established path it stands in for does not
+/// charge the same way. Each is armed only over rescannable inputs, and a scan it took that the budget refused runs
+/// again without it (`runMultiAggregate`): a budget the established path fits never fails the query.
+pub const FastPath = enum { dense, spill, pairs, partitioned };
 
 pub const RowGroupGate = struct {
     ctx: *anyopaque,
@@ -158,8 +178,10 @@ pub const MultiAggArgs = struct {
     ndv_union: bool = true,
     /// Keep a lone integer key's union as an exact domain and fold by its ids (`agg_dense`) where the plan allows.
     dense: bool = true,
-    /// Set when the scan took the dense fold, so a budget refusal can run again without it.
-    dense_taken: ?*bool = null,
+    /// The fast paths the scan armed, so a budget refusal can run again without them (`FastPath`).
+    taken: ?*std.EnumSet(FastPath) = null,
+    /// Let the cost rules move a plain GROUP BY to partitioned tables (worker-copy pressure, long strings).
+    partition_cost: bool = true,
     /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
     /// `partagg.local_cap` and `partagg.probe_rows`.
     part_cap: usize = 0,
@@ -795,7 +817,8 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     const pressure_copies = (pressure_groups *| per_group) *| plan.dispatch.tables;
     const memory_pressure = !state_unknown and pressure_copies > in.args.max_memory / 2 and
         single <= in.args.max_memory;
-    if ((long_strings or memory_pressure) and partAggSupported(in.args, in.calls, in.keys != null)) {
+    const partition_ok = in.args.partition_cost and partAggSupported(in.args, in.calls, in.keys != null);
+    if ((long_strings or memory_pressure) and partition_ok) {
         // A known union can expose worker-copy pressure even in a sketch's eventual plain fallback.
         if (plan.dispatch.strategy == .plain_hash or (memory_pressure and plan.dispatch.strategy == .sketch) or
             (long_strings and stat.covered_rows == 0 and stat.encoding_stats_rows == stat.rows and
@@ -2540,16 +2563,25 @@ fn footerLen(bytes: []const u8) usize {
 /// answer, `MultiAggResult.output`, is gpa-owned; `MultiAggResult.deinit`
 /// frees both.
 pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs) !MultiAggResult {
-    // The dense fold's state is reserved up front, but row groups it cannot take still grow the worker tables beside
-    // it: a budget the established path fits must not fail the query, so a refusal there runs that path again.
-    // Exact because the dense fold reads only inputs held whole (none gated), which a second scan reads again.
-    var taken = false;
+    // A fast path charges more of its peak than the path it stands in for (`FastPath`): a budget the established
+    // path fits must not fail the query, so a refusal runs the scan again without every fast path it armed. Exact
+    // because each is armed only over inputs a second scan reads again, whole, from the start.
+    var taken: std.EnumSet(FastPath) = .{};
     var first = args;
-    first.dense_taken = &taken;
+    first.taken = &taken;
     return prepareAggregate(gpa, arena, first, false) catch |e| {
-        if (e != error.ExceededMemoryBudget or !taken) return e;
+        if (e != error.ExceededMemoryBudget or taken.count() == 0) return e;
         var plain = args;
-        plain.dense = false;
+        if (taken.contains(.dense)) plain.dense = false;
+        if (taken.contains(.spill)) plain.spill = false;
+        if (taken.contains(.pairs)) plain.distinct_pairs = .off;
+        if (taken.contains(.partitioned)) plain.partition_cost = false;
+        const inputs = try arena.dupe(Input, args.inputs);
+        for (inputs) |*in| if (in.plan_bytes) |b| {
+            in.bytes = b;
+            in.gate = null;
+        };
+        plain.inputs = inputs;
         return prepareAggregate(gpa, arena, plain, false);
     };
 }
@@ -2775,11 +2807,15 @@ fn prepareAggregate(
     defer if (domain) |*d| d.deinit(gpa);
     if (args.ndv_policy) if (group_by_keys) |keys| {
         const files = try arena.alloc(ndv.File, args.inputs.len);
-        for (args.inputs, files) |input, *file| file.* = .{
-            .bytes = input.bytes,
-            .local = !std.mem.startsWith(u8, input.name, "s3://") and
-                (input.logical_size == 0 or input.logical_size == input.bytes.len),
-        };
+        // Dictionaries are read from the file as mapped, never from buffers a reader may not have filled yet.
+        for (args.inputs, files) |input, *file| {
+            const bytes = input.plan_bytes orelse input.bytes;
+            file.* = .{
+                .bytes = bytes,
+                .local = !std.mem.startsWith(u8, input.name, "s3://") and input.rescannable() and
+                    (input.logical_size == 0 or input.logical_size == bytes.len),
+            };
+        }
         // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
         const prefix = planAggregate(plan_inputs).dispatch.strategy == .first_keys;
         const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
@@ -2893,8 +2929,14 @@ fn prepareAggregate(
     defer if (!leave_tables) if (part_state) |*p| p.deinit();
     // Fixed-width keys fold into an open-addressed table cheap enough that moving near-unique ones to runs cost more
     // than it saved; string keys, copied into a byte map per worker, gain.
+    const rescannable = allRescannable(args.inputs);
     const spill_on = !part_on and args.spill and decision.strategy == .plain_hash and !use_blocks and
-        fixed_stride == 0 and partAggSupported(args, agg_calls, group_by_keys != null);
+        fixed_stride == 0 and partAggSupported(args, agg_calls, group_by_keys != null) and rescannable;
+    if (args.taken) |taken| {
+        if (spill_on) taken.insert(.spill);
+        // Chosen by the cost rules rather than asked for, a partitioned plan has the plain one to fall back to.
+        if (part_on and !args.partagg and rescannable) taken.insert(.partitioned);
+    }
     // A partitioned plan the cost rules chose (long strings, worker-copy pressure) merges into shared partition
     // tables; `ZPQ_PARTAGG=1` and a worker that moves at run time append to runs.
     const armed = spill_on;
@@ -2919,10 +2961,12 @@ fn prepareAggregate(
         .on => true,
         .off => false,
     };
-    const pairs_call: ?usize = if (args.distinct_pairs != .off and decision.strategy == .plain_hash and !use_blocks)
+    const pairs_call: ?usize = if (args.distinct_pairs != .off and decision.strategy == .plain_hash and !use_blocks and
+        rescannable)
         distinctPairsCall(agg_calls, fixed_stride)
     else
         null;
+    if (pairs_call != null) if (args.taken) |taken| taken.insert(.pairs);
     var pair_sinks: []expr_agg.DistinctPairs = &.{};
     defer for (pair_sinks) |*ps| ps.deinit();
     if (pairs_call) |ai| {
@@ -2944,13 +2988,13 @@ fn prepareAggregate(
     if (dense_wanted) dense: {
         const d = &domain.?;
         const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls.len);
-        for (args.inputs) |in| if (in.gate != null) break :dense;
+        if (!rescannable) break :dense;
         if (spill_on or pairs_call != null or n_workers *| d.ids() > d.entries()) break :dense;
         dense_table_charge = agg_dense.tableBytes(d.ids(), fixed_stride, agg_calls.len);
         dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes +| dense_table_charge) orelse break :dense;
         dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
         for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls };
-        if (args.dense_taken) |taken| taken.* = true;
+        if (args.taken) |taken| taken.insert(.dense);
     }
     if (dense_lanes.len == 0) if (domain) |*d| {
         d.deinit(gpa);
@@ -3121,14 +3165,9 @@ fn prepareAggregate(
         // those comparisons the query. Worker maps store an 8-bit fingerprint, not the hash, so each ref is hashed
         // once here. One table already has distinct keys and only needs first-appearance order.
         //
-        // Merge maps borrow source keys. Numeric cuts charge their scratch alongside the source tables; the full
-        // merge and established COUNT specializations retain their existing admission behavior.
-        var cut_memory: CutScratch = .{ .parent = gpa, .shared = &group_budget };
-        defer cut_memory.finish();
-        var result_cut = resultCut(group_outputs.?, agg_calls, args.result_order, args.unordered);
-        if (result_cut) |*rc| if (rc.ranking_first) {
-            rc.memory = cut_memory.allocator();
-        };
+        // Merge maps borrow source keys. A result cut allocates as the full merge does, uncharged: charged, it refused
+        // budgets the merge it stands in for answers (`FastPath`), and it never holds more than that merge.
+        const result_cut = resultCut(group_outputs.?, agg_calls, args.result_order, args.unordered);
         const out_tables: []expr_agg.GroupTable = if (use_blocks)
             (&merged_table)[0..1]
         else if (dense_merged) blk: {
@@ -3141,16 +3180,15 @@ fn prepareAggregate(
         const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
         // One table already holds complete ranks; its top-H heap avoids materializing every losing group.
         const cut: ?[]const u32 = if (candidates == null and out_tables.len == 1)
-            resultLimitGroups(
+            try resultLimitGroups(
                 arena,
                 &out_tables[0],
                 group_outputs.?,
                 agg_calls,
                 args.result_order,
                 args.unordered,
-                if (result_cut) |c| c.memory else null,
-            ) catch |e|
-                return if (cut_memory.denied.load(.monotonic)) error.ExceededMemoryBudget else e
+                null,
+            )
         else
             null;
         var total_group_refs: usize = 0;
@@ -3161,11 +3199,8 @@ fn prepareAggregate(
         } else for (out_tables) |gt| {
             total_group_refs += gt.groupCount();
         }
-        const merge_allocator = if (result_cut) |c| c.memory orelse gpa else gpa;
-        defer if (cut) |ids| if (result_cut != null and result_cut.?.memory != null) merge_allocator.free(ids);
-        const group_refs_buf = merge_allocator.alloc(MergeGroupRef, total_group_refs) catch |e|
-            return if (cut_memory.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
-        defer merge_allocator.free(group_refs_buf);
+        const group_refs_buf = try gpa.alloc(MergeGroupRef, total_group_refs);
+        defer gpa.free(group_refs_buf);
         var ref_i: usize = 0;
         for (out_tables, 0..) |gt, ti| {
             if (cut) |ids| {
@@ -3239,7 +3274,7 @@ fn prepareAggregate(
         // borrowed until the rows are built.
         if (spilled) {
             const ps = &part_state.?;
-            fillFromPartitions(
+            try fillFromPartitions(
                 gpa,
                 arena,
                 ps.parts,
@@ -3250,13 +3285,13 @@ fn prepareAggregate(
                 result_cut,
                 &slots,
                 &merged_accs,
-            ) catch |e| return if (cut_memory.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
+            );
             folded = true;
         } else if (folded) {
             if (candidates) |keys_kept| {
                 try mergeCandidates(gpa, arena, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
             } else {
-                mergeFoldedRefs(
+                try mergeFoldedRefs(
                     gpa,
                     arena,
                     out_tables,
@@ -3266,14 +3301,11 @@ fn prepareAggregate(
                     result_cut,
                     &slots,
                     &merged_accs,
-                ) catch |e|
-                    return if (cut_memory.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
+                );
             }
         } else {
             const gt = &out_tables[0];
-            const ma = if (result_cut) |c| c.memory orelse gpa else gpa;
-            slots.ensureTotalCapacity(ma, group_refs.len) catch |e|
-                return if (cut_memory.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
+            try slots.ensureTotalCapacity(gpa, group_refs.len);
             for (group_refs) |ref| {
                 slots.appendAssumeCapacity(.{
                     .key = gt.keyAt(ref.group),
@@ -3283,8 +3315,7 @@ fn prepareAggregate(
             }
         }
         if (folded) if (result_cut) |rc| {
-            if (rc.ranking_first) keepResultTop(gpa, agg_calls, rc, &slots, &merged_accs) catch |e|
-                return if (cut_memory.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
+            if (rc.ranking_first) try keepResultTop(gpa, agg_calls, rc, &slots, &merged_accs);
         };
         if (!args.unordered) try sortSlotsByFirst(gpa, slots.items, n_workers);
 
@@ -4273,10 +4304,8 @@ fn mergeResultCut(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    var scratch: CutScratch = .{
-        .parent = cut.memory orelse gpa,
-        .shared = if (cut.memory == null and tables.len > 0) tables[0].shared else null,
-    };
+    // Uncharged, as the full merge's maps are: see the result cut in `prepareAggregate`.
+    var scratch: CutScratch = .{ .parent = cut.memory orelse gpa, .shared = null };
     mergeResultCutInner(gpa, tables, refs, hashes, calls, cut, &scratch, slots, accs) catch |e|
         return if (scratch.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
 }
@@ -4771,7 +4800,7 @@ fn resultLimitGroups(
     var cut = resultCut(outputs, calls, order, unordered) orelse return null;
     if (!cut.ranking_first) return countLimitGroups(arena, table, outputs, calls, order);
     cut.memory = memory;
-    var scratch: CutScratch = .{ .parent = table.allocator, .shared = table.shared };
+    var scratch: CutScratch = .{ .parent = table.allocator, .shared = null };
     return rankLimitGroups(arena, table, calls, cut, &scratch) catch |e|
         return if (scratch.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
 }
@@ -10122,6 +10151,93 @@ test "runMultiAggregate: a budget the plain fold fits in holds every worker's pa
     }
 }
 
+const NoGate = struct {
+    var ctx: u8 = 0;
+    fn wait(_: *anyopaque, _: usize) anyerror!void {}
+    fn done(_: *anyopaque, _: usize, _: usize) void {}
+    const gate: RowGroupGate = .{ .ctx = &ctx, .wait = wait, .done = done };
+};
+
+/// The query's outcome at each budget, an error or the group count, for comparing fast paths with their fallback.
+fn outcomes(args: MultiAggArgs, budgets: []const usize, out: []anyerror!usize) void {
+    for (budgets, out) |budget, *o| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var a = args;
+        a.max_memory = budget;
+        o.* = if (runMultiAggregate(testing.allocator, arena_state.allocator(), a)) |res| blk: {
+            var r = res;
+            defer freeResult(r);
+            r.output.applyResultOrder(testing.allocator, args.result_order) catch |e| break :blk e;
+            break :blk r.output.group_rows.?.len;
+        } else |e| e;
+    }
+}
+
+fn expectSameOutcomes(want: []const (anyerror!usize), got: []const (anyerror!usize)) !void {
+    for (want, got) |w, g| {
+        if (w) |n| try testing.expectEqual(n, try g) else |e| try testing.expectError(e, g);
+    }
+}
+
+test "regression: string-key spill answers every budget the plain fold answers, gated inputs included" {
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const budgets = [_]usize{ 96 << 10, 192 << 10, 384 << 10, 768 << 10, 1536 << 10, 4 << 20 };
+    // A gate that never waits: with the mapped file beside it the input reads again, without it a spill is not armed.
+    const plain_in = [_]Input{.{ .name = path, .bytes = bytes }};
+    const gated_in = [_]Input{.{ .name = path, .bytes = bytes, .gate = NoGate.gate, .plan_bytes = bytes }};
+    const unmapped_in = [_]Input{.{ .name = path, .bytes = bytes, .gate = NoGate.gate }};
+    for ([_]usize{ 1, 3 }) |j| {
+        const base: MultiAggArgs = .{
+            .inputs = &plain_in,
+            .aggregate = "count(*) AS c, sum(t) AS st",
+            .group_by = "s",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .spill_groups = 64,
+        };
+        var want: [budgets.len]anyerror!usize = undefined;
+        var no_spill = base;
+        no_spill.spill = false;
+        outcomes(no_spill, &budgets, &want);
+        for ([_][]const Input{ &plain_in, &gated_in, &unmapped_in }) |inputs| {
+            var got: [budgets.len]anyerror!usize = undefined;
+            var a = base;
+            a.inputs = inputs;
+            outcomes(a, &budgets, &got);
+            try expectSameOutcomes(&want, &got);
+        }
+    }
+}
+
+test "regression: a ranking result cut answers every budget the uncut merge answers" {
+    const path = "ci/fixtures/parquet/census_topk.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const budgets = [_]usize{ 96 << 10, 192 << 10, 384 << 10, 768 << 10, 4 << 20 };
+    for ([_]usize{ 1, 3 }) |j| {
+        const uncut: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "sum(t) AS st, count(*) AS c",
+            .group_by = "s",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+        };
+        var cut = uncut;
+        cut.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+        var want: [budgets.len]anyerror!usize = undefined;
+        var got: [budgets.len]anyerror!usize = undefined;
+        outcomes(uncut, &budgets, &want);
+        outcomes(cut, &budgets, &got);
+        for (want, got) |w, g| {
+            if (w) |_| try testing.expectEqual(@as(usize, 10), try g) else |e| try testing.expectError(e, g);
+        }
+    }
+}
+
 test "runMultiAggregate: grouped count(DISTINCT) through pairs answers as through sets" {
     const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -10253,22 +10369,41 @@ test "runMultiAggregate: a pilot short of rows a group judges again at twice the
     };
 }
 
-test "runMultiAggregate: count(DISTINCT) pairs fail cleanly when the budget cannot hold them" {
+test "regression: count(DISTINCT) pairs answer every budget the set path answers, as the set path does" {
     const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
     const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    try testing.expectError(error.ExceededMemoryBudget, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
-        .inputs = &inputs,
-        .aggregate = "count(DISTINCT u) AS d",
-        .group_by = "t",
-        .parallelism = 3,
-        .min_bytes_per_worker = 1,
-        .max_memory = 64 * 1024,
-        .distinct_pairs = .on,
-    }));
+    var answered: usize = 0;
+    for ([_]usize{ 64 << 10, 256 << 10, 1 << 20, 512 << 20 }) |budget| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var results: [2]?MultiAggResult = .{ null, null };
+        defer for (results) |r| if (r) |res| freeResult(res);
+        var errs: [2]?anyerror = .{ null, null };
+        for ([_]@FieldType(MultiAggArgs, "distinct_pairs"){ .off, .on }, 0..) |pairs, i| {
+            results[i] = runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .aggregate = "count(DISTINCT u) AS d",
+                .group_by = "t",
+                .parallelism = 3,
+                .min_bytes_per_worker = 1,
+                .max_memory = budget,
+                .distinct_pairs = pairs,
+            }) catch |e| blk: {
+                errs[i] = e;
+                break :blk null;
+            };
+        }
+        // Pairs refused budgets the set path answers: the refusal now runs the set path.
+        try testing.expectEqual(errs[0], errs[1]);
+        const off = results[0] orelse continue;
+        answered += 1;
+        const rows = off.output.group_rows.?;
+        try testing.expectEqual(rows.len, results[1].?.output.group_rows.?.len);
+        for (rows, results[1].?.output.group_rows.?) |r, p_row| for (r, p_row) |x, y| try expectSameAggValue(x, y);
+    }
+    try testing.expect(answered > 0);
 }
 
 test "count-only: charged bytes equals keys and filter estimate alone" {
@@ -10746,7 +10881,7 @@ test "result cut SUM: scan and shared partitions match full ordered answers at j
     };
 }
 
-test "result cut SUM: scratch budget admits actual capacity and releases on refusal" {
+test "result cut SUM: the merge's scratch is uncharged, as the full merge's is" {
     const calls = [_]expr_agg.AggCall{.{ .func = .sum, .arg = null, .where = null, .alias = "s", .result = .i64 }};
     var table = expr_agg.GroupTable.init(testing.allocator, 1 << 20);
     defer table.deinit();
@@ -10759,7 +10894,8 @@ test "result cut SUM: scratch budget admits actual capacity and releases on refu
     defer slots.deinit(testing.allocator);
     var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
     defer accs.deinit(testing.allocator);
-    try testing.expectError(error.ExceededMemoryBudget, hashMergeGroupRefs(
+    // A budget the full merge ignores no longer refuses the cut that stands in for it.
+    try hashMergeGroupRefs(
         testing.allocator,
         (&table)[0..1],
         &.{.{ .table = 0, .group = id }},
@@ -10768,7 +10904,8 @@ test "result cut SUM: scratch budget admits actual capacity and releases on refu
         .{ .a_idx = 0, .k = 1, .ranking_first = true },
         &slots,
         &accs,
-    ));
+    );
+    try testing.expectEqual(@as(usize, 1), slots.items.len);
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
@@ -10797,7 +10934,7 @@ test "result cut SUM: planner reports every explicit fallback" {
     try testing.expect(resultCut(&outputs, &calls, .{ .keys = order.keys }, false) == null);
 }
 
-test "result cut SUM: one-table and retained winner capacities share and return the budget" {
+test "result cut SUM: the one-table cut holds no charge; retained winner capacities share and return the budget" {
     const calls = [_]expr_agg.AggCall{.{ .func = .sum, .arg = null, .where = null, .alias = "s", .result = .i64 }};
     const outputs = [_]BoundOutputColumn{.{ .source = .{ .agg = 0 }, .name = "s" }};
     var table = expr_agg.GroupTable.init(testing.allocator, 1 << 20);
@@ -10812,7 +10949,8 @@ test "result cut SUM: one-table and retained winner capacities share and return 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 1 };
-    try testing.expectError(error.ExceededMemoryBudget, resultLimitGroups(
+    // The full merge it stands in for answers whatever the budget, so the cut does too (it refused before).
+    const top = (try resultLimitGroups(
         arena_state.allocator(),
         &table,
         &outputs,
@@ -10820,7 +10958,8 @@ test "result cut SUM: one-table and retained winner capacities share and return 
         order,
         false,
         null,
-    ));
+    )).?;
+    try testing.expectEqualSlices(u32, &.{1}, top);
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     budget.limit = 1 << 20;
     var memory: CutScratch = .{ .parent = testing.allocator, .shared = &budget };

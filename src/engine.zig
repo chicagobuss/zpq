@@ -677,7 +677,13 @@ fn executeAggregate(
         arena,
         opened,
         local_plan.?,
-        .{ .mode = io_mode, .threads = io_policy.threads, .window = io_policy.window },
+        // The reader's buffers count against the budget as the S3 fetch window does: a fixed 1 GiB held reads far
+        // past --max-memory (and N GiB under N libzpq queries).
+        .{
+            .mode = io_mode,
+            .threads = io_policy.threads,
+            .window = io_policy.window orelse s3_window.windowFor(args.max_memory),
+        },
         &reader,
     );
     const t_reader = nowMonoNs();

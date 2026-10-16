@@ -43,7 +43,8 @@ pub const Config = struct {
 /// default) the backend this host and these files suit.
 pub const Policy = struct {
     profile: Profile = .auto,
-    window: u64 = 1 << 30,
+    /// `ZPQ_IO_WINDOW_MIB`; null sizes the window from the query's budget (`windowFor`).
+    window: ?u64 = null,
     threads: usize = 8,
 
     pub const Profile = enum { auto, mmap, pread, uring };

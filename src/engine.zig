@@ -7780,15 +7780,30 @@ test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for 
     );
 }
 
-test "regression: a V2 page whose levels disagree with its null count is refused, not read as extra NULLs" {
-    const path = "ci/fixtures/parquet/v2_def_run_corrupt.parquet";
+test "regression: a V2 page whose levels disagree with its null count is refused" {
+    const path = "ci/fixtures/parquet/v2_num_nulls_lies.parquet";
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
     const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
-    // One byte of `i64`'s def stream became a bit-packed run longer than the stream: 42 of 271 values read as NULL.
+    // `i64`'s first page header says 8 nulls; its levels hold 9.
     for ([_]bool{ false, true }) |fast| try std.testing.expectError(
         error.DefLevelsMismatch,
         runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(i64) AS n", .fast_levels = fast }),
     );
+}
+
+test "regression: a def-level run claiming bytes past its stream is refused, not read as extra NULLs" {
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
+    // One byte of `i64`'s def stream made a bit-packed run longer than the stream, in a V2 page (42 of 271 values
+    // read as NULL) and a V1 one (7), which has no null count to check.
+    for ([_][]const u8{ "v2_def_run_corrupt", "v1_def_run_corrupt" }) |name| {
+        var buf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "ci/fixtures/parquet/{s}.parquet", .{name});
+        std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+        for ([_]bool{ false, true }) |fast| try std.testing.expectError(
+            error.UnexpectedPage,
+            runQuery(ctx, .{ .inputs = &.{path}, .aggregate = "count(i64) AS n", .fast_levels = fast }),
+        );
+    }
 }
 
 test "regression: a DELTA_BYTE_ARRAY value of another length than its FIXED_LEN_BYTE_ARRAY column is refused" {

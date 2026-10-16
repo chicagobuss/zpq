@@ -341,6 +341,10 @@ pub fn decodeLevels(bytes: []const u8, max_level: u32, out: []u32) LevelError!vo
     var dec = HybridRleDecoder.init(bytes, width);
     const got = dec.decode(out) catch return error.CorruptLevels;
     if (got != out.len) return error.LevelCountMismatch;
+    // A level stream is exactly its runs, every bit-packed group of them written whole. A run claiming groups past the
+    // stream's end is a corrupt header, and the levels read from its start are the next bytes, not levels; a V1 page
+    // has no null count to catch it by.
+    if (!dec.in_rle and (dec.remaining_in_run / 8) *| width > bytes.len - dec.pos) return error.CorruptLevels;
     if (!levelsWithin(out, max_level)) return error.LevelOutOfRange;
 }
 
@@ -769,6 +773,18 @@ test "single RLE run of length 5, bit_width=4" {
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, 5), n);
     for (out[0..5]) |v| try testing.expectEqual(@as(u32, 7), v);
+}
+
+test "regression: a level run claiming bit-packed groups past its stream is refused, not read short" {
+    var out: [16]u32 = undefined;
+    // Two groups at width 1, as a writer writes them, then one byte flipped to claim 127.
+    const whole = [_]u8{ (2 << 1) | 1, 0b1011_0110, 0b0000_0001 };
+    try decodeLevels(&whole, 1, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0 }, &out);
+    const claims = [_]u8{ 0xff, 0x01, 0b1011_0110, 0b0000_0001 };
+    try std.testing.expectError(error.CorruptLevels, decodeLevels(&claims, 1, &out));
+    // Fewer levels than the run holds, all of it written: still a whole stream.
+    try decodeLevels(&whole, 1, out[0..13]);
 }
 
 test "regression: an RLE run value wider than the bit width is refused, not masked" {

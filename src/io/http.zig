@@ -203,15 +203,17 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
     var chunked: bool = false;
     var status: ?u16 = null;
     var first_byte_ns: i64 = 0;
+    var received: usize = 0;
 
     while (true) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try recvResponseBytes(conn, &tmp, stream.items.len);
+        const n = try recvResponseBytes(conn, &tmp, received);
         if (n == 0) break;
+        received += n;
         if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
         try stream.appendSlice(arena, tmp[0..n]);
         if (headers_end == null) {
-            if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
+            if (try finalHeadEnd(&stream)) |i| {
                 if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
                 headers_end = i;
                 status = try parseStatus(stream.items[0..i]);
@@ -272,6 +274,22 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
     return .{ .status = final_status, .headers = headers, .body = body, .first_byte_ns = first_byte_ns };
 }
 
+/// Where the final response's head ends in `stream` (the index of its blank line), once it has arrived. Interim 1xx
+/// responses before it (`100 Continue`, `103 Early Hints`; RFC 9110 §15.2) are dropped from `stream` as they come:
+/// taken as the answer, one failed the request, and the real response left unread on a pooled connection was read as
+/// the next request's. 101 is final: zpq never asks to switch protocols, so it fails the request as any status does.
+fn finalHeadEnd(stream: *std.ArrayList(u8)) Error!?usize {
+    while (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
+        if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
+        const status = try parseStatus(stream.items[0..i]);
+        if (status < 100 or status > 199 or status == 101) return i;
+        const rest = stream.items.len - (i + 4);
+        std.mem.copyForwards(u8, stream.items[0..rest], stream.items[i + 4 ..]);
+        stream.shrinkRetainingCapacity(rest);
+    }
+    return null;
+}
+
 /// Per RFC 7230 §3.3.3, these status codes MUST NOT carry a message
 /// body. The drain loop must short-circuit on them rather than wait
 /// for body bytes that will never arrive.
@@ -289,13 +307,15 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     var headers_end: ?usize = null;
     var first_byte_ns: i64 = 0;
     var noted = false;
+    var received: usize = 0;
     while (headers_end == null) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try recvResponseBytes(conn, &tmp, stream.items.len);
+        const n = try recvResponseBytes(conn, &tmp, received);
         if (n == 0) return error.BodyTruncated;
+        received += n;
         if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
         try stream.appendSlice(arena, tmp[0..n]);
-        if (std.mem.indexOf(u8, stream.items, "\r\n\r\n")) |i| {
+        if (try finalHeadEnd(&stream)) |i| {
             if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
             headers_end = i;
             if (!noted) {
@@ -321,7 +341,7 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
 
     while (written < content_length) {
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try recvResponseBytes(conn, &tmp, he + 4 + written);
+        const n = try recvResponseBytes(conn, &tmp, received + written);
         if (n == 0) return error.BodyTruncated;
         const take = @min(n, content_length - written);
         @memcpy(target[written..][0..take], tmp[0..take]);
@@ -656,6 +676,31 @@ test "a HEAD response ends at its headers whatever Content-Length says" {
     try testing.expectEqual(@as(u16, 200), r.status);
     try testing.expectEqualStrings("\"abc-2\"", r.header("etag").?);
     try testing.expectEqual(@as(usize, 0), r.body.len);
+}
+
+test "regression: interim 1xx responses are passed over to the final one, which leaves nothing unread" {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = std.posix.system.close(fds[1]);
+    var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+    defer conn.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const interim = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>; rel=preload\r\n\r\n";
+    const req: Request = .{ .method = .GET, .host = "h", .path = "/k", .headers = &.{} };
+    const first = interim ++ "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\n\r\nabc";
+    _ = std.posix.system.write(fds[1], first.ptr, first.len);
+    const r = try sendRequest(arena.allocator(), &conn, req);
+    try testing.expectEqual(@as(u16, 206), r.status);
+    try testing.expectEqualStrings("abc", r.body);
+    // The same over the into-a-buffer path; and the connection holds the next response, not this one's tail.
+    const second = interim ++ "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nwxyz";
+    _ = std.posix.system.write(fds[1], second.ptr, second.len);
+    var target: [4]u8 = undefined;
+    const into = try sendRequestInto(arena.allocator(), &conn, req, &target, null);
+    try testing.expectEqual(@as(u16, 206), into.status);
+    try testing.expectEqualStrings("wxyz", into.body);
 }
 
 const test_server = @import("tls_test_server.zig");

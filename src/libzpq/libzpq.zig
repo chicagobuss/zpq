@@ -26,6 +26,53 @@ pub const Status = enum(c_int) {
     einternal = -4,
 };
 
+/// Every `std.Io.Threaded` installs do-nothing SIGIO and SIGPIPE handlers at init and restores what it found at
+/// deinit, so contexts whose lives overlap undid each other: closing one put back the host's default SIGPIPE under
+/// another still running. The process holds one count instead: the first open keeps the dispositions the host had,
+/// the last close restores them, unless the host installed its own meanwhile. zpq's own sockets never raise SIGPIPE
+/// whatever the disposition (`tls.sendNoSignal`).
+const signals = struct {
+    const posix = std.posix;
+    const Saved = if (posix.Sigaction == void) void else posix.Sigaction;
+    var lock: c.pthread_mutex_t = .{};
+    var count: usize = 0;
+    var host_io: Saved = undefined;
+    var host_pipe: Saved = undefined;
+    var ours: Saved = undefined;
+
+    fn adopt(t: std.Io.Threaded) std.Io.Threaded {
+        var out = t;
+        if (Saved == void or !out.have_signal_handler) return out;
+        _ = c.pthread_mutex_lock(&lock);
+        defer _ = c.pthread_mutex_unlock(&lock);
+        if (count == 0) {
+            if (@TypeOf(out.old_sig_io) != void) host_io = out.old_sig_io;
+            if (@TypeOf(out.old_sig_pipe) != void) host_pipe = out.old_sig_pipe;
+            posix.sigaction(.PIPE, null, &ours);
+        }
+        count += 1;
+        out.have_signal_handler = false;
+        return out;
+    }
+
+    fn release() void {
+        if (Saved == void) return;
+        _ = c.pthread_mutex_lock(&lock);
+        defer _ = c.pthread_mutex_unlock(&lock);
+        if (count == 0) return;
+        count -= 1;
+        if (count != 0) return;
+        if (@TypeOf(std.Io.Threaded.init_single_threaded.old_sig_io) != void) restore(.IO, &host_io);
+        if (@TypeOf(std.Io.Threaded.init_single_threaded.old_sig_pipe) != void) restore(.PIPE, &host_pipe);
+    }
+
+    fn restore(sig: posix.SIG, host: *const posix.Sigaction) void {
+        var cur: posix.Sigaction = undefined;
+        posix.sigaction(sig, null, &cur);
+        if (cur.handler.handler == ours.handler.handler) posix.sigaction(sig, host, null);
+    }
+};
+
 pub const Ctx = struct {
     threaded: std.Io.Threaded,
     pool: service.PersistentPool,
@@ -135,7 +182,7 @@ export fn zpq_open(options_json: ?[*:0]const u8, out_ctx: ?*?*Ctx, out_error: ?*
     const ceiling = opts.ceiling orelse zpq.core.system.discoverAvailableMemory(env);
     const ctx = gpa.create(Ctx) catch return fail(out_error, .enomem, "OutOfMemory");
     ctx.* = .{
-        .threaded = std.Io.Threaded.init(gpa, .{}),
+        .threaded = signals.adopt(std.Io.Threaded.init(gpa, .{})),
         .pool = .sized(ceiling),
         .budget = .init(ceiling),
         .budget_wait_ms = opts.budget_wait_ms,
@@ -147,6 +194,7 @@ export fn zpq_open(options_json: ?[*:0]const u8, out_ctx: ?*?*Ctx, out_error: ?*
     // Ready before any call: every query, the first ones included, gets the footer cache.
     ctx.pool.warm(gpa) catch |err| {
         ctx.threaded.deinit();
+        signals.release();
         gpa.destroy(ctx);
         const status: Status = if (err == error.OutOfMemory) .enomem else .einternal;
         return fail(out_error, status, @errorName(err));
@@ -223,6 +271,7 @@ export fn zpq_close(ctx: ?*Ctx) void {
     _ = c.pthread_mutex_unlock(&self.lock);
     self.pool.deinit();
     self.threaded.deinit();
+    signals.release();
     gpa.destroy(self);
 }
 
@@ -406,3 +455,41 @@ test "a context opens and answers after the host clears its environment" {
     defer zpq_free(out);
     try testing.expect(std.mem.startsWith(u8, std.mem.span(out.?), "{\"error\""));
 }
+
+test "regression: contexts that overlap leave SIGPIPE as the host had it, and keep a handler it installs" {
+    const posix = std.posix;
+    if (posix.Sigaction == void) return error.SkipZigTest;
+    var host: posix.Sigaction = undefined;
+    posix.sigaction(.PIPE, null, &host);
+    defer posix.sigaction(.PIPE, &host, null);
+    const dfl: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.PIPE, &dfl, null);
+    var a: ?*Ctx = null;
+    var b: ?*Ctx = null;
+    try testing.expectEqual(@as(c_int, 0), zpq_open(null, &a, null));
+    try testing.expectEqual(@as(c_int, 0), zpq_open(null, &b, null));
+    zpq_close(a);
+    // B still runs: closing A restored nothing (it reset SIGPIPE to the default, which a peer reset then killed on).
+    var cur: posix.Sigaction = undefined;
+    posix.sigaction(.PIPE, null, &cur);
+    try testing.expect(cur.handler.handler != posix.SIG.DFL);
+    zpq_close(b);
+    posix.sigaction(.PIPE, null, &cur);
+    try testing.expect(cur.handler.handler == posix.SIG.DFL);
+
+    // A handler the host installs while a context is open stays after the last close.
+    const Host = struct {
+        fn on(_: posix.SIG) callconv(.c) void {}
+    };
+    const mine: posix.Sigaction = .{ .handler = .{ .handler = Host.on }, .mask = posix.sigemptyset(), .flags = 0 };
+    try testing.expectEqual(@as(c_int, 0), zpq_open(null, &a, null));
+    posix.sigaction(.PIPE, &mine, null);
+    zpq_close(a);
+    posix.sigaction(.PIPE, null, &cur);
+    try testing.expect(cur.handler.handler == mine.handler.handler);
+}
+

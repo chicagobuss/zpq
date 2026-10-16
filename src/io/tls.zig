@@ -447,6 +447,16 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     return last;
 }
 
+const send_flags: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+
+/// One write to a socket that cannot raise SIGPIPE: MSG_NOSIGNAL, or SO_NOSIGPIPE set at `openTcp` where there is no
+/// such flag. A peer that reset the connection is `SendFailed`, whatever SIGPIPE disposition the process has: a
+/// libzpq host keeps its own, and one context closing (`std.Io.Threaded` restores the disposition it saved) cannot
+/// leave another's writes to kill the host.
+fn sendNoSignal(fd: posix.fd_t, buf: []const u8) @TypeOf(posix.system.sendto(fd, buf.ptr, buf.len, 0, null, 0)) {
+    return posix.system.sendto(fd, buf.ptr, buf.len, send_flags, null, 0);
+}
+
 /// A connected TCP socket to `ip:port`, in blocking mode, or `error.ConnectTimeout` when the connection is not
 /// established within `timeout_ms`. The connect itself runs non-blocking under `poll`, which bounds it the same way
 /// on Linux and Darwin (Darwin's connect ignores SO_SNDTIMEO). `clock_ms`, when set, is the deadline clock: the
@@ -459,6 +469,11 @@ fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, de
     const fd: posix.fd_t = @intCast(r);
     errdefer closeFd(fd);
     if (builtin.os.tag != .linux) _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    // Darwin has no MSG_NOSIGNAL: the socket itself is told not to raise SIGPIPE (see `sendNoSignal`).
+    if (@hasDecl(posix.SO, "NOSIGPIPE")) {
+        const one: c_int = 1;
+        _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    }
 
     // `posix.sockaddr.in` carries Darwin's leading `len` byte and defaults `family`.
     const addr: posix.sockaddr.in = .{
@@ -676,7 +691,7 @@ fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: 
                 else => return error.SendFailed,
             }
             if (pr == 0) continue;
-            const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
+            const r = sendNoSignal(fd, buf[off..]);
             switch (posix.errno(r)) {
                 .SUCCESS => {},
                 .INTR, .AGAIN => continue,
@@ -694,7 +709,7 @@ fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: 
     while (off < buf.len) {
         const left = msLeft(deadline, null) orelse return error.WouldBlock;
         if (!armSockTimeout(fd, posix.SO.SNDTIMEO, left, &opts.snd_ms)) return error.SendFailed;
-        const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
+        const r = sendNoSignal(fd, buf[off..]);
         switch (posix.errno(r)) {
             .SUCCESS => {},
             .INTR => continue,

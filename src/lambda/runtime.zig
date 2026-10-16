@@ -40,8 +40,14 @@ pub const Error = error{
     BadChunkedBody,
     /// The response exceeds `MAX_RESPONSE_BYTES`.
     ResponseTooLarge,
+    /// The runtime API answered a post with a status other than 2xx: a response past its limit (413), or one for an
+    /// invocation it no longer holds.
+    PostRefused,
     OutOfMemory,
 };
+
+/// The most the runtime API takes as a response body: Lambda's 6 MB limit, in the bytes its refusals name.
+pub const MAX_POST_BYTES: usize = 6_291_556;
 
 /// Ceiling on a next-invocation response. Lambda caps a synchronous event at 6 MB; the margin covers headers and a
 /// raised limit while keeping a runaway response from taking the sandbox's memory.
@@ -159,9 +165,13 @@ pub const Client = struct {
         defer self.allocator.free(req);
         try writeAll(sock, req);
 
-        // Drain the response so the kernel queues it before we close.
-        var drain: [1024]u8 = undefined;
-        _ = linux.read(sock, &drain, drain.len);
+        // Its answer says whether the post was taken; a refused one leaves the invocation open for an /error.
+        var answer: [1024]u8 = undefined;
+        const r = linux.read(sock, &answer, answer.len);
+        if (isErr(r)) return;
+        const got = answer[0..r];
+        if (got.len < 12 or !std.mem.startsWith(u8, got, "HTTP/1.")) return;
+        if (got[9] != '2') return error.PostRefused;
     }
 
     fn connect(self: *const Client) Error!linux.fd_t {
@@ -424,6 +434,28 @@ const FakeRuntimeApi = struct {
         writeAll(conn, self.response) catch {};
     }
 };
+
+test "regression: a response the runtime API refuses is an error, not taken as posted" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "HTTP/1.1 202 Accepted\r\nContent-Length: 16\r\n\r\n{\"status\":\"OK\"}",
+        "HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\n\r\n",
+    }, [_]bool{ true, false }) |answer, taken| {
+        var api = try FakeRuntimeApi.start(answer);
+        defer close(api.fd);
+        const server = try std.Thread.spawn(.{}, FakeRuntimeApi.serveOne, .{&api});
+        defer {
+            _ = linux.shutdown(api.fd, linux.SHUT.RDWR);
+            server.join();
+        }
+        var buf: [32]u8 = undefined;
+        var c = try Client.fromHostPort(a, try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{api.port}));
+        defer c.deinit();
+        const posted = c.postResponse("req-1", "{\"ok\":true}");
+        if (taken) try posted else try std.testing.expectError(error.PostRefused, posted);
+    }
+}
 
 test "nextInvocation reads a large event the runtime API sends chunked" {
     // The client makes Linux syscalls directly, as Lambda runs only on Linux.

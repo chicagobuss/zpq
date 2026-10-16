@@ -95,10 +95,26 @@ pub fn main(init: std.process.Init) !void {
         };
         defer allocator.free(response);
 
+        // Past the runtime API's limit the caller got AWS's generic payload error and no reason: say why, and how to
+        // get the answer instead. One the runtime refuses, or drops while it is sent, is reported the same way.
+        if (response.len > runtime.MAX_POST_BYTES) {
+            var buf: [256]u8 = undefined;
+            const why = std.fmt.bufPrint(&buf, "the response is {d} bytes, past the {d} a Lambda response may be: " ++
+                "write the answer to output_url", .{ response.len, runtime.MAX_POST_BYTES }) catch "ResultTooLarge";
+            postFailure(&client, inv.request_id, "ResultTooLarge", why);
+            continue;
+        }
         client.postResponse(inv.request_id, response) catch |err| {
             std.debug.print("zpq lambda: postResponse failed: {s}\n", .{@errorName(err)});
+            postFailure(&client, inv.request_id, "ResponseNotPosted", @errorName(err));
         };
     }
+}
+
+fn postFailure(client: *runtime.Client, request_id: []const u8, error_type: []const u8, message: []const u8) void {
+    client.postError(request_id, error_type, message) catch |err| {
+        std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(err)});
+    };
 }
 
 /// Requests that neither aggregate nor write: the single-file int8 diagnostics, over S3 or (a raw parquet body, for the

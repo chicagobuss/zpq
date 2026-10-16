@@ -131,16 +131,22 @@ pub const DecodeOptions = struct {
     int_range: ?IntRange = null,
 };
 
-/// `o` for the chunk `cm` describes: its pages inflate to at most twice what the footer says the chunk holds, plus
-/// slack for writers that count loosely.
+/// `o` for the chunk `cm` describes: its pages bounded by `inflateLimit`, and its values by an INT32 column's narrow
+/// integer type (`IntRange`).
 pub fn chunkOptions(o: DecodeOptions, meta: *const schema.FileMetaData, cm: schema.ColumnMetaData) DecodeOptions {
     var x = o;
-    const total = std.math.cast(usize, cm.total_uncompressed_size) orelse std.math.maxInt(usize);
-    x.page_bytes_limit = @min(o.page_bytes_limit, total *| 2 +| (1 << 20));
+    x.page_bytes_limit = @min(o.page_bytes_limit, inflateLimit(cm));
     if (cm.type == .INT32) if (meta.getColumnSchema(cm.path_in_schema.items)) |se| {
         x.int_range = IntRange.of(se);
     };
     return x;
+}
+
+/// The most the pages of chunk `cm` may inflate to: twice what the footer says it holds, plus slack for writers that
+/// count loosely.
+pub fn inflateLimit(cm: schema.ColumnMetaData) usize {
+    const total = std.math.cast(usize, cm.total_uncompressed_size) orelse std.math.maxInt(usize);
+    return total *| 2 +| (1 << 20);
 }
 
 /// The values an INT32 column's 8- or 16-bit integer annotation (INT_8/16, UINT_8/16, or the INTEGER logical type)

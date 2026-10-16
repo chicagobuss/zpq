@@ -7936,6 +7936,28 @@ test "regression: a FIXED_LEN_BYTE_ARRAY of length 0 is malformed, not a column 
     );
 }
 
+test "regression: a write recompressing a page past its chunk refuses it, as a read does" {
+    const path = "ci/fixtures/parquet/page_bomb.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    // Its one page claims 1 GiB in a chunk the footer gives 32 KiB: the byte copy decompressed it whole to recompress
+    // it, at any budget, serially or a page per worker.
+    for ([_]schema.CompressionCodec{ .SNAPPY, .UNCOMPRESSED }) |codec| for ([_]usize{ 1, 3 }) |j| {
+        try std.testing.expectError(error.PageLargerThanChunk, runQuery(ctx, .{
+            .inputs = &.{path},
+            .output = out,
+            .codec = codec,
+            .parallelism = j,
+            .max_memory = 16 << 20,
+        }));
+    };
+}
+
 test "regression: a page inflating past its chunk, or values expanding past the budget, are refused" {
     const dir = "ci/fixtures/parquet/";
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "page_bomb.parquet", .{}) catch return error.SkipZigTest;

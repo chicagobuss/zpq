@@ -117,7 +117,9 @@ pub fn writeAll(fd: fd_t, bytes: []const u8) error{ WriteFailed, BrokenPipe, NoS
 /// Read a whole file into an `allocator`-owned buffer. A missing file is `error.FileNotFound`, which fixture-reading
 /// tests turn into a skip.
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = try openRead(path);
+    // Without blocking, as `mapFile` opens: a FIFO waited for a writer forever (`zpq schema`, `zpq conform`), and
+    // `fileSize` refuses it. A regular file's reads ignore the flag.
+    const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
     defer close(fd);
     const size = try fileSize(fd);
     const buf = try allocator.alloc(u8, size);
@@ -587,7 +589,7 @@ test "regression: the SIGBUS handler is in place only while a mapping is, and yi
     posix.sigaction(.BUS, &before, null);
 }
 
-test "regression: mapFile refuses a directory and a FIFO instead of misreporting or blocking" {
+test "regression: mapFile and readFile refuse a directory and a FIFO instead of misreporting or blocking" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -600,6 +602,8 @@ test "regression: mapFile refuses a directory and a FIFO instead of misreporting
     const made = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
     try testing.expectError(error.NotAFile, mapFile(fifo));
+    try testing.expectError(error.NotAFile, readFile(testing.allocator, fifo));
+    try testing.expectError(error.NotAFile, readFile(testing.allocator, dir));
 }
 
 test "writeAll distinguishes a full device from a broken pipe" {

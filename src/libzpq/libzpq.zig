@@ -85,6 +85,7 @@ pub const Ctx = struct {
     cond: c.pthread_cond_t = .{},
     /// `zpq_run` calls between their admission and their return.
     inflight: usize = 0,
+    runners: Runners = .{},
     /// Set by `zpq_shutdown` (and so by `zpq_close`): new calls are refused with ZPQ_ECLOSED.
     closing: bool = false,
     /// Reserved for the ETag-validated object cache (F5). It will charge its bytes to `budget` as evictable,
@@ -224,9 +225,9 @@ export fn zpq_run(
     defer self.leave();
 
     var call: Call = .{ .ctx = self, .body = body };
-    const thread = zpq.core.spawn.spawn(.{ .stack_size = request_stack_size }, Call.run, .{&call}) catch
-        return fail(out_json, .einternal, "ThreadSpawnFailed");
-    thread.join();
+    if (stackLeft() >= inline_stack) call.run() else {
+        self.runners.run(&call) catch return fail(out_json, .einternal, "ThreadSpawnFailed");
+    }
     const response = call.result catch |err|
         return switch (err) {
             error.OutOfMemory => @backingInt(Status.enomem),
@@ -246,15 +247,115 @@ export fn zpq_run(
 /// `ExpressionTooDeep`) are sized against. Reserved, not committed, so an idle page costs nothing.
 const request_stack_size = 8 << 20;
 
+/// Stack a caller's thread must have left for a request to run on it: well past what the depth caps let a request
+/// reach (a filter nested to its cap takes about 256 KiB). A thread with less hands the request to `Runners`.
+const inline_stack = 4 << 20;
+
+/// The lowest address of this thread's stack, found once per thread (glibc reads /proc/self/maps for the main one);
+/// 0 where the platform does not say, which sends every request to `Runners`.
+threadlocal var stack_low: usize = 0;
+threadlocal var stack_known = false;
+
+extern "c" fn pthread_getattr_np(thread: c.pthread_t, attr: *c.pthread_attr_t) c_int;
+extern "c" fn pthread_attr_getstack(attr: *const c.pthread_attr_t, addr: *?*anyopaque, size: *usize) c_int;
+extern "c" fn pthread_attr_destroy(attr: *c.pthread_attr_t) c_int;
+
+/// Bytes of stack left below the caller's frame.
+fn stackLeft() usize {
+    if (@import("builtin").os.tag != .linux) return 0;
+    if (!stack_known) {
+        stack_known = true;
+        var attr: c.pthread_attr_t = undefined;
+        if (pthread_getattr_np(c.pthread_self(), &attr) == 0) {
+            defer _ = pthread_attr_destroy(&attr);
+            var addr: ?*anyopaque = null;
+            var size: usize = 0;
+            if (pthread_attr_getstack(&attr, &addr, &size) == 0) stack_low = @intFromPtr(addr);
+        }
+    }
+    if (stack_low == 0) return 0;
+    return @frameAddress() -| stack_low;
+}
+
 /// One request, run on a thread of zpq's own rather than the caller's: a host thread's stack can be far smaller (musl
 /// gives 128 KiB, a JVM 512 KiB), and a filter nested within the depth cap overflowed it and killed the process.
 const Call = struct {
     ctx: *Ctx,
     body: []const u8,
     result: @typeInfo(@TypeOf(service.handle)).@"fn".return_type.? = undefined,
+    next: ?*Call = null,
+    finished: bool = false,
 
     fn run(call: *Call) void {
         call.result = service.handle(call.ctx.threaded.io(), gpa, processEnviron(), call.body, &call.ctx.pool, null);
+    }
+};
+
+/// A context's request threads, kept between calls: spawning one per call cost more than a cached count(*) does. A
+/// call goes to an idle thread, or a new one when none is; concurrent calls run concurrently, as on the callers'
+/// threads they did. The threads end at `zpq_close`, after every call has returned.
+const Runners = struct {
+    lock: c.pthread_mutex_t = .{},
+    /// A call is queued, or the context is closing.
+    work: c.pthread_cond_t = .{},
+    /// A call finished.
+    done: c.pthread_cond_t = .{},
+    queue: ?*Call = null,
+    /// Threads waiting for work, and how many of them have been signalled one call each.
+    idle: usize = 0,
+    signalled: usize = 0,
+    threads: std.ArrayList(std.Thread) = .empty,
+    closing: bool = false,
+
+    fn run(self: *Runners, call: *Call) error{ThreadSpawnFailed}!void {
+        _ = c.pthread_mutex_lock(&self.lock);
+        defer _ = c.pthread_mutex_unlock(&self.lock);
+        call.next = self.queue;
+        self.queue = call;
+        if (self.idle > self.signalled) {
+            self.signalled += 1;
+            _ = c.pthread_cond_signal(&self.work);
+        } else spawn: {
+            self.threads.ensureUnusedCapacity(gpa, 1) catch break :spawn;
+            const t = zpq.core.spawn.spawn(.{ .stack_size = request_stack_size }, loop, .{self}) catch break :spawn;
+            self.threads.appendAssumeCapacity(t);
+        }
+        // Without a thread to take it, a call is withdrawn rather than left to wait for one.
+        if (self.threads.items.len == 0) {
+            self.queue = call.next;
+            return error.ThreadSpawnFailed;
+        }
+        while (!call.finished) _ = c.pthread_cond_wait(&self.done, &self.lock);
+    }
+
+    fn loop(self: *Runners) void {
+        _ = c.pthread_mutex_lock(&self.lock);
+        defer _ = c.pthread_mutex_unlock(&self.lock);
+        while (true) {
+            while (self.queue == null and !self.closing) {
+                self.idle += 1;
+                _ = c.pthread_cond_wait(&self.work, &self.lock);
+                self.idle -= 1;
+                if (self.signalled > 0) self.signalled -= 1;
+            }
+            const call = self.queue orelse return;
+            self.queue = call.next;
+            _ = c.pthread_mutex_unlock(&self.lock);
+            call.run();
+            _ = c.pthread_mutex_lock(&self.lock);
+            call.finished = true;
+            _ = c.pthread_cond_broadcast(&self.done);
+        }
+    }
+
+    /// Ends every thread; no call may be running or start.
+    fn stop(self: *Runners) void {
+        _ = c.pthread_mutex_lock(&self.lock);
+        self.closing = true;
+        _ = c.pthread_cond_broadcast(&self.work);
+        _ = c.pthread_mutex_unlock(&self.lock);
+        for (self.threads.items) |t| t.join();
+        self.threads.deinit(gpa);
     }
 };
 
@@ -289,6 +390,7 @@ export fn zpq_close(ctx: ?*Ctx) void {
     _ = c.pthread_mutex_lock(&self.lock);
     while (self.inflight > 0) _ = c.pthread_cond_wait(&self.cond, &self.lock);
     _ = c.pthread_mutex_unlock(&self.lock);
+    self.runners.stop();
     self.pool.deinit();
     self.threaded.deinit();
     signals.release();

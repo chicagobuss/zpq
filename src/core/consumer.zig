@@ -1912,6 +1912,83 @@ pub fn decimalElem(elem: *schema.SchemaElement, d: expr_ast.Dec) void {
     elem.precision = d.precision;
 }
 
+/// Rows from which `writeAggregateRows` encodes columns on several threads: fewer encode faster than threads start.
+const parallel_encode_rows = 1 << 16;
+
+fn encodeAggOutputCol(
+    arena: std.mem.Allocator,
+    out_col: expr_agg.OutputCol,
+    leaf_elem: *const schema.SchemaElement,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+) !encoder.EncodedColumn {
+    const path_buf = try arena.alloc([]const u8, 1);
+    path_buf[0] = out_col.name;
+    return encoder.encodeColumn(arena, .{
+        .values = out_col.col,
+        .schema_elem = leaf_elem,
+        .path_in_schema = path_buf,
+        .codec = codec,
+        .zstd = zstd,
+    });
+}
+
+/// Every column of an aggregate answer encoded on up to one thread a column, each into an arena of its own that holds
+/// the encoding (and the footer metadata pointing into it) until `deinit`.
+const AggColumnEncode = struct {
+    arenas: []std.heap.ArenaAllocator,
+    results: []anyerror!encoder.EncodedColumn,
+
+    const Task = struct {
+        cols: []const expr_agg.OutputCol,
+        arenas: []std.heap.ArenaAllocator,
+        results: []anyerror!encoder.EncodedColumn,
+        codec: schema.CompressionCodec,
+        zstd: compression.ZstdPlan,
+        cursor: *std.atomic.Value(usize),
+
+        /// Claim columns until none remain: one a failed spawn left unclaimed is taken by a thread that did start.
+        fn run(t: *Task) void {
+            while (true) {
+                const i = t.cursor.fetchAdd(1, .monotonic);
+                if (i >= t.cols.len) return;
+                const elem = aggLeafElem(t.cols[i]);
+                t.results[i] = encodeAggOutputCol(t.arenas[i].allocator(), t.cols[i], &elem, t.codec, t.zstd);
+            }
+        }
+    };
+
+    fn run(
+        arena: std.mem.Allocator,
+        cols: []const expr_agg.OutputCol,
+        codec: schema.CompressionCodec,
+        zstd: compression.ZstdPlan,
+    ) !AggColumnEncode {
+        const arenas = try arena.alloc(std.heap.ArenaAllocator, cols.len);
+        for (arenas) |*a| a.* = .init(std.heap.page_allocator);
+        const results = try arena.alloc(anyerror!encoder.EncodedColumn, cols.len);
+        const self: AggColumnEncode = .{ .arenas = arenas, .results = results };
+        errdefer self.deinit();
+        const n_threads = @min(cols.len, std.Thread.getCpuCount() catch 1);
+        const tasks = try arena.alloc(Task, n_threads);
+        var cursor = std.atomic.Value(usize).init(0);
+        for (tasks) |*t| t.* = .{
+            .cols = cols,
+            .arenas = arenas,
+            .results = self.results,
+            .codec = codec,
+            .zstd = zstd,
+            .cursor = &cursor,
+        };
+        if (!spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) Task.run(&tasks[0]);
+        return self;
+    }
+
+    fn deinit(self: *const AggColumnEncode) void {
+        for (self.arenas) |*a| a.deinit();
+    }
+};
+
 /// Write an aggregate result — one row, or one per GROUP BY group — as a
 /// single-row-group parquet file with one column-chunk per `OutputCol`
 /// (avg-style aggs already split into two cols upstream), each holding
@@ -1929,6 +2006,20 @@ pub fn writeAggregateRows(
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
 ) !u64 {
+    const parallel = output_cols.len > 1 and num_rows >= parallel_encode_rows;
+    return writeAggregateRowsEncoded(arena, sink, output_cols, num_rows, codec, zstd, parallel);
+}
+
+/// `writeAggregateRows`, its columns encoded on threads when `parallel`; the bytes written are the same either way.
+fn writeAggregateRowsEncoded(
+    arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    output_cols: []const expr_agg.OutputCol,
+    num_rows: i64,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    parallel: bool,
+) !u64 {
     const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
     var off: u64 = 0;
     try sink.write(&MAGIC);
@@ -1936,17 +2027,17 @@ pub fn writeAggregateRows(
 
     var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     var rg_total: i64 = 0;
-    for (output_cols) |out_col| {
-        const path_buf = try arena.alloc([]const u8, 1);
-        path_buf[0] = out_col.name;
+    // Parallel, every column is encoded first, each on a thread; the loop below still takes them, and any error, in
+    // column order, so the file and the error are the serial loop's.
+    var encoded: ?AggColumnEncode = null;
+    defer if (encoded) |*e| e.deinit();
+    if (parallel) encoded = try AggColumnEncode.run(arena, output_cols, codec, zstd);
+    for (output_cols, 0..) |out_col, i| {
         const leaf_elem = aggLeafElem(out_col);
-        const enc = try encoder.encodeColumn(arena, .{
-            .values = out_col.col,
-            .schema_elem = &leaf_elem,
-            .path_in_schema = path_buf,
-            .codec = codec,
-            .zstd = zstd,
-        });
+        const enc = if (encoded) |e|
+            try e.results[i]
+        else
+            try encodeAggOutputCol(arena, out_col, &leaf_elem, codec, zstd);
         const col_start: i64 = @intCast(off);
         var em = enc.meta;
         em.data_page_offset += col_start;
@@ -6619,4 +6710,128 @@ test "chunkDictionary gives a string chunk's dictionary only when every data pag
             }
         }
     }
+}
+
+/// Columns of each lane and encoding an answer writes: near-unique integers (DELTA), repeating ones (dictionary),
+/// floats and strings with NULLs, and a DECIMAL whose value at `bad_row`, when set, its INT32 cannot hold.
+fn aggAnswerCols(a: std.mem.Allocator, n: usize, bad_row: ?usize) ![]expr_agg.OutputCol {
+    const uniq = try a.alloc(i64, n);
+    const reps = try a.alloc(i64, n);
+    const fl = try a.alloc(f64, n);
+    const strs = try a.alloc([]const u8, n);
+    const decs = try a.alloc(i128, n);
+    const defs = try a.alloc(u32, n);
+    for (0..n) |i| {
+        uniq[i] = @bitCast(@as(u64, i) *% 0x9E3779B97F4A7C15);
+        reps[i] = @intCast(i % 37);
+        fl[i] = @as(f64, @floatFromInt(i % 1000)) * 0.25;
+        strs[i] = try std.fmt.allocPrint(a, "v{d}", .{i % 500});
+        decs[i] = @intCast(i % 9000);
+        defs[i] = @intFromBool(i % 7 != 0);
+    }
+    if (bad_row) |r| decs[r] = 1 << 40;
+    const cols = try a.alloc(expr_agg.OutputCol, 5);
+    cols[0] = .{
+        .name = "u",
+        .col = .{ .i64 = .{ .values = uniq, .max_def = 0 } },
+        .parquet_type = .INT64,
+        .nullable = false,
+    };
+    cols[1] = .{
+        .name = "r",
+        .col = .{ .i64 = .{ .values = reps, .max_def = 0 } },
+        .parquet_type = .INT64,
+        .nullable = false,
+    };
+    cols[2] = .{
+        .name = "d",
+        .col = .{ .i128 = .{ .values = decs, .max_def = 0 } },
+        .parquet_type = .INT32,
+        .nullable = false,
+        .dec = .{ .precision = 9, .scale = 2 },
+    };
+    cols[3] = .{
+        .name = "f",
+        .col = .{ .f64 = .{ .values = fl, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .parquet_type = .DOUBLE,
+        .nullable = true,
+    };
+    cols[4] = .{
+        .name = "s",
+        .col = .{ .string = .{ .values = strs, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .parquet_type = .BYTE_ARRAY,
+        .nullable = true,
+    };
+    return cols;
+}
+
+/// Keeps what is written; fails the write numbered `fail_at` (0 is the magic), if set.
+const AnswerCapture = struct {
+    a: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    writes: usize = 0,
+    fail_at: ?usize = null,
+
+    fn sink(c: *AnswerCapture) streaming.Sink {
+        return .{ .ctx = @ptrCast(c), .write_fn = write };
+    }
+
+    fn write(ctx: *anyopaque, b: []const u8) anyerror!void {
+        const c: *AnswerCapture = @ptrCast(@alignCast(ctx));
+        defer c.writes += 1;
+        if (c.fail_at == c.writes) return error.TestSinkFailed;
+        try c.bytes.appendSlice(c.a, b);
+    }
+};
+
+test "writeAggregateRows: columns encoded on threads write the serial bytes, whatever spawns fail" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 70_000;
+    const cols = try aggAnswerCols(a, n, null);
+    for ([_]schema.CompressionCodec{ .SNAPPY, .ZSTD, .UNCOMPRESSED }) |codec| {
+        var serial: AnswerCapture = .{ .a = a };
+        const want = try writeAggregateRowsEncoded(a, serial.sink(), cols, n, codec, .{}, false);
+        try std.testing.expectEqual(@as(u64, serial.bytes.items.len), want);
+        for ([_]?usize{ null, 0, 1, 2 }) |fail_after| {
+            if (fail_after) |k| spawn_util.injectFailureAfter(k);
+            defer spawn_util.resetFailure();
+            var par: AnswerCapture = .{ .a = a };
+            const got = try writeAggregateRowsEncoded(a, par.sink(), cols, n, codec, .{}, true);
+            try std.testing.expectEqual(want, got);
+            try std.testing.expectEqualSlices(u8, serial.bytes.items, par.bytes.items);
+        }
+    }
+}
+
+test "writeAggregateRows: on threads, the serial error and the bytes written before it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 1000;
+    // Column 2 cannot encode; write 1 (column 0) fails, or write 2 (column 1), or none does.
+    const cols = try aggAnswerCols(a, n, 600);
+    for ([_]?usize{ null, 1, 2 }) |fail_at| {
+        var serial: AnswerCapture = .{ .a = a, .fail_at = fail_at };
+        const want = writeAggregateRowsEncoded(a, serial.sink(), cols, n, .SNAPPY, .{}, false);
+        var par: AnswerCapture = .{ .a = a, .fail_at = fail_at };
+        const got = writeAggregateRowsEncoded(a, par.sink(), cols, n, .SNAPPY, .{}, true);
+        try std.testing.expectError(if (fail_at == null) error.UnsupportedType else error.TestSinkFailed, want);
+        try std.testing.expectEqual(want, got);
+        try std.testing.expectEqualSlices(u8, serial.bytes.items, par.bytes.items);
+    }
+}
+
+fn writeAnswerOnThreads(a: std.mem.Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cols = try aggAnswerCols(arena, 300, null);
+    var out: AnswerCapture = .{ .a = arena };
+    _ = try writeAggregateRowsEncoded(arena, out.sink(), cols, 300, .SNAPPY, .{}, true);
+}
+
+test "writeAggregateRows: on threads, an allocation failure frees everything" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, writeAnswerOnThreads, .{});
 }

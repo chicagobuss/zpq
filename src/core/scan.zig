@@ -3975,17 +3975,69 @@ pub const TypedAnswer = struct {
         gpa.free(l.defs);
     }
 
+    /// Cleared by `clear`, but a string lane's defs at once: its `deinit` reads them, should a later lane fail.
     fn lane(gpa: std.mem.Allocator, comptime T: type, n: usize) !Lane(T) {
         const values = try gpa.alloc(T, n);
         errdefer gpa.free(values);
         const defs = try gpa.alloc(u32, n);
-        @memset(defs, 0);
-        @memset(values, std.mem.zeroes(T));
+        if (T == []const u8) @memset(defs, 0);
         return .{ .values = values, .defs = defs };
     }
 
-    /// Columns typed by `types`, every cell NULL, owned by the caller's answer from the first allocation on.
-    fn init(gpa: std.mem.Allocator, types: []const GroupColType, n: usize, out: *TypedAnswer) !void {
+    fn clearLane(comptime T: type, l: Lane(T), lo: usize, hi: usize) void {
+        @memset(l.values[lo..hi], std.mem.zeroes(T));
+        @memset(l.defs[lo..hi], 0);
+    }
+
+    /// Rows `lo..hi` of every column NULL, values zero.
+    fn clear(self: *const TypedAnswer, lo: usize, hi: usize) void {
+        for (self.columns) |col| switch (col) {
+            .i64 => |l| clearLane(i64, l, lo, hi),
+            .f64 => |l| clearLane(f64, l, lo, hi),
+            .string => |l| clearLane([]const u8, l, lo, hi),
+            .dec => |l| clearLane(i128, l, lo, hi),
+            .avg => |a| {
+                clearLane(f64, a.sum, lo, hi);
+                @memset(a.count[lo..hi], 0);
+            },
+            .avg_dec => |a| {
+                clearLane(i128, a.sum, lo, hi);
+                @memset(a.count[lo..hi], 0);
+            },
+        };
+    }
+
+    /// Rows a `clear` task claims at a time.
+    const clear_block = 1 << 16;
+
+    /// `clear` of every row, on up to `n_workers` threads: an answer of millions of rows is cleared, and its pages
+    /// first touched, on every core rather than one. Cannot fail: rows a thread that never started left are cleared by
+    /// one that did, or here.
+    fn clearAll(self: *const TypedAnswer, n_workers: usize) void {
+        const Task = struct {
+            answer: *const TypedAnswer,
+            cursor: *std.atomic.Value(usize),
+
+            fn run(t: *@This()) void {
+                while (true) {
+                    const lo = t.cursor.fetchAdd(clear_block, .monotonic);
+                    if (lo >= t.answer.rows) return;
+                    t.answer.clear(lo, @min(t.answer.rows, lo + clear_block));
+                }
+            }
+        };
+        var tasks: [32]Task = undefined;
+        const n_threads = @min(tasks.len, n_workers, self.rows / clear_block);
+        if (n_threads < 2) return self.clear(0, self.rows);
+        var cursor = std.atomic.Value(usize).init(0);
+        for (tasks[0..n_threads]) |*t| t.* = .{ .answer = self, .cursor = &cursor };
+        const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+        if (!spawn_util.runTree(Task, tasks[0..n_threads], config, Task.run)) Task.run(&tasks[0]);
+    }
+
+    /// Columns typed by `types`, every cell NULL, owned by the caller's answer from the first allocation on. Cleared on
+    /// up to `n_workers` threads.
+    fn init(gpa: std.mem.Allocator, types: []const GroupColType, n: usize, out: *TypedAnswer, n_workers: usize) !void {
         out.* = .{ .rows = n, .columns = try gpa.alloc(TypedColumn, types.len) };
         // Each column is valid (empty) until allocated, so a failure leaves `deinit` something to free.
         for (out.columns) |*c| c.* = .{ .i64 = .{ .values = &.{}, .defs = &.{} } };
@@ -4000,7 +4052,6 @@ pub const TypedAnswer = struct {
                     freeLane(gpa, f64, sum);
                     return e;
                 };
-                @memset(count, 0);
                 break :blk .{ .avg = .{ .sum = sum, .count = count } };
             },
             .avg_dec => blk: {
@@ -4009,10 +4060,10 @@ pub const TypedAnswer = struct {
                     freeLane(gpa, i128, sum);
                     return e;
                 };
-                @memset(count, 0);
                 break :blk .{ .avg_dec = .{ .sum = sum, .count = count } };
             },
         };
+        out.clearAll(n_workers);
     }
 
     /// Store value `v` of row `i` in column `col`, narrowed as the row writer narrows it. A string's ownership passes
@@ -4099,7 +4150,7 @@ fn buildGroupColumns(
     types: []const GroupColType,
     n_workers: usize,
 ) !void {
-    try TypedAnswer.init(gpa, types, src.slots.len, out);
+    try TypedAnswer.init(gpa, types, src.slots.len, out, n_workers);
     const n = src.slots.len;
     if (n == 0) return;
     const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, n, row_block) catch unreachable));
@@ -4571,9 +4622,28 @@ fn inPlaceAccs(tables: []const expr_agg.GroupTable, idx: usize, n_calls: usize) 
 /// fresh sum adds into +0.0, so never ends -0.0.
 fn foldedAcc(gpa: std.mem.Allocator, call: expr_agg.AggCall, acc: expr_agg.Accumulator) !expr_agg.Accumulator {
     std.debug.assert(call.func != .count_distinct);
+    if (foldsToItself(acc)) return acc;
     var out = expr_agg.Accumulator.init(call);
     try out.merge(acc, gpa);
     return out;
+}
+
+/// Whether merging `acc` into a fresh accumulator gives every bit of it back. Not a float sum of -0.0 (it becomes
+/// +0.0) or NaN (left to the addition), and not a count past i64 (`Accumulator.merge` refuses it); integer and
+/// DECIMAL sums add into zero exactly, and an extremum or a string winner is taken as is.
+fn foldsToItself(acc: expr_agg.Accumulator) bool {
+    const plainFloat = struct {
+        fn f(x: f64) bool {
+            return !std.math.isNan(x) and !(x == 0 and std.math.signbit(x));
+        }
+    }.f;
+    return switch (acc) {
+        .count => |c| c <= std.math.maxInt(i64),
+        .distinct => false,
+        .sum_f => |x| if (x) |v| plainFloat(v) else true,
+        .avg => |a| plainFloat(a.sum),
+        .sum_i, .min_i, .min_f, .max_i, .max_f, .min_bytes, .max_bytes, .sum_d, .avg_d, .min_d, .max_d => true,
+    };
 }
 
 /// `hashMergeGroupRefs` with no copy of a group's state: a key's first ref keeps it, and each later ref of the key is
@@ -9702,6 +9772,92 @@ test "in-place merge: the copying merge's rows, bit for bit, at every -j and whe
     }
 }
 
+fn sameAccBits(a: expr_agg.Accumulator, b: expr_agg.Accumulator) bool {
+    const F = struct {
+        fn f(x: ?f64, y: ?f64) bool {
+            if (x == null or y == null) return x == null and y == null;
+            return @as(u64, @bitCast(x.?)) == @as(u64, @bitCast(y.?));
+        }
+        fn s(x: ?[]const u8, y: ?[]const u8) bool {
+            if (x == null or y == null) return x == null and y == null;
+            return x.?.ptr == y.?.ptr and x.?.len == y.?.len;
+        }
+    };
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .count => |c| c == b.count,
+        .distinct => false,
+        .sum_i => |v| v == b.sum_i,
+        .min_i => |v| v == b.min_i,
+        .max_i => |v| v == b.max_i,
+        .min_d => |v| v == b.min_d,
+        .max_d => |v| v == b.max_d,
+        .sum_f => |v| F.f(v, b.sum_f),
+        .min_f => |v| F.f(v, b.min_f),
+        .max_f => |v| F.f(v, b.max_f),
+        .min_bytes => |v| F.s(v, b.min_bytes),
+        .max_bytes => |v| F.s(v, b.max_bytes),
+        .avg => |v| F.f(v.sum, b.avg.sum) and v.count == b.avg.count and v.isum == b.avg.isum,
+        .sum_d => |v| v.lo == b.sum_d.lo and v.hi == b.sum_d.hi and v.n == b.sum_d.n,
+        .avg_d => |v| v.lo == b.avg_d.lo and v.hi == b.avg_d.hi and v.n == b.avg_d.n,
+    };
+}
+
+test "foldsToItself: merging such an accumulator into a fresh one gives every bit back, and only those" {
+    const call = struct {
+        fn c(func: expr_agg.AggFunc, result: expr_agg.ResultShape) expr_agg.AggCall {
+            return .{ .func = func, .alias = "a", .result = result, .arg = null, .where = null };
+        }
+    }.c;
+    const nan: f64 = std.math.nan(f64);
+    const inf: f64 = std.math.inf(f64);
+    const big = std.math.maxInt(i64);
+    var dec: expr_agg.DecSum = .{};
+    dec.add(-(@as(i192, 1) << 150) + 7, 3);
+    const Case = struct { call: expr_agg.AggCall, acc: expr_agg.Accumulator };
+    const cases = [_]Case{
+        .{ .call = call(.count, .i64), .acc = .{ .count = 0 } },
+        .{ .call = call(.count, .i64), .acc = .{ .count = big } },
+        .{ .call = call(.count, .i64), .acc = .{ .count = big + 1 } },
+        .{ .call = call(.sum, .i64), .acc = .{ .sum_i = null } },
+        .{ .call = call(.sum, .i64), .acc = .{ .sum_i = -(@as(i128, 1) << 100) } },
+        .{ .call = call(.sum, .f64), .acc = .{ .sum_f = null } },
+        .{ .call = call(.sum, .f64), .acc = .{ .sum_f = -0.0 } },
+        .{ .call = call(.sum, .f64), .acc = .{ .sum_f = 0.0 } },
+        .{ .call = call(.sum, .f64), .acc = .{ .sum_f = nan } },
+        .{ .call = call(.sum, .f64), .acc = .{ .sum_f = -inf } },
+        .{ .call = call(.sum, .f64), .acc = .{ .sum_f = -2.5 } },
+        .{ .call = call(.min, .f64), .acc = .{ .min_f = -0.0 } },
+        .{ .call = call(.max, .f64), .acc = .{ .max_f = nan } },
+        .{ .call = call(.min, .i64), .acc = .{ .min_i = null } },
+        .{ .call = call(.max, .i64), .acc = .{ .max_i = 3 } },
+        .{ .call = call(.min, .bytes), .acc = .{ .min_bytes = "pear" } },
+        .{ .call = call(.max, .bytes), .acc = .{ .max_bytes = null } },
+        .{ .call = call(.avg, .avg_f64), .acc = .{ .avg = .{ .sum = -0.0, .count = 2, .isum = 0 } } },
+        .{ .call = call(.avg, .avg_f64), .acc = .{ .avg = .{ .sum = 1.5, .count = 2, .isum = -9 } } },
+        .{ .call = call(.sum, .dec), .acc = .{ .sum_d = dec } },
+        .{ .call = call(.avg, .avg_dec), .acc = .{ .avg_d = dec } },
+        .{ .call = call(.min, .dec), .acc = .{ .min_d = -5 } },
+        .{ .call = call(.max, .dec), .acc = .{ .max_d = null } },
+    };
+    var itself: usize = 0;
+    for (cases) |c| {
+        var out = expr_agg.Accumulator.init(c.call);
+        const merged = out.merge(c.acc, testing.allocator);
+        if (foldsToItself(c.acc)) {
+            try merged;
+            try testing.expect(sameAccBits(c.acc, out));
+            itself += 1;
+        }
+        // The rest (-0.0 and NaN float sums, a count past i64) the merge changes, or refuses, and `foldedAcc` with it.
+        const folded = foldedAcc(testing.allocator, c.call, c.acc);
+        if (merged) {
+            try testing.expect(sameAccBits(try folded, out));
+        } else |e| try testing.expectError(e, folded);
+    }
+    try testing.expectEqual(@as(usize, cases.len - 4), itself);
+}
+
 test "in-place merge: an allocation failure frees everything" {
     var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     try testing.checkAllAllocationFailures(fixed.allocator(), struct {
@@ -9915,6 +10071,42 @@ test "buildGroupRows: the same rows at every -j, and when spawns fail" {
         try f.build(testing.allocator, &out, run.j);
         if (run.fail_after != null) try testing.expect(spawn_util.failuresInjected() > 0);
         try RowFixture.expectRows(out.group_rows.?);
+    }
+}
+
+test "TypedAnswer.init: every cell NULL and zero at every -j, and when spawns fail" {
+    const lanes = [_]@FieldType(GroupColType, "lane"){ .i64, .f64, .string, .dec, .avg, .avg_dec };
+    var types: [lanes.len]GroupColType = undefined;
+    for (&types, lanes) |*t, l| t.* = .{
+        .nullable = true,
+        .lane = l,
+        .dec = .{ .precision = 30, .scale = 2 },
+        .source = null,
+    };
+    const n = 3 * TypedAnswer.clear_block + 5;
+    const Run = struct { j: usize, fail_after: ?usize = null };
+    for ([_]Run{ .{ .j = 1 }, .{ .j = 8 }, .{ .j = 8, .fail_after = 0 }, .{ .j = 8, .fail_after = 1 } }) |run| {
+        if (run.fail_after) |k| spawn_util.injectFailureAfter(k);
+        defer spawn_util.resetFailure();
+        var out: TypedAnswer = undefined;
+        try TypedAnswer.init(testing.allocator, &types, n, &out, run.j);
+        defer out.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, n), out.rows);
+        for (out.columns) |col| switch (col) {
+            inline .i64, .f64, .string, .dec => |l, tag| {
+                for (l.defs) |d| try testing.expectEqual(@as(u32, 0), d);
+                const T = @TypeOf(l.values[0]);
+                for (l.values) |v| switch (tag) {
+                    .string => try testing.expectEqual(@as(usize, 0), v.len),
+                    else => try testing.expectEqual(std.mem.zeroes(T), v),
+                };
+            },
+            inline .avg, .avg_dec => |a| {
+                for (a.sum.defs) |d| try testing.expectEqual(@as(u32, 0), d);
+                for (a.sum.values) |v| try testing.expectEqual(std.mem.zeroes(@TypeOf(v)), v);
+                for (a.count) |c| try testing.expectEqual(@as(i64, 0), c);
+            },
+        };
     }
 }
 

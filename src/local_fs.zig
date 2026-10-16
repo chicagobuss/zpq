@@ -136,19 +136,76 @@ pub const Mapped = struct {
     bytes: []align(std.heap.page_size_min) const u8,
     /// Its entry in `guard`, when one was free.
     slot: ?usize = null,
+    /// The file as it was mapped.
+    id: Identity,
 
     pub fn unmap(self: Mapped) void {
         if (self.slot) |i| guard.leave(i);
         posix.munmap(self.bytes);
     }
 
-    /// `error.InputChanged` once a read of the mapping went past the file's end: the file was truncated (or
-    /// replaced in place) while mapped, and what the query read of it is not the file it planned against.
-    pub fn intact(self: Mapped) error{InputChanged}!void {
-        const i = self.slot orelse return;
-        if (guard.faulted[i].load(.acquire)) return error.InputChanged;
+    /// `error.InputChanged` once the file at `path` (the one mapped) is no longer the file mapped: a read went past
+    /// its end, or it now has another size, mtime or inode. A cut inside the last page raises no fault (the kernel
+    /// serves zeros up to the page's end), so only the size says so, and a rewrite in place only the mtime.
+    pub fn intact(self: Mapped, path: []const u8) error{InputChanged}!void {
+        if (self.slot) |i| if (guard.faulted[i].load(.acquire)) return error.InputChanged;
+        const now = pathIdentity(path) catch return error.InputChanged;
+        if (!std.meta.eql(now, self.id)) return error.InputChanged;
     }
 };
+
+/// What makes a file the same file across a query: a change to any of these while it is read means what was read
+/// is no one version of it. Not the fd's own word alone, which keeps an inode that was renamed over.
+pub const Identity = struct {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+};
+
+pub fn fdIdentity(fd: fd_t) !Identity {
+    if (builtin.os.tag == .linux) return statxIdentity(fd, "", std.os.linux.AT.EMPTY_PATH);
+    var st: posix.system.Stat = undefined;
+    if (posix.errno(posix.system.fstat(fd, &st)) != .SUCCESS) return error.StatFailed;
+    return statIdentity(st);
+}
+
+pub fn pathIdentity(path: []const u8) !Identity {
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_z.len) return error.NameTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    if (builtin.os.tag == .linux) return statxIdentity(posix.AT.FDCWD, path_z[0..path.len :0], 0);
+    var st: posix.system.Stat = undefined;
+    if (posix.errno(posix.system.stat(path_z[0..path.len :0], &st)) != .SUCCESS) return error.StatFailed;
+    return statIdentity(st);
+}
+
+fn statxIdentity(dirfd: fd_t, path: [*:0]const u8, flags: u32) !Identity {
+    const linux = std.os.linux;
+    var st = std.mem.zeroes(linux.Statx);
+    const mask: linux.STATX = .{ .INO = true, .SIZE = true, .MTIME = true };
+    if (linux.errno(linux.statx(dirfd, path, flags, mask, &st)) != .SUCCESS) return error.StatFailed;
+    return .{
+        .dev = @as(u64, st.dev_major) << 32 | st.dev_minor,
+        .ino = st.ino,
+        .size = st.size,
+        .mtime_sec = st.mtime.sec,
+        .mtime_nsec = st.mtime.nsec,
+    };
+}
+
+fn statIdentity(st: posix.system.Stat) Identity {
+    const m = st.mtime();
+    return .{
+        .dev = @bitCast(@as(i64, st.dev)),
+        .ino = st.ino,
+        .size = @intCast(st.size),
+        .mtime_sec = @intCast(m.sec),
+        .mtime_nsec = @intCast(m.nsec),
+    };
+}
 
 /// Opens `path` without blocking (a FIFO would wait for a writer forever), checks it is a regular file, and maps it.
 pub fn mapFile(path: []const u8) !Mapped {
@@ -156,8 +213,11 @@ pub fn mapFile(path: []const u8) !Mapped {
     defer close(fd);
     const size = try fileSize(fd);
     if (size == 0) return error.EmptyFile;
+    const id = try fdIdentity(fd);
+    // Sized by the identity's own word so the two agree; a file growing between them maps what was asked.
+    if (id.size != size) return error.InputChanged;
     const bytes = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
-    return .{ .bytes = bytes, .slot = guard.enter(bytes) };
+    return .{ .bytes = bytes, .slot = guard.enter(bytes), .id = id };
 }
 
 /// A file mapped while another process truncates it raises SIGBUS on the first touch of a page past its new end,
@@ -374,7 +434,7 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
 
     const m = try mapFile(path);
     defer m.unmap();
-    try m.intact();
+    try m.intact(path);
     const wfd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     defer close(wfd);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.ftruncate(wfd, @intCast(page))));
@@ -383,13 +443,63 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
     try testing.expectEqual(@as(u8, 0xab), before.*);
     // Unguarded, this read was SIGBUS.
     try testing.expectEqual(@as(u8, 0), past.*);
-    try testing.expectError(error.InputChanged, m.intact());
+    try testing.expectError(error.InputChanged, m.intact(path));
 
     // A fresh mapping of the file as it now is reads whole.
     const again = try mapFile(path);
     defer again.unmap();
     try testing.expectEqual(page, again.bytes.len);
-    try again.intact();
+    try again.intact(path);
+}
+
+test "regression: a mapped file cut inside its last page, rewritten in place, or renamed over reports it changed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
+    var nbuf: [256]u8 = undefined;
+    const other = try std.fmt.bufPrintSentinel(&nbuf, ".zig-cache/tmp/{s}/g", .{tmp.sub_path}, 0);
+    var data: [1000]u8 = @splat(0xab);
+    const write = struct {
+        fn at(p: []const u8, bytes: []const u8) !void {
+            const fd = try createFile(p);
+            defer close(fd);
+            try writeAll(fd, bytes);
+        }
+    }.at;
+
+    // No read crosses a page the cut removed, so no fault: the kernel serves zeros to the page's end.
+    try write(path, &data);
+    const cut = try mapFile(path);
+    defer cut.unmap();
+    const wfd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.ftruncate(wfd, 600)));
+    close(wfd);
+    const tail: *volatile const u8 = &cut.bytes[900];
+    try testing.expectEqual(@as(u8, 0), tail.*);
+    try testing.expectError(error.InputChanged, cut.intact(path));
+
+    // Same size, other bytes: only the mtime tells, set apart here since a fast rewrite can land in the same tick.
+    try write(path, &data);
+    const same = try mapFile(path);
+    defer same.unmap();
+    try same.intact(path);
+    data[0] = 0;
+    try write(path, &data);
+    const rfd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const times = [2]posix.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.futimens(rfd, &times)));
+    close(rfd);
+    try testing.expectError(error.InputChanged, same.intact(path));
+
+    // Another file renamed over the path: the mapping is whole, but it is no longer what the path names.
+    const kept = try mapFile(path);
+    defer kept.unmap();
+    try write(other, &data);
+    var pbuf: [256]u8 = undefined;
+    const path_z = try std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0);
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.rename(other, path_z)));
+    try testing.expectError(error.InputChanged, kept.intact(path));
 }
 
 test "regression: the SIGBUS handler is in place only while a mapping is, and yields to one installed since" {

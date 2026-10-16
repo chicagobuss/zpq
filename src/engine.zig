@@ -519,6 +519,20 @@ fn executeAggregate(
     agg_str: []const u8,
     comptime explain: bool,
 ) !if (explain) AggregateExplanation else AggResult {
+    var changed = false;
+    return executeAggregateOver(ctx, arena, args, agg_str, explain, &changed) catch |err|
+        if (changed) error.InputChanged else err;
+}
+
+/// `changed`: set on an error when a local input changed under the query (`OpenedInputs.whole`).
+fn executeAggregateOver(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    agg_str: []const u8,
+    comptime explain: bool,
+    changed: *bool,
+) !if (explain) AggregateExplanation else AggResult {
     const empty_result = args.empty_scalar or args.result_order.limit == 0;
     var t: Timings = .{};
 
@@ -534,6 +548,7 @@ fn executeAggregate(
         .footer_only = explain or empty_result,
     });
     defer opened.deinit();
+    errdefer changed.* = !opened.whole();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
     profile.record(prof, .open_inputs, t_open, t_open_end, profile.args(.{args.inputs.len}));
@@ -1835,6 +1850,12 @@ fn writtenCodec(rgs: []const schema.RowGroup, none_written: schema.CompressionCo
 }
 
 fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
+    var changed = false;
+    return runWriteOver(ctx, args, out_path, &changed) catch |err| if (changed) error.InputChanged else err;
+}
+
+/// As `executeAggregateOver`.
+fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *bool) !WriteResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1850,6 +1871,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
     const t_open = nowMonoNs();
     var opened = try openInputs(ctx, arena, args, .{ .limit = s3FetchWindow(ctx.env, args.max_memory) });
     defer opened.deinit();
+    errdefer changed.* = !opened.whole();
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
     profile.record(prof, .open_inputs, t_open, t_open_end, profile.args(.{args.inputs.len}));
@@ -2464,7 +2486,13 @@ const OpenedInputs = struct {
     /// `error.InputChanged` when a local input was truncated while it was mapped (`local_fs.Mapped.intact`): checked
     /// before an answer is returned or published.
     pub fn intact(self: *const OpenedInputs) error{InputChanged}!void {
-        for (self.mmaps) |m_opt| if (m_opt) |m| try m.intact();
+        for (self.inputs, self.mmaps) |in, m_opt| if (m_opt) |m| try m.intact(in.name);
+    }
+
+    /// For a query's error path: zeros read past a cut parse as a corrupt page, which is the cut, not the file.
+    fn whole(self: *const OpenedInputs) bool {
+        self.intact() catch return false;
+        return true;
     }
 
     pub fn deinit(self: *OpenedInputs) void {
@@ -6283,6 +6311,22 @@ pub fn runPrintSink(
     offset: usize,
     sink: ?*std.Io.Writer,
 ) !PrintResult {
+    var changed = false;
+    return runPrintSinkOver(ctx, args, format, limit, fd, offset, sink, &changed) catch |err|
+        if (changed) error.InputChanged else err;
+}
+
+/// As `executeAggregateOver`.
+fn runPrintSinkOver(
+    ctx: Context,
+    args: QueryArgs,
+    format: PrintFormat,
+    limit: ?usize,
+    fd: local_fs.fd_t,
+    offset: usize,
+    sink: ?*std.Io.Writer,
+    changed: *bool,
+) !PrintResult {
     const t_start = nowMonoNs();
     const prof = profile.threadOf(args.profiler, .main);
     const query_span = profile.Span.begin(prof);
@@ -6301,6 +6345,7 @@ pub fn runPrintSink(
         .footer_only = limit == 0,
     });
     defer opened.deinit();
+    errdefer changed.* = !opened.whole();
     open_span.end(.open_inputs, profile.args(.{args.inputs.len}));
 
     const parse_span = profile.Span.begin(prof);

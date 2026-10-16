@@ -223,7 +223,11 @@ export fn zpq_run(
     if (!self.enter()) return fail(out_json, .eclosed, "Closed");
     defer self.leave();
 
-    const response = service.handle(self.threaded.io(), gpa, processEnviron(), body, &self.pool, null) catch |err|
+    var call: Call = .{ .ctx = self, .body = body };
+    const thread = zpq.core.spawn.spawn(.{ .stack_size = request_stack_size }, Call.run, .{&call}) catch
+        return fail(out_json, .einternal, "ThreadSpawnFailed");
+    thread.join();
+    const response = call.result catch |err|
         return switch (err) {
             error.OutOfMemory => @backingInt(Status.enomem),
             error.ContextClosed => fail(out_json, .eclosed, "Closed"),
@@ -237,6 +241,22 @@ export fn zpq_run(
     if (out_len) |l| l.* = response.len;
     return @backingInt(Status.ok);
 }
+
+/// The stack a request runs on: the CLI's main-thread default, which the parser depth caps (`MAX_GROUP_DEPTH`,
+/// `ExpressionTooDeep`) are sized against. Reserved, not committed, so an idle page costs nothing.
+const request_stack_size = 8 << 20;
+
+/// One request, run on a thread of zpq's own rather than the caller's: a host thread's stack can be far smaller (musl
+/// gives 128 KiB, a JVM 512 KiB), and a filter nested within the depth cap overflowed it and killed the process.
+const Call = struct {
+    ctx: *Ctx,
+    body: []const u8,
+    result: @typeInfo(@TypeOf(service.handle)).@"fn".return_type.? = undefined,
+
+    fn run(call: *Call) void {
+        call.result = service.handle(call.ctx.threaded.io(), gpa, processEnviron(), call.body, &call.ctx.pool, null);
+    }
+};
 
 /// Return `status`, with `{"error":"<kind>","reason":"<reason>"}` in `*out` when the caller gave one and it can be
 /// allocated. ENOMEM carries none: there may be no memory to describe it with.
@@ -493,3 +513,31 @@ test "regression: contexts that overlap leave SIGPIPE as the host had it, and ke
     try testing.expect(cur.handler.handler == mine.handler.handler);
 }
 
+test "regression: a filter nested near the depth cap runs from a host thread with a small stack" {
+    var ctx: ?*Ctx = null;
+    try testing.expectEqual(@as(c_int, 0), zpq_open(null, &ctx, null));
+    defer zpq_close(ctx);
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("{\"inputs\":[\"ci/fixtures/parquet/nullable_mix.parquet\"],");
+    try w.writeAll("\"aggregate\":\"count(*) AS n\",\"filter\":\"");
+    for (0..31) |_| try w.writeByte('(');
+    try w.writeAll("id > 0");
+    for (0..31) |_| try w.writeByte(')');
+    try w.writeAll("\"}");
+    const Run = struct {
+        fn call(context: ?*Ctx, req: []const u8, status: *c_int, out: *?[*:0]u8) void {
+            status.* = zpq_run(context, req.ptr, req.len, out, null);
+        }
+    };
+    var status: c_int = -1;
+    var out: ?[*:0]u8 = null;
+    // 192 KiB of usable stack (beside the signal stack a safe build keeps in it): at about 8 KiB a level, this nesting
+    // overflowed it before requests ran on zpq's own.
+    const host_stack = (zpq.core.spawn.signal_stack_size orelse 0) + (192 << 10);
+    const t = try std.Thread.spawn(.{ .stack_size = host_stack }, Run.call, .{ ctx, w.buffered(), &status, &out });
+    t.join();
+    defer zpq_free(out);
+    try testing.expectEqual(@as(c_int, 0), status);
+    try testing.expect(out != null);
+}

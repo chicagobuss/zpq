@@ -683,6 +683,19 @@ pub fn foldGroupedCall(
             agg.intersectPresentMask(&own.?, arg_col.?);
         }
     };
+    // A computed argument that may be NULL (`coalesce(a, b)`, `strlen(s)`) narrows the selection by its NULLs, as a
+    // bare column's do, so it is evaluated before any fold reads the selection: counted, a NULL was a row.
+    var computed: ?Column = null;
+    if (call.arg) |arg| if (arg != .col_ref and arg.mayBeNull()) {
+        const v = try expr_eval.evalExpr(ra, &batch.restrictedTo(if (own) |*s| s else outer), lookup, arg);
+        if (switch (v) {
+            inline else => |c| c.has_nulls,
+        }) {
+            if (own == null) own = try outer.cloneAlloc(ra);
+            agg.intersectPresentMask(&own.?, v);
+        }
+        computed = v;
+    };
     const sel: *const Sel = if (own) |*s| s else outer;
 
     // count(*) / count(col): rows per composite.
@@ -745,7 +758,7 @@ pub fn foldGroupedCall(
                 },
             };
         },
-        else => |e| vals_col = try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
+        else => |e| vals_col = computed orelse try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
     const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and

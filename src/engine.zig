@@ -7477,6 +7477,56 @@ test "regression: inputs whose legacy DECIMAL scales differ are refused on every
     try std.testing.expectEqual(@as(i128, 48), r.aggregate.output.aggs[0].value.i);
 }
 
+/// The answer's group rows as `v,v,...;` lines, sorted, so a test reads the same text whatever the group order.
+fn sortedGroupText(gpa: std.mem.Allocator, ctx: Context, args: QueryArgs) ![]u8 {
+    var r = try runQuery(ctx, args);
+    defer r.deinit(gpa);
+    var lines: std.ArrayList([]u8) = .empty;
+    defer {
+        for (lines.items) |l| gpa.free(l);
+        lines.deinit(gpa);
+    }
+    for (r.aggregate.output.group_rows orelse &.{}) |row| {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        errdefer aw.deinit();
+        for (row) |v| {
+            try writeAggValueJson(&aw.writer, v);
+            try aw.writer.writeByte(',');
+        }
+        try lines.append(gpa, try aw.toOwnedSlice());
+    }
+    std.mem.sort([]u8, lines.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var out: std.ArrayList(u8) = .empty;
+    for (lines.items) |l| {
+        try out.appendSlice(gpa, l);
+        try out.append(gpa, ';');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "regression: grouped aggregates skip a computed argument's NULLs, coded or not" {
+    const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    // a = [1, -, -, 4, -, 6], b = [10, 20, -, -, -, 60], g = 1 1 2 2 3 3; the strings s and t have NULLs likewise.
+    for ([_]bool{ true, false }) |encoded| {
+        const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .aggregate = "count(coalesce(a, b)) AS n, min(coalesce(a, b)) AS m, count(coalesce(s, t)) AS c, " ++
+                "min(coalesce(s, t)) AS ms, count(strlen(s)) AS l",
+            .group_by = "g",
+            .encoded = encoded,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("1,2,1,2,\"q\",1,;2,1,4,1,\"y\",1,;3,1,6,1,\"z\",1,;", got);
+    }
+}
+
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

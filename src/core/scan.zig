@@ -3512,6 +3512,8 @@ fn prepareAggregate(
             merged_accs.deinit(gpa);
         }
         var folded = out_tables.len > 1;
+        // Set when the merge left each group's state in its source table (`mergeInPlace`).
+        var in_place_tables: []const expr_agg.GroupTable = &.{};
         // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
         // borrowed until the rows are built.
         if (spilled) {
@@ -3533,6 +3535,7 @@ fn prepareAggregate(
             if (candidates) |keys_kept| {
                 try mergeCandidates(gpa, arena, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
             } else {
+                const in_place = mergesInPlace(agg_calls, result_cut);
                 try mergeFoldedRefs(
                     gpa,
                     arena,
@@ -3541,9 +3544,11 @@ fn prepareAggregate(
                     agg_calls,
                     n_workers,
                     result_cut,
+                    in_place,
                     &slots,
                     &merged_accs,
                 );
+                if (in_place) in_place_tables = out_tables;
             }
         } else {
             const gt = &out_tables[0];
@@ -3570,6 +3575,7 @@ fn prepareAggregate(
             .key_types = key_types,
             .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
             .folded = folded,
+            .in_place = in_place_tables,
             .fixed_keys = if (spilled) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
         };
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
@@ -3852,6 +3858,9 @@ const RowSource = struct {
     /// table's, starting at `slot.idx * calls.len`.
     accs: []const expr_agg.Accumulator,
     folded: bool,
+    /// Non-empty when the merge left each group's state in these tables (`mergeInPlace`): `slot.idx` names it, and
+    /// `accs` is unused.
+    in_place: []const expr_agg.GroupTable = &.{},
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
 
@@ -3859,13 +3868,19 @@ const RowSource = struct {
     /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
     fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
-        const accs = s.accs[at..][0..s.calls.len];
+        const accs = if (s.in_place.len > 0)
+            inPlaceAccs(s.in_place, slot.idx, s.calls.len)
+        else
+            s.accs[at..][0..s.calls.len];
         // A fixed image pads a null column with zeros; the reader wants that payload omitted.
         var ser_buf: [48]u8 = undefined;
         const key_bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
         for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
             .key => |k_idx| try deserializeKeyColumn(gpa, key_bytes, k_idx, s.key_types),
-            .agg => |a_idx| try materializeOne(gpa, s.calls[a_idx], accs[a_idx]),
+            .agg => |a_idx| try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
+                try foldedAcc(gpa, s.calls[a_idx], accs[a_idx])
+            else
+                accs[a_idx]),
         };
     }
 };
@@ -4393,9 +4408,97 @@ const HashKeyCtx = struct {
     }
 };
 
+/// A merge's key -> merged group index, sized up front for every key it will see. Fixed-width keys (every table
+/// with the same `fixed_stride`) are copied into the slots of an open-addressed table, so a probe compares the slot's
+/// own bytes instead of following a slice into a source table; other keys go through a map borrowing them.
+const MergeIndex = union(enum) {
+    bytes: KeyHashMap(u32),
+    fixed9: FixedMergeIndex(9),
+    fixed18: FixedMergeIndex(18),
+    fixed27: FixedMergeIndex(27),
+
+    const Entry = struct { found: bool, value: *u32 };
+
+    fn init(allocator: std.mem.Allocator, tables: []const expr_agg.GroupTable, n: usize) !MergeIndex {
+        const n32: u32 = std.math.cast(u32, n) orelse return error.OutOfMemory;
+        var stride: u8 = if (tables.len > 0) tables[0].fixed_stride else 0;
+        for (tables) |gt| if (gt.fixed_stride != stride) {
+            stride = 0;
+        };
+        return switch (stride) {
+            9 => .{ .fixed9 = try .init(allocator, n32) },
+            18 => .{ .fixed18 = try .init(allocator, n32) },
+            27 => .{ .fixed27 = try .init(allocator, n32) },
+            else => blk: {
+                var map = KeyHashMap(u32).init(allocator);
+                errdefer map.deinit();
+                try map.ensureTotalCapacity(n32);
+                break :blk .{ .bytes = map };
+            },
+        };
+    }
+
+    fn deinit(self: *MergeIndex) void {
+        switch (self.*) {
+            .bytes => |*m| m.deinit(),
+            inline else => |*f| f.allocator.free(f.slots),
+        }
+    }
+
+    /// `hash` is `std.hash.Wyhash.hash(0, key)`, the map's own hash. A new entry's value is the caller's to set.
+    inline fn getOrPut(self: *MergeIndex, key: []const u8, hash: u64) Entry {
+        switch (self.*) {
+            .bytes => |*m| {
+                const got = m.getOrPutAssumeCapacityAdapted(HashKey{ .bytes = key, .hash = hash }, HashKeyCtx{});
+                if (!got.found_existing) got.key_ptr.* = key;
+                return .{ .found = got.found_existing, .value = got.value_ptr };
+            },
+            inline else => |*f| return f.getOrPut(key, hash),
+        }
+    }
+};
+
+fn FixedMergeIndex(comptime stride: usize) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        slots: []Slot,
+
+        /// 16, 24 or 32 bytes: a stride-9 slot is a quarter of a cache line.
+        const Slot = extern struct { key: [stride]u8, id: u32 };
+        const empty = std.math.maxInt(u32);
+
+        /// Room for `n` keys at most 2/3 full: a near-unique merge mostly misses, and a miss walks to an empty slot.
+        fn init(allocator: std.mem.Allocator, n: u32) !@This() {
+            const cap = std.math.ceilPowerOfTwo(usize, @max(16, @as(usize, n) + n / 2 + 1)) catch
+                return error.OutOfMemory;
+            const slots = try allocator.alloc(Slot, cap);
+            for (slots) |*s| s.id = empty;
+            return .{ .allocator = allocator, .slots = slots };
+        }
+
+        /// Never more keys than `init` was given, so an empty slot is always found. Ids are below that count, so none
+        /// is `empty`.
+        inline fn getOrPut(self: *@This(), key: []const u8, hash: u64) MergeIndex.Entry {
+            std.debug.assert(key.len == stride);
+            const mask = self.slots.len - 1;
+            var i: usize = @intCast(hash & mask);
+            while (true) : (i = (i + 1) & mask) {
+                const s = &self.slots[i];
+                if (s.id == empty) {
+                    s.key = key[0..stride].*;
+                    return .{ .found = false, .value = &s.id };
+                }
+                if (keyEql(&s.key, key)) return .{ .found = true, .value = &s.id };
+            }
+        }
+    };
+}
+
 /// Fold `refs` into distinct groups. `slots` borrows keys from `tables`; `accs` owns any string winners moved out of
 /// those tables. The map is sized for every ref, so a repeated key does not rehash it. `hashes`, when set, is the
 /// Wyhash already computed for each ref (the same one `StringHashMap` uses) and is not computed again.
+/// `in_place` (`mergesInPlace`): `accs` stays empty and each group's state is merged into its first ref's own
+/// accumulators instead, which `slot.idx` names (`packRef`).
 fn hashMergeGroupRefs(
     gpa: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
@@ -4403,36 +4506,32 @@ fn hashMergeGroupRefs(
     hashes: ?[]const u64,
     calls: []const expr_agg.AggCall,
     cut: ?ResultCut,
+    in_place: bool,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
+    if (in_place) return mergeInPlace(gpa, tables, refs, hashes, calls, slots);
     if (cut) |c| {
         if (c.ranking_first) return mergeResultCut(gpa, tables, refs, hashes, calls, c, slots, accs);
         if (calls[c.a_idx].func == .count)
             return mergeCountCut(gpa, tables, refs, hashes, calls, .{ .a_idx = c.a_idx, .k = c.k }, slots, accs);
     }
-    var map = KeyHashMap(u32).init(gpa);
-    defer map.deinit();
-    const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
-    try map.ensureTotalCapacity(n);
+    var index = try MergeIndex.init(gpa, tables, refs.len);
+    defer index.deinit();
     try slots.ensureTotalCapacity(gpa, refs.len);
 
     for (refs, 0..) |ref, ri| {
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
-        const gop = if (hashes) |hs| blk: {
-            const got = map.getOrPutAssumeCapacityAdapted(HashKey{ .bytes = key, .hash = hs[ri] }, HashKeyCtx{});
-            if (!got.found_existing) got.key_ptr.* = key;
-            break :blk got;
-        } else map.getOrPutAssumeCapacity(key);
+        const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
         const src = gt.accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
-        if (gop.found_existing) {
-            const slot = &slots.items[gop.value_ptr.*];
+        if (gop.found) {
+            const slot = &slots.items[gop.value.*];
             slot.first = @min(slot.first, gt.first.items[ref.group]);
             const dst = accs.items[slot.idx..][0..calls.len];
             for (dst, src) |*d, *s| try mergeOwnedAccumulator(d, s, gpa);
         } else {
-            gop.value_ptr.* = @intCast(slots.items.len);
+            gop.value.* = @intCast(slots.items.len);
             const acc_at = accs.items.len;
             try accs.ensureUnusedCapacity(gpa, calls.len);
             for (calls) |call| accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
@@ -4449,6 +4548,70 @@ fn hashMergeGroupRefs(
     if (cut) |c| try keepCountTop(gpa, calls, .{ .a_idx = c.a_idx, .k = c.k }, slots, accs);
 }
 
+/// Whether a full merge may leave each group's state in the source table that first holds it (`mergeInPlace`): no
+/// cut, which keeps and reorders merged state, and no count(DISTINCT), whose sets a read-only copy cannot merge.
+fn mergesInPlace(calls: []const expr_agg.AggCall, cut: ?ResultCut) bool {
+    if (cut != null) return false;
+    for (calls) |call| if (call.func == .count_distinct) return false;
+    return true;
+}
+
+/// A merged-in-place slot's `idx`: its source table above its group.
+fn packRef(ref: MergeGroupRef) usize {
+    return @as(usize, ref.table) << 32 | ref.group;
+}
+
+fn inPlaceAccs(tables: []const expr_agg.GroupTable, idx: usize, n_calls: usize) []expr_agg.Accumulator {
+    const g: usize = @as(u32, @truncate(idx));
+    return tables[idx >> 32].accumulators.items[g * n_calls ..][0..n_calls];
+}
+
+/// `acc` as the copying merge leaves it after merging it into a fresh accumulator. Merging into a fresh one neither
+/// allocates nor frees (`gpa` goes unused), and a string winner stays borrowed. Applying it twice changes nothing: a
+/// fresh sum adds into +0.0, so never ends -0.0.
+fn foldedAcc(gpa: std.mem.Allocator, call: expr_agg.AggCall, acc: expr_agg.Accumulator) !expr_agg.Accumulator {
+    std.debug.assert(call.func != .count_distinct);
+    var out = expr_agg.Accumulator.init(call);
+    try out.merge(acc, gpa);
+    return out;
+}
+
+/// `hashMergeGroupRefs` with no copy of a group's state: a key's first ref keeps it, and each later ref of the key is
+/// merged into it there. Before each such merge the kept state is first made `foldedAcc` of itself, so the sequence of
+/// merges, and every bit of the result, is the copying merge's; rows read a group seen once through `foldedAcc`. A key
+/// is in one partition only, so no two threads write the same state.
+fn mergeInPlace(
+    gpa: std.mem.Allocator,
+    tables: []const expr_agg.GroupTable,
+    refs: []const MergeGroupRef,
+    hashes: ?[]const u64,
+    calls: []const expr_agg.AggCall,
+    slots: *std.ArrayList(MergedSlot),
+) !void {
+    var index = try MergeIndex.init(gpa, tables, refs.len);
+    defer index.deinit();
+    try slots.ensureTotalCapacity(gpa, slots.items.len + refs.len);
+    for (refs, 0..) |ref, ri| {
+        const gt = &tables[ref.table];
+        const key = gt.keyAt(ref.group);
+        const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
+        const first = gt.first.items[ref.group];
+        if (!gop.found) {
+            gop.value.* = @intCast(slots.items.len);
+            slots.appendAssumeCapacity(.{ .key = key, .first = first, .idx = packRef(ref) });
+            continue;
+        }
+        const slot = &slots.items[gop.value.*];
+        slot.first = @min(slot.first, first);
+        const dst = inPlaceAccs(tables, slot.idx, calls.len);
+        const src = gt.accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
+        for (dst, src, calls) |*d, *s, call| {
+            d.* = try foldedAcc(gpa, call, d.*);
+            try mergeOwnedAccumulator(d, s, gpa);
+        }
+    }
+}
+
 /// `hashMergeGroupRefs` under a cut by a COUNT: the counts are summed first, alone, to pick the `cut.k` groups the cut
 /// keeps (largest count, earlier first appearance on a tie); only those groups' accumulators are then merged. A key
 /// seen once (the common case on a near-unique key) costs a count and a position, not a merged copy of its state.
@@ -4462,10 +4625,8 @@ fn mergeCountCut(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
-    var map = KeyHashMap(u32).init(gpa);
-    defer map.deinit();
-    try map.ensureTotalCapacity(n);
+    var index = try MergeIndex.init(gpa, tables, refs.len);
+    defer index.deinit();
     const Group = struct { count: u64, first: u64, key: []const u8 };
     var groups: std.ArrayList(Group) = .empty;
     defer groups.deinit(gpa);
@@ -4475,22 +4636,18 @@ fn mergeCountCut(
     for (refs, group_of, 0..) |ref, *gi, ri| {
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
-        const gop = if (hashes) |hs| blk: {
-            const got = map.getOrPutAssumeCapacityAdapted(HashKey{ .bytes = key, .hash = hs[ri] }, HashKeyCtx{});
-            if (!got.found_existing) got.key_ptr.* = key;
-            break :blk got;
-        } else map.getOrPutAssumeCapacity(key);
+        const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
         const count = gt.accumulators.items[@as(usize, ref.group) * calls.len + cut.a_idx].count;
         const first = gt.first.items[ref.group];
-        if (gop.found_existing) {
-            const g = &groups.items[gop.value_ptr.*];
+        if (gop.found) {
+            const g = &groups.items[gop.value.*];
             g.count +|= count;
             g.first = @min(g.first, first);
         } else {
-            gop.value_ptr.* = @intCast(groups.items.len);
+            gop.value.* = @intCast(groups.items.len);
             groups.appendAssumeCapacity(.{ .count = count, .first = first, .key = key });
         }
-        gi.* = gop.value_ptr.*;
+        gi.* = gop.value.*;
     }
 
     const Item = struct { c: u64, first: u64, g: u32 };
@@ -4566,10 +4723,8 @@ fn mergeResultCutInner(
 ) !void {
     const sa = scratch.allocator();
     const ma = cut.memory orelse gpa;
-    const n: u32 = std.math.cast(u32, refs.len) orelse return error.OutOfMemory;
-    var map = KeyHashMap(u32).init(sa);
-    defer map.deinit();
-    try map.ensureTotalCapacity(n);
+    var index = try MergeIndex.init(sa, tables, refs.len);
+    defer index.deinit();
     const Group = struct { rank: expr_agg.Accumulator, first: u64, key: []const u8 };
     var groups: std.ArrayList(Group) = .empty;
     defer groups.deinit(sa);
@@ -4579,22 +4734,18 @@ fn mergeResultCutInner(
     for (refs, group_of, 0..) |ref, *gi, ri| {
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
-        const gop = if (hashes) |hs| blk: {
-            const got = map.getOrPutAssumeCapacityAdapted(HashKey{ .bytes = key, .hash = hs[ri] }, HashKeyCtx{});
-            if (!got.found_existing) got.key_ptr.* = key;
-            break :blk got;
-        } else map.getOrPutAssumeCapacity(key);
+        const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
         const rank = gt.accumulators.items[@as(usize, ref.group) * calls.len + cut.a_idx];
         const first = gt.first.items[ref.group];
-        if (gop.found_existing) {
-            const g = &groups.items[gop.value_ptr.*];
+        if (gop.found) {
+            const g = &groups.items[gop.value.*];
             try g.rank.merge(rank, sa);
             g.first = @min(g.first, first);
         } else {
-            gop.value_ptr.* = @intCast(groups.items.len);
+            gop.value.* = @intCast(groups.items.len);
             groups.appendAssumeCapacity(.{ .rank = rank, .first = first, .key = key });
         }
-        gi.* = gop.value_ptr.*;
+        gi.* = gop.value.*;
     }
 
     var heap = RankHeap.initContext(cut.descending);
@@ -4676,6 +4827,7 @@ const MergeTask = struct {
     tables: []const expr_agg.GroupTable,
     calls: []const expr_agg.AggCall,
     cut: ?ResultCut,
+    in_place: bool,
     parts: []MergePart,
     cursor: *std.atomic.Value(usize),
     err: ?anyerror = null,
@@ -4687,10 +4839,11 @@ const MergeTask = struct {
             const i = t.cursor.fetchAdd(1, .monotonic);
             if (i >= t.parts.len) return;
             const p = &t.parts[i];
-            hashMergeGroupRefs(t.gpa, t.tables, p.refs, p.hashes, t.calls, t.cut, &p.slots, &p.accs) catch |e| {
-                t.err = e;
-                return;
-            };
+            hashMergeGroupRefs(t.gpa, t.tables, p.refs, p.hashes, t.calls, t.cut, t.in_place, &p.slots, &p.accs) catch |e|
+                {
+                    t.err = e;
+                    return;
+                };
         }
     }
 };
@@ -4705,13 +4858,15 @@ fn mergeFoldedRefs(
     calls: []const expr_agg.AggCall,
     n_workers: usize,
     cut: ?ResultCut,
+    in_place: bool,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
+    std.debug.assert(!in_place or mergesInPlace(calls, cut));
     const ma = if (cut) |c| c.memory orelse gpa else gpa;
     const split_arena = if (cut) |c| c.memory orelse arena else arena;
     const nparts = mergePartitionCount(n_workers, refs.len, cut != null, mergeEntryBytes(calls.len));
-    if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, slots, accs);
+    if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, in_place, slots, accs);
 
     // Partitions come from the middle of the hash: the map inside each takes its fingerprint from the top bits and
     // its slot from the low ones, and a partition that fixed either would collide more.
@@ -4827,6 +4982,7 @@ fn mergeFoldedRefs(
         .tables = tables,
         .calls = calls,
         .cut = cut,
+        .in_place = in_place,
         .parts = parts,
         .cursor = &cursor,
     };
@@ -4852,7 +5008,13 @@ fn mergeFoldedRefs(
     slots.items.len = nslots;
     accs.items.len = naccs;
     cursor.store(0, .monotonic);
-    for (copies) |*c| c.* = .{ .parts = parts, .slots = slots.items, .accs = accs.items, .cursor = &cursor };
+    for (copies) |*c| c.* = .{
+        .parts = parts,
+        .slots = slots.items,
+        .accs = accs.items,
+        .in_place = in_place,
+        .cursor = &cursor,
+    };
     if (!spawn_util.runTree(ConcatTask, copies, config, ConcatTask.run)) ConcatTask.run(&copies[0]);
     // The combined list now owns these winners.
     for (parts) |*p| p.accs.clearRetainingCapacity();
@@ -4863,6 +5025,8 @@ const ConcatTask = struct {
     parts: []const MergePart,
     slots: []MergedSlot,
     accs: []expr_agg.Accumulator,
+    /// Slots name their source groups (`packRef`), not merged accumulators, so none is offset.
+    in_place: bool,
     cursor: *std.atomic.Value(usize),
 
     fn run(t: *ConcatTask) void {
@@ -4873,7 +5037,7 @@ const ConcatTask = struct {
             for (p.slots.items, t.slots[p.slot_at..][0..p.slots.items.len]) |s, *d| d.* = .{
                 .key = s.key,
                 .first = s.first,
-                .idx = s.idx + p.acc_at,
+                .idx = if (t.in_place) s.idx else s.idx + p.acc_at,
             };
             @memcpy(t.accs[p.acc_at..][0..p.accs.items.len], p.accs.items);
         }
@@ -9162,7 +9326,7 @@ fn mergeOverlapAndFree(allocator: std.mem.Allocator) !void {
         freeOwnedAccumulatorStrings(allocator, accs.items);
         accs.deinit(allocator);
     }
-    try hashMergeGroupRefs(allocator, &tables, &refs, null, &calls, null, &slots, &accs);
+    try hashMergeGroupRefs(allocator, &tables, &refs, null, &calls, null, false, &slots, &accs);
     std.sort.pdq(MergedSlot, slots.items, {}, struct {
         fn lt(_: void, x: MergedSlot, y: MergedSlot) bool {
             return x.first < y.first;
@@ -9231,7 +9395,7 @@ test "parallel hash merge matches one thread, including a failed spawn" {
     var serial_accs: std.ArrayList(expr_agg.Accumulator) = .empty;
     defer serial_accs.deinit(testing.allocator);
     // Counts are copied by value and the source is left intact, so a second merge sees the same partials.
-    try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 1, null, &serial_slots, &serial_accs);
+    try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 1, null, false, &serial_slots, &serial_accs);
     try testing.expectEqual(n + n / 2, serial_slots.items.len);
     const half: u64 = @intCast(n / 2);
     try testing.expectEqual(half + 11 * half + 10 * half, countSum(serial_accs.items, serial_slots.items));
@@ -9250,7 +9414,7 @@ test "parallel hash merge matches one thread, including a failed spawn" {
         defer accs.deinit(testing.allocator);
         spawn_util.injectFailureAfter(fail_after);
         defer spawn_util.resetFailure();
-        try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 8, null, &slots, &accs);
+        try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 8, null, false, &slots, &accs);
         spawn_util.resetFailure();
         try testing.expectEqual(serial_slots.items.len, slots.items.len);
         std.sort.pdq(MergedSlot, slots.items, {}, Less.lt);
@@ -9266,6 +9430,295 @@ test "hash merge of worker tables: overlapping keys, first appearance, allocatio
     try mergeOverlapAndFree(testing.allocator);
     var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     try testing.checkAllAllocationFailures(fixed.allocator(), mergeOverlapAndFree, .{});
+}
+
+test "MergeIndex: inline fixed-width keys find what the byte map finds, at every stride" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rand = prng.random();
+    inline for (.{ 9, 18, 27 }) |stride| {
+        const pool = 1500;
+        var images: [pool][stride]u8 = undefined;
+        for (&images, 0..) |*img, i| {
+            rand.bytes(img);
+            // Pairs that differ only in the last byte, past the first 8-byte word the compare loads.
+            if (i % 2 == 1) {
+                img.* = images[i - 1];
+                img[stride - 1] +%= 1;
+            }
+        }
+        var t = expr_agg.GroupTable.init(testing.allocator, 1 << 20);
+        t.fixed_stride = stride;
+        const tables = [_]expr_agg.GroupTable{t};
+        const n = 5000;
+        var fixed = try MergeIndex.init(testing.allocator, &tables, n);
+        defer fixed.deinit();
+        try testing.expect(fixed != .bytes);
+        var bytes: MergeIndex = .{ .bytes = KeyHashMap(u32).init(testing.allocator) };
+        defer bytes.deinit();
+        try bytes.bytes.ensureTotalCapacity(n);
+        var next: u32 = 0;
+        for (0..n) |_| {
+            const key: []const u8 = &images[rand.uintLessThan(usize, pool)];
+            const h = std.hash.Wyhash.hash(0, key);
+            const f = fixed.getOrPut(key, h);
+            const b = bytes.getOrPut(key, h);
+            try testing.expectEqual(b.found, f.found);
+            if (b.found) {
+                try testing.expectEqual(b.value.*, f.value.*);
+            } else {
+                b.value.* = next;
+                f.value.* = next;
+                next += 1;
+            }
+        }
+    }
+}
+
+fn fillFixedPair(
+    allocator: std.mem.Allocator,
+    fixed: *[2]expr_agg.GroupTable,
+    bytes: *[2]expr_agg.GroupTable,
+    stride: u8,
+    calls: []const expr_agg.AggCall,
+    n: usize,
+) !void {
+    for (fixed, bytes, 0..) |*f, *b, ti| {
+        f.* = expr_agg.GroupTable.init(allocator, 1 << 30);
+        f.fixed_stride = stride;
+        b.* = expr_agg.GroupTable.init(allocator, 1 << 30);
+        // Table 1 repeats the upper half of table 0's keys, asked from earlier positions for odd keys.
+        for (0..n) |r| {
+            const i = r + ti * n / 2;
+            var image: [27]u8 = @splat(0);
+            var c: usize = 0;
+            while (c < stride) : (c += 9) {
+                image[c] = 1;
+                std.mem.writeInt(u64, image[c + 1 ..][0..8], (i *% 0x9E3779B97F4A7C15) >> @intCast(c), .little);
+            }
+            const pos: u64 = if (ti == 1 and i % 2 == 1) i / 4 else 1000 * ti + i;
+            const fid = try f.getOrInsertFixed(image[0..stride], calls, pos);
+            const bid = try b.getOrInsert(image[0..stride], calls, pos);
+            for ([_]*expr_agg.GroupTable{ f, b }, [_]u32{ fid, bid }) |t, id| {
+                const accs = t.accumulators.items[@as(usize, id) * calls.len ..][0..calls.len];
+                accs[0].count = i % 7 + 1;
+                accs[1] = .{ .sum_i = @as(i128, @intCast(i)) - 300 };
+            }
+        }
+    }
+}
+
+fn expectSameMerge(
+    allocator: std.mem.Allocator,
+    fixed: []const expr_agg.GroupTable,
+    bytes: []const expr_agg.GroupTable,
+    refs: []const MergeGroupRef,
+    calls: []const expr_agg.AggCall,
+    n_workers: usize,
+    cut: ?ResultCut,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const Lists = struct {
+        slots: std.ArrayList(MergedSlot) = .empty,
+        accs: std.ArrayList(expr_agg.Accumulator) = .empty,
+    };
+    var lists: [2]Lists = .{ .{}, .{} };
+    defer for (&lists) |*l| {
+        l.slots.deinit(allocator);
+        l.accs.deinit(allocator);
+    };
+    const arena = arena_state.allocator();
+    for ([_][]const expr_agg.GroupTable{ fixed, bytes }, &lists) |tables, *l|
+        try mergeFoldedRefs(allocator, arena, tables, refs, calls, n_workers, cut, false, &l.slots, &l.accs);
+    try testing.expectEqual(lists[1].slots.items.len, lists[0].slots.items.len);
+    for (lists[0].slots.items, lists[1].slots.items) |f, b| {
+        try testing.expectEqualSlices(u8, b.key, f.key);
+        try testing.expectEqual(b.first, f.first);
+        try testing.expectEqual(lists[1].accs.items[b.idx].count, lists[0].accs.items[f.idx].count);
+        try testing.expectEqual(lists[1].accs.items[b.idx + 1].sum_i, lists[0].accs.items[f.idx + 1].sum_i);
+    }
+}
+
+fn mergeFixedAsBytes(allocator: std.mem.Allocator, comptime n: usize, stride: u8, n_workers: usize) !void {
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null },
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = null, .where = null },
+    };
+    var fixed: [2]expr_agg.GroupTable = .{ .init(allocator, 0), .init(allocator, 0) };
+    var bytes: [2]expr_agg.GroupTable = .{ .init(allocator, 0), .init(allocator, 0) };
+    defer for (&fixed, &bytes) |*f, *b| {
+        f.deinit();
+        b.deinit();
+    };
+    try fillFixedPair(allocator, &fixed, &bytes, stride, &calls, n);
+    var refs: [2 * n]MergeGroupRef = undefined;
+    for (&refs, 0..) |*r, i| r.* = .{ .table = @intCast(i / n), .group = @intCast(i % n) };
+    // Whole merges, a count cut and a ranking cut, each in one partition and in several.
+    try expectSameMerge(allocator, &fixed, &bytes, &refs, &calls, n_workers, null);
+    try expectSameMerge(allocator, &fixed, &bytes, &refs, &calls, n_workers, .{ .a_idx = 0, .k = 25 });
+    try expectSameMerge(allocator, &fixed, &bytes, &refs, &calls, n_workers, .{
+        .a_idx = 1,
+        .k = 25,
+        .ranking_first = true,
+    });
+}
+
+test "hash merge of fixed-width tables: the byte map's groups, firsts, order and state, cut or not, at every -j" {
+    for ([_]u8{ 9, 18, 27 }) |stride| for ([_]usize{ 1, 3, 8 }) |j| {
+        try mergeFixedAsBytes(testing.allocator, 6000, stride, j);
+    };
+    spawn_util.injectFailureAfter(1);
+    defer spawn_util.resetFailure();
+    try mergeFixedAsBytes(testing.allocator, 6000, 9, 8);
+}
+
+const in_place_calls = [_]expr_agg.AggCall{
+    .{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null },
+    .{ .func = .sum, .alias = "si", .result = .i64, .arg = null, .where = null },
+    .{ .func = .sum, .alias = "sf", .result = .f64, .arg = null, .where = null },
+    .{ .func = .min, .alias = "mb", .result = .bytes, .arg = null, .where = null },
+    .{ .func = .avg, .alias = "av", .result = .avg_f64, .arg = null, .where = null },
+    .{ .func = .max, .alias = "mf", .result = .f64, .arg = null, .where = null },
+};
+
+/// Three tables over `n` keys, each holding about two thirds of them, with float sums of -0.0 alone, -0.0 meeting
+/// -0.0 or +0.0, NULL sums and extrema, and owned string minima.
+fn fillInPlaceTables(gpa: std.mem.Allocator, tables: *[3]expr_agg.GroupTable, fixed: bool, n: usize) !void {
+    const calls = &in_place_calls;
+    for (tables, 0..) |*t, ti| {
+        t.* = expr_agg.GroupTable.init(gpa, 1 << 30);
+        if (fixed) t.fixed_stride = 9;
+        for (0..n) |r| {
+            const i = (r * 7 + ti * 3) % n;
+            if ((i + ti) % 3 == 0) continue;
+            var image: [9]u8 = @splat(0);
+            image[0] = 1;
+            std.mem.writeInt(u64, image[1..9], i, .little);
+            const id = try t.getOrInsert(&image, calls, ti * n + r);
+            const accs = t.accumulators.items[@as(usize, id) * calls.len ..][0..calls.len];
+            const v: f64 = @floatFromInt(@as(i64, @intCast(i % 11)) - 5);
+            accs[0].count = i % 4 + 1;
+            accs[1] = .{ .sum_i = if (i % 13 == 0) null else @as(i128, @intCast(i)) * 3 - 700 };
+            accs[2] = .{ .sum_f = switch (i % 5) {
+                0 => -0.0,
+                1 => if (ti == 0) 0.0 else -0.0,
+                2 => null,
+                else => v * 0.1,
+            } };
+            const tag = (i * 31 + ti * 5) % 97;
+            const min: ?[]const u8 = if (i % 6 == 0) null else try std.fmt.allocPrint(gpa, "s{d}", .{tag});
+            accs[3] = .{ .min_bytes = min };
+            accs[4] = .{ .avg = .{ .sum = v, .count = 1, .isum = @as(i128, @intCast(i)) + ti } };
+            accs[5] = .{ .max_f = if (i % 4 == 0) null else v };
+        }
+    }
+}
+
+const in_place_outputs = blk: {
+    var outs: [in_place_calls.len]BoundOutputColumn = undefined;
+    for (&outs, 0..) |*o, i| o.* = .{ .source = .{ .agg = i }, .name = in_place_calls[i].alias };
+    break :blk outs;
+};
+
+/// Merge, then build rows, from fresh tables, copying the state or in place.
+fn mergeAndBuildRows(gpa: std.mem.Allocator, fixed: bool, n: usize, n_workers: usize, in_place: bool) !AggOutput {
+    var tables: [3]expr_agg.GroupTable = .{ .init(gpa, 0), .init(gpa, 0), .init(gpa, 0) };
+    defer for (&tables) |*t| t.deinit();
+    try fillInPlaceTables(gpa, &tables, fixed, n);
+    var refs: std.ArrayList(MergeGroupRef) = .empty;
+    defer refs.deinit(gpa);
+    for (tables, 0..) |t, ti| for (0..t.groupCount()) |g| {
+        try refs.append(gpa, .{ .table = @intCast(ti), .group = @intCast(g) });
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var slots: std.ArrayList(MergedSlot) = .empty;
+    defer slots.deinit(gpa);
+    var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+    defer {
+        freeOwnedAccumulatorStrings(gpa, accs.items);
+        accs.deinit(gpa);
+    }
+    const calls = &in_place_calls;
+    const arena = arena_state.allocator();
+    try mergeFoldedRefs(gpa, arena, &tables, refs.items, calls, n_workers, null, in_place, &slots, &accs);
+    if (in_place) try testing.expectEqual(@as(usize, 0), accs.items.len);
+    try sortSlotsByFirst(gpa, slots.items, n_workers);
+    var out: AggOutput = .{};
+    errdefer out.deinit(gpa);
+    const rows = try gpa.alloc([]const AggValue, slots.items.len);
+    @memset(rows, &.{});
+    out.group_rows = rows;
+    try buildGroupRows(gpa, &out.slab, .{
+        .slots = slots.items,
+        .outputs = &in_place_outputs,
+        .calls = calls,
+        .key_types = &.{.i64},
+        .accs = accs.items,
+        .folded = true,
+        .in_place = if (in_place) &tables else &.{},
+        .fixed_keys = fixed,
+    }, rows, n_workers);
+    return out;
+}
+
+test "in-place merge: the copying merge's rows, bit for bit, at every -j and when spawns fail" {
+    const gpa = testing.allocator;
+    // Over 8192 refs, so several workers split the merge into partitions.
+    const n = 6000;
+    for ([_]bool{ false, true }) |fixed| {
+        var want = try mergeAndBuildRows(gpa, fixed, n, 1, false);
+        defer want.deinit(gpa);
+        const Run = struct { j: usize, fail_after: ?usize = null };
+        for ([_]Run{ .{ .j = 1 }, .{ .j = 3 }, .{ .j = 8 }, .{ .j = 8, .fail_after = 1 } }) |run| {
+            if (run.fail_after) |k| spawn_util.injectFailureAfter(k);
+            defer spawn_util.resetFailure();
+            var got = try mergeAndBuildRows(gpa, fixed, n, run.j, true);
+            defer got.deinit(gpa);
+            const w = want.group_rows.?;
+            const g = got.group_rows.?;
+            try testing.expectEqual(w.len, g.len);
+            var neg_zero: usize = 0;
+            for (w, g) |wr, gr| for (wr, gr) |wv, gv| {
+                try testing.expectEqual(std.meta.activeTag(wv), std.meta.activeTag(gv));
+                switch (wv) {
+                    .s => |s| try testing.expectEqualStrings(s, gv.s),
+                    .f => |f| {
+                        try testing.expectEqual(@as(u64, @bitCast(f)), @as(u64, @bitCast(gv.f)));
+                        if (std.math.signbit(f) and f == 0) neg_zero += 1;
+                    },
+                    .avg => |a| {
+                        try testing.expectEqual(a.sum == null, gv.avg.sum == null);
+                        if (a.sum) |sum|
+                            try testing.expectEqual(@as(u64, @bitCast(sum)), @as(u64, @bitCast(gv.avg.sum.?)));
+                        try testing.expectEqual(a.count, gv.avg.count);
+                    },
+                    else => try testing.expect(std.meta.eql(wv, gv)),
+                }
+            };
+            // A float sum of -0.0 is never an answer: the copying merge adds every one into +0.0.
+            try testing.expectEqual(@as(usize, 0), neg_zero);
+        }
+    }
+}
+
+test "in-place merge: an allocation failure frees everything" {
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    try testing.checkAllAllocationFailures(fixed.allocator(), struct {
+        fn run(a: std.mem.Allocator) !void {
+            var out = try mergeAndBuildRows(a, true, 12, 1, true);
+            out.deinit(a);
+        }
+    }.run, .{});
+}
+
+test "hash merge of fixed-width tables: an allocation failure frees everything" {
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    try testing.checkAllAllocationFailures(fixed.allocator(), struct {
+        fn run(a: std.mem.Allocator) !void {
+            try mergeFixedAsBytes(a, 24, 18, 1);
+        }
+    }.run, .{});
 }
 
 fn slotFirstLess(_: void, a: MergedSlot, b: MergedSlot) bool {
@@ -10030,7 +10483,7 @@ test "a count cut inside the merge keeps exactly the groups the full sort would,
         defer slots.deinit(testing.allocator);
         var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
         defer accs.deinit(testing.allocator);
-        try mergeFoldedRefs(testing.allocator, arena, &tables, refs.items, &calls, 8, cut, &slots, &accs);
+        try mergeFoldedRefs(testing.allocator, arena, &tables, refs.items, &calls, 8, cut, false, &slots, &accs);
         if (cut != null) try testing.expectEqual(@as(usize, 25) * mergePartitionCount(8, refs.items.len, true, mergeEntryBytes(calls.len)), slots.items.len);
         const ranked = try arena.alloc(Ranked, slots.items.len);
         for (slots.items, ranked) |s, *r| r.* = .{ .c = accs.items[s.idx].count, .first = s.first, .key = s.key };
@@ -11080,7 +11533,8 @@ test "result cut SUM: complete signed ranks, NULLs, ties, offsets and owned payl
                 accs.deinit(gpa);
             }
             const cut: ResultCut = .{ .a_idx = 0, .k = 3, .descending = true, .ranking_first = true };
-            try mergeFoldedRefs(gpa, arena_state.allocator(), &tables, refs.items, &calls, 3, cut, &slots, &accs);
+            const arena = arena_state.allocator();
+            try mergeFoldedRefs(gpa, arena, &tables, refs.items, &calls, 3, cut, false, &slots, &accs);
             try keepResultTop(gpa, &calls, cut, &slots, &accs);
             try sortSlotsByFirst(gpa, slots.items, 1);
             try testing.expectEqual(@as(usize, 3), slots.items.len);
@@ -11168,6 +11622,7 @@ test "result cut SUM: the merge's scratch is uncharged, as the full merge's is" 
         null,
         &calls,
         .{ .a_idx = 0, .k = 1, .ranking_first = true },
+        false,
         &slots,
         &accs,
     );
@@ -11241,6 +11696,7 @@ test "result cut SUM: the one-table cut holds no charge; retained winner capacit
         null,
         &calls,
         .{ .a_idx = 0, .k = 1, .ranking_first = true, .memory = memory.allocator() },
+        false,
         &slots,
         &accs,
     );

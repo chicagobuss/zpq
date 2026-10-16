@@ -774,10 +774,18 @@ fn executeAggregateOver(
         const st = r.state;
         const codec = args.codec orelse .SNAPPY;
         const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
+        // A big answer's columns encode on the query's workers, with a quarter of its budget for those in flight, as a
+        // re-encode's output in flight takes.
+        const encode: consumer.AggEncode = .{
+            .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
+            .budget = args.max_memory / 4,
+        };
+        const names = r.output.group_cols;
+        const fd = args.output_fd;
         bytes_out = if (r.output.typed) |typed|
-            try writeTypedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, typed, codec, zstd, args.output_fd)
+            try writeTypedParquet(arena, out_path, names.?, st.group_col_types.?, typed, codec, zstd, encode, fd)
         else if (r.output.group_rows) |rows|
-            try writeGroupedParquet(arena, out_path, r.output.group_cols.?, st.group_col_types.?, rows, codec, zstd, args.output_fd)
+            try writeGroupedParquet(arena, out_path, names.?, st.group_col_types.?, rows, codec, zstd, encode, fd)
         else
             try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, args.output_fd, args.empty_scalar or r.output.no_row);
         const t_footer_end = nowMonoNs();
@@ -4320,7 +4328,7 @@ fn writeOneRowParquet(
             if (col.def_levels) |levels| col.def_levels = levels[0..0];
         },
     };
-    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, if (empty) 0 else 1, codec, zstd);
+    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, if (empty) 0 else 1, codec, zstd, .{});
     if (fd_open) {
         fd_open = false;
         try local_fs.closeChecked(fd);
@@ -4338,6 +4346,7 @@ fn writeGroupedParquet(
     rows: []const []const scan.AggValue,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
     output_fd: ?local_fs.fd_t,
 ) !u64 {
     var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
@@ -4377,7 +4386,7 @@ fn writeGroupedParquet(
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
-    const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd);
+    const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd, encode);
     if (fd_open) {
         fd_open = false;
         try local_fs.closeChecked(fd);
@@ -4395,6 +4404,7 @@ fn writeTypedParquet(
     answer: scan.TypedAnswer,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
     output_fd: ?local_fs.fd_t,
 ) !u64 {
     var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
@@ -4427,7 +4437,8 @@ fn writeTypedParquet(
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
-    const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(answer.rows), codec, zstd);
+    const rows: i64 = @intCast(answer.rows);
+    const written = try consumer.writeAggregateRows(arena, sink, outs.items, rows, codec, zstd, encode);
     if (fd_open) {
         fd_open = false;
         try local_fs.closeChecked(fd);

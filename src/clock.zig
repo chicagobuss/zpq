@@ -29,6 +29,12 @@ pub fn bootNs() i64 {
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
+/// Wall-clock milliseconds since the Unix epoch.
+pub fn realtimeMs() i64 {
+    const ts = read(.real);
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
 /// Wall-clock seconds since the Unix epoch.
 pub fn realtimeS() i64 {
     return @intCast(read(.real).sec);

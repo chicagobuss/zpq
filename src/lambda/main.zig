@@ -87,13 +87,27 @@ pub fn main(init: std.process.Init) !void {
         };
         defer inv.deinit(allocator);
 
+        // A second short of the invocation's deadline: S3 requests stop there, and the caller hears why rather than
+        // nothing when the sandbox is stopped (`Watchdog`).
+        const left_ms: ?u64 = if (inv.deadline_ms) |d| @intCast(@max(0, d - zpq.clock.realtimeMs() - 1000)) else null;
+        zpq.io.tls.setInvocationDeadline(left_ms);
+        defer zpq.io.tls.setInvocationDeadline(null);
+        var watchdog: Watchdog = .{ .client = &client, .request_id = inv.request_id };
+        const watcher: ?std.Thread = if (left_ms) |ms| std.Thread.spawn(.{}, Watchdog.run, .{ &watchdog, ms }) catch
+            null else null;
+        defer if (watcher) |t| watchdog.stop(t);
+
         const response = service.handle(io, allocator, env, inv.body, &pool, legacy) catch |err| {
-            client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
+            if (watchdog.claim()) client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
             continue;
         };
         defer allocator.free(response);
+        if (!watchdog.claim()) {
+            std.debug.print("zpq lambda: answered past the deadline; the invocation was failed already\n", .{});
+            continue;
+        }
 
         // Past the runtime API's limit the caller got AWS's generic payload error and no reason: say why, and how to
         // get the answer instead. One the runtime refuses, or drops while it is sent, is reported the same way.
@@ -110,6 +124,46 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 }
+
+/// Fails the invocation through /error once its deadline is a second away and the handler has not answered: a query
+/// still computing then was stopped with the sandbox, and the caller was told nothing. Whichever of it and the loop
+/// claims the invocation first posts for it.
+const Watchdog = struct {
+    client: *runtime.Client,
+    request_id: []const u8,
+    /// 0 unanswered, 1 claimed by the loop, 2 by the watchdog.
+    owner: std.atomic.Value(u32) = .init(0),
+    /// Futex word: 1 once the loop is done with the invocation.
+    done: std.atomic.Value(u32) = .init(0),
+
+    fn run(self: *Watchdog, ms: u64) void {
+        const until = zpq.clock.monoNs() + @as(i64, @intCast(ms * std.time.ns_per_ms));
+        while (self.done.load(.acquire) == 0) {
+            const left = until - zpq.clock.monoNs();
+            if (left <= 0) break;
+            const ts: std.os.linux.timespec = .{
+                .sec = @intCast(@divTrunc(left, std.time.ns_per_s)),
+                .nsec = @intCast(@mod(left, std.time.ns_per_s)),
+            };
+            _ = std.os.linux.futex_4arg(&self.done.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
+        }
+        if (self.done.load(.acquire) != 0) return;
+        if (self.owner.cmpxchgStrong(0, 2, .acq_rel, .acquire) != null) return;
+        postFailure(self.client, self.request_id, "DeadlineExceeded", "the query did not finish within the " ++
+            "function's timeout: raise the timeout, or narrow the query (a filter, fewer columns, an output_url)");
+    }
+
+    /// Whether the loop may answer the invocation: false once the watchdog has failed it.
+    fn claim(self: *Watchdog) bool {
+        return self.owner.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null or self.owner.load(.acquire) == 1;
+    }
+
+    fn stop(self: *Watchdog, t: std.Thread) void {
+        self.done.store(1, .release);
+        _ = std.os.linux.futex_3arg(&self.done.raw, .{ .cmd = .WAKE, .private = true }, 1);
+        t.join();
+    }
+};
 
 fn postFailure(client: *runtime.Client, request_id: []const u8, error_type: []const u8, message: []const u8) void {
     client.postError(request_id, error_type, message) catch |err| {

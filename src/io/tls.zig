@@ -100,6 +100,16 @@ pub const Timeouts = struct {
     }
 };
 
+/// The last moment (`monoMs`) any request may run to, 0 for none: the Lambda sets it a second before its invocation's
+/// deadline, so a query still waiting on S3 then fails, cleans up and says why before the sandbox is stopped. One
+/// invocation runs at a time there; libzpq and the CLI never set it.
+pub var invocation_deadline_ms: std.atomic.Value(u64) = .init(0);
+
+/// Set `invocation_deadline_ms` `ms` from now, or clear it with null.
+pub fn setInvocationDeadline(ms: ?u64) void {
+    invocation_deadline_ms.store(if (ms) |m| monoMs() +| @max(1, m) else 0, .monotonic);
+}
+
 pub const ClientContext = boring.tls_client.ClientContext;
 
 /// An IPv4 address, in network byte order.
@@ -326,7 +336,10 @@ pub const Connection = struct {
     pub fn armDeadline(self: *Connection, bytes: usize) void {
         const at_rate = std.math.mul(u64, bytes, std.time.ms_per_s) catch std.math.maxInt(u64);
         const total = @max(self.timeouts.request_ms, at_rate / @max(1, self.timeouts.min_rate));
-        self.deadline_ms = nowMs(self.timeouts.clock_ms) +| total;
+        var at = nowMs(self.timeouts.clock_ms) +| total;
+        const last = invocation_deadline_ms.load(.monotonic);
+        if (last != 0 and self.timeouts.clock_ms == null) at = @min(at, last);
+        self.deadline_ms = at;
     }
 
     pub fn disarmDeadline(self: *Connection) void {
@@ -1297,4 +1310,19 @@ test "signals interrupting a wait do not extend the handshake, first-byte, idle 
     }
     // At 20 ms apart, each 200 ms wait above was interrupted several times.
     try testing.expect(irq.sent.load(.monotonic) >= 20);
+}
+
+test "regression: an attempt's deadline never runs past the invocation's" {
+    var conn: Connection = undefined;
+    conn.timeouts = .{};
+    conn.deadline_ms = null;
+    // The Lambda's last second: a request armed now must be done by then, not 30 s on.
+    setInvocationDeadline(100);
+    defer setInvocationDeadline(null);
+    const before = monoMs();
+    conn.armDeadline(0);
+    try std.testing.expect(conn.deadline_ms.? <= before + 100 + 5);
+    setInvocationDeadline(null);
+    conn.armDeadline(0);
+    try std.testing.expect(conn.deadline_ms.? >= before + conn.timeouts.request_ms);
 }

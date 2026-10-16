@@ -25,6 +25,8 @@ pub const Error = error{
     NegativeSize,
     /// A page header's value / null / row count is negative, or claims more nulls than values.
     BadPageCount,
+    /// The chunk's pages inflate past `PageReader.byte_limit`: past what the footer says the chunk holds.
+    PageLargerThanChunk,
 } || compression.Error;
 
 pub const Page = struct {
@@ -121,6 +123,11 @@ pub const PageReader = struct {
     /// Records a `decompress` span per compressed page when set. Separate from `scratch`, which byte-array readers
     /// leave unset.
     prof: ?*profile.Thread = null,
+    /// The most bytes the chunk's pages may inflate to together, from its footer (`DecodeOptions.page_bytes_limit`):
+    /// a page header claiming 1 GiB in a chunk whose footer says 32 KiB would otherwise be decompressed whole,
+    /// outside any memory budget.
+    byte_limit: usize = std.math.maxInt(usize),
+    inflated: usize = 0,
 
     pub fn init(
         chunk: []const u8,
@@ -174,6 +181,9 @@ pub const PageReader = struct {
         if (self.pos + header_size + csize > self.chunk.len) {
             return error.UnexpectedEndOfChunk;
         }
+
+        self.inflated +|= usize_;
+        if (self.inflated > self.byte_limit) return error.PageLargerThanChunk;
 
         const payload_start = self.pos + header_size;
         const payload = self.chunk[payload_start..][0..csize];

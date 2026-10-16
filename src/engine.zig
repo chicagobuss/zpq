@@ -2176,7 +2176,7 @@ fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
                 .kept_set = kept_set,
                 .codec = args.codec orelse .SNAPPY,
                 .zstd = zstd,
-                .decode_options = .{ .fast_levels = args.fast_levels },
+                .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
                 .bloom_outputs = blooms.outputs,
                 .bloom_leaves = blooms.leaves,
                 .slots = slots,
@@ -6444,7 +6444,7 @@ pub fn runPrintSink(
                 .limit = limit,
                 .total_printed = &total_printed,
                 .budget = args.max_memory / 2,
-                .decode_options = .{ .fast_levels = args.fast_levels },
+                .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
             };
             const printed = try printRowGroupSliced(
                 ctx.gpa,
@@ -7657,6 +7657,33 @@ test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for 
         error.NotParquet,
         runQuery(ctx, .{ .inputs = &.{dir ++ "decimal_precision0.parquet"}, .aggregate = "count(*) AS n" }),
     );
+}
+
+test "regression: a page inflating past its chunk, or values expanding past the budget, are refused" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "page_bomb.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // A 32 KiB file whose footer says one row and 32 KiB; its one page inflates to 1 GiB.
+    var diag: Diag = .{};
+    try std.testing.expectError(error.PageLargerThanChunk, runQuery(ctx, .{
+        .inputs = &.{dir ++ "page_bomb.parquet"},
+        .aggregate = "count(*) AS n",
+        .filter = "x = 1",
+        .max_memory = 16 << 20,
+        .diag = &diag,
+    }));
+    // 442 bytes of DELTA_BYTE_ARRAY: 60 values of 100 kB, each its predecessor as a prefix.
+    const dba: []const []const u8 = &.{dir ++ "dba_expand.parquet"};
+    try std.testing.expectError(error.ExceededMemoryBudget, runQuery(ctx, .{
+        .inputs = dba,
+        .aggregate = "count(*) AS n",
+        .filter = "s = 'x'",
+        .max_memory = 1 << 20,
+    }));
+    var r = try runQuery(ctx, .{ .inputs = dba, .aggregate = "count(*) AS n", .filter = "s = 'x'" });
+    defer r.deinit(gpa);
+    try std.testing.expectEqual(@as(i128, 0), r.aggregate.output.aggs[0].value.i);
 }
 
 test "every write path records a row group's uncompressed bytes as its total_byte_size" {

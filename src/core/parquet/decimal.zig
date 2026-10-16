@@ -339,7 +339,8 @@ pub fn decodeColumnExact(
             };
         },
         .FIXED_LEN_BYTE_ARRAY => {
-            const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind);
+            const limit = decode_options.page_bytes_limit;
+            const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind, limit);
             const values = try arena.alloc(f64, raw.values.len);
             for (raw.values, values) |v, *o| o.* = applyScaleI128(v, kind.scale);
             return .{
@@ -442,7 +443,15 @@ pub fn decodeColumnAsI128WithOptions(
     return switch (kind.physical) {
         .INT32 => try decodeIntBackedI128(i32, arena, chunk, codec, levels, num_leaves, decode_options),
         .INT64 => try decodeIntBackedI128(i64, arena, chunk, codec, levels, num_leaves, decode_options),
-        .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind),
+        .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind,
+            decode_options.page_bytes_limit,
+        ),
         .BYTE_ARRAY => try decodeByteArrayBackedI128(arena, chunk, codec, levels, num_leaves, decode_options, null),
         else => error.UnsupportedDecimalPhysicalType,
     };
@@ -629,6 +638,7 @@ fn decodeFlbaBackedI128(
     levels: schema.Levels,
     num_leaves: usize,
     kind: Kind,
+    byte_limit: usize,
 ) Error!filter_eval.ColumnT(i128) {
     if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH) {
         return error.DecimalByteWidthTooLarge;
@@ -647,6 +657,7 @@ fn decodeFlbaBackedI128(
     var dict_i128: ?[]const i128 = null;
 
     var pr = page_mod.PageReader.init(chunk, codec, arena);
+    pr.byte_limit = byte_limit;
     var written: usize = 0;
     var has_nulls = false;
     var data_seen = false;
@@ -707,7 +718,7 @@ fn decodeFlbaBacked(
     num_leaves: usize,
     kind: Kind,
 ) Error!filter_eval.ColumnT(f64) {
-    const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind);
+    const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind, std.math.maxInt(usize));
     const out = try arena.alloc(f64, raw.values.len);
     for (raw.values, 0..) |v, i| out[i] = applyScaleI128(v, kind.scale);
     return .{

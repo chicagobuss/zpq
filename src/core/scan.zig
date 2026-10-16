@@ -3023,7 +3023,11 @@ fn prepareAggregate(
             .cursor = &work_cursor,
             .agg_calls = agg_calls,
             .plan = &plan,
-            .decode_options = .{ .fast_levels = args.fast_levels, .encoded = args.encoded },
+            .decode_options = .{
+                .fast_levels = args.fast_levels,
+                .encoded = args.encoded,
+                .expand_limit = args.max_memory,
+            },
             .profiler = args.profiler,
             .index = wi,
             .group_by_keys = group_by_keys,

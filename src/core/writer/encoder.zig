@@ -1846,7 +1846,7 @@ test "both string layouts round-trip through their decoders (incl. nulls), chose
         try testing.expectEqual(case.want, enc.encoding);
         var out: [5][]const u8 = undefined; // 5 present values
         const n = if (enc.encoding == .DELTA_BYTE_ARRAY) blk: {
-            var dec = try dba.DeltaByteArrayDecoder.init(enc.bytes, a, std.math.maxInt(usize));
+            var dec = try dba.DeltaByteArrayDecoder.init(enc.bytes, a, std.math.maxInt(usize), std.math.maxInt(usize));
             break :blk try dec.decode(&out);
         } else blk: {
             var dec = try dba.DeltaLengthByteArrayDecoder.init(enc.bytes, a, std.math.maxInt(usize));
@@ -2417,7 +2417,7 @@ test "the string prefix choice is inclusive at a quarter, and skips nulls" {
         const dba = @import("../parquet/encoding/delta_byte_array.zig");
         var out: [2][]const u8 = undefined;
         const n = if (got.encoding == .DELTA_BYTE_ARRAY) blk: {
-            var decoder = try dba.DeltaByteArrayDecoder.init(got.bytes, a, 2);
+            var decoder = try dba.DeltaByteArrayDecoder.init(got.bytes, a, 2, std.math.maxInt(usize));
             break :blk try decoder.decode(&out);
         } else blk: {
             var decoder = try dba.DeltaLengthByteArrayDecoder.init(got.bytes, a, 2);

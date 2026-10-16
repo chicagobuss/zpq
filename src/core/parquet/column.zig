@@ -54,6 +54,8 @@ pub const Error = error{
     UnexpectedDictionaryPage,
     /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
     LevelOutOfRange,
+    /// A page's values expand past `DecodeOptions.expand_limit`, the query's budget.
+    ExceededMemoryBudget,
 } || page_mod.Error;
 
 /// Choose the right decoder shape for T at comptime.
@@ -118,7 +120,21 @@ pub const DecodeOptions = struct {
     /// Keep codes however near-unique the dictionary: a key folded by a retained domain translates its codes, so
     /// they never cost per-entry work (`agg_dense`).
     any_dictionary: bool = false,
+    /// The most bytes one chunk's pages may inflate to (`PageReader.byte_limit`); set per chunk from its footer.
+    page_bytes_limit: usize = std.math.maxInt(usize),
+    /// The most bytes one page's DELTA_BYTE_ARRAY values may expand to: the query's memory budget, which a page past
+    /// it could only overrun (a few bytes of prefix lengths can ask for a terabyte).
+    expand_limit: usize = std.math.maxInt(usize),
 };
+
+/// `o` for the chunk `cm` describes: its pages inflate to at most twice what the footer says the chunk holds, plus
+/// slack for writers that count loosely.
+pub fn chunkOptions(o: DecodeOptions, cm: schema.ColumnMetaData) DecodeOptions {
+    var x = o;
+    const total = std.math.cast(usize, cm.total_uncompressed_size) orelse std.math.maxInt(usize);
+    x.page_bytes_limit = @min(o.page_bytes_limit, total *| 2 +| (1 << 20));
+    return x;
+}
 
 /// Hardwood's definition-level test, ported: a page has no nulls iff its
 /// def-level stream is a single RLE run at max_def long enough to cover
@@ -231,6 +247,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             scratch: ?*DecodeScratch,
         ) Self {
             var pages = page_mod.PageReader.init(chunk_bytes, codec, arena);
+            pages.byte_limit = options.page_bytes_limit;
             // Byte-array values are slices into the page bytes, so those pages must outlive the reader.
             if (T != []const u8) pages.scratch = scratch;
             if (scratch) |s| pages.prof = s.prof;
@@ -1349,8 +1366,12 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values);
-                    self.active = .{ .delta_ba = d catch return error.UnexpectedPage };
+                    const limit = self.options.expand_limit;
+                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, limit);
+                    self.active = .{ .delta_ba = d catch |e| return if (e == error.ExceededMemoryBudget)
+                        error.ExceededMemoryBudget
+                    else
+                        error.UnexpectedPage };
                 },
                 .RLE => try self.installRleBoolean(values_bytes),
                 .BYTE_STREAM_SPLIT => try self.installByteStreamSplit(values_bytes),

@@ -33,6 +33,8 @@ pub const Error = error{
     NegativeLength,
     OutOfMemory,
     InvalidStream,
+    /// The values expand past the caller's limit (`DeltaByteArrayDecoder.init`).
+    ExceededMemoryBudget,
 } || dbp.Error;
 
 // ============================================================
@@ -103,8 +105,15 @@ pub const DeltaByteArrayDecoder = struct {
     /// its prefix. arena-owned, replaced per value.
     last_value: []u8,
 
-    /// `max_values`: as for `DeltaLengthByteArrayDecoder.init`.
-    pub fn init(encoded: []const u8, arena: std.mem.Allocator, max_values: usize) Error!DeltaByteArrayDecoder {
+    /// `max_values`: as for `DeltaLengthByteArrayDecoder.init`. `expand_limit`: the most bytes the values may
+    /// expand to, summed from both length streams before any value is built: each value copies its prefix from the
+    /// one before, so a page of a few bytes can describe a terabyte.
+    pub fn init(
+        encoded: []const u8,
+        arena: std.mem.Allocator,
+        max_values: usize,
+        expand_limit: usize,
+    ) Error!DeltaByteArrayDecoder {
         // First DELTA_BINARY_PACKED stream: prefix lengths.
         var prefix_dec = try dbp.Decoder(i32).init(encoded);
         if (prefix_dec.total_value_count > max_values) return error.InvalidStream;
@@ -124,6 +133,16 @@ pub const DeltaByteArrayDecoder = struct {
         const suffix_bytes = encoded[prefix_dec.pos..];
         const suffixes = try DeltaLengthByteArrayDecoder.init(suffix_bytes, arena, total);
         if (suffixes.lengths.len != total) return error.InvalidStream;
+        var prev: usize = 0;
+        var expanded: usize = 0;
+        for (prefixes, suffixes.lengths) |p, l| {
+            if (p < 0 or l < 0) return error.NegativeLength;
+            const pl: usize = @intCast(p);
+            if (pl > prev) return error.InvalidStream;
+            prev = pl + @as(usize, @intCast(l));
+            expanded +|= prev;
+        }
+        if (expanded > expand_limit) return error.ExceededMemoryBudget;
 
         return .{
             .arena = arena,
@@ -285,7 +304,9 @@ test "a delta stream claiming more values than its page holds is rejected before
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try testing.expectError(error.InvalidStream, DeltaLengthByteArrayDecoder.init(&stream, arena_state.allocator(), 4));
-    try testing.expectError(error.InvalidStream, DeltaByteArrayDecoder.init(&stream, arena_state.allocator(), 4));
+    const no_limit = std.math.maxInt(usize);
+    const got = DeltaByteArrayDecoder.init(&stream, arena_state.allocator(), 4, no_limit);
+    try testing.expectError(error.InvalidStream, got);
 }
 
 test "DELTA_LENGTH_BYTE_ARRAY round-trip" {
@@ -338,7 +359,7 @@ test "DELTA_BYTE_ARRAY round-trip with shared prefixes" {
     try stream.appendSlice(testing.allocator, suf_lens_enc);
     for (suffixes) |s| try stream.appendSlice(testing.allocator, s);
 
-    var dec = try DeltaByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize));
+    var dec = try DeltaByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize), std.math.maxInt(usize));
     var out: [4][]const u8 = undefined;
     const n = try dec.decode(&out);
     try testing.expectEqual(@as(usize, values.len), n);
@@ -381,7 +402,7 @@ test "DELTA_BYTE_ARRAY partial decode preserves last_value" {
     try stream.appendSlice(testing.allocator, suf_lens_enc);
     for (suffixes) |s| try stream.appendSlice(testing.allocator, s);
 
-    var dec = try DeltaByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize));
+    var dec = try DeltaByteArrayDecoder.init(stream.items, a, std.math.maxInt(usize), std.math.maxInt(usize));
     var out: [2][]const u8 = undefined;
 
     const n1 = try dec.decode(&out);

@@ -60,6 +60,8 @@ pub fn decodeColumnAsI64Nanos(
     codec: schema.CompressionCodec,
     levels: schema.Levels,
     num_leaves: usize,
+    /// `DecodeOptions.page_bytes_limit`.
+    byte_limit: usize,
 ) Error!filter_eval.ColumnT(i64) {
     const values = try arena.alloc(i64, num_leaves);
 
@@ -73,6 +75,7 @@ pub fn decodeColumnAsI64Nanos(
     var dict_i64: ?[]const i64 = null;
 
     var pr = page_mod.PageReader.init(chunk, codec, arena);
+    pr.byte_limit = byte_limit;
     var written: usize = 0;
     var has_nulls = false;
     var data_seen = false;
@@ -339,12 +342,12 @@ test "a second INT96 dictionary page, after data or after the first, is a corrup
     const dict_page = .{ true, 2, @as([]const u8, &dict) };
     const data_page = .{ false, 2, @as([]const u8, &data) };
     const back_to_back = try chunkForTest(a, &.{ dict_page, dict_page, data_page });
-    const twice = decodeColumnAsI64Nanos(a, back_to_back, .UNCOMPRESSED, levels, 2);
+    const twice = decodeColumnAsI64Nanos(a, back_to_back, .UNCOMPRESSED, levels, 2, std.math.maxInt(usize));
     try testing.expectError(error.UnexpectedDictionaryPage, twice);
     const after_data = try chunkForTest(a, &.{ dict_page, data_page, dict_page, data_page });
-    const late = decodeColumnAsI64Nanos(a, after_data, .UNCOMPRESSED, levels, 4);
+    const late = decodeColumnAsI64Nanos(a, after_data, .UNCOMPRESSED, levels, 4, std.math.maxInt(usize));
     try testing.expectError(error.UnexpectedDictionaryPage, late);
     // One dictionary, first: decodes.
     const good = try chunkForTest(a, &.{ .{ true, 2, &dict }, .{ false, 2, &data } });
-    _ = try decodeColumnAsI64Nanos(a, good, .UNCOMPRESSED, levels, 2);
+    _ = try decodeColumnAsI64Nanos(a, good, .UNCOMPRESSED, levels, 2, std.math.maxInt(usize));
 }

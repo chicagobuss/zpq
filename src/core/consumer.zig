@@ -569,13 +569,14 @@ fn decodeWriteColumn(
     meta: *const schema.FileMetaData,
     src: RGSrc,
     ci: usize,
-    decode_options: DecodeOptions,
+    decode_options_in: DecodeOptions,
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
     const num_rows: usize = @intCast(rg.num_rows);
     const chunk_span = profile.Span.begin(prof);
     const col = &rg.columns.items[ci];
     const cm = col.meta_data orelse return error.ColumnMetaMissing;
+    const decode_options = column_mod.chunkOptions(decode_options_in, cm);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
     const len: usize = @intCast(cm.total_compressed_size);
     // Programmer invariant: the chunk's absolute start is at or past
@@ -628,7 +629,14 @@ fn decodeWriteColumn(
             .boolean = try decodeColumnTWithOptions(bool, ra, chunk, cm.codec, levels, n_leaves, decode_options),
         },
         // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
-        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(ra, chunk, cm.codec, levels, n_leaves) },
+        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            decode_options.page_bytes_limit,
+        ) },
         // FIXED_LEN_BYTE_ARRAY (non-decimal — decimal handled above): raw
         // fixed-width bytes (UUID / Float16 / fixed binary).
         .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnWithOptions(
@@ -705,7 +713,14 @@ pub fn chunkDictionary(
     invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
     const buf_off = start - @as(usize, @intCast(src.byte_origin));
     if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
-    var r = column_mod.ColumnChunkReader([]const u8).init(src.bytes[buf_off..][0..len], cm.codec, levels, a);
+    var r = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        src.bytes[buf_off..][0..len],
+        cm.codec,
+        levels,
+        a,
+        column_mod.chunkOptions(.{}, cm),
+        null,
+    );
     return r.dictionaryOfEveryPage();
 }
 
@@ -751,10 +766,11 @@ pub const SliceReader = struct {
         meta: *const schema.FileMetaData,
         src: RGSrc,
         ci: usize,
-        decode_options: DecodeOptions,
+        decode_options_in: DecodeOptions,
     ) !?SliceReader {
         if (!supports(rg, meta, ci)) return null;
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+        const decode_options = column_mod.chunkOptions(decode_options_in, cm);
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
         const se = meta.getColumnSchema(cm.path_in_schema.items);
         const dec: ?decimal_mod.Kind = if (se) |e| decimal_mod.kindFromSchema(&e) else null;
@@ -1073,9 +1089,10 @@ fn decodeDecimalI128(
     meta: *const schema.FileMetaData,
     src: RGSrc,
     kept_ci: usize,
-    decode_options: DecodeOptions,
+    decode_options_in: DecodeOptions,
 ) !filter_eval.ColumnT(i128) {
     const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
+    const decode_options = column_mod.chunkOptions(decode_options_in, cm);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
     const len: usize = @intCast(cm.total_compressed_size);
     invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
@@ -1276,10 +1293,11 @@ fn decodeWriteColumnMaybeCoded(
     meta: *const schema.FileMetaData,
     src: RGSrc,
     ci: usize,
-    decode_options: DecodeOptions,
+    decode_options_in: DecodeOptions,
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
     const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
+    const decode_options = column_mod.chunkOptions(decode_options_in, cm);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     const se = meta.getColumnSchema(cm.path_in_schema.items);
     const converted = if (se) |e| decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e) else false;
@@ -2834,7 +2852,7 @@ const ChunkDecoder = struct {
         // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
         const uses = self.uses;
-        var decode_options = self.decode_options;
+        var decode_options = column_mod.chunkOptions(self.decode_options, cm);
         decode_options.any_dictionary = switch (self.target) {
             .grouped => |g| g.dense != null and g.keys[0].col_ref.col_idx == ci,
             .scalar => false,
@@ -3692,6 +3710,7 @@ fn decodeAggColumn(
             cm.codec,
             levels,
             n_leaves,
+            decode_options.page_bytes_limit,
         ) },
         .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(
             ra,

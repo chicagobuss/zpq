@@ -2113,6 +2113,19 @@ test "regression: LIKE `_` matches one UTF-8 character, not one byte" {
     try testing.expect(ast.likeGlob("%é_", "xxéé") and !ast.likeGlob("%é__", "xxéé"));
     // Bytes that are no UTF-8 count one apiece, so binary values still match.
     try testing.expect(ast.likeGlob("__", "\xff\xfe") and ast.likeGlob("_", "\xc3"));
+    // A lead byte without its continuation bytes is no character either.
+    try testing.expect(ast.likeGlob("__", "\xc3A") and ast.likeGlob("_A", "\xc3A") and !ast.likeGlob("_", "\xc3A"));
+    try testing.expect(ast.likeGlob("___", "\xe2\x82A") and !ast.likeGlob("_", "\xe2\x82\xac\xac"));
+}
+
+test "regression: LIKE wildcards stay wildcards against a `%` or `_` in the value" {
+    try testing.expect(ast.likeGlob("_%", "a%b"));
+    try testing.expect(ast.likeGlob("a%_b", "a%b"));
+    try testing.expect(ast.likeGlob("%%", "%") and ast.likeGlob("%_", "%") and ast.likeGlob("_", "%"));
+    try testing.expect(ast.likeGlob("a_%", "a_") and ast.likeGlob("%_%", "_") and !ast.likeGlob("__", "_"));
+    try testing.expect(ast.likeGlob("x%y%z", "x%%y__z") and !ast.likeGlob("x%y%z", "x%%y__"));
+    try testing.expect(ast.likeGlob("é%_", "é%é") and ast.likeGlob("é%__", "é%é") and !ast.likeGlob("é%___", "é%é"));
+    // ESCAPE, which would make `%` or `_` literal, is refused rather than ignored (see the string-literal test).
 }
 
 test "parse IS NULL / IS NOT NULL → null_check node (+ NOT negation)" {

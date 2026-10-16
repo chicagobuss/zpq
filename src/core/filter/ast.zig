@@ -112,24 +112,27 @@ pub const LikeMatch = struct {
 
 /// Backtracking `%`/`_` matcher for the general case. `%` matches any run
 /// (incl. empty); `_` matches exactly one UTF-8 character, as SQL means it
-/// (a byte at a time, `_` missed `é` and `a_` missed `aé`). O(n·m) worst
-/// case, linear in practice — the fast kinds skip this entirely.
+/// (a byte at a time, `_` missed `é` and `a_` missed `aé`). A pattern's `%`
+/// and `_` are wildcards before anything else: tested for equality first, a
+/// `%` facing a `%` in the value was taken as a literal and left nothing to
+/// backtrack to (`'a%b' LIKE '_%'` missed). O(n·m) worst case, linear in
+/// practice — the fast kinds skip this entirely.
 pub fn likeGlob(pattern: []const u8, str: []const u8) bool {
     var p: usize = 0;
     var s: usize = 0;
     var star_p: ?usize = null;
     var star_s: usize = 0;
     while (s < str.len) {
-        if (p < pattern.len and pattern[p] == '_') {
+        if (p < pattern.len and pattern[p] == '%') {
+            star_p = p;
+            star_s = s;
+            p += 1;
+        } else if (p < pattern.len and pattern[p] == '_') {
             p += 1;
             s += charLen(str, s);
         } else if (p < pattern.len and pattern[p] == str[s]) {
             p += 1;
             s += 1;
-        } else if (p < pattern.len and pattern[p] == '%') {
-            star_p = p;
-            star_s = s;
-            p += 1;
         } else if (star_p) |sp| {
             // Restart on character boundaries, so a later `_` never starts inside a character.
             p = sp + 1;
@@ -141,10 +144,13 @@ pub fn likeGlob(pattern: []const u8, str: []const u8) bool {
     return p == pattern.len;
 }
 
-/// Bytes of the UTF-8 character starting at `str[i]`, by its lead byte; a stray or truncated byte counts as one.
+/// Bytes of the UTF-8 character starting at `str[i]`: its lead byte's sequence length when every continuation byte
+/// follows as 10xxxxxx, else one, so a binary value (no UTF-8) still matches byte by byte.
 fn charLen(str: []const u8, i: usize) usize {
-    const n: usize = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
-    return @min(n, str.len - i);
+    const n: usize = std.unicode.utf8ByteSequenceLength(str[i]) catch return 1;
+    if (n > str.len - i) return 1;
+    for (str[i + 1 ..][0 .. n - 1]) |c| if (c & 0xc0 != 0x80) return 1;
+    return n;
 }
 
 /// Whether `needle` occurs in `hay`. The needle's first and last bytes are compared against 32 starting positions at

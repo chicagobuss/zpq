@@ -4842,7 +4842,7 @@ fn writeExplainFacts(writer: anytype, plan: scan.ScanPlan) !void {
         try writer.print("{s}{{\"strategy\":\"{s}\",\"admissible\":{}}}", .{ sep, @tagName(kind), f.admissible.contains(kind) });
         sep = ",";
     }
-    try writer.print("],\"winner\":\"{s}\"", .{@tagName(plan.dispatch.strategy)});
+    try writer.print("],\"winner\":\"{s}\",\"rule\":\"{s}\"", .{ @tagName(plan.dispatch.strategy), @tagName(scan.decidingRule(plan)) });
 }
 
 pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExplanation) !void {
@@ -9411,6 +9411,12 @@ test "explainAggregate: the facts a plan was made from, the admissible strategie
         json.value.object.get("strategy").?.string,
         json.value.object.get("winner").?.string,
     );
+    // The deciding rule is one of the plan's reasons: here the filter no row passes drops the count cut.
+    const rule = json.value.object.get("rule").?.string;
+    try std.testing.expectEqualStrings("selective_filter", rule);
+    var listed = false;
+    for (json.value.object.get("reasons").?.array.items) |r| listed = listed or std.mem.eql(u8, r.string, rule);
+    try std.testing.expect(listed);
 }
 
 test "explainAggregate: partitioned force agrees for API and environment" {

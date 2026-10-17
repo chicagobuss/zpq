@@ -774,6 +774,17 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
     return result;
 }
 
+/// The rule that decided the plan's strategy, among its reasons: the cost rules first (they override eligibility),
+/// then the eligibility that left the strategy standing.
+pub fn decidingRule(plan: ScanPlan) Reason {
+    for ([_]Reason{
+        .partitioned_forced, .few_dictionary_entries,   .selective_filter,   .repeated_dictionary_entries,
+        .small_ndv,          .high_cardinality_strings, .worker_copy_memory, .first_keys_cut,
+        .census_distinct,    .sketch_count_cut,         .unknown_ndv,
+    }) |r| if (plan.reasons.contains(r)) return r;
+    return .plain_scan;
+}
+
 fn planFacts(in: PlanInputs, rank_cut: bool, first_cut: bool) PlanFacts {
     var f: PlanFacts = .{ .readers = in.readers, .pass_share = if (in.filter != null) passShare(in) else null };
     for (in.work) |item| if (item.agg_start == 0) {

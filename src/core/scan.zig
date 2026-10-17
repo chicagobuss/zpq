@@ -120,10 +120,10 @@ pub const FastPath = enum {
     /// them depends on timing; and whether shared partitions, one copy of each group, could answer instead.
     worker_tables,
     partitions_fit,
-    /// What the refusal says of one worker's table: several workers' tables held copies of the same keys (or the
-    /// merge refused), so one table may fit the budget they did not. Without it a single table must hold what they
-    /// held and the rows they had not reached, and the scan on one worker is not run (it would refuse, many times
-    /// slower).
+    /// What the refusal says of one worker: several workers' tables held copies of the same keys, the merge refused,
+    /// or on one worker the query plans a cut (`oneWorkerCuts`), so one worker may fit the budget they did not.
+    /// Without it a single table must hold what they held and the rows they had not reached, and the scan on one
+    /// worker is not run (it would refuse, many times slower).
     one_table_may_fit,
 };
 
@@ -2835,11 +2835,12 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // A budget the established path fits must not fail the query, nor may whether it fails depend on timing. A refused
     // scan runs again, exactly, each time on a narrower path: without every fast path it armed (they charge more of
     // their peak than the paths they stand in for, `FastPath`); then, where several workers' tables were refused, on
-    // shared partitions, one copy of each group whatever the timing; then on one worker, which claims row groups in
-    // order and so peaks the same every run, but only where the refused tables held copies of the same keys: else one
-    // table must hold all they held and more, and the one-worker scan only refuses, many times slower. A plain grouping
-    // a cost rule chose over a cut gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`),
-    // so at most five scans run, and each arms its paths only over inputs a scan reads again, whole, from the start.
+    // the forced partitions, a partition's groups folded at a time; then on one worker, which claims row groups in
+    // order and so peaks the same every run, but only where one worker may fit (`FastPath.one_table_may_fit`): else
+    // its one table must hold all the refused tables held and more, and it only refuses, many times slower. A plain
+    // grouping a cost rule chose over a cut gives way to that cut, whose refusal is final. Each step only narrows
+    // (`narrowed`), so at most five scans run, and each arms its paths only over inputs a scan reads again, whole,
+    // from the start.
     var attempt = args;
     var chain: Chain = .{ .parts_tried = args.partagg };
     var may_fit = false;
@@ -2888,6 +2889,28 @@ fn holdCopies(tables: []const expr_agg.GroupTable) bool {
         }
     }
     return seen == 0 or shared *| 8 >= seen;
+}
+
+/// Whether the query, planned as the one-worker rerun plans it (on one worker, its inputs mapped, no forced
+/// partitions or cost-rule plain grouping), takes a cut, which holds far less than the tables a refusal held: one
+/// worker's cells fit where several workers' did not, and a mapped input admits the first keys' cut.
+fn oneWorkerCuts(arena: std.mem.Allocator, in: PlanInputs) !bool {
+    var one = in;
+    one.workers = 1;
+    one.readers = false;
+    one.args.parallelism = 1;
+    one.args.partagg = false;
+    one.args.plain_rules = false;
+    const inputs = try arena.dupe(Input, in.args.inputs);
+    for (inputs) |*input| if (input.plan_bytes) |b| {
+        input.bytes = b;
+        input.gate = null;
+    };
+    one.args.inputs = inputs;
+    return switch (planAggregate(one).dispatch.strategy) {
+        .sketch, .first_keys => true,
+        .scalar, .plain_hash, .partitioned_hash => false,
+    };
 }
 
 /// What a refusal chain has run so far (`narrowed`).
@@ -3498,9 +3521,9 @@ fn prepareAggregate(
     // The last pass is done: nothing decodes into the regions again, so the merge does not hold them.
     if (!args.leave_regions) releaseRegions(workers);
     for (workers) |w| if (w.err) |e| {
-        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
-            if (taken.contains(.worker_tables) and decision.strategy == .plain_hash and holdCopies(group_tables))
-                taken.insert(.one_table_may_fit);
+        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| if (taken.contains(.worker_tables)) {
+            if ((decision.strategy == .plain_hash and holdCopies(group_tables)) or
+                try oneWorkerCuts(arena, plan_inputs)) taken.insert(.one_table_may_fit);
         };
         return e;
     };
@@ -12608,9 +12631,14 @@ test "regression: a plain grouping a cost rule chose over a cut answers every bu
             cut.plain_rules = false;
             var want: [budgets.len]anyerror!usize = undefined;
             outcomes(cut, &budgets, &want);
-            var got: [budgets.len]anyerror!usize = undefined;
-            outcomes(args, &budgets, &got);
-            try expectSameOutcomes(&want, &got);
+            // The plain grouping may also answer budgets the cut refuses. On several workers whether the cut itself
+            // answers depends on which worker claimed which row groups, and its refusal is final, so the outcomes are
+            // compared on one; there both are the same every run.
+            if (j == 1) {
+                var got: [budgets.len]anyerror!usize = undefined;
+                outcomes(args, &budgets, &got);
+                for (want, got) |w, g| if (w) |n| try testing.expectEqual(n, try g) else |_| {};
+            }
             if (!case.rescues) continue;
             var rescued = false;
             for (budgets, want) |b, w| {
@@ -12739,13 +12767,16 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
     try testing.expect(!cut.plain_rules and cut.dense and cut.parallelism == 4 and !chain.parts_tried);
 }
 
-test "runMultiAggregate: a refusal says one table may fit only where the workers' tables held copies of the same keys" {
+test "runMultiAggregate: a refusal says one worker may fit only where tables held copies or one worker plans a cut" {
     const gpa = testing.allocator;
-    for ([_]struct { path: []const u8, copies: bool }{
+    const top10: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    for ([_]struct { path: []const u8, order: expr_ast.ResultOrder = .{}, may_fit: bool }{
         // Every key in every row group.
-        .{ .path = "ci/fixtures/parquet/repeat_keys.parquet", .copies = true },
+        .{ .path = "ci/fixtures/parquet/repeat_keys.parquet", .may_fit = true },
         // Near-unique keys.
-        .{ .path = "ci/fixtures/parquet/skew_filter.parquet", .copies = false },
+        .{ .path = "ci/fixtures/parquet/skew_filter.parquet", .may_fit = false },
+        // The same, cut by their count: one worker's sketch cells fit where four workers' did not.
+        .{ .path = "ci/fixtures/parquet/skew_filter.parquet", .order = top10, .may_fit = true },
     }) |case| {
         const bytes = (try loadFixture(case.path)) orelse return error.SkipZigTest;
         defer gpa.free(bytes);
@@ -12756,6 +12787,8 @@ test "runMultiAggregate: a refusal says one table may fit only where the workers
             .inputs = &.{.{ .name = case.path, .bytes = bytes }},
             .aggregate = "count(*) AS c",
             .group_by = "k",
+            .result_order = case.order,
+            .sketch_topk = .{ .cell_bits = 12 },
             .parallelism = 4,
             .min_bytes_per_worker = 1,
             .max_memory = 256 << 10,
@@ -12766,7 +12799,7 @@ test "runMultiAggregate: a refusal says one table may fit only where the workers
         }, false);
         if (refused) |r| freeResult(r) else |e| try testing.expectEqual(error.ExceededMemoryBudget, e);
         try testing.expect(taken.contains(.worker_tables));
-        try testing.expectEqual(case.copies, taken.contains(.one_table_may_fit));
+        try testing.expectEqual(case.may_fit, taken.contains(.one_table_may_fit));
     }
 }
 

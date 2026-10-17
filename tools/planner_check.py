@@ -80,14 +80,17 @@ assert plan["strategy"] == "plain_hash" and "small_ndv" in plan["reasons"], plan
 assert plan["ndv"]["hi"] == 100 and plan["ndv"]["union_complete"], plan
 assert plan["ndv"]["estimate"] == 100 and plan["ndv"]["lo"] == 0, plan
 assert len(plan["passes"]) == 1 and plan["count_agg"] is None, plan
+# A LIMIT with no ORDER BY over few dictionary entries groups every key in one plain pass (the union proves the
+# domain small); the plan still reads no data page.
 plan = run(f"SELECT k, count(*) AS c FROM '{bounded}' GROUP BY k LIMIT 10", explain=True)
-assert plan["strategy"] == "first_keys" and "first_keys_cut" in plan["reasons"], plan
-assert not plan["ndv"]["union_attempted"] and plan["ndv"]["estimate"] is None, plan
+assert plan["strategy"] == "plain_hash" and "few_dictionary_entries" in plan["reasons"], plan
+assert plan["ndv"]["union_complete"] and plan["rule"] == "few_dictionary_entries", plan
 
 # Unknown DISTINCT state must not be admitted by the small-group memory estimate.
 plan = run(f"SELECT k, count(DISTINCT v) AS c FROM '{bounded}' GROUP BY k", explain=True)
 assert plan["plain_bytes_estimate"] is None and "state_memory_unknown" in plan["reasons"], plan
-# The base planner fuses an allowed census on a plain-width hint; certification and disable remain exact.
+# A small domain whose keys recur in every row group groups in one plain pass, payloads included; answers stay exact
+# with the census on or off. (Census fusion on a plain-width hint is checked on the raw fixture below.)
 moderate = Path(directory) / "planner_census.parquet"
 pq.write_table(pa.table({"k": [i % 25_000 for i in range(400_000)],
                          "v": [(i % 201) - 100 for i in range(400_000)], "pos": range(400_000)}),
@@ -95,9 +98,7 @@ pq.write_table(pa.table({"k": [i % 25_000 for i in range(400_000)],
 sql = (f"SELECT k, count(*) AS c, sum(v) AS s, avg(v) AS av, min(v) AS mn, max(v) AS mx "
        f"FROM '{moderate}' GROUP BY k ORDER BY c DESC LIMIT 10")
 plan = run(sql, explain=True)
-assert plan["strategy"] == "sketch" and plan["sketch"]["census_allowed"], plan
-assert plan["sketch"]["census_fused"] and not plan["sketch"]["census_cell_repeat_gate"], plan
-assert "census_fixed_width_bail" in plan["reasons"], plan
+assert plan["strategy"] == "plain_hash" and "repeated_dictionary_entries" in plan["reasons"], plan
 truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
 for workers in (1, 4):
     for census in ("0", "1"):
@@ -143,4 +144,5 @@ for workers in (1, 4):
 for sql in (f"SELECT k, count(*) AS c FROM '{strings}' GROUP BY k ORDER BY c DESC LIMIT 10",
             f"SELECT k, f, count(*) AS c, sum(pos) AS s FROM '{strings}' GROUP BY k, f ORDER BY c DESC LIMIT 10"):
     assert run(sql, explain=True)["strategy"] == "plain_hash"
-print("planner check: bounded NDV, prefix precedence, census bail and partitioned answers agree with DuckDB")
+print("planner check: bounded NDV, few-entry and recurring-key rules, census bail and partitioned answers agree "
+      "with DuckDB")

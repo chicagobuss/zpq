@@ -3726,13 +3726,15 @@ fn prepareAggregate(
             if (candidates) |keys_kept| {
                 try mergeCandidates(gpa, arena, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
             } else {
-                const in_place = mergesInPlace(agg_calls, result_cut);
+                // Pairs left their count(DISTINCT) a count in every table: it merges as one, in place or under a cut.
+                const merge_calls = if (pairs_used) try countedCalls(arena, agg_calls, pairs_call.?) else agg_calls;
+                const in_place = mergesInPlace(merge_calls, result_cut);
                 try mergeFoldedRefs(
                     gpa,
                     arena,
                     out_tables,
                     group_refs,
-                    agg_calls,
+                    merge_calls,
                     n_workers,
                     result_cut,
                     in_place,
@@ -4837,6 +4839,15 @@ fn mergesInPlace(calls: []const expr_agg.AggCall, cut: ?ResultCut) bool {
     return true;
 }
 
+/// `calls` with call `i`, a count(DISTINCT) whose every state `foldDistinctPairs` made a count, merged as the COUNT
+/// it now is: a fresh count(DISTINCT) state takes a count as it is, so the merge's every value is the same.
+fn countedCalls(arena: std.mem.Allocator, calls: []const expr_agg.AggCall, i: usize) ![]const expr_agg.AggCall {
+    std.debug.assert(calls[i].func == .count_distinct);
+    const out = try arena.dupe(expr_agg.AggCall, calls);
+    out[i].func = .count;
+    return out;
+}
+
 /// A merged-in-place slot's `idx`: its source table above its group.
 fn packRef(ref: MergeGroupRef) usize {
     return @as(usize, ref.table) << 32 | ref.group;
@@ -4851,7 +4862,11 @@ fn inPlaceAccs(tables: []const expr_agg.GroupTable, idx: usize, n_calls: usize) 
 /// allocates nor frees (`gpa` goes unused), and a string winner stays borrowed. Applying it twice changes nothing: a
 /// fresh sum adds into +0.0, so never ends -0.0.
 fn foldedAcc(gpa: std.mem.Allocator, call: expr_agg.AggCall, acc: expr_agg.Accumulator) !expr_agg.Accumulator {
-    std.debug.assert(call.func != .count_distinct);
+    // Only a count pairs folded merges in place (`countedCalls`); a fresh count(DISTINCT) state takes it as it is.
+    if (call.func == .count_distinct) {
+        std.debug.assert(acc == .count);
+        return acc;
+    }
     if (foldsToItself(acc)) return acc;
     var out = expr_agg.Accumulator.init(call);
     try out.merge(acc, gpa);
@@ -12753,4 +12768,40 @@ test "runMultiAggregate: a refusal says one table may fit only where the workers
         try testing.expect(taken.contains(.worker_tables));
         try testing.expectEqual(case.copies, taken.contains(.one_table_may_fit));
     }
+}
+
+test "regression: counts pairs folded merge in place or under a count cut, as the sets' merge leaves them" {
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    // A full merge (in place), a cut by the count(DISTINCT) (`mergeCountCut`), and payloads beside it.
+    const top: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 7 };
+    for ([_]struct { aggregate: []const u8, order: expr_ast.ResultOrder }{
+        .{ .aggregate = "count(DISTINCT u) AS d", .order = .{} },
+        .{ .aggregate = "count(DISTINCT u) AS d, count(*) AS c, sum(u) AS s", .order = .{} },
+        .{ .aggregate = "count(DISTINCT u) AS d", .order = top },
+        .{ .aggregate = "count(DISTINCT u) AS d, min(u) AS m", .order = top },
+    }) |case| for ([_]usize{ 1, 3, 8 }) |j| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var results: [2]MultiAggResult = undefined;
+        for ([_]@FieldType(MultiAggArgs, "distinct_pairs"){ .off, .on }, &results) |pairs, *res| {
+            res.* = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+                .inputs = &inputs,
+                .aggregate = case.aggregate,
+                .group_by = "t",
+                .result_order = case.order,
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+                .distinct_pairs = pairs,
+            });
+        }
+        defer for (results) |r| freeResult(r);
+        try testing.expect(!results[0].distinct_pairs and results[1].distinct_pairs);
+        const sets = results[0].output.group_rows.?;
+        const counted = results[1].output.group_rows.?;
+        try testing.expectEqual(sets.len, counted.len);
+        for (sets, counted) |r, p_row| for (r, p_row) |x, y| try expectSameAggValue(x, y);
+    };
 }

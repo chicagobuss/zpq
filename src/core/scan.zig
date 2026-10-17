@@ -671,12 +671,30 @@ pub const AggregateDispatch = struct {
     distinct_census: bool = false,
 };
 
+/// What a plan was made from, for `--explain`. Rows and row groups are exact; the pass share is an estimate.
+pub const PlanFacts = struct {
+    rows: u64 = 0,
+    row_groups: usize = 0,
+    /// The share of rows the filter passes, from row-group bounds (`passShare`); null without a filter.
+    pass_share: ?f64 = null,
+    /// Some input is read behind the reader's gates (`Input.readerBacked`).
+    readers: bool = false,
+    /// The dictionary probe asked of the reader: its ranges, their page-aligned bytes, and whether its cap sent the
+    /// reader's inputs to their footers instead.
+    probe_ranges: usize = 0,
+    probe_bytes: u64 = 0,
+    probe_capped: bool = false,
+    /// The strategies whose exactness preconditions hold for this query; the cost rules chose `dispatch.strategy`.
+    admissible: std.EnumSet(@FieldType(AggregateDispatch, "strategy")) = .{},
+};
+
 /// Fixed-size decision; census and plain fallback remain conditional runtime transitions.
 pub const ScanPlan = struct {
     ndv_stat: ?NdvStat = null,
     plain_bytes: ?u64 = null,
     dispatch: AggregateDispatch,
     reasons: std.EnumSet(Reason) = .{},
+    facts: PlanFacts = .{},
 };
 
 pub fn planAggregate(in: PlanInputs) ScanPlan {
@@ -750,8 +768,27 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         };
         result.reasons.insert(census_reason);
     }
+    result.facts = planFacts(in, rank_agg != null, first_cut or (count_agg == null and args.sketch_topk != null and
+        args.sketch_topk.?.census and firstCutEligible(args, in.calls, use_blocks, in.work.len, tables)));
     if (in.ndv_stat) |stat| applyCostRules(in, stat, &result);
     return result;
+}
+
+fn planFacts(in: PlanInputs, rank_cut: bool, first_cut: bool) PlanFacts {
+    var f: PlanFacts = .{ .readers = in.readers, .pass_share = if (in.filter != null) passShare(in) else null };
+    for (in.work) |item| if (item.agg_start == 0) {
+        f.row_groups += 1;
+        f.rows +|= @intCast(@max(0, in.metas[item.file].row_groups.items[item.rg].num_rows));
+    };
+    if (in.keys == null) {
+        f.admissible.insert(.scalar);
+        return f;
+    }
+    f.admissible.insert(.plain_hash);
+    if (partAggSupported(in.args, in.calls, true)) f.admissible.insert(.partitioned_hash);
+    if (rank_cut) f.admissible.insert(.sketch);
+    if (first_cut) f.admissible.insert(.first_keys);
+    return f;
 }
 
 fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strategy")) void {
@@ -2907,6 +2944,7 @@ fn prepareAggregate(
         } else false,
     };
     var ndv_stat: ?NdvStat = null;
+    var probe_facts: PlanFacts = .{};
     // Freed once the dense tables are built, or as soon as the plan cannot use it.
     var domain: ?agg_dense.Domain = null;
     defer if (domain) |*d| d.deinit(gpa);
@@ -2938,6 +2976,11 @@ fn prepareAggregate(
             probe_bytes +|= std.mem.alignForward(u64, r.end, page) - std.mem.alignBackward(u64, r.start, page);
         };
         const probe_ok = probe_bytes <= args.probe_cap orelse ndv.probeCap(args.max_memory);
+        if (plan_inputs.readers) {
+            probe_facts.probe_ranges = ranges.len;
+            probe_facts.probe_bytes = probe_bytes;
+            probe_facts.probe_capped = !probe_ok;
+        }
         const files = try arena.alloc(ndv.File, args.inputs.len);
         // Dictionaries are read from a mapped file, or from a reader's buffer once its probe of them is in. Explain
         // reads a reader's input through its mapping, as the probe would read it. Without either (S3, a probe past
@@ -2977,7 +3020,10 @@ fn prepareAggregate(
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
-    const scan_plan = planAggregate(plan_inputs);
+    var scan_plan = planAggregate(plan_inputs);
+    scan_plan.facts.probe_ranges = probe_facts.probe_ranges;
+    scan_plan.facts.probe_bytes = probe_facts.probe_bytes;
+    scan_plan.facts.probe_capped = probe_facts.probe_capped;
     if (@import("builtin").is_test and !args.partagg and ndv_stat == null)
         try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
     const decision = scan_plan.dispatch;

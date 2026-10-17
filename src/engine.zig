@@ -4823,6 +4823,28 @@ fn writeCsvString(writer: anytype, s: []const u8) !void {
 }
 
 /// The same single-object JSON convention as query results. Passes describe permitted work, not a runtime trace.
+/// The facts a plan was made from, each with how far it can be trusted (`exact`, `bound`, `estimate`), the strategies
+/// whose exactness preconditions hold, and the one the cost rules chose (its `reasons` say why).
+fn writeExplainFacts(writer: anytype, plan: scan.ScanPlan) !void {
+    const f = plan.facts;
+    try writer.print(",\"facts\":{{\"rows\":{{\"value\":{d},\"provenance\":\"exact\"}},\"row_groups\":{{\"value\":{d},\"provenance\":\"exact\"}}", .{ f.rows, f.row_groups });
+    if (plan.ndv_stat) |stat| {
+        const prov = if (stat.confidence == .upper_bound) "bound" else "unknown";
+        try writer.print(",\"groups\":{{\"value\":{d},\"provenance\":\"{s}\",\"source\":\"{s}\"}}", .{ stat.hi, prov, @tagName(stat.source) });
+        if (stat.estimate) |e| try writer.print(",\"groups_estimate\":{{\"value\":{d},\"provenance\":\"estimate\"}}", .{e});
+        if (stat.entries) |e| try writer.print(",\"dictionary_entries\":{{\"value\":{d},\"provenance\":\"exact\"}}", .{e});
+    }
+    if (f.pass_share) |p| try writer.print(",\"filter_pass\":{{\"value\":{d:.4},\"provenance\":\"estimate\"}}", .{p});
+    try writer.print(",\"readers\":{},\"probe\":{{\"ranges\":{d},\"bytes\":{d},\"capped\":{}}}}}", .{ f.readers, f.probe_ranges, f.probe_bytes, f.probe_capped });
+    try writer.writeAll(",\"candidates\":[");
+    var sep: []const u8 = "";
+    for (std.enums.values(@FieldType(scan.AggregateDispatch, "strategy"))) |kind| {
+        try writer.print("{s}{{\"strategy\":\"{s}\",\"admissible\":{}}}", .{ sep, @tagName(kind), f.admissible.contains(kind) });
+        sep = ",";
+    }
+    try writer.print("],\"winner\":\"{s}\"", .{@tagName(plan.dispatch.strategy)});
+}
+
 pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExplanation) !void {
     const a = explanation.aggregate;
     const d = a.plan.dispatch;
@@ -4858,6 +4880,7 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
         if (stat.estimate) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
         try writer.writeAll("}");
     } else try writer.writeAll("null");
+    try writeExplainFacts(writer, a.plan);
     try writer.writeAll(",\"plain_bytes_estimate\":");
     if (a.plan.plain_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
     try writer.print(",\"shared_tables\":{d},\"count_agg\":", .{
@@ -9354,6 +9377,40 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and ev
         try std.testing.expectEqual(i == 0, reasons.contains(.dictionary_union));
         try std.testing.expect(!explained.encoded);
     };
+}
+
+test "explainAggregate: the facts a plan was made from, the admissible strategies and the winner" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lines = [_:null]?[*:0]const u8{"ZPQ_IO_PROFILE=mmap"};
+    const env: std.process.Environ = .{ .block = .{ .slice = &lines } };
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = env, .io = std.testing.io };
+    const got = try explainAggregate(ctx, arena.allocator(), .{
+        .inputs = &.{"ci/fixtures/parquet/topk_skew.parquet"},
+        .group_by = "k",
+        .aggregate = "count(*) AS c",
+        .filter = "n < 0",
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+    });
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeAggregateExplanationJson(&out.writer, got);
+    const json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer json.deinit();
+    const facts = json.value.object.get("facts").?.object;
+    try std.testing.expectEqual(@as(i64, 20000), facts.get("rows").?.object.get("value").?.integer);
+    try std.testing.expectEqualStrings("exact", facts.get("row_groups").?.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("bound", facts.get("groups").?.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("estimate", facts.get("filter_pass").?.object.get("provenance").?.string);
+    var plain = false;
+    for (json.value.object.get("candidates").?.array.items) |c| {
+        if (std.mem.eql(u8, c.object.get("strategy").?.string, "plain_hash")) plain = c.object.get("admissible").?.bool;
+    }
+    try std.testing.expect(plain);
+    try std.testing.expectEqualStrings(
+        json.value.object.get("strategy").?.string,
+        json.value.object.get("winner").?.string,
+    );
 }
 
 test "explainAggregate: partitioned force agrees for API and environment" {

@@ -2618,9 +2618,7 @@ fn foldGroupedWindows(
         @memset(ids, 0);
         var resolver = expr_agg.GroupKeyResolver.init(key_cols);
         defer resolver.deinit(ra);
-        for (0..n) |r| if (win_sel.isActive(r)) {
-            ids[r] = try resolver.resolve(ra, g.table, key_cols, r, g.calls, pos);
-        };
+        try resolver.resolveBatch(ra, g.table, key_cols, g.calls, pos, &win_sel, ids);
         try expr_agg.sinkSketchRows(g.table, ids, &win_sel);
         if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
             try expr_agg.updateTableGrouped(ra, gpa, g.table, ids, i, g.calls, &win, lookup, &win_sel);
@@ -2812,19 +2810,14 @@ pub fn scanRGForAgg(
                 key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch.restrictedTo(&sel), lookup, key_expr);
             }
 
-            var group_id_arr = try ra.alloc(u32, num_rows);
+            const group_id_arr = try ra.alloc(u32, num_rows);
             @memset(group_id_arr, 0);
 
             // Never cached across row groups: the resolver's memo holds pointers into `ra`.
             var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
             defer key_resolver.deinit(ra);
 
-            var r: usize = 0;
-            while (r < num_rows) : (r += 1) {
-                if (sel.isActive(r)) {
-                    group_id_arr[r] = try key_resolver.resolve(ra, g.table, key_cols, r, g.calls, g.pos_base);
-                }
-            }
+            try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, &sel, group_id_arr);
             try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
 
             // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
@@ -2959,9 +2952,7 @@ fn scanRGSliced(
                 var resolver = expr_agg.GroupKeyResolver.init(key_cols);
                 defer resolver.deinit(sa);
                 // First appearance counts rows from the row group's start, as when it decodes whole.
-                for (0..n) |r| if (sel.isActive(r)) {
-                    ids[r] = try resolver.resolve(sa, g.table, key_cols, r, g.calls, g.pos_base + done);
-                };
+                try resolver.resolveBatch(sa, g.table, key_cols, g.calls, g.pos_base + done, &sel, ids);
                 try expr_agg.sinkSketchRows(g.table, ids, &sel);
                 if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
                     try expr_agg.updateTableGrouped(sa, gpa, g.table, ids, i, g.calls, &batch, lookup, &sel);

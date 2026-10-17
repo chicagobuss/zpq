@@ -1,0 +1,25 @@
+{
+  "base_commit": "f44dc9d",
+  "base_sha256": "70a64c963640e18a5b03f11a17b0a7223e3ea0cb7009b45605a20fd990890280",
+  "candidate_sha256": "2590c991ee47c93211c8caeec144e52b9d631648afb7829f7b8e5ae80b933152",
+  "zig": "0.17.0",
+  "optimize": "ReleaseFast",
+  "threads": 16,
+  "mode": "warm",
+  "runs": 3,
+  "cells": 29,
+  "runner": "zpq-bench-run, CCD0, one query per 16G scope, no swap",
+  "sink": "Identical SQL; fresh memfd for Parquet, stdout otherwise; complete output hashes and strict-reader validation outside timed interval",
+  "notes": [
+    "Measures the added lookup change against compact-state artifact, not against the original base.",
+    "Seven-pair long-string retimes retained separately: lstr100k 0.9947x, lstr1m 0.9845x. Initial 3-pair lstr100k result was noisy.",
+    "All 20 quick controls have median slowdown below 3%; short-cell variance remains visible.",
+    "Candidate source subsequently received only a function-signature line wrap; full final gates rebuild the final source."
+  ],
+  "gates": {
+    "targeted_tests": "32 pass, 2 fixture skips",
+    "baseline_exact": "1512 comparisons, j1/2/3/4/8/16, 1/4/16/256MB, mmap/pread/uring, encoded on/off",
+    "parquet": "90 byte-identical pairs fully decoded by PyArrow and DuckDB",
+    "grouped_differential": "324/324"
+  }
+}

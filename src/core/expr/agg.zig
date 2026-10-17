@@ -3568,6 +3568,48 @@ pub const GroupKeyResolver = struct {
         self.memo.deinit(allocator);
     }
 
+    pub fn resolveBatch(
+        self: *GroupKeyResolver,
+        allocator: std.mem.Allocator,
+        table: *GroupTable,
+        cols: []const filter_eval.Batch.Column,
+        calls: []const AggCall,
+        pos: u64,
+        sel: *const filter_selection.SelectionVector,
+        ids: []u32,
+    ) !void {
+        if (table.fixed_stride == 0) {
+            for (0..sel.len) |r| if (sel.isActive(r)) {
+                ids[r] = try self.resolve(allocator, table, cols, r, calls, pos);
+            };
+            return;
+        }
+        const batch_n = 64;
+        var images: [batch_n][32]u8 = undefined;
+        var hashes: [batch_n]u64 = undefined;
+        var off: usize = 0;
+        while (off < sel.len) : (off += batch_n) {
+            const n = @min(batch_n, sel.len - off);
+            var packed_mask: u64 = 0;
+            for (0..n) |i| if (sel.isActive(off + i)) {
+                if (packFixedKey(cols, off + i, &images[i])) |len| if (len == table.fixed_stride) {
+                    hashes[i] = hashFixed(images[i][0..len]);
+                    packed_mask |= @as(u64, 1) << @intCast(i);
+                    if (table.fixed_slots.len >= 1 << 15) {
+                        const slot = @as(usize, @as(u32, @truncate(hashes[i]))) & (table.fixed_slots.len - 1);
+                        @prefetch(&table.fixed_slots[slot], .{ .rw = .read, .locality = 2 });
+                    }
+                };
+            };
+            for (0..n) |i| if (sel.isActive(off + i)) {
+                ids[off + i] = if (packed_mask & (@as(u64, 1) << @intCast(i)) != 0)
+                    try table.getOrInsertFixedHashed(images[i][0..table.fixed_stride], calls, pos + off + i, hashes[i])
+                else
+                    try self.resolve(allocator, table, cols, off + i, calls, pos);
+            };
+        }
+    }
+
     pub fn resolve(
         self: *GroupKeyResolver,
         allocator: std.mem.Allocator,
@@ -4254,6 +4296,16 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
     }
 }
 
+const CachedKey = struct { bytes: []const u8, hash: u64 };
+const CachedKeyCtx = struct {
+    pub fn hash(_: @This(), key: CachedKey) u64 {
+        return key.hash;
+    }
+    pub fn eql(_: @This(), key: CachedKey, stored: []const u8) bool {
+        return keyEql(key.bytes, stored);
+    }
+};
+
 pub const GroupTable = struct {
     compact: @import("agg_state.zig").State = .{},
     // 16-aligned: a private distinct acc stores this pointer with bit 3 set (`DistinctAcc.table_flag`).
@@ -4281,7 +4333,8 @@ pub const GroupTable = struct {
 
     const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
     const empty_id: u32 = std.math.maxInt(u32);
-    const FixedSlot = struct { hash: u64, id: u32 };
+    // The projected hash rejects candidates; only a complete normalized key comparison admits one.
+    const FixedSlot = extern struct { hash: u32, id: u32 };
 
     comptime {
         if (@alignOf(GroupTable) < 16) @compileError("private distinct sets use bit 3 of this pointer");
@@ -4448,36 +4501,33 @@ pub const GroupTable = struct {
             return self.getOrInsertFixed(image, agg_calls, pos);
         }
         if (self.sketch) |s| if (try s.route(s.keyHash(key), pos)) |id| return id;
-        if (self.map.get(key)) |id| {
+        const hashed: CachedKey = .{ .bytes = key, .hash = std.hash.Wyhash.hash(0, key) };
+        if (self.map.unmanaged.available == 0) if (self.map.getAdapted(hashed, CachedKeyCtx{})) |id| {
+            self.first.items[id] = @min(self.first.items[id], pos);
+            return id;
+        };
+
+        if (self.map.unmanaged.available == 0) {
+            try self.admit(self.variableEntrySize(key.len, agg_calls.len));
+            try self.map.ensureUnusedCapacity(1);
+        }
+        const gop = self.map.getOrPutAssumeCapacityAdapted(hashed, CachedKeyCtx{});
+        if (gop.found_existing) {
+            const id = gop.value_ptr.*;
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
-
-        // Inline distinct values live in the accumulator. A shared budget is charged by the spilled set; a private
-        // ceiling is charged when that set is created (`chargeSpilledSet`).
-        const state_growth = if (self.compact.stride != 0)
-            self.compact.projected(self.groupCount() + 1) - self.compact.held()
-        else
-            @sizeOf(Accumulator) * agg_calls.len;
-        const entry_size = key.len + state_growth + @sizeOf(u64) + MapNodeOverhead;
-        if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
-            const budget = self.shared orelse return error.ExceededMemoryBudget;
-            // Checked on the draw path rather than per new group, to keep the shared atomic off the insertion path.
-            if (budget.tight()) self.releaseSlack();
-            const deficit = (self.allocated_bytes + entry_size) - self.max_memory_bytes;
-            const got = budget.draw(deficit) orelse blk: {
-                // Our own unused block may be part of why the pool is empty.
-                self.releaseSlack();
-                break :blk budget.draw(entry_size) orelse
-                    return error.ExceededMemoryBudget;
-            };
-            self.max_memory_bytes += got;
-        }
+        // The key stays borrowed until every owned buffer is ready. A failed admit or allocation removes the slot.
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = 0;
+        errdefer _ = self.map.remove(key);
+        const entry_size = self.variableEntrySize(key.len, agg_calls.len);
+        try self.admit(entry_size);
 
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
 
-        const group_id = @as(u32, @intCast(self.keys.items.len));
+        const group_id = std.math.cast(u32, self.keys.items.len) orelse return error.OutOfMemory;
 
         const old_accumulators_len = self.accumulators.items.len;
         if (self.compact.stride != 0)
@@ -4497,11 +4547,11 @@ pub const GroupTable = struct {
             self.accumulators.appendAssumeCapacity(acc);
         };
 
-        try self.map.put(key_copy, group_id);
-        errdefer _ = self.map.remove(key_copy);
-
         try self.first.ensureUnusedCapacity(self.allocator, 1);
-        try self.keys.append(self.allocator, key_copy);
+        try self.keys.ensureUnusedCapacity(self.allocator, 1);
+        gop.key_ptr.* = key_copy;
+        gop.value_ptr.* = group_id;
+        self.keys.appendAssumeCapacity(key_copy);
         if (self.compact.stride != 0) self.compact.append();
         self.first.appendAssumeCapacity(pos);
 
@@ -4512,10 +4562,17 @@ pub const GroupTable = struct {
 
     /// `key` is the fixed image (`fixed_stride` bytes). Copied in; the caller may reuse its buffer.
     pub fn getOrInsertFixed(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
+        return self.getOrInsertFixedHashed(key, agg_calls, pos, hashFixed(key));
+    }
+
+    fn getOrInsertFixedHashed(
+        self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64, full_hash: u64,
+    ) !u32 {
         std.debug.assert(key.len == self.fixed_stride);
-        const hash = hashFixed(key);
-        if (self.sketch) |s| if (try s.route(hash, pos)) |id| return id;
-        if (self.findFixed(key, hash)) |id| {
+        if (self.sketch) |s| if (try s.route(full_hash, pos)) |id| return id;
+        const hash: u32 = @truncate(full_hash);
+        const probe = self.probeFixed(key, full_hash);
+        if (probe.id) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
@@ -4589,8 +4646,11 @@ pub const GroupTable = struct {
 
         const id: u32 = self.fixed_len;
         @memcpy(self.fixed_keys[@as(usize, id) * stride ..][0..stride], key);
-        var i = hash & (self.fixed_slots.len - 1);
-        while (self.fixed_slots[i].id != empty_id) i = (i + 1) & (self.fixed_slots.len - 1);
+        var i = probe.slot;
+        if (grow_slots) {
+            i = @as(usize, hash) & (self.fixed_slots.len - 1);
+            while (self.fixed_slots[i].id != empty_id) i = (i + 1) & (self.fixed_slots.len - 1);
+        }
         self.fixed_slots[i] = .{ .hash = hash, .id = id };
         if (self.compact.stride != 0) self.compact.append();
         self.first.appendAssumeCapacity(pos);
@@ -4639,20 +4699,53 @@ pub const GroupTable = struct {
     }
 
     fn findFixed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
+        return self.probeFixed(key, hash).id;
+    }
+
+    const FixedProbe = struct { id: ?u32, slot: usize };
+
+    inline fn probeFixed(self: *const GroupTable, key: []const u8, full_hash: u64) FixedProbe {
         const slots = self.fixed_slots;
-        if (slots.len == 0) return null;
+        if (slots.len == 0) return .{ .id = null, .slot = 0 };
         const mask = slots.len - 1;
         const stride: usize = self.fixed_stride;
-        var i = hash & mask;
+        const hash: u32 = @truncate(full_hash);
+        var i = @as(usize, hash) & mask;
         var n: usize = 0;
         while (n < slots.len) : (n += 1) {
-            const s = slots[i];
-            if (s.id == empty_id) return null;
-            if (s.hash == hash and keyEql(self.fixed_keys[@as(usize, s.id) * stride ..][0..stride], key))
-                return s.id;
+            const slot = slots[i];
+            if (slot.id == empty_id) return .{ .id = null, .slot = i };
+            if (slot.hash == hash and keyEql(self.fixed_keys[@as(usize, slot.id) * stride ..][0..stride], key))
+                return .{ .id = slot.id, .slot = i };
             i = (i + 1) & mask;
         }
-        return null;
+        unreachable; // Growth keeps at least one slot empty.
+    }
+
+    /// Local fixed tables keep their buffers and their charge across flushes. No key id survives a flush.
+    pub fn clearFixedRetainingCapacity(self: *GroupTable) void {
+        std.debug.assert(self.fixed_stride != 0);
+        for (self.accumulators.items) |*acc| switch (acc.*) {
+            .min_bytes, .max_bytes => |s| if (s) |b| self.allocator.free(b),
+            .distinct => |*d| d.deinit(self.allocator),
+            else => {},
+        };
+        self.accumulators.clearRetainingCapacity();
+        self.first.clearRetainingCapacity();
+        self.compact.words.clearRetainingCapacity();
+        self.fixed_len = 0;
+        @memset(self.fixed_slots, .{ .hash = 0, .id = empty_id });
+        self.allocated_bytes = self.fixedHeld();
+        self.releaseSlack();
+    }
+
+    inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
+        // Inline distinct values live in the accumulator. A spilled set carries its own object charge.
+        const state_growth = if (self.compact.stride != 0)
+            self.compact.projected(self.groupCount() + 1) - self.compact.held()
+        else
+            @sizeOf(Accumulator) * calls;
+        return key_len + state_growth + @sizeOf(u64) + MapNodeOverhead;
     }
 
     fn admit(self: *GroupTable, entry_size: usize) !void {
@@ -6233,4 +6326,107 @@ test "compact states refuse float tuples and only share identical integer inputs
     calls[2].arg.?.col_ref.expr_type = .f64;
     state.configure(&calls);
     try std.testing.expectEqual(@as(usize, 0), state.stride);
+}
+
+test "compact fixed slots compare complete keys under projected-hash collisions and growth" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(GroupTable.FixedSlot));
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var table = GroupTable.init(std.testing.allocator, 1 << 20);
+    table.fixed_stride = 9;
+    defer table.deinit();
+    for (0..256) |g| {
+        var key: [9]u8 = @splat(0);
+        key[0] = 1;
+        std.mem.writeInt(u64, key[1..9], g, .little);
+        const id = try table.getOrInsertFixedHashed(&key, &calls, 1000 + g, @as(u64, g) << 32);
+        try std.testing.expectEqual(@as(u32, @intCast(g)), id);
+    }
+    for (0..256) |g| {
+        var key: [9]u8 = @splat(0);
+        key[0] = 1;
+        std.mem.writeInt(u64, key[1..9], g, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(g)), table.findFixed(&key, @as(u64, g) << 32));
+        const id = try table.getOrInsertFixedHashed(&key, &calls, g, 0);
+        try std.testing.expectEqual(@as(u32, @intCast(g)), id);
+        try std.testing.expectEqual(@as(u64, g), table.first.items[id]);
+    }
+}
+
+test "fixed local tables retain charged capacity and discard every old id" {
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+    };
+    for ([_]bool{ false, true }) |compact| {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        var table = GroupTable.init(std.testing.allocator, 0);
+        table.shared = &budget;
+        table.fixed_stride = 9;
+        if (compact) table.compact.configure(&calls);
+        defer table.deinit();
+        var capacity: usize = 0;
+        for (0..4) |epoch| {
+            var last: [9]u8 = @splat(0);
+            for (0..64) |g| {
+                last[0] = 1;
+                std.mem.writeInt(u64, last[1..9], epoch * 64 + g, .little);
+                const id = try table.getOrInsertFixed(&last, &calls, epoch * 64 + g);
+                try std.testing.expectEqual(@as(u32, @intCast(g)), id);
+                try std.testing.expectEqual(@as(u64, 0), table.readAcc(id, 0, calls.len).count);
+                try std.testing.expectEqual(@as(?i128, null), table.readAcc(id, 1, calls.len).sum_i);
+                table.writeAcc(id, 0, calls.len, .{ .count = 1 });
+                table.writeAcc(id, 1, calls.len, .{ .sum_i = @intCast(g) });
+            }
+            if (epoch == 0) capacity = table.allocated_bytes;
+            table.clearFixedRetainingCapacity();
+            try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+            try std.testing.expectEqual(capacity, table.allocated_bytes);
+            try std.testing.expectEqual(capacity, budget.used.load(.monotonic));
+            try std.testing.expectEqual(@as(?u32, null), table.findFixed(&last, hashFixed(&last)));
+        }
+    }
+}
+
+test "batched fixed lookups preserve sparse selections nulls NaNs and signed zeros" {
+    const n = 129;
+    var values: [n]f64 = undefined;
+    var defs: [n]u32 = undefined;
+    for (0..n) |r| {
+        values[r] = switch (r % 4) {
+            0 => -0.0,
+            1 => 0.0,
+            2 => @bitCast(@as(u64, 0x7ff8000000000001)),
+            else => 7.0,
+        };
+        defs[r] = if (r % 19 == 0) 0 else 1;
+    }
+    const cols = [_]filter_eval.Batch.Column{.{ .f64 = .{
+        .values = &values,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var sel = try filter_selection.SelectionVector.init(std.testing.allocator, n);
+    defer sel.deinit();
+    for (0..n) |r| if (r % 11 == 0) {
+        sel.set(r, false);
+    };
+    var scalar = GroupTable.init(std.testing.allocator, 1 << 20);
+    defer scalar.deinit();
+    var batched = GroupTable.init(std.testing.allocator, 1 << 20);
+    defer batched.deinit();
+    scalar.fixed_stride = 9;
+    batched.fixed_stride = 9;
+    var resolver = GroupKeyResolver.init(&cols);
+    defer resolver.deinit(std.testing.allocator);
+    var ids: [n]u32 = @splat(0);
+    try resolver.resolveBatch(std.testing.allocator, &batched, &cols, &calls, 1000, &sel, &ids);
+    for (0..n) |r| if (sel.isActive(r)) {
+        const id = try resolver.resolve(std.testing.allocator, &scalar, &cols, r, &calls, 1000);
+        try std.testing.expectEqual(id, ids[r]);
+    };
+    try std.testing.expectEqual(scalar.groupCount(), batched.groupCount());
+    try std.testing.expectEqualSlices(u64, scalar.first.items, batched.first.items);
 }

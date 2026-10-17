@@ -220,7 +220,7 @@ pub const PartAgg = struct {
         }
         const groups: u64 = @intCast(table.groupCount());
         const poor = local.rows_since < groups * 2;
-        try self.flush(local, table);
+        try self.flushKeeping(local, table, !poor);
         local.rows_since = 0;
         if (poor) local.abandoned = true;
     }
@@ -228,9 +228,17 @@ pub const PartAgg = struct {
     /// Append every local group to this worker's run for its partition, then drop the local table's memory back to the
     /// shared budget.
     pub fn flush(self: *PartAgg, local: *Local, table: *expr_agg.GroupTable) !void {
+        if (table.groupCount() == 0) {
+            self.reset(table, false);
+            return;
+        }
+        return self.flushKeeping(local, table, false);
+    }
+
+    fn flushKeeping(self: *PartAgg, local: *Local, table: *expr_agg.GroupTable, retain: bool) !void {
         const n = table.groupCount();
         if (n == 0) return;
-        if (self.shared) return self.flushShared(table);
+        if (self.shared) return self.flushShared(table, retain);
         const runs = local.runs.?;
         const len = self.calls.len;
         for (0..n) |g| {
@@ -243,11 +251,11 @@ pub const PartAgg = struct {
             for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
             run.writeGroup(at, dst);
         }
-        self.reset(table);
+        self.reset(table, retain);
     }
 
     /// `flush` in shared mode: each partition's groups merged under its lock, `batch_n` at a time.
-    fn flushShared(self: *PartAgg, local: *expr_agg.GroupTable) !void {
+    fn flushShared(self: *PartAgg, local: *expr_agg.GroupTable, retain: bool) !void {
         const n = local.groupCount();
         const ids = try self.gpa.alloc(u32, n);
         defer self.gpa.free(ids);
@@ -270,7 +278,7 @@ pub const PartAgg = struct {
                 i = end;
             }
         }
-        self.reset(local);
+        self.reset(local, retain);
     }
 
     pub fn lock(part: *Part) void {
@@ -410,7 +418,12 @@ pub const PartAgg = struct {
         }
     }
 
-    fn reset(self: *PartAgg, table: *expr_agg.GroupTable) void {
+    fn reset(self: *PartAgg, table: *expr_agg.GroupTable, retain: bool) void {
+        // Keep capacity only for useful local reductions; abandoned and final tables return their charge.
+        if (retain and table.fixed_stride != 0) {
+            table.clearFixedRetainingCapacity();
+            return;
+        }
         const gpa = table.allocator;
         const shared = table.shared;
         const stride = table.fixed_stride;
@@ -643,4 +656,48 @@ fn compactPartitionTrial(backing: std.mem.Allocator, shared: bool) !void {
 test "compact private runs and shared partitions preserve shared SUM AVG on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, compactPartitionTrial, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, compactPartitionTrial, .{true});
+}
+
+test "partagg: useful fixed flush retains capacity but final flush releases it" {
+    const a = std.testing.allocator;
+    var budget = expr_agg.SharedBudget{ .limit = 1 << 20, .block = 1024 };
+    const calls = [_]expr_agg.AggCall{.{
+        .func = .count,
+        .arg = null,
+        .where = null,
+        .alias = "c",
+        .result = .i64,
+    }};
+    var part = try PartAgg.init(a, &budget, &calls, 8, countMerge, 4, 1, 1, false);
+    defer part.deinit();
+    var w: Local = .{ .runs = &part.runs[0] };
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    table.fixed_stride = 8;
+    defer table.deinit();
+    var key: [8]u8 = @splat(0);
+    for (0..4) |g| {
+        std.mem.writeInt(u64, &key, g, .little);
+        const id = try table.getOrInsertFixed(&key, &calls, g);
+        table.accumulators.items[id].count = 2;
+    }
+    const held = table.allocated_bytes;
+    try part.pump(&w, &table, 8);
+    try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+    try std.testing.expectEqual(held, table.allocated_bytes);
+    try std.testing.expect(!w.abandoned);
+    try part.flush(&w, &table);
+    try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), table.max_memory_bytes);
+    const id = try table.getOrInsertFixed(&key, &calls, 9);
+    table.accumulators.items[id].count = 1;
+    try part.flush(&w, &table);
+    try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), table.max_memory_bytes);
+    try part.foldRuns(1);
+    var total: u64 = 0;
+    for (part.parts) |p| for (0..p.table.groupCount()) |g| {
+        total += p.table.accumulators.items[g].count;
+    };
+    try std.testing.expectEqual(@as(u64, 9), total);
 }

@@ -1,0 +1,3 @@
+cell	base_min_ms	base_median_ms	base_max_ms	tip_min_ms	tip_median_ms	tip_max_ms	ratio	base_rss_kb	tip_rss_kb	reps	exact
+study/lstr100k/q15_comp_kf	3577.825	3657.262	3813.413	3565.845	3637.974	3723.553	0.9947	8327176	8389144	7/7	True
+study/lstr1m/q15_comp_kf	3609.346	3767.919	3840.477	3639.039	3709.654	3820.226	0.9845	8829108	8819164	7/7	True

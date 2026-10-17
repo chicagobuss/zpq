@@ -28,6 +28,8 @@ pub const Stat = struct {
     union_attempted: bool = false,
     union_complete: bool = false,
     union_budget_exceeded: bool = false,
+    /// The union was wanted for the dense fold alone, and the footers or headers say the fold would decline it.
+    fold_declined: bool = false,
     /// A lone key's dictionary entries summed over row groups (one more where nulls may be, at most the row group's
     /// rows), when every row group is covered: from the headers, and what grouping by codes resolves, entry by entry.
     /// Null otherwise.
@@ -387,7 +389,13 @@ pub fn collectRetaining(
             break :blk if (stat.rows > most) most else null;
         } else null else null;
         const run = full[ki] and ki < reads.whole.len and reads.whole[ki] and !declined;
-        if (allow_union and full[ki] and !run and !declined) stat.union_budget_exceeded = true;
+        // The footers' guess (`planReads`) leaves `whole` unset for the same decline.
+        const footers_declined = allow_union and full[ki] and ki < reads.whole.len and !reads.whole[ki] and
+            foldDeclined(metas, key, workers);
+        const fold_declined = fold_only and keys.len == 1 and
+            (workers *| widest > sums[0] +| refs.items.len or footers_declined);
+        stat.fold_declined = stat.fold_declined or fold_declined;
+        if (allow_union and full[ki] and !run and !declined and !fold_declined) stat.union_budget_exceeded = true;
         if (run) {
             stat.union_attempted = true;
             const col = key.col_ref.col_idx;

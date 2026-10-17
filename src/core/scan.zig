@@ -711,8 +711,38 @@ pub const PlanFacts = struct {
     probe_ranges: usize = 0,
     probe_bytes: u64 = 0,
     probe_capped: bool = false,
+    /// Where the group bound came from, and why; null without a GROUP BY bound to plan from.
+    planning: ?Planning = null,
     /// The strategies whose exactness preconditions hold for this query; the cost rules chose `dispatch.strategy`.
     admissible: std.EnumSet(@FieldType(AggregateDispatch, "strategy")) = .{},
+};
+
+/// The facts a GROUP BY was planned from: the dictionaries' union, their headers, or the footers alone, and why. A plan
+/// can differ by read mode (`--explain` says which it made): a reader's input unions only where a choice turns on it.
+pub const Planning = struct {
+    source: enum { footers, dictionary_headers, dictionary_union },
+    why: enum {
+        /// The union ran over mapped inputs.
+        mapped,
+        /// The union ran over the dictionaries a reader's probe read first.
+        reader_probe,
+        /// `ZPQ_NDV_UNION=0`.
+        union_disabled,
+        /// A first-keys cut whose footers say its codes resolve many entries: no bound can change it.
+        prefix_cut,
+        /// Beside a reader, no choice turns on the union (no count cut, dense fold or count(DISTINCT)).
+        reader_no_choice,
+        /// The union was wanted for the dense fold alone, which the footers or headers say would decline it.
+        fold_declines,
+        /// The reader's probe of the dictionaries passed its cap.
+        probe_capped,
+        /// The union's input or memory gates declined it.
+        union_budget,
+        /// The union began and gave up: a key past its gates, or a union no choice could use past its size.
+        union_incomplete,
+        /// Some key has no dictionary in every row group, or the input is remote: footers and headers only.
+        no_dictionaries,
+    },
 };
 
 /// Fixed-size decision; census and plain fallback remain conditional runtime transitions.
@@ -3179,6 +3209,7 @@ fn prepareAggregate(
     };
     var ndv_stat: ?NdvStat = null;
     var probe_facts: PlanFacts = .{};
+    var planning_why: ?@FieldType(Planning, "why") = null;
     // Freed once the dense tables are built, or as soon as the plan cannot use it.
     var domain: ?agg_dense.Domain = null;
     defer if (domain) |*d| d.deinit(gpa);
@@ -3196,6 +3227,9 @@ fn prepareAggregate(
         const guess = ndv.footerEntries(metas, keys) orelse std.math.maxInt(u64);
         const prefix = first == .first_keys and guess > few_entries;
         const allow_union = args.ndv_union and !prefix and (!plan_inputs.readers or union_matters);
+        planning_why = if (!args.ndv_union)
+            .union_disabled
+        else if (prefix) .prefix_cut else if (!allow_union) .reader_no_choice else null;
         // Beside a reader the union may be read for the fold alone: then not where the fold would decline it.
         const fold_only = plan_inputs.readers and first != .sketch and for (agg_calls) |c| {
             if (c.func == .count_distinct) break false;
@@ -3252,6 +3286,25 @@ fn prepareAggregate(
             .{ .fold_only = fold_only, .limit = if (first == .first_keys) few_union else null },
         );
         if (!explain) if (args.start_reads) |s| if (s.planned) |planned| planned(s.ctx);
+        const st = ndv_stat.?;
+        probe_facts.planning = .{
+            .source = switch (st.source) {
+                .unknown => .footers,
+                .dictionary_headers => .dictionary_headers,
+                .dictionary_union => .dictionary_union,
+            },
+            .why = if (st.union_complete)
+                (if (plan_inputs.readers) .reader_probe else .mapped)
+            else if (planning_why) |w|
+                w
+            else if (plan_inputs.readers and !probe_ok)
+                .probe_capped
+            else if (st.fold_declined)
+                .fold_declines
+            else if (st.union_budget_exceeded)
+                .union_budget
+            else if (st.union_attempted) .union_incomplete else .no_dictionaries,
+        };
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
@@ -3271,6 +3324,7 @@ fn prepareAggregate(
     scan_plan.facts.probe_ranges = probe_facts.probe_ranges;
     scan_plan.facts.probe_bytes = probe_facts.probe_bytes;
     scan_plan.facts.probe_capped = probe_facts.probe_capped;
+    scan_plan.facts.planning = probe_facts.planning;
     if (@import("builtin").is_test and !args.partagg and ndv_stat == null)
         try testing.expectEqualDeep(referenceDispatch(plan_inputs), scan_plan.dispatch);
     const decision = scan_plan.dispatch;

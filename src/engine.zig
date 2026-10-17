@@ -4848,6 +4848,9 @@ fn writeExplainFacts(writer: anytype, plan: scan.ScanPlan) !void {
     if (f.pass_share) |p| try writer.print(",\"filter_pass\":{{\"value\":{d:.4},\"provenance\":\"estimate\"}}", .{p});
     if (f.sampled_pass) |p|
         try writer.print(",\"filter_pass_sampled\":{{\"value\":{d:.4},\"provenance\":\"first_row_group\"}}", .{p});
+    if (f.planning) |pl| try writer.print(",\"planning\":{{\"source\":\"{s}\",\"why\":\"{s}\"}}", .{
+        @tagName(pl.source), @tagName(pl.why),
+    });
     try writer.print(",\"readers\":{},\"probe\":{{\"ranges\":{d},\"bytes\":{d},\"capped\":{}}}}}", .{ f.readers, f.probe_ranges, f.probe_bytes, f.probe_capped });
     try writer.writeAll(",\"candidates\":[");
     var sep: []const u8 = "";
@@ -9388,6 +9391,15 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and ev
         const reasons = explained.aggregate.plan.reasons;
         try std.testing.expect(reasons.contains(.small_ndv));
         try std.testing.expectEqual(i == 0, reasons.contains(.dictionary_union));
+        // Explain says which facts it planned from and why: the union over the mapping, the headers beside a reader.
+        const planning = explained.aggregate.plan.facts.planning.?;
+        if (i == 0) {
+            try std.testing.expectEqual(.dictionary_union, planning.source);
+            try std.testing.expectEqual(.mapped, planning.why);
+        } else {
+            try std.testing.expectEqual(.dictionary_headers, planning.source);
+            try std.testing.expectEqual(.reader_no_choice, planning.why);
+        }
         try std.testing.expect(!explained.encoded);
     };
 }
@@ -9414,6 +9426,8 @@ test "explainAggregate: the facts a plan was made from, the admissible strategie
     try std.testing.expectEqual(@as(i64, 20000), facts.get("rows").?.object.get("value").?.integer);
     try std.testing.expectEqualStrings("exact", facts.get("row_groups").?.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("bound", facts.get("groups").?.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("dictionary_union", facts.get("planning").?.object.get("source").?.string);
+    try std.testing.expectEqualStrings("mapped", facts.get("planning").?.object.get("why").?.string);
     try std.testing.expectEqualStrings("estimate", facts.get("filter_pass").?.object.get("provenance").?.string);
     var plain = false;
     for (json.value.object.get("candidates").?.array.items) |c| {

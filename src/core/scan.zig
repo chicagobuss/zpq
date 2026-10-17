@@ -1356,10 +1356,10 @@ const Worker = struct {
     pairs: ?*expr_agg.DistinctPairs = null,
     /// This worker's lanes over a retained key domain (`agg_dense`); row groups it cannot translate use the table.
     dense: ?*agg_dense.Lanes = null,
-    /// Rows this worker read before deciding whether its sets move to pairs, and whether it has decided.
-    pairs_rows: u64 = 0,
+    /// Whether this worker has decided if its sets move to pairs.
     pairs_decided: bool = false,
-    /// Rows at which the sets are judged next, and how many more judgments a `.wait` may buy.
+    /// Values its sets took (`DistinctPairs.seen`) at which they are judged next, and how many more judgments a
+    /// `.wait` may buy.
     pairs_pilot_rows: u64 = 0,
     pairs_rechecks: u8 = 0,
     /// Ordered GROUP BY: the work list split into fixed blocks, block `b` = `work[blocks[b]..blocks[b + 1]]`, claimed
@@ -1523,8 +1523,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .region = region,
         });
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
-            w.pairs_rows +|= @intCast(@max(rg.num_rows, 0));
-            if (w.pairs_rows >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, w.pairs_rows)) {
+            if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
                 .pay => {
                     w.pairs_decided = true;
                     try dp.drainTable(gt);
@@ -1532,7 +1531,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
                 },
                 .wait => if (w.pairs_rechecks > 0) {
                     w.pairs_rechecks -= 1;
-                    w.pairs_pilot_rows = w.pairs_rows *| 2;
+                    w.pairs_pilot_rows = dp.seen *| 2;
                 } else {
                     w.pairs_decided = true;
                 },
@@ -2625,12 +2624,13 @@ fn pairsPay(stat: ?NdvStat) bool {
     return est > 0 and est <= 1 << 20 and st.rows / est >= 64;
 }
 
-/// Whether a worker's sets, after `rows` rows, are the kind pairs beat: groups of 8 rows or more on average, nearly
-/// every row a value its group has not seen (nine in ten). Near-unique keys keep a few values inline in each set, and
-/// input whose values repeat (skew, or a few huge groups) keeps small or cache-resident sets; the sets win there.
-/// Rows a group gathers only grow, so too few of them is `.wait`: small row groups, or files each holding most of
-/// the keys, reach eight a group only after several items. The share of new values only falls, so too few is final.
-/// The row test runs first: it is free, and walking every set at each check cost near-unique keys ~4%.
+/// Whether a worker's sets, after taking `rows` values (`DistinctPairs.seen`), are the kind pairs beat: groups of 8
+/// rows or more on average, nearly every row a value its group has not seen (nine in ten). Near-unique keys keep a few
+/// values inline in each set, and input whose values repeat (skew, or a few huge groups) keeps small or cache-resident
+/// sets; the sets win there. Rows a group gathers only grow, so too few of them is `.wait`: small row groups, or files
+/// each holding most of the keys, reach eight a group only after several items. The share of new values only falls,
+/// so too few is final. The row test runs first: it is free, and walking every set at each check cost near-unique
+/// keys ~4%.
 fn pairsPayRuntime(table: *const expr_agg.GroupTable, agg_idx: usize, rows: u64) enum { pay, wait, never } {
     const groups = table.groupCount();
     if (groups == 0 or rows < 8 * @as(u64, groups)) return .wait;
@@ -12857,4 +12857,33 @@ test "clearWorkerErrors: a phase's expected failure is cleared on every worker, 
     ws[1].err = error.ExceededMemoryBudget;
     try clearWorkerErrors(&ws, error.ExceededMemoryBudget);
     for (ws) |w| try testing.expectEqual(@as(?anyerror, null), w.err);
+}
+
+test "regression: count(DISTINCT) pairs pay by the values the sets took, a filter's dropped rows left out" {
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // Seven groups of near-unique values; the filter drops one row in eight, which the rows read counted.
+    var results: [2]MultiAggResult = undefined;
+    for ([_]@FieldType(MultiAggArgs, "distinct_pairs"){ .off, .auto }, &results) |pairs, *res| {
+        res.* = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "count(DISTINCT u) AS d",
+            .group_by = "t",
+            .filter = "n = 1",
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .distinct_pairs = pairs,
+            .pairs_pilot_rows = 1000,
+            .ndv_policy = false,
+        });
+    }
+    defer for (results) |r| freeResult(r);
+    try testing.expect(results[1].distinct_pairs);
+    const sets = results[0].output.group_rows.?;
+    try testing.expectEqual(sets.len, results[1].output.group_rows.?.len);
+    for (sets, results[1].output.group_rows.?) |r, p_row| for (r, p_row) |x, y| try expectSameAggValue(x, y);
 }

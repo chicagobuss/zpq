@@ -4793,6 +4793,9 @@ pub const DistinctPairs = struct {
     agg_idx: usize,
     /// Rows go to the sets until this is set (`drainTable` moves what they hold so far).
     active: bool = true,
+    /// Values the sets took meanwhile: rows that passed the filter, NULLs left out, which `scan.pairsPayRuntime`
+    /// judges the sets by.
+    seen: u64 = 0,
     parts: [N]std.ArrayList(Pair) = @splat(.empty),
     charged: usize = 0,
     recent: [1 << recent_bits]Pair = undefined,
@@ -5013,11 +5016,16 @@ fn foldDistinctU64(
         }
         return;
     };
+    var fed: u64 = 0;
+    defer if (distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr and dp.agg_idx == agg_idx) {
+        dp.seen += fed;
+    };
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (!sel.isActive(r)) continue;
         if (def_levels) |dl| if (dl[r] < max_def) continue;
         try accs[group_id_arr[r] * agg_len + agg_idx].distinct.insertU64(persist, bit(values[r]));
+        fed += 1;
     }
 }
 

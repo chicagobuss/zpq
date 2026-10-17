@@ -17,6 +17,7 @@ const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
 const agg = @import("agg.zig");
 const DecodeBudget = @import("../consumer.zig").DecodeBudget;
+const huge_pages = @import("../huge_pages.zig");
 
 const Column = filter_eval.Batch.Column;
 const Sel = filter_selection.SelectionVector;
@@ -499,6 +500,8 @@ pub fn groupedCoded(
     sel: *const Sel,
     /// Charged for a composite space past `MAX_COMPOSITE`; null keeps grouping by code to the free spaces.
     budget: ?*DecodeBudget,
+    /// The region `ra` allocates from, whose ledger must take that scratch too (with an arena node's growth).
+    region: ?*huge_pages.Region,
 ) !bool {
     const num_rows = batch.num_rows;
     if (keys.len == 1 and keys[0] == .col_ref) if (lookup[keys[0].col_ref.col_idx]) |pos| {
@@ -527,6 +530,10 @@ pub fn groupedCoded(
         const b = budget orelse return false;
         charged = chargedScratch(space, calls);
         if (!b.tryAcquire(charged)) return false;
+        if (region) |r| if (!r.admit(r.end +| charged +| charged / 2)) {
+            b.release(charged);
+            return false;
+        };
     }
     defer if (charged > 0) budget.?.release(charged);
 
@@ -1284,7 +1291,7 @@ test "regression: grouped coded keys do not invent infinities for all-NaN values
     defer table.deinit();
     var sel = try Sel.init(a, vals.len);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vals.len };
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null));
     try testing.expect(std.math.isNan(table.accumulators.items[0].min_f.?));
     try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
 }
@@ -1315,7 +1322,7 @@ test "regression: grouped float min/max over coded keys and coded values order N
     defer table.deinit();
     var sel = try Sel.init(a, vcodes.len);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vcodes.len };
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null));
     try testing.expectEqual(@as(f64, 1.0), table.accumulators.items[0].min_f.?);
     try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
 }
@@ -1399,7 +1406,7 @@ test "a composite space past 2^16 groups by code only when its scratch is reserv
         var table = agg.GroupTable.init(testing.allocator, 1 << 28);
         defer table.deinit();
         var budget: DecodeBudget = .{ .limit = limit orelse 0 };
-        try testing.expect(!try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, if (limit != null) &budget else null));
+        try testing.expect(!try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, if (limit != null) &budget else null, null));
         try testing.expectEqual(@as(usize, 0), table.groupCount());
         try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     }
@@ -1407,7 +1414,7 @@ test "a composite space past 2^16 groups by code only when its scratch is reserv
     var table = agg.GroupTable.init(testing.allocator, 1 << 28);
     defer table.deinit();
     var budget: DecodeBudget = .{ .limit = 1 << 30 };
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, &budget));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, &budget, null));
     // Released once grouped.
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     try testing.expectEqual(@as(usize, n_keys), table.groupCount());
@@ -1483,11 +1490,11 @@ test "groupedCoded: a lone null-free key groups as when a constant second key is
 
     var lone = agg.GroupTable.init(testing.allocator, 1 << 20);
     defer lone.deinit();
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{k0}, &lone, 0, &batch, &lookup, &sel, null));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{k0}, &lone, 0, &batch, &lookup, &sel, null, null));
     var pair = agg.GroupTable.init(testing.allocator, 1 << 20);
     defer pair.deinit();
     const both = [_]expr_ast.Expr{ k0, k1 };
-    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &both, &pair, 0, &batch, &lookup, &sel, null));
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &both, &pair, 0, &batch, &lookup, &sel, null, null));
 
     try testing.expectEqual(@as(usize, 3), lone.groupCount());
     try testing.expectEqual(lone.groupCount(), pair.groupCount());
@@ -1537,7 +1544,7 @@ test "groupedCoded over a key histogram with first rows makes the groups, positi
     for (&tables, [_][]const Column{ &coded, &histed }) |*t, cols| {
         t.* = agg.GroupTable.init(testing.allocator, 1 << 20);
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
-        try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, t, 7, &batch, &lookup, &sel, null));
+        try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, t, 7, &batch, &lookup, &sel, null, null));
     }
     defer for (&tables) |*t| t.deinit();
     try testing.expectEqual(@as(usize, 4), tables[1].groupCount());

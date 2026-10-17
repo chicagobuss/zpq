@@ -2283,7 +2283,48 @@ pub const AggWorkspace = struct {
     /// The worker's region under `scratch` and `rg_arena`, which keeps an earlier pass's pages: trimmed before a row
     /// group decodes sliced or staged on memory of its own, so those pages are not held beside its reservation.
     region: ?*huge_pages.Region = null,
+    /// Where a row group decodes staged or sliced, beside the region: drawn from the query's ledger, as the region is.
+    /// Null allocates from the scan's `gpa`.
+    charged: ?std.mem.Allocator = null,
+    /// The ledger `charged` draws from, which a sliced row group sizes its slices to fit.
+    ledger: ?*const expr_agg.SharedBudget = null,
+    /// Without a ledger, what a sliced row group's slices are cut to hold, by the bytes their rows took (`lean_decode`
+    /// on a refusal chain's last scan); null cuts them by the footer's estimate.
+    slice_cap: ?usize = null,
 };
+
+/// Whether a row group's whole decode of `bytes` may go on the worker's region: the query's ledger takes what the
+/// region does not hold already. Without a region (or a ledger) only the decode budget decides.
+fn admitWhole(ws: AggWorkspace, bytes: usize) bool {
+    const r = ws.region orelse return true;
+    return r.admit(bytes);
+}
+
+/// Give back everything the worker's region holds, the row-group arena's nodes and the decode scratch, with what
+/// they drew from the ledger: a row group the ledger refused there then decodes in slices on memory of its own, not
+/// beside the pages it was refused for. Nothing allocated on either may be live.
+fn dropRegion(ws: AggWorkspace) void {
+    const r = ws.region orelse return;
+    const prof = ws.scratch.prof;
+    ws.scratch.deinit();
+    ws.scratch.* = .init(r.allocator());
+    ws.scratch.prof = prof;
+    ws.rg_arena.deinit();
+    ws.rg_arena.* = .init(r.allocator());
+    r.rewind();
+    r.trim();
+}
+
+/// `err` was the region's or `ws.charged`'s refusal of a draw, not the host's out-of-memory: the row group may still
+/// decode in slices, on less.
+fn refusedDraw(ws: AggWorkspace, err: anyerror) bool {
+    if (err != error.OutOfMemory) return false;
+    if (ws.region) |r| if (r.refused) {
+        r.refused = false;
+        return true;
+    };
+    return false;
+}
 
 /// The memory a query's scan workers' decoded row groups may take together (`scan.runMultiAggregate` gives it half of
 /// `max_memory`). A worker reserves a row group's estimate (`decodeEstimate`) before decoding it and gives it back
@@ -2572,6 +2613,8 @@ fn foldGroupedWindows(
     encoded: bool,
     /// Charged for a coded composite space past the free one, as the whole-row-group fold is.
     budget: ?*DecodeBudget,
+    /// The region `ra` allocates from, if it does.
+    region: ?*huge_pages.Region,
 ) !void {
     const g = switch (target) {
         .grouped => |grouped| grouped,
@@ -2583,7 +2626,7 @@ fn foldGroupedWindows(
     // resolve again nearly every code of a large dictionary.
     if (local.armed and encoded and sel.len > 0) {
         const whole: filter_eval.Batch = .{ .cols = cols, .num_rows = sel.len };
-        if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &whole, lookup, sel, budget)) {
+        if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &whole, lookup, sel, budget, region)) {
             try part.pump(local, g.table, @intCast(sel.count()));
             return;
         }
@@ -2607,7 +2650,7 @@ fn foldGroupedWindows(
             const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
             const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
-            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget)) {
+            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget, region)) {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
                 continue;
@@ -2683,11 +2726,14 @@ pub fn scanRGForAgg(
     // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan, which the
     // decode budget bounds: a row group past a worker's share decodes staged, on memory handed back when it is done.
     ws.rg_arena.nextRowGroup();
+    if (ws.region) |r| r.settle();
     const prof = ws.timings.prof;
 
     var staged = false;
     var reserved: usize = 0;
-    var plan_arena = std.heap.ArenaAllocator.init(gpa);
+    // Staged and sliced decodes live beside the region, on memory drawn from the query's ledger as the region's is.
+    const side = ws.charged orelse gpa;
+    var plan_arena = std.heap.ArenaAllocator.init(side);
     defer plan_arena.deinit();
     var full_estimate: usize = 0;
     const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
@@ -2698,13 +2744,15 @@ pub fn scanRGForAgg(
             std.debug.assert(full == keys_only);
         }
         reserved = full;
-        if (full > b.share()) if (ws.region) |r| r.trim();
-        // Too big for this worker's share: a slice of rows at a time when every column has a sliced form, else one
-        // aggregate's columns at a time.
-        if (full > b.share() and try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) {
+        // Too big for this worker's share, or for what the query's ledger has left: a slice of rows at a time when
+        // every column has a sliced form, else one aggregate's columns at a time.
+        const fits_share = full <= b.share();
+        const whole = fits_share and admitWhole(ws, full);
+        if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
+        if (!whole and try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) {
             return;
         }
-        if (full > b.share()) {
+        if (!whole) {
             const sp = try StagePlan.init(plan_arena.allocator(), in, target, handled_via_stats);
             if (sp.estimate < full) {
                 staged = true;
@@ -2719,7 +2767,7 @@ pub fn scanRGForAgg(
     defer if (ws.budget) |b| b.release(held);
     // Staged, everything decoded lives on memory of its own, given back with the row group; otherwise on the
     // worker's arena.
-    var staged_arena = std.heap.ArenaAllocator.init(gpa);
+    var staged_arena = std.heap.ArenaAllocator.init(side);
     defer staged_arena.deinit();
     const ra = if (staged) staged_arena.allocator() else ws.rg_arena.allocator();
 
@@ -2753,11 +2801,14 @@ pub fn scanRGForAgg(
             // stream a slice at a time. Nothing is aggregated before every column decodes, so the row group starts
             // over; its reservation and what it decoded go back first.
             const b = ws.budget orelse return err;
-            if (err != error.DecodeExceededBudget or staged) return err;
+            const refused = refusedDraw(ws, err);
+            if ((err != error.DecodeExceededBudget and !refused) or staged) return err;
             b.release(held);
             held = 0;
-            ws.rg_arena.nextRowGroup();
-            if (ws.region) |r| r.trim();
+            if (refused) dropRegion(ws) else {
+                ws.rg_arena.nextRowGroup();
+                if (ws.region) |r| r.trim();
+            }
             if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) return;
             return err;
         };
@@ -2793,6 +2844,7 @@ pub fn scanRGForAgg(
                     in.consumed,
                     decode_options.encoded,
                     ws.budget,
+                    ws.region,
                 );
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
@@ -2804,7 +2856,7 @@ pub fn scanRGForAgg(
             else
                 false;
             if (dense or (!staged and decode_options.encoded and
-                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget)))
+                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget, ws.region)))
             {
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
@@ -2833,7 +2885,7 @@ pub fn scanRGForAgg(
 
             // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
             if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                var call_arena = std.heap.ArenaAllocator.init(gpa);
+                var call_arena = std.heap.ArenaAllocator.init(side);
                 defer call_arena.deinit();
                 const ca = if (staged) call_arena.allocator() else ra;
                 const cb = if (stage_plan) |sp|
@@ -2861,7 +2913,7 @@ pub fn scanRGForAgg(
             // own per-WHERE predicate (if any) is composed inside updateOne.
             for (s.calls, s.accumulators, handled_via_stats, 0..) |call, *acc, handled, i| {
                 if (handled) continue;
-                var call_arena = std.heap.ArenaAllocator.init(gpa);
+                var call_arena = std.heap.ArenaAllocator.init(side);
                 defer call_arena.deinit();
                 const ca = if (staged) call_arena.allocator() else ra;
                 const cb = if (stage_plan) |sp|
@@ -2894,7 +2946,8 @@ fn scanRGSliced(
 ) !bool {
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return false;
-    var pages = std.heap.ArenaAllocator.init(gpa);
+    const side = ws.charged orelse gpa;
+    var pages = std.heap.ArenaAllocator.init(side);
     defer pages.deinit();
     var readers: std.ArrayList(SliceReader) = .empty;
     defer for (readers.items) |*r| r.deinit();
@@ -2907,14 +2960,17 @@ fn scanRGSliced(
         uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
-        var r = try SliceReader.init(pages.allocator(), gpa, in.rg, in.meta, in.src, ci, decode_options) orelse
+        var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, decode_options) orelse
             return false;
         if (levels_only[ci]) r.levelsOnly();
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
     }
     const per_row = @max(1, full / num_rows);
-    const slice_rows = sliceRows(budget.share() / per_row, num_rows);
+    // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
+    // answer, only how many rows decode at once.
+    const room = if (ws.ledger) |l| l.available() / 2 else std.math.maxInt(usize);
+    const slice_rows = sliceRows(@min(budget.share(), room) / per_row, num_rows);
     const reserved = @min(budget.limit, slice_rows * per_row);
     try budget.acquire(reserved);
     defer budget.release(reserved);
@@ -2922,11 +2978,21 @@ fn scanRGSliced(
     const prof = ws.timings.prof;
     const t0 = nowMonoNs();
     var done: usize = 0;
+    // Under a ledger, slices are cut by what rows took, not the footer's estimate, which can understate values by any
+    // factor (DELTA_BYTE_ARRAY copies a prefix into every one): the first slice is the least, each next is what the
+    // reservation, or the ledger's room, holds at the bytes a row of the last one took.
+    const measured = ws.ledger != null or ws.slice_cap != null;
+    var rows_now = if (measured) @min(slice_rows, 64) else slice_rows;
     while (done < num_rows) {
-        const n = @min(slice_rows, num_rows - done);
+        const n = @min(rows_now, num_rows - done);
         defer done += n;
-        var slice = std.heap.ArenaAllocator.init(gpa);
+        var slice = std.heap.ArenaAllocator.init(side);
         defer slice.deinit();
+        defer if (measured) {
+            const took = @max(1, slice.queryCapacity() / n);
+            const cap = if (ws.ledger) |l| l.available() / 2 else ws.slice_cap.?;
+            rows_now = sliceRows(@min(reserved, cap) / took, num_rows);
+        };
         const sa = slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
@@ -2952,6 +3018,7 @@ fn scanRGSliced(
                         in.consumed,
                         decode_options.encoded,
                         ws.budget,
+                        null,
                     );
                     continue;
                 }

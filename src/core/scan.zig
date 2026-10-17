@@ -31,6 +31,7 @@ const metadata = @import("parquet/metadata.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_parser = @import("expr/parser.zig");
 const expr_agg = @import("expr/agg.zig");
+const core_memory = @import("memory.zig");
 const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
@@ -125,6 +126,9 @@ pub const FastPath = enum {
     /// Without it a single table must hold what they held and the rows they had not reached, and the scan on one
     /// worker is not run (it would refuse, many times slower).
     one_table_may_fit,
+    /// The workers' decode memory came out of the query's ledger beside the rest: one worker, decoding one row group
+    /// at a time, holds the least of it.
+    decode_memory,
 };
 
 pub const RowGroupGate = struct {
@@ -169,6 +173,13 @@ pub const MultiAggArgs = struct {
     aggregate: []const u8,
     group_by: ?[]const u8 = null,
     max_memory: usize = 512 * 1024 * 1024,
+    /// The query's ledger (`memory.zig`): its limit is `max_memory`, and the scan's tables, decode memory, merge and
+    /// answer draw from it, beside whatever else the query holds. Null: a budget of `max_memory` the scan's tables
+    /// draw from alone, as tests that size a budget to their groups expect.
+    ledger: ?*expr_agg.SharedBudget = null,
+    /// Whether the workers' decode memory is drawn from `ledger`. A refusal chain's last scan decodes one small slice
+    /// at a time outside it (`narrowed`), as the ceiling's slack allows, so the tables have all of it.
+    charge_decode: bool = true,
     /// What the workers' decoded row groups may take together (`consumer.DecodeBudget`); null leaves decode unbounded.
     decode_limit: ?usize = null,
     /// The GROUP BY output columns as a select list writes them (SQL).
@@ -1405,6 +1416,12 @@ const Worker = struct {
     /// owning thread touches it during a pass; `prepareAggregate` unmaps it after the last.
     region: ?huge_pages.Region = null,
     decode_budget: ?*consumer.DecodeBudget = null,
+    /// The query's ledger, which the region and `charged` draw from; null draws nothing.
+    ledger: ?*expr_agg.SharedBudget = null,
+    /// Memory a row group decodes on beside the region (staged, sliced), drawn from `ledger`.
+    charged: ?core_memory.Charged = null,
+    /// Without a ledger: what a sliced row group's slices hold (`consumer.AggWorkspace.slice_cap`).
+    slice_cap: ?usize = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -1423,12 +1440,27 @@ fn workerRun(w: *Worker) void {
     expr_agg.distinct_pairs = w.pairs;
     defer expr_agg.distinct_pairs = null;
     workerRunErr(w, prof, &items) catch |e| {
-        w.err = e;
+        w.err = workerRefusal(w, e);
         if (w.block_merge) |m| m.fail();
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
     // doing the real work. (Ordered blocks release theirs as each finishes.)
     if (w.blocks == null and w.group_tables.len > 0) w.group_tables[w.index].releaseSlack();
+}
+
+/// Whether the worker drew decode memory from the query's ledger, past its region's allowance, or was refused it.
+fn decodeHeld(w: *const Worker) bool {
+    if (w.region) |r| if (r.charged > 0 or r.spilled > 0 or r.refused) return true;
+    if (w.charged) |c| return c.drew.load(.monotonic) or c.refused.load(.monotonic);
+    return false;
+}
+
+/// `err`, or `error.ExceededMemoryBudget` when it is the out-of-memory a refused draw from the ledger raised.
+fn workerRefusal(w: *const Worker, err: anyerror) anyerror {
+    if (err != error.OutOfMemory) return err;
+    if (w.region) |r| if (r.refused) return error.ExceededMemoryBudget;
+    if (w.charged) |c| return c.refusal(err);
+    return err;
 }
 
 fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
@@ -1438,7 +1470,14 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
     // Both it and the scratch are written front to back and reused, and both live in the worker's huge-page region
     // (see `huge_pages.Region`), rewound here for the next pass once both are released.
-    if (w.region == null) w.region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+    if (w.region == null) {
+        w.region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+        w.region.?.budget = w.ledger;
+        w.region.?.allowance = huge_pages.huge_page_size;
+    }
+    if (w.ledger) |l| if (w.charged == null) {
+        w.charged = .{ .child = w.gpa, .budget = l };
+    };
     const region = &w.region.?;
     defer region.rewind();
     var rg_decode_arena = consumer.RowGroupArena.init(region.allocator());
@@ -1551,6 +1590,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .timings = &w.timings,
             .budget = w.decode_budget,
             .region = region,
+            .charged = if (w.charged) |*c| c.allocator() else null,
+            .ledger = w.ledger,
+            .slice_cap = w.slice_cap,
         });
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
@@ -2876,18 +2918,22 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // their peak than the paths they stand in for, `FastPath`); then, where several workers' tables were refused, on
     // the forced partitions, a partition's groups folded at a time; then on one worker, which claims row groups in
     // order and so peaks the same every run, but only where one worker may fit (`FastPath.one_table_may_fit`): else
-    // its one table must hold all the refused tables held and more, and it only refuses, many times slower. A plain
-    // grouping a cost rule chose over a cut gives way to that cut, whose refusal is final. Each step only narrows
-    // (`narrowed`), so at most five scans run, and each arms its paths only over inputs a scan reads again, whole,
-    // from the start.
+    // its one table must hold all the refused tables held and more, and it only refuses, many times slower. Decode
+    // memory the query's ledger refused also runs on one worker (`FastPath.decode_memory`), and there once more on a
+    // small decode budget, so the tables have nearly all of the ledger. A plain grouping a cost rule chose over a cut
+    // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`), so at most six scans run,
+    // and each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = args;
     var chain: Chain = .{ .parts_tried = args.partagg };
+    const ledger_before = if (args.ledger) |l| l.used.load(.monotonic) else 0;
     var may_fit = false;
     while (true) {
         var taken: std.EnumSet(FastPath) = .{};
         attempt.taken = &taken;
         if (prepareAggregate(gpa, arena, attempt, false)) |r| return r else |e| {
             if (e != error.ExceededMemoryBudget) return e;
+            // A refused scan gives back all it drew: the next runs on the whole of what the query has left.
+            if (args.ledger) |l| std.debug.assert(l.used.load(.monotonic) == ledger_before);
             may_fit = may_fit or taken.contains(.one_table_may_fit);
             var next = narrowed(args, attempt, taken, &chain, may_fit) orelse return e;
             if (attempt.inputs.ptr == args.inputs.ptr) {
@@ -2957,6 +3003,8 @@ const Chain = struct {
     /// The forced partitions (`MultiAggArgs.partagg`), which append to runs; the cost rules' shared partitions
     /// (`FastPath.partitioned`) are not those, and leave it.
     parts_tried: bool,
+    /// The one-worker scan has run again on a small decode budget (`narrowed`).
+    lean_tried: bool = false,
 };
 
 /// The scan to run after `attempt` was refused with `taken` armed, or null when no narrower one can answer and the
@@ -2979,13 +3027,23 @@ fn narrowed(
     if (taken.contains(.partitioned)) next.partition_cost = false;
     if (taken.contains(.dense) or taken.contains(.spill) or taken.contains(.pairs) or taken.contains(.partitioned))
         return next;
-    if (!taken.contains(.worker_tables)) return null;
-    if (taken.contains(.partitions_fit) and !chain.parts_tried) {
+    // Decode memory the ledger refused is least on one worker, whatever the tables held; and least of all there in
+    // slices of `lean_decode`, outside the ledger (the ceiling's slack), which leaves the tables all of it, as they had
+    // beside an uncharged decode.
+    const one_decoder = taken.contains(.decode_memory) and attempt.parallelism != 1;
+    if (taken.contains(.decode_memory) and attempt.parallelism == 1 and !chain.lean_tried) if (args.decode_limit) |l| {
+        chain.lean_tried = true;
+        next.decode_limit = @min(l, core_memory.lean_decode);
+        next.charge_decode = false;
+        return next;
+    };
+    if (!taken.contains(.worker_tables) and !one_decoder) return null;
+    if (taken.contains(.worker_tables) and taken.contains(.partitions_fit) and !chain.parts_tried) {
         next.partagg = true;
         chain.parts_tried = true;
         return next;
     }
-    if (!may_fit) return null;
+    if (!may_fit and !one_decoder) return null;
     next.parallelism = 1;
     next.partagg = args.partagg;
     return next;
@@ -3365,21 +3423,20 @@ fn prepareAggregate(
     // worker meets the group-heavy row groups is unknowable in advance — fixed quotas made `-j2` reject queries `-j1`
     // ran on identical data. Fully initialized before any worker exists, so none can insert against an unpublished
     // budget.
-    var group_budget = expr_agg.SharedBudget{
-        .limit = args.max_memory,
-        // Shared partitions retain their own reservation slack alongside the workers' local tables.
-        .block = expr_agg.SharedBudget.blockFor(
-            args.max_memory,
-            n_workers + if (part_on) partagg.n_parts else @as(usize, 0),
-        ),
-    };
+    var own_budget = expr_agg.SharedBudget{ .limit = args.max_memory };
+    const group_budget = args.ledger orelse &own_budget;
+    // Shared partitions retain their own reservation slack alongside the workers' local tables.
+    group_budget.block = expr_agg.SharedBudget.blockFor(
+        args.max_memory,
+        n_workers + if (part_on) partagg.n_parts else @as(usize, 0),
+    );
     for (work_items.items) |item| {
         for (item.accumulators) |*acc| {
             if (acc.* == .distinct) if (acc.distinct.heap()) |ds| {
                 if (group_by_keys == null and n_workers > 1) {
-                    try ds.initPartitions(gpa, &group_budget);
+                    try ds.initPartitions(gpa, group_budget);
                 } else {
-                    ds.shared = &group_budget;
+                    ds.shared = group_budget;
                 }
             };
         }
@@ -3407,7 +3464,7 @@ fn prepareAggregate(
         // Zero local ceiling: everything is drawn from the shared pool, so an idle table reserves nothing others
         // could use.
         gt.* = expr_agg.GroupTable.init(gpa, 0);
-        gt.shared = &group_budget;
+        gt.shared = group_budget;
         gt.fixed_stride = fixed_stride;
         // A lone SUM's ranking merge paid more to unpack its state than the smaller scan saved.
         if (!dense_wanted and !use_blocks and (agg_calls.len != 1 or agg_calls[0].func == .count))
@@ -3420,11 +3477,14 @@ fn prepareAggregate(
     errdefer if (leave_tables) for (all_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
     var merged_table = expr_agg.GroupTable.init(gpa, 0);
-    merged_table.shared = &group_budget;
+    merged_table.shared = group_budget;
     merged_table.fixed_stride = fixed_stride;
     defer if (!leave_tables) merged_table.deinit();
+    errdefer if (leave_tables) merged_table.deinit();
     var part_state: ?partagg.PartAgg = null;
     defer if (!leave_tables) if (part_state) |*p| p.deinit();
+    // A refused scan runs again: what it held goes back, to the OS and to the query's ledger.
+    errdefer if (leave_tables) if (part_state) |*p| p.deinit();
     // Fixed-width keys fold into an open-addressed table cheap enough that moving near-unique ones to runs cost more
     // than it saved; string keys, copied into a byte map per worker, gain.
     const rescannable = allRescannable(args.inputs);
@@ -3453,7 +3513,7 @@ fn prepareAggregate(
     if (part_on or spill_on) {
         part_state = try partagg.PartAgg.init(
             gpa,
-            &group_budget,
+            group_budget,
             agg_calls,
             fixed_stride,
             mergeAccOwned,
@@ -3484,7 +3544,7 @@ fn prepareAggregate(
     if (pairs_call) |ai| {
         pair_sinks = try arena.alloc(expr_agg.DistinctPairs, n_tables);
         for (pair_sinks, group_tables) |*ps, *gt| {
-            ps.* = .{ .gpa = gpa, .budget = &group_budget, .table = gt, .agg_idx = ai, .active = pairs_from_start };
+            ps.* = .{ .gpa = gpa, .budget = group_budget, .table = gt, .agg_idx = ai, .active = pairs_from_start };
         }
     }
     // A lone integer key whose exact domain the union kept folds by global id when the plan groups it in per-worker
@@ -3556,6 +3616,8 @@ fn prepareAggregate(
             .items_per_rg = chunks_per_rg,
             .count_columns = count_columns,
             .decode_budget = if (decode_budget) |*b| b else null,
+            .ledger = if (args.charge_decode) args.ledger else null,
+            .slice_cap = if (args.charge_decode or args.ledger == null) null else core_memory.lean_decode,
         };
     }
 
@@ -3567,9 +3629,9 @@ fn prepareAggregate(
         o.* = .ineligible;
     };
     const order = args.result_order;
-    switch (decision.strategy) {
-        .first_keys => try firstKeysCut(gpa, arena, workers, &work_cursor, group_tables, order, args.sketch_topk.?),
-        .sketch => try sketchTopK(
+    const passes: anyerror!void = switch (decision.strategy) {
+        .first_keys => firstKeysCut(gpa, arena, workers, &work_cursor, group_tables, order, args.sketch_topk.?),
+        .sketch => sketchTopK(
             gpa,
             arena,
             workers,
@@ -3582,16 +3644,30 @@ fn prepareAggregate(
             decision,
         ),
         .scalar, .plain_hash, .partitioned_hash => runWorkers(workers),
-    }
+    };
+    // A cut's passes return their refusal themselves: what decode memory the workers drew is noted on the way out.
+    passes catch |e| {
+        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
+            for (workers) |*w| if (decodeHeld(w) and rescannable) taken.insert(.decode_memory);
+        };
+        return e;
+    };
     const t_decode_end = nowMonoNs();
     t.decode_wall_ns = @intCast(t_decode_end - t_decode);
     profile.record(prof, .scan, t_decode, t_decode_end, profile.args(.{n_workers}));
-    // The last pass is done: nothing decodes into the regions again, so the merge does not hold them.
-    if (!args.leave_regions) releaseRegions(workers);
+    const decode_held = for (workers) |*w| {
+        if (decodeHeld(w)) break true;
+    } else false;
+    // The last pass is done: nothing decodes into the regions again, so the merge does not hold them. Under a ledger
+    // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
+    if (!args.leave_regions or args.ledger != null) releaseRegions(workers);
     for (workers) |w| if (w.err) |e| {
-        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| if (taken.contains(.worker_tables)) {
-            if ((decision.strategy == .plain_hash and holdCopies(group_tables)) or
-                try oneWorkerCuts(arena, plan_inputs)) taken.insert(.one_table_may_fit);
+        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
+            if (decode_held and rescannable) taken.insert(.decode_memory);
+            if (taken.contains(.worker_tables)) {
+                if ((decision.strategy == .plain_hash and holdCopies(group_tables)) or
+                    try oneWorkerCuts(arena, plan_inputs)) taken.insert(.one_table_may_fit);
+            }
         };
         return e;
     };
@@ -3633,7 +3709,7 @@ fn prepareAggregate(
     for (pair_sinks) |*ps| pairs_used = pairs_used or ps.active;
     if (pairs_used) {
         for (pair_sinks, group_tables) |*ps, *gt| if (!ps.active) try ps.drainTable(gt);
-        try foldDistinctPairs(gpa, &group_budget, pair_sinks, group_tables, pairs_call.?, agg_calls.len, n_workers);
+        try foldDistinctPairs(gpa, group_budget, pair_sinks, group_tables, pairs_call.?, agg_calls.len, n_workers);
     }
     // Once one worker has moved to the partition runs every table goes there, so each key is in one partition.
     const spilled = part_on or (armed and part_state.?.spilled.load(.monotonic));
@@ -3652,9 +3728,9 @@ fn prepareAggregate(
         ds.* = .{};
         acc.* = .{ .distinct = .fromSet(ds) };
         if (group_by_keys == null and n_workers > 1) {
-            try ds.initPartitions(gpa, &group_budget);
+            try ds.initPartitions(gpa, group_budget);
         } else {
-            ds.shared = &group_budget;
+            ds.shared = group_budget;
         }
     };
     // These sets outlive `group_budget`, which lives in this frame: they give their reservations back to it before
@@ -12750,7 +12826,7 @@ test "regression: a plain grouping a cost rule chose over a cut answers every bu
     }
 }
 
-test "runMultiAggregate: every refusal narrows, the forced partitions follow the cost rules' ones, within five scans" {
+test "runMultiAggregate: every refusal narrows, the forced partitions follow the cost rules' ones, within six scans" {
     const S = std.EnumSet(FastPath);
     const Walk = struct {
         /// `plain`: a per-worker plain scan has run. `scans`: how many have.
@@ -12786,6 +12862,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
                 a.dense,    a.spill,            a.distinct_pairs != .off, a.partition_cost,
                 a.partagg,  a.parallelism == 1, a.plain_rules,            st.chain.parts_tried,
                 st.may_fit, st.cut,             st.plain,                 st.scans > 1,
+                st.chain.lean_tried,
             }, 0..) |b, i| k |= @as(u16, @intFromBool(b)) << @intCast(i);
             return k;
         }
@@ -12793,7 +12870,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
         /// The most scans any sequence of refusals from `st` runs; every one of them ends.
         fn longest(args: MultiAggArgs, st: State, depth: usize) !usize {
             try testing.expect(depth < 8);
-            var seen: [1 << 12]bool = @splat(false);
+            var seen: [1 << 13]bool = @splat(false);
             var most: usize = 1;
             const all = std.enums.values(FastPath);
             for (0..@as(usize, 1) << @intCast(all.len)) |bits| {
@@ -12818,7 +12895,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
             return most;
         }
     };
-    const args: MultiAggArgs = .{ .inputs = &.{}, .aggregate = "", .parallelism = 4 };
+    const args: MultiAggArgs = .{ .inputs = &.{}, .aggregate = "", .parallelism = 4, .decode_limit = 256 << 20 };
     const start: Walk.State = .{
         .a = args,
         .chain = .{ .parts_tried = false },
@@ -12827,11 +12904,13 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
         .plain = false,
         .scans = 0,
     };
-    // The cost rules' shared partitions, a fast path's mask, the plain tables, the forced partitions, one worker.
-    try testing.expectEqual(@as(usize, 5), try Walk.longest(args, start, 0));
+    // The cost rules' shared partitions, a fast path's mask, the plain tables, the forced partitions, one worker, and
+    // one worker on a small decode budget.
+    try testing.expectEqual(@as(usize, 6), try Walk.longest(args, start, 0));
     var forced = args;
     forced.partagg = true;
-    try testing.expectEqual(@as(usize, 2), try Walk.longest(forced, .{
+    // Forced partitions, one worker, one worker on a small decode budget.
+    try testing.expectEqual(@as(usize, 3), try Walk.longest(forced, .{
         .a = forced,
         .chain = .{ .parts_tried = true },
         .may_fit = false,
@@ -12855,6 +12934,16 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
     chain = .{ .parts_tried = false };
     const cut = narrowed(args, args, S.initMany(&.{ .plain_rule, .dense, .worker_tables }), &chain, false).?;
     try testing.expect(!cut.plain_rules and cut.dense and cut.parallelism == 4 and !chain.parts_tried);
+    // Refused decode memory: one worker, without copies of the keys or any table at all; then a small decode budget
+    // there; then the refusal is the query's.
+    chain = .{ .parts_tried = true };
+    const decoder = narrowed(args, args, S.initMany(&.{.decode_memory}), &chain, false).?;
+    try testing.expect(decoder.parallelism == 1 and decoder.decode_limit.? == args.decode_limit.?);
+    const lean = narrowed(args, decoder, S.initMany(&.{.decode_memory}), &chain, false).?;
+    try testing.expect(lean.parallelism == 1 and !lean.charge_decode);
+    try testing.expectEqual(core_memory.lean_decode, lean.decode_limit.?);
+    try testing.expect(chain.lean_tried);
+    try testing.expect(narrowed(args, lean, S.initMany(&.{.decode_memory}), &chain, false) == null);
 }
 
 test "runMultiAggregate: a refusal says one worker may fit only where tables held copies or one worker plans a cut" {

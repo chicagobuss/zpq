@@ -99,6 +99,7 @@ test {
     _ = @import("core/agg_plan.zig");
     _ = @import("core/result_program.zig");
     _ = @import("core/huge_pages.zig");
+    _ = @import("core/memory.zig");
     _ = @import("core/spawn.zig");
     _ = @import("core/invariant.zig");
     _ = @import("core/filter/ast.zig");

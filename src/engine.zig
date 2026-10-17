@@ -30,6 +30,7 @@ const schema = @import("core/schema.zig");
 const compression = @import("core/parquet/compression.zig");
 const decimal_mod = @import("core/parquet/decimal.zig");
 const huge_pages = @import("core/huge_pages.zig");
+const core_memory = @import("core/memory.zig");
 const consumer = @import("core/consumer.zig");
 const invariant = @import("core/invariant.zig");
 const scan = @import("core/scan.zig");
@@ -538,6 +539,8 @@ fn executeAggregateOver(
 ) !if (explain) AggregateExplanation else AggResult {
     const empty_result = args.empty_scalar or args.result_order.limit == 0;
     var t: Timings = .{};
+    // The query's ledger: what the scan's tables, decode memory, merge and answer hold together stays under it.
+    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
 
     // 1. Open all inputs — local mmap or s3 parallel range-fetch.
     //    This step already does column pruning for s3 (parses the
@@ -645,6 +648,7 @@ fn executeAggregateOver(
         .typed_answer = args.typed_answer and args.output != null,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
+        .ledger = &ledger,
         // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
         .decode_limit = args.max_memory / 2,
         .diag = args.diag,
@@ -8539,16 +8543,20 @@ test "regression: DELTA_BYTE_ARRAY values are charged where they decode, and a r
             defer counted.deinit(gpa);
             try std.testing.expectEqual(@as(i128, 1500), counted.aggregate.output.aggs[0].value.i);
         }
-        // Read whole, the chunk's pages together pass the budget; a slice at a time they do not.
-        var res = try runQuery(ctx, .{
-            .inputs = &.{path},
-            .aggregate = "count(*) AS n",
-            .filter = "s = 'x'",
-            .parallelism = j,
-            .max_memory = 8 << 20,
-        });
-        defer res.deinit(gpa);
-        try std.testing.expectEqual(@as(i128, 0), res.aggregate.output.aggs[0].value.i);
+        // Read whole, the chunk's pages together pass the budget; a slice at a time, slices cut by the bytes their rows
+        // took, they hold a page and a slice: within 32 MiB of the query's ledger, and at 8 MiB on the last rerun's
+        // small decode outside it (they held 160 MB there before slices were cut by bytes).
+        for ([_]usize{ 8 << 20, 32 << 20 }) |budget| {
+            var res = try runQuery(ctx, .{
+                .inputs = &.{path},
+                .aggregate = "count(*) AS n",
+                .filter = "s = 'x'",
+                .parallelism = j,
+                .max_memory = budget,
+            });
+            defer res.deinit(gpa);
+            try std.testing.expectEqual(@as(i128, 0), res.aggregate.output.aggs[0].value.i);
+        }
     }
     // Printed rows decode the same values, and took no budget at all.
     for ([_]usize{ 2 << 20, 64 << 20 }) |budget| {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const core_memory = @import("memory.zig");
 
 pub const huge_page_size: usize = 2 << 20;
 
@@ -61,6 +62,11 @@ pub const HugePageAdvisor = struct {
 ///     which with every scan thread live costs a TLB shootdown on each.
 /// Address space is reserved, not committed (MAP_NORESERVE): only touched pages count. A request past the reserve,
 /// or a reservation the system refuses, goes to `child`. Not thread-safe: one per worker.
+///
+/// With a `budget`, what the region may hold resident is drawn from it before it is handed out: the span blocks have
+/// reached, in whole huge pages (what THP faults in), and each block spilled to `child`. A draw the budget refuses
+/// fails the allocation and sets `refused`. Pages stay charged until `trim` or `deinit` gives them back, as they stay
+/// resident until then.
 pub const Region = struct {
     child: std.mem.Allocator,
     /// The whole mapping, for `munmap`; empty when the reservation failed.
@@ -72,6 +78,15 @@ pub const Region = struct {
     last: usize = 0,
     /// How far blocks have reached since the last `trim`: pages past `end` up to here may still be resident.
     touched: usize = 0,
+    budget: ?*core_memory.SharedBudget = null,
+    /// Drawn from `budget` for `buf`: whole huge pages from its start, never less than `touched` covers.
+    charged: usize = 0,
+    /// Drawn for blocks spilled to `child`, given back as each is freed.
+    spilled: usize = 0,
+    /// What the region holds before it draws anything: a worker's first huge page, which the ceiling counts in its
+    /// per-worker slack (`memory.zig`) since no worker makes progress on less.
+    allowance: usize = 0,
+    refused: bool = false,
 
     pub fn init(child: std.mem.Allocator, reserve: usize) Region {
         var r: Region = .{ .child = child };
@@ -89,7 +104,54 @@ pub const Region = struct {
 
     pub fn deinit(self: *Region) void {
         if (self.mapping.len > 0) std.posix.munmap(self.mapping);
-        self.* = .{ .child = self.child };
+        if (self.budget) |b| b.release(self.charged);
+        self.* = .{ .child = self.child, .budget = self.budget, .spilled = self.spilled };
+    }
+
+    /// Make sure `bytes` of the region are charged, drawing the rest now: the reservation a row group's decode makes
+    /// before it allocates. False, holding nothing more, when the budget refuses it. Pages an earlier row group left
+    /// charged count, as its arena reuses them.
+    pub fn admit(self: *Region, bytes: usize) bool {
+        if (self.budget == null or self.buf.len == 0) return true;
+        return self.chargeTo(bytes);
+    }
+
+    /// Give back what `admit` reserved past the pages blocks have reached: at a row-group boundary, where the next
+    /// row group's reservation replaces the last one's.
+    pub fn settle(self: *Region) void {
+        const b = self.budget orelse return;
+        const keep = @min(self.buf.len, std.mem.alignForward(usize, self.touched, huge_page_size)) -| self.allowance;
+        if (self.charged <= keep) return;
+        b.release(self.charged - keep);
+        self.charged = keep;
+    }
+
+    fn chargeTo(self: *Region, end: usize) bool {
+        const b = self.budget orelse return true;
+        const want = @min(self.buf.len, std.mem.alignForward(usize, end, huge_page_size)) -| self.allowance;
+        if (want <= self.charged) return true;
+        if (b.drawExact(want - self.charged) == null) {
+            self.refused = true;
+            return false;
+        }
+        self.charged = want;
+        return true;
+    }
+
+    fn chargeSpill(self: *Region, n: usize) bool {
+        const b = self.budget orelse return true;
+        if (b.drawExact(n) == null) {
+            self.refused = true;
+            return false;
+        }
+        self.spilled += n;
+        return true;
+    }
+
+    fn releaseSpill(self: *Region, n: usize) void {
+        const b = self.budget orelse return;
+        b.release(n);
+        self.spilled -= n;
     }
 
     /// Make the whole region free again for the next phase of work, keeping its pages. Everything carved from it
@@ -109,6 +171,11 @@ pub const Region = struct {
             release(@alignCast(self.buf[lo..hi]));
         }
         self.touched = self.end;
+        if (self.budget) |b| {
+            const keep = @min(self.charged, std.mem.alignForward(usize, self.end, huge_page_size) -| self.allowance);
+            b.release(self.charged - keep);
+            self.charged = keep;
+        }
     }
 
     pub fn allocator(self: *Region) std.mem.Allocator {
@@ -136,19 +203,33 @@ pub const Region = struct {
         const base = @intFromPtr(self.buf.ptr);
         const start = alignment.forward(base + self.end) - base;
         if (self.buf.len > 0 and start <= self.buf.len and len <= self.buf.len - start) {
+            if (!self.chargeTo(start + len)) return null;
             self.last = start;
             self.end = start + len;
             self.touched = @max(self.touched, self.end);
             return self.buf.ptr + start;
         }
-        return self.child.rawAlloc(len, alignment, ret_addr);
+        if (!self.chargeSpill(len)) return null;
+        return self.child.rawAlloc(len, alignment, ret_addr) orelse {
+            self.releaseSpill(len);
+            return null;
+        };
     }
 
     fn regionResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *Region = @ptrCast(@alignCast(ctx));
-        if (!self.owns(memory)) return self.child.rawResize(memory, alignment, new_len, ret_addr);
+        if (!self.owns(memory)) {
+            if (new_len > memory.len and !self.chargeSpill(new_len - memory.len)) return false;
+            if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) {
+                if (new_len > memory.len) self.releaseSpill(new_len - memory.len);
+                return false;
+            }
+            if (new_len < memory.len) self.releaseSpill(memory.len - new_len);
+            return true;
+        }
         if (self.isLast(memory)) {
             if (new_len > self.buf.len - self.last) return false;
+            if (!self.chargeTo(self.last + new_len)) return false;
             self.end = self.last + new_len;
             self.touched = @max(self.touched, self.end);
             return true;
@@ -158,13 +239,25 @@ pub const Region = struct {
 
     fn regionRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *Region = @ptrCast(@alignCast(ctx));
-        if (!self.owns(memory)) return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        if (!self.owns(memory)) {
+            if (new_len > memory.len and !self.chargeSpill(new_len - memory.len)) return null;
+            const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse {
+                if (new_len > memory.len) self.releaseSpill(new_len - memory.len);
+                return null;
+            };
+            if (new_len < memory.len) self.releaseSpill(memory.len - new_len);
+            return p;
+        }
         return if (regionResize(ctx, memory, alignment, new_len, ret_addr)) memory.ptr else null;
     }
 
     fn regionFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *Region = @ptrCast(@alignCast(ctx));
-        if (!self.owns(memory)) return self.child.rawFree(memory, alignment, ret_addr);
+        if (!self.owns(memory)) {
+            self.child.rawFree(memory, alignment, ret_addr);
+            self.releaseSpill(memory.len);
+            return;
+        }
         if (self.isLast(memory)) self.end = self.last;
     }
 };
@@ -274,4 +367,52 @@ test "Region.trim hands back the pages past the newest block that an earlier pha
     const again = try a.alloc(u8, 2 * huge_page_size);
     @memset(again, 3);
     try std.testing.expectEqual(@as(u8, 3), again[again.len - 1]);
+}
+
+test "Region with a budget charges whole huge pages as blocks reach them, refuses past it, and gives them back" {
+    var budget: core_memory.SharedBudget = .{ .limit = 3 * huge_page_size };
+    var region = Region.init(std.testing.allocator, 8 * huge_page_size);
+    region.budget = &budget;
+    if (region.buf.len == 0) {
+        region.deinit();
+        return error.SkipZigTest;
+    }
+    const a = region.allocator();
+    const x = try a.alloc(u8, 100);
+    try std.testing.expectEqual(huge_page_size, budget.used.load(.monotonic));
+    // The newest block grows in place across a huge-page boundary only as far as the budget lets it.
+    var y = try a.alloc(u8, huge_page_size);
+    try std.testing.expectEqual(2 * huge_page_size, budget.used.load(.monotonic));
+    try std.testing.expect(!a.resize(y, 4 * huge_page_size));
+    try std.testing.expect(region.refused);
+    try std.testing.expectEqual(2 * huge_page_size, budget.used.load(.monotonic));
+    try std.testing.expect(a.resize(y, huge_page_size + 4096));
+    y = y.ptr[0 .. huge_page_size + 4096];
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 2 * huge_page_size));
+    // `admit` reserves ahead, and pages already charged count toward it.
+    region.refused = false;
+    try std.testing.expect(region.admit(2 * huge_page_size));
+    try std.testing.expect(region.admit(3 * huge_page_size));
+    try std.testing.expectEqual(3 * huge_page_size, budget.used.load(.monotonic));
+    try std.testing.expect(!region.admit(4 * huge_page_size));
+    // `settle` gives back what the reservation held past the pages blocks reached.
+    region.settle();
+    try std.testing.expectEqual(2 * huge_page_size, budget.used.load(.monotonic));
+    try std.testing.expect(region.admit(3 * huge_page_size));
+    // A rewind keeps the pages and their charge; a trim gives back what lies past the newest block.
+    a.free(y);
+    _ = x;
+    region.rewind();
+    try std.testing.expectEqual(3 * huge_page_size, budget.used.load(.monotonic));
+    region.trim();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    // A block past the reserve spills to the child, charged by its length.
+    budget.limit = 16 * huge_page_size;
+    const big = try a.alloc(u8, 9 * huge_page_size);
+    try std.testing.expectEqual(9 * huge_page_size, budget.used.load(.monotonic));
+    a.free(big);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    _ = try a.alloc(u8, 10);
+    region.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }

@@ -371,7 +371,7 @@ test "dense fold makes the groups and states grouping by code makes, by value ac
         const b = Fixture.batch(rg);
         var sel = try Fixture.selection(a, rg);
         const pos = agg.firstPosition(rg, 0);
-        try testing.expect(try agg_coded.groupedCoded(a, testing.allocator, calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null));
+        try testing.expect(try agg_coded.groupedCoded(a, testing.allocator, calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null, null));
         try testing.expect(try lanes[wi].fold(a, testing.allocator, Fixture.key, 0, rg, pos, &b, &lookup, &sel));
     }
     try intoTable(testing.allocator, a, &lanes, Fixture.key, &got, lookup.len, 2);

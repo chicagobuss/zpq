@@ -31,6 +31,7 @@ const decimal_mod = @import("../parquet/decimal.zig");
 const agg_coded = @import("agg_coded.zig");
 const statistics = @import("../parquet/statistics.zig");
 const core_bytes = @import("../bytes.zig");
+const core_memory = @import("../memory.zig");
 const keyEql = core_bytes.keyEql;
 const KeyHashMap = core_bytes.KeyHashMap;
 const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
@@ -3738,66 +3739,7 @@ pub fn serializeRowKey(
     }
 }
 
-/// One `max_memory` shared by every group table filling in parallel, so required headroom stops scaling with `-j`
-/// (see `scan.zig`). Usage never exceeds `limit`, but admission near it is approximate — tables draw in blocks and can
-/// sit on part of one — because exact per-entry accounting would put a contended atomic on every insertion. Stranded
-/// residue is at most ~5% of the budget in aggregate regardless of worker count (see `blockFor`).
-pub const SharedBudget = struct {
-    // 16-aligned so an inline distinct acc can use bit 3 of this pointer as a flag (`DistinctAcc.table_flag`).
-    used: std.atomic.Value(usize) align(16) = .init(0),
-    limit: usize,
-    block: usize = 64 * 1024,
-
-    /// Blocks keep the shared counter off the per-group path: the counter is cheap, but many workers invalidating one
-    /// cache line is not. The cap stops a barely-grouping worker from stranding quota an active table needs.
-    const BlockMax: usize = 64 * 1024;
-
-    /// Caps blocks so all tables together strand at most ~5% of the budget. A per-worker fraction would be far wider:
-    /// early workers can reserve most of the pool between them.
-    pub fn blockFor(limit: usize, n_tables: usize) usize {
-        return @max(1, @min(BlockMax, limit / @max(1, n_tables) / 20));
-    }
-
-    fn blockSize(self: *const SharedBudget) usize {
-        return self.block;
-    }
-
-    /// Near the ceiling, held slack can fail a table while total use is under the limit, so blocks are dropped once
-    /// the pool is tight — exact admission where it is observable, atomic off the hot path elsewhere.
-    pub fn tight(self: *const SharedBudget) bool {
-        return self.used.load(.monotonic) >= self.limit - self.limit / 4;
-    }
-
-    /// `draw` of exactly `need`, never a block: for holders too many to each strand a block's slack, such as the
-    /// per-partition lists of every worker.
-    pub fn drawExact(self: *SharedBudget, need: usize) ?usize {
-        var cur = self.used.load(.monotonic);
-        while (cur + need <= self.limit) {
-            cur = self.used.cmpxchgWeak(cur, cur + need, .monotonic, .monotonic) orelse return need;
-        }
-        return null;
-    }
-
-    pub fn draw(self: *SharedBudget, need: usize) ?usize {
-        const first: usize = if (self.tight()) need else @max(need, self.blockSize());
-        for ([_]usize{ first, need }) |want| {
-            var cur = self.used.load(.monotonic);
-            while (cur + want <= self.limit) {
-                if (self.used.cmpxchgWeak(cur, cur + want, .monotonic, .monotonic)) |actual| {
-                    cur = actual;
-                    continue;
-                }
-                return want;
-            }
-        }
-        return null;
-    }
-
-    pub fn release(self: *SharedBudget, bytes: usize) void {
-        if (bytes == 0) return;
-        _ = self.used.fetchSub(bytes, .monotonic);
-    }
-};
+pub const SharedBudget = core_memory.SharedBudget;
 
 /// Byte width of one fixed-width group key, or null when a key is a string, a decimal, or wider than the inline
 /// image. Each integer or float column is a presence byte plus 8 payload bytes, the same bytes `serializeRowKey`

@@ -3731,22 +3731,23 @@ const MergedSlot = struct {
     idx: usize,
 };
 
-const radix_bits = 11;
-const radix_buckets = 1 << radix_bits;
-/// Fewer slots than this per chunk sort on fewer threads: a chunk's pass over its 2048 buckets would cost more than
-/// its share of the slots.
+/// The widest digit a pass sorts by: 8192 buckets a chunk.
+const radix_bits_max = 13;
+/// Fewer slots than this per chunk sort on fewer threads: a chunk's pass over its buckets would cost more than its
+/// share of the slots.
 const radix_chunk_min = 1 << 16;
 
 /// Sort `slots` by `first`, the input row that created each group, so unique per group: answers list groups in
 /// first-appearance order, the same at every `-j`. An LSD radix sort, so every pass splits into chunks of slots each
 /// worker counts and scatters on its own. `first` packs a row group ordinal above a row index (`firstPosition`), so
-/// most of its 64 bits are the same in every slot, and a digit that is costs no pass.
+/// most of its 64 bits are the same in every slot: the sort key is `first` with the row index's unused high bits
+/// squeezed out (`SlotRadix.key`, order-preserving), and its varying bits are split into as few passes as cover them.
 fn sortSlotsByFirst(gpa: std.mem.Allocator, slots: []MergedSlot, n_workers: usize) error{OutOfMemory}!void {
     if (slots.len < 2) return;
     const n_chunks = @max(1, @min(n_workers, slots.len / radix_chunk_min));
     const scratch = try gpa.alloc(MergedSlot, slots.len);
     defer gpa.free(scratch);
-    const counts = try gpa.alloc(usize, n_chunks * radix_buckets);
+    const counts = try gpa.alloc(usize, n_chunks << radix_bits_max);
     defer gpa.free(counts);
     const spans = try gpa.alloc(SlotRadix.Span, n_chunks);
     defer gpa.free(spans);
@@ -3762,20 +3763,29 @@ fn sortSlotsByFirst(gpa: std.mem.Allocator, slots: []MergedSlot, n_workers: usiz
         any |= s.any;
         all &= s.all;
     }
-    const varying = any ^ all;
+    // Every slot's row index is below 2^row_bits. `key` moves bits, so it maps an OR or an AND of firsts to the same
+    // of their keys.
+    sort.row_bits = @intCast(64 - @clz(any & 0xffff_ffff));
+    const varying = sort.key(any) ^ sort.key(all);
+    if (varying == 0) return;
+    const lo: usize = @ctz(varying);
+    const span_bits = 64 - @clz(varying) - lo;
+    const passes = std.math.divCeil(usize, span_bits, radix_bits_max) catch unreachable;
+    sort.bits = @intCast(std.math.divCeil(usize, span_bits, passes) catch unreachable);
+    const buckets = @as(usize, 1) << sort.bits;
 
-    var shift: usize = 0;
-    while (shift < 64) : (shift += radix_bits) {
+    var shift: usize = lo;
+    while (shift < lo + span_bits) : (shift += sort.bits) {
         sort.shift = @intCast(shift);
-        if ((varying >> sort.shift) & (radix_buckets - 1) == 0) continue;
+        if ((varying >> sort.shift) & (buckets - 1) == 0) continue;
         sort.runPhase(tasks, .count);
         // Bucket b starts after every chunk's slots of the buckets below it; within b, chunk c's after chunks < c, so
         // each pass is stable, as LSD needs.
         var at: usize = 0;
-        for (0..radix_buckets) |b| {
+        for (0..buckets) |b| {
             for (0..n_chunks) |c| {
-                const n = counts[c * radix_buckets + b];
-                counts[c * radix_buckets + b] = at;
+                const n = counts[c * buckets + b];
+                counts[c * buckets + b] = at;
                 at += n;
             }
         }
@@ -3796,6 +3806,10 @@ const SlotRadix = struct {
     spans: []Span,
     n_chunks: usize,
     shift: u6 = 0,
+    /// The digit's width, at most `radix_bits_max`.
+    bits: u4 = radix_bits_max,
+    /// Bits of the row index in `key`: as many as the largest row index of any slot takes.
+    row_bits: u6 = 32,
     phase: Phase = .span,
     cursor: std.atomic.Value(usize) = .init(0),
 
@@ -3819,7 +3833,8 @@ const SlotRadix = struct {
             if (c >= s.n_chunks) return;
             const lo = s.src.len * c / s.n_chunks;
             const hi = s.src.len * (c + 1) / s.n_chunks;
-            const mine = s.counts[c * radix_buckets ..][0..radix_buckets];
+            const buckets = @as(usize, 1) << s.bits;
+            const mine = s.counts[c * buckets ..][0..buckets];
             switch (s.phase) {
                 .span => {
                     var span: Span = .{ .any = 0, .all = std.math.maxInt(u64) };
@@ -3843,8 +3858,14 @@ const SlotRadix = struct {
         }
     }
 
+    /// `first`'s row group ordinal right above its row index's `row_bits`: the same order on fewer bits.
+    fn key(s: *const SlotRadix, first: u64) u64 {
+        const row_mask = (@as(u64, 1) << s.row_bits) - 1;
+        return (first >> 32) << s.row_bits | (first & row_mask);
+    }
+
     fn digit(s: *const SlotRadix, first: u64) usize {
-        return @intCast((first >> s.shift) & (radix_buckets - 1));
+        return @intCast((s.key(first) >> s.shift) & ((@as(u64, 1) << s.bits) - 1));
     }
 };
 
@@ -9909,21 +9930,27 @@ test "sortSlotsByFirst: a comparison sort's order at every -j, and when spawns f
     var prng = std.Random.DefaultPrng.init(0x51075);
     const random = prng.random();
     const Spread = enum {
-        /// `firstPosition`s over 29 row groups: four digits differ, the row group's straddling two.
+        /// `firstPosition`s over 29 row groups: the key squeezes the row index's unused high bits out.
         positions,
-        /// Every bit differs: all six digits, the top one short.
+        /// Row indexes that take all 32 bits, so the key is `first` itself.
+        high_rows,
+        /// Row index 0 everywhere: the key is the row group ordinal alone.
+        ordinals,
+        /// Every bit differs: five passes, the last one short.
         wide,
-        /// Below 2^11: one pass, so the answer is left in the scratch and copied back.
+        /// Below 2^13: one pass, so the answer is left in the scratch and copied back.
         narrow,
     };
     for ([_]usize{ 0, 1, 2, 1000, 300_000 }) |n| for (std.enums.values(Spread)) |spread| {
-        if (spread == .narrow and n > radix_buckets) continue;
+        if (spread == .narrow and n > 1 << radix_bits_max) continue;
         const input = try testing.allocator.alloc(MergedSlot, n);
         defer testing.allocator.free(input);
         for (input, 0..) |*s, i| s.* = .{
             .key = "",
             .first = switch (spread) {
                 .positions => expr_agg.firstPosition(i % 29, i / 29),
+                .high_rows => expr_agg.firstPosition(i % 3, 0xffff_0000 - i / 3),
+                .ordinals => expr_agg.firstPosition(i, 0),
                 // An odd multiplier permutes the u64s, so these stay unique.
                 .wide => @as(u64, i) *% 0x9E3779B97F4A7C15,
                 .narrow => i,

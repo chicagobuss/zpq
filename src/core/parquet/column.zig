@@ -109,6 +109,12 @@ fn levelsInto(bytes: []const u8, max_level: anytype, out: []u32) Error!void {
 
 pub const DecodeScratch = page_mod.DecodeScratch;
 
+/// A value decoder's failure as the reader reports it: the page is malformed, unless the decoder ran out of memory
+/// (a budget's refusal, whose caller may decode on less), which stays what it is.
+fn pageError(err: anyerror) Error {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.UnexpectedPage;
+}
+
 /// Decode configuration: plain values, free to copy and share between threads. Per-worker state (`DecodeScratch`)
 /// is a separate reader argument.
 pub const DecodeOptions = struct {
@@ -1095,7 +1101,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 inline else => |*d| if (@TypeOf(d.*) == void)
                     unreachable
                 else
-                    d.decode(dest) catch return error.UnexpectedPage,
+                    d.decode(dest) catch |e| return pageError(e),
             };
             // A dictionary's codes index entries checked when it was installed.
             if (T == i32 and self.active != .rle_dict) try self.checkIntRange(dest[0..got]);
@@ -1475,8 +1481,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 .DELTA_LENGTH_BYTE_ARRAY => {
                     if (T != []const u8) return error.UnsupportedEncoding;
-                    const d = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena, num_values) catch
-                        return error.UnexpectedPage;
+                    const d = dba.DeltaLengthByteArrayDecoder.init(values_bytes, self.arena, num_values) catch |e|
+                        return pageError(e);
                     if (!self.fixedLengths(&.{}, d.lengths)) return error.UnexpectedPage;
                     self.active = .{ .delta_len_ba = d };
                 },
@@ -1484,8 +1490,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     if (T != []const u8) return error.UnsupportedEncoding;
                     // Charged when its values are decoded (`chargeExpansion`), which levels alone never are.
                     const unbounded = std.math.maxInt(usize);
-                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, unbounded) catch
-                        return error.UnexpectedPage;
+                    const d = dba.DeltaByteArrayDecoder.init(values_bytes, self.arena, num_values, unbounded) catch |e|
+                        return pageError(e);
                     self.pending_expansion = d.expanded;
                     if (!self.fixedLengths(d.prefix_lengths, d.suffixes.lengths)) return error.UnexpectedPage;
                     self.active = .{ .delta_ba = d };

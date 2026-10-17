@@ -2511,7 +2511,8 @@ fn scatterGrouped(
             partagg.PartAgg.lock(pt);
             defer partagg.PartAgg.unlock(pt);
             for (order[lo..hi]) |r| ids[r] = try insertRow(ra, &scratch, &pt.table, key_cols, r, g.calls, pos);
-            try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls);
+            try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls,
+                if (pt.table.compact.stride != 0) &pt.table.compact else null);
         }
         return;
     }
@@ -2525,7 +2526,8 @@ fn scatterGrouped(
             const key = try storedRowKey(ra, &scratch, g.table, key_cols, r, &image);
             ids[r] = @intCast(try part.append(run, key, pos + r));
         }
-        try preps.fold(gpa, run.accs.items, ids, order[lo..hi], g.calls);
+        try preps.fold(gpa, run.accs.items, ids, order[lo..hi], g.calls,
+            if (run.compact.stride != 0) &run.compact else null);
     }
 }
 
@@ -2620,8 +2622,8 @@ fn foldGroupedWindows(
             ids[r] = try resolver.resolve(ra, g.table, key_cols, r, g.calls, pos);
         };
         try expr_agg.sinkSketchRows(g.table, ids, &win_sel);
-        if (!g.table.countOnly()) for (g.calls, 0..) |call, i| {
-            try expr_agg.updateOneGrouped(ra, gpa, g.table.accumulators.items, ids, i, g.calls.len, call, &win, lookup, &win_sel);
+        if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+            try expr_agg.updateTableGrouped(ra, gpa, g.table, ids, i, g.calls, &win, lookup, &win_sel);
         };
         try part.pump(local, g.table, @intCast(win_sel.count()));
         off += n;
@@ -2826,7 +2828,7 @@ pub fn scanRGForAgg(
             try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
 
             // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
-            if (!g.table.countOnly()) for (g.calls, 0..) |call, i| {
+            if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
                 var call_arena = std.heap.ArenaAllocator.init(gpa);
                 defer call_arena.deinit();
                 const ca = if (staged) call_arena.allocator() else ra;
@@ -2834,14 +2836,13 @@ pub fn scanRGForAgg(
                     try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, true)
                 else
                     CallBatch{ .batch = batch, .lookup = lookup };
-                try expr_agg.updateOneGrouped(
+                try expr_agg.updateTableGrouped(
                     ca,
                     gpa,
-                    g.table.accumulators.items,
+                    g.table,
                     group_id_arr,
                     i,
-                    g.calls.len,
-                    call,
+                    g.calls,
                     &cb.batch,
                     cb.lookup,
                     &sel,
@@ -2962,9 +2963,8 @@ fn scanRGSliced(
                     ids[r] = try resolver.resolve(sa, g.table, key_cols, r, g.calls, g.pos_base + done);
                 };
                 try expr_agg.sinkSketchRows(g.table, ids, &sel);
-                if (!g.table.countOnly()) for (g.calls, 0..) |call, i| {
-                    const accs = g.table.accumulators.items;
-                    try expr_agg.updateOneGrouped(sa, gpa, accs, ids, i, g.calls.len, call, &batch, lookup, &sel);
+                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+                    try expr_agg.updateTableGrouped(sa, gpa, g.table, ids, i, g.calls, &batch, lookup, &sel);
                 };
             },
         }

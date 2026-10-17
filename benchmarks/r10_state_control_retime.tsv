@@ -1,0 +1,2 @@
+cell	base_min_ms	base_median_ms	base_max_ms	tip_min_ms	tip_median_ms	tip_max_ms	ratio	base_rss_kb	tip_rss_kb	reps	exact
+study/card100k/q04_topc_pay	240.245	284.020	429.661	239.579	283.076	300.925	0.9967	1165204	1165228	15/15	True

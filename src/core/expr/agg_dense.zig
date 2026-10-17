@@ -178,7 +178,9 @@ pub const Lanes = struct {
             l.first[id] = @min(l.first[id], pos_base + fr);
         };
         for (l.calls, 0..) |call, ai| {
-            try agg_coded.foldGroupedCall(ra, gpa, l.accs, trans, comp, space, ai, n_calls, call, batch, lookup, sel);
+            try @call(.never_inline, agg_coded.foldGroupedCall, .{
+                ra, gpa, l.accs, trans, comp, space, ai, n_calls, call, batch, lookup, sel, null,
+            });
         }
         return true;
     }
@@ -247,7 +249,10 @@ pub fn intoTable(
     for (into.first, 0..) |f, id| if (f != unseen) {
         const len = agg.packFixedKey(&kd, id, &image) orelse return error.BadGroupKey;
         const g = try table.getOrInsert(image[0..len], calls, f);
-        @memcpy(table.accumulators.items[g * calls.len ..][0..calls.len], into.accs[id * calls.len ..][0..calls.len]);
+        var scratch: [16]agg.Accumulator = undefined;
+        const dst = table.readGroup(g, calls.len, &scratch);
+        @memcpy(dst, into.accs[id * calls.len ..][0..calls.len]);
+        table.writeGroup(g, dst);
     };
 }
 

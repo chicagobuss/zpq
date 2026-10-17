@@ -42,6 +42,7 @@ pub const Run = struct {
     ends: std.ArrayList(u32) = .empty,
     first: std.ArrayList(u64) = .empty,
     accs: std.ArrayList(expr_agg.Accumulator) = .empty,
+    compact: @import("expr/agg_state.zig").State = .{},
     /// Bytes drawn from the shared budget for the capacities above.
     charged: usize = 0,
 
@@ -55,9 +56,19 @@ pub const Run = struct {
         return self.keys.items[lo..self.ends.items[i]];
     }
 
+    pub fn readGroup(self: *const Run, g: usize, n: usize, scratch: *[16]expr_agg.Accumulator) []expr_agg.Accumulator {
+        if (self.compact.stride == 0) return self.accs.items[g * n ..][0..n];
+        for (scratch[0..n], 0..) |*a, i| a.* = self.compact.read(g, i);
+        return scratch[0..n];
+    }
+
+    pub fn writeGroup(self: *const Run, g: usize, values: []const expr_agg.Accumulator) void {
+        if (self.compact.stride != 0) for (values, 0..) |a, i| self.compact.write(g, i, a);
+    }
+
     fn held(self: *const Run) usize {
         return self.keys.capacity + self.ends.capacity * @sizeOf(u32) + self.first.capacity * @sizeOf(u64) +
-            self.accs.capacity * @sizeOf(expr_agg.Accumulator);
+            self.accs.capacity * @sizeOf(expr_agg.Accumulator) + self.compact.held();
     }
 
     fn free(self: *Run, gpa: std.mem.Allocator, budget: *expr_agg.SharedBudget) void {
@@ -66,6 +77,7 @@ pub const Run = struct {
         self.ends.deinit(gpa);
         self.first.deinit(gpa);
         self.accs.deinit(gpa);
+        self.compact.words.deinit(gpa);
         budget.release(self.charged);
         self.* = .{};
     }
@@ -114,6 +126,7 @@ pub const PartAgg = struct {
     /// Workers merge straight into the partition tables under their locks instead of appending to runs. Long keys
     /// gain: each is held once, in its partition, rather than once per worker and again in a run.
     shared: bool = false,
+    compact: bool = false,
     /// Set by the first worker that moves its plain table here (`scan.MultiAggArgs.spill`).
     spilled: std.atomic.Value(bool) = .init(false),
     spill_groups: usize = 1 << 18,
@@ -223,9 +236,12 @@ pub const PartAgg = struct {
         for (0..n) |g| {
             const run = &runs[self.indexOf(table.routeHash(g))];
             const at = try self.append(run, table.keyAt(g), table.first.items[g]);
-            const dst = run.accs.items[at * len ..][0..len];
-            const src = table.accumulators.items[g * len ..][0..len];
+            var dst_scratch: [16]expr_agg.Accumulator = undefined;
+            const dst = run.readGroup(at, len, &dst_scratch);
+            var scratch: [16]expr_agg.Accumulator = undefined;
+            const src = table.readGroup(g, len, &scratch);
             for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
+            run.writeGroup(at, dst);
         }
         self.reset(table);
     }
@@ -278,9 +294,12 @@ pub const PartAgg = struct {
         for (groups) |g| {
             const gi: usize = g;
             const id = try part.table.getOrInsert(local.keyAt(gi), self.calls, local.first.items[gi]);
-            const dst = part.table.accumulators.items[@as(usize, id) * len ..][0..len];
-            const src = local.accumulators.items[gi * len ..][0..len];
+            var dst_scratch: [16]expr_agg.Accumulator = undefined;
+            var src_scratch: [16]expr_agg.Accumulator = undefined;
+            const dst = part.table.readGroup(id, len, &dst_scratch);
+            const src = local.readGroup(gi, len, &src_scratch);
             for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
+            part.table.writeGroup(id, dst);
         }
     }
 
@@ -291,8 +310,13 @@ pub const PartAgg = struct {
         const key = if (self.stride == 0) raw_key else expr_agg.fixedImage(self.stride, raw_key, &image) orelse
             return error.BadGroupKey;
         const len = self.calls.len;
+        if (self.compact and run.compact.stride == 0) run.compact.configure(self.calls);
         if (run.first.items.len == run.first.capacity or run.keys.items.len + key.len > run.keys.capacity or
-            run.accs.items.len + len > run.accs.capacity or (self.stride == 0 and run.ends.items.len == run.ends.capacity))
+            (if (run.compact.stride != 0)
+                run.compact.words.items.len + run.compact.stride > run.compact.words.capacity
+            else
+                run.accs.items.len + len > run.accs.capacity) or
+            (self.stride == 0 and run.ends.items.len == run.ends.capacity))
         {
             // Every list's new capacity is chosen here and grown to exactly that, so the bytes it will hold are
             // reserved before anything changes: a growth that fits the budget is never refused for an estimate.
@@ -303,9 +327,10 @@ pub const PartAgg = struct {
             else
                 run.keys.capacity;
             const ends_cap = if (self.stride == 0) @max(run.ends.capacity, want) else run.ends.capacity;
-            const accs_cap = @max(run.accs.capacity, want * len);
+            const accs_cap = if (run.compact.stride != 0) 0 else @max(run.accs.capacity, want * len);
+            const compact_cap = @max(run.compact.words.capacity, first_cap * run.compact.stride);
             const target = keys_cap + ends_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) +
-                accs_cap * @sizeOf(expr_agg.Accumulator);
+                accs_cap * @sizeOf(expr_agg.Accumulator) + compact_cap * @sizeOf(u64);
             if (target > run.charged) {
                 run.charged += self.budget.drawExact(target - run.charged) orelse return error.ExceededMemoryBudget;
             }
@@ -315,12 +340,17 @@ pub const PartAgg = struct {
             try run.keys.ensureTotalCapacityPrecise(self.gpa, keys_cap);
             if (self.stride == 0) try run.ends.ensureTotalCapacityPrecise(self.gpa, ends_cap);
             try run.accs.ensureTotalCapacityPrecise(self.gpa, accs_cap);
+            try run.compact.words.ensureTotalCapacityPrecise(self.gpa, compact_cap);
         }
         const at = run.first.items.len;
         run.keys.appendSliceAssumeCapacity(key);
         if (self.stride == 0) run.ends.appendAssumeCapacity(@intCast(run.keys.items.len));
         run.first.appendAssumeCapacity(first);
-        for (self.calls) |call| run.accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
+        if (run.compact.stride != 0) {
+            run.compact.append();
+        } else {
+            for (self.calls) |call| run.accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
+        }
         return at;
     }
 
@@ -369,9 +399,12 @@ pub const PartAgg = struct {
                     try table.getOrInsertFixed(run.key(self.stride, i), self.calls, run.first.items[i])
                 else
                     try table.getOrInsert(run.key(self.stride, i), self.calls, run.first.items[i]);
-                const dst = table.accumulators.items[@as(usize, id) * len ..][0..len];
-                const src = run.accs.items[i * len ..][0..len];
+                var scratch: [16]expr_agg.Accumulator = undefined;
+                const dst = table.readGroup(id, len, &scratch);
+                var src_scratch: [16]expr_agg.Accumulator = undefined;
+                const src = run.readGroup(i, len, &src_scratch);
                 for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
+                table.writeGroup(id, dst);
             }
             run.free(self.gpa, self.budget);
         }
@@ -385,7 +418,7 @@ pub const PartAgg = struct {
         table.* = expr_agg.GroupTable.init(gpa, 0);
         table.shared = shared;
         table.fixed_stride = stride;
-        _ = self;
+        if (self.compact) table.compact.configure(self.calls);
     }
 };
 
@@ -533,7 +566,7 @@ test "partagg: a run grows within a budget that holds exactly what it ends up ho
     const keyOf = struct {
         fn f(b: *[24]u8, i: usize) []const u8 {
             @memset(b, 'a' + @as(u8, @intCast(i % 26)));
-            return b[0 .. if (i < n / 2) 24 else 2];
+            return b[0..if (i < n / 2) 24 else 2];
         }
     }.f;
     var held: usize = 0;
@@ -549,4 +582,65 @@ test "partagg: a run grows within a budget that holds exactly what it ends up ho
     defer part.deinit();
     for (0..n) |i| _ = try part.append(&part.runs[0][0], keyOf(&buf, i), i);
     try std.testing.expectEqual(held, part.runs[0][0].charged);
+}
+
+fn compactPartitionTrial(backing: std.mem.Allocator, shared: bool) !void {
+    // In-place remaps depend on neighboring allocations; force copies so every failure index is reproducible.
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const gpa = no_resize.allocator();
+    const arg: @import("expr/ast.zig").Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .i64,
+    } };
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+        .{ .func = .avg, .arg = arg, .where = null, .alias = "a", .result = .avg_f64 },
+    };
+    var budget: expr_agg.SharedBudget = .{ .limit = 16 << 20 };
+    const merge = struct {
+        fn f(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, a: std.mem.Allocator) anyerror!void {
+            try dst.merge(src.*, a);
+        }
+    }.f;
+    var p = try PartAgg.init(gpa, &budget, &calls, 0, merge, 4, 4, 1, shared);
+    defer p.deinit();
+    p.compact = true;
+    for (p.parts) |*part| part.table.compact.configure(&calls);
+    var table = expr_agg.GroupTable.init(gpa, 0);
+    table.shared = &budget;
+    table.compact.configure(&calls);
+    defer table.deinit();
+    var local: Local = .{ .runs = &p.runs[0] };
+    for (0..48) |r| {
+        const key = [_]u8{@intCast(r % 3)};
+        const id = try table.getOrInsert(&key, &calls, r);
+        var n = table.readAcc(id, 0, calls.len);
+        n.count += 1;
+        table.writeAcc(id, 0, calls.len, n);
+        var avg = table.readAcc(id, 2, calls.len);
+        avg.avg.isum += @as(i128, @intCast(r));
+        avg.avg.count += 1;
+        table.writeAcc(id, 2, calls.len, avg);
+        if (r % 8 == 7) try p.flush(&local, &table);
+    }
+    try p.foldRuns(1);
+    var groups: usize = 0;
+    for (p.parts) |*part| for (0..part.table.groupCount()) |g| {
+        const k: i128 = part.table.keyAt(g)[0];
+        try std.testing.expectEqual(@as(u64, 16), part.table.readAcc(g, 0, calls.len).count);
+        try std.testing.expectEqual(@as(?i128, 360 + 16 * k), part.table.readAcc(g, 1, calls.len).sum_i);
+        const avg = part.table.readAcc(g, 2, calls.len).avg;
+        try std.testing.expectEqual(@as(u64, 16), avg.count);
+        try std.testing.expectEqual(@as(i128, 360 + 16 * k), avg.isum);
+        try std.testing.expectEqual(@as(u64, @intCast(k)), part.table.first.items[g]);
+        groups += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), groups);
+}
+
+test "compact private runs and shared partitions preserve shared SUM AVG on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, compactPartitionTrial, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, compactPartitionTrial, .{true});
 }

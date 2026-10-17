@@ -1808,7 +1808,7 @@ pub fn sumBlocksGatheredF64(acc: f64, vals: []const f64, sel: *const filter_sele
     var total = acc;
     var at: usize = 0;
     const full_words = sel.len / 64;
-    for (sel.mask[0..(sel.len + 63) / 64], 0..) |mask, w| {
+    for (sel.mask[0 .. (sel.len + 63) / 64], 0..) |mask, w| {
         const word = if (w < full_words) mask else mask & ((@as(u64, 1) << @intCast(sel.len % 64)) - 1);
         if (word == 0) continue;
         const n = @popCount(word);
@@ -4255,6 +4255,7 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
 }
 
 pub const GroupTable = struct {
+    compact: @import("agg_state.zig").State = .{},
     // 16-aligned: a private distinct acc stores this pointer with bit 3 set (`DistinctAcc.table_flag`).
     allocator: std.mem.Allocator align(16),
     keys: std.ArrayList([]const u8),
@@ -4335,9 +4336,29 @@ pub const GroupTable = struct {
             }
         }
         self.accumulators.deinit(self.allocator);
+        self.compact.words.deinit(self.allocator);
         self.map.deinit();
         if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
         if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
+    }
+
+    pub inline fn readAcc(self: *const GroupTable, g: usize, i: usize, n: usize) Accumulator {
+        return if (self.compact.stride != 0) self.compact.read(g, i) else self.accumulators.items[g * n + i];
+    }
+
+    pub inline fn writeAcc(self: *const GroupTable, g: usize, i: usize, n: usize, value: Accumulator) void {
+        if (self.compact.stride != 0) self.compact.write(g, i, value) else self.accumulators.items[g * n + i] = value;
+    }
+
+    /// Compact records own no pointers. Generic records return their actual cells so ownership moves still detach.
+    pub inline fn readGroup(self: *const GroupTable, g: usize, n: usize, scratch: *[16]Accumulator) []Accumulator {
+        if (self.compact.stride == 0) return self.accumulators.items[g * n ..][0..n];
+        for (scratch[0..n], 0..) |*a, i| a.* = self.compact.read(g, i);
+        return scratch[0..n];
+    }
+
+    pub inline fn writeGroup(self: *const GroupTable, g: usize, values: []const Accumulator) void {
+        if (self.compact.stride != 0) for (values, 0..) |a, i| self.compact.write(g, i, a);
     }
 
     pub fn groupCount(self: *const GroupTable) usize {
@@ -4434,7 +4455,11 @@ pub const GroupTable = struct {
 
         // Inline distinct values live in the accumulator. A shared budget is charged by the spilled set; a private
         // ceiling is charged when that set is created (`chargeSpilledSet`).
-        const entry_size = key.len + @sizeOf(Accumulator) * agg_calls.len + @sizeOf(u64) + MapNodeOverhead;
+        const state_growth = if (self.compact.stride != 0)
+            self.compact.projected(self.groupCount() + 1) - self.compact.held()
+        else
+            @sizeOf(Accumulator) * agg_calls.len;
+        const entry_size = key.len + state_growth + @sizeOf(u64) + MapNodeOverhead;
         if (self.allocated_bytes + entry_size > self.max_memory_bytes) {
             const budget = self.shared orelse return error.ExceededMemoryBudget;
             // Checked on the draw path rather than per new group, to keep the shared atomic off the insertion path.
@@ -4455,7 +4480,10 @@ pub const GroupTable = struct {
         const group_id = @as(u32, @intCast(self.keys.items.len));
 
         const old_accumulators_len = self.accumulators.items.len;
-        try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
+        if (self.compact.stride != 0)
+            try self.compact.reserve(self.allocator, self.groupCount() + 1)
+        else
+            try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
         // A failure past here unmakes the group's state, count(DISTINCT) sets included.
         errdefer {
             for (self.accumulators.items[old_accumulators_len..]) |*acc| {
@@ -4463,17 +4491,18 @@ pub const GroupTable = struct {
             }
             self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
         }
-        for (agg_calls) |call| {
+        if (self.compact.stride == 0) for (agg_calls) |call| {
             var acc = Accumulator.init(call);
             if (call.func == .count_distinct) acc = .{ .distinct = self.freshDistinct() };
             self.accumulators.appendAssumeCapacity(acc);
-        }
+        };
 
         try self.map.put(key_copy, group_id);
         errdefer _ = self.map.remove(key_copy);
 
         try self.first.ensureUnusedCapacity(self.allocator, 1);
         try self.keys.append(self.allocator, key_copy);
+        if (self.compact.stride != 0) self.compact.append();
         self.first.appendAssumeCapacity(pos);
 
         self.allocated_bytes += entry_size;
@@ -4504,7 +4533,7 @@ pub const GroupTable = struct {
             @max(key_need, self.fixed_keys.len * 2)
         else
             self.fixed_keys.len;
-        const acc_need = self.accumulators.items.len + agg_calls.len;
+        const acc_need = self.accumulators.items.len + if (self.compact.stride != 0) @as(usize, 0) else agg_calls.len;
         const acc_cap = if (self.accumulators.capacity >= acc_need)
             self.accumulators.capacity
         else
@@ -4517,7 +4546,8 @@ pub const GroupTable = struct {
         // `set_objects` is already in `allocated_bytes`. Leave it out and the reset to `fixedHeld` steps past the
         // ceiling this admit just accepted.
         const projected = key_cap + slot_cap * @sizeOf(FixedSlot) +
-            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) + self.set_objects;
+            first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) +
+            (if (self.compact.stride != 0) self.compact.projected(groups_now + 1) else 0) + self.set_objects;
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
 
         if (slot_cap != self.fixed_slots.len) {
@@ -4538,6 +4568,7 @@ pub const GroupTable = struct {
             if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
             self.fixed_keys = grown;
         }
+        if (self.compact.stride != 0) try self.compact.reserve(self.allocator, groups_now + 1);
         try self.accumulators.ensureTotalCapacity(self.allocator, acc_need);
         try self.first.ensureTotalCapacity(self.allocator, first_need);
 
@@ -4550,17 +4581,18 @@ pub const GroupTable = struct {
             }
             self.accumulators.shrinkRetainingCapacity(acc_start);
         }
-        for (agg_calls) |call| {
+        if (self.compact.stride == 0) for (agg_calls) |call| {
             var acc = Accumulator.init(call);
             if (call.func == .count_distinct) acc = .{ .distinct = self.freshDistinct() };
             self.accumulators.appendAssumeCapacity(acc);
-        }
+        };
 
         const id: u32 = self.fixed_len;
         @memcpy(self.fixed_keys[@as(usize, id) * stride ..][0..stride], key);
         var i = hash & (self.fixed_slots.len - 1);
         while (self.fixed_slots[i].id != empty_id) i = (i + 1) & (self.fixed_slots.len - 1);
         self.fixed_slots[i] = .{ .hash = hash, .id = id };
+        if (self.compact.stride != 0) self.compact.append();
         self.first.appendAssumeCapacity(pos);
         self.fixed_len = id + 1;
         self.allocated_bytes = self.fixedHeld();
@@ -4577,7 +4609,10 @@ pub const GroupTable = struct {
         if (slot_cap <= self.fixed_slots.len) return;
         const key_cap = groups * self.fixed_stride;
         const projected = key_cap + slot_cap * @sizeOf(FixedSlot) + groups * @sizeOf(u64) +
-            groups * n_calls * @sizeOf(Accumulator) + self.set_objects;
+            (if (self.compact.stride == 0)
+                groups * n_calls * @sizeOf(Accumulator)
+            else
+                self.compact.projected(groups)) + self.set_objects;
         errdefer self.allocated_bytes = self.fixedHeld();
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
         const slots = try self.allocator.alloc(FixedSlot, slot_cap);
@@ -4589,7 +4624,10 @@ pub const GroupTable = struct {
             if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
             self.fixed_keys = keys;
         }
-        try self.accumulators.ensureTotalCapacityPrecise(self.allocator, groups * n_calls);
+        if (self.compact.stride != 0)
+            try self.compact.reserve(self.allocator, groups)
+        else
+            try self.accumulators.ensureTotalCapacityPrecise(self.allocator, groups * n_calls);
         try self.first.ensureTotalCapacityPrecise(self.allocator, groups);
         self.allocated_bytes = self.fixedHeld();
     }
@@ -4597,7 +4635,7 @@ pub const GroupTable = struct {
     fn fixedHeld(self: *const GroupTable) usize {
         return self.fixed_keys.len + self.fixed_slots.len * @sizeOf(FixedSlot) +
             self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator) +
-            self.set_objects;
+            self.compact.held() + self.set_objects;
     }
 
     fn findFixed(self: *const GroupTable, key: []const u8, hash: u64) ?u32 {
@@ -4664,6 +4702,35 @@ pub fn updateOneGrouped(
         input.selection(),
         input.unsigned_64,
     );
+}
+
+pub fn updateTableGrouped(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    table: *GroupTable,
+    ids: []const u32,
+    i: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const filter_selection.SelectionVector,
+) Error!void {
+    if (table.compact.stride == 0) return updateOneGrouped(
+        arena,
+        persist,
+        table.accumulators.items,
+        ids,
+        i,
+        calls.len,
+        calls[i],
+        batch,
+        lookup,
+        outer,
+    );
+    if (table.compact.fields[i].shared_sum) return;
+    var input: PreparedAggInput = try .init(arena, calls[i], batch, lookup, outer, false);
+    defer input.deinit(arena);
+    table.compact.foldRows(i, input.values, input.selection(), ids, null, calls[i].offset);
 }
 
 /// `updateOneGrouped` over an already-prepared argument and selection.
@@ -4737,14 +4804,18 @@ pub const GroupedPreps = struct {
         group_id_arr: []const u32,
         rows: []const u32,
         calls: []const AggCall,
+        compact: ?*const @import("agg_state.zig").State,
     ) !void {
         for (calls, self.mem, 0..) |call, prep, i| {
             const sel = prep.selection();
+            if (compact) |c| {
+                c.foldRows(i, prep.values, sel, group_id_arr, rows, call.offset);
+                continue;
+            }
             for (rows) |r| {
-                const ri: usize = r;
-                if (!sel.isActive(ri)) continue;
-                const state = &accs[group_id_arr[ri] * calls.len + i];
-                try applyGrouped(persist, state, call, prep.values, ri, prep.unsigned_64);
+                if (!sel.isActive(r)) continue;
+                const state = &accs[group_id_arr[r] * calls.len + i];
+                try applyGrouped(persist, state, call, prep.values, r, prep.unsigned_64);
             }
         }
     }
@@ -6095,4 +6166,71 @@ test "regression: sumBlocksGatheredF64 sums gathered values in their rows' block
         const got = sumBlocksGatheredF64(0, gathered.items, &sel);
         try std.testing.expectEqual(@as(u64, @bitCast(want)), @as(u64, @bitCast(got)));
     }
+}
+
+fn compactAllocationTrial(gpa: std.mem.Allocator, fixed: bool) !void {
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+        .{ .func = .avg, .arg = arg, .where = null, .alias = "a", .result = .avg_f64 },
+        .{ .func = .min, .arg = arg, .where = null, .alias = "lo", .result = .i64 },
+        .{ .func = .max, .arg = arg, .where = null, .alias = "hi", .result = .i64 },
+    };
+    var budget: SharedBudget = .{ .limit = 1 << 20 };
+    var table = GroupTable.init(gpa, 0);
+    table.shared = &budget;
+    table.fixed_stride = if (fixed) 9 else 0;
+    table.compact.configure(&calls);
+    defer table.deinit();
+    try std.testing.expectEqual(@as(usize, 56), table.compact.stride * 8);
+    for (0..90) |k| {
+        var key: [9]u8 = @splat(0);
+        key[0] = 1;
+        std.mem.writeInt(u64, key[1..9], k, .little);
+        const g = try table.getOrInsert(&key, &calls, k);
+        try std.testing.expectEqual(@as(?i128, null), table.readAcc(g, 1, calls.len).sum_i);
+        table.writeAcc(g, 0, calls.len, .{ .count = 2 });
+        table.writeAcc(g, 2, calls.len, .{ .avg = .{ .sum = 0, .isum = -5, .count = 1 } });
+        table.writeAcc(g, 3, calls.len, .{ .min_i = -5 });
+        table.writeAcc(g, 4, calls.len, .{ .max_i = -5 });
+        try std.testing.expectEqual(@as(?i128, -5), table.readAcc(g, 1, calls.len).sum_i);
+        try std.testing.expectEqual(@as(?i128, -5), table.readAcc(g, 3, calls.len).min_i);
+        try std.testing.expectEqual(g, try table.getOrInsert(&key, &calls, k + 1));
+    }
+}
+
+test "compact count and integer tuple allocation failures leave tables owned" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, compactAllocationTrial, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, compactAllocationTrial, .{true});
+}
+
+test "compact states refuse float tuples and only share identical integer inputs" {
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    var calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+        .{ .func = .avg, .arg = arg, .where = null, .alias = "a", .result = .avg_f64 },
+    };
+    var state: @import("agg_state.zig").State = .{};
+    state.configure(calls[0..1]);
+    try std.testing.expectEqual(@as(usize, 8), state.stride * 8);
+    state.configure(calls[0..2]);
+    try std.testing.expectEqual(@as(usize, 32), state.stride * 8);
+    state.configure(&calls);
+    try std.testing.expect(state.fields[1].shared_sum);
+    calls[1].offset = 1;
+    state.configure(&calls);
+    try std.testing.expect(!state.fields[1].shared_sum);
+    calls[1].offset = 0;
+    calls[2].arg.?.col_ref.col_idx = 1;
+    state.configure(&calls);
+    try std.testing.expect(!state.fields[1].shared_sum);
+    var reordered = [_]AggCall{ calls[1], calls[0], calls[2] };
+    reordered[2].arg = arg;
+    state.configure(&reordered);
+    try std.testing.expect(!state.fields[0].shared_sum);
+    calls[2].arg.?.col_ref.expr_type = .f64;
+    state.configure(&calls);
+    try std.testing.expectEqual(@as(usize, 0), state.stride);
 }

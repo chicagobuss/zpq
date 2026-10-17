@@ -1934,11 +1934,14 @@ fn clearTables(gpa: std.mem.Allocator, tables: []expr_agg.GroupTable) void {
         const shared = t.shared;
         const stride = t.fixed_stride;
         const sketch = t.sketch;
+        const layout = t.compact;
         t.deinit();
         t.* = expr_agg.GroupTable.init(gpa, 0);
         t.shared = shared;
         t.fixed_stride = stride;
         t.sketch = sketch;
+        t.compact = layout;
+        t.compact.words = .empty;
     }
 }
 
@@ -2484,7 +2487,7 @@ fn kthDistinct(
             e.merged = .{};
             try e.merged.?.mergeFrom(tables[e.table].accumulators.items[e.group * stride + a_idx].distinct, gpa);
         }
-        try e.merged.?.mergeFrom(t.accumulators.items[g * stride + a_idx].distinct, gpa);
+        try e.merged.?.mergeFrom(t.readAcc(g, a_idx, stride).distinct, gpa);
     };
     if (keys.count() < k) return 0;
     const counts = try arena.alloc(u64, keys.count());
@@ -2827,7 +2830,7 @@ fn kthTotal(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable, strid
     var totals: std.StringArrayHashMapUnmanaged(u64) = .empty;
     for (tables) |*t| for (0..t.groupCount()) |g| {
         const e = try totals.getOrPutValue(arena, t.keyAt(g), 0);
-        e.value_ptr.* +|= t.accumulators.items[g * stride + a_idx].count;
+        e.value_ptr.* +|= t.readAcc(g, a_idx, stride).count;
     };
     const vals = totals.values();
     if (vals.len < k) return 0;
@@ -3406,6 +3409,9 @@ fn prepareAggregate(
         gt.* = expr_agg.GroupTable.init(gpa, 0);
         gt.shared = &group_budget;
         gt.fixed_stride = fixed_stride;
+        // A lone SUM's ranking merge paid more to unpack its state than the smaller scan saved.
+        if (!dense_wanted and !use_blocks and (agg_calls.len != 1 or agg_calls[0].func == .count))
+            gt.compact.configure(agg_calls);
     }
     // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
     // is serial time the answer would wait for. Builds that check for leaks free them, so a real leak still shows.
@@ -3456,6 +3462,8 @@ fn prepareAggregate(
             n_workers,
             part_on and !args.partagg,
         );
+        part_state.?.compact = group_tables[0].compact.stride != 0;
+        if (part_state.?.compact) for (part_state.?.parts) |*p| p.table.compact.configure(agg_calls);
         part_state.?.spill_groups = args.spill_groups;
         part_state.?.spill_rows = args.spill_rows;
     }
@@ -3852,6 +3860,7 @@ fn prepareAggregate(
             .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
             .folded = folded,
             .in_place = in_place_tables,
+            .single = if (folded) null else &out_tables[0],
             .fixed_keys = if (spilled) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
         };
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
@@ -4158,6 +4167,7 @@ const RowSource = struct {
     /// Non-empty when the merge left each group's state in these tables (`mergeInPlace`): `slot.idx` names it, and
     /// `accs` is unused.
     in_place: []const expr_agg.GroupTable = &.{},
+    single: ?*const expr_agg.GroupTable = null,
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
 
@@ -4165,8 +4175,13 @@ const RowSource = struct {
     /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
     fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
-        const accs = if (s.in_place.len > 0)
-            inPlaceAccs(s.in_place, slot.idx, s.calls.len)
+        const table: ?*const expr_agg.GroupTable = if (s.in_place.len > 0)
+            &s.in_place[slot.idx >> 32]
+        else s.single;
+        const group = if (s.in_place.len > 0) @as(u32, @truncate(slot.idx)) else slot.idx;
+        const compact = table != null and table.?.compact.stride != 0;
+        const accs = if (compact) &.{} else if (s.in_place.len > 0)
+            table.?.accumulators.items[@as(usize, group) * s.calls.len ..][0..s.calls.len]
         else
             s.accs[at..][0..s.calls.len];
         // A fixed image pads a null column with zeros; the reader wants that payload omitted.
@@ -4174,10 +4189,12 @@ const RowSource = struct {
         const key_bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
         for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
             .key => |k_idx| try deserializeKeyColumn(gpa, key_bytes, k_idx, s.key_types),
-            .agg => |a_idx| try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
-                try foldedAcc(gpa, s.calls[a_idx], accs[a_idx])
-            else
-                accs[a_idx]),
+            .agg => |a_idx| blk: {
+                const acc = if (compact) table.?.readAcc(group, a_idx, s.calls.len) else accs[a_idx];
+                break :blk try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
+                    try foldedAcc(gpa, s.calls[a_idx], acc)
+                else acc);
+            },
         };
     }
 };
@@ -4731,7 +4748,11 @@ fn mergeCandidates(
             const dst = &accs.items[accs.items.len - 1];
             for (tables) |gt| {
                 if (gt.findKey(key)) |gi| {
-                    const src = &gt.accumulators.items[@as(usize, gi) * calls.len + ci];
+                    var local = gt.readAcc(gi, ci, calls.len);
+                    const src = if (gt.compact.stride != 0)
+                        &local
+                    else
+                        &gt.accumulators.items[@as(usize, gi) * calls.len + ci];
                     try mergeOwnedAccumulator(dst, src, gpa);
                 }
             }
@@ -4890,7 +4911,8 @@ fn hashMergeGroupRefs(
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
         const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
-        const src = gt.accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
+        var src_scratch: [16]expr_agg.Accumulator = undefined;
+        const src = gt.readGroup(@as(usize, ref.group), calls.len, &src_scratch);
         if (gop.found) {
             const slot = &slots.items[gop.value.*];
             slot.first = @min(slot.first, gt.first.items[ref.group]);
@@ -4936,9 +4958,11 @@ fn packRef(ref: MergeGroupRef) usize {
     return @as(usize, ref.table) << 32 | ref.group;
 }
 
-fn inPlaceAccs(tables: []const expr_agg.GroupTable, idx: usize, n_calls: usize) []expr_agg.Accumulator {
+fn inPlaceAccs(
+    tables: []const expr_agg.GroupTable, idx: usize, n_calls: usize, scratch: *[16]expr_agg.Accumulator,
+) []expr_agg.Accumulator {
     const g: usize = @as(u32, @truncate(idx));
-    return tables[idx >> 32].accumulators.items[g * n_calls ..][0..n_calls];
+    return tables[idx >> 32].readGroup(g, n_calls, scratch);
 }
 
 /// `acc` as the copying merge leaves it after merging it into a fresh accumulator. Merging into a fresh one neither
@@ -5001,12 +5025,15 @@ fn mergeInPlace(
         }
         const slot = &slots.items[gop.value.*];
         slot.first = @min(slot.first, first);
-        const dst = inPlaceAccs(tables, slot.idx, calls.len);
-        const src = gt.accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
+        var dst_scratch: [16]expr_agg.Accumulator = undefined;
+        const dst = inPlaceAccs(tables, slot.idx, calls.len, &dst_scratch);
+        var src_scratch: [16]expr_agg.Accumulator = undefined;
+        const src = gt.readGroup(@as(usize, ref.group), calls.len, &src_scratch);
         for (dst, src, calls) |*d, *s, call| {
             d.* = try foldedAcc(gpa, call, d.*);
             try mergeOwnedAccumulator(d, s, gpa);
         }
+        tables[slot.idx >> 32].writeGroup(@as(u32, @truncate(slot.idx)), dst);
     }
 }
 
@@ -5035,7 +5062,7 @@ fn mergeCountCut(
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
         const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
-        const count = gt.accumulators.items[@as(usize, ref.group) * calls.len + cut.a_idx].count;
+        const count = gt.readAcc(@as(usize, ref.group), cut.a_idx, calls.len).count;
         const first = gt.first.items[ref.group];
         if (gop.found) {
             const g = &groups.items[gop.value.*];
@@ -5086,7 +5113,8 @@ fn mergeCountCut(
         const out = out_of[gi];
         if (out == none) continue;
         const dst = accs.items[slots.items[out].idx..][0..calls.len];
-        const src = tables[ref.table].accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
+        var src_scratch: [16]expr_agg.Accumulator = undefined;
+        const src = tables[ref.table].readGroup(@as(usize, ref.group), calls.len, &src_scratch);
         for (dst, src) |*d, *sa| try mergeOwnedAccumulator(d, sa, gpa);
     }
 }
@@ -5133,7 +5161,7 @@ fn mergeResultCutInner(
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
         const gop = index.getOrPut(key, if (hashes) |hs| hs[ri] else std.hash.Wyhash.hash(0, key));
-        const rank = gt.accumulators.items[@as(usize, ref.group) * calls.len + cut.a_idx];
+        const rank = gt.readAcc(@as(usize, ref.group), cut.a_idx, calls.len);
         const first = gt.first.items[ref.group];
         if (gop.found) {
             const g = &groups.items[gop.value.*];
@@ -5173,7 +5201,8 @@ fn mergeResultCutInner(
         const out = out_of[gi];
         if (out == none) continue;
         const dst = accs.items[slots.items[out].idx..][0..calls.len];
-        const src = tables[ref.table].accumulators.items[@as(usize, ref.group) * calls.len ..][0..calls.len];
+        var src_scratch: [16]expr_agg.Accumulator = undefined;
+        const src = tables[ref.table].readGroup(@as(usize, ref.group), calls.len, &src_scratch);
         for (dst, src, 0..) |*d, *src_acc, i| if (i != cut.a_idx) try mergeOwnedAccumulator(d, src_acc, gpa);
     }
 }
@@ -5625,7 +5654,7 @@ fn rankLimitGroups(
     try heap.ensureTotalCapacity(sa, k);
     for (0..table.groupCount()) |g| {
         // Validate every rank, including losers and LIMIT 0, before dropping groups.
-        const value = try rankValue(table.accumulators.items[g * calls.len + cut.a_idx], calls[cut.a_idx]);
+        const value = try rankValue(table.readAcc(g, cut.a_idx, calls.len), calls[cut.a_idx]);
         pushRank(&heap, sa, k, .{ .value = value, .first = table.first.items[g], .g = @intCast(g) });
     }
     const ids = try (cut.memory orelse arena).alloc(u32, heap.count());
@@ -5770,7 +5799,7 @@ fn countLimitGroups(
     try heap.ensureTotalCapacity(arena, k);
     for (0..n) |g| {
         const item: Item = .{
-            .c = accCount(table.accumulators.items[g * stride + a_idx]),
+            .c = accCount(table.readAcc(g, a_idx, stride)),
             .first = table.first.items[g],
             .g = @intCast(g),
         };
@@ -5927,7 +5956,7 @@ fn topKCandidates(
         c: u64,
         g: u32,
         fn of(t: *const expr_agg.GroupTable, g: usize, at: usize, n: usize) u64 {
-            return accCount(t.accumulators.items[g * n + at]);
+            return accCount(t.readAcc(g, at, n));
         }
         fn byCount(_: void, a: @This(), b: @This()) std.math.Order {
             return std.math.order(a.c, b.c);
@@ -6120,7 +6149,8 @@ fn fillFromPartitions(
         const n = if (cut) |ids| ids.len else gt.groupCount();
         for (0..n) |i| {
             const g = if (cut) |ids| ids[i] else i;
-            const src = gt.accumulators.items[g * len ..][0..len];
+            var src_scratch: [16]expr_agg.Accumulator = undefined;
+            const src = gt.readGroup(g, len, &src_scratch);
             const idx = accs.items.len;
             try accs.appendSlice(ma, src);
             for (src) |*a| detachOwned(a);

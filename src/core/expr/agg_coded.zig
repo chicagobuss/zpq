@@ -594,7 +594,10 @@ pub fn groupedCoded(
     const agg_len = calls.len;
     for (calls, 0..) |call, ai| {
         const accs = table.accumulators.items;
-        try foldGroupedCall(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel);
+        // Inlining the large reduction kernel into the scan increases register pressure on dense controls.
+        try @call(.never_inline, foldGroupedCall, .{
+            ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, table,
+        });
     }
     return true;
 }
@@ -622,7 +625,11 @@ fn groupedHist(
         if (fr == std.math.maxInt(u32)) return error.UnsupportedAggType;
         try serializeKeyAt(&scratch, ra, &kd, &.{code});
         const g = try table.getOrInsert(scratch.items, calls, pos_base + fr);
-        for (table.accumulators.items[g * calls.len ..][0..calls.len]) |*acc| acc.count += n;
+        if (table.compact.stride != 0) {
+            for (calls, 0..) |_, i| table.compact.addCount(g, i, n);
+        } else {
+            for (table.accumulators.items[g * calls.len ..][0..calls.len]) |*acc| acc.count += n;
+        }
     }
 }
 
@@ -707,7 +714,11 @@ pub fn foldGroupedCall(
     batch: *const filter_eval.Batch,
     lookup: []const ?usize,
     outer: *const Sel,
+    maybe_table: anytype,
 ) !void {
+    // Dense lanes pass literal null, specializing away record access on the established typed-array path.
+    const table: ?*agg.GroupTable = maybe_table;
+    if (table) |t| if (t.compact.stride != 0 and t.compact.fields[ai].shared_sum) return;
     // Selection for this call: outer, narrowed by FILTER and the argument's nulls.
     var own: ?Sel = null;
     defer if (own) |*s| s.deinit();
@@ -747,6 +758,10 @@ pub fn foldGroupedCall(
     if (call.func == .count) {
         const cnt = try compositeCounts(ra, comp, space, sel);
         for (cnt, 0..) |n, cp| if (n != 0) {
+            if (table) |t| if (t.compact.stride != 0) {
+                t.compact.addCount(gid_of[cp], ai, n);
+                continue;
+            };
             accs[gid_of[cp] * agg_len + ai].count += n;
         };
         return;
@@ -780,7 +795,10 @@ pub fn foldGroupedCall(
                 break;
             };
             if (!any) continue;
-            try foldHist(gpa, &accs[gid_of[cp] * agg_len + ai], call, dict, hist, c.unsigned_64);
+            var local: Accumulator = undefined;
+            const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+            try foldHist(gpa, st, call, dict, hist, c.unsigned_64);
+            if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
         }
         return;
     }
@@ -857,7 +875,8 @@ pub fn foldGroupedCall(
             }
             for (0..space) |cp| {
                 if (seen[cp] == 0) continue;
-                const st = &accs[gid_of[cp] * agg_len + ai];
+                var local: Accumulator = undefined;
+                const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
                 switch (st.*) {
                     .sum_f => |*s| s.* = part[cp],
                     .avg => |*a| {
@@ -868,6 +887,7 @@ pub fn foldGroupedCall(
                     .max_f => |*m| agg.foldExtremeF(false, m, part[cp]),
                     else => return error.UnsupportedAggType,
                 }
+                if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
             }
         },
         .i64 => |vc| {
@@ -895,7 +915,8 @@ pub fn foldGroupedCall(
             }
             for (0..space) |cp| {
                 if (seen[cp] == 0) continue;
-                const st = &accs[gid_of[cp] * agg_len + ai];
+                var local: Accumulator = undefined;
+                const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
                 switch (st.*) {
                     .sum_i => |*s| s.* = (s.* orelse 0) + part[cp] + @as(i128, call.offset) * seen[cp],
                     .avg => |*a| {
@@ -910,6 +931,7 @@ pub fn foldGroupedCall(
                     .max_d => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
                     else => return error.UnsupportedAggType,
                 }
+                if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
             }
         },
         // Exact DECIMAL: per-composite wide sums (as `agg.DecSum`), or extremes.
@@ -938,7 +960,8 @@ pub fn foldGroupedCall(
             }
             for (0..space) |cp| {
                 if (seen[cp] == 0) continue;
-                const st = &accs[gid_of[cp] * agg_len + ai];
+                var local: Accumulator = undefined;
+                const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
                 switch (st.*) {
                     .sum_d => |*d| d.add(sums[cp], seen[cp]),
                     .avg_d => |*d| d.add(sums[cp], seen[cp]),
@@ -946,10 +969,26 @@ pub fn foldGroupedCall(
                     .max_d => |*m| m.* = if (m.*) |cur| @max(cur, ext[cp]) else ext[cp],
                     else => return error.UnsupportedAggType,
                 }
+                if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
             }
         },
         else => unreachable,
     }
+}
+
+inline fn statePtr(
+    table: ?*agg.GroupTable,
+    accs: []Accumulator,
+    g: usize,
+    i: usize,
+    n: usize,
+    local: *Accumulator,
+) *Accumulator {
+    if (table) |t| if (t.compact.stride != 0) {
+        local.* = t.readAcc(g, i, n);
+        return local;
+    };
+    return &accs[g * n + i];
 }
 
 pub const no_row = std.math.maxInt(u32);

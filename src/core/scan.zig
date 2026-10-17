@@ -1732,10 +1732,7 @@ fn sketchTopK(
     };
     runPhase(workers, cursor) catch |e| {
         if (e != error.CensusAbandoned) return e;
-        for (workers) |*w| if (w.err) |we| if (we == error.CensusAbandoned) {
-            w.err = null;
-        };
-        for (workers) |w| if (w.err) |other| return other;
+        try clearWorkerErrors(workers, error.CensusAbandoned);
     };
     for (workers) |*w| w.stop = null;
     var t1 = nowMonoNs();
@@ -2405,7 +2402,7 @@ fn censusDistinctTopK(
         // budget they exceed is the certificate failing, never the query.
         runPhase(workers, cursor) catch |e| {
             if (e != error.ExceededMemoryBudget) return e;
-            for (workers) |*w| w.err = null;
+            try clearWorkerErrors(workers, error.ExceededMemoryBudget);
             if (cfg.trace) std.debug.print("census distinct: trial over budget, exact scan\n", .{});
             break false;
         };
@@ -2585,6 +2582,15 @@ fn restoreCounts(workers: []Worker, saved: []const Worker) void {
 }
 
 /// One pass of `workers` over every work item, from a fresh cursor.
+/// After a phase that failed with `expected`: clears every worker's `expected`, then returns the first other error a
+/// worker met, which the exact path would meet too.
+fn clearWorkerErrors(workers: []Worker, expected: anyerror) !void {
+    for (workers) |*w| if (w.err) |we| if (we == expected) {
+        w.err = null;
+    };
+    for (workers) |w| if (w.err) |other| return other;
+}
+
 fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize)) !void {
     cursor.store(0, .monotonic);
     runWorkers(workers);
@@ -12837,4 +12843,18 @@ test "regression: counts pairs folded merge in place or under a count cut, as th
         try testing.expectEqual(sets.len, counted.len);
         for (sets, counted) |r, p_row| for (r, p_row) |x, y| try expectSameAggValue(x, y);
     };
+}
+
+test "clearWorkerErrors: a phase's expected failure is cleared on every worker, any other is returned" {
+    var ws: [3]Worker = undefined;
+    for (&ws) |*w| w.err = null;
+    // The census trial's budget on one worker, a corrupt page on a later one: the page's error is the query's.
+    ws[0].err = error.ExceededMemoryBudget;
+    ws[2].err = error.CorruptPage;
+    try testing.expectError(error.CorruptPage, clearWorkerErrors(&ws, error.ExceededMemoryBudget));
+    try testing.expectEqual(@as(?anyerror, null), ws[0].err);
+    ws[2].err = error.ExceededMemoryBudget;
+    ws[1].err = error.ExceededMemoryBudget;
+    try clearWorkerErrors(&ws, error.ExceededMemoryBudget);
+    for (ws) |w| try testing.expectEqual(@as(?anyerror, null), w.err);
 }

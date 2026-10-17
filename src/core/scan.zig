@@ -112,6 +112,9 @@ pub const FastPath = enum {
     spill,
     pairs,
     partitioned,
+    /// A plain grouping the cost rules chose over a bounded cut (`fewEntries`, `selective_share`) from facts that
+    /// cannot bound its table: its refusal runs the cut instead.
+    plain_rule,
     /// Not fast paths but what the scan held: tables filled by several workers off a shared cursor, whose peak depends
     /// on which worker claimed which row groups (a table past a power of two doubles), so whether the budget refuses
     /// them depends on timing; and whether shared partitions, one copy of each group, could answer instead.
@@ -227,6 +230,8 @@ pub const MultiAggArgs = struct {
     taken: ?*std.EnumSet(FastPath) = null,
     /// Let the cost rules move a plain GROUP BY to partitioned tables (worker-copy pressure, long strings).
     partition_cost: bool = true,
+    /// Let the cost rules group plainly in place of a first-keys or count cut (`FastPath.plain_rule`).
+    plain_rules: bool = true,
     /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
     /// `partagg.local_cap` and `partagg.probe_rows`.
     part_cap: usize = 0,
@@ -624,6 +629,11 @@ pub const PlanInputs = struct {
     /// Some input is read in behind the reader's gates (`Input.readerBacked`), which holds a window of its own.
     readers: bool = false,
     filter: ?filter_ast.Filter = null,
+    /// The share of rows the filter passes in the first row group the scan reads, counted (`sampledPassShare`).
+    sampled_pass: ?f64 = null,
+    /// The count was asked for but the inputs' bytes do not hold that row group (S3, explained from its footer): the
+    /// estimate decides alone, as the execution reading them would not.
+    sample_unread: bool = false,
 };
 
 pub const Reason = enum {
@@ -687,6 +697,8 @@ pub const PlanFacts = struct {
     row_groups: usize = 0,
     /// The share of rows the filter passes, from row-group bounds (`passShare`); null without a filter.
     pass_share: ?f64 = null,
+    /// The share it passes in the first row group the scan reads, counted there; null where no rule asked.
+    sampled_pass: ?f64 = null,
     /// Some input is read behind the reader's gates (`Input.readerBacked`).
     readers: bool = false,
     /// The dictionary probe asked of the reader: its ranges, their page-aligned bytes, and whether its cap sent the
@@ -705,6 +717,8 @@ pub const ScanPlan = struct {
     dispatch: AggregateDispatch,
     reasons: std.EnumSet(Reason) = .{},
     facts: PlanFacts = .{},
+    /// The filter rule's estimate wants the measured pass share (`PlanInputs.sampled_pass`) before it commits.
+    wants_sample: bool = false,
 };
 
 pub fn planAggregate(in: PlanInputs) ScanPlan {
@@ -796,7 +810,11 @@ pub fn decidingRule(plan: ScanPlan) Reason {
 }
 
 fn planFacts(in: PlanInputs, rank_cut: bool, first_cut: bool) PlanFacts {
-    var f: PlanFacts = .{ .readers = in.readers, .pass_share = if (in.filter != null) passShare(in) else null };
+    var f: PlanFacts = .{
+        .readers = in.readers,
+        .pass_share = if (in.filter != null) passShare(in) else null,
+        .sampled_pass = in.sampled_pass,
+    };
     for (in.work) |item| if (item.agg_start == 0) {
         f.row_groups += 1;
         f.rows +|= @intCast(@max(0, in.metas[item.file].row_groups.items[item.rg].num_rows));
@@ -846,6 +864,81 @@ fn passShare(in: PlanInputs) f64 {
         pass += n * filter_prune.passFraction(f, rg, m);
     }
     return if (rows == 0) 1 else pass / rows;
+}
+
+/// A proven upper bound on the share of rows the filter passes: the rows of the row groups its statistics leave in
+/// (`filter_prune.pruneRowGroup`). 1 without a filter or rows.
+fn provenPassShare(in: PlanInputs) f64 {
+    const f = in.filter orelse return 1;
+    if (in.args.scan_all) return 1;
+    var rows: f64 = 0;
+    var kept: f64 = 0;
+    for (in.work) |item| {
+        if (item.agg_start != 0) continue;
+        const m = &in.metas[item.file];
+        const rg = &m.row_groups.items[item.rg];
+        const n: f64 = @floatFromInt(@max(0, rg.num_rows));
+        rows += n;
+        if (filter_prune.pruneRowGroup(rg, f, m) != .skip) kept += n;
+    }
+    return if (rows == 0) 1 else kept / rows;
+}
+
+/// The share of rows the filter passes in the first row group the scan reads (in input order, so the same at every
+/// `-j`), counted by decoding that row group's filter columns once; 1 where its decode does not fit `decode_limit`, and
+/// null where the input's bytes are not the whole file (an S3 input's fetched ranges).
+fn sampledPassShare(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    plan: *const agg_plan.Plan,
+    metas: []const schema.FileMetaData,
+    inputs: []const Input,
+    work: []const WorkItem,
+    options: consumer.DecodeOptions,
+    decode_limit: ?usize,
+) !?f64 {
+    for (work) |item| {
+        if (item.agg_start != 0) continue;
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        const decision = plan.decide(rg, meta);
+        if (decision == .skip) continue;
+        const in = inputs[item.file];
+        if (std.mem.startsWith(u8, in.name, "s3://") or (in.logical_size != 0 and in.logical_size != in.bytes.len))
+            return null;
+        if (decision == .full_match or rg.num_rows <= 0) return 1;
+        const read = try arena.alloc(bool, plan.filter_cols.len);
+        for (read, plan.filter_cols, plan.columns.read) |*r, f, whole| r.* = f and whole;
+        const consumed = try arena.alloc(bool, plan.filter_cols.len);
+        @memset(consumed, false);
+        var rg_arena = consumer.RowGroupArena.init(gpa);
+        defer rg_arena.deinit();
+        var scratch = consumer.DecodeScratch.init(gpa);
+        defer scratch.deinit();
+        var timings: consumer.Timings = .{};
+        var budget: ?consumer.DecodeBudget = if (decode_limit) |l| .{ .limit = l } else null;
+        const calls = [_]expr_agg.AggCall{
+            .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 },
+        };
+        var passed = [_]expr_agg.Accumulator{.{ .count = 0 }};
+        consumer.scanRGForAgg(gpa, .{
+            .rg = rg,
+            .file_index = item.file,
+            .rg_index = item.rg,
+            .meta = meta,
+            .src = .{ .bytes = inputs[item.file].bytes, .byte_origin = 0 },
+            .filter = plan.filterFor(decision),
+            .read = read,
+            .consumed = consumed,
+        }, plan.stats, options, .{ .scalar = .{ .calls = &calls, .accumulators = &passed } }, .{
+            .scratch = &scratch,
+            .rg_arena = &rg_arena,
+            .timings = &timings,
+            .budget = if (budget) |*b| b else null,
+        }) catch |e| return if (e == error.ExceededMemoryBudget) 1 else e;
+        return @as(f64, @floatFromInt(passed[0].count)) / @as(f64, @floatFromInt(rg.num_rows));
+    }
+    return 0;
 }
 
 /// A lone key whose dictionaries, summed over row groups, hold few entries: grouping by their codes is cheap.
@@ -934,15 +1027,31 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     if (plan.dispatch.strategy == .first_keys) {
         // Prefix discovery avoids grouping every key, but its admit pass fingerprints every row: where the codes
         // resolve few dictionary entries in all, grouping them all is cheaper (measured 1.5-3x, card10 to files50).
-        if (fewEntries(stat, keys)) {
+        if (in.args.plain_rules and fewEntries(stat, keys)) {
             plainDispatch(plan, .plain_hash);
             plan.reasons.insert(.few_dictionary_entries);
         }
         return;
     }
     // A count cut reads the filter and keys twice to skip grouping most rows; a filter its row groups' bounds say
-    // passes few rows leaves little grouping to skip (measured 1.2-2.1x at 1%, while the cut still wins at 30%).
-    if (plan.dispatch.strategy == .sketch and !plan.dispatch.distinct_census and passShare(in) <= selective_share) {
+    // passes few rows leaves little grouping to skip (measured 1.2-2.1x at 1%, while the cut still wins at 30%). The
+    // even-spread estimate alone never picks the plain table, whose size it cannot bound (on skewed values it put nine
+    // rows in ten at a thousandth): the row groups the statistics leave in must hold few rows, or the groups' bound
+    // fit the sketch's own share of the budget, or the first row group the scan reads pass few rows, counted. A
+    // refusal of the plain table still runs the cut (`FastPath.plain_rule`).
+    const groups_fit = stat.confidence == .upper_bound and !state_unknown and copies <= in.args.max_memory / 8;
+    if (in.args.plain_rules and plan.dispatch.strategy == .sketch and !plan.dispatch.distinct_census and
+        passShare(in) <= selective_share)
+    select: {
+        const kept = provenPassShare(in);
+        if (!groups_fit and kept > selective_share) {
+            if (in.sampled_pass) |sampled| {
+                if (kept * sampled > selective_share) break :select;
+            } else if (!in.sample_unread) {
+                plan.wants_sample = true;
+                break :select;
+            }
+        }
         plainDispatch(plan, .plain_hash);
         plan.reasons.insert(.selective_filter);
     }
@@ -2720,8 +2829,9 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // scan runs again, exactly, each time on a narrower path: without every fast path it armed (they charge more of
     // their peak than the paths they stand in for, `FastPath`); then, where several workers' tables were refused, on
     // shared partitions, one copy of each group whatever the timing; then on one worker, which claims row groups in
-    // order and so peaks the same every run. Each step only narrows, so at most four scans run, and each arms its
-    // paths only over inputs a scan reads again, whole, from the start.
+    // order and so peaks the same every run. A plain grouping a cost rule chose over a cut gives way to that cut, whose
+    // refusal is final. Each step only narrows, so at most four scans run, and each arms its paths only over inputs a
+    // scan reads again, whole, from the start.
     var attempt = args;
     var parts_tried = args.partagg;
     while (true) {
@@ -2730,21 +2840,26 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
         if (prepareAggregate(gpa, arena, attempt, false)) |r| return r else |e| {
             if (e != error.ExceededMemoryBudget) return e;
             var next = attempt;
-            if (taken.contains(.dense)) next.dense = false;
-            if (taken.contains(.spill)) next.spill = false;
-            if (taken.contains(.pairs)) next.distinct_pairs = .off;
-            if (taken.contains(.partitioned)) next.partition_cost = false;
-            const masked = taken.contains(.dense) or taken.contains(.spill) or taken.contains(.pairs) or
-                taken.contains(.partitioned);
-            parts_tried = parts_tried or taken.contains(.partitioned);
-            if (!masked) {
-                if (!taken.contains(.worker_tables)) return e;
-                if (taken.contains(.partitions_fit) and !parts_tried) {
-                    next.partagg = true;
-                    parts_tried = true;
-                } else {
-                    next.parallelism = 1;
-                    next.partagg = args.partagg;
+            if (taken.contains(.plain_rule)) {
+                // The cut the rule stood in for, planned as if the rule had not run: the chain from here is the cut's.
+                next.plain_rules = false;
+            } else {
+                if (taken.contains(.dense)) next.dense = false;
+                if (taken.contains(.spill)) next.spill = false;
+                if (taken.contains(.pairs)) next.distinct_pairs = .off;
+                if (taken.contains(.partitioned)) next.partition_cost = false;
+                const masked = taken.contains(.dense) or taken.contains(.spill) or taken.contains(.pairs) or
+                    taken.contains(.partitioned);
+                parts_tried = parts_tried or taken.contains(.partitioned);
+                if (!masked) {
+                    if (!taken.contains(.worker_tables)) return e;
+                    if (taken.contains(.partitions_fit) and !parts_tried) {
+                        next.partagg = true;
+                        parts_tried = true;
+                    } else {
+                        next.parallelism = 1;
+                        next.partagg = args.partagg;
+                    }
                 }
             }
             if (attempt.inputs.ptr == args.inputs.ptr) {
@@ -3063,6 +3178,18 @@ fn prepareAggregate(
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
     var scan_plan = planAggregate(plan_inputs);
+    if (scan_plan.wants_sample) {
+        const options: consumer.DecodeOptions = .{
+            .fast_levels = args.fast_levels,
+            .encoded = args.encoded,
+            .expand_limit = args.max_memory,
+        };
+        const work = work_items.items;
+        const limit = args.decode_limit;
+        plan_inputs.sampled_pass = try sampledPassShare(gpa, arena, &plan, metas, args.inputs, work, options, limit);
+        plan_inputs.sample_unread = plan_inputs.sampled_pass == null;
+        scan_plan = planAggregate(plan_inputs);
+    }
     scan_plan.facts.probe_ranges = probe_facts.probe_ranges;
     scan_plan.facts.probe_bytes = probe_facts.probe_bytes;
     scan_plan.facts.probe_capped = probe_facts.probe_capped;
@@ -3174,6 +3301,13 @@ fn prepareAggregate(
         if (decision.strategy == .plain_hash and !use_blocks and partAggSupported(args, agg_calls, true) and
             (if (group_outputs) |outs| countCut(outs, agg_calls, args.result_order) == null else true))
             taken.insert(.partitions_fit);
+        if (rescannable and (scan_plan.reasons.contains(.few_dictionary_entries) or
+            scan_plan.reasons.contains(.selective_filter)))
+        {
+            var cut_inputs = plan_inputs;
+            cut_inputs.args.plain_rules = false;
+            if (!std.meta.eql(planAggregate(cut_inputs).dispatch, decision)) taken.insert(.plain_rule);
+        }
     }
     // A partitioned plan the cost rules chose (long strings, worker-copy pressure) merges into shared partition
     // tables; `ZPQ_PARTAGG=1` and a worker that moves at run time append to runs.
@@ -12305,5 +12439,123 @@ test "runMultiAggregate: whether a budget answers does not depend on the workers
             }
         }
         try testing.expect(rescued);
+    }
+}
+
+test "regression: a plain grouping a cost rule chose over a cut answers every budget the cut answers" {
+    const gpa = testing.allocator;
+    const Case = struct {
+        path: []const u8,
+        aggregate: []const u8,
+        filter: ?[]const u8 = null,
+        order: expr_ast.ResultOrder,
+        /// The rule that groups plainly; null where the facts cannot bound its table and the cut stands.
+        rule: ?Reason,
+        /// Some budget refuses the rule's plain scan, which the cut answers.
+        rescues: bool,
+        budget0: usize,
+        step: usize,
+    };
+    const top10: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    const skew = "ci/fixtures/parquet/skew_filter.parquet";
+    const cases = [_]Case{
+        // Few dictionary entries: plain grouping in place of the first keys' cut. Its small domain fits wherever the
+        // union runs, so nothing refuses.
+        .{
+            .path = "ci/fixtures/parquet/topk_skew.parquet",
+            .aggregate = "count(*) AS c, sum(n) AS s",
+            .order = .{ .limit = 5 },
+            .rule = .few_dictionary_entries,
+            .rescues = false,
+            .budget0 = 512 << 10,
+            .step = 512 << 10,
+        },
+        // The bounds say `s = 5` passes a thousandth of the rows; nine in ten pass, over near-unique keys. Nothing
+        // proves the filter selective or the groups few, and the first row group read passes nine in ten: the count
+        // cut stays.
+        .{
+            .path = skew,
+            .aggregate = "count(*) AS c",
+            .filter = "s = 5",
+            .order = top10,
+            .rule = null,
+            .rescues = false,
+            .budget0 = 64 << 10,
+            .step = 32 << 10,
+        },
+        // The bounds put `f > 994` at under 1%, and the first row group the scan reads passes that few, counted.
+        .{
+            .path = skew,
+            .aggregate = "count(*) AS c",
+            .filter = "f > 994",
+            .order = top10,
+            .rule = .selective_filter,
+            .rescues = false,
+            .budget0 = 32 << 10,
+            .step = 8 << 10,
+        },
+        // The bounds prove `f = 0` passes one row group in 24, whose near-unique keys a tight budget refuses plainly.
+        .{
+            .path = skew,
+            .aggregate = "count(*) AS c",
+            .filter = "f = 0",
+            .order = top10,
+            .rule = .selective_filter,
+            .rescues = true,
+            .budget0 = 32 << 10,
+            .step = 8 << 10,
+        },
+    };
+    for (cases) |case| {
+        const bytes = (try loadFixture(case.path)) orelse return error.SkipZigTest;
+        defer gpa.free(bytes);
+        var budgets: [24]usize = undefined;
+        for (&budgets, 0..) |*b, i| b.* = case.budget0 + i * case.step;
+        for ([_]usize{ 1, 4 }) |j| {
+            const args: MultiAggArgs = .{
+                .inputs = &.{.{ .name = case.path, .bytes = bytes }},
+                .aggregate = case.aggregate,
+                .group_by = "k",
+                .filter = case.filter,
+                .result_order = case.order,
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+                .sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1 },
+            };
+            {
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                var at = args;
+                at.max_memory = budgets[budgets.len - 1];
+                const plan = (try explainAggregate(gpa, arena.allocator(), at)).plan;
+                if (case.rule) |r| try testing.expect(plan.reasons.contains(r)) else {
+                    try testing.expect(!plan.reasons.contains(.selective_filter));
+                }
+            }
+            var cut = args;
+            cut.plain_rules = false;
+            var want: [budgets.len]anyerror!usize = undefined;
+            outcomes(cut, &budgets, &want);
+            var got: [budgets.len]anyerror!usize = undefined;
+            outcomes(args, &budgets, &got);
+            try expectSameOutcomes(&want, &got);
+            if (!case.rescues) continue;
+            var rescued = false;
+            for (budgets, want) |b, w| {
+                _ = w catch continue;
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                var first = args;
+                first.max_memory = b;
+                var taken: std.EnumSet(FastPath) = .{};
+                first.taken = &taken;
+                if (prepareAggregate(gpa, arena.allocator(), first, false)) |r| freeResult(r) else |e| {
+                    try testing.expectEqual(error.ExceededMemoryBudget, e);
+                    try testing.expect(taken.contains(.plain_rule));
+                    rescued = true;
+                }
+            }
+            try testing.expect(rescued);
+        }
     }
 }

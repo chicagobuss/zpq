@@ -4846,6 +4846,8 @@ fn writeExplainFacts(writer: anytype, plan: scan.ScanPlan) !void {
         if (stat.entries) |e| try writer.print(",\"dictionary_entries\":{{\"value\":{d},\"provenance\":\"exact\"}}", .{e});
     }
     if (f.pass_share) |p| try writer.print(",\"filter_pass\":{{\"value\":{d:.4},\"provenance\":\"estimate\"}}", .{p});
+    if (f.sampled_pass) |p|
+        try writer.print(",\"filter_pass_sampled\":{{\"value\":{d:.4},\"provenance\":\"first_row_group\"}}", .{p});
     try writer.print(",\"readers\":{},\"probe\":{{\"ranges\":{d},\"bytes\":{d},\"capped\":{}}}}}", .{ f.readers, f.probe_ranges, f.probe_bytes, f.probe_capped });
     try writer.writeAll(",\"candidates\":[");
     var sep: []const u8 = "";

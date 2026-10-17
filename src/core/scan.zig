@@ -107,7 +107,17 @@ fn allRescannable(inputs: []const Input) bool {
 /// A fast path that charges its peak to the query's budget where the established path it stands in for does not
 /// charge the same way. Each is armed only over rescannable inputs, and a scan it took that the budget refused runs
 /// again without it (`runMultiAggregate`): a budget the established path fits never fails the query.
-pub const FastPath = enum { dense, spill, pairs, partitioned };
+pub const FastPath = enum {
+    dense,
+    spill,
+    pairs,
+    partitioned,
+    /// Not fast paths but what the scan held: tables filled by several workers off a shared cursor, whose peak depends
+    /// on which worker claimed which row groups (a table past a power of two doubles), so whether the budget refuses
+    /// them depends on timing; and whether shared partitions, one copy of each group, could answer instead.
+    worker_tables,
+    partitions_fit,
+};
 
 pub const RowGroupGate = struct {
     ctx: *anyopaque,
@@ -2706,33 +2716,54 @@ fn footerLen(bytes: []const u8) usize {
 /// answer, `MultiAggResult.output`, is gpa-owned; `MultiAggResult.deinit`
 /// frees both.
 pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs) !MultiAggResult {
-    // A fast path charges more of its peak than the path it stands in for (`FastPath`): a budget the established
-    // path fits must not fail the query, so a refusal runs the scan again without every fast path it armed. Exact
-    // because each is armed only over inputs a second scan reads again, whole, from the start.
-    var taken: std.EnumSet(FastPath) = .{};
-    var first = args;
-    first.taken = &taken;
-    return prepareAggregate(gpa, arena, first, false) catch |e| {
-        if (e != error.ExceededMemoryBudget or taken.count() == 0) return e;
-        var plain = args;
-        if (taken.contains(.dense)) plain.dense = false;
-        if (taken.contains(.spill)) plain.spill = false;
-        if (taken.contains(.pairs)) plain.distinct_pairs = .off;
-        if (taken.contains(.partitioned)) plain.partition_cost = false;
-        // The rerun reads the mappings from the start: an exact restart, which reuses none of the reader's bytes and so
-        // must not hold its window beside its own.
-        if (args.start_reads) |s| if (s.abandon) |abandon| abandon(s.ctx);
-        plain.start_reads = null;
-        plain.dict_probe = null;
-        const inputs = try arena.dupe(Input, args.inputs);
-        for (inputs) |*in| if (in.plan_bytes) |b| {
-            in.bytes = b;
-            in.gate = null;
-            in.dict_wait = null;
-        };
-        plain.inputs = inputs;
-        return prepareAggregate(gpa, arena, plain, false);
-    };
+    // A budget the established path fits must not fail the query, nor may whether it fails depend on timing. A refused
+    // scan runs again, exactly, each time on a narrower path: without every fast path it armed (they charge more of
+    // their peak than the paths they stand in for, `FastPath`); then, where several workers' tables were refused, on
+    // shared partitions, one copy of each group whatever the timing; then on one worker, which claims row groups in
+    // order and so peaks the same every run. Each step only narrows, so at most four scans run, and each arms its
+    // paths only over inputs a scan reads again, whole, from the start.
+    var attempt = args;
+    var parts_tried = args.partagg;
+    while (true) {
+        var taken: std.EnumSet(FastPath) = .{};
+        attempt.taken = &taken;
+        if (prepareAggregate(gpa, arena, attempt, false)) |r| return r else |e| {
+            if (e != error.ExceededMemoryBudget) return e;
+            var next = attempt;
+            if (taken.contains(.dense)) next.dense = false;
+            if (taken.contains(.spill)) next.spill = false;
+            if (taken.contains(.pairs)) next.distinct_pairs = .off;
+            if (taken.contains(.partitioned)) next.partition_cost = false;
+            const masked = taken.contains(.dense) or taken.contains(.spill) or taken.contains(.pairs) or
+                taken.contains(.partitioned);
+            parts_tried = parts_tried or taken.contains(.partitioned);
+            if (!masked) {
+                if (!taken.contains(.worker_tables)) return e;
+                if (taken.contains(.partitions_fit) and !parts_tried) {
+                    next.partagg = true;
+                    parts_tried = true;
+                } else {
+                    next.parallelism = 1;
+                    next.partagg = args.partagg;
+                }
+            }
+            if (attempt.inputs.ptr == args.inputs.ptr) {
+                // The rerun reads the mappings from the start: an exact restart, which reuses none of the reader's
+                // bytes and so must not hold its window beside its own.
+                if (args.start_reads) |s| if (s.abandon) |abandon| abandon(s.ctx);
+                next.start_reads = null;
+                next.dict_probe = null;
+                const inputs = try arena.dupe(Input, args.inputs);
+                for (inputs) |*in| if (in.plan_bytes) |b| {
+                    in.bytes = b;
+                    in.gate = null;
+                    in.dict_wait = null;
+                };
+                next.inputs = inputs;
+            }
+            attempt = next;
+        }
+    }
 }
 
 /// Shares all binding and work sizing with execution, but stops before allocating workers or aggregate tables.
@@ -3138,6 +3169,11 @@ fn prepareAggregate(
         if (spill_on) taken.insert(.spill);
         // Chosen by the cost rules rather than asked for, a partitioned plan has the plain one to fall back to.
         if (part_on and !args.partagg and rescannable) taken.insert(.partitioned);
+        const shared = decision.strategy == .plain_hash or part_on;
+        if (shared and n_workers > 1 and rescannable) taken.insert(.worker_tables);
+        if (decision.strategy == .plain_hash and !use_blocks and partAggSupported(args, agg_calls, true) and
+            (if (group_outputs) |outs| countCut(outs, agg_calls, args.result_order) == null else true))
+            taken.insert(.partitions_fit);
     }
     // A partitioned plan the cost rules chose (long strings, worker-copy pressure) merges into shared partition
     // tables; `ZPQ_PARTAGG=1` and a worker that moves at run time append to runs.
@@ -11526,4 +11562,49 @@ test "planAggregate: a filter its row groups' bounds say passes few rows drops a
     const plan = planAggregate(in);
     try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
     try testing.expect(plan.reasons.contains(.selective_filter) and !plan.reasons.contains(.sketch_count_cut));
+}
+
+test "runMultiAggregate: whether a budget answers does not depend on the workers or their timing" {
+    const gpa = testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/repeat_keys.parquet", gpa);
+    defer gpa.free(bytes);
+    // Every key is in every row group: each of four workers' tables holds every key whichever row groups it claims,
+    // one table each key once. Partitions answer sum; count(DISTINCT) has none, so it runs on one worker.
+    for ([_][]const u8{ "sum(v) AS s", "count(DISTINCT v) AS s" }) |aggregate| {
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "r", .bytes = bytes }},
+            .aggregate = aggregate,
+            .group_by = "k",
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 5 },
+            .min_bytes_per_worker = 1,
+            .dense = false,
+            .parallelism = 1,
+        };
+        var budgets: [40]usize = undefined;
+        for (&budgets, 0..) |*b, i| b.* = (256 << 10) + i * (96 << 10);
+        var want: [budgets.len](anyerror!usize) = undefined;
+        outcomes(args, &budgets, &want);
+        args.parallelism = 4;
+        var rescued = false;
+        for (0..8) |_| {
+            var got: [budgets.len](anyerror!usize) = undefined;
+            outcomes(args, &budgets, &got);
+            try expectSameOutcomes(&want, &got);
+        }
+        // Some budget the four workers' own tables refuse, which the narrower reruns answer.
+        for (budgets, want) |b, w| {
+            _ = w catch continue;
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            var first = args;
+            first.max_memory = b;
+            var taken: std.EnumSet(FastPath) = .{};
+            first.taken = &taken;
+            if (prepareAggregate(gpa, arena.allocator(), first, false)) |r| freeResult(r) else |e| {
+                try testing.expectEqual(error.ExceededMemoryBudget, e);
+                rescued = true;
+            }
+        }
+        try testing.expect(rescued);
+    }
 }

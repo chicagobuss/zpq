@@ -1,0 +1,32 @@
+"""Fixtures for tools/memory_gate.py: DELTA_BYTE_ARRAY expansion and dictionary-heavy strings.
+
+    memory_gate_fixtures.py OUT_DIR    # writes dba_big, dba_rg16 and dict_heavy .parquet (about 60 MB in all)
+"""
+import sys, random
+import pyarrow as pa, pyarrow.parquet as pq
+
+out = sys.argv[1]
+# 1500 x 100 kB values, one row group: expands ~150 MB from a tiny file (the harden round's slice-sizing shape).
+s = "x" * 100_000
+t = pa.table({"s": pa.array([s] * 1500, pa.string()), "n": pa.array(range(1500), pa.int64())})
+pq.write_table(t, f"{out}/dba_big.parquet", use_dictionary=False, column_encoding={"s": "DELTA_BYTE_ARRAY"},
+               compression="zstd", row_group_size=1500)
+# 16 row groups of 400 x 64 kB values with shared prefixes: each row group expands ~25 MB, so -j16 holds ~16x.
+rows = []
+for i in range(6400):
+    rows.append(("p" * 60_000) + f"{i:08d}" + ("q" * 4000))
+t = pa.table({"s": pa.array(rows, pa.string()), "n": pa.array(range(len(rows)), pa.int64())})
+pq.write_table(t, f"{out}/dba_rg16.parquet", use_dictionary=False, column_encoding={"s": "DELTA_BYTE_ARRAY"},
+               compression="zstd", row_group_size=400)
+# Dictionary-heavy: 4M rows over 1M distinct 120-byte strings, dictionary encoded, 8 row groups.
+rng = random.Random(7)
+keys = [f"{i:012d}" + "abcdefghij" * 10 + f"{i % 97:08d}" for i in range(1_000_000)]
+col = [keys[rng.randrange(len(keys))] for _ in range(4_000_000)]
+t = pa.table({"k": pa.array(col, pa.string()), "v": pa.array([rng.randrange(1000) for _ in range(4_000_000)],
+                                                             pa.int64())})
+pq.write_table(t, f"{out}/dict_heavy.parquet", use_dictionary=True, dictionary_pagesize_limit=1 << 30,
+               compression="snappy", row_group_size=500_000)
+for f in ("dba_big", "dba_rg16", "dict_heavy"):
+    m = pq.ParquetFile(f"{out}/{f}.parquet").metadata
+    c = m.row_group(0).column(0)
+    print(f, m.num_row_groups, m.num_rows, c.encodings, c.total_compressed_size, c.total_uncompressed_size)

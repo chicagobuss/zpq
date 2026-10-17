@@ -4523,6 +4523,9 @@ pub const GroupTable = struct {
         errdefer _ = self.map.remove(key);
         const entry_size = self.variableEntrySize(key.len, agg_calls.len);
         try self.admit(entry_size);
+        const old_record_capacity = self.compact.words.capacity;
+        // A later allocation may fail after this buffer grew; slack release must retain its reservation.
+        errdefer self.allocated_bytes += (self.compact.words.capacity - old_record_capacity) * @sizeOf(u64);
 
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
@@ -4566,7 +4569,11 @@ pub const GroupTable = struct {
     }
 
     fn getOrInsertFixedHashed(
-        self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64, full_hash: u64,
+        self: *GroupTable,
+        key: []const u8,
+        agg_calls: []const AggCall,
+        pos: u64,
+        full_hash: u64,
     ) !u32 {
         std.debug.assert(key.len == self.fixed_stride);
         if (self.sketch) |s| if (try s.route(full_hash, pos)) |id| return id;
@@ -6429,4 +6436,30 @@ test "batched fixed lookups preserve sparse selections nulls NaNs and signed zer
     };
     try std.testing.expectEqual(scalar.groupCount(), batched.groupCount());
     try std.testing.expectEqualSlices(u64, scalar.first.items, batched.first.items);
+}
+
+test "compact variable insertion keeps retained capacity charged after allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            const arg: expr_ast.Expr = .{ .col_ref = .{
+                .col_idx = 0,
+                .physical_type = .INT64,
+                .expr_type = .i64,
+            } };
+            const calls = [_]AggCall{
+                .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+                .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+            };
+            var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1024 };
+            var table = GroupTable.init(a, 0);
+            table.shared = &budget;
+            table.compact.configure(&calls);
+            defer table.deinit();
+            _ = table.getOrInsert("key", &calls, 0) catch |err| {
+                table.releaseSlack();
+                try std.testing.expect(budget.used.load(.monotonic) >= table.compact.held());
+                return err;
+            };
+        }
+    }.run, .{});
 }

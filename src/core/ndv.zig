@@ -240,8 +240,17 @@ pub fn collect(
     max_memory: usize,
     allow_union: bool,
 ) !Stat {
-    return collectRetaining(gpa, arena, files, metas, keys, workers, max_memory, true, allow_union, null, false);
+    return collectRetaining(gpa, arena, files, metas, keys, workers, max_memory, true, allow_union, null, .{});
 }
+
+/// `collectRetaining`'s union: `fold_only` wants it only for the dense fold's domain, so skips it where the footers,
+/// or then the headers, show the fold would decline it; `limit` where it decides one choice only.
+pub const UnionOpts = struct { fold_only: bool = false, limit: ?UnionLimit = null };
+
+/// A union a lone key's plan reads for one choice: the choice needs at most `entries` dictionary entries in all, and a
+/// union of at most `values` values or an eighth (`recur`) of the entries. Past either the union cannot change it, so
+/// it is not read, or stops, bound-less, as soon as it holds more values (`scan.fewEntries`).
+pub const UnionLimit = struct { entries: u64, values: u64, recur: u64 };
 
 /// `collect`, also keeping a lone INT32/INT64 key's union as an exact domain in `domain` (owned by the caller, gpa)
 /// when it is complete and small (`agg_dense.Domain`). Retention never changes the bound: it is dropped, not failed,
@@ -258,10 +267,9 @@ pub fn collectRetaining(
     allow_headers: bool,
     allow_union: bool,
     domain: ?*?agg_dense.Domain,
-    /// The union is wanted only for the dense fold's domain: skip it when the footers, or then the headers, show the
-    /// fold would decline it.
-    fold_only: bool,
+    union_opts: UnionOpts,
 ) !Stat {
+    const fold_only = union_opts.fold_only;
     var stat: Stat = .{};
     var refs: std.ArrayList(Ref) = .empty;
     for (metas, 0..) |m, fi| for (m.row_groups.items, 0..) |rg, ri| {
@@ -370,13 +378,33 @@ pub fn collectRetaining(
             (key.col_ref.physical_type == .INT32 or key.col_ref.physical_type == .INT64)) domain else null;
         // The dense fold takes a domain only where every worker's lanes cost no more than the entries they stand in
         // for (`scan.prepareAggregate`): `workers` times the widest dictionary past the entries already rules it out.
-        const declined = fold_only and keys.len == 1 and workers *| widest > sums[0] +| refs.items.len;
+        const declined = (fold_only and keys.len == 1 and workers *| widest > sums[0] +| refs.items.len) or
+            (union_opts.limit != null and (stat.entries == null or stat.entries.? > union_opts.limit.?.entries));
+        // More values than the choice allows, past every row: the union can stop there (a union within the rows can
+        // still bound them, so it runs whole).
+        const stop: ?u64 = if (union_opts.limit) |l| if (stat.entries) |n| blk: {
+            const most = @max(l.values, n / l.recur);
+            break :blk if (stat.rows > most) most else null;
+        } else null else null;
         const run = full[ki] and ki < reads.whole.len and reads.whole[ki] and !declined;
         if (allow_union and full[ki] and !run and !declined) stat.union_budget_exceeded = true;
         if (run) {
             stat.union_attempted = true;
             const col = key.col_ref.col_idx;
-            if (try unionBound(gpa, arena, files, metas, refs.items, col, workers, max_memory, retain, !gated)) |n| {
+            const bound = try unionBound(
+                gpa,
+                arena,
+                files,
+                metas,
+                refs.items,
+                col,
+                workers,
+                max_memory,
+                retain,
+                !gated,
+                stop,
+            );
+            if (bound) |n| {
                 sums[ki] = @min(sums[ki], n + nulls[ki]);
                 // Multiplying marginal cardinalities does not estimate the number of observed tuples.
                 if (keys.len == 1) stat.estimate = @min(stat.rows, n + nulls[ki]);
@@ -446,6 +474,9 @@ const Shared = struct {
     /// union.
     distinct: std.atomic.Value(usize) = .init(0),
     strict: bool = false,
+    /// See `unionBound`; `held` counts the values every partition holds against it.
+    stop: ?u64 = null,
+    held: std.atomic.Value(u64) = .init(0),
 
     fn retaining(s: *const Shared) bool {
         return !s.dropped.load(.monotonic);
@@ -547,6 +578,11 @@ const Worker = struct {
                 done[pi] = true;
                 left -= 1;
                 const entries = ids[starts[pi]..starts[pi + 1]];
+                const had = p.count();
+                defer if (s.stop) |most| {
+                    const added = p.count() - had;
+                    if (s.held.fetchAdd(added, .monotonic) + added > most) s.failed.store(true, .monotonic);
+                };
                 if (p.mapped and !(packed_ids.len > 0 and s.retaining() and
                     retainRun(s, p, @intCast(pi), ints, entries, packed_ids))) try p.migrate(s.gpa);
                 if (!p.mapped) for (entries) |j| {
@@ -597,6 +633,8 @@ fn unionBound(
     retain: ?*?agg_dense.Domain,
     /// Past the cost gate: fail (no bound) rather than outgrow a domain or give retention up.
     strict: bool,
+    /// Fail (no bound) once the union holds more values than this.
+    stop: ?u64,
 ) !?u64 {
     // Binding permits schema evolution across inputs. Raw dictionary images only union safely when their
     // physical/logical interpretation matches; otherwise the sum of per-RG bounds remains valid.
@@ -641,6 +679,7 @@ fn unionBound(
         .col = col,
         .parts = &parts,
         .page_limit = @min(16 * 1024 * 1024, max_memory / 8 / n_workers),
+        .stop = stop,
     };
     const int_key = refs.len > 0 and switch (metas[refs[0].file].row_groups.items[refs[0].rg].columns.items[col].meta_data.?.type) {
         .INT32, .INT64 => true,
@@ -926,8 +965,8 @@ test "ndv: a buffer holding only the probed bytes gives the facts the whole file
             const wait: Wait = .{ .ctx = &waits, .wait = Waits.wait };
             const part = [_]File{.{ .bytes = probed, .local = true, .probed = true, .wait = wait }};
             const mm = max_memory;
-            const want = try collectRetaining(a, arena, &whole, &.{meta}, ks, 4, mm, headers, allow_union, null, false);
-            const got = try collectRetaining(a, arena, &part, &.{meta}, ks, 4, mm, headers, allow_union, null, false);
+            const want = try collectRetaining(a, arena, &whole, &.{meta}, ks, 4, mm, headers, allow_union, null, .{});
+            const got = try collectRetaining(a, arena, &part, &.{meta}, ks, 4, mm, headers, allow_union, null, .{});
             try std.testing.expectEqualDeep(want, got);
             // Every read waited for the probe, and none was made without one.
             try std.testing.expectEqual(ranges.len == 0, waits.n == 0);
@@ -951,7 +990,8 @@ test "ndv: a union wanted for the dense fold alone is skipped where the headers 
         var domain: ?agg_dense.Domain = null;
         defer if (domain) |*d| d.deinit(a);
         const ms = &.{meta};
-        const stat = try collectRetaining(a, arena, &files, ms, &keys, workers, 512 << 20, true, true, &domain, true);
+        const fold: UnionOpts = .{ .fold_only = true };
+        const stat = try collectRetaining(a, arena, &files, ms, &keys, workers, 512 << 20, true, true, &domain, fold);
         try std.testing.expectEqual(workers == 1, stat.union_attempted);
         try std.testing.expect(!stat.union_budget_exceeded);
         try std.testing.expectEqual(.dictionary_headers, if (workers == 1) .dictionary_headers else stat.source);
@@ -1000,7 +1040,7 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
         var domain: ?agg_dense.Domain = null;
         defer if (domain) |*d| d.deinit(a);
         const ms = &.{meta};
-        const stat = try collectRetaining(a, arena, &files, ms, &keys, workers, 512 << 20, true, true, &domain, false);
+        const stat = try collectRetaining(a, arena, &files, ms, &keys, workers, 512 << 20, true, true, &domain, .{});
         const bound = try collect(a, arena, &files, &.{meta}, &keys, workers, 512 << 20, true);
         try std.testing.expectEqual(bound.hi, stat.hi); // Retention never moves the bound.
         const d = &(domain orelse return error.TestExpectedEqual);
@@ -1025,24 +1065,24 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
     // Retention costs what the domain holds, its presized map shares charged once: a budget of exactly that keeps it.
     {
         var full: ?agg_dense.Domain = null;
-        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true, true, &full, false);
+        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true, true, &full, .{});
         const d = &full.?;
         const need = d.values.len * 32 + d.entries() * 4 + d.trans.len * @sizeOf([]u32) + d.file_base.len * @sizeOf(usize);
         d.deinit(a);
         var exact: ?agg_dense.Domain = null;
         defer if (exact) |*e| e.deinit(a);
-        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, need * 16, true, true, &exact, false);
+        _ = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, need * 16, true, true, &exact, .{});
         try std.testing.expect(exact != null);
     }
     // Strings and composites keep no domain; a retention budget too small drops it, not the bound.
     var none: ?agg_dense.Domain = null;
     const str_key = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
-    _ = try collectRetaining(a, arena, &files, &.{meta}, &str_key, 4, 512 << 20, true, true, &none, false);
+    _ = try collectRetaining(a, arena, &files, &.{meta}, &str_key, 4, 512 << 20, true, true, &none, .{});
     try std.testing.expect(none == null);
     const pair = [_]expr.Expr{ keys[0], keys[0] };
-    _ = try collectRetaining(a, arena, &files, &.{meta}, &pair, 4, 512 << 20, true, true, &none, false);
+    _ = try collectRetaining(a, arena, &files, &.{meta}, &pair, 4, 512 << 20, true, true, &none, .{});
     try std.testing.expect(none == null);
-    const tight = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true, true, &none, false);
+    const tight = try collectRetaining(a, arena, &files, &.{meta}, &keys, 4, 4 << 20, true, true, &none, .{});
     try std.testing.expect(tight.union_complete);
     try std.testing.expect(none == null);
     // Retention given up part way moves what it held into the union's sets: the same exact count.
@@ -1050,12 +1090,16 @@ test "ndv: a retained integer domain translates every dictionary entry to a dist
     // Past the cost gate (strict) the union only runs to retain: given up, it gives no bound at all.
     var refs: std.ArrayList(Ref) = .empty;
     for (0..meta.row_groups.items.len) |rg| try refs.append(arena, .{ .file = 0, .rg = rg });
-    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 4 << 20, &none, true) == null);
-    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 4 << 20, &none, false) != null);
-    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, null, true) == null);
-    const strict = try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, &none, true);
+    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 4 << 20, &none, true, null) ==
+        null);
+    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 4 << 20, &none, false, null) !=
+        null);
+    try std.testing.expect(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, null, true, null) ==
+        null);
+    const strict = try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, &none, true, null);
     defer if (none) |*d| d.deinit(a);
-    try std.testing.expectEqual(try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, null, false), strict);
+    const loose = try unionBound(a, arena, &files, &.{meta}, refs.items, 1, 4, 512 << 20, null, false, null);
+    try std.testing.expectEqual(loose, strict);
     try std.testing.expect(none != null);
 }
 
@@ -1081,12 +1125,58 @@ test "ndv: allocation failures while retaining a domain leak nothing and never f
         var domain: ?agg_dense.Domain = null;
         defer if (domain) |*d| d.deinit(gpa);
         const sa = scratch.allocator();
-        if (collectRetaining(gpa, sa, &files, &.{meta}, &keys, 1, 512 << 20, true, true, &domain, false)) |stat| {
+        if (collectRetaining(gpa, sa, &files, &.{meta}, &keys, 1, 512 << 20, true, true, &domain, .{})) |stat| {
             try std.testing.expect(stat.union_complete);
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         if (!failing.has_induced_failure) {
             try std.testing.expect(domain != null);
             break;
         }
+    }
+}
+
+test "ndv: a union read for one choice stops, or is not read, where it cannot change it" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    const arena = state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const files = [_]File{.{ .bytes = bytes, .local = true }};
+    const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
+    const ms = [_]schema.FileMetaData{meta};
+    const mm = 512 << 20;
+    const whole = try collect(a, arena, &files, &.{meta}, &keys, 4, 512 << 20, true);
+    try std.testing.expect(whole.union_complete and whole.hi == 9295);
+    for ([_]usize{ 1, 4 }) |workers| {
+        // Within its values the union runs whole, to the same bound.
+        const within_opts: UnionOpts = .{ .limit = .{
+            .entries = 1 << 23,
+            .values = 1 << 17,
+            .recur = 8,
+        } };
+        const within = try collectRetaining(a, arena, &files, &ms, &keys, workers, mm, true, true, null, within_opts);
+        try std.testing.expect(within.union_complete);
+        try std.testing.expectEqual(whole.hi, within.hi);
+        // Past them it stops: no bound from the union, the headers' bound stands.
+        const past_opts: UnionOpts = .{ .limit = .{
+            .entries = 1 << 23,
+            .values = 100,
+            .recur = 1 << 30,
+        } };
+        const past = try collectRetaining(a, arena, &files, &ms, &keys, workers, mm, true, true, null, past_opts);
+        try std.testing.expect(past.union_attempted and !past.union_complete and !past.union_budget_exceeded);
+        try std.testing.expectEqual(.dictionary_headers, past.source);
+        // Past its entries it is not read at all.
+        const none_opts: UnionOpts = .{ .limit = .{
+            .entries = 100,
+            .values = 1 << 17,
+            .recur = 8,
+        } };
+        const none = try collectRetaining(a, arena, &files, &ms, &keys, workers, mm, true, true, null, none_opts);
+        try std.testing.expect(!none.union_attempted and !none.union_complete and !none.union_budget_exceeded);
+        try std.testing.expectEqual(past.entries, none.entries);
     }
 }

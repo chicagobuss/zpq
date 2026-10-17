@@ -943,14 +943,16 @@ fn sampledPassShare(
 
 /// A lone key whose dictionaries, summed over row groups, hold few entries: grouping by their codes is cheap.
 const few_entries = 1 << 23;
+/// The union `fewEntries` needs: a small domain, or one an eighth of the entries or less.
+const few_union: ndv.UnionLimit = .{ .entries = few_entries, .values = 1 << 17, .recur = 8 };
 
 /// Grouping a lone key's codes plainly is cheap where they resolve few entries in all and the union proves either a
 /// small domain or keys that recur across row groups (the dense fold's case); a large domain whose keys each sit in
 /// one or two row groups (clustered) pays for a union and declines the fold.
 fn fewEntries(stat: NdvStat, keys: []const expr_ast.Expr) bool {
     const n = stat.entries orelse return false;
-    if (keys.len != 1 or !stat.union_complete or n > few_entries) return false;
-    return stat.hi <= 1 << 17 or n >= stat.hi *| 8;
+    if (keys.len != 1 or !stat.union_complete or n > few_union.entries) return false;
+    return stat.hi <= few_union.values or n >= stat.hi *| few_union.recur;
 }
 
 fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
@@ -3171,7 +3173,8 @@ fn prepareAggregate(
             true,
             allow_union,
             if (want) &domain else null,
-            fold_only,
+            // A prefix plan reads the union only for `fewEntries`: none past its entries, and none past its values.
+            .{ .fold_only = fold_only, .limit = if (first == .first_keys) few_union else null },
         );
         if (!explain) if (args.start_reads) |s| if (s.planned) |planned| planned(s.ctx);
     };

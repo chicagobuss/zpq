@@ -1941,6 +1941,26 @@ pub const AggEncode = struct {
     budget: u64 = 0,
 };
 
+/// `meta` with everything it points to copied into `arena`, every other field as it is: it outlives the wave arena
+/// its encoding was made in. Unlike `cloneColumnMeta`, which builds a copy field by field, a field the encoder sets in
+/// the future cannot be lost here.
+fn ownColumnMeta(arena: std.mem.Allocator, meta: schema.ColumnMetaData) !schema.ColumnMetaData {
+    var out = meta;
+    out.encodings = .empty;
+    try out.encodings.appendSlice(arena, meta.encodings.items);
+    out.path_in_schema = .empty;
+    try out.path_in_schema.appendSlice(arena, meta.path_in_schema.items);
+    if (meta.statistics) |st| {
+        var copy = st;
+        inline for (.{ "max", "min", "max_value", "min_value" }) |f| {
+            if (@field(st, f)) |v| @field(copy, f) = try arena.dupe(u8, v);
+        }
+        out.statistics = copy;
+    }
+    if (meta.encoding_stats) |es| out.encoding_stats = try es.clone(arena);
+    return out;
+}
+
 /// What encoding `col` may hold at its peak: three times its values and levels, the estimate the re-encode path
 /// slices row groups by (a dictionary attempt's table and indices, the page, its compressed copy).
 fn aggEncodeCharge(col: expr_agg.OutputCol) u64 {
@@ -2015,9 +2035,10 @@ const AggColumnWave = struct {
         if (!spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) Task.run(&tasks[0]);
     }
 
-    /// Free what the last wave's columns hold.
+    /// Drop what the last wave's columns hold, keeping the pages for the next wave: what is kept is at most what one
+    /// wave held, which the budget admitted.
     fn reset(w: *AggColumnWave) void {
-        for (w.arenas) |*a| _ = a.reset(.free_all);
+        for (w.arenas) |*a| _ = a.reset(.retain_capacity);
     }
 
     fn deinit(w: *AggColumnWave) void {
@@ -2093,7 +2114,7 @@ fn writeAggregateRowsEncoded(
         else
             try encodeAggOutputCol(arena, out_col, &leaf_elem, codec, zstd);
         const col_start: i64 = @intCast(off);
-        var em = if (in_wave) try cloneColumnMeta(arena, enc.meta) else enc.meta;
+        var em = if (in_wave) try ownColumnMeta(arena, enc.meta) else enc.meta;
         em.data_page_offset += col_start;
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start;
         // The encoder orders min/max signed; an unsigned column's type-defined order is not, so drop the bounds.

@@ -4459,9 +4459,9 @@ const HashKeyCtx = struct {
     }
 };
 
-/// A merge's key -> merged group index, sized up front for every key it will see. Fixed-width keys (every table
-/// with the same `fixed_stride`) are copied into the slots of an open-addressed table, so a probe compares the slot's
-/// own bytes instead of following a slice into a source table; other keys go through a map borrowing them.
+/// A merge's key -> merged group index, sized up front for every key it will see. Fixed-width keys (every table with
+/// the same `fixed_stride`) may be copied into the slots of an open-addressed table, so a probe compares the slot's
+/// own bytes instead of following a slice into a source table; other keys go through a map borrowing them (`Inline`).
 const MergeIndex = union(enum) {
     bytes: KeyHashMap(u32),
     fixed9: FixedMergeIndex(9),
@@ -4470,16 +4470,34 @@ const MergeIndex = union(enum) {
 
     const Entry = struct { found: bool, value: *u32 };
 
-    fn init(allocator: std.mem.Allocator, tables: []const expr_agg.GroupTable, n: usize) !MergeIndex {
+    /// Which fixed-width keys go inline. An inline slot of a 27-byte key is 32 bytes, against the map's 21 per slot.
+    const Inline = enum {
+        /// Every stride, at most 2/3 full: the in-place merge, which copies no group state, so its index is the most
+        /// it holds per group (up to three times the map's bytes at 27-byte keys).
+        any,
+        /// 9-byte keys only, at the map's own capacity: 16-byte slots, so never more bytes than the map would take. The
+        /// merges that copy state, where the index sits beside the state.
+        within_map,
+    };
+
+    fn init(allocator: std.mem.Allocator, tables: []const expr_agg.GroupTable, n: usize, mode: Inline) !MergeIndex {
         const n32: u32 = std.math.cast(u32, n) orelse return error.OutOfMemory;
         var stride: u8 = if (tables.len > 0) tables[0].fixed_stride else 0;
         for (tables) |gt| if (gt.fixed_stride != stride) {
             stride = 0;
         };
+        if (mode == .within_map and stride != 9) stride = 0;
+        // `std.HashMap.capacityForSize` at its default 80% load, for `within_map`.
+        const load = std.hash_map.default_max_load_percentage;
+        const map_cap = std.math.ceilPowerOfTwo(u64, @as(u64, n32) * 100 / load + 1) catch return error.OutOfMemory;
+        const cap: u64 = switch (mode) {
+            .any => @as(u64, n32) + n32 / 2 + 1,
+            .within_map => map_cap,
+        };
         return switch (stride) {
-            9 => .{ .fixed9 = try .init(allocator, n32) },
-            18 => .{ .fixed18 = try .init(allocator, n32) },
-            27 => .{ .fixed27 = try .init(allocator, n32) },
+            9 => .{ .fixed9 = try .init(allocator, cap) },
+            18 => .{ .fixed18 = try .init(allocator, cap) },
+            27 => .{ .fixed27 = try .init(allocator, cap) },
             else => blk: {
                 var map = KeyHashMap(u32).init(allocator);
                 errdefer map.deinit();
@@ -4518,10 +4536,10 @@ fn FixedMergeIndex(comptime stride: usize) type {
         const Slot = extern struct { key: [stride]u8, id: u32 };
         const empty = std.math.maxInt(u32);
 
-        /// Room for `n` keys at most 2/3 full: a near-unique merge mostly misses, and a miss walks to an empty slot.
-        fn init(allocator: std.mem.Allocator, n: u32) !@This() {
-            const cap = std.math.ceilPowerOfTwo(usize, @max(16, @as(usize, n) + n / 2 + 1)) catch
-                return error.OutOfMemory;
+        /// At least `min_cap` slots, more than the keys it will hold, so a probe always ends at an empty slot.
+        fn init(allocator: std.mem.Allocator, min_cap: u64) !@This() {
+            const want = std.math.cast(usize, @max(16, min_cap)) orelse return error.OutOfMemory;
+            const cap = std.math.ceilPowerOfTwo(usize, want) catch return error.OutOfMemory;
             const slots = try allocator.alloc(Slot, cap);
             for (slots) |*s| s.id = empty;
             return .{ .allocator = allocator, .slots = slots };
@@ -4567,7 +4585,7 @@ fn hashMergeGroupRefs(
         if (calls[c.a_idx].func == .count)
             return mergeCountCut(gpa, tables, refs, hashes, calls, .{ .a_idx = c.a_idx, .k = c.k }, slots, accs);
     }
-    var index = try MergeIndex.init(gpa, tables, refs.len);
+    var index = try MergeIndex.init(gpa, tables, refs.len, .within_map);
     defer index.deinit();
     try slots.ensureTotalCapacity(gpa, refs.len);
 
@@ -4658,7 +4676,7 @@ fn mergeInPlace(
     calls: []const expr_agg.AggCall,
     slots: *std.ArrayList(MergedSlot),
 ) !void {
-    var index = try MergeIndex.init(gpa, tables, refs.len);
+    var index = try MergeIndex.init(gpa, tables, refs.len, .any);
     defer index.deinit();
     try slots.ensureTotalCapacity(gpa, slots.items.len + refs.len);
     for (refs, 0..) |ref, ri| {
@@ -4695,7 +4713,7 @@ fn mergeCountCut(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    var index = try MergeIndex.init(gpa, tables, refs.len);
+    var index = try MergeIndex.init(gpa, tables, refs.len, .within_map);
     defer index.deinit();
     const Group = struct { count: u64, first: u64, key: []const u8 };
     var groups: std.ArrayList(Group) = .empty;
@@ -4793,7 +4811,7 @@ fn mergeResultCutInner(
 ) !void {
     const sa = scratch.allocator();
     const ma = cut.memory orelse gpa;
-    var index = try MergeIndex.init(sa, tables, refs.len);
+    var index = try MergeIndex.init(sa, tables, refs.len, .within_map);
     defer index.deinit();
     const Group = struct { rank: expr_agg.Accumulator, first: u64, key: []const u8 };
     var groups: std.ArrayList(Group) = .empty;
@@ -9502,7 +9520,7 @@ test "hash merge of worker tables: overlapping keys, first appearance, allocatio
     try testing.checkAllAllocationFailures(fixed.allocator(), mergeOverlapAndFree, .{});
 }
 
-test "MergeIndex: inline fixed-width keys find what the byte map finds, at every stride" {
+test "MergeIndex: inline fixed-width keys find what the byte map finds, at every stride and either size" {
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const rand = prng.random();
     inline for (.{ 9, 18, 27 }) |stride| {
@@ -9520,25 +9538,31 @@ test "MergeIndex: inline fixed-width keys find what the byte map finds, at every
         t.fixed_stride = stride;
         const tables = [_]expr_agg.GroupTable{t};
         const n = 5000;
-        var fixed = try MergeIndex.init(testing.allocator, &tables, n);
-        defer fixed.deinit();
-        try testing.expect(fixed != .bytes);
-        var bytes: MergeIndex = .{ .bytes = KeyHashMap(u32).init(testing.allocator) };
-        defer bytes.deinit();
-        try bytes.bytes.ensureTotalCapacity(n);
-        var next: u32 = 0;
-        for (0..n) |_| {
-            const key: []const u8 = &images[rand.uintLessThan(usize, pool)];
-            const h = std.hash.Wyhash.hash(0, key);
-            const f = fixed.getOrPut(key, h);
-            const b = bytes.getOrPut(key, h);
-            try testing.expectEqual(b.found, f.found);
-            if (b.found) {
-                try testing.expectEqual(b.value.*, f.value.*);
-            } else {
-                b.value.* = next;
-                f.value.* = next;
-                next += 1;
+        for ([_]MergeIndex.Inline{ .any, .within_map }) |mode| {
+            var fixed = try MergeIndex.init(testing.allocator, &tables, n, mode);
+            defer fixed.deinit();
+            var bytes: MergeIndex = .{ .bytes = KeyHashMap(u32).init(testing.allocator) };
+            defer bytes.deinit();
+            try bytes.bytes.ensureTotalCapacity(n);
+            if (mode == .within_map) {
+                // 9-byte keys only, and in no more bytes than the map's keys, values and metadata.
+                try testing.expectEqual(stride == 9, fixed != .bytes);
+                if (stride == 9) try testing.expect(fixed.fixed9.slots.len * 16 <= bytes.bytes.capacity() * 21);
+            } else try testing.expect(fixed != .bytes);
+            var next: u32 = 0;
+            for (0..n) |_| {
+                const key: []const u8 = &images[rand.uintLessThan(usize, pool)];
+                const h = std.hash.Wyhash.hash(0, key);
+                const f = fixed.getOrPut(key, h);
+                const b = bytes.getOrPut(key, h);
+                try testing.expectEqual(b.found, f.found);
+                if (b.found) {
+                    try testing.expectEqual(b.value.*, f.value.*);
+                } else {
+                    b.value.* = next;
+                    f.value.* = next;
+                    next += 1;
+                }
             }
         }
     }

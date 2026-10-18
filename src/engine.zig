@@ -623,7 +623,10 @@ fn executeAggregateOver(
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
-    const io_mode: local_reader.Mode = if (choose_io) io_policy.choose(resident, coverage) else .mmap;
+    // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
+    // the page cache's, not the query's.
+    const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
+    const io_mode: local_reader.Mode = if (choose_io and fits_reader) io_policy.choose(resident, coverage) else .mmap;
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         io_policy.profile,
         io_mode,
@@ -3376,6 +3379,8 @@ const LocalPlan = struct {
     files: []const []const ?[]local_reader.Range,
     planned: u64,
     total: u64,
+    /// The most one row group reads: the reader holds a row group's planned bytes whole.
+    largest: u64 = 0,
 
     fn coverage(self: LocalPlan) f64 {
         if (self.total == 0) return 0;
@@ -3393,6 +3398,7 @@ fn planLocalReads(
     const files = try arena.alloc([]const ?[]local_reader.Range, metas.len);
     var planned: u64 = 0;
     var total: u64 = 0;
+    var largest: u64 = 0;
     for (files, metas, opened.mmaps) |*file, *meta, m_opt| {
         total += if (m_opt) |m| m.bytes.len else 0;
         const per_rg = try arena.alloc(?[]local_reader.Range, meta.row_groups.items.len);
@@ -3402,6 +3408,8 @@ fn planLocalReads(
                 continue;
             };
             var rs: std.ArrayList(local_reader.Range) = .empty;
+            var rg_bytes: u64 = 0;
+            defer largest = @max(largest, rg_bytes);
             for (cols, 0..) |needed, ci| {
                 if (!needed or ci >= rg.columns.items.len) continue;
                 const chunk = rg.columns.items[ci];
@@ -3409,6 +3417,7 @@ fn planLocalReads(
                 const start: u64 = @intCast(if (cm.dictionary_page_offset) |dp| @min(dp, cm.data_page_offset) else cm.data_page_offset);
                 try rs.append(arena, .{ .start = start, .end = start + @as(u64, @intCast(cm.total_compressed_size)) });
                 planned +|= @intCast(cm.total_compressed_size);
+                rg_bytes +|= @intCast(cm.total_compressed_size);
                 // The scan reads a needed chunk's page index too.
                 if (chunk.column_index_offset) |o| if (chunk.column_index_length) |l| {
                     try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
@@ -3421,7 +3430,7 @@ fn planLocalReads(
         }
         file.* = per_rg;
     }
-    return .{ .files = files, .planned = planned, .total = total };
+    return .{ .files = files, .planned = planned, .total = total, .largest = largest };
 }
 
 /// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:
@@ -9873,6 +9882,24 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and ev
             try std.testing.expectEqual(.reader_no_choice, planning.why);
         }
         try std.testing.expect(!explained.encoded);
+    };
+}
+
+test "a row group past half the query's budget is read through the mapping, whatever read mode is asked for" {
+    const gpa = std.testing.allocator;
+    for ([_][*:0]const u8{ "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" }) |mode| for ([_]usize{ 1 << 30, 4096 }) |mm| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const lines = [_:null]?[*:0]const u8{mode};
+        const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
+        const explained = try explainAggregate(ctx, arena_state.allocator(), .{
+            .inputs = &.{"ci/fixtures/parquet/topk_skew.parquet"},
+            .group_by = "k",
+            .aggregate = "count(*) AS c",
+            .max_memory = mm,
+        });
+        // The reader would hold a row group whole, beside everything the ledger holds; the mapping holds none of it.
+        try std.testing.expectEqual(mm == 4096, explained.io_mode == .mmap);
     };
 }
 

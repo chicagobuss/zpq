@@ -4154,13 +4154,14 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     // installed at the end of the cold path.
     if (!sp.footer_only) if (t.ctx.meta_cache) |cache| {
         if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
+            // Charged before it is asked for: the suffix is at most the probe.
+            t.account.add(t.probe);
+            defer t.account.sub(t.probe);
             const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
                 .range = s3.Range.suffix(t.probe),
                 .if_none_match = entry.etag,
                 .prof = t.prof,
             });
-            t.account.add(cond.body.len);
-            defer t.account.sub(cond.body.len);
             t.cache = if (cond.status == 304) 1 else 2;
             noteFooterRtt(sp, cond);
             if (cond.status == 304) {
@@ -4189,13 +4190,14 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         }
     };
 
-    // Cold path: one suffix. A footer that does not fit costs one more GET, inside populateFromTailResponse.
+    // Cold path: one suffix, charged before it is asked for. A footer that does not fit costs one more GET, inside
+    // populateFromTailResponse.
+    t.account.add(t.probe);
+    defer t.account.sub(t.probe);
     const tail_resp = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
         .range = s3.Range.suffix(t.probe),
         .prof = t.prof,
     });
-    t.account.add(tail_resp.body.len);
-    defer t.account.sub(tail_resp.body.len);
     if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
     noteFooterRtt(sp, tail_resp);
     sp.noteEtag(tail_resp.header("ETag"));
@@ -4232,18 +4234,22 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     if (sp.tail_start == 0) try ensureHeadMagic(0, tail);
 
     const footer_region_len: usize = @intCast(footer_len + 8);
+    // The footer's own copy, charged while it is assembled beside the suffix it comes from.
+    t.account.add(footer_region_len);
+    defer t.account.sub(footer_region_len);
     const footer_region = try t.ctx.gpa.alloc(u8, footer_region_len);
     sp.footer_region = footer_region;
     sp.footer_offset = footer_actual_start;
 
-    // One more GET, and only this one, when the footer did not fit in the suffix.
+    // One more GET, and only this one, when the footer did not fit in the suffix; charged before it is asked for.
     if (footer_actual_start < sp.tail_start) {
+        const need_len: usize = @intCast(sp.tail_start - footer_actual_start);
+        t.account.add(need_len);
+        defer t.account.sub(need_len);
         const need = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
             .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
             .prof = t.prof,
         });
-        t.account.add(need.body.len);
-        defer t.account.sub(need.body.len);
         if (need.status != 206) return error.BadResponse;
         const missing_len: usize = @intCast(sp.tail_start - footer_actual_start);
         if (need.body.len != missing_len) return error.BadResponse;

@@ -210,7 +210,7 @@ const MAX_HEADERS_BYTES: usize = 64 * 1024;
 fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: bool, max_body: usize) Error!Response {
     // Read until \r\n\r\n appears, then keep reading the body.
     var stream: std.ArrayList(u8) = .empty;
-    defer stream.deinit(arena);
+    errdefer stream.deinit(arena);
 
     var headers_end: ?usize = null;
     var content_length: ?usize = null;
@@ -234,6 +234,8 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
                 content_length = parseContentLength(stream.items[0..i]);
                 // Before any sum uses it: a length near 2^64 would wrap `headers_end + 4 + length`.
                 if (!head_only) if (content_length) |clen| if (clen > max_body) return error.BodyTooLarge;
+                // A declared body arrives into one buffer of its size, not one doubled as it grows.
+                if (!head_only) if (content_length) |clen| try stream.ensureTotalCapacityPrecise(arena, i + 4 + clen);
                 chunked = parseTransferEncodingChunked(stream.items[0..i]);
                 // RFC 7230 §3.3.3 rule 1: 1xx, 204, and 304 responses
                 // MUST NOT include a message body — regardless of any
@@ -280,10 +282,8 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
     }
 
     const raw_body = stream.items[body_start..raw_body_end];
-    const body = if (chunked)
-        try decodeChunked(arena, raw_body)
-    else
-        try arena.dupe(u8, raw_body);
+    // The body is the buffer it arrived in, not a copy beside it: `arena` owns the response, and frees it whole.
+    const body = if (chunked) try decodeChunked(arena, raw_body) else raw_body;
 
     return .{ .status = final_status, .headers = headers, .body = body, .first_byte_ns = first_byte_ns };
 }
@@ -572,6 +572,61 @@ fn drainSent(bytes: []const u8, max_body: usize) Error!void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     _ = try drainResponse(arena.allocator(), &conn, false, max_body);
+}
+
+test "a declared body is read into one buffer of its size, and returned in it" {
+    const body_len = 150_000;
+    const head = "HTTP/1.1 206 Partial\r\nContent-Length: 150000\r\n\r\n";
+    const bytes = try testing.allocator.alloc(u8, head.len + body_len);
+    defer testing.allocator.free(bytes);
+    @memcpy(bytes[0..head.len], head);
+    for (bytes[head.len..], 0..) |*b, i| b.* = @truncate(i);
+    var fds: [2]std.posix.fd_t = undefined;
+    const pair = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(pair));
+    defer _ = std.posix.system.close(fds[1]);
+    var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+    defer conn.deinit();
+    const Writer = struct {
+        fn run(fd: std.posix.fd_t, data: []const u8) void {
+            var at: usize = 0;
+            while (at < data.len) {
+                const n = std.posix.system.write(fd, data[at..].ptr, data.len - at);
+                if (n <= 0) return;
+                at += @intCast(n);
+            }
+            _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Writer.run, .{ fds[1], bytes });
+    defer writer.join();
+    // What the response asks of the allocator under its arena: the body's buffer once, not a doubling one and a copy.
+    const Counting = struct {
+        child: std.mem.Allocator,
+        bytes: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            const A = std.mem.Allocator;
+            const vt: A.VTable = .{ .alloc = alloc, .resize = A.noResize, .remap = A.noRemap, .free = free };
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.bytes += n;
+            return self.child.rawAlloc(n, a, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(m, a, ra);
+        }
+    };
+    var counting: Counting = .{ .child = testing.allocator };
+    var arena = std.heap.ArenaAllocator.init(counting.allocator());
+    defer arena.deinit();
+    const resp = try drainResponse(arena.allocator(), &conn, false, body_len);
+    try testing.expectEqualSlices(u8, bytes[head.len..], resp.body);
+    // The arena's node for it rounds up by half again, beside the first read's: a buffer grown as it fills, then
+    // copied, asked for four times the body here.
+    try testing.expect(counting.bytes < body_len * 5 / 2);
 }
 
 test "a response whose framing claims more than its cap, or near 2^64, is refused without overflow" {

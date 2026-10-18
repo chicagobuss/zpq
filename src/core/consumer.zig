@@ -1794,6 +1794,13 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
         decimalElem(&elem, c.expr.decSpec().?);
         return elem;
     }
+    if (c.source) |src| if (c.expr == .col_ref and !schema.isFloat16(src) and
+        (src.type == .BYTE_ARRAY or src.type == .FIXED_LEN_BYTE_ARRAY or src.type == .INT64 or src.type == .DOUBLE)) {
+        var renamed = src;
+        renamed.name = c.alias;
+        renamed.num_children = 0;
+        return renamed;
+    };
     // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
     // are printed and written as the unsigned values they are.
     const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;
@@ -1828,6 +1835,8 @@ pub const OutputCol = union(enum) {
         /// Output column name. The caller's footer-build step uses
         /// the same string as the leaf SchemaElement's name.
         alias: []const u8,
+        /// A renamed reference retains its source annotation when the value lane is unchanged.
+        source: ?schema.SchemaElement = null,
     };
 };
 
@@ -1888,12 +1897,13 @@ fn cloneColumnMeta(
 fn aggLeafElem(out_col: expr_agg.OutputCol) schema.SchemaElement {
     var elem: schema.SchemaElement = .{
         .type = out_col.parquet_type,
-        .type_length = null,
+        .type_length = out_col.type_length,
         .repetition_type = if (out_col.nullable) .OPTIONAL else .REQUIRED,
         .name = out_col.name,
         .num_children = 0,
         .converted_type = out_col.converted_type,
         .logical_type = out_col.logical_type,
+        .logical_type_raw = out_col.logical_type_raw,
         .scale = null,
         .precision = null,
         .field_id = null,
@@ -1907,6 +1917,7 @@ pub fn decimalElem(elem: *schema.SchemaElement, d: expr_ast.Dec) void {
     elem.type = d.physical();
     elem.type_length = if (d.physical() == .FIXED_LEN_BYTE_ARRAY) 16 else null;
     elem.converted_type = .DECIMAL;
+    elem.logical_type_raw = &.{};
     elem.logical_type = .{ .DECIMAL = .{ .scale = d.scale, .precision = d.precision } };
     elem.scale = d.scale;
     elem.precision = d.precision;

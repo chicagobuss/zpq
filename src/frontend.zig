@@ -93,6 +93,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: column `{s}` has a decimal value exceeding its declared precision\n",
             .{diag.column.get()},
         ),
+        error.UnsupportedLogicalTypeReencode => diagnosticPrint(
+            "zpq query: cannot preserve the logical annotation while changing its physical type\n",
+            .{},
+        ),
         error.FooterSchemaChunkMismatch => diagnosticPrint("zpq query: footer schema chunk mismatch\n", .{}),
         error.CrossBucketNotSupported => diagnosticPrint("zpq query: cross-bucket queries are not supported\n", .{}),
         error.BadInputUrl => diagnosticPrint("zpq query: invalid input S3 URL\n", .{}),

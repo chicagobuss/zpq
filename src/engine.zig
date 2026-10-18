@@ -1737,7 +1737,14 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
                     const nested_name: ?[]const u8 =
                         if (item.alias == null) try labels.ofNested(c.col_idx) else null;
                     if (item.alias orelse nested_name) |alias| {
-                        try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
+                        const source = metadata.leafSchemaElement(meta0, c.col_idx) orelse return error.SchemaLookupFailed;
+                        if (source.logical_type_raw.len > 0 and source.logical_type != null and
+                            source.logical_type.? == .UNKNOWN and (source.type == .INT32 or source.type == .FLOAT))
+                            return error.UnsupportedLogicalTypeReencode;
+                        try output_specs.append(arena, .{ .computed = .{
+                            .expr = item.expr, .alias = alias,
+                            .source = metadata.leafSchemaElement(meta0, c.col_idx),
+                        } });
                         any_computed = true;
                     } else {
                         try output_specs.append(arena, .{ .passthrough = c.col_idx });
@@ -2439,6 +2446,7 @@ fn coerceFloat16LeavesToDouble(items: *std.ArrayListUnmanaged(schema.SchemaEleme
         elem.type_length = null;
         elem.converted_type = null;
         elem.logical_type = null;
+        elem.logical_type_raw = &.{};
         elem.scale = null;
         elem.precision = null;
     }
@@ -4489,21 +4497,26 @@ fn decColumn(name: []const u8, l: scan.TypedAnswer.Lane(i128), spec: expr_ast.De
 /// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a
 /// bare GROUP BY key, min/max of a column), rather than its evaluation lane's plain INT64 / DOUBLE / BYTE_ARRAY: a
 /// DATE comes back a DATE, a string a STRING, an INT8 an INT8. DECIMAL and FLOAT16 stay DOUBLE, the f64 values the
-/// lane holds; INT96 becomes INT64 TIMESTAMP(NANOS), the value zpq decodes it to; fixed-length bytes stay plain
-/// BYTE_ARRAY.
+/// lane holds; INT96 becomes INT64 TIMESTAMP(NANOS), the value zpq decodes it to; fixed-length bytes retain their
+/// width and logical annotation.
 fn retypeOutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol, src: schema.SchemaElement) !expr_agg.OutputCol {
     if (src.type == .INT96) if (out.col == .i128) return int96OutputCol(arena, out);
     if (decimal_mod.kindFromSchema(&src) != null or schema.isFloat16(src)) return out;
     var res = out;
     res.logical_type = src.logical_type;
+    res.logical_type_raw = src.logical_type_raw;
     res.converted_type = src.converted_type;
     switch (src.type orelse return out) {
         .INT64, .DOUBLE, .BYTE_ARRAY => {},
         .INT96 => {
+            res.logical_type_raw = &.{};
             res.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .NANOS = .{} } } };
             res.converted_type = null;
         },
-        .FIXED_LEN_BYTE_ARRAY => return out,
+        .FIXED_LEN_BYTE_ARRAY => {
+            res.parquet_type = .FIXED_LEN_BYTE_ARRAY;
+            res.type_length = src.type_length;
+        },
         .INT32 => {
             const c = out.col.i64;
             const vals = try arena.alloc(i32, c.values.len);

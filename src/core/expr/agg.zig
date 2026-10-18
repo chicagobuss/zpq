@@ -2207,11 +2207,13 @@ pub const OutputCol = struct {
     /// Parquet physical type — used by the caller to synthesize a
     /// SchemaElement for the output leaf.
     parquet_type: schema.Type,
+    type_length: ?i32 = null,
     /// OPTIONAL in the output schema. Set by the aggregate kind, not by whether this result happens to be NULL, so
     /// per-file outputs of one query share a schema and re-aggregate together.
     nullable: bool,
     /// Annotations carried from a source column whose values pass through unchanged (see `engine.retypeOutputCol`).
     logical_type: ?schema.LogicalType = null,
+    logical_type_raw: []const u8 = &.{},
     converted_type: ?schema.ConvertedType = null,
     /// An exact DECIMAL output: `col` is `.i128` (unscaled) and the leaf is DECIMAL(precision, scale).
     dec: ?expr_ast.Dec = null,

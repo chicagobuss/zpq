@@ -381,6 +381,8 @@ pub fn schemaMismatch(
         if (a.type != b.type or a.repetition_type != b.repetition_type) return i;
         if (a.converted_type != b.converted_type or a.type_length != b.type_length) return i;
         if (!std.meta.eql(a.logical_type, b.logical_type)) return i;
+        if (a.logical_type_raw.len != 0 and b.logical_type_raw.len != 0 and
+            !std.mem.eql(u8, a.logical_type_raw, b.logical_type_raw)) return i;
     }
     return null;
 }
@@ -975,16 +977,22 @@ test "footer open rejects counts, offsets and sizes no valid file can have" {
                 m.schema.items[1].type_length = -16;
             }
         }.f },
-        .{ .err = error.BadSchemaElement, .apply = struct {
-            fn f(m: *schema.FileMetaData) void {
-                m.schema.items[2].num_children = 3; // a primitive with children
-            }
-        }.f },
-        .{ .err = error.BadSchemaElement, .apply = struct {
-            fn f(m: *schema.FileMetaData) void {
-                m.schema.items[1].type = null; // neither a type nor children
-            }
-        }.f },
+        .{
+            .err = error.BadSchemaElement,
+            .apply = struct {
+                fn f(m: *schema.FileMetaData) void {
+                    m.schema.items[2].num_children = 3; // a primitive with children
+                }
+            }.f,
+        },
+        .{
+            .err = error.BadSchemaElement,
+            .apply = struct {
+                fn f(m: *schema.FileMetaData) void {
+                    m.schema.items[1].type = null; // neither a type nor children
+                }
+            }.f,
+        },
         // `b` lies past the root's last child.
         .{ .err = error.BadSchemaElement, .apply = struct {
             fn f(m: *schema.FileMetaData) void {
@@ -1446,4 +1454,32 @@ test "regression: schemas whose roots alone are named apart match" {
     other.name = "b";
     const c = [_]schema.SchemaElement{ spark_root, other };
     try std.testing.expectEqual(@as(?usize, 1), schemaMismatch(&a, &c, .values));
+}
+
+test "one output schema cannot describe two different opaque logical types" {
+    const root: schema.SchemaElement = .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = null,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const leaf: schema.SchemaElement = .{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "v",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = .{ .UNKNOWN = .{} },
+        .logical_type_raw = &.{ 0x0c, 0x22, 0, 0 },
+    };
+    var other = leaf;
+    other.logical_type_raw = &.{ 0x0c, 0x24, 0, 0 };
+    try std.testing.expectEqual(@as(?usize, 1), schemaMismatch(&.{ root, leaf }, &.{ root, other }, .exact));
 }

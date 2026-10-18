@@ -392,6 +392,8 @@ pub const SchemaElement = struct {
     num_children: ?i32,
     converted_type: ?ConvertedType = null,
     logical_type: ?LogicalType = null,
+    /// Borrowed complete LogicalType struct, including fields this reader does not interpret.
+    logical_type_raw: []const u8 = &.{},
     scale: ?i32,
     precision: ?i32,
     field_id: ?i32,
@@ -428,7 +430,12 @@ pub const SchemaElement = struct {
                 7 => elem.scale = try reader.readZigZag(i32),
                 8 => elem.precision = try reader.readZigZag(i32),
                 9 => elem.field_id = try reader.readZigZag(i32),
-                10 => elem.logical_type = try LogicalType.read(reader),
+                10 => {
+                    if (field.type != .Struct) return error.InvalidThriftType;
+                    const start = reader.pos;
+                    elem.logical_type = try LogicalType.read(reader);
+                    elem.logical_type_raw = reader.data[start..reader.pos];
+                },
                 else => try reader.skip(field.type),
             }
         }
@@ -437,16 +444,19 @@ pub const SchemaElement = struct {
 
     pub fn write(self: *const SchemaElement, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
-        if (self.type) |t| try writer.writeFieldI32(1, @intFromEnum(t));
+        if (self.type) |t| try writer.writeFieldI32(1, @backingInt(t));
         if (self.type_length) |v| try writer.writeFieldI32(2, v);
-        if (self.repetition_type) |rt| try writer.writeFieldI32(3, @intFromEnum(rt));
+        if (self.repetition_type) |rt| try writer.writeFieldI32(3, @backingInt(rt));
         try writer.writeFieldString(4, self.name);
         if (self.num_children) |v| try writer.writeFieldI32(5, v);
-        if (self.converted_type) |ct| try writer.writeFieldI32(6, @intFromEnum(ct));
+        if (self.converted_type) |ct| try writer.writeFieldI32(6, @backingInt(ct));
         if (self.scale) |v| try writer.writeFieldI32(7, v);
         if (self.precision) |v| try writer.writeFieldI32(8, v);
         if (self.field_id) |v| try writer.writeFieldI32(9, v);
-        if (self.logical_type) |*lt| {
+        if (self.logical_type_raw.len != 0) {
+            try writer.writeFieldBegin(.Struct, 10);
+            try writer.writeBytes(self.logical_type_raw);
+        } else if (self.logical_type) |*lt| {
             try writer.writeFieldBegin(.Struct, 10);
             try lt.write(writer);
         }
@@ -543,9 +553,9 @@ pub const DataPageHeader = struct {
     pub fn write(self: *const DataPageHeader, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
         try writer.writeFieldI32(1, self.num_values);
-        try writer.writeFieldI32(2, @intFromEnum(self.encoding));
-        try writer.writeFieldI32(3, @intFromEnum(self.definition_level_encoding));
-        try writer.writeFieldI32(4, @intFromEnum(self.repetition_level_encoding));
+        try writer.writeFieldI32(2, @backingInt(self.encoding));
+        try writer.writeFieldI32(3, @backingInt(self.definition_level_encoding));
+        try writer.writeFieldI32(4, @backingInt(self.repetition_level_encoding));
         try writer.writeStructEnd();
     }
 };
@@ -584,7 +594,7 @@ pub const DictionaryPageHeader = struct {
     pub fn write(self: *const DictionaryPageHeader, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
         try writer.writeFieldI32(1, self.num_values);
-        try writer.writeFieldI32(2, @intFromEnum(self.encoding));
+        try writer.writeFieldI32(2, @backingInt(self.encoding));
         if (self.is_sorted) |v| try writer.writeFieldBool(3, v);
         try writer.writeStructEnd();
     }
@@ -647,7 +657,7 @@ pub const DataPageHeaderV2 = struct {
         try writer.writeFieldI32(1, self.num_values);
         try writer.writeFieldI32(2, self.num_nulls);
         try writer.writeFieldI32(3, self.num_rows);
-        try writer.writeFieldI32(4, @intFromEnum(self.encoding));
+        try writer.writeFieldI32(4, @backingInt(self.encoding));
         try writer.writeFieldI32(5, self.definition_levels_byte_length);
         try writer.writeFieldI32(6, self.repetition_levels_byte_length);
         // is_compressed defaults to true; only emit when false.
@@ -701,7 +711,7 @@ pub const PageHeader = struct {
 
     pub fn write(self: *const PageHeader, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
-        try writer.writeFieldI32(1, @intFromEnum(self.type));
+        try writer.writeFieldI32(1, @backingInt(self.type));
         try writer.writeFieldI32(2, self.uncompressed_page_size);
         try writer.writeFieldI32(3, self.compressed_page_size);
         if (self.crc) |v| try writer.writeFieldI32(4, v);
@@ -956,18 +966,18 @@ pub const ColumnMetaData = struct {
 
     pub fn write(self: *const ColumnMetaData, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
-        try writer.writeFieldI32(1, @intFromEnum(self.type));
+        try writer.writeFieldI32(1, @backingInt(self.type));
         // Field 2: encodings list
         try writer.writeFieldListBegin(2, .I32, self.encodings.items.len);
         for (self.encodings.items) |enc| {
-            try writer.writeZigZag(@as(i32, @intFromEnum(enc)));
+            try writer.writeZigZag(@as(i32, @backingInt(enc)));
         }
         // Field 3: path_in_schema list
         try writer.writeFieldListBegin(3, .Binary, self.path_in_schema.items.len);
         for (self.path_in_schema.items) |path| {
             try writer.writeString(path);
         }
-        try writer.writeFieldI32(4, @intFromEnum(self.codec));
+        try writer.writeFieldI32(4, @backingInt(self.codec));
         try writer.writeFieldI64(5, self.num_values);
         try writer.writeFieldI64(6, self.total_uncompressed_size);
         try writer.writeFieldI64(7, self.total_compressed_size);
@@ -1264,7 +1274,7 @@ pub const ColumnIndex = struct {
         for (self.min_values.items) |v| try writer.writeString(v);
         try writer.writeFieldListBegin(3, .Binary, self.max_values.items.len);
         for (self.max_values.items) |v| try writer.writeString(v);
-        try writer.writeFieldI32(4, @intFromEnum(self.boundary_order));
+        try writer.writeFieldI32(4, @backingInt(self.boundary_order));
         if (self.null_counts) |nc| {
             try writer.writeFieldListBegin(5, .I64, nc.items.len);
             for (nc.items) |v| try writer.writeZigZag(v);
@@ -1420,7 +1430,7 @@ pub const FileMetaData = struct {
         const header = try reader.readByte();
         var size = @as(usize, header >> 4);
         if (size == 0xF) size = try reader.readVarInt(usize);
-        if (header & 0x0f != @intFromEnum(thrift.Type.Struct)) return error.InvalidThriftType;
+        if (header & 0x0f != @backingInt(thrift.Type.Struct)) return error.InvalidThriftType;
         var orders: std.ArrayListUnmanaged(i16) = .empty;
         errdefer orders.deinit(allocator);
         try orders.ensureTotalCapacityPrecise(allocator, safeListReserve(i16, size, reader.remaining()));
@@ -1951,4 +1961,41 @@ test "outputColumnOrders: zpq's own bounds are type-defined, copied bounds keep 
     try std.testing.expect(x.keptLeavesTypeDefined(&.{ true, false, true }));
     try std.testing.expect(!x.keptLeavesTypeDefined(&.{ true, true, true }));
     try std.testing.expect(blank.keptLeavesTypeDefined(&.{ true, true, true }));
+}
+
+test "schema preserves opaque logical annotations without replacing them with NullType" {
+    const a = std.testing.allocator;
+    // Geometry with a CRS, Variant with a version, and a future union arm with an unknown binary field.
+    const payloads = [_][]const u8{
+        &.{ 0x0c, 0x22, 0x18, 0x03, 'c', 'r', 's', 0x00, 0x00 },
+        &.{ 0x0c, 0x20, 0x15, 0x02, 0x00, 0x00 },
+        &.{ 0x0c, 0xc8, 0x01, 0x18, 0x02, 0xff, 0x00, 0x00, 0x00 },
+    };
+    for (payloads) |raw| {
+        const elem: SchemaElement = .{
+            .type = .BYTE_ARRAY,
+            .type_length = null,
+            .repetition_type = .OPTIONAL,
+            .name = "value",
+            .num_children = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+            .logical_type_raw = raw,
+        };
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        try elem.write(&w);
+        var r = thrift.Reader.init(w.bytes());
+        var parsed = try SchemaElement.read(&r);
+        try std.testing.expectEqualSlices(u8, raw, parsed.logical_type_raw);
+        // A renamed projection must retain the inner struct independently of the outer field deltas.
+        parsed.name = "projected";
+        var projected = thrift.Writer.init(a);
+        defer projected.deinit();
+        try parsed.write(&projected);
+        var rr = thrift.Reader.init(projected.bytes());
+        const again = try SchemaElement.read(&rr);
+        try std.testing.expectEqualSlices(u8, raw, again.logical_type_raw);
+    }
 }

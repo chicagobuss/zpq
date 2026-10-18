@@ -392,10 +392,7 @@ pub fn schemaMismatch(
         if (ka) |x| if (x.scale != kb.?.scale or (match == .exact and x.precision != kb.?.precision)) return i;
         if (match == .values) continue;
         if (a.type != b.type or a.repetition_type != b.repetition_type) return i;
-        if (a.converted_type != b.converted_type or a.type_length != b.type_length) return i;
-        if (!std.meta.eql(a.logical_type, b.logical_type)) return i;
-        if (a.logical_type_raw.len != 0 and b.logical_type_raw.len != 0 and
-            !std.mem.eql(u8, a.logical_type_raw, b.logical_type_raw)) return i;
+        if (a.type_length != b.type_length or !a.sameAnnotation(b)) return i;
     }
     return null;
 }

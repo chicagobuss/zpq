@@ -401,6 +401,59 @@ pub const SchemaElement = struct {
     /// parquet.thrift's LogicalType union arms this reader keeps only as `logical_type_raw`.
     pub const RawLogicalType = enum(i16) { VARIANT = 16, GEOMETRY = 17, GEOGRAPHY = 18, _ };
 
+    /// The logical type this element's values have: its recognized logical type, or the legacy ConvertedType's
+    /// equivalent when it has none, so writers of either generation describe one column alike. INTERVAL and
+    /// MAP_KEY_VALUE have no logical equivalent; an annotation this reader does not interpret stays `.UNKNOWN`.
+    pub fn effectiveLogicalType(self: *const SchemaElement) ?LogicalType {
+        if (self.logical_type) |lt| return lt;
+        const ct = self.converted_type orelse return null;
+        const int = struct {
+            fn of(bits: i8, signed: bool) LogicalType {
+                return .{ .INTEGER = .{ .bitWidth = bits, .isSigned = signed } };
+            }
+        };
+        return switch (ct) {
+            .UTF8 => .{ .STRING = .{} },
+            .MAP => .{ .MAP = .{} },
+            .LIST => .{ .LIST = .{} },
+            .ENUM => .{ .ENUM = .{} },
+            .DECIMAL => .{ .DECIMAL = .{ .scale = self.scale orelse 0, .precision = self.precision orelse 0 } },
+            .DATE => .{ .DATE = .{} },
+            // The format defines the legacy TIME and TIMESTAMP types as UTC-adjusted.
+            .TIME_MILLIS => .{ .TIME = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } },
+            .TIME_MICROS => .{ .TIME = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } },
+            .TIMESTAMP_MILLIS => .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } },
+            .TIMESTAMP_MICROS => .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } },
+            .UINT_8 => int.of(8, false),
+            .UINT_16 => int.of(16, false),
+            .UINT_32 => int.of(32, false),
+            .UINT_64 => int.of(64, false),
+            .INT_8 => int.of(8, true),
+            .INT_16 => int.of(16, true),
+            .INT_32 => int.of(32, true),
+            .INT_64 => int.of(64, true),
+            .JSON => .{ .JSON = .{} },
+            .BSON => .{ .BSON = .{} },
+            .MAP_KEY_VALUE, .INTERVAL => null,
+        };
+    }
+
+    /// Whether `a` and `b` annotate their values alike however each writer spelled it: recognized logical types as
+    /// parsed (Thrift fields may come in any order and either header form), a legacy ConvertedType as its logical
+    /// equivalent. An annotation this reader does not interpret is compared byte for byte, conservatively. DECIMAL
+    /// scale and precision are left to the caller, which compares them as resolved (`decimal.kindFromSchema`).
+    pub fn sameAnnotation(a: *const SchemaElement, b: *const SchemaElement) bool {
+        if ((a.converted_type == .INTERVAL) != (b.converted_type == .INTERVAL)) return false;
+        const la = a.effectiveLogicalType() orelse return b.effectiveLogicalType() == null;
+        const lb = b.effectiveLogicalType() orelse return false;
+        if (std.meta.activeTag(la) != std.meta.activeTag(lb)) return false;
+        return switch (la) {
+            .DECIMAL => true,
+            .UNKNOWN => std.mem.eql(u8, a.logical_type_raw, b.logical_type_raw),
+            else => std.meta.eql(la, lb),
+        };
+    }
+
     /// The union arm `logical_type_raw` holds, when it holds one.
     pub fn rawLogicalType(self: *const SchemaElement) ?RawLogicalType {
         if (self.logical_type_raw.len == 0) return null;
@@ -2016,4 +2069,53 @@ test "schema preserves opaque logical annotations without replacing them with Nu
         const again = try SchemaElement.read(&rr);
         try std.testing.expectEqualSlices(u8, raw, again.logical_type_raw);
     }
+}
+
+test "sameAnnotation: one annotation however written, refusing genuinely different and opaque-but-different ones" {
+    const base: SchemaElement = .{
+        .type = .INT64,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "v",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var modern = base;
+    modern.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } };
+    var both = modern;
+    both.converted_type = .TIMESTAMP_MICROS;
+    var legacy = base;
+    legacy.converted_type = .TIMESTAMP_MICROS;
+    try std.testing.expect(SchemaElement.sameAnnotation(&modern, &both));
+    try std.testing.expect(SchemaElement.sameAnnotation(&modern, &legacy));
+    try std.testing.expect(SchemaElement.sameAnnotation(&legacy, &both));
+    // The raw bytes of a recognized annotation are the writer's spelling, not its meaning.
+    both.logical_type_raw = &.{ 0x8c, 0x1c, 0x12, 0x00, 0x00 };
+    try std.testing.expect(SchemaElement.sameAnnotation(&modern, &both));
+
+    var local = modern;
+    local.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .MICROS = .{} } } };
+    var millis = modern;
+    millis.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } };
+    var plain = base;
+    try std.testing.expect(!SchemaElement.sameAnnotation(&modern, &local));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&legacy, &local));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&modern, &millis));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&modern, &plain));
+    try std.testing.expect(SchemaElement.sameAnnotation(&plain, &plain));
+
+    var geometry = base;
+    geometry.logical_type = .{ .UNKNOWN = .{} };
+    geometry.logical_type_raw = &.{ 0x0c, 0x22, 0x18, 0x03, 'c', 'r', 's', 0x00, 0x00 };
+    var other_crs = geometry;
+    other_crs.logical_type_raw = &.{ 0x0c, 0x22, 0x18, 0x03, 'x', 'y', 'z', 0x00, 0x00 };
+    try std.testing.expect(SchemaElement.sameAnnotation(&geometry, &geometry));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&geometry, &other_crs));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&geometry, &plain));
+
+    var interval = base;
+    interval.converted_type = .INTERVAL;
+    try std.testing.expect(!SchemaElement.sameAnnotation(&interval, &plain));
 }

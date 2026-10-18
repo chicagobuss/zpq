@@ -200,9 +200,63 @@ def encrypted_inputs(tmp):
             # A plaintext footer is still inspectable metadata; its chunks say they are encrypted.
             assert p.returncode == 0 and '"encrypted":true' in p.stdout, p.stdout
 
+def rewrite_footer(src, dst, old, new):
+    """`src` with one byte sequence of its footer replaced: another writer's spelling of the same schema."""
+    b = src.read_bytes()
+    n = struct.unpack('<I', b[-8:-4])[0]
+    footer = b[-8 - n:-8]
+    assert footer.count(old) == 1, footer.hex()
+    footer = footer.replace(old, new)
+    dst.write_bytes(b[:-8 - n] + footer + struct.pack('<I', len(footer)) + b'PAR1')
+
+
+def mixed_writers(tmp):
+    # Inputs whose footers spell one annotation differently must still read together; only a different type refuses.
+    ts = tmp / 'ts.parquet'
+    pq.write_table(pa.table({'v': pa.array([1, 2], pa.timestamp('ns'))}), ts)
+    ts_reordered = tmp / 'ts-reordered.parquet'  # TimestampType's fields in the other order
+    rewrite_footer(ts, ts_reordered, bytes.fromhex('6c8c121c3c00000000'), bytes.fromhex('6c8c2c3c000002020000'))
+    text = tmp / 'text.parquet'
+    pq.write_table(pa.table({'v': ['abc', 'def']}), text)
+    text_long = tmp / 'text-long-header.parquet'  # STRING's field header in the long form
+    rewrite_footer(text, text_long, b'\x4c\x1c\x00\x00', b'\x4c\x0c\x02\x00\x00')
+    text_legacy = tmp / 'text-legacy.parquet'  # only the legacy UTF8 ConvertedType
+    rewrite_footer(text, text_legacy, b'\x4c\x1c\x00\x00', b'')
+    assert pq.ParquetFile(text_legacy).schema.column(0).logical_type.type in ('NONE', 'STRING')
+    for first, second in [(ts, ts_reordered), (text, text_long), (text, text_legacy), (text_legacy, text)]:
+        want = pa.concat_tables([pq.read_table(first), pq.read_table(second)])
+        assert pq.read_table(second).equals(pq.read_table(first)), (first, second)
+        out = tmp / 'mixed.parquet'
+        for args in [[], ['--limit', '3'], ['--filter', 'v IS NOT NULL']]:
+            if out.exists():
+                out.unlink()
+            p = subprocess.run([ZPQ, 'query', str(first), str(second), '-j', '1', *args, '-o', str(out)],
+                               capture_output=True, text=True, timeout=30)
+            assert p.returncode == 0, (first.name, second.name, args, p.stderr)
+            expected = want.slice(0, 3) if '--limit' in args else want
+            assert pq.read_table(out).equals(expected), (first.name, second.name, args)
+            with duckdb.connect(config={'threads': '1', 'memory_limit': '512MB'}) as d:
+                got = d.execute('SELECT * FROM read_parquet(?)', [str(out)]).fetchall()
+                both = d.execute('SELECT * FROM read_parquet(?)', [[str(first), str(second)]]).fetchall()
+                assert got == (both[:3] if '--limit' in args else both), (first.name, second.name, args)
+        p = subprocess.run([ZPQ, 'query', str(first), str(second), '-j', '1', '--format', 'json'],
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0 and len(json.loads(p.stdout)) == want.num_rows, p.stderr
+    # Genuinely different annotations still refuse a shared output footer.
+    micros = tmp / 'ts-micros.parquet'
+    pq.write_table(pa.table({'v': pa.array([1, 2], pa.timestamp('us'))}), micros)
+    blob = tmp / 'blob.parquet'
+    pq.write_table(pa.table({'v': [b'abc', b'def']}), blob)
+    for first, second in [(ts, micros), (text, blob)]:
+        p = subprocess.run([ZPQ, 'query', str(first), str(second), '-j', '1', '-o', str(tmp / 'refused.parquet')],
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode != 0 and 'schema mismatch' in p.stderr, (first.name, second.name, p.stderr)
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
     repeated_fields(Path(directory))
     encrypted_inputs(Path(directory))
+    mixed_writers(Path(directory))
 print('Format correctness regressions passed')

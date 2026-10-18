@@ -95,6 +95,10 @@
 
 ### Fixes
 
+- Inputs written by different writers copy and re-encode together when their columns mean the same thing: a legacy
+  ConvertedType (`UTF8`, `TIMESTAMP_MICROS`, `INT_8`...) matches its logical type, and logical types compare by
+  value, not by how their Thrift fields were ordered or encoded. Such inputs failed with `schema mismatch across
+  inputs`. Genuinely different types, and annotations zpq does not interpret that differ at all, are still refused.
 - Encrypted Parquet is refused on every path, naming the file (exit 1). A file with a plaintext footer over
   encrypted columns was copied by `-o` with exit 0 into a file no key could decrypt: the new footer dropped the
   columns' crypto metadata. An encrypted footer (`PARE`) was reported as an invalid file. zpq does not decrypt.

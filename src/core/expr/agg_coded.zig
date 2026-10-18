@@ -307,12 +307,8 @@ fn foldHist(
             if (m.*) |cur| {
                 const ord = std.mem.order(u8, cand, cur);
                 if (!((is_min and ord == .lt) or (!is_min and ord == .gt))) return;
-                const owned = try persist.dupe(u8, cand);
-                persist.free(cur);
-                m.* = owned;
-                return;
             }
-            m.* = try persist.dupe(u8, cand);
+            try agg.persistWinner(persist, m, cand);
         },
         .avg => |*a| {
             const vals: []const f64 = switch (dict) {

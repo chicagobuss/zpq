@@ -1426,7 +1426,7 @@ const Worker = struct {
     ledger: ?*expr_agg.SharedBudget = null,
     /// Memory a row group decodes on beside the region (staged, sliced), drawn from `ledger`.
     charged: ?core_memory.Charged = null,
-    /// A scalar query's string min/max winners, drawn from the query's ledger as they change.
+    /// A scalar query's string min/max winners, each copy drawn from the query's ledger before it is made.
     winners: ?*WinnerCharge = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
@@ -1454,31 +1454,7 @@ fn workerRun(w: *Worker) void {
     if (w.blocks == null and w.group_tables.len > 0) w.group_tables[w.index].releaseSlack();
 }
 
-/// What a scalar query's string min/max winners hold, drawn from the query's ledger: each work item keeps an owned
-/// copy of its own winner until the merge, and a value can be any size. Drawn after a row group folds, by what its
-/// winners grew (the copy is made inside the fold), so a refusal comes one value late, never more.
-const WinnerCharge = struct {
-    ledger: ?*expr_agg.SharedBudget,
-    held: std.atomic.Value(usize) = .init(0),
-
-    fn adjust(self: *WinnerCharge, before: usize, after: usize) error{ExceededMemoryBudget}!void {
-        const l = self.ledger orelse return;
-        if (after > before) {
-            if (l.drawExact(after - before) == null) return error.ExceededMemoryBudget;
-            _ = self.held.fetchAdd(after - before, .monotonic);
-        } else if (before > after) {
-            l.release(before - after);
-            _ = self.held.fetchSub(before - after, .monotonic);
-        }
-    }
-
-    /// The merge has freed the losers: what is drawn is what `keep` bytes of winners hold.
-    fn settle(self: *WinnerCharge, keep: usize) void {
-        const l = self.ledger orelse return;
-        const held = self.held.swap(keep, .monotonic);
-        if (held > keep) l.release(held - keep) else _ = l.used.fetchAdd(keep - held, .monotonic);
-    }
-};
+const WinnerCharge = expr_agg.WinnerCharge;
 
 fn ownedWinnerBytes(accs: []const expr_agg.Accumulator) usize {
     var n: usize = 0;
@@ -1619,7 +1595,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
-        const winners_before = if (w.winners != null and table == null) ownedWinnerBytes(item.accumulators) else 0;
+        expr_agg.winner_charge = if (table == null) w.winners else null;
+        defer expr_agg.winner_charge = null;
         try consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
             .file_index = item.file,
@@ -1639,7 +1616,6 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .charged = if (w.charged) |*c| c.allocator() else null,
             .ledger = w.ledger,
         });
-        if (w.winners) |wc| if (table == null) try wc.adjust(winners_before, ownedWinnerBytes(item.accumulators));
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
                 .pay => {
@@ -13233,6 +13209,78 @@ test "regression: count(DISTINCT) pairs pay by the values the sets took, a filte
     const sets = results[0].output.group_rows.?;
     try testing.expectEqual(sets.len, results[1].output.group_rows.?.len);
     for (sets, results[1].output.group_rows.?) |r, p_row| for (r, p_row) |x, y| try expectSameAggValue(x, y);
+}
+
+/// Counts the bytes live through it, and their high-water mark.
+const LivePeak = struct {
+    child: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *LivePeak) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn grew(self: *LivePeak, n: usize) void {
+        const now = self.live.fetchAdd(n, .monotonic) + n;
+        _ = self.peak.fetchMax(now, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *LivePeak = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ret) orelse return null;
+        self.grew(len);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *LivePeak = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(m, a, new_len, ret)) return false;
+        if (new_len > m.len) self.grew(new_len - m.len) else _ = self.live.fetchSub(m.len - new_len, .monotonic);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const self: *LivePeak = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(m, a, new_len, ret) orelse return null;
+        if (new_len > m.len) self.grew(new_len - m.len) else _ = self.live.fetchSub(m.len - new_len, .monotonic);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ret: usize) void {
+        const self: *LivePeak = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ret);
+        _ = self.live.fetchSub(m.len, .monotonic);
+    }
+};
+
+test "a scalar query's string winner copy is drawn before it is made, so a refusal holds no copy past the ledger" {
+    const path = "ci/fixtures/parquet/scalar_strings.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    // Each row group's 1 MiB value is a new winner of all three aggregates: three copies, one fold. Drawn only after
+    // the fold, the third copy was made before the ledger refused it (and at 40 MiB a value, past the host's memory).
+    for ([_]usize{ 1, 3 }) |j| {
+        var ledger: core_memory.SharedBudget = .{ .limit = (5 << 20) / 2 };
+        var gpa: LivePeak = .{ .child = testing.allocator };
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "min(s) AS a, max(s) AS b, min(s) AS c",
+            .parallelism = j,
+            .max_memory = ledger.limit,
+            .ledger = &ledger,
+            .decode_limit = ledger.limit / 2,
+            .min_bytes_per_worker = 1,
+        };
+        const refused = runMultiAggregate(gpa.allocator(), arena_state.allocator(), args);
+        try testing.expectError(error.ExceededMemoryBudget, refused);
+        try testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), gpa.live.load(.monotonic));
+        if (j == 1) try testing.expect(gpa.peak.load(.monotonic) < 3 << 20);
+    }
 }
 
 test "a scalar query's string winners are drawn from the query's ledger: past it the query refuses, holding nothing" {

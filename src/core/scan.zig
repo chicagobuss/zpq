@@ -3507,9 +3507,8 @@ fn prepareAggregate(
     }
     // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
     // is serial time the answer would wait for. Builds that check for leaks free them, so a real leak still shows.
-    // Not an answer the query goes on to encode under a ledger: the encoding needs the room the tables hold.
-    const encoded_next = args.typed_answer and args.ledger != null;
-    const leave_tables = args.leave_regions and !std.debug.runtime_safety and !encoded_next;
+    // Cleared once an answer is built that the query encodes next and the ledger has no room for beside the tables.
+    var leave_tables = args.leave_regions and !std.debug.runtime_safety;
     defer if (!leave_tables) for (all_tables) |*gt| gt.deinit();
     errdefer if (leave_tables) for (all_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);
@@ -4006,6 +4005,14 @@ fn prepareAggregate(
         if (typed) {
             output.typed = .{ .rows = 0, .columns = &.{} };
             try buildGroupColumns(gpa, &output.typed.?, row_src, col_types, n_workers);
+            // Its encoding draws up to three times its bytes (`consumer.aggEncodeCharge`) from the ledger.
+            if (leave_tables and args.ledger != null and group_budget.available() < answer_charge *| 3) {
+                leave_tables = false;
+                for (left_lanes) |*l| l.deinit(gpa);
+                if (left_domain) |*d| d.deinit(gpa);
+                left_lanes = &.{};
+                left_domain = null;
+            }
         } else {
             const rows = try gpa.alloc([]const AggValue, slots.items.len);
             @memset(rows, &.{});

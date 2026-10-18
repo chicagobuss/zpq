@@ -643,9 +643,11 @@ test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI
             .want = "{\"s\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":1},{\"s\":\"b\",\"n\":\"NaN\"},{\"s\":\"c\",\"n\":2}",
         },
         .{
-            // Unannotated bytes print as base64 (docs/binary-output.md): `ff fe 41 e2 80`, a surrogate, U+2028.
+            // Unannotated bytes (docs/binary-output.md): `ff fe 41 e2 80` and a surrogate are not UTF-8, so base64;
+            // U+2028 is text, escaped.
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"count(*) AS n\"}",
-            .want = "[{\"b\":\"//5B4oA=\",\"n\":1},{\"b\":\"7aCA\",\"n\":1},{\"b\":\"4oCo\",\"n\":1}]",
+            .want = "[{\"b\":{\"base64\":\"//5B4oA=\"},\"n\":1},{\"b\":{\"base64\":\"7aCA\"},\"n\":1}," ++
+                "{\"b\":\"\\u2028\",\"n\":1}]",
         },
     });
 }

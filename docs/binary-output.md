@@ -2,17 +2,24 @@
 
 JSON text is UTF-8, and a Parquet BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY need not be. Escaping arbitrary bytes into a
 JSON string loses them: replacing each byte that is not UTF-8 with U+FFFD prints `ff` and `fe` alike. So zpq picks a
-column's JSON form from its annotation, and every form round-trips to the stored bytes.
+value's JSON form from its column's annotation and, for unannotated bytes, from the value itself. Every form
+round-trips to the stored bytes, and no two values print alike: bytes that are not text print as an object, and a
+JSON string never equals an object.
 
 | Column | JSON value |
 |---|---|
-| STRING / UTF8, ENUM, JSON (logical or legacy annotation) | the text, as a JSON string |
+| STRING / UTF8, ENUM, JSON (logical or legacy annotation) | the text, as a JSON string; a value that is not UTF-8 is an error |
+| no annotation | the text, as a JSON string, when the bytes are UTF-8; otherwise `{"base64":"..."}` |
+| BSON, GEOMETRY, GEOGRAPHY (WKB) | always `{"base64":"..."}` |
 | UUID (FLBA(16)) | lowercase canonical `"00010203-0405-0607-0809-0a0b0c0dfeff"` |
 | legacy INTERVAL (FLBA(12)) | `{"months":m,"days":d,"millis":ms}`, each an unsigned 32-bit little-endian field |
-| any other BYTE_ARRAY / FLBA: unannotated, BSON, GEOMETRY, GEOGRAPHY, an annotation zpq does not interpret | base64, standard alphabet, padded |
 
-An annotation zpq does not interpret falls back to the legacy annotation beside it, as the format allows, so a future
-logical type over a UTF8 column still prints as text. DECIMAL and FLOAT16 over FLBA are numbers, not bytes.
+Base64 is the standard alphabet, padded. Many writers store text without a STRING annotation (ClickBench's
+`hits.parquet` among them), which is why unannotated bytes that are UTF-8 print as text. A reader that needs the
+bytes back takes a string's UTF-8 encoding, or an object's decoded `base64`.
+
+An annotation zpq does not interpret falls back to the legacy annotation beside it, as the format allows; with none,
+its values are unannotated bytes. DECIMAL and FLOAT16 over FLBA are numbers, not bytes.
 
 The form applies wherever a value leaves as text: rows (`--format ndjson` / `json`, SQL), GROUP BY keys, min/max
 results, libzpq's SQL NDJSON and the Lambda's `agg` response. It is chosen from the column a value passes through

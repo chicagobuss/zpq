@@ -5076,6 +5076,33 @@ pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     );
 }
 
+/// Whether `s` is UTF-8. Most unannotated text is ASCII: 16 bytes at a time until a byte with the high bit, which
+/// starts a sequence because every byte before it is ASCII; the rest goes to the full check.
+fn isUtf8(s: []const u8) bool {
+    const V = @Vector(16, u8);
+    var i: usize = 0;
+    while (i + 16 <= s.len) : (i += 16) {
+        const v: V = s[i..][0..16].*;
+        if (@reduce(.Or, v) & 0x80 != 0) break;
+    }
+    while (i < s.len and s[i] < 0x80) i += 1;
+    return std.unicode.utf8ValidateSlice(s[i..]);
+}
+
+/// `{"base64":"..."}`, standard alphabet, padded.
+fn writeBase64Json(writer: anytype, value: []const u8) !void {
+    try writer.writeAll("{\"base64\":\"");
+    var buf: [4096]u8 = undefined;
+    var rest = value;
+    while (rest.len > 0) {
+        // A whole number of 3-byte groups a chunk, so only the last one pads.
+        const n = @min(rest.len, buf.len / 4 * 3);
+        try writer.writeAll(std.base64.standard.Encoder.encode(&buf, rest[0..n]));
+        rest = rest[n..];
+    }
+    try writer.writeAll("\"}");
+}
+
 /// Column `ci`'s kind; a computed string's, when none is known.
 pub fn kindAt(kinds: []const TextKind, ci: usize) TextKind {
     return if (ci < kinds.len) kinds[ci] else .utf8;
@@ -5171,31 +5198,39 @@ fn escapeJson(writer: anytype, s: []const u8, comptime strict: bool) !void {
     }
 }
 
-/// How a byte value is written as JSON text, from its column's annotation. Only UTF-8 text is written as it is; any
-/// other bytes would collide once escaped, so they take a lossless form (`docs/binary-output.md`).
+/// How a byte value is written as JSON text, from its column's annotation (`docs/binary-output.md`). Every form is
+/// lossless and no two values print alike: a string is never equal to an object.
 pub const TextKind = enum {
+    /// STRING, ENUM or JSON: the text. A value that is not UTF-8 is an invalid file, not a value to print.
     utf8,
-    /// Standard alphabet, padded.
+    /// No annotation: text when the bytes are UTF-8, else `{"base64":...}`.
+    bytes,
+    /// Bytes that are never text (BSON, GEOMETRY, GEOGRAPHY): always `{"base64":...}`.
     base64,
     /// Canonical lowercase 8-4-4-4-12.
     uuid,
     /// The legacy FLBA(12) INTERVAL as `{"months":m,"days":d,"millis":ms}`.
     interval,
 
-    /// An unrecognized logical annotation falls back to the legacy one, as the format allows.
+    /// An annotation this reader does not interpret falls back to the legacy one beside it, as the format allows.
     pub fn of(elem: schema.SchemaElement) TextKind {
         if (elem.logical_type) |lt| switch (lt) {
             .STRING, .ENUM, .JSON => return .utf8,
             .UUID => return .uuid,
-            .UNKNOWN => {},
-            else => return .base64,
+            .BSON => return .base64,
+            .UNKNOWN => if (elem.rawLogicalType()) |raw| switch (raw) {
+                .GEOMETRY, .GEOGRAPHY => return .base64,
+                else => {},
+            },
+            else => {},
         };
         if (elem.converted_type) |ct| switch (ct) {
             .UTF8, .ENUM, .JSON => return .utf8,
+            .BSON => return .base64,
             .INTERVAL => return .interval,
             else => {},
         };
-        return .base64;
+        return .bytes;
     }
 
     /// A value whose source column is known; a computed string (no source) is text.
@@ -5212,18 +5247,26 @@ pub fn writeBytesJson(writer: anytype, value: []const u8, kind: TextKind) !void 
             try writeJsonText(writer, value);
             try writer.writeByte('"');
         },
-        .base64 => {
-            try writer.writeByte('"');
-            var buf: [4096]u8 = undefined;
-            var rest = value;
-            while (rest.len > 0) {
-                // A whole number of 3-byte groups a chunk, so only the last one pads.
-                const n = @min(rest.len, buf.len / 4 * 3);
-                try writer.writeAll(std.base64.standard.Encoder.encode(&buf, rest[0..n]));
-                rest = rest[n..];
-            }
-            try writer.writeByte('"');
+        .bytes => {
+            // One pass for most values: escaped strictly into `buf` (a byte escapes to at most 6), kept if all UTF-8.
+            const short = 1024;
+            var buf: [6 * short]u8 = undefined;
+            if (value.len <= short) {
+                var text: std.Io.Writer = .fixed(&buf);
+                escapeJson(&text, value, true) catch |err| switch (err) {
+                    error.InvalidUtf8 => return writeBase64Json(writer, value),
+                    error.WriteFailed => unreachable,
+                };
+                try writer.writeByte('"');
+                try writer.writeAll(text.buffered());
+                try writer.writeByte('"');
+            } else if (isUtf8(value)) {
+                try writer.writeByte('"');
+                try writeJsonString(writer, value);
+                try writer.writeByte('"');
+            } else try writeBase64Json(writer, value);
         },
+        .base64 => try writeBase64Json(writer, value),
         .uuid => {
             if (value.len != 16) return error.InvalidBinaryValue;
             const hex = "0123456789abcdef";
@@ -7231,11 +7274,15 @@ test "writeJsonString: escapes, and replaces invalid UTF-8 with U+FFFD per byte"
 test "writeBytesJson: lossless bytes, UUID and INTERVAL text; a STRING value that is not UTF-8 fails" {
     const a = std.testing.allocator;
     const cases = [_]struct { in: []const u8, kind: TextKind, want: []const u8 }{
-        .{ .in = "\xff", .kind = .base64, .want = "\"/w==\"" },
-        .{ .in = "\xfe", .kind = .base64, .want = "\"/g==\"" },
-        .{ .in = "", .kind = .base64, .want = "\"\"" },
-        .{ .in = "ab", .kind = .base64, .want = "\"YWI=\"" },
-        .{ .in = "abc", .kind = .base64, .want = "\"YWJj\"" },
+        .{ .in = "\xff", .kind = .bytes, .want = "{\"base64\":\"/w==\"}" },
+        .{ .in = "\xfe", .kind = .bytes, .want = "{\"base64\":\"/g==\"}" },
+        // Text that looks like base64 stays a string, so it never meets the object of the bytes it spells.
+        .{ .in = "/w==", .kind = .bytes, .want = "\"/w==\"" },
+        .{ .in = "a\"\x00\xe2\x80\xa8", .kind = .bytes, .want = "\"a\\\"\\u0000\\u2028\"" },
+        .{ .in = "", .kind = .bytes, .want = "\"\"" },
+        .{ .in = "", .kind = .base64, .want = "{\"base64\":\"\"}" },
+        .{ .in = "ab", .kind = .base64, .want = "{\"base64\":\"YWI=\"}" },
+        .{ .in = "abc", .kind = .base64, .want = "{\"base64\":\"YWJj\"}" },
         .{ .in = "caf\xc3\xa9\n", .kind = .utf8, .want = "\"caf\xc3\xa9\\n\"" },
         .{
             .in = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\xfe\xff",
@@ -7260,19 +7307,33 @@ test "writeBytesJson: lossless bytes, UUID and INTERVAL text; a STRING value tha
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     try writeBytesJson(&aw.writer, &long, .base64);
-    const text = aw.written()[1 .. aw.written().len - 1];
+    const text = aw.written()["{\"base64\":\"".len .. aw.written().len - "\"}".len];
     try std.testing.expectEqual(@as(?usize, text.len - 1), std.mem.indexOfScalar(u8, text, '='));
     var back: [3074]u8 = undefined;
     try std.base64.standard.Decoder.decode(&back, text);
     try std.testing.expectEqualSlices(u8, &long, &back);
 
+    // The ASCII fast path hands a sequence that starts past 16 bytes, or splits across a 16-byte block, to the check.
+    for ([_][]const u8{ "0123456789abcdef\xff", "0123456789abcde\xc3\xa9x", "0123456789abcdefg\xc3" }, [_]bool{ false, true, false }) |in, want| {
+        try std.testing.expectEqual(want, isUtf8(in));
+    }
+    // Past the one-pass size: text stays text, and one bad byte at the end makes the whole value base64.
+    var wide: [1500]u8 = undefined;
+    @memset(&wide, 'a');
+    for ([_]bool{ true, false }) |valid| {
+        if (!valid) wide[wide.len - 1] = 0xff;
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try writeBytesJson(&out.writer, &wide, .bytes);
+        try std.testing.expectEqual(valid, out.written()[0] == '"');
+    }
     var sink: std.Io.Writer.Discarding = .init(&.{});
     try std.testing.expectError(error.InvalidUtf8, writeBytesJson(&sink.writer, "a\xff", .utf8));
     try std.testing.expectError(error.InvalidBinaryValue, writeBytesJson(&sink.writer, "short", .uuid));
     try std.testing.expectError(error.InvalidBinaryValue, writeBytesJson(&sink.writer, "short", .interval));
 }
 
-test "TextKind: text annotations print as text, UUID and INTERVAL by type, any other bytes as base64" {
+test "TextKind: text annotations print as text, UUID and INTERVAL by type, blobs as base64, other bytes as found" {
     var elem: schema.SchemaElement = .{
         .type = .BYTE_ARRAY,
         .type_length = null,
@@ -7283,7 +7344,18 @@ test "TextKind: text annotations print as text, UUID and INTERVAL by type, any o
         .precision = null,
         .field_id = null,
     };
+    try std.testing.expectEqual(TextKind.bytes, TextKind.of(elem));
+    // GEOMETRY (union arm 17, a CRS) and GEOGRAPHY (18), which this reader keeps only as raw thrift.
+    elem.logical_type = .{ .UNKNOWN = .{} };
+    elem.logical_type_raw = &.{ 0x0c, 0x22, 0x18, 0x03, 'c', 'r', 's', 0x00, 0x00 };
     try std.testing.expectEqual(TextKind.base64, TextKind.of(elem));
+    elem.logical_type_raw = &.{ 0x0c, 0x24, 0x00, 0x00 };
+    try std.testing.expectEqual(TextKind.base64, TextKind.of(elem));
+    // A future arm with no legacy annotation is plain bytes.
+    elem.logical_type_raw = &.{ 0x0c, 0xc8, 0x01, 0x00, 0x00 };
+    try std.testing.expectEqual(TextKind.bytes, TextKind.of(elem));
+    elem.logical_type = null;
+    elem.logical_type_raw = &.{};
     elem.converted_type = .UTF8;
     try std.testing.expectEqual(TextKind.utf8, TextKind.of(elem));
     // An annotation this reader does not interpret falls back to the legacy one.

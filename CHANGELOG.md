@@ -15,12 +15,13 @@
   Scripts must replace `.agg` extraction with row parsing.
   CSV is reserved but deferred. The libzpq, service and Lambda response envelopes are unchanged.
 - Byte values print losslessly in JSON and NDJSON (rows, GROUP BY keys, min/max, libzpq SQL NDJSON and the Lambda's
-  `agg`). A BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY without a STRING, UTF8, ENUM or JSON annotation, BSON and GEOMETRY /
-  GEOGRAPHY included, prints as padded standard base64, where its bytes printed as text with U+FFFD for each byte
-  that was not UTF-8, so distinct values (`ff`, `fe`) printed alike. **This changes the output of unannotated
-  binary columns that hold ASCII text too**: `abc` prints `"YWJj"`. A UUID prints as lowercase `8-4-4-4-12` and a
-  legacy INTERVAL as `{"months":m,"days":d,"millis":ms}`. A STRING value that is not UTF-8 is an error naming the
-  column (exit 1), where it printed U+FFFD; the file is invalid. See `docs/binary-output.md`.
+  `agg`). Bytes that were not UTF-8 printed as text with U+FFFD for each such byte, so distinct values (`ff`, `fe`)
+  printed alike. A BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY without an annotation still prints as a JSON string when its
+  bytes are UTF-8; **when they are not, it prints as `{"base64":"..."}`** (standard alphabet, padded), where it
+  printed a string. BSON, GEOMETRY and GEOGRAPHY values always print as `{"base64":"..."}`. A UUID prints as
+  lowercase `8-4-4-4-12` and a legacy INTERVAL as `{"months":m,"days":d,"millis":ms}`, where both printed their raw
+  bytes as text. A STRING, ENUM or JSON value that is not UTF-8 is an error naming the column (exit 1), where it
+  printed U+FFFD; the file is invalid. See `docs/binary-output.md`.
 
 - DECIMAL is exact. `sum` / `min` / `max` / `avg` over DECIMAL columns and DECIMAL arithmetic (`+`, `-`, `*`, e.g.
   `price * (1 - discount) * (1 + tax)`) compute in scaled 128-bit integers with the result types DuckDB and Trino use,

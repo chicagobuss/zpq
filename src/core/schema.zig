@@ -398,6 +398,18 @@ pub const SchemaElement = struct {
     precision: ?i32,
     field_id: ?i32,
 
+    /// parquet.thrift's LogicalType union arms this reader keeps only as `logical_type_raw`.
+    pub const RawLogicalType = enum(i16) { VARIANT = 16, GEOMETRY = 17, GEOGRAPHY = 18, _ };
+
+    /// The union arm `logical_type_raw` holds, when it holds one.
+    pub fn rawLogicalType(self: *const SchemaElement) ?RawLogicalType {
+        if (self.logical_type_raw.len == 0) return null;
+        var reader = thrift.Reader.init(self.logical_type_raw);
+        const field = reader.readFieldBegin() catch return null;
+        if (field.type == .Stop) return null;
+        return @enumFromInt(field.id);
+    }
+
     pub fn read(reader: *thrift.Reader) !SchemaElement {
         const saved_id = reader.last_field_id;
         defer reader.last_field_id = saved_id;

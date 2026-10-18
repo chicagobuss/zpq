@@ -11,8 +11,6 @@ only if every zpq row is a row of DuckDB's whole (unlimited) answer, and the col
 
 usage: clickbench_check.py ZPQ_BIN PARQUET ZPQ_REPO OUT_JSON [QUERY_NUMBERS...]
 """
-import base64
-import binascii
 import datetime
 import json
 import os
@@ -61,13 +59,6 @@ def as_answer(v, like):
         return None if not v["count"] else v["sum"] / v["count"]
     if isinstance(like, datetime.date) and not isinstance(like, datetime.datetime) and isinstance(v, int):
         return datetime.date(1970, 1, 1) + datetime.timedelta(days=v)
-    # ClickBench's text columns have no STRING annotation, so zpq prints their bytes as base64
-    # (docs/binary-output.md), where the view reads them as text (`binary_as_string`).
-    if isinstance(like, str) and isinstance(v, str) and v != like:
-        try:
-            return base64.b64decode(v, validate=True).decode()
-        except (binascii.Error, UnicodeDecodeError):
-            return v
     return v
 
 
@@ -92,9 +83,7 @@ def check(con, n, sql):
     rec["duckdb_s"] = time.monotonic() - t
     rec["rows"] = [len(got), len(want)]
     if want and got:
-        # Each column's type from a row where it is not NULL.
-        like = [next((w[c] for w in want if w[c] is not None), None) for c in range(len(want[0]))]
-        got = [[as_answer(v, w) for v, w in zip(g, like)] for g in got]
+        got = [[as_answer(v, w) for v, w in zip(g, want[0])] for g in got]
     if len(got) != len(want) or any(len(g) != len(w) for g, w in zip(got, want)):
         rec["status"] = "FAIL"
         rec["why"] = "shape differs"

@@ -75,20 +75,26 @@ def as_text(value, kind):
         return f'{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}'
     if kind == 'interval':
         return dict(zip(['months', 'days', 'millis'], struct.unpack('<III', value)))
-    return base64.b64encode(value).decode('ascii')
+    if kind == 'bytes':
+        try:
+            return value.decode('utf-8')
+        except UnicodeDecodeError:
+            pass
+    return {'base64': base64.b64encode(value).decode('ascii')}
 
 
 def binary_text(tmp):
     blob = tmp / 'blob.parquet'
-    # Distinct values that U+FFFD replacement printed alike, a 3n+1 length for padding, and one past a 3072-byte chunk.
-    pq.write_table(pa.table({'v': [b'\xff', b'\xfe', b'ASCII', b'', None, b'\x00', b'\xff', bytes(range(256)) * 13]}),
-                   blob)
+    # Distinct values that U+FFFD replacement printed alike; text that spells the base64 of another value; a 3n+1
+    # length for padding, and one past a 3072-byte chunk.
+    pq.write_table(pa.table({'v': [b'\xff', b'\xfe', b'ASCII', b'', None, b'\x00', b'\xff', b'/w==', 'é'.encode(),
+                                   bytes(range(256)) * 13]}), blob)
     uuids = tmp / 'uuid.parquet'
     pq.write_table(pa.table({'v': pa.array([b'\xff' * 16, b'\xfe' * 16, None, bytes(range(16))],
                                            pa.binary(16)).cast(pa.uuid())}), uuids)
     flba = tmp / 'flba.parquet'
     pq.write_table(pa.table({'v': pa.array([b'\xff\x00', b'\xfe\x00', None], pa.binary(2))}), flba)
-    cases = [(blob, 'base64'), (uuids, 'uuid'), (flba, 'base64'), (FIXTURES / 'format_geometry.parquet', 'base64'),
+    cases = [(blob, 'bytes'), (uuids, 'uuid'), (flba, 'bytes'), (FIXTURES / 'format_geometry.parquet', 'base64'),
              (FIXTURES / 'format_bson.parquet', 'base64'), (FIXTURES / 'format_interval.parquet', 'interval')]
     lib = None
     if os.environ.get('ZPQ_LIB'):
@@ -98,7 +104,7 @@ def binary_text(tmp):
     for src, kind in cases:
         values = raw_values(src)
         rows = [{'v': as_text(v, kind)} for v in values]
-        assert len({json.dumps(r) for r in rows}) == len(set(values)), src
+        assert len({json.dumps(r, sort_keys=True) for r in rows}) == len(set(values)), src
         for args, want in [([], rows), (['--limit', '2'], rows[:2]),
                            (['--filter', 'v IS NOT NULL'], [r for r in rows if r['v'] is not None])]:
             for fmt in ['json', 'ndjson']:

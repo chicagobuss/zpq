@@ -3,9 +3,9 @@
 //! One `SharedBudget` per query is the ledger: group tables, decode arenas, merges and the answer all draw from it
 //! before they allocate, so what a query holds at once stays under the one limit, whatever `-j` is. Fixed costs the
 //! ledger does not see are the slack the ceiling documents: the binary, thread stacks, the input's mapping, allocator
-//! bookkeeping, each scan worker's first huge page of decode memory, and on a refusal chain's last scan
-//! (`scan.narrowed`) one worker's decode, drawn from a ledger of `lean_decode` bytes of its own, and the first
-//! `finalize_allowance` bytes a GROUP BY's merge and answer hold beside its tables.
+//! bookkeeping, each scan worker's first huge page of decode memory, the first `finalize_allowance` bytes a GROUP BY's
+//! merge and answer hold beside its tables, and a ledger of `lean_decode` bytes of its own for one decode: a refusal
+//! chain's last scan (`scan.narrowed`), or a write's row group sliced on its writer.
 
 const std = @import("std");
 const builtin = @import("builtin");

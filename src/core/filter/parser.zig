@@ -37,6 +37,8 @@ pub const Error = error{
     FilterTooDeep,
     /// A quote opens a string literal or quoted name that never closes.
     UnterminatedString,
+    /// The column is repeated (in a LIST or MAP, or a legacy REPEATED field): a row holds a list of its values.
+    NestedFilterNotSupported,
 } || std.mem.Allocator.Error;
 
 /// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
@@ -279,15 +281,25 @@ fn groupBody(term: []const u8) Error!?[]const u8 {
 
 /// Resolve a (possibly double-quoted) column name to its leaf index. See
 /// `metadata.resolveColumn` for how bare and dotted names bind.
+/// A repeated column is refused here, before statistics could answer for it without the decode that refuses it.
 fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) Error!usize {
     const ident = metadata.unquoteIdent(name);
-    return metadata.resolveColumn(file, ident) catch |err| {
+    const ci = metadata.resolveColumn(file, ident) catch |err| {
         if (err == error.AmbiguousColumn) Diag.set(diag, ident, .{ .ambiguous_column = .{
             .parser = .filter,
             .hint = metadata.ambiguityHint(file, ident),
         } });
         return err;
     };
+    var leaves: schema.LeafIterator = .init(file.schema.items);
+    while (leaves.next()) |leaf| if (leaf.index == ci) {
+        if (leaf.max_rep > 0) {
+            Diag.setColumn(diag, ident);
+            return error.NestedFilterNotSupported;
+        }
+        break;
+    };
+    return ci;
 }
 
 fn parseLeafBody(
@@ -2386,5 +2398,23 @@ test "regression: IN sets preserve temporal comparison rewrites" {
         try eval.evaluate(try withoutInSets(a, filter), &batch, &expected, &lookup, a);
         try eval.evaluate(filter, &batch, &actual, &lookup, a);
         try testing.expectEqualSlices(u64, expected.mask, actual.mask);
+    }
+}
+
+test "a filter on a legacy repeated field is refused, even where statistics could answer it without decoding" {
+    const a = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/format_repeated.parquet", a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(bytes);
+    var meta = try metadata.open(a, bytes);
+    defer meta.deinit(a);
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    for ([_][]const u8{ "Int32_list IS NULL", "Int32_list IS NOT NULL", "Int32_list > 999999" }) |predicate| {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.NestedFilterNotSupported, parse(arena.allocator(), predicate, &meta, &diag));
+        try std.testing.expectEqualStrings("Int32_list", diag.column.get());
     }
 }

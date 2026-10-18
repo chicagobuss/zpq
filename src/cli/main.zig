@@ -689,7 +689,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "NestedRowOutputNotSupported", "UnbalancedParentheses",     "FilterTooDeep",                "AggregateInGroupBy",   "HavingTypeMismatch",   "UnsupportedCase",
         "UnsupportedType",             "DecimalScaleTooLarge",      "MissingOutputOrAggregate",     "MultipleStatements",   "CteNotSupported",      "AggregateInWhere",
         "MissingFromClause",           "MissingTableName",          "UnsupportedFromClause",        "UnsupportedAggType",   "UnsupportedCoalesce",  "UnsupportedColumnType",
-        "UnlabelledColumn",            "INT96ReencodeNotSupported", "NestedReencodeNotSupported",
+        "UnlabelledColumn",            "INT96ReencodeNotSupported", "NestedReencodeNotSupported",   "NestedFilterNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

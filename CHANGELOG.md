@@ -94,6 +94,11 @@
 
 ### Fixes
 
+- A legacy REPEATED field with no LIST or MAP annotation (a repeated primitive, or a field under a repeated group)
+  printed one row per stored value, so `[[0,1,2,3],[],[4],[5,6,7,8]]` came out as four scalar rows; it is now refused
+  in row output, as LIST and MAP columns are, naming the column (exit 2). A filter naming any repeated column is
+  refused when the query is parsed (exit 2, where LIST/MAP filters exited 1 at the decode), so a predicate that
+  statistics could answer no longer answers for a column the decode would refuse. Copies are unchanged.
 - INT96 timestamps read exactly in any year. Values outside 1677-2262, which 64-bit nanoseconds cannot hold, wrapped
   into another instant: Spark's 0001-01-01 and 9999-12-31 sentinels read as 1754 and as some other date. They now
   read as the exact count of nanoseconds since the epoch, printed as that integer, and compare, sort, group and

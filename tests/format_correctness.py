@@ -144,7 +144,40 @@ def binary_text(tmp):
         lib.close()
 
 
+def repeated_fields(tmp):
+    # Legacy REPEATED fields with no LIST/MAP annotation hold a list per row; printing each leaf value as a row was
+    # incorrect, and a filter answered from statistics skipped the decode that refuses them.
+    for filename, column in [('format_repeated.parquet', 'Int32_list'),
+                             ('format_repeated_group.parquet', 'phoneNumbers.phone.number')]:
+        src = FIXTURES / filename
+        for args in [[], ['--limit', '1'], ['--limit', '0'], ['--columns', column], ['--select', column + ' + 1 AS x'],
+                     ['--format', 'json']]:
+            p = query(src, *args, ok=False)
+            assert p.returncode == 2 and 'repeated' in p.stderr and column in p.stderr, (args, p.stderr)
+            assert not p.stdout, p.stdout
+        p = subprocess.run([ZPQ, 'query', '--query', f"SELECT * FROM '{src}'"], capture_output=True, text=True,
+                           timeout=30)
+        assert p.returncode == 2 and 'repeated' in p.stderr and not p.stdout, p.stderr
+        for predicate in [column + ' IS NULL', column + ' IS NOT NULL', column + ' > 999999999999']:
+            for args in [['--aggregate', 'count(*) AS n'], ['--aggregate', 'count(*) AS n', '--scan-all'],
+                         ['-o', str(tmp / 'refused.parquet')]]:
+                p = query(src, '--filter', predicate, *args, ok=False)
+                assert p.returncode == 2 and 'repeated' in p.stderr, (predicate, args, p.stderr)
+        assert not (tmp / 'refused.parquet').exists()
+        out = tmp / filename
+        query(src, '-o', str(out))
+        assert pq.read_table(src).equals(pq.read_table(out))
+        with duckdb.connect(config={'threads': '1', 'memory_limit': '512MB'}) as d:
+            sql = 'SELECT * FROM read_parquet(?)'
+            assert d.execute(sql, [str(src)]).fetchall() == d.execute(sql, [str(out)]).fetchall()
+    # A flat column beside a repeated group still prints and filters.
+    src = FIXTURES / 'format_repeated_group.parquet'
+    want = [{'id': i} for i in pq.read_table(src).column('id').to_pylist() if i > 2]
+    got = json.loads(query(src, '--filter', 'id > 2', '--columns', 'id', '--format', 'json').stdout)
+    assert got == want, got
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
+    repeated_fields(Path(directory))
 print('Format correctness regressions passed')

@@ -4812,10 +4812,12 @@ pub const StdoutWriter = struct {
     }
 };
 
+/// Marks the leaves row output cannot print: under a LIST or MAP, or repeated without one (a legacy REPEATED field or
+/// group), whose values are a list per row, not one each.
 fn checkNestedListMap(node: schema_tree.Node, is_nested: bool, list_map_cols: []bool) void {
     switch (node) {
         .primitive => |p| {
-            if (is_nested) {
+            if (is_nested or p.max_rep > 0) {
                 list_map_cols[p.column_index] = true;
             }
         },
@@ -6714,11 +6716,11 @@ fn runPrintSinkOver(
     @memset(list_map_cols, false);
     checkNestedListMap(.{ .group = tree0.root }, false, list_map_cols);
 
-    // Fail loud on nested LIST/MAP columns in output
     for (output_specs) |spec| {
         switch (spec) {
             .passthrough => |ci| {
                 if (ci < list_map_cols.len and list_map_cols[ci]) {
+                    Diag.setColumn(args.diag, try std.mem.join(arena, ".", tree0.leaves[ci].path));
                     return error.NestedRowOutputNotSupported;
                 }
             },
@@ -6728,6 +6730,7 @@ fn runPrintSinkOver(
                 comp.expr.collectColumns(comp_cols);
                 for (comp_cols, 0..) |referenced, ci| {
                     if (referenced and ci < list_map_cols.len and list_map_cols[ci]) {
+                        Diag.setColumn(args.diag, try std.mem.join(arena, ".", tree0.leaves[ci].path));
                         return error.NestedRowOutputNotSupported;
                     }
                 }

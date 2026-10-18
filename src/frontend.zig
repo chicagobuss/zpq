@@ -62,9 +62,21 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  the file is invalid (UUID is 16 bytes, INTERVAL 12)\n",
             .{diag.column.get()},
         ),
-        error.NestedRowOutputNotSupported => diagnosticPrint(
-            "zpq query: nested LIST/MAP columns are not supported in row output yet\n",
+        error.NestedRowOutputNotSupported => if (diag.column.len > 0) diagnosticPrint(
+            "zpq query: column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); row output does not\n" ++
+                "  support repeated columns yet\n",
+            .{diag.column.get()},
+        ) else diagnosticPrint(
+            "zpq query: repeated columns (LIST, MAP or legacy REPEATED) are not\n" ++
+                "  supported in row output yet\n",
             .{},
+        ),
+        error.NestedFilterNotSupported => diagnosticPrint(
+            "zpq query: filter column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); filtering on list\n" ++
+                "  elements is not supported\n",
+            .{diag.column.get()},
         ),
         error.UnlabelledColumn => diagnosticPrint(
             "zpq query: nested column {s} has no output name of its own:\n" ++

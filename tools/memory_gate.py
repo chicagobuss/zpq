@@ -2,18 +2,19 @@
 """Memory gate: does a query's peak memory stay under --max-memory, and does the answer stay the same?
 
 Runs a matrix of query shapes x budgets x -j, each in a cgroup scope of its own (systemd-run --user --scope) capped
-well above the budget, so an overrun is measured rather than killing the host. Per run it records the scope's
-`memory.peak` (anonymous memory plus any page cache the run itself faults in: inputs are read once before the matrix,
-so their pages are charged elsewhere), the process's peak RSS (`VmHWM`, which counts the mapped input as well), the
-exit status, the first error line, and a hash of stdout (of the rows, for a Parquet answer:
-its bytes may follow the row-group boundaries budget and -j choose).
+well above the budget, so an overrun is measured rather than killing the host. Per run it records its peak anonymous
+memory (`RssAnon`, sampled every 5 ms: the verdict's measure), the scope's `memory.peak` (which also counts page cache
+the run faults in, an input evicted since it was read before the matrix), the process's peak RSS (`VmHWM`, which counts
+the mapped input as well), the exit status, the first error line, and a hash of stdout (of the rows, for a Parquet
+answer: its bytes may follow the row-group boundaries budget and -j choose).
 
     memory_gate.py run --bin zig-out/bin/zpq --out base.jsonl [--cells REGEX] [--budgets 64M,256M] [--jobs 1,16]
     memory_gate.py report base.jsonl [tip.jsonl]          # per-cell table; with two files, before/after
 
 The verdict per run: `ok` (answered, peak <= budget + slack), `over` (answered above it), `refused` (clean error),
 `killed` (the scope cap or a signal), `diff` (answered, but stdout differs from the same shape's other answers).
-Slack is fixed per run: `--slack` (default 48 MiB) plus 1 MiB per worker for thread stacks and per-thread arenas.
+Slack is fixed per run: `--slack` (default 48 MiB: binary, allocator bookkeeping, a GROUP BY's finalize allowance or
+a last retry's own decode ledger, src/core/memory.zig) plus 2 MiB per worker (its stack, its first huge page).
 
 Datasets: the study set under ~/bench/zpq-general/data (override ZPQ_STUDY_DATA), ClickBench sub16 under
 ~/bench/zpq-fair/data/clickbench (ZPQ_CLICKBENCH_DATA), and the fixtures `--fixtures DIR` holds (dba_big, dba_rg16,
@@ -27,6 +28,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HOME = os.path.expanduser("~")
@@ -137,6 +139,49 @@ def content_hash(reader, path):
     return h.hexdigest()[:16] if p.wait() == 0 else "unreadable"
 
 
+def descendants(pid):
+    out, todo = [], [pid]
+    while todo:
+        q = todo.pop()
+        try:
+            for t in os.listdir(f"/proc/{q}/task"):
+                kids = open(f"/proc/{q}/task/{t}/children").read().split()
+                out += [int(k) for k in kids]
+                todo += [int(k) for k in kids]
+        except OSError:
+            pass
+    return out
+
+
+class AnonSampler(threading.Thread):
+    """Peak RssAnon of the process running `binary` under `root`, sampled every few milliseconds. The scope's
+    memory.peak also counts page cache the run faults in (an input evicted since it was warmed); this does not."""
+
+    def __init__(self, root, binary):
+        super().__init__(daemon=True)
+        self.root, self.binary, self.peak, self.done = root, os.path.realpath(binary), 0, False
+
+    def run(self):
+        pid = None
+        while not self.done:
+            if pid is None:
+                for d in descendants(self.root):
+                    try:
+                        if os.path.realpath(f"/proc/{d}/exe") == self.binary:
+                            pid = d
+                    except OSError:
+                        pass
+            if pid is not None:
+                try:
+                    for line in open(f"/proc/{pid}/status"):
+                        if line.startswith("RssAnon:"):
+                            self.peak = max(self.peak, int(line.split()[1]) * 1024)
+                            break
+                except OSError:
+                    pid = None
+            time.sleep(0.005)
+
+
 def run_one(binary, argv, budget, jobs, cap, timeout, reader):
     parquet = "parquet" in argv
     with tempfile.TemporaryDirectory(prefix="zpq-gate-", dir=os.environ.get("ZPQ_GATE_TMP")) as td:
@@ -148,6 +193,8 @@ def run_one(binary, argv, budget, jobs, cap, timeout, reader):
         t0 = time.time()
         h = hashlib.sha256()
         p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        sampler = AnonSampler(p.pid, binary)
+        sampler.start()
         sink = open(f"{td}/answer.parquet", "wb") if parquet else None
         timed_out = False
         while chunk := p.stdout.read(1 << 20):
@@ -164,6 +211,8 @@ def run_one(binary, argv, budget, jobs, cap, timeout, reader):
             p.kill()
             p.wait()
         wall = time.time() - t0
+        sampler.done = True
+        sampler.join()
         rc, peak = -1, -1
         if os.path.exists(f"{td}/meta"):
             parts = open(f"{td}/meta").read().split()
@@ -183,12 +232,17 @@ def run_one(binary, argv, budget, jobs, cap, timeout, reader):
         if os.path.exists(f"{td}/err"):
             lines = [l for l in open(f"{td}/err", errors="replace").read().splitlines() if l.strip()]
             err = lines[-1][:240] if lines else ""
-        return {"rc": rc, "peak": peak, "hwm": hwm, "secs": round(el, 3), "hash": digest, "err": err,
-                "timed_out": timed_out}
+        return {"rc": rc, "peak": peak, "anon": sampler.peak, "hwm": hwm, "secs": round(el, 3), "hash": digest,
+                "err": err, "timed_out": timed_out}
+
+
+def mem(r):
+    """The run's peak as the verdict reads it: anonymous memory when sampled, else the scope's memory.peak."""
+    return r["anon"] if r.get("anon") else r["peak"]
 
 
 def slack_for(jobs, base):
-    return base + jobs * MiB
+    return base + 2 * jobs * MiB
 
 
 def verdict(r, slack_base):
@@ -198,7 +252,7 @@ def verdict(r, slack_base):
         return "killed"
     if r["rc"] != 0:
         return "refused"
-    return "ok" if r["peak"] <= r["budget"] + slack_for(r["jobs"], slack_base) else "over"
+    return "ok" if mem(r) <= r["budget"] + slack_for(r["jobs"], slack_base) else "over"
 
 
 def cmd_run(a):
@@ -226,8 +280,8 @@ def cmd_run(a):
                     r["verdict"] = verdict(r, a.slack << 20)
                     out.write(json.dumps(r) + "\n")
                     out.flush()
-                    print(f"{name:24s} {budget >> 20:6d}M -j{j:<2d} {r['verdict']:8s} peak {r['peak'] / MiB:8.1f} MiB "
-                          f"x{r['peak'] / budget:5.2f} {r['secs']:7.2f}s {r['hash']} {r['err'][:70]}", flush=True)
+                    print(f"{name:24s} {budget >> 20:6d}M -j{j:<2d} {r['verdict']:8s} peak {mem(r) / MiB:8.1f} MiB "
+                          f"x{mem(r) / budget:5.2f} {r['secs']:7.2f}s {r['hash']} {r['err'][:70]}", flush=True)
 
 
 def load(path):
@@ -256,7 +310,7 @@ def fmt(r):
         return "-"
     v = r["verdict"]
     if v in ("ok", "over", "diff"):
-        s = f"{r['peak'] / r['budget']:.2f}"
+        s = f"{mem(r) / r['budget']:.2f}"
         return s + ("!" if v == "over" else "") + ("D" if v == "diff" else "")
     return {"refused": "R", "killed": "K", "timeout": "T"}[v]
 
@@ -293,12 +347,12 @@ def cmd_report(a):
         print(f"{n:24s} " + " ".join(cols))
     for name, rows in ((("before", before),) + ((("after", after),) if after else ())):
         counts = {}
-        worst = max((r for r in rows.values() if r["rc"] == 0), key=lambda r: r["peak"] / r["budget"], default=None)
+        worst = max((r for r in rows.values() if r["rc"] == 0), key=lambda r: mem(r) / r["budget"], default=None)
         for r in rows.values():
             counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
         print(f"{name}: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) +
               (f"; worst answered {worst['cell']} {worst['budget'] >> 20}M j{worst['jobs']} "
-               f"x{worst['peak'] / worst['budget']:.2f}" if worst else ""))
+               f"x{mem(worst) / worst['budget']:.2f}" if worst else ""))
     for k, v in tallies.items():
         print(f"{k}: {len(v)}")
         for line in v:

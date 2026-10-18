@@ -4354,13 +4354,15 @@ fn buildGroupRows(
 }
 
 /// What a GROUP BY answer of `slots` holds once built (`buildGroupColumns` or `buildGroupRows`): its values, their
-/// lanes and NULL flags, and the bytes of a string key. A string aggregate's own value is not counted.
+/// lanes and NULL flags, and its string keys' heap blocks. A string aggregate's own value is not counted.
 fn answerBytes(slots: []const MergedSlot, cols: []const GroupColType, key_types: []const KeyType, typed: bool) usize {
     const rows = slots.len;
+    // Each string key value is a heap block of its own: rounded to 16 bytes, with a header.
+    var string_keys: usize = 0;
+    for (key_types) |kt| string_keys += @intFromBool(kt == .string);
     var strings: usize = 0;
-    for (key_types) |kt| if (kt == .string) {
-        for (slots) |sl| strings +|= sl.key.len;
-        break;
+    if (string_keys > 0) for (slots) |sl| {
+        strings +|= std.mem.alignForward(usize, sl.key.len, 16) + string_keys * 16;
     };
     if (!typed) return rows *| (cols.len *| @sizeOf(AggValue) +| @sizeOf([]const AggValue)) +| strings;
     var per_row: usize = 0;

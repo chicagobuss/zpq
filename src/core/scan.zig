@@ -3065,13 +3065,13 @@ fn narrowed(
     may_fit: bool,
 ) ?MultiAggArgs {
     var next = attempt;
-    // A rerun never trades a cut for a plain table again. After a cost rule's plain grouping that is the cut it stood
-    // in for, planned as if the rule had not run: the chain from here is the cut's.
-    next.plain_rules = false;
     if (taken.contains(.private_runs)) {
         next.private_runs = false;
         return next;
     }
+    // A rerun never trades a cut for a plain table again. After a cost rule's plain grouping that is the cut it stood
+    // in for, planned as if the rule had not run: the chain from here is the cut's.
+    next.plain_rules = false;
     if (taken.contains(.plain_rule)) return next;
     if (taken.contains(.dense)) next.dense = false;
     if (taken.contains(.spill)) next.spill = false;
@@ -3590,11 +3590,12 @@ fn prepareAggregate(
             agg_calls.len == 1 and agg_calls[0].func == .count)
         {
             if (group_by_keys) |keys| if (keys.len > 1) if (ndv_stat) |stat| {
+                const run_width = @max(stat.key_bytes, stat.run_key_bytes);
                 if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536 and
-                    part_state.?.reservePrivate(stat.rows, stat.key_bytes))
+                    part_state.?.reservePrivate(stat.rows, run_width))
                 {
                     part_state.?.private_rows = stat.rows;
-                    part_state.?.private_key_bytes = stat.key_bytes;
+                    part_state.?.private_key_bytes = run_width;
                 }
             };
         }
@@ -13079,7 +13080,7 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
                     .a = next,
                     .chain = chain,
                     .may_fit = may_fit,
-                    .cut = st.cut or t.contains(.plain_rule),
+                    .cut = st.cut or (t.contains(.plain_rule) and !t.contains(.private_runs)),
                     .plain = st.plain or !(t.contains(.partitioned) or st.a.partagg or t.contains(.plain_rule)),
                     .scans = st.scans + 1,
                 };
@@ -13115,6 +13116,10 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
     }, 0));
     // Refused shared partitions leave the forced ones still to try, before one worker.
     var chain: Chain = .{ .parts_tried = false };
+    const shared_retry = narrowed(args, args, S.initMany(&.{ .private_runs, .partitioned, .plain_rule }), &chain, true).?;
+    try testing.expect(!shared_retry.private_runs and shared_retry.plain_rules and shared_retry.partition_cost);
+    try testing.expectEqual(args.parallelism, shared_retry.parallelism);
+    try testing.expect(!chain.parts_tried);
     const plain = narrowed(args, args, S.initMany(&.{ .partitioned, .worker_tables }), &chain, true).?;
     try testing.expect(!plain.partition_cost and !plain.partagg and plain.parallelism == 4);
     const parts = narrowed(args, plain, S.initMany(&.{ .worker_tables, .partitions_fit }), &chain, true).?;

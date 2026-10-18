@@ -18,10 +18,16 @@ partitions.
 
 Before workers start, the candidate prepays a run ceiling from the query ledger:
 twice the estimated key, count, position and offset bytes over the input rows,
-plus run/partition metadata. The ceiling is at most half the query budget and
-must be granted beside existing query holders. Width is a cost estimate, never a
-proof about subsequent keys. Run capacity growth transfers prepaid credit to
-that run's charge; temporary old/new buffer overlap borrows credit too. Unused
+plus run/partition metadata. The initial reservation is at most half the query
+budget and must be granted beside existing query holders. Width is a cost estimate, never a
+proof about subsequent keys. Dictionary strings use the dictionary payload per
+entry, including length and presence framing, rather than encoded column bytes
+per input row. This admission estimate leaves the other planner cost rules alone.
+Other key components retain their original estimate to preserve decode headroom.
+Run capacity growth transfers prepaid credit to that run's charge; temporary
+old/new buffer overlap borrows credit too. Any shortfall first draws the exact
+missing bytes from the shared ledger; exhausting the estimate alone never forces
+a rescan. A concurrent credit change relinquishes that draw before retrying. Unused
 credit returns before the partition owners fold the runs. A query with no
 surviving rows returns its whole reservation without ever choosing private runs.
 Tables and decode continue to draw their actual allocations from the same
@@ -29,8 +35,8 @@ ledger.
 
 A refused admission leaves every local accumulator available to the shared path.
 If later growth or folding refuses the budget, the whole attempt is freed and
-rescanned through shared partitions before the existing narrower retries. It
-never continues a fallback from partially moved accumulators. The bounded retry
+rescanned through shared partitions with the other cost rules preserved, before
+the existing narrower retries. It never continues a fallback from partially moved accumulators. The bounded retry
 chain has at most seven scans. Private runs are only offered for rescannable
 inputs. Allocation and spawn failures preserve cleanup and exact answers.
 

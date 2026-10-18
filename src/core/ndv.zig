@@ -24,6 +24,9 @@ pub const Stat = struct {
     dictionary_bytes: u64 = 0,
     column_bytes: u64 = 0,
     key_bytes: u64 = 0,
+    /// Dictionary strings correct the existing width hint for run admission. Other components keep their hint:
+    /// prepaying more for them can crowd out decode. Growth must still draw actual room for skew or later keys.
+    run_key_bytes: u64 = 0,
     string_keys: bool = false,
     union_attempted: bool = false,
     union_complete: bool = false,
@@ -232,6 +235,17 @@ fn nullBound(cm: schema.ColumnMetaData) u64 {
     return if (cm.statistics) |s| if (s.null_count == 0) 0 else 1 else 1;
 }
 
+fn dictionaryRunExtra(cm: schema.ColumnMetaData, rows: u64, h: schema.PageHeader) u64 {
+    if (cm.type != .BYTE_ARRAY) return 0;
+    const n: u64 = @intCast(h.dictionary_page_header.?.num_values);
+    if (n == 0) return 0;
+    const bytes: u64 = @intCast(h.uncompressed_page_size);
+    // PLAIN entries already include the u32 string length; serialized keys add a presence byte.
+    const width = bytes / n + @intFromBool(bytes % n != 0) + 1;
+    const raw: u64 = @intCast(@max(0, cm.total_uncompressed_size));
+    return rows *| width -| raw;
+}
+
 pub fn collect(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -303,6 +317,7 @@ pub fn collectRetaining(
     // A lone key's largest dictionary: the union holds about that many values at least.
     var widest: u64 = 0;
     var raw_key_bytes: u64 = 0;
+    var run_key_extra: u64 = 0;
     var known = false;
     for (refs.items) |ref| {
         const m = &metas[ref.file];
@@ -340,6 +355,7 @@ pub fn collectRetaining(
                 const file = files[ref.file];
                 const limit = file.headerLimit();
                 if (covers and reads.headers) if (dictSlice(file, ref.rg, cm)) |b| if (header(b, limit)) |h| {
+                    run_key_extra +|= dictionaryRunExtra(cm, rows, h);
                     known = true;
                     widest = @max(widest, @as(u64, @intCast(h.dictionary_page_header.?.num_values)));
                     break :blk @min(rows, @as(u64, @intCast(h.dictionary_page_header.?.num_values)) + nullBound(cm));
@@ -361,6 +377,8 @@ pub fn collectRetaining(
         stat.column_bytes +|= c;
     }
     stat.key_bytes = @max(@as(u64, @intCast(keys.len)) * 9, raw_key_bytes / @max(1, stat.rows));
+    stat.run_key_bytes = stat.key_bytes +| (run_key_extra / @max(1, stat.rows) +
+        @intFromBool(run_key_extra % @max(1, stat.rows) != 0));
     stat.hi = @min(stat.rows, sum_products);
     if (known and keys.len == 1 and stat.covered_rows == stat.rows) stat.entries = sums[0];
     if (known) {
@@ -936,6 +954,42 @@ test "ndv: dictionary headers accept the execution reader's legacy PLAIN_DICTION
         try h.write(&writer);
         try std.testing.expect(header(writer.bytes(), map_prefix) != null);
     }
+}
+
+test "ndv: run width corrects only dictionary strings and preserves other column hints" {
+    var cm: schema.ColumnMetaData = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .SNAPPY,
+        .num_values = 4_000_000,
+        .total_uncompressed_size = 66 * 4_000_000,
+        .total_compressed_size = 1,
+        .data_page_offset = 1,
+        .index_page_offset = null,
+        .dictionary_page_offset = 0,
+    };
+    var h: schema.PageHeader = .{
+        .type = .DICTIONARY_PAGE,
+        .uncompressed_page_size = 700_000 * (80 + 6 + 4),
+        .compressed_page_size = 1,
+        .crc = null,
+        .data_page_header = null,
+        .data_page_header_v2 = null,
+        .dictionary_page_header = .{ .num_values = 700_000, .encoding = .PLAIN, .is_sorted = null },
+    };
+    try std.testing.expectEqual(@as(u64, 25 * 4_000_000), dictionaryRunExtra(cm, 4_000_000, h));
+    h.uncompressed_page_size += 1;
+    try std.testing.expectEqual(@as(u64, 26 * 4_000_000), dictionaryRunExtra(cm, 4_000_000, h));
+    cm.type = .INT32;
+    cm.total_uncompressed_size = 5_000_000;
+    try std.testing.expectEqual(@as(u64, 0), dictionaryRunExtra(cm, 4_000_000, h));
+    cm.type = .BYTE_ARRAY;
+    cm.total_uncompressed_size = 100 * 4_000_000;
+    try std.testing.expectEqual(@as(u64, 0), dictionaryRunExtra(cm, 4_000_000, h));
+    cm.total_uncompressed_size = 66 * 4_000_000;
+    h.dictionary_page_header.?.num_values = 0;
+    try std.testing.expectEqual(@as(u64, 0), dictionaryRunExtra(cm, 4_000_000, h));
 }
 
 test "ndv: a buffer holding only the probed bytes gives the facts the whole file gives, at any budget" {

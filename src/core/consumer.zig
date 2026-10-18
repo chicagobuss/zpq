@@ -2080,7 +2080,7 @@ pub fn writeAggregateRows(
     encode: AggEncode,
 ) !u64 {
     const together = output_cols.len > 1 and num_rows >= parallel_encode_rows;
-    return writeAggregateRowsEncoded(arena, sink, output_cols, num_rows, codec, zstd, if (together) encode else .{});
+    return writeAggregateRowsEncoded(arena, sink, output_cols, num_rows, codec, zstd, if (together) encode else .{ .ledger = encode.ledger });
 }
 
 /// `writeAggregateRows` under `encode`, whatever the answer's size; the bytes written are the same for every `encode`.
@@ -7026,6 +7026,22 @@ test "writeAggregateRows: one worker, or a budget no two columns fit, starts no 
         _ = try writeAggregateRows(a, out.sink(), cols, n, .SNAPPY, .{}, encode);
         try std.testing.expectEqual(@as(usize, 0), spawn_util.failuresInjected());
     }
+}
+
+test "writeAggregateRows: a column encoded alone still draws from the ledger" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cols = try aggAnswerCols(a, 1000, null);
+    // One column, and few rows: no waves, but the column is the ledger's to refuse.
+    var ledger: expr_agg.SharedBudget = .{ .limit = 1 };
+    var out: AnswerCapture = .{ .a = a };
+    const encode: AggEncode = .{ .workers = 16, .budget = std.math.maxInt(u64), .ledger = &ledger };
+    const one = writeAggregateRows(a, out.sink(), cols[0..1], 1000, .SNAPPY, .{}, encode);
+    try std.testing.expectError(error.ExceededMemoryBudget, one);
+    ledger.limit = 1 << 30;
+    _ = try writeAggregateRows(a, out.sink(), cols, 1000, .SNAPPY, .{}, encode);
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }
 
 test "writeAggregateRows: on threads, an allocation failure frees everything" {

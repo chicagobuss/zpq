@@ -1086,6 +1086,7 @@ fn copyRGToBuffer(
     bloom_leaves: []const ?f64,
 ) !EncodedRG {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(gpa);
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
     var local_off: u64 = 0;
@@ -7522,6 +7523,35 @@ test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
     const rgs = metas[0].row_groups.items;
     try std.testing.expectEqual(@as(?[]const bool, null), plan.rowGroupColumns(&rgs[0], &metas[0]));
     try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false, false }, plan.rowGroupColumns(&rgs[7], &metas[0]).?);
+}
+
+test "a byte-copied row group its ledger refuses holds nothing after" {
+    const a = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/overflow_rows.parquet", a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const meta = try metadata.open(arena_state.allocator(), bytes);
+    const job: RGJob = .{ .bytes = bytes, .meta = &meta, .rg = &meta.row_groups.items[0] };
+    const kept: [5]bool = @splat(true);
+    var refused: usize = 0;
+    // Refused part way through the copy (its buffer grown, then refused), or not at all.
+    for ([_]usize{ 4 << 10, 16 << 10, 1 << 20 }) |limit| {
+        var ledger: core_memory.SharedBudget = .{ .limit = limit };
+        var charged: core_memory.Charged = .{ .child = a, .budget = &ledger };
+        const ca = charged.allocator();
+        if (copyRGToBuffer(ca, arena_state.allocator(), job, &kept, null, &.{})) |out| {
+            ca.free(out.bytes);
+        } else |err| {
+            try std.testing.expectEqual(error.ExceededMemoryBudget, charged.refusal(err));
+            refused += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(usize, 2), refused);
 }
 
 test "a deferred write row group slices on the write's ledger while it has room, else beside it on its own" {

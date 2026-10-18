@@ -1315,14 +1315,18 @@ fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
     }
     var surviving: i64 = 0;
     var done: usize = 0;
+    // One arena for every slice, its pages kept from one to the next; what a row took is measured on the first.
+    var slice = std.heap.ArenaAllocator.init(gpa);
+    defer slice.deinit();
+    var took: ?usize = null;
     while (done < num_rows) {
         const n = @min(slice_rows, num_rows - done);
         done += n;
-        var slice = std.heap.ArenaAllocator.init(gpa);
-        defer slice.deinit();
+        _ = slice.reset(.retain_capacity);
         defer if (ledger) |l| {
-            const took = @max(1, slice.queryCapacity() / n);
-            slice_rows = @min(num_rows, @max(64, @min(w.decode_share, l.available() / 2) / took / 64 * 64));
+            const kept = slice.queryCapacity();
+            if (took == null) took = @max(1, kept / n);
+            slice_rows = @min(num_rows, @max(64, @min(w.decode_share, l.available() / 2 + kept) / took.? / 64 * 64));
         };
         const sa = slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);

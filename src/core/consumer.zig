@@ -3006,14 +3006,19 @@ fn scanRGSliced(
     // factor (DELTA_BYTE_ARRAY copies a prefix into every one): the first slice is the least, each next is what the
     // reservation, or the ledger's room, holds at the bytes a row of the last one took.
     var rows_now = if (ws.ledger != null) @min(slice_rows, 64) else slice_rows;
+    // One arena for every slice, its pages kept from one to the next rather than faulted in afresh; what a row took is
+    // measured on the first, when the arena holds nothing else.
+    var slice = std.heap.ArenaAllocator.init(side);
+    defer slice.deinit();
+    var took: ?usize = null;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
         defer done += n;
-        var slice = std.heap.ArenaAllocator.init(side);
-        defer slice.deinit();
+        _ = slice.reset(.retain_capacity);
         defer if (ws.ledger) |l| {
-            const took = @max(1, slice.queryCapacity() / n);
-            rows_now = sliceRows(@min(reserved, l.available() / 2) / took, num_rows);
+            const kept = slice.queryCapacity();
+            if (took == null) took = @max(1, kept / n);
+            rows_now = sliceRows(@min(reserved, l.available() / 2 + kept) / took.?, num_rows);
         };
         const sa = slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);

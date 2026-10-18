@@ -84,6 +84,9 @@ def cells(fixtures):
     pq = ["-o", "-", "--format", "parquet"]
     out.append(("write/agg_carduniq", ["--query", f"SELECT k, count(*) AS c, sum(v) AS s FROM '{cu}' GROUP BY k"] + pq,
                 [cu]))
+    cz = f"{STUDY}/clustzipf.parquet"
+    out.append(("write/agg_clustzipf", ["--query", f"SELECT k, count(*) AS c, sum(v) AS s, max(x) AS m FROM '{cz}' "
+                                        f"GROUP BY k"] + pq, [cz]))
     out.append(("write/filter_card10m", [c10, "--filter", "f < 300"] + pq, [c10]))
     out.append(("write/select_lstr1m", [ls, "--columns", "k,v", "--filter", "f < 900"] + pq, [ls]))
     out.append(("write/copy_heavy", [hv] + pq, [hv]))

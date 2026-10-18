@@ -1154,6 +1154,16 @@ const WinCtx = struct {
     /// The one of them the row group being sliced draws from.
     slicing_now: ?*core_memory.Charged = null,
 
+    /// What a deferred row group's slices draw from (`slicing`, `lean`): the writer alone has the write's ledger and
+    /// the slack's room past it. Beside producers still fetching it has the write's ledger while that holds more than
+    /// the slack's worth, its own small ledger only once the write's is that short: never a wait on the producers,
+    /// whose fetches the writer's turn may be what frees.
+    fn slicingFor(w: *WinCtx, alone: bool) ?*core_memory.Charged {
+        const m = w.slicing orelse return null;
+        if (alone or m.budget.available() > core_memory.lean_decode) return m;
+        return w.lean;
+    }
+
     /// What output buffers are allocated through.
     fn outAlloc(w: *WinCtx) std.mem.Allocator {
         return if (w.memory) |m| m.allocator() else w.gpa;
@@ -1393,7 +1403,7 @@ fn winWriter(w: *WinCtx) void {
             defer if (w.slicing) |m| {
                 m.budget.limit -= slack;
             };
-            w.slicing_now = if (turns > 0 or w.memory == null) w.slicing else w.lean;
+            w.slicing_now = w.slicingFor(turns > 0);
             if (w.first_err == null) {
                 const before = w.new_row_groups.items.len;
                 const kept = encodeRGSliced(w, w.jobs[next], prof) catch |e| blk: {
@@ -7503,6 +7513,25 @@ test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
     const rgs = metas[0].row_groups.items;
     try std.testing.expectEqual(@as(?[]const bool, null), plan.rowGroupColumns(&rgs[0], &metas[0]));
     try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false, false }, plan.rowGroupColumns(&rgs[7], &metas[0]).?);
+}
+
+test "a deferred write row group slices on the write's ledger while it has room, else beside it on its own" {
+    var write_ledger: core_memory.SharedBudget = .{ .limit = 1 << 30 };
+    var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
+    var main: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &write_ledger };
+    var lean: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &lean_ledger };
+    var w: WinCtx = undefined;
+    w.slicing = &main;
+    w.lean = &lean;
+    // Alone, the writer always has the write's ledger (and the slack's room past it).
+    try std.testing.expectEqual(&main, w.slicingFor(true).?);
+    // Beside producers still fetching: the write's ledger while it has more than the slack's worth left.
+    try std.testing.expectEqual(&main, w.slicingFor(false).?);
+    _ = write_ledger.used.fetchAdd(write_ledger.limit - core_memory.lean_decode, .monotonic);
+    try std.testing.expectEqual(&lean, w.slicingFor(false).?);
+    try std.testing.expectEqual(&main, w.slicingFor(true).?);
+    w.slicing = null;
+    try std.testing.expectEqual(@as(?*core_memory.Charged, null), w.slicingFor(false));
 }
 
 test "regression: a row group in flight holds the write window's bytes for its own size, at most the whole window" {

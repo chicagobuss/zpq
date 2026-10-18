@@ -135,6 +135,9 @@ Numbers and trade-offs are dated and contextualised as they're captured. Harness
 DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED
 codecs, plus the deprecated LZ4 codec in each container writers used for it (parquet-mr's Hadoop framing, a bare LZ4
 block, an LZ4 frame); all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
+Row output and filters refuse repeated columns (LIST, MAP, legacy REPEATED); copies keep them. Bytes without a STRING
+annotation print as base64, UUIDs and INTERVALs in their own forms ([docs/binary-output.md](docs/binary-output.md)).
+Encrypted Parquet is refused: zpq does not decrypt.
 
 **Filter** with `= != <> < <= > >=`, `IN` / `NOT IN`, `[NOT] BETWEEN x AND y`, `[NOT] LIKE`, `IS [NOT] NULL`, `AND` /
 `OR` / `NOT` and grouping parentheses (nested at most 32 deep), plus row-group stat pruning and Hive-partition pruning

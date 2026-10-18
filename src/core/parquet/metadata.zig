@@ -22,11 +22,16 @@ const decimal = @import("decimal.zig");
 
 const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 const MAGIC_LEN: usize = MAGIC.len;
+/// The magic of a file whose footer is encrypted.
+const ENCRYPTED_MAGIC: [4]u8 = .{ 'P', 'A', 'R', 'E' };
 const FOOTER_LEN_LEN: usize = 4;
 
 pub const Error = error{
     TooSmall,
     BadMagic,
+    /// Parquet modular encryption: an encrypted footer, or a plaintext one over encrypted columns. zpq has no keys,
+    /// and a copy that carried the pages under a new footer without their crypto metadata could never be decrypted.
+    EncryptedFile,
     FooterTooLarge,
     BadMetadata,
     /// A column chunk's `path_in_schema` names a different column than the schema leaf at its position.
@@ -63,6 +68,7 @@ pub fn open(
 ) !schema.FileMetaData {
     if (file_bytes.len < MAGIC_LEN * 2 + FOOTER_LEN_LEN) return error.TooSmall;
 
+    if (hasEncryptedFooter(file_bytes)) return error.EncryptedFile;
     if (!std.mem.eql(u8, file_bytes[0..MAGIC_LEN], &MAGIC)) return error.BadMagic;
     const trailing_start = file_bytes.len - MAGIC_LEN;
     if (!std.mem.eql(u8, file_bytes[trailing_start..], &MAGIC)) return error.BadMagic;
@@ -82,6 +88,11 @@ pub fn open(
     return openFooter(allocator, footer_bytes);
 }
 
+/// True when `tail`, the end of a file, is the magic of an encrypted footer.
+pub fn hasEncryptedFooter(tail: []const u8) bool {
+    return tail.len >= MAGIC_LEN and std.mem.eql(u8, tail[tail.len - MAGIC_LEN ..], &ENCRYPTED_MAGIC);
+}
+
 /// True when `bytes` opens with the Parquet magic. A suffix fetch always checks the trailing magic; the leading
 /// magic is checked only for bytes a read already covered at offset 0.
 pub fn hasLeadingMagic(bytes: []const u8) bool {
@@ -98,6 +109,8 @@ pub fn openFooter(
     var reader = thrift.Reader.init(footer_bytes);
     var meta = schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
     errdefer meta.deinit(allocator);
+    if (meta.encrypted) return error.EncryptedFile;
+    for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| if (chunk.encrypted) return error.EncryptedFile;
     try checkFooterFields(&meta);
     try reconcileChunkPaths(allocator, &meta);
     return meta;
@@ -1482,4 +1495,20 @@ test "one output schema cannot describe two different opaque logical types" {
     var other = leaf;
     other.logical_type_raw = &.{ 0x0c, 0x24, 0, 0 };
     try std.testing.expectEqual(@as(?usize, 1), schemaMismatch(&.{ root, leaf }, &.{ root, other }, .exact));
+}
+
+test "encrypted Parquet is refused where its footer is opened, footer encrypted or not" {
+    const a = testing.allocator;
+    var pare = [_]u8{ 'P', 'A', 'R', 'E', 0, 0, 0, 0, 'P', 'A', 'R', 'E' };
+    try testing.expectError(error.EncryptedFile, open(a, &pare));
+    for ([_][]const u8{ "format_encrypted_footer", "format_encrypted_columns", "format_encrypted_plaintext" }) |name| {
+        var path_buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "ci/fixtures/parquet/{s}.parquet", .{name});
+        const bytes = readFileSlice(path, a) catch |err| {
+            if (err == error.FileNotFound) return error.SkipZigTest;
+            return err;
+        };
+        defer a.free(bytes);
+        try testing.expectError(error.EncryptedFile, open(a, bytes));
+    }
 }

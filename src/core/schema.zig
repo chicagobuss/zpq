@@ -1361,6 +1361,8 @@ pub const FileMetaData = struct {
     /// Per leaf, the `ColumnOrder` union member the writer declared (0 = an empty union). Null when the footer has no
     /// column_orders. Written from `outputColumnOrders`.
     column_orders: ?std.ArrayListUnmanaged(i16) = null,
+    /// Fields 8/9 (encryption_algorithm, footer_signing_key_metadata): a plaintext footer over encrypted columns.
+    encrypted: bool = false,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         const saved_id = reader.last_field_id;
@@ -1420,6 +1422,10 @@ pub const FileMetaData = struct {
                     if (meta.column_orders) |*co| co.deinit(allocator);
                     meta.column_orders = orders;
                 } else try reader.skip(field.type),
+                8, 9 => {
+                    meta.encrypted = true;
+                    try reader.skip(field.type);
+                },
                 else => try reader.skip(field.type),
             }
         }

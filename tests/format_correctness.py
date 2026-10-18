@@ -176,8 +176,27 @@ def repeated_fields(tmp):
     got = json.loads(query(src, '--filter', 'id > 2', '--columns', 'id', '--format', 'json').stdout)
     assert got == want, got
 
+def encrypted_inputs(tmp):
+    # zpq has no keys. A copy carried encrypted pages under a new footer without their crypto metadata: unreadable.
+    for name in ['format_encrypted_footer.parquet', 'format_encrypted_columns.parquet',
+                 'format_encrypted_plaintext.parquet']:
+        src = FIXTURES / name
+        out = tmp / 'encrypted-copy.parquet'
+        for args in [['--format', 'json'], ['--aggregate', 'count(*) AS n'], ['--limit', '1', '-o', str(out)],
+                     ['-o', str(out)], ['--explain', '--aggregate', 'count(*) AS n']]:
+            p = query(src, *args, ok=False)
+            assert p.returncode == 1 and 'encrypted Parquet' in p.stderr, (name, args, p.stderr)
+            assert not p.stdout and not out.exists(), (name, args)
+        p = subprocess.run([ZPQ, 'inspect', str(src), '--format', 'json'], capture_output=True, text=True, timeout=30)
+        if name == 'format_encrypted_footer.parquet':
+            assert p.returncode != 0 and 'EncryptedFile' in p.stdout, p.stdout
+        else:
+            # A plaintext footer is still inspectable metadata; its chunks say they are encrypted.
+            assert p.returncode == 0 and '"encrypted":true' in p.stdout, p.stdout
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
     repeated_fields(Path(directory))
+    encrypted_inputs(Path(directory))
 print('Format correctness regressions passed')

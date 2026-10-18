@@ -2629,7 +2629,7 @@ fn materializeMetas(
         defer span.end(.footer_parse, profile.args(.{ i, in.bytes.len }));
         metas[i] = metadata.open(arena, in.bytes) catch |err| {
             Diag.setInput(diag, in.name, err);
-            return error.NotParquet;
+            return if (err == error.EncryptedFile) err else error.NotParquet;
         };
     }
     return metas;
@@ -4138,6 +4138,7 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
 
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
+    if (metadata.hasEncryptedFooter(tail)) return error.EncryptedFile;
     if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
     if (footer_len + 8 > sp.total_size) return error.NotParquet;

@@ -236,6 +236,7 @@ fn handleS3(
     // 3. Locate the footer and fetch the missing prefix if needed.
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
+    if (metadata.hasEncryptedFooter(tail)) return error.EncryptedFile;
     if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
     // The length is the file's claim; one longer than the object would underflow the start below.

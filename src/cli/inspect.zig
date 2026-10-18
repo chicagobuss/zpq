@@ -70,7 +70,10 @@ const Source = struct {
     }
 
     fn footer(self: *Source) !schema.FileMetaData {
-        if (!std.mem.eql(u8, try self.range(0, 4, false), "PAR1")) return error.BadMagic;
+        // An encrypted footer's file opens with the same magic it ends with.
+        const head = try self.range(0, 4, false);
+        if (metadata.hasEncryptedFooter(head)) return error.EncryptedFile;
+        if (!std.mem.eql(u8, head, "PAR1")) return error.BadMagic;
         const tail = try self.range(self.size - 8, 8, false);
         if (!std.mem.eql(u8, tail[4..], "PAR1")) return error.BadMagic;
         const len = std.mem.readInt(u32, tail[0..4], .little);

@@ -94,6 +94,9 @@
 
 ### Fixes
 
+- Encrypted Parquet is refused on every path, naming the file (exit 1). A file with a plaintext footer over
+  encrypted columns was copied by `-o` with exit 0 into a file no key could decrypt: the new footer dropped the
+  columns' crypto metadata. An encrypted footer (`PARE`) was reported as an invalid file. zpq does not decrypt.
 - A legacy REPEATED field with no LIST or MAP annotation (a repeated primitive, or a field under a repeated group)
   printed one row per stored value, so `[[0,1,2,3],[],[4],[5,6,7,8]]` came out as four scalar rows; it is now refused
   in row output, as LIST and MAP columns are, naming the column (exit 2). A filter naming any repeated column is

@@ -127,6 +127,16 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.NoRegion => diagnosticPrint("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
         error.BadResponse => diagnosticPrint("zpq query: bad S3 HTTP response\n", .{}),
         error.TailTooSmall => diagnosticPrint("zpq query: file footer metadata tail too small\n", .{}),
+        error.EncryptedFile => if (diag.input) |in| diagnosticPrint(
+            "zpq query: input file {s}\n" ++
+                "  is encrypted Parquet; zpq does not decrypt, so it neither reads nor\n" ++
+                "  copies encrypted files\n",
+            .{in},
+        ) else diagnosticPrint(
+            "zpq query: an input file is encrypted Parquet; zpq does not decrypt,\n" ++
+                "  so it neither reads nor copies encrypted files\n",
+            .{},
+        ),
         error.NotParquet, error.BadMagic => if (diag.input) |in| diagnosticPrint(
             "zpq query: input file {s} is not a valid Parquet file ({s})\n",
             .{ in, causeName(diag) },

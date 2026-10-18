@@ -3021,7 +3021,7 @@ fn prepareAggregate(
             .ok => |parsed| break :blk parsed,
             .failed => |f| {
                 Diag.setInput(args.diag, args.inputs[f.index].name, f.err);
-                return error.NotParquet;
+                return if (f.err == error.EncryptedFile) error.EncryptedFile else error.NotParquet;
             },
         }
     };

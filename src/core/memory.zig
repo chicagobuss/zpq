@@ -4,8 +4,9 @@
 //! before they allocate, so what a query holds at once stays under the one limit, whatever `-j` is. Fixed costs the
 //! ledger does not see are the slack the ceiling documents: the binary, thread stacks, the input's mapping, allocator
 //! bookkeeping, each scan worker's first huge page of decode memory, the first `finalize_allowance` bytes a GROUP BY's
-//! merge and answer hold beside its tables, and a ledger of `lean_decode` bytes of its own for one decode: a refusal
-//! chain's last scan (`scan.narrowed`), or a write's row group sliced on its writer.
+//! merge and answer hold beside its tables, and `lean_decode` bytes for one decode: a refusal chain's last scan
+//! (`scan.narrowed`), or a write's row group sliced on its writer (past the write's limit while its producers are
+//! idle, else on a ledger of its own).
 
 const std = @import("std");
 const builtin = @import("builtin");

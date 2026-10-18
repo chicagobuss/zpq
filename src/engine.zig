@@ -1146,9 +1146,13 @@ const WinCtx = struct {
     /// The query's ledger, through which the encoded row groups in flight and the writer's slices are allocated, and
     /// which the producers' regions draw from (`runWriteOver`). Null: `gpa`, uncharged.
     memory: ?*core_memory.Charged = null,
-    /// Under a ledger, what the writer's slices are allocated through: a ledger of `memory.lean_decode` bytes of its
-    /// own, the ceiling's slack, as a refused scan's last retry decodes on. The producers are idle while it slices.
+    /// Under a ledger, what the writer's slices are allocated through, straight from the OS: the write's ledger, with
+    /// `memory.lean_decode` more room (the ceiling's slack) while the writer slices alone, its producers idle; or,
+    /// over fetched inputs, where producers go on beside it, a ledger of `lean_decode` bytes of its own (`lean`).
     slicing: ?*core_memory.Charged = null,
+    lean: ?*core_memory.Charged = null,
+    /// The one of them the row group being sliced draws from.
+    slicing_now: ?*core_memory.Charged = null,
 
     /// What output buffers are allocated through.
     fn outAlloc(w: *WinCtx) std.mem.Allocator {
@@ -1270,7 +1274,7 @@ fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) error{RowGroupTooL
 /// sink: each slice decodes (`consumer.SliceReader`), filters and encodes on memory of its own, so neither the decoded
 /// rows nor the output are ever held whole. Runs on the writer, in the row group's turn; returns the rows written.
 fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
-    const gpa = if (w.slicing) |m| m.allocator() else w.gpa;
+    const gpa = if (w.slicing_now) |m| m.allocator() else w.gpa;
     const rg = job.rg;
     const num_rows: usize = @intCast(@max(0, rg.num_rows));
     const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
@@ -1300,7 +1304,7 @@ fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
     var slice_rows = std.math.clamp(w.decode_share / per_row, 1, num_rows);
     // Under a ledger, slices are cut by the bytes rows took, as an aggregate's are (`consumer.scanRGSliced`), within
     // half its room: the footer's estimate can understate values by any factor. The first is the least.
-    const ledger: ?*const core_memory.SharedBudget = if (w.slicing) |m| m.budget else null;
+    const ledger: ?*const core_memory.SharedBudget = if (w.slicing_now) |m| m.budget else null;
     if (ledger != null) slice_rows = @min(slice_rows, 64);
 
     var timings: consumer.Timings = .{ .prof = prof };
@@ -1378,10 +1382,18 @@ fn winWriter(w: *WinCtx) void {
                 r.rows.trim();
                 r.work.trim();
             };
+            // Alone, the writer has the slack's room for one decode beside what the write holds; beside producers, it
+            // has that room as a ledger of its own.
+            const slack = if (turns > 0) core_memory.lean_decode else 0;
+            if (w.slicing) |m| m.budget.limit += slack;
+            defer if (w.slicing) |m| {
+                m.budget.limit -= slack;
+            };
+            w.slicing_now = if (turns > 0 or w.memory == null) w.slicing else w.lean;
             if (w.first_err == null) {
                 const before = w.new_row_groups.items.len;
                 const kept = encodeRGSliced(w, w.jobs[next], prof) catch |e| blk: {
-                    w.first_err = if (w.slicing) |m| m.refusal(e) else e;
+                    w.first_err = if (w.slicing_now) |m| m.refusal(e) else e;
                     break :blk 0;
                 };
                 w.rows_kept += kept;
@@ -2376,8 +2388,9 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             // its slices hold no more than the budget together, past each producer's first huge page.
             var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
             var memory: core_memory.Charged = .{ .child = ctx.gpa, .budget = &ledger };
+            var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &ledger };
             var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
-            var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &lean_ledger };
+            var lean: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &lean_ledger };
             const regions = try arena.alloc(WorkRegions, @max(effective_async_budget, 1));
             for (regions) |*r| {
                 r.* = .init(ctx.gpa);
@@ -2391,6 +2404,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             var w = WinCtx{
                 .memory = &memory,
                 .slicing = &slicing,
+                .lean = &lean,
                 .win_unit = sizing.unit,
                 .win_units = sizing.units,
                 .gpa = ctx.gpa,

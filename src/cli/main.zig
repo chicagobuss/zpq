@@ -585,7 +585,7 @@ fn runQuery(
                 owns_fd = true;
             }
             var w: StdoutWriter = .{ .fd = fd };
-            try engine.writeAggregateText(&w, answer, rows, fmt);
+            try engine.writeAggregateText(&w, answer, ar.text_kinds, rows, fmt);
             try w.flush();
             text_bytes_out = if (w.inner) |inner| inner.bytes_written else 0;
             if (owns_fd) {

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Format regressions with independent readers; invoked by cli_smoke.sh."""
+import base64
 import json
+import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 
 import duckdb
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 ZPQ = str(Path(sys.argv[1]).resolve())
@@ -19,6 +23,12 @@ def query(src, *args, ok=True):
         assert p.returncode == 0, (p.returncode, p.stderr)
     else:
         assert p.returncode > 0, (p.returncode, p.stdout, p.stderr)
+    return p
+
+
+def sql_query(sql, *args):
+    p = subprocess.run([ZPQ, 'query', '--query', sql, '-j', '1', *args], capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, (p.returncode, p.stderr)
     return p
 
 
@@ -51,6 +61,90 @@ def logical_annotations(tmp):
             assert got.equals(expected.rename_columns(['renamed'])), got
 
 
+def raw_values(src):
+    """Column `v`'s values as the bytes stored, whatever type the reader maps the annotation to."""
+    col = pq.read_table(src).column('v').combine_chunks()
+    return (col.storage if isinstance(col, pa.ExtensionArray) else col).to_pylist()
+
+
+def as_text(value, kind):
+    if value is None:
+        return None
+    if kind == 'uuid':
+        h = value.hex()
+        return f'{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}'
+    if kind == 'interval':
+        return dict(zip(['months', 'days', 'millis'], struct.unpack('<III', value)))
+    return base64.b64encode(value).decode('ascii')
+
+
+def binary_text(tmp):
+    blob = tmp / 'blob.parquet'
+    # Distinct values that U+FFFD replacement printed alike, a 3n+1 length for padding, and one past a 3072-byte chunk.
+    pq.write_table(pa.table({'v': [b'\xff', b'\xfe', b'ASCII', b'', None, b'\x00', b'\xff', bytes(range(256)) * 13]}),
+                   blob)
+    uuids = tmp / 'uuid.parquet'
+    pq.write_table(pa.table({'v': pa.array([b'\xff' * 16, b'\xfe' * 16, None, bytes(range(16))],
+                                           pa.binary(16)).cast(pa.uuid())}), uuids)
+    flba = tmp / 'flba.parquet'
+    pq.write_table(pa.table({'v': pa.array([b'\xff\x00', b'\xfe\x00', None], pa.binary(2))}), flba)
+    cases = [(blob, 'base64'), (uuids, 'uuid'), (flba, 'base64'), (FIXTURES / 'format_geometry.parquet', 'base64'),
+             (FIXTURES / 'format_bson.parquet', 'base64'), (FIXTURES / 'format_interval.parquet', 'interval')]
+    lib = None
+    if os.environ.get('ZPQ_LIB'):
+        sys.path.insert(0, str(FIXTURES.parents[2] / 'python'))
+        import zpq
+        lib = zpq.Zpq(max_memory='256MB')
+    for src, kind in cases:
+        values = raw_values(src)
+        rows = [{'v': as_text(v, kind)} for v in values]
+        assert len({json.dumps(r) for r in rows}) == len(set(values)), src
+        for args, want in [([], rows), (['--limit', '2'], rows[:2]),
+                           (['--filter', 'v IS NOT NULL'], [r for r in rows if r['v'] is not None])]:
+            for fmt in ['json', 'ndjson']:
+                out = query(src, *args, '--format', fmt).stdout
+                got = json.loads(out) if fmt == 'json' else [json.loads(line) for line in out.splitlines()]
+                assert got == want, (src, args, fmt, want, got)
+        # A bare alias of a nullable column is refused (`NullableNotSupported`) before any value is printed.
+        if None not in values:
+            renamed = json.loads(query(src, '--select', 'v AS renamed', '--format', 'json').stdout)
+            assert renamed == [{'renamed': r['v']} for r in rows], (src, renamed)
+        sql = json.loads(sql_query(f"SELECT v FROM '{src}' LIMIT 2 OFFSET 1", '--format', 'json').stdout)
+        assert sql == rows[1:3], (src, sql)
+        present = [v for v in values if v is not None]
+        for args in [[], ['--scan-all']]:
+            got = json.loads(query(src, '--aggregate', 'min(v) AS lo,max(v) AS hi', *args, '--format', 'json').stdout)
+            assert got == [{'lo': as_text(min(present), kind), 'hi': as_text(max(present), kind)}], (src, got)
+        counts = {}
+        for v in values:
+            counts[v] = counts.get(v, 0) + 1
+        want = sorted(json.dumps({'v': as_text(v, kind), 'n': n}) for v, n in counts.items())
+        for args in [[], ['--max-memory', '64MB']]:
+            got = json.loads(query(src, '--group-by', 'v', '--aggregate', 'count(*) AS n', *args, '--format',
+                                   'json').stdout)
+            assert sorted(json.dumps(r) for r in got) == want, (src, got)
+        # An explanation names columns and counts; it never prints a value.
+        json.loads(query(src, '--aggregate', 'min(v) AS lo', '--explain').stdout)
+        if lib:
+            for sql in [f"SELECT * FROM '{src}'", f"SELECT min(v) AS lo, max(v) AS hi FROM '{src}'",
+                        f"SELECT v, count(*) AS n FROM '{src}' GROUP BY v"]:
+                assert lib.query_raw(sql, parallelism=1) == sql_query(sql).stdout, sql
+    invalid = tmp / 'invalid-string.parquet'
+    bad = pa.Array.from_buffers(pa.string(), 2, [None, pa.py_buffer(struct.pack('<iii', 0, 1, 3)),
+                                                 pa.py_buffer(b'\xff\xfe\x80')])
+    pq.write_table(pa.table({'bad': bad}), invalid)
+    for args in [[], ['--limit', '1'], ['--aggregate', 'min(bad) AS lo'],
+                 ['--aggregate', 'max(bad) AS hi', '--scan-all'], ['--group-by', 'bad', '--aggregate', 'count(*) AS n']]:
+        p = query(invalid, *args, ok=False)
+        assert 'not valid UTF-8' in p.stderr and '`bad`' in p.stderr, (args, p.stderr)
+    if lib:
+        for sql in [f"SELECT * FROM '{invalid}'", f"SELECT max(bad) AS hi FROM '{invalid}'"]:
+            response = lib.run({'sql': sql}, check=False)
+            assert response.get('reason') == 'InvalidUtf8' and response.get('column') == 'bad', response
+        lib.close()
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
+    binary_text(Path(directory))
 print('Format correctness regressions passed')

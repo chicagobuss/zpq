@@ -29,6 +29,9 @@ usage:
                  is an array of row objects. `parquet` can stream to
                  stdout, but refuses a terminal. No extension inference.
                  CSV is reserved and not supported yet (exit 2).
+                 STRING/ENUM/JSON values print as text; other bytes
+                 as base64, UUID as 8-4-4-4-12, INTERVAL as an object
+                 (docs/binary-output.md). Non-UTF-8 STRING: exit 1.
   --limit        cap final answer rows, including aggregates and files.
                  SQL LIMIT has the same meaning; do not combine them.
   --summary=json emit a typed summary on stderr after output completes;

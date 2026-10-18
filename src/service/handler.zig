@@ -543,7 +543,7 @@ fn executeSql(
         defer result.deinit(allocator);
         const answer = result.aggregate.output;
         const n: usize = if (answer.group_rows) |groups| groups.len else if (qa.empty_scalar or answer.no_row) 0 else 1;
-        try engine.writeAggregateText(&rows.writer, answer, n, .jsonl);
+        try engine.writeAggregateText(&rows.writer, answer, result.aggregate.text_kinds, n, .jsonl);
     } else {
         _ = try engine.runPrintSink(
             ctx,
@@ -843,7 +843,7 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
                 if (col_idx > 0) try w.writeByte(',');
                 try engine.writeJsonQuoted(w, col_name);
                 try w.writeByte(':');
-                try engine.writeAggValueJson(w, row_vals[col_idx]);
+                try engine.writeTypedAggValueJson(w, row_vals[col_idx], engine.kindAt(ar.text_kinds, col_idx));
             }
             try w.writeByte('}');
         }
@@ -857,7 +857,7 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
             if (i > 0) try w.writeByte(',');
             try engine.writeJsonQuoted(w, item.alias);
             try w.writeByte(':');
-            try engine.writeAggValueJson(w, item.value);
+            try engine.writeTypedAggValueJson(w, item.value, engine.kindAt(ar.text_kinds, i));
         }
         try w.writeByte('}');
     }

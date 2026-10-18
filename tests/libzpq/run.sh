@@ -26,3 +26,4 @@ ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/test_python.py
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/differential.py
 
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/sql_differential.py
+ZPQ_LIB="$lib/libzpq.so" "$PY" tests/format_correctness.py zig-out/bin/zpq

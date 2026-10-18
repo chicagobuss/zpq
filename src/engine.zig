@@ -425,9 +425,12 @@ pub const AggResult = struct {
     timings: Timings,
     /// The answer, owned in `Context.gpa`.
     output: scan.AggOutput,
+    /// How each answer column's byte values are printed (`writeAggregateText`), owned in `Context.gpa`.
+    text_kinds: []const TextKind = &.{},
 
     pub fn deinit(self: *AggResult, gpa: std.mem.Allocator) void {
         self.output.deinit(gpa);
+        gpa.free(self.text_kinds);
     }
 };
 
@@ -760,6 +763,8 @@ fn executeAggregateOver(
     if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
     const program: ResultProgram = .{ .order = args.result_order, .visible = r.visible_cols };
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
+    const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);
+    errdefer ctx.gpa.free(text_kinds);
     // Without GROUP BY, the aggregates shown: the hidden HAVING terms follow them.
     const n_aggs = if (r.output.group_rows == null) r.visible_cols orelse r.state.agg_calls.len else r.state.agg_calls.len;
 
@@ -807,7 +812,43 @@ fn executeAggregateOver(
         .membership = probed,
         .timings = t,
         .output = r.output,
+        .text_kinds = text_kinds,
     };
+}
+
+/// The `TextKind` of each answer column, from the column its values pass through. With `check`, a text answer: its
+/// STRING values are checked to be UTF-8 before any is printed, the column named on one that is not.
+fn answerTextKinds(
+    gpa: std.mem.Allocator,
+    out: scan.AggOutput,
+    state: scan.ScanState,
+    check: bool,
+    diag: ?*Diag,
+) ![]TextKind {
+    if (out.typed != null) return &.{};
+    const grouped = out.group_cols != null;
+    const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
+    const kinds = try gpa.alloc(TextKind, n);
+    errdefer gpa.free(kinds);
+    for (kinds, 0..) |*kind, ci| {
+        const source: ?schema.SchemaElement = if (grouped)
+            (if (state.group_col_types) |types| (if (ci < types.len) types[ci].source else null) else null)
+        else if (ci < state.agg_sources.len) state.agg_sources[ci] else null;
+        kind.* = TextKind.ofSource(source);
+        if (!check or kind.* != .utf8) continue;
+        const name = if (source) |src| src.name else if (out.group_cols) |cols| cols[ci] else out.aggs[ci].alias;
+        if (out.group_rows) |rows| {
+            for (rows) |row| try checkUtf8(row[ci], name, diag);
+        } else if (!grouped) try checkUtf8(out.aggs[ci].value, name, diag);
+    }
+    return kinds;
+}
+
+fn checkUtf8(v: scan.AggValue, name: []const u8, diag: ?*Diag) !void {
+    if (v == .s and !std.unicode.utf8ValidateSlice(v.s)) {
+        Diag.setColumn(diag, name);
+        return error.InvalidUtf8;
+    }
 }
 
 // ============================================================
@@ -4692,7 +4733,13 @@ fn createFile(path: []const u8) !local_fs.fd_t {
 pub const PrintFormat = enum { csv, jsonl, json, parquet };
 
 /// Shared text serialization keeps SQL ABI responses byte-identical to CLI rows.
-pub fn writeAggregateText(writer: anytype, answer: scan.AggOutput, rows: usize, format: PrintFormat) !void {
+pub fn writeAggregateText(
+    writer: anytype,
+    answer: scan.AggOutput,
+    kinds: []const TextKind,
+    rows: usize,
+    format: PrintFormat,
+) !void {
     if (format == .json) try writer.writeByte('[');
     if (answer.group_rows) |groups| {
         for (groups, 0..) |values, ri| {
@@ -4703,7 +4750,7 @@ pub fn writeAggregateText(writer: anytype, answer: scan.AggOutput, rows: usize, 
                 try writer.writeByte('"');
                 try writeJsonString(writer, name);
                 try writer.writeAll("\":");
-                try writeAggValueJson(writer, value);
+                try writeTypedAggValueJson(writer, value, kindAt(kinds, ci));
             }
             try writer.writeAll(if (format == .json) "}" else "}\n");
         }
@@ -4714,7 +4761,7 @@ pub fn writeAggregateText(writer: anytype, answer: scan.AggOutput, rows: usize, 
             try writer.writeByte('"');
             try writeJsonString(writer, item.alias);
             try writer.writeAll("\":");
-            try writeAggValueJson(writer, item.value);
+            try writeTypedAggValueJson(writer, item.value, kindAt(kinds, ci));
         }
         try writer.writeAll(if (format == .json) "}" else "}\n");
     }
@@ -4731,6 +4778,8 @@ pub const StdoutWriter = struct {
     json_array: bool = false,
     skip_remaining: usize = 0,
     parquet: ?*ParquetPrint = null,
+    /// Names the column of a value that cannot be printed (`TextKind`).
+    diag: ?*Diag = null,
 
     pub fn writeAll(self: *StdoutWriter, bytes: []const u8) !void {
         var i: usize = 0;
@@ -5024,6 +5073,17 @@ pub fn writeMembershipJson(writer: anytype, s: membership.Stats) !void {
     );
 }
 
+/// Column `ci`'s kind; a computed string's, when none is known.
+pub fn kindAt(kinds: []const TextKind, ci: usize) TextKind {
+    return if (ci < kinds.len) kinds[ci] else .utf8;
+}
+
+/// `v` as `writeAggValueJson` writes it, its bytes in the form `kind` gives them.
+pub fn writeTypedAggValueJson(writer: anytype, v: scan.AggValue, kind: TextKind) !void {
+    if (v == .s) return writeBytesJson(writer, v.s, kind);
+    return writeAggValueJson(writer, v);
+}
+
 pub fn writeAggValueJson(writer: anytype, v: scan.AggValue) !void {
     switch (v) {
         .i => |x| try writer.print("{d}", .{x}),
@@ -5055,12 +5115,21 @@ pub fn writeJsonQuoted(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
 }
 
-/// The body of a JSON string: quotes, backslashes and control characters escaped. JSON text must be UTF-8 and parquet
-/// strings need not be, so each byte that does not start a valid UTF-8 sequence (stray continuation bytes, bad
-/// leads, truncated, overlong or surrogate encodings) is written as U+FFFD, one per byte, as Python's
-/// `errors="replace"` and most decoders do for lone bytes. Valid sequences pass through; U+2028/U+2029 are escaped
-/// so the output also stays valid JavaScript.
+/// The body of a JSON string: quotes, backslashes and control characters escaped. For names and messages, not values:
+/// each byte that does not start a valid UTF-8 sequence (stray continuation bytes, bad leads, truncated, overlong or
+/// surrogate encodings) is written as U+FFFD, one per byte, as Python's `errors="replace"` and most decoders do for
+/// lone bytes. Valid sequences pass through; U+2028/U+2029 are escaped so the output also stays valid JavaScript.
 pub fn writeJsonString(writer: anytype, s: []const u8) !void {
+    return escapeJson(writer, s, false);
+}
+
+/// A STRING value's JSON string body. Replacing a byte would print distinct values alike, so a value that is not
+/// UTF-8 fails with `InvalidUtf8` instead: a STRING column must hold UTF-8, and bytes are `TextKind.base64`.
+pub fn writeJsonText(writer: anytype, s: []const u8) !void {
+    return escapeJson(writer, s, true);
+}
+
+fn escapeJson(writer: anytype, s: []const u8, comptime strict: bool) !void {
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
@@ -5092,9 +5161,92 @@ pub fn writeJsonString(writer: anytype, s: []const u8) !void {
             }
             i += len;
         } else {
+            if (strict) return error.InvalidUtf8;
             try writer.writeAll("\u{FFFD}");
             i += 1;
         }
+    }
+}
+
+/// How a byte value is written as JSON text, from its column's annotation. Only UTF-8 text is written as it is; any
+/// other bytes would collide once escaped, so they take a lossless form (`docs/binary-output.md`).
+pub const TextKind = enum {
+    utf8,
+    /// Standard alphabet, padded.
+    base64,
+    /// Canonical lowercase 8-4-4-4-12.
+    uuid,
+    /// The legacy FLBA(12) INTERVAL as `{"months":m,"days":d,"millis":ms}`.
+    interval,
+
+    /// An unrecognized logical annotation falls back to the legacy one, as the format allows.
+    pub fn of(elem: schema.SchemaElement) TextKind {
+        if (elem.logical_type) |lt| switch (lt) {
+            .STRING, .ENUM, .JSON => return .utf8,
+            .UUID => return .uuid,
+            .UNKNOWN => {},
+            else => return .base64,
+        };
+        if (elem.converted_type) |ct| switch (ct) {
+            .UTF8, .ENUM, .JSON => return .utf8,
+            .INTERVAL => return .interval,
+            else => {},
+        };
+        return .base64;
+    }
+
+    /// A value whose source column is known; a computed string (no source) is text.
+    pub fn ofSource(source: ?schema.SchemaElement) TextKind {
+        return if (source) |src| of(src) else .utf8;
+    }
+};
+
+/// `value` as a JSON value of `kind`. A UUID or INTERVAL of the wrong width is not one: `InvalidBinaryValue`.
+pub fn writeBytesJson(writer: anytype, value: []const u8, kind: TextKind) !void {
+    switch (kind) {
+        .utf8 => {
+            try writer.writeByte('"');
+            try writeJsonText(writer, value);
+            try writer.writeByte('"');
+        },
+        .base64 => {
+            try writer.writeByte('"');
+            var buf: [4096]u8 = undefined;
+            var rest = value;
+            while (rest.len > 0) {
+                // A whole number of 3-byte groups a chunk, so only the last one pads.
+                const n = @min(rest.len, buf.len / 4 * 3);
+                try writer.writeAll(std.base64.standard.Encoder.encode(&buf, rest[0..n]));
+                rest = rest[n..];
+            }
+            try writer.writeByte('"');
+        },
+        .uuid => {
+            if (value.len != 16) return error.InvalidBinaryValue;
+            const hex = "0123456789abcdef";
+            var text: [38]u8 = undefined;
+            text[0] = '"';
+            var at: usize = 1;
+            for (value, 0..) |b, i| {
+                if (i == 4 or i == 6 or i == 8 or i == 10) {
+                    text[at] = '-';
+                    at += 1;
+                }
+                text[at] = hex[b >> 4];
+                text[at + 1] = hex[b & 15];
+                at += 2;
+            }
+            text[at] = '"';
+            try writer.writeAll(&text);
+        },
+        .interval => {
+            if (value.len != 12) return error.InvalidBinaryValue;
+            try writer.print("{{\"months\":{d},\"days\":{d},\"millis\":{d}}}", .{
+                std.mem.readInt(u32, value[0..4], .little),
+                std.mem.readInt(u32, value[4..8], .little),
+                std.mem.readInt(u32, value[8..12], .little),
+            });
+        },
     }
 }
 
@@ -5146,9 +5298,7 @@ fn printCell(
             } else {
                 const val = tb.values.items[row_idx];
                 if (is_jsonl) {
-                    try writer.writeByte('"');
-                    try writeJsonString(writer, val);
-                    try writer.writeByte('"');
+                    try writeBytesJson(writer, val, TextKind.of(elem));
                 } else {
                     try writeCsvString(writer, val);
                 }
@@ -6383,7 +6533,12 @@ fn flushAggregator(
                 if (col_idx > 0) try writer.writeAll(",");
                 try writeJsonQuoted(writer, names[col_idx]);
                 try writer.writeByte(':');
-                try printCell(writer, col, row_idx, agg.schema_elems[col_idx], true);
+                printCell(writer, col, row_idx, agg.schema_elems[col_idx], true) catch |err| {
+                    if (err == error.InvalidUtf8 or err == error.InvalidBinaryValue) {
+                        Diag.setColumn(writer.diag, names[col_idx]);
+                    }
+                    return err;
+                };
             }
             try writer.writeAll(if (writer.json_array) "}" else "}\n");
         } else {
@@ -6619,6 +6774,7 @@ fn runPrintSinkOver(
         .json_array = format == .json,
         .skip_remaining = offset,
         .parquet = if (format == .parquet) &parquet else null,
+        .diag = args.diag,
     };
     defer stdout_writer.flush() catch {};
 
@@ -7066,6 +7222,81 @@ test "writeJsonString: escapes, and replaces invalid UTF-8 with U+FFFD per byte"
         try std.testing.expectEqualStrings(c.want, aw.written());
         try std.testing.expect(std.unicode.utf8ValidateSlice(aw.written()));
     }
+}
+
+test "writeBytesJson: lossless bytes, UUID and INTERVAL text; a STRING value that is not UTF-8 fails" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, kind: TextKind, want: []const u8 }{
+        .{ .in = "\xff", .kind = .base64, .want = "\"/w==\"" },
+        .{ .in = "\xfe", .kind = .base64, .want = "\"/g==\"" },
+        .{ .in = "", .kind = .base64, .want = "\"\"" },
+        .{ .in = "ab", .kind = .base64, .want = "\"YWI=\"" },
+        .{ .in = "abc", .kind = .base64, .want = "\"YWJj\"" },
+        .{ .in = "caf\xc3\xa9\n", .kind = .utf8, .want = "\"caf\xc3\xa9\\n\"" },
+        .{
+            .in = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\xfe\xff",
+            .kind = .uuid,
+            .want = "\"00010203-0405-0607-0809-0a0b0c0dfeff\"",
+        },
+        .{
+            .in = "\x01\x00\x00\x00\xff\xff\xff\xff\x80\xee\x36\x00",
+            .kind = .interval,
+            .want = "{\"months\":1,\"days\":4294967295,\"millis\":3600000}",
+        },
+    };
+    for (cases) |c| {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        try writeBytesJson(&aw.writer, c.in, c.kind);
+        try std.testing.expectEqualStrings(c.want, aw.written());
+    }
+    // Past one 3072-byte chunk: padding only at the very end, and the text decodes back to the bytes.
+    var long: [3074]u8 = undefined;
+    for (&long, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try writeBytesJson(&aw.writer, &long, .base64);
+    const text = aw.written()[1 .. aw.written().len - 1];
+    try std.testing.expectEqual(@as(?usize, text.len - 1), std.mem.indexOfScalar(u8, text, '='));
+    var back: [3074]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&back, text);
+    try std.testing.expectEqualSlices(u8, &long, &back);
+
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.InvalidUtf8, writeBytesJson(&sink.writer, "a\xff", .utf8));
+    try std.testing.expectError(error.InvalidBinaryValue, writeBytesJson(&sink.writer, "short", .uuid));
+    try std.testing.expectError(error.InvalidBinaryValue, writeBytesJson(&sink.writer, "short", .interval));
+}
+
+test "TextKind: text annotations print as text, UUID and INTERVAL by type, any other bytes as base64" {
+    var elem: schema.SchemaElement = .{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "v",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    try std.testing.expectEqual(TextKind.base64, TextKind.of(elem));
+    elem.converted_type = .UTF8;
+    try std.testing.expectEqual(TextKind.utf8, TextKind.of(elem));
+    // An annotation this reader does not interpret falls back to the legacy one.
+    elem.logical_type = .{ .UNKNOWN = .{} };
+    try std.testing.expectEqual(TextKind.utf8, TextKind.of(elem));
+    elem.converted_type = .BSON;
+    elem.logical_type = .{ .BSON = .{} };
+    try std.testing.expectEqual(TextKind.base64, TextKind.of(elem));
+    elem.logical_type = .{ .JSON = .{} };
+    try std.testing.expectEqual(TextKind.utf8, TextKind.of(elem));
+    elem.logical_type = null;
+    elem.converted_type = .INTERVAL;
+    try std.testing.expectEqual(TextKind.interval, TextKind.of(elem));
+    elem.converted_type = null;
+    elem.logical_type = .{ .UUID = .{} };
+    try std.testing.expectEqual(TextKind.uuid, TextKind.of(elem));
+    try std.testing.expectEqual(TextKind.utf8, TextKind.ofSource(null));
 }
 
 test "S3 range plan: GROUP BY with no aggregates plans like the scan" {

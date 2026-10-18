@@ -52,6 +52,16 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.MissingOutputOrAggregate => diagnosticPrint("zpq query: missing --output or --aggregate\n", .{}),
         error.SchemaMismatch => diagnosticPrint("zpq query: schema mismatch across inputs\n", .{}),
+        error.InvalidUtf8 => diagnosticPrint(
+            "zpq query: column `{s}` holds a STRING value that is not valid UTF-8;\n" ++
+                "  the file is invalid (a STRING, ENUM or JSON column must be UTF-8)\n",
+            .{diag.column.get()},
+        ),
+        error.InvalidBinaryValue => diagnosticPrint(
+            "zpq query: column `{s}` holds a UUID or INTERVAL value of the wrong width;\n" ++
+                "  the file is invalid (UUID is 16 bytes, INTERVAL 12)\n",
+            .{diag.column.get()},
+        ),
         error.NestedRowOutputNotSupported => diagnosticPrint(
             "zpq query: nested LIST/MAP columns are not supported in row output yet\n",
             .{},

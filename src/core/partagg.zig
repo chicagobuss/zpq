@@ -50,6 +50,11 @@ pub const Run = struct {
         return self.first.items.len;
     }
 
+    fn keyEnd(current: usize, additional: usize) error{ExceededMemoryBudget}!u32 {
+        const end = std.math.add(usize, current, additional) catch return error.ExceededMemoryBudget;
+        return std.math.cast(u32, end) orelse error.ExceededMemoryBudget;
+    }
+
     fn key(self: *const Run, stride: u8, i: usize) []const u8 {
         if (stride != 0) return self.keys.items[i * stride ..][0..stride];
         const lo: usize = if (i == 0) 0 else self.ends.items[i - 1];
@@ -95,6 +100,8 @@ pub const Local = struct {
     /// Still on the plain fold: whole windows of `armed_window` rows into one table that never flushes, until it
     /// holds `spill_groups` groups at fewer than `spill_rows` rows each. Then it flushes once and scatters.
     armed: bool = false,
+    private: bool = false,
+    private_checked: bool = false,
 };
 
 /// Rows an armed worker folds before looking at its table again. Large, as a window's fixed cost (the coded path
@@ -126,6 +133,15 @@ pub const PartAgg = struct {
     /// Workers merge straight into the partition tables under their locks instead of appending to runs. Long keys
     /// gain: each is held once, in its partition, rather than once per worker and again in a run.
     shared: bool = false,
+    /// A prepaid ceiling for private run capacities, including a growth's old/new buffer overlap.
+    run_credit: std.atomic.Value(usize) = .init(0),
+    private_metadata: usize = 0,
+    private_admitted: bool = false,
+    private_reserved: bool = false,
+    private_rows: u64 = 0,
+    private_key_bytes: u64 = 0,
+    private_lock: std.atomic.Mutex = .unlocked,
+    private_decided: bool = false,
     compact: bool = false,
     /// Set by the first worker that moves its plain table here (`scan.MultiAggArgs.spill`).
     spilled: std.atomic.Value(bool) = .init(false),
@@ -169,11 +185,93 @@ pub const PartAgg = struct {
     }
 
     pub fn deinit(self: *PartAgg) void {
+        self.budget.release(self.run_credit.load(.monotonic));
         for (self.runs) |*rs| for (rs) |*r| r.free(self.gpa, self.budget);
         self.gpa.free(self.runs);
         for (self.parts) |*p| p.table.deinit();
         self.gpa.free(self.parts);
+        self.budget.release(self.private_metadata);
         self.* = undefined;
+    }
+
+    /// Reserve while decode is idle: concurrent decoder reservations must not crowd out a private plan's ceiling.
+    /// Width is a cost hint, not a bound; later exhaustion discards the attempt and rescans shared partitions.
+    pub fn reservePrivate(self: *PartAgg, rows: u64, key_bytes: u64) bool {
+        std.debug.assert(self.shared);
+        const payload: u64 = if (self.compact)
+            self.parts[0].table.compact.stride * 8
+        else
+            @sizeOf(expr_agg.Accumulator) * self.calls.len;
+        const run_bytes = rows *| ((key_bytes +| payload +| 12) *| 2);
+        const bits = partBits(self.budget.limit);
+        const metadata = (@as(usize, 1) << bits) * @sizeOf(Part) + self.runs.len * @sizeOf(Runs);
+        // Runs take at most half the query's ceiling; the ledger also has to grant that whole reservation beside
+        // the query's existing holders. Unused credit returns before the final partitions are folded.
+        const total = run_bytes +| metadata;
+        if (run_bytes == 0 or total > self.budget.limit / 2) return false;
+        const charge = self.budget.drawExact(@intCast(run_bytes + metadata)) orelse return false;
+        std.debug.assert(charge == total);
+        self.run_credit.store(@intCast(run_bytes), .monotonic);
+        self.private_metadata = metadata;
+        self.private_reserved = true;
+        return true;
+    }
+
+    fn cancelPrivate(self: *PartAgg) void {
+        std.debug.assert(!self.private_admitted);
+        self.budget.release(self.run_credit.swap(0, .monotonic) + self.private_metadata);
+        self.private_metadata = 0;
+        self.private_reserved = false;
+    }
+
+    /// The sample decides before moving any group; a reducing window returns the prepaid ceiling unchanged.
+    pub fn admitPrivate(self: *PartAgg, rows: u64, key_bytes: u64) !bool {
+        if (!self.private_reserved and !self.reservePrivate(rows, key_bytes)) return false;
+        const bits = partBits(self.budget.limit);
+        const parts = try self.gpa.alloc(Part, @as(usize, 1) << bits);
+        for (self.parts) |*p| {
+            std.debug.assert(p.table.groupCount() == 0);
+            p.table.deinit();
+        }
+        self.gpa.free(self.parts);
+        for (parts) |*p| {
+            p.* = .{ .table = expr_agg.GroupTable.init(self.gpa, 0) };
+            p.table.shared = self.budget;
+            p.table.fixed_stride = self.stride;
+            if (self.compact) p.table.compact.configure(self.calls);
+        }
+        self.parts = parts;
+        self.shift = @intCast(64 - @as(u7, bits));
+        self.private_admitted = true;
+        return true;
+    }
+
+    pub fn usesRuns(self: *const PartAgg, local: *const Local) bool {
+        return !self.shared or local.private;
+    }
+
+    fn choosePrivate(self: *PartAgg, local: *Local, table: *const expr_agg.GroupTable) !void {
+        if (self.private_rows == 0 or local.private_checked) return;
+        // No worker can touch a partition until its first flush has passed this lock. The winner may replace the
+        // still-empty partition array; every later worker sees that choice before routing or scattering a row.
+        while (!self.private_lock.tryLock()) std.Thread.yield() catch {};
+        defer self.private_lock.unlock();
+        if (!self.private_decided) {
+            self.private_decided = true;
+            if (local.rows_since >= self.probe and table.groupCount() *| 10 >= local.rows_since *| 9) {
+                _ = try self.admitPrivate(self.private_rows, self.private_key_bytes);
+            } else self.cancelPrivate();
+        }
+        local.private_checked = true;
+    }
+
+    fn takeCredit(self: *PartAgg, need: usize) !usize {
+        if (!self.private_admitted) return self.budget.drawExact(need) orelse error.ExceededMemoryBudget;
+        var cur = self.run_credit.load(.monotonic);
+        while (cur >= need) {
+            cur = self.run_credit.cmpxchgWeak(cur, cur - need, .monotonic, .monotonic) orelse return need;
+        }
+        return error.ExceededMemoryBudget;
     }
 
     pub fn needsFlush(self: *const PartAgg, local: *const Local, table: *const expr_agg.GroupTable) bool {
@@ -238,7 +336,10 @@ pub const PartAgg = struct {
     fn flushKeeping(self: *PartAgg, local: *Local, table: *expr_agg.GroupTable, retain: bool) !void {
         const n = table.groupCount();
         if (n == 0) return;
-        if (self.shared) return self.flushShared(table, retain);
+        try self.choosePrivate(local, table);
+        if (self.private_admitted and local.rows_since >= self.probe and n *| 10 >= local.rows_since *| 9)
+            local.private = true;
+        if (!self.usesRuns(local)) return self.flushShared(table, retain);
         const runs = local.runs.?;
         const len = self.calls.len;
         for (0..n) |g| {
@@ -317,6 +418,8 @@ pub const PartAgg = struct {
         var image: [32]u8 = undefined;
         const key = if (self.stride == 0) raw_key else expr_agg.fixedImage(self.stride, raw_key, &image) orelse
             return error.BadGroupKey;
+        // A skewed partition can reach the offset limit before the whole query's ledger is full.
+        const end = if (self.stride == 0) try Run.keyEnd(run.keys.items.len, key.len) else 0;
         const len = self.calls.len;
         if (self.compact and run.compact.stride == 0) run.compact.configure(self.calls);
         if (run.first.items.len == run.first.capacity or run.keys.items.len + key.len > run.keys.capacity or
@@ -340,10 +443,16 @@ pub const PartAgg = struct {
             const target = keys_cap + ends_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) +
                 accs_cap * @sizeOf(expr_agg.Accumulator) + compact_cap * @sizeOf(u64);
             if (target > run.charged) {
-                run.charged += self.budget.drawExact(target - run.charged) orelse return error.ExceededMemoryBudget;
+                run.charged += try self.takeCredit(target - run.charged);
             }
             // A list that failed to grow leaves the others grown: the charge falls back to what is held.
             defer self.settle(run);
+            // ArrayList may allocate a replacement before freeing its old buffer. Credit covers that temporary
+            // overlap too; it is still part of the prepaid reservation while the allocation is in flight.
+            const overlap = if (self.private_admitted) try self.takeCredit(run.held()) else 0;
+            defer {
+                if (overlap != 0) _ = self.run_credit.fetchAdd(overlap, .monotonic);
+            }
             try run.first.ensureTotalCapacityPrecise(self.gpa, first_cap);
             try run.keys.ensureTotalCapacityPrecise(self.gpa, keys_cap);
             if (self.stride == 0) try run.ends.ensureTotalCapacityPrecise(self.gpa, ends_cap);
@@ -352,7 +461,7 @@ pub const PartAgg = struct {
         }
         const at = run.first.items.len;
         run.keys.appendSliceAssumeCapacity(key);
-        if (self.stride == 0) run.ends.appendAssumeCapacity(@intCast(run.keys.items.len));
+        if (self.stride == 0) run.ends.appendAssumeCapacity(end);
         run.first.appendAssumeCapacity(first);
         if (run.compact.stride != 0) {
             run.compact.append();
@@ -380,7 +489,11 @@ pub const PartAgg = struct {
     /// Fold every worker's runs into the partition tables, partitions claimed off a shared cursor by up to `threads`
     /// threads. Each run is freed, and its budget released, once folded.
     pub fn foldRuns(self: *PartAgg, threads: usize) !void {
-        if (self.shared) return;
+        if (self.shared and !self.private_admitted) {
+            self.cancelPrivate();
+            return;
+        }
+        self.budget.release(self.run_credit.swap(0, .monotonic));
         var cursor: std.atomic.Value(usize) = .init(0);
         var failed: std.atomic.Value(bool) = .init(false);
         const n = @max(1, @min(threads, self.parts.len, 64));
@@ -700,4 +813,175 @@ test "partagg: useful fixed flush retains capacity but final flush releases it" 
         total += p.table.accumulators.items[g].count;
     };
     try std.testing.expectEqual(@as(u64, 9), total);
+}
+
+test "partagg: private admission declines before touching shared partitions or their ledger" {
+    const a = std.testing.allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 1 << 20 };
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 4, 4, 1, true);
+    defer part.deinit();
+    const original = part.parts.ptr;
+    try std.testing.expect(!try part.admitPrivate(std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expect(!try part.admitPrivate(0, 64));
+    try std.testing.expectEqual(original, part.parts.ptr);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try std.testing.expect(!part.private_admitted);
+}
+
+test "partagg: admitted private and shared workers combine complete counts and minimum positions" {
+    const a = std.testing.allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 4, 4, 2, true);
+    defer part.deinit();
+    part.compact = true;
+    for (part.parts) |*p| p.table.compact.configure(&calls);
+    try std.testing.expect(try part.admitPrivate(128, 64));
+    const reserved = budget.used.load(.monotonic);
+    try std.testing.expectEqual(reserved, part.run_credit.load(.monotonic) + part.private_metadata);
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    table.compact.configure(&calls);
+    defer table.deinit();
+    var private: Local = .{ .runs = &part.runs[0] };
+    for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }, 0..) |key, i| {
+        const g = try table.getOrInsert(key, &calls, i + 10);
+        table.compact.write(g, 0, .{ .count = 1 });
+    }
+    try part.pump(&private, &table, 4);
+    try std.testing.expect(private.private);
+    try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+    var shared: Local = .{ .runs = &part.runs[1] };
+    const g = try table.getOrInsert("alpha", &calls, 2);
+    table.compact.write(g, 0, .{ .count = 8 });
+    try part.pump(&shared, &table, 8);
+    try std.testing.expect(!shared.private);
+    try part.flush(&shared, &table);
+    try part.foldRuns(3);
+    var groups: usize = 0;
+    for (part.parts) |*p| {
+        groups += p.table.groupCount();
+        if (p.table.findKey("alpha")) |id| {
+            try std.testing.expectEqual(@as(u64, 9), p.table.compact.read(id, 0).count);
+            try std.testing.expectEqual(@as(u64, 2), p.table.first.items[id]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), groups);
+    try std.testing.expectEqual(@as(usize, 0), part.run_credit.load(.monotonic));
+}
+
+test "partagg: refused private credit leaves a local accumulator unconsumed" {
+    const a = std.testing.allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 1, 1, 1, true);
+    defer part.deinit();
+    try std.testing.expect(try part.admitPrivate(128, 64));
+    budget.release(part.run_credit.swap(0, .monotonic));
+    var local: Local = .{ .runs = &part.runs[0] };
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    defer table.deinit();
+    const g = try table.getOrInsert("alpha", &calls, 7);
+    table.accumulators.items[g].count = 1;
+    try std.testing.expectError(error.ExceededMemoryBudget, part.pump(&local, &table, 1));
+    try std.testing.expectEqual(@as(usize, 1), table.groupCount());
+    try std.testing.expectEqual(@as(u64, 1), table.accumulators.items[g].count);
+    try std.testing.expectEqual(@as(u64, 7), table.first.items[g]);
+    for (part.runs[0]) |r| try std.testing.expectEqual(@as(usize, 0), r.len());
+}
+
+test "partagg: every private admission and append allocation failure returns all charged bytes" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+            defer std.debug.assert(budget.used.load(.monotonic) == 0);
+            const calls = [_]expr_agg.AggCall{.{
+                .func = .count,
+                .arg = null,
+                .where = null,
+                .alias = "c",
+                .result = .i64,
+            }};
+            var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 4, 4, 1, true);
+            defer part.deinit();
+            try std.testing.expect(try part.admitPrivate(128, 64));
+            var local: Local = .{ .runs = &part.runs[0] };
+            var table = expr_agg.GroupTable.init(a, 0);
+            table.shared = &budget;
+            defer table.deinit();
+            for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }, 0..) |key, i| {
+                const g = try table.getOrInsert(key, &calls, i);
+                table.accumulators.items[g].count = 1;
+            }
+            try part.pump(&local, &table, 4);
+            try part.foldRuns(1);
+        }
+    }.run, .{});
+}
+
+test "partagg: a reducing first window keeps the original shared partitions and reserves no runs" {
+    const a = std.testing.allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 4, 4, 1, true);
+    defer part.deinit();
+    part.private_rows = 128;
+    part.private_key_bytes = 64;
+    const original = part.parts.ptr;
+    var local: Local = .{ .runs = &part.runs[0] };
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    defer table.deinit();
+    const g = try table.getOrInsert("alpha", &calls, 7);
+    table.accumulators.items[g].count = 8;
+    try part.pump(&local, &table, 8);
+    try part.flush(&local, &table);
+    try std.testing.expectEqual(original, part.parts.ptr);
+    try std.testing.expect(part.private_decided and !part.private_admitted and !local.private);
+    try std.testing.expectEqual(@as(usize, 0), part.private_metadata);
+    try std.testing.expectEqual(@as(usize, 0), part.run_credit.load(.monotonic));
+}
+
+test "partagg: a run refuses an unrepresentable key end before appending" {
+    const t = std.testing;
+    const last = std.math.maxInt(u32);
+    try t.expectEqual(@as(u32, last), try Run.keyEnd(last - 7, 7));
+    try t.expectError(error.ExceededMemoryBudget, Run.keyEnd(last, 1));
+    try t.expectError(error.ExceededMemoryBudget, Run.keyEnd(std.math.maxInt(usize), 1));
+}
+
+test "partagg: a reducing sample returns its prepaid ceiling without replacing shared partitions" {
+    const a = std.testing.allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 4, 4, 1, true);
+    defer part.deinit();
+    const original = part.parts.ptr;
+    try std.testing.expect(part.reservePrivate(128, 64));
+    try std.testing.expect(part.private_reserved and budget.used.load(.monotonic) > 0);
+    try std.testing.expectEqual(original, part.parts.ptr);
+    // An empty or fully filtered query never reaches a sample.
+    try part.foldRuns(1);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try std.testing.expect(!part.private_reserved);
+    try std.testing.expect(part.reservePrivate(128, 64));
+    part.private_rows = 128;
+    part.private_key_bytes = 64;
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    defer table.deinit();
+    const id = try table.getOrInsert("repeated", &calls, 0);
+    table.accumulators.items[id].count = 32;
+    var local: Local = .{ .runs = &part.runs[0], .rows_since = 32 };
+    try part.flush(&local, &table);
+    try std.testing.expectEqual(original, part.parts.ptr);
+    try std.testing.expect(!part.private_reserved and !part.private_admitted);
+    try std.testing.expectEqual(@as(usize, 0), part.run_credit.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), part.private_metadata);
 }

@@ -113,6 +113,7 @@ pub const FastPath = enum {
     spill,
     pairs,
     partitioned,
+    private_runs,
     /// A plain grouping the cost rules chose over a bounded cut (`fewEntries`, `selective_share`) from facts that
     /// cannot bound its table: its refusal runs the cut instead.
     plain_rule,
@@ -235,6 +236,8 @@ pub const MultiAggArgs = struct {
     /// Plain GROUP BY through shared partition tables (`partagg.zig`). The CLI sets this from `ZPQ_PARTAGG=1`.
     /// A count cut, sketch, census, or first-keys cut ignores it and keeps the per-worker tables.
     partagg: bool = false,
+    /// Admitted private runs for poorly reducing long composite count keys; a refusal retries shared partitions.
+    private_runs: bool = true,
     /// Grouped count(DISTINCT) through sorted pairs (`distinctPairsCall`): where they pay (`pairsPay`), always, or
     /// never. The CLI takes `.on` from `ZPQ_DISTINCT_PAIRS=1` and `.off` from `=0`.
     distinct_pairs: enum { auto, on, off } = .auto,
@@ -2956,7 +2959,7 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // its one table must hold all the refused tables held and more, and it only refuses, many times slower. Decode
     // memory the query's ledger refused also runs on one worker (`FastPath.decode_memory`), and there once more on a
     // small decode budget, so the tables have nearly all of the ledger. A plain grouping a cost rule chose over a cut
-    // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`), so at most six scans run,
+    // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`), so at most seven scans run,
     // and each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = args;
     var chain: Chain = .{ .parts_tried = args.partagg };
@@ -3065,6 +3068,10 @@ fn narrowed(
     // A rerun never trades a cut for a plain table again. After a cost rule's plain grouping that is the cut it stood
     // in for, planned as if the rule had not run: the chain from here is the cut's.
     next.plain_rules = false;
+    if (taken.contains(.private_runs)) {
+        next.private_runs = false;
+        return next;
+    }
     if (taken.contains(.plain_rule)) return next;
     if (taken.contains(.dense)) next.dense = false;
     if (taken.contains(.spill)) next.spill = false;
@@ -3537,6 +3544,9 @@ fn prepareAggregate(
     defer if (!leave_tables) if (part_state) |*p| p.deinit();
     // A refused scan runs again: what it held goes back, to the OS and to the query's ledger.
     errdefer if (leave_tables) if (part_state) |*p| p.deinit();
+    defer if (part_state) |*p| {
+        if (p.private_reserved) if (args.taken) |taken| taken.insert(.private_runs);
+    };
     // Fixed-width keys fold into an open-addressed table cheap enough that moving near-unique ones to runs cost more
     // than it saved; string keys, copied into a byte map per worker, gain.
     const rescannable = allRescannable(args.inputs);
@@ -3576,6 +3586,18 @@ fn prepareAggregate(
         );
         part_state.?.compact = group_tables[0].compact.stride != 0;
         if (part_state.?.compact) for (part_state.?.parts) |*p| p.table.compact.configure(agg_calls);
+        if (part_on and !args.partagg and args.private_runs and rescannable and n_workers > 1 and
+            agg_calls.len == 1 and agg_calls[0].func == .count)
+        {
+            if (group_by_keys) |keys| if (keys.len > 1) if (ndv_stat) |stat| {
+                if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536 and
+                    part_state.?.reservePrivate(stat.rows, stat.key_bytes))
+                {
+                    part_state.?.private_rows = stat.rows;
+                    part_state.?.private_key_bytes = stat.key_bytes;
+                }
+            };
+        }
         part_state.?.spill_groups = args.spill_groups;
         part_state.?.spill_rows = args.spill_rows;
     }
@@ -4342,7 +4364,8 @@ const RowSource = struct {
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
         const table: ?*const expr_agg.GroupTable = if (s.in_place.len > 0)
             &s.in_place[slot.idx >> 32]
-        else s.single;
+        else
+            s.single;
         const group = if (s.in_place.len > 0) @as(u32, @truncate(slot.idx)) else slot.idx;
         const compact = table != null and table.?.compact.stride != 0;
         const accs = if (compact) &.{} else if (s.in_place.len > 0)
@@ -4358,7 +4381,8 @@ const RowSource = struct {
                 const acc = if (compact) table.?.readAcc(group, a_idx, s.calls.len) else accs[a_idx];
                 break :blk try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
                     try foldedAcc(gpa, s.calls[a_idx], acc)
-                else acc);
+                else
+                    acc);
             },
         };
     }
@@ -5149,7 +5173,10 @@ fn packRef(ref: MergeGroupRef) usize {
 }
 
 fn inPlaceAccs(
-    tables: []const expr_agg.GroupTable, idx: usize, n_calls: usize, scratch: *[16]expr_agg.Accumulator,
+    tables: []const expr_agg.GroupTable,
+    idx: usize,
+    n_calls: usize,
+    scratch: *[16]expr_agg.Accumulator,
 ) []expr_agg.Accumulator {
     const g: usize = @as(u32, @truncate(idx));
     return tables[idx >> 32].readGroup(g, n_calls, scratch);
@@ -10015,7 +10042,6 @@ test "parallel hash merge matches one thread, including a failed spawn" {
     for (a.keys.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
     for (b.keys.items, 0..) |_, i| refs[a.keys.items.len + i] = .{ .table = 1, .group = @intCast(i) };
 
-
     var serial_slots: std.ArrayList(MergedSlot) = .empty;
     defer serial_slots.deinit(testing.allocator);
     var serial_accs: std.ArrayList(expr_agg.Accumulator) = .empty;
@@ -12993,7 +13019,7 @@ test "regression: a plain grouping a cost rule chose over a cut answers every bu
     }
 }
 
-test "runMultiAggregate: every refusal narrows, the forced partitions follow the cost rules' ones, within six scans" {
+test "runMultiAggregate: every refusal narrows, admitted runs retry shared partitions, within seven scans" {
     const S = std.EnumSet(FastPath);
     const Walk = struct {
         /// `plain`: a per-worker plain scan has run. `scans`: how many have.
@@ -13011,6 +13037,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
             if (st.plain and (t.contains(.dense) or t.contains(.spill) or t.contains(.pairs))) return false;
             if (t.contains(.plain_rule) and !a.plain_rules) return false;
             if (t.contains(.partitioned) and (!a.partition_cost or a.partagg)) return false;
+            if (t.contains(.private_runs) and (!a.private_runs or !t.contains(.partitioned))) return false;
             const shared = t.contains(.partitioned) or a.partagg;
             if (shared and (t.contains(.dense) or t.contains(.spill) or t.contains(.pairs) or
                 t.contains(.partitions_fit))) return false;
@@ -13027,18 +13054,18 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
             const a = st.a;
             var k: u16 = 0;
             for ([_]bool{
-                a.dense,    a.spill,            a.distinct_pairs != .off, a.partition_cost,
-                a.partagg,  a.parallelism == 1, a.plain_rules,            st.chain.parts_tried,
-                st.may_fit, st.cut,             st.plain,                 st.scans > 1,
-                st.chain.lean_tried,
+                a.dense,             a.spill,            a.distinct_pairs != .off, a.partition_cost,
+                a.partagg,           a.parallelism == 1, a.plain_rules,            st.chain.parts_tried,
+                st.may_fit,          st.cut,             st.plain,                 st.scans > 1,
+                st.chain.lean_tried, a.private_runs,
             }, 0..) |b, i| k |= @as(u16, @intFromBool(b)) << @intCast(i);
             return k;
         }
 
         /// The most scans any sequence of refusals from `st` runs; every one of them ends.
         fn longest(args: MultiAggArgs, st: State, depth: usize) !usize {
-            try testing.expect(depth < 8);
-            var seen: [1 << 13]bool = @splat(false);
+            try testing.expect(depth < 9);
+            var seen: [1 << 14]bool = @splat(false);
             var most: usize = 1;
             const all = std.enums.values(FastPath);
             for (0..@as(usize, 1) << @intCast(all.len)) |bits| {
@@ -13074,7 +13101,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
     };
     // The cost rules' shared partitions, a fast path's mask, the plain tables, the forced partitions, one worker, and
     // one worker on a small decode budget.
-    try testing.expectEqual(@as(usize, 6), try Walk.longest(args, start, 0));
+    try testing.expectEqual(@as(usize, 7), try Walk.longest(args, start, 0));
     var forced = args;
     forced.partagg = true;
     // Forced partitions, one worker, one worker on a small decode budget.
@@ -13340,5 +13367,43 @@ test "a scalar query's string winners are drawn from the query's ledger: past it
         try testing.expectEqual(@as(usize, 1 << 20), got.len);
         try testing.expectEqual(@as(u8, 'a'), got[0]);
         try testing.expect(roomy.used.load(.monotonic) >= 2 << 20);
+    }
+}
+
+test "partagg: admitted long composite counts match shared partitions after a spawn failure" {
+    const bytes = (try loadFixture(full_match_fixture)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    // Repeat a small fixture to cross the planning row gate; a short probe makes the first local window unique.
+    var inputs: [48]Input = undefined;
+    for (&inputs) |*in| in.* = .{ .name = full_match_fixture, .bytes = bytes };
+    for ([_]usize{ 3, 16 }) |j| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var taken: std.EnumSet(FastPath) = .{};
+        var args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "count(*) AS c",
+            .group_by = "s, ts",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .max_memory = 128 << 20,
+            .part_cap = 8,
+            .part_probe = 8,
+            .private_runs = false,
+        };
+        const want = try prepareAggregate(testing.allocator, arena_state.allocator(), args, false);
+        defer freeResult(want);
+        args.private_runs = true;
+        args.taken = &taken;
+        const got = try prepareAggregate(testing.allocator, arena_state.allocator(), args, false);
+        defer freeResult(got);
+        try testing.expect(taken.contains(.private_runs));
+        try expectSameAnswer(want, got);
+        spawn_util.injectFailureAfter(1);
+        defer spawn_util.resetFailure();
+        const failed = try prepareAggregate(testing.allocator, arena_state.allocator(), args, false);
+        defer freeResult(failed);
+        try testing.expect(spawn_util.failuresInjected() > 0);
+        try expectSameAnswer(want, failed);
     }
 }

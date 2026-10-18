@@ -2629,7 +2629,7 @@ fn scatterGrouped(
     const ids = try ra.alloc(u32, n);
     var preps = try expr_agg.prepareGrouped(ra, g.calls, &win, lookup, win_sel);
     defer preps.deinit();
-    if (part.shared) {
+    if (!part.usesRuns(local)) {
         for (part.parts, 0..) |*pt, p| {
             const lo = start[p];
             const hi = start[p + 1];

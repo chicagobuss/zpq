@@ -1,0 +1,42 @@
+{
+  "base": "ef99b78e37a44db9985771725934930b7dfbfabf",
+  "source_diff_sha256": "3262bb358ba218476efacc728065867e4304b9ff1e1c7ebc28126798b3c924cc",
+  "artifacts": {
+    "base": {
+      "path": "[redacted].cache/zpq-r10-wt/r10-rank1/integrated/base/bin/zpq",
+      "sha256": "f3e9d295fe38b18558859c8d8ad133478f0da689718bec4cc2f5307c5857cb10"
+    },
+    "tip": {
+      "path": "[redacted].cache/zpq-r10-wt/r10-rank1/integrated/tip/bin/zpq",
+      "sha256": "865ba7b84476f4ecfd51e86471750f9f76765701d954962c16f1150e690e4d07"
+    }
+  },
+  "timing": {
+    "targets": "r10_private_runs_targets.tsv",
+    "mode": "ReleaseFast",
+    "cpus": "0-7,16-23",
+    "protocol": "One query per zpq-bench-run; fully resident warm input, file-specific eviction and mincore cold guard",
+    "warm_tail": "One slow candidate run is retained in each seven-pair warm target study; see ranges",
+    "evidence": "r10-rank1/integrated/{target-warm7,cold}.jsonl"
+  },
+  "validation": {
+    "targeted_tests": 19,
+    "default_comparisons": 504,
+    "forced_private_comparisons": 216,
+    "collision_comparisons": 11,
+    "strict_reader_parquet_pairs": 13,
+    "full_tests_pass": 1027,
+    "full_tests_skip": 41,
+    "integration_pass": 18,
+    "integration_skip": 3,
+    "differential": 872,
+    "cross_builds": [
+      "x86_64-linux-musl",
+      "aarch64-linux-musl",
+      "aarch64-macos"
+    ],
+    "private_memory_cases_per_binary": 27,
+    "real_memory_cases_per_binary": 12,
+    "spill_repro": "Both baseline and candidate refuse at 500MB and answer byte-identically at 1GB"
+  }
+}

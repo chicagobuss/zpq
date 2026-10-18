@@ -129,6 +129,8 @@ pub const FastPath = enum {
     /// The workers' decode memory came out of the query's ledger beside the rest: one worker, decoding one row group
     /// at a time, holds the least of it.
     decode_memory,
+    /// The merge of several workers' tables was refused its maps and lists: one worker's table needs none.
+    merge_memory,
 };
 
 pub const RowGroupGate = struct {
@@ -177,6 +179,9 @@ pub const MultiAggArgs = struct {
     /// answer draw from it, beside whatever else the query holds. Null: a budget of `max_memory` the scan's tables
     /// draw from alone, as tests that size a budget to their groups expect.
     ledger: ?*expr_agg.SharedBudget = null,
+    /// The allocator the merge's own maps and lists come from, drawing from `ledger` (`runMultiAggregate` makes one
+    /// per scan, and turns its refusal into the query's). Null: `gpa`, uncharged.
+    merge_memory: ?*core_memory.Charged = null,
     /// Whether the workers' decode memory is drawn from `ledger`. A refusal chain's last scan decodes one small slice
     /// at a time outside it (`narrowed`), as the ceiling's slack allows, so the tables have all of it.
     charge_decode: bool = true,
@@ -2930,8 +2935,15 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     while (true) {
         var taken: std.EnumSet(FastPath) = .{};
         attempt.taken = &taken;
-        if (prepareAggregate(gpa, arena, attempt, false)) |r| return r else |e| {
+        var merge_memory: core_memory.Charged = undefined;
+        if (args.ledger) |l| {
+            merge_memory = .{ .child = gpa, .budget = l };
+            attempt.merge_memory = &merge_memory;
+        }
+        if (prepareAggregate(gpa, arena, attempt, false)) |r| return r else |e0| {
+            const e = if (args.ledger != null) merge_memory.refusal(e0) else e0;
             if (e != error.ExceededMemoryBudget) return e;
+            if (args.ledger != null and merge_memory.refused.load(.monotonic)) taken.insert(.merge_memory);
             // A refused scan gives back all it drew: the next runs on the whole of what the query has left.
             if (args.ledger) |l| std.debug.assert(l.used.load(.monotonic) == ledger_before);
             may_fit = may_fit or taken.contains(.one_table_may_fit);
@@ -3030,7 +3042,7 @@ fn narrowed(
     // Decode memory the ledger refused is least on one worker, whatever the tables held; and least of all there in
     // slices of `lean_decode`, outside the ledger (the ceiling's slack), which leaves the tables all of it, as they had
     // beside an uncharged decode.
-    const one_decoder = taken.contains(.decode_memory) and attempt.parallelism != 1;
+    const one_decoder = (taken.contains(.decode_memory) or taken.contains(.merge_memory)) and attempt.parallelism != 1;
     if (taken.contains(.decode_memory) and attempt.parallelism == 1 and !chain.lean_tried) if (args.decode_limit) |l| {
         chain.lean_tried = true;
         next.decode_limit = @min(l, core_memory.lean_decode);
@@ -3765,8 +3777,11 @@ fn prepareAggregate(
         // those comparisons the query. Worker maps store an 8-bit fingerprint, not the hash, so each ref is hashed
         // once here. One table already has distinct keys and only needs first-appearance order.
         //
-        // Merge maps borrow source keys. A result cut allocates as the full merge does, uncharged: charged, it refused
-        // budgets the merge it stands in for answers (`FastPath`), and it never holds more than that merge.
+        // Merge maps borrow source keys. Under a ledger the merge's maps, lists and scratch are drawn from it
+        // (`MultiAggArgs.merge_memory`), the full merge's and a result cut's alike, so a cut never refuses a budget
+        // the merge it stands in for answers; the accumulators' own values stay on `gpa`. A refusal here is the
+        // merge's, which the one-worker rerun goes without.
+        const lists = if (args.merge_memory) |m| m.allocator() else gpa;
         const result_cut = resultCut(group_outputs.?, agg_calls, args.result_order, args.unordered);
         const out_tables: []expr_agg.GroupTable = if (use_blocks)
             (&merged_table)[0..1]
@@ -3799,8 +3814,8 @@ fn prepareAggregate(
         } else for (out_tables) |gt| {
             total_group_refs += gt.groupCount();
         }
-        const group_refs_buf = try gpa.alloc(MergeGroupRef, total_group_refs);
-        defer gpa.free(group_refs_buf);
+        const group_refs_buf = try lists.alloc(MergeGroupRef, total_group_refs);
+        defer lists.free(group_refs_buf);
         var ref_i: usize = 0;
         for (out_tables, 0..) |gt, ti| {
             if (cut) |ids| {
@@ -3861,13 +3876,13 @@ fn prepareAggregate(
         group_col_types = col_types;
 
         var slots: std.ArrayList(MergedSlot) = .empty;
-        defer slots.deinit(gpa);
+        defer slots.deinit(lists);
         // Accumulators moved out of the source tables when several tables share keys. Empty when there is one table:
         // its groups are already distinct, so rows read that table directly.
         var merged_accs: std.ArrayList(expr_agg.Accumulator) = .empty;
         defer {
             freeOwnedAccumulatorStrings(gpa, merged_accs.items);
-            merged_accs.deinit(gpa);
+            merged_accs.deinit(lists);
         }
         var folded = out_tables.len > 1;
         // Set when the merge left each group's state in its source table (`mergeInPlace`).
@@ -3878,6 +3893,7 @@ fn prepareAggregate(
             const ps = &part_state.?;
             try fillFromPartitions(
                 gpa,
+                lists,
                 arena,
                 ps.parts,
                 agg_calls,
@@ -3891,14 +3907,14 @@ fn prepareAggregate(
             folded = true;
         } else if (folded) {
             if (candidates) |keys_kept| {
-                try mergeCandidates(gpa, arena, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
+                try mergeCandidates(gpa, lists, out_tables, keys_kept, agg_calls, n_workers, &slots, &merged_accs);
             } else {
                 // Pairs left their count(DISTINCT) a count in every table: it merges as one, in place or under a cut.
                 const merge_calls = if (pairs_used) try countedCalls(arena, agg_calls, pairs_call.?) else agg_calls;
                 const in_place = mergesInPlace(merge_calls, result_cut);
                 try mergeFoldedRefs(
                     gpa,
-                    arena,
+                    lists,
                     out_tables,
                     group_refs,
                     merge_calls,
@@ -3912,7 +3928,7 @@ fn prepareAggregate(
             }
         } else {
             const gt = &out_tables[0];
-            try slots.ensureTotalCapacity(gpa, group_refs.len);
+            try slots.ensureTotalCapacity(lists, group_refs.len);
             for (group_refs) |ref| {
                 slots.appendAssumeCapacity(.{
                     .key = gt.keyAt(ref.group),
@@ -3922,9 +3938,9 @@ fn prepareAggregate(
             }
         }
         if (folded) if (result_cut) |rc| {
-            if (rc.ranking_first) try keepResultTop(gpa, agg_calls, rc, &slots, &merged_accs);
+            if (rc.ranking_first) try keepResultTop(gpa, lists, agg_calls, rc, &slots, &merged_accs);
         };
-        if (!args.unordered) try sortSlotsByFirst(gpa, slots.items, n_workers);
+        if (!args.unordered) try sortSlotsByFirst(lists, slots.items, n_workers);
 
         // Owned by `output` from allocation on, every slot valid at every step, so its `deinit` frees a partly built
         // answer: unbuilt values NULL. One slab holds every row's cells (`AggOutput.slab`), not an allocation a row.
@@ -4788,7 +4804,7 @@ fn parallelDistinctCountU64(
 
 fn mergeCandidates(
     gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     keys: []const []const u8,
     calls: []const expr_agg.AggCall,
@@ -4796,10 +4812,9 @@ fn mergeCandidates(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    _ = arena;
     _ = n_workers;
-    try slots.ensureTotalCapacity(gpa, keys.len);
-    try accs.ensureTotalCapacity(gpa, keys.len * calls.len);
+    try slots.ensureTotalCapacity(lists, keys.len);
+    try accs.ensureTotalCapacity(lists, keys.len * calls.len);
 
     for (keys) |key| {
         var first: u64 = std.math.maxInt(u64);
@@ -4964,6 +4979,7 @@ fn FixedMergeIndex(comptime stride: usize) type {
 /// accumulators instead, which `slot.idx` names (`packRef`).
 fn hashMergeGroupRefs(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     refs: []const MergeGroupRef,
     hashes: ?[]const u64,
@@ -4973,15 +4989,17 @@ fn hashMergeGroupRefs(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    if (in_place) return mergeInPlace(gpa, tables, refs, hashes, calls, slots);
+    if (in_place) return mergeInPlace(gpa, lists, tables, refs, hashes, calls, slots);
     if (cut) |c| {
-        if (c.ranking_first) return mergeResultCut(gpa, tables, refs, hashes, calls, c, slots, accs);
-        if (calls[c.a_idx].func == .count)
-            return mergeCountCut(gpa, tables, refs, hashes, calls, .{ .a_idx = c.a_idx, .k = c.k }, slots, accs);
+        if (c.ranking_first) return mergeResultCut(gpa, lists, tables, refs, hashes, calls, c, slots, accs);
+        if (calls[c.a_idx].func == .count) {
+            const count_cut: CountCut = .{ .a_idx = c.a_idx, .k = c.k };
+            return mergeCountCut(gpa, lists, tables, refs, hashes, calls, count_cut, slots, accs);
+        }
     }
-    var index = try MergeIndex.init(gpa, tables, refs.len, .within_map);
+    var index = try MergeIndex.init(lists, tables, refs.len, .within_map);
     defer index.deinit();
-    try slots.ensureTotalCapacity(gpa, refs.len);
+    try slots.ensureTotalCapacity(lists, refs.len);
 
     for (refs, 0..) |ref, ri| {
         const gt = &tables[ref.table];
@@ -4997,7 +5015,7 @@ fn hashMergeGroupRefs(
         } else {
             gop.value.* = @intCast(slots.items.len);
             const acc_at = accs.items.len;
-            try accs.ensureUnusedCapacity(gpa, calls.len);
+            try accs.ensureUnusedCapacity(lists, calls.len);
             for (calls) |call| accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
             const dst = accs.items[acc_at..][0..calls.len];
             for (dst, src) |*d, *s| try mergeOwnedAccumulator(d, s, gpa);
@@ -5009,7 +5027,7 @@ fn hashMergeGroupRefs(
         }
     }
     // A partition holds every copy of its keys, so its counts are final and a count cut applies here.
-    if (cut) |c| try keepCountTop(gpa, calls, .{ .a_idx = c.a_idx, .k = c.k }, slots, accs);
+    if (cut) |c| try keepCountTop(gpa, lists, calls, .{ .a_idx = c.a_idx, .k = c.k }, slots, accs);
 }
 
 /// Whether a full merge may leave each group's state in the source table that first holds it (`mergeInPlace`): no
@@ -5080,15 +5098,16 @@ fn foldsToItself(acc: expr_agg.Accumulator) bool {
 /// is in one partition only, so no two threads write the same state.
 fn mergeInPlace(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     refs: []const MergeGroupRef,
     hashes: ?[]const u64,
     calls: []const expr_agg.AggCall,
     slots: *std.ArrayList(MergedSlot),
 ) !void {
-    var index = try MergeIndex.init(gpa, tables, refs.len, .any);
+    var index = try MergeIndex.init(lists, tables, refs.len, .any);
     defer index.deinit();
-    try slots.ensureTotalCapacity(gpa, slots.items.len + refs.len);
+    try slots.ensureTotalCapacity(lists, slots.items.len + refs.len);
     for (refs, 0..) |ref, ri| {
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
@@ -5118,6 +5137,7 @@ fn mergeInPlace(
 /// seen once (the common case on a near-unique key) costs a count and a position, not a merged copy of its state.
 fn mergeCountCut(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     refs: []const MergeGroupRef,
     hashes: ?[]const u64,
@@ -5126,14 +5146,14 @@ fn mergeCountCut(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    var index = try MergeIndex.init(gpa, tables, refs.len, .within_map);
+    var index = try MergeIndex.init(lists, tables, refs.len, .within_map);
     defer index.deinit();
     const Group = struct { count: u64, first: u64, key: []const u8 };
     var groups: std.ArrayList(Group) = .empty;
-    defer groups.deinit(gpa);
-    try groups.ensureTotalCapacity(gpa, refs.len);
-    const group_of = try gpa.alloc(u32, refs.len);
-    defer gpa.free(group_of);
+    defer groups.deinit(lists);
+    try groups.ensureTotalCapacity(lists, refs.len);
+    const group_of = try lists.alloc(u32, refs.len);
+    defer lists.free(group_of);
     for (refs, group_of, 0..) |ref, *gi, ri| {
         const gt = &tables[ref.table];
         const key = gt.keyAt(ref.group);
@@ -5159,9 +5179,9 @@ fn mergeCountCut(
         }
     }.cmp;
     var heap: std.PriorityQueue(Item, void, worse) = .empty;
-    defer heap.deinit(gpa);
+    defer heap.deinit(lists);
     const k = @min(cut.k, groups.items.len);
-    try heap.ensureTotalCapacity(gpa, k);
+    try heap.ensureTotalCapacity(lists, k);
     if (k > 0) for (groups.items, 0..) |g, gi| {
         const item: Item = .{ .c = g.count, .first = g.first, .g = @intCast(gi) };
         if (heap.count() == k) {
@@ -5169,16 +5189,16 @@ fn mergeCountCut(
             if (!(item.c > w.c or (item.c == w.c and item.first < w.first))) continue;
             _ = heap.pop();
         }
-        heap.push(gpa, item) catch unreachable; // within the capacity reserved above
+        heap.push(lists, item) catch unreachable; // within the capacity reserved above
     };
 
     // The kept groups' state, merged from just their refs.
     const none = std.math.maxInt(u32);
-    const out_of = try gpa.alloc(u32, groups.items.len);
-    defer gpa.free(out_of);
+    const out_of = try lists.alloc(u32, groups.items.len);
+    defer lists.free(out_of);
     @memset(out_of, none);
-    try slots.ensureTotalCapacity(gpa, slots.items.len + heap.count());
-    try accs.ensureUnusedCapacity(gpa, heap.count() * calls.len);
+    try slots.ensureTotalCapacity(lists, slots.items.len + heap.count());
+    try accs.ensureUnusedCapacity(lists, heap.count() * calls.len);
     for (heap.items) |item| {
         const g = groups.items[item.g];
         out_of[item.g] = @intCast(slots.items.len);
@@ -5198,6 +5218,7 @@ fn mergeCountCut(
 /// Complete groups are ranked before any owning payload moves; each partition's top-H contains its global winners.
 fn mergeResultCut(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     refs: []const MergeGroupRef,
     hashes: ?[]const u64,
@@ -5206,14 +5227,15 @@ fn mergeResultCut(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    // Uncharged, as the full merge's maps are: see the result cut in `prepareAggregate`.
-    var scratch: CutScratch = .{ .parent = cut.memory orelse gpa, .shared = null };
-    mergeResultCutInner(gpa, tables, refs, hashes, calls, cut, &scratch, slots, accs) catch |e|
+    // Charged as the full merge's maps are, through `lists`: see the merge in `prepareAggregate`.
+    var scratch: CutScratch = .{ .parent = cut.memory orelse lists, .shared = null };
+    mergeResultCutInner(gpa, lists, tables, refs, hashes, calls, cut, &scratch, slots, accs) catch |e|
         return if (scratch.denied.load(.monotonic)) error.ExceededMemoryBudget else e;
 }
 
 fn mergeResultCutInner(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     refs: []const MergeGroupRef,
     hashes: ?[]const u64,
@@ -5224,7 +5246,7 @@ fn mergeResultCutInner(
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     const sa = scratch.allocator();
-    const ma = cut.memory orelse gpa;
+    const ma = cut.memory orelse lists;
     var index = try MergeIndex.init(sa, tables, refs.len, .within_map);
     defer index.deinit();
     const Group = struct { rank: expr_agg.Accumulator, first: u64, key: []const u8 };
@@ -5327,6 +5349,7 @@ const MergePart = struct {
 
 const MergeTask = struct {
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     calls: []const expr_agg.AggCall,
     cut: ?ResultCut,
@@ -5342,11 +5365,11 @@ const MergeTask = struct {
             const i = t.cursor.fetchAdd(1, .monotonic);
             if (i >= t.parts.len) return;
             const p = &t.parts[i];
-            hashMergeGroupRefs(t.gpa, t.tables, p.refs, p.hashes, t.calls, t.cut, t.in_place, &p.slots, &p.accs) catch |e|
-                {
-                    t.err = e;
-                    return;
-                };
+            const slots = &p.slots;
+            hashMergeGroupRefs(t.gpa, t.lists, t.tables, p.refs, p.hashes, t.calls, t.cut, t.in_place, slots, &p.accs) catch |e| {
+                t.err = e;
+                return;
+            };
         }
     }
 };
@@ -5355,7 +5378,8 @@ const MergeTask = struct {
 /// partitions are disjoint, so none writes a group another writes. `hashes` are Wyhash with seed 0, matching the map.
 fn mergeFoldedRefs(
     gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
+    /// The merge's own maps, lists and scratch; `gpa` holds the accumulators' values.
+    lists: std.mem.Allocator,
     tables: []const expr_agg.GroupTable,
     refs: []const MergeGroupRef,
     calls: []const expr_agg.AggCall,
@@ -5366,10 +5390,10 @@ fn mergeFoldedRefs(
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     std.debug.assert(!in_place or mergesInPlace(calls, cut));
-    const ma = if (cut) |c| c.memory orelse gpa else gpa;
-    const split_arena = if (cut) |c| c.memory orelse arena else arena;
+    const ma = if (cut) |c| c.memory orelse lists else lists;
+    const split_arena = ma;
     const nparts = mergePartitionCount(n_workers, refs.len, cut != null, mergeEntryBytes(calls.len));
-    if (nparts == 1) return hashMergeGroupRefs(gpa, tables, refs, null, calls, cut, in_place, slots, accs);
+    if (nparts == 1) return hashMergeGroupRefs(gpa, ma, tables, refs, null, calls, cut, in_place, slots, accs);
 
     // Partitions come from the middle of the hash: the map inside each takes its fingerprint from the top bits and
     // its slot from the low ones, and a partition that fixed either would collide more.
@@ -5482,6 +5506,7 @@ fn mergeFoldedRefs(
     var cursor = std.atomic.Value(usize).init(0);
     for (tasks) |*task| task.* = .{
         .gpa = gpa,
+        .lists = ma,
         .tables = tables,
         .calls = calls,
         .cut = cut,
@@ -5740,13 +5765,14 @@ fn rankLimitGroups(
 
 fn keepResultTop(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     calls: []const expr_agg.AggCall,
     cut: ResultCut,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     if (slots.items.len <= cut.k) return;
-    const ma = cut.memory orelse gpa;
+    const ma = cut.memory orelse lists;
     var heap = RankHeap.initContext(cut.descending);
     defer heap.deinit(ma);
     try heap.ensureTotalCapacity(ma, cut.k);
@@ -5792,6 +5818,7 @@ fn countCut(outputs: []const BoundOutputColumn, agg_calls: []const expr_agg.AggC
 /// counts are final: a merge partition holds every copy of its keys.
 fn keepCountTop(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     calls: []const expr_agg.AggCall,
     cut: CountCut,
     slots: *std.ArrayList(MergedSlot),
@@ -5813,10 +5840,10 @@ fn keepCountTop(
         }
     }.cmp;
     var heap: std.PriorityQueue(Item, void, worse) = .empty;
-    defer heap.deinit(gpa);
-    try heap.ensureTotalCapacity(gpa, cut.k);
-    const kept_accs = try gpa.alloc(expr_agg.Accumulator, cut.k * calls.len);
-    defer gpa.free(kept_accs);
+    defer heap.deinit(lists);
+    try heap.ensureTotalCapacity(lists, cut.k);
+    const kept_accs = try lists.alloc(expr_agg.Accumulator, cut.k * calls.len);
+    defer lists.free(kept_accs);
     for (slots.items, 0..) |slot, si| {
         const item: Item = .{ .c = accCount(accs.items[slot.idx + cut.a_idx]), .first = slot.first, .s = @intCast(si) };
         if (heap.count() == cut.k) {
@@ -5824,11 +5851,11 @@ fn keepCountTop(
             if (!(item.c > w.c or (item.c == w.c and item.first < w.first))) continue;
             _ = heap.pop();
         }
-        heap.push(gpa, item) catch unreachable; // within the capacity reserved above
+        heap.push(lists, item) catch unreachable; // within the capacity reserved above
     }
     // Nothing fails from here on: the kept groups' state moves, the rest is freed.
-    const keep = try gpa.alloc(bool, n);
-    defer gpa.free(keep);
+    const keep = try lists.alloc(bool, n);
+    defer lists.free(keep);
     @memset(keep, false);
     for (heap.items) |item| keep[item.s] = true;
     var kept: usize = 0;
@@ -6191,6 +6218,7 @@ fn detachOwned(acc: *expr_agg.Accumulator) void {
 /// Move each partition's groups into `slots` / `accs`. Keys stay borrowed from the partition tables.
 fn fillFromPartitions(
     gpa: std.mem.Allocator,
+    lists: std.mem.Allocator,
     arena: std.mem.Allocator,
     parts: []partagg.Part,
     calls: []const expr_agg.AggCall,
@@ -6201,7 +6229,8 @@ fn fillFromPartitions(
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
-    const ma = if (result_cut) |c| c.memory orelse gpa else gpa;
+    _ = gpa;
+    const ma = if (result_cut) |c| c.memory orelse lists else lists;
     var total: usize = 0;
     for (parts) |*p| total += if (resultCut(outputs, calls, order, unordered) != null)
         @min(p.table.groupCount(), order.limit.? +| order.offset)
@@ -7515,7 +7544,7 @@ test "mergeCandidates: a merge that fails part-way leaks none of the sets alread
             }
             var arena_state = std.heap.ArenaAllocator.init(gpa);
             defer arena_state.deinit();
-            try mergeCandidates(gpa, arena_state.allocator(), &tables, &.{ "a", "b" }, &calls, 1, &slots, &accs);
+            try mergeCandidates(gpa, gpa, &tables, &.{ "a", "b" }, &calls, 1, &slots, &accs);
             try testing.expectEqual(@as(usize, 2), slots.items.len);
             for (accs.items) |acc| try testing.expectEqual(@as(usize, 100), acc.distinct.count());
         }
@@ -9830,7 +9859,7 @@ fn mergeOverlapAndFree(allocator: std.mem.Allocator) !void {
         freeOwnedAccumulatorStrings(allocator, accs.items);
         accs.deinit(allocator);
     }
-    try hashMergeGroupRefs(allocator, &tables, &refs, null, &calls, null, false, &slots, &accs);
+    try hashMergeGroupRefs(allocator, allocator, &tables, &refs, null, &calls, null, false, &slots, &accs);
     std.sort.pdq(MergedSlot, slots.items, {}, struct {
         fn lt(_: void, x: MergedSlot, y: MergedSlot) bool {
             return x.first < y.first;
@@ -9890,16 +9919,14 @@ test "parallel hash merge matches one thread, including a failed spawn" {
     for (a.keys.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
     for (b.keys.items, 0..) |_, i| refs[a.keys.items.len + i] = .{ .table = 1, .group = @intCast(i) };
 
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var serial_slots: std.ArrayList(MergedSlot) = .empty;
     defer serial_slots.deinit(testing.allocator);
     var serial_accs: std.ArrayList(expr_agg.Accumulator) = .empty;
     defer serial_accs.deinit(testing.allocator);
     // Counts are copied by value and the source is left intact, so a second merge sees the same partials.
-    try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 1, null, false, &serial_slots, &serial_accs);
+    const ta = testing.allocator;
+    try mergeFoldedRefs(ta, ta, &tables, refs, &calls, 1, null, false, &serial_slots, &serial_accs);
     try testing.expectEqual(n + n / 2, serial_slots.items.len);
     const half: u64 = @intCast(n / 2);
     try testing.expectEqual(half + 11 * half + 10 * half, countSum(serial_accs.items, serial_slots.items));
@@ -9918,7 +9945,7 @@ test "parallel hash merge matches one thread, including a failed spawn" {
         defer accs.deinit(testing.allocator);
         spawn_util.injectFailureAfter(fail_after);
         defer spawn_util.resetFailure();
-        try mergeFoldedRefs(testing.allocator, arena, &tables, refs, &calls, 8, null, false, &slots, &accs);
+        try mergeFoldedRefs(ta, ta, &tables, refs, &calls, 8, null, false, &slots, &accs);
         spawn_util.resetFailure();
         try testing.expectEqual(serial_slots.items.len, slots.items.len);
         std.sort.pdq(MergedSlot, slots.items, {}, Less.lt);
@@ -9928,6 +9955,51 @@ test "parallel hash merge matches one thread, including a failed spawn" {
             try testing.expectEqual(serial_accs.items[want.idx].count, accs.items[got.idx].count);
         }
     }
+}
+
+test "a merge drawn from the query's ledger gives all of it back, and past it is refused, holding nothing" {
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null },
+    };
+    const n: usize = 10_000;
+    var a = expr_agg.GroupTable.init(testing.allocator, 64 << 20);
+    defer a.deinit();
+    var b = expr_agg.GroupTable.init(testing.allocator, 64 << 20);
+    defer b.deinit();
+    try fillCountTables(&a, &b, &calls, n);
+    const tables = [_]expr_agg.GroupTable{ a, b };
+    const refs = try testing.allocator.alloc(MergeGroupRef, a.keys.items.len + b.keys.items.len);
+    defer testing.allocator.free(refs);
+    for (a.keys.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
+    for (b.keys.items, 0..) |_, i| refs[a.keys.items.len + i] = .{ .table = 1, .group = @intCast(i) };
+    for ([_]usize{ 1, 8 }) |workers| for ([_]bool{ false, true }) |in_place| {
+        var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        var charged: core_memory.Charged = .{ .child = testing.allocator, .budget = &budget };
+        const lists = charged.allocator();
+        {
+            var slots: std.ArrayList(MergedSlot) = .empty;
+            defer slots.deinit(lists);
+            var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+            defer accs.deinit(lists);
+            const ta = testing.allocator;
+            try mergeFoldedRefs(ta, lists, &tables, refs, &calls, workers, null, in_place, &slots, &accs);
+            try testing.expectEqual(n + n / 2, slots.items.len);
+            try testing.expect(budget.used.load(.monotonic) >= slots.capacity * @sizeOf(MergedSlot));
+        }
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        budget.limit = 64 << 10;
+        var slots: std.ArrayList(MergedSlot) = .empty;
+        defer slots.deinit(lists);
+        var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+        defer accs.deinit(lists);
+        const ta = testing.allocator;
+        const refused = mergeFoldedRefs(ta, lists, &tables, refs, &calls, workers, null, in_place, &slots, &accs);
+        try testing.expectError(error.OutOfMemory, refused);
+        try testing.expectEqual(error.ExceededMemoryBudget, charged.refusal(error.OutOfMemory));
+        slots.clearAndFree(lists);
+        accs.clearAndFree(lists);
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    };
 }
 
 test "hash merge of worker tables: overlapping keys, first appearance, allocation failure" {
@@ -10037,9 +10109,8 @@ fn expectSameMerge(
         l.slots.deinit(allocator);
         l.accs.deinit(allocator);
     };
-    const arena = arena_state.allocator();
     for ([_][]const expr_agg.GroupTable{ fixed, bytes }, &lists) |tables, *l|
-        try mergeFoldedRefs(allocator, arena, tables, refs, calls, n_workers, cut, false, &l.slots, &l.accs);
+        try mergeFoldedRefs(allocator, allocator, tables, refs, calls, n_workers, cut, false, &l.slots, &l.accs);
     try testing.expectEqual(lists[1].slots.items.len, lists[0].slots.items.len);
     for (lists[0].slots.items, lists[1].slots.items) |f, b| {
         try testing.expectEqualSlices(u8, b.key, f.key);
@@ -10150,8 +10221,7 @@ fn mergeAndBuildRows(gpa: std.mem.Allocator, fixed: bool, n: usize, n_workers: u
         accs.deinit(gpa);
     }
     const calls = &in_place_calls;
-    const arena = arena_state.allocator();
-    try mergeFoldedRefs(gpa, arena, &tables, refs.items, calls, n_workers, null, in_place, &slots, &accs);
+    try mergeFoldedRefs(gpa, gpa, &tables, refs.items, calls, n_workers, null, in_place, &slots, &accs);
     if (in_place) try testing.expectEqual(@as(usize, 0), accs.items.len);
     try sortSlotsByFirst(gpa, slots.items, n_workers);
     var out: AggOutput = .{};
@@ -11121,7 +11191,7 @@ test "a count cut inside the merge keeps exactly the groups the full sort would,
         defer slots.deinit(testing.allocator);
         var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
         defer accs.deinit(testing.allocator);
-        try mergeFoldedRefs(testing.allocator, arena, &tables, refs.items, &calls, 8, cut, false, &slots, &accs);
+        try mergeFoldedRefs(testing.allocator, testing.allocator, &tables, refs.items, &calls, 8, cut, false, &slots, &accs);
         if (cut != null) try testing.expectEqual(@as(usize, 25) * mergePartitionCount(8, refs.items.len, true, mergeEntryBytes(calls.len)), slots.items.len);
         const ranked = try arena.alloc(Ranked, slots.items.len);
         for (slots.items, ranked) |s, *r| r.* = .{ .c = accs.items[s.idx].count, .first = s.first, .key = s.key };
@@ -12171,9 +12241,8 @@ test "result cut SUM: complete signed ranks, NULLs, ties, offsets and owned payl
                 accs.deinit(gpa);
             }
             const cut: ResultCut = .{ .a_idx = 0, .k = 3, .descending = true, .ranking_first = true };
-            const arena = arena_state.allocator();
-            try mergeFoldedRefs(gpa, arena, &tables, refs.items, &calls, 3, cut, false, &slots, &accs);
-            try keepResultTop(gpa, &calls, cut, &slots, &accs);
+            try mergeFoldedRefs(gpa, gpa, &tables, refs.items, &calls, 3, cut, false, &slots, &accs);
+            try keepResultTop(gpa, gpa, &calls, cut, &slots, &accs);
             try sortSlotsByFirst(gpa, slots.items, 1);
             try testing.expectEqual(@as(usize, 3), slots.items.len);
             for (slots.items, [_]u64{ 16, 34, 52 }) |s, first| {
@@ -12255,6 +12324,7 @@ test "result cut SUM: the merge's scratch is uncharged, as the full merge's is" 
     // A budget the full merge ignores no longer refuses the cut that stands in for it.
     try hashMergeGroupRefs(
         testing.allocator,
+        testing.allocator,
         (&table)[0..1],
         &.{.{ .table = 0, .group = id }},
         null,
@@ -12328,6 +12398,7 @@ test "result cut SUM: the one-table cut holds no charge; retained winner capacit
     var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
     defer accs.deinit(testing.allocator);
     try hashMergeGroupRefs(
+        testing.allocator,
         testing.allocator,
         (&table)[0..1],
         &.{ .{ .table = 0, .group = 0 }, .{ .table = 0, .group = 1 } },
@@ -12851,6 +12922,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
             if (t.contains(.spill) and !a.spill) return false;
             if (t.contains(.pairs) and a.distinct_pairs == .off) return false;
             if (t.contains(.worker_tables) and a.parallelism == 1) return false;
+            if (t.contains(.merge_memory) and a.parallelism == 1) return false;
             return true;
         }
 
@@ -12944,6 +13016,11 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
     try testing.expectEqual(core_memory.lean_decode, lean.decode_limit.?);
     try testing.expect(chain.lean_tried);
     try testing.expect(narrowed(args, lean, S.initMany(&.{.decode_memory}), &chain, false) == null);
+    // A refused merge: one worker, whose one table needs none; its own refusal is the query's.
+    chain = .{ .parts_tried = true };
+    const merged = narrowed(args, args, S.initMany(&.{.merge_memory}), &chain, false).?;
+    try testing.expect(merged.parallelism == 1 and merged.charge_decode);
+    try testing.expect(narrowed(args, merged, .{}, &chain, false) == null);
 }
 
 test "runMultiAggregate: a refusal says one worker may fit only where tables held copies or one worker plans a cut" {

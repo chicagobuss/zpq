@@ -199,7 +199,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.TrailingTokens => diagnosticPrint("zpq query: trailing tokens after expression\n", .{}),
         error.GroupKeyAliasRequired => diagnosticPrint("zpq query: non-trivial GROUP BY key requires AS alias\n", .{}),
         error.BadGroupKey => diagnosticPrint("zpq query: corrupted GROUP BY key framing\n", .{}),
-        error.ExceededMemoryBudget => diagnosticPrint("zpq query: GROUP BY exceeded --max-memory budget\n", .{}),
+        error.ExceededMemoryBudget => diagnosticPrint(
+            "zpq query: the query needs more memory than --max-memory allows\n",
+            .{},
+        ),
         error.DecodeExceededBudget => diagnosticPrint("zpq query: column decode exceeded --max-memory budget\n", .{}),
         error.NullableNotSupported => diagnosticPrint(
             "zpq query: nullable values are not supported in this expression\n",

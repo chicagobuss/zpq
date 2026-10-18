@@ -3685,6 +3685,12 @@ fn prepareAggregate(
     };
     // Past the scan a refusal is the merge's, which one worker's table goes without (a scan that answers drops this).
     if (args.taken) |taken| taken.insert(.one_table_may_fit);
+    // The merge and the answer may hold a fixed allowance past the budget, beside the tables they are built from:
+    // the ceiling's slack (`memory.finalize_allowance`), so a small answer never refuses a query its tables fit.
+    if (args.ledger != null) group_budget.limit += core_memory.finalize_allowance;
+    defer if (args.ledger != null) {
+        group_budget.limit -= core_memory.finalize_allowance;
+    };
     const merge_span = profile.Span.begin(prof);
     // The lanes merge by id into the spare table; the lanes and the domain go as soon as it is built (to the OS with
     // the process, when it is about to exit, as the tables do). Row groups no lane took sit in the worker tables, which
@@ -3750,6 +3756,8 @@ fn prepareAggregate(
     defer for (accumulators) |*acc| if (acc.* == .distinct) acc.distinct.detach();
     var output: AggOutput = .{};
     errdefer output.deinit(gpa);
+    var answer_charge: usize = 0;
+    errdefer group_budget.release(answer_charge);
     var rows_in: i64 = 0;
     var rows_kept: i64 = 0;
     var rgs_in: usize = 0;
@@ -3957,7 +3965,18 @@ fn prepareAggregate(
         };
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
             order.hidden.len == 0;
-        if (args.typed_answer and as_is) {
+        const typed = args.typed_answer and as_is;
+        // The answer is drawn from the ledger before it is built, beside the tables and merge it is built from, and
+        // stays drawn while the query holds it (the engine's ledger outlives it). Refused, it is the merge's refusal:
+        // on one worker the tables it reads are one.
+        if (args.ledger != null) {
+            const bytes = answerBytes(slots.items, col_types, key_types, typed);
+            answer_charge = group_budget.drawExact(bytes) orelse {
+                if (args.taken) |taken| taken.insert(.merge_memory);
+                return error.ExceededMemoryBudget;
+            };
+        }
+        if (typed) {
             output.typed = .{ .rows = 0, .columns = &.{} };
             try buildGroupColumns(gpa, &output.typed.?, row_src, col_types, n_workers);
         } else {
@@ -4325,6 +4344,27 @@ fn buildGroupRows(
         failed = t;
     };
     if (failed) |t| return t.err.?;
+}
+
+/// What a GROUP BY answer of `slots` holds once built (`buildGroupColumns` or `buildGroupRows`): its values, their
+/// lanes and NULL flags, and the bytes of a string key. A string aggregate's own value is not counted.
+fn answerBytes(slots: []const MergedSlot, cols: []const GroupColType, key_types: []const KeyType, typed: bool) usize {
+    const rows = slots.len;
+    var strings: usize = 0;
+    for (key_types) |kt| if (kt == .string) {
+        for (slots) |sl| strings +|= sl.key.len;
+        break;
+    };
+    if (!typed) return rows *| (cols.len *| @sizeOf(AggValue) +| @sizeOf([]const AggValue)) +| strings;
+    var per_row: usize = 0;
+    for (cols) |c| per_row += @sizeOf(u32) + switch (c.lane) {
+        .i64, .f64 => @as(usize, 8),
+        .string => @sizeOf([]const u8),
+        .dec => 16,
+        .avg => 16,
+        .avg_dec => 24,
+    };
+    return rows *| per_row +| strings;
 }
 
 /// A GROUP BY answer as typed columns, one per output column in `group_cols` order, built straight from the merged

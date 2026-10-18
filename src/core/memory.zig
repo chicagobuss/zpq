@@ -6,8 +6,13 @@
 //! bookkeeping, each scan worker's first huge page of decode memory, and on a refusal chain's last scan
 //! (`scan.narrowed`) one worker's decode, in slices of `lean_decode` bytes (or of 64 rows, if they are more) beside the
 //! page they come from.
+//! Past the tables, a GROUP BY's merge and answer may hold `finalize_allowance` bytes more.
 
 const std = @import("std");
+
+/// What a GROUP BY's merge and answer may hold past the ledger's limit once the scan is done: a small answer never
+/// refuses a query whose tables fit.
+pub const finalize_allowance: usize = 16 << 20;
 
 /// The decode budget of a refusal chain's last scan, one worker's, outside the ledger.
 pub const lean_decode: usize = 4 << 20;

@@ -77,19 +77,19 @@ usage:
                  to run. By default groups come in the order they
                  first appear in the input and the same bits come out
                  at every -j.
-  --max-memory   ceiling on accounted GROUP BY entries across all worker
-                 tables. Allocator capacity overhead, finalization
-                 scratch, and materialized output rows are outside this
-                 entry budget. Workers draw from it in blocks rather
-                 than each owning fixed slices, so raising -j does not
-                 shrink what a query may use. Partly-used blocks can
-                 collectively strand at most ~5% of the budget, so give
-                 it headroom rather than tuning to the exact byte.
-                 It also bounds working memory on every path: a row
-                 group too big for it is read a slice of rows at a
-                 time. Output contents are identical; row-group
-                 boundaries may depend on --max-memory (and -j) for
-                 filtered or computed writes.
+  --max-memory   ceiling on what an aggregate or a write holds at once:
+                 GROUP BY tables, decoded row groups, read-ahead,
+                 merge and answer, encoded output waiting to be
+                 written, all drawn from one budget whatever -j is.
+                 Outside it, a fixed slack: the binary, thread stacks,
+                 the mapped input, each worker's first 2 MiB, 16 MiB
+                 for a GROUP BY's merge and answer, and 32 MiB for a
+                 last retry's or a sliced write's decode. A query
+                 that does not fit runs again on narrower paths (one
+                 worker, smaller slices) and else fails with an error,
+                 never more memory. Output contents are identical;
+                 row-group boundaries may depend on --max-memory (and
+                 -j) for filtered or computed writes.
   --explain      print an aggregate plan as JSON using only file footers;
                  accepts SQL or --aggregate / --group-by, then exits.
   --profile      write a Chrome Trace Event JSON trace of the query

@@ -68,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
     const env = init.minimal.environ;
     const io = init.io;
     zpq.local_fs.raiseOpenFileLimit();
+    zpq.core.memory.fixHeapThreshold();
 
     var client = runtime.Client.fromEnv(allocator, env) catch |err| {
         std.debug.print("zpq lambda: runtime client init failed: {s}\n", .{@errorName(err)});

@@ -13,6 +13,7 @@ pub const core = struct {
     pub const diag = @import("core/diag.zig");
     pub const spawn = @import("core/spawn.zig");
     pub const huge_pages = @import("core/huge_pages.zig");
+    pub const memory = @import("core/memory.zig");
     pub const filter = struct {
         pub const ast = @import("core/filter/ast.zig");
         pub const encoded = @import("core/filter/encoded.zig");

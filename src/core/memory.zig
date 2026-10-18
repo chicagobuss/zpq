@@ -26,6 +26,18 @@ pub fn trimHeap() void {
     _ = trim(0);
 }
 
+/// Keep the C heap from holding blocks of 1 MiB and more once they are freed: glibc raises its mmap threshold as large
+/// blocks come and go (up to 32 MiB), after which a freed growth buffer stays resident in a thread's arena, held but
+/// charged to nothing. Fixed, such blocks are their own mappings, given back when freed. For a process zpq owns (the
+/// CLI, the Lambda); a library leaves its host's heap alone. A no-op without glibc's `mallopt`.
+pub fn fixHeapThreshold() void {
+    if (comptime !builtin.link_libc or builtin.os.tag != .linux) return;
+    const Mallopt = ?*const fn (c_int, c_int) callconv(.c) c_int;
+    const mallopt = @extern(Mallopt, .{ .name = "mallopt", .linkage = .weak }) orelse return;
+    const M_MMAP_THRESHOLD: c_int = -3;
+    _ = mallopt(M_MMAP_THRESHOLD, 1 << 20);
+}
+
 /// One `max_memory` shared by every group table filling in parallel, so required headroom stops scaling with `-j`
 /// (see `scan.zig`). Usage never exceeds `limit`, but admission near it is approximate — tables draw in blocks and can
 /// sit on part of one — because exact per-entry accounting would put a contended atomic on every insertion. Stranded

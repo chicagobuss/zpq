@@ -2944,9 +2944,7 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
             const e = if (args.ledger != null) merge_memory.refusal(e0) else e0;
             if (e != error.ExceededMemoryBudget) return e;
             if (args.ledger != null and merge_memory.refused.load(.monotonic)) taken.insert(.merge_memory);
-            // A refused scan gives back all it drew: the next runs on the whole of what the query has left. What it
-            // freed goes back to the OS too, or the next scan's peak stands on the last one's leftovers.
-            if (args.ledger) |l| std.debug.assert(l.used.load(.monotonic) == ledger_before);
+            // What a refused scan freed goes back to the OS too, or the next scan's peak stands on its leftovers.
             core_memory.trimHeap();
             may_fit = may_fit or taken.contains(.one_table_may_fit);
             var next = narrowed(args, attempt, taken, &chain, may_fit) orelse return e;
@@ -2964,6 +2962,9 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
                 };
                 next.inputs = inputs;
             }
+            // A refused scan, and the reader it abandoned, gave back all they drew: the next runs on the whole of what
+            // the query has left.
+            if (args.ledger) |l| std.debug.assert(l.used.load(.monotonic) == ledger_before);
             attempt = next;
         }
     }

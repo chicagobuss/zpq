@@ -14,6 +14,7 @@
 //! one; `ZPQ_IO_PROFILE` overrides it.
 const std = @import("std");
 const builtin = @import("builtin");
+const core_memory = @import("../core/memory.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -33,6 +34,10 @@ pub const Config = struct {
     block: u64 = 1 << 20,
     /// Bytes read ahead of the workers and not yet released.
     window: u64 = 1 << 30,
+    /// The query's ledger, which a row group's bytes are drawn from as it is admitted to the window and given back to
+    /// when it is released: a row group waits for room there as it does in the window, and goes alone when nothing is
+    /// outstanding, drawn whatever the ledger holds. Null: the window alone.
+    ledger: ?*core_memory.SharedBudget = null,
     /// Test hook: the read of this unit fails as an I/O error would.
     fail_unit: ?usize = null,
     /// Test hook: the ring of reader thread `i` fails to set up when bit `i` is set, as seccomp or memlock can make it.
@@ -243,6 +248,10 @@ pub const File = struct {
             }
         }
         _ = rd.released.fetchAdd(f.rg_bytes[rg], .release);
+        if (rd.cfg.ledger) |l| {
+            l.release(f.rg_bytes[rg]);
+            _ = rd.ledger_held.fetchSub(f.rg_bytes[rg], .monotonic);
+        }
         _ = rd.rel_gen.fetchAdd(1, .release);
         _ = linux.futex_3arg(&rd.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
     }
@@ -269,6 +278,8 @@ pub const Reader = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     released: std.atomic.Value(u64) = .init(0),
     submitted: std.atomic.Value(u64) = .init(0),
+    /// What the admitted row groups drew from `cfg.ledger` and have not given back.
+    ledger_held: std.atomic.Value(u64) = .init(0),
     rel_gen: std.atomic.Value(u32) = .init(0),
     next_unit: std.atomic.Value(usize) = .init(0),
     /// Row groups are admitted to the window one at a time, in plan order: the ticket of the next to go, and how many
@@ -581,6 +592,13 @@ pub const Reader = struct {
         for (self.threads.items) |t| t.join();
         self.threads.clearRetainingCapacity();
         for (self.files.items) |f| _ = linux.madvise(f.buf.ptr, f.buf.len, linux.MADV.DONTNEED);
+        self.giveBackLedger();
+    }
+
+    /// The pages every admitted row group still holds are gone: so is their charge.
+    fn giveBackLedger(self: *Reader) void {
+        const l = self.cfg.ledger orelse return;
+        l.release(self.ledger_held.swap(0, .monotonic));
     }
 
     /// Joins the reader threads (abandoning reads not yet made), then unmaps and closes.
@@ -589,6 +607,7 @@ pub const Reader = struct {
         _ = self.rel_gen.fetchAdd(1, .release);
         _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
         for (self.threads.items) |t| t.join();
+        self.giveBackLedger();
         for (self.files.items) |f| {
             posix.munmap(f.buf);
             if (f.owned) _ = linux.close(f.fd);
@@ -665,6 +684,13 @@ pub const Reader = struct {
         // Only this admitter adds to `submitted`, and only admitted row groups add to `released`.
         const out = self.submitted.load(.monotonic) -| self.released.load(.acquire);
         if (out + u.charge > self.cfg.window and out != 0) return false;
+        if (self.cfg.ledger) |l| {
+            if (l.drawExact(u.charge) == null) {
+                if (out != 0) return false;
+                _ = l.used.fetchAdd(u.charge, .monotonic);
+            }
+            _ = self.ledger_held.fetchAdd(u.charge, .monotonic);
+        }
         _ = self.submitted.fetchAdd(u.charge, .monotonic);
         self.admit_next.store(u.ticket + 1, .release);
         _ = self.rel_gen.fetchAdd(1, .release);
@@ -1314,4 +1340,45 @@ test "auto never reads a wide scan with pread" {
         try testing.expectEqual(Mode.mmap, wide);
         try testing.expectEqual(Mode.pread, narrow);
     }
+}
+
+test "row groups draw their bytes from the query's ledger as they are admitted, and give them back as released" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const size: usize = 1 << 20;
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    @memset(data, 7);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    for ([_]Mode{ .pread, .uring }) |mode| for ([_]bool{ false, true }) |abandon| {
+        if (mode == .uring and !uringAvailable()) continue;
+        // Room for one row group of four at a time: each waits on the one before it, and none is refused.
+        var ledger: core_memory.SharedBudget = .{ .limit = size / 4 + 4096 };
+        _ = ledger.used.fetchAdd(4096, .monotonic);
+        const cfg: Config = .{ .mode = mode, .threads = 2, .window = 1 << 30, .ledger = &ledger };
+        const rd = try Reader.create(testing.allocator, cfg);
+        defer rd.destroy();
+        const f = try rd.openFile(path, size);
+        var store: [4][1]Range = undefined;
+        var plans: [4]?[]Range = undefined;
+        for (&plans, &store, 0..) |*p, *st, g| {
+            st[0] = .{ .start = g * size / 4, .end = (g + 1) * size / 4 };
+            p.* = st;
+        }
+        try rd.planFile(f, &plans, 4096);
+        try rd.start();
+        const gate = f.gate();
+        for (0..4) |g| {
+            try gate.wait(gate.ctx, g);
+            try testing.expect(ledger.used.load(.monotonic) <= ledger.limit + size / 4);
+            const lo = g * size / 4;
+            try testing.expectEqualSlices(u8, data[lo..][0 .. size / 4], f.bytes()[lo..][0 .. size / 4]);
+            if (abandon and g == 1) break;
+            gate.done(gate.ctx, g, 1);
+        }
+        if (abandon) rd.abandon();
+        try testing.expectEqual(@as(usize, 4096), ledger.used.load(.monotonic));
+    };
 }

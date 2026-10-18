@@ -707,6 +707,7 @@ fn executeAggregateOver(
             .mode = io_mode,
             .threads = io_policy.threads,
             .window = io_policy.window orelse s3_window.windowFor(args.max_memory),
+            .ledger = &ledger,
         },
         &reader,
     );

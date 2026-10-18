@@ -3489,7 +3489,9 @@ fn prepareAggregate(
     }
     // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
     // is serial time the answer would wait for. Builds that check for leaks free them, so a real leak still shows.
-    const leave_tables = args.leave_regions and !std.debug.runtime_safety;
+    // Not an answer the query goes on to encode under a ledger: the encoding needs the room the tables hold.
+    const encoded_next = args.typed_answer and args.ledger != null;
+    const leave_tables = args.leave_regions and !std.debug.runtime_safety and !encoded_next;
     defer if (!leave_tables) for (all_tables) |*gt| gt.deinit();
     errdefer if (leave_tables) for (all_tables) |*gt| gt.deinit();
     var block_cursor = std.atomic.Value(usize).init(0);

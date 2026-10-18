@@ -1950,6 +1950,10 @@ fn encodeAggOutputCol(
 pub const AggEncode = struct {
     workers: usize = 1,
     budget: u64 = 0,
+    /// The query's ledger: what the columns in flight hold is drawn from it before they encode, a wave narrowing to
+    /// what it takes, and a column it cannot take alone refused. Null: the waves' `budget` alone, and a column alone
+    /// uncharged.
+    ledger: ?*expr_agg.SharedBudget = null,
 };
 
 /// `meta` with everything it points to copied into `arena`, every other field as it is: it outlives the wave arena
@@ -2098,34 +2102,57 @@ fn writeAggregateRowsEncoded(
     var rg_total: i64 = 0;
     // Columns are encoded in waves, in order: as many at once as the workers and the budget admit, each on a thread. A
     // column the budget cannot hold beside the one before it starts a wave alone, which encodes as the serial loop
-    // does, uncharged. Each wave's columns are then written, and any error returned, in column order, so the file and
-    // the error are the serial loop's; their metadata is copied out and the wave's memory freed before the next.
+    // does. Each wave's columns are then written, and any error returned, in column order, so the file and the error
+    // are the serial loop's; their metadata is copied out and the wave's memory freed before the next. A column alone
+    // encodes on memory given back once it is written, not on `arena`, which kept every column's until the end.
     const width = @min(encode.workers, output_cols.len);
     var wave: ?AggColumnWave = if (width > 1) try AggColumnWave.init(arena, width) else null;
     defer if (wave) |*w| w.deinit();
+    var alone = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer alone.deinit();
+    var drawn: u64 = 0;
+    defer if (encode.ledger) |l| l.release(drawn);
     var wave_lo: usize = 0;
     var wave_hi: usize = 0;
     for (output_cols, 0..) |out_col, i| {
-        if (i == wave_hi) if (wave) |*w| {
-            w.reset();
+        if (i == wave_hi) {
+            if (encode.ledger) |l| l.release(drawn);
+            drawn = 0;
             wave_lo = i;
-            var charged: u64 = aggEncodeCharge(out_col);
             wave_hi = i + 1;
-            while (wave_hi < output_cols.len and wave_hi - i < width) : (wave_hi += 1) {
-                const c = aggEncodeCharge(output_cols[wave_hi]);
-                if (charged +| c > encode.budget) break;
-                charged += c;
+            if (wave) |*w| {
+                w.reset();
+                var charged: u64 = aggEncodeCharge(out_col);
+                while (wave_hi < output_cols.len and wave_hi - i < width) : (wave_hi += 1) {
+                    const c = aggEncodeCharge(output_cols[wave_hi]);
+                    if (charged +| c > encode.budget) break;
+                    charged += c;
+                }
+                // Drawn whole, or narrowed a column at a time to what the ledger takes.
+                if (encode.ledger) |l| while (wave_hi - i > 1) : (wave_hi -= 1) {
+                    if (l.drawExact(charged) != null) {
+                        drawn = charged;
+                        break;
+                    }
+                    charged -= aggEncodeCharge(output_cols[wave_hi - 1]);
+                };
+                if (wave_hi - i > 1) w.run(output_cols[i..wave_hi], codec, zstd);
             }
-            if (wave_hi - i > 1) w.run(output_cols[i..wave_hi], codec, zstd);
-        };
+            if (wave_hi - i == 1) if (encode.ledger) |l| {
+                drawn = l.drawExact(aggEncodeCharge(out_col)) orelse return error.ExceededMemoryBudget;
+            };
+        }
         const leaf_elem = aggLeafElem(out_col);
         const in_wave = wave != null and wave_hi - wave_lo > 1;
+        defer if (!in_wave) {
+            _ = alone.reset(.free_all);
+        };
         const enc = if (in_wave)
             try wave.?.results[i - wave_lo]
         else
-            try encodeAggOutputCol(arena, out_col, &leaf_elem, codec, zstd);
+            try encodeAggOutputCol(alone.allocator(), out_col, &leaf_elem, codec, zstd);
         const col_start: i64 = @intCast(off);
-        var em = if (in_wave) try ownColumnMeta(arena, enc.meta) else enc.meta;
+        var em = try ownColumnMeta(arena, enc.meta);
         em.data_page_offset += col_start;
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start;
         // The encoder orders min/max signed; an unsigned column's type-defined order is not, so drop the bounds.

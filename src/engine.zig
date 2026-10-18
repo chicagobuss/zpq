@@ -784,11 +784,15 @@ fn executeAggregateOver(
         const codec = args.codec orelse .SNAPPY;
         const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
         // A big answer's columns encode on the query's workers, with a quarter of its budget for those in flight, as a
-        // re-encode's output in flight takes.
+        // re-encode's output in flight takes, drawn from the ledger beside the answer, within the slack a GROUP BY's
+        // merge and answer have past its limit.
         const encode: consumer.AggEncode = .{
             .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
             .budget = args.max_memory / 4,
+            .ledger = &ledger,
         };
+        ledger.limit += core_memory.finalize_allowance;
+        defer ledger.limit -= core_memory.finalize_allowance;
         const names = r.output.group_cols;
         const fd = args.output_fd;
         bytes_out = if (r.output.typed) |typed|

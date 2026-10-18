@@ -182,8 +182,9 @@ pub const MultiAggArgs = struct {
     /// The allocator the merge's own maps and lists come from, drawing from `ledger` (`runMultiAggregate` makes one
     /// per scan, and turns its refusal into the query's). Null: `gpa`, uncharged.
     merge_memory: ?*core_memory.Charged = null,
-    /// Whether the workers' decode memory is drawn from `ledger`. A refusal chain's last scan decodes one small slice
-    /// at a time outside it (`narrowed`), as the ceiling's slack allows, so the tables have all of it.
+    /// Whether the workers' decode memory is drawn from `ledger`. A refusal chain's last scan draws it instead from a
+    /// ledger of its own of `memory.lean_decode` bytes (`narrowed`), which the ceiling's slack holds, so the tables
+    /// have all of the query's.
     charge_decode: bool = true,
     /// What the workers' decoded row groups may take together (`consumer.DecodeBudget`); null leaves decode unbounded.
     decode_limit: ?usize = null,
@@ -1425,8 +1426,6 @@ const Worker = struct {
     ledger: ?*expr_agg.SharedBudget = null,
     /// Memory a row group decodes on beside the region (staged, sliced), drawn from `ledger`.
     charged: ?core_memory.Charged = null,
-    /// Without a ledger: what a sliced row group's slices hold (`consumer.AggWorkspace.slice_cap`).
-    slice_cap: ?usize = null,
     err: ?anyerror = null,
     profiler: ?*profile.Profiler = null,
     index: usize = 0,
@@ -1481,7 +1480,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         w.region.?.allowance = huge_pages.huge_page_size;
     }
     if (w.ledger) |l| if (w.charged == null) {
-        w.charged = .{ .child = w.gpa, .budget = l };
+        // Straight from the OS, not the general heap: a sliced row group's arenas come and go, and freed heap blocks
+        // stay resident in its per-thread arenas, held but no longer charged.
+        w.charged = .{ .child = std.heap.page_allocator, .budget = l };
     };
     const region = &w.region.?;
     defer region.rewind();
@@ -1597,7 +1598,6 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .region = region,
             .charged = if (w.charged) |*c| c.allocator() else null,
             .ledger = w.ledger,
-            .slice_cap = w.slice_cap,
         });
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
@@ -2944,8 +2944,10 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
             const e = if (args.ledger != null) merge_memory.refusal(e0) else e0;
             if (e != error.ExceededMemoryBudget) return e;
             if (args.ledger != null and merge_memory.refused.load(.monotonic)) taken.insert(.merge_memory);
-            // A refused scan gives back all it drew: the next runs on the whole of what the query has left.
+            // A refused scan gives back all it drew: the next runs on the whole of what the query has left. What it
+            // freed goes back to the OS too, or the next scan's peak stands on the last one's leftovers.
             if (args.ledger) |l| std.debug.assert(l.used.load(.monotonic) == ledger_before);
+            core_memory.trimHeap();
             may_fit = may_fit or taken.contains(.one_table_may_fit);
             var next = narrowed(args, attempt, taken, &chain, may_fit) orelse return e;
             if (attempt.inputs.ptr == args.inputs.ptr) {
@@ -3039,13 +3041,14 @@ fn narrowed(
     if (taken.contains(.partitioned)) next.partition_cost = false;
     if (taken.contains(.dense) or taken.contains(.spill) or taken.contains(.pairs) or taken.contains(.partitioned))
         return next;
-    // Decode memory the ledger refused is least on one worker, whatever the tables held; and least of all there in
-    // slices of `lean_decode`, outside the ledger (the ceiling's slack), which leaves the tables all of it, as they had
-    // beside an uncharged decode.
+    // Decode memory the ledger refused is least on one worker, whatever the tables held; and least of all there on a
+    // ledger of `lean_decode` bytes of its own (the ceiling's slack), which leaves the tables all of the query's, as
+    // they had beside an uncharged decode. What does not decode in that refuses.
     const one_decoder = (taken.contains(.decode_memory) or taken.contains(.merge_memory)) and attempt.parallelism != 1;
     if (taken.contains(.decode_memory) and attempt.parallelism == 1 and !chain.lean_tried) if (args.decode_limit) |l| {
         chain.lean_tried = true;
-        next.decode_limit = @min(l, core_memory.lean_decode);
+        // Half the ledger as the decode budget: a row group past it slices, on the room the other half leaves.
+        next.decode_limit = @min(l, core_memory.lean_decode / 2);
         next.charge_decode = false;
         return next;
     };
@@ -3437,6 +3440,8 @@ fn prepareAggregate(
     // budget.
     var own_budget = expr_agg.SharedBudget{ .limit = args.max_memory };
     const group_budget = args.ledger orelse &own_budget;
+    // A refusal chain's last scan decodes beside the query's ledger, on a ledger of its own (`narrowed`).
+    var lean_budget = expr_agg.SharedBudget{ .limit = core_memory.lean_decode };
     // Shared partitions retain their own reservation slack alongside the workers' local tables.
     group_budget.block = expr_agg.SharedBudget.blockFor(
         args.max_memory,
@@ -3628,8 +3633,7 @@ fn prepareAggregate(
             .items_per_rg = chunks_per_rg,
             .count_columns = count_columns,
             .decode_budget = if (decode_budget) |*b| b else null,
-            .ledger = if (args.charge_decode) args.ledger else null,
-            .slice_cap = if (args.charge_decode or args.ledger == null) null else core_memory.lean_decode,
+            .ledger = if (args.charge_decode or args.ledger == null) args.ledger else &lean_budget,
         };
     }
 
@@ -13053,7 +13057,7 @@ test "runMultiAggregate: every refusal narrows, the forced partitions follow the
     try testing.expect(decoder.parallelism == 1 and decoder.decode_limit.? == args.decode_limit.?);
     const lean = narrowed(args, decoder, S.initMany(&.{.decode_memory}), &chain, false).?;
     try testing.expect(lean.parallelism == 1 and !lean.charge_decode);
-    try testing.expectEqual(core_memory.lean_decode, lean.decode_limit.?);
+    try testing.expectEqual(core_memory.lean_decode / 2, lean.decode_limit.?);
     try testing.expect(chain.lean_tried);
     try testing.expect(narrowed(args, lean, S.initMany(&.{.decode_memory}), &chain, false) == null);
     // A refused merge: one worker, whose one table needs none; its own refusal is the query's.

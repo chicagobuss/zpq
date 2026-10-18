@@ -2288,9 +2288,6 @@ pub const AggWorkspace = struct {
     charged: ?std.mem.Allocator = null,
     /// The ledger `charged` draws from, which a sliced row group sizes its slices to fit.
     ledger: ?*const expr_agg.SharedBudget = null,
-    /// Without a ledger, what a sliced row group's slices are cut to hold, by the bytes their rows took (`lean_decode`
-    /// on a refusal chain's last scan); null cuts them by the footer's estimate.
-    slice_cap: ?usize = null,
 };
 
 /// Whether a row group's whole decode of `bytes` may go on the worker's region: the query's ledger takes what the
@@ -2981,17 +2978,15 @@ fn scanRGSliced(
     // Under a ledger, slices are cut by what rows took, not the footer's estimate, which can understate values by any
     // factor (DELTA_BYTE_ARRAY copies a prefix into every one): the first slice is the least, each next is what the
     // reservation, or the ledger's room, holds at the bytes a row of the last one took.
-    const measured = ws.ledger != null or ws.slice_cap != null;
-    var rows_now = if (measured) @min(slice_rows, 64) else slice_rows;
+    var rows_now = if (ws.ledger != null) @min(slice_rows, 64) else slice_rows;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
         defer done += n;
         var slice = std.heap.ArenaAllocator.init(side);
         defer slice.deinit();
-        defer if (measured) {
+        defer if (ws.ledger) |l| {
             const took = @max(1, slice.queryCapacity() / n);
-            const cap = if (ws.ledger) |l| l.available() / 2 else ws.slice_cap.?;
-            rows_now = sliceRows(@min(reserved, cap) / took, num_rows);
+            rows_now = sliceRows(@min(reserved, l.available() / 2) / took, num_rows);
         };
         const sa = slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);

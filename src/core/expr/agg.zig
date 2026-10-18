@@ -4275,7 +4275,6 @@ pub const GroupTable = struct {
     /// group. The id is the key's alone to take, so callers that memoize ids per key stay correct.
     sketch: ?*CountSketch = null,
 
-    const MapNodeOverhead = 48; // Size of StringHashMap node + bucket overhead
     const empty_id: u32 = std.math.maxInt(u32);
     // The projected hash rejects candidates; only a complete normalized key comparison admits one.
     const FixedSlot = extern struct { hash: u32, id: u32 };
@@ -4316,8 +4315,6 @@ pub const GroupTable = struct {
     }
 
     pub fn deinit(self: *GroupTable) void {
-        // A shared table starts at a zero ceiling, so all of `max_memory_bytes` came from the pool.
-        if (self.shared) |budget| budget.release(self.max_memory_bytes);
         for (self.keys.items) |key| {
             self.allocator.free(key);
         }
@@ -4337,6 +4334,9 @@ pub const GroupTable = struct {
         self.map.deinit();
         if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
         if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
+        // A shared table starts at a zero ceiling, so all of `max_memory_bytes` came from the pool. Given back last:
+        // another table may draw it as soon as it is back, while this one's memory is still held.
+        if (self.shared) |budget| budget.release(self.max_memory_bytes);
     }
 
     pub inline fn readAcc(self: *const GroupTable, g: usize, i: usize, n: usize) Accumulator {
@@ -4690,13 +4690,20 @@ pub const GroupTable = struct {
         self.releaseSlack();
     }
 
+    /// What one byte-keyed group holds, kept on the high side as the fixed-width table's capacities are: the key's
+    /// own heap block (the C heap rounds to 16 bytes and keeps a header), its slots in `keys` and `first` and its
+    /// state, each list half again over its length once grown (compact records count their buffer's projected
+    /// growth), and the map's entry at its working load. Inline distinct values live in the accumulator; a spilled
+    /// set carries its own object charge.
     inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
-        // Inline distinct values live in the accumulator. A spilled set carries its own object charge.
-        const state_growth = if (self.compact.stride != 0)
+        const state_room = if (self.compact.stride != 0)
             self.compact.projected(self.groupCount() + 1) - self.compact.held()
         else
-            @sizeOf(Accumulator) * calls;
-        return key_len + state_growth + @sizeOf(u64) + MapNodeOverhead;
+            @sizeOf(Accumulator) * calls * 3 / 2;
+        const key_block = std.mem.alignForward(usize, key_len, 16) + 16;
+        const slots = (@sizeOf([]const u8) + @sizeOf(u64)) * 3 / 2;
+        const map_entry = (@sizeOf([]const u8) + @sizeOf(u32) + 1) * 2;
+        return key_block + slots + state_room + map_entry;
     }
 
     fn admit(self: *GroupTable, entry_size: usize) !void {
@@ -5804,8 +5811,9 @@ test "a table charges each group's count(DISTINCT) set object, fixed-width keys 
         _ = try fixed.getOrInsertFixed(&image, &calls, i);
         _ = try fixed_without.getOrInsertFixed(&image, calls[1..], i);
     }
-    // String-key accounting is per entry, so the only extra is the distinct accumulator: no set object yet.
-    try std.testing.expectEqual(without.allocated_bytes + n * @sizeOf(Accumulator), plain.allocated_bytes);
+    // String-key accounting is per entry, so the only extra is the distinct accumulator's room: no set object yet.
+    const extra = @sizeOf(Accumulator) * 3 / 2;
+    try std.testing.expectEqual(without.allocated_bytes + n * extra, plain.allocated_bytes);
     for ([_]*const GroupTable{ &plain, &fixed }) |t| {
         for (t.accumulators.items) |acc| {
             if (acc == .distinct) try std.testing.expect(acc.distinct.heap() == null);

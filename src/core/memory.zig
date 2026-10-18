@@ -4,18 +4,27 @@
 //! before they allocate, so what a query holds at once stays under the one limit, whatever `-j` is. Fixed costs the
 //! ledger does not see are the slack the ceiling documents: the binary, thread stacks, the input's mapping, allocator
 //! bookkeeping, each scan worker's first huge page of decode memory, and on a refusal chain's last scan
-//! (`scan.narrowed`) one worker's decode, in slices of `lean_decode` bytes (or of 64 rows, if they are more) beside the
-//! page they come from.
-//! Past the tables, a GROUP BY's merge and answer may hold `finalize_allowance` bytes more.
+//! (`scan.narrowed`) one worker's decode, drawn from a ledger of `lean_decode` bytes of its own, and the first
+//! `finalize_allowance` bytes a GROUP BY's merge and answer hold beside its tables.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// What a GROUP BY's merge and answer may hold past the ledger's limit once the scan is done: a small answer never
 /// refuses a query whose tables fit.
 pub const finalize_allowance: usize = 16 << 20;
 
-/// The decode budget of a refusal chain's last scan, one worker's, outside the ledger.
-pub const lean_decode: usize = 4 << 20;
+/// The ledger a refusal chain's last scan decodes on, one worker's, beside the query's.
+pub const lean_decode: usize = 32 << 20;
+
+/// Hand the C heap's free memory back to the OS (glibc's `malloc_trim`; a no-op where there is none). Freed blocks
+/// otherwise stay resident in its per-thread arenas: memory the ledger has back is not memory the process gave up.
+pub fn trimHeap() void {
+    if (comptime !builtin.link_libc or builtin.os.tag != .linux) return;
+    const trim = @extern(?*const fn (usize) callconv(.c) c_int, .{ .name = "malloc_trim", .linkage = .weak }) orelse
+        return;
+    _ = trim(0);
+}
 
 /// One `max_memory` shared by every group table filling in parallel, so required headroom stops scaling with `-j`
 /// (see `scan.zig`). Usage never exceeds `limit`, but admission near it is approximate — tables draw in blocks and can

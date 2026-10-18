@@ -5997,6 +5997,9 @@ const RankWorker = struct {
     err_at: usize = std.math.maxInt(usize),
     /// Row groups whose rows this worker offered, for its profile span.
     ranked: usize = 0,
+    /// What a row group decodes on, rewound for the next with its pages kept: on the general allocator, which maps
+    /// every large block afresh (`core.memory.fixHeapThreshold`), each row group's decode was faulted in anew.
+    decode: huge_pages.Region,
 
     fn init(shared: *RankShared, index: usize) !RankWorker {
         const size = std.math.mul(usize, shared.h, @sizeOf(RankEntry)) catch return error.ExceededMemoryBudget;
@@ -6004,7 +6007,7 @@ const RankWorker = struct {
         errdefer shared.res.give(size);
         var heap: std.PriorityQueue(RankEntry, []const RowSortKey, RankEntry.later) = .initContext(shared.keys);
         try heap.ensureTotalCapacityPrecise(shared.gpa, shared.h);
-        return .{ .shared = shared, .index = index, .heap = heap };
+        return .{ .shared = shared, .index = index, .heap = heap, .decode = .init(shared.gpa, ENCODE_REGION_RESERVE) };
     }
 
     fn deinit(w: *RankWorker) void {
@@ -6014,6 +6017,7 @@ const RankWorker = struct {
         w.heap.deinit(s.gpa);
         s.res.give(w.cut_buf.capacity);
         w.cut_buf.deinit(s.gpa);
+        w.decode.deinit();
     }
 
     fn run(w: *RankWorker) void {
@@ -6041,7 +6045,8 @@ const RankWorker = struct {
         try w.refreshCut();
         if (item.best) |best| if (w.cut) |c| if (sortsAfter(s.keys[0], best, c)) return;
         if (s.dict_key != null) if (w.cut) |c| {
-            var dict_mem = std.heap.ArenaAllocator.init(s.gpa);
+            defer w.decode.rewind();
+            var dict_mem = std.heap.ArenaAllocator.init(w.decode.allocator());
             defer dict_mem.deinit();
             if (try w.dictionaryBest(dict_mem.allocator(), rg, meta, item.*)) |best| {
                 if (sortsAfter(s.keys[0], best, c)) return;
@@ -6054,17 +6059,19 @@ const RankWorker = struct {
     /// Offer one row group's filtered rows to the heap, by their keys alone.
     fn rank(w: *RankWorker, rg: *const schema.RowGroup, meta: *const schema.FileMetaData, item: RankedRG) !void {
         const s = w.shared;
-        var rg_arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer w.decode.rewind();
+        const da = w.decode.allocator();
+        var rg_arena = std.heap.ArenaAllocator.init(da);
         defer rg_arena.deinit();
         const ra = rg_arena.allocator();
         var keyed = try consumer.initOutputAggregator(ra, meta, s.key_specs);
         const src: consumer.RGSrc = .{ .bytes = s.inputs[item.file].bytes, .byte_origin = 0 };
         var p: consumer.ProjectedRG = undefined;
-        try p.init(&keyed, s.gpa, rg, meta, src, s.filter, s.fetch, s.key_specs, &w.timings, s.options);
+        try p.init(&keyed, da, rg, meta, src, s.filter, s.fetch, s.key_specs, &w.timings, s.options);
         defer p.deinit();
         w.ranked += 1;
         if (p.surviving == 0) return;
-        for (0..s.key_specs.len) |i| try p.projectColumn(&keyed, i, s.gpa, &w.timings);
+        for (0..s.key_specs.len) |i| try p.projectColumn(&keyed, i, da, &w.timings);
         keyed.num_rows += p.surviving;
 
         const scratch = try ra.alloc(SortCell, s.keys.len);

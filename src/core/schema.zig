@@ -440,18 +440,21 @@ pub const SchemaElement = struct {
 
     /// Whether `a` and `b` annotate their values alike however each writer spelled it: recognized logical types as
     /// parsed (Thrift fields may come in any order and either header form), a legacy ConvertedType as its logical
-    /// equivalent. An annotation this reader does not interpret is compared byte for byte, conservatively. DECIMAL
-    /// scale and precision are left to the caller, which compares them as resolved (`decimal.kindFromSchema`).
+    /// equivalent. An annotation this reader does not interpret is compared byte for byte, and its legacy fallback
+    /// must be the same too: that fallback is how the values are read and printed (the same arm over UTF8 and over
+    /// plain bytes is text in one file and binary in the other). Beside a recognized type, a legacy annotation either
+    /// file leaves out is implied by it; two that are both present must agree. DECIMAL scale and precision are left
+    /// to the caller, which compares them as resolved (`decimal.kindFromSchema`).
     pub fn sameAnnotation(a: *const SchemaElement, b: *const SchemaElement) bool {
         if ((a.converted_type == .INTERVAL) != (b.converted_type == .INTERVAL)) return false;
         const la = a.effectiveLogicalType() orelse return b.effectiveLogicalType() == null;
         const lb = b.effectiveLogicalType() orelse return false;
         if (std.meta.activeTag(la) != std.meta.activeTag(lb)) return false;
-        return switch (la) {
-            .DECIMAL => true,
-            .UNKNOWN => std.mem.eql(u8, a.logical_type_raw, b.logical_type_raw),
-            else => std.meta.eql(la, lb),
-        };
+        if (la == .UNKNOWN) {
+            return a.converted_type == b.converted_type and std.mem.eql(u8, a.logical_type_raw, b.logical_type_raw);
+        }
+        if (a.converted_type) |x| if (b.converted_type) |y| if (x != y) return false;
+        return la == .DECIMAL or std.meta.eql(la, lb);
     }
 
     /// The union arm `logical_type_raw` holds, when it holds one.
@@ -2118,4 +2121,26 @@ test "sameAnnotation: one annotation however written, refusing genuinely differe
     var interval = base;
     interval.converted_type = .INTERVAL;
     try std.testing.expect(!SchemaElement.sameAnnotation(&interval, &plain));
+
+    // One future arm over a UTF8 fallback and over none: text in one file, bytes in the other.
+    var future_text = base;
+    future_text.type = .BYTE_ARRAY;
+    future_text.logical_type = .{ .UNKNOWN = .{} };
+    future_text.logical_type_raw = &.{ 0x0c, 0xc8, 0x01, 0x00, 0x00 };
+    future_text.converted_type = .UTF8;
+    var future_bytes = future_text;
+    future_bytes.converted_type = null;
+    try std.testing.expect(SchemaElement.sameAnnotation(&future_text, &future_text));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&future_text, &future_bytes));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&future_bytes, &future_text));
+    // Two legacy annotations, both present, that disagree beside one recognized type.
+    var signed = base;
+    signed.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = true } };
+    signed.converted_type = .INT_64;
+    var conflicting = signed;
+    conflicting.converted_type = .UINT_64;
+    var implied = signed;
+    implied.converted_type = null;
+    try std.testing.expect(SchemaElement.sameAnnotation(&signed, &implied));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&signed, &conflicting));
 }

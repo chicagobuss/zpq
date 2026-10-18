@@ -242,6 +242,23 @@ def mixed_writers(tmp):
         p = subprocess.run([ZPQ, 'query', str(first), str(second), '-j', '1', '--format', 'json'],
                            capture_output=True, text=True, timeout=30)
         assert p.returncode == 0 and len(json.loads(p.stdout)) == want.num_rows, p.stderr
+    # One future logical type arm over different legacy fallbacks: text (UTF8) in one file, bytes in the other. Read
+    # alone each is fine; one output footer over both would label the bytes UTF8.
+    future_text, future_bytes = tmp / 'future-text.parquet', tmp / 'future-bytes.parquet'
+    rewrite_footer(text, future_text, bytes.fromhex('4c1c0000'), bytes.fromhex('4c0cc8010000'))
+    raw = tmp / 'raw.parquet'
+    pq.write_table(pa.table({'v': [b'\xff', b'\xfe']}), raw, store_schema=False)
+    rewrite_footer(raw, future_bytes, b'\x18\x01v\x00', b'\x18\x01v' + bytes.fromhex('6c0cc8010000') + b'\x00')
+    assert json.loads(query(future_text, '--format', 'json').stdout) == [{'v': 'abc'}, {'v': 'def'}]
+    assert json.loads(query(future_bytes, '--format', 'json').stdout) == [{'v': {'base64': '/w=='}},
+                                                                          {'v': {'base64': '/g=='}}]
+    for args in [['-o', str(tmp / 'refused.parquet')], ['--limit', '4', '-o', str(tmp / 'refused.parquet')],
+                 ['--filter', 'v IS NOT NULL', '-o', str(tmp / 'refused.parquet')], ['--format', 'json']]:
+        for pair in [(future_text, future_bytes), (future_bytes, future_text)]:
+            p = subprocess.run([ZPQ, 'query', *map(str, pair), '-j', '1', *args], capture_output=True, text=True,
+                               timeout=30)
+            assert p.returncode != 0 and 'schema mismatch' in p.stderr and not p.stdout, (args, p.stderr)
+    assert not (tmp / 'refused.parquet').exists()
     # Genuinely different annotations still refuse a shared output footer.
     micros = tmp / 'ts-micros.parquet'
     pq.write_table(pa.table({'v': pa.array([1, 2], pa.timestamp('us'))}), micros)

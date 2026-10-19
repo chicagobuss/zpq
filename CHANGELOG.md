@@ -17,7 +17,8 @@ shell-completion and man-page packaging.
    NULL (0.4.1 printed both as an empty field). Aggregate and GROUP BY answers can now be CSV too.
 3. **Re-run the queries listed under "Answers that changed"** if you relied on their 0.4.1 results: DECIMAL sums and
    filters, UUID filters, `NOT IN` lists containing `NULL`, `LIKE NULL` and `LIKE` with `_`, `coalesce`, integer
-   arithmetic near the 64-bit limit, INT96 timestamps, float min/max with NaN, BOOLEAN GROUP BY keys, and any Parquet
+   arithmetic near the 64-bit limit, INT96 timestamps, float filters and min/max over columns that hold NaN, BOOLEAN
+   GROUP BY keys, and any Parquet
    file 0.4.1 **rewrote** from a fixed-width binary (UUID), FLOAT16 or BYTE_ARRAY DECIMAL column, or from inputs with
    different DECIMAL scales.
 4. **Check `--max-memory` values you pass.** It used to bound GROUP BY entries only; it now bounds everything an
@@ -32,8 +33,9 @@ shell-completion and man-page packaging.
 - **Answers on stdout, ready for Unix tools.** NDJSON rows by default for every query kind, `--format json` for an
   array, CSV, Parquet to a file or to stdout. Local outputs are published atomically.
 - **Exact by default.** DECIMAL computes in scaled 128-bit integers, integer arithmetic fails instead of wrapping, and
-  every aggregate (float sums included) gives the same bits at every `-j` and on every run. From Python, DECIMAL
-  values arrive as `decimal.Decimal`.
+  every aggregate (float sums included) gives the same bits at every `-j` and on every run. Floats compare in one
+  total order on every path, filters and pruning included, so NaN rows are never dropped. From Python, DECIMAL values
+  arrive as `decimal.Decimal`.
 - **A memory ceiling that holds.** `--max-memory` is one budget per query that tables, decoding, read-ahead, Top-N, the
   merge, the answer and write buffers all draw from; a query that does not fit is retried on narrower paths and
   otherwise refused, never killed.
@@ -145,6 +147,8 @@ answer below was reproduced with the 0.4.1 binary.
 | Integer `+ - * /` wrapped silently on overflow: `sum(a * 4)` with `a = 2^62` answered 4. It now fails with `integer overflow in *` (exit 1). | Integer arithmetic near the 64-bit limit | Cast to DECIMAL, or check the inputs' range. |
 | Float `min`/`max` over a column of only NaN answered `Infinity`/`-Infinity`. | Float min/max | See also the NaN ordering change under "Behaviour changes". |
 | `--trust-stats` float `min`/`max` of a chunk holding zero took its sign from the statistics: `min` of `[0.0, 5.0]` answered `-0`. | `--trust-stats` with float columns | Re-run them. |
+| Float filters dropped NaN rows. `x > 5` and `x >= 5` left NaN out, though ORDER BY and `max` already put NaN above every number. `NOT (x < 5)` was rewritten to `x >= 5`, and so dropped NaN rows under either reading. `x = nan` matched nothing, and `IN (nan, ...)` ignored its NaN member. On files with no NaN counts, `x >= c` also skipped row groups whose max was below `c`, along with the NaN rows they held. | Filters and SQL `WHERE`/`FILTER`/`CASE WHEN` on float columns that hold NaN | Re-run them; see "Floats in filters" below. |
+| A FLOAT literal past the 32-bit float range rounded to infinity: `f > 3.5e38` missed a stored `+inf`, and `f = 3.5e38` matched it. | Filters on FLOAT (32-bit) columns with very large literals | Re-run them. |
 | A BOOLEAN GROUP BY key, and `min`/`max` of a BOOLEAN, printed `0`/`1` where rows print `false`/`true`. | GROUP BY or min/max over BOOLEAN columns, read as JSON | Compare with `true`/`false`. Parquet output was already BOOLEAN. |
 | INT96 timestamps outside 1677-2262 wrapped into another instant: the 9999-12-31 sentinel read as a negative number. They now print the exact count of nanoseconds since the epoch. | INT96 columns with far-past or far-future values | Re-run them. |
 | A legacy REPEATED field without a LIST or MAP annotation printed one row per stored value. Row output and filters now refuse it, naming the column (exit 2). | Row output from files with legacy repeated fields | Copies (`-o` without a filter) still keep them. |
@@ -162,15 +166,15 @@ answer below was reproduced with the 0.4.1 binary.
 
 Fixed during the 0.5.0 cycle and never released, so not listed: `c IS NOT NULL AND (c = 2 OR b = 1)` dropping rows
 (0.4.1 refused that shape), several grouped-aggregate paths over dictionary codes that are new in 0.5.0, a UINT64
-min/max lost to a compiler miscompile in optimized builds, and aliased columns re-typed on write (0.4.1 refused those
-writes).
+min/max lost to a compiler miscompile in optimized builds, aliased columns re-typed on write (0.4.1 refused those
+writes), and a float `sum` over no rows answering 0 instead of NULL on the dictionary-code path.
 
 ### Behaviour changes
 
 **Output**
 - Every query prints only its answer: NDJSON rows on stdout, one object per line, scalar aggregates as one row.
   - The summary is opt-in with `--summary=json`, on stderr. That flag also types errors (`{"type":"error",...}`) and
-    JSON profiles.
+    JSON profiles. Row output and writes report `row_groups_pruned` there too, as aggregates do.
   - `jsonl` remains an alias of `ndjson`.
   - `--format json` prints an array.
   - `--format parquet` writes Parquet to stdout and refuses a terminal.
@@ -202,7 +206,8 @@ writes).
 - Float sums and averages are summed in one fixed order, so they are the same at every `-j`, budget and decoder; their
   last bits can differ from 0.4.1's.
 - Float `min`/`max` order NaN above every number: `max` is NaN if any value is NaN (0.4.1 skipped NaN: `max` of
-  `[1, NaN, 2]` was 2, now NaN), `min` skips NaN unless every value is NaN. `-0` is less than `+0`.
+  `[1, NaN, 2]` was 2, now NaN), `min` skips NaN unless every value is NaN. Of `-0` and `+0`, which compare equal,
+  `min` returns `-0` and `max` `+0`.
 - DECIMAL results are DECIMAL, with fixed result-type rules:
   - `+`/`-` take the larger scale and one more digit, and `*` adds scales;
   - `sum` is DECIMAL(38, s), and `min`/`max`/`avg` keep the column's type, with `avg` rounding half away from zero;
@@ -215,7 +220,36 @@ writes).
 - `SELECT c AS k` writes the same column, renamed: same type, same nullability.
 - Integer overflow in `+ - * /` fails the query (`integer overflow in *`, exit 1) instead of wrapping, but only on a
   row the query consumes.
+- Arithmetic over a NULL is NULL, as in SQL. `x * 2` over a nullable column gives NULL where `x` is NULL, and the
+  output column is nullable. 0.4.1 refused such queries with `nullable values are not supported` (exit 1), and could
+  do so after rows had already streamed. NULL rows never raise an overflow or a division by zero. Arithmetic over
+  nested columns, and over UINT64, stays refused.
 - A count past 2^63 across files is an error (`RowCountTooLarge`), where 0.4.1's unchecked add wrapped.
+
+**Floats in filters**
+
+Every path compares floats in one total order. NaN equals NaN and sorts above every number, `+inf` included, and `-0`
+equals `+0`. So `x > c` and `x >= c` keep NaN rows, `x < c` does not, `NOT` is the exact complement, and `x = nan`
+and `IN (nan, ...)` match NaN rows. ORDER BY, `min`/`max`, GROUP BY and `count(DISTINCT)` already used this order.
+
+Parquet's float min and max leave NaN out. A row group whose max is below `c` can therefore still hold rows with
+`x > c`, and only the chunk's NaN count can rule them out. zpq is exact by default: it skips a float row group or page
+for `>`/`>=` only when it is proven free of NaN, by one of these:
+- a NaN count of zero, in the chunk's statistics or in the page index (a file written with IEEE_754_TOTAL_ORDER always
+  has one);
+- a dictionary that holds no NaN;
+- zpq's NaN probe, which reads the chunk's values first. It runs for row output, writes and S3 inputs, and for
+  uncompressed chunks in aggregates.
+
+On files with no NaN counts (most PyArrow- and DuckDB-written files), such filters can therefore skip fewer row
+groups than in 0.4.1. Files zpq writes carry the counts and prune as before. `--trust-stats` now also reads a missing
+NaN count as zero, which restores 0.4.1's pruning, and its dropped NaN rows, on request.
+
+The NaN page ({{URL: published nan.html}}) shows the problem on a real file and why zpq stays exact by default. On
+the same file, DuckDB 1.5.5 and DataFusion drop the NaN rows when they prune.
+
+A FLOAT literal outside the 32-bit range compares exactly against a FLOAT column (`f > 3.5e38` matches `+inf`). A
+literal inside the range is first rounded to 32 bits, as a cast would be, so `f = 0.1` matches the stored 32-bit 0.1.
 
 **Python (libzpq), for anyone on a 0.5.0 preview build.** `Zpq.query()` rows and `Zpq.run()`'s `agg` give DECIMAL
 columns as `decimal.Decimal`, every digit and the scale kept, a scale-0 DECIMAL included. Other numbers are as JSON
@@ -243,14 +277,22 @@ client of the C ABI can do the same.
   annotation, Thrift fields in another order) copy and re-encode together; 0.4.1 refused them with
   `schema mismatch across inputs`. Different types are still refused.
 - INT96 values in any year.
+- Float bounds under the IEEE_754_TOTAL_ORDER column order are read and used for pruning. 0.4.1, like 0.4.0, turned
+  pruning off for a column order it did not know.
 - `-o` of `min`/`max` over a UINT64 column holding 2^63 or more writes UINT64; 0.4.1 refused it with `AggIntTooWide`.
 - A page whose V2 header miscounts its nulls is read by its levels, as other readers do.
 
 **Writes**
 - With a `--max-memory` that binds, a filtered or computed write may emit one output row group per slice: contents
   are identical, row-group boundaries depend on `--max-memory` and `-j`.
-- Written float statistics leave NaN out of min/max and write zero bounds as `-0.0`/`+0.0`; `total_byte_size` is the
-  uncompressed size. Byte-copied chunks keep their source's statistics.
+- Written float statistics leave NaN out of min/max and write zero bounds as `-0.0`/`+0.0`. Every FLOAT and DOUBLE
+  chunk zpq encodes gets a `nan_count`, and its page index gets per-page `nan_counts`, so readers can prune it
+  exactly. `total_byte_size` is the uncompressed size. Byte-copied chunks keep their source's statistics, and no NaN
+  count is invented for them.
+- A file whose column data zpq encodes (any filter, `--select`, computed columns, row output or an aggregate written as
+  Parquet) is `created_by` `zpq version 0.5.0`. 0.4.1 kept the first input's string, as plain copies and codec-only
+  recompressions still do. In such a file, a byte-copied chunk drops a deprecated min/max pair that disagrees with its
+  `min_value`/`max_value`, because readers key workarounds for that pair on `created_by`.
 - Re-encoded strings choose dictionary (a quarter or fewer distinct and within 1 MiB), DELTA_BYTE_ARRAY (long shared
   prefixes) or DELTA_LENGTH_BYTE_ARRAY; FIXED_LEN_BYTE_ARRAY falls back to PLAIN.
 - `--compress-priority size|speed`; `size` (level 3) is the default everywhere.
@@ -400,7 +442,7 @@ Not supported: `%` (refused as `operator % is not supported`), the simple `CASE 
 
 - `zpq inspect FILE... [--format json] [--detail]` reports each file without decoding data.
   - It covers the footer, the schema, the row groups and each column chunk: codecs, encodings, sizes, statistics with
-    their exactness, and whether a page index or Bloom filter is present.
+    their exactness, each float chunk's NaN count, and whether a page index or Bloom filter is present.
   - The JSON has `schema_version: 1`. Values are strings, so 64-bit and DECIMAL bounds do not round.
   - `--detail` reads bounded page, index and Bloom metadata (8 MiB).
   - A file that fails is reported in place, and the command exits 1.
@@ -457,7 +499,8 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
   libzpq host.
 - A high-cardinality GROUP BY just inside a cgroup's default budget can take many times longer than with headroom.
   It retries narrower paths before the one that fits.
-- Arithmetic over a column that holds NULLs is refused (`nullable values are not supported`).
+- `coalesce` over an arithmetic expression (`coalesce(x + 1, 0)`) fails at run time (`UnsupportedCoalesce`, exit 1),
+  after a CSV header has already been printed.
 - Windowed filter and re-encode writes omit page indexes, so readers fall back to row-group pruning.
 - A filtered or limited Parquet write refuses nested leaves and INT96 (`INT96 re-encoding is not supported yet`); a
   plain copy keeps both.

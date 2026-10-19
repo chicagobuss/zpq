@@ -304,6 +304,60 @@ pub const DistinctSet = struct {
         };
     }
 
+    const ValSet = @FieldType(DistinctSet, "val_set");
+    const ValKind = std.meta.Tag(ValSet);
+
+    /// The kind of table this set (or its partitions) keeps its values in, once past the inline few; null while none.
+    fn mapKind(self: *const DistinctSet) ?ValKind {
+        if (self.parts) |parts| {
+            for (parts) |*p| if (p.mapKind()) |k| return k;
+            return null;
+        }
+        return switch (self.val_set) {
+            .u64, .i128, .bytes => |_, tag| tag,
+            else => null,
+        };
+    }
+
+    /// Room for `extra` more values of `kind` in this set's own table, a set still inline (or empty) becoming that
+    /// table now, sized. A partitioned set gives each partition about its share: the partitions split values by hash
+    /// bits the tables' slots do not use, and one that gets more than its share grows only near the end of a merge,
+    /// when what has arrived is spread evenly over its slots.
+    fn reserveFor(self: *DistinctSet, allocator: std.mem.Allocator, kind: ValKind, extra: usize) !void {
+        if (extra <= INLINE_CAP) return;
+        if (self.parts) |parts| {
+            const share = extra / NUM_PARTS + extra / (4 * NUM_PARTS) + 16;
+            for (parts) |*p| try p.reserveFor(allocator, kind, share);
+            return;
+        }
+        const n = std.math.cast(u32, extra) orelse return;
+        switch (kind) {
+            inline .u64, .i128, .bytes => |map_tag| {
+                const inline_tag: ValKind = switch (map_tag) {
+                    .u64 => .inline_u64,
+                    .i128 => .inline_i128,
+                    else => .inline_bytes,
+                };
+                switch (self.val_set) {
+                    map_tag => |*m| try m.ensureUnusedCapacity(allocator, n),
+                    .none, inline_tag => {
+                        var map: @FieldType(ValSet, @tagName(map_tag)) = .empty;
+                        const held = switch (self.val_set) {
+                            inline_tag => |inl| inl.vals[0..inl.len],
+                            else => &.{},
+                        };
+                        try map.ensureTotalCapacity(allocator, @intCast(held.len + n));
+                        for (held) |v| map.putAssumeCapacity(v, {});
+                        self.val_set = @unionInit(ValSet, @tagName(map_tag), map);
+                    },
+                    // Another kind: insertion reports it.
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+
     pub fn insertU64(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
@@ -494,6 +548,12 @@ pub const DistinctSet = struct {
     }
 
     pub fn merge(self: *DistinctSet, other: *const DistinctSet, allocator: std.mem.Allocator) !void {
+        // A table's values come out in its slot order, which is hash order. Inserted into a table that grows as they
+        // arrive, a larger table's hash-ordered prefix wraps onto the smaller one's slots unevenly, some ranges a lap
+        // ahead of the rest, and at the 80% load where it grows those ranges are full: long linear-probe runs, and a
+        // merge of two workers' sets took 40 s where it takes under one (which -j hit it depended on how the rows
+        // split). Sized for the result first, every table stays at or below its final load throughout.
+        if (other.mapKind()) |kind| try self.reserveFor(allocator, kind, other.count());
         if (self.parts) |parts| {
             if (other.parts) |oparts| {
                 for (parts, oparts) |*p, op| {
@@ -6558,4 +6618,44 @@ test "regression: a one-row min/max of a UINT64 column keeps values of 2^63 and 
         const cols = try finalize(a, call, state);
         try std.testing.expectEqual(@as(i64, -1), cols[0].col.i64.values[0]);
     }
+}
+
+test "regression: a count(DISTINCT) merge sizes its tables for the result, so none grows while hash-ordered values arrive" {
+    // F3: one worker's set merged into another's slot by slot (hash order) while the destination grew as values came
+    // took 40 s at -j 3 against 0.4 s presized. A table that grows mid-merge allocates once per doubling; sized
+    // first, each destination table allocates at most once. That allocation count is what this pins.
+    const gpa = std.testing.allocator;
+    const n: u64 = 60_000;
+    const Dest = enum { empty, inline_two, small_map, partitioned };
+    inline for (.{ u64, i128 }) |T| for ([_]bool{ false, true }) |other_parted| for (std.enums.values(Dest)) |dest_shape| {
+        var other: DistinctSet = .{};
+        defer other.deinit(gpa);
+        if (other_parted) try other.initPartitions(gpa, null);
+        for (0..n) |i| {
+            const v: T = @intCast(i * 7919);
+            if (T == u64) try other.insertU64(gpa, v) else try other.insertI128(gpa, v);
+        }
+        var dest: DistinctSet = .{};
+        if (dest_shape == .partitioned) try dest.initPartitions(gpa, null);
+        // Values both sets hold (the first few multiples), and some only the destination does (odd ones).
+        const own: usize = switch (dest_shape) {
+            .empty => 0,
+            .inline_two => 2,
+            .small_map, .partitioned => 50,
+        };
+        for (0..own) |i| {
+            const v: T = @intCast(if (i % 2 == 0) i * 7919 else i * 7919 + 1);
+            if (T == u64) try dest.insertU64(gpa, v) else try dest.insertI128(gpa, v);
+        }
+        const before = dest.count();
+        var counting = std.testing.FailingAllocator.init(gpa, .{});
+        try dest.merge(&other, counting.allocator());
+        try std.testing.expectEqual(@as(usize, n) + before - (own + 1) / 2, dest.count());
+        const tables: usize = if (dest_shape == .partitioned) NUM_PARTS else 1;
+        std.testing.expect(counting.allocations <= tables) catch |err| {
+            std.debug.print("{s} {s} other_parted={}: {d} allocations\n", .{ @typeName(T), @tagName(dest_shape), other_parted, counting.allocations });
+            return err;
+        };
+        dest.deinit(gpa);
+    };
 }

@@ -387,6 +387,37 @@ def alias_is_rename(tmp):
             assert printed(sql) == values, (sql, printed(sql))
 
 
+def nested_by_name(tmp):
+    """`SELECT st` / `SELECT l` on a STRUCT or LIST: refused in rows with a message naming a leaf (exit 2); written
+    whole with -o when the list is bare columns in the file's order; refused clearly in any other order."""
+    src = tmp / 'nested_by_name.parquet'
+    t = pa.table({'id': [1, 2, 3], 'st': [{'a': 1, 'b': 'x'}, None, {'a': 3, 'b': None}], 'l': [[1, 2], [], None]})
+    pq.write_table(t, src)
+    def cli(*args):
+        return subprocess.run([ZPQ, 'query', '--query', *args], capture_output=True, text=True, timeout=30)
+    for col, words in (('st', ['`st` is nested (a STRUCT)', '`st.a`']),
+                       ('l', ['`l` is repeated (a LIST or MAP)', '`l.list.element`'])):
+        p = cli(f"SELECT {col} FROM '{src}'")
+        assert p.returncode == 2 and not p.stdout and all(w in p.stderr for w in words), (col, p.returncode, p.stderr)
+    out = tmp / 'nested_by_name_out.parquet'
+    for sql, names in ((f"SELECT st FROM '{src}'", ['st']), (f"SELECT id, st, l FROM '{src}'", ['id', 'st', 'l']),
+                       (f"SELECT id, st FROM '{src}' WHERE id >= 2", ['id', 'st'])):
+        out.unlink(missing_ok=True)
+        p = cli(sql, '-o', str(out))
+        assert p.returncode == 0, (sql, p.stderr)
+        got = pq.read_table(out)
+        want = duckdb.connect().execute(sql).to_arrow_table()
+        assert got.schema.names == names and got.to_pylist() == want.to_pylist(), (sql, got.to_pylist())
+        assert all(got.schema.field(n).type == t.schema.field(n).type for n in names), (sql, got.schema)
+    # A filtered LIST is refused as `--columns l --filter` refuses it: its rows are not re-encoded yet.
+    out.unlink(missing_ok=True)
+    p = cli(f"SELECT id, l FROM '{src}' WHERE id >= 2", '-o', str(out))
+    q = query(src, '--columns', 'id,l', '--filter', 'id >= 2', '-o', str(out), ok=False)
+    assert p.returncode == q.returncode == 2 and p.stderr == q.stderr and not out.exists(), (p.stderr, q.stderr)
+    p = cli(f"SELECT st, id FROM '{src}'", '-o', str(out))
+    assert p.returncode == 2 and "file's order" in p.stderr and not out.exists(), p.stderr
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
@@ -396,4 +427,5 @@ with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     answer_values(Path(directory))
     unsigned_answers(Path(directory))
     alias_is_rename(Path(directory))
+    nested_by_name(Path(directory))
 print('Format correctness regressions passed')

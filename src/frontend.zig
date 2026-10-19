@@ -157,6 +157,19 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.EmptyExpr => diagnosticPrint("zpq query: empty expression\n", .{}),
         error.UnexpectedChar => diagnosticPrint("zpq query: unexpected character in expression\n", .{}),
         error.ModuloNotSupported => diagnosticPrint("zpq query: operator % is not supported\n", .{}),
+        error.NestedColumnSelected => switch (diag.detail) {
+            .nested_selected => |n| diagnosticPrint(
+                "zpq query: column `{s}` is {s}; row output takes its leaves (e.g. `{s}`){s}. A SELECT of\n" ++
+                    "  bare columns in the file's order written with -o keeps it whole\n",
+                .{
+                    diag.column.get(),
+                    if (n.repeated) "repeated (a LIST or MAP)" else "nested (a STRUCT)",
+                    n.example.get(),
+                    if (n.repeated) ", though not repeated ones yet" else "",
+                },
+            ),
+            else => diagnosticPrint("zpq query: a nested column is selected where a value is wanted\n", .{}),
+        },
         error.ExpressionInPredicate => diagnosticPrint(
             "zpq query: `{s}` is an expression; a predicate compares a column with a literal\n",
             .{diag.column.get()},
@@ -300,6 +313,8 @@ fn printDetail(diag: *const Diag) void {
                 "  expression or LIKE ... ESCAPE)\n",
             .{name},
         ),
+        // Printed with the error itself.
+        .nested_selected => {},
         .bare_non_boolean => |b| diagnosticPrint(
             "filter: `{s}` alone is a predicate only if it is BOOLEAN (it is {s}); compare it, e.g. `{s} != 0`\n",
             .{ name, b.type_name, name },

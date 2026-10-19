@@ -174,7 +174,8 @@ def sources(work):
              req={"filter": "int32_field > 2147483646", "columns": ["int32_field"]}, passthrough=True),
     ])
     src("list_columns", f"{PT}/list_columns.parquet", "LIST<INT64>, LIST<STRING>", [
-        cell("rows_refused", "SELECT int64_list FROM '{src}'", refuse=ROWS),
+        # A LIST named whole: refused in rows, written whole (a copy of the column) with -o.
+        cell("rows_refused", "SELECT int64_list FROM '{src}'", passthrough=True, refuse=ROWS),
         cell("copy", "SELECT * FROM '{src}'", req={}, passthrough=True, refuse=ROWS),
     ])
     src("delta_strings", f"{PT}/delta_byte_array.parquet", "DELTA_BYTE_ARRAY strings", [
@@ -234,7 +235,8 @@ def sources(work):
                  req={"group_by": "b", "aggregate": "sum(d9) AS s"}),
             cell("struct", "SELECT id, st.a AS sa, st.b AS sb FROM '{src}' WHERE id < 4",
                  req={"filter": "id < 4", "select": "id, st.a AS sa, st.b AS sb"}),
-            cell("struct_whole", "SELECT id, st FROM '{src}' WHERE id < 4", passthrough=True,
+            # A STRUCT named whole: refused in rows (its leaves are the values), written whole with -o.
+            cell("struct_whole", "SELECT id, st FROM '{src}' WHERE id < 4", passthrough=True, refuse=ROWS,
                  req={"filter": "id < 4", "columns": ["id", "st"]}),
             cell("bool_minmax", "SELECT min(b) AS mn, max(b) AS mx FROM '{src}'",
                  req={"aggregate": "min(b) AS mn, max(b) AS mx"}),

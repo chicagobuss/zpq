@@ -29,6 +29,8 @@ pub const Error = error{
     UnexpectedChar,
     /// `%`, which zpq does not have.
     ModuloNotSupported,
+    /// A STRUCT, LIST or MAP column named where a value is wanted (`SELECT st`): its leaves are the values.
+    NestedColumnSelected,
     UnexpectedEnd,
     BadNumber,
     UnknownColumn,
@@ -461,6 +463,19 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     .parser = .expression,
                     .hint = metadata.ambiguityHint(file, tk.text),
                 } });
+                // A group by that name: say so, and name a leaf to select instead.
+                if (err == error.UnknownColumn) {
+                    const leaves = metadata.resolveProjection(arena, file, tk.text) catch &.{};
+                    if (leaves.len > 0) {
+                        const path = (try metadata.leafPathSegments(arena, file, leaves[0])) orelse return err;
+                        const example = try std.mem.join(arena, ".", path);
+                        Diag.set(lex.diag, tk.text, .{ .nested_selected = .{
+                            .example = .of(example),
+                            .repeated = file.getColumnLevels(path).max_rep > 0,
+                        } });
+                        return error.NestedColumnSelected;
+                    }
+                }
                 return err;
             };
             const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
@@ -1547,4 +1562,20 @@ test "regression: `%` in an expression is named as an operator zpq does not have
     try testing.expectError(error.ModuloNotSupported, parseSelect(a, "id, id%2 AS m", &file, null));
     // In a string literal it is a character.
     _ = try parseExprOnly(a, "coalesce('a%', 'b')", &file, null);
+}
+
+test "regression: a STRUCT named where a value is wanted is refused, naming a leaf to select instead" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try test_fixtures.sharedLeafNameMeta(a);
+    var diag: Diag = .{};
+    try testing.expectError(error.NestedColumnSelected, parseExprOnly(a, "r", &file, &diag));
+    try testing.expectEqualStrings("r", diag.column.get());
+    try testing.expectEqualStrings("r.key", diag.detail.nested_selected.example.get());
+    try testing.expect(!diag.detail.nested_selected.repeated);
+    try testing.expectError(error.NestedColumnSelected, parseSelect(a, "key, r AS q", &file, null));
+    // Its leaves, and a name that matches nothing, keep their answers.
+    try testing.expectEqual(@as(usize, 0), (try parseExprOnly(a, "r.key", &file, null)).col_ref.col_idx);
+    try testing.expectError(error.UnknownColumn, parseExprOnly(a, "nope", &file, null));
 }

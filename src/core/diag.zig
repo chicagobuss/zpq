@@ -71,6 +71,9 @@ pub const Detail = union(enum) {
     float16_filter,
     /// A filter compares the string column `Diag.column` with something other than a literal.
     non_literal_value,
+    /// An expression names `Diag.column`, a STRUCT, LIST or MAP, where a value is wanted. `example` is its first leaf's
+    /// path; `repeated` says it is a LIST or MAP, whose rows hold several values each.
+    nested_selected: struct { example: Text, repeated: bool },
     /// A filter names `Diag.column` alone as a predicate, which only a BOOLEAN column is; `type_name` (static) is its
     /// physical type.
     bare_non_boolean: struct { type_name: []const u8 },

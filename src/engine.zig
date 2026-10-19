@@ -1747,6 +1747,38 @@ fn keptColumnsUseCodec(rg: *const schema.RowGroup, kept: []const bool, codec: sc
 /// Set `set[i]` for each leaf a `--columns` name selects. A name that selects nothing is `UnknownColumn`, named
 /// through `diag`, as in --select and --filter: dropping it wrote a file short of that column, or of every column.
 /// A list naming no column at all (`--columns ','`) is `EmptyColumnList`, not a file with no columns.
+/// The leaves of a SQL SELECT list that is bare columns alone, at least one of them a STRUCT, LIST or MAP, in the
+/// file's order: the projection `--columns` would make of it, which keeps groups whole. Null for any other list
+/// (an alias, an expression, a leaf out of order, a list of leaves alone), which the expression path takes.
+fn nestedProjection(
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    select_cols: ?[]const expr_ast.SelectColumn,
+    num_leaves: usize,
+) !?[]bool {
+    const cols = select_cols orelse return null;
+    if (cols.len == 0) return null;
+    const set = try arena.alloc(bool, num_leaves);
+    @memset(set, false);
+    var any_group = false;
+    var next: usize = 0;
+    for (cols) |col| {
+        if (col.alias != null) return null;
+        const leaves = metadata.resolveProjection(arena, meta, col.expr) catch return null;
+        if (leaves.len == 0) return null;
+        _ = metadata.resolveColumn(meta, metadata.unquoteIdent(col.expr)) catch |err| switch (err) {
+            error.UnknownColumn => any_group = true,
+            else => return null,
+        };
+        for (leaves) |leaf| {
+            if (leaf < next or leaf >= num_leaves) return null;
+            set[leaf] = true;
+            next = leaf + 1;
+        }
+    }
+    return if (any_group) set else null;
+}
+
 fn markColumns(
     arena: std.mem.Allocator,
     meta: *const schema.FileMetaData,
@@ -1886,13 +1918,18 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
 
     // --columns resolves to leaf indices; --select is mutually exclusive with it (checked by the callers).
     var kept_set: ?[]bool = null;
+    var select = args.select;
     if (args.columns) |cols_list| {
         const set = try arena.alloc(bool, num_leaves);
         @memset(set, false);
         try markColumns(arena, meta0, cols_list, set, args.diag);
         kept_set = set;
-    }
-    const select_items: ?[]expr_ast.SelectItem = if (args.select) |s|
+    } else if (args.output != null) if (try nestedProjection(arena, meta0, args.select_cols, num_leaves)) |set| {
+        // A written SELECT of bare columns naming a STRUCT, LIST or MAP is the projection that keeps it whole.
+        kept_set = set;
+        select = null;
+    };
+    const select_items: ?[]expr_ast.SelectItem = if (select) |s|
         try expr_parser.parseSelect(arena, s, meta0, args.diag)
     else
         null;

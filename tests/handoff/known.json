@@ -1,10 +1,4 @@
 {
  "alltypes_plain/int96:cli-write": "D1 (documented) INT96 re-encoding refused",
- "alltypes_plain/int96:py-write": "D1 (documented) INT96 re-encoding refused",
- "gen_duck_types/struct_whole:arrow>zpq": "F4 (P2) SQL cannot name a STRUCT or LIST column",
- "gen_duck_types/struct_whole:cli-csv": "F4 (P2) SQL cannot name a STRUCT or LIST column",
- "gen_duck_types/struct_whole:cli-write": "F4 (P2) SQL cannot name a STRUCT or LIST column",
- "gen_duck_types/struct_whole:duck>zpq": "F4 (P2) SQL cannot name a STRUCT or LIST column",
- "gen_duck_types/struct_whole:py-rows": "F4 (P2) SQL cannot name a STRUCT or LIST column",
- "list_columns/rows_refused:cli-write": "F4 (P2) SQL cannot name a STRUCT or LIST column"
+ "alltypes_plain/int96:py-write": "D1 (documented) INT96 re-encoding refused"
 }

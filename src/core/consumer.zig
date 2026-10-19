@@ -1011,11 +1011,10 @@ pub const SliceReader = struct {
         if (!self.dict_held) return;
         r.arena = self.pages.allocator();
         r.pages.arena = self.pages.allocator();
-        // Under `chargePages`, what is on `held` stays drawn until `deinit`: its pages, and the dictionary's slices.
-        if (r.pages.budget) |b| {
-            const slices = if (r.dictionary) |d| d.len * @sizeOf([]const u8) else 0;
-            _ = b.drawExact(slices) orelse return error.ExceededMemoryBudget;
-            self.held_drawn = r.pages.drawn + slices;
+        // Under `chargePages`, what is on `held` stays drawn until `deinit`: its pages, and the dictionary's slices
+        // (drawn as it was installed).
+        if (r.pages.budget != null) {
+            self.held_drawn = r.pages.drawn;
             r.pages.drawn = 0;
         }
     }

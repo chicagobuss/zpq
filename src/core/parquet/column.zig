@@ -1295,6 +1295,12 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 else => unreachable,
             };
             if (num > pg.bytes.len / min_entry) return error.DictionaryLargerThanPage;
+            // A byte-array dictionary's slices, drawn before they are built (an uncompressed page draws nothing else).
+            if (T == []const u8) if (self.pages.budget) |b| {
+                const slices = num * @sizeOf([]const u8);
+                _ = b.drawExact(slices) orelse return error.ExceededMemoryBudget;
+                self.pages.drawn += slices;
+            };
             const buf = try self.dictBuffer(num);
             switch (T) {
                 i32, i64, f32, f64 => {

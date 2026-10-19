@@ -39,6 +39,10 @@ pub const Error = error{
     UnterminatedString,
     /// The column is repeated (in a LIST or MAP, or a legacy REPEATED field): a row holds a list of its values.
     NestedFilterNotSupported,
+    /// `%`, an operator zpq does not have, where a column was expected (`x % 2 = 1`).
+    ModuloNotSupported,
+    /// Arithmetic where a predicate compares a column (`x + 1 > 5`): the left side must be a column.
+    ExpressionInPredicate,
 } || std.mem.Allocator.Error;
 
 /// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
@@ -289,6 +293,11 @@ fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) 
             .parser = .filter,
             .hint = metadata.ambiguityHint(file, ident),
         } });
+        // No column by that name: an operator outside quotes says what it is instead.
+        if (err == error.UnknownColumn) if (try operatorOutsideQuotes(name)) |op| {
+            Diag.setColumn(diag, name);
+            return if (op == '%') error.ModuloNotSupported else error.ExpressionInPredicate;
+        };
         return err;
     };
     var leaves: schema.LeafIterator = .init(file.schema.items);
@@ -300,6 +309,22 @@ fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) 
         break;
     };
     return ci;
+}
+
+/// An arithmetic operator or blank in `name` outside a quoted span, which no unquoted column name holds: `%` if there
+/// is one, else the first.
+fn operatorOutsideQuotes(name: []const u8) Error!?u8 {
+    var first: ?u8 = null;
+    var i: usize = 0;
+    while (i < name.len) : (i += 1) switch (name[i]) {
+        '\'', '"' => i = try skipQuoted(name, i) - 1,
+        '%' => return '%',
+        '+', '-', '*', '/', ' ', '\t' => |c| if (first == null) {
+            first = c;
+        },
+        else => {},
+    };
+    return first;
 }
 
 fn parseLeafBody(
@@ -2613,7 +2638,8 @@ test "regression: a SQL predicate handed on as text selects the rows it was writ
         .{ .where = "x > 2 + 3", .err = error.BadValue },
         .{ .where = "x > - -5", .err = error.BadValue },
         .{ .where = "5 < x", .err = error.BadValue },
-        .{ .where = "x + 1 > 5", .err = error.UnknownColumn },
+        .{ .where = "x + 1 > 5", .err = error.ExpressionInPredicate },
+        .{ .where = "x % 2 = 1", .err = error.ModuloNotSupported },
         .{ .where = "s GLOB 'a*'", .err = error.BadOperator },
     };
     for (cases) |case| {
@@ -2696,4 +2722,23 @@ test "regression: a BOOLEAN column alone is the predicate `col = true`, NULL kep
     try testing.expectError(error.UnknownColumn, parse(a, "nope AND flag", &meta, null));
     try testing.expectError(error.BadOperator, parse(a, "TRUE", &meta, null));
     try testing.expectError(error.BadOperator, parse(a, "flag + 1", &meta, null));
+}
+
+test "regression: a `%` or arithmetic where a predicate wants a column is named, not an unknown column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    var diag: Diag = .{};
+    try testing.expectError(error.ModuloNotSupported, parse(a, "id % 2 = 1", &meta, &diag));
+    try testing.expectEqualStrings("id % 2", diag.column.get());
+    try testing.expectError(error.ModuloNotSupported, parse(a, "id % 2 IN (1, 3)", &meta, null));
+    try testing.expectError(error.ModuloNotSupported, parse(a, "NOT (id%2 BETWEEN 0 AND 1)", &meta, null));
+    try testing.expectError(error.ExpressionInPredicate, parse(a, "id + 1 > 5", &meta, null));
+    try testing.expectError(error.ExpressionInPredicate, parse(a, "score * 2 IS NULL", &meta, null));
+    // A `%` in a literal is no operator, and a name that matches nothing stays an unknown column.
+    _ = try parse(a, "status LIKE 'a%' AND status != '100%'", &meta, null);
+    try testing.expectError(error.UnknownColumn, parse(a, "nope = 1", &meta, null));
+    try testing.expectError(error.UnknownColumn, parse(a, "\"no % pe\" = 1", &meta, null));
 }

@@ -27,6 +27,8 @@ pub const Error = error{
     EmptyExpr,
     EmptyAggregate,
     UnexpectedChar,
+    /// `%`, which zpq does not have.
+    ModuloNotSupported,
     UnexpectedEnd,
     BadNumber,
     UnknownColumn,
@@ -144,6 +146,8 @@ const Lexer = struct {
                 self.pos += 1;
                 return .{ .kind = .comma, .text = "" };
             },
+            // An operator SQL has and zpq does not: named, not an unexpected character.
+            '%' => return error.ModuloNotSupported,
             '|' => {
                 if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '|') {
                     self.pos += 2;
@@ -1532,4 +1536,15 @@ test "fuzz: select, aggregate, group-by and filter text parse or fail with an er
         "a IN (1, 2, 3) AND s NOT IN ('p', 'q') AND s LIKE 'ab%' AND b IS NOT NULL",
         "coalesce(a, 0) * -(b - 3) / 2",
     } });
+}
+
+test "regression: `%` in an expression is named as an operator zpq does not have" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"id"}, &.{.INT64});
+    try testing.expectError(error.ModuloNotSupported, parseExprOnly(a, "id % 2", &file, null));
+    try testing.expectError(error.ModuloNotSupported, parseSelect(a, "id, id%2 AS m", &file, null));
+    // In a string literal it is a character.
+    _ = try parseExprOnly(a, "coalesce('a%', 'b')", &file, null);
 }

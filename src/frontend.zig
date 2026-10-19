@@ -156,6 +156,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             diagnosticPrint("zpq query: input file path too long\n", .{}),
         error.EmptyExpr => diagnosticPrint("zpq query: empty expression\n", .{}),
         error.UnexpectedChar => diagnosticPrint("zpq query: unexpected character in expression\n", .{}),
+        error.ModuloNotSupported => diagnosticPrint("zpq query: operator % is not supported\n", .{}),
+        error.ExpressionInPredicate => diagnosticPrint(
+            "zpq query: `{s}` is an expression; a predicate compares a column with a literal\n",
+            .{diag.column.get()},
+        ),
         error.UnexpectedEnd => diagnosticPrint("zpq query: unexpected end of expression\n", .{}),
         error.BadNumber => diagnosticPrint("zpq query: invalid number in expression\n", .{}),
         error.UnsupportedCodec => diagnosticPrint(

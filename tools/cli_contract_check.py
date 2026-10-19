@@ -105,6 +105,13 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
             '--query', 'SELECT broken(', '--summary=json', code=2)
         error = json.loads(p.stderr)
         assert error['type'] == 'error' and not error['ok'] and not p.stdout
+    # An operator zpq does not have is named, as an unsupported query (exit 2), wherever it is written.
+    for args in (['--filter', 'k % 2 = 1'], ['--query', f"SELECT k % 2 AS m FROM '{src}'"],
+                 ['--query', f"SELECT count(*) AS n FROM '{src}' WHERE k % 2 = 1"]):
+        p = run(src, *args, code=2) if '--query' not in args else run(*args, code=2)
+        assert b'operator % is not supported' in p.stderr and not p.stdout, (args, p.stderr)
+    p = run(src, '--filter', 'k + 1 > 2', code=2)
+    assert b'`k + 1` is an expression' in p.stderr, p.stderr
     p = run(src, '--aggregate', 'count(*)', '--explain', '-o', str(root / 'never.parquet'))
     assert json.loads(p.stdout)['explain'] and not (root / 'never.parquet').exists()
     p = run(src, '--aggregate', 'count(*)', '--summary=json', '--profile-summary=json')

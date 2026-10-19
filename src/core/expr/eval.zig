@@ -105,31 +105,7 @@ fn evalCase(
 ) Error!Batch.Column {
     const n = batch.num_rows;
     var remaining = if (batch.sel) |s| try s.cloneAlloc(arena) else try selection.SelectionVector.init(arena, n);
-    const def = try arena.alloc(u32, n);
-    @memset(def, 0);
-    const Lane = union(enum) { i64: []i64, f64: []f64, str: [][]const u8, dec: []i128 };
-    const out: Lane = switch (c.result_type) {
-        .i64 => blk: {
-            const v = try arena.alloc(i64, n);
-            @memset(v, 0);
-            break :blk .{ .i64 = v };
-        },
-        .f64 => blk: {
-            const v = try arena.alloc(f64, n);
-            @memset(v, 0);
-            break :blk .{ .f64 = v };
-        },
-        .str => blk: {
-            const v = try arena.alloc([]const u8, n);
-            @memset(v, "");
-            break :blk .{ .str = v };
-        },
-        .dec => blk: {
-            const v = try arena.alloc(i128, n);
-            @memset(v, 0);
-            break :blk .{ .dec = v };
-        },
-    };
+    var result = try RowAssembly.init(arena, n, c.result_type, c.dec);
     for (0..c.whens.len + 1) |w| {
         if (!remaining.any()) break;
         const is_else = w == c.whens.len;
@@ -146,11 +122,53 @@ fn evalCase(
             try evalGroupKeyExpr(arena, &restricted, column_lookup, branch.*)
         else
             try evalExpr(arena, &restricted, column_lookup, branch.*);
-        const scale: u8 = if (branch.typeOf() == .dec) branch.decSpec().?.scale else 0;
-        for (0..n) |i| {
-            if (!taken.isActive(i) or rowIsNull(col, i)) continue;
-            def[i] = 1;
-            switch (out) {
+        try result.take(&taken, col, branch.*);
+    }
+    return result.finish();
+}
+
+/// A result built row by row from columns that each supply some of its rows (CASE's branches, coalesce's arguments),
+/// in the result's lane: a value converted exactly (a DECIMAL to the result's scale, an error past its precision), a
+/// row no column supplies a value for NULL.
+const RowAssembly = struct {
+    out: union(enum) { i64: []i64, f64: []f64, str: [][]const u8, dec: []i128 },
+    def: []u32,
+    dec: ?ast.Dec,
+
+    fn init(arena: std.mem.Allocator, n: usize, result_type: ast.Type, dec: ?ast.Dec) Error!RowAssembly {
+        const def = try arena.alloc(u32, n);
+        @memset(def, 0);
+        return .{ .def = def, .dec = dec, .out = switch (result_type) {
+            .i64 => .{ .i64 = blk: {
+                const v = try arena.alloc(i64, n);
+                @memset(v, 0);
+                break :blk v;
+            } },
+            .f64 => .{ .f64 = blk: {
+                const v = try arena.alloc(f64, n);
+                @memset(v, 0);
+                break :blk v;
+            } },
+            .str => .{ .str = blk: {
+                const v = try arena.alloc([]const u8, n);
+                @memset(v, "");
+                break :blk v;
+            } },
+            .dec => .{ .dec = blk: {
+                const v = try arena.alloc(i128, n);
+                @memset(v, 0);
+                break :blk v;
+            } },
+        } };
+    }
+
+    /// `col`'s value, evaluated from `e`, at each row of `rows` where it is present.
+    fn take(self: *RowAssembly, rows: *const selection.SelectionVector, col: Batch.Column, e: ast.Expr) Error!void {
+        const scale: u8 = if (e.typeOf() == .dec) e.decSpec().?.scale else 0;
+        for (0..self.def.len) |i| {
+            if (!rows.isActive(i) or rowIsNull(col, i)) continue;
+            self.def[i] = 1;
+            switch (self.out) {
                 .i64 => |v| v[i] = switch (col) {
                     .i64 => |x| x.values[i],
                     else => return error.TypeMismatch,
@@ -167,7 +185,7 @@ fn evalCase(
                 },
                 // To the result's scale, exactly; a value its precision cannot hold is an error, never rounded.
                 .dec => |v| {
-                    const spec = c.dec.?;
+                    const spec = self.dec.?;
                     const raw: i128 = switch (col) {
                         .i128 => |x| x.values[i],
                         .i64 => |x| x.values[i],
@@ -181,15 +199,18 @@ fn evalCase(
             }
         }
     }
-    const has_nulls = std.mem.indexOfScalar(u32, def, 0) != null;
-    const levels: ?[]const u32 = if (has_nulls) def else null;
-    return switch (out) {
-        .i64 => |v| .{ .i64 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
-        .f64 => |v| .{ .f64 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
-        .str => |v| .{ .string = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
-        .dec => |v| .{ .i128 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
-    };
-}
+
+    fn finish(self: RowAssembly) Batch.Column {
+        const has_nulls = std.mem.indexOfScalar(u32, self.def, 0) != null;
+        const levels: ?[]const u32 = if (has_nulls) self.def else null;
+        return switch (self.out) {
+            .i64 => |v| .{ .i64 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+            .f64 => |v| .{ .f64 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+            .str => |v| .{ .string = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+            .dec => |v| .{ .i128 = .{ .values = v, .def_levels = levels, .max_def = 1, .has_nulls = has_nulls } },
+        };
+    }
+};
 
 fn rowIsNull(col: Batch.Column, row: usize) bool {
     return switch (col) {
@@ -1009,8 +1030,10 @@ fn evalCoalesce(
     result_type: ast.Type,
     c_dec: ?ast.Dec,
 ) Error!Batch.Column {
-    if (args.len != 2) return error.UnsupportedCoalesce;
-    if (args[0].* != .col_ref) return error.UnsupportedCoalesce;
+    // The kernels below serve the common `coalesce(column, literal | column)`; any other arguments, as many as given,
+    // take the general form.
+    const fast = args.len == 2 and args[0].* == .col_ref and (args[1].* == .literal or args[1].* == .col_ref);
+    if (!fast) return evalCoalesceAny(arena, batch, column_lookup, args, result_type, c_dec);
 
     // `coalesce(col, X)`. X is either a literal (the original form —
     // "use literal default for null rows") or another column ref
@@ -1027,8 +1050,30 @@ fn evalCoalesce(
             result_type,
             c_dec,
         ),
-        else => error.UnsupportedCoalesce,
+        else => unreachable,
     };
+}
+
+/// `coalesce` over any arguments: each evaluated, NULLs kept, over just the rows every earlier one left NULL, so its
+/// faults (`coalesce(a, 100 / b)` where `b` is 0) count only where it is the answer; its present values are taken.
+fn evalCoalesceAny(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    args: []const *ast.Expr,
+    result_type: ast.Type,
+    c_dec: ?ast.Dec,
+) Error!Batch.Column {
+    const n = batch.num_rows;
+    var remaining = if (batch.sel) |s| try s.cloneAlloc(arena) else try selection.SelectionVector.init(arena, n);
+    var result = try RowAssembly.init(arena, n, result_type, c_dec);
+    for (args) |arg| {
+        if (!remaining.any()) break;
+        const col = try evalGroupKeyExpr(arena, &batch.restrictedTo(&remaining), column_lookup, arg.*);
+        try result.take(&remaining, col, arg.*);
+        for (result.def, 0..) |d, i| if (d == 1) remaining.set(i, false);
+    }
+    return result.finish();
 }
 
 fn evalCoalesceColLit(
@@ -2194,4 +2239,53 @@ test "strlen counts bytes, keeps NULL rows NULL and reads dictionary codes per e
     try std.testing.expectEqualSlices(u32, &def, got.i64.def_levels.?);
     const via_codes = try evalExpr(a, &.{ .cols = &.{coded}, .num_rows = 4 }, &lookup, call);
     try std.testing.expectEqualSlices(i64, &.{ 6, 2, 2, 6 }, via_codes.i64.values);
+}
+
+test "coalesce over any arguments: first present value, each argument evaluated only where every earlier one is NULL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // x NULL in row 1; y NULL in rows 0 and 1, 0 in row 2 (a divisor), REQUIRED neighbours elsewhere.
+    const xs = [_]i64{ 3, 0, 5, 7 };
+    const x_def = [_]u32{ 1, 0, 1, 1 };
+    const ys = [_]i64{ 0, 0, 0, 2 };
+    const y_def = [_]u32{ 0, 0, 1, 1 };
+    const strs = [_][]const u8{ "a", "", "c", "d" };
+    const cols = [_]Batch.Column{
+        .{ .i64 = .{ .values = &xs, .def_levels = &x_def, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = &ys, .def_levels = &y_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs, .def_levels = &x_def, .max_def = 1, .has_nulls = true } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4 };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    var x: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    var y: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    var s: ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    var two: ast.Expr = .{ .literal = .{ .i64 = 2 } };
+    var seven: ast.Expr = .{ .literal = .{ .i64 = 7 } };
+    var hundred: ast.Expr = .{ .literal = .{ .i64 = 100 } };
+    var na: ast.Expr = .{ .literal = .{ .str = "NA" } };
+    var suffix: ast.Expr = .{ .literal = .{ .str = "!" } };
+    var x2: ast.Expr = .{ .binop = .{ .op = .mul, .left = &x, .right = &two, .result_type = .i64, .depth = 2 } };
+    var div: ast.Expr = .{ .binop = .{ .op = .div, .left = &hundred, .right = &y, .result_type = .i64, .depth = 2 } };
+    var cat: ast.Expr = .{ .binop = .{ .op = .concat, .left = &s, .right = &suffix, .result_type = .str, .depth = 2 } };
+    const call = struct {
+        fn of(args: []const *ast.Expr, t: ast.Type) ast.Expr {
+            return .{ .call = .{ .func = .coalesce, .args = args, .result_type = t, .depth = 3 } };
+        }
+    }.of;
+
+    // Arithmetic first, a column, then a literal: three arguments.
+    const three = try evalExpr(a, &batch, &lookup, call(&.{ &x2, &y, &seven }, .i64));
+    try testing.expectEqualSlices(i64, &.{ 6, 7, 10, 14 }, three.i64.values);
+    try testing.expect(three.i64.def_levels == null);
+    // `100 / y` divides by zero only in row 2, where `x * 2` already answered; rows 0 and 1 stay NULL there.
+    const guarded = try evalExpr(a, &batch, &lookup, call(&.{ &x2, &div }, .i64));
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 1 }, guarded.i64.def_levels.?);
+    try testing.expectEqualSlices(i64, &.{ 6, 0, 10, 14 }, guarded.i64.values);
+    try testing.expectError(error.DivisionByZero, evalExpr(a, &batch, &lookup, call(&.{ &div, &x2 }, .i64)));
+    // Strings, an expression first.
+    const words = try evalExpr(a, &batch, &lookup, call(&.{ &cat, &na }, .str));
+    try testing.expectEqualStrings("a!", words.string.values[0]);
+    try testing.expectEqualStrings("NA", words.string.values[1]);
 }

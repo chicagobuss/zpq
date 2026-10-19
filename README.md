@@ -151,9 +151,10 @@ not rounded to it.
 **Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
-`coalesce(col, default)`, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ... [ELSE v] END`, parens,
-unary minus. A CASE evaluates a branch only on the rows that take it, so a fault in a branch no row reaches is no
-error; the simple form (`CASE x WHEN ...`) is not supported. DECIMAL arithmetic is exact (see below).
+`coalesce(a, b, ...)` over any expressions, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
+[ELSE v] END`, parens, unary minus. A CASE evaluates a branch only on the rows that take it, and coalesce an argument
+only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
+(`CASE x WHEN ...`) is not supported. DECIMAL arithmetic is exact (see below).
 
 **Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`. In SQL,
 GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a column of the name wins,

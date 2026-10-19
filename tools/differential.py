@@ -100,6 +100,13 @@ SELECTS = [
     ("dec_null",  "price * CASE WHEN amt IS NOT NULL THEN 2 END AS x", "price * CASE WHEN amt IS NOT NULL THEN 2 END AS x"),
     ("str_null",  "nname || '_z' AS x",     "nname || '_z' AS x"),
     ("null_div",  "id / CASE WHEN id = 0 THEN NULL ELSE id END AS x", "id // CASE WHEN id = 0 THEN NULL ELSE id END AS x"),
+    # coalesce over any arguments: arithmetic first, three of them, DECIMAL, strings; a later argument evaluated only
+    # where the earlier ones are NULL (`id + 1` is never NULL, so the division by zero never happens).
+    ("coal_arith", "coalesce(amt * 2, id, 0) AS x", "coalesce(amt * 2, id, 0) AS x"),
+    ("coal_dec",  "coalesce(price * CASE WHEN amt IS NOT NULL THEN 2 END, price + 1) AS x",
+                  "coalesce(price * CASE WHEN amt IS NOT NULL THEN 2 END, price + 1) AS x"),
+    ("coal_str",  "coalesce(nname || '_z', name, 'NA') AS x", "coalesce(nname || '_z', name, 'NA') AS x"),
+    ("coal_lazy", "coalesce(id + 1, 100 / (id - id)) AS x", "id + 1 AS x"),
 ]
 
 # (label, zpq_agg, duckdb_select) — filter × aggregate, compared as scalars.

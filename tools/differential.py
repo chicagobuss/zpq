@@ -88,6 +88,8 @@ SELECTS = [
                   "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x"),
     ("case_dead_div", "CASE WHEN id = 0 THEN -1 ELSE 100 / id END AS x",
                   "CASE WHEN id = 0 THEN -1 ELSE 100 // id END AS x"),
+    ("case_bare_bool", "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x",
+                  "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x"),
     ("case_dec",  "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x",
                   "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x"),
     # Raw arithmetic over a NULLABLE column (e.g. `amt * 2`) is a documented
@@ -182,6 +184,17 @@ SQL_PRED_DIFF = [
     "NOT (id BETWEEN -5 AND NULL)",
     "amt < +2.5e3 AND amt > -1.5E2",
     "price BETWEEN -1.5 AND 1e2",
+    # A BOOLEAN column alone is `flag = true`: NULL is not true, and NOT NULL is NULL, so neither form keeps it.
+    "flag",
+    "NOT flag",
+    "\"flag\"",
+    "flag AND id > 0",
+    "NOT flag OR nname IS NULL",
+    "NOT (flag AND amt > 0)",
+    "flag OR NOT flag",
+    "(flag OR id < -1900) AND NOT (nname LIKE 'v1%')",
+    # Only a BOOLEAN column is a predicate alone.
+    "id",
 ]
 
 # The same shapes over a fixture whose strings hold the literals a raw-substring split would cut, so a predicate that

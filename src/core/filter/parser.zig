@@ -605,7 +605,7 @@ fn parseComparisonLeaf(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const found = (try findComparison(expr)) orelse return error.BadOperator;
+    const found = (try findComparison(expr)) orelse return bareBoolean(arena, expr, file, diag);
     const op = found.op;
     const found_at = found.at;
     const found_len = found.len;
@@ -623,6 +623,25 @@ fn parseComparisonLeaf(
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     return try buildTypedComparison(arena, file, col_idx, &elem, op, val_str, diag);
+}
+
+/// A leaf that is a column's name alone (`b`, `"b"`, `t.b`): SQL's bare BOOLEAN predicate, the same leaf as `b = true`
+/// (a NULL is not true, and under NOT stays out too). A column of another type is no predicate.
+fn bareBoolean(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error!ast.Filter {
+    const lone = if (expr[0] == '"')
+        try skipQuoted(expr, 0) == expr.len
+    else for (expr) |c| {
+        if (!isWordByte(c) and c != '.') break false;
+    } else true;
+    if (!lone or isNullLiteral(expr) or std.ascii.eqlIgnoreCase(expr, "true") or std.ascii.eqlIgnoreCase(expr, "false"))
+        return error.BadOperator;
+    const col_idx = try resolveCol(file, expr, diag);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    if (elem.type != .BOOLEAN) {
+        Diag.set(diag, metadata.unquoteIdent(expr), .{ .bare_non_boolean = .{ .type_name = @tagName(elem.type orelse .BOOLEAN) } });
+        return error.BadOperator;
+    }
+    return buildTypedComparison(arena, file, col_idx, &elem, .Eq, "true", diag);
 }
 
 const Comparison = struct { op: ast.Operator, at: usize, len: usize };
@@ -2624,4 +2643,57 @@ test "regression: a SQL predicate handed on as text selects the rows it was writ
             if (case.want) |w| try testing.expectEqualSlices(bool, &(try Select.rows(a, try parse(a, w, &meta, null), &batch, &lookup)), &got);
         }
     }
+}
+
+test "regression: a BOOLEAN column alone is the predicate `col = true`, NULL kept out under any NOT" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
+    defer meta.deinit(a);
+    try meta.schema.append(a, .{ .type = .BOOLEAN, .type_length = null, .repetition_type = .REQUIRED, .name = "root", .num_children = 2, .scale = null, .precision = null, .field_id = null });
+    try meta.schema.append(a, .{ .type = .BOOLEAN, .type_length = null, .repetition_type = .OPTIONAL, .name = "flag", .num_children = null, .scale = null, .precision = null, .field_id = null });
+    try meta.schema.append(a, .{ .type = .INT32, .type_length = null, .repetition_type = .OPTIONAL, .name = "id", .num_children = null, .scale = null, .precision = null, .field_id = null });
+    const flags = [_]bool{ true, false, false, true };
+    const flag_def = [_]u32{ 1, 1, 0, 1 };
+    const ids = [_]i32{ 1, 2, 3, 4 };
+    const cols = [_]eval.Batch.Column{
+        .{ .boolean = .{ .values = &flags, .def_levels = &flag_def, .max_def = 1, .has_nulls = true } },
+        .{ .i32 = .{ .values = &ids } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    // Rows: flag true, false, NULL, true.
+    const cases = [_]Case{
+        .{ .filter = "flag", .want = .{ true, false, false, true } },
+        .{ .filter = "\"flag\"", .want = .{ true, false, false, true } },
+        .{ .filter = "NOT flag", .want = .{ false, true, false, false } },
+        .{ .filter = "NOT NOT flag", .want = .{ true, false, false, true } },
+        .{ .filter = "flag AND id > 1", .want = .{ false, false, false, true } },
+        .{ .filter = "flag OR id = 3", .want = .{ true, false, true, true } },
+        .{ .filter = "NOT (flag OR id = 2)", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (flag AND id > 1)", .want = .{ true, true, false, false } },
+        .{ .filter = "(flag) AND NOT (id = 1)", .want = .{ false, false, false, true } },
+        .{ .filter = "flag OR NOT flag", .want = .{ true, true, false, true } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
+    // Only a BOOLEAN column alone is a predicate; the refusal says so.
+    var diag: Diag = .{};
+    try testing.expectError(error.BadOperator, parse(a, "id", &meta, &diag));
+    try testing.expect(diag.detail == .bare_non_boolean);
+    try testing.expectEqualStrings("id", diag.column.get());
+    try testing.expectError(error.UnknownColumn, parse(a, "nope AND flag", &meta, null));
+    try testing.expectError(error.BadOperator, parse(a, "TRUE", &meta, null));
+    try testing.expectError(error.BadOperator, parse(a, "flag + 1", &meta, null));
 }

@@ -295,6 +295,10 @@ fn printDetail(diag: *const Diag) void {
                 "  expression or LIKE ... ESCAPE)\n",
             .{name},
         ),
+        .bare_non_boolean => |b| diagnosticPrint(
+            "filter: `{s}` alone is a predicate only if it is BOOLEAN (it is {s}); compare it, e.g. `{s} != 0`\n",
+            .{ name, b.type_name, name },
+        ),
         // The upload logged it to stderr when it happened.
         .s3_request => {},
     }

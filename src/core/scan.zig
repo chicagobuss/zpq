@@ -3649,7 +3649,13 @@ fn prepareAggregate(
             if (group_by_keys) |keys| if (keys.len > 1) if (ndv_stat) |stat| {
                 const run_width = @max(stat.key_bytes, stat.run_key_bytes);
                 if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536) {
-                    private_decode = try PrivateDecode.init(arena, group_budget, n_workers, args.decode_limit, stat.run_dictionary_peak);
+                    private_decode = try PrivateDecode.init(
+                        arena,
+                        group_budget,
+                        n_workers,
+                        args.decode_limit,
+                        stat.run_dictionary_peak,
+                    );
                     if (private_decode.held > 0 and part_state.?.reservePrivate(stat.rows, run_width) and
                         try private_decode.fundSamples(arena, &part_state.?, run_width))
                     {

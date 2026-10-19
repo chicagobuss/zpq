@@ -59,9 +59,11 @@ side allocations are freed before remaining funding returns, before the run fold
 Local sample tables also receive bounded floors, transferred from the prepaid
 run credit rather than charged again. Otherwise whole decoders can consume the
 ledger before any table reaches the first flush, while the entire run ceiling
-is still unused. An admitted table transfers its idle floor back to prepaid run credit when it
+is still unused. A pending or admitted table transfers its idle floor back to prepaid run credit when it
 is abandoned or finally flushed, without refunding the parent: borrowing decoders
-cannot take those run bytes between a refund and a top-up. A cancelled sample
+cannot take those run bytes between a refund and a top-up. Empty workers return
+their credit under the admission lock too, before or after the first sample
+decides; cancellation uses that same ordering. A cancelled sample
 returns unused floors to the parent while keeping live bytes charged. Child
 ledgers use the parent's tight state when deciding to return table slack. If the run ceiling cannot fund those samples, private runs decline
 before consuming rows. Allocation-failure checks exercise sample tables with a

@@ -5579,6 +5579,9 @@ const TopRows = struct {
     budget: usize,
     /// The query's budget, `--max-memory`: what the kept rows and a row group's decode hold together.
     limit: usize,
+    /// The live account of that budget: the store, the heap, a compaction's copy and a row group's decode all draw
+    /// from it before they allocate. Kept off the struct, which is moved after `init`.
+    mem: *Mem,
     /// The rows admitted so far, their output columns copied; a heap entry indexes one. Rows evicted stay until
     /// `compact` drops them.
     store_arena: *std.heap.ArenaAllocator,
@@ -5586,7 +5589,17 @@ const TopRows = struct {
     heap: std.PriorityQueue(Entry, *const TopRows, later),
 
     const pending = std.math.maxInt(usize);
+    /// What the account holds at least: under a tiny budget a decode's few bytes of noise decided the answer.
     const decode_floor: usize = 1 << 20;
+
+    const Mem = struct {
+        ledger: core_memory.SharedBudget,
+        charged: core_memory.Charged,
+
+        fn allocator(m: *Mem) std.mem.Allocator {
+            return m.charged.allocator();
+        }
+    };
 
     const Entry = struct {
         cells: []SortCell,
@@ -5606,8 +5619,12 @@ const TopRows = struct {
         const key_specs = try gpa.alloc(consumer.OutputCol, keys.len);
         errdefer gpa.free(key_specs);
         for (keys, key_specs) |k, *spec| spec.* = k.spec;
+        const mem = try gpa.create(Mem);
+        errdefer gpa.destroy(mem);
+        mem.* = .{ .ledger = .{ .limit = @max(limit, decode_floor) }, .charged = undefined };
+        mem.charged = .{ .child = gpa, .budget = &mem.ledger };
         const store_arena = try gpa.create(std.heap.ArenaAllocator);
-        store_arena.* = .init(gpa);
+        store_arena.* = .init(mem.allocator());
         errdefer {
             store_arena.deinit();
             gpa.destroy(store_arena);
@@ -5621,6 +5638,7 @@ const TopRows = struct {
             .h = h,
             .budget = limit / 2,
             .limit = limit,
+            .mem = mem,
             .store_arena = store_arena,
             .store = try consumer.initOutputAggregator(store_arena.allocator(), meta, specs),
             .heap = .empty,
@@ -5628,9 +5646,10 @@ const TopRows = struct {
     }
 
     fn deinit(self: *TopRows) void {
-        self.heap.deinit(self.gpa);
+        self.heap.deinit(self.mem.allocator());
         self.store_arena.deinit();
         self.gpa.destroy(self.store_arena);
+        self.gpa.destroy(self.mem);
         self.gpa.free(self.key_specs);
     }
 
@@ -5663,14 +5682,10 @@ const TopRows = struct {
         options: consumer.DecodeOptions,
     ) !void {
         if (self.h == 0) return;
-        // The row group decodes on what the query's budget has left beside the kept rows, drawn before it is
-        // allocated: a row group too big for it refuses here, not after the decode has already been resident. Never
-        // less than the fixed slack's `decode_floor`: under a tiny budget a decode's few bytes of noise decided it.
-        const held = self.store_arena.queryCapacity() + self.heap.cap * @sizeOf(Entry);
-        var room: core_memory.SharedBudget = .{ .limit = @max(self.limit -| held, decode_floor) };
-        var decode: core_memory.Charged = .{ .child = self.gpa, .budget = &room };
-        return self.offerOn(decode.allocator(), rg, meta, src, filter, fetch, at, timings, options) catch |e|
-            decode.refusal(e);
+        // The row group decodes on the same account as the rows it keeps, each drawn before it is allocated: what does
+        // not fit refuses there, not after it was resident.
+        return self.offerOn(self.mem.allocator(), rg, meta, src, filter, fetch, at, timings, options) catch |e|
+            self.mem.charged.refusal(e);
     }
 
     fn offerOn(
@@ -5706,17 +5721,23 @@ const TopRows = struct {
         self.heap.context = self;
         const scratch = try ra.alloc(SortCell, self.keys.len);
         var admitted = false;
+        const sa = self.store_arena.allocator();
         for (0..n) |i| {
             for (self.keys, keyed.cols, scratch) |k, buf, *cell| cell.* = sortCell(buf, i, k.unsigned);
             const pos: RowPos = .{ .file = at.file, .rg = at.rg, .ord = @intCast(i) };
+            // An evicted row's keys are the newcomer's: its cells, and its strings where the new ones fit, so input
+            // that improves on every row (descending, for an ascending key) holds one copy per kept row, not per row.
+            var cells: []SortCell = &.{};
             if (self.heap.count() == self.h) {
                 const top = self.heap.peek().?;
                 if (!before(self.keys, scratch, pos, top.cells, top.pos)) continue;
-                _ = self.heap.pop();
+                cells = self.heap.pop().?.cells;
+                for (scratch, cells) |c, *d| d.* = try reuseCell(sa, d.*, c);
+            } else {
+                cells = try sa.alloc(SortCell, self.keys.len);
+                for (scratch, cells) |c, *d| d.* = try ownCell(sa, c);
             }
-            const cells = try self.store_arena.allocator().alloc(SortCell, self.keys.len);
-            for (scratch, cells) |c, *d| d.* = try ownCell(self.store_arena.allocator(), c);
-            try self.heap.push(self.gpa, .{ .cells = cells, .pos = pos, .row = pending });
+            try self.heap.push(self.mem.allocator(), .{ .cells = cells, .pos = pos, .row = pending });
             admitted = true;
         }
         if (!admitted) return;
@@ -5757,10 +5778,21 @@ const TopRows = struct {
         return if (c == .str) .{ .str = try arena.dupe(u8, c.str) } else c;
     }
 
+    /// `c` owned in place of `old`, an evicted row's cell: into its string's bytes when it fits, else copied anew.
+    fn reuseCell(arena: std.mem.Allocator, old: SortCell, c: SortCell) !SortCell {
+        if (c != .str) return c;
+        if (old == .str and old.str.len >= c.str.len) {
+            const into = @constCast(old.str)[0..c.str.len];
+            @memcpy(into, c.str);
+            return .{ .str = into };
+        }
+        return ownCell(arena, c);
+    }
+
     /// Rebuild `store` with only the rows the heap still keeps.
     fn compact(self: *TopRows) !void {
         const fresh = try self.gpa.create(std.heap.ArenaAllocator);
-        fresh.* = .init(self.gpa);
+        fresh.* = .init(self.mem.allocator());
         errdefer {
             fresh.deinit();
             self.gpa.destroy(fresh);
@@ -10527,6 +10559,42 @@ test "the parallel plain-row Top-N answers within the memory budget wherever rea
         // Its own reservations stay within half the budget; decoding the row group and the printed answer are the rest.
         try std.testing.expect(peak.peak < 8 << 20);
     }
+}
+
+test "the serial Top-N keeps one key copy per kept row when every row evicts the last, within its budget" {
+    // 100000 descending values in one row group: under ORDER BY k LIMIT 1 each row improves on the one kept. Its key
+    // was copied anew per row on memory the budget did not see (a 4M-row file held 150 MiB at 64M, or was killed).
+    const path_in = "ci/fixtures/parquet/topn_descending.parquet";
+    const gpa = std.testing.allocator;
+    const bytes = metadata.readFileSlice(path_in, gpa) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer gpa.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const meta = try metadata.open(arena_state.allocator(), bytes);
+    const specs = [_]consumer.OutputCol{.{ .passthrough = 0 }};
+    const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = 0 }, .descending = false, .unsigned = false }};
+    var top: TopRows = try .init(gpa, &meta, &specs, &keys, 1, 64 << 20);
+    defer top.deinit();
+    var timings: consumer.Timings = .{};
+    try top.offer(&meta.row_groups.items[0], &meta, .{ .bytes = bytes, .byte_origin = 0 }, null, &.{true}, .{
+        .file = 0,
+        .rg = 0,
+    }, &timings, .{});
+    try std.testing.expectEqual(@as(usize, 1), top.heap.count());
+    try std.testing.expectEqual(SortCell{ .int = 0 }, top.heap.peek().?.cells[0]);
+    // One kept row's keys and output, not a copy per row (3.2 MB); and every byte of it on the live account.
+    try std.testing.expect(top.store_arena.queryCapacity() < 64 << 10);
+    try std.testing.expect(top.mem.ledger.used.load(.monotonic) >= top.store_arena.queryCapacity());
+    try std.testing.expect(top.mem.ledger.used.load(.monotonic) < 256 << 10);
+    // Past the account, the row group's decode refuses cleanly before it is allocated.
+    var tight: TopRows = try .init(gpa, &meta, &specs, &keys, 1, 0);
+    defer tight.deinit();
+    const src: consumer.RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+    const refused = tight.offer(&meta.row_groups.items[0], &meta, src, null, &.{true}, .{ .file = 0, .rg = 0 }, &timings, .{});
+    if (refused) |_| {} else |e| try std.testing.expectEqual(error.ExceededMemoryBudget, e);
 }
 
 test "in-process text sink flushes across buffer boundaries and allocation failures" {

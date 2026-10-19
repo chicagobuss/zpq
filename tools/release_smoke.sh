@@ -6,7 +6,8 @@
 #   - x86_64-linux-musl: the CLI natively (--version, an aggregate, SQL, a filtered -o write read back), then the
 #     Lambda bootstrap against the fake runtime API of tests/lambda_integration.zig (`zig build test-integration`
 #     built for the target: the same `zpq-lambda` artifact tools/serverless/aws.sh zips as `bootstrap`).
-#   - aarch64-linux-musl: the same under qemu-aarch64 when installed; otherwise reported as NOT RUN, with what to install.
+#   - aarch64-linux-musl: the same under qemu-aarch64 when installed (Ubuntu: qemu-user, plus qemu-user-binfmt so the
+#     Lambda bootstrap the integration test spawns runs too); otherwise reported as NOT RUN, with what to install.
 #   - aarch64-macos: built only. It runs on a Mac (the grantedmbp run), never here.
 # Exit 1 on any failed build or run; a target this host cannot run is listed at the end, not a failure.
 #
@@ -52,11 +53,13 @@ smoke_cli() {
         "$($runner "$bin" query "$TMP/$t.parquet" --aggregate 'count(*) AS n, sum(b) AS s')"
 }
 
-# The Lambda bootstrap of target `t` against the fake runtime API, natively.
+# The Lambda bootstrap of target `t` against the fake runtime API; extra arguments go to `zig build` (`-fqemu` runs a
+# foreign test binary under qemu, whose bootstrap child binfmt hands to qemu in turn).
 smoke_lambda() {
     local t="$1"
-    echo "== run $t Lambda bootstrap (fake runtime API)"
-    "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast test-integration --summary failures
+    shift
+    echo "== run $t Lambda bootstrap (fake runtime API)${1:+ $*}"
+    "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast "$@" test-integration --summary failures
     echo "  ok test-integration"
 }
 
@@ -77,11 +80,15 @@ build "$t"
 if [[ "$(uname -s)" == Linux && "$host" == aarch64 ]]; then
     smoke_cli "$t" ""
     smoke_lambda "$t"
-elif [[ "$(uname -s)" == Linux ]] && { command -v qemu-aarch64 >/dev/null 2>&1 || command -v qemu-aarch64-static >/dev/null 2>&1; }; then
-    smoke_cli "$t" "$(command -v qemu-aarch64 || command -v qemu-aarch64-static)"
-    not_run+=("$t Lambda bootstrap: the fake runtime harness runs natively only")
+elif [[ "$(uname -s)" == Linux ]] && qemu="$(command -v qemu-aarch64 || command -v qemu-aarch64-static)"; then
+    smoke_cli "$t" "$qemu"
+    if [[ -r /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] && grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64; then
+        smoke_lambda "$t" -fqemu
+    else
+        not_run+=("$t Lambda bootstrap: no binfmt for aarch64 to run the child the harness spawns (install qemu-user-binfmt)")
+    fi
 else
-    not_run+=("$t CLI and Lambda: no qemu-aarch64 (install qemu-user-static, e.g. 'apt install qemu-user-static')")
+    not_run+=("$t CLI and Lambda: no qemu-aarch64 (install qemu-user and qemu-user-binfmt; qemu-user-static elsewhere)")
 fi
 
 t=aarch64-macos

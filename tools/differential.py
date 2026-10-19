@@ -139,6 +139,143 @@ def gen_fixture(con, path, n=4000):
 from decimal import Decimal
 
 
+# SQL predicates the front end hands to the filter grammar as text: NOT over groups, literals holding the grammar's
+# keywords, NULL operands, values that are no literal. Each answers as DuckDB does (count and sum, in WHERE and in an
+# aggregate FILTER, the same at every -j) or is refused with a message and no rows; where DuckDB refuses, zpq must too.
+SQL_PRED_DIFF = [
+    # NOT over groups
+    "NOT (amt > 5 AND id < 3)",
+    "NOT (amt > 5 OR id < -1000)",
+    "NOT NOT (amt > 5 OR id < -1000)",
+    "id > 0 AND NOT (amt > 1000 OR nname LIKE 'v3%')",
+    "NOT (amt > 1000 OR nname LIKE 'v3%') AND id > 0",
+    "id < -1500 OR NOT (amt > 0 AND nname IS NOT NULL)",
+    "NOT ((amt > 0 OR nname LIKE 'v2%') AND (id > 100 OR nname IS NULL))",
+    "NOT (id IN (1, 5, 999) AND amt > 0)",
+    "NOT (id NOT IN (1, 5, 999) OR nname IS NULL)",
+    "NOT (amt NOT BETWEEN -100 AND 100)",
+    "amt NOT BETWEEN -100 AND 100 AND id > 0",
+    "NOT (amt BETWEEN -100 AND 100 OR id > 1000)",
+    "NOT (nname LIKE 'v1%' AND name NOT LIKE '%3')",
+    "NOT (nname IS NULL OR amt IS NULL)",
+    "NOT (amt <= 10 AND amt >= -10)",
+    "amt > 0 OR (id < -1000 OR nname IS NULL)",
+    "NOT ((amt > 5 AND id < 3) OR nname LIKE 'v2%')",
+    "id > 0 AND (amt > 5 OR nname LIKE 'v2%')",
+    "NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%'",
+    "nname = 'a OR id > 0'",
+    "name LIKE 'n1%' ESCAPE '#'",
+    "NOT (id > -5 AND amt < 1.5E+3)",
+    "NOT (price > 1e2 OR d >= '2020-06-01') OR ts < '2020-01-01 00:00:00.0995'",
+    "nname NOT IN ('v1', NULL)",
+    "NOT (nname IN ('v1', NULL))",
+    "nname != NULL",
+    "name = nname",
+    "name = 'n' || '1'",
+    # A NULL pattern or bound is UNKNOWN (the grammar once read `LIKE NULL` as the text), and signed or exponent
+    # literals on DOUBLE and DECIMAL columns.
+    "nname LIKE NULL",
+    "nname NOT LIKE NULL OR id = 7",
+    "NOT (nname LIKE NULL)",
+    "id BETWEEN NULL AND 5",
+    "id NOT BETWEEN NULL AND 5",
+    "NOT (id BETWEEN -5 AND NULL)",
+    "amt < +2.5e3 AND amt > -1.5E2",
+    "price BETWEEN -1.5 AND 1e2",
+]
+
+# The same shapes over a fixture whose strings hold the literals a raw-substring split would cut, so a predicate that
+# splits them answers differently.
+SQL_PRED_UNIT = [
+    "NOT (x > 5 AND y < 3)", "NOT (x > 5 OR y < 3)", "NOT NOT (x > 5 OR y < 3)", "NOT NOT NOT x > 5",
+    "z = 1 AND NOT (x > 5 OR y < 3)", "NOT (x > 5 OR y < 3) AND z = 1", "NOT (x > 5 AND y < 3) OR z = 1",
+    "z = 1 OR NOT (x > 5 AND y < 3)", "NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))", "NOT (x IN (1, 2) AND y = 1)",
+    "NOT (x NOT IN (1, 2) OR y = 1)", "NOT (x NOT BETWEEN 1 AND 3)", "x NOT BETWEEN 1 AND 3 OR y = 1",
+    "NOT (x BETWEEN 1 AND 3 OR y = 1)", "NOT (s LIKE 'a%' AND s NOT LIKE '%b')",
+    "NOT (s IS NULL OR s IS NOT NULL)", "x = 1 OR (y = 2 OR z = 3)", "x = 1 AND (y = 2 AND (z = 3 AND x = 4))",
+    "(x = 1 AND y = 2) OR z = 3", "x BETWEEN 1 AND 2 OR s = 'a or b'", "x > -5 AND y < +2.5e3 AND z IN (-1, 2)",
+    "x BETWEEN -1.5 AND 1e2 OR s = ''", "d >= '2020-06-01' AND s IS NOT NULL",
+    # groups that are not an OR of ANDs
+    "NOT ((x > 5 AND y < 3) OR z = 1)", "x = 1 AND (y = 2 OR z = 3)", "(x = 1 OR y = 2) AND z = 3",
+    "NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5", "NOT (x = 1 AND y = 2) AND z = 3",
+    # literals with keywords, quotes or commas; NULL operands; values that are no literal
+    "s = 'a OR b = 1'", "s = 'rock AND roll'", "s = 'x BETWEEN y'", "s = 'O''Brien'", "s IN ('a,b', 'c')",
+    "\"a OR b\" = 1", "s LIKE 'a#%' ESCAPE '#'", "s NOT IN ('a', NULL)", "NOT (s IN ('a', NULL))", "s IN (NULL)",
+    "s != NULL", "s > NULL", "s LIKE NULL", "x BETWEEN NULL AND 5", "s IS 'a'", "b = TRUE", "s = t", "s = \"t\"",
+    "s = 'a' || 'b'", "s = 'a' COLLATE NOCASE", "s = upper('a')", "s = CAST('a' AS TEXT)", "s = x'61'",
+    "x > 2 + 3", "x > - -5", "5 < x", "x + 1 > 5", "s GLOB 'a*'",
+]
+
+
+def gen_sql_pred_fixture(con, path):
+    strs = ["a", "b", "a OR b = 1", "rock AND roll", "x BETWEEN y", "O'Brien", "a,b", "c", "NULL", "", "a#%", "a%",
+            "ab", "A", "abb", "a or b", "t"]
+    lit = ", ".join("'" + v.replace("'", "''") + "'" for v in strs)
+    con.execute(f"""COPY (SELECT
+        (CASE WHEN i % 9 = 0 THEN NULL ELSE (i % 13) - 3 END)::INTEGER AS x,
+        (CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 11) - 4 END)::INTEGER AS y,
+        (CASE WHEN i % 10 = 0 THEN NULL ELSE (i % 5) - 1 END)::INTEGER AS z,
+        (CASE WHEN i % 8 = 0 THEN NULL ELSE ([{lit}])[1 + i % {len(strs)}] END) AS s,
+        (CASE WHEN i % 6 = 0 THEN NULL ELSE ([{lit}])[1 + (i * 7) % {len(strs)}] END) AS t,
+        (CASE WHEN i % 4 = 0 THEN NULL ELSE i % 3 = 0 END) AS b,
+        (DATE '2020-05-01' + (i % 90)::INTEGER) AS d,
+        (i % 4)::INTEGER AS "a OR b"
+      FROM range(1, 1200) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 300)""")
+
+
+def sql_pred_checks(con, tmp, fixture):
+    unit = os.path.join(tmp, "sql_pred.parquet")
+    gen_sql_pred_fixture(con, unit)
+    total = fails = 0
+    answered = refused = 0
+    for path, sum_col, cases in ((fixture, "id", SQL_PRED_DIFF), (unit, "x", SQL_PRED_UNIT)):
+        for where in cases:
+            dsql = f"SELECT count(*) AS c, sum({sum_col}) AS s FROM '{path}' WHERE {where}"
+            try:
+                want = list(con.execute(dsql).fetchone())
+            except Exception as e:
+                want = None  # DuckDB refuses the SQL too: zpq must refuse it
+                duck_err = str(e).splitlines()[0][:60]
+            for form, zsql in (("where", dsql),
+                               ("filter", f"SELECT count(*) FILTER (WHERE {where}) AS c, "
+                                          f"sum({sum_col}) FILTER (WHERE {where}) AS s FROM '{path}'")):
+                outcomes = set()
+                for j in ("1", "4", "16"):
+                    total += 1
+                    r = subprocess.run([ZPQ, "query", "-j", j, "--query", zsql], capture_output=True, text=True)
+                    label = f"sql_pred:{form:6} -j{j:2} {where}"
+                    if r.returncode != 0:
+                        msg = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else ""
+                        if r.stdout or not msg:
+                            fails += 1
+                            print(f"  FAIL  {label}  refused without a message: rc={r.returncode} {r.stdout[:60]!r}")
+                        else:
+                            outcomes.add(("refused", msg))
+                            print(f"  OK    {label}  (refused: {msg[:90]})")
+                        continue
+                    try:
+                        got = list(read_one(r.stdout, parse_float=Decimal).values())
+                    except Exception as e:
+                        got = f"error: {e}"
+                    outcomes.add(("answer", str(got)))
+                    if want is None:
+                        fails += 1
+                        print(f"  FAIL  {label}  zpq answered {got}; DuckDB refuses ({duck_err})")
+                    elif got == want:
+                        print(f"  OK    {label}  {got}")
+                    else:
+                        fails += 1
+                        print(f"  FAIL  {label}  zpq={got} duck={want}")
+                if len(outcomes) > 1:
+                    fails += 1
+                    print(f"  FAIL  sql_pred:{form} {where}  differs across -j: {sorted(outcomes)}")
+                kinds = {o[0] for o in outcomes}
+                answered += "answer" in kinds
+                refused += "refused" in kinds
+    print(f"  sql_pred: {answered} shapes answered, {refused} refused")
+    return total, fails
+
+
 def fold_avg(v):
     """avg arrives as its re-aggregatable {sum, count} pair; no values averaged means NULL."""
     if isinstance(v, dict):
@@ -598,6 +735,10 @@ def main():
     gen_fixture(con, fixture)
 
     fails, total = 0, 0
+    if sys.argv[1:] == ["--only", "sql_pred"]:
+        total, fails = sql_pred_checks(con, tmp, fixture)
+        print(f"\ndifferential --only sql_pred: {total - fails}/{total} checks match")
+        sys.exit(1 if fails else 0)
     for flabel, zf, dw in FILTERS:
         for plabel, cols in PROJECTIONS:
             total += 1
@@ -1764,6 +1905,9 @@ def main():
     dn_total, dn_fails = dense_domain_checks(con, tmp)
     total += dn_total
     fails += dn_fails
+    sp_total, sp_fails = sql_pred_checks(con, tmp, fixture)
+    total += sp_total
+    fails += sp_fails
 
     print(f"\ndifferential: {total - fails}/{total} checks match (strict pyarrow read + DuckDB value diff + order)")
     sys.exit(1 if fails else 0)

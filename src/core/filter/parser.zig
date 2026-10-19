@@ -2464,3 +2464,164 @@ test "a filter on a legacy repeated field is refused, even where statistics coul
         try std.testing.expectEqualStrings("Int32_list", diag.column.get());
     }
 }
+
+test "regression: a SQL predicate handed on as text selects the rows it was written to" {
+    // The SQL front end pushes NOT to the leaves and unparses the predicate for this grammar. Every case must select,
+    // row for row, what this grammar reads straight from the SQL text and, where given, the flat reading `want`
+    // with NOT at the leaves. The rest must be refused, each with its own error.
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    const sql_parser = @import("../expr/sql_parser.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
+    defer meta.deinit(a);
+    const Col = struct { name: []const u8, type: schema.Type, lt: ?schema.LogicalType = null };
+    const columns = [_]Col{
+        .{ .name = "x", .type = .INT32 },                               .{ .name = "y", .type = .INT32 },
+        .{ .name = "z", .type = .INT32 },                               .{ .name = "s", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } },
+        .{ .name = "t", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } }, .{ .name = "b", .type = .BOOLEAN },
+        .{ .name = "d", .type = .INT32, .lt = .{ .DATE = .{} } },        .{ .name = "a OR b", .type = .INT32 },
+    };
+    try meta.schema.append(a, .{ .type = .BOOLEAN, .type_length = null, .repetition_type = .REQUIRED, .name = "root", .num_children = columns.len, .scale = null, .precision = null, .field_id = null });
+    for (columns) |col| try meta.schema.append(a, .{ .type = col.type, .type_length = null, .repetition_type = .OPTIONAL, .name = col.name, .num_children = null, .scale = null, .precision = null, .field_id = null, .logical_type = col.lt });
+
+    // Every combination of x, y and z over a few values and NULL; s cycles through strings holding the grammar's
+    // keywords, a quote and a comma, and NULL; b holds NULLs; d steps across 2020-06-01 (day 18414).
+    const xs = [_]?i32{ null, 1, 2, 3, 4, 5, 6 };
+    const ys = [_]?i32{ null, 1, 2, 3 };
+    const zs = [_]?i32{ null, 1, 3 };
+    const strs = [_]?[]const u8{ "a", "ab", "b", "abb", "a OR b = 1", "", null, "a or b", "O'Brien", "a,b", "c" };
+    const n = xs.len * ys.len * zs.len;
+    var vals: [5][n]i32 = undefined;
+    var defs: [5][n]u32 = undefined;
+    var svals: [n][]const u8 = undefined;
+    var sdefs: [n]u32 = undefined;
+    var bvals: [n]bool = undefined;
+    var bdefs: [n]u32 = undefined;
+    for (0..n) |r| {
+        const ints = [5]?i32{ xs[r % xs.len], ys[(r / xs.len) % ys.len], zs[r / (xs.len * ys.len)], 18410 + @as(i32, @intCast(r % 8)), @intCast(r % 4) };
+        for (ints, 0..) |v, k| {
+            vals[k][r] = v orelse 0;
+            defs[k][r] = @intFromBool(v != null);
+        }
+        svals[r] = strs[r % strs.len] orelse "";
+        sdefs[r] = @intFromBool(strs[r % strs.len] != null);
+        bvals[r] = r % 3 == 0;
+        bdefs[r] = @intFromBool(r % 5 != 0);
+    }
+    var cols: [7]eval.Batch.Column = undefined;
+    for (0..5) |k| cols[k] = .{ .i32 = .{ .values = &vals[k], .def_levels = &defs[k], .max_def = 1, .has_nulls = true } };
+    cols[5] = .{ .string = .{ .values = &svals, .def_levels = &sdefs, .max_def = 1, .has_nulls = true } };
+    cols[6] = .{ .boolean = .{ .values = &bvals, .def_levels = &bdefs, .max_def = 1, .has_nulls = true } };
+    // x y z s t b d "a OR b" → batch columns (t is never evaluated).
+    const lookup = [_]?usize{ 0, 1, 2, 5, null, 6, 3, 4 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = n };
+
+    const Select = struct {
+        fn rows(al: std.mem.Allocator, f: ast.Filter, b: *const eval.Batch, l: []const ?usize) ![n]bool {
+            var sel = try selection.SelectionVector.init(al, n);
+            try eval.evaluate(f, b, &sel, l, al);
+            var out: [n]bool = undefined;
+            for (&out, 0..) |*o, i| o.* = sel.isActive(i);
+            return out;
+        }
+    };
+
+    const Case = struct { where: []const u8, want: ?[]const u8 = null, err: ?anyerror = null };
+    const cases = [_]Case{
+        // NOT over groups and nested chains, `want` the flat reading.
+        .{ .where = "NOT (x > 5 AND y < 3)", .want = "NOT x > 5 OR NOT y < 3" },
+        .{ .where = "NOT (x > 5 OR y < 3)", .want = "NOT x > 5 AND NOT y < 3" },
+        .{ .where = "NOT NOT (x > 5 OR y < 3)", .want = "x > 5 OR y < 3" },
+        .{ .where = "NOT NOT NOT x > 5", .want = "NOT x > 5" },
+        .{ .where = "z = 1 AND NOT (x > 5 OR y < 3)", .want = "z = 1 AND NOT x > 5 AND NOT y < 3" },
+        .{ .where = "NOT (x > 5 OR y < 3) AND z = 1", .want = "NOT x > 5 AND NOT y < 3 AND z = 1" },
+        .{ .where = "NOT (x > 5 AND y < 3) OR z = 1", .want = "NOT x > 5 OR NOT y < 3 OR z = 1" },
+        .{ .where = "z = 1 OR NOT (x > 5 AND y < 3)", .want = "z = 1 OR NOT x > 5 OR NOT y < 3" },
+        .{ .where = "NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))", .want = "NOT x > 5 AND NOT y < 3 OR NOT z = 1 AND NOT x = 2" },
+        .{ .where = "NOT (x IN (1, 2) AND y = 1)", .want = "NOT x IN (1, 2) OR NOT y = 1" },
+        .{ .where = "NOT (x NOT IN (1, 2) OR y = 1)", .want = "x IN (1, 2) AND NOT y = 1" },
+        .{ .where = "NOT (x NOT BETWEEN 1 AND 3)", .want = "x BETWEEN 1 AND 3" },
+        .{ .where = "x NOT BETWEEN 1 AND 3 OR y = 1", .want = "NOT x BETWEEN 1 AND 3 OR y = 1" },
+        .{ .where = "NOT (x BETWEEN 1 AND 3 OR y = 1)", .want = "NOT x BETWEEN 1 AND 3 AND NOT y = 1" },
+        .{ .where = "NOT (s LIKE 'a%' AND s NOT LIKE '%b')", .want = "NOT s LIKE 'a%' OR s LIKE '%b'" },
+        .{ .where = "NOT (s IS NULL OR s IS NOT NULL)", .want = "NOT s IS NULL AND NOT s IS NOT NULL" },
+        .{ .where = "x = 1 OR (y = 2 OR z = 3)", .want = "x = 1 OR y = 2 OR z = 3" },
+        .{ .where = "x = 1 AND (y = 2 AND (z = 3 AND x = 4))", .want = "x = 1 AND y = 2 AND z = 3 AND x = 4" },
+        .{ .where = "(x = 1 AND y = 2) OR z = 3", .want = "x = 1 AND y = 2 OR z = 3" },
+        .{ .where = "x BETWEEN 1 AND 2 OR s = 'a or b'", .want = "x BETWEEN 1 AND 2 OR s = 'a or b'" },
+        .{ .where = "x > -5 AND z IN (-1, 2)", .want = "x > -5 AND z IN (-1, 2)" },
+        .{ .where = "x BETWEEN -1 AND 1e0 OR s = ''", .err = error.BadValue }, // an INT32 takes no exponent literal
+        .{ .where = "d >= '2020-06-01' AND s IS NOT NULL", .want = "d >= '2020-06-01' AND s IS NOT NULL" },
+        // A fraction or an exponent against an INT32 column is refused.
+        .{ .where = "x > -5 AND y < +2.5e3 AND z IN (-1, 2)", .err = error.BadValue },
+        .{ .where = "x BETWEEN -1.5 AND 1e2 OR s = ''", .err = error.BadValue },
+        // Groups that are not an OR of ANDs.
+        .{ .where = "NOT ((x > 5 AND y < 3) OR z = 1)" },
+        .{ .where = "x = 1 AND (y = 2 OR z = 3)" },
+        .{ .where = "(x = 1 OR y = 2) AND z = 3" },
+        .{ .where = "NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5" },
+        .{ .where = "NOT (x = 1 AND y = 2) AND z = 3" },
+        // Literals and names a raw-substring split would cut.
+        .{ .where = "s = 'a OR b = 1'" },
+        .{ .where = "s = 'rock AND roll'" },
+        .{ .where = "s = 'x BETWEEN y'" },
+        .{ .where = "s = 'O''Brien'" },
+        .{ .where = "s IN ('a,b', 'c')" },
+        .{ .where = "\"a OR b\" = 1" },
+        // NULL is the NULL literal, never the text 'NULL'.
+        .{ .where = "s NOT IN ('a', NULL)" },
+        .{ .where = "NOT (s IN ('a', NULL))" },
+        .{ .where = "s IN (NULL)" },
+        .{ .where = "s != NULL" },
+        .{ .where = "s > NULL" },
+        .{ .where = "s LIKE NULL" },
+        .{ .where = "x BETWEEN NULL AND 5" },
+        .{ .where = "b = TRUE" },
+        // Refused, each with its own error.
+        .{ .where = "s LIKE 'a#%' ESCAPE '#'", .err = error.BadValue },
+        .{ .where = "s IS 'a'", .err = error.BadOperator },
+        .{ .where = "s = t", .err = error.BadValue },
+        .{ .where = "s = \"t\"", .err = error.BadValue },
+        .{ .where = "s = 'a' || 'b'", .err = error.BadValue },
+        .{ .where = "s = 'a' COLLATE NOCASE", .err = error.BadValue },
+        .{ .where = "s = upper('a')", .err = error.BadValue },
+        .{ .where = "s = CAST('a' AS TEXT)", .err = error.BadValue },
+        .{ .where = "s = x'61'", .err = error.BadValue },
+        .{ .where = "x > 2 + 3", .err = error.BadValue },
+        .{ .where = "x > - -5", .err = error.BadValue },
+        .{ .where = "5 < x", .err = error.BadValue },
+        .{ .where = "x + 1 > 5", .err = error.UnknownColumn },
+        .{ .where = "s GLOB 'a*'", .err = error.BadOperator },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("WHERE {s}\n", .{case.where});
+        const sql = try std.fmt.allocPrint(a, "SELECT count(*) AS c FROM 't' WHERE {s}", .{case.where});
+        for ([_]bool{ false, true }) |in_agg| {
+            const text = if (in_agg) try std.fmt.allocPrint(a, "SELECT count(*) FILTER (WHERE {s}) AS c FROM 't'", .{case.where}) else sql;
+            const handed: []const u8 = blk: {
+                const q = sql_parser.parseSqlQuery(testing.allocator, text) catch |err| {
+                    try testing.expectEqual(case.err.?, err);
+                    break :blk "";
+                };
+                defer q.deinit(testing.allocator);
+                const s = if (in_agg) q.aggregate_str.? else q.filter_str.?;
+                const body = if (in_agg) s["count(*) FILTER (WHERE ".len .. s.len - ") AS c".len] else s;
+                break :blk try a.dupe(u8, body);
+            };
+            if (handed.len == 0) continue;
+            const f = parse(a, handed, &meta, null) catch |err| {
+                try testing.expectEqual(case.err orelse return err, err);
+                continue;
+            };
+            try testing.expect(case.err == null);
+            const got = try Select.rows(a, f, &batch, &lookup);
+            const direct = try Select.rows(a, try parse(a, case.where, &meta, null), &batch, &lookup);
+            try testing.expectEqualSlices(bool, &direct, &got);
+            if (case.want) |w| try testing.expectEqualSlices(bool, &(try Select.rows(a, try parse(a, w, &meta, null), &batch, &lookup)), &got);
+        }
+    }
+}

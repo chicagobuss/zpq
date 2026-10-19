@@ -35,6 +35,7 @@ const filter_prune = @import("filter/prune.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_eval = @import("expr/eval.zig");
 const expr_agg = @import("expr/agg.zig");
+const core_memory = @import("memory.zig");
 const agg_plan = @import("agg_plan.zig");
 const encoder = @import("writer/encoder.zig");
 const streaming = @import("writer/streaming.zig");
@@ -746,6 +747,9 @@ pub const SliceReader = struct {
     /// Holds a byte-array dictionary for the chunk, copied off `pages` once installed.
     held: std.mem.Allocator,
     dict_held: bool = false,
+    /// Set by `chargePages`: what the pages draw from, and what the pages on `held` drew.
+    page_budget: ?*core_memory.SharedBudget = null,
+    held_drawn: usize = 0,
     levels: schema.Levels,
     dec: ?decimal_mod.Kind,
     float16: bool,
@@ -815,7 +819,8 @@ pub const SliceReader = struct {
             },
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => blk: {
                 const Reader = column_mod.ColumnChunkReader([]const u8);
-                var r = Reader.initWithOptions(chunk, cm.codec, levels, pages.allocator(), decode_options, null);
+                // On `a` until the dictionary is in (`holdDictionary`), which then lives there without a copy.
+                var r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, null);
                 r.type_length = switch (cm.type) {
                     .FIXED_LEN_BYTE_ARRAY => flbaWidth(se),
                     .INT96 => int96_mod.INT96_WIDTH,
@@ -840,6 +845,13 @@ pub const SliceReader = struct {
     pub fn deinit(self: *SliceReader) void {
         self.scratch.deinit();
         self.pages.deinit();
+        if (self.page_budget) |b| {
+            b.release(self.held_drawn);
+            switch (self.raw.*) {
+                .bytes => |*r| b.release(r.pages.drawn),
+                else => {},
+            }
+        }
     }
 
     /// Whether leaf `ci` has a sliced form (what `init` returns non-null for).
@@ -870,7 +882,7 @@ pub const SliceReader = struct {
                     // row group's pages would pile up on `pages`.
                     if (r.pageValuesLeft() == 0) {
                         if (@TypeOf(r.*).Value == []const u8) {
-                            _ = self.pages.reset(.retain_capacity);
+                            self.resetPages();
                             if (!try r.nextPage()) break;
                             try self.holdDictionary(r);
                         } else if (!try r.nextPage()) break;
@@ -974,7 +986,7 @@ pub const SliceReader = struct {
         var got: usize = 0;
         while (got < values.len) {
             if (r.pageValuesLeft() == 0) {
-                _ = self.pages.reset(.retain_capacity);
+                self.resetPages();
                 r.releaseExpansion();
                 if (!try r.nextPage()) break;
                 try self.holdDictionary(r);
@@ -990,12 +1002,48 @@ pub const SliceReader = struct {
         return got;
     }
 
-    /// Copy a byte-array chunk's dictionary off `pages` once it is in, before `pages` is next reset. The dictionary
-    /// page comes first, so once a data page is in there is none to come; it serves every page that follows.
+    /// A byte-array chunk reads on `held` until its dictionary is in, which so lives as long as the reader without a
+    /// copy (a copy off `pages` held it twice while it was made); its pages after that read on `pages`. The
+    /// dictionary page comes first, so once a data page is in there is none to come.
     fn holdDictionary(self: *SliceReader, r: *column_mod.ColumnChunkReader([]const u8)) !void {
         if (self.dict_held) return;
-        if (r.dictionary) |d| r.dictionary = try copyBytes(self.held, try self.held.dupe([]const u8, d));
         self.dict_held = r.dictionary != null or r.data_page_seen;
+        if (!self.dict_held) return;
+        r.arena = self.pages.allocator();
+        r.pages.arena = self.pages.allocator();
+        // Under `chargePages`, what is on `held` stays drawn until `deinit`: its pages, and the dictionary's slices.
+        if (r.pages.budget) |b| {
+            const slices = if (r.dictionary) |d| d.len * @sizeOf([]const u8) else 0;
+            _ = b.drawExact(slices) orelse return error.ExceededMemoryBudget;
+            self.held_drawn = r.pages.drawn + slices;
+            r.pages.drawn = 0;
+        }
+    }
+
+    /// A byte-array chunk's pages on `raw`, each drawn from `budget` before it is decompressed (its inflated size)
+    /// and given back as `pages` is reset, rather than on an arena that draws a node half again past each one. Right
+    /// after `init`, before any page is read.
+    pub fn chargePages(self: *SliceReader, raw: std.mem.Allocator, budget: *core_memory.SharedBudget) void {
+        switch (self.raw.*) {
+            .bytes => |*r| {
+                self.pages.* = .init(raw);
+                r.pages.budget = budget;
+                self.page_budget = budget;
+            },
+            else => {},
+        }
+    }
+
+    /// Reset `pages`, giving back what its pages drew.
+    fn resetPages(self: *SliceReader) void {
+        _ = self.pages.reset(.retain_capacity);
+        if (self.page_budget) |b| switch (self.raw.*) {
+            .bytes => |*r| {
+                b.release(r.pages.drawn);
+                r.pages.drawn = 0;
+            },
+            else => {},
+        };
     }
 
     /// Pass over the next `n` rows. A data page whose rows all fall in the skip is passed over by its header, never
@@ -1013,7 +1061,7 @@ pub const SliceReader = struct {
                 while (left > 0) {
                     if (r.pageValuesLeft() == 0) {
                         if (T == []const u8) {
-                            _ = self.pages.reset(.retain_capacity);
+                            self.resetPages();
                             r.releaseExpansion();
                         }
                         const passed = try r.passPageWithin(left);
@@ -6853,6 +6901,50 @@ test "SliceReader.skip reads the rows after it as decoding every row would, pass
             try testing.expect(sparse.pages_passed > 0);
         }
     }
+}
+
+test "a sliced string reader under chargePages draws each page and its dictionary, and gives all back at deinit" {
+    const testing = std.testing;
+    // A dictionary-coded, snappy string column (`s`) of eight row groups.
+    const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
+    const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var meta = try metadata.open(testing.allocator, bytes);
+    defer meta.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+    const rg = &meta.row_groups.items[0];
+    const rows: usize = @intCast(rg.num_rows);
+    var plain = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 2, .{})).?;
+    defer plain.deinit();
+    const want = try plain.next(a, rows);
+    var budget: core_memory.SharedBudget = .{ .limit = 1 << 30 };
+    {
+        var r = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 2, .{})).?;
+        defer r.deinit();
+        r.chargePages(testing.allocator, &budget);
+        var at: usize = 0;
+        while (at < rows) {
+            const n = @min(rows - at, 37);
+            const got = try r.next(a, n);
+            for (want.string.values[at..][0..n], got.string.values) |w, g| try testing.expectEqualStrings(w, g);
+            at += n;
+        }
+        try testing.expect(budget.peak.load(.monotonic) > 0);
+    }
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    // A page the budget cannot take is refused before it is decompressed.
+    var tiny: core_memory.SharedBudget = .{ .limit = 1 };
+    var r = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 2, .{})).?;
+    defer r.deinit();
+    r.chargePages(testing.allocator, &tiny);
+    try testing.expectError(error.ExceededMemoryBudget, r.next(a, rows));
+    try testing.expectEqual(@as(usize, 0), tiny.used.load(.monotonic));
 }
 
 test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {

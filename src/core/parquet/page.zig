@@ -14,6 +14,7 @@
 //! page kind; this layer just walks them.
 
 const std = @import("std");
+const core_memory = @import("../memory.zig");
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
 const compression = @import("compression.zig");
@@ -27,6 +28,8 @@ pub const Error = error{
     BadPageCount,
     /// The chunk's pages inflate past `PageReader.byte_limit`: past what the footer says the chunk holds.
     PageLargerThanChunk,
+    /// `PageReader.budget` cannot take a page's inflated size.
+    ExceededMemoryBudget,
 } || compression.Error;
 
 pub const Page = struct {
@@ -128,6 +131,10 @@ pub const PageReader = struct {
     /// outside any memory budget.
     byte_limit: usize = std.math.maxInt(usize),
     inflated: usize = 0,
+    /// When set, a page's inflated size is drawn from it before the page is decompressed, and added to `drawn`,
+    /// which the owner gives back as it frees the pages (an uncompressed page is the chunk's own bytes: nothing).
+    budget: ?*core_memory.SharedBudget = null,
+    drawn: usize = 0,
 
     pub fn init(
         chunk: []const u8,
@@ -184,6 +191,10 @@ pub const PageReader = struct {
 
         self.inflated +|= usize_;
         if (self.inflated > self.byte_limit) return error.PageLargerThanChunk;
+        if (self.budget) |b| if (self.codec != .UNCOMPRESSED or header.type == .DATA_PAGE_V2) {
+            _ = b.drawExact(usize_) orelse return error.ExceededMemoryBudget;
+            self.drawn += usize_;
+        };
 
         const payload_start = self.pos + header_size;
         const payload = self.chunk[payload_start..][0..csize];

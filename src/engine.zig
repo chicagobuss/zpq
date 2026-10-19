@@ -6337,13 +6337,29 @@ const GatherTask = struct {
         t.mem.deinit();
     }
 
+    /// Back to before `run`, everything it held given back: for a task the reservation refused beside the others,
+    /// to run again alone.
+    fn reset(t: *GatherTask) void {
+        t.deinit();
+        t.bytes = .empty;
+        t.mem = .{ .gpa = t.mem.gpa, .res = t.mem.res };
+        t.buf = switch (t.buf) {
+            inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
+        };
+        t.err = null;
+    }
+
     fn run(t: *GatherTask) void {
-        t.read() catch |e| {
-            t.err = e;
+        // The column's decode (its scratch, a page, a byte-array dictionary and a run of rows) draws from the
+        // reservation before it is allocated, as the heaps and the gathered values do: runners decoding at once
+        // held a page or a dictionary each past it. Refused, the gather fails, and the query ranks serially.
+        var decode: core_memory.Charged = .{ .child = t.mem.gpa, .budget = &t.mem.res.ledger };
+        t.read(decode.allocator()) catch |e| {
+            t.err = decode.refusal(e);
         };
     }
 
-    fn read(t: *GatherTask) !void {
+    fn read(t: *GatherTask, dg: std.mem.Allocator) !void {
         const g = t.group;
         const n = g.rows.len;
         const meta = &t.metas[g.file];
@@ -6361,17 +6377,20 @@ const GatherTask = struct {
                 if (T == []const u8) ends = try t.mem.alloc(usize, n);
             },
         }
+        // A byte-array dictionary and its pages each draw their own inflated size (`SliceReader.chargePages`): on an
+        // arena on `dg` a 60 MB page was charged as the 90 MB node holding it.
         var held = std.heap.ArenaAllocator.init(t.mem.gpa);
         defer held.deinit();
-        var r = (try consumer.SliceReader.init(held.allocator(), t.mem.gpa, rg, meta, src, t.ci, t.options)) orelse
+        var r = (try consumer.SliceReader.init(held.allocator(), dg, rg, meta, src, t.ci, t.options)) orelse
             return error.NestedRowOutputNotSupported;
         defer r.deinit();
+        r.chargePages(t.mem.gpa, &t.mem.res.ledger);
         var at: usize = 0;
         var i: usize = 0;
         while (i < n) {
             var j = i + 1;
             while (j < n and g.rows[j] == g.rows[j - 1] + 1) j += 1;
-            var slice = std.heap.ArenaAllocator.init(t.mem.gpa);
+            var slice = std.heap.ArenaAllocator.init(dg);
             defer slice.deinit();
             const sa = slice.allocator();
             try r.skip(sa, g.rows[i] - at);
@@ -6660,6 +6679,11 @@ fn gatherInto(
     const runners = try arena.alloc(GatherRunner, std.math.clamp(threads, 1, tasks.len));
     for (runners) |*r| r.* = .{ .cursor = &cursor };
     runAll(GatherRunner, runners, GatherRunner.run);
+    // A task the reservation refused beside the others runs again alone, after them: fewer at once rather than none.
+    if (runners.len > 1) for (tasks) |*task| if (task.err) |e| if (e == error.ExceededMemoryBudget) {
+        task.reset();
+        task.run();
+    };
     // The first failure in task order, so the error does not depend on which thread met it first.
     for (tasks) |*task| if (task.err) |e| return e;
 

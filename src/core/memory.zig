@@ -18,25 +18,46 @@ pub const finalize_allowance: usize = 16 << 20;
 /// The ledger a refusal chain's last scan decodes on, one worker's, beside the query's.
 pub const lean_decode: usize = 32 << 20;
 
+/// Whether the C heap is glibc's, the only one with `malloc_trim` and `mallopt`: decided at compile time from the
+/// target, so a build without them (musl, macOS, Windows, no libc) never references them. A weak extern's null check
+/// decided it at run time before, and under static musl it did not hold: the call jumped to address 0, and every query
+/// of the release CLI and the Lambda crashed on start.
+const glibc_heap = hasGlibcHeap(builtin.os.tag, builtin.abi, builtin.link_libc);
+
+fn hasGlibcHeap(os: std.Target.Os.Tag, abi: std.Target.Abi, link_libc: bool) bool {
+    return link_libc and os == .linux and abi.isGnu();
+}
+
+extern "c" fn malloc_trim(pad: usize) c_int;
+extern "c" fn mallopt(param: c_int, value: c_int) c_int;
+
 /// Hand the C heap's free memory back to the OS (glibc's `malloc_trim`; a no-op where there is none). Freed blocks
 /// otherwise stay resident in its per-thread arenas: memory the ledger has back is not memory the process gave up.
 pub fn trimHeap() void {
-    if (comptime !builtin.link_libc or builtin.os.tag != .linux) return;
-    const trim = @extern(?*const fn (usize) callconv(.c) c_int, .{ .name = "malloc_trim", .linkage = .weak }) orelse
-        return;
-    _ = trim(0);
+    if (comptime !glibc_heap) return;
+    _ = malloc_trim(0);
 }
 
 /// Keep the C heap from holding blocks of 1 MiB and more once they are freed: glibc raises its mmap threshold as large
 /// blocks come and go (up to 32 MiB), after which a freed growth buffer stays resident in a thread's arena, held but
 /// charged to nothing. Fixed, such blocks are their own mappings, given back when freed. For a process zpq owns (the
-/// CLI, the Lambda); a library leaves its host's heap alone. A no-op without glibc's `mallopt`.
+/// CLI, the Lambda); a library leaves its host's heap alone. A no-op without glibc.
 pub fn fixHeapThreshold() void {
-    if (comptime !builtin.link_libc or builtin.os.tag != .linux) return;
-    const Mallopt = ?*const fn (c_int, c_int) callconv(.c) c_int;
-    const mallopt = @extern(Mallopt, .{ .name = "mallopt", .linkage = .weak }) orelse return;
+    if (comptime !glibc_heap) return;
     const M_MMAP_THRESHOLD: c_int = -3;
     _ = mallopt(M_MMAP_THRESHOLD, 1 << 20);
+}
+
+test "the C heap calls are glibc's alone, and run where the target has them" {
+    // The release targets (static musl CLI and Lambda, macOS) never reference `mallopt`/`malloc_trim`.
+    try std.testing.expect(!hasGlibcHeap(.linux, .musl, true));
+    try std.testing.expect(!hasGlibcHeap(.linux, .musleabihf, true));
+    try std.testing.expect(!hasGlibcHeap(.macos, .none, true));
+    try std.testing.expect(!hasGlibcHeap(.linux, .gnu, false));
+    try std.testing.expect(hasGlibcHeap(.linux, .gnu, true));
+    try std.testing.expect(hasGlibcHeap(.linux, .gnueabihf, true));
+    fixHeapThreshold();
+    trimHeap();
 }
 
 /// One `max_memory` shared by every group table filling in parallel, so required headroom stops scaling with `-j`

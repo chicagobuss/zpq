@@ -223,11 +223,11 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
                     *flags, code=2)
             assert reason in p.stderr and not p.stdout
 
-    # Type errors from binding are usage failures; null-dependent evaluation errors are runtime failures.
+    # Type errors from binding are usage failures; arithmetic over a NULL is NULL, not an error.
     p = run(src, '--select', 's + 1 AS bad', '--summary=json', code=2)
     assert json.loads(p.stderr)['code'] == 'TypeMismatch'
-    p = run(src, '--select', 'v + 1 AS bad', '--summary=json', code=1)
-    assert json.loads(p.stderr)['code'] == 'NullableNotSupported'
+    p = run(src, '--select', 'v + 1 AS w')
+    assert ndjson(p.stdout) == [{'w': 4}, {'w': None}, {'w': 6}, {'w': 8}]
     for args in (['--format', 'ndjson'], ['--format', 'json'], ['--limit', '1']):
         p = run(src, '-o', str(root / 'bloom'), '--bloom-filter', 'k', *args, code=2)
         assert b'--bloom-filter' in p.stderr

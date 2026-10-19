@@ -90,8 +90,9 @@ def rand_query(r):
             a = f"{f}({r.choice(STR)})"
         else:
             c = r.choice(NUM)
-            if r.random() < 0.15 and f in ("sum", "min", "max"):
-                c = f"{r.choice(['vf', 'dec', 'k2'])} * {r.choice(['vf', 'k2', 'mid'])}"
+            # Arithmetic, over nullable operands too (`vn`, `vi`): a NULL on either side is NULL, which folds skip.
+            if r.random() < 0.2 and f in ("sum", "min", "max", "avg", "count"):
+                c = f"{r.choice(['vf', 'dec', 'k2', 'vn', 'vi'])} {r.choice(['*', '+', '-'])} {r.choice(['vf', 'k2', 'mid', 'vn'])}"
             a = f"{f}({c})"
         if r.random() < 0.15:
             a += f" FILTER (WHERE {r.choice(FILTERS)})"

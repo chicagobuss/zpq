@@ -14,11 +14,11 @@
 //! a runtime switch in the hot loop. Four ops × two types = eight
 //! specializations.
 //!
-//! Scope of first slice:
-//!   - Required, non-nested numeric columns only. OPTIONAL or LIST/MAP
-//!     columns return error.NullableNotSupported. Null-aware arithmetic
-//!     lands in a follow-up slice when we know what the encoder side
-//!     wants to do with computed nulls.
+//! Scope:
+//!   - Flat columns, REQUIRED or OPTIONAL: a NULL operand makes its row's
+//!     result NULL (definition levels on the result), and that row is never
+//!     computed, so it raises no fault. LIST/MAP columns return
+//!     error.NestedNotSupported.
 //!   - Integer division truncates (matches Zig `/` on integers). To
 //!     get true-division semantics, write `i / 1.0` to force f64.
 
@@ -263,7 +263,7 @@ fn evalGroupKeyBinOp(
     column_lookup: []const ?usize,
     b: ast.BinOp,
 ) Error!Batch.Column {
-    if (b.result_type == .dec) return .{ .i128 = try decBinOp(arena, batch, column_lookup, b, true) };
+    if (b.result_type == .dec) return .{ .i128 = try decBinOp(arena, batch, column_lookup, b) };
     const l_raw = try evalGroupKeyExpr(arena, batch, column_lookup, b.left.*);
     const r_raw = try evalGroupKeyExpr(arena, batch, column_lookup, b.right.*);
     const l_col = try keyOperandAs(arena, l_raw, b.left.*, b.result_type);
@@ -338,27 +338,32 @@ fn evalGroupKeyNumericBinOp(
         def_out = try arena.alloc(u32, l_vals.len);
     }
 
+    var any_null = false;
     for (l_vals, r_vals, 0..) |lv, rv, i| {
         if (rowIsNull(l_col, i) or rowIsNull(r_col, i)) {
             if (def_out) |dl| dl[i] = 0;
             out[i] = 0;
+            any_null = true;
             continue;
         }
         if (def_out) |dl| dl[i] = 1;
         out[i] = applyScalarKernel(T, op, lv, rv) catch |err| if (consumed.has(i)) return err else 0;
     }
 
+    // `has_nulls` set from the rows, as readers that narrow a selection by a computed value's NULLs check it.
     if (T == i64) {
         return .{ .i64 = .{
             .values = out,
             .def_levels = def_out,
             .max_def = if (needs_nulls) 1 else 0,
+            .has_nulls = any_null,
         } };
     }
     return .{ .f64 = .{
         .values = out,
         .def_levels = def_out,
         .max_def = if (needs_nulls) 1 else 0,
+        .has_nulls = any_null,
     } };
 }
 
@@ -378,10 +383,12 @@ fn evalGroupKeyConcatBinOp(
         def_out = try arena.alloc(u32, l_vals.len);
     }
 
+    var any_null = false;
     for (l_vals, r_vals, 0..) |lv, rv, i| {
         if (rowIsNull(l_col, i) or rowIsNull(r_col, i)) {
             if (def_out) |dl| dl[i] = 0;
             out[i] = "";
+            any_null = true;
             continue;
         }
         if (def_out) |dl| dl[i] = 1;
@@ -395,6 +402,7 @@ fn evalGroupKeyConcatBinOp(
         .values = out,
         .def_levels = def_out,
         .max_def = if (needs_nulls) 1 else 0,
+        .has_nulls = any_null,
     } };
 }
 
@@ -510,8 +518,9 @@ fn evalAs(
     if (target == .f64 and e.typeOf() == .dec) switch (e) {
         .col_ref => |c| {
             const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
-            try rejectNullableOrNested(batch.cols[pos], batch.sel);
-            return .{ .f64 = .{ .values = try widenToF64(arena, batch.cols[pos]) } };
+            const col = batch.cols[pos];
+            try rejectNested(col);
+            return withNullsOf(.{ .f64 = .{ .values = try widenToF64(arena, col) } }, col);
         },
         .literal => |l| {
             const out = try arena.alloc(f64, batch.num_rows);
@@ -520,14 +529,13 @@ fn evalAs(
         },
         else => {},
     };
+    // NULL rows keep their levels through every conversion; `evalBinOp` leaves them uncomputed.
     const result = try evalExpr(arena, batch, column_lookup, e);
-    // A computed operand may be NULL (`coalesce(a, b)`, CASE): its placeholder is no value to compute with.
-    if (e != .col_ref) try rejectNullableOrNested(result, batch.sel);
     // Only binop operands come through here; an unsigned 64-bit column among them needs the same care as in a key.
     if (e == .col_ref and e.col_ref.unsigned_64) return keyOperandAs(arena, result, e, target);
     if (e.typeOf() == target) return result;
     if (target == .f64 and result == .i128) {
-        return .{ .f64 = .{ .values = try decToF64(arena, result.i128.values, e) } };
+        return withNullsOf(.{ .f64 = .{ .values = try decToF64(arena, result.i128.values, e) } }, result);
     }
     // Promotion: i64 → f64. The reverse never happens for valid ASTs
     // (the parser sets binop.result_type via Type.promote).
@@ -535,7 +543,7 @@ fn evalAs(
         const src = result.i64.values;
         const out = try arena.alloc(f64, src.len);
         for (src, 0..) |v, i| out[i] = @floatFromInt(v);
-        return .{ .f64 = .{ .values = out } };
+        return withNullsOf(.{ .f64 = .{ .values = out } }, result);
     }
     return error.TypeMismatch;
 }
@@ -576,16 +584,14 @@ fn colRefAsColumn(
 ) Error!Batch.Column {
     const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
     const col = batch.cols[pos];
-    // Reject OPTIONAL / nested columns up-front. Null-aware arithmetic
-    // is a follow-up slice.
-    try rejectNullableOrNested(col, batch.sel);
-
-    return switch (c.expr_type) {
+    try rejectNested(col);
+    // The values as they are (borrowed where the lane matches), under the column's own levels.
+    return withNullsOf(switch (c.expr_type) {
         .i64 => .{ .i64 = .{ .values = try widenColRefToI64(arena, col, c) } },
         .f64 => .{ .f64 = .{ .values = try widenToF64(arena, col) } },
         .str => .{ .string = .{ .values = try borrowStr(col) } },
         .dec => .{ .i128 = .{ .values = (try unscaledView(arena, col)).values } },
-    };
+    }, col);
 }
 
 fn evalBinOp(
@@ -594,11 +600,19 @@ fn evalBinOp(
     column_lookup: []const ?usize,
     b: ast.BinOp,
 ) Error!Batch.Column {
-    if (b.result_type == .dec) return .{ .i128 = try decBinOp(arena, batch, column_lookup, b, false) };
+    if (b.result_type == .dec) return .{ .i128 = try decBinOp(arena, batch, column_lookup, b) };
     const l_col = try evalAs(arena, batch, column_lookup, b.left.*, b.result_type);
     const r_col = try evalAs(arena, batch, column_lookup, b.right.*, b.result_type);
 
     const consumed: Consumed = .{ .sel = batch.sel };
+    // A NULL on either side makes the row NULL, never computed, so its placeholder raises no fault. Only a batch with
+    // a NULL row pays for that; the rest run the vector kernels below.
+    if (columnHasNullRows(l_col) or columnHasNullRows(r_col)) return switch (b.result_type) {
+        .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col, consumed),
+        .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col, consumed),
+        .str => evalGroupKeyConcatBinOp(arena, l_col, r_col),
+        .dec => unreachable,
+    };
     return switch (b.result_type) {
         .i64 => .{ .i64 = .{
             .values = try applyKernel(i64, arena, b.op, l_col.i64.values, r_col.i64.values, consumed),
@@ -722,15 +736,13 @@ const DecOperand = union(enum) {
     i128: []const i128,
 };
 
-/// `e` as an exact operand at `scale`, and its null layout. `key` evaluates like a GROUP BY key (nulls allowed), else
-/// like `evalExpr` (nulls refused).
+/// `e` as an exact operand at `scale`, and its null layout.
 fn decOperand(
     arena: std.mem.Allocator,
     batch: *const Batch,
     column_lookup: []const ?usize,
     e: ast.Expr,
     scale: u8,
-    key: bool,
 ) Error!struct { op: DecOperand, nulls: ?Batch.Column } {
     if (e == .literal) {
         const one = try decColumnAt(arena, try literalAsColumn(arena, e.literal, 1), e, scale, null);
@@ -741,15 +753,11 @@ fn decOperand(
     var raw: Batch.Column = undefined;
     if (e == .col_ref and e.typeOf() == .dec) {
         const col = batch.cols[column_lookup[e.col_ref.col_idx] orelse return error.BadColumn];
-        if (!key) try rejectNullableOrNested(col, batch.sel);
         raw = try exactColumn(col);
     } else if (e == .binop and e.binop.result_type == .dec) {
-        raw = try decBinOpLane(arena, batch, column_lookup, e.binop, key);
-    } else if (key) {
-        raw = try evalGroupKeyExpr(arena, batch, column_lookup, e);
+        raw = try decBinOpLane(arena, batch, column_lookup, e.binop);
     } else {
-        raw = try evalExpr(arena, batch, column_lookup, e);
-        if (e != .col_ref) try rejectNullableOrNested(raw, batch.sel);
+        raw = try evalGroupKeyExpr(arena, batch, column_lookup, e);
     }
     const nulls: ?Batch.Column = if (columnHasNullRows(raw)) raw else null;
     const factor = ast.pow10(scale - e.decSpec().?.scale);
@@ -778,9 +786,8 @@ fn decBinOp(
     batch: *const Batch,
     column_lookup: []const ?usize,
     b: ast.BinOp,
-    key: bool,
 ) Error!ColumnT(i128) {
-    switch (try decBinOpLane(arena, batch, column_lookup, b, key)) {
+    switch (try decBinOpLane(arena, batch, column_lookup, b)) {
         .i128 => |c| return c,
         .i64 => |c| {
             const out = try arena.alloc(i128, c.values.len);
@@ -794,14 +801,13 @@ fn decBinOp(
 /// `b` over the batch, at the narrowest lane its type allows: a result of at most 18 digits in `.i64`, which an
 /// enclosing operation then reads without widening. A sum or difference brings both sides to the result scale first;
 /// a product multiplies the operands as they are, its scale being their scales' sum. Each result must stay under
-/// 10^precision, so a value too wide for the type is an error, not a wrap. A row null on either side is null (group
-/// keys; `evalExpr` has already refused nulls), and is never computed: its slots hold whatever the decoder left.
+/// 10^precision, so a value too wide for the type is an error, not a wrap. A row null on either side is null, and is
+/// never computed: its slots hold whatever the decoder left.
 fn decBinOpLane(
     arena: std.mem.Allocator,
     batch: *const Batch,
     column_lookup: []const ?usize,
     b: ast.BinOp,
-    key: bool,
 ) Error!Batch.Column {
     const spec = b.dec.?;
     const lhs_scale, const rhs_scale = switch (b.op) {
@@ -809,8 +815,8 @@ fn decBinOpLane(
         .mul => .{ b.left.decSpec().?.scale, b.right.decSpec().?.scale },
         .div, .concat => unreachable,
     };
-    const l = try decOperand(arena, batch, column_lookup, b.left.*, lhs_scale, key);
-    const r = try decOperand(arena, batch, column_lookup, b.right.*, rhs_scale, key);
+    const l = try decOperand(arena, batch, column_lookup, b.left.*, lhs_scale);
+    const r = try decOperand(arena, batch, column_lookup, b.right.*, rhs_scale);
     const n = batch.num_rows;
     const bound: u128 = @intCast(spec.bound());
     // `+` and `-` first bring both sides to their common type, as the SQL engines cast them: a value that does not
@@ -1319,21 +1325,26 @@ fn applyKernel(
     return out;
 }
 
-/// Refuse a nested operand, or one NULL in a row the batch wants (`batch.sel`, else every row): arithmetic does not
-/// propagate NULLs yet. Many writers emit every column OPTIONAL with no row null, and a WHERE or FILTER that drops the
-/// NULL rows (`x IS NOT NULL`) leaves well-defined arithmetic; reading the levels of every row instead refused those
-/// queries, and whether one failed hung on how the writer cut its row groups.
-fn rejectNullableOrNested(col: Batch.Column, sel: ?*const selection.SelectionVector) Error!void {
+/// Refuse a nested (repeated) operand: arithmetic over a list's elements has no row to put its result in.
+fn rejectNested(col: Batch.Column) Error!void {
     switch (col) {
-        inline else => |c| {
-            if (c.max_rep > 0) return error.NestedNotSupported;
-            const dls = c.def_levels orelse return;
-            for (dls, 0..) |dl, i| if (dl < c.max_def) {
-                if (sel) |s| if (!s.isActive(i)) continue;
-                return error.NullableNotSupported;
-            };
+        inline else => |c| if (c.max_rep > 0) return error.NestedNotSupported,
+    }
+}
+
+/// `out` under the null layout of `src`, the column it was converted from row for row.
+fn withNullsOf(out: Batch.Column, src: Batch.Column) Batch.Column {
+    var r = out;
+    switch (r) {
+        inline else => |*c| switch (src) {
+            inline else => |sc| {
+                c.def_levels = sc.def_levels;
+                c.max_def = sc.max_def;
+                c.has_nulls = sc.has_nulls;
+            },
         },
     }
+    return r;
 }
 
 /// `widenToI64` for a column reference: an unsigned column in the i32 lane zero-extends.
@@ -1999,19 +2010,86 @@ test "regression: coalesce zero-extends UINT32 operands in the i64 and f64 lanes
     }
 }
 
-test "nullable column rejected" {
+test "arithmetic over NULLs is NULL, and a NULL, unwanted or placeholder row never faults" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const xs = [_]i64{ 1, 2, 3 };
-    const def_levels = [_]u32{ 1, 1, 0 };
-    const cols = [_]Batch.Column{.{ .i64 = .{ .values = &xs, .def_levels = &def_levels, .max_def = 1 } }};
-    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
-    const lookup = [_]?usize{0};
+    // x: NULL in row 2, whose placeholder would overflow `* 2` and divide by zero; y: NULL in row 0.
+    const xs = [_]i64{ 1, 2, std.math.maxInt(i64), 4 };
+    const x_def = [_]u32{ 1, 1, 0, 1 };
+    const ys = [_]i64{ 0, 5, 0, 3 };
+    const y_def = [_]u32{ 0, 1, 1, 1 };
+    const strs = [_][]const u8{ "a", "b", "", "d" };
+    const nested_rep = [_]u32{ 0, 1, 0, 0 };
+    const cols = [_]Batch.Column{
+        .{ .i64 = .{ .values = &xs, .def_levels = &x_def, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = &ys, .def_levels = &y_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs, .def_levels = &x_def, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = &xs, .max_rep = 1, .rep_levels = &nested_rep } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4 };
+    const lookup = [_]?usize{ 0, 1, 2, 3 };
+    var x: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64, .nullable = true } };
+    var y: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64, .nullable = true } };
+    var s_col: ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str, .nullable = true } };
+    var nested: ast.Expr = .{ .col_ref = .{ .col_idx = 3, .physical_type = .INT64, .expr_type = .i64 } };
+    var two: ast.Expr = .{ .literal = .{ .i64 = 2 } };
+    var half: ast.Expr = .{ .literal = .{ .f64 = 0.5 } };
+    const bin = struct {
+        fn of(op: ast.Op, l: *ast.Expr, r: *ast.Expr, t: ast.Type) ast.Expr {
+            return .{ .binop = .{ .op = op, .left = l, .right = r, .result_type = t, .depth = 2 } };
+        }
+    }.of;
 
-    const e: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
-    try testing.expectError(error.NullableNotSupported, evalExpr(a, &batch, &lookup, e));
+    // The column alone keeps its levels.
+    const alone = try evalExpr(a, &batch, &lookup, x);
+    try testing.expectEqualSlices(u32, &x_def, alone.i64.def_levels.?);
+
+    const doubled = try evalExpr(a, &batch, &lookup, bin(.mul, &x, &two, .i64));
+    try testing.expectEqualSlices(u32, &.{ 1, 1, 0, 1 }, doubled.i64.def_levels.?);
+    try testing.expect(doubled.i64.has_nulls);
+    try testing.expectEqual(@as(i64, 8), doubled.i64.values[3]);
+
+    // NULL on either side; `x / y` divides by zero only in row 0, where y is NULL.
+    const sum = try evalExpr(a, &batch, &lookup, bin(.add, &x, &y, .i64));
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, sum.i64.def_levels.?);
+    try testing.expectEqual(@as(i64, 7), sum.i64.values[1]);
+    const quotient = try evalExpr(a, &batch, &lookup, bin(.div, &x, &y, .i64));
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, quotient.i64.def_levels.?);
+    try testing.expectEqual(@as(i64, 1), quotient.i64.values[3]);
+
+    // An integer side promoted to the float lane keeps its NULLs.
+    const plus_half = try evalExpr(a, &batch, &lookup, bin(.add, &x, &half, .f64));
+    try testing.expectEqualSlices(u32, &.{ 1, 1, 0, 1 }, plus_half.f64.def_levels.?);
+    try testing.expectEqual(@as(f64, 4.5), plus_half.f64.values[3]);
+
+    // String concatenation.
+    const joined = try evalExpr(a, &batch, &lookup, bin(.concat, &s_col, &s_col, .str));
+    try testing.expectEqualSlices(u32, &.{ 1, 1, 0, 1 }, joined.string.def_levels.?);
+    try testing.expectEqualStrings("dd", joined.string.values[3]);
+
+    // A wanted, present row still faults; one the selection drops does not.
+    var y_plus: ast.Expr = bin(.add, &x, &y, .i64);
+    var big: ast.Expr = .{ .literal = .{ .i64 = std.math.maxInt(i64) } };
+    try testing.expectError(error.IntegerOverflowAdd, evalExpr(a, &batch, &lookup, bin(.add, &y_plus, &big, .i64)));
+    var sel = try selection.SelectionVector.init(a, 4);
+    sel.set(1, false);
+    sel.set(3, false);
+    const dropped = try evalExpr(a, &batch.restrictedTo(&sel), &lookup, bin(.add, &y_plus, &big, .i64));
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, dropped.i64.def_levels.?);
+
+    // An OPTIONAL column with no NULL row takes the vector kernels: no levels on the result.
+    const no_nulls = [_]u32{ 1, 1, 1, 1 };
+    const ones = [_]i64{ 1, 2, 3, 4 };
+    const present = [_]Batch.Column{.{ .i64 = .{ .values = &ones, .def_levels = &no_nulls, .max_def = 1 } }};
+    const full: Batch = .{ .cols = &present, .num_rows = 4 };
+    const fast = try evalExpr(a, &full, &lookup, bin(.mul, &x, &two, .i64));
+    try testing.expect(fast.i64.def_levels == null);
+    try testing.expectEqualSlices(i64, &.{ 2, 4, 6, 8 }, fast.i64.values);
+
+    // Elements of a list stay refused.
+    try testing.expectError(error.NestedNotSupported, evalExpr(a, &batch, &lookup, bin(.mul, &nested, &two, .i64)));
 }
 
 test "group key: integer operands convert to the binop's float lane" {

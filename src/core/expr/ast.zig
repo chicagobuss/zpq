@@ -366,7 +366,9 @@ pub const Expr = union(enum) {
 
     pub fn mayBeNull(self: Expr) bool {
         return switch (self) {
-            .literal, .binop => false,
+            .literal => false,
+            // NULL on either side is NULL.
+            .binop => |b| b.left.mayBeNull() or b.right.mayBeNull(),
             .col_ref => |c| c.nullable,
             .case_ => |c| blk: {
                 const e = c.else_ orelse break :blk true;

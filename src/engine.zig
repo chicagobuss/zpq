@@ -8943,7 +8943,7 @@ test "regression: grouped aggregates skip a computed argument's NULLs, coded or 
     }
 }
 
-test "regression: arithmetic refuses only the NULLs it would read" {
+test "regression: arithmetic over a NULL is NULL, which aggregates skip" {
     const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -8963,15 +8963,14 @@ test "regression: arithmetic refuses only the NULLs it would read" {
     });
     defer cw.deinit(gpa);
     try std.testing.expectEqual(@as(i128, 19), cw.aggregate.output.aggs[0].value.i);
-    // A NULL that arithmetic would read is refused, a column's or a computed one's.
-    try std.testing.expectError(error.NullableNotSupported, runQuery(ctx, .{
+    // A column's NULL or a computed one's makes the row's result NULL, which sum and count skip (it was refused).
+    var nulls = try runQuery(ctx, .{
         .inputs = &.{fixture},
-        .aggregate = "sum(i32n * 2) AS s",
-    }));
-    try std.testing.expectError(error.NullableNotSupported, runQuery(ctx, .{
-        .inputs = &.{fixture},
-        .aggregate = "sum(coalesce(a, b) + 1) AS s",
-    }));
+        .aggregate = "sum(i32n * 2) AS s, count(i32n * 2) AS n, sum(coalesce(a, b) + 1) AS c, count(coalesce(a, b) + 1) AS m",
+    });
+    defer nulls.deinit(gpa);
+    const want = [_]i128{ 30, 4, 35, 4 };
+    for (want, nulls.aggregate.output.aggs) |w, got| try std.testing.expectEqual(w, got.value.i);
 }
 
 test "regression: an INT96 past what 64-bit nanoseconds hold reads, compares and aggregates exactly" {

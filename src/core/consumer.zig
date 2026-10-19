@@ -1337,6 +1337,7 @@ fn appendSelected(
         inline else => |c, tag| {
             const T = @TypeOf(c.values[0]);
             const tb = &@field(buf.*, @tagName(tag));
+            const before = tb.values.items.len;
             // Exact sizing: the aggregator usually holds one row group, and ArrayList growth would leave half again
             // as much unused (and, being arena memory, never reclaimed).
             try tb.values.ensureTotalCapacityPrecise(arena, tb.values.items.len + surviving);
@@ -1353,13 +1354,27 @@ fn appendSelected(
                     pos += v.len;
                 }
             }
-            if (c.max_def == 0) return;
-            tb.max_def = c.max_def;
+            // Levels stay one per row however the batches come: a computed column is NULL-free in one row group (no
+            // levels, the vector kernels' result) and NULL in the next, so a batch without levels appends present
+            // rows to a buffer that has them, and a buffer gaining levels first gives its earlier rows theirs.
+            const max_def = @max(c.max_def, tb.max_def);
+            if (max_def == 0) return;
+            if (tb.max_def == 0) {
+                try tb.def_levels.ensureTotalCapacityPrecise(arena, before);
+                @memset(tb.def_levels.addManyAsSliceAssumeCapacity(before), max_def);
+            } else if (tb.max_def != max_def) for (tb.def_levels.items) |*d| {
+                if (d.* == tb.max_def) d.* = max_def;
+            };
+            tb.max_def = max_def;
             try tb.def_levels.ensureTotalCapacityPrecise(arena, tb.def_levels.items.len + surviving);
             const dl_out = tb.def_levels.addManyAsSliceAssumeCapacity(surviving);
             if (c.def_levels) |dl| {
                 encoder.compactByMask(u32, dl, sel.mask, dl_out);
-            } else @memset(dl_out, c.max_def);
+                // A flat column is present at its own max; carry it to the buffer's.
+                if (c.max_def != max_def) for (dl_out) |*d| {
+                    if (d.* == c.max_def) d.* = max_def;
+                };
+            } else @memset(dl_out, max_def);
         },
     }
 }
@@ -7385,4 +7400,33 @@ test "regression: a renamed passthrough is its leaf renamed and flat, NULL where
     const flat_defs = [_]u32{ 0, 1, 1, 1 };
     const flat: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &flat_defs, .max_def = 1, .has_nulls = true } };
     try testing.expectEqual(flat.i32.def_levels.?.ptr, (try namedLevels(a, .{ .ci = 0, .name = "k" }, flat)).i32.def_levels.?.ptr);
+}
+
+test "appendSelected keeps one level per row when a column's batches come with and without levels" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const vals = [_]i64{ 7, 8 };
+    const defs = [_]u32{ 1, 0 };
+    // A computed column NULL in one row group (levels) and NULL-free in the next (none), in both orders.
+    const with: filter_eval.Batch.Column = .{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
+    const without: filter_eval.Batch.Column = .{ .i64 = .{ .values = &vals } };
+    var sel = try filter_selection.SelectionVector.init(a, 2);
+    const Case = struct { first: filter_eval.Batch.Column, second: filter_eval.Batch.Column, want: [4]u32 };
+    for ([_]Case{
+        .{ .first = with, .second = without, .want = .{ 1, 0, 1, 1 } },
+        .{ .first = without, .second = with, .want = .{ 1, 1, 1, 0 } },
+    }) |c| {
+        var buf: OutputAggregator.ColumnBuf = .{ .i64 = .{} };
+        try appendSelected(&buf, c.first, &sel, 2, a, false, a);
+        try appendSelected(&buf, c.second, &sel, 2, a, false, a);
+        try std.testing.expectEqual(@as(usize, 4), buf.i64.values.items.len);
+        try std.testing.expectEqualSlices(u32, &c.want, buf.i64.def_levels.items);
+        try std.testing.expectEqual(@as(u32, 1), buf.i64.max_def);
+    }
+    // NULL-free batches alone carry no levels.
+    var plain: OutputAggregator.ColumnBuf = .{ .i64 = .{} };
+    try appendSelected(&plain, without, &sel, 2, a, false, a);
+    try appendSelected(&plain, without, &sel, 2, a, false, a);
+    try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
 }

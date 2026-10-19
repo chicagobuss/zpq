@@ -92,9 +92,14 @@ SELECTS = [
                   "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x"),
     ("case_dec",  "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x",
                   "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x"),
-    # Raw arithmetic over a NULLABLE column (e.g. `amt * 2`) is a documented
-    # limitation: eval.zig returns NullableNotSupported (clean error, not wrong
-    # answer). Coalesce IS null-aware.
+    # Arithmetic over a NULL is NULL, in every lane: a nullable DOUBLE, an INTEGER and a DECIMAL beside a NULL-able
+    # CASE, a string; a NULL row's placeholder raises no division by zero.
+    ("amt_x2",    "amt * 2 AS x",           "amt * 2 AS x"),
+    ("amt_id",    "amt + id AS x",          "amt + id AS x"),
+    ("int_null",  "id + CASE WHEN amt IS NOT NULL THEN 1 END AS x", "id + CASE WHEN amt IS NOT NULL THEN 1 END AS x"),
+    ("dec_null",  "price * CASE WHEN amt IS NOT NULL THEN 2 END AS x", "price * CASE WHEN amt IS NOT NULL THEN 2 END AS x"),
+    ("str_null",  "nname || '_z' AS x",     "nname || '_z' AS x"),
+    ("null_div",  "id / CASE WHEN id = 0 THEN NULL ELSE id END AS x", "id // CASE WHEN id = 0 THEN NULL ELSE id END AS x"),
 ]
 
 # (label, zpq_agg, duckdb_select) — filter × aggregate, compared as scalars.
@@ -110,6 +115,9 @@ AGGS = [
                   "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))"),
     ("case_arg",  "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
                   "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)"),
+    # Arithmetic over a NULL is NULL, which every aggregate skips.
+    ("null_arith", "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+                   "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)"),
 ]
 # (label, columns_csv | None) — None = all columns (passthrough fast path).
 PROJECTIONS = [

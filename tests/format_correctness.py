@@ -112,10 +112,9 @@ def binary_text(tmp):
                 out = query(src, *args, '--format', fmt).stdout
                 got = json.loads(out) if fmt == 'json' else [json.loads(line) for line in out.splitlines()]
                 assert got == want, (src, args, fmt, want, got)
-        # A bare alias of a nullable column is refused (`NullableNotSupported`) before any value is printed.
-        if None not in values:
-            renamed = json.loads(query(src, '--select', 'v AS renamed', '--format', 'json').stdout)
-            assert renamed == [{'renamed': r['v']} for r in rows], (src, renamed)
+        # A bare alias keeps the column's NULLs.
+        renamed = json.loads(query(src, '--select', 'v AS renamed', '--format', 'json').stdout)
+        assert renamed == [{'renamed': r['v']} for r in rows], (src, renamed)
         sql = json.loads(sql_query(f"SELECT v FROM '{src}' LIMIT 2 OFFSET 1", '--format', 'json').stdout)
         assert sql == rows[1:3], (src, sql)
         present = [v for v in values if v is not None]

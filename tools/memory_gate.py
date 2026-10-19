@@ -22,7 +22,7 @@ something.
 The verdict per run: `ok` (answered, peak <= budget + slack), `over` (answered above it), `refused` (clean error),
 `killed` (the scope cap or a signal), `diff` (answered, but stdout differs from the same shape's other answers).
 With `--cap` every run gets that one cgroup cap, as in a container: a budget at or under it must answer or refuse,
-never be killed (`topn/*` at 128M and 512M).
+never be killed (`topn/desc_*` at 128M and 512M, `topn/gather_*` at 256M and 512M).
 Slack is fixed per run: `--slack` (default 48 MiB: binary, allocator bookkeeping, a GROUP BY's finalize allowance or
 a last retry's own decode ledger, src/core/memory.zig) plus 2 MiB per worker (its stack, its first huge page).
 
@@ -120,6 +120,11 @@ def cells(fixtures):
             # Every row evicts the one kept: the serial Top-N's kept keys (a computed output always runs serially).
             out.append(("topn/desc_expr", ["--query", f"SELECT k + 0 AS v FROM '{td}' ORDER BY k LIMIT 1"], [td]))
             out.append(("topn/desc_col", ["--query", f"SELECT k FROM '{td}' ORDER BY k LIMIT 1"], [td]))
+        for name, limit in (("gather_big", 16), ("gather_dict_big", 8)):
+            gf = f"{fixtures}/{name}.parquet"
+            if os.path.exists(gf):
+                # The parallel Top-N's gather: a winner in every row group, read a page or a dictionary at a time.
+                out.append((f"topn/{name}", ["--query", f"SELECT s FROM '{gf}' ORDER BY k LIMIT {limit}"], [gf]))
     return out
 
 

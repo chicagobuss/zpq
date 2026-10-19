@@ -5777,8 +5777,21 @@ const TopRows = struct {
             e.row = self.store.num_rows - 1;
         };
         if (self.store.num_rows > 2 *| self.h +| 1024) try self.compact();
-        const held = self.store_arena.queryCapacity() + self.heap.cap * @sizeOf(Entry);
+        const held = self.storeUsed() + self.heap.cap * @sizeOf(Entry);
         if (held > self.budget) return error.ExceededMemoryBudget;
+    }
+
+    /// Bytes the store's arena has handed out: its nodes' used ends, not the tails a node reserves half again past
+    /// them (counted, a few bytes more per row moved the answer's threshold by a node). The account holds the rest.
+    fn storeUsed(self: *const TopRows) usize {
+        var used: usize = 0;
+        var it = self.store_arena.state.used_list;
+        while (it) |node| : (it = node.next) {
+            // The low bit of a node's size marks a resize in flight; sizes are even.
+            const size = @as(usize, @bitCast(node.size)) & ~@as(usize, 1);
+            used += @min(node.end_index, size - @sizeOf(@TypeOf(node.*)));
+        }
+        return used;
     }
 
     /// Whether a row group whose rows' first key is at best `best` holds no row the heap would keep: the heap is full

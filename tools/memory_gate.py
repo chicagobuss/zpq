@@ -125,6 +125,10 @@ def cells(fixtures):
             if os.path.exists(gf):
                 # The parallel Top-N's gather: a winner in every row group, read a page or a dictionary at a time.
                 out.append((f"topn/{name}", ["--query", f"SELECT s FROM '{gf}' ORDER BY k LIMIT {limit}"], [gf]))
+        gp = f"{fixtures}/gather_pages.parquet"
+        if os.path.exists(gp):
+            # Every row kept and sorted, 330 MB of them: answers from 800M (its kept rows counted by bytes used).
+            out.append(("topn/order_all", ["--query", f"SELECT s FROM '{gp}' ORDER BY k"], [gp]))
     return out
 
 

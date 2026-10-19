@@ -238,6 +238,19 @@ fn isIdentCont(c: u8) bool {
 }
 
 /// Parse a comma-separated list of `expr [AS alias]` items.
+/// An output name as written after AS: a double-quoted one is its text, a doubled quote inside it one quote
+/// (`"a""b"` names `a"b`). The lexer keeps such a name quoted, as a column reference it is a quoted path.
+fn aliasName(arena: std.mem.Allocator, text: []const u8) Error![]const u8 {
+    if (text.len < 2 or text[0] != '"' or text[text.len - 1] != '"') return text;
+    var i: usize = 1;
+    while (i < text.len - 1) : (i += 1) if (text[i] == '"') {
+        // A quote inside one quoted name comes doubled; anything else (`"a"."b"`) is no single quoted name.
+        if (i + 1 >= text.len - 1 or text[i + 1] != '"') return text;
+        i += 1;
+    };
+    return std.mem.replaceOwned(u8, arena, text[1 .. text.len - 1], "\"\"", "\"");
+}
+
 pub fn parseSelect(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -258,7 +271,7 @@ pub fn parseSelect(
             _ = try lex.next();
             const id = try lex.next();
             if (id.kind != .ident) return error.ExpectedIdentifier;
-            alias = id.text;
+            alias = try aliasName(arena, id.text);
         }
         try items.append(arena, .{ .expr = e, .alias = alias });
 
@@ -305,7 +318,7 @@ pub fn parseGroupByOf(
             _ = try lex.next();
             const id = try lex.next();
             if (id.kind != .ident) return error.ExpectedIdentifier;
-            alias = id.text;
+            alias = try aliasName(arena, id.text);
         }
         try items.append(arena, .{ .expr = e, .alias = alias });
 
@@ -898,7 +911,7 @@ fn parseAggCall(
         _ = try lex.next();
         const alias_tok = try lex.next();
         if (alias_tok.kind != .ident) return error.ExpectedIdentifier;
-        alias = alias_tok.text;
+        alias = try aliasName(arena, alias_tok.text);
         default_name = null;
     }
 
@@ -1578,4 +1591,20 @@ test "regression: a STRUCT named where a value is wanted is refused, naming a le
     // Its leaves, and a name that matches nothing, keep their answers.
     try testing.expectEqual(@as(usize, 0), (try parseExprOnly(a, "r.key", &file, null)).col_ref.col_idx);
     try testing.expectError(error.UnknownColumn, parseExprOnly(a, "nope", &file, null));
+}
+
+test "regression: a doubled quote in a quoted alias is one quote of the output name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"id"}, &.{.INT64});
+    const sel = try parseSelect(a, "id AS \"a\"\"b\", id AS \"plain\", id AS bare, id AS \"\"\"\"", &file, null);
+    try testing.expectEqualStrings("a\"b", sel[0].alias.?);
+    try testing.expectEqualStrings("plain", sel[1].alias.?);
+    try testing.expectEqualStrings("bare", sel[2].alias.?);
+    try testing.expectEqualStrings("\"", sel[3].alias.?);
+    const aggs = try parseAggList(a, "count(*) AS \"c\"\"d\"", &file, null);
+    try testing.expectEqualStrings("c\"d", aggs[0].alias);
+    const keys = try parseGroupBy(a, "id AS \"k\"\"k\"", &file, null);
+    try testing.expectEqualStrings("k\"k", keys[0].alias.?);
 }

@@ -359,8 +359,15 @@ fn selectColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocato
     if (expr_c == null) return error.UnparseError;
     out.expr = try allocator.dupe(u8, std.mem.span(expr_c));
     if (rc.kind == c.LP_RESULT_COLUMN and rc.u.result_column.alias != null) {
-        out.alias = try allocator.dupe(u8, std.mem.span(rc.u.result_column.alias));
+        out.alias = try aliasText(allocator, std.mem.span(rc.u.result_column.alias));
     }
+}
+
+/// The output name an alias spells: the parser keeps a quoted one quoted (`"n m"`, `"a""b"`); the name is its text,
+/// a doubled quote one quote.
+fn aliasText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return allocator.dupe(u8, raw);
+    return std.mem.replaceOwned(u8, allocator, raw[1 .. raw.len - 1], "\"\"", "\"");
 }
 
 pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
@@ -1414,4 +1421,13 @@ test "sql_parser binds ORDER BY over plain rows to row expressions" {
     try std.testing.expectEqualStrings("x + 1", all.result_order.rows[0].expr);
     try std.testing.expectEqual(@as(?u64, null), all.result_order.limit);
     try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY count(*) LIMIT 3"));
+}
+
+test "regression: a quoted alias names its text, a doubled quote one quote" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k AS \"a\"\"b\", count(*) AS \"n m\", sum(x) AS s FROM 't' GROUP BY k");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("a\"b", q.select_cols[0].alias.?);
+    try std.testing.expectEqualStrings("n m", q.select_cols[1].alias.?);
+    try std.testing.expectEqualStrings("s", q.select_cols[2].alias.?);
 }

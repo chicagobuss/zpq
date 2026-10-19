@@ -60,9 +60,36 @@ jobs:
             dist/*.tar.gz*
             dist/release.json
 
+  # Every release artifact, built as it ships, RUN before anything is published (tools/release_smoke.sh): the
+  # x86_64-linux-musl CLI and Lambda bootstrap natively, the aarch64-linux-musl ones under qemu. A gate that only
+  # compiled let a static-musl build that crashed on every query through. The macOS targets run on a Mac and are
+  # explicit skips here.
+  smoke:
+    name: Run release artifacts (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Zig (anyzig pins to build.zig.zon)
+        run: |
+          mkdir -p $HOME/zig-bin
+          curl -fsSL "https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz" \
+            | tar -xz -C $HOME/zig-bin
+          echo "$HOME/zig-bin" >> $GITHUB_PATH
+
+      - name: Install qemu for aarch64
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user qemu-user-binfmt
+
+      - name: Build and run the release artifacts
+        run: zig build release-smoke -Drelease-smoke-skip=aarch64-macos,x86_64-macos
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write

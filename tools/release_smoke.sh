@@ -1,25 +1,44 @@
 #!/usr/bin/env bash
-# Build every release artifact and RUN it, where this host can.
+# Build every release artifact and RUN it.
 #
 # A cross-build gate that only compiled let through a static-musl CLI and Lambda that crashed on every query (a weak
-# extern resolved to address 0). So each target here is built exactly as it ships (ReleaseFast) and then executed:
-#   - x86_64-linux-musl: the CLI natively (--version, an aggregate, SQL, a filtered -o write read back), then the
-#     Lambda bootstrap against the fake runtime API of tests/lambda_integration.zig (`zig build test-integration`
-#     built for the target: the same `zpq-lambda` artifact tools/serverless/aws.sh zips as `bootstrap`).
-#   - aarch64-linux-musl: the same under qemu-aarch64 when installed (Ubuntu: qemu-user, plus qemu-user-binfmt so the
-#     Lambda bootstrap the integration test spawns runs too); otherwise reported as NOT RUN, with what to install.
-#   - aarch64-macos: built only. It runs on a Mac (the grantedmbp run), never here.
-# Exit 1 on any failed build or run; a target this host cannot run is listed at the end, not a failure.
+# extern resolved to address 0). So each release target (tools/package_release.py's four) is built exactly as it ships
+# (ReleaseFast) and then executed:
+#   - CLI: --version, an aggregate, SQL, and a filtered -o write read back.
+#   - Lambda (Linux targets): the bootstrap against the fake runtime API of tests/lambda_integration.zig
+#     (`zig build test-integration` built for the target: the same `zpq-lambda` artifact tools/serverless/aws.sh zips).
+# Where the runs happen:
+#   - x86_64-linux-musl: natively on an x86_64 Linux host.
+#   - aarch64-linux-musl: natively on aarch64 Linux, else under qemu-aarch64 (Ubuntu: qemu-user; the Lambda run also
+#     needs qemu-user-binfmt, as the harness spawns the bootstrap as a child; qemu-user-static elsewhere).
+#   - aarch64-macos, x86_64-macos: on a Mac (x86_64 under Rosetta on Apple silicon). Never on Linux.
+# A run this host cannot do FAILS the gate unless it is listed to skip (comma-separated targets, or `<target>:lambda`
+# for the Lambda run alone) in --skip or RELEASE_SMOKE_SKIP, e.g. on Linux:
+#   zig build release-smoke -Drelease-smoke-skip=aarch64-macos,x86_64-macos
+#   RELEASE_SMOKE_SKIP=aarch64-macos,x86_64-macos tools/release_smoke.sh
+# Every target is built whatever is skipped. Exit 1 on a failed build, a failed run, or an unlisted run not done.
 #
-# Usage: tools/release_smoke.sh [OUT_DIR]   (default zig-out/release; `zig build release-smoke` passes ZIG)
+# Usage: tools/release_smoke.sh [--skip LIST] [OUT_DIR]   (default zig-out/release; `zig build release-smoke` passes
+# ZIG and, from -Drelease-smoke-skip, --skip)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ZIG="${ZIG:-zig}"
+skip_list="${RELEASE_SMOKE_SKIP:-}"
+if [[ "${1:-}" == --skip ]]; then
+    skip_list="${skip_list:+$skip_list,}${2:?--skip needs a list}"
+    shift 2
+fi
 OUT="${1:-zig-out/release}"
 FIX="ci/fixtures/parquet/full_match.parquet"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-not_run=()
+SKIP=()
+IFS=',' read -r -a SKIP <<< "$skip_list"
+ran=()
+skipped=()
+missing=()
+os="$(uname -s)"
+host="$(uname -m)"
 
 build() {
     local t="$1"
@@ -34,6 +53,24 @@ expect() {
         exit 1
     fi
     echo "  ok $what"
+}
+
+listed() {
+    local name="$1" s
+    for s in "${SKIP[@]+"${SKIP[@]}"}"; do
+        [[ "$s" == "$name" ]] && return 0
+    done
+    return 1
+}
+
+# A run this host cannot do: skipped if listed (as the run or as its whole target), else a failure, with why.
+cannot() {
+    local run="$1" why="$2"
+    if listed "$run" || listed "${run%%:*}"; then
+        skipped+=("$run ($why)")
+    else
+        missing+=("$run ($why; list it in -Drelease-smoke-skip / RELEASE_SMOKE_SKIP to skip)")
+    fi
 }
 
 # The CLI of target `t`, run through `runner` (empty for native).
@@ -51,6 +88,7 @@ smoke_cli() {
     $runner "$bin" query "$FIX" --filter 'b >= 14' --columns b,s -o "$TMP/$t.parquet"
     expect "write, read back" '{"n":200,"s":2900}' \
         "$($runner "$bin" query "$TMP/$t.parquet" --aggregate 'count(*) AS n, sum(b) AS s')"
+    ran+=("$t${runner:+ (under $runner)}")
 }
 
 # The Lambda bootstrap of target `t` against the fake runtime API; extra arguments go to `zig build` (`-fqemu` runs a
@@ -61,43 +99,58 @@ smoke_lambda() {
     echo "== run $t Lambda bootstrap (fake runtime API)${1:+ $*}"
     "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast "$@" test-integration --summary failures
     echo "  ok test-integration"
+    ran+=("$t:lambda${1:+ ($*)}")
 }
 
-host="$(uname -m)"
-[[ "$(uname -s)" == Darwin ]] && not_run+=("linux-musl targets: built only on a Mac")
+for t in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do build "$t"; done
 
 t=x86_64-linux-musl
-build "$t"
-if [[ "$(uname -s)" == Linux && "$host" == x86_64 ]]; then
+if [[ "$os" == Linux && "$host" == x86_64 ]]; then
     smoke_cli "$t" ""
     smoke_lambda "$t"
 else
-    not_run+=("$t: not an x86_64 host")
+    cannot "$t" "not an x86_64 Linux host"
 fi
 
 t=aarch64-linux-musl
-build "$t"
-if [[ "$(uname -s)" == Linux && "$host" == aarch64 ]]; then
+qemu="$(command -v qemu-aarch64 || command -v qemu-aarch64-static || true)"
+if [[ "$os" == Linux && "$host" == aarch64 ]]; then
     smoke_cli "$t" ""
     smoke_lambda "$t"
-elif [[ "$(uname -s)" == Linux ]] && qemu="$(command -v qemu-aarch64 || command -v qemu-aarch64-static)"; then
+elif [[ "$os" == Linux && -n "$qemu" ]]; then
     smoke_cli "$t" "$qemu"
     if [[ -r /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] && grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64; then
         smoke_lambda "$t" -fqemu
     else
-        not_run+=("$t Lambda bootstrap: no binfmt for aarch64 to run the child the harness spawns (install qemu-user-binfmt)")
+        cannot "$t:lambda" "no binfmt for aarch64 (install qemu-user-binfmt)"
     fi
 else
-    not_run+=("$t CLI and Lambda: no qemu-aarch64 (install qemu-user and qemu-user-binfmt; qemu-user-static elsewhere)")
+    cannot "$t" "no qemu-aarch64 (install qemu-user and qemu-user-binfmt, or qemu-user-static)"
 fi
 
 t=aarch64-macos
-build "$t"
-if [[ "$(uname -s)" == Darwin && "$host" == arm64 ]]; then
+if [[ "$os" == Darwin && "$host" == arm64 ]]; then
     smoke_cli "$t" ""
 else
-    not_run+=("$t: built only; run tools/release_smoke.sh on a Mac (the grantedmbp run)")
+    cannot "$t" "runs on an Apple silicon Mac (the grantedmbp run)"
 fi
 
+t=x86_64-macos
+if [[ "$os" == Darwin && "$host" == x86_64 ]]; then
+    smoke_cli "$t" ""
+elif [[ "$os" == Darwin ]] && arch -x86_64 /usr/bin/true 2>/dev/null; then
+    smoke_cli "$t" "arch -x86_64"
+else
+    cannot "$t" "runs on a Mac (Intel, or Apple silicon with Rosetta)"
+fi
+
+echo
+echo "release smoke summary (built: x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos)"
+for r in "${ran[@]+"${ran[@]}"}"; do echo "  RAN     $r"; done
+for r in "${skipped[@]+"${skipped[@]}"}"; do echo "  SKIPPED $r"; done
+for r in "${missing[@]+"${missing[@]}"}"; do echo "  NOT RUN $r"; done
+if (( ${#missing[@]} > 0 )); then
+    echo "release smoke: FAIL (runs not done and not listed to skip)"
+    exit 1
+fi
 echo "release smoke: PASS"
-for n in "${not_run[@]}"; do echo "  NOT RUN $n"; done

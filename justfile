@@ -40,10 +40,11 @@ cross-check:
     @echo "[aarch64-macos]" ; zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
     @echo "All targets OK."
 
-# Build every release target as it ships and RUN its CLI and Lambda where this host can (aarch64 under qemu-aarch64 if
-# installed, macOS on a Mac); part of the stop and integration gates. tools/release_smoke.sh says what runs where.
-release-smoke:
-    zig build release-smoke
+# Build every release target as it ships and RUN its CLI and Lambda (aarch64 Linux under qemu, macOS on a Mac); part of
+# the stop and integration gates. A run the host cannot do fails unless listed to skip (`just release-smoke
+# aarch64-macos,x86_64-macos` on Linux). tools/release_smoke.sh says what runs where.
+release-smoke skip="":
+    zig build release-smoke {{ if skip == "" { "" } else { "-Drelease-smoke-skip=" + skip } }}
 
 # The Lambda deploy zips (musl static, ReleaseFast) for both archs, built by
 # tools/serverless/aws.sh. ReleaseFast, not ReleaseSmall: on Lambda the small

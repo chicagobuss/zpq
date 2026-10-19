@@ -107,8 +107,9 @@ pub const Region = struct {
     /// rest, so a small scan faults in and zeroes one huge page per worker, not one each. That first page is the
     /// worker's slack, the allowance of both, counted once: the scratch never draws for its span and the arena draws
     /// from the next page on. A scratch block past its span spills straight to the OS (`page_allocator`), charged by
-    /// its length: it grows in place by remapping rather than copying beside itself, and is resident only until
-    /// freed, which a general heap's per-thread caches do not promise. Deinit both together, the scratch first.
+    /// its length; a buffer that outgrows it is replaced (`DecodeScratch.ensure` allocates the larger one, then frees
+    /// the old), and a freed one is unmapped with its charge, not kept resident as a general heap's per-thread caches
+    /// may keep it. Deinit both together, the scratch first.
     pub fn initPair(child: std.mem.Allocator, reserve: usize) Pair {
         var arena = map(child, reserve + pair_scratch_span);
         var scratch: Region = .{ .child = std.heap.page_allocator, .allowance = huge_page_size };

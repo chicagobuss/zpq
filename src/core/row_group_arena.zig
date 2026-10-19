@@ -301,3 +301,63 @@ test "on a region with no mapping, everything is the arena's spill, gone at dein
     try std.testing.expectEqual(@as(usize, 0), region.spilled);
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
+
+/// A paired scratch and row-group arena through scratch growth, an arena spill, a boundary and teardown, on the
+/// mapping (`mapped`) or on a reserve too large to map, where both fall back to their children. Whatever fails, the
+/// ledger ends holding only what was drawn before.
+fn pairUnwindsForTest(child: std.mem.Allocator, mapped: bool) !void {
+    var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+    _ = budget.drawExact(17).?;
+    defer std.debug.assert(budget.used.load(.monotonic) == 17);
+    var pair = huge_pages.Region.initPair(child, if (mapped) huge_pages.huge_page_size else @as(usize, 1) << 62);
+    if (!mapped) {
+        try std.testing.expectEqual(@as(usize, 0), pair.arena.mapping.len);
+        try std.testing.expectEqual(@as(usize, 0), pair.arena.buf.len);
+        try std.testing.expectEqual(@as(usize, 0), pair.scratch.buf.len);
+    }
+    pair.scratch.child = child;
+    pair.scratch.budget = &budget;
+    pair.arena.budget = &budget;
+    defer pair.arena.deinit();
+    defer pair.scratch.deinit();
+    var scratch = @import("parquet/page.zig").DecodeScratch.init(pair.scratch.allocator());
+    defer scratch.deinit();
+    var arena = RowGroupArena.initOn(&pair.arena);
+    defer arena.deinit();
+    @memset(try scratch.ensure(u8, 1, &scratch.page, 4096), 0x5a);
+    @memset(try scratch.ensure(u8, 1, &scratch.page, 2 << 20), 0x5a);
+    @memset(try arena.allocator().alloc(u8, 6 << 20), 1);
+    const held = budget.used.load(.monotonic);
+    arena.nextRowGroup();
+    @memset(try arena.allocator().alloc(u8, 6 << 20), 2);
+    try std.testing.expectEqual(held, budget.used.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0x5a), scratch.page[scratch.page.len - 1]);
+}
+
+test "a worker's region pair unwinds every allocation failure, mapped or not, holding no charge of its own" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pairUnwindsForTest, .{true});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pairUnwindsForTest, .{false});
+}
+
+test "a row-group arena filling its pair's whole span, rewound and trimmed, leaves the live scratch intact" {
+    var pair = huge_pages.Region.initPair(std.testing.allocator, 4 << 20);
+    defer pair.arena.deinit();
+    defer pair.scratch.deinit();
+    if (pair.arena.buf.len == 0) return error.SkipZigTest;
+    var budget: core_memory.SharedBudget = .{ .limit = 32 << 20 };
+    pair.arena.budget = &budget;
+    pair.scratch.budget = &budget;
+    const s = try pair.scratch.allocator().alloc(u8, huge_pages.Region.pair_scratch_span);
+    @memset(s, 0xa5);
+    var arena = RowGroupArena.initOn(&pair.arena);
+    defer arena.deinit();
+    for (0..4) |_| {
+        @memset(try arena.allocator().alloc(u8, pair.arena.buf.len), 0x33);
+        try std.testing.expectEqual(@as(u8, 0xa5), s[0]);
+        try std.testing.expectEqual(@as(u8, 0xa5), s[s.len - 1]);
+        arena.nextRowGroup();
+        pair.arena.trim();
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        try std.testing.expectEqual(@as(u8, 0xa5), s[s.len - 1]);
+    }
+}

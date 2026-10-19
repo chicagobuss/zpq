@@ -379,13 +379,15 @@ fn parseLike(
     const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
     const col_idx = try resolveCol(file, col_name, diag);
-    const pattern = try stringValue(arena, file, col_name, trimSpace(pat_part), diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
         const type_name = @tagName(elem.type orelse .BYTE_ARRAY);
         Diag.set(diag, col_name, .{ .like_non_string = .{ .type_name = type_name } });
         return error.UnsupportedType;
     }
+    // `s LIKE NULL` is UNKNOWN for every row, as `s = NULL` is: the bare word is the NULL literal, not the text 'NULL'.
+    if (isNullLiteral(trimSpace(pat_part))) return unknown;
+    const pattern = try stringValue(arena, file, col_name, trimSpace(pat_part), diag);
     const c = classifyLike(pattern);
     return ast.Filter{ .like = .{ .col_idx = col_idx, .kind = c.kind, .operand = c.operand, .negate = negate } };
 }
@@ -589,10 +591,11 @@ fn parseBetween(
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
 
     // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
-    // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals.
+    // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals. A NULL bound is the
+    // UNKNOWN `x >= NULL` is, so `x NOT BETWEEN NULL AND 5` still keeps the rows past 5.
     return ast.join(arena, true, &.{
-        try buildTypedComparison(arena, file, col_idx, &elem, .GtEq, x_str, diag),
-        try buildTypedComparison(arena, file, col_idx, &elem, .LtEq, y_str, diag),
+        if (isNullLiteral(x_str)) unknown else try buildTypedComparison(arena, file, col_idx, &elem, .GtEq, x_str, diag),
+        if (isNullLiteral(y_str)) unknown else try buildTypedComparison(arena, file, col_idx, &elem, .LtEq, y_str, diag),
     });
 }
 
@@ -2030,6 +2033,49 @@ test "a NULL in an IN list matches nothing and leaves NOT IN true for no row, un
             return err;
         };
     }
+}
+
+test "regression: a NULL LIKE pattern or BETWEEN bound is UNKNOWN, never the text 'NULL', under any NOT" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const ids = [_]i32{ 1, 2, 5, 0 };
+    const id_def = [_]u32{ 1, 1, 1, 0 };
+    const strs = [_][]const u8{ "foo", "NULL", "bar", "" };
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = &ids, .def_levels = &id_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    const cases = [_]Case{
+        .{ .filter = "status LIKE NULL", .want = .{ false, false, false, false } },
+        .{ .filter = "status NOT LIKE null", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (status LIKE NULL)", .want = .{ false, false, false, false } },
+        .{ .filter = "status LIKE NULL OR id = 2", .want = .{ false, true, false, false } },
+        .{ .filter = "status LIKE 'NULL'", .want = .{ false, true, false, false } },
+        .{ .filter = "id BETWEEN NULL AND 2", .want = .{ false, false, false, false } },
+        .{ .filter = "id BETWEEN NULL AND NULL", .want = .{ false, false, false, false } },
+        // x < NULL OR x > 2: the second half still holds for 5.
+        .{ .filter = "id NOT BETWEEN NULL AND 2", .want = .{ false, false, true, false } },
+        .{ .filter = "NOT (id BETWEEN 3 AND NULL)", .want = .{ true, true, false, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
+    // LIKE keeps its type rule for a NULL pattern too.
+    try testing.expectError(error.UnsupportedType, parse(a, "id LIKE NULL", &meta, null));
 }
 
 test "fuzz-lite: nested predicates select exactly the rows three-valued logic passes" {

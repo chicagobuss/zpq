@@ -656,6 +656,50 @@ test "regression: a float row group whose NaN rows its bounds leave out is kept 
     try testing.expect(no_nan.decide(leaf(.Lt, nan)) != .skip);
 }
 
+test "float pruning reads bounds under IEEE_754_TOTAL_ORDER, and a page index's own NaN counts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.mem.toBytes(@as(f64, 0.0));
+    const hi = std.mem.toBytes(@as(f64, 1.0));
+    const gt5: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 5 } };
+    const lt_neg: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = -1 } };
+
+    var fx = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 });
+    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    try orders.append(a, schema.COLUMN_ORDER_IEEE_754_TOTAL);
+    fx.fm.column_orders = orders;
+    try testing.expectEqual(Decision.skip, fx.decide(gt5));
+    try testing.expectEqual(Decision.skip, fx.decide(lt_neg));
+    // An all-NaN chunk under that order has NaN bounds: nothing is pruned on them.
+    const nan = std.mem.toBytes(std.math.nan(f64));
+    var all_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &nan, .max_value = &nan, .null_count = 0, .nan_count = 9 });
+    all_nan.fm.column_orders = orders;
+    try testing.expect(all_nan.decide(lt_neg) != .skip);
+    try testing.expect(all_nan.decide(gt5) != .skip);
+    // The order is for floats alone; on a string column it is no order zpq reads.
+    var str = try ProofFixture.init(a, leafElem(.BYTE_ARRAY), .{ .min_value = "a", .max_value = "c", .null_count = 0 });
+    str.fm.column_orders = orders;
+    try testing.expectEqual(Decision.unknown, str.decide(.{ .string = .{ .col_idx = 0, .op = .Eq, .value = "z" } }));
+
+    // Pages: the chunk's nan_count unknown, the index's count for the page decides.
+    const unknown = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    for ([_]?i64{ null, 3, 0 }) |page_nans| {
+        var ci: schema.ColumnIndex = .{};
+        try ci.null_pages.append(a, false);
+        try ci.min_values.append(a, &lo);
+        try ci.max_values.append(a, &hi);
+        if (page_nans) |n| {
+            ci.nan_counts = .empty;
+            try ci.nan_counts.?.append(a, n);
+        }
+        const cis = [_]?schema.ColumnIndex{ci};
+        const d = prunePage(&unknown.rg, 0, gt5, &cis, &unknown.fm, false);
+        if (page_nans == 0) try testing.expectEqual(Decision.skip, d) else try testing.expect(d != .skip);
+        try testing.expectEqual(Decision.skip, prunePage(&unknown.rg, 0, lt_neg, &cis, &unknown.fm, false));
+    }
+}
+
 /// `test_fixtures.StatsColumn`, deciding filters against itself.
 const ProofFixture = struct {
     rg: schema.RowGroup,
@@ -918,8 +962,9 @@ fn prunePageNumeric(
     const min = ci.min_values.items[page_idx];
     const max = ci.max_values.items[page_idx];
 
-    // The chunk's nan_count covers each of its pages.
-    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(meta))) return .skip;
+    // The chunk's nan_count covers each of its pages; the index may count each page's own.
+    const page_nan_free = if (ci.nan_counts) |nc| page_idx < nc.items.len and nc.items[page_idx] == 0 else false;
+    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(meta) or page_nan_free)) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {

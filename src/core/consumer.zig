@@ -1271,6 +1271,12 @@ fn synthPageIndexToSink(
         var ncs: std.ArrayListUnmanaged(i64) = .empty;
         try ncs.append(out_arena, null_count);
         ci.null_counts = ncs;
+        // One page: the chunk's NaN count is the page's.
+        if (stats.nan_count) |n| {
+            var nans: std.ArrayListUnmanaged(i64) = .empty;
+            try nans.append(out_arena, n);
+            ci.nan_counts = nans;
+        }
 
         var w = thrift.Writer.init(out_arena);
         try ci.write(&w);
@@ -1976,6 +1982,7 @@ fn cloneColumnMeta(
             .distinct_count = st.distinct_count,
             .max_value = if (st.max_value) |v| try arena.dupe(u8, v) else null,
             .min_value = if (st.min_value) |v| try arena.dupe(u8, v) else null,
+            .nan_count = st.nan_count,
         };
     }
 

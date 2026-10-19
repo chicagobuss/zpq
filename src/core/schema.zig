@@ -819,7 +819,9 @@ pub const Statistics = struct {
     /// written back, so byte-copied output loses them, which only makes later readers more conservative.
     is_max_value_exact: ?bool = null,
     is_min_value_exact: ?bool = null,
-    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Read-only, like the exactness flags.
+    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Written back, unlike the exactness flags: the
+    /// writer counts its own chunks' NaN, and a chunk copied byte for byte keeps its count. Missing means NaN may be
+    /// present.
     nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
@@ -864,6 +866,7 @@ pub const Statistics = struct {
         if (self.distinct_count) |v| try writer.writeFieldI64(4, v);
         if (self.max_value) |v| try writer.writeFieldString(5, v);
         if (self.min_value) |v| try writer.writeFieldString(6, v);
+        if (self.nan_count) |v| try writer.writeFieldI64(9, v);
         try writer.writeStructEnd();
     }
 };
@@ -1250,6 +1253,8 @@ pub const ColumnIndex = struct {
     boundary_order: BoundaryOrder = .UNORDERED,
     /// Optional per-page null counts. Histograms (fields 6-7) skipped.
     null_counts: ?std.ArrayListUnmanaged(i64) = null,
+    /// Optional per-page NaN counts of a FLOAT/DOUBLE column; missing means any page may hold NaN.
+    nan_counts: ?std.ArrayListUnmanaged(i64) = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnIndex {
         const saved_id = reader.last_field_id;
@@ -1262,6 +1267,7 @@ pub const ColumnIndex = struct {
             ci.min_values.deinit(allocator);
             ci.max_values.deinit(allocator);
             if (ci.null_counts) |*nc| nc.deinit(allocator);
+            if (ci.nan_counts) |*nc| nc.deinit(allocator);
         }
 
         reader.readStructBegin();
@@ -1312,19 +1318,14 @@ pub const ColumnIndex = struct {
                 },
                 4 => ci.boundary_order = (std.enums.fromInt(BoundaryOrder, try reader.readZigZag(i32)) orelse .UNORDERED),
                 5 => {
-                    const header = try reader.readByte();
-                    var size = @as(usize, header >> 4);
-                    if (size == 0xF) size = try reader.readVarInt(usize);
-                    var nc: std.ArrayListUnmanaged(i64) = .empty;
-                    try nc.ensureTotalCapacityPrecise(
-                        allocator,
-                        safeListReserve(i64, size, reader.remaining()),
-                    );
-                    var i: usize = 0;
-                    while (i < size) : (i += 1) {
-                        try nc.append(allocator, try reader.readZigZag(i64));
-                    }
-                    ci.null_counts = nc;
+                    if (ci.null_counts) |*old| old.deinit(allocator);
+                    ci.null_counts = null;
+                    ci.null_counts = try readI64List(allocator, reader);
+                },
+                8 => {
+                    if (ci.nan_counts) |*old| old.deinit(allocator);
+                    ci.nan_counts = null;
+                    ci.nan_counts = try readI64List(allocator, reader);
                 },
                 else => try reader.skip(field.type),
             }
@@ -1347,9 +1348,25 @@ pub const ColumnIndex = struct {
             try writer.writeFieldListBegin(5, .I64, nc.items.len);
             for (nc.items) |v| try writer.writeZigZag(v);
         }
+        if (self.nan_counts) |nc| {
+            try writer.writeFieldListBegin(8, .I64, nc.items.len);
+            for (nc.items) |v| try writer.writeZigZag(v);
+        }
         try writer.writeStructEnd();
     }
 };
+
+/// A `list<i64>` field's elements, the list header included.
+fn readI64List(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayListUnmanaged(i64) {
+    const header = try reader.readByte();
+    var size = @as(usize, header >> 4);
+    if (size == 0xF) size = try reader.readVarInt(usize);
+    var list: std.ArrayListUnmanaged(i64) = .empty;
+    errdefer list.deinit(allocator);
+    try list.ensureTotalCapacityPrecise(allocator, safeListReserve(i64, size, reader.remaining()));
+    for (0..size) |_| try list.append(allocator, try reader.readZigZag(i64));
+    return list;
+}
 
 pub const RowGroup = struct {
     columns: std.ArrayListUnmanaged(ColumnChunk),
@@ -1419,6 +1436,9 @@ pub const RowGroup = struct {
 
 /// `ColumnOrder` union member id for TYPE_DEFINED_ORDER, the only order the full-match proof reads stats in.
 pub const COLUMN_ORDER_TYPE_DEFINED: i16 = 1;
+/// `ColumnOrder` member id for IEEE_754_TOTAL_ORDER (FLOAT/DOUBLE/FLOAT16): bounds are the least and greatest non-NaN
+/// values, NaN only for a chunk or page of nothing but NaN, and nan_count is mandatory.
+pub const COLUMN_ORDER_IEEE_754_TOTAL: i16 = 2;
 
 pub const FileMetaData = struct {
     version: i32,
@@ -1915,6 +1935,7 @@ test "ColumnIndex roundtrip" {
         ci.min_values.deinit(allocator);
         ci.max_values.deinit(allocator);
         if (ci.null_counts) |*nc| nc.deinit(allocator);
+        if (ci.nan_counts) |*nc| nc.deinit(allocator);
     }
     try ci.null_pages.appendSlice(allocator, &[_]bool{ false, true });
     try ci.min_values.appendSlice(allocator, &[_][]const u8{ "\x01\x00\x00\x00", "" });
@@ -1922,6 +1943,9 @@ test "ColumnIndex roundtrip" {
     var nc: std.ArrayListUnmanaged(i64) = .empty;
     try nc.appendSlice(allocator, &[_]i64{ 0, 1000 });
     ci.null_counts = nc;
+    var nans: std.ArrayListUnmanaged(i64) = .empty;
+    try nans.appendSlice(allocator, &[_]i64{ 3, 0 });
+    ci.nan_counts = nans;
 
     var writer = thrift.Writer.init(allocator);
     defer writer.deinit();
@@ -1934,6 +1958,7 @@ test "ColumnIndex roundtrip" {
         decoded.min_values.deinit(allocator);
         decoded.max_values.deinit(allocator);
         if (decoded.null_counts) |*d| d.deinit(allocator);
+        if (decoded.nan_counts) |*d| d.deinit(allocator);
     }
 
     try std.testing.expectEqual(@as(usize, 2), decoded.null_pages.items.len);
@@ -1943,6 +1968,21 @@ test "ColumnIndex roundtrip" {
     try std.testing.expectEqualSlices(u8, "\x01\x00\x00\x00", decoded.min_values.items[0]);
     try std.testing.expect(decoded.null_counts != null);
     try std.testing.expectEqual(@as(i64, 1000), decoded.null_counts.?.items[1]);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 0 }, decoded.nan_counts.?.items);
+}
+
+test "Statistics write their nan_count, and read it back" {
+    const allocator = std.testing.allocator;
+    for ([_]?i64{ null, 0, 7 }) |nan_count| {
+        const st: Statistics = .{ .null_count = 1, .min_value = "\x00\x00\x00\x00", .max_value = "\x00\x00\x80\x3f", .nan_count = nan_count };
+        var writer = thrift.Writer.init(allocator);
+        defer writer.deinit();
+        try st.write(&writer);
+        var reader = thrift.Reader.init(writer.bytes());
+        const back = try Statistics.read(&reader);
+        try std.testing.expectEqual(nan_count, back.nan_count);
+        try std.testing.expectEqual(@as(?i64, 1), back.null_count);
+    }
 }
 
 test "ColumnChunk write emits page-index pointers" {

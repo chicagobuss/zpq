@@ -870,7 +870,14 @@ fn finishDictionaryColumn(
     // Statistics over the distinct values, not every row: the dictionary holds exactly the present values, first
     // occurrence first, so the scan meets them in the order a row scan first would and keeps the same bounds.
     var stats = computeStats(arena, dict, null, 0, in.schema_elem);
-    if (stats) |*st| st.null_count = num_values - @as(i64, @intCast(indices.len));
+    if (stats) |*st| {
+        st.null_count = num_values - @as(i64, @intCast(indices.len));
+        // Over the entries it counted NaN entries; the chunk's count is of rows.
+        if (st.nan_count) |entries| st.nan_count = if (entries == 0) 0 else switch (dict) {
+            inline .f32, .f64 => |d| nanRows(d.values, indices),
+            else => unreachable,
+        };
+    }
     const dict_compressed = try compression.compressPage(arena, dict_plain, in.codec, in.zstd);
     const dict_header = try pageHeaderBytes(arena, .{
         .type = .DICTIONARY_PAGE,
@@ -1523,6 +1530,13 @@ fn valueCount(c: filter_eval.Batch.Column) usize {
 // Statistics — min/max over surviving non-null values
 // ============================================================
 
+/// Rows whose dictionary entry is NaN.
+fn nanRows(entries: anytype, indices: []const u32) i64 {
+    var n: i64 = 0;
+    for (indices) |k| n += @intFromBool(std.math.isNan(entries[k]));
+    return n;
+}
+
 fn computeStats(
     arena: std.mem.Allocator,
     c: filter_eval.Batch.Column,
@@ -1627,25 +1641,30 @@ fn statsTyped(arena: std.mem.Allocator, comptime T: type, values: []const T, def
 }
 
 /// Float bounds follow the format's TYPE_DEFINED_ORDER writing rules: NaN never enters min or max (a chunk whose
-/// present values are all NaN gets null_count only), a zero min is written as -0.0 and a zero max as +0.0, so a reader
-/// that trusts the bounds still keeps a chunk holding the other zero.
+/// present values are all NaN gets null_count and nan_count only), nan_count is always written, a zero min is written
+/// as -0.0 and a zero max as +0.0, so a reader that trusts the bounds still keeps a chunk holding the other zero. A
+/// reader that knows a chunk holds no NaN may prune `>`/`>=` on its max, where NaN would pass.
 fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T, def_levels: ?[]const u32, max_def: u32) ?schema.Statistics {
     if (values.len == 0) return null;
     var lo: T = std.math.inf(T);
     var hi: T = -std.math.inf(T);
     var any = false;
     var null_count: i64 = 0;
+    var nan_count: i64 = 0;
     for (values, 0..) |v, i| {
         if (!isPresent(def_levels, max_def, i)) {
             null_count += 1;
             continue;
         }
-        if (std.math.isNan(v)) continue;
+        if (std.math.isNan(v)) {
+            nan_count += 1;
+            continue;
+        }
         any = true;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
     }
-    if (!any) return .{ .null_count = null_count };
+    if (!any) return .{ .null_count = null_count, .nan_count = nan_count };
     if (lo == 0) lo = -0.0;
     if (hi == 0) hi = 0.0;
     const Bits = @Int(.unsigned, @bitSizeOf(T));
@@ -1662,6 +1681,7 @@ fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T
         .min_value = min_buf,
         .max_value = max_buf,
         .null_count = null_count,
+        .nan_count = nan_count,
     };
 }
 
@@ -2637,10 +2657,12 @@ test "a FIXED_LEN_BYTE_ARRAY column is written in FLBA's PLAIN form (no lengths)
     }));
 }
 
-fn expectFloatBounds(comptime T: type, stats: ?schema.Statistics, lo: ?T, hi: ?T, nulls: i64) !void {
+fn expectFloatBounds(comptime T: type, stats: ?schema.Statistics, lo: ?T, hi: ?T, nulls: i64, nans: i64) !void {
     const Bits = @Int(.unsigned, @bitSizeOf(T));
     const st = stats.?;
     try testing.expectEqual(nulls, st.null_count.?);
+    // Always written, zero included: a missing count means NaN may be present.
+    try testing.expectEqual(@as(?i64, nans), st.nan_count);
     if (lo == null) {
         try testing.expect(st.min == null and st.max == null and st.min_value == null and st.max_value == null);
         return;
@@ -2651,33 +2673,33 @@ fn expectFloatBounds(comptime T: type, stats: ?schema.Statistics, lo: ?T, hi: ?T
     try expectMirroredStats(st);
 }
 
-test "float statistics leave NaN out of the bounds, and write a zero min as -0.0 and a zero max as +0.0" {
+test "float statistics leave NaN out of the bounds, count it, and write a zero min as -0.0 and a zero max as +0.0" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     inline for (.{ f32, f64 }) |T| {
         const nan = std.math.nan(T);
         const inf = std.math.inf(T);
-        const Case = struct { vals: []const T, defs: ?[]const u32 = null, lo: ?T, hi: ?T, nulls: i64 = 0 };
+        const Case = struct { vals: []const T, defs: ?[]const u32 = null, lo: ?T, hi: ?T, nulls: i64 = 0, nans: i64 = 0 };
         const cases = [_]Case{
             // A NaN first value no longer becomes both bounds.
-            .{ .vals = &.{ nan, 1, -2, 3, nan, 0.5 }, .lo = -2, .hi = 3 },
-            .{ .vals = &.{ 1, nan, -2 }, .lo = -2, .hi = 1 },
-            // Every present value NaN: null_count only, as for an all-null chunk.
-            .{ .vals = &.{ nan, nan }, .lo = null, .hi = null },
-            .{ .vals = &.{ 7, nan, 7, nan }, .defs = &.{ 0, 1, 0, 1 }, .lo = null, .hi = null, .nulls = 2 },
-            .{ .vals = &.{ 7, nan, 5, 0 }, .defs = &.{ 0, 1, 1, 0 }, .lo = 5, .hi = 5, .nulls = 2 },
+            .{ .vals = &.{ nan, 1, -2, 3, nan, 0.5 }, .lo = -2, .hi = 3, .nans = 2 },
+            .{ .vals = &.{ 1, nan, -2 }, .lo = -2, .hi = 1, .nans = 1 },
+            // Every present value NaN: null_count and nan_count only, as for an all-null chunk.
+            .{ .vals = &.{ nan, nan }, .lo = null, .hi = null, .nans = 2 },
+            .{ .vals = &.{ 7, nan, 7, nan }, .defs = &.{ 0, 1, 0, 1 }, .lo = null, .hi = null, .nulls = 2, .nans = 2 },
+            .{ .vals = &.{ 7, nan, 5, 0 }, .defs = &.{ 0, 1, 1, 0 }, .lo = 5, .hi = 5, .nulls = 2, .nans = 1 },
             // Zero bounds, whichever zero the chunk holds.
             .{ .vals = &.{ 0.0, 1, 2 }, .lo = -0.0, .hi = 2 },
             .{ .vals = &.{ -0.0, -1, -2 }, .lo = -2, .hi = 0.0 },
             .{ .vals = &.{ 0.0, -0.0 }, .lo = -0.0, .hi = 0.0 },
-            .{ .vals = &.{ -0.0, nan, 0.0 }, .lo = -0.0, .hi = 0.0 },
+            .{ .vals = &.{ -0.0, nan, 0.0 }, .lo = -0.0, .hi = 0.0, .nans = 1 },
             // Infinities are ordinary bounds.
-            .{ .vals = &.{ inf, nan }, .lo = inf, .hi = inf },
-            .{ .vals = &.{ -inf, nan, inf }, .lo = -inf, .hi = inf },
+            .{ .vals = &.{ inf, nan }, .lo = inf, .hi = inf, .nans = 1 },
+            .{ .vals = &.{ -inf, nan, inf }, .lo = -inf, .hi = inf, .nans = 1 },
         };
         for (cases) |c| {
-            try expectFloatBounds(T, statsTypedFloat(a, T, c.vals, c.defs, 1), c.lo, c.hi, c.nulls);
+            try expectFloatBounds(T, statsTypedFloat(a, T, c.vals, c.defs, 1), c.lo, c.hi, c.nulls, c.nans);
         }
 
         // The dictionary path takes its bounds over its entries: the same rules, NaN among them.
@@ -2699,6 +2721,16 @@ test "float statistics leave NaN out of the bounds, and write a zero min as -0.0
             .path_in_schema = &.{"f"},
         });
         try testing.expect(enc.meta.dictionary_page_offset != null);
-        try expectFloatBounds(T, enc.meta.statistics, -0.0, 2.5, 0);
+        // NaN counted per row, not per entry: one NaN entry, 67 rows of it.
+        try expectFloatBounds(T, enc.meta.statistics, -0.0, 2.5, 0, 67);
+        // A dictionary without NaN counts none.
+        for (&vals, 0..) |*v, i| v.* = ([_]T{ 1.5, 0.0, 2.5 })[i % 3];
+        const clean = try encodeColumn(a, .{
+            .values = @unionInit(filter_eval.Batch.Column, if (T == f32) "f32" else "f64", .{ .values = &vals }),
+            .schema_elem = &elem,
+            .path_in_schema = &.{"f"},
+        });
+        try testing.expect(clean.meta.dictionary_page_offset != null);
+        try expectFloatBounds(T, clean.meta.statistics, -0.0, 2.5, 0, 0);
     }
 }

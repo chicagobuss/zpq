@@ -498,7 +498,14 @@ pub fn inspect(arena: std.mem.Allocator, env: std.process.Environ, path: []const
                 .min = lo,
                 .max = hi,
                 .column_order = if (meta.column_orders) |co| blk: {
-                    break :blk if (ci < co.items.len and co.items[ci] == 1) "type-defined" else "unsupported";
+                    if (ci >= co.items.len) break :blk "unsupported";
+                    const float = cm.type == .FLOAT or cm.type == .DOUBLE;
+                    break :blk switch (co.items[ci]) {
+                        schema.COLUMN_ORDER_TYPE_DEFINED => "type-defined",
+                        // Read like type-defined float bounds (see `statistics.boundsReadable`).
+                        schema.COLUMN_ORDER_IEEE_754_TOTAL => if (float) "ieee754-total" else "unsupported",
+                        else => "unsupported",
+                    };
                 } else "unknown",
                 .column_index = presence(chunk.column_index_offset, chunk.column_index_length, src.size, false),
                 .offset_index = presence(chunk.offset_index_offset, chunk.offset_index_length, src.size, false),

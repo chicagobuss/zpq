@@ -38,13 +38,20 @@ pub fn chunkBounds(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*cons
 /// an absent column_orders list is read as type-defined, as parquet-mr does. An annotation zpq does not recognise
 /// (read as UNKNOWN) or INTERVAL has no order at all. Without file metadata nothing can be checked, so nothing is
 /// refused: those callers already accept what the chunk's own min_value/max_value say.
+/// IEEE_754_TOTAL_ORDER on a FLOAT/DOUBLE column is read too: its bounds are the least and greatest non-NaN values,
+/// as type-defined float bounds are, except that a chunk or page of nothing but NaN has NaN bounds, which every
+/// reader of float bounds already refuses to prune on; -0 below +0 changes no comparison zpq makes, which takes them
+/// as equal.
 pub fn boundsReadable(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const schema.FileMetaData) bool {
     if (col_idx >= rg.columns.items.len) return false;
     const fm = file_meta orelse return true;
-    if (fm.column_orders) |co| {
-        if (col_idx >= co.items.len or co.items[col_idx] != schema.COLUMN_ORDER_TYPE_DEFINED) return false;
-    }
     const cm = rg.columns.items[col_idx].meta_data orelse return false;
+    if (fm.column_orders) |co| {
+        if (col_idx >= co.items.len) return false;
+        const float = cm.type == .FLOAT or cm.type == .DOUBLE;
+        const total = float and co.items[col_idx] == schema.COLUMN_ORDER_IEEE_754_TOTAL;
+        if (co.items[col_idx] != schema.COLUMN_ORDER_TYPE_DEFINED and !total) return false;
+    }
     const elem = fm.getColumnSchema(cm.path_in_schema.items) orelse return true;
     if (elem.logical_type) |lt| if (lt == .UNKNOWN) return false;
     if (elem.converted_type) |ct| if (ct == .INTERVAL) return false;

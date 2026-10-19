@@ -29,8 +29,9 @@ pub const Operator = enum {
 };
 
 /// Test a comparison `a op b` returning whether the predicate holds.
-/// `T` must support all the comparison operators.
+/// `T` must support all the comparison operators. Floats compare in total order (see `floatOp`).
 pub fn applyOp(comptime T: type, a: T, op: Operator, b: T) bool {
+    if (comptime @typeInfo(T) == .float) return floatOp(op, T, a, b);
     return switch (op) {
         .Eq => a == b,
         .NotEq => a != b,
@@ -38,6 +39,23 @@ pub fn applyOp(comptime T: type, a: T, op: Operator, b: T) bool {
         .LtEq => a <= b,
         .Gt => a > b,
         .GtEq => a >= b,
+    };
+}
+
+/// `a op b` for floats, or vectors of them, in the total order every other path already sorts, groups and takes
+/// min/max in: NaN equals NaN and lies above every number (-0 still equals +0). Each operator is then the exact
+/// complement of its `negate`, so NOT stays a flip of the operator. `a > b` alone kept no NaN row, and so neither did
+/// `NOT (a < b)`.
+pub inline fn floatOp(op: Operator, comptime T: type, a: T, b: T) @TypeOf(a == b) {
+    const a_nan = a != a;
+    const b_nan = b != b;
+    return switch (op) {
+        .Eq => (a == b) | (a_nan & b_nan),
+        .NotEq => (a != b) & !(a_nan & b_nan),
+        .Lt => (a < b) | (b_nan & !a_nan),
+        .LtEq => (a <= b) | b_nan,
+        .Gt => (a > b) | (a_nan & !b_nan),
+        .GtEq => (a >= b) | a_nan,
     };
 }
 
@@ -367,6 +385,29 @@ test "Operator.negate" {
     try testing.expectEqual(Operator.Lt, Operator.GtEq.negate());
     try testing.expectEqual(Operator.Gt, Operator.LtEq.negate());
     try testing.expectEqual(Operator.LtEq, Operator.Gt.negate());
+}
+
+test "float comparisons follow the total order (NaN = NaN, above every number), and negate is their complement" {
+    const ops = [_]Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq };
+    inline for (.{ f32, f64 }) |T| {
+        const nan = std.math.nan(T);
+        const inf = std.math.inf(T);
+        const vals = [_]T{ -inf, -1, -0.0, 0.0, 0.5, inf, nan, -nan };
+        // The order by rank: NaN of any sign above +inf, -0 equal to +0.
+        const rank = struct {
+            fn of(v: T) f64 {
+                return if (std.math.isNan(v)) std.math.floatMax(f64) else if (std.math.isInf(v)) std.math.copysign(std.math.floatMax(f64) / 2, v) else v;
+            }
+        }.of;
+        for (vals) |a| for (vals) |b| for (ops) |op| {
+            const want = applyOp(f64, rank(a), op, rank(b));
+            try testing.expectEqual(want, applyOp(T, a, op, b));
+            try testing.expectEqual(!want, applyOp(T, a, op.negate(), b));
+            const V = @Vector(4, T);
+            const got: [4]bool = floatOp(op, V, @splat(a), @splat(b));
+            try testing.expectEqual(want, got[3]);
+        };
+    }
 }
 
 test "applyOp on integers" {

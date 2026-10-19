@@ -10,8 +10,8 @@
 //!   - strings: compared directly when few, else the same table over their hashes, comparing bytes only on a match;
 //!   - literals chosen so the table can't seat them (colliding homes) without growing past `max_growth` per literal:
 //!     a sorted array searched without branches, for strings an array of their sorted hashes.
-//! Equality is the leaves' own: `==` on numbers (so -0 matches +0 and NaN matches nothing), bytes on strings; a null
-//! row matches neither IN nor NOT IN.
+//! Equality is the leaves' own: `==` on numbers in their total order (so -0 matches +0 and NaN matches NaN), bytes on
+//! strings; a null row matches neither IN nor NOT IN.
 
 const std = @import("std");
 const keyEql = @import("../bytes.zig").keyEql;
@@ -117,9 +117,21 @@ pub fn NumSet(comptime T: type) type {
             /// The literals' bits, sorted, when `windowTable` can't seat them.
             sorted: []const Bits,
         },
+        /// A NaN literal: NaN rows match (the leaves compare in total order, see `ast.floatOp`). NaN bits are no slot's
+        /// or lane's, so the structure above never matches them itself.
+        nan: bool = false,
 
-        /// `values`: the literals, in any order, duplicates allowed. NaN never equals anything, so it is dropped.
+        /// `values`: the literals, in any order, duplicates allowed. NaN is kept as the `nan` flag.
         pub fn init(arena: std.mem.Allocator, values: []const T) !Self {
+            var self = try initNumbers(arena, values);
+            if (comptime !is_int) self.nan = for (values) |v| {
+                if (std.math.isNan(v)) break true;
+            } else false;
+            return self;
+        }
+
+        /// The structure over `values`' numbers, NaN left out.
+        fn initNumbers(arena: std.mem.Allocator, values: []const T) !Self {
             var distinct = try arena.alloc(T, values.len);
             var n: usize = 0;
             for (values) |v| {
@@ -139,7 +151,7 @@ pub fn NumSet(comptime T: type) type {
             }
             distinct = distinct[0..n];
 
-            // Only NaN: nothing matches, and NaN lanes compare false everywhere.
+            // Only NaN: no number matches, and NaN lanes compare false everywhere.
             if (distinct.len == 0) {
                 if (comptime is_int) unreachable;
                 return .{ .how = .{ .few = @splat(std.math.nan(T)) } };
@@ -177,6 +189,11 @@ pub fn NumSet(comptime T: type) type {
         }
 
         pub inline fn contains(self: *const Self, v: T) bool {
+            if (comptime !is_int) return self.containsNumber(v) or (self.nan and v != v);
+            return self.containsNumber(v);
+        }
+
+        inline fn containsNumber(self: *const Self, v: T) bool {
             switch (self.how) {
                 .few => |lanes| return @reduce(.Or, lanes == @as(V, @splat(v))),
                 .bitmap => |b| {
@@ -352,7 +369,7 @@ test "each numeric shape answers as == does" {
     }
 }
 
-test "floats: -0 matches +0, NaN matches nothing, in every shape" {
+test "floats: -0 matches +0, NaN matches NaN only when listed, in every shape" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -364,12 +381,16 @@ test "floats: -0 matches +0, NaN matches nothing, in every shape" {
         lits[1] = nan;
         const set = try NumSet(f64).init(a, lits);
         try testing.expect(set.contains(0.0) and set.contains(-0.0));
-        try testing.expect(!set.contains(nan));
+        // Any NaN payload, as the leaves' total order has it.
+        try testing.expect(set.contains(nan) and set.contains(-nan) and set.contains(@bitCast(@as(u64, 0x7ff0_0000_0000_0001))));
         try testing.expect(set.contains(lits[k - 1]) and !set.contains(lits[k - 1] + 0.25));
         try testing.expect(!set.contains(std.math.inf(f64)) and !set.contains(-std.math.inf(f64)));
+        lits[1] = 2.0;
+        const numbers = try NumSet(f64).init(a, lits);
+        try testing.expect(!numbers.contains(nan) and numbers.contains(2.0));
     }
     const only_nan = try NumSet(f32).init(a, &.{std.math.nan(f32)});
-    try testing.expect(!only_nan.contains(std.math.nan(f32)) and !only_nan.contains(0));
+    try testing.expect(only_nan.contains(std.math.nan(f32)) and !only_nan.contains(0));
 }
 
 test "strings: direct and hashed, duplicates and the empty string" {

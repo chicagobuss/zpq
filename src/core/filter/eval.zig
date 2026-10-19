@@ -151,6 +151,7 @@ fn filterWords(
 }
 
 inline fn compare(comptime op: ast.Operator, comptime V: type, a: V, b: V) @Vector(@typeInfo(V).vector.len, bool) {
+    if (comptime @typeInfo(@typeInfo(V).vector.child) == .float) return ast.floatOp(op, V, a, b);
     return switch (op) {
         .Eq => a == b,
         .NotEq => a != b,

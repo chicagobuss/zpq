@@ -200,21 +200,20 @@ fn pruneNumeric(
 
     const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
 
-    if (!encoded.rangeIntersects(T, op, b.min, b.max, value)) return .skip;
-    if (comptime @typeInfo(T) == .float) {
-        // `!=` on a constant chunk: the bounds exclude NaN rows, which pass it, so only a nan_count of zero skips.
-        if (op == .NotEq and meta.statistics.?.nan_count == 0) {
-            const lo = encoded.readFixedLE(T, b.min) orelse return .keep;
-            const hi = encoded.readFixedLE(T, b.max) orelse return .keep;
-            if (lo == hi and lo == value) return .skip;
-        }
-    }
+    if (!encoded.rangeIntersects(T, op, b.min, b.max, value, nanFree(meta))) return .skip;
     // The positive assertion reads only the bounds `comparisonProof` vouches for, never the deprecated pair.
     if (comparisonProof(rg, col_idx, file_meta)) |p| {
         if (statistics.signedIntOrder(p.elem) and encoded.rangeAlwaysMatches(T, op, p.min, p.max, value))
             return .always_match;
     }
     return .keep;
+}
+
+/// Whether a chunk is known to hold no NaN: a nan_count of zero. Float bounds leave NaN out, so without one a NaN row
+/// may pass a comparison no bound does (see `encoded.rangeIntersects`).
+fn nanFree(meta: schema.ColumnMetaData) bool {
+    const stats = meta.statistics orelse return false;
+    return stats.nan_count == 0;
 }
 
 /// Unsigned columns compare bounds as unsigned. `chunkBounds` never hands back the signed-ordered deprecated pair,
@@ -625,6 +624,38 @@ test "pruneRowGroup unknown when stats absent" {
     try testing.expectEqual(Decision.unknown, pruneRowGroup(&rg, filter, null));
 }
 
+test "regression: a float row group whose NaN rows its bounds leave out is kept for `>`, `>=` and their NOT forms" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.mem.toBytes(@as(f64, 0.0));
+    const hi = std.mem.toBytes(@as(f64, 1.0));
+    const unknown_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    const no_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 });
+    const some_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 3 });
+    const leaf = struct {
+        fn of(op: ast.Operator, v: f64) ast.Filter {
+            return .{ .double = .{ .col_idx = 0, .op = op, .value = v } };
+        }
+    }.of;
+    // `NOT (x < 5)` binds as `x >= 5`: NaN passes it, so only a chunk known to hold none skips.
+    for ([_]ast.Filter{ leaf(.Gt, 5), leaf(.GtEq, 5) }) |f| {
+        try testing.expect(unknown_nan.decide(f) != .skip);
+        try testing.expect(some_nan.decide(f) != .skip);
+        try testing.expectEqual(Decision.skip, no_nan.decide(f));
+    }
+    // NaN fails `<`, `<=` and `=` a number: the bounds alone still skip.
+    for ([_]ast.Filter{ leaf(.Lt, -1), leaf(.LtEq, -1), leaf(.Eq, 5) }) |f| {
+        try testing.expectEqual(Decision.skip, unknown_nan.decide(f));
+    }
+    // A NaN literal: only NaN rows pass `= NaN`; nothing passes `> NaN`.
+    const nan = std.math.nan(f64);
+    try testing.expect(unknown_nan.decide(leaf(.Eq, nan)) != .skip);
+    try testing.expectEqual(Decision.skip, no_nan.decide(leaf(.Eq, nan)));
+    try testing.expectEqual(Decision.skip, unknown_nan.decide(leaf(.Gt, nan)));
+    try testing.expect(no_nan.decide(leaf(.Lt, nan)) != .skip);
+}
+
 /// `test_fixtures.StatsColumn`, deciding filters against itself.
 const ProofFixture = struct {
     rg: schema.RowGroup,
@@ -887,7 +918,8 @@ fn prunePageNumeric(
     const min = ci.min_values.items[page_idx];
     const max = ci.max_values.items[page_idx];
 
-    if (!encoded.rangeIntersects(T, op, min, max, value)) return .skip;
+    // The chunk's nan_count covers each of its pages.
+    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(meta))) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {

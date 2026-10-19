@@ -2122,6 +2122,69 @@ test "regression: a NULL LIKE pattern or BETWEEN bound is UNKNOWN, never the tex
     try testing.expectError(error.UnsupportedType, parse(a, "id LIKE NULL", &meta, null));
 }
 
+test "regression: NOT over a float range keeps NaN rows: floats compare in total order, NaN above every number" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    // The fuzz repro's column, then the same values dictionary-coded.
+    const nan = std.math.nan(f64);
+    const vals = [_]f64{ nan, 0.5, 2.0, 0 };
+    const defs = [_]u32{ 1, 1, 1, 0 };
+    const dict = [_]f64{ 2.0, nan, 0.5 };
+    const codes = [_]u32{ 1, 2, 0, 0 };
+    const plain = [_]eval.Batch.Column{.{ .f64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    const coded = [_]eval.Batch.Column{.{ .f64 = .{
+        .values = &.{},
+        .codes = &codes,
+        .dict = &dict,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const lookup = [_]?usize{ null, null, 0 };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    const cases = [_]Case{
+        .{ .filter = "NOT (score < 1.0)", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score <= 1.0)", .want = .{ true, false, true, false } },
+        .{ .filter = "score NOT BETWEEN 0 AND 1", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score BETWEEN 0 AND 1)", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score < 1.0 AND score > 0)", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score < 1.0 OR score = 5)", .want = .{ true, false, true, false } },
+        .{ .filter = "score > 1.0", .want = .{ true, false, true, false } },
+        .{ .filter = "score >= 1.0", .want = .{ true, false, true, false } },
+        .{ .filter = "score < 1.0", .want = .{ false, true, false, false } },
+        .{ .filter = "NOT (score > 1.0)", .want = .{ false, true, false, false } },
+        .{ .filter = "NOT (score >= 1.0)", .want = .{ false, true, false, false } },
+        .{ .filter = "score != 0.5", .want = .{ true, false, true, false } },
+        // NaN and infinite literals bind through the --filter text: NaN equals NaN and lies above +inf.
+        .{ .filter = "score = nan", .want = .{ true, false, false, false } },
+        .{ .filter = "score != nan", .want = .{ false, true, true, false } },
+        .{ .filter = "score < nan", .want = .{ false, true, true, false } },
+        .{ .filter = "score >= nan", .want = .{ true, false, false, false } },
+        .{ .filter = "score > nan", .want = .{ false, false, false, false } },
+        .{ .filter = "score <= inf", .want = .{ false, true, true, false } },
+        .{ .filter = "score > -inf", .want = .{ true, true, true, false } },
+        .{ .filter = "score IN (nan, 2.0)", .want = .{ true, false, true, false } },
+        .{ .filter = "score NOT IN (nan, 2.0)", .want = .{ false, true, false, false } },
+        .{ .filter = "score NOT IN (0.5)", .want = .{ true, false, true, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        for ([_][]const eval.Batch.Column{ &plain, &coded }) |cols| {
+            var sel = try selection.SelectionVector.init(a, vals.len);
+            try eval.evaluate(f, &.{ .cols = cols, .num_rows = vals.len }, &sel, &lookup, a);
+            for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+                std.debug.print("{s} ({s}): row {d}\n", .{ case.filter, if (cols.ptr == &plain) "plain" else "coded", i });
+                return err;
+            };
+        }
+    }
+}
+
 test "fuzz-lite: nested predicates select exactly the rows three-valued logic passes" {
     const eval = @import("eval.zig");
     const selection = @import("selection.zig");

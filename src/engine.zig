@@ -6517,6 +6517,14 @@ const Gathered = struct {
     }
 };
 
+/// What a plain-row Top-N may hold: the query's budget, less the S3 fetch window beside it when an input is fetched
+/// (the window is its own account), and at most half of it, as an aggregate's decode leaves the other half.
+fn topnLimit(ctx: Context, args: QueryArgs, inputs: []const scan.Input) usize {
+    const window: usize = @min(@as(usize, @intCast(s3FetchWindow(ctx.env, args.max_memory))), args.max_memory / 2);
+    for (inputs) |in| if (in.gate != null) return args.max_memory -| window;
+    return args.max_memory;
+}
+
 /// The plain-row Top-N ranked in parallel and gathered (see `RankShared`). Null when its memory would pass the
 /// budget, refused before it is allocated and with everything given back; the caller then runs `TopRows`.
 fn rankAndGather(
@@ -6535,7 +6543,7 @@ fn rankAndGather(
 ) !?Gathered {
     const res = try arena.create(Reservation);
     // Heaps, gather and the workers' decode together: the query's budget.
-    res.* = .{ .ledger = .{ .limit = args.max_memory } };
+    res.* = .{ .ledger = .{ .limit = topnLimit(ctx, args, inputs) } };
     var g: Gathered = .{
         .out = try consumer.initOutputAggregator(arena, &metas[0], specs),
         .mem = .{ .gpa = ctx.gpa, .res = res },
@@ -7123,7 +7131,8 @@ fn runPrintSinkOver(
             null;
         defer if (gathered) |*g| g.deinit();
         var ranked = if (gathered) |g| g.out else ranked: {
-            var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory);
+            const top_limit = topnLimit(ctx, args, opened.inputs);
+            var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, top_limit);
             defer top.deinit();
             for (items) |item| {
                 const in = opened.inputs[item.file];

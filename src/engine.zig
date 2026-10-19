@@ -5575,7 +5575,8 @@ const TopRows = struct {
     keys: []const RowSortKey,
     key_specs: []consumer.OutputCol,
     h: usize,
-    /// Bytes the kept rows and their heap may take, half of `limit`; past it the query fails cleanly (no spilling).
+    /// Bytes the kept rows and their heap may take, half of `limit` (or of `decode_floor`: under a tiny budget the
+    /// heap's layout, which decides the store's capacity, decided the answer); past it the query fails cleanly.
     budget: usize,
     /// The query's budget, `--max-memory`: what the kept rows and a row group's decode hold together.
     limit: usize,
@@ -5589,7 +5590,7 @@ const TopRows = struct {
     heap: std.PriorityQueue(Entry, *const TopRows, later),
 
     const pending = std.math.maxInt(usize);
-    /// What the account holds at least: under a tiny budget a decode's few bytes of noise decided the answer.
+    /// What the account holds at least, a fixed slack: under a tiny budget a few bytes of noise decided the answer.
     const decode_floor: usize = 1 << 20;
 
     const Mem = struct {
@@ -5606,6 +5607,9 @@ const TopRows = struct {
         pos: RowPos,
         /// Its row in `store`, or `pending` until its row group's output columns are copied.
         row: usize,
+        /// Per cell, the bytes its string's block holds, which a newcomer reusing it may fill (its own key may be
+        /// shorter). Empty: each string's length.
+        caps: []usize = &.{},
     };
 
     fn init(
@@ -5636,7 +5640,7 @@ const TopRows = struct {
             .keys = keys,
             .key_specs = key_specs,
             .h = h,
-            .budget = limit / 2,
+            .budget = @max(limit, decode_floor) / 2,
             .limit = limit,
             .mem = mem,
             .store_arena = store_arena,
@@ -5728,16 +5732,27 @@ const TopRows = struct {
             // An evicted row's keys are the newcomer's: its cells, and its strings where the new ones fit, so input
             // that improves on every row (descending, for an ascending key) holds one copy per kept row, not per row.
             var cells: []SortCell = &.{};
+            var caps: []usize = &.{};
             if (self.heap.count() == self.h) {
                 const top = self.heap.peek().?;
                 if (!before(self.keys, scratch, pos, top.cells, top.pos)) continue;
-                cells = self.heap.pop().?.cells;
-                for (scratch, cells) |c, *d| d.* = try reuseCell(sa, d.*, c);
+                const out = self.heap.pop().?;
+                cells = out.cells;
+                const fresh_caps = out.caps.len != cells.len;
+                caps = if (fresh_caps) try sa.alloc(usize, cells.len) else out.caps;
+                for (scratch, cells, caps) |c, *d, *cap| {
+                    if (fresh_caps) cap.* = if (d.* == .str) d.str.len else 0;
+                    d.* = try reuseCell(sa, d.*, cap, c);
+                }
             } else {
                 cells = try sa.alloc(SortCell, self.keys.len);
-                for (scratch, cells) |c, *d| d.* = try ownCell(sa, c);
+                caps = try sa.alloc(usize, self.keys.len);
+                for (scratch, cells, caps) |c, *d, *cap| {
+                    d.* = try ownCell(sa, c);
+                    cap.* = if (c == .str) c.str.len else 0;
+                }
             }
-            try self.heap.push(self.mem.allocator(), .{ .cells = cells, .pos = pos, .row = pending });
+            try self.heap.push(self.mem.allocator(), .{ .cells = cells, .pos = pos, .row = pending, .caps = caps });
             admitted = true;
         }
         if (!admitted) return;
@@ -5778,15 +5793,18 @@ const TopRows = struct {
         return if (c == .str) .{ .str = try arena.dupe(u8, c.str) } else c;
     }
 
-    /// `c` owned in place of `old`, an evicted row's cell: into its string's bytes when it fits, else copied anew.
-    fn reuseCell(arena: std.mem.Allocator, old: SortCell, c: SortCell) !SortCell {
+    /// `c` owned in place of `old`, an evicted row's cell whose string's block holds `cap.*` bytes: into that block
+    /// when it fits (keys whose lengths alternate kept shrinking it), else copied anew, `cap` becoming its size.
+    fn reuseCell(arena: std.mem.Allocator, old: SortCell, cap: *usize, c: SortCell) !SortCell {
         if (c != .str) return c;
-        if (old == .str and old.str.len >= c.str.len) {
-            const into = @constCast(old.str)[0..c.str.len];
+        if (old == .str and cap.* >= c.str.len) {
+            const into = @constCast(old.str.ptr)[0..c.str.len];
             @memcpy(into, c.str);
             return .{ .str = into };
         }
-        return ownCell(arena, c);
+        const owned = try ownCell(arena, c);
+        cap.* = c.str.len;
+        return owned;
     }
 
     /// Rebuild `store` with only the rows the heap still keeps.
@@ -5800,14 +5818,20 @@ const TopRows = struct {
         const fa = fresh.allocator();
         var store = try consumer.initOutputAggregator(fa, self.meta, self.specs);
         const cells = try fa.alloc([]SortCell, self.heap.items.len);
-        for (self.heap.items, cells) |e, *dst| {
+        const caps = try fa.alloc([]usize, self.heap.items.len);
+        for (self.heap.items, cells, caps) |e, *dst, *cap| {
             try copyRow(&store, &self.store, e.row);
             dst.* = try fa.alloc(SortCell, e.cells.len);
-            for (e.cells, dst.*) |c, *d| d.* = try ownCell(fa, c);
+            cap.* = try fa.alloc(usize, e.cells.len);
+            for (e.cells, dst.*, cap.*) |c, *d, *k| {
+                d.* = try ownCell(fa, c);
+                k.* = if (c == .str) c.str.len else 0;
+            }
         }
         // Nothing can fail from here: swap the rows in.
-        for (self.heap.items, cells, 0..) |*e, c, i| {
+        for (self.heap.items, cells, caps, 0..) |*e, c, k, i| {
             e.cells = c;
+            e.caps = k;
             e.row = i;
         }
         self.store_arena.deinit();
@@ -10628,6 +10652,26 @@ test "the serial Top-N keeps one key copy per kept row when every row evicts the
     const src: consumer.RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
     const refused = tight.offer(&meta.row_groups.items[0], &meta, src, null, &.{true}, .{ .file = 0, .rg = 0 }, &timings, .{});
     if (refused) |_| {} else |e| try std.testing.expectEqual(error.ExceededMemoryBudget, e);
+}
+
+test "an evicted key's string block is reused up to its size, not its last key's length" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var cap: usize = 0;
+    var cell = try TopRows.reuseCell(a, .null, &cap, .{ .str = "a long first key" });
+    const block = cell.str.ptr;
+    try std.testing.expectEqual(@as(usize, 16), cap);
+    // Shorter, then long again: both into the first block, which keeps its size.
+    cell = try TopRows.reuseCell(a, cell, &cap, .{ .str = "short" });
+    try std.testing.expectEqual(block, cell.str.ptr);
+    cell = try TopRows.reuseCell(a, cell, &cap, .{ .str = "sixteen bytes ok" });
+    try std.testing.expectEqual(block, cell.str.ptr);
+    try std.testing.expectEqualStrings("sixteen bytes ok", cell.str);
+    // Longer than the block: copied anew, its size the new key's.
+    cell = try TopRows.reuseCell(a, cell, &cap, .{ .str = "a key longer than the block" });
+    try std.testing.expect(cell.str.ptr != block);
+    try std.testing.expectEqual(@as(usize, 27), cap);
 }
 
 test "in-process text sink flushes across buffer boundaries and allocation failures" {

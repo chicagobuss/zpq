@@ -3062,9 +3062,17 @@ const PrivateDecode = struct {
     workers: []core_memory.SharedBudget = &.{},
     samples: []core_memory.SharedBudget = &.{},
 
-    fn init(a: std.mem.Allocator, parent: *core_memory.SharedBudget, n: usize, limit: ?usize) !PrivateDecode {
+    fn init(
+        a: std.mem.Allocator,
+        parent: *core_memory.SharedBudget,
+        n: usize,
+        limit: ?usize,
+        dictionary_peak: u64,
+    ) !PrivateDecode {
         const share = @min(limit orelse parent.limit / 2, parent.limit / 4) / n;
-        if (share < huge_pages.huge_page_size) return .{};
+        // A floor consumed by a dictionary strands the sample on tiny slices even when it later cancels.
+        // Decline before reserving runs or reading rows; leave room for a slice beside the fixed dictionary.
+        if (share < @max(huge_pages.huge_page_size, dictionary_peak +| parent.block)) return .{};
         const held = parent.drawExact(share * n) orelse return .{};
         errdefer parent.release(held);
         const workers = try a.alloc(core_memory.SharedBudget, n);
@@ -3641,7 +3649,7 @@ fn prepareAggregate(
             if (group_by_keys) |keys| if (keys.len > 1) if (ndv_stat) |stat| {
                 const run_width = @max(stat.key_bytes, stat.run_key_bytes);
                 if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536) {
-                    private_decode = try PrivateDecode.init(arena, group_budget, n_workers, args.decode_limit);
+                    private_decode = try PrivateDecode.init(arena, group_budget, n_workers, args.decode_limit, stat.run_dictionary_peak);
                     if (private_decode.held > 0 and part_state.?.reservePrivate(stat.rows, run_width) and
                         try private_decode.fundSamples(arena, &part_state.?, run_width))
                     {
@@ -13479,7 +13487,7 @@ test "private decoder floors stay funded and cannot consume another worker's cre
     defer arena.deinit();
     var parent: core_memory.SharedBudget = .{ .limit = 128 << 20 };
     defer std.debug.assert(parent.used.load(.monotonic) == 0);
-    var decoders = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2);
+    var decoders = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2, 0);
     defer decoders.release();
     const rest = parent.drawExact(parent.available()).?;
     defer parent.release(rest);
@@ -13499,7 +13507,7 @@ fn privateDecodeAllocationFailure(a: std.mem.Allocator) !void {
     defer arena.deinit();
     var parent: core_memory.SharedBudget = .{ .limit = 128 << 20 };
     defer std.debug.assert(parent.used.load(.monotonic) == 0);
-    var decoders = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2);
+    var decoders = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2, 0);
     defer decoders.release();
     var charged: core_memory.Charged = .{ .child = a, .budget = &decoders.workers[0] };
     const memory = try charged.allocator().alloc(u8, 4096);
@@ -13511,7 +13519,7 @@ test "private decoder funding returns after allocation failures or declined admi
     var parent: core_memory.SharedBudget = .{ .limit = 128 << 20 };
     const held = parent.drawExact(parent.limit).?;
     defer parent.release(held);
-    var refused = try PrivateDecode.init(testing.allocator, &parent, 4, null);
+    var refused = try PrivateDecode.init(testing.allocator, &parent, 4, null, 0);
     defer refused.release();
     try testing.expectEqual(@as(usize, 0), refused.held);
     try testing.expectEqual(parent.limit, parent.used.load(.monotonic));
@@ -13532,7 +13540,7 @@ fn privateSampleAllocationFailure(a: std.mem.Allocator) !void {
     defer part.deinit();
     part.compact = true;
     for (part.parts) |*p| p.table.compact.configure(&calls);
-    var funding = try PrivateDecode.init(arena.allocator(), &parent, 2, parent.limit / 2);
+    var funding = try PrivateDecode.init(arena.allocator(), &parent, 2, parent.limit / 2, 0);
     defer funding.release();
     try testing.expect(part.reservePrivate(65536, 128));
     const before = parent.used.load(.monotonic);
@@ -13559,4 +13567,19 @@ fn privateSampleAllocationFailure(a: std.mem.Allocator) !void {
 
 test "private decoder loans cannot starve local samples: prepaid tables survive a full ledger and allocation failures" {
     try testing.checkAllAllocationFailures(testing.allocator, privateSampleAllocationFailure, .{});
+}
+
+test "private decoder floors decline a dictionary that leaves no sliced sample room before charging" {
+    var parent: core_memory.SharedBudget = .{ .limit = 2 << 30 };
+    const dictionary_peak = 2 * (80_000_000 + 900_000 * @sizeOf([]const u8));
+    var small = try PrivateDecode.init(testing.allocator, &parent, 4, parent.limit / 2, dictionary_peak);
+    defer small.release();
+    try testing.expectEqual(@as(usize, 0), small.held);
+    try testing.expectEqual(@as(usize, 0), parent.used.load(.monotonic));
+    parent.limit = 4 << 30;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ample = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2, dictionary_peak);
+    defer ample.release();
+    try testing.expectEqual(@as(usize, parent.limit / 4), ample.held);
 }

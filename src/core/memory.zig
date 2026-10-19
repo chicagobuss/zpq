@@ -70,6 +70,17 @@ pub const SharedBudget = struct {
         self.funded = 0;
     }
 
+    /// Return an empty child's floor to prepaid credit on the same parent, without exposing it to borrowers.
+    /// Publish credit before dropping the floor; the child's lock prevents a draw against both representations.
+    pub fn transferIdleFloor(self: *SharedBudget, credit: *std.atomic.Value(usize)) void {
+        if (self.parent == null) return;
+        self.lockFunding();
+        defer self.funding_lock.unlock();
+        std.debug.assert(self.used.load(.monotonic) == 0);
+        _ = credit.fetchAdd(self.funded, .monotonic);
+        self.funded = 0;
+    }
+
     /// Slices use protected room rather than competing for borrowed headroom needed by whole row groups.
     /// A cancelled private plan has no floor and falls through to the ordinary ledger.
     pub fn sliceAvailable(self: *const SharedBudget) usize {
@@ -99,6 +110,7 @@ pub const SharedBudget = struct {
     /// Near the ceiling, held slack can fail a table while total use is under the limit, so blocks are dropped once
     /// the pool is tight — exact admission where it is observable, atomic off the hot path elsewhere.
     pub fn tight(self: *const SharedBudget) bool {
+        if (self.parent) |parent| return parent.tight();
         return self.used.load(.monotonic) >= self.limit - self.limit / 4;
     }
 
@@ -347,4 +359,16 @@ test "cancelling a decoder floor while its worker holds memory refunds only unus
     const charged = parent.used.load(.monotonic);
     ctx.cancelled.store(true, .release);
     try std.testing.expectEqual(@as(usize, 4096), charged);
+}
+
+test "a child drops table slack when its parent is tight" {
+    var parent: SharedBudget = .{ .limit = 1000 };
+    _ = parent.drawExact(200).?;
+    var child: SharedBudget = .{ .limit = parent.limit, .parent = &parent, .funded = 200 };
+    const rest = parent.drawExact(600).?;
+    try std.testing.expect(child.tight());
+    parent.release(rest);
+    try std.testing.expect(!child.tight());
+    child.releaseFloor();
+    try std.testing.expectEqual(@as(usize, 0), parent.used.load(.monotonic));
 }

@@ -41,7 +41,12 @@ and can make parallel worker progress decide whether the scan must restart.
 
 Before reserving runs, the plan also funds decoder floors from at most a quarter
 of the query ledger (and no more than its decode limit), split evenly between
-workers. Whole row groups may borrow additional room from the same query ledger;
+workers. A string dictionary's header also sizes its fixed sliced-decode footprint:
+the decoded dictionary and its retained copy overlap. If the floor cannot hold
+that footprint plus one ledger allocation block, the plan declines before any
+reservation or row consumption. Otherwise small slices can delay a reducing
+sample's cancellation enough to waste substantial work on a refused attempt.
+Whole row groups may borrow additional room from the same query ledger;
 the parent holds the larger of each floor and its live allocations. A refused
 whole-row-group admission selects sliced decode, whose buffers use protected
 room, so one worker cannot consume another decoder's floor. Local group tables
@@ -54,9 +59,11 @@ side allocations are freed before remaining funding returns, before the run fold
 Local sample tables also receive bounded floors, transferred from the prepaid
 run credit rather than charged again. Otherwise whole decoders can consume the
 ledger before any table reaches the first flush, while the entire run ceiling
-is still unused. Each table returns its floor when it is abandoned or finally
-flushed; a cancelled sample returns all unused floors while keeping live bytes
-charged. If the run ceiling cannot fund those samples, private runs decline
+is still unused. An admitted table transfers its idle floor back to prepaid run credit when it
+is abandoned or finally flushed, without refunding the parent: borrowing decoders
+cannot take those run bytes between a refund and a top-up. A cancelled sample
+returns unused floors to the parent while keeping live bytes charged. Child
+ledgers use the parent's tight state when deciding to return table slack. If the run ceiling cannot fund those samples, private runs decline
 before consuming rows. Allocation-failure checks exercise sample tables with a
 full parent ledger and verify that transferring credit adds no charge.
 

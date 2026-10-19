@@ -27,6 +27,8 @@ pub const Stat = struct {
     /// Dictionary strings correct the existing width hint for run admission. Other components keep their hint:
     /// prepaying more for them can crowd out decode. Growth must still draw actual room for skew or later keys.
     run_key_bytes: u64 = 0,
+    /// Largest row group's string dictionary footprint while a sliced reader retains its decoded copy.
+    run_dictionary_peak: u64 = 0,
     string_keys: bool = false,
     union_attempted: bool = false,
     union_complete: bool = false,
@@ -235,6 +237,15 @@ fn nullBound(cm: schema.ColumnMetaData) u64 {
     return if (cm.statistics) |s| if (s.null_count == 0) 0 else 1 else 1;
 }
 
+fn dictionaryDecodePeak(cm: schema.ColumnMetaData, h: schema.PageHeader) u64 {
+    if (cm.type != .BYTE_ARRAY) return 0;
+    const d = h.dictionary_page_header orelse return 0;
+    const entries: u64 = @intCast(@max(0, d.num_values));
+    const bytes: u64 = @intCast(@max(0, h.uncompressed_page_size));
+    // SliceReader.holdDictionary copies the strings and slice array before its page arena can reset.
+    return (bytes +| entries *| @sizeOf([]const u8)) *| 2;
+}
+
 fn dictionaryRunExtra(cm: schema.ColumnMetaData, rows: u64, h: schema.PageHeader) u64 {
     if (cm.type != .BYTE_ARRAY) return 0;
     const n: u64 = @intCast(h.dictionary_page_header.?.num_values);
@@ -324,6 +335,7 @@ pub fn collectRetaining(
         const rg = &m.row_groups.items[ref.rg];
         const rows: u64 = @intCast(@max(0, rg.num_rows));
         var product: u64 = 1;
+        var dictionary_peak: u64 = 0;
         var covered = true;
         var stats_present = true;
         for (keys, 0..) |key, ki| {
@@ -356,6 +368,7 @@ pub fn collectRetaining(
                 const limit = file.headerLimit();
                 if (covers and reads.headers) if (dictSlice(file, ref.rg, cm)) |b| if (header(b, limit)) |h| {
                     run_key_extra +|= dictionaryRunExtra(cm, rows, h);
+                    dictionary_peak +|= dictionaryDecodePeak(cm, h);
                     known = true;
                     widest = @max(widest, @as(u64, @intCast(h.dictionary_page_header.?.num_values)));
                     break :blk @min(rows, @as(u64, @intCast(h.dictionary_page_header.?.num_values)) + nullBound(cm));
@@ -368,6 +381,7 @@ pub fn collectRetaining(
             nulls[ki] = @max(nulls[ki], nullBound(cm));
             product = @min(rows, product *| n);
         }
+        stat.run_dictionary_peak = @max(stat.run_dictionary_peak, dictionary_peak);
         sum_products +|= @min(rows, product);
         if (covered) stat.covered_rows +|= rows;
         if (stats_present) stat.encoding_stats_rows +|= rows;
@@ -979,6 +993,7 @@ test "ndv: run width corrects only dictionary strings and preserves other column
         .dictionary_page_header = .{ .num_values = 700_000, .encoding = .PLAIN, .is_sorted = null },
     };
     try std.testing.expectEqual(@as(u64, 25 * 4_000_000), dictionaryRunExtra(cm, 4_000_000, h));
+    try std.testing.expectEqual(@as(u64, 2 * (63_000_000 + 700_000 * 16)), dictionaryDecodePeak(cm, h));
     h.uncompressed_page_size += 1;
     try std.testing.expectEqual(@as(u64, 26 * 4_000_000), dictionaryRunExtra(cm, 4_000_000, h));
     cm.type = .INT32;

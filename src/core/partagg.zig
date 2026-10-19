@@ -555,7 +555,12 @@ pub const PartAgg = struct {
         const shared = table.shared;
         const stride = table.fixed_stride;
         table.deinit();
-        if (!retain) if (shared) |b| b.releaseFloor();
+        if (!retain) if (shared) |b| {
+            if (self.private_admitted and b.parent == self.budget)
+                b.transferIdleFloor(&self.run_credit)
+            else
+                b.releaseFloor();
+        };
         table.* = expr_agg.GroupTable.init(gpa, 0);
         table.shared = shared;
         table.fixed_stride = stride;
@@ -1097,4 +1102,39 @@ test "partagg: a reducing sample returns its prepaid ceiling without replacing s
     try std.testing.expectEqual(@as(usize, 0), part.private_metadata);
     for (&decoders) |*d| try std.testing.expectEqual(@as(usize, 0), d.funded);
     try std.testing.expectEqual(@as(usize, 4096), decoders[0].used.load(.monotonic));
+}
+
+test "partagg: an admitted sample returns idle floors to run credit even with a full parent" {
+    const a = std.testing.allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try PartAgg.init(a, &budget, &calls, 0, countMerge, 4, 4, 2, true);
+    defer part.deinit();
+    part.compact = true;
+    for (part.parts) |*p| p.table.compact.configure(&calls);
+    try std.testing.expect(try part.admitPrivate(65536, 128));
+    const floor = 256 << 10;
+    _ = part.run_credit.fetchSub(floor, .monotonic);
+    const credit = part.run_credit.load(.monotonic);
+    var sample: expr_agg.SharedBudget = .{ .limit = budget.limit, .parent = &budget, .funded = floor };
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &sample;
+    table.compact.configure(&calls);
+    defer table.deinit();
+    _ = try table.getOrInsert("sample key", &calls, 0);
+    const rest = budget.drawExact(budget.available()).?;
+    defer budget.release(rest);
+    part.reset(&table, true);
+    try std.testing.expectEqual(floor, sample.funded);
+    try std.testing.expectEqual(credit, part.run_credit.load(.monotonic));
+    part.reset(&table, false);
+    try std.testing.expectEqual(@as(usize, 0), sample.funded);
+    try std.testing.expectEqual(budget.limit, budget.used.load(.monotonic));
+    try std.testing.expectEqual(credit + floor, part.run_credit.load(.monotonic));
+    part.reset(&table, false);
+    try std.testing.expectEqual(credit + floor, part.run_credit.load(.monotonic));
+    // No parent room exists: the returned credit alone must fund a run, with no top-up race.
+    try std.testing.expectEqual(floor, try part.takeCredit(floor));
+    budget.release(floor);
 }

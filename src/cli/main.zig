@@ -1283,7 +1283,11 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
                         col.min.value orelse col.min.state, col.min.exactness,
                         col.max.value orelse col.max.state, col.max.exactness,
                     });
-                    if (col.null_count) |n| try ws.print("{d}\n", .{n}) else try ws.writeAll("unknown\n");
+                    if (col.null_count) |n| try ws.print("{d}", .{n}) else try ws.writeAll("unknown");
+                    if (std.mem.eql(u8, col.physical_type, "FLOAT") or std.mem.eql(u8, col.physical_type, "DOUBLE")) {
+                        if (col.nan_count) |n| try ws.print(", NaNs={d}", .{n}) else try ws.writeAll(", NaNs=unknown");
+                    }
+                    try ws.writeByte('\n');
                     try ws.print("      index={s}/{s}, Bloom={s}, dictionary fallback={s}\n", .{
                         col.column_index.state, col.offset_index.state, col.bloom_filter.state, col.dictionary_fallback,
                     });

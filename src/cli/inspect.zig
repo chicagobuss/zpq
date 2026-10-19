@@ -161,6 +161,8 @@ const Column = struct {
     dictionary_fallback: []const u8,
     statistics: []const u8,
     null_count: ?i64,
+    /// FLOAT/DOUBLE only; null when the writer left it out (readers must then assume NaN may be present).
+    nan_count: ?i64,
     min: Bound,
     max: Bound,
     column_order: []const u8,
@@ -495,6 +497,7 @@ pub fn inspect(arena: std.mem.Allocator, env: std.process.Environ, path: []const
                 .dictionary_fallback = fallback(cm),
                 .statistics = if (st == null) "absent" else "present",
                 .null_count = if (st) |s| s.null_count else null,
+                .nan_count = if (st) |s| s.nan_count else null,
                 .min = lo,
                 .max = hi,
                 .column_order = if (meta.column_orders) |co| blk: {
@@ -565,6 +568,25 @@ test "inspect typed bounds and metadata presence are conservative" {
     const bad = try bound(a, se, &.{1}, null);
     defer a.free(bad.raw_hex.?);
     try std.testing.expectEqualStrings("malformed", bad.state);
+}
+
+test "inspect reports a float chunk's NaN count, null when the writer left it out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // parquet-java writes nan_count for every float chunk: row group 1 holds 4 NaN, row group 0 none.
+    const path = "data/parquet-testing/data/floating_orders_nan_count.parquet";
+    const rep = inspect(arena.allocator(), .empty, path, false) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const rg0 = rep.row_groups[0].columns[0];
+    try std.testing.expectEqualStrings("float_ieee754", rg0.path[0]);
+    try std.testing.expectEqual(@as(?i64, 0), rg0.nan_count);
+    try std.testing.expectEqual(@as(?i64, 4), rep.row_groups[1].columns[0].nan_count);
+    // A non-float column never has one.
+    const tiny = try inspect(arena.allocator(), .empty, "packaging/fixtures/tiny.parquet", false);
+    for (tiny.row_groups[0].columns) |c| if (!std.mem.eql(u8, c.physical_type, "FLOAT") and !std.mem.eql(u8, c.physical_type, "DOUBLE"))
+        try std.testing.expectEqual(@as(?i64, null), c.nan_count);
 }
 
 fn allocationProbe(a: std.mem.Allocator) !void {

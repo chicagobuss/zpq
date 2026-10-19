@@ -15,7 +15,8 @@ JSON is one object with `schema_version: 1` and a `files` array in input order. 
   the requested metadata ranges; requested bytes are not page-fault or physical-device-byte measurements.
 
 Each column retains its complete nested path, types, value count, codec, footer encoding list, compressed and
-uncompressed bytes/ratio, data/dictionary offsets, dictionary presence and fallback evidence, null count,
+uncompressed bytes/ratio, data/dictionary offsets, dictionary presence and fallback evidence, null count, NaN count
+(`nan_count`, null when the writer did not record it),
 column-order interpretation, min/max, index/Bloom offset-length presence, detail results and evidence-based hints.
 An error entry has `path`, `status: "error"`, and a named `cause`; it is not an empty successful footer.
 

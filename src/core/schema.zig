@@ -1333,6 +1333,12 @@ pub const ColumnIndex = struct {
                 else => try reader.skip(field.type),
             }
         }
+        // NaN counts that are not one per page come from a broken writer: none of them is read as a count, so no zero
+        // among them prunes a page and no copy writes them back.
+        if (ci.nan_counts) |*nc| if (nc.items.len != ci.null_pages.items.len) {
+            nc.deinit(allocator);
+            ci.nan_counts = null;
+        };
         return ci;
     }
 
@@ -1996,6 +2002,26 @@ test "ColumnIndex roundtrip" {
     try std.testing.expect(decoded.null_counts != null);
     try std.testing.expectEqual(@as(i64, 1000), decoded.null_counts.?.items[1]);
     try std.testing.expectEqualSlices(i64, &.{ 3, 0 }, decoded.nan_counts.?.items);
+
+    // A list longer or shorter than the pages is no list of counts.
+    for ([_][]const i64{ &.{ 0, 0, 0 }, &.{0} }) |bad| {
+        ci.nan_counts.?.clearRetainingCapacity();
+        try ci.nan_counts.?.appendSlice(allocator, bad);
+        var w2 = thrift.Writer.init(allocator);
+        defer w2.deinit();
+        try ci.write(&w2);
+        var r2 = thrift.Reader.init(w2.bytes());
+        var back = try ColumnIndex.read(allocator, &r2);
+        defer {
+            back.null_pages.deinit(allocator);
+            back.min_values.deinit(allocator);
+            back.max_values.deinit(allocator);
+            if (back.null_counts) |*d| d.deinit(allocator);
+            if (back.nan_counts) |*d| d.deinit(allocator);
+        }
+        try std.testing.expect(back.nan_counts == null);
+        try std.testing.expectEqual(@as(usize, 2), back.null_counts.?.items.len);
+    }
 }
 
 test "Statistics write their nan_count, and read it back" {

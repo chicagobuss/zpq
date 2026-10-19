@@ -5004,6 +5004,8 @@ fn pageIndexUsable(ci: schema.ColumnIndex, oi: schema.OffsetIndex, num_rows: usi
     if (ci.null_pages.items.len != locs.len) return false;
     if (ci.min_values.items.len != locs.len or ci.max_values.items.len != locs.len) return false;
     if (ci.null_counts) |nc| if (nc.items.len != locs.len) return false;
+    // NaN counts as for null counts; `ColumnIndex.read` already leaves a list of another length out.
+    if (ci.nan_counts) |nc| if (nc.items.len != locs.len) return false;
     var prev: i64 = 0;
     for (locs) |loc| {
         if (loc.offset < 0 or loc.compressed_page_size < 0) return false;

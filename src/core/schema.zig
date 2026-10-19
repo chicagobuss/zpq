@@ -1085,6 +1085,9 @@ pub const ColumnChunk = struct {
     /// dictionary proved absent. Written by `filter/membership.zig` before any row group is planned, read by
     /// `filter/prune.zig` at `=` leaves, so the S3 planner and the scan workers see the same answer.
     absent: []const []const u8 = &.{},
+    /// Runtime only, per query, never serialized: `filter/nanprobe.zig` read this FLOAT/DOUBLE chunk and found no NaN.
+    /// Read by `filter/prune.zig` as a NaN count of zero.
+    nan_free: bool = false,
     /// Runtime only, write side: the Bloom filter (header and bitset) an output chunk carries, copied from its source
     /// or built for it. `fastpath.placeFilters` writes it after the row groups and points fields 14/15 at it.
     bloom_out: []const u8 = &.{},

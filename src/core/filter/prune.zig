@@ -202,7 +202,7 @@ fn pruneNumeric(
 
     const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
 
-    if (!encoded.rangeIntersects(T, op, b.min, b.max, value, nanFree(meta, trust_nan))) return .skip;
+    if (!encoded.rangeIntersects(T, op, b.min, b.max, value, nanFree(&rg.columns.items[col_idx], trust_nan))) return .skip;
     // The positive assertion reads only the bounds `comparisonProof` vouches for, never the deprecated pair.
     if (comparisonProof(rg, col_idx, file_meta)) |p| {
         if (statistics.signedIntOrder(p.elem) and encoded.rangeAlwaysMatches(T, op, p.min, p.max, value))
@@ -211,11 +211,12 @@ fn pruneNumeric(
     return .keep;
 }
 
-/// Whether a chunk is known to hold no NaN: a nan_count of zero, or, under `--trust-stats` (`trust_nan`), none at all.
-/// Float bounds leave NaN out, so without one a NaN row may pass a comparison no bound does (see
-/// `encoded.rangeIntersects`).
-fn nanFree(meta: schema.ColumnMetaData, trust_nan: bool) bool {
-    const stats = meta.statistics orelse return false;
+/// Whether a chunk is known to hold no NaN: a nan_count of zero, a NaN probe of its values (`nanprobe.zig`), or,
+/// under `--trust-stats` (`trust_nan`), no count at all. Float bounds leave NaN out, so without one a NaN row may pass a
+/// comparison no bound does (see `encoded.rangeIntersects`).
+fn nanFree(chunk: *const schema.ColumnChunk, trust_nan: bool) bool {
+    if (chunk.nan_free) return true;
+    const stats = (chunk.meta_data orelse return false).statistics orelse return false;
     const missing: ?i64 = if (trust_nan) 0 else null;
     return (stats.nan_count orelse missing) == 0;
 }
@@ -1004,7 +1005,7 @@ fn prunePageNumeric(
 
     // The chunk's nan_count covers each of its pages; the index may count each page's own.
     const page_nan_free = if (ci.nan_counts) |nc| page_idx < nc.items.len and nc.items[page_idx] == 0 else false;
-    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(meta, trust_nan) or page_nan_free)) return .skip;
+    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(&rg.columns.items[col_idx], trust_nan) or page_nan_free)) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {

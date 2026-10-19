@@ -20,6 +20,7 @@ pub const core = struct {
         pub const parser = @import("core/filter/parser.zig");
         pub const prune = @import("core/filter/prune.zig");
         pub const membership = @import("core/filter/membership.zig");
+        pub const nanprobe = @import("core/filter/nanprobe.zig");
         pub const selection = @import("core/filter/selection.zig");
         pub const eval = @import("core/filter/eval.zig");
         pub const in_set = @import("core/filter/in_set.zig");
@@ -108,6 +109,7 @@ test {
     _ = @import("core/filter/parser.zig");
     _ = @import("core/filter/prune.zig");
     _ = @import("core/filter/membership.zig");
+    _ = @import("core/filter/nanprobe.zig");
     _ = @import("core/filter/selection.zig");
     _ = @import("core/filter/eval.zig");
     _ = @import("core/filter/in_set.zig");

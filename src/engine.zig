@@ -51,6 +51,7 @@ const filter_parser = @import("core/filter/parser.zig");
 const filter_prune = @import("core/filter/prune.zig");
 const statistics = @import("core/parquet/statistics.zig");
 const membership = @import("core/filter/membership.zig");
+const nanprobe = @import("core/filter/nanprobe.zig");
 const sbbf = @import("core/parquet/bloom.zig");
 const streaming = @import("core/writer/streaming.zig");
 const fastpath = @import("core/writer/fastpath.zig");
@@ -625,7 +626,7 @@ fn executeAggregateOver(
             (if (fs.len > 0) try bindFilter(arena, fs, &m[0], args) else null)
         else
             null;
-        if (!explain and !empty_result) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
+        if (!explain and !empty_result) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all, false));
         break :blk m;
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
@@ -2150,7 +2151,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     const any_computed = proj.any_computed;
     const num_leaves = kept_arr.len;
     var probed = opened.membership;
-    probed.add(try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all));
+    probed.add(try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all, true));
     const t_parse_end = nowMonoNs();
     t.parse_ns = @intCast(t_parse_end - t_parse_start);
     profile.record(prof, .parse_query, t_parse_start, t_parse_end, profile.args(.{}));
@@ -2793,6 +2794,8 @@ fn loadLocalMembership(
     metas: []const schema.FileMetaData,
     filter: ?filter_ast.Filter,
     scan_all: bool,
+    /// `nanprobe.Options.compressed`: false for the aggregate scan, which evaluates its filter column first.
+    probe_compressed: bool,
 ) !membership.Stats {
     const f = filter orelse return .{};
     if (scan_all) return .{};
@@ -2806,7 +2809,10 @@ fn loadLocalMembership(
     }
     if (local_metas.items.len == 0) return .{};
     const mapped: membership.MappedSource = .{ .files = local_bytes.items };
-    return membership.load(arena, opened.gpa, f, local_metas.items, mapped.source(), .{});
+    const stats = try membership.load(arena, opened.gpa, f, local_metas.items, mapped.source(), .{});
+    // Float chunks the bounds would skip but for an unknown NaN count: proven free of NaN from their values.
+    _ = try nanprobe.load(opened.gpa, f, local_metas.items, mapped.source(), .{ .compressed = probe_compressed });
+    return stats;
 }
 
 fn materializeMetas(
@@ -3005,6 +3011,8 @@ fn openInputs(
             var src: S3Membership = .init(read_ctx, creds, pool, specs, @min(fetch_window.limit, account.limit));
             src.profiler = args.profiler;
             membership_stats = try membership.load(arena, ctx.gpa, f, metas_for_plan, src.source(), .{});
+            // Reads only the float chunks it probes, never the row group's other columns.
+            _ = try nanprobe.load(ctx.gpa, f, metas_for_plan, src.source(), .{ .batch_bytes = @min(fetch_window.limit, account.limit) });
         };
 
         // What each row group needs fetched. (Yes, this re-parses arg strings that scan and runWrite will parse again
@@ -7390,7 +7398,7 @@ fn runPrintSinkOver(
     const filter_opt = proj.filter;
     const fetch_arr = proj.fetch;
     const output_specs = proj.output_specs;
-    if (limit != 0) _ = try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all);
+    if (limit != 0) _ = try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all, true);
     parse_span.end(.parse_query, profile.args(.{}));
     if (args.profiler) |p| p.setColumnsFromMeta(meta0);
 

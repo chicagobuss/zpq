@@ -40,6 +40,7 @@ const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
 const filter_prune = @import("filter/prune.zig");
 const membership = @import("filter/membership.zig");
+const nanprobe = @import("filter/nanprobe.zig");
 const Diag = @import("diag.zig").Diag;
 const core_bytes = @import("bytes.zig");
 const keyEql = core_bytes.keyEql;
@@ -3272,6 +3273,7 @@ fn prepareAggregate(
         for (args.inputs, files) |in, *b| b.* = in.bytes;
         const mapped: membership.MappedSource = .{ .files = files };
         membership_stats = try membership.load(arena, gpa, f, metas, mapped.source(), .{ .threads = args.parallelism });
+        _ = try nanprobe.load(gpa, f, metas, mapped.source(), .{ .threads = args.parallelism, .compressed = false });
     };
 
     // 4. Build the flat row-group work list. If we have fewer row groups

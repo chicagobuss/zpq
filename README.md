@@ -347,12 +347,20 @@ of what the file claims. Two things are still always fast and always safe, becau
 - **Row-group pruning** uses stats only to *skip* groups that provably can't match a filter — it never invents a value,
   so a bad stat can at worst cost a little extra decoding, never a wrong result.
 
+Floats compare in total order, as they sort: NaN equals NaN and lies above every number, so `x > 5` and `NOT (x < 5)`
+keep NaN rows. Float bounds leave NaN out, so a chunk whose max is below 5 can still hold rows passing `x > 5`. ZPQ
+prunes such a chunk only when the file proves it holds no NaN: a `nan_count` of zero in its statistics or page index
+(ZPQ writes one for every float chunk), or IEEE_754_TOTAL_ORDER bounds. A missing count means NaN may be present.
+
 If you know your writer's statistics are trustworthy, opt into the stats fast-path — `min / max / sum` answered from
 metadata in microseconds, without touching a data page:
 
 ```bash
 zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
 ```
+
+`--trust-stats` also reads a float chunk's missing `nan_count` as zero, so `>` and `>=` prune on its bounds as if it
+held no NaN; a NaN row in such a chunk is then lost.
 
 `--trust-stats` is a scalpel: it trades correctness-on-bad-files for speed, and it's your call per query. `--scan-all`
 is the opposite extreme — no statistics at all, so row-group pruning is off too and every filter is evaluated on decoded

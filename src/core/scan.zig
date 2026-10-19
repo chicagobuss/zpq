@@ -3221,7 +3221,11 @@ fn prepareAggregate(
 
     var filter_opt: ?filter_ast.Filter = null;
     if (args.filter) |expr_str| {
-        if (expr_str.len > 0) filter_opt = try filter_parser.parse(arena, expr_str, meta0, args.diag);
+        if (expr_str.len > 0) {
+            filter_opt = try filter_parser.parse(arena, expr_str, meta0, args.diag);
+            // `--trust-stats`: a float chunk without a NaN count prunes as if it had none.
+            if (args.trust_stats) filter_opt = try filter_ast.trustMissingNanCounts(arena, filter_opt.?);
+        }
     }
     const group_by_items = if (args.group_by) |gb_str|
         try expr_parser.parseGroupByOf(arena, gb_str, meta0, args.diag, args.select_cols orelse &.{})

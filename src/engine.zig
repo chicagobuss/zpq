@@ -622,7 +622,7 @@ fn executeAggregateOver(
     blk: {
         const m = steer_metas orelse try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
-            (if (fs.len > 0) try filter_parser.parse(arena, fs, &m[0], args.diag) else null)
+            (if (fs.len > 0) try bindFilter(arena, fs, &m[0], args) else null)
         else
             null;
         if (!explain and !empty_result) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all));
@@ -1935,7 +1935,7 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
         null;
     var filter: ?filter_ast.Filter = null;
     if (args.filter) |fs| if (fs.len > 0) {
-        filter = try filter_parser.parse(arena, fs, meta0, args.diag);
+        filter = try bindFilter(arena, fs, meta0, args);
     };
 
     const kept = try arena.alloc(bool, num_leaves);
@@ -2999,7 +2999,7 @@ fn openInputs(
         // Bloom filters first: what they prove lands on the footers' chunks, so the plan below and the scan workers
         // after it prune the same row groups.
         if (!fetch_window.footer_only and !args.scan_all) if (args.filter) |fs| if (fs.len > 0) {
-            const f = try filter_parser.parse(arena, fs, &metas_for_plan[0], args.diag);
+            const f = try bindFilter(arena, fs, &metas_for_plan[0], args);
             // Bloom holds its own copies of what it probes. Cap them at the bytes the query can keep, not at the
             // fetch window's 64 MiB floor when that floor is above `--max-memory`.
             var src: S3Membership = .init(read_ctx, creds, pool, specs, @min(fetch_window.limit, account.limit));
@@ -3683,11 +3683,18 @@ const RangePlan = union(enum) {
 };
 
 /// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
+/// The query's filter bound against `meta`. Under `--trust-stats` a FLOAT/DOUBLE chunk without a NaN count prunes as
+/// if it had none (`ast.trustMissingNanCounts`); every row-group and page decision reads that from the leaves.
+fn bindFilter(arena: std.mem.Allocator, text: []const u8, meta: *const schema.FileMetaData, args: QueryArgs) !filter_ast.Filter {
+    const f = try filter_parser.parse(arena, text, meta, args.diag);
+    return if (args.trust_stats) filter_ast.trustMissingNanCounts(arena, f) else f;
+}
+
 fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.FileMetaData) !RangePlan {
     const meta0 = &metas[0];
     if (args.aggregate != null or args.group_by != null) {
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
-            (if (fs.len > 0) try filter_parser.parse(arena, fs, meta0, args.diag) else null)
+            (if (fs.len > 0) try bindFilter(arena, fs, meta0, args) else null)
         else
             null;
         const group_keys: ?[]const expr_ast.Expr = if (args.group_by) |gb| blk: {

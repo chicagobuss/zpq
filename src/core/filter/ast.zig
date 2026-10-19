@@ -104,6 +104,10 @@ pub fn Leaf(comptime T: type) type {
         /// at the column's scale, INT96 to nanoseconds, FLOAT16 to f64) leave it unset, and so does any leaf built
         /// elsewhere.
         stored: bool = false,
+        /// `--trust-stats` on a FLOAT/DOUBLE leaf: a chunk or page whose statistics carry no NaN count is pruned as
+        /// if they said zero, so `>`/`>=` skip on the bounds as they did before NaN counted. Without it a missing count
+        /// means NaN may be present, and such a chunk is kept (see `encoded.rangeIntersects`).
+        trust_missing_nan_count: bool = false,
     };
 }
 
@@ -305,9 +309,11 @@ pub fn eql(a: Filter, b: Filter) bool {
         },
         .string => |l| l.col_idx == b.string.col_idx and l.op == b.string.op and std.mem.eql(u8, l.value, b.string.value),
         .float => |l| l.col_idx == b.float.col_idx and l.op == b.float.op and
-            @as(u32, @bitCast(l.value)) == @as(u32, @bitCast(b.float.value)),
+            @as(u32, @bitCast(l.value)) == @as(u32, @bitCast(b.float.value)) and
+            l.trust_missing_nan_count == b.float.trust_missing_nan_count,
         .double => |l| l.col_idx == b.double.col_idx and l.op == b.double.op and
-            @as(u64, @bitCast(l.value)) == @as(u64, @bitCast(b.double.value)),
+            @as(u64, @bitCast(l.value)) == @as(u64, @bitCast(b.double.value)) and
+            l.trust_missing_nan_count == b.double.trust_missing_nan_count,
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
             std.mem.eql(u8, m.operand, b.like.operand),
@@ -344,6 +350,26 @@ pub fn exactLeaf(comptime T: type, col_idx: usize, op: Operator, floor: i256, in
         .Gt, .GtEq, .NotEq => always,
     };
     return .{ .col_idx = col_idx, .op = o, .value = @intCast(floor) };
+}
+
+/// `f` with every FLOAT/DOUBLE leaf trusting a missing NaN count as zero (`--trust-stats`), composites rebuilt around
+/// them; the input is not changed.
+pub fn trustMissingNanCounts(arena: std.mem.Allocator, f: Filter) std.mem.Allocator.Error!Filter {
+    return switch (f) {
+        inline .float, .double => |l, tag| blk: {
+            var out = l;
+            out.trust_missing_nan_count = true;
+            break :blk @unionInit(Filter, @tagName(tag), out);
+        },
+        .and_filter, .or_filter => |c| blk: {
+            const children = try arena.alloc(Filter, c.children.len);
+            for (c.children, children) |child, *n| n.* = try trustMissingNanCounts(arena, child);
+            var out = c;
+            out.children = children;
+            break :blk if (f == .and_filter) .{ .and_filter = out } else .{ .or_filter = out };
+        },
+        else => f,
+    };
 }
 
 fn markAllColumns(f: Filter, cols: []bool) void {

@@ -571,11 +571,11 @@ fn constantLeaf(comptime T: type, leaf: ast.Leaf(T)) ?bool {
 fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {
         // Negating keeps the value, so a stored literal stays one (`NOT x != 5` is `x = 5`).
-        inline .int32, .int64, .uint64, .float, .double, .decimal, .string, .boolean => |l, tag| @unionInit(
-            ast.Filter,
-            @tagName(tag),
-            .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value, .stored = l.stored },
-        ),
+        inline .int32, .int64, .uint64, .float, .double, .decimal, .string, .boolean => |l, tag| blk: {
+            var out = l;
+            out.op = l.op.negate();
+            break :blk @unionInit(ast.Filter, @tagName(tag), out);
+        },
         // NOT (x IS NULL) == x IS NOT NULL, and vice-versa.
         .null_check => |nc| .{ .null_check = .{ .col_idx = nc.col_idx, .is_not = !nc.is_not } },
         // NOT (x LIKE p) == x NOT LIKE p — flip the negate flag.

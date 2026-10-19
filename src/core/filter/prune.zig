@@ -82,11 +82,11 @@ pub fn pruneRowGroup(
 /// A comparison leaf's decision from statistics alone.
 fn valueStats(rg: *const schema.RowGroup, leaf: ast.Filter, file_meta: ?*const schema.FileMetaData) Decision {
     return switch (leaf) {
-        .int32 => |l| pruneNumeric(i32, rg, l.col_idx, l.op, l.value, .INT32, file_meta),
-        .int64 => |l| pruneNumeric(i64, rg, l.col_idx, l.op, l.value, .INT64, file_meta),
+        .int32 => |l| pruneNumeric(i32, rg, l.col_idx, l.op, l.value, .INT32, file_meta, false),
+        .int64 => |l| pruneNumeric(i64, rg, l.col_idx, l.op, l.value, .INT64, file_meta, false),
         .uint64 => |l| pruneUnsigned(rg, l.col_idx, l.op, l.value, file_meta),
-        .float => |l| pruneNumeric(f32, rg, l.col_idx, l.op, l.value, .FLOAT, file_meta),
-        .double => |l| pruneNumeric(f64, rg, l.col_idx, l.op, l.value, .DOUBLE, file_meta),
+        .float => |l| pruneNumeric(f32, rg, l.col_idx, l.op, l.value, .FLOAT, file_meta, l.trust_missing_nan_count),
+        .double => |l| pruneNumeric(f64, rg, l.col_idx, l.op, l.value, .DOUBLE, file_meta, l.trust_missing_nan_count),
         .decimal => |l| pruneDecimal(rg, l.col_idx, l.op, l.value, file_meta),
         .string => |l| pruneBytes(rg, l.col_idx, l.op, l.value, .BYTE_ARRAY, file_meta),
         else => unreachable,
@@ -188,6 +188,8 @@ fn pruneNumeric(
     value: T,
     parquet_type: schema.Type,
     file_meta: ?*const schema.FileMetaData,
+    /// `Leaf.trust_missing_nan_count`.
+    trust_nan: bool,
 ) Decision {
     if (col_idx >= rg.columns.items.len) return .unknown;
     const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
@@ -200,7 +202,7 @@ fn pruneNumeric(
 
     const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
 
-    if (!encoded.rangeIntersects(T, op, b.min, b.max, value, nanFree(meta))) return .skip;
+    if (!encoded.rangeIntersects(T, op, b.min, b.max, value, nanFree(meta, trust_nan))) return .skip;
     // The positive assertion reads only the bounds `comparisonProof` vouches for, never the deprecated pair.
     if (comparisonProof(rg, col_idx, file_meta)) |p| {
         if (statistics.signedIntOrder(p.elem) and encoded.rangeAlwaysMatches(T, op, p.min, p.max, value))
@@ -209,11 +211,13 @@ fn pruneNumeric(
     return .keep;
 }
 
-/// Whether a chunk is known to hold no NaN: a nan_count of zero. Float bounds leave NaN out, so without one a NaN row
-/// may pass a comparison no bound does (see `encoded.rangeIntersects`).
-fn nanFree(meta: schema.ColumnMetaData) bool {
+/// Whether a chunk is known to hold no NaN: a nan_count of zero, or, under `--trust-stats` (`trust_nan`), none at all.
+/// Float bounds leave NaN out, so without one a NaN row may pass a comparison no bound does (see
+/// `encoded.rangeIntersects`).
+fn nanFree(meta: schema.ColumnMetaData, trust_nan: bool) bool {
     const stats = meta.statistics orelse return false;
-    return stats.nan_count == 0;
+    const missing: ?i64 = if (trust_nan) 0 else null;
+    return (stats.nan_count orelse missing) == 0;
 }
 
 /// Unsigned columns compare bounds as unsigned. `chunkBounds` never hands back the signed-ordered deprecated pair,
@@ -656,6 +660,40 @@ test "regression: a float row group whose NaN rows its bounds leave out is kept 
     try testing.expect(no_nan.decide(leaf(.Lt, nan)) != .skip);
 }
 
+test "--trust-stats reads a float chunk's missing NaN count as zero, never a count it has" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.mem.toBytes(@as(f64, 0.0));
+    const hi = std.mem.toBytes(@as(f64, 1.0));
+    const unknown_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    const some_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 3 });
+    // A tree as the binder hands it on: the flag reaches every float leaf, under NOT and inside composites.
+    const plain: ast.Filter = try ast.join(a, true, &.{
+        .{ .double = .{ .col_idx = 0, .op = .GtEq, .value = 5 } },
+        try ast.join(a, false, &.{ .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 7 } }, .{ .int32 = .{ .col_idx = 1, .op = .Eq, .value = 1 } } }),
+    });
+    const trusted = try ast.trustMissingNanCounts(a, plain);
+    try testing.expect(trusted.and_filter.children[0].double.trust_missing_nan_count);
+    try testing.expect(trusted.and_filter.children[1].or_filter.children[0].double.trust_missing_nan_count);
+    try testing.expect(!plain.and_filter.children[0].double.trust_missing_nan_count);
+    try testing.expect(!ast.eql(plain, trusted));
+
+    const gt5 = trusted.and_filter.children[0];
+    try testing.expect(unknown_nan.decide(plain.and_filter.children[0]) != .skip);
+    try testing.expectEqual(Decision.skip, unknown_nan.decide(gt5));
+    // A count the file does give is never overridden.
+    try testing.expect(some_nan.decide(gt5) != .skip);
+    // Pages too: no chunk count, no page count.
+    var ci: schema.ColumnIndex = .{};
+    try ci.null_pages.append(a, false);
+    try ci.min_values.append(a, &lo);
+    try ci.max_values.append(a, &hi);
+    const cis = [_]?schema.ColumnIndex{ci};
+    try testing.expect(prunePage(&unknown_nan.rg, 0, plain.and_filter.children[0], &cis, &unknown_nan.fm, true) != .skip);
+    try testing.expectEqual(Decision.skip, prunePage(&unknown_nan.rg, 0, gt5, &cis, &unknown_nan.fm, true));
+}
+
 test "float pruning reads bounds under IEEE_754_TOTAL_ORDER, and a page index's own NaN counts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -894,11 +932,11 @@ pub fn prunePage(
         inline else => |leaf| if (!statistics.boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,
     }
     return switch (filter) {
-        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, trust_stats),
-        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, trust_stats),
+        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, trust_stats, false),
+        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, trust_stats, false),
         .uint64 => |leaf| prunePageUnsigned(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
-        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, trust_stats),
-        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, trust_stats),
+        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, trust_stats, leaf.trust_missing_nan_count),
+        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, trust_stats, leaf.trust_missing_nan_count),
         .decimal => |leaf| prunePageDecimal(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes, file_meta, trust_stats),
         .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
         .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
@@ -947,6 +985,8 @@ fn prunePageNumeric(
     parquet_type: schema.Type,
     col_indexes: []const ?schema.ColumnIndex,
     trust_stats: bool,
+    /// `Leaf.trust_missing_nan_count`.
+    trust_nan: bool,
 ) Decision {
     if (col_idx >= col_indexes.len or col_idx >= rg.columns.items.len) return .unknown;
     const ci = col_indexes[col_idx] orelse return .unknown;
@@ -964,7 +1004,7 @@ fn prunePageNumeric(
 
     // The chunk's nan_count covers each of its pages; the index may count each page's own.
     const page_nan_free = if (ci.nan_counts) |nc| page_idx < nc.items.len and nc.items[page_idx] == 0 else false;
-    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(meta) or page_nan_free)) return .skip;
+    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(meta, trust_nan) or page_nan_free)) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {

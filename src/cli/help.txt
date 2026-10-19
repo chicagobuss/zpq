@@ -66,6 +66,9 @@ usage:
   --trust-stats  answer min/max/sum from file statistics instead of
                  decoding (fast, but trusts the writer's stats — off
                  by default; count(*) is always answered from metadata).
+                 Also prunes FLOAT/DOUBLE `>`/`>=` on chunks whose stats
+                 carry no NaN count, as if they said none: NaN sorts
+                 above every number, so by default such a chunk is read.
   --bloom-filter write a split-block Bloom filter for output column COL
                  (repeatable), at false-positive probability FPP
                  (default 0.01). Readers then skip row groups an `=`

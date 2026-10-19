@@ -180,6 +180,9 @@ jobs:
       - name: CLI smoke + cross-impl validation
         run: tools/cli_smoke.sh
 
+      - name: Private decoder funding regression
+        run: .venv/bin/python tools/private_decode_check.py zig-out/bin/zpq --out-dir zig-out/private-decode-check
+
       # Step 6: conformance with a regression floor. The corpus clone is
       # pinned to a known SHA so upstream additions can't fail us
       # surprise-style; bump the SHA + floor together, deliberately.

@@ -3053,7 +3053,7 @@ fn scanRGSliced(
     const per_row = @max(1, full / num_rows);
     // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
     // answer, only how many rows decode at once.
-    const room = if (ws.ledger) |l| l.available() / 2 else std.math.maxInt(usize);
+    const room = if (ws.ledger) |l| l.sliceAvailable() / 2 else std.math.maxInt(usize);
     const slice_rows = sliceRows(@min(budget.share(), room) / per_row, num_rows);
     const reserved = @min(budget.limit, slice_rows * per_row);
     try budget.acquire(reserved);
@@ -3081,7 +3081,7 @@ fn scanRGSliced(
         defer if (ws.ledger) |l| {
             const kept = if (on_region) ws.region.?.end else slice.queryCapacity();
             if (took == null) took = @max(1, kept / n);
-            rows_now = sliceRows(@min(reserved, l.available() / 2 + kept) / took.?, num_rows);
+            rows_now = sliceRows(@min(reserved, l.sliceAvailable() / 2 + kept) / took.?, num_rows);
         };
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
@@ -7158,17 +7158,21 @@ test "writeAggregateRows: on threads, an allocation failure frees everything" {
 fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !void {
     const strings = try a.alloc([]const u8, n);
     defer a.free(strings);
-    @memset(strings, "a long composite key whose bytes must outlive every temporary grouping window");
+    const text = try a.alloc([96]u8, n);
+    defer a.free(text);
+    for (strings, text, 0..) |*s, *buf, i| {
+        s.* = try std.fmt.bufPrint(buf, "a distinct long key whose bytes must outlive grouping window {d:0>8}", .{i});
+    }
     const ints = try a.alloc(i64, n);
     defer a.free(ints);
     for (ints, 0..) |*v, i| v.* = @intCast(i);
     const codes = try a.alloc(u32, n);
     defer a.free(codes);
-    @memset(codes, 0);
+    for (codes, 0..) |*code, i| code.* = @intCast(i);
     var cols = [_]filter_eval.Batch.Column{
         .{ .string = .{
             .values = if (coded) &.{} else strings,
-            .dict = if (coded) &.{strings[0]} else &.{},
+            .dict = if (coded) strings else &.{},
             .codes = if (coded) codes else null,
             .max_def = 0,
         } },
@@ -7222,6 +7226,8 @@ fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !voi
             const k = p.table.keyAt(g);
             const id = std.mem.readInt(i64, k[k.len - 8 ..][0..8], .little);
             try std.testing.expectEqual(@as(u64, @intCast(id)), p.table.first.items[g]);
+            const len = std.mem.readInt(u32, k[1..5], .little);
+            try std.testing.expectEqualStrings(strings[@intCast(id)], k[5..][0..len]);
         }
     }
     try std.testing.expectEqual(@as(usize, n), groups);

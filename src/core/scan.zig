@@ -3055,28 +3055,48 @@ const Chain = struct {
     lean_tried: bool = false,
 };
 
-/// A private plan's decoder room is funded before workers start. Equal quotas stop one worker's decode from
-/// refusing another while most run credit is still unused; every quota remains part of the query's charged peak.
+/// Fund a decoder floor before workers start. Whole row groups may borrow headroom; slices retain protected room
+/// when that admission refuses. Cancelling the private sample returns the floors beside still-charged live values.
 const PrivateDecode = struct {
-    parent: *core_memory.SharedBudget,
     held: usize = 0,
     workers: []core_memory.SharedBudget = &.{},
+    samples: []core_memory.SharedBudget = &.{},
 
     fn init(a: std.mem.Allocator, parent: *core_memory.SharedBudget, n: usize, limit: ?usize) !PrivateDecode {
         const share = @min(limit orelse parent.limit / 2, parent.limit / 4) / n;
-        if (share < huge_pages.huge_page_size) return .{ .parent = parent };
-        const held = parent.drawExact(share * n) orelse return .{ .parent = parent };
+        if (share < huge_pages.huge_page_size) return .{};
+        const held = parent.drawExact(share * n) orelse return .{};
         errdefer parent.release(held);
         const workers = try a.alloc(core_memory.SharedBudget, n);
-        for (workers) |*w| w.* = .{ .limit = share };
-        return .{ .parent = parent, .held = held, .workers = workers };
+        for (workers) |*w| w.* = .{ .limit = parent.limit, .parent = parent, .funded = share };
+        return .{ .held = held, .workers = workers };
+    }
+
+    fn fundSamples(self: *PrivateDecode, a: std.mem.Allocator, part: *partagg.PartAgg, width: u64) !bool {
+        // Decode loans must not strand every worker before its first flush. Transfer part of the prepaid run
+        // ceiling into bounded local-table floors; it is the same charged credit, not another reservation.
+        const share = (width +| 64) *| part.cap *| 4 +| part.budget.block;
+        const total = share *| self.workers.len;
+        const credit = part.run_credit.load(.monotonic);
+        if (total > credit) return false;
+        const samples = try a.alloc(core_memory.SharedBudget, self.workers.len);
+        part.run_credit.store(credit - @as(usize, @intCast(total)), .monotonic);
+        for (samples) |*b| b.* = .{ .limit = part.budget.limit, .parent = part.budget, .funded = @intCast(share) };
+        self.samples = samples;
+        part.sample_floors = samples;
+        return true;
     }
 
     fn release(self: *PrivateDecode) void {
-        for (self.workers) |*w| std.debug.assert(w.used.load(.monotonic) == 0);
-        self.parent.release(self.held);
+        for (self.workers) |*w| {
+            std.debug.assert(w.used.load(.monotonic) == 0);
+            w.releaseFloor();
+        }
+        // A failed worker can still hold a local table; cancellation keeps its live bytes charged until deinit.
+        for (self.samples) |*b| b.releaseFloor();
         self.held = 0;
         self.workers = &.{};
+        self.samples = &.{};
     }
 };
 
@@ -3487,10 +3507,10 @@ fn prepareAggregate(
             .work_items = work_items.items.len,
         };
     }
-    // Tables still share one pool. Only a prepaid private plan's decoders use fixed, funded worker quotas.
+    // Tables still share one pool. Only a prepaid private plan's decoders protect funded worker floors.
     var own_budget = expr_agg.SharedBudget{ .limit = args.max_memory };
     const group_budget = args.ledger orelse &own_budget;
-    var private_decode: PrivateDecode = .{ .parent = group_budget };
+    var private_decode: PrivateDecode = .{};
     // Declared before region cleanup: their actual allocations go before their funding returns to the query.
     defer private_decode.release();
     const workers = try arena.alloc(Worker, n_workers);
@@ -3622,11 +3642,17 @@ fn prepareAggregate(
                 const run_width = @max(stat.key_bytes, stat.run_key_bytes);
                 if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536) {
                     private_decode = try PrivateDecode.init(arena, group_budget, n_workers, args.decode_limit);
-                    if (private_decode.held > 0 and part_state.?.reservePrivate(stat.rows, run_width)) {
+                    if (private_decode.held > 0 and part_state.?.reservePrivate(stat.rows, run_width) and
+                        try private_decode.fundSamples(arena, &part_state.?, run_width))
+                    {
                         part_state.?.private_rows = stat.rows;
                         part_state.?.private_key_bytes = run_width;
-                        decode_budget = .{ .limit = private_decode.held, .workers = n_workers };
-                    } else private_decode.release();
+                        part_state.?.decoder_floors = private_decode.workers;
+                        for (group_tables, private_decode.samples) |*table, *sample| table.shared = sample;
+                    } else {
+                        if (part_state.?.private_reserved) part_state.?.cancelPrivate();
+                        private_decode.release();
+                    }
                 }
             };
         }
@@ -13447,7 +13473,7 @@ test "partagg: admitted long composite counts match shared partitions after a sp
     }
 }
 
-test "private decoder quotas stay funded and cannot consume another worker's credit" {
+test "private decoder floors stay funded and cannot consume another worker's credit" {
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -13458,11 +13484,11 @@ test "private decoder quotas stay funded and cannot consume another worker's cre
     const rest = parent.drawExact(parent.available()).?;
     defer parent.release(rest);
     const first = &decoders.workers[0];
-    const full = first.drawExact(first.limit).?;
+    const full = first.drawExact(first.funded).?;
     defer first.release(full);
     try testing.expect(first.drawExact(1) == null);
     const second = &decoders.workers[1];
-    const independent = second.drawExact(second.limit).?;
+    const independent = second.drawExact(second.funded).?;
     defer second.release(independent);
     try testing.expectEqual(parent.limit, parent.used.load(.monotonic));
     try testing.expectEqual(@as(usize, parent.limit / 4), decoders.held);
@@ -13489,4 +13515,48 @@ test "private decoder funding returns after allocation failures or declined admi
     defer refused.release();
     try testing.expectEqual(@as(usize, 0), refused.held);
     try testing.expectEqual(parent.limit, parent.used.load(.monotonic));
+}
+
+fn privateSampleAllocationFailure(a: std.mem.Allocator) !void {
+    var parent: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(parent.used.load(.monotonic) == 0);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const Merge = struct {
+        fn count(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, _: std.mem.Allocator) !void {
+            dst.count += src.count;
+        }
+    };
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var part = try partagg.PartAgg.init(a, &parent, &calls, 0, Merge.count, 4, 4, 2, true);
+    defer part.deinit();
+    part.compact = true;
+    for (part.parts) |*p| p.table.compact.configure(&calls);
+    var funding = try PrivateDecode.init(arena.allocator(), &parent, 2, parent.limit / 2);
+    defer funding.release();
+    try testing.expect(part.reservePrivate(65536, 128));
+    const before = parent.used.load(.monotonic);
+    const credit = part.run_credit.load(.monotonic);
+    try testing.expect(try funding.fundSamples(arena.allocator(), &part, 128));
+    part.decoder_floors = funding.workers;
+    try testing.expectEqual(before, parent.used.load(.monotonic));
+    try testing.expectEqual(credit, part.run_credit.load(.monotonic) +
+        funding.samples[0].funded + funding.samples[1].funded);
+    const rest = parent.drawExact(parent.available()).?;
+    defer parent.release(rest);
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &funding.samples[0];
+    table.compact.configure(&calls);
+    defer table.deinit();
+    for ([_][]const u8{ "alpha", "bravo", "charlie", "delta" }, 0..) |key, i| {
+        _ = try table.getOrInsert(key, &calls, i);
+    }
+    try testing.expect(funding.samples[0].used.load(.monotonic) > 0);
+    part.cancelPrivate();
+    for (funding.samples) |*b| try testing.expectEqual(@as(usize, 0), b.funded);
+    try testing.expect(funding.samples[0].used.load(.monotonic) > 0);
+}
+
+test "private decoder loans cannot starve local samples: prepaid tables survive a full ledger and allocation failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, privateSampleAllocationFailure, .{});
 }

@@ -140,6 +140,9 @@ pub const PartAgg = struct {
     private_reserved: bool = false,
     private_rows: u64 = 0,
     private_key_bytes: u64 = 0,
+    /// Offered decoder floors return as soon as a reducing sample keeps the shared path.
+    decoder_floors: []expr_agg.SharedBudget = &.{},
+    sample_floors: []expr_agg.SharedBudget = &.{},
     private_lock: std.atomic.Mutex = .unlocked,
     private_decided: bool = false,
     compact: bool = false,
@@ -217,11 +220,13 @@ pub const PartAgg = struct {
         return true;
     }
 
-    fn cancelPrivate(self: *PartAgg) void {
+    pub fn cancelPrivate(self: *PartAgg) void {
         std.debug.assert(!self.private_admitted);
         self.budget.release(self.run_credit.swap(0, .monotonic) + self.private_metadata);
         self.private_metadata = 0;
         self.private_reserved = false;
+        for (self.decoder_floors) |*b| b.releaseFloor();
+        for (self.sample_floors) |*b| b.releaseFloor();
     }
 
     /// The sample decides before moving any group; a reducing window returns the prepaid ceiling unchanged.
@@ -550,6 +555,7 @@ pub const PartAgg = struct {
         const shared = table.shared;
         const stride = table.fixed_stride;
         table.deinit();
+        if (!retain) if (shared) |b| b.releaseFloor();
         table.* = expr_agg.GroupTable.init(gpa, 0);
         table.shared = shared;
         table.fixed_stride = stride;
@@ -1069,6 +1075,15 @@ test "partagg: a reducing sample returns its prepaid ceiling without replacing s
     try std.testing.expect(part.reservePrivate(128, 64));
     part.private_rows = 128;
     part.private_key_bytes = 64;
+    _ = budget.drawExact(2 << 20).?;
+    var decoders = [_]expr_agg.SharedBudget{
+        .{ .limit = budget.limit, .parent = &budget, .funded = 1 << 20 },
+        .{ .limit = budget.limit, .parent = &budget, .funded = 1 << 20 },
+    };
+    defer for (&decoders) |*d| d.releaseFloor();
+    _ = decoders[0].drawExact(4096).?;
+    defer decoders[0].release(4096);
+    part.decoder_floors = &decoders;
     var table = expr_agg.GroupTable.init(a, 0);
     table.shared = &budget;
     defer table.deinit();
@@ -1080,4 +1095,6 @@ test "partagg: a reducing sample returns its prepaid ceiling without replacing s
     try std.testing.expect(!part.private_reserved and !part.private_admitted);
     try std.testing.expectEqual(@as(usize, 0), part.run_credit.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), part.private_metadata);
+    for (&decoders) |*d| try std.testing.expectEqual(@as(usize, 0), d.funded);
+    try std.testing.expectEqual(@as(usize, 4096), decoders[0].used.load(.monotonic));
 }

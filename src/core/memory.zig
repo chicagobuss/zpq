@@ -50,6 +50,37 @@ pub const SharedBudget = struct {
     block: usize = 64 * 1024,
     /// The most `used` has been: what the query held at once by the ledger's count (`--profile-summary`).
     peak: std.atomic.Value(usize) = .init(0),
+    /// A private scan's funded floor. Its parent holds max(funded, used); room past the floor is borrowed exactly.
+    /// The lock serializes cancellation against the owning worker's draws and frees. Ordinary ledgers use atomics.
+    parent: ?*SharedBudget = null,
+    funded: usize = 0,
+    funding_lock: std.atomic.Mutex = .unlocked,
+
+    fn lockFunding(self: *SharedBudget) void {
+        while (!self.funding_lock.tryLock()) std.Thread.yield() catch {};
+    }
+
+    /// Stop protecting the floor, preserving the parent's charge for every live allocation. Future draws use
+    /// whatever the parent has available, just as they did before the private plan was offered.
+    pub fn releaseFloor(self: *SharedBudget) void {
+        const parent = self.parent orelse return;
+        self.lockFunding();
+        defer self.funding_lock.unlock();
+        parent.release(self.funded -| self.used.load(.monotonic));
+        self.funded = 0;
+    }
+
+    /// Slices use protected room rather than competing for borrowed headroom needed by whole row groups.
+    /// A cancelled private plan has no floor and falls through to the ordinary ledger.
+    pub fn sliceAvailable(self: *const SharedBudget) usize {
+        if (self.parent != null) {
+            const mutable = @constCast(self);
+            mutable.lockFunding();
+            defer mutable.funding_lock.unlock();
+            if (self.funded > 0) return self.funded -| self.used.load(.monotonic);
+        }
+        return self.available();
+    }
 
     /// Blocks keep the shared counter off the per-group path: the counter is cheap, but many workers invalidating one
     /// cache line is not. The cap stops a barely-grouping worker from stranding quota an active table needs.
@@ -73,12 +104,28 @@ pub const SharedBudget = struct {
 
     /// What is not drawn now: a hint for sizing work to fit, not a promise (other holders draw concurrently).
     pub fn available(self: *const SharedBudget) usize {
+        if (self.parent) |parent| {
+            const mutable = @constCast(self);
+            mutable.lockFunding();
+            defer mutable.funding_lock.unlock();
+            return (self.funded -| self.used.load(.monotonic)) + parent.available();
+        }
         return self.limit -| self.used.load(.monotonic);
     }
 
     /// `draw` of exactly `need`, never a block: for holders too many to each strand a block's slack, such as the
     /// per-partition lists of every worker.
     pub fn drawExact(self: *SharedBudget, need: usize) ?usize {
+        if (self.parent) |parent| {
+            self.lockFunding();
+            defer self.funding_lock.unlock();
+            const cur = self.used.load(.monotonic);
+            if (need > self.limit -| cur) return null;
+            const extra = @max(cur + need, self.funded) - @max(cur, self.funded);
+            if (extra > 0) _ = parent.drawExact(extra) orelse return null;
+            self.used.store(cur + need, .monotonic);
+            return need;
+        }
         var cur = self.used.load(.monotonic);
         while (cur + need <= self.limit) {
             cur = self.used.cmpxchgWeak(cur, cur + need, .monotonic, .monotonic) orelse {
@@ -99,6 +146,10 @@ pub const SharedBudget = struct {
     }
 
     pub fn draw(self: *SharedBudget, need: usize) ?usize {
+        if (self.parent) |parent| {
+            const first = if (parent.tight()) need else @max(need, parent.blockSize());
+            return self.drawExact(first) orelse self.drawExact(need);
+        }
         const first: usize = if (self.tight()) need else @max(need, self.blockSize());
         for ([_]usize{ first, need }) |want| {
             var cur = self.used.load(.monotonic);
@@ -116,6 +167,15 @@ pub const SharedBudget = struct {
 
     pub fn release(self: *SharedBudget, bytes: usize) void {
         if (bytes == 0) return;
+        if (self.parent) |parent| {
+            self.lockFunding();
+            defer self.funding_lock.unlock();
+            const cur = self.used.load(.monotonic);
+            std.debug.assert(cur >= bytes);
+            parent.release(@max(cur, self.funded) - @max(cur - bytes, self.funded));
+            self.used.store(cur - bytes, .monotonic);
+            return;
+        }
         _ = self.used.fetchSub(bytes, .monotonic);
     }
 };
@@ -220,4 +280,71 @@ test "Charged gives back the draw when its child fails" {
     try std.testing.expect(!c.refused.load(.monotonic));
     try std.testing.expectEqual(error.OutOfMemory, c.refusal(error.OutOfMemory));
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "a decoder borrows above its floor and cancellation preserves every live charge" {
+    var parent: SharedBudget = .{ .limit = 1000 };
+    _ = parent.drawExact(200).?;
+    var worker: SharedBudget = .{ .limit = parent.limit, .parent = &parent, .funded = 200 };
+    _ = worker.drawExact(600).?;
+    try std.testing.expectEqual(@as(usize, 600), parent.used.load(.monotonic));
+    try std.testing.expect(worker.drawExact(401) == null);
+    try std.testing.expectEqual(@as(usize, 600), worker.used.load(.monotonic));
+    worker.release(550);
+    try std.testing.expectEqual(@as(usize, 200), parent.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 150), worker.sliceAvailable());
+    worker.releaseFloor();
+    try std.testing.expectEqual(@as(usize, 50), parent.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 950), worker.sliceAvailable());
+    _ = worker.draw(300).?;
+    try std.testing.expectEqual(@as(usize, 350), parent.used.load(.monotonic));
+    worker.release(350);
+    worker.releaseFloor();
+    try std.testing.expectEqual(@as(usize, 0), parent.used.load(.monotonic));
+}
+
+test "a borrowed decode refusal leaves the other worker's sliced room protected" {
+    var parent: SharedBudget = .{ .limit = 1000 };
+    _ = parent.drawExact(400).?;
+    var workers = [_]SharedBudget{
+        .{ .limit = parent.limit, .parent = &parent, .funded = 200 },
+        .{ .limit = parent.limit, .parent = &parent, .funded = 200 },
+    };
+    _ = workers[0].drawExact(800).?;
+    try std.testing.expect(workers[1].drawExact(201) == null);
+    _ = workers[1].drawExact(workers[1].sliceAvailable()).?;
+    try std.testing.expectEqual(parent.limit, parent.used.load(.monotonic));
+    for (&workers) |*w| {
+        w.release(w.used.load(.monotonic));
+        w.releaseFloor();
+    }
+    try std.testing.expectEqual(@as(usize, 0), parent.used.load(.monotonic));
+}
+
+test "cancelling a decoder floor while its worker holds memory refunds only unused room" {
+    const Context = struct {
+        budget: *SharedBudget,
+        live: std.atomic.Value(bool) = .init(false),
+        cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn run(ctx: *@This()) void {
+            _ = ctx.budget.drawExact(4096).?;
+            ctx.live.store(true, .release);
+            while (!ctx.cancelled.load(.acquire)) std.Thread.yield() catch {};
+            ctx.budget.release(4096);
+        }
+    };
+    var parent: SharedBudget = .{ .limit = 1 << 20 };
+    defer std.debug.assert(parent.used.load(.monotonic) == 0);
+    _ = parent.drawExact(1 << 18).?;
+    var worker: SharedBudget = .{ .limit = parent.limit, .parent = &parent, .funded = 1 << 18 };
+    defer worker.releaseFloor();
+    var ctx: Context = .{ .budget = &worker };
+    const thread = try std.Thread.spawn(.{}, Context.run, .{&ctx});
+    defer thread.join();
+    while (!ctx.live.load(.acquire)) std.Thread.yield() catch {};
+    worker.releaseFloor();
+    const charged = parent.used.load(.monotonic);
+    ctx.cancelled.store(true, .release);
+    try std.testing.expectEqual(@as(usize, 4096), charged);
 }

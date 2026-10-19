@@ -39,14 +39,26 @@ tables and runs own every key and aggregate state that escapes a window. Keeping
 window scratch until row-group teardown needlessly competes with prepaid credit
 and can make parallel worker progress decide whether the scan must restart.
 
-Before reserving runs, the plan also funds decoder quotas from at most a quarter
+Before reserving runs, the plan also funds decoder floors from at most a quarter
 of the query ledger (and no more than its decode limit), split evenly between
-workers. Region and sliced-decode allocations draw from their worker's quota;
-local group tables and run growth continue to share the query ledger. A worker
-cannot consume another decoder's room. The existing sliced decoder handles row
-groups that do not fit a quota. If both reservations cannot be funded, the plan
-keeps shared partitions before consuming any rows. Regions and side allocations
-are freed before their funding returns, before the run fold starts.
+workers. Whole row groups may borrow additional room from the same query ledger;
+the parent holds the larger of each floor and its live allocations. A refused
+whole-row-group admission selects sliced decode, whose buffers use protected
+room, so one worker cannot consume another decoder's floor. Local group tables
+and run growth continue to share the query ledger. A reducing sample returns
+unused floors immediately; live allocations retain their charge and subsequent
+decode uses the parent's available room. If both initial reservations cannot be
+funded, the plan keeps shared partitions before consuming any rows. Regions and
+side allocations are freed before remaining funding returns, before the run fold.
+
+Local sample tables also receive bounded floors, transferred from the prepaid
+run credit rather than charged again. Otherwise whole decoders can consume the
+ledger before any table reaches the first flush, while the entire run ceiling
+is still unused. Each table returns its floor when it is abandoned or finally
+flushed; a cancelled sample returns all unused floors while keeping live bytes
+charged. If the run ceiling cannot fund those samples, private runs decline
+before consuming rows. Allocation-failure checks exercise sample tables with a
+full parent ledger and verify that transferring credit adds no charge.
 
 A refused admission leaves every local accumulator available to the shared path.
 If later growth or folding refuses the budget, the whole attempt is freed and

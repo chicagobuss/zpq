@@ -92,7 +92,7 @@ test *args="":
     zig build test --summary all -- {{args}}
 
 # Tier 2 — run before every commit.
-check: test-modules test test-integration smoke duckdb-smoke differential libzpq
+check: test-modules test test-integration smoke duckdb-smoke differential private-decode-check libzpq
 
 # Static guard for Zig's lazy test discovery. Every src file containing a
 # top-level test must be directly rooted by one of the two test artifacts.
@@ -143,6 +143,11 @@ duckdb-smoke:
 differential:
     zig build -Doptimize=ReleaseFast
     {{python}} tools/differential.py
+
+# Reducing samples must return their private funding without adding a scan for a large dictionary tail.
+private-decode-check:
+    zig build -Doptimize=ReleaseFast
+    {{python}} tools/private_decode_check.py zig-out/bin/zpq --out-dir zig-out/private-decode-check
 
 # libzpq, the C ABI (Tier 2): its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close
 # cycles), the Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte

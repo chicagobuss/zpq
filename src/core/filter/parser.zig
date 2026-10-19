@@ -1026,11 +1026,7 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
             .op = op,
             .value = std.fmt.parseInt(i64, val_str, 10) catch return error.BadValue,
         } },
-        .FLOAT => .{ .float = .{
-            .col_idx = col_idx,
-            .op = op,
-            .value = std.fmt.parseFloat(f32, val_str) catch return error.BadValue,
-        } },
+        .FLOAT => .{ .float = try floatLeaf(col_idx, op, val_str) },
         .DOUBLE => .{ .double = .{
             .col_idx = col_idx,
             .op = op,
@@ -1054,6 +1050,32 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
         } },
         .INT96 => return error.UnsupportedType,
     };
+}
+
+/// A FLOAT literal binds as the f32 it rounds to, the cast SQL makes of it, unless it is finite and past f32's range.
+/// Rounded, it became an infinity: `f > 3.5e38` missed a stored +inf and `f = 3.5e38` matched it. Such a literal lies
+/// strictly between every finite f32 and the infinity on its side, so each comparison with it is one with a bound
+/// f32 has: past the top, `f < v` is `f <= floatMax` and `f > v` is `f > floatMax` (+inf and NaN, above every
+/// number); `=` matches nothing (`f < -inf`) and `!=` every present row (`f >= -inf`). Each negates into its
+/// complement, so NOT stays exact.
+fn floatLeaf(col_idx: usize, op: ast.Operator, val_str: []const u8) Error!ast.Leaf(f32) {
+    const rounded = std.fmt.parseFloat(f32, val_str) catch return error.BadValue;
+    const wide = std.fmt.parseFloat(f64, val_str) catch return error.BadValue;
+    if (!std.math.isInf(rounded) or std.math.isInf(wide)) return .{ .col_idx = col_idx, .op = op, .value = rounded };
+    const top = std.math.floatMax(f32);
+    const inf = std.math.inf(f32);
+    const bound: struct { op: ast.Operator, value: f32 } = if (wide > 0) switch (op) {
+        .Eq => .{ .op = .Lt, .value = -inf },
+        .NotEq => .{ .op = .GtEq, .value = -inf },
+        .Lt, .LtEq => .{ .op = .LtEq, .value = top },
+        .Gt, .GtEq => .{ .op = .Gt, .value = top },
+    } else switch (op) {
+        .Eq => .{ .op = .Lt, .value = -inf },
+        .NotEq => .{ .op = .GtEq, .value = -inf },
+        .Lt, .LtEq => .{ .op = .Lt, .value = -top },
+        .Gt, .GtEq => .{ .op = .GtEq, .value = -top },
+    };
+    return .{ .col_idx = col_idx, .op = bound.op, .value = bound.value };
 }
 
 /// Strip one matching pair of surrounding quotes from a string literal so
@@ -2182,6 +2204,49 @@ test "regression: NOT over a float range keeps NaN rows: floats compare in total
                 return err;
             };
         }
+    }
+}
+
+test "regression: a FLOAT literal past f32's range compares exactly, not as the infinity it rounds to" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    meta.schema.items[3].type = .FLOAT; // score
+    const inf = std.math.inf(f32);
+    const top = std.math.floatMax(f32);
+    const vals = [_]f32{ inf, top, 0.5, -top, -inf, std.math.nan(f32) };
+    const cols = [_]eval.Batch.Column{.{ .f32 = .{ .values = &vals } }};
+    const lookup = [_]?usize{ null, null, 0 };
+    const Case = struct { filter: []const u8, want: [6]bool };
+    const cases = [_]Case{
+        .{ .filter = "score > 3.5e38", .want = .{ true, false, false, false, false, true } },
+        .{ .filter = "score >= 3.5e38", .want = .{ true, false, false, false, false, true } },
+        .{ .filter = "score < 3.5e38", .want = .{ false, true, true, true, true, false } },
+        .{ .filter = "score <= 1e300", .want = .{ false, true, true, true, true, false } },
+        .{ .filter = "score = 3.5e38", .want = .{ false, false, false, false, false, false } },
+        .{ .filter = "score != 3.5e38", .want = .{ true, true, true, true, true, true } },
+        .{ .filter = "NOT (score = 3.5e38)", .want = .{ true, true, true, true, true, true } },
+        .{ .filter = "NOT (score > 3.5e38)", .want = .{ false, true, true, true, true, false } },
+        .{ .filter = "score < -3.5e38", .want = .{ false, false, false, false, true, false } },
+        .{ .filter = "score > -3.5e38", .want = .{ true, true, true, true, false, true } },
+        .{ .filter = "NOT (score <= -3.5e38)", .want = .{ true, true, true, true, false, true } },
+        .{ .filter = "score IN (3.5e38, 0.5)", .want = .{ false, false, true, false, false, false } },
+        // In range, a literal still binds as the f32 it rounds to; an infinite one is the infinity.
+        .{ .filter = "score = 3.4028235e38", .want = .{ false, true, false, false, false, false } },
+        .{ .filter = "score = inf", .want = .{ true, false, false, false, false, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, vals.len);
+        try eval.evaluate(f, &.{ .cols = &cols, .num_rows = vals.len }, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
     }
 }
 

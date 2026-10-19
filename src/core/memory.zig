@@ -56,7 +56,9 @@ test "the C heap calls are glibc's alone, and run where the target has them" {
     try std.testing.expect(!hasGlibcHeap(.linux, .gnu, false));
     try std.testing.expect(hasGlibcHeap(.linux, .gnu, true));
     try std.testing.expect(hasGlibcHeap(.linux, .gnueabihf, true));
-    fixHeapThreshold();
+    // Run for real only where it leaves nothing behind: `fixHeapThreshold` would pin glibc's mmap threshold for the
+    // rest of this test process, and glibc offers no way to read the dynamic one back. release-smoke runs both in the
+    // shipped binaries; `trimHeap` only returns free memory.
     trimHeap();
 }
 

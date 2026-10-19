@@ -109,6 +109,23 @@ def test_decimal_exact(z):
         check(r.get("decimal") == ["s", "a"], f"decimal names {r.get('decimal')}")
         r2 = z.run({"inputs": [src], "aggregate": "sum(p) AS s"}, decimal=False)
         check(type(r2["agg"]["s"]) is float, f"run decimal=False {r2['agg']}")
+        # A scale-0 DECIMAL prints as an integer token: still Decimal, in rows, keys and aggregates; an average's
+        # count, and a non-DECIMAL integer, stay int.
+        src0 = os.path.join(d, "dec0.parquet")
+        big = Decimal("12345678901234567890123456789012345678")
+        pq.write_table(pa.table({"d": pa.array([big, Decimal("2")], pa.decimal128(38, 0)),
+                                 "i": pa.array([1, 2], pa.int64())}), src0)
+        r0 = z.query(f"SELECT d, i FROM '{src0}'")
+        check(r0[0] == {"d": big, "i": 1} and type(r0[0]["d"]) is Decimal and type(r0[0]["i"]) is int,
+              f"scale-0 rows {r0}")
+        k0 = z.query(f"SELECT d, count(*) AS n FROM '{src0}' GROUP BY d ORDER BY d")
+        check(type(k0[0]["d"]) is Decimal and type(k0[0]["n"]) is int, f"scale-0 key {k0}")
+        m0 = z.query(f"SELECT min(d) AS m FROM '{src0}'")
+        check(m0 == [{"m": Decimal(2)}] and type(m0[0]["m"]) is Decimal, f"scale-0 scalar {m0}")
+        s0 = z.run({"inputs": [src0], "aggregate": "min(d) AS m, avg(d) AS a, sum(i) AS si"})
+        check(type(s0["agg"]["m"]) is Decimal and type(s0["agg"]["a"]["count"]) is int
+              and type(s0["agg"]["a"]["sum"]) is Decimal and type(s0["agg"]["si"]) is int, f"scale-0 agg {s0['agg']}")
+        check(type(z.query(f"SELECT d FROM '{src0}'", decimal=False)[0]["d"]) is int, "scale-0 opt-out")
 
 
 def test_threads(z):

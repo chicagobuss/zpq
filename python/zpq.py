@@ -111,7 +111,17 @@ def _exact_columns(exact, plain, names):
     same JSON parsed with Decimal for its fractional numbers."""
     if isinstance(plain, list):
         return [_exact_columns(e, p, names) for e, p in zip(exact, plain)]
-    return {k: (exact[k] if k in names else v) for k, v in plain.items()}
+    return {k: (_as_decimal(exact[k]) if k in names else v) for k, v in plain.items()}
+
+
+def _as_decimal(v):
+    """A DECIMAL column's value as Decimal: a scale-0 DECIMAL prints as an integer token, which JSON reads as int. An
+    average's {"sum", "count", "avg"} keeps its count an int."""
+    if isinstance(v, dict):
+        return {k: (x if k == "count" else _as_decimal(x)) for k, x in v.items()}
+    if isinstance(v, int) and not isinstance(v, bool):
+        return _decimal.Decimal(v)
+    return v
 
 
 class Zpq:

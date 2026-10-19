@@ -270,6 +270,8 @@ Not supported: the simple `CASE x WHEN` form, `%`, joins.
   `{"sql": "...", "parallelism": n}`, or `Zpq.query()` (rows as dicts) and `Zpq.query_raw()` (NDJSON identical to the
   CLI's stdout). The binding has no Arrow export, and a SQL request cannot write a file (`output_url` is excluded); use
   a structured request with `output_url` to write Parquet.
+- `Zpq.query()` and `Zpq.run()` decode numbers with Python's JSON defaults, so a DECIMAL arrives as a float. To keep
+  every digit, parse `query_raw()` (or `run_raw()`) with `json.loads(text, parse_float=decimal.Decimal)`.
 - Also experimental: the response's `pool` and `profile` members, the Python API and the HTTP service.
 - libzpq never raises or resets SIGPIPE in its host and runs each request on a stack of its own when the caller's is
   short. A local input truncated while libzpq reads it raises SIGBUS in the host; write a new file and rename it.

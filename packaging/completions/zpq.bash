@@ -2,7 +2,7 @@
 _zpq() {
   local cur="${COMP_WORDS[COMP_CWORD]}" prev="${COMP_WORDS[COMP_CWORD-1]}"
   case "$prev" in
-    --format) COMPREPLY=($(compgen -W 'ndjson json parquet' -- "$cur")); return ;;
+    --format) COMPREPLY=($(compgen -W 'ndjson json csv parquet' -- "$cur")); return ;;
     --codec) COMPREPLY=($(compgen -W 'snappy zstd gzip lz4 lz4_raw uncompressed' -- "$cur")); return ;;
   esac
   if [[ "$cur" == -* || $COMP_CWORD == 1 ]]; then

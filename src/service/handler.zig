@@ -543,7 +543,7 @@ fn executeSql(
         defer result.deinit(allocator);
         const answer = result.aggregate.output;
         const n: usize = if (answer.group_rows) |groups| groups.len else if (qa.empty_scalar or answer.no_row) 0 else 1;
-        try engine.writeAggregateText(&rows.writer, answer, result.aggregate.text_kinds, n, .jsonl);
+        try engine.writeAggregateText(&rows.writer, answer, result.aggregate.text_kinds, &.{}, n, .jsonl);
     } else {
         _ = try engine.runPrintSink(
             ctx,

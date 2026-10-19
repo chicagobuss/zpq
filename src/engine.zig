@@ -428,10 +428,13 @@ pub const AggResult = struct {
     output: scan.AggOutput,
     /// How each answer column's byte values are printed (`writeAggregateText`), owned in `Context.gpa`.
     text_kinds: []const TextKind = &.{},
+    /// What each answer column needs to print as CSV (`writeAggregateText`), owned in `Context.gpa`.
+    answer_types: []const AnswerType = &.{},
 
     pub fn deinit(self: *AggResult, gpa: std.mem.Allocator) void {
         self.output.deinit(gpa);
         gpa.free(self.text_kinds);
+        gpa.free(self.answer_types);
     }
 };
 
@@ -774,6 +777,8 @@ fn executeAggregateOver(
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);
     errdefer ctx.gpa.free(text_kinds);
+    const answer_types = try answerTypes(ctx.gpa, r.output, r.state);
+    errdefer ctx.gpa.free(answer_types);
     // Without GROUP BY, the aggregates shown: the hidden HAVING terms follow them.
     const n_aggs = if (r.output.group_rows == null) r.visible_cols orelse r.state.agg_calls.len else r.state.agg_calls.len;
 
@@ -826,7 +831,31 @@ fn executeAggregateOver(
         .timings = t,
         .output = r.output,
         .text_kinds = text_kinds,
+        .answer_types = answer_types,
     };
+}
+
+/// The `AnswerType` of each answer column: a DATE/TIME/TIMESTAMP from the column its values pass through, and
+/// whether it is an average.
+fn answerTypes(gpa: std.mem.Allocator, out: scan.AggOutput, state: scan.ScanState) ![]AnswerType {
+    if (out.typed != null) return &.{};
+    const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
+    const types = try gpa.alloc(AnswerType, n);
+    for (types, 0..) |*ty, ci| {
+        ty.* = .{};
+        if (out.group_cols != null) {
+            const all = state.group_col_types orelse continue;
+            if (ci >= all.len) continue;
+            ty.avg = all[ci].lane == .avg or all[ci].lane == .avg_dec;
+            if (all[ci].source) |src| ty.temporal = Temporal.of(src);
+        } else {
+            ty.avg = out.aggs[ci].value == .avg or out.aggs[ci].value == .avg_dec;
+            if (ci < state.agg_sources.len) if (state.agg_sources[ci]) |src| {
+                ty.temporal = Temporal.of(src);
+            };
+        }
+    }
+    return types;
 }
 
 /// The `TextKind` of each answer column, from the column its values pass through. With `check`, a text answer: its
@@ -4872,9 +4901,11 @@ pub fn writeAggregateText(
     writer: anytype,
     answer: scan.AggOutput,
     kinds: []const TextKind,
+    types: []const AnswerType,
     rows: usize,
     format: PrintFormat,
 ) !void {
+    if (format == .csv) return writeAggregateCsv(writer, answer, kinds, types, rows);
     if (format == .json) try writer.writeByte('[');
     if (answer.group_rows) |groups| {
         for (groups, 0..) |values, ri| {
@@ -4901,6 +4932,72 @@ pub fn writeAggregateText(
         try writer.writeAll(if (format == .json) "}" else "}\n");
     }
     if (format == .json) try writer.writeAll("]\n");
+}
+
+/// The answer as CSV: a header row, then its rows (none past `rows`, as the JSON forms). An average is two cells,
+/// `<name>__sum` and `<name>__count`, as `-o` writes it; every other value prints as its column's rows do.
+fn writeAggregateCsv(
+    writer: anytype,
+    answer: scan.AggOutput,
+    kinds: []const TextKind,
+    types: []const AnswerType,
+    rows: usize,
+) !void {
+    const n = if (answer.group_cols) |cols| cols.len else answer.aggs.len;
+    for (0..n) |ci| {
+        if (ci > 0) try writer.writeByte(',');
+        const name = if (answer.group_cols) |cols| cols[ci] else answer.aggs[ci].alias;
+        if (typeAt(types, ci).avg) {
+            try writeCsvParts(writer, &.{ name, "__sum" });
+            try writer.writeByte(',');
+            try writeCsvParts(writer, &.{ name, "__count" });
+        } else try writeCsvString(writer, name);
+    }
+    try writer.writeByte('\n');
+    if (answer.group_rows) |groups| {
+        for (groups) |values| {
+            for (values, 0..) |value, ci| {
+                if (ci > 0) try writer.writeByte(',');
+                try writeAggValueCsv(writer, value, kindAt(kinds, ci), typeAt(types, ci));
+            }
+            try writer.writeByte('\n');
+        }
+    } else if (rows > 0) {
+        for (answer.aggs, 0..) |item, ci| {
+            if (ci > 0) try writer.writeByte(',');
+            try writeAggValueCsv(writer, item.value, kindAt(kinds, ci), typeAt(types, ci));
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+fn typeAt(types: []const AnswerType, ci: usize) AnswerType {
+    return if (ci < types.len) types[ci] else .{};
+}
+
+/// One answer value as CSV cells: NULL an empty field, a BOOLEAN true/false, a DATE/TIME/TIMESTAMP its ISO text,
+/// a DECIMAL every digit of its scale, bytes as `writeBytesCsv`, an average its sum and count.
+fn writeAggValueCsv(writer: anytype, v: scan.AggValue, kind: TextKind, ty: AnswerType) !void {
+    switch (v) {
+        .null_val => if (ty.avg) try writer.writeByte(','),
+        .i => |x| if (kind == .boolean)
+            try writer.writeAll(if (x != 0) "true" else "false")
+        else if (ty.temporal) |t|
+            try t.write(writer, x)
+        else
+            try writer.print("{d}", .{x}),
+        .f => |x| try writeFloat(writer, x, false),
+        .s => |x| try writeBytesCsv(writer, x, kind),
+        .dec => |d| if (ty.temporal) |t| try t.write(writer, d.v) else try writeDecimal(writer, d.v, d.spec.scale),
+        .avg => |p| {
+            if (p.sum) |x| try writeFloat(writer, x, false);
+            try writer.print(",{d}", .{p.count});
+        },
+        .avg_dec => |p| {
+            if (p.sum) |x| try writeDecimal(writer, x, p.spec.scale);
+            try writer.print(",{d}", .{p.count});
+        },
+    }
 }
 
 pub const StdoutWriter = struct {
@@ -5009,27 +5106,31 @@ fn writeDecimal(writer: anytype, unscaled: anytype, scale: i32) !void {
     }
 }
 
+/// `s` as an RFC 4180 field: quoted when it holds a comma, quote or line break, and when empty, which an unquoted
+/// empty field (NULL) would not tell apart.
 fn writeCsvString(writer: anytype, s: []const u8) !void {
+    return writeCsvParts(writer, &.{s});
+}
+
+/// The concatenation of `parts` as one CSV field (`writeCsvString`).
+fn writeCsvParts(writer: anytype, parts: []const []const u8) !void {
+    var len: usize = 0;
     var needs_quotes = false;
-    for (s) |c| {
-        if (c == ',' or c == '"' or c == '\n' or c == '\r') {
+    for (parts) |part| {
+        len += part.len;
+        for (part) |c| if (c == ',' or c == '"' or c == '\n' or c == '\r') {
             needs_quotes = true;
-            break;
-        }
+        };
     }
-    if (needs_quotes) {
-        try writer.writeByte('"');
-        for (s) |c| {
-            if (c == '"') {
-                try writer.writeAll("\"\"");
-            } else {
-                try writer.writeByte(c);
-            }
-        }
-        try writer.writeByte('"');
-    } else {
-        try writer.writeAll(s);
+    if (len == 0) needs_quotes = true;
+    if (!needs_quotes) {
+        for (parts) |part| try writer.writeAll(part);
+        return;
     }
+    try writer.writeByte('"');
+    const quoting: CsvQuoting(@TypeOf(writer)) = .{ .inner = writer };
+    for (parts) |part| try quoting.writeAll(part);
+    try writer.writeByte('"');
 }
 
 /// The same single-object JSON convention as query results. Passes describe permitted work, not a runtime trace.
@@ -5379,6 +5480,154 @@ pub const TextKind = enum {
     }
 };
 
+/// How a CSV cell prints an integer column that SQL types DATE, TIME or TIMESTAMP: as ISO text, not its stored
+/// count of days or units. INT96 is a TIMESTAMP in nanoseconds; a UTC-adjusted TIME or TIMESTAMP ends in `Z`.
+pub const Temporal = struct {
+    kind: enum { date, time, timestamp },
+    unit: enum { ms, us, ns } = .us,
+    utc: bool = false,
+
+    pub fn of(elem: schema.SchemaElement) ?Temporal {
+        if (elem.type == .INT96) return .{ .kind = .timestamp, .unit = .ns };
+        if (elem.type != .INT32 and elem.type != .INT64) return null;
+        const lt = elem.effectiveLogicalType() orelse return null;
+        return switch (lt) {
+            .DATE => .{ .kind = .date },
+            .TIME => |t| .{ .kind = .time, .unit = unitOf(t.unit), .utc = t.isAdjustedToUTC },
+            .TIMESTAMP => |t| .{ .kind = .timestamp, .unit = unitOf(t.unit), .utc = t.isAdjustedToUTC },
+            else => null,
+        };
+    }
+
+    fn unitOf(u: schema.TimeUnit) @FieldType(Temporal, "unit") {
+        return switch (u) {
+            .MILLIS => .ms,
+            .MICROS => .us,
+            .NANOS => .ns,
+        };
+    }
+
+    fn perSecond(self: Temporal) i128 {
+        return switch (self.unit) {
+            .ms => 1_000,
+            .us => 1_000_000,
+            .ns => 1_000_000_000,
+        };
+    }
+
+    fn digits(self: Temporal) usize {
+        return switch (self.unit) {
+            .ms => 3,
+            .us => 6,
+            .ns => 9,
+        };
+    }
+
+    /// `v` (days, or units since midnight or the epoch) as `YYYY-MM-DD`, `HH:MM:SS.fff` or `YYYY-MM-DD HH:MM:SS.fff`,
+    /// every fractional digit of the unit printed.
+    pub fn write(self: Temporal, writer: anytype, v: i128) !void {
+        if (self.kind == .date) return writeCivilDate(writer, v);
+        const per = self.perSecond();
+        const day = per * 86_400;
+        const days = @divFloor(v, day);
+        const in_day = @mod(v, day);
+        if (self.kind == .timestamp) {
+            try writeCivilDate(writer, days);
+            try writer.writeByte(' ');
+        }
+        // A TIME past a day is no time of day; it prints its hours whole.
+        const t = if (self.kind == .time) v else in_day;
+        if (t < 0) return error.InvalidBinaryValue;
+        const secs = @divFloor(t, per);
+        try writer.print("{d:0>2}:{d:0>2}:{d:0>2}.", .{ @as(u128, @intCast(@divFloor(secs, 3600))), @as(u128, @intCast(@mod(@divFloor(secs, 60), 60))), @as(u128, @intCast(@mod(secs, 60))) });
+        var frac_buf: [9]u8 = undefined;
+        const frac = std.fmt.bufPrint(&frac_buf, "{d}", .{@as(u128, @intCast(@mod(t, per)))}) catch unreachable;
+        for (0..self.digits() - frac.len) |_| try writer.writeByte('0');
+        try writer.writeAll(frac);
+        if (self.utc) try writer.writeByte('Z');
+    }
+};
+
+/// Day `days` since 1970-01-01 as a proleptic Gregorian `YYYY-MM-DD` (H. Hinnant's civil_from_days); a year before
+/// 1 prints signed, as ISO 8601 writes it.
+fn writeCivilDate(writer: anytype, days: i128) !void {
+    const z = days + 719_468;
+    const era = @divFloor(z, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = yoe + era * 400 + @intFromBool(m <= 2);
+    if (y < 0) try writer.writeByte('-');
+    try writer.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u128, @intCast(@abs(y))), @as(u128, @intCast(m)), @as(u128, @intCast(d)) });
+}
+
+/// Writes through to `inner`, doubling each `"`: the body of a quoted CSV field.
+fn CsvQuoting(comptime W: type) type {
+    return struct {
+        inner: W,
+
+        pub fn writeAll(self: @This(), bytes: []const u8) !void {
+            var start: usize = 0;
+            for (bytes, 0..) |c, i| if (c == '"') {
+                try self.inner.writeAll(bytes[start .. i + 1]);
+                try self.inner.writeByte('"');
+                start = i + 1;
+            };
+            try self.inner.writeAll(bytes[start..]);
+        }
+
+        pub fn writeByte(self: @This(), c: u8) !void {
+            try self.writeAll(&.{c});
+        }
+
+        pub fn print(self: @This(), comptime fmt: []const u8, args: anytype) !void {
+            var tmp: [512]u8 = undefined;
+            try self.writeAll(try std.fmt.bufPrint(&tmp, fmt, args));
+        }
+    };
+}
+
+/// `value` as a CSV field under the same lossless rules as JSON (`writeBytesJson`): text is the field, quoted as RFC
+/// 4180 needs; a UUID its canonical text; anything JSON prints as an object (bytes that are not UTF-8, BSON and the
+/// like, an INTERVAL) that object's JSON text, quoted.
+pub fn writeBytesCsv(writer: anytype, value: []const u8, kind: TextKind) !void {
+    switch (kind) {
+        .utf8 => {
+            if (!isUtf8(value)) return error.InvalidUtf8;
+            try writeCsvString(writer, value);
+        },
+        .bytes => if (isUtf8(value)) try writeCsvString(writer, value) else try writeJsonAsCsv(writer, value, kind),
+        .uuid => {
+            var buf: [40]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            writeBytesJson(&w, value, .uuid) catch |err| switch (err) {
+                error.WriteFailed => unreachable,
+                else => |e| return e,
+            };
+            const text = w.buffered();
+            try writer.writeAll(text[1 .. text.len - 1]);
+        },
+        .base64, .interval => try writeJsonAsCsv(writer, value, kind),
+        .boolean => return error.InvalidBinaryValue,
+    }
+}
+
+fn writeJsonAsCsv(writer: anytype, value: []const u8, kind: TextKind) !void {
+    try writer.writeByte('"');
+    try writeBytesJson(CsvQuoting(@TypeOf(writer)){ .inner = writer }, value, kind);
+    try writer.writeByte('"');
+}
+
+/// What an answer column needs besides its `TextKind` to print as CSV: DATE/TIME/TIMESTAMP text, and an average
+/// split into `<name>__sum` and `<name>__count` cells, as `-o` writes it.
+pub const AnswerType = struct {
+    temporal: ?Temporal = null,
+    avg: bool = false,
+};
+
 /// `value` as a JSON value of `kind`. A UUID or INTERVAL of the wrong width is not one: `InvalidBinaryValue`.
 pub fn writeBytesJson(writer: anytype, value: []const u8, kind: TextKind) !void {
     switch (kind) {
@@ -5455,6 +5704,7 @@ fn printCell(
                 try writer.writeAll(if (is_jsonl) "null" else "");
             } else {
                 const v = tb.values.items[row_idx];
+                if (!is_jsonl) if (Temporal.of(elem)) |t| return t.write(writer, v);
                 if (unsigned) try writer.print("{d}", .{@as(u32, @bitCast(v))}) else try writer.print("{d}", .{v});
             }
         },
@@ -5463,6 +5713,7 @@ fn printCell(
                 try writer.writeAll(if (is_jsonl) "null" else "");
             } else {
                 const v = tb.values.items[row_idx];
+                if (!is_jsonl) if (Temporal.of(elem)) |t| return t.write(writer, v);
                 if (unsigned) try writer.print("{d}", .{@as(u64, @bitCast(v))}) else try writer.print("{d}", .{v});
             }
         },
@@ -5488,7 +5739,7 @@ fn printCell(
                 if (is_jsonl) {
                     try writeBytesJson(writer, val, TextKind.of(elem));
                 } else {
-                    try writeCsvString(writer, val);
+                    try writeBytesCsv(writer, val, TextKind.of(elem));
                 }
             }
         },
@@ -5503,6 +5754,8 @@ fn printCell(
             if (tb.max_def > 0 and tb.def_levels.items[row_idx] < tb.max_def) {
                 try writer.writeAll(if (is_jsonl) "null" else "");
             } else {
+                // INT96 rides this lane as exact nanoseconds.
+                if (!is_jsonl) if (Temporal.of(elem)) |t| return t.write(writer, tb.values.items[row_idx]);
                 try writeDecimal(writer, tb.values.items[row_idx], scale);
             }
         },
@@ -7723,7 +7976,7 @@ test "regression: a BOOLEAN answer column (key, min, max) prints true/false as i
     const kinds = [_]TextKind{ .boolean, .utf8 };
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeAggregateText(&w, .{ .group_cols = &cols, .group_rows = &rows }, &kinds, rows.len, .jsonl);
+    try writeAggregateText(&w, .{ .group_cols = &cols, .group_rows = &rows }, &kinds, &.{}, rows.len, .jsonl);
     try std.testing.expectEqualStrings(
         \\{"b":true,"n":2}
         \\{"b":false,"n":1}
@@ -10755,4 +11008,78 @@ test "in-process text sink flushes across buffer boundaries and allocation failu
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.write, .{});
+}
+
+test "CSV: temporal text, bytes under the JSON rules, quoting, NULL and the empty string apart" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const date: Temporal = .{ .kind = .date };
+    const T = struct { t: Temporal, v: i128, want: []const u8 };
+    for ([_]T{
+        .{ .t = date, .v = 0, .want = "1970-01-01" },
+        .{ .t = date, .v = -1, .want = "1969-12-31" },
+        .{ .t = date, .v = 18_263, .want = "2020-01-02" },
+        .{ .t = date, .v = 11_016, .want = "2000-02-29" },
+        .{ .t = date, .v = -719_528, .want = "0000-01-01" },
+        .{ .t = .{ .kind = .timestamp, .unit = .us }, .v = 1_577_934_245_123_456, .want = "2020-01-02 03:04:05.123456" },
+        .{ .t = .{ .kind = .timestamp, .unit = .ms, .utc = true }, .v = -1, .want = "1969-12-31 23:59:59.999Z" },
+        .{ .t = .{ .kind = .timestamp, .unit = .ns }, .v = 1, .want = "1970-01-01 00:00:00.000000001" },
+        .{ .t = .{ .kind = .time, .unit = .ms }, .v = 3_723_500, .want = "01:02:03.500" },
+        .{ .t = .{ .kind = .time, .unit = .ns }, .v = 86_399_999_999_999, .want = "23:59:59.999999999" },
+    }) |c| {
+        w = .fixed(&buf);
+        try c.t.write(&w, c.v);
+        try std.testing.expectEqualStrings(c.want, w.buffered());
+    }
+    var elem: schema.SchemaElement = .{
+        .type = .INT32,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "d",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .converted_type = .DATE,
+    };
+    try std.testing.expect(Temporal.of(elem).?.kind == .date);
+    elem.converted_type = .TIMESTAMP_MILLIS;
+    elem.type = .INT64;
+    try std.testing.expect(Temporal.of(elem).?.utc);
+    elem.converted_type = .INT_64;
+    try std.testing.expect(Temporal.of(elem) == null);
+
+    const B = struct { v: []const u8, kind: TextKind, want: []const u8 };
+    for ([_]B{
+        .{ .v = "plain", .kind = .utf8, .want = "plain" },
+        .{ .v = "", .kind = .utf8, .want = "\"\"" },
+        .{ .v = "a,b \"q\"\nz", .kind = .utf8, .want = "\"a,b \"\"q\"\"\nz\"" },
+        .{ .v = "text", .kind = .bytes, .want = "text" },
+        .{ .v = "\xff\x00", .kind = .bytes, .want = "\"{\"\"base64\"\":\"\"/wA=\"\"}\"" },
+        .{ .v = "ok", .kind = .base64, .want = "\"{\"\"base64\"\":\"\"b2s=\"\"}\"" },
+        .{ .v = &.{ 0xb6, 0xd5, 0xf6, 0xa0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1 }, .kind = .uuid, .want = "b6d5f6a0-0000-4000-8000-000000000001" },
+        .{ .v = &.{ 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0 }, .kind = .interval, .want = "\"{\"\"months\"\":1,\"\"days\"\":2,\"\"millis\"\":3}\"" },
+    }) |c| {
+        w = .fixed(&buf);
+        try writeBytesCsv(&w, c.v, c.kind);
+        try std.testing.expectEqualStrings(c.want, w.buffered());
+    }
+    w = .fixed(&buf);
+    try std.testing.expectError(error.InvalidUtf8, writeBytesCsv(&w, "\xff", .utf8));
+
+    // An answer: header (an average as two columns), BOOLEAN, DATE, NULL and the empty string apart.
+    const cols = [_][]const u8{ "b", "d", "s", "a" };
+    const r0 = [_]scan.AggValue{ .{ .i = 1 }, .{ .i = 18_263 }, .{ .s = "" }, .{ .avg = .{ .sum = 3.5, .count = 2 } } };
+    const r1 = [_]scan.AggValue{ .null_val, .null_val, .null_val, .{ .avg = .{ .sum = null, .count = 0 } } };
+    const rows = [_][]const scan.AggValue{ &r0, &r1 };
+    const kinds = [_]TextKind{ .boolean, .bytes, .utf8, .utf8 };
+    const types = [_]AnswerType{ .{}, .{ .temporal = date }, .{}, .{ .avg = true } };
+    w = .fixed(&buf);
+    try writeAggregateText(&w, .{ .group_cols = &cols, .group_rows = &rows }, &kinds, &types, rows.len, .csv);
+    try std.testing.expectEqualStrings(
+        \\b,d,s,a__sum,a__count
+        \\true,2020-01-02,"",3.5,2
+        \\,,,,0
+        \\
+    , w.buffered());
 }

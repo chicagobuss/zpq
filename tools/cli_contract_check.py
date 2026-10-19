@@ -88,13 +88,18 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
         got = pq.read_table(io.BytesIO(p.stdout)).to_pylist() if fmt == 'parquet' else (
             json.loads(p.stdout) if fmt == 'json' else ndjson(p.stdout))
         assert got == []
+    # CSV: a header row always, so an empty answer is the header alone; NULL is an empty unquoted field.
+    assert run(src, '--filter', 'k < 0', '--format', 'csv').stdout == b'k,v,s\n'
+    csv_sql = f"SELECT k, v, s FROM '{src}' LIMIT 3 OFFSET 1"
+    assert run('--query', csv_sql, '--format', 'csv').stdout == b'k,v,s\n2,,b\n1,5,\n3,7,d\n'
+    assert run(src, '--aggregate', 'count(*) AS n', '--filter', 'k < 0', '--format', 'csv').stdout == b'n\n0\n'
     sql = f"SELECT k, v FROM '{src}' LIMIT 2 OFFSET 1"
     assert ndjson(run('--query', sql).stdout) == [{'k': 2, 'v': None}, {'k': 1, 'v': 5}]
     run('--query', sql, '--limit', '1', code=2)
     for sql in (f"SELECT count(*) AS n FROM '{src}' LIMIT 0",
                 f"SELECT count(*) AS n FROM '{src}' LIMIT 1 OFFSET 1"):
         assert not run('--query', sql).stdout
-    for args in (['--format', 'csv'], ['--format', 'wat'], ['--limit', '1', '--limit', '2'],
+    for args in (['--format', 'wat'], ['--limit', '1', '--limit', '2'],
                  ['--aggregate', 'sum(missing)'], ['--query', 'SELECT broken(']):
         p = run(src, *args, '--summary=json', code=2) if '--query' not in args else run(
             '--query', 'SELECT broken(', '--summary=json', code=2)

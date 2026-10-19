@@ -310,8 +310,7 @@ fn runQuery(
                 return error.BadArgs;
             };
             if (std.ascii.eqlIgnoreCase(v, "csv")) {
-                diagnosticPrint("zpq query: csv output is not supported yet\n", .{});
-                return error.BadArgs;
+                format = .csv;
             } else if (std.ascii.eqlIgnoreCase(v, "jsonl") or std.ascii.eqlIgnoreCase(v, "ndjson")) {
                 format = .jsonl;
             } else if (std.ascii.eqlIgnoreCase(v, "json")) {
@@ -586,7 +585,7 @@ fn runQuery(
                 owns_fd = true;
             }
             var w: StdoutWriter = .{ .fd = fd };
-            try engine.writeAggregateText(&w, answer, ar.text_kinds, rows, fmt);
+            try engine.writeAggregateText(&w, answer, ar.text_kinds, ar.answer_types, rows, fmt);
             try w.flush();
             text_bytes_out = if (w.inner) |inner| inner.bytes_written else 0;
             if (owns_fd) {

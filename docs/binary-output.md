@@ -21,12 +21,15 @@ bytes back takes a string's UTF-8 encoding, or an object's decoded `base64`.
 An annotation zpq does not interpret falls back to the legacy annotation beside it, as the format allows; with none,
 its values are unannotated bytes. DECIMAL and FLOAT16 over FLBA are numbers, not bytes.
 
-The form applies wherever a value leaves as text: rows (`--format ndjson` / `json`, SQL), GROUP BY keys, min/max
+The form applies wherever a value leaves as text: rows (`--format ndjson` / `json` / `csv`, SQL), GROUP BY keys, min/max
 results, libzpq's SQL NDJSON and the Lambda's `agg` response. It is chosen from the column a value passes through
 unchanged: a bare column, an alias of one, a GROUP BY key that is a column, or a min/max of one. A computed string
 (`CASE ... THEN 'x'`, concatenation) is text. Filters, ordering and min/max compare the stored bytes, unsigned,
 whatever the printed form. `--explain` prints names and counts, never values; `zpq inspect` prints statistics bounds
 that are not valid STRING text as hex.
+
+In CSV (`--format csv`) a value JSON prints as a string is that field's text, a UUID unquoted; one JSON prints as an
+object is that object's JSON text, in a quoted field: `"{""base64"":""/wA=""}"`.
 
 A STRING, ENUM or JSON value that is not valid UTF-8 makes the file invalid. zpq fails with an error naming the column
 (exit 1) rather than print a replacement; streamed rows before it may already be on stdout, as with any read error.

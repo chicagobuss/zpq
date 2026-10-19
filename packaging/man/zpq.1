@@ -14,7 +14,7 @@ usage:
             [\-\-compress\-priority size|speed]
             [\-\-scan\-all] [\-\-trust\-stats] [\-\-fast\-levels] [\-\-unordered]
             [\-\-bloom\-filter COL[:FPP] ...]
-            [\-\-format ndjson|json|parquet] [\-\-limit N] [\-\-summary=json]
+            [\-\-format ndjson|json|csv|parquet] [\-\-limit N] [\-\-summary=json]
             [\-\-explain] [\-\-profile TRACE.json] [\-\-profile\-summary[=text|json]]
   zpq query \-\-query "<sql query>" [\-\-output <out.parquet>]
             [\-\-codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
@@ -22,7 +22,7 @@ usage:
             [\-\-compress\-priority size|speed]
             [\-\-scan\-all] [\-\-trust\-stats]
             [\-\-explain] [\-\-profile TRACE.json] [\-\-profile\-summary[=text|json]]
-            [\-\-format ndjson|json|parquet] [\-\-limit N] [\-\-summary=json]
+            [\-\-format ndjson|json|csv|parquet] [\-\-limit N] [\-\-summary=json]
   zpq schema <file.parquet>
   zpq inspect FILE... [\-\-format json] [\-\-detail]
   zpq conform <file.parquet>
@@ -33,7 +33,14 @@ usage:
   \-\-format       NDJSON rows by default (`jsonl` is an alias); `json`
                  is an array of row objects. `parquet` can stream to
                  stdout, but refuses a terminal. No extension inference.
-                 CSV is reserved and not supported yet (exit 2).
+                 `csv` is RFC 4180 with a header row: NULL an empty
+                 field, "" an empty string, DATE/TIME/TIMESTAMP as ISO
+                 text (`Z` when UTC), an average as <name>__sum and
+                 <name>__count; bytes as below, objects as their JSON.
+                 Bytes print as text when UTF\-8, else {"base64":...};
+                 BSON/GEOMETRY/GEOGRAPHY always {"base64":...}; UUID
+                 8\-4\-4\-4\-12; INTERVAL an object. Non\-UTF\-8 STRING:
+                 exit 1 (docs/binary\-output.md).
   \-\-limit        cap final answer rows, including aggregates and files.
                  SQL LIMIT has the same meaning; do not combine them.
   \-\-summary=json emit a typed summary on stderr after output completes;

@@ -19,6 +19,9 @@ from $ZPQ_HANDOFF_STUDY (default ~/bench/zpq-general/data) and skipped when abse
 
 import argparse
 import base64
+import datetime
+import io
+import re
 import json
 import math
 import os
@@ -496,6 +499,7 @@ class Ctx:
         self.duck = duckdb.connect()
         self.duck.execute(f"SET threads = {args.duck_threads}")
         self.duck.execute(f"SET memory_limit = '{args.duck_memory}'")
+        self.duck.execute("SET TimeZone = 'UTC'")  # its CSV prints a TIMESTAMPTZ in the session zone
         self.n = 0
 
     def tmp(self, stem):
@@ -552,7 +556,7 @@ def run_cell(ctx, s, c, src_path, results, notes):
     try:
         oracle = ctx.oracle(sql)
     except Exception as e:  # the oracle itself cannot run it: nothing to compare
-        for k in ("py-rows", "cli=py", "py-write", "cli-write"):
+        for k in ("py-rows", "cli=py", "cli-csv", "py-write", "cli-write"):
             results[k] = "n/a"
         notes.append(f"oracle failed: {e}")
         return
@@ -612,6 +616,8 @@ def run_cell(ctx, s, c, src_path, results, notes):
     else:
         results["py-write"] = "-"
 
+    check_csv(ctx, sql, oracle, want_names, want_rows, c, f32, results, notes)
+
     out = ctx.tmp(f"{s['name']}-{c['id']}-cli")
     p = ctx.cli("query", "--query", sql, "-o", out)
     if p.returncode != 0:
@@ -624,6 +630,189 @@ def run_cell(ctx, s, c, src_path, results, notes):
         except Mismatch as e:
             results["cli-write"] = "FAIL"
             notes.append(f"cli-write: {e}")
+
+
+def check_csv(ctx, sql, oracle, want_names, want_rows, c, f32, results, notes):
+    """`--format csv` against the oracle's values and against DuckDB's own CSV of the same SQL, both parsed with
+    Python's csv (an unquoted empty field is NULL, `""` the empty string) and typed by the oracle's schema."""
+    p = ctx.cli("query", "--query", sql, "--format", "csv")
+    if p.returncode != 0:
+        results["cli-csv"] = "REFUSED" if "py-rows" in c["refuse"] else "FAIL"
+        notes.append(f"cli-csv: rc {p.returncode}: {p.stderr.decode()[:240]}")
+        return
+    path = os.path.join(ctx.work, f"duck-{ctx.n}.csv")
+    ctx.n += 1
+    try:
+        types = dict(flat_fields(oracle.schema))
+        names, got = csv_rows(p.stdout.decode(), types, "zpq")
+        if names != want_names:
+            raise Mismatch(f"header {names}, expected {want_names}")
+        compare_rows(got, want_rows, names, c["order"], c["approx"], f32)
+        ctx.duck.execute(f"COPY ({sql}) TO '{path}' (FORMAT CSV, HEADER)")
+        duck_names, duck = csv_rows(open(path, encoding="utf-8").read(), types, "duck")
+        if duck_names != names:
+            raise Mismatch(f"header {names}, DuckDB's {duck_names}")
+        try:
+            compare_rows(got, duck, names, c["order"], c["approx"], f32)
+        except Mismatch as e:
+            raise Mismatch(f"against DuckDB's CSV: {e}")
+        results["cli-csv"] = "PASS"
+    except Mismatch as e:
+        results["cli-csv"] = "FAIL"
+        notes.append(f"cli-csv: {e}")
+
+
+def csv_rows(text, types, engine):
+    """Canonical rows of a CSV answer (as `json_value` gives them): an average's `__sum`/`__count` cells joined."""
+    lines = parse_csv(text)
+    if not lines:
+        raise Mismatch("no header row")
+    header, body = lines[0], lines[1:]
+    for r in body:
+        if len(r) != len(header):
+            raise Mismatch(f"row of {len(r)} fields under a header of {len(header)}")
+    names, cols, i = [], list(zip(*body)) if body else [() for _ in header], 0
+    out = []
+    while i < len(header):
+        n = header[i]
+        if n.endswith("__sum") and i + 1 < len(header) and header[i + 1] == n[:-5] + "__count" and n[:-5] in types:
+            names.append(n[:-5])
+            out.append([None if cnt in (None, "0") and sm is None else
+                        {"sum": None if sm is None else Decimal(sm), "count": int(cnt)}
+                        for sm, cnt in zip(cols[i], cols[i + 1])])
+            i += 2
+            continue
+        if n not in types:
+            raise Mismatch(f"column {n} is not in the answer")
+        names.append(n)
+        out.append([csv_value(v, types[n], engine) for v in cols[i]])
+        i += 1
+    return names, [tuple(r) for r in zip(*out)] if out else []
+
+
+def parse_csv(text):
+    """RFC 4180 records, an unquoted empty field as None and a quoted one as "" (Python's csv reads both as "")."""
+    rows, row, i, n = [], [], 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            j, buf = i + 1, []
+            while True:
+                k = text.find('"', j)
+                if k < 0:
+                    raise Mismatch("unterminated quoted field")
+                buf.append(text[j:k])
+                if k + 1 < n and text[k + 1] == '"':
+                    buf.append('"')
+                    j = k + 2
+                    continue
+                i = k + 1
+                break
+            row.append("".join(buf))
+        else:
+            j = i
+            while j < n and text[j] not in ',\r\n':
+                j += 1
+            row.append(text[i:j] if j > i else None)
+            i = j
+        if i < n and text[i] == ',':
+            i += 1
+            if i < n and text[i] not in '\r\n':
+                continue
+            row.append(None)  # a record ending in a comma ends in an empty field
+        if text.startswith("\r\n", i):
+            i += 2
+        elif i < n:
+            if text[i] != "\n":
+                raise Mismatch(f"unexpected {text[i]!r} after a field")
+            i += 1
+        rows.append(row)
+        row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+TS = re.compile(r"(-?\d{4,})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d(?::?\d\d)?)?")
+CLOCK = re.compile(r"(-)?(\d+):(\d\d):(\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d(?::?\d\d)?)?")
+EPOCH = datetime.date(1970, 1, 1)
+
+
+def days_of(y, m, d):
+    # Proleptic Gregorian, any year (date() stops at 1..9999): days since 1970-01-01.
+    y, m = (y - 1, m + 12) if m <= 2 else (y, m)
+    era = y // 400
+    yoe = y - era * 400
+    doy = (153 * (m - 3) + 2) // 5 + d - 1
+    return era * 146097 + yoe * 365 + yoe // 4 - yoe // 100 + doy - 719468
+
+
+def offset_ns(z):
+    if not z or z == "Z":
+        return 0
+    sign = -1 if z[0] == "-" else 1
+    hh, mm = int(z[1:3]), int(z[-2:]) if len(z) > 3 else 0
+    return sign * (hh * 3600 + mm * 60) * 10**9
+
+
+def csv_value(v, t, engine):
+    """Canonical value of one CSV field typed `t`: zpq's form, or DuckDB's where it prints otherwise."""
+    if v is None:
+        return None
+    if isinstance(t, pa.DictionaryType):
+        t = t.value_type
+    if is_uuid(t):
+        return str(uuid.UUID(v))
+    if pa.types.is_boolean(t):
+        if v not in ("true", "false"):
+            raise Mismatch(f"BOOLEAN printed as {v!r}")
+        return v == "true"
+    if pa.types.is_timestamp(t):
+        m = TS.fullmatch(v)
+        if not m:
+            raise Mismatch(f"TIMESTAMP printed as {v!r}")
+        y, mo, d, hh, mi, ss, frac, z = m.groups()
+        secs = days_of(int(y), int(mo), int(d)) * 86400 + int(hh) * 3600 + int(mi) * 60 + int(ss)
+        return secs * 10**9 + int((frac or "").ljust(9, "0")) - offset_ns(z)
+    if pa.types.is_time(t):
+        m = CLOCK.fullmatch(v)
+        if not m:
+            raise Mismatch(f"TIME printed as {v!r}")
+        neg, hh, mi, ss, frac, _ = m.groups()
+        ns = (int(hh) * 3600 + int(mi) * 60 + int(ss)) * 10**9 + int((frac or "").ljust(9, "0"))
+        return -ns if neg else ns
+    if pa.types.is_date32(t):
+        m = re.fullmatch(r"(-?\d{4,})-(\d\d)-(\d\d)", v)
+        if not m:
+            raise Mismatch(f"DATE printed as {v!r}")
+        return days_of(*map(int, m.groups()))
+    if pa.types.is_interval(t):
+        if engine == "zpq":
+            o = json.loads(v)
+            return (o["months"], o["days"], o["millis"] * 10**6)
+        months = days = ns = 0
+        for n, unit in re.findall(r"(-?\d+) (year|month|mon|day)s?", v):
+            months += int(n) * 12 if unit == "year" else int(n) if unit in ("month", "mon") else 0
+            days += int(n) if unit == "day" else 0
+        m = re.search(r"(-)?(\d+):(\d\d):(\d\d)(?:\.(\d{1,9}))?", v)
+        if m:
+            neg, hh, mi, ss, frac = m.groups()
+            ns = (int(hh) * 3600 + int(mi) * 60 + int(ss)) * 10**9 + int((frac or "").ljust(9, "0"))
+            ns = -ns if neg else ns
+        return (months, days, ns)
+    if pa.types.is_floating(t):
+        return float(v)
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t) or pa.types.is_fixed_size_binary(t):
+        if engine == "zpq":
+            if v.startswith('{"base64":'):
+                return base64.b64decode(json.loads(v)["base64"])
+            return v.encode()
+        return re.sub(rb"\\x([0-9A-Fa-f]{2})", lambda m: bytes([int(m.group(1), 16)]), v.encode())
+    if pa.types.is_integer(t) or pa.types.is_decimal(t):
+        try:
+            return Decimal(v)
+        except Exception:
+            raise Mismatch(f"number printed as {v!r}")
+    return v
 
 
 # Type changes a write makes by design (README "CLI output contract"), as (source type, written type).
@@ -741,7 +930,7 @@ def make_copies(ctx, s):
     return duck, arrow
 
 
-COLS = ["py-rows", "cli=py", "py-write", "cli-write", "duck>zpq", "arrow>zpq"]
+COLS = ["py-rows", "cli=py", "cli-csv", "py-write", "cli-write", "duck>zpq", "arrow>zpq"]
 
 
 def main():

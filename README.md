@@ -280,8 +280,17 @@ zpq query data.parquet -o out.parquet \
 
 Every query emits answer rows as NDJSON by default, including scans, projections, scalar aggregates and grouped
 aggregates. Each line is a row object; scalar aggregates produce one row. `jsonl` remains an alias for `ndjson`.
-`--format json` emits an array of row objects, and `--format parquet` emits Parquet. These flags apply to SQL and
-flag queries alike. CSV is deferred: `--format csv` exits 2 with `csv output is not supported yet`.
+`--format json` emits an array of row objects, `--format csv` RFC 4180 CSV, and `--format parquet` Parquet. These
+flags apply to SQL and flag queries alike.
+
+CSV has a header row, then one row per answer row, for scans and aggregates alike. A NULL is an empty, unquoted field
+and an empty string `""`; a field is quoted when it holds a comma, a quote or a line break. BOOLEAN prints `true` /
+`false`, DECIMAL every digit of its scale, DATE `YYYY-MM-DD`, TIME `HH:MM:SS.fff` and TIMESTAMP (INT96 included)
+`YYYY-MM-DD HH:MM:SS.fff`, with the column's own number of fractional digits and a trailing `Z` when it is adjusted to
+UTC. Bytes follow the JSON rules ([docs/binary-output.md](docs/binary-output.md)): text as text, a UUID as
+8-4-4-4-12, and what JSON prints as an object (bytes that are not UTF-8, BSON and GEOMETRY, INTERVAL) as that object's
+JSON text in a quoted field. An average is two columns, `<name>__sum` and `<name>__count`, as a Parquet write holds
+it. `--limit` and SQL `LIMIT` / `OFFSET` count rows, never the header.
 
 ```sh
 zpq query input.parquet --limit 10                          # NDJSON rows
@@ -289,6 +298,7 @@ zpq query input.parquet --aggregate 'count(*) AS n'          # {"n":...}
 zpq query --query "SELECT k, count(*) AS n FROM 'input.parquet' GROUP BY k" --format json
 zpq query input.parquet -o answer.parquet                    # file only; stdout empty
 zpq query input.parquet -o answer.json --format json         # JSON file
+zpq query input.parquet --format csv > rows.csv                # CSV, header row first
 zpq query input.parquet -o - --format parquet > answer.parquet
 zpq query input.parquet --summary=json > rows.ndjson 2> diagnostics.ndjson
 ```

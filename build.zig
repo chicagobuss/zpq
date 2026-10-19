@@ -249,6 +249,14 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run Lambda integration tests");
     integration_step.dependOn(&run_integration_tests.step);
 
+    // Build every release target as it ships and RUN its CLI and Lambda where this host can (tools/release_smoke.sh):
+    // a gate that only compiled them let a static-musl build that crashed on every query through.
+    const release_smoke = b.addSystemCommand(&.{"tools/release_smoke.sh"});
+    release_smoke.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    release_smoke.has_side_effects = true;
+    b.step("release-smoke", "Build every release target and run its CLI and Lambda where this host can")
+        .dependOn(&release_smoke.step);
+
     // probe_simd_decoders: compare zigzag, bit-unpacking, and gather performance
     const probe_simd_decoders = b.addExecutable(.{
         .name = "probe_simd_decoders",

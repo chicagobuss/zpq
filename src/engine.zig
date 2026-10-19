@@ -4761,7 +4761,7 @@ fn groupedColumn(
             .i => |x| if (T != i64)
                 return error.TypeMismatch
             else if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
-                @bitCast(@as(u64, @intCast(x)))
+                expr_agg.u64Lane(x)
             else
                 std.math.cast(i64, x) orelse return error.AggIntTooWide,
             .f => |x| if (T == f64) x else return error.TypeMismatch,

@@ -4694,7 +4694,7 @@ pub const TypedAnswer = struct {
                 };
                 const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
                 l.values[i] = if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
-                    @bitCast(@as(u64, @intCast(x)))
+                    expr_agg.u64Lane(x)
                 else
                     std.math.cast(i64, x) orelse return error.AggIntTooWide;
                 l.defs[i] = 1;

@@ -1246,8 +1246,10 @@ fn statPresentCount(
     if (levels.max_rep > 0) return null;
     if (stats_opt) |stats| {
         if (stats.null_count) |nc| {
-            const present = rg.num_rows - nc;
-            return if (present >= 0) present else null;
+            // A count outside the row group's rows is no count: `num_rows - nc` would answer more rows than there are
+            // (a negative count) or overflow (minInt). The column is decoded instead.
+            if (nc < 0 or nc > rg.num_rows) return null;
+            return rg.num_rows - nc;
         }
     }
     return if (levels.max_def == 0) rg.num_rows else null;
@@ -2289,12 +2291,15 @@ fn emitAvgDecPair(arena: std.mem.Allocator, name: []const u8, st: DecSum, spec: 
 fn u64Bits(call: AggCall, v: ?i128) ?i128 {
     const x = v orelse return null;
     const unsigned = if (call.arg) |a| a == .col_ref and a.col_ref.unsigned_64 else false;
-    if (!unsigned) return x;
-    // The low 64 bits, as the column stores them. `@intCast` to u64 here, widened back, was folded to `x` itself by
-    // the optimizer (ReleaseFast and ReleaseSafe; Debug was right), so a value of 2^63 and up reached the INT64
-    // column unconverted and was refused as too wide. No range assertion either: it hands the optimizer the same fact.
-    const bits: i64 = @bitCast(@as(u64, @truncate(@as(u128, @bitCast(x)))));
-    return bits;
+    return if (unsigned) u64Lane(x) else x;
+}
+
+/// The INT64 lane's form of an unsigned 64-bit value `x` (0 <= x < 2^64): its low 64 bits. By truncation, never an
+/// `@intCast` to u64: that narrowing of an unwrapped `?i128`, bit-cast and widened back, was folded to `x` itself by
+/// the optimizer (ReleaseFast and ReleaseSafe; Debug was right), so a value of 2^63 and up reached an INT64 column
+/// unconverted. No range assertion either: it would hand the optimizer the same fact.
+pub fn u64Lane(x: i128) i64 {
+    return @bitCast(@as(u64, @truncate(@as(u128, @bitCast(x)))));
 }
 
 /// A one-row output column. NULL is a placeholder value under def level 0, so it needs `nullable`.
@@ -6469,6 +6474,76 @@ test "compact variable insertion keeps retained capacity charged after allocatio
             };
         }
     }.run, .{});
+}
+
+test "boundary: an unsigned 64-bit value's INT64 lane is its low bits, as one-row min/max write it" {
+    // Run in ReleaseFast too (see `u64Lane`): the narrowing this replaced answered wrong only when optimized.
+    const U = struct { v: i128, lane: i64 };
+    for ([_]U{
+        .{ .v = 0, .lane = 0 },
+        .{ .v = 1, .lane = 1 },
+        .{ .v = std.math.maxInt(i64), .lane = std.math.maxInt(i64) },
+        .{ .v = @as(i128, std.math.maxInt(i64)) + 1, .lane = std.math.minInt(i64) },
+        .{ .v = std.math.maxInt(u64), .lane = -1 },
+    }) |u| {
+        try std.testing.expectEqual(u.lane, u64Lane(u.v));
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const unsigned_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64, .unsigned_64 = true } };
+        for ([_]AggFunc{ .min, .max }) |func| {
+            const call: AggCall = .{ .func = func, .arg = unsigned_arg, .where = null, .alias = "m", .result = .i64 };
+            var state = Accumulator.init(call);
+            if (func == .min) state.min_i = u.v else state.max_i = u.v;
+            const cols = try finalize(arena.allocator(), call, state);
+            try std.testing.expectEqual(u.lane, cols[0].col.i64.values[0]);
+        }
+    }
+    // A signed column's extremes pass through unchanged, minInt and -1 included.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const signed_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    for ([_]i64{ std.math.minInt(i64), -1, 0, std.math.maxInt(i64) }) |v| {
+        const call: AggCall = .{ .func = .max, .arg = signed_arg, .where = null, .alias = "m", .result = .i64 };
+        var state = Accumulator.init(call);
+        state.max_i = v;
+        const cols = try finalize(arena.allocator(), call, state);
+        try std.testing.expectEqual(v, cols[0].col.i64.values[0]);
+    }
+}
+
+test "boundary: a footer null count outside the row group's rows answers no count from statistics" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var path: schema.StringList = .empty;
+    try path.append(a, "x");
+    const meta = try testI64Meta(a, .empty, 100, .OPTIONAL);
+    const rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 800, .num_rows = 100 };
+    const cm: schema.ColumnMetaData = .{
+        .type = .INT64,
+        .encodings = .empty,
+        .path_in_schema = path,
+        .codec = .UNCOMPRESSED,
+        .num_values = 100,
+        .total_uncompressed_size = 800,
+        .total_compressed_size = 800,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .statistics = null,
+    };
+    const Case = struct { nc: i64, want: ?i64 };
+    for ([_]Case{
+        .{ .nc = 0, .want = 100 },
+        .{ .nc = 100, .want = 0 },
+        .{ .nc = 37, .want = 63 },
+        .{ .nc = 101, .want = null },
+        .{ .nc = -1, .want = null },
+        .{ .nc = std.math.minInt(i64), .want = null },
+        .{ .nc = std.math.maxInt(i64), .want = null },
+    }) |case| {
+        try testing.expectEqual(case.want, statPresentCount(&rg, &cm, .{ .null_count = case.nc }, &meta));
+    }
 }
 
 test "regression: a one-row min/max of a UINT64 column keeps values of 2^63 and up as the column's bits" {

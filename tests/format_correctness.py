@@ -347,6 +347,46 @@ def unsigned_answers(tmp):
             assert sorted(got.to_pylist(), key=json.dumps) == sorted(rows, key=json.dumps), (sql, got.to_pylist())
 
 
+def alias_is_rename(tmp):
+    """`SELECT c AS k` writes and prints the column `SELECT c` does, renamed: the same type, annotation and NULLs. A
+    nested leaf's dotted label is the same leaf, flat and NULL wherever it or its struct is."""
+    src = tmp / 'alias.parquet'
+    t = pa.table({
+        'dt': pa.array([1, None, -1], pa.date32()), 'i8': pa.array([-5, None, 7], pa.int8()),
+        'i16': pa.array([-300, 2, None], pa.int16()), 'u8': pa.array([250, None, 1], pa.uint8()),
+        'u32': pa.array([(1 << 32) - 1, 2, None], pa.uint32()), 'u64': pa.array([(1 << 64) - 1, None, 3], pa.uint64()),
+        'f': pa.array([1.5, None, -2.25], pa.float32()), 'h': pa.array([1.5, None, -2.0], pa.float16()),
+        'b': pa.array([True, None, False], pa.bool_()), 's': pa.array(['x', None, 'z']),
+        'ts': pa.array([1, None, 3], pa.timestamp('ms')), 'tm': pa.array([1000, None, 3], pa.time32('ms')),
+        'd': pa.array([Decimal('1.50'), None, Decimal('-2.25')], pa.decimal128(9, 2)),
+        'n': pa.array([1, 2, 3], pa.int32()),
+        'st': pa.array([{'a': 1, 'b': None}, None, {'a': None, 'b': 'q'}],
+                       pa.struct([pa.field('a', pa.int16()), pa.field('b', pa.string())])),
+    })
+    pq.write_table(t, src)
+    def written(sql):
+        out = tmp / 'alias_out.parquet'
+        out.unlink(missing_ok=True)
+        sql_query(sql, '-o', str(out))
+        return pq.read_table(out)
+    def printed(sql):
+        return [list(json.loads(line).values())[0] for line in sql_query(sql).stdout.splitlines()]
+    for c in [n for n in t.schema.names if n != 'st']:
+        bare, alias = written(f"SELECT {c} FROM '{src}'"), written(f"SELECT {c} AS k FROM '{src}'")
+        fb, fa = bare.schema.field(c), alias.schema.field('k')
+        assert (fa.type, fa.nullable) == (fb.type, fb.nullable), (c, fb, fa)
+        assert alias.column('k').to_pylist() == bare.column(c).to_pylist(), c
+        assert printed(f"SELECT {c} AS k FROM '{src}'") == printed(f"SELECT {c} FROM '{src}'"), c
+    # Nested leaves by label and by alias: the leaf's own type, NULL where the struct is NULL.
+    want = {'st.a': (pa.int16(), [1, None, None]), 'st.b': (pa.string(), [None, None, 'q'])}
+    for leaf, (typ, values) in want.items():
+        for sql, name in ((f"SELECT {leaf} FROM '{src}'", leaf), (f"SELECT {leaf} AS k FROM '{src}'", 'k')):
+            got = written(sql)
+            assert got.schema.names == [name] and got.schema.field(name).type == typ, (sql, got.schema)
+            assert got.schema.field(name).nullable and got.column(name).to_pylist() == values, (sql, got.to_pylist())
+            assert printed(sql) == values, (sql, printed(sql))
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
@@ -355,4 +395,5 @@ with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     mixed_writers(Path(directory))
     answer_values(Path(directory))
     unsigned_answers(Path(directory))
+    alias_is_rename(Path(directory))
 print('Format correctness regressions passed')

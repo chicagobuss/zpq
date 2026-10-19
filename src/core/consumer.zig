@@ -193,7 +193,8 @@ pub fn initOutputAggregator(
 
     for (output_specs, 0..) |spec, i| {
         const phys_type: schema.Type = switch (spec) {
-            .passthrough => |kept_ci| blk: {
+            .passthrough => |pt| blk: {
+                const kept_ci = pt.ci;
                 // The leaf and its path come from the schema, which every chunk's path_in_schema matches (footer
                 // open enforces it), so a file with no row groups still builds its output schema.
                 var leaves: schema.LeafIterator = .init(meta.schema.items);
@@ -306,6 +307,13 @@ pub fn initOutputAggregator(
             .FIXED_LEN_BYTE_ARRAY => .{ .string = .{} },
         };
     }
+    // A named passthrough is its leaf renamed and flat (`OutputCol.Passthrough`).
+    for (output_specs, schemas, paths) |spec, *elem, *path| if (spec == .passthrough) if (spec.passthrough.name) |name| {
+        renameLeaf(elem, name, meta.getColumnLevels(path.*).max_def);
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = name;
+        path.* = one;
+    };
 
     return .{
         .arena = arena,
@@ -457,8 +465,8 @@ pub const ProjectedRG = struct {
         const lossless = try ra.alloc(bool, num_leaves);
         @memset(lossless, false);
         for (output_specs, agg.cols) |spec, cbuf| switch (spec) {
-            .passthrough => |ci| if (cbuf == .i128 and ci < num_leaves) {
-                lossless[ci] = true;
+            .passthrough => |pt| if (cbuf == .i128 and pt.ci < num_leaves) {
+                lossless[pt.ci] = true;
             },
             .computed => {},
         };
@@ -533,29 +541,29 @@ pub const ProjectedRG = struct {
         // Lossless DECIMAL lane: a passthrough decimal's buf is `.i128`. Decode the source chunk to unscaled i128,
         // apply the selection, and append the integers untouched. A computed DECIMAL evaluates to `.i128` below.
         if (agg.cols[i] == .i128 and spec == .passthrough) {
-            const kept_ci = spec.passthrough;
+            const kept_ci = spec.passthrough.ci;
             var late = std.heap.ArenaAllocator.init(gpa);
             defer late.deinit();
             const dcol = self.unscaled[kept_ci] orelse
                 try decodeDecimalI128(late.allocator(), rg, meta, src, kept_ci, decode_options);
             const filtered_dec = try encoder.applySelectionI128(late.allocator(), dcol, &self.sel);
-            const f = filtered_dec;
+            const f = if (spec.passthrough.name != null) try flatLevels(i128, late.allocator(), filtered_dec) else filtered_dec;
             try appendTyped(i128, &agg.cols[i].i128, f.values, f.def_levels, f.max_def, agg.arena);
             return;
         }
 
         var late = std.heap.ArenaAllocator.init(gpa);
         defer late.deinit();
-        const col: filter_eval.Batch.Column = switch (spec) {
-            .passthrough => |kept_ci| if (self.batch_pos_for_col[kept_ci]) |pos|
+        const decoded: filter_eval.Batch.Column = switch (spec) {
+            .passthrough => |pt| if (self.batch_pos_for_col[pt.ci]) |pos|
                 self.batch.cols[pos]
-            else if (kept_ci < self.fetch_set.len and self.fetch_set[kept_ci]) blk: {
+            else if (pt.ci < self.fetch_set.len and self.fetch_set[pt.ci]) blk: {
                 const t0 = nowMonoNs();
                 const la = late.allocator();
                 const decoded = if (agg.keep_codes)
-                    try decodeWriteColumnMaybeCoded(la, rg, meta, src, kept_ci, decode_options, timings.prof)
+                    try decodeWriteColumnMaybeCoded(la, rg, meta, src, pt.ci, decode_options, timings.prof)
                 else
-                    try decodeWriteColumn(la, rg, meta, src, kept_ci, decode_options, timings.prof);
+                    try decodeWriteColumn(la, rg, meta, src, pt.ci, decode_options, timings.prof);
                 const t1 = nowMonoNs();
                 timings.decode_ns += @intCast(t1 - t0);
                 profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
@@ -563,6 +571,7 @@ pub const ProjectedRG = struct {
             } else return error.MissingDecodedColumn,
             .computed => |c| try booleanLane(ra, agg.cols[i], try expr_eval.evalExpr(ra, &self.batch.restrictedTo(&self.sel), self.lookup, c.expr)),
         };
+        const col = if (spec == .passthrough) try namedLevels(late.allocator(), spec.passthrough, decoded) else decoded;
         if (col.nullInfo().max_rep == 0) {
             try appendSelected(&agg.cols[i], col, &self.sel, self.surviving, agg.arena, agg.keep_codes, late.allocator());
             return;
@@ -678,7 +687,7 @@ pub fn appendSliceRows(
     if (surviving == 0) return 0;
     for (output_specs, 0..) |spec, i| {
         var col: filter_eval.Batch.Column = switch (spec) {
-            .passthrough => |ci| batch.cols[lookup[ci] orelse return error.MissingDecodedColumn],
+            .passthrough => |pt| try namedLevels(scratch, pt, batch.cols[lookup[pt.ci] orelse return error.MissingDecodedColumn]),
             .computed => |c| try booleanLane(scratch, agg.cols[i], try expr_eval.evalExpr(scratch, &batch.restrictedTo(sel), lookup, c.expr)),
         };
         // A DECIMAL written losslessly buffers its exact integers.
@@ -691,6 +700,35 @@ pub fn appendSliceRows(
     }
     agg.num_rows += surviving;
     return surviving;
+}
+
+/// A named passthrough's leaf as the flat column it is written as: present (`def == max_def`) or NULL, at one level.
+/// A nested leaf counts its parents' levels too, which a flat leaf has none of. Others pass through as they are.
+fn namedLevels(scratch: std.mem.Allocator, pt: OutputCol.Passthrough, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
+    if (pt.name == null) return col;
+    return switch (col) {
+        inline else => |c, tag| @unionInit(filter_eval.Batch.Column, @tagName(tag), try flatLevels(@TypeOf(c.values[0]), scratch, c)),
+    };
+}
+
+fn flatLevels(comptime T: type, scratch: std.mem.Allocator, c: filter_eval.ColumnT(T)) !filter_eval.ColumnT(T) {
+    if (c.max_def <= 1 or c.max_rep > 0) return c;
+    var out = c;
+    out.max_def = 1;
+    if (c.def_levels) |dl| {
+        const flat = try scratch.alloc(u32, dl.len);
+        for (dl, flat) |d, *f| f.* = @intFromBool(d == c.max_def);
+        out.def_levels = flat;
+    }
+    return out;
+}
+
+/// `elem`, a kept leaf's schema element, as the flat leaf `name` that a renamed passthrough writes: the same type and
+/// annotation, OPTIONAL exactly when the leaf can be NULL at its depth (`max_def`), whatever its own repetition says.
+pub fn renameLeaf(elem: *schema.SchemaElement, name: []const u8, max_def: i32) void {
+    elem.name = name;
+    elem.num_children = 0;
+    elem.repetition_type = if (max_def > 0) .OPTIONAL else .REQUIRED;
 }
 
 /// `col`, a computed output's values, in the BOOLEAN lane when its buffer `buf` is one: expressions evaluate a
@@ -1885,8 +1923,15 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
 /// `computed` evaluates an expression against the (post-filter) decoded
 /// batch and encodes the result as a new flat leaf.
 pub const OutputCol = union(enum) {
-    passthrough: usize,
+    passthrough: Passthrough,
     computed: Computed,
+
+    /// A kept input leaf, written as it is. With `name` (a SELECT alias, or a nested leaf's dotted label) it is the
+    /// same leaf renamed and flat: its type, annotation and NULLs unchanged, its definition levels mapped to 0/1.
+    pub const Passthrough = struct {
+        ci: usize,
+        name: ?[]const u8 = null,
+    };
 
     pub const Computed = struct {
         expr: expr_ast.Expr,
@@ -5542,7 +5587,7 @@ test "initOutputAggregator widens FLOAT16 passthrough to DOUBLE" {
         .num_rows = 1,
     });
 
-    const specs = [_]OutputCol{.{ .passthrough = 0 }};
+    const specs = [_]OutputCol{.{ .passthrough = .{ .ci = 0 } }};
     const agg = try initOutputAggregator(arena, &file_meta, &specs);
     try testing.expect(agg.cols[0] == .f64);
     try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
@@ -6462,7 +6507,7 @@ test "initOutputAggregator rewrites BYTE_ARRAY decimal to FIXED_LEN_BYTE_ARRAY w
         .num_rows = 1,
     });
 
-    const specs = [_]OutputCol{.{ .passthrough = 0 }};
+    const specs = [_]OutputCol{.{ .passthrough = .{ .ci = 0 } }};
     const agg = try initOutputAggregator(arena, &file_meta, &specs);
     try testing.expect(agg.cols[0] == .i128);
     try testing.expectEqual(schema.Type.FIXED_LEN_BYTE_ARRAY, agg.schema_elems[0].type.?);
@@ -6530,7 +6575,7 @@ test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
         .num_rows = 1,
     });
 
-    const specs = [_]OutputCol{.{ .passthrough = 0 }};
+    const specs = [_]OutputCol{.{ .passthrough = .{ .ci = 0 } }};
     const agg = try initOutputAggregator(arena, &file_meta, &specs);
     try testing.expect(agg.cols[0] == .f64);
     try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
@@ -7292,4 +7337,45 @@ test "partition window scratch keeps materialized dictionaries live across reset
 
 test "partition window scratch returns every charge on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPartitionWindowScratch, .{ 32, false });
+}
+
+test "regression: a renamed passthrough is its leaf renamed and flat, NULL where it is NULL at any depth" {
+    const testing = std.testing;
+    var elem: schema.SchemaElement = .{
+        .type = .INT32,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "a",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .converted_type = .DATE,
+        .logical_type = .{ .DATE = .{} },
+    };
+    // A REQUIRED field under an OPTIONAL struct can be NULL: flat, it is OPTIONAL.
+    renameLeaf(&elem, "k", 1);
+    try testing.expectEqualStrings("k", elem.name);
+    try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, elem.repetition_type.?);
+    try testing.expectEqual(schema.Type.INT32, elem.type.?);
+    try testing.expect(elem.logical_type.? == .DATE);
+    renameLeaf(&elem, "k", 0);
+    try testing.expectEqual(schema.FieldRepetitionType.REQUIRED, elem.repetition_type.?);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Levels of an OPTIONAL leaf in an OPTIONAL struct: 0 struct NULL, 1 leaf NULL, 2 present.
+    const vals = [_]i32{ 0, 0, 7, 9 };
+    const defs = [_]u32{ 0, 1, 2, 2 };
+    const col: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &defs, .max_def = 2, .has_nulls = true } };
+    const named = try namedLevels(a, .{ .ci = 0, .name = "k" }, col);
+    try testing.expectEqual(@as(u32, 1), named.i32.max_def);
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1 }, named.i32.def_levels.?);
+    try testing.expectEqualSlices(i32, &vals, named.i32.values);
+    // Unnamed, or already flat, the column is untouched.
+    try testing.expectEqual(@as(u32, 2), (try namedLevels(a, .{ .ci = 0 }, col)).i32.max_def);
+    const flat_defs = [_]u32{ 0, 1, 1, 1 };
+    const flat: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &flat_defs, .max_def = 1, .has_nulls = true } };
+    try testing.expectEqual(flat.i32.def_levels.?.ptr, (try namedLevels(a, .{ .ci = 0, .name = "k" }, flat)).i32.def_levels.?.ptr);
 }

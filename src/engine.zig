@@ -1775,7 +1775,7 @@ fn outputColumnNames(
 ) ![]const []const u8 {
     const names = try arena.alloc([]const u8, specs.len);
     for (specs, names) |spec, *name| name.* = switch (spec) {
-        .passthrough => |ci| try labels.of(ci),
+        .passthrough => |pt| pt.name orelse try labels.of(pt.ci),
         .computed => |c| c.alias,
     };
     return names;
@@ -1885,13 +1885,10 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
                         if (source.logical_type_raw.len > 0 and source.logical_type != null and
                             source.logical_type.? == .UNKNOWN and (source.type == .INT32 or source.type == .FLOAT))
                             return error.UnsupportedLogicalTypeReencode;
-                        try output_specs.append(arena, .{ .computed = .{
-                            .expr = item.expr, .alias = alias,
-                            .source = metadata.leafSchemaElement(meta0, c.col_idx),
-                        } });
-                        any_computed = true;
+                        // A rename: the same leaf, flat under its new name (`consumer.OutputCol.Passthrough`).
+                        try output_specs.append(arena, .{ .passthrough = .{ .ci = c.col_idx, .name = alias } });
                     } else {
-                        try output_specs.append(arena, .{ .passthrough = c.col_idx });
+                        try output_specs.append(arena, .{ .passthrough = .{ .ci = c.col_idx } });
                     }
                     if (c.col_idx < num_leaves) fetch[c.col_idx] = true;
                 },
@@ -1905,7 +1902,7 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
         }
     } else {
         for (kept, 0..) |b, i| if (b) {
-            try output_specs.append(arena, .{ .passthrough = i });
+            try output_specs.append(arena, .{ .passthrough = .{ .ci = i } });
             fetch[i] = true;
         };
     }
@@ -1928,7 +1925,7 @@ fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schem
                 return error.NestedRowOutputNotSupported;
             }
             const elem = metadata.leafSchemaElement(meta0, ci) orelse return error.UnknownColumn;
-            key.* = .{ .spec = .{ .passthrough = ci }, .descending = rk.descending, .unsigned = schema.isUnsignedInt(elem) };
+            key.* = .{ .spec = .{ .passthrough = .{ .ci = ci } }, .descending = rk.descending, .unsigned = schema.isUnsignedInt(elem) };
         } else {
             // Computed as a written column would be; its lane is signed (arithmetic refuses UINT64 operands).
             const alias = try std.fmt.allocPrint(arena, "__order_{d}", .{k});
@@ -1980,7 +1977,8 @@ fn resolveBlooms(
             return error.UnknownColumn;
         };
         switch (proj.output_specs[i]) {
-            .passthrough => |ci| {
+            .passthrough => |pt| {
+                const ci = pt.ci;
                 var it: schema.LeafIterator = .init(meta0.schema.items);
                 const leaf = while (it.next()) |l| {
                     if (l.index == ci) break l;
@@ -2199,7 +2197,8 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     if (need_encoder) {
         for (output_specs) |spec| switch (spec) {
             // From the schema, never a row group: the first input may have none, and the guards with it.
-            .passthrough => |ci| {
+            .passthrough => |pt| {
+                const ci = pt.ci;
                 if (ci >= num_leaves) continue;
                 const leaf = tree0.leaves[ci];
                 if (leaf.type == .INT96)
@@ -2636,10 +2635,14 @@ fn buildSelectSchema(
 
     for (specs) |spec| {
         switch (spec) {
-            .passthrough => |ci| {
-                const elem = metadata.leafSchemaElement(meta, ci) orelse return error.SchemaMismatch;
+            .passthrough => |pt| {
+                const elem = metadata.leafSchemaElement(meta, pt.ci) orelse return error.SchemaMismatch;
                 var copy = elem;
                 copy.num_children = 0;
+                if (pt.name) |name| {
+                    const path = (try metadata.leafPathSegments(arena, meta, pt.ci)) orelse return error.SchemaMismatch;
+                    consumer.renameLeaf(&copy, name, meta.getColumnLevels(path).max_def);
+                }
                 try out.append(arena, copy);
             },
             .computed => |c| try out.append(arena, consumer.computedSchemaElem(c)),
@@ -5881,7 +5884,7 @@ const TopRows = struct {
 /// either: a NaN sorts first there, and writers leave NaN out of the bounds.
 fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, key: RowSortKey) ?SortCell {
     const ci = switch (key.spec) {
-        .passthrough => |ci| ci,
+        .passthrough => |pt| pt.ci,
         .computed => return null,
     };
     if (ci >= rg.columns.items.len) return null;
@@ -5925,7 +5928,8 @@ fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ke
 
 /// Whether every output column and sort key is a bare input column, which no row can fail to produce.
 fn allPassthrough(specs: []const consumer.OutputCol, keys: []const RowSortKey) bool {
-    for (specs) |spec| if (spec == .computed) return false;
+    // A named leaf is renamed and flattened by the general path; the gather copies leaves as they are.
+    for (specs) |spec| if (spec == .computed or spec.passthrough.name != null) return false;
     for (keys) |key| if (key.spec == .computed) return false;
     return true;
 }
@@ -6505,7 +6509,7 @@ fn runAll(comptime Ctx: type, ctxs: []Ctx, comptime func: fn (*Ctx) void) void {
 /// `SortCell` is. `filtered` when the filter reads that column alone, so it can judge each dictionary entry.
 fn dictionaryKey(meta: *const schema.FileMetaData, key: RowSortKey, filter: ?filter_ast.Filter) ?DictKey {
     const ci = switch (key.spec) {
-        .passthrough => |ci| ci,
+        .passthrough => |pt| pt.ci,
         .computed => return null,
     };
     var leaves: schema.LeafIterator = .init(meta.schema.items);
@@ -6542,7 +6546,7 @@ fn gatherEligible(
     for (inputs) |in| if (in.gate != null) return false;
     var leaves: schema.LeafIterator = .init(meta.schema.items);
     while (leaves.next()) |leaf| for (specs) |spec| {
-        if (spec.passthrough == leaf.index and leaf.max_rep > 0) return false;
+        if (spec.passthrough.ci == leaf.index and leaf.max_rep > 0) return false;
     };
     return true;
 }
@@ -6719,7 +6723,7 @@ fn gatherInto(
             .inputs = inputs,
             .metas = metas,
             .group = grp,
-            .ci = spec.passthrough,
+            .ci = spec.passthrough.ci,
             .options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
             .buf = switch (col) {
                 inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
@@ -7079,7 +7083,8 @@ fn runPrintSinkOver(
 
     for (output_specs) |spec| {
         switch (spec) {
-            .passthrough => |ci| {
+            .passthrough => |pt| {
+                const ci = pt.ci;
                 if (ci < list_map_cols.len and list_map_cols[ci]) {
                     Diag.setColumn(args.diag, try std.mem.join(arena, ".", tree0.leaves[ci].path));
                     return error.NestedRowOutputNotSupported;
@@ -7102,10 +7107,12 @@ fn runPrintSinkOver(
     // The row sink has a flat schema and no repetition-level buffer. Keep unsupported
     // leaves out rather than publishing a footer that misdescribes their encoded pages.
     if (format == .parquet) for (output_specs) |spec| switch (spec) {
-        .passthrough => |ci| {
+        .passthrough => |pt| {
+            const ci = pt.ci;
             const leaf = tree0.leaves[ci];
             if (leaf.type == .INT96) return error.INT96ReencodeNotSupported;
-            if (leaf.path.len > 1 or leaf.max_rep > 0) return error.NestedReencodeNotSupported;
+            // A named leaf is written flat under its name; an unnamed nested one would lose its parents.
+            if ((leaf.path.len > 1 and pt.name == null) or leaf.max_rep > 0) return error.NestedReencodeNotSupported;
             // As the full write refuses it: no output width holds a BYTE_ARRAY decimal past 38 digits.
             if (metadata.leafSchemaElement(meta0, ci)) |elem| {
                 if (decimal_mod.kindFromSchema(&elem)) |k| if (k.precision > 38) {
@@ -10289,8 +10296,8 @@ test "rowGroupBest reads the first key a row group can reach, and only what its 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const asc: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = false, .unsigned = false };
-    const desc: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = true, .unsigned = false };
+    const asc: RowSortKey = .{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = false, .unsigned = false };
+    const desc: RowSortKey = .{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = true, .unsigned = false };
     var lo: [8]u8 = undefined;
     var hi: [8]u8 = undefined;
     std.mem.writeInt(i64, &lo, -7, .little);
@@ -10307,7 +10314,7 @@ test "rowGroupBest reads the first key a row group can reach, and only what its 
     uleaf.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
     const all_ones: [8]u8 = @splat(0xff);
     c = try fixtures.StatsColumn.init(a, uleaf, .{ .min_value = &lo, .max_value = &all_ones });
-    const udesc: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = true, .unsigned = true };
+    const udesc: RowSortKey = .{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = true, .unsigned = true };
     try testing.expectEqual(@as(i128, std.math.maxInt(u64)), rowGroupBest(&c.rg, &c.fm, udesc).?.int);
 
     // DECIMAL is not read; a double proves its min ascending, nothing descending, and a NaN bound nothing.
@@ -10338,7 +10345,7 @@ test "rowGroupBest reads the first key a row group can reach, and only what its 
 test "TopRows.cutsOff passes over a row group only when its best first key sorts strictly after the last row kept" {
     const testing = std.testing;
     inline for (.{ false, true }) |descending| {
-        const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = 0 }, .descending = descending, .unsigned = false }};
+        const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = descending, .unsigned = false }};
         var top: TopRows = undefined;
         top.keys = &keys;
         top.h = 2;
@@ -10362,7 +10369,7 @@ test "TopRows.cutsOff passes over a row group only when its best first key sorts
         try testing.expect(top.cutsOff(.null));
     }
     // Once the last row kept is NULL, no group sorts strictly after it.
-    const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = 0 }, .descending = false, .unsigned = false }};
+    const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = false, .unsigned = false }};
     var top: TopRows = undefined;
     top.keys = &keys;
     top.h = 1;
@@ -10378,7 +10385,7 @@ test "TopRows.cutsOff passes over a row group only when its best first key sorts
 test "RankedRG.sooner reads unbounded row groups first in input order, then the most promising, NULL last" {
     const testing = std.testing;
     inline for (.{ false, true }) |descending| {
-        const key: RowSortKey = .{ .spec = .{ .passthrough = 0 }, .descending = descending, .unsigned = false };
+        const key: RowSortKey = .{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = descending, .unsigned = false };
         var rgs = [_]RankedRG{
             .{ .file = 0, .rg = 0, .best = .{ .int = 3 } },
             .{ .file = 0, .rg = 1, .best = null },
@@ -10408,7 +10415,7 @@ test "dictionaryKey takes a bare string first key, judged by the filter only whe
     const meta = try metadata.open(a, try metadata.readFileSlice(topn_gather_inputs[0], a));
     const key = struct {
         fn of(ci: usize) RowSortKey {
-            return .{ .spec = .{ .passthrough = ci }, .descending = false, .unsigned = false };
+            return .{ .spec = .{ .passthrough = .{ .ci = ci } }, .descending = false, .unsigned = false };
         }
     }.of;
     const on_c = try filter_parser.parse(a, "c != ''", &meta, null);
@@ -10423,8 +10430,8 @@ test "dictionaryKey takes a bare string first key, judged by the filter only whe
 
 test "allPassthrough keeps a computed output or key off the bound-first Top-N" {
     const testing = std.testing;
-    const bare = [_]consumer.OutputCol{ .{ .passthrough = 0 }, .{ .passthrough = 3 } };
-    const key: RowSortKey = .{ .spec = .{ .passthrough = 1 }, .descending = false, .unsigned = false };
+    const bare = [_]consumer.OutputCol{ .{ .passthrough = .{ .ci = 0 } }, .{ .passthrough = .{ .ci = 3 } } };
+    const key: RowSortKey = .{ .spec = .{ .passthrough = .{ .ci = 1 } }, .descending = false, .unsigned = false };
     try testing.expect(allPassthrough(&bare, &.{key}));
     const computed: consumer.OutputCol = .{ .computed = .{ .expr = undefined, .alias = "z" } };
     try testing.expect(!allPassthrough(&.{ bare[0], computed }, &.{key}));
@@ -10691,8 +10698,8 @@ test "the serial Top-N keeps one key copy per kept row when every row evicts the
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const meta = try metadata.open(arena_state.allocator(), bytes);
-    const specs = [_]consumer.OutputCol{.{ .passthrough = 0 }};
-    const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = 0 }, .descending = false, .unsigned = false }};
+    const specs = [_]consumer.OutputCol{.{ .passthrough = .{ .ci = 0 } }};
+    const keys = [_]RowSortKey{.{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = false, .unsigned = false }};
     var top: TopRows = try .init(gpa, &meta, &specs, &keys, 1, 64 << 20);
     defer top.deinit();
     var timings: consumer.Timings = .{};

@@ -115,11 +115,12 @@ def gen_empty(path):
 # The matrix. A cell is a SQL text over `{src}` that zpq and DuckDB both run, and optionally the structured request
 # (filter / columns / select / aggregate / group_by) that writes the same table from Python.
 
-def cell(cid, sql, req=None, order=False, passthrough=False, approx=(), units=None, refuse=(), widened=()):
+def cell(cid, sql, req=None, order=False, passthrough=False, approx=(), units=None, refuse=(), widened=(), renames=None):
     """`refuse`: the checks where a refusal is the documented answer (rows of repeated columns). `widened`: computed
-    outputs of a FLOAT16 column, which a write widens to DOUBLE by design (as `WIDENED` allows a passthrough)."""
+    outputs of a FLOAT16 column, which a write widens to DOUBLE by design (as `WIDENED` allows a passthrough).
+    `renames`: output name -> source column for aliases, which must keep the source's type exactly, as a passthrough."""
     return {"id": cid, "sql": sql, "req": req, "order": order, "passthrough": passthrough, "approx": set(approx),
-            "units": units or {}, "refuse": set(refuse), "widened": set(widened)}
+            "units": units or {}, "refuse": set(refuse), "widened": set(widened), "renames": renames or {}}
 
 
 def sources(work):
@@ -235,6 +236,12 @@ def sources(work):
             cell("bool_minmax", "SELECT min(b) AS mn, max(b) AS mx FROM '{src}'",
                  req={"aggregate": "min(b) AS mn, max(b) AS mx"}),
             # BOOLEAN-typed expressions: an aliased column, a CASE over one, as rows, keys and min/max.
+            cell("alias_types", "SELECT id AS k, u8 AS a8, u16 AS a16, u32 AS a32, i8 AS ai8, d38 AS ad, u AS au, "
+                 "tstz AS az, st.a AS sa FROM '{src}' WHERE id < 40",
+                 req={"filter": "id < 40", "select": "id AS k, u8 AS a8, u16 AS a16, u32 AS a32, i8 AS ai8, d38 AS ad, "
+                                                     "u AS au, tstz AS az, st.a AS sa"},
+                 renames={"k": "id", "a8": "u8", "a16": "u16", "a32": "u32", "ai8": "i8", "ad": "d38", "au": "u",
+                          "az": "tstz", "sa": "st.a"}),
             cell("bool_alias", "SELECT id, b AS k FROM '{src}' WHERE id < 40",
                  req={"filter": "id < 40", "select": "id, b AS k"}),
             cell("bool_case", "SELECT id, CASE WHEN id < 20 THEN b END AS k FROM '{src}' WHERE id < 40",
@@ -256,6 +263,12 @@ def sources(work):
                  "count(ls) AS c FROM '{src}'",
                  req={"aggregate": "max(u64) AS mu, min(ts_ns) AS mt, max(h) AS mh, min(d) AS md, max(f32) AS mf, "
                                    "count(ls) AS c"}, widened=("mh",)),
+            # An alias is a rename: each keeps its column's type exactly, NULLs included.
+            cell("alias_types", "SELECT id AS k, i8 AS a8, d AS ad, u64 AS au, h AS ah, t AS at, f32 AS af, ts_ns AS an "
+                 "FROM '{src}' WHERE id < 40",
+                 req={"filter": "id < 40", "select": "id AS k, i8 AS a8, d AS ad, u64 AS au, h AS ah, t AS at, f32 AS af, "
+                                                     "ts_ns AS an"},
+                 renames={"k": "id", "a8": "i8", "ad": "d", "au": "u64", "ah": "h", "at": "t", "af": "f32", "an": "ts_ns"}),
             cell("grp_dict", "SELECT dict, count(*) AS n, sum(i8) AS s FROM '{src}' GROUP BY dict",
                  req={"group_by": "dict", "aggregate": "count(*) AS n, sum(i8) AS s"}),
             cell("topn_ts", "SELECT id, ts_ms_tz FROM '{src}' ORDER BY ts_ms_tz DESC LIMIT 3", order=True,
@@ -515,10 +528,12 @@ def json_rows(objs, names, types, units):
     return rows
 
 
-def zpq_units(path, overrides):
+def zpq_units(path, overrides, renames=None):
     """The unit zpq prints each temporal column in: the file's own, by name; aliases from the cell."""
     units = {n: t.unit for n, t in flat_fields(pq.read_schema(path))
              if pa.types.is_timestamp(t) or pa.types.is_time(t)}
+    # An alias prints in its source column's unit.
+    units.update({a: units[c] for a, c in (renames or {}).items() if c in units})
     units.update(overrides)
     return units
 
@@ -544,7 +559,7 @@ def run_cell(ctx, s, c, src_path, results, notes):
     want_names, want_rows = table_rows(oracle)
     f32 = float_cols(oracle.schema)
     source_schema = pq.read_schema(src_path)
-    units = zpq_units(src_path, c["units"])
+    units = zpq_units(src_path, c["units"], c["renames"])
 
     raw = None
     try:
@@ -617,14 +632,18 @@ WIDENED = {(pa.float16(), pa.float64())}
 SAME_FAMILY = {(("uuid",), ("str",))}
 
 
-def check_types(out_schema, oracle_schema, source_schema, passthrough, widened=frozenset()):
+def check_types(out_schema, oracle_schema, source_schema, passthrough, widened=frozenset(), renames=None):
     """A column passed through keeps the source's type exactly; any other column the oracle's type family."""
     def plain(t):
         return t.value_type if isinstance(t, pa.DictionaryType) else t
     src = dict(flat_fields(source_schema))
     orc = dict(flat_fields(oracle_schema))
     for name, t in flat_fields(out_schema):
-        if passthrough and name in src:
+        if renames and name in renames:
+            s_t = src[renames[name]]
+            if plain(t) != plain(s_t) and (plain(s_t), plain(t)) not in WIDENED:
+                raise Mismatch(f"column {name} (alias of {renames[name]}) written as {t}, source is {s_t}")
+        elif passthrough and name in src:
             if plain(t) != plain(src[name]) and (plain(src[name]), plain(t)) not in WIDENED:
                 raise Mismatch(f"column {name} written as {t}, source is {src[name]}")
         elif name in widened and pa.types.is_float64(t):
@@ -658,7 +677,7 @@ def check_written(ctx, path, oracle, source_schema, want_names, want_rows, c, f3
         raise Mismatch(f"PyArrow cannot read the file: {type(e).__name__}: {e}")
     if by_name and sorted(t.schema.names) == sorted(oracle.schema.names):
         t = t.select(oracle.schema.names)
-    check_types(t.schema, oracle.schema, source_schema, c["passthrough"], c["widened"])
+    check_types(t.schema, oracle.schema, source_schema, c["passthrough"], c["widened"], c["renames"])
     names, rows = table_rows(t)
     if names != want_names:
         raise Mismatch(f"PyArrow columns {names}, expected {want_names}")
@@ -690,7 +709,7 @@ def run_reverse(ctx, s, c, copy_path, label, results, notes):
         return
     _, want_rows = table_rows(oracle)
     try:
-        units = zpq_units(copy_path, c["units"])
+        units = zpq_units(copy_path, c["units"], c["renames"])
         raw, names, objs = ctx.zpq_rows(sql, oracle, units)
         got = ctx.typed(objs, names, oracle, units)
         compare_rows(got, want_rows, names, c["order"], c["approx"], float_cols(oracle.schema))

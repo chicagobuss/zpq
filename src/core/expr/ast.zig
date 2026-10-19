@@ -340,6 +340,30 @@ pub const Expr = union(enum) {
     /// Whether a value of this expression can be NULL, as a written column must declare: a NULL-propagating function
     /// of a nullable operand. Arithmetic refuses nullable operands (the evaluator errors), and `coalesce` is NULL only
     /// where every argument is.
+    /// SQL types this expression BOOLEAN: a BOOLEAN column, or a CASE or coalesce whose every value is one (a NULL
+    /// branch aside). Its lane holds 0/1 like any integer; output prints and writes it as BOOLEAN.
+    pub fn isBoolean(self: Expr) bool {
+        return switch (self) {
+            .literal, .binop => false,
+            .col_ref => |c| c.physical_type == .BOOLEAN,
+            .case_ => |c| blk: {
+                var any = false;
+                for (c.whens) |w| if (w.then) |t| {
+                    if (!t.isBoolean()) break :blk false;
+                    any = true;
+                };
+                if (c.else_) |e| {
+                    if (!e.isBoolean()) break :blk false;
+                    any = true;
+                }
+                break :blk any;
+            },
+            .call => |c| c.func == .coalesce and for (c.args) |a| {
+                if (!a.isBoolean()) break false;
+            } else true,
+        };
+    }
+
     pub fn mayBeNull(self: Expr) bool {
         return switch (self) {
             .literal, .binop => false,
@@ -578,4 +602,30 @@ test "Expr.typeOf composes through binop" {
         .depth = 2,
     } };
     try testing.expectEqual(Type.f64, e.typeOf());
+}
+
+test "Expr.isBoolean: a BOOLEAN column, and CASE or coalesce whose every value is one" {
+    var b: Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BOOLEAN, .expr_type = .i64 } };
+    var i: Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64 } };
+    try std.testing.expect(b.isBoolean());
+    try std.testing.expect(!i.isBoolean());
+    const always: filter_ast.Filter = .{ .and_filter = .{ .children = &.{} } };
+    const only_b = [_]Case.When{.{ .cond = always, .then = &b }};
+    const null_then = [_]Case.When{ .{ .cond = always, .then = null }, .{ .cond = always, .then = &b } };
+    const mixed = [_]Case.When{.{ .cond = always, .then = &i }};
+    const case = struct {
+        fn of(whens: []const Case.When, else_: ?*Expr) Expr {
+            return .{ .case_ = .{ .whens = whens, .else_ = else_, .result_type = .i64, .depth = 1 } };
+        }
+    }.of;
+    try std.testing.expect(case(&only_b, null).isBoolean());
+    try std.testing.expect(case(&null_then, &b).isBoolean());
+    try std.testing.expect(!case(&only_b, &i).isBoolean());
+    try std.testing.expect(!case(&mixed, &b).isBoolean());
+    // All NULL is no BOOLEAN.
+    try std.testing.expect(!case(null_then[0..1], null).isBoolean());
+    const both = [_]*Expr{ &b, &b };
+    const one = [_]*Expr{ &b, &i };
+    try std.testing.expect((Expr{ .call = .{ .func = .coalesce, .args = &both, .result_type = .i64, .depth = 1 } }).isBoolean());
+    try std.testing.expect(!(Expr{ .call = .{ .func = .coalesce, .args = &one, .result_type = .i64, .depth = 1 } }).isBoolean());
 }

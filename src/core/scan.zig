@@ -4001,7 +4001,9 @@ fn prepareAggregate(
                     .dec => .dec,
                 },
                 .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
-                .source = if (keys[k_idx] == .col_ref) leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx) else null,
+                .source = if (keys[k_idx] == .col_ref)
+                    leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx)
+                else if (keys[k_idx].isBoolean()) boolean_answer else null,
             },
             .agg => |a_idx| .{
                 .nullable = agg_calls[a_idx].func != .count,
@@ -4261,9 +4263,22 @@ fn prepareAggregate(
 fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
-    if (arg != .col_ref) return null;
+    if (arg != .col_ref) return if (arg.isBoolean()) boolean_answer else null;
     return leafSchemaElem(meta, arg.col_ref.col_idx);
 }
+
+/// The type a computed BOOLEAN answer column (a key, min or max of a BOOLEAN expression) passes through as, as a bare
+/// BOOLEAN column's does: printed true/false and written BOOLEAN, though its lane holds 0/1.
+const boolean_answer: schema.SchemaElement = .{
+    .type = .BOOLEAN,
+    .type_length = null,
+    .repetition_type = .OPTIONAL,
+    .name = "",
+    .num_children = null,
+    .scale = null,
+    .precision = null,
+    .field_id = null,
+};
 
 const MergeGroupRef = struct {
     table: u32,

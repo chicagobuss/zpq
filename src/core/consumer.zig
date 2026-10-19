@@ -289,7 +289,7 @@ pub fn initOutputAggregator(
                     cols[i] = .{ .i128 = .{} };
                     continue;
                 }
-                break :blk expr_type.toParquet();
+                break :blk schemas[i].type.?;
             },
         };
 
@@ -561,7 +561,7 @@ pub const ProjectedRG = struct {
                 profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
                 break :blk decoded;
             } else return error.MissingDecodedColumn,
-            .computed => |c| try expr_eval.evalExpr(ra, &self.batch.restrictedTo(&self.sel), self.lookup, c.expr),
+            .computed => |c| try booleanLane(ra, agg.cols[i], try expr_eval.evalExpr(ra, &self.batch.restrictedTo(&self.sel), self.lookup, c.expr)),
         };
         if (col.nullInfo().max_rep == 0) {
             try appendSelected(&agg.cols[i], col, &self.sel, self.surviving, agg.arena, agg.keep_codes, late.allocator());
@@ -679,7 +679,7 @@ pub fn appendSliceRows(
     for (output_specs, 0..) |spec, i| {
         var col: filter_eval.Batch.Column = switch (spec) {
             .passthrough => |ci| batch.cols[lookup[ci] orelse return error.MissingDecodedColumn],
-            .computed => |c| try expr_eval.evalExpr(scratch, &batch.restrictedTo(sel), lookup, c.expr),
+            .computed => |c| try booleanLane(scratch, agg.cols[i], try expr_eval.evalExpr(scratch, &batch.restrictedTo(sel), lookup, c.expr)),
         };
         // A DECIMAL written losslessly buffers its exact integers.
         if (agg.cols[i] == .i128 and col == .f64) {
@@ -691,6 +691,16 @@ pub fn appendSliceRows(
     }
     agg.num_rows += surviving;
     return surviving;
+}
+
+/// `col`, a computed output's values, in the BOOLEAN lane when its buffer `buf` is one: expressions evaluate a
+/// BOOLEAN as 0/1 in the integer lane.
+fn booleanLane(scratch: std.mem.Allocator, buf: OutputAggregator.ColumnBuf, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
+    if (buf != .boolean or col != .i64) return col;
+    const c = col.i64;
+    const values = try scratch.alloc(bool, c.values.len);
+    for (c.values, values) |v, *o| o.* = v != 0;
+    return .{ .boolean = .{ .values = values, .def_levels = c.def_levels, .max_def = c.max_def, .has_nulls = c.has_nulls } };
 }
 
 /// `col`, a passthrough output's rows as `SliceReader.next` reads them, in the lane of the output buffer `buf`, as
@@ -1841,8 +1851,8 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
         decimalElem(&elem, c.expr.decSpec().?);
         return elem;
     }
-    if (c.source) |src| if (c.expr == .col_ref and !schema.isFloat16(src) and
-        (src.type == .BYTE_ARRAY or src.type == .FIXED_LEN_BYTE_ARRAY or src.type == .INT64 or src.type == .DOUBLE)) {
+    if (c.source) |src| if (c.expr == .col_ref and !schema.isFloat16(src) and (src.type == .BYTE_ARRAY or
+        src.type == .FIXED_LEN_BYTE_ARRAY or src.type == .INT64 or src.type == .DOUBLE or src.type == .BOOLEAN)) {
         var renamed = src;
         renamed.name = c.alias;
         renamed.num_children = 0;
@@ -1852,7 +1862,8 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
     // are printed and written as the unsigned values they are.
     const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;
     return .{
-        .type = expr_type.toParquet(),
+        // A BOOLEAN expression's 0/1 lane is written and printed as the BOOLEAN SQL types it.
+        .type = if (c.expr.isBoolean()) .BOOLEAN else expr_type.toParquet(),
         .type_length = null,
         .repetition_type = repetition,
         .name = c.alias,
@@ -5960,6 +5971,44 @@ test "fast-levels: all-present pages on both sides of a null page" {
     try testing.expectEqualSlices(u32, off.def_levels.?, on.def_levels.?);
     try testing.expectEqualSlices(i32, &present, on.values[per_page * 2 ..]);
     for (on.def_levels.?[per_page * 2 ..]) |d| try testing.expectEqual(@as(u32, 1), d);
+}
+
+test "regression: a BOOLEAN expression is a BOOLEAN output leaf and buffer, its 0/1 lane stored as booleans" {
+    const testing = std.testing;
+    var b: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BOOLEAN, .expr_type = .i64 } };
+    var src: schema.SchemaElement = .{
+        .type = .BOOLEAN,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "b",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    // An aliased reference keeps its column's leaf, nullable as the column is.
+    const aliased = computedSchemaElem(.{ .expr = b, .alias = "k", .source = src });
+    try testing.expectEqual(schema.Type.BOOLEAN, aliased.type.?);
+    try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, aliased.repetition_type.?);
+    try testing.expectEqualStrings("k", aliased.name);
+    src.type = .INT32;
+    const always: filter_ast.Filter = .{ .and_filter = .{ .children = &.{} } };
+    const whens = [_]expr_ast.Case.When{.{ .cond = always, .then = &b }};
+    const case: expr_ast.Expr = .{ .case_ = .{ .whens = &whens, .else_ = null, .result_type = .i64, .depth = 1 } };
+    const computed = computedSchemaElem(.{ .expr = case, .alias = "k" });
+    try testing.expectEqual(schema.Type.BOOLEAN, computed.type.?);
+    try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, computed.repetition_type.?);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const vals = [_]i64{ 1, 0, 0 };
+    const defs = [_]u32{ 1, 1, 0 };
+    const col: filter_eval.Batch.Column = .{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
+    const lane = try booleanLane(arena.allocator(), .{ .boolean = .{} }, col);
+    try testing.expectEqualSlices(bool, &.{ true, false, false }, lane.boolean.values);
+    try testing.expectEqualSlices(u32, &defs, lane.boolean.def_levels.?);
+    // Any other buffer takes the lane as it is.
+    try testing.expect((try booleanLane(arena.allocator(), .{ .i64 = .{} }, col)) == .i64);
 }
 
 test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 reference" {

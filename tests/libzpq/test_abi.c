@@ -140,6 +140,19 @@ static void test_round_trip(zpq_ctx *c) {
     CHECK(rc == ZPQ_OK && strstr(out, "\"agg\":[{\"b\":\"s0\",\"n\":1},{\"b\":\"s1\",\"n\":1},{\"b\":\"s2\",\"n\":1}]"),
           "rc %d: %s", rc, out);
     zpq_free(out);
+
+    /* A BOOLEAN key and min/max print true/false, as its rows do. */
+    rc = run(c, "{\"inputs\":[\"ci/fixtures/parquet/nested_key_shape.parquet\"],\"aggregate\":\"count(*) AS n\","
+                "\"group_by\":\"flag\"}",
+             &out);
+    CHECK(rc == ZPQ_OK && strstr(out, "{\"flag\":true,\"n\":30}") && strstr(out, "{\"flag\":false,\"n\":30}"),
+          "rc %d: %s", rc, out);
+    zpq_free(out);
+    rc = run(c, "{\"inputs\":[\"ci/fixtures/parquet/nested_key_shape.parquet\"],"
+                "\"aggregate\":\"min(flag) AS lo, max(flag) AS hi\"}",
+             &out);
+    CHECK(rc == ZPQ_OK && strstr(out, "\"agg\":{\"lo\":false,\"hi\":true}"), "rc %d: %s", rc, out);
+    zpq_free(out);
 }
 
 static void test_write(zpq_ctx *c) {

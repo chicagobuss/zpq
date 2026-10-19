@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Format regressions with independent readers; invoked by cli_smoke.sh."""
 import base64
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -270,10 +271,63 @@ def mixed_writers(tmp):
         assert p.returncode != 0 and 'schema mismatch' in p.stderr, (first.name, second.name, p.stderr)
 
 
+def answer_values(tmp):
+    """A GROUP BY key and min/max of a column print as its rows print, per type: the answer's lane (BOOLEAN's 0/1,
+    an unsigned value's bits, DECIMAL's unscaled integer, a UUID's bytes) is never what reaches the JSON."""
+    src = tmp / 'answer_types.parquet'
+    duckdb.connect().execute(f"""COPY (SELECT * FROM (VALUES
+      (true, DATE '2020-01-02', TIMESTAMP '2020-01-02 03:04:05.123456', TIMESTAMP_NS '2020-01-02 03:04:05.123456789',
+       TIME '01:02:03.5', 12.34::DECIMAL(9,2), 123456789012.34::DECIMAL(18,2), 1234567890123456789012.345::DECIMAL(38,3),
+       'b6d5f6a0-0000-4000-8000-000000000001'::UUID, 250::UTINYINT, 4000000000::UINTEGER, 18446744073709551615::UBIGINT,
+       -5::TINYINT, 1.5::FLOAT, 'x', '\\xFF\\x00'::BLOB, INTERVAL 3 DAY),
+      (false, DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59', TIMESTAMP_NS '1970-01-01 00:00:00.000000001',
+       TIME '23:59:59', -0.05::DECIMAL(9,2), -1.00::DECIMAL(18,2), -0.001::DECIMAL(38,3),
+       '00000000-0000-4000-8000-000000000002'::UUID, 1::UTINYINT, 3::UINTEGER, 9223372036854775808::UBIGINT,
+       5::TINYINT, -1.5::FLOAT, 'y', 'ab'::BLOB, INTERVAL 1 MONTH),
+      (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+    ) t(b, dt, ts, tsns, tm, d9, d18, d38, u, u8, u32, u64, i8, f, s, bl, iv)) TO '{src}' (FORMAT PARQUET)""")
+    flba = tmp / 'answer_flba.parquet'
+    pq.write_table(pa.table({'flba': pa.array([Decimal('1.50'), None, Decimal('-2.25')], pa.decimal128(25, 2))}),
+                   flba, store_decimal_as_integer=False)
+    for path, names in ((src, pq.read_schema(src).names), (flba, ['flba'])):
+        for c in names:
+            texts = lambda sql: sorted(json.dumps(v) for line in sql_query(sql).stdout.splitlines()
+                                       for v in json.loads(line).values())
+            rows = texts(f"SELECT {c} FROM '{path}'")
+            keys = texts(f"SELECT {c} FROM '{path}' GROUP BY {c}")
+            assert keys == rows, (c, keys, rows)
+            extremes = texts(f"SELECT min({c}) AS mn, max({c}) AS mx FROM '{path}'")
+            assert extremes == [v for v in rows if v != 'null'], (c, extremes, rows)
+    # A BOOLEAN-typed expression (an aliased column, a CASE over one) is BOOLEAN as rows, keys and min/max, printed
+    # true/false and written BOOLEAN; its 0/1 lane never shows.
+    # (An aliased column's rows are taken where it is present: a NULL in a renamed column is refused as yet.)
+    for e, where in (('b', ' WHERE b IS NOT NULL'), ('CASE WHEN i8 > 0 THEN b END', ''),
+                     ('CASE WHEN i8 > 0 THEN b WHEN i8 < 0 THEN b END', '')):
+        values = lambda sql: [v for line in sql_query(sql).stdout.splitlines() for v in json.loads(line).values()]
+        rows = values(f"SELECT {e} AS k FROM '{src}'{where}")
+        assert all(v is None or type(v) is bool for v in rows) and any(v is not None for v in rows), (e, rows)
+        keys = values(f"SELECT {e} AS k FROM '{src}' GROUP BY k")
+        assert set(map(json.dumps, rows)) <= set(map(json.dumps, keys)) and all(
+            v is None or type(v) is bool for v in keys), (e, keys, rows)
+        extremes = values(f"SELECT min({e}) AS mn, max({e}) AS mx FROM '{src}'")
+        assert all(type(v) is bool for v in extremes), (e, extremes)
+        for sql in (f"SELECT {e} AS k FROM '{src}'{where}", f"SELECT {e} AS k, count(*) AS n FROM '{src}' GROUP BY k",
+                    f"SELECT max({e}) AS k FROM '{src}'"):
+            out = tmp / 'bool_expr.parquet'
+            out.unlink(missing_ok=True)
+            sql_query(sql, '-o', str(out))
+            got = pq.read_table(out)
+            assert got.schema.field('k').type == pa.bool_(), (sql, got.schema)
+            printed = [json.loads(line)['k'] for line in sql_query(sql).stdout.splitlines()]
+            assert sorted(map(json.dumps, got.column('k').to_pylist())) == sorted(
+                map(json.dumps, printed)), (sql, got.to_pylist())
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
     repeated_fields(Path(directory))
     encrypted_inputs(Path(directory))
     mixed_writers(Path(directory))
+    answer_values(Path(directory))
 print('Format correctness regressions passed')

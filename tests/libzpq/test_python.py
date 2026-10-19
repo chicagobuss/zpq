@@ -55,6 +55,29 @@ def test_binding(z):
         check(back["agg"] == {"s": 90}, f"read back {back}")
 
 
+def test_boolean_answers(z):
+    # A BOOLEAN key and min/max of a BOOLEAN print true/false in every JSON surface, as its rows do.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "b.parquet")
+        pq.write_table(pa.table({"b": pa.array([True, False, True, None], pa.bool_())}), src)
+        rows = z.query_raw(f"SELECT b, count(*) AS n FROM '{src}' GROUP BY b")
+        check(rows == '{"b":true,"n":2}\n{"b":false,"n":1}\n{"b":null,"n":1}\n', f"bool key rows {rows!r}")
+        mm = z.query_raw(f"SELECT min(b) AS mn, max(b) AS mx FROM '{src}'")
+        check(mm == '{"mn":false,"mx":true}\n', f"bool min/max rows {mm!r}")
+        g = z.run({"inputs": [src], "group_by": "b", "aggregate": "count(*) AS n"})
+        check(g["agg"] == [{"b": True, "n": 2}, {"b": False, "n": 1}, {"b": None, "n": 1}]
+              and all(type(r["b"]) is not int for r in g["agg"]), f"bool key agg {g['agg']}")
+        a = z.run({"inputs": [src], "aggregate": "min(b) AS mn, max(b) AS mx"})
+        check(a["agg"] == {"mn": False, "mx": True} and type(a["agg"]["mn"]) is bool, f"bool min/max agg {a['agg']}")
+        # A BOOLEAN-typed expression too: a CASE over the column.
+        e = z.run({"inputs": [src], "aggregate": "max(CASE WHEN b IS NOT NULL THEN b END) AS mx"})
+        check(e["agg"] == {"mx": True} and type(e["agg"]["mx"]) is bool, f"bool expression agg {e['agg']}")
+        r = z.query_raw(f"SELECT CASE WHEN b IS NOT NULL THEN b END AS k FROM '{src}'")
+        check(r == '{"k":true}\n{"k":false}\n{"k":true}\n{"k":null}\n', f"bool expression rows {r!r}")
+
+
 def test_threads(z):
     # Small budgets, so the calls run at once within the context's ceiling.
     reqs = [
@@ -309,6 +332,7 @@ def main():
     test_options_and_budget()
     with zpq.Zpq(max_memory="512MB") as z:
         test_binding(z)
+        test_boolean_answers(z)
         test_threads(z)
         test_service(z)
         test_bad_lengths(z)

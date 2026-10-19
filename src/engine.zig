@@ -1993,7 +1993,7 @@ fn resolveBlooms(
                 }
                 leaves[ci] = spec.fpp;
             },
-            .computed => |c| if (c.expr.typeOf().toParquet() == .BOOLEAN) {
+            .computed => |c| if (c.expr.isBoolean()) {
                 Diag.setColumn(args.diag, spec.column);
                 return error.BloomFilterUnsupportedColumn;
             },
@@ -5239,9 +5239,11 @@ pub fn kindAt(kinds: []const TextKind, ci: usize) TextKind {
     return if (ci < kinds.len) kinds[ci] else .utf8;
 }
 
-/// `v` as `writeAggValueJson` writes it, its bytes in the form `kind` gives them.
+/// `v` as `writeAggValueJson` writes it, its bytes in the form `kind` gives them and a BOOLEAN's 0/1 as false/true,
+/// as its rows print.
 pub fn writeTypedAggValueJson(writer: anytype, v: scan.AggValue, kind: TextKind) !void {
     if (v == .s) return writeBytesJson(writer, v.s, kind);
+    if (kind == .boolean and v == .i) return writer.writeAll(if (v.i != 0) "true" else "false");
     return writeAggValueJson(writer, v);
 }
 
@@ -5330,7 +5332,8 @@ fn escapeJson(writer: anytype, s: []const u8, comptime strict: bool) !void {
 }
 
 /// How a byte value is written as JSON text, from its column's annotation (`docs/binary-output.md`). Every form is
-/// lossless and no two values print alike: a string is never equal to an object.
+/// lossless and no two values print alike: a string is never equal to an object. An answer column also marks a
+/// BOOLEAN source, whose lane holds 0/1.
 pub const TextKind = enum {
     /// STRING, ENUM or JSON: the text. A value that is not UTF-8 is an invalid file, not a value to print.
     utf8,
@@ -5342,6 +5345,8 @@ pub const TextKind = enum {
     uuid,
     /// The legacy FLBA(12) INTERVAL as `{"months":m,"days":d,"millis":ms}`.
     interval,
+    /// A BOOLEAN answer column (a key, min or max): `true` / `false`. It holds no bytes.
+    boolean,
 
     /// An annotation this reader does not interpret falls back to the legacy one beside it, as the format allows.
     pub fn of(elem: schema.SchemaElement) TextKind {
@@ -5366,7 +5371,8 @@ pub const TextKind = enum {
 
     /// A value whose source column is known; a computed string (no source) is text.
     pub fn ofSource(source: ?schema.SchemaElement) TextKind {
-        return if (source) |src| of(src) else .utf8;
+        const src = source orelse return .utf8;
+        return if (src.type == .BOOLEAN) .boolean else of(src);
     }
 };
 
@@ -5398,6 +5404,8 @@ pub fn writeBytesJson(writer: anytype, value: []const u8, kind: TextKind) !void 
             } else try writeBase64Json(writer, value);
         },
         .base64 => try writeBase64Json(writer, value),
+        // A BOOLEAN column holds no bytes.
+        .boolean => return error.InvalidBinaryValue,
         .uuid => {
             if (value.len != 16) return error.InvalidBinaryValue;
             const hex = "0123456789abcdef";
@@ -7683,6 +7691,45 @@ test "TextKind: text annotations print as text, UUID and INTERVAL by type, blobs
     elem.logical_type = .{ .UUID = .{} };
     try std.testing.expectEqual(TextKind.uuid, TextKind.of(elem));
     try std.testing.expectEqual(TextKind.utf8, TextKind.ofSource(null));
+}
+
+test "regression: a BOOLEAN answer column (key, min, max) prints true/false as its rows do, not its 0/1 lane" {
+    var elem: schema.SchemaElement = .{
+        .type = .BOOLEAN,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "b",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    try std.testing.expectEqual(TextKind.boolean, TextKind.ofSource(elem));
+    elem.type = .INT32;
+    try std.testing.expectEqual(TextKind.bytes, TextKind.ofSource(elem));
+
+    const cols = [_][]const u8{ "b", "n" };
+    const r0 = [_]scan.AggValue{ .{ .i = 1 }, .{ .i = 2 } };
+    const r1 = [_]scan.AggValue{ .{ .i = 0 }, .{ .i = 1 } };
+    const r2 = [_]scan.AggValue{ .null_val, .{ .i = 0 } };
+    const rows = [_][]const scan.AggValue{ &r0, &r1, &r2 };
+    const kinds = [_]TextKind{ .boolean, .utf8 };
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeAggregateText(&w, .{ .group_cols = &cols, .group_rows = &rows }, &kinds, rows.len, .jsonl);
+    try std.testing.expectEqualStrings(
+        \\{"b":true,"n":2}
+        \\{"b":false,"n":1}
+        \\{"b":null,"n":0}
+        \\
+    , w.buffered());
+    // An integer column keeps its integers.
+    w = .fixed(&buf);
+    try writeTypedAggValueJson(&w, .{ .i = 1 }, .bytes);
+    try std.testing.expectEqualStrings("1", w.buffered());
+    // No BOOLEAN value is bytes.
+    w = .fixed(&buf);
+    try std.testing.expectError(error.InvalidBinaryValue, writeBytesJson(&w, "x", .boolean));
 }
 
 test "S3 range plan: GROUP BY with no aggregates plans like the scan" {

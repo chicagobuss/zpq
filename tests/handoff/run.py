@@ -233,6 +233,16 @@ def sources(work):
                  req={"filter": "id < 4", "columns": ["id", "st"]}),
             cell("bool_minmax", "SELECT min(b) AS mn, max(b) AS mx FROM '{src}'",
                  req={"aggregate": "min(b) AS mn, max(b) AS mx"}),
+            # BOOLEAN-typed expressions: an aliased column, a CASE over one, as rows, keys and min/max.
+            cell("bool_alias", "SELECT id, b AS k FROM '{src}' WHERE id < 40",
+                 req={"filter": "id < 40", "select": "id, b AS k"}),
+            cell("bool_case", "SELECT id, CASE WHEN id < 20 THEN b END AS k FROM '{src}' WHERE id < 40",
+                 req={"filter": "id < 40", "select": "id, CASE WHEN id < 20 THEN b END AS k"}),
+            cell("bool_case_key", "SELECT CASE WHEN id < 500 THEN b END AS k, count(*) AS n FROM '{src}' GROUP BY k"),
+            cell("bool_case_minmax", "SELECT min(CASE WHEN id < 500 THEN b END) AS mn, "
+                 "max(CASE WHEN id > 500 THEN b END) AS mx, max(CASE WHEN id < 0 THEN b END) AS none FROM '{src}'",
+                 req={"aggregate": "min(CASE WHEN id < 500 THEN b END) AS mn, max(CASE WHEN id > 500 THEN b END) AS mx, "
+                                   "max(CASE WHEN id < 0 THEN b END) AS none"}),
             cell("copy", "SELECT * FROM '{src}'", req={}, passthrough=True, refuse=ROWS),
         ], gen=gen_duck_types)
     src("gen_arrow_types", os.path.join(work, "gen_arrow_types.parquet"),

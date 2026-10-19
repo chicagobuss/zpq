@@ -601,6 +601,11 @@ pub fn writeText(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     try w.print("  rss peak {d:.0} MB ({s})", .{ mb(s.peak_rss), rssLabel(p.peak_rss_scope) });
     if (p.start_rss > 0) try w.print(", {d:.0} MB at start", .{mb(p.start_rss)});
     try w.writeByte('\n');
+    if (p.ledger_limit > 0) {
+        try w.print("  memory ledger peak {d:.0} MB of {d:.0} MB (--max-memory)\n", .{
+            mb(p.ledger_peak), mb(p.ledger_limit),
+        });
+    }
     const m = p.meta;
     const lambda = if (m.on_lambda) ", on Lambda" else "";
     try w.print("  {s} {s} {s}, {d} cpus, parallelism {d}{s}\n", .{
@@ -767,6 +772,8 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
         try cpu.int("peak_rss", s.peak_rss);
         try cpu.int("start_rss", p.start_rss);
         try cpu.str("peak_rss_scope", @tagName(p.peak_rss_scope));
+        try cpu.int("ledger_peak", p.ledger_peak);
+        try cpu.int("ledger_limit", p.ledger_limit);
         try cpu.end();
     }
     try o.key("meta");

@@ -89,8 +89,10 @@ and `max_idle_ms`.
 described in [profiling.md](profiling.md), as one object: `total_ns`, `idle_ns`, `threads`, `events`, `dropped`,
 `event_cap`; `cpu` (this run's `user_ns`, `sys_ns`, `minor_faults`, `major_faults`; `peak_rss`, this invocation's peak
 resident memory, `start_rss`, the resident memory when it began, and `peak_rss_scope`, how it was measured: `run`,
-`sampled` or `process`, see [profiling.md](profiling.md)); `meta` (`zpq_version`, `build_mode`, `target`, `cpu_count`,
-`parallelism`, `memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`, `query`, the request cut to 512 bytes);
+`sampled` or `process`, see [profiling.md](profiling.md); `ledger_peak` and `ledger_limit`, the most the query's memory
+ledger held at once and its limit, `--max-memory`, both 0 when no ledger ran); `meta` (`zpq_version`, `build_mode`,
+`target`, `cpu_count`, `parallelism`, `memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`, `query`, the
+request cut to 512 bytes);
 `phases` (per phase: `wall_ns`, `busy_ns`, `share_ns`, `alone_ns`, `spans`); `chunks`, `chunk_ns` and `top_chunks` (the
 ten costliest column chunks: `file`, `rg`, `column`, `codec`, `encoding`, `bytes_in`, `bytes_out`, `ns`,
 `decompress_ns`, `pages`); `io` (`gets`, `puts`, `bytes`, `ttfb_ns`, `body_ns`, `acquire_ns`, `reused`, `retries`,

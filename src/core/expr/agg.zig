@@ -5023,7 +5023,7 @@ pub const WinnerCharge = struct {
     pub fn settle(self: *WinnerCharge, keep: usize) void {
         const l = self.ledger orelse return;
         const held = self.held.swap(keep, .monotonic);
-        if (held > keep) l.release(held - keep) else _ = l.used.fetchAdd(keep - held, .monotonic);
+        if (held > keep) l.release(held - keep) else l.force(keep - held);
     }
 };
 

@@ -541,6 +541,7 @@ fn executeAggregateOver(
     var t: Timings = .{};
     // The query's ledger: what the scan's tables, decode memory, merge and answer hold together stays under it.
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    defer if (args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
 
     // 1. Open all inputs — local mmap or s3 parallel range-fetch.
     //    This step already does column pruning for s3 (parses the
@@ -2405,6 +2406,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             // The write's ledger: the producers' decode and encode memory, the row groups waiting for the writer and
             // its slices hold no more than the budget together, past each producer's first huge page.
             var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+            defer if (args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
             var memory: core_memory.Charged = .{ .child = ctx.gpa, .budget = &ledger };
             var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &ledger };
             var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };

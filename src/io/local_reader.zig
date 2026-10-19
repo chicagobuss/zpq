@@ -687,7 +687,7 @@ pub const Reader = struct {
         if (self.cfg.ledger) |l| {
             if (l.drawExact(u.charge) == null) {
                 if (out != 0) return false;
-                _ = l.used.fetchAdd(u.charge, .monotonic);
+                l.force(u.charge);
             }
             _ = self.ledger_held.fetchAdd(u.charge, .monotonic);
         }

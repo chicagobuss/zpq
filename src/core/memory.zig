@@ -48,6 +48,8 @@ pub const SharedBudget = struct {
     used: std.atomic.Value(usize) align(16) = .init(0),
     limit: usize,
     block: usize = 64 * 1024,
+    /// The most `used` has been: what the query held at once by the ledger's count (`--profile-summary`).
+    peak: std.atomic.Value(usize) = .init(0),
 
     /// Blocks keep the shared counter off the per-group path: the counter is cheap, but many workers invalidating one
     /// cache line is not. The cap stops a barely-grouping worker from stranding quota an active table needs.
@@ -79,9 +81,21 @@ pub const SharedBudget = struct {
     pub fn drawExact(self: *SharedBudget, need: usize) ?usize {
         var cur = self.used.load(.monotonic);
         while (cur + need <= self.limit) {
-            cur = self.used.cmpxchgWeak(cur, cur + need, .monotonic, .monotonic) orelse return need;
+            cur = self.used.cmpxchgWeak(cur, cur + need, .monotonic, .monotonic) orelse {
+                self.notePeak(cur + need);
+                return need;
+            };
         }
         return null;
+    }
+
+    /// Hold `n` whatever the limit: for what is already resident, or must go ahead alone for the query to progress.
+    pub fn force(self: *SharedBudget, n: usize) void {
+        self.notePeak(self.used.fetchAdd(n, .monotonic) + n);
+    }
+
+    fn notePeak(self: *SharedBudget, now: usize) void {
+        if (now > self.peak.load(.monotonic)) _ = self.peak.fetchMax(now, .monotonic);
     }
 
     pub fn draw(self: *SharedBudget, need: usize) ?usize {
@@ -93,6 +107,7 @@ pub const SharedBudget = struct {
                     cur = actual;
                     continue;
                 }
+                self.notePeak(cur + want);
                 return want;
             }
         }

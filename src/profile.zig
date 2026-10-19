@@ -564,6 +564,9 @@ pub const Profiler = struct {
     rss_reset: bool = false,
     /// RSS when the run started: a warm process holds memory from earlier runs, which the peak includes.
     start_rss: u64 = 0,
+    /// The most a query's memory ledger held at once, and its limit (`--max-memory`): zero when no ledger ran.
+    ledger_peak: u64 = 0,
+    ledger_limit: u64 = 0,
     sampler: ?std.Thread = null,
     /// Nonzero once `finish` runs; the sampler sleeps on it as a futex so finishing never waits out a period.
     stop: std.atomic.Value(u32) = .init(0),
@@ -650,6 +653,12 @@ pub const Profiler = struct {
     }
 
     /// Display names for input file indexes. Owner thread only, before workers start.
+    /// A query's ledger finished holding at most `held` of `limit`. Not thread-safe: the query's own thread, after it.
+    pub fn noteLedger(self: *Profiler, held: u64, limit: u64) void {
+        self.ledger_peak = @max(self.ledger_peak, held);
+        self.ledger_limit = @max(self.ledger_limit, limit);
+    }
+
     pub fn setFiles(self: *Profiler, names: []const []const u8) void {
         self.files = self.dupeNames(names) catch &.{};
     }

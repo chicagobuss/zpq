@@ -97,6 +97,11 @@ that can miss a spike shorter than the sampling period); where there is neither,
 lifetime`). A warm process still holds memory from earlier runs, and the peak includes it; `at start` (JSON `start_rss`)
 is the resident memory when the run began, so the difference is what this run added.
 
+An aggregate or a write adds `memory ledger peak X MB of Y MB (--max-memory)` (JSON `ledger_peak`, `ledger_limit`):
+the most its memory ledger held at once, by its own count. Against `rss peak` it shows how close that count is to what
+was resident: well above it, the query refuses or narrows before it needs to; below it, by about the documented fixed
+slack (see `--help`), as expected.
+
 ```
 phase          wall ms   busy ms  share ms  alone ms    spans
   decompress      ...

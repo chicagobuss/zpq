@@ -188,8 +188,9 @@ completes:
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
 
-It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default is 80%
-of available memory, three quarters of a cgroup's memory limit or a Lambda's memory size where those are lower.
+It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default on
+Linux is 80% of available memory, or three quarters of a cgroup's memory limit or a Lambda's memory size where those
+are lower; on macOS it is half of physical memory (`src/core/system.zig`), and 512 MB where neither can be read.
 
 Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
 It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports the strategy, reasons, column passes,

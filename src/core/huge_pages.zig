@@ -197,7 +197,15 @@ pub const Region = struct {
         } };
     }
 
-    fn owns(self: *const Region, memory: []u8) bool {
+    /// Whether `len` bytes at `alignment` fit the reserved span past the newest block: placed there, not spilled.
+    pub fn fitsSpan(self: *const Region, len: usize, alignment: std.mem.Alignment) bool {
+        if (self.buf.len == 0) return false;
+        const base = @intFromPtr(self.buf.ptr);
+        const start = alignment.forward(base + self.end) - base;
+        return start <= self.buf.len and len <= self.buf.len - start;
+    }
+
+    pub fn owns(self: *const Region, memory: []u8) bool {
         const p = @intFromPtr(memory.ptr);
         const base = @intFromPtr(self.buf.ptr);
         return p >= base and p < base + self.buf.len;
@@ -425,4 +433,22 @@ test "Region with a budget charges whole huge pages as blocks reach them, refuse
     _ = try a.alloc(u8, 10);
     region.deinit();
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "two regions' row-group fit checks can both pass; their draws still hold the shared limit" {
+    var budget: core_memory.SharedBudget = .{ .limit = 2 * huge_page_size };
+    var a = Region.init(std.testing.allocator, 8 * huge_page_size);
+    defer a.deinit();
+    var b = Region.init(std.testing.allocator, 8 * huge_page_size);
+    defer b.deinit();
+    if (a.buf.len == 0 or b.buf.len == 0) return error.SkipZigTest;
+    a.budget = &budget;
+    b.budget = &budget;
+    try std.testing.expect(a.fitsRowGroup(2 * huge_page_size));
+    try std.testing.expect(b.fitsRowGroup(2 * huge_page_size));
+    @memset(try a.allocator().alloc(u8, 2 * huge_page_size), 1);
+    try std.testing.expectError(error.OutOfMemory, b.allocator().alloc(u8, huge_page_size));
+    try std.testing.expect(b.refused);
+    try std.testing.expectEqual(budget.limit, budget.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), b.end);
 }

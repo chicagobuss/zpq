@@ -2352,6 +2352,10 @@ test "legacy LZ4 (codec 5): a multi-chunk Hadoop page decodes to pyarrow's value
 
 /// Fuzz target: arbitrary bytes as a column chunk of a chosen type, codec and level shape, decoded as values, as a
 /// code histogram or as codes; every outcome but an error is the reader's to answer for.
+fn fuzzInflateLimit(input_len: usize) usize {
+    return (input_len * 64) * 2 + (1 << 20);
+}
+
 fn fuzzChunk(_: void, smith: *std.testing.Smith) anyerror!void {
     const Kind = enum(u3) { i32, i64, f64, bytes, flba, boolean };
     const Mode = enum(u2) { values, histogram, codes };
@@ -2379,7 +2383,12 @@ fn fuzzChunk(_: void, smith: *std.testing.Smith) anyerror!void {
                 .bytes, .flba => []const u8,
                 .boolean => bool,
             };
-            var reader = ColumnChunkReader(T).init(buf[0..n], codec, levels, arena);
+            // Bounded as production bounds a chunk (`chunkOptions`): what `inflateLimit` allows a footer claiming the
+            // input inflates 64-fold. A page header's size claim alone otherwise sized an allocation, and fuzz
+            // instances ran out of memory in the allocator instead of exercising decode.
+            const limit = fuzzInflateLimit(n);
+            const options: DecodeOptions = .{ .page_bytes_limit = limit, .expand_limit = limit };
+            var reader = ColumnChunkReader(T).initWithOptions(buf[0..n], codec, levels, arena, options, null);
             if (k == .flba) reader.type_length = smith.valueRangeAtMost(u8, 1, 32);
             switch (mode) {
                 .values => {
@@ -2397,6 +2406,32 @@ fn fuzzChunk(_: void, smith: *std.testing.Smith) anyerror!void {
                 },
             }
         },
+    }
+}
+
+test "regression: the fuzz target bounds a page's claimed size, as production does, before allocating it" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    // A page whose header claims 2^31-1 inflated bytes behind a few bytes of body.
+    const body = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0x07, 0, 0, 0 };
+    const header = schema.PageHeader{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = std.math.maxInt(i32),
+        .compressed_page_size = body.len,
+        .crc = null,
+        .data_page_header = .{ .num_values = 4, .encoding = .PLAIN, .definition_level_encoding = .RLE, .repetition_level_encoding = .RLE },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    var w = thrift.Writer.init(arena);
+    try header.write(&w);
+    const chunk = try std.mem.concat(arena, u8, &.{ w.bytes(), &body });
+    const limit = fuzzInflateLimit(chunk.len);
+    for ([_]schema.CompressionCodec{ .SNAPPY, .ZSTD, .GZIP }) |codec| {
+        var reader = ColumnChunkReader(i64).initWithOptions(chunk, codec, .{ .max_def = 0, .max_rep = 0 }, arena, .{ .page_bytes_limit = limit }, null);
+        var out: [4]i64 = undefined;
+        try testing.expectError(error.PageLargerThanChunk, reader.decode(&out));
     }
 }
 

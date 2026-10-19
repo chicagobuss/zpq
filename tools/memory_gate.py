@@ -21,6 +21,8 @@ something.
 
 The verdict per run: `ok` (answered, peak <= budget + slack), `over` (answered above it), `refused` (clean error),
 `killed` (the scope cap or a signal), `diff` (answered, but stdout differs from the same shape's other answers).
+With `--cap` every run gets that one cgroup cap, as in a container: a budget at or under it must answer or refuse,
+never be killed (`topn/*` at 128M and 512M).
 Slack is fixed per run: `--slack` (default 48 MiB: binary, allocator bookkeeping, a GROUP BY's finalize allowance or
 a last retry's own decode ledger, src/core/memory.zig) plus 2 MiB per worker (its stack, its first huge page).
 
@@ -113,6 +115,11 @@ def cells(fixtures):
                     [dh]))
         out.append(("dict/full", ["--query", f"SELECT k, sum(v) AS s FROM '{dh}' GROUP BY k"], [dh]))
         out.append(("dict/distinct", ["--query", f"SELECT count(DISTINCT k) AS d FROM '{dh}'"], [dh]))
+        td = f"{fixtures}/topn_descending.parquet"
+        if os.path.exists(td):
+            # Every row evicts the one kept: the serial Top-N's kept keys (a computed output always runs serially).
+            out.append(("topn/desc_expr", ["--query", f"SELECT k + 0 AS v FROM '{td}' ORDER BY k LIMIT 1"], [td]))
+            out.append(("topn/desc_col", ["--query", f"SELECT k FROM '{td}' ORDER BY k LIMIT 1"], [td]))
     return out
 
 
@@ -298,7 +305,8 @@ def cmd_run(a):
                 for j in jobs:
                     if (name, budget, j) in done:
                         continue
-                    cap = min(parse_size(a.cap_max), max(parse_size(a.cap_min), 2 * budget + (2 << 30)))
+                    cap = parse_size(a.cap) if a.cap else min(parse_size(a.cap_max),
+                                                              max(parse_size(a.cap_min), 2 * budget + (2 << 30)))
                     r = run_one(binary, argv, budget, j, cap, a.timeout, os.path.abspath(a.reader or a.bin))
                     r.update(cell=name, budget=budget, jobs=j, cap=cap, tag=a.tag)
                     r["verdict"] = verdict(r, a.slack << 20)
@@ -473,6 +481,7 @@ def main():
     r.add_argument("--slack", type=int, default=48, help="MiB")
     r.add_argument("--cap-min", default="4G")
     r.add_argument("--cap-max", default="12G")
+    r.add_argument("--cap", default="", help="one scope cap for every run (a container's), in place of cap-min/max")
     r.add_argument("--timeout", type=float, default=300)
     r.add_argument("--resume", action="store_true")
     q = sub.add_parser("report")

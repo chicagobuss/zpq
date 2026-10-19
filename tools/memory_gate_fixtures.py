@@ -1,6 +1,6 @@
 """Fixtures for tools/memory_gate.py: DELTA_BYTE_ARRAY expansion and dictionary-heavy strings.
 
-    memory_gate_fixtures.py OUT_DIR    # writes dba_big, dba_rg16 and dict_heavy .parquet (about 60 MB in all)
+    memory_gate_fixtures.py OUT_DIR    # dba_big, dba_rg16, dict_heavy, topn_descending .parquet (about 80 MB)
 """
 import sys, random
 import pyarrow as pa, pyarrow.parquet as pq
@@ -26,7 +26,12 @@ t = pa.table({"k": pa.array(col, pa.string()), "v": pa.array([rng.randrange(1000
                                                              pa.int64())})
 pq.write_table(t, f"{out}/dict_heavy.parquet", use_dictionary=True, dictionary_pagesize_limit=1 << 30,
                compression="snappy", row_group_size=500_000)
-for f in ("dba_big", "dba_rg16", "dict_heavy"):
+# 4M descending INT32 in one row group, no statistics: an ascending Top-N's every row evicts the row it kept.
+t = pa.Table.from_arrays([pa.array(range(3_999_999, -1, -1), pa.int32())],
+                         schema=pa.schema([pa.field("k", pa.int32(), nullable=False)]))
+pq.write_table(t, f"{out}/topn_descending.parquet", row_group_size=4_000_000, compression="NONE", use_dictionary=False,
+               write_statistics=False)
+for f in ("dba_big", "dba_rg16", "dict_heavy", "topn_descending"):
     m = pq.ParquetFile(f"{out}/{f}.parquet").metadata
     c = m.row_group(0).column(0)
     print(f, m.num_row_groups, m.num_rows, c.encodings, c.total_compressed_size, c.total_uncompressed_size)

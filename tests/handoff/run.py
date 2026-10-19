@@ -115,10 +115,11 @@ def gen_empty(path):
 # The matrix. A cell is a SQL text over `{src}` that zpq and DuckDB both run, and optionally the structured request
 # (filter / columns / select / aggregate / group_by) that writes the same table from Python.
 
-def cell(cid, sql, req=None, order=False, passthrough=False, approx=(), units=None, refuse=()):
-    """`refuse`: the checks where a refusal is the documented answer (rows of repeated columns)."""
+def cell(cid, sql, req=None, order=False, passthrough=False, approx=(), units=None, refuse=(), widened=()):
+    """`refuse`: the checks where a refusal is the documented answer (rows of repeated columns). `widened`: computed
+    outputs of a FLOAT16 column, which a write widens to DOUBLE by design (as `WIDENED` allows a passthrough)."""
     return {"id": cid, "sql": sql, "req": req, "order": order, "passthrough": passthrough, "approx": set(approx),
-            "units": units or {}, "refuse": set(refuse)}
+            "units": units or {}, "refuse": set(refuse), "widened": set(widened)}
 
 
 def sources(work):
@@ -254,7 +255,7 @@ def sources(work):
             cell("agg", "SELECT max(u64) AS mu, min(ts_ns) AS mt, max(h) AS mh, min(d) AS md, max(f32) AS mf, "
                  "count(ls) AS c FROM '{src}'",
                  req={"aggregate": "max(u64) AS mu, min(ts_ns) AS mt, max(h) AS mh, min(d) AS md, max(f32) AS mf, "
-                                   "count(ls) AS c"}),
+                                   "count(ls) AS c"}, widened=("mh",)),
             cell("grp_dict", "SELECT dict, count(*) AS n, sum(i8) AS s FROM '{src}' GROUP BY dict",
                  req={"group_by": "dict", "aggregate": "count(*) AS n, sum(i8) AS s"}),
             cell("topn_ts", "SELECT id, ts_ms_tz FROM '{src}' ORDER BY ts_ms_tz DESC LIMIT 3", order=True,
@@ -616,7 +617,7 @@ WIDENED = {(pa.float16(), pa.float64())}
 SAME_FAMILY = {(("uuid",), ("str",))}
 
 
-def check_types(out_schema, oracle_schema, source_schema, passthrough):
+def check_types(out_schema, oracle_schema, source_schema, passthrough, widened=frozenset()):
     """A column passed through keeps the source's type exactly; any other column the oracle's type family."""
     def plain(t):
         return t.value_type if isinstance(t, pa.DictionaryType) else t
@@ -626,6 +627,8 @@ def check_types(out_schema, oracle_schema, source_schema, passthrough):
         if passthrough and name in src:
             if plain(t) != plain(src[name]) and (plain(src[name]), plain(t)) not in WIDENED:
                 raise Mismatch(f"column {name} written as {t}, source is {src[name]}")
+        elif name in widened and pa.types.is_float64(t):
+            continue
         elif name in orc and family(t) != family(orc[name]) and (family(t), family(orc[name])) not in SAME_FAMILY:
             raise Mismatch(f"column {name} written as {t}, oracle type {orc[name]}")
 
@@ -655,7 +658,7 @@ def check_written(ctx, path, oracle, source_schema, want_names, want_rows, c, f3
         raise Mismatch(f"PyArrow cannot read the file: {type(e).__name__}: {e}")
     if by_name and sorted(t.schema.names) == sorted(oracle.schema.names):
         t = t.select(oracle.schema.names)
-    check_types(t.schema, oracle.schema, source_schema, c["passthrough"])
+    check_types(t.schema, oracle.schema, source_schema, c["passthrough"], c["widened"])
     names, rows = table_rows(t)
     if names != want_names:
         raise Mismatch(f"PyArrow columns {names}, expected {want_names}")

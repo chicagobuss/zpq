@@ -323,6 +323,30 @@ def answer_values(tmp):
                 map(json.dumps, printed)), (sql, got.to_pylist())
 
 
+def unsigned_answers(tmp):
+    """min/max keep an unsigned column's type in a write, at every width and past 2^63: scalar, grouped and as keys."""
+    src = tmp / 'unsigned.parquet'
+    top = {8: 255, 16: 65535, 32: (1 << 32) - 1, 64: (1 << 64) - 1}
+    pq.write_table(pa.table({**{f'u{w}': pa.array([1, top[w], None, 1 << (w - 1)], getattr(pa, f'uint{w}')())
+                                for w in top}, 'k': pa.array([1, 1, 2, 2], pa.int32())}), src)
+    for w in top:
+        c = f'u{w}'
+        want = pa.field('x', getattr(pa, f'uint{w}')()).type
+        for sql, rows in ((f"SELECT min({c}) AS lo, max({c}) AS x FROM '{src}'", [{'lo': 1, 'x': top[w]}]),
+                          (f"SELECT k, max({c}) AS x FROM '{src}' GROUP BY k ORDER BY k",
+                           [{'k': 1, 'x': top[w]}, {'k': 2, 'x': 1 << (w - 1)}]),
+                          (f"SELECT {c} AS x, count(*) AS n FROM '{src}' WHERE {c} IS NOT NULL GROUP BY x ORDER BY x",
+                           [{'x': v, 'n': 1} for v in sorted((1, top[w], 1 << (w - 1)))])):
+            out = tmp / 'unsigned_out.parquet'
+            out.unlink(missing_ok=True)
+            printed = [json.loads(line) for line in sql_query(sql).stdout.splitlines()]
+            assert printed == rows, (sql, printed)
+            sql_query(sql, '-o', str(out))
+            got = pq.read_table(out)
+            assert got.schema.field('x').type == want, (sql, got.schema)
+            assert sorted(got.to_pylist(), key=json.dumps) == sorted(rows, key=json.dumps), (sql, got.to_pylist())
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
@@ -330,4 +354,5 @@ with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     encrypted_inputs(Path(directory))
     mixed_writers(Path(directory))
     answer_values(Path(directory))
+    unsigned_answers(Path(directory))
 print('Format correctness regressions passed')

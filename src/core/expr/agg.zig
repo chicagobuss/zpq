@@ -2289,7 +2289,12 @@ fn emitAvgDecPair(arena: std.mem.Allocator, name: []const u8, st: DecSum, spec: 
 fn u64Bits(call: AggCall, v: ?i128) ?i128 {
     const x = v orelse return null;
     const unsigned = if (call.arg) |a| a == .col_ref and a.col_ref.unsigned_64 else false;
-    return if (unsigned) @as(i64, @bitCast(@as(u64, @intCast(x)))) else x;
+    if (!unsigned) return x;
+    // The low 64 bits, as the column stores them. `@intCast` to u64 here, widened back, was folded to `x` itself by
+    // the optimizer (ReleaseFast and ReleaseSafe; Debug was right), so a value of 2^63 and up reached the INT64
+    // column unconverted and was refused as too wide. No range assertion either: it hands the optimizer the same fact.
+    const bits: i64 = @bitCast(@as(u64, @truncate(@as(u128, @bitCast(x)))));
+    return bits;
 }
 
 /// A one-row output column. NULL is a placeholder value under def level 0, so it needs `nullable`.
@@ -6464,4 +6469,18 @@ test "compact variable insertion keeps retained capacity charged after allocatio
             };
         }
     }.run, .{});
+}
+
+test "regression: a one-row min/max of a UINT64 column keeps values of 2^63 and up as the column's bits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64, .unsigned_64 = true } };
+    for ([_]AggFunc{ .min, .max }) |func| {
+        const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "m", .result = .i64 };
+        var state = Accumulator.init(call);
+        if (func == .min) state.min_i = std.math.maxInt(u64) else state.max_i = std.math.maxInt(u64);
+        const cols = try finalize(a, call, state);
+        try std.testing.expectEqual(@as(i64, -1), cols[0].col.i64.values[0]);
+    }
 }

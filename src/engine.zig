@@ -410,6 +410,8 @@ pub const WriteResult = struct {
     bytes_out: u64,
     row_groups_in: usize,
     row_groups_kept: usize,
+    /// Row groups statistics (or membership, or a NaN probe) ruled out before any page was read.
+    row_groups_pruned: usize = 0,
     /// Bloom filter probing: what it read and the row groups it ruled out beyond statistics.
     membership: membership.Stats = .{},
     timings: Timings,
@@ -2237,6 +2239,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     var rows_in: i64 = 0;
     var rows_kept: i64 = 0;
     var rgs_in: usize = 0;
+    var rgs_pruned: usize = 0;
     var rg_kept: usize = 0;
     var bytes_in: u64 = 0;
     var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
@@ -2439,6 +2442,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 if (filter_opt) |f| if (!args.scan_all) {
                     const d = filter_prune.pruneRowGroup(src_rg, f, meta_p);
                     if (d == .skip) {
+                        rgs_pruned += 1;
                         skipRowGroup(in, ri);
                         continue;
                     }
@@ -2640,6 +2644,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
         .bytes_out = out_offset,
         .row_groups_in = rgs_in,
         .row_groups_kept = rg_kept,
+        .row_groups_pruned = rgs_pruned,
         .membership = probed,
         .timings = t,
     };
@@ -7318,6 +7323,9 @@ const ParquetPrint = struct {
 pub const PrintResult = struct {
     output_ns: u64 = 0,
     rows_in: usize = 0,
+    /// Row groups read or passed over, and of those the ones statistics (or membership, or a NaN probe) ruled out.
+    row_groups_in: usize = 0,
+    row_groups_pruned: usize = 0,
     rows: usize = 0,
     bytes_out: u64 = 0,
     membership: membership.Stats = .{},
@@ -7502,6 +7510,8 @@ fn runPrintSinkOver(
     if (args.diag) |diag| diag.execution_started = true;
     var total_printed: usize = 0;
     var rows_in: usize = 0;
+    var rgs_in: usize = 0;
+    var rgs_pruned: usize = 0;
 
     var t: Timings = .{};
     t.core.prof = prof;
@@ -7515,7 +7525,17 @@ fn runPrintSinkOver(
         // answer where reading in order raises the error. Filter leaves compare a column with a literal and never fail.
         const bounded = limit != null and !args.scan_all and allPassthrough(output_specs, proj.row_keys);
         const items = if (limit != 0) try rankRowGroups(arena, opened.inputs, metas, proj.row_keys[0], bounded) else try arena.alloc(RankedRG, 0);
-        for (items) |item| rows_in += @intCast(metas[item.file].row_groups.items[item.rg].num_rows);
+        for (items) |item| {
+            const meta_i = &metas[item.file];
+            const rg = &meta_i.row_groups.items[item.rg];
+            rows_in += @intCast(rg.num_rows);
+            // Every ranked row group is visited, by the gather workers or the loop below, and pruned by the same
+            // footer-only decision, so they are counted here once.
+            rgs_in += 1;
+            if (filter_opt) |f| if (!args.scan_all) {
+                if (filter_prune.pruneRowGroup(rg, f, meta_i) == .skip) rgs_pruned += 1;
+            };
+        }
         var gathered = if (gatherEligible(ctx.env, opened.inputs, meta0, limit, keep, output_specs, proj.row_keys))
             try rankAndGather(ctx, arena, args, opened.inputs, metas, filter_opt, fetch_arr, output_specs, proj.row_keys, keep, items, &t)
         else
@@ -7561,6 +7581,7 @@ fn runPrintSinkOver(
             }
 
             rows_in += @intCast(src_rg.num_rows);
+            rgs_in += 1;
 
             const rg_span = profile.Span.begin(prof);
             var skipped = false;
@@ -7571,6 +7592,7 @@ fn runPrintSinkOver(
             if (filter_opt) |f| if (!args.scan_all) {
                 if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
                     skipped = true;
+                    rgs_pruned += 1;
                     skipRowGroup(in, rg_i);
                     continue;
                 }
@@ -7647,7 +7669,7 @@ fn runPrintSinkOver(
     try stdout_writer.flush();
     stdout_writer.output_ns += @intCast(nowMonoNs() - finish_start);
     _ = t_start;
-    return .{ .rows_in = rows_in, .rows = total_printed, .bytes_out = if (format == .parquet) parquet.out_offset else stdout_writer.bytes_written, .output_ns = stdout_writer.output_ns, .membership = opened.membership, .timings = t };
+    return .{ .rows_in = rows_in, .row_groups_in = rgs_in, .row_groups_pruned = rgs_pruned, .rows = total_printed, .bytes_out = if (format == .parquet) parquet.out_offset else stdout_writer.bytes_written, .output_ns = stdout_writer.output_ns, .membership = opened.membership, .timings = t };
 }
 
 // ============================================================
@@ -11168,6 +11190,50 @@ test "CSV: temporal text, bytes under the JSON rules, quoting, NULL and the empt
         \\,,,,0
         \\
     , w.buffered());
+}
+
+test "row output and writes report the row groups pruning skipped, as aggregates do" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var text_buf: [96]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    // Eight row groups, `b` 2i..2i+1 in row group i: only row group 6 can match.
+    const filter = "b >= 12 AND b <= 13";
+
+    var agg = try runQuery(ctx, .{ .inputs = &.{fixture}, .filter = filter, .aggregate = "count(*) AS n" });
+    defer agg.aggregate.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 7), agg.aggregate.row_groups_pruned);
+
+    var w = try runQuery(ctx, .{ .inputs = &.{fixture}, .output = out, .filter = filter });
+    defer w.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 8), w.write.row_groups_in);
+    try std.testing.expectEqual(@as(usize, 7), w.write.row_groups_pruned);
+    try std.testing.expectEqual(@as(usize, 1), w.write.row_groups_kept);
+
+    // Printed rows, in file order and ordered (a top-N over every row group), with and without a LIMIT.
+    const orders = [_]expr_ast.ResultOrder{ .{}, .{ .rows = &.{.{ .expr = "b", .descending = true }} } };
+    for (orders) |order| for ([_]?usize{ null, 3 }) |limit| {
+        const fd = try local_fs.createFile(text);
+        defer local_fs.close(fd);
+        const p = try runPrintTo(ctx, .{ .inputs = &.{fixture}, .filter = filter, .columns = &.{"b"}, .result_order = order }, .jsonl, limit, fd, 0);
+        // In file order a LIMIT the one matching row group fills stops before the last row group, as `rows_in` does.
+        const stops = order.rows.len == 0 and limit != null;
+        try std.testing.expectEqual(@as(usize, if (stops) 7 else 8), p.row_groups_in);
+        try std.testing.expectEqual(@as(usize, if (stops) 6 else 7), p.row_groups_pruned);
+    };
+    // --scan-all prunes nothing.
+    {
+        const fd = try local_fs.createFile(text);
+        defer local_fs.close(fd);
+        const p = try runPrintTo(ctx, .{ .inputs = &.{fixture}, .filter = filter, .columns = &.{"b"}, .scan_all = true }, .jsonl, null, fd, 0);
+        try std.testing.expectEqual(@as(usize, 0), p.row_groups_pruned);
+    }
 }
 
 test "written files name zpq as their writer once zpq encodes their data, and keep their source's otherwise" {

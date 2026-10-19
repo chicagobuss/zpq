@@ -600,7 +600,7 @@ fn runQuery(
         const result = (try engine.runQuery(ctx, query_args)).write;
         rows = @intCast(result.rows_kept);
         output_ns = result.timings.core.encode_ns + result.timings.core.sink_ns + result.timings.footer_ns;
-        stats = .{ .rows_in = result.rows_in, .rows_kept = result.rows_kept, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .membership = result.membership, .timings = result.timings, .codec = result.codec };
+        stats = .{ .rows_in = result.rows_in, .rows_kept = result.rows_kept, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .row_groups_pruned = result.row_groups_pruned, .membership = result.membership, .timings = result.timings, .codec = result.codec };
     } else {
         if (!to_stdout and std.mem.startsWith(u8, engine_output.?, "s3://")) {
             diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
@@ -620,7 +620,7 @@ fn runQuery(
         }
         rows = printed.rows;
         output_ns = printed.output_ns;
-        stats = .{ .rows_in = @intCast(printed.rows_in), .rows_kept = @intCast(printed.rows), .bytes_out = printed.bytes_out, .files_in = inputs.len, .membership = printed.membership, .timings = printed.timings };
+        stats = .{ .rows_in = @intCast(printed.rows_in), .rows_kept = @intCast(printed.rows), .bytes_out = printed.bytes_out, .files_in = inputs.len, .row_groups_in = printed.row_groups_in, .row_groups_pruned = printed.row_groups_pruned, .membership = printed.membership, .timings = printed.timings };
     }
     const publication_start = nowMonoNs();
     try publication.commit(io);

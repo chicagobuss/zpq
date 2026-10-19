@@ -345,7 +345,8 @@ fn aliasKey(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaD
     if (metadata.resolveColumn(file, tok.text)) |_| return null else |err| if (err != error.UnknownColumn) return null;
     for (select) |item| {
         const alias = item.alias orelse continue;
-        if (!asciiEqIgnoreCase(std.mem.trim(u8, alias, " "), tok.text)) continue;
+        // The alias as decoded: `x` names no alias `" x "`, which differs from it by its spaces.
+        if (!asciiEqIgnoreCase(alias, tok.text)) continue;
         if (item.role == .agg) return error.AggregateInGroupBy;
         _ = try lex.next();
         return try parseExprOnly(arena, item.expr, file, lex.diag);
@@ -1607,4 +1608,16 @@ test "regression: a doubled quote in a quoted alias is one quote of the output n
     try testing.expectEqualStrings("c\"d", aggs[0].alias);
     const keys = try parseGroupBy(a, "id AS \"k\"\"k\"", &file, null);
     try testing.expectEqualStrings("k\"k", keys[0].alias.?);
+}
+
+test "regression: GROUP BY binds an alias by its exact text, not one that differs by surrounding spaces" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"id"}, &.{.INT64});
+    const spaced = [_]ast.SelectColumn{.{ .expr = "id + 1", .alias = " x ", .role = .key }};
+    try testing.expectError(error.UnknownColumn, parseGroupByOf(a, "x", &file, null, &spaced));
+    const exact = [_]ast.SelectColumn{.{ .expr = "id + 1", .alias = "x", .role = .key }};
+    const keys = try parseGroupByOf(a, "x", &file, null, &exact);
+    try testing.expect(keys[0].expr == .binop);
 }

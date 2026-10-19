@@ -418,6 +418,27 @@ def nested_by_name(tmp):
     assert p.returncode == 2 and "file's order" in p.stderr and not out.exists(), p.stderr
 
 
+def alias_spaces(tmp):
+    """A quoted alias keeps its surrounding spaces in every output, for a grouped key and an aggregate; two names that
+    differ only in their spaces are two names, as DuckDB has them."""
+    src = tmp / 'alias_spaces.parquet'
+    pq.write_table(pa.table({'k': ['a', 'b', 'a']}), src)
+    out = tmp / 'alias_spaces.parquet.out'
+    for sql in (f"SELECT k AS \" trailing \", count(*) AS n FROM '{src}' GROUP BY k ORDER BY k",
+                f"SELECT k, count(*) AS \" n \" FROM '{src}' GROUP BY k ORDER BY k",
+                f"SELECT k AS x, count(*) AS \" x \" FROM '{src}' GROUP BY k ORDER BY k",
+                f"SELECT count(*) AS \" n \", min(k) AS n FROM '{src}'",
+                f"SELECT k AS \" k \" FROM '{src}'"):
+        names = [d[0] for d in duckdb.connect().execute(sql).description]
+        p = sql_query(sql)
+        assert list(json.loads(p.stdout.splitlines()[0])) == names, (sql, p.stdout)
+        p = sql_query(sql, '--format', 'csv')
+        assert p.stdout.splitlines()[0] == ",".join(names), (sql, p.stdout)
+        out.unlink(missing_ok=True)
+        sql_query(sql, '-o', str(out))
+        assert pq.read_table(out).column_names == names, (sql, pq.read_table(out).column_names)
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     logical_annotations(Path(directory))
     binary_text(Path(directory))
@@ -428,4 +449,5 @@ with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     unsigned_answers(Path(directory))
     alias_is_rename(Path(directory))
     nested_by_name(Path(directory))
+    alias_spaces(Path(directory))
 print('Format correctness regressions passed')

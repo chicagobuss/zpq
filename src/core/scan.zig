@@ -6951,10 +6951,10 @@ fn exprName(spec: expr_ast.SelectColumn) []const u8 {
     return stripQuotes(std.mem.trim(u8, spec.expr, " "));
 }
 
-/// The name an output column asks to print under: its alias, else its expression's name.
+/// The name an output column asks to print under: its alias, else its expression's name. An alias is the name as the
+/// parser decoded it, spaces inside a quoted one included (`AS " n "` names ` n `); the flag form trims its own text.
 fn aliasName(spec: expr_ast.SelectColumn) []const u8 {
-    const alias = spec.alias orelse return exprName(spec);
-    return std.mem.trim(u8, alias, " ");
+    return spec.alias orelse exprName(spec);
 }
 
 /// A quoted path (`"a"."b"`, a nested leaf's label) is a name in its own right and keeps its quotes.
@@ -13603,4 +13603,12 @@ test "private decoder floors decline a dictionary that leaves no sliced sample r
     var ample = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2, dictionary_peak);
     defer ample.release();
     try testing.expectEqual(@as(usize, parent.limit / 4), ample.held);
+}
+
+test "regression: a decoded alias keeps its surrounding spaces; an expression's name is trimmed" {
+    try std.testing.expectEqualStrings(" n ", aliasName(.{ .expr = "count(*)", .alias = " n " }));
+    try std.testing.expectEqualStrings("x", aliasName(.{ .expr = "x", .alias = "x" }));
+    try std.testing.expectEqualStrings("k", aliasName(.{ .expr = " k " }));
+    // The flag form's `--column-order "k AS  n "` trims what it was given, as before.
+    try std.testing.expectEqualStrings("n", aliasName(.parse(" k AS  n ")));
 }

@@ -538,13 +538,20 @@ fn executeSql(
     // Quoted into the response as they are printed: an NDJSON copy beside it held the answer twice, under one cap.
     var quote_buf: [4096]u8 = undefined;
     var rows: JsonQuoting = .init(&out.writer, &quote_buf);
+    var decimal: engine.DecimalColumns = .{ .gpa = allocator };
+    defer decimal.deinit();
     if (qa.aggregate != null or qa.group_by != null) {
         var result = try engine.runQuery(ctx, qa);
         defer result.deinit(allocator);
         const answer = result.aggregate.output;
         const n: usize = if (answer.group_rows) |groups| groups.len else if (qa.empty_scalar or answer.no_row) 0 else 1;
         try engine.writeAggregateText(&rows.writer, answer, result.aggregate.text_kinds, &.{}, n, .jsonl);
+        for (result.aggregate.answer_types, 0..) |ty, ci| if (ty.decimal) {
+            const name = if (answer.group_cols) |cols| cols[ci] else answer.aggs[ci].alias;
+            try decimal.names.append(allocator, try allocator.dupe(u8, name));
+        };
     } else {
+        qa.decimal_columns = &decimal;
         _ = try engine.runPrintSink(
             ctx,
             qa,
@@ -556,7 +563,9 @@ fn executeSql(
         );
     }
     try rows.finish();
-    try out.writer.writeAll("\"}");
+    try out.writer.writeByte('"');
+    try writeDecimalList(&out.writer, decimal.names.items);
+    try out.writer.writeAll("}");
     return out.toOwnedSlice();
 }
 
@@ -829,6 +838,29 @@ fn runAggregate(
     return result_cap.admit(allocator, try aw.toOwnedSlice());
 }
 
+/// `,"decimal":[...]`: the answer's DECIMAL columns, which a reader parses exactly (python/zpq.py does); nothing when
+/// there are none.
+fn writeDecimalNames(w: *std.Io.Writer, ar: engine.AggResult) !void {
+    var sep: []const u8 = ",\"decimal\":[";
+    for (ar.answer_types, 0..) |ty, ci| if (ty.decimal) {
+        try w.writeAll(sep);
+        sep = ",";
+        try engine.writeJsonQuoted(w, if (ar.output.group_cols) |cols| cols[ci] else ar.output.aggs[ci].alias);
+    };
+    if (sep.len == 1) try w.writeByte(']');
+}
+
+/// The DECIMAL columns of a SQL answer, as `writeDecimalNames` writes them.
+fn writeDecimalList(w: *std.Io.Writer, names: []const []const u8) !void {
+    if (names.len == 0) return;
+    try w.writeAll(",\"decimal\":[");
+    for (names, 0..) |name, i| {
+        if (i > 0) try w.writeByte(',');
+        try engine.writeJsonQuoted(w, name);
+    }
+    try w.writeByte(']');
+}
+
 /// `runAggregate`'s response for `ar`, onto `w`.
 fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool) !void {
     if (ar.output.group_rows) |rows| {
@@ -861,6 +893,7 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
         }
         try w.writeByte('}');
     }
+    try writeDecimalNames(w, ar);
     try w.print(",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}},", .{
         total_ms,
         ar.timings.read_ns / std.time.ns_per_ms,

@@ -55,7 +55,9 @@ pass-through to the CLI frontend; Parquet I/O remains the engine's focus.
 `zpq_run` also accepts `{"sql":"SELECT ... FROM 'data.parquet'", "parallelism":3}`. It uses the CLI's SQL
 frontend, binder, planner, path expansion (local and S3 globs), and NDJSON serializers. Successful responses are
 `{"ok":true,"ndjson":"{\"n\":42}\n"}`: the decoded `ndjson` string is byte-identical to the CLI's stdout for
-that SQL and options. Empty results carry an empty string. The seven C exports and ABI version 1 are unchanged.
+that SQL and options. Empty results carry an empty string. When the answer has DECIMAL columns, the response also
+names them, `"decimal":["price","total"]`; a structured aggregate's response does the same beside its `agg`. The seven
+C exports and ABI version 1 are unchanged.
 
 ```python
 with zpq.Zpq(max_memory="1GB") as z:
@@ -65,8 +67,10 @@ with zpq.Zpq(max_memory="1GB") as z:
 ```
 
 `query()` returns a list of row dicts; `query_raw()` returns exact NDJSON. The binding has no Arrow export path.
-Python's JSON decoder uses its usual integer/float types; use the raw text with a Decimal-aware decoder to retain
-all DECIMAL digits. `run()` continues to return the response envelope, including for SQL.
+Exact by default: the values of the DECIMAL columns the response names come back as `decimal.Decimal`, every digit
+kept (`"83332533333.00"` is `Decimal('83332533333.00')`, not `83332533333.0`), in `query()` rows and in `run()`'s
+`agg`; other numbers are int or float as Python's JSON decoder reads them. `decimal=False` gives floats throughout,
+as before. `run()` continues to return the response envelope, including for SQL.
 
 SQL excludes the structured fields `inputs`, `s3_url`, `filter`, `columns`, `select`, `aggregate`, `group_by`,
 `column_order`, `output_url`, `output_codec`, `compress_priority`, and `bloom_filters` (null counts as absent).

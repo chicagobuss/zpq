@@ -279,6 +279,9 @@ pub const QueryArgs = struct {
     result_order: expr_ast.ResultOrder = .{},
     /// Comma-separated output column names for GROUP BY (CLI `--column-order`).
     column_order: ?[]const u8 = null,
+    /// Receives, for a plain-row print, the names of its DECIMAL output columns (duplicated on its `gpa`), so a
+    /// reader of the text can parse just those exactly. An aggregate says so in `AggResult.answer_types`.
+    decimal_columns: ?*DecimalColumns = null,
     /// Receives what a failure was about; see `core/diag.zig`.
     diag: ?*Diag = null,
     /// Requested output codec. Null when none was asked for: re-encoded
@@ -848,11 +851,16 @@ fn answerTypes(gpa: std.mem.Allocator, out: scan.AggOutput, state: scan.ScanStat
             if (ci >= all.len) continue;
             ty.avg = all[ci].lane == .avg or all[ci].lane == .avg_dec;
             if (all[ci].source) |src| ty.temporal = Temporal.of(src);
+            ty.decimal = (all[ci].lane == .dec or all[ci].lane == .avg_dec) and ty.temporal == null;
         } else {
             ty.avg = out.aggs[ci].value == .avg or out.aggs[ci].value == .avg_dec;
             if (ci < state.agg_sources.len) if (state.agg_sources[ci]) |src| {
                 ty.temporal = Temporal.of(src);
             };
+            if (ci < state.agg_calls.len) {
+                const result = state.agg_calls[ci].result;
+                ty.decimal = (result == .dec or result == .avg_dec) and ty.temporal == null;
+            }
         }
     }
     return types;
@@ -5622,10 +5630,23 @@ fn writeJsonAsCsv(writer: anytype, value: []const u8, kind: TextKind) !void {
 }
 
 /// What an answer column needs besides its `TextKind` to print as CSV: DATE/TIME/TIMESTAMP text, and an average
-/// split into `<name>__sum` and `<name>__count` cells, as `-o` writes it.
+/// split into `<name>__sum` and `<name>__count` cells, as `-o` writes it; and whether it is DECIMAL (an exact sum,
+/// min/max or average of a DECIMAL, or a DECIMAL key), whose text a reader may want to parse exactly.
 pub const AnswerType = struct {
     temporal: ?Temporal = null,
     avg: bool = false,
+    decimal: bool = false,
+};
+
+/// Names of DECIMAL output columns, as `QueryArgs.decimal_columns` collects them.
+pub const DecimalColumns = struct {
+    gpa: std.mem.Allocator,
+    names: std.ArrayList([]const u8) = .empty,
+
+    pub fn deinit(self: *DecimalColumns) void {
+        for (self.names.items) |n| self.gpa.free(n);
+        self.names.deinit(self.gpa);
+    }
 };
 
 /// `value` as a JSON value of `kind`. A UUID or INTERVAL of the wrong width is not one: `InvalidBinaryValue`.
@@ -7403,6 +7424,16 @@ fn runPrintSinkOver(
     defer stdout_writer.flush() catch {};
 
     const names = try proj.names(arena);
+    if (args.decimal_columns) |dc| for (output_specs, names) |spec, name| {
+        const decimal = switch (spec) {
+            .passthrough => |pt| if (metadata.leafSchemaElement(meta0, pt.ci)) |elem|
+                decimal_mod.kindFromSchema(&elem) != null and elem.type != .INT96
+            else
+                false,
+            .computed => |c| c.expr.typeOf() == .dec,
+        };
+        if (decimal) try dc.names.append(dc.gpa, try dc.gpa.dupe(u8, name));
+    };
     const is_jsonl = format != .csv;
     if (format == .json) try stdout_writer.writeByte('[');
     if (!is_jsonl) {

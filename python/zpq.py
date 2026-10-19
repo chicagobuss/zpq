@@ -13,11 +13,16 @@ running ones, so a context is never freed under a running query.
 SQL requests are EXPERIMENTAL in 0.5.0, with no stability guarantee for their request or response shape.
 `query` and `query_raw` are thin pass-throughs to the CLI frontend.
 
+Exact by default: `query` rows and `run`'s `agg` give the values of DECIMAL columns (the response's `decimal` list
+names them) as `decimal.Decimal`, every digit kept; other numbers are int or float, as JSON reads them. Pass
+`decimal=False` for floats throughout.
+
 The library is found at $ZPQ_LIB, else as libzpq.so (libzpq.dylib on macOS) next to this file, in ../zig-out/lib, or
 on the loader path.
 """
 
 import ctypes
+import decimal as _decimal
 import json
 import os
 import sys
@@ -101,6 +106,14 @@ def load_library(path=None):
         return lib
 
 
+def _exact_columns(exact, plain, names):
+    """`plain` (rows or a row: dicts parsed as JSON reads them), with the values of columns `names` from `exact`, the
+    same JSON parsed with Decimal for its fractional numbers."""
+    if isinstance(plain, list):
+        return [_exact_columns(e, p, names) for e, p in zip(exact, plain)]
+    return {k: (exact[k] if k in names else v) for k, v in plain.items()}
+
+
 class Zpq:
     """A libzpq context: warm S3 connections and footers shared by every `run` on it."""
 
@@ -170,11 +183,16 @@ class Zpq:
         finally:
             self._lib.zpq_free(out)
 
-    def run(self, request, check=True):
-        """Run `request` (a dict, or JSON text) and return the response as a dict."""
-        response = json.loads(self.run_raw(request if isinstance(request, (str, bytes)) else json.dumps(request)))
+    def run(self, request, check=True, decimal=True):
+        """Run `request` (a dict, or JSON text) and return the response as a dict. With `decimal` (the default), the
+        `agg` values of the DECIMAL columns the response names are `decimal.Decimal`."""
+        text = self.run_raw(request if isinstance(request, (str, bytes)) else json.dumps(request))
+        response = json.loads(text)
         if check and isinstance(response, dict) and "error" in response:
             raise ZpqError(response)
+        if decimal and isinstance(response, dict) and response.get("decimal") and "agg" in response:
+            exact = json.loads(text, parse_float=_decimal.Decimal)["agg"]
+            response["agg"] = _exact_columns(exact, response["agg"], set(response["decimal"]))
         return response
 
     def query_raw(self, sql, **options):
@@ -186,17 +204,25 @@ class Zpq:
             raise TypeError("sql must be a string")
         return self.run({**options, "sql": sql})["ndjson"]
 
-    def query(self, sql, **options):
+    def query(self, sql, decimal=True, **options):
         """EXPERIMENTAL in 0.5.0: thin CLI SQL pass-through returning a list of row dicts.
 
         The SQL request and response shapes have no stability guarantee. `parallelism` selects workers (0: automatic).
+        With `decimal` (the default) a DECIMAL column's values are `decimal.Decimal`; `decimal=False` gives floats.
         """
+        if not isinstance(sql, str):
+            raise TypeError("sql must be a string")
+        response = self.run({**options, "sql": sql})
         # NDJSON rows end in "\n" alone: str.splitlines() would also split at U+0085 and other line boundaries,
         # which may appear unescaped inside JSON strings.
-        lines = self.query_raw(sql, **options).split("\n")
+        lines = response["ndjson"].split("\n")
         if lines[-1] == "":
             lines.pop()
-        return [json.loads(line) for line in lines]
+        exact = set(response.get("decimal") or ()) if decimal else set()
+        if not exact:
+            return [json.loads(line) for line in lines]
+        return [_exact_columns(json.loads(line, parse_float=_decimal.Decimal), json.loads(line), exact)
+                for line in lines]
 
     def close(self):
         """Refuse new calls, end those waiting for their memory budget (`ZpqClosed`), wait for the running ones, then

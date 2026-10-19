@@ -78,6 +78,39 @@ def test_boolean_answers(z):
         check(r == '{"k":true}\n{"k":false}\n{"k":true}\n{"k":null}\n', f"bool expression rows {r!r}")
 
 
+def test_decimal_exact(z):
+    # DECIMAL columns come back as Decimal, every digit kept; DOUBLE stays float; decimal=False gives floats.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from decimal import Decimal
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "dec.parquet")
+        pq.write_table(pa.table({
+            "p": pa.array([Decimal("83332533333.00"), Decimal("0.10"), None], pa.decimal128(18, 2)),
+            "f": pa.array([0.5, 0.25, 1.0], pa.float64()),
+            "k": pa.array([Decimal("1.5"), Decimal("1.5"), Decimal("2.0")], pa.decimal128(4, 1)),
+        }), src)
+        rows = z.query(f"SELECT p, f FROM '{src}'")
+        check(rows[0] == {"p": Decimal("83332533333.00"), "f": 0.5} and type(rows[0]["p"]) is Decimal
+              and type(rows[0]["f"]) is float and rows[2]["p"] is None, f"decimal rows {rows}")
+        check(str(rows[1]["p"]) == "0.10", f"decimal scale kept {rows[1]}")
+        plain = z.query(f"SELECT p, f FROM '{src}'", decimal=False)
+        check(type(plain[0]["p"]) is float, f"decimal=False rows {plain}")
+        agg = z.query(f"SELECT sum(p) AS s, min(f) AS m, count(*) AS n FROM '{src}'")
+        check(agg == [{"s": Decimal("83332533333.10"), "m": 0.25, "n": 3}] and type(agg[0]["m"]) is float,
+              f"decimal SQL aggregate {agg}")
+        grp = z.query(f"SELECT k, sum(p) AS s FROM '{src}' GROUP BY k ORDER BY k")
+        check(grp == [{"k": Decimal("1.5"), "s": Decimal("83332533333.10")}, {"k": Decimal("2.0"), "s": None}],
+              f"decimal key {grp}")
+        r = z.run({"inputs": [src], "aggregate": "sum(p) AS s, avg(p) AS a, min(f) AS m"})
+        check(r["agg"]["s"] == Decimal("83332533333.10") and type(r["agg"]["s"]) is Decimal
+              and type(r["agg"]["m"]) is float and r["agg"]["a"]["avg"] == Decimal("41666266666.55"),
+              f"decimal agg {r['agg']}")
+        check(r.get("decimal") == ["s", "a"], f"decimal names {r.get('decimal')}")
+        r2 = z.run({"inputs": [src], "aggregate": "sum(p) AS s"}, decimal=False)
+        check(type(r2["agg"]["s"]) is float, f"run decimal=False {r2['agg']}")
+
+
 def test_threads(z):
     # Small budgets, so the calls run at once within the context's ceiling.
     reqs = [
@@ -333,6 +366,7 @@ def main():
     with zpq.Zpq(max_memory="512MB") as z:
         test_binding(z)
         test_boolean_answers(z)
+        test_decimal_exact(z)
         test_threads(z)
         test_service(z)
         test_bad_lengths(z)

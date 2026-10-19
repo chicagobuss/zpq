@@ -5575,8 +5575,10 @@ const TopRows = struct {
     keys: []const RowSortKey,
     key_specs: []consumer.OutputCol,
     h: usize,
-    /// Bytes the kept rows and their heap may take; past it the query fails cleanly (no spilling).
+    /// Bytes the kept rows and their heap may take, half of `limit`; past it the query fails cleanly (no spilling).
     budget: usize,
+    /// The query's budget, `--max-memory`: what the kept rows and a row group's decode hold together.
+    limit: usize,
     /// The rows admitted so far, their output columns copied; a heap entry indexes one. Rows evicted stay until
     /// `compact` drops them.
     store_arena: *std.heap.ArenaAllocator,
@@ -5584,6 +5586,7 @@ const TopRows = struct {
     heap: std.PriorityQueue(Entry, *const TopRows, later),
 
     const pending = std.math.maxInt(usize);
+    const decode_floor: usize = 1 << 20;
 
     const Entry = struct {
         cells: []SortCell,
@@ -5598,7 +5601,7 @@ const TopRows = struct {
         specs: []const consumer.OutputCol,
         keys: []const RowSortKey,
         h: usize,
-        budget: usize,
+        limit: usize,
     ) !TopRows {
         const key_specs = try gpa.alloc(consumer.OutputCol, keys.len);
         errdefer gpa.free(key_specs);
@@ -5616,7 +5619,8 @@ const TopRows = struct {
             .keys = keys,
             .key_specs = key_specs,
             .h = h,
-            .budget = budget,
+            .budget = limit / 2,
+            .limit = limit,
             .store_arena = store_arena,
             .store = try consumer.initOutputAggregator(store_arena.allocator(), meta, specs),
             .heap = .empty,
@@ -5659,11 +5663,44 @@ const TopRows = struct {
         options: consumer.DecodeOptions,
     ) !void {
         if (self.h == 0) return;
-        var rg_arena = std.heap.ArenaAllocator.init(self.gpa);
+        // The row group decodes on what the query's budget has left beside the kept rows, drawn before it is
+        // allocated: a row group too big for it refuses here, not after the decode has already been resident. Never
+        // less than the fixed slack's `decode_floor`: under a tiny budget a decode's few bytes of noise decided it.
+        const held = self.store_arena.queryCapacity() + self.heap.cap * @sizeOf(Entry);
+        var room: core_memory.SharedBudget = .{ .limit = @max(self.limit -| held, decode_floor) };
+        var decode: core_memory.Charged = .{ .child = self.gpa, .budget = &room };
+        return self.offerOn(decode.allocator(), rg, meta, src, filter, fetch, at, timings, options) catch |e|
+            decode.refusal(e);
+    }
+
+    fn offerOn(
+        self: *TopRows,
+        dg: std.mem.Allocator,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        src: consumer.RGSrc,
+        filter: ?filter_ast.Filter,
+        fetch: []const bool,
+        at: RowPos,
+        timings: *consumer.Timings,
+        options: consumer.DecodeOptions,
+    ) !void {
+        var rg_arena = std.heap.ArenaAllocator.init(dg);
         defer rg_arena.deinit();
         const ra = rg_arena.allocator();
         var keyed = try consumer.initOutputAggregator(ra, meta, self.key_specs);
-        const n = try consumer.appendProjectedRGWithOptions(&keyed, self.gpa, rg, meta, src, filter, fetch, self.key_specs, timings, options);
+        const n = try consumer.appendProjectedRGWithOptions(
+            &keyed,
+            dg,
+            rg,
+            meta,
+            src,
+            filter,
+            fetch,
+            self.key_specs,
+            timings,
+            options,
+        );
         if (n == 0) return;
 
         self.heap.context = self;
@@ -5686,7 +5723,18 @@ const TopRows = struct {
 
         // The rows that entered and are still kept: copy their output columns, decoded once for the row group.
         var outputs = try consumer.initOutputAggregator(ra, meta, self.specs);
-        const m = try consumer.appendProjectedRGWithOptions(&outputs, self.gpa, rg, meta, src, filter, fetch, self.specs, timings, options);
+        const m = try consumer.appendProjectedRGWithOptions(
+            &outputs,
+            dg,
+            rg,
+            meta,
+            src,
+            filter,
+            fetch,
+            self.specs,
+            timings,
+            options,
+        );
         if (m != n) return error.ShortDecode;
         for (self.heap.items) |*e| if (e.row == pending) {
             try copyRow(&self.store, &outputs, e.pos.ord);
@@ -5882,20 +5930,15 @@ const max_gather_rows = 1 << 16;
 /// memory does; it sends the query to `TopRows`, which answers the same. Row group decoding is not counted here, as it
 /// is not for `TopRows`.
 const Reservation = struct {
-    limit: usize,
-    used: std.atomic.Value(usize) = .init(0),
+    /// What the heaps, the gather and the workers' decode regions (`RankWorker.decode`) hold together.
+    ledger: core_memory.SharedBudget,
 
     fn take(self: *Reservation, n: usize) error{ExceededMemoryBudget}!void {
-        var cur = self.used.load(.monotonic);
-        while (true) {
-            const next = std.math.add(usize, cur, n) catch return error.ExceededMemoryBudget;
-            if (next > self.limit) return error.ExceededMemoryBudget;
-            cur = self.used.cmpxchgWeak(cur, next, .monotonic, .monotonic) orelse return;
-        }
+        _ = self.ledger.drawExact(n) orelse return error.ExceededMemoryBudget;
     }
 
     fn give(self: *Reservation, n: usize) void {
-        _ = self.used.fetchSub(n, .monotonic);
+        self.ledger.release(n);
     }
 };
 
@@ -6000,7 +6043,9 @@ const RankWorker = struct {
     /// Row groups whose rows this worker offered, for its profile span.
     ranked: usize = 0,
     /// What a row group decodes on, rewound for the next with its pages kept: on the general allocator, which maps
-    /// every large block afresh (`core.memory.fixHeapThreshold`), each row group's decode was faulted in anew.
+    /// every large block afresh (`core.memory.fixHeapThreshold`), each row group's decode was faulted in anew. Drawn
+    /// from the reservation as its blocks reach new pages, and held while kept: a row group it cannot take fails the
+    /// ranking (`ExceededMemoryBudget`), which then runs as `TopRows`.
     decode: huge_pages.Region,
 
     fn init(shared: *RankShared, index: usize) !RankWorker {
@@ -6009,7 +6054,9 @@ const RankWorker = struct {
         errdefer shared.res.give(size);
         var heap: std.PriorityQueue(RankEntry, []const RowSortKey, RankEntry.later) = .initContext(shared.keys);
         try heap.ensureTotalCapacityPrecise(shared.gpa, shared.h);
-        return .{ .shared = shared, .index = index, .heap = heap, .decode = .init(shared.gpa, ENCODE_REGION_RESERVE) };
+        var decode: huge_pages.Region = .init(shared.gpa, ENCODE_REGION_RESERVE);
+        decode.budget = &shared.res.ledger;
+        return .{ .shared = shared, .index = index, .heap = heap, .decode = decode };
     }
 
     fn deinit(w: *RankWorker) void {
@@ -6031,7 +6078,7 @@ const RankWorker = struct {
         while (!s.failed.load(.monotonic)) {
             const item = s.cursor.next() orelse break;
             w.step(item) catch |e| {
-                w.err = e;
+                w.err = if (e == error.OutOfMemory and w.decode.refused) error.ExceededMemoryBudget else e;
                 w.err_at = item - s.cursor.items.ptr;
                 s.failed.store(true, .monotonic);
                 break;
@@ -6207,6 +6254,28 @@ const RankWorker = struct {
         _ = s.cut_version.fetchAdd(1, .release);
     }
 };
+
+test "a Top-N worker's decode is drawn from the reservation before it is allocated, and refused past it" {
+    var reservation: Reservation = .{ .ledger = .{ .limit = 4 << 20 } };
+    var shared: RankShared = undefined;
+    shared.gpa = std.testing.allocator;
+    shared.res = &reservation;
+    shared.h = 1;
+    shared.keys = &.{};
+    var worker = try RankWorker.init(&shared, 0);
+    defer worker.deinit();
+    if (worker.decode.buf.len == 0) return error.SkipZigTest;
+    const before = reservation.ledger.used.load(.monotonic);
+    // Past the reservation: refused before anything is allocated, as the ranking's own refusal.
+    try std.testing.expectError(error.OutOfMemory, worker.decode.allocator().alloc(u8, 8 << 20));
+    try std.testing.expect(worker.decode.refused);
+    try std.testing.expectEqual(before, reservation.ledger.used.load(.monotonic));
+    worker.decode.refused = false;
+    // Within it: held, a huge page at a time, as long as the worker keeps it.
+    const bytes = try worker.decode.allocator().alloc(u8, 1 << 20);
+    @memset(bytes, 1);
+    try std.testing.expect(reservation.ledger.used.load(.monotonic) >= before + bytes.len);
+}
 
 /// The winners of one row group, by their physical rows, ascending.
 const GatherGroup = struct {
@@ -6414,7 +6483,8 @@ fn rankAndGather(
     t: *Timings,
 ) !?Gathered {
     const res = try arena.create(Reservation);
-    res.* = .{ .limit = args.max_memory / 2 };
+    // Heaps, gather and the workers' decode together: the query's budget.
+    res.* = .{ .ledger = .{ .limit = args.max_memory } };
     var g: Gathered = .{
         .out = try consumer.initOutputAggregator(arena, &metas[0], specs),
         .mem = .{ .gpa = ctx.gpa, .res = res },
@@ -6448,9 +6518,9 @@ fn gatherInto(
     const key_specs = try arena.alloc(consumer.OutputCol, keys.len);
     for (keys, key_specs) |k, *spec| spec.* = k.spec;
     const threads = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
-    // Every worker holds a heap of h: fewer workers rather than heaps taking more than a quarter of the budget.
+    // Every worker holds a heap of h: fewer workers rather than heaps taking more than an eighth of the budget.
     var n_workers = std.math.clamp(threads, 1, items.len);
-    while (n_workers > 1 and n_workers *| h *| @sizeOf(RankEntry) > res.limit / 4) n_workers -= 1;
+    while (n_workers > 1 and n_workers *| h *| @sizeOf(RankEntry) > res.ledger.limit / 8) n_workers -= 1;
 
     const t_rank = nowMonoNs();
     var shared: RankShared = .{
@@ -6997,7 +7067,7 @@ fn runPrintSinkOver(
             null;
         defer if (gathered) |*g| g.deinit();
         var ranked = if (gathered) |g| g.out else ranked: {
-            var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory / 2);
+            var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, args.max_memory);
             defer top.deinit();
             for (items) |item| {
                 const in = opened.inputs[item.file];

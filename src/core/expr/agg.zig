@@ -268,14 +268,17 @@ pub const DistinctSet = struct {
         budget.release(slack);
     }
 
-    /// Exact draws, never a block: a set per group is a holder too many to each strand a block's slack (a GROUP BY's
-    /// count(DISTINCT) held a 64 KiB block per group of a few values).
+    /// Drawn in proportion to the set, never a block: a set per group is a holder too many to each strand a block's
+    /// slack (a GROUP BY's count(DISTINCT) held a 64 KiB block per group of a few values), and an exact draw per
+    /// entry put every insert of every worker on the ledger's one counter. An eighth of what the set holds strands
+    /// at most that much, and a big set draws a logarithmic number of times.
     pub fn drawMore(self: *DistinctSet, need: usize) error{ExceededMemoryBudget}!void {
         if (self.allocated_bytes + need <= self.max_memory_bytes) return;
         const budget = self.shared orelse return;
         if (budget.tight()) self.releaseSlack();
         const deficit = (self.allocated_bytes + need) - self.max_memory_bytes;
-        const got = budget.drawExact(deficit) orelse blk: {
+        const ahead = if (budget.tight()) deficit else @max(deficit, self.allocated_bytes / 8);
+        const got = budget.drawExact(ahead) orelse budget.drawExact(deficit) orelse blk: {
             self.releaseSlack();
             break :blk budget.drawExact(need) orelse return error.ExceededMemoryBudget;
         };

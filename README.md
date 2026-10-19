@@ -349,8 +349,12 @@ of what the file claims. Two things are still always fast and always safe, becau
 
 Floats compare in total order, as they sort: NaN equals NaN and lies above every number, so `x > 5` and `NOT (x < 5)`
 keep NaN rows. Float bounds leave NaN out, so a chunk whose max is below 5 can still hold rows passing `x > 5`. ZPQ
-prunes such a chunk only when the file proves it holds no NaN: a `nan_count` of zero in its statistics or page index
-(ZPQ writes one for every float chunk), or IEEE_754_TOTAL_ORDER bounds. A missing count means NaN may be present.
+prunes such a chunk only when NaN is proven absent: by a `nan_count` of zero in the chunk's statistics or its page
+index (a file declaring IEEE_754_TOTAL_ORDER must write one), or by the NaN probe, which reads the float chunk alone and
+tests its values (its dictionary, when every page is coded) before any row group is planned. A missing count means NaN
+may be present. ZPQ writes `nan_count` for every float chunk it encodes; a chunk it byte-copies keeps its source's
+statistics, count or no count. The probe runs for row output, writes and S3 reads; aggregates over local files use it
+only for uncompressed chunks, where it costs less than the scan it replaces.
 
 If you know your writer's statistics are trustworthy, opt into the stats fast-path — `min / max / sum` answered from
 metadata in microseconds, without touching a data page:

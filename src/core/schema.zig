@@ -1439,6 +1439,30 @@ pub const RowGroup = struct {
 
 /// `ColumnOrder` union member id for TYPE_DEFINED_ORDER, the only order the full-match proof reads stats in.
 pub const COLUMN_ORDER_TYPE_DEFINED: i16 = 1;
+/// The `created_by` of every file whose column data zpq encodes, so readers apply no other writer's statistics
+/// workarounds to it. A pure byte copy, or a recompression that keeps every page's values and every statistic as it
+/// found them, keeps its source's string instead.
+pub const ZPQ_CREATED_BY = "zpq version " ++ @import("build_options").version;
+
+/// Drop a chunk's deprecated `min`/`max` unless they mirror its `min_value`/`max_value`, as zpq's writer always writes
+/// them. For a chunk copied from another writer into a file `ZPQ_CREATED_BY` labels: readers trust or work around the
+/// deprecated pair by `created_by` (some writers ordered it signed for byte arrays), and under zpq's name they would
+/// trust it. `min_value`/`max_value` are ordered by the column order and kept.
+pub fn dropForeignDeprecatedBounds(chunk: *ColumnChunk) void {
+    const cm = &(chunk.meta_data orelse return);
+    const st = &(cm.statistics orelse return);
+    const mirrored = mirrors(st.min, st.min_value) and mirrors(st.max, st.max_value);
+    if (mirrored) return;
+    st.min = null;
+    st.max = null;
+}
+
+fn mirrors(deprecated: ?[]const u8, typed: ?[]const u8) bool {
+    const d = deprecated orelse return true;
+    const t = typed orelse return false;
+    return std.mem.eql(u8, d, t);
+}
+
 /// `ColumnOrder` member id for IEEE_754_TOTAL_ORDER (FLOAT/DOUBLE/FLOAT16): bounds are the least and greatest non-NaN
 /// values, NaN only for a chunk or page of nothing but NaN, and nan_count is mandatory.
 pub const COLUMN_ORDER_IEEE_754_TOTAL: i16 = 2;
@@ -2186,4 +2210,42 @@ test "sameAnnotation: one annotation however written, refusing genuinely differe
     implied.converted_type = null;
     try std.testing.expect(SchemaElement.sameAnnotation(&signed, &implied));
     try std.testing.expect(!SchemaElement.sameAnnotation(&signed, &conflicting));
+}
+
+test "dropForeignDeprecatedBounds keeps a mirrored pair and drops one a foreign writer ordered its own way" {
+    var path: StringList = .empty;
+    defer path.deinit(std.testing.allocator);
+    const Case = struct { st: Statistics, keep: bool };
+    const cases = [_]Case{
+        // zpq's own writer: the deprecated pair mirrors the typed one.
+        .{ .st = .{ .min = "a", .max = "z", .min_value = "a", .max_value = "z" }, .keep = true },
+        // An unsigned or DECIMAL chunk zpq wrote: no deprecated pair at all.
+        .{ .st = .{ .min_value = "a", .max_value = "z" }, .keep = true },
+        // A signed-ordered byte-array pair beside the typed one, and a deprecated pair alone.
+        .{ .st = .{ .min = "\x80", .max = "z", .min_value = "a", .max_value = "\x80" }, .keep = false },
+        .{ .st = .{ .min = "a", .max = "z" }, .keep = false },
+    };
+    for (cases) |c| {
+        var chunk: ColumnChunk = .{ .file_path = null, .file_offset = 0, .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 1,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 4,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = c.st,
+        } };
+        dropForeignDeprecatedBounds(&chunk);
+        const st = chunk.meta_data.?.statistics.?;
+        try std.testing.expectEqual(c.keep, st.min != null or c.st.min == null);
+        try std.testing.expectEqual(c.keep, st.max != null or c.st.max == null);
+        // The typed pair is never touched.
+        try std.testing.expectEqual(c.st.min_value, st.min_value);
+        try std.testing.expectEqual(c.st.max_value, st.max_value);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, ZPQ_CREATED_BY, "zpq version "));
 }

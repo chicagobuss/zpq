@@ -2586,11 +2586,14 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // is an error instead of a debug assert.
     const footer_leaves = invariant.footerLeafCount(new_schema_items.items);
     const kept_map: ?[]const usize = if (select_items == null and kept_set != null) kept_in_order.items else null;
+    // Encoded column data makes the file zpq's (row groups copied beside it keep only bounds no writer quirk
+    // reads differently); a pure byte copy or recompression stays its source's.
+    if (need_encoder) for (new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
     const new_meta: schema.FileMetaData = .{
         .version = meta0.version,
         .schema = new_schema_items,
         .num_rows = rows_kept,
-        .created_by = meta0.created_by,
+        .created_by = if (need_encoder) schema.ZPQ_CREATED_BY else meta0.created_by,
         .row_groups = new_row_groups,
         .column_orders = try schema.FileMetaData.outputColumnOrders(arena, footer_leaves, kept_map, copied_from.items),
     };
@@ -7296,7 +7299,7 @@ const ParquetPrint = struct {
             .schema = self.schema_items,
             .num_rows = @intCast(rows),
             .row_groups = self.rgs,
-            .created_by = "zpq",
+            .created_by = schema.ZPQ_CREATED_BY,
             .column_orders = try schema.FileMetaData.outputColumnOrders(self.arena, invariant.footerLeafCount(self.schema_items.items), null, &.{}),
         };
         var writer: thrift.Writer = .init(self.arena);
@@ -11165,4 +11168,35 @@ test "CSV: temporal text, bytes under the JSON rules, quoting, NULL and the empt
         \\,,,,0
         \\
     , w.buffered());
+}
+
+test "written files name zpq as their writer once zpq encodes their data, and keep their source's otherwise" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    const source = "parquet-cpp-arrow version 25.0.1";
+    const Case = struct { args: QueryArgs, writer: []const u8 };
+    const cases = [_]Case{
+        // Re-encoded: a filter, a projection by --select, and a filter whose every row group fully matches.
+        .{ .args = .{ .inputs = &.{fixture}, .output = out, .filter = "b >= 3" }, .writer = schema.ZPQ_CREATED_BY },
+        .{ .args = .{ .inputs = &.{fixture}, .output = out, .select = "b, s" }, .writer = schema.ZPQ_CREATED_BY },
+        // A byte copy, and a recompression that keeps every value and statistic: the source's.
+        .{ .args = .{ .inputs = &.{fixture}, .output = out }, .writer = source },
+        .{ .args = .{ .inputs = &.{fixture}, .output = out, .codec = .ZSTD }, .writer = source },
+    };
+    for (cases) |c| {
+        var r = try runQuery(ctx, c.args);
+        defer r.deinit(gpa);
+        const bytes = try metadata.readFileSlice(out, gpa);
+        defer gpa.free(bytes);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const meta = try metadata.open(arena.allocator(), bytes);
+        try std.testing.expectEqualStrings(c.writer, meta.created_by.?);
+    }
 }

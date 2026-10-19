@@ -156,6 +156,8 @@ pub fn assemble(
         .version = meta0.version,
         .schema = if (kept_columns) |kc| try projectSchema(arena, meta0.schema, kc) else meta0.schema,
         .num_rows = total_rows,
+        // A pure byte copy: every page and statistic is the source writer's, so its name stays (see
+        // `schema.ZPQ_CREATED_BY`).
         .created_by = meta0.created_by,
         .row_groups = new_row_groups,
         .column_orders = column_orders,

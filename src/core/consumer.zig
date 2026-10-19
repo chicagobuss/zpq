@@ -2308,7 +2308,7 @@ fn writeAggregateRowsEncoded(
         .version = 1,
         .schema = new_schema,
         .num_rows = num_rows,
-        .created_by = null,
+        .created_by = schema.ZPQ_CREATED_BY,
         .row_groups = new_row_groups,
         .column_orders = try schema.FileMetaData.outputColumnOrders(arena, rg_columns.items.len, null, &.{}),
     };

@@ -71,8 +71,11 @@ pub const Region = struct {
     child: std.mem.Allocator,
     /// The whole mapping, for `munmap`; empty when the reservation failed.
     mapping: []align(std.heap.page_size_min) u8 = &.{},
-    /// The usable, 2 MiB-aligned span inside `mapping`.
+    /// The usable span inside `mapping`, 2 MiB-aligned but for `phase`.
     buf: []u8 = &.{},
+    /// Where `buf` starts in its first huge page: zero but for the arena of `initPair`, which starts past the
+    /// scratch in the huge page the two share. Charges count whole huge pages from that page's start.
+    phase: usize = 0,
     end: usize = 0,
     /// Offset of the newest block, the only one that can grow, shrink or be given back.
     last: usize = 0,
@@ -89,6 +92,36 @@ pub const Region = struct {
     refused: bool = false,
 
     pub fn init(child: std.mem.Allocator, reserve: usize) Region {
+        const r = map(child, reserve);
+        advise(r.buf);
+        return r;
+    }
+
+    pub const Pair = struct { scratch: Region, arena: Region };
+
+    /// The scratch's span in a `Pair`: a scan's page buffers are mostly a few hundred KiB.
+    pub const pair_scratch_span: usize = 1 << 20;
+
+    /// A scan worker's decode arena and its page scratch, which lives across the arena's rewinds, on one mapping
+    /// that `arena` owns: the scratch takes the first `pair_scratch_span` of its first huge page and the arena the
+    /// rest, so a small scan faults in and zeroes one huge page per worker, not one each. That first page is the
+    /// worker's slack, the allowance of both, counted once: the scratch never draws for its span and the arena draws
+    /// from the next page on. A scratch block past its span spills straight to the OS (`page_allocator`), charged by
+    /// its length: it grows in place by remapping rather than copying beside itself, and is resident only until
+    /// freed, which a general heap's per-thread caches do not promise. Deinit both together, the scratch first.
+    pub fn initPair(child: std.mem.Allocator, reserve: usize) Pair {
+        var arena = map(child, reserve + pair_scratch_span);
+        var scratch: Region = .{ .child = std.heap.page_allocator, .allowance = huge_page_size };
+        arena.allowance = huge_page_size;
+        if (arena.buf.len == 0) return .{ .scratch = scratch, .arena = arena };
+        advise(arena.buf);
+        scratch.buf = arena.buf[0..pair_scratch_span];
+        arena.buf = arena.buf[pair_scratch_span..];
+        arena.phase = pair_scratch_span;
+        return .{ .scratch = scratch, .arena = arena };
+    }
+
+    fn map(child: std.mem.Allocator, reserve: usize) Region {
         var r: Region = .{ .child = child };
         if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return r;
         const len = std.mem.alignForward(usize, reserve, huge_page_size) + huge_page_size;
@@ -98,7 +131,6 @@ pub const Region = struct {
         const lo = std.mem.alignForward(usize, @intFromPtr(m.ptr), huge_page_size);
         r.mapping = m;
         r.buf = @as([*]u8, @ptrFromInt(lo))[0 .. len - huge_page_size];
-        advise(r.buf);
         return r;
     }
 
@@ -123,14 +155,15 @@ pub const Region = struct {
         const b = self.budget orelse return true;
         if (self.buf.len == 0) return true;
         const held = self.charged + self.allowance;
-        return estimate <= held or estimate - held <= b.available();
+        const need = self.phase +| estimate;
+        return need <= held or need - held <= b.available();
     }
 
     /// Give back what `admit` reserved past the pages blocks have reached: at a row-group boundary, where the next
     /// row group's reservation replaces the last one's.
     pub fn settle(self: *Region) void {
         const b = self.budget orelse return;
-        const keep = @min(self.buf.len, std.mem.alignForward(usize, self.touched, huge_page_size)) -| self.allowance;
+        const keep = self.hugePagesTo(self.touched) -| self.allowance;
         if (self.charged <= keep) return;
         b.release(self.charged - keep);
         self.charged = keep;
@@ -138,7 +171,7 @@ pub const Region = struct {
 
     fn chargeTo(self: *Region, end: usize) bool {
         const b = self.budget orelse return true;
-        const want = @min(self.buf.len, std.mem.alignForward(usize, end, huge_page_size)) -| self.allowance;
+        const want = self.hugePagesTo(end) -| self.allowance;
         if (want <= self.charged) return true;
         if (b.drawExact(want - self.charged) == null) {
             self.refused = true;
@@ -146,6 +179,11 @@ pub const Region = struct {
         }
         self.charged = want;
         return true;
+    }
+
+    /// The whole huge pages `buf[0..offset]` lies on (capped at `buf`), in bytes from the start of its first one.
+    fn hugePagesTo(self: *const Region, offset: usize) usize {
+        return std.mem.alignForward(usize, self.phase + @min(offset, self.buf.len), huge_page_size);
     }
 
     fn chargeSpill(self: *Region, n: usize) bool {
@@ -182,7 +220,7 @@ pub const Region = struct {
         }
         self.touched = self.end;
         if (self.budget) |b| {
-            const keep = @min(self.charged, std.mem.alignForward(usize, self.end, huge_page_size) -| self.allowance);
+            const keep = @min(self.charged, self.hugePagesTo(self.end) -| self.allowance);
             b.release(self.charged - keep);
             self.charged = keep;
         }
@@ -451,4 +489,116 @@ test "two regions' row-group fit checks can both pass; their draws still hold th
     try std.testing.expect(b.refused);
     try std.testing.expectEqual(budget.limit, budget.used.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), b.end);
+}
+
+/// The number on `key`'s line for the mapping holding `addr`, as /proc/self/smaps reports it.
+fn smapsFieldForTest(addr: usize, key: []const u8) !usize {
+    const linux = std.os.linux;
+    const rc = linux.open("/proc/self/smaps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const buf = try std.testing.allocator.alloc(u8, 8 << 20);
+    defer std.testing.allocator.free(buf);
+    var len: usize = 0;
+    while (true) {
+        const nr = linux.read(fd, buf[len..].ptr, buf.len - len);
+        if (linux.errno(nr) != .SUCCESS or len + nr == buf.len) return error.ReadFailed;
+        if (nr == 0) break;
+        len += nr;
+    }
+    var inside = false;
+    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
+    while (lines.next()) |line| {
+        const dash = std.mem.indexOfScalar(u8, line, '-');
+        const space = std.mem.indexOfScalar(u8, line, ' ');
+        if (dash != null and space != null and dash.? < space.?) header: {
+            const lo = std.fmt.parseInt(usize, line[0..dash.?], 16) catch break :header;
+            const hi = std.fmt.parseInt(usize, line[dash.? + 1 .. space.?], 16) catch break :header;
+            inside = lo <= addr and addr < hi;
+            continue;
+        }
+        if (inside and std.mem.startsWith(u8, line, key)) {
+            var words = std.mem.tokenizeScalar(u8, line[key.len..], ' ');
+            return std.fmt.parseInt(usize, words.next() orelse return error.ReadFailed, 10);
+        }
+    }
+    return error.SkipZigTest;
+}
+
+/// The resident bytes of the mapping holding `addr`, as /proc/self/smaps reports them.
+fn rssForTest(addr: usize) !usize {
+    return (try smapsFieldForTest(addr, "Rss:")) * 1024;
+}
+
+test "a worker's pair of regions shares its first huge page, counted once, and holds no more than it draws past it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const huge = huge_page_size;
+    const span = Region.pair_scratch_span;
+    var budget: core_memory.SharedBudget = .{ .limit = 32 * huge };
+    var pair = Region.initPair(std.testing.allocator, 8 * huge);
+    const scratch = &pair.scratch;
+    const arena = &pair.arena;
+    defer {
+        scratch.deinit();
+        arena.deinit();
+    }
+    if (arena.buf.len == 0) return error.SkipZigTest;
+    scratch.budget = &budget;
+    arena.budget = &budget;
+    const base = @intFromPtr(scratch.buf.ptr);
+    // The scratch's span, then the arena, in one mapping the arena owns, starting on a huge page.
+    try std.testing.expect(std.mem.isAligned(base, huge));
+    try std.testing.expectEqual(span, scratch.buf.len);
+    try std.testing.expectEqual(base + span, @intFromPtr(arena.buf.ptr));
+    try std.testing.expect(arena.buf.len >= 8 * huge);
+    try std.testing.expectEqual(@as(usize, 0), scratch.mapping.len);
+    // Both on the shared first huge page draw nothing: it is the worker's slack.
+    const s = try scratch.allocator().alloc(u8, 300 << 10);
+    @memset(s, 1);
+    @memset(try arena.allocator().alloc(u8, 200 << 10), 2);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    // The arena draws from the next huge page on, before its block is handed out.
+    const a = try arena.allocator().alloc(u8, huge);
+    try std.testing.expectEqual(huge, budget.used.load(.monotonic));
+    @memset(a, 3);
+    try std.testing.expectEqual(@as(u8, 1), s[s.len - 1]);
+    // Past its span the scratch spills, charged by length; freed, given back.
+    const big = try scratch.allocator().alloc(u8, span);
+    try std.testing.expect(!scratch.owns(big) and !arena.owns(big));
+    try std.testing.expectEqual(huge + span, budget.used.load(.monotonic));
+    scratch.allocator().free(big);
+    // Resident: never more than drawn plus the one slack page (whole huge pages where THP backs them).
+    try std.testing.expect(try rssForTest(base) <= arena.charged + scratch.charged + huge);
+    // A budget that refuses the arena's next page refuses the block; what it holds stays.
+    budget.limit = budget.used.load(.monotonic);
+    try std.testing.expectError(error.OutOfMemory, arena.allocator().alloc(u8, 2 * huge));
+    try std.testing.expect(arena.refused);
+    // Rewound and trimmed, the arena gives back all it drew; the scratch keeps its bytes.
+    arena.rewind();
+    arena.trim();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 1), s[0]);
+    try std.testing.expect(arena.fitsRowGroup(huge - span));
+    budget.limit = 0;
+    try std.testing.expect(!arena.fitsRowGroup(huge));
+}
+
+test "a pair's scratch block that its child refuses past the span holds no charge, and the pair still serves" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var budget: core_memory.SharedBudget = .{ .limit = 32 * huge_page_size };
+    var pair = Region.initPair(std.testing.allocator, 4 * huge_page_size);
+    pair.scratch.child = failing.allocator();
+    defer {
+        pair.scratch.deinit();
+        pair.arena.deinit();
+    }
+    if (pair.arena.buf.len == 0) return error.SkipZigTest;
+    pair.scratch.budget = &budget;
+    pair.arena.budget = &budget;
+    try std.testing.expectError(error.OutOfMemory, pair.scratch.allocator().alloc(u8, 2 * Region.pair_scratch_span));
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), pair.scratch.spilled);
+    @memset(try pair.scratch.allocator().alloc(u8, 4096), 1);
+    @memset(try pair.arena.allocator().alloc(u8, 4096), 2);
 }

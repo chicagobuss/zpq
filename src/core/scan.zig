@@ -1496,14 +1496,14 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     defer release_span.end(.worker_release, profile.args(.{w.index}));
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
     // It and the scratch are written front to back and reused, each on a huge-page region of the worker's (see
-    // `huge_pages.Region`), rewound here for the next pass. The first huge page of the two is the worker's slack.
+    // `huge_pages.Region`), rewound here for the next pass. The two share their first huge page, the worker's slack
+    // (`Region.initPair`): a small scan faults in one huge page per worker, not one for each region.
     if (w.region == null) {
-        w.region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+        std.debug.assert(w.scratch_region == null);
+        const pair = huge_pages.Region.initPair(w.gpa, WORKER_REGION_RESERVE);
+        w.region = pair.arena;
         w.region.?.budget = w.ledger;
-        w.region.?.allowance = huge_pages.huge_page_size;
-    }
-    if (w.scratch_region == null) {
-        w.scratch_region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+        w.scratch_region = pair.scratch;
         w.scratch_region.?.budget = w.ledger;
     }
     if (w.ledger) |l| if (w.charged == null) {
@@ -1654,8 +1654,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
 
 fn releaseRegions(workers: []Worker) void {
     for (workers) |*w| {
-        if (w.region) |*r| r.deinit();
+        // The scratch first: the arena's region owns the mapping the two share.
         if (w.scratch_region) |*r| r.deinit();
+        if (w.region) |*r| r.deinit();
         w.region = null;
         w.scratch_region = null;
     }

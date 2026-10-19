@@ -116,6 +116,16 @@ pub const Region = struct {
         return self.chargeTo(bytes);
     }
 
+    /// Whether a row group's whole decode, by an `estimate` kept on the high side, fits what the region holds and
+    /// the budget has free now: checked, not drawn. Drawn, every worker held its overestimate at once and queries
+    /// that fit refused. Its blocks draw as they are placed; one refused there slices the row group.
+    pub fn fitsRowGroup(self: *const Region, estimate: usize) bool {
+        const b = self.budget orelse return true;
+        if (self.buf.len == 0) return true;
+        const held = self.charged + self.allowance;
+        return estimate <= held or estimate - held <= b.available();
+    }
+
     /// Give back what `admit` reserved past the pages blocks have reached: at a row-group boundary, where the next
     /// row group's reservation replaces the last one's.
     pub fn settle(self: *Region) void {

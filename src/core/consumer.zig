@@ -2317,11 +2317,12 @@ pub const AggWorkspace = struct {
     ledger: ?*const expr_agg.SharedBudget = null,
 };
 
-/// Whether a row group's whole decode of `bytes` may go on the worker's region: the query's ledger takes what the
-/// region does not hold already. Without a region (or a ledger) only the decode budget decides.
+/// Whether a row group's whole decode of `bytes` may go on the worker's region: the query's ledger has room now for
+/// what the region does not hold already (`Region.fitsRowGroup`). Without a region (or a ledger) only the decode budget
+/// decides.
 fn admitWhole(ws: AggWorkspace, bytes: usize) bool {
     const r = ws.region orelse return true;
-    return r.admit(bytes);
+    return r.fitsRowGroup(bytes);
 }
 
 /// Give back everything the worker's region holds, the row-group arena's nodes and the decode scratch, with what
@@ -2329,12 +2330,14 @@ fn admitWhole(ws: AggWorkspace, bytes: usize) bool {
 /// beside the pages it was refused for. Nothing allocated on either may be live.
 fn dropRegion(ws: AggWorkspace) void {
     const r = ws.region orelse return;
-    const prof = ws.scratch.prof;
-    ws.scratch.deinit();
-    ws.scratch.* = .init(r.allocator());
-    ws.scratch.prof = prof;
-    ws.rg_arena.deinit();
-    ws.rg_arena.* = .init(r.allocator());
+    if (ws.rg_arena.region == null) {
+        const prof = ws.scratch.prof;
+        ws.scratch.deinit();
+        ws.scratch.* = .init(r.allocator());
+        ws.scratch.prof = prof;
+        ws.rg_arena.deinit();
+        ws.rg_arena.* = .init(r.allocator());
+    }
     r.rewind();
     r.trim();
 }
@@ -3007,20 +3010,23 @@ fn scanRGSliced(
     // reservation, or the ledger's room, holds at the bytes a row of the last one took.
     var rows_now = if (ws.ledger != null) @min(slice_rows, 64) else slice_rows;
     // One arena for every slice, its pages kept from one to the next rather than faulted in afresh; what a row took is
-    // measured on the first, when the arena holds nothing else.
+    // measured on the first, when the arena holds nothing else. The worker's own row-group arena when it is a region
+    // (nothing is on it by now: the row group starts over here), whose blocks are what the slice asked for; an
+    // `ArenaAllocator` reserves past that, and its reservation was charged as if used.
+    const on_region = ws.region != null and ws.rg_arena.region != null;
     var slice = std.heap.ArenaAllocator.init(side);
     defer slice.deinit();
     var took: ?usize = null;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
         defer done += n;
-        _ = slice.reset(.retain_capacity);
+        if (on_region) ws.rg_arena.nextRowGroup() else _ = slice.reset(.retain_capacity);
         defer if (ws.ledger) |l| {
-            const kept = slice.queryCapacity();
+            const kept = if (on_region) ws.region.?.end else slice.queryCapacity();
             if (took == null) took = @max(1, kept / n);
             rows_now = sliceRows(@min(reserved, l.available() / 2 + kept) / took.?, num_rows);
         };
-        const sa = slice.allocator();
+        const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };

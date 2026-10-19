@@ -8726,29 +8726,32 @@ test "regression: DELTA_BYTE_ARRAY values are charged where they decode, and a r
             try std.testing.expectEqual(@as(i128, 1500), counted.aggregate.output.aggs[0].value.i);
         }
         // Read whole, the chunk's pages together pass the budget; a slice at a time, slices cut by the bytes their rows
-        // took, they hold a 5 MB page and a slice: within 32 MiB of the query's ledger, and not within 8 MiB, nor on
-        // the last rerun's small ledger, where it refuses (it held 160 MB at 8 MiB before slices were cut by bytes).
+        // took, they hold a 5 MB page and a slice (it held 160 MB at 8 MiB before slices were cut by bytes): not
+        // within 4 MiB, where it refuses, and within 8 MiB, charged for the pieces its decode arena handed out rather
+        // than the nodes it reserved.
         const refused = runQuery(ctx, .{
             .inputs = &.{path},
             .aggregate = "count(*) AS n",
             .filter = "s = 'x'",
             .parallelism = j,
-            .max_memory = 8 << 20,
+            .max_memory = 4 << 20,
         });
         if (refused) |r| {
             var rr = r;
             rr.deinit(gpa);
             return error.TestUnexpectedResult;
         } else |e| try std.testing.expect(e == error.ExceededMemoryBudget or e == error.DecodeExceededBudget);
-        var res = try runQuery(ctx, .{
-            .inputs = &.{path},
-            .aggregate = "count(*) AS n",
-            .filter = "s = 'x'",
-            .parallelism = j,
-            .max_memory = 32 << 20,
-        });
-        defer res.deinit(gpa);
-        try std.testing.expectEqual(@as(i128, 0), res.aggregate.output.aggs[0].value.i);
+        for ([_]usize{ 8 << 20, 32 << 20 }) |budget| {
+            var res = try runQuery(ctx, .{
+                .inputs = &.{path},
+                .aggregate = "count(*) AS n",
+                .filter = "s = 'x'",
+                .parallelism = j,
+                .max_memory = budget,
+            });
+            defer res.deinit(gpa);
+            try std.testing.expectEqual(@as(i128, 0), res.aggregate.output.aggs[0].value.i);
+        }
     }
     // Printed rows decode the same values, and took no budget at all.
     for ([_]usize{ 2 << 20, 64 << 20 }) |budget| {

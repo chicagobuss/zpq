@@ -496,7 +496,7 @@ pub fn groupedCoded(
     sel: *const Sel,
     /// Charged for a composite space past `MAX_COMPOSITE`; null keeps grouping by code to the free spaces.
     budget: ?*DecodeBudget,
-    /// The region `ra` allocates from, whose ledger must take that scratch too (with an arena node's growth).
+    /// The region `ra` allocates from, whose ledger must take that scratch too.
     region: ?*huge_pages.Region,
 ) !bool {
     const num_rows = batch.num_rows;
@@ -526,7 +526,7 @@ pub fn groupedCoded(
         const b = budget orelse return false;
         charged = chargedScratch(space, calls);
         if (!b.tryAcquire(charged)) return false;
-        if (region) |r| if (!r.admit(r.end +| charged +| charged / 2)) {
+        if (region) |r| if (!r.admit(r.end +| charged)) {
             b.release(charged);
             return false;
         };

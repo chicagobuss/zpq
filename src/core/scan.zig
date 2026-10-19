@@ -1421,6 +1421,9 @@ const Worker = struct {
     /// count and admit passes, a census), so a later pass reuses faulted pages instead of zeroing fresh ones. Only the
     /// owning thread touches it during a pass; `prepareAggregate` unmaps it after the last.
     region: ?huge_pages.Region = null,
+    /// The decode scratch's (page and dictionary buffers, kept across row groups), beside `region`, which the row
+    /// group arena has to itself (`consumer.RowGroupArena.initOn`). Drawn from `ledger` as `region` is.
+    scratch_region: ?huge_pages.Region = null,
     decode_budget: ?*consumer.DecodeBudget = null,
     /// The query's ledger, which the region and `charged` draw from; null draws nothing.
     ledger: ?*expr_agg.SharedBudget = null,
@@ -1470,6 +1473,7 @@ fn ownedWinnerBytes(accs: []const expr_agg.Accumulator) usize {
 /// Whether the worker drew decode memory from the query's ledger, past its region's allowance, or was refused it.
 fn decodeHeld(w: *const Worker) bool {
     if (w.region) |r| if (r.charged > 0 or r.spilled > 0 or r.refused) return true;
+    if (w.scratch_region) |r| if (r.charged > 0 or r.spilled > 0 or r.refused) return true;
     if (w.charged) |c| return c.drew.load(.monotonic) or c.refused.load(.monotonic);
     return false;
 }
@@ -1478,6 +1482,7 @@ fn decodeHeld(w: *const Worker) bool {
 fn workerRefusal(w: *const Worker, err: anyerror) anyerror {
     if (err != error.OutOfMemory) return err;
     if (w.region) |r| if (r.refused) return error.ExceededMemoryBudget;
+    if (w.scratch_region) |r| if (r.refused) return error.ExceededMemoryBudget;
     if (w.charged) |c| return c.refusal(err);
     return err;
 }
@@ -1487,12 +1492,16 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     var release_span: profile.Span = .{ .t = null, .start = 0 };
     defer release_span.end(.worker_release, profile.args(.{w.index}));
     // One decode arena for the whole run: scanRGForAgg rewinds it per row group instead of regrowing a fresh one.
-    // Both it and the scratch are written front to back and reused, and both live in the worker's huge-page region
-    // (see `huge_pages.Region`), rewound here for the next pass once both are released.
+    // It and the scratch are written front to back and reused, each on a huge-page region of the worker's (see
+    // `huge_pages.Region`), rewound here for the next pass. The first huge page of the two is the worker's slack.
     if (w.region == null) {
         w.region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
         w.region.?.budget = w.ledger;
         w.region.?.allowance = huge_pages.huge_page_size;
+    }
+    if (w.scratch_region == null) {
+        w.scratch_region = huge_pages.Region.init(w.gpa, WORKER_REGION_RESERVE);
+        w.scratch_region.?.budget = w.ledger;
     }
     if (w.ledger) |l| if (w.charged == null) {
         // Straight from the OS, not the general heap: a sliced row group's arenas come and go, and freed heap blocks
@@ -1501,9 +1510,11 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     };
     const region = &w.region.?;
     defer region.rewind();
-    var rg_decode_arena = consumer.RowGroupArena.init(region.allocator());
+    var rg_decode_arena = consumer.RowGroupArena.initOn(region);
     defer rg_decode_arena.deinit();
-    var scratch = consumer.DecodeScratch.init(region.allocator());
+    const scratch_region = &w.scratch_region.?;
+    defer scratch_region.rewind();
+    var scratch = consumer.DecodeScratch.init(scratch_region.allocator());
     defer scratch.deinit();
     scratch.prof = prof;
 
@@ -1639,10 +1650,12 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
 }
 
 fn releaseRegions(workers: []Worker) void {
-    for (workers) |*w| if (w.region) |*r| {
-        r.deinit();
+    for (workers) |*w| {
+        if (w.region) |*r| r.deinit();
+        if (w.scratch_region) |*r| r.deinit();
         w.region = null;
-    };
+        w.scratch_region = null;
+    }
 }
 
 fn runWorkers(workers: []Worker) void {
@@ -3443,7 +3456,10 @@ fn prepareAggregate(
         };
     }
     const workers = try arena.alloc(Worker, n_workers);
-    for (workers) |*w| w.region = null;
+    for (workers) |*w| {
+        w.region = null;
+        w.scratch_region = null;
+    }
     // A process about to exit leaves the regions to it: unmapping them delays the answer. A failed scan may be run
     // again (`runMultiAggregate`), so it gives them back.
     defer if (!args.leave_regions) releaseRegions(workers);

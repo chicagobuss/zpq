@@ -5,20 +5,33 @@
 //! breaks either must be answered here, not by dropping the reuse.
 
 const std = @import("std");
+const huge_pages = @import("huge_pages.zig");
 
 /// Worker-owned and not thread-safe. Everything allocated from `allocator()` lives until the next `nextRowGroup`.
 pub const RowGroupArena = struct {
     arena: std.heap.ArenaAllocator,
+    /// Set by `initOn`: a region of the arena's own that it allocates from directly, rewound at each boundary.
+    region: ?*huge_pages.Region = null,
 
     pub fn init(child: std.mem.Allocator) RowGroupArena {
         return .{ .arena = .init(child) };
     }
 
+    /// The arena as `region` itself, which nothing else may allocate from. A region charged to a ledger charges what
+    /// its blocks span, and an `ArenaAllocator`'s nodes span more than is written: a new node is half again past the
+    /// last, and growing one in place leaves the request that did not fit as a gap. On the region, the blocks are
+    /// what was asked for, the newest grows in place, and the boundary is a rewind that keeps the pages.
+    pub fn initOn(region: *huge_pages.Region) RowGroupArena {
+        return .{ .arena = .init(std.heap.page_allocator), .region = region };
+    }
+
     pub fn deinit(self: *RowGroupArena) void {
+        if (self.region) |r| return r.rewind();
         self.arena.deinit();
     }
 
     pub fn allocator(self: *RowGroupArena) std.mem.Allocator {
+        if (self.region) |r| return r.allocator();
         return self.arena.allocator();
     }
 
@@ -30,6 +43,9 @@ pub const RowGroupArena = struct {
     /// After the boundary, memory from the previous row group may still be freed or resized (a deferred cleanup that
     /// runs late is safe), but its contents are garbage from the first new allocation on.
     pub fn nextRowGroup(self: *RowGroupArena) void {
+        // On a region a block from before is never its newest after the rewind: freeing it does nothing, resizing it
+        // only shrinks (as below for the nodes).
+        if (self.region) |r| return r.rewind();
         const state = &self.arena.state;
         // The used list is newest-first. Reversing it hands the nodes back oldest-first, so the next row group fills
         // them in the order this one did and touches the same pages, not a scatter across every node's tail.
@@ -135,4 +151,39 @@ test "after a row-group boundary, freeing and resizing memory from before it is 
     empty.nextRowGroup();
     try std.testing.expect(empty.arena.state.used_list == null);
     _ = try empty.allocator().alloc(u8, 8);
+}
+
+test "on a region of its own, the arena is charged for what it hands out, not for nodes reserved past it" {
+    const huge = huge_pages.huge_page_size;
+    var budget: @import("memory.zig").SharedBudget = .{ .limit = 64 * huge };
+    var region = huge_pages.Region.init(std.testing.allocator, 256 * huge);
+    defer region.deinit();
+    if (region.buf.len == 0) return error.SkipZigTest;
+    region.budget = &budget;
+    var rga = RowGroupArena.initOn(&region);
+    defer rga.deinit();
+    const a = rga.allocator();
+    // An `ArenaAllocator` here reserved nodes half again past these and left gaps where it grew one in place.
+    var asked: usize = 0;
+    for (0..10) |i| {
+        const n = (i + 1) * huge / 2;
+        @memset(try a.alloc(u8, n), 1);
+        asked += n;
+    }
+    try std.testing.expectEqual(std.mem.alignForward(usize, asked, huge), region.charged);
+    // Refused past the budget, holding nothing more; what fits is still served.
+    const past = a.alloc(u8, 48 * huge);
+    if (past) |_| return error.TestUnexpectedResult else |e| try std.testing.expectEqual(error.OutOfMemory, e);
+    try std.testing.expectEqual(std.mem.alignForward(usize, asked, huge), region.charged);
+    region.refused = false;
+    // The boundary reuses the pages: a repeat charges nothing more.
+    const first = try a.alloc(u8, huge);
+    rga.nextRowGroup();
+    // A block from before the boundary can be freed or shrunk, not grown, before the next allocation.
+    try std.testing.expect(!a.resize(first, 2 * huge));
+    try std.testing.expect(a.resize(first, huge / 2));
+    a.free(first);
+    const charged = region.charged;
+    for (0..10) |i| @memset(try a.alloc(u8, (i + 1) * huge / 2), 2);
+    try std.testing.expectEqual(charged, region.charged);
 }

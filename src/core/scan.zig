@@ -3055,6 +3055,31 @@ const Chain = struct {
     lean_tried: bool = false,
 };
 
+/// A private plan's decoder room is funded before workers start. Equal quotas stop one worker's decode from
+/// refusing another while most run credit is still unused; every quota remains part of the query's charged peak.
+const PrivateDecode = struct {
+    parent: *core_memory.SharedBudget,
+    held: usize = 0,
+    workers: []core_memory.SharedBudget = &.{},
+
+    fn init(a: std.mem.Allocator, parent: *core_memory.SharedBudget, n: usize, limit: ?usize) !PrivateDecode {
+        const share = @min(limit orelse parent.limit / 2, parent.limit / 4) / n;
+        if (share < huge_pages.huge_page_size) return .{ .parent = parent };
+        const held = parent.drawExact(share * n) orelse return .{ .parent = parent };
+        errdefer parent.release(held);
+        const workers = try a.alloc(core_memory.SharedBudget, n);
+        for (workers) |*w| w.* = .{ .limit = share };
+        return .{ .parent = parent, .held = held, .workers = workers };
+    }
+
+    fn release(self: *PrivateDecode) void {
+        for (self.workers) |*w| std.debug.assert(w.used.load(.monotonic) == 0);
+        self.parent.release(self.held);
+        self.held = 0;
+        self.workers = &.{};
+    }
+};
+
 /// The scan to run after `attempt` was refused with `taken` armed, or null when no narrower one can answer and the
 /// refusal is the query's. `may_fit`: some refusal so far showed one worker's table may fit (`one_table_may_fit`).
 fn narrowed(
@@ -3462,6 +3487,12 @@ fn prepareAggregate(
             .work_items = work_items.items.len,
         };
     }
+    // Tables still share one pool. Only a prepaid private plan's decoders use fixed, funded worker quotas.
+    var own_budget = expr_agg.SharedBudget{ .limit = args.max_memory };
+    const group_budget = args.ledger orelse &own_budget;
+    var private_decode: PrivateDecode = .{ .parent = group_budget };
+    // Declared before region cleanup: their actual allocations go before their funding returns to the query.
+    defer private_decode.release();
     const workers = try arena.alloc(Worker, n_workers);
     for (workers) |*w| {
         w.region = null;
@@ -3479,8 +3510,6 @@ fn prepareAggregate(
     // worker meets the group-heavy row groups is unknowable in advance — fixed quotas made `-j2` reject queries `-j1`
     // ran on identical data. Fully initialized before any worker exists, so none can insert against an unpublished
     // budget.
-    var own_budget = expr_agg.SharedBudget{ .limit = args.max_memory };
-    const group_budget = args.ledger orelse &own_budget;
     // A refusal chain's last scan decodes beside the query's ledger, on a ledger of its own (`narrowed`).
     var lean_budget = expr_agg.SharedBudget{ .limit = core_memory.lean_decode };
     // Shared partitions retain their own reservation slack alongside the workers' local tables.
@@ -3591,11 +3620,13 @@ fn prepareAggregate(
         {
             if (group_by_keys) |keys| if (keys.len > 1) if (ndv_stat) |stat| {
                 const run_width = @max(stat.key_bytes, stat.run_key_bytes);
-                if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536 and
-                    part_state.?.reservePrivate(stat.rows, run_width))
-                {
-                    part_state.?.private_rows = stat.rows;
-                    part_state.?.private_key_bytes = run_width;
+                if (stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536) {
+                    private_decode = try PrivateDecode.init(arena, group_budget, n_workers, args.decode_limit);
+                    if (private_decode.held > 0 and part_state.?.reservePrivate(stat.rows, run_width)) {
+                        part_state.?.private_rows = stat.rows;
+                        part_state.?.private_key_bytes = run_width;
+                        decode_budget = .{ .limit = private_decode.held, .workers = n_workers };
+                    } else private_decode.release();
                 }
             };
         }
@@ -3693,7 +3724,9 @@ fn prepareAggregate(
             .items_per_rg = chunks_per_rg,
             .count_columns = count_columns,
             .decode_budget = if (decode_budget) |*b| b else null,
-            .ledger = if (args.charge_decode or args.ledger == null) args.ledger else &lean_budget,
+            .ledger = if (private_decode.held > 0)
+                &private_decode.workers[wi]
+            else if (args.charge_decode or args.ledger == null) args.ledger else &lean_budget,
             .winners = if (winners.ledger != null) &winners else null,
         };
     }
@@ -3737,7 +3770,8 @@ fn prepareAggregate(
     } else false;
     // The last pass is done: nothing decodes into the regions again, so the merge does not hold them. Under a ledger
     // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
-    if (!args.leave_regions or args.ledger != null) releaseRegions(workers);
+    if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegions(workers);
+    private_decode.release();
     for (workers) |w| if (w.err) |e| {
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             if (decode_held and rescannable) taken.insert(.decode_memory);
@@ -13411,4 +13445,48 @@ test "partagg: admitted long composite counts match shared partitions after a sp
         try testing.expect(spawn_util.failuresInjected() > 0);
         try expectSameAnswer(want, failed);
     }
+}
+
+test "private decoder quotas stay funded and cannot consume another worker's credit" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var parent: core_memory.SharedBudget = .{ .limit = 128 << 20 };
+    defer std.debug.assert(parent.used.load(.monotonic) == 0);
+    var decoders = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2);
+    defer decoders.release();
+    const rest = parent.drawExact(parent.available()).?;
+    defer parent.release(rest);
+    const first = &decoders.workers[0];
+    const full = first.drawExact(first.limit).?;
+    defer first.release(full);
+    try testing.expect(first.drawExact(1) == null);
+    const second = &decoders.workers[1];
+    const independent = second.drawExact(second.limit).?;
+    defer second.release(independent);
+    try testing.expectEqual(parent.limit, parent.used.load(.monotonic));
+    try testing.expectEqual(@as(usize, parent.limit / 4), decoders.held);
+}
+
+fn privateDecodeAllocationFailure(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var parent: core_memory.SharedBudget = .{ .limit = 128 << 20 };
+    defer std.debug.assert(parent.used.load(.monotonic) == 0);
+    var decoders = try PrivateDecode.init(arena.allocator(), &parent, 4, parent.limit / 2);
+    defer decoders.release();
+    var charged: core_memory.Charged = .{ .child = a, .budget = &decoders.workers[0] };
+    const memory = try charged.allocator().alloc(u8, 4096);
+    charged.allocator().free(memory);
+}
+
+test "private decoder funding returns after allocation failures or declined admission" {
+    try testing.checkAllAllocationFailures(testing.allocator, privateDecodeAllocationFailure, .{});
+    var parent: core_memory.SharedBudget = .{ .limit = 128 << 20 };
+    const held = parent.drawExact(parent.limit).?;
+    defer parent.release(held);
+    var refused = try PrivateDecode.init(testing.allocator, &parent, 4, null);
+    defer refused.release();
+    try testing.expectEqual(@as(usize, 0), refused.held);
+    try testing.expectEqual(parent.limit, parent.used.load(.monotonic));
 }

@@ -33,6 +33,21 @@ surviving rows returns its whole reservation without ever choosing private runs.
 Tables and decode continue to draw their actual allocations from the same
 ledger.
 
+Selection, routing, expression and group-id scratch is reused at each grouping
+window. Decoded and materialized column values retain row-group lifetime; group
+tables and runs own every key and aggregate state that escapes a window. Keeping
+window scratch until row-group teardown needlessly competes with prepaid credit
+and can make parallel worker progress decide whether the scan must restart.
+
+Before reserving runs, the plan also funds decoder quotas from at most a quarter
+of the query ledger (and no more than its decode limit), split evenly between
+workers. Region and sliced-decode allocations draw from their worker's quota;
+local group tables and run growth continue to share the query ledger. A worker
+cannot consume another decoder's room. The existing sliced decoder handles row
+groups that do not fit a quota. If both reservations cannot be funded, the plan
+keeps shared partitions before consuming any rows. Regions and side allocations
+are freed before their funding returns, before the run fold starts.
+
 A refused admission leaves every local accumulator available to the shared path.
 If later growth or folding refuses the budget, the whole attempt is freed and
 rescanned through shared partitions with the other cost rules preserved, before

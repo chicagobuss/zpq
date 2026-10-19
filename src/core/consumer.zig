@@ -2578,6 +2578,7 @@ fn insertRow(
 /// Abandoned pre-aggregation: each row appended to this worker's run for its key's partition.
 fn scatterGrouped(
     ra: std.mem.Allocator,
+    values: std.mem.Allocator,
     gpa: std.mem.Allocator,
     g: @FieldType(AggTarget, "grouped"),
     part: *partagg.PartAgg,
@@ -2593,7 +2594,7 @@ fn scatterGrouped(
 ) !void {
     if (!prepared_values.*) {
         for (lookup, 0..) |at, ci| if (at) |p| if (ci < consumed.len and consumed[ci]) {
-            cols[p] = try agg_coded.materialize(ra, cols[p]);
+            cols[p] = try agg_coded.materialize(values, cols[p]);
         };
         prepared_values.* = true;
     }
@@ -2705,26 +2706,35 @@ fn foldGroupedWindows(
             return;
         }
     }
+    // Group tables/runs own their keys and states. Only decoded columns survive a window: otherwise routing,
+    // selection and expression scratch accumulates across the row group beside the prepaid run ceiling.
+    var window = RowGroupArena.init(ra);
+    defer window.deinit();
     var prepared_values = false;
     var off: usize = 0;
     while (off < sel.len) {
+        window.nextRowGroup();
+        const wa = window.allocator();
         if (part.needsFlush(local, g.table)) try part.pump(local, g.table, 0);
         const n = part.nextSpan(local, g.table, sel.len - off);
         if (n == 0) break;
-        var win_sel = try selWindow(ra, sel, off, n);
+        var win_sel = try selWindow(wa, sel, off, n);
         defer win_sel.deinit();
         const pos = g.pos_base + @as(u64, @intCast(off));
         // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its partition.
         if (local.abandoned) {
-            try scatterGrouped(ra, gpa, g, part, local, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n);
+            try scatterGrouped(wa, ra, gpa, g, part, local, cols, lookup, &win_sel, consumed,
+                &prepared_values, pos, off, n);
             off += n;
             continue;
         }
         if (!prepared_values and encoded) {
-            const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
+            const win_cols = try wa.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
             const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
-            if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget, region)) {
+            if (try agg_coded.groupedCoded(wa, gpa, g.calls, g.keys, g.table, pos, &win,
+                lookup, &win_sel, budget, region))
+            {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
                 continue;
@@ -2736,20 +2746,20 @@ fn foldGroupedWindows(
             };
             prepared_values = true;
         }
-        const win_cols = try ra.alloc(filter_eval.Batch.Column, cols.len);
+        const win_cols = try wa.alloc(filter_eval.Batch.Column, cols.len);
         for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
         var win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
-        const key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
+        const key_cols = try wa.alloc(filter_eval.Batch.Column, g.keys.len);
         const keyed = win.restrictedTo(&win_sel);
-        for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(ra, &keyed, lookup, k);
-        const ids = try ra.alloc(u32, n);
+        for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(wa, &keyed, lookup, k);
+        const ids = try wa.alloc(u32, n);
         @memset(ids, 0);
         var resolver = expr_agg.GroupKeyResolver.init(key_cols);
-        defer resolver.deinit(ra);
-        try resolver.resolveBatch(ra, g.table, key_cols, g.calls, pos, &win_sel, ids);
+        defer resolver.deinit(wa);
+        try resolver.resolveBatch(wa, g.table, key_cols, g.calls, pos, &win_sel, ids);
         try expr_agg.sinkSketchRows(g.table, ids, &win_sel);
         if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-            try expr_agg.updateTableGrouped(ra, gpa, g.table, ids, i, g.calls, &win, lookup, &win_sel);
+            try expr_agg.updateTableGrouped(wa, gpa, g.table, ids, i, g.calls, &win, lookup, &win_sel);
         };
         try part.pump(local, g.table, @intCast(win_sel.count()));
         off += n;
@@ -7143,4 +7153,88 @@ test "writeAggregateRows: a column encoded alone still draws from the ledger" {
 
 test "writeAggregateRows: on threads, an allocation failure frees everything" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, writeAnswerOnThreads, .{});
+}
+
+fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !void {
+    const strings = try a.alloc([]const u8, n);
+    defer a.free(strings);
+    @memset(strings, "a long composite key whose bytes must outlive every temporary grouping window");
+    const ints = try a.alloc(i64, n);
+    defer a.free(ints);
+    for (ints, 0..) |*v, i| v.* = @intCast(i);
+    const codes = try a.alloc(u32, n);
+    defer a.free(codes);
+    @memset(codes, 0);
+    var cols = [_]filter_eval.Batch.Column{
+        .{ .string = .{
+            .values = if (coded) &.{} else strings,
+            .dict = if (coded) &.{strings[0]} else &.{},
+            .codes = if (coded) codes else null,
+            .max_def = 0,
+        } },
+        .{ .i64 = .{ .values = ints, .max_def = 0 } },
+    };
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } },
+    };
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const Merge = struct {
+        fn count(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, _: std.mem.Allocator) !void {
+            dst.count += src.count;
+        }
+    };
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    var part = try partagg.PartAgg.init(a, &budget, &calls, 0, Merge.count, 4, 4, 1, true);
+    defer part.deinit();
+    part.compact = true;
+    try std.testing.expect(try part.admitPrivate(n, 100));
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    table.compact.configure(&calls);
+    defer table.deinit();
+    var local: partagg.Local = .{ .runs = &part.runs[0] };
+    var sel = try filter_selection.SelectionVector.init(a, n);
+    defer sel.deinit();
+    var scratch_budget: expr_agg.SharedBudget = .{ .limit = 512 << 10 };
+    var charged: @import("memory.zig").Charged = .{ .child = a, .budget = &scratch_budget };
+    var arena = RowGroupArena.init(charged.allocator());
+    defer arena.deinit();
+    const target: AggTarget = .{ .grouped = .{
+        .calls = &calls,
+        .keys = &keys,
+        .table = &table,
+        .pos_base = 0,
+        .part = &part,
+        .local = &local,
+    } };
+    try foldGroupedWindows(arena.allocator(), a, target, &cols, &.{ 0, 1 }, &sel,
+        &.{ coded, false }, coded, null, null);
+    try part.flush(&local, &table);
+    try part.foldRuns(1);
+    var groups: usize = 0;
+    for (part.parts) |*p| {
+        groups += p.table.groupCount();
+        for (0..p.table.groupCount()) |g| {
+            var tmp: [16]expr_agg.Accumulator = undefined;
+            try std.testing.expectEqual(@as(u64, 1), p.table.readGroup(g, 1, &tmp)[0].count);
+            const k = p.table.keyAt(g);
+            const id = std.mem.readInt(i64, k[k.len - 8 ..][0..8], .little);
+            try std.testing.expectEqual(@as(u64, @intCast(id)), p.table.first.items[g]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, n), groups);
+}
+
+test "partition windows reuse charged scratch instead of retaining a row group's windows" {
+    try checkPartitionWindowScratch(std.testing.allocator, 32_768, false);
+}
+
+test "partition window scratch keeps materialized dictionaries live across resets" {
+    try checkPartitionWindowScratch(std.testing.allocator, 8192, true);
+}
+
+test "partition window scratch returns every charge on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPartitionWindowScratch, .{ 32, false });
 }

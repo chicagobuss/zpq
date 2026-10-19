@@ -166,6 +166,7 @@ pub fn updateOneCoded(
     // A float sum reads its entries row by row, in the order every path sums in: a histogram's count × entry
     // rounds otherwise.
     if (floatSum(call)) {
+        if (!sel.any()) return true; // no values: leave a NULL sum NULL, as the row fold does
         const dict = (try widenDict(arena, col, c)).f64.values;
         const codes = col.codes().?;
         switch (state.*) {
@@ -1226,6 +1227,83 @@ test "aggregates over a coded column match the row folds over its values, histog
         const hist_cols = [_]Column{histogram_col};
         try agg.updateOne(a, a, &got, call, &.{ .cols = &hist_cols, .num_rows = n }, &lookup, &all);
         try testing.expectEqualDeep(want, got);
+    }
+}
+
+test "regression: aggregates over a coded column that no row reaches stay NULL, as the row folds leave them" {
+    const testing = std.testing;
+    const filter_ast = @import("../filter/ast.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // 4096 rows over 8 entries, every fifth null. Selections: none, only null rows, and some present rows.
+    const n = 4096;
+    const fdict = [_]f64{ 0.5, -1.25, 3, 8, 1e10, -0.0, 7.5, 2 };
+    const idict = [_]i64{ 5, -9, 3, 8, 100, 0, 7, 2 };
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var fvals: [n]f64 = undefined;
+    var ivals: [n]i64 = undefined;
+    for (0..n) |i| {
+        defs[i] = @intFromBool(i % 5 != 2);
+        codes[i] = if (defs[i] == 1) @intCast((i * 3 + i / 7) % fdict.len) else 0;
+        fvals[i] = if (defs[i] == 1) fdict[codes[i]] else 0;
+        ivals[i] = if (defs[i] == 1) idict[codes[i]] else 0;
+    }
+    var none = try Sel.init(a, n);
+    @memset(none.mask, 0);
+    var nulls = try Sel.init(a, n);
+    for (0..n) |i| nulls.set(i, defs[i] == 0);
+    var some = try Sel.init(a, n);
+    for (0..n) |i| some.set(i, i % 3 == 0);
+    const lookup = [_]?usize{0};
+
+    const Lane = struct { coded: Column, plain: Column, ref: expr_ast.Expr, scalar: agg.ResultShape, never: filter_ast.Filter };
+    const lanes = [_]Lane{
+        .{
+            .coded = .{ .f64 = .{ .values = &.{}, .codes = &codes, .dict = &fdict, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .plain = .{ .f64 = .{ .values = &fvals, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .ref = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } },
+            .scalar = .f64,
+            .never = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = -1e300 } },
+        },
+        .{
+            .coded = .{ .i64 = .{ .values = &.{}, .codes = &codes, .dict = &idict, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .plain = .{ .i64 = .{ .values = &ivals, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .ref = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+            .scalar = .i64,
+            .never = .{ .int64 = .{ .col_idx = 0, .op = .Lt, .value = -1_000_000 } },
+        },
+    };
+    for (lanes) |lane| {
+        for ([_]agg.AggFunc{ .sum, .min, .max, .avg, .count }) |func| {
+            const result: agg.ResultShape = switch (func) {
+                .avg => .avg_f64,
+                .count => .i64,
+                else => lane.scalar,
+            };
+            // Plain, and through a FILTER no row passes.
+            for ([_]?filter_ast.Filter{ null, lane.never }) |where| {
+                const call: AggCall = .{ .func = func, .arg = lane.ref, .where = where, .alias = "a", .result = result };
+                for ([_]*const Sel{ &none, &nulls, &some }) |s| {
+                    var want = Accumulator.init(call);
+                    try agg.updateOne(a, a, &want, call, &.{ .cols = &.{lane.plain}, .num_rows = n }, &lookup, s);
+                    var got = Accumulator.init(call);
+                    try agg.updateOne(a, a, &got, call, &.{ .cols = &.{lane.coded}, .num_rows = n }, &lookup, s);
+                    try testing.expectEqualDeep(want, got);
+                }
+            }
+        }
+        // The fuzz repro's shape: a float sum no row reaches is NULL.
+        const call: AggCall = .{ .func = .sum, .arg = lane.ref, .where = null, .alias = "a", .result = lane.scalar };
+        var got = Accumulator.init(call);
+        try agg.updateOne(a, a, &got, call, &.{ .cols = &.{lane.coded}, .num_rows = n }, &lookup, &none);
+        switch (got) {
+            .sum_f => |s| try testing.expectEqual(@as(?f64, null), s),
+            .sum_i => |s| try testing.expectEqual(@as(?i128, null), s),
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 

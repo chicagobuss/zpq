@@ -10,6 +10,14 @@ answer: its bytes may follow the row-group boundaries budget and -j choose).
 
     memory_gate.py run --bin zig-out/bin/zpq --out base.jsonl [--cells REGEX] [--budgets 64M,256M] [--jobs 1,16]
     memory_gate.py report base.jsonl [tip.jsonl]          # per-cell table; with two files, before/after
+    zpq-bench-run memory_gate.py cgroup --bin base=OLD --bin tip=NEW [--caps 8G,2G] [--rounds 5] [--out FILE]
+
+`cgroup` is default-budget parity under a memory limit, the container and Lambda case: no --max-memory and no -j, so
+both come from the cgroup, as they do there. Each cell's inputs are evicted from the page cache before every run, the
+binaries interleave, and each also runs once with --profile-summary=json for its ledger's peak against its RssAnon. A
+cell holds when the last binary answers whatever the first answers, alike, its median within 10% (or 15 ms) of the
+first's (`cgroup_verdict`); run it under zpq-bench-run (with ZPQ_GATE_CPUS set to the timing cores) so the walls mean
+something.
 
 The verdict per run: `ok` (answered, peak <= budget + slack), `over` (answered above it), `refused` (clean error),
 `killed` (the scope cap or a signal), `diff` (answered, but stdout differs from the same shape's other answers).
@@ -40,6 +48,9 @@ MiB = 1 << 20
 
 STUDY_SETS = ["carduniq", "heavy", "lstr1m", "sstr10m", "card10m", "card100k", "clustzipf", "nullszipf"]
 CB_QUERIES = [4, 8, 13, 17, 33]
+# Default-budget parity under a cgroup limit (`cgroup`): scans, groupings and Top-N of each data shape.
+CGROUP_CELLS = ["lstr1m/q13", "lstr1m/q01", "lstr1m/q14", "sstr10m/q13", "sstr10m/q06", "heavy/q09", "card10m/q14",
+                "clustzipf/q06", "cb16/Q4", "cb16/Q13", "cb16/Q17", "cb16/Q33"]
 
 
 def study_queries(meta):
@@ -186,13 +197,17 @@ class AnonSampler(threading.Thread):
 
 
 def run_one(binary, argv, budget, jobs, cap, timeout, reader):
+    return run_query(binary, [*argv, "--max-memory", str(budget), "-j", str(jobs)], cap, timeout, reader)
+
+
+def run_query(binary, argv, cap, timeout, reader):
     parquet = "parquet" in argv
     with tempfile.TemporaryDirectory(prefix="zpq-gate-", dir=os.environ.get("ZPQ_GATE_TMP")) as td:
         env = dict(os.environ, ZG_STDERR=f"{td}/err", ZG_META=f"{td}/meta")
         cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"-pMemoryMax={cap}", "-pMemorySwapMax=0",
                "-pOOMPolicy=continue", "--", "taskset", "-c", CPUS, "sh", "-c", WRAP, "sh",
                "/usr/bin/time", "-f", "ZGTIME %e %M", "-o", f"{td}/time",
-               binary, "query", *argv, "--max-memory", str(budget), "-j", str(jobs)]
+               binary, "query", *argv]
         t0 = time.time()
         h = hashlib.sha256()
         p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
@@ -231,12 +246,18 @@ def run_one(binary, argv, budget, jobs, cap, timeout, reader):
         digest = h.hexdigest()[:16]
         if parquet and rc == 0:
             digest = content_hash(reader, f"{td}/answer.parquet")
-        err = ""
+        err, summary = "", None
         if os.path.exists(f"{td}/err"):
             lines = [l for l in open(f"{td}/err", errors="replace").read().splitlines() if l.strip()]
             err = lines[-1][:240] if lines else ""
+            for l in lines:
+                if l.startswith("{") and '"cpu"' in l:
+                    try:
+                        summary = json.loads(l)
+                    except ValueError:
+                        pass
         return {"rc": rc, "peak": peak, "anon": sampler.peak, "hwm": hwm, "secs": round(el, 3), "hash": digest,
-                "err": err, "timed_out": timed_out}
+                "err": err, "timed_out": timed_out, "wall": round(wall, 4), "summary": summary}
 
 
 def mem(r):
@@ -285,6 +306,81 @@ def cmd_run(a):
                     out.flush()
                     print(f"{name:24s} {budget >> 20:6d}M -j{j:<2d} {r['verdict']:8s} peak {mem(r) / MiB:8.1f} MiB "
                           f"x{mem(r) / budget:5.2f} {r['secs']:7.2f}s {r['hash']} {r['err'][:70]}", flush=True)
+
+
+def evict(paths):
+    for p in paths:
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+
+def cgroup_verdict(first, last):
+    """`parity`: both answer alike, the last within 10% (or 15 ms); `better`: only the last answers; `both fail`:
+    neither answers (how long each took to give up is in the row); `lost`, `differs`, `slower`: a regression."""
+    ok_first, ok_last = first["rcs"] == [0], last["rcs"] == [0]
+    if ok_first and not ok_last:
+        return "lost"
+    if ok_last and not ok_first:
+        return "better"
+    if not ok_first:
+        return "both fail"
+    if first["hashes"] != last["hashes"] or len(last["hashes"]) != 1:
+        return "differs"
+    fast = last["median_ms"] <= max(first["median_ms"] * 1.10, first["median_ms"] + 15)
+    return "parity" if fast else "slower"
+
+
+def cmd_cgroup(a):
+    bins = dict(b.split("=", 1) for b in a.bin)
+    names = list(bins)
+    want = a.cells.split(",") if a.cells else CGROUP_CELLS
+    todo = {c[0]: c for c in cells(a.fixtures)}
+    out = open(a.out, "a") if a.out else None
+    rows = []
+    for cap in a.caps.split(","):
+        for cell in want:
+            name, argv, paths = todo[cell]
+            runs = {k: [] for k in names}
+            for i in range(a.rounds):
+                for k in (names if i % 2 == 0 else names[::-1]):
+                    evict(paths)
+                    runs[k].append(run_query(os.path.abspath(bins[k]), argv, cap, a.timeout,
+                                             os.path.abspath(a.reader or bins[names[-1]])))
+            prof = {}
+            for k in names:
+                evict(paths)
+                prof[k] = run_query(os.path.abspath(bins[k]), [*argv, "--profile-summary=json"], cap, a.timeout,
+                                    os.path.abspath(a.reader or bins[names[-1]]))
+            row = {"cell": name, "cap": cap, "bins": {}}
+            for k in names:
+                rs = runs[k]
+                walls = sorted(r["wall"] for r in rs)
+                cpu = (prof[k].get("summary") or {}).get("cpu", {})
+                row["bins"][k] = {
+                    "median_ms": round(walls[len(walls) // 2] * 1000, 1), "min_ms": round(walls[0] * 1000, 1),
+                    "rcs": sorted({r["rc"] for r in rs}), "hashes": sorted({r["hash"] for r in rs if r["rc"] == 0}),
+                    "anon": max(r["anon"] for r in rs), "ledger_peak": cpu.get("ledger_peak", 0),
+                    "ledger_limit": cpu.get("ledger_limit", 0), "prof_anon": prof[k]["anon"],
+                    "err": next((r["err"] for r in rs if r["rc"] != 0), ""),
+                }
+            first, last = row["bins"][names[0]], row["bins"][names[-1]]
+            row["verdict"] = cgroup_verdict(first, last)
+            row["parity"] = row["verdict"] in ("parity", "better", "both fail")
+            rows.append(row)
+            if out:
+                out.write(json.dumps(row) + "\n")
+                out.flush()
+            cols = "  ".join(f"{k} {b['median_ms']:7.1f} ms rc{','.join(map(str, b['rcs']))} anon "
+                             f"{b['anon'] / MiB:6.0f} ledger {b['ledger_peak'] / MiB:6.0f}"
+                             for k, b in row["bins"].items())
+            ratio = last["median_ms"] / max(first["median_ms"], 1e-9)
+            print(f"{cap:>4s} {name:16s} {cols}  x{ratio:4.2f} {row['verdict']}", flush=True)
+    bad = [r for r in rows if not r["parity"]]
+    print(f"cgroup parity: {len(rows) - len(bad)}/{len(rows)} cells")
+    return 1 if bad else 0
 
 
 def load(path):
@@ -382,8 +478,22 @@ def main():
     q = sub.add_parser("report")
     q.add_argument("files", nargs="+")
     q.add_argument("--slack", type=int, default=48, help="MiB")
+    c = sub.add_parser("cgroup")
+    c.add_argument("--bin", action="append", required=True, help="NAME=PATH, the baseline first (repeatable)")
+    c.add_argument("--caps", default="8G,2G")
+    c.add_argument("--rounds", type=int, default=5)
+    c.add_argument("--cells", default="", help="comma-separated cell names (default CGROUP_CELLS)")
+    c.add_argument("--fixtures", default="")
+    c.add_argument("--reader", default="")
+    c.add_argument("--timeout", type=float, default=300)
+    c.add_argument("--out", default="")
     a = p.parse_args()
-    cmd_run(a) if a.cmd == "run" else cmd_report(a)
+    if a.cmd == "run":
+        cmd_run(a)
+    elif a.cmd == "report":
+        cmd_report(a)
+    else:
+        sys.exit(cmd_cgroup(a))
 
 
 if __name__ == "__main__":

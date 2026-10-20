@@ -800,11 +800,26 @@ fn sendError(err: WriteError) Error {
     };
 }
 
+/// The read for a socket that refused its receive timeout. macOS refuses every socket option once the connection is
+/// shut both ways, as a reset or a close the peer finished leave it, so the timeout fails just when the read would say
+/// why: it is asked without waiting, and a reset is `error.ConnectionReset` (an idle pooled connection S3 dropped is
+/// closed before the response, not a failed read), the end of the stream 0. Elsewhere, and for anything else, the
+/// refusal is a local failure.
+fn readShut(fd: posix.fd_t, buf: []u8) ReadError!usize {
+    if (comptime !builtin.os.tag.isDarwin()) return error.ReadFailed;
+    const r = posix.system.recvfrom(fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, null, null);
+    return switch (posix.errno(r)) {
+        .SUCCESS => @intCast(r),
+        .CONNRESET, .CONNABORTED, .TIMEDOUT => error.ConnectionReset,
+        else => error.ReadFailed,
+    };
+}
+
 /// One read, by `deadline` (absolute, `monoMs`). `error.WouldBlock`: the deadline passed without a byte arriving.
 /// A signal interrupting the wait does not extend it: the socket timeout is set to the time left before each try.
 fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadError!usize {
     if (opts.clock_ms) |clock_ms| {
-        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, 20, &opts.rcv_ms)) return error.ReadFailed;
+        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, 20, &opts.rcv_ms)) return readShut(fd, buf);
         const real_start = monoMs();
         while (true) {
             if (clock_ms() >= deadline) {
@@ -834,7 +849,7 @@ fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadErr
     }
     while (true) {
         const left = msLeft(deadline, null) orelse return error.WouldBlock;
-        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, left, &opts.rcv_ms)) return error.ReadFailed;
+        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, left, &opts.rcv_ms)) return readShut(fd, buf);
         const r = posix.system.read(fd, buf.ptr, buf.len);
         return switch (posix.errno(r)) {
             .SUCCESS => @intCast(r),

@@ -13,6 +13,7 @@
 //! keeping HTTP/SigV4 details in one place.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const clock = @import("../clock.zig");
 const nowMonoNs = clock.monoNs;
 const Io = std.Io;
@@ -1286,15 +1287,23 @@ test "a CreateMultipartUpload that could not connect or finish its TLS handshake
 }
 
 test "a CreateMultipartUpload whose connections are all refused gives up after the retry budget, never sent" {
-    // A bound socket that is not listening: every connect to its port is refused.
+    // A bound socket that is not listening: every connect to its port is refused on Linux. macOS drops a SYN to such
+    // a socket unanswered, so there the connects would time out instead; its port, once closed, refuses them.
     const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
     const fd: posix.fd_t = @intCast(rc);
-    defer _ = posix.system.close(fd);
+    var open = true;
+    defer if (open) {
+        _ = posix.system.close(fd);
+    };
     var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
     if (posix.errno(posix.system.bind(fd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
     if (posix.errno(posix.system.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
+    if (builtin.os.tag.isDarwin()) {
+        _ = posix.system.close(fd);
+        open = false;
+    }
 
     var diag: Diag = .{};
     try testing.expectError(error.CreateMultipartFailed, writeToPort(

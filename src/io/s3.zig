@@ -832,10 +832,16 @@ pub const DataWave = struct {
     in_flight: std.atomic.Value(usize) = .init(0),
     /// The cap once the first header is in (`inFlight`).
     full: usize = S3_IN_FLIGHT,
+    /// Bumped whenever a slot may have opened (a `release`, the first `noteHeader`). A worker without a slot sleeps
+    /// on it instead of polling: until the first header, the workers past the first wave would otherwise wake every
+    /// 50 µs, and on a 2-vCPU Lambda that CPU was taken from the TLS handshakes whose header they were waiting for.
+    seq: std.atomic.Value(u32) = .init(0),
 
     /// Wait until fewer than `cap` data-range requests are in flight, then count this one.
     pub fn acquire(self: *DataWave, io: Io) Io.Cancelable!void {
         while (true) {
+            // Read `seq` before the slots: a release between the two moves it, and the wait returns at once.
+            const seen = self.seq.load(.acquire);
             const cap = self.cap.load(.acquire);
             var cur = self.in_flight.load(.acquire);
             while (cur < cap) {
@@ -845,17 +851,22 @@ pub const DataWave = struct {
                 }
                 return;
             }
-            try io.sleep(.fromNanoseconds(50 * std.time.ns_per_us), .awake);
+            try io.futexWait(u32, &self.seq.raw, seen);
         }
     }
 
-    pub fn release(self: *DataWave) void {
+    pub fn release(self: *DataWave, io: Io) void {
         _ = self.in_flight.fetchSub(1, .release);
+        _ = self.seq.fetchAdd(1, .release);
+        io.futexWake(u32, &self.seq.raw, 1);
     }
 
-    /// The first data-range response header has arrived. Later acquires may use the full cap. Idempotent.
-    pub fn noteHeader(self: *DataWave) void {
-        self.cap.store(self.full, .release);
+    /// A data-range response header has arrived. Later acquires may use the full cap. Idempotent: only the first wakes
+    /// the waiting workers.
+    pub fn noteHeader(self: *DataWave, io: Io) void {
+        if (self.cap.swap(self.full, .acq_rel) == self.full) return;
+        _ = self.seq.fetchAdd(1, .release);
+        io.futexWake(u32, &self.seq.raw, std.math.maxInt(u32));
     }
 };
 
@@ -952,6 +963,7 @@ pub fn fetchJobs(
             .profiler = profiler,
             .landed = j.landed,
             .wave = wave,
+            .io = io,
         };
     }
 
@@ -1024,12 +1036,14 @@ const FetchCtx = struct {
     landed: ?Landed = null,
     /// Set for a query's data-range fetches. Null for Bloom and other callers.
     wave: ?*DataWave = null,
+    /// The fetch's executor, for the wave's wakeups from the header callback.
+    io: Io,
 };
 
 /// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
 fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     if (ctx.wave) |w| try w.acquire(io);
-    defer if (ctx.wave) |w| w.release();
+    defer if (ctx.wave) |w| w.release(io);
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const criteria: PoolCriteria = .{
@@ -1088,7 +1102,7 @@ fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !htt
 
 fn noteDataHeader(ctx: *anyopaque) void {
     const f: *FetchCtx = @ptrCast(@alignCast(ctx));
-    if (f.wave) |w| w.noteHeader();
+    if (f.wave) |w| w.noteHeader(f.io);
 }
 
 /// Parallel multipart upload of `body` to `url`. Thin wrapper around
@@ -1833,13 +1847,116 @@ test "ZPQ_S3_FIRST_WAVE selects the cap before the first data header, and 16 is 
 
     var open: DataWave = .{ .cap = .init(parseFirstWave("16")) };
     try testing.expectEqual(S3_IN_FLIGHT, open.cap.load(.acquire));
-    open.noteHeader();
+    open.noteHeader(testing.io);
     try testing.expectEqual(S3_IN_FLIGHT, open.cap.load(.acquire));
 
     var slow: DataWave = .{ .cap = .init(parseFirstWave(null)) };
     try testing.expectEqual(S3_FIRST_WAVE, slow.cap.load(.acquire));
-    slow.noteHeader();
+    slow.noteHeader(testing.io);
     try testing.expectEqual(S3_IN_FLIGHT, slow.cap.load(.acquire));
+}
+
+test "a worker without a data-wave slot sleeps until a release or the first header frees one" {
+    const io = testing.io;
+    var wave: DataWave = .{ .cap = .init(1), .full = 3 };
+    try wave.acquire(io); // the first wave's one slot
+    const Waiter = struct {
+        fn run(w: *DataWave, got: *std.atomic.Value(u32)) void {
+            w.acquire(testing.io) catch return;
+            _ = got.fetchAdd(1, .acq_rel);
+        }
+        fn waitFor(got: *std.atomic.Value(u32), n: u32) !void {
+            var spins: usize = 0;
+            while (got.load(.acquire) < n) : (spins += 1) {
+                if (spins > 5_000) return error.TestTimedOut;
+                try testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var got: std.atomic.Value(u32) = .init(0);
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Waiter.run, .{ &wave, &got });
+    defer for (threads) |t| t.join();
+
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectEqual(@as(u32, 0), got.load(.acquire));
+    // Waiting does not move the count a release or a header moves: the waiters are asleep, not polling.
+    try testing.expectEqual(@as(u32, 0), wave.seq.load(.acquire));
+
+    wave.noteHeader(io); // full cap 3, one held: two of the three get in
+    try Waiter.waitFor(&got, 2);
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectEqual(@as(u32, 2), got.load(.acquire));
+    wave.noteHeader(io); // a later header changes nothing and wakes no one
+    try testing.expectEqual(@as(u32, 1), wave.seq.load(.acquire));
+
+    wave.release(io); // the first slot comes back: the last waiter takes it
+    try Waiter.waitFor(&got, 3);
+    try testing.expectEqual(@as(u32, 2), wave.seq.load(.acquire));
+    try testing.expectEqual(@as(usize, 3), wave.in_flight.load(.acquire));
+}
+
+test "the first data header wakes every worker waiting for a data-wave slot" {
+    const io = testing.io;
+    var wave: DataWave = .{ .cap = .init(1), .full = 7 };
+    try wave.acquire(io);
+    const Waiter = struct {
+        fn run(w: *DataWave, got: *std.atomic.Value(u32)) void {
+            w.acquire(testing.io) catch return;
+            _ = got.fetchAdd(1, .acq_rel);
+        }
+    };
+    var got: std.atomic.Value(u32) = .init(0);
+    var threads: [6]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Waiter.run, .{ &wave, &got });
+    defer for (threads) |t| t.join();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectEqual(@as(u32, 0), got.load(.acquire));
+    wave.noteHeader(io);
+    var spins: usize = 0;
+    while (got.load(.acquire) < threads.len) : (spins += 1) {
+        if (spins > 5_000) return error.TestTimedOut;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 7), wave.in_flight.load(.acquire));
+}
+
+test "data-wave slots lose no wakeup when releases race acquires" {
+    const io = testing.io;
+    const cap = 2;
+    var wave: DataWave = .{ .cap = .init(cap), .full = cap };
+    const Worker = struct {
+        fn run(w: *DataWave, held: *std.atomic.Value(usize), peak: *std.atomic.Value(usize), done: *std.atomic.Value(u32)) void {
+            for (0..2_000) |_| {
+                w.acquire(testing.io) catch return;
+                const now = held.fetchAdd(1, .acq_rel) + 1;
+                _ = peak.fetchMax(now, .acq_rel);
+                _ = held.fetchSub(1, .acq_rel);
+                w.release(testing.io);
+            }
+            _ = done.fetchAdd(1, .acq_rel);
+        }
+    };
+    var held: std.atomic.Value(usize) = .init(0);
+    var peak: std.atomic.Value(usize) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &wave, &held, &peak, &done });
+    // A lost wakeup leaves a worker asleep with a slot free: the workers would never all finish.
+    var spins: usize = 0;
+    const finished = while (done.load(.acquire) < threads.len) : (spins += 1) {
+        if (spins > 30_000) break false;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    } else true;
+    if (!finished) {
+        // Let any stranded worker out before failing, so the threads can be joined.
+        wave.full = 1 << 20;
+        wave.noteHeader(io);
+    }
+    for (threads) |t| t.join();
+    try testing.expect(finished);
+    try testing.expect(peak.load(.acquire) <= cap);
+    try testing.expectEqual(@as(usize, 0), wave.in_flight.load(.acquire));
 }
 
 test "the first data wave keeps at most 8 data-range requests in flight until the first data-range response header" {

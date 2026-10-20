@@ -23,6 +23,7 @@
 //! follow-up.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const tls = @import("tls.zig");
 const work_cursor = @import("work_cursor.zig");
@@ -53,8 +54,11 @@ pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 /// per-request TLS handshake amortizes badly across tiny fetches.
 pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
 
-/// Most data ranges in flight on Lambda, where more made its network policer slower.
-pub const S3_IN_FLIGHT: usize = 16;
+/// Most data ranges in flight on Lambda, where more made its network policer slower: 16 on x86_64, 8 on aarch64.
+/// Every connection's TLS stream costs CPU, and on a 3008 MB (2-vCPU) Graviton sandbox 16 at once took several times
+/// the user CPU of 8 for the same bytes and finished cold scans later; x86_64 finished them sooner at 16. Only that
+/// memory size was measured, so the cap does not follow the vCPU count.
+pub const S3_IN_FLIGHT: usize = if (builtin.cpu.arch == .aarch64) 8 else 16;
 /// Most data ranges in flight anywhere else, and the size of the connection pool. Over a link with a long round trip
 /// (a laptop or a server far from the bucket), each request's first byte is the cost, so throughput follows how many
 /// are in flight: 16 left most of a home link idle.
@@ -76,6 +80,7 @@ pub const S3_FIRST_WAVE: usize = 8;
 
 /// The first-wave cap for this process: `ZPQ_S3_FIRST_WAVE` when it is a positive integer, otherwise
 /// `S3_FIRST_WAVE`. A value above `S3_IN_FLIGHT` is clamped to it, so 16 starts every data request at the full cap.
+/// On aarch64 the first wave is already the full cap.
 pub fn firstWaveCap(env: ?std.process.Environ) usize {
     const text = if (env) |e| e.getPosix("ZPQ_S3_FIRST_WAVE") else null;
     return parseFirstWave(text);
@@ -1992,7 +1997,8 @@ test "the first data wave keeps at most 8 data-range requests in flight until th
             .target = &targets[i],
         };
     }
-    var wave: DataWave = .{};
+    // A full cap past the first wave, whatever this target's default, so the gate can be seen to open.
+    var wave: DataWave = .{ .full = 16 };
     var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(16) });
     defer threaded.deinit();
 
@@ -2071,7 +2077,12 @@ test "a server that always stalls fails the request with the timeout once the re
     try testing.expectEqual(@as(u64, retry.max_attempts - 1), stats.timeout_retries);
 }
 
-test "inFlight: 16 on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLIGHT within it" {
+test "S3_IN_FLIGHT is 8 on aarch64 and 16 on x86_64" {
+    try testing.expectEqual(@as(usize, if (builtin.cpu.arch == .aarch64) 8 else 16), S3_IN_FLIGHT);
+    try testing.expect(S3_FIRST_WAVE <= S3_IN_FLIGHT);
+}
+
+test "inFlight: S3_IN_FLIGHT on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLIGHT within it" {
     try testing.expectEqual(S3_IN_FLIGHT, inFlight(testEnviron(&.{"AWS_LAMBDA_FUNCTION_NAME=f"})));
     try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"AWS_REGION=us-east-1"})));
     try testing.expectEqual(@as(usize, 32), inFlight(testEnviron(&.{ "AWS_LAMBDA_FUNCTION_NAME=f", "ZPQ_S3_IN_FLIGHT=32" })));

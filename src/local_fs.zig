@@ -152,10 +152,12 @@ pub const Mapped = struct {
     }
 
     /// `error.InputChanged` once the file mapped (at `path`) changed under it: a read went past its end, or it has
-    /// another size or mtime now. A cut inside the last page raises no fault (the kernel serves zeros to the page's
-    /// end), so only the size says so, and a rewrite in place only the mtime. Another file renamed over the path is
-    /// no change to this one, which the query goes on reading whole. Without a descriptor the file is found by its
-    /// path, and one that is not there by its device and inode was replaced: not asked, as it cannot be.
+    /// another size or mtime now. A cut inside the last page raises no fault (Linux serves zeros to the page's end),
+    /// so only the size says so, and a rewrite in place only the mtime. macOS raises no fault for any cut: a mapping
+    /// goes on serving the bytes it mapped, past the new end too, so there only the size and mtime say so. Another
+    /// file renamed over the path is no change to this one, which the query goes on reading whole. Without a
+    /// descriptor the file is found by its path, and one that is not there by its device and inode was replaced: not
+    /// asked, as it cannot be.
     pub fn intact(self: Mapped, path: []const u8) error{InputChanged}!void {
         if (self.slot) |i| if (guard.faulted[i].load(.acquire)) return error.InputChanged;
         const now = if (self.fd) |fd| fdStamp(fd) catch return error.InputChanged else pathStamp(path) catch return;
@@ -459,6 +461,14 @@ test "mapFile rejects an empty file" {
     try testing.expectError(error.EmptyFile, mapFile(path));
 }
 
+/// A byte of a file written as 0xab, read through its mapping past where it was cut since. Linux serves zeros (the cut
+/// page's tail, or the guard's zero page over a removed one); macOS goes on serving the bytes it mapped, or zeros
+/// should the page be evicted and fault. Either way `Mapped.intact` is what reports the cut.
+fn expectCutByte(byte: u8) !void {
+    if (builtin.os.tag.isDarwin() and byte == 0xab) return;
+    try testing.expectEqual(@as(u8, 0), byte);
+}
+
 test "regression: a mapped file truncated under the reader reads zeros past its end and reports it changed" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -481,8 +491,8 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
     const before: *volatile const u8 = &m.bytes[0];
     const past: *volatile const u8 = &m.bytes[2 * page + 7];
     try testing.expectEqual(@as(u8, 0xab), before.*);
-    // Unguarded, this read was SIGBUS.
-    try testing.expectEqual(@as(u8, 0), past.*);
+    // Unguarded, this read was SIGBUS on Linux.
+    try expectCutByte(past.*);
     try testing.expectError(error.InputChanged, m.intact(path));
 
     // A fresh mapping of the file as it now is reads whole.
@@ -526,7 +536,7 @@ test "regression: a mapped file cut inside its last page or rewritten in place r
         try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.ftruncate(wfd, 600)));
         close(wfd);
         const tail: *volatile const u8 = &cut.bytes[900];
-        try testing.expectEqual(@as(u8, 0), tail.*);
+        try expectCutByte(tail.*);
         try testing.expectError(error.InputChanged, cut.intact(path));
 
         // Same size, other bytes: only the mtime tells, set apart here since a fast rewrite can land in the same tick.

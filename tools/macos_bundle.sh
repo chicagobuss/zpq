@@ -105,25 +105,34 @@ cp tools/macos_check.sh "$STAGE/"
 echo "== recording expected outputs with the Linux build" >&2
 "$STAGE/macos_check.sh" --record --bin "$TMP/build-native/bin" > "$TMP/record.log" 2>&1 || {
   cat "$TMP/record.log" >&2; echo "recording goldens failed" >&2; exit 1; }
-# Tests that skip off Linux by design: the ones that open with `if (builtin.os.tag != .linux) return error.SkipZigTest`
-# (or `@import("builtin").os.tag`). Printed as the test runner names them: the module's path below the test root,
-# dotted, then `.test.<name>`.
-linux_only_tests() { # <test root dir> [subdir of it to leave out]
-  local root="$1" skip="${2:-}" f mod
+# The tests whose skip line matches a pattern, printed as the test runner names them: the module's path below the test
+# root, dotted, then `.test.<name>`.
+tests_skipping() { # <awk pattern> <test root dir> [subdir of it to leave out]
+  local pat="$1" root="$2" skip="${3:-}" f mod
   find "$root" -name '*.zig' | sort | while read -r f; do
     if [ -n "$skip" ] && [ "${f#"$root/$skip/"}" != "$f" ]; then continue; fi
     mod="${f#"$root/"}"; mod="${mod%.zig}"; mod="${mod//\//.}"
-    awk -v mod="$mod" '
+    # Through the environment: `awk -v` would read the pattern's backslashes as escapes.
+    PAT="$pat" awk -v mod="$mod" '
       /^test "/ { name = $0; sub(/^test "/, "", name); sub(/" *\{ *$/, "", name) }
-      /os\.tag != \.linux\) return error\.SkipZigTest/ && name != "" { print mod ".test." name; name = "" }
+      $0 ~ ENVIRON["PAT"] && name != "" { print mod ".test." name; name = "" }
     ' "$f"
   done
 }
+# Tests that skip off Linux by design: the ones that open with `if (builtin.os.tag != .linux) return error.SkipZigTest`
+# (or `@import("builtin").os.tag`).
+linux_only='os\.tag != \.linux\) return error\.SkipZigTest'
+# Tests that skip on a CPU without AVX-512, as every Mac's is (Rosetta emulates none of it), where the Linux build host
+# may have it: their skip line says `return error.SkipZigTest; // no AVX-512`.
+avx512_only='return error\.SkipZigTest; // no AVX-512'
 
-# Each unit-test binary's skips on Linux, and its Linux-only tests: macos_check.sh accepts no other skip on the Mac.
+# Each unit-test binary's skips on Linux, its Linux-only tests and its AVX-512 ones: macos_check.sh accepts no other
+# skip on the Mac.
 mkdir -p "$STAGE/skips"
-linux_only_tests src lambda > "$STAGE/skips/zpq-test.linux-only"
-linux_only_tests src/lambda > "$STAGE/skips/zpq-lambda-test.linux-only"
+tests_skipping "$linux_only" src lambda > "$STAGE/skips/zpq-test.linux-only"
+tests_skipping "$linux_only" src/lambda > "$STAGE/skips/zpq-lambda-test.linux-only"
+tests_skipping "$avx512_only" src lambda > "$STAGE/skips/zpq-test.avx512"
+tests_skipping "$avx512_only" src/lambda > "$STAGE/skips/zpq-lambda-test.avx512"
 {
   echo "commit=$REV"
   echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

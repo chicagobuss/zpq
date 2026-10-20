@@ -9671,7 +9671,7 @@ test "many files keep a count under the memory budget" {
 const fake_s3 = @import("io/fake_s3.zig");
 
 test "Lambda default fetch window streams a large projection and fetches a smaller one up front" {
-    if (!s3_window.supported) return error.SkipZigTest;
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // where the window runs (`s3_window.supported`)
     const gpa = std.testing.allocator;
     var fixture_arena = std.heap.ArenaAllocator.init(gpa);
     defer fixture_arena.deinit();

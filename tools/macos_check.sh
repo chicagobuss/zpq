@@ -16,7 +16,7 @@
 # Bundle layout (relative to this script): bin/<arch>-macos/{zpq,zpq-test,
 # zpq-lambda-test}, data/ and ci/ (unit-test fixtures), smoke/ (CLI fixtures),
 # expected/ (golden outputs recorded from the Linux build of the same commit),
-# skips/ (each test binary's skips on Linux, and its Linux-only tests), MANIFEST.
+# skips/ (each test binary's skips on Linux, its Linux-only tests and its AVX-512 ones), MANIFEST.
 #
 # CLI outputs are compared against expected/, so the check needs nothing but
 # bash; with python3 + pyarrow it also validates every written parquet file
@@ -156,10 +156,11 @@ if [ "$RECORD" = 0 ]; then
       fail "unit:$t" "exit $rc${summary:+, $summary}" "$WORK/log/unit-$t.fail"
       continue
     fi
-    # Every skip must be one the Linux run of this bundle had too, or a test that is Linux-only by design.
+    # Every skip must be one the Linux run of this bundle had too, or a test that is Linux-only by design, or one that
+    # needs AVX-512, which no Mac has.
     skipped="$(printf '%s' "$summary" | sed -n 's/.*passed; \([0-9]*\) skipped.*/\1/p')"
     skip_names "$WORK/log/unit-$t.log" > "$WORK/log/unit-$t.skips"
-    cat "$ROOT/skips/$t.linux" "$ROOT/skips/$t.linux-only" > "$WORK/log/unit-$t.allowed" 2> /dev/null
+    cat "$ROOT/skips/$t.linux" "$ROOT/skips/$t.linux-only" "$ROOT/skips/$t.avx512" > "$WORK/log/unit-$t.allowed" 2> /dev/null
     grep -vxF -f "$WORK/log/unit-$t.allowed" "$WORK/log/unit-$t.skips" > "$WORK/log/unit-$t.extra"
     named="$(wc -l < "$WORK/log/unit-$t.skips" | tr -d ' ')"
     if [ ! -f "$ROOT/skips/$t.linux" ]; then
@@ -167,7 +168,7 @@ if [ "$RECORD" = 0 ]; then
     elif [ "${skipped:-0}" != "$named" ]; then
       fail "unit:$t" "the summary counts ${skipped:-0} skipped, but $named skipped tests were found in the log" "$WORK/log/unit-$t.skips"
     elif [ -s "$WORK/log/unit-$t.extra" ]; then
-      fail "unit:$t" "$(wc -l < "$WORK/log/unit-$t.extra" | tr -d ' ') skipped here, not on Linux, and not Linux-only" "$WORK/log/unit-$t.extra"
+      fail "unit:$t" "$(wc -l < "$WORK/log/unit-$t.extra" | tr -d ' ') skipped here, not on Linux, and neither Linux-only nor AVX-512" "$WORK/log/unit-$t.extra"
     else
       pass "unit:$t (${summary%.}; $(wc -l < "$ROOT/skips/$t.linux-only" | tr -d ' ') Linux-only)"
     fi

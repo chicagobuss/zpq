@@ -787,7 +787,7 @@ test "the AVX-512 Huffman encoder writes zstd's bytes for every literal distribu
 
 test "zstd frames are the same bytes with the AVX-512 Huffman encoder and without" {
     defer _ = ZPQ_huf4x_select(0);
-    if (ZPQ_huf4x_select(0) == 0) return error.SkipZigTest;
+    if (ZPQ_huf4x_select(0) == 0) return error.SkipZigTest; // no AVX-512 VBMI2 here, or ZPQ_ZSTD_SCALAR set
     var prng = std.Random.DefaultPrng.init(0x4f4e);
     const r = prng.random();
     const cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;

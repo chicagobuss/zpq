@@ -409,7 +409,7 @@ fn stopCopied(gpa: std.mem.Allocator, fetcher: *Fetcher(s3.Pool(1))) void {
 }
 
 test "a skipped copied-only group does not release a charge it never took" {
-    if (comptime !supported) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // where the window runs (`supported`)
     const gpa = std.testing.allocator;
     var bufs: [3][]align(page) u8 = undefined;
     for (&bufs) |*b| b.* = try mapBuffer(page);
@@ -439,7 +439,7 @@ test "a skipped copied-only group does not release a charge it never took" {
 }
 
 test "a copied-only group dropped after it is admitted releases its charge" {
-    if (comptime !supported) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // where the window runs (`supported`)
     const gpa = std.testing.allocator;
     const buf = try mapBuffer(page);
     defer unmapBuffer(buf);

@@ -1134,7 +1134,8 @@ test "an allocation failing anywhere in open, plan or start leaks nothing and le
 }
 
 test "threads whose ring fails to set up read with pread, and say so" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0xf1);

@@ -1212,7 +1212,8 @@ test "a TLS response that never starts fails with FirstByteTimeout, and a reques
 
 test "a connect the listener never completes fails within its timeout" {
     // A listener that never accepts, with the shortest backlog: once its queue is full the kernel drops further SYNs,
-    // so a connect waits on retransmissions with no answer, as an unreachable front end looks.
+    // so a connect waits on retransmissions with no answer, as an unreachable front end looks. macOS queues every
+    // connection to it, but drops a SYN to a socket that is bound and not listening: there that is the front end.
     const lfd_r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     if (posix.errno(lfd_r) != .SUCCESS) return error.SkipZigTest;
     const lfd: posix.fd_t = @intCast(lfd_r);
@@ -1220,7 +1221,7 @@ test "a connect the listener never completes fails within its timeout" {
     var addr: posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
     if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
-    if (posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
+    if (!builtin.os.tag.isDarwin() and posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
     if (posix.errno(posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
 
     var peer: Peer = .loopback(std.mem.bigToNative(u16, addr.port));

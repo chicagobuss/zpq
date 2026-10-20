@@ -100,15 +100,33 @@ Each run was a fresh process, median of 3, with zstd level 3 output.
   in its window (for example 176 → 571 MiB for that full rewrite). It is lower on 2 (1631 → 1155 MiB and
   1054 → 728 MiB).
 
-**AWS Lambda.** These figures are from earlier 0.5.0 builds, and a re-run on the release artifacts is due:
-d2f4fa1 on 2026-10-09 in us-west-2 at 3008 MB, and de39261 for the 0.4.0 comparisons. Each is the median of 5 forced
-cold starts, Init + Duration.
-- Cold, on arm64, zpq was faster than DataFusion 55.2 (Rust) in 11 of 11 scenarios, Polars 2.0 (native) in 9 of 11,
-  and DuckDB 1.5.6 (native) in 11 of 11.
-- Against zpq 0.4.0 (x86_64), it was faster in 7 of 11.
-- Bloom-filter point lookups were 2.2–4.6× faster than 0.4.0.
-- Warm, with calls at least 10 s apart, the other engines were mostly faster. zpq was faster in 2 of 11 against
-  DataFusion, 4 of 11 against Polars and 1 of 11 against DuckDB.
+**AWS Lambda, cold starts.**
+
+How these were measured:
+- **Builds:** zpq's final stripped Lambda builds against native builds of the other engines, in the same session on
+  the same architecture.
+- **Setup:** us-west-2, 3008 MB, default network quota.
+- **Engines:** DataFusion 55.2.0 (Rust; 32 partitions, page index and pushdown off), Polars 2.0.0 (native) and DuckDB
+  1.5.6 (native container image; 16 threads, file cache on).
+- **Scenarios:** the same 11 as earlier runs, with answers checked against reference results. Six read a 174.8 MB
+  synthetic file, four read TPC-H SF1 lineitem (207.1 MB), and one filters the Overture places file and writes the
+  result to S3. The Overture outputs were read back with PyArrow and DuckDB.
+- **Metric:** each cell is 5 forced cold starts (the function's configuration is changed before each round). The
+  figure compared is the median Init + median Duration per call.
+
+Results:
+- **arm64 (Graviton):** zpq is faster than DataFusion in 11 of 11 scenarios, Polars in 10 of 11 and DuckDB in 11 of
+  11. The loss is the full scan of the 174.8 MB file (B1): 777 ms against Polars' 729 ms.
+- **x86_64:** zpq is faster than all three in 11 of 11 scenarios.
+- **Against an earlier 0.5.0 build** (d2f4fa1, 2026-10-09, same session): zpq is at or below it on 9 of 11 scenarios
+  on each architecture.
+- **Init:** median 30.8 ms on arm64 and 40.3 ms on x86_64, up from 23.0 and 26.0 ms for d2f4fa1. Most of the
+  difference is the S3 pre-connect, which now runs during Init. DataFusion's Init is 149.8 ms, Polars' 74.5 ms and
+  DuckDB's 218.7 ms on arm64.
+- **B1, the trade-off:** zpq now holds much less memory there. On arm64 it takes 777 ms at a 114 MB peak, against
+  670 ms at 269 MB for d2f4fa1. On x86_64, 771 ms at 129 MB against 722 ms at 271 MB.
+
+From an earlier build (de39261, AWS run B): Bloom-filter point lookups were 2.2–4.6× faster than zpq 0.4.0.
 
 What changed underneath:
 
@@ -313,6 +331,15 @@ client of the C ABI can do the same.
 - The Lambda pre-connects to the regional S3 endpoint during init and fetches a footer with one suffix GET.
 - Request strictness: a NUL byte in a path, header-breaking bytes in an S3 URL, an unknown `output_codec`, a size of
   `0MB` and a `max_memory` of 0 are refused.
+- On Lambda, 8 S3 data requests are kept in flight on arm64 (Graviton) and 16 on x86_64. Each connection's TLS
+  stream costs CPU, and a 3008 MB Graviton sandbox has two vCPUs: there, 16 at once finished cold scans later. Only
+  that memory size was measured, so the default goes by architecture, not by vCPU count; `ZPQ_S3_IN_FLIGHT`
+  overrides it.
+- S3 fetch workers waiting for a slot sleep until one frees instead of polling, and an aggregate whose input is
+  fetched through the read-ahead window takes full batches from its first fetch. Only a read that may stop early (a
+  print with `--limit`) still starts small.
+- On macOS, a pooled S3 connection the server has reset is retried at once on a fresh connection, without backoff or
+  charging the retry budget, as on Linux. Before, macOS counted it as a failed read.
 
 ### Memory ceiling: `--max-memory`
 
@@ -401,6 +428,9 @@ DECIMAL and FLOAT16 over FIXED_LEN_BYTE_ARRAY are numbers. `-o` Parquet output i
 - GROUP BY keys as expressions (bound by value), SELECT positions or aliases; ORDER BY and HAVING on a quoted alias.
 - Searched `CASE WHEN ... THEN ... [ELSE ...] END` (a branch is evaluated only on rows that take it) and
   `strlen(s)` (bytes; NULL for NULL).
+- `coalesce` takes any number of arguments of any kind: columns, literals or expressions (`coalesce(x * 2, y, 0)`).
+  Each argument is evaluated only on the rows every earlier one left NULL, so a fault in it counts only where it is
+  the answer.
 - Filters (SQL `WHERE`, `FILTER (WHERE ...)` and `--filter`):
   - grouping parentheses, and `NOT` over a group (three-valued), nested at most 32 deep;
   - `NOT BETWEEN`, `<>`, and quoted text containing keywords, with `''` for a quote;
@@ -446,7 +476,8 @@ Not supported: `%` (refused as `operator % is not supported`), the simple `CASE 
   - The JSON has `schema_version: 1`. Values are strings, so 64-bit and DECIMAL bounds do not round.
   - `--detail` reads bounded page, index and Bloom metadata (8 MiB).
   - A file that fails is reported in place, and the command exits 1.
-- Bash, zsh and fish completions and a man page are in `packaging/`, generated from the CLI's help text.
+- Bash, zsh and fish completions and a man page are in `packaging/`, generated from the CLI's help text. The man page
+  is regenerated for the release, including `--trust-stats` and missing NaN counts.
 - `zpq --version` prints the version and build revision.
 
 ### Homebrew
@@ -475,13 +506,19 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
 - libzpq: Linux x86_64 and arm64 (glibc 2.28 or later, or musl) and macOS arm64 and x86_64; the macOS libraries are
   cross-built and not run. Windows is not built.
 - snappy's NEON paths are enabled on arm64.
+- Release binaries are stripped, which makes them much smaller, and they carry no paths from the machine that built
+  them. A build is reproducible: the same commit and flags give the same bytes, whatever directory they were built
+  in. The Lambda zip is written the same way every time.
+  - The x86_64 Linux CLI is 8.1 MB.
+  - The Lambda bootstraps are 6.0 MB (arm64) and 7.3 MB (x86_64), against 44.8 and 47.2 MB unstripped.
+  - Local builds keep their symbols unless built with `-Dstrip=true`.
+- macOS: the macOS build carries no Linux-only system calls, and its fetch workers wait through libSystem.
 - Building from source requires Zig 0.17.0 exactly.
 
 ### Known limits
 
 - **SQL shapes still refused:**
-  - `coalesce` over BOOLEAN columns;
-  - a `CASE` whose BOOLEAN branch reads a column holding NULLs where the branch is taken;
+  - `coalesce` over BOOLEAN columns (`type mismatch in expression`, exit 1, after a CSV header);
   - `TRUE`/`FALSE` literals inside expressions, and comparisons as values (`SELECT x > 5`);
   - a quoted alias used as a GROUP BY key;
   - a fractional literal against an integer column (`x > 1.5`).
@@ -499,8 +536,6 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
   libzpq host.
 - A high-cardinality GROUP BY just inside a cgroup's default budget can take many times longer than with headroom.
   It retries narrower paths before the one that fits.
-- `coalesce` over an arithmetic expression (`coalesce(x + 1, 0)`) fails at run time (`UnsupportedCoalesce`, exit 1),
-  after a CSV header has already been printed.
 - Windowed filter and re-encode writes omit page indexes, so readers fall back to row-group pruning.
 - A filtered or limited Parquet write refuses nested leaves and INT96 (`INT96 re-encoding is not supported yet`); a
   plain copy keeps both.

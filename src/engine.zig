@@ -10497,13 +10497,15 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and ev
         });
         try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
         // A reader's input bounds its key by the dictionary headers its probe reads first, so the plan is the same
-        // whatever the read mode; it unions them only where a choice turns on it (no dense fold or pairs here).
+        // whatever the read mode; it unions them only where a choice turns on it (no dense fold or pairs here). Off
+        // Linux there is no reader (`executeAggregateOver`): every mode reads through the mapping.
+        const mapped = i == 0 or @import("builtin").os.tag != .linux;
         const reasons = explained.aggregate.plan.reasons;
         try std.testing.expect(reasons.contains(.small_ndv));
-        try std.testing.expectEqual(i == 0, reasons.contains(.dictionary_union));
+        try std.testing.expectEqual(mapped, reasons.contains(.dictionary_union));
         // Explain says which facts it planned from and why: the union over the mapping, the headers beside a reader.
         const planning = explained.aggregate.plan.facts.planning.?;
-        if (i == 0) {
+        if (mapped) {
             try std.testing.expectEqual(.dictionary_union, planning.source);
             try std.testing.expectEqual(.mapped, planning.why);
         } else {
@@ -10528,7 +10530,8 @@ test "a row group past half the query's budget is read through the mapping, what
             .max_memory = mm,
         });
         // The reader would hold a row group whole, beside everything the ledger holds; the mapping holds none of it.
-        try std.testing.expectEqual(mm == 4096, explained.io_mode == .mmap);
+        // Off Linux there is no reader: the mapping, whatever the budget.
+        try std.testing.expectEqual(mm == 4096 or @import("builtin").os.tag != .linux, explained.io_mode == .mmap);
     };
 }
 

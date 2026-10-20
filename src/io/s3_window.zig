@@ -162,9 +162,11 @@ pub fn Fetcher(comptime Pool: type) type {
             var exec = self.executor(w.gpa);
             defer exec.deinit();
             var next: usize = 0;
-            // Slow start: the first batch is one row group, so the first rows are ready soon and a reader that stops
-            // early (a print's `--limit`) has fetched little; each batch may then take twice the last, up to `batch`.
-            var cap: u64 = 0;
+            // Slow start, for a reader that may stop early (a print's `--limit`): the first batch is one row group, so
+            // the first rows are ready soon and little is fetched for nothing; each batch may then take twice the last,
+            // up to `batch`. A reader that takes every row group starts at `batch`: halving its first batches only
+            // left the connections idle between batches.
+            var cap: u64 = if (w.slow_start) 0 else w.batch;
             while (next < w.order.len) {
                 if (w.cancel.load(.acquire)) return;
                 const first = next;
@@ -285,6 +287,8 @@ pub const Window = struct {
     /// Bytes one fetch batch may take: smaller than the window, so the next batch can be admitted while the scan
     /// works through the last.
     batch: u64,
+    /// Start with a one-row-group batch and double (`Fetcher.runErr`): for a reader that may stop before the end.
+    slow_start: bool = true,
     /// Fetcher thread only.
     submitted: u64 = 0,
     released: std.atomic.Value(u64) = .init(0),
@@ -457,6 +461,37 @@ test "a copied-only group dropped after it is admitted releases its charge" {
     try std.testing.expect(one.admitted);
     try std.testing.expectEqual(@as(u64, page), fetcher.window.submitted);
     try std.testing.expectEqual(@as(u64, page), fetcher.window.released.load(.acquire));
+}
+
+test "only a reader that may stop early starts its fetch at one row group" {
+    if (comptime !supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |slow| {
+        var bufs: [4][]align(page) u8 = undefined;
+        for (&bufs) |*b| b.* = try mapBuffer(page);
+        defer for (bufs) |b| unmapBuffer(b);
+        var copies: [4]Copied = undefined;
+        var groups: [4]RowGroup = undefined;
+        var order: [4]*RowGroup = undefined;
+        for (0..4) |i| {
+            copies[i] = .{ .dst = bufs[i][0..copied_byte.len], .src = &copied_byte };
+            groups[i] = copiedGroup(bufs[i], copies[i .. i + 1]);
+            order[i] = &groups[i];
+        }
+        var fetcher = try startCopied(gpa, &order);
+        fetcher.window.limit = 4 * page;
+        fetcher.window.batch = 4 * page;
+        fetcher.window.slow_start = slow;
+        // On this thread, so the batches are counted when it returns.
+        fetcher.runErr() catch |err| {
+            stopCopied(gpa, &fetcher);
+            return err;
+        };
+        stopCopied(gpa, &fetcher);
+        for (&groups) |*g| try std.testing.expectEqual(State.ready, g.state.load(.acquire));
+        // One row group, then two, then the last; or, taking every row group, all four in one batch.
+        try std.testing.expectEqual(@as(u64, if (slow) 3 else 1), fetcher.window.stats.batches);
+    }
 }
 
 test "dispatch fetches the admitted spans and does not allocate a second buffer" {

@@ -3342,6 +3342,8 @@ fn openInputs(
                     .order = win_order.items,
                     .limit = fetch_window.limit,
                     .batch = @max(1, fetch_window.limit / 4),
+                    // Only a reader that may stop early (`always`: a print with a limit) fetches its first rows first.
+                    .slow_start = fetch_window.always,
                 },
                 .pool = pool,
                 .creds = creds,

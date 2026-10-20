@@ -46,7 +46,7 @@ def main():
         prefix = out / target
         if not args.skip_build:
             subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + target,
-                            "-Dcpu=baseline", "-Drevision=" + revision, "--prefix", str(prefix)],
+                            "-Dcpu=baseline", "-Dstrip=true", "-Drevision=" + revision, "--prefix", str(prefix)],
                            cwd=ROOT, check=True, timeout=1200)
         binary = prefix / "bin/zpq"
         if revision.encode() not in binary.read_bytes():

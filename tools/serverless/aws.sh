@@ -48,8 +48,8 @@ build() {
     # before talking to the runtime API.
     # ReleaseFast is the Lambda build: ReleaseSmall measured no faster to
     # start on Lambda and up to 2x slower cold, for a zip far under the
-    # 50 MB direct-upload limit either way.
-    zig build -Dtarget="${target}-musl" -Doptimize=ReleaseFast lambda
+    # 50 MB direct-upload limit either way. Stripped, as every release artifact is (build.zig `strip`).
+    zig build -Dtarget="${target}-musl" -Doptimize=ReleaseFast -Dstrip=true lambda
 
     local zpq_bin="zig-out/bin/zpq-lambda"
     if [[ ! -f "$zpq_bin" ]]; then
@@ -62,12 +62,16 @@ build() {
     file_arch=$(file "$zpq_bin" 2>/dev/null | grep -oE "x86-64|aarch64|ARM" || echo "unknown")
     info "Built: $file_arch binary ($(du -h "$zpq_bin" | cut -f1))"
 
-    # Create Lambda zip (zpq renamed to bootstrap)
+    # Create Lambda zip (zpq renamed to bootstrap). Reproducible: the commit's time and fixed mode on the entry, no
+    # extra attributes, UTC for the zip's local-time stamp, and a fresh archive rather than an update of the last one.
     local zip_dir="zig-out/lambda"
     local zip_path="$zip_dir/zpq-lambda-$arch.zip"
     mkdir -p "$zip_dir"
+    rm -f "$zip_path"
     cp "$zpq_bin" "$zip_dir/bootstrap"
-    (cd "$zip_dir" && zip -j "zpq-lambda-$arch.zip" bootstrap && rm bootstrap)
+    chmod 0755 "$zip_dir/bootstrap"
+    touch -d "@$(git show -s --format=%ct HEAD)" "$zip_dir/bootstrap"
+    (cd "$zip_dir" && TZ=UTC zip -X -j "zpq-lambda-$arch.zip" bootstrap && rm bootstrap)
     success "Created $zip_path ($(du -h "$zip_path" | cut -f1))"
 
     echo "$zip_path"

@@ -43,7 +43,7 @@ host="$(uname -m)"
 build() {
     local t="$1"
     echo "== build $t"
-    "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast --prefix "$OUT/$t" cli lambda
+    "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast -Dstrip=true --prefix "$OUT/$t" cli lambda
 }
 
 expect() {
@@ -97,7 +97,7 @@ smoke_lambda() {
     local t="$1"
     shift
     echo "== run $t Lambda bootstrap (fake runtime API)${1:+ $*}"
-    "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast "$@" test-integration --summary failures
+    "$ZIG" build -Dtarget="$t" -Doptimize=ReleaseFast -Dstrip=true "$@" test-integration --summary failures
     echo "  ok test-integration"
     ran+=("$t:lambda${1:+ ($*)}")
 }

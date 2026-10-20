@@ -38,7 +38,7 @@ python3 tools/verify_tls.py
 for t in $TARGETS native; do
   tgt=(); [ "$t" = native ] || tgt=(-Dtarget="$t")
   echo "== building $t" >&2
-  zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" -Doptimize=ReleaseFast cli --prefix "$TMP/build-$t"
+  zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" -Doptimize=ReleaseFast -Dstrip=true cli --prefix "$TMP/build-$t"
   if [ "$CLI_ONLY" != 1 ]; then
     zig build -j"${ZPQ_BUILD_JOBS:-8}" -Drevision="$REV" "${tgt[@]}" test-bin --prefix "$TMP/build-$t"
   fi

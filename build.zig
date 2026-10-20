@@ -37,11 +37,16 @@ pub fn build(b: *std.Build) void {
     // `-Dprofile=false` compiles the span sites out entirely.
     const profile = b.option(bool, "profile", "Compile in query profiling (--profile; default true)") orelse true;
 
+    // Release artifacts ship stripped (tools/package_release.py, release_smoke.sh, macos_bundle.sh and serverless/aws.sh
+    // pass `-Dstrip=true`): debug info carries the builder's absolute paths into public binaries and makes their bytes
+    // depend on where they were built. Off by default so local builds keep the symbols profilers and stack traces use.
+    const strip = b.option(bool, "strip", "Strip debug info and symbols from zpq and zpq-lambda (default false)") orelse false;
+
     var deps = CoreDeps.init(b, target, optimize, fetch_prebuilt, false);
     deps.profile = profile;
 
     // ----- CLI binary -----
-    const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql);
+    const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql, strip);
     const cli_version = b.addOptions();
     var revision_status: u8 = 0;
     const revision_args: []const []const u8 = &.{ "git", "describe", "--always", "--dirty", "--exclude=*", "--abbrev=12" };
@@ -64,7 +69,7 @@ pub fn build(b: *std.Build) void {
     test_cli_step.dependOn(&b.addRunArtifact(cli_tests).step);
 
     // ----- Lambda binary -----
-    const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, sql);
+    const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, sql, strip);
     const lambda = b.addExecutable(.{
         .name = "zpq-lambda",
         .root_module = lambda_zpq.root,
@@ -525,6 +530,7 @@ fn addBinaryModules(
     optimize: std.builtin.Optimize,
     binary: Binary,
     sql: bool,
+    strip: bool,
 ) BinaryModules {
     const is_lambda = binary == .lambda;
     // SQL frontend (liteparser) is opt-in and CLI-only: Lambda is
@@ -539,6 +545,7 @@ fn addBinaryModules(
         .root_source_file = b.path(if (is_lambda) "src/lambda/main.zig" else "src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .omit_frame_pointer = false,
         // libc gives us getaddrinfo; under -O ReleaseSmall + musl static
         // it adds ~150 KB which is dwarfed by BoringSSL anyway. Until

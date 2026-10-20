@@ -7,6 +7,7 @@
 //! Linux.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 fn read(clock: std.Io.Clock) posix.timespec {
@@ -40,6 +41,18 @@ pub fn realtimeS() i64 {
     return @intCast(read(.real).sec);
 }
 
+/// Sleep for `ns` nanoseconds, or until a signal cuts it short. The raw syscall on Linux; libc elsewhere, where a
+/// raw Linux syscall is not one.
+pub fn sleepNs(ns: u64) void {
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+        _ = std.os.linux.nanosleep(&ts, null);
+    } else {
+        var ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
 test "monoNs and bootNs are non-decreasing and realtimeS is past 2020" {
     const a = monoNs();
     const b = monoNs();
@@ -50,4 +63,10 @@ test "monoNs and bootNs are non-decreasing and realtimeS is past 2020" {
     try std.testing.expect(c > 0);
     try std.testing.expect(d >= c);
     try std.testing.expect(realtimeS() > 1_577_836_800);
+}
+
+test "sleepNs sleeps at least as long as asked" {
+    const a = monoNs();
+    sleepNs(2 * std.time.ns_per_ms);
+    try std.testing.expect(monoNs() - a >= 2 * std.time.ns_per_ms);
 }

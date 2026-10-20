@@ -671,8 +671,7 @@ fn waitPreconnect(p: anytype, n: u32) !void {
     const start = nowMonoNs();
     while (p.preconnect_done.load(.monotonic) < n) {
         if (nowMonoNs() - start > 30 * std.time.ns_per_s) return error.TestUnexpectedResult;
-        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.os.linux.nanosleep(&ts, null);
+        clock.sleepNs(std.time.ns_per_ms);
     }
 }
 
@@ -763,10 +762,7 @@ test "a preconnect across two addresses of a full listen queue stops without han
     const virtual_start = tls.testClockMs();
     var batch_started = std.atomic.Value(bool).init(false);
     const Gate = struct {
-        fn nap(ns: u64) void {
-            var ts: std.os.linux.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-            _ = std.os.linux.nanosleep(&ts, null);
-        }
+        const nap = clock.sleepNs;
         fn run(pool: *Pool(1), flag: *std.atomic.Value(bool)) void {
             while (!flag.load(.acquire)) nap(std.time.ns_per_ms);
             nap(20 * std.time.ns_per_ms);
@@ -810,8 +806,7 @@ fn holdAccepted(fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
         n += 1;
     }
     while (!stop.load(.monotonic)) {
-        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&ts, null);
+        clock.sleepNs(20 * std.time.ns_per_ms);
     }
     for (held[0..n]) |cfd| _ = std.posix.system.close(cfd);
 }

@@ -708,7 +708,8 @@ fn executeAggregateOver(
     }
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
-    defer if (reader) |rd| rd.destroy();
+    // Off Linux the reader never exists (`on_linux`), and its teardown's futex and close must not be compiled in.
+    defer if (on_linux) if (reader) |rd| rd.destroy();
     const scan_inputs = if (io_mode == .mmap or empty_result) opened.inputs else try planLocalReader(
         ctx,
         arena,

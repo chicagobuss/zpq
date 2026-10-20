@@ -1819,8 +1819,7 @@ test "regression: a response that trickles in past its attempt's deadline is cut
 }
 
 fn sleepMs(ms: u64) void {
-    var ts: std.os.linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
-    _ = std.os.linux.nanosleep(&ts, null);
+    clock.sleepNs(ms * std.time.ns_per_ms);
 }
 
 test "ZPQ_S3_FIRST_WAVE selects the cap before the first data header, and 16 is no slow start" {

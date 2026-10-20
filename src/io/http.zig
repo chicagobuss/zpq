@@ -567,8 +567,30 @@ fn drainSent(bytes: []const u8, max_body: usize) Error!void {
     defer _ = std.posix.system.close(fds[1]);
     var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
     defer conn.deinit();
-    _ = std.posix.system.write(fds[1], bytes.ptr, bytes.len);
-    _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+    // The peer writes from its own thread: a response larger than the socket buffer (8 KiB for AF_UNIX on macOS) would
+    // otherwise block the write before anything reads it. A refused response stops the reader early, so the reader's
+    // end is shut before the join: the writer's blocked send then fails (no SIGPIPE: MSG_NOSIGNAL, or SO_NOSIGPIPE).
+    if (@hasDecl(std.posix.SO, "NOSIGPIPE")) {
+        const one: c_int = 1;
+        _ = std.posix.system.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    }
+    const Writer = struct {
+        const flags: u32 = if (@hasDecl(std.posix.MSG, "NOSIGNAL")) std.posix.MSG.NOSIGNAL else 0;
+        fn run(fd: std.posix.fd_t, data: []const u8) void {
+            var at: usize = 0;
+            while (at < data.len) {
+                const n = std.posix.system.sendto(fd, data[at..].ptr, data.len - at, flags, null, 0);
+                if (n <= 0) break;
+                at += @intCast(n);
+            }
+            _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        }
+    };
+    const writer = std.Thread.spawn(.{}, Writer.run, .{ fds[1], bytes }) catch return error.RecvFailed;
+    defer {
+        _ = std.posix.system.shutdown(fds[0], std.posix.SHUT.RDWR);
+        writer.join();
+    }
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     _ = try drainResponse(arena.allocator(), &conn, false, max_body);

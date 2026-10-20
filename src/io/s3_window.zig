@@ -464,7 +464,7 @@ test "a copied-only group dropped after it is admitted releases its charge" {
 }
 
 test "only a reader that may stop early starts its fetch at one row group" {
-    if (comptime !supported) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     for ([_]bool{ false, true }) |slow| {
         var bufs: [4][]align(page) u8 = undefined;

@@ -70,7 +70,8 @@ build() {
     rm -f "$zip_path"
     cp "$zpq_bin" "$zip_dir/bootstrap"
     chmod 0755 "$zip_dir/bootstrap"
-    touch -d "@$(git show -s --format=%ct HEAD)" "$zip_dir/bootstrap"
+    # The commit time, set portably (GNU and BSD touch disagree on epoch syntax).
+    python3 -c 'import os, sys; t = int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$zip_dir/bootstrap" "$(git show -s --format=%ct HEAD)"
     (cd "$zip_dir" && TZ=UTC zip -X -j "zpq-lambda-$arch.zip" bootstrap && rm bootstrap)
     success "Created $zip_path ($(du -h "$zip_path" | cut -f1))"
 

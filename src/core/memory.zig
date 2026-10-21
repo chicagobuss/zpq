@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const blocking = @import("blocking.zig");
 
 /// What a GROUP BY's merge and answer may hold past the ledger's limit once the scan is done: a small answer never
 /// refuses a query whose tables fit.
@@ -77,10 +78,15 @@ pub const SharedBudget = struct {
     /// The lock serializes cancellation against the owning worker's draws and frees. Ordinary ledgers use atomics.
     parent: ?*SharedBudget = null,
     funded: usize = 0,
-    funding_lock: std.atomic.Mutex = .unlocked,
+    /// Blocking, not spun on: every draw and release of a child with a parent takes it.
+    funding_lock: std.Io.Mutex = .init,
 
     fn lockFunding(self: *SharedBudget) void {
-        while (!self.funding_lock.tryLock()) std.Thread.yield() catch {};
+        self.funding_lock.lockUncancelable(blocking.io);
+    }
+
+    fn unlockFunding(self: *SharedBudget) void {
+        self.funding_lock.unlock(blocking.io);
     }
 
     /// Stop protecting the floor, preserving the parent's charge for every live allocation. Future draws use
@@ -88,7 +94,7 @@ pub const SharedBudget = struct {
     pub fn releaseFloor(self: *SharedBudget) void {
         const parent = self.parent orelse return;
         self.lockFunding();
-        defer self.funding_lock.unlock();
+        defer self.unlockFunding();
         parent.release(self.funded -| self.used.load(.monotonic));
         self.funded = 0;
     }
@@ -98,7 +104,7 @@ pub const SharedBudget = struct {
     pub fn transferIdleFloor(self: *SharedBudget, credit: *std.atomic.Value(usize)) void {
         if (self.parent == null) return;
         self.lockFunding();
-        defer self.funding_lock.unlock();
+        defer self.unlockFunding();
         std.debug.assert(self.used.load(.monotonic) == 0);
         _ = credit.fetchAdd(self.funded, .monotonic);
         self.funded = 0;
@@ -110,7 +116,7 @@ pub const SharedBudget = struct {
         if (self.parent != null) {
             const mutable = @constCast(self);
             mutable.lockFunding();
-            defer mutable.funding_lock.unlock();
+            defer mutable.unlockFunding();
             if (self.funded > 0) return self.funded -| self.used.load(.monotonic);
         }
         return self.available();
@@ -142,7 +148,7 @@ pub const SharedBudget = struct {
         if (self.parent) |parent| {
             const mutable = @constCast(self);
             mutable.lockFunding();
-            defer mutable.funding_lock.unlock();
+            defer mutable.unlockFunding();
             return (self.funded -| self.used.load(.monotonic)) + parent.available();
         }
         return self.limit -| self.used.load(.monotonic);
@@ -153,7 +159,7 @@ pub const SharedBudget = struct {
     pub fn drawExact(self: *SharedBudget, need: usize) ?usize {
         if (self.parent) |parent| {
             self.lockFunding();
-            defer self.funding_lock.unlock();
+            defer self.unlockFunding();
             const cur = self.used.load(.monotonic);
             if (need > self.limit -| cur) return null;
             const extra = @max(cur + need, self.funded) - @max(cur, self.funded);
@@ -204,7 +210,7 @@ pub const SharedBudget = struct {
         if (bytes == 0) return;
         if (self.parent) |parent| {
             self.lockFunding();
-            defer self.funding_lock.unlock();
+            defer self.unlockFunding();
             const cur = self.used.load(.monotonic);
             std.debug.assert(cur >= bytes);
             parent.release(@max(cur, self.funded) - @max(cur - bytes, self.funded));

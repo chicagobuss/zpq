@@ -27,6 +27,7 @@ const profile = @import("../profile.zig");
 /// scan.zig, which imports this module.
 const WORKER_STACK_SIZE: usize = 1 << 20;
 const spawn_util = @import("spawn.zig");
+const blocking = @import("blocking.zig");
 const schema = @import("schema.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_eval = @import("filter/eval.zig");
@@ -2803,33 +2804,35 @@ pub const DecodeBudget = struct {
     limit: usize,
     workers: usize = 1,
     used: std.atomic.Value(usize) = .init(0),
+    /// Bumped by every release; a worker whose row group does not fit sleeps on it until one does.
+    released: std.atomic.Value(u32) = .init(0),
+    /// Workers asleep in `acquire`: a release with none wakes nobody, and costs no system call.
+    waiters: std.atomic.Value(u32) = .init(0),
 
     /// What one worker may hold without staging: its even share.
     pub fn share(self: *const DecodeBudget) usize {
         return self.limit / @max(1, self.workers);
     }
 
+    /// Others hold the budget for a whole row group's decode, milliseconds at least, so a worker that does not fit
+    /// sleeps until a release rather than spin or poll on a core a decoding worker needs (Lambda has two).
     pub fn acquire(self: *DecodeBudget, bytes: usize) error{RowGroupTooLarge}!void {
         if (bytes > self.limit) return error.RowGroupTooLarge;
-        var waits: u32 = 0;
+        if (self.tryAcquire(bytes)) return;
+        _ = self.waiters.fetchAdd(1, .seq_cst);
+        defer _ = self.waiters.fetchSub(1, .seq_cst);
         while (true) {
-            const cur = self.used.load(.monotonic);
-            if (cur + bytes <= self.limit) {
-                if (self.used.cmpxchgWeak(cur, cur + bytes, .acquire, .monotonic) == null) return;
-                continue;
-            }
-            // Others hold the budget for a whole row group's decode: milliseconds at least. Yield a few times, then
-            // sleep rather than spin on a core a decoding worker needs (Lambda has two).
-            waits += 1;
-            if (waits < 8) std.Thread.yield() catch {} else {
-                const ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000 };
-                _ = std.c.nanosleep(&ts, null);
-            }
+            // Read `released` before trying: a release between the two moves it, and the wait returns at once.
+            const seen = self.released.load(.seq_cst);
+            if (self.tryAcquire(bytes)) return;
+            blocking.io.futexWaitUncancelable(u32, &self.released.raw, seen);
         }
     }
 
     pub fn release(self: *DecodeBudget, bytes: usize) void {
         _ = self.used.fetchSub(bytes, .release);
+        _ = self.released.fetchAdd(1, .seq_cst);
+        if (self.waiters.load(.seq_cst) > 0) blocking.io.futexWake(u32, &self.released.raw, std.math.maxInt(u32));
     }
 
     /// `acquire` without waiting: false, holding nothing, when the bytes do not fit now. For optional scratch whose
@@ -5769,6 +5772,29 @@ fn decodeWithReader(
 // Compile-time API check. End-to-end behavior is exercised through
 // the lambda integration tests + CLI golden tests.
 // ============================================================
+test "a decode budget's waiting worker sleeps until a release makes room, then holds its bytes" {
+    var budget: DecodeBudget = .{ .limit = 100 };
+    try budget.acquire(80);
+    const Waiter = struct {
+        fn run(b: *DecodeBudget, got: *std.atomic.Value(bool)) void {
+            b.acquire(50) catch return;
+            got.store(true, .release);
+        }
+    };
+    var got: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ &budget, &got });
+    for (0..10) |_| {
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try std.testing.expect(!got.load(.acquire));
+    }
+    budget.release(80);
+    t.join();
+    try std.testing.expect(got.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 50), budget.used.load(.monotonic));
+    try std.testing.expectError(error.RowGroupTooLarge, budget.acquire(101));
+    budget.release(50);
+}
+
 test "consumer: API is well-typed" {
     _ = appendProjectedRG;
     _ = encodeAggregator;

@@ -43,6 +43,7 @@ const membership = @import("filter/membership.zig");
 const nanprobe = @import("filter/nanprobe.zig");
 const Diag = @import("diag.zig").Diag;
 const core_bytes = @import("bytes.zig");
+const blocking = @import("blocking.zig");
 const keyEql = core_bytes.keyEql;
 const KeyHashMap = core_bytes.KeyHashMap;
 const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
@@ -1312,9 +1313,6 @@ const BlockMerge = struct {
     /// Bumped whenever `next` advances or a worker fails: the word `awaitTurn` sleeps on.
     moved: std.atomic.Value(u32) = .init(0),
 
-    /// Only the OS futex is used, which no `Io` instance holds state for; the scan has no `Io` of its own.
-    const futex_io = std.Io.Threaded.global_single_threaded.io();
-
     /// Wait until block `b` may start; false once another worker has failed.
     fn awaitTurn(self: *BlockMerge, b: usize) bool {
         while (true) {
@@ -1322,7 +1320,7 @@ const BlockMerge = struct {
             const seen = self.moved.load(.acquire);
             if (self.failed.load(.acquire)) return false;
             if (b < self.next.load(.acquire) + self.ahead) return true;
-            futex_io.futexWaitUncancelable(u32, &self.moved.raw, seen);
+            blocking.io.futexWaitUncancelable(u32, &self.moved.raw, seen);
         }
     }
 
@@ -1330,8 +1328,8 @@ const BlockMerge = struct {
     /// the lock merges every block ready by then, so none is left behind.
     fn finish(self: *BlockMerge, b: usize) !void {
         self.done[b].store(true, .release);
-        self.lock.lockUncancelable(futex_io);
-        defer self.lock.unlock(futex_io);
+        self.lock.lockUncancelable(blocking.io);
+        defer self.lock.unlock(blocking.io);
         var n = self.next.load(.monotonic);
         while (n < self.tables.len and self.done[n].load(.acquire)) : (n += 1) {
             const src = &self.tables[n];
@@ -1357,7 +1355,7 @@ const BlockMerge = struct {
 
     fn wake(self: *BlockMerge) void {
         _ = self.moved.fetchAdd(1, .release);
-        futex_io.futexWake(u32, &self.moved.raw, std.math.maxInt(u32));
+        blocking.io.futexWake(u32, &self.moved.raw, std.math.maxInt(u32));
     }
 };
 

@@ -13,6 +13,7 @@
 const std = @import("std");
 const expr_agg = @import("expr/agg.zig");
 const spawn_util = @import("spawn.zig");
+const blocking = @import("blocking.zig");
 
 /// At most this many partitions: enough that one holds a cache-sized table at tens of millions of groups. A small
 /// budget gets fewer (`partBits`), as every partition's table costs a few hundred bytes even when nearly empty.
@@ -110,7 +111,7 @@ pub const armed_window: usize = 1 << 18;
 
 pub const Part = struct {
     /// Held while a worker merges into `table` (`PartAgg.shared` only).
-    lock: std.atomic.Value(bool) align(64) = .init(false),
+    lock: std.Io.Mutex align(64) = .init,
     table: expr_agg.GroupTable,
 };
 
@@ -143,7 +144,7 @@ pub const PartAgg = struct {
     /// Offered decoder floors return as soon as a reducing sample keeps the shared path.
     decoder_floors: []expr_agg.SharedBudget = &.{},
     sample_floors: []expr_agg.SharedBudget = &.{},
-    private_lock: std.atomic.Mutex = .unlocked,
+    private_lock: std.Io.Mutex = .init,
     private_decided: bool = false,
     compact: bool = false,
     /// Set by the first worker that moves its plain table here (`scan.MultiAggArgs.spill`).
@@ -259,8 +260,8 @@ pub const PartAgg = struct {
         if (self.private_rows == 0 or local.private_checked) return;
         // No worker can touch a partition until its first flush has passed this lock. The winner may replace the
         // still-empty partition array; every later worker sees that choice before routing or scattering a row.
-        while (!self.private_lock.tryLock()) std.Thread.yield() catch {};
-        defer self.private_lock.unlock();
+        self.private_lock.lockUncancelable(blocking.io);
+        defer self.private_lock.unlock(blocking.io);
         if (!self.private_decided) {
             self.private_decided = true;
             if (local.rows_since >= self.probe and table.groupCount() *| 10 >= local.rows_since *| 9) {
@@ -396,18 +397,18 @@ pub const PartAgg = struct {
         self.reset(local, retain);
     }
 
+    /// A merge holds a partition briefly, so a few spins usually find it free; past them the waiter sleeps rather
+    /// than yield the CPU the holder needs.
     pub fn lock(part: *Part) void {
-        var spins: u32 = 0;
-        while (part.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            if (spins < 64) {
-                spins += 1;
-                std.atomic.spinLoopHint();
-            } else std.Thread.yield() catch {};
+        for (0..64) |_| {
+            if (part.lock.tryLock()) return;
+            std.atomic.spinLoopHint();
         }
+        part.lock.lockUncancelable(blocking.io);
     }
 
     pub fn unlock(part: *Part) void {
-        part.lock.store(false, .release);
+        part.lock.unlock(blocking.io);
     }
 
     fn mergeBatch(self: *PartAgg, part: *Part, local: *expr_agg.GroupTable, groups: []const u32) !void {
@@ -559,8 +560,8 @@ pub const PartAgg = struct {
             if (b.parent == self.budget) {
                 // Empty workers can finish before the sample decides. Keep their credit prepaid, with returns
                 // ordered against admission/cancellation under the same lock as nonempty workers' first flush.
-                while (!self.private_lock.tryLock()) std.Thread.yield() catch {};
-                defer self.private_lock.unlock();
+                self.private_lock.lockUncancelable(blocking.io);
+                defer self.private_lock.unlock(blocking.io);
                 if (self.private_reserved) b.transferIdleFloor(&self.run_credit) else b.releaseFloor();
             } else b.releaseFloor();
         };
@@ -601,6 +602,25 @@ fn freeOwned(gpa: std.mem.Allocator, acc: *expr_agg.Accumulator) void {
 fn countMerge(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, _: std.mem.Allocator) anyerror!void {
     dst.count += src.count;
     src.count = 0;
+}
+
+test "partagg: a partition's lock admits one merging worker at a time" {
+    var part: Part = .{ .table = expr_agg.GroupTable.init(std.testing.allocator, 0) };
+    defer part.table.deinit();
+    const Worker = struct {
+        fn run(p: *Part, n: *usize) void {
+            for (0..20_000) |_| {
+                PartAgg.lock(p);
+                defer PartAgg.unlock(p);
+                n.* += 1;
+            }
+        }
+    };
+    var n: usize = 0;
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &part, &n });
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(usize, 80_000), n);
 }
 
 test "partagg: partial flushes sum and keep the earliest position" {

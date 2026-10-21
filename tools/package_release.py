@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import tarfile
 import tempfile
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos", "x86_64-macos")
@@ -33,6 +35,22 @@ def release_version(version):
     return tags.pop()[1:]
 
 
+def man_gzip(page):
+    """gzip -9n of the man page. Deflate output differs between zlib builds (zlib-ng does), so pin the bytes."""
+    deflate = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+    body = b"\x1f\x8b\x08\x00" + bytes(4) + b"\x02\xff" + deflate.compress(page) + deflate.flush()
+    body += struct.pack("<II", zlib.crc32(page), len(page) & 0xFFFFFFFF)
+    lines = [f"{hashlib.sha256(page).hexdigest()}  zpq.1", f"{hashlib.sha256(body).hexdigest()}  zpq.1.gz"]
+    pinned = (ROOT / "packaging/man/zpq.1.gz.sha256").read_text().splitlines()
+    if lines[0] != pinned[0]:
+        raise SystemExit("packaging/man/zpq.1 changed; with a stock-zlib python3, pin its gzip in "
+                         "packaging/man/zpq.1.gz.sha256:\n" + "\n".join(lines))
+    if lines[1] != pinned[1]:
+        raise SystemExit(f"zlib {zlib.ZLIB_RUNTIME_VERSION} gzips the man page differently from "
+                         "packaging/man/zpq.1.gz.sha256; run with a python3 linked against stock zlib")
+    return body
+
+
 def write_packages(out, target, content, version, epoch):
     """Write the .deb and .rpm for one Linux target from the tarball's own bytes, with packaging/nfpm.yaml."""
     deb_arch, rpm_arch = PACKAGE_ARCHES[target]
@@ -43,7 +61,7 @@ def write_packages(out, target, content, version, epoch):
         for filename, body in content.items():
             (stage / filename).parent.mkdir(parents=True, exist_ok=True)
             (stage / filename).write_bytes(body)
-        (stage / "share/man/man1/zpq.1.gz").write_bytes(gzip.compress(content["share/man/man1/zpq.1"], mtime=0))
+        (stage / "share/man/man1/zpq.1.gz").write_bytes(man_gzip(content["share/man/man1/zpq.1"]))
         env = {**os.environ, "ZPQ_VERSION": version, "ZPQ_ARCH": deb_arch, "SOURCE_DATE_EPOCH": str(epoch)}
         for packager, name in names.items():
             subprocess.run(["nfpm", "pkg", "--config", str(ROOT / "packaging/nfpm.yaml"), "--packager", packager,

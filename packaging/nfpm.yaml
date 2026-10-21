@@ -1,9 +1,10 @@
 # .deb and .rpm packaging for the static zpq CLI. tools/package_release.py --packages runs nfpm with this file once per
 # Linux target and format, from a directory staged with the tarball's own files plus a reproducibly gzipped
-# share/man/man1/zpq.1.gz, so the packages carry the same bytes as the tarball and install what the Homebrew formula does.
+# share/man/man1/zpq.1.gz (pinned by packaging/man/zpq.1.gz.sha256), so the packages carry the same bytes as the tarball and install what the Homebrew formula does.
 #   ZPQ_VERSION  0.5.0, or 0.5.0-rc1 for a prerelease (nfpm writes it as 0.5.0~rc1, which sorts before 0.5.0)
 #   ZPQ_ARCH     amd64 or arm64 (nfpm maps them to x86_64 and aarch64 for rpm)
-# SOURCE_DATE_EPOCH (the release commit time) pins every mtime, so the same inputs give byte-identical packages.
+# SOURCE_DATE_EPOCH (the release commit time) pins every mtime and rpm.buildhost replaces the host name, so the same
+# inputs give byte-identical packages on any machine.
 name: zpq
 version: ${ZPQ_VERSION}
 version_schema: semver
@@ -15,6 +16,8 @@ homepage: https://github.com/chicagobuss/zpq
 license: MIT
 section: utils
 priority: optional
+rpm:
+  buildhost: reproducible
 description: |-
   Fast Unix-native Parquet inspection, filtering and projection
   An agentically-engineered Apache Parquet engine in Zig, optimized for

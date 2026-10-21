@@ -49,7 +49,10 @@ build() {
     # ReleaseFast is the Lambda build: ReleaseSmall measured no faster to
     # start on Lambda and up to 2x slower cold, for a zip far under the
     # 50 MB direct-upload limit either way. Stripped, as every release artifact is (build.zig `strip`).
-    zig build -Dtarget="${target}-musl" -Doptimize=ReleaseFast -Dstrip=true lambda
+    # The revision is passed explicitly (a cached configure can keep an old `git describe`), and ZPQ_PRERELEASE
+    # (e.g. rc2) stamps a release candidate the way package_release.py --tag does.
+    zig build -Dtarget="${target}-musl" -Doptimize=ReleaseFast -Dstrip=true -Drevision="$(git rev-parse HEAD)" \
+        ${ZPQ_PRERELEASE:+-Dprerelease="$ZPQ_PRERELEASE"} lambda
 
     local zpq_bin="zig-out/bin/zpq-lambda"
     if [[ ! -f "$zpq_bin" ]]; then

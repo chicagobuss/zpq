@@ -7,6 +7,7 @@
 //! the spec replaced it with LZ4_RAW, which is what `--codec lz4` writes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("../schema.zig");
 const snappy = @import("snappy.zig");
 const lz4 = @import("lz4.zig");
@@ -139,13 +140,89 @@ fn compressFlate(
     return out.writer.buffered();
 }
 
+/// A thread's zstd contexts, each made at its first use and kept for every later page. A context is a few hundred
+/// KiB, an mmap/munmap pair per page under musl when made per call. A pthread key frees them when the thread exits,
+/// so a pass's workers, a library's request threads and a host's own threads each hold one set at most.
+/// Reuse leaves the bytes unchanged: every compression resets the context and its parameters first (`setLevel`).
+const ThreadZstd = struct {
+    dctx: ?*c_zstd.ZSTD_DCtx = null,
+    cctx: ?*c_zstd.ZSTD_CCtx = null,
+
+    var key: std.c.pthread_key_t = undefined;
+    var key_ready: std.atomic.Value(bool) = .init(false);
+    var key_tried = false;
+    var key_lock: std.c.pthread_mutex_t = .{};
+    /// Tests only: contexts made and freed, to show reuse and teardown.
+    var made: std.atomic.Value(usize) = .init(0);
+    var freed: std.atomic.Value(usize) = .init(0);
+
+    /// This thread's set; null when it cannot be registered to be freed at thread exit (no pthread key or memory
+    /// left), and the caller then uses a set of its own for the one call.
+    fn current() ?*ThreadZstd {
+        if (!haveKey()) return null;
+        if (std.c.pthread_getspecific(key)) |p| return @ptrCast(@alignCast(p));
+        const s = std.heap.c_allocator.create(ThreadZstd) catch return null;
+        s.* = .{};
+        if (std.c.pthread_setspecific(key, s) != 0) {
+            std.heap.c_allocator.destroy(s);
+            return null;
+        }
+        return s;
+    }
+
+    fn haveKey() bool {
+        if (key_ready.load(.acquire)) return true;
+        _ = std.c.pthread_mutex_lock(&key_lock);
+        defer _ = std.c.pthread_mutex_unlock(&key_lock);
+        if (!key_tried) {
+            key_tried = true;
+            if (std.c.pthread_key_create(&key, atThreadExit) == .SUCCESS) key_ready.store(true, .release);
+        }
+        return key_ready.load(.monotonic);
+    }
+
+    fn atThreadExit(p: *anyopaque) callconv(.c) void {
+        const s: *ThreadZstd = @ptrCast(@alignCast(p));
+        s.deinit();
+        std.heap.c_allocator.destroy(s);
+    }
+
+    fn deinit(s: *ThreadZstd) void {
+        if (s.dctx) |d| _ = c_zstd.ZSTD_freeDCtx(d);
+        if (s.cctx) |c| _ = c_zstd.ZSTD_freeCCtx(c);
+        if (builtin.is_test) {
+            const n = @as(usize, @intFromBool(s.dctx != null)) + @intFromBool(s.cctx != null);
+            _ = freed.fetchAdd(n, .monotonic);
+        }
+        s.* = .{};
+    }
+
+    fn decoder(s: *ThreadZstd) Error!*c_zstd.ZSTD_DCtx {
+        if (s.dctx == null) {
+            s.dctx = c_zstd.ZSTD_createDCtx() orelse return error.OutOfMemory;
+            if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
+        }
+        return s.dctx.?;
+    }
+
+    fn encoder(s: *ThreadZstd) Error!*c_zstd.ZSTD_CCtx {
+        if (s.cctx == null) {
+            s.cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
+            if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
+        }
+        return s.cctx.?;
+    }
+};
+
 fn compressZstd(arena: std.mem.Allocator, src: []const u8, plan: ZstdPlan) Error![]u8 {
     const max_len = c_zstd.ZSTD_compressBound(src.len);
     if (c_zstd.ZSTD_isError(max_len) != 0) return error.CompressionFailed;
     const buf = try arena.alloc(u8, @max(max_len, rawFrameLen(src.len)));
     errdefer arena.free(buf);
-    const cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
-    defer _ = c_zstd.ZSTD_freeCCtx(cctx);
+    var own: ThreadZstd = .{};
+    const zs = ThreadZstd.current() orelse &own;
+    defer if (zs == &own) own.deinit();
+    const cctx = try zs.encoder();
     const choice: Choice = if (plan.lambda) |lambda| try chooseZstdMode(arena, cctx, src, lambda) else .{};
     var mode = choice.mode;
     var out = buf[0..try zstdWith(cctx, mode, buf, src)];
@@ -515,13 +592,13 @@ fn decompressFlate(
 }
 
 fn decompressZstd(src: []const u8, out: []u8) Error!void {
-    // Use libzstd's `ZSTD_decompress` directly. Zig's stdlib zstd
-    // decoder is correct but ~10× slower than libzstd on the
-    // dict-encoded numeric column-chunks Parquet writers produce —
-    // 92% of CLI aggregate time was in `std.compress.zstd` per perf
-    // profile (2026-05-06). libzstd is already linked for the write
-    // path; same library, different entry point.
-    const n = c_zstd.ZSTD_decompress(
+    // libzstd, not the stdlib decoder: that one is correct but ~10× slower on the dict-encoded numeric chunks Parquet
+    // writers produce (92% of CLI aggregate time per a 2026-05-06 profile).
+    var own: ThreadZstd = .{};
+    const zs = ThreadZstd.current() orelse &own;
+    defer if (zs == &own) own.deinit();
+    const n = c_zstd.ZSTD_decompressDCtx(
+        try zs.decoder(),
         @ptrCast(out.ptr),
         out.len,
         @ptrCast(src.ptr),
@@ -695,6 +772,51 @@ test "every zstd page mode makes a frame libzstd decodes, and each priority pick
         for (&counts.pages) |*c| pages += c.load(.monotonic);
         try testing.expectEqual(@as(u64, 1), pages);
     }
+}
+
+test "a thread makes one zstd context of each kind, reuses it for every page, and frees both when it exits" {
+    const Work = struct {
+        made: usize = 0,
+        failed: ?anyerror = null,
+
+        fn run(w: *@This()) void {
+            w.pages() catch |e| {
+                w.failed = e;
+            };
+        }
+
+        fn pages(w: *@This()) !void {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var prng = std.Random.DefaultPrng.init(0x2c7f);
+            const big = try adversarialPage(a, 1, prng.random());
+            const small = big[big.len / 2 - 3000 ..][0..6000];
+            const before = ThreadZstd.made.load(.monotonic);
+            // What a context made for this page alone writes.
+            const fresh = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
+            defer _ = c_zstd.ZSTD_freeCCtx(fresh);
+            const want = try a.alloc(u8, c_zstd.ZSTD_compressBound(big.len));
+            const want_len = try zstdWith(fresh, .level3, want, big);
+            for (std.meta.tags(CompressPriority)) |p| {
+                const plan: ZstdPlan = .{ .lambda = p.lambda() };
+                const first = try compressPage(a, big, .ZSTD, plan);
+                _ = try compressPage(a, small, .ZSTD, plan);
+                const again = try compressPage(a, big, .ZSTD, plan);
+                try testing.expectEqualSlices(u8, first, again);
+                if (p == .size) try testing.expectEqualSlices(u8, want[0..want_len], again);
+                for (0..3) |_| try testing.expectEqualSlices(u8, big, try decompress(a, again, .ZSTD, big.len));
+            }
+            w.made = ThreadZstd.made.load(.monotonic) - before;
+        }
+    };
+    const freed = ThreadZstd.freed.load(.monotonic);
+    var w: Work = .{};
+    const t = try std.Thread.spawn(.{}, Work.run, .{&w});
+    t.join();
+    if (w.failed) |e| return e;
+    try testing.expectEqual(@as(usize, 2), w.made);
+    try testing.expectEqual(@as(usize, 2), ThreadZstd.freed.load(.monotonic) - freed);
 }
 
 /// A 1 MiB page built so that the chooser's four sample slices see something unlike the rest of it.

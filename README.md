@@ -19,6 +19,10 @@ Download the CLI for your OS/architecture from a published release, or build it 
 `zig build cli -Doptimize=ReleaseFast` using Zig 0.17.0. `zpq --version` prints the version and build revision.
 The Homebrew formula is staged in `packaging/homebrew/`; it is not a published tap yet.
 
+New to zpq? [docs/getting-started.md](docs/getting-started.md) walks through a filtered read, a GROUP BY with `avg`
+and a computed Parquet write, each with its exact output; [docs/output-format.md](docs/output-format.md) is the
+contract for JSON, NDJSON and CSV answers and how each type prints.
+
 ```sh
 # Answers are NDJSON rows, ready for Unix tools (jq is a separate install).
 zpq query trips.parquet --columns VendorID,trip_distance --limit 5 | jq .
@@ -195,9 +199,12 @@ completes:
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
 
-It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default on
-Linux is 80% of available memory, or three quarters of a cgroup's memory limit or a Lambda's memory size where those
-are lower; on macOS it is half of physical memory (`src/core/system.zig`), and 512 MB where neither can be read.
+It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default
+(`src/core/system.zig`) is three quarters of the memory size on Lambda; on Linux, 80% of available memory, but no more
+than three quarters of a cgroup v2 `memory.max`; on macOS, half of physical memory; and 512 MiB where none of these
+can be read. Give it as bytes, or as a number (fractions allowed) followed by `K`, `M`, `G` or `T`, with or without a
+`B`, in any case, all powers of 1024: `--max-memory 2GB`, `--max-memory 1.5g`, `--max-memory 1073741824`. A space,
+an exponent (`1e9`) or a `MiB` spelling is refused (exit 2).
 
 Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
 It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports the strategy, reasons, column passes,
@@ -330,10 +337,13 @@ input/group order, exact numeric digits and nulls are the same in every format: 
 
 Successful queries are silent on stderr unless diagnostics were requested. `--summary=json` emits one typed
 `{"type":"summary","ok":true,"rows":N,"output":...}` line after the answer is flushed and a named file is published.
-It includes input statistics, membership and phase counters; `rows` counts emitted rows, distinct from `rows_kept`.
-`total_us` includes formatting, flushing and publication, excludes writing the summary, and `output_us` records
-output work separately. In this mode failures emit a typed `error` line and JSON profile summaries a typed `profile`
-line; text profile summaries are rejected. The libzpq, service and Lambda envelopes are unchanged.
+It counts rows four ways: `rows` in the answer, `rows_in` in the inputs, `rows_scanned` in the row groups read, and
+`rows_matched` kept by the filter. Its times are wall clock (`total_ms`, `output_us`, `wall_ms`) or, in `worker_ms`,
+summed over the workers, so a `worker_ms.decode` above `total_ms` means several workers decoded at once.
+[docs/output-format.md](docs/output-format.md) defines every field. `total_us` includes formatting, flushing and
+publication and excludes writing the summary. In this mode failures emit a typed `error` line and JSON profile
+summaries a typed `profile` line; text profile summaries are rejected. The libzpq, service and Lambda responses carry
+the same row counters and time objects.
 
 Exit status is 0 for success, 1 for read/decode/write failure, 2 for invalid or unsupported options/queries, and 141
 when a consumer closes stdout. Disk-full errors remain failures. Named local outputs use an exclusive sibling
@@ -433,8 +443,12 @@ just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 `zpq --version` reports the release the binary was built from.
 
 The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases ship the CLI for Linux
-and macOS, each x86_64 and arm64, as `zpq-<linux|macos>-<x86_64|arm64>.tar.gz` (plus a `.sha256`) on the GitHub Release
-and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or `releases/v<version>/`).
+and macOS, each x86_64 and arm64, as `zpq-<version>-<revision>-<target>.tar.gz` (plus a `.sha256` and `release.json`)
+on the GitHub Release and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or
+`releases/v<version>/`). An archive holds the binary, the man page, completions, `tiny.parquet` and the guides under
+`share/doc/zpq/`. `python3 tools/package_release.py --tag v0.5.0-rc2` builds a release candidate: the tag's suffix
+goes into `zpq --version`, the binary's `created_by`, the archive names and `release.json` (`zig build
+-Dprerelease=rc2` does the same for a local build). A final tag (`v0.5.0`) builds exactly as without `--tag`.
 
 For a private local Homebrew rehearsal, pass the release manifest as the generator's positional argument.
 Keep the tarballs beside that manifest and use their directory as the local URL prefix:

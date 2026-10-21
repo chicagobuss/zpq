@@ -25,6 +25,7 @@ pub fn noSqlMatches(table_name: []const u8) void {
 }
 
 pub fn queryError(err: anyerror, diag: *const Diag) void {
+    if (diag.detail == .decode and zpq.core.consumer.isDecodeError(err)) return decodeError(err, diag);
     printDetail(diag);
     switch (err) {
         error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
@@ -75,6 +76,18 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.NestedFilterNotSupported => diagnosticPrint(
             "zpq query: filter column `{s}` is repeated\n" ++
                 "  (in a LIST or MAP, or a legacy REPEATED field); filtering on list\n" ++
+                "  elements is not supported\n",
+            .{diag.column.get()},
+        ),
+        error.NestedAggregateNotSupported => diagnosticPrint(
+            "zpq query: aggregate argument column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); aggregating list\n" ++
+                "  elements is not supported\n",
+            .{diag.column.get()},
+        ),
+        error.NestedGroupKeyNotSupported => diagnosticPrint(
+            "zpq query: GROUP BY key column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); grouping by list\n" ++
                 "  elements is not supported\n",
             .{diag.column.get()},
         ),
@@ -302,6 +315,45 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
     }
 }
 
+/// A column chunk that failed to decode, by where (`Diag.detail.decode`) and why, the error's name last for a script.
+fn decodeError(err: anyerror, diag: *const Diag) void {
+    const at = diag.detail.decode;
+    var page_buf: [24]u8 = undefined;
+    const page = if (at.page) |p| std.fmt.bufPrint(&page_buf, ", page {d}", .{p}) catch "" else "";
+    diagnosticPrint("zpq query: cannot decode input file {s}\n  row group {d}, column `{s}`{s}:\n  {s} ({s})\n", .{
+        at.input, at.row_group, at.column.get(), page, decodeCause(err), @errorName(err),
+    });
+}
+
+fn decodeCause(err: anyerror) []const u8 {
+    const causes = [_]struct { []const u8, []const u8 }{
+        .{ "UnexpectedPage", "the page's encoded data is invalid" },
+        .{ "DictionaryMissing", "a dictionary-encoded page has no dictionary page" },
+        .{ "UnexpectedDictionaryPage", "a second dictionary page, or one after a data page" },
+        .{ "ShortDecode", "a page holds fewer values than its header declares" },
+        .{ "DefLevelsMismatch", "the definition levels disagree with the value count" },
+        .{ "BadPageHeader", "the page header cannot be parsed" },
+        .{ "BadPageCount", "the page header's value, null or row count is invalid" },
+        .{ "DecompressionFailed", "the page does not decompress with the chunk's codec" },
+        .{ "SizeMismatch", "the page decompresses to another size than its header says" },
+        .{ "NegativeSize", "the page header declares a negative size" },
+        .{ "MissingChunkBytes", "the column chunk lies outside the file" },
+        .{ "UnexpectedEndOfChunk", "the column chunk ends inside a page" },
+        .{ "LevelOutOfRange", "a level is past the column's maximum" },
+        .{ "IntOutOfRange", "a value is past the column's 8- or 16-bit integer type" },
+        .{ "PageLargerThanChunk", "the pages inflate past the chunk's size in the footer" },
+        .{ "UnsupportedEncoding", "the page uses an encoding zpq does not read" },
+        .{ "UnsupportedPageType", "the chunk holds a page type zpq does not read" },
+        .{ "PageValueCountExceedsChunk", "a page claims more values than the chunk holds" },
+        .{ "DictionaryLargerThanPage", "the dictionary claims more entries than its page holds" },
+        .{ "UnsupportedCodec", "the chunk's compression codec is one zpq cannot decompress" },
+        .{ "InvalidColumnOffsets", "the chunk's offsets lie outside the file" },
+        .{ "ColumnMetaMissing", "the chunk has no column metadata" },
+    };
+    for (causes) |c| if (std.mem.eql(u8, c[0], @errorName(err))) return c[1];
+    return "the chunk cannot be read";
+}
+
 /// The line a failed query's `Diag.detail` adds before the error's own message.
 fn printDetail(diag: *const Diag) void {
     const name = diag.column.get();
@@ -336,6 +388,8 @@ fn printDetail(diag: *const Diag) void {
         ),
         // The upload logged it to stderr when it happened.
         .s3_request => {},
+        // `decodeError` prints it whole, for a decode error; any other error's message stands alone.
+        .decode => {},
     }
 }
 

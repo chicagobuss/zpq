@@ -39,16 +39,19 @@ Every response is one JSON object. Durations are whole milliseconds; `pool` and 
 |-------|---------|
 | `ok` | `true`. |
 | `files_in`, `rows_in`, `bytes_in` | Inputs read, their rows, and the bytes fetched or mapped. |
+| `rows_scanned`, `rows_matched` | Rows in the row groups read (not pruned), and of those the rows the filter kept, which the aggregates fold. |
 | `row_groups_in`, `row_groups_pruned`, `row_groups_full_match`, `cols_stat_pruned` | Row groups seen, skipped by statistics, known to match the filter whole; columns answered from statistics. |
 | `agg` | The answer: an object of alias → value, or with `group_by` an array of such objects, one per group. |
 | `total_ms` | Time inside the handler. |
-| `phase` | `read_ms`, `decode_ms`, `eval_ms`, `encode_ms`. |
+| `wall_ms` | Wall-clock phases in ms: `open`, `parse`, `scan`, `footer`. |
+| `worker_ms` | Each scan step summed over the workers, in ms: `decode`, `filter`, `fold`, `encode` (0), `sink`. With N workers a step can reach N times `wall_ms.scan`. |
 | `membership` | Bloom filter and dictionary pruning, below. |
 | `pool` | Connection pool counters, below. |
 
-**Write** (`output_url` set, no aggregate): `ok`, `output` (the URL, escaped), `files_in`, `rows_in`, `rows_kept`,
-`bytes_in`, `bytes_out`, `row_groups_in`, `row_groups_kept`, `total_ms`; `phase` with `read_ms`, `parse_ms`,
-`decode_ms`, `eval_ms`, `encode_ms`, `sink_ms`, `footer_ms`, `mp_await_ms`, `mp_complete_ms`; `meta_cache` with the
+**Write** (`output_url` set, no aggregate): `ok`, `output` (the URL, escaped), `files_in`, `rows_in`, `rows_scanned`,
+`rows_matched` (the rows written), `bytes_in`, `bytes_out`, `row_groups_in`, `row_groups_kept`, `total_ms`; `wall_ms`
+with `open`, `parse`, `scan`, `footer`, `mp_await`, `mp_complete`; `worker_ms` with `decode`, `filter`, `fold` (0),
+`encode`, `sink`, summed over the workers; `meta_cache` with the
 container's cumulative footer-cache counters `hits`, `misses`, `revalidations`, `invalidations`, `inserts`,
 `evictions`; `membership`; and `pool`.
 
@@ -79,11 +82,12 @@ cache hits from earlier invocations appear only when Lambda reuses a sandbox, wh
 | `max_idle_ms` | The longest any idle connection had waited when a request looked at it. |
 | `acquire_wait_ms`, `acquire_lock_ms` | Time spent waiting for a connection permit, and holding the pool lock. |
 
-Response changes: the aggregate and write responses gained `profile` and `profile_trace` when asked for; the write
-response's `decode_ms`, `eval_ms` and `encode_ms`, always 0 for a re-encoding write before, now sum the encode
-threads' time. The aggregate response gained `row_groups_full_match` and `pool`; in the write response `output` is
-now JSON-escaped, and `pool` moved after `meta_cache` and gained `idle_evictions`, `stale_retries`, `backoff_retries`
-and `max_idle_ms`.
+Response changes: the aggregate and write responses gained `profile` and `profile_trace` when asked for; `phase` is
+replaced by `wall_ms` and `worker_ms` (the CLI summary's, defined in [output-format.md](output-format.md)), whose worker
+steps sum every worker's time; the write response's `rows_kept` is now `rows_matched`, beside the new `rows_scanned`,
+which the aggregate response also gained with `rows_matched`. The aggregate response gained `row_groups_full_match` and
+`pool`; in the write response `output` is now JSON-escaped, and `pool` moved after `meta_cache` and gained
+`idle_evictions`, `stale_retries`, `backoff_retries` and `max_idle_ms`.
 
 **`profile`** (aggregate and write responses, when the request set `profile` or `profile_url`): the profile summary
 described in [profiling.md](profiling.md), as one object: `total_ns`, `idle_ns`, `threads`, `events`, `dropped`,

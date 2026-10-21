@@ -585,8 +585,12 @@ pub const Timings = struct {
 
 pub const MultiAggResult = struct {
     files_in: usize,
+    /// Rows in every row group of the inputs.
     rows_in: i64,
-    rows_kept: i64,
+    /// Rows in the row groups read: not ruled out by statistics or membership.
+    rows_scanned: i64,
+    /// Rows of those the outer filter kept: every one without a filter. The aggregates fold these.
+    rows_matched: i64,
     bytes_in: u64,
     row_groups_in: usize,
     row_groups_pruned: usize,
@@ -978,7 +982,7 @@ fn sampledPassShare(
             .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 },
         };
         var passed = [_]expr_agg.Accumulator{.{ .count = 0 }};
-        consumer.scanRGForAgg(gpa, .{
+        _ = consumer.scanRGForAgg(gpa, .{
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
@@ -1409,7 +1413,10 @@ const Worker = struct {
     decode_options: consumer.DecodeOptions,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
-    rows_kept: i64 = 0,
+    rows_scanned: i64 = 0,
+    rows_matched: i64 = 0,
+    /// Where this worker's decode error was raised (`consumer.decodeFailure`), handed to the reporting thread.
+    failure: ?consumer.DecodeSite = null,
     rgs_in: usize = 0,
     rgs_pruned: usize = 0,
     rgs_full_match: usize = 0,
@@ -1470,8 +1477,10 @@ fn workerRun(w: *Worker) void {
     w.timings.prof = prof;
     expr_agg.distinct_pairs = w.pairs;
     defer expr_agg.distinct_pairs = null;
+    consumer.setDecodeFailure(null);
     workerRunErr(w, prof, &items) catch |e| {
         w.err = workerRefusal(w, e);
+        w.failure = consumer.decodeFailure();
         if (w.block_merge) |m| m.fail();
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
@@ -1603,7 +1612,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .filter => {},
         }
         if (item.agg_start == 0) {
-            w.rows_kept +|= rg.num_rows;
+            w.rows_scanned +|= rg.num_rows;
         }
         if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
@@ -1630,7 +1639,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
         expr_agg.winner_charge = if (table == null) w.winners else null;
         defer expr_agg.winner_charge = null;
-        try consumer.scanRGForAgg(w.gpa, .{
+        const matched = try consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
@@ -1649,6 +1658,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .charged = if (w.charged) |*c| c.allocator() else null,
             .ledger = w.ledger,
         });
+        if (item.agg_start == 0) w.rows_matched +|= @intCast(matched);
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
                 .pay => {
@@ -2706,7 +2716,8 @@ fn firstKeysCut(
 fn restoreCounts(workers: []Worker, saved: []const Worker) void {
     for (workers, saved) |*w, s| {
         w.rows_in = s.rows_in;
-        w.rows_kept = s.rows_kept;
+        w.rows_scanned = s.rows_scanned;
+        w.rows_matched = s.rows_matched;
         w.rgs_in = s.rgs_in;
         w.rgs_pruned = s.rgs_pruned;
         w.rgs_full_match = s.rgs_full_match;
@@ -3214,6 +3225,8 @@ fn prepareAggregate(
             },
         }
     };
+    consumer.setDecodeFailure(null);
+    errdefer consumer.resolveDecodeFailure(args.diag, metas, args.inputs);
 
     // Validate schemas match the first file's: same number of leaves
     // and same names *case-insensitively*. Real-world datasets drift on
@@ -3260,6 +3273,7 @@ fn prepareAggregate(
         for (items, 0..) |item, i| exprs[i] = item.expr;
         break :blk exprs;
     } else null;
+    try refuseRepeated(arena, meta0, agg_calls, group_by_keys, args.diag);
     var key_names = try KeyNames.init(arena, meta0, group_by_items orelse &.{});
     key_names.sql = sqlBound(args.select_cols);
     try nameUnaliasedAggs(arena, agg_calls, &key_names);
@@ -3827,6 +3841,10 @@ fn prepareAggregate(
     };
     // A cut's passes return their refusal themselves: what decode memory the workers drew is noted on the way out.
     passes catch |e| {
+        for (workers) |w| if (w.err != null) {
+            consumer.setDecodeFailure(w.failure);
+            break;
+        };
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             for (workers) |*w| if (decodeHeld(w) and rescannable) taken.insert(.decode_memory);
         };
@@ -3850,6 +3868,7 @@ fn prepareAggregate(
                     try oneWorkerCuts(arena, plan_inputs)) taken.insert(.one_table_may_fit);
             }
         };
+        consumer.setDecodeFailure(w.failure);
         return e;
     };
     // Past the scan a refusal is the merge's, which one worker's table goes without (a scan that answers drops this).
@@ -3928,7 +3947,8 @@ fn prepareAggregate(
     var answer_charge: usize = 0;
     errdefer group_budget.release(answer_charge);
     var rows_in: i64 = 0;
-    var rows_kept: i64 = 0;
+    var rows_scanned: i64 = 0;
+    var rows_matched: i64 = 0;
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
     var rgs_full_match: usize = 0;
@@ -3938,7 +3958,8 @@ fn prepareAggregate(
     if (group_by_keys) |keys| {
         for (workers) |w| {
             rows_in += w.rows_in;
-            rows_kept += w.rows_kept;
+            rows_scanned += w.rows_scanned;
+            rows_matched += w.rows_matched;
             rgs_in += w.rgs_in;
             rgs_pruned += w.rgs_pruned;
             rgs_full_match += w.rgs_full_match;
@@ -4232,7 +4253,8 @@ fn prepareAggregate(
         }
         for (workers) |w| {
             rows_in += w.rows_in;
-            rows_kept += w.rows_kept;
+            rows_scanned += w.rows_scanned;
+            rows_matched += w.rows_matched;
             rgs_in += w.rgs_in;
             rgs_pruned += w.rgs_pruned;
             rgs_full_match += w.rgs_full_match;
@@ -4267,7 +4289,8 @@ fn prepareAggregate(
     return .{
         .files_in = args.inputs.len,
         .rows_in = rows_in,
-        .rows_kept = rows_kept,
+        .rows_scanned = rows_scanned,
+        .rows_matched = rows_matched,
         .bytes_in = bytes_in,
         .row_groups_in = rgs_in,
         .row_groups_pruned = rgs_pruned,
@@ -4290,6 +4313,29 @@ fn prepareAggregate(
 }
 
 /// min/max of a bare column returns one of that column's values, so its output can carry the column's type.
+/// An aggregate argument or GROUP BY key that reads a repeated leaf (in a LIST or MAP) is refused while planning, as a
+/// filter on one is: it is an unsupported query (exit 2), not a decode failure found after reading the column.
+fn refuseRepeated(
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    calls: []const expr_agg.AggCall,
+    keys: ?[]const expr_ast.Expr,
+    diag: ?*Diag,
+) !void {
+    for ([_]bool{ false, true }) |in_keys| {
+        const reads = try arena.alloc(bool, meta.schema.items.len);
+        @memset(reads, false);
+        if (in_keys) {
+            for (keys orelse &.{}) |k| k.collectColumns(reads);
+        } else for (calls) |c| if (c.arg) |a| a.collectColumns(reads);
+        var leaves: schema.LeafIterator = .init(meta.schema.items);
+        while (leaves.next()) |leaf| if (leaf.max_rep > 0 and leaf.index < reads.len and reads[leaf.index]) {
+            Diag.setColumn(diag, try std.mem.join(arena, ".", leaf.path));
+            return if (in_keys) error.NestedGroupKeyNotSupported else error.NestedAggregateNotSupported;
+        };
+    }
+}
+
 fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
@@ -8066,7 +8112,8 @@ test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certifie
             defer got.deinit(testing.allocator);
             seen.insert(outcome);
             try testing.expectEqual(want.rows_in, got.rows_in);
-            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
             try want.output.applyResultOrder(testing.allocator, cut);
             try got.output.applyResultOrder(testing.allocator, cut);
             const w = want.output.group_rows.?;
@@ -8137,7 +8184,8 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
             defer got.deinit(testing.allocator);
             seen.insert(outcome);
             try testing.expectEqual(want.rows_in, got.rows_in);
-            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
             try want.output.applyResultOrder(testing.allocator, cut);
             try got.output.applyResultOrder(testing.allocator, cut);
             const w = want.output.group_rows.?;
@@ -8484,7 +8532,8 @@ test "runMultiAggregate: a LIMIT with no ORDER BY answers as the full scan throu
                 var got = try runMultiAggregate(testing.allocator, arena, args);
                 defer got.deinit(testing.allocator);
                 try testing.expectEqual(want.rows_in, got.rows_in);
-                try testing.expectEqual(want.rows_kept, got.rows_kept);
+                try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+                try testing.expectEqual(want.rows_matched, got.rows_matched);
                 try want.output.applyResultOrder(testing.allocator, cut);
                 try got.output.applyResultOrder(testing.allocator, cut);
                 const w = want.output.group_rows.?;
@@ -11536,6 +11585,41 @@ test "a DECIMAL result past its precision is an error, never a wrapped or rounde
     }, &.{.{ .alias = "a", .v = 666666666666666666666666666666666668, .p = 38, .s = 0 }});
 }
 
+test "an aggregate or GROUP BY key over a repeated leaf is refused while planning, before any page decodes" {
+    // `l` is LIST<INT64>; a filter on its elements is refused by the filter parser, these by `refuseRepeated`.
+    const path = "ci/fixtures/parquet/list_int64.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Case = struct { aggregate: []const u8, group_by: ?[]const u8 = null, err: anyerror };
+    for ([_]Case{
+        .{ .aggregate = "count(l.list.element) AS c", .err = error.NestedAggregateNotSupported },
+        .{ .aggregate = "sum(l.list.element + 1) AS s", .err = error.NestedAggregateNotSupported },
+        .{ .aggregate = "count(*) AS c", .group_by = "l.list.element", .err = error.NestedGroupKeyNotSupported },
+    }) |c| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var diag: Diag = .{};
+        try testing.expectError(c.err, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = c.aggregate,
+            .group_by = c.group_by,
+            .diag = &diag,
+        }));
+        try testing.expect(!diag.execution_started);
+        try testing.expectEqualStrings("l.list.element", diag.column.get());
+    }
+    // Its sibling top-level column still aggregates.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "sum(id) AS s",
+    });
+    defer freeResult(ok);
+    try testing.expectEqual(@as(i128, 15), ok.output.aggs[0].value.i);
+}
+
 test "DECIMAL aggregates over no values are NULL, and GROUP BY a DECIMAL key is exact" {
     const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
@@ -12031,7 +12115,8 @@ test "review round3 count budget and path matrix" {
                     try want.output.applyResultOrder(testing.allocator, args.result_order);
                     try got.output.applyResultOrder(testing.allocator, args.result_order);
                     try testing.expectEqual(want.rows_in, got.rows_in);
-                    try testing.expectEqual(want.rows_kept, got.rows_kept);
+                    try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+                    try testing.expectEqual(want.rows_matched, got.rows_matched);
                     const wr = want.output.group_rows.?;
                     const gr = got.output.group_rows.?;
                     try testing.expectEqual(wr.len, gr.len);

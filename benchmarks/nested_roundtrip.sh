@@ -67,7 +67,7 @@ EOF
     FAILED_LABELS+=("$label (zpq error: $err)")
     continue
   fi
-  echo "  zpq: $(echo "$resp" | jq -c '{rows_kept, bytes_out, total_ms}')"
+  echo "  zpq: $(echo "$resp" | jq -c '{rows_matched, bytes_out, total_ms}')"
 
   # Cross-validate
   if ! python3 benchmarks/validate_outputs.py "$label" "$out_url" 2>&1 | tail -3; then

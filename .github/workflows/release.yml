@@ -49,8 +49,11 @@ jobs:
 
       # The build downloads the target's pinned BoringSSL prebuilts and
       # checks them against vendor/boring_tls/prebuilt.sha256.
+      # The tag must name build.zig.zon's version; a suffix (v0.5.0-rc2) is built into --version and release.json.
       - name: Build and package CLI with revision and TLS provenance
-        run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist --tag "$TAG"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

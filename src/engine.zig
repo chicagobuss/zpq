@@ -404,8 +404,11 @@ pub const WriteResult = struct {
     /// byte copy, with no codec requested, of inputs stored in several).
     codec: ?schema.CompressionCodec,
     files_in: usize,
+    /// Rows in every row group of the inputs; of those, the rows in row groups read (not pruned), and the rows the
+    /// filter kept, which are the rows written.
     rows_in: i64,
-    rows_kept: i64,
+    rows_scanned: i64,
+    rows_matched: i64,
     bytes_in: u64,
     bytes_out: u64,
     row_groups_in: usize,
@@ -419,8 +422,10 @@ pub const WriteResult = struct {
 
 pub const AggResult = struct {
     files_in: usize,
+    /// As `scan.MultiAggResult`'s: every input row, the rows in row groups read, and the rows the filter kept.
     rows_in: i64,
-    rows_kept: i64,
+    rows_scanned: i64,
+    rows_matched: i64,
     bytes_in: u64,
     bytes_out: u64,
     row_groups_in: usize,
@@ -448,7 +453,8 @@ pub const Timings = struct {
     read_ns: u64 = 0,
     parse_ns: u64 = 0,
     core: consumer.Timings = .{},
-    /// Wall-clock of the parallel scan region (see scan.Timings.decode_wall_ns).
+    /// Wall-clock of the scan: an aggregate's parallel region (see scan.Timings.decode_wall_ns); a write's or a row
+    /// output's, from its first row group to its footer.
     decode_wall_ns: u64 = 0,
     footer_ns: u64 = 0,
     /// Multipart-upload-only counters; zero for local-fd output.
@@ -827,7 +833,8 @@ fn executeAggregateOver(
     return .{
         .files_in = r.files_in,
         .rows_in = r.rows_in,
-        .rows_kept = r.rows_kept,
+        .rows_scanned = r.rows_scanned,
+        .rows_matched = r.rows_matched,
         .bytes_in = r.bytes_in,
         .bytes_out = bytes_out,
         .row_groups_in = r.row_groups_in,
@@ -1006,6 +1013,8 @@ const EncodedRG = struct {
     deferred: bool = false,
     surviving: i64 = 0,
     err: ?anyerror = null,
+    /// Where `err` was raised when it is a decode error (`consumer.decodeFailure`).
+    failure: ?consumer.DecodeSite = null,
     /// The producer's decode/eval/encode time for this row group, summed by the writer.
     timings: consumer.Timings = .{},
 };
@@ -1182,6 +1191,7 @@ const WinCtx = struct {
     /// Producers' decode/eval/encode time, summed as their row groups drain.
     core: consumer.Timings = .{},
     first_err: ?anyerror = null,
+    first_failure: ?consumer.DecodeSite = null,
 
     inflight: std.atomic.Value(usize) = .init(0),
     peak_bytes: std.atomic.Value(usize) = .init(0),
@@ -1249,7 +1259,7 @@ fn winProducer(w: *WinCtx, i: usize) void {
             break :deferred EncodedRG{ .deferred = true };
         }
         w.jobs[i].leave();
-        w.slots[i].enc = .{ .err = e };
+        w.slots[i].enc = .{ .err = e, .failure = consumer.decodeFailure() };
         w.slots[i].done.store(true, .release);
         w.completions.post(w.io);
         return;
@@ -1429,7 +1439,10 @@ fn winWriter(w: *WinCtx) void {
         w.core.eval_ns += enc.timings.eval_ns;
         w.core.encode_ns += enc.timings.encode_ns;
         if (enc.err) |e| {
-            if (w.first_err == null) w.first_err = e;
+            if (w.first_err == null) {
+                w.first_err = e;
+                w.first_failure = enc.failure;
+            }
         } else if (enc.deferred) {
             defer w.jobs[next].leave();
             // Under a ledger the slices are written alone: the writer takes every producer's turn, so those running
@@ -1454,6 +1467,7 @@ fn winWriter(w: *WinCtx) void {
                 const before = w.new_row_groups.items.len;
                 const kept = encodeRGSliced(w, w.jobs[next], prof) catch |e| blk: {
                     w.first_err = if (w.slicing_now) |m| m.refusal(e) else e;
+                    w.first_failure = consumer.decodeFailure();
                     break :blk 0;
                 };
                 w.rows_kept += kept;
@@ -1521,7 +1535,11 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
         group.async(w.io, Run.producer, .{ w, i });
     }
     try group.await(w.io);
-    if (w.first_err) |e| return e;
+    if (w.first_err) |e| {
+        // The error is reported from this thread: where a producer or the writer raised it goes with it.
+        if (@hasField(Ctx, "first_failure")) consumer.setDecodeFailure(w.first_failure);
+        return e;
+    }
 }
 
 /// A byte copy that changes codec: producers recompress whole row groups in parallel, and the in-order writer places
@@ -2132,6 +2150,8 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     //    against meta[0].
     const t_parse_start = nowMonoNs();
     const metas = try materializeMetas(arena, opened, args.diag, prof);
+    consumer.setDecodeFailure(null);
+    errdefer consumer.resolveDecodeFailure(args.diag, metas, opened.inputs);
     const meta0 = &metas[0];
     // Same name is not enough: a byte-copy concatenation (and a shared footer) is only valid when the columns are
     // structurally identical, or the footer lies about the copied bytes.
@@ -2236,6 +2256,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     out_offset += PAR1.len;
 
     var rows_in: i64 = 0;
+    var rows_pruned: i64 = 0;
     var rows_kept: i64 = 0;
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
@@ -2305,6 +2326,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     defer for (win_slots) |*s| s.meta_arena.deinit();
 
     if (args.diag) |diag| diag.execution_started = true;
+    const t_scan = nowMonoNs();
     const kept_opt: ?[]const bool = if (kept_set != null) kept_arr else null;
     if (!need_encoder and args.codec != null and anyChunkNeedsRecompress(metas, kept_opt, args.codec.?)) {
         // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
@@ -2442,6 +2464,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                     const d = filter_prune.pruneRowGroup(src_rg, f, meta_p);
                     if (d == .skip) {
                         rgs_pruned += 1;
+                        rows_pruned += src_rg.num_rows;
                         skipRowGroup(in, ri);
                         continue;
                     }
@@ -2555,6 +2578,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
 
     // 6. Bloom filters after the row groups, then the footer.
     const t_footer = nowMonoNs();
+    t.decode_wall_ns = @intCast(t_footer - t_scan);
     const footer_span = profile.Span.begin(prof);
     {
         var so: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(out_offset) };
@@ -2638,7 +2662,8 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
         .codec = writtenCodec(new_row_groups.items, args.codec orelse .SNAPPY),
         .files_in = opened.inputs.len,
         .rows_in = rows_in,
-        .rows_kept = rows_kept,
+        .rows_scanned = rows_in - rows_pruned,
+        .rows_matched = rows_kept,
         .bytes_in = bytes_in,
         .bytes_out = out_offset,
         .row_groups_in = rgs_in,
@@ -6068,6 +6093,8 @@ const TopRows = struct {
             timings,
             options,
         );
+        timings.rows_scanned += @intCast(rg.num_rows);
+        timings.rows_matched += n;
         if (n == 0) return;
 
         self.heap.context = self;
@@ -6456,6 +6483,8 @@ const RankWorker = struct {
     cut_seen: u64 = 0,
     timings: consumer.Timings = .{},
     err: ?anyerror = null,
+    /// Where `err` was raised when it is a decode error (`consumer.decodeFailure`).
+    failure: ?consumer.DecodeSite = null,
     /// The item that failed, for a deterministic choice among failing workers.
     err_at: usize = std.math.maxInt(usize),
     /// Row groups whose rows this worker offered, for its profile span.
@@ -6497,6 +6526,7 @@ const RankWorker = struct {
             const item = s.cursor.next() orelse break;
             w.step(item) catch |e| {
                 w.err = if (e == error.OutOfMemory and w.decode.refused) error.ExceededMemoryBudget else e;
+                w.failure = consumer.decodeFailure();
                 w.err_at = item - s.cursor.items.ptr;
                 s.failed.store(true, .monotonic);
                 break;
@@ -6505,6 +6535,7 @@ const RankWorker = struct {
     }
 
     fn step(w: *RankWorker, item: *const RankedRG) !void {
+        consumer.setDecodeFailure(null);
         const s = w.shared;
         const meta = &s.metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
@@ -6537,6 +6568,8 @@ const RankWorker = struct {
         try p.init(&keyed, da, rg, meta, src, s.filter, s.fetch, s.key_specs, &w.timings, s.options);
         defer p.deinit();
         w.ranked += 1;
+        w.timings.rows_scanned += @intCast(rg.num_rows);
+        w.timings.rows_matched += p.surviving;
         if (p.surviving == 0) return;
         for (0..s.key_specs.len) |i| try p.projectColumn(&keyed, i, da, &w.timings);
         keyed.num_rows += p.surviving;
@@ -7000,9 +7033,14 @@ fn gatherInto(
     for (workers) |*w| {
         t.core.decode_ns += w.timings.decode_ns;
         t.core.eval_ns += w.timings.eval_ns;
+        t.core.rows_scanned += w.timings.rows_scanned;
+        t.core.rows_matched += w.timings.rows_matched;
         if (w.err != null and (failed == null or w.err_at < failed.?.err_at)) failed = w;
     }
-    if (failed) |w| return w.err.?;
+    if (failed) |w| {
+        consumer.setDecodeFailure(w.failure);
+        return w.err.?;
+    }
 
     var n_entries: usize = 0;
     for (workers) |w| n_entries += w.heap.count();
@@ -7116,6 +7154,8 @@ const SlicedPrint = struct {
     decode_options: consumer.DecodeOptions,
     /// Slice even a row group that looks to fit: one whose values expanded past the budget decoded whole.
     force: bool = false,
+    /// Where the rows each slice read and kept are counted: only slices read count, as printing stops at the limit.
+    counts: *consumer.Timings,
 };
 
 /// Print `rg` a slice of rows at a time when its decoded columns would take more than `o.budget`, or a limit is set:
@@ -7191,7 +7231,8 @@ fn printRowGroupSliced(
             inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
         };
         agg.num_rows = 0;
-        _ = try consumer.appendSliceRows(agg, &batch, lookup, &sel, output_specs, sa);
+        o.counts.rows_scanned += n;
+        o.counts.rows_matched += try consumer.appendSliceRows(agg, &batch, lookup, &sel, output_specs, sa);
         try flushAggregator(agg, o.names, o.writer, o.is_jsonl, o.limit, o.total_printed);
         for (agg.cols) |*c| c.* = switch (c.*) {
             inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
@@ -7324,7 +7365,12 @@ const ParquetPrint = struct {
 
 pub const PrintResult = struct {
     output_ns: u64 = 0,
+    /// Rows in every row group of the inputs, as an aggregate or a write counts them; of those, the rows read (row
+    /// groups not pruned, not passed over by a top-N, not left unread once the limit was met) and the rows the filter
+    /// kept of them.
     rows_in: usize = 0,
+    rows_scanned: usize = 0,
+    rows_matched: usize = 0,
     /// Row groups read or passed over, and of those the ones statistics (or membership, or a NaN probe) ruled out.
     row_groups_in: usize = 0,
     row_groups_pruned: usize = 0,
@@ -7398,6 +7444,8 @@ fn runPrintSinkOver(
 
     const parse_span = profile.Span.begin(prof);
     const metas = try materializeMetas(arena, opened, args.diag, prof);
+    consumer.setDecodeFailure(null);
+    errdefer consumer.resolveDecodeFailure(args.diag, metas, opened.inputs);
     if (metas.len == 0) return .{};
     const meta0 = &metas[0];
 
@@ -7510,8 +7558,8 @@ fn runPrintSinkOver(
     }
 
     if (args.diag) |diag| diag.execution_started = true;
+    const t_scan = nowMonoNs();
     var total_printed: usize = 0;
-    var rows_in: usize = 0;
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
 
@@ -7530,7 +7578,6 @@ fn runPrintSinkOver(
         for (items) |item| {
             const meta_i = &metas[item.file];
             const rg = &meta_i.row_groups.items[item.rg];
-            rows_in += @intCast(rg.num_rows);
             // Every ranked row group is visited, by the gather workers or the loop below, and pruned by the same
             // footer-only decision, so they are counted here once.
             rgs_in += 1;
@@ -7582,7 +7629,6 @@ fn runPrintSinkOver(
                 if (total_printed >= lim) break;
             }
 
-            rows_in += @intCast(src_rg.num_rows);
             rgs_in += 1;
 
             const rg_span = profile.Span.begin(prof);
@@ -7611,6 +7657,7 @@ fn runPrintSinkOver(
                 .total_printed = &total_printed,
                 .budget = args.max_memory / 2,
                 .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+                .counts = &t.core,
             };
             const printed = try printRowGroupSliced(
                 ctx.gpa,
@@ -7625,7 +7672,7 @@ fn runPrintSinkOver(
             );
             if (printed) continue;
 
-            _ = consumer.appendProjectedRGWithOptions(
+            const matched = consumer.appendProjectedRGWithOptions(
                 &agg,
                 ctx.gpa,
                 src_rg,
@@ -7656,6 +7703,8 @@ fn runPrintSinkOver(
                 if (!ok) return err;
                 continue;
             };
+            t.core.rows_scanned += @intCast(src_rg.num_rows);
+            t.core.rows_matched += matched;
 
             const print_span = profile.Span.begin(prof);
             try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
@@ -7664,6 +7713,7 @@ fn runPrintSinkOver(
         }
     }
 
+    t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
     const finish_start = nowMonoNs();
     try opened.intact();
     if (format == .json) try stdout_writer.writeAll("]\n");
@@ -7671,7 +7721,11 @@ fn runPrintSinkOver(
     try stdout_writer.flush();
     stdout_writer.output_ns += @intCast(nowMonoNs() - finish_start);
     _ = t_start;
-    return .{ .rows_in = rows_in, .row_groups_in = rgs_in, .row_groups_pruned = rgs_pruned, .rows = total_printed, .bytes_out = if (format == .parquet) parquet.out_offset else stdout_writer.bytes_written, .output_ns = stdout_writer.output_ns, .membership = opened.membership, .timings = t };
+    var all_rows: usize = 0;
+    for (metas) |m| for (m.row_groups.items) |rg| {
+        all_rows += @intCast(rg.num_rows);
+    };
+    return .{ .rows_in = all_rows, .rows_scanned = t.core.rows_scanned, .rows_matched = t.core.rows_matched, .row_groups_in = rgs_in, .row_groups_pruned = rgs_pruned, .rows = total_printed, .bytes_out = if (format == .parquet) parquet.out_offset else stdout_writer.bytes_written, .output_ns = stdout_writer.output_ns, .membership = opened.membership, .timings = t };
 }
 
 // ============================================================
@@ -11237,6 +11291,146 @@ test "row output and writes report the row groups pruning skipped, as aggregates
         defer local_fs.close(fd);
         const p = try runPrintTo(ctx, .{ .inputs = &.{fixture}, .filter = filter, .columns = &.{"b"}, .scan_all = true }, .jsonl, null, fd, 0);
         try std.testing.expectEqual(@as(usize, 0), p.row_groups_pruned);
+    }
+}
+
+test "summary row counters: every input row, the rows read, and the rows the filter kept, on every query kind" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var text_buf: [96]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    // 8 row groups of 200 rows, `b` 2i and 2i+1 100 times each in row group i: the filter rules out row groups 0
+    // and 7 on statistics, reads 1..6 (1200 rows) and keeps b = 3..12 (1000 rows). Without it every row counts.
+    const Want = struct { filter: ?[]const u8, scanned: i64, matched: i64 };
+    for ([_]Want{
+        .{ .filter = "b >= 3 AND b <= 12", .scanned = 1200, .matched = 1000 },
+        .{ .filter = null, .scanned = 1600, .matched = 1600 },
+    }) |want| {
+        for ([_]usize{ 1, 3 }) |j| for ([_]?[]const u8{ null, "b" }) |group_by| {
+            var agg = try runQuery(ctx, .{
+                .inputs = &.{fixture},
+                .filter = want.filter,
+                .aggregate = "count(*) AS n",
+                .group_by = group_by,
+                .parallelism = j,
+            });
+            defer agg.aggregate.deinit(gpa);
+            const a = agg.aggregate;
+            try std.testing.expectEqual(@as(i64, 1600), a.rows_in);
+            try std.testing.expectEqual(want.scanned, a.rows_scanned);
+            try std.testing.expectEqual(want.matched, a.rows_matched);
+            // The aggregates fold exactly the matched rows.
+            var n: i128 = 0;
+            if (a.output.group_rows) |rows| {
+                const at = for (a.output.group_cols.?, 0..) |name, ci| {
+                    if (std.mem.eql(u8, name, "n")) break ci;
+                } else unreachable;
+                for (rows) |row| n += row[at].i;
+            } else n = a.output.aggs[0].value.i;
+            try std.testing.expectEqual(@as(i128, want.matched), n);
+        };
+
+        var w = try runQuery(ctx, .{ .inputs = &.{fixture}, .output = out, .filter = want.filter });
+        defer w.deinit(gpa);
+        try std.testing.expectEqual(@as(i64, 1600), w.write.rows_in);
+        try std.testing.expectEqual(want.scanned, w.write.rows_scanned);
+        try std.testing.expectEqual(want.matched, w.write.rows_matched);
+
+        // Rows in file order and ordered (a top-N, every row kept without a LIMIT).
+        const orders = [_]expr_ast.ResultOrder{ .{}, .{ .rows = &.{.{ .expr = "b", .descending = true }} } };
+        for (orders) |order| for ([_]?usize{ null, 3 }) |limit| {
+            const fd = try local_fs.createFile(text);
+            defer local_fs.close(fd);
+            const p = try runPrintTo(ctx, .{
+                .inputs = &.{fixture},
+                .filter = want.filter,
+                .columns = &.{"b"},
+                .result_order = order,
+            }, .jsonl, limit, fd, 0);
+            try std.testing.expectEqual(@as(usize, 1600), p.rows_in);
+            if (limit == null) {
+                try std.testing.expectEqual(@as(usize, @intCast(want.scanned)), p.rows_scanned);
+                try std.testing.expectEqual(@as(usize, @intCast(want.matched)), p.rows_matched);
+                try std.testing.expectEqual(p.rows_matched, p.rows);
+            } else {
+                // In file order a LIMIT stops reading once it is met; a top-N's workers may each read a row group
+                // before a cut passes over the rest. Never fewer kept than printed.
+                try std.testing.expectEqual(@as(usize, 3), p.rows);
+                try std.testing.expect(p.rows <= p.rows_matched and p.rows_matched <= p.rows_scanned);
+                if (order.rows.len == 0)
+                    try std.testing.expect(p.rows_scanned < @as(usize, @intCast(want.scanned)))
+                else
+                    try std.testing.expect(p.rows_scanned <= @as(usize, @intCast(want.scanned)));
+            }
+        };
+    }
+}
+
+test "a page that fails to decode is named by file, row group, column and page, on every query kind" {
+    // The torture case dict_index_oob_rle_500: an RLE_DICTIONARY index of 500 into a 12-entry dictionary, in data page
+    // 1 (page 0 the dictionary) of `z`; its sibling is valid, so the failure is in the second input.
+    const bad = "ci/fixtures/parquet/dict_index_oob.parquet";
+    const good = "ci/fixtures/parquet/dict_index_ok.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, bad, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var text_buf: [96]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    const inputs = [_][]const u8{ good, bad };
+    const Check = struct {
+        fn site(diag: *const Diag) !void {
+            try std.testing.expect(diag.detail == .decode);
+            const at = diag.detail.decode;
+            try std.testing.expectEqualStrings(bad, at.input);
+            try std.testing.expectEqual(@as(usize, 0), at.row_group);
+            try std.testing.expectEqualStrings("z", at.column.get());
+            try std.testing.expectEqual(@as(?u32, 1), at.page);
+        }
+    };
+    for ([_]usize{ 1, 3 }) |j| for ([_]?[]const u8{ null, "z" }) |group_by| {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.UnexpectedPage, runQuery(ctx, .{
+            .inputs = &inputs,
+            // sum reads the values; count(z) alone would read only the levels, which are sound.
+            .aggregate = "sum(z) AS s",
+            .group_by = group_by,
+            .parallelism = j,
+            .diag = &diag,
+        }));
+        try Check.site(&diag);
+    };
+    {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.UnexpectedPage, runQuery(ctx, .{
+            .inputs = &inputs,
+            .output = out,
+            .select = "z + 1 AS y",
+            .diag = &diag,
+        }));
+        try Check.site(&diag);
+    }
+    const orders = [_]expr_ast.ResultOrder{ .{}, .{ .rows = &.{.{ .expr = "z", .descending = true }} } };
+    for (orders) |order| {
+        const fd = try local_fs.createFile(text);
+        defer local_fs.close(fd);
+        var diag: Diag = .{};
+        try std.testing.expectError(error.UnexpectedPage, runPrintTo(ctx, .{
+            .inputs = &inputs,
+            .columns = &.{"z"},
+            .result_order = order,
+            .diag = &diag,
+        }, .jsonl, null, fd, 0));
+        try Check.site(&diag);
     }
 }
 

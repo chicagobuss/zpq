@@ -42,6 +42,9 @@ const streaming = @import("writer/streaming.zig");
 const fastpath = @import("writer/fastpath.zig");
 const thrift = @import("thrift.zig");
 const column_mod = @import("parquet/column.zig");
+const page_mod = @import("parquet/page.zig");
+const Diag = @import("diag.zig").Diag;
+const Text = @import("diag.zig").Text;
 const decimal_mod = @import("parquet/decimal.zig");
 const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
@@ -94,10 +97,87 @@ pub const Timings = struct {
     eval_ns: u64 = 0,
     encode_ns: u64 = 0,
     sink_ns: u64 = 0,
+    /// A row output's rows read (in row groups not pruned or passed over) and kept by its filter, for the summary.
+    /// Counted by the drivers, not by `ProjectedRG`, which a top-N runs twice over a row group it keeps rows of.
+    rows_scanned: u64 = 0,
+    rows_matched: u64 = 0,
     /// The accumulating thread's profile buffer; spans reuse the timestamps these counters are taken from. A Timings
     /// accumulates on one thread at a time, which is what makes handing it the buffer safe.
     prof: ?*profile.Thread = null,
 };
+
+/// The column chunk this thread last began to decode. A marker, not a scope: set as each chunk (or slice) starts, and
+/// read only once a decode error has ended the query, so it names where that error was raised. A worker hands its own
+/// to the thread that reports the error (`decodeFailure`, `setDecodeFailure`); `resolveDecodeFailure` turns it into
+/// the file, row group, column path and page of the message.
+pub const DecodeSite = struct {
+    rg: *const schema.RowGroup,
+    column: usize,
+    page: ?u32 = null,
+};
+threadlocal var decode_site: ?DecodeSite = null;
+
+/// Mark `column` of `rg` as this thread's chunk. Its page is unknown until a page begins, so a slice reader that
+/// re-marks its column per slice, interleaved with other columns' readers, never reports another column's page.
+pub fn enterChunk(rg: *const schema.RowGroup, column: usize) void {
+    decode_site = .{ .rg = rg, .column = column };
+    page_mod.last_page = null;
+}
+
+/// This thread's decode site, with the page it last began, for a worker to hand over with its error.
+pub fn decodeFailure() ?DecodeSite {
+    var site = decode_site orelse return null;
+    site.page = page_mod.last_page;
+    return site;
+}
+
+/// Adopt a worker's failure site as this thread's; null clears it (a query's start).
+pub fn setDecodeFailure(site: ?DecodeSite) void {
+    decode_site = site;
+    page_mod.last_page = if (site) |s| s.page else null;
+}
+
+/// After a failure ended a query over `metas`, whose `inputs` each have a `name`: this thread's decode site as the
+/// file, row group, leaf path and page of `diag`'s `decode` detail. Nothing over another detail, or for a site outside
+/// these inputs (one left from an earlier query on the thread: compared by address only, never followed).
+pub fn resolveDecodeFailure(diag: ?*Diag, metas: []const schema.FileMetaData, inputs: anytype) void {
+    const d = diag orelse return;
+    if (d.detail != .none) return;
+    const site = decodeFailure() orelse return;
+    // By the row group's address in a file's row-group list, which a decoder's copy of the footer shares.
+    const at = @intFromPtr(site.rg);
+    var file: usize = 0;
+    const rg = while (file < metas.len) : (file += 1) {
+        const rgs = metas[file].row_groups.items;
+        const lo = @intFromPtr(rgs.ptr);
+        if (at >= lo and at < lo + rgs.len * @sizeOf(schema.RowGroup)) break (at - lo) / @sizeOf(schema.RowGroup);
+    } else return;
+    var path: Text = .{};
+    var leaves: schema.LeafIterator = .init(metas[file].schema.items);
+    while (leaves.next()) |leaf| if (leaf.index == site.column) {
+        for (leaf.path, 0..) |seg, i| {
+            if (i > 0) path.append(".");
+            path.append(seg);
+        }
+        break;
+    };
+    d.detail = .{ .decode = .{ .input = inputs[file].name, .row_group = rg, .column = path, .page = site.page } };
+}
+
+/// Errors raised by reading a column chunk's pages, whose message names where: the corrupt or unsupported encodings
+/// a page can hold, not the query's own failures (overflow, memory) that a decode site would mislabel.
+pub fn isDecodeError(err: anyerror) bool {
+    const names = [_][]const u8{
+        "UnexpectedPage",      "DictionaryMissing",          "UnexpectedDictionaryPage", "ShortDecode",
+        "DefLevelsMismatch",   "BadPageHeader",              "BadPageCount",             "DecompressionFailed",
+        "SizeMismatch",        "NegativeSize",               "MissingChunkBytes",        "UnexpectedEndOfChunk",
+        "LevelOutOfRange",     "IntOutOfRange",              "PageLargerThanChunk",      "UnsupportedEncoding",
+        "UnsupportedPageType", "PageValueCountExceedsChunk", "DictionaryLargerThanPage", "UnsupportedCodec",
+        "InvalidColumnOffsets", "ColumnMetaMissing",
+    };
+    for (names) |n| if (std.mem.eql(u8, n, @errorName(err))) return true;
+    return false;
+}
 
 /// Per-RG result. `surviving_rows == 0` means the filter dropped
 /// every row — in that case `rg` is null and the caller MUST NOT
@@ -589,6 +669,7 @@ fn decodeWriteColumn(
     decode_options_in: DecodeOptions,
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
+    enterChunk(rg, ci);
     const num_rows: usize = @intCast(rg.num_rows);
     const chunk_span = profile.Span.begin(prof);
     const col = &rg.columns.items[ci];
@@ -806,6 +887,8 @@ pub const SliceReader = struct {
     pages_passed: usize = 0,
     /// Only the levels are read (see `levelsOnly`): a count(col)'s column, read as its whole-chunk path reads it.
     levels_only: bool = false,
+    /// The chunk it reads, re-marked as each slice starts (`enterChunk`).
+    site: DecodeSite,
 
     const Raw = union(enum) {
         i32: column_mod.ColumnChunkReader(i32),
@@ -828,6 +911,7 @@ pub const SliceReader = struct {
         decode_options_in: DecodeOptions,
     ) !?SliceReader {
         if (!supports(rg, meta, ci)) return null;
+        enterChunk(rg, ci);
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
         const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
@@ -886,6 +970,7 @@ pub const SliceReader = struct {
             .float16 = if (se) |e| schema.isFloat16(e) else false,
             .int96 = cm.type == .INT96,
             .left = @intCast(cm.num_values),
+            .site = .{ .rg = rg, .column = ci },
         };
     }
 
@@ -917,6 +1002,7 @@ pub const SliceReader = struct {
     }
 
     pub fn next(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !filter_eval.Batch.Column {
+        enterChunk(self.site.rg, self.site.column);
         const n = @min(n_want, self.left);
         self.left -= n;
         if (self.levels_only) {
@@ -1216,6 +1302,7 @@ fn decodeDecimalI128(
     kept_ci: usize,
     decode_options_in: DecodeOptions,
 ) !filter_eval.ColumnT(i128) {
+    enterChunk(rg, kept_ci);
     const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
     const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
@@ -1442,6 +1529,7 @@ fn decodeWriteColumnMaybeCoded(
     decode_options_in: DecodeOptions,
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
+    enterChunk(rg, ci);
     const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
     const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
@@ -2857,6 +2945,7 @@ fn foldGroupedWindows(
 ///
 /// `gpa` owns what outlives the row group: string min/max winners and
 /// group-table entries.
+/// Returns the rows the outer filter kept (every row without one), for the summary's `rows_matched`.
 pub fn scanRGForAgg(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -2864,7 +2953,7 @@ pub fn scanRGForAgg(
     decode_options: DecodeOptions,
     target: AggTarget,
     ws: AggWorkspace,
-) !void {
+) !u64 {
     const calls = target.planCalls();
     const num_rows: usize = @intCast(in.rg.num_rows);
 
@@ -2883,7 +2972,8 @@ pub fn scanRGForAgg(
     // Fast path: every agg answered from stats, no decode needed at
     // all. This is the headline win — `max(cost)`, `count(*)`, etc.
     // complete in microseconds because we never read any data pages.
-    if (!any_decode_required) return;
+    // An outer filter disables every stats answer, so here none is pending; with one it decodes to count its rows.
+    if (!any_decode_required and in.filter == null) return num_rows;
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
     // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
@@ -2913,9 +3003,8 @@ pub fn scanRGForAgg(
         const fits_share = full <= b.share();
         const whole = fits_share and admitWhole(ws, full);
         if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
-        if (!whole and try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) {
-            return;
-        }
+        if (!whole) if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) |kept|
+            return kept;
         if (!whole) {
             const sp = try StagePlan.init(plan_arena.allocator(), in, target, handled_via_stats);
             if (sp.estimate < full) {
@@ -2973,7 +3062,8 @@ pub fn scanRGForAgg(
                 ws.rg_arena.nextRowGroup();
                 if (ws.region) |r| r.trim();
             }
-            if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) return;
+            if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) |kept|
+                return kept;
             return err;
         };
         try batch_cols.append(ra, col);
@@ -2992,7 +3082,7 @@ pub fn scanRGForAgg(
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
-    const selected: usize = if (prof != null) sel.count() else 0;
+    const selected: usize = if (in.filter != null) sel.count() else num_rows;
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, selected }));
 
     switch (target) {
@@ -3013,7 +3103,7 @@ pub fn scanRGForAgg(
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
-                return;
+                return selected;
             }
             const dense = if (g.dense) |d| !staged and decode_options.encoded and
                 try d.fold(ra, gpa, g.keys[0].col_ref, in.file_index, in.rg_index, g.pos_base, &batch, lookup, &sel)
@@ -3025,7 +3115,7 @@ pub fn scanRGForAgg(
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
-                return;
+                return selected;
             }
             // The row path reads values: gather any column decoded as codes only, but not one only the outer filter
             // read, which it has evaluated already.
@@ -3093,11 +3183,12 @@ pub fn scanRGForAgg(
     const t_agg_end = nowMonoNs();
     ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
     profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+    return selected;
 }
 
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time (`SliceReader`), each slice on memory of its own:
-/// for a row group too big for a worker's share of `budget`. False, having done nothing, when some column has no
-/// sliced form.
+/// for a row group too big for a worker's share of `budget`. The rows the outer filter kept; null, having done
+/// nothing, when some column has no sliced form.
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -3107,9 +3198,9 @@ fn scanRGSliced(
     budget: *DecodeBudget,
     handled: []const bool,
     full: usize,
-) !bool {
+) !?u64 {
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
-    if (num_rows == 0) return false;
+    if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
     var pages = std.heap.ArenaAllocator.init(side);
     defer pages.deinit();
@@ -3125,7 +3216,7 @@ fn scanRGSliced(
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
         var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, decode_options) orelse
-            return false;
+            return null;
         if (levels_only[ci]) r.levelsOnly();
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
@@ -3154,6 +3245,7 @@ fn scanRGSliced(
     var slice = std.heap.ArenaAllocator.init(side);
     defer slice.deinit();
     var took: ?usize = null;
+    var matched: u64 = 0;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
         defer done += n;
@@ -3169,6 +3261,7 @@ fn scanRGSliced(
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
         var sel = try filter_selection.SelectionVector.init(sa, n);
         if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        matched += if (in.filter != null) sel.count() else n;
         switch (target) {
             .scalar => |s| for (s.calls, s.accumulators, handled) |call, *acc, h| {
                 if (h) continue;
@@ -3211,7 +3304,7 @@ fn scanRGSliced(
     const t1 = nowMonoNs();
     ws.timings.decode_ns += @intCast(t1 - t0);
     profile.record(prof, .decode, t0, t1, profile.args(.{ in.file_index, in.rg_index, readers.items.len }));
-    return true;
+    return matched;
 }
 
 /// A staged row group's decode: the columns the outer filter and GROUP BY keys read (`base`), decoded first; then
@@ -3286,6 +3379,7 @@ const ChunkDecoder = struct {
         sel: *const filter_selection.SelectionVector,
     ) !filter_eval.Batch.Column {
         const in = self.in;
+        enterChunk(in.rg, ci);
         const prof = self.ws.timings.prof;
         const cm = in.rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
         const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);

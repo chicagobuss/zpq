@@ -114,10 +114,16 @@ pub const DecodeScratch = struct {
     }
 };
 
+/// The ordinal in its column chunk (0 the first, a dictionary page counted) of the page this thread last began to
+/// read: where a decode error was raised, for its message (`consumer.decodeFailure`).
+pub threadlocal var last_page: ?u32 = null;
+
 pub const PageReader = struct {
     /// The full column chunk bytes (compressed pages back-to-back).
     chunk: []const u8,
     pos: usize,
+    /// Pages begun so far, for `last_page`.
+    ordinal: u32 = 0,
     codec: schema.CompressionCodec,
     arena: std.mem.Allocator,
     /// When set, every page (dictionary included) is materialised into `scratch.page` and is only valid until the
@@ -171,6 +177,8 @@ pub const PageReader = struct {
     /// source was compressed.
     pub fn next(self: *PageReader) Error!?Page {
         if (self.pos >= self.chunk.len) return null;
+        last_page = self.ordinal;
+        self.ordinal +|= 1;
 
         // Parse the thrift-encoded header. Reader.pos tells us how
         // many bytes we consumed.

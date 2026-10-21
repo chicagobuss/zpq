@@ -49,6 +49,7 @@ class Zpq < Formula
     zsh_completion.install "share/zsh/site-functions/_zpq"
     fish_completion.install "share/fish/vendor_completions.d/zpq.fish"
     man1.install "share/man/man1/zpq.1"
+    doc.install Dir["share/doc/zpq/*"]
     pkgshare.install "share/zpq/tiny.parquet"
     pkgshare.install "MANIFEST.json"
   end

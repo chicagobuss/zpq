@@ -49,6 +49,13 @@ pub const Text = struct {
         return self.buf[0..self.len];
     }
 
+    /// `s` after what is held, truncated at the buffer's end.
+    pub fn append(self: *Text, s: []const u8) void {
+        const n = @min(s.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..n], s[0..n]);
+        self.len += n;
+    }
+
     pub fn of(s: []const u8) Text {
         var t: Text = .{};
         t.set(s);
@@ -77,6 +84,11 @@ pub const Detail = union(enum) {
     /// A filter names `Diag.column` alone as a predicate, which only a BOOLEAN column is; `type_name` (static) is its
     /// physical type.
     bare_non_boolean: struct { type_name: []const u8 },
+    /// Where this thread last decoded when the query failed: input `input`, row group `row_group` (0 the first), leaf
+    /// `column`, page `page` (0 the first, a dictionary page counted) when known. Set on any failure past the first
+    /// decode, so a frontend reads it only for a decode error (`consumer.isDecodeError`); it leaves `Diag.column` and
+    /// `Diag.input` to the error they describe.
+    decode: struct { input: []const u8, row_group: usize, column: Text, page: ?u32 },
     /// The S3 request behind the error failed: which one, at what point, and how.
     s3_request: S3Failure,
 };

@@ -62,8 +62,9 @@ def compare_tables(want, got, exact_bits=True):
     """First difference between two pyarrow tables (by column name), or None."""
     if want.num_rows != got.num_rows:
         return f"rows {got.num_rows} != {want.num_rows}"
+    got_names = set(got.column_names)
     for name in want.column_names:
-        if name not in got.column_names:
+        if name not in got_names:
             return f"column {name} missing"
         w, g = want.column(name), got.column(name)
         fw = float_width(w.type)

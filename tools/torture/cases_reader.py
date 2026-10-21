@@ -674,13 +674,18 @@ def list_page(reps_body, defs_body, values, num_values):
 
 
 def list_runs(count=None, count_kind="err|eq"):
-    """Repeated leaves are decoded by the aggregate path before it refuses them, and copied by a plain -o."""
+    """Paths over a malformed repeated leaf: aggregate, row output, copy, inspect. None may crash."""
     return [run("count", ["query", "{F}", "--aggregate", "count(*) AS n"], E(count_kind, [{"n": count}])),
+            # Aggregates over a repeated leaf are refused at plan time (exit 2, T12); before that fix they decoded the
+            # column and failed. Either is fine; a crash is not.
             run("agg-leaf", ["query", "{F}", "--aggregate", "count(l.list.element) AS c, sum(l.list.element) AS s"],
-                E("err")),
+                E("err|refuse")),
             run("agg-leaf-scanall", ["query", "{F}", "--scan-all", "--aggregate", "max(l.list.element) AS m"],
-                E("err")),
+                E("err|refuse")),
             run("rows", ["query", "{F}"], E("refuse")),
+            # Row output over the list column: today refused at plan time too (exit 2); once zpq prints repeated
+            # columns it must decode these malformed levels and fail with a clear error (exit 1), never crash.
+            run("rows-list", ["query", "{F}", "--format", "ndjson", "--columns", "l"], E("err|refuse")),
             run("write", ["query", "{F}", "-o", "{O}"], E("safe")),
             run("inspect", ["inspect", "{F}", "--detail", "--format", "json"], E("safe"))]
 

@@ -646,27 +646,34 @@ def _():
 
 
 def bytes_order_check(cols):
+    """Written byte-array bounds use unsigned byte order. A bound equal to the true min/max is exact; otherwise it must
+    be a truncation the spec allows, flagged inexact (is_min/max_value_exact = false): min a prefix of the true min,
+    max >= the true max (truncated and incremented)."""
     def check(o, md):
         t = pq.read_table(o)
+        _, fmd, _ = T.read_file(open(o, "rb").read())
         start = 0
-        for rg in range(md.num_row_groups):
-            n = md.row_group(rg).num_rows
-            for ci in range(md.num_columns):
-                c = md.row_group(rg).column(ci)
-                if c.path_in_schema not in cols:
+        for rgi, rg in enumerate(fmd.get(T.FMD_ROW_GROUPS).items):
+            n = rg.get(T.RG_NUM_ROWS)
+            for c in rg.get(T.RG_COLUMNS).items:
+                m = c.get(T.CC_META)
+                name = ".".join(p.decode() for p in m.get(T.CMD_PATH).items)
+                if name not in cols:
                     continue
-                vals = [v for v in t.column(c.path_in_schema).to_pylist()[start:start + n] if v is not None]
+                vals = [v for v in t.column(name).to_pylist()[start:start + n] if v is not None]
                 vals = [v.encode() if isinstance(v, str) else v for v in vals]
-                st = c.statistics
                 if not vals:
                     continue
-                if not st or not st.has_min_max:
-                    return f"{c.path_in_schema}: no bounds"
-                mn = st.min.encode() if isinstance(st.min, str) else st.min
-                mx = st.max.encode() if isinstance(st.max, str) else st.max
-                if mn != min(vals) or mx != max(vals):
-                    return (f"{c.path_in_schema} rg{rg}: bounds {mn[:12]!r}/{mx[:12]!r} != unsigned "
-                            f"{min(vals)[:12]!r}/{max(vals)[:12]!r}")
+                st = m.get(T.CMD_STATS)
+                mn = st.get(T.ST_MIN_VALUE) if st else None
+                mx = st.get(T.ST_MAX_VALUE) if st else None
+                if mn is None or mx is None:
+                    return f"{name} rg{rgi}: no bounds"
+                lo, hi = min(vals), max(vals)
+                if mn != lo and not (lo.startswith(mn) and st.get(8) is False):
+                    return f"{name} rg{rgi}: min {mn[:12]!r}… is neither {lo[:12]!r}… nor an inexact prefix of it"
+                if mx != hi and not (mx > hi and st.get(7) is False):
+                    return f"{name} rg{rgi}: max {mx[-12:]!r} is neither …{hi[-12:]!r} nor an inexact bound above it"
             start += n
         return None
     return check
@@ -701,8 +708,9 @@ def _():
 
 @case("w_stats_long_shared_prefix", B33)
 def _():
-    # Every value shares a 10 KiB prefix, then 'a' or 'b' (and one with 0xFF bytes at the cut point). zpq writes full
-    # bounds (no truncation): they must be exact, and pushdown on the zpq output must find both kinds of row.
+    # Every value shares a 10 KiB prefix, then 'a' or 'b'; the binary column has 0xFF bytes at a 64-byte cut point, so a
+    # truncated max cannot be incremented there. Bounds may be exact or truncated (T5 fix: 64 bytes, max incremented,
+    # flagged inexact); either way pushdown on the zpq output must find both kinds of row.
     pre = "p" * 10240
     vals = [pre + ("a" if i % 2 else "b") for i in range(200)]
     bins = [b"q" * 63 + b"\xff" * 2 + (b"\x01" if i % 2 else b"\x02") for i in range(200)]

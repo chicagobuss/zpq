@@ -1258,7 +1258,7 @@ fn synthPageIndexToSink(
     const stats = meta.statistics orelse return ptrs;
     // Data-page byte size = total chunk size minus the dictionary page
     // (the relative data_page_offset is the dict-page span, 0 if none).
-    const data_size: i32 = @intCast(meta.total_compressed_size - meta.data_page_offset);
+    const data_size = std.math.cast(i32, meta.total_compressed_size - meta.data_page_offset) orelse return ptrs;
     const null_count = stats.null_count orelse 0;
     const all_null = meta.num_values > 0 and null_count == meta.num_values;
 
@@ -1838,8 +1838,9 @@ const ChunkPlacer = struct {
         self.total.* += enc.meta.total_uncompressed_size;
 
         // One data page per freshly encoded chunk → one OffsetIndex + ColumnIndex entry, from the stats the
-        // encoder already computed, so a filtered re-encode keeps page-level pruning too.
-        const idx = if (self.emit_page_index)
+        // encoder already computed, so a filtered re-encode keeps page-level pruning too. A chunk split over several
+        // pages (one no page header could hold) gets none: the chunk's stats describe no single page.
+        const idx = if (self.emit_page_index and enc.data_pages == 1)
             try synthPageIndexToSink(self.out_arena, self.sink, self.out_offset, &enc.meta, em.data_page_offset)
         else
             fastpath.PageIndexPtrs{};

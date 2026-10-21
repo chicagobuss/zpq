@@ -2614,7 +2614,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     try sink.write(footer_bytes);
     out_offset += footer_bytes.len;
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
+    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
     try sink.write(&len_bytes);
     out_offset += len_bytes.len;
     try sink.write(&PAR1);
@@ -3702,11 +3702,12 @@ const RangePlan = union(enum) {
 };
 
 /// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
-/// The query's filter bound against `meta`. Under `--trust-stats` a FLOAT/DOUBLE chunk without a NaN count prunes as
-/// if it had none (`ast.trustMissingNanCounts`); every row-group and page decision reads that from the leaves.
+/// The query's filter bound against `meta`. Under `--trust-stats` its leaves trust plausible statistics, and a
+/// FLOAT/DOUBLE chunk without a NaN count prunes as if it had none (`ast.trustStats`); every row-group and page
+/// decision reads that from the leaves.
 fn bindFilter(arena: std.mem.Allocator, text: []const u8, meta: *const schema.FileMetaData, args: QueryArgs) !filter_ast.Filter {
     const f = try filter_parser.parse(arena, text, meta, args.diag);
-    return if (args.trust_stats) filter_ast.trustMissingNanCounts(arena, f) else f;
+    return if (args.trust_stats) filter_ast.trustStats(arena, f) else f;
 }
 
 fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.FileMetaData) !RangePlan {
@@ -6224,9 +6225,9 @@ fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ke
     };
     if (ci >= rg.columns.items.len) return null;
     const cm = rg.columns.items[ci].meta_data orelse return null;
-    const b = statistics.chunkBounds(rg, ci, meta) orelse {
-        const stats = cm.statistics orelse return null;
-        const nulls = stats.null_count orelse return null;
+    const st = statistics.chunkStats(rg, ci, meta, .corroborated);
+    const b = st.bounds orelse {
+        const nulls = st.null_count orelse return null;
         return if (rg.num_rows > 0 and nulls == rg.num_rows) .null else null;
     };
     const bytes = if (key.descending) b.max else b.min;
@@ -7314,7 +7315,7 @@ const ParquetPrint = struct {
         const footer = writer.bytes();
         try self.sink().write(footer);
         var len: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len, @intCast(footer.len), .little);
+        std.mem.writeInt(u32, &len, std.math.cast(u32, footer.len) orelse return error.TooLarge, .little);
         try self.sink().write(&len);
         try self.sink().write("PAR1");
         self.out_offset += footer.len + 8;

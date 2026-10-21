@@ -42,6 +42,8 @@ pub const EncodedColumn = struct {
     meta: schema.ColumnMetaData,
     /// The chunk's Bloom filter (header and bitset) when `ColumnInput.bloom_fpp` asked for one.
     bloom: []const u8 = &.{},
+    /// More than one only for a chunk no single page header could hold (`appendPages`).
+    data_pages: usize = 1,
 };
 
 pub const ColumnInput = struct {
@@ -148,7 +150,6 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     const is_optional = elem.repetition_type == .OPTIONAL;
     const src_def_levels = sourceDefLevels(in.values);
     const src_max_def = sourceMaxDef(in.values);
-    const src_rep_levels = sourceRepLevels(in.values);
     const src_max_rep = sourceMaxRep(in.values);
     const fixed = phys == .FIXED_LEN_BYTE_ARRAY;
     // FLBA's PLAIN form is the bare bytes, so a value of another width would shift every value after it.
@@ -188,49 +189,18 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
         }
     }
 
-    // 1. Encode values. For i32/i64 columns we use DELTA_BINARY_PACKED
-    //    — it dominates PLAIN by 4-8× on sorted/timestamp columns and
-    //    is roughly equivalent on random data (per-block overhead is
-    //    small and bit-packing adapts to actual delta range). For
-    //    f32/f64/string/bool we use PLAIN.
-    //
-    //    The page-header `encoding` field is set accordingly below.
-    const delta_bytes_opt = if (src_max_rep == 0)
-        try tryEncodeValuesDelta(arena, in.values, src_def_levels, src_max_def)
-    else
-        null;
-    // Strings the dictionary declined: DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY (see `encodeValuesStrings`).
-    // Only for flat columns.
-    const strings_opt = if (delta_bytes_opt == null and src_max_rep == 0)
-        try encodeValuesStrings(arena, in.values, src_def_levels, src_max_def, fixed)
-    else
-        null;
-    const values_bytes = if (delta_bytes_opt) |b|
-        b
-    else if (strings_opt) |sv|
-        sv.bytes
-    else
-        try encodeValuesPlain(arena, in.values, src_def_levels, src_max_def, fixed);
-    const values_encoding: schema.Encoding = if (delta_bytes_opt != null)
-        .DELTA_BINARY_PACKED
-    else if (strings_opt) |sv|
-        sv.encoding
-    else
-        .PLAIN;
-
-    // 2a. Rep-level prefix when the column has nesting (max_rep > 0).
-    //     V1 layout puts rep before def.
-    const rep_prefix: []const u8 = if (src_max_rep > 0)
-        try levelPrefix(arena, src_rep_levels orelse return error.NullableNotSupported, bitWidthFor(src_max_rep))
-    else
-        &.{};
-
-    // 2b. Def-level prefix when OPTIONAL (or when nested with max_def > 0).
+    // 1-2. Values, then the rep- and def-level prefixes (`valuesPayload`). A chunk no page header can hold is
+    //      written over several pages instead (`encodeValuesSplit`).
     const need_def_prefix = is_optional or src_max_rep > 0;
-    const def_prefix: []const u8 = if (need_def_prefix)
-        try defLevelPrefix(arena, src_def_levels, src_max_def, num_values)
-    else
-        &.{};
+    if (@as(u64, @intCast(num_values)) > pageLimit()) return encodeValuesSplit(arena, in, need_def_prefix, fixed);
+    const pp = valuesPayload(arena, in.values, need_def_prefix, fixed) catch |err| switch (err) {
+        error.TooLarge => return encodeValuesSplit(arena, in, need_def_prefix, fixed),
+        else => return err,
+    };
+    const values_bytes = pp.values;
+    const values_encoding = pp.encoding;
+    const rep_prefix = pp.rep_prefix;
+    const def_prefix = pp.def_prefix;
 
     const data_total_len = rep_prefix.len + def_prefix.len + values_bytes.len;
 
@@ -266,6 +236,9 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     //     allows it. (zstd pages pick their own mode, raw blocks
     //     among them; see `compression.ZstdPlan`.)
     const compressed = try compression.compressPage(arena, payload, in.codec, in.zstd);
+    if (data_total_len > pageLimit() or compressed.len > pageLimit()) {
+        return encodeValuesSplit(arena, in, need_def_prefix, fixed);
+    }
 
     // 5. Build PageHeader. uncompressed_page_size measures the
     //    payload-as-if-uncompressed; compressed_page_size measures
@@ -327,16 +300,260 @@ fn encodeValues(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
     return .{ .bytes = total, .meta = meta };
 }
 
-/// `encoding_stats` for a chunk of one page per entry.
+/// The pieces of a plain (not dictionary) column's V1 data page over `vals`: its values in the encoding chosen for
+/// them, and the level prefixes (a def prefix when `need_def_prefix`).
+const ValuesPayload = struct {
+    rep_prefix: []const u8,
+    def_prefix: []const u8,
+    values: []const u8,
+    encoding: schema.Encoding,
+
+    fn len(self: ValuesPayload) usize {
+        return self.rep_prefix.len + self.def_prefix.len + self.values.len;
+    }
+};
+
+fn valuesPayload(
+    arena: std.mem.Allocator,
+    vals: filter_eval.Batch.Column,
+    need_def_prefix: bool,
+    fixed: bool,
+) Error!ValuesPayload {
+    const def_levels = sourceDefLevels(vals);
+    const max_def = sourceMaxDef(vals);
+    const max_rep = sourceMaxRep(vals);
+    // 1. Encode values. For i32/i64 columns we use DELTA_BINARY_PACKED
+    //    — it dominates PLAIN by 4-8× on sorted/timestamp columns and
+    //    is roughly equivalent on random data (per-block overhead is
+    //    small and bit-packing adapts to actual delta range). For
+    //    f32/f64/string/bool we use PLAIN.
+    //
+    //    The page-header `encoding` field is set accordingly below.
+    const delta_bytes_opt = if (max_rep == 0)
+        try tryEncodeValuesDelta(arena, vals, def_levels, max_def)
+    else
+        null;
+    // Strings the dictionary declined: DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY (see `encodeValuesStrings`).
+    // Only for flat columns.
+    const strings_opt = if (delta_bytes_opt == null and max_rep == 0)
+        try encodeValuesStrings(arena, vals, def_levels, max_def, fixed)
+    else
+        null;
+    const values_bytes = if (delta_bytes_opt) |b|
+        b
+    else if (strings_opt) |sv|
+        sv.bytes
+    else
+        try encodeValuesPlain(arena, vals, def_levels, max_def, fixed);
+    const values_encoding: schema.Encoding = if (delta_bytes_opt != null)
+        .DELTA_BINARY_PACKED
+    else if (strings_opt) |sv|
+        sv.encoding
+    else
+        .PLAIN;
+
+    // 2a. Rep-level prefix when the column has nesting (max_rep > 0).
+    //     V1 layout puts rep before def.
+    const rep_prefix: []const u8 = if (max_rep > 0)
+        try levelPrefix(arena, sourceRepLevels(vals) orelse return error.NullableNotSupported, bitWidthFor(max_rep))
+    else
+        &.{};
+
+    // 2b. Def-level prefix when OPTIONAL (or when nested with max_def > 0).
+    const def_prefix: []const u8 = if (need_def_prefix)
+        try defLevelPrefix(arena, def_levels, max_def, @intCast(valueCount(vals)))
+    else
+        &.{};
+
+    return .{ .rep_prefix = rep_prefix, .def_prefix = def_prefix, .values = values_bytes, .encoding = values_encoding };
+}
+
+/// `encodeValues` for a chunk no single page header holds: the same encodings, page by page (`ValuesPages`).
+fn encodeValuesSplit(
+    arena: std.mem.Allocator,
+    in: ColumnInput,
+    need_def_prefix: bool,
+    fixed: bool,
+) Error!EncodedColumn {
+    const source: ValuesPages = .{ .in = &in, .need_def_prefix = need_def_prefix, .fixed = fixed };
+    var pages: std.ArrayList(DataPage) = .empty;
+    try appendPages(arena, &source, 0, valueCount(in.values), sourceRepLevels(in.values), &pages);
+    const stats = computeStats(arena, in.values, sourceDefLevels(in.values), sourceMaxDef(in.values), in.schema_elem);
+    const chunk = try joinPages(arena, &.{}, pages.items);
+    var encodings: schema.EncodingList = .empty;
+    try encodings.append(arena, .RLE);
+    for (chunk.encodings) |e| try encodings.append(arena, e.encoding);
+    var path_list: schema.StringList = .empty;
+    try path_list.appendSlice(arena, in.path_in_schema);
+    return .{
+        .bytes = chunk.bytes,
+        .meta = .{
+            .type = in.schema_elem.type.?,
+            .encodings = encodings,
+            .path_in_schema = path_list,
+            .codec = in.codec,
+            .num_values = @intCast(valueCount(in.values)),
+            .total_uncompressed_size = @intCast(chunk.uncompressed),
+            .total_compressed_size = @intCast(chunk.bytes.len),
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = stats,
+            .encoding_stats = try pageStats(arena, chunk.encodings),
+        },
+        .data_pages = pages.items.len,
+    };
+}
+
+/// The data page of slots `[lo, hi)` of a plain column, as `encodeValues` writes a whole chunk's.
+const ValuesPages = struct {
+    in: *const ColumnInput,
+    need_def_prefix: bool,
+    fixed: bool,
+
+    fn page(self: *const ValuesPages, arena: std.mem.Allocator, lo: usize, hi: usize) Error!?DataPage {
+        const vals = sliceSlots(self.in.values, lo, hi);
+        const pp = valuesPayload(arena, vals, self.need_def_prefix, self.fixed) catch |err| switch (err) {
+            error.TooLarge => return null, // past what one page holds: split the slots
+            else => return err,
+        };
+        const payload = try std.mem.concat(arena, u8, &.{ pp.rep_prefix, pp.def_prefix, pp.values });
+        return dataPage(arena, payload, hi - lo, pp.encoding, self.in.codec, self.in.zstd);
+    }
+};
+
+/// The most a page header's i32 sizes and counts hold. Tests lower it to split chunks small enough to check.
+fn pageLimit() usize {
+    return if (@import("builtin").is_test) test_page_limit else std.math.maxInt(i32);
+}
+var test_page_limit: usize = std.math.maxInt(i32);
+
+/// One V1 data page of a split chunk: header, then compressed payload.
+const DataPage = struct {
+    header: []const u8,
+    compressed: []const u8,
+    /// Header plus uncompressed payload, as `total_uncompressed_size` counts it.
+    uncompressed: usize,
+    encoding: schema.Encoding,
+};
+
+/// The V1 data page of `num_values` level entries over `payload`, or null when a header field would not fit its i32
+/// (the caller splits the slots).
+fn dataPage(
+    arena: std.mem.Allocator,
+    payload: []const u8,
+    num_values: usize,
+    encoding: schema.Encoding,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+) Error!?DataPage {
+    if (num_values > pageLimit() or payload.len > pageLimit()) return null;
+    const compressed = try compression.compressPage(arena, payload, codec, zstd);
+    if (compressed.len > pageLimit()) return null;
+    const header = try pageHeaderBytes(arena, .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(payload.len),
+        .compressed_page_size = @intCast(compressed.len),
+        .crc = null,
+        .data_page_header = .{
+            .num_values = @intCast(num_values),
+            .encoding = encoding,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    });
+    const uncompressed = header.len + payload.len;
+    return .{ .header = header, .compressed = compressed, .uncompressed = uncompressed, .encoding = encoding };
+}
+
+/// Append the data pages of slots `[lo, hi)` from `source` (`fn page(source, arena, lo, hi) Error!?DataPage`): one
+/// page when its header holds it, otherwise the slots split in halves until each part fits. A repeated column splits
+/// only where a record starts (`rep_levels[i] == 0`); one record no page holds is `error.TooLarge`. Only chunks past
+/// 2^31 values or 2 GiB of payload come here: the encoders write every other chunk's one page as they always have,
+/// allocation for allocation, which the writer's memory-measured row-group slicing depends on.
+fn appendPages(
+    arena: std.mem.Allocator,
+    source: anytype,
+    lo: usize,
+    hi: usize,
+    rep_levels: ?[]const u32,
+    pages: *std.ArrayList(DataPage),
+) Error!void {
+    if (hi - lo <= pageLimit()) if (try source.page(arena, lo, hi)) |p| return pages.append(arena, p);
+    const mid = splitSlot(rep_levels, lo, hi) orelse return error.TooLarge;
+    try appendPages(arena, source, lo, mid, rep_levels, pages);
+    try appendPages(arena, source, mid, hi, rep_levels, pages);
+}
+
+/// The record start in `(lo, hi)` nearest the middle, or null when there is none.
+fn splitSlot(rep_levels: ?[]const u32, lo: usize, hi: usize) ?usize {
+    if (hi - lo < 2) return null;
+    const half = lo + (hi - lo) / 2;
+    const rep = rep_levels orelse return half;
+    var d: usize = 0;
+    while (true) : (d += 1) {
+        const up = half + d < hi;
+        const down = d < half - lo; // half - d stays above lo
+        if (!up and !down) return null;
+        if (up and rep[half + d] == 0) return half + d;
+        if (down and rep[half - d] == 0) return half - d;
+    }
+}
+
+/// Slots `[lo, hi)` of a column the encoder writes: values row for row with the levels.
+fn sliceSlots(col: filter_eval.Batch.Column, lo: usize, hi: usize) filter_eval.Batch.Column {
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            var o = c;
+            o.values = c.values[lo..hi];
+            if (c.def_levels) |dl| o.def_levels = dl[lo..hi];
+            if (c.rep_levels) |rl| o.rep_levels = rl[lo..hi];
+            break :blk @unionInit(filter_eval.Batch.Column, @tagName(tag), o);
+        },
+    };
+}
+
+/// A split chunk's pages joined: `prefix` (a dictionary page) then the data pages, with the uncompressed total and
+/// each distinct data-page encoding counted, in first-page order.
+const JoinedPages = struct {
+    bytes: []u8,
+    uncompressed: usize,
+    encodings: []const PageCount,
+};
+
+const PageCount = struct { page_type: schema.PageType = .DATA_PAGE, encoding: schema.Encoding, count: i32 = 1 };
+
+fn joinPages(arena: std.mem.Allocator, prefix: []const []const u8, pages: []const DataPage) Error!JoinedPages {
+    var parts: std.ArrayList([]const u8) = .empty;
+    try parts.appendSlice(arena, prefix);
+    var counts: std.ArrayList(PageCount) = .empty;
+    var uncompressed: usize = 0;
+    for (pages) |p| {
+        try parts.appendSlice(arena, &.{ p.header, p.compressed });
+        uncompressed += p.uncompressed;
+        for (counts.items) |*c| {
+            if (c.encoding == p.encoding) {
+                c.count += 1;
+                break;
+            }
+        } else try counts.append(arena, .{ .encoding = p.encoding });
+    }
+    const bytes = try std.mem.concat(arena, u8, parts.items);
+    return .{ .bytes = bytes, .uncompressed = uncompressed, .encodings = counts.items };
+}
+
+/// `encoding_stats`: each page type and encoding with its page count.
 fn pageStats(
     arena: std.mem.Allocator,
-    pages: []const struct { page_type: schema.PageType, encoding: schema.Encoding },
+    pages: []const PageCount,
 ) Error!std.ArrayListUnmanaged(schema.PageEncodingStats) {
     var out: std.ArrayListUnmanaged(schema.PageEncodingStats) = .empty;
     for (pages) |p| try out.append(arena, .{
         .page_type = @backingInt(p.page_type),
         .encoding = @backingInt(p.encoding),
-        .count = 1,
+        .count = p.count,
     });
     return out;
 }
@@ -411,6 +628,10 @@ pub fn encodeDecimalFlba(
         }
     }
 
+    if (col.values.len > pageLimit()) {
+        return encodeDecimalFlbaSplit(arena, col, schema_elem, path_in_schema, codec, zstd);
+    }
+
     // PLAIN values: `bw` big-endian bytes per present value.
     const values_bytes = try arena.alloc(u8, num_present * bw);
     {
@@ -431,41 +652,11 @@ pub fn encodeDecimalFlba(
     @memcpy(payload[0..def_prefix.len], def_prefix);
     @memcpy(payload[def_prefix.len..], values_bytes);
     const compressed = try compression.compressPage(arena, payload, codec, zstd);
-
-    // Stats: min/max over present values as big-endian `bw` bytes.
-    var stats = schema.Statistics{};
-    {
-        var have = false;
-        var lo: i128 = 0;
-        var hi: i128 = 0;
-        var nulls: i64 = 0;
-        for (col.values, 0..) |v, i| {
-            if (!isPresent(def_levels, max_def, i)) {
-                nulls += 1;
-                continue;
-            }
-            if (!have) {
-                lo = v;
-                hi = v;
-                have = true;
-            } else {
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-            }
-        }
-        if (have) {
-            const lob = try arena.alloc(u8, bw);
-            const hib = try arena.alloc(u8, bw);
-            var be: [16]u8 = undefined;
-            std.mem.writeInt(i128, &be, lo, .big);
-            @memcpy(lob, be[16 - bw ..]);
-            std.mem.writeInt(i128, &be, hi, .big);
-            @memcpy(hib, be[16 - bw ..]);
-            stats.min_value = lob;
-            stats.max_value = hib;
-        }
-        stats.null_count = nulls;
+    if (data_total_len > pageLimit() or compressed.len > pageLimit()) {
+        return encodeDecimalFlbaSplit(arena, col, schema_elem, path_in_schema, codec, zstd);
     }
+
+    const stats = try decimalFlbaStats(arena, col, bw);
 
     var page_hdr: schema.PageHeader = .{
         .type = .DATA_PAGE,
@@ -512,6 +703,120 @@ pub fn encodeDecimalFlba(
     };
     return .{ .bytes = total, .meta = meta };
 }
+
+/// Min/max over a DECIMAL FLBA column's present values as big-endian `bw` bytes, and its null count.
+fn decimalFlbaStats(arena: std.mem.Allocator, col: filter_eval.ColumnT(i128), bw: usize) Error!schema.Statistics {
+    const def_levels = col.def_levels;
+    const max_def = col.max_def;
+    var stats = schema.Statistics{};
+    var have = false;
+    var lo: i128 = 0;
+    var hi: i128 = 0;
+    var nulls: i64 = 0;
+    for (col.values, 0..) |v, i| {
+        if (!isPresent(def_levels, max_def, i)) {
+            nulls += 1;
+            continue;
+        }
+        if (!have) {
+            lo = v;
+            hi = v;
+            have = true;
+        } else {
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+    }
+    if (have) {
+        const lob = try arena.alloc(u8, bw);
+        const hib = try arena.alloc(u8, bw);
+        var be: [16]u8 = undefined;
+        std.mem.writeInt(i128, &be, lo, .big);
+        @memcpy(lob, be[16 - bw ..]);
+        std.mem.writeInt(i128, &be, hi, .big);
+        @memcpy(hib, be[16 - bw ..]);
+        stats.min_value = lob;
+        stats.max_value = hib;
+    }
+    stats.null_count = nulls;
+    return stats;
+}
+
+/// `encodeDecimalFlba` for a chunk no single page header holds, page by page (`DecimalFlbaPages`).
+fn encodeDecimalFlbaSplit(
+    arena: std.mem.Allocator,
+    col: filter_eval.ColumnT(i128),
+    schema_elem: *const schema.SchemaElement,
+    path_in_schema: []const []const u8,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+) Error!EncodedColumn {
+    const bw: usize = @intCast(schema_elem.type_length.?);
+    const source: DecimalFlbaPages = .{
+        .col = col,
+        .bw = bw,
+        .is_optional = schema_elem.repetition_type == .OPTIONAL,
+        .codec = codec,
+        .zstd = zstd,
+    };
+    var pages: std.ArrayList(DataPage) = .empty;
+    try appendPages(arena, &source, 0, col.values.len, null, &pages);
+    const stats = try decimalFlbaStats(arena, col, bw);
+    const chunk = try joinPages(arena, &.{}, pages.items);
+    var encodings: schema.EncodingList = .empty;
+    try encodings.appendSlice(arena, &.{ .RLE, .PLAIN });
+    var path_list: schema.StringList = .empty;
+    try path_list.appendSlice(arena, path_in_schema);
+    return .{
+        .bytes = chunk.bytes,
+        .meta = .{
+            .type = .FIXED_LEN_BYTE_ARRAY,
+            .encodings = encodings,
+            .path_in_schema = path_list,
+            .codec = codec,
+            .num_values = @intCast(col.values.len),
+            .total_uncompressed_size = @intCast(chunk.uncompressed),
+            .total_compressed_size = @intCast(chunk.bytes.len),
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = stats,
+            .encoding_stats = try pageStats(arena, chunk.encodings),
+        },
+        .data_pages = pages.items.len,
+    };
+}
+
+/// The data page of slots `[lo, hi)` of a DECIMAL FLBA column: PLAIN, `bw` big-endian bytes per present value.
+const DecimalFlbaPages = struct {
+    col: filter_eval.ColumnT(i128),
+    bw: usize,
+    is_optional: bool,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+
+    fn page(self: *const DecimalFlbaPages, arena: std.mem.Allocator, lo: usize, hi: usize) Error!?DataPage {
+        const def_levels = if (self.col.def_levels) |dl| dl[lo..hi] else null;
+        const max_def = self.col.max_def;
+        const values = self.col.values[lo..hi];
+        const bw = self.bw;
+        const values_bytes = try arena.alloc(u8, countPresent(values.len, def_levels, max_def) * bw);
+        var pos: usize = 0;
+        for (values, 0..) |v, i| {
+            if (!isPresent(def_levels, max_def, i)) continue;
+            var be: [16]u8 = undefined;
+            std.mem.writeInt(i128, &be, v, .big);
+            @memcpy(values_bytes[pos .. pos + bw], be[16 - bw ..]);
+            pos += bw;
+        }
+        const def_prefix: []const u8 = if (self.is_optional)
+            try defLevelPrefix(arena, def_levels, max_def, @intCast(values.len))
+        else
+            &.{};
+        const payload = try std.mem.concat(arena, u8, &.{ def_prefix, values_bytes });
+        return dataPage(arena, payload, values.len, .PLAIN, self.codec, self.zstd);
+    }
+};
 
 /// A column carried as codes into its source dictionary (`ColumnT.codes`). The dictionary is rebuilt from the codes
 /// alone: each code met among present rows becomes the next entry, in first-occurrence order and under the same
@@ -570,7 +875,7 @@ fn encodeCodedColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedCol
                     break :blk out;
                 };
                 const dict_col = @unionInit(filter_eval.Batch.Column, @tagName(tag), .{ .values = used });
-                return finishDictionaryColumn(arena, in, @intCast(n), dict_plain, dict_col, indices);
+                if (try finishDictionaryColumn(arena, in, @intCast(n), dict_plain, dict_col, indices)) |enc| return enc;
             }
             var vals = c;
             const gathered = try agg_coded.materialize(arena, in.values);
@@ -853,8 +1158,10 @@ fn tryEncodeDictFloat(
 
 /// The two pages every dictionary encoder emits once it has interned its values (the encoders differ only in how
 /// they key and PLAIN-encode entries): the compressed `dict_plain` dictionary page holding `dict_count` entries,
-/// then a data page of `indices`, one per present value. `dictionary_page_offset` is 0 and `data_page_offset` the
-/// dictionary page's length, both relative to the returned bytes; callers add the chunk's absolute start to both.
+/// then a data page of `indices`, one per present value (several where no one page header holds them,
+/// `encodeDictionarySplit`). Null when the dictionary page itself would not fit a header; the caller encodes the
+/// values instead. `dictionary_page_offset` is 0 and `data_page_offset` the dictionary page's length, both relative
+/// to the returned bytes; callers add the chunk's absolute start to both.
 fn finishDictionaryColumn(
     arena: std.mem.Allocator,
     in: ColumnInput,
@@ -863,10 +1170,11 @@ fn finishDictionaryColumn(
     /// The entries in first-occurrence order, every one present at least once.
     dict: filter_eval.Batch.Column,
     indices: []const u32,
-) Error!EncodedColumn {
+) Error!?EncodedColumn {
     const def_levels = sourceDefLevels(in.values);
     const max_def = sourceMaxDef(in.values);
     const dict_count = valueCount(dict);
+    if (dict_count > pageLimit() or dict_plain.len > pageLimit()) return null;
     // Statistics over the distinct values, not every row: the dictionary holds exactly the present values, first
     // occurrence first, so the scan meets them in the order a row scan first would and keeps the same bounds.
     var stats = computeStats(arena, dict, null, 0, in.schema_elem);
@@ -879,6 +1187,7 @@ fn finishDictionaryColumn(
         };
     }
     const dict_compressed = try compression.compressPage(arena, dict_plain, in.codec, in.zstd);
+    if (dict_compressed.len > pageLimit()) return null;
     const dict_header = try pageHeaderBytes(arena, .{
         .type = .DICTIONARY_PAGE,
         .uncompressed_page_size = @intCast(dict_plain.len),
@@ -893,6 +1202,25 @@ fn finishDictionaryColumn(
         .data_page_header_v2 = null,
     });
 
+    const split: DictionarySplit = .{
+        .in = &in,
+        .num_values = num_values,
+        .stats = stats,
+        .dict_header = dict_header,
+        .dict_compressed = dict_compressed,
+        .dict_plain_len = dict_plain.len,
+        .pages = .{
+            .def_levels = def_levels,
+            .max_def = max_def,
+            .optional = in.schema_elem.repetition_type == .OPTIONAL,
+            .indices = indices,
+            .bit_width = dictIndexBitWidth(dict_count),
+            .codec = in.codec,
+            .zstd = in.zstd,
+        },
+    };
+    if (@as(u64, @intCast(num_values)) > pageLimit()) return try split.encode(arena);
+
     // Data page payload: def prefix (OPTIONAL only), the index bit width, then the RLE/bit-packed indices.
     const def_prefix: []const u8 = if (in.schema_elem.repetition_type == .OPTIONAL)
         try defLevelPrefix(arena, def_levels, max_def, num_values)
@@ -902,6 +1230,7 @@ fn finishDictionaryColumn(
     const idx_rle = try hybrid_rle.encode(arena, indices, idx_bit_width);
     const data_payload = try std.mem.concat(arena, u8, &.{ def_prefix, &.{idx_bit_width}, idx_rle });
     const data_compressed = try compression.compressPage(arena, data_payload, in.codec, in.zstd);
+    if (data_payload.len > pageLimit() or data_compressed.len > pageLimit()) return try split.encode(arena);
     const data_header = try pageHeaderBytes(arena, .{
         .type = .DATA_PAGE,
         .uncompressed_page_size = @intCast(data_payload.len),
@@ -947,6 +1276,74 @@ fn finishDictionaryColumn(
     };
 }
 
+/// A dictionary chunk whose indices no one data page header holds: the dictionary page once, then the index pages.
+const DictionarySplit = struct {
+    in: *const ColumnInput,
+    num_values: i64,
+    stats: ?schema.Statistics,
+    dict_header: []const u8,
+    dict_compressed: []const u8,
+    dict_plain_len: usize,
+    pages: DictionaryPages,
+
+    fn encode(self: *const DictionarySplit, arena: std.mem.Allocator) Error!EncodedColumn {
+        const in = self.in;
+        var pages: std.ArrayList(DataPage) = .empty;
+        try appendPages(arena, &self.pages, 0, @intCast(self.num_values), null, &pages);
+        const chunk = try joinPages(arena, &.{ self.dict_header, self.dict_compressed }, pages.items);
+        var encodings: schema.EncodingList = .empty;
+        try encodings.appendSlice(arena, &.{ .RLE, .PLAIN, .PLAIN_DICTIONARY });
+        var path_list: schema.StringList = .empty;
+        try path_list.appendSlice(arena, in.path_in_schema);
+        return .{
+            .bytes = chunk.bytes,
+            .meta = .{
+                .type = in.schema_elem.type.?,
+                .encodings = encodings,
+                .path_in_schema = path_list,
+                .codec = in.codec,
+                .num_values = self.num_values,
+                .total_uncompressed_size = @intCast(self.dict_header.len + self.dict_plain_len + chunk.uncompressed),
+                .total_compressed_size = @intCast(chunk.bytes.len),
+                .data_page_offset = @intCast(self.dict_header.len + self.dict_compressed.len),
+                .dictionary_page_offset = 0,
+                .index_page_offset = null,
+                .statistics = self.stats,
+                .encoding_stats = try pageStats(arena, &.{
+                    .{ .page_type = .DICTIONARY_PAGE, .encoding = .PLAIN },
+                    .{ .page_type = .DATA_PAGE, .encoding = .PLAIN_DICTIONARY, .count = @intCast(pages.items.len) },
+                }),
+            },
+            .data_pages = pages.items.len,
+        };
+    }
+};
+
+/// The data page of slots `[lo, hi)` of a dictionary column: the def prefix (OPTIONAL only), the index bit width,
+/// then the RLE/bit-packed indices of the slots' present values.
+const DictionaryPages = struct {
+    def_levels: ?[]const u32,
+    max_def: u32,
+    optional: bool,
+    indices: []const u32,
+    bit_width: u8,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+
+    fn page(self: *const DictionaryPages, arena: std.mem.Allocator, lo: usize, hi: usize) Error!?DataPage {
+        const dl = if (self.def_levels) |d| d[lo..hi] else null;
+        const first = countPresent(lo, if (self.def_levels) |d| d[0..lo] else null, self.max_def);
+        const present = countPresent(hi - lo, dl, self.max_def);
+        const def_prefix: []const u8 = if (self.optional)
+            try defLevelPrefix(arena, dl, self.max_def, @intCast(hi - lo))
+        else
+            &.{};
+        const idx_rle = try hybrid_rle.encode(arena, self.indices[first..][0..present], self.bit_width);
+        const payload = try std.mem.concat(arena, u8, &.{ def_prefix, &.{self.bit_width}, idx_rle });
+        return dataPage(arena, payload, hi - lo, .PLAIN_DICTIONARY, self.codec, self.zstd);
+    }
+};
+
 /// Index width for a `dict_count`-entry dictionary, never below one bit. A 0-bit index page is legal RLE, but
 /// strict readers (pyarrow) reject it ("Invalid number of indices: 0"), so a column filtered down to one distinct
 /// value would be unreadable elsewhere while ZPQ's lenient reader hid it. parquet-mr uses the same minimum. Found by
@@ -959,7 +1356,7 @@ fn dictIndexBitWidth(dict_count: usize) u8 {
 fn levelPrefix(arena: std.mem.Allocator, levels: []const u32, bit_width: u8) Error![]const u8 {
     const rle = try hybrid_rle.encode(arena, levels, bit_width);
     const prefix = try arena.alloc(u8, 4 + rle.len);
-    std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
+    std.mem.writeInt(u32, prefix[0..4], std.math.cast(u32, rle.len) orelse return error.TooLarge, .little);
     @memcpy(prefix[4..], rle);
     return prefix;
 }
@@ -1467,6 +1864,8 @@ fn encodePlainBytes(
         if (!isPresent(def_levels, max_def, i)) continue;
         total += len_prefix + v.len;
     }
+    // Every length prefix below is at most `total`.
+    if (total > std.math.maxInt(u32)) return error.TooLarge;
 
     const out = try arena.alloc(u8, total);
     var pos: usize = 0;
@@ -2733,4 +3132,195 @@ test "float statistics leave NaN out of the bounds, count it, and write a zero m
         try testing.expect(clean.meta.dictionary_page_offset != null);
         try expectFloatBounds(T, clean.meta.statistics, -0.0, 2.5, 0, 0);
     }
+}
+
+const split_path = [_][]const u8{"c"};
+
+fn splitInput(
+    values: filter_eval.Batch.Column,
+    elem: *const schema.SchemaElement,
+    codec: schema.CompressionCodec,
+) ColumnInput {
+    return .{ .values = values, .schema_elem = elem, .path_in_schema = &split_path, .codec = codec };
+}
+
+/// Every data page of `enc` (after its dictionary page, if any) within `limit`, their value counts summed.
+fn expectPagesWithin(a: std.mem.Allocator, enc: EncodedColumn, limit: usize) !usize {
+    const start: usize = @intCast(enc.meta.data_page_offset);
+    var values: usize = 0;
+    const pages = try testPages(a, enc.bytes[start..]);
+    for (pages) |p| {
+        try testing.expectEqual(schema.PageType.DATA_PAGE, p.header.type);
+        const n: usize = @intCast(p.header.data_page_header.?.num_values);
+        try testing.expect(n <= limit);
+        try testing.expect(@as(usize, @intCast(p.header.uncompressed_page_size)) <= limit);
+        try testing.expect(@as(usize, @intCast(p.header.compressed_page_size)) <= limit);
+        values += n;
+    }
+    try testing.expectEqual(enc.data_pages, pages.len);
+    var counted: i32 = 0;
+    for (enc.meta.encoding_stats.?.items) |st| {
+        if (st.page_type == @backingInt(schema.PageType.DATA_PAGE)) counted += st.count;
+    }
+    try testing.expectEqual(@as(i32, @intCast(pages.len)), counted);
+    try testing.expectEqual(@as(i64, @intCast(enc.bytes.len)), enc.meta.total_compressed_size);
+    return values;
+}
+
+fn ReadBack(comptime T: type) type {
+    return struct { values: []T, defs: []u32, reps: []u32 };
+}
+
+/// The `n` entries of `enc`'s chunk, read back by the column reader.
+fn readBack(comptime T: type, a: std.mem.Allocator, enc: EncodedColumn, levels: schema.Levels, n: usize) !ReadBack(T) {
+    const column = @import("../parquet/column.zig");
+    var reader = column.ColumnChunkReader(T).init(enc.bytes, enc.meta.codec, levels, a);
+    const out: ReadBack(T) = .{ .values = try a.alloc(T, n), .defs = try a.alloc(u32, n), .reps = try a.alloc(u32, n) };
+    var got: usize = 0;
+    while (got < n) {
+        const k = if (levels.max_rep > 0)
+            try reader.decodeWithRepLevels(out.values[got..], out.defs[got..], out.reps[got..])
+        else if (levels.max_def > 0)
+            try reader.decodeWithLevels(out.values[got..], out.defs[got..])
+        else
+            try reader.decode(out.values[got..]);
+        if (k == 0) break;
+        got += k;
+    }
+    try testing.expectEqual(n, got);
+    return out;
+}
+
+test "a chunk no page header holds splits into pages that read back as the chunk" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const limit = 300;
+    test_page_limit = limit;
+    defer test_page_limit = std.math.maxInt(i32);
+    const n = 1000;
+    var required = flbaElem(0, .REQUIRED);
+    var optional = flbaElem(0, .OPTIONAL);
+
+    // INT64, REQUIRED: DELTA_BINARY_PACKED pages, split by value count.
+    {
+        required.type = .INT64;
+        const vals = try a.alloc(i64, n);
+        for (vals, 0..) |*v, i| v.* = @as(i64, @intCast(i)) * 7919 - 100_000;
+        const enc = try encodeColumn(a, splitInput(.{ .i64 = .{ .values = vals } }, &required, .UNCOMPRESSED));
+        try testing.expect(enc.data_pages > 1);
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const back = try readBack(i64, a, enc, .{ .max_def = 0, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(i64, vals, back.values);
+    }
+    // INT64, OPTIONAL, few distinct values: one dictionary page, then index pages.
+    {
+        optional.type = .INT64;
+        const vals = try a.alloc(i64, n);
+        const defs = try a.alloc(u32, n);
+        for (vals, defs, 0..) |*v, *d, i| {
+            d.* = @intFromBool(i % 3 != 0);
+            v.* = if (d.* == 1) @intCast(i % 20) else 0;
+        }
+        const col: filter_eval.Batch.Column = .{ .i64 = .{ .values = vals, .def_levels = defs, .max_def = 1 } };
+        const enc = try encodeColumn(a, splitInput(col, &optional, .UNCOMPRESSED));
+        try testing.expect(enc.meta.dictionary_page_offset != null and enc.data_pages > 1);
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const back = try readBack(i64, a, enc, .{ .max_def = 1, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(u32, defs, back.defs);
+        for (vals, defs, back.values) |v, d, b| if (d == 1) try testing.expectEqual(v, b);
+    }
+    // Strings, OPTIONAL, all distinct: split by bytes as well as values, snappy-compressed.
+    {
+        optional.type = .BYTE_ARRAY;
+        const vals = try a.alloc([]const u8, n);
+        const defs = try a.alloc(u32, n);
+        for (vals, defs, 0..) |*v, *d, i| {
+            d.* = @intFromBool(i % 7 != 0);
+            v.* = if (d.* == 1) try std.fmt.allocPrint(a, "value-{d}-{d}", .{ i, i * i }) else "";
+        }
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = vals, .def_levels = defs, .max_def = 1 } };
+        const enc = try encodeColumn(a, splitInput(col, &optional, .SNAPPY));
+        try testing.expect(enc.data_pages > n / limit + 1);
+        const back = try readBack([]const u8, a, enc, .{ .max_def = 1, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(u32, defs, back.defs);
+        for (vals, defs, back.values) |v, d, b| if (d == 1) try testing.expectEqualStrings(v, b);
+    }
+    // BOOLEAN, REQUIRED.
+    {
+        required.type = .BOOLEAN;
+        const vals = try a.alloc(bool, n);
+        for (vals, 0..) |*v, i| v.* = (i * 31) % 7 < 3;
+        const enc = try encodeColumn(a, splitInput(.{ .boolean = .{ .values = vals } }, &required, .UNCOMPRESSED));
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const back = try readBack(bool, a, enc, .{ .max_def = 0, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(bool, vals, back.values);
+    }
+    // A repeated leaf: records of three entries, so every page starts a record.
+    {
+        optional.type = .INT64;
+        const vals = try a.alloc(i64, n - 1);
+        const defs = try a.alloc(u32, n - 1);
+        const reps = try a.alloc(u32, n - 1);
+        for (vals, defs, reps, 0..) |*v, *d, *r, i| {
+            v.* = @intCast(i);
+            d.* = 2;
+            r.* = @intFromBool(i % 3 != 0);
+        }
+        const col: filter_eval.Batch.Column = .{ .i64 = .{
+            .values = vals,
+            .def_levels = defs,
+            .max_def = 2,
+            .rep_levels = reps,
+            .max_rep = 1,
+        } };
+        const enc = try encodeColumn(a, splitInput(col, &optional, .UNCOMPRESSED));
+        try testing.expect(enc.data_pages > 1);
+        for (try testPages(a, enc.bytes)) |p| {
+            try testing.expectEqual(0, @mod(p.header.data_page_header.?.num_values, 3));
+        }
+        const back = try readBack(i64, a, enc, .{ .max_def = 2, .max_rep = 1 }, n - 1);
+        try testing.expectEqualSlices(i64, vals, back.values);
+        try testing.expectEqualSlices(u32, reps, back.reps);
+
+        // One record past what a page holds cannot be split.
+        @memset(reps[1..], 1);
+        try testing.expectError(error.TooLarge, encodeColumn(a, splitInput(col, &optional, .UNCOMPRESSED)));
+    }
+    // DECIMAL(38, 8) over FLBA(16): 16 bytes a value, so about 18 values a page.
+    {
+        var elem = flbaElem(16, .REQUIRED);
+        elem.logical_type = .{ .DECIMAL = .{ .scale = 8, .precision = 38 } };
+        const vals = try a.alloc(i128, n);
+        for (vals, 0..) |*v, i| v.* = @as(i128, @intCast(i)) * 1_000_000_000_000_000_007 - 3;
+        const enc = try encodeDecimalFlba(a, .{ .values = vals }, &elem, &split_path, .UNCOMPRESSED, .{});
+        try testing.expect(enc.data_pages >= n * 16 / limit);
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const kind = decimal_mod_test.kindFromSchema(&elem).?;
+        const flat: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+        const back = try decimal_mod_test.decodeColumnAsI128(a, enc.bytes, .UNCOMPRESSED, flat, n, kind);
+        try testing.expectEqualSlices(i128, vals, back.values);
+    }
+}
+
+test "a dictionary no page header holds leaves the chunk to its values' own encoding" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var elem = flbaElem(0, .REQUIRED);
+    elem.type = .INT64;
+    // 4000 values, 200 distinct: a 1600-byte dictionary.
+    const vals = try a.alloc(i64, 4000);
+    for (vals, 0..) |*v, i| v.* = @intCast((i * 37) % 200);
+    const in = splitInput(.{ .i64 = .{ .values = vals } }, &elem, .UNCOMPRESSED);
+    const whole = try encodeColumn(a, in);
+    try testing.expect(whole.meta.dictionary_page_offset != null and whole.data_pages == 1);
+
+    test_page_limit = 1000;
+    defer test_page_limit = std.math.maxInt(i32);
+    const split = try encodeColumn(a, in);
+    try testing.expect(split.meta.dictionary_page_offset == null and split.data_pages > 1);
+    try testing.expectEqual(@as(usize, 4000), try expectPagesWithin(a, split, 1000));
+    const back = try readBack(i64, a, split, .{ .max_def = 0, .max_rep = 0 }, 4000);
+    try testing.expectEqualSlices(i64, vals, back.values);
 }

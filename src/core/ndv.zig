@@ -10,6 +10,7 @@ const membership = @import("filter/membership.zig");
 const page = @import("parquet/page.zig");
 const plain = @import("parquet/encoding/plain.zig");
 const spawn = @import("spawn.zig");
+const statistics = @import("parquet/statistics.zig");
 
 pub const Stat = struct {
     source: enum { unknown, dictionary_headers, dictionary_union } = .unknown,
@@ -232,9 +233,9 @@ fn header(bytes: []const u8, limit: usize) ?schema.PageHeader {
     return h;
 }
 
-fn nullBound(cm: schema.ColumnMetaData) u64 {
-    // Missing null_count is not zero. One extra entry is always safe for an optional flat key.
-    return if (cm.statistics) |s| if (s.null_count == 0) 0 else 1 else 1;
+fn nullBound(rg: *const schema.RowGroup, ci: usize, m: *const schema.FileMetaData) u64 {
+    // A missing or uncorroborated null_count is not zero. One extra entry is always safe for an optional flat key.
+    return if (statistics.chunkStats(rg, ci, m, .corroborated).null_count == 0) 0 else 1;
 }
 
 fn dictionaryDecodePeak(cm: schema.ColumnMetaData, h: schema.PageHeader) u64 {
@@ -371,14 +372,15 @@ pub fn collectRetaining(
                     dictionary_peak +|= dictionaryDecodePeak(cm, h);
                     known = true;
                     widest = @max(widest, @as(u64, @intCast(h.dictionary_page_header.?.num_values)));
-                    break :blk @min(rows, @as(u64, @intCast(h.dictionary_page_header.?.num_values)) + nullBound(cm));
+                    const entries: u64 = @intCast(h.dictionary_page_header.?.num_values);
+                    break :blk @min(rows, entries + nullBound(rg, ci, m));
                 };
                 covered = false;
                 full[ki] = false;
                 break :blk rows;
             };
             sums[ki] +|= n;
-            nulls[ki] = @max(nulls[ki], nullBound(cm));
+            nulls[ki] = @max(nulls[ki], nullBound(rg, ci, m));
             product = @min(rows, product *| n);
         }
         stat.run_dictionary_peak = @max(stat.run_dictionary_peak, dictionary_peak);
@@ -873,9 +875,10 @@ test "ndv: partial coverage, missing null counts, unavailable pages and probe bu
     try std.testing.expect(partial.hi >= 9295);
     const cm = &meta.row_groups.items[1].columns.items[1].meta_data.?;
     cm.statistics.?.null_count = null;
-    try std.testing.expectEqual(@as(u64, 1), nullBound(cm.*));
+    const rg1 = &meta.row_groups.items[1];
+    try std.testing.expectEqual(@as(u64, 1), nullBound(rg1, 1, &meta));
     cm.statistics.?.null_count = 0;
-    try std.testing.expectEqual(@as(u64, 0), nullBound(cm.*));
+    try std.testing.expectEqual(@as(u64, 0), nullBound(rg1, 1, &meta));
     cm.encoding_stats = null;
     try std.testing.expect(!fullCoverage(cm));
 }

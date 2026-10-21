@@ -11,7 +11,8 @@ shell-completion and man-page packaging.
 
 1. **Scripts that parse `zpq query` output must change.** Every query now prints its answer as NDJSON rows on stdout,
    and nothing else. The `{"ok":true,...,"agg":...}` summary that 0.4.1 printed is gone from stdout; take the rows
-   instead, or add `--summary=json` to get a typed summary line on **stderr**.
+   instead, or add `--summary=json` to get a typed summary line on **stderr**. `docs/output-format.md` (shipped in
+   the release archive) is the contract for the shapes and for how each type prints.
 2. **BREAKING: `avg(x)` is now a plain number, in every format.** 0.4.1 answered it as a `{"sum":..,"count":..}`
    object in JSON (a DECIMAL one with an `"avg"` field too) and as `<name>__sum` / `<name>__count` columns in CSV and
    Parquet; the Lambda, libzpq and Python answers carried the same object. It is now one value, NULL over no values:
@@ -38,7 +39,23 @@ shell-completion and man-page packaging.
    `the query needs more memory than --max-memory allows` (exit 1). Raise the value, or leave it unset.
 6. **Expect GROUP BY rows in a different order.** Groups now come in the order they first appear in the input, at
    every `-j`; 0.4.1 sorted them by their serialized key bytes. Add `ORDER BY` if you need an order.
-7. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141.
+7. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141. An
+   aggregate or a GROUP BY key over a list's elements (a repeated leaf) is now refused while planning, exit 2, with a
+   sentence naming the column (`aggregate argument column `l.list.element` is repeated`), as a filter on one already
+   was; rc1 decoded the column first and exited 1 with a bare `UnsupportedAggType` or a GROUP BY message.
+8. **BREAKING for summary readers: `rows_kept` is gone.** It meant rows in the row groups read for an aggregate, but
+   rows written for a write, so a filtered aggregate reported every row of the row groups it read as kept. The
+   `--summary=json` line, and the Lambda's and libzpq's responses, now carry `rows_in` (every input row),
+   `rows_scanned` (rows in the row groups read) and `rows_matched` (rows the filter kept: what an aggregate folds, a
+   write writes, a row output prints before ORDER BY and LIMIT), beside `rows` (rows in the answer). The Lambda write
+   response's `rows_kept` is `rows_matched`. A row output's `rows_in` now counts every input row, not just the row
+   groups reached before a LIMIT.
+9. **BREAKING for summary readers: `phase` is now `wall_ms` and `worker_ms`.** `wall_ms` holds wall-clock phases
+   (`open`, `parse`, `scan`, `footer`; a Lambda write adds `mp_await`, `mp_complete`), which run one after another.
+   `worker_ms` holds each scan step summed over every worker (`decode`, `filter`, `fold` for aggregates, `encode` for
+   writes, `sink`), so with N workers one can reach N times `wall_ms.scan`: a `decode_ms` many times `total_ms` in
+   rc1 was many workers decoding at once, not a slow decode. `wall_ms.scan` is now measured for writes and row output
+   too. The field names lost their `_ms` suffix inside the objects. `docs/output-format.md` defines every field.
 
 ### Highlights
 
@@ -201,6 +218,13 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
 
 ### Behaviour changes
 
+**Errors**
+- A page or column chunk that fails to decode names where, on every query kind and at every `-j`:
+  `cannot decode input file data/b.parquet` / `row group 0, column `z`, page 1:` / `the page's encoded data is
+  invalid (UnexpectedPage)`. rc1 printed only the error's name (`UnexpectedPage`, `DictionaryMissing`,
+  `ShortDecode`, ...), so over a glob the corrupt file could not be told. The error's name stays last and is still the
+  `code` of `--summary=json`'s error line. Pages count from 0 in the column chunk, a dictionary page included.
+
 **Output**
 - Every query prints only its answer: NDJSON rows on stdout, one object per line, scalar aggregates as one row.
   - The summary is opt-in with `--summary=json`, on stderr. That flag also types errors (`{"type":"error",...}`) and
@@ -357,6 +381,9 @@ client of the C ABI can do the same.
 ### Memory ceiling: `--max-memory`
 
 `--max-memory` (the Lambda's and libzpq's `max_memory`) is one budget per query, and it does not depend on `-j`.
+Give it as bytes, or as a number (fractions allowed) followed by `K`, `M`, `G` or `T`, with or without a `B`, in any
+case, in powers of 1024: `--max-memory 2GB`, `1.5g`, `1073741824`. A space, an exponent or a `MiB` spelling is
+refused (exit 2). It is now in the help's usage synopsis, with its syntax, default and an example.
 Everything an aggregate, a Top-N or a write holds at once draws from it **before** allocating:
 - GROUP BY tables and `count(DISTINCT)` sets, which draw in proportion to their size;
 - each worker's decoded row groups, sliced string dictionaries, and a local reader's read-ahead;
@@ -492,7 +519,15 @@ Not supported: `%` (refused as `operator % is not supported`), the simple `CASE 
   - A file that fails is reported in place, and the command exits 1.
 - Bash, zsh and fish completions and a man page are in `packaging/`, generated from the CLI's help text. The man page
   is regenerated for the release, including `--trust-stats` and missing NaN counts.
-- `zpq --version` prints the version and build revision.
+- `zpq --version` prints the version and build revision. A release candidate carries its tag:
+  `zpq 0.5.0-rc2 (<rev>)`, and the same version is in the `created_by` of files it writes, its archive names and
+  `release.json`. 0.5.0-rc1 said `0.5.0` in each. `tools/package_release.py --tag v0.5.0-rc2` (or
+  `zig build -Dprerelease=rc2`) builds one, and refuses a tag that does not name `build.zig.zon`'s version.
+- Release archives are self-contained. Beside the binary, man page, completions and `share/zpq/tiny.parquet`, they
+  ship `share/doc/zpq/`: `getting-started.md` (a filtered read, a GROUP BY with `avg`, and a computed Parquet write,
+  each with its exact output against `tiny.parquet`), `output-format.md` and `binary-output.md`. Help names these
+  guides, and no longer points at the README, which the archive does not carry. Packaging fails if a shipped doc
+  names a file the archive lacks. The Homebrew formula installs the guides.
 
 ### Homebrew
 
@@ -537,6 +572,8 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
   - a quoted alias used as a GROUP BY key;
   - a fractional literal against an integer column (`x > 1.5`).
 - A DOUBLE that holds an integral value prints without a fraction (`1`), so a JSON reader may take it as an integer.
+- JSON prints DATE, TIME and TIMESTAMP (INT96 included) as their stored integers (days, or the column's unit since
+  midnight or the epoch; INT96 as nanoseconds), where CSV prints ISO text.
 - **`--max-memory` does not yet cover** the following:
   - grouped string `min`/`max` winners inside group tables;
   - first-keys, census and sketch structures;

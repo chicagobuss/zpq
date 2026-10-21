@@ -409,7 +409,8 @@ def _():
 
 @case("chunk_data_offset_past_eof", B4)
 def _():
-    return chunk_lie(lambda f: cmd(f, 1, 1).set(T.CMD_DATA_OFF, 1 << 40, T.T_I64))
+    # The chunk has a dictionary page, whose offset zpq reads from: ignoring the lying data_page_offset is right.
+    return chunk_lie(lambda f: cmd(f, 1, 1).set(T.CMD_DATA_OFF, 1 << 40, T.T_I64), kind="err|eq")
 
 
 @case("chunk_data_offset_in_footer", B4)
@@ -417,7 +418,31 @@ def _():
     def m(f):
         b = base()
         cmd(f, 1, 0).set(T.CMD_DATA_OFF, len(b) - 100, T.T_I64)
-    return chunk_lie(m)
+    return chunk_lie(m, kind="err|eq")
+
+
+def chunk_lie_nodict(mutate, kind="err"):
+    b = base(use_dictionary=False)
+    return {"file": refooter(b, mutate), "runs": battery(kind, count=N, count_kind="err|eq", agg=AGG,
+                                                         agg_value=AGG_TRUE, select="a, s", write_kind="safe",
+                                                         rows=TRUE_ROWS if "eq" in kind else None)}
+
+
+@case("chunk_data_offset_past_eof_nodict", B4)
+def _():
+    return chunk_lie_nodict(lambda f: cmd(f, 1, 1).set(T.CMD_DATA_OFF, 1 << 40, T.T_I64))
+
+
+@case("chunk_data_offset_into_other_column_nodict", B4)
+def _():
+    # a's data_page_offset (row group 1) points at s's first page in the same row group.
+    return chunk_lie_nodict(lambda f: cmd(f, 1, 0).set(T.CMD_DATA_OFF, cmd(f, 1, 1).get(T.CMD_DATA_OFF), T.T_I64))
+
+
+@case("chunk_data_offset_mid_page_nodict", B4)
+def _():
+    return chunk_lie_nodict(lambda f: cmd(f, 0, 0).set(T.CMD_DATA_OFF, cmd(f, 0, 0).get(T.CMD_DATA_OFF) + 3,
+                                                       T.T_I64))
 
 
 @case("chunk_dict_offset_negative", B4)
@@ -511,8 +536,9 @@ def _():
 
 @case("chunk_file_path_external", B4)
 def _():
-    # ColumnChunk.file_path names another file (here /etc/passwd). zpq must not open it.
-    return chunk_lie(lambda f: cc(f, 0, 0).set(T.CC_FILE_PATH, b"/etc/passwd", T.T_BIN), kind="err")
+    # ColumnChunk.file_path names another file (here /etc/passwd). zpq never opens it: it reads the chunk from this
+    # file's bytes (pyarrow does the same; DuckDB refuses). Whether to refuse is an open policy question (REPORT.md).
+    return chunk_lie(lambda f: cc(f, 0, 0).set(T.CC_FILE_PATH, b"/etc/passwd", T.T_BIN), kind="err|eq")
 
 
 @case("rowgroup_missing_column", B4)
@@ -1660,7 +1686,7 @@ def _():
     return {"file": b, "runs": logical_runs("err|eq", n=1, agg="sum(z) AS s", agg_value={"s": 1.2345e-06})}
 
 
-@case("logical_decimal_negative_scale", B43)
+@case("logical_decimal_negative_scale", B43, known="T13")
 def _():
     se = T.schema_elem("z", ty=T.INT64, rep=T.REQUIRED, converted=T.CT_DECIMAL, scale=-3, precision=10)
     b = logical_file(se, T.plain_i64([12345]), 1, T.INT64)

@@ -815,13 +815,13 @@ pub const Statistics = struct {
     distinct_count: ?i64 = null,
     max_value: ?[]const u8 = null,
     min_value: ?[]const u8 = null,
-    /// False means `max_value` is a truncated upper bound rather than a value present in the chunk. Read-only: not
-    /// written back, so byte-copied output loses them, which only makes later readers more conservative.
+    /// False means `max_value` (`min_value`) is a cut bound rather than a value present in the chunk: it prunes but
+    /// answers nothing. Written back, so a chunk copied byte for byte keeps what its writer said, and set by zpq's own
+    /// writer on every BYTE_ARRAY chunk (`encoder.statsBytes`).
     is_max_value_exact: ?bool = null,
     is_min_value_exact: ?bool = null,
-    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Written back, unlike the exactness flags: the
-    /// writer counts its own chunks' NaN, and a chunk copied byte for byte keeps its count. Missing means NaN may be
-    /// present.
+    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. The writer counts its own chunks' NaN, and a
+    /// chunk copied byte for byte keeps its count. Missing means NaN may be present.
     nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {

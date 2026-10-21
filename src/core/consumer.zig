@@ -1996,6 +1996,8 @@ fn cloneColumnMeta(
             .distinct_count = st.distinct_count,
             .max_value = if (st.max_value) |v| try arena.dupe(u8, v) else null,
             .min_value = if (st.min_value) |v| try arena.dupe(u8, v) else null,
+            .is_max_value_exact = st.is_max_value_exact,
+            .is_min_value_exact = st.is_min_value_exact,
             .nan_count = st.nan_count,
         };
     }
@@ -7192,4 +7194,42 @@ test "appendSelected keeps one level per row when a column's batches come with a
     try appendSelected(&plain, without, &sel, 2, a, false, a);
     try appendSelected(&plain, without, &sel, 2, a, false, a);
     try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
+}
+
+test "cloneColumnMeta keeps every statistics field, the bounds' exactness among them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const st: schema.Statistics = .{
+        .max = "b",
+        .min = "a",
+        .null_count = 3,
+        .distinct_count = 7,
+        .max_value = "y",
+        .min_value = "x",
+        .is_max_value_exact = false,
+        .is_min_value_exact = true,
+        .nan_count = 2,
+    };
+    const cm: schema.ColumnMetaData = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 10,
+        .total_uncompressed_size = 0,
+        .total_compressed_size = 0,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .statistics = st,
+    };
+    const got = (try cloneColumnMeta(a, cm)).statistics.?;
+    inline for (@typeInfo(schema.Statistics).@"struct".field_names) |name| {
+        const want = @field(st, name);
+        const have = @field(got, name);
+        if (@TypeOf(want) == ?[]const u8) {
+            try std.testing.expectEqualStrings(want.?, have.?);
+        } else try std.testing.expectEqual(want, have);
+    }
 }

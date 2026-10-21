@@ -9,6 +9,7 @@ import random
 import struct
 
 import pyarrow as pa
+import pyarrow.compute  # noqa: F401  (pa.compute)
 import pyarrow.parquet as pq
 
 import tpq as T
@@ -763,3 +764,47 @@ def _():
     return {"file": b, "runs": [
         run("count-all", ["query", "{F}", "--aggregate", "count(s) AS n"], E("eq", [{"n": 49}])),
         run("ne", ["query", "{F}", "--filter", "s != 'x'", "--aggregate", "count(*) AS n"], E("eq", [{"n": 49}]))]}
+
+
+# ================================================================ output contract (lead, 2026-10-20)
+# Without --max-memory, written bytes depend only on input + options; an explicit --max-memory may shrink row groups,
+# so bytes may depend on its value, but never on -j.
+
+BC = "writer determinism (-j / budget)"
+
+
+def contract_table(n=300_000):
+    rng = random.Random(11)
+    return pa.table({"id": pa.array(range(n), pa.int64()),
+                     "g": pa.array([rng.randrange(50) for _ in range(n)], pa.int32()),
+                     "s": pa.array([uuidish(rng, 24) if i % 3 else "x" for i in range(n)]),
+                     "d": pa.array([rng.random() for _ in range(n)], pa.float64())})
+
+
+@case("w_contract_budget_j_independent", BC, known="T9")
+def _():
+    t = contract_table()
+
+    def gen(path):
+        pq.write_table(t, path, row_group_size=t.num_rows, compression="zstd")
+
+    return {"file": gen, "cleanup": True, "runs": [
+        wrun("default", ["--scan-all", "--filter", "id >= 0"], t, mem="8G"),
+        wrun("mm-64MB", ["--scan-all", "--filter", "id >= 0", "--max-memory", "64MB"], t, mem="8G"),
+        wrun("mm-256MB", ["--scan-all", "--filter", "id >= 0", "--max-memory", "256MB"], t, mem="8G"),
+        wrun("mm-256MB-filter", ["--filter", "g < 25", "--max-memory", "256MB"],
+             lambda: t.filter(pa.compute.less(t.column("g"), 25)), mem="8G"),
+        wrun("mm-256MB-select", ["--select", "id, g * 2 AS g2, s", "--max-memory", "256MB"],
+             lambda: pa.table({"id": t.column("id"), "g2": pa.compute.multiply(t.column("g"), 2), "s": t.column("s")}),
+             mem="8G"),
+    ]}
+
+
+@case("w_contract_multi_rowgroup", BC, known="T9")
+def _():
+    # Many small row groups: the common case; no slicing should ever be needed.
+    t = contract_table(200_000)
+    return {"file": lambda p: pq.write_table(t, p, row_group_size=20_000, compression="snappy"), "cleanup": True,
+            "runs": [wrun("default", ["--scan-all", "--filter", "id >= 0"], t, mem="8G"),
+                     wrun("mm-64MB", ["--scan-all", "--filter", "id >= 0", "--max-memory", "64MB"], t, mem="8G"),
+                     wrun("copy-zstd", ["--codec", "zstd"], t, mem="8G")]}

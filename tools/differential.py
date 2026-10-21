@@ -18,6 +18,7 @@ Usage: .venv/bin/python tools/differential.py
 from cli_output import read_one, read_rows, read_summary
 import datetime
 import duckdb, subprocess, os, sys, tempfile, json
+from fractions import Fraction
 import pyarrow as pa
 import pyarrow.parquet as pq  # strict reader: DuckDB is lenient, pyarrow is not
 from oracle_compare import DUCKDB_STATS_DIVERGENCES, canon, same, self_check
@@ -109,6 +110,23 @@ SELECTS = [
     ("coal_lazy", "coalesce(id + 1, 100 / (id - id)) AS x", "id + 1 AS x"),
 ]
 
+
+def avg_dec(total, n, scale):
+    """zpq's avg over a DECIMAL as exact text: `total` (the exact sum, as text) over `n`, rounded half away from zero
+    to `scale` digits. DuckDB's own avg is a DOUBLE, so main() registers this as the oracle's `zpq_avg`."""
+    if not n:
+        return None
+    q = Fraction(Decimal(total)) / n * 10**scale
+    m = (2 * abs(q.numerator) + q.denominator) // (2 * q.denominator)
+    return f"{'-' if q < 0 else ''}{m}E-{scale}"
+
+
+def duck_avg_dec(arg, p, s):
+    """DuckDB SQL for zpq's avg over `arg`, a DECIMAL(p, s): exact, as DECIMAL(q, s + q - p), q = min(38, p + 4)."""
+    q = min(38, p + 4)
+    return f"CAST(zpq_avg(sum({arg})::VARCHAR, count({arg}), {s + q - p}) AS DECIMAL({q}, {s + q - p}))"
+
+
 # (label, zpq_agg, duckdb_select) — filter × aggregate, compared as scalars.
 AGGS = [
     ("sum_count", "sum(id) AS s, count(id) AS c", "sum(id), count(id)"),
@@ -117,6 +135,9 @@ AGGS = [
     # count(*) alone needs no column at all in a row group statistics prove fully matching.
     ("count_star", "count(*) AS n, sum(amt) AS s", "count(*), sum(amt)"),
     ("avg",       "avg(amt) AS a, min(name) AS mn", "avg(amt), min(name)"),
+    # avg over a DECIMAL is its exact mean at 4 more digits; avg_state is the pair it divides, sum then count.
+    ("avg_dec",   "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+                  f"{duck_avg_dec('price', 18, 2)}, sum(price), count(price), sum(amt), count(amt)"),
     # A computed argument that is NULL where its column is: skipped, as a bare column's NULLs are.
     ("strlen",    "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
                   "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))"),
@@ -304,11 +325,15 @@ def sql_pred_checks(con, tmp, fixture):
     return total, fails
 
 
-def fold_avg(v):
-    """avg arrives as its re-aggregatable {sum, count} pair; no values averaged means NULL."""
-    if isinstance(v, dict):
-        return v["sum"] / v["count"] if v["count"] else None
-    return v
+def split_state(row):
+    """A zpq JSON row with each avg_state {sum, count} pair as the `<name>__sum`, `<name>__count` columns of `-o`."""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, dict) and set(v) == {"sum", "count"}:
+            out[f"{k}__sum"], out[f"{k}__count"] = v["sum"], v["count"]
+        else:
+            out[k] = v
+    return out
 
 
 def canon_rows(rows, lanes=None):
@@ -758,6 +783,7 @@ def dense_domain_checks(con, tmp):
 def main():
     self_check()
     con = duckdb.connect()
+    con.create_function("zpq_avg", avg_dec, ["VARCHAR", "BIGINT", "INTEGER"], "VARCHAR")
     tmp = tempfile.mkdtemp()
     fixture = os.path.join(tmp, "diff_fixture.parquet")
     gen_fixture(con, fixture)
@@ -880,7 +906,7 @@ def main():
 
             try:
                 zout = read_one(r.stdout, parse_float=Decimal)
-                zvals = [fold_avg(v) for v in zout.values()]
+                zvals = list(split_state(zout).values())
                 proven = read_summary(r.stderr).get("row_groups_full_match", 0)
             except Exception as e:
                 print(f"  FAIL  {label}  bad json: {e}")
@@ -921,6 +947,9 @@ def main():
         ("gb_null_input", "flag", "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
          None, "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx "
          "FROM '{fixture}' GROUP BY flag"),
+        ("gb_avg_state", "flag", "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m", None,
+         "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, "
+         f"{duck_avg_dec('price', 18, 2)} AS m FROM '{{fixture}}' GROUP BY flag"),
     ]
     for glabel, gby, agg, order, d_sql in GROUP_BYS:
         for flabel, zf, dw in [("none", None, None), ("id_gt", "id > 500", "id > 500"),
@@ -959,7 +988,7 @@ def main():
                 col_names = [desc[0] for desc in duck_rel.description]
                 lanes = json_lanes(duck_rel)
                 drows = canon_rows(duck_rel.fetchall(), lanes)
-                zrows = canon_rows([from_zpq([fold_avg(row_dict.get(c)) for c in col_names], lanes)
+                zrows = canon_rows([from_zpq([split_state(row_dict).get(c) for c in col_names], lanes)
                                     for row_dict in zrows_raw], lanes)
             except Exception as e:
                 print(f"  FAIL  {label}  compare setup error: {e}")
@@ -974,8 +1003,8 @@ def main():
             else:
                 print(f"  OK    {label}  ({len(zrows)} rows)")
 
-            # `-o` writes the same groups as parquet: same column order, same values and row order as the JSON, avg
-            # split into <name>__sum / <name>__count. pyarrow is the strict reader.
+            # `-o` writes the same groups as parquet: same column order, same values and row order as the JSON,
+            # avg_state split into <name>__sum / <name>__count. pyarrow is the strict reader.
             total += 1
             out = os.path.join(tmp, "zgroup.parquet")
             if os.path.exists(out):
@@ -983,15 +1012,9 @@ def main():
             r = subprocess.run(cmd + ["-o", out], capture_output=True, text=True)
             assert not r.stdout, r.stdout
             label = f"groupby-o:{glabel:13} × {flabel:6}"
-            want_cols, want_rows = [], []
-            for c, v in (zrows_raw[0].items() if zrows_raw else []):
-                want_cols += [f"{c}__sum", f"{c}__count"] if isinstance(v, dict) else [c]
-            json_rows = []
-            for row_dict in zrows_raw:
-                vals = []
-                for v in row_dict.values():
-                    vals += [v["sum"], v["count"]] if isinstance(v, dict) else [v]
-                json_rows.append(vals)
+            want_rows = []
+            want_cols = list(split_state(zrows_raw[0])) if zrows_raw else []
+            json_rows = [list(split_state(row_dict).values()) for row_dict in zrows_raw]
             try:
                 if r.returncode != 0:
                     raise RuntimeError((r.stderr or r.stdout).strip()[:70])
@@ -1065,7 +1088,7 @@ def main():
             duck_rel = con.execute(sql)
             lanes = json_lanes(duck_rel)
             want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in duck_rel.fetchall()]
-            got = [tuple(canon(v, lanes[i]) for i, v in enumerate(from_zpq([fold_avg(v) for v in row.values()], lanes)))
+            got = [tuple(canon(v, lanes[i]) for i, v in enumerate(from_zpq(list(row.values()), lanes)))
                    for row in read_rows(r.stdout, parse_float=Decimal)]
             problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
         except Exception as e:
@@ -1196,7 +1219,7 @@ def main():
                     raise RuntimeError((r.stderr or r.stdout).strip()[:90])
                 agg = read_rows(r.stdout, parse_float=Decimal)
                 zrows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
-                got = [tuple(canon(v, lanes[k]) for k, v in enumerate(from_zpq([fold_avg(v) for v in row], lanes)))
+                got = [tuple(canon(v, lanes[k]) for k, v in enumerate(from_zpq(row, lanes)))
                        for row in zrows]
                 problem = None if got == want else f"zpq={got[:3]}.. ({len(got)}) duck={want[:3]}.. ({len(want)})"
             except Exception as e:
@@ -1503,22 +1526,25 @@ def main():
 
     # An integer avg sums exactly, so its groups take the per-worker merge, whose order varies with -j and timing. Values
     # near 2^60 put every sum far past 2^53, where a double sum would round differently in each order: the answer
-    # must come out byte for byte the same at every -j, and match DuckDB's exact sum.
+    # must come out byte for byte the same at every -j, avg as the double of DuckDB's exact sum divided by the count
+    # (DuckDB's own avg can differ in the last bit), avg_state as that double beside the count.
     huge = os.path.join(tmp, "avg_huge.parquet")
     con.execute(f"""COPY (SELECT (i % 7)::INTEGER AS g, ((1::BIGINT << 60) + i * 1000003)::BIGINT AS v,
         (i % 1000)::INTEGER AS w FROM range(0, 60000) t(i)) TO '{huge}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)""")
-    sql = f"SELECT g, avg(v) AS a, avg(w) AS b, count(*) AS n FROM '{huge}' GROUP BY g"
+    sql = f"SELECT g, avg(v) AS a, avg(w) AS b, count(*) AS n, avg_state(v) AS st FROM '{huge}' GROUP BY g"
     outs = set()
     for j in ("1", "2", "4", "16"):
         r = subprocess.run([ZPQ, "query", "--query", sql, "-j", j], capture_output=True, text=True)
         outs.add(json.dumps(read_rows(r.stdout, parse_float=Decimal), default=str) if r.returncode == 0 else f"error {r.stderr[:80]}")
     total += 1
-    want = {row[0]: row for row in con.execute(sql.replace("avg(v)", "sum(v)::HUGEINT / count(v)")).fetchall()}
+    want = {g: (float(sv), nv, float(sw) / nw) for g, sv, nv, sw, nw in con.execute(
+        f"SELECT g, sum(v)::HUGEINT, count(v), sum(w)::HUGEINT, count(w) FROM '{huge}' GROUP BY g").fetchall()}
     got = {row["g"]: row for row in json.loads(next(iter(outs)), parse_float=Decimal)} if len(outs) == 1 else {}
-    # The double of the exact sum, divided as a double: what DuckDB computes from its HUGEINT sum.
-    exact = all(float(got[g]["a"]["sum"]) / got[g]["a"]["count"] == float(want[g][1]) for g in want) if got else False
+    exact = len(got) == len(want) and all(
+        g in got and float(got[g]["a"]) == sv / nv and float(got[g]["b"]) == b
+        and float(got[g]["st"]["sum"]) == sv and got[g]["st"]["count"] == nv for g, (sv, nv, b) in want.items())
     if len(outs) == 1 and exact:
-        print(f"  OK    avg-exact: integer avg identical at -j 1/2/4/16 and equal to the exact sum's quotient")
+        print(f"  OK    avg-exact: integer avg and avg_state identical at -j 1/2/4/16, from the exact sum")
     else:
         fails += 1
         print(f"  FAIL  avg-exact: {len(outs)} distinct answers across -j; exact={exact}")
@@ -1548,7 +1574,8 @@ def main():
             rel = con.execute(sql)
             lanes = json_lanes(rel)
             want = canon_rows(rel.fetchall(), lanes)
-            got = canon_rows([from_zpq([fold_avg(v) for v in row.values()], lanes) for row in read_rows(r.stdout, parse_float=Decimal)], lanes)
+            got = canon_rows([from_zpq(list(row.values()), lanes) for row in read_rows(r.stdout, parse_float=Decimal)],
+                             lanes)
             problem = None if got == want else f"zpq={got[:3]} duck={want[:3]}"
         except Exception as e:
             problem = f"error: {e}"
@@ -1576,7 +1603,7 @@ def main():
                 want = sorted(con.execute(sql).fetchall(), key=repr)
                 agg = read_rows(r.stdout, parse_float=Decimal)
                 rows = [list(row.values()) for row in agg] if isinstance(agg, list) else [list(agg.values())]
-                got = sorted([[float(v["sum"]) / v["count"] if isinstance(v, dict) else v for v in row] for row in rows], key=repr)
+                got = sorted([from_zpq(row, None) for row in rows], key=repr)
                 ok = len(got) == len(want) and all(same(g, w) for gr, wr in zip(got, want) for g, w in zip(gr, wr))
                 problem = None if ok else f"zpq={got} duck={want}"
             except Exception as e:
@@ -1683,15 +1710,20 @@ def main():
             print(f"  FAIL  {label}  {e}")
 
     # Exact DECIMAL aggregates written with -o: DECIMAL columns of the type SQL gives the result (sum DECIMAL(38, s),
-    # min/max the argument's, avg's exact sum beside its count), read back by pyarrow and DuckDB value for value.
+    # min/max the argument's, avg its exact mean at up to 4 more digits, avg_state's exact sum beside its count), read
+    # back by pyarrow and DuckDB value for value.
     dfix = "ci/fixtures/parquet/decimal_exact.parquet"
     DEC_O = [
-        ("scalar", [], "sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, avg(dn) AS a",
-         "SELECT sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, sum(dn) AS a__sum, count(dn) AS a__count FROM '{f}'",
-         ["decimal128(38, 2)", "decimal128(38, 10)", "decimal128(38, 6)", "decimal128(38, 2)", "int64"]),
-        ("grouped", ["--group-by", "k"], "sum(d18 * q) AS p, max(dn) AS mx",
-         "SELECT k, sum(d18 * q) AS p, max(dn) AS mx FROM '{f}' GROUP BY k",
-         ["string", "decimal128(38, 6)", "decimal128(15, 2)"]),
+        ("scalar", [], "sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, avg_state(dn) AS a, avg(dn) AS m, "
+         "avg(d38) AS m38",
+         "SELECT sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, sum(dn) AS a__sum, count(dn) AS a__count, "
+         f"{duck_avg_dec('dn', 15, 2)} AS m, {duck_avg_dec('d38', 38, 10)} AS m38 FROM '{{f}}'",
+         ["decimal128(38, 2)", "decimal128(38, 10)", "decimal128(38, 6)", "decimal128(38, 2)", "int64",
+          "decimal128(19, 6)", "decimal128(38, 10)"]),
+        # Group "a" has no non-NULL dn: its mean is NULL.
+        ("grouped", ["--group-by", "k"], "sum(d18 * q) AS p, max(dn) AS mx, avg(dn) AS m",
+         f"SELECT k, sum(d18 * q) AS p, max(dn) AS mx, {duck_avg_dec('dn', 15, 2)} AS m FROM '{{f}}' GROUP BY k",
+         ["string", "decimal128(38, 6)", "decimal128(15, 2)", "decimal128(19, 6)"]),
     ]
     for dlabel, extra, za, dsql, want_types in DEC_O:
         total += 1
@@ -1764,7 +1796,7 @@ def main():
             else:
                 agg = read_rows(r.stdout, parse_float=Decimal)
                 rows = agg if isinstance(agg, list) else [agg]
-                got = canon_rows([from_zpq([fold_avg(row.get(c)) for c in cols], lanes) for row in rows], lanes)
+                got = canon_rows([from_zpq([row.get(c) for c in cols], lanes) for row in rows], lanes)
             if got != want:
                 raise RuntimeError(f"zpq={got[:2]} duck={want[:2]} ({len(got)} vs {len(want)})")
             print(f"  OK    {label}  ({len(got)} rows)")

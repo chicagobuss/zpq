@@ -30,12 +30,20 @@ usage:
                  stdout, but refuses a terminal. No extension inference.
                  `csv` is RFC 4180 with a header row: NULL an empty
                  field, "" an empty string, DATE/TIME/TIMESTAMP as ISO
-                 text (`Z` when UTC), an average as <name>__sum and
+                 text (`Z` when UTC), an avg_state as <name>__sum and
                  <name>__count; bytes as below, objects as their JSON.
                  Bytes print as text when UTF-8, else {"base64":...};
                  BSON/GEOMETRY/GEOGRAPHY always {"base64":...}; UUID
                  8-4-4-4-12; INTERVAL an object. Non-UTF-8 STRING:
                  exit 1 (docs/binary-output.md).
+  --aggregate    sum, count, min, max, avg; count(DISTINCT x); avg_state.
+                 avg(x) is the mean, NULL over no values: DOUBLE, or
+                 for DECIMAL(p,s) DECIMAL(q, s+q-p) with q = min(38,
+                 p+4) (p = 38 keeps the input type), rounded half
+                 away from zero. avg_state(x) is the mergeable pair:
+                 {"sum":..,"count":..} in JSON, <name>__sum and
+                 <name>__count columns in CSV and Parquet; merge
+                 files with sum(<name>__sum) / sum(<name>__count).
   --limit        cap final answer rows, including aggregates and files.
                  SQL LIMIT has the same meaning; do not combine them.
   --summary=json emit a typed summary on stderr after output completes;

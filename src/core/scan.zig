@@ -306,16 +306,17 @@ pub const AggValue = union(enum) {
     /// representable (DuckDB likewise widens int SUM to HUGEINT). Counts and
     /// signed i64 values widen in losslessly.
     i: i128,
-    /// Single f64 result (float sum/min/max).
+    /// Single f64 result (float sum/min/max, avg's mean).
     f: f64,
-    /// Avg's split-output: ship sum + count, caller divides at end. The sum is
-    /// NULL when count is 0, as sum() over no values is.
+    /// avg_state's split-output: ship sum + count, caller divides at end. The sum
+    /// is NULL when count is 0, as sum() over no values is.
     avg: struct { sum: ?f64, count: i64 },
     /// String (bytewise/unsigned) min/max result or string group key. Owned by the `AggOutput` holding it.
     s: []const u8,
-    /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL.
+    /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL. Also avg's mean.
     dec: DecValue,
-    /// avg over a DECIMAL: the exact sum and count, which re-aggregate, and the mean rounded to the argument's type.
+    /// avg_state over a DECIMAL: the exact sum and count, which re-aggregate, and the mean rounded to the argument's
+    /// type, which only ranks and filters (HAVING) the rows, never printed.
     /// The sum may pass 38 digits while the mean fits (two values near 10^38); JSON prints it whole, and only `-o`,
     /// whose `__sum` column is DECIMAL(38, s), refuses it. `sum` and `mean` are NULL when count is 0.
     avg_dec: struct { sum: ?i192, count: i64, mean: ?i128, spec: expr_ast.Dec },
@@ -4018,9 +4019,9 @@ fn prepareAggregate(
                     .i64 => .i64,
                     .f64 => .f64,
                     .bytes => .string,
-                    .avg_f64 => .avg,
+                    .avg_f64 => if (agg_calls[a_idx].state) .avg else .f64,
                     .dec => .dec,
-                    .avg_dec => .avg_dec,
+                    .avg_dec => if (agg_calls[a_idx].state) .avg_dec else .dec,
                 },
                 .dec = switch (agg_calls[a_idx].result) {
                     .dec, .avg_dec => expr_agg.resultDec(agg_calls[a_idx]),
@@ -4566,7 +4567,7 @@ pub const TypedAnswer = struct {
         f64: Lane(f64),
         string: Lane([]const u8),
         dec: Lane(i128),
-        /// avg's re-aggregatable pair, written as `<name>__sum` and `<name>__count`.
+        /// avg_state's re-aggregatable pair, written as `<name>__sum` and `<name>__count`.
         avg: struct { sum: Lane(f64), count: []i64 },
         avg_dec: struct { sum: Lane(i128), count: []i64 },
     };
@@ -5872,7 +5873,7 @@ fn rankValue(acc: expr_agg.Accumulator, call: expr_agg.AggCall) !SortKey {
         else
             .none,
         .sum_d => |d| decimalRank(try d.result(), call),
-        .avg_d => |d| decimalRank(try d.mean(), call),
+        .avg_d => |d| decimalRank(try expr_agg.avgDecMean(call, d), call),
         .min_d, .max_d => |v| decimalRank(v, call),
         else => unreachable,
     };
@@ -7068,13 +7069,24 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
             .dec => decValue(state.max_d, expr_agg.resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
-        .avg => if (call.result == .avg_dec) .{ .avg_dec = .{
-            .sum = state.avg_d.wide(),
-            .count = @intCast(state.avg_d.n),
-            .mean = try state.avg_d.mean(),
-            .spec = expr_agg.resultDec(call),
-        } } else .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } },
+        .avg => if (call.state)
+            try avgStateValue(call, state)
+        else if (call.result == .avg_dec)
+            decValue(try expr_agg.avgDecMean(call, state.avg_d), expr_agg.resultDec(call))
+        else if (expr_agg.avgMean(state.avg)) |m| .{ .f = m } else .null_val,
     };
+}
+
+/// avg_state's mergeable pair. A DECIMAL one keeps its mean at the argument's scale only to rank and filter by.
+fn avgStateValue(call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
+    if (call.result != .avg_dec)
+        return .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } };
+    return .{ .avg_dec = .{
+        .sum = state.avg_d.wide(),
+        .count = @intCast(state.avg_d.n),
+        .mean = try state.avg_d.mean(),
+        .spec = expr_agg.resultDec(call),
+    } };
 }
 
 // ============================================================
@@ -9892,7 +9904,7 @@ test "ordered GROUP BY: groups as they first appear, and the same float bits at 
             if (first) |f| {
                 for (rows, f.output.group_rows.?) |r, fr| {
                     try testing.expectEqual(@as(u64, @bitCast(fr[1].f)), @as(u64, @bitCast(r[1].f)));
-                    try testing.expectEqual(@as(u64, @bitCast(fr[2].avg.sum.?)), @as(u64, @bitCast(r[2].avg.sum.?)));
+                    try testing.expectEqual(@as(u64, @bitCast(fr[2].f)), @as(u64, @bitCast(r[2].f)));
                     try testing.expectEqual(fr[3].i, r[3].i);
                 }
                 freeResult(res);
@@ -9930,7 +9942,8 @@ test "regression: float sums and avgs keep their bits at every -j, budget, decod
                     .inputs = &inputs,
                     // Computed arguments over the coded column: one gathered under a sparse filter, one that may be
                     // NULL and so evaluates in place.
-                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t, sum(CASE WHEN i > 3 THEN x END) AS u",
+                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t, sum(CASE WHEN i > 3 THEN x END) AS u, " ++
+                        "avg_state(x) AS st",
                     .group_by = shape.group_by,
                     .filter = shape.filter,
                     .parallelism = j,
@@ -11136,14 +11149,18 @@ test "DECIMAL aggregates and arithmetic are exact, on every decode path and work
         .{ .alias = "co", .v = 3670000, .p = 38, .s = 2 },
         .{ .alias = "cc", .v = 3649800, .p = 38, .s = 2 },
         // avg keeps the argument's type, rounded half away from zero: 36700.00 / 133 = 275.939...
-        .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
+        // avg over DECIMAL(15,2) is DECIMAL(19,6); over DECIMAL(38,10) its own type. avg_state ranks by the mean
+        // at the argument's scale.
+        .{ .alias = "adn", .v = 275939850, .p = 19, .s = 6 },
         .{ .alias = "a38", .v = 1495000000000, .p = 38, .s = 10 },
+        .{ .alias = "sadn", .v = 27594, .p = 15, .s = 2 },
     };
     const aggregate =
         "sum(d9) AS s9, min(d9) AS mn9, max(d9) AS mx9, sum(d18) AS s18, sum(d38) AS s38, min(d38) AS mn38, " ++
         "max(d38) AS mx38, sum(dn) AS sdn, sum(q) AS sq, sum(d9 * d18) AS p, sum(d9 + i) AS di, " ++
         "sum(d9 * i) AS dti, sum(d38 - d9) AS dd, sum(d9 * 1.5) AS dlit, sum(i * 1.5) AS ilit, sum(-d9) AS neg, " ++
-        "sum(coalesce(dn, 0)) AS co, sum(coalesce(dn, d9)) AS cc, avg(dn) AS adn, avg(d38) AS a38";
+        "sum(coalesce(dn, 0)) AS co, sum(coalesce(dn, d9)) AS cc, avg(dn) AS adn, avg(d38) AS a38, " ++
+        "avg_state(dn) AS sadn";
     for ([_]bool{ true, false }) |encoded| for ([_]usize{ 1, 3 }) |j| {
         try expectDecimalAnswers(.{
             .inputs = &inputs,
@@ -11212,14 +11229,15 @@ test "DECIMAL aggregates over no values are NULL, and GROUP BY a DECIMAL key is 
     // Row group 1 holds only NULL `dn`.
     const empty = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
         .inputs = &inputs,
-        .aggregate = "sum(dn) AS s, min(dn) AS m, avg(dn) AS a",
+        .aggregate = "sum(dn) AS s, min(dn) AS m, avg(dn) AS a, avg_state(dn) AS st",
         .filter = "i >= -50 AND i < 50",
         .parallelism = 1,
     });
     defer freeResult(empty);
     try testing.expect(empty.output.aggs[0].value == .null_val);
     try testing.expect(empty.output.aggs[1].value == .null_val);
-    const a = empty.output.aggs[2].value.avg_dec;
+    try testing.expect(empty.output.aggs[2].value == .null_val);
+    const a = empty.output.aggs[3].value.avg_dec;
     try testing.expect(a.sum == null and a.mean == null and a.count == 0);
 
     const grouped = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
@@ -11275,7 +11293,7 @@ test "a decode budget slices wide row groups, FIXED_LEN_BYTE_ARRAY DECIMAL inclu
         .{ .alias = "s9", .v = -15150, .p = 38, .s = 2 },
         .{ .alias = "s38", .v = 448500000000000, .p = 38, .s = 10 },
         .{ .alias = "p", .v = 209832550, .p = 38, .s = 6 },
-        .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
+        .{ .alias = "adn", .v = 275939850, .p = 19, .s = 6 },
     };
     const aggregate = "sum(d9) AS s9, sum(d38) AS s38, sum(d9 * d18) AS p, avg(dn) AS adn";
     // Unbounded; then budgets too small for a whole row group per worker, down to a few rows a slice.
@@ -12652,7 +12670,7 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
         .{ .sum_d = .{ .lo = 12345, .n = 2 } },
         .{ .avg_d = .{ .lo = @bitCast(@as(i128, -5)), .hi = -1, .n = 2 } },
     };
-    for (states) |state| {
+    for (states) |state| for ([_]bool{ false, true }) |avg_state| {
         const dec = state == .min_d or state == .max_d or state == .sum_d or state == .avg_d;
         const func: expr_agg.AggFunc = switch (state) {
             .min_i, .min_d => .min,
@@ -12669,11 +12687,12 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
                 (if (dec) .avg_dec else .avg_f64)
             else
                 (if (dec) .dec else .i64),
+            .state = avg_state and func == .avg,
         };
         const got = try rankValue(state, call);
         const want = sortKey(try materializeOne(testing.allocator, call, state));
         for ([_]bool{ false, true }) |desc| try testing.expectEqual(.eq, orderSortKeys(want, got, desc));
-    }
+    };
     const avg_call: expr_agg.AggCall = .{
         .func = .avg,
         .arg = int_arg,
@@ -12693,7 +12712,13 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
         .alias = "a",
         .result = .avg_dec,
     };
-    const rounded = try rankValue(states[8], dec_call);
+    // -0.00025: avg's mean at DECIMAL(22, 8); avg_state ranks by it rounded to the argument's scale.
+    const exact = try rankValue(states[8], dec_call);
+    try testing.expectEqual(@as(i128, -25000), exact.dec.v);
+    try testing.expectEqual(@as(u8, 8), exact.dec.spec.scale);
+    var state_call = dec_call;
+    state_call.state = true;
+    const rounded = try rankValue(states[8], state_call);
     try testing.expectEqual(@as(i128, -3), rounded.dec.v);
     try testing.expectEqual(@as(u8, 4), rounded.dec.spec.scale);
 }
@@ -12705,13 +12730,15 @@ test "result cut extrema AVG DECIMAL: scans match full stable order at j1 j3 j8"
             .keys = &.{"s"},
             .aggs = &.{
                 "min(t - 30) FILTER (WHERE n = 1) AS rank", "max(t - 30) FILTER (WHERE n = 1) AS rank",
-                "avg(t - 30) FILTER (WHERE n = 1) AS rank",
+                "avg(t - 30) FILTER (WHERE n = 1) AS rank", "avg_state(t - 30) FILTER (WHERE n = 1) AS rank",
             },
         },
         .{
             .path = decimal_exact_fixture,
             .keys = &.{ "k", "i" },
-            .aggs = &.{ "sum(d38) AS rank", "min(dn) AS rank", "max(dn) AS rank", "avg(dn) AS rank" },
+            .aggs = &.{
+                "sum(d38) AS rank", "min(dn) AS rank", "max(dn) AS rank", "avg(dn) AS rank", "avg_state(dn) AS rank",
+            },
         },
     };
     for (fixtures) |fixture| {

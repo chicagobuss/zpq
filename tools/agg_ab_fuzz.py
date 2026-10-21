@@ -12,17 +12,10 @@ import argparse, decimal, json, os, random, subprocess, sys, tempfile
 import numpy as np, pyarrow as pa, pyarrow.parquet as pq
 
 
-def norm_value(v):
-    if isinstance(v, dict) and set(v) == {"sum", "count"}:  # avg partial
-        return v["sum"] / v["count"] if v["count"] else None
-    return v
-
-
 def norm_result(r, group):
     if isinstance(r, list):
-        rows = [{k: norm_value(v) for k, v in row.items()} for row in r]
-        return sorted(rows, key=lambda row: tuple(str(row[g]) for g in group))
-    return {k: norm_value(v) for k, v in r.items()}
+        return sorted(r, key=lambda row: tuple(str(row[g]) for g in group))
+    return r
 
 
 def same(a, b):
@@ -83,7 +76,7 @@ GROUPS = ["k1", "k2", "s", "k3", "u32", "dec", "vn"]
 def rand_query(r):
     aggs = []
     for i in range(r.randint(1, 4)):
-        f = r.choice(["count", "sum", "min", "max", "avg", "countstar"])
+        f = r.choice(["count", "sum", "min", "max", "avg", "avg_state", "countstar"])
         if f == "countstar":
             a = "count(*)"
         elif f in ("min", "max", "count") and r.random() < 0.3:
@@ -91,7 +84,7 @@ def rand_query(r):
         else:
             c = r.choice(NUM)
             # Arithmetic, over nullable operands too (`vn`, `vi`): a NULL on either side is NULL, which folds skip.
-            if r.random() < 0.2 and f in ("sum", "min", "max", "avg", "count"):
+            if r.random() < 0.2 and f in ("sum", "min", "max", "avg", "avg_state", "count"):
                 c = f"{r.choice(['vf', 'dec', 'k2', 'vn', 'vi'])} {r.choice(['*', '+', '-'])} {r.choice(['vf', 'k2', 'mid', 'vn'])}"
             a = f"{f}({c})"
         if r.random() < 0.15:

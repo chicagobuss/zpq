@@ -12,8 +12,8 @@
 //! `--filter`: the per-agg SelectionVector starts as a copy of the
 //! query's surviving rows, then ANDs in the per-agg predicate.
 //!
-//! The output of an aggregate workload is a 1-row parquet file. For
-//! sum/count/min/max we emit one column per agg. For avg we emit two
+//! The output of an aggregate workload is a 1-row parquet file, one
+//! column per agg; avg is its finalized mean. `avg_state` emits two
 //! columns (`<alias>__sum`, `<alias>__count`) so downstream re-
 //! aggregation across N files preserves the algebra: a tier-2
 //! re-aggregate is `sum(<alias>__sum) / sum(<alias>__count)`. You
@@ -77,30 +77,58 @@ pub const AggCall = struct {
     /// Added to every value `sum` folds: `sum(x + c)` folds `x` and adds `c` per value, as many times as there are
     /// values, so the constant is never materialized per row (see the parser's `sumOffset`).
     offset: i64 = 0,
+    /// `avg_state(x)`: an avg that answers its mergeable sum and count instead of the mean. It folds exactly as
+    /// `avg(x)` does (same `func` and `result`); only what it answers differs.
+    state: bool = false,
 };
 
-/// What an aggregate emits in the final 1-row parquet:
+/// How an aggregate folds, and what it emits in the final 1-row parquet:
 ///   - single i64: count, sum/min/max of integer columns
-///   - single f64: sum/min/max of float columns
-///   - two-column avg: `<alias>__sum: f64` + `<alias>__count: i64`
-///   - exact DECIMAL sum/min/max, and avg's DECIMAL sum beside its count
+///   - single f64: sum/min/max of float columns, avg's mean of a non-DECIMAL argument
+///   - exact DECIMAL sum/min/max, and avg's mean of a DECIMAL argument (`avgDec`)
+///   - avg_state's pair: `<alias>__sum` (f64, or DECIMAL(38, s)) + `<alias>__count: i64`
 pub const ResultShape = enum {
     i64,
     f64,
+    /// avg over a non-DECIMAL argument: a DOUBLE mean, or avg_state's f64 sum and count.
     avg_f64,
     /// String (BYTE_ARRAY/UTF8) min/max — bytewise/unsigned order.
     bytes,
     /// DECIMAL sum (DECIMAL(38, s)), min or max (the argument's type): exact. See `resultDec`.
     dec,
-    /// avg over a DECIMAL: the exact sum and count, and the mean rounded to the argument's type.
+    /// avg over a DECIMAL: the exact sum and count, folded to the mean (`avgDec`) or answered as avg_state's pair.
     avg_dec,
 };
 
 /// The DECIMAL type a `.dec`/`.avg_dec` call's result has: sum widens to 38 digits at the argument's scale, as
-/// DuckDB and Trino type it; min, max and avg keep the argument's type (avg rounds to it, as Trino does).
+/// DuckDB and Trino type it; min, max and avg_state (whose pair re-aggregates at it) keep the argument's type; avg's
+/// mean is `avgDec` of it.
 pub fn resultDec(call: AggCall) expr_ast.Dec {
     const arg = call.arg.?.decSpec().?;
+    if (call.func == .avg and !call.state) return avgDec(arg);
     return if (call.func == .sum) arg.sum() else arg;
+}
+
+/// avg over DECIMAL(p, s) answers DECIMAL(p', s + p' - p), p' = min(38, p + 4): up to 4 more fractional digits, as
+/// DataFusion's (p + 4, s + 4) whenever p <= 34, but never fewer integer digits, so at p = 38 the argument's own type,
+/// as Trino types it. Never overflows: |mean| <= max |v|, which lies on the s grid and so on the finer s' one, and
+/// rounding half away from zero to that grid cannot pass it.
+pub fn avgDec(arg: expr_ast.Dec) expr_ast.Dec {
+    const p = @min(expr_ast.Dec.max_precision, arg.precision + 4);
+    return .{ .precision = p, .scale = arg.scale + (p - arg.precision) };
+}
+
+/// avg's answer over a non-DECIMAL argument: the avg_state sum over its count, so a reader dividing the pair gets
+/// every bit of it; NULL over no values.
+pub fn avgMean(st: AvgState) ?f64 {
+    const sum = avgSum(st) orelse return null;
+    return sum / @as(f64, @floatFromInt(st.count));
+}
+
+/// The rounded DECIMAL mean `call` ranks and answers by: at `avgDec` scale for avg, at the argument's for avg_state.
+pub fn avgDecMean(call: AggCall, st: DecSum) expr_eval.Error!?i128 {
+    const arg = call.arg.?.decSpec().?;
+    return st.meanAt(resultDec(call).scale - arg.scale);
 }
 
 /// An exact DECIMAL sum. Wide enough that no run of i128 values can overflow it before 2^64 of them, so only the
@@ -136,11 +164,24 @@ pub const DecSum = struct {
 
     /// The mean rounded half away from zero to the argument's scale (Trino's rule for avg over a DECIMAL).
     pub fn mean(self: DecSum) expr_eval.Error!?i128 {
+        return self.meanAt(0);
+    }
+
+    /// The mean at `shift` more digits of scale (at most 4), rounded half away from zero. |sum| * 10^shift can pass
+    /// 192 bits, so it divides the whole quotient first: the remainder is under 2^64, its shifted double under 2^79.
+    pub fn meanAt(self: DecSum, shift: u8) expr_eval.Error!?i128 {
+        std.debug.assert(shift <= 4);
         if (self.n == 0) return null;
         const v = self.get();
         const n: u192 = self.n;
-        const q: i192 = @intCast((2 * @abs(v) + n) / (2 * n));
-        return try fit38(if (v < 0) -q else q);
+        const q = @abs(v) / n;
+        const r: u128 = @intCast(@abs(v) % n);
+        const scale: u128 = @intCast(expr_ast.pow10(shift));
+        const frac = (2 * r * scale + self.n) / (2 * @as(u128, self.n));
+        const whole = std.math.mul(u192, q, scale) catch return error.DecimalOverflow;
+        const m = std.math.add(u192, whole, frac) catch return error.DecimalOverflow;
+        const x = std.math.cast(i192, m) orelse return error.DecimalOverflow;
+        return try fit38(if (v < 0) -x else x);
     }
 };
 
@@ -2266,8 +2307,8 @@ fn foldAvg(
 
 /// Materialize one agg's accumulator into one or two `Batch.Column`s
 /// for the final 1-row output. Allocates from `arena`. Returns a
-/// slice of `OutputCol` (length 1 for sum/count/min/max, length 2 for
-/// avg's split-output shape).
+/// slice of `OutputCol` (length 1 for every agg but avg_state, length 2
+/// for its split-output shape).
 pub const OutputCol = struct {
     name: []const u8,
     col: filter_eval.Batch.Column,
@@ -2314,10 +2355,15 @@ pub fn finalize(
             .dec => try emitOneDec(arena, call.alias, state.max_d, resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
-        .avg => if (call.result == .avg_dec)
-            try emitAvgDecPair(arena, call.alias, state.avg_d, resultDec(call))
+        .avg => if (call.state)
+            (if (call.result == .avg_dec)
+                try emitAvgDecPair(arena, call.alias, state.avg_d, resultDec(call))
+            else
+                try emitAvgPair(arena, call.alias, state.avg))
+        else if (call.result == .avg_dec)
+            try emitOneDec(arena, call.alias, try avgDecMean(call, state.avg_d), resultDec(call))
         else
-            try emitAvgPair(arena, call.alias, state.avg),
+            try emitOneF64(arena, call.alias, avgMean(state.avg)),
     };
 }
 
@@ -2334,7 +2380,8 @@ fn emitOneDec(arena: std.mem.Allocator, name: []const u8, v: ?i128, spec: expr_a
     return out;
 }
 
-/// avg over a DECIMAL as `<alias>__sum` (DECIMAL(38, s), exact) and `<alias>__count`, which re-aggregate exactly.
+/// avg_state over a DECIMAL as `<alias>__sum` (DECIMAL(38, s), exact) and `<alias>__count`, which re-aggregate
+/// exactly.
 fn emitAvgDecPair(arena: std.mem.Allocator, name: []const u8, st: DecSum, spec: expr_ast.Dec) Error![]OutputCol {
     const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
     const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
@@ -2419,8 +2466,8 @@ fn emitOneF64(arena: std.mem.Allocator, name: []const u8, v: ?f64) Error![]Outpu
 
 fn emitAvgPair(arena: std.mem.Allocator, name: []const u8, st: AvgState) Error![]OutputCol {
     // Two columns: <alias>__sum (DOUBLE) and <alias>__count (INT64).
-    // Caller running `zpq query --aggregate "avg(...) AS x"` over the
-    // tier-1 outputs gets sum(x__sum) / sum(x__count) — algebraically
+    // Caller running `zpq query --aggregate "avg_state(...) AS x"` over
+    // the tier-1 outputs gets sum(x__sum) / sum(x__count) — algebraically
     // correct re-aggregation. With no values the sum is NULL like sum()'s,
     // and the count 0 like count()'s.
     const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
@@ -2433,7 +2480,7 @@ fn emitAvgPair(arena: std.mem.Allocator, name: []const u8, st: AvgState) Error![
     return out;
 }
 
-/// The avg pair's sum, NULL when no value was averaged.
+/// The avg_state pair's sum, NULL when no value was averaged.
 pub fn avgSum(st: AvgState) ?f64 {
     return if (st.count == 0) null else st.sum + @as(f64, @floatFromInt(st.isum));
 }
@@ -2793,7 +2840,7 @@ test "prepared aggregate input owns its widened copy and nothing it borrows" {
     try testing.expect(sel.isActive(1));
 }
 
-test "avg emits sum + count pair" {
+test "avg emits its mean; avg_state the sum + count pair" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2821,12 +2868,97 @@ test "avg emits sum + count pair" {
     try testing.expectEqual(@as(f64, 10.0), state.avg.sum);
     try testing.expectEqual(@as(u64, 4), state.avg.count);
 
-    const out = try finalize(a, call, state);
+    const mean = try finalize(a, call, state);
+    try testing.expectEqual(@as(usize, 1), mean.len);
+    try testing.expectEqualStrings("mean_x", mean[0].name);
+    try testing.expectEqual(schema.Type.DOUBLE, mean[0].parquet_type);
+    try testing.expect(mean[0].nullable);
+    try testing.expectEqual(@as(f64, 2.5), mean[0].col.f64.values[0]);
+
+    var state_call = call;
+    state_call.state = true;
+    const out = try finalize(a, state_call, state);
     try testing.expectEqual(@as(usize, 2), out.len);
     try testing.expectEqualStrings("mean_x__sum", out[0].name);
     try testing.expectEqualStrings("mean_x__count", out[1].name);
     try testing.expectEqual(@as(f64, 10.0), out[0].col.f64.values[0]);
     try testing.expectEqual(@as(i64, 4), out[1].col.i64.values[0]);
+}
+
+test "avg over DECIMAL(p, s) types as DECIMAL(min(38, p + 4), s + that widening)" {
+    const Case = struct { p: u8, s: u8, want_p: u8, want_s: u8 };
+    for ([_]Case{
+        .{ .p = 9, .s = 2, .want_p = 13, .want_s = 6 },
+        .{ .p = 34, .s = 0, .want_p = 38, .want_s = 4 },
+        .{ .p = 34, .s = 33, .want_p = 38, .want_s = 37 },
+        .{ .p = 35, .s = 0, .want_p = 38, .want_s = 3 },
+        .{ .p = 35, .s = 34, .want_p = 38, .want_s = 37 },
+        .{ .p = 36, .s = 35, .want_p = 38, .want_s = 37 },
+        .{ .p = 38, .s = 0, .want_p = 38, .want_s = 0 },
+        .{ .p = 38, .s = 37, .want_p = 38, .want_s = 37 },
+        .{ .p = 38, .s = 38, .want_p = 38, .want_s = 38 },
+    }) |c| {
+        const got = avgDec(.{ .precision = c.p, .scale = c.s });
+        try testing.expectEqual(c.want_p, got.precision);
+        try testing.expectEqual(c.want_s, got.scale);
+        // Never fewer integer digits than the argument's, so no mean of its values overflows.
+        try testing.expectEqual(c.p - c.s, got.precision - got.scale);
+    }
+}
+
+test "DecSum.meanAt rounds half away from zero at up to 4 more digits, past 192-bit products" {
+    const Case = struct { sum: i192, n: u64, shift: u8, want: ?i128 };
+    const big: i192 = expr_ast.pow10(37);
+    for ([_]Case{
+        .{ .sum = 0, .n = 0, .shift = 4, .want = null },
+        .{ .sum = 10, .n = 4, .shift = 0, .want = 3 }, // 2.5 -> 3
+        .{ .sum = -10, .n = 4, .shift = 0, .want = -3 },
+        .{ .sum = 10, .n = 4, .shift = 4, .want = 25_000 },
+        .{ .sum = 2, .n = 3, .shift = 4, .want = 6_667 }, // 0.66666.. -> 0.6667
+        .{ .sum = -2, .n = 3, .shift = 4, .want = -6_667 },
+        .{ .sum = 1, .n = 80_000, .shift = 4, .want = 0 }, // 0.0000125 -> 0.0000
+        .{ .sum = 1, .n = 20_000, .shift = 4, .want = 1 }, // 0.00005 -> 0.0001
+        .{ .sum = -1, .n = 20_000, .shift = 4, .want = -1 },
+        // DECIMAL(38, 0) values near 10^37: the sum passes 38 digits, the mean is the input's exact value.
+        .{ .sum = 3 * big, .n = 3, .shift = 0, .want = @intCast(big) },
+        // DECIMAL(36, 35) mean of 5: at scale 37 it is 5 * 10^37 unscaled, which fits 38 digits.
+        .{ .sum = 2 * 5 * expr_ast.pow10(35), .n = 2, .shift = 2, .want = 5 * expr_ast.pow10(37) },
+        // 2^64 - 1 values of nearly 10^38 - 1, as the widest sum DecSum holds: |sum| * 10^4 needs 205 bits.
+        .{
+            .sum = (expr_ast.pow10(38) - 1) * @as(i192, std.math.maxInt(u64)),
+            .n = std.math.maxInt(u64),
+            .shift = 0,
+            .want = expr_ast.pow10(38) - 1,
+        },
+        .{
+            .sum = -(expr_ast.pow10(34) - 1) * @as(i192, std.math.maxInt(u64)),
+            .n = std.math.maxInt(u64),
+            .shift = 4,
+            .want = -(expr_ast.pow10(34) - 1) * 10_000,
+        },
+    }) |c| {
+        var d: DecSum = .{};
+        if (c.n > 0) d.add(c.sum, c.n);
+        try testing.expectEqual(c.want, try d.meanAt(c.shift));
+    }
+    // Against the 256-bit definition, round(|sum| * 10^shift / n) with its sign.
+    var rng = std.Random.DefaultPrng.init(0xa5_9d_ec);
+    const r = rng.random();
+    for (0..20_000) |_| {
+        const n = r.intRangeAtMost(u64, 1, if (r.boolean()) 1000 else std.math.maxInt(u64));
+        const shift = r.intRangeAtMost(u8, 0, 4);
+        const bound: i192 = expr_ast.pow10(r.intRangeAtMost(u8, shift + 1, 38));
+        // A mean under 10^(38 - shift) - 1, so the shifted, rounded one fits.
+        const per: i192 = @divTrunc(bound, @as(i192, expr_ast.pow10(shift))) - 1;
+        const sum = r.intRangeLessThan(i192, -per, per) * @as(i192, n) + r.intRangeLessThan(i192, 0, @as(i192, n));
+        var d: DecSum = .{};
+        d.add(sum, n);
+        const num = @as(u256, @abs(sum)) * @as(u256, @intCast(expr_ast.pow10(shift)));
+        const q: i256 = @intCast((2 * num + n) / (2 * @as(u256, n)));
+        const want: i128 = @intCast(if (sum < 0) -q else q);
+        try testing.expectEqual(@as(?i128, want), try d.meanAt(shift));
+        if (shift == 0) try testing.expectEqual(@as(?i128, want), try d.mean());
+    }
 }
 
 test "canStatShortCircuit eligibility rules" {
@@ -3513,6 +3645,11 @@ test "sum/avg/min/max over no values are NULL; count is 0" {
         .{ .call = .{ .func = .sum, .arg = f_null, .where = null, .alias = "a", .result = .f64 }, .sel = &all },
         .{ .call = .{ .func = .min, .arg = f_null, .where = null, .alias = "b", .result = .f64 }, .sel = &all },
         .{ .call = .{ .func = .avg, .arg = f_null, .where = null, .alias = "c", .result = .avg_f64 }, .sel = &all },
+        .{
+            .call = .{ .func = .avg, .arg = f_null, .where = null, .alias = "c", .result = .avg_f64, .state = true },
+            .sel = &all,
+        },
+        .{ .call = .{ .func = .avg, .arg = i_col, .where = never, .alias = "c", .result = .avg_f64 }, .sel = &all },
         // zero rows selected by the outer filter
         .{ .call = .{ .func = .sum, .arg = i_col, .where = null, .alias = "d", .result = .i64 }, .sel = &none },
         .{ .call = .{ .func = .max, .arg = i_col, .where = null, .alias = "e", .result = .i64 }, .sel = &none },
@@ -3527,7 +3664,7 @@ test "sum/avg/min/max over no values are NULL; count is 0" {
         // A second, equally empty partial merged in must not turn NULL into 0.
         try state.merge(Accumulator.init(c.call), a);
         const outs = try finalize(a, c.call, state);
-        // avg's count column stays a REQUIRED 0; every other output is a NULL.
+        // avg_state's count column stays a REQUIRED 0; every other output, avg's mean too, is a NULL.
         for (outs) |o| {
             if (std.mem.endsWith(u8, o.name, "__count")) {
                 try testing.expect(!o.nullable);

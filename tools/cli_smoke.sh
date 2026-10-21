@@ -536,3 +536,5 @@ echo "CLI smoke: PASS"
 
 # Format metadata and text regressions require both independent readers.
 "$PY" tests/format_correctness.py "$ZPQ"
+# avg / avg_state in every format, type and path, Parquet read back by both readers.
+"$PY" tests/avg_contract.py "$ZPQ"

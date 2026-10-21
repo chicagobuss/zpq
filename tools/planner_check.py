@@ -55,10 +55,6 @@ for template in queries:
     for workers in (1, 3, 8):
         for encoded in ("0", "1"):
             result = run(sql, workers, overrides={"ZPQ_ENCODED": encoded})
-            for row in result:
-                if isinstance(row.get("av"), dict):
-                    avg = row["av"]
-                    row["av"] = avg["sum"] / avg["count"] if avg["count"] else None
             assert result == truth, (workers, encoded, sql, result[:3], truth[:3])
 
 # Dictionary statistics must never need a data page. Preserve dictionaries, poison all data-page spans.
@@ -103,11 +99,7 @@ truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) AS
 for workers in (1, 4):
     for census in ("0", "1"):
         result = run(sql, workers, overrides={"ZPQ_SKETCH_CENSUS": census})
-        rows = result
-        for row in rows:
-            avg = row["av"]
-            row["av"] = avg["sum"] / avg["count"] if avg["count"] else None
-        assert [tuple(row[c] for c in ("k", "c", "s", "av", "mn", "mx")) for row in rows] == truth, result
+        assert [tuple(row[c] for c in ("k", "c", "s", "av", "mn", "mx")) for row in result] == truth, result
 
 # Raw fixed-width keys can permit a conditional census, without claiming uniqueness in explain.
 raw = Path(directory) / "planner_census_raw.parquet"

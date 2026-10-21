@@ -44,6 +44,8 @@ STUDY = [
     "SELECT count(*) AS n FROM {t} WHERE name NOT IN ('n1', NULL)",
     "SELECT k, count(*) AS n FROM {t} WHERE k BETWEEN 2 AND 9 GROUP BY k ORDER BY k DESC LIMIT 3",
     "SELECT sum(money) AS s FROM {t}",
+    "SELECT avg(money) AS a, avg_state(money) AS st, avg_state(v) AS sv FROM {t}",
+    "SELECT k, avg(money) AS a, avg_state(v) AS s FROM {t} GROUP BY k ORDER BY a DESC LIMIT 5",
     "SELECT k, sum(money) AS s FROM {t} GROUP BY k ORDER BY s DESC LIMIT 7",
     "SELECT id AS quoted, v FROM {t} WHERE id < 7 ORDER BY 1 DESC",
     "SELECT id FROM {t} WHERE id < 0",

@@ -831,11 +831,12 @@ fn parseAggCall(
     lex: *Lexer,
     file: *const schema.FileMetaData,
 ) Error!agg.AggCall {
-    // 1. Function name (sum, count, min, max, avg).
+    // 1. Function name (sum, count, min, max, avg, avg_state).
     const name_tok = try lex.next();
     if (name_tok.kind != .ident) return error.ExpectedAggFunc;
     const call_start = @intFromPtr(name_tok.text.ptr) - @intFromPtr(lex.src.ptr);
-    var func = resolveAggFunc(name_tok.text) orelse return error.UnknownAggFunc;
+    const state = asciiEqIgnoreCase(name_tok.text, "avg_state");
+    var func: agg.AggFunc = if (state) .avg else resolveAggFunc(name_tok.text) orelse return error.UnknownAggFunc;
 
     // 2. Open paren.
     const lp = try lex.next();
@@ -928,6 +929,7 @@ fn parseAggCall(
         .default_name = default_name,
         .result = result,
         .offset = if (shifted) |s| s.offset else 0,
+        .state = state,
     };
 }
 

@@ -2837,7 +2837,10 @@ fn materializeMetas(
         defer span.end(.footer_parse, profile.args(.{ i, in.bytes.len }));
         metas[i] = metadata.open(arena, in.bytes) catch |err| {
             Diag.setInput(diag, in.name, err);
-            return if (err == error.EncryptedFile or err == error.ExternalColumnChunk) err else error.NotParquet;
+            return switch (err) {
+                error.EncryptedFile, error.ExternalColumnChunk, error.InvalidDecimalType => err,
+                else => error.NotParquet,
+            };
         };
     }
     return metas;

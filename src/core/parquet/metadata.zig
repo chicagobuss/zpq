@@ -55,6 +55,8 @@ pub const Error = error{
     ColumnChunkTypeMismatch,
     /// A column chunk's data lives in another file (`ColumnChunk.file_path`).
     ExternalColumnChunk,
+    /// A DECIMAL annotation whose scale is negative or exceeds its precision.
+    InvalidDecimalType,
 };
 
 /// Deepest group nesting a footer may have: `schema.max_schema_depth`.
@@ -142,7 +144,12 @@ pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
         // A FIXED_LEN_BYTE_ARRAY of no length fell back to the length-prefixed decoder and read its bytes as strings.
         if (elem.type == .FIXED_LEN_BYTE_ARRAY and (elem.type_length orelse 0) == 0) return error.BadSchemaElement;
         // A DECIMAL holds at least one digit: precision 0 left every width computed from it out of range.
-        if (decimal.kindFromSchema(&elem)) |k| if (k.precision < 1) return error.BadSchemaElement;
+        if (decimal.kindFromSchema(&elem)) |k| {
+            if (k.precision < 1) return error.BadSchemaElement;
+            // A scale outside 0..precision gives the stored integer no meaning: refused on read as the writer refuses
+            // to write it, rather than printed raw or at a scale no reader agrees on.
+            if (k.scale < 0 or k.scale > k.precision) return error.InvalidDecimalType;
+        }
         // A primitive can't have children. Some walkers find leaves by type, others by child count; this keeps
         // them agreeing on which element is leaf N. Not the root: every walker starts below it, and some writers
         // (segmentio/parquet-go) give the root a type anyway.
@@ -1596,4 +1603,47 @@ test "a column chunk whose data lives in another file is refused at footer open"
             try testing.expectError(error.ExternalColumnChunk, openFooter(arena, w.bytes()));
         } else _ = try openFooter(arena, w.bytes());
     }
+}
+
+test "a DECIMAL whose scale is negative or past its precision is refused at footer open" {
+    const bytes = readFileSlice("ci/fixtures/parquet/decimal_exact.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try open(arena, bytes);
+    const at = for (meta.schema.items, 0..) |e, i| {
+        if (decimal.kindFromSchema(&e) != null) break i;
+    } else return error.SkipZigTest;
+    const elem = &meta.schema.items[at];
+    const precision = decimal.kindFromSchema(elem).?.precision;
+    for ([_]struct { scale: i32, ok: bool }{
+        .{ .scale = -3, .ok = false },
+        .{ .scale = precision + 1, .ok = false },
+        .{ .scale = precision, .ok = true },
+        .{ .scale = 0, .ok = true },
+    }) |c| for ([_]bool{ true, false }) |logical| {
+        // The logical annotation, or the legacy converted one with its own scale and precision. The footer writer
+        // re-emits the bytes it read for the logical type, so they go too.
+        elem.logical_type_raw = "";
+        if (logical) {
+            elem.logical_type = .{ .DECIMAL = .{ .scale = c.scale, .precision = precision } };
+        } else {
+            elem.logical_type = null;
+            elem.converted_type = .DECIMAL;
+            elem.scale = c.scale;
+            elem.precision = precision;
+        }
+        var w = thrift.Writer.init(arena);
+        try meta.write(&w);
+        if (c.ok) {
+            _ = try openFooter(arena, w.bytes());
+        } else testing.expectError(error.InvalidDecimalType, openFooter(arena, w.bytes())) catch |err| {
+            std.debug.print("scale {d} (logical {}) was accepted\n", .{ c.scale, logical });
+            return err;
+        };
+    };
 }

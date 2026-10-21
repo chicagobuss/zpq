@@ -3190,6 +3190,7 @@ fn prepareAggregate(
                 return switch (f.err) {
                     error.EncryptedFile => error.EncryptedFile,
                     error.ExternalColumnChunk => error.ExternalColumnChunk,
+                    error.InvalidDecimalType => error.InvalidDecimalType,
                     else => error.NotParquet,
                 };
             },

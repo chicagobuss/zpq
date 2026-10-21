@@ -97,7 +97,12 @@ pub fn compress(
 ) Error![]u8 {
     return switch (codec) {
         .UNCOMPRESSED => try arena.dupe(u8, src),
-        .SNAPPY => snappy.compressAlloc(arena, src) catch return error.CompressionFailed,
+        // A refused allocation stays OutOfMemory: the write's memory ladder retries it on less, where a codec error
+        // would end the query.
+        .SNAPPY => snappy.compressAlloc(arena, src) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.CompressionFailed,
+        },
         .ZSTD => compressZstd(arena, src, .{}),
         .GZIP => compressFlate(arena, src, .gzip),
         .LZ4_RAW => compressLz4Raw(arena, src),
@@ -116,28 +121,30 @@ fn compressLz4Raw(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
     return dest[0..@intCast(n)];
 }
 
-/// Compress `src` to a single gzip member via stdlib deflate. Mirrors the
-/// decode path's `decompressFlate`; output lands in an arena-backed growing
-/// writer (deflate can briefly exceed the input on incompressible data, so a
-/// fixed worst-case buffer is fiddly — the allocating writer just grows).
+/// Compress `src` to a single gzip member via stdlib deflate. Mirrors the decode path's `decompressFlate`. The output
+/// is sized up front for deflate's worst case (fixed-Huffman literals at 9 bits, block headers), so the only
+/// allocation failures are the two up-front ones, which stay OutOfMemory; a write past the bound is a codec error.
 fn compressFlate(
     arena: std.mem.Allocator,
     src: []const u8,
     container: std.compress.flate.Container,
 ) Error![]u8 {
-    // Allocating output: Compress.init asserts the output buffer is > 8, so
-    // seed a small capacity that the writer grows as needed.
-    var out = std.Io.Writer.Allocating.initCapacity(arena, @max(64, src.len / 2)) catch
-        return error.CompressionFailed;
     // The compressor's history window (asserted >= max_window_len = 64 KB).
     const window = try arena.alloc(u8, std.compress.flate.max_window_len);
     defer arena.free(window);
-
-    var c = std.compress.flate.Compress.init(&out.writer, window, container, .default) catch
+    const dest = try arena.alloc(u8, flateBound(src.len));
+    var out: std.Io.Writer = .fixed(dest);
+    var c = std.compress.flate.Compress.init(&out, window, container, .default) catch
         return error.CompressionFailed;
     c.writer.writeAll(src) catch return error.CompressionFailed;
     c.finish() catch return error.CompressionFailed;
-    return out.writer.buffered();
+    return dest[0..out.end];
+}
+
+/// The most deflate can write for `n` bytes: every byte a 9-bit fixed-Huffman literal, a stored block's 5-byte header
+/// per 64 KiB, and the gzip/zlib wrapper.
+fn flateBound(n: usize) usize {
+    return n + n / 8 + 5 * (n / 65535 + 1) + 64;
 }
 
 /// A thread's zstd contexts, each made at its first use and kept for every later page. A context is a few hundred
@@ -666,6 +673,43 @@ test "SNAPPY writes the same bytes whatever the thread's kept working memory hel
     const t = try std.Thread.spawn(.{}, Work.run, .{&w});
     t.join();
     if (w.failed) |e| return e;
+}
+
+test "every codec reports a refused allocation as OutOfMemory, so the write can retry on less memory" {
+    // T10: SNAPPY and GZIP turned the budget's refusal into CompressionFailed, which no retry takes.
+    var prng = std.Random.DefaultPrng.init(0x710);
+    var src: [70_000]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = if (i % 3 == 0) prng.random().int(u8) else @truncate(i / 7);
+    for ([_]schema.CompressionCodec{ .UNCOMPRESSED, .SNAPPY, .GZIP, .ZSTD, .LZ4_RAW }) |codec| {
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            var arena = std.heap.ArenaAllocator.init(failing.allocator());
+            defer arena.deinit();
+            const out = compressPage(arena.allocator(), &src, codec, .{}) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                continue;
+            };
+            // Read back on memory that does not fail (UNCOMPRESSED hands back its input).
+            var check = std.heap.ArenaAllocator.init(testing.allocator);
+            defer check.deinit();
+            try testing.expectEqualSlices(u8, &src, try decompress(check.allocator(), out, codec, src.len));
+            break;
+        }
+    }
+}
+
+test "GZIP pages fit the worst-case bound on incompressible input" {
+    var prng = std.Random.DefaultPrng.init(0x6219);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]usize{ 0, 1, 100, 65_535, 65_536, 300_001 }) |n| {
+        const src = try arena.allocator().alloc(u8, n);
+        prng.random().bytes(src);
+        const out = try compress(arena.allocator(), src, .GZIP);
+        try testing.expect(out.len <= flateBound(n));
+        try testing.expectEqualSlices(u8, src, try decompress(arena.allocator(), out, .GZIP, n));
+    }
 }
 
 test "unsupported codec" {

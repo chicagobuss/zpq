@@ -1059,6 +1059,8 @@ fn projectRGToPiece(
     output_specs: []const consumer.OutputCol,
     decode_options: consumer.DecodeOptions,
     prof: ?*profile.Thread,
+    /// The producer's share, what the filter's columns take decoded, and what every fetched column takes whole.
+    fit: struct { share: usize, early: usize, rows: usize },
 ) !EncodedRG {
     // `rows` holds what lives for the whole row group (the filter's columns and selection); each output column is
     // decoded on `work`, rewound before the next, so the working set is one column rather than the row group.
@@ -1086,6 +1088,10 @@ fn projectRGToPiece(
         decode_options,
     );
     defer projected.deinit();
+    // The kept rows' share of the row group, beside the filter's columns, is what the piece will hold.
+    const num_rows: usize = @intCast(@max(1, job.rg.num_rows));
+    const kept = @as(u128, fit.rows) * projected.surviving / num_rows;
+    if (fit.early + kept > fit.share) return error.PieceTooLarge;
     if (projected.surviving > 0) for (0..output_specs.len) |i| {
         work_region.rewind();
         var col_arena = std.heap.ArenaAllocator.init(work_region.allocator());
@@ -1467,6 +1473,8 @@ const WinCtx = struct {
     decode_options: consumer.DecodeOptions,
     /// Where output row groups are cut (`RowGroupTarget`).
     rg_target: RowGroupTarget = .{},
+    /// Per leaf: read by the filter or a computed output, so decoded before the filter runs.
+    early_arr: []const bool = &.{},
     /// The output columns' schema leaves and paths, as every piece's aggregator has them.
     out_elems: []const schema.SchemaElement = &.{},
     out_paths: []const []const []const u8 = &.{},
@@ -1612,7 +1620,9 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
     const job = w.jobs[i];
     try job.arrive();
     if (job.passthrough) return copyRGToBuffer(w.outAlloc(), ma, job, w.kept_set, prof, w.bloom_leaves);
-    if (try sliceRG(job, w.fetch_arr, w.decode_share)) return .{ .deferred = true };
+    // The filter's (and computed outputs') columns must fit; the kept rows are checked once the filter has run.
+    const early = decodeBytes(job, w.early_arr);
+    if (try sliceRG(job, w.fetch_arr, early * 2, w.decode_share)) return .{ .deferred = true };
     return projectRGToPiece(
         w.gpa,
         w.pieceAlloc(),
@@ -1623,7 +1633,27 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
         w.output_specs,
         w.decode_options,
         prof,
-    );
+        .{ .share = w.decode_share, .early = early, .rows = decodeBytes(job, w.fetch_arr) },
+    ) catch |e| switch (e) {
+        // More rows kept than the share holds: the writer decodes the row group a slice at a time.
+        error.PieceTooLarge => {
+            if (!slicesWhole(job, w.fetch_arr)) return error.RowGroupTooLarge;
+            return .{ .deferred = true };
+        },
+        else => return e,
+    };
+}
+
+/// What decoding `cols` of `job`'s row group whole takes (`consumer.decodeEstimate`).
+fn decodeBytes(job: RGJob, cols: []const bool) usize {
+    return consumer.decodeEstimate(.{
+        .rg = job.rg,
+        .meta = job.meta,
+        .src = .{ .bytes = job.bytes, .byte_origin = 0 },
+        .filter = null,
+        .read = cols,
+        .consumed = cols,
+    }, cols, &.{}, false);
 }
 
 /// Whether every column `job` reads has a sliced form, so its row group can be decoded a slice at a time.
@@ -1635,20 +1665,11 @@ fn slicesWhole(job: RGJob, fetch_arr: []const bool) bool {
     return true;
 }
 
-/// Whether `job`'s row group is decoded a slice of rows at a time (`projectRGSliced`): its decoded columns would take
-/// more than `share`. One that would, with a column that has no sliced form, is refused before anything decodes.
-fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) error{RowGroupTooLarge}!bool {
+/// Whether `job`'s row group is decoded a slice of rows at a time (`projectRGSliced`): what it needs, `est`, would
+/// take more than `share`. One that would, with a column that has no sliced form, is refused before anything decodes.
+fn sliceRG(job: RGJob, fetch_arr: []const bool, est: usize, share: usize) error{RowGroupTooLarge}!bool {
     const rg = job.rg;
     if (rg.num_rows <= 0) return false;
-    // The kept rows, and beside them the filter's columns and the column being projected.
-    const est = consumer.decodeEstimate(.{
-        .rg = rg,
-        .meta = job.meta,
-        .src = .{ .bytes = job.bytes, .byte_origin = 0 },
-        .filter = null,
-        .read = fetch_arr,
-        .consumed = fetch_arr,
-    }, fetch_arr, &.{}, false) * 2;
     if (est <= share) return false;
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
@@ -2881,10 +2902,15 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             defer for (regions) |*r| r.deinit();
             var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
             var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+            const early_arr = try arena.alloc(bool, fetch_arr.len);
+            @memset(early_arr, false);
+            if (filter_opt) |f| filter_ast.markColumns(f, early_arr);
+            for (output_specs) |spec| if (spec == .computed) spec.computed.expr.collectColumns(early_arr);
             // Every piece's aggregator has these leaves; the row groups cut from them are written under them.
             const out_agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
             var w = WinCtx{
                 .rg_target = args.row_group.under(args.max_memory_explicit),
+                .early_arr = early_arr,
                 .out_elems = out_agg.schema_elems,
                 .out_paths = out_agg.paths,
                 .page_indexes = &page_indexes,

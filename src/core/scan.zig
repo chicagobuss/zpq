@@ -3224,8 +3224,8 @@ fn prepareAggregate(
     if (args.filter) |expr_str| {
         if (expr_str.len > 0) {
             filter_opt = try filter_parser.parse(arena, expr_str, meta0, args.diag);
-            // `--trust-stats`: a float chunk without a NaN count prunes as if it had none.
-            if (args.trust_stats) filter_opt = try filter_ast.trustMissingNanCounts(arena, filter_opt.?);
+            // `--trust-stats`: leaves trust plausible statistics; a float chunk with no NaN count prunes as NaN-free.
+            if (args.trust_stats) filter_opt = try filter_ast.trustStats(arena, filter_opt.?);
         }
     }
     const group_by_items = if (args.group_by) |gb_str|
@@ -12914,7 +12914,8 @@ test "planAggregate: a filter its row groups' bounds say passes few rows drops a
     };
     var lo: i64 = std.math.maxInt(i64);
     for (meta.row_groups.items) |*rg| {
-        const b = @import("parquet/statistics.zig").chunkBounds(rg, 1, &meta) orelse return error.SkipZigTest;
+        const b = @import("parquet/statistics.zig").chunkStats(rg, 1, &meta, .corroborated).bounds orelse
+            return error.SkipZigTest;
         lo = @min(lo, std.mem.readInt(i64, b.min[0..8], .little));
     }
     const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};

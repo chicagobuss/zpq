@@ -1119,7 +1119,7 @@ pub fn statsCoverageComplete(
                 .count => {
                     const levels = columnLevelsForStats(&m, &cm) orelse return false;
                     if (levels.max_rep > 0) return false;
-                    _ = statPresentCount(&rg, &cm, cm.statistics, &m) orelse return false;
+                    _ = statPresentCount(&rg, ci, &cm, &m) orelse return false;
                 },
                 // The same plan `updateOneFromStats` folds from: any row group it would decode instead keeps the
                 // column in the fetch set. Sum needs every row group constant (min == max) to drop the column.
@@ -1167,7 +1167,7 @@ pub fn updateOneFromStats(
             const col_idx = statArgColumn(call) orelse return false;
             if (col_idx >= rg.columns.items.len) return false;
             const cm = rg.columns.items[col_idx].meta_data orelse return false;
-            const present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return false;
+            const present = statPresentCount(rg, col_idx, &cm, file_meta) orelse return false;
             state.count = try addRowCount(state.count, @intCast(present));
             return true;
         },
@@ -1176,7 +1176,7 @@ pub fn updateOneFromStats(
             const plan = planStatFold(call, rg, statArgColumn(call) orelse return false, file_meta) orelse return false;
             // A chunk with no non-null values contributes nothing, whatever bounds its writer left behind.
             const cm = rg.columns.items[statArgColumn(call).?].meta_data.?;
-            if (statPresentCount(rg, &cm, cm.statistics, file_meta) == 0) return true;
+            if (statPresentCount(rg, statArgColumn(call).?, &cm, file_meta) == 0) return true;
             const bytes = if (call.func == .min) plan.bounds.min else plan.bounds.max;
             switch (plan.lane) {
                 // DECIMAL stat bytes are in the physical wire format: decode them through the same
@@ -1231,8 +1231,9 @@ fn planStatFold(
     const cm = rg.columns.items[col_idx].meta_data orelse return null;
     const levels = columnLevelsForStats(file_meta, &cm) orelse return null;
     if (levels.max_rep > 0) return null;
-    // Bounds in the column's own order: the deprecated pair only where signed is that order.
-    const bounds = statistics.chunkBounds(rg, col_idx, file_meta) orelse return null;
+    // Bounds in the column's own order: the deprecated pair only where signed is that order. Every fold but count(*)
+    // runs under `--trust-stats` alone (`canStatShortCircuit`), which trusts plausible statistics.
+    const bounds = statistics.chunkStats(rg, col_idx, file_meta, .plausible).bounds orelse return null;
     const lane = statFoldLane(call, cm.type, file_meta.getColumnSchema(cm.path_in_schema.items)) orelse return null;
     // Bounds leave NaN out. A min skips NaN anyway (and an all-NaN chunk has no bounds), but a max or a constant sum
     // can take them only when the chunk is known to hold none.
@@ -1256,7 +1257,7 @@ fn planStatFold(
         if (!std.mem.eql(u8, bounds.min, bounds.max)) return null;
         // REQUIRED columns can use the row count; nullable ones need null_count, or null slots would count as the
         // constant.
-        plan.present = statPresentCount(rg, &cm, cm.statistics, file_meta) orelse return null;
+        plan.present = statPresentCount(rg, col_idx, &cm, file_meta) orelse return null;
         if (lane == .decimal and decimal_mod.statToI128(bounds.min, lane.decimal) == null) return null;
         // A float constant sums block by block as its rows would (`sumConstantF64`), which needs every row present:
         // a NULL moves the rows after it within their blocks.
@@ -1296,22 +1297,18 @@ fn columnLevelsForStats(file_meta: *const schema.FileMetaData, cm: *const schema
     return file_meta.getColumnLevels(cm.path_in_schema.items);
 }
 
+/// Non-null rows of chunk `col_idx` (meta `cm`), from its null_count. A count `chunkStats` refuses, one outside the
+/// row group's rows among them, is no count: `num_rows - nc` would answer more rows than there are (a negative count)
+/// or overflow (minInt). The column is decoded instead.
 fn statPresentCount(
     rg: *const schema.RowGroup,
+    col_idx: usize,
     cm: *const schema.ColumnMetaData,
-    stats_opt: ?schema.Statistics,
     file_meta: *const schema.FileMetaData,
 ) ?i64 {
     const levels = columnLevelsForStats(file_meta, cm) orelse return null;
     if (levels.max_rep > 0) return null;
-    if (stats_opt) |stats| {
-        if (stats.null_count) |nc| {
-            // A count outside the row group's rows is no count: `num_rows - nc` would answer more rows than there are
-            // (a negative count) or overflow (minInt). The column is decoded instead.
-            if (nc < 0 or nc > rg.num_rows) return null;
-            return rg.num_rows - nc;
-        }
-    }
+    if (statistics.chunkStats(rg, col_idx, file_meta, .plausible).null_count) |nc| return rg.num_rows - nc;
     return if (levels.max_def == 0) rg.num_rows else null;
 }
 
@@ -6578,8 +6575,8 @@ test "boundary: a footer null count outside the row group's rows answers no coun
     var path: schema.StringList = .empty;
     try path.append(a, "x");
     const meta = try testI64Meta(a, .empty, 100, .OPTIONAL);
-    const rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 800, .num_rows = 100 };
-    const cm: schema.ColumnMetaData = .{
+    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 800, .num_rows = 100 };
+    try rg.columns.append(a, .{ .file_path = null, .file_offset = 0, .meta_data = .{
         .type = .INT64,
         .encodings = .empty,
         .path_in_schema = path,
@@ -6591,7 +6588,8 @@ test "boundary: a footer null count outside the row group's rows answers no coun
         .index_page_offset = null,
         .dictionary_page_offset = null,
         .statistics = null,
-    };
+    } });
+    const cm = &rg.columns.items[0].meta_data.?;
     const Case = struct { nc: i64, want: ?i64 };
     for ([_]Case{
         .{ .nc = 0, .want = 100 },
@@ -6602,7 +6600,8 @@ test "boundary: a footer null count outside the row group's rows answers no coun
         .{ .nc = std.math.minInt(i64), .want = null },
         .{ .nc = std.math.maxInt(i64), .want = null },
     }) |case| {
-        try testing.expectEqual(case.want, statPresentCount(&rg, &cm, .{ .null_count = case.nc }, &meta));
+        cm.statistics = .{ .null_count = case.nc };
+        try testing.expectEqual(case.want, statPresentCount(&rg, 0, cm, &meta));
     }
 }
 

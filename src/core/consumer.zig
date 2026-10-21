@@ -47,6 +47,7 @@ const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
+const statistics = @import("parquet/statistics.zig");
 const agg_coded = @import("expr/agg_coded.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const partagg = @import("partagg.zig");
@@ -3897,7 +3898,9 @@ fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.Stats
 
         const cm = chunk_meta.meta_data orelse continue;
         const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
-        if (!pageIndexIsPlausible(&col_index, &offset_index, cm, levels, in.rg.num_rows)) continue;
+        const elem = in.meta.getColumnSchema(cm.path_in_schema.items);
+        const trust: statistics.Trust = if (stats == .trust) .plausible else .corroborated;
+        if (!statistics.pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, in.rg.num_rows, trust)) continue;
 
         indexes[ci] = .{ .col_index = col_index, .offset_index = offset_index };
     }
@@ -4946,54 +4949,6 @@ fn copyChunkRecompressed(
     chunk.offset_index_length = @intCast(oi_w.bytes().len);
     try out.write(oi_w.bytes());
     return chunk;
-}
-
-/// Whether a chunk's ColumnIndex is fit to prune pages with. Page pruning and the always-match fill act on these
-/// claims without decoding, so one the footer or the OffsetIndex can contradict for free is dropped whole and the
-/// chunk reads as if it had no page index: a writer that got one claim wrong cannot be trusted on its neighbours.
-///
-/// The contradictions checked:
-///   - per-page lists whose lengths disagree with the OffsetIndex page count;
-///   - a negative null count, which no page can have;
-///   - a page flagged all-null on a leaf with no optional or repeated ancestor (max definition level 0), which
-///     cannot hold a null at all;
-///   - for a non-repeated leaf, whose entries are its rows, a page flagged all-null whose null count is not its row
-///     count, or null pages covering more rows than the chunk's own statistics say are null.
-///
-/// Writers that collected no page statistics are known to flag every page null and record -1 null counts, while
-/// the pages hold ordinary values; trusting them drops every row.
-pub fn pageIndexIsPlausible(
-    ci: *const schema.ColumnIndex,
-    oi: *const schema.OffsetIndex,
-    cm: schema.ColumnMetaData,
-    levels: schema.Levels,
-    rg_rows: i64,
-) bool {
-    const locs = oi.page_locations.items;
-    const n = locs.len;
-    if (ci.null_pages.items.len != n or ci.min_values.items.len != n or ci.max_values.items.len != n) return false;
-    if (ci.null_counts) |nc| {
-        if (nc.items.len != n) return false;
-        for (nc.items) |c| if (c < 0) return false;
-    }
-
-    var null_page_rows: i64 = 0;
-    for (ci.null_pages.items, 0..) |is_null, i| {
-        if (!is_null) continue;
-        if (levels.max_def == 0) return false;
-        // A repeated leaf's counts are entries, not rows; only the flag itself is checked there.
-        if (levels.max_rep > 0) continue;
-        const end = if (i + 1 < n) locs[i + 1].first_row_index else rg_rows;
-        const rows = end - locs[i].first_row_index;
-        if (ci.null_counts) |nc| if (nc.items[i] != rows) return false;
-        null_page_rows += rows;
-    }
-    if (levels.max_rep == 0) {
-        if (cm.statistics) |s| if (s.null_count) |chunk_nulls| {
-            if (null_page_rows > chunk_nulls) return false;
-        };
-    }
-    return true;
 }
 
 /// Whether a column's page index can drive page pruning. Its arrays are indexed by page number together, and each
@@ -6094,147 +6049,6 @@ test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 refe
     var signed = ref;
     signed.col_ref.unsigned_64 = false;
     try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
-}
-
-test "pageIndexIsPlausible: corpus page indexes are kept except the ones their footers contradict" {
-    const testing = std.testing;
-    // Every parquet-testing file that carries a page index. The datapage_v1 trio flags every page of two REQUIRED
-    // columns null (with -1 null counts) while the pages hold values; the rest, int32_with_null_pages's genuine null
-    // pages included, must keep their index so page pruning still applies to them.
-    const Case = struct { path: []const u8, plausible: bool };
-    const cases = [_]Case{
-        .{ .path = "alltypes_tiny_pages.parquet", .plausible = true },
-        .{ .path = "alltypes_tiny_pages_plain.parquet", .plausible = true },
-        .{ .path = "binary_truncated_min_max.parquet", .plausible = true },
-        .{ .path = "data_index_bloom_encoding_stats.parquet", .plausible = true },
-        .{ .path = "data_index_bloom_encoding_with_length.parquet", .plausible = true },
-        .{ .path = "datapage_v2_empty_datapage.snappy.parquet", .plausible = true },
-        .{ .path = "delta_encoding_required_column.parquet", .plausible = true },
-        .{ .path = "fixed_length_byte_array.parquet", .plausible = true },
-        .{ .path = "floating_orders_nan_count.parquet", .plausible = true },
-        .{ .path = "int32_with_null_pages.parquet", .plausible = true },
-        .{ .path = "old_list_structure.parquet", .plausible = true },
-        .{ .path = "plain-dict-uncompressed-checksum.parquet", .plausible = true },
-        .{ .path = "repeated_primitive_no_list.parquet", .plausible = true },
-        .{ .path = "rle-dict-snappy-checksum.parquet", .plausible = true },
-        .{ .path = "datapage_v1-corrupt-checksum.parquet", .plausible = false },
-        .{ .path = "datapage_v1-snappy-compressed-checksum.parquet", .plausible = false },
-        .{ .path = "datapage_v1-uncompressed-checksum.parquet", .plausible = false },
-    };
-    for (cases) |case| {
-        var path_buf: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "data/parquet-testing/data/{s}", .{case.path});
-        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
-            if (err == error.FileNotFound) {
-                std.debug.print("skipping: {s} not present\n", .{path});
-                return error.SkipZigTest;
-            }
-            return err;
-        };
-        defer testing.allocator.free(bytes);
-        var meta = try metadata.open(testing.allocator, bytes);
-        defer meta.deinit(testing.allocator);
-
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        var indexed: usize = 0;
-        var rejected: usize = 0;
-        for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| {
-            const cm = chunk.meta_data orelse continue;
-            const co: usize = @intCast(chunk.column_index_offset orelse continue);
-            const oo: usize = @intCast(chunk.offset_index_offset orelse continue);
-            var cr = thrift.Reader.init(bytes[co..][0..@intCast(chunk.column_index_length.?)]);
-            const col_index = try schema.ColumnIndex.read(arena.allocator(), &cr);
-            var orr = thrift.Reader.init(bytes[oo..][0..@intCast(chunk.offset_index_length.?)]);
-            const offset_index = try schema.OffsetIndex.read(arena.allocator(), &orr);
-            indexed += 1;
-            const levels = meta.getColumnLevels(cm.path_in_schema.items);
-            if (!pageIndexIsPlausible(&col_index, &offset_index, cm, levels, rg.num_rows)) rejected += 1;
-        };
-        testing.expect(indexed > 0) catch |err| {
-            std.debug.print("{s}: no page index found\n", .{case.path});
-            return err;
-        };
-        const want_rejected: usize = if (case.plausible) 0 else indexed;
-        testing.expectEqual(want_rejected, rejected) catch |err| {
-            std.debug.print("{s}: rejected {d} of {d} page indexes\n", .{ case.path, rejected, indexed });
-            return err;
-        };
-    }
-}
-
-test "pageIndexIsPlausible: each contradiction drops the index on its own" {
-    const testing = std.testing;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Two pages of 10 and 6 rows; page 1 is all null.
-    var oi: schema.OffsetIndex = .{};
-    try oi.page_locations.appendSlice(a, &.{
-        .{ .offset = 4, .compressed_page_size = 10, .first_row_index = 0 },
-        .{ .offset = 14, .compressed_page_size = 10, .first_row_index = 10 },
-    });
-    const Fixture = struct {
-        fn index(alloc: std.mem.Allocator, null_pages: []const bool, null_counts: ?[]const i64) !schema.ColumnIndex {
-            var ci: schema.ColumnIndex = .{};
-            try ci.null_pages.appendSlice(alloc, null_pages);
-            for (null_pages) |np| {
-                const bound: []const u8 = if (np) "" else "\x01\x00\x00\x00";
-                try ci.min_values.append(alloc, bound);
-                try ci.max_values.append(alloc, bound);
-            }
-            if (null_counts) |nc| {
-                var list: std.ArrayListUnmanaged(i64) = .empty;
-                try list.appendSlice(alloc, nc);
-                ci.null_counts = list;
-            }
-            return ci;
-        }
-    };
-    const cm: schema.ColumnMetaData = .{
-        .type = .INT32,
-        .encodings = .empty,
-        .path_in_schema = .empty,
-        .codec = .UNCOMPRESSED,
-        .num_values = 16,
-        .total_uncompressed_size = 0,
-        .total_compressed_size = 0,
-        .data_page_offset = 4,
-        .index_page_offset = null,
-        .dictionary_page_offset = null,
-    };
-    const optional: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
-    const required: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
-    const repeated: schema.Levels = .{ .max_def = 2, .max_rep = 1 };
-
-    const good = try Fixture.index(a, &.{ false, true }, &.{ 2, 6 });
-    try testing.expect(pageIndexIsPlausible(&good, &oi, cm, optional, 16));
-    // Without null counts the flag alone is taken on an optional leaf.
-    const no_counts = try Fixture.index(a, &.{ false, true }, null);
-    try testing.expect(pageIndexIsPlausible(&no_counts, &oi, cm, optional, 16));
-    // A null page on a leaf that cannot be null.
-    try testing.expect(!pageIndexIsPlausible(&no_counts, &oi, cm, required, 16));
-    // A required leaf with no null page is fine.
-    const all_values = try Fixture.index(a, &.{ false, false }, &.{ 0, 0 });
-    try testing.expect(pageIndexIsPlausible(&all_values, &oi, cm, required, 16));
-    // Negative null counts.
-    const negative = try Fixture.index(a, &.{ false, false }, &.{ -1, 0 });
-    try testing.expect(!pageIndexIsPlausible(&negative, &oi, cm, optional, 16));
-    // A null page whose null count is not its row count.
-    const short = try Fixture.index(a, &.{ false, true }, &.{ 0, 5 });
-    try testing.expect(!pageIndexIsPlausible(&short, &oi, cm, optional, 16));
-    // ...is only checked where entries are rows.
-    try testing.expect(pageIndexIsPlausible(&short, &oi, cm, repeated, 16));
-    // Null pages covering more rows than the chunk statistics count as null.
-    var with_stats = cm;
-    with_stats.statistics = .{ .null_count = 3 };
-    try testing.expect(!pageIndexIsPlausible(&no_counts, &oi, with_stats, optional, 16));
-    with_stats.statistics = .{ .null_count = 6 };
-    try testing.expect(pageIndexIsPlausible(&no_counts, &oi, with_stats, optional, 16));
-    // Per-page lists that disagree with the OffsetIndex page count.
-    const one_page = try Fixture.index(a, &.{false}, null);
-    try testing.expect(!pageIndexIsPlausible(&one_page, &oi, cm, optional, 16));
 }
 
 test "recompressChunk: a codec round trip gives back the chunk byte for byte" {

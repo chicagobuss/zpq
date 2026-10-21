@@ -108,6 +108,9 @@ pub fn Leaf(comptime T: type) type {
         /// if they said zero, so `>`/`>=` skip on the bounds as they did before NaN counted. Without it a missing count
         /// means NaN may be present, and such a chunk is kept (see `encoded.rangeIntersects`).
         trust_missing_nan_count: bool = false,
+        /// `--trust-stats`: statistics that are plausible but contradict themselves or go uncorroborated are pruned on
+        /// as written (`statistics.Trust.plausible`).
+        trust_stats: bool = false,
     };
 }
 
@@ -117,6 +120,8 @@ pub fn Leaf(comptime T: type) type {
 pub const NullCheck = struct {
     col_idx: usize,
     is_not: bool,
+    /// As `Leaf.trust_stats`.
+    trust_stats: bool = false,
 };
 
 /// SQL `LIKE` (`%` = any run, `_` = one char). The pattern is classified
@@ -307,19 +312,21 @@ pub fn eql(a: Filter, b: Filter) bool {
             for (ca.children, cb.children) |x, y| if (!eql(x, y)) break :blk false;
             break :blk true;
         },
-        .string => |l| l.col_idx == b.string.col_idx and l.op == b.string.op and std.mem.eql(u8, l.value, b.string.value),
+        .string => |l| l.col_idx == b.string.col_idx and l.op == b.string.op and std.mem.eql(u8, l.value, b.string.value) and
+            l.trust_stats == b.string.trust_stats,
         .float => |l| l.col_idx == b.float.col_idx and l.op == b.float.op and
             @as(u32, @bitCast(l.value)) == @as(u32, @bitCast(b.float.value)) and
-            l.trust_missing_nan_count == b.float.trust_missing_nan_count,
+            l.trust_missing_nan_count == b.float.trust_missing_nan_count and l.trust_stats == b.float.trust_stats,
         .double => |l| l.col_idx == b.double.col_idx and l.op == b.double.op and
             @as(u64, @bitCast(l.value)) == @as(u64, @bitCast(b.double.value)) and
-            l.trust_missing_nan_count == b.double.trust_missing_nan_count,
-        .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not,
+            l.trust_missing_nan_count == b.double.trust_missing_nan_count and l.trust_stats == b.double.trust_stats,
+        .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not and
+            n.trust_stats == b.null_check.trust_stats,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
             std.mem.eql(u8, m.operand, b.like.operand),
         inline .int32, .int64, .uint64, .decimal, .boolean => |l, tag| blk: {
             const o = @field(b, @tagName(tag));
-            break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value;
+            break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value and l.trust_stats == o.trust_stats;
         },
     };
 }
@@ -352,23 +359,39 @@ pub fn exactLeaf(comptime T: type, col_idx: usize, op: Operator, floor: i256, in
     return .{ .col_idx = col_idx, .op = o, .value = @intCast(floor) };
 }
 
-/// `f` with every FLOAT/DOUBLE leaf trusting a missing NaN count as zero (`--trust-stats`), composites rebuilt around
-/// them; the input is not changed.
+/// `f` with every FLOAT/DOUBLE leaf trusting a missing NaN count as zero, composites rebuilt around them; the input is
+/// not changed. The NaN probe asks this alone of a filter; `--trust-stats` asks `trustStats`.
 pub fn trustMissingNanCounts(arena: std.mem.Allocator, f: Filter) std.mem.Allocator.Error!Filter {
+    return withTrust(arena, f, false);
+}
+
+/// `f` as `--trust-stats` reads it: every leaf trusts plausible statistics, and FLOAT/DOUBLE leaves a missing NaN count
+/// as zero.
+pub fn trustStats(arena: std.mem.Allocator, f: Filter) std.mem.Allocator.Error!Filter {
+    return withTrust(arena, f, true);
+}
+
+fn withTrust(arena: std.mem.Allocator, f: Filter, plausible: bool) std.mem.Allocator.Error!Filter {
     return switch (f) {
-        inline .float, .double => |l, tag| blk: {
+        inline .int32, .int64, .uint64, .float, .double, .decimal, .string, .boolean => |l, tag| blk: {
             var out = l;
-            out.trust_missing_nan_count = true;
+            if (tag == .float or tag == .double) out.trust_missing_nan_count = true;
+            if (plausible) out.trust_stats = true;
             break :blk @unionInit(Filter, @tagName(tag), out);
+        },
+        .null_check => |n| blk: {
+            var out = n;
+            if (plausible) out.trust_stats = true;
+            break :blk .{ .null_check = out };
         },
         .and_filter, .or_filter => |c| blk: {
             const children = try arena.alloc(Filter, c.children.len);
-            for (c.children, children) |child, *n| n.* = try trustMissingNanCounts(arena, child);
+            for (c.children, children) |child, *n| n.* = try withTrust(arena, child, plausible);
             var out = c;
             out.children = children;
             break :blk if (f == .and_filter) .{ .and_filter = out } else .{ .or_filter = out };
         },
-        else => f,
+        .like => f,
     };
 }
 

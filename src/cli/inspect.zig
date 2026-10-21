@@ -493,7 +493,7 @@ pub fn inspect(arena: std.mem.Allocator, env: std.process.Environ, path: []const
                 .data_page_offset = cm.data_page_offset,
                 .dictionary_page_offset = cm.dictionary_page_offset,
                 .dictionary = presence(cm.dictionary_page_offset, null, src.size, true),
-                .bounds_usable = zpq.core.parquet.statistics.chunkBounds(&rg, ci, &meta) != null,
+                .bounds_usable = zpq.core.parquet.statistics.chunkStats(&rg, ci, &meta, .corroborated).bounds != null,
                 .dictionary_fallback = fallback(cm),
                 .statistics = if (st == null) "absent" else "present",
                 .null_count = if (st) |s| s.null_count else null,

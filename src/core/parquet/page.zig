@@ -231,7 +231,7 @@ pub const PageReader = struct {
             const values_dst = out[rep_len + def_len ..][0..value_uncompressed_len];
             if (v2.is_compressed and self.codec != .UNCOMPRESSED) {
                 const span = profile.Span.begin(self.prof);
-                try compression.decompressInto(self.arena, value_src, self.codec, values_dst);
+                try compression.decompressInto(value_src, self.codec, values_dst);
                 if (span.t != null) span.end(.decompress, self.pageArgs(header, value_src.len, values_dst.len));
             } else {
                 if (compressed_value_len != value_uncompressed_len) return error.UnexpectedEndOfChunk;
@@ -249,7 +249,7 @@ pub const PageReader = struct {
             return .{ .header = header, .bytes = decompressed };
         }
         const out = try self.pageBuffer(usize_);
-        try compression.decompressInto(self.arena, payload, self.codec, out);
+        try compression.decompressInto(payload, self.codec, out);
         return .{ .header = header, .bytes = out };
     }
 

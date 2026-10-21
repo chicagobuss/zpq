@@ -4890,7 +4890,7 @@ fn recode(
     if (from == .UNCOMPRESSED or raw_len == 0)
         return compression.compressPage(arena, try compression.decompress(arena, body, from, raw_len), to, zstd);
     try raw.resize(scratch, raw_len);
-    try compression.decompressInto(arena, body, from, raw.items);
+    try compression.decompressInto(body, from, raw.items);
     return compression.compressPage(arena, raw.items, to, zstd);
 }
 

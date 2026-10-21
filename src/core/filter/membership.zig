@@ -1139,12 +1139,8 @@ const DictWorker = struct {
     jobs: []DictJob,
     cursor: *std.atomic.Value(usize),
     buf: []u8,
-    gpa: std.mem.Allocator,
 
     fn run(w: *DictWorker) void {
-        // Only GZIP keeps codec state, so this arena stays empty for the other codecs.
-        var codec_state = std.heap.ArenaAllocator.init(w.gpa);
-        defer codec_state.deinit();
         while (true) {
             const i = w.cursor.fetchAdd(1, .monotonic);
             if (i >= w.jobs.len) return;
@@ -1156,10 +1152,9 @@ const DictWorker = struct {
                 if (d.payload.len != d.size) continue;
                 break :blk d.payload;
             } else blk: {
-                compression.decompressInto(codec_state.allocator(), d.payload, job.codec, out) catch continue;
+                compression.decompressInto(d.payload, job.codec, out) catch continue;
                 break :blk out;
             };
-            _ = codec_state.reset(.retain_capacity);
             job.decoded = true;
             job.ok = scanDictionary(values, d.count, job.slot, job.want, job.found);
         }
@@ -1987,7 +1982,6 @@ const Probing = struct {
             .jobs = jobs,
             .cursor = &cursor,
             .buf = try self.scratch.alloc(u8, max_size),
-            .gpa = self.gpa,
         };
         const config: std.Thread.SpawnConfig = .{ .stack_size = 1 << 20 };
         if (n_threads <= 1 or !spawn_util.runTree(DictWorker, workers[0..n_threads], config, DictWorker.run))

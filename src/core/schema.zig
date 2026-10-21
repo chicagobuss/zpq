@@ -866,6 +866,8 @@ pub const Statistics = struct {
         if (self.distinct_count) |v| try writer.writeFieldI64(4, v);
         if (self.max_value) |v| try writer.writeFieldString(5, v);
         if (self.min_value) |v| try writer.writeFieldString(6, v);
+        if (self.is_max_value_exact) |v| try writer.writeFieldBool(7, v);
+        if (self.is_min_value_exact) |v| try writer.writeFieldBool(8, v);
         if (self.nan_count) |v| try writer.writeFieldI64(9, v);
         try writer.writeStructEnd();
     }

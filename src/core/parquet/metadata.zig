@@ -415,7 +415,8 @@ pub fn schemaMismatch(
 /// The schema element of the `leaf_idx`-th primitive leaf, as
 /// `resolveColumn` counts them. Null when the schema has fewer leaves.
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
-    return (file.leafAt(leaf_idx) orelse return null).element.*;
+    var walk: schema.LeafIterator = undefined;
+    return (file.leafAt(leaf_idx, &walk) orelse return null).element.*;
 }
 
 /// The dot-joined path of the `leaf_idx`-th primitive leaf (`key` for a
@@ -630,7 +631,8 @@ pub fn leafCount(file: *const schema.FileMetaData) usize {
 /// Compare paths by these segments, never by `leafPath`'s dot-joined form: a top-level column named `a.b` and the
 /// field `b` of a group `a` join to the same string.
 pub fn leafPathSegments(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const []const u8 {
-    return try arena.dupe([]const u8, (file.leafAt(leaf_idx) orelse return null).path);
+    var walk: schema.LeafIterator = undefined;
+    return try arena.dupe([]const u8, (file.leafAt(leaf_idx, &walk) orelse return null).path);
 }
 
 /// The leaves a name matches at each step of `resolveColumn`: top-level leaves named exactly `name`; nested leaves

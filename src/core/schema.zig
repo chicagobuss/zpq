@@ -1713,17 +1713,20 @@ pub const FileMetaData = struct {
     }
 
     /// Leaf `index` of the schema walk (the column chunk at that position in every row group), or null past the last.
-    /// The leaf's path is valid for as long as the schema when indexed, else until this is called again.
-    pub fn leafAt(self: *const FileMetaData, index: usize) ?LeafIterator.Leaf {
+    /// Without an index the schema is walked in `scratch`, whose names the leaf's path then borrows: it stays valid
+    /// while `scratch` and the schema do.
+    pub fn leafAt(self: *const FileMetaData, index: usize, scratch: *LeafIterator) ?LeafIterator.Leaf {
         if (self.leaf_index) |ix| if (ix.schema_len == self.schema.items.len) {
             if (index >= ix.leaves.items.len) return null;
             return ix.leaf(self, @intCast(index));
         };
-        var it: LeafIterator = .init(self.schema.items);
-        while (it.next()) |leaf| if (leaf.index == index) return leaf;
+        scratch.* = .init(self.schema.items);
+        while (scratch.next()) |leaf| if (leaf.index == index) return leaf;
         return null;
     }
 
+    /// The first leaf whose path is `path`. Callers read its element and levels only: without an index its path
+    /// borrows a walk that ends here.
     fn leafAtPath(self: *const FileMetaData, path: []const []const u8) ?LeafIterator.Leaf {
         if (self.leaf_index) |ix| if (ix.schema_len == self.schema.items.len) {
             return ix.leaf(self, ix.first_by_path.get(path) orelse return null);

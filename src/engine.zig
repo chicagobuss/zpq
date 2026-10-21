@@ -2057,7 +2057,8 @@ fn resolveBlooms(
         switch (proj.output_specs[i]) {
             .passthrough => |pt| {
                 const ci = pt.ci;
-                const leaf = meta0.leafAt(ci) orelse return error.UnknownColumn;
+                var walk: schema.LeafIterator = undefined;
+                const leaf = meta0.leafAt(ci, &walk) orelse return error.UnknownColumn;
                 const elem = leaf.element.*;
                 const flba_decimal = elem.type == .FIXED_LEN_BYTE_ARRAY and decimal_mod.kindFromSchema(&elem) != null;
                 if (elem.type == .BOOLEAN or elem.type == .INT96 or leaf.max_rep > 0 or flba_decimal) {
@@ -6850,7 +6851,8 @@ fn dictionaryKey(meta: *const schema.FileMetaData, key: RowSortKey, filter: ?fil
         .passthrough => |pt| pt.ci,
         .computed => return null,
     };
-    const leaf = meta.leafAt(ci) orelse return null;
+    var walk: schema.LeafIterator = undefined;
+    const leaf = meta.leafAt(ci, &walk) orelse return null;
     if (leaf.element.type != .BYTE_ARRAY or leaf.max_rep > 0 or decimal_mod.kindFromSchema(leaf.element) != null) return null;
     const f = filter orelse return .{ .ci = ci, .filtered = false };
     var buf: [64]usize = undefined;
@@ -6879,8 +6881,9 @@ fn gatherEligible(
     if (l == 0 or keep > max_gather_rows) return false;
     if (!allPassthrough(specs, keys)) return false;
     for (inputs) |in| if (in.gate != null) return false;
+    var walk: schema.LeafIterator = undefined;
     for (specs) |spec| {
-        const leaf = meta.leafAt(spec.passthrough.ci) orelse continue;
+        const leaf = meta.leafAt(spec.passthrough.ci, &walk) orelse continue;
         if (leaf.max_rep > 0) return false;
     }
     return true;

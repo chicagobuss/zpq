@@ -198,7 +198,8 @@ pub fn initOutputAggregator(
                 const kept_ci = pt.ci;
                 // The leaf and its path come from the schema, which every chunk's path_in_schema matches (footer
                 // open enforces it), so a file with no row groups still builds its output schema.
-                const leaf = meta.leafAt(kept_ci) orelse return error.ColumnMetaMissing;
+                var walk: schema.LeafIterator = undefined;
+                const leaf = meta.leafAt(kept_ci, &walk) orelse return error.ColumnMetaMissing;
                 const src_elem = leaf.element.*;
                 paths[i] = try arena.dupe([]const u8, leaf.path);
 
@@ -6373,9 +6374,13 @@ test "StagePlan.init in countOnly mode plans zero calls and charges only base co
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var file_meta: schema.FileMetaData = undefined;
-    file_meta.schema = .empty;
-    file_meta.row_groups = .empty;
+    var file_meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
     try file_meta.schema.append(arena, .{
         .name = "schema",
         .num_children = 2,
@@ -6510,9 +6515,13 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            var file_meta: schema.FileMetaData = undefined;
-            file_meta.schema = .empty;
-            file_meta.row_groups = .empty;
+            var file_meta: schema.FileMetaData = .{
+                .version = 1,
+                .schema = .empty,
+                .num_rows = 0,
+                .created_by = null,
+                .row_groups = .empty,
+            };
             try file_meta.schema.append(arena, .{
                 .name = "schema",
                 .num_children = 2,

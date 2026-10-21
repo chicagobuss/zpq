@@ -68,11 +68,14 @@
 #include <arm_acle.h>
 #endif
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -753,14 +756,19 @@ uint32_t CalculateTableSize(uint32_t input_size) {
 // zpq: a thread's working memory, kept for its later calls and freed when the
 // thread exits. Allocated per call it was up to ~200 KiB, an mmap/munmap pair
 // per page under musl. Nothing carries between calls: GetHashTable clears the
-// table, and the scratch buffers are written before they are read.
+// table, and the scratch buffers are written before they are read. It is
+// mapped directly, not taken from malloc, so it goes back to the OS when freed
+// whatever the host's malloc does with blocks this size.
 namespace {
 struct ThreadWorkingMemory {
   char* mem = nullptr;
   size_t size = 0;
-  ~ThreadWorkingMemory() {
-    if (mem != nullptr) std::allocator<char>().deallocate(mem, size);
+  void Release() {
+    if (mem != nullptr) munmap(mem, size);
+    mem = nullptr;
+    size = 0;
   }
+  ~ThreadWorkingMemory() { Release(); }
 };
 thread_local ThreadWorkingMemory thread_working_memory;
 }  // namespace
@@ -773,10 +781,12 @@ WorkingMemory::WorkingMemory(size_t input_size) {
           MaxCompressedLength(max_fragment_size);
   ThreadWorkingMemory& kept = thread_working_memory;
   if (kept.size < size_) {
-    if (kept.mem != nullptr) {
-      std::allocator<char>().deallocate(kept.mem, kept.size);
-    }
-    kept.mem = std::allocator<char>().allocate(size_);
+    kept.Release();
+    void* p = mmap(nullptr, size_, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // As allocate() did, in a build without exceptions.
+    if (p == MAP_FAILED) std::abort();
+    kept.mem = static_cast<char*>(p);
     kept.size = size_;
   }
   mem_ = kept.mem;

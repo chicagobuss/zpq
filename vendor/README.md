@@ -26,8 +26,9 @@ sources.
   symbols hidden so the shared library does not export them.
 - `snappy.cc`: `WorkingMemory` (the compressor's hash table and scratch buffers, up to ~200 KiB) takes its memory
   from a `thread_local` block kept for the thread's later calls and freed when it exits, instead of allocating and
-  freeing it on every call, an mmap/munmap pair per page under musl. The bytes written are unchanged: the table is
-  cleared per fragment as before.
+  freeing it on every call, an mmap/munmap pair per page under musl. The block is mapped directly rather than taken
+  from malloc, so it goes back to the OS when freed whatever the host's malloc does. The bytes written are unchanged:
+  the table is cleared per fragment as before.
 
 ## boring_tls (`vendor/boring_tls`, Zig bindings over BoringSSL)
 

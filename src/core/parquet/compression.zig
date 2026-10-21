@@ -635,6 +635,39 @@ test "SNAPPY round-trip" {
     try testing.expectEqualStrings(input, out);
 }
 
+test "SNAPPY writes the same bytes whatever the thread's kept working memory held before" {
+    const Work = struct {
+        failed: ?anyerror = null,
+
+        fn run(w: *@This()) void {
+            pages() catch |e| {
+                w.failed = e;
+            };
+        }
+
+        // On a fresh thread, so the small page sizes the block; the big one grows it, and the small one then comes
+        // back to a block the big one dirtied.
+        fn pages() !void {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var prng = std.Random.DefaultPrng.init(0x5a4f);
+            const big = try a.alloc(u8, 300_000);
+            for (big, 0..) |*b, i| b.* = if (i % 5 == 0) prng.random().int(u8) else @truncate(i / 11);
+            const small = big[1000..][0..5000];
+            const small_first = try compress(a, small, .SNAPPY);
+            const big_first = try compress(a, big, .SNAPPY);
+            try testing.expectEqualSlices(u8, small_first, try compress(a, small, .SNAPPY));
+            try testing.expectEqualSlices(u8, big_first, try compress(a, big, .SNAPPY));
+            try testing.expectEqualSlices(u8, big, try decompress(a, big_first, .SNAPPY, big.len));
+        }
+    };
+    var w: Work = .{};
+    const t = try std.Thread.spawn(.{}, Work.run, .{&w});
+    t.join();
+    if (w.failed) |e| return e;
+}
+
 test "unsupported codec" {
     try testing.expectError(error.UnsupportedCodec, decompress(testing.allocator, "x", .BROTLI, 1));
     try testing.expectError(error.UnsupportedCodec, compress(testing.allocator, "x", .LZ4)); // read-only codec

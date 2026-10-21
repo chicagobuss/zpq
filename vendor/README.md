@@ -24,6 +24,10 @@ sources.
   which Zig 0.17 removed; `build.zig.zon` requires Zig 0.17.0.
 - `build.zig`: `pic` and `hidden-symbols` options, which libzpq's archive sets: position-independent, with its
   symbols hidden so the shared library does not export them.
+- `snappy.cc`: `WorkingMemory` (the compressor's hash table and scratch buffers, up to ~200 KiB) takes its memory
+  from a `thread_local` block kept for the thread's later calls and freed when it exits, instead of allocating and
+  freeing it on every call, an mmap/munmap pair per page under musl. The bytes written are unchanged: the table is
+  cleared per fragment as before.
 
 ## boring_tls (`vendor/boring_tls`, Zig bindings over BoringSSL)
 

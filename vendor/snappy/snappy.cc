@@ -750,21 +750,42 @@ uint32_t CalculateTableSize(uint32_t input_size) {
 }
 }  // namespace
 
+// zpq: a thread's working memory, kept for its later calls and freed when the
+// thread exits. Allocated per call it was up to ~200 KiB, an mmap/munmap pair
+// per page under musl. Nothing carries between calls: GetHashTable clears the
+// table, and the scratch buffers are written before they are read.
+namespace {
+struct ThreadWorkingMemory {
+  char* mem = nullptr;
+  size_t size = 0;
+  ~ThreadWorkingMemory() {
+    if (mem != nullptr) std::allocator<char>().deallocate(mem, size);
+  }
+};
+thread_local ThreadWorkingMemory thread_working_memory;
+}  // namespace
+
 namespace internal {
 WorkingMemory::WorkingMemory(size_t input_size) {
   const size_t max_fragment_size = std::min(input_size, kBlockSize);
   const size_t table_size = CalculateTableSize(max_fragment_size);
   size_ = table_size * sizeof(*table_) + max_fragment_size +
           MaxCompressedLength(max_fragment_size);
-  mem_ = std::allocator<char>().allocate(size_);
+  ThreadWorkingMemory& kept = thread_working_memory;
+  if (kept.size < size_) {
+    if (kept.mem != nullptr) {
+      std::allocator<char>().deallocate(kept.mem, kept.size);
+    }
+    kept.mem = std::allocator<char>().allocate(size_);
+    kept.size = size_;
+  }
+  mem_ = kept.mem;
   table_ = reinterpret_cast<uint16_t*>(mem_);
   input_ = mem_ + table_size * sizeof(*table_);
   output_ = input_ + max_fragment_size;
 }
 
-WorkingMemory::~WorkingMemory() {
-  std::allocator<char>().deallocate(mem_, size_);
-}
+WorkingMemory::~WorkingMemory() = default;
 
 uint16_t* WorkingMemory::GetHashTable(size_t fragment_size,
                                       int* table_size) const {

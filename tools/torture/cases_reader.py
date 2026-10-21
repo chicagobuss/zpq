@@ -376,7 +376,8 @@ def _():
 @case("page_num_values_2g_tiny", B3)
 def _():
     return {"file": zero_page_file(T.UNCOMPRESSED, b"\x00" * 64, 64, 2**31 - 1),
-            "runs": battery("err", count=2**31 - 1, count_kind="err|eq", write_kind="safe", select="z", agg="sum(z) AS s", agg_value={"s": 0})}
+            "runs": battery("err", count=2**31 - 1, count_kind="err|eq", write_kind="safe", select="z",
+                            agg="sum(z) AS s", agg_value={"s": 0})}
 
 
 @case("dict_page_num_values_2g", B3)
@@ -398,7 +399,8 @@ def chunk_lie(mutate, kind="err", count_kind="err|eq", **kw):
     b = base()
     kw.setdefault("write_kind", "safe")  # a plain -o byte-copies chunks it does not decode
     return {"file": refooter(b, mutate), "runs": battery(kind, count=N, count_kind=count_kind, agg=AGG,
-                                                         agg_value=AGG_TRUE, rows=TRUE_ROWS if "eq" in kind else None, select="a, s",
+                                                         agg_value=AGG_TRUE,
+                                                         rows=TRUE_ROWS if "eq" in kind else None, select="a, s",
                                                          **kw)}
 
 
@@ -502,8 +504,9 @@ def two_int_cols(**kw):
 
 @case("chunk_overlap_same_type_consistent", B4)
 def _():
-    # Column y's chunk metadata copies column x's offsets and sizes exactly (stats dropped): a consistent lie. A reader
-    # that does not check overlap answers y with x's values.
+    # Column y's chunk metadata copies column x's offsets and sizes exactly (stats dropped): a consistent lie, so y
+    # reads as x's values. Lead's ruling (2026-10-20): overlap is accepted, not refused (real writer bugs such as
+    # dictionary_page_offset = 0 make valid files look overlapping, and decoding is bounds-checked).
     def m(f):
         for rg in (0, 1):
             x, y = cmd(f, rg, 0), cmd(f, rg, 1)
@@ -534,11 +537,12 @@ def _():
     return chunk_lie(m, kind="err", count_kind="eq")
 
 
-@case("chunk_file_path_external", B4)
+@case("chunk_file_path_external", B4, known="T14")
 def _():
-    # ColumnChunk.file_path names another file (here /etc/passwd). zpq never opens it: it reads the chunk from this
-    # file's bytes (pyarrow does the same; DuckDB refuses). Whether to refuse is an open policy question (REPORT.md).
-    return chunk_lie(lambda f: cc(f, 0, 0).set(T.CC_FILE_PATH, b"/etc/passwd", T.T_BIN), kind="err|eq")
+    # ColumnChunk.file_path names another file (here /etc/passwd). Lead's ruling (2026-10-20): refuse with a clear
+    # error, exit 1 (path-traversal risk, essentially unused). zpq reads the chunk from this file's bytes instead.
+    return chunk_lie(lambda f: cc(f, 0, 0).set(T.CC_FILE_PATH, b"/etc/passwd", T.T_BIN), kind="err",
+                     write_kind="err")
 
 
 @case("rowgroup_missing_column", B4)
@@ -892,13 +896,15 @@ def dict_runs(kind, n, rows=None, agg_value=None, group=None, filt_rows=None, fi
 @case("dict_index_oob_rle_500", B31)
 def _():
     body = T.rle_run(3, 4, 9) + T.rle_run(500, 4, 9)
-    return {"file": dict_file([T.dict_page(T.plain_i64(DICT12), 12), dpage(9, body, 8)], 8), "runs": dict_runs("err", 8)}
+    return {"file": dict_file([T.dict_page(T.plain_i64(DICT12), 12), dpage(9, body, 8)], 8),
+            "runs": dict_runs("err", 8)}
 
 
 @case("dict_index_oob_bitpacked_13", B31)
 def _():
     body = T.bitpack([0, 1, 2, 13, 4, 5, 15, 7], 4)
-    return {"file": dict_file([T.dict_page(T.plain_i64(DICT12), 12), dpage(4, body, 8)], 8), "runs": dict_runs("err", 8)}
+    return {"file": dict_file([T.dict_page(T.plain_i64(DICT12), 12), dpage(4, body, 8)], 8),
+            "runs": dict_runs("err", 8)}
 
 
 @case("dict_index_oob_optional_after_nulls", B31)
@@ -1183,7 +1189,8 @@ def ba_runs(kind, n):
 
 @case("plain_ba_len_4g", B35)
 def _():
-    return {"file": ba_file(b"\x01\x00\x00\x00a" + b"\xff\xff\xff\xff" + b"b" * 16, 2, T.PLAIN), "runs": ba_runs("err", 2)}
+    return {"file": ba_file(b"\x01\x00\x00\x00a" + b"\xff\xff\xff\xff" + b"b" * 16, 2, T.PLAIN),
+            "runs": ba_runs("err", 2)}
 
 
 @case("dlba_negative_length", B35)

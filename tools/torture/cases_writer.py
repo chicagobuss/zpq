@@ -419,7 +419,8 @@ def _():
     def gen(path):
         pq.write_table(t, path, row_group_size=len(vals), compression="zstd")
 
-    return {"file": gen, "cleanup": True, "runs": [wrun("filter-write", ["--scan-all", "--filter", "id >= 0"], t, mem="8G")]}
+    return {"file": gen, "cleanup": True,
+            "runs": [wrun("filter-write", ["--scan-all", "--filter", "id >= 0"], t, mem="8G")]}
 
 
 @case("w_dict_int_float_boundary", B21)
@@ -430,7 +431,8 @@ def _():
                   "i_past": pa.array([r % 1001 for r in range(n)], pa.int64()),
                   "f_at": pa.array([float(r % 1000) + 0.5 for r in range(n)], pa.float64()),
                   "f_past": pa.array([float(r % 1001) + 0.5 for r in range(n)], pa.float32())})
-    return {"file": pq_bytes(t, row_group_size=n), "runs": [wrun("select-write", ["--select", "i_at, i_past, f_at, f_past"], t)]}
+    return {"file": pq_bytes(t, row_group_size=n),
+            "runs": [wrun("select-write", ["--select", "i_at, i_past, f_at, f_past"], t)]}
 
 
 @case("w_huge_value_500mb", B22, big=True, known="T5")
@@ -452,7 +454,8 @@ def _():
         return None if flen < 100_000_000 else f"footer {flen} B: full min/max of the 500 MB value"
 
     return {"file": gen, "cleanup": True, "runs": [
-        wrun("filter-write", ["--scan-all", "--filter", "id >= 0"], want, mem="14G", js=(1,), stats_check=footer, zpq_rows=False)]}
+        wrun("filter-write", ["--scan-all", "--filter", "id >= 0"], want, mem="14G", js=(1,), stats_check=footer,
+             zpq_rows=False)]}
 
 
 def entropy_table(n=20_000, seed=9):
@@ -662,7 +665,8 @@ def bytes_order_check(cols):
                 mn = st.min.encode() if isinstance(st.min, str) else st.min
                 mx = st.max.encode() if isinstance(st.max, str) else st.max
                 if mn != min(vals) or mx != max(vals):
-                    return f"{c.path_in_schema} rg{rg}: bounds {mn[:12]!r}/{mx[:12]!r} != unsigned {min(vals)[:12]!r}/{max(vals)[:12]!r}"
+                    return (f"{c.path_in_schema} rg{rg}: bounds {mn[:12]!r}/{mx[:12]!r} != unsigned "
+                            f"{min(vals)[:12]!r}/{max(vals)[:12]!r}")
             start += n
         return None
     return check
@@ -675,7 +679,8 @@ def _():
     t = pa.table({"id": pa.array(range(10), pa.int64()), "u": pa.array(utf), "b": pa.array(binv, pa.binary()),
                   "fx": pa.array([bytes([x, 255 - x]) for x in (0, 127, 128, 255, 1, 200, 129, 126, 64, 192)],
                                  pa.binary(2))})
-    runs = [wrun("filter-write", ["--scan-all", "--filter", "id >= 0"], t, stats_check=bytes_order_check({"u", "b", "fx"})),
+    runs = [wrun("filter-write", ["--scan-all", "--filter", "id >= 0"], t,
+                 stats_check=bytes_order_check({"u", "b", "fx"})),
             wrun("select-write", ["--select", "id, u, b, fx"], t, stats_check=bytes_order_check({"u", "b", "fx"}))]
     return {"file": pq_bytes(t), "runs": runs}
 
@@ -730,9 +735,12 @@ def _():
     # max truncated to 64 bytes and incremented ('p'*63 + 'q'): a correct writer's output; zpq must find every row.
     b, pre = truncated_stats_file(b"p" * 63 + b"q", False)
     return {"file": b, "runs": [
-        run("eq-b", ["query", "{F}", "--filter", f"s = '{pre}b'", "--aggregate", "count(*) AS n"], E("eq", [{"n": 50}])),
-        run("gt", ["query", "{F}", "--filter", f"s > '{pre}a'", "--aggregate", "count(*) AS n"], E("eq", [{"n": 50}])),
-        run("max-trust", ["query", "{F}", "--trust-stats", "--aggregate", "max(s) AS m"], E("err|eq", [{"m": pre + "b"}])),
+        run("eq-b", ["query", "{F}", "--filter", f"s = '{pre}b'", "--aggregate", "count(*) AS n"],
+            E("eq", [{"n": 50}])),
+        run("gt", ["query", "{F}", "--filter", f"s > '{pre}a'", "--aggregate", "count(*) AS n"],
+            E("eq", [{"n": 50}])),
+        run("max-trust", ["query", "{F}", "--trust-stats", "--aggregate", "max(s) AS m"],
+            E("err|eq", [{"m": pre + "b"}])),
         run("max", ["query", "{F}", "--aggregate", "max(s) AS m"], E("eq", [{"m": pre + "b"}]))]}
 
 

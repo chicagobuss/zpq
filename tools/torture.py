@@ -128,7 +128,8 @@ def run_case(c, bins, outdir, log):
                 results.append(rec)
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
-                print(f"{'PASS' if ok else (f'KNOWN[{c.known}]' if c.known else 'FAIL')} {c.name:44s} {binname:5s} {run['label']:12s} rc={res.get('rc')} "
+                mark = "PASS" if ok else (f"KNOWN[{c.known}]" if c.known else "FAIL")
+                print(f"{mark} {c.name:44s} {binname:5s} {run['label']:12s} rc={res.get('rc')} "
                       f"rss={res.get('rss_kb')}KB {res.get('wall', 0):.2f}s {verdict[:150]}", flush=True)
                 continue
             argv = [str(binpath)] + [a.replace("{F}", str(path)).replace("{O}", str(cdir / f"{c.name}.out.parquet"))

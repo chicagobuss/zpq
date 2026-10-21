@@ -9811,6 +9811,74 @@ test "poisoned stats: a null count outside the chunk's values is refused, by def
     }
 }
 
+test "cut bounds prune but never answer: equality and ranges at the cut, min and max decoded" {
+    // full_match.parquet's s holds 'k%06d-' then 24 'p's, row ids 200..399 in row group 1. Its bounds there become what
+    // a writer cutting to 9 bytes writes: the min a prefix, the max a prefix grown by one, both marked inexact. ts's max
+    // there becomes an inexact 10^6 (no row holds it).
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            const st = rg1Stats(meta, 2);
+            st.min_value = "k000200-p";
+            st.max_value = "k000399-q";
+            st.min = null;
+            st.max = null;
+            st.is_min_value_exact = false;
+            st.is_max_value_exact = false;
+            const ts = rg1Stats(meta, 0);
+            ts.max_value = &big_ts;
+            ts.max = null;
+            ts.is_max_value_exact = false;
+        }
+        const big_ts = [_]u8{ 0x40, 0x42, 0x0f, 0, 0, 0, 0, 0 }; // 1_000_000
+    }.f;
+    const p = "pppppppppppppppppppppppp";
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        // Equal to the cut min, and to the cut max: no row holds either.
+        .{ .filter = "s = 'k000200-p'", .n = 0, .trusted = 0 },
+        .{ .filter = "s = 'k000399-q'", .n = 0, .trusted = 0 },
+        // The values the cut bounds stand for, just above the cut min and just below the cut max.
+        .{ .filter = "s = 'k000200-" ++ p ++ "'", .n = 1, .trusted = 1 },
+        .{ .filter = "s = 'k000399-" ++ p ++ "'", .n = 1, .trusted = 1 },
+        // Ranges with the cut bounds and their neighbours as edges.
+        .{ .filter = "s < 'k000200-p'", .n = 200, .trusted = 200 },
+        .{ .filter = "s <= 'k000200-pa'", .n = 200, .trusted = 200 },
+        .{ .filter = "s < 'k000200-pq'", .n = 201, .trusted = 201 },
+        .{ .filter = "s >= 'k000200-p'", .n = 1400, .trusted = 1400 },
+        .{ .filter = "s > 'k000399-q'", .n = 1200, .trusted = 1200 },
+        .{ .filter = "s < 'k000399-q'", .n = 400, .trusted = 400 },
+        .{ .filter = "s >= 'k000399-q'", .n = 1200, .trusted = 1200 },
+        .{ .filter = "ts <= 399", .n = 400, .trusted = 400 },
+    });
+
+    // The answers come from decoding, with and without --trust-stats.
+    const clean = try loadFullMatchFixture() orelse return error.SkipZigTest;
+    defer testing.allocator.free(clean);
+    const bytes = try rewritten(clean, .{ .footer = edit });
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+    for ([_]bool{ false, true }) |trust| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "min(s) AS lo, max(s) AS hi, max(ts) AS t, min(ts) AS u",
+            .parallelism = 1,
+            .trust_stats = trust,
+        };
+        var oracle_args = args;
+        oracle_args.scan_all = true;
+        const oracle = try runMultiAggregate(testing.allocator, arena_state.allocator(), oracle_args);
+        defer freeResult(oracle);
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), args);
+        defer freeResult(got);
+        expectSameAnswer(oracle, got) catch |err| {
+            std.debug.print("cut bounds: min/max answered from statistics, trust_stats={}\n", .{trust});
+            return err;
+        };
+        try testing.expectEqual(@as(i128, 1599), got.output.aggs[2].value.i);
+    }
+}
+
 test "poisoned stats: a page whose min is above its max drops the page index, by default and under --trust-stats" {
     // null_pages.parquet: id = row, ten pages of 100 rows in row group 0; page 1 holds 100..199.
     const edit = struct {

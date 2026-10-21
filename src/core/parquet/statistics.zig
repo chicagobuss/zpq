@@ -25,6 +25,11 @@ pub const ChunkStats = struct {
     /// In the column's type-defined order (`writtenBounds`), min never above max.
     bounds: ?Bounds = null,
     null_count: ?i64 = null,
+    /// Whether each bound is a value the chunk holds, not just a bound on them: writers cut long byte bounds (a prefix
+    /// for the min, a grown prefix for the max) and say so in `is_*_value_exact`. Pruning reads any bound; an answer
+    /// read from statistics only an exact one. Chunk statistics that do not say were never cut.
+    min_exact: bool = true,
+    max_exact: bool = true,
 };
 
 /// The one gate every reader of chunk statistics goes through: pruning, the full-match proof, stats-as-answer.
@@ -42,7 +47,13 @@ pub fn chunkStats(
     const bounds = writtenBounds(rg, col_idx, file_meta);
     if (bounds) |b| if (boundsInverted(cm.type, elem, b.min, b.max)) return .{};
     if (stats.null_count) |nc| if (nc < 0 or nc > cm.num_values) return .{};
-    const out: ChunkStats = .{ .bounds = bounds, .null_count = stats.null_count };
+    const modern = stats.min_value != null and stats.max_value != null;
+    const out: ChunkStats = .{
+        .bounds = bounds,
+        .null_count = stats.null_count,
+        .min_exact = !modern or (stats.is_min_value_exact orelse true),
+        .max_exact = !modern or (stats.is_max_value_exact orelse true),
+    };
     if (trust == .plausible) return out;
 
     const nc = stats.null_count orelse return out;
@@ -51,7 +62,9 @@ pub fn chunkStats(
         (stats.min != null and stats.max != null);
     if (cm.num_values > 0 and nc == cm.num_values and has_bounds) return .{};
     if (cm.num_values > 0 and nc == 0 and !has_bounds and boundsExpected(rg, col_idx, cm, file_meta)) {
-        return .{ .bounds = bounds };
+        var no_count = out;
+        no_count.null_count = null;
+        return no_count;
     }
     return out;
 }

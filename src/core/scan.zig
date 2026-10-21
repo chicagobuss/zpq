@@ -1290,6 +1290,9 @@ fn parseFooters(
 /// into one table, strictly in block order, as soon as every block before it has, and its own table is freed. A worker
 /// starts block `b` only once `b` is fewer than `ahead` blocks past the first unmerged one, so at most `ahead` block
 /// tables are alive beside the merged one, about what one table per worker holds.
+///
+/// A worker ahead of the window sleeps on `moved` rather than spinning: with more workers than free CPUs (an
+/// oversubscribed or virtualised host) a yielding waiter takes the CPU the merging worker needs to let it go.
 const BlockMerge = struct {
     tables: []expr_agg.GroupTable,
     merged: *expr_agg.GroupTable,
@@ -1299,24 +1302,31 @@ const BlockMerge = struct {
     /// The first block not yet merged.
     next: std.atomic.Value(usize) = .init(0),
     ahead: usize,
-    lock: std.atomic.Value(bool) = .init(false),
+    lock: std.Io.Mutex = .init,
     failed: std.atomic.Value(bool) = .init(false),
+    /// Bumped whenever `next` advances or a worker fails: the word `awaitTurn` sleeps on.
+    moved: std.atomic.Value(u32) = .init(0),
+
+    /// Only the OS futex is used, which no `Io` instance holds state for; the scan has no `Io` of its own.
+    const futex_io = std.Io.Threaded.global_single_threaded.io();
 
     /// Wait until block `b` may start; false once another worker has failed.
     fn awaitTurn(self: *BlockMerge, b: usize) bool {
-        while (b >= self.next.load(.acquire) + self.ahead) {
+        while (true) {
+            // Read `moved` before the condition: a merge or failure between the two changes it, and the wait returns.
+            const seen = self.moved.load(.acquire);
             if (self.failed.load(.acquire)) return false;
-            std.Thread.yield() catch {};
+            if (b < self.next.load(.acquire) + self.ahead) return true;
+            futex_io.futexWaitUncancelable(u32, &self.moved.raw, seen);
         }
-        return !self.failed.load(.acquire);
     }
 
     /// Block `b` is complete: merge it, and any finished after it, once every earlier block has merged. Whoever holds
     /// the lock merges every block ready by then, so none is left behind.
     fn finish(self: *BlockMerge, b: usize) !void {
         self.done[b].store(true, .release);
-        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.Thread.yield() catch {};
-        defer self.lock.store(false, .release);
+        self.lock.lockUncancelable(futex_io);
+        defer self.lock.unlock(futex_io);
         var n = self.next.load(.monotonic);
         while (n < self.tables.len and self.done[n].load(.acquire)) : (n += 1) {
             const src = &self.tables[n];
@@ -1331,11 +1341,18 @@ const BlockMerge = struct {
             src.deinit();
             src.* = expr_agg.GroupTable.init(self.gpa, 0);
             self.next.store(n + 1, .release);
+            self.wake();
         }
     }
 
     fn fail(self: *BlockMerge) void {
         self.failed.store(true, .release);
+        self.wake();
+    }
+
+    fn wake(self: *BlockMerge) void {
+        _ = self.moved.fetchAdd(1, .release);
+        futex_io.futexWake(u32, &self.moved.raw, std.math.maxInt(u32));
     }
 };
 
@@ -7117,6 +7134,41 @@ fn expectOrderedNames(order: expr_ast.ResultOrder, want: []const ?[]const u8) !v
     for (rows, want) |row, name| {
         if (name) |n| try testing.expectEqualStrings(n, row[0].s) else try testing.expect(row[0] == .null_val);
     }
+}
+
+test "an ordered merge's waiting worker sleeps until the block before its window merges, and wakes on failure" {
+    const gpa = testing.allocator;
+    var tables: [3]expr_agg.GroupTable = .{ .init(gpa, 0), .init(gpa, 0), .init(gpa, 0) };
+    defer for (&tables) |*t| t.deinit();
+    var merged = expr_agg.GroupTable.init(gpa, 0);
+    defer merged.deinit();
+    var done: [3]std.atomic.Value(bool) = @splat(.init(false));
+    var m: BlockMerge = .{ .tables = &tables, .merged = &merged, .calls = &.{}, .gpa = gpa, .done = &done, .ahead = 1 };
+    const Waiter = struct {
+        fn run(merge: *BlockMerge, b: usize, got: *std.atomic.Value(u8)) void {
+            got.store(if (merge.awaitTurn(b)) 1 else 2, .release);
+        }
+    };
+    try testing.expect(m.awaitTurn(0));
+    var got: std.atomic.Value(u8) = .init(0);
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ &m, 1, &got });
+    // Block 1 may not start while block 0 is unmerged.
+    for (0..20) |_| {
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+        try testing.expectEqual(@as(u8, 0), got.load(.acquire));
+    }
+    try m.finish(0);
+    t.join();
+    try testing.expectEqual(@as(u8, 1), got.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), m.next.load(.acquire));
+
+    var failed: std.atomic.Value(u8) = .init(0);
+    const t2 = try std.Thread.spawn(.{}, Waiter.run, .{ &m, 2, &failed });
+    try testing.io.sleep(.fromMilliseconds(2), .awake);
+    try testing.expectEqual(@as(u8, 0), failed.load(.acquire));
+    m.fail();
+    t2.join();
+    try testing.expectEqual(@as(u8, 2), failed.load(.acquire));
 }
 
 test "applyResultOrder: NULLs last both ways, NaN above numbers, stable ties, offset then limit" {

@@ -3871,7 +3871,6 @@ const PageIndex = struct {
 /// `--scan-all`. An unparseable or inconsistent index is ignored and its column decoded whole.
 fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.StatsUse) ![]?PageIndex {
     const num_leaves = in.rg.columns.items.len;
-    const num_rows: usize = @intCast(in.rg.num_rows);
     const indexes = try ra.alloc(?PageIndex, num_leaves);
     @memset(indexes, null);
     if (stats == .ignore) return indexes;
@@ -3894,13 +3893,12 @@ fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.Stats
 
         var off_reader = thrift.Reader.init(off_bytes);
         const offset_index = schema.OffsetIndex.read(ra, &off_reader) catch continue;
-        if (!pageIndexUsable(col_index, offset_index, num_rows)) continue;
-
         const cm = chunk_meta.meta_data orelse continue;
         const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
         const elem = in.meta.getColumnSchema(cm.path_in_schema.items);
         const trust: statistics.Trust = if (stats == .trust) .plausible else .corroborated;
-        if (!statistics.pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, in.rg.num_rows, trust)) continue;
+        const rows = in.rg.num_rows;
+        if (!statistics.pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, rows, trust)) continue;
 
         indexes[ci] = .{ .col_index = col_index, .offset_index = offset_index };
     }
@@ -4949,55 +4947,6 @@ fn copyChunkRecompressed(
     chunk.offset_index_length = @intCast(oi_w.bytes().len);
     try out.write(oi_w.bytes());
     return chunk;
-}
-
-/// Whether a column's page index can drive page pruning. Its arrays are indexed by page number together, and each
-/// page's `first_row_index` slices the row selection, so the arrays must agree in length and the row starts must be
-/// in range and non-decreasing. Page offsets and sizes are checked again where the pages are read.
-fn pageIndexUsable(ci: schema.ColumnIndex, oi: schema.OffsetIndex, num_rows: usize) bool {
-    const locs = oi.page_locations.items;
-    if (ci.null_pages.items.len != locs.len) return false;
-    if (ci.min_values.items.len != locs.len or ci.max_values.items.len != locs.len) return false;
-    if (ci.null_counts) |nc| if (nc.items.len != locs.len) return false;
-    // NaN counts as for null counts; `ColumnIndex.read` already leaves a list of another length out.
-    if (ci.nan_counts) |nc| if (nc.items.len != locs.len) return false;
-    var prev: i64 = 0;
-    for (locs) |loc| {
-        if (loc.offset < 0 or loc.compressed_page_size < 0) return false;
-        if (loc.first_row_index < prev) return false;
-        if (loc.first_row_index > num_rows) return false;
-        prev = loc.first_row_index;
-    }
-    return true;
-}
-
-test "pageIndexUsable rejects page indexes whose arrays or row starts disagree" {
-    const testing = std.testing;
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-
-    var ci: schema.ColumnIndex = .{};
-    var oi: schema.OffsetIndex = .{};
-    for ([_]i64{ 0, 10, 20 }) |first| {
-        try ci.null_pages.append(a, false);
-        try ci.min_values.append(a, "");
-        try ci.max_values.append(a, "");
-        try oi.page_locations.append(a, .{ .offset = 4 + first, .compressed_page_size = 8, .first_row_index = first });
-    }
-    try testing.expect(pageIndexUsable(ci, oi, 30));
-    try testing.expect(!pageIndexUsable(ci, oi, 19)); // a page starts past the row group
-
-    oi.page_locations.items[2].first_row_index = 5; // goes backwards
-    try testing.expect(!pageIndexUsable(ci, oi, 30));
-    oi.page_locations.items[2].first_row_index = 20;
-
-    oi.page_locations.items[0].first_row_index = -1;
-    try testing.expect(!pageIndexUsable(ci, oi, 30));
-    oi.page_locations.items[0].first_row_index = 0;
-
-    _ = ci.min_values.pop(); // ColumnIndex shorter than OffsetIndex
-    try testing.expect(!pageIndexUsable(ci, oi, 30));
 }
 
 /// A decoded column must describe exactly its row group's rows: a flat column one value per row, a repeated one

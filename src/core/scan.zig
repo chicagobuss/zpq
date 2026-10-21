@@ -9648,6 +9648,197 @@ test "runMultiAggregate: an input that is not Parquet is named with the reason" 
     try testing.expect(diag.cause != null);
 }
 
+// ============================================================ Poisoned statistics.
+//
+// Checked-in fixtures with their footer, ColumnIndex or OffsetIndex rewritten in memory so they lie in the ways
+// `statistics.chunkStats` and `statistics.pageIndexIsPlausible` check for. By default every answer is the decoded
+// one. Under --trust-stats impossible claims are still refused, while contradictory or uncorroborated ones are taken
+// as written, lie and all.
+// ============================================================
+
+/// What `rewritten` changes: the footer, and one chunk's ColumnIndex or OffsetIndex.
+const Rewrite = struct {
+    footer: ?*const fn (*schema.FileMetaData) void = null,
+    rg: usize = 0,
+    col: usize = 0,
+    column_index: ?*const fn (*schema.ColumnIndex) void = null,
+    offset_index: ?*const fn (*schema.OffsetIndex) void = null,
+};
+
+/// `bytes` rewritten by `rw`: an edited index is written after the pages and the footer pointed at it. Caller frees.
+fn rewritten(bytes: []const u8, rw: Rewrite) ![]u8 {
+    const thrift = @import("thrift.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try metadata.open(arena, bytes);
+    const old_len = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, bytes[0 .. bytes.len - 8 - old_len]);
+
+    const chunk = &meta.row_groups.items[rw.rg].columns.items[rw.col];
+    if (rw.column_index) |edit| {
+        const at: usize = @intCast(chunk.column_index_offset.?);
+        var r = thrift.Reader.init(bytes[at..][0..@intCast(chunk.column_index_length.?)]);
+        var ci = try schema.ColumnIndex.read(arena, &r);
+        edit(&ci);
+        var w = thrift.Writer.init(arena);
+        try ci.write(&w);
+        chunk.column_index_offset = @intCast(out.items.len);
+        chunk.column_index_length = @intCast(w.bytes().len);
+        try out.appendSlice(testing.allocator, w.bytes());
+    }
+    if (rw.offset_index) |edit| {
+        const at: usize = @intCast(chunk.offset_index_offset.?);
+        var r = thrift.Reader.init(bytes[at..][0..@intCast(chunk.offset_index_length.?)]);
+        var oi = try schema.OffsetIndex.read(arena, &r);
+        edit(&oi);
+        var w = thrift.Writer.init(arena);
+        try oi.write(&w);
+        chunk.offset_index_offset = @intCast(out.items.len);
+        chunk.offset_index_length = @intCast(w.bytes().len);
+        try out.appendSlice(testing.allocator, w.bytes());
+    }
+    if (rw.footer) |edit| edit(&meta);
+
+    var w = thrift.Writer.init(arena);
+    try meta.write(&w);
+    try out.appendSlice(testing.allocator, w.bytes());
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(w.bytes().len), .little);
+    try out.appendSlice(testing.allocator, &len);
+    try out.appendSlice(testing.allocator, "PAR1");
+    return out.toOwnedSlice(testing.allocator);
+}
+
+const PoisonCase = struct {
+    filter: []const u8,
+    /// count(*) by default (the decoded truth, hand-known) and under --trust-stats.
+    n: i128,
+    trusted: i128,
+};
+
+fn expectPoisonCases(path: []const u8, rw: Rewrite, cases: []const PoisonCase) !void {
+    const clean = try loadFixture(path) orelse return error.SkipZigTest;
+    defer testing.allocator.free(clean);
+    const bytes = try rewritten(clean, rw);
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for (cases) |c| for ([_]bool{ false, true }) |trust| for ([_]bool{ true, false }) |scan_all| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .filter = c.filter,
+            .aggregate = "count(*) AS n",
+            .parallelism = 1,
+            .trust_stats = trust,
+            .scan_all = scan_all,
+        });
+        defer freeResult(got);
+        const want = if (trust and !scan_all) c.trusted else c.n;
+        testing.expectEqual(want, got.output.aggs[0].value.i) catch |err| {
+            const fmt = "poisoned stats: {s}: {s} trust_stats={} scan_all={}\n";
+            std.debug.print(fmt, .{ path, c.filter, trust, scan_all });
+            return err;
+        };
+    };
+}
+
+/// full_match.parquet's row group 1 chunk statistics for leaf `ci`: ts, b, s, x, n, u.
+fn rg1Stats(meta: *schema.FileMetaData, ci: usize) *schema.Statistics {
+    return &meta.row_groups.items[1].columns.items[ci].meta_data.?.statistics.?;
+}
+
+test "poisoned stats: chunk bounds with min above max are refused, by default and under --trust-stats" {
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            for ([_]usize{ 0, 2, 3, 5 }) |ci| {
+                const st = rg1Stats(meta, ci);
+                std.mem.swap(?[]const u8, &st.min_value, &st.max_value);
+                std.mem.swap(?[]const u8, &st.min, &st.max);
+            }
+        }
+    }.f;
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        .{ .filter = "ts = 300", .n = 1, .trusted = 1 },
+        .{ .filter = "ts >= 250 AND ts <= 260", .n = 11, .trusted = 11 },
+        .{ .filter = "s = 'k000300-pppppppppppppppppppppppp'", .n = 1, .trusted = 1 },
+        .{ .filter = "u = 300", .n = 1, .trusted = 1 },
+        .{ .filter = "x > 5 AND ts >= 200 AND ts < 400", .n = 29, .trusted = 29 },
+    });
+}
+
+test "poisoned stats: an all-null count beside bounds decodes by default and is trusted under --trust-stats" {
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            rg1Stats(meta, 0).null_count = 200;
+        }
+    }.f;
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        .{ .filter = "ts IS NULL", .n = 0, .trusted = 200 },
+        .{ .filter = "ts IS NOT NULL", .n = 1600, .trusted = 1400 },
+        .{ .filter = "ts = 300", .n = 1, .trusted = 1 },
+    });
+}
+
+test "poisoned stats: a zero null count with no bounds decodes by default and is trusted under --trust-stats" {
+    // Row group 1's n is all null, so its writer kept no bounds; the footer now claims no nulls either.
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            rg1Stats(meta, 4).null_count = 0;
+        }
+    }.f;
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        .{ .filter = "n IS NULL", .n = 320, .trusted = 120 },
+        .{ .filter = "n IS NOT NULL", .n = 1280, .trusted = 1480 },
+    });
+}
+
+test "poisoned stats: a null count outside the chunk's values is refused, by default and under --trust-stats" {
+    const cases = [_]PoisonCase{
+        .{ .filter = "ts IS NULL", .n = 0, .trusted = 0 },
+        .{ .filter = "ts IS NOT NULL", .n = 1600, .trusted = 1600 },
+    };
+    inline for ([_]i64{ -1, 201, 1000 }) |nc| {
+        const edit = struct {
+            fn f(meta: *schema.FileMetaData) void {
+                rg1Stats(meta, 0).null_count = nc;
+            }
+        }.f;
+        try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &cases);
+    }
+}
+
+test "poisoned stats: a page whose min is above its max drops the page index, by default and under --trust-stats" {
+    // null_pages.parquet: id = row, ten pages of 100 rows in row group 0; page 1 holds 100..199.
+    const edit = struct {
+        fn f(ci: *schema.ColumnIndex) void {
+            std.mem.swap([]const u8, &ci.min_values.items[1], &ci.max_values.items[1]);
+        }
+    }.f;
+    try expectPoisonCases(null_pages_fixture, .{ .column_index = edit }, &.{
+        .{ .filter = "id = 130", .n = 1, .trusted = 1 },
+        .{ .filter = "id >= 126 AND id <= 128", .n = 3, .trusted = 3 },
+    });
+}
+
+test "poisoned stats: page locations out of page order drop the page index, by default and under --trust-stats" {
+    // Pages 1 and 2 of id swap places while their row starts stay in order: skipping to page 1 would decode page 2.
+    const edit = struct {
+        fn f(oi: *schema.OffsetIndex) void {
+            const locs = oi.page_locations.items;
+            std.mem.swap(i64, &locs[1].offset, &locs[2].offset);
+            std.mem.swap(i32, &locs[1].compressed_page_size, &locs[2].compressed_page_size);
+        }
+    }.f;
+    try expectPoisonCases(null_pages_fixture, .{ .offset_index = edit }, &.{
+        .{ .filter = "id = 130", .n = 1, .trusted = 1 },
+        .{ .filter = "id = 260", .n = 1, .trusted = 1 },
+    });
+}
+
 // ============================================================ All-null pages.
 //
 // The fixture's ColumnIndex flags whole pages of `v` and `s.b` all-null (see tools/gen_null_pages_fixture.py). A

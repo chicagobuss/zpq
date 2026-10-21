@@ -47,7 +47,8 @@ pub fn chunkStats(
 
     const nc = stats.null_count orelse return out;
     // Any written pair counts, read or not: the writer saw a value.
-    const has_bounds = (stats.min_value != null and stats.max_value != null) or (stats.min != null and stats.max != null);
+    const has_bounds = (stats.min_value != null and stats.max_value != null) or
+        (stats.min != null and stats.max != null);
     if (cm.num_values > 0 and nc == cm.num_values and has_bounds) return .{};
     if (cm.num_values > 0 and nc == 0 and !has_bounds and boundsExpected(rg, col_idx, cm, file_meta)) {
         return .{ .bounds = bounds };
@@ -74,7 +75,8 @@ fn boundsExpected(
     file_meta: ?*const schema.FileMetaData,
 ) bool {
     if (cm.type == .INT96 or !boundsReadable(rg, col_idx, file_meta)) return false;
-    if (cm.type == .FLOAT or cm.type == .DOUBLE) if (cm.statistics.?.nan_count) |n| if (n == cm.num_values) return false;
+    const float = cm.type == .FLOAT or cm.type == .DOUBLE;
+    if (float) if (cm.statistics.?.nan_count) |n| if (n == cm.num_values) return false;
     return true;
 }
 
@@ -217,6 +219,9 @@ pub fn bytewiseOrder(elem: schema.SchemaElement) bool {
 ///
 /// Impossible, refused under any `trust`:
 ///   - per-page lists whose lengths disagree with the OffsetIndex page count;
+///   - page locations out of page order: each page lies inside the chunk's bytes, after the one before it, and the
+///     row starts begin at 0 and increase strictly below the row group's rows. Skipping a page seeks to the next
+///     location and slices the row selection by these starts, so a misplaced one decodes the wrong page's rows;
 ///   - a negative null count, which no page can have;
 ///   - a page flagged all-null on a leaf with no optional or repeated ancestor (max definition level 0), which
 ///     cannot hold a null at all;
@@ -245,6 +250,9 @@ pub fn pageIndexIsPlausible(
         if (nc.items.len != n) return false;
         for (nc.items) |c| if (c < 0) return false;
     }
+    // `ColumnIndex.read` already leaves a NaN count list of another length out.
+    if (ci.nan_counts) |nc| if (nc.items.len != n) return false;
+    if (!pagesInOrder(locs, cm, rg_rows)) return false;
 
     var null_page_rows: i64 = 0;
     for (ci.null_pages.items, ci.min_values.items, ci.max_values.items, 0..) |is_null, min, max, i| {
@@ -266,6 +274,23 @@ pub fn pageIndexIsPlausible(
         if (cm.statistics) |s| if (s.null_count) |chunk_nulls| {
             if (null_page_rows > chunk_nulls) return false;
         };
+    }
+    return true;
+}
+
+fn pagesInOrder(locs: []const schema.PageLocation, cm: schema.ColumnMetaData, rg_rows: i64) bool {
+    const start = if (cm.dictionary_page_offset) |d| @min(d, cm.data_page_offset) else cm.data_page_offset;
+    if (start < 0 or cm.total_compressed_size < 0) return false;
+    const end = std.math.add(i64, start, cm.total_compressed_size) catch return false;
+    var bytes_from = start;
+    for (locs, 0..) |loc, i| {
+        if (loc.offset < bytes_from or loc.compressed_page_size <= 0) return false;
+        bytes_from = std.math.add(i64, loc.offset, loc.compressed_page_size) catch return false;
+        if (bytes_from > end) return false;
+        if (loc.first_row_index >= rg_rows) return false;
+        if (i == 0) {
+            if (loc.first_row_index != 0) return false;
+        } else if (loc.first_row_index <= locs[i - 1].first_row_index) return false;
     }
     return true;
 }
@@ -383,7 +408,9 @@ test "pageIndexIsPlausible: corpus page indexes are kept except the ones their f
             indexed += 1;
             const levels = meta.getColumnLevels(cm.path_in_schema.items);
             const elem = meta.getColumnSchema(cm.path_in_schema.items);
-            if (!pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, rg.num_rows, .corroborated)) rejected += 1;
+            const trust: Trust = .corroborated;
+            const plausible = pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, rg.num_rows, trust);
+            if (!plausible) rejected += 1;
         };
         testing.expect(indexed > 0) catch |err| {
             std.debug.print("{s}: no page index found\n", .{case.path});
@@ -432,7 +459,7 @@ test "pageIndexIsPlausible: each contradiction drops the index on its own" {
         .codec = .UNCOMPRESSED,
         .num_values = 16,
         .total_uncompressed_size = 0,
-        .total_compressed_size = 0,
+        .total_compressed_size = 20,
         .data_page_offset = 4,
         .index_page_offset = null,
         .dictionary_page_offset = null,
@@ -468,4 +495,272 @@ test "pageIndexIsPlausible: each contradiction drops the index on its own" {
     // Per-page lists that disagree with the OffsetIndex page count.
     const one_page = try Fixture.index(a, &.{false}, null);
     try testing.expect(!pageIndexIsPlausible(&one_page, &oi, cm, null, optional, 16, .corroborated));
+}
+
+fn le(comptime T: type, v: T) [@sizeOf(T)]u8 {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(@Int(.unsigned, @bitSizeOf(T)), &b, @bitCast(v), .little);
+    return b;
+}
+
+test "chunkStats: impossible statistics are refused under any trust" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = le(i64, 150);
+    const hi = le(i64, 120);
+    const f_lo = le(f64, 1.5);
+    const f_hi = le(f64, -2);
+    const u_max = le(u32, 0xffff_ffff);
+    const u_one = le(u32, 1);
+    const f_nan = le(f64, std.math.nan(f64));
+    const f_one = le(f64, 1);
+    var u32_elem = leafForTest(.INT32);
+    u32_elem.converted_type = .UINT_32;
+    var dec = leafForTest(.FIXED_LEN_BYTE_ARRAY);
+    dec.type_length = 2;
+    dec.logical_type = .{ .DECIMAL = .{ .scale = 0, .precision = 4 } };
+    var str = leafForTest(.BYTE_ARRAY);
+    str.logical_type = .{ .STRING = .{} };
+    const Case = struct { elem: schema.SchemaElement, stats: schema.Statistics };
+    const impossible = [_]Case{
+        // min above max, in each order: signed, float, bytewise, unsigned, DECIMAL, boolean, the deprecated pair.
+        .{ .elem = leafForTest(.INT64), .stats = .{ .min_value = &lo, .max_value = &hi, .null_count = 0 } },
+        .{ .elem = leafForTest(.DOUBLE), .stats = .{ .min_value = &f_lo, .max_value = &f_hi, .null_count = 0 } },
+        .{ .elem = str, .stats = .{ .min_value = "0150", .max_value = "0120", .null_count = 0 } },
+        .{ .elem = u32_elem, .stats = .{ .min_value = &u_max, .max_value = &u_one, .null_count = 0 } },
+        .{ .elem = dec, .stats = .{ .min_value = "\x00\x05", .max_value = "\xff\xfe", .null_count = 0 } },
+        .{ .elem = leafForTest(.BOOLEAN), .stats = .{ .min_value = "\x01", .max_value = "\x00", .null_count = 0 } },
+        .{ .elem = leafForTest(.INT64), .stats = .{ .min = &lo, .max = &hi, .null_count = 0 } },
+        // A null count outside the chunk's 100 values, the 1000-on-100 variant of T2 among them.
+        .{ .elem = leafForTest(.INT64), .stats = .{ .min_value = &hi, .max_value = &lo, .null_count = -1 } },
+        .{ .elem = leafForTest(.INT64), .stats = .{ .min_value = &hi, .max_value = &lo, .null_count = 101 } },
+        .{ .elem = leafForTest(.INT64), .stats = .{ .min_value = &hi, .max_value = &lo, .null_count = 1000 } },
+        .{ .elem = leafForTest(.INT64), .stats = .{ .null_count = 1000 } },
+    };
+    for (impossible, 0..) |c, i| for ([_]Trust{ .corroborated, .plausible }) |trust| {
+        const fx = try ColumnForTest.init(a, c.elem, c.stats);
+        const got = chunkStats(&fx.rg, 0, &fx.fm, trust);
+        testing.expect(got.bounds == null and got.null_count == null) catch |err| {
+            std.debug.print("impossible case {d} used under {t}\n", .{ i, trust });
+            return err;
+        };
+    };
+
+    // Bounds in order for the column's own order stay, though another order would call them inverted.
+    const unsigned_ok = try ColumnForTest.init(a, u32_elem, .{ .min_value = &u_one, .max_value = &u_max });
+    try testing.expect(chunkStats(&unsigned_ok.rg, 0, &unsigned_ok.fm, .corroborated).bounds != null);
+    const dec_ok = try ColumnForTest.init(a, dec, .{ .min_value = "\xff\xfe", .max_value = "\x00\x05" });
+    try testing.expect(chunkStats(&dec_ok.rg, 0, &dec_ok.fm, .corroborated).bounds != null);
+    // NaN bounds are not judged here; every reader of float bounds declines them.
+    const nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .min_value = &f_nan, .max_value = &f_one });
+    try testing.expect(chunkStats(&nan.rg, 0, &nan.fm, .corroborated).bounds != null);
+
+    // A flat chunk whose value count is not its row count, either way.
+    for ([_]i64{ 99, 101 }) |num_values| for ([_]Trust{ .corroborated, .plausible }) |trust| {
+        var fx = try ColumnForTest.init(a, leafForTest(.INT64), .{ .min_value = &hi, .max_value = &lo });
+        fx.rg.columns.items[0].meta_data.?.num_values = num_values;
+        const got = chunkStats(&fx.rg, 0, &fx.fm, trust);
+        try testing.expect(got.bounds == null and got.null_count == null);
+    };
+}
+
+test "chunkStats: contradictory and uncorroborated null counts are used only when plausible ones are trusted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = le(i64, 100);
+    const hi = le(i64, 199);
+
+    // Every row null, yet bounds (T2): both claims go by default.
+    const i64_elem = leafForTest(.INT64);
+    const all_null = try ColumnForTest.init(a, i64_elem, .{ .min_value = &lo, .max_value = &hi, .null_count = 100 });
+    const strict = chunkStats(&all_null.rg, 0, &all_null.fm, .corroborated);
+    try testing.expect(strict.bounds == null and strict.null_count == null);
+    const trusted = chunkStats(&all_null.rg, 0, &all_null.fm, .plausible);
+    try testing.expectEqual(@as(?i64, 100), trusted.null_count);
+    try testing.expect(trusted.bounds != null);
+    // ...the deprecated pair counts as bounds too.
+    const legacy = try ColumnForTest.init(a, leafForTest(.INT64), .{ .min = &lo, .max = &hi, .null_count = 100 });
+    try testing.expect(chunkStats(&legacy.rg, 0, &legacy.fm, .corroborated).null_count == null);
+    // Every row null and no bounds is what a writer writes.
+    const honest = try ColumnForTest.init(a, leafForTest(.INT64), .{ .null_count = 100 });
+    try testing.expectEqual(@as(?i64, 100), chunkStats(&honest.rg, 0, &honest.fm, .corroborated).null_count);
+
+    // No nulls and no bounds (T3): uncorroborated by default where a writer would have written bounds.
+    const bare = try ColumnForTest.init(a, leafForTest(.INT64), .{ .null_count = 0 });
+    try testing.expectEqual(@as(?i64, null), chunkStats(&bare.rg, 0, &bare.fm, .corroborated).null_count);
+    try testing.expectEqual(@as(?i64, 0), chunkStats(&bare.rg, 0, &bare.fm, .plausible).null_count);
+    const with_bounds = try ColumnForTest.init(a, i64_elem, .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    try testing.expectEqual(@as(?i64, 0), chunkStats(&with_bounds.rg, 0, &with_bounds.fm, .corroborated).null_count);
+    // Where a writer keeps no bounds: INT96, an order zpq cannot read, a float chunk of nothing but NaN.
+    const int96 = try ColumnForTest.init(a, leafForTest(.INT96), .{ .null_count = 0 });
+    try testing.expectEqual(@as(?i64, 0), chunkStats(&int96.rg, 0, &int96.fm, .corroborated).null_count);
+    var interval = leafForTest(.FIXED_LEN_BYTE_ARRAY);
+    interval.converted_type = .INTERVAL;
+    const unordered = try ColumnForTest.init(a, interval, .{ .null_count = 0 });
+    try testing.expectEqual(@as(?i64, 0), chunkStats(&unordered.rg, 0, &unordered.fm, .corroborated).null_count);
+    const all_nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .null_count = 0, .nan_count = 100 });
+    try testing.expectEqual(@as(?i64, 0), chunkStats(&all_nan.rg, 0, &all_nan.fm, .corroborated).null_count);
+    const some_nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .null_count = 0, .nan_count = 3 });
+    try testing.expectEqual(@as(?i64, null), chunkStats(&some_nan.rg, 0, &some_nan.fm, .corroborated).null_count);
+}
+
+test "pageIndexIsPlausible: page locations must lie in page order inside the chunk" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Three pages of 10 rows and 10 bytes from byte 4; the chunk spans bytes 4..34.
+    var ci: schema.ColumnIndex = .{};
+    var oi: schema.OffsetIndex = .{};
+    for ([_]i64{ 0, 10, 20 }) |first| {
+        try ci.null_pages.append(a, false);
+        try ci.min_values.append(a, "");
+        try ci.max_values.append(a, "");
+        try oi.page_locations.append(a, .{ .offset = 4 + first, .compressed_page_size = 10, .first_row_index = first });
+    }
+    const cm: schema.ColumnMetaData = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 30,
+        .total_uncompressed_size = 30,
+        .total_compressed_size = 30,
+        .data_page_offset = 4,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+    };
+    const check = struct {
+        fn f(c: *const schema.ColumnIndex, o: *const schema.OffsetIndex, m: schema.ColumnMetaData, rows: i64) bool {
+            return pageIndexIsPlausible(c, o, m, null, .{ .max_def = 1, .max_rep = 0 }, rows, .plausible);
+        }
+    }.f;
+    try testing.expect(check(&ci, &oi, cm, 30));
+    try testing.expect(!check(&ci, &oi, cm, 20)); // a page starts at the row group's end
+
+    const locs = oi.page_locations.items;
+    const Edit = struct { page: usize, loc: schema.PageLocation };
+    const edits = [_]Edit{
+        .{ .page = 2, .loc = .{ .offset = 24, .compressed_page_size = 10, .first_row_index = 5 } }, // rows go back
+        .{ .page = 2, .loc = .{ .offset = 24, .compressed_page_size = 10, .first_row_index = 10 } }, // rows repeat
+        .{ .page = 0, .loc = .{ .offset = 4, .compressed_page_size = 10, .first_row_index = 3 } }, // rows start late
+        .{ .page = 0, .loc = .{ .offset = 4, .compressed_page_size = 10, .first_row_index = -1 } },
+        .{ .page = 1, .loc = .{ .offset = 10, .compressed_page_size = 10, .first_row_index = 10 } }, // overlaps page 0
+        .{ .page = 0, .loc = .{ .offset = 0, .compressed_page_size = 4, .first_row_index = 0 } }, // before the chunk
+        .{ .page = 2, .loc = .{ .offset = 30, .compressed_page_size = 10, .first_row_index = 20 } }, // past its end
+        .{ .page = 1, .loc = .{ .offset = 14, .compressed_page_size = 0, .first_row_index = 10 } }, // no bytes
+    };
+    for (edits, 0..) |e, i| {
+        const kept = locs[e.page];
+        locs[e.page] = e.loc;
+        defer locs[e.page] = kept;
+        testing.expect(!check(&ci, &oi, cm, 30)) catch |err| {
+            std.debug.print("page location edit {d} kept the index\n", .{i});
+            return err;
+        };
+    }
+    // T7: pages 1 and 2 swapped while their row starts stay in order.
+    std.mem.swap(i64, &locs[1].offset, &locs[2].offset);
+    try testing.expect(!check(&ci, &oi, cm, 30));
+    std.mem.swap(i64, &locs[1].offset, &locs[2].offset);
+
+    // A dictionary page first moves the chunk's start before the first data page.
+    var with_dict = cm;
+    with_dict.dictionary_page_offset = 0;
+    with_dict.data_page_offset = 4;
+    with_dict.total_compressed_size = 34;
+    try testing.expect(check(&ci, &oi, with_dict, 30));
+
+    _ = ci.min_values.pop(); // ColumnIndex shorter than OffsetIndex
+    try testing.expect(!check(&ci, &oi, cm, 30));
+}
+
+test "pageIndexIsPlausible: inverted page bounds are refused under any trust, contradictions only by default" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Two pages of 10 rows each.
+    var oi: schema.OffsetIndex = .{};
+    try oi.page_locations.appendSlice(a, &.{
+        .{ .offset = 4, .compressed_page_size = 10, .first_row_index = 0 },
+        .{ .offset = 14, .compressed_page_size = 10, .first_row_index = 10 },
+    });
+    const Page = struct { null_page: bool = false, min: []const u8, max: []const u8, nulls: i64 = 0 };
+    const Fx = struct {
+        fn index(alloc: std.mem.Allocator, pages: []const Page) !schema.ColumnIndex {
+            var ci: schema.ColumnIndex = .{};
+            var nc: std.ArrayListUnmanaged(i64) = .empty;
+            for (pages) |p| {
+                try ci.null_pages.append(alloc, p.null_page);
+                try ci.min_values.append(alloc, p.min);
+                try ci.max_values.append(alloc, p.max);
+                try nc.append(alloc, p.nulls);
+            }
+            ci.null_counts = nc;
+            return ci;
+        }
+    };
+    var cm: schema.ColumnMetaData = .{
+        .type = .INT32,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 20,
+        .total_uncompressed_size = 20,
+        .total_compressed_size = 20,
+        .data_page_offset = 4,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+    };
+    const optional: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+    const one = le(i32, 1);
+    const five = le(i32, 5);
+    const max_u = le(u32, 0xffff_ffff);
+    var u32_elem = leafForTest(.INT32);
+    u32_elem.converted_type = .UINT_32;
+    const Case = struct {
+        type: schema.Type = .INT32,
+        elem: ?schema.SchemaElement = null,
+        pages: []const Page,
+        /// Kept by default, and under --trust-stats.
+        strict: bool,
+        trusted: bool,
+    };
+    const ok: Page = .{ .min = &one, .max = &five };
+    const wide: Page = .{ .min = &one, .max = &max_u }; // in order unsigned, inverted signed
+    const null_with_bounds: Page = .{ .null_page = true, .min = &one, .max = &five, .nulls = 10 };
+    const honest_null: Page = .{ .null_page = true, .min = "", .max = "", .nulls = 10 };
+    const cases = [_]Case{
+        .{ .pages = &.{ ok, .{ .min = &one, .max = &five, .nulls = 3 } }, .strict = true, .trusted = true },
+        // T6: one value page with min above max.
+        .{ .pages = &.{ .{ .min = &five, .max = &one }, ok }, .strict = false, .trusted = false },
+        .{
+            .type = .BYTE_ARRAY,
+            .pages = &.{ .{ .min = "0149", .max = "0125" }, .{ .min = "a", .max = "b" } },
+            .strict = false,
+            .trusted = false,
+        },
+        .{ .elem = u32_elem, .pages = &.{ wide, ok }, .strict = true, .trusted = true },
+        .{ .pages = &.{ wide, ok }, .strict = false, .trusted = false },
+        // A null count above the page's rows.
+        .{ .pages = &.{ .{ .min = &one, .max = &five, .nulls = 11 }, ok }, .strict = false, .trusted = false },
+        // A null page with bounds, and a page of nothing but nulls not flagged as one.
+        .{ .pages = &.{ null_with_bounds, ok }, .strict = false, .trusted = true },
+        .{ .pages = &.{ .{ .min = &one, .max = &five, .nulls = 10 }, ok }, .strict = false, .trusted = true },
+        .{ .pages = &.{ honest_null, ok }, .strict = true, .trusted = true },
+    };
+    for (cases, 0..) |c, i| {
+        const ci = try Fx.index(a, c.pages);
+        cm.type = c.type;
+        cm.statistics = .{ .null_count = 20 };
+        for ([_]Trust{ .corroborated, .plausible }, [_]bool{ c.strict, c.trusted }) |trust, want| {
+            testing.expectEqual(want, pageIndexIsPlausible(&ci, &oi, cm, c.elem, optional, 20, trust)) catch |err| {
+                std.debug.print("page bounds case {d} under {t}\n", .{ i, trust });
+                return err;
+            };
+        }
+    }
 }

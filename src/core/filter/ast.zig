@@ -312,8 +312,8 @@ pub fn eql(a: Filter, b: Filter) bool {
             for (ca.children, cb.children) |x, y| if (!eql(x, y)) break :blk false;
             break :blk true;
         },
-        .string => |l| l.col_idx == b.string.col_idx and l.op == b.string.op and std.mem.eql(u8, l.value, b.string.value) and
-            l.trust_stats == b.string.trust_stats,
+        .string => |l| l.col_idx == b.string.col_idx and l.op == b.string.op and
+            std.mem.eql(u8, l.value, b.string.value) and l.trust_stats == b.string.trust_stats,
         .float => |l| l.col_idx == b.float.col_idx and l.op == b.float.op and
             @as(u32, @bitCast(l.value)) == @as(u32, @bitCast(b.float.value)) and
             l.trust_missing_nan_count == b.float.trust_missing_nan_count and l.trust_stats == b.float.trust_stats,
@@ -326,7 +326,8 @@ pub fn eql(a: Filter, b: Filter) bool {
             std.mem.eql(u8, m.operand, b.like.operand),
         inline .int32, .int64, .uint64, .decimal, .boolean => |l, tag| blk: {
             const o = @field(b, @tagName(tag));
-            break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value and l.trust_stats == o.trust_stats;
+            break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value and
+                l.trust_stats == o.trust_stats;
         },
     };
 }

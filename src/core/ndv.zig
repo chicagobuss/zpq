@@ -372,7 +372,8 @@ pub fn collectRetaining(
                     dictionary_peak +|= dictionaryDecodePeak(cm, h);
                     known = true;
                     widest = @max(widest, @as(u64, @intCast(h.dictionary_page_header.?.num_values)));
-                    break :blk @min(rows, @as(u64, @intCast(h.dictionary_page_header.?.num_values)) + nullBound(rg, ci, m));
+                    const entries: u64 = @intCast(h.dictionary_page_header.?.num_values);
+                    break :blk @min(rows, entries + nullBound(rg, ci, m));
                 };
                 covered = false;
                 full[ki] = false;

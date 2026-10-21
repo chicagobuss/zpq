@@ -863,19 +863,32 @@ test "full-match proof: IS [NOT] NULL from null_count" {
     const not_null: ast.Filter = .{ .null_check = .{ .col_idx = 0, .is_not = true } };
     const is_null: ast.Filter = .{ .null_check = .{ .col_idx = 0, .is_not = false } };
 
-    const none = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .null_count = 0 });
+    const lo = try le64(a, 1);
+    const none = try ProofFixture.init(a, leafElem(.INT64), .{ .min_value = lo, .max_value = lo, .null_count = 0 });
     try testing.expectEqual(Decision.always_match, none.decide(not_null));
     try testing.expectEqual(Decision.skip, none.decide(is_null));
-    const all = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .null_count = 100 });
+    const all = try ProofFixture.init(a, leafElem(.INT64), .{ .null_count = 100 });
     try testing.expectEqual(Decision.skip, all.decide(not_null));
     try testing.expectEqual(Decision.always_match, all.decide(is_null));
-    const unknown = try ProofFixture.init(a, leafElem(.DOUBLE), .{});
+    const unknown = try ProofFixture.init(a, leafElem(.INT64), .{});
     try testing.expectEqual(Decision.unknown, unknown.decide(not_null));
 
-    // A repeated leaf counts values, not rows.
-    var repeated = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .null_count = 0 });
-    repeated.rg.columns.items[0].meta_data.?.num_values = 250;
-    try testing.expectEqual(Decision.keep, repeated.decide(not_null));
+    // No nulls but no bounds either: uncorroborated, so decoded unless --trust-stats vouches for it.
+    const bare = try ProofFixture.init(a, leafElem(.INT64), .{ .null_count = 0 });
+    try testing.expectEqual(Decision.unknown, bare.decide(not_null));
+    try testing.expectEqual(Decision.unknown, bare.decide(is_null));
+    var trusted_not_null = not_null;
+    trusted_not_null.null_check.trust_stats = true;
+    var trusted_is_null = is_null;
+    trusted_is_null.null_check.trust_stats = true;
+    try testing.expectEqual(Decision.always_match, bare.decide(trusted_not_null));
+    try testing.expectEqual(Decision.skip, bare.decide(trusted_is_null));
+
+    // A flat leaf whose value count is not its row count is refused outright.
+    var miscounted = try ProofFixture.init(a, leafElem(.INT64), .{ .min_value = lo, .max_value = lo, .null_count = 0 });
+    miscounted.rg.columns.items[0].meta_data.?.num_values = 250;
+    try testing.expectEqual(Decision.unknown, miscounted.decide(not_null));
+    try testing.expectEqual(Decision.unknown, miscounted.decide(trusted_not_null));
 }
 
 test "bounds are unreadable under an undeclared column order or an unordered annotation, for chunks and pages" {

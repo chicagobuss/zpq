@@ -2101,6 +2101,44 @@ pub fn plainBits(buf: *const OutputAggregator.ColumnBuf, elem: *const schema.Sch
     }
 }
 
+/// Per row, the PLAIN bits of every row before it (`plainBits` over all of `agg`'s columns, summed): `n + 1` running
+/// totals, so the bits of rows `lo..hi` are `prefix[hi] - prefix[lo]` and the row a byte target falls in is found by
+/// search. The sums are `plainBits`'s exactly.
+pub fn plainBitsPrefix(arena: std.mem.Allocator, agg: *const OutputAggregator) ![]u64 {
+    const n = agg.num_rows;
+    const prefix = try arena.alloc(u64, n + 1);
+    @memset(prefix, 0);
+    // Fixed-width columns without NULLs take the same bits every row: added once per row in the running sum.
+    var per_row: u64 = 0;
+    for (agg.cols, agg.schema_elems) |*buf, *elem| {
+        const fixed: ?u64 = switch (elem.type orelse .BYTE_ARRAY) {
+            .BOOLEAN => 1,
+            .INT32, .FLOAT => 32,
+            .INT64, .DOUBLE => 64,
+            .INT96 => 96,
+            .FIXED_LEN_BYTE_ARRAY => @as(u64, @intCast(@max(0, elem.type_length orelse 0))) * 8,
+            .BYTE_ARRAY => null,
+        };
+        switch (buf.*) {
+            inline else => |b| {
+                if (fixed) |w| if (b.max_def == 0) {
+                    per_row += w;
+                    continue;
+                };
+                for (0..n) |r| {
+                    if (b.max_def > 0 and b.def_levels.items[r] != b.max_def) continue;
+                    prefix[r + 1] += fixed orelse if (comptime @TypeOf(b.dict) != []const []const u8) 0 else blk: {
+                        const v = if (b.coded) b.dict[b.codes.items[r]] else b.values.items[r];
+                        break :blk (4 + @as(u64, v.len)) * 8;
+                    };
+                }
+            },
+        }
+    }
+    for (1..n + 1) |r| prefix[r] += prefix[r - 1] + per_row;
+    return prefix;
+}
+
 /// An encoded chunk placed at the sink's offset `out_offset.*`: its metadata copied into `out_arena` with offsets made
 /// absolute, and its pages (offsets still relative to the chunk) copied there too, for its page index.
 pub fn placeChunk(
@@ -7681,5 +7719,54 @@ test "cloneColumnMeta keeps every statistics field, the bounds' exactness among 
         if (@TypeOf(want) == ?[]const u8) {
             try std.testing.expectEqualStrings(want.?, have.?);
         } else try std.testing.expectEqual(want, have);
+    }
+}
+
+test "plainBitsPrefix: every range's bits are plainBits' over the same rows, whatever the lanes and NULLs" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 257;
+    var agg: OutputAggregator = .{
+        .arena = a,
+        .cols = try a.alloc(OutputAggregator.ColumnBuf, 4),
+        .schema_elems = try a.alloc(schema.SchemaElement, 4),
+        .paths = &.{},
+        .num_rows = n,
+        .captured = true,
+    };
+    const base: schema.SchemaElement = .{
+        .type = .INT64,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "c",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    for (agg.schema_elems) |*e| e.* = base;
+    agg.schema_elems[1].type = .BYTE_ARRAY;
+    agg.schema_elems[2].type = .BYTE_ARRAY;
+    agg.schema_elems[3].type = .BOOLEAN;
+    agg.cols[0] = .{ .i64 = .{} };
+    agg.cols[1] = .{ .string = .{} };
+    agg.cols[2] = .{ .string = .{ .coded = true, .dict = &.{ "x", "yyyy", "" }, .max_def = 1 } };
+    agg.cols[3] = .{ .boolean = .{ .max_def = 1 } };
+    for (0..n) |r| {
+        try agg.cols[0].i64.values.append(a, @intCast(r));
+        try agg.cols[1].string.values.append(a, "abcdefghij"[0 .. r % 11]);
+        try agg.cols[2].string.codes.append(a, @intCast(r % 3));
+        try agg.cols[2].string.def_levels.append(a, @intFromBool(r % 4 != 0));
+        try agg.cols[3].boolean.values.append(a, r % 2 == 0);
+        try agg.cols[3].boolean.def_levels.append(a, @intFromBool(r % 5 != 0));
+    }
+    const prefix = try plainBitsPrefix(a, &agg);
+    try testing.expectEqual(@as(usize, n + 1), prefix.len);
+    for ([_][2]usize{ .{ 0, n }, .{ 0, 0 }, .{ 3, 4 }, .{ 17, 200 }, .{ 100, n } }) |lohi| {
+        var want: u64 = 0;
+        for (agg.cols, agg.schema_elems) |*c, *e| want += plainBits(c, e, lohi[0], lohi[1]);
+        try testing.expectEqual(want, prefix[lohi[1]] - prefix[lohi[0]]);
     }
 }

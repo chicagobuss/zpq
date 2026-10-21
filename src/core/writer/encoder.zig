@@ -246,7 +246,7 @@ pub const Plan = struct {
         };
     }
 
-    /// The chunk: the dictionary page, then `pages` (one per `page(i)`, in order), and its metadata, on `arena`.
+    /// The chunk: the dictionary page, then `pages` (one per `page(i)`, in order), and its metadata, all on `arena`.
     pub fn finish(self: *const Plan, arena: std.mem.Allocator, pages: []const BuiltPage) Error!EncodedColumn {
         std.debug.assert(pages.len == self.ends.len);
         var total: usize = self.dict_page.len;
@@ -263,6 +263,8 @@ pub const Plan = struct {
             @memcpy(bytes[pos..][0..pg.bytes.len], pg.bytes);
             info.* = pg.info;
             info.offset = pos;
+            if (info.min) |v| info.min = try arena.dupe(u8, v);
+            if (info.max) |v| info.max = try arena.dupe(u8, v);
             pos += pg.bytes.len;
         }
 
@@ -300,7 +302,7 @@ pub const Plan = struct {
                 .data_page_offset = @intCast(self.dict_page.len),
                 .dictionary_page_offset = if (has_dict) 0 else null,
                 .index_page_offset = null,
-                .statistics = self.stats,
+                .statistics = try ownStats(arena, self.stats),
                 .encoding_stats = enc_stats,
             },
             .pages = infos,
@@ -370,6 +372,16 @@ fn pageLimit() usize {
 }
 
 var test_page_limit: usize = std.math.maxInt(i32);
+
+/// `stats` with its bounds copied onto `arena`: a finished chunk holds nothing of the memory its plan and pages were
+/// built on, which may be reused as soon as it is finished.
+fn ownStats(arena: std.mem.Allocator, stats: ?schema.Statistics) Error!?schema.Statistics {
+    var st = stats orelse return null;
+    inline for (.{ "max", "min", "max_value", "min_value" }) |f| {
+        if (@field(st, f)) |v| @field(st, f) = try arena.dupe(u8, v);
+    }
+    return st;
+}
 
 /// A data page built by `Plan.page`: header and compressed payload, its uncompressed length with the header, and its
 /// page index entry (`offset` set by `Plan.finish`).

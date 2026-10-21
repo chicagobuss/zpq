@@ -5,8 +5,9 @@ The dual of `differential.py` (which randomizes *data* over a fixed query
 set): this randomizes the *operations* over a fixed *corpus*. For each
 parquet file in the corpus it introspects the real schema, generates a
 seeded batch of random-but-valid aggregate queries (count/min/max/sum/avg,
-optionally under a random filter sampled from the column's own values), and
-runs each through ZPQ and DuckDB, comparing normalized results.
+avg_state beside each avg, optionally under a random filter sampled from the
+column's own values), and runs each through ZPQ and DuckDB, comparing
+normalized results.
 
 The point of the corpus living on S3 (rustfs / R2 / real S3) is that ZPQ
 reads it **over the network via its own SigV4 client** — the same path a
@@ -172,15 +173,16 @@ def gen_ops(local_path: str, cols: list[tuple[str, str]], n: int, rng: random.Ra
     return ops
 
 
-def fold_avg(zv):
-    """ZPQ emits avg as {sum,count} so partial averages re-aggregate across a
-    fan-out; fold to a scalar before comparing. count==0 → empty → NULL. A
-    non-finite sum arrives as the string "NaN"/"Infinity" — pass it through
-    for the NaN-aware compare."""
-    if isinstance(zv, dict) and "sum" in zv and "count" in zv:
-        s, c = zv["sum"], zv["count"]
-        return None if not c else (s if isinstance(s, str) else s / c)
-    return zv
+def with_avg_state(agg: str):
+    """(zpq agg, DuckDB agg) pairs for one generated op: the op itself and, for an avg, avg_state over the same
+    argument, whose {sum, count} DuckDB answers as a struct. DuckDB's sum is cast to DOUBLE: past 2^53 zpq's f64 sum of
+    an integer column prints as the double's digits, which an exact integer compare would reject. Derived here rather
+    than drawn in gen_ops, so a seed still yields the same ops."""
+    pairs = [(agg, agg)]
+    if agg.startswith("avg("):
+        arg = agg[len("avg("):agg.rindex(")")]
+        pairs.append((f"avg_state({arg}) AS r", f"{{'sum': sum({arg})::DOUBLE, 'count': count({arg})}} AS r"))
+    return pairs
 
 
 def run_read(files, args):
@@ -196,24 +198,25 @@ def run_read(files, args):
             skipped += 1  # DuckDB can't read it → no oracle; not our verdict
             continue
         frng = random.Random(f"{args.seed}:{f.name}")  # stable across processes (tuple.__hash__ is salted)
-        for agg, where in gen_ops(local, cols, args.ops, frng):
-            try:
-                d = duck_agg(local, agg, where)
-            except RuntimeError:
-                continue
-            z = zpq_agg(zpq_path, agg, where)
-            checked += 1
-            if z is None:
-                mism += 1
-                failures.append((f.name, agg, where, "zpq error/no-result", d))
-                continue
-            ok = all(
-                compare_values(fold_avg(zv), next((d[dk] for dk in d if dk.lower() == k.lower()), None))
-                for k, zv in z.items()
-            )
-            if not ok:
-                mism += 1
-                failures.append((f.name, agg, where, z, d))
+        for op, where in gen_ops(local, cols, args.ops, frng):
+            for agg, dagg in with_avg_state(op):
+                try:
+                    d = duck_agg(local, dagg, where)
+                except RuntimeError:
+                    continue
+                z = zpq_agg(zpq_path, agg, where)
+                checked += 1
+                if z is None:
+                    mism += 1
+                    failures.append((f.name, agg, where, "zpq error/no-result", d))
+                    continue
+                ok = all(
+                    compare_values(zv, next((d[dk] for dk in d if dk.lower() == k.lower()), None))
+                    for k, zv in z.items()
+                )
+                if not ok:
+                    mism += 1
+                    failures.append((f.name, agg, where, z, d))
     return checked, mism, skipped, failures
 
 

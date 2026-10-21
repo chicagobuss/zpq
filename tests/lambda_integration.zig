@@ -616,11 +616,12 @@ test "lambda aggregate over no rows answers NULL for sum/avg/min/max, 0 for coun
             "Content-Type: application/json\r\n",
         "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"filter\":\"id < 0\"," ++
             "\"aggregate\":\"sum(id) AS s, avg(id) AS a, min(string_col) AS m, max(double_col) AS x, " ++
-            "count(*) AS c, count(id) AS ci\"}",
+            "count(*) AS c, count(id) AS ci, avg_state(id) AS st\"}",
     );
 
     var resp = try server.acceptRequest(std.testing.allocator);
-    const want = "\"agg\":{\"s\":null,\"a\":{\"sum\":null,\"count\":0},\"m\":null,\"x\":null,\"c\":0,\"ci\":0}";
+    const want = "\"agg\":{\"s\":null,\"a\":null,\"m\":null,\"x\":null,\"c\":0,\"ci\":0," ++
+        "\"st\":{\"sum\":null,\"count\":0}}";
     if (std.mem.indexOf(u8, resp.body, want) == null) {
         std.debug.print("[lambda empty agg] response: {s}\n", .{resp.body});
         return error.TestUnexpectedResult;
@@ -634,9 +635,9 @@ test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI
     try expectResponses("lambda json escape", &.{
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"]," ++
-                "\"aggregate\":\"min(s) AS m, sum(x) AS n, max(y) AS i, avg(x) AS a\"}",
+                "\"aggregate\":\"min(s) AS m, sum(x) AS n, max(y) AS i, avg(x) AS a, avg_state(x) AS st\"}",
             .want = "\"agg\":{\"m\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":\"NaN\",\"i\":\"Infinity\"," ++
-                "\"a\":{\"sum\":\"NaN\",\"count\":3}}",
+                "\"a\":\"NaN\",\"st\":{\"sum\":\"NaN\",\"count\":3}}",
         },
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"s\",\"aggregate\":\"sum(x) AS n\"}",

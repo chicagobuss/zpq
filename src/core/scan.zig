@@ -306,16 +306,17 @@ pub const AggValue = union(enum) {
     /// representable (DuckDB likewise widens int SUM to HUGEINT). Counts and
     /// signed i64 values widen in losslessly.
     i: i128,
-    /// Single f64 result (float sum/min/max).
+    /// Single f64 result (float sum/min/max, avg's mean).
     f: f64,
-    /// Avg's split-output: ship sum + count, caller divides at end. The sum is
-    /// NULL when count is 0, as sum() over no values is.
+    /// avg_state's split-output: ship sum + count, caller divides at end. The sum
+    /// is NULL when count is 0, as sum() over no values is.
     avg: struct { sum: ?f64, count: i64 },
     /// String (bytewise/unsigned) min/max result or string group key. Owned by the `AggOutput` holding it.
     s: []const u8,
-    /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL.
+    /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL. Also avg's mean.
     dec: DecValue,
-    /// avg over a DECIMAL: the exact sum and count, which re-aggregate, and the mean rounded to the argument's type.
+    /// avg_state over a DECIMAL: the exact sum and count, which re-aggregate, and the mean rounded to the argument's
+    /// type, which only ranks and filters (HAVING) the rows, never printed.
     /// The sum may pass 38 digits while the mean fits (two values near 10^38); JSON prints it whole, and only `-o`,
     /// whose `__sum` column is DECIMAL(38, s), refuses it. `sum` and `mean` are NULL when count is 0.
     avg_dec: struct { sum: ?i192, count: i64, mean: ?i128, spec: expr_ast.Dec },
@@ -584,8 +585,12 @@ pub const Timings = struct {
 
 pub const MultiAggResult = struct {
     files_in: usize,
+    /// Rows in every row group of the inputs.
     rows_in: i64,
-    rows_kept: i64,
+    /// Rows in the row groups read: not ruled out by statistics or membership.
+    rows_scanned: i64,
+    /// Rows of those the outer filter kept: every one without a filter. The aggregates fold these.
+    rows_matched: i64,
     bytes_in: u64,
     row_groups_in: usize,
     row_groups_pruned: usize,
@@ -977,7 +982,7 @@ fn sampledPassShare(
             .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 },
         };
         var passed = [_]expr_agg.Accumulator{.{ .count = 0 }};
-        consumer.scanRGForAgg(gpa, .{
+        _ = consumer.scanRGForAgg(gpa, .{
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
@@ -1290,6 +1295,9 @@ fn parseFooters(
 /// into one table, strictly in block order, as soon as every block before it has, and its own table is freed. A worker
 /// starts block `b` only once `b` is fewer than `ahead` blocks past the first unmerged one, so at most `ahead` block
 /// tables are alive beside the merged one, about what one table per worker holds.
+///
+/// A worker ahead of the window sleeps on `moved` rather than spinning: with more workers than free CPUs (an
+/// oversubscribed or virtualised host) a yielding waiter takes the CPU the merging worker needs to let it go.
 const BlockMerge = struct {
     tables: []expr_agg.GroupTable,
     merged: *expr_agg.GroupTable,
@@ -1299,24 +1307,31 @@ const BlockMerge = struct {
     /// The first block not yet merged.
     next: std.atomic.Value(usize) = .init(0),
     ahead: usize,
-    lock: std.atomic.Value(bool) = .init(false),
+    lock: std.Io.Mutex = .init,
     failed: std.atomic.Value(bool) = .init(false),
+    /// Bumped whenever `next` advances or a worker fails: the word `awaitTurn` sleeps on.
+    moved: std.atomic.Value(u32) = .init(0),
+
+    /// Only the OS futex is used, which no `Io` instance holds state for; the scan has no `Io` of its own.
+    const futex_io = std.Io.Threaded.global_single_threaded.io();
 
     /// Wait until block `b` may start; false once another worker has failed.
     fn awaitTurn(self: *BlockMerge, b: usize) bool {
-        while (b >= self.next.load(.acquire) + self.ahead) {
+        while (true) {
+            // Read `moved` before the condition: a merge or failure between the two changes it, and the wait returns.
+            const seen = self.moved.load(.acquire);
             if (self.failed.load(.acquire)) return false;
-            std.Thread.yield() catch {};
+            if (b < self.next.load(.acquire) + self.ahead) return true;
+            futex_io.futexWaitUncancelable(u32, &self.moved.raw, seen);
         }
-        return !self.failed.load(.acquire);
     }
 
     /// Block `b` is complete: merge it, and any finished after it, once every earlier block has merged. Whoever holds
     /// the lock merges every block ready by then, so none is left behind.
     fn finish(self: *BlockMerge, b: usize) !void {
         self.done[b].store(true, .release);
-        while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.Thread.yield() catch {};
-        defer self.lock.store(false, .release);
+        self.lock.lockUncancelable(futex_io);
+        defer self.lock.unlock(futex_io);
         var n = self.next.load(.monotonic);
         while (n < self.tables.len and self.done[n].load(.acquire)) : (n += 1) {
             const src = &self.tables[n];
@@ -1331,11 +1346,18 @@ const BlockMerge = struct {
             src.deinit();
             src.* = expr_agg.GroupTable.init(self.gpa, 0);
             self.next.store(n + 1, .release);
+            self.wake();
         }
     }
 
     fn fail(self: *BlockMerge) void {
         self.failed.store(true, .release);
+        self.wake();
+    }
+
+    fn wake(self: *BlockMerge) void {
+        _ = self.moved.fetchAdd(1, .release);
+        futex_io.futexWake(u32, &self.moved.raw, std.math.maxInt(u32));
     }
 };
 
@@ -1391,7 +1413,10 @@ const Worker = struct {
     decode_options: consumer.DecodeOptions,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
-    rows_kept: i64 = 0,
+    rows_scanned: i64 = 0,
+    rows_matched: i64 = 0,
+    /// Where this worker's decode error was raised (`consumer.decodeFailure`), handed to the reporting thread.
+    failure: ?consumer.DecodeSite = null,
     rgs_in: usize = 0,
     rgs_pruned: usize = 0,
     rgs_full_match: usize = 0,
@@ -1452,8 +1477,10 @@ fn workerRun(w: *Worker) void {
     w.timings.prof = prof;
     expr_agg.distinct_pairs = w.pairs;
     defer expr_agg.distinct_pairs = null;
+    consumer.setDecodeFailure(null);
     workerRunErr(w, prof, &items) catch |e| {
         w.err = workerRefusal(w, e);
+        w.failure = consumer.decodeFailure();
         if (w.block_merge) |m| m.fail();
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
@@ -1585,7 +1612,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .filter => {},
         }
         if (item.agg_start == 0) {
-            w.rows_kept +|= rg.num_rows;
+            w.rows_scanned +|= rg.num_rows;
         }
         if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
@@ -1612,7 +1639,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
         expr_agg.winner_charge = if (table == null) w.winners else null;
         defer expr_agg.winner_charge = null;
-        try consumer.scanRGForAgg(w.gpa, .{
+        const matched = try consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
@@ -1631,6 +1658,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .charged = if (w.charged) |*c| c.allocator() else null,
             .ledger = w.ledger,
         });
+        if (item.agg_start == 0) w.rows_matched +|= @intCast(matched);
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
                 .pay => {
@@ -2688,7 +2716,8 @@ fn firstKeysCut(
 fn restoreCounts(workers: []Worker, saved: []const Worker) void {
     for (workers, saved) |*w, s| {
         w.rows_in = s.rows_in;
-        w.rows_kept = s.rows_kept;
+        w.rows_scanned = s.rows_scanned;
+        w.rows_matched = s.rows_matched;
         w.rgs_in = s.rgs_in;
         w.rgs_pruned = s.rgs_pruned;
         w.rgs_full_match = s.rgs_full_match;
@@ -3187,10 +3216,17 @@ fn prepareAggregate(
             .ok => |parsed| break :blk parsed,
             .failed => |f| {
                 Diag.setInput(args.diag, args.inputs[f.index].name, f.err);
-                return if (f.err == error.EncryptedFile) error.EncryptedFile else error.NotParquet;
+                return switch (f.err) {
+                    error.EncryptedFile => error.EncryptedFile,
+                    error.ExternalColumnChunk => error.ExternalColumnChunk,
+                    error.InvalidDecimalType => error.InvalidDecimalType,
+                    else => error.NotParquet,
+                };
             },
         }
     };
+    consumer.setDecodeFailure(null);
+    errdefer consumer.resolveDecodeFailure(args.diag, metas, args.inputs);
 
     // Validate schemas match the first file's: same number of leaves
     // and same names *case-insensitively*. Real-world datasets drift on
@@ -3224,8 +3260,8 @@ fn prepareAggregate(
     if (args.filter) |expr_str| {
         if (expr_str.len > 0) {
             filter_opt = try filter_parser.parse(arena, expr_str, meta0, args.diag);
-            // `--trust-stats`: a float chunk without a NaN count prunes as if it had none.
-            if (args.trust_stats) filter_opt = try filter_ast.trustMissingNanCounts(arena, filter_opt.?);
+            // `--trust-stats`: leaves trust plausible statistics; a float chunk with no NaN count prunes as NaN-free.
+            if (args.trust_stats) filter_opt = try filter_ast.trustStats(arena, filter_opt.?);
         }
     }
     const group_by_items = if (args.group_by) |gb_str|
@@ -3237,6 +3273,7 @@ fn prepareAggregate(
         for (items, 0..) |item, i| exprs[i] = item.expr;
         break :blk exprs;
     } else null;
+    try refuseRepeated(arena, meta0, agg_calls, group_by_keys, args.diag);
     var key_names = try KeyNames.init(arena, meta0, group_by_items orelse &.{});
     key_names.sql = sqlBound(args.select_cols);
     try nameUnaliasedAggs(arena, agg_calls, &key_names);
@@ -3804,6 +3841,10 @@ fn prepareAggregate(
     };
     // A cut's passes return their refusal themselves: what decode memory the workers drew is noted on the way out.
     passes catch |e| {
+        for (workers) |w| if (w.err != null) {
+            consumer.setDecodeFailure(w.failure);
+            break;
+        };
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             for (workers) |*w| if (decodeHeld(w) and rescannable) taken.insert(.decode_memory);
         };
@@ -3827,6 +3868,7 @@ fn prepareAggregate(
                     try oneWorkerCuts(arena, plan_inputs)) taken.insert(.one_table_may_fit);
             }
         };
+        consumer.setDecodeFailure(w.failure);
         return e;
     };
     // Past the scan a refusal is the merge's, which one worker's table goes without (a scan that answers drops this).
@@ -3905,7 +3947,8 @@ fn prepareAggregate(
     var answer_charge: usize = 0;
     errdefer group_budget.release(answer_charge);
     var rows_in: i64 = 0;
-    var rows_kept: i64 = 0;
+    var rows_scanned: i64 = 0;
+    var rows_matched: i64 = 0;
     var rgs_in: usize = 0;
     var rgs_pruned: usize = 0;
     var rgs_full_match: usize = 0;
@@ -3915,7 +3958,8 @@ fn prepareAggregate(
     if (group_by_keys) |keys| {
         for (workers) |w| {
             rows_in += w.rows_in;
-            rows_kept += w.rows_kept;
+            rows_scanned += w.rows_scanned;
+            rows_matched += w.rows_matched;
             rgs_in += w.rgs_in;
             rgs_pruned += w.rgs_pruned;
             rgs_full_match += w.rgs_full_match;
@@ -4018,9 +4062,9 @@ fn prepareAggregate(
                     .i64 => .i64,
                     .f64 => .f64,
                     .bytes => .string,
-                    .avg_f64 => .avg,
+                    .avg_f64 => if (agg_calls[a_idx].state) .avg else .f64,
                     .dec => .dec,
-                    .avg_dec => .avg_dec,
+                    .avg_dec => if (agg_calls[a_idx].state) .avg_dec else .dec,
                 },
                 .dec = switch (agg_calls[a_idx].result) {
                     .dec, .avg_dec => expr_agg.resultDec(agg_calls[a_idx]),
@@ -4209,7 +4253,8 @@ fn prepareAggregate(
         }
         for (workers) |w| {
             rows_in += w.rows_in;
-            rows_kept += w.rows_kept;
+            rows_scanned += w.rows_scanned;
+            rows_matched += w.rows_matched;
             rgs_in += w.rgs_in;
             rgs_pruned += w.rgs_pruned;
             rgs_full_match += w.rgs_full_match;
@@ -4244,7 +4289,8 @@ fn prepareAggregate(
     return .{
         .files_in = args.inputs.len,
         .rows_in = rows_in,
-        .rows_kept = rows_kept,
+        .rows_scanned = rows_scanned,
+        .rows_matched = rows_matched,
         .bytes_in = bytes_in,
         .row_groups_in = rgs_in,
         .row_groups_pruned = rgs_pruned,
@@ -4267,6 +4313,29 @@ fn prepareAggregate(
 }
 
 /// min/max of a bare column returns one of that column's values, so its output can carry the column's type.
+/// An aggregate argument or GROUP BY key that reads a repeated leaf (in a LIST or MAP) is refused while planning, as a
+/// filter on one is: it is an unsupported query (exit 2), not a decode failure found after reading the column.
+fn refuseRepeated(
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    calls: []const expr_agg.AggCall,
+    keys: ?[]const expr_ast.Expr,
+    diag: ?*Diag,
+) !void {
+    for ([_]bool{ false, true }) |in_keys| {
+        const reads = try arena.alloc(bool, meta.schema.items.len);
+        @memset(reads, false);
+        if (in_keys) {
+            for (keys orelse &.{}) |k| k.collectColumns(reads);
+        } else for (calls) |c| if (c.arg) |a| a.collectColumns(reads);
+        var leaves: schema.LeafIterator = .init(meta.schema.items);
+        while (leaves.next()) |leaf| if (leaf.max_rep > 0 and leaf.index < reads.len and reads[leaf.index]) {
+            Diag.setColumn(diag, try std.mem.join(arena, ".", leaf.path));
+            return if (in_keys) error.NestedGroupKeyNotSupported else error.NestedAggregateNotSupported;
+        };
+    }
+}
+
 fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
@@ -4566,7 +4635,7 @@ pub const TypedAnswer = struct {
         f64: Lane(f64),
         string: Lane([]const u8),
         dec: Lane(i128),
-        /// avg's re-aggregatable pair, written as `<name>__sum` and `<name>__count`.
+        /// avg_state's re-aggregatable pair, written as `<name>__sum` and `<name>__count`.
         avg: struct { sum: Lane(f64), count: []i64 },
         avg_dec: struct { sum: Lane(i128), count: []i64 },
     };
@@ -5872,7 +5941,7 @@ fn rankValue(acc: expr_agg.Accumulator, call: expr_agg.AggCall) !SortKey {
         else
             .none,
         .sum_d => |d| decimalRank(try d.result(), call),
-        .avg_d => |d| decimalRank(try d.mean(), call),
+        .avg_d => |d| decimalRank(try expr_agg.avgDecMean(call, d), call),
         .min_d, .max_d => |v| decimalRank(v, call),
         else => unreachable,
     };
@@ -7068,13 +7137,24 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
             .dec => decValue(state.max_d, expr_agg.resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
-        .avg => if (call.result == .avg_dec) .{ .avg_dec = .{
-            .sum = state.avg_d.wide(),
-            .count = @intCast(state.avg_d.n),
-            .mean = try state.avg_d.mean(),
-            .spec = expr_agg.resultDec(call),
-        } } else .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } },
+        .avg => if (call.state)
+            try avgStateValue(call, state)
+        else if (call.result == .avg_dec)
+            decValue(try expr_agg.avgDecMean(call, state.avg_d), expr_agg.resultDec(call))
+        else if (expr_agg.avgMean(state.avg)) |m| .{ .f = m } else .null_val,
     };
+}
+
+/// avg_state's mergeable pair. A DECIMAL one keeps its mean at the argument's scale only to rank and filter by.
+fn avgStateValue(call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
+    if (call.result != .avg_dec)
+        return .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } };
+    return .{ .avg_dec = .{
+        .sum = state.avg_d.wide(),
+        .count = @intCast(state.avg_d.n),
+        .mean = try state.avg_d.mean(),
+        .spec = expr_agg.resultDec(call),
+    } };
 }
 
 // ============================================================
@@ -7117,6 +7197,41 @@ fn expectOrderedNames(order: expr_ast.ResultOrder, want: []const ?[]const u8) !v
     for (rows, want) |row, name| {
         if (name) |n| try testing.expectEqualStrings(n, row[0].s) else try testing.expect(row[0] == .null_val);
     }
+}
+
+test "an ordered merge's waiting worker sleeps until the block before its window merges, and wakes on failure" {
+    const gpa = testing.allocator;
+    var tables: [3]expr_agg.GroupTable = .{ .init(gpa, 0), .init(gpa, 0), .init(gpa, 0) };
+    defer for (&tables) |*t| t.deinit();
+    var merged = expr_agg.GroupTable.init(gpa, 0);
+    defer merged.deinit();
+    var done: [3]std.atomic.Value(bool) = @splat(.init(false));
+    var m: BlockMerge = .{ .tables = &tables, .merged = &merged, .calls = &.{}, .gpa = gpa, .done = &done, .ahead = 1 };
+    const Waiter = struct {
+        fn run(merge: *BlockMerge, b: usize, got: *std.atomic.Value(u8)) void {
+            got.store(if (merge.awaitTurn(b)) 1 else 2, .release);
+        }
+    };
+    try testing.expect(m.awaitTurn(0));
+    var got: std.atomic.Value(u8) = .init(0);
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ &m, 1, &got });
+    // Block 1 may not start while block 0 is unmerged.
+    for (0..20) |_| {
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+        try testing.expectEqual(@as(u8, 0), got.load(.acquire));
+    }
+    try m.finish(0);
+    t.join();
+    try testing.expectEqual(@as(u8, 1), got.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), m.next.load(.acquire));
+
+    var failed: std.atomic.Value(u8) = .init(0);
+    const t2 = try std.Thread.spawn(.{}, Waiter.run, .{ &m, 2, &failed });
+    try testing.io.sleep(.fromMilliseconds(2), .awake);
+    try testing.expectEqual(@as(u8, 0), failed.load(.acquire));
+    m.fail();
+    t2.join();
+    try testing.expectEqual(@as(u8, 2), failed.load(.acquire));
 }
 
 test "applyResultOrder: NULLs last both ways, NaN above numbers, stable ties, offset then limit" {
@@ -7997,7 +8112,8 @@ test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certifie
             defer got.deinit(testing.allocator);
             seen.insert(outcome);
             try testing.expectEqual(want.rows_in, got.rows_in);
-            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
             try want.output.applyResultOrder(testing.allocator, cut);
             try got.output.applyResultOrder(testing.allocator, cut);
             const w = want.output.group_rows.?;
@@ -8068,7 +8184,8 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
             defer got.deinit(testing.allocator);
             seen.insert(outcome);
             try testing.expectEqual(want.rows_in, got.rows_in);
-            try testing.expectEqual(want.rows_kept, got.rows_kept);
+            try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
             try want.output.applyResultOrder(testing.allocator, cut);
             try got.output.applyResultOrder(testing.allocator, cut);
             const w = want.output.group_rows.?;
@@ -8415,7 +8532,8 @@ test "runMultiAggregate: a LIMIT with no ORDER BY answers as the full scan throu
                 var got = try runMultiAggregate(testing.allocator, arena, args);
                 defer got.deinit(testing.allocator);
                 try testing.expectEqual(want.rows_in, got.rows_in);
-                try testing.expectEqual(want.rows_kept, got.rows_kept);
+                try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+                try testing.expectEqual(want.rows_matched, got.rows_matched);
                 try want.output.applyResultOrder(testing.allocator, cut);
                 try got.output.applyResultOrder(testing.allocator, cut);
                 const w = want.output.group_rows.?;
@@ -9648,6 +9766,265 @@ test "runMultiAggregate: an input that is not Parquet is named with the reason" 
     try testing.expect(diag.cause != null);
 }
 
+// ============================================================ Poisoned statistics.
+//
+// Checked-in fixtures with their footer, ColumnIndex or OffsetIndex rewritten in memory so they lie in the ways
+// `statistics.chunkStats` and `statistics.pageIndexIsPlausible` check for. By default every answer is the decoded
+// one. Under --trust-stats impossible claims are still refused, while contradictory or uncorroborated ones are taken
+// as written, lie and all.
+// ============================================================
+
+/// What `rewritten` changes: the footer, and one chunk's ColumnIndex or OffsetIndex.
+const Rewrite = struct {
+    footer: ?*const fn (*schema.FileMetaData) void = null,
+    rg: usize = 0,
+    col: usize = 0,
+    column_index: ?*const fn (*schema.ColumnIndex) void = null,
+    offset_index: ?*const fn (*schema.OffsetIndex) void = null,
+};
+
+/// `bytes` rewritten by `rw`: an edited index is written after the pages and the footer pointed at it. Caller frees.
+fn rewritten(bytes: []const u8, rw: Rewrite) ![]u8 {
+    const thrift = @import("thrift.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try metadata.open(arena, bytes);
+    const old_len = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, bytes[0 .. bytes.len - 8 - old_len]);
+
+    const chunk = &meta.row_groups.items[rw.rg].columns.items[rw.col];
+    if (rw.column_index) |edit| {
+        const at: usize = @intCast(chunk.column_index_offset.?);
+        var r = thrift.Reader.init(bytes[at..][0..@intCast(chunk.column_index_length.?)]);
+        var ci = try schema.ColumnIndex.read(arena, &r);
+        edit(&ci);
+        var w = thrift.Writer.init(arena);
+        try ci.write(&w);
+        chunk.column_index_offset = @intCast(out.items.len);
+        chunk.column_index_length = @intCast(w.bytes().len);
+        try out.appendSlice(testing.allocator, w.bytes());
+    }
+    if (rw.offset_index) |edit| {
+        const at: usize = @intCast(chunk.offset_index_offset.?);
+        var r = thrift.Reader.init(bytes[at..][0..@intCast(chunk.offset_index_length.?)]);
+        var oi = try schema.OffsetIndex.read(arena, &r);
+        edit(&oi);
+        var w = thrift.Writer.init(arena);
+        try oi.write(&w);
+        chunk.offset_index_offset = @intCast(out.items.len);
+        chunk.offset_index_length = @intCast(w.bytes().len);
+        try out.appendSlice(testing.allocator, w.bytes());
+    }
+    if (rw.footer) |edit| edit(&meta);
+
+    var w = thrift.Writer.init(arena);
+    try meta.write(&w);
+    try out.appendSlice(testing.allocator, w.bytes());
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(w.bytes().len), .little);
+    try out.appendSlice(testing.allocator, &len);
+    try out.appendSlice(testing.allocator, "PAR1");
+    return out.toOwnedSlice(testing.allocator);
+}
+
+const PoisonCase = struct {
+    filter: []const u8,
+    /// count(*) by default (the decoded truth, hand-known) and under --trust-stats.
+    n: i128,
+    trusted: i128,
+};
+
+fn expectPoisonCases(path: []const u8, rw: Rewrite, cases: []const PoisonCase) !void {
+    const clean = try loadFixture(path) orelse return error.SkipZigTest;
+    defer testing.allocator.free(clean);
+    const bytes = try rewritten(clean, rw);
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for (cases) |c| for ([_]bool{ false, true }) |trust| for ([_]bool{ true, false }) |scan_all| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .filter = c.filter,
+            .aggregate = "count(*) AS n",
+            .parallelism = 1,
+            .trust_stats = trust,
+            .scan_all = scan_all,
+        });
+        defer freeResult(got);
+        const want = if (trust and !scan_all) c.trusted else c.n;
+        testing.expectEqual(want, got.output.aggs[0].value.i) catch |err| {
+            const fmt = "poisoned stats: {s}: {s} trust_stats={} scan_all={}\n";
+            std.debug.print(fmt, .{ path, c.filter, trust, scan_all });
+            return err;
+        };
+    };
+}
+
+/// full_match.parquet's row group 1 chunk statistics for leaf `ci`: ts, b, s, x, n, u.
+fn rg1Stats(meta: *schema.FileMetaData, ci: usize) *schema.Statistics {
+    return &meta.row_groups.items[1].columns.items[ci].meta_data.?.statistics.?;
+}
+
+test "poisoned stats: chunk bounds with min above max are refused, by default and under --trust-stats" {
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            for ([_]usize{ 0, 2, 3, 5 }) |ci| {
+                const st = rg1Stats(meta, ci);
+                std.mem.swap(?[]const u8, &st.min_value, &st.max_value);
+                std.mem.swap(?[]const u8, &st.min, &st.max);
+            }
+        }
+    }.f;
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        .{ .filter = "ts = 300", .n = 1, .trusted = 1 },
+        .{ .filter = "ts >= 250 AND ts <= 260", .n = 11, .trusted = 11 },
+        .{ .filter = "s = 'k000300-pppppppppppppppppppppppp'", .n = 1, .trusted = 1 },
+        .{ .filter = "u = 300", .n = 1, .trusted = 1 },
+        .{ .filter = "x > 5 AND ts >= 200 AND ts < 400", .n = 29, .trusted = 29 },
+    });
+}
+
+test "poisoned stats: an all-null count beside bounds decodes by default and is trusted under --trust-stats" {
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            rg1Stats(meta, 0).null_count = 200;
+        }
+    }.f;
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        .{ .filter = "ts IS NULL", .n = 0, .trusted = 200 },
+        .{ .filter = "ts IS NOT NULL", .n = 1600, .trusted = 1400 },
+        .{ .filter = "ts = 300", .n = 1, .trusted = 1 },
+    });
+}
+
+test "poisoned stats: a zero null count with no bounds decodes by default and is trusted under --trust-stats" {
+    // Row group 1's n is all null, so its writer kept no bounds; the footer now claims no nulls either.
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            rg1Stats(meta, 4).null_count = 0;
+        }
+    }.f;
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        .{ .filter = "n IS NULL", .n = 320, .trusted = 120 },
+        .{ .filter = "n IS NOT NULL", .n = 1280, .trusted = 1480 },
+    });
+}
+
+test "poisoned stats: a null count outside the chunk's values is refused, by default and under --trust-stats" {
+    const cases = [_]PoisonCase{
+        .{ .filter = "ts IS NULL", .n = 0, .trusted = 0 },
+        .{ .filter = "ts IS NOT NULL", .n = 1600, .trusted = 1600 },
+    };
+    inline for ([_]i64{ -1, 201, 1000 }) |nc| {
+        const edit = struct {
+            fn f(meta: *schema.FileMetaData) void {
+                rg1Stats(meta, 0).null_count = nc;
+            }
+        }.f;
+        try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &cases);
+    }
+}
+
+test "cut bounds prune but never answer: equality and ranges at the cut, min and max decoded" {
+    // full_match.parquet's s holds 'k%06d-' then 24 'p's, row ids 200..399 in row group 1. Its bounds there become what
+    // a writer cutting to 9 bytes writes: the min a prefix, the max a prefix grown by one, both marked inexact. ts's max
+    // there becomes an inexact 10^6 (no row holds it).
+    const edit = struct {
+        fn f(meta: *schema.FileMetaData) void {
+            const st = rg1Stats(meta, 2);
+            st.min_value = "k000200-p";
+            st.max_value = "k000399-q";
+            st.min = null;
+            st.max = null;
+            st.is_min_value_exact = false;
+            st.is_max_value_exact = false;
+            const ts = rg1Stats(meta, 0);
+            ts.max_value = &big_ts;
+            ts.max = null;
+            ts.is_max_value_exact = false;
+        }
+        const big_ts = [_]u8{ 0x40, 0x42, 0x0f, 0, 0, 0, 0, 0 }; // 1_000_000
+    }.f;
+    const p = "pppppppppppppppppppppppp";
+    try expectPoisonCases(full_match_fixture, .{ .footer = edit }, &.{
+        // Equal to the cut min, and to the cut max: no row holds either.
+        .{ .filter = "s = 'k000200-p'", .n = 0, .trusted = 0 },
+        .{ .filter = "s = 'k000399-q'", .n = 0, .trusted = 0 },
+        // The values the cut bounds stand for, just above the cut min and just below the cut max.
+        .{ .filter = "s = 'k000200-" ++ p ++ "'", .n = 1, .trusted = 1 },
+        .{ .filter = "s = 'k000399-" ++ p ++ "'", .n = 1, .trusted = 1 },
+        // Ranges with the cut bounds and their neighbours as edges.
+        .{ .filter = "s < 'k000200-p'", .n = 200, .trusted = 200 },
+        .{ .filter = "s <= 'k000200-pa'", .n = 200, .trusted = 200 },
+        .{ .filter = "s < 'k000200-pq'", .n = 201, .trusted = 201 },
+        .{ .filter = "s >= 'k000200-p'", .n = 1400, .trusted = 1400 },
+        .{ .filter = "s > 'k000399-q'", .n = 1200, .trusted = 1200 },
+        .{ .filter = "s < 'k000399-q'", .n = 400, .trusted = 400 },
+        .{ .filter = "s >= 'k000399-q'", .n = 1200, .trusted = 1200 },
+        .{ .filter = "ts <= 399", .n = 400, .trusted = 400 },
+    });
+
+    // The answers come from decoding, with and without --trust-stats.
+    const clean = try loadFullMatchFixture() orelse return error.SkipZigTest;
+    defer testing.allocator.free(clean);
+    const bytes = try rewritten(clean, .{ .footer = edit });
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = full_match_fixture, .bytes = bytes }};
+    for ([_]bool{ false, true }) |trust| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "min(s) AS lo, max(s) AS hi, max(ts) AS t, min(ts) AS u",
+            .parallelism = 1,
+            .trust_stats = trust,
+        };
+        var oracle_args = args;
+        oracle_args.scan_all = true;
+        const oracle = try runMultiAggregate(testing.allocator, arena_state.allocator(), oracle_args);
+        defer freeResult(oracle);
+        const got = try runMultiAggregate(testing.allocator, arena_state.allocator(), args);
+        defer freeResult(got);
+        expectSameAnswer(oracle, got) catch |err| {
+            std.debug.print("cut bounds: min/max answered from statistics, trust_stats={}\n", .{trust});
+            return err;
+        };
+        try testing.expectEqual(@as(i128, 1599), got.output.aggs[2].value.i);
+    }
+}
+
+test "poisoned stats: a page whose min is above its max drops the page index, by default and under --trust-stats" {
+    // null_pages.parquet: id = row, ten pages of 100 rows in row group 0; page 1 holds 100..199.
+    const edit = struct {
+        fn f(ci: *schema.ColumnIndex) void {
+            std.mem.swap([]const u8, &ci.min_values.items[1], &ci.max_values.items[1]);
+        }
+    }.f;
+    try expectPoisonCases(null_pages_fixture, .{ .column_index = edit }, &.{
+        .{ .filter = "id = 130", .n = 1, .trusted = 1 },
+        .{ .filter = "id >= 126 AND id <= 128", .n = 3, .trusted = 3 },
+    });
+}
+
+test "poisoned stats: page locations out of page order drop the page index, by default and under --trust-stats" {
+    // Pages 1 and 2 of id swap places while their row starts stay in order: skipping to page 1 would decode page 2.
+    const edit = struct {
+        fn f(oi: *schema.OffsetIndex) void {
+            const locs = oi.page_locations.items;
+            std.mem.swap(i64, &locs[1].offset, &locs[2].offset);
+            std.mem.swap(i32, &locs[1].compressed_page_size, &locs[2].compressed_page_size);
+        }
+    }.f;
+    try expectPoisonCases(null_pages_fixture, .{ .offset_index = edit }, &.{
+        .{ .filter = "id = 130", .n = 1, .trusted = 1 },
+        .{ .filter = "id = 260", .n = 1, .trusted = 1 },
+    });
+}
+
 // ============================================================ All-null pages.
 //
 // The fixture's ColumnIndex flags whole pages of `v` and `s.b` all-null (see tools/gen_null_pages_fixture.py). A
@@ -9892,7 +10269,7 @@ test "ordered GROUP BY: groups as they first appear, and the same float bits at 
             if (first) |f| {
                 for (rows, f.output.group_rows.?) |r, fr| {
                     try testing.expectEqual(@as(u64, @bitCast(fr[1].f)), @as(u64, @bitCast(r[1].f)));
-                    try testing.expectEqual(@as(u64, @bitCast(fr[2].avg.sum.?)), @as(u64, @bitCast(r[2].avg.sum.?)));
+                    try testing.expectEqual(@as(u64, @bitCast(fr[2].f)), @as(u64, @bitCast(r[2].f)));
                     try testing.expectEqual(fr[3].i, r[3].i);
                 }
                 freeResult(res);
@@ -9930,7 +10307,8 @@ test "regression: float sums and avgs keep their bits at every -j, budget, decod
                     .inputs = &inputs,
                     // Computed arguments over the coded column: one gathered under a sparse filter, one that may be
                     // NULL and so evaluates in place.
-                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t, sum(CASE WHEN i > 3 THEN x END) AS u",
+                    .aggregate = "sum(x) AS s, avg(x) AS a, sum(x * 2) AS t, sum(CASE WHEN i > 3 THEN x END) AS u, " ++
+                        "avg_state(x) AS st",
                     .group_by = shape.group_by,
                     .filter = shape.filter,
                     .parallelism = j,
@@ -11136,14 +11514,18 @@ test "DECIMAL aggregates and arithmetic are exact, on every decode path and work
         .{ .alias = "co", .v = 3670000, .p = 38, .s = 2 },
         .{ .alias = "cc", .v = 3649800, .p = 38, .s = 2 },
         // avg keeps the argument's type, rounded half away from zero: 36700.00 / 133 = 275.939...
-        .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
+        // avg over DECIMAL(15,2) is DECIMAL(19,6); over DECIMAL(38,10) its own type. avg_state ranks by the mean
+        // at the argument's scale.
+        .{ .alias = "adn", .v = 275939850, .p = 19, .s = 6 },
         .{ .alias = "a38", .v = 1495000000000, .p = 38, .s = 10 },
+        .{ .alias = "sadn", .v = 27594, .p = 15, .s = 2 },
     };
     const aggregate =
         "sum(d9) AS s9, min(d9) AS mn9, max(d9) AS mx9, sum(d18) AS s18, sum(d38) AS s38, min(d38) AS mn38, " ++
         "max(d38) AS mx38, sum(dn) AS sdn, sum(q) AS sq, sum(d9 * d18) AS p, sum(d9 + i) AS di, " ++
         "sum(d9 * i) AS dti, sum(d38 - d9) AS dd, sum(d9 * 1.5) AS dlit, sum(i * 1.5) AS ilit, sum(-d9) AS neg, " ++
-        "sum(coalesce(dn, 0)) AS co, sum(coalesce(dn, d9)) AS cc, avg(dn) AS adn, avg(d38) AS a38";
+        "sum(coalesce(dn, 0)) AS co, sum(coalesce(dn, d9)) AS cc, avg(dn) AS adn, avg(d38) AS a38, " ++
+        "avg_state(dn) AS sadn";
     for ([_]bool{ true, false }) |encoded| for ([_]usize{ 1, 3 }) |j| {
         try expectDecimalAnswers(.{
             .inputs = &inputs,
@@ -11203,6 +11585,41 @@ test "a DECIMAL result past its precision is an error, never a wrapped or rounde
     }, &.{.{ .alias = "a", .v = 666666666666666666666666666666666668, .p = 38, .s = 0 }});
 }
 
+test "an aggregate or GROUP BY key over a repeated leaf is refused while planning, before any page decodes" {
+    // `l` is LIST<INT64>; a filter on its elements is refused by the filter parser, these by `refuseRepeated`.
+    const path = "ci/fixtures/parquet/list_int64.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const Case = struct { aggregate: []const u8, group_by: ?[]const u8 = null, err: anyerror };
+    for ([_]Case{
+        .{ .aggregate = "count(l.list.element) AS c", .err = error.NestedAggregateNotSupported },
+        .{ .aggregate = "sum(l.list.element + 1) AS s", .err = error.NestedAggregateNotSupported },
+        .{ .aggregate = "count(*) AS c", .group_by = "l.list.element", .err = error.NestedGroupKeyNotSupported },
+    }) |c| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var diag: Diag = .{};
+        try testing.expectError(c.err, runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = c.aggregate,
+            .group_by = c.group_by,
+            .diag = &diag,
+        }));
+        try testing.expect(!diag.execution_started);
+        try testing.expectEqualStrings("l.list.element", diag.column.get());
+    }
+    // Its sibling top-level column still aggregates.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
+        .inputs = &inputs,
+        .aggregate = "sum(id) AS s",
+    });
+    defer freeResult(ok);
+    try testing.expectEqual(@as(i128, 15), ok.output.aggs[0].value.i);
+}
+
 test "DECIMAL aggregates over no values are NULL, and GROUP BY a DECIMAL key is exact" {
     const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
@@ -11212,14 +11629,15 @@ test "DECIMAL aggregates over no values are NULL, and GROUP BY a DECIMAL key is 
     // Row group 1 holds only NULL `dn`.
     const empty = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
         .inputs = &inputs,
-        .aggregate = "sum(dn) AS s, min(dn) AS m, avg(dn) AS a",
+        .aggregate = "sum(dn) AS s, min(dn) AS m, avg(dn) AS a, avg_state(dn) AS st",
         .filter = "i >= -50 AND i < 50",
         .parallelism = 1,
     });
     defer freeResult(empty);
     try testing.expect(empty.output.aggs[0].value == .null_val);
     try testing.expect(empty.output.aggs[1].value == .null_val);
-    const a = empty.output.aggs[2].value.avg_dec;
+    try testing.expect(empty.output.aggs[2].value == .null_val);
+    const a = empty.output.aggs[3].value.avg_dec;
     try testing.expect(a.sum == null and a.mean == null and a.count == 0);
 
     const grouped = try runMultiAggregate(testing.allocator, arena_state.allocator(), .{
@@ -11275,7 +11693,7 @@ test "a decode budget slices wide row groups, FIXED_LEN_BYTE_ARRAY DECIMAL inclu
         .{ .alias = "s9", .v = -15150, .p = 38, .s = 2 },
         .{ .alias = "s38", .v = 448500000000000, .p = 38, .s = 10 },
         .{ .alias = "p", .v = 209832550, .p = 38, .s = 6 },
-        .{ .alias = "adn", .v = 27594, .p = 15, .s = 2 },
+        .{ .alias = "adn", .v = 275939850, .p = 19, .s = 6 },
     };
     const aggregate = "sum(d9) AS s9, sum(d38) AS s38, sum(d9 * d18) AS p, avg(dn) AS adn";
     // Unbounded; then budgets too small for a whole row group per worker, down to a few rows a slice.
@@ -11697,7 +12115,8 @@ test "review round3 count budget and path matrix" {
                     try want.output.applyResultOrder(testing.allocator, args.result_order);
                     try got.output.applyResultOrder(testing.allocator, args.result_order);
                     try testing.expectEqual(want.rows_in, got.rows_in);
-                    try testing.expectEqual(want.rows_kept, got.rows_kept);
+                    try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+                    try testing.expectEqual(want.rows_matched, got.rows_matched);
                     const wr = want.output.group_rows.?;
                     const gr = got.output.group_rows.?;
                     try testing.expectEqual(wr.len, gr.len);
@@ -12652,7 +13071,7 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
         .{ .sum_d = .{ .lo = 12345, .n = 2 } },
         .{ .avg_d = .{ .lo = @bitCast(@as(i128, -5)), .hi = -1, .n = 2 } },
     };
-    for (states) |state| {
+    for (states) |state| for ([_]bool{ false, true }) |avg_state| {
         const dec = state == .min_d or state == .max_d or state == .sum_d or state == .avg_d;
         const func: expr_agg.AggFunc = switch (state) {
             .min_i, .min_d => .min,
@@ -12669,11 +13088,12 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
                 (if (dec) .avg_dec else .avg_f64)
             else
                 (if (dec) .dec else .i64),
+            .state = avg_state and func == .avg,
         };
         const got = try rankValue(state, call);
         const want = sortKey(try materializeOne(testing.allocator, call, state));
         for ([_]bool{ false, true }) |desc| try testing.expectEqual(.eq, orderSortKeys(want, got, desc));
-    }
+    };
     const avg_call: expr_agg.AggCall = .{
         .func = .avg,
         .arg = int_arg,
@@ -12693,7 +13113,13 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
         .alias = "a",
         .result = .avg_dec,
     };
-    const rounded = try rankValue(states[8], dec_call);
+    // -0.00025: avg's mean at DECIMAL(22, 8); avg_state ranks by it rounded to the argument's scale.
+    const exact = try rankValue(states[8], dec_call);
+    try testing.expectEqual(@as(i128, -25000), exact.dec.v);
+    try testing.expectEqual(@as(u8, 8), exact.dec.spec.scale);
+    var state_call = dec_call;
+    state_call.state = true;
+    const rounded = try rankValue(states[8], state_call);
     try testing.expectEqual(@as(i128, -3), rounded.dec.v);
     try testing.expectEqual(@as(u8, 4), rounded.dec.spec.scale);
 }
@@ -12705,13 +13131,15 @@ test "result cut extrema AVG DECIMAL: scans match full stable order at j1 j3 j8"
             .keys = &.{"s"},
             .aggs = &.{
                 "min(t - 30) FILTER (WHERE n = 1) AS rank", "max(t - 30) FILTER (WHERE n = 1) AS rank",
-                "avg(t - 30) FILTER (WHERE n = 1) AS rank",
+                "avg(t - 30) FILTER (WHERE n = 1) AS rank", "avg_state(t - 30) FILTER (WHERE n = 1) AS rank",
             },
         },
         .{
             .path = decimal_exact_fixture,
             .keys = &.{ "k", "i" },
-            .aggs = &.{ "sum(d38) AS rank", "min(dn) AS rank", "max(dn) AS rank", "avg(dn) AS rank" },
+            .aggs = &.{
+                "sum(d38) AS rank", "min(dn) AS rank", "max(dn) AS rank", "avg(dn) AS rank", "avg_state(dn) AS rank",
+            },
         },
     };
     for (fixtures) |fixture| {
@@ -12914,7 +13342,8 @@ test "planAggregate: a filter its row groups' bounds say passes few rows drops a
     };
     var lo: i64 = std.math.maxInt(i64);
     for (meta.row_groups.items) |*rg| {
-        const b = @import("parquet/statistics.zig").chunkBounds(rg, 1, &meta) orelse return error.SkipZigTest;
+        const b = @import("parquet/statistics.zig").chunkStats(rg, 1, &meta, .corroborated).bounds orelse
+            return error.SkipZigTest;
         lo = @min(lo, std.mem.readInt(i64, b.min[0..8], .little));
     }
     const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};

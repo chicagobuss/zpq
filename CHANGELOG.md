@@ -11,28 +11,57 @@ shell-completion and man-page packaging.
 
 1. **Scripts that parse `zpq query` output must change.** Every query now prints its answer as NDJSON rows on stdout,
    and nothing else. The `{"ok":true,...,"agg":...}` summary that 0.4.1 printed is gone from stdout; take the rows
-   instead, or add `--summary=json` to get a typed summary line on **stderr**.
-2. **If you read zpq's CSV, check dates and empty strings.** `--format csv` works as in 0.4.1, but DATE, TIME and
+   instead, or add `--summary=json` to get a typed summary line on **stderr**. `docs/output-format.md` (shipped in
+   the release archive) is the contract for the shapes and for how each type prints.
+2. **BREAKING: `avg(x)` is now a plain number, in every format.** 0.4.1 answered it as a `{"sum":..,"count":..}`
+   object in JSON (a DECIMAL one with an `"avg"` field too) and as `<name>__sum` / `<name>__count` columns in CSV and
+   Parquet; the Lambda, libzpq and Python answers carried the same object. It is now one value, NULL over no values:
+   - a DOUBLE for integer and floating `x`, the sum divided once by the count;
+   - for DECIMAL(p, s), DECIMAL(q, s + q - p) with q = min(38, p + 4): the exact mean rounded half away from zero,
+     with up to four more fractional digits and never fewer integer digits (DECIMAL(15,2) gives DECIMAL(19,6),
+     DECIMAL(36,35) gives DECIMAL(38,37), and p = 38 keeps the input type, as Trino does). It never overflows.
+
+   If you merge averages across files or Lambda fan-out, ask for **`avg_state(x)`** instead: it answers exactly what
+   `avg(x)` answered in 0.4.1 (minus the DECIMAL `"avg"` field), and `sum(<name>__sum) / sum(<name>__count)` over its
+   per-file results is the exact overall average. A query that keeps `avg(x)` and parses `__sum` / `__count` or the
+   object breaks.
+3. **If you read zpq's CSV, check dates and empty strings.** `--format csv` works as in 0.4.1, but DATE, TIME and
    TIMESTAMP now print as ISO text (0.4.1 printed integers), and an empty string prints as `""` so it differs from
    NULL (0.4.1 printed both as an empty field). Aggregate and GROUP BY answers can now be CSV too.
-3. **Re-run the queries listed under "Answers that changed"** if you relied on their 0.4.1 results: DECIMAL sums and
+4. **Re-run the queries listed under "Answers that changed"** if you relied on their 0.4.1 results: DECIMAL sums and
    filters, UUID filters, `NOT IN` lists containing `NULL`, `LIKE NULL` and `LIKE` with `_`, `coalesce`, integer
    arithmetic near the 64-bit limit, INT96 timestamps, float filters and min/max over columns that hold NaN, BOOLEAN
    GROUP BY keys, and any Parquet
    file 0.4.1 **rewrote** from a fixed-width binary (UUID), FLOAT16 or BYTE_ARRAY DECIMAL column, or from inputs with
    different DECIMAL scales.
-4. **Check `--max-memory` values you pass.** It used to bound GROUP BY entries only; it now bounds everything an
+5. **Check `--max-memory` values you pass.** It used to bound GROUP BY entries only; it now bounds everything an
    aggregate or a write holds. A query that answered at a given value can now refuse instead, with
    `the query needs more memory than --max-memory allows` (exit 1). Raise the value, or leave it unset.
-5. **Expect GROUP BY rows in a different order.** Groups now come in the order they first appear in the input, at
+6. **Expect GROUP BY rows in a different order.** Groups now come in the order they first appear in the input, at
    every `-j`; 0.4.1 sorted them by their serialized key bytes. Add `ORDER BY` if you need an order.
-6. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141.
-7. **Expect a different layout in files zpq re-encodes** (any filter, `--select` or computed column). Output row
-   groups no longer follow the input's: they hold up to 131,072 rows or 64 MiB of uncompressed values
-   (`--row-group-size`, `--row-group-bytes`), so a selective filter over many small row groups writes a few large
-   ones. Chunks are split into data pages of at most 1 MiB or 20,000 rows, with a page index. The bytes written depend
-   only on the input and the options, never on `-j` or the machine's memory; an explicit `--max-memory` caps row
-   groups at a sixteenth of it. Plain copies keep their input's row groups.
+7. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141. An
+   aggregate or a GROUP BY key over a list's elements (a repeated leaf) is now refused while planning, exit 2, with a
+   sentence naming the column (`aggregate argument column `l.list.element` is repeated`), as a filter on one already
+   was; rc1 decoded the column first and exited 1 with a bare `UnsupportedAggType` or a GROUP BY message.
+8. **BREAKING for summary readers: `rows_kept` is gone.** It meant rows in the row groups read for an aggregate, but
+   rows written for a write, so a filtered aggregate reported every row of the row groups it read as kept. The
+   `--summary=json` line, and the Lambda's and libzpq's responses, now carry `rows_in` (every input row),
+   `rows_scanned` (rows in the row groups read) and `rows_matched` (rows the filter kept: what an aggregate folds, a
+   write writes, a row output prints before ORDER BY and LIMIT), beside `rows` (rows in the answer). The Lambda write
+   response's `rows_kept` is `rows_matched`. A row output's `rows_in` now counts every input row, not just the row
+   groups reached before a LIMIT.
+9. **BREAKING for summary readers: `phase` is now `wall_ms` and `worker_ms`.** `wall_ms` holds wall-clock phases
+   (`open`, `parse`, `scan`, `footer`; a Lambda write adds `mp_await`, `mp_complete`), which run one after another.
+   `worker_ms` holds each scan step summed over every worker (`decode`, `filter`, `fold` for aggregates, `encode` for
+   writes, `sink`), so with N workers one can reach N times `wall_ms.scan`: a `decode_ms` many times `total_ms` in
+   rc1 was many workers decoding at once, not a slow decode. `wall_ms.scan` is now measured for writes and row output
+   too. The field names lost their `_ms` suffix inside the objects. `docs/output-format.md` defines every field.
+10. **Expect a different layout in files zpq re-encodes** (any filter, `--select` or computed column). Output row
+    groups no longer follow the input's: they hold up to 131,072 rows or 64 MiB of uncompressed values
+    (`--row-group-size`, `--row-group-bytes`), so a selective filter over many small row groups writes a few large
+    ones. Chunks are split into data pages of at most 1 MiB or 20,000 rows, with a page index. The bytes written depend
+    only on the input and the options, never on `-j` or the machine's memory; an explicit `--max-memory` caps row
+    groups at a sixteenth of it. Plain copies keep their input's row groups.
 
 ### Highlights
 
@@ -180,6 +209,7 @@ answer below was reproduced with the 0.4.1 binary.
 | Two inputs whose DECIMAL scales differed were read as one schema: rows and copies took the second file at the first file's scale (`1.00` became `0.0100`). Such inputs are now refused as a schema mismatch. | Multi-file row output and copies over files with different DECIMAL scales | Rewrite those copies; query such files separately. |
 | A DECIMAL carrying only the logical annotation printed in rows without its scale (`1.25` as `125`). | Row output of such columns | Re-run them. |
 | `count(col)` answered from statistics trusted a negative `null_count` in a corrupt footer and counted more rows than exist. | `count(col)` over files with corrupt statistics | None; such a count now decodes the column. |
+| Statistics that contradict themselves were acted on. A row group whose min is above its max was skipped (`k = 130` found no row); a null count of every row beside min/max, or of none on a chunk with no min/max, answered `IS NULL`/`IS NOT NULL` from the footer; and aggregates skipped or misread pages of a page index with a page's min above its max or its page locations out of order. | Filters over files with corrupt statistics or page indexes | None; such statistics are now ignored and the data decoded. `--trust-stats` takes null counts the bounds fail to back at their word, never impossible claims. |
 | **Rewritten files:** a fixed-width binary column (UUID, `fixed_size_binary`) re-encoded with a dictionary got a 4-byte length before each entry, so other readers returned incorrect values with no error. | Files 0.4.1 wrote with a filter, `--select` or `--codec` from inputs with such columns | **Rewrite those files with 0.5.0** from their sources. |
 | **Rewritten files:** a BYTE_ARRAY DECIMAL column was re-encoded as DOUBLE, losing exactness and changing the schema. It is now written as a DECIMAL (FIXED_LEN_BYTE_ARRAY). | Files 0.4.1 rewrote from BYTE_ARRAY DECIMAL inputs | Rewrite them with 0.5.0. |
 | **Rewritten files:** when the first input of a multi-file filtered write had no row groups, a LIST column was re-encoded without its repetition levels, and a FLOAT16 column was copied under a DOUBLE footer, both with exit 0. Other readers cannot read those files. | Multi-file writes whose first file is empty | Rewrite those files. |
@@ -194,6 +224,13 @@ min/max lost to a compiler miscompile in optimized builds, aliased columns re-ty
 writes), and a float `sum` over no rows answering 0 instead of NULL on the dictionary-code path.
 
 ### Behaviour changes
+
+**Errors**
+- A page or column chunk that fails to decode names where, on every query kind and at every `-j`:
+  `cannot decode input file data/b.parquet` / `row group 0, column `z`, page 1:` / `the page's encoded data is
+  invalid (UnexpectedPage)`. rc1 printed only the error's name (`UnexpectedPage`, `DictionaryMissing`,
+  `ShortDecode`, ...), so over a glob the corrupt file could not be told. The error's name stays last and is still the
+  `code` of `--summary=json`'s error line. Pages count from 0 in the column chunk, a dictionary page included.
 
 **Output**
 - Every query prints only its answer: NDJSON rows on stdout, one object per line, scalar aggregates as one row.
@@ -234,11 +271,12 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
   `min` returns `-0` and `max` `+0`.
 - DECIMAL results are DECIMAL, with fixed result-type rules:
   - `+`/`-` take the larger scale and one more digit, and `*` adds scales;
-  - `sum` is DECIMAL(38, s), and `min`/`max`/`avg` keep the column's type, with `avg` rounding half away from zero;
+  - `sum` is DECIMAL(38, s), `min`/`max` keep the column's type, and `avg` widens it by up to four fractional digits
+    (see "What to do"), rounding half away from zero;
   - numeric literals with a decimal point are DECIMAL, and `/` is DOUBLE;
   - a result past 38 digits is an error.
 
-  A DECIMAL `avg` adds `"avg"` beside `{"sum","count"}`, and `-o` writes DECIMAL columns where 0.4.1 wrote DOUBLE.
+  `-o` writes DECIMAL columns where 0.4.1 wrote DOUBLE, `avg_state`'s `__sum` included.
 - BOOLEAN answers are BOOLEAN everywhere (`true`/`false` in JSON and CSV, BOOLEAN in Parquet). That covers keys,
   min/max, `SELECT b AS k` and `CASE ... THEN b END`.
 - `SELECT c AS k` writes the same column, renamed: same type, same nullability.
@@ -373,6 +411,9 @@ client of the C ABI can do the same.
 ### Memory ceiling: `--max-memory`
 
 `--max-memory` (the Lambda's and libzpq's `max_memory`) is one budget per query, and it does not depend on `-j`.
+Give it as bytes, or as a number (fractions allowed) followed by `K`, `M`, `G` or `T`, with or without a `B`, in any
+case, in powers of 1024: `--max-memory 2GB`, `1.5g`, `1073741824`. A space, an exponent or a `MiB` spelling is
+refused (exit 2). It is now in the help's usage synopsis, with its syntax, default and an example.
 Everything an aggregate, a Top-N or a write holds at once draws from it **before** allocating:
 - GROUP BY tables and `count(DISTINCT)` sets, which draw in proportion to their size;
 - each worker's decoded row groups, sliced string dictionaries, and a local reader's read-ahead;
@@ -458,6 +499,7 @@ DECIMAL and FLOAT16 over FIXED_LEN_BYTE_ARRAY are numbers. `-o` Parquet output i
 - `ORDER BY` over plain rows, with or without `LIMIT` (ties by input position).
 - `HAVING`, comparing aggregates or keys with literals.
 - `count(DISTINCT x)`, exact.
+- `avg_state(x)` (also in `--aggregate`), the mergeable `{sum, count}` form of `avg(x)` for fan-out.
 - GROUP BY keys as expressions (bound by value), SELECT positions or aliases; ORDER BY and HAVING on a quoted alias.
 - Searched `CASE WHEN ... THEN ... [ELSE ...] END` (a branch is evaluated only on rows that take it) and
   `strlen(s)` (bytes; NULL for NULL).
@@ -511,7 +553,15 @@ Not supported: `%` (refused as `operator % is not supported`), the simple `CASE 
   - A file that fails is reported in place, and the command exits 1.
 - Bash, zsh and fish completions and a man page are in `packaging/`, generated from the CLI's help text. The man page
   is regenerated for the release, including `--trust-stats` and missing NaN counts.
-- `zpq --version` prints the version and build revision.
+- `zpq --version` prints the version and build revision. A release candidate carries its tag:
+  `zpq 0.5.0-rc2 (<rev>)`, and the same version is in the `created_by` of files it writes, its archive names and
+  `release.json`. 0.5.0-rc1 said `0.5.0` in each. `tools/package_release.py --tag v0.5.0-rc2` (or
+  `zig build -Dprerelease=rc2`) builds one, and refuses a tag that does not name `build.zig.zon`'s version.
+- Release archives are self-contained. Beside the binary, man page, completions and `share/zpq/tiny.parquet`, they
+  ship `share/doc/zpq/`: `getting-started.md` (a filtered read, a GROUP BY with `avg`, and a computed Parquet write,
+  each with its exact output against `tiny.parquet`), `output-format.md` and `binary-output.md`. Help names these
+  guides, and no longer points at the README, which the archive does not carry. Packaging fails if a shipped doc
+  names a file the archive lacks. The Homebrew formula installs the guides.
 
 ### Homebrew
 
@@ -556,6 +606,8 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
   - a quoted alias used as a GROUP BY key;
   - a fractional literal against an integer column (`x > 1.5`).
 - A DOUBLE that holds an integral value prints without a fraction (`1`), so a JSON reader may take it as an integer.
+- JSON prints DATE, TIME and TIMESTAMP (INT96 included) as their stored integers (days, or the column's unit since
+  midnight or the epoch; INT96 as nanoseconds), where CSV prints ISO text.
 - **`--max-memory` does not yet cover** the following:
   - grouped string `min`/`max` winners inside group tables;
   - first-keys, census and sketch structures;

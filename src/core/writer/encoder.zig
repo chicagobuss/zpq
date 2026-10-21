@@ -210,7 +210,10 @@ pub const Plan = struct {
                 break :blk try std.mem.concat(arena, u8, &.{ def_prefix, values_bytes });
             },
         };
+        // A page header's sizes and count are i32: a page past them (one value of 2 GiB) cannot be written.
+        if (hi - lo > pageLimit() or payload.len > pageLimit()) return error.TooLarge;
         const compressed = try compression.compressPage(arena, payload, self.in.codec, self.in.zstd);
+        if (compressed.len > pageLimit()) return error.TooLarge;
         const header = try pageHeaderBytes(arena, .{
             .type = .DATA_PAGE,
             .uncompressed_page_size = @intCast(payload.len),
@@ -360,6 +363,13 @@ fn bloomOf(
     b.foldToFpp(fpp);
     return b.serialize(arena);
 }
+
+/// The most a page header's i32 sizes and counts hold. Tests lower it to reach the limits.
+fn pageLimit() usize {
+    return if (@import("builtin").is_test) test_page_limit else std.math.maxInt(i32);
+}
+
+var test_page_limit: usize = std.math.maxInt(i32);
 
 /// A data page built by `Plan.page`: header and compressed payload, its uncompressed length with the header, and its
 /// page index entry (`offset` set by `Plan.finish`).
@@ -783,7 +793,7 @@ fn planCoded(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
                     break :blk out;
                 };
                 const dict_col = @unionInit(filter_eval.Batch.Column, @tagName(tag), .{ .values = used });
-                return planDictionary(arena, in, @intCast(n), dict_plain, dict_col, indices);
+                if (try planDictionary(arena, in, @intCast(n), dict_plain, dict_col, indices)) |p| return p;
             }
             var vals = c;
             const gathered = try agg_coded.materialize(arena, in.values);
@@ -1083,7 +1093,8 @@ fn tryEncodeDictFloat(
 
 /// The plan every dictionary encoder ends in once it has interned its values (the encoders differ only in how they
 /// key and PLAIN-encode entries): the compressed `dict_plain` dictionary page holding `dict`'s entries, built here,
-/// then data pages of `indices`, one per present value. `dictionary_page_offset` is 0 and `data_page_offset` the
+/// then data pages of `indices`, one per present value. Null when the dictionary page would not fit a page header's
+/// i32 sizes: the caller writes the values instead. `dictionary_page_offset` is 0 and `data_page_offset` the
 /// dictionary page's length, both relative to the chunk's bytes; callers add the chunk's absolute start to both.
 fn planDictionary(
     arena: std.mem.Allocator,
@@ -1093,10 +1104,11 @@ fn planDictionary(
     /// The entries in first-occurrence order, every one present at least once.
     dict: filter_eval.Batch.Column,
     indices: []const u32,
-) Error!Plan {
+) Error!?Plan {
     const def_levels = sourceDefLevels(in.values);
     const max_def = sourceMaxDef(in.values);
     const dict_count = valueCount(dict);
+    if (dict_count > pageLimit() or dict_plain.len > pageLimit()) return null;
     // Statistics over the distinct values, not every row: the dictionary holds exactly the present values, first
     // occurrence first, so the scan meets them in the order a row scan first would and keeps the same bounds.
     var stats = computeStats(arena, dict, null, 0, in.schema_elem);
@@ -1109,6 +1121,7 @@ fn planDictionary(
         };
     }
     const dict_compressed = try compression.compressPage(arena, dict_plain, in.codec, in.zstd);
+    if (dict_compressed.len > pageLimit()) return null;
     const dict_header = try pageHeaderBytes(arena, .{
         .type = .DICTIONARY_PAGE,
         .uncompressed_page_size = @intCast(dict_plain.len),
@@ -1168,7 +1181,7 @@ fn dictIndexBitWidth(dict_count: usize) u8 {
 fn levelPrefix(arena: std.mem.Allocator, levels: []const u32, bit_width: u8) Error![]const u8 {
     const rle = try hybrid_rle.encode(arena, levels, bit_width);
     const prefix = try arena.alloc(u8, 4 + rle.len);
-    std.mem.writeInt(u32, prefix[0..4], @intCast(rle.len), .little);
+    std.mem.writeInt(u32, prefix[0..4], std.math.cast(u32, rle.len) orelse return error.TooLarge, .little);
     @memcpy(prefix[4..], rle);
     return prefix;
 }
@@ -1708,6 +1721,8 @@ fn encodePlainBytes(
         if (!isPresent(def_levels, max_def, i)) continue;
         total += len_prefix + v.len;
     }
+    // Every length prefix below is at most `total`.
+    if (total > std.math.maxInt(u32)) return error.TooLarge;
 
     const out = try arena.alloc(u8, total);
     var pos: usize = 0;
@@ -1808,7 +1823,7 @@ fn computeStats(
         .i64 => |x| statsTyped(arena, i64, x.values, def_levels, max_def),
         .f32 => |x| statsTypedFloat(arena, f32, x.values, def_levels, max_def),
         .f64 => |x| statsTypedFloat(arena, f64, x.values, def_levels, max_def),
-        .string => |x| statsBytes(arena, x.values, def_levels, max_def),
+        .string => |x| statsBytes(arena, x.values, def_levels, max_def, boundCut(elem.*)),
         .boolean => |x| statsBool(arena, x.values, def_levels, max_def),
         .i128 => unreachable,
     };
@@ -1926,7 +1941,77 @@ fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T
     };
 }
 
-fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: ?[]const u32, max_def: u32) ?schema.Statistics {
+/// Written BYTE_ARRAY bounds are cut to this many bytes, the length arrow-rs cuts statistics to: kept whole, one 100 MB
+/// value fills the footer twice over, past what readers parse (pyarrow refuses a thrift string over 100 MB).
+const stats_bound_len = 64;
+
+/// How a column's byte bounds are cut: FIXED_LEN_BYTE_ARRAY not at all (a bound of another width reads as corrupt),
+/// UTF-8 text at a character boundary so the bound stays text, other bytes anywhere.
+const BoundCut = enum { none, bytes, utf8 };
+
+fn boundCut(elem: schema.SchemaElement) BoundCut {
+    if (elem.type != .BYTE_ARRAY) return .none;
+    if (elem.logical_type) |lt| switch (lt) {
+        .STRING, .ENUM, .JSON => return .utf8,
+        else => {},
+    };
+    if (elem.converted_type) |ct| switch (ct) {
+        .UTF8, .ENUM, .JSON => return .utf8,
+        else => {},
+    };
+    return .bytes;
+}
+
+/// `v` cut to at most `stats_bound_len` bytes: a prefix, so still no greater than `v`.
+fn cutMin(v: []const u8, cut: BoundCut) []const u8 {
+    if (cut == .none or v.len <= stats_bound_len) return v;
+    var n: usize = stats_bound_len;
+    if (cut == .utf8 and std.unicode.utf8ValidateSlice(v)) {
+        while (n > 0 and (v[n] & 0xC0) == 0x80) n -= 1;
+    }
+    return v[0..n];
+}
+
+/// An upper bound for `v` of at most `stats_bound_len` bytes, on `arena`: `v` cut, then its last byte (UTF-8: last
+/// character) that can grow by one without changing width grown, and what follows it dropped. Null when nothing
+/// can grow (all 0xFF), and then no max is written. `v` itself when it needs no cut.
+fn cutMax(arena: std.mem.Allocator, v: []const u8, cut: BoundCut) std.mem.Allocator.Error!?[]const u8 {
+    if (cut == .none or v.len <= stats_bound_len) return v;
+    if (cut == .utf8 and std.unicode.utf8ValidateSlice(v)) {
+        var end: usize = stats_bound_len;
+        while (end > 0 and (v[end] & 0xC0) == 0x80) end -= 1;
+        while (end > 0) {
+            var start = end - 1;
+            while (start > 0 and (v[start] & 0xC0) == 0x80) start -= 1;
+            const cp = std.unicode.utf8Decode(v[start..end]) catch unreachable;
+            const next = cp + 1;
+            const surrogate = next >= 0xD800 and next <= 0xDFFF;
+            const width = std.unicode.utf8CodepointSequenceLength(next) catch 0;
+            if (!surrogate and next <= 0x10FFFF and width == end - start) {
+                const out = try arena.alloc(u8, end);
+                @memcpy(out[0..start], v[0..start]);
+                _ = std.unicode.utf8Encode(next, out[start..end]) catch unreachable;
+                return out;
+            }
+            end = start;
+        }
+        return null;
+    }
+    var n: usize = stats_bound_len;
+    while (n > 0 and v[n - 1] == 0xFF) n -= 1;
+    if (n == 0) return null;
+    const out = try arena.dupe(u8, v[0..n]);
+    out[n - 1] += 1;
+    return out;
+}
+
+fn statsBytes(
+    arena: std.mem.Allocator,
+    values: []const []const u8,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    cut: BoundCut,
+) ?schema.Statistics {
     if (values.len == 0) return null;
     var first_idx: ?usize = null;
     var null_count: i64 = 0;
@@ -1964,14 +2049,21 @@ fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: 
     // Caller's arena is the file-footer-lifetime arena; the values
     // slices typically borrow from a row-group-scoped arena. Dupe so
     // the footer write later sees stable bytes.
-    const lo_owned = arena.dupe(u8, lo) catch return null;
-    const hi_owned = arena.dupe(u8, hi) catch return null;
+    const lo_cut = cutMin(lo, cut);
+    const hi_cut = cutMax(arena, hi, cut) catch return null;
+    const lo_owned = arena.dupe(u8, lo_cut) catch return null;
+    const hi_owned: ?[]const u8 = if (hi_cut) |h| arena.dupe(u8, h) catch return null else null;
     // Bytewise unsigned is a byte array's type-defined order. The deprecated min/max are defined as signed, so they
-    // are left unset rather than written in an order a legacy reader would misread.
+    // are left unset rather than written in an order a legacy reader would misread. A cut bound says so, and readers
+    // then take it as a bound only (zpq's own full-match proof needs an exact max).
+    const cuts = cut != .none;
     return .{
         .min_value = lo_owned,
         .max_value = hi_owned,
         .null_count = null_count,
+        .is_min_value_exact = if (cuts) lo_cut.len == lo.len else null,
+        // `cutMax` hands back `hi` itself when it needs no cut.
+        .is_max_value_exact = if (cuts and hi_cut != null) hi_cut.?.ptr == hi.ptr else null,
     };
 }
 
@@ -2032,7 +2124,7 @@ test "statistics populate legacy bounds only where their signed order is the typ
     try expectMirroredStats(statsTypedFloat(arena, f64, &floats, null, 0) orelse return error.MissingStats);
 
     const bytes = [_][]const u8{ "bravo", "alpha", "charlie", "\xc3\xa9" };
-    const byte_stats = statsBytes(arena, &bytes, null, 0) orelse return error.MissingStats;
+    const byte_stats = statsBytes(arena, &bytes, null, 0, .bytes) orelse return error.MissingStats;
     try testing.expect(byte_stats.min == null and byte_stats.max == null);
     try testing.expectEqualStrings("alpha", byte_stats.min_value.?);
     try testing.expectEqualStrings("\xc3\xa9", byte_stats.max_value.?);
@@ -2279,7 +2371,7 @@ test "statsBytes all-null page emits null_count only" {
 
     const vals = [_][]const u8{ "", "", "" };
     const dls = [_]u32{ 0, 0, 0 };
-    const s = statsBytes(arena, &vals, &dls, 1) orelse return error.MissingStats;
+    const s = statsBytes(arena, &vals, &dls, 1, .bytes) orelse return error.MissingStats;
     try testing.expectEqual(@as(?i64, 3), s.null_count);
     try testing.expectEqual(@as(?[]const u8, null), s.min_value);
     try testing.expectEqual(@as(?[]const u8, null), s.max_value);
@@ -2486,7 +2578,7 @@ test "string statistics equal a byte-order fold: shared prefixes, empty strings,
             v.* = buf;
             d.* = if (nullable and r.uintLessThan(u8, 4) == 0) 0 else 1;
         }
-        const st = statsBytes(a, vals, if (nullable) defs else null, 1) orelse return error.TestUnexpectedResult;
+        const st = statsBytes(a, vals, if (nullable) defs else null, 1, .bytes) orelse return error.TestUnexpectedResult;
         var lo: ?[]const u8 = null;
         var hi: ?[]const u8 = null;
         for (vals, defs) |v, d| {
@@ -3198,4 +3290,276 @@ test "a coded column whose dictionary repeats a value encodes to its values' byt
     const fplain_col: filter_eval.Batch.Column = .{ .f64 = .{ .values = &fvals } };
     const fplain = try encodeColumn(a, .{ .values = fplain_col, .schema_elem = &elem, .path_in_schema = path });
     try testing.expectEqualSlices(u8, fplain.bytes, fcoded.bytes);
+}
+
+const split_path = [_][]const u8{"c"};
+
+/// `values` under a page target small enough (100 rows, 300 bytes) to cut a test-sized chunk into many pages.
+fn splitInput(
+    values: filter_eval.Batch.Column,
+    elem: *const schema.SchemaElement,
+    codec: schema.CompressionCodec,
+) ColumnInput {
+    return .{
+        .values = values,
+        .schema_elem = elem,
+        .path_in_schema = &split_path,
+        .codec = codec,
+        .page_rows = 100,
+        .page_bytes = 300,
+    };
+}
+
+/// Every data page of `enc` (after its dictionary page, if any) within `limit`, their value counts summed.
+fn expectPagesWithin(a: std.mem.Allocator, enc: EncodedColumn, limit: usize) !usize {
+    const start: usize = @intCast(enc.meta.data_page_offset);
+    var values: usize = 0;
+    const pages = try testPages(a, enc.bytes[start..]);
+    for (pages) |p| {
+        try testing.expectEqual(schema.PageType.DATA_PAGE, p.header.type);
+        const n: usize = @intCast(p.header.data_page_header.?.num_values);
+        try testing.expect(n <= limit);
+        try testing.expect(@as(usize, @intCast(p.header.uncompressed_page_size)) <= limit);
+        try testing.expect(@as(usize, @intCast(p.header.compressed_page_size)) <= limit);
+        values += n;
+    }
+    try testing.expectEqual(enc.pages.len, pages.len);
+    var counted: i32 = 0;
+    for (enc.meta.encoding_stats.?.items) |st| {
+        if (st.page_type == @backingInt(schema.PageType.DATA_PAGE)) counted += st.count;
+    }
+    try testing.expectEqual(@as(i32, @intCast(pages.len)), counted);
+    try testing.expectEqual(@as(i64, @intCast(enc.bytes.len)), enc.meta.total_compressed_size);
+    return values;
+}
+
+fn ReadBack(comptime T: type) type {
+    return struct { values: []T, defs: []u32, reps: []u32 };
+}
+
+/// The `n` entries of `enc`'s chunk, read back by the column reader.
+fn readBack(comptime T: type, a: std.mem.Allocator, enc: EncodedColumn, levels: schema.Levels, n: usize) !ReadBack(T) {
+    const column = @import("../parquet/column.zig");
+    var reader = column.ColumnChunkReader(T).init(enc.bytes, enc.meta.codec, levels, a);
+    const out: ReadBack(T) = .{ .values = try a.alloc(T, n), .defs = try a.alloc(u32, n), .reps = try a.alloc(u32, n) };
+    var got: usize = 0;
+    while (got < n) {
+        const k = if (levels.max_rep > 0)
+            try reader.decodeWithRepLevels(out.values[got..], out.defs[got..], out.reps[got..])
+        else if (levels.max_def > 0)
+            try reader.decodeWithLevels(out.values[got..], out.defs[got..])
+        else
+            try reader.decode(out.values[got..]);
+        if (k == 0) break;
+        got += k;
+    }
+    try testing.expectEqual(n, got);
+    return out;
+}
+
+test "a chunk under a small page target splits into pages that read back as the chunk" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const limit = 600; // what the 100-row / 300-byte target leaves a page at most, header and levels included
+    const n = 1000;
+    var required = flbaElem(0, .REQUIRED);
+    var optional = flbaElem(0, .OPTIONAL);
+
+    // INT64, REQUIRED: DELTA_BINARY_PACKED pages.
+    {
+        required.type = .INT64;
+        const vals = try a.alloc(i64, n);
+        for (vals, 0..) |*v, i| v.* = @as(i64, @intCast(i)) * 7919 - 100_000;
+        const enc = try encodeColumn(a, splitInput(.{ .i64 = .{ .values = vals } }, &required, .UNCOMPRESSED));
+        try testing.expect(enc.pages.len > 1);
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const back = try readBack(i64, a, enc, .{ .max_def = 0, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(i64, vals, back.values);
+    }
+    // INT64, OPTIONAL, few distinct values: one dictionary page, then index pages.
+    {
+        optional.type = .INT64;
+        const vals = try a.alloc(i64, n);
+        const defs = try a.alloc(u32, n);
+        for (vals, defs, 0..) |*v, *d, i| {
+            d.* = @intFromBool(i % 3 != 0);
+            v.* = if (d.* == 1) @intCast(i % 20) else 0;
+        }
+        const col: filter_eval.Batch.Column = .{ .i64 = .{ .values = vals, .def_levels = defs, .max_def = 1 } };
+        const enc = try encodeColumn(a, splitInput(col, &optional, .UNCOMPRESSED));
+        try testing.expect(enc.meta.dictionary_page_offset != null and enc.pages.len > 1);
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const back = try readBack(i64, a, enc, .{ .max_def = 1, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(u32, defs, back.defs);
+        for (vals, defs, back.values) |v, d, b| if (d == 1) try testing.expectEqual(v, b);
+    }
+    // Strings, OPTIONAL, all distinct: cut by bytes as well as rows, snappy-compressed.
+    {
+        optional.type = .BYTE_ARRAY;
+        const vals = try a.alloc([]const u8, n);
+        const defs = try a.alloc(u32, n);
+        for (vals, defs, 0..) |*v, *d, i| {
+            d.* = @intFromBool(i % 7 != 0);
+            v.* = if (d.* == 1) try std.fmt.allocPrint(a, "value-{d}-{d}", .{ i, i * i }) else "";
+        }
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = vals, .def_levels = defs, .max_def = 1 } };
+        const enc = try encodeColumn(a, splitInput(col, &optional, .SNAPPY));
+        try testing.expect(enc.pages.len > n / 100);
+        const back = try readBack([]const u8, a, enc, .{ .max_def = 1, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(u32, defs, back.defs);
+        for (vals, defs, back.values) |v, d, b| if (d == 1) try testing.expectEqualStrings(v, b);
+    }
+    // BOOLEAN, REQUIRED.
+    {
+        required.type = .BOOLEAN;
+        const vals = try a.alloc(bool, n);
+        for (vals, 0..) |*v, i| v.* = (i * 31) % 7 < 3;
+        const enc = try encodeColumn(a, splitInput(.{ .boolean = .{ .values = vals } }, &required, .UNCOMPRESSED));
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const back = try readBack(bool, a, enc, .{ .max_def = 0, .max_rep = 0 }, n);
+        try testing.expectEqualSlices(bool, vals, back.values);
+    }
+    // DECIMAL(38, 8) over FLBA(16): 16 bytes a value, so about 18 values a page.
+    {
+        var elem = flbaElem(16, .REQUIRED);
+        elem.logical_type = .{ .DECIMAL = .{ .scale = 8, .precision = 38 } };
+        const vals = try a.alloc(i128, n);
+        for (vals, 0..) |*v, i| v.* = @as(i128, @intCast(i)) * 1_000_000_000_000_000_007 - 3;
+        const enc = try encodeColumn(a, splitInput(.{ .i128 = .{ .values = vals } }, &elem, .UNCOMPRESSED));
+        try testing.expect(enc.pages.len >= n * 16 / 300);
+        try testing.expectEqual(@as(usize, n), try expectPagesWithin(a, enc, limit));
+        const kind = decimal_mod_test.kindFromSchema(&elem).?;
+        const flat: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+        const back = try decimal_mod_test.decodeColumnAsI128(a, enc.bytes, .UNCOMPRESSED, flat, n, kind);
+        try testing.expectEqualSlices(i128, vals, back.values);
+    }
+}
+
+test "a page no page header holds is TooLarge, and a dictionary page none holds leaves the chunk to its values" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    test_page_limit = 1000;
+    defer test_page_limit = std.math.maxInt(i32);
+    // One value longer than a page header holds cannot be split.
+    var s_elem = flbaElem(0, .REQUIRED);
+    s_elem.type = .BYTE_ARRAY;
+    const big = try a.alloc(u8, 1500);
+    @memset(big, 'x');
+    const one = [_][]const u8{big};
+    try testing.expectError(error.TooLarge, encodeColumn(a, splitInput(.{ .string = .{ .values = &one } }, &s_elem, .UNCOMPRESSED)));
+    // A repeated leaf is one page: past the limit, it is refused, never written wrapped.
+    var r_elem = flbaElem(0, .OPTIONAL);
+    r_elem.type = .INT64;
+    const reps = try a.alloc(u32, 400);
+    const defs = try a.alloc(u32, 400);
+    const rvals = try a.alloc(i64, 400);
+    for (reps, defs, rvals, 0..) |*r, *d, *v, i| {
+        r.* = @intFromBool(i % 3 != 0);
+        d.* = 2;
+        v.* = @intCast(i * 1_000_003);
+    }
+    const nested: filter_eval.Batch.Column = .{ .i64 = .{
+        .values = rvals,
+        .def_levels = defs,
+        .max_def = 2,
+        .rep_levels = reps,
+        .max_rep = 1,
+    } };
+    try testing.expectError(error.TooLarge, encodeColumn(a, splitInput(nested, &r_elem, .UNCOMPRESSED)));
+    // 4000 values, 200 distinct: a 1600-byte dictionary, past the limit, so the values are written instead.
+    var elem = flbaElem(0, .REQUIRED);
+    elem.type = .INT64;
+    const vals = try a.alloc(i64, 4000);
+    for (vals, 0..) |*v, i| v.* = @intCast((i * 37) % 200);
+    const in = splitInput(.{ .i64 = .{ .values = vals } }, &elem, .UNCOMPRESSED);
+    test_page_limit = std.math.maxInt(i32);
+    const whole = try encodeColumn(a, in);
+    try testing.expect(whole.meta.dictionary_page_offset != null);
+    test_page_limit = 1000;
+    const split = try encodeColumn(a, in);
+    try testing.expect(split.meta.dictionary_page_offset == null and split.pages.len > 1);
+    try testing.expectEqual(@as(usize, 4000), try expectPagesWithin(a, split, 1000));
+    const back = try readBack(i64, a, split, .{ .max_def = 0, .max_rep = 0 }, 4000);
+    try testing.expectEqualSlices(i64, vals, back.values);
+}
+
+/// `s` `n` times over, at comptime.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    comptime {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |k| @memcpy(out[k * s.len ..][0..s.len], s);
+        const final = out;
+        return &final;
+    }
+}
+
+test "byte bounds past 64 bytes are cut: a prefix for the min, a grown prefix for the max, none past all 0xFF" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const long = comptime repeat("a", 100);
+    try testing.expectEqualStrings(comptime repeat("a", 64), cutMin(long, .bytes));
+    try testing.expectEqualStrings(comptime repeat("a", 63) ++ "b", (try cutMax(a, long, .bytes)).?);
+    // Short bounds, and FIXED_LEN_BYTE_ARRAY ones, are kept whole (the very slice).
+    try testing.expectEqual(@as([*]const u8, "abc".ptr), (try cutMax(a, "abc", .bytes)).?.ptr);
+    try testing.expectEqual(long.len, cutMin(long, .none).len);
+    try testing.expectEqual(long.len, (try cutMax(a, long, .none)).?.len);
+
+    // Trailing 0xFF bytes cannot grow: the byte before them does, and they go.
+    const ff = comptime repeat("x", 60) ++ "\xfe" ++ repeat("\xff", 10);
+    try testing.expectEqualStrings(comptime repeat("x", 60) ++ "\xff", (try cutMax(a, ff, .bytes)).?);
+    try testing.expect(try cutMax(a, comptime repeat("\xff", 70), .bytes) == null);
+
+    // UTF-8 is cut at a character boundary and grows by a character of the same width.
+    const euro = comptime repeat("€", 30); // 3 bytes each: the boundary below 64 is 63
+    try testing.expectEqualStrings(comptime repeat("€", 21), cutMin(euro, .utf8));
+    try testing.expectEqualStrings(comptime repeat("€", 20) ++ "\u{20AD}", (try cutMax(a, euro, .utf8)).?);
+    // U+FFFF grows to a 4-byte character: it is dropped and the one before it grows instead.
+    const top = comptime repeat("a", 61) ++ "\u{FFFF}" ++ repeat("z", 10); // the cut at 64 ends on U+FFFF
+    try testing.expectEqualStrings(comptime repeat("a", 60) ++ "b", (try cutMax(a, top, .utf8)).?);
+    // Text that is not UTF-8 is cut as bytes.
+    const bad = comptime repeat("\xc3", 70);
+    try testing.expectEqualStrings(comptime repeat("\xc3", 64), cutMin(bad, .utf8));
+
+    // Every cut bound lies on the right side of the value.
+    for ([_][]const u8{ long, ff, euro, top, bad }) |v| for ([_]BoundCut{ .bytes, .utf8 }) |c| {
+        try testing.expect(!std.mem.lessThan(u8, v, cutMin(v, c)));
+        if (try cutMax(a, v, c)) |m| try testing.expect(!std.mem.lessThan(u8, m, v));
+    };
+}
+
+test "string statistics say whether their bounds were cut; FIXED_LEN_BYTE_ARRAY bounds are never cut" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big = comptime repeat("m", 200);
+    var str = flbaElem(0, .REQUIRED);
+    str.type = .BYTE_ARRAY;
+    str.logical_type = .{ .STRING = .{} };
+
+    const cut = computeStats(a, .{ .string = .{ .values = &.{ big, "zz" ++ big } } }, null, 0, &str).?;
+    try testing.expectEqual(@as(usize, 64), cut.min_value.?.len);
+    try testing.expect(cut.max_value.?.len <= 64);
+    try testing.expectEqual(@as(?bool, false), cut.is_min_value_exact);
+    try testing.expectEqual(@as(?bool, false), cut.is_max_value_exact);
+
+    const whole = computeStats(a, .{ .string = .{ .values = &.{ "a", "b" } } }, null, 0, &str).?;
+    try testing.expectEqual(@as(?bool, true), whole.is_min_value_exact);
+    try testing.expectEqual(@as(?bool, true), whole.is_max_value_exact);
+
+    const fixed = flbaElem(200, .REQUIRED);
+    const flba = computeStats(a, .{ .string = .{ .values = &.{ big, big } } }, null, 0, &fixed).?;
+    try testing.expectEqual(@as(usize, 200), flba.max_value.?.len);
+    try testing.expect(flba.is_max_value_exact == null and flba.is_min_value_exact == null);
+
+    // The flags survive the footer.
+    var w: thrift.Writer = .init(a);
+    try cut.write(&w);
+    var r = thrift.Reader.init(w.bytes());
+    const back = try schema.Statistics.read(&r);
+    try testing.expectEqual(@as(?bool, false), back.is_max_value_exact);
+    try testing.expectEqual(@as(?bool, false), back.is_min_value_exact);
 }

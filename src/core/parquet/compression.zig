@@ -151,6 +151,9 @@ fn flateBound(n: usize) usize {
 /// KiB, an mmap/munmap pair per page under musl when made per call. A pthread key frees them when the thread exits,
 /// so a pass's workers, a library's request threads and a host's own threads each hold one set at most.
 /// Reuse leaves the bytes unchanged: every compression resets the context and its parameters first (`setLevel`).
+/// Their memory comes straight from the OS (`page_mem`), so a freed context goes back to it whatever the host's malloc
+/// does: glibc otherwise keeps blocks this size in a thread's arena once its mmap threshold has risen, tens of MB after
+/// a large write in a library's host.
 const ThreadZstd = struct {
     dctx: ?*c_zstd.ZSTD_DCtx = null,
     cctx: ?*c_zstd.ZSTD_CCtx = null,
@@ -206,7 +209,7 @@ const ThreadZstd = struct {
 
     fn decoder(s: *ThreadZstd) Error!*c_zstd.ZSTD_DCtx {
         if (s.dctx == null) {
-            s.dctx = c_zstd.ZSTD_createDCtx() orelse return error.OutOfMemory;
+            s.dctx = c_zstd.ZSTD_createDCtx_advanced(page_mem) orelse return error.OutOfMemory;
             if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
         }
         return s.dctx.?;
@@ -214,12 +217,28 @@ const ThreadZstd = struct {
 
     fn encoder(s: *ThreadZstd) Error!*c_zstd.ZSTD_CCtx {
         if (s.cctx == null) {
-            s.cctx = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
+            s.cctx = c_zstd.ZSTD_createCCtx_advanced(page_mem) orelse return error.OutOfMemory;
             if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
         }
         return s.cctx.?;
     }
 };
+
+/// libzstd's allocator for the thread contexts: page-backed blocks behind a header holding their length. A context is
+/// made once per thread and its workspace regrown rarely, so this costs system calls per thread, not per page.
+const page_mem: c_zstd.ZSTD_customMem = .{ .customAlloc = pageAlloc, .customFree = pageFree, .@"opaque" = null };
+const page_head = 64;
+
+fn pageAlloc(_: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    const block = std.heap.page_allocator.alignedAlloc(u8, .@"64", page_head + size) catch return null;
+    std.mem.writeInt(usize, block[0..@sizeOf(usize)], block.len, .native);
+    return block.ptr + page_head;
+}
+
+fn pageFree(_: ?*anyopaque, p: ?*anyopaque) callconv(.c) void {
+    const at: [*]align(64) u8 = @alignCast(@as([*]u8, @ptrCast(p orelse return)) - page_head);
+    std.heap.page_allocator.free(at[0..std.mem.readInt(usize, at[0..@sizeOf(usize)], .native)]);
+}
 
 fn compressZstd(arena: std.mem.Allocator, src: []const u8, plan: ZstdPlan) Error![]u8 {
     const max_len = c_zstd.ZSTD_compressBound(src.len);
@@ -640,6 +659,17 @@ test "SNAPPY round-trip" {
     const out = try decompress(testing.allocator, compressed[0..comp_len], .SNAPPY, input.len);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(input, out);
+}
+
+test "the zstd contexts' page allocator hands out aligned, writable blocks of the size asked and takes them back" {
+    for ([_]usize{ 1, 63, 4096 - page_head, 4096, 1 << 20, (3 << 20) + 5 }) |n| {
+        const p: [*]u8 = @ptrCast(pageAlloc(null, n) orelse return error.OutOfMemory);
+        try testing.expect(std.mem.isAligned(@intFromPtr(p), 64));
+        @memset(p[0..n], 0xA5);
+        try testing.expectEqual(@as(u8, 0xA5), p[n - 1]);
+        pageFree(null, p);
+    }
+    pageFree(null, null);
 }
 
 test "SNAPPY writes the same bytes whatever the thread's kept working memory held before" {

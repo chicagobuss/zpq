@@ -42,8 +42,20 @@ pub fn build(b: *std.Build) void {
     // depend on where they were built. Off by default so local builds keep the symbols profilers and stack traces use.
     const strip = b.option(bool, "strip", "Strip debug info and symbols from zpq and zpq-lambda (default false)") orelse false;
 
+    // A release candidate carries its tag in every version string (`--version`, `created_by`, profiles) so its output
+    // is never mistaken for the final release's; tools/package_release.py derives it from the release tag.
+    const prerelease = b.option([]const u8, "prerelease", "Prerelease identifier appended to the version (e.g. rc2)");
+    const version = if (prerelease) |pre| blk: {
+        if (!validPrerelease(pre)) {
+            std.log.err("-Dprerelease={s}: want dot-separated [0-9A-Za-z-] identifiers (SemVer), e.g. rc2", .{pre});
+            std.process.exit(1);
+        }
+        break :blk b.fmt("{s}-{s}", .{ zon.version, pre });
+    } else zon.version;
+
     var deps = CoreDeps.init(b, target, optimize, fetch_prebuilt, false);
     deps.profile = profile;
+    deps.version = version;
 
     // ----- CLI binary -----
     const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql, strip);
@@ -84,6 +96,7 @@ pub fn build(b: *std.Build) void {
     // the codec and BoringSSL archives; see docs/libzpq.md). Opt-in: `zig build libzpq`.
     var libzpq_deps = CoreDeps.init(b, target, optimize, fetch_prebuilt, true);
     libzpq_deps.profile = profile;
+    libzpq_deps.version = version;
     const libzpq_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
     const libzpq_mod = b.createModule(.{
         .root_source_file = b.path("src/libzpq/libzpq.zig"),
@@ -377,6 +390,8 @@ const CoreDeps = struct {
     liteparser_c: *std.Build.Module,
     /// `build_options.enable_profile` for every module instance.
     profile: bool = true,
+    /// `build_options.version`: build.zig.zon's, plus `-Dprerelease`'s suffix.
+    version: []const u8 = zon.version,
 
     fn init(
         b: *std.Build,
@@ -475,7 +490,7 @@ fn addCoreModule(
     const opts = b.addOptions();
     opts.addOption(bool, "enable_sql", options.sql);
     opts.addOption(bool, "enable_profile", deps.profile);
-    opts.addOption([]const u8, "version", zon.version);
+    opts.addOption([]const u8, "version", deps.version);
     const opts_mod = opts.createModule();
 
     // Frame pointers on: makes `perf record --call-graph=fp` produce clean
@@ -796,4 +811,13 @@ fn liteparserCModule(
     );
     tc.addIncludePath(b.path("vendor/liteparser"));
     return tc.createModule();
+}
+
+fn validPrerelease(pre: []const u8) bool {
+    var ids = std.mem.splitScalar(u8, pre, '.');
+    while (ids.next()) |id| {
+        if (id.len == 0) return false;
+        for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    }
+    return true;
 }

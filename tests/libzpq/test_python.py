@@ -50,7 +50,7 @@ def test_binding(z):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "o.parquet")
         w = z.run({"inputs": [FIX], "output_url": out, "select": "a * 2 AS x, b", "filter": "a < 10"})
-        check(w["rows_kept"] == 10, f"write {w}")
+        check(w["rows_matched"] == 10 and w["rows_scanned"] >= 10, f"write {w}")
         back = z.run({"inputs": [out], "aggregate": "sum(x) AS s"})
         check(back["agg"] == {"s": 90}, f"read back {back}")
 
@@ -102,15 +102,18 @@ def test_decimal_exact(z):
         grp = z.query(f"SELECT k, sum(p) AS s FROM '{src}' GROUP BY k ORDER BY k")
         check(grp == [{"k": Decimal("1.5"), "s": Decimal("83332533333.10")}, {"k": Decimal("2.0"), "s": None}],
               f"decimal key {grp}")
-        r = z.run({"inputs": [src], "aggregate": "sum(p) AS s, avg(p) AS a, min(f) AS m"})
+        r = z.run({"inputs": [src], "aggregate": "sum(p) AS s, avg(p) AS a, min(f) AS m, avg_state(p) AS st"})
+        # avg over DECIMAL(18,2) is DECIMAL(22,6); avg_state keeps the exact sum at the column's scale.
         check(r["agg"]["s"] == Decimal("83332533333.10") and type(r["agg"]["s"]) is Decimal
-              and type(r["agg"]["m"]) is float and r["agg"]["a"]["avg"] == Decimal("41666266666.55"),
+              and type(r["agg"]["m"]) is float and type(r["agg"]["a"]) is Decimal
+              and str(r["agg"]["a"]) == "41666266666.550000"
+              and r["agg"]["st"] == {"sum": Decimal("83332533333.10"), "count": 2},
               f"decimal agg {r['agg']}")
-        check(r.get("decimal") == ["s", "a"], f"decimal names {r.get('decimal')}")
+        check(r.get("decimal") == ["s", "a", "st"], f"decimal names {r.get('decimal')}")
         r2 = z.run({"inputs": [src], "aggregate": "sum(p) AS s"}, decimal=False)
         check(type(r2["agg"]["s"]) is float, f"run decimal=False {r2['agg']}")
-        # A scale-0 DECIMAL prints as an integer token: still Decimal, in rows, keys and aggregates; an average's
-        # count, and a non-DECIMAL integer, stay int.
+        # A scale-0 DECIMAL prints as an integer token: still Decimal, in rows, keys and aggregates; an avg_state's
+        # count, and a non-DECIMAL integer, stay int. avg over DECIMAL(38,0) keeps the type.
         src0 = os.path.join(d, "dec0.parquet")
         big = Decimal("12345678901234567890123456789012345678")
         pq.write_table(pa.table({"d": pa.array([big, Decimal("2")], pa.decimal128(38, 0)),
@@ -122,9 +125,11 @@ def test_decimal_exact(z):
         check(type(k0[0]["d"]) is Decimal and type(k0[0]["n"]) is int, f"scale-0 key {k0}")
         m0 = z.query(f"SELECT min(d) AS m FROM '{src0}'")
         check(m0 == [{"m": Decimal(2)}] and type(m0[0]["m"]) is Decimal, f"scale-0 scalar {m0}")
-        s0 = z.run({"inputs": [src0], "aggregate": "min(d) AS m, avg(d) AS a, sum(i) AS si"})
+        s0 = z.run({"inputs": [src0], "aggregate": "min(d) AS m, avg_state(d) AS a, sum(i) AS si, avg(d) AS av"})
         check(type(s0["agg"]["m"]) is Decimal and type(s0["agg"]["a"]["count"]) is int
-              and type(s0["agg"]["a"]["sum"]) is Decimal and type(s0["agg"]["si"]) is int, f"scale-0 agg {s0['agg']}")
+              and type(s0["agg"]["a"]["sum"]) is Decimal and type(s0["agg"]["si"]) is int
+              and s0["agg"]["av"] == Decimal("6172839450617283945061728394506172840")
+              and type(s0["agg"]["av"]) is Decimal, f"scale-0 agg {s0['agg']}")
         check(type(z.query(f"SELECT d FROM '{src0}'", decimal=False)[0]["d"]) is int, "scale-0 opt-out")
 
 

@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Reuse corpus_diff's seeded, schema-derived query generation and the
 # value-normalization helpers — same query distribution, so a metamorphic
 # failure and a differential failure speak the same language.
-from corpus_diff import columns_of, gen_ops, fold_avg, duck_agg  # noqa: E402
+from corpus_diff import columns_of, gen_ops, duck_agg  # noqa: E402
 from triangulate import compare_values, ZPQ_BIN  # noqa: E402
 
 try:
@@ -67,12 +67,12 @@ TIMEOUT_S = 60
 # Polars = Rust (its own parquet engine). Both are SQL, both read the local file.
 
 def _scalar(payload):
-    """An agg dict has exactly one result column; reduce to its scalar
-    (avg folded from {sum,count}) so engines compare apples-to-apples."""
+    """An agg dict has exactly one result column; reduce to its scalar so
+    engines compare apples-to-apples."""
     if not payload:
         return None
     (v,) = payload.values()
-    return fold_avg(v)
+    return v
 
 
 def polars_agg(path: str, agg: str, where: str | None):
@@ -148,13 +148,13 @@ def zpq_agg(path: str, agg: str, where: str | None, *, scan_all: bool):
 
 
 def agg_equal(a, b) -> bool:
-    """Compare two ZPQ agg dicts (avg folded from {sum,count}), NaN/float
-    tolerant via triangulate.compare_values."""
+    """Compare two ZPQ agg dicts, NaN/float tolerant via
+    triangulate.compare_values."""
     if a is None or b is None:
         return a is None and b is None
     if set(a) != set(b):
         return False
-    return all(compare_values(fold_avg(a[k]), fold_avg(b[k])) for k in a)
+    return all(compare_values(a[k], b[k]) for k in a)
 
 
 def compare_runs(label, r_a, r_b):

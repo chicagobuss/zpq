@@ -19,6 +19,10 @@ Download the CLI for your OS/architecture from a published release, or build it 
 `zig build cli -Doptimize=ReleaseFast` using Zig 0.17.0. `zpq --version` prints the version and build revision.
 The Homebrew formula is staged in `packaging/homebrew/`; it is not a published tap yet.
 
+New to zpq? [docs/getting-started.md](docs/getting-started.md) walks through a filtered read, a GROUP BY with `avg`
+and a computed Parquet write, each with its exact output; [docs/output-format.md](docs/output-format.md) is the
+contract for JSON, NDJSON and CSV answers and how each type prints.
+
 ```sh
 # Answers are NDJSON rows, ready for Unix tools (jq is a separate install).
 zpq query trips.parquet --columns VendorID,trip_distance --limit 5 | jq .
@@ -156,15 +160,21 @@ not rounded to it.
 only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
 (`CASE x WHEN ...`) is not supported. DECIMAL arithmetic is exact (see below).
 
-**Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`. In SQL,
-GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a column of the name wins,
-as in DuckDB); `HAVING` compares aggregates or keys with literals (only TRUE keeps a group; without GROUP BY the one
-group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks. Plain rows take
-`ORDER BY` columns with a `LIMIT`, keeping the first rows by those keys, ties by input position.
-As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet; avg's
-`{"sum", "count"}` pair becomes `{"sum": null, "count": 0}`) while `count` is 0. Earlier versions reported 0 or `""`.
+**Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and
+`GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a
+column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals (only TRUE keeps a group;
+without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks. Plain
+rows take `ORDER BY` columns with a `LIMIT`, keeping the first rows by those keys, ties by input position.
+As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet;
+avg_state's pair becomes `{"sum": null, "count": 0}`) while `count` is 0. Earlier versions reported 0 or `""`.
+`avg(x)` is the mean, one value in every format: DOUBLE for integer and floating `x` (the sum, its integers summed
+exactly, divided once by the count), DECIMAL for a DECIMAL `x` (below). `avg_state(x)` is the same average as mergeable
+state for fan-out: `{"sum": .., "count": ..}` in JSON and NDJSON, `<name>__sum` and `<name>__count` columns in CSV and
+Parquet (a DOUBLE or exact DECIMAL(38, s) sum, a non-null INT64 count), so per-file answers merge exactly with
+`sum(<name>__sum) / sum(<name>__count)`; you cannot average means. A double avg is the avg_state sum over its count,
+bit for bit.
 `-o out.parquet` writes the result as parquet: one row, or one row per group with the same columns and values as the
-JSON (avg as `<name>__sum` / `<name>__count`).
+JSON (avg_state as `<name>__sum` / `<name>__count`).
 `count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
 opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
 is a ceiling on what an aggregate or a write holds at once: one budget (`src/core/memory.zig`) that the GROUP BY tables,
@@ -188,9 +198,12 @@ completes:
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
 
-It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default on
-Linux is 80% of available memory, or three quarters of a cgroup's memory limit or a Lambda's memory size where those
-are lower; on macOS it is half of physical memory (`src/core/system.zig`), and 512 MB where neither can be read.
+It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default
+(`src/core/system.zig`) is three quarters of the memory size on Lambda; on Linux, 80% of available memory, but no more
+than three quarters of a cgroup v2 `memory.max`; on macOS, half of physical memory; and 512 MiB where none of these
+can be read. Give it as bytes, or as a number (fractions allowed) followed by `K`, `M`, `G` or `T`, with or without a
+`B`, in any case, all powers of 1024: `--max-memory 2GB`, `--max-memory 1.5g`, `--max-memory 1073741824`. A space,
+an exponent (`1e9`) or a `MiB` spelling is refused (exit 2).
 
 Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
 It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports the strategy, reasons, column passes,
@@ -214,14 +227,16 @@ is there), `a * b` adds scales and precisions (capped at 38 digits), an integer 
 DECIMAL(19,0), and a DOUBLE operand gives DOUBLE. Two places follow DuckDB instead: `/` gives DOUBLE, and an `avg`'s
 sum may pass 38 digits. DuckDB agrees on every scale but keeps some results at 18 digits where Trino and zpq widen
 (the product of two DECIMAL(15,2) is DECIMAL(18,4) in DuckDB, DECIMAL(30,4) here); values are the same.
-`sum` is DECIMAL(38, s); `min` / `max` keep the column's type; `avg` keeps it too, the exact mean rounded half away
-from zero as Trino does (DuckDB answers avg in DOUBLE). The JSON prints every digit of the scale
-(`3344516955134.66`), `-o` writes DECIMAL columns, and a DECIMAL avg's JSON adds `"avg"` beside `{"sum", "count"}`; its
-sum is exact at any width, but `-o`'s `__sum` column is DECIMAL(38, s), so an avg whose sum passes 38 digits answers in
-JSON and errors with `-o`. A value that needs more than its type's digits stops the query with an error rather than
-wrapping or rounding, but only in rows the filter keeps. Filters compare a DECIMAL column with a literal exactly, at
-the column's scale. Arithmetic over a NULL is NULL, for every type, as in SQL: `x * 2` is NULL where `x` is, aggregates
-skip it, and a NULL row raises no overflow or division by zero.
+`sum` is DECIMAL(38, s); `min` / `max` keep the column's type. `avg` over DECIMAL(p, s) is DECIMAL(q, s + q - p) with
+q = min(38, p + 4): up to four more fractional digits and never fewer integer digits, so DataFusion's (p + 4, s + 4)
+for p <= 34, the input's own type at p = 38 as in Trino, and DECIMAL(38, 37) for DECIMAL(36, 35). The mean is exact,
+divided from the exact sum and rounded half away from zero once, so it always fits (it is never larger than the
+largest value). The JSON prints every digit of the scale (`3344516955134.66`) and `-o` writes DECIMAL columns.
+avg_state's sum is exact at any width in JSON, but `-o`'s `__sum` column is DECIMAL(38, s), so an avg_state whose sum
+passes 38 digits answers in JSON and errors with `-o`; avg itself never does. A value that needs more than its type's
+digits stops the query with an error rather than wrapping or rounding, but only in rows the filter keeps. Filters
+compare a DECIMAL column with a literal exactly, at the column's scale. Arithmetic over a NULL is NULL, for every type,
+as in SQL: `x * 2` is NULL where `x` is, aggregates skip it, and a NULL row raises no overflow or division by zero.
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
@@ -300,8 +315,8 @@ and an empty string `""`; a field is quoted when it holds a comma, a quote or a 
 `YYYY-MM-DD HH:MM:SS.fff`, with the column's own number of fractional digits and a trailing `Z` when it is adjusted to
 UTC. Bytes follow the JSON rules ([docs/binary-output.md](docs/binary-output.md)): text as text, a UUID as
 8-4-4-4-12, and what JSON prints as an object (bytes that are not UTF-8, BSON and GEOMETRY, INTERVAL) as that object's
-JSON text in a quoted field. An average is two columns, `<name>__sum` and `<name>__count`, as a Parquet write holds
-it. `--limit` and SQL `LIMIT` / `OFFSET` count rows, never the header.
+JSON text in a quoted field. An average is one column; an `avg_state` is two, `<name>__sum` and `<name>__count`, as a
+Parquet write holds it. `--limit` and SQL `LIMIT` / `OFFSET` count rows, never the header.
 
 ```sh
 zpq query input.parquet --limit 10                          # NDJSON rows
@@ -327,15 +342,18 @@ even when `-o` is supplied.
 same semantics; combining it with `--limit` is an error. LIMIT 0 validates the query and schema without decoding data
 pages. Empty NDJSON is zero bytes, empty JSON is `[]` followed by a newline, and empty Parquet retains its schema.
 A scalar aggregate over empty input still emits one row unless the final limit or offset excludes it. Column order,
-input/group order, exact numeric digits, nulls, and the existing AVG representation are preserved: JSON keeps
-`{sum,count}` (DECIMAL AVG also has `avg`); Parquet retains its split AVG columns. Grouped results still materialize.
+input/group order, exact numeric digits and nulls are the same in every format: avg is one value, avg_state its
+`{sum,count}` object in JSON and its split columns in CSV and Parquet. Grouped results still materialize.
 
 Successful queries are silent on stderr unless diagnostics were requested. `--summary=json` emits one typed
 `{"type":"summary","ok":true,"rows":N,"output":...}` line after the answer is flushed and a named file is published.
-It includes input statistics, membership and phase counters; `rows` counts emitted rows, distinct from `rows_kept`.
-`total_us` includes formatting, flushing and publication, excludes writing the summary, and `output_us` records
-output work separately. In this mode failures emit a typed `error` line and JSON profile summaries a typed `profile`
-line; text profile summaries are rejected. The libzpq, service and Lambda envelopes are unchanged.
+It counts rows four ways: `rows` in the answer, `rows_in` in the inputs, `rows_scanned` in the row groups read, and
+`rows_matched` kept by the filter. Its times are wall clock (`total_ms`, `output_us`, `wall_ms`) or, in `worker_ms`,
+summed over the workers, so a `worker_ms.decode` above `total_ms` means several workers decoded at once.
+[docs/output-format.md](docs/output-format.md) defines every field. `total_us` includes formatting, flushing and
+publication and excludes writing the summary. In this mode failures emit a typed `error` line and JSON profile
+summaries a typed `profile` line; text profile summaries are rejected. The libzpq, service and Lambda responses carry
+the same row counters and time objects.
 
 Exit status is 0 for success, 1 for read/decode/write failure, 2 for invalid or unsupported options/queries, and 141
 when a consumer closes stdout. Disk-full errors remain failures. Named local outputs use an exclusive sibling
@@ -435,8 +453,12 @@ just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 `zpq --version` reports the release the binary was built from.
 
 The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases ship the CLI for Linux
-and macOS, each x86_64 and arm64, as `zpq-<linux|macos>-<x86_64|arm64>.tar.gz` (plus a `.sha256`) on the GitHub Release
-and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or `releases/v<version>/`).
+and macOS, each x86_64 and arm64, as `zpq-<version>-<revision>-<target>.tar.gz` (plus a `.sha256` and `release.json`)
+on the GitHub Release and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or
+`releases/v<version>/`). An archive holds the binary, the man page, completions, `tiny.parquet` and the guides under
+`share/doc/zpq/`. `python3 tools/package_release.py --tag v0.5.0-rc2` builds a release candidate: the tag's suffix
+goes into `zpq --version`, the binary's `created_by`, the archive names and `release.json` (`zig build
+-Dprerelease=rc2` does the same for a local build). A final tag (`v0.5.0`) builds exactly as without `--tag`.
 
 For a private local Homebrew rehearsal, pass the release manifest as the generator's positional argument.
 Keep the tarballs beside that manifest and use their directory as the local URL prefix:

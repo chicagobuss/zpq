@@ -11,22 +11,25 @@ usage:
             [\-\-group\-by "EXPR [AS name], ..."] [\-\-column\-order COL1,COL2,...]
             [\-\-codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
             [\-\-row\-group\-size ROWS] [\-\-row\-group\-bytes SIZE]
-            [\-\-threads N | \-j N] [\-\-max\-memory SIZE]
+            [\-\-threads N | \-j N]
             [\-\-compress\-priority size|speed]
             [\-\-scan\-all] [\-\-trust\-stats] [\-\-fast\-levels] [\-\-unordered]
-            [\-\-bloom\-filter COL[:FPP] ...]
+            [\-\-max\-memory SIZE] [\-\-bloom\-filter COL[:FPP] ...]
             [\-\-format ndjson|json|csv|parquet] [\-\-limit N] [\-\-summary=json]
             [\-\-explain] [\-\-profile TRACE.json] [\-\-profile\-summary[=text|json]]
   zpq query \-\-query "<sql query>" [\-\-output <out.parquet>]
             [\-\-codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
             [\-\-threads N | \-j N]
             [\-\-compress\-priority size|speed]
-            [\-\-scan\-all] [\-\-trust\-stats]
+            [\-\-scan\-all] [\-\-trust\-stats] [\-\-max\-memory SIZE]
             [\-\-explain] [\-\-profile TRACE.json] [\-\-profile\-summary[=text|json]]
             [\-\-format ndjson|json|csv|parquet] [\-\-limit N] [\-\-summary=json]
   zpq schema <file.parquet>
   zpq inspect FILE... [\-\-format json] [\-\-detail]
   zpq conform <file.parquet>
+
+  First steps: docs/getting\-started.md. Output shapes: docs/output\-format.md.
+  A release archive ships both under share/doc/zpq/.
 
   \-\-output / \-o  named destination: default Parquet, stdout stays empty.
                  `\-o \-` writes stdout (default NDJSON).
@@ -36,17 +39,29 @@ usage:
                  stdout, but refuses a terminal. No extension inference.
                  `csv` is RFC 4180 with a header row: NULL an empty
                  field, "" an empty string, DATE/TIME/TIMESTAMP as ISO
-                 text (`Z` when UTC), an average as <name>__sum and
+                 text (`Z` when UTC), an avg_state as <name>__sum and
                  <name>__count; bytes as below, objects as their JSON.
                  Bytes print as text when UTF\-8, else {"base64":...};
                  BSON/GEOMETRY/GEOGRAPHY always {"base64":...}; UUID
                  8\-4\-4\-4\-12; INTERVAL an object. Non\-UTF\-8 STRING:
                  exit 1 (docs/binary\-output.md).
+  \-\-aggregate    sum, count, min, max, avg; count(DISTINCT x); avg_state.
+                 avg(x) is the mean, NULL over no values: DOUBLE, or
+                 for DECIMAL(p,s) DECIMAL(q, s+q\-p) with q = min(38,
+                 p+4) (p = 38 keeps the input type), rounded half
+                 away from zero. avg_state(x) is the mergeable pair:
+                 {"sum":..,"count":..} in JSON, <name>__sum and
+                 <name>__count columns in CSV and Parquet; merge
+                 files with sum(<name>__sum) / sum(<name>__count).
   \-\-limit        cap final answer rows, including aggregates and files.
                  SQL LIMIT has the same meaning; do not combine them.
   \-\-summary=json emit a typed summary on stderr after output completes;
                  errors and JSON profiles are typed too. No default
                  success summary. Text profile summaries conflict.
+                 Rows: rows_in, rows_scanned (row groups read),
+                 rows_matched (kept by the filter), rows (answer).
+                 Times: wall_ms phases, worker_ms summed over workers
+                 (docs/output\-format.md).
   exit codes     0 success; 1 read/decode/write failure; 2 invalid or
                  unsupported query/options; 141 closed stdout pipe.
                  Local files publish atomically; failed stdout can
@@ -73,8 +88,7 @@ usage:
                  every page. `speed`: each page stored raw, as
                  entropy\-coded literals, or at level 1 or 3, whichever
                  a sample says costs least; less CPU, but a page can
-                 come out uncompressed where level 3 would shrink it
-                 (see README).
+                 come out uncompressed where level 3 would shrink it.
   \-\-scan\-all     decode every page/byte: disables all stats shortcuts
                  (row\-group pruning, stats\-as\-answer). Slower but
                  thorough — use when you don't trust a file's stats.
@@ -84,6 +98,10 @@ usage:
                  Also prunes FLOAT/DOUBLE `>`/`>=` on chunks whose stats
                  carry no NaN count, as if they said none: NaN sorts
                  above every number, so by default such a chunk is read.
+                 Trusts plausible stats, never impossible ones: min
+                 above max, or a null count outside the chunk, is
+                 ignored either way; a null count the bounds contradict
+                 or fail to back is used only with this flag.
   \-\-bloom\-filter write a split\-block Bloom filter for output column COL
                  (repeatable), at false\-positive probability FPP
                  (default 0.01). Readers then skip row groups an `=`
@@ -98,12 +116,17 @@ usage:
                  to run. By default groups come in the order they
                  first appear in the input and the same bits come out
                  at every \-j.
-  \-\-max\-memory   SIZE such as 500MB or 2GB (default: most of the memory
-                 available). A ceiling on what an aggregate or a
-                 write holds at once:
+  \-\-max\-memory SIZE
+                 ceiling on what an aggregate or a write holds at once:
                  GROUP BY tables, decoded row groups, read\-ahead,
                  merge and answer, encoded output waiting to be
                  written, all drawn from one budget whatever \-j is.
+                 SIZE is bytes, or a number (fractions allowed) with K,
+                 M, G or T, B optional, any case, in powers of 1024:
+                 1024, 512MB, 1.5g. No space; MiB and 1e9 are refused.
+                 Unset: 80% of available memory on Linux (at most 3/4
+                 of a cgroup memory.max), half of RAM on macOS, else
+                 512 MiB. Example: \-\-max\-memory 2GB.
                  Outside it, a fixed slack: the binary, thread stacks,
                  the mapped input, each worker's first 2 MiB, 16 MiB
                  for a GROUP BY's merge and answer, and 32 MiB for a

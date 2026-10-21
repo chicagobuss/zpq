@@ -815,13 +815,13 @@ pub const Statistics = struct {
     distinct_count: ?i64 = null,
     max_value: ?[]const u8 = null,
     min_value: ?[]const u8 = null,
-    /// False means `max_value` is a truncated upper bound rather than a value present in the chunk. Read-only: not
-    /// written back, so byte-copied output loses them, which only makes later readers more conservative.
+    /// False means `max_value` (`min_value`) is a cut bound rather than a value present in the chunk: it prunes but
+    /// answers nothing. Written back, so a chunk copied byte for byte keeps what its writer said, and set by zpq's own
+    /// writer on every BYTE_ARRAY chunk (`encoder.statsBytes`).
     is_max_value_exact: ?bool = null,
     is_min_value_exact: ?bool = null,
-    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Written back, unlike the exactness flags: the
-    /// writer counts its own chunks' NaN, and a chunk copied byte for byte keeps its count. Missing means NaN may be
-    /// present.
+    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. The writer counts its own chunks' NaN, and a
+    /// chunk copied byte for byte keeps its count. Missing means NaN may be present.
     nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
@@ -866,6 +866,8 @@ pub const Statistics = struct {
         if (self.distinct_count) |v| try writer.writeFieldI64(4, v);
         if (self.max_value) |v| try writer.writeFieldString(5, v);
         if (self.min_value) |v| try writer.writeFieldString(6, v);
+        if (self.is_max_value_exact) |v| try writer.writeFieldBool(7, v);
+        if (self.is_min_value_exact) |v| try writer.writeFieldBool(8, v);
         if (self.nan_count) |v| try writer.writeFieldI64(9, v);
         try writer.writeStructEnd();
     }
@@ -1484,6 +1486,11 @@ pub const FileMetaData = struct {
     column_orders: ?std.ArrayListUnmanaged(i16) = null,
     /// Fields 8/9 (encryption_algorithm, footer_signing_key_metadata): a plaintext footer over encrypted columns.
     encrypted: bool = false,
+    /// Each leaf's element and levels, and the first leaf of each path, from one schema walk at footer open
+    /// (`indexLeaves`), so a chunk resolves its leaf by a hash probe: a walk over every leaf per column per row group
+    /// made row output and re-encoded writes quadratic in the column count. Null on a footer built in memory; lookups
+    /// then walk the schema. Indexed schemas must keep their shape.
+    leaf_index: ?*const LeafIndex = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         const saved_id = reader.last_field_id;
@@ -1579,6 +1586,7 @@ pub const FileMetaData = struct {
     }
 
     pub fn deinit(self: *FileMetaData, allocator: std.mem.Allocator) void {
+        if (self.leaf_index) |ix| ix.destroy(allocator);
         if (self.column_orders) |*co| co.deinit(allocator);
         self.schema.deinit(allocator);
         for (self.row_groups.items) |*rg| {
@@ -1680,12 +1688,109 @@ pub const FileMetaData = struct {
         return leaf.element.*;
     }
 
+    /// Build `leaf_index` over the current schema.
+    pub fn indexLeaves(self: *FileMetaData, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+        const ix = try allocator.create(LeafIndex);
+        ix.* = .{ .schema_len = self.schema.items.len };
+        errdefer ix.destroy(allocator);
+        var it: LeafIterator = .init(self.schema.items);
+        while (it.next()) |leaf| {
+            const path = try allocator.dupe([]const u8, leaf.path);
+            ix.leaves.append(allocator, .{
+                .element = @intCast(it.pos - 1),
+                .top = @intCast(leaf.top),
+                .max_def = leaf.max_def,
+                .max_rep = leaf.max_rep,
+                .path = path,
+            }) catch |err| {
+                allocator.free(path);
+                return err;
+            };
+            const gop = try ix.first_by_path.getOrPut(allocator, path);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(leaf.index);
+        }
+        self.leaf_index = ix;
+    }
+
+    /// Leaf `index` of the schema walk (the column chunk at that position in every row group), or null past the last.
+    /// Without an index the schema is walked in `scratch`, whose names the leaf's path then borrows: it stays valid
+    /// while `scratch` and the schema do.
+    pub fn leafAt(self: *const FileMetaData, index: usize, scratch: *LeafIterator) ?LeafIterator.Leaf {
+        if (self.leaf_index) |ix| if (ix.schema_len == self.schema.items.len) {
+            if (index >= ix.leaves.items.len) return null;
+            return ix.leaf(self, @intCast(index));
+        };
+        scratch.* = .init(self.schema.items);
+        while (scratch.next()) |leaf| if (leaf.index == index) return leaf;
+        return null;
+    }
+
+    /// The first leaf whose path is `path`. Callers read its element and levels only: without an index its path
+    /// borrows a walk that ends here.
     fn leafAtPath(self: *const FileMetaData, path: []const []const u8) ?LeafIterator.Leaf {
+        if (self.leaf_index) |ix| if (ix.schema_len == self.schema.items.len) {
+            return ix.leaf(self, ix.first_by_path.get(path) orelse return null);
+        };
         var it: LeafIterator = .init(self.schema.items);
         while (it.next()) |leaf| {
             if (pathEql(leaf.path, path)) return leaf;
         }
         return null;
+    }
+};
+
+/// `FileMetaData.leaf_index`: leaf `i` of the schema walk is `leaves[i]`; `first_by_path` maps a path to the first
+/// leaf with it, as the walk would find it.
+pub const LeafIndex = struct {
+    schema_len: usize,
+    leaves: std.ArrayListUnmanaged(Entry) = .empty,
+    first_by_path: PathMap = .empty,
+
+    const PathMap = std.HashMapUnmanaged([]const []const u8, u32, PathContext, std.hash_map.default_max_load_percentage);
+
+    pub const Entry = struct {
+        /// Schema index of the leaf's element.
+        element: u32,
+        top: u32,
+        max_def: u8,
+        max_rep: u8,
+        /// Owned copy of the path; its names borrow the schema.
+        path: []const []const u8,
+    };
+
+    const PathContext = struct {
+        pub fn hash(_: PathContext, path: []const []const u8) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            // Lengths first, so `a.b` and the field `b` of a group `a` hash apart.
+            for (path) |name| {
+                h.update(std.mem.asBytes(&name.len));
+                h.update(name);
+            }
+            return h.final();
+        }
+        pub fn eql(_: PathContext, a: []const []const u8, b: []const []const u8) bool {
+            return pathEql(a, b);
+        }
+    };
+
+    fn leaf(self: *const LeafIndex, file: *const FileMetaData, i: u32) LeafIterator.Leaf {
+        const e = self.leaves.items[i];
+        return .{
+            .index = i,
+            .element = &file.schema.items[e.element],
+            .path = e.path,
+            .top = e.top,
+            .max_def = e.max_def,
+            .max_rep = e.max_rep,
+        };
+    }
+
+    pub fn destroy(self: *const LeafIndex, allocator: std.mem.Allocator) void {
+        var ix = self.*;
+        for (ix.leaves.items) |e| allocator.free(e.path);
+        ix.leaves.deinit(allocator);
+        ix.first_by_path.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 

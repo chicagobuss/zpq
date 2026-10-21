@@ -135,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
             if (machine_diagnostics) try emitError(err);
             std.process.exit(queryExitCode(err, diag.execution_started));
         };
+        local_fs.releaseLeft();
         return;
     }
     if (std.mem.eql(u8, cmd, "conform")) {
@@ -619,12 +620,12 @@ fn runQuery(
             output_ns = @intCast(nowMonoNs() - output_start);
         }
         output_ns = if (fmt == .parquet) ar.timings.core.encode_ns + ar.timings.core.sink_ns + ar.timings.footer_ns else output_ns;
-        stats = .{ .rows_in = ar.rows_in, .rows_kept = ar.rows_kept, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
+        stats = .{ .aggregate = true, .rows_in = ar.rows_in, .rows_scanned = ar.rows_scanned, .rows_matched = ar.rows_matched, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
     } else if (fmt == .parquet and limit == null and result_order.offset == 0 and result_order.rows.len == 0) {
         const result = (try engine.runQuery(ctx, query_args)).write;
-        rows = @intCast(result.rows_kept);
+        rows = @intCast(result.rows_matched);
         output_ns = result.timings.core.encode_ns + result.timings.core.sink_ns + result.timings.footer_ns;
-        stats = .{ .rows_in = result.rows_in, .rows_kept = result.rows_kept, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .row_groups_pruned = result.row_groups_pruned, .membership = result.membership, .timings = result.timings, .codec = result.codec };
+        stats = .{ .rows_in = result.rows_in, .rows_scanned = result.rows_scanned, .rows_matched = result.rows_matched, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .row_groups_pruned = result.row_groups_pruned, .membership = result.membership, .timings = result.timings, .codec = result.codec };
     } else {
         if (!to_stdout and std.mem.startsWith(u8, engine_output.?, "s3://")) {
             diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
@@ -644,7 +645,7 @@ fn runQuery(
         }
         rows = printed.rows;
         output_ns = printed.output_ns;
-        stats = .{ .rows_in = @intCast(printed.rows_in), .rows_kept = @intCast(printed.rows), .bytes_out = printed.bytes_out, .files_in = inputs.len, .row_groups_in = printed.row_groups_in, .row_groups_pruned = printed.row_groups_pruned, .membership = printed.membership, .timings = printed.timings };
+        stats = .{ .rows_in = @intCast(printed.rows_in), .rows_scanned = @intCast(printed.rows_scanned), .rows_matched = @intCast(printed.rows_matched), .bytes_out = printed.bytes_out, .files_in = inputs.len, .row_groups_in = printed.row_groups_in, .row_groups_pruned = printed.row_groups_pruned, .membership = printed.membership, .timings = printed.timings };
     }
     const publication_start = nowMonoNs();
     try publication.commit(io);
@@ -659,9 +660,12 @@ fn runQuery(
 }
 
 const SummaryStats = struct {
+    /// An aggregate: its workers' third phase folds rows into aggregates, where a write's or a row output's encodes.
+    aggregate: bool = false,
     output_ns: u64 = 0,
     rows_in: i64 = 0,
-    rows_kept: i64 = 0,
+    rows_scanned: i64 = 0,
+    rows_matched: i64 = 0,
     bytes_in: u64 = 0,
     bytes_out: u64 = 0,
     files_in: usize = 0,
@@ -683,17 +687,21 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
         try writeJsonString(&w, path);
         try w.writeByte('"');
     } else try w.writeAll("null");
-    try w.print(",\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"files_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"codec\":", .{
-        s.rows_in,           s.rows_kept,             s.bytes_in,         s.bytes_out, s.files_in, s.row_groups_in,
-        s.row_groups_pruned, s.row_groups_full_match, s.cols_stat_pruned,
+    try w.print(",\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"files_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"codec\":", .{
+        s.rows_in,     s.rows_scanned,      s.rows_matched,          s.bytes_in,         s.bytes_out,
+        s.files_in,    s.row_groups_in,     s.row_groups_pruned,     s.row_groups_full_match, s.cols_stat_pruned,
     });
     if (s.codec) |codec| try w.print("\"{s}\",", .{@tagName(codec)}) else try w.writeAll(if (s.codec_applicable) "\"MIXED\"," else "null,");
     try engine.writeMembershipJson(&w, s.membership);
-    try w.print(",\"total_ms\":{d},\"total_us\":{d},\"output_us\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"decode_wall_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d}}}}}\n", .{
-        @divTrunc(elapsed, std.time.ns_per_ms),        @divTrunc(elapsed, std.time.ns_per_us),      s.output_ns / std.time.ns_per_us,
-        s.timings.read_ns / std.time.ns_per_ms,        s.timings.parse_ns / std.time.ns_per_ms,     s.timings.core.decode_ns / std.time.ns_per_ms,
-        s.timings.decode_wall_ns / std.time.ns_per_ms, s.timings.core.eval_ns / std.time.ns_per_ms, s.timings.core.encode_ns / std.time.ns_per_ms,
-        s.timings.core.sink_ns / std.time.ns_per_ms,   s.timings.footer_ns / std.time.ns_per_ms,
+    // Wall-clock phases run one after another (S3 reads also continue under the scan) and sum to at most total_ms.
+    // Worker phases are summed over every worker, so with N workers they can reach N times the scan's wall time.
+    const c = s.timings.core;
+    const ms = std.time.ns_per_ms;
+    try w.print(",\"total_ms\":{d},\"total_us\":{d},\"output_us\":{d},\"wall_ms\":{{\"open\":{d},\"parse\":{d},\"scan\":{d},\"footer\":{d}}},\"worker_ms\":{{\"decode\":{d},\"filter\":{d},\"fold\":{d},\"encode\":{d},\"sink\":{d}}}}}\n", .{
+        @divTrunc(elapsed, std.time.ns_per_ms), @divTrunc(elapsed, std.time.ns_per_us), s.output_ns / std.time.ns_per_us,
+        s.timings.read_ns / ms,                 s.timings.parse_ns / ms,                s.timings.decode_wall_ns / ms,
+        s.timings.footer_ns / ms,               c.decode_ns / ms,                       c.eval_ns / ms,
+        if (s.aggregate) c.encode_ns / ms else 0, if (s.aggregate) 0 else c.encode_ns / ms, c.sink_ns / ms,
     });
     try w.flush();
 }
@@ -714,7 +722,8 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "UnsupportedType",             "DecimalScaleTooLarge",      "MissingOutputOrAggregate",     "MultipleStatements",   "CteNotSupported",      "AggregateInWhere",
         "MissingFromClause",           "MissingTableName",          "UnsupportedFromClause",        "UnsupportedAggType",   "UnsupportedCoalesce",  "UnsupportedColumnType",
         "UnlabelledColumn",            "INT96ReencodeNotSupported", "NestedReencodeNotSupported",   "NestedFilterNotSupported",
-        "ModuloNotSupported",          "ExpressionInPredicate",     "NestedColumnSelected",
+        "ModuloNotSupported",          "ExpressionInPredicate",     "NestedColumnSelected",         "NestedAggregateNotSupported",
+        "NestedGroupKeyNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

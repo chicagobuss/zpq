@@ -878,9 +878,10 @@ fn writeDecimalList(w: *std.Io.Writer, names: []const []const u8) !void {
 /// `runAggregate`'s response for `ar`, onto `w`.
 fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool) !void {
     if (ar.output.group_rows) |rows| {
-        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
-            ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
-            ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
+        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
+            ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,
+            ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
+            ar.bytes_in,
         });
         for (rows, 0..) |row_vals, row_idx| {
             if (row_idx > 0) try w.writeByte(',');
@@ -895,9 +896,10 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
         }
         try w.writeByte(']');
     } else {
-        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
-            ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
-            ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
+        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
+            ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,
+            ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
+            ar.bytes_in,
         });
         for (ar.output.aggs, 0..) |item, i| {
             if (i > 0) try w.writeByte(',');
@@ -908,12 +910,18 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
         try w.writeByte('}');
     }
     try writeDecimalNames(w, ar);
-    try w.print(",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}},", .{
+    // As the CLI summary's: wall-clock phases, then each worker phase summed over the workers.
+    const ms = std.time.ns_per_ms;
+    try w.print(",\"total_ms\":{d},\"wall_ms\":{{\"open\":{d},\"parse\":{d},\"scan\":{d},\"footer\":{d}}},\"worker_ms\":{{\"decode\":{d},\"filter\":{d},\"fold\":{d},\"encode\":0,\"sink\":{d}}},", .{
         total_ms,
-        ar.timings.read_ns / std.time.ns_per_ms,
-        ar.timings.core.decode_ns / std.time.ns_per_ms,
-        ar.timings.core.eval_ns / std.time.ns_per_ms,
-        ar.timings.core.encode_ns / std.time.ns_per_ms,
+        ar.timings.read_ns / ms,
+        ar.timings.parse_ns / ms,
+        ar.timings.decode_wall_ns / ms,
+        ar.timings.footer_ns / ms,
+        ar.timings.core.decode_ns / ms,
+        ar.timings.core.eval_ns / ms,
+        ar.timings.core.encode_ns / ms,
+        ar.timings.core.sink_ns / ms,
     });
     try engine.writeMembershipJson(w, ar.membership);
     try w.writeByte(',');
@@ -974,11 +982,12 @@ fn writeResponse(
     try w.writeAll("{\"ok\":true,\"output\":");
     try engine.writeJsonQuoted(w, output);
     try w.print(
-        ",\"files_in\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d},\"mp_await_ms\":{d},\"mp_complete_ms\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}},",
+        ",\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"wall_ms\":{{\"open\":{d},\"parse\":{d},\"scan\":{d},\"footer\":{d},\"mp_await\":{d},\"mp_complete\":{d}}},\"worker_ms\":{{\"decode\":{d},\"filter\":{d},\"fold\":0,\"encode\":{d},\"sink\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}},",
         .{
             wr.files_in,
             wr.rows_in,
-            wr.rows_kept,
+            wr.rows_scanned,
+            wr.rows_matched,
             wr.bytes_in,
             wr.bytes_out,
             wr.row_groups_in,
@@ -986,13 +995,14 @@ fn writeResponse(
             total_ms,
             wr.timings.read_ns / std.time.ns_per_ms,
             wr.timings.parse_ns / std.time.ns_per_ms,
+            wr.timings.decode_wall_ns / std.time.ns_per_ms,
+            wr.timings.footer_ns / std.time.ns_per_ms,
+            wr.timings.mp_await_ns / std.time.ns_per_ms,
+            wr.timings.mp_complete_ns / std.time.ns_per_ms,
             wr.timings.core.decode_ns / std.time.ns_per_ms,
             wr.timings.core.eval_ns / std.time.ns_per_ms,
             wr.timings.core.encode_ns / std.time.ns_per_ms,
             wr.timings.core.sink_ns / std.time.ns_per_ms,
-            wr.timings.footer_ns / std.time.ns_per_ms,
-            wr.timings.mp_await_ns / std.time.ns_per_ms,
-            wr.timings.mp_complete_ns / std.time.ns_per_ms,
             cache_stats.hits,
             cache_stats.misses,
             cache_stats.revalidations,
@@ -1071,7 +1081,8 @@ test "the write response escapes the output name" {
         .codec = .SNAPPY,
         .files_in = 1,
         .rows_in = 3,
-        .rows_kept = 2,
+        .rows_scanned = 3,
+        .rows_matched = 2,
         .bytes_in = 10,
         .bytes_out = 8,
         .row_groups_in = 1,

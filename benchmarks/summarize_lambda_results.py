@@ -21,7 +21,7 @@ ENGINES = ("zpq", "polars", "duckdb")
 def read_rows(path: Path):
     with path.open(newline="") as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
-    expected = {"label", "total_ms", "bytes_out", "rows_kept"}
+    expected = {"label", "total_ms", "bytes_out", "rows_matched"}
     if not rows or set(rows[0]) != expected:
         raise ValueError(f"{path} must have exactly these TSV columns: {sorted(expected)}")
 
@@ -32,7 +32,7 @@ def read_rows(path: Path):
             if engine not in ENGINES:
                 raise ValueError(f"unknown engine {engine!r}")
             grouped[scenario, engine].append(
-                (float(row["total_ms"]), int(row["bytes_out"]), int(row["rows_kept"]))
+                (float(row["total_ms"]), int(row["bytes_out"]), int(row["rows_matched"]))
             )
         except (ValueError, KeyError) as e:
             raise ValueError(f"invalid row {row}: {e}") from e

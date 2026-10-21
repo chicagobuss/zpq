@@ -43,7 +43,7 @@ BASELINE_FILE = ROOT / "baseline.json"
 # JSON keys that vary per run (timing, paths, pid, etc.) — strip
 # before diffing against golden.
 TIMING_KEYS = {
-    "total_ms", "phase", "read_ms", "parse_ms", "decode_ms", "eval_ms",
+    "total_ms", "total_us", "output_us", "wall_ms", "worker_ms", "phase", "read_ms", "parse_ms", "decode_ms", "eval_ms",
     "encode_ms", "footer_ms", "sink_ms", "wait_for_rg_ms",
     "fetch_concurrent_ms", "fetch_ms", "build_ms", "close_ms", "meta_ms",
 }

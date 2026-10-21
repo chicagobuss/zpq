@@ -104,7 +104,7 @@ pub fn offsetIndex(arena: std.mem.Allocator, pages: []const encoder.PageInfo, ch
     try oi.page_locations.ensureTotalCapacityPrecise(arena, pages.len);
     for (pages) |p| oi.page_locations.appendAssumeCapacity(.{
         .offset = @intCast(chunk_start + p.offset),
-        .compressed_page_size = @intCast(p.size),
+        .compressed_page_size = std.math.cast(i32, p.size) orelse return error.TooLarge,
         .first_row_index = @intCast(p.first_row),
     });
     return oi;

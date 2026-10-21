@@ -95,6 +95,9 @@ jobs:
       - name: Check generated CLI documentation
         run: python3 tools/generate_cli_docs.py --check
 
+      - name: Check the release archive ships every doc its help and guides name
+        run: python3 tools/package_release.py --check-docs
+
       - name: Test CLI inspection
         run: zig build test-cli --summary all -j8
 

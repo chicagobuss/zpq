@@ -43,11 +43,15 @@ const fastpath = @import("writer/fastpath.zig");
 const page_index = @import("writer/page_index.zig");
 const thrift = @import("thrift.zig");
 const column_mod = @import("parquet/column.zig");
+const page_mod = @import("parquet/page.zig");
+const Diag = @import("diag.zig").Diag;
+const Text = @import("diag.zig").Text;
 const decimal_mod = @import("parquet/decimal.zig");
 const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
+const statistics = @import("parquet/statistics.zig");
 const agg_coded = @import("expr/agg_coded.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const partagg = @import("partagg.zig");
@@ -94,10 +98,87 @@ pub const Timings = struct {
     eval_ns: u64 = 0,
     encode_ns: u64 = 0,
     sink_ns: u64 = 0,
+    /// A row output's rows read (in row groups not pruned or passed over) and kept by its filter, for the summary.
+    /// Counted by the drivers, not by `ProjectedRG`, which a top-N runs twice over a row group it keeps rows of.
+    rows_scanned: u64 = 0,
+    rows_matched: u64 = 0,
     /// The accumulating thread's profile buffer; spans reuse the timestamps these counters are taken from. A Timings
     /// accumulates on one thread at a time, which is what makes handing it the buffer safe.
     prof: ?*profile.Thread = null,
 };
+
+/// The column chunk this thread last began to decode. A marker, not a scope: set as each chunk (or slice) starts, and
+/// read only once a decode error has ended the query, so it names where that error was raised. A worker hands its own
+/// to the thread that reports the error (`decodeFailure`, `setDecodeFailure`); `resolveDecodeFailure` turns it into
+/// the file, row group, column path and page of the message.
+pub const DecodeSite = struct {
+    rg: *const schema.RowGroup,
+    column: usize,
+    page: ?u32 = null,
+};
+threadlocal var decode_site: ?DecodeSite = null;
+
+/// Mark `column` of `rg` as this thread's chunk. Its page is unknown until a page begins, so a slice reader that
+/// re-marks its column per slice, interleaved with other columns' readers, never reports another column's page.
+pub fn enterChunk(rg: *const schema.RowGroup, column: usize) void {
+    decode_site = .{ .rg = rg, .column = column };
+    page_mod.last_page = null;
+}
+
+/// This thread's decode site, with the page it last began, for a worker to hand over with its error.
+pub fn decodeFailure() ?DecodeSite {
+    var site = decode_site orelse return null;
+    site.page = page_mod.last_page;
+    return site;
+}
+
+/// Adopt a worker's failure site as this thread's; null clears it (a query's start).
+pub fn setDecodeFailure(site: ?DecodeSite) void {
+    decode_site = site;
+    page_mod.last_page = if (site) |s| s.page else null;
+}
+
+/// After a failure ended a query over `metas`, whose `inputs` each have a `name`: this thread's decode site as the
+/// file, row group, leaf path and page of `diag`'s `decode` detail. Nothing over another detail, or for a site outside
+/// these inputs (one left from an earlier query on the thread: compared by address only, never followed).
+pub fn resolveDecodeFailure(diag: ?*Diag, metas: []const schema.FileMetaData, inputs: anytype) void {
+    const d = diag orelse return;
+    if (d.detail != .none) return;
+    const site = decodeFailure() orelse return;
+    // By the row group's address in a file's row-group list, which a decoder's copy of the footer shares.
+    const at = @intFromPtr(site.rg);
+    var file: usize = 0;
+    const rg = while (file < metas.len) : (file += 1) {
+        const rgs = metas[file].row_groups.items;
+        const lo = @intFromPtr(rgs.ptr);
+        if (at >= lo and at < lo + rgs.len * @sizeOf(schema.RowGroup)) break (at - lo) / @sizeOf(schema.RowGroup);
+    } else return;
+    var path: Text = .{};
+    var leaves: schema.LeafIterator = .init(metas[file].schema.items);
+    while (leaves.next()) |leaf| if (leaf.index == site.column) {
+        for (leaf.path, 0..) |seg, i| {
+            if (i > 0) path.append(".");
+            path.append(seg);
+        }
+        break;
+    };
+    d.detail = .{ .decode = .{ .input = inputs[file].name, .row_group = rg, .column = path, .page = site.page } };
+}
+
+/// Errors raised by reading a column chunk's pages, whose message names where: the corrupt or unsupported encodings
+/// a page can hold, not the query's own failures (overflow, memory) that a decode site would mislabel.
+pub fn isDecodeError(err: anyerror) bool {
+    const names = [_][]const u8{
+        "UnexpectedPage",      "DictionaryMissing",          "UnexpectedDictionaryPage", "ShortDecode",
+        "DefLevelsMismatch",   "BadPageHeader",              "BadPageCount",             "DecompressionFailed",
+        "SizeMismatch",        "NegativeSize",               "MissingChunkBytes",        "UnexpectedEndOfChunk",
+        "LevelOutOfRange",     "IntOutOfRange",              "PageLargerThanChunk",      "UnsupportedEncoding",
+        "UnsupportedPageType", "PageValueCountExceedsChunk", "DictionaryLargerThanPage", "UnsupportedCodec",
+        "InvalidColumnOffsets", "ColumnMetaMissing",
+    };
+    for (names) |n| if (std.mem.eql(u8, n, @errorName(err))) return true;
+    return false;
+}
 
 /// Per-RG result. `surviving_rows == 0` means the filter dropped
 /// every row — in that case `rg` is null and the caller MUST NOT
@@ -198,10 +279,8 @@ pub fn initOutputAggregator(
                 const kept_ci = pt.ci;
                 // The leaf and its path come from the schema, which every chunk's path_in_schema matches (footer
                 // open enforces it), so a file with no row groups still builds its output schema.
-                var leaves: schema.LeafIterator = .init(meta.schema.items);
-                const leaf = while (leaves.next()) |l| {
-                    if (l.index == kept_ci) break l;
-                } else return error.ColumnMetaMissing;
+                var walk: schema.LeafIterator = undefined;
+                const leaf = meta.leafAt(kept_ci, &walk) orelse return error.ColumnMetaMissing;
                 const src_elem = leaf.element.*;
                 paths[i] = try arena.dupe([]const u8, leaf.path);
 
@@ -702,6 +781,7 @@ fn decodeWriteColumn(
     decode_options_in: DecodeOptions,
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
+    enterChunk(rg, ci);
     const num_rows: usize = @intCast(rg.num_rows);
     const chunk_span = profile.Span.begin(prof);
     const col = &rg.columns.items[ci];
@@ -930,6 +1010,8 @@ pub const SliceReader = struct {
     pages_passed: usize = 0,
     /// Only the levels are read (see `levelsOnly`): a count(col)'s column, read as its whole-chunk path reads it.
     levels_only: bool = false,
+    /// The chunk it reads, re-marked as each slice starts (`enterChunk`).
+    site: DecodeSite,
 
     const Raw = union(enum) {
         i32: column_mod.ColumnChunkReader(i32),
@@ -952,6 +1034,7 @@ pub const SliceReader = struct {
         decode_options_in: DecodeOptions,
     ) !?SliceReader {
         if (!supports(rg, meta, ci)) return null;
+        enterChunk(rg, ci);
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
         const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
         const levels = meta.getColumnLevels(cm.path_in_schema.items);
@@ -1010,6 +1093,7 @@ pub const SliceReader = struct {
             .float16 = if (se) |e| schema.isFloat16(e) else false,
             .int96 = cm.type == .INT96,
             .left = @intCast(cm.num_values),
+            .site = .{ .rg = rg, .column = ci },
         };
     }
 
@@ -1041,6 +1125,7 @@ pub const SliceReader = struct {
     }
 
     pub fn next(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !filter_eval.Batch.Column {
+        enterChunk(self.site.rg, self.site.column);
         const n = @min(n_want, self.left);
         self.left -= n;
         if (self.levels_only) {
@@ -1340,6 +1425,7 @@ fn decodeDecimalI128(
     kept_ci: usize,
     decode_options_in: DecodeOptions,
 ) !filter_eval.ColumnT(i128) {
+    enterChunk(rg, kept_ci);
     const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
     const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
@@ -1506,6 +1592,7 @@ fn decodeWriteColumnMaybeCoded(
     decode_options_in: DecodeOptions,
     prof: ?*profile.Thread,
 ) !filter_eval.Batch.Column {
+    enterChunk(rg, ci);
     const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
     const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
@@ -2224,6 +2311,8 @@ fn cloneColumnMeta(
             .distinct_count = st.distinct_count,
             .max_value = if (st.max_value) |v| try arena.dupe(u8, v) else null,
             .min_value = if (st.min_value) |v| try arena.dupe(u8, v) else null,
+            .is_max_value_exact = st.is_max_value_exact,
+            .is_min_value_exact = st.is_min_value_exact,
             .nan_count = st.nan_count,
         };
     }
@@ -2563,7 +2652,7 @@ fn writeAggregateRowsEncoded(
     off += footer_bytes.len;
 
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
+    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
     try sink.write(&len_bytes);
     off += len_bytes.len;
     try sink.write(&MAGIC);
@@ -3082,6 +3171,7 @@ fn foldGroupedWindows(
 ///
 /// `gpa` owns what outlives the row group: string min/max winners and
 /// group-table entries.
+/// Returns the rows the outer filter kept (every row without one), for the summary's `rows_matched`.
 pub fn scanRGForAgg(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -3089,7 +3179,7 @@ pub fn scanRGForAgg(
     decode_options: DecodeOptions,
     target: AggTarget,
     ws: AggWorkspace,
-) !void {
+) !u64 {
     const calls = target.planCalls();
     const num_rows: usize = @intCast(in.rg.num_rows);
 
@@ -3108,7 +3198,8 @@ pub fn scanRGForAgg(
     // Fast path: every agg answered from stats, no decode needed at
     // all. This is the headline win — `max(cost)`, `count(*)`, etc.
     // complete in microseconds because we never read any data pages.
-    if (!any_decode_required) return;
+    // An outer filter disables every stats answer, so here none is pending; with one it decodes to count its rows.
+    if (!any_decode_required and in.filter == null) return num_rows;
 
     // 2. Decode path for the aggs that couldn't be stat-handled.
     // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
@@ -3138,9 +3229,8 @@ pub fn scanRGForAgg(
         const fits_share = full <= b.share();
         const whole = fits_share and admitWhole(ws, full);
         if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
-        if (!whole and try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) {
-            return;
-        }
+        if (!whole) if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) |kept|
+            return kept;
         if (!whole) {
             const sp = try StagePlan.init(plan_arena.allocator(), in, target, handled_via_stats);
             if (sp.estimate < full) {
@@ -3198,7 +3288,8 @@ pub fn scanRGForAgg(
                 ws.rg_arena.nextRowGroup();
                 if (ws.region) |r| r.trim();
             }
-            if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) return;
+            if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) |kept|
+                return kept;
             return err;
         };
         try batch_cols.append(ra, col);
@@ -3217,7 +3308,7 @@ pub fn scanRGForAgg(
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
-    const selected: usize = if (prof != null) sel.count() else 0;
+    const selected: usize = if (in.filter != null) sel.count() else num_rows;
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, selected }));
 
     switch (target) {
@@ -3238,7 +3329,7 @@ pub fn scanRGForAgg(
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
-                return;
+                return selected;
             }
             const dense = if (g.dense) |d| !staged and decode_options.encoded and
                 try d.fold(ra, gpa, g.keys[0].col_ref, in.file_index, in.rg_index, g.pos_base, &batch, lookup, &sel)
@@ -3250,7 +3341,7 @@ pub fn scanRGForAgg(
                 const t_agg_end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
-                return;
+                return selected;
             }
             // The row path reads values: gather any column decoded as codes only, but not one only the outer filter
             // read, which it has evaluated already.
@@ -3318,11 +3409,12 @@ pub fn scanRGForAgg(
     const t_agg_end = nowMonoNs();
     ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
     profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+    return selected;
 }
 
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time (`SliceReader`), each slice on memory of its own:
-/// for a row group too big for a worker's share of `budget`. False, having done nothing, when some column has no
-/// sliced form.
+/// for a row group too big for a worker's share of `budget`. The rows the outer filter kept; null, having done
+/// nothing, when some column has no sliced form.
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -3332,9 +3424,9 @@ fn scanRGSliced(
     budget: *DecodeBudget,
     handled: []const bool,
     full: usize,
-) !bool {
+) !?u64 {
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
-    if (num_rows == 0) return false;
+    if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
     var pages = std.heap.ArenaAllocator.init(side);
     defer pages.deinit();
@@ -3350,7 +3442,7 @@ fn scanRGSliced(
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
         var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, decode_options) orelse
-            return false;
+            return null;
         if (levels_only[ci]) r.levelsOnly();
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
@@ -3379,6 +3471,7 @@ fn scanRGSliced(
     var slice = std.heap.ArenaAllocator.init(side);
     defer slice.deinit();
     var took: ?usize = null;
+    var matched: u64 = 0;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
         defer done += n;
@@ -3394,6 +3487,7 @@ fn scanRGSliced(
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
         var sel = try filter_selection.SelectionVector.init(sa, n);
         if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        matched += if (in.filter != null) sel.count() else n;
         switch (target) {
             .scalar => |s| for (s.calls, s.accumulators, handled) |call, *acc, h| {
                 if (h) continue;
@@ -3436,7 +3530,7 @@ fn scanRGSliced(
     const t1 = nowMonoNs();
     ws.timings.decode_ns += @intCast(t1 - t0);
     profile.record(prof, .decode, t0, t1, profile.args(.{ in.file_index, in.rg_index, readers.items.len }));
-    return true;
+    return matched;
 }
 
 /// A staged row group's decode: the columns the outer filter and GROUP BY keys read (`base`), decoded first; then
@@ -3511,6 +3605,7 @@ const ChunkDecoder = struct {
         sel: *const filter_selection.SelectionVector,
     ) !filter_eval.Batch.Column {
         const in = self.in;
+        enterChunk(in.rg, ci);
         const prof = self.ws.timings.prof;
         const cm = in.rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
         const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
@@ -4097,7 +4192,6 @@ const PageIndex = struct {
 /// `--scan-all`. An unparseable or inconsistent index is ignored and its column decoded whole.
 fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.StatsUse) ![]?PageIndex {
     const num_leaves = in.rg.columns.items.len;
-    const num_rows: usize = @intCast(in.rg.num_rows);
     const indexes = try ra.alloc(?PageIndex, num_leaves);
     @memset(indexes, null);
     if (stats == .ignore) return indexes;
@@ -4120,11 +4214,12 @@ fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.Stats
 
         var off_reader = thrift.Reader.init(off_bytes);
         const offset_index = schema.OffsetIndex.read(ra, &off_reader) catch continue;
-        if (!pageIndexUsable(col_index, offset_index, num_rows)) continue;
-
         const cm = chunk_meta.meta_data orelse continue;
         const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
-        if (!pageIndexIsPlausible(&col_index, &offset_index, cm, levels, in.rg.num_rows)) continue;
+        const elem = in.meta.getColumnSchema(cm.path_in_schema.items);
+        const trust: statistics.Trust = if (stats == .trust) .plausible else .corroborated;
+        const rows = in.rg.num_rows;
+        if (!statistics.pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, rows, trust)) continue;
 
         indexes[ci] = .{ .col_index = col_index, .offset_index = offset_index };
     }
@@ -5173,103 +5268,6 @@ fn copyChunkRecompressed(
     chunk.offset_index_length = @intCast(oi_w.bytes().len);
     try out.write(oi_w.bytes());
     return chunk;
-}
-
-/// Whether a chunk's ColumnIndex is fit to prune pages with. Page pruning and the always-match fill act on these
-/// claims without decoding, so one the footer or the OffsetIndex can contradict for free is dropped whole and the
-/// chunk reads as if it had no page index: a writer that got one claim wrong cannot be trusted on its neighbours.
-///
-/// The contradictions checked:
-///   - per-page lists whose lengths disagree with the OffsetIndex page count;
-///   - a negative null count, which no page can have;
-///   - a page flagged all-null on a leaf with no optional or repeated ancestor (max definition level 0), which
-///     cannot hold a null at all;
-///   - for a non-repeated leaf, whose entries are its rows, a page flagged all-null whose null count is not its row
-///     count, or null pages covering more rows than the chunk's own statistics say are null.
-///
-/// Writers that collected no page statistics are known to flag every page null and record -1 null counts, while
-/// the pages hold ordinary values; trusting them drops every row.
-pub fn pageIndexIsPlausible(
-    ci: *const schema.ColumnIndex,
-    oi: *const schema.OffsetIndex,
-    cm: schema.ColumnMetaData,
-    levels: schema.Levels,
-    rg_rows: i64,
-) bool {
-    const locs = oi.page_locations.items;
-    const n = locs.len;
-    if (ci.null_pages.items.len != n or ci.min_values.items.len != n or ci.max_values.items.len != n) return false;
-    if (ci.null_counts) |nc| {
-        if (nc.items.len != n) return false;
-        for (nc.items) |c| if (c < 0) return false;
-    }
-
-    var null_page_rows: i64 = 0;
-    for (ci.null_pages.items, 0..) |is_null, i| {
-        if (!is_null) continue;
-        if (levels.max_def == 0) return false;
-        // A repeated leaf's counts are entries, not rows; only the flag itself is checked there.
-        if (levels.max_rep > 0) continue;
-        const end = if (i + 1 < n) locs[i + 1].first_row_index else rg_rows;
-        const rows = end - locs[i].first_row_index;
-        if (ci.null_counts) |nc| if (nc.items[i] != rows) return false;
-        null_page_rows += rows;
-    }
-    if (levels.max_rep == 0) {
-        if (cm.statistics) |s| if (s.null_count) |chunk_nulls| {
-            if (null_page_rows > chunk_nulls) return false;
-        };
-    }
-    return true;
-}
-
-/// Whether a column's page index can drive page pruning. Its arrays are indexed by page number together, and each
-/// page's `first_row_index` slices the row selection, so the arrays must agree in length and the row starts must be
-/// in range and non-decreasing. Page offsets and sizes are checked again where the pages are read.
-fn pageIndexUsable(ci: schema.ColumnIndex, oi: schema.OffsetIndex, num_rows: usize) bool {
-    const locs = oi.page_locations.items;
-    if (ci.null_pages.items.len != locs.len) return false;
-    if (ci.min_values.items.len != locs.len or ci.max_values.items.len != locs.len) return false;
-    if (ci.null_counts) |nc| if (nc.items.len != locs.len) return false;
-    // NaN counts as for null counts; `ColumnIndex.read` already leaves a list of another length out.
-    if (ci.nan_counts) |nc| if (nc.items.len != locs.len) return false;
-    var prev: i64 = 0;
-    for (locs) |loc| {
-        if (loc.offset < 0 or loc.compressed_page_size < 0) return false;
-        if (loc.first_row_index < prev) return false;
-        if (loc.first_row_index > num_rows) return false;
-        prev = loc.first_row_index;
-    }
-    return true;
-}
-
-test "pageIndexUsable rejects page indexes whose arrays or row starts disagree" {
-    const testing = std.testing;
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-
-    var ci: schema.ColumnIndex = .{};
-    var oi: schema.OffsetIndex = .{};
-    for ([_]i64{ 0, 10, 20 }) |first| {
-        try ci.null_pages.append(a, false);
-        try ci.min_values.append(a, "");
-        try ci.max_values.append(a, "");
-        try oi.page_locations.append(a, .{ .offset = 4 + first, .compressed_page_size = 8, .first_row_index = first });
-    }
-    try testing.expect(pageIndexUsable(ci, oi, 30));
-    try testing.expect(!pageIndexUsable(ci, oi, 19)); // a page starts past the row group
-
-    oi.page_locations.items[2].first_row_index = 5; // goes backwards
-    try testing.expect(!pageIndexUsable(ci, oi, 30));
-    oi.page_locations.items[2].first_row_index = 20;
-
-    oi.page_locations.items[0].first_row_index = -1;
-    try testing.expect(!pageIndexUsable(ci, oi, 30));
-    oi.page_locations.items[0].first_row_index = 0;
-
-    _ = ci.min_values.pop(); // ColumnIndex shorter than OffsetIndex
-    try testing.expect(!pageIndexUsable(ci, oi, 30));
 }
 
 /// A decoded column must describe exactly its row group's rows: a flat column one value per row, a repeated one
@@ -6323,147 +6321,6 @@ test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 refe
     try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
 }
 
-test "pageIndexIsPlausible: corpus page indexes are kept except the ones their footers contradict" {
-    const testing = std.testing;
-    // Every parquet-testing file that carries a page index. The datapage_v1 trio flags every page of two REQUIRED
-    // columns null (with -1 null counts) while the pages hold values; the rest, int32_with_null_pages's genuine null
-    // pages included, must keep their index so page pruning still applies to them.
-    const Case = struct { path: []const u8, plausible: bool };
-    const cases = [_]Case{
-        .{ .path = "alltypes_tiny_pages.parquet", .plausible = true },
-        .{ .path = "alltypes_tiny_pages_plain.parquet", .plausible = true },
-        .{ .path = "binary_truncated_min_max.parquet", .plausible = true },
-        .{ .path = "data_index_bloom_encoding_stats.parquet", .plausible = true },
-        .{ .path = "data_index_bloom_encoding_with_length.parquet", .plausible = true },
-        .{ .path = "datapage_v2_empty_datapage.snappy.parquet", .plausible = true },
-        .{ .path = "delta_encoding_required_column.parquet", .plausible = true },
-        .{ .path = "fixed_length_byte_array.parquet", .plausible = true },
-        .{ .path = "floating_orders_nan_count.parquet", .plausible = true },
-        .{ .path = "int32_with_null_pages.parquet", .plausible = true },
-        .{ .path = "old_list_structure.parquet", .plausible = true },
-        .{ .path = "plain-dict-uncompressed-checksum.parquet", .plausible = true },
-        .{ .path = "repeated_primitive_no_list.parquet", .plausible = true },
-        .{ .path = "rle-dict-snappy-checksum.parquet", .plausible = true },
-        .{ .path = "datapage_v1-corrupt-checksum.parquet", .plausible = false },
-        .{ .path = "datapage_v1-snappy-compressed-checksum.parquet", .plausible = false },
-        .{ .path = "datapage_v1-uncompressed-checksum.parquet", .plausible = false },
-    };
-    for (cases) |case| {
-        var path_buf: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "data/parquet-testing/data/{s}", .{case.path});
-        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
-            if (err == error.FileNotFound) {
-                std.debug.print("skipping: {s} not present\n", .{path});
-                return error.SkipZigTest;
-            }
-            return err;
-        };
-        defer testing.allocator.free(bytes);
-        var meta = try metadata.open(testing.allocator, bytes);
-        defer meta.deinit(testing.allocator);
-
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        var indexed: usize = 0;
-        var rejected: usize = 0;
-        for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| {
-            const cm = chunk.meta_data orelse continue;
-            const co: usize = @intCast(chunk.column_index_offset orelse continue);
-            const oo: usize = @intCast(chunk.offset_index_offset orelse continue);
-            var cr = thrift.Reader.init(bytes[co..][0..@intCast(chunk.column_index_length.?)]);
-            const col_index = try schema.ColumnIndex.read(arena.allocator(), &cr);
-            var orr = thrift.Reader.init(bytes[oo..][0..@intCast(chunk.offset_index_length.?)]);
-            const offset_index = try schema.OffsetIndex.read(arena.allocator(), &orr);
-            indexed += 1;
-            const levels = meta.getColumnLevels(cm.path_in_schema.items);
-            if (!pageIndexIsPlausible(&col_index, &offset_index, cm, levels, rg.num_rows)) rejected += 1;
-        };
-        testing.expect(indexed > 0) catch |err| {
-            std.debug.print("{s}: no page index found\n", .{case.path});
-            return err;
-        };
-        const want_rejected: usize = if (case.plausible) 0 else indexed;
-        testing.expectEqual(want_rejected, rejected) catch |err| {
-            std.debug.print("{s}: rejected {d} of {d} page indexes\n", .{ case.path, rejected, indexed });
-            return err;
-        };
-    }
-}
-
-test "pageIndexIsPlausible: each contradiction drops the index on its own" {
-    const testing = std.testing;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Two pages of 10 and 6 rows; page 1 is all null.
-    var oi: schema.OffsetIndex = .{};
-    try oi.page_locations.appendSlice(a, &.{
-        .{ .offset = 4, .compressed_page_size = 10, .first_row_index = 0 },
-        .{ .offset = 14, .compressed_page_size = 10, .first_row_index = 10 },
-    });
-    const Fixture = struct {
-        fn index(alloc: std.mem.Allocator, null_pages: []const bool, null_counts: ?[]const i64) !schema.ColumnIndex {
-            var ci: schema.ColumnIndex = .{};
-            try ci.null_pages.appendSlice(alloc, null_pages);
-            for (null_pages) |np| {
-                const bound: []const u8 = if (np) "" else "\x01\x00\x00\x00";
-                try ci.min_values.append(alloc, bound);
-                try ci.max_values.append(alloc, bound);
-            }
-            if (null_counts) |nc| {
-                var list: std.ArrayListUnmanaged(i64) = .empty;
-                try list.appendSlice(alloc, nc);
-                ci.null_counts = list;
-            }
-            return ci;
-        }
-    };
-    const cm: schema.ColumnMetaData = .{
-        .type = .INT32,
-        .encodings = .empty,
-        .path_in_schema = .empty,
-        .codec = .UNCOMPRESSED,
-        .num_values = 16,
-        .total_uncompressed_size = 0,
-        .total_compressed_size = 0,
-        .data_page_offset = 4,
-        .index_page_offset = null,
-        .dictionary_page_offset = null,
-    };
-    const optional: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
-    const required: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
-    const repeated: schema.Levels = .{ .max_def = 2, .max_rep = 1 };
-
-    const good = try Fixture.index(a, &.{ false, true }, &.{ 2, 6 });
-    try testing.expect(pageIndexIsPlausible(&good, &oi, cm, optional, 16));
-    // Without null counts the flag alone is taken on an optional leaf.
-    const no_counts = try Fixture.index(a, &.{ false, true }, null);
-    try testing.expect(pageIndexIsPlausible(&no_counts, &oi, cm, optional, 16));
-    // A null page on a leaf that cannot be null.
-    try testing.expect(!pageIndexIsPlausible(&no_counts, &oi, cm, required, 16));
-    // A required leaf with no null page is fine.
-    const all_values = try Fixture.index(a, &.{ false, false }, &.{ 0, 0 });
-    try testing.expect(pageIndexIsPlausible(&all_values, &oi, cm, required, 16));
-    // Negative null counts.
-    const negative = try Fixture.index(a, &.{ false, false }, &.{ -1, 0 });
-    try testing.expect(!pageIndexIsPlausible(&negative, &oi, cm, optional, 16));
-    // A null page whose null count is not its row count.
-    const short = try Fixture.index(a, &.{ false, true }, &.{ 0, 5 });
-    try testing.expect(!pageIndexIsPlausible(&short, &oi, cm, optional, 16));
-    // ...is only checked where entries are rows.
-    try testing.expect(pageIndexIsPlausible(&short, &oi, cm, repeated, 16));
-    // Null pages covering more rows than the chunk statistics count as null.
-    var with_stats = cm;
-    with_stats.statistics = .{ .null_count = 3 };
-    try testing.expect(!pageIndexIsPlausible(&no_counts, &oi, with_stats, optional, 16));
-    with_stats.statistics = .{ .null_count = 6 };
-    try testing.expect(pageIndexIsPlausible(&no_counts, &oi, with_stats, optional, 16));
-    // Per-page lists that disagree with the OffsetIndex page count.
-    const one_page = try Fixture.index(a, &.{false}, null);
-    try testing.expect(!pageIndexIsPlausible(&one_page, &oi, cm, optional, 16));
-}
-
 test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
     // tiny_pages: uncompressed v1 pages, dictionaries, no CRCs, so UNCOMPRESSED -> ZSTD -> UNCOMPRESSED must reproduce
     // every header field and payload exactly. datapage_v2: v2 pages, whose levels stay outside the compressed values.
@@ -6837,9 +6694,13 @@ test "StagePlan.init in countOnly mode plans zero calls and charges only base co
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var file_meta: schema.FileMetaData = undefined;
-    file_meta.schema = .empty;
-    file_meta.row_groups = .empty;
+    var file_meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
     try file_meta.schema.append(arena, .{
         .name = "schema",
         .num_children = 2,
@@ -6974,9 +6835,13 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            var file_meta: schema.FileMetaData = undefined;
-            file_meta.schema = .empty;
-            file_meta.row_groups = .empty;
+            var file_meta: schema.FileMetaData = .{
+                .version = 1,
+                .schema = .empty,
+                .num_rows = 0,
+                .created_by = null,
+                .row_groups = .empty,
+            };
             try file_meta.schema.append(arena, .{
                 .name = "schema",
                 .num_children = 2,
@@ -7752,5 +7617,43 @@ test "appendSliceRows: a computed column over the kept rows is the one computed 
     try testing.expectEqualSlices(u32, want.f64.def_levels.items, agg.cols[0].f64.def_levels.items);
     for (want.f64.values.items, agg.cols[0].f64.values.items, want.f64.def_levels.items) |w, g, d| {
         if (d == 1) try testing.expectEqual(w, g);
+    }
+}
+
+test "cloneColumnMeta keeps every statistics field, the bounds' exactness among them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const st: schema.Statistics = .{
+        .max = "b",
+        .min = "a",
+        .null_count = 3,
+        .distinct_count = 7,
+        .max_value = "y",
+        .min_value = "x",
+        .is_max_value_exact = false,
+        .is_min_value_exact = true,
+        .nan_count = 2,
+    };
+    const cm: schema.ColumnMetaData = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 10,
+        .total_uncompressed_size = 0,
+        .total_compressed_size = 0,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .statistics = st,
+    };
+    const got = (try cloneColumnMeta(a, cm)).statistics.?;
+    inline for (@typeInfo(schema.Statistics).@"struct".field_names) |name| {
+        const want = @field(st, name);
+        const have = @field(got, name);
+        if (@TypeOf(want) == ?[]const u8) {
+            try std.testing.expectEqualStrings(want.?, have.?);
+        } else try std.testing.expectEqual(want, have);
     }
 }

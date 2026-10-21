@@ -41,6 +41,27 @@ contents:
     dst: /usr/share/bash-completion/completions/zpq
     file_info:
       mode: 0644
+  # rpm leaves unowned parent directories behind on removal, and EL9 has no zsh or fish directories of its own.
+  - dst: /usr/share/fish
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - dst: /usr/share/fish/vendor_completions.d
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - dst: /usr/share/zsh
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - dst: /usr/share/zsh/site-functions
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
   - src: share/fish/vendor_completions.d/zpq.fish
     dst: /usr/share/fish/vendor_completions.d/zpq.fish
     file_info:

@@ -52,7 +52,7 @@ invoke() {
       --cli-binary-format raw-in-base64-out --payload "file://$payload_file" \
       --cli-read-timeout 300 --region "$REGION" /tmp/p.json >/dev/null 2>&1
     jq -r --arg label "$label" \
-      '[$label, (.total_ms // .errorMessage // .error), (.bytes_out // ""), (.rows_kept // "")] | @tsv' \
+      '[$label, (.total_ms // .errorMessage // .error), (.bytes_out // ""), (.rows_matched // "")] | @tsv' \
       /tmp/p.json
   done
 }
@@ -104,7 +104,7 @@ EOF
 }
 
 {
-  printf "label\ttotal_ms\tbytes_out\trows_kept\n"
+  printf "label\ttotal_ms\tbytes_out\trows_matched\n"
   for scenario in "${SCENARIOS[@]}"; do
     IFS='|' read -r label predicate pct <<<"$scenario"
     run_scenario "$label" "$predicate" "$pct"

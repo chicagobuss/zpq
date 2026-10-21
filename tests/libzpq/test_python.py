@@ -50,7 +50,7 @@ def test_binding(z):
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "o.parquet")
         w = z.run({"inputs": [FIX], "output_url": out, "select": "a * 2 AS x, b", "filter": "a < 10"})
-        check(w["rows_kept"] == 10, f"write {w}")
+        check(w["rows_matched"] == 10 and w["rows_scanned"] >= 10, f"write {w}")
         back = z.run({"inputs": [out], "aggregate": "sum(x) AS s"})
         check(back["agg"] == {"s": 90}, f"read back {back}")
 

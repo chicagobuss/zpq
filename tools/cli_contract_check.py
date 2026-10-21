@@ -226,6 +226,21 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
     # Type errors from binding are usage failures; arithmetic over a NULL is NULL, not an error.
     p = run(src, '--select', 's + 1 AS bad', '--summary=json', code=2)
     assert json.loads(p.stderr)['code'] == 'TypeMismatch'
+    # An aggregate or GROUP BY key over a list's elements is an unsupported query, refused before reading (exit 2).
+    fixtures = Path(__file__).resolve().parent.parent / 'ci/fixtures/parquet'
+    lists = fixtures / 'list_int64.parquet'
+    refusals = [(('--aggregate', 'count(l.list.element) AS c'), 'NestedAggregateNotSupported'),
+                (('--aggregate', 'count(*) AS c', '--group-by', 'l.list.element'), 'NestedGroupKeyNotSupported')]
+    for args, want in refusals:
+        p = run(lists, *args, '--summary=json', code=2)
+        assert json.loads(p.stderr)['code'] == want and '`l.list.element`' in json.loads(p.stderr)['message'], p.stderr
+    p = run('--query', f"SELECT max(l.list.element) FROM '{lists}'", code=2)
+    # A page that fails to decode is a read failure (exit 1) that names its file, row group, column and page.
+    bad = fixtures / 'dict_index_oob.parquet'
+    p = run(bad, '--aggregate', 'sum(z) AS s', '--summary=json', code=1)
+    err = json.loads(p.stderr)
+    assert err['code'] == 'UnexpectedPage', err
+    assert f'input file {bad}' in err['message'] and 'row group 0, column `z`, page 1' in err['message'], err
     p = run(src, '--select', 'v + 1 AS w')
     assert ndjson(p.stdout) == [{'w': 4}, {'w': None}, {'w': 6}, {'w': 8}]
     for args in (['--format', 'ndjson'], ['--format', 'json'], ['--limit', '1']):

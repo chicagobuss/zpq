@@ -167,7 +167,7 @@ static void test_write(zpq_ctx *c) {
              FIXTURE, path);
     char *out = NULL;
     int rc = run(c, req, &out);
-    CHECK(rc == ZPQ_OK && strstr(out, "\"rows_kept\":47900"), "rc %d: %s", rc, out);
+    CHECK(rc == ZPQ_OK && strstr(out, "\"rows_matched\":47900"), "rc %d: %s", rc, out);
     zpq_free(out);
     snprintf(req, sizeof req, "{\"inputs\":[\"%s\"],\"aggregate\":\"count(*) AS n, sum(a) AS s\"}", path);
     rc = run(c, req, &out);

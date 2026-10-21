@@ -53,6 +53,8 @@ pub const Error = error{
     ColumnChunkRowCountMismatch,
     /// A column chunk's physical type differs from its schema leaf's.
     ColumnChunkTypeMismatch,
+    /// A column chunk's data lives in another file (`ColumnChunk.file_path`).
+    ExternalColumnChunk,
 };
 
 /// Deepest group nesting a footer may have: `schema.max_schema_depth`.
@@ -111,6 +113,11 @@ pub fn openFooter(
     errdefer meta.deinit(allocator);
     if (meta.encrypted) return error.EncryptedFile;
     for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| if (chunk.encrypted) return error.EncryptedFile;
+    // zpq reads only the file it was given: a path from an untrusted footer could name any file on the machine, and
+    // a copy would carry the reference into its output. An empty path names nothing and reads as absent.
+    for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| {
+        if (chunk.file_path) |p| if (p.len > 0) return error.ExternalColumnChunk;
+    };
     try checkFooterFields(&meta);
     try reconcileChunkPaths(allocator, &meta);
     try meta.indexLeaves(allocator);
@@ -1565,4 +1572,28 @@ test "a footer's leaf index is freed whole when an allocation fails" {
             m.leaf_index.?.destroy(alloc);
         }
     }.run, .{&meta});
+}
+
+test "a column chunk whose data lives in another file is refused at footer open" {
+    const bytes = readFileSlice("ci/fixtures/parquet/nested_key_shape.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try open(arena, bytes);
+    for ([_]struct { path: []const u8, refused: bool }{
+        .{ .path = "/etc/passwd", .refused = true },
+        .{ .path = "part-0.parquet", .refused = true },
+        .{ .path = "", .refused = false },
+    }) |c| {
+        meta.row_groups.items[0].columns.items[0].file_path = c.path;
+        var w = thrift.Writer.init(arena);
+        try meta.write(&w);
+        if (c.refused) {
+            try testing.expectError(error.ExternalColumnChunk, openFooter(arena, w.bytes()));
+        } else _ = try openFooter(arena, w.bytes());
+    }
 }

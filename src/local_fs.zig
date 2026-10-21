@@ -166,6 +166,81 @@ pub const Mapped = struct {
     }
 };
 
+/// Mappings a query left for the process exit to take (`engine.Context.exit_after`), until `releaseLeft`. Only the
+/// thread that runs the query adds to it.
+var left: std.ArrayList([]align(std.heap.page_size_min) const u8) = .empty;
+
+/// Leave `m` mapped for the process exit; `releaseLeft` drops its pages before then.
+pub fn leaveForExit(m: Mapped) void {
+    left.append(std.heap.page_allocator, m.bytes) catch {};
+}
+
+/// Drop the pages of the mappings left for the exit, from several threads, once the answer is out. The exit would
+/// otherwise unmap them on one thread, page by page, before the process is gone: 37 ms for a fully read 937 MiB file.
+/// MADV_DONTNEED over disjoint ranges runs in parallel (about 3 ms over 16 threads for that file); munmap does not, as
+/// it holds the address-space lock for writing. The mappings stay, and a later read faults the file's bytes in again.
+/// Linux only: elsewhere the exit takes them as before.
+pub fn releaseLeft() void {
+    releaseLeftOver(64 << 20);
+}
+
+fn releaseLeftOver(min_bytes: usize) void {
+    defer {
+        left.deinit(std.heap.page_allocator);
+        left = .empty;
+    }
+    if (builtin.os.tag != .linux) return;
+    const slice_len = 32 << 20;
+    var total: usize = 0;
+    var slices: usize = 0;
+    for (left.items) |b| {
+        total += b.len;
+        slices += (b.len + slice_len - 1) / slice_len;
+    }
+    // What the exit would tear down is what is mapped in, not what is mapped: a query that touched little of a large
+    // glob leaves next to nothing, and starting helpers would cost more than they save.
+    const mapped_in = @min(total, if (statmPages(2)) |pages| pages * std.heap.pageSize() else |_| total);
+    if (total == 0 or mapped_in < min_bytes) return;
+    const Release = struct {
+        maps: []const []align(std.heap.page_size_min) const u8,
+        next: std.atomic.Value(usize) = .init(0),
+
+        /// Claims slice `k` of every mapping in turn until none is left.
+        fn run(r: *@This()) void {
+            while (true) {
+                var k = r.next.fetchAdd(1, .monotonic);
+                const m = for (r.maps) |b| {
+                    const n = (b.len + slice_len - 1) / slice_len;
+                    if (k < n) break b;
+                    k -= n;
+                } else return;
+                const off = k * slice_len;
+                const len = @min(slice_len, m.len - off);
+                _ = std.os.linux.madvise(@constCast(m.ptr + off), len, std.os.linux.MADV.DONTNEED);
+            }
+        }
+    };
+    var r: Release = .{ .maps = left.items };
+    var helpers: [15]?std.Thread = @splat(null);
+    const cpus = std.Thread.getCpuCount() catch 1;
+    const want = @min(helpers.len, @min(@min(slices, cpus), mapped_in / (64 << 20)) -| 1);
+    for (helpers[0..want]) |*h| h.* = std.Thread.spawn(.{ .stack_size = 1 << 20 }, Release.run, .{&r}) catch null;
+    Release.run(&r);
+    for (helpers[0..want]) |h| if (h) |t| t.join();
+}
+
+/// Field `i` of `/proc/self/statm`, in pages: 1 is what the process has mapped in, 2 the part of it backed by files
+/// and shared memory. Read directly: `readFile` refuses it, as it is no regular file.
+fn statmPages(i: usize) !usize {
+    const fd = try openRead("/proc/self/statm");
+    defer close(fd);
+    var buf: [256]u8 = undefined;
+    const n = try posix.read(fd, &buf);
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+    for (0..i) |_| _ = it.next();
+    return std.fmt.parseInt(usize, it.next() orelse return error.BadStatm, 10);
+}
+
 /// Raise the process's soft limit on open files to its hard limit: each mapped input holds a descriptor while it is
 /// queried (`Mapped.fd`), and a glob of local files would otherwise run short past the soft limit (256 on macOS,
 /// often 1024 elsewhere). For the CLI and the Lambda, whose processes they are; libzpq leaves its host's limits alone.
@@ -451,6 +526,33 @@ test "createNewFile refuses an existing path; rename replaces its target" {
     try testing.expectError(error.FileNotFound, readFile(testing.allocator, a));
     try testing.expectError(error.RenameFailed, rename(a, b));
 }
+
+test "releaseLeft drops a left mapping's pages from the resident set and leaves its bytes readable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/big.bin", .{tmp.sub_path});
+    const data = try arena.alloc(u8, 40 << 20);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+    const fd = try createFile(file_path);
+    try writeAll(fd, data);
+    close(fd);
+
+    const m = try mapFile(file_path);
+    defer m.unmap();
+    try testing.expectEqualSlices(u8, data, m.bytes); // every page touched
+    const before = try statmPages(1);
+    leaveForExit(m);
+    releaseLeftOver(0);
+    try testing.expectEqual(@as(usize, 0), left.items.len);
+    const after = try statmPages(1);
+    try testing.expect(before - after >= (40 << 20) / std.heap.pageSize() * 9 / 10);
+    try testing.expectEqualSlices(u8, data, m.bytes);
+}
+
 
 test "mapFile rejects an empty file" {
     var tmp = testing.tmpDir(.{});

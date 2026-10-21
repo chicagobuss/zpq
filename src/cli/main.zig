@@ -134,6 +134,7 @@ pub fn main(init: std.process.Init) !void {
             if (machine_diagnostics) try emitError(err);
             std.process.exit(queryExitCode(err, diag.execution_started));
         };
+        local_fs.releaseLeft();
         return;
     }
     if (std.mem.eql(u8, cmd, "conform")) {

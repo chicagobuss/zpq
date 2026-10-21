@@ -363,7 +363,8 @@ pub const Context = struct {
     meta_cache: ?*meta_cache_mod.MetaCache = null,
     /// The process exits once this query's answer is out (the CLI). Input mappings and scan workers' regions are then
     /// left to the exit: unmapping a large populated mapping first holds the answer back by milliseconds, and the
-    /// kernel tears it down at exit regardless. Never for a process that runs another query (the Lambda).
+    /// kernel tears it down at exit regardless. The CLI drops the input mappings' pages in parallel once the answer is
+    /// out (`local_fs.releaseLeft`). Never for a process that runs another query (the Lambda).
     exit_after: bool = false,
 };
 
@@ -2780,7 +2781,7 @@ const OpenedInputs = struct {
     s3_buffers: []const []u8,
     /// Bloom filter probing done while planning the S3 fetch.
     membership: membership.Stats = .{},
-    /// `Context.exit_after`: the mappings go with the process.
+    /// `Context.exit_after`: the mappings go with the process (`local_fs.leaveForExit`).
     leave_mappings: bool = false,
     /// Fetching S3 bytes into `s3_mapped` behind the scan's gates, when the query reads more than its window.
     s3_fetcher: ?*S3Fetcher = null,
@@ -2807,7 +2808,7 @@ const OpenedInputs = struct {
     }
 
     pub fn deinit(self: *OpenedInputs) void {
-        if (!self.leave_mappings) for (self.mmaps) |m_opt| if (m_opt) |m| m.unmap();
+        for (self.mmaps) |m_opt| if (m_opt) |m| if (self.leave_mappings) local_fs.leaveForExit(m) else m.unmap();
         // Joined before its buffers go: a batch may still be landing in them.
         if (self.s3_fetcher) |f| f.stop();
         for (self.s3_mapped) |buf| s3_window.unmapBuffer(buf);

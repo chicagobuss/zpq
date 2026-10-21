@@ -1,0 +1,148 @@
+# .deb and .rpm packaging for the static zpq CLI. tools/package_release.py --packages runs nfpm with this file once per
+# Linux target and format, from a directory staged with the tarball's own files plus a reproducibly gzipped
+# share/man/man1/zpq.1.gz (pinned by packaging/man/zpq.1.gz.sha256), so the packages carry the same bytes as the tarball and install what the Homebrew formula does.
+#   ZPQ_VERSION  0.5.0, or 0.5.0-rc1 for a prerelease (nfpm writes it as 0.5.0~rc1, which sorts before 0.5.0)
+#   ZPQ_ARCH     amd64 or arm64 (nfpm maps them to x86_64 and aarch64 for rpm)
+# SOURCE_DATE_EPOCH (the release commit time) pins every mtime and rpm.buildhost replaces the host name, so the same
+# inputs give byte-identical packages on any machine.
+name: zpq
+version: ${ZPQ_VERSION}
+version_schema: semver
+arch: ${ZPQ_ARCH}
+platform: linux
+maintainer: chicagobuss <joshua.buss@gmail.com>
+vendor: chicagobuss
+homepage: https://github.com/chicagobuss/zpq
+license: MIT
+section: utils
+priority: optional
+rpm:
+  buildhost: reproducible
+description: |-
+  Fast Unix-native Parquet inspection, filtering and projection
+  An agentically-engineered Apache Parquet engine in Zig, optimized for
+  serverless compute against object storage. This package installs the
+  zpq workstation CLI, a static binary with no runtime dependencies.
+
+contents:
+  - src: bin/zpq
+    dst: /usr/bin/zpq
+    file_info:
+      mode: 0755
+  - src: share/man/man1/zpq.1.gz
+    dst: /usr/share/man/man1/zpq.1.gz
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/man/man1/zpq.1.gz
+    dst: /usr/share/man/man1/zpq.1.gz
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/bash-completion/completions/zpq
+    dst: /usr/share/bash-completion/completions/zpq
+    file_info:
+      mode: 0644
+  # rpm leaves unowned parent directories behind on removal, and EL9 has no zsh or fish directories of its own.
+  - dst: /usr/share/fish
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - dst: /usr/share/fish/vendor_completions.d
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - dst: /usr/share/zsh
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - dst: /usr/share/zsh/site-functions
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - src: share/fish/vendor_completions.d/zpq.fish
+    dst: /usr/share/fish/vendor_completions.d/zpq.fish
+    file_info:
+      mode: 0644
+  - src: share/zsh/site-functions/_zpq
+    dst: /usr/share/zsh/vendor-completions/_zpq
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/zsh/site-functions/_zpq
+    dst: /usr/share/zsh/site-functions/_zpq
+    file_info:
+      mode: 0644
+    packager: rpm
+  - dst: /usr/share/zpq
+    type: dir
+    file_info:
+      mode: 0755
+  - src: share/zpq/tiny.parquet
+    dst: /usr/share/zpq/tiny.parquet
+    file_info:
+      mode: 0644
+  - src: MANIFEST.json
+    dst: /usr/share/zpq/MANIFEST.json
+    file_info:
+      mode: 0644
+  # The guides help and the man page name, where the tarball keeps them (share/doc/zpq/).
+  - dst: /usr/share/doc/zpq
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - src: share/doc/zpq/getting-started.md
+    dst: /usr/share/doc/zpq/getting-started.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/getting-started.md
+    dst: /usr/share/doc/zpq/getting-started.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/doc/zpq/output-format.md
+    dst: /usr/share/doc/zpq/output-format.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/output-format.md
+    dst: /usr/share/doc/zpq/output-format.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/doc/zpq/binary-output.md
+    dst: /usr/share/doc/zpq/binary-output.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/binary-output.md
+    dst: /usr/share/doc/zpq/binary-output.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: LICENSE
+    dst: /usr/share/doc/zpq/copyright
+    file_info:
+      mode: 0644
+    packager: deb
+  - dst: /usr/share/licenses/zpq
+    type: dir
+    file_info:
+      mode: 0755
+    packager: rpm
+  - src: LICENSE
+    dst: /usr/share/licenses/zpq/LICENSE
+    type: license
+    file_info:
+      mode: 0644
+    packager: rpm

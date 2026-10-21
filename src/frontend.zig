@@ -137,6 +137,16 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  so it neither reads nor copies encrypted files\n",
             .{},
         ),
+        error.ExternalColumnChunk => if (diag.input) |in| diagnosticPrint(
+            "zpq query: input file {s}\n" ++
+                "  keeps column data in another file (ColumnChunk.file_path); zpq\n" ++
+                "  reads only self-contained files and never follows such a path\n",
+            .{in},
+        ) else diagnosticPrint(
+            "zpq query: an input file keeps column data in another file\n" ++
+                "  (ColumnChunk.file_path); zpq reads only self-contained files\n",
+            .{},
+        ),
         error.NotParquet, error.BadMagic => if (diag.input) |in| diagnosticPrint(
             "zpq query: input file {s} is not a valid Parquet file ({s})\n",
             .{ in, causeName(diag) },

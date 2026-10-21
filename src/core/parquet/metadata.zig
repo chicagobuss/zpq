@@ -53,6 +53,10 @@ pub const Error = error{
     ColumnChunkRowCountMismatch,
     /// A column chunk's physical type differs from its schema leaf's.
     ColumnChunkTypeMismatch,
+    /// A column chunk's data lives in another file (`ColumnChunk.file_path`).
+    ExternalColumnChunk,
+    /// A DECIMAL annotation whose scale is negative or exceeds its precision.
+    InvalidDecimalType,
 };
 
 /// Deepest group nesting a footer may have: `schema.max_schema_depth`.
@@ -111,8 +115,14 @@ pub fn openFooter(
     errdefer meta.deinit(allocator);
     if (meta.encrypted) return error.EncryptedFile;
     for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| if (chunk.encrypted) return error.EncryptedFile;
+    // zpq reads only the file it was given: a path from an untrusted footer could name any file on the machine, and
+    // a copy would carry the reference into its output. An empty path names nothing and reads as absent.
+    for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| {
+        if (chunk.file_path) |p| if (p.len > 0) return error.ExternalColumnChunk;
+    };
     try checkFooterFields(&meta);
     try reconcileChunkPaths(allocator, &meta);
+    try meta.indexLeaves(allocator);
     return meta;
 }
 
@@ -134,7 +144,12 @@ pub fn checkFooterFields(meta: *schema.FileMetaData) Error!void {
         // A FIXED_LEN_BYTE_ARRAY of no length fell back to the length-prefixed decoder and read its bytes as strings.
         if (elem.type == .FIXED_LEN_BYTE_ARRAY and (elem.type_length orelse 0) == 0) return error.BadSchemaElement;
         // A DECIMAL holds at least one digit: precision 0 left every width computed from it out of range.
-        if (decimal.kindFromSchema(&elem)) |k| if (k.precision < 1) return error.BadSchemaElement;
+        if (decimal.kindFromSchema(&elem)) |k| {
+            if (k.precision < 1) return error.BadSchemaElement;
+            // A scale outside 0..precision gives the stored integer no meaning: refused on read as the writer refuses
+            // to write it, rather than printed raw or at a scale no reader agrees on.
+            if (k.scale < 0 or k.scale > k.precision) return error.InvalidDecimalType;
+        }
         // A primitive can't have children. Some walkers find leaves by type, others by child count; this keeps
         // them agreeing on which element is leaf N. Not the root: every walker starts below it, and some writers
         // (segmentio/parquet-go) give the root a type anyway.
@@ -400,11 +415,8 @@ pub fn schemaMismatch(
 /// The schema element of the `leaf_idx`-th primitive leaf, as
 /// `resolveColumn` counts them. Null when the schema has fewer leaves.
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
-    var it: schema.LeafIterator = .init(file.schema.items);
-    while (it.next()) |leaf| {
-        if (leaf.index == leaf_idx) return leaf.element.*;
-    }
-    return null;
+    var walk: schema.LeafIterator = undefined;
+    return (file.leafAt(leaf_idx, &walk) orelse return null).element.*;
 }
 
 /// The dot-joined path of the `leaf_idx`-th primitive leaf (`key` for a
@@ -608,6 +620,7 @@ pub fn quotedPathEql(name: []const u8, segments: []const []const u8) bool {
 /// Number of leaf columns in the schema: the column-chunk count of every row group (enforced at footer open), and
 /// still defined for a file with no row groups at all, which is a valid empty table.
 pub fn leafCount(file: *const schema.FileMetaData) usize {
+    if (file.leaf_index) |ix| if (ix.schema_len == file.schema.items.len) return ix.leaves.items.len;
     var it: schema.LeafIterator = .init(file.schema.items);
     while (it.next()) |_| {}
     return it.index;
@@ -618,11 +631,8 @@ pub fn leafCount(file: *const schema.FileMetaData) usize {
 /// Compare paths by these segments, never by `leafPath`'s dot-joined form: a top-level column named `a.b` and the
 /// field `b` of a group `a` join to the same string.
 pub fn leafPathSegments(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const []const u8 {
-    var it: schema.LeafIterator = .init(file.schema.items);
-    while (it.next()) |leaf| {
-        if (leaf.index == leaf_idx) return try arena.dupe([]const u8, leaf.path);
-    }
-    return null;
+    var walk: schema.LeafIterator = undefined;
+    return try arena.dupe([]const u8, (file.leafAt(leaf_idx, &walk) orelse return null).path);
 }
 
 /// The leaves a name matches at each step of `resolveColumn`: top-level leaves named exactly `name`; nested leaves
@@ -1508,4 +1518,134 @@ test "encrypted Parquet is refused where its footer is opened, footer encrypted 
         defer a.free(bytes);
         try testing.expectError(error.EncryptedFile, open(a, bytes));
     }
+}
+
+test "the leaf index answers every path lookup as the schema walk does" {
+    const a = testing.allocator;
+    const corpus = "data/parquet-testing/data";
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, corpus, .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(std.testing.io);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| a.free(n);
+        names.deinit(a);
+    }
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |e| {
+        if (!std.mem.endsWith(u8, e.name, ".parquet")) continue;
+        try names.append(a, try std.fmt.allocPrint(a, "data/parquet-testing/data/{s}", .{e.name}));
+    }
+    // Duplicate and dotted names, nested keys and legacy repeated fields.
+    for ([_][]const u8{ "dotted_twin", "nested_key_shape", "format_repeated", "format_repeated_group", "null_pages" }) |f| {
+        try names.append(a, try std.fmt.allocPrint(a, "ci/fixtures/parquet/{s}.parquet", .{f}));
+    }
+    var checked: usize = 0;
+    for (names.items) |path| {
+        const bytes = readFileSlice(path, a) catch continue;
+        defer a.free(bytes);
+        var meta = open(a, bytes) catch continue;
+        defer meta.deinit(a);
+        try testing.expect(meta.leaf_index != null);
+        var walk = meta;
+        walk.leaf_index = null;
+        var leaves: schema.LeafIterator = .init(meta.schema.items);
+        while (leaves.next()) |leaf| {
+            const want = walk.getColumnSchema(leaf.path);
+            const got = meta.getColumnSchema(leaf.path);
+            try testing.expectEqual(want == null, got == null);
+            if (want) |w| try testing.expectEqualStrings(w.name, got.?.name);
+            try testing.expectEqual(walk.getColumnLevels(leaf.path), meta.getColumnLevels(leaf.path));
+            checked += 1;
+        }
+        const missing = [_][]const u8{ "no", "such", "column" };
+        try testing.expect(meta.getColumnSchema(&missing) == null);
+        try testing.expectEqual(walk.getColumnLevels(&missing), meta.getColumnLevels(&missing));
+    }
+    std.debug.print("leaf index: {d} leaves of {d} files agree with the walk\n", .{ checked, names.items.len });
+    try testing.expect(checked > 500);
+}
+
+test "a footer's leaf index is freed whole when an allocation fails" {
+    const bytes = readFileSlice("ci/fixtures/parquet/nested_key_shape.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var meta = try open(testing.allocator, bytes);
+    defer meta.deinit(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(alloc: std.mem.Allocator, opened: *const schema.FileMetaData) !void {
+            var m = opened.*;
+            m.leaf_index = null;
+            try m.indexLeaves(alloc);
+            m.leaf_index.?.destroy(alloc);
+        }
+    }.run, .{&meta});
+}
+
+test "a column chunk whose data lives in another file is refused at footer open" {
+    const bytes = readFileSlice("ci/fixtures/parquet/nested_key_shape.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try open(arena, bytes);
+    for ([_]struct { path: []const u8, refused: bool }{
+        .{ .path = "/etc/passwd", .refused = true },
+        .{ .path = "part-0.parquet", .refused = true },
+        .{ .path = "", .refused = false },
+    }) |c| {
+        meta.row_groups.items[0].columns.items[0].file_path = c.path;
+        var w = thrift.Writer.init(arena);
+        try meta.write(&w);
+        if (c.refused) {
+            try testing.expectError(error.ExternalColumnChunk, openFooter(arena, w.bytes()));
+        } else _ = try openFooter(arena, w.bytes());
+    }
+}
+
+test "a DECIMAL whose scale is negative or past its precision is refused at footer open" {
+    const bytes = readFileSlice("ci/fixtures/parquet/decimal_exact.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try open(arena, bytes);
+    const at = for (meta.schema.items, 0..) |e, i| {
+        if (decimal.kindFromSchema(&e) != null) break i;
+    } else return error.SkipZigTest;
+    const elem = &meta.schema.items[at];
+    const precision = decimal.kindFromSchema(elem).?.precision;
+    for ([_]struct { scale: i32, ok: bool }{
+        .{ .scale = -3, .ok = false },
+        .{ .scale = precision + 1, .ok = false },
+        .{ .scale = precision, .ok = true },
+        .{ .scale = 0, .ok = true },
+    }) |c| for ([_]bool{ true, false }) |logical| {
+        // The logical annotation, or the legacy converted one with its own scale and precision. The footer writer
+        // re-emits the bytes it read for the logical type, so they go too.
+        elem.logical_type_raw = "";
+        if (logical) {
+            elem.logical_type = .{ .DECIMAL = .{ .scale = c.scale, .precision = precision } };
+        } else {
+            elem.logical_type = null;
+            elem.converted_type = .DECIMAL;
+            elem.scale = c.scale;
+            elem.precision = precision;
+        }
+        var w = thrift.Writer.init(arena);
+        try meta.write(&w);
+        if (c.ok) {
+            _ = try openFooter(arena, w.bytes());
+        } else testing.expectError(error.InvalidDecimalType, openFooter(arena, w.bytes())) catch |err| {
+            std.debug.print("scale {d} (logical {}) was accepted\n", .{ c.scale, logical });
+            return err;
+        };
+    };
 }

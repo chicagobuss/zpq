@@ -1273,8 +1273,15 @@ fn planStatFold(
     const levels = columnLevelsForStats(file_meta, &cm) orelse return null;
     if (levels.max_rep > 0) return null;
     // Bounds in the column's own order: the deprecated pair only where signed is that order. Every fold but count(*)
-    // runs under `--trust-stats` alone (`canStatShortCircuit`), which trusts plausible statistics.
-    const bounds = statistics.chunkStats(rg, col_idx, file_meta, .plausible).bounds orelse return null;
+    // runs under `--trust-stats` alone (`canStatShortCircuit`), which trusts plausible statistics, but never answers
+    // with a bound the writer marked inexact (cut): that one only prunes.
+    const vetted = statistics.chunkStats(rg, col_idx, file_meta, .plausible);
+    const bounds = vetted.bounds orelse return null;
+    switch (call.func) {
+        .min => if (!vetted.min_exact) return null,
+        .max => if (!vetted.max_exact) return null,
+        else => if (!vetted.min_exact or !vetted.max_exact) return null,
+    }
     const lane = statFoldLane(call, cm.type, file_meta.getColumnSchema(cm.path_in_schema.items)) orelse return null;
     // Bounds leave NaN out. A min skips NaN anyway (and an all-NaN chunk has no bounds), but a max or a constant sum
     // can take them only when the chunk is known to hold none.

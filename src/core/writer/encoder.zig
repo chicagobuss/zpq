@@ -1966,7 +1966,7 @@ fn computeStats(
         .i64 => |x| statsTyped(arena, i64, x.values, def_levels, max_def),
         .f32 => |x| statsTypedFloat(arena, f32, x.values, def_levels, max_def),
         .f64 => |x| statsTypedFloat(arena, f64, x.values, def_levels, max_def),
-        .string => |x| statsBytes(arena, x.values, def_levels, max_def),
+        .string => |x| statsBytes(arena, x.values, def_levels, max_def, boundCut(elem.*)),
         .boolean => |x| statsBool(arena, x.values, def_levels, max_def),
         .i128 => unreachable,
     };
@@ -2084,7 +2084,77 @@ fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T
     };
 }
 
-fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: ?[]const u32, max_def: u32) ?schema.Statistics {
+/// Written BYTE_ARRAY bounds are cut to this many bytes, the length arrow-rs cuts statistics to: kept whole, one 100 MB
+/// value fills the footer twice over, past what readers parse (pyarrow refuses a thrift string over 100 MB).
+const stats_bound_len = 64;
+
+/// How a column's byte bounds are cut: FIXED_LEN_BYTE_ARRAY not at all (a bound of another width reads as corrupt),
+/// UTF-8 text at a character boundary so the bound stays text, other bytes anywhere.
+const BoundCut = enum { none, bytes, utf8 };
+
+fn boundCut(elem: schema.SchemaElement) BoundCut {
+    if (elem.type != .BYTE_ARRAY) return .none;
+    if (elem.logical_type) |lt| switch (lt) {
+        .STRING, .ENUM, .JSON => return .utf8,
+        else => {},
+    };
+    if (elem.converted_type) |ct| switch (ct) {
+        .UTF8, .ENUM, .JSON => return .utf8,
+        else => {},
+    };
+    return .bytes;
+}
+
+/// `v` cut to at most `stats_bound_len` bytes: a prefix, so still no greater than `v`.
+fn cutMin(v: []const u8, cut: BoundCut) []const u8 {
+    if (cut == .none or v.len <= stats_bound_len) return v;
+    var n: usize = stats_bound_len;
+    if (cut == .utf8 and std.unicode.utf8ValidateSlice(v)) {
+        while (n > 0 and (v[n] & 0xC0) == 0x80) n -= 1;
+    }
+    return v[0..n];
+}
+
+/// An upper bound for `v` of at most `stats_bound_len` bytes, on `arena`: `v` cut, then its last byte (UTF-8: last
+/// character) that can grow by one without changing width grown, and what follows it dropped. Null when nothing
+/// can grow (all 0xFF), and then no max is written. `v` itself when it needs no cut.
+fn cutMax(arena: std.mem.Allocator, v: []const u8, cut: BoundCut) std.mem.Allocator.Error!?[]const u8 {
+    if (cut == .none or v.len <= stats_bound_len) return v;
+    if (cut == .utf8 and std.unicode.utf8ValidateSlice(v)) {
+        var end: usize = stats_bound_len;
+        while (end > 0 and (v[end] & 0xC0) == 0x80) end -= 1;
+        while (end > 0) {
+            var start = end - 1;
+            while (start > 0 and (v[start] & 0xC0) == 0x80) start -= 1;
+            const cp = std.unicode.utf8Decode(v[start..end]) catch unreachable;
+            const next = cp + 1;
+            const surrogate = next >= 0xD800 and next <= 0xDFFF;
+            const width = std.unicode.utf8CodepointSequenceLength(next) catch 0;
+            if (!surrogate and next <= 0x10FFFF and width == end - start) {
+                const out = try arena.alloc(u8, end);
+                @memcpy(out[0..start], v[0..start]);
+                _ = std.unicode.utf8Encode(next, out[start..end]) catch unreachable;
+                return out;
+            }
+            end = start;
+        }
+        return null;
+    }
+    var n: usize = stats_bound_len;
+    while (n > 0 and v[n - 1] == 0xFF) n -= 1;
+    if (n == 0) return null;
+    const out = try arena.dupe(u8, v[0..n]);
+    out[n - 1] += 1;
+    return out;
+}
+
+fn statsBytes(
+    arena: std.mem.Allocator,
+    values: []const []const u8,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    cut: BoundCut,
+) ?schema.Statistics {
     if (values.len == 0) return null;
     var first_idx: ?usize = null;
     var null_count: i64 = 0;
@@ -2122,14 +2192,21 @@ fn statsBytes(arena: std.mem.Allocator, values: []const []const u8, def_levels: 
     // Caller's arena is the file-footer-lifetime arena; the values
     // slices typically borrow from a row-group-scoped arena. Dupe so
     // the footer write later sees stable bytes.
-    const lo_owned = arena.dupe(u8, lo) catch return null;
-    const hi_owned = arena.dupe(u8, hi) catch return null;
+    const lo_cut = cutMin(lo, cut);
+    const hi_cut = cutMax(arena, hi, cut) catch return null;
+    const lo_owned = arena.dupe(u8, lo_cut) catch return null;
+    const hi_owned: ?[]const u8 = if (hi_cut) |h| arena.dupe(u8, h) catch return null else null;
     // Bytewise unsigned is a byte array's type-defined order. The deprecated min/max are defined as signed, so they
-    // are left unset rather than written in an order a legacy reader would misread.
+    // are left unset rather than written in an order a legacy reader would misread. A cut bound says so, and readers
+    // then take it as a bound only (zpq's own full-match proof needs an exact max).
+    const cuts = cut != .none;
     return .{
         .min_value = lo_owned,
         .max_value = hi_owned,
         .null_count = null_count,
+        .is_min_value_exact = if (cuts) lo_cut.len == lo.len else null,
+        // `cutMax` hands back `hi` itself when it needs no cut.
+        .is_max_value_exact = if (cuts and hi_cut != null) hi_cut.?.ptr == hi.ptr else null,
     };
 }
 
@@ -2190,7 +2267,7 @@ test "statistics populate legacy bounds only where their signed order is the typ
     try expectMirroredStats(statsTypedFloat(arena, f64, &floats, null, 0) orelse return error.MissingStats);
 
     const bytes = [_][]const u8{ "bravo", "alpha", "charlie", "\xc3\xa9" };
-    const byte_stats = statsBytes(arena, &bytes, null, 0) orelse return error.MissingStats;
+    const byte_stats = statsBytes(arena, &bytes, null, 0, .bytes) orelse return error.MissingStats;
     try testing.expect(byte_stats.min == null and byte_stats.max == null);
     try testing.expectEqualStrings("alpha", byte_stats.min_value.?);
     try testing.expectEqualStrings("\xc3\xa9", byte_stats.max_value.?);
@@ -2437,7 +2514,7 @@ test "statsBytes all-null page emits null_count only" {
 
     const vals = [_][]const u8{ "", "", "" };
     const dls = [_]u32{ 0, 0, 0 };
-    const s = statsBytes(arena, &vals, &dls, 1) orelse return error.MissingStats;
+    const s = statsBytes(arena, &vals, &dls, 1, .bytes) orelse return error.MissingStats;
     try testing.expectEqual(@as(?i64, 3), s.null_count);
     try testing.expectEqual(@as(?[]const u8, null), s.min_value);
     try testing.expectEqual(@as(?[]const u8, null), s.max_value);
@@ -2644,7 +2721,7 @@ test "string statistics equal a byte-order fold: shared prefixes, empty strings,
             v.* = buf;
             d.* = if (nullable and r.uintLessThan(u8, 4) == 0) 0 else 1;
         }
-        const st = statsBytes(a, vals, if (nullable) defs else null, 1) orelse return error.TestUnexpectedResult;
+        const st = statsBytes(a, vals, if (nullable) defs else null, 1, .bytes) orelse return error.TestUnexpectedResult;
         var lo: ?[]const u8 = null;
         var hi: ?[]const u8 = null;
         for (vals, defs) |v, d| {
@@ -3323,4 +3400,83 @@ test "a dictionary no page header holds leaves the chunk to its values' own enco
     try testing.expectEqual(@as(usize, 4000), try expectPagesWithin(a, split, 1000));
     const back = try readBack(i64, a, split, .{ .max_def = 0, .max_rep = 0 }, 4000);
     try testing.expectEqualSlices(i64, vals, back.values);
+}
+
+/// `s` `n` times over, at comptime.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    comptime {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |k| @memcpy(out[k * s.len ..][0..s.len], s);
+        const final = out;
+        return &final;
+    }
+}
+
+test "byte bounds past 64 bytes are cut: a prefix for the min, a grown prefix for the max, none past all 0xFF" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const long = comptime repeat("a", 100);
+    try testing.expectEqualStrings(comptime repeat("a", 64), cutMin(long, .bytes));
+    try testing.expectEqualStrings(comptime repeat("a", 63) ++ "b", (try cutMax(a, long, .bytes)).?);
+    // Short bounds, and FIXED_LEN_BYTE_ARRAY ones, are kept whole (the very slice).
+    try testing.expectEqual(@as([*]const u8, "abc".ptr), (try cutMax(a, "abc", .bytes)).?.ptr);
+    try testing.expectEqual(long.len, cutMin(long, .none).len);
+    try testing.expectEqual(long.len, (try cutMax(a, long, .none)).?.len);
+
+    // Trailing 0xFF bytes cannot grow: the byte before them does, and they go.
+    const ff = comptime repeat("x", 60) ++ "\xfe" ++ repeat("\xff", 10);
+    try testing.expectEqualStrings(comptime repeat("x", 60) ++ "\xff", (try cutMax(a, ff, .bytes)).?);
+    try testing.expect(try cutMax(a, comptime repeat("\xff", 70), .bytes) == null);
+
+    // UTF-8 is cut at a character boundary and grows by a character of the same width.
+    const euro = comptime repeat("€", 30); // 3 bytes each: the boundary below 64 is 63
+    try testing.expectEqualStrings(comptime repeat("€", 21), cutMin(euro, .utf8));
+    try testing.expectEqualStrings(comptime repeat("€", 20) ++ "\u{20AD}", (try cutMax(a, euro, .utf8)).?);
+    // U+FFFF grows to a 4-byte character: it is dropped and the one before it grows instead.
+    const top = comptime repeat("a", 61) ++ "\u{FFFF}" ++ repeat("z", 10); // the cut at 64 ends on U+FFFF
+    try testing.expectEqualStrings(comptime repeat("a", 60) ++ "b", (try cutMax(a, top, .utf8)).?);
+    // Text that is not UTF-8 is cut as bytes.
+    const bad = comptime repeat("\xc3", 70);
+    try testing.expectEqualStrings(comptime repeat("\xc3", 64), cutMin(bad, .utf8));
+
+    // Every cut bound lies on the right side of the value.
+    for ([_][]const u8{ long, ff, euro, top, bad }) |v| for ([_]BoundCut{ .bytes, .utf8 }) |c| {
+        try testing.expect(!std.mem.lessThan(u8, v, cutMin(v, c)));
+        if (try cutMax(a, v, c)) |m| try testing.expect(!std.mem.lessThan(u8, m, v));
+    };
+}
+
+test "string statistics say whether their bounds were cut; FIXED_LEN_BYTE_ARRAY bounds are never cut" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big = comptime repeat("m", 200);
+    var str = flbaElem(0, .REQUIRED);
+    str.type = .BYTE_ARRAY;
+    str.logical_type = .{ .STRING = .{} };
+
+    const cut = computeStats(a, .{ .string = .{ .values = &.{ big, "zz" ++ big } } }, null, 0, &str).?;
+    try testing.expectEqual(@as(usize, 64), cut.min_value.?.len);
+    try testing.expect(cut.max_value.?.len <= 64);
+    try testing.expectEqual(@as(?bool, false), cut.is_min_value_exact);
+    try testing.expectEqual(@as(?bool, false), cut.is_max_value_exact);
+
+    const whole = computeStats(a, .{ .string = .{ .values = &.{ "a", "b" } } }, null, 0, &str).?;
+    try testing.expectEqual(@as(?bool, true), whole.is_min_value_exact);
+    try testing.expectEqual(@as(?bool, true), whole.is_max_value_exact);
+
+    const fixed = flbaElem(200, .REQUIRED);
+    const flba = computeStats(a, .{ .string = .{ .values = &.{ big, big } } }, null, 0, &fixed).?;
+    try testing.expectEqual(@as(usize, 200), flba.max_value.?.len);
+    try testing.expect(flba.is_max_value_exact == null and flba.is_min_value_exact == null);
+
+    // The flags survive the footer.
+    var w: thrift.Writer = .init(a);
+    try cut.write(&w);
+    var r = thrift.Reader.init(w.bytes());
+    const back = try schema.Statistics.read(&r);
+    try testing.expectEqual(@as(?bool, false), back.is_max_value_exact);
+    try testing.expectEqual(@as(?bool, false), back.is_min_value_exact);
 }

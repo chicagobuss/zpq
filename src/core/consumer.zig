@@ -198,10 +198,8 @@ pub fn initOutputAggregator(
                 const kept_ci = pt.ci;
                 // The leaf and its path come from the schema, which every chunk's path_in_schema matches (footer
                 // open enforces it), so a file with no row groups still builds its output schema.
-                var leaves: schema.LeafIterator = .init(meta.schema.items);
-                const leaf = while (leaves.next()) |l| {
-                    if (l.index == kept_ci) break l;
-                } else return error.ColumnMetaMissing;
+                var walk: schema.LeafIterator = undefined;
+                const leaf = meta.leafAt(kept_ci, &walk) orelse return error.ColumnMetaMissing;
                 const src_elem = leaf.element.*;
                 paths[i] = try arena.dupe([]const u8, leaf.path);
 
@@ -1999,6 +1997,8 @@ fn cloneColumnMeta(
             .distinct_count = st.distinct_count,
             .max_value = if (st.max_value) |v| try arena.dupe(u8, v) else null,
             .min_value = if (st.min_value) |v| try arena.dupe(u8, v) else null,
+            .is_max_value_exact = st.is_max_value_exact,
+            .is_min_value_exact = st.is_min_value_exact,
             .nan_count = st.nan_count,
         };
     }
@@ -6374,9 +6374,13 @@ test "StagePlan.init in countOnly mode plans zero calls and charges only base co
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var file_meta: schema.FileMetaData = undefined;
-    file_meta.schema = .empty;
-    file_meta.row_groups = .empty;
+    var file_meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 0,
+        .created_by = null,
+        .row_groups = .empty,
+    };
     try file_meta.schema.append(arena, .{
         .name = "schema",
         .num_children = 2,
@@ -6511,9 +6515,13 @@ test "StagePlan.init in countOnly mode: allocation failures cleanly unwind witho
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            var file_meta: schema.FileMetaData = undefined;
-            file_meta.schema = .empty;
-            file_meta.row_groups = .empty;
+            var file_meta: schema.FileMetaData = .{
+                .version = 1,
+                .schema = .empty,
+                .num_rows = 0,
+                .created_by = null,
+                .row_groups = .empty,
+            };
             try file_meta.schema.append(arena, .{
                 .name = "schema",
                 .num_children = 2,
@@ -7195,4 +7203,42 @@ test "appendSelected keeps one level per row when a column's batches come with a
     try appendSelected(&plain, without, &sel, 2, a, false, a);
     try appendSelected(&plain, without, &sel, 2, a, false, a);
     try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
+}
+
+test "cloneColumnMeta keeps every statistics field, the bounds' exactness among them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const st: schema.Statistics = .{
+        .max = "b",
+        .min = "a",
+        .null_count = 3,
+        .distinct_count = 7,
+        .max_value = "y",
+        .min_value = "x",
+        .is_max_value_exact = false,
+        .is_min_value_exact = true,
+        .nan_count = 2,
+    };
+    const cm: schema.ColumnMetaData = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 10,
+        .total_uncompressed_size = 0,
+        .total_compressed_size = 0,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+        .statistics = st,
+    };
+    const got = (try cloneColumnMeta(a, cm)).statistics.?;
+    inline for (@typeInfo(schema.Statistics).@"struct".field_names) |name| {
+        const want = @field(st, name);
+        const have = @field(got, name);
+        if (@TypeOf(want) == ?[]const u8) {
+            try std.testing.expectEqualStrings(want.?, have.?);
+        } else try std.testing.expectEqual(want, have);
+    }
 }

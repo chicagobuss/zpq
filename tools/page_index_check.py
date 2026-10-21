@@ -245,7 +245,11 @@ def check_file(path, require_index, quiet):
                 if phys in ("INT32", "INT64") and unsigned:
                     width = 32 if phys == "INT32" else 64
                     py = [v % (1 << width) for v in py]
-                if lo != min(py) or hi != max(py):
+                if phys in ("BYTE_ARRAY", "FLBA") and isinstance(lo, bytes):
+                    # Writers may truncate byte-array bounds; they must still enclose the page's values.
+                    if lo > min(py) or hi < max(py):
+                        fail(f"rg {rgi} col {ci} page {pi}: bounds {lo[:40]!r}..{hi[:40]!r} do not enclose the values")
+                elif lo != min(py) or hi != max(py):
                     if not (phys in ("FLOAT", "DOUBLE") and lo == min(py) == 0 and hi == max(py)):
                         fail(f"rg {rgi} col {ci} page {pi}: bounds {lo!r}..{hi!r}, values {min(py)!r}..{max(py)!r}")
                 if prev is not None:

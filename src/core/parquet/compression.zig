@@ -129,9 +129,10 @@ fn compressFlate(
     src: []const u8,
     container: std.compress.flate.Container,
 ) Error![]u8 {
-    // The compressor's history window (asserted >= max_window_len = 64 KB).
-    const window = try arena.alloc(u8, std.compress.flate.max_window_len);
-    defer arena.free(window);
+    var own: ThreadCodecs = .{};
+    const codecs = ThreadCodecs.current() orelse &own;
+    defer if (codecs == &own) own.deinit();
+    const window = try codecs.flateWindow();
     const dest = try arena.alloc(u8, flateBound(src.len));
     var out: std.Io.Writer = .fixed(dest);
     var c = std.compress.flate.Compress.init(&out, window, container, .default) catch
@@ -147,31 +148,36 @@ fn flateBound(n: usize) usize {
     return n + n / 8 + 5 * (n / 65535 + 1) + 64;
 }
 
-/// A thread's zstd contexts, each made at its first use and kept for every later page. A context is a few hundred
-/// KiB, an mmap/munmap pair per page under musl when made per call. A pthread key frees them when the thread exits,
-/// so a pass's workers, a library's request threads and a host's own threads each hold one set at most.
-/// Reuse leaves the bytes unchanged: every compression resets the context and its parameters first (`setLevel`).
+/// A thread's codec state, each part made at its first use and kept for every later page: zstd's contexts, a
+/// libdeflate decompressor and the 64 KiB window `std.compress.flate` needs. A zstd context is a few hundred KiB, an
+/// mmap/munmap pair per page under musl when made per call; the others were a malloc and a free (or a window left on
+/// the page's arena) per page. A pthread key frees them when the thread exits, so a pass's workers, a library's
+/// request threads and a host's own threads each hold one set at most.
+/// Reuse leaves the bytes unchanged: every compression resets the context and its parameters first (`setLevel`), and
+/// the inflaters start each member afresh.
 /// Their memory comes straight from the OS (`page_mem`), so a freed context goes back to it whatever the host's malloc
 /// does: glibc otherwise keeps blocks this size in a thread's arena once its mmap threshold has risen, tens of MB after
 /// a large write in a library's host.
-const ThreadZstd = struct {
+const ThreadCodecs = struct {
     dctx: ?*c_zstd.ZSTD_DCtx = null,
     cctx: ?*c_zstd.ZSTD_CCtx = null,
+    inflater: ?*c_deflate.libdeflate_decompressor = null,
+    window: ?[]align(std.heap.page_size_min) u8 = null,
 
     var key: std.c.pthread_key_t = undefined;
     var key_ready: std.atomic.Value(bool) = .init(false);
     var key_tried = false;
     var key_lock: std.c.pthread_mutex_t = .{};
-    /// Tests only: contexts made and freed, to show reuse and teardown.
+    /// Tests only: parts made and freed, to show reuse and teardown.
     var made: std.atomic.Value(usize) = .init(0);
     var freed: std.atomic.Value(usize) = .init(0);
 
     /// This thread's set; null when it cannot be registered to be freed at thread exit (no pthread key or memory
     /// left), and the caller then uses a set of its own for the one call.
-    fn current() ?*ThreadZstd {
+    fn current() ?*ThreadCodecs {
         if (!haveKey()) return null;
         if (std.c.pthread_getspecific(key)) |p| return @ptrCast(@alignCast(p));
-        const s = std.heap.c_allocator.create(ThreadZstd) catch return null;
+        const s = std.heap.c_allocator.create(ThreadCodecs) catch return null;
         s.* = .{};
         if (std.c.pthread_setspecific(key, s) != 0) {
             std.heap.c_allocator.destroy(s);
@@ -192,22 +198,25 @@ const ThreadZstd = struct {
     }
 
     fn atThreadExit(p: *anyopaque) callconv(.c) void {
-        const s: *ThreadZstd = @ptrCast(@alignCast(p));
+        const s: *ThreadCodecs = @ptrCast(@alignCast(p));
         s.deinit();
         std.heap.c_allocator.destroy(s);
     }
 
-    fn deinit(s: *ThreadZstd) void {
+    fn deinit(s: *ThreadCodecs) void {
         if (s.dctx) |d| _ = c_zstd.ZSTD_freeDCtx(d);
         if (s.cctx) |c| _ = c_zstd.ZSTD_freeCCtx(c);
+        if (s.inflater) |d| c_deflate.libdeflate_free_decompressor(d);
+        if (s.window) |w| std.heap.page_allocator.free(w);
         if (builtin.is_test) {
-            const n = @as(usize, @intFromBool(s.dctx != null)) + @intFromBool(s.cctx != null);
+            const n = @as(usize, @intFromBool(s.dctx != null)) + @intFromBool(s.cctx != null) +
+                @intFromBool(s.inflater != null) + @intFromBool(s.window != null);
             _ = freed.fetchAdd(n, .monotonic);
         }
         s.* = .{};
     }
 
-    fn decoder(s: *ThreadZstd) Error!*c_zstd.ZSTD_DCtx {
+    fn decoder(s: *ThreadCodecs) Error!*c_zstd.ZSTD_DCtx {
         if (s.dctx == null) {
             s.dctx = c_zstd.ZSTD_createDCtx_advanced(page_mem) orelse return error.OutOfMemory;
             if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
@@ -215,16 +224,50 @@ const ThreadZstd = struct {
         return s.dctx.?;
     }
 
-    fn encoder(s: *ThreadZstd) Error!*c_zstd.ZSTD_CCtx {
+    fn encoder(s: *ThreadCodecs) Error!*c_zstd.ZSTD_CCtx {
         if (s.cctx == null) {
             s.cctx = c_zstd.ZSTD_createCCtx_advanced(page_mem) orelse return error.OutOfMemory;
             if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
         }
         return s.cctx.?;
     }
+
+    fn inflate(s: *ThreadCodecs) Error!*c_deflate.libdeflate_decompressor {
+        if (s.inflater == null) {
+            const options: c_deflate.libdeflate_options = .{
+                .sizeof_options = @sizeOf(c_deflate.libdeflate_options),
+                .malloc_func = deflateAlloc,
+                .free_func = deflateFree,
+            };
+            s.inflater = c_deflate.libdeflate_alloc_decompressor_ex(&options) orelse return error.OutOfMemory;
+            if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
+        }
+        return s.inflater.?;
+    }
+
+    /// The history window `std.compress.flate` reads and writes through, for one call at a time.
+    fn flateWindow(s: *ThreadCodecs) Error![]u8 {
+        if (s.window == null) {
+            s.window = try std.heap.page_allocator.alignedAlloc(
+                u8,
+                .fromByteUnits(std.heap.page_size_min),
+                std.compress.flate.max_window_len,
+            );
+            if (builtin.is_test) _ = made.fetchAdd(1, .monotonic);
+        }
+        return s.window.?;
+    }
 };
 
-/// libzstd's allocator for the thread contexts: page-backed blocks behind a header holding their length. A context is
+fn deflateAlloc(size: usize) callconv(.c) ?*anyopaque {
+    return pageAlloc(null, size);
+}
+
+fn deflateFree(p: ?*anyopaque) callconv(.c) void {
+    pageFree(null, p);
+}
+
+/// libzstd's (and libdeflate's) allocator for the thread contexts: page-backed blocks behind a header holding their length. A context is
 /// made once per thread and its workspace regrown rarely, so this costs system calls per thread, not per page.
 const page_mem: c_zstd.ZSTD_customMem = .{ .customAlloc = pageAlloc, .customFree = pageFree, .@"opaque" = null };
 const page_head = 64;
@@ -245,8 +288,8 @@ fn compressZstd(arena: std.mem.Allocator, src: []const u8, plan: ZstdPlan) Error
     if (c_zstd.ZSTD_isError(max_len) != 0) return error.CompressionFailed;
     const buf = try arena.alloc(u8, @max(max_len, rawFrameLen(src.len)));
     errdefer arena.free(buf);
-    var own: ThreadZstd = .{};
-    const zs = ThreadZstd.current() orelse &own;
+    var own: ThreadCodecs = .{};
+    const zs = ThreadCodecs.current() orelse &own;
     defer if (zs == &own) own.deinit();
     const cctx = try zs.encoder();
     const choice: Choice = if (plan.lambda) |lambda| try chooseZstdMode(arena, cctx, src, lambda) else .{};
@@ -466,14 +509,13 @@ pub fn decompress(
     }
     const out = try arena.alloc(u8, uncompressed_size);
     errdefer arena.free(out);
-    try decompressInto(arena, src, codec, out);
+    try decompressInto(src, codec, out);
     return out;
 }
 
 /// `decompress` into a caller-owned buffer of exactly the uncompressed size, so callers can reuse one buffer
-/// across pages. UNCOMPRESSED copies. `arena` is only touched for codec working state (the flate window).
+/// across pages. UNCOMPRESSED copies. Codec working state is the thread's (`ThreadCodecs`).
 pub fn decompressInto(
-    arena: std.mem.Allocator,
     src: []const u8,
     codec: schema.CompressionCodec,
     out: []u8,
@@ -493,7 +535,7 @@ pub fn decompressInto(
             const n = snappy.uncompress(src, out) catch return error.DecompressionFailed;
             if (n != out.len) return error.SizeMismatch;
         },
-        .GZIP => try decompressGzip(arena, src, out),
+        .GZIP => try decompressGzip(src, out),
         .ZSTD => try decompressZstd(src, out),
         .LZ4_RAW => {
             const n = lz4.uncompress(src, out) catch return error.DecompressionFailed;
@@ -547,10 +589,12 @@ pub fn setGzipStd(std_flate: bool) void {
 /// and length; the members must use all of `src` and fill `out` exactly, so trailing bytes that are no member, or a
 /// member past the page's size, are errors. libdeflate decodes a member into the space left and never writes past
 /// `out`. An empty body is accepted only for an empty page: there is nothing in it to check.
-fn decompressGzip(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!void {
-    if (gzipUsesStd()) return decompressFlate(arena, src, out, .gzip);
-    const d = c_deflate.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;
-    defer c_deflate.libdeflate_free_decompressor(d);
+fn decompressGzip(src: []const u8, out: []u8) Error!void {
+    if (gzipUsesStd()) return decompressFlate(src, out, .gzip);
+    var own: ThreadCodecs = .{};
+    const codecs = ThreadCodecs.current() orelse &own;
+    defer if (codecs == &own) own.deinit();
+    const d = try codecs.inflate();
     var written: usize = 0;
     var pos: usize = 0;
     while (pos < src.len) {
@@ -572,18 +616,13 @@ fn decompressGzip(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!vo
     if (written != out.len) return error.DecompressionFailed;
 }
 
-fn decompressFlate(
-    arena: std.mem.Allocator,
-    src: []const u8,
-    out: []u8,
-    container: std.compress.flate.Container,
-) Error!void {
+fn decompressFlate(src: []const u8, out: []u8, container: std.compress.flate.Container) Error!void {
     const uncompressed_size = out.len;
     var input = std.Io.Reader.fixed(src);
-    // The flate decoder asserts buffer.len >= max_window_len (64 KB).
-    // Arena-allocated; lives until the row-group arena resets.
-    const window = try arena.alloc(u8, std.compress.flate.max_window_len);
-    defer arena.free(window);
+    var own: ThreadCodecs = .{};
+    const codecs = ThreadCodecs.current() orelse &own;
+    defer if (codecs == &own) own.deinit();
+    const window = try codecs.flateWindow();
 
     // gzip/zlib permit concatenated members: several independently-framed
     // streams back-to-back that together produce `uncompressed_size` bytes
@@ -620,8 +659,8 @@ fn decompressFlate(
 fn decompressZstd(src: []const u8, out: []u8) Error!void {
     // libzstd, not the stdlib decoder: that one is correct but ~10× slower on the dict-encoded numeric chunks Parquet
     // writers produce (92% of CLI aggregate time per a 2026-05-06 profile).
-    var own: ThreadZstd = .{};
-    const zs = ThreadZstd.current() orelse &own;
+    var own: ThreadCodecs = .{};
+    const zs = ThreadCodecs.current() orelse &own;
     defer if (zs == &own) own.deinit();
     const n = c_zstd.ZSTD_decompressDCtx(
         try zs.decoder(),
@@ -881,6 +920,47 @@ test "every zstd page mode makes a frame libzstd decodes, and each priority pick
     }
 }
 
+test "a thread keeps one libdeflate decompressor and one flate window for every gzip page, and frees both at exit" {
+    const Work = struct {
+        made: usize = 0,
+        failed: ?anyerror = null,
+
+        fn run(w: *@This()) void {
+            w.pages() catch |e| {
+                w.failed = e;
+            };
+        }
+
+        fn pages(w: *@This()) !void {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            var prng = std.Random.DefaultPrng.init(0x9a1f);
+            const big = try a.alloc(u8, 300_000);
+            for (big, 0..) |*b, i| b.* = if (i % 4 == 0) prng.random().int(u8) else @truncate(i / 13);
+            const small = big[5000..][0..20_000];
+            const before = ThreadCodecs.made.load(.monotonic);
+            const first = try compress(a, big, .GZIP);
+            _ = try compress(a, small, .GZIP);
+            // The window a page leaves behind does not reach the next one's bytes.
+            try testing.expectEqualSlices(u8, first, try compress(a, big, .GZIP));
+            defer setGzipStd(false);
+            for ([_]bool{ false, true, false }) |std_flate| {
+                setGzipStd(std_flate);
+                for (0..3) |_| try testing.expectEqualSlices(u8, big, try decompress(a, first, .GZIP, big.len));
+            }
+            w.made = ThreadCodecs.made.load(.monotonic) - before;
+        }
+    };
+    const freed = ThreadCodecs.freed.load(.monotonic);
+    var w: Work = .{};
+    const t = try std.Thread.spawn(.{}, Work.run, .{&w});
+    t.join();
+    if (w.failed) |e| return e;
+    try testing.expectEqual(@as(usize, 2), w.made);
+    try testing.expectEqual(@as(usize, 2), ThreadCodecs.freed.load(.monotonic) - freed);
+}
+
 test "a thread makes one zstd context of each kind, reuses it for every page, and frees both when it exits" {
     const Work = struct {
         made: usize = 0,
@@ -899,7 +979,7 @@ test "a thread makes one zstd context of each kind, reuses it for every page, an
             var prng = std.Random.DefaultPrng.init(0x2c7f);
             const big = try adversarialPage(a, 1, prng.random());
             const small = big[big.len / 2 - 3000 ..][0..6000];
-            const before = ThreadZstd.made.load(.monotonic);
+            const before = ThreadCodecs.made.load(.monotonic);
             // What a context made for this page alone writes.
             const fresh = c_zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
             defer _ = c_zstd.ZSTD_freeCCtx(fresh);
@@ -914,16 +994,16 @@ test "a thread makes one zstd context of each kind, reuses it for every page, an
                 if (p == .size) try testing.expectEqualSlices(u8, want[0..want_len], again);
                 for (0..3) |_| try testing.expectEqualSlices(u8, big, try decompress(a, again, .ZSTD, big.len));
             }
-            w.made = ThreadZstd.made.load(.monotonic) - before;
+            w.made = ThreadCodecs.made.load(.monotonic) - before;
         }
     };
-    const freed = ThreadZstd.freed.load(.monotonic);
+    const freed = ThreadCodecs.freed.load(.monotonic);
     var w: Work = .{};
     const t = try std.Thread.spawn(.{}, Work.run, .{&w});
     t.join();
     if (w.failed) |e| return e;
     try testing.expectEqual(@as(usize, 2), w.made);
-    try testing.expectEqual(@as(usize, 2), ThreadZstd.freed.load(.monotonic) - freed);
+    try testing.expectEqual(@as(usize, 2), ThreadCodecs.freed.load(.monotonic) - freed);
 }
 
 /// A 1 MiB page built so that the chooser's four sample slices see something unlike the rest of it.
@@ -1084,7 +1164,7 @@ fn expectGzipBoth(a: std.mem.Allocator, src: []const u8, want: []const u8, want_
         const buf = try a.alloc(u8, want_len + 64);
         @memset(buf, 0xA5);
         const out = buf[32..][0..want_len];
-        if (decompressGzip(a, src, out)) |_| {
+        if (decompressGzip(src, out)) |_| {
             try testing.expectEqualSlices(u8, want, out);
             ok[k] = true;
         } else |_| ok[k] = false;
@@ -1229,7 +1309,7 @@ test "GZIP pages: both inflaters reject a member whose CRC-32 or length does not
         const out = try a.alloc(u8, data.len);
         for ([_]bool{ false, true }) |use_std| {
             setGzipStd(use_std);
-            try testing.expectError(error.DecompressionFailed, decompressGzip(a, z, out));
+            try testing.expectError(error.DecompressionFailed, decompressGzip(z, out));
         }
     }
 }
@@ -1265,10 +1345,10 @@ test "GZIP pages: every member is checked, empty ones and ones past the page's s
         for (cases) |case| {
             const out = try a.alloc(u8, case.out_len);
             if (case.ok) {
-                try decompressGzip(a, case.src, out);
+                try decompressGzip(case.src, out);
                 try testing.expectEqualStrings("abc"[0..case.out_len], out);
             } else {
-                try testing.expectError(error.DecompressionFailed, decompressGzip(a, case.src, out));
+                try testing.expectError(error.DecompressionFailed, decompressGzip(case.src, out));
             }
         }
     }

@@ -178,14 +178,15 @@ JSON (avg_state as `<name>__sum` / `<name>__count`).
 `count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
 opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
 is a ceiling on what an aggregate or a write holds at once: one budget (`src/core/memory.zig`) that the GROUP BY tables,
-decoded row groups, a local reader's read-ahead, the merge, the answer and its encoding, and a write's encoded output
-in flight all draw from before they allocate, whatever `-j` is. A fixed slack sits outside it: the binary, thread
-stacks, the mapped input, each worker's first 2 MiB of decode memory, 16 MiB for a GROUP BY's merge and answer past its
-tables, and a 32 MiB budget of its own for one decode, a refused query's last retry or a write's row group sliced on
-its writer. A query the budget refuses runs again on narrower paths (fast paths off, partitions, one worker, then
-small slices) and, if none fits, fails with an error rather than taking more memory. It also bounds a query's working
-memory on every path (aggregate, print, write, byte copy), over S3 and locally alike, so a scan larger than memory
-completes:
+decoded row groups, a local reader's read-ahead, the merge, the answer and its encoding, and a write's encoded output in
+flight all draw from before they allocate, whatever `-j` is. A fixed slack sits outside it: the binary, thread stacks,
+the mapped input, each worker's first 2 MiB of decode memory, each worker's codec state (about 0.1 MiB reading; writing,
+0.2 MiB more for snappy, 0.1 MiB for gzip, 1.3 MiB for zstd, or 3.5 MiB for zstd with `--compress-priority speed`),
+16 MiB for a GROUP BY's merge and answer past its tables, and a 32 MiB budget of its own for one decode, a refused
+query's last retry or a write's row group sliced on its writer. A query the budget refuses runs again on narrower paths
+(fast paths off, partitions, one worker, then small slices) and, if none fits, fails with an error rather than taking
+more memory. It also bounds a query's working memory on every path (aggregate, print, write, byte copy), over S3 and
+locally alike, so a scan larger than memory completes:
 - **Fetched bytes:** S3 inputs past a quarter of it (between 64 MiB and 1 GiB; `ZPQ_S3_WINDOW_KIB` sets it) are
   fetched just ahead of the readers and released behind them (Linux; elsewhere still up front). A print with
   `--limit` fetches row group by row group and stops once it has its rows.

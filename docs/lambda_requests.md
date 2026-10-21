@@ -22,6 +22,8 @@ the CLI flags of the same name.
 | `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
 | `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
 | `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
+| `row_group_size` | positive integer | As `--row-group-size`: rows per re-encoded output row group (default 1048576). |
+| `row_group_bytes` | positive number, or size string | As `--row-group-bytes`: uncompressed bytes per re-encoded output row group (default 128MB). A `max_memory` the request names caps it at a sixteenth of that. |
 
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them

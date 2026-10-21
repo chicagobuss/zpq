@@ -38,6 +38,8 @@ const Wire = struct {
     profile: ?std.json.Value = null,
     profile_url: ?std.json.Value = null,
     bloom_filters: ?std.json.Value = null,
+    row_group_size: ?std.json.Value = null,
+    row_group_bytes: ?std.json.Value = null,
 };
 
 pub const Request = struct {
@@ -73,6 +75,10 @@ pub const Request = struct {
     profile_url: ?[]const u8 = null,
     /// `bloom_filters`: `"col"` or `"col:fpp"` per written column, as the CLI's `--bloom-filter` takes them.
     bloom_filters: []const []const u8 = &.{},
+    /// `row_group_size` (rows) and `row_group_bytes` (a byte count or size string): as the CLI's
+    /// `--row-group-size` and `--row-group-bytes`; null for the defaults.
+    row_group_size: ?usize = null,
+    row_group_bytes: ?MaxMemory = null,
 
     pub const MaxMemory = union(enum) { bytes: usize, text: []const u8 };
 
@@ -100,6 +106,8 @@ pub const Request = struct {
                 "output_codec",
                 "compress_priority",
                 "bloom_filters",
+                "row_group_size",
+                "row_group_bytes",
             }) |name| {
                 if (@field(parsed.value, name)) |v| if (v != .null) {
                     bad_field.* = name;
@@ -153,6 +161,17 @@ pub const Request = struct {
             .float => |x| if (x >= 0 and x < 0x1p64) .{ .bytes = @intFromFloat(x) } else return f.bad("max_memory"),
             .string => |s| .{ .text = s },
             else => return f.bad("max_memory"),
+        };
+        if (parsed.value.row_group_size) |v| req.row_group_size = switch (v) {
+            .null => null,
+            .integer => |n| if (n > 0) @intCast(n) else return f.bad("row_group_size"),
+            else => return f.bad("row_group_size"),
+        };
+        if (parsed.value.row_group_bytes) |v| req.row_group_bytes = switch (v) {
+            .null => null,
+            .integer => |n| if (n > 0) .{ .bytes = @intCast(n) } else return f.bad("row_group_bytes"),
+            .string => |s| .{ .text = s },
+            else => return f.bad("row_group_bytes"),
         };
         if (parsed.value.max_result_bytes) |v| req.max_result_bytes = switch (v) {
             .null => null,

@@ -21,6 +21,8 @@ _arguments '*:file:_files' \
   '--profile[zpq option]' \
   '--profile-summary[zpq option]' \
   '--query[zpq option]' \
+  '--row-group-bytes[zpq option]' \
+  '--row-group-size[zpq option]' \
   '--scan-all[zpq option]' \
   '--select[zpq option]' \
   '--summary=json[zpq option]' \

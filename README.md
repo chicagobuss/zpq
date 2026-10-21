@@ -181,10 +181,9 @@ completes:
   `--limit` fetches row group by row group and stops once it has its rows.
 - **Decoded rows:** half of it is for decoded row groups, shared by the workers. A row group too big for a worker's
   share is decoded, filtered and aggregated, printed or written a slice of rows at a time, holding one page per
-  column beside the slice. A write then emits one output row group per slice: the file's contents are identical, but
-  for filtered or computed writes its row-group boundaries may depend on `--max-memory` (and `-j`, which divides it),
-  the same for the same values of both. A row group that cannot be sliced (a nested column) and does not fit is refused
-  (`RowGroupTooLarge`) before anything is decoded, rather than run out of memory.
+  column beside the slice; a slice the budget refuses is decoded again at half its rows. Slicing never changes what a
+  write writes (see "Output layout" below). A row group that cannot be sliced (a nested column) and does not fit is
+  refused (`RowGroupTooLarge`) before anything is decoded, rather than run out of memory.
 - **Output:** a write holds at most a quarter of it encoded and waiting. A row group whose rewrite could take more (a
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
@@ -229,8 +228,19 @@ to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); R
 arrays; DELTA_BINARY_PACKED for INT32 / INT64; for other strings DELTA_BYTE_ARRAY where values share long prefixes and
 DELTA_LENGTH_BYTE_ARRAY otherwise (PLAIN for FIXED_LEN_BYTE_ARRAY, which DELTA_LENGTH_BYTE_ARRAY does not allow).
 DECIMAL columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never
-a lossy detour through DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes
-currently omit them and readers fall back to row-group pruning.
+a lossy detour through DOUBLE). Direct projection copies preserve page indexes; re-encoded chunks get their own.
+
+**Output layout.** A write that re-encodes (a filter, `--select` or a computed column) cuts its row groups from the
+rows it writes, in order, not from the input's row groups: one closes once it holds `--row-group-size` rows (default
+1,048,576) or its values take `--row-group-bytes` (default 128 MiB) at their PLAIN size, a fixed-width value its
+width and a byte array 4 bytes plus its length. Each column chunk is split into data pages of at most 1 MiB of
+values or 20,000 rows, and gets a page index (ColumnIndex and OffsetIndex, written after the row groups, column by
+column). The bytes written depend only on the inputs and the options: the same file at every `-j`, on every machine.
+An explicit `--max-memory` caps row groups at a sixteenth of it, so there the file can depend on that value (never
+on `-j`). Holding a row group's decoded rows until it is encoded is the write's largest fixed cost: with the default
+budget a machine needs a few times `--row-group-bytes` of memory, or an explicit `--max-memory`. Plain copies and row
+groups a filter's statistics prove fully matching are copied as they are, keeping their source's row groups. Computed
+columns are evaluated only for the rows the filter keeps.
 
 `--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
 codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names

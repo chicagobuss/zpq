@@ -241,6 +241,18 @@ pub fn handle(
             .{},
         );
 
+        var row_group: engine.RowGroupTarget = .{};
+        if (req.row_group_size) |n| row_group.rows = n;
+        if (req.row_group_bytes) |b| row_group.bytes = switch (b) {
+            .bytes => |n| n,
+            .text => |t| zpq.core.system.parseSizeString(t) catch 0,
+        };
+        if (row_group.bytes == 0) return std.fmt.allocPrint(
+            allocator,
+            "{{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"row_group_bytes\"}}",
+            .{},
+        );
+
         const bloom_filters = try allocator.alloc(engine.BloomSpec, req.bloom_filters.len);
         defer allocator.free(bloom_filters);
         for (req.bloom_filters, bloom_filters) |text, *spec| spec.* = engine.BloomSpec.parse(text) catch
@@ -301,6 +313,8 @@ pub fn handle(
             .trust_stats = req.trust_stats,
             .unordered = req.unordered,
             .max_memory = if (profiler != null) budget -| prof_opts.reservedBytes() else budget,
+            .max_memory_explicit = max_memory,
+            .row_group = row_group,
             .group_by = req.group_by,
             .column_order = req.column_order,
             .bloom_filters = bloom_filters,

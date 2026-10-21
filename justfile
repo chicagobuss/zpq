@@ -98,7 +98,7 @@ test *args="":
     zig build test --summary all -- {{args}}
 
 # Tier 2 — run before every commit.
-check: test-modules test test-integration smoke duckdb-smoke differential private-decode-check libzpq
+check: test-modules test test-integration smoke duckdb-smoke differential write-layout-check private-decode-check libzpq
 
 # Static guard for Zig's lazy test discovery. Every src file containing a
 # top-level test must be directly rooted by one of the two test artifacts.
@@ -329,3 +329,9 @@ clean:
 # builds need no network (a normal build fetches them into .zig-cache itself).
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
+
+# Re-encoding writes: bytes the same at every -j, explicit budgets at every codec (T9/T10), row-group and page
+# targets, and every page index checked against its values.
+write-layout-check:
+    zig build -Doptimize=ReleaseFast
+    {{python}} tools/write_layout_check.py

@@ -5,7 +5,8 @@ usage:
             [--aggregate "AGG(...) [FILTER (WHERE ...)] [AS name], ..."]
             [--group-by "EXPR [AS name], ..."] [--column-order COL1,COL2,...]
             [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
-            [--threads N | -j N]
+            [--row-group-size ROWS] [--row-group-bytes SIZE]
+            [--threads N | -j N] [--max-memory SIZE]
             [--compress-priority size|speed]
             [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
             [--bloom-filter COL[:FPP] ...]
@@ -53,6 +54,15 @@ usage:
                  uses, or "MIXED" when a copy keeps several. Text has null.
                  `lz4` and `lz4_raw` both write LZ4_RAW; zpq reads the
                  deprecated LZ4 codec but never compresses to it.
+  --row-group-size, --row-group-bytes
+                 where a re-encoding write (a filter, --select or a
+                 computed column) cuts its output row groups: once
+                 one holds ROWS rows (default 1048576) or its values
+                 take SIZE bytes uncompressed (default 128MB), from
+                 the rows written alone, not the input's row groups,
+                 -j or memory. Data pages close at 1 MiB or 20,000
+                 rows, and each gets a page index entry. A plain copy
+                 keeps its input's row groups.
   --compress-priority
                  how hard zstd works. `size` (default): level 3 for
                  every page. `speed`: each page stored raw, as
@@ -83,7 +93,9 @@ usage:
                  to run. By default groups come in the order they
                  first appear in the input and the same bits come out
                  at every -j.
-  --max-memory   ceiling on what an aggregate or a write holds at once:
+  --max-memory   SIZE such as 500MB or 2GB (default: most of the memory
+                 available). A ceiling on what an aggregate or a
+                 write holds at once:
                  GROUP BY tables, decoded row groups, read-ahead,
                  merge and answer, encoded output waiting to be
                  written, all drawn from one budget whatever -j is.
@@ -93,9 +105,9 @@ usage:
                  last retry's or a sliced write's decode. A query
                  that does not fit runs again on narrower paths (one
                  worker, smaller slices) and else fails with an error,
-                 never more memory. Output contents are identical;
-                 row-group boundaries may depend on --max-memory (and
-                 -j) for filtered or computed writes.
+                 never more memory. Written bytes never depend on -j;
+                 an explicit --max-memory caps re-encoded row groups
+                 at a sixteenth of it, so they may depend on its value.
   --explain      print an aggregate plan as JSON using only file footers;
                  accepts SQL or --aggregate / --group-by, then exits.
   --profile      write a Chrome Trace Event JSON trace of the query

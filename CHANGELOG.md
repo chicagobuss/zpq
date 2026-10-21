@@ -27,6 +27,12 @@ shell-completion and man-page packaging.
 5. **Expect GROUP BY rows in a different order.** Groups now come in the order they first appear in the input, at
    every `-j`; 0.4.1 sorted them by their serialized key bytes. Add `ORDER BY` if you need an order.
 6. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141.
+7. **Expect a different layout in files zpq re-encodes** (any filter, `--select` or computed column). Output row
+   groups no longer follow the input's: they hold up to 1,048,576 rows or 128 MiB of uncompressed values
+   (`--row-group-size`, `--row-group-bytes`), so a selective filter over many small row groups writes a few large
+   ones. Chunks are split into data pages of at most 1 MiB or 20,000 rows, with a page index. The bytes written depend
+   only on the input and the options, never on `-j` or the machine's memory; an explicit `--max-memory` caps row
+   groups at a sixteenth of it. Plain copies keep their input's row groups.
 
 ### Highlights
 
@@ -301,8 +307,29 @@ client of the C ABI can do the same.
 - A page whose V2 header miscounts its nulls is read by its levels, as other readers do.
 
 **Writes**
-- With a `--max-memory` that binds, a filtered or computed write may emit one output row group per slice: contents
-  are identical, row-group boundaries depend on `--max-memory` and `-j`.
+- A re-encoding write (any filter, `--select` or computed column) cuts its output into row groups by a target, not
+  by the input's row groups: a row group closes once it holds 1,048,576 rows or its values take 128 MiB at their PLAIN
+  size (a fixed-width value its width, a byte array 4 bytes plus its length, NULLs nothing). `--row-group-size` and
+  `--row-group-bytes` (the requests' `row_group_size` and `row_group_bytes`) set them. Rows from several input row
+  groups and files fill one output row group, and one input row group can span two. 0.4.1 wrote one output row group
+  per input row group (400 tiny row groups for a 1% filter over 400 inputs); pyarrow writes 1,048,576 rows too.
+  Row groups byte-copied whole by a filter that statistics prove matches them still go as they came, closing the
+  re-encoded row group before them. A Parquet answer with `--limit`, `OFFSET` or `ORDER BY` is cut the same way; it
+  was one row group per batch read.
+- The written bytes depend only on the input and the options: the same file at every `-j`, on every machine, at any
+  default budget. An explicit `--max-memory` (or a request's `max_memory`) caps re-encoded row groups at a sixteenth
+  of it, so the file may depend on that value, never on `-j`. In 0.4.1 and the 0.5.0 release candidate, a row group
+  too big for its worker was written one output row group per slice, sliced by `-j` and by the machine's memory.
+- Every re-encoded column chunk is split into data pages that close at 1 MiB of PLAIN values or 20,000 rows (the
+  pyarrow and parquet-mr defaults), and gets a page index: per page, its offset and first row (OffsetIndex) and its
+  bounds, null count, NaN count and boundary order (ColumnIndex), written after the row groups column by column.
+  0.4.1 wrote one data page per chunk and no page index on a filtered write. A dictionary chunk keeps one dictionary
+  page.
+- Computed `--select` columns are evaluated only for the rows the filter keeps. They used to be computed for every
+  row of the row group and then filtered.
+- A budget shortfall while decoding a large row group retries smaller slices, down to one row, before the write is
+  refused. `-j 1` used to refuse budgets that `-j 16` met (a row group sliced by the size of its first 64 rows), and
+  SNAPPY and GZIP reported the refusal as `CompressionFailed`, which skipped every retry.
 - Written float statistics leave NaN out of min/max and write zero bounds as `-0.0`/`+0.0`. Every FLOAT and DOUBLE
   chunk zpq encodes gets a `nan_count`, and its page index gets per-page `nan_counts`, so readers can prune it
   exactly. `total_byte_size` is the uncompressed size. Byte-copied chunks keep their source's statistics, and no NaN
@@ -391,7 +418,11 @@ A parallel Top-N that does not fit runs on the serial path, which holds its kept
 
 **Slicing large row groups.** A row group too big for a worker's share is decoded, filtered and aggregated, printed or
 written a slice of rows at a time. One that cannot be sliced (a nested column) is refused with `RowGroupTooLarge`
-before it decodes. A write whose row group does not fit beside its producers hands it to the writer, which slices it.
+before it decodes. A write whose row group does not fit beside its producers hands it to the writer, which slices it;
+the slices never show in the output, whose row groups are cut from the rows alone. A slice the budget refuses is
+decoded again at half its rows. A re-encoding write also holds the rows of one output row group, decoded, until it
+is encoded, so a budget below about four times `--row-group-bytes` can refuse it unless `--max-memory` is given
+explicitly (which shrinks the row groups to fit).
 
 **S3 read-ahead.** S3 inputs are fetched just ahead of the readers and released behind them (Linux), in a window of a
 quarter of the budget, clamped to 64 MiB–1 GiB (at most 128 MiB on Lambda; `ZPQ_S3_WINDOW_KIB` overrides it).
@@ -536,7 +567,6 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
   libzpq host.
 - A high-cardinality GROUP BY just inside a cgroup's default budget can take many times longer than with headroom.
   It retries narrower paths before the one that fits.
-- Windowed filter and re-encode writes omit page indexes, so readers fall back to row-group pruning.
 - A filtered or limited Parquet write refuses nested leaves and INT96 (`INT96 re-encoding is not supported yet`); a
   plain copy keeps both.
 

@@ -55,6 +55,7 @@ fn wantsJsonSummary(args: std.process.Args) bool {
             "--output",       "-o",       "--filter", "-f",         "--columns",      "-c",                  "--select",  "-s",
             "--aggregate",    "-a",       "--query",  "-q",         "--codec",        "--compress-priority", "--threads", "-j",
             "--bloom-filter", "--format", "--limit",  "--group-by", "--column-order", "--max-memory",        "--profile",
+            "--row-group-size", "--row-group-bytes",
         };
         for (values) |flag| if (std.mem.eql(u8, a, flag)) {
             _ = it.next();
@@ -203,6 +204,7 @@ fn runQuery(
     var summary = false;
     var limit: ?usize = null;
     var max_memory: ?usize = null;
+    var row_group: engine.RowGroupTarget = .{};
     var group_by: ?[]const u8 = null;
     var select_cols: ?[]const zpq.core.expr.ast.SelectColumn = null;
     var result_order: zpq.core.expr.ast.ResultOrder = .{};
@@ -355,6 +357,26 @@ fn runQuery(
                 diagnosticPrint("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--row-group-size")) {
+            const v = iter.next() orelse {
+                diagnosticPrint("zpq query: --row-group-size requires a value\n", .{});
+                return error.BadArgs;
+            };
+            row_group.rows = std.fmt.parseInt(usize, v, 10) catch 0;
+            if (row_group.rows == 0) {
+                diagnosticPrint("zpq query: invalid --row-group-size: {s} (a positive number of rows)\n", .{v});
+                return error.BadArgs;
+            }
+        } else if (std.mem.eql(u8, tok, "--row-group-bytes")) {
+            const v = iter.next() orelse {
+                diagnosticPrint("zpq query: --row-group-bytes requires a value\n", .{});
+                return error.BadArgs;
+            };
+            row_group.bytes = zpq.core.system.parseSizeString(v) catch 0;
+            if (row_group.bytes == 0) {
+                diagnosticPrint("zpq query: invalid --row-group-bytes: {s} (examples: 64MB, 1GB)\n", .{v});
+                return error.BadArgs;
+            }
         } else if (std.mem.eql(u8, tok, "--profile")) {
             profile_out.trace_path = iter.next() orelse {
                 diagnosticPrint("zpq query: --profile requires a path\n", .{});
@@ -555,6 +577,8 @@ fn runQuery(
         .fast_levels = fast_levels,
         .unordered = unordered,
         .max_memory = engine_max_mem,
+        .max_memory_explicit = max_memory,
+        .row_group = row_group,
         .group_by = group_by,
         .select_cols = select_cols,
         .result_order = result_order,

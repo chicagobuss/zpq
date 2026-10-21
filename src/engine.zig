@@ -55,6 +55,8 @@ const nanprobe = @import("core/filter/nanprobe.zig");
 const sbbf = @import("core/parquet/bloom.zig");
 const streaming = @import("core/writer/streaming.zig");
 const fastpath = @import("core/writer/fastpath.zig");
+const encoder = @import("core/writer/encoder.zig");
+const page_index = @import("core/writer/page_index.zig");
 
 const s3 = @import("io/s3.zig");
 const s3_window = @import("io/s3_window.zig");
@@ -317,6 +319,11 @@ pub const QueryArgs = struct {
     /// When set, receives the high-water of footer bytes charged to the resident budget.
     footer_resident_peak: ?*u64 = null,
     max_memory: usize = 512 * 1024 * 1024,
+    /// The `--max-memory` the caller set, when it set one: a write's row groups shrink to fit it
+    /// (`RowGroupTarget.under`). A budget the engine chose itself never changes what is written.
+    max_memory_explicit: ?usize = null,
+    /// Where a re-encoding write cuts its output row groups (`--row-group-size`, `--row-group-bytes`).
+    row_group: RowGroupTarget = .{},
     /// Records the query's spans when set (`--profile`, the Lambda's `"profile"`); see `profile.zig`.
     profiler: ?*profile.Profiler = null,
     /// Output columns to write split-block Bloom filters for (`--bloom-filter`). A copied chunk keeps the filter it
@@ -999,15 +1006,36 @@ fn skipRowGroup(in: scan.Input, rg: usize) void {
 }
 
 const EncodedRG = struct {
-    bytes: []u8 = &.{}, // encoded RG bytes (gpa-owned; writer frees after sink.write)
-    rg: ?schema.RowGroup = null, // footer meta, offsets relative to 0 (meta_arena-owned)
-    /// Too big for a producer to decode at once: the writer re-encodes it a slice at a time straight into the sink in
-    /// its turn (`encodeRGSliced`), and releases its input after.
+    bytes: []u8 = &.{}, // a byte-copied RG's bytes (gpa-owned; writer frees after sink.write)
+    rg: ?schema.RowGroup = null, // its footer meta, offsets relative to 0 (meta_arena-owned)
+    /// A re-encoded row group's kept rows, decoded, for the writer to cut into output row groups.
+    piece: ?*Piece = null,
+    /// Too big for a producer to decode at once: the writer decodes it a slice at a time in its turn
+    /// (`projectRGSliced`), and releases its input after.
     deferred: bool = false,
     surviving: i64 = 0,
     err: ?anyerror = null,
     /// The producer's decode/eval/encode time for this row group, summed by the writer.
     timings: consumer.Timings = .{},
+};
+
+/// Rows kept from an input row group (or a slice of one), decoded and projected, waiting for the writer to cut them
+/// into output row groups (`Assembler`). Where pieces start and end never shows in the output: only the rows do.
+const Piece = struct {
+    agg: consumer.OutputAggregator,
+    /// Holds `agg`'s rows, on the write's ledger; the writer frees it once the last of them is written.
+    arena: std.heap.ArenaAllocator,
+
+    fn create(gpa: std.mem.Allocator, rows_alloc: std.mem.Allocator) !*Piece {
+        const p = try gpa.create(Piece);
+        p.* = .{ .agg = undefined, .arena = .init(rows_alloc) };
+        return p;
+    }
+
+    fn destroy(p: *Piece, gpa: std.mem.Allocator) void {
+        p.arena.deinit();
+        gpa.destroy(p);
+    }
 };
 
 const Slot = struct {
@@ -1019,38 +1047,34 @@ const Slot = struct {
     done: std.atomic.Value(bool) = .init(false),
 };
 
-/// Encode one row group into a gpa-owned byte buffer with offsets relative to
-/// 0; footer metadata is allocated on `meta_alloc` (the slot's private arena).
-/// The working memory is `regions`, emptied again before returning.
-fn encodeRGToBuffer(
+/// Decode, filter and project one row group into a piece: its kept rows, decoded, on `rows_alloc`. The working memory
+/// is `regions`, emptied again before returning.
+fn projectRGToPiece(
     gpa: std.mem.Allocator,
-    meta_alloc: std.mem.Allocator,
+    rows_alloc: std.mem.Allocator,
     regions: *WorkRegions,
     job: RGJob,
     filter: ?filter_ast.Filter,
     fetch_arr: []const bool,
     output_specs: []const consumer.OutputCol,
-    codec: schema.CompressionCodec,
-    zstd: compression.ZstdPlan,
     decode_options: consumer.DecodeOptions,
     prof: ?*profile.Thread,
-    bloom: consumer.BloomWrite,
-    diag: ?*Diag,
 ) !EncodedRG {
-    // `rows` holds what lives for the whole row group (the aggregator's frame, the filter's columns and selection);
-    // each output column is projected, encoded and written out of `work`, rewound before the next, so the working
-    // set is one column rather than the row group (whose first touch, on every producer, is page faults).
+    // `rows` holds what lives for the whole row group (the filter's columns and selection); each output column is
+    // decoded on `work`, rewound before the next, so the working set is one column rather than the row group.
     const work_region = &regions.work;
     defer work_region.rewind();
     defer regions.rows.rewind();
     var scratch = std.heap.ArenaAllocator.init(regions.rows.allocator());
     defer scratch.deinit();
     var timings: consumer.Timings = .{ .prof = prof };
-    var agg = try consumer.initOutputAggregator(scratch.allocator(), job.meta, output_specs);
-    agg.keep_codes = true;
+    const piece = try Piece.create(gpa, rows_alloc);
+    errdefer piece.destroy(gpa);
+    piece.agg = try consumer.initOutputAggregator(piece.arena.allocator(), job.meta, output_specs);
+    piece.agg.keep_codes = true;
     var projected: consumer.ProjectedRG = undefined;
     try projected.init(
-        &agg,
+        &piece.agg,
         scratch.allocator(),
         job.rg,
         job.meta,
@@ -1062,63 +1086,21 @@ fn encodeRGToBuffer(
         decode_options,
     );
     defer projected.deinit();
-    // The output waits here for its turn at the sink, so every row group's is fresh memory: in huge pages, a fault per
-    // 2 MiB rather than per 4 KiB. Freed by the writer through `gpa`, to which the advisor forwards frees.
-    var advisor: huge_pages.HugePageAdvisor = .{ .child = gpa };
-    const out_gpa = advisor.allocator();
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(out_gpa);
-    var bufsink = BufSink{ .buf = &buf, .gpa = out_gpa };
-    const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
-    var local_off: u64 = 0;
-    var rg_enc: consumer.RGEncoder = .{
-        .out_arena = meta_alloc,
-        .sink = sink,
-        .out_offset = &local_off,
-        .codec = codec,
-        .zstd = zstd,
-        .bloom_write = bloom,
-        .timings = &timings,
+    if (projected.surviving > 0) for (0..output_specs.len) |i| {
+        work_region.rewind();
+        var col_arena = std.heap.ArenaAllocator.init(work_region.allocator());
+        defer col_arena.deinit();
+        const span = profile.Span.begin(prof);
+        try projected.projectColumn(&piece.agg, i, col_arena.allocator(), &timings);
+        span.end(.project, profile.args(.{ projected.surviving, 1 }));
     };
-    if (projected.surviving > 0) {
-        // The output is about as big as the compressed chunks it comes from: reserve that once rather than growing
-        // the buffer by doubling (each step a copy, and fresh pages to fault).
-        var estimate: usize = 0;
-        for (job.rg.columns.items, 0..) |cc, ci| {
-            const m = cc.meta_data orelse continue;
-            if (ci < fetch_arr.len and fetch_arr[ci]) estimate += @intCast(@max(0, m.total_compressed_size));
-        }
-        try buf.ensureTotalCapacity(out_gpa, estimate);
-        agg.num_rows = projected.surviving;
-        for (0..output_specs.len) |i| {
-            work_region.rewind();
-            var col_arena = std.heap.ArenaAllocator.init(work_region.allocator());
-            defer col_arena.deinit();
-            agg.arena = col_arena.allocator();
-            const span = profile.Span.begin(prof);
-            try projected.projectColumn(&agg, i, col_arena.allocator(), &timings);
-            span.end(.project, profile.args(.{ projected.surviving, 1 }));
-            rg_enc.column(&agg, i, col_arena.allocator()) catch |err| {
-                if (err == error.DecimalValueExceedsPrecision) {
-                    Diag.setColumn(diag, agg.schema_elems[i].name);
-                }
-                return err;
-            };
-            // Its rows lived on `col_arena`: nothing may read them after this.
-            agg.cols[i] = switch (agg.cols[i]) {
-                inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
-            };
-        }
-    }
-    const out = rg_enc.finish(projected.surviving);
-    const owned = try buf.toOwnedSlice(out_gpa);
+    piece.agg.num_rows = projected.surviving;
     timings.prof = null;
-    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
+    return .{ .piece = piece, .surviving = @intCast(projected.surviving), .timings = timings };
 }
 
 /// Byte-copy a fully-passing row group's kept columns into a buffer (no decode
-/// or re-encode) — the filter fast path. Same buffer/relative-offset shape as
-/// `encodeRGToBuffer` so the windowed writer places it identically.
+/// or re-encode) — the filter fast path. Offsets are relative to the buffer; the writer places it.
 fn copyRGToBuffer(
     gpa: std.mem.Allocator,
     meta_alloc: std.mem.Allocator,
@@ -1144,6 +1126,330 @@ fn copyRGToBuffer(
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
 }
 
+/// What output row groups are cut at: a row group is closed once it holds `rows` rows or its rows' PLAIN values take
+/// `bytes` bytes (`consumer.plainBits`), whichever comes first. Both come from the query's options alone, so the
+/// layout depends only on the rows written: never on `-j`, the machine's memory, timing, or the input's row groups.
+pub const RowGroupTarget = struct {
+    rows: usize = default_row_group_rows,
+    bytes: u64 = default_row_group_bytes,
+
+    /// The target under an explicit `--max-memory`: row groups no bigger than a sixteenth of it, so the rows held
+    /// for one and its encoding fit beside the decoding the rest of the budget is for.
+    pub fn under(self: RowGroupTarget, max_memory: ?usize) RowGroupTarget {
+        var t = self;
+        if (max_memory) |m| t.bytes = @max(1, @min(t.bytes, @as(u64, m) / 16));
+        return t;
+    }
+};
+
+/// 2^20 rows, the row group pyarrow writes, and a byte cap that holds a wide row group to what one writer can buffer
+/// decoded and encode without the row cap's 1M rows of a hundred columns (DuckDB and Spark cap theirs by bytes too).
+pub const default_row_group_rows: usize = 1 << 20;
+pub const default_row_group_bytes: u64 = 128 << 20;
+
+/// The writer's cutter: takes pieces in input order, holds their rows until an output row group's worth is in, then
+/// encodes and writes it. A piece may end one row group and start the next.
+const Assembler = struct {
+    w: *WinCtx,
+    target: RowGroupTarget,
+    ranges: std.ArrayListUnmanaged(Range) = .empty,
+    rows: usize = 0,
+    bits: u64 = 0,
+    /// Pieces whose rows are all in `ranges`, freed once those are written.
+    done: std.ArrayListUnmanaged(*Piece) = .empty,
+    /// The writer's working memory between row groups (ranges, joined columns, encodings).
+    scratch: std.heap.ArenaAllocator,
+
+    /// The piece being fed, until all its rows are in `ranges` (it is then in `done`).
+    current: ?*Piece = null,
+
+    const Range = struct { piece: *Piece, lo: usize, hi: usize };
+
+    fn init(w: *WinCtx) Assembler {
+        return .{ .w = w, .target = w.rg_target, .scratch = .init(w.encode_pages.allocator()) };
+    }
+
+    fn deinit(a: *Assembler) void {
+        for (a.done.items) |p| p.destroy(a.w.gpa);
+        if (a.current) |p| p.destroy(a.w.gpa);
+        a.ranges.deinit(a.w.gpa);
+        a.done.deinit(a.w.gpa);
+        a.scratch.deinit();
+    }
+
+    fn bitsOf(p: *const Piece, lo: usize, hi: usize) u64 {
+        var bits: u64 = 0;
+        for (p.agg.cols, p.agg.schema_elems) |*c, *e| bits += consumer.plainBits(c, e, lo, hi);
+        return bits;
+    }
+
+    /// Take `p`'s rows, writing every row group they complete. The assembler owns `p` from here.
+    fn feed(a: *Assembler, p: *Piece) !void {
+        std.debug.assert(a.current == null);
+        const n = p.agg.num_rows;
+        if (n == 0) {
+            p.destroy(a.w.gpa);
+            return;
+        }
+        a.current = p;
+        const target_bits = a.target.bytes *| 8;
+        var lo: usize = 0;
+        while (lo < n) {
+            var hi = @min(n, lo + (a.target.rows - a.rows));
+            var bits = bitsOf(p, lo, hi);
+            const room = target_bits -| a.bits;
+            if (bits >= room) {
+                // The row that reaches the byte target closes the row group.
+                hi = lo;
+                bits = 0;
+                while (hi < n) {
+                    bits += bitsOf(p, hi, hi + 1);
+                    hi += 1;
+                    if (bits >= room) break;
+                }
+            }
+            try a.ranges.append(a.w.gpa, .{ .piece = p, .lo = lo, .hi = hi });
+            if (hi == n) {
+                try a.done.append(a.w.gpa, p);
+                a.current = null;
+            }
+            a.rows += hi - lo;
+            a.bits += bits;
+            lo = hi;
+            if (a.rows >= a.target.rows or a.bits >= target_bits) try a.flush();
+        }
+    }
+
+    /// Encode and write the rows held as one output row group, then free the pieces they finish.
+    fn flush(a: *Assembler) !void {
+        if (a.rows == 0) return;
+        defer {
+            for (a.done.items) |p| p.destroy(a.w.gpa);
+            a.done.clearRetainingCapacity();
+            a.ranges.clearRetainingCapacity();
+            a.rows = 0;
+            a.bits = 0;
+            _ = a.scratch.reset(.retain_capacity);
+        }
+        const w = a.w;
+        const sa = a.scratch.allocator();
+        const n_cols = w.out_elems.len;
+        const cols = try sa.alloc(filter_eval.Batch.Column, n_cols);
+        const parts = try sa.alloc(consumer.BufRange, a.ranges.items.len);
+        for (cols, 0..) |*c, i| {
+            for (a.ranges.items, parts) |r, *part| part.* = .{ .buf = &r.piece.agg.cols[i], .lo = r.lo, .hi = r.hi };
+            c.* = try consumer.joinRows(sa, parts);
+        }
+        const rg_index = w.new_row_groups.items.len;
+        var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        try columns.ensureTotalCapacity(w.arena, n_cols);
+        var total: i64 = 0;
+        try encodeRowGroup(w, cols, &columns, &total, rg_index);
+        try w.new_row_groups.append(w.arena, .{
+            .columns = columns,
+            .total_byte_size = total,
+            .num_rows = @intCast(a.rows),
+        });
+        w.rows_kept += @intCast(a.rows);
+        w.rgs_kept += 1;
+    }
+};
+
+/// The encode estimate the hashagg answer writer charges a column by: three times its values and levels (a dictionary
+/// attempt's table and indices, the pages, their compressed copies).
+fn encodeCharge(col: filter_eval.Batch.Column) u64 {
+    const bytes: u64 = switch (col) {
+        inline else => |c| blk: {
+            const T = @typeInfo(@TypeOf(c.values)).pointer.child;
+            var n: u64 = c.rowCount() * @sizeOf(T);
+            if (T == []const u8) {
+                if (c.codes) |k| {
+                    for (k) |code| n += c.dict[code].len;
+                } else for (c.values) |v| n += v.len;
+            }
+            break :blk n + if (c.def_levels) |d| d.len * @sizeOf(u32) else 0;
+        },
+    };
+    return bytes *| 3;
+}
+
+/// One encode helper's share of a row group being encoded: the columns' plans, then their pages, claimed from shared
+/// cursors, each on the helper's own arena.
+const EncodeTask = struct {
+    shared: *Shared,
+    arena: std.heap.ArenaAllocator,
+    err: ?anyerror = null,
+
+    const Shared = struct {
+        inputs: []const encoder.ColumnInput,
+        plans: []encoder.Plan,
+        pages: [][]encoder.BuiltPage,
+        /// (column, page) pairs of the wave, in column then page order.
+        work: []const [2]u32 = &.{},
+        phase: enum { plan, pages } = .plan,
+        cursor: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+    };
+
+    fn run(t: *EncodeTask) void {
+        const s = t.shared;
+        const a = t.arena.allocator();
+        while (!s.failed.load(.monotonic)) {
+            const i = s.cursor.fetchAdd(1, .monotonic);
+            switch (s.phase) {
+                .plan => {
+                    if (i >= s.inputs.len) return;
+                    s.plans[i] = encoder.plan(a, s.inputs[i]) catch |e| return t.fail(e);
+                },
+                .pages => {
+                    if (i >= s.work.len) return;
+                    const cp = s.work[i];
+                    s.pages[cp[0]][cp[1]] = s.plans[cp[0]].page(a, cp[1]) catch |e| return t.fail(e);
+                },
+            }
+        }
+    }
+
+    fn fail(t: *EncodeTask, e: anyerror) void {
+        t.err = e;
+        t.shared.failed.store(true, .monotonic);
+    }
+};
+
+/// Encode an output row group's columns and write them in order at the sink's offset, their page indexes recorded for
+/// the end of the file. Columns go in waves, as many at once as the ledger admits (`encodeCharge`; a column alone is
+/// always admitted); within a wave the columns plan on the writer's helpers, then every page of every column builds
+/// on them, so a row group of few columns still uses every helper. The bytes are the ones one thread would write.
+fn encodeRowGroup(
+    w: *WinCtx,
+    cols: []const filter_eval.Batch.Column,
+    columns: *std.ArrayListUnmanaged(schema.ColumnChunk),
+    total: *i64,
+    rg_index: usize,
+) !void {
+    const elems = w.out_elems;
+    const prof = profile.threadOf(w.profiler, .writer);
+    const t0 = nowMonoNs();
+    defer {
+        const t1 = nowMonoNs();
+        w.core.encode_ns += @intCast(t1 - t0);
+        profile.record(prof, .encode, t0, t1, profile.args(.{ cols.len, valueRows(cols) }));
+    }
+    var inputs = try w.gpa.alloc(encoder.ColumnInput, cols.len);
+    defer w.gpa.free(inputs);
+    for (cols, 0..) |c, i| inputs[i] = .{
+        .values = c,
+        .schema_elem = &elems[i],
+        .path_in_schema = w.out_paths[i],
+        .codec = w.codec,
+        .zstd = w.zstd,
+        .bloom_fpp = if (i < w.bloom_outputs.len) w.bloom_outputs[i] else null,
+    };
+    // Helpers: the CPU budget's threads producers never get (there are fewer of them when the input has few row
+    // groups), and the producers' turns the writer holds while it slices, else those no producer holds now; never more
+    // than the CPU budget in all.
+    const spare = w.cpu_budget -| w.producers;
+    const taken = if (w.writer_turns > 0) 0 else takePermits(&w.cpu, w.io, w.producers);
+    defer for (0..taken) |_| w.cpu.post(w.io);
+    const helpers = @max(1, spare + if (w.writer_turns > 0) w.writer_turns else taken);
+    const tasks = try w.gpa.alloc(EncodeTask, helpers);
+    defer w.gpa.free(tasks);
+    var shared: EncodeTask.Shared = .{ .inputs = &.{}, .plans = &.{}, .pages = &.{} };
+    for (tasks) |*t| t.* = .{ .shared = &shared, .arena = .init(w.encode_pages.allocator()) };
+    defer for (tasks) |*t| t.arena.deinit();
+    const ledger: ?*core_memory.SharedBudget = if (w.memory) |m| m.budget else null;
+
+    var lo: usize = 0;
+    while (lo < cols.len) {
+        // A wave: the next columns the ledger admits together, at least one.
+        var hi = lo + 1;
+        var charge = encodeCharge(cols[lo]);
+        while (hi < cols.len and hi - lo < 4 * helpers) : (hi += 1) {
+            const c = encodeCharge(cols[hi]);
+            if (ledger) |l| if (charge +| c > l.available()) break;
+            charge +|= c;
+        }
+        if (ledger) |l| if (l.drawExact(charge) == null) l.force(charge);
+        defer if (ledger) |l| l.release(charge);
+        defer for (tasks) |*t| {
+            _ = t.arena.reset(.retain_capacity);
+        };
+        const wave_inputs = inputs[lo..hi];
+        const plans = try w.gpa.alloc(encoder.Plan, wave_inputs.len);
+        defer w.gpa.free(plans);
+        const pages = try w.gpa.alloc([]encoder.BuiltPage, wave_inputs.len);
+        defer w.gpa.free(pages);
+        shared = .{ .inputs = wave_inputs, .plans = plans, .pages = pages };
+        try runEncodeTasks(tasks);
+        var n_work: usize = 0;
+        for (plans, pages) |*p, *pg| {
+            pg.* = try w.gpa.alloc(encoder.BuiltPage, p.pageCount());
+            n_work += p.pageCount();
+        }
+        defer for (pages) |pg| w.gpa.free(pg);
+        const work = try w.gpa.alloc([2]u32, n_work);
+        defer w.gpa.free(work);
+        var k: usize = 0;
+        for (plans, 0..) |*p, ci| for (0..p.pageCount()) |pi| {
+            work[k] = .{ @intCast(ci), @intCast(pi) };
+            k += 1;
+        };
+        shared.work = work;
+        shared.phase = .pages;
+        shared.cursor.store(0, .monotonic);
+        try runEncodeTasks(tasks);
+        // Laid out and written in column order, on the writer.
+        var col_arena = std.heap.ArenaAllocator.init(w.encode_pages.allocator());
+        defer col_arena.deinit();
+        for (plans, pages, lo..) |*p, pg, ci| {
+            _ = col_arena.reset(.retain_capacity);
+            const chunk_span = profile.Span.begin(prof);
+            const enc = p.finish(col_arena.allocator(), pg) catch |e| {
+                if (e == error.DecimalValueExceedsPrecision) Diag.setColumn(w.diag, elems[ci].name);
+                return e;
+            };
+            const t_sink = nowMonoNs();
+            const placed = try consumer.placeChunk(w.arena, w.sink, &w.out_offset, enc);
+            const t_sunk = nowMonoNs();
+            w.sink_ns += @intCast(t_sunk - t_sink);
+            profile.record(prof, .sink_write, t_sink, t_sunk, profile.args(.{enc.bytes.len}));
+            chunk_span.end(.encode_chunk, profile.args(.{
+                ci, w.codec, enc.meta.total_uncompressed_size, enc.meta.total_compressed_size, enc.meta.num_values,
+            }));
+            columns.appendAssumeCapacity(placed.chunk);
+            total.* += enc.meta.total_uncompressed_size;
+            try w.page_indexes.add(w.arena, rg_index, ci, placed.pages, &elems[ci]);
+        }
+        lo = hi;
+    }
+}
+
+fn valueRows(cols: []const filter_eval.Batch.Column) usize {
+    if (cols.len == 0) return 0;
+    return switch (cols[0]) {
+        inline else => |c| c.rowCount(),
+    };
+}
+
+/// Run `tasks` (one already running thread's worth each) to the end of the shared phase, on threads; the first
+/// error any hit. A thread that fails to start leaves its share to the ones that did.
+fn runEncodeTasks(tasks: []EncodeTask) !void {
+    tasks[0].shared.failed.store(false, .monotonic);
+    for (tasks) |*t| t.err = null;
+    if (tasks.len == 1 or !spawn_util.runTree(EncodeTask, tasks, .{ .stack_size = 1 << 20 }, EncodeTask.run))
+        EncodeTask.run(&tasks[0]);
+    for (tasks) |t| if (t.err) |e| return e;
+}
+
+/// Take up to `max` permits `s` has free now, without waiting.
+fn takePermits(s: *std.Io.Semaphore, io: std.Io, max: usize) usize {
+    s.mutex.lockUncancelable(io);
+    defer s.mutex.unlock(io);
+    const n = @min(max, s.permits);
+    s.permits -= n;
+    return n;
+}
+
 const WinCtx = struct {
     const writer = winWriter;
     const producer = winProducer;
@@ -1158,6 +1464,13 @@ const WinCtx = struct {
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan = .{},
     decode_options: consumer.DecodeOptions,
+    /// Where output row groups are cut (`RowGroupTarget`).
+    rg_target: RowGroupTarget = .{},
+    /// The output columns' schema leaves and paths, as every piece's aggregator has them.
+    out_elems: []const schema.SchemaElement = &.{},
+    out_paths: []const []const []const u8 = &.{},
+    /// Producer turns the writer holds while it slices a row group alone (its encode helpers then).
+    writer_turns: usize = 0,
     /// The Bloom filters asked for: per output column for re-encoded row groups, per source leaf for copied ones.
     bloom_outputs: []const ?f64 = &.{},
     bloom_leaves: []const ?f64 = &.{},
@@ -1170,12 +1483,16 @@ const WinCtx = struct {
     completions: *std.Io.Semaphore, // "a slot finished, re-check" signal
     cpu: std.Io.Semaphore = .{}, // producers running at once; sized in runWindowed
     producers: usize = 0, // `cpu`'s permits
+    /// The CPU budget (`-j`, or the host's), which the producers' permits are at most.
+    cpu_budget: usize = 1,
 
     // Writer-owned (single writer → no races); read back after the fan-out.
     sink: streaming.Sink,
     out_offset: u64,
     new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
     arena: std.mem.Allocator, // writer-only append target
+    /// Re-encoded chunks' page indexes, written after the row groups.
+    page_indexes: *page_index.Deferred,
     rows_kept: i64 = 0,
     rgs_kept: usize = 0,
     sink_ns: u64 = 0,
@@ -1186,19 +1503,25 @@ const WinCtx = struct {
     inflight: std.atomic.Value(usize) = .init(0),
     peak_bytes: std.atomic.Value(usize) = .init(0),
     profiler: ?*profile.Profiler = null,
-    /// What one producer's decoded rows may take; a row group past it is written in slices (`encodeRGSliced`).
+    /// What one producer's decoded rows may take; a row group past it is decoded in slices (`projectRGSliced`).
     decode_share: usize = std.math.maxInt(usize),
     diag: ?*Diag = null,
-    /// The query's ledger, through which the encoded row groups in flight and the writer's slices are allocated, and
-    /// which the producers' regions draw from (`runWriteOver`). Null: `gpa`, uncharged.
+    /// The query's ledger, through which pieces and byte-copied row groups in flight are allocated, and which the
+    /// producers' regions draw from (`runWriteOver`). Null: `gpa`, uncharged.
     memory: ?*core_memory.Charged = null,
-    /// Under a ledger, what the writer's slices are allocated through, straight from the OS: the write's ledger, with
+    /// Under a ledger, what the writer's slices are decoded on, straight from the OS: the write's ledger, with
     /// `memory.lean_decode` more room (the ceiling's slack) while the writer slices alone, its producers idle; or,
     /// over fetched inputs, where producers go on beside it, a ledger of `lean_decode` bytes of its own (`lean`).
     slicing: ?*core_memory.Charged = null,
     lean: ?*core_memory.Charged = null,
     /// The one of them the row group being sliced draws from.
     slicing_now: ?*core_memory.Charged = null,
+    /// Pieces and encodings are fresh memory, waiting or worked on whole: in huge pages, a fault per 2 MiB rather
+    /// than per 4 KiB. One advisor per child, at a fixed address, as the arenas over them hold it until they are freed.
+    piece_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
+    slicing_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
+    lean_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
+    encode_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
 
     /// What a deferred row group's slices draw from (`slicing`, `lean`): the writer alone has the write's ledger and
     /// the slack's room past it. Beside producers still fetching it has the write's ledger while that holds more than
@@ -1210,13 +1533,24 @@ const WinCtx = struct {
         return w.lean;
     }
 
-    /// What output buffers are allocated through.
+    /// What pieces and copied row groups are allocated through.
     fn outAlloc(w: *WinCtx) std.mem.Allocator {
         return if (w.memory) |m| m.allocator() else w.gpa;
     }
 
+    /// What a piece's rows are allocated through: `outAlloc` in huge pages.
+    fn pieceAlloc(w: *WinCtx) std.mem.Allocator {
+        return w.piece_pages.allocator();
+    }
+
+    /// What a sliced row group's pieces are allocated through: the ledger it slices on, in huge pages.
+    fn slicePieceAlloc(w: *WinCtx) std.mem.Allocator {
+        const m = w.slicing_now orelse return w.pieceAlloc();
+        return if (m == w.lean) w.lean_pages.allocator() else w.slicing_pages.allocator();
+    }
+
     /// `err` was a refused draw from the query's ledger, by `regions` or the output: the row group may still be
-    /// written a slice at a time, in the writer's turn.
+    /// decoded a slice at a time, in the writer's turn.
     fn refused(w: *WinCtx, regions: *WorkRegions, err: anyerror) bool {
         if (err != error.OutOfMemory or w.memory == null) return false;
         const any = regions.rows.refused or regions.work.refused or w.memory.?.refused.load(.monotonic);
@@ -1241,7 +1575,7 @@ fn winProducer(w: *WinCtx, i: usize) void {
     };
     defer regions.busy.store(false, .release);
     const enc = produceRG(w, i, ma, regions, prof) catch |e| deferred: {
-        // Refused its memory beside the other row groups in flight: its regions go back, and the writer writes it a
+        // Refused its memory beside the other row groups in flight: its regions go back, and the writer decodes it a
         // slice at a time in its turn, when the row groups before it have gone. A column with no sliced form refuses.
         if (w.refused(regions, e) and slicesWhole(w.jobs[i], w.fetch_arr)) {
             regions.rows.trim();
@@ -1262,8 +1596,9 @@ fn winProducer(w: *WinCtx, i: usize) void {
         regions.rows.trim();
         regions.work.trim();
     };
-    profile.gauge(prof, .buffered_bytes, @intCast(enc.bytes.len));
-    const now = w.inflight.fetchAdd(enc.bytes.len, .acq_rel) + enc.bytes.len;
+    const held = enc.bytes.len + if (enc.piece) |p| p.arena.queryCapacity() else 0;
+    profile.gauge(prof, .buffered_bytes, @intCast(held));
+    const now = w.inflight.fetchAdd(held, .acq_rel) + held;
     var p = w.peak_bytes.load(.monotonic);
     while (now > p) p = w.peak_bytes.cmpxchgWeak(p, now, .monotonic, .monotonic) orelse break;
     w.slots[i].enc = enc;
@@ -1271,31 +1606,26 @@ fn winProducer(w: *WinCtx, i: usize) void {
     w.completions.post(w.io);
 }
 
-/// Job `i`'s output: a byte copy, the row group sliced when it is too big to decode at once, or re-encoded whole.
+/// Job `i`'s output: a byte copy, deferred to the writer when it is too big to decode at once, or its kept rows.
 fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions, prof: ?*profile.Thread) !EncodedRG {
     const job = w.jobs[i];
     try job.arrive();
     if (job.passthrough) return copyRGToBuffer(w.outAlloc(), ma, job, w.kept_set, prof, w.bloom_leaves);
-    const bloom: consumer.BloomWrite = .{ .fpp = w.bloom_outputs };
     if (try sliceRG(job, w.fetch_arr, w.decode_share)) return .{ .deferred = true };
-    return encodeRGToBuffer(
-        w.outAlloc(),
-        ma,
+    return projectRGToPiece(
+        w.gpa,
+        w.pieceAlloc(),
         regions,
         job,
         w.filter,
         w.fetch_arr,
         w.output_specs,
-        w.codec,
-        w.zstd,
         w.decode_options,
         prof,
-        bloom,
-        w.diag,
     );
 }
 
-/// Whether every column `job` reads has a sliced form, so its row group can be written a slice at a time.
+/// Whether every column `job` reads has a sliced form, so its row group can be decoded a slice at a time.
 fn slicesWhole(job: RGJob, fetch_arr: []const bool) bool {
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= job.rg.columns.items.len) continue;
@@ -1304,12 +1634,12 @@ fn slicesWhole(job: RGJob, fetch_arr: []const bool) bool {
     return true;
 }
 
-/// Whether `job`'s row group is re-encoded a slice of rows at a time (`encodeRGSliced`): its decoded columns would take
+/// Whether `job`'s row group is decoded a slice of rows at a time (`projectRGSliced`): its decoded columns would take
 /// more than `share`. One that would, with a column that has no sliced form, is refused before anything decodes.
 fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) error{RowGroupTooLarge}!bool {
     const rg = job.rg;
     if (rg.num_rows <= 0) return false;
-    // Decoded, then buffered for the encoder, then encoded.
+    // The kept rows, and beside them the filter's columns and the column being projected.
     const est = consumer.decodeEstimate(.{
         .rg = rg,
         .meta = job.meta,
@@ -1317,7 +1647,7 @@ fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) error{RowGroupTooL
         .filter = null,
         .read = fetch_arr,
         .consumed = fetch_arr,
-    }, fetch_arr, &.{}, false) * 3;
+    }, fetch_arr, &.{}, false) * 2;
     if (est <= share) return false;
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
@@ -1326,41 +1656,63 @@ fn sliceRG(job: RGJob, fetch_arr: []const bool, share: usize) error{RowGroupTooL
     return true;
 }
 
-/// Re-encode `job`'s row group a slice of rows at a time, one output row group per slice, straight into the writer's
-/// sink: each slice decodes (`consumer.SliceReader`), filters and encodes on memory of its own, so neither the decoded
-/// rows nor the output are ever held whole. Runs on the writer, in the row group's turn; returns the rows written.
-fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
+/// The column readers of a sliced row group, positioned `skip` rows in. Built in place: the readers hold the address
+/// of `pages`.
+const SliceReaders = struct {
+    pages: std.heap.ArenaAllocator,
+    readers: std.ArrayList(consumer.SliceReader) = .empty,
+    lookup: []?usize,
+
+    fn init(self: *SliceReaders, w: *WinCtx, gpa: std.mem.Allocator, job: RGJob, skip: usize) !void {
+        self.* = .{ .pages = .init(gpa), .lookup = &.{} };
+        errdefer self.deinit();
+        const pa = self.pages.allocator();
+        self.lookup = try pa.alloc(?usize, w.fetch_arr.len);
+        @memset(self.lookup, null);
+        const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
+        for (w.fetch_arr, 0..) |needed, ci| {
+            if (!needed or ci >= job.rg.columns.items.len) continue;
+            var r = try consumer.SliceReader.init(pa, gpa, job.rg, job.meta, src, ci, w.decode_options) orelse
+                return error.UnsupportedColumnType; // `sliceRG` checked every column
+            errdefer r.deinit();
+            if (skip > 0) {
+                var skipped = std.heap.ArenaAllocator.init(gpa);
+                defer skipped.deinit();
+                try r.skip(skipped.allocator(), skip);
+            }
+            self.lookup[ci] = self.readers.items.len;
+            try self.readers.append(pa, r);
+        }
+    }
+
+    fn deinit(self: *SliceReaders) void {
+        for (self.readers.items) |*r| r.deinit();
+        self.pages.deinit();
+    }
+};
+
+/// Decode, filter and project `job`'s row group a slice of rows at a time on the writer, in its turn, each slice's
+/// kept rows a piece for the assembler: neither the decoded row group nor its output is ever held whole. Slices are
+/// sized by what rows took so far, within half the ledger's room; a slice the ledger refuses is decoded again at half
+/// its rows, down to one, before the write is refused. None of this shows in the output, whose row groups the
+/// assembler cuts from the rows alone.
+fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assembler) !void {
     const gpa = if (w.slicing_now) |m| m.allocator() else w.gpa;
     const rg = job.rg;
     const num_rows: usize = @intCast(@max(0, rg.num_rows));
-    const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
     const est = consumer.decodeEstimate(.{
         .rg = rg,
         .meta = job.meta,
-        .src = src,
+        .src = .{ .bytes = job.bytes, .byte_origin = 0 },
         .filter = null,
         .read = w.fetch_arr,
         .consumed = w.fetch_arr,
     }, w.fetch_arr, &.{}, false) * 3;
-
-    var pages = std.heap.ArenaAllocator.init(gpa);
-    defer pages.deinit();
-    var readers: std.ArrayList(consumer.SliceReader) = .empty;
-    defer for (readers.items) |*r| r.deinit();
-    const lookup = try pages.allocator().alloc(?usize, w.fetch_arr.len);
-    @memset(lookup, null);
-    for (w.fetch_arr, 0..) |needed, ci| {
-        if (!needed or ci >= rg.columns.items.len) continue;
-        const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, job.meta, src, ci, w.decode_options) orelse
-            return error.UnsupportedColumnType; // `sliceRG` checked every column
-        lookup[ci] = readers.items.len;
-        try readers.append(pages.allocator(), r);
-    }
-    const per_row = @max(1, est / num_rows);
-    var slice_rows = std.math.clamp(w.decode_share / per_row, 1, num_rows);
-    // Under a ledger, slices are cut by the bytes rows took, as an aggregate's are (`consumer.scanRGSliced`), within
-    // half its room: the footer's estimate can understate values by any factor. The first is the least.
     const ledger: ?*const core_memory.SharedBudget = if (w.slicing_now) |m| m.budget else null;
+    const per_row = @max(1, est / @max(1, num_rows));
+    var slice_rows = std.math.clamp(w.decode_share / per_row, 1, num_rows);
+    // Under a ledger, the footer's estimate can understate values by any factor: start small and size each slice by
+    // what the rows before it took.
     if (ledger != null) slice_rows = @min(slice_rows, 64);
 
     var timings: consumer.Timings = .{ .prof = prof };
@@ -1369,58 +1721,72 @@ fn encodeRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread) !i64 {
         w.core.eval_ns += timings.eval_ns;
         w.core.encode_ns += timings.encode_ns;
     }
-    var surviving: i64 = 0;
+    var readers: SliceReaders = undefined;
+    try readers.init(w, gpa, job, 0);
+    defer readers.deinit();
     var done: usize = 0;
-    // One arena for every slice, its pages kept from one to the next; what a row took is measured on the first.
+    // Per-slice working memory (the decoded slice and its selection), its pages kept from one to the next.
     var slice = std.heap.ArenaAllocator.init(gpa);
     defer slice.deinit();
-    var took: ?usize = null;
     while (done < num_rows) {
         const n = @min(slice_rows, num_rows - done);
-        done += n;
         _ = slice.reset(.retain_capacity);
-        defer if (ledger) |l| {
-            const kept = slice.queryCapacity();
-            if (took == null) took = @max(1, kept / n);
-            slice_rows = @min(num_rows, @max(64, @min(w.decode_share, l.available() / 2 + kept) / took.? / 64 * 64));
-        };
-        const sa = slice.allocator();
-        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
-        for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
-        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
-        var sel = try filter_selection.SelectionVector.init(sa, n);
-        if (w.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
-        var agg = try consumer.initOutputAggregator(sa, job.meta, w.output_specs);
-        _ = try consumer.appendSliceRows(&agg, &batch, lookup, &sel, w.output_specs, sa);
-        if (agg.num_rows == 0) continue;
-        var rg_enc: consumer.RGEncoder = .{
-            .out_arena = w.arena,
-            .sink = w.sink,
-            .out_offset = &w.out_offset,
-            .codec = w.codec,
-            .zstd = w.zstd,
-            .bloom_write = .{ .fpp = w.bloom_outputs },
-            .timings = &timings,
-        };
-        for (0..w.output_specs.len) |i| {
-            rg_enc.column(&agg, i, sa) catch |err| {
-                if (err == error.DecimalValueExceedsPrecision) {
-                    Diag.setColumn(w.diag, agg.schema_elems[i].name);
-                }
-                return err;
+        const piece = sliceToPiece(w, job, &readers, &slice, n, &timings) catch |e| {
+            const m = w.slicing_now orelse return e;
+            if (e != error.OutOfMemory or !m.refused.load(.monotonic) or n == 1) return e;
+            // Refused: decode the same rows again, half as many at a time.
+            m.refused.store(false, .monotonic);
+            _ = slice.reset(.free_all);
+            readers.deinit();
+            readers.init(w, gpa, job, done) catch |re| {
+                readers = .{ .pages = .init(gpa), .lookup = &.{} };
+                return re;
             };
+            slice_rows = @max(1, n / 2);
+            continue;
+        };
+        done += n;
+        if (ledger) |l| {
+            const took = @max(1, (slice.queryCapacity() + piece.arena.queryCapacity()) / n);
+            slice_rows = @min(num_rows, @max(1, @min(w.decode_share, l.available() / 2) / took));
         }
-        const out = rg_enc.finish(agg.num_rows);
-        try w.new_row_groups.append(w.arena, out.rg.?);
-        surviving += out.surviving_rows;
+        try asm_.feed(piece);
     }
-    return surviving;
 }
 
-/// In-order writer: drains slots 0..N, rebasing offsets, writing to the sink,
-/// then freeing the bulk bytes and posting a window permit (sliding forward).
+/// The next `n` rows of `readers` as a piece: decoded and filtered on `slice`, their kept rows projected onto the
+/// piece's own memory, which the assembler holds until they are written.
+fn sliceToPiece(
+    w: *WinCtx,
+    job: RGJob,
+    readers: *SliceReaders,
+    slice: *std.heap.ArenaAllocator,
+    n: usize,
+    timings: *consumer.Timings,
+) !*Piece {
+    const sa = slice.allocator();
+    const cols = try sa.alloc(filter_eval.Batch.Column, readers.readers.items.len);
+    const t0 = nowMonoNs();
+    for (readers.readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
+    const t1 = nowMonoNs();
+    timings.decode_ns += @intCast(t1 - t0);
+    const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+    var sel = try filter_selection.SelectionVector.init(sa, n);
+    if (w.filter) |f| try filter_eval.evaluate(f, &batch, &sel, readers.lookup, sa);
+    const piece = try Piece.create(w.gpa, w.slicePieceAlloc());
+    errdefer piece.destroy(w.gpa);
+    piece.agg = try consumer.initOutputAggregator(piece.arena.allocator(), job.meta, w.output_specs);
+    _ = try consumer.appendSliceRows(&piece.agg, &batch, readers.lookup, &sel, w.output_specs, sa);
+    timings.eval_ns += @intCast(nowMonoNs() - t1);
+    return piece;
+}
+
+/// In-order writer: takes slots 0..N, feeding their kept rows to the assembler (which writes each output row group
+/// as it completes) or writing their byte copies, frees their bytes and posts their window permits.
 fn winWriter(w: *WinCtx) void {
     const prof = profile.threadOf(w.profiler, .writer);
+    var asm_ = Assembler.init(w);
+    defer asm_.deinit();
     var next: usize = 0;
     while (next < w.slots.len) : (next += 1) {
         while (!w.slots[next].done.load(.acquire)) w.completions.waitUncancelable(w.io);
@@ -1428,16 +1794,28 @@ fn winWriter(w: *WinCtx) void {
         w.core.decode_ns += enc.timings.decode_ns;
         w.core.eval_ns += enc.timings.eval_ns;
         w.core.encode_ns += enc.timings.encode_ns;
+        const held = enc.bytes.len + if (enc.piece) |p| p.arena.queryCapacity() else 0;
         if (enc.err) |e| {
             if (w.first_err == null) w.first_err = e;
+            if (enc.piece) |p| p.destroy(w.gpa);
+        } else if (w.first_err != null) {
+            if (enc.piece) |p| p.destroy(w.gpa);
+            if (enc.deferred) w.jobs[next].leave();
+        } else if (enc.piece) |p| {
+            // The window bounds rows waiting for the writer; held by the assembler they count toward a row group.
+            asm_.feed(p) catch |e| {
+                w.first_err = e;
+            };
         } else if (enc.deferred) {
             defer w.jobs[next].leave();
-            // Under a ledger the slices are written alone: the writer takes every producer's turn, so those running
+            // Under a ledger the slices are decoded alone: the writer takes every producer's turn, so those running
             // finish and none starts, and their regions give their pages back, before it slices. Not over fetched
             // inputs: a producer may be waiting for fetch room this row group holds until the writer is done with it.
             const turns = if (w.memory != null and w.jobs[next].gate == null) w.producers else 0;
             for (0..turns) |_| w.cpu.waitUncancelable(w.io);
             defer for (0..turns) |_| w.cpu.post(w.io);
+            w.writer_turns = turns;
+            defer w.writer_turns = 0;
             if (turns > 0) for (w.regions) |*r| {
                 r.rows.trim();
                 r.work.trim();
@@ -1450,22 +1828,20 @@ fn winWriter(w: *WinCtx) void {
                 m.budget.limit -= slack;
             };
             w.slicing_now = w.slicingFor(turns > 0);
-            if (w.first_err == null) {
-                const before = w.new_row_groups.items.len;
-                const kept = encodeRGSliced(w, w.jobs[next], prof) catch |e| blk: {
-                    w.first_err = if (w.slicing_now) |m| m.refusal(e) else e;
-                    break :blk 0;
-                };
-                w.rows_kept += kept;
-                w.rgs_kept += w.new_row_groups.items.len - before;
-            }
+            projectRGSliced(w, w.jobs[next], prof, &asm_) catch |e| {
+                w.first_err = if (w.slicing_now) |m| m.refusal(e) else e;
+            };
         } else if (enc.rg) |rg| {
-            if (enc.surviving > 0) {
+            // A byte copy: the rows before it make the row group they are, then it goes as it came.
+            asm_.flush() catch |e| {
+                w.first_err = e;
+            };
+            if (w.first_err == null and enc.surviving > 0) {
                 var rgm = rg;
                 consumer.rebaseRowGroupOffsets(&rgm, @intCast(w.out_offset));
                 const t0 = nowMonoNs();
                 w.sink.write(enc.bytes) catch |e| {
-                    if (w.first_err == null) w.first_err = e;
+                    w.first_err = e;
                 };
                 const t1 = nowMonoNs();
                 w.sink_ns += @intCast(t1 - t0);
@@ -1474,15 +1850,18 @@ fn winWriter(w: *WinCtx) void {
                 w.rows_kept += enc.surviving;
                 w.rgs_kept += 1;
                 w.new_row_groups.append(w.arena, rgm) catch |e| {
-                    if (w.first_err == null) w.first_err = e;
+                    w.first_err = e;
                 };
             }
         }
         if (enc.bytes.len > 0) w.outAlloc().free(enc.bytes);
-        profile.gauge(prof, .buffered_bytes, -@as(i64, @intCast(enc.bytes.len)));
-        _ = w.inflight.fetchSub(enc.bytes.len, .acq_rel);
+        profile.gauge(prof, .buffered_bytes, -@as(i64, @intCast(held)));
+        _ = w.inflight.fetchSub(held, .acq_rel);
         for (0..windowPermits(WinCtx, w, next)) |_| w.window.post(w.io);
     }
+    if (w.first_err == null) asm_.flush() catch |e| {
+        w.first_err = e;
+    };
 }
 
 fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
@@ -2305,6 +2684,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // earlier, by the windowed writer.)
     var win_slots: []Slot = &.{};
     defer for (win_slots) |*s| s.meta_arena.deinit();
+    var page_indexes: page_index.Deferred = .{};
 
     if (args.diag) |diag| diag.execution_started = true;
     const kept_opt: ?[]const bool = if (kept_set != null) kept_arr else null;
@@ -2500,7 +2880,13 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             defer for (regions) |*r| r.deinit();
             var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
             var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+            // Every piece's aggregator has these leaves; the row groups cut from them are written under them.
+            const out_agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
             var w = WinCtx{
+                .rg_target = args.row_group.under(args.max_memory_explicit),
+                .out_elems = out_agg.schema_elems,
+                .out_paths = out_agg.paths,
+                .page_indexes = &page_indexes,
                 .memory = &memory,
                 .slicing = &slicing,
                 .lean = &lean,
@@ -2528,11 +2914,14 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 .profiler = args.profiler,
                 .diag = args.diag,
                 // Half the budget for the producers' decoded rows (the fetch window and the encoded output in flight
-                // take a quarter each), shared among as many as -j allows. Not among those that run at once, which
-                // the host's memory sizes: the share sets a sliced row group's output layout, so it depends only on
-                // --max-memory and -j.
-                .decode_share = args.max_memory / 2 / @max(1, sizing.budget),
+                // take a quarter each), shared among those that can run at once. Slicing never shows in the output.
+                .decode_share = args.max_memory / 2 / @max(1, effective_async_budget),
             };
+            // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
+            w.cpu_budget = sizing.budget;
+            w.piece_pages.child = w.outAlloc();
+            w.slicing_pages.child = slicing.allocator();
+            w.lean_pages.child = lean.allocator();
             const re_span = profile.Span.begin(prof);
             defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
             try runWindowedReencode(&w, effective_async_budget);
@@ -2555,11 +2944,12 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
         }));
     }
 
-    // 6. Bloom filters after the row groups, then the footer.
+    // 6. Page indexes of the re-encoded chunks and Bloom filters after the row groups, then the footer.
     const t_footer = nowMonoNs();
     const footer_span = profile.Span.begin(prof);
     {
         var so: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(out_offset) };
+        try page_indexes.write(arena, &so, new_row_groups.items);
         try fastpath.placeFilters(&so, new_row_groups.items);
         out_offset = so.offset;
     }
@@ -7266,6 +7656,12 @@ const ParquetPrint = struct {
     schema_items: std.ArrayListUnmanaged(schema.SchemaElement),
     rgs: std.ArrayListUnmanaged(schema.RowGroup) = .empty,
     out_offset: u64 = 0,
+    /// Where row groups are cut (`RowGroupTarget`), as on every write.
+    target: RowGroupTarget = .{},
+    /// Rows waiting for their row group: copied in as batches come, written once one closes.
+    pending: ?consumer.OutputAggregator = null,
+    pending_arena: ?std.heap.ArenaAllocator = null,
+    pending_bits: u64 = 0,
 
     fn sink(self: *ParquetPrint) streaming.Sink {
         return .{ .ctx = @ptrCast(&self.fd_sink), .write_fn = FdSink.writeFn };
@@ -7281,27 +7677,97 @@ const ParquetPrint = struct {
         skip.* -= start_row;
         const n = @min(agg.num_rows - start_row, if (limit) |lim| lim -| total.* else agg.num_rows);
         if (n == 0) return;
-        const saved = try self.gpa.dupe(consumer.OutputAggregator.ColumnBuf, agg.cols);
-        defer self.gpa.free(saved);
-        const old_rows = agg.num_rows;
-        defer {
-            @memcpy(agg.cols, saved);
-            agg.num_rows = old_rows;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const target_bits = self.target.bytes *| 8;
+        var lo = start_row;
+        const end = start_row + n;
+        while (lo < end) {
+            if (self.pending == null) {
+                self.pending_arena = .init(self.gpa);
+                const pa = self.pending_arena.?.allocator();
+                const cols = try pa.alloc(consumer.OutputAggregator.ColumnBuf, agg.cols.len);
+                for (cols, agg.cols) |*c, src| c.* = switch (src) {
+                    inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
+                };
+                self.pending = .{
+                    .arena = pa,
+                    .cols = cols,
+                    .schema_elems = agg.schema_elems,
+                    .paths = agg.paths,
+                    .num_rows = 0,
+                    .captured = true,
+                };
+            }
+            const p = &self.pending.?;
+            var hi = @min(end, lo + (self.target.rows - p.num_rows));
+            var bits = plainBitsOf(agg, lo, hi);
+            const room = target_bits -| self.pending_bits;
+            if (bits >= room) {
+                // The row that reaches the byte target closes the row group.
+                hi = lo;
+                bits = 0;
+                while (hi < end) {
+                    bits += plainBitsOf(agg, hi, hi + 1);
+                    hi += 1;
+                    if (bits >= room) break;
+                }
+            }
+            _ = scratch.reset(.retain_capacity);
+            const sa = scratch.allocator();
+            var all = try filter_selection.SelectionVector.init(sa, hi - lo);
+            for (p.cols, agg.cols) |*dst, src| {
+                try consumer.appendRows(dst, consumer.bufRows(src, lo, hi), &all, hi - lo, p.arena, sa);
+            }
+            p.num_rows += hi - lo;
+            self.pending_bits += bits;
+            total.* += hi - lo;
+            lo = hi;
+            if (p.num_rows >= self.target.rows or self.pending_bits >= target_bits) try self.flushPending();
         }
-        for (agg.cols) |*col| switch (col.*) {
-            inline else => |*buf| {
-                buf.values.items = buf.values.items[start_row..][0..n];
-                if (buf.def_levels.items.len > 0) buf.def_levels.items = buf.def_levels.items[start_row..][0..n];
-            },
-        };
-        agg.num_rows = n;
+    }
+
+    fn plainBitsOf(agg: *const consumer.OutputAggregator, lo: usize, hi: usize) u64 {
+        var bits: u64 = 0;
+        for (agg.cols, agg.schema_elems) |*c, *e| bits += consumer.plainBits(c, e, lo, hi);
+        return bits;
+    }
+
+    /// Write the rows waiting as one row group, its page index after each chunk.
+    fn flushPending(self: *ParquetPrint) !void {
+        const p = &(self.pending orelse return);
+        defer {
+            self.pending_arena.?.deinit();
+            self.pending_arena = null;
+            self.pending = null;
+            self.pending_bits = 0;
+        }
+        if (p.num_rows == 0) return;
         var timings: consumer.Timings = .{};
-        const out = try consumer.encodeAggregator(agg, self.arena, self.gpa, self.sink(), &self.out_offset, self.codec, self.zstd, &timings, 1, true, .{});
+        const out = try consumer.encodeAggregator(
+            p,
+            self.arena,
+            self.gpa,
+            self.sink(),
+            &self.out_offset,
+            self.codec,
+            self.zstd,
+            &timings,
+            1,
+            true,
+            .{},
+        );
         if (out.rg) |rg| try self.rgs.append(self.arena, rg);
-        total.* += n;
+    }
+
+    fn deinit(self: *ParquetPrint) void {
+        if (self.pending_arena) |*a| a.deinit();
+        self.pending_arena = null;
+        self.pending = null;
     }
 
     fn finish(self: *ParquetPrint, rows: usize) !void {
+        try self.flushPending();
         const meta: schema.FileMetaData = .{
             .version = 2,
             .schema = self.schema_items,
@@ -7473,7 +7939,9 @@ fn runPrintSinkOver(
         .codec = args.codec orelse .SNAPPY,
         .zstd = .{ .lambda = args.compress_priority.lambda() },
         .schema_items = try buildSelectSchema(arena, meta0, output_specs),
+        .target = args.row_group.under(args.max_memory_explicit),
     };
+    defer parquet.deinit();
     if (format == .parquet) {
         coerceByteArrayDecimalLeavesToFlba(&parquet.schema_items);
         coerceFloat16LeavesToDouble(&parquet.schema_items);
@@ -9692,7 +10160,6 @@ test "Lambda default fetch window streams a large projection and fetches a small
         .precision = null,
         .field_id = null,
     };
-    const encoder = @import("core/writer/encoder.zig");
     const encoded = try encoder.encodeColumn(a, .{
         .values = .{ .f64 = .{ .values = values } },
         .schema_elem = &leaf,
@@ -10100,7 +10567,10 @@ test "every write reads back whole, holding what an unbounded run writes, throug
                 q.inputs = if (v.s3 == .local) &local_in else &s3_in;
                 q.output = out;
                 q.parallelism = v.j;
-                if (v.max_memory) |mm| q.max_memory = mm;
+                if (v.max_memory) |mm| {
+                    q.max_memory = mm;
+                    q.max_memory_explicit = mm;
+                }
                 // A server per run: one serves a bounded number of connections.
                 var fake: fake_s3.FakeS3 = undefined;
                 try fake.start(gpa);
@@ -10640,6 +11110,7 @@ test "limited Parquet row sink restores borrowed buffers on every allocation fai
                 .zstd = .{ .lambda = CompressPriority.size.lambda() },
                 .schema_items = .empty,
             };
+            defer sink.deinit();
             var total: usize = 0;
             var skip: usize = 1;
             defer {

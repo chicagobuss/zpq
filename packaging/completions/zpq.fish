@@ -19,6 +19,8 @@ complete -c zpq -l output
 complete -c zpq -l profile
 complete -c zpq -l profile-summary
 complete -c zpq -l query
+complete -c zpq -l row-group-bytes
+complete -c zpq -l row-group-size
 complete -c zpq -l scan-all
 complete -c zpq -l select
 complete -c zpq -l threads

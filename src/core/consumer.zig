@@ -40,6 +40,7 @@ const agg_plan = @import("agg_plan.zig");
 const encoder = @import("writer/encoder.zig");
 const streaming = @import("writer/streaming.zig");
 const fastpath = @import("writer/fastpath.zig");
+const page_index = @import("writer/page_index.zig");
 const thrift = @import("thrift.zig");
 const column_mod = @import("parquet/column.zig");
 const decimal_mod = @import("parquet/decimal.zig");
@@ -486,7 +487,9 @@ pub const ProjectedRG = struct {
                 var view = try decimal_mod.scaledF64FromI128(ra, dcol, kind.?.scale);
                 view.unscaled = .{ .i128 = dcol.values };
                 break :blk .{ .f64 = view };
-            } else if (agg.keep_codes and !computed_refs[ci])
+            } else if (agg.keep_codes)
+                // Codes even for a column computed outputs read: the filter runs on the dictionary, and only the
+                // kept rows' values are looked up (`Survivors`).
                 try decodeWriteColumnMaybeCoded(ra, rg, meta, src, ci, decode_options, timings.prof)
             else
                 try decodeWriteColumn(ra, rg, meta, src, ci, decode_options, timings.prof);
@@ -620,13 +623,24 @@ pub const Survivors = struct {
         sel: *const filter_selection.SelectionVector,
         surviving: usize,
     ) !Survivors {
-        if (surviving == batch.num_rows) return .{ .batch = batch.*, .sel = sel };
         const cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
+        // A column decoded as dictionary codes gets values here, for the rows kept only.
+        if (surviving == batch.num_rows) {
+            for (refs, 0..) |r, ci| {
+                if (!r or ci >= lookup.len) continue;
+                const pos = lookup[ci] orelse continue;
+                cols[pos] = try agg_coded.materialize(arena, cols[pos]);
+            }
+            return .{ .batch = .{ .cols = cols, .num_rows = batch.num_rows }, .sel = sel };
+        }
         for (refs, 0..) |r, ci| {
             if (!r or ci >= lookup.len) continue;
             const pos = lookup[ci] orelse continue;
-            cols[pos] = try gatherRows(arena, batch.cols[pos], sel, surviving) orelse
+            const gathered = try gatherRows(arena, batch.cols[pos], sel, surviving) orelse {
+                if (batch.cols[pos].codes() != null) return error.MissingDecodedColumn;
                 return .{ .batch = batch.restrictedTo(sel), .sel = sel };
+            };
+            cols[pos] = try agg_coded.materialize(arena, gathered);
         }
         const all = try arena.create(filter_selection.SelectionVector);
         all.* = try filter_selection.SelectionVector.init(arena, surviving);
@@ -1350,71 +1364,6 @@ fn decodeDecimalI128(
     );
 }
 
-/// Synthesize and write a one-page OffsetIndex + ColumnIndex for a
-/// freshly-encoded chunk (the encoder emits a single data page per
-/// chunk), derived from `meta`'s stats. `abs_data_offset` is the data
-/// page's absolute file offset. Returns the new pointers; emits no
-/// ColumnIndex when stats lack usable min/max (readers fall back).
-fn synthPageIndexToSink(
-    out_arena: std.mem.Allocator,
-    sink: streaming.Sink,
-    out_offset: *u64,
-    meta: *const schema.ColumnMetaData,
-    abs_data_offset: i64,
-) !fastpath.PageIndexPtrs {
-    var ptrs = fastpath.PageIndexPtrs{};
-    const stats = meta.statistics orelse return ptrs;
-    // Data-page byte size = total chunk size minus the dictionary page
-    // (the relative data_page_offset is the dict-page span, 0 if none).
-    const data_size: i32 = @intCast(meta.total_compressed_size - meta.data_page_offset);
-    const null_count = stats.null_count orelse 0;
-    const all_null = meta.num_values > 0 and null_count == meta.num_values;
-
-    // ColumnIndex (one page) — needs min/max bytes unless the page is
-    // all-null (in which case both are empty per the spec).
-    if (all_null or (stats.min_value != null and stats.max_value != null)) {
-        var ci = schema.ColumnIndex{ .boundary_order = .UNORDERED };
-        try ci.null_pages.append(out_arena, all_null);
-        try ci.min_values.append(out_arena, if (all_null) "" else stats.min_value.?);
-        try ci.max_values.append(out_arena, if (all_null) "" else stats.max_value.?);
-        var ncs: std.ArrayListUnmanaged(i64) = .empty;
-        try ncs.append(out_arena, null_count);
-        ci.null_counts = ncs;
-        // One page: the chunk's NaN count is the page's.
-        if (stats.nan_count) |n| {
-            var nans: std.ArrayListUnmanaged(i64) = .empty;
-            try nans.append(out_arena, n);
-            ci.nan_counts = nans;
-        }
-
-        var w = thrift.Writer.init(out_arena);
-        try ci.write(&w);
-        const bytes = w.bytes();
-        ptrs.column_index_offset = @intCast(out_offset.*);
-        try sink.write(bytes);
-        out_offset.* += bytes.len;
-        ptrs.column_index_length = @intCast(bytes.len);
-    }
-
-    // OffsetIndex (one data page).
-    {
-        var oi = schema.OffsetIndex{};
-        try oi.page_locations.append(out_arena, .{
-            .offset = abs_data_offset,
-            .compressed_page_size = data_size,
-            .first_row_index = 0,
-        });
-        var w = thrift.Writer.init(out_arena);
-        try oi.write(&w);
-        const bytes = w.bytes();
-        ptrs.offset_index_offset = @intCast(out_offset.*);
-        try sink.write(bytes);
-        out_offset.* += bytes.len;
-        ptrs.offset_index_length = @intCast(bytes.len);
-    }
-    return ptrs;
-}
-
 /// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
 /// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die
 /// with the row group.
@@ -1436,7 +1385,12 @@ fn appendSelected(
         const fresh = switch (buf.*) {
             inline else => |*tb| tb.values.items.len == 0 and !tb.coded,
         };
-        if (keep_codes and fresh) return appendSelectedCodes(buf, src, sel, surviving, arena);
+        // Codes only when the dictionary, copied with them, is no bigger than the rows: a selective filter over a
+        // chunk of mostly distinct values would otherwise copy its whole dictionary for a few rows.
+        const dict_len = switch (src) {
+            inline else => |c| c.dict.len,
+        };
+        if (keep_codes and fresh and dict_len <= surviving) return appendSelectedCodes(buf, src, sel, surviving, arena);
         src = try agg_coded.materialize(scratch, src);
     }
     switch (buf.*) {
@@ -1710,7 +1664,7 @@ pub fn encodeAggregator(
             defer col_arena.deinit();
             const enc = results[i] orelse
                 try encodeAggColumn(agg, i, col_arena.allocator(), output_codec, zstd, bloom_write, timings);
-            try placer.place(enc);
+            try placer.place(enc, &agg.schema_elems[i]);
         }
     } else {
         const arenas = try ra.alloc(std.heap.ArenaAllocator, num_workers);
@@ -1753,7 +1707,9 @@ pub fn encodeAggregator(
         timings.encode_ns += @intCast(t_enc_end - t_enc_start);
         profile.record(timings.prof, .encode, t_enc_start, t_enc_end, profile.args(.{ n_specs, agg.num_rows }));
         // Sequential write phase, in output order.
-        for (results) |maybe_enc| try placer.place(maybe_enc orelse return error.MissingEncodeResult);
+        for (results, agg.schema_elems) |maybe_enc, *elem| {
+            try placer.place(maybe_enc orelse return error.MissingEncodeResult, elem);
+        }
     }
 
     return .{
@@ -1909,7 +1865,7 @@ pub const RGEncoder = struct {
             .columns = &self.columns,
             .total = &self.total,
         };
-        try placer.place(enc);
+        try placer.place(enc, &agg.schema_elems[i]);
     }
 
     pub fn finish(self: *RGEncoder, num_rows: usize) RGOut {
@@ -1920,6 +1876,172 @@ pub const RGEncoder = struct {
         };
     }
 };
+
+/// Rows `lo..hi` of an output buffer as the column the encoder takes: its values, or its codes into the dictionary
+/// they index, and its levels; an exact DECIMAL as its unscaled integers (the encoder narrows them to the schema's
+/// width).
+pub fn bufRows(buf: OutputAggregator.ColumnBuf, lo: usize, hi: usize) filter_eval.Batch.Column {
+    return switch (buf) {
+        inline else => |b, tag| @unionInit(filter_eval.Batch.Column, @tagName(tag), .{
+            .values = if (b.coded) &.{} else b.values.items[lo..hi],
+            .def_levels = if (b.max_def > 0) b.def_levels.items[lo..hi] else null,
+            .max_def = b.max_def,
+            .has_nulls = b.max_def > 0,
+            .codes = if (b.coded) b.codes.items[lo..hi] else null,
+            .dict = b.dict,
+        }),
+    };
+}
+
+/// Append the rows `sel` keeps of `src` to `buf`, copying them onto `arena` (`appendSelected`, never keeping codes).
+pub fn appendRows(
+    buf: *OutputAggregator.ColumnBuf,
+    src: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    surviving: usize,
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+) !void {
+    return appendSelected(buf, src, sel, surviving, arena, false, scratch);
+}
+
+/// Rows `lo..hi` of one output buffer.
+pub const BufRange = struct {
+    buf: *const OutputAggregator.ColumnBuf,
+    lo: usize,
+    hi: usize,
+};
+
+/// The rows of `ranges`, in order, as one column (`bufRows` of each, joined on `arena`). Ranges of buffers coded by
+/// one dictionary stay codes; otherwise values, a coded range's taken from its dictionary. Levels run at the deepest
+/// range's `max_def`, a range without levels present throughout. Which of these a column comes out as never changes
+/// its encoding: coded and plain columns, with or without all-present levels, encode to the same bytes.
+pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval.Batch.Column {
+    std.debug.assert(ranges.len > 0);
+    if (ranges.len == 1) return bufRows(ranges[0].buf.*, ranges[0].lo, ranges[0].hi);
+    switch (ranges[0].buf.*) {
+        inline else => |first, tag| {
+            const TB = @TypeOf(first);
+            const T = @typeInfo(@TypeOf(first.dict)).pointer.child;
+            var total: usize = 0;
+            var max_def: u32 = 0;
+            var one_dict = first.coded;
+            for (ranges) |r| {
+                const b = @field(r.buf.*, @tagName(tag));
+                total += r.hi - r.lo;
+                max_def = @max(max_def, b.max_def);
+                one_dict = one_dict and b.coded and b.dict.ptr == first.dict.ptr and b.dict.len == first.dict.len;
+            }
+            var out: filter_eval.ColumnT(T) = .{ .values = &.{}, .max_def = max_def, .has_nulls = max_def > 0 };
+            if (one_dict) {
+                const codes = try arena.alloc(u32, total);
+                var pos: usize = 0;
+                for (ranges) |r| {
+                    const b: *const TB = &@field(r.buf.*, @tagName(tag));
+                    @memcpy(codes[pos..][0 .. r.hi - r.lo], b.codes.items[r.lo..r.hi]);
+                    pos += r.hi - r.lo;
+                }
+                out.codes = codes;
+                out.dict = first.dict;
+            } else {
+                const values = try arena.alloc(T, total);
+                var pos: usize = 0;
+                for (ranges) |r| {
+                    const b: *const TB = &@field(r.buf.*, @tagName(tag));
+                    const dst = values[pos..][0 .. r.hi - r.lo];
+                    if (b.coded) {
+                        for (dst, b.codes.items[r.lo..r.hi], r.lo..) |*v, k, row| {
+                            const present = b.max_def == 0 or b.def_levels.items[row] == b.max_def;
+                            v.* = if (present) b.dict[k] else std.mem.zeroes(T);
+                        }
+                    } else @memcpy(dst, b.values.items[r.lo..r.hi]);
+                    pos += r.hi - r.lo;
+                }
+                out.values = values;
+            }
+            if (max_def > 0) {
+                const levels = try arena.alloc(u32, total);
+                var pos: usize = 0;
+                for (ranges) |r| {
+                    const b: *const TB = &@field(r.buf.*, @tagName(tag));
+                    const dst = levels[pos..][0 .. r.hi - r.lo];
+                    if (b.max_def == 0) {
+                        @memset(dst, max_def);
+                    } else {
+                        @memcpy(dst, b.def_levels.items[r.lo..r.hi]);
+                        if (b.max_def != max_def) for (dst) |*d| {
+                            if (d.* == b.max_def) d.* = max_def;
+                        };
+                    }
+                    pos += r.hi - r.lo;
+                }
+                out.def_levels = levels;
+            }
+            return @unionInit(filter_eval.Batch.Column, @tagName(tag), out);
+        },
+    }
+}
+
+/// The PLAIN size, in bits, of the present values in rows `lo..hi` of an output buffer written as `elem`: its physical
+/// width (a BOOLEAN one bit, a FIXED_LEN_BYTE_ARRAY its length), a BYTE_ARRAY 4 bytes plus its length. What output row
+/// groups are cut by: a property of the rows, however they were decoded or batched.
+pub fn plainBits(buf: *const OutputAggregator.ColumnBuf, elem: *const schema.SchemaElement, lo: usize, hi: usize) u64 {
+    const fixed: ?u64 = switch (elem.type orelse .BYTE_ARRAY) {
+        .BOOLEAN => 1,
+        .INT32, .FLOAT => 32,
+        .INT64, .DOUBLE => 64,
+        .INT96 => 96,
+        .FIXED_LEN_BYTE_ARRAY => @as(u64, @intCast(@max(0, elem.type_length orelse 0))) * 8,
+        .BYTE_ARRAY => null,
+    };
+    switch (buf.*) {
+        inline else => |b| {
+            const levels: ?[]const u32 = if (b.max_def > 0) b.def_levels.items[lo..hi] else null;
+            if (fixed) |w| return w * encoder.countPresentRows(hi - lo, levels, b.max_def);
+            if (comptime @TypeOf(b.dict) != []const []const u8) {
+                return 0;
+            } else {
+                var bits: u64 = 0;
+                for (lo..hi) |r| {
+                    if (levels) |l| if (l[r - lo] != b.max_def) continue;
+                    const v = if (b.coded) b.dict[b.codes.items[r]] else b.values.items[r];
+                    bits += (4 + @as(u64, v.len)) * 8;
+                }
+                return bits;
+            }
+        },
+    }
+}
+
+/// An encoded chunk placed at the sink's offset `out_offset.*`: its metadata copied into `out_arena` with offsets made
+/// absolute, and its pages (offsets still relative to the chunk) copied there too, for its page index.
+pub fn placeChunk(
+    out_arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    out_offset: *u64,
+    enc: encoder.EncodedColumn,
+) !struct { chunk: schema.ColumnChunk, pages: []const encoder.PageInfo } {
+    const start: i64 = @intCast(out_offset.*);
+    var em = try cloneColumnMeta(out_arena, enc.meta);
+    em.data_page_offset += start;
+    if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + start;
+    const pages = try out_arena.dupe(encoder.PageInfo, enc.pages);
+    for (pages) |*p| {
+        if (p.min) |v| p.min = try out_arena.dupe(u8, v);
+        if (p.max) |v| p.max = try out_arena.dupe(u8, v);
+    }
+    try sink.write(enc.bytes);
+    out_offset.* += enc.bytes.len;
+    return .{
+        .chunk = .{
+            .file_path = null,
+            .file_offset = start,
+            .meta_data = em,
+            .bloom_out = if (enc.bloom.len > 0) try out_arena.dupe(u8, enc.bloom) else &.{},
+        },
+        .pages = pages,
+    };
+}
 
 /// Writes encoded chunks to the sink in output order: metadata deep-cloned into `out_arena` (which outlives the
 /// encoders' arenas) with offsets made absolute, and, direct to a file, a synthesised page index after each chunk.
@@ -1932,7 +2054,7 @@ const ChunkPlacer = struct {
     columns: *std.ArrayListUnmanaged(schema.ColumnChunk),
     total: *i64,
 
-    fn place(self: ChunkPlacer, enc: encoder.EncodedColumn) !void {
+    fn place(self: ChunkPlacer, enc: encoder.EncodedColumn, elem: *const schema.SchemaElement) !void {
         const col_start_in_file: i64 = @intCast(self.out_offset.*);
         var em = try cloneColumnMeta(self.out_arena, enc.meta);
         em.data_page_offset += col_start_in_file;
@@ -1945,24 +2067,20 @@ const ChunkPlacer = struct {
         self.out_offset.* += enc.bytes.len;
         self.total.* += enc.meta.total_uncompressed_size;
 
-        // One data page per freshly encoded chunk → one OffsetIndex + ColumnIndex entry, from the stats the
-        // encoder already computed, so a filtered re-encode keeps page-level pruning too.
-        const idx = if (self.emit_page_index)
-            try synthPageIndexToSink(self.out_arena, self.sink, self.out_offset, &enc.meta, em.data_page_offset)
-        else
-            fastpath.PageIndexPtrs{};
-
-        try self.columns.append(self.out_arena, .{
+        var chunk: schema.ColumnChunk = .{
             .file_path = null,
             .file_offset = col_start_in_file,
             .meta_data = em,
-            .offset_index_offset = idx.offset_index_offset,
-            .offset_index_length = idx.offset_index_length,
-            .column_index_offset = idx.column_index_offset,
-            .column_index_length = idx.column_index_length,
             // Placed after the last row group, so it must outlive this row group's arena and the encoder's.
             .bloom_out = if (enc.bloom.len > 0) try self.out_arena.dupe(u8, enc.bloom) else &.{},
-        });
+        };
+        // Straight to a file the chunk's page index can follow it, where its pages' offsets are final.
+        if (self.emit_page_index) {
+            var so: streaming.SinkOut = .{ .sink = self.sink, .offset = @intCast(self.out_offset.*) };
+            try page_index.writeInline(self.out_arena, &so, &chunk, enc.pages, elem);
+            self.out_offset.* = so.offset;
+        }
+        try self.columns.append(self.out_arena, chunk);
     }
 };
 
@@ -7584,7 +7702,13 @@ test "Survivors: computed outputs evaluate over the kept rows only, with their l
         k += 1;
     }
     try testing.expect(s.batch.cols[0].f64.has_nulls);
-    try testing.expectEqual(@as(usize, 0), s.batch.cols[2].string.values.len);
+    // A coded column comes back with values, looked up for the kept rows only.
+    k = 0;
+    for (0..n) |r| {
+        if (!sel.isActive(r)) continue;
+        try testing.expectEqualStrings(dict[codes[r]], s.batch.cols[2].string.values[k]);
+        k += 1;
+    }
 
     // Every row kept: nothing is gathered. Kept rows with no NULL among them: the gathered column says so.
     var all = try filter_selection.SelectionVector.init(a, n);

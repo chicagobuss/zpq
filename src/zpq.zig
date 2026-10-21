@@ -44,6 +44,7 @@ pub const core = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
         pub const encoder = @import("core/writer/encoder.zig");
         pub const streaming = @import("core/writer/streaming.zig");
+        pub const page_index = @import("core/writer/page_index.zig");
     };
     pub const parquet = struct {
         pub const metadata = @import("core/parquet/metadata.zig");
@@ -126,6 +127,7 @@ test {
     _ = @import("core/writer/fastpath.zig");
     _ = @import("core/writer/encoder.zig");
     _ = @import("core/writer/streaming.zig");
+    _ = @import("core/writer/page_index.zig");
     _ = @import("core/system.zig");
     _ = @import("core/bytes.zig");
     _ = @import("core/row_group_arena.zig");

@@ -48,6 +48,8 @@ pub const Error = error{
     BadColumnIndex,
     /// The inputs declare different column orders for a copied leaf; a byte copy cannot be declared truthfully.
     ColumnOrderMismatch,
+    /// A footer past the 4-byte length Parquet gives it.
+    TooLarge,
 } || std.mem.Allocator.Error;
 
 /// One input file. `bytes` covers (at minimum) the tail/head/footer
@@ -167,7 +169,7 @@ pub fn assemble(
     try new_meta.write(&w);
 
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(w.bytes().len), .little);
+    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, w.bytes().len) orelse return error.TooLarge, .little);
     try out.write(w.bytes());
     try out.write(&len_bytes);
     try out.write(&MAGIC);

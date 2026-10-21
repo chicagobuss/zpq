@@ -236,6 +236,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "type; zpq stops rather than return a rounded or wrapped value\n",
             .{},
         ),
+        error.TooLarge => diagnosticPrint(
+            "zpq query: the output would hold a value, record or footer larger\n" ++
+                "than Parquet can describe (a page holds at most 2 GiB)\n",
+            .{},
+        ),
         error.RowGroupTooLarge => diagnosticPrint(
             "zpq query: a row group needs more memory to decode than --max-memory\n" ++
                 "allows, even one aggregate or slice of rows at a time; raise\n" ++

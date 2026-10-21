@@ -2614,7 +2614,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     try sink.write(footer_bytes);
     out_offset += footer_bytes.len;
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
+    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
     try sink.write(&len_bytes);
     out_offset += len_bytes.len;
     try sink.write(&PAR1);
@@ -7317,7 +7317,7 @@ const ParquetPrint = struct {
         const footer = writer.bytes();
         try self.sink().write(footer);
         var len: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len, @intCast(footer.len), .little);
+        std.mem.writeInt(u32, &len, std.math.cast(u32, footer.len) orelse return error.TooLarge, .little);
         try self.sink().write(&len);
         try self.sink().write("PAR1");
         self.out_offset += footer.len + 8;

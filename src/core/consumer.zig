@@ -2338,7 +2338,7 @@ fn writeAggregateRowsEncoded(
     off += footer_bytes.len;
 
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(footer_bytes.len), .little);
+    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
     try sink.write(&len_bytes);
     off += len_bytes.len;
     try sink.write(&MAGIC);

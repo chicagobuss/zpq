@@ -123,14 +123,17 @@ usage:
                  of a cgroup memory.max), half of RAM on macOS, else
                  512 MiB. Example: --max-memory 2GB.
                  Outside it, a fixed slack: the binary, thread stacks,
-                 the mapped input, each worker's first 2 MiB, 16 MiB
-                 for a GROUP BY's merge and answer, and 32 MiB for a
-                 last retry's or a sliced write's decode. A query
-                 that does not fit runs again on narrower paths (one
-                 worker, smaller slices) and else fails with an error,
-                 never more memory. Written bytes never depend on -j;
-                 an explicit --max-memory caps re-encoded row groups
-                 at a sixteenth of it, so they may depend on its value.
+                 the mapped input, each worker's first 2 MiB and its
+                 codec state (about 0.1 MiB reading; writing, +0.2 MiB
+                 snappy, +0.1 MiB gzip, +1.3 MiB zstd, +3.5 MiB zstd at
+                 --compress-priority speed), 16 MiB for a GROUP BY's
+                 merge and answer, and 32 MiB for a last retry's or a
+                 sliced write's decode. A query that does not fit runs
+                 again on narrower paths (one worker, smaller slices)
+                 and else fails with an error, never more memory.
+                 Written bytes never depend on -j; an explicit
+                 --max-memory caps re-encoded row groups at a sixteenth
+                 of it, so they may depend on its value.
   --explain      print an aggregate plan as JSON using only file footers;
                  accepts SQL or --aggregate / --group-by, then exits.
   --profile      write a Chrome Trace Event JSON trace of the query

@@ -112,4 +112,7 @@ a DECIMAL (`value / 4.0`) gives a DOUBLE. Any Parquet reader can open the output
 - `zpq --help` or `man zpq`: every option. Exit codes: 0 means success, 1 a read, decode or write failure, 2 an invalid
   query or option, and 141 a closed stdout pipe.
 - `--max-memory 2GB` caps what one query holds at once. A query that does not fit fails with an error instead of
-  growing past the cap.
+  growing past the cap. A fixed slack sits outside it, listed under `--max-memory` in `zpq --help`: thread stacks, the
+  mapped input, and per worker its first 2 MiB of decode memory and its codec state (about 0.1 MiB reading; writing,
+  up to 0.2 MiB more for snappy, 0.1 MiB for gzip, 1.3 MiB for zstd or 3.5 MiB for zstd with
+  `--compress-priority speed`).

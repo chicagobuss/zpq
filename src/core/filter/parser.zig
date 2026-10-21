@@ -300,13 +300,9 @@ fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) 
         };
         return err;
     };
-    var leaves: schema.LeafIterator = .init(file.schema.items);
-    while (leaves.next()) |leaf| if (leaf.index == ci) {
-        if (leaf.max_rep > 0) {
-            Diag.setColumn(diag, ident);
-            return error.NestedFilterNotSupported;
-        }
-        break;
+    if (file.leafAt(ci)) |leaf| if (leaf.max_rep > 0) {
+        Diag.setColumn(diag, ident);
+        return error.NestedFilterNotSupported;
     };
     return ci;
 }

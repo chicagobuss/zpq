@@ -113,6 +113,7 @@ pub fn openFooter(
     for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| if (chunk.encrypted) return error.EncryptedFile;
     try checkFooterFields(&meta);
     try reconcileChunkPaths(allocator, &meta);
+    try meta.indexLeaves(allocator);
     return meta;
 }
 
@@ -400,11 +401,7 @@ pub fn schemaMismatch(
 /// The schema element of the `leaf_idx`-th primitive leaf, as
 /// `resolveColumn` counts them. Null when the schema has fewer leaves.
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
-    var it: schema.LeafIterator = .init(file.schema.items);
-    while (it.next()) |leaf| {
-        if (leaf.index == leaf_idx) return leaf.element.*;
-    }
-    return null;
+    return (file.leafAt(leaf_idx) orelse return null).element.*;
 }
 
 /// The dot-joined path of the `leaf_idx`-th primitive leaf (`key` for a
@@ -608,6 +605,7 @@ pub fn quotedPathEql(name: []const u8, segments: []const []const u8) bool {
 /// Number of leaf columns in the schema: the column-chunk count of every row group (enforced at footer open), and
 /// still defined for a file with no row groups at all, which is a valid empty table.
 pub fn leafCount(file: *const schema.FileMetaData) usize {
+    if (file.leaf_index) |ix| if (ix.schema_len == file.schema.items.len) return ix.leaves.items.len;
     var it: schema.LeafIterator = .init(file.schema.items);
     while (it.next()) |_| {}
     return it.index;
@@ -618,11 +616,7 @@ pub fn leafCount(file: *const schema.FileMetaData) usize {
 /// Compare paths by these segments, never by `leafPath`'s dot-joined form: a top-level column named `a.b` and the
 /// field `b` of a group `a` join to the same string.
 pub fn leafPathSegments(arena: std.mem.Allocator, file: *const schema.FileMetaData, leaf_idx: usize) !?[]const []const u8 {
-    var it: schema.LeafIterator = .init(file.schema.items);
-    while (it.next()) |leaf| {
-        if (leaf.index == leaf_idx) return try arena.dupe([]const u8, leaf.path);
-    }
-    return null;
+    return try arena.dupe([]const u8, (file.leafAt(leaf_idx) orelse return null).path);
 }
 
 /// The leaves a name matches at each step of `resolveColumn`: top-level leaves named exactly `name`; nested leaves
@@ -1508,4 +1502,67 @@ test "encrypted Parquet is refused where its footer is opened, footer encrypted 
         defer a.free(bytes);
         try testing.expectError(error.EncryptedFile, open(a, bytes));
     }
+}
+
+test "the leaf index answers every path lookup as the schema walk does" {
+    const a = testing.allocator;
+    const corpus = "data/parquet-testing/data";
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, corpus, .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(std.testing.io);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| a.free(n);
+        names.deinit(a);
+    }
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |e| {
+        if (!std.mem.endsWith(u8, e.name, ".parquet")) continue;
+        try names.append(a, try std.fmt.allocPrint(a, "data/parquet-testing/data/{s}", .{e.name}));
+    }
+    // Duplicate and dotted names, nested keys and legacy repeated fields.
+    for ([_][]const u8{ "dotted_twin", "nested_key_shape", "format_repeated", "format_repeated_group", "null_pages" }) |f| {
+        try names.append(a, try std.fmt.allocPrint(a, "ci/fixtures/parquet/{s}.parquet", .{f}));
+    }
+    var checked: usize = 0;
+    for (names.items) |path| {
+        const bytes = readFileSlice(path, a) catch continue;
+        defer a.free(bytes);
+        var meta = open(a, bytes) catch continue;
+        defer meta.deinit(a);
+        try testing.expect(meta.leaf_index != null);
+        var walk = meta;
+        walk.leaf_index = null;
+        var leaves: schema.LeafIterator = .init(meta.schema.items);
+        while (leaves.next()) |leaf| {
+            const want = walk.getColumnSchema(leaf.path);
+            const got = meta.getColumnSchema(leaf.path);
+            try testing.expectEqual(want == null, got == null);
+            if (want) |w| try testing.expectEqualStrings(w.name, got.?.name);
+            try testing.expectEqual(walk.getColumnLevels(leaf.path), meta.getColumnLevels(leaf.path));
+            checked += 1;
+        }
+        const missing = [_][]const u8{ "no", "such", "column" };
+        try testing.expect(meta.getColumnSchema(&missing) == null);
+        try testing.expectEqual(walk.getColumnLevels(&missing), meta.getColumnLevels(&missing));
+    }
+    std.debug.print("leaf index: {d} leaves of {d} files agree with the walk\n", .{ checked, names.items.len });
+    try testing.expect(checked > 500);
+}
+
+test "a footer's leaf index is freed whole when an allocation fails" {
+    const bytes = readFileSlice("ci/fixtures/parquet/nested_key_shape.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var meta = try open(testing.allocator, bytes);
+    defer meta.deinit(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(alloc: std.mem.Allocator, opened: *const schema.FileMetaData) !void {
+            var m = opened.*;
+            m.leaf_index = null;
+            try m.indexLeaves(alloc);
+            m.leaf_index.?.destroy(alloc);
+        }
+    }.run, .{&meta});
 }

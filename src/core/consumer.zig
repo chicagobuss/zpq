@@ -198,10 +198,7 @@ pub fn initOutputAggregator(
                 const kept_ci = pt.ci;
                 // The leaf and its path come from the schema, which every chunk's path_in_schema matches (footer
                 // open enforces it), so a file with no row groups still builds its output schema.
-                var leaves: schema.LeafIterator = .init(meta.schema.items);
-                const leaf = while (leaves.next()) |l| {
-                    if (l.index == kept_ci) break l;
-                } else return error.ColumnMetaMissing;
+                const leaf = meta.leafAt(kept_ci) orelse return error.ColumnMetaMissing;
                 const src_elem = leaf.element.*;
                 paths[i] = try arena.dupe([]const u8, leaf.path);
 

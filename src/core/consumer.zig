@@ -416,6 +416,10 @@ pub const ProjectedRG = struct {
     unscaled: []?filter_eval.ColumnT(i128),
     sel: filter_selection.SelectionVector,
     surviving: usize,
+    /// Per leaf: read by some computed output.
+    computed_refs: []const bool,
+    /// What computed outputs evaluate over, made by the first one projected (`survivors`).
+    survived: ?Survivors = null,
 
     pub fn init(
         self: *ProjectedRG,
@@ -516,7 +520,20 @@ pub const ProjectedRG = struct {
             .unscaled = unscaled,
             .sel = sel,
             .surviving = surviving,
+            .computed_refs = computed_refs,
         };
+    }
+
+    fn survivors(self: *ProjectedRG) !*const Survivors {
+        if (self.survived == null) self.survived = try Survivors.init(
+            self.arena_state.allocator(),
+            &self.batch,
+            self.lookup,
+            self.computed_refs,
+            &self.sel,
+            self.surviving,
+        );
+        return &self.survived.?;
     }
 
     pub fn deinit(self: *ProjectedRG) void {
@@ -569,7 +586,12 @@ pub const ProjectedRG = struct {
                 profile.record(timings.prof, .decode, t0, t1, profile.args(.{ 0, 0, 1 }));
                 break :blk decoded;
             } else return error.MissingDecodedColumn,
-            .computed => |c| try booleanLane(ra, agg.cols[i], try expr_eval.evalExpr(ra, &self.batch.restrictedTo(&self.sel), self.lookup, c.expr)),
+            .computed => |c| {
+                const s = try self.survivors();
+                const col = try booleanLane(ra, agg.cols[i], try expr_eval.evalExpr(ra, &s.batch, self.lookup, c.expr));
+                try appendSelected(&agg.cols[i], col, s.sel, self.surviving, agg.arena, false, late.allocator());
+                return;
+            },
         };
         const col = if (spec == .passthrough) try namedLevels(late.allocator(), spec.passthrough, decoded) else decoded;
         if (col.nullInfo().max_rep == 0) {
@@ -579,6 +601,82 @@ pub const ProjectedRG = struct {
         try appendIntoBuf(&agg.cols[i], try encoder.applySelection(late.allocator(), col, &self.sel), agg.arena);
     }
 };
+
+/// The rows a filter kept, as computed outputs evaluate over them: the columns they read gathered down to those rows,
+/// so no expression is computed for a row that is not written (a `value * 1.19` over 1% of a row group costs 1% of
+/// one over all of it). `sel` then covers the gathered rows. A column that cannot be gathered row for row (nested)
+/// leaves the whole batch, restricted to the kept rows (`Batch.sel`) as before: values computed for every row, faults
+/// raised only for kept ones.
+pub const Survivors = struct {
+    batch: filter_eval.Batch,
+    sel: *const filter_selection.SelectionVector,
+
+    /// `refs` marks, by leaf, the columns computed outputs read (through `lookup`); others are left as they are.
+    pub fn init(
+        arena: std.mem.Allocator,
+        batch: *const filter_eval.Batch,
+        lookup: []const ?usize,
+        refs: []const bool,
+        sel: *const filter_selection.SelectionVector,
+        surviving: usize,
+    ) !Survivors {
+        if (surviving == batch.num_rows) return .{ .batch = batch.*, .sel = sel };
+        const cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
+        for (refs, 0..) |r, ci| {
+            if (!r or ci >= lookup.len) continue;
+            const pos = lookup[ci] orelse continue;
+            cols[pos] = try gatherRows(arena, batch.cols[pos], sel, surviving) orelse
+                return .{ .batch = batch.restrictedTo(sel), .sel = sel };
+        }
+        const all = try arena.create(filter_selection.SelectionVector);
+        all.* = try filter_selection.SelectionVector.init(arena, surviving);
+        return .{ .batch = .{ .cols = cols, .num_rows = surviving }, .sel = all };
+    }
+};
+
+/// `col`'s rows that `sel` keeps (`surviving` of them), with everything kept row for row moved alongside: levels,
+/// dictionary codes and a DECIMAL's exact integers. Null for a column whose values are not one per row.
+fn gatherRows(
+    arena: std.mem.Allocator,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    surviving: usize,
+) !?filter_eval.Batch.Column {
+    switch (col) {
+        inline else => |c, tag| {
+            if (c.max_rep > 0 or c.levels_only_rows != 0 or c.hist != null) return null;
+            const T = @typeInfo(@TypeOf(c.values)).pointer.child;
+            var out = c;
+            if (!c.codesOnly()) {
+                const vals = try arena.alloc(T, surviving);
+                encoder.compactByMask(T, c.values, sel.mask, vals);
+                out.values = vals;
+            }
+            if (c.codes) |k| {
+                const codes = try arena.alloc(u32, surviving);
+                encoder.compactByMask(u32, k, sel.mask, codes);
+                out.codes = codes;
+            }
+            if (c.def_levels) |dl| {
+                const levels = try arena.alloc(u32, surviving);
+                encoder.compactByMask(u32, dl, sel.mask, levels);
+                out.def_levels = levels;
+                out.has_nulls = for (levels) |d| {
+                    if (d < c.max_def) break true;
+                } else false;
+            }
+            if (c.unscaled) |u| out.unscaled = switch (u) {
+                inline else => |v, utag| blk: {
+                    const U = @typeInfo(@TypeOf(v)).pointer.child;
+                    const exact = try arena.alloc(U, surviving);
+                    encoder.compactByMask(U, v, sel.mask, exact);
+                    break :blk @unionInit(filter_eval.Exact, @tagName(utag), exact);
+                },
+            };
+            return @unionInit(filter_eval.Batch.Column, @tagName(tag), out);
+        },
+    }
+}
 
 /// Decode column `ci` of a row group into the batch lane the write path keeps it in.
 fn decodeWriteColumn(
@@ -685,10 +783,21 @@ pub fn appendSliceRows(
 ) !usize {
     const surviving = sel.count();
     if (surviving == 0) return 0;
+    var survived: ?Survivors = null;
     for (output_specs, 0..) |spec, i| {
+        var rows = sel;
         var col: filter_eval.Batch.Column = switch (spec) {
             .passthrough => |pt| try namedLevels(scratch, pt, batch.cols[lookup[pt.ci] orelse return error.MissingDecodedColumn]),
-            .computed => |c| try booleanLane(scratch, agg.cols[i], try expr_eval.evalExpr(scratch, &batch.restrictedTo(sel), lookup, c.expr)),
+            .computed => |c| blk: {
+                if (survived == null) {
+                    const refs = try scratch.alloc(bool, lookup.len);
+                    @memset(refs, false);
+                    for (output_specs) |o| if (o == .computed) o.computed.expr.collectColumns(refs);
+                    survived = try Survivors.init(scratch, batch, lookup, refs, sel, surviving);
+                }
+                rows = survived.?.sel;
+                break :blk try booleanLane(scratch, agg.cols[i], try expr_eval.evalExpr(scratch, &survived.?.batch, lookup, c.expr));
+            },
         };
         // A DECIMAL written losslessly buffers its exact integers.
         if (agg.cols[i] == .i128 and col == .f64) {
@@ -696,7 +805,7 @@ pub fn appendSliceRows(
             const exact = try expr_eval.unscaledView(scratch, col);
             col = .{ .i128 = exact };
         }
-        try appendSelected(&agg.cols[i], col, sel, surviving, agg.arena, false, scratch);
+        try appendSelected(&agg.cols[i], col, rows, surviving, agg.arena, false, scratch);
     }
     agg.num_rows += surviving;
     return surviving;
@@ -7431,4 +7540,93 @@ test "appendSelected keeps one level per row when a column's batches come with a
     try appendSelected(&plain, without, &sel, 2, a, false, a);
     try appendSelected(&plain, without, &sel, 2, a, false, a);
     try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
+}
+
+test "Survivors: computed outputs evaluate over the kept rows only, with their levels, codes and exact values" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 200;
+    const x = try a.alloc(f64, n);
+    const x_def = try a.alloc(u32, n);
+    const d_vals = try a.alloc(f64, n);
+    const d_exact = try a.alloc(i64, n);
+    const codes = try a.alloc(u32, n);
+    var sel = try filter_selection.SelectionVector.init(a, n);
+    for (0..n) |r| {
+        x[r] = @floatFromInt(r);
+        x_def[r] = @intFromBool(r % 7 != 3);
+        d_exact[r] = @intCast(r * 25);
+        d_vals[r] = @as(f64, @floatFromInt(r * 25)) / 100.0;
+        codes[r] = @intCast(r % 3);
+        sel.set(r, r % 5 == 1 or r % 7 == 3 or r == 64);
+    }
+    const surviving = sel.count();
+    const dict = [_][]const u8{ "a", "bb", "ccc" };
+    const cols = [_]filter_eval.Batch.Column{
+        .{ .f64 = .{ .values = x, .def_levels = x_def, .max_def = 1, .has_nulls = true } },
+        .{ .f64 = .{ .values = d_vals, .unscaled = .{ .i64 = d_exact } } },
+        .{ .string = .{ .values = &.{}, .codes = codes, .dict = &dict } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    const s = try Survivors.init(a, &batch, &lookup, &.{ true, true, true }, &sel, surviving);
+    try testing.expectEqual(surviving, s.batch.num_rows);
+    try testing.expectEqual(surviving, s.sel.count());
+    var k: usize = 0;
+    for (0..n) |r| {
+        if (!sel.isActive(r)) continue;
+        try testing.expectEqual(x[r], s.batch.cols[0].f64.values[k]);
+        try testing.expectEqual(x_def[r], s.batch.cols[0].f64.def_levels.?[k]);
+        try testing.expectEqual(d_exact[r], s.batch.cols[1].f64.unscaled.?.i64[k]);
+        try testing.expectEqual(codes[r], s.batch.cols[2].string.codes.?[k]);
+        k += 1;
+    }
+    try testing.expect(s.batch.cols[0].f64.has_nulls);
+    try testing.expectEqual(@as(usize, 0), s.batch.cols[2].string.values.len);
+
+    // Every row kept: nothing is gathered. Kept rows with no NULL among them: the gathered column says so.
+    var all = try filter_selection.SelectionVector.init(a, n);
+    const whole = try Survivors.init(a, &batch, &lookup, &.{ true, true, true }, &all, n);
+    try testing.expectEqual(x.ptr, whole.batch.cols[0].f64.values.ptr);
+    var present = try filter_selection.SelectionVector.init(a, n);
+    for (0..n) |r| present.set(r, x_def[r] == 1 and r % 2 == 0);
+    const no_nulls = try Survivors.init(a, &batch, &lookup, &.{ true, false, false }, &present, present.count());
+    try testing.expect(!no_nulls.batch.cols[0].f64.has_nulls);
+    // Columns no computed output reads stay as they are.
+    try testing.expectEqual(d_vals.ptr, no_nulls.batch.cols[1].f64.values.ptr);
+}
+
+test "appendSliceRows: a computed column over the kept rows is the one computed over every row and then filtered" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 300;
+    const x = try a.alloc(f64, n);
+    const x_def = try a.alloc(u32, n);
+    var sel = try filter_selection.SelectionVector.init(a, n);
+    for (0..n) |r| {
+        x[r] = @as(f64, @floatFromInt(r)) * 1.5 - 7;
+        x_def[r] = @intFromBool(r % 11 != 0);
+        sel.set(r, r % 3 != 1);
+    }
+    const cols = [_]filter_eval.Batch.Column{.{ .f64 = .{ .values = x, .def_levels = x_def, .max_def = 1, .has_nulls = true } }};
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{0};
+    var left: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var right: expr_ast.Expr = .{ .literal = .{ .f64 = 1.19 } };
+    const e: expr_ast.Expr = .{ .binop = .{ .op = .mul, .left = &left, .right = &right, .result_type = .f64, .depth = 1 } };
+    const specs = [_]OutputCol{.{ .computed = .{ .expr = e, .alias = "g" } }};
+    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = n, .created_by = null, .row_groups = .empty };
+    var agg = try initOutputAggregator(a, &meta, &specs);
+    try testing.expectEqual(sel.count(), try appendSliceRows(&agg, &batch, &lookup, &sel, &specs, a));
+    const dense = try expr_eval.evalExpr(a, &batch.restrictedTo(&sel), &lookup, e);
+    var want: OutputAggregator.ColumnBuf = .{ .f64 = .{} };
+    try appendSelected(&want, dense, &sel, sel.count(), a, false, a);
+    try testing.expectEqualSlices(u32, want.f64.def_levels.items, agg.cols[0].f64.def_levels.items);
+    for (want.f64.values.items, agg.cols[0].f64.values.items, want.f64.def_levels.items) |w, g, d| {
+        if (d == 1) try testing.expectEqual(w, g);
+    }
 }

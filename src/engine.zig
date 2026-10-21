@@ -1142,10 +1142,11 @@ pub const RowGroupTarget = struct {
     }
 };
 
-/// 2^20 rows, the row group pyarrow writes, and a byte cap that holds a wide row group to what one writer can buffer
-/// decoded and encode without the row cap's 1M rows of a hundred columns (DuckDB and Spark cap theirs by bytes too).
-pub const default_row_group_rows: usize = 1 << 20;
-pub const default_row_group_bytes: u64 = 128 << 20;
+/// 2^17 rows (DuckDB writes 122,880, Polars about 2^18) and 64 MiB: readers that split a file by row group read a
+/// 2^20-row group of a 1M-row output 2-5x slower than 2^17-row ones (DuckDB, Polars), for 0.2% of file size and no
+/// write time. The byte cap keeps a wide row group to what one writer buffers decoded and encodes at once.
+pub const default_row_group_rows: usize = 1 << 17;
+pub const default_row_group_bytes: u64 = 64 << 20;
 
 /// The writer's cutter: takes pieces in input order, holds their rows until an output row group's worth is in, then
 /// encodes and writes it. A piece may end one row group and start the next.

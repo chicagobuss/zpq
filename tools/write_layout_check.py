@@ -66,7 +66,8 @@ def main():
         out = os.path.join(tmp, f"t9_j{j}.parquet")
         r = zpq(t9, "--scan-all", "--filter", "id >= 0", "-j", str(j), "-o", out)
         seen[j] = digest(out) if r.returncode == 0 else r.stderr.strip()[:60]
-    report(len(set(seen.values())) == 1 and rg_rows(os.path.join(tmp, "t9_j1.parquet")) == [200_000],
+    # 131,072 rows, then the 1 KiB strings reach 64 MiB.
+    report(len(set(seen.values())) == 1 and rg_rows(os.path.join(tmp, "t9_j1.parquet")) == [131_072, 64_777, 4_151],
            "t9:bytes-at-every-j", str(rg_rows(os.path.join(tmp, "t9_j1.parquet"))))
 
     # 2. Explicit budgets, every codec, -j1 against -j16.
@@ -101,7 +102,7 @@ def main():
         # k and d (INT64-backed) 8 bytes each, v 8 when present, s 4 + 9 when present: about 32 bytes a row, so
         # 1MB closes at about 32,000.
         ("bytes", ["--row-group-bytes", "1MB"], None),
-        ("default", [], [n]),
+        ("default", [], [131_072, n - 131_072]),
     ]
     for label, extra, want_rows in cases:
         out = os.path.join(tmp, f"src_{label}.parquet")

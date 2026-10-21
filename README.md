@@ -232,7 +232,7 @@ a lossy detour through DOUBLE). Direct projection copies preserve page indexes; 
 
 **Output layout.** A write that re-encodes (a filter, `--select` or a computed column) cuts its row groups from the
 rows it writes, in order, not from the input's row groups: one closes once it holds `--row-group-size` rows (default
-1,048,576) or its values take `--row-group-bytes` (default 128 MiB) at their PLAIN size, a fixed-width value its
+131,072) or its values take `--row-group-bytes` (default 64 MiB) at their PLAIN size, a fixed-width value its
 width and a byte array 4 bytes plus its length. Each column chunk is split into data pages of at most 1 MiB of
 values or 20,000 rows, and gets a page index (ColumnIndex and OffsetIndex, written after the row groups, column by
 column). The bytes written depend only on the inputs and the options: the same file at every `-j`, on every machine.

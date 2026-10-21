@@ -125,7 +125,6 @@ def as_key(phys, v):
 def check_file(path, require_index, quiet):
     data = open(path, "rb").read()
     meta = footer(data)
-    table = pq.read_table(path)
     pf = pq.ParquetFile(path)
     schema_elems = meta[2]
     leaves = [e for e in schema_elems[1:] if 5 not in e or not e.get(5)]  # num_children unset → leaf
@@ -202,12 +201,13 @@ def check_file(path, require_index, quiet):
             nan_counts = ci_s.get(8)
             if not (len(null_pages) == len(mins) == len(maxs) == len(data_pages)):
                 fail(f"rg {rgi} col {ci}: column index lists disagree with {len(data_pages)} pages")
-            col = table.column(ci)
+            # One column chunk at a time: memory stays one chunk's values, whatever the file's size.
+            col = pf.read_row_group(rgi, columns=[pf.schema_arrow.names[ci]]).column(0)
             first = 0
             prev = None
             asc = desc = True
             for pi, p in enumerate(data_pages):
-                vals = col.slice(row_base + first, p["values"])
+                vals = col.slice(first, p["values"])
                 first += p["values"]
                 nulls = vals.null_count
                 present = vals.drop_null()

@@ -62,8 +62,8 @@ usage:
   \-\-row\-group\-size, \-\-row\-group\-bytes
                  where a re\-encoding write (a filter, \-\-select or a
                  computed column) cuts its output row groups: once
-                 one holds ROWS rows (default 1048576) or its values
-                 take SIZE bytes uncompressed (default 128MB), from
+                 one holds ROWS rows (default 131072) or its values
+                 take SIZE bytes uncompressed (default 64MB), from
                  the rows written alone, not the input's row groups,
                  \-j or memory. Data pages close at 1 MiB or 20,000
                  rows, and each gets a page index entry. A plain copy

@@ -28,7 +28,7 @@ shell-completion and man-page packaging.
    every `-j`; 0.4.1 sorted them by their serialized key bytes. Add `ORDER BY` if you need an order.
 6. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141.
 7. **Expect a different layout in files zpq re-encodes** (any filter, `--select` or computed column). Output row
-   groups no longer follow the input's: they hold up to 1,048,576 rows or 128 MiB of uncompressed values
+   groups no longer follow the input's: they hold up to 131,072 rows or 64 MiB of uncompressed values
    (`--row-group-size`, `--row-group-bytes`), so a selective filter over many small row groups writes a few large
    ones. Chunks are split into data pages of at most 1 MiB or 20,000 rows, with a page index. The bytes written depend
    only on the input and the options, never on `-j` or the machine's memory; an explicit `--max-memory` caps row
@@ -308,11 +308,13 @@ client of the C ABI can do the same.
 
 **Writes**
 - A re-encoding write (any filter, `--select` or computed column) cuts its output into row groups by a target, not
-  by the input's row groups: a row group closes once it holds 1,048,576 rows or its values take 128 MiB at their PLAIN
+  by the input's row groups: a row group closes once it holds 131,072 rows or its values take 64 MiB at their PLAIN
   size (a fixed-width value its width, a byte array 4 bytes plus its length, NULLs nothing). `--row-group-size` and
   `--row-group-bytes` (the requests' `row_group_size` and `row_group_bytes`) set them. Rows from several input row
   groups and files fill one output row group, and one input row group can span two. 0.4.1 wrote one output row group
-  per input row group (400 tiny row groups for a 1% filter over 400 inputs); pyarrow writes 1,048,576 rows too.
+  per input row group (400 tiny row groups for a 1% filter over 400 inputs). The defaults are near DuckDB's 122,880
+  rows: readers that split a file by row group (DuckDB, Polars) read 1M rows held in one row group several times
+  slower than in eight.
   Row groups byte-copied whole by a filter that statistics prove matches them still go as they came, closing the
   re-encoded row group before them. A Parquet answer with `--limit`, `OFFSET` or `ORDER BY` is cut the same way; it
   was one row group per batch read.

@@ -176,7 +176,7 @@ if [ "$RECORD" = 0 ]; then
 fi
 
 # ---------------------------------------------------------------- CLI smoke
-AGG='count(*) AS n, sum(qty) AS s, min(price) AS lo, max(name) AS hi, avg(opt) AS a'
+AGG='count(*) AS n, sum(qty) AS s, min(price) AS lo, max(name) AS hi, avg(opt) AS a, avg_state(opt) AS st'
 WCOLS='id,qty,price,name,opt,day'
 
 case_out version --version

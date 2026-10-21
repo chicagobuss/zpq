@@ -121,7 +121,8 @@ def main():
 
     # GROUP BY: first-appearance order, same bits everywhere; --unordered same groups and integers.
     for name, inputs, agg in (
-        ("group-by", paths, ["--aggregate", "sum(v) AS sv, avg(v) AS av, count(*) AS c, min(s) AS ms"]),
+        ("group-by", paths,
+         ["--aggregate", "sum(v) AS sv, avg(v) AS av, avg_state(v) AS st, count(*) AS c, min(s) AS ms"]),
         ("group-by-wide", [make_group_input(d)], ["--aggregate", "sum(v) AS sv, avg(v) AS av, count(*) AS c"]),
     ):
         agg = [*agg, "--group-by", "k"]

@@ -272,9 +272,11 @@ mrow "min(amt)"    "min(amt)"    # DOUBLE
 mrow "max(amt)"    "max(amt)"
 mrow "sum(amt)"    "sum(amt)"
 mrow "avg(amt)"    "avg(amt)"
+mrow "avg_state(amt)" "avg_state(amt)"
 mrow "min(price)"  "min(price)"  # DECIMAL
 mrow "max(price)"  "max(price)"
 mrow "sum(price)"  "sum(price)"
+mrow "avg(price)"  "avg(price)"
 mrow "min(name)"   "min(name)"   # STRING
 mrow "max(name)"   "max(name)"
 mrow "min(d)"      "min(d)"      # DATE

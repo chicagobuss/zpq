@@ -53,10 +53,8 @@ def zpq_rows(sql):
 
 
 def as_answer(v, like):
-    """zpq's JSON value as the answer it stands for: AVG is printed as its re-aggregatable {sum, count}; a column the
-    file stores as days since the epoch (ClickBench's EventDate, which DuckDB's view turns into a DATE) is that date."""
-    if isinstance(v, dict) and set(v) == {"sum", "count"}:
-        return None if not v["count"] else v["sum"] / v["count"]
+    """zpq's JSON value as the answer it stands for: a column the file stores as days since the epoch (ClickBench's
+    EventDate, which DuckDB's view turns into a DATE) is that date."""
     if isinstance(like, datetime.date) and not isinstance(like, datetime.datetime) and isinstance(v, int):
         return datetime.date(1970, 1, 1) + datetime.timedelta(days=v)
     return v

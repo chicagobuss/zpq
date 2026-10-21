@@ -33,6 +33,7 @@ import tempfile
 import traceback
 import uuid
 from decimal import Decimal
+from fractions import Fraction
 
 import duckdb
 import pyarrow as pa
@@ -105,6 +106,22 @@ def gen_arrow_types(path):
     pq.write_table(tbl, path, row_group_size=256, use_dictionary=["dict", "ls"], store_schema=False)
 
 
+def avg_dec(total, n, scale):
+    """zpq's avg over a DECIMAL as exact text: `total` (the exact sum, as text) over `n`, rounded half away from zero
+    to `scale` digits. Registered on the oracle's connection as `zpq_avg`."""
+    if not n:
+        return None
+    q = Fraction(Decimal(total)) / n * 10**scale
+    m = (2 * abs(q.numerator) + q.denominator) // (2 * q.denominator)
+    return f"{'-' if q < 0 else ''}{m}E-{scale}"
+
+
+def duck_avg_dec(arg, p, s):
+    """DuckDB SQL for zpq's avg over `arg`, a DECIMAL(p, s): exact, as DECIMAL(q, s + q - p), q = min(38, p + 4)."""
+    q = min(38, p + 4)
+    return f"CAST(zpq_avg(sum({arg})::VARCHAR, count({arg}), {s + q - p}) AS DECIMAL({q}, {s + q - p}))"
+
+
 def gen_one_row(path):
     pq.write_table(pa.table({"k": pa.array(["only"]), "v": pa.array([Decimal("12345678901234567890.12")],
                                                                     pa.decimal128(38, 2))}), path)
@@ -118,12 +135,15 @@ def gen_empty(path):
 # The matrix. A cell is a SQL text over `{src}` that zpq and DuckDB both run, and optionally the structured request
 # (filter / columns / select / aggregate / group_by) that writes the same table from Python.
 
-def cell(cid, sql, req=None, order=False, passthrough=False, approx=(), units=None, refuse=(), widened=(), renames=None):
+def cell(cid, sql, req=None, order=False, passthrough=False, approx=(), units=None, refuse=(), widened=(), renames=None,
+         oracle=None):
     """`refuse`: the checks where a refusal is the documented answer (rows of repeated columns). `widened`: computed
     outputs of a FLOAT16 column, which a write widens to DOUBLE by design (as `WIDENED` allows a passthrough).
-    `renames`: output name -> source column for aliases, which must keep the source's type exactly, as a passthrough."""
+    `renames`: output name -> source column for aliases, which must keep the source's type exactly, as a passthrough.
+    `oracle`: the SQL DuckDB answers in place of `sql`, where DuckDB has no such aggregate or types it otherwise."""
     return {"id": cid, "sql": sql, "req": req, "order": order, "passthrough": passthrough, "approx": set(approx),
-            "units": units or {}, "refuse": set(refuse), "widened": set(widened), "renames": renames or {}}
+            "units": units or {}, "refuse": set(refuse), "widened": set(widened), "renames": renames or {},
+            "oracle": oracle}
 
 
 def sources(work):
@@ -156,7 +176,12 @@ def sources(work):
              req={"filter": "value > 10.00", "columns": ["value"]}),
         cell("agg", "SELECT sum(value) AS s, min(value) AS mn, max(value) AS mx, count(value) AS n FROM '{src}'",
              req={"aggregate": "sum(value) AS s, min(value) AS mn, max(value) AS mx, count(value) AS n"}),
-        cell("avg", "SELECT avg(value) AS a FROM '{src}'", req={"aggregate": "avg(value) AS a"}, approx=["a"]),
+        # avg over DECIMAL(25,2) is the exact mean as DECIMAL(29,6), where DuckDB's avg is a DOUBLE; avg_state is the
+        # sum and count it divides, `a__sum` and `a__count` in every output (in JSON, the pair under `a`).
+        cell("avg", "SELECT avg(value) AS a FROM '{src}'", req={"aggregate": "avg(value) AS a"},
+             oracle=f"SELECT {duck_avg_dec('value', 25, 2)} AS a FROM '{{src}}'"),
+        cell("avg_state", "SELECT avg_state(value) AS a FROM '{src}'", req={"aggregate": "avg_state(value) AS a"},
+             oracle="SELECT sum(value) AS a__sum, count(value) AS a__count FROM '{src}'"),
     ])
     src("bytearray_decimal", f"{PT}/byte_array_decimal.parquet", "DECIMAL(4,2) on BYTE_ARRAY", [
         cell("proj", "SELECT value FROM '{src}' WHERE value >= 5.00 ORDER BY value", order=True,
@@ -368,7 +393,7 @@ def json_value(v, t, unit=None):
     if pa.types.is_interval(t):
         return (v["months"], v["days"], v["millis"] * 10**6)
     if pa.types.is_floating(t):
-        return v if isinstance(v, dict) else float(v)  # a dict is avg's {"sum", "count"}; "NaN" is a string
+        return float(v)  # "NaN" is a string
     if pa.types.is_binary(t) or pa.types.is_large_binary(t) or pa.types.is_fixed_size_binary(t):
         if isinstance(v, dict):
             return base64.b64decode(v["base64"])
@@ -383,12 +408,6 @@ def json_value(v, t, unit=None):
 def eq(a, b, approx=False, f32=False):
     if a is None or b is None:
         return a is None and b is None
-    if isinstance(a, dict) or isinstance(b, dict):  # avg pair against a float average
-        d, f = (a, b) if isinstance(a, dict) else (b, a)
-        if d.get("count") in (0, None):
-            return f is None
-        avg = Decimal(str(d["avg"])) if "avg" in d else Decimal(str(d["sum"])) / Decimal(d["count"])
-        return math.isclose(float(avg), float(f), rel_tol=1e-12)
     if isinstance(a, float) or isinstance(b, float):
         a, b = float(a), float(b)
         if math.isnan(a) or math.isnan(b):
@@ -433,26 +452,10 @@ def compare_rows(got, want, names, order, approx, f32cols):
 
 
 def table_rows(t):
-    """Canonical row tuples of an Arrow table, typed by its own schema; avg split columns rejoined."""
+    """Canonical row tuples of an Arrow table, typed by its own schema."""
     t = flat_table(t)
     cols = [arrow_values(t.column(i), t.schema.field(i).type) for i in range(t.num_columns)]
-    names = t.schema.names
-    # `-o` writes an avg as `<name>__sum` and `<name>__count`.
-    joined, rows_cols = [], []
-    skip = set()
-    for i, n in enumerate(names):
-        if n in skip:
-            continue
-        if n.endswith("__sum") and n[:-5] + "__count" in names:
-            j = names.index(n[:-5] + "__count")
-            skip.add(names[j])
-            joined.append(n[:-5])
-            rows_cols.append([None if s is None and c in (0, None) else {"sum": s, "count": c}
-                              for s, c in zip(cols[i], cols[j])])
-            continue
-        joined.append(n)
-        rows_cols.append(cols[i])
-    return joined, [tuple(r) for r in zip(*rows_cols)] if rows_cols else []
+    return t.schema.names, [tuple(r) for r in zip(*cols)] if cols else []
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -502,6 +505,7 @@ class Ctx:
         self.duck.execute(f"SET threads = {args.duck_threads}")
         self.duck.execute(f"SET memory_limit = '{args.duck_memory}'")
         self.duck.execute("SET TimeZone = 'UTC'")  # its CSV prints a TIMESTAMPTZ in the session zone
+        self.duck.create_function("zpq_avg", avg_dec, ["VARCHAR", "BIGINT", "INTEGER"], "VARCHAR")
         self.n = 0
 
     def tmp(self, stem):
@@ -525,9 +529,21 @@ class Ctx:
         return subprocess.run([self.zpq_bin, *args], capture_output=True, timeout=600)
 
 
+def split_state(obj):
+    """A JSON row with each avg_state {sum, count} pair as the `<name>__sum`, `<name>__count` columns CSV and Parquet
+    hold."""
+    out = {}
+    for k, v in obj.items():
+        if isinstance(v, dict) and set(v) == {"sum", "count"}:
+            out[f"{k}__sum"], out[f"{k}__count"] = v["sum"], v["count"]
+        else:
+            out[k] = v
+    return out
+
+
 def json_rows(objs, names, types, units):
     rows = []
-    for obj in objs:
+    for obj in map(split_state, objs):
         if list(obj) != names:
             raise Mismatch(f"columns {list(obj)}, expected {names}")
         rows.append(tuple(json_value(obj[n], types[n], units.get(n)) for n in names))
@@ -553,10 +569,14 @@ def message(e):
     return r.get("message") or r.get("reason") or json.dumps(r)
 
 
+def oracle_sql(c, src):
+    return (c["oracle"] or c["sql"]).format(src=src)
+
+
 def run_cell(ctx, s, c, src_path, results, notes):
     sql = c["sql"].format(src=src_path)
     try:
-        oracle = ctx.oracle(sql)
+        oracle = ctx.oracle(oracle_sql(c, src_path))
     except Exception as e:  # the oracle itself cannot run it: nothing to compare
         for k in ("py-rows", "cli=py", "cli-csv", "py-write", "cli-write"):
             results[k] = "n/a"
@@ -618,7 +638,7 @@ def run_cell(ctx, s, c, src_path, results, notes):
     else:
         results["py-write"] = "-"
 
-    check_csv(ctx, sql, oracle, want_names, want_rows, c, f32, results, notes)
+    check_csv(ctx, sql, oracle_sql(c, src_path), oracle, want_names, want_rows, c, f32, results, notes)
 
     out = ctx.tmp(f"{s['name']}-{c['id']}-cli")
     p = ctx.cli("query", "--query", sql, "-o", out)
@@ -634,9 +654,9 @@ def run_cell(ctx, s, c, src_path, results, notes):
             notes.append(f"cli-write: {e}")
 
 
-def check_csv(ctx, sql, oracle, want_names, want_rows, c, f32, results, notes):
-    """`--format csv` against the oracle's values and against DuckDB's own CSV of the same SQL, both parsed with
-    Python's csv (an unquoted empty field is NULL, `""` the empty string) and typed by the oracle's schema."""
+def check_csv(ctx, sql, osql, oracle, want_names, want_rows, c, f32, results, notes):
+    """`--format csv` against the oracle's values and against DuckDB's own CSV of the oracle's SQL `osql`, both parsed
+    with Python's csv (an unquoted empty field is NULL, `""` the empty string) and typed by the oracle's schema."""
     p = ctx.cli("query", "--query", sql, "--format", "csv")
     if p.returncode != 0:
         results["cli-csv"] = "REFUSED" if "py-rows" in c["refuse"] else "FAIL"
@@ -650,7 +670,7 @@ def check_csv(ctx, sql, oracle, want_names, want_rows, c, f32, results, notes):
         if names != want_names:
             raise Mismatch(f"header {names}, expected {want_names}")
         compare_rows(got, want_rows, names, c["order"], c["approx"], f32)
-        ctx.duck.execute(f"COPY ({sql}) TO '{path}' (FORMAT CSV, HEADER)")
+        ctx.duck.execute(f"COPY ({osql}) TO '{path}' (FORMAT CSV, HEADER)")
         duck_names, duck = csv_rows(open(path, encoding="utf-8").read(), types, "duck")
         if duck_names != names:
             raise Mismatch(f"header {names}, DuckDB's {duck_names}")
@@ -665,7 +685,7 @@ def check_csv(ctx, sql, oracle, want_names, want_rows, c, f32, results, notes):
 
 
 def csv_rows(text, types, engine):
-    """Canonical rows of a CSV answer (as `json_value` gives them): an average's `__sum`/`__count` cells joined."""
+    """Canonical rows of a CSV answer (as `json_value` gives them)."""
     lines = parse_csv(text)
     if not lines:
         raise Mismatch("no header row")
@@ -673,23 +693,13 @@ def csv_rows(text, types, engine):
     for r in body:
         if len(r) != len(header):
             raise Mismatch(f"row of {len(r)} fields under a header of {len(header)}")
-    names, cols, i = [], list(zip(*body)) if body else [() for _ in header], 0
+    cols = list(zip(*body)) if body else [() for _ in header]
     out = []
-    while i < len(header):
-        n = header[i]
-        if n.endswith("__sum") and i + 1 < len(header) and header[i + 1] == n[:-5] + "__count" and n[:-5] in types:
-            names.append(n[:-5])
-            out.append([None if cnt in (None, "0") and sm is None else
-                        {"sum": None if sm is None else Decimal(sm), "count": int(cnt)}
-                        for sm, cnt in zip(cols[i], cols[i + 1])])
-            i += 2
-            continue
+    for n, col in zip(header, cols):
         if n not in types:
             raise Mismatch(f"column {n} is not in the answer")
-        names.append(n)
-        out.append([csv_value(v, types[n], engine) for v in cols[i]])
-        i += 1
-    return names, [tuple(r) for r in zip(*out)] if out else []
+        out.append([csv_value(v, types[n], engine) for v in col])
+    return header, [tuple(r) for r in zip(*out)] if out else []
 
 
 def parse_csv(text):
@@ -893,7 +903,7 @@ def run_reverse(ctx, s, c, copy_path, label, results, notes):
     """zpq reads a file DuckDB or PyArrow wrote: Python and the CLI agree byte for byte, and with DuckDB's answer."""
     sql = c["sql"].format(src=copy_path)
     try:
-        oracle = ctx.oracle(sql)
+        oracle = ctx.oracle(oracle_sql(c, copy_path))
     except Exception as e:
         results[label] = "n/a"
         notes.append(f"{label}: oracle failed: {e}")

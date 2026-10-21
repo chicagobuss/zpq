@@ -97,6 +97,7 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
                     is_count = true;
                 } else if (std.ascii.eqlIgnoreCase(name, "sum") or
                     std.ascii.eqlIgnoreCase(name, "avg") or
+                    std.ascii.eqlIgnoreCase(name, "avg_state") or
                     std.ascii.eqlIgnoreCase(name, "min") or
                     std.ascii.eqlIgnoreCase(name, "max")) is_agg = true;
             }

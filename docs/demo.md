@@ -203,15 +203,21 @@ sandboxes, with nothing to keep warm in between.
 mkdir -p /tmp/results
 for f in yellow_tripdata_{2023,2024}-{01..12}.parquet; do
   payload=$(jq -nc --arg u "s3://$BUCKET/demo/nyc-taxi/yellow/$f" \
-    '{s3_url:$u, aggregate:"count(*),max(tip_amount),sum(fare_amount)"}')
+    '{s3_url:$u, aggregate:"count(*) AS n, max(tip_amount) AS max_tip, sum(fare_amount) AS fare, avg_state(tip_amount) AS tip"}')
   aws lambda invoke --function-name "$FN" \
     --payload "$(echo -n "$payload" | base64 -w 0)" \
     --cli-binary-format base64 "/tmp/results/$f.json" \
     --region us-west-2 >/dev/null &
 done
 wait
-jq -s 'map(.agg.sum) | add' /tmp/results/*.json
+jq -s '{n: (map(.agg.n) | add), fare: (map(.agg.fare) | add), max_tip: (map(.agg.max_tip) | max),
+        avg_tip: ((map(.agg.tip.sum) | add) / (map(.agg.tip.count) | add))}' /tmp/results/*.json
 ```
+
+Per-file means do not average into the overall mean, so the average
+tip comes from `avg_state`: each file answers its `{"sum", "count"}`,
+and the overall mean is the sum of the sums over the sum of the counts.
+`avg(tip_amount)` would answer each file's mean as a plain number.
 
 Wall time ~6 s; cost ~$0.01.
 

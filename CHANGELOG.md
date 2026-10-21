@@ -12,21 +12,33 @@ shell-completion and man-page packaging.
 1. **Scripts that parse `zpq query` output must change.** Every query now prints its answer as NDJSON rows on stdout,
    and nothing else. The `{"ok":true,...,"agg":...}` summary that 0.4.1 printed is gone from stdout; take the rows
    instead, or add `--summary=json` to get a typed summary line on **stderr**.
-2. **If you read zpq's CSV, check dates and empty strings.** `--format csv` works as in 0.4.1, but DATE, TIME and
+2. **BREAKING: `avg(x)` is now a plain number, in every format.** 0.4.1 answered it as a `{"sum":..,"count":..}`
+   object in JSON (a DECIMAL one with an `"avg"` field too) and as `<name>__sum` / `<name>__count` columns in CSV and
+   Parquet; the Lambda, libzpq and Python answers carried the same object. It is now one value, NULL over no values:
+   - a DOUBLE for integer and floating `x`, the sum divided once by the count;
+   - for DECIMAL(p, s), DECIMAL(q, s + q - p) with q = min(38, p + 4): the exact mean rounded half away from zero,
+     with up to four more fractional digits and never fewer integer digits (DECIMAL(15,2) gives DECIMAL(19,6),
+     DECIMAL(36,35) gives DECIMAL(38,37), and p = 38 keeps the input type, as Trino does). It never overflows.
+
+   If you merge averages across files or Lambda fan-out, ask for **`avg_state(x)`** instead: it answers exactly what
+   `avg(x)` answered in 0.4.1 (minus the DECIMAL `"avg"` field), and `sum(<name>__sum) / sum(<name>__count)` over its
+   per-file results is the exact overall average. A query that keeps `avg(x)` and parses `__sum` / `__count` or the
+   object breaks.
+3. **If you read zpq's CSV, check dates and empty strings.** `--format csv` works as in 0.4.1, but DATE, TIME and
    TIMESTAMP now print as ISO text (0.4.1 printed integers), and an empty string prints as `""` so it differs from
    NULL (0.4.1 printed both as an empty field). Aggregate and GROUP BY answers can now be CSV too.
-3. **Re-run the queries listed under "Answers that changed"** if you relied on their 0.4.1 results: DECIMAL sums and
+4. **Re-run the queries listed under "Answers that changed"** if you relied on their 0.4.1 results: DECIMAL sums and
    filters, UUID filters, `NOT IN` lists containing `NULL`, `LIKE NULL` and `LIKE` with `_`, `coalesce`, integer
    arithmetic near the 64-bit limit, INT96 timestamps, float filters and min/max over columns that hold NaN, BOOLEAN
    GROUP BY keys, and any Parquet
    file 0.4.1 **rewrote** from a fixed-width binary (UUID), FLOAT16 or BYTE_ARRAY DECIMAL column, or from inputs with
    different DECIMAL scales.
-4. **Check `--max-memory` values you pass.** It used to bound GROUP BY entries only; it now bounds everything an
+5. **Check `--max-memory` values you pass.** It used to bound GROUP BY entries only; it now bounds everything an
    aggregate or a write holds. A query that answered at a given value can now refuse instead, with
    `the query needs more memory than --max-memory allows` (exit 1). Raise the value, or leave it unset.
-5. **Expect GROUP BY rows in a different order.** Groups now come in the order they first appear in the input, at
+6. **Expect GROUP BY rows in a different order.** Groups now come in the order they first appear in the input, at
    every `-j`; 0.4.1 sorted them by their serialized key bytes. Add `ORDER BY` if you need an order.
-6. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141.
+7. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141.
 
 ### Highlights
 
@@ -228,11 +240,12 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
   `min` returns `-0` and `max` `+0`.
 - DECIMAL results are DECIMAL, with fixed result-type rules:
   - `+`/`-` take the larger scale and one more digit, and `*` adds scales;
-  - `sum` is DECIMAL(38, s), and `min`/`max`/`avg` keep the column's type, with `avg` rounding half away from zero;
+  - `sum` is DECIMAL(38, s), `min`/`max` keep the column's type, and `avg` widens it by up to four fractional digits
+    (see "What to do"), rounding half away from zero;
   - numeric literals with a decimal point are DECIMAL, and `/` is DOUBLE;
   - a result past 38 digits is an error.
 
-  A DECIMAL `avg` adds `"avg"` beside `{"sum","count"}`, and `-o` writes DECIMAL columns where 0.4.1 wrote DOUBLE.
+  `-o` writes DECIMAL columns where 0.4.1 wrote DOUBLE, `avg_state`'s `__sum` included.
 - BOOLEAN answers are BOOLEAN everywhere (`true`/`false` in JSON and CSV, BOOLEAN in Parquet). That covers keys,
   min/max, `SELECT b AS k` and `CASE ... THEN b END`.
 - `SELECT c AS k` writes the same column, renamed: same type, same nullability.
@@ -425,6 +438,7 @@ DECIMAL and FLOAT16 over FIXED_LEN_BYTE_ARRAY are numbers. `-o` Parquet output i
 - `ORDER BY` over plain rows, with or without `LIMIT` (ties by input position).
 - `HAVING`, comparing aggregates or keys with literals.
 - `count(DISTINCT x)`, exact.
+- `avg_state(x)` (also in `--aggregate`), the mergeable `{sum, count}` form of `avg(x)` for fan-out.
 - GROUP BY keys as expressions (bound by value), SELECT positions or aliases; ORDER BY and HAVING on a quoted alias.
 - Searched `CASE WHEN ... THEN ... [ELSE ...] END` (a branch is evaluated only on rows that take it) and
   `strlen(s)` (bytes; NULL for NULL).

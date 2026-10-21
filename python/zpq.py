@@ -116,7 +116,7 @@ def _exact_columns(exact, plain, names):
 
 def _as_decimal(v):
     """A DECIMAL column's value as Decimal: a scale-0 DECIMAL prints as an integer token, which JSON reads as int. An
-    average's {"sum", "count", "avg"} keeps its count an int."""
+    avg_state's {"sum", "count"} keeps its count an int."""
     if isinstance(v, dict):
         return {k: (x if k == "count" else _as_decimal(x)) for k, x in v.items()}
     if isinstance(v, int) and not isinstance(v, bool):

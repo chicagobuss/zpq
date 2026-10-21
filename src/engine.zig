@@ -843,7 +843,7 @@ fn executeAggregateOver(
 }
 
 /// The `AnswerType` of each answer column: a DATE/TIME/TIMESTAMP from the column its values pass through, and
-/// whether it is an average.
+/// whether it is an avg_state pair.
 fn answerTypes(gpa: std.mem.Allocator, out: scan.AggOutput, state: scan.ScanState) ![]AnswerType {
     if (out.typed != null) return &.{};
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
@@ -4621,7 +4621,7 @@ fn writeOneRowParquet(
 }
 
 /// Write GROUP BY results as parquet: one row per group, columns in `cols` order, values exactly as the JSON output
-/// reports them. avg splits into `<name>__sum` / `<name>__count` as in the 1-row output.
+/// reports them. avg_state splits into `<name>__sum` / `<name>__count` as in the 1-row output.
 fn writeGroupedParquet(
     arena: std.mem.Allocator,
     out_path: []const u8,
@@ -4842,7 +4842,7 @@ fn sameNulls(comptime T: type, src: anytype, values: []const T) filter_eval.Colu
     return .{ .values = values, .def_levels = src.def_levels, .max_def = src.max_def, .has_nulls = src.has_nulls };
 }
 
-/// Column `ci` of every grouped row as a `T` lane. For an avg column, `T == f64` takes the pair's sum and
+/// Column `ci` of every grouped row as a `T` lane. For an avg_state column, `T == f64` takes the pair's sum and
 /// `T == i64` its count.
 fn groupedColumn(
     comptime T: type,
@@ -4901,7 +4901,7 @@ fn groupedColumn(
     };
 }
 
-/// Column `ci` of every grouped row as an exact DECIMAL(`spec`) column: a `dec` value, or an avg's exact sum.
+/// Column `ci` of every grouped row as an exact DECIMAL(`spec`) column: a `dec` value, or an avg_state's exact sum.
 fn groupedDecColumn(
     arena: std.mem.Allocator,
     name: []const u8,
@@ -5005,7 +5005,7 @@ pub fn writeAggregateText(
     if (format == .json) try writer.writeAll("]\n");
 }
 
-/// The answer as CSV: a header row, then its rows (none past `rows`, as the JSON forms). An average is two cells,
+/// The answer as CSV: a header row, then its rows (none past `rows`, as the JSON forms). An avg_state is two cells,
 /// `<name>__sum` and `<name>__count`, as `-o` writes it; every other value prints as its column's rows do.
 fn writeAggregateCsv(
     writer: anytype,
@@ -5047,7 +5047,7 @@ fn typeAt(types: []const AnswerType, ci: usize) AnswerType {
 }
 
 /// One answer value as CSV cells: NULL an empty field, a BOOLEAN true/false, a DATE/TIME/TIMESTAMP its ISO text,
-/// a DECIMAL every digit of its scale, bytes as `writeBytesCsv`, an average its sum and count.
+/// a DECIMAL every digit of its scale, bytes as `writeBytesCsv`, an avg_state its sum and count.
 fn writeAggValueCsv(writer: anytype, v: scan.AggValue, kind: TextKind, ty: AnswerType) !void {
     switch (v) {
         .null_val => if (ty.avg) try writer.writeByte(','),
@@ -5438,9 +5438,7 @@ pub fn writeAggValueJson(writer: anytype, v: scan.AggValue) !void {
         .avg_dec => |p| {
             try writer.writeAll("{\"sum\":");
             if (p.sum) |sum| try writeDecimal(writer, sum, p.spec.scale) else try writer.writeAll("null");
-            try writer.print(",\"count\":{d},\"avg\":", .{p.count});
-            if (p.mean) |m| try writeDecimal(writer, m, p.spec.scale) else try writer.writeAll("null");
-            try writer.writeByte('}');
+            try writer.print(",\"count\":{d}}}", .{p.count});
         },
         .null_val => try writer.writeAll("null"),
     }
@@ -5692,7 +5690,7 @@ fn writeJsonAsCsv(writer: anytype, value: []const u8, kind: TextKind) !void {
     try writer.writeByte('"');
 }
 
-/// What an answer column needs besides its `TextKind` to print as CSV: DATE/TIME/TIMESTAMP text, and an average
+/// What an answer column needs besides its `TextKind` to print as CSV: DATE/TIME/TIMESTAMP text, and an avg_state
 /// split into `<name>__sum` and `<name>__count` cells, as `-o` writes it; and whether it is DECIMAL (an exact sum,
 /// min/max or average of a DECIMAL, or a DECIMAL key), whose text a reader may want to parse exactly.
 pub const AnswerType = struct {
@@ -11180,7 +11178,7 @@ test "CSV: temporal text, bytes under the JSON rules, quoting, NULL and the empt
     w = .fixed(&buf);
     try std.testing.expectError(error.InvalidUtf8, writeBytesCsv(&w, "\xff", .utf8));
 
-    // An answer: header (an average as two columns), BOOLEAN, DATE, NULL and the empty string apart.
+    // An answer: header (an avg_state as two columns), BOOLEAN, DATE, NULL and the empty string apart.
     const cols = [_][]const u8{ "b", "d", "s", "a" };
     const r0 = [_]scan.AggValue{ .{ .i = 1 }, .{ .i = 18_263 }, .{ .s = "" }, .{ .avg = .{ .sum = 3.5, .count = 2 } } };
     const r1 = [_]scan.AggValue{ .null_val, .null_val, .null_val, .{ .avg = .{ .sum = null, .count = 0 } } };

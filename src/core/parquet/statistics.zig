@@ -66,8 +66,9 @@ fn valuesAddUp(rg: *const schema.RowGroup, cm: schema.ColumnMetaData, file_meta:
 }
 
 /// Whether a writer that saw a non-null value would have recorded bounds for it. Not for an order zpq cannot read
-/// (the writer had none to keep them in), INT96 (no defined order), or a float chunk counted as NaN throughout (NaN is
-/// left out of bounds). Writers also drop bounds over a size limit; such a chunk decodes for its null checks.
+/// (the writer had none to keep them in), INT96 (no defined order), or a float chunk counted as holding NaN: NaN is
+/// left out of bounds, and writers drop type-defined float bounds altogether for a chunk with any (parquet-mr does).
+/// Writers also drop bounds over a size limit; such a chunk decodes for its null checks.
 fn boundsExpected(
     rg: *const schema.RowGroup,
     col_idx: usize,
@@ -75,9 +76,10 @@ fn boundsExpected(
     file_meta: ?*const schema.FileMetaData,
 ) bool {
     if (cm.type == .INT96 or !boundsReadable(rg, col_idx, file_meta)) return false;
-    const float = cm.type == .FLOAT or cm.type == .DOUBLE;
-    if (float) if (cm.statistics.?.nan_count) |n| if (n == cm.num_values) return false;
-    return true;
+    const elem = if (file_meta) |fm| fm.getColumnSchema(cm.path_in_schema.items) else null;
+    const float = cm.type == .FLOAT or cm.type == .DOUBLE or (elem != null and schema.isFloat16(elem.?));
+    const nan_count = cm.statistics.?.nan_count orelse return true;
+    return !float or nan_count == 0;
 }
 
 /// Whether `min` sorts above `max` in the column's type-defined order, which no writer's bounds can. Bounds this
@@ -600,10 +602,19 @@ test "chunkStats: contradictory and uncorroborated null counts are used only whe
     interval.converted_type = .INTERVAL;
     const unordered = try ColumnForTest.init(a, interval, .{ .null_count = 0 });
     try testing.expectEqual(@as(?i64, 0), chunkStats(&unordered.rg, 0, &unordered.fm, .corroborated).null_count);
-    const all_nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .null_count = 0, .nan_count = 100 });
-    try testing.expectEqual(@as(?i64, 0), chunkStats(&all_nan.rg, 0, &all_nan.fm, .corroborated).null_count);
-    const some_nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .null_count = 0, .nan_count = 3 });
-    try testing.expectEqual(@as(?i64, null), chunkStats(&some_nan.rg, 0, &some_nan.fm, .corroborated).null_count);
+    // floating_orders_nan_count.parquet's writer keeps no bounds for its chunks of 4 and of 10 NaN in 10.
+    for ([_]i64{ 100, 3 }) |nans| {
+        const with_nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .null_count = 0, .nan_count = nans });
+        try testing.expectEqual(@as(?i64, 0), chunkStats(&with_nan.rg, 0, &with_nan.fm, .corroborated).null_count);
+    }
+    var half = leafForTest(.FIXED_LEN_BYTE_ARRAY);
+    half.type_length = 2;
+    half.logical_type = .{ .FLOAT16 = .{} };
+    const half_nan = try ColumnForTest.init(a, half, .{ .null_count = 0, .nan_count = 4 });
+    try testing.expectEqual(@as(?i64, 0), chunkStats(&half_nan.rg, 0, &half_nan.fm, .corroborated).null_count);
+    // A NaN count of zero is no excuse.
+    const no_nan = try ColumnForTest.init(a, leafForTest(.DOUBLE), .{ .null_count = 0, .nan_count = 0 });
+    try testing.expectEqual(@as(?i64, null), chunkStats(&no_nan.rg, 0, &no_nan.fm, .corroborated).null_count);
 }
 
 test "pageIndexIsPlausible: page locations must lie in page order inside the chunk" {

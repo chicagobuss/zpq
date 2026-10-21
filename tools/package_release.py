@@ -5,13 +5,16 @@ import gzip
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import tarfile
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos", "x86_64-macos")
+PACKAGE_ARCHES = {"x86_64-linux-musl": ("amd64", "x86_64"), "aarch64-linux-musl": ("arm64", "aarch64")}
 
 
 def sha(path):
@@ -19,11 +22,42 @@ def sha(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+def release_version(version):
+    """The version a tag at HEAD names: 0.5.0-rc1 for v0.5.0-rc1, else build.zig.zon's version."""
+    tags = set(subprocess.check_output(["git", "tag", "--points-at", "HEAD", "--list", "v" + version,
+                                        f"v{version}-*"], cwd=ROOT, text=True, timeout=10).split())
+    if not tags or "v" + version in tags:
+        return version
+    if len(tags) > 1:
+        raise SystemExit("ambiguous prerelease tags at HEAD: " + " ".join(sorted(tags)))
+    return tags.pop()[1:]
+
+
+def write_packages(out, target, content, version, epoch):
+    """Write the .deb and .rpm for one Linux target from the tarball's own bytes, with packaging/nfpm.yaml."""
+    deb_arch, rpm_arch = PACKAGE_ARCHES[target]
+    package_version = version.replace("-", "~", 1)
+    names = {"deb": f"zpq_{package_version}_{deb_arch}.deb", "rpm": f"zpq-{package_version}-1.{rpm_arch}.rpm"}
+    with tempfile.TemporaryDirectory() as stage:
+        stage = Path(stage)
+        for filename, body in content.items():
+            (stage / filename).parent.mkdir(parents=True, exist_ok=True)
+            (stage / filename).write_bytes(body)
+        (stage / "share/man/man1/zpq.1.gz").write_bytes(gzip.compress(content["share/man/man1/zpq.1"], mtime=0))
+        env = {**os.environ, "ZPQ_VERSION": version, "ZPQ_ARCH": deb_arch, "SOURCE_DATE_EPOCH": str(epoch)}
+        for packager, name in names.items():
+            subprocess.run(["nfpm", "pkg", "--config", str(ROOT / "packaging/nfpm.yaml"), "--packager", packager,
+                            "--target", str(out / name)], cwd=stage, env=env, check=True, timeout=120)
+            (out / (name + ".sha256")).write_text(sha(out / name) + "  " + name + "\n")
+            print(target, name, sha(out / name), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="zig-out/release")
     parser.add_argument("--targets", default=",".join(TARGETS[:3]))
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--packages", action="store_true", help="also write .deb and .rpm for Linux targets (nfpm)")
     args = parser.parse_args()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -36,6 +70,7 @@ def main():
         raise SystemExit("release staging requires a clean tracked tree; commit first")
     epoch = int(subprocess.check_output(["git", "show", "-s", "--format=%ct", "HEAD"], cwd=ROOT, timeout=10))
     version = re.search(r'\.version = "([^"]+)"', (ROOT / "build.zig.zon").read_text())[1]
+    package_version = release_version(version) if args.packages else None
     manifest = {"version": version, "revision": revision, "zig": subprocess.check_output(
         ["zig", "version"], text=True, timeout=10).strip(),
         "tls_manifest_sha256": sha(ROOT / "vendor/boring_tls/prebuilt.sha256"),
@@ -78,6 +113,8 @@ def main():
         (out / (name + ".sha256")).write_text(sha(artifact) + "  " + name + "\n")
         (out / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(target, name, manifest["artifacts"][target]["sha256"], flush=True)
+        if args.packages and target in PACKAGE_ARCHES:
+            write_packages(out, target, content, package_version, epoch)
 
 
 if __name__ == "__main__":

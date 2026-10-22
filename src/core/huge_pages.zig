@@ -331,8 +331,69 @@ fn release(span: []align(std.heap.page_size_min) u8) void {
     }
 }
 
+// Advice is process-wide and sampled once: synchronous THP compaction can cost hundreds of milliseconds on a
+// fragmented long-lived host. Require twice a conservative 4 GiB active working set in free huge-capable blocks.
+// Virtual Region reserves are not committed bytes. ZPQ_HUGEPAGE=on/off overrides this decision for experiments.
+var advice_state: std.atomic.Value(u8) = .init(0); // 0 uninitialized, 1 reading, 2 off, 3 on
+
+fn adviceEnabled() bool {
+    while (true) switch (advice_state.load(.acquire)) {
+        2 => return false,
+        3 => return true,
+        1 => std.atomic.spinLoopHint(),
+        else => if (advice_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+            const enabled = discoverAdvice();
+            advice_state.store(if (enabled) 3 else 2, .release);
+            return enabled;
+        },
+    };
+}
+
+fn policyFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch
+        return null;
+    defer _ = std.posix.system.close(fd);
+    const n = std.posix.read(fd, buf) catch return null;
+    return if (n == buf.len) null else buf[0..n];
+}
+
+fn discoverAdvice() bool {
+    if (std.c.getenv("ZPQ_HUGEPAGE")) |raw| {
+        const value = std.mem.span(raw);
+        if (std.mem.eql(u8, value, "on")) return true;
+        if (std.mem.eql(u8, value, "off")) return false;
+    }
+    var mode_buf: [512]u8 = undefined;
+    const modes = policyFile("/sys/kernel/mm/transparent_hugepage/defrag", &mode_buf) orelse return false;
+    const start = (std.mem.indexOfScalar(u8, modes, '[') orelse return false) + 1;
+    const end = std.mem.indexOfScalarPos(u8, modes, start, ']') orelse return false;
+    var buddy_buf: [16 << 10]u8 = undefined;
+    const buddy = policyFile("/proc/buddyinfo", &buddy_buf) orelse return false;
+    return adviceFor(modes[start..end], buddy, 4 << 30);
+}
+
+fn adviceFor(mode: []const u8, buddy: []const u8, expected: u64) bool {
+    if (std.mem.eql(u8, mode, "defer") or std.mem.eql(u8, mode, "never")) return true;
+    // defer+madvise still compacts synchronously for MADV_HUGEPAGE regions (Linux transhuge documentation).
+    if (!std.mem.eql(u8, mode, "always") and !std.mem.eql(u8, mode, "madvise") and
+        !std.mem.eql(u8, mode, "defer+madvise")) return false;
+    var free: u64 = 0;
+    var lines = std.mem.tokenizeScalar(u8, buddy, '\n');
+    while (lines.next()) |line| {
+        var words = std.mem.tokenizeAny(u8, line, " \t");
+        for (0..4) |_| _ = words.next() orelse return false;
+        var bytes: u64 = std.heap.pageSize();
+        while (words.next()) |word| {
+            const count = std.fmt.parseInt(u64, word, 10) catch return false;
+            if (bytes >= huge_page_size) free +|= count *| bytes;
+            bytes *|= 2;
+        }
+    }
+    return free >= expected *| 2;
+}
+
 fn advise(block: []u8) void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.os.tag != .linux or !adviceEnabled()) return;
     const lo = std.mem.alignForward(usize, @intFromPtr(block.ptr), huge_page_size);
     const hi = std.mem.alignBackward(usize, @intFromPtr(block.ptr) + block.len, huge_page_size);
     if (hi <= lo) return;
@@ -602,4 +663,17 @@ test "a pair's scratch block that its child refuses past the span holds no charg
     try std.testing.expectEqual(@as(usize, 0), pair.scratch.spilled);
     @memset(try pair.scratch.allocator().alloc(u8, 4096), 1);
     @memset(try pair.arena.allocator().alloc(u8, 4096), 2);
+}
+
+test "THP advice avoids synchronous compaction without enough free huge blocks" {
+    const scarce = "Node 0, zone Normal 1000 0 0 0 0 0 0 0 0 1 1\n";
+    const plenty = "Node 0, zone Normal 0 0 0 0 0 0 0 0 0 4096 0\n";
+    for ([_][]const u8{ "always", "madvise", "defer+madvise" }) |mode| {
+        try std.testing.expect(!adviceFor(mode, scarce, 4 << 30));
+        try std.testing.expect(adviceFor(mode, plenty, 4 << 30));
+        try std.testing.expect(!adviceFor(mode, plenty, 5 << 30));
+        try std.testing.expect(!adviceFor(mode, "bad input", 4 << 30));
+    }
+    for ([_][]const u8{ "defer", "never" }) |mode| try std.testing.expect(adviceFor(mode, scarce, 4 << 30));
+    try std.testing.expect(!adviceFor("unknown", plenty, 4 << 30));
 }

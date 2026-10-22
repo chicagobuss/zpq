@@ -1257,7 +1257,6 @@ const Assembler = struct {
             while (!job.done.load(.acquire)) w.completions.waitUncancelable(w.io);
             job.destroy();
         }
-        w.encode_group.await(w.io) catch {};
         for (a.done.items) |p| p.unref(w.gpa);
         if (a.current) |p| p.unref(w.gpa);
         a.ranges.deinit(w.gpa);
@@ -1305,18 +1304,16 @@ const Assembler = struct {
             a.rows += hi - lo;
             a.bits += bits;
             lo = hi;
-            if (a.rows >= a.target.rows or a.bits >= target_bits) try a.seal(false);
+            if (a.rows >= a.target.rows or a.bits >= target_bits) try a.seal();
         }
         try a.writeReady(false);
     }
 
-    /// Seal the rows held as one output row group: an encode job, started on a CPU permit of its own where one can be
-    /// had, else run here.
-    fn seal(a: *Assembler, last: bool) !void {
+    /// Seal the rows held as one output row group and submit its ready column/page work to the executor.
+    fn seal(a: *Assembler) !void {
         if (a.rows == 0) return;
         const w = a.w;
         const job = try EncodeJob.create(w, a.rows);
-        job.last = last;
         var started = false;
         defer if (!started) job.destroy();
         // Only the ranges here: the job joins them into columns on its own thread.
@@ -1348,26 +1345,19 @@ const Assembler = struct {
         };
     }
 
-    /// Run `job` beside the writer on an encoder permit (`WinCtx.encoders`), beside the producers' reads. Over fetched
-    /// inputs, and while the writer slices a row group alone, it runs here: a wait could wait on the writer itself.
-    /// Before it starts, older pending ones are written while more are pending than the CPU budget, or the ledger has
-    /// no room for its encoding.
+    /// Admission and execution share one bound. Placement releases the reservation; completed jobs still count.
     fn start(a: *Assembler, job: *EncodeJob) !void {
         const w = a.w;
-        // Bound the row groups encoding at once: by the CPU budget, and by the ledger's room for their encoding.
+        const executor = w.executor.?;
         while (a.pending.items.len > 1) {
             const room = if (w.memory) |m| m.budget.available() >= job.charge else true;
-            if (a.pending.items.len <= w.cpu_budget and a.pending_bytes <= w.encode_window and room) break;
+            if (executor.admits(a.pending.items.len, a.pending_bytes) and room) break;
             try a.writeFront();
         }
         job.reserve();
-        if (w.inline_encode or w.writer_turns > 0) {
-            job.run();
-            return;
-        }
-        w.encoders.waitUncancelable(w.io);
         job.permit = .encoder;
-        w.encode_group.async(w.io, EncodeJob.runAsync, .{job});
+        job.trim_scratch = w.writer_turns > 0;
+        executor.submit(.{ .begin = job });
     }
 
     /// Write the oldest pending row group once it has encoded.
@@ -1388,9 +1378,65 @@ const Assembler = struct {
         }
     }
 
+    /// A small tail must not pin a wide producer's entire piece beside the next producer. Drain its encodings,
+    /// then copy only carried rows; this never seals the output group or changes its row/byte boundary.
+    fn compactCarry(a: *Assembler) !void {
+        if (a.rows == 0) return;
+        try a.writeReady(true);
+        const w = a.w;
+        const p = try Piece.create(w.gpa, w.pieceAlloc());
+        errdefer p.unref(w.gpa);
+        const pa = p.arena.allocator();
+        p.agg = .{
+            .arena = pa,
+            .cols = try pa.alloc(consumer.OutputAggregator.ColumnBuf, w.out_elems.len),
+            .schema_elems = try pa.dupe(schema.SchemaElement, w.out_elems),
+            .paths = try pa.dupe([]const []const u8, w.out_paths),
+            .num_rows = a.rows,
+            .captured = true,
+        };
+        for (p.agg.cols, a.ranges.items[0].piece.agg.cols) |*dst, src| dst.* = switch (src) {
+            inline else => |_, tag| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(tag), .{}),
+        };
+        var scratch = std.heap.ArenaAllocator.init(w.gpa);
+        defer scratch.deinit();
+        for (a.ranges.items) |range| {
+            const n = range.hi - range.lo;
+            var sel = try filter_selection.SelectionVector.init(w.gpa, n);
+            defer sel.deinit();
+            for (p.agg.cols, range.piece.agg.cols) |*dst, src| {
+                try consumer.appendRows(
+                    dst,
+                    consumer.bufRows(src, range.lo, range.hi),
+                    &sel,
+                    n,
+                    pa,
+                    scratch.allocator(),
+                );
+                _ = scratch.reset(.retain_capacity);
+            }
+        }
+        p.bits_prefix = try consumer.plainBitsPrefix(pa, &p.agg);
+        std.debug.assert(p.bits_prefix[a.rows] == a.bits);
+        for (a.done.items) |old| old.unref(w.gpa);
+        a.done.clearRetainingCapacity();
+        a.done.appendAssumeCapacity(p);
+        a.ranges.clearRetainingCapacity();
+        a.ranges.appendAssumeCapacity(.{ .piece = p, .lo = 0, .hi = a.rows });
+    }
+
+    fn shouldCompact(a: *const Assembler) bool {
+        if (a.rows == 0 or a.done.items.len == 0) return false;
+        var held: u64 = 0;
+        for (a.done.items) |p| held +|= p.arena.queryCapacity();
+        const live = a.bits / 8;
+        if (a.w.memory) |m| if (m.budget.available() < live *| 3) return false;
+        return held > @max(64 << 20, live *| 2);
+    }
+
     /// Seal what is held and write every row group: before a byte copy, and at the end.
     fn flush(a: *Assembler) !void {
-        try a.seal(true);
+        try a.seal();
         try a.writeReady(true);
     }
 };
@@ -1413,7 +1459,7 @@ fn encodeCharge(col: filter_eval.Batch.Column) u64 {
     return bytes *| 3;
 }
 
-/// An output row group the assembler sealed: its columns joined, encoded on a thread of its own (`run`), placed by
+/// An output row group the assembler sealed: its column/page tasks share the executor, then it is placed by
 /// the writer in its turn (`place`). Its memory is its own arena and the pieces it holds references to.
 const EncodeJob = struct {
     w: *WinCtx,
@@ -1434,10 +1480,10 @@ const EncodeJob = struct {
     err_col: ?usize = null,
     encode_ns: u64 = 0,
     permit: enum { none, encoder } = .none,
-    /// Sealed by a flush (the end of the input, or a byte copy next): no row group follows it soon, so it may take
-    /// helpers for its columns.
-    last: bool = false,
+    trim_scratch: bool = false,
     done: std.atomic.Value(bool) = .init(false),
+    state: ?*EncodeState = null,
+    started_ns: i64 = 0,
 
     fn create(w: *WinCtx, rows: usize) !*EncodeJob {
         const job = try w.gpa.create(EncodeJob);
@@ -1453,7 +1499,7 @@ const EncodeJob = struct {
         if (m.budget.drawExact(job.reserved) == null) m.budget.force(job.reserved);
     }
 
-    /// Its memory, claimed now, on the job's thread: the arena its chunks stay on (a region's `rows`), and what each
+    /// Its memory, claimed by its first ready task: the arena its chunks stay on (a region's `rows`), and what each
     /// wave works on (its `work`, rewound after every wave), or fresh pages for both.
     fn claimMemory(job: *EncodeJob) struct { keep: std.mem.Allocator, work: ?*huge_pages.Region } {
         const w = job.w;
@@ -1473,6 +1519,7 @@ const EncodeJob = struct {
     fn destroy(job: *EncodeJob) void {
         const w = job.w;
         if (!job.done.load(.acquire)) for (job.pieces) |p| p.unref(w.gpa);
+        if (job.state) |state| state.deinit();
         if (job.arena) |*a| a.deinit();
         if (w.memory) |m| m.budget.release(job.reserved);
         if (job.regions) |r| {
@@ -1481,7 +1528,7 @@ const EncodeJob = struct {
             r.rows.budget = job.region_budgets[0];
             r.work.budget = job.region_budgets[1];
             // Retained pages outlive the job's reservation. Charge their actual high water or return them now.
-            if (job.permit == .none) {
+            if (job.permit == .none or job.trim_scratch) {
                 // Sliced input needs the room for its next batch, rather than warm encoder scratch.
                 r.rows.trim();
                 r.work.trim();
@@ -1500,32 +1547,29 @@ const EncodeJob = struct {
         w.gpa.destroy(job);
     }
 
-    fn runAsync(job: *EncodeJob) void {
-        const w = job.w;
-        job.encode();
-        if (job.permit == .encoder) w.encoders.post(w.io);
-        // The writer may free the job the moment it is done: nothing of it is touched after.
-        job.done.store(true, .release);
-        w.completions.post(w.io);
+    fn begin(job: *EncodeJob) void {
+        job.started_ns = nowMonoNs();
+        EncodeState.start(job) catch |e| job.finish(e);
     }
 
-    fn run(job: *EncodeJob) void {
-        job.encode();
-        job.done.store(true, .release);
-    }
-
-    /// Encode the columns; the error, if any, is kept for the writer, which reports it in this row group's turn.
-    fn encode(job: *EncodeJob) void {
+    fn finish(job: *EncodeJob, err: ?anyerror) void {
         const w = job.w;
-        const t0 = nowMonoNs();
-        encodeColumns(job) catch |e| {
-            job.err = e;
-        };
+        job.err = err;
+        if (job.state) |state| state.deinit();
         for (job.pieces) |p| p.unref(w.gpa);
         const t1 = nowMonoNs();
-        job.encode_ns = @intCast(t1 - t0);
-        const prof = profile.threadOf(w.profiler, .encode);
-        profile.record(prof, .encode, t0, t1, profile.args(.{ w.out_elems.len, job.rows }));
+        job.encode_ns = @intCast(t1 - job.started_ns);
+        profile.record(
+            profile.threadOf(w.profiler, .encode),
+            .encode,
+            job.started_ns,
+            t1,
+            profile.args(.{ w.out_elems.len, job.rows }),
+        );
+        _ = w.executor.?.active.fetchSub(1, .acq_rel);
+        // Publication may destroy the job immediately after this store.
+        job.done.store(true, .release);
+        w.completions.post(w.io);
     }
 
     /// Write the encoded chunks in column order at the sink's offset, their page indexes recorded for the end of the
@@ -1567,178 +1611,288 @@ const EncodeJob = struct {
     }
 };
 
-/// One encode helper's share of a row group being encoded: the columns' plans, then their pages, claimed from shared
-/// cursors, each on the helper's own arena.
+/// A bounded queue shared by every output row group. Workers only run ready work: the final task in a phase
+/// releases the next phase, so no worker blocks waiting for another worker (including at -j1).
+const EncodeExecutor = struct {
+    w: *WinCtx,
+    queue: std.Io.Queue(Work),
+    buffer: []Work,
+    group: std.Io.Group = .init,
+    workers: usize,
+    byte_limit: u64,
+    active: std.atomic.Value(usize) = .init(0),
+    slots: std.Io.Semaphore,
+    granted: std.atomic.Value(usize),
+
+    const Work = union(enum) { begin: *EncodeJob, phase: *EncodeTask };
+
+    fn init(e: *EncodeExecutor, w: *WinCtx) !void {
+        const workers: usize = @min(64, @max(1, w.cpu_budget));
+        const buffer = try w.gpa.alloc(Work, workers * (workers + 1));
+        e.* = .{
+            .w = w,
+            .queue = .init(buffer),
+            .buffer = buffer,
+            .workers = workers,
+            .slots = .{ .permits = if (w.encode_during_decode) 1 else workers },
+            .granted = .init(if (w.encode_during_decode) 1 else workers),
+            .byte_limit = if (w.memory) |m| @min(m.budget.limit / 2, workers *| (64 << 20)) else workers *| (64 << 20),
+        };
+        errdefer e.deinit();
+        for (0..workers) |_| try e.group.concurrent(w.io, worker, .{e});
+    }
+
+    fn allowThreads(e: *EncodeExecutor, count: usize) void {
+        const before = e.granted.fetchMax(count, .acq_rel);
+        if (before >= count) return;
+        for (before..count) |_| e.slots.post(e.w.io);
+    }
+
+    fn allowParallel(e: *EncodeExecutor) void {
+        e.allowThreads(e.workers);
+    }
+
+    fn deinit(e: *EncodeExecutor) void {
+        e.allowParallel();
+        e.queue.close(e.w.io);
+        e.group.await(e.w.io) catch {};
+        e.w.gpa.free(e.buffer);
+    }
+
+    fn admits(e: *const EncodeExecutor, count: usize, bytes: u64) bool {
+        // Wide groups already supply many columns/pages; fewer simultaneous groups avoid retaining idle scratch.
+        const groups = if (e.w.out_elems.len > e.workers) @max(1, e.workers / 4) else e.workers;
+        return count <= groups and bytes <= e.byte_limit;
+    }
+
+    fn submit(e: *EncodeExecutor, work: Work) void {
+        if (work == .begin) _ = e.active.fetchAdd(1, .acq_rel);
+        e.queue.putOneUncancelable(e.w.io, work) catch unreachable;
+    }
+
+    fn worker(e: *EncodeExecutor) void {
+        while (true) {
+            e.slots.waitUncancelable(e.w.io);
+            defer e.slots.post(e.w.io);
+            const work = e.queue.getOneUncancelable(e.w.io) catch return;
+            switch (work) {
+                .begin => |job| job.begin(),
+                .phase => |task| {
+                    const state = task.shared.state;
+                    if (task.run()) {
+                        e.submit(.{ .phase = task });
+                        continue;
+                    }
+                    if (state.remaining.fetchSub(1, .acq_rel) == 1) {
+                        state.advance() catch |err| state.job.finish(err);
+                    }
+                },
+            }
+        }
+    }
+};
+
+/// Each task owns its allocations until the whole wave has completed. Plans/pages may be consumed by another
+/// worker, but their arena is never mutated by two tasks. Codec contexts belong to the persistent worker threads.
 const EncodeTask = struct {
     shared: *Shared,
     arena: std.heap.ArenaAllocator,
     err: ?anyerror = null,
 
     const Shared = struct {
+        state: *EncodeState,
         inputs: []const encoder.ColumnInput,
         plans: []encoder.Plan,
         pages: [][]encoder.BuiltPage,
-        /// (column, page) pairs of the wave, in column then page order.
         work: []const [2]u32 = &.{},
         phase: enum { plan, pages } = .plan,
         cursor: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
     };
 
-    fn run(t: *EncodeTask) void {
-        const s = t.shared;
+    /// One column or four pages per queue turn keeps a fast cohort from consuming a whole row group while its other
+    /// tasks wait behind unrelated groups. The fixed cohort bounds queued descriptors and arena ownership.
+    fn run(t: *EncodeTask) bool {
+        const shared = t.shared;
         const a = t.arena.allocator();
-        while (!s.failed.load(.monotonic)) {
-            const i = s.cursor.fetchAdd(1, .monotonic);
-            switch (s.phase) {
+        const quantum: usize = if (shared.phase == .plan) 1 else 4;
+        for (0..quantum) |_| {
+            if (shared.failed.load(.monotonic)) return false;
+            const i = shared.cursor.fetchAdd(1, .monotonic);
+            switch (shared.phase) {
                 .plan => {
-                    if (i >= s.inputs.len) return;
-                    s.plans[i] = encoder.plan(a, s.inputs[i]) catch |e| return t.fail(e);
+                    if (i >= shared.inputs.len) return false;
+                    shared.plans[i] = encoder.plan(a, shared.inputs[i]) catch |err| {
+                        t.fail(err);
+                        return false;
+                    };
                 },
                 .pages => {
-                    if (i >= s.work.len) return;
-                    const cp = s.work[i];
-                    s.pages[cp[0]][cp[1]] = s.plans[cp[0]].page(a, cp[1]) catch |e| return t.fail(e);
+                    if (i >= shared.work.len) return false;
+                    const cp = shared.work[i];
+                    shared.pages[cp[0]][cp[1]] = shared.plans[cp[0]].page(a, cp[1]) catch |err| {
+                        t.fail(err);
+                        return false;
+                    };
                 },
             }
         }
+        return true;
     }
 
-    fn fail(t: *EncodeTask, e: anyerror) void {
-        t.err = e;
+    fn fail(t: *EncodeTask, err: anyerror) void {
+        t.err = err;
         t.shared.failed.store(true, .monotonic);
     }
 };
 
-/// Encode a sealed row group's columns onto its arena. Columns go in waves, as many at once as the ledger admits
-/// (`encodeCharge`; a column alone is always attempted); within a wave the columns plan on the job's helpers, then
-/// every page builds on them, so a row group of few columns still uses every helper it has. Helpers beyond
-/// the job's own thread are CPU permits free now (spare ones first), or the producers' turns the writer holds while it
-/// slices alone; they go back when the job ends. The bytes are the ones one thread would write.
-fn encodeColumns(job: *EncodeJob) !void {
-    const w = job.w;
-    const memory = job.claimMemory();
-    const ja = memory.keep;
-    const work_alloc = if (memory.work) |r| r.allocator() else w.encode_pages.allocator();
-    const n_cols = w.out_elems.len;
-    // What each column's encoding is estimated to hold, from the pieces' rows as they are.
-    const charges = try ja.alloc(u64, n_cols);
-    for (charges, 0..) |*c, i| {
-        c.* = 0;
-        for (job.ranges) |r| c.* +|= encodeCharge(consumer.bufRows(r.piece.agg.cols[i], r.lo, r.hi));
-    }
-    var inputs = try ja.alloc(encoder.ColumnInput, n_cols);
-    for (inputs, 0..) |*in, i| in.* = .{
-        .values = undefined,
-        .schema_elem = &w.out_elems[i],
-        .path_in_schema = w.out_paths[i],
-        .codec = w.codec,
-        .zstd = w.zstd,
-        .bloom_fpp = if (i < w.bloom_outputs.len) w.bloom_outputs[i] else null,
-    };
-    job.encs = try ja.alloc(encoder.EncodedColumn, n_cols);
-    const parts = try ja.alloc(consumer.BufRange, job.ranges.len);
-    // Helpers: row groups encode beside one another, a thread each, so one takes helpers only when none follows it soon
-    // (`last`): the encoder permits free now. While the writer slices alone, the producers' turns it holds.
-    const turns = if (job.permit == .none) w.writer_turns else 0;
-    // A sliced writer may hold fewer producer turns than the CPU budget (one wide input row group, for example).
-    // Borrow the remaining encoder permits too, while keeping its total helpers within that budget.
-    const extra = if (turns > 0) w.cpu_budget - turns else n_cols *| 8;
-    const taken = if (turns == 0 and !job.last) 0 else takePermits(&w.encoders, w.io, .{ .max = @min(n_cols *| 8, extra) });
-    defer for (0..taken) |_| w.encoders.post(w.io);
-    const helpers = 1 + (turns -| 1) + taken;
-    const tasks = try ja.alloc(EncodeTask, helpers);
-    var shared: EncodeTask.Shared = .{ .inputs = &.{}, .plans = &.{}, .pages = &.{} };
-    // Helpers, on threads of their own, work on fresh pages, kept from one wave to the next.
-    for (tasks[1..]) |*t| t.* = .{ .shared = &shared, .arena = .init(w.encode_pages.allocator()) };
-    defer for (tasks[1..]) |*t| t.arena.deinit();
-    const ledger: ?*core_memory.SharedBudget = if (w.memory) |m| m.budget else null;
+const EncodeState = struct {
+    job: *EncodeJob,
+    keep: std.mem.Allocator,
+    work_alloc: std.mem.Allocator,
+    work_region: ?*huge_pages.Region,
+    charges: []u64,
+    inputs: []encoder.ColumnInput,
+    parts: []consumer.BufRange,
+    tasks: []EncodeTask,
+    shared: EncodeTask.Shared = undefined,
+    remaining: std.atomic.Value(usize) = .init(0),
+    wave: ?std.heap.ArenaAllocator = null,
+    lo: usize = 0,
+    hi: usize = 0,
 
-    var lo: usize = 0;
-    while (lo < n_cols) {
-        // A wave: the next columns the ledger admits together, at least one.
-        var hi = lo + 1;
-        var charge = charges[lo];
-        while (hi < n_cols and hi - lo < 4 * helpers) : (hi += 1) {
-            if (ledger) |l| if (charge +| charges[hi] > l.available() +| job.reserved) break;
-            charge +|= charges[hi];
-        }
-        // The job's reservation covers the waves and stays drawn while completed chunks wait for placement.
-        // The wave's columns joined from the pieces, and the job thread's own encoding, on `work`, given back whole
-        // after the wave: a row group's copy is never held whole, and the next wave reuses the same pages.
-        var wave_arena = std.heap.ArenaAllocator.init(work_alloc);
-        tasks[0] = .{ .shared = &shared, .arena = .init(work_alloc) };
-        defer {
-            tasks[0].arena.deinit();
-            wave_arena.deinit();
-            if (memory.work) |r| r.rewind();
-            for (tasks[1..]) |*t| _ = t.arena.reset(.retain_capacity);
-        }
-        const wa = wave_arena.allocator();
-        for (inputs[lo..hi], lo..) |*in, i| {
-            for (job.ranges, parts) |r, *part| part.* = .{ .buf = &r.piece.agg.cols[i], .lo = r.lo, .hi = r.hi };
-            in.values = try consumer.joinRows(wa, parts);
-        }
-        const wave_inputs = inputs[lo..hi];
-        const plans = try wa.alloc(encoder.Plan, wave_inputs.len);
-        const pages = try wa.alloc([]encoder.BuiltPage, wave_inputs.len);
-        shared = .{ .inputs = wave_inputs, .plans = plans, .pages = pages };
-        try runEncodeTasks(tasks);
-        var n_work: usize = 0;
-        for (plans, pages) |*p, *pg| {
-            pg.* = try wa.alloc(encoder.BuiltPage, p.pageCount());
-            n_work += p.pageCount();
-        }
-        const work = try wa.alloc([2]u32, n_work);
-        var k: usize = 0;
-        for (plans, 0..) |*p, ci| for (0..p.pageCount()) |pi| {
-            work[k] = .{ @intCast(ci), @intCast(pi) };
-            k += 1;
+    fn start(job: *EncodeJob) !void {
+        const w = job.w;
+        const memory = job.claimMemory();
+        const ja = memory.keep;
+        const state = try ja.create(EncodeState);
+        state.* = .{
+            .job = job,
+            .keep = ja,
+            .work_alloc = if (memory.work) |r| r.allocator() else w.encode_pages.allocator(),
+            .work_region = memory.work,
+            .charges = &.{},
+            .inputs = &.{},
+            .parts = &.{},
+            .tasks = &.{},
         };
-        shared.work = work;
-        shared.phase = .pages;
-        shared.cursor.store(0, .monotonic);
-        try runEncodeTasks(tasks);
-        // Laid out onto the job's arena, which holds them until the writer places them.
-        for (plans, pages, lo..) |*p, pg, ci| {
-            job.encs[ci] = p.finish(ja, pg) catch |e| {
-                job.err_col = ci;
-                return e;
+        job.state = state;
+        const n_cols = w.out_elems.len;
+        state.charges = try ja.alloc(u64, n_cols);
+        for (state.charges, 0..) |*charge, i| {
+            charge.* = 0;
+            for (job.ranges) |r| charge.* +|= encodeCharge(consumer.bufRows(r.piece.agg.cols[i], r.lo, r.hi));
+        }
+        state.inputs = try ja.alloc(encoder.ColumnInput, n_cols);
+        for (state.inputs, 0..) |*in, i| in.* = .{
+            .values = undefined,
+            .schema_elem = &w.out_elems[i],
+            .path_in_schema = w.out_paths[i],
+            .codec = w.codec,
+            .zstd = w.zstd,
+            .bloom_fpp = if (i < w.bloom_outputs.len) w.bloom_outputs[i] else null,
+        };
+        job.encs = try ja.alloc(encoder.EncodedColumn, n_cols);
+        state.parts = try ja.alloc(consumer.BufRange, job.ranges.len);
+        state.tasks = try ja.alloc(EncodeTask, w.executor.?.workers);
+        for (state.tasks) |*task| task.* = .{ .shared = &state.shared, .arena = .init(w.encode_pages.allocator()) };
+        try state.nextWave();
+    }
+
+    fn deinit(state: *EncodeState) void {
+        for (state.tasks) |*task| task.arena.deinit();
+        state.tasks = &.{};
+        if (state.wave) |*wave| wave.deinit();
+        state.wave = null;
+    }
+
+    fn dispatch(state: *EncodeState, count: usize) void {
+        const executor = state.job.w.executor.?;
+        const active = @max(1, executor.active.load(.acquire));
+        const helpers = std.math.divCeil(usize, executor.workers, active) catch 1;
+        const tasks = state.tasks[0..@max(1, @min(helpers, count))];
+        state.remaining.store(tasks.len, .monotonic);
+        // The queue holds every admitted group's cohort plus its initial task. No task waits for queue room
+        // needed by its own descendants, even when every worker completes a different group's phase together.
+        for (tasks) |*task| executor.submit(.{ .phase = task });
+    }
+
+    fn nextWave(state: *EncodeState) !void {
+        const job = state.job;
+        const w = job.w;
+        if (state.lo == state.inputs.len) {
+            job.finish(null);
+            return;
+        }
+        var hi = state.lo + 1;
+        var charge = state.charges[state.lo];
+        while (hi < state.inputs.len and hi - state.lo < 4) : (hi += 1) {
+            if (w.memory) |m| if (charge +| state.charges[hi] > m.budget.available() +| job.reserved) break;
+            charge +|= state.charges[hi];
+        }
+        state.hi = hi;
+        state.wave = .init(state.work_alloc);
+        const wa = state.wave.?.allocator();
+        for (state.inputs[state.lo..hi], state.lo..) |*in, i| {
+            for (job.ranges, state.parts) |r, *part| part.* = .{
+                .buf = &r.piece.agg.cols[i],
+                .lo = r.lo,
+                .hi = r.hi,
+            };
+            in.values = try consumer.joinRows(wa, state.parts);
+        }
+        const inputs = state.inputs[state.lo..hi];
+        state.shared = .{
+            .state = state,
+            .inputs = inputs,
+            .plans = try wa.alloc(encoder.Plan, inputs.len),
+            .pages = try wa.alloc([]encoder.BuiltPage, inputs.len),
+        };
+        state.dispatch(inputs.len);
+    }
+
+    fn advance(state: *EncodeState) !void {
+        for (state.tasks) |task| if (task.err) |err| return err;
+        const shared = &state.shared;
+        const wa = state.wave.?.allocator();
+        if (shared.phase == .plan) {
+            var count: usize = 0;
+            for (shared.plans, shared.pages) |*plan, *pages| {
+                pages.* = try wa.alloc(encoder.BuiltPage, plan.pageCount());
+                count += plan.pageCount();
+            }
+            const work = try wa.alloc([2]u32, count);
+            var k: usize = 0;
+            for (shared.plans, 0..) |*plan, ci| for (0..plan.pageCount()) |pi| {
+                work[k] = .{ @intCast(ci), @intCast(pi) };
+                k += 1;
+            };
+            shared.work = work;
+            shared.phase = .pages;
+            shared.cursor.store(0, .monotonic);
+            state.dispatch(count);
+            return;
+        }
+        for (shared.plans, shared.pages, state.lo..) |*plan, pages, ci| {
+            state.job.encs[ci] = plan.finish(state.keep, pages) catch |err| {
+                state.job.err_col = ci;
+                return err;
             };
         }
-        lo = hi;
+        for (state.tasks) |*task| _ = task.arena.reset(.retain_capacity);
+        state.wave.?.deinit();
+        state.wave = null;
+        if (state.work_region) |region| region.rewind();
+        state.lo = state.hi;
+        try state.nextWave();
     }
-}
+};
 
 fn valueRows(cols: []const filter_eval.Batch.Column) usize {
     if (cols.len == 0) return 0;
     return switch (cols[0]) {
         inline else => |c| c.rowCount(),
     };
-}
-
-/// Run `tasks` to the end of the shared phase: the first on this thread, the others on threads of their own; the
-/// first error any hit. A thread that fails to start leaves its share to the ones that did.
-fn runEncodeTasks(tasks: []EncodeTask) !void {
-    tasks[0].shared.failed.store(false, .monotonic);
-    for (tasks) |*t| t.err = null;
-    var threads: [64]?std.Thread = @splat(null);
-    const extra = @min(tasks.len - 1, threads.len);
-    for (tasks[1..][0..extra], threads[0..extra]) |*t, *th| {
-        th.* = spawn_util.spawn(.{ .stack_size = 1 << 20 }, EncodeTask.run, .{t}) catch null;
-    }
-    EncodeTask.run(&tasks[0]);
-    for (threads[0..extra]) |th| if (th) |t| t.join();
-    for (tasks) |t| if (t.err) |e| return e;
-}
-
-/// Take up to `max` permits `s` has free now (up to half of them with `half`), without waiting.
-fn takePermits(s: *std.Io.Semaphore, io: std.Io, opts: struct { max: usize, half: bool = false }) usize {
-    s.mutex.lockUncancelable(io);
-    defer s.mutex.unlock(io);
-    const n = @min(opts.max, if (opts.half) s.permits / 2 else s.permits);
-    s.permits -= n;
-    return n;
 }
 
 const WinCtx = struct {
@@ -1762,18 +1916,13 @@ const WinCtx = struct {
     /// The output columns' schema leaves and paths, as every piece's aggregator has them.
     out_elems: []const schema.SchemaElement = &.{},
     out_paths: []const []const []const u8 = &.{},
-    /// Producer turns the writer holds while it slices a row group alone (its encode helpers then).
+    /// Producer turns the writer holds while it slices a row group alone.
     writer_turns: usize = 0,
-    /// Encode jobs and their helpers run on these, the CPU budget's worth, beside the producers' permits: while
-    /// producers wait on reads, the row groups before theirs encode.
-    encoders: std.Io.Semaphore = .{},
-    /// Encode jobs running beside the writer (`Assembler.start`).
-    encode_group: std.Io.Group = .init,
+    executor: ?*EncodeExecutor = null,
+    encode_during_decode: bool = false,
+    producer_left: std.atomic.Value(usize) = .init(0),
     /// Freed producers' pieces, kept for reuse.
     piece_pool: PiecePool = .{ .gpa = undefined },
-    /// Over fetched inputs encode jobs run on the writer: a wait of its for a CPU permit could wait on a producer that
-    /// waits for fetch room the writer is yet to free.
-    inline_encode: bool = false,
     /// The Bloom filters asked for: per output column for re-encoded row groups, per source leaf for copied ones.
     bloom_outputs: []const ?f64 = &.{},
     bloom_leaves: []const ?f64 = &.{},
@@ -1789,8 +1938,6 @@ const WinCtx = struct {
     producers: usize = 0, // `cpu`'s permits
     /// The CPU budget (`-j`, or the host's), which the producers' permits are at most.
     cpu_budget: usize = 1,
-    /// Pending encodings share a byte window as well as a worker limit; one oversized row group runs alone.
-    encode_window: u64 = 1 << 30,
 
     // Writer-owned (single writer → no races); read back after the fan-out.
     sink: streaming.Sink,
@@ -2150,6 +2297,10 @@ fn winWriter(w: *WinCtx) void {
             asm_.feed(p) catch |e| {
                 w.first_err = e;
             };
+            if (w.first_err == null and next + 1 < w.slots.len and w.out_elems.len > w.executor.?.workers and
+                asm_.shouldCompact()) asm_.compactCarry() catch |e| {
+                w.first_err = e;
+            };
         } else if (enc.deferred) {
             defer w.jobs[next].leave();
             // Under a ledger the slices are decoded alone: the writer takes every producer's turn, so those running
@@ -2161,7 +2312,10 @@ fn winWriter(w: *WinCtx) void {
             w.writer_turns = turns;
             defer w.writer_turns = 0;
             // Encode jobs may still hold regions: only idle ones are trimmed.
-            if (turns > 0) w.trimIdle();
+            if (turns > 0) {
+                w.trimIdle();
+                w.executor.?.allowParallel();
+            }
             // Alone, the writer has the slack's room for one decode beside what the write holds; beside producers, it
             // has that room as a ledger of its own.
             const slack = if (turns > 0) core_memory.lean_decode else 0;
@@ -2228,15 +2382,34 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
     var threaded = std.Io.Threaded.init(w.gpa, .{ .async_limit = .limited(1 + 2 * (async_budget + encoders)) });
     defer threaded.deinit();
     w.io = threaded.io();
-    w.cpu = .{ .permits = async_budget };
-    if (@hasField(Ctx, "producers")) w.producers = async_budget;
-    if (@hasField(Ctx, "encoders")) w.encoders = .{ .permits = w.cpu_budget };
+    const producer_count = if (Ctx == WinCtx) (if (async_budget >= w.cpu_budget and w.cpu_budget > 1)
+        async_budget - 1
+    else
+        async_budget) else async_budget;
+    w.cpu = .{ .permits = producer_count };
+    if (@hasField(Ctx, "producers")) w.producers = producer_count;
+    var executor: EncodeExecutor = undefined;
+    if (Ctx == WinCtx) {
+        w.encode_during_decode = producer_count < async_budget;
+        w.producer_left.store(n_jobs, .monotonic);
+        try executor.init(w);
+        w.executor = &executor;
+    }
+    defer if (Ctx == WinCtx) {
+        executor.deinit();
+        w.executor = null;
+    };
     if (@hasField(Ctx, "piece_pool")) w.piece_pool.io = w.io;
 
     const Run = struct {
         fn producer(ctx: *Ctx, i: usize) void {
             defer ctx.cpu.post(ctx.io);
             Ctx.producer(ctx, i);
+            if (Ctx == WinCtx) {
+                const left = ctx.producer_left.fetchSub(1, .acq_rel) - 1;
+                const e = ctx.executor.?;
+                e.allowThreads(e.workers - @min(left, @min(ctx.producers, e.workers - 1)));
+            }
         }
     };
     var group: std.Io.Group = .init;
@@ -3275,16 +3448,14 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 .arena = arena,
                 .profiler = args.profiler,
                 .diag = args.diag,
-                // Half the budget shared among producers, capped per producer: a few wide input row groups must not
-                // inflate whole-group buffering. Slicing changes neither output boundaries nor encoding.
-                .decode_share = @min(256 << 20, args.max_memory / 2 / @max(1, effective_async_budget)),
-                .encode_window = @min(1 << 30, args.max_memory / 4),
+                // Leave room for the executor beside whole producer pieces; wide input need not take the serial
+                // slice path merely because few input groups are available. Output boundaries remain unchanged.
+                .decode_share = args.max_memory / 2 / @max(1, effective_async_budget),
             };
             // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
             w.cpu_budget = sizing.budget;
             w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
             defer w.piece_pool.deinit();
-            for (jobs.items) |j| w.inline_encode = w.inline_encode or j.gate != null;
             w.piece_pages.child = w.outAlloc();
             w.slicing_pages.child = slicing.allocator();
             w.lean_pages.child = lean.allocator();
@@ -9150,6 +9321,153 @@ test "windowed re-encode writes the same bytes at every parallelism" {
     }
 }
 
+test "persistent encode executor completes multiple waves and jobs under allocation failures with one active worker" {
+    for ([_]bool{ false, true }) |limited_pool| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+            fn run(gpa: std.mem.Allocator, limited: bool) !void {
+                var values: [20_001]f64 = undefined;
+                for (&values, 0..) |*value, i| value.* = @as(f64, @floatFromInt(i)) * 1.319;
+                var elems: [5]schema.SchemaElement = @splat(.{
+                    .name = "x",
+                    .type = .DOUBLE,
+                    .repetition_type = .REQUIRED,
+                    .type_length = null,
+                    .num_children = null,
+                    .scale = null,
+                    .precision = null,
+                    .field_id = null,
+                });
+                var paths: [5][]const []const u8 = @splat(&.{"x"});
+                var cols: [5]consumer.OutputAggregator.ColumnBuf = @splat(.{ .f64 = .{
+                    .values = .fromOwnedSlice(&values),
+                } });
+                var piece: Piece = .{
+                    .arena = .init(std.testing.allocator),
+                    .agg = .{
+                        .arena = gpa,
+                        .cols = &cols,
+                        .schema_elems = &elems,
+                        .paths = &paths,
+                        .num_rows = values.len,
+                        .captured = true,
+                    },
+                };
+                defer piece.arena.deinit();
+                var expected_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer expected_arena.deinit();
+                const expected = try encoder.encodeColumn(expected_arena.allocator(), .{
+                    .values = .{ .f64 = .{ .values = &values } },
+                    .schema_elem = &elems[0],
+                    .path_in_schema = paths[0],
+                    .codec = .UNCOMPRESSED,
+                });
+                var completions: std.Io.Semaphore = .{};
+                var w: WinCtx = undefined;
+                w.gpa = gpa;
+                w.io = std.testing.io;
+                w.memory = null;
+                w.cpu_budget = if (limited) 4 else 1;
+                w.encode_during_decode = limited;
+                w.rg_target = .{};
+                w.regions = &.{};
+                w.encode_pages = .{ .child = gpa };
+                w.out_elems = &elems;
+                w.out_paths = &paths;
+                w.codec = .UNCOMPRESSED;
+                w.zstd = .{};
+                w.bloom_outputs = &.{};
+                w.profiler = null;
+                w.completions = &completions;
+                var executor: EncodeExecutor = undefined;
+                try executor.init(&w);
+                defer executor.deinit();
+                w.executor = &executor;
+                for (0..3) |_| {
+                    const job = try EncodeJob.create(&w, values.len);
+                    defer job.destroy();
+                    job.ranges = try gpa.dupe(Assembler.Range, &.{.{ .piece = &piece, .lo = 0, .hi = values.len }});
+                    executor.submit(.{ .begin = job });
+                    while (!job.done.load(.acquire)) completions.waitUncancelable(w.io);
+                    if (job.err) |err| return err;
+                    try std.testing.expectEqual(@as(usize, 5), job.encs.len);
+                    for (job.encs) |enc| {
+                        try std.testing.expectEqualSlices(u8, expected.bytes, enc.bytes);
+                        try std.testing.expectEqual(@as(usize, 2), enc.pages.len);
+                    }
+                }
+            }
+        }.run, .{limited_pool});
+    }
+}
+
+test "wide carried rows release their original piece without changing values under allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var elems: [2]schema.SchemaElement = @splat(.{
+                .name = "x",
+                .type = .INT32,
+                .repetition_type = .REQUIRED,
+                .type_length = null,
+                .num_children = null,
+                .scale = null,
+                .precision = null,
+                .field_id = null,
+            });
+            elems[1].name = "s";
+            elems[1].type = .BYTE_ARRAY;
+            var paths = [_][]const []const u8{ &.{"x"}, &.{"s"} };
+            var w: WinCtx = undefined;
+            w.gpa = gpa;
+            w.memory = null;
+            w.rg_target = .{};
+            w.piece_pages = .{ .child = gpa };
+            w.out_elems = &elems;
+            w.out_paths = &paths;
+            var a = Assembler.init(&w);
+            defer a.deinit();
+            const p = try Piece.create(gpa, gpa);
+            var owned = true;
+            defer if (owned) p.unref(gpa);
+            const pa = p.arena.allocator();
+            const cols = try pa.alloc(consumer.OutputAggregator.ColumnBuf, 2);
+            cols[0] = .{ .i32 = .{ .values = .fromOwnedSlice(try pa.dupe(i32, &.{ 11, 12, 13, 14, 15, 16 })) } };
+            const dict = try pa.alloc([]const u8, 3);
+            for (dict, [_][]const u8{ "alpha", "beta", "gamma" }) |*value, text| value.* = try pa.dupe(u8, text);
+            cols[1] = .{ .string = .{
+                .coded = true,
+                .codes = .fromOwnedSlice(try pa.dupe(u32, &.{ 1, 0, 2, 0, 1, 2 })),
+                .dict = dict,
+            } };
+            p.agg = .{
+                .arena = pa,
+                .cols = cols,
+                .schema_elems = &elems,
+                .paths = &paths,
+                .num_rows = 6,
+                .captured = true,
+            };
+            p.bits_prefix = try consumer.plainBitsPrefix(pa, &p.agg);
+            try a.done.append(gpa, p);
+            owned = false;
+            try a.ranges.append(gpa, .{ .piece = p, .lo = 2, .hi = 6 });
+            a.rows = 4;
+            a.bits = p.bits_prefix[6] - p.bits_prefix[2];
+            const bits = a.bits;
+            try a.compactCarry();
+            try std.testing.expectEqual(@as(usize, 1), a.ranges.items.len);
+            const carry = a.ranges.items[0];
+            try std.testing.expectEqual(@as(usize, 0), carry.lo);
+            try std.testing.expectEqual(@as(usize, 4), carry.hi);
+            try std.testing.expectEqualSlices(i32, &.{ 13, 14, 15, 16 }, carry.piece.agg.cols[0].i32.values.items);
+            const strings = carry.piece.agg.cols[1].string.values.items;
+            for (strings, [_][]const u8{ "gamma", "alpha", "beta", "gamma" }) |value, text| {
+                try std.testing.expectEqualStrings(text, value);
+            }
+            try std.testing.expectEqual(bits, carry.piece.bits_prefix[4]);
+        }
+    }.run, .{});
+}
+
 test "idle pieces stay bounded, reuse their rows and remain charged until freed" {
     const gpa = std.testing.allocator;
     var ledger: core_memory.SharedBudget = .{ .limit = 1 << 20 };
@@ -9236,7 +9554,6 @@ test "a byte-copy sink error wins over later allocation and producer errors" {
     w.io = std.testing.io;
     w.rg_target = .{};
     w.core = .{};
-    w.encode_group = .init;
     w.slots = &slots;
     w.jobs = &jobs;
     w.profiler = null;
@@ -9277,9 +9594,18 @@ test "a failed older encode cancels the unstarted job at count and byte bounds u
                 w.rg_target = .{};
                 w.core = .{};
                 w.cpu_budget = if (bytes) 8 else 1;
-                w.encode_window = if (bytes) 16 else 1 << 20;
+                var executor: EncodeExecutor = .{
+                    .w = &w,
+                    .queue = undefined,
+                    .buffer = &.{},
+                    .workers = w.cpu_budget,
+                    .slots = .{},
+                    .granted = .init(w.cpu_budget),
+                    .byte_limit = if (bytes) 16 else 1 << 20,
+                };
+                w.executor = &executor;
                 w.memory = null;
-                w.encode_group = .init;
+                w.out_elems = &.{};
                 var a = Assembler.init(&w);
                 defer a.deinit();
                 const older = try EncodeJob.create(&w, 1);
@@ -9293,7 +9619,7 @@ test "a failed older encode cancels the unstarted job at count and byte bounds u
                 a.pending_bytes = older.charge;
                 a.rows = 1;
                 a.bits = 64;
-                if (a.seal(false)) |_| return error.TestUnexpectedResult else |e| switch (e) {
+                if (a.seal()) |_| return error.TestUnexpectedResult else |e| switch (e) {
                     error.DiskQuota => {},
                     else => return e,
                 }

@@ -192,6 +192,7 @@ export fn zpq_open(options_json: ?[*:0]const u8, out_ctx: ?*?*Ctx, out_error: ?*
         .budget = .init(ceiling),
         .budget_wait_ms = opts.budget_wait_ms,
     };
+    ctx.pool.worker_io = ctx.threaded.io();
     ctx.pool.per_call_stats = false;
     // A request that names no max_memory takes the whole ceiling, as the CLI takes all it may.
     ctx.pool.query_memory = ceiling;

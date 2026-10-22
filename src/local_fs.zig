@@ -166,6 +166,33 @@ pub const Mapped = struct {
     }
 };
 
+/// Release a finished large mapping's PTEs concurrently before its final unmap. Linux serializes munmap under
+/// mmap_lock; disjoint MADV_DONTNEED calls can release those PTEs in parallel on the context's persistent workers.
+/// The mapping stays valid through this call, including when dispatch fails and the caller does the work.
+pub fn releaseMappingPages(bytes: []align(std.heap.page_size_min) const u8, io: std.Io) void {
+    if (builtin.os.tag != .linux or bytes.len < 64 << 20) return;
+    const slice_len = 32 << 20;
+    const Release = struct {
+        bytes: []align(std.heap.page_size_min) const u8,
+        next: std.atomic.Value(usize) = .init(0),
+
+        fn run(self: *@This()) void {
+            while (true) {
+                const off = self.next.fetchAdd(slice_len, .monotonic);
+                if (off >= self.bytes.len) return;
+                const len = @min(slice_len, self.bytes.len - off);
+                _ = std.os.linux.madvise(@constCast(self.bytes.ptr + off), len, std.os.linux.MADV.DONTNEED);
+            }
+        }
+    };
+    var release: Release = .{ .bytes = bytes };
+    var group: std.Io.Group = .init;
+    const workers = @min(16, @min(std.Thread.getCpuCount() catch 1, (bytes.len + slice_len - 1) / slice_len));
+    for (1..workers) |_| group.concurrent(io, Release.run, .{&release}) catch break;
+    release.run();
+    group.await(io) catch {};
+}
+
 /// Mappings a query left for the process exit to take (`engine.Context.exit_after`), until `releaseLeft`. Only the
 /// thread that runs the query adds to it.
 var left: std.ArrayList([]align(std.heap.page_size_min) const u8) = .empty;
@@ -553,7 +580,6 @@ test "releaseLeft drops a left mapping's pages from the resident set and leaves 
     try testing.expectEqualSlices(u8, data, m.bytes);
 }
 
-
 test "mapFile rejects an empty file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -590,8 +616,8 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
     const wfd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     defer close(wfd);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.ftruncate(wfd, @intCast(page))));
-    const before: *volatile const u8 = &m.bytes[0];
-    const past: *volatile const u8 = &m.bytes[2 * page + 7];
+    const before: *const volatile u8 = &m.bytes[0];
+    const past: *const volatile u8 = &m.bytes[2 * page + 7];
     try testing.expectEqual(@as(u8, 0xab), before.*);
     // Unguarded, this read was SIGBUS on Linux.
     try expectCutByte(past.*);
@@ -637,7 +663,7 @@ test "regression: a mapped file cut inside its last page or rewritten in place r
         const wfd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
         try testing.expectEqual(posix.E.SUCCESS, posix.errno(posix.system.ftruncate(wfd, 600)));
         close(wfd);
-        const tail: *volatile const u8 = &cut.bytes[900];
+        const tail: *const volatile u8 = &cut.bytes[900];
         try expectCutByte(tail.*);
         try testing.expectError(error.InputChanged, cut.intact(path));
 
@@ -727,4 +753,27 @@ test "writeAll distinguishes a full device from a broken pipe" {
     close(pipe[0]);
     defer close(pipe[1]);
     try testing.expectError(error.BrokenPipe, writeAll(pipe[1], "x"));
+}
+
+test "parallel mapping release keeps bytes intact and falls back when concurrency is unavailable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/release.bin", .{tmp.sub_path});
+    const data = try arena.allocator().alloc(u8, 65 << 20);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+    const fd = try createFile(path);
+    try writeAll(fd, data);
+    close(fd);
+    const mapped = try mapFile(path);
+    defer mapped.unmap();
+    for ([_]std.Io.Limit{ .unlimited, .nothing }) |limit| {
+        var runtime = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = limit });
+        defer runtime.deinit();
+        try testing.expectEqualSlices(u8, data, mapped.bytes);
+        releaseMappingPages(mapped.bytes, runtime.io());
+        try testing.expectEqualSlices(u8, data, mapped.bytes);
+    }
 }

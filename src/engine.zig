@@ -363,6 +363,8 @@ pub const Context = struct {
     /// container connection reuse; null in CLI which builds a fresh
     /// pool per invocation.
     pool_registry: ?*PoolRegistry = null,
+    /// Optional context-owned worker runtime. Its threads and codec TLS survive this query.
+    worker_io: ?std.Io = null,
     /// Optional long-lived metadata cache. Lambda uses this to skip
     /// repeated footer fetches on warm-container repeat invocations
     /// against the same object (validated via If-None-Match
@@ -1901,6 +1903,7 @@ const WinCtx = struct {
 
     gpa: std.mem.Allocator,
     io: std.Io = undefined, // set in runWindowed once the runtime exists
+    worker_io: ?std.Io = null,
     jobs: []const RGJob,
     filter: ?filter_ast.Filter,
     fetch_arr: []const bool,
@@ -2379,9 +2382,15 @@ fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
 fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) !void {
     // A write's encode jobs run on the pool too, beside the producers.
     const encoders = if (@hasField(Ctx, "cpu_budget")) w.cpu_budget else 0;
-    var threaded = std.Io.Threaded.init(w.gpa, .{ .async_limit = .limited(1 + 2 * (async_budget + encoders)) });
-    defer threaded.deinit();
-    w.io = threaded.io();
+    const borrowed = if (@hasField(Ctx, "worker_io")) w.worker_io else null;
+    var threaded: ?std.Io.Threaded = null;
+    defer if (threaded) |*runtime| runtime.deinit();
+    if (borrowed) |io| {
+        w.io = io;
+    } else {
+        threaded = .init(w.gpa, .{ .async_limit = .limited(1 + 2 * (async_budget + encoders)) });
+        w.io = threaded.?.io();
+    }
     const producer_count = if (Ctx == WinCtx) (if (async_budget >= w.cpu_budget and w.cpu_budget > 1)
         async_budget - 1
     else
@@ -2419,7 +2428,11 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
         // One dispatching thread takes every permit, so no two producers each hold part of what both need.
         for (0..windowPermits(Ctx, w, i)) |_| w.window.waitUncancelable(w.io);
         w.cpu.waitUncancelable(w.io);
-        group.async(w.io, Run.producer, .{ w, i });
+        // The host runtime may have a smaller async limit than this query's ready tasks. Concurrent dispatch
+        // must not run a producer inline on the dispatcher while its writer waits for another input slot.
+        if (borrowed != null) {
+            group.concurrent(w.io, Run.producer, .{ w, i }) catch group.async(w.io, Run.producer, .{ w, i });
+        } else group.async(w.io, Run.producer, .{ w, i });
     }
     try group.await(w.io);
     if (w.first_err) |e| {
@@ -2438,6 +2451,7 @@ const RecompressCtx = struct {
 
     gpa: std.mem.Allocator,
     io: std.Io = undefined, // set in runWindowed once the runtime exists
+    worker_io: ?std.Io = null,
     jobs: []const RGJob,
     kept: ?[]const bool,
     codec: schema.CompressionCodec,
@@ -3247,6 +3261,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
             var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
             var rw = RecompressCtx{
+                .worker_io = ctx.worker_io,
                 .win_unit = sizing.unit,
                 .win_units = sizing.units,
                 .gpa = ctx.gpa,
@@ -3417,6 +3432,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             // Every piece's aggregator has these leaves; the row groups cut from them are written under them.
             const out_agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
             var w = WinCtx{
+                .worker_io = ctx.worker_io,
                 .rg_target = args.row_group.under(args.max_memory_explicit),
                 .early_arr = early_arr,
                 .out_elems = out_agg.schema_elems,
@@ -3688,6 +3704,7 @@ const OpenedInputs = struct {
     membership: membership.Stats = .{},
     /// `Context.exit_after`: the mappings go with the process (`local_fs.leaveForExit`).
     leave_mappings: bool = false,
+    release_io: ?std.Io = null,
     /// Fetching S3 bytes into `s3_mapped` behind the scan's gates, when the query reads more than its window.
     s3_fetcher: ?*S3Fetcher = null,
     s3_mapped: []const []align(s3_window.page) u8 = &.{},
@@ -3713,7 +3730,14 @@ const OpenedInputs = struct {
     }
 
     pub fn deinit(self: *OpenedInputs) void {
-        for (self.mmaps) |m_opt| if (m_opt) |m| if (self.leave_mappings) local_fs.leaveForExit(m) else m.unmap();
+        for (self.mmaps) |m_opt| if (m_opt) |m| {
+            if (self.leave_mappings) {
+                local_fs.leaveForExit(m);
+            } else {
+                if (self.release_io) |io| local_fs.releaseMappingPages(m.bytes, io);
+                m.unmap();
+            }
+        };
         // Joined before its buffers go: a batch may still be landing in them.
         if (self.s3_fetcher) |f| f.stop();
         for (self.s3_mapped) |buf| s3_window.unmapBuffer(buf);
@@ -4060,6 +4084,7 @@ fn openInputs(
                 .owned_pools = owned_pools.items,
                 .s3_buffers = &.{},
                 .leave_mappings = ctx.exit_after,
+                .release_io = ctx.worker_io,
                 .footer_resident_peak = footer_resident_peak,
             };
         }
@@ -4359,6 +4384,7 @@ fn openInputs(
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),
         .membership = membership_stats,
         .leave_mappings = ctx.exit_after,
+        .release_io = ctx.worker_io,
         .s3_fetcher = s3_fetcher,
         .s3_mapped = try s3_mapped.toOwnedSlice(arena),
         .footer_resident_peak = footer_resident_peak,
@@ -12764,5 +12790,46 @@ test "written files name zpq as their writer once zpq encodes their data, and ke
         defer arena.deinit();
         const meta = try metadata.open(arena.allocator(), bytes);
         try std.testing.expectEqualStrings(c.writer, meta.created_by.?);
+    }
+}
+
+test "a borrowed worker runtime survives repeated writes and a sink failure" {
+    const fixture = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/borrowed.parquet", .{tmp.sub_path});
+    var expected: ?[]u8 = null;
+    defer if (expected) |bytes| std.testing.allocator.free(bytes);
+    for (0..3) |i| {
+        const ctx: Context = .{
+            .gpa = std.testing.allocator,
+            .env = .empty,
+            .io = std.testing.io,
+            .worker_io = runtime.io(),
+        };
+        const args: QueryArgs = .{
+            .inputs = &.{fixture},
+            .output = path,
+            .filter = "x > 0",
+            .parallelism = 3,
+            .max_memory = 256 << 20,
+        };
+        if (i == 1 and @import("builtin").os.tag == .linux) {
+            const full = try std.posix.openat(std.posix.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0);
+            defer local_fs.close(full);
+            var bad = args;
+            bad.output_fd = full;
+            try std.testing.expectError(error.NoSpaceLeft, runQuery(ctx, bad));
+        }
+        var answer = try runQuery(ctx, args);
+        answer.deinit(std.testing.allocator);
+        const bytes = try local_fs.readFile(std.testing.allocator, path);
+        defer std.testing.allocator.free(bytes);
+        if (expected) |want| try std.testing.expectEqualSlices(u8, want, bytes) else expected = try std.testing.allocator.dupe(u8, bytes);
+        try std.testing.expect(runtime.worker_threads.load(.acquire) != null);
     }
 }

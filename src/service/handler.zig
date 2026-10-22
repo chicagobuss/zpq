@@ -49,6 +49,8 @@ pub const PersistentPool = struct {
     /// Gates each query's budget against a ceiling its pool's queries share (libzpq's context). Null: no gate (the
     /// Lambda runs one query at a time).
     admission: ?Admission = null,
+    /// Owned by an embedding context and joined only when that context closes.
+    worker_io: ?std.Io = null,
 
     /// A sixteenth of the function's memory for warm Bloom filters (188 MB at 3008 MB), at most 256 MiB.
     pub fn sized(available: usize) PersistentPool {
@@ -545,6 +547,7 @@ fn executeSql(
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
+        .worker_io = pool.worker_io,
     };
     var out: std.Io.Writer.Allocating = .init(result_memory);
     defer out.deinit();
@@ -837,6 +840,7 @@ fn runAggregate(
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
+        .worker_io = pool.worker_io,
     }, args) catch |err| return engineError(allocator, err, &diag);
     defer result.deinit(allocator);
     const ar = result.aggregate;
@@ -952,6 +956,7 @@ fn runWrite(
         .io = io,
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
+        .worker_io = pool.worker_io,
     }, args) catch |err| return engineError(allocator, err, &diag);
     const wr = result.write;
     const output_url_str = qa.output.?; // dispatch only routes here when set

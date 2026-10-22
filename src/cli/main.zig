@@ -592,7 +592,7 @@ fn runQuery(
     const started = nowMonoNs();
     var rows: usize = 0;
     var stats: SummaryStats = .{};
-    var output_ns: u64 = 0;
+    var output_started_ns: i64 = 0;
     var text_bytes_out: u64 = 0;
     if (aggregate != null or group_by != null) {
         var result = try engine.runQuery(ctx, query_args);
@@ -601,7 +601,7 @@ fn runQuery(
         const answer = ar.output;
         rows = if (answer.group_rows) |groups| groups.len else if (answer.typed) |t| t.rows else if (query_args.empty_scalar or answer.no_row) 0 else 1;
         if (fmt != .parquet) {
-            const output_start = nowMonoNs();
+            output_started_ns = nowMonoNs();
             var fd: local_fs.fd_t = 1;
             var owns_fd = false;
             defer if (owns_fd) local_fs.close(fd);
@@ -617,14 +617,13 @@ fn runQuery(
                 owns_fd = false;
                 try local_fs.closeChecked(fd);
             }
-            output_ns = @intCast(nowMonoNs() - output_start);
         }
-        output_ns = if (fmt == .parquet) ar.timings.core.encode_ns + ar.timings.core.sink_ns + ar.timings.footer_ns else output_ns;
+        if (fmt == .parquet) output_started_ns = ar.timings.output_started_ns;
         stats = .{ .aggregate = true, .rows_in = ar.rows_in, .rows_scanned = ar.rows_scanned, .rows_matched = ar.rows_matched, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
     } else if (fmt == .parquet and limit == null and result_order.offset == 0 and result_order.rows.len == 0) {
         const result = (try engine.runQuery(ctx, query_args)).write;
         rows = @intCast(result.rows_matched);
-        output_ns = result.timings.core.encode_ns + result.timings.core.sink_ns + result.timings.footer_ns;
+        output_started_ns = result.timings.output_started_ns;
         stats = .{ .rows_in = result.rows_in, .rows_scanned = result.rows_scanned, .rows_matched = result.rows_matched, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .row_groups_pruned = result.row_groups_pruned, .membership = result.membership, .timings = result.timings, .codec = result.codec };
     } else {
         if (!to_stdout and std.mem.startsWith(u8, engine_output.?, "s3://")) {
@@ -644,16 +643,16 @@ fn runQuery(
             try local_fs.closeChecked(fd);
         }
         rows = printed.rows;
-        output_ns = printed.output_ns;
+        output_started_ns = printed.timings.output_started_ns;
         stats = .{ .rows_in = @intCast(printed.rows_in), .rows_scanned = @intCast(printed.rows_scanned), .rows_matched = @intCast(printed.rows_matched), .bytes_out = printed.bytes_out, .files_in = inputs.len, .row_groups_in = printed.row_groups_in, .row_groups_pruned = printed.row_groups_pruned, .membership = printed.membership, .timings = printed.timings };
     }
-    const publication_start = nowMonoNs();
+    if (output_started_ns == 0) output_started_ns = nowMonoNs();
     try publication.commit(io);
-    output_ns += @intCast(nowMonoNs() - publication_start);
+    const published_ns = nowMonoNs();
     if (fmt == .parquet and (aggregate != null or group_by != null or limit != null or result_order.offset != 0))
         stats.codec = codec orelse .SNAPPY;
     stats.codec_applicable = fmt == .parquet;
-    stats.output_ns = output_ns;
+    stats.output_ns = @intCast(published_ns - output_started_ns);
     const total_ns = nowMonoNs() - started;
     if (profiler) |p| try profile_out.emit(gpa, io, p);
     if (summary) try writeSummary(if (to_stdout) null else output, rows, stats, total_ns);

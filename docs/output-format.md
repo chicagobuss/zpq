@@ -167,7 +167,9 @@ a LIMIT top-N, whose workers may each read a row group before a cut passes over 
 Every field is whole milliseconds (`_ms`, rounded down) or microseconds (`_us`).
 
 - `total_ms` / `total_us`: wall-clock time of the query, from parsing the command to the summary.
-- `output_us`: time spent printing the answer, or encoding and writing the output file.
+- `output_us`: wall-clock time from the first output encoding or write through flushing and publication of the
+  answer. Includes waits between output writes while scanning continues; never exceeds `total_us`. Worker encode
+  and sink times remain in `worker_ms` and may exceed wall-clock time when summed across workers.
 - `wall_ms`: wall-clock phases.
   - `open` opens the inputs and reads their footers.
   - `parse` parses the footers and the query.

@@ -43,6 +43,22 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
                  (['--group-by', 'k', '--aggregate', 'sum(v) AS s'],
                   [{'k': 1, 's': 8}, {'k': 2, 's': None}, {'k': 3, 's': 7}])]
     con = duckdb.connect()
+    parallel_src = root / 'parallel.parquet'
+    n = 600_003
+    pq.write_table(pa.table({'k': range(n), 'v': [i * .03125 for i in range(n)],
+                            's': [f'name-{i % 997}' for i in range(n)]}),
+                   parallel_src, row_group_size=16_384)
+    for j in ('1', '16'):
+        for fmt in ('parquet', 'ndjson'):
+            dst = root / 'parallel.out'
+            p = run(parallel_src, '--select', 'k, v, v * 1.19 AS gross, s', '--filter', 'k >= 0',
+                    '-j', j, '--codec', 'zstd', '--format', fmt, '-o', str(dst), '--summary=json')
+            summary = json.loads(p.stderr)
+            assert 0 < summary['output_us'] <= summary['total_us'], summary
+            assert summary['rows'] == n
+            if fmt == 'parquet':
+                assert pq.read_table(dst).num_rows == n
+                assert con.execute(f"SELECT count(*) FROM read_parquet('{dst}')").fetchone()[0] == n
     for args, wanted in scenarios:
         p = run(src, *args)
         assert ndjson(p.stdout) == wanted and not p.stderr, (args, p.stdout, p.stderr)
@@ -52,11 +68,14 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
         p = run(src, *args, '--summary=json')
         summary = json.loads(p.stderr)
         assert summary['type'] == 'summary' and summary['rows'] == len(wanted)
-        assert summary['output_us'] >= 0 and summary['bytes_out'] == len(p.stdout)
+        assert 0 <= summary['output_us'] <= summary['total_us']
+        assert summary['bytes_out'] == len(p.stdout)
         for fmt in ('ndjson', 'json', 'parquet'):
             dst = root / 'answer.blob'
             p = run(src, *args, '-o', str(dst), '--format', fmt, '--summary=json')
-            assert not p.stdout and json.loads(p.stderr)['rows'] == len(wanted)
+            summary = json.loads(p.stderr)
+            assert not p.stdout and summary['rows'] == len(wanted)
+            assert 0 <= summary['output_us'] <= summary['total_us']
             if fmt == 'parquet':
                 got = pq.read_table(dst).to_pylist()
                 cursor = con.execute(f"SELECT * FROM read_parquet('{dst}')")

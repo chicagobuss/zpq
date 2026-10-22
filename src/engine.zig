@@ -458,6 +458,8 @@ pub const AggResult = struct {
 };
 
 pub const Timings = struct {
+    /// Monotonic start of output work, including gaps between writes. The CLI ends it after publication.
+    output_started_ns: i64 = 0,
     read_ns: u64 = 0,
     parse_ns: u64 = 0,
     core: consumer.Timings = .{},
@@ -811,6 +813,7 @@ fn executeAggregateOver(
             return error.BadOutputUrl;
         }
         const t_footer = nowMonoNs();
+        t.output_started_ns = t_footer;
         const st = r.state;
         const codec = args.codec orelse .SNAPPY;
         const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
@@ -1065,7 +1068,7 @@ const Piece = struct {
 
 /// Freed pieces with their arenas reset but their memory kept, for the producers' next pieces: a piece's rows are
 /// megabytes the general allocator maps fresh and unmaps whole, a fault per page and, unmapped while encode threads
-/// run, a TLB shootdown on every one of them. Near the ledger's limit a freed piece is freed for good instead.
+/// run, a TLB shootdown on every one of them. Idle pieces keep at most 32 MiB together, still on the ledger.
 const PiecePool = struct {
     io: std.Io = undefined,
     mutex: std.Io.Mutex = .init,
@@ -1073,11 +1076,14 @@ const PiecePool = struct {
     gpa: std.mem.Allocator,
     rows_alloc: std.mem.Allocator = undefined,
     ledger: ?*core_memory.SharedBudget = null,
+    retained: usize = 0,
+    limit: usize = 32 << 20,
 
     /// A piece with no rows and a reference count of one, its arena's memory reused where the pool has one.
     fn take(pool: *PiecePool) !*Piece {
         pool.mutex.lockUncancelable(pool.io);
         const reused = pool.free.pop();
+        if (reused) |p| pool.retained -= p.arena.queryCapacity();
         pool.mutex.unlock(pool.io);
         const p = reused orelse try Piece.create(pool.gpa, pool.rows_alloc);
         p.refs.store(1, .monotonic);
@@ -1087,10 +1093,14 @@ const PiecePool = struct {
 
     fn give(pool: *PiecePool, p: *Piece) void {
         if (pool.ledger) |l| if (l.tight()) return p.destroy(pool.gpa);
+        if (p.arena.queryCapacity() > pool.limit) return p.destroy(pool.gpa);
         _ = p.arena.reset(.retain_capacity);
         pool.mutex.lockUncancelable(pool.io);
         defer pool.mutex.unlock(pool.io);
-        pool.free.append(pool.gpa, p) catch p.destroy(pool.gpa);
+        const bytes = p.arena.queryCapacity();
+        if (bytes > pool.limit - pool.retained) return p.destroy(pool.gpa);
+        pool.free.append(pool.gpa, p) catch return p.destroy(pool.gpa);
+        pool.retained += bytes;
     }
 
     fn deinit(pool: *PiecePool) void {
@@ -1232,6 +1242,7 @@ const Assembler = struct {
     current: ?*Piece = null,
     /// Sealed row groups not yet written, oldest first.
     pending: std.ArrayListUnmanaged(*EncodeJob) = .empty,
+    pending_bytes: u64 = 0,
 
     const Range = struct { piece: *Piece, lo: usize, hi: usize };
 
@@ -1320,6 +1331,7 @@ const Assembler = struct {
         for (job.pieces) |p| p.ref();
         job.charge = a.bits / 8 *| 3;
         try a.pending.append(w.gpa, job);
+        a.pending_bytes += job.charge;
         started = true;
         for (a.done.items) |p| p.unref(w.gpa);
         a.done.clearRetainingCapacity();
@@ -1335,15 +1347,16 @@ const Assembler = struct {
     /// no room for its encoding.
     fn start(a: *Assembler, job: *EncodeJob) !void {
         const w = a.w;
-        if (w.inline_encode or w.writer_turns > 0) {
-            job.run();
-            return;
-        }
         // Bound the row groups encoding at once: by the CPU budget, and by the ledger's room for their encoding.
         while (a.pending.items.len > 1) {
             const room = if (w.memory) |m| m.budget.available() >= job.charge else true;
-            if (a.pending.items.len <= w.cpu_budget and room) break;
+            if (a.pending.items.len <= w.cpu_budget and a.pending_bytes <= w.encode_window and room) break;
             try a.writeFront();
+        }
+        job.reserve();
+        if (w.inline_encode or w.writer_turns > 0) {
+            job.run();
+            return;
         }
         w.encoders.waitUncancelable(w.io);
         job.permit = .encoder;
@@ -1354,6 +1367,7 @@ const Assembler = struct {
     fn writeFront(a: *Assembler) !void {
         const w = a.w;
         const job = a.pending.orderedRemove(0);
+        a.pending_bytes -= job.charge;
         defer job.destroy();
         while (!job.done.load(.acquire)) w.completions.waitUncancelable(w.io);
         try job.place();
@@ -1400,7 +1414,6 @@ const EncodeJob = struct {
     /// the job holds it until the writer has placed it), else fresh pages.
     arena: ?std.heap.ArenaAllocator = null,
     regions: ?*WorkRegions = null,
-    /// The region's ledgers, set aside while the job uses it: a job's waves charge the ledger by estimate.
     region_budgets: [2]?*core_memory.SharedBudget = .{ null, null },
     rows: usize,
     /// The pieces' rows it is made of, in order (`Assembler.Range`), joined a wave of columns at a time as it runs.
@@ -1409,6 +1422,7 @@ const EncodeJob = struct {
     encs: []encoder.EncodedColumn = &.{},
     /// What its encoding is estimated to hold (three times its PLAIN bytes), for the writer's admission.
     charge: u64 = 0,
+    reserved: usize = 0,
     err: ?anyerror = null,
     err_col: ?usize = null,
     encode_ns: u64 = 0,
@@ -1422,6 +1436,14 @@ const EncodeJob = struct {
         const job = try w.gpa.create(EncodeJob);
         job.* = .{ .w = w, .rows = rows };
         return job;
+    }
+
+    fn reserve(job: *EncodeJob) void {
+        const m = job.w.memory orelse return;
+        job.reserved = @intCast(job.charge);
+        // A row group alone retains the existing lone-column allowance. The reservation now lives through
+        // placement, so completed chunks cannot disappear from the ledger between encode waves and sink writes.
+        if (m.budget.drawExact(job.reserved) == null) m.budget.force(job.reserved);
     }
 
     /// Its memory, claimed now, on the job's thread: the arena its chunks stay on (a region's `rows`), and what each
@@ -1445,11 +1467,21 @@ const EncodeJob = struct {
         const w = job.w;
         if (!job.done.load(.acquire)) for (job.pieces) |p| p.unref(w.gpa);
         if (job.arena) |*a| a.deinit();
+        if (w.memory) |m| m.budget.release(job.reserved);
         if (job.regions) |r| {
             r.rows.rewind();
             r.work.rewind();
             r.rows.budget = job.region_budgets[0];
             r.work.budget = job.region_budgets[1];
+            // Retained pages outlive the job's reservation. Charge their actual high water or return them now.
+            if (job.permit == .none) {
+                // Sliced input needs the room for its next batch, rather than warm encoder scratch.
+                r.rows.trim();
+                r.work.trim();
+            } else {
+                if (!r.rows.admit(r.rows.touched)) r.rows.trim();
+                if (!r.work.admit(r.work.touched)) r.work.trim();
+            }
             if (w.memory) |m| if (m.budget.tight()) {
                 r.rows.trim();
                 r.work.trim();
@@ -1572,8 +1604,8 @@ const EncodeTask = struct {
 };
 
 /// Encode a sealed row group's columns onto its arena. Columns go in waves, as many at once as the ledger admits
-/// (`encodeCharge`; a column alone is always admitted); within a wave the columns plan on the job's helpers, then every
-/// page of every column builds on them, so a row group of few columns still uses every helper it has. Helpers beyond
+/// (`encodeCharge`; a column alone is always attempted); within a wave the columns plan on the job's helpers, then
+/// every page builds on them, so a row group of few columns still uses every helper it has. Helpers beyond
 /// the job's own thread are CPU permits free now (spare ones first), or the producers' turns the writer holds while it
 /// slices alone; they go back when the job ends. The bytes are the ones one thread would write.
 fn encodeColumns(job: *EncodeJob) !void {
@@ -1602,7 +1634,10 @@ fn encodeColumns(job: *EncodeJob) !void {
     // Helpers: row groups encode beside one another, a thread each, so one takes helpers only when none follows it soon
     // (`last`): the encoder permits free now. While the writer slices alone, the producers' turns it holds.
     const turns = if (job.permit == .none) w.writer_turns else 0;
-    const taken = if (turns > 0 or !job.last) 0 else takePermits(&w.encoders, w.io, .{ .max = n_cols *| 8 });
+    // A sliced writer may hold fewer producer turns than the CPU budget (one wide input row group, for example).
+    // Borrow the remaining encoder permits too, while keeping its total helpers within that budget.
+    const extra = if (turns > 0) w.cpu_budget - turns else n_cols *| 8;
+    const taken = if (turns == 0 and !job.last) 0 else takePermits(&w.encoders, w.io, .{ .max = @min(n_cols *| 8, extra) });
     defer for (0..taken) |_| w.encoders.post(w.io);
     const helpers = 1 + (turns -| 1) + taken;
     const tasks = try ja.alloc(EncodeTask, helpers);
@@ -1618,11 +1653,10 @@ fn encodeColumns(job: *EncodeJob) !void {
         var hi = lo + 1;
         var charge = charges[lo];
         while (hi < n_cols and hi - lo < 4 * helpers) : (hi += 1) {
-            if (ledger) |l| if (charge +| charges[hi] > l.available()) break;
+            if (ledger) |l| if (charge +| charges[hi] > l.available() +| job.reserved) break;
             charge +|= charges[hi];
         }
-        if (ledger) |l| if (l.drawExact(charge) == null) l.force(charge);
-        defer if (ledger) |l| l.release(charge);
+        // The job's reservation covers the waves and stays drawn while completed chunks wait for placement.
         // The wave's columns joined from the pieces, and the job thread's own encoding, on `work`, given back whole
         // after the wave: a row group's copy is never held whole, and the next wave reuses the same pages.
         var wave_arena = std.heap.ArenaAllocator.init(work_alloc);
@@ -1748,6 +1782,8 @@ const WinCtx = struct {
     producers: usize = 0, // `cpu`'s permits
     /// The CPU budget (`-j`, or the host's), which the producers' permits are at most.
     cpu_budget: usize = 1,
+    /// Pending encodings share a byte window as well as a worker limit; one oversized row group runs alone.
+    encode_window: u64 = 1 << 30,
 
     // Writer-owned (single writer → no races); read back after the fan-out.
     sink: streaming.Sink,
@@ -1805,6 +1841,15 @@ const WinCtx = struct {
     /// What a piece's rows are allocated through: `outAlloc` in huge pages.
     fn pieceAlloc(w: *WinCtx) std.mem.Allocator {
         return w.piece_pages.allocator();
+    }
+
+    fn trimIdle(w: *WinCtx) void {
+        for (w.regions) |*r| {
+            if (r.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) continue;
+            r.rows.trim();
+            r.work.trim();
+            r.busy.store(false, .release);
+        }
     }
 
     /// What a sliced row group's pieces are allocated through: the ledger it slices on, in huge pages.
@@ -2006,6 +2051,7 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
     var slice = std.heap.ArenaAllocator.init(gpa);
     defer slice.deinit();
     while (done < num_rows) {
+        if (ledger) |l| if (l.tight()) w.trimIdle();
         const n = @min(slice_rows, num_rows - done);
         _ = slice.reset(.retain_capacity);
         const piece = sliceToPiece(w, job, &readers, &slice, n, &timings) catch |e| {
@@ -2014,6 +2060,7 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
             // Refused: decode the same rows again, half as many at a time.
             m.refused.store(false, .monotonic);
             _ = slice.reset(.free_all);
+            w.trimIdle();
             readers.deinit();
             readers.init(w, gpa, job, done) catch |re| {
                 readers = .{ .pages = .init(gpa), .lookup = &.{} };
@@ -2025,7 +2072,10 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
         done += n;
         if (ledger) |l| {
             const took = @max(1, (slice.queryCapacity() + piece.arena.queryCapacity()) / n);
-            slice_rows = @min(num_rows, @max(1, @min(w.decode_share, l.available() / 2) / took));
+            // Each piece owns column buffers and schema metadata. Shrinking the next batch below the initial 64
+            // rows makes that fixed cost dominate, until an unfinished output row group can exhaust the ledger.
+            // Actual allocation refusals still halve below this hint, down to one row.
+            slice_rows = @min(num_rows, @max(64, @min(w.decode_share, l.available() / 2) / took));
         }
         try asm_.feed(piece);
     }
@@ -2098,12 +2148,7 @@ fn winWriter(w: *WinCtx) void {
             w.writer_turns = turns;
             defer w.writer_turns = 0;
             // Encode jobs may still hold regions: only idle ones are trimmed.
-            if (turns > 0) for (w.regions) |*r| {
-                if (r.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) continue;
-                r.rows.trim();
-                r.work.trim();
-                r.busy.store(false, .release);
-            };
+            if (turns > 0) w.trimIdle();
             // Alone, the writer has the slack's room for one decode beside what the write holds; beside producers, it
             // has that room as a ledger of its own.
             const slack = if (turns > 0) core_memory.lean_decode else 0;
@@ -2906,6 +2951,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // 5. Stream output. PAR1 magic, then per-file × per-RG
     //    encodeRG/copyRG, then footer.
     var out_offset: u64 = 0;
+    t.output_started_ns = nowMonoNs();
     try sink.write(&PAR1);
     out_offset += PAR1.len;
 
@@ -3214,9 +3260,10 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 .arena = arena,
                 .profiler = args.profiler,
                 .diag = args.diag,
-                // Half the budget for the producers' decoded rows (the fetch window and the encoded output in flight
-                // take a quarter each), shared among those that can run at once. Slicing never shows in the output.
-                .decode_share = args.max_memory / 2 / @max(1, effective_async_budget),
+                // Half the budget shared among producers, capped per producer: a few wide input row groups must not
+                // inflate whole-group buffering. Slicing changes neither output boundaries nor encoding.
+                .decode_share = @min(256 << 20, args.max_memory / 2 / @max(1, effective_async_budget)),
+                .encode_window = @min(1 << 30, args.max_memory / 4),
             };
             // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
             w.cpu_budget = sizing.budget;
@@ -5777,6 +5824,7 @@ pub const StdoutWriter = struct {
     buf: [4096]u8 = undefined,
     pos: usize = 0,
     output_ns: u64 = 0,
+    output_started_ns: i64 = 0,
     bytes_written: u64 = 0,
     json_array: bool = false,
     skip_remaining: usize = 0,
@@ -5785,6 +5833,7 @@ pub const StdoutWriter = struct {
     diag: ?*Diag = null,
 
     pub fn writeAll(self: *StdoutWriter, bytes: []const u8) !void {
+        if (bytes.len > 0 and self.output_started_ns == 0) self.output_started_ns = nowMonoNs();
         var i: usize = 0;
         while (i < bytes.len) {
             const space = self.buf.len - self.pos;
@@ -7925,8 +7974,7 @@ fn flushAggregator(
     limit: ?usize,
     total_printed: *usize,
 ) !void {
-    const output_start = nowMonoNs();
-    defer writer.output_ns += @intCast(nowMonoNs() - output_start);
+    if (agg.num_rows > 0 and writer.output_started_ns == 0) writer.output_started_ns = nowMonoNs();
     if (writer.parquet) |pq| {
         try pq.append(agg, limit, total_printed, &writer.skip_remaining);
         return;
@@ -8272,9 +8320,11 @@ fn runPrintSinkOver(
         .target = args.row_group.under(args.max_memory_explicit),
     };
     defer parquet.deinit();
+    var output_started_ns: i64 = 0;
     if (format == .parquet) {
         coerceByteArrayDecimalLeavesToFlba(&parquet.schema_items);
         coerceFloat16LeavesToDouble(&parquet.schema_items);
+        output_started_ns = nowMonoNs();
         try parquet.start();
     }
     var stdout_writer = StdoutWriter{
@@ -8283,6 +8333,7 @@ fn runPrintSinkOver(
         .json_array = format == .json,
         .skip_remaining = offset,
         .parquet = if (format == .parquet) &parquet else null,
+        .output_started_ns = output_started_ns,
         .diag = args.diag,
     };
     defer stdout_writer.flush() catch {};
@@ -8466,11 +8517,13 @@ fn runPrintSinkOver(
 
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
     const finish_start = nowMonoNs();
+    if (stdout_writer.output_started_ns == 0) stdout_writer.output_started_ns = finish_start;
     try opened.intact();
     if (format == .json) try stdout_writer.writeAll("]\n");
     if (format == .parquet) try parquet.finish(total_printed);
     try stdout_writer.flush();
-    stdout_writer.output_ns += @intCast(nowMonoNs() - finish_start);
+    t.output_started_ns = stdout_writer.output_started_ns;
+    stdout_writer.output_ns = @intCast(nowMonoNs() - t.output_started_ns);
     _ = t_start;
     var all_rows: usize = 0;
     for (metas) |m| for (m.row_groups.items) |rg| {
@@ -9080,6 +9133,72 @@ test "windowed re-encode writes the same bytes at every parallelism" {
             } else first = bytes;
         }
     }
+}
+
+test "idle pieces stay bounded, reuse their rows and remain charged until freed" {
+    const gpa = std.testing.allocator;
+    var ledger: core_memory.SharedBudget = .{ .limit = 1 << 20 };
+    var charged: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+    var pool: PiecePool = .{ .gpa = gpa, .rows_alloc = charged.allocator(), .io = std.testing.io, .limit = 20_000 };
+    {
+        defer pool.deinit();
+        const p = try pool.take();
+        const q = try pool.take();
+        _ = try p.arena.allocator().alloc(u8, 8192);
+        _ = try q.arena.allocator().alloc(u8, 8192);
+        p.unref(gpa);
+        q.unref(gpa);
+        try std.testing.expect(pool.retained > 0 and pool.retained <= pool.limit);
+        try std.testing.expect(ledger.used.load(.monotonic) >= pool.retained);
+        const reused = try pool.take();
+        try std.testing.expect(reused == p or reused == q);
+        try std.testing.expectEqual(@as(usize, 0), pool.retained);
+        reused.unref(gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "piece allocation failures release their rows" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var pool: PiecePool = .{ .gpa = gpa, .rows_alloc = gpa, .io = std.testing.io, .limit = 0 };
+            defer pool.deinit();
+            const p = try pool.take();
+            defer p.unref(gpa);
+            _ = try p.arena.allocator().alloc(u8, 8192);
+        }
+    }.run, .{});
+}
+
+test "encode reservations cover placement and retained regions become charged pages" {
+    const gpa = std.testing.allocator;
+    var ledger: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+    var charged: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+    var regions = [_]WorkRegions{.init(gpa)};
+    regions[0].rows.budget = &ledger;
+    regions[0].work.budget = &ledger;
+    var w: WinCtx = undefined;
+    w.gpa = gpa;
+    w.regions = &regions;
+    w.memory = &charged;
+    w.encode_pages = .{ .child = charged.allocator() };
+    const job = try EncodeJob.create(&w, 1);
+    job.charge = 8 << 20;
+    job.permit = .encoder;
+    job.reserve();
+    const memory = job.claimMemory();
+    _ = try memory.keep.alloc(u8, 3 << 20);
+    try std.testing.expectEqual(@as(usize, 8 << 20), ledger.used.load(.monotonic));
+    job.destroy();
+    try std.testing.expect(ledger.used.load(.monotonic) >= 3 << 20);
+    const inline_job = try EncodeJob.create(&w, 1);
+    inline_job.charge = 8 << 20;
+    inline_job.reserve();
+    _ = try inline_job.claimMemory().keep.alloc(u8, 3 << 20);
+    inline_job.destroy();
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+    regions[0].deinit();
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }
 
 test "a recompressing copy writes the same bytes at every parallelism and reads back the same answer" {

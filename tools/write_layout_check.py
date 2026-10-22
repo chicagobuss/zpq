@@ -86,6 +86,31 @@ def main():
             ok = len(outs) == 2 and digest(outs[0]) == digest(outs[1]) and pq.read_table(outs[0]).equals(want)
             report(ok, f"t9:{budget}:{codec}", err or f"{len(rg_rows(outs[0]))} row groups")
 
+    # A pressure-driven one-row slice can spend the ledger on per-piece schema/buffer overhead before an output
+    # row group fills. The normal batch hint must amortize that cost, while real refusals can still halve it.
+    con = duckdb.connect(config={"memory_limit": "256MB", "threads": "4"})
+    wide_values = pa.array([f"v-{i:08x}" for i in range(100_003)])
+    for width, budget in ((16, "64MB"), (32, "128MB"), (48, "256MB")):
+        wide = pa.Table.from_arrays([wide_values] * width, names=[f"c{i}" for i in range(width)])
+        src_wide = os.path.join(tmp, f"wide_{width}.parquet")
+        pq.write_table(wide, src_wide, row_group_size=wide.num_rows, compression="zstd")
+        names = ",".join(wide.column_names)
+        want_hash = con.execute(f"SELECT count(*), bit_xor(hash({names})) FROM '{src_wide}'").fetchone()
+        hashes = []
+        for j in (1, 16):
+            out = os.path.join(tmp, f"wide_{width}_{j}.parquet")
+            r = zpq(src_wide, "--scan-all", "--filter", "c0 IS NOT NULL", "--codec", "zstd",
+                    "--max-memory", budget, "-j", str(j), "-o", out)
+            ok = r.returncode == 0
+            if ok:
+                hashes.append(digest(out))
+                ok = pq.read_table(out).equals(wide)
+                got = con.execute(f"SELECT count(*), bit_xor(hash({names})) FROM '{out}'").fetchone()
+                ok = ok and got == want_hash
+            report(ok, f"wide:{width}:{budget}:j{j}", r.stderr.strip()[:80] if r.returncode else "")
+        report(len(hashes) == 2 and hashes[0] == hashes[1], f"wide:{width}:{budget}:bytes-at-every-j")
+    con.close()
+
     # 3. Targets, cut across the input's row groups; pages and their index; two readers.
     src = os.path.join(tmp, "src.parquet")
     n = 230_001

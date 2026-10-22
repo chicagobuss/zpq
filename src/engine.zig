@@ -1654,6 +1654,12 @@ const EncodeExecutor = struct {
         e.allowThreads(e.workers);
     }
 
+    /// Called while every producer turn is held, so producer completion cannot race the temporary boost.
+    fn restrainThreads(e: *EncodeExecutor, count: usize) void {
+        const before = e.granted.swap(count, .acq_rel);
+        for (count..@max(count, before)) |_| e.slots.waitUncancelable(e.w.io);
+    }
+
     fn deinit(e: *EncodeExecutor) void {
         e.allowParallel();
         e.queue.close(e.w.io);
@@ -1674,9 +1680,9 @@ const EncodeExecutor = struct {
 
     fn worker(e: *EncodeExecutor) void {
         while (true) {
+            const work = e.queue.getOneUncancelable(e.w.io) catch return;
             e.slots.waitUncancelable(e.w.io);
             defer e.slots.post(e.w.io);
-            const work = e.queue.getOneUncancelable(e.w.io) catch return;
             switch (work) {
                 .begin => |job| job.begin(),
                 .phase => |task| {
@@ -2314,6 +2320,9 @@ fn winWriter(w: *WinCtx) void {
             defer for (0..turns) |_| w.cpu.post(w.io);
             w.writer_turns = turns;
             defer w.writer_turns = 0;
+            // Restore encode admission before returning the producer turns. Idle workers own no slot permits.
+            const restrained = w.executor.?.granted.load(.acquire);
+            defer if (turns > 0) w.executor.?.restrainThreads(restrained);
             // Encode jobs may still hold regions: only idle ones are trimmed.
             if (turns > 0) {
                 w.trimIdle();
@@ -2424,6 +2433,8 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
     var group: std.Io.Group = .init;
     defer group.cancel(w.io);
     try group.concurrent(w.io, Ctx.writer, .{w});
+    // No fallible dispatch exit after the writer starts: even a failed producer publishes its own slot, and later
+    // slots must still be dispatched. Cancellation is observed at await only after every slot has a producer.
     for (0..n_jobs) |i| {
         // One dispatching thread takes every permit, so no two producers each hold part of what both need.
         for (0..windowPermits(Ctx, w, i)) |_| w.window.waitUncancelable(w.io);
@@ -2434,12 +2445,17 @@ fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usize) 
             group.concurrent(w.io, Run.producer, .{ w, i }) catch group.async(w.io, Run.producer, .{ w, i });
         } else group.async(w.io, Run.producer, .{ w, i });
     }
-    try group.await(w.io);
+    var wait_error: ?anyerror = null;
+    group.await(w.io) catch |err| {
+        wait_error = err;
+        group.cancel(w.io);
+    };
     if (w.first_err) |e| {
         // The error is reported from this thread: where a producer or the writer raised it goes with it.
         if (@hasField(Ctx, "first_failure")) consumer.setDecodeFailure(w.first_failure);
         return e;
     }
+    if (wait_error) |err| return err;
 }
 
 /// A byte copy that changes codec: producers recompress whole row groups in parallel, and the in-order writer places
@@ -9347,83 +9363,127 @@ test "windowed re-encode writes the same bytes at every parallelism" {
     }
 }
 
-test "persistent encode executor completes multiple waves and jobs under allocation failures with one active worker" {
-    for ([_]bool{ false, true }) |limited_pool| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-            fn run(gpa: std.mem.Allocator, limited: bool) !void {
-                var values: [20_001]f64 = undefined;
-                for (&values, 0..) |*value, i| value.* = @as(f64, @floatFromInt(i)) * 1.319;
-                var elems: [5]schema.SchemaElement = @splat(.{
-                    .name = "x",
-                    .type = .DOUBLE,
-                    .repetition_type = .REQUIRED,
-                    .type_length = null,
-                    .num_children = null,
-                    .scale = null,
-                    .precision = null,
-                    .field_id = null,
-                });
-                var paths: [5][]const []const u8 = @splat(&.{"x"});
-                var cols: [5]consumer.OutputAggregator.ColumnBuf = @splat(.{ .f64 = .{
-                    .values = .fromOwnedSlice(&values),
-                } });
-                var piece: Piece = .{
-                    .arena = .init(std.testing.allocator),
-                    .agg = .{
-                        .arena = gpa,
-                        .cols = &cols,
-                        .schema_elems = &elems,
-                        .paths = &paths,
-                        .num_rows = values.len,
-                        .captured = true,
-                    },
-                };
-                defer piece.arena.deinit();
-                var expected_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-                defer expected_arena.deinit();
-                const expected = try encoder.encodeColumn(expected_arena.allocator(), .{
-                    .values = .{ .f64 = .{ .values = &values } },
-                    .schema_elem = &elems[0],
-                    .path_in_schema = paths[0],
-                    .codec = .UNCOMPRESSED,
-                });
-                var completions: std.Io.Semaphore = .{};
-                var w: WinCtx = undefined;
-                w.gpa = gpa;
-                w.io = std.testing.io;
-                w.memory = null;
-                w.cpu_budget = if (limited) 4 else 1;
-                w.encode_during_decode = limited;
-                w.rg_target = .{};
-                w.regions = &.{};
-                w.encode_pages = .{ .child = gpa };
-                w.out_elems = &elems;
-                w.out_paths = &paths;
-                w.codec = .UNCOMPRESSED;
-                w.zstd = .{};
-                w.bloom_outputs = &.{};
-                w.profiler = null;
-                w.completions = &completions;
-                var executor: EncodeExecutor = undefined;
-                try executor.init(&w);
-                defer executor.deinit();
-                w.executor = &executor;
-                for (0..3) |_| {
-                    const job = try EncodeJob.create(&w, values.len);
-                    defer job.destroy();
-                    job.ranges = try gpa.dupe(Assembler.Range, &.{.{ .piece = &piece, .lo = 0, .hi = values.len }});
-                    executor.submit(.{ .begin = job });
-                    while (!job.done.load(.acquire)) completions.waitUncancelable(w.io);
-                    if (job.err) |err| return err;
-                    try std.testing.expectEqual(@as(usize, 5), job.encs.len);
-                    for (job.encs) |enc| {
-                        try std.testing.expectEqualSlices(u8, expected.bytes, enc.bytes);
-                        try std.testing.expectEqual(@as(usize, 2), enc.pages.len);
-                    }
+test "persistent encode executor cleans up allocation failures with serial and parallel workers" {
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator, limited: bool, parallel: bool) !void {
+            var values: [20_001]f64 = undefined;
+            for (&values, 0..) |*value, i| value.* = @as(f64, @floatFromInt(i)) * 1.319;
+            var elems: [5]schema.SchemaElement = @splat(.{
+                .name = "x",
+                .type = .DOUBLE,
+                .repetition_type = .REQUIRED,
+                .type_length = null,
+                .num_children = null,
+                .scale = null,
+                .precision = null,
+                .field_id = null,
+            });
+            var paths: [5][]const []const u8 = @splat(&.{"x"});
+            var cols: [5]consumer.OutputAggregator.ColumnBuf = @splat(.{ .f64 = .{
+                .values = .fromOwnedSlice(&values),
+            } });
+            var piece: Piece = .{
+                .arena = .init(std.testing.allocator),
+                .agg = .{
+                    .arena = gpa,
+                    .cols = &cols,
+                    .schema_elems = &elems,
+                    .paths = &paths,
+                    .num_rows = values.len,
+                    .captured = true,
+                },
+            };
+            defer piece.arena.deinit();
+            var expected_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer expected_arena.deinit();
+            const expected = try encoder.encodeColumn(expected_arena.allocator(), .{
+                .values = .{ .f64 = .{ .values = &values } },
+                .schema_elem = &elems[0],
+                .path_in_schema = paths[0],
+                .codec = .UNCOMPRESSED,
+            });
+            var completions: std.Io.Semaphore = .{};
+            var w: WinCtx = undefined;
+            w.gpa = gpa;
+            w.io = std.testing.io;
+            w.memory = null;
+            w.cpu_budget = if (limited or parallel) 4 else 1;
+            w.encode_during_decode = limited;
+            w.rg_target = .{};
+            w.regions = &.{};
+            w.encode_pages = .{ .child = gpa };
+            w.out_elems = &elems;
+            w.out_paths = &paths;
+            w.codec = .UNCOMPRESSED;
+            w.zstd = .{};
+            w.bloom_outputs = &.{};
+            w.profiler = null;
+            w.completions = &completions;
+            var executor: EncodeExecutor = undefined;
+            try executor.init(&w);
+            defer executor.deinit();
+            w.executor = &executor;
+            for (0..3) |_| {
+                if (limited) {
+                    executor.allowParallel();
+                    executor.restrainThreads(1);
+                    try std.testing.expectEqual(@as(usize, 1), executor.granted.load(.acquire));
+                }
+                const job = try EncodeJob.create(&w, values.len);
+                defer job.destroy();
+                job.ranges = try gpa.dupe(Assembler.Range, &.{.{ .piece = &piece, .lo = 0, .hi = values.len }});
+                executor.submit(.{ .begin = job });
+                while (!job.done.load(.acquire)) completions.waitUncancelable(w.io);
+                if (job.err) |err| return err;
+                try std.testing.expectEqual(@as(usize, 5), job.encs.len);
+                for (job.encs) |enc| {
+                    try std.testing.expectEqualSlices(u8, expected.bytes, enc.bytes);
+                    try std.testing.expectEqual(expected.pages.len, enc.pages.len);
                 }
             }
-        }.run, .{limited_pool});
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{ false, false });
+    try Run.run(std.testing.allocator, true, false);
+    // A parallel cohort has scheduling-dependent arena growth, so sweep an atomic failure threshold rather than
+    // use FailingAllocator's non-atomic counters and deterministic-allocation-count requirement.
+    const Fail = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        after: usize = std.math.maxInt(usize),
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ptr: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.calls.fetchAdd(1, .monotonic) >= self.after) {
+                self.failed.store(true, .monotonic);
+                return null;
+            }
+            return std.testing.allocator.rawAlloc(n, alignment, ra);
+        }
+        fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(memory, alignment, ra);
+        }
+    };
+    var count: Fail = .{};
+    try Run.run(count.allocator(), false, true);
+    var failures: usize = 0;
+    for (0..count.calls.load(.monotonic) * 2) |limit| {
+        var fail: Fail = .{ .after = limit };
+        Run.run(fail.allocator(), false, true) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(fail.failed.load(.monotonic));
+            failures += 1;
+        };
     }
+    try std.testing.expect(failures > 10);
 }
 
 test "wide carried rows release their original piece without changing values under allocation failures" {
@@ -12831,5 +12891,56 @@ test "a borrowed worker runtime survives repeated writes and a sink failure" {
         defer std.testing.allocator.free(bytes);
         if (expected) |want| try std.testing.expectEqualSlices(u8, want, bytes) else expected = try std.testing.allocator.dupe(u8, bytes);
         try std.testing.expect(runtime.worker_threads.load(.acquire) != null);
+    }
+}
+
+test "windowed dispatch drains a producer failure despite cancellation midway through its window" {
+    const Fake = struct {
+        const writer = write;
+        const producer = produce;
+        const n = 32;
+        gpa: std.mem.Allocator = std.testing.allocator,
+        io: std.Io = undefined,
+        window: *std.Io.Semaphore,
+        cpu: std.Io.Semaphore = .{},
+        completions: std.Io.Semaphore = .{},
+        failed: std.Io.Semaphore = .{},
+        slots: [n]std.atomic.Value(bool) = @splat(.init(false)),
+        first_err: ?anyerror = null,
+        answer: ?anyerror = null,
+        finished: usize = 0,
+        budget: usize,
+
+        fn produce(self: *@This(), i: usize) void {
+            self.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            self.slots[i].store(true, .release);
+            self.completions.post(self.io);
+        }
+        fn write(self: *@This()) void {
+            for (0..n) |i| {
+                while (!self.slots[i].load(.acquire)) self.completions.waitUncancelable(self.io);
+                if (i == n / 2) {
+                    self.first_err = error.InjectedProducerFailure;
+                    self.failed.post(self.io);
+                }
+                self.finished += 1;
+                self.window.post(self.io);
+            }
+        }
+        fn run(self: *@This()) void {
+            runWindowed(@This(), self, n, self.budget) catch |err| {
+                self.answer = err;
+            };
+        }
+    };
+    for ([_]usize{ 1, 4, 16 }) |budget| {
+        var window: std.Io.Semaphore = .{ .permits = 2 };
+        var fake: Fake = .{ .window = &window, .budget = budget };
+        var group: std.Io.Group = .init;
+        try group.concurrent(std.testing.io, Fake.run, .{&fake});
+        fake.failed.waitUncancelable(std.testing.io);
+        group.cancel(std.testing.io);
+        try std.testing.expectEqual(error.InjectedProducerFailure, fake.answer.?);
+        try std.testing.expectEqual(Fake.n, fake.finished);
     }
 }

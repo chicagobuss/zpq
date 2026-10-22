@@ -98,7 +98,7 @@ test *args="":
     zig build test --summary all -- {{args}}
 
 # Tier 2 — run before every commit.
-check: test-modules test test-integration smoke duckdb-smoke differential write-layout-check private-decode-check libzpq
+check: test-modules test test-integration smoke duckdb-smoke differential write-layout-check write-failure-check private-decode-check libzpq
 
 # Static guard for Zig's lazy test discovery. Every src file containing a
 # top-level test must be directly rooted by one of the two test artifacts.
@@ -335,3 +335,8 @@ fetch-deps:
 write-layout-check:
     zig build -Doptimize=ReleaseFast
     {{python}} tools/write_layout_check.py
+
+# Every failure probe has a timeout, including sink errors with encodes pending.
+write-failure-check:
+    zig build
+    {{python}} tools/write_failure_check.py zig-out/bin/zpq

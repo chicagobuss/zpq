@@ -1338,7 +1338,14 @@ const Assembler = struct {
         a.ranges.clearRetainingCapacity();
         a.rows = 0;
         a.bits = 0;
-        try a.start(job);
+        a.start(job) catch |e| {
+            // Admission may fail while placing an older job, before this one has a runnable task.
+            const unstarted = a.pending.pop().?;
+            std.debug.assert(unstarted == job);
+            a.pending_bytes -= job.charge;
+            started = false;
+            return e;
+        };
     }
 
     /// Run `job` beside the writer on an encoder permit (`WinCtx.encoders`), beside the producers' reads. Over fetched
@@ -2125,8 +2132,14 @@ fn winWriter(w: *WinCtx) void {
         const held = enc.bytes.len + if (enc.piece) |p| p.arena.queryCapacity() else 0;
         if (enc.err) |e| {
             if (w.first_err == null) {
-                w.first_err = e;
-                w.first_failure = enc.failure;
+                // Encodes of earlier rows report in output order, even if this later producer fails first.
+                asm_.flush() catch |earlier| {
+                    w.first_err = earlier;
+                };
+                if (w.first_err == null) {
+                    w.first_err = e;
+                    w.first_failure = enc.failure;
+                }
             }
             if (enc.piece) |p| p.unref(w.gpa);
         } else if (w.first_err != null) {
@@ -2176,12 +2189,14 @@ fn winWriter(w: *WinCtx) void {
                 const t1 = nowMonoNs();
                 w.sink_ns += @intCast(t1 - t0);
                 profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.bytes.len}));
-                w.out_offset += enc.bytes.len;
-                w.rows_kept += enc.surviving;
-                w.rgs_kept += 1;
-                w.new_row_groups.append(w.arena, rgm) catch |e| {
-                    w.first_err = e;
-                };
+                if (w.first_err == null) {
+                    w.out_offset += enc.bytes.len;
+                    w.rows_kept += enc.surviving;
+                    w.rgs_kept += 1;
+                    w.new_row_groups.append(w.arena, rgm) catch |e| {
+                        w.first_err = e;
+                    };
+                }
             }
         }
         if (enc.bytes.len > 0) w.outAlloc().free(enc.bytes);
@@ -9199,6 +9214,94 @@ test "encode reservations cover placement and retained regions become charged pa
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
     regions[0].deinit();
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "a byte-copy sink error wins over later allocation and producer errors" {
+    const gpa = std.testing.allocator;
+    var allocations = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var calls: usize = 0;
+    const rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = 1 };
+    const jobs = [_]RGJob{
+        .{ .bytes = &.{}, .meta = undefined, .rg = &rg },
+        .{ .bytes = &.{}, .meta = undefined, .rg = &rg },
+    };
+    var slots = [_]Slot{
+        .{ .meta_arena = .init(gpa), .enc = .{ .rg = rg, .surviving = 1 }, .done = .init(true) },
+        .{ .meta_arena = .init(gpa), .enc = .{ .err = error.OutOfMemory }, .done = .init(true) },
+    };
+    var row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var window: std.Io.Semaphore = .{};
+    var w: WinCtx = undefined;
+    w.gpa = gpa;
+    w.io = std.testing.io;
+    w.rg_target = .{};
+    w.core = .{};
+    w.encode_group = .init;
+    w.slots = &slots;
+    w.jobs = &jobs;
+    w.profiler = null;
+    w.first_err = null;
+    w.first_failure = null;
+    w.out_offset = 4;
+    w.rows_kept = 0;
+    w.rgs_kept = 0;
+    w.sink_ns = 0;
+    w.inflight = .init(0);
+    w.window = &window;
+    w.win_unit = 1;
+    w.win_units = 1;
+    w.arena = allocations.allocator();
+    w.new_row_groups = &row_groups;
+    w.sink = .{ .ctx = &calls, .write_fn = struct {
+        fn write(ctx: *anyopaque, _: []const u8) !void {
+            const count: *usize = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+            return error.DiskQuota;
+        }
+    }.write };
+    winWriter(&w);
+    try std.testing.expectEqual(error.DiskQuota, w.first_err.?);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 0), row_groups.items.len);
+    try std.testing.expectEqual(@as(i64, 0), w.rows_kept);
+    try std.testing.expect(!allocations.has_induced_failure);
+}
+
+test "a failed older encode cancels the unstarted job at count and byte bounds under allocation failures" {
+    for ([_]bool{ false, true }) |byte_bound| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+            fn run(gpa: std.mem.Allocator, bytes: bool) !void {
+                var w: WinCtx = undefined;
+                w.gpa = gpa;
+                w.io = std.testing.io;
+                w.rg_target = .{};
+                w.core = .{};
+                w.cpu_budget = if (bytes) 8 else 1;
+                w.encode_window = if (bytes) 16 else 1 << 20;
+                w.memory = null;
+                w.encode_group = .init;
+                var a = Assembler.init(&w);
+                defer a.deinit();
+                const older = try EncodeJob.create(&w, 1);
+                var owned = true;
+                defer if (owned) older.destroy();
+                older.charge = 24;
+                older.err = error.DiskQuota;
+                older.done.store(true, .release);
+                try a.pending.append(gpa, older);
+                owned = false;
+                a.pending_bytes = older.charge;
+                a.rows = 1;
+                a.bits = 64;
+                if (a.seal(false)) |_| return error.TestUnexpectedResult else |e| switch (e) {
+                    error.DiskQuota => {},
+                    else => return e,
+                }
+                try std.testing.expectEqual(@as(usize, 0), a.pending.items.len);
+                try std.testing.expectEqual(@as(u64, 0), a.pending_bytes);
+            }
+        }.run, .{byte_bound});
+    }
 }
 
 test "a recompressing copy writes the same bytes at every parallelism and reads back the same answer" {

@@ -4522,6 +4522,60 @@ const RowSource = struct {
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
 
+    fn integerOutputs(s: *const RowSource, types: []const GroupColType) bool {
+        for (s.outputs, types) |out, ty| switch (out.source) {
+            .key => {},
+            .agg => |ai| {
+                if (ty.lane != .i64) return false;
+                const call = s.calls[ai];
+                switch (call.func) {
+                    .count => {},
+                    .sum, .min, .max => if (call.result != .i64) return false,
+                    else => return false,
+                }
+            },
+        };
+        return true;
+    }
+
+    const IntegerRow = struct {
+        table: ?*const expr_agg.GroupTable,
+        group: usize,
+        accs: []const expr_agg.Accumulator,
+        folded: bool,
+
+        inline fn value(r: IntegerRow, ai: usize, func: expr_agg.AggFunc) !?i128 {
+            const x: ?i128 = if (r.table != null and r.table.?.compact.stride != 0)
+                r.table.?.compact.integer(r.group, ai)
+            else switch (func) {
+                .count => r.accs[ai].count,
+                .sum => r.accs[ai].sum_i,
+                .min => r.accs[ai].min_i,
+                .max => r.accs[ai].max_i,
+                else => unreachable,
+            };
+            // The copying merge rejects this count before output narrowing, including a group seen only once.
+            if (r.folded and func == .count and x.? > std.math.maxInt(i64)) return error.RowCountTooLarge;
+            return x;
+        }
+    };
+
+    fn integerRow(s: *const RowSource, slot: MergedSlot) IntegerRow {
+        const table = if (s.in_place.len > 0) &s.in_place[slot.idx >> 32] else s.single;
+        const group = if (s.in_place.len > 0) @as(u32, @truncate(slot.idx)) else slot.idx;
+        const compact = table != null and table.?.compact.stride != 0;
+        const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
+        return .{
+            .table = table,
+            .group = group,
+            .accs = if (compact) &.{} else if (s.in_place.len > 0)
+                table.?.accumulators.items[@as(usize, group) * s.calls.len ..][0..s.calls.len]
+            else
+                s.accs[at..][0..s.calls.len],
+            .folded = s.in_place.len > 0,
+        };
+    }
+
     /// Fill `vals`, the row's slab cells, all NULL, for `slot`. Each value is set only once built, so on an error the
     /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
     fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
@@ -4766,12 +4820,7 @@ pub const TypedAnswer = struct {
                     .i => |x| x,
                     else => return error.TypeMismatch,
                 };
-                const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
-                l.values[i] = if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
-                    expr_agg.u64Lane(x)
-                else
-                    std.math.cast(i64, x) orelse return error.AggIntTooWide;
-                l.defs[i] = 1;
+                try putInteger(l, ty, i, x);
             },
             .f64 => |*l| {
                 l.values[i] = switch (v) {
@@ -4819,6 +4868,15 @@ pub const TypedAnswer = struct {
         }
     }
 
+    inline fn putInteger(l: *Lane(i64), ty: GroupColType, i: usize, x: i128) !void {
+        const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
+        l.values[i] = if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
+            expr_agg.u64Lane(x)
+        else
+            std.math.cast(i64, x) orelse return error.AggIntTooWide;
+        l.defs[i] = 1;
+    }
+
     /// Flag the columns that hold a NULL, and refuse one its type says cannot: the row writer's check.
     fn seal(self: *TypedAnswer, types: []const GroupColType) !void {
         for (self.columns, types) |*col, ty| switch (col.*) {
@@ -4856,6 +4914,7 @@ fn buildGroupColumns(
         .answer = out,
         .cursor = &cursor,
         .vals = vals[ti * src.outputs.len ..][0..src.outputs.len],
+        .integers = src.integerOutputs(types),
     };
     const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
     if (tasks.len == 1 or !spawn_util.runTree(ColumnBuildTask, tasks, config, ColumnBuildTask.run)) ColumnBuildTask.run(&tasks[0]);
@@ -4882,6 +4941,7 @@ const ColumnBuildTask = struct {
     cursor: *std.atomic.Value(usize),
     /// One row's values, built then stored a row at a time.
     vals: []AggValue,
+    integers: bool,
     err: ?anyerror = null,
     err_row: usize = 0,
     narrow_err: ?anyerror = null,
@@ -4894,6 +4954,14 @@ const ColumnBuildTask = struct {
             const lo = t.cursor.fetchAdd(row_block, .monotonic);
             if (lo >= n) return;
             for (lo..@min(n, lo + row_block)) |i| {
+                if (t.integers) {
+                    t.buildIntegers(i) catch |e| {
+                        t.err = e;
+                        t.err_row = i;
+                        return;
+                    };
+                    continue;
+                }
                 @memset(t.vals, .null_val);
                 const built = t.src.buildRow(t.gpa, t.src.slots[i], t.vals);
                 // Every value built passes to its column, whatever happens to the rest of the row.
@@ -4914,6 +4982,36 @@ const ColumnBuildTask = struct {
                 };
             }
         }
+    }
+
+    fn narrowing(t: *ColumnBuildTask, err: anyerror, ci: usize, row: usize) void {
+        if (t.narrow_err == null or ci < t.narrow_col or (ci == t.narrow_col and row < t.narrow_row)) {
+            t.narrow_err = err;
+            t.narrow_col = ci;
+            t.narrow_row = row;
+        }
+    }
+
+    /// Keep row/output visitation and the materialization-before-narrowing error contract. Only integer states
+    /// bypass the generic unions; key strings still acquire the answer's owned copy before being published.
+    fn buildIntegers(t: *ColumnBuildTask, i: usize) !void {
+        const s = t.src;
+        const slot = s.slots[i];
+        const row = s.integerRow(slot);
+        var buf: [48]u8 = undefined;
+        const key = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &buf) else slot.key;
+        for (s.outputs, t.types, t.answer.columns, 0..) |out, ty, *col, ci| switch (out.source) {
+            .key => |ki| {
+                const v = try deserializeKeyColumn(t.gpa, key, ki, s.key_types);
+                TypedAnswer.put(col, ty, i, v) catch |e| {
+                    if (v == .s) t.gpa.free(v.s);
+                    t.narrowing(e, ci, i);
+                };
+            },
+            .agg => |ai| if (try row.value(ai, s.calls[ai].func)) |x| {
+                TypedAnswer.putInteger(&col.i64, ty, i, x) catch |e| t.narrowing(e, ci, i);
+            },
+        };
     }
 };
 
@@ -11244,6 +11342,132 @@ test "buildGroupRows: an allocation failure leaves every row freeable" {
         defer out.deinit(gpa);
         try testing.expectError(error.OutOfMemory, f.build(gpa, &out, 8));
     }
+}
+
+fn directIntegerColumnsTrial(gpa: std.mem.Allocator, compact: bool, in_place: bool, n: usize, j: usize) !void {
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .alias = "c", .result = .i64, .arg = null, .where = null },
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = null, .where = null },
+        .{ .func = .min, .alias = "lo", .result = .i64, .arg = null, .where = null },
+        .{ .func = .max, .alias = "hi", .result = .i64, .arg = null, .where = null },
+    };
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .agg = 1 }, .name = "s" },
+        .{ .source = .{ .key = 0 }, .name = "k" },
+        .{ .source = .{ .agg = 0 }, .name = "c" },
+        .{ .source = .{ .agg = 2 }, .name = "lo" },
+        .{ .source = .{ .agg = 3 }, .name = "hi" },
+    };
+    const types = [_]GroupColType{
+        .{ .lane = .i64, .nullable = true },  .{ .lane = .i64, .nullable = true },
+        .{ .lane = .i64, .nullable = false }, .{ .lane = .i64, .nullable = true },
+        .{ .lane = .i64, .nullable = true },
+    };
+    var tables = [_]expr_agg.GroupTable{.init(gpa, 64 << 20)};
+    defer tables[0].deinit();
+    const table = &tables[0];
+    table.fixed_stride = 9;
+    if (compact) table.compact.configure(&calls);
+    const slots = try gpa.alloc(MergedSlot, n);
+    defer gpa.free(slots);
+    for (0..n) |i| {
+        var key: [9]u8 = @splat(0);
+        if (i != 0) {
+            key[0] = 1;
+            std.mem.writeInt(i64, key[1..9], -@as(i64, @intCast(i)), .little);
+        }
+        const id = try table.getOrInsert(&key, &calls, i);
+        table.writeAcc(id, 0, calls.len, .{ .count = i + 1 });
+        const x: ?i128 = if (i % 5 == 0) null else -@as(i128, @intCast(i)) * 2;
+        table.writeAcc(id, 1, calls.len, .{ .sum_i = x });
+        table.writeAcc(id, 2, calls.len, .{ .min_i = x });
+        table.writeAcc(id, 3, calls.len, .{ .max_i = x });
+        slots[i] = .{ .key = &.{}, .idx = id, .first = i };
+    }
+    for (slots) |*slot| slot.key = table.keyAt(@intCast(slot.idx));
+    const src: RowSource = .{
+        .slots = slots,
+        .outputs = &outputs,
+        .calls = &calls,
+        .key_types = &.{.i64},
+        .accs = table.accumulators.items,
+        .folded = in_place,
+        .fixed_keys = true,
+        .single = if (in_place) null else table,
+        .in_place = if (in_place) &tables else &.{},
+    };
+    try testing.expect(src.integerOutputs(&types));
+    var out: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+    defer out.deinit(gpa);
+    try buildGroupColumns(gpa, &out, src, &types, j);
+    for (slots, 0..) |slot, i| {
+        var vals: [outputs.len]AggValue = @splat(.null_val);
+        try src.buildRow(gpa, slot, &vals);
+        for (out.columns, vals) |col, v| {
+            try testing.expectEqual(@as(u32, @intFromBool(v != .null_val)), col.i64.defs[i]);
+            if (v != .null_val) try testing.expectEqual(v.i, col.i64.values[i]);
+        }
+    }
+}
+
+test "direct integer columns: scalar rows' values with compact/generic states, all thread counts and failures" {
+    for ([_]bool{ false, true }) |compact| for ([_]bool{ false, true }) |in_place| {
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j|
+            try directIntegerColumnsTrial(testing.allocator, compact, in_place, 2 * row_block + 7, j);
+        spawn_util.injectFailureAfter(0);
+        defer spawn_util.resetFailure();
+        try directIntegerColumnsTrial(testing.allocator, compact, in_place, 2 * row_block + 7, 8);
+        spawn_util.resetFailure();
+        try testing.checkAllAllocationFailures(testing.allocator, directIntegerColumnsTrial, .{ compact, in_place, 3, 1 });
+    };
+}
+
+test "direct integer columns: string key ownership and allocation failures" {
+    var f = try RowFixture.init(3);
+    defer f.deinit();
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "g" },
+        .{ .source = .{ .agg = 0 }, .name = "n" },
+    };
+    const types = [_]GroupColType{ .{ .lane = .string, .nullable = true }, .{ .lane = .i64, .nullable = false } };
+    var src = f.source();
+    src.outputs = &outputs;
+    try testing.expect(src.integerOutputs(&types));
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator, source: RowSource, ty: []const GroupColType) !void {
+            var out: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+            defer out.deinit(gpa);
+            try buildGroupColumns(gpa, &out, source, ty, 1);
+            for (out.columns[0].string.values, source.slots) |key, slot|
+                try testing.expectEqualStrings(slot.key[5..], key);
+        }
+    }.run, .{ src, &types });
+}
+
+test "direct integer columns: materialization errors precede narrowing and folded counts keep their error" {
+    var f = try RowFixture.init(3);
+    defer f.deinit();
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .agg = 0 }, .name = "n" },
+        .{ .source = .{ .key = 0 }, .name = "g" },
+    };
+    const types = [_]GroupColType{ .{ .lane = .i64, .nullable = false }, .{ .lane = .string, .nullable = true } };
+    f.accs[0] = .{ .count = @as(u64, std.math.maxInt(i64)) + 1 };
+    const key = f.slots[1].key;
+    f.slots[1].key = &.{1};
+    var src = f.source();
+    src.outputs = &outputs;
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| {
+        var out: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+        defer out.deinit(testing.allocator);
+        try testing.expectError(error.BadGroupKey, buildGroupColumns(testing.allocator, &out, src, &types, j));
+    }
+    f.slots[1].key = key;
+    var out: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.AggIntTooWide, buildGroupColumns(testing.allocator, &out, src, &types, 1));
+    const row: RowSource.IntegerRow = .{ .table = null, .group = 0, .accs = f.accs, .folded = true };
+    try testing.expectError(error.RowCountTooLarge, row.value(0, .count));
 }
 
 test "buildGroupColumns: the rows' values as typed columns at every -j; freeable on any allocation failure" {

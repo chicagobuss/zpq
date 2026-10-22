@@ -6508,6 +6508,7 @@ fn compactAllocationTrial(gpa: std.mem.Allocator, fixed: bool) !void {
         table.writeAcc(g, 3, calls.len, .{ .min_i = -5 });
         table.writeAcc(g, 4, calls.len, .{ .max_i = -5 });
         try std.testing.expectEqual(@as(?i128, -5), table.readAcc(g, 1, calls.len).sum_i);
+        try std.testing.expectEqual(@as(?i128, -5), table.compact.integer(g, 1));
         try std.testing.expectEqual(@as(?i128, -5), table.readAcc(g, 3, calls.len).min_i);
         try std.testing.expectEqual(g, try table.getOrInsert(&key, &calls, k + 1));
     }

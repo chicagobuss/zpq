@@ -126,8 +126,13 @@ pub const State = struct {
     }
 
     inline fn foldOne(
-        self: *const State, comptime kind: Kind, g: usize, i: usize,
-        values: ?@import("../filter/eval.zig").Batch.Column, r: usize, offset: i64,
+        self: *const State,
+        comptime kind: Kind,
+        g: usize,
+        i: usize,
+        values: ?@import("../filter/eval.zig").Batch.Column,
+        r: usize,
+        offset: i64,
     ) void {
         const f = self.fields[i];
         const b = self.bytes(g)[f.off..];
@@ -176,6 +181,23 @@ pub const State = struct {
             } },
             .min => .{ .min_i = if (present) extreme(b, f.unsigned) else null },
             .max => .{ .max_i = if (present) extreme(b, f.unsigned) else null },
+        };
+    }
+
+    /// Integer output without expanding the record into the scalar accumulator union.
+    pub inline fn integer(self: *const State, g: usize, i: usize) ?i128 {
+        const f = self.fields[i];
+        const b = self.bytes(g)[f.off..];
+        if (f.kind == .count) return std.mem.readInt(u64, b[0..8], .little);
+        const present = if (f.shared_sum)
+            std.mem.readInt(u64, b[16..24], .little) != 0
+        else
+            self.words.items[g * self.stride] & (@as(u64, 1) << @intCast(i)) != 0;
+        if (!present) return null;
+        return switch (f.kind) {
+            .sum => std.mem.readInt(i128, b[0..16], .little),
+            .min, .max => extreme(b, f.unsigned),
+            .count, .avg => unreachable,
         };
     }
     fn extreme(b: []const u8, unsigned: bool) i128 {

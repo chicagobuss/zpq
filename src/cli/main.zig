@@ -562,7 +562,7 @@ fn runQuery(
     const query_args: engine.QueryArgs = .{
         .inputs = inputs,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
-        .output_fd = if (fmt == .parquet and to_stdout) 1 else null,
+        .output_fd = if (fmt == .parquet) (if (to_stdout) 1 else publication.fd) else null,
         .typed_answer = fmt == .parquet,
         .quiet_diagnostics = machine_diagnostics,
         .empty_scalar = group_by == null and (limit == 0 or result_order.offset > 0),
@@ -602,21 +602,11 @@ fn runQuery(
         rows = if (answer.group_rows) |groups| groups.len else if (answer.typed) |t| t.rows else if (query_args.empty_scalar or answer.no_row) 0 else 1;
         if (fmt != .parquet) {
             output_started_ns = nowMonoNs();
-            var fd: local_fs.fd_t = 1;
-            var owns_fd = false;
-            defer if (owns_fd) local_fs.close(fd);
-            if (!to_stdout) {
-                fd = try local_fs.createFile(engine_output.?);
-                owns_fd = true;
-            }
+            const fd: local_fs.fd_t = if (to_stdout) 1 else publication.fd orelse return error.BadOutputUrl;
             var w: StdoutWriter = .{ .fd = fd };
             try engine.writeAggregateText(&w, answer, ar.text_kinds, ar.answer_types, rows, fmt);
             try w.flush();
             text_bytes_out = if (w.inner) |inner| inner.bytes_written else 0;
-            if (owns_fd) {
-                owns_fd = false;
-                try local_fs.closeChecked(fd);
-            }
         }
         if (fmt == .parquet) output_started_ns = ar.timings.output_started_ns;
         stats = .{ .aggregate = true, .rows_in = ar.rows_in, .rows_scanned = ar.rows_scanned, .rows_matched = ar.rows_matched, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
@@ -630,18 +620,8 @@ fn runQuery(
             diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
             return error.BadArgs;
         }
-        var fd: local_fs.fd_t = 1;
-        var owns_fd = false;
-        defer if (owns_fd) local_fs.close(fd);
-        if (!to_stdout) {
-            fd = try local_fs.createFile(engine_output.?);
-            owns_fd = true;
-        }
+        const fd: local_fs.fd_t = if (to_stdout) 1 else publication.fd orelse return error.BadOutputUrl;
         const printed = try engine.runPrintTo(ctx, query_args, fmt, limit, fd, @intCast(result_order.offset));
-        if (owns_fd) {
-            owns_fd = false;
-            try local_fs.closeChecked(fd);
-        }
         rows = printed.rows;
         output_started_ns = printed.timings.output_started_ns;
         stats = .{ .rows_in = @intCast(printed.rows_in), .rows_scanned = @intCast(printed.rows_scanned), .rows_matched = @intCast(printed.rows_matched), .bytes_out = printed.bytes_out, .files_in = inputs.len, .row_groups_in = printed.row_groups_in, .row_groups_pruned = printed.row_groups_pruned, .membership = printed.membership, .timings = printed.timings };
@@ -732,6 +712,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
 const OutputPublication = struct {
     target: ?[]const u8 = null,
     permissions: ?std.Io.File.Permissions = null,
+    fd: ?local_fs.fd_t = null,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
 
@@ -769,25 +750,29 @@ const OutputPublication = struct {
         }
         const pid: u32 = @bitCast(std.posix.system.getpid());
         const tmp = try std.fmt.bufPrint(&self.buffer, "{s}.{d}.zpq-tmp", .{ target, pid });
-        const fd = try local_fs.createNewFile(tmp);
+        // Retain the exclusive fd: reopening even this empty file with O_TRUNC makes ext4 flush at final close.
+        self.fd = try local_fs.createNewFile(tmp);
         self.len = tmp.len;
         self.target = target;
-        try local_fs.closeChecked(fd);
         return self.path();
     }
 
     fn commit(self: *OutputPublication, io: std.Io) !void {
         const target = self.target orelse return;
+        const fd = self.fd orelse unreachable;
         if (self.permissions) |permissions| {
-            const file = try std.Io.Dir.cwd().openFile(io, self.path(), .{});
-            defer file.close(io);
+            const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
             try file.setPermissions(io, permissions);
         }
+        self.fd = null;
+        try local_fs.closeChecked(fd);
         try local_fs.rename(self.path(), target);
         self.target = null;
     }
 
     fn abort(self: *OutputPublication) void {
+        if (self.fd) |fd| local_fs.close(fd);
+        self.fd = null;
         if (self.target != null) local_fs.removeFile(self.path());
         self.target = null;
     }

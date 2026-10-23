@@ -7,6 +7,10 @@ answers that 0.4.1 got incorrect without an error, and turns `--max-memory` into
 (libzpq) with a Python binding, `zpq inspect`, a much larger SQL surface, Bloom filters, profiling, and Homebrew,
 shell-completion and man-page packaging.
 
+Grouped Parquet answers now use fixed 131,072-row row groups and 20,000-row pages, matching the normal writer.
+Large aggregate files therefore have different bytes from earlier releases. Decoded values and row order are
+preserved, and output bytes remain deterministic across worker counts and memory budgets.
+
 ### What to do
 
 1. **Scripts that parse `zpq query` output must change.** Every query now prints its answer as NDJSON rows on stdout,

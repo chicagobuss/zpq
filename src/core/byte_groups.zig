@@ -121,11 +121,15 @@ pub const Local = struct {
         for (0..batch_view.num_rows) |i| {
             const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
             const vn = if (v.def_levels) |d| d[i] < v.max_def else false;
-            try l.append(try Record.init(
+            const record = Record.init(
                 if (kn) null else if (k.codes) |codes| k.dict[codes[i]] else k.values[i],
                 if (vn) null else if (v.codes) |codes| v.dict[codes[i]] else v.values[i],
                 l.ordinal_base + @as(u32, @intCast(offset + i)),
-            ));
+            ) catch |e| {
+                l.state.width_refused.store(true, .monotonic);
+                return e;
+            };
+            try l.append(record);
         }
     }
 };
@@ -137,6 +141,7 @@ pub const State = struct {
     rows: usize,
     blocks: []Block = &.{},
     block_cursor: std.atomic.Value(u32) = .init(0),
+    width_refused: std.atomic.Value(bool) = .init(false),
     locals: []Local = &.{},
     groups: []Group = &.{},
     winners: []u32 = &.{},

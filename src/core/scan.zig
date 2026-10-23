@@ -1178,6 +1178,13 @@ pub const AggregateExplanation = struct {
     count_columns: ?agg_plan.Columns,
     workers: usize,
     work_items: usize,
+    /// Preferred bounded record executor, subject to its ledger draw and runtime key/decode guards.
+    record_path: ?RecordAdmission = null,
+};
+
+pub const RecordAdmission = struct {
+    layout: enum { integer_group_stream, integer_sum_top_h, byte_group_stream },
+    reservation: usize,
 };
 
 /// Ordered GROUP BY folds the work list in at most this many fixed blocks, each into a table of its own (see
@@ -3007,7 +3014,7 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // memory the query's ledger refused also runs on one worker (`FastPath.decode_memory`), and there once more on a
     // small decode budget, so the tables have nearly all of the ledger. A plain grouping a cost rule chose over a cut
     // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`): at most seven general scans,
-    // plus at most one admitted inline-integer scan, which disables itself before entering the general chain,
+    // plus an admitted record scan and its serial decode retry before entering the general chain,
     // and each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = args;
     var chain: Chain = .{ .parts_tried = args.partagg };
@@ -3168,8 +3175,15 @@ fn narrowed(
     var next = attempt;
     if (taken.contains(.integer_records)) {
         // Both owned-record layouts use this refusal/restart slot; a query's key type chooses only one layout.
+        // Concurrent decode draws can race with one another. Try the same layout serially before giving it up,
+        // so a budget its single decoder fits always answers. A width refusal is independent of decoder scheduling.
+        if (taken.contains(.decode_memory) and attempt.parallelism != 1) {
+            next.parallelism = 1;
+            return next;
+        }
         next.integer_records = false;
         next.byte_records = false;
+        next.parallelism = args.parallelism;
         return next;
     }
     if (taken.contains(.private_runs)) {
@@ -3439,6 +3453,7 @@ fn prepareAggregate(
         group_outputs,
         n_workers,
         t,
+        false,
     )) |result| return result;
 
     if (!explain) if (try inlineByteAnswer(
@@ -3453,6 +3468,7 @@ fn prepareAggregate(
         group_outputs,
         n_workers,
         t,
+        false,
     )) |result| return result;
 
     var plan_inputs: PlanInputs = .{
@@ -3596,6 +3612,8 @@ fn prepareAggregate(
     else
         null;
     if (explain) {
+        const record_path = try inlineIntegerAnswer(gpa, arena, args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse
+            try inlineByteAnswer(gpa, arena, args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true);
         const names = try arena.alloc([]const u8, plan.columns.read.len);
         const labels = try metadata.leafLabels(arena, meta0);
         for (labels.names, names, 0..) |label, *name, i| {
@@ -3608,6 +3626,7 @@ fn prepareAggregate(
             .count_columns = count_columns,
             .workers = n_workers,
             .work_items = work_items.items.len,
+            .record_path = record_path,
         };
     }
     // Tables still share one pool. Only a prepaid private plan's decoders protect funded worker floors.
@@ -4583,6 +4602,46 @@ pub const ByteStream = struct {
     }
 };
 
+/// A missing footer bound warrants a bounded look at the first page. It can only decline: later keys still face
+/// the exact width guard. A corrupt sample also declines, so the ordinary scan preserves decode error precedence.
+fn byteSampleMayFit(
+    gpa: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    work: []const WorkItem,
+    key_col: usize,
+) !bool {
+    for (work) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        const cm = rg.columns.items[key_col].meta_data orelse return false;
+        if (rg.num_rows == 0) continue;
+        if (cm.statistics) |st| if (st.min_value != null or st.max_value != null or
+            st.min != null or st.max != null) continue;
+        const cap = 4 << 20;
+        if (args.ledger) |l| _ = l.drawExact(cap) orelse return false;
+        defer if (args.ledger) |l| l.release(cap);
+        const buf = try gpa.alloc(u8, cap);
+        defer gpa.free(buf);
+        var fixed = std.heap.FixedBufferAllocator.init(buf);
+        const a = fixed.allocator();
+        var reader = (consumer.SliceReader.init(a, a, rg, &metas[item.file], .{
+            .bytes = args.inputs[item.file].plan_bytes orelse args.inputs[item.file].bytes,
+            .byte_origin = 0,
+        }, key_col, .{ .encoded = args.encoded, .expand_limit = cap }) catch return false) orelse return false;
+        defer reader.deinit();
+        const sampled: usize = @intCast(@min(rg.num_rows, 64));
+        const col = reader.next(a, sampled) catch return false;
+        const strings = col.string;
+        for (0..sampled) |i| {
+            if (strings.def_levels) |d| if (d[i] < strings.max_def) continue;
+            const value = if (strings.codes) |codes| strings.dict[codes[i]] else strings.values[i];
+            if (value.len > 16) return false;
+        }
+        return true;
+    }
+    return true;
+}
+
 fn inlineByteAnswer(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -4595,9 +4654,11 @@ fn inlineByteAnswer(
     outputs_opt: ?[]const BoundOutputColumn,
     n_workers: usize,
     timings: Timings,
-) !?MultiAggResult {
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const order = args.result_order;
-    if (!args.byte_records or !args.typed_answer or args.unordered or args.filter != null or
+    if (!args.byte_records or !allRescannable(args.inputs) or !args.typed_answer or args.unordered or
+        args.filter != null or
         order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
         order.hidden.len != 0 or calls.len != 2) return null;
     const keys = keys_opt orelse return null;
@@ -4648,13 +4709,18 @@ fn inlineByteAnswer(
         byte_groups.State.reservation(rows) > args.max_memory) return null;
     if (args.byte_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
+    if (explain_only) return .{ .layout = .byte_group_stream, .reservation = byte_groups.State.reservation(rows) };
+    if (!try byteSampleMayFit(gpa, args, metas, work, key.col_idx)) return null;
     const state = (try byte_groups.State.init(gpa, args.ledger, rows, n_workers, key.col_idx, value.?)) orelse
         return null;
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
     for (sinks, state.locals) |*sink, *local| sink.* = .{ .bytes = local };
-    const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, timings);
+    const t = runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, timings) catch |e| {
+        if (state.width_refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+        return e;
+    };
     const prof = profile.threadOf(args.profiler, .main);
     const begin = nowMonoNs();
     try state.finish(n_workers);
@@ -4711,9 +4777,11 @@ fn inlineIntegerAnswer(
     outputs_opt: ?[]const BoundOutputColumn,
     n_workers: usize,
     timings: Timings,
-) !?MultiAggResult {
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const order = args.result_order;
-    if (!args.integer_records or args.unordered or args.filter != null or order.having != null or
+    if (!args.integer_records or !allRescannable(args.inputs) or args.unordered or args.filter != null or
+        order.having != null or
         order.hidden.len != 0) return null;
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
@@ -4773,6 +4841,10 @@ fn inlineIntegerAnswer(
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
+    if (explain_only) return .{
+        .layout = if (cut != null) .integer_sum_top_h else .integer_group_stream,
+        .reservation = integer_groups.State.reservation(rows),
+    };
     const admitted = if (cut) |c| try integer_groups.State.top(
         gpa,
         args.ledger,
@@ -4897,6 +4969,7 @@ fn runRecordWorkers(
     runWorkers(workers);
     releaseRegions(workers);
     for (workers) |w| if (w.err) |e| {
+        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| taken.insert(.decode_memory);
         consumer.setDecodeFailure(w.failure);
         return e;
     };
@@ -12281,6 +12354,202 @@ test "inline integer stream matches the row answer across workers, spawn failure
     defer fallback.deinit(testing.allocator);
     try testing.expect(fallback.output.integer_stream == null);
     try testing.expectEqual(want.output.group_rows.?.len, fallback.output.typed.?.rows);
+}
+
+test "inline records decline released remote windows and retry only through a retained mapping" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = consumer.answer_rg_rows + 1;
+    const strings = try a.alloc([]const u8, n);
+    @memset(strings, "a");
+    strings[n - 1] = "a long interior key";
+    const ints = try a.alloc(i64, n);
+    @memset(ints, 1);
+    const cols = [_]expr_agg.OutputCol{
+        .{
+            .name = "k",
+            .col = .{ .string = .{ .values = strings, .max_def = 0 } },
+            .parquet_type = .BYTE_ARRAY,
+            .nullable = false,
+        },
+        .{
+            .name = "n",
+            .col = .{ .i64 = .{ .values = ints, .max_def = 0 } },
+            .parquet_type = .INT64,
+            .nullable = false,
+        },
+    };
+    const Capture = struct {
+        a: std.mem.Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+        fn write(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            try c.bytes.appendSlice(c.a, data);
+        }
+    };
+    var captured: Capture = .{ .a = a };
+    _ = try consumer.writeAggregateRows(
+        a,
+        .{ .ctx = &captured, .write_fn = Capture.write },
+        &cols,
+        n,
+        .SNAPPY,
+        .{},
+        .{},
+    );
+    const meta = try metadata.open(a, captured.bytes.items);
+    // No width evidence in the footer: a mapped byte scan must discover the last key after releasing the first RG.
+    for (meta.row_groups.items) |*rg| rg.columns.items[0].meta_data.?.statistics = null;
+    const Probe = struct {
+        fn trial(alloc: std.mem.Allocator, m: schema.FileMetaData, data: []const u8) !void {
+            var budget: core_memory.SharedBudget = .{ .limit = 8 << 20 };
+            defer std.debug.assert(budget.used.load(.monotonic) == 0);
+            const inputs = [_]Input{.{ .name = "sample.parquet", .bytes = data }};
+            const work = [_]WorkItem{.{
+                .file = 0,
+                .rg = 0,
+                .agg_start = 0,
+                .agg_len = 0,
+                .columns = undefined,
+                .accumulators = &.{},
+            }};
+            try testing.expect(try byteSampleMayFit(alloc, .{
+                .inputs = &inputs,
+                .aggregate = "",
+                .ledger = &budget,
+            }, &.{m}, &work, 0));
+        }
+    };
+    try Probe.trial(gpa, meta, captured.bytes.items);
+    try testing.checkAllAllocationFailures(gpa, Probe.trial, .{ meta, captured.bytes.items });
+    var last = meta;
+    last.row_groups.items = meta.row_groups.items[1..];
+    const sample_inputs = [_]Input{.{ .name = "sample.parquet", .bytes = captured.bytes.items }};
+    const sample_work = [_]WorkItem{.{
+        .file = 0,
+        .rg = 0,
+        .agg_start = 0,
+        .agg_len = 0,
+        .columns = undefined,
+        .accumulators = &.{},
+    }};
+    try testing.expect(!try byteSampleMayFit(
+        gpa,
+        .{ .inputs = &sample_inputs, .aggregate = "" },
+        &.{last},
+        &sample_work,
+        0,
+    ));
+    const Window = struct {
+        bytes: []u8,
+        meta: *const schema.FileMetaData,
+        budget: *core_memory.SharedBudget,
+        refuse_at: usize,
+        force_decode: bool,
+        refused: bool = false,
+        waits: [2]usize = @splat(0),
+        done: [2]usize = @splat(0),
+        fn wait(ctx: *anyopaque, rg: usize) anyerror!void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            w.waits[rg] += 1;
+            if (rg != 0 and w.force_decode and !w.refused and w.budget.used.load(.monotonic) >= w.refuse_at) {
+                w.refused = true;
+                return error.ExceededMemoryBudget;
+            }
+        }
+        fn release(ctx: *anyopaque, rg: usize, _: usize) void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            w.done[rg] += 1;
+            for (w.meta.row_groups.items[rg].columns.items) |col| {
+                const cm = col.meta_data.?;
+                const lo: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+                @memset(w.bytes[lo..][0..@intCast(cm.total_compressed_size)], 0);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |mapped| for ([_]bool{ false, true }) |bytes_key| {
+        var budget: core_memory.SharedBudget = .{ .limit = 512 << 20 };
+        // The established answer retains its small materialization charge until the query ledger dies.
+        defer std.debug.assert(budget.used.load(.monotonic) < 1 << 20);
+        const buffer = try a.dupe(u8, captured.bytes.items);
+        var window: Window = .{
+            .bytes = buffer,
+            .meta = &meta,
+            .budget = &budget,
+            .refuse_at = integer_groups.State.reservation(n),
+            .force_decode = !bytes_key,
+        };
+        const in = [_]Input{.{
+            .name = if (mapped) "window.parquet" else "s3://bucket/window.parquet",
+            .bytes = buffer,
+            .gate = .{ .ctx = &window, .wait = Window.wait, .done = Window.release },
+            .plan_bytes = if (mapped) captured.bytes.items else null,
+        }};
+        var got = try runMultiAggregate(gpa, a, .{
+            .inputs = &in,
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c,sum(n) AS s",
+            .group_by = if (bytes_key) "k" else "n",
+            .parallelism = if (mapped and !bytes_key) 4 else 1,
+            .typed_answer = true,
+            .integer_records_min_rows = 0,
+            .byte_records = true,
+            .byte_records_min_rows = 0,
+            .max_memory = budget.limit,
+            .ledger = &budget,
+            .min_bytes_per_worker = 1,
+        });
+        defer got.deinit(gpa);
+        try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.waits);
+        try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.done);
+        try testing.expect(got.output.byte_stream == null);
+        if (mapped and !bytes_key) {
+            // The injected parallel decode refusal must keep the inline layout for its deterministic serial retry.
+            const stream = got.output.integer_stream.?;
+            try testing.expectEqual(@as(usize, 1), stream.state.locals.len);
+            try testing.expectEqual(@as(usize, 1), stream.state.group_count);
+        } else {
+            try testing.expect(got.output.integer_stream == null);
+            try testing.expectEqual(@as(usize, if (bytes_key) 2 else 1), got.output.typed.?.rows);
+        }
+        try testing.expectEqual(mapped and !bytes_key, window.refused);
+    };
+    for ([_]bool{ false, true }) |bytes_key| {
+        const inputs = [_]Input{.{ .name = "mapped.parquet", .bytes = captured.bytes.items }};
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c,sum(n) AS s",
+            .group_by = if (bytes_key) "k" else "n",
+            .typed_answer = true,
+            .integer_records_min_rows = 0,
+            .byte_records = true,
+            .byte_records_min_rows = 0,
+            .max_memory = 512 << 20,
+        };
+        const explanation = try explainAggregate(gpa, a, args);
+        const expected: RecordAdmission = .{
+            .layout = if (bytes_key) .byte_group_stream else .integer_group_stream,
+            .reservation = if (bytes_key) byte_groups.State.reservation(n) else integer_groups.State.reservation(n),
+        };
+        try testing.expectEqual(expected, explanation.record_path.?);
+    }
+}
+
+test "inline record decode refusals retry serially without disabling the layout" {
+    const S = std.EnumSet(FastPath);
+    var chain: Chain = .{ .parts_tried = false };
+    const args: MultiAggArgs = .{ .inputs = &.{}, .aggregate = "", .parallelism = 8, .byte_records = true };
+    const serial = narrowed(args, args, S.initMany(&.{ .integer_records, .decode_memory }), &chain, false).?;
+    try testing.expectEqual(@as(usize, 1), serial.parallelism);
+    try testing.expect(serial.integer_records and serial.byte_records);
+    const fallback = narrowed(args, serial, S.initMany(&.{ .integer_records, .decode_memory }), &chain, false).?;
+    try testing.expect(!fallback.integer_records and !fallback.byte_records);
+    try testing.expectEqual(args.parallelism, fallback.parallelism);
+    const wide = narrowed(args, args, S.initMany(&.{.integer_records}), &chain, false).?;
+    try testing.expect(!wide.integer_records and !wide.byte_records);
 }
 
 fn integerWindowAllocTrial(a: std.mem.Allocator, stream: IntegerStream, types: []const GroupColType) !void {

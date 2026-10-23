@@ -2638,9 +2638,19 @@ pub const AggregateFile = struct {
     }
 
     pub fn deinit(f: *AggregateFile) void {
+        f.releaseWorkspace();
+    }
+
+    fn releaseWorkspace(f: *AggregateFile) void {
         if (f.cached_wave) |*w| w.deinit();
+        f.cached_wave = null;
         f.cached_alone.deinit();
+        f.cached_alone = .init(std.heap.page_allocator);
         if (f.cached_ledger) |l| l.release(f.cached_charge);
+        f.cached_ledger = null;
+        f.cached_charge = 0;
+        f.cached_width = 0;
+        f.cached_unit_charge = 0;
     }
 
     /// Reuse one bounded wave for four row groups of three integer columns. Its full scratch upper bound stays
@@ -2658,8 +2668,10 @@ pub const AggregateFile = struct {
         std.debug.assert(f.cached_width == 0 and f.cached_charge == 0);
         const admitted = encode.budget / unit_charge;
         if (admitted == 0) return;
-        const width = @max(1, @min(@min(encode.workers, 12), admitted));
-        const charge = width * unit_charge;
+        var width = @max(1, @min(@min(encode.workers, 12), admitted));
+        // A trailing single unit uses its own arena beside every retained wave arena.
+        if (width > 1 and width == admitted) width -= 1;
+        const charge = (width + @intFromBool(width > 1)) * unit_charge;
         if (encode.ledger) |l| _ = l.drawExact(charge) orelse return;
         f.cached_ledger = encode.ledger;
         f.cached_charge = charge;
@@ -2698,10 +2710,6 @@ fn appendAggregateRows(
     const sink = file.sink;
     var off = file.off;
     var encode = options;
-    if (file.cached_width != 0) {
-        encode.ledger = null;
-        encode.workers = @min(encode.workers, file.cached_width);
-    }
 
     // Each row group's columns in order, row group after row group: the units encoded and written below. One row
     // group is the columns themselves.
@@ -2726,13 +2734,21 @@ fn appendAggregateRows(
     // does. Each wave's columns are then written, and any error returned, in column order, so the file and the error
     // are the serial loop's; their metadata is copied out and the wave's memory freed before the next. A column alone
     // encodes on memory given back once it is written, not on `arena`, which kept every column's until the end.
-    const width = @min(encode.workers, units.len);
     if (file.cached_width != 0) {
-        std.debug.assert(width <= file.cached_width);
         for (units) |unit| {
-            std.debug.assert(aggEncodeCharge(unit) <= file.cached_unit_charge);
+            // New shapes must not silently outgrow a prepaid unit in release builds. Return the reservation and
+            // retained arenas first, then use the ordinary per-wave ledger draws for this and later windows.
+            if (aggEncodeCharge(unit) > file.cached_unit_charge) {
+                file.releaseWorkspace();
+                break;
+            }
         }
     }
+    if (file.cached_width != 0) {
+        encode.ledger = null;
+        encode.workers = @min(encode.workers, file.cached_width);
+    }
+    const width = @min(encode.workers, units.len);
     var wave: ?AggColumnWave = file.cached_wave orelse
         if (width > 1) try AggColumnWave.init(arena, width) else @as(?AggColumnWave, null);
     defer if (file.cached_width == 0) if (wave) |*w| w.deinit();
@@ -7768,23 +7784,37 @@ fn cachedIntegerWindows(a: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const all = try aggAnswerCols(alloc, 1000, null);
+    const all = try aggAnswerCols(alloc, 1201, null);
     var cols = [_]expr_agg.OutputCol{ all[0], all[1], all[0] };
     cols[2].name = "s";
     var whole: AnswerCapture = .{ .a = alloc };
-    _ = try writeAggregateRowsEncoded(alloc, whole.sink(), &cols, 1000, 300, .SNAPPY, .{}, .{});
+    _ = try writeAggregateRowsEncoded(alloc, whole.sink(), &cols, 1201, 300, .SNAPPY, .{}, .{});
     var windows: AnswerCapture = .{ .a = alloc };
     var file = try AggregateFile.init(alloc, windows.sink());
     defer file.deinit();
-    const encode: AggEncode = .{ .workers = 8, .budget = 128 << 20, .ledger = &budget };
+    const encode: AggEncode = .{ .workers = 11, .budget = 128 << 20, .ledger = &budget };
     try file.reserveIntegerWorkspace(encode);
-    for ([_][2]usize{ .{ 0, 600 }, .{ 600, 1000 } }) |range| {
+    try std.testing.expectEqual(@as(usize, 12 * answer_rg_rows * 12 * 3), file.cached_charge);
+    try std.testing.expectEqual(file.cached_charge, budget.used.load(.monotonic));
+    for ([_][2]usize{ .{ 0, 1200 }, .{ 1200, 1201 } }) |range| {
         var part: [3]expr_agg.OutputCol = undefined;
         for (cols, &part) |c, *p| p.* = sliceOutputCol(c, range[0], range[1]);
         try appendAggregateRows(&file, &part, @intCast(range[1] - range[0]), 300, .SNAPPY, .{}, encode);
     }
     _ = try file.finish(&cols);
     try std.testing.expectEqualSlices(u8, whole.bytes.items, windows.bytes.items);
+    // A later wider shape returns every retained arena before drawing its ordinary per-wave workspace.
+    file.releaseWorkspace();
+    var fallback: AnswerCapture = .{ .a = alloc };
+    var wider = try AggregateFile.init(alloc, fallback.sink());
+    defer wider.deinit();
+    try wider.reserveIntegerWorkspace(encode);
+    wider.cached_unit_charge = 1;
+    try appendAggregateRows(&wider, &cols, 1201, 300, .SNAPPY, .{}, encode);
+    _ = try wider.finish(&cols);
+    try std.testing.expectEqualSlices(u8, whole.bytes.items, fallback.bytes.items);
+    try std.testing.expectEqual(@as(usize, 0), wider.cached_charge);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
 test "writeAggregateRows: retained integer encode scratch stays charged through windows and unwinds on failure" {

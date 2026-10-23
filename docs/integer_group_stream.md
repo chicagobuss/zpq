@@ -9,8 +9,10 @@ key-identity proof.
 
 `integer_groups.State` reserves a conservative peak from the query ledger before decoding starts. Its quote depends
 on row count, with headroom for at most 64 workers and bounded output windows. Refused admission takes the existing
-path without consuming input. A later decode-memory refusal releases the state and enters the existing exact
-restart chain with this executor disabled. Source descriptors, decoded pages and dictionary codes never escape their
+path without consuming input. Only rescannable inputs admit the path: released remote windows cannot be replayed.
+A later parallel decode-memory refusal releases the state and retries this layout with one worker before entering
+the existing exact restart chain with the executor disabled. Local reader retries use their retained mappings.
+Source descriptors, decoded pages and dictionary codes never escape their
 usual lifetimes: each record owns the key, integer value, dense input ordinal and NULL flags.
 
 Workers append records to private coarse-partition block chains, collecting fine-partition counts at the same time.

@@ -5771,15 +5771,17 @@ fn writeIntegerStream(
         }
         try file.append(cols, hi - lo, codec, zstd, encode);
         lo = hi;
+        if (lo == total) {
+            const written = try file.finish(cols);
+            if (fd_open) {
+                fd_open = false;
+                try local_fs.closeChecked(fd);
+            }
+            return written;
+        }
         _ = window.reset(.retain_capacity);
-        if (lo == total) break;
     }
-    const written = try file.finish(cols);
-    if (fd_open) {
-        fd_open = false;
-        try local_fs.closeChecked(fd);
-    }
-    return written;
+    unreachable;
 }
 
 fn writeByteStream(
@@ -6345,7 +6347,13 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
         try writer.print("{s}\"{s}\"", .{ sep, @tagName(reason) });
         sep = ",";
     }
-    try writer.writeAll("],\"ndv\":");
+    try writer.writeAll("],\"record_path\":");
+    if (a.record_path) |r| {
+        try writer.print("{{\"layout\":\"{s}\",\"reservation\":{d},\"partitions\":2048,\"conditional\":true}}", .{
+            @tagName(r.layout), r.reservation,
+        });
+    } else try writer.writeAll("null");
+    try writer.writeAll(",\"ndv\":");
     if (a.plan.ndv_stat) |stat| {
         try writer.print("{{\"source\":\"{s}\",\"lo\":{d},\"hi\":{d},\"rows\":{d},\"covered_rows\":{d},\"encoding_stats_rows\":{d},\"confidence\":\"{s}\",\"dictionary_bytes\":{d},\"column_bytes\":{d},\"key_bytes_estimate\":{d},\"union_attempted\":{},\"union_complete\":{}", .{
             @tagName(stat.source),

@@ -535,7 +535,8 @@ fn runQuery(
         }
         const explanation = try engine.explainAggregate(.{ .gpa = gpa, .env = env, .io = io }, arena, .{
             .inputs = inputs,
-            .output = engine_output,
+            .output = if (fmt == .parquet) engine_output orelse "-" else null,
+            .typed_answer = fmt == .parquet,
             .filter = filter,
             .aggregate = aggregate orelse "",
             .parallelism = parallelism,

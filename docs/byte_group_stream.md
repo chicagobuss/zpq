@@ -5,6 +5,11 @@ owned inline records. Selected columns may be permuted. Filters, ordering, limit
 aggregate shapes retain the established executor. Small inputs and low dictionary-cardinality estimates decline
 before allocation. Statistics can decline long keys, but never certify a key's width: every decoded key is checked.
 A key longer than 16 bytes releases the attempt and restarts the general executor, without changing query semantics.
+Only rescannable inputs admit this executor. Remote windows retain the general path; local reader retries use the
+retained mapping. A parallel decode-memory refusal retries the record layout once with one worker before giving it
+up. Width refusals skip that retry. When chunk bounds are absent, a bounded first-page sample can cheaply decline
+long keys; it never certifies the remaining keys or changes decode errors. A long key later in the input can still
+cost a refused scan. EXPLAIN reports metadata eligibility, reservation and the conditional runtime guards.
 
 Each 32-byte record owns its key, value, input ordinal, exact key length and NULL flags. A single hash chooses one
 of 2048 partitions; its low 30 bits also supply the initial table bucket. Admission limits input to fewer than 2^27

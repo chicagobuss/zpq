@@ -40,7 +40,7 @@ Sketch, census and first-key multipass plans reject every gated input, including
 local readers with a mapping. They cannot rerun a source whose bytes have been returned to its producer.
 
 Separately, zpq prunes on footer/page statistics that pass corroboration: compatible type/order, counts,
-bounds and consistency checks. Corroboration does not compare those claims with all decoded values.
+bounds and consistency checks, plus the [known writer-version policy](writer-statistics.md). Corroboration does not compare those claims with all decoded values.
 Internally consistent but false statistics can therefore produce a different answer from a full scan.
 `--trust-stats` accepts additional plausible claims and statistics-as-answer; `--scan-all` ignores statistics.
 It still projects columns and may use exact decoded sketch/census proofs, so it is not whole-file validation.

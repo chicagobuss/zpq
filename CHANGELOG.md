@@ -240,6 +240,9 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
 ### Behaviour changes
 
 **Contracts**
+- Known parquet-cpp/parquet-mr writer-version defects suppress affected chunk/page statistics for pruning and
+  metadata answers, including under `--trust-stats`; CDH fixes and equal extrema retain their established exceptions.
+  Unknown or malformed `created_by` remains modern. See [writer statistics](docs/writer-statistics.md).
 - Query validation covers answer-relevant data: corruption confined to unprojected columns, unread COUNT-pass
   arguments or items excluded by exact decoded sketch/census/admit proofs may go undetected. Multipass proofs
   reject gated inputs. Existing footer/page-statistics corroboration is not value verification: internally

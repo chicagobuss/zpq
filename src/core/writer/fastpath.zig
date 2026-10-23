@@ -35,6 +35,8 @@
 
 const std = @import("std");
 const schema = @import("../schema.zig");
+const statistics = @import("../parquet/statistics.zig");
+const writer_statistics = @import("../parquet/writer_statistics.zig");
 const thrift = @import("../thrift.zig");
 const bloom = @import("../parquet/bloom.zig");
 
@@ -143,9 +145,9 @@ pub fn assemble(
     for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
         if (!keep) continue;
         const new_rg = if (kept_columns) |kc|
-            try copyProjectedRowGroup(arena, out, f.bytes, rg, kc)
+            try copyProjectedRowGroup(arena, out, f.bytes, rg, kc, f.meta)
         else
-            try copyRowGroup(arena, out, f.bytes, rg) orelse continue;
+            try copyRowGroup(arena, out, f.bytes, rg, f.meta) orelse continue;
         try new_row_groups.append(arena, new_rg);
         total_rows += rg.num_rows;
     };
@@ -213,6 +215,7 @@ fn copyRowGroup(
     out: anytype,
     input: []const u8,
     src: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
 ) !?schema.RowGroup {
     const range = try rowGroupByteRange(src, input.len) orelse return null;
     const delta = offsetDelta(out.pos(), range.start);
@@ -223,7 +226,10 @@ fn copyRowGroup(
     try cols.ensureTotalCapacity(arena, src.columns.items.len);
     // Every chunk in the group moved by the same delta; the rebased
     // indexes follow the group's data.
-    for (src.columns.items) |*chunk| cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, chunk, delta));
+    for (src.columns.items) |*chunk| {
+        const safe = writerSafeChunk(arena, input, chunk, meta);
+        cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &safe, delta));
+    }
     return .{
         .columns = cols,
         .total_byte_size = src.total_byte_size,
@@ -250,6 +256,7 @@ fn copyProjectedRowGroup(
     input: []const u8,
     src_rg: *const schema.RowGroup,
     kept: []const usize,
+    meta: *const schema.FileMetaData,
 ) !schema.RowGroup {
     var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     errdefer new_cols.deinit(arena);
@@ -259,7 +266,8 @@ fn copyProjectedRowGroup(
         const range = try projectedChunkRange(src_rg, col_idx, input.len);
         const delta = offsetDelta(out.pos(), range.start);
         try out.write(input[range.start .. range.start + range.len]);
-        new_cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &src_rg.columns.items[col_idx], delta));
+        const safe = writerSafeChunk(arena, input, &src_rg.columns.items[col_idx], meta);
+        new_cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &safe, delta));
     }
 
     return .{
@@ -271,6 +279,50 @@ fn copyProjectedRowGroup(
 
 fn offsetDelta(new_start: usize, src_start: usize) i64 {
     return @as(i64, @intCast(new_start)) - @as(i64, @intCast(src_start));
+}
+
+/// Copied statistics must stay absent even if a mixed/encoded output changes created_by. Retain raw source
+/// metadata for inspection; clear only the copy. A page-index parse/refusal drops that optional index.
+pub fn writerSafeChunk(
+    a: std.mem.Allocator,
+    input: []const u8,
+    src: *const schema.ColumnChunk,
+    file_meta: ?*const schema.FileMetaData,
+) schema.ColumnChunk {
+    var chunk = src.*;
+    const fm = file_meta orelse return chunk;
+    const cm = chunk.meta_data orelse return chunk;
+    const elem = fm.getColumnSchema(cm.path_in_schema.items);
+    // Modern writers and signed types unaffected by any rule do no extra allocation or page-index walk.
+    if (writer_statistics.usable(fm.created_by, cm.type, elem, null, null)) return chunk;
+    if (cm.statistics) |st| {
+        const pair = if (st.min_value != null and st.max_value != null)
+            [2]?[]const u8{ st.min_value, st.max_value }
+        else
+            [2]?[]const u8{ st.min, st.max };
+        if (!writer_statistics.usable(fm.created_by, cm.type, elem, pair[0], pair[1]))
+            chunk.meta_data.?.statistics = null;
+    }
+    const usable_index = keep: {
+        // Binary corruption rejects every possible extrema pair, without reading the index at all.
+        if (!writer_statistics.usable(fm.created_by, cm.type, elem, "", "")) break :keep false;
+        const co = src.column_index_offset orelse return chunk;
+        const cl = src.column_index_length orelse return chunk;
+        const bytes = sliceInBounds(input, co, cl) orelse break :keep false;
+        var r = thrift.Reader.init(bytes);
+        var ci = schema.ColumnIndex.read(a, &r) catch break :keep false;
+        defer ci.null_pages.deinit(a);
+        defer ci.min_values.deinit(a);
+        defer ci.max_values.deinit(a);
+        defer if (ci.null_counts) |*nc| nc.deinit(a);
+        defer if (ci.nan_counts) |*nc| nc.deinit(a);
+        break :keep statistics.pageIndexWriterUsable(&ci, cm, elem, fm.created_by);
+    };
+    if (!usable_index) {
+        chunk.column_index_offset = null;
+        chunk.column_index_length = null;
+    }
+    return chunk;
 }
 
 /// `src` with every offset shifted by `delta`, the distance its data
@@ -1027,4 +1079,35 @@ test "carriedFilter: only a filter that reads whole and agrees with the footer" 
     c = good;
     c.meta_data.?.bloom_filter_length = null;
     try testing.expectEqual(carriedFilter(bytes, &good).len, carriedFilter(bytes, &c).len);
+}
+
+test "writer statistics: copied chunks cannot regain suppressed statistics under another writer name" {
+    const a = std.testing.allocator;
+    const path = "ci/fixtures/parquet/writer_stats.parquet";
+    const bytes = @import("../parquet/metadata.zig").readFileSlice(path, a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(bytes);
+    var meta = try @import("../parquet/metadata.zig").open(a, bytes);
+    defer meta.deinit(a);
+    const rg = &meta.row_groups.items[0];
+    for (rg.columns.items[0..3]) |*src| {
+        const safe = writerSafeChunk(a, bytes, src, &meta);
+        try std.testing.expect(safe.meta_data.?.statistics == null);
+        try std.testing.expect(safe.column_index_offset == null);
+        try std.testing.expect(src.meta_data.?.statistics != null);
+        try std.testing.expect(src.column_index_offset != null);
+    }
+    // An allowed equal pair keeps its page index; every optional parse allocation can be refused without leaks.
+    meta.created_by = "parquet-cpp version 1.2.9";
+    const src = &rg.columns.items[0];
+    const kept = writerSafeChunk(a, bytes, src, &meta);
+    try std.testing.expectEqual(src.column_index_offset, kept.column_index_offset);
+    for (0..6) |fail_index| {
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const safe = writerSafeChunk(fail.allocator(), bytes, src, &meta);
+        try std.testing.expect(safe.meta_data.?.statistics != null);
+        try std.testing.expect(safe.column_index_offset == null or safe.column_index_offset == src.column_index_offset);
+    }
 }

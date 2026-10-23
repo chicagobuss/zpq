@@ -10,6 +10,7 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 const decimal_mod = @import("decimal.zig");
+const writer_statistics = @import("writer_statistics.zig");
 
 pub const Bounds = struct { min: []const u8, max: []const u8 };
 
@@ -43,6 +44,15 @@ pub fn chunkStats(
     const cm = rg.columns.items[col_idx].meta_data orelse return .{};
     const stats = cm.statistics orelse return .{};
     const elem = if (file_meta) |fm| fm.getColumnSchema(cm.path_in_schema.items) else null;
+    const raw = rawBounds(stats);
+    const created_by = if (file_meta) |fm| fm.created_by else null;
+    if (!writer_statistics.usable(
+        created_by,
+        cm.type,
+        elem,
+        if (raw) |b| b.min else null,
+        if (raw) |b| b.max else null,
+    )) return .{};
     if (!valuesAddUp(rg, cm, file_meta)) return .{};
     const bounds = writtenBounds(rg, col_idx, file_meta);
     if (bounds) |b| if (boundsInverted(cm.type, elem, b.min, b.max)) return .{};
@@ -67,6 +77,45 @@ pub fn chunkStats(
         return no_count;
     }
     return out;
+}
+
+// Preserve pair selection: never combine a modern endpoint with a deprecated one. This checks writer defects
+// before the ordinary order/type checks; an equal deprecated pair does not gain a new readable order.
+fn rawBounds(stats: schema.Statistics) ?Bounds {
+    if (stats.min_value) |min| if (stats.max_value) |max| return .{ .min = min, .max = max };
+    if (stats.min) |min| if (stats.max) |max| return .{ .min = min, .max = max };
+    return null;
+}
+
+/// Writer policy for one page's complete statistics, including null/NaN counts. No bounds on an all-null page.
+pub fn pageWriterUsable(
+    ci: *const schema.ColumnIndex,
+    page: usize,
+    cm: schema.ColumnMetaData,
+    elem: ?schema.SchemaElement,
+    created_by: ?[]const u8,
+) bool {
+    if (page >= ci.null_pages.items.len or page >= ci.min_values.items.len or page >= ci.max_values.items.len)
+        return false;
+    const is_null = ci.null_pages.items[page];
+    return writer_statistics.usable(
+        created_by,
+        cm.type,
+        elem,
+        if (is_null) null else ci.min_values.items[page],
+        if (is_null) null else ci.max_values.items[page],
+    );
+}
+
+/// Drop the entire index if a known writer defect affects any page, before a consumer can act on its flags/counts.
+pub fn pageIndexWriterUsable(
+    ci: *const schema.ColumnIndex,
+    cm: schema.ColumnMetaData,
+    elem: ?schema.SchemaElement,
+    created_by: ?[]const u8,
+) bool {
+    for (0..ci.null_pages.items.len) |page| if (!pageWriterUsable(ci, page, cm, elem, created_by)) return false;
+    return true;
 }
 
 /// Every row has at least one entry in each leaf, and a leaf that does not repeat has exactly one.
@@ -786,5 +835,71 @@ test "pageIndexIsPlausible: inverted page bounds are refused under any trust, co
                 return err;
             };
         }
+    }
+}
+
+test "writer statistics: chunk suppression removes counts under both trust modes and never promotes legacy order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { writer: ?[]const u8, unequal: bool, equal: bool }{
+        .{ .writer = "parquet-cpp version 1.2.9", .unequal = false, .equal = true },
+        .{ .writer = "parquet-cpp version 1.3.0", .unequal = true, .equal = true },
+        .{ .writer = "parquet-mr version 1.7.0", .unequal = false, .equal = false },
+        .{ .writer = "parquet-mr version 1.8.0", .unequal = false, .equal = true },
+        .{ .writer = "parquet-mr version 1.10.0", .unequal = true, .equal = true },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .unequal = false, .equal = true },
+        .{ .writer = "parquet-mr version malformed", .unequal = true, .equal = true },
+        .{ .writer = null, .unequal = true, .equal = true },
+    };
+    for (cases) |c| for ([_]bool{ false, true }) |equal| for ([_]Trust{ .corroborated, .plausible }) |trust| {
+        var fx = try ColumnForTest.init(arena.allocator(), leafForTest(.BYTE_ARRAY), .{
+            .min_value = "a",
+            .max_value = if (equal) "a" else "b",
+            .null_count = 0,
+        });
+        fx.fm.created_by = c.writer;
+        const got = chunkStats(&fx.rg, 0, &fx.fm, trust);
+        const want = if (equal) c.equal else c.unequal;
+        try testing.expectEqual(want, got.bounds != null);
+        try testing.expectEqual(want, got.null_count != null);
+        // Policy is subtractive: even an allowed equal pair cannot make signed legacy bytes type-ordered.
+        fx.rg.columns.items[0].meta_data.?.statistics = .{ .min = "a", .max = "a", .null_count = 0 };
+        const legacy = chunkStats(&fx.rg, 0, &fx.fm, trust);
+        try testing.expect(legacy.bounds == null);
+        try testing.expectEqual(c.equal, legacy.null_count != null);
+    };
+}
+
+test "writer statistics: page suppression includes null-only predicates and drops an affected index whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try ColumnForTest.init(a, leafForTest(.BYTE_ARRAY), .{ .min_value = "a", .max_value = "b" });
+    const cm = fx.rg.columns.items[0].meta_data.?;
+    var ci: schema.ColumnIndex = .{};
+    try ci.null_pages.appendSlice(a, &.{ false, false });
+    try ci.min_values.appendSlice(a, &.{ "a", "a" });
+    try ci.max_values.appendSlice(a, &.{ "a", "b" });
+    const old_cpp = "parquet-cpp version 1.2.9";
+    try testing.expect(pageWriterUsable(&ci, 0, cm, null, old_cpp));
+    try testing.expect(!pageWriterUsable(&ci, 1, cm, null, old_cpp));
+    try testing.expect(!pageIndexWriterUsable(&ci, cm, null, old_cpp));
+    ci.max_values.items[1] = "a";
+    try testing.expect(pageIndexWriterUsable(&ci, cm, null, old_cpp));
+    try testing.expect(!pageIndexWriterUsable(&ci, cm, null, "parquet-mr version 1.7.0"));
+    // A null page has no extrema and cannot use the equal-extrema exception for old unsigned-order writers.
+    ci.null_pages.items[0] = true;
+    ci.min_values.items[0] = "";
+    ci.max_values.items[0] = "";
+    fx.fm.created_by = old_cpp;
+    const indexes = [_]?schema.ColumnIndex{ci};
+    const prune = @import("../filter/prune.zig");
+    const ast = @import("../filter/ast.zig");
+    const filter: ast.Filter = .{ .null_check = .{ .col_idx = 0, .is_not = true } };
+    for ([_]bool{ false, true }) |trust| {
+        try testing.expectEqual(prune.Decision.unknown, prune.prunePage(&fx.rg, 0, filter, &indexes, &fx.fm, trust));
+        fx.fm.created_by = "parquet-cpp version 1.3.0";
+        try testing.expectEqual(prune.Decision.skip, prune.prunePage(&fx.rg, 0, filter, &indexes, &fx.fm, trust));
+        fx.fm.created_by = old_cpp;
     }
 }

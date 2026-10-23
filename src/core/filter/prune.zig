@@ -940,6 +940,19 @@ pub fn prunePage(
     file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
 ) Decision {
+    // Callers may supply an index directly; writer suppression also covers null-only predicates.
+    switch (filter) {
+        .like, .and_filter, .or_filter => {},
+        inline else => |leaf| {
+            const col = leaf.col_idx;
+            if (col >= col_indexes.len or col >= rg.columns.items.len) return .unknown;
+            const ci = col_indexes[col] orelse return .unknown;
+            const cm = rg.columns.items[col].meta_data orelse return .unknown;
+            const elem = if (file_meta) |fm| fm.getColumnSchema(cm.path_in_schema.items) else null;
+            const writer = if (file_meta) |fm| fm.created_by else null;
+            if (!statistics.pageWriterUsable(&ci, page_idx, cm, elem, writer)) return .unknown;
+        },
+    }
     switch (filter) {
         .null_check, .like, .and_filter, .or_filter => {},
         inline else => |leaf| if (!statistics.boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,

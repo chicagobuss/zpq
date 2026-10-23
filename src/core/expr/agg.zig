@@ -1096,8 +1096,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
     // reads file-written statistics, which real-world writers (e.g. parquet-mr
     // 1.8.2 / Spark) sometimes emit *inaccurately* — yielding a silently wrong
     // answer. Trust those only under --trust-stats; otherwise decode for the
-    // true value (row-group pruning still uses stats — that path is safe
-    // because it only ever skips provably-non-matching groups).
+    // true value. Row-group pruning retains the documented corroborated-statistics trust boundary.
     const is_count_star = call.func == .count and call.arg == null;
     if (!trust_stats and !is_count_star) return false;
     // BOOLEAN columns widen to i64 (0/1) at decode time but have no

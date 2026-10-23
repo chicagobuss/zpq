@@ -11288,6 +11288,7 @@ test "runMultiAggregate: an input that is not Parquet is named with the reason" 
 
 /// What `rewritten` changes: the footer, and one chunk's ColumnIndex or OffsetIndex.
 const Rewrite = struct {
+    created_by: ?[]const u8 = null,
     footer: ?*const fn (*schema.FileMetaData) void = null,
     rg: usize = 0,
     col: usize = 0,
@@ -11331,6 +11332,7 @@ fn rewritten(bytes: []const u8, rw: Rewrite) ![]u8 {
         try out.appendSlice(testing.allocator, w.bytes());
     }
     if (rw.footer) |edit| edit(&meta);
+    if (rw.created_by) |writer| meta.created_by = writer;
 
     var w = thrift.Writer.init(arena);
     try meta.write(&w);
@@ -17212,4 +17214,65 @@ test "stream probe funding follows projected chunks and retains the fixed option
     try testing.expectEqual(core_memory.lean_decode / 2, budget.used.load(.monotonic));
     probe.releaseStream();
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "writer statistics: rewritten footers suppress pruning page indexes and trusted aggregate answers" {
+    const path = "ci/fixtures/parquet/writer_stats.parquet";
+    const original = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(original);
+    const cases = [_]struct { writer: []const u8, binary: bool, unsigned: bool }{
+        .{ .writer = "parquet-mr version 1.7.0 (build synthetic)", .binary = false, .unsigned = false },
+        .{ .writer = "parquet-mr version 1.8.0", .binary = true, .unsigned = false },
+        .{ .writer = "parquet-mr version 1.10.0", .binary = true, .unsigned = true },
+        .{ .writer = "parquet-cpp version 1.2.9", .binary = true, .unsigned = false },
+        .{ .writer = "parquet-cpp version 1.3.0", .binary = true, .unsigned = true },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.4.999", .binary = false, .unsigned = false },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .binary = true, .unsigned = false },
+        .{ .writer = "parquet-mr version malformed", .binary = true, .unsigned = true },
+    };
+    for (cases) |c| {
+        const bytes = try rewritten(original, .{ .created_by = c.writer });
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+        // The fixture's false but plausible chunk AND page claims exclude real rows and say there are no nulls.
+        for ([_][]const u8{ "s = 'a'", "s IS NULL", "d = 1.00", "d IS NULL", "u = 1", "u IS NULL" }, 0..) |filter, fi| {
+            for ([_]bool{ false, true }) |trust| for ([_]bool{ false, true }) |scan_all| {
+                var arena = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena.deinit();
+                const result = try runMultiAggregate(testing.allocator, arena.allocator(), .{
+                    .inputs = &inputs,
+                    .aggregate = "count(*) AS n",
+                    .filter = filter,
+                    .trust_stats = trust,
+                    .scan_all = scan_all,
+                    .parallelism = 3,
+                    .max_memory = 64 << 10,
+                    .decode_batch_rows = 64,
+                });
+                defer freeResult(result);
+                const allowed = if (fi < 4) c.binary else c.unsigned;
+                const want: i128 = if (scan_all or !allowed) 1 else 0;
+                try testing.expectEqual(want, result.output.aggs[0].value.i);
+            };
+        }
+        for ([_]usize{ 1, 3, 16 }) |j| for ([_]bool{ false, true }) |scan_all| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const result = try runMultiAggregate(testing.allocator, arena.allocator(), .{
+                .inputs = &inputs,
+                .aggregate = "count(s) AS s, count(d) AS d, count(u) AS u, min(d) AS m",
+                .trust_stats = true,
+                .scan_all = scan_all,
+                .parallelism = j,
+            });
+            defer freeResult(result);
+            for (0..3) |ci| {
+                const allowed = if (ci < 2) c.binary else c.unsigned;
+                const want: i128 = if (allowed and !scan_all) 3 else 2;
+                try testing.expectEqual(want, result.output.aggs[ci].value.i);
+            }
+            const minimum: i128 = if (c.binary and !scan_all) 900 else 100;
+            try testing.expectEqual(minimum, result.output.aggs[3].value.dec.v);
+        };
+    }
 }

@@ -146,6 +146,7 @@ test {
     _ = @import("core/parquet/column.zig");
     _ = @import("core/parquet/decimal.zig");
     _ = @import("core/parquet/statistics.zig");
+    _ = @import("core/parquet/writer_statistics.zig");
     _ = @import("core/parquet/bloom.zig");
     _ = @import("core/parquet/int96.zig");
     _ = @import("core/parquet/fuzz_decode.zig");

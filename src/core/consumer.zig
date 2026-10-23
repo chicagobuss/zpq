@@ -5000,6 +5000,7 @@ fn loadPageIndexes(ra: std.mem.Allocator, in: AggRowGroup, stats: agg_plan.Stats
         const cm = chunk_meta.meta_data orelse continue;
         const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
         const elem = in.meta.getColumnSchema(cm.path_in_schema.items);
+        if (!statistics.pageIndexWriterUsable(&col_index, cm, elem, in.meta.created_by)) continue;
         const trust: statistics.Trust = if (stats == .trust) .plausible else .corroborated;
         const rows = in.rg.num_rows;
         if (!statistics.pageIndexIsPlausible(&col_index, &offset_index, cm, elem, levels, rows, trust)) continue;
@@ -5336,7 +5337,8 @@ pub fn copyRG(
         for (kept, 0..) |b, ci| {
             if (!b) continue;
             if (ci >= rg.columns.items.len) return error.BadColumnIndex;
-            const src_chunk = &rg.columns.items[ci];
+            const safe = fastpath.writerSafeChunk(out_arena, src.bytes, &rg.columns.items[ci], bloom_write.meta);
+            const src_chunk = &safe;
             const m = src_chunk.meta_data orelse return error.InvalidColumnOffsets;
             const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
             const slice = try sourceBytes(src, range);
@@ -5398,7 +5400,8 @@ pub fn copyRG(
     // Whole-RG copy: one delta for the group. Index bytes for each
     // chunk are appended after the RG data block, in column order.
     for (rg.columns.items, 0..) |*chunk, ci| {
-        var copied = try carryChunk(out_arena, &out, src, chunk, delta, emit_page_index);
+        const safe = fastpath.writerSafeChunk(out_arena, src.bytes, chunk, bloom_write.meta);
+        var copied = try carryChunk(out_arena, &out, src, &safe, delta, emit_page_index);
         try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
         try cols.append(out_arena, copied);
     }

@@ -315,6 +315,7 @@ def main() -> None:
     write_collated()
     write_nan()
     write_false_bounds()
+    write_writer_stats()
 
 
 def write_deprecated() -> None:
@@ -354,6 +355,39 @@ def write_false_bounds() -> None:
                 bound[2] = struct.pack("<q", value)
 
     rewrite_footer(out, edit)
+    print(f"wrote {out} ({out.stat().st_size} bytes)")
+
+
+def write_writer_stats() -> None:
+    """Modern encoded pages with an old-writer footer and plausible but false chunk/page statistics."""
+    out = OUT_DIR / "writer_stats.parquet"
+    table = pa.table({
+        "s": pa.array(["a", None, "b"], type=pa.string()),
+        "d": pa.array([decimal.Decimal("1.00"), None, decimal.Decimal("2.00")], type=pa.decimal128(9, 2)),
+        "u": pa.array([1, None, 2], type=pa.uint32()),
+        "v": pa.array([10, 20, 30], type=pa.int64()),
+    })
+    pq.write_table(table, out, use_dictionary=False, compression="snappy", write_page_index=True)
+
+    def edit(meta, body):
+        field(meta, 6)[2] = b"parquet-mr version 1.7.0 (build synthetic)"
+        bounds = [(b"z", b"z"), ((900).to_bytes(4, "big", signed=True),) * 2,
+                  (struct.pack("<I", 100), struct.pack("<I", 200))]
+        for chunk, (lo, hi) in zip(field(field(meta, 4)[2][1][0], 1)[2][1], bounds):
+            stats = field(field(chunk, 3)[2], 12)[2]
+            stats[:] = [[3, T_I64, 0], [5, T_BINARY, hi], [6, T_BINARY, lo]]
+            co, cl = field(chunk, 6)[2], field(chunk, 7)[2]
+            ci = Reader(bytes(body[co:co + cl])).value(T_STRUCT)
+            assert len(field(ci, 2)[2][1]) == 1
+            field(ci, 2)[2] = (T_BINARY, [lo])
+            field(ci, 3)[2] = (T_BINARY, [hi])
+            field(ci, 5)[2] = (T_I64, [0])
+            encoded = write_value(T_STRUCT, ci)
+            field(chunk, 6)[2], field(chunk, 7)[2] = len(body), len(encoded)
+            body += encoded
+
+    rewrite_footer(out, edit)
+    assert pq.read_table(out).equals(table)
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 

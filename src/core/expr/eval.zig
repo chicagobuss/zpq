@@ -55,6 +55,134 @@ pub const Error = error{
 const Batch = filter_eval.Batch;
 const ColumnT = filter_eval.ColumnT;
 
+/// Batch-local DAG for fault-free DOUBLE arithmetic. Checked integer/DECIMAL operations, CASE and functions keep
+/// their established expression-major error precedence in the general evaluator. No reassociation occurs here.
+pub const FloatPlan = struct {
+    nodes: std.ArrayList(Node) = .empty,
+
+    const Node = struct { expr: ast.Expr, children: ?[2]usize };
+
+    pub fn liveBytesPerRow(self: *const FloatPlan) usize {
+        // Group IDs and selection included. A nullable result needs levels; FLOAT inputs need both their narrow
+        // source and widened lane. Counting borrowed inputs too leaves headroom for the whole expression tree.
+        var bytes: usize = 8;
+        for (self.nodes.items) |node| bytes += switch (node.expr) {
+            .literal => 8,
+            .col_ref => |c| if (c.physical_type == .FLOAT) 16 else 12,
+            else => 12,
+        };
+        return bytes;
+    }
+
+    pub fn deinit(self: *FloatPlan, a: std.mem.Allocator) void {
+        self.nodes.deinit(a);
+    }
+
+    /// Null declines the whole fused path before any accumulator is touched. Bound expressions are compared, so
+    /// independently parsed occurrences of a common subtree share one result in each batch.
+    pub fn add(
+        self: *FloatPlan,
+        a: std.mem.Allocator,
+        batch: *const Batch,
+        lookup: []const ?usize,
+        e: ast.Expr,
+    ) std.mem.Allocator.Error!?usize {
+        for (self.nodes.items, 0..) |node, i| if (node.expr.eql(e)) return i;
+        const children: ?[2]usize = switch (e) {
+            .literal => |l| if (l == .str) return null else null,
+            .col_ref => |c| blk: {
+                if (c.expr_type != .f64) return null;
+                const p = lookup[c.col_idx] orelse return null;
+                const col = batch.cols[p];
+                if (col.nullInfo().max_rep != 0 or col.codes() != null or col.levelsOnly()) return null;
+                if (col != .f64 and col != .f32) return null;
+                break :blk null;
+            },
+            .binop => |b| blk: {
+                if (b.result_type != .f64 or b.op == .concat) return null;
+                const left = (try self.add(a, batch, lookup, b.left.*)) orelse return null;
+                const right = (try self.add(a, batch, lookup, b.right.*)) orelse return null;
+                break :blk .{ left, right };
+            },
+            .call, .case_ => return null,
+        };
+        try self.nodes.append(a, .{ .expr = e, .children = children });
+        return self.nodes.items.len - 1;
+    }
+
+    /// Retaining all DAG results bounds scratch by nodes x rows. Inputs are borrowed; literals and arithmetic use
+    /// the same conversion and kernels as evalAs/evalBinOp, including NULL propagation and IEEE division.
+    pub fn evaluate(
+        self: *const FloatPlan,
+        a: std.mem.Allocator,
+        batch: *const Batch,
+        lookup: []const ?usize,
+    ) Error![]Batch.Column {
+        const values = try a.alloc(Batch.Column, self.nodes.items.len);
+        for (self.nodes.items, values) |node, *out| {
+            if (node.children) |ch| {
+                const l = values[ch[0]];
+                const r = values[ch[1]];
+                out.* = if (columnHasNullRows(l) or columnHasNullRows(r))
+                    try evalGroupKeyNumericBinOp(f64, a, node.expr.binop.op, l, r, .{ .sel = batch.sel })
+                else
+                    .{ .f64 = .{ .values = try applyKernel(
+                        f64,
+                        a,
+                        node.expr.binop.op,
+                        l.f64.values,
+                        r.f64.values,
+                        .{ .sel = batch.sel },
+                    ) } };
+            } else if (node.expr == .literal) {
+                const v: f64 = switch (node.expr.literal) {
+                    .i64 => |x| @floatFromInt(x),
+                    .f64 => |x| x,
+                    .dec => |x| x.f,
+                    .str => unreachable,
+                };
+                out.* = try literalAsColumn(a, .{ .f64 = v }, batch.num_rows);
+            } else {
+                out.* = try evalAs(a, batch, lookup, node.expr, .f64);
+            }
+        }
+        return values;
+    }
+};
+
+/// Test overrides are local to the caller; the environment knob exercises every path on every host.
+pub threadlocal var forced_batch_rows: ?usize = null;
+
+pub fn floatBatchRows(live_bytes_per_row: usize, fixed_bytes: usize) usize {
+    const forced = forced_batch_rows orelse if (std.c.getenv("ZPQ_EXPR_BATCH_ROWS")) |raw|
+        std.fmt.parseInt(usize, std.mem.span(raw), 10) catch null
+    else
+        null;
+    if (forced) |rows| return if (rows == 0) 0 else @max(64, std.mem.alignBackward(usize, rows, 64));
+    const budget = @import("../hw.zig").l2BytesPerWorker();
+    // Keep a quarter of each sibling's L2 share for the decoder, aggregate state and unrelated hot data.
+    const available = (budget - budget / 4) -| fixed_bytes;
+    return std.mem.alignBackward(usize, available / @max(1, live_bytes_per_row), 64);
+}
+
+test "float batch budgets follow L2 sharing and forced paths independently of the host" {
+    const hw = @import("../hw.zig");
+    defer hw.test_cpu = null;
+    defer forced_batch_rows = null;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 } };
+    try std.testing.expectEqual(@as(usize, 3840), floatBatchRows(100, 4096));
+    hw.test_cpu.?.l2.bytes = 1280 << 10;
+    try std.testing.expectEqual(@as(usize, 4864), floatBatchRows(100, 4096));
+    hw.test_cpu.?.l2.bytes = 0;
+    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096));
+    for ([_]usize{ 2048, 4096, 8192, 16384 }) |rows| {
+        forced_batch_rows = rows;
+        try std.testing.expectEqual(rows, floatBatchRows(100, 4096));
+    }
+    forced_batch_rows = 0;
+    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096));
+}
+
 /// Evaluate `e` against `batch`, returning a freshly-allocated column
 /// (owned by `arena`) of length `batch.num_rows`. `column_lookup` maps
 /// AST col_ref indices to positions in `batch.cols`, mirroring

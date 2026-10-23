@@ -595,6 +595,7 @@ pub fn groupedCoded(
         if (table.countOnly()) return true;
         break :blk &sunk;
     } else sel;
+    if (try foldFloatBatches(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     const agg_len = calls.len;
     for (calls, 0..) |call, ai| {
         const accs = table.accumulators.items;
@@ -705,6 +706,184 @@ fn seedable(ra: std.mem.Allocator, gid_of: []const u32) !bool {
     return true;
 }
 
+/// Expressions share their DAG only under the same selection. Fold each group in its original row order, carrying
+/// its sum between batches; the canonical group fold is sequential, unlike the scalar fold's 64-row reductions.
+fn foldFloatBatches(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    table: *agg.GroupTable,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) !bool {
+    if (batch.num_rows == 0) return false;
+    var has_expression = false;
+    for (calls) |call| if (call.arg) |arg| {
+        has_expression = has_expression or arg != .col_ref;
+    };
+    if (!has_expression) return false;
+    // Keep admission and DAG storage independent of the row group's long-lived decode allocations.
+    var planning = std.heap.ArenaAllocator.init(ra);
+    defer planning.deinit();
+    const pa = planning.allocator();
+    var plan: expr_eval.FloatPlan = .{};
+    const roots = try pa.alloc(?usize, calls.len);
+    @memset(roots, null);
+    var computed = false;
+    for (calls, roots) |call, *root| {
+        if (call.where != null or call.func == .count_distinct or call.result == .bytes) return false;
+        if (call.arg) |arg| {
+            if (arg == .col_ref) {
+                const c = arg.col_ref;
+                const p = lookup[c.col_idx] orelse return false;
+                if (c.unsigned_64 or c.expr_type == .dec or batch.cols[p].nullInfo().max_rep != 0) return false;
+            } else {
+                if (arg.typeOf() != .f64) return false;
+                root.* = (try plan.add(pa, batch, lookup, arg)) orelse return false;
+                computed = true;
+            }
+        }
+    }
+    if (!computed) return false;
+    const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) + space *| 32;
+    const batch_rows = expr_eval.floatBatchRows(plan.liveBytesPerRow(), fixed);
+    if (batch_rows == 0) return false;
+    // Bare columns already have dictionary/histogram folds: leave those full-column shortcuts in place.
+    for (calls, roots, 0..) |call, root, ai| if (root == null) {
+        try foldGroupedCall(
+            ra,
+            gpa,
+            table.accumulators.items,
+            gid_of,
+            comp,
+            space,
+            ai,
+            calls.len,
+            call,
+            batch,
+            lookup,
+            outer,
+            table,
+        );
+    };
+    const cols = try pa.alloc(Column, batch.cols.len);
+    var scratch = @import("../row_group_arena.zig").RowGroupArena.init(ra);
+    defer scratch.deinit();
+    var off: usize = 0;
+    while (off < batch.num_rows) {
+        scratch.nextRowGroup();
+        const a = scratch.allocator();
+        const n = @min(batch_rows, batch.num_rows - off);
+        for (batch.cols, cols) |col, *out| out.* = col.sliceRows(off, n);
+        const sel: Sel = .{ .allocator = ra, .len = n, .mask = outer.mask[off / 64 ..][0 .. (n + 63) / 64] };
+        const win: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .sel = &sel };
+        const values = try plan.evaluate(a, &win, lookup);
+        for (calls, roots, 0..) |call, root, ai| if (root) |r| {
+            try foldGroupedValue(
+                a,
+                gpa,
+                table.accumulators.items,
+                gid_of,
+                comp[off..][0..n],
+                space,
+                ai,
+                calls.len,
+                call,
+                &win,
+                lookup,
+                &sel,
+                table,
+                values[r],
+            );
+        };
+        off += n;
+    }
+    return true;
+}
+
+test "float batches preserve grouped sum bits, NULLs, selections, CSE and allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testFloatBatches, .{});
+}
+
+fn testFloatBatches(a: std.mem.Allocator) !void {
+    const old = expr_eval.forced_batch_rows;
+    expr_eval.forced_batch_rows = 4096;
+    defer expr_eval.forced_batch_rows = old;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n = 32769;
+    const vals = try ra.alloc(f64, n);
+    const defs = try ra.alloc(u32, n);
+    const comp = try ra.alloc(u32, n);
+    for (vals, defs, comp, 0..) |*v, *d, *c, r| {
+        v.* = switch (r % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
+        };
+        d.* = @intFromBool(r % 19 != 0);
+        c.* = @intCast(r % 4);
+    }
+    const cols = [_]Column{.{ .f64 = .{ .values = vals, .def_levels = defs, .max_def = 1, .has_nulls = true } }};
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{0};
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    var sum: expr_ast.Expr = .{ .binop = .{ .op = .add, .left = &x, .right = &one, .result_type = .f64, .depth = 2 } };
+    // A second occurrence has its own AST address but shares its computed result.
+    var same_sum = sum;
+    const product: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &same_sum,
+        .right = &sum,
+        .result_type = .f64,
+        .depth = 3,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = sum, .result = .f64, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = product, .result = .avg_f64, .where = null, .alias = "a" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    var plan: expr_eval.FloatPlan = .{};
+    _ = try plan.add(ra, &batch, &lookup, sum);
+    _ = try plan.add(ra, &batch, &lookup, product);
+    try std.testing.expectEqual(@as(usize, 4), plan.nodes.items.len);
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 7 == 0 or r / 64 == 80) sel.set(r, false);
+    var want = agg.GroupTable.init(a, 1 << 24);
+    defer want.deinit();
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    const keys = [_][]const u8{ "a", "b", "c", "d" };
+    for (keys) |key| {
+        _ = try want.getOrInsert(key, &calls, 0);
+        _ = try got.getOrInsert(key, &calls, 0);
+    }
+    const gids = [_]u32{ 0, 1, 2, 3 };
+    for (calls, 0..) |call, ai| try foldGroupedCall(
+        ra,
+        a,
+        want.accumulators.items,
+        &gids,
+        comp,
+        4,
+        ai,
+        calls.len,
+        call,
+        &batch,
+        &lookup,
+        &sel,
+        &want,
+    );
+    try std.testing.expect(try foldFloatBatches(ra, a, &got, &gids, comp, 4, &calls, &batch, &lookup, &sel));
+    try std.testing.expectEqualDeep(want.accumulators.items, got.accumulators.items);
+}
+
 pub fn foldGroupedCall(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -719,6 +898,40 @@ pub fn foldGroupedCall(
     lookup: []const ?usize,
     outer: *const Sel,
     maybe_table: anytype,
+) !void {
+    return foldGroupedValue(
+        ra,
+        gpa,
+        accs,
+        gid_of,
+        comp,
+        space,
+        ai,
+        agg_len,
+        call,
+        batch,
+        lookup,
+        outer,
+        maybe_table,
+        null,
+    );
+}
+
+fn foldGroupedValue(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    ai: usize,
+    agg_len: usize,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    maybe_table: anytype,
+    prepared: ?Column,
 ) !void {
     // Dense lanes pass literal null, specializing away record access on the established typed-array path.
     const table: ?*agg.GroupTable = maybe_table;
@@ -745,9 +958,10 @@ pub fn foldGroupedCall(
     };
     // A computed argument that may be NULL (`coalesce(a, b)`, `strlen(s)`) narrows the selection by its NULLs, as a
     // bare column's do, so it is evaluated before any fold reads the selection: counted, a NULL was a row.
-    var computed: ?Column = null;
-    if (call.arg) |arg| if (arg != .col_ref and arg.mayBeNull()) {
-        const v = try expr_eval.evalExpr(ra, &batch.restrictedTo(if (own) |*s| s else outer), lookup, arg);
+    var computed: ?Column = prepared;
+    if (call.arg) |arg| if (arg != .col_ref and (prepared != null or arg.mayBeNull())) {
+        const restricted = batch.restrictedTo(if (own) |*s| s else outer);
+        const v = prepared orelse try expr_eval.evalExpr(ra, &restricted, lookup, arg);
         if (switch (v) {
             inline else => |c| c.has_nulls,
         }) {

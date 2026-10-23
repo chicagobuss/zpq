@@ -364,6 +364,33 @@ pub const Batch = struct {
         /// Produced by expression evaluation and aggregate output, never by decode.
         i128: ColumnT(i128),
 
+        /// A borrowed flat row window; dictionaries remain shared while row-indexed buffers move together.
+        pub fn sliceRows(col: Column, lo: usize, n: usize) Column {
+            return switch (col) {
+                inline else => |c, tag| blk: {
+                    var o = c;
+                    if (c.codes) |cs| if (cs.len >= lo + n) {
+                        o.codes = cs[lo..][0..n];
+                    };
+                    if (c.values.len >= lo + n) o.values = c.values[lo..][0..n];
+                    if (c.def_levels) |dl| if (dl.len >= lo + n) {
+                        o.def_levels = dl[lo..][0..n];
+                    };
+                    if (c.rep_levels) |rl| if (rl.len >= lo + n) {
+                        o.rep_levels = rl[lo..][0..n];
+                    };
+                    if (c.unscaled) |u| o.unscaled = switch (u) {
+                        inline else => |v, utag| if (v.len >= lo + n)
+                            @unionInit(Exact, @tagName(utag), v[lo..][0..n])
+                        else
+                            u,
+                    };
+                    if (o.levels_only_rows != 0) o.levels_only_rows = n;
+                    break :blk @unionInit(Column, @tagName(tag), o);
+                },
+            };
+        }
+
         /// Null mask + nesting, independent of the value type — used by
         /// IS NULL / IS NOT NULL, which never touch values.
         pub fn levelsOnly(self: Column) bool {

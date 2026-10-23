@@ -28,6 +28,7 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_HW_L1D_BYTES` | Replace discovered L1 data sizes, in bytes |
 | `ZPQ_HW_L2_BYTES` | Replace discovered L2 sizes, in bytes |
 | `ZPQ_HW_L3_BYTES` | Replace discovered L3 sizes, in bytes |
+| `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` selects the legacy full-row-group evaluator |
 
 Sharing sets remain real under size overrides. Zero means unknown, letting a
 caller test its conservative fallback. Invalid values leave discovery intact.
@@ -40,6 +41,15 @@ must never reach any choice that changes bytes or float bits.
 `python tools/hw_execution_check.py CANDIDATE [BASE]` checks q1-like scalar
 and grouped float answers byte for byte under 256K, 1M and 4M L2 overrides
 at j1/3/8/16. It uses an isolated temporary fixture and requires pyarrow.
+
+Expression DAGs count every live input, widened lane, intermediate, null layout,
+selection and group ID. Their row budget uses three quarters of each SMT
+sibling's L2 share after fixed scratch. Batches align to 64 rows; a positive
+forced size rounds down to that alignment, with a minimum of 64. The knob
+bypasses cache admission for cross-host experiments. Checked integer/DECIMAL
+trees retain the general evaluator's error precedence. Grouped DOUBLE folds
+carry each group's running sum in row order across batches; scalar sums keep
+their canonical 64-row reduction and row-group merge boundaries.
 
 The x86 decoding follows the deterministic cache leaves (4 / 0x8000001d), as
 documented by the [Linux cache discovery implementation](https://github.com/torvalds/linux/blob/master/arch/x86/kernel/cpu/cacheinfo.c).

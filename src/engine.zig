@@ -678,6 +678,7 @@ fn executeAggregateOver(
         .result_order = cut_args.result_order,
         .typed_answer = args.typed_answer and args.output != null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
+        .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         .ledger = &ledger,
@@ -845,6 +846,8 @@ fn executeAggregateOver(
                 fd,
                 args.profiler,
             )
+        else if (r.output.byte_stream) |stream|
+            try writeByteStream(arena, out_path, st.group_col_types.?, stream, codec, zstd, encode, fd, args.profiler)
         else if (r.output.typed) |typed|
             try writeTypedParquet(arena, out_path, names.?, st.group_col_types.?, typed, codec, zstd, encode, fd)
         else if (r.output.group_rows) |rows|
@@ -855,6 +858,12 @@ fn executeAggregateOver(
             const rows = stream.state.group_count;
             stream.state.deinit();
             r.output.integer_stream = null;
+            r.output.typed = .{ .rows = rows, .columns = &.{} };
+        }
+        if (r.output.byte_stream) |stream| {
+            const rows = stream.state.group_count;
+            stream.state.deinit();
+            r.output.byte_stream = null;
             r.output.typed = .{ .rows = rows, .columns = &.{} };
         }
         const t_footer_end = nowMonoNs();
@@ -885,7 +894,7 @@ fn executeAggregateOver(
 /// The `AnswerType` of each answer column: a DATE/TIME/TIMESTAMP from the column its values pass through, and
 /// whether it is an avg_state pair.
 fn answerTypes(gpa: std.mem.Allocator, out: scan.AggOutput, state: scan.ScanState) ![]AnswerType {
-    if (out.typed != null or out.integer_stream != null) return &.{};
+    if (out.typed != null or out.integer_stream != null or out.byte_stream != null) return &.{};
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
     const types = try gpa.alloc(AnswerType, n);
     for (types, 0..) |*ty, ci| {
@@ -919,7 +928,7 @@ fn answerTextKinds(
     check: bool,
     diag: ?*Diag,
 ) ![]TextKind {
-    if (out.typed != null or out.integer_stream != null) return &.{};
+    if (out.typed != null or out.integer_stream != null or out.byte_stream != null) return &.{};
     const grouped = out.group_cols != null;
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
     const kinds = try gpa.alloc(TextKind, n);
@@ -5771,6 +5780,51 @@ fn writeIntegerStream(
         try local_fs.closeChecked(fd);
     }
     return written;
+}
+
+fn writeByteStream(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    types: []const scan.GroupColType,
+    stream: scan.ByteStream,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+    profiler: ?*profile.Profiler,
+) !u64 {
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    var file = try consumer.AggregateFile.init(arena, .{ .ctx = &fd_sink, .write_fn = FdSink.writeFn });
+    defer file.deinit();
+    try file.reserveByteWorkspace(encode);
+    var window = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer window.deinit();
+    const total = stream.state.group_count;
+    var lo: usize = 0;
+    while (lo < total or (lo == 0 and total == 0)) {
+        const hi = @min(total, lo + 4 * consumer.answer_rg_rows);
+        const columns_span = profile.Span.begin(profile.threadOf(profiler, .main));
+        const answer = try stream.window(window.allocator(), lo, hi, encode.workers);
+        columns_span.end(.byte_columns, profile.args(.{}));
+        for (types, answer.columns) |ty, *col| {
+            if (ty.source) |src| col.* = try retypeOutputCol(arena, col.*, src);
+        }
+        try file.append(answer.columns, hi - lo, codec, zstd, encode);
+        lo = hi;
+        if (lo == total) {
+            const written = try file.finish(answer.columns);
+            if (fd_open) {
+                fd_open = false;
+                try local_fs.closeChecked(fd);
+            }
+            return written;
+        }
+        _ = window.reset(.retain_capacity);
+    }
+    unreachable;
 }
 
 fn typedColumn(comptime S: type, name: []const u8, nullable: bool, l: anytype, parquet_type: schema.Type) expr_agg.OutputCol {

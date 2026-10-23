@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const integer_groups = @import("integer_groups.zig");
+const byte_groups = @import("byte_groups.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 
@@ -2629,6 +2630,7 @@ pub const AggregateFile = struct {
     cached_alone: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     cached_ledger: ?*expr_agg.SharedBudget = null,
     cached_charge: usize = 0,
+    cached_unit_charge: usize = 0,
 
     pub fn init(arena: std.mem.Allocator, sink: streaming.Sink) !AggregateFile {
         try sink.write("PAR1");
@@ -2644,14 +2646,24 @@ pub const AggregateFile = struct {
     /// Reuse one bounded wave for four row groups of three integer columns. Its full scratch upper bound stays
     /// charged until deinit, including retained pages between windows. A refused reservation keeps the usual waves.
     pub fn reserveIntegerWorkspace(f: *AggregateFile, encode: AggEncode) !void {
+        return f.reserveWorkspace(encode, answer_rg_rows * 12 * 3);
+    }
+
+    /// A short-key window owns at most 16 payload bytes, one slice and one definition level per key row.
+    pub fn reserveByteWorkspace(f: *AggregateFile, encode: AggEncode) !void {
+        return f.reserveWorkspace(encode, answer_rg_rows * 36 * 3);
+    }
+
+    fn reserveWorkspace(f: *AggregateFile, encode: AggEncode, unit_charge: usize) !void {
         std.debug.assert(f.cached_width == 0 and f.cached_charge == 0);
-        const admitted = encode.budget / (answer_rg_rows * 12 * 3);
+        const admitted = encode.budget / unit_charge;
         if (admitted == 0) return;
         const width = @max(1, @min(@min(encode.workers, 12), admitted));
-        const charge = width * answer_rg_rows * 12 * 3;
+        const charge = width * unit_charge;
         if (encode.ledger) |l| _ = l.drawExact(charge) orelse return;
         f.cached_ledger = encode.ledger;
         f.cached_charge = charge;
+        f.cached_unit_charge = unit_charge;
         if (width > 1) f.cached_wave = try AggColumnWave.init(f.arena, width);
         f.cached_width = width;
     }
@@ -2718,8 +2730,7 @@ fn appendAggregateRows(
     if (file.cached_width != 0) {
         std.debug.assert(width <= file.cached_width);
         for (units) |unit| {
-            std.debug.assert(unit.col == .i64);
-            std.debug.assert(aggEncodeCharge(unit) <= answer_rg_rows * 12 * 3);
+            std.debug.assert(aggEncodeCharge(unit) <= file.cached_unit_charge);
         }
     }
     var wave: ?AggColumnWave = file.cached_wave orelse
@@ -2911,6 +2922,24 @@ pub const AggRowGroup = struct {
     preserve: ?[]const bool = null,
 };
 
+/// The owned-record layouts share worker startup and decoded-batch routing.
+pub const RecordSink = union(enum) {
+    integer: *integer_groups.Local,
+    bytes: *byte_groups.Local,
+
+    pub fn start(s: RecordSink, ordinal_base: u32) void {
+        switch (s) {
+            inline else => |local| local.ordinal_base = ordinal_base,
+        }
+    }
+
+    fn batch(s: RecordSink, view: filter_eval.Batch, lookup: []const ?usize, offset: usize) !void {
+        switch (s) {
+            inline else => |local| try local.batch(view, lookup, offset),
+        }
+    }
+};
+
 /// What `scanRGForAgg` folds a row group's surviving rows into. The caller owns the state, which persists across
 /// row groups of one query.
 pub const AggTarget = union(enum) {
@@ -2929,7 +2958,7 @@ pub const AggTarget = union(enum) {
         /// A retained key domain's lanes: a row group whose dictionary the domain translated folds there, by global
         /// id, instead of into `table`.
         dense: ?*agg_dense.Lanes = null,
-        records: ?*integer_groups.Local = null,
+        records: ?*const RecordSink = null,
     },
 
     fn calls(self: AggTarget) []const expr_agg.AggCall {

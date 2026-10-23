@@ -51,6 +51,44 @@ test "a proven unique integer column skips only a declined dictionary attempt" {
     };
 }
 const schema = @import("../schema.zig");
+test "a proven unique short byte column skips only a declined dictionary attempt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 10, 64, 65, 5000 }) |n| for ([_]bool{ false, true }) |nulls| {
+        const values = try a.alloc([]const u8, n);
+        const defs = try a.alloc(u32, n);
+        for (values, defs, 0..) |*v, *d, i| {
+            v.* = try std.fmt.allocPrint(a, "key-{d}", .{i});
+            d.* = @intFromBool(i % 13 != 0);
+        }
+        const elem: schema.SchemaElement = .{
+            .name = "k",
+            .type = .BYTE_ARRAY,
+            .repetition_type = if (nulls) .OPTIONAL else .REQUIRED,
+            .type_length = null,
+            .num_children = 0,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+        const input: ColumnInput = .{
+            .values = .{ .string = .{
+                .values = values,
+                .def_levels = if (nulls) defs else null,
+                .max_def = @intFromBool(nulls),
+                .has_nulls = nulls,
+            } },
+            .schema_elem = &elem,
+            .path_in_schema = &.{"k"},
+        };
+        const expected = try encodeColumn(a, input);
+        var skipped = input;
+        skipped.distinct = true;
+        const got = try encodeColumn(a, skipped);
+        try std.testing.expectEqualSlices(u8, expected.bytes, got.bytes);
+    };
+}
 const thrift = @import("../thrift.zig");
 const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");

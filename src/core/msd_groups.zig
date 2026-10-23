@@ -191,7 +191,7 @@ pub const Local = struct {
         for (0..view.num_rows) |i| {
             const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
             const key: []const u8 = if (kn) "" else if (k.codes) |codes| k.dict[codes[i]] else k.values[i];
-            if (!kn and !l.owner.?.contains(key)) return error.UnexpectedPage;
+            if (!kn and !l.owner.?.contains(key)) return error.RetainedOwnershipViolation;
             const fv: ?i32 = switch (f) {
                 .i64 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def) null else @intCast(if (c.codes) |codes| c.dict[codes[i]] else c.values[i]),
                 .i32 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def) null else if (c.codes) |codes| c.dict[codes[i]] else c.values[i],
@@ -690,6 +690,28 @@ test "retained grouping prepays output copies and declines failed allocation bef
     try std.testing.expect((try State.init(failure.allocator(), &budget, 0, 1, 0, 1, 10, &.{4096})) == null);
     try std.testing.expect(failure.has_induced_failure);
     try std.testing.expectEqual(failure.allocated_bytes, failure.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "retained grouping rejects a key from another owner as an internal failure" {
+    var budget: memory.SharedBudget = .{ .limit = 512 << 20 };
+    {
+        const s = (try State.init(std.testing.allocator, &budget, 1, 1, 0, 1, 1, &.{ 8, 8 })).?;
+        defer s.deinit();
+        const key = try s.pages.chunks[1].take(1);
+        key[0] = 'a';
+        const cols = [_]eval.Batch.Column{
+            .{ .string = .{ .values = &.{key} } },
+            .{ .i32 = .{ .values = &.{0} } },
+        };
+        s.locals[0].start(0, 0);
+        try std.testing.expectError(error.RetainedOwnershipViolation, s.locals[0].batch(
+            .{ .cols = &cols, .num_rows = 1 },
+            &.{ 0, 1 },
+            0,
+        ));
+        try std.testing.expectEqual(@as(u32, 0), s.locals[0].histogram[0]);
+    }
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 

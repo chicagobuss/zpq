@@ -31,7 +31,8 @@ the maximum of those phase credits. Output never requests another parent draw af
 Decoder workers draw from a child ledger funded by that reservation. MSD makes no incremental parent draw during
 consumption; reader-window draws remain the established reader's separate behavior. A refused initial reservation
 or failed retained allocation declines before rows are consumed. A decoder-ledger refusal, allocation failure after
-admission, or unsupported retained encoding releases owners, abandons the reader, and retries the established path
+admission, unsupported retained encoding, or an internal retained-ownership violation releases owners, abandons the
+reader, and retries the established path
 from its original mapping. Admission requires rescannability for this retry; it never reuses released window bytes.
 The ordinary whole-column-to-sliced decode adaptation can rewind its retained cursor only before emitting records.
 It preserves column decode precedence and never rereads a released row group.

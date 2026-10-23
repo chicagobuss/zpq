@@ -3910,7 +3910,8 @@ fn prepareAggregateWithMetas(
         if (msd_args.start_reads) |*starter| starter.planned = null;
     }
     if (!explain) if (inlineMsdAnswer(gpa, arena, msd_args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, false) catch |e| switch (e) {
-        error.OutOfMemory, error.RetainedEncodingUnsupported => return error.ExceededMemoryBudget,
+        error.OutOfMemory, error.RetainedEncodingUnsupported, error.RetainedOwnershipViolation =>
+            return error.ExceededMemoryBudget,
         else => return e,
     }) |result| return result;
     plan_inputs.ndv_stat = ndv_stat;
@@ -16262,6 +16263,7 @@ test "worker refusal races replay an earlier corrupt row group in either complet
 }
 
 test "retained MSD composite count matches ordered rows across workers, encodings and budgets" {
+    try testing.expect(!consumer.isDecodeError(error.RetainedOwnershipViolation));
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

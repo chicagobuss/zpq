@@ -909,6 +909,8 @@ pub const PageEncodingStats = struct {
 };
 
 pub const ColumnMetaData = struct {
+    /// Runtime source-writer policy. Copy/recompression preserves it; newly encoded columns start trusted.
+    writer_stats: @import("parquet/writer_statistics.zig").Policy = .trust,
     type: Type,
     encodings: EncodingList,
     path_in_schema: StringList,
@@ -1555,6 +1557,19 @@ pub const FileMetaData = struct {
                     try reader.skip(field.type);
                 },
                 else => try reader.skip(field.type),
+            }
+        }
+        // Modern files need no provenance walk. Older/unknown versions of known writers classify each chunk
+        // through one leaf walk, before the lookup index exists (never a schema walk per chunk on wide files).
+        const writers = @import("parquet/writer_statistics.zig");
+        if (writers.policy(meta.created_by, .BYTE_ARRAY, null) != .trust) {
+            var leaves = LeafIterator.init(meta.schema.items);
+            while (leaves.next()) |leaf| {
+                for (meta.row_groups.items) |*rg| {
+                    if (leaf.index >= rg.columns.items.len) continue;
+                    if (rg.columns.items[leaf.index].meta_data) |*cm|
+                        cm.writer_stats = writers.policy(meta.created_by, cm.type, leaf.element.*);
+                }
             }
         }
         return meta;

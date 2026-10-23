@@ -1,4 +1,4 @@
-//! Known writer defects only. Unknown/malformed created_by is treated as modern, never as a decode error.
+//! Known writer defects only. Unknown applications are modern; malformed known versions are 0.0.0.
 //! This policy can remove statistics, including counts, but cannot make otherwise unreadable bounds usable.
 //! Sources and compatibility choices: docs/writer-statistics.md.
 
@@ -38,8 +38,35 @@ const Version = struct {
     }
 };
 
-/// Arrow's signed-order/equal-extrema guard, plus parquet-mr's binary-corruption/CDH rule. A refusal applies to
-/// the entire statistics record, not only its extrema. --trust-stats cannot override a known writer defect.
+/// Immutable per-column policy retained through copy/recompression, where source created_by may no longer be
+/// available. It is runtime provenance only, never written to a footer. Unknown applications remain trusted.
+pub const Policy = enum {
+    trust,
+    equal_only,
+    absent,
+
+    pub fn accepts(p: Policy, min: ?[]const u8, max: ?[]const u8) bool {
+        return switch (p) {
+            .trust => true,
+            .absent => false,
+            .equal_only => min != null and max != null and std.mem.eql(u8, min.?, max.?),
+        };
+    }
+};
+
+pub fn policy(created_by: ?[]const u8, physical: schema.Type, elem: ?schema.SchemaElement) Policy {
+    const writer = parse(created_by) orelse return .trust;
+    if (writer.app == .mr and (physical == .BYTE_ARRAY or physical == .FIXED_LEN_BYTE_ARRAY)) {
+        const binary_fixed: Version = .{ .number = .{ 1, 8, 0 } };
+        // Conservative like Arrow: CDH's backport banner does not re-enable pre-1.8 binary statistics.
+        if (writer.version.order(binary_fixed) == .lt) return .absent;
+    }
+    const fixed: [3]u31 = if (writer.app == .cpp) .{ 1, 3, 0 } else .{ 1, 10, 0 };
+    if (writer.version.numericOrder(fixed) == .lt and !signedOrder(physical, elem)) return .equal_only;
+    return .trust;
+}
+
+/// A refusal applies to the entire record, not only its extrema. --trust-stats cannot override a writer defect.
 pub fn usable(
     created_by: ?[]const u8,
     physical: schema.Type,
@@ -47,18 +74,7 @@ pub fn usable(
     min: ?[]const u8,
     max: ?[]const u8,
 ) bool {
-    const writer = parse(created_by) orelse return true;
-    const fixed: [3]u31 = if (writer.app == .cpp) .{ 1, 3, 0 } else .{ 1, 10, 0 };
-    if (writer.version.numericOrder(fixed) == .lt and !signedOrder(physical, elem)) {
-        const equal = min != null and max != null and std.mem.eql(u8, min.?, max.?);
-        if (!equal) return false;
-    }
-    if (writer.app != .mr or (physical != .BYTE_ARRAY and physical != .FIXED_LEN_BYTE_ARRAY)) return true;
-    const binary_fixed: Version = .{ .number = .{ 1, 8, 0 } };
-    if (writer.version.order(binary_fixed) != .lt) return true;
-    const cdh_start: Version = .{ .number = .{ 1, 5, 0 }, .pre = "cdh5.5.0" };
-    const cdh_end: Version = .{ .number = .{ 1, 5, 0 } };
-    return writer.version.order(cdh_start) != .lt and writer.version.order(cdh_end) == .lt;
+    return policy(created_by, physical, elem).accepts(min, max);
 }
 
 fn signedOrder(physical: schema.Type, elem: ?schema.SchemaElement) bool {
@@ -91,7 +107,7 @@ fn signedOrder(physical: schema.Type, elem: ?schema.SchemaElement) bool {
 
 /// Allocation-free, bounded by created_by length. Recognize exact application names, whitespace, optional build
 /// wrappers, numeric Arrow versions (missing minor/patch = 0) and parquet-mr's rc/prerelease/build suffixes.
-/// Parse all of a known version before applying rules: a malformed prefix never becomes an old partial version.
+/// Known applications retain a 0.0.0 version unless parsing succeeds completely; unknown applications stay modern.
 fn parse(created_by: ?[]const u8) ?Writer {
     const text = std.mem.trim(u8, created_by orelse return null, spaces);
     var words = std.mem.tokenizeAny(u8, text, spaces);
@@ -101,16 +117,17 @@ fn parse(created_by: ?[]const u8) ?Writer {
         if (std.mem.eql(u8, app, "parquet-cpp")) break :kind .cpp;
         return null;
     };
-    if (!std.mem.eql(u8, words.next() orelse return null, "version")) return null;
-    const token = words.next() orelse return null;
-    const version = parseVersion(token) orelse return null;
+    const unknown: Writer = .{ .app = kind, .version = .{} };
+    if (!std.mem.eql(u8, words.next() orelse return unknown, "version")) return unknown;
+    const token = words.next() orelse return unknown;
+    const version = parseVersion(token) orelse return unknown;
     const rest = std.mem.trim(u8, words.rest(), spaces);
     if (rest.len != 0) {
-        if (rest.len < 2 or rest[0] != '(' or rest[rest.len - 1] != ')') return null;
+        if (rest.len < 2 or rest[0] != '(' or rest[rest.len - 1] != ')') return unknown;
         const inner = std.mem.trim(u8, rest[1 .. rest.len - 1], spaces);
         var build = std.mem.tokenizeAny(u8, inner, spaces);
-        if (!std.mem.eql(u8, build.next() orelse return null, "build")) return null;
-        if (std.mem.findAny(u8, build.rest(), "()") != null) return null;
+        if (!std.mem.eql(u8, build.next() orelse return unknown, "build")) return unknown;
+        if (std.mem.findAny(u8, build.rest(), "()") != null) return unknown;
     }
     return .{ .app = kind, .version = version };
 }
@@ -165,7 +182,7 @@ fn identifiers(text: []const u8, pre: bool) bool {
 
 const testing = std.testing;
 
-test "writer statistics: numeric boundaries and equal extrema are independent of binary corruption" {
+test "writer statistics: numeric boundaries equal extrema and conservative CDH rejection" {
     const Case = struct { writer: []const u8, signed: bool = true, bytes: bool, equal_bytes: bool };
     const spaced = " \tparquet-mr \n version \x0b 1.7.0rc99-SNAPSHOT \r ( build hash ) ";
     const cases = [_]Case{
@@ -182,10 +199,10 @@ test "writer statistics: numeric boundaries and equal extrema are independent of
         .{ .writer = "parquet-mr version 1.10.0-SNAPSHOT", .bytes = true, .equal_bytes = true },
         .{ .writer = "parquet-mr version 2.0.0", .bytes = true, .equal_bytes = true },
         .{ .writer = "parquet-mr version 1.5.0-cdh5.4.999", .bytes = false, .equal_bytes = false },
-        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .bytes = false, .equal_bytes = true },
-        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0-SNAPSHOT (build hash)", .bytes = false, .equal_bytes = true },
-        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.1+build", .bytes = false, .equal_bytes = true },
-        .{ .writer = "parquet-mr version 1.5.0-cdh5.6.0", .bytes = false, .equal_bytes = true },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .bytes = false, .equal_bytes = false },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0-SNAPSHOT (build hash)", .bytes = false, .equal_bytes = false },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.1+build", .bytes = false, .equal_bytes = false },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.6.0", .bytes = false, .equal_bytes = false },
         .{ .writer = "parquet-mr version 1.5.0ab-cdh5.5.0+cd", .bytes = false, .equal_bytes = false },
         .{ .writer = "parquet-mr version 1.5.0", .bytes = false, .equal_bytes = false },
         .{ .writer = "parquet-mr version 1.5.1-cdh5.5.0", .bytes = false, .equal_bytes = false },
@@ -201,11 +218,25 @@ test "writer statistics: numeric boundaries and equal extrema are independent of
     }
 }
 
-test "writer statistics: unknown malformed and modern applications retain existing statistics" {
+test "writer statistics: unknown applications stay modern and malformed known versions are distrusted" {
     const modern = [_]?[]const u8{
         null,
         "",
         "unknown",
+        "parquet-mr-other version 1.0.0",
+        "zpq version 0.5.0",
+        "parquet-cpp-arrow version 24.0.0",
+        "Arrow version 1.0.0",
+        "DuckDB version v2.0.0",
+        "Polars",
+        "Spark version 4.0.0",
+        "parquet-mr version 1.15.2 (build spark)",
+    };
+    for (modern) |s| for ([_]schema.Type{ .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT32, .DOUBLE }) |t| {
+        try testing.expect(usable(s, t, null, "a", "b"));
+        try testing.expect(usable(s, t, null, null, null));
+    };
+    const known_malformed = [_][]const u8{
         "parquet-mr",
         "parquet-mr version",
         "parquet-mr version nope",
@@ -222,19 +253,18 @@ test "writer statistics: unknown malformed and modern applications retain existi
         "parquet-mr version 1.7.0-cdh5.5.999999999999999999999999",
         "parquet-mr version 1.7.0 (bad hash)",
         "parquet-mr version 1.7.0 (build hash) trailing",
-        "parquet-mr-other version 1.0.0",
-        "zpq version 0.5.0",
-        "parquet-cpp-arrow version 24.0.0",
-        "Arrow version 1.0.0",
-        "DuckDB version v2.0.0",
-        "Polars",
-        "Spark version 4.0.0",
-        "parquet-mr version 1.15.2 (build spark)",
     };
-    for (modern) |s| for ([_]schema.Type{ .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT32, .DOUBLE }) |t| {
-        try testing.expect(usable(s, t, null, "a", "b"));
-        try testing.expect(usable(s, t, null, null, null));
-    };
+    for (known_malformed) |by| {
+        try testing.expect(!usable(by, .BYTE_ARRAY, null, "a", "a"));
+        try testing.expect(!usable(by, .FIXED_LEN_BYTE_ARRAY, null, "a", "b"));
+        try testing.expect(usable(by, .INT32, null, "a", "b"));
+    }
+    for ([_][]const u8{ "parquet-cpp", "parquet-cpp version garbage", "parquet-cpp version 1.3.bad" }) |by| {
+        try testing.expectEqual([3]u31{ 0, 0, 0 }, parse(by).?.version.number);
+        try testing.expect(!usable(by, .BYTE_ARRAY, null, "a", "b"));
+        try testing.expect(usable(by, .BYTE_ARRAY, null, "a", "a"));
+        try testing.expect(usable(by, .INT32, null, "a", "b"));
+    }
     for ([_][]const u8{ "parquet-mr version 1", "parquet-mr version 1.7", "parquet-cpp version 1.2" }) |s|
         try testing.expect(!usable(s, .BYTE_ARRAY, null, "a", "b"));
 }

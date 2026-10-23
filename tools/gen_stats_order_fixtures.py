@@ -316,6 +316,7 @@ def main() -> None:
     write_nan()
     write_false_bounds()
     write_writer_stats()
+    write_writer_headers()
 
 
 def write_deprecated() -> None:
@@ -389,6 +390,65 @@ def write_writer_stats() -> None:
     rewrite_footer(out, edit)
     assert pq.read_table(out).equals(table)
     print(f"wrote {out} ({out.stat().st_size} bytes)")
+
+
+def write_writer_headers() -> None:
+    """Poison V1/V2 header statistics as well as footer statistics, leaving page bodies and CRCs intact."""
+    table = pa.table({
+        "s": pa.array(["a", None, "b"], type=pa.string()),
+        "d": pa.array([decimal.Decimal("1.00"), None, decimal.Decimal("2.00")], type=pa.decimal128(9, 2)),
+        "u": pa.array([1, None, 2], type=pa.uint32()),
+        "v": pa.array([10, 20, 30], type=pa.int64()),
+    })
+    bounds = [(b"z", b"z"), ((900).to_bytes(4, "big", signed=True),) * 2,
+              (struct.pack("<I", 100), struct.pack("<I", 200))]
+
+    def edit(meta, body):
+        field(meta, 6)[2] = b"parquet-mr version 1.7.0 (build synthetic)"
+        original = bytes(body)
+        body[:] = b"PAR1"
+        for rg in field(meta, 4)[2][1]:
+            raw_total = 0
+            for ci, chunk in enumerate(field(rg, 1)[2][1]):
+                cm = field(chunk, 3)[2]
+                start = min(field(cm, f)[2] for f in [9, 11] if field(cm, f) is not None)
+                end = start + field(cm, 7)[2]
+                out_start, delta, pos = len(body), 0, start
+                offsets = {f: field(cm, f)[2] for f in [9, 10, 11] if field(cm, f) is not None}
+                if ci < len(bounds):
+                    lo, hi = bounds[ci]
+                    field(cm, 12)[2] = [[3, T_I64, 0], [5, T_BINARY, hi], [6, T_BINARY, lo]]
+                while pos < end:
+                    reader = Reader(original[pos:end])
+                    header = reader.value(T_STRUCT)
+                    n = field(header, 3)[2]
+                    for fid, old in offsets.items():
+                        if pos == old:
+                            field(cm, fid)[2] = len(body)
+                    data = field(header, 5) or field(header, 8)
+                    if data is not None and ci < len(bounds):
+                        stats_id = 5 if data[0] == 5 else 8
+                        stats = field(data[2], stats_id)
+                        assert stats is not None, (ci, header)
+                        stats[2] = [[3, T_I64, 0], [5, T_BINARY, hi], [6, T_BINARY, lo]]
+                    encoded = write_value(T_STRUCT, header)
+                    body += encoded + original[pos + reader.pos:pos + reader.pos + n]
+                    delta += len(encoded) - reader.pos
+                    pos += reader.pos + n
+                assert pos == end
+                field(chunk, 2)[2] = field(cm, 9)[2]
+                field(cm, 7)[2] = len(body) - out_start
+                field(cm, 6)[2] += delta
+                raw_total += field(cm, 6)[2]
+            field(rg, 2)[2] = raw_total
+
+    for version in ["1.0", "2.0"]:
+        out = OUT_DIR / f"writer_headers_v{version[0]}.parquet"
+        pq.write_table(table, out, use_dictionary=True, compression="snappy", data_page_version=version,
+                       write_statistics=True, write_page_index=False, write_page_checksum=True)
+        rewrite_footer(out, edit)
+        assert pq.read_table(out, page_checksum_verification=True).equals(table)
+        print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

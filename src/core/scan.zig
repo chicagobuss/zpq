@@ -17227,8 +17227,8 @@ test "writer statistics: rewritten footers suppress pruning page indexes and tru
         .{ .writer = "parquet-cpp version 1.2.9", .binary = true, .unsigned = false },
         .{ .writer = "parquet-cpp version 1.3.0", .binary = true, .unsigned = true },
         .{ .writer = "parquet-mr version 1.5.0-cdh5.4.999", .binary = false, .unsigned = false },
-        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .binary = true, .unsigned = false },
-        .{ .writer = "parquet-mr version malformed", .binary = true, .unsigned = true },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .binary = false, .unsigned = false },
+        .{ .writer = "parquet-mr version malformed", .binary = false, .unsigned = false },
     };
     for (cases) |c| {
         const bytes = try rewritten(original, .{ .created_by = c.writer });

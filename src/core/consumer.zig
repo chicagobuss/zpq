@@ -57,6 +57,8 @@ const invariant = @import("invariant.zig");
 const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
 const statistics = @import("parquet/statistics.zig");
+const header_writer = @import("writer/page_header.zig");
+const WriterStatsPolicy = @import("parquet/writer_statistics.zig").Policy;
 const agg_coded = @import("expr/agg_coded.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const partagg = @import("partagg.zig");
@@ -5292,7 +5294,7 @@ fn decodeAggColumn(
 ///
 /// `kept_set != null`: per-column copy. Only chunks where
 /// `kept_set[ci] == true` are written. A `recompress` that changes any
-/// chunk's codec takes this path too, with every column kept.
+/// chunk's codec, or stripping affected page-header statistics, takes this path too, with every column kept.
 pub fn copyRG(
     out_arena: std.mem.Allocator,
     rg: *const schema.RowGroup,
@@ -5312,18 +5314,18 @@ pub fn copyRG(
     bloom_write: BloomWrite,
 ) !RGOut {
     invariant.assert(src.byte_origin == 0);
-    // A chunk that must change codec changes size, so the whole-group copy
-    // below cannot place it; take the per-chunk path for every column.
+    // Changed codecs or untrusted page-header statistics can change chunk sizes.
     var all_kept: ?[]bool = null;
-    if (kept_set == null) if (recompress) |rc| {
-        for (rg.columns.items) |chunk| {
+    if (kept_set == null) {
+        for (rg.columns.items) |*chunk| {
             const m = chunk.meta_data orelse return error.InvalidColumnOffsets;
-            if (m.codec == rc.codec) continue;
+            const changes_codec = if (recompress) |rc| m.codec != rc.codec else false;
+            if (!changes_codec and fastpath.writerPolicy(chunk, bloom_write.meta) == .trust) continue;
             all_kept = try out_arena.alloc(bool, rg.columns.items.len);
             @memset(all_kept.?, true);
             break;
         }
-    };
+    }
     const kept_eff: ?[]const bool = kept_set orelse all_kept;
 
     var out: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(out_offset.*) };
@@ -5360,6 +5362,14 @@ pub fn copyRG(
                 rg_total += written.meta_data.?.total_uncompressed_size;
                 continue;
             };
+            if (m.writer_stats != .trust) {
+                var timed: TimedCopyOut = .{ .out = &out, .timings = timings };
+                var copied = try fastpath.copyPolicyChunk(out_arena, &timed, src.bytes, src_chunk, emit_page_index);
+                try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
+                try new_cols.append(out_arena, copied);
+                rg_total += copied.meta_data.?.total_uncompressed_size;
+                continue;
+            }
             const delta = offsetDelta(out.pos(), range.start);
             try timedWrite(&out, slice, timings);
             // Carry the page index forward, written right after this chunk's data.
@@ -5484,6 +5494,19 @@ fn timedWrite(out: *streaming.SinkOut, bytes: []const u8, timings: *Timings) !vo
     profile.record(timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{bytes.len}));
 }
 
+const TimedCopyOut = struct {
+    out: *streaming.SinkOut,
+    timings: *Timings,
+
+    pub fn pos(t: *const TimedCopyOut) usize {
+        return t.out.pos();
+    }
+
+    pub fn write(t: *TimedCopyOut, bytes: []const u8) !void {
+        try timedWrite(t.out, bytes, t.timings);
+    }
+};
+
 /// A copied chunk's metadata, offsets moved by `delta`, with its page index carried into `out` when the output
 /// keeps one.
 fn carryChunk(
@@ -5541,7 +5564,7 @@ pub const RecompressedChunk = struct {
 /// compressed), and a v2 page stored uncompressed is kept as is. Each
 /// header is re-emitted field by field with the new compressed size and
 /// without its CRC, which covered the old bytes; everything else in it,
-/// page statistics included, is carried over unchanged.
+/// valid page statistics included, is carried over unchanged. Known writer defects remove affected records.
 ///
 /// The result lives on `arena`; `scratch` holds the decompressed page, one
 /// buffer reused across pages and freed before returning.
@@ -5553,6 +5576,7 @@ fn recompressChunk(
     to: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
     limit: usize,
+    writer_policy: WriterStatsPolicy,
 ) !RecompressedChunk {
     var out: std.ArrayList(u8) = .empty;
     var pages: std.ArrayList(PageMove) = .empty;
@@ -5573,7 +5597,8 @@ fn recompressChunk(
         inflated +|= @intCast(h.uncompressed_page_size);
         if (inflated > limit) return error.PageLargerThanChunk;
         const new_body = try recodePage(arena, scratch, &raw, &h, body, from, to, zstd);
-        const new_hdr = try patchPageHeader(arena, chunk[pos..][0..hdr_len], @intCast(new_body.len));
+        const raw_header = chunk[pos..][0..hdr_len];
+        const new_hdr = try header_writer.rewrite(arena, raw_header, @intCast(new_body.len), writer_policy);
         try pages.append(arena, .{ .src_off = pos, .dst_off = out.items.len, .dst_len = new_hdr.len + new_body.len });
         try out.appendSlice(arena, new_hdr);
         try out.appendSlice(arena, new_body);
@@ -5596,6 +5621,7 @@ fn recompressChunkTo(
     out: *streaming.SinkOut,
     timings: *Timings,
     limit: usize,
+    writer_policy: WriterStatsPolicy,
 ) !RecompressedChunk {
     var pages: std.ArrayList(PageMove) = .empty;
     var raw: std.ArrayList(u8) = .empty;
@@ -5618,7 +5644,7 @@ fn recompressChunkTo(
         inflated +|= @intCast(h.uncompressed_page_size);
         if (inflated > limit) return error.PageLargerThanChunk;
         const new_body = try recodePage(pa, scratch, &raw, &h, body, from, to, zstd);
-        const new_hdr = try patchPageHeader(pa, chunk[pos..][0..hdr_len], @intCast(new_body.len));
+        const new_hdr = try header_writer.rewrite(pa, chunk[pos..][0..hdr_len], @intCast(new_body.len), writer_policy);
         try pages.append(arena, .{ .src_off = pos, .dst_off = dst, .dst_len = new_hdr.len + new_body.len });
         try timedWrite(out, new_hdr, timings);
         try timedWrite(out, new_body, timings);
@@ -5706,7 +5732,8 @@ pub fn recompressRowGroup(
         const range = fastpath.chunkRange(&m, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
         const t0 = nowMonoNs();
         const bytes = try sourceBytes(src, range);
-        slot.* = recompressChunk(arena, scratch, bytes, m.codec, codec, zstd, column_mod.inflateLimit(m)) catch |err|
+        const limit = column_mod.inflateLimit(m);
+        slot.* = recompressChunk(arena, scratch, bytes, m.codec, codec, zstd, limit, m.writer_stats) catch |err|
             return reportRecompressError(err, m, codec);
         const t1 = nowMonoNs();
         timings.encode_ns += @intCast(t1 - t0);
@@ -5883,7 +5910,8 @@ fn recompressRowGroupPages(
         var header_delta: i64 = 0;
         while (i < tasks.items.len and tasks.items[i].column == ci) : (i += 1) {
             const t = tasks.items[i];
-            const new_hdr = try patchPageHeader(arena, t.hdr, @intCast(t.out.len));
+            const policy = rg.columns.items[ci].meta_data.?.writer_stats;
+            const new_hdr = try header_writer.rewrite(arena, t.hdr, @intCast(t.out.len), policy);
             try pages.append(arena, .{ .src_off = t.src_off, .dst_off = out.items.len, .dst_len = new_hdr.len + t.out.len });
             try out.appendSlice(arena, new_hdr);
             try out.appendSlice(arena, t.out);
@@ -5904,31 +5932,6 @@ fn reportRecompressError(err: anyerror, m: schema.ColumnMetaData, to: schema.Com
         });
     }
     return err;
-}
-
-/// Re-emit a serialized PageHeader with `compressed_page_size` replaced and
-/// `crc` dropped, copying every other top-level field's bytes verbatim.
-fn patchPageHeader(arena: std.mem.Allocator, header: []const u8, compressed_size: i32) ![]const u8 {
-    var r = thrift.Reader.init(header);
-    var w = thrift.Writer.init(arena);
-    r.readStructBegin();
-    w.writeStructBegin();
-    while (true) {
-        const f = try r.readFieldBegin();
-        if (f.type == .Stop) break;
-        const start = r.pos;
-        try r.skip(f.type);
-        switch (f.id) {
-            3 => try w.writeFieldI32(3, compressed_size),
-            4 => {},
-            else => {
-                try w.writeFieldBegin(f.type, f.id);
-                try w.writeBytes(header[start..r.pos]);
-            },
-        }
-    }
-    try w.writeStructEnd();
-    return w.bytes();
 }
 
 /// The output offset of the page that started `src_rel` bytes into the source chunk.
@@ -5988,7 +5991,18 @@ fn copyChunkRecompressed(
         // Page by page into the sink: a codec that expands (to UNCOMPRESSED, say) never holds more than a page.
         const t_encode = nowMonoNs();
         const limit = column_mod.inflateLimit(m);
-        const r = recompressChunkTo(scratch, rc.scratch, slice, m.codec, rc.codec, rc.zstd, out, timings, limit) catch |err|
+        const r = recompressChunkTo(
+            scratch,
+            rc.scratch,
+            slice,
+            m.codec,
+            rc.codec,
+            rc.zstd,
+            out,
+            timings,
+            limit,
+            m.writer_stats,
+        ) catch |err|
             return reportRecompressError(err, m, rc.codec);
         const t_encode_end = nowMonoNs();
         timings.encode_ns += @intCast(t_encode_end - t_encode);
@@ -7161,9 +7175,11 @@ test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
             const start: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
             const src = bytes[start..][0..@intCast(cm.total_compressed_size)];
             // Normalise to UNCOMPRESSED first, so the comparison does not depend on one compressor's output.
-            const plain = try recompressChunk(a, testing.allocator, src, cm.codec, .UNCOMPRESSED, .{}, max);
-            const there = try recompressChunk(a, testing.allocator, plain.bytes, .UNCOMPRESSED, case.via, .{}, max);
-            const back = try recompressChunk(a, testing.allocator, there.bytes, case.via, .UNCOMPRESSED, .{}, max);
+            const alloc = testing.allocator;
+            const policy = cm.writer_stats;
+            const plain = try recompressChunk(a, alloc, src, cm.codec, .UNCOMPRESSED, .{}, max, policy);
+            const there = try recompressChunk(a, alloc, plain.bytes, .UNCOMPRESSED, case.via, .{}, max, policy);
+            const back = try recompressChunk(a, alloc, there.bytes, case.via, .UNCOMPRESSED, .{}, max, policy);
             try testing.expectEqualSlices(u8, plain.bytes, back.bytes);
             if (cm.codec == .UNCOMPRESSED) try testing.expectEqualSlices(u8, src, plain.bytes);
             try testing.expectEqual(plain.pages.len, there.pages.len);

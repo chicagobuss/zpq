@@ -17,11 +17,11 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from gen_stats_order_fixtures import T_BINARY, field, rewrite_footer
+from gen_stats_order_fixtures import Reader, T_STRUCT, T_BINARY, field, rewrite_footer
 
 
 MODERN = [
-    None, b"", b"unknown", b"parquet-mr version malformed",
+    None, b"", b"unknown",
     b"zpq version 0.5.0", b"parquet-cpp-arrow version 24.0.0",
     b"DuckDB version v2.0.0", b"Polars", b"Spark version 4.0.0",
     b"parquet-mr version 1.15.2 (build spark)", b"parquet-cpp version 1.3.0",
@@ -97,7 +97,7 @@ def main():
                             want = con.execute(sql).fetchone()[0]
                             assert json.loads(got)["n"] == want, (writer, sql, extra, want, got)
                         checks += 1
-        print(f"writer statistics: {checks} modern/unknown/malformed outputs byte-identical to base", flush=True)
+        print(f"writer statistics: {checks} modern/unknown outputs byte-identical to base", flush=True)
 
         # Exercise actual current writer banners and physical encodings as well as the synthetic footer matrix.
         path.write_bytes(original)
@@ -188,7 +188,67 @@ def main():
                         expected = ["a", decimal.Decimal("1.00"), 1][ci]
                         assert stats.min == expected and stats.null_count == 1, (label, ci, stats)
             checks += 1
-        print(f"writer statistics: {checks} total checks including tight-budget old-writer fallback", flush=True)
+        # A fresh reader must not need the original writer banner to reject copied page-header statistics.
+        # Validate headers physically, then let PyArrow and DuckDB use their normal pruning/answer paths.
+        independent = duckdb.connect()
+        for version in [1, 2]:
+            source = root / f"ci/fixtures/parquet/writer_headers_v{version}.parquet"
+            truth = pq.read_table(source, page_checksum_verification=True)
+            for writer in [b"parquet-mr version garbage", b"parquet-mr version 1.5.0-cdh5.5.0"]:
+                affected = pathlib.Path(temp) / "affected.parquet"
+                affected.write_bytes(source.read_bytes())
+                rewrite_footer(affected, change_writer(writer))
+                for predicate in ["s = 'a'", "s IS NULL", "d = 1.00", "d IS NULL", "u = 1", "u IS NULL"]:
+                    sql = f"SELECT count(*) AS n FROM '{affected}' WHERE {predicate}"
+                    for extra in [(), ("--trust-stats",), ("--scan-all",)]:
+                        assert json.loads(run(candidate, sql, 3, extra))["n"] == 1, (writer, sql, extra)
+                        checks += 1
+                for j in [1, 16]:
+                    for mode, extra in [("copy", []), ("project", ["--columns", "s,u,v"]),
+                                        ("recompress", ["--codec", "zstd"]),
+                                        ("same-codec", ["--codec", "snappy"]),
+                                        ("filtered-copy", ["--filter", "v > 0", "--columns", "s,u,v"])]:
+                        output = pathlib.Path(temp) / "header-copy.parquet"
+                        # A modern first input forces relabeling even on a copy-only path.
+                        clean = pathlib.Path(temp) / "header-clean.parquet"
+                        pq.write_table(truth, clean, compression="snappy", write_page_checksum=True)
+                        command = [candidate, "query", str(clean), str(affected), "-j", str(j),
+                                   "-o", str(output), *extra]
+                        result = subprocess.run(command, capture_output=True, timeout=60)
+                        assert result.returncode == 0, (command, result.stderr.decode())
+                        expected = pa.concat_tables([truth, truth])
+                        if mode in ["project", "filtered-copy"]:
+                            expected = expected.select(["s", "u", "v"])
+                        got = pq.read_table(output, page_checksum_verification=True)
+                        assert got.equals(expected, check_metadata=False), (version, writer, mode, j)
+                        for col, val in [("s", "a"), ("u", 1)]:
+                            assert pq.read_table(output, filters=[(col, "==", val)]).num_rows == 2
+                            literal = "'a'" if col == "s" else "1"
+                            sql = f"SELECT count(*) AS n FROM '{output}' WHERE {col} = {literal}"
+                            assert independent.execute(sql).fetchone()[0] == 2, (version, mode, col)
+                            assert json.loads(run(candidate, sql, j, ("--trust-stats",)))["n"] == 2
+                        raw = output.read_bytes()
+                        meta = pq.ParquetFile(output).metadata
+                        last = meta.row_group(meta.num_row_groups - 1)
+                        for ci in range(last.num_columns):
+                            cm = last.column(ci)
+                            if cm.path_in_schema == "v":
+                                continue
+                            assert cm.statistics is None, (version, writer, mode, ci)
+                            pos = min(x for x in [cm.data_page_offset, cm.dictionary_page_offset] if x is not None)
+                            end = pos + cm.total_compressed_size
+                            pages = 0
+                            while pos < end:
+                                reader = Reader(raw[pos:end])
+                                header = reader.value(T_STRUCT)
+                                data = field(header, 5) or field(header, 8)
+                                if data is not None:
+                                    assert field(data[2], 5 if data[0] == 5 else 8) is None, (mode, header)
+                                    pages += 1
+                                pos += reader.pos + field(header, 3)[2]
+                            assert pages > 0 and pos == end
+                        checks += 1
+        print(f"writer statistics: {checks} total checks including header copies and independent readers", flush=True)
 
 
 if __name__ == "__main__":

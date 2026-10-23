@@ -847,8 +847,8 @@ test "writer statistics: chunk suppression removes counts under both trust modes
         .{ .writer = "parquet-mr version 1.7.0", .unequal = false, .equal = false },
         .{ .writer = "parquet-mr version 1.8.0", .unequal = false, .equal = true },
         .{ .writer = "parquet-mr version 1.10.0", .unequal = true, .equal = true },
-        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .unequal = false, .equal = true },
-        .{ .writer = "parquet-mr version malformed", .unequal = true, .equal = true },
+        .{ .writer = "parquet-mr version 1.5.0-cdh5.5.0", .unequal = false, .equal = false },
+        .{ .writer = "parquet-mr version malformed", .unequal = false, .equal = false },
         .{ .writer = null, .unequal = true, .equal = true },
     };
     for (cases) |c| for ([_]bool{ false, true }) |equal| for ([_]Trust{ .corroborated, .plausible }) |trust| {

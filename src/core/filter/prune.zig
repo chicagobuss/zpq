@@ -942,7 +942,7 @@ pub fn prunePage(
 ) Decision {
     // Callers may supply an index directly; writer suppression also covers null-only predicates.
     switch (filter) {
-        .like, .and_filter, .or_filter => {},
+        .and_filter, .or_filter => {},
         inline else => |leaf| {
             const col = leaf.col_idx;
             if (col >= col_indexes.len or col >= rg.columns.items.len) return .unknown;

@@ -4,19 +4,18 @@ Known writer defects make the affected statistics absent, including null counts.
 Neither pruning nor `--trust-stats` answers may use them. Decoded values and
 structural row counts keep their existing semantics. Chunk statistics and page
 indexes use the same policy; one affected page drops its index as a whole.
-Copy and recompression paths remove affected footer/index statistics before an
-output can advertise another writer, including mixed inputs and a fully matching
+Copy and recompression paths remove affected footer, page-header and index
+statistics before an output can advertise another writer, including mixed inputs and a fully matching
 filter copied beside encoded data. Raw input metadata remains available for inspection.
 
 | Writer | Statistics declined |
 | --- | --- |
 | `parquet-cpp` before 1.3.0 | Non-signed-order columns, unless both encoded extrema are equal |
 | `parquet-mr` before 1.10.0 | The same non-signed-order rule |
-| `parquet-mr` before semantic version 1.8.0 | BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY, even with equal extrema, except the CDH interval below |
+| `parquet-mr` before semantic version 1.8.0 | BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY, even with equal extrema or a CDH backport banner |
 
-The binary-corruption exception is parquet-mr's semantic interval
-`[1.5.0-cdh5.5.0, 1.5.0)`, including `1.5.0-cdh5.5.0-SNAPSHOT`, 5.5.1 and 5.6.0.
-It does not override the separate non-signed-order rule. Numeric version boundaries
+Unlike parquet-mr's CDH exception for `[1.5.0-cdh5.5.0, 1.5.0)`, zpq conservatively
+rejects all pre-1.8 binary statistics, as Arrow does. Numeric version boundaries
 for the ordering rule ignore suffixes, as Arrow does. The binary rule orders
 prereleases and parquet-mr's extra suffix (`rc2`, for example) as parquet-mr does.
 DECIMAL has signed numeric logical order; binary DECIMAL still faces the binary
@@ -27,9 +26,11 @@ removes statistics; it never makes previously unreadable bounds usable.
 `created_by` parsing is allocation-free and case-sensitive. Exact application names,
 ASCII whitespace, optional `(build ...)`, numeric major/minor/patch (omitted minor
 or patch becomes zero), and rc/prerelease/build suffixes are recognized. Parsing
-must succeed completely before a version is classified. Missing, unknown or
-malformed strings mean **modern**: no writer-specific suppression. This is the
-explicit compatibility policy, following Arrow's permissive unknown-writer choice;
+must succeed completely before a version is classified. A recognized application
+(`parquet-mr` or `parquet-cpp`) with a missing or malformed version is **0.0.0**,
+so the corresponding old-writer rules apply. Missing/empty `created_by` or an unknown
+application means **modern**: no writer-specific suppression. This follows Arrow's
+permissive unknown-application choice and conservative known-application fallback;
 it deliberately differs from parquet-mr's conservative unknown-binary-writer rule.
 It is not evidence that unknown writers' statistics are true. Other applications,
 including `parquet-cpp-arrow`, zpq, DuckDB, Polars and Spark, get no special rule;
@@ -57,3 +58,14 @@ Modern-writer parity is also checked on valid generated data by
 Arrow, DuckDB and zpq outputs, optional Polars output, and the checked-in Spark
 INT96 fixture, in addition to rewritten writer strings. Every generated output
 is read strictly with PyArrow; query answers compare with base bytes and DuckDB.
+
+Copied pages keep their encoded bodies and CRCs. Affected header statistics are
+removed with bounded stack scratch, without decompressing or buffering the page.
+Chunk offsets and compressed/uncompressed totals follow changed header lengths;
+optional offset/column indexes are dropped if the page layout changes. Recompressed
+pages use the same statistics policy and drop the old payload CRC. The source
+policy is runtime provenance, retained through parallel recompression, and is never
+serialized as a new footer field. Modern-writer copies retain their existing path.
+`writer_headers_v1.parquet` and `writer_headers_v2.parquet` pin both data-page
+versions, dictionary offsets, checksums, and false header/footer bounds. Their
+bodies are PyArrow encoded; `write_writer_headers()` rewrites only metadata.

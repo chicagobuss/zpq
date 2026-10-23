@@ -33,6 +33,7 @@ const rle_dict = @import("encoding/rle_dict.zig");
 const dbp = @import("encoding/delta_binary_packed.zig");
 const dba = @import("encoding/delta_byte_array.zig");
 const hybrid_rle = @import("encoding/hybrid_rle.zig");
+const selection = @import("../filter/selection.zig");
 
 pub const Error = error{
     UnsupportedEncoding,
@@ -141,6 +142,10 @@ pub const DecodeOptions = struct {
     expand_limit: usize = std.math.maxInt(usize),
     /// Per chunk (`chunkOptions`): the range an INT32 column's narrow integer annotation allows.
     int_range: ?IntRange = null,
+    /// The row group's rows a query still needs (its filter's survivors). A data page of an optional flat column
+    /// with none of them is passed by its header alone, never decompressed, and reads as nulls: those rows are never
+    /// read. Only the input and the query decide which pages that is, never the decode path, workers or budget.
+    row_gate: ?*const selection.SelectionVector = null,
 };
 
 /// `o` for the chunk `cm` describes: its pages bounded by `inflateLimit`, and its values by an INT32 column's narrow
@@ -290,6 +295,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// The installed DELTA_BYTE_ARRAY page's expansion, not yet charged to `expanded`: a count(col) that reads
         /// only its levels never builds the values, and must not be refused for them.
         pending_expansion: usize = 0,
+        /// `DecodeOptions.row_gate`, kept only for an optional flat column, and the rows its data pages so far hold.
+        gate: ?*const selection.SelectionVector = null,
+        gate_row: usize = 0,
 
         pub fn init(
             chunk_bytes: []const u8,
@@ -319,6 +327,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 .levels = levels,
                 .options = options,
                 .scratch = scratch,
+                .gate = if (levels.max_def > 0 and levels.max_rep == 0) options.row_gate else null,
             };
         }
 
@@ -988,6 +997,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     try self.chargePage(rows);
                     self.data_page_seen = true;
                     self.pages.pass(p);
+                    self.gate_row +|= rows;
                     return rows;
                 },
             };
@@ -1249,7 +1259,22 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// was set up for use; false if the chunk is exhausted.
         pub fn advancePage(self: *Self) Error!bool {
             try self.holdScratch();
-            while (try self.pages.next()) |pg| {
+            while (true) {
+                if (self.gate) |gate| if (try self.pages.peek()) |p| if (p.header.type == .DATA_PAGE or
+                    p.header.type == .DATA_PAGE_V2)
+                {
+                    // Its header is read and checked like any other; only its body goes unread.
+                    const rows = try flatPageRows(p.header);
+                    const lo = @min(self.gate_row, gate.len);
+                    if (!gate.anyInRange(lo, @min(self.gate_row +| rows, gate.len))) {
+                        self.pages.pass(p);
+                        self.pages.ordinal +|= 1;
+                        try self.installNullPage(rows);
+                        self.gate_row +|= rows;
+                        return true;
+                    }
+                };
+                const pg = (try self.pages.next()) orelse return false;
                 switch (pg.header.type) {
                     .DICTIONARY_PAGE => {
                         try self.installDictionary(pg);
@@ -1257,16 +1282,36 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     },
                     .DATA_PAGE => {
                         try self.installDataPageDecoder(pg);
+                        self.gate_row +|= self.current_page_num_values;
                         return true;
                     },
                     .DATA_PAGE_V2 => {
                         try self.installDataPageV2Decoder(pg);
+                        self.gate_row +|= self.current_page_num_values;
                         return true;
                     },
                     .INDEX_PAGE => continue, // skip; not used by decode
                 }
             }
-            return false;
+        }
+
+        /// A flat column's leaves are its rows, nulls included.
+        fn flatPageRows(header: schema.PageHeader) Error!usize {
+            const n = if (header.data_page_header) |h| h.num_values else if (header.data_page_header_v2) |h|
+                h.num_values
+            else
+                return error.UnexpectedPage;
+            return std.math.cast(usize, n) orelse error.UnexpectedPage;
+        }
+
+        /// A page of `rows` nulls, standing for a gated page: every slot reads as absent.
+        fn installNullPage(self: *Self, rows: usize) Error!void {
+            self.data_page_seen = true;
+            try self.beginPage(rows);
+            const buf = try self.levelBuffer(.def, rows);
+            @memset(buf, 0);
+            self.current_def_levels = buf;
+            try self.installValues(.PLAIN, &.{}, 0);
         }
 
         /// Page-lifetime level buffer: `decodePageSlice` copies levels out before the next page is installed.

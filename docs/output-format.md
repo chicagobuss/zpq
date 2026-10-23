@@ -32,6 +32,13 @@ zpq validates every byte that can affect the answer; corruption confined to data
 may go undetected. This is a query contract, not a whole-file integrity check, and is subject to the
 existing statistics trust boundary below.
 
+Filtered scans decode a payload column (one the filter and the group keys do not read) after the filter, and
+pass by its header any data page of an optional flat payload column with no surviving row:
+a payload page whose rows the filter rejects is not decoded, so its corruption is not reported.
+Which pages those are depends only on the input and the query (the decoded, validated filter columns and the
+payload page headers, which are read and checked like any other), never on worker count, memory budget,
+decode path or hardware sizing. Every payload page that is decoded follows the canonical error order below.
+
 Sketch/census counts, fingerprints, first-appearance prefixes and admit certificates use keys and predicates
 that have actually been decoded and passed normal decoder validation. Skipped aggregate arguments do not
 supply these proofs. Collisions only widen admission; an uncertified bound falls back to the exact scan.

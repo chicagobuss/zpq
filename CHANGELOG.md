@@ -254,7 +254,10 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
   binary statistics are declined conservatively, including CDH backports. Copy/recompression strips affected
   page-header statistics as well as footer/index statistics before writer relabeling. See [writer statistics](docs/writer-statistics.md).
 - Query validation covers answer-relevant data: corruption confined to unprojected columns, unread COUNT-pass
-  arguments or items excluded by exact decoded sketch/census/admit proofs may go undetected. Multipass proofs
+  arguments or items excluded by exact decoded sketch/census/admit proofs may go undetected. Filtered scans
+  decode payload columns after the filter: a payload page whose rows the filter rejects is not decoded, so its
+  corruption is not reported. The pages skipped depend only on the input and the query, never on workers,
+  budget or decode path; their headers are still checked, and decoded pages keep the canonical error order. Multipass proofs
   reject gated inputs. Existing footer/page-statistics corroboration is not value verification: internally
   consistent false bounds may change the default answer; `--scan-all` ignores statistics.
 - Error-only full-projection replay includes input omitted by census/sketch count and admit passes; prepaid stream-probe funding makes evidence independent of concurrent ledger usage, and remaining worker failures use canonical order. Resource-limited probes retain the documented best-confirmed-error fallback.

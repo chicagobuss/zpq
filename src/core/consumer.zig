@@ -4009,9 +4009,20 @@ fn scanRGForAggImpl(
     const sel_pre = if (staged) try sel.cloneAlloc(ra) else sel;
     // Compact columns: every kept row is selected so far.
     if (keep != null) sel = try filter_selection.SelectionVector.init(ra, batch_rows);
-    for (in.read, 0..) |needed, ci| {
+    // Payload columns decode after the filter, gated by its survivors; a staged plan decodes them with its calls.
+    dec.payload = try payloadColumns(ra, in, target);
+    var filtered = false;
+    for ([_]bool{ false, true }) |late| for (in.read, 0..) |needed, ci| {
+        if (late and dec.payload == null) break;
         if (!needed or ci >= in.rg.columns.items.len) continue;
         if (stage_plan) |sp| if (!sp.base[ci]) continue;
+        if (dec.payload) |p| if (p[ci] != late) continue;
+        if (late and !filtered) {
+            const first: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = batch_rows, .expr_batch_rows = ws.expr_batch_rows };
+            try filter_eval.evaluate(in.filter.?, &first, &sel, lookup, ra);
+            filtered = true;
+            dec.gate = &sel;
+        }
         lookup[ci] = batch_cols.items.len;
         const col = dec.column(ra, ci, &sel_pre) catch |err| {
             // Values that expand past the budget read whole (a footer can understate them by any factor) may still
@@ -4033,7 +4044,7 @@ fn scanRGForAggImpl(
             return err;
         };
         try batch_cols.append(ra, col);
-    }
+    };
     const t_decode_end = nowMonoNs();
     ws.timings.decode_ns += @intCast(t_decode_end - t_decode_start);
     if (prof) |t| {
@@ -4049,7 +4060,9 @@ fn scanRGForAggImpl(
         .num_rows = batch_rows,
         .expr_batch_rows = ws.expr_batch_rows,
     };
-    if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+    if (in.filter) |f| if (!filtered) try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+    // A staged plan's call columns decode below, after the filter: payload among them is gated the same way.
+    if (dec.payload != null) dec.gate = &sel;
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
     const selected: usize = if (in.filter != null) sel.count() else num_rows;
@@ -4165,6 +4178,46 @@ fn scanRGForAggImpl(
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time (`SliceReader`), each slice on memory of its own:
 /// for a row group too big for a worker's share of `budget`. The rows the outer filter kept; null, having done
 /// nothing, when some column has no sliced form.
+/// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.
+fn filterSurvivors(
+    a: std.mem.Allocator,
+    side: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    payload: []const bool,
+    num_rows: usize,
+    ws: AggWorkspace,
+) !?filter_selection.SelectionVector {
+    var survivors = try filter_selection.SelectionVector.init(a, num_rows);
+    var readers: std.ArrayList(SliceReader) = .empty;
+    defer for (readers.items) |*r| r.deinit();
+    const lookup = try a.alloc(?usize, in.meta.schema.items.len);
+    @memset(lookup, null);
+    for (in.read, payload, 0..) |needed, late, ci| {
+        if (!needed or late or ci >= in.rg.columns.items.len) continue;
+        const r = try SliceReader.init(a, side, in.rg, in.meta, in.src, ci, decode_options) orelse return null;
+        lookup[ci] = readers.items.len;
+        try readers.append(a, r);
+    }
+    var slice = std.heap.ArenaAllocator.init(side);
+    defer slice.deinit();
+    // A memory granule over the filter's own columns; it never changes which rows survive.
+    const step: usize = 1 << 16;
+    var done: usize = 0;
+    while (done < num_rows) : (done += step) {
+        _ = slice.reset(.retain_capacity);
+        const sa = slice.allocator();
+        const n = @min(step, num_rows - done);
+        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
+        for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
+        var sel = try filter_selection.SelectionVector.init(sa, n);
+        try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
+        for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
+    }
+    return survivors;
+}
+
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -4189,9 +4242,18 @@ fn scanRGSliced(
     const levels_only = try pages.allocator().alloc(bool, in.read.len);
     for (levels_only, 0..) |*l, ci| l.* = decode_options.encoded and target == .scalar and ci < uses.levels.len and
         uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
+    // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
+    const payload = try payloadColumns(pages.allocator(), in, target);
+    var survivors: filter_selection.SelectionVector = undefined;
+    if (payload) |p| survivors = (try filterSurvivors(pages.allocator(), side, in, decode_options, p, num_rows, ws)) orelse
+        return null;
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
-        var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, decode_options) orelse
+        var options = decode_options;
+        if (payload) |p| if (p[ci]) {
+            options.row_gate = &survivors;
+        };
+        var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, options) orelse
             return null;
         if (levels_only[ci]) r.levelsOnly();
         if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
@@ -4328,20 +4390,7 @@ const StagePlan = struct {
 
     fn init(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget, handled: []const bool) !StagePlan {
         const n = in.read.len;
-        const base = try a.alloc(bool, n);
-        @memset(base, false);
-        if (in.filter) |f| {
-            var cols: std.ArrayList(usize) = .empty;
-            try f.collectColumns(&cols, a);
-            for (cols.items) |ci| if (ci < n) {
-                base[ci] = true;
-            };
-        }
-        switch (target) {
-            .grouped => |g| for (g.keys) |k| k.collectColumns(base),
-            .scalar => {},
-        }
-        for (base, in.read) |*b, r| b.* = b.* and r;
+        const base = try baseColumns(a, in, target);
         const calls = target.planCalls();
         if (target == .grouped and target.grouped.table.countOnly()) {
             std.debug.assert(calls.len == 0);
@@ -4370,6 +4419,45 @@ const StagePlan = struct {
 
 const CallBatch = struct { batch: filter_eval.Batch, lookup: []?usize };
 
+/// The columns of `in.read` a row group needs before its filter has run: the filter's own, and the group keys.
+fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool {
+    const n = in.read.len;
+    const base = try a.alloc(bool, n);
+    @memset(base, false);
+    if (in.filter) |f| {
+        var cols: std.ArrayList(usize) = .empty;
+        try f.collectColumns(&cols, a);
+        for (cols.items) |ci| if (ci < n) {
+            base[ci] = true;
+        };
+    }
+    switch (target) {
+        .grouped => |g| for (g.keys) |k| k.collectColumns(base),
+        .scalar => {},
+    }
+    for (base, in.read) |*b, r| b.* = b.* and r;
+    return base;
+}
+
+/// Payload columns: what a filtered row group reads past `baseColumns`, flat. Every decode path (whole, compact,
+/// staged, sliced) decodes them after the filter, gated by its survivors (`DecodeOptions.row_gate`), so which of their
+/// pages decode depends on the input and the query alone. Null when there are none.
+fn payloadColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !?[]const bool {
+    if (in.filter == null) return null;
+    if (target == .grouped and target.grouped.records != null) return null;
+    const base = try baseColumns(a, in, target);
+    var any = false;
+    for (base, in.read, 0..) |*b, r, ci| {
+        const flat = ci < in.rg.columns.items.len and if (in.rg.columns.items[ci].meta_data) |cm|
+            in.meta.getColumnLevels(cm.path_in_schema.items).max_rep == 0
+        else
+            false;
+        b.* = r and !b.* and flat;
+        any = any or b.*;
+    }
+    return if (any) base else null;
+}
+
 /// Decodes one row group's column chunks into batch lanes, the way every column of `in.read` is decoded.
 const ChunkDecoder = struct {
     in: AggRowGroup,
@@ -4383,6 +4471,9 @@ const ChunkDecoder = struct {
     /// Decode just these rows (`compactRows`); `rows_out` is their count.
     keep: ?[]const RowRange = null,
     rows_out: ?usize = null,
+    /// `payloadColumns`, gated by `gate` (the filter's survivors, in batch rows) once the filter has run.
+    payload: ?[]const bool = null,
+    gate: ?*const filter_selection.SelectionVector = null,
     pages_total: usize = 0,
     pages_skipped: usize = 0,
 
@@ -4414,6 +4505,10 @@ const ChunkDecoder = struct {
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
         const uses = self.uses;
         var decode_options = column_mod.chunkOptions(self.decode_options, in.meta, cm);
+        if (self.payload) |p| if (p[ci]) {
+            std.debug.assert(self.gate != null);
+            decode_options.row_gate = self.gate;
+        };
         decode_options.any_dictionary = switch (self.target) {
             .grouped => |g| g.dense != null and g.keys[0].col_ref.col_idx == ci,
             .scalar => false,
@@ -4429,7 +4524,9 @@ const ChunkDecoder = struct {
             return decoded;
         };
         const scratch = self.ws.scratch;
-        const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;
+        // A gated column decodes values: the code paths read every page.
+        const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len and
+            decode_options.row_gate == null;
         const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and
             self.target == .scalar;
         const firsts = self.target == .grouped;
@@ -6250,6 +6347,12 @@ fn defaultVal(comptime T: type) T {
 /// `decodeWithReaderPruned` for just the rows of `keep` (sorted, disjoint, one value per row): pages with no kept row
 /// are skipped unread, the others decode into a page-sized scratch and their kept rows are copied out in order. The
 /// result has one entry per kept row and never zero-fills the rows it leaves out.
+/// Whether a data page of rows `start..end` is passed unread by the reader's row gate (`DecodeOptions.row_gate`).
+fn gatedOut(comptime T: type, reader: *const column_mod.ColumnChunkReader(T), start: usize, end: usize) bool {
+    const gate = reader.gate orelse return false;
+    return !gate.anyInRange(@min(start, gate.len), @min(end, gate.len));
+}
+
 fn decodeKeptRows(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -6260,6 +6363,9 @@ fn decodeKeptRows(
     keep: []const RowRange,
 ) !filter_eval.ColumnT(T) {
     if (levels.max_rep != 0) return error.ShortDecode;
+    // The row gate is in compact positions here: decided below per page, never by the reader in row-group rows.
+    const gate_kept = reader.gate;
+    reader.gate = null;
     var total: usize = 0;
     for (keep) |r| total += r.hi - r.lo;
     reader.value_budget = num_leaves;
@@ -6281,7 +6387,36 @@ fn decodeKeptRows(
         const start: usize = @intCast(loc.first_row_index);
         const end: usize = if (pi + 1 < prune.locations.len) @intCast(prune.locations[pi + 1].first_row_index) else num_leaves;
         while (k < keep.len and keep[k].hi <= start) : (k += 1) out += keep[k].hi - keep[k].lo;
-        const meets = k < keep.len and keep[k].lo < end;
+        var meets = k < keep.len and keep[k].lo < end;
+        if (meets) if (gate_kept) |gate| {
+            // Gated by the filter's survivors among the kept rows, in compact positions.
+            var any = false;
+            var j = k;
+            var o = out;
+            while (j < keep.len and keep[j].lo < end) : (j += 1) {
+                const lo = @max(keep[j].lo, start);
+                const hi = @min(keep[j].hi, end);
+                const at = o + (lo - keep[j].lo);
+                any = any or gate.anyInRange(at, at + (hi - lo));
+                if (keep[j].hi > end) break;
+                o += keep[j].hi - keep[j].lo;
+            }
+            if (!any) {
+                // Reads as nulls; `values` and levels for its kept rows are filled below as for a null page.
+                var j2 = k;
+                var o2 = out;
+                while (j2 < keep.len and keep[j2].lo < end) : (j2 += 1) {
+                    const lo = @max(keep[j2].lo, start);
+                    const hi = @min(keep[j2].hi, end);
+                    const at = o2 + (lo - keep[j2].lo);
+                    @memset(values[at..][0 .. hi - lo], defaultVal(T));
+                    @memset(def_levels.?[at..][0 .. hi - lo], 0);
+                    if (keep[j2].hi > end) break;
+                    o2 += keep[j2].hi - keep[j2].lo;
+                }
+                meets = false;
+            }
+        };
         const null_page = pi < prune.col_index.null_pages.items.len and prune.col_index.null_pages.items[pi];
         const always = prune.page_is_always_match[pi] and (!null_page or def_levels != null);
         // A skipped page holds no kept row (pruning deselected its rows); one that did would decode below.
@@ -6309,6 +6444,8 @@ fn decodeKeptRows(
             } else reader.pages.pos = reader.pages.chunk.len;
             continue;
         }
+        // The row gate counts from this page's first row, which a seek skips to.
+        reader.gate_row = start;
         _ = try reader.seekAndInstallPage(loc.offset, prune.chunk_file_offset);
         const want = end - start;
         if (page_values.len < want) {
@@ -6409,7 +6546,7 @@ fn decodeWithReaderPruned(
         const start: usize = @intCast(loc.first_row_index);
         const end: usize = if (pi + 1 < prune.locations.len) @intCast(prune.locations[pi + 1].first_row_index) else num_leaves;
 
-        const is_skipped = prune.page_is_skipped[pi];
+        const is_skipped = prune.page_is_skipped[pi] or gatedOut(T, reader, start, end);
         // An always-match page stands in for its rows with values that satisfy what the filter proved. On a page
         // the ColumnIndex flags all-null that is `IS NULL`, so its rows must read as absent (definition level 0),
         // not as present copies of the page minimum. A leaf without levels cannot express that: decode instead.
@@ -6444,6 +6581,8 @@ fn decodeWithReaderPruned(
             continue;
         }
 
+        // The row gate counts from this page's first row, which a seek skips to.
+        reader.gate_row = start;
         _ = try reader.seekAndInstallPage(loc.offset, prune.chunk_file_offset);
 
         const want = end - start;

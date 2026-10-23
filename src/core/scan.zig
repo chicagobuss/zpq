@@ -11558,6 +11558,90 @@ test "page-pruned row groups decode just their kept rows, with the answers of wh
     }
 }
 
+test "a payload page whose rows the filter rejects is not decoded; one with a selected row reports its corruption" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const streaming = @import("writer/streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    const n = 100000;
+    const k = try a.alloc(i64, n);
+    const v = try a.alloc(i64, n);
+    const v_def = try a.alloc(u32, n);
+    for (0..n) |i| {
+        k[i] = @intCast(i);
+        v[i] = @intCast(i % 97);
+        v_def[i] = @intFromBool(i % 5 != 0);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = k } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = v, .def_levels = v_def, .max_def = 1 } } },
+    };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, n, .SNAPPY, .{}, .{});
+    const bytes = sink.buffer.items;
+    // Corrupt the third data page of `v`: its snappy stream claims an impossible length.
+    const meta = try metadata.open(a, bytes);
+    const cm = meta.row_groups.items[0].columns.items[1].meta_data.?;
+    var pos: usize = @intCast(cm.data_page_offset);
+    var first_row: usize = 0;
+    var page: usize = 0;
+    var rows: usize = 0;
+    while (true) : (page += 1) {
+        var rdr = thrift_mod.Reader.init(bytes[pos..]);
+        const header = try schema.PageHeader.read(&rdr);
+        rows = @intCast(header.data_page_header.?.num_values);
+        if (page == 2) {
+            @memset(bytes[pos + rdr.pos ..][0..4], 0xff);
+            break;
+        }
+        first_row += rows;
+        pos += rdr.pos + @as(usize, @intCast(header.compressed_page_size));
+    }
+    const inputs = [_]Input{.{ .name = "corrupt-payload.parquet", .bytes = bytes }};
+    // The canonical site: what an unfiltered scan, which decodes every page, reports.
+    var whole: Diag = .{};
+    try testing.expectError(error.DecompressionFailed, runMultiAggregate(testing.allocator, a, .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS n, sum(v) AS s",
+        .parallelism = 1,
+        .diag = &whole,
+    }));
+    var select_one_buf: [64]u8 = undefined;
+    const select_one = try std.fmt.bufPrint(&select_one_buf, "k = {d}", .{first_row + rows / 2});
+    for ([_]usize{ 1, 4 }) |j| for ([_]usize{ 1 << 20, 512 << 20 }) |budget| {
+        // Every row of the corrupt page rejected (with others kept): the answer, from the other pages.
+        for ([_][]const u8{ "k < 1000", "k >= 99000 OR k < 10" }) |rejecting| {
+            var ok = try runMultiAggregate(testing.allocator, a, .{
+                .inputs = &inputs,
+                .filter = rejecting,
+                .aggregate = "count(*) AS n, sum(v) AS s",
+                .parallelism = j,
+                .max_memory = budget,
+            });
+            defer ok.deinit(testing.allocator);
+            try testing.expect(ok.output.aggs[0].value.i > 0);
+        }
+        // A filter keeping one of its rows reads the page, and reports the canonical decode error at that page.
+        var diag: Diag = .{};
+        const failed = runMultiAggregate(testing.allocator, a, .{
+            .inputs = &inputs,
+            .filter = select_one,
+            .aggregate = "count(*) AS n, sum(v) AS s",
+            .parallelism = j,
+            .max_memory = budget,
+            .diag = &diag,
+        });
+        if (failed) |res| {
+            var r = res;
+            r.deinit(testing.allocator);
+            return error.TestExpectedError;
+        } else |e| try testing.expectEqual(error.DecompressionFailed, e);
+        try testing.expectEqual(@as(usize, 0), diag.detail.decode.row_group);
+        try testing.expectEqualStrings("v", diag.detail.decode.column.get());
+        try testing.expectEqual(whole.detail.decode.page, diag.detail.decode.page);
+    };
+}
+
 test "page index: null pages a footer contradicts do not drop rows" {
     // These files flag every page of their two REQUIRED columns all-null in the ColumnIndex, while every page holds
     // values. Pruning on that claim answered 0 for filters every other row satisfies.

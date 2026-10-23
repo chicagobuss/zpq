@@ -12,6 +12,44 @@
 //! into the file footer.
 
 const std = @import("std");
+test "a proven unique integer column skips only a declined dictionary attempt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ 10, 64, 65, 5000 }) |n| for ([_]bool{ false, true }) |nulls| {
+        const values = try a.alloc(i64, n);
+        const defs = try a.alloc(u32, n);
+        for (values, defs, 0..) |*v, *d, i| {
+            v.* = @as(i64, @intCast(i)) * -730201;
+            d.* = @intFromBool(i % 13 != 0);
+        }
+        const elem: schema.SchemaElement = .{
+            .name = "k",
+            .type = .INT64,
+            .repetition_type = if (nulls) .OPTIONAL else .REQUIRED,
+            .type_length = null,
+            .num_children = 0,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+        const input: ColumnInput = .{
+            .values = .{ .i64 = .{
+                .values = values,
+                .def_levels = if (nulls) defs else null,
+                .max_def = @intFromBool(nulls),
+                .has_nulls = nulls,
+            } },
+            .schema_elem = &elem,
+            .path_in_schema = &.{"k"},
+        };
+        const expected = try encodeColumn(a, input);
+        var skipped = input;
+        skipped.distinct = true;
+        const got = try encodeColumn(a, skipped);
+        try std.testing.expectEqualSlices(u8, expected.bytes, got.bytes);
+    };
+}
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
 const filter_eval = @import("../filter/eval.zig");
@@ -89,6 +127,8 @@ pub const ColumnInput = struct {
     zstd: compression.ZstdPlan = .{},
     /// Build a split-block Bloom filter of the chunk at this false-positive probability.
     bloom_fpp: ?f64 = null,
+    /// The caller proves present values unique, so a dictionary attempt would decline without changing the bytes.
+    distinct: bool = false,
     /// The data page target (`default_page_bytes`, `default_page_rows`). A repeated column is one page.
     page_bytes: usize = default_page_bytes,
     page_rows: usize = default_page_rows,
@@ -503,7 +543,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     // dictionary) AND with at least 64 present values, we emit a
     // dictionary page, then data pages of RLE_DICTIONARY-encoded
     // indices. Otherwise we fall through to the paths below.
-    if (in.values == .string and src_max_rep == 0) {
+    if (in.values == .string and src_max_rep == 0 and !in.distinct) {
         if (try tryEncodeDictBytes(arena, in, num_values)) |p| return p;
     }
     // Dict-encode low-cardinality INT32/INT64 columns. The big win is
@@ -516,7 +556,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     // [0.01, 100.00] have ≤10K unique values). An empirical bench
     // showed BYTE_STREAM_SPLIT is a loss on this shape; dict captures
     // the redundancy properly.
-    if (src_max_rep == 0) {
+    if (src_max_rep == 0 and !in.distinct) {
         switch (in.values) {
             .i32 => if (try tryEncodeDictInt(i32, arena, in, num_values)) |p| return p,
             .i64 => if (try tryEncodeDictInt(i64, arena, in, num_values)) |p| return p,

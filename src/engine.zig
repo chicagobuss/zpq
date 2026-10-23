@@ -677,6 +677,7 @@ fn executeAggregateOver(
         .select_cols = args.select_cols,
         .result_order = cut_args.result_order,
         .typed_answer = args.typed_answer and args.output != null,
+        .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         .ledger = &ledger,
@@ -831,12 +832,31 @@ fn executeAggregateOver(
         defer ledger.limit -= core_memory.finalize_allowance;
         const names = r.output.group_cols;
         const fd = args.output_fd;
-        bytes_out = if (r.output.typed) |typed|
+        bytes_out = if (r.output.integer_stream) |stream|
+            try writeIntegerStream(
+                arena,
+                out_path,
+                names.?,
+                st.group_col_types.?,
+                stream,
+                codec,
+                zstd,
+                encode,
+                fd,
+                args.profiler,
+            )
+        else if (r.output.typed) |typed|
             try writeTypedParquet(arena, out_path, names.?, st.group_col_types.?, typed, codec, zstd, encode, fd)
         else if (r.output.group_rows) |rows|
             try writeGroupedParquet(arena, out_path, names.?, st.group_col_types.?, rows, codec, zstd, encode, fd)
         else
             try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, args.output_fd, args.empty_scalar or r.output.no_row);
+        if (r.output.integer_stream) |stream| {
+            const rows = stream.state.group_count;
+            stream.state.deinit();
+            r.output.integer_stream = null;
+            r.output.typed = .{ .rows = rows, .columns = &.{} };
+        }
         const t_footer_end = nowMonoNs();
         t.footer_ns += @intCast(t_footer_end - t_footer);
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
@@ -865,7 +885,7 @@ fn executeAggregateOver(
 /// The `AnswerType` of each answer column: a DATE/TIME/TIMESTAMP from the column its values pass through, and
 /// whether it is an avg_state pair.
 fn answerTypes(gpa: std.mem.Allocator, out: scan.AggOutput, state: scan.ScanState) ![]AnswerType {
-    if (out.typed != null) return &.{};
+    if (out.typed != null or out.integer_stream != null) return &.{};
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
     const types = try gpa.alloc(AnswerType, n);
     for (types, 0..) |*ty, ci| {
@@ -899,7 +919,7 @@ fn answerTextKinds(
     check: bool,
     diag: ?*Diag,
 ) ![]TextKind {
-    if (out.typed != null) return &.{};
+    if (out.typed != null or out.integer_stream != null) return &.{};
     const grouped = out.group_cols != null;
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
     const kinds = try gpa.alloc(TextKind, n);
@@ -1225,7 +1245,7 @@ pub const RowGroupTarget = struct {
 /// 2^17 rows (DuckDB writes 122,880, Polars about 2^18) and 64 MiB: readers that split a file by row group read a
 /// 2^20-row group of a 1M-row output 2-5x slower than 2^17-row ones (DuckDB, Polars), for 0.2% of file size and no
 /// write time. The byte cap keeps a wide row group to what one writer buffers decoded and encodes at once.
-pub const default_row_group_rows: usize = 1 << 17;
+pub const default_row_group_rows: usize = consumer.answer_rg_rows;
 pub const default_row_group_bytes: u64 = 64 << 20;
 
 /// The writer's cutter: takes pieces in input order, holds their rows until an output row group's worth is in, then
@@ -5698,6 +5718,54 @@ fn writeTypedParquet(
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
     const rows: i64 = @intCast(answer.rows);
     const written = try consumer.writeAggregateRows(arena, sink, outs.items, rows, codec, zstd, encode);
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
+    return written;
+}
+
+fn writeIntegerStream(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    names: []const []const u8,
+    types: []const scan.GroupColType,
+    stream: scan.IntegerStream,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+    profiler: ?*profile.Profiler,
+) !u64 {
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    var file = try consumer.AggregateFile.init(arena, .{ .ctx = &fd_sink, .write_fn = FdSink.writeFn });
+    defer file.deinit();
+    try file.reserveIntegerWorkspace(encode);
+    var window = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer window.deinit();
+    const cols = try arena.alloc(expr_agg.OutputCol, names.len);
+    const total = stream.state.group_count;
+    var lo: usize = 0;
+    while (lo < total or (lo == 0 and total == 0)) {
+        const hi = @min(total, lo + 4 * consumer.answer_rg_rows);
+        const a = window.allocator();
+        const columns_span = profile.Span.begin(profile.threadOf(profiler, .main));
+        const answer = try stream.window(a, types, lo, hi, encode.workers);
+        columns_span.end(.integer_columns, profile.args(.{}));
+        for (names, types, answer.columns, cols) |name, ty, col, *out| {
+            const plain = typedColumn([]i64, name, ty.nullable, col.i64, .INT64);
+            out.* = if (ty.source) |src| try retypeOutputCol(arena, plain, src) else plain;
+            out.distinct = ty.source != null;
+        }
+        try file.append(cols, hi - lo, codec, zstd, encode);
+        lo = hi;
+        _ = window.reset(.retain_capacity);
+        if (lo == total) break;
+    }
+    const written = try file.finish(cols);
     if (fd_open) {
         fd_open = false;
         try local_fs.closeChecked(fd);

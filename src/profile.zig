@@ -88,6 +88,10 @@ pub const Kind = enum(u8) {
     aggregate,
     merge,
     finalize,
+    integer_scatter,
+    integer_fold,
+    integer_order,
+    integer_columns,
     reencode,
     encode_rg,
     encode,
@@ -115,7 +119,7 @@ pub const Kind = enum(u8) {
             .stats_fold, .aggregate => .aggregate,
             .encode, .encode_chunk => .encode,
             .copy_rg, .sink_write, .footer_write => .write,
-            .merge, .finalize => .merge,
+            .merge, .finalize, .integer_scatter, .integer_fold, .integer_order, .integer_columns => .merge,
             .footer_batch, .fetch, .scan, .reencode, .upload_wait => .wait,
             .local_read, .local_backend, .io_choice, .zstd_plan => .wait,
         };
@@ -129,7 +133,15 @@ pub const Kind = enum(u8) {
     /// `reason` the leaf index + 1 of the filter column whose statistics skipped it (0 none).
     pub fn argNames(k: Kind) []const []const u8 {
         return switch (k) {
-            .query, .parse_query, .merge, .finalize => &.{},
+            .query,
+            .parse_query,
+            .merge,
+            .finalize,
+            .integer_scatter,
+            .integer_fold,
+            .integer_order,
+            .integer_columns,
+            => &.{},
             .open_inputs, .footer_batch => &.{"files"},
             .open_file, .footer_parse => &.{ "file", "bytes" },
             .local_read => &.{ "mode", "bytes", "threads", "stalls", "stall_ns", "window_waits" },

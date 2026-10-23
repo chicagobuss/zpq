@@ -35,6 +35,7 @@ const core_memory = @import("memory.zig");
 const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
+const integer_groups = @import("integer_groups.zig");
 pub const NdvStat = ndv.Stat;
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
@@ -111,6 +112,7 @@ fn allRescannable(inputs: []const Input) bool {
 /// charge the same way. Each is armed only over rescannable inputs, and a scan it took that the budget refused runs
 /// again without it (`runMultiAggregate`): a budget the established path fits never fails the query.
 pub const FastPath = enum {
+    integer_records,
     dense,
     spill,
     pairs,
@@ -221,6 +223,10 @@ pub const MultiAggArgs = struct {
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
     /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
     typed_answer: bool = false,
+    /// Exact inline-record execution for a full signed integer COUNT/SUM answer when its reserved peak fits.
+    integer_records: bool = true,
+    /// Tests lower the cost threshold; ordinary execution keeps small answers on the established path.
+    integer_records_min_rows: usize = 1 << 20,
     /// `--unordered`: GROUP BY output in no particular order, with floating-point aggregates summed in whatever order
     /// workers finish. Ordered (the default) lists groups where they first appear in the input and gives the same bits
     /// at every `-j`; see `group_blocks_max`.
@@ -346,6 +352,7 @@ pub const AggOutput = struct {
     slab: []AggValue = &.{},
     /// The GROUP BY answer as typed columns instead of rows (`MultiAggArgs.typed_answer`); `group_rows` is then null.
     typed: ?TypedAnswer = null,
+    integer_stream: ?IntegerStream = null,
 
     pub fn deinit(self: *AggOutput, gpa: std.mem.Allocator) void {
         for (self.aggs) |item| {
@@ -359,6 +366,7 @@ pub const AggOutput = struct {
         }
         gpa.free(self.slab);
         if (self.typed) |*t| t.deinit(gpa);
+        if (self.integer_stream) |s| s.state.deinit();
         if (self.group_cols) |cols| {
             for (cols) |c| gpa.free(c);
             gpa.free(cols);
@@ -1430,6 +1438,8 @@ const Worker = struct {
     pairs: ?*expr_agg.DistinctPairs = null,
     /// This worker's lanes over a retained key domain (`agg_dense`); row groups it cannot translate use the table.
     dense: ?*agg_dense.Lanes = null,
+    records: ?*integer_groups.Local = null,
+    record_starts: []const u32 = &.{},
     /// Whether this worker has decided if its sets move to pairs.
     pairs_decided: bool = false,
     /// Values its sets took (`DistinctPairs.seen`) at which they are judged next, and how many more judgments a
@@ -1632,10 +1642,12 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
                 .part = w.part,
                 .local = if (w.part != null) &w.local else null,
                 .dense = w.dense,
+                .records = w.records,
             } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
         expr_agg.winner_charge = if (table == null) w.winners else null;
+        if (w.records) |records| records.ordinal_base = w.record_starts[idx];
         defer expr_agg.winner_charge = null;
         const matched = try consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
@@ -2988,7 +3000,8 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // its one table must hold all the refused tables held and more, and it only refuses, many times slower. Decode
     // memory the query's ledger refused also runs on one worker (`FastPath.decode_memory`), and there once more on a
     // small decode budget, so the tables have nearly all of the ledger. A plain grouping a cost rule chose over a cut
-    // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`), so at most seven scans run,
+    // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`): at most seven general scans,
+    // plus at most one admitted inline-integer scan, which disables itself before entering the general chain,
     // and each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = args;
     var chain: Chain = .{ .parts_tried = args.partagg };
@@ -3147,6 +3160,10 @@ fn narrowed(
     may_fit: bool,
 ) ?MultiAggArgs {
     var next = attempt;
+    if (taken.contains(.integer_records)) {
+        next.integer_records = false;
+        return next;
+    }
     if (taken.contains(.private_runs)) {
         next.private_runs = false;
         return next;
@@ -3401,6 +3418,20 @@ fn prepareAggregate(
     const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / @max(1, args.min_bytes_per_worker))));
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
+
+    if (!explain) if (try inlineIntegerAnswer(
+        gpa,
+        arena,
+        args,
+        metas,
+        &plan,
+        work_items.items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+    )) |result| return result;
 
     var plan_inputs: PlanInputs = .{
         .args = args,
@@ -4310,6 +4341,272 @@ fn prepareAggregate(
     };
 }
 
+pub const IntegerStream = struct {
+    state: *integer_groups.State,
+    outputs: []const BoundOutputColumn,
+    count_call: usize,
+
+    /// A bounded piece of the already validated answer. Reuses direct typed narrowing and column ownership.
+    pub fn window(
+        s: IntegerStream,
+        a: std.mem.Allocator,
+        types: []const GroupColType,
+        lo: usize,
+        hi: usize,
+        workers: usize,
+    ) !TypedAnswer {
+        var answer: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+        errdefer answer.deinit(a);
+        answer.rows = hi - lo;
+        answer.columns = try a.alloc(TypedAnswer.TypedColumn, 3);
+        @memset(answer.columns, .{ .i64 = .{ .values = &.{}, .defs = &.{} } });
+        for (s.outputs, answer.columns) |out, *col| {
+            const needs_levels = switch (out.source) {
+                .key => s.state.input_nulls & 1 != 0,
+                .agg => |ai| ai != s.count_call and s.state.input_nulls & 2 != 0,
+            };
+            col.* = .{
+                .i64 = if (needs_levels)
+                    try TypedAnswer.lane(a, i64, hi - lo)
+                else
+                    .{ .values = try a.alloc(i64, hi - lo), .defs = &.{} },
+            };
+        }
+        const ids = try s.state.window(a, lo, hi);
+        defer a.free(ids);
+        var key_at: usize = 0;
+        var count_at: usize = 0;
+        var sum_at: usize = 0;
+        for (s.outputs, 0..) |out, i| switch (out.source) {
+            .key => key_at = i,
+            .agg => |ai| {
+                if (ai == s.count_call) count_at = i else sum_at = i;
+            },
+        };
+        const Fill = struct {
+            state: *const integer_groups.State,
+            ids: []const u32,
+            key: *TypedAnswer.Lane(i64),
+            count: *TypedAnswer.Lane(i64),
+            sum: *TypedAnswer.Lane(i64),
+            cursor: *std.atomic.Value(usize),
+            err: ?anyerror = null,
+            fn run(f: *@This()) void {
+                const key_values = f.key.values;
+                const key_defs = f.key.defs;
+                const count_values = f.count.values;
+                const sum_values = f.sum.values;
+                const sum_defs = f.sum.defs;
+                while (true) {
+                    const start = f.cursor.fetchAdd(row_block, .monotonic);
+                    if (start >= f.ids.len) return;
+                    for (start..@min(f.ids.len, start + row_block)) |i| {
+                        const g = &f.state.groups[f.ids[i]];
+                        if (key_defs.len != 0) {
+                            const key_value = g.keyValue();
+                            key_values[i] = if (key_value) |x| @intCast(x) else 0;
+                            key_defs[i] = @intFromBool(key_value != null);
+                        } else key_values[i] = g.key;
+                        count_values[i] = @intCast(g.countValue());
+                        if (sum_defs.len != 0) {
+                            sum_values[i] = 0;
+                            sum_defs[i] = 0;
+                            if (g.sumValue()) |v| TypedAnswer.putIntegerRaw(f.sum, false, i, v) catch |e| {
+                                f.err = e;
+                                return;
+                            };
+                        } else {
+                            // No input SUM value was NULL; every group is present and finish checked every i64 bound.
+                            sum_values[i] = @intCast(g.sum);
+                        }
+                    }
+                }
+            }
+        };
+        const threads = @max(1, @min(workers, (ids.len + row_block - 1) / row_block));
+        const tasks = try a.alloc(Fill, threads);
+        defer a.free(tasks);
+        var cursor = std.atomic.Value(usize).init(0);
+        for (tasks) |*task| task.* = .{
+            .state = s.state,
+            .ids = ids,
+            .key = &answer.columns[key_at].i64,
+            .count = &answer.columns[count_at].i64,
+            .sum = &answer.columns[sum_at].i64,
+            .cursor = &cursor,
+        };
+        if (tasks.len == 1 or !spawn_util.runTree(Fill, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Fill.run))
+            Fill.run(&tasks[0]);
+        for (tasks) |task| if (task.err) |e| return e;
+        try answer.seal(types);
+        return answer;
+    }
+};
+
+fn inlineIntegerAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    n_workers: usize,
+    timings: Timings,
+) !?MultiAggResult {
+    const order = args.result_order;
+    if (!args.integer_records or !args.typed_answer or args.unordered or args.filter != null or
+        order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
+        order.hidden.len != 0 or calls.len != 2) return null;
+    const keys = keys_opt orelse return null;
+    const outputs = outputs_opt orelse return null;
+    if (keys.len != 1 or keys[0] != .col_ref or outputs.len != 3) return null;
+    const key = keys[0].col_ref;
+    if (key.physical_type != .INT64 or key.expr_type != .i64 or key.unsigned_64) return null;
+    var count: ?usize = null;
+    var value: ?usize = null;
+    for (calls, 0..) |call, i| {
+        if (call.where != null or call.offset != 0 or call.state or call.result != .i64) return null;
+        switch (call.func) {
+            .count => {
+                if (call.arg != null or count != null) return null;
+                count = i;
+            },
+            .sum => {
+                const arg = call.arg orelse return null;
+                if (arg != .col_ref or arg.col_ref.physical_type != .INT64 or arg.col_ref.expr_type != .i64 or
+                    arg.col_ref.unsigned_64 or value != null) return null;
+                value = arg.col_ref.col_idx;
+            },
+            else => return null,
+        }
+    }
+    if (count == null or value == null) return null;
+    var seen: u8 = 0;
+    for (outputs) |out| seen |= @as(u8, 1) << @intCast(switch (out.source) {
+        .key => @as(usize, 0),
+        .agg => |ai| ai + 1,
+    });
+    if (seen != 7) return null;
+    const starts = try arena.alloc(u32, work.len);
+    var rows: usize = 0;
+    for (work, starts) |item, *start| {
+        if (rows >= 1 << 31) return null;
+        start.* = @intCast(rows);
+        const n = metas[item.file].row_groups.items[item.rg].num_rows;
+        if (n < 0) return null;
+        rows +|= @intCast(n);
+    }
+    if (rows < args.integer_records_min_rows or rows >= 1 << 31 or
+        integer_groups.State.reservation(rows) > args.max_memory) return null;
+    // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
+    // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
+    if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
+        if (guess < rows / 4) return null;
+    const state = (try integer_groups.State.init(
+        gpa,
+        args.ledger,
+        rows,
+        n_workers,
+        key.col_idx,
+        value.?,
+    )) orelse return null;
+    errdefer state.deinit();
+    if (args.taken) |taken| taken.insert(.integer_records);
+    const workers = try arena.alloc(Worker, n_workers);
+    @memset(workers, undefined);
+    const tables = try arena.alloc(expr_agg.GroupTable, n_workers);
+    for (tables) |*table| table.* = .init(gpa, 0);
+    defer for (tables) |*table| table.deinit();
+    var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l|
+        .{ .limit = l, .workers = n_workers }
+    else
+        null;
+    var cursor = std.atomic.Value(usize).init(0);
+    for (workers, state.locals, 0..) |*w, *local, i| w.* = .{
+        .gpa = gpa,
+        .inputs = args.inputs,
+        .metas = metas,
+        .work = work,
+        .cursor = &cursor,
+        .agg_calls = calls,
+        .plan = plan,
+        .decode_options = .{
+            .fast_levels = args.fast_levels,
+            .encoded = args.encoded,
+            .expand_limit = args.max_memory,
+        },
+        .group_by_keys = keys,
+        .group_tables = tables,
+        .index = i,
+        .records = local,
+        .record_starts = starts,
+        .ledger = args.ledger,
+        .decode_budget = if (decode_budget) |*b| b else null,
+        .profiler = args.profiler,
+    };
+    defer releaseRegions(workers);
+    if (args.start_reads) |s| {
+        try s.start(s.ctx);
+        if (s.planned) |planned| planned(s.ctx);
+    }
+    const t0 = nowMonoNs();
+    runWorkers(workers);
+    releaseRegions(workers);
+    for (workers) |w| if (w.err) |e| {
+        consumer.setDecodeFailure(w.failure);
+        return e;
+    };
+    var t = timings;
+    t.decode_wall_ns = @intCast(nowMonoNs() - t0);
+    for (workers) |w| {
+        t.core.decode_ns += w.timings.decode_ns;
+        t.core.eval_ns += w.timings.eval_ns;
+        t.core.encode_ns += w.timings.encode_ns;
+    }
+    const prof = profile.threadOf(args.profiler, .main);
+    const final_start = nowMonoNs();
+    try state.finish(n_workers);
+    const scatter_end = final_start + @as(i64, @intCast(state.scatter_ns));
+    const fold_end = scatter_end + @as(i64, @intCast(state.fold_ns));
+    profile.record(prof, .integer_scatter, final_start, scatter_end, profile.args(.{}));
+    profile.record(prof, .integer_fold, scatter_end, fold_end, profile.args(.{}));
+    profile.record(prof, .integer_order, fold_end, nowMonoNs(), profile.args(.{}));
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    const types = try arena.alloc(GroupColType, outputs.len);
+    for (outputs, types, names) |out, *ty, *name| {
+        name.* = try gpa.dupe(u8, out.name);
+        ty.* = .{ .lane = .i64, .nullable = switch (out.source) {
+            .key => true,
+            .agg => |ai| ai != count.?,
+        }, .source = if (out.source == .key) leafSchemaElem(&metas[0], key.col_idx) else null };
+    }
+    output.integer_stream = .{ .state = state, .outputs = outputs, .count_call = count.? };
+    var bytes_in: u64 = 0;
+    for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
+    return .{
+        .files_in = args.inputs.len,
+        .rows_in = @intCast(rows),
+        .rows_scanned = @intCast(rows),
+        .rows_matched = @intCast(rows),
+        .bytes_in = bytes_in,
+        .row_groups_in = work.len,
+        .row_groups_pruned = 0,
+        .row_groups_full_match = work.len,
+        .cols_stat_pruned = plan.cols_stat_pruned,
+        .timings = t,
+        .output = output,
+        .part_agg = true,
+        .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
+    };
+}
+
 /// min/max of a bare column returns one of that column's values, so its output can carry the column's type.
 /// An aggregate argument or GROUP BY key that reads a repeated leaf (in a LIST or MAP) is refused while planning, as a
 /// filter on one is: it is an unsupported query (exit 2), not a decode failure found after reading the column.
@@ -4870,6 +5167,10 @@ pub const TypedAnswer = struct {
 
     inline fn putInteger(l: *Lane(i64), ty: GroupColType, i: usize, x: i128) !void {
         const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
+        return putIntegerRaw(l, raw_u64, i, x);
+    }
+
+    inline fn putIntegerRaw(l: *Lane(i64), raw_u64: bool, i: usize, x: i128) !void {
         l.values[i] = if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
             expr_agg.u64Lane(x)
         else
@@ -11599,6 +11900,114 @@ test "runMultiAggregate: a big GROUP BY answers the same rows in the same order 
     };
 }
 
+test "inline integer stream matches the row answer across workers, spawn failure and a tight fallback" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const base: MultiAggArgs = .{
+        .inputs = &inputs,
+        .aggregate = "count(*) AS c, sum(n) AS s",
+        .group_by = "n",
+        .max_memory = 512 << 20,
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .integer_records = false,
+    };
+    var want = try runMultiAggregate(testing.allocator, arena.allocator(), base);
+    defer want.deinit(testing.allocator);
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]?usize{ null, 0, 2 }) |fail_after| {
+        var args = base;
+        args.parallelism = j;
+        args.typed_answer = true;
+        args.integer_records = true;
+        args.integer_records_min_rows = 0;
+        if (fail_after) |n| spawn_util.injectFailureAfter(n);
+        defer spawn_util.resetFailure();
+        var got = try runMultiAggregate(testing.allocator, arena.allocator(), args);
+        defer got.deinit(testing.allocator);
+        const stream = got.output.integer_stream.?;
+        const rows = want.output.group_rows.?;
+        try testing.expectEqual(rows.len, stream.state.group_count);
+        var lo: usize = 0;
+        while (lo < rows.len) {
+            const hi = @min(rows.len, lo + 137);
+            var window = try stream.window(testing.allocator, got.state.group_col_types.?, lo, hi, j);
+            defer window.deinit(testing.allocator);
+            for (rows[lo..hi], 0..) |row, i| for (row, window.columns) |value, col| {
+                const lane = col.i64;
+                try testing.expectEqual(value == .null_val, lane.defs.len != 0 and lane.defs[i] == 0);
+                if (value != .null_val) try testing.expectEqual(value.i, lane.values[i]);
+            };
+            lo = hi;
+        }
+    };
+    var tight = base;
+    tight.integer_records = true;
+    tight.integer_records_min_rows = 0;
+    tight.typed_answer = true;
+    tight.max_memory = 16 << 20;
+    var fallback = try runMultiAggregate(testing.allocator, arena.allocator(), tight);
+    defer fallback.deinit(testing.allocator);
+    try testing.expect(fallback.output.integer_stream == null);
+    try testing.expectEqual(want.output.group_rows.?.len, fallback.output.typed.?.rows);
+}
+
+fn integerWindowAllocTrial(a: std.mem.Allocator, stream: IntegerStream, types: []const GroupColType) !void {
+    var answer = try stream.window(a, types, 0, stream.state.group_count, 1);
+    defer answer.deinit(a);
+    try testing.expectEqualSlices(i64, &.{ 0, 1, 2 }, answer.columns[0].i64.values);
+    try testing.expectEqualSlices(i64, &.{ 2, 2, 1 }, answer.columns[1].i64.values);
+    try testing.expectEqualSlices(i64, &.{ 3, 5, 0 }, answer.columns[2].i64.values);
+    try testing.expectEqual(@as(usize, 0), answer.columns[1].i64.defs.len);
+    if (stream.state.input_nulls == 0) {
+        for (answer.columns) |col| try testing.expectEqual(@as(usize, 0), col.i64.defs.len);
+    } else {
+        try testing.expectEqualSlices(u32, &.{ 0, 1, 1 }, answer.columns[0].i64.defs);
+        try testing.expectEqualSlices(u32, &.{ 1, 1, 0 }, answer.columns[2].i64.defs);
+    }
+}
+
+test "inline integer stream windows free every partial typed allocation" {
+    for ([_]bool{ false, true }) |nulls| {
+        const state = (try integer_groups.State.init(testing.allocator, null, 5, 1, 0, 1)).?;
+        defer state.deinit();
+        const k = [_]i64{ 0, 1, 2, 1, 0 };
+        const v = [_]i64{ 0, 7, 0, -2, 3 };
+        const kd = [_]u32{ 0, 1, 1, 1, 0 };
+        const vd = [_]u32{ 0, 1, 0, 1, 1 };
+        try state.locals[0].batch(.{ .num_rows = 5, .cols = &.{
+            .{ .i64 = .{
+                .values = &k,
+                .def_levels = if (nulls) &kd else null,
+                .max_def = @intFromBool(nulls),
+                .has_nulls = nulls,
+            } },
+            .{ .i64 = .{
+                .values = &v,
+                .def_levels = if (nulls) &vd else null,
+                .max_def = @intFromBool(nulls),
+                .has_nulls = nulls,
+            } },
+        } }, &.{ 0, 1 }, 0);
+        try state.finish(1);
+        const outputs = [_]BoundOutputColumn{
+            .{ .source = .{ .key = 0 }, .name = "k" },
+            .{ .source = .{ .agg = 0 }, .name = "c" },
+            .{ .source = .{ .agg = 1 }, .name = "s" },
+        };
+        const types = [_]GroupColType{
+            .{ .lane = .i64, .nullable = true },
+            .{ .lane = .i64, .nullable = false },
+            .{ .lane = .i64, .nullable = true },
+        };
+        const stream: IntegerStream = .{ .state = state, .outputs = &outputs, .count_call = 0 };
+        try testing.checkAllAllocationFailures(testing.allocator, integerWindowAllocTrial, .{ stream, &types });
+    }
+}
+
 test "runMultiAggregate: a NULL first key of two fixed-width keys still reads the second back" {
     // A fixed-width key image pads a NULL column's payload with zeros; read as framing, the pad would be taken for
     // the next column's flag and `id` would come back NULL.
@@ -13780,6 +14189,7 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
         /// at all was armed by the first per-worker plain scan.
         fn armable(st: State, t: S) bool {
             const a = st.a;
+            if (t.contains(.integer_records)) return a.integer_records and a.typed_answer and t.count() == 1;
             if (st.cut) return t.count() == 0;
             if (t.contains(.partitioned) and st.scans > 1) return false;
             if (st.plain and (t.contains(.dense) or t.contains(.spill) or t.contains(.pairs))) return false;
@@ -13805,7 +14215,7 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
                 a.dense,             a.spill,            a.distinct_pairs != .off, a.partition_cost,
                 a.partagg,           a.parallelism == 1, a.plain_rules,            st.chain.parts_tried,
                 st.may_fit,          st.cut,             st.plain,                 st.scans > 1,
-                st.chain.lean_tried, a.private_runs,
+                st.chain.lean_tried, a.private_runs,     a.integer_records,
             }, 0..) |b, i| k |= @as(u16, @intFromBool(b)) << @intCast(i);
             return k;
         }
@@ -13813,9 +14223,16 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
         /// The most scans any sequence of refusals from `st` runs; every one of them ends.
         fn longest(args: MultiAggArgs, st: State, depth: usize) !usize {
             try testing.expect(depth < 9);
-            var seen: [1 << 14]bool = @splat(false);
+            var seen: [1 << 15]bool = @splat(false);
             var most: usize = 1;
-            const all = std.enums.values(FastPath);
+            var candidates: [std.enums.values(FastPath).len]FastPath = undefined;
+            var count: usize = 0;
+            for (std.enums.values(FastPath)) |path| {
+                if (path == .integer_records and (!st.a.integer_records or !st.a.typed_answer)) continue;
+                candidates[count] = path;
+                count += 1;
+            }
+            const all = candidates[0..count];
             for (0..@as(usize, 1) << @intCast(all.len)) |bits| {
                 var t: S = .{};
                 for (all, 0..) |path, i| if (bits >> @intCast(i) & 1 != 0) t.insert(path);
@@ -13828,7 +14245,8 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
                     .chain = chain,
                     .may_fit = may_fit,
                     .cut = st.cut or (t.contains(.plain_rule) and !t.contains(.private_runs)),
-                    .plain = st.plain or !(t.contains(.partitioned) or st.a.partagg or t.contains(.plain_rule)),
+                    .plain = st.plain or !(t.contains(.integer_records) or t.contains(.partitioned) or
+                        st.a.partagg or t.contains(.plain_rule)),
                     .scans = st.scans + 1,
                 };
                 if (seen[key(after)]) continue;
@@ -13847,6 +14265,13 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
         .plain = false,
         .scans = 0,
     };
+    // The integer path is a single prefix to this general chain: it arms no other path and switches itself off.
+    var integer_chain: Chain = .{ .parts_tried = false };
+    var integer_args = args;
+    integer_args.typed_answer = true;
+    const declined = narrowed(integer_args, integer_args, S.initMany(&.{.integer_records}), &integer_chain, false).?;
+    try testing.expect(!declined.integer_records and declined.parallelism == args.parallelism);
+    try testing.expect(!integer_chain.parts_tried);
     // The cost rules' shared partitions, a fast path's mask, the plain tables, the forced partitions, one worker, and
     // one worker on a small decode budget.
     try testing.expectEqual(@as(usize, 7), try Walk.longest(args, start, 0));

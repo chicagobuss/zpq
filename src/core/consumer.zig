@@ -20,6 +20,7 @@
 //! any I/O. The `Sink` is opaque; the source is a borrowed slice.
 
 const std = @import("std");
+const integer_groups = @import("integer_groups.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 
@@ -170,11 +171,11 @@ pub fn resolveDecodeFailure(diag: ?*Diag, metas: []const schema.FileMetaData, in
 /// a page can hold, not the query's own failures (overflow, memory) that a decode site would mislabel.
 pub fn isDecodeError(err: anyerror) bool {
     const names = [_][]const u8{
-        "UnexpectedPage",      "DictionaryMissing",          "UnexpectedDictionaryPage", "ShortDecode",
-        "DefLevelsMismatch",   "BadPageHeader",              "BadPageCount",             "DecompressionFailed",
-        "SizeMismatch",        "NegativeSize",               "MissingChunkBytes",        "UnexpectedEndOfChunk",
-        "LevelOutOfRange",     "IntOutOfRange",              "PageLargerThanChunk",      "UnsupportedEncoding",
-        "UnsupportedPageType", "PageValueCountExceedsChunk", "DictionaryLargerThanPage", "UnsupportedCodec",
+        "UnexpectedPage",       "DictionaryMissing",          "UnexpectedDictionaryPage", "ShortDecode",
+        "DefLevelsMismatch",    "BadPageHeader",              "BadPageCount",             "DecompressionFailed",
+        "SizeMismatch",         "NegativeSize",               "MissingChunkBytes",        "UnexpectedEndOfChunk",
+        "LevelOutOfRange",      "IntOutOfRange",              "PageLargerThanChunk",      "UnsupportedEncoding",
+        "UnsupportedPageType",  "PageValueCountExceedsChunk", "DictionaryLargerThanPage", "UnsupportedCodec",
         "InvalidColumnOffsets", "ColumnMetaMissing",
     };
     for (names) |n| if (std.mem.eql(u8, n, @errorName(err))) return true;
@@ -2264,7 +2265,8 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
         return elem;
     }
     if (c.source) |src| if (c.expr == .col_ref and !schema.isFloat16(src) and (src.type == .BYTE_ARRAY or
-        src.type == .FIXED_LEN_BYTE_ARRAY or src.type == .INT64 or src.type == .DOUBLE or src.type == .BOOLEAN)) {
+        src.type == .FIXED_LEN_BYTE_ARRAY or src.type == .INT64 or src.type == .DOUBLE or src.type == .BOOLEAN))
+    {
         var renamed = src;
         renamed.name = c.alias;
         renamed.num_children = 0;
@@ -2406,6 +2408,28 @@ pub fn decimalElem(elem: *schema.SchemaElement, d: expr_ast.Dec) void {
 /// Rows from which `writeAggregateRows` encodes columns on several threads: fewer encode faster than threads start.
 const parallel_encode_rows = 1 << 16;
 
+/// Rows per row group of a written answer. A bigger answer is cut at these fixed boundaries, never by `-j` or memory,
+/// so its row groups' columns encode on every worker and its readers can split it the same way; a smaller one is the
+/// single row group it always was.
+pub const answer_rg_rows: usize = 1 << 17;
+
+/// Rows `lo..hi` of an answer column: its values and levels, nothing else (an answer column is never coded,
+/// repeated or carrying a decimal's exact view).
+fn sliceOutputCol(col: expr_agg.OutputCol, lo: usize, hi: usize) expr_agg.OutputCol {
+    var out = col;
+    switch (out.col) {
+        inline else => |*c| {
+            std.debug.assert(c.codes == null and c.rep_levels == null and c.unscaled == null);
+            c.values = c.values[lo..hi];
+            if (c.def_levels) |d| {
+                c.def_levels = d[lo..hi];
+                c.has_nulls = std.mem.indexOfScalar(u32, d[lo..hi], 0) != null;
+            }
+        },
+    }
+    return out;
+}
+
 fn encodeAggOutputCol(
     arena: std.mem.Allocator,
     out_col: expr_agg.OutputCol,
@@ -2421,6 +2445,7 @@ fn encodeAggOutputCol(
         .path_in_schema = path_buf,
         .codec = codec,
         .zstd = zstd,
+        .distinct = out_col.distinct,
     });
 }
 
@@ -2542,9 +2567,10 @@ const AggColumnWave = struct {
 };
 
 /// Write an aggregate result — one row, or one per GROUP BY group — as a
-/// single-row-group parquet file with one column-chunk per `OutputCol`
-/// (avg-style aggs already split into two cols upstream), each holding
-/// `num_rows` values. The output of an aggregate workload is a tiny parquet
+/// parquet file with one column-chunk per `OutputCol` per row group
+/// (avg-style aggs already split into two cols upstream): one row group of
+/// `num_rows` values, or row groups of `answer_rg_rows` for a bigger answer,
+/// their chunks encoded together. The output of an aggregate workload is a parquet
 /// that downstream consumers (Iceberg/Athena/Polars/another zpq invocation)
 /// read like any other file.
 ///
@@ -2559,24 +2585,127 @@ pub fn writeAggregateRows(
     zstd: compression.ZstdPlan,
     encode: AggEncode,
 ) !u64 {
-    const together = output_cols.len > 1 and num_rows >= parallel_encode_rows;
-    return writeAggregateRowsEncoded(arena, sink, output_cols, num_rows, codec, zstd, if (together) encode else .{ .ledger = encode.ledger });
+    const together = (output_cols.len > 1 or num_rows > answer_rg_rows) and num_rows >= parallel_encode_rows;
+    return writeAggregateRowsEncoded(
+        arena,
+        sink,
+        output_cols,
+        num_rows,
+        answer_rg_rows,
+        codec,
+        zstd,
+        if (together) encode else .{ .ledger = encode.ledger },
+    );
 }
 
-/// `writeAggregateRows` under `encode`, whatever the answer's size; the bytes written are the same for every `encode`.
+/// `writeAggregateRows` under `encode`, whatever the answer's size, in row groups of `rg_rows` (`answer_rg_rows`); the
+/// bytes written are the same for every `encode`.
 fn writeAggregateRowsEncoded(
     arena: std.mem.Allocator,
     sink: streaming.Sink,
     output_cols: []const expr_agg.OutputCol,
     num_rows: i64,
+    rg_rows: usize,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
     encode: AggEncode,
 ) !u64 {
-    const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
-    var off: u64 = 0;
-    try sink.write(&MAGIC);
-    off += MAGIC.len;
+    var file = try AggregateFile.init(arena, sink);
+    defer file.deinit();
+    try appendAggregateRows(&file, output_cols, num_rows, rg_rows, codec, zstd, encode);
+    return file.finish(output_cols);
+}
+
+/// One deterministic aggregate file, fed complete fixed row groups in bounded windows. The caller keeps a window
+/// alive through `append` and may then free it; only owned footer metadata survives. The last window may be short.
+pub const AggregateFile = struct {
+    arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    off: u64 = 4,
+    rows: i64 = 0,
+    groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty,
+    cached_wave: ?AggColumnWave = null,
+    cached_width: usize = 0,
+    cached_alone: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    cached_ledger: ?*expr_agg.SharedBudget = null,
+    cached_charge: usize = 0,
+
+    pub fn init(arena: std.mem.Allocator, sink: streaming.Sink) !AggregateFile {
+        try sink.write("PAR1");
+        return .{ .arena = arena, .sink = sink };
+    }
+
+    pub fn deinit(f: *AggregateFile) void {
+        if (f.cached_wave) |*w| w.deinit();
+        f.cached_alone.deinit();
+        if (f.cached_ledger) |l| l.release(f.cached_charge);
+    }
+
+    /// Reuse one bounded wave for four row groups of three integer columns. Its full scratch upper bound stays
+    /// charged until deinit, including retained pages between windows. A refused reservation keeps the usual waves.
+    pub fn reserveIntegerWorkspace(f: *AggregateFile, encode: AggEncode) !void {
+        std.debug.assert(f.cached_width == 0 and f.cached_charge == 0);
+        const admitted = encode.budget / (answer_rg_rows * 12 * 3);
+        if (admitted == 0) return;
+        const width = @max(1, @min(@min(encode.workers, 12), admitted));
+        const charge = width * answer_rg_rows * 12 * 3;
+        if (encode.ledger) |l| _ = l.drawExact(charge) orelse return;
+        f.cached_ledger = encode.ledger;
+        f.cached_charge = charge;
+        if (width > 1) f.cached_wave = try AggColumnWave.init(f.arena, width);
+        f.cached_width = width;
+    }
+
+    pub fn append(
+        f: *AggregateFile,
+        cols: []const expr_agg.OutputCol,
+        rows: usize,
+        codec: schema.CompressionCodec,
+        zstd: compression.ZstdPlan,
+        encode: AggEncode,
+    ) !void {
+        try appendAggregateRows(f, cols, @intCast(rows), answer_rg_rows, codec, zstd, encode);
+    }
+
+    /// `cols` supplies names and types only, and may have empty value slices.
+    pub fn finish(f: *AggregateFile, cols: []const expr_agg.OutputCol) !u64 {
+        return aggregateFooter(f.arena, f.sink, cols, f.rows, f.groups, f.off);
+    }
+};
+
+fn appendAggregateRows(
+    file: *AggregateFile,
+    output_cols: []const expr_agg.OutputCol,
+    num_rows: i64,
+    rg_rows: usize,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    options: AggEncode,
+) !void {
+    const arena = file.arena;
+    const sink = file.sink;
+    var off = file.off;
+    var encode = options;
+    if (file.cached_width != 0) {
+        encode.ledger = null;
+        encode.workers = @min(encode.workers, file.cached_width);
+    }
+
+    // Each row group's columns in order, row group after row group: the units encoded and written below. One row
+    // group is the columns themselves.
+    const total_rows: usize = @intCast(num_rows);
+    const n_rg = @max(1, std.math.divCeil(usize, total_rows, rg_rows) catch unreachable);
+    const units: []const expr_agg.OutputCol = if (n_rg == 1) output_cols else blk: {
+        const all = try arena.alloc(expr_agg.OutputCol, n_rg * output_cols.len);
+        for (0..n_rg) |g| {
+            const lo = g * rg_rows;
+            const hi = @min(total_rows, lo + rg_rows);
+            for (output_cols, 0..) |c, i| all[g * output_cols.len + i] = sliceOutputCol(c, lo, hi);
+        }
+        break :blk all;
+    };
+    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    try new_row_groups.ensureTotalCapacity(arena, n_rg);
 
     var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     var rg_total: i64 = 0;
@@ -2585,16 +2714,25 @@ fn writeAggregateRowsEncoded(
     // does. Each wave's columns are then written, and any error returned, in column order, so the file and the error
     // are the serial loop's; their metadata is copied out and the wave's memory freed before the next. A column alone
     // encodes on memory given back once it is written, not on `arena`, which kept every column's until the end.
-    const width = @min(encode.workers, output_cols.len);
-    var wave: ?AggColumnWave = if (width > 1) try AggColumnWave.init(arena, width) else null;
-    defer if (wave) |*w| w.deinit();
-    var alone = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer alone.deinit();
+    const width = @min(encode.workers, units.len);
+    if (file.cached_width != 0) {
+        std.debug.assert(width <= file.cached_width);
+        for (units) |unit| {
+            std.debug.assert(unit.col == .i64);
+            std.debug.assert(aggEncodeCharge(unit) <= answer_rg_rows * 12 * 3);
+        }
+    }
+    var wave: ?AggColumnWave = file.cached_wave orelse
+        if (width > 1) try AggColumnWave.init(arena, width) else @as(?AggColumnWave, null);
+    defer if (file.cached_width == 0) if (wave) |*w| w.deinit();
+    var own_alone = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer own_alone.deinit();
+    const alone = if (file.cached_width != 0) &file.cached_alone else &own_alone;
     var drawn: u64 = 0;
     defer if (encode.ledger) |l| l.release(drawn);
     var wave_lo: usize = 0;
     var wave_hi: usize = 0;
-    for (output_cols, 0..) |out_col, i| {
+    for (units, 0..) |out_col, i| {
         if (i == wave_hi) {
             if (encode.ledger) |l| l.release(drawn);
             drawn = 0;
@@ -2603,8 +2741,8 @@ fn writeAggregateRowsEncoded(
             if (wave) |*w| {
                 w.reset();
                 var charged: u64 = aggEncodeCharge(out_col);
-                while (wave_hi < output_cols.len and wave_hi - i < width) : (wave_hi += 1) {
-                    const c = aggEncodeCharge(output_cols[wave_hi]);
+                while (wave_hi < units.len and wave_hi - i < width) : (wave_hi += 1) {
+                    const c = aggEncodeCharge(units[wave_hi]);
                     if (charged +| c > encode.budget) break;
                     charged += c;
                 }
@@ -2614,9 +2752,9 @@ fn writeAggregateRowsEncoded(
                         drawn = charged;
                         break;
                     }
-                    charged -= aggEncodeCharge(output_cols[wave_hi - 1]);
+                    charged -= aggEncodeCharge(units[wave_hi - 1]);
                 };
-                if (wave_hi - i > 1) w.run(output_cols[i..wave_hi], codec, zstd);
+                if (wave_hi - i > 1) w.run(units[i..wave_hi], codec, zstd);
             }
             if (wave_hi - i == 1) if (encode.ledger) |l| {
                 drawn = l.drawExact(aggEncodeCharge(out_col)) orelse return error.ExceededMemoryBudget;
@@ -2625,7 +2763,7 @@ fn writeAggregateRowsEncoded(
         const leaf_elem = aggLeafElem(out_col);
         const in_wave = wave != null and wave_hi - wave_lo > 1;
         defer if (!in_wave) {
-            _ = alone.reset(.free_all);
+            _ = alone.reset(if (file.cached_width != 0) .retain_capacity else .free_all);
         };
         const enc = if (in_wave)
             try wave.?.results[i - wave_lo]
@@ -2650,8 +2788,40 @@ fn writeAggregateRowsEncoded(
             .file_offset = col_start,
             .meta_data = em,
         });
+        if (rg_columns.items.len == output_cols.len) {
+            const g = new_row_groups.items.len;
+            const g_rows = if (n_rg == 1) num_rows else @as(i64, @intCast(@min(total_rows - g * rg_rows, rg_rows)));
+            new_row_groups.appendAssumeCapacity(.{
+                .columns = rg_columns,
+                .total_byte_size = rg_total,
+                .num_rows = g_rows,
+            });
+            rg_columns = .empty;
+            rg_total = 0;
+        }
     }
 
+    // No columns, no units: the one row group is still written, empty.
+    if (new_row_groups.items.len == 0)
+        new_row_groups.appendAssumeCapacity(.{
+            .columns = rg_columns,
+            .total_byte_size = rg_total,
+            .num_rows = num_rows,
+        });
+    try file.groups.appendSlice(arena, new_row_groups.items);
+    file.rows += num_rows;
+    file.off = off;
+}
+
+fn aggregateFooter(
+    arena: std.mem.Allocator,
+    sink: streaming.Sink,
+    output_cols: []const expr_agg.OutputCol,
+    num_rows: i64,
+    new_row_groups: std.ArrayListUnmanaged(schema.RowGroup),
+    start: u64,
+) !u64 {
+    var off = start;
     var new_schema: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
     try new_schema.append(arena, .{
         .type = null,
@@ -2667,20 +2837,13 @@ fn writeAggregateRowsEncoded(
     });
     for (output_cols) |out_col| try new_schema.append(arena, aggLeafElem(out_col));
 
-    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
-    try new_row_groups.append(arena, .{
-        .columns = rg_columns,
-        .total_byte_size = rg_total,
-        .num_rows = num_rows,
-    });
-
     const new_meta: schema.FileMetaData = .{
         .version = 1,
         .schema = new_schema,
         .num_rows = num_rows,
         .created_by = schema.ZPQ_CREATED_BY,
         .row_groups = new_row_groups,
-        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, rg_columns.items.len, null, &.{}),
+        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, output_cols.len, null, &.{}),
     };
 
     var w: thrift.Writer = .init(arena);
@@ -2694,8 +2857,8 @@ fn writeAggregateRowsEncoded(
     std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
     try sink.write(&len_bytes);
     off += len_bytes.len;
-    try sink.write(&MAGIC);
-    off += MAGIC.len;
+    try sink.write("PAR1");
+    off += 4;
 
     return off;
 }
@@ -2766,6 +2929,7 @@ pub const AggTarget = union(enum) {
         /// A retained key domain's lanes: a row group whose dictionary the domain translated folds there, by global
         /// id, instead of into `table`.
         dense: ?*agg_dense.Lanes = null,
+        records: ?*integer_groups.Local = null,
     },
 
     fn calls(self: AggTarget) []const expr_agg.AggCall {
@@ -3073,8 +3237,7 @@ fn scatterGrouped(
             partagg.PartAgg.lock(pt);
             defer partagg.PartAgg.unlock(pt);
             for (order[lo..hi]) |r| ids[r] = try insertRow(ra, &scratch, &pt.table, key_cols, r, g.calls, pos);
-            try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls,
-                if (pt.table.compact.stride != 0) &pt.table.compact else null);
+            try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls, if (pt.table.compact.stride != 0) &pt.table.compact else null);
         }
         return;
     }
@@ -3088,8 +3251,7 @@ fn scatterGrouped(
             const key = try storedRowKey(ra, &scratch, g.table, key_cols, r, &image);
             ids[r] = @intCast(try part.append(run, key, pos + r));
         }
-        try preps.fold(gpa, run.accs.items, ids, order[lo..hi], g.calls,
-            if (run.compact.stride != 0) &run.compact else null);
+        try preps.fold(gpa, run.accs.items, ids, order[lo..hi], g.calls, if (run.compact.stride != 0) &run.compact else null);
     }
 }
 
@@ -3158,8 +3320,7 @@ fn foldGroupedWindows(
         const pos = g.pos_base + @as(u64, @intCast(off));
         // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its partition.
         if (local.abandoned) {
-            try scatterGrouped(wa, ra, gpa, g, part, local, cols, lookup, &win_sel, consumed,
-                &prepared_values, pos, off, n);
+            try scatterGrouped(wa, ra, gpa, g, part, local, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n);
             off += n;
             continue;
         }
@@ -3167,9 +3328,7 @@ fn foldGroupedWindows(
             const win_cols = try wa.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
             const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
-            if (try agg_coded.groupedCoded(wa, gpa, g.calls, g.keys, g.table, pos, &win,
-                lookup, &win_sel, budget, region))
-            {
+            if (try agg_coded.groupedCoded(wa, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget, region)) {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
                 continue;
@@ -3273,6 +3432,7 @@ pub fn scanRGForAgg(
         if (!whole) if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) |kept|
             return kept;
         if (!whole) {
+            if (target == .grouped and target.grouped.records != null) return error.ExceededMemoryBudget;
             const sp = try StagePlan.init(plan_arena.allocator(), in, target, handled_via_stats);
             if (sp.estimate < full) {
                 staged = true;
@@ -3343,7 +3503,7 @@ pub fn scanRGForAgg(
         t.record(.decode, t_decode_start, t_decode_end, decode_args);
     }
 
-    if (target == .grouped and !staged and decode_options.encoded)
+    if (target == .grouped and target.grouped.records == null and !staged and decode_options.encoded)
         try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
@@ -3354,6 +3514,13 @@ pub fn scanRGForAgg(
 
     switch (target) {
         .grouped => |g| {
+            if (g.records) |records| {
+                try records.batch(batch, lookup, 0);
+                const end = nowMonoNs();
+                ws.timings.encode_ns += @intCast(end - t_eval_end);
+                profile.record(prof, .aggregate, t_eval_end, end, profile.args(.{ selected, calls.len }));
+                return selected;
+            }
             if (g.part != null and !staged) {
                 try foldGroupedWindows(
                     ra,
@@ -3373,9 +3540,7 @@ pub fn scanRGForAgg(
                 return selected;
             }
             const dense = if (g.dense) |d| !staged and decode_options.encoded and
-                try d.fold(ra, gpa, g.keys[0].col_ref, in.file_index, in.rg_index, g.pos_base, &batch, lookup, &sel)
-            else
-                false;
+                try d.fold(ra, gpa, g.keys[0].col_ref, in.file_index, in.rg_index, g.pos_base, &batch, lookup, &sel) else false;
             if (dense or (!staged and decode_options.encoded and
                 try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget, ws.region)))
             {
@@ -3535,6 +3700,10 @@ fn scanRGSliced(
                 try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);
             },
             .grouped => |g| {
+                if (g.records) |records| {
+                    try records.batch(batch, lookup, done);
+                    continue;
+                }
                 if (g.part != null) {
                     var shifted = target;
                     shifted.grouped.pos_base = g.pos_base + @as(u64, @intCast(done));
@@ -5243,8 +5412,8 @@ fn copyChunkRecompressed(
         // Page by page into the sink: a codec that expands (to UNCOMPRESSED, say) never holds more than a page.
         const t_encode = nowMonoNs();
         const limit = column_mod.inflateLimit(m);
-        const r = recompressChunkTo(scratch, rc.scratch, slice, m.codec, rc.codec, rc.zstd, out, timings, limit) catch
-            |err| return reportRecompressError(err, m, rc.codec);
+        const r = recompressChunkTo(scratch, rc.scratch, slice, m.codec, rc.codec, rc.zstd, out, timings, limit) catch |err|
+            return reportRecompressError(err, m, rc.codec);
         const t_encode_end = nowMonoNs();
         timings.encode_ns += @intCast(t_encode_end - t_encode);
         profile.record(timings.prof, .encode, t_encode, t_encode_end, profile.args(.{ 1, m.num_values }));
@@ -7344,7 +7513,7 @@ test "writeAggregateRows: columns encoded on threads write the serial bytes, wha
     const cols = try aggAnswerCols(a, n, null);
     for ([_]schema.CompressionCodec{ .SNAPPY, .ZSTD, .UNCOMPRESSED }) |codec| {
         var serial: AnswerCapture = .{ .a = a };
-        const want = try writeAggregateRowsEncoded(a, serial.sink(), cols, n, codec, .{}, .{});
+        const want = try writeAggregateRowsEncoded(a, serial.sink(), cols, n, answer_rg_rows, codec, .{}, .{});
         try std.testing.expectEqual(@as(u64, serial.bytes.items.len), want);
         // Every column in one wave; two columns' charge a wave, so waves of two and lone columns; and spawns failing.
         const two = aggEncodeCharge(cols[0]) + aggEncodeCharge(cols[1]);
@@ -7358,7 +7527,7 @@ test "writeAggregateRows: columns encoded on threads write the serial bytes, wha
             if (run.fail_after) |k| spawn_util.injectFailureAfter(k);
             defer spawn_util.resetFailure();
             var par: AnswerCapture = .{ .a = a };
-            const got = try writeAggregateRowsEncoded(a, par.sink(), cols, n, codec, .{}, run.encode);
+            const got = try writeAggregateRowsEncoded(a, par.sink(), cols, n, answer_rg_rows, codec, .{}, run.encode);
             try std.testing.expectEqual(want, got);
             try std.testing.expectEqualSlices(u8, serial.bytes.items, par.bytes.items);
         }
@@ -7374,10 +7543,10 @@ test "writeAggregateRows: on threads, the serial error and the bytes written bef
     const cols = try aggAnswerCols(a, n, 600);
     for ([_]?usize{ null, 1, 2 }) |fail_at| {
         var serial: AnswerCapture = .{ .a = a, .fail_at = fail_at };
-        const want = writeAggregateRowsEncoded(a, serial.sink(), cols, n, .SNAPPY, .{}, .{});
+        const want = writeAggregateRowsEncoded(a, serial.sink(), cols, n, answer_rg_rows, .SNAPPY, .{}, .{});
         var par: AnswerCapture = .{ .a = a, .fail_at = fail_at };
         const all: AggEncode = .{ .workers = 8, .budget = std.math.maxInt(u64) };
-        const got = writeAggregateRowsEncoded(a, par.sink(), cols, n, .SNAPPY, .{}, all);
+        const got = writeAggregateRowsEncoded(a, par.sink(), cols, n, answer_rg_rows, .SNAPPY, .{}, all);
         try std.testing.expectError(if (fail_at == null) error.UnsupportedType else error.TestSinkFailed, want);
         try std.testing.expectEqual(want, got);
         try std.testing.expectEqualSlices(u8, serial.bytes.items, par.bytes.items);
@@ -7390,7 +7559,16 @@ fn writeAnswerOnThreads(a: std.mem.Allocator) !void {
     const arena = arena_state.allocator();
     const cols = try aggAnswerCols(arena, 300, null);
     var out: AnswerCapture = .{ .a = arena };
-    _ = try writeAggregateRowsEncoded(arena, out.sink(), cols, 300, .SNAPPY, .{}, .{ .workers = 4, .budget = 1 << 40 });
+    _ = try writeAggregateRowsEncoded(
+        arena,
+        out.sink(),
+        cols,
+        300,
+        answer_rg_rows,
+        .SNAPPY,
+        .{},
+        .{ .workers = 4, .budget = 1 << 40 },
+    );
 }
 
 test "writeAggregateRows: one worker, or a budget no two columns fit, starts no thread" {
@@ -7427,6 +7605,162 @@ test "writeAggregateRows: a column encoded alone still draws from the ledger" {
 
 test "writeAggregateRows: on threads, an allocation failure frees everything" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, writeAnswerOnThreads, .{});
+}
+
+/// The bytes between a written answer's leading magic and its footer: its column chunks, in order.
+fn answerChunks(file: []const u8) []const u8 {
+    const footer_len = std.mem.readInt(u32, file[file.len - 8 ..][0..4], .little);
+    return file[4 .. file.len - 8 - footer_len];
+}
+
+fn answerFooter(a: std.mem.Allocator, file: []const u8) !schema.FileMetaData {
+    const footer_len = std.mem.readInt(u32, file[file.len - 8 ..][0..4], .little);
+    var reader = thrift.Reader.init(file[file.len - 8 - footer_len .. file.len - 8]);
+    return schema.FileMetaData.read(a, &reader);
+}
+
+test "writeAggregateRows: big answers use fixed row groups with serial chunks at every worker count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const n = 1000;
+    const rg = 300;
+    const cols = try aggAnswerCols(a, n, null);
+    var serial: AnswerCapture = .{ .a = a };
+    _ = try writeAggregateRowsEncoded(a, serial.sink(), cols, n, rg, .SNAPPY, .{}, .{});
+    const meta = try answerFooter(a, serial.bytes.items);
+    try std.testing.expectEqual(@as(i64, n), meta.num_rows);
+    try std.testing.expectEqual(@as(usize, 4), meta.row_groups.items.len);
+    for (meta.row_groups.items, [_]i64{ 300, 300, 300, 100 }) |g, rows| {
+        try std.testing.expectEqual(rows, g.num_rows);
+        try std.testing.expectEqual(cols.len, g.columns.items.len);
+    }
+    // Row group g's chunks are what its rows encode to as an answer of their own, in order.
+    var want: std.ArrayList(u8) = .empty;
+    for (0..4) |g| {
+        const lo = g * rg;
+        const hi = @min(n, lo + rg);
+        const part = try a.alloc(expr_agg.OutputCol, cols.len);
+        for (cols, part) |c, *p| p.* = sliceOutputCol(c, lo, hi);
+        var alone: AnswerCapture = .{ .a = a };
+        _ = try writeAggregateRowsEncoded(a, alone.sink(), part, @intCast(hi - lo), rg, .SNAPPY, .{}, .{});
+        try want.appendSlice(a, answerChunks(alone.bytes.items));
+    }
+    try std.testing.expectEqualSlices(u8, want.items, answerChunks(serial.bytes.items));
+    // The same file whatever the workers, the budget's waves, or failing spawns.
+    const two = aggEncodeCharge(sliceOutputCol(cols[0], 0, rg)) + aggEncodeCharge(sliceOutputCol(cols[1], 0, rg));
+    const Run = struct { encode: AggEncode, fail_after: ?usize = null };
+    for ([_]Run{
+        .{ .encode = .{ .workers = 16, .budget = std.math.maxInt(u64) } },
+        .{ .encode = .{ .workers = 3, .budget = two } },
+        .{ .encode = .{ .workers = 7, .budget = std.math.maxInt(u64) }, .fail_after = 1 },
+    }) |run| {
+        if (run.fail_after) |k| spawn_util.injectFailureAfter(k);
+        defer spawn_util.resetFailure();
+        var par: AnswerCapture = .{ .a = a };
+        _ = try writeAggregateRowsEncoded(a, par.sink(), cols, n, rg, .SNAPPY, .{}, run.encode);
+        try std.testing.expectEqualSlices(u8, serial.bytes.items, par.bytes.items);
+    }
+}
+
+test "writeAggregateRows: an answer of a row group's rows or fewer is one row group" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cols = try aggAnswerCols(a, 300, null);
+    for ([_]usize{ 0, 1, 300 }) |n| {
+        const part = try a.alloc(expr_agg.OutputCol, cols.len);
+        for (cols, part) |c, *p| p.* = sliceOutputCol(c, 0, n);
+        var out: AnswerCapture = .{ .a = a };
+        _ = try writeAggregateRowsEncoded(a, out.sink(), part, @intCast(n), 300, .SNAPPY, .{}, .{});
+        const meta = try answerFooter(a, out.bytes.items);
+        try std.testing.expectEqual(@as(usize, 1), meta.row_groups.items.len);
+        try std.testing.expectEqual(@as(i64, @intCast(n)), meta.row_groups.items[0].num_rows);
+    }
+}
+
+fn writeRowGroupsOnThreads(a: std.mem.Allocator) !void {
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cols = try aggAnswerCols(arena, 300, null);
+    var out: AnswerCapture = .{ .a = arena };
+    _ = try writeAggregateRowsEncoded(
+        arena,
+        out.sink(),
+        cols,
+        300,
+        128,
+        .SNAPPY,
+        .{},
+        .{ .workers = 4, .budget = 1 << 40 },
+    );
+}
+
+test "writeAggregateRows: row groups on threads, an allocation failure frees everything" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, writeRowGroupsOnThreads, .{});
+}
+
+fn writeAnswerWindows(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cols = try aggAnswerCols(alloc, 1000, null);
+    var whole: AnswerCapture = .{ .a = alloc };
+    _ = try writeAggregateRowsEncoded(alloc, whole.sink(), cols, 1000, 300, .SNAPPY, .{}, .{});
+    var windows: AnswerCapture = .{ .a = alloc };
+    var file = try AggregateFile.init(alloc, windows.sink());
+    defer file.deinit();
+    for ([_][2]usize{ .{ 0, 600 }, .{ 600, 1000 } }) |range| {
+        const part = try alloc.alloc(expr_agg.OutputCol, cols.len);
+        for (cols, part) |c, *p| p.* = sliceOutputCol(c, range[0], range[1]);
+        try appendAggregateRows(
+            &file,
+            part,
+            @intCast(range[1] - range[0]),
+            300,
+            .SNAPPY,
+            .{},
+            .{ .workers = 4, .budget = 1 << 30 },
+        );
+    }
+    _ = try file.finish(cols);
+    try std.testing.expectEqualSlices(u8, whole.bytes.items, windows.bytes.items);
+}
+
+test "writeAggregateRows: bounded windows write the whole answer's bytes and free every failed allocation" {
+    try writeAnswerWindows(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, writeAnswerWindows, .{});
+}
+
+fn cachedIntegerWindows(a: std.mem.Allocator) !void {
+    var budget: expr_agg.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const all = try aggAnswerCols(alloc, 1000, null);
+    var cols = [_]expr_agg.OutputCol{ all[0], all[1], all[0] };
+    cols[2].name = "s";
+    var whole: AnswerCapture = .{ .a = alloc };
+    _ = try writeAggregateRowsEncoded(alloc, whole.sink(), &cols, 1000, 300, .SNAPPY, .{}, .{});
+    var windows: AnswerCapture = .{ .a = alloc };
+    var file = try AggregateFile.init(alloc, windows.sink());
+    defer file.deinit();
+    const encode: AggEncode = .{ .workers = 8, .budget = 128 << 20, .ledger = &budget };
+    try file.reserveIntegerWorkspace(encode);
+    for ([_][2]usize{ .{ 0, 600 }, .{ 600, 1000 } }) |range| {
+        var part: [3]expr_agg.OutputCol = undefined;
+        for (cols, &part) |c, *p| p.* = sliceOutputCol(c, range[0], range[1]);
+        try appendAggregateRows(&file, &part, @intCast(range[1] - range[0]), 300, .SNAPPY, .{}, encode);
+    }
+    _ = try file.finish(&cols);
+    try std.testing.expectEqualSlices(u8, whole.bytes.items, windows.bytes.items);
+}
+
+test "writeAggregateRows: retained integer encode scratch stays charged through windows and unwinds on failure" {
+    try cachedIntegerWindows(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cachedIntegerWindows, .{});
 }
 
 fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !void {
@@ -7487,8 +7821,7 @@ fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !voi
         .part = &part,
         .local = &local,
     } };
-    try foldGroupedWindows(arena.allocator(), a, target, &cols, &.{ 0, 1 }, &sel,
-        &.{ coded, false }, coded, null, null);
+    try foldGroupedWindows(arena.allocator(), a, target, &cols, &.{ 0, 1 }, &sel, &.{ coded, false }, coded, null, null);
     try part.flush(&local, &table);
     try part.foldRuns(1);
     var groups: usize = 0;

@@ -120,6 +120,7 @@ test {
     _ = @import("core/expr/eval.zig");
     _ = @import("core/expr/agg.zig");
     _ = @import("core/partagg.zig");
+    _ = @import("core/integer_groups.zig");
     _ = @import("core/ndv.zig");
     _ = @import("core/expr/agg_coded.zig");
     _ = @import("core/expr/agg_dense.zig");

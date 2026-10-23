@@ -230,6 +230,7 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
 ### Behaviour changes
 
 **Contracts**
+- Canonical decode ordering currently covers scanned units with bounded-probe fallback; before 0.5.0 final, remove live-ledger dependence from stream probes, check full-projection input omitted by census/sketch passes, and order the remaining worker-error fallback canonically.
 - Aggregate decode failures have one canonical order: input and row-group order first, then the failing page's
   first row, then input-column order in the result projection. A computed output's leaves keep schema order;
   columns read only by filters follow projected columns. Checks within a page retain their existing order.

@@ -133,6 +133,7 @@ test {
     _ = @import("core/system.zig");
     _ = @import("core/bytes.zig");
     _ = @import("core/row_group_arena.zig");
+    _ = @import("core/hw.zig");
     _ = @import("core/parquet/metadata.zig");
     _ = @import("core/parquet/schema_tree.zig");
     _ = @import("core/parquet/snappy.zig");

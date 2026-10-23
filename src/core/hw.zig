@@ -42,6 +42,7 @@ pub threadlocal var test_cpu: ?Cpu = null;
 var state: std.atomic.Value(u8) = .init(0);
 var detected: [cpu_capacity]Cpu = @splat(.{});
 var process_l2: usize = 0;
+var process_l3: usize = 0;
 const unknown: Cpu = .{};
 
 /// Diagnostics only; execution policies use the stable process-affinity minimum below.
@@ -75,6 +76,25 @@ pub fn l2BytesPerWorker() usize {
 pub fn l2BytesPerWorkerOr(default: usize) usize {
     const bytes = l2BytesPerWorker();
     return if (bytes == 0) default else bytes;
+}
+
+/// Minimum whole L3 across the captured process affinity, divided by the query's active workers. This assumes all
+/// workers compete in the smallest allowed L3 domain, conservatively ignoring any benefit from spreading domains.
+/// Unknown stays zero; scheduling cannot change this hint. Like L2 budgets, it may affect performance only.
+pub fn l3BytesPerActiveWorker(workers: usize) usize {
+    if (test_cpu) |cpu| return cpu.l3.bytes / @max(1, workers);
+    _ = forCpu(0);
+    return process_l3 / @max(1, workers);
+}
+
+fn affinityL3Minimum(cpus: []const Cpu, affinity: CpuSet) usize {
+    var minimum: usize = std.math.maxInt(usize);
+    var it = affinity.iterator(.{});
+    while (it.next()) |id| {
+        if (id >= cpus.len) return 0;
+        minimum = @min(minimum, cpus[id].l3.bytes);
+    }
+    return if (minimum == std.math.maxInt(usize)) 0 else minimum;
 }
 
 fn affinityMinimum(cpus: []const Cpu, affinity: CpuSet) usize {
@@ -127,8 +147,10 @@ fn discover() void {
     if (builtin.os.tag == .linux) {
         var mask: std.os.linux.cpu_set_t = undefined;
         // Query the main thread's mask, not an initializing worker's possibly narrower mask.
-        if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0)
+        if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0) {
             process_l2 = affinityMinimum(&detected, .{ .masks = mask });
+            process_l3 = affinityL3Minimum(&detected, .{ .masks = mask });
+        }
     }
 }
 
@@ -265,4 +287,18 @@ test "hardware process budget is the affinity minimum on hybrid CPUs, unknown in
     defer test_cpu = null;
     try std.testing.expectEqual(@as(usize, 0), l2BytesPerWorker());
     try std.testing.expectEqual(@as(usize, 12345), l2BytesPerWorkerOr(12345));
+}
+
+test "hardware active-worker L3 hints use a stable affinity minimum, including unknown domains" {
+    const cpus = [_]Cpu{ .{ .l3 = .{ .bytes = 32 << 20 } }, .{ .l3 = .{ .bytes = 96 << 20 } }, .{} };
+    try std.testing.expectEqual(@as(usize, 32 << 20), affinityL3Minimum(&cpus, parseCpuList("0-1").?));
+    try std.testing.expectEqual(@as(usize, 96 << 20), affinityL3Minimum(&cpus, parseCpuList("1").?));
+    try std.testing.expectEqual(@as(usize, 0), affinityL3Minimum(&cpus, parseCpuList("0-2").?));
+    test_cpu = cpus[0];
+    defer test_cpu = null;
+    try std.testing.expectEqual(@as(usize, 32 << 20), l3BytesPerActiveWorker(1));
+    try std.testing.expectEqual(@as(usize, 8 << 20), l3BytesPerActiveWorker(4));
+    try std.testing.expectEqual(@as(usize, 2 << 20), l3BytesPerActiveWorker(16));
+    test_cpu = .{};
+    try std.testing.expectEqual(@as(usize, 0), l3BytesPerActiveWorker(4));
 }

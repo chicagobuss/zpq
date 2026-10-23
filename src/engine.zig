@@ -661,6 +661,7 @@ fn executeAggregateOver(
         @as(u64, @intFromFloat(resident * 1000)),
         @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
     }));
+    const decode_rows_env = ctx.env.getPosix("ZPQ_DECODE_BATCH_ROWS");
     var scan_args: scan.MultiAggArgs = .{
         .inputs = opened.inputs,
         .metas = metas,
@@ -678,10 +679,11 @@ fn executeAggregateOver(
             if (std.mem.eql(u8, v, "0")) break :blk false;
             break :blk if (std.mem.eql(u8, v, "1")) true else null;
         },
-        .decode_batch_rows = if (ctx.env.getPosix("ZPQ_DECODE_BATCH_ROWS")) |v|
+        .decode_batch_rows = if (decode_rows_env) |v|
             std.fmt.parseInt(usize, v, 10) catch 0
         else
             0,
+        .auto_decode_batches = decode_rows_env == null,
         .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else

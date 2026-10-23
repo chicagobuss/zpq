@@ -390,6 +390,13 @@ const max_coded_plain = 256;
 /// Distinct values up to which a row's value is matched by comparing it with each, before any hashing.
 const few_plain = 16;
 
+/// Conservative fixed storage for recoding plain string keys: hash slots, dictionary growth and alignment.
+/// Row codes are separate. The cache admission caller also counts key dictionaries and composite scratch.
+pub fn plainKeyScratchBytes(entries: usize) ?usize {
+    if (entries > max_coded_plain) return null;
+    return max_coded_plain * (8 * @sizeOf([]const u8));
+}
+
 /// Give each plain (not dictionary-coded) string GROUP BY key of the batch a dictionary built here, when the batch
 /// holds at most `max_coded_plain` distinct values of it, so `groupedCoded` groups it by code: each distinct key
 /// combination is then resolved once per batch instead of serialized and looked up for every row. Values stay as they

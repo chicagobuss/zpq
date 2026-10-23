@@ -1211,11 +1211,18 @@ pub const SliceReader = struct {
             inline else => |*r, tag| {
                 const T = @TypeOf(r.*).Value;
                 const values = try a.alloc(T, n);
-                const def: ?[]u32 = if (self.levels.max_def > 0) try a.alloc(u32, n) else null;
-                const got = if (T == []const u8)
+                // A proven all-present numeric page needs no per-slice levels either. Byte-array values keep
+                // decodeBytes' page/dictionary lifetime handling when a window crosses page boundaries.
+                const present = if (T != []const u8 and self.levels.max_def == 1)
+                    try r.decodeAllPresent(values)
+                else
+                    0;
+                const def: ?[]u32 = if (self.levels.max_def > 0 and present != n) try a.alloc(u32, n) else null;
+                if (def) |d| @memset(d[0..present], @as(u32, @intCast(self.levels.max_def)));
+                const got = present + if (T == []const u8)
                     try self.decodeBytes(r, a, values, def)
                 else
-                    try decodeSome(T, r, values, def);
+                    try decodeSome(T, r, values[present..], if (def) |d| d[present..] else null);
                 if (got != n) return error.ShortDecode;
                 const max_def: u32 = @intCast(self.levels.max_def);
                 var has_nulls = false;
@@ -3081,6 +3088,8 @@ pub const AggWorkspace = struct {
     /// The scan coordinator revalidates after all workers and their arenas have unwound.
     defer_decode_errors: bool = false,
     decode_batch_rows: usize = 0,
+    auto_decode_batches: bool = false,
+    scan_workers: usize = 1,
     expr_batch_rows: ?usize = null,
     scratch: *DecodeScratch,
     /// Rewound at each row group that decodes: everything decoded lives here until the next one.
@@ -3518,8 +3527,13 @@ pub fn scanRGForAgg(
     target: AggTarget,
     ws: AggWorkspace,
 ) !u64 {
-    if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, ws);
-    return scanRGForAggImpl(gpa, in, stats, decode_options, target, ws) catch |err| {
+    var execution = ws;
+    if (ws.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
+        (target != .grouped or (decode_options.encoded and target.grouped.part == null and
+            target.grouped.records == null)))
+        execution.decode_batch_rows = automaticCacheRows(ws.charged orelse gpa, in, target, ws.scan_workers) catch 0;
+    if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
+    return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution) catch |err| {
         if (!isDecodeError(err)) return err;
         const site = decodeFailure() orelse return err;
         const failure = canonicalDecodeFailure(
@@ -3565,9 +3579,11 @@ pub fn canonicalDecodeFailure(
 // fault-free expressions are evaluated; memory-driven slicing otherwise retains its existing admission.
 fn cacheExpressionsSafe(target: AggTarget) bool {
     for (target.calls()) |call| if (call.arg) |arg| {
+        if (arg == .col_ref and (arg.col_ref.unsigned_64 or arg.col_ref.expr_type == .dec)) return false;
         if (arg != .col_ref and !floatTreeSafe(arg)) return false;
     };
     if (target == .grouped) for (target.grouped.keys) |key| {
+        if (key == .col_ref and (key.col_ref.unsigned_64 or key.col_ref.expr_type == .dec)) return false;
         if (key != .col_ref and !floatTreeSafe(key)) return false;
     };
     return true;
@@ -3581,6 +3597,229 @@ fn floatTreeSafe(e: expr_ast.Expr) bool {
             floatTreeSafe(b.left.*) and floatTreeSafe(b.right.*),
         .call, .case_ => false,
     };
+}
+
+const CacheDictionary = struct { entries: usize, bytes: usize };
+
+/// Header-only proof of a column's finite dictionary domain. It is a cost hint: malformed/incomplete bytes decline
+/// admission and leave all errors to ordinary execution. No statistics or decompression result authorizes a path.
+fn cacheDictionary(in: AggRowGroup, ci: usize) ?CacheDictionary {
+    if (ci >= in.rg.columns.items.len) return null;
+    const cm = in.rg.columns.items[ci].meta_data orelse return null;
+    if (cm.total_compressed_size < 0) return null;
+    const offset = cm.dictionary_page_offset orelse return null;
+    const absolute = std.math.cast(usize, offset) orelse return null;
+    const origin = std.math.cast(usize, in.src.byte_origin) orelse return null;
+    if (absolute < origin) return null;
+    const start = absolute - origin;
+    const len: usize = @intCast(cm.total_compressed_size);
+    if (start > in.src.bytes.len or len > in.src.bytes.len - start) return null;
+    var pages = page_mod.PageReader.init(in.src.bytes[start..][0..len], cm.codec, std.heap.page_allocator);
+    var dict: ?CacheDictionary = null;
+    var data = false;
+    while (pages.peek() catch return null) |p| {
+        switch (p.header.type) {
+            .DICTIONARY_PAGE => {
+                if (dict != null or data) return null;
+                const h = p.header.dictionary_page_header orelse return null;
+                if (h.num_values <= 0) return null;
+                dict = .{ .entries = @intCast(h.num_values), .bytes = @intCast(p.header.uncompressed_page_size) };
+            },
+            .DATA_PAGE, .DATA_PAGE_V2 => {
+                if (dict == null) return null;
+                const encoding = if (p.header.data_page_header) |h|
+                    h.encoding
+                else if (p.header.data_page_header_v2) |h| h.encoding else return null;
+                if (encoding != .RLE_DICTIONARY and encoding != .PLAIN_DICTIONARY) return null;
+                data = true;
+            },
+            .INDEX_PAGE => {},
+        }
+        pages.pass(p);
+    }
+    return if (data) dict else null;
+}
+
+fn cacheFilterNodes(f: filter_ast.Filter) usize {
+    return switch (f) {
+        .and_filter, .or_filter => |c| blk: {
+            var n: usize = 1;
+            for (c.children) |child| n +|= cacheFilterNodes(child);
+            break :blk n;
+        },
+        else => 1,
+    };
+}
+
+fn cacheExpandedTreeBytes(e: expr_ast.Expr) usize {
+    return switch (e) {
+        .binop => |b| 12 +| cacheExpandedTreeBytes(b.left.*) +| cacheExpandedTreeBytes(b.right.*),
+        .literal => 8,
+        else => 16,
+    };
+}
+
+fn wholeFloatTreeBytes(e: expr_ast.Expr) usize {
+    return switch (e) {
+        .binop => |b| 12 +| wholeFloatTreeBytes(b.left.*) +| wholeFloatTreeBytes(b.right.*),
+        .literal => 8,
+        .col_ref => |c| if (c.physical_type == .FLOAT) 8 else 0,
+        else => 0,
+    };
+}
+
+/// Admit only computed fault-free float trees. Decoded inputs, all DAG results, key codes, selection and group
+/// IDs share the stable L2 worker budget; pages/dictionaries use the decoder's separate bounded buffers.
+fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize) !usize {
+    var computed = false;
+    for (target.calls()) |call| {
+        if (call.where != null or call.func == .count_distinct or call.result == .bytes) return 0;
+        if (call.arg) |arg| {
+            computed = computed or arg == .binop;
+            if (arg == .col_ref and (arg.col_ref.unsigned_64 or arg.col_ref.expr_type == .dec)) return 0;
+        }
+    }
+    if (!computed or !cacheExpressionsSafe(target)) return 0;
+    if (target == .grouped) for (target.grouped.keys) |key| {
+        if (key != .col_ref or key.col_ref.unsigned_64 or key.col_ref.expr_type == .dec) return 0;
+    };
+    if (@import("hw.zig").l2BytesPerWorker() == 0) return 0;
+    var planning = std.heap.ArenaAllocator.init(gpa);
+    defer planning.deinit();
+    const a = planning.allocator();
+    const lookup = try a.alloc(?usize, in.meta.schema.items.len);
+    @memset(lookup, null);
+    var cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
+    var copied_bytes: usize = 0;
+    var fixed_keys: usize = 0;
+    var whole_values: usize = 0;
+    var largest_chunk: usize = 0;
+    for (in.read, 0..) |needed, ci| {
+        if (!needed) continue;
+        if (!SliceReader.supports(in.rg, in.meta, ci)) return 0;
+        const cm = in.rg.columns.items[ci].meta_data orelse return 0;
+        const n: usize = @intCast(@max(0, cm.num_values));
+        const dictionary = cacheDictionary(in, ci);
+        const lane: usize = if (dictionary != null) 4 else switch (cm.type) {
+            .INT32, .FLOAT => 4,
+            .BOOLEAN => 1,
+            else => 8,
+        };
+        whole_values +|= n *| lane;
+        if (in.meta.getColumnLevels(cm.path_in_schema.items).max_def > 0)
+            whole_values +|= if (dictionary != null) n / 8 +| 8 else n *| 4;
+        largest_chunk = @max(largest_chunk, @as(usize, @intCast(@max(0, cm.total_uncompressed_size))));
+        if (in.meta.getColumnSchema(cm.path_in_schema.items)) |se|
+            if (decimal_mod.exactKind(&se) != null) return 0;
+        switch (cm.type) {
+            .BYTE_ARRAY => {
+                const d = dictionary orelse return 0;
+                // decodeBytes can copy the same dictionary string on every row. Its entire encoded dictionary
+                // bounds one string's width, even when compression makes a footer's per-row estimate tiny.
+                copied_bytes +|= d.bytes;
+                fixed_keys +|= d.bytes +| d.entries *| @sizeOf([]const u8);
+            },
+            .FIXED_LEN_BYTE_ARRAY, .INT96 => return 0,
+            else => {},
+        }
+        lookup[ci] = cols.items.len;
+        // FloatPlan inspects lane types and layouts before decoding; other input lanes are counted below.
+        const col: filter_eval.Batch.Column = switch (cm.type) {
+            .FLOAT => .{ .f32 = .{ .values = &.{} } },
+            .DOUBLE => .{ .f64 = .{ .values = &.{} } },
+            else => .{ .i64 = .{ .values = &.{} } },
+        };
+        try cols.append(a, col);
+    }
+    const batch: filter_eval.Batch = .{ .cols = cols.items, .num_rows = 0 };
+    var plan: expr_eval.FloatPlan = .{};
+    for (target.calls()) |call| if (call.arg) |arg| if (arg != .col_ref) {
+        _ = (try plan.add(a, &batch, lookup, arg)) orelse return 0;
+    };
+    const rows: usize = @intCast(@max(0, in.rg.num_rows));
+    if (rows == 0) return 0;
+    const grouped = target == .grouped;
+    const whole_dictionaries = fixed_keys;
+    var space: usize = 1;
+    if (grouped) for (target.grouped.keys) |key| {
+        const d = cacheDictionary(in, key.col_ref.col_idx) orelse return 0;
+        fixed_keys +|= agg_coded.plainKeyScratchBytes(d.entries) orelse return 0;
+        space *|= d.entries +| 1;
+    };
+    const inputs = std.math.divCeil(usize, decodeEstimate(in, in.read, &.{}, grouped), rows) catch return 0;
+    const key_bytes = if (grouped) 4 * target.grouped.keys.len else 0;
+    // Counting the DAG's borrowed input lanes again is conservative and reserves room for widening and key scratch.
+    var widened: usize = 0;
+    for (target.calls()) |call| if (call.arg) |arg| if (arg == .col_ref and
+        (arg.col_ref.physical_type == .INT32 or arg.col_ref.physical_type == .FLOAT))
+    {
+        widened +|= 8;
+    };
+    const masks = target.calls().len +| if (in.filter) |f| cacheFilterNodes(f) else @as(usize, 0);
+    // A window with only NULL keys can decline recoding. Its general fold must fit too, even without CSE.
+    var expanded: usize = 8;
+    if (grouped) for (target.calls()) |call| if (call.arg) |arg| {
+        if (arg != .col_ref) expanded +|= cacheExpandedTreeBytes(arg);
+    };
+    const live = inputs +| @max(plan.liveBytesPerRow(), expanded) +| key_bytes +| copied_bytes +| widened +| masks;
+    const group_state = if (grouped) space *| (64 +| target.grouped.keys.len *| 32 +|
+        target.calls().len *| (2 * @sizeOf(expr_agg.Accumulator) + 32) +| copied_bytes) else 0;
+    const fixed = fixed_keys +| group_state +|
+        (plan.nodes.items.len + cols.items.len) * @sizeOf(filter_eval.Batch.Column) +|
+        in.meta.schema.items.len *| @sizeOf(?usize) *| (3 + if (grouped) target.grouped.keys.len else @as(usize, 0)) +|
+        target.calls().len * @sizeOf(expr_agg.Accumulator);
+    const cap = expr_eval.floatBatchRows(live, fixed, null);
+    // Whole vectors are often cheaper while their hot state fits in L3. This is a cost estimate, independent of
+    // the conservative L2 bound above: dictionary codes/presence, values/levels, one page and aggregate scratch.
+    const l3 = @import("hw.zig").l3BytesPerActiveWorker(workers);
+    if (l3 != 0) {
+        var whole = whole_values +| largest_chunk +| rows / 8 +| whole_dictionaries +| group_state;
+        if (grouped) {
+            whole +|= rows *| 4 +| plan.liveBytesPerRow() *|
+                expr_eval.floatBatchRows(plan.liveBytesPerRow(), group_state, null);
+        } else for (target.calls()) |call| if (call.arg) |arg| {
+            if (arg != .col_ref) whole +|= rows *| wholeFloatTreeBytes(arg);
+        };
+        if (whole <= l3) return 0;
+    }
+    return if (cap != 0 and cap < rows) cap else 0;
+}
+
+/// Share computed scalar inputs too, then use the ordinary typed folds over their prepared values. Synthesizing a
+/// borrowed DOUBLE column keeps NULL masks and canonical 64-row reductions in updateOne; no partial sum is merged.
+fn foldScalarCache(
+    a: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    calls: []const expr_agg.AggCall,
+    accumulators: []expr_agg.Accumulator,
+    handled: []const bool,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const filter_selection.SelectionVector,
+) !bool {
+    var plan: expr_eval.FloatPlan = .{};
+    const roots = try a.alloc(?usize, calls.len);
+    @memset(roots, null);
+    for (calls, handled, roots) |call, h, *root| {
+        if (h) continue;
+        if (call.where != null or call.func == .count_distinct or call.result == .bytes) return false;
+        if (call.arg) |arg| if (arg != .col_ref) {
+            root.* = (try plan.add(a, batch, lookup, arg)) orelse return false;
+        };
+    }
+    if (plan.nodes.items.len == 0) return false;
+    const restricted = batch.restrictedTo(sel);
+    const values = try plan.evaluate(a, &restricted, lookup);
+    for (calls, accumulators, handled, roots) |call, *acc, h, root| {
+        if (h) continue;
+        if (root) |r| {
+            var prepared = call;
+            prepared.arg = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+            const input: filter_eval.Batch = .{ .cols = &.{values[r]}, .num_rows = batch.num_rows };
+            try expr_agg.updateOne(a, persist, acc, prepared, &input, &.{0}, sel);
+        } else try expr_agg.updateOne(a, persist, acc, call, batch, lookup, sel);
+    }
+    return true;
 }
 
 fn scanRGForAggImpl(
@@ -3921,14 +4160,18 @@ fn scanRGSliced(
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
-        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
         var sel = try filter_selection.SelectionVector.init(sa, n);
         if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
         matched += if (in.filter != null) sel.count() else n;
         switch (target) {
-            .scalar => |s| for (s.calls, s.accumulators, handled) |call, *acc, h| {
-                if (h) continue;
-                try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);
+            .scalar => |s| {
+                if (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target) and
+                    try foldScalarCache(sa, gpa, s.calls, s.accumulators, handled, &batch, lookup, &sel)) continue;
+                for (s.calls, s.accumulators, handled) |call, *acc, h| {
+                    if (h) continue;
+                    try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);
+                }
             },
             .grouped => |g| {
                 if (g.records) |records| {
@@ -3954,6 +4197,22 @@ fn scanRGSliced(
                         null,
                     );
                     continue;
+                }
+                if (decode_options.encoded and ws.decode_batch_rows != 0 and cacheExpressionsSafe(target)) {
+                    try agg_coded.codePlainKeys(sa, g.keys, cols, lookup);
+                    if (try agg_coded.groupedCoded(
+                        sa,
+                        gpa,
+                        g.calls,
+                        g.keys,
+                        g.table,
+                        g.pos_base + done,
+                        &batch,
+                        lookup,
+                        &sel,
+                        ws.budget,
+                        null,
+                    )) continue;
                 }
                 const key_cols = try sa.alloc(filter_eval.Batch.Column, g.keys.len);
                 const keyed = batch.restrictedTo(&sel);
@@ -8482,4 +8741,316 @@ test "canonical decode failure checks every competing column and unwinds allocat
     columns[0].meta_data.?.num_values = 0;
     const reproduced = decode_order.canonical(SliceReader, isDecodeError, std.testing.allocator, in, .{}, &.{ false, false }, .{ .err = error.UnexpectedPage, .site = .{ .rg = in.rg, .column = 0, .page = 0 } });
     try std.testing.expectEqual(@as(usize, 1), reproduced.site.column);
+}
+
+test "cache decode admission counts inputs and DAG, follows sharing, and releases failed planning allocations" {
+    const hw = @import("hw.zig");
+    defer hw.test_cpu = null;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 } };
+    var elements = [_]schema.SchemaElement{ fl_test_elem, fl_test_elem };
+    elements[0].name = "schema";
+    elements[0].type = null;
+    elements[0].repetition_type = .REQUIRED;
+    elements[0].num_children = 1;
+    elements[1].type = .DOUBLE;
+    var path = [_][]const u8{"v"};
+    var columns = [_]schema.ColumnChunk{.{ .file_path = null, .file_offset = 0, .meta_data = .{
+        .type = .DOUBLE,
+        .encodings = .empty,
+        .path_in_schema = .{ .items = &path, .capacity = 1, .pointer_stability = .{} },
+        .codec = .UNCOMPRESSED,
+        .num_values = 65553,
+        .total_uncompressed_size = 65553 * 8,
+        .total_compressed_size = 65553 * 8,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+    } }};
+    var rg: schema.RowGroup = .{
+        .columns = .{ .items = &columns, .capacity = 1, .pointer_stability = .{} },
+        .total_byte_size = 65553 * 8,
+        .num_rows = 65553,
+    };
+    const meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .{ .items = &elements, .capacity = 2, .pointer_stability = .{} },
+        .num_rows = 65553,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    const in: AggRowGroup = .{
+        .rg = &rg,
+        .meta = &meta,
+        .src = .{ .bytes = &.{}, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{true},
+        .consumed = &.{true},
+    };
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    const sum: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &one,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    var call = [_]expr_agg.AggCall{.{ .func = .sum, .arg = sum, .result = .f64, .where = null, .alias = "s" }};
+    const target: AggTarget = .{ .scalar = .{ .calls = &call, .accumulators = &.{} } };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator, input: AggRowGroup, t: AggTarget) !void {
+            const n = try automaticCacheRows(a, input, t, 16);
+            try std.testing.expect(n >= 64 and n < 65553 and n % 64 == 0);
+        }
+    }.run, .{ in, target });
+    const small = try automaticCacheRows(std.testing.allocator, in, target, 16);
+    hw.test_cpu.?.l2.bytes = 1280 << 10;
+    const larger = try automaticCacheRows(std.testing.allocator, in, target, 16);
+    try std.testing.expect(larger > small);
+    hw.test_cpu.?.l3.bytes = 16 << 20;
+    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(std.testing.allocator, in, target, 1));
+    try std.testing.expect(try automaticCacheRows(std.testing.allocator, in, target, 16) > 0);
+    hw.test_cpu.?.l3.bytes = 0;
+    hw.test_cpu.?.l2.bytes = 0;
+    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(std.testing.allocator, in, target, 16));
+    hw.test_cpu.?.l2.bytes = 1 << 20;
+    call[0].arg = x;
+    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(std.testing.allocator, in, target, 16));
+}
+
+test "cache decode admission bounds dictionary strings and composite domains from every page header" {
+    const testing = std.testing;
+    const hw = @import("hw.zig");
+    defer hw.test_cpu = null;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 } };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fixture = struct {
+        fn bytes(alloc: std.mem.Allocator, entries: i32, width: i32, last: schema.Encoding) ![]const u8 {
+            var w = thrift.Writer.init(alloc);
+            var h: schema.PageHeader = .{
+                .type = .DICTIONARY_PAGE,
+                .uncompressed_page_size = width,
+                .compressed_page_size = 1,
+                .crc = null,
+                .data_page_header = null,
+                .data_page_header_v2 = null,
+                .dictionary_page_header = .{ .num_values = entries, .encoding = .PLAIN, .is_sorted = null },
+            };
+            try h.write(&w);
+            try w.buffer.append(alloc, 0);
+            h.type = .DATA_PAGE;
+            h.uncompressed_page_size = 1;
+            h.dictionary_page_header = null;
+            h.data_page_header = .{
+                .num_values = 32768,
+                .encoding = .RLE_DICTIONARY,
+                .definition_level_encoding = .RLE,
+                .repetition_level_encoding = .RLE,
+            };
+            try h.write(&w);
+            try w.buffer.append(alloc, 0);
+            h.type = .DATA_PAGE_V2;
+            h.data_page_header = null;
+            h.data_page_header_v2 = .{
+                .num_values = 32785,
+                .num_nulls = 0,
+                .num_rows = 32785,
+                .encoding = last,
+                .definition_levels_byte_length = 0,
+                .repetition_levels_byte_length = 0,
+                .is_compressed = true,
+            };
+            try h.write(&w);
+            try w.buffer.append(alloc, 0);
+            return w.bytes(); // Bodies deliberately aren't decoded by this admission-only hint.
+        }
+    };
+    var elements = [_]schema.SchemaElement{ fl_test_elem, fl_test_elem, fl_test_elem };
+    elements[0].name = "schema";
+    elements[0].type = null;
+    elements[0].repetition_type = .REQUIRED;
+    elements[0].num_children = 2;
+    elements[1].type = .DOUBLE;
+    elements[1].name = "x";
+    elements[2].type = .BYTE_ARRAY;
+    elements[2].name = "g";
+    var paths = [_][1][]const u8{ .{"x"}, .{"g"} };
+    var columns: [2]schema.ColumnChunk = undefined;
+    for (&columns, &paths, 0..) |*c, *path, i| c.* = .{
+        .file_path = null,
+        .file_offset = 1000,
+        .meta_data = .{
+            .type = if (i == 0) .DOUBLE else .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = .{ .items = path, .capacity = 1, .pointer_stability = .{} },
+            .codec = .ZSTD,
+            .num_values = 65553,
+            .total_uncompressed_size = 65553 * 8,
+            .total_compressed_size = 0,
+            .data_page_offset = 1000,
+            .index_page_offset = null,
+            .dictionary_page_offset = if (i == 1) 1000 else null,
+        },
+    };
+    var rg: schema.RowGroup = .{
+        .columns = .{ .items = &columns, .capacity = 2, .pointer_stability = .{} },
+        .total_byte_size = 65553 * 8,
+        .num_rows = 65553,
+    };
+    const meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .{ .items = &elements, .capacity = 3, .pointer_stability = .{} },
+        .num_rows = rg.num_rows,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    var in: AggRowGroup = .{
+        .rg = &rg,
+        .meta = &meta,
+        .src = .{ .bytes = &.{}, .byte_origin = 1000 },
+        .filter = null,
+        .read = &.{ true, true },
+        .consumed = &.{ true, true },
+    };
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    const computed: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &one,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    const calls = [_]expr_agg.AggCall{.{ .func = .sum, .arg = computed, .result = .f64, .where = null, .alias = "s" }};
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    var target: AggTarget = .{ .grouped = .{ .calls = &calls, .keys = &.{key}, .table = undefined, .pos_base = 0 } };
+    var small: usize = 0;
+    for ([_]i32{ 24, 4000, 2 << 20 }) |width| {
+        const bytes = try Fixture.bytes(a, 2, width, .RLE_DICTIONARY);
+        in.src.bytes = bytes;
+        columns[1].meta_data.?.total_compressed_size = @intCast(bytes.len);
+        const proof = cacheDictionary(in, 1).?;
+        try testing.expectEqual(@as(usize, @intCast(width)), proof.bytes);
+        const rows = try automaticCacheRows(testing.allocator, in, target, 16);
+        if (width == 24) {
+            small = rows;
+            try testing.expect(small >= 64 and small < 65553);
+        } else try testing.expect(rows < small);
+        if (width == 2 << 20) try testing.expectEqual(@as(usize, 0), rows);
+    }
+    // Every data page must qualify, including V2 after an eligible V1 page.
+    in.src.bytes = try Fixture.bytes(a, 2, 24, .PLAIN);
+    columns[1].meta_data.?.total_compressed_size = @intCast(in.src.bytes.len);
+    try testing.expect(cacheDictionary(in, 1) == null);
+    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(testing.allocator, in, target, 16));
+    in.src.bytes = try Fixture.bytes(a, 256, 4096, .RLE_DICTIONARY);
+    columns[1].meta_data.?.total_compressed_size = @intCast(in.src.bytes.len);
+    // Two individually bounded keys can still have a composite table much larger than L2.
+    target.grouped.keys = &.{ key, key };
+    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(testing.allocator, in, target, 16));
+    target.grouped.keys = &.{key};
+    in.src.bytes = try Fixture.bytes(a, 257, 24, .RLE_DICTIONARY);
+    columns[1].meta_data.?.total_compressed_size = @intCast(in.src.bytes.len);
+    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(testing.allocator, in, target, 16));
+    columns[1].meta_data.?.dictionary_page_offset = -1;
+    try testing.expect(cacheDictionary(in, 1) == null);
+}
+
+test "scalar cache DAG shares nullable inputs without changing canonical sum blocks, including allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testScalarCache, .{});
+}
+
+fn testScalarCache(backing: std.mem.Allocator) !void {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 193;
+    const values = try a.alloc(f64, n);
+    const defs = try a.alloc(u32, n);
+    for (values, defs, 0..) |*v, *d, i| {
+        v.* = switch (i % 6) {
+            0 => 1e16,
+            1 => 1,
+            2 => -1e16,
+            3 => 0.1,
+            4 => -0.0,
+            else => std.math.nan(f64),
+        };
+        d.* = @intFromBool(i % 17 != 0);
+    }
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    var base: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &one,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    var repeated = base;
+    const square: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &base,
+        .right = &repeated,
+        .result_type = .f64,
+        .depth = 3,
+    } };
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .sum, .arg = base, .result = .f64, .where = null, .alias = "s" },
+        .{ .func = .sum, .arg = square, .result = .f64, .where = null, .alias = "ss" },
+        .{ .func = .avg, .arg = base, .result = .avg_f64, .where = null, .alias = "a" },
+        .{ .func = .count, .arg = base, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .min, .arg = base, .result = .f64, .where = null, .alias = "lo" },
+    };
+    const cols = [_]filter_eval.Batch.Column{.{ .f64 = .{
+        .values = values,
+        .def_levels = defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    for ([_]bool{ false, true }) |empty| {
+        var sel = try filter_selection.SelectionVector.init(a, n);
+        for (0..n) |i| sel.set(i, !empty and i % 3 != 1);
+        var want: [calls.len]expr_agg.Accumulator = undefined;
+        var got: [calls.len]expr_agg.Accumulator = undefined;
+        for (calls, &want, &got) |call, *w, *g| {
+            w.* = .init(call);
+            g.* = .init(call);
+            try expr_agg.updateOne(a, a, w, call, &batch, &.{0}, &sel);
+        }
+        var off: usize = 0;
+        while (off < n) : (off += 64) {
+            const count = @min(64, n - off);
+            const col = try cols[0].sliceRows(off, count);
+            const part: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = count };
+            const mask = try sel.alignedWindow(off, count);
+            try testing.expect(try foldScalarCache(
+                a,
+                a,
+                &calls,
+                &got,
+                &@as([calls.len]bool, @splat(false)),
+                &part,
+                &.{0},
+                &mask,
+            ));
+        }
+        for (want, got) |w, g| switch (w) {
+            .sum_f, .min_f => |expected| {
+                const actual = if (g == .sum_f) g.sum_f else g.min_f;
+                try testing.expectEqual(expected != null, actual != null);
+                if (expected) |v| try testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(actual.?)));
+            },
+            .avg => |avg| {
+                try testing.expectEqual(avg.count, g.avg.count);
+                try testing.expectEqual(@as(u64, @bitCast(avg.sum)), @as(u64, @bitCast(g.avg.sum)));
+            },
+            .count => |count| try testing.expectEqual(count, g.count),
+            else => unreachable,
+        };
+    }
 }

@@ -230,6 +230,7 @@ pub const MultiAggArgs = struct {
     expr_batch_rows: ?usize = null,
     /// Forced flat decode windows; zero keeps ordinary memory admission.
     decode_batch_rows: usize = 0,
+    auto_decode_batches: bool = false,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
@@ -1627,7 +1628,9 @@ const Worker = struct {
     decode_options: consumer.DecodeOptions,
     expr_batch_rows: ?usize = null,
     decode_batch_rows: usize = 0,
+    auto_decode_batches: bool = false,
     error_outputs: ?[]const BoundOutputColumn = null,
+    scan_workers: usize = 1,
     failure_probe: ?*FailureProbe = null,
     failed_gate: ?RowGroupGate = null,
     failed_rg: usize = 0,
@@ -1926,6 +1929,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .ledger = w.ledger,
             .expr_batch_rows = w.expr_batch_rows,
             .decode_batch_rows = w.decode_batch_rows,
+            .auto_decode_batches = w.auto_decode_batches,
+            .scan_workers = w.scan_workers,
             .defer_decode_errors = w.failure_probe != null,
         }) catch |err| {
             if (consumer.isDecodeError(err)) {
@@ -1935,6 +1940,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             }
             return err;
         };
+
         if (item.agg_start == 0) w.rows_matched +|= @intCast(matched);
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
@@ -4195,6 +4201,8 @@ fn prepareAggregateWithMetas(
             },
             .expr_batch_rows = args.expr_batch_rows,
             .decode_batch_rows = args.decode_batch_rows,
+            .auto_decode_batches = args.auto_decode_batches,
+            .scan_workers = n_workers,
             .error_outputs = group_outputs,
             .failure_probe = args.failure_probe,
             .profiler = args.profiler,
@@ -5528,6 +5536,8 @@ fn runRecordWorkers(
         },
         .expr_batch_rows = args.expr_batch_rows,
         .decode_batch_rows = args.decode_batch_rows,
+        .auto_decode_batches = args.auto_decode_batches,
+        .scan_workers = workers.len,
         .error_outputs = outputs,
         .failure_probe = args.failure_probe,
         .group_by_keys = keys,

@@ -240,6 +240,10 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
 ### Behaviour changes
 
 **Contracts**
+- Query validation covers answer-relevant data: corruption confined to unprojected columns, unread COUNT-pass
+  arguments or items excluded by exact decoded sketch/census/admit proofs may go undetected. Multipass proofs
+  reject gated inputs. Existing footer/page-statistics corroboration is not value verification: internally
+  consistent false bounds may change the default answer; `--scan-all` ignores statistics.
 - Error-only full-projection replay includes input omitted by census/sketch count and admit passes; prepaid stream-probe funding makes evidence independent of concurrent ledger usage, and remaining worker failures use canonical order. Resource-limited probes retain the documented best-confirmed-error fallback.
 - Aggregate decode failures have one canonical order: input and row-group order first, then the failing page's
   first row, then input-column order in the result projection. A computed output's leaves keep schema order;

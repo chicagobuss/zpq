@@ -111,7 +111,10 @@ entry counts bound key-domain products. These facts come from page bytes,
 not statistics. Unbounded/plain byte columns, excessive composite state or
 unknown cache sizes decline automatic admission. A failed admission allocation
 also falls back to ordinary execution. Header facts are memoized once per
-column chunk per query and shared across workers and passes; they retain only
+column chunk per query and shared across workers and passes. The memo uses one
+hash shard per active scan worker, initialized before scanning, so independent
+header walks proceed in parallel. A refused shard allocation retains a single
+inline memo. The shards retain only
 sizes/counts, never pointers into input windows. Refusal to allocate the
 optional memo leaves that hint uncached. Optional planning and decode attempts
 have separate refusal flags, reset per attempt, so a declined hint cannot

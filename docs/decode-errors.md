@@ -10,6 +10,12 @@ failures by:
 3. The input column's rank in the result projection.
 4. The decoder's established check order within that page.
 
+This order applies when execution observes a decode failure. An exact sketch/census/admit proof can omit
+irrelevant data without observing corruption there. Such proofs use decoded, validated keys and predicates,
+never the skipped aggregate payload; all gated inputs are excluded from these multipass plans.
+The separate footer/page-statistics trust boundary still applies: corroboration cannot detect every
+internally consistent false claim. See [validation and skipped data](output-format.md#validation-and-skipped-data).
+
 For flat columns, preceding data-page counts locate a page's first row.
 Dictionary pages before data and failures before a page is installed belong
 to row zero. Page ordinals include dictionary pages. A computed output's
@@ -40,10 +46,16 @@ its arena and scratch, then takes a query-wide probe lock before returning the
 source bytes. Thus probes never run concurrently or stack on failed decode
 arenas. Probes use a bounded allocator charged through the query ledger.
 Before stream workers or tables start drawing, the query prepays a probe quota
-of `min(max_memory / 8, lean_decode / 2)` (at most 16 MiB). The serialized
+from the largest projected stream-column probe quote, capped by
+`min(max_memory / 8, lean_decode / 2)` (at most 16 MiB). The quote uses chunk
+uncompressed sizes, row counts, a 64-row window and reader/planning headroom;
+byte windows allow repeated copies of a long dictionary entry. No projected
+payload means no reservation. Size metadata is a cost hint, never a skip proof. The serialized
 stream probe uses only that funded quota, so concurrent worker usage cannot
 change what it can verify. Unused funding returns after the workers stop.
-Failure to reserve the quota is a resource refusal before decoding starts.
+The funding is held on valid runs too; tight budgets can refuse an otherwise
+valid query before decoding starts. The plan-derived quote avoids reserving
+the maximum for small chunks. Resource-limited probes retain the fallback below.
 Mapped inputs probe after scan teardown within `max_memory`, after local input
 windows release their charges.
 

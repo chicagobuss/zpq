@@ -3619,25 +3619,53 @@ const CacheDictionary = struct { entries: usize, bytes: usize };
 /// Optional allocation refusal leaves the cost hint uncached; it never affects decode diagnostics.
 pub const CacheHints = struct {
     const Key = struct { rg: *const schema.RowGroup, column: usize };
-    lock: std.Io.Mutex = .init,
-    facts: std.AutoHashMapUnmanaged(Key, ?CacheDictionary) = .empty,
+    const Shard = struct {
+        lock: std.Io.Mutex = .init,
+        facts: std.AutoHashMapUnmanaged(Key, ?CacheDictionary) = .empty,
+    };
+    inline_shard: Shard = .{},
+    shards: []Shard = &.{},
     allocator: std.mem.Allocator,
 
+    /// Initialized before workers start. Refusal retains the inline memo, without changing decoder flags.
+    pub fn initShards(h: *CacheHints, workers: usize) !void {
+        if (workers <= 1) return;
+        const shards = try h.allocator.alloc(Shard, workers);
+        @memset(shards, .{});
+        h.shards = shards;
+    }
+
     pub fn deinit(h: *CacheHints) void {
-        h.facts.deinit(h.allocator);
-        h.facts = .empty;
+        h.inline_shard.facts.deinit(h.allocator);
+        h.inline_shard.facts = .empty;
+        for (h.shards) |*shard| shard.facts.deinit(h.allocator);
+        if (h.shards.len != 0) h.allocator.free(h.shards);
+        h.shards = &.{};
+    }
+
+    fn count(h: *const CacheHints) usize {
+        var n = h.inline_shard.facts.count();
+        for (h.shards) |shard| n += shard.facts.count();
+        return n;
     }
 
     fn get(h: *CacheHints, in: AggRowGroup, ci: usize) ?CacheDictionary {
-        h.lock.lockUncancelable(@import("blocking.zig").io);
-        defer h.lock.unlock(@import("blocking.zig").io);
         const key: Key = .{ .rg = in.rg, .column = ci };
-        if (h.facts.get(key)) |fact| return fact;
+        const hash = (std.hash_map.AutoContext(Key){}).hash(key);
+        const shard = if (h.shards.len == 0) &h.inline_shard else &h.shards[hash % h.shards.len];
+        shard.lock.lockUncancelable(@import("blocking.zig").io);
+        defer shard.lock.unlock(@import("blocking.zig").io);
+        if (shard.facts.getPtr(key)) |fact| return fact.*;
         const fact = cacheDictionary(in, ci);
-        h.facts.put(h.allocator, key, fact) catch {};
+        shard.facts.put(h.allocator, key, fact) catch {};
         return fact;
     }
 };
+
+pub fn cacheHintsWanted(calls: []const expr_agg.AggCall) bool {
+    for (calls) |call| if (call.arg) |arg| if (arg == .binop and arg.typeOf() == .f64) return true;
+    return false;
+}
 
 /// Header-only proof of a column's finite dictionary domain. It is a cost hint: malformed/incomplete bytes decline
 /// admission and leave all errors to ordinary execution. No statistics or decompression result authorizes a path.
@@ -8977,15 +9005,18 @@ test "cache decode admission bounds dictionary strings and composite domains fro
         var funding: core_memory.SharedBudget = .{ .limit = 64 << 10 };
         var charge: core_memory.Charged = .{ .child = testing.allocator, .budget = &funding };
         var memo: CacheHints = .{ .allocator = charge.allocator() };
+        try memo.initShards(3);
         try testing.expectEqualDeep(proof, memo.get(in, 1).?);
         try testing.expectEqualDeep(proof, memo.get(in, 1).?);
-        try testing.expectEqual(@as(usize, 1), memo.facts.count());
+        try testing.expectEqual(@as(usize, 1), memo.count());
         memo.deinit();
         try testing.expectEqual(@as(usize, 0), funding.used.load(.monotonic));
         var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
         var uncached: CacheHints = .{ .allocator = failing.allocator() };
+        try testing.expectError(error.OutOfMemory, uncached.initShards(3));
+        try testing.expectEqual(@as(usize, 0), uncached.shards.len);
         try testing.expectEqualDeep(proof, uncached.get(in, 1).?);
-        try testing.expectEqual(@as(usize, 0), uncached.facts.count());
+        try testing.expectEqual(@as(usize, 0), uncached.count());
         uncached.deinit();
 
         try testing.expectEqual(@as(usize, @intCast(width)), proof.bytes);

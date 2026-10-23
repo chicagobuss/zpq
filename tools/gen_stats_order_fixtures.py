@@ -314,6 +314,7 @@ def main() -> None:
     write_deprecated()
     write_collated()
     write_nan()
+    write_false_bounds()
 
 
 def write_deprecated() -> None:
@@ -335,6 +336,24 @@ def write_unsigned() -> None:
         write_batch_size=64,
         data_page_size=64,
     )
+    print(f"wrote {out} ({out.stat().st_size} bytes)")
+
+
+def write_false_bounds() -> None:
+    """Pin the existing trust boundary: internally consistent footer bounds can still be false."""
+    out = OUT_DIR / "false_bounds.parquet"
+    pq.write_table(pa.table({"x": [100000, 100001, 100002], "v": [10, 20, 30]}),
+                   out, use_dictionary=False, compression=None)
+
+    def edit(meta, _body):
+        rg = field(meta, 4)[2][1][0]
+        chunk = field(rg, 1)[2][1][0]
+        stats = field(field(chunk, 3)[2], 12)[2]
+        for fid, value in [(1, 200002), (2, 200000), (5, 200002), (6, 200000)]:
+            if (bound := field(stats, fid)) is not None:
+                bound[2] = struct.pack("<q", value)
+
+    rewrite_footer(out, edit)
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 

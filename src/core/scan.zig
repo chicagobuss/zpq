@@ -1503,8 +1503,8 @@ const FailureProbe = struct {
     /// Prepaid before stream workers start; probes never borrow a live worker's headroom.
     stream_budget: core_memory.SharedBudget = .{ .limit = 0 },
 
-    fn reserveStream(p: *FailureProbe, parent: *core_memory.SharedBudget) !void {
-        const quota = @min(p.limit / 8, core_memory.lean_decode / 2);
+    fn reserveStream(p: *FailureProbe, parent: *core_memory.SharedBudget, planned: usize) !void {
+        const quota = @min(planned, @min(p.limit / 8, core_memory.lean_decode / 2));
         if (parent.drawExact(quota) == null) return error.ExceededMemoryBudget;
         p.stream_budget = .{ .limit = quota, .parent = parent, .funded = quota };
     }
@@ -1554,6 +1554,38 @@ const FailureProbe = struct {
         };
     }
 };
+
+/// Cost quote only: stream pages are not available yet. Bound one probe column from its chunk footprint and
+/// a 64-row window, never all projected columns or workers at once. False size metadata can only limit evidence.
+fn streamProbeBytes(inputs: []const Input, metas: []const schema.FileMetaData, plan: *const agg_plan.Plan) usize {
+    var largest: usize = 0;
+    for (inputs, metas) |input, *meta| {
+        if (input.rescannable()) continue;
+        for (meta.row_groups.items) |*rg| {
+            const decision = plan.decide(rg, meta);
+            if (decision == .skip) continue;
+            const read = plan.columns.forRowGroup(decision);
+            for (read, 0..) |needed, ci| {
+                if (!needed) continue;
+                var unit: usize = std.heap.pageSize() * 4 +| read.len *| 16;
+                if (rg.columns.items[ci].meta_data) |cm| {
+                    const raw = std.math.cast(usize, @max(0, cm.total_uncompressed_size)) orelse
+                        std.math.maxInt(usize);
+                    const n = std.math.cast(usize, @max(0, cm.num_values)) orelse std.math.maxInt(usize);
+                    // Byte windows may copy the same long dictionary string 64 times. Numeric pages retain
+                    // decompression/dictionary storage and can expand levels even when values are tightly coded.
+                    const copies: usize = switch (cm.type) {
+                        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => 64 + 12,
+                        else => 4,
+                    };
+                    unit +|= raw *| copies +| n *| 4 +| 64 * 32;
+                }
+                largest = @max(largest, unit);
+            }
+        }
+    }
+    return largest;
+}
 
 /// Only on failure: count/discovery/admit passes may have omitted arguments or entire work items. Replay the
 /// query's ordinary full projection in input/RG order, including those omissions, after all scan storage is gone.
@@ -4025,12 +4057,16 @@ fn prepareAggregateWithMetas(
     const group_budget = args.ledger orelse &own_budget;
     // Non-rescannable sources must diagnose while their bytes are held, beside live peer workers.
     // Reserve the error-only quota before any of those workers or tables can draw.
-    if (!allRescannable(args.inputs)) if (args.failure_probe) |p| try p.reserveStream(group_budget);
+    if (!allRescannable(args.inputs)) if (args.failure_probe) |p| {
+        try p.reserveStream(group_budget, streamProbeBytes(args.inputs, metas, &plan));
+    };
     defer if (args.failure_probe) |p| p.releaseStream();
     // Shared optional header memo: charged separately so a declined hint cannot poison decoder flags.
     var hint_charge: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = group_budget };
     var cache_hints: consumer.CacheHints = .{ .allocator = hint_charge.allocator() };
     defer cache_hints.deinit();
+    if (args.auto_decode_batches and args.decode_batch_rows == 0 and args.expr_batch_rows != 0 and
+        consumer.cacheHintsWanted(agg_calls)) cache_hints.initShards(n_workers) catch {};
     var private_decode: PrivateDecode = .{};
     // Declared before region cleanup: their actual allocations go before their funding returns to the query.
     defer private_decode.release();
@@ -16936,7 +16972,7 @@ test "stream probe funding is independent of peer ledger pressure and unwinds ev
         for ([_]bool{ false, true, false }) |pressure| {
             var root: core_memory.SharedBudget = .{ .limit = limit };
             var probe: FailureProbe = .{ .limit = limit };
-            try probe.reserveStream(&root);
+            try probe.reserveStream(&root, 128 << 10);
             const held = if (pressure) root.available() else 0;
             _ = root.drawExact(held).?;
             var charge: core_memory.Charged = .{ .child = testing.allocator, .budget = &probe.stream_budget };
@@ -16955,7 +16991,7 @@ test "stream probe funding is independent of peer ledger pressure and unwinds ev
     }
     var small: core_memory.SharedBudget = .{ .limit = 1 };
     var probe: FailureProbe = .{ .limit = 1 << 20 };
-    try testing.expectError(error.ExceededMemoryBudget, probe.reserveStream(&small));
+    try testing.expectError(error.ExceededMemoryBudget, probe.reserveStream(&small, 128 << 10));
     try testing.expectEqual(@as(usize, 0), small.used.load(.monotonic));
 }
 
@@ -17055,4 +17091,125 @@ test "cost hint and previous attempt refusals never classify a later host OOM" {
     // A real refusal in this attempt still classifies normally.
     try testing.expectError(error.OutOfMemory, w.charged.?.allocator().alloc(u8, 1));
     try testing.expectEqual(error.ExceededMemoryBudget, workerRefusal(&w, error.OutOfMemory));
+}
+
+test "false but corroborated footer bounds pin the default and scan-all trust boundary" {
+    const path = "ci/fixtures/parquet/false_bounds.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_]usize{ 1, 3, 16 }) |j| for ([_]bool{ false, true }) |scan_all| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var result = try runMultiAggregate(testing.allocator, arena.allocator(), .{
+            .inputs = &inputs,
+            .aggregate = "sum(v) AS s",
+            .filter = "x = 100001",
+            .scan_all = scan_all,
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+        });
+        defer result.deinit(testing.allocator);
+        const got = result.output.aggs[0].value;
+        if (scan_all) try testing.expectEqual(@as(i128, 20), got.i) else try testing.expect(got == .null_val);
+    };
+}
+
+test "sketch census and first-key plans reject all gated inputs including mapped readers" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const Gate = struct {
+        fn wait(_: *anyopaque, _: usize) anyerror!void {
+            unreachable;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {
+            unreachable;
+        }
+    };
+    var marker: u8 = 0;
+    var inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_][]const u8{ "count(*) AS c", "count(DISTINCT v) AS c" }) |aggregate| {
+        for ([_]bool{ false, true }) |first| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .aggregate = aggregate,
+                .group_by = "k",
+                .select_cols = try selectList(a, &.{ "k", aggregate }),
+                .ndv_policy = false,
+                .result_order = .{
+                    .keys = if (first) &.{} else &.{.{ .column = 1, .descending = true }},
+                    .limit = 1,
+                },
+                .sketch_topk = .{ .fuse_census = true },
+            };
+            inputs[0].gate = null;
+            inputs[0].plan_bytes = null;
+            const ordinary = try explainAggregate(testing.allocator, a, args);
+            const expected: @FieldType(AggregateDispatch, "strategy") = if (first) .first_keys else .sketch;
+            try testing.expectEqual(expected, ordinary.plan.dispatch.strategy);
+            if (!first) try testing.expect(ordinary.plan.dispatch.census_allowed);
+            for ([_]bool{ false, true }) |mapped| {
+                inputs[0].gate = .{ .ctx = &marker, .wait = Gate.wait, .done = Gate.done };
+                inputs[0].plan_bytes = if (mapped) bytes else null;
+                const gated = try explainAggregate(testing.allocator, a, args);
+                try testing.expectEqual(.plain_hash, gated.plan.dispatch.strategy);
+                try testing.expect(!gated.plan.dispatch.census_allowed);
+                try testing.expect(!gated.plan.dispatch.census_fused);
+                try testing.expect(!gated.plan.dispatch.distinct_census);
+            }
+        }
+    }
+}
+
+test "stream probe funding follows projected chunks and retains the fixed option cap" {
+    const bytes = (try loadFixture("ci/fixtures/parquet/plain_values_corrupt.parquet")) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metas = [_]schema.FileMetaData{try metadata.open(a, bytes)};
+    const Gate = struct {
+        fn wait(_: *anyopaque, _: usize) anyerror!void {
+            unreachable;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {
+            unreachable;
+        }
+    };
+    var marker: u8 = 0;
+    var inputs = [_]Input{.{
+        .name = "stream",
+        .bytes = &.{},
+        .gate = .{ .ctx = &marker, .wait = Gate.wait, .done = Gate.done },
+    }};
+    const leaf = try expr_parser.parseExprOnly(a, "s", &metas[0], null);
+    const calls = [_]expr_agg.AggCall{.{
+        .func = .min,
+        .arg = leaf,
+        .alias = "m",
+        .result = .bytes,
+        .where = null,
+    }};
+    const plan = try agg_plan.Plan.init(a, .{ .filter = null, .calls = &calls, .group_keys = null }, &metas, .ignore);
+    const quote = streamProbeBytes(&inputs, &metas, &plan);
+    try testing.expect(quote > 0 and quote < core_memory.lean_decode / 2);
+    var budget: core_memory.SharedBudget = .{ .limit = 1 << 30 };
+    var probe: FailureProbe = .{ .limit = budget.limit };
+    try probe.reserveStream(&budget, quote);
+    try testing.expectEqual(quote, budget.used.load(.monotonic));
+    probe.releaseStream();
+    // No projected payload and no non-rescannable source require no funding.
+    const empty = try agg_plan.Plan.init(a, .{ .filter = null, .calls = &.{}, .group_keys = null }, &metas, .ignore);
+    try testing.expectEqual(@as(usize, 0), streamProbeBytes(&inputs, &metas, &empty));
+    inputs[0].plan_bytes = bytes;
+    try testing.expectEqual(@as(usize, 0), streamProbeBytes(&inputs, &metas, &plan));
+    // The plan may request arbitrarily much; the quota is still independent of workers and live ledger room.
+    try probe.reserveStream(&budget, std.math.maxInt(usize));
+    try testing.expectEqual(core_memory.lean_decode / 2, budget.used.load(.monotonic));
+    probe.releaseStream();
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }

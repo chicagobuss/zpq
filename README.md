@@ -372,12 +372,13 @@ Parquet files carry per-column statistics (min / max / null counts). The spec sa
 real-world writers ship inaccurate ones (we have a `parquet-mr 1.8.2` file in the test corpus whose recorded `min` is
 `2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently wrong answer**.
 
-ZPQ's default is **correctness**: `min / max / sum` are computed by decoding the data, so the answer is right regardless
-of what the file claims. Two things are still always fast and always safe, because they can't produce a wrong value:
+By default, `min / max / sum` decode their values instead of taking the answer from statistics. Filters can still
+prune data using corroborated statistics. The metadata shortcuts have separate trust boundaries:
 
 - **`count(*)`** is answered from the row group's `num_rows` (structural, not a statistic).
-- **Row-group pruning** uses stats only to *skip* groups that provably can't match a filter — it never invents a value,
-  so a bad stat can at worst cost a little extra decoding, never a wrong result.
+- **Row-group pruning** uses footer/page statistics that pass type/order and consistency checks. Internally
+  consistent but false bounds can still skip matching rows and change the result; `--scan-all` ignores statistics.
+  See the [validation contract](docs/output-format.md#validation-and-skipped-data).
 
 Floats compare in total order, as they sort: NaN equals NaN and lies above every number, so `x > 5` and `NOT (x < 5)`
 keep NaN rows. Float bounds leave NaN out, so a chunk whose max is below 5 can still hold rows passing `x > 5`. ZPQ

@@ -191,6 +191,70 @@ pub const HybridRleDecoder = struct {
         return .{ .value = self.rle_value, .count = n };
     }
 
+    /// A performance hint only: keep run-dominated pages encoded. On mostly packed levels, decoding twice
+    /// (validation then consumption) costs more than copying the expanded page. Malformed hints fall back to
+    /// decodeLevels, which retains the error and its precedence. Sixty-four levels are one selection-mask word.
+    pub fn preferLevelRuns(bytes: []const u8, width: u8, count: usize) bool {
+        if (width == 0 or count == 0) return false;
+        var stream = HybridRleDecoder.init(bytes, width);
+        var left = count;
+        var long_rows: usize = 0;
+        while (left != 0) {
+            if (stream.pos >= bytes.len) return false;
+            stream.readNextRun() catch return false;
+            if (stream.remaining_in_run == 0) return false;
+            const n = @min(left, stream.remaining_in_run);
+            if (stream.in_rle) {
+                if (n >= 64) long_rows += n;
+            } else {
+                const size = (stream.remaining_in_run / 8) *| width;
+                if (size > bytes.len - stream.pos) return false;
+                stream.pos += size;
+            }
+            left -= n;
+        }
+        return long_rows >= count / 2 + count % 2;
+    }
+
+    /// Count present levels without expanding RLE runs. Packed spans use bounded scratch. The whole page
+    /// must be checked before value decoding: corruption/count errors precede an out-of-range level anywhere.
+    pub fn countPresentLevels(self: *HybridRleDecoder, max_level: u32, count: usize) LevelError!usize {
+        if (self.bit_width == 0) return count;
+        var done: usize = 0;
+        var present: usize = 0;
+        var bad_range = false;
+        var packed_buf: [256]u32 = undefined;
+        while (done < count) {
+            if (self.remaining_in_run == 0 and self.bp_carry_count == 0) {
+                if (self.pos >= self.bytes.len) break;
+                self.readNextRun() catch return error.CorruptLevels;
+                // decodeLevels stops at an empty run, even if more bytes follow it.
+                if (self.remaining_in_run == 0) break;
+            }
+            if (self.in_rle and self.bp_carry_count == 0) {
+                const n = @min(count - done, self.remaining_in_run);
+                bad_range = bad_range or self.rle_value > max_level;
+                if (self.rle_value == max_level) present += n;
+                self.remaining_in_run -= n;
+                done += n;
+            } else {
+                const n = @min(count - done, packed_buf.len, self.remaining_in_run + self.bp_carry_count);
+                const got = self.decode(packed_buf[0..n]) catch return error.CorruptLevels;
+                if (got != n) return error.LevelCountMismatch;
+                for (packed_buf[0..n]) |v| {
+                    bad_range = bad_range or v > max_level;
+                    present += @intFromBool(v == max_level);
+                }
+                done += n;
+            }
+        }
+        if (done != count) return error.LevelCountMismatch;
+        if (!self.in_rle and (self.remaining_in_run / 8) *| self.bit_width > self.bytes.len - self.pos)
+            return error.CorruptLevels;
+        if (bad_range) return error.LevelOutOfRange;
+        return present;
+    }
+
     /// Peek the stream's opening run without expanding a single value.
     ///
     /// Returns null when the stream is empty/truncated or opens with a
@@ -1149,4 +1213,70 @@ test "regression: decodeLevels refuses a level past its maximum, whatever the bo
     many[97] = 5;
     try std.testing.expect(!levelsWithin(&many, 4) and !levelsWithin(&many, 2));
     try std.testing.expectError(error.LevelCountMismatch, decodeLevels(&run2, 2, &many));
+}
+
+test "run-counted levels match expanded validation and error precedence" {
+    var prng = std.Random.DefaultPrng.init(0x739d187a);
+    const random = prng.random();
+    var bytes: [32]u8 = undefined;
+    var out: [64]u32 = undefined;
+    for (0..5000) |_| {
+        random.bytes(&bytes);
+        const n = random.uintLessThan(usize, out.len + 1);
+        const len = random.uintLessThan(usize, bytes.len + 1);
+        const max = random.uintLessThan(u32, 16);
+        try compareLevelCount(bytes[0..len], max, out[0..n]);
+    }
+    // Earlier out-of-range values lose to later corruption / short streams; a zero run ends decoding.
+    for ([_][]const u8{ &.{ 2, 3, 2 }, &.{ 2, 3 }, &.{ 5, 0, 0 }, &.{ 0, 0, 2, 1 } }) |encoded|
+        try compareLevelCount(encoded, 2, out[0..2]);
+    // Trailing bytes after the requested RLE prefix remain ignored, matching decodeLevels.
+    try compareLevelCount(&.{ 2, 1, 255 }, 1, out[0..1]);
+}
+
+fn compareLevelCount(bytes: []const u8, max: u32, out: []u32) !void {
+    const width: u8 = if (max == 0) 0 else @intCast(32 - @clz(max));
+    var stream = HybridRleDecoder.init(bytes, width);
+    const expected = decodeLevels(bytes, max, out);
+    const counted = stream.countPresentLevels(max, out.len);
+    if (expected) |_| {
+        var present: usize = 0;
+        for (out) |v| present += @intFromBool(v == max);
+        try std.testing.expectEqual(present, try counted);
+    } else |want_error| {
+        if (counted) |_| {
+            return error.TestExpectedError;
+        } else |got_error| {
+            try std.testing.expectEqual(want_error, got_error);
+        }
+    }
+}
+
+test "run-counted levels keep packed carry across arbitrary consumer windows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var levels: [1543]u32 = undefined;
+    for (&levels, 0..) |*v, i| v.* = if (i < 700) 1 else if (i < 1300) 0 else @intCast(i % 2);
+    const encoded = try encode(a, &levels, 1);
+    for ([_]usize{ 1, 3, 63, 64, 129, 512 }) |size| {
+        var stream = HybridRleDecoder.init(encoded, 1);
+        var off: usize = 0;
+        while (off < levels.len) {
+            const n = @min(size, levels.len - off);
+            var present: usize = 0;
+            for (levels[off..][0..n]) |v| present += v;
+            try std.testing.expectEqual(present, try stream.countPresentLevels(1, n));
+            off += n;
+        }
+    }
+}
+
+test "level run admission is encoded-byte based and leaves packed pages on the legacy path" {
+    try std.testing.expect(HybridRleDecoder.preferLevelRuns(&.{ 128, 1, 1, 128, 1, 0 }, 1, 128));
+    try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 3, 0xff }, 1, 8));
+    try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 5, 0xff }, 1, 8));
+    try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 0, 0, 128, 1, 1 }, 1, 64));
+    // A packed opening followed by a long run also admits: the decision is not restricted to the first header.
+    try std.testing.expect(HybridRleDecoder.preferLevelRuns(&.{ 3, 0xaa, 128, 1, 1 }, 1, 72));
 }

@@ -100,7 +100,11 @@ fn bitWidthFor(max: u32) u8 {
 }
 
 fn levelsInto(bytes: []const u8, max_level: anytype, out: []u32) Error!void {
-    hybrid_rle.decodeLevels(bytes, @intCast(max_level), out) catch |err| return switch (err) {
+    hybrid_rle.decodeLevels(bytes, @intCast(max_level), out) catch |err| return levelError(err);
+}
+
+fn levelError(err: hybrid_rle.LevelError) Error {
+    return switch (err) {
         error.CorruptLevels => error.UnexpectedPage,
         error.LevelCountMismatch => error.DefLevelsMismatch,
         error.LevelOutOfRange => error.LevelOutOfRange,
@@ -122,6 +126,8 @@ pub const DecodeOptions = struct {
     /// proves every value present. Kept on each reader so concurrent queries
     /// can choose independently without process-global mutable state.
     fast_levels: bool = false,
+    /// null chooses run-dominated flat pages from encoded headers; true/false force streaming/legacy expansion.
+    level_runs: ?bool = null,
     /// Let an aggregate scan work on dictionary-encoded columns as codes (filters once per dictionary entry,
     /// histogram aggregates, level-only counts) instead of materialising values. Off only to compare against.
     encoded: bool = true,
@@ -255,6 +261,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// entries the caller has already consumed across decode()
         /// calls within this page.
         current_def_levels: ?[]u32 = null,
+        /// Flat fast-level readers retain the validated encoded stream, expanding only a caller's row window.
+        current_def_stream: ?hybrid_rle.HybridRleDecoder = null,
+        current_def_nulls: usize = 0,
         current_rep_levels: ?[]u32 = null,
         current_def_pos: usize = 0,
         current_page_num_values: usize = 0,
@@ -544,19 +553,19 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     const want = @min(num_leaves - written, remaining_in_page);
                     const out = codes[written..][0..want];
                     const idx = &self.active.rle_dict.indices;
-                    const page_has_levels = !self.current_def_all_present and self.current_def_levels != null;
+                    const page_has_levels = !self.current_def_all_present and self.hasDefLevels();
                     if (max_def > 0 and def_out == null and page_has_levels) {
                         def_out = try self.arena.alloc(u32, num_leaves);
                         @memset(def_out.?[0..written], max_def);
                     }
-                    if (def_out == null or self.current_def_all_present or self.current_def_levels == null) {
+                    if (def_out == null or self.current_def_all_present or !self.hasDefLevels()) {
                         if (def_out) |dl| @memset(dl[written..][0..want], max_def);
                         const got = idx.decode(out) catch return error.UnexpectedPage;
                         if (got != want) return error.UnexpectedPage;
                         try self.checkCodes(out);
                     } else {
-                        const src = self.current_def_levels.?[self.current_def_pos..][0..want];
-                        @memcpy(def_out.?[written..][0..want], src);
+                        const src = def_out.?[written..][0..want];
+                        try self.readDefLevels(src);
                         var num_present: usize = 0;
                         for (src) |dv| num_present += @intFromBool(dv == max_def);
                         if (num_present > 0) {
@@ -671,10 +680,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     }
                     const want = @min(num_leaves - written, remaining_in_page);
                     var present = want;
-                    if (max_def > 0 and !self.current_def_all_present and self.current_def_levels != null) {
-                        const src = self.current_def_levels.?[self.current_def_pos..][0..want];
-                        present = 0;
-                        for (src) |dv| present += @intFromBool(dv == max_def);
+                    if (max_def > 0 and !self.current_def_all_present and self.hasDefLevels()) {
+                        present = try self.countDefPresent(want);
                     }
                     if (track_first and present != want) return null;
                     const idx = &self.active.rle_dict.indices;
@@ -751,15 +758,14 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     0;
                 if (remaining_in_page > 0) {
                     const want = @min(num_leaves - written, remaining_in_page);
-                    if (self.current_def_all_present or self.current_def_levels == null) {
+                    if (self.current_def_all_present or !self.hasDefLevels()) {
                         if (out_opt) |out| @memset(out[written..][0..want], max_def);
                     } else {
                         if (out_opt == null) {
                             out_opt = try self.arena.alloc(u32, num_leaves);
                             @memset(out_opt.?[0..written], max_def);
                         }
-                        const src = self.current_def_levels.?[self.current_def_pos..][0..want];
-                        @memcpy(out_opt.?[written..][0..want], src);
+                        try self.readDefLevels(out_opt.?[written..][0..want]);
                     }
                     written += want;
                     self.current_def_pos += want;
@@ -787,10 +793,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (left > 0) {
                     const want = @min(def_out.len - written, left);
                     const dst = def_out[written..][0..want];
-                    if (self.current_def_all_present or self.current_def_levels == null)
+                    if (self.current_def_all_present or !self.hasDefLevels())
                         @memset(dst, max_def)
                     else
-                        @memcpy(dst, self.current_def_levels.?[self.current_def_pos..][0..want]);
+                        try self.readDefLevels(dst);
                     written += want;
                     self.current_def_pos += want;
                     continue;
@@ -990,6 +996,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.active = .idle;
             self.pending_expansion = 0;
             self.current_def_levels = null;
+            self.current_def_stream = null;
+            self.current_def_nulls = 0;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
             self.current_def_pos = 0;
@@ -1037,9 +1045,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 return;
             }
 
-            const dl = self.current_def_levels.?;
-            const src = dl[self.current_def_pos .. self.current_def_pos + values.len];
-            @memcpy(def_levels_out, src);
+            try self.readDefLevels(def_levels_out);
+            const src = def_levels_out;
 
             if (rep_levels_out) |rl_out| {
                 if (self.current_rep_levels) |rl| {
@@ -1411,6 +1418,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
             try self.chargePage(num_values);
             self.pending_expansion = 0;
             self.current_def_levels = null;
+            self.current_def_stream = null;
+            self.current_def_nulls = 0;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
             self.current_def_pos = 0;
@@ -1432,6 +1441,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         /// The installed page's levels below max_def.
         fn pageNulls(self: *const Self) usize {
+            if (self.current_def_stream != null) return self.current_def_nulls;
             const levels = self.current_def_levels orelse return 0;
             const max_def: u32 = @intCast(self.levels.max_def);
             const L = 16;
@@ -1450,10 +1460,49 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.current_rep_levels = buf;
         }
 
+        fn hasDefLevels(self: *const Self) bool {
+            return self.current_def_levels != null or self.current_def_stream != null;
+        }
+
+        fn readDefLevels(self: *Self, out: []u32) Error!void {
+            if (self.current_def_stream) |*stream| {
+                const got = stream.decode(out) catch return error.UnexpectedPage;
+                if (got != out.len) return error.DefLevelsMismatch;
+            } else {
+                @memcpy(out, self.current_def_levels.?[self.current_def_pos..][0..out.len]);
+            }
+        }
+
+        fn countDefPresent(self: *Self, n: usize) Error!usize {
+            const max_def: u32 = @intCast(self.levels.max_def);
+            if (self.current_def_stream) |*stream| {
+                return stream.countPresentLevels(max_def, n) catch |err| return levelError(err);
+            }
+            var count: usize = 0;
+            for (self.current_def_levels.?[self.current_def_pos..][0..n]) |v| count += @intFromBool(v == max_def);
+            return count;
+        }
+
         fn installDefLevels(self: *Self, def_bytes: []const u8, num_values: usize) Error!void {
             const bit_width = bitWidthFor(@intCast(self.levels.max_def));
             if (self.canSkipDefLevels(def_bytes, bit_width, num_values)) {
                 self.current_def_all_present = true;
+                return;
+            }
+            if (self.options.fast_levels and self.levels.max_rep == 0 and
+                (self.options.level_runs orelse
+                    hybrid_rle.HybridRleDecoder.preferLevelRuns(def_bytes, bit_width, num_values)))
+            {
+                const stream = hybrid_rle.HybridRleDecoder.init(def_bytes, bit_width);
+                var validation = stream;
+                const present = validation.countPresentLevels(@intCast(self.levels.max_def), num_values) catch |err|
+                    return levelError(err);
+                self.current_def_nulls = num_values - present;
+                if (present == num_values) {
+                    self.current_def_all_present = true;
+                } else {
+                    self.current_def_stream = stream;
+                }
                 return;
             }
             const buf = try self.levelBuffer(.def, num_values);
@@ -2616,4 +2665,60 @@ test "regression: a histogram past 2^32 leaves counts untracked and is declined 
     try testing.expectEqual(@as(u64, n), (try untracked.readAllHistogram(n, false)).?.hist.hist[0]);
     var tracked = ColumnChunkReader(i32).init(chunk.items, .UNCOMPRESSED, flat, arena);
     try testing.expect(try tracked.readAllHistogram(n, true) == null);
+}
+
+test "flat level runs validate eagerly and remain encoded until the consumer window" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var levels: [1543]u32 = undefined;
+    for (&levels, 0..) |*v, i| v.* = if (i < 700) 1 else if (i < 1300) 0 else @intCast(i % 2);
+    const encoded = try hybrid_rle.encode(a, &levels, 1);
+    for ([_]bool{ false, true }) |fast| {
+        var reader = ColumnChunkReader(i32).initWithOptions(
+            &.{},
+            .UNCOMPRESSED,
+            .{ .max_def = 1, .max_rep = 0 },
+            a,
+            .{ .fast_levels = fast },
+            null,
+        );
+        try reader.installDefLevels(encoded, levels.len);
+        try testing.expectEqual(fast, reader.current_def_stream != null);
+        try testing.expectEqual(!fast, reader.current_def_levels != null);
+        var nulls: usize = 0;
+        for (levels) |v| nulls += @intFromBool(v == 0);
+        try testing.expectEqual(nulls, reader.pageNulls());
+        var buf: [63]u32 = undefined;
+        var off: usize = 0;
+        while (off < levels.len) {
+            const n = @min(buf.len, levels.len - off);
+            if ((off / buf.len) % 2 == 0) {
+                try reader.readDefLevels(buf[0..n]);
+                try testing.expectEqualSlices(u32, levels[off..][0..n], buf[0..n]);
+            } else {
+                var present: usize = 0;
+                for (levels[off..][0..n]) |v| present += v;
+                try testing.expectEqual(present, try reader.countDefPresent(n));
+            }
+            off += n;
+            reader.current_def_pos = off;
+        }
+        reader.resetPageState();
+        try testing.expect(!reader.hasDefLevels());
+    }
+    // The first level is outside max_def, but the truncated next RLE run wins before any value is decoded.
+    for ([_]bool{ false, true }) |fast| {
+        var reader = ColumnChunkReader(i32).initWithOptions(
+            &.{},
+            .UNCOMPRESSED,
+            .{ .max_def = 2, .max_rep = 0 },
+            a,
+            .{ .fast_levels = fast },
+            null,
+        );
+        try testing.expectError(error.UnexpectedPage, reader.installDefLevels(&.{ 2, 3, 2 }, 2));
+        try testing.expectError(error.DefLevelsMismatch, reader.installDefLevels(&.{ 2, 3 }, 2));
+        try testing.expectError(error.LevelOutOfRange, reader.installDefLevels(&.{ 4, 3 }, 2));
+    }
 }

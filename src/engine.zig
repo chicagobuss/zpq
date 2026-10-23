@@ -673,6 +673,11 @@ fn executeAggregateOver(
         // Aggregate consumers need presence, not an expanded level array when the encoded run proves every row
         // present. The forced legacy path is for cross-checks; dictionary consumers already make this proof.
         .fast_levels = args.fast_levels or !envDisables(ctx.env, "ZPQ_LEVEL_RUNS"),
+        .level_runs = blk: {
+            const v = ctx.env.getPosix("ZPQ_LEVEL_RUNS") orelse break :blk null;
+            if (std.mem.eql(u8, v, "0")) break :blk false;
+            break :blk if (std.mem.eql(u8, v, "1")) true else null;
+        },
         .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else

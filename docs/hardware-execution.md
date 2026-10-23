@@ -29,7 +29,7 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_HW_L2_BYTES` | Replace discovered L2 sizes, in bytes |
 | `ZPQ_HW_L3_BYTES` | Replace discovered L3 sizes, in bytes |
 | `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` selects the legacy full-row-group evaluator |
-| `ZPQ_LEVEL_RUNS` | Aggregate plain-value all-present level proof; `0` selects legacy level expansion |
+| `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` keeps legacy expansion |
 
 Sharing sets remain real under size overrides. Zero means unknown, letting a
 caller test its conservative fallback. Invalid values leave discovery intact.
@@ -42,6 +42,18 @@ must never reach any choice that changes bytes or float bits.
 `python tools/hw_execution_check.py CANDIDATE [BASE]` checks q1-like scalar
 and grouped float answers byte for byte under 256K, 1M and 4M L2 overrides
 at j1/3/8/16. It uses an isolated temporary fixture and requires pyarrow.
+
+Flat level streams are validated eagerly before the value decoder is installed.
+The default retains encoded streams when runs of at least 64 levels cover half
+the requested page rows, determined solely by encoded headers. Other mixed
+pages keep the expanded path to avoid decoding packed values twice. This is a
+performance hint; both paths perform the same validation.
+RLE spans contribute weighted counts directly to histogram consumers. Other
+consumers expand only their requested row window, without a page-sized level
+array. Nested levels keep their established expanded representation.
+`python tools/level_runs_check.py CANDIDATE [BASE]` checks both forced variants
+on nullable V1/V2 pages, scalar/grouped arithmetic, dictionary histograms,
+BOOLEAN filters, and memory-driven row slices.
 
 Expression DAGs count every live input, widened lane, intermediate, null layout,
 selection and group ID. Their row budget uses three quarters of each SMT

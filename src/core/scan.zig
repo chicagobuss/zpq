@@ -219,6 +219,7 @@ pub const MultiAggArgs = struct {
     /// `count(*)` is always answered from num_rows regardless.
     trust_stats: bool = false,
     fast_levels: bool = false,
+    level_runs: ?bool = null,
     /// Query-local computed DOUBLE batch override; 0 keeps the legacy evaluator.
     expr_batch_rows: ?usize = null,
     /// See `consumer.DecodeOptions.encoded`.
@@ -3594,6 +3595,7 @@ fn prepareAggregate(
     if (scan_plan.wants_sample) {
         const options: consumer.DecodeOptions = .{
             .fast_levels = args.fast_levels,
+            .level_runs = args.level_runs,
             .encoded = args.encoded,
             .expand_limit = args.max_memory,
         };
@@ -3863,6 +3865,7 @@ fn prepareAggregate(
             .plan = &plan,
             .decode_options = .{
                 .fast_levels = args.fast_levels,
+                .level_runs = args.level_runs,
                 .encoded = args.encoded,
                 .expand_limit = args.max_memory,
             },
@@ -4955,6 +4958,7 @@ fn runRecordWorkers(
         .plan = plan,
         .decode_options = .{
             .fast_levels = args.fast_levels,
+            .level_runs = args.level_runs,
             .encoded = args.encoded,
             .expand_limit = args.max_memory,
         },

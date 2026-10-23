@@ -229,6 +229,16 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
 
 ### Behaviour changes
 
+**Contracts**
+- Aggregate decode failures have one canonical order: input and row-group order first, then the failing page's
+  first row, then input-column order in the result projection. A computed output's leaves keep schema order;
+  columns read only by filters follow projected columns. Checks within a page retain their existing order.
+  Whole-row-group, memory-sliced and cache-window execution report the same error at every worker count and
+  memory budget. Sliced readers also enforce the chunk's value count, so an oversized REQUIRED page cannot
+  escape validation when a slice stops at the footer's row count. This fixes the earlier tight-budget change in
+  reported row group, column or page. Competing columns are checked only after a decode failure; valid input does
+  not pay for these checks.
+
 **Errors**
 - A page or column chunk that fails to decode names where, on every query kind and at every `-j`:
   `cannot decode input file data/b.parquet` / `row group 0, column `z`, page 1:` / `the page's encoded data is

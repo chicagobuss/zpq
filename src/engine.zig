@@ -678,6 +678,10 @@ fn executeAggregateOver(
             if (std.mem.eql(u8, v, "0")) break :blk false;
             break :blk if (std.mem.eql(u8, v, "1")) true else null;
         },
+        .decode_batch_rows = if (ctx.env.getPosix("ZPQ_DECODE_BATCH_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch 0
+        else
+            0,
         .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else

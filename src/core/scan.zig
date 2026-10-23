@@ -222,6 +222,8 @@ pub const MultiAggArgs = struct {
     level_runs: ?bool = null,
     /// Query-local computed DOUBLE batch override; 0 keeps the legacy evaluator.
     expr_batch_rows: ?usize = null,
+    /// Forced flat decode windows; zero keeps ordinary memory admission.
+    decode_batch_rows: usize = 0,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
@@ -1334,6 +1336,7 @@ const BlockMerge = struct {
     ahead: usize,
     lock: std.Io.Mutex = .init,
     failed: std.atomic.Value(bool) = .init(false),
+    failed_from: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
     /// Bumped whenever `next` advances or a worker fails: the word `awaitTurn` sleeps on.
     moved: std.atomic.Value(u32) = .init(0),
 
@@ -1342,7 +1345,7 @@ const BlockMerge = struct {
         while (true) {
             // Read `moved` before the condition: a merge or failure between the two changes it, and the wait returns.
             const seen = self.moved.load(.acquire);
-            if (self.failed.load(.acquire)) return false;
+            if (self.failed.load(.acquire) and b >= self.failed_from.load(.acquire)) return false;
             if (b < self.next.load(.acquire) + self.ahead) return true;
             blocking.io.futexWaitUncancelable(u32, &self.moved.raw, seen);
         }
@@ -1373,6 +1376,11 @@ const BlockMerge = struct {
     }
 
     fn fail(self: *BlockMerge) void {
+        self.failFrom(0);
+    }
+
+    fn failFrom(self: *BlockMerge, b: usize) void {
+        _ = self.failed_from.fetchMin(b, .acq_rel);
         self.failed.store(true, .release);
         self.wake();
     }
@@ -1414,6 +1422,84 @@ fn orderSensitive(calls: []const expr_agg.AggCall) bool {
 }
 
 /// One worker thread's slice of work.
+fn decodeProjectionOrder(
+    a: std.mem.Allocator,
+    n: usize,
+    calls: []const expr_agg.AggCall,
+    keys: ?[]const expr_ast.Expr,
+    outputs: ?[]const BoundOutputColumn,
+) ![]const usize {
+    const ranks = try a.alloc(usize, n);
+    @memset(ranks, std.math.maxInt(usize));
+    const Builder = struct {
+        ranks: []usize,
+        mask: []bool,
+        next: usize = 0,
+
+        fn add(b: *@This(), e: expr_ast.Expr) void {
+            @memset(b.mask, false);
+            e.collectColumns(b.mask);
+            for (b.mask, 0..) |used, ci| if (used and b.ranks[ci] == std.math.maxInt(usize)) {
+                b.ranks[ci] = b.next;
+                b.next += 1;
+            };
+        }
+    };
+    var b: Builder = .{ .ranks = ranks, .mask = try a.alloc(bool, n) };
+    if (outputs) |cols| for (cols) |out| switch (out.source) {
+        .key => |ki| b.add(keys.?[ki]),
+        .agg => |ai| if (calls[ai].arg) |arg| b.add(arg),
+    };
+    if (keys) |ks| for (ks) |key| b.add(key);
+    for (calls) |call| if (call.arg) |arg| b.add(arg);
+    for (ranks) |*rank| if (rank.* == std.math.maxInt(usize)) {
+        rank.* = b.next;
+        b.next += 1;
+    };
+    return ranks;
+}
+
+fn workerErrorRanks(ctx: *const anyopaque, a: std.mem.Allocator, n: usize) anyerror![]const usize {
+    const w: *const Worker = @ptrCast(@alignCast(ctx));
+    return decodeProjectionOrder(a, n, w.agg_calls, w.group_by_keys, w.error_outputs);
+}
+
+/// Called only once a worker failed. Row groups follow input/row-group order, independent of worker IDs.
+fn firstWorkerFailure(workers: []const Worker) ?struct { err: anyerror, site: ?consumer.DecodeSite } {
+    var best: ?usize = null;
+    var first: ?usize = null;
+    var best_file: usize = std.math.maxInt(usize);
+    var best_rg: usize = std.math.maxInt(usize);
+    for (workers, 0..) |w, wi| if (w.err) |err| {
+        if (first == null) first = wi;
+        if (!consumer.isDecodeError(err) or w.failure == null) {
+            // Other query/resource failures retain the pre-existing worker precedence.
+            const original = workers[first.?];
+            return .{ .err = original.err.?, .site = original.failure };
+        }
+        const site = w.failure.?;
+        var file: usize = 0;
+        var ri: usize = std.math.maxInt(usize);
+        while (file < w.metas.len) : (file += 1) {
+            const rgs = w.metas[file].row_groups.items;
+            const p = @intFromPtr(site.rg);
+            const lo = @intFromPtr(rgs.ptr);
+            if (p >= lo and p < lo + rgs.len * @sizeOf(schema.RowGroup)) {
+                ri = (p - lo) / @sizeOf(schema.RowGroup);
+                break;
+            }
+        }
+        if (best == null or file < best_file or (file == best_file and
+            (ri < best_rg or (ri == best_rg and @import("decode_order.zig").less(site, workers[best.?].failure.?)))))
+        {
+            best = wi;
+            best_file = file;
+            best_rg = ri;
+        }
+    };
+    return if (best) |wi| .{ .err = workers[wi].err.?, .site = workers[wi].failure } else null;
+}
+
 const Worker = struct {
     gpa: std.mem.Allocator,
     inputs: []const Input,
@@ -1434,6 +1520,8 @@ const Worker = struct {
     plan: *const agg_plan.Plan,
     decode_options: consumer.DecodeOptions,
     expr_batch_rows: ?usize = null,
+    decode_batch_rows: usize = 0,
+    error_outputs: ?[]const BoundOutputColumn = null,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_scanned: i64 = 0,
@@ -1506,7 +1594,19 @@ fn workerRun(w: *Worker) void {
     workerRunErr(w, prof, &items) catch |e| {
         w.err = workerRefusal(w, e);
         w.failure = consumer.decodeFailure();
-        if (w.block_merge) |m| m.fail();
+        if (w.block_merge) |m| {
+            if (consumer.isDecodeError(e) and w.failure != null) {
+                // A lower block may not have entered awaitTurn yet. It must still decode: a later block's
+                // failure cannot hide an earlier row group's failure just because its worker ran first.
+                const wi = for (w.work, 0..) |item, i| {
+                    if (&w.metas[item.file].row_groups.items[item.rg] == w.failure.?.rg) break i;
+                } else 0;
+                const block = for (w.blocks.?[1..], 0..) |end, b| {
+                    if (wi < end) break b;
+                } else 0;
+                m.failFrom(block);
+            } else m.fail();
+        }
     };
     // Holding a drawn block until teardown let a barely-grouping worker strand a small budget and fail the worker
     // doing the real work. (Ordered blocks release theirs as each finishes.)
@@ -1676,6 +1776,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .read = columns.forRowGroup(decision),
             .consumed = columns.consumed,
             .preserve = columns.preserve,
+            .error_ranks = .{ .ctx = w, .make = workerErrorRanks },
+            .error_read = w.plan.columns.forRowGroup(decision),
+            .error_calls = w.agg_calls,
         }, w.plan.stats, w.decode_options, target, .{
             .scratch = &scratch,
             .rg_arena = &rg_decode_arena,
@@ -1685,6 +1788,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .charged = if (w.charged) |*c| c.allocator() else null,
             .ledger = w.ledger,
             .expr_batch_rows = w.expr_batch_rows,
+            .decode_batch_rows = w.decode_batch_rows,
         });
         if (item.agg_start == 0) w.rows_matched +|= @intCast(matched);
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
@@ -3870,6 +3974,8 @@ fn prepareAggregate(
                 .expand_limit = args.max_memory,
             },
             .expr_batch_rows = args.expr_batch_rows,
+            .decode_batch_rows = args.decode_batch_rows,
+            .error_outputs = group_outputs,
             .profiler = args.profiler,
             .index = wi,
             .group_by_keys = group_by_keys,
@@ -3919,10 +4025,10 @@ fn prepareAggregate(
     };
     // A cut's passes return their refusal themselves: what decode memory the workers drew is noted on the way out.
     passes catch |e| {
-        for (workers) |w| if (w.err != null) {
-            consumer.setDecodeFailure(w.failure);
-            break;
-        };
+        if (firstWorkerFailure(workers)) |f| {
+            consumer.setDecodeFailure(f.site);
+            if (consumer.isDecodeError(e)) return f.err;
+        }
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             for (workers) |*w| if (decodeHeld(w) and rescannable) taken.insert(.decode_memory);
         };
@@ -3938,7 +4044,8 @@ fn prepareAggregate(
     // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
     if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegions(workers);
     private_decode.release();
-    for (workers) |w| if (w.err) |e| {
+    if (firstWorkerFailure(workers)) |failure| {
+        const e = failure.err;
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             if (decode_held and rescannable) taken.insert(.decode_memory);
             if (taken.contains(.worker_tables)) {
@@ -3946,9 +4053,9 @@ fn prepareAggregate(
                     try oneWorkerCuts(arena, plan_inputs)) taken.insert(.one_table_may_fit);
             }
         };
-        consumer.setDecodeFailure(w.failure);
+        consumer.setDecodeFailure(failure.site);
         return e;
-    };
+    }
     // Past the scan a refusal is the merge's, which one worker's table goes without (a scan that answers drops this).
     if (args.taken) |taken| taken.insert(.one_table_may_fit);
     // The merge and the answer may hold a fixed allowance past the budget, beside the tables they are built from:
@@ -4727,7 +4834,20 @@ fn inlineByteAnswer(
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
     for (sinks, state.locals) |*sink, *local| sink.* = .{ .bytes = local };
-    const t = runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, timings) catch |e| {
+    const t = runRecordWorkers(
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        sinks,
+        starts,
+        outputs,
+        timings,
+    ) catch |e| {
         if (state.width_refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
         return e;
     };
@@ -4876,7 +4996,7 @@ fn inlineIntegerAnswer(
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
     for (sinks, state.locals) |*sink, *local| sink.* = .{ .integer = local };
-    const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, timings);
+    const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, outputs, timings);
     const prof = profile.threadOf(args.profiler, .main);
     const final_start = nowMonoNs();
     try state.finish(n_workers);
@@ -4937,6 +5057,7 @@ fn runRecordWorkers(
     keys: []const expr_ast.Expr,
     sinks: []const consumer.RecordSink,
     starts: []const u32,
+    outputs: []const BoundOutputColumn,
     timings: Timings,
 ) !Timings {
     const n = sinks.len;
@@ -4963,6 +5084,8 @@ fn runRecordWorkers(
             .expand_limit = args.max_memory,
         },
         .expr_batch_rows = args.expr_batch_rows,
+        .decode_batch_rows = args.decode_batch_rows,
+        .error_outputs = outputs,
         .group_by_keys = keys,
         .group_tables = tables,
         .index = i,
@@ -4980,12 +5103,13 @@ fn runRecordWorkers(
     const t0 = nowMonoNs();
     runWorkers(workers);
     releaseRegions(workers);
-    for (workers) |w| if (w.err) |e| {
+    if (firstWorkerFailure(workers)) |failure| {
+        const e = failure.err;
         // Only an effectively parallel attempt can benefit from the deterministic serial retry.
         if (e == error.ExceededMemoryBudget and n > 1) if (args.taken) |taken| taken.insert(.decode_memory);
-        consumer.setDecodeFailure(w.failure);
+        consumer.setDecodeFailure(failure.site);
         return e;
-    };
+    }
     var t = timings;
     t.decode_wall_ns = @intCast(nowMonoNs() - t0);
     for (workers) |w| {
@@ -8043,6 +8167,28 @@ test "an ordered merge's waiting worker sleeps until the block before its window
     m.fail();
     t2.join();
     try testing.expectEqual(@as(u8, 2), failed.load(.acquire));
+}
+
+test "a later failed ordered block cannot cancel an earlier block before it starts" {
+    var tables: [3]expr_agg.GroupTable = undefined;
+    var merged: expr_agg.GroupTable = undefined;
+    var done: [3]std.atomic.Value(bool) = @splat(.init(false));
+    var m: BlockMerge = .{
+        .tables = &tables,
+        .merged = &merged,
+        .calls = &.{},
+        .gpa = testing.allocator,
+        .done = &done,
+        .ahead = 3,
+    };
+    m.failFrom(2);
+    try testing.expect(m.awaitTurn(0));
+    try testing.expect(m.awaitTurn(1));
+    try testing.expect(!m.awaitTurn(2));
+    m.failFrom(1);
+    m.failFrom(2);
+    try testing.expect(!m.awaitTurn(1));
+    try testing.expect(m.awaitTurn(0));
 }
 
 test "applyResultOrder: NULLs last both ways, NaN above numbers, stable ties, offset then limit" {

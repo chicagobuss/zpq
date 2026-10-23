@@ -114,11 +114,8 @@ pub const Timings = struct {
 /// read only once a decode error has ended the query, so it names where that error was raised. A worker hands its own
 /// to the thread that reports the error (`decodeFailure`, `setDecodeFailure`); `resolveDecodeFailure` turns it into
 /// the file, row group, column path and page of the message.
-pub const DecodeSite = struct {
-    rg: *const schema.RowGroup,
-    column: usize,
-    page: ?u32 = null,
-};
+const decode_order = @import("decode_order.zig");
+pub const DecodeSite = decode_order.Site;
 threadlocal var decode_site: ?DecodeSite = null;
 
 /// Mark `column` of `rg` as this thread's chunk. Its page is unknown until a page begins, so a slice reader that
@@ -1071,13 +1068,15 @@ pub const SliceReader = struct {
                     else => comptime unreachable,
                 };
                 const Reader = column_mod.ColumnChunkReader(T);
-                const r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, scratch);
+                var r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, scratch);
+                r.value_budget = @intCast(cm.num_values);
                 break :blk @unionInit(Raw, tag, r);
             },
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => blk: {
                 const Reader = column_mod.ColumnChunkReader([]const u8);
                 // On `a` until the dictionary is in (`holdDictionary`), which then lives there without a copy.
                 var r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, null);
+                r.value_budget = @intCast(cm.num_values);
                 r.type_length = switch (cm.type) {
                     .FIXED_LEN_BYTE_ARRAY => flbaWidth(se),
                     .INT96 => int96_mod.INT96_WIDTH,
@@ -1125,6 +1124,18 @@ pub const SliceReader = struct {
     pub fn levelsOnly(self: *SliceReader) void {
         // Nested or REQUIRED, the whole-chunk path decodes the values after all (`readAllLevels` declines).
         if (self.levels.max_def > 0 and self.levels.max_rep == 0) self.levels_only = true;
+    }
+
+    pub fn pageLeft(self: *const SliceReader) usize {
+        return switch (self.raw.*) {
+            inline else => |*r| r.pageValuesLeft(),
+        };
+    }
+
+    pub fn pageOrdinal(self: *const SliceReader) ?u32 {
+        return switch (self.raw.*) {
+            inline else => |*r| if (r.pages.ordinal == 0) null else r.pages.ordinal - 1,
+        };
     }
 
     pub fn next(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !filter_eval.Batch.Column {
@@ -2929,6 +2940,15 @@ pub const AggRowGroup = struct {
     src: RGSrc,
     /// The outer filter; null when there is none or statistics prove every row passes it.
     filter: ?filter_ast.Filter,
+    /// Projected input-column ranks for decode-error ties; null keeps read-mask order.
+    error_order: ?[]const usize = null,
+    error_ranks: ?struct {
+        ctx: *const anyopaque,
+        make: *const fn (*const anyopaque, std.mem.Allocator, usize) anyerror![]const usize,
+    } = null,
+    /// The full query projection when workers split a row group by aggregate calls.
+    error_read: ?[]const bool = null,
+    error_calls: ?[]const expr_agg.AggCall = null,
     /// Columns to decode (`agg_plan.Columns.forRowGroup`).
     read: []const bool,
     /// Columns whose values an aggregate argument, a per-aggregate FILTER or a GROUP BY key consumes
@@ -2990,6 +3010,7 @@ pub const AggTarget = union(enum) {
 
 /// A scan worker's state, reused from one row group to the next.
 pub const AggWorkspace = struct {
+    decode_batch_rows: usize = 0,
     expr_batch_rows: ?usize = null,
     scratch: *DecodeScratch,
     /// Rewound at each row group that decodes: everything decoded lives here until the next one.
@@ -3427,6 +3448,67 @@ pub fn scanRGForAgg(
     target: AggTarget,
     ws: AggWorkspace,
 ) !u64 {
+    return scanRGForAggImpl(gpa, in, stats, decode_options, target, ws) catch |err| {
+        if (!isDecodeError(err)) return err;
+        const site = decodeFailure() orelse return err;
+        var planning = std.heap.ArenaAllocator.init(gpa);
+        defer planning.deinit();
+        var check_in = in;
+        check_in.read = in.error_read orelse in.read;
+        if (in.error_ranks) |rank| check_in.error_order =
+            try rank.make(rank.ctx, planning.allocator(), check_in.read.len);
+        var check_target = target;
+        if (in.error_calls) |all| switch (check_target) {
+            inline else => |*t| t.calls = all,
+        };
+        const uses = try planCodeUses(planning.allocator(), check_in, check_target, false);
+        const only = try planning.allocator().alloc(bool, check_in.read.len);
+        for (only, 0..) |*v, ci| v.* = target == .scalar and uses.levels[ci] and
+            !uses.code[ci] and !uses.value[ci];
+        const failure = try decode_order.canonical(
+            SliceReader,
+            isDecodeError,
+            gpa,
+            check_in,
+            decode_options,
+            only,
+            .{ .err = err, .site = site },
+        );
+        setDecodeFailure(failure.site);
+        return failure.err;
+    };
+}
+
+// Checked arithmetic keeps its expression-major error order. A forced cache window may change only when
+// fault-free expressions are evaluated; memory-driven slicing otherwise retains its existing admission.
+fn cacheExpressionsSafe(target: AggTarget) bool {
+    for (target.calls()) |call| if (call.arg) |arg| {
+        if (arg != .col_ref and !floatTreeSafe(arg)) return false;
+    };
+    if (target == .grouped) for (target.grouped.keys) |key| {
+        if (key != .col_ref and !floatTreeSafe(key)) return false;
+    };
+    return true;
+}
+
+fn floatTreeSafe(e: expr_ast.Expr) bool {
+    return switch (e) {
+        .literal => |l| l != .str,
+        .col_ref => |c| c.expr_type == .f64 and (c.physical_type == .FLOAT or c.physical_type == .DOUBLE),
+        .binop => |b| b.result_type == .f64 and b.op != .concat and
+            floatTreeSafe(b.left.*) and floatTreeSafe(b.right.*),
+        .call, .case_ => false,
+    };
+}
+
+fn scanRGForAggImpl(
+    gpa: std.mem.Allocator,
+    in: AggRowGroup,
+    stats: agg_plan.StatsUse,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+) !u64 {
     const calls = target.planCalls();
     const num_rows: usize = @intCast(in.rg.num_rows);
 
@@ -3474,7 +3556,8 @@ pub fn scanRGForAgg(
         // Too big for this worker's share, or for what the query's ledger has left: a slice of rows at a time when
         // every column has a sliced form, else one aggregate's columns at a time.
         const fits_share = full <= b.share();
-        const whole = fits_share and admitWhole(ws, full);
+        const force_cache = ws.decode_batch_rows != 0 and cacheExpressionsSafe(target);
+        const whole = !force_cache and fits_share and admitWhole(ws, full);
         if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
         if (!whole) if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) |kept|
             return kept;
@@ -3709,7 +3792,11 @@ fn scanRGSliced(
     // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
     // answer, only how many rows decode at once.
     const room = if (ws.ledger) |l| l.sliceAvailable() / 2 else std.math.maxInt(usize);
-    const slice_rows = sliceRows(@min(budget.share(), room) / per_row, num_rows);
+    const forced = if (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target))
+        ws.decode_batch_rows
+    else
+        std.math.maxInt(usize);
+    const slice_rows = sliceRows(@min(@min(budget.share(), room) / per_row, forced), num_rows);
     const reserved = @min(budget.limit, slice_rows * per_row);
     try budget.acquire(reserved);
     defer budget.release(reserved);
@@ -3737,7 +3824,7 @@ fn scanRGSliced(
         defer if (ws.ledger) |l| {
             const kept = if (on_region) ws.region.?.end else slice.queryCapacity();
             if (took == null) took = @max(1, kept / n);
-            rows_now = sliceRows(@min(reserved, l.sliceAvailable() / 2 + kept) / took.?, num_rows);
+            rows_now = sliceRows(@min(@min(reserved, l.sliceAvailable() / 2 + kept) / took.?, forced), num_rows);
         };
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
@@ -8181,4 +8268,88 @@ test "plainBitsPrefix: every range's bits are plainBits' over the same rows, wha
         for (agg.cols, agg.schema_elems) |*c, *e| want += plainBits(c, e, lohi[0], lohi[1]);
         try testing.expectEqual(want, prefix[lohi[1]] - prefix[lohi[0]]);
     }
+}
+
+test "canonical decode failure checks every competing column and unwinds allocation failures" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const header: schema.PageHeader = .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = 4,
+        .compressed_page_size = 4,
+        .crc = null,
+        .data_page_header = .{
+            .num_values = 300,
+            .encoding = .PLAIN,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    var writer = thrift.Writer.init(a);
+    try header.write(&writer);
+    const bytes = try std.mem.concat(a, u8, &.{ writer.bytes(), &.{ 255, 255, 255, 255 } });
+    var elements = [_]schema.SchemaElement{ fl_test_elem, fl_test_elem, fl_test_elem };
+    elements[0].name = "schema";
+    elements[0].type = null;
+    elements[0].repetition_type = .REQUIRED;
+    elements[0].num_children = 2;
+    elements[1].name = "a";
+    elements[2].name = "b";
+    var paths = [_][1][]const u8{ .{"a"}, .{"b"} };
+    var columns: [2]schema.ColumnChunk = undefined;
+    for (&columns, &paths) |*c, *path| c.* = .{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .INT32,
+            .encodings = .empty,
+            .path_in_schema = .{ .items = path, .capacity = 1, .pointer_stability = .{} },
+            .codec = .UNCOMPRESSED,
+            .num_values = 300,
+            .total_uncompressed_size = @intCast(bytes.len),
+            .total_compressed_size = @intCast(bytes.len),
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    };
+    var groups = [_]schema.RowGroup{.{
+        .columns = .{ .items = &columns, .capacity = 2, .pointer_stability = .{} },
+        .total_byte_size = @intCast(bytes.len * 2),
+        .num_rows = 300,
+    }};
+    const meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .{ .items = &elements, .capacity = 3, .pointer_stability = .{} },
+        .num_rows = 300,
+        .row_groups = .{ .items = &groups, .capacity = 1, .pointer_stability = .{} },
+        .created_by = null,
+    };
+    const in: AggRowGroup = .{
+        .rg = &groups[0],
+        .meta = &meta,
+        .src = .{ .bytes = bytes, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{ true, true },
+        .consumed = &.{ true, true },
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator, input: AggRowGroup) !void {
+            const failure = try decode_order.canonical(
+                SliceReader,
+                isDecodeError,
+                gpa,
+                input,
+                .{},
+                &.{ false, false },
+                .{ .err = error.UnexpectedPage, .site = .{ .rg = input.rg, .column = 1, .page = 0 } },
+            );
+            try std.testing.expectEqual(error.UnexpectedPage, failure.err);
+            try std.testing.expectEqual(@as(usize, 0), failure.site.column);
+            try std.testing.expectEqual(@as(usize, 0), failure.site.first_row);
+        }
+    }.run, .{in});
 }

@@ -29,8 +29,12 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_HW_L2_BYTES` | Replace discovered L2 sizes, in bytes |
 | `ZPQ_HW_L3_BYTES` | Replace discovered L3 sizes, in bytes |
 | `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` selects the legacy full-row-group evaluator |
-| `ZPQ_DECODE_BATCH_ROWS` | Force flat decode windows for fault-free trees, aligned to 64 rows; `0` keeps memory admission |
+| `ZPQ_DECODE_BATCH_ROWS` | Force flat decode windows for fault-free trees; unset, `0`, invalid or overflowing decimal values keep ordinary memory admission |
 | `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` keeps legacy expansion |
+
+A positive `ZPQ_DECODE_BATCH_ROWS` rounds down to a multiple of 64, with a
+minimum of 64 rows. It is parsed once from the query context as an unsigned
+decimal integer.
 
 Sharing sets remain real under size overrides. Zero means unknown, letting a
 caller test its conservative fallback. Invalid values leave discovery intact.

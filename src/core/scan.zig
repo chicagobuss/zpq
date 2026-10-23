@@ -167,6 +167,8 @@ pub const ReadStart = struct {
 };
 
 pub const MultiAggArgs = struct {
+    /// Internal error handoff; prepareAggregate owns it until all scan state has been released.
+    failure_probe: ?*FailureProbe = null,
     inputs: []const Input,
     /// See `ReadStart`.
     start_reads: ?ReadStart = null,
@@ -1007,16 +1009,21 @@ fn sampledPassShare(
             .file_index = item.file,
             .rg_index = item.rg,
             .meta = meta,
-            .src = .{ .bytes = inputs[item.file].bytes, .byte_origin = 0 },
+            .src = .{ .bytes = in.plan_bytes orelse in.bytes, .byte_origin = 0 },
             .filter = plan.filterFor(decision),
             .read = read,
             .consumed = consumed,
         }, plan.stats, options, .{ .scalar = .{ .calls = &calls, .accumulators = &passed } }, .{
+            .defer_decode_errors = true,
             .scratch = &scratch,
             .rg_arena = &rg_arena,
             .timings = &timings,
             .budget = if (budget) |*b| b else null,
-        }) catch |e| return if (e == error.ExceededMemoryBudget) 1 else e;
+        }) catch |e| {
+            // Optional costing reads only filter columns, so it cannot choose the query's canonical failure.
+            if (e == error.ExceededMemoryBudget or consumer.isDecodeError(e)) return 1;
+            return e;
+        };
         return @as(f64, @floatFromInt(passed[0].count)) / @as(f64, @floatFromInt(rg.num_rows));
     }
     return 0;
@@ -1464,40 +1471,129 @@ fn workerErrorRanks(ctx: *const anyopaque, a: std.mem.Allocator, n: usize) anyer
     return decodeProjectionOrder(a, n, w.agg_calls, w.group_by_keys, w.error_outputs);
 }
 
-/// Called only once a worker failed. Row groups follow input/row-group order, independent of worker IDs.
-fn firstWorkerFailure(workers: []const Worker) ?struct { err: anyerror, site: ?consumer.DecodeSite } {
-    var best: ?usize = null;
-    var first: ?usize = null;
-    var best_file: usize = std.math.maxInt(usize);
-    var best_rg: usize = std.math.maxInt(usize);
-    for (workers, 0..) |w, wi| if (w.err) |err| {
-        if (first == null) first = wi;
-        if (!consumer.isDecodeError(err) or w.failure == null) {
-            // Other query/resource failures retain the pre-existing worker precedence.
-            const original = workers[first.?];
-            return .{ .err = original.err.?, .site = original.failure };
-        }
+const FailureProbe = struct {
+    const Context = struct {
+        in: consumer.AggRowGroup,
+        options: consumer.DecodeOptions,
+        calls: []const expr_agg.AggCall,
+        scalar: bool,
+        original: @import("decode_order.zig").Failure,
+    };
+    lock: std.Io.Mutex = .init,
+    limit: usize = 0,
+    ledger: ?*core_memory.SharedBudget = null,
+    workers: []const Worker = &.{},
+    context: ?Context = null,
+
+    fn releaseGates(p: *FailureProbe) void {
+        for (p.workers) |w| if (w.failed_gate) |gate| gate.done(gate.ctx, w.failed_rg, w.items_per_rg);
+        p.workers = &.{};
+    }
+
+    fn capture(p: *FailureProbe, workers: []const Worker, wi: usize) void {
+        const w = &workers[wi];
+        // An unrescanable stream must probe before giving its failed row group back to the producer.
+        if (w.inputs[w.work[w.failed_item].file].gate != null and
+            w.inputs[w.work[w.failed_item].file].plan_bytes == null) return;
+        p.context = contextOf(w);
+    }
+
+    fn contextOf(w: *const Worker) Context {
         const site = w.failure.?;
-        var file: usize = 0;
-        var ri: usize = std.math.maxInt(usize);
-        while (file < w.metas.len) : (file += 1) {
-            const rgs = w.metas[file].row_groups.items;
-            const p = @intFromPtr(site.rg);
-            const lo = @intFromPtr(rgs.ptr);
-            if (p >= lo and p < lo + rgs.len * @sizeOf(schema.RowGroup)) {
-                ri = (p - lo) / @sizeOf(schema.RowGroup);
-                break;
-            }
+        const item = w.work[w.failed_item];
+        const decision = w.plan.decide(site.rg, &w.metas[item.file]);
+        return .{
+            .in = .{
+                .rg = site.rg,
+                .meta = &w.metas[item.file],
+                .src = .{ .bytes = w.inputs[item.file].plan_bytes orelse w.inputs[item.file].bytes, .byte_origin = 0 },
+                .filter = w.plan.filterFor(decision),
+                .read = w.plan.columns.forRowGroup(decision),
+                .consumed = w.plan.columns.consumed,
+                .error_ranks = .{ .ctx = w, .make = workerErrorRanks },
+            },
+            .options = w.decode_options,
+            .calls = w.agg_calls,
+            .scalar = w.group_by_keys == null,
+            .original = .{ .err = w.err.?, .site = site },
+        };
+    }
+};
+
+const WorkerFailureKey = struct {
+    file: usize,
+    rg: usize,
+    unit: u1,
+    row: usize,
+    projection: usize,
+    column: usize,
+
+    fn of(w: *const Worker) WorkerFailureKey {
+        const unknown = std.math.maxInt(usize);
+        const refusal = w.err.? == error.ExceededMemoryBudget;
+        var key: WorkerFailureKey = .{
+            // An unlocated refusal must replay: it may hide a failure before every known site.
+            .file = if (refusal) 0 else unknown,
+            .rg = if (refusal) 0 else unknown,
+            .unit = if (refusal) 0 else 1,
+            .row = if (refusal) 0 else unknown,
+            .projection = if (refusal) 0 else unknown,
+            .column = if (refusal) 0 else unknown,
+        };
+        if (w.failure_work) |i| {
+            key.file = w.work[i].file;
+            key.rg = w.work[i].rg;
         }
-        if (best == null or file < best_file or (file == best_file and
-            (ri < best_rg or (ri == best_rg and @import("decode_order.zig").less(site, workers[best.?].failure.?)))))
+        if (consumer.isDecodeError(w.err.?)) if (w.failure) |site| {
+            if (w.failure_work == null) outer: for (w.metas, 0..) |meta, fi| {
+                for (meta.row_groups.items, 0..) |*rg, ri| if (rg == site.rg) {
+                    key.file = fi;
+                    key.rg = ri;
+                    break :outer;
+                };
+            };
+            key.row = site.first_row;
+            key.projection = site.projection;
+            key.column = site.column;
+        };
+        return key;
+    }
+
+    fn less(a: WorkerFailureKey, b: WorkerFailureKey) bool {
+        inline for (.{ "file", "rg", "unit", "row", "projection", "column" }) |field| {
+            if (@field(a, field) != @field(b, field)) return @field(a, field) < @field(b, field);
+        }
+        return false;
+    }
+};
+
+/// Collect every failure, including refusals which must replay before a later decode error can be final.
+fn firstWorkerFailure(
+    workers: []const Worker,
+    probe: ?*FailureProbe,
+) ?struct { err: anyerror, site: ?consumer.DecodeSite } {
+    var best: ?usize = null;
+    var best_key: WorkerFailureKey = undefined;
+    for (workers, 0..) |w, wi| if (w.err) |err| {
+        const key = WorkerFailureKey.of(&w);
+        if (best == null or key.less(best_key) or
+            (!best_key.less(key) and std.mem.order(u8, @errorName(err), @errorName(workers[best.?].err.?)) == .lt))
         {
             best = wi;
-            best_file = file;
-            best_rg = ri;
+            best_key = key;
         }
     };
-    return if (best) |wi| .{ .err = workers[wi].err.?, .site = workers[wi].failure } else null;
+    if (best) |wi| {
+        const w = &workers[wi];
+        const site = if (consumer.isDecodeError(w.err.?)) w.failure else null;
+        if (probe) |p| {
+            p.workers = workers;
+            p.context = null;
+            if (site != null) p.capture(workers, wi);
+        }
+        return .{ .err = w.err.?, .site = site };
+    }
+    return null;
 }
 
 const Worker = struct {
@@ -1522,6 +1618,12 @@ const Worker = struct {
     expr_batch_rows: ?usize = null,
     decode_batch_rows: usize = 0,
     error_outputs: ?[]const BoundOutputColumn = null,
+    failure_probe: ?*FailureProbe = null,
+    failed_gate: ?RowGroupGate = null,
+    failed_rg: usize = 0,
+    failed_item: usize = 0,
+    /// The failing work item, also for refusals before a decoder installs its site. Null means unlocated.
+    failure_work: ?usize = null,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_scanned: i64 = 0,
@@ -1591,16 +1693,40 @@ fn workerRun(w: *Worker) void {
     expr_agg.distinct_pairs = w.pairs;
     defer expr_agg.distinct_pairs = null;
     consumer.setDecodeFailure(null);
+    w.failure_work = null;
     workerRunErr(w, prof, &items) catch |e| {
         w.err = workerRefusal(w, e);
         w.failure = consumer.decodeFailure();
+        if (consumer.isDecodeError(e) and w.failure != null and w.failed_gate != null) {
+            const probe = w.failure_probe.?;
+            probe.lock.lockUncancelable(blocking.io);
+            defer probe.lock.unlock(blocking.io);
+            if (w.scratch_region) |*r| r.deinit();
+            if (w.region) |*r| r.deinit();
+            w.scratch_region = null;
+            w.region = null;
+            const p = FailureProbe.contextOf(w);
+            var own: core_memory.SharedBudget = .{ .limit = probe.limit };
+            var bound: core_memory.SharedBudget = .{ .limit = probe.limit, .parent = probe.ledger orelse w.ledger orelse &own };
+            var charged: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &bound };
+            const failure = consumer.canonicalDecodeFailure(
+                charged.allocator(),
+                p.in,
+                p.options,
+                p.calls,
+                p.scalar,
+                p.original,
+            );
+            w.err = failure.err;
+            w.failure = failure.site;
+            const gate = w.failed_gate.?;
+            gate.done(gate.ctx, w.failed_rg, w.items_per_rg);
+            w.failed_gate = null;
+        }
         if (w.block_merge) |m| {
-            if (consumer.isDecodeError(e) and w.failure != null) {
+            if (w.failure_work) |wi| {
                 // A lower block may not have entered awaitTurn yet. It must still decode: a later block's
-                // failure cannot hide an earlier row group's failure just because its worker ran first.
-                const wi = for (w.work, 0..) |item, i| {
-                    if (&w.metas[item.file].row_groups.items[item.rg] == w.failure.?.rg) break i;
-                } else 0;
+                // refusal or decode failure cannot hide an earlier row group's failure.
                 const block = for (w.blocks.?[1..], 0..) |end, b| {
                     if (wi < end) break b;
                 } else 0;
@@ -1703,10 +1829,11 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             break;
         };
         if (w.skip) |skip| if (skip[idx]) continue;
+        errdefer w.failure_work = idx;
         items.* += 1;
         const item = w.work[idx];
         const gate = w.inputs[item.file].gate;
-        defer if (gate) |g| g.done(g.ctx, item.rg, w.items_per_rg);
+        defer if (gate) |g| if (w.failed_gate == null) g.done(g.ctx, item.rg, w.items_per_rg);
         const meta = &w.metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
         // File bytes are shared read-only across workers (one mmap / one
@@ -1766,7 +1893,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         expr_agg.winner_charge = if (table == null) w.winners else null;
         if (w.records) |records| records.start(w.record_starts[idx]);
         defer expr_agg.winner_charge = null;
-        const matched = try consumer.scanRGForAgg(w.gpa, .{
+        const matched = consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
@@ -1789,7 +1916,15 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .ledger = w.ledger,
             .expr_batch_rows = w.expr_batch_rows,
             .decode_batch_rows = w.decode_batch_rows,
-        });
+            .defer_decode_errors = w.failure_probe != null,
+        }) catch |err| {
+            if (consumer.isDecodeError(err)) {
+                w.failed_item = idx;
+                w.failed_rg = item.rg;
+                if (w.failure_probe != null and w.inputs[item.file].plan_bytes == null) w.failed_gate = gate;
+            }
+            return err;
+        };
         if (item.agg_start == 0) w.rows_matched +|= @intCast(matched);
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
             if (dp.seen >= w.pairs_pilot_rows) switch (pairsPayRuntime(gt, dp.agg_idx, dp.seen)) {
@@ -2857,10 +2992,16 @@ fn restoreCounts(workers: []Worker, saved: []const Worker) void {
 }
 
 /// One pass of `workers` over every work item, from a fresh cursor.
-/// After a phase that failed with `expected`: clears every worker's `expected`, then returns the first other error a
-/// worker met, which the exact path would meet too.
+/// Clears an optional phase's expected failures and partial decode evidence before its exact retry.
+/// Other failures still propagate. `runPhase` chooses refusals canonically before deciding to retry.
 fn clearWorkerErrors(workers: []Worker, expected: anyerror) !void {
-    for (workers) |*w| if (w.err) |we| if (we == expected) {
+    const exact_retry = expected == error.ExceededMemoryBudget or expected == error.CensusAbandoned;
+    for (workers) |*w| if (w.err) |we| if (we == expected or
+        (exact_retry and consumer.isDecodeError(we)))
+    {
+        // The optional census scans exactly from the start next. Its partial projection cannot make a payload
+        // error final while an earlier refused/abandoned unit may conceal another error. Trial memory is never
+        // the query's refusal: discard the trial and let the established scan decide what fits.
         w.err = null;
     };
     for (workers) |w| if (w.err) |other| return other;
@@ -2869,7 +3010,12 @@ fn clearWorkerErrors(workers: []Worker, expected: anyerror) !void {
 fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize)) !void {
     cursor.store(0, .monotonic);
     runWorkers(workers);
-    for (workers) |w| if (w.err) |e| return e;
+    if (phaseFailure(workers)) |err| return err;
+}
+
+fn phaseFailure(workers: []const Worker) ?anyerror {
+    for (workers) |w| if (w.err) |err| if (err == error.CensusAbandoned) return err;
+    return if (firstWorkerFailure(workers, null)) |failure| failure.err else null;
 }
 
 /// The one count(DISTINCT) call `foldDistinctPairs` can answer: a plain numeric column, the only count(DISTINCT) of
@@ -3345,9 +3491,6 @@ fn prepareAggregate(
 ) !if (explain) AggregateExplanation else MultiAggResult {
     if (args.inputs.len == 0) return error.NoInputs;
 
-    var t: Timings = .{};
-    const prof = profile.threadOf(args.profiler, .main);
-
     // Parallel because footer parsing scales with file count and schema width and can dominate short multi-file scans.
     // `meta_arenas` must outlive this call: `metas` points into them.
     var meta_arenas: []std.heap.ArenaAllocator = &.{};
@@ -3372,7 +3515,45 @@ fn prepareAggregate(
         }
     };
     consumer.setDecodeFailure(null);
-    errdefer consumer.resolveDecodeFailure(args.diag, metas, args.inputs);
+
+    var probe: FailureProbe = .{ .limit = args.max_memory, .ledger = args.ledger };
+    defer probe.releaseGates();
+    var execution = args;
+    execution.failure_probe = &probe;
+    return prepareAggregateWithMetas(gpa, arena, execution, explain, metas, t_parse) catch |err| {
+        if (!consumer.isDecodeError(err)) return err;
+        defer consumer.resolveDecodeFailure(args.diag, metas, args.inputs);
+        const p = probe.context orelse return err;
+        // Local read windows can return their entire charge before the bounded probe reads the mapping.
+        if (args.start_reads) |start| if (start.abandon) |abandon| abandon(start.ctx);
+        var own: core_memory.SharedBudget = .{ .limit = args.max_memory };
+        const ledger = args.ledger orelse &own;
+        // Independent of worker count and cache windows. The outer ledger accounts for any still-live input bytes.
+        var bound: core_memory.SharedBudget = .{ .limit = args.max_memory, .parent = ledger };
+        var charged: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &bound };
+        const failure = consumer.canonicalDecodeFailure(
+            charged.allocator(),
+            p.in,
+            p.options,
+            p.calls,
+            p.scalar,
+            p.original,
+        );
+        consumer.setDecodeFailure(failure.site);
+        return failure.err;
+    };
+}
+
+fn prepareAggregateWithMetas(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    comptime explain: bool,
+    metas: []const schema.FileMetaData,
+    t_parse: i64,
+) !if (explain) AggregateExplanation else MultiAggResult {
+    var t: Timings = .{};
+    const prof = profile.threadOf(args.profiler, .main);
 
     // Validate schemas match the first file's: same number of leaves
     // and same names *case-insensitively*. Real-world datasets drift on
@@ -3976,6 +4157,7 @@ fn prepareAggregate(
             .expr_batch_rows = args.expr_batch_rows,
             .decode_batch_rows = args.decode_batch_rows,
             .error_outputs = group_outputs,
+            .failure_probe = args.failure_probe,
             .profiler = args.profiler,
             .index = wi,
             .group_by_keys = group_by_keys,
@@ -4024,11 +4206,11 @@ fn prepareAggregate(
         .scalar, .plain_hash, .partitioned_hash => runWorkers(workers),
     };
     // A cut's passes return their refusal themselves: what decode memory the workers drew is noted on the way out.
-    passes catch |e| {
-        if (firstWorkerFailure(workers)) |f| {
+    passes catch |original| {
+        const e = if (firstWorkerFailure(workers, args.failure_probe)) |f| chosen: {
             consumer.setDecodeFailure(f.site);
-            if (consumer.isDecodeError(e)) return f.err;
-        }
+            break :chosen f.err;
+        } else original;
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             for (workers) |*w| if (decodeHeld(w) and rescannable) taken.insert(.decode_memory);
         };
@@ -4044,7 +4226,7 @@ fn prepareAggregate(
     // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
     if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegions(workers);
     private_decode.release();
-    if (firstWorkerFailure(workers)) |failure| {
+    if (firstWorkerFailure(workers, args.failure_probe)) |failure| {
         const e = failure.err;
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             if (decode_held and rescannable) taken.insert(.decode_memory);
@@ -5086,6 +5268,7 @@ fn runRecordWorkers(
         .expr_batch_rows = args.expr_batch_rows,
         .decode_batch_rows = args.decode_batch_rows,
         .error_outputs = outputs,
+        .failure_probe = args.failure_probe,
         .group_by_keys = keys,
         .group_tables = tables,
         .index = i,
@@ -5103,7 +5286,7 @@ fn runRecordWorkers(
     const t0 = nowMonoNs();
     runWorkers(workers);
     releaseRegions(workers);
-    if (firstWorkerFailure(workers)) |failure| {
+    if (firstWorkerFailure(workers, args.failure_probe)) |failure| {
         const e = failure.err;
         // Only an effectively parallel attempt can benefit from the deterministic serial retry.
         if (e == error.ExceededMemoryBudget and n > 1) if (args.taken) |taken| taken.insert(.decode_memory);
@@ -15629,4 +15812,183 @@ test "regression: a decoded alias keeps its surrounding spaces; an expression's 
     try std.testing.expectEqualStrings("k", aliasName(.{ .expr = " k " }));
     // The flag form's `--column-order "k AS  n "` trims what it was given, as before.
     try std.testing.expectEqualStrings("n", aliasName(.parse(" k AS  n ")));
+}
+
+test "stream decode probes release failed arenas and finish before the source gate returns its bytes" {
+    const path = "ci/fixtures/parquet/plain_values_corrupt.parquet";
+    const original = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(original);
+    var meta = try metadata.open(testing.allocator, original);
+    defer meta.deinit(testing.allocator);
+    const metas = [_]schema.FileMetaData{meta};
+    const Gate = struct {
+        data: []u8,
+        returned: std.atomic.Value(usize) = .init(0),
+        fn wait(_: *anyopaque, _: usize) anyerror!void {}
+        fn done(ctx: *anyopaque, _: usize, items: usize) void {
+            const g: *@This() = @ptrCast(@alignCast(ctx));
+            if (g.returned.fetchAdd(1, .acq_rel) + 1 == items) @memset(g.data, 0);
+        }
+    };
+    for ([_]usize{ 1, 2, 4, 16 }) |j| for ([_]usize{ 64 << 10, 1 << 20 }) |limit| for ([_]bool{ false, true }) |provided| {
+        const data = try testing.allocator.dupe(u8, original);
+        defer testing.allocator.free(data);
+        var gate: Gate = .{ .data = data };
+        const inputs = [_]Input{.{
+            .name = "s3://fixture/corrupt.parquet",
+            .bytes = data,
+            .gate = .{ .ctx = &gate, .wait = Gate.wait, .done = Gate.done },
+        }};
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var ledger: core_memory.SharedBudget = .{ .limit = limit };
+        var diag: Diag = .{};
+        const result = runMultiAggregate(testing.allocator, arena.allocator(), .{
+            .inputs = &inputs,
+            .metas = &metas,
+            .aggregate = "min(s) AS lo,max(s) AS hi",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .max_memory = limit,
+            .decode_limit = limit / 2,
+            .ledger = if (provided) &ledger else null,
+            .diag = &diag,
+            .scan_all = true,
+        });
+        try testing.expectError(error.UnexpectedPage, result);
+        try testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+        try testing.expect(ledger.peak.load(.monotonic) <= limit);
+        try testing.expect(gate.returned.load(.monotonic) > 0);
+        try testing.expect(std.mem.allEqual(u8, data, 0));
+        try testing.expectEqualStrings("s", diag.detail.decode.column.get());
+        try testing.expectEqual(@as(?u32, 0), diag.detail.decode.page);
+    };
+}
+
+test "optional filter sampling declines corrupt values so the full projection chooses the failure" {
+    const path = "ci/fixtures/parquet/plain_values_corrupt.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metas = [_]schema.FileMetaData{try metadata.open(a, bytes)};
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 }};
+    const filter = try filter_parser.parse(a, "s = 'a'", &metas[0], null);
+    const plan: agg_plan.Plan = try .init(a, .{ .filter = filter, .calls = &calls, .group_keys = null }, &metas, .fromFlags(true, false));
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    const work = [_]WorkItem{.{
+        .file = 0,
+        .rg = 0,
+        .agg_start = 0,
+        .agg_len = 1,
+        .columns = plan.columns,
+        .accumulators = &.{},
+    }};
+    try testing.expectEqual(@as(?f64, 1), try sampledPassShare(testing.allocator, a, &plan, &metas, &inputs, &work, .{ .fast_levels = true }, null));
+}
+
+test "worker refusal races replay an earlier corrupt row group in either completion order" {
+    const bytes = (try loadFixture("ci/fixtures/parquet/plain_values_corrupt.parquet")) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try metadata.open(a, bytes);
+    const rgs = try a.alloc(schema.RowGroup, 2);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 2;
+    const metas = [_]schema.FileMetaData{meta};
+    const inputs = [_]Input{.{ .name = "race.parquet", .bytes = bytes }};
+    const work = [_]WorkItem{
+        .{ .file = 0, .rg = 0, .agg_start = 0, .agg_len = 1, .columns = undefined, .accumulators = &.{} },
+        .{ .file = 0, .rg = 1, .agg_start = 0, .agg_len = 1, .columns = undefined, .accumulators = &.{} },
+    };
+    const Publisher = struct {
+        fn run(w: *Worker, turn: *std.atomic.Value(u32), rank: u32, err: anyerror) void {
+            while (true) {
+                const seen = turn.load(.acquire);
+                if (seen > rank) return; // A failed thread spawn cancels the other publisher.
+                if (seen == rank) break;
+                blocking.io.futexWaitUncancelable(u32, &turn.raw, seen);
+            }
+            w.err = err;
+            turn.store(rank + 1, .release);
+            blocking.io.futexWake(u32, &turn.raw, std.math.maxInt(u32));
+        }
+    };
+    for (0..2) |refusal_worker| for (0..2) |first_completion| {
+        var cursor: std.atomic.Value(usize) = .init(0);
+        var workers: [2]Worker = undefined;
+        for (&workers, 0..) |*w, i| w.* = .{
+            .gpa = testing.allocator,
+            .inputs = &inputs,
+            .metas = &metas,
+            .work = &work,
+            .cursor = &cursor,
+            .agg_calls = &.{},
+            .plan = undefined,
+            .decode_options = .{},
+            .failure_work = if (i == refusal_worker) 0 else 1,
+            // A refusal may retain the previous decoder's marker. Its work item is authoritative.
+            .failure = .{ .rg = &rgs[1], .column = 1, .first_row = 0, .projection = 0 },
+        };
+        var turn: std.atomic.Value(u32) = .init(0);
+        const t0 = try std.Thread.spawn(.{}, Publisher.run, .{
+            &workers[0],                                                                                  &turn, @as(u32, @intCast(first_completion)),
+            @as(anyerror, if (refusal_worker == 0) error.ExceededMemoryBudget else error.UnexpectedPage),
+        });
+        const t1 = std.Thread.spawn(.{}, Publisher.run, .{
+            &workers[1],                                                                                  &turn, @as(u32, @intCast(1 - first_completion)),
+            @as(anyerror, if (refusal_worker == 1) error.ExceededMemoryBudget else error.UnexpectedPage),
+        }) catch |err| {
+            turn.store(2, .release);
+            blocking.io.futexWake(u32, &turn.raw, std.math.maxInt(u32));
+            t0.join();
+            return err;
+        };
+        t0.join();
+        t1.join();
+        const refusal = firstWorkerFailure(&workers, null).?;
+        try testing.expectEqual(error.ExceededMemoryBudget, refusal.err);
+        try testing.expect(refusal.site == null);
+        try clearWorkerErrors(&workers, error.ExceededMemoryBudget);
+        try testing.expect(phaseFailure(&workers) == null);
+        workers[refusal_worker].err = error.CensusAbandoned;
+        workers[1 - refusal_worker].err = error.UnexpectedPage;
+        try testing.expectEqual(error.CensusAbandoned, phaseFailure(&workers).?);
+        try clearWorkerErrors(&workers, error.CensusAbandoned);
+        try testing.expect(phaseFailure(&workers) == null);
+        workers[refusal_worker].err = error.ExceededMemoryBudget;
+        workers[1 - refusal_worker].err = error.UnexpectedPage;
+        // An unlocated refusal is equally conservative, including a refusal before any decoder starts.
+        workers[refusal_worker].failure_work = null;
+        try testing.expectEqual(error.ExceededMemoryBudget, firstWorkerFailure(&workers, null).?.err);
+        // A known later refusal must not suppress an earlier confirmed decode error.
+        workers[refusal_worker].failure_work = 1;
+        workers[1 - refusal_worker].failure_work = 0;
+        workers[1 - refusal_worker].failure.?.rg = &rgs[0];
+        try testing.expectEqual(error.UnexpectedPage, firstWorkerFailure(&workers, null).?.err);
+
+        var chain: Chain = .{ .parts_tried = false };
+        var diag: Diag = .{};
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = &metas,
+            .aggregate = "min(s)",
+            .parallelism = 2,
+            .min_bytes_per_worker = 1,
+            .decode_limit = 1 << 20,
+            .max_memory = 2 << 20,
+            .scan_all = true,
+            .diag = &diag,
+        };
+        const replay = narrowed(args, args, std.EnumSet(FastPath).initMany(&.{.decode_memory}), &chain, false).?;
+        try testing.expectEqual(@as(usize, 1), replay.parallelism);
+        try testing.expectError(error.UnexpectedPage, runMultiAggregate(testing.allocator, a, replay));
+        try testing.expectEqual(@as(usize, 0), diag.detail.decode.row_group);
+        try testing.expectEqual(@as(?u32, 0), diag.detail.decode.page);
+        try testing.expectEqualStrings("s", diag.detail.decode.column.get());
+    };
 }

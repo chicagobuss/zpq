@@ -126,6 +126,8 @@ pub const PageReader = struct {
     ordinal: u32 = 0,
     codec: schema.CompressionCodec,
     arena: std.mem.Allocator,
+    /// Error probes keep dictionary backing bytes while releasing every data page before the next unit.
+    dictionary_arena: ?std.mem.Allocator = null,
     /// When set, every page (dictionary included) is materialised into `scratch.page` and is only valid until the
     /// next `next()`. Null keeps the arena behaviour: page bytes live as long as `arena`.
     scratch: ?*DecodeScratch = null,
@@ -245,7 +247,8 @@ pub const PageReader = struct {
         const span = profile.Span.begin(if (self.codec == .UNCOMPRESSED) null else self.prof);
         defer if (span.t != null) span.end(.decompress, self.pageArgs(header, csize, usize_));
         if (self.scratch == null or self.codec == .UNCOMPRESSED or usize_ == 0) {
-            const decompressed = try compression.decompress(self.arena, payload, self.codec, usize_);
+            const a = if (header.type == .DICTIONARY_PAGE) self.dictionary_arena orelse self.arena else self.arena;
+            const decompressed = try compression.decompress(a, payload, self.codec, usize_);
             return .{ .header = header, .bytes = decompressed };
         }
         const out = try self.pageBuffer(usize_);

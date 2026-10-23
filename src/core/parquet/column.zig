@@ -231,6 +231,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         pages: page_mod.PageReader,
         arena: std.mem.Allocator,
+        /// A probe's retained dictionary; its other allocations can then be released per page.
+        dictionary_arena: ?std.mem.Allocator = null,
         levels: schema.Levels,
         options: DecodeOptions,
         /// The calling worker's reusable page buffers, or null to decode into `arena`. See `DecodeScratch` for the
@@ -1283,7 +1285,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 },
                 else => {},
             }
-            return self.arena.alloc(T, n);
+            return (self.dictionary_arena orelse self.arena).alloc(T, n);
         }
 
         fn installDictionary(self: *Self, pg: page_mod.Page) Error!void {

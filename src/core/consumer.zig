@@ -1126,6 +1126,33 @@ pub const SliceReader = struct {
         if (self.levels.max_def > 0 and self.levels.max_rep == 0) self.levels_only = true;
     }
 
+    /// Fresh error probe: separate the retained byte dictionary from page storage before any page is installed.
+    pub fn beginProbe(self: *SliceReader) void {
+        switch (self.raw.*) {
+            .bytes => |*r| {
+                r.dictionary_arena = self.held;
+                r.pages.dictionary_arena = self.held;
+                r.arena = self.pages.allocator();
+                r.pages.arena = self.pages.allocator();
+                self.dict_held = true;
+            },
+            else => {},
+        }
+    }
+
+    /// Between probe units no value refers to the drained page. Keep only its decoded dictionary.
+    pub fn releaseProbePage(self: *SliceReader) void {
+        invariant.assert(self.pageLeft() == 0);
+        _ = self.pages.reset(.free_all);
+        const s = self.scratch;
+        s.gpa.free(s.page);
+        s.gpa.free(s.def_levels);
+        s.gpa.free(s.rep_levels);
+        s.page = &.{};
+        s.def_levels = &.{};
+        s.rep_levels = &.{};
+    }
+
     pub fn pageLeft(self: *const SliceReader) usize {
         return switch (self.raw.*) {
             inline else => |*r| r.pageValuesLeft(),
@@ -3010,6 +3037,8 @@ pub const AggTarget = union(enum) {
 
 /// A scan worker's state, reused from one row group to the next.
 pub const AggWorkspace = struct {
+    /// The scan coordinator revalidates after all workers and their arenas have unwound.
+    defer_decode_errors: bool = false,
     decode_batch_rows: usize = 0,
     expr_batch_rows: ?usize = null,
     scratch: *DecodeScratch,
@@ -3448,35 +3477,47 @@ pub fn scanRGForAgg(
     target: AggTarget,
     ws: AggWorkspace,
 ) !u64 {
+    if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, ws);
     return scanRGForAggImpl(gpa, in, stats, decode_options, target, ws) catch |err| {
         if (!isDecodeError(err)) return err;
         const site = decodeFailure() orelse return err;
-        var planning = std.heap.ArenaAllocator.init(gpa);
-        defer planning.deinit();
-        var check_in = in;
-        check_in.read = in.error_read orelse in.read;
-        if (in.error_ranks) |rank| check_in.error_order =
-            try rank.make(rank.ctx, planning.allocator(), check_in.read.len);
-        var check_target = target;
-        if (in.error_calls) |all| switch (check_target) {
-            inline else => |*t| t.calls = all,
-        };
-        const uses = try planCodeUses(planning.allocator(), check_in, check_target, false);
-        const only = try planning.allocator().alloc(bool, check_in.read.len);
-        for (only, 0..) |*v, ci| v.* = target == .scalar and uses.levels[ci] and
-            !uses.code[ci] and !uses.value[ci];
-        const failure = try decode_order.canonical(
-            SliceReader,
-            isDecodeError,
-            gpa,
-            check_in,
+        const failure = canonicalDecodeFailure(
+            ws.charged orelse gpa,
+            in,
             decode_options,
-            only,
+            target.calls(),
+            target == .scalar,
             .{ .err = err, .site = site },
         );
         setDecodeFailure(failure.site);
         return failure.err;
     };
+}
+
+/// Error-only work, after releasing the failed scan's arenas. All allocations use the caller's bounded, charged
+/// allocator. Resource failure ends the probe with its best confirmed decode error; it never becomes the diagnostic.
+pub fn canonicalDecodeFailure(
+    a: std.mem.Allocator,
+    in: AggRowGroup,
+    options: DecodeOptions,
+    calls: []const expr_agg.AggCall,
+    scalar: bool,
+    original: decode_order.Failure,
+) decode_order.Failure {
+    var planning = std.heap.ArenaAllocator.init(a);
+    defer planning.deinit();
+    const pa = planning.allocator();
+    var check_in = in;
+    check_in.read = in.error_read orelse in.read;
+    if (in.error_ranks) |rank| check_in.error_order = rank.make(rank.ctx, pa, check_in.read.len) catch return original;
+    const only = pa.alloc(bool, check_in.read.len) catch return original;
+    @memset(only, false);
+    if (scalar) {
+        const target: AggTarget = .{ .scalar = .{ .calls = calls, .accumulators = &.{} } };
+        const uses = planCodeUses(pa, check_in, target, false) catch return original;
+        for (only, 0..) |*v, ci| v.* = uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
+    }
+    return decode_order.canonical(SliceReader, isDecodeError, a, check_in, options, only, original);
 }
 
 // Checked arithmetic keeps its expression-major error order. A forced cache window may change only when
@@ -8335,21 +8376,47 @@ test "canonical decode failure checks every competing column and unwinds allocat
         .filter = null,
         .read = &.{ true, true },
         .consumed = &.{ true, true },
+        .error_ranks = .{ .ctx = &meta, .make = struct {
+            fn make(_: *const anyopaque, alloc: std.mem.Allocator, n: usize) anyerror![]const usize {
+                const ranks = try alloc.alloc(usize, n);
+                for (ranks, 0..) |*rank, i| rank.* = i;
+                return ranks;
+            }
+        }.make },
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(gpa: std.mem.Allocator, input: AggRowGroup) !void {
-            const failure = try decode_order.canonical(
-                SliceReader,
-                isDecodeError,
-                gpa,
-                input,
-                .{},
-                &.{ false, false },
-                .{ .err = error.UnexpectedPage, .site = .{ .rg = input.rg, .column = 1, .page = 0 } },
-            );
-            try std.testing.expectEqual(error.UnexpectedPage, failure.err);
+    // Probe OOM is intentionally absorbed: exhaust every allocation site and assert cleanup/diagnostic preservation.
+    var count: usize = 0;
+    while (count < 64) : (count += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = count });
+        const failure = canonicalDecodeFailure(
+            failing.allocator(),
+            in,
+            .{},
+            &.{},
+            true,
+            .{ .err = error.UnexpectedPage, .site = .{ .rg = in.rg, .column = 1, .page = 0 } },
+        );
+        try std.testing.expectEqual(error.UnexpectedPage, failure.err);
+        try std.testing.expect(failure.site.column == 0 or failure.site.column == 1);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) {
             try std.testing.expectEqual(@as(usize, 0), failure.site.column);
-            try std.testing.expectEqual(@as(usize, 0), failure.site.first_row);
+            break;
         }
-    }.run, .{in});
+    }
+    try std.testing.expect(count < 64);
+    var ledger: core_memory.SharedBudget = .{ .limit = 1024 };
+    var charged: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &ledger };
+    const original: decode_order.Failure = .{
+        .err = error.UnexpectedPage,
+        .site = .{ .rg = in.rg, .column = 1, .page = 0 },
+    };
+    const bounded = decode_order.canonical(SliceReader, isDecodeError, charged.allocator(), in, .{}, &.{ false, false }, original);
+    try std.testing.expectEqual(original.err, bounded.err);
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+    try std.testing.expect(ledger.peak.load(.monotonic) <= ledger.limit);
+    // A marker whose failure cannot be reproduced never outranks a real page, even at the same row.
+    columns[0].meta_data.?.num_values = 0;
+    const reproduced = decode_order.canonical(SliceReader, isDecodeError, std.testing.allocator, in, .{}, &.{ false, false }, .{ .err = error.UnexpectedPage, .site = .{ .rg = in.rg, .column = 0, .page = 0 } });
+    try std.testing.expectEqual(@as(usize, 1), reproduced.site.column);
 }

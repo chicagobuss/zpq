@@ -198,6 +198,66 @@ def main():
                     assert proc.stderr == want, (version, memory, batch, j, proc.stderr, want)
                     checks += 1
             print(f"{version} required page count: whole/sliced/cache, j1..16 identical", flush=True)
+        # Tight budgets must retain corruption diagnostics, including reader-backed inputs whose failed arenas
+        # and input window are released before the coordinator probes the mapping.
+        tight = pa.table({"a": pa.array(range(4096), type=pa.int32()),
+                          "b": pa.array(range(4096), type=pa.int32())})
+        for version in ["1.0", "2.0"]:
+            pq.write_table(tight, path, row_group_size=1024, data_page_size=128, write_batch_size=64,
+                           use_dictionary=False, compression=None, data_page_version=version)
+            meta = pq.ParquetFile(path).metadata
+            data = bytearray(path.read_bytes())
+            corrupt(data, meta, version, 0, 0, 3)
+            corrupt(data, meta, version, 0, 1, 0)
+            path.write_bytes(data)
+            sql = f"SELECT sum(a) AS sa, sum(b) AS sb FROM '{path}'"
+            want = None
+            for memory in ["64K", "128K", "256K", "1M"]:
+                for io in ["mmap", "pread", "uring"]:
+                    for batch in ["0", "64", "256"]:
+                        for j in range(1, 17):
+                            proc = subprocess.run([binary, "query", "--query", sql, "--scan-all",
+                                                   "--max-memory", memory, "-j", str(j)],
+                                                  env=dict(env, ZPQ_IO_PROFILE=io, ZPQ_DECODE_BATCH_ROWS=batch),
+                                                  capture_output=True, timeout=60)
+                            assert proc.returncode == 1 and not proc.stdout, (memory, io, batch, j, proc)
+                            if want is None:
+                                want = proc.stderr
+                                assert b"row group 0, column `b`, page 0:" in want, want
+                                assert b"(UnexpectedPage)" in want, want
+                            assert proc.stderr == want, (version, memory, io, batch, j, proc.stderr, want)
+                            checks += 1
+            print(f"{version} tight: 64K/128K/256K/1M, mmap/pread/uring, windows0/64/256, j1..16 identical",
+                  flush=True)
+        # A compressed byte dictionary survives all its data pages while every drained page is freed.
+        dictionary = pa.table({"g": [("group-" + str(i % 16) + "x" * 128) for i in range(4096)],
+                               "a": pa.array(range(4096), type=pa.int32())})
+        for version in ["1.0", "2.0"]:
+            pq.write_table(dictionary, path, row_group_size=1024, data_page_size=128, write_batch_size=64,
+                           use_dictionary=["g"], compression={"g": "zstd", "a": "NONE"},
+                           data_page_version=version)
+            meta = pq.ParquetFile(path).metadata
+            data = bytearray(path.read_bytes())
+            corrupt(data, meta, version, 0, 1, 3)
+            path.write_bytes(data)
+            sql = f"SELECT g, sum(a) AS sa FROM '{path}' GROUP BY g"
+            want = None
+            for io in ["mmap", "pread", "uring"]:
+                for batch in ["0", "64", "256"]:
+                    for j in range(1, 17):
+                        proc = subprocess.run([binary, "query", "--query", sql, "--scan-all",
+                                               "--max-memory", "64K", "-j", str(j)],
+                                              env=dict(env, ZPQ_IO_PROFILE=io, ZPQ_DECODE_BATCH_ROWS=batch),
+                                              capture_output=True, timeout=60)
+                        assert proc.returncode == 1 and not proc.stdout, (version, io, batch, j, proc)
+                        if want is None:
+                            want = proc.stderr
+                            assert b"row group 0, column `a`, page 3:" in want, want
+                            assert b"(UnexpectedPage)" in want, want
+                        assert proc.stderr == want, (version, io, batch, j, proc.stderr, want)
+                        checks += 1
+            print(f"{version} compressed dictionary: 64K, mmap/pread/uring, windows0/64/256, j1..16 identical",
+                  flush=True)
     print(f"canonical decode errors: {checks} byte-identical failures")
 
 

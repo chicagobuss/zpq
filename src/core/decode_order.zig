@@ -9,8 +9,9 @@ pub const Site = struct {
     rg: *const schema.RowGroup,
     column: usize,
     page: ?u32 = null,
-    first_row: usize = 0,
-    projection: usize = 0,
+    // An unverified execution marker must not sort ahead of a reproduced page.
+    first_row: usize = std.math.maxInt(usize),
+    projection: usize = std.math.maxInt(usize),
 };
 
 pub const Failure = struct { err: anyerror, site: Site };
@@ -21,9 +22,9 @@ pub fn less(a: Site, b: Site) bool {
     return a.column < b.column;
 }
 
-/// Recheck the failing column first to recover its unit even when a resumed slice lost its diagnostic marker.
-/// Then check competing columns only through units starting at or before that row. No state reaches the query.
-/// Reader is the ordinary sliced decoder, so conversion and within-page validation remain the same as execution.
+/// Check projected columns in fixed schema order, stopping each after pages whose first row can beat the best
+/// confirmed failure. Resource refusals skip that column; other columns still run with all its storage released.
+/// The original marker is only a fallback if no failure can be reproduced, never a bound on confirmed units.
 pub fn canonical(
     comptime Reader: type,
     comptime isDecodeError: fn (anyerror) bool,
@@ -32,25 +33,16 @@ pub fn canonical(
     options: column.DecodeOptions,
     levels_only: []const bool,
     original: Failure,
-) !Failure {
-    var best = original;
-    if (try checkColumn(
-        Reader,
-        isDecodeError,
-        gpa,
-        in,
-        options,
-        levels_only,
-        original.site.column,
-        std.math.maxInt(usize),
-    )) |found| best = found;
+) Failure {
+    var best: ?Failure = null;
     for (in.read, 0..) |needed, ci| {
-        if (!needed or ci == original.site.column) continue;
-        if (try checkColumn(Reader, isDecodeError, gpa, in, options, levels_only, ci, best.site.first_row)) |found| {
-            if (less(found.site, best.site)) best = found;
+        if (!needed) continue;
+        const through = if (best) |b| b.site.first_row else std.math.maxInt(usize);
+        if (checkColumn(Reader, isDecodeError, gpa, in, options, levels_only, ci, through) catch continue) |found| {
+            if (best == null or less(found.site, best.?.site)) best = found;
         }
     }
-    return best;
+    return best orelse original;
 }
 
 fn checkColumn(
@@ -70,6 +62,7 @@ fn checkColumn(
         return Failure{ .err = err, .site = makeSite(in, ci, null) };
     } orelse return null; // Repeated aggregate columns are refused before scanning.
     defer reader.deinit();
+    reader.beginProbe();
     if (ci < levels_only.len and levels_only[ci]) reader.levelsOnly();
     var window = std.heap.ArenaAllocator.init(gpa);
     defer window.deinit();
@@ -78,6 +71,7 @@ fn checkColumn(
         const page_left = reader.pageLeft();
         // Finish a page that started before the bound, including value faults beyond the bound within that page.
         if (page_left == 0 and done > through_row) break;
+        if (page_left == 0) reader.releaseProbePage();
         const n = if (page_left == 0) 1 else @min(64, page_left);
         _ = window.reset(.retain_capacity);
         _ = reader.next(window.allocator(), n) catch |err| {

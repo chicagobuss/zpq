@@ -238,6 +238,13 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
   escape validation when a slice stops at the footer's row count. This fixes the earlier tight-budget change in
   reported row group, column or page. Competing columns are checked only after a decode failure; valid input does
   not pay for these checks.
+- Decode-error probes are bounded and charged to the query ledger, release the failed scan's storage first, and
+  retain only one column dictionary and page at a time. If a unit cannot be probed within the budget, reporting
+  keeps the minimum confirmed decode failure (or the original diagnostic if none is reproduced), never an OOM
+  from probing. A memory-refused attempt leaves no decode diagnostic that could mask an exact retry's failure.
+- Worker failures are selected in input/row-group order, including memory refusals that require replay. An earlier
+  or unlocated refusal cannot be suppressed by a later decode error from a lower-index worker, so scheduling no
+  longer decides whether replay exposes the canonical corruption error.
 
 **Errors**
 - A page or column chunk that fails to decode names where, on every query kind and at every `-j`:

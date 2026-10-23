@@ -323,9 +323,12 @@ pub const Region = struct {
 /// Scan workers' region pairs kept across queries. A query takes its workers' pairs here (`takePair`) and hands
 /// them back when it is done (`retirePair`): the next query reuses the reserved mappings and whatever pages the kernel
 /// has not yet reclaimed, instead of mapping, faulting and zeroing fresh ones and unmapping them serially at the end.
-/// A retired pair holds no charge on any ledger. Its pages past the first huge page (the worker's slack, which every
-/// ceiling already counts) are lazily freed (MADV_FREE): resident until the kernel needs them, never committed, and
-/// re-touching them is a plain write. At most one pair per CPU is kept; `drainPairs` unmaps them.
+/// A retired pair holds no charge on any ledger. It keeps its first `retained_span` as it is (resident, ready for the
+/// next small query without a fault or a system call) and lazily frees what lies past it (MADV_FREE): resident only
+/// until the kernel needs the pages, never committed, and re-touching them is a plain write. At most one pair per CPU
+/// is kept, so idle workers hold at most `retained_span` per CPU; `drainPairs` unmaps them.
+pub const retained_span: usize = 4 * huge_page_size;
+
 pub const pair_cache = struct {
     var lock: std.Io.Mutex = .init;
     var pairs: [256]Region.Pair = undefined;
@@ -378,8 +381,8 @@ pub fn retirePair(pair: *Region.Pair) void {
         return;
     }
     if (arena.budget) |b| b.release(arena.charged);
-    // Keep the first huge page, the worker's slack, as it is; lazily free what the query touched past it.
-    const first = huge_page_size - arena.phase;
+    // Keep the first pages as they are; lazily free what the query touched past them.
+    const first = retained_span - arena.phase;
     if (arena.touched > first) {
         const page = std.heap.pageSize();
         const hi = @min(std.mem.alignForward(usize, arena.touched, page), arena.buf.len);

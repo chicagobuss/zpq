@@ -2990,6 +2990,7 @@ pub const AggTarget = union(enum) {
 
 /// A scan worker's state, reused from one row group to the next.
 pub const AggWorkspace = struct {
+    expr_batch_rows: ?usize = null,
     scratch: *DecodeScratch,
     /// Rewound at each row group that decodes: everything decoded lives here until the next one.
     rg_arena: *RowGroupArena,
@@ -3328,6 +3329,7 @@ fn foldGroupedWindows(
     sel: *const filter_selection.SelectionVector,
     consumed: []const bool,
     encoded: bool,
+    expr_batch_rows: ?usize,
     /// Charged for a coded composite space past the free one, as the whole-row-group fold is.
     budget: ?*DecodeBudget,
     /// The region `ra` allocates from, if it does.
@@ -3342,7 +3344,7 @@ fn foldGroupedWindows(
     // An armed worker folds a batch the coded path takes whole, as the plain fold does: in windows, each would
     // resolve again nearly every code of a large dictionary.
     if (local.armed and encoded and sel.len > 0) {
-        const whole: filter_eval.Batch = .{ .cols = cols, .num_rows = sel.len };
+        const whole: filter_eval.Batch = .{ .cols = cols, .num_rows = sel.len, .expr_batch_rows = expr_batch_rows };
         if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &whole, lookup, sel, budget, region)) {
             try part.pump(local, g.table, @intCast(sel.count()));
             return;
@@ -3372,7 +3374,7 @@ fn foldGroupedWindows(
         if (!prepared_values and encoded) {
             const win_cols = try wa.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
-            const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n };
+            const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n, .expr_batch_rows = expr_batch_rows };
             if (try agg_coded.groupedCoded(wa, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget, region)) {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
@@ -3550,7 +3552,11 @@ pub fn scanRGForAgg(
 
     if (target == .grouped and target.grouped.records == null and !staged and decode_options.encoded)
         try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
-    const batch: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = num_rows };
+    const batch: filter_eval.Batch = .{
+        .cols = batch_cols.items,
+        .num_rows = num_rows,
+        .expr_batch_rows = ws.expr_batch_rows,
+    };
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
@@ -3576,6 +3582,7 @@ pub fn scanRGForAgg(
                     &sel,
                     in.consumed,
                     decode_options.encoded,
+                    ws.expr_batch_rows,
                     ws.budget,
                     ws.region,
                 );
@@ -3761,6 +3768,7 @@ fn scanRGSliced(
                         &sel,
                         in.consumed,
                         decode_options.encoded,
+                        ws.expr_batch_rows,
                         ws.budget,
                         null,
                     );
@@ -7880,7 +7888,19 @@ fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !voi
         .part = &part,
         .local = &local,
     } };
-    try foldGroupedWindows(arena.allocator(), a, target, &cols, &.{ 0, 1 }, &sel, &.{ coded, false }, coded, null, null);
+    try foldGroupedWindows(
+        arena.allocator(),
+        a,
+        target,
+        &cols,
+        &.{ 0, 1 },
+        &sel,
+        &.{ coded, false },
+        coded,
+        null,
+        null,
+        null,
+    );
     try part.flush(&local, &table);
     try part.foldRuns(1);
     var groups: usize = 0;

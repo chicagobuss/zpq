@@ -670,7 +670,13 @@ fn executeAggregateOver(
         .parallelism = args.parallelism,
         .scan_all = args.scan_all,
         .trust_stats = args.trust_stats,
-        .fast_levels = args.fast_levels,
+        // Aggregate consumers need presence, not an expanded level array when the encoded run proves every row
+        // present. The forced legacy path is for cross-checks; dictionary consumers already make this proof.
+        .fast_levels = args.fast_levels or !envDisables(ctx.env, "ZPQ_LEVEL_RUNS"),
+        .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
         .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
         .leave_regions = ctx.exit_after,
         .unordered = args.unordered,

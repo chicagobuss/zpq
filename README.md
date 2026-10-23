@@ -402,7 +402,9 @@ values (`count(*)` still comes from the row counts).
 
 For supported flat OPTIONAL primitive columns that contain no nulls, `--fast-levels` can skip materializing definition
 levels. The check reads the encoded level stream rather than trusting writer statistics, and falls back to the normal
-decoder unless one RLE run proves that the entire page is present. It is off by default while the path is new.
+decoder unless one RLE run proves that the entire page is present. Aggregate scans use this proof automatically;
+`ZPQ_LEVEL_RUNS=0` selects their legacy plain-value level handling.
+Projection/write paths still require `--fast-levels`.
 
 ## Bloom filters and dictionaries
 

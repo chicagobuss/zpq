@@ -153,11 +153,8 @@ pub const FloatPlan = struct {
 /// Test overrides are local to the caller; the environment knob exercises every path on every host.
 pub threadlocal var forced_batch_rows: ?usize = null;
 
-pub fn floatBatchRows(live_bytes_per_row: usize, fixed_bytes: usize) usize {
-    const forced = forced_batch_rows orelse if (std.c.getenv("ZPQ_EXPR_BATCH_ROWS")) |raw|
-        std.fmt.parseInt(usize, std.mem.span(raw), 10) catch null
-    else
-        null;
+pub fn floatBatchRows(live_bytes_per_row: usize, fixed_bytes: usize, option: ?usize) usize {
+    const forced = forced_batch_rows orelse option;
     if (forced) |rows| return if (rows == 0) 0 else @max(64, std.mem.alignBackward(usize, rows, 64));
     const budget = @import("../hw.zig").l2BytesPerWorker();
     // Keep a quarter of each sibling's L2 share for the decoder, aggregate state and unrelated hot data.
@@ -169,18 +166,20 @@ test "float batch budgets follow L2 sharing and forced paths independently of th
     const hw = @import("../hw.zig");
     defer hw.test_cpu = null;
     defer forced_batch_rows = null;
+    try std.testing.expectEqual(@as(usize, 128), floatBatchRows(100, 4096, 130));
+    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096, 0));
     hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 } };
-    try std.testing.expectEqual(@as(usize, 3840), floatBatchRows(100, 4096));
+    try std.testing.expectEqual(@as(usize, 3840), floatBatchRows(100, 4096, null));
     hw.test_cpu.?.l2.bytes = 1280 << 10;
-    try std.testing.expectEqual(@as(usize, 4864), floatBatchRows(100, 4096));
+    try std.testing.expectEqual(@as(usize, 4864), floatBatchRows(100, 4096, null));
     hw.test_cpu.?.l2.bytes = 0;
-    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096));
+    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096, null));
     for ([_]usize{ 2048, 4096, 8192, 16384 }) |rows| {
         forced_batch_rows = rows;
-        try std.testing.expectEqual(rows, floatBatchRows(100, 4096));
+        try std.testing.expectEqual(rows, floatBatchRows(100, 4096, null));
     }
     forced_batch_rows = 0;
-    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096));
+    try std.testing.expectEqual(@as(usize, 0), floatBatchRows(100, 4096, null));
 }
 
 /// Evaluate `e` against `batch`, returning a freshly-allocated column
@@ -2416,4 +2415,83 @@ test "coalesce over any arguments: first present value, each argument evaluated 
     const words = try evalExpr(a, &batch, &lookup, call(&.{ &cat, &na }, .str));
     try testing.expectEqualStrings("a!", words.string.values[0]);
     try testing.expectEqualStrings("NA", words.string.values[1]);
+}
+
+test "float DAG batches propagate independent FLOAT and DOUBLE nulls through shared trees" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 257;
+    var xs: [n]f32 = undefined;
+    var ys: [n]f64 = undefined;
+    var xd: [n]u32 = undefined;
+    var yd: [n]u32 = undefined;
+    for (0..n) |i| {
+        xs[i] = @as(f32, @floatFromInt(i % 13)) - 6;
+        ys[i] = @as(f64, @floatFromInt(i % 17)) / 8;
+        // An entirely null interior batch and independent null patterns at both sides of slice boundaries.
+        xd[i] = @intFromBool(i % 11 != 0 and !(i >= 64 and i < 128));
+        yd[i] = @intFromBool(i % 7 != 0);
+    }
+    const cols = [_]Batch.Column{
+        .{ .f32 = .{ .values = &xs, .def_levels = &xd, .max_def = 1, .has_nulls = true } },
+        .{ .f64 = .{ .values = &ys, .def_levels = &yd, .max_def = 1, .has_nulls = true } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    var x: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .FLOAT, .expr_type = .f64 } };
+    var y: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: ast.Expr = .{ .literal = .{ .f64 = 1 } };
+    var shared: ast.Expr = .{ .binop = .{
+        .op = .sub,
+        .left = &one,
+        .right = &y,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    var product: ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &x,
+        .right = &shared,
+        .result_type = .f64,
+        .depth = 3,
+    } };
+    const quotient: ast.Expr = .{ .binop = .{
+        .op = .div,
+        .left = &product,
+        .right = &shared,
+        .result_type = .f64,
+        .depth = 4,
+    } };
+    var sel = try selection.SelectionVector.init(a, n);
+    for (0..n) |i| if (i % 5 == 0) sel.set(i, false);
+    const batch: Batch = .{ .cols = &cols, .num_rows = n, .sel = &sel };
+    var plan: FloatPlan = .{};
+    const roots = [_]usize{
+        (try plan.add(a, &batch, &lookup, product)).?,
+        (try plan.add(a, &batch, &lookup, quotient)).?,
+    };
+    const want = [_]Batch.Column{
+        try evalGroupKeyExpr(a, &batch, &lookup, product),
+        try evalGroupKeyExpr(a, &batch, &lookup, quotient),
+    };
+    var off: usize = 0;
+    while (off < n) : (off += 64) {
+        const count = @min(64, n - off);
+        var sliced: [2]Batch.Column = undefined;
+        for (cols, &sliced) |col, *out| out.* = try col.sliceRows(off, count);
+        const mask = try sel.alignedWindow(off, count);
+        const win: Batch = .{ .cols = &sliced, .num_rows = count, .sel = &mask };
+        const got = try plan.evaluate(a, &win, &lookup);
+        for (want, roots) |expected, root| for (0..count) |r| {
+            const ni = got[root].nullInfo();
+            const wi = expected.nullInfo();
+            const present = ni.def_levels == null or ni.def_levels.?[r] == ni.max_def;
+            const wanted = wi.def_levels == null or wi.def_levels.?[off + r] == wi.max_def;
+            try std.testing.expectEqual(wanted, present);
+            if (present and mask.isActive(r)) try std.testing.expectEqual(
+                @as(u64, @bitCast(expected.f64.values[off + r])),
+                @as(u64, @bitCast(got[root].f64.values[r])),
+            );
+        };
+    }
 }

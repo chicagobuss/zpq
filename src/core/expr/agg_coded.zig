@@ -750,7 +750,7 @@ fn foldFloatBatches(
     }
     if (!computed) return false;
     const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) + space *| 32;
-    const batch_rows = expr_eval.floatBatchRows(plan.liveBytesPerRow(), fixed);
+    const batch_rows = expr_eval.floatBatchRows(plan.liveBytesPerRow(), fixed, batch.expr_batch_rows);
     if (batch_rows == 0) return false;
     // Bare columns already have dictionary/histogram folds: leave those full-column shortcuts in place.
     for (calls, roots, 0..) |call, root, ai| if (root == null) {
@@ -778,8 +778,8 @@ fn foldFloatBatches(
         scratch.nextRowGroup();
         const a = scratch.allocator();
         const n = @min(batch_rows, batch.num_rows - off);
-        for (batch.cols, cols) |col, *out| out.* = col.sliceRows(off, n);
-        const sel: Sel = .{ .allocator = ra, .len = n, .mask = outer.mask[off / 64 ..][0 .. (n + 63) / 64] };
+        for (batch.cols, cols) |col, *out| out.* = try col.sliceRows(off, n);
+        const sel = try outer.alignedWindow(off, n);
         const win: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .sel = &sel };
         const values = try plan.evaluate(a, &win, lookup);
         for (calls, roots, 0..) |call, root, ai| if (root) |r| {

@@ -219,6 +219,8 @@ pub const MultiAggArgs = struct {
     /// `count(*)` is always answered from num_rows regardless.
     trust_stats: bool = false,
     fast_levels: bool = false,
+    /// Query-local computed DOUBLE batch override; 0 keeps the legacy evaluator.
+    expr_batch_rows: ?usize = null,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
@@ -1430,6 +1432,7 @@ const Worker = struct {
     agg_calls: []const expr_agg.AggCall,
     plan: *const agg_plan.Plan,
     decode_options: consumer.DecodeOptions,
+    expr_batch_rows: ?usize = null,
     timings: consumer.Timings = .{},
     rows_in: i64 = 0,
     rows_scanned: i64 = 0,
@@ -1680,6 +1683,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .region = region,
             .charged = if (w.charged) |*c| c.allocator() else null,
             .ledger = w.ledger,
+            .expr_batch_rows = w.expr_batch_rows,
         });
         if (item.agg_start == 0) w.rows_matched +|= @intCast(matched);
         if (w.pairs) |dp| if (!dp.active and !w.pairs_decided) if (table) |gt| {
@@ -3862,6 +3866,7 @@ fn prepareAggregate(
                 .encoded = args.encoded,
                 .expand_limit = args.max_memory,
             },
+            .expr_batch_rows = args.expr_batch_rows,
             .profiler = args.profiler,
             .index = wi,
             .group_by_keys = group_by_keys,
@@ -4953,6 +4958,7 @@ fn runRecordWorkers(
             .encoded = args.encoded,
             .expand_limit = args.max_memory,
         },
+        .expr_batch_rows = args.expr_batch_rows,
         .group_by_keys = keys,
         .group_tables = tables,
         .index = i,

@@ -342,6 +342,8 @@ pub const Batch = struct {
     /// need to be present (caller decides what to provide).
     cols: []const Column,
     num_rows: usize,
+    /// Query-local execution override, read once from the caller's environment; null uses the cache budget.
+    expr_batch_rows: ?usize = null,
     /// The rows a computed result is wanted for, when not all. Exact DECIMAL evaluation checks only these: a value
     /// too wide in a row the filter dropped is no error, as the SQL engines filter before they compute.
     sel: ?*const selection.SelectionVector = null,
@@ -365,30 +367,34 @@ pub const Batch = struct {
         i128: ColumnT(i128),
 
         /// A borrowed flat row window; dictionaries remain shared while row-indexed buffers move together.
-        pub fn sliceRows(col: Column, lo: usize, n: usize) Column {
+        pub fn sliceRows(col: Column, lo: usize, n: usize) error{BadColumn}!Column {
             return switch (col) {
                 inline else => |c, tag| blk: {
                     var o = c;
-                    if (c.codes) |cs| if (cs.len >= lo + n) {
-                        o.codes = cs[lo..][0..n];
-                    };
-                    if (c.values.len >= lo + n) o.values = c.values[lo..][0..n];
-                    if (c.def_levels) |dl| if (dl.len >= lo + n) {
-                        o.def_levels = dl[lo..][0..n];
-                    };
-                    if (c.rep_levels) |rl| if (rl.len >= lo + n) {
-                        o.rep_levels = rl[lo..][0..n];
-                    };
+                    // Empty value buffers are legitimate only for dictionary/level-only views. Every buffer
+                    // that carries rows must cover the requested window; retaining a short buffer misindexes it.
+                    if (c.hist == null and (lo > c.rowCount() or n > c.rowCount() - lo)) return error.BadColumn;
+                    if (c.codes) |cs| o.codes = try rowWindow(u32, cs, lo, n);
+                    if (c.values.len != 0 or (c.codes == null and c.levels_only_rows == 0 and c.hist == null))
+                        o.values = try rowWindow(@TypeOf(c.values[0]), c.values, lo, n);
+                    if (c.def_levels) |dl| o.def_levels = try rowWindow(u32, dl, lo, n);
+                    if (c.rep_levels) |rl| o.rep_levels = try rowWindow(u32, rl, lo, n);
                     if (c.unscaled) |u| o.unscaled = switch (u) {
-                        inline else => |v, utag| if (v.len >= lo + n)
-                            @unionInit(Exact, @tagName(utag), v[lo..][0..n])
-                        else
-                            u,
+                        inline else => |v, utag| @unionInit(
+                            Exact,
+                            @tagName(utag),
+                            try rowWindow(@TypeOf(v[0]), v, lo, n),
+                        ),
                     };
                     if (o.levels_only_rows != 0) o.levels_only_rows = n;
                     break :blk @unionInit(Column, @tagName(tag), o);
                 },
             };
+        }
+
+        fn rowWindow(comptime T: type, values: []const T, lo: usize, n: usize) error{BadColumn}![]const T {
+            if (lo > values.len or n > values.len - lo) return error.BadColumn;
+            return values[lo..][0..n];
         }
 
         /// Null mask + nesting, independent of the value type — used by
@@ -1208,4 +1214,31 @@ test "IN and NOT IN sets over a coded column select as they do over its values, 
             try testing.expectEqual(defs[i] == 1 and listed != negated, plain_sel.isActive(i));
         }
     }
+}
+
+test "row windows preserve coded and exact views and reject short buffers" {
+    const vals = [_]i32{ 10, 20, 30 };
+    const codes = [_]u32{ 0, 1, 0 };
+    const defs = [_]u32{ 1, 0, 1 };
+    const exact = [_]i64{ 100, 200, 300 };
+    const plain: Batch.Column = .{ .i32 = .{
+        .values = &vals,
+        .def_levels = &defs,
+        .unscaled = .{ .i64 = &exact },
+        .max_def = 1,
+    } };
+    const win = try plain.sliceRows(1, 2);
+    try std.testing.expectEqualSlices(i32, vals[1..], win.i32.values);
+    try std.testing.expectEqualSlices(u32, defs[1..], win.i32.def_levels.?);
+    try std.testing.expectEqualSlices(i64, exact[1..], win.i32.unscaled.?.i64);
+    var coded: Batch.Column = .{ .i32 = .{ .values = &.{}, .codes = &codes, .dict = &vals } };
+    const cw = try coded.sliceRows(1, 2);
+    try std.testing.expectEqualSlices(u32, codes[1..], cw.i32.codes.?);
+    try std.testing.expectEqual(@as(usize, 0), cw.i32.values.len);
+    coded.i32.def_levels = defs[0..1];
+    try std.testing.expectError(error.BadColumn, coded.sliceRows(1, 2));
+    coded.i32.def_levels = null;
+    coded.i32.values = vals[0..1];
+    try std.testing.expectError(error.BadColumn, coded.sliceRows(1, 2));
+    try std.testing.expectError(error.BadColumn, plain.sliceRows(2, 2));
 }

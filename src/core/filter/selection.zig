@@ -35,6 +35,15 @@ pub const SelectionVector = struct {
         return .{ .allocator = allocator, .len = len, .mask = mask };
     }
 
+    /// Borrow whole mask words. A partial final word is valid only at the original selection's end.
+    /// Explicit checks also run in ReleaseFast: shifting a window silently changes which rows are selected.
+    pub fn alignedWindow(self: SelectionVector, lo: usize, n: usize) error{UnalignedSelectionWindow}!SelectionVector {
+        if (lo % 64 != 0 or lo > self.len or n > self.len - lo or
+            (n % 64 != 0 and n != self.len - lo) or self.mask.len < (self.len + 63) / 64)
+            return error.UnalignedSelectionWindow;
+        return .{ .allocator = self.allocator, .len = n, .mask = self.mask[lo / 64 ..][0 .. (n + 63) / 64] };
+    }
+
     pub fn deinit(self: *SelectionVector) void {
         self.allocator.free(self.mask);
         self.* = undefined;
@@ -169,4 +178,15 @@ test "SelectionVector unionWith" {
     try testing.expect(a.isActive(1));
     try testing.expect(a.isActive(2));
     try testing.expect(!a.isActive(3));
+}
+
+test "borrowed selection windows reject shifted or interior partial words" {
+    var s = try SelectionVector.init(std.testing.allocator, 129);
+    defer s.deinit();
+    s.set(64, false);
+    try std.testing.expect(!(try s.alignedWindow(64, 64)).isActive(0));
+    try std.testing.expectEqual(@as(usize, 1), (try s.alignedWindow(128, 1)).count());
+    try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(1, 64));
+    try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(64, 1));
+    try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(128, 2));
 }

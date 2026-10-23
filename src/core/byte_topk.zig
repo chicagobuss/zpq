@@ -13,6 +13,8 @@ const ordinal_limit = 1 << 27;
 const sum_present = 1;
 const null_identity = 255;
 const stack_size = 1 << 20;
+const cache_headroom = 64 << 10;
+const producer_row_bytes = 128;
 
 pub const Cut = struct { k: usize, descending: bool };
 const Record = extern struct {
@@ -75,17 +77,30 @@ const Heap = std.PriorityQueue(Group, bool, worse);
 fn cacheBudget() usize {
     return hw.l2BytesPerWorkerOr(640 << 10);
 }
-pub fn partitionCount(rows: usize, forced: ?usize) usize {
+pub fn partitionCount(rows: usize, workers: usize, producer_rows: usize, forced: ?usize) usize {
     if (forced) |n| return powerOfTwo(if (n == 0) 2048 else n, 64, 16384);
     // Forty bytes per group, and fewer than four u32 slots per input row after rounding. This is a
     // conservative uniform-partition cache estimate; skew changes performance, never key identity.
-    const count = std.math.divCeil(usize, rows *| 56, @max(1, cacheBudget() -| (64 << 10))) catch 16384;
-    return std.math.ceilPowerOfTwo(usize, std.math.clamp(count, 64, 16384)) catch 16384;
+    const tables = rows *| 56;
+    const count = std.math.divCeil(usize, tables, @max(1, cacheBudget() -| cache_headroom)) catch 16384;
+    const l2_parts = std.math.ceilPowerOfTwo(usize, std.math.clamp(count, 64, 16384)) catch 16384;
+    const l3 = hw.l3BytesPerActiveWorker(workers);
+    // Ordinary memory-driven decoding has no bounded cache window. Unknown L3 keeps the L2 policy too.
+    if (l3 == 0 or producer_rows == 0) return l2_parts;
+    const producer_fixed = producer_rows *| producer_row_bytes +| cache_headroom;
+    const frontier_bytes = @sizeOf(Block) + 3 * @sizeOf(u32);
+    const capacity = (l3 -| producer_fixed) / frontier_bytes;
+    if (capacity < 64) return l2_parts;
+    const parts = @min(l2_parts, powerOfTwo(capacity, 64, 16384));
+    // Fewer write streams may trade L2-resident fold scratch for L3 residency. If neither phase can fit
+    // together under these estimates, preserve the L2 fold target instead of making both spill.
+    if (tables > (l3 -| cache_headroom) *| parts) return l2_parts;
+    return parts;
 }
 pub fn batchRows(forced: ?usize) usize {
     if (forced) |n| return if (n == 0) 0 else powerOfTwo(n, 64, 16384);
     // Decoded views, integer/code/level lanes and an emitted record share the producer's cache headroom.
-    return powerOfTwo((cacheBudget() -| (64 << 10)) / 128, 64, 16384);
+    return powerOfTwo((cacheBudget() -| cache_headroom) / producer_row_bytes, 64, 16384);
 }
 fn powerOfTwo(n: usize, lo: usize, hi: usize) usize {
     return @as(usize, 1) << @intCast(std.math.log2_int(usize, std.math.clamp(n, lo, hi)));
@@ -464,14 +479,27 @@ test "packed byte identity distinguishes NULL, empty and embedded zero bytes and
 test "packed byte SUM cache policy uses shared hardware and supports every forced variant" {
     defer hw.test_cpu = null;
     hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 } };
-    const small = partitionCount(30000000, null);
+    const small = partitionCount(30000000, 16, batchRows(null), null);
     const small_batch = batchRows(null);
     hw.test_cpu = .{ .l2 = .{ .bytes = 4 << 20, .max_sharing = 2 } };
-    try std.testing.expect(partitionCount(30000000, null) < small);
+    try std.testing.expect(partitionCount(30000000, 16, batchRows(null), null) < small);
     try std.testing.expect(batchRows(null) > small_batch);
-    try std.testing.expectEqual(@as(usize, 2048), partitionCount(30000000, 0));
+    try std.testing.expectEqual(@as(usize, 2048), partitionCount(30000000, 16, 4096, 0));
     try std.testing.expectEqual(@as(usize, 0), batchRows(0));
-    try std.testing.expectEqual(@as(usize, 64), partitionCount(30000000, 1));
-    try std.testing.expectEqual(@as(usize, 16384), partitionCount(30000000, 999999));
+    try std.testing.expectEqual(@as(usize, 64), partitionCount(30000000, 16, 4096, 1));
+    try std.testing.expectEqual(@as(usize, 16384), partitionCount(30000000, 16, 4096, 999999));
     for ([_]usize{ 64, 1024, 8192, 16384 }) |parts| try trial(std.testing.allocator, 1, true, parts, false);
+
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1280 << 10, .max_sharing = 2 }, .l3 = .{ .bytes = 30 << 20 } };
+    try std.testing.expectEqual(@as(usize, 4096), partitionCount(30000000, 1, 4096, null));
+    try std.testing.expectEqual(@as(usize, 2048), partitionCount(30000000, 12, 4096, null));
+    try std.testing.expectEqual(@as(usize, 4096), partitionCount(30000000, 64, 4096, null));
+    try std.testing.expectEqual(@as(usize, 4096), partitionCount(30000000, 12, 0, null));
+    try std.testing.expectEqual(@as(usize, 4096), partitionCount(30000000, 12, 65536, null));
+    hw.test_cpu.?.l3.bytes = 4 << 20;
+    try std.testing.expectEqual(@as(usize, 4096), partitionCount(30000000, 1, 4096, null));
+    hw.test_cpu.?.l3.bytes = 0;
+    try std.testing.expectEqual(@as(usize, 4096), partitionCount(30000000, 12, 4096, null));
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 }, .l3 = .{ .bytes = 32 << 20 } };
+    try std.testing.expectEqual(@as(usize, 2048), partitionCount(30000000, 16, batchRows(null), null));
 }

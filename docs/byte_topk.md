@@ -34,10 +34,14 @@ attempt and uses the existing serial/mapped retry chain. Admission requires all 
 no decoded view outlives its owner. Every record worker retains the query's complete projection and shared
 canonical error-probe context.
 
-Partition and producer-window sizes use the shared minimum per-worker L2 budget. Partition sizing includes
-group and slot bytes plus cache headroom; skew may exceed the estimate without changing correctness. Producer
-windows include views, integer/code/level lanes and record work. The global forced decode-window option takes
-precedence. All execution overrides are documented in [hardware-execution.md](hardware-execution.md); cache
+Producer windows use the shared minimum per-worker L2 budget, counting views, integer/code/level lanes and
+record work. The global forced decode-window option takes precedence. Partition sizing starts with the count
+needed for worst-case group/slot scratch to fit L2, then bounds active producer buffers by
+`hw.l3BytesPerActiveWorker(workers)`. Each partition needs one 16-record block and three u32 metadata entries
+per producer; the L3 share also leaves room for the decode window and cache headroom. A smaller count may put
+fold scratch in L3 instead of L2, but must still fit that L3 share. Unknown L3, ordinary unbounded decode windows
+or incompatible phase budgets retain the L2-based count. Skew can exceed these cost estimates without changing
+correctness. All execution overrides are documented in [hardware-execution.md](hardware-execution.md); cache
 choices never change key identity, exact sums, ties or output layout.
 Partition counts contribute to the reservation, so cache sizes can change admission near a memory-budget
 boundary. Different hosts may choose the owned-record layout or the established executor for the same query

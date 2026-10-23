@@ -5430,7 +5430,11 @@ fn inlineByteTopAnswer(
     if (rows < args.byte_records_min_rows or rows >= 1 << 27) return null;
     if (args.byte_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
-    const parts = byte_topk.partitionCount(rows, args.byte_top_partitions);
+    const producer_rows = if (args.decode_batch_rows != 0)
+        args.decode_batch_rows
+    else
+        byte_topk.batchRows(args.byte_top_batch_rows);
+    const parts = byte_topk.partitionCount(rows, n_workers, producer_rows, args.byte_top_partitions);
     const output_credit = names_bytes +| @as(usize, @intCast(h)) *|
         (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue) + 15);
     const quote = byte_topk.State.reservation(rows, n_workers, parts, @intCast(h), output_credit);
@@ -5454,7 +5458,7 @@ fn inlineByteTopAnswer(
     const sinks = arena.alloc(consumer.RecordSink, n_workers) catch return error.ExceededMemoryBudget;
     for (sinks, s.locals) |*sink, *local| sink.* = .{ .byte_top = local };
     var decoded = args;
-    if (decoded.decode_batch_rows == 0) decoded.decode_batch_rows = byte_topk.batchRows(args.byte_top_batch_rows);
+    decoded.decode_batch_rows = producer_rows;
     const t = runRecordWorkers(
         gpa,
         arena,
@@ -17911,11 +17915,37 @@ test "packed byte SUM declines reconstructed outputs before admission" {
     };
     const plan = try agg_plan.Plan.init(a, .{ .filter = null, .calls = &.{}, .group_keys = null }, &.{}, .ignore);
     // Keep the other admission conditions satisfied: a multi-key SQL fixture alone could mask a missing guard.
-    const admitted = try inlineByteTopAnswer(testing.allocator, a, args, &.{}, &plan, &.{}, &calls, &.{key}, &outputs, 1, .{}, true);
+    const admitted = try inlineByteTopAnswer(
+        testing.allocator,
+        a,
+        args,
+        &.{},
+        &plan,
+        &.{},
+        &calls,
+        &.{key},
+        &outputs,
+        1,
+        .{},
+        true,
+    );
     try testing.expect(admitted != null);
     for (&outputs) |*out| {
         out.derived = key;
-        const refused = try inlineByteTopAnswer(testing.allocator, a, args, &.{}, &plan, &.{}, &calls, &.{key}, &outputs, 1, .{}, true);
+        const refused = try inlineByteTopAnswer(
+            testing.allocator,
+            a,
+            args,
+            &.{},
+            &plan,
+            &.{},
+            &calls,
+            &.{key},
+            &outputs,
+            1,
+            .{},
+            true,
+        );
         try testing.expect(refused == null);
         out.derived = null;
     }

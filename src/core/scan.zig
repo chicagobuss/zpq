@@ -32,6 +32,7 @@ const metadata = @import("parquet/metadata.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_parser = @import("expr/parser.zig");
 const expr_agg = @import("expr/agg.zig");
+const group_dependencies = @import("expr/group_dependencies.zig");
 const core_memory = @import("memory.zig");
 const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
@@ -228,6 +229,8 @@ pub const MultiAggArgs = struct {
     level_runs: ?bool = null,
     /// Query-local computed DOUBLE batch override; 0 keeps the legacy evaluator.
     expr_batch_rows: ?usize = null,
+    /// Drop fault-free integer expressions fixed by retained bare GROUP BY keys; false forces legacy grouping.
+    dependent_keys: bool = true,
     /// Forced flat decode windows; zero keeps ordinary memory admission.
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,
@@ -1465,7 +1468,7 @@ fn decodeProjectionOrder(
     };
     var b: Builder = .{ .ranks = ranks, .mask = try a.alloc(bool, n) };
     if (outputs) |cols| for (cols) |out| switch (out.source) {
-        .key => |ki| b.add(keys.?[ki]),
+        .key => |ki| b.add(out.derived orelse keys.?[ki]),
         .agg => |ai| if (calls[ai].arg) |arg| b.add(arg),
     };
     if (keys) |ks| for (ks) |key| b.add(key);
@@ -1479,7 +1482,7 @@ fn decodeProjectionOrder(
 
 fn workerErrorRanks(ctx: *const anyopaque, a: std.mem.Allocator, n: usize) anyerror![]const usize {
     const w: *const Worker = @ptrCast(@alignCast(ctx));
-    return decodeProjectionOrder(a, n, w.agg_calls, w.group_by_keys, w.error_outputs);
+    return decodeProjectionOrder(a, n, w.agg_calls, w.error_group_keys orelse w.group_by_keys, w.error_outputs);
 }
 
 const FailureProbe = struct {
@@ -1710,6 +1713,8 @@ const Worker = struct {
     auto_decode_batches: bool = false,
     cache_hints: ?*consumer.CacheHints = null,
     error_outputs: ?[]const BoundOutputColumn = null,
+    /// Original bindings, before dependent-key removal, including keys absent from SELECT.
+    error_group_keys: ?[]const expr_ast.Expr = null,
     scan_workers: usize = 1,
     failure_probe: ?*FailureProbe = null,
     failed_gate: ?RowGroupGate = null,
@@ -3706,7 +3711,7 @@ fn prepareAggregateWithMetas(
         try expr_parser.parseGroupByOf(arena, gb_str, meta0, args.diag, args.select_cols orelse &.{})
     else
         null;
-    const group_by_keys = if (group_by_items) |items| blk: {
+    var group_by_keys: ?[]const expr_ast.Expr = if (group_by_items) |items| blk: {
         const exprs = try arena.alloc(expr_ast.Expr, items.len);
         for (items, 0..) |item, i| exprs[i] = item.expr;
         break :blk exprs;
@@ -3717,13 +3722,20 @@ fn prepareAggregateWithMetas(
     try nameUnaliasedAggs(arena, agg_calls, &key_names);
     const agg_sources = try arena.alloc(?schema.SchemaElement, agg_calls.len);
     for (agg_calls, agg_sources) |call, *src| src.* = passThroughSource(call, meta0);
-    const group_outputs: ?[]const BoundOutputColumn = if (group_by_items != null)
+    var group_outputs: ?[]const BoundOutputColumn = if (group_by_items != null)
         try bindGroupOutputs(arena, &key_names, agg_calls, meta0, args)
     else blk: {
         try checkAggAliases(agg_calls, args.diag);
         break :blk null;
     };
     if (args.result_order.having) |h| try checkHavingLanes(arena, h.*, group_outputs, agg_calls, group_by_keys);
+    const error_group_keys = group_by_keys;
+    const error_outputs = group_outputs;
+    if (args.dependent_keys and !args.unordered) if (group_by_keys) |keys| {
+        const dependencies = try dependentGroupKeys(arena, keys, group_outputs.?);
+        group_by_keys = dependencies.keys;
+        group_outputs = dependencies.outputs;
+    };
     if (!explain) if (args.diag) |diag| {
         diag.execution_started = true;
     };
@@ -4303,7 +4315,8 @@ fn prepareAggregateWithMetas(
             .auto_decode_batches = args.auto_decode_batches,
             .cache_hints = &cache_hints,
             .scan_workers = n_workers,
-            .error_outputs = group_outputs,
+            .error_outputs = error_outputs,
+            .error_group_keys = error_group_keys,
             .failure_probe = args.failure_probe,
             .profiler = args.profiler,
             .index = wi,
@@ -4567,7 +4580,7 @@ fn prepareAggregateWithMetas(
                     .dec => .dec,
                 },
                 .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
-                .source = if (keys[k_idx] == .col_ref)
+                .source = if (out.derived != null) null else if (keys[k_idx] == .col_ref)
                     leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx)
                 else if (keys[k_idx].isBoolean()) boolean_answer else null,
             },
@@ -4664,6 +4677,7 @@ fn prepareAggregateWithMetas(
             .outputs = outputs,
             .calls = agg_calls,
             .key_types = key_types,
+            .key_exprs = keys,
             .accs = if (folded) merged_accs.items else out_tables[0].accumulators.items,
             .folded = folded,
             .in_place = in_place_tables,
@@ -5165,6 +5179,7 @@ fn inlineMsdAnswer(
         order.having != null or order.hidden.len != 0 or order.keys.len != 1 or calls.len != 1) return null;
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
+    for (outputs) |out| if (out.derived != null) return null;
     if (keys.len != 2 or keys[0] != .col_ref or keys[1] != .col_ref or outputs.len != 3) return null;
     const key = keys[0].col_ref;
     const f = keys[1].col_ref;
@@ -5332,6 +5347,7 @@ fn inlineByteAnswer(
         order.hidden.len != 0 or calls.len != 2) return null;
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
+    for (outputs) |out| if (out.derived != null) return null;
     if (keys.len != 1 or keys[0] != .col_ref or outputs.len != 3) return null;
     const key = keys[0].col_ref;
     if (key.physical_type != .BYTE_ARRAY or key.expr_type != .str) return null;
@@ -5467,6 +5483,7 @@ fn inlineIntegerAnswer(
         order.hidden.len != 0) return null;
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
+    for (outputs) |out| if (out.derived != null) return null;
     const full = order.keys.len == 0 and order.limit == null and order.offset == 0;
     var cut: ?integer_groups.Cut = null;
     if (full) {
@@ -5901,6 +5918,7 @@ const RowSource = struct {
     outputs: []const BoundOutputColumn,
     calls: []const expr_agg.AggCall,
     key_types: []const KeyType,
+    key_exprs: []const expr_ast.Expr = &.{},
     /// The merged accumulators, a group's starting at `slot.idx`, when worker tables were folded; else the one
     /// table's, starting at `slot.idx * calls.len`.
     accs: []const expr_agg.Accumulator,
@@ -5911,6 +5929,31 @@ const RowSource = struct {
     single: ?*const expr_agg.GroupTable = null,
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
+
+    fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn) !AggValue {
+        const e = out.derived orelse return deserializeKeyColumn(gpa, bytes, out.source.key, s.key_types);
+        const Reader = struct {
+            src: *const RowSource,
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+
+            pub fn column(r: *@This(), ci: usize) !?i64 {
+                for (r.src.key_exprs, 0..) |key, i| {
+                    if (key != .col_ref or key.col_ref.col_idx != ci) continue;
+                    const value = try deserializeKeyColumn(r.gpa, r.bytes, i, r.src.key_types);
+                    return switch (value) {
+                        .null_val => null,
+                        .i => |v| std.math.cast(i64, v) orelse return error.BadGroupKey,
+                        else => error.BadGroupKey,
+                    };
+                }
+                return error.BadGroupKey;
+            }
+        };
+        var reader: Reader = .{ .src = s, .gpa = gpa, .bytes = bytes };
+        const value = try group_dependencies.evaluate(e, &reader);
+        return if (value) |v| .{ .i = v } else .null_val;
+    }
 
     fn integerOutputs(s: *const RowSource, types: []const GroupColType) bool {
         for (s.outputs, types) |out, ty| switch (out.source) {
@@ -5984,7 +6027,7 @@ const RowSource = struct {
         var ser_buf: [48]u8 = undefined;
         const key_bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
         for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
-            .key => |k_idx| try deserializeKeyColumn(gpa, key_bytes, k_idx, s.key_types),
+            .key => try s.keyValue(gpa, key_bytes, out),
             .agg => |a_idx| blk: {
                 const acc = if (compact) table.?.readAcc(group, a_idx, s.calls.len) else accs[a_idx];
                 break :blk try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
@@ -6395,8 +6438,8 @@ const ColumnBuildTask = struct {
         var buf: [48]u8 = undefined;
         const key = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &buf) else slot.key;
         for (s.outputs, t.types, t.answer.columns, 0..) |out, ty, *col, ci| switch (out.source) {
-            .key => |ki| {
-                const v = try deserializeKeyColumn(t.gpa, key, ki, s.key_types);
+            .key => {
+                const v = try s.keyValue(t.gpa, key, out);
                 TypedAnswer.put(col, ty, i, v) catch |e| {
                     if (v == .s) t.gpa.free(v.s);
                     t.narrowing(e, ci, i);
@@ -8204,7 +8247,39 @@ const ColSource = union(enum) {
 const BoundOutputColumn = struct {
     source: ColSource,
     name: []const u8,
+    /// Original expression, reconstructed from retained keys only after the aggregate. The source key is one
+    /// retained integer dependency, used for lane classification; names and original projection order stay bound.
+    derived: ?expr_ast.Expr = null,
 };
+
+fn dependentGroupKeys(
+    arena: std.mem.Allocator,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+) !struct { keys: []const expr_ast.Expr, outputs: []const BoundOutputColumn } {
+    var count: usize = 0;
+    for (keys) |e| if (group_dependencies.dependency(e, keys) != null) {
+        count += 1;
+    };
+    if (count == 0) return .{ .keys = keys, .outputs = outputs };
+    const kept = try arena.alloc(expr_ast.Expr, keys.len - count);
+    const map = try arena.alloc(usize, keys.len);
+    const bound = try arena.dupe(BoundOutputColumn, outputs);
+    var n: usize = 0;
+    for (keys, 0..) |e, i| if (group_dependencies.dependency(e, keys) == null) {
+        map[i] = n;
+        kept[n] = e;
+        n += 1;
+    };
+    for (bound) |*out| if (out.source == .key) {
+        const old = out.source.key;
+        if (group_dependencies.dependency(keys[old], keys)) |base| {
+            out.derived = keys[old];
+            out.source.key = map[base];
+        } else out.source.key = map[old];
+    };
+    return .{ .keys = kept, .outputs = bound };
+}
 
 /// An unaliased aggregate is named after its function (`sum`), as it always has been, unless that name is taken by
 /// another aggregate or a GROUP BY key; then it takes its call text (`sum(x)`), as DuckDB names it. So
@@ -17028,6 +17103,7 @@ test "canonical full projection prefix includes count arguments and skipped admi
     w.decode_options = .{};
     w.agg_calls = &calls;
     w.group_by_keys = &keys;
+    w.error_group_keys = null;
     w.error_outputs = null;
     // The worker sees only RG2, with a count-only projection. Neither controls the canonical replay.
     const found = canonicalFailurePrefix(testing.allocator, FailureProbe.contextOf(&w));
@@ -17274,5 +17350,117 @@ test "writer statistics: rewritten footers suppress pruning page indexes and tru
             const minimum: i128 = if (c.binary and !scan_all) 900 else 100;
             try testing.expectEqual(minimum, result.output.aggs[3].value.dec.v);
         };
+    }
+}
+
+test "dependent group keys: allocation failures and original projection ranks" {
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 5, .physical_type = .INT32, .expr_type = .i64 } };
+    var y: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 3, .physical_type = .INT32, .expr_type = .i64 } };
+    const sum: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &y,
+        .result_type = .i64,
+        .depth = 2,
+    } };
+    const keys = [_]expr_ast.Expr{ sum, x, y };
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "sum" },
+        .{ .source = .{ .key = 1 }, .name = "x" },
+        .{ .source = .{ .key = 2 }, .name = "y" },
+    };
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator, ks: []const expr_ast.Expr, outs: []const BoundOutputColumn) !void {
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const a = arena_state.allocator();
+            const result = try dependentGroupKeys(a, ks, outs);
+            try testing.expectEqual(@as(usize, 2), result.keys.len);
+            try testing.expect(result.outputs[0].derived != null);
+            const before = try decodeProjectionOrder(a, 6, &.{}, ks, outs);
+            const after = try decodeProjectionOrder(a, 6, &.{}, result.keys, result.outputs);
+            try testing.expectEqualSlices(usize, before, after);
+            // With no key output, a removed expression may have established a different order from bare keys.
+            var w: Worker = undefined;
+            w.agg_calls = &.{};
+            w.group_by_keys = result.keys;
+            w.error_group_keys = ks;
+            w.error_outputs = &.{};
+            const hidden_before = try decodeProjectionOrder(a, 6, &.{}, ks, &.{});
+            const hidden_after = try workerErrorRanks(&w, a, 6);
+            try testing.expectEqualSlices(usize, hidden_before, hidden_after);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{ &keys, &outputs });
+}
+
+test "dependent group keys: nullable multi-key trees and canonical float blocks match legacy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const streaming = @import("writer/streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    const k = [_]i32{ std.math.minInt(i32), -1, 0, 1, std.math.maxInt(i32), -1, 1, 0 };
+    const b = [_]i32{ 0, 1, 1, -1, 0, 1, -1, 1 };
+    const defs = [_]u32{ 1, 1, 0, 1, 1, 1, 1, 0 };
+    const f = [_]f64{ 1e20, 1, -1e20, -0.0, 7, 1e-20, 11, -0.0 };
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .INT32, .nullable = true, .col = .{ .i32 = .{
+            .values = &k,
+            .def_levels = &defs,
+            .max_def = 1,
+        } } },
+        .{ .name = "b", .parquet_type = .INT32, .nullable = false, .col = .{ .i32 = .{ .values = &b } } },
+        .{ .name = "f", .parquet_type = .DOUBLE, .nullable = false, .col = .{ .f64 = .{ .values = &f } } },
+    };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 16;
+    const inputs = [_]Input{.{ .name = "dependent.parquet", .bytes = sink.buffer.items }};
+    for ([_][]const u8{ "k, k-1 AS km, k*k AS sq", "b, k-1 AS km, k, k+b AS kb, k*0 AS z" }) |keys| {
+        const args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c, sum(f) AS s, avg(f) AS a",
+            .group_by = keys,
+            .dependent_keys = false,
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .scan_all = true,
+        };
+        var want = try runMultiAggregate(testing.allocator, a, args);
+        defer want.deinit(testing.allocator);
+        for ([_]usize{ 1, 3, 16 }) |j| for ([_]usize{ 0, 64 }) |rows| {
+            var trial = args;
+            trial.parallelism = j;
+            trial.dependent_keys = true;
+            trial.decode_batch_rows = rows;
+            var got = try runMultiAggregate(testing.allocator, a, trial);
+            defer got.deinit(testing.allocator);
+            const wr = want.output.group_rows.?;
+            const gr = got.output.group_rows.?;
+            try testing.expectEqual(wr.len, gr.len);
+            for (wr, gr) |w, g| for (w, g) |x, y| try expectSameBits(x, y);
+            for (want.output.group_cols.?, got.output.group_cols.?) |w, g| try testing.expectEqualStrings(w, g);
+        };
+        var typed_args = args;
+        typed_args.aggregate = "count(*) AS c";
+        var original = try runMultiAggregate(testing.allocator, a, typed_args);
+        defer original.deinit(testing.allocator);
+        typed_args.dependent_keys = true;
+        typed_args.typed_answer = true;
+        var typed = try runMultiAggregate(testing.allocator, a, typed_args);
+        defer typed.deinit(testing.allocator);
+        for (original.output.group_rows.?, 0..) |row, i| {
+            for (row, typed.output.typed.?.columns) |v, col| {
+                try testing.expectEqual(v == .null_val, col.i64.defs[i] == 0);
+                if (v != .null_val) try testing.expectEqual(v.i, col.i64.values[i]);
+            }
+        }
+        // Derived arithmetic is INT64, even when the retained base is INT32.
+        try testing.expect(typed.state.group_col_types.?[1].source == null);
     }
 }

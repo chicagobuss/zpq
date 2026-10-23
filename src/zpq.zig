@@ -148,6 +148,7 @@ test {
     _ = @import("core/parquet/statistics.zig");
     _ = @import("core/parquet/writer_statistics.zig");
     _ = @import("core/writer/page_header.zig");
+    _ = @import("core/expr/group_dependencies.zig");
     _ = @import("core/parquet/bloom.zig");
     _ = @import("core/parquet/int96.zig");
     _ = @import("core/parquet/fuzz_decode.zig");

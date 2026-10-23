@@ -184,6 +184,9 @@ What changed underneath:
 - A rule-based planner picks among grouping strategies from footer and dictionary facts only, and `--explain` shows
   the facts, the candidates and the rule that decided. The strategies are plain tables, shared partitions, exact count
   cuts for `ORDER BY count(*) DESC LIMIT n`, and a dense fold over a dictionary domain. Every strategy is exact.
+- GROUP BY removes integer expression keys fixed by retained bare keys when schema ranges prove every operation
+  fault-free, reconstructing their outputs per group. NULLs, output types and float reduction order are preserved;
+  potentially faulting expressions keep per-row evaluation. See [dependent group keys](docs/dependent-group-keys.md).
 - GROUP BY state is stored at the width each reduction needs, and group lookups cache their hashes. A count over
   long, near-unique composite keys can move each worker's groups to private partition runs, funded from the query's
   memory budget, instead of one shared table.

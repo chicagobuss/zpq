@@ -684,6 +684,7 @@ fn executeAggregateOver(
         else
             0,
         .auto_decode_batches = decode_rows_env == null,
+        .dependent_keys = !envDisables(ctx.env, "ZPQ_GROUP_KEY_FD"),
         .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else

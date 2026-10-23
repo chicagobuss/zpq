@@ -32,6 +32,7 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_HW_L1D_BYTES` | Replace discovered L1 data sizes, in bytes |
 | `ZPQ_HW_L2_BYTES` | Replace discovered L2 sizes, in bytes |
 | `ZPQ_HW_L3_BYTES` | Replace discovered L3 sizes, in bytes |
+| `ZPQ_GROUP_KEY_FD` | Fault-free dependent integer GROUP BY keys; `0` forces legacy grouping |
 | `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` selects the legacy full-row-group evaluator |
 | `ZPQ_DECODE_BATCH_ROWS` | Unset selects cache-sized decode for admitted float trees; `0`, invalid or overflowing values keep ordinary memory admission; positive values force the window path with a row cap |
 | `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` keeps legacy expansion |

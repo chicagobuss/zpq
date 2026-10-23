@@ -4612,6 +4612,8 @@ fn byteSampleMayFit(
     key_col: usize,
 ) !bool {
     for (work) |item| {
+        // Readers have not started. Do not fault their mapping for an optional cost probe.
+        if (args.inputs[item.file].gate != null) continue;
         const rg = &metas[item.file].row_groups.items[item.rg];
         const cm = rg.columns.items[key_col].meta_data orelse return false;
         if (rg.num_rows == 0) continue;
@@ -4620,7 +4622,7 @@ fn byteSampleMayFit(
         const cap = 4 << 20;
         if (args.ledger) |l| _ = l.drawExact(cap) orelse return false;
         defer if (args.ledger) |l| l.release(cap);
-        const buf = try gpa.alloc(u8, cap);
+        const buf = gpa.alloc(u8, cap) catch return false;
         defer gpa.free(buf);
         var fixed = std.heap.FixedBufferAllocator.init(buf);
         const a = fixed.allocator();
@@ -4969,7 +4971,8 @@ fn runRecordWorkers(
     runWorkers(workers);
     releaseRegions(workers);
     for (workers) |w| if (w.err) |e| {
-        if (e == error.ExceededMemoryBudget) if (args.taken) |taken| taken.insert(.decode_memory);
+        // Only an effectively parallel attempt can benefit from the deterministic serial retry.
+        if (e == error.ExceededMemoryBudget and n > 1) if (args.taken) |taken| taken.insert(.decode_memory);
         consumer.setDecodeFailure(w.failure);
         return e;
     };
@@ -12415,11 +12418,11 @@ test "inline records decline released remote windows and retry only through a re
                 .columns = undefined,
                 .accumulators = &.{},
             }};
-            try testing.expect(try byteSampleMayFit(alloc, .{
+            if (!try byteSampleMayFit(alloc, .{
                 .inputs = &inputs,
                 .aggregate = "",
                 .ledger = &budget,
-            }, &.{m}, &work, 0));
+            }, &.{m}, &work, 0)) return error.OutOfMemory;
         }
     };
     try Probe.trial(gpa, meta, captured.bytes.items);
@@ -12442,6 +12445,41 @@ test "inline records decline released remote windows and retry only through a re
         &sample_work,
         0,
     ));
+    var failing_probe = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var probe_budget: core_memory.SharedBudget = .{ .limit = 8 << 20 };
+    try testing.expect(!try byteSampleMayFit(
+        failing_probe.allocator(),
+        .{ .inputs = &sample_inputs, .aggregate = "", .ledger = &probe_budget },
+        &.{meta},
+        &sample_work,
+        0,
+    ));
+    try testing.expect(failing_probe.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), probe_budget.used.load(.monotonic));
+    const Unstarted = struct {
+        fn wait(_: *anyopaque, _: usize) anyerror!void {
+            return error.ReaderNotStarted;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {
+            @panic("reader not started");
+        }
+    };
+    // Neither buffered bytes nor the mapping may be read before a reader starts.
+    var unstarted: u8 = 0;
+    const gated_inputs = [_]Input{.{
+        .name = "unstarted.parquet",
+        .bytes = &.{},
+        .plan_bytes = &.{},
+        .gate = .{ .ctx = &unstarted, .wait = Unstarted.wait, .done = Unstarted.done },
+    }};
+    try testing.expect(try byteSampleMayFit(
+        failing_probe.allocator(),
+        .{ .inputs = &gated_inputs, .aggregate = "", .ledger = &probe_budget },
+        &.{meta},
+        &sample_work,
+        0,
+    ));
+    try testing.expectEqual(@as(usize, 0), probe_budget.used.load(.monotonic));
     const Window = struct {
         bytes: []u8,
         meta: *const schema.FileMetaData,
@@ -12469,7 +12507,8 @@ test "inline records decline released remote windows and retry only through a re
             }
         }
     };
-    for ([_]bool{ false, true }) |mapped| for ([_]bool{ false, true }) |bytes_key| {
+    for ([_]usize{ 0, 4, 8 }) |requested| for ([_]bool{ false, true }) |mapped| for ([_]bool{ false, true }) |bytes_key| {
+        const parallel_retry = requested == 4;
         var budget: core_memory.SharedBudget = .{ .limit = 512 << 20 };
         // The established answer retains its small materialization charge until the query ledger dies.
         defer std.debug.assert(budget.used.load(.monotonic) < 1 << 20);
@@ -12492,20 +12531,20 @@ test "inline records decline released remote windows and retry only through a re
             .metas = &.{meta},
             .aggregate = "count(*) AS c,sum(n) AS s",
             .group_by = if (bytes_key) "k" else "n",
-            .parallelism = if (mapped and !bytes_key) 4 else 1,
+            .parallelism = if (mapped and !bytes_key) requested else 1,
             .typed_answer = true,
             .integer_records_min_rows = 0,
             .byte_records = true,
             .byte_records_min_rows = 0,
             .max_memory = budget.limit,
             .ledger = &budget,
-            .min_bytes_per_worker = 1,
+            .min_bytes_per_worker = if (parallel_retry) 1 else std.math.maxInt(usize),
         });
         defer got.deinit(gpa);
         try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.waits);
         try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.done);
         try testing.expect(got.output.byte_stream == null);
-        if (mapped and !bytes_key) {
+        if (mapped and !bytes_key and parallel_retry) {
             // The injected parallel decode refusal must keep the inline layout for its deterministic serial retry.
             const stream = got.output.integer_stream.?;
             try testing.expectEqual(@as(usize, 1), stream.state.locals.len);

@@ -39,6 +39,7 @@ const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const integer_groups = @import("integer_groups.zig");
 const byte_groups = @import("byte_groups.zig");
+const byte_topk = @import("byte_topk.zig");
 const msd_groups = @import("msd_groups.zig");
 const column_mod = @import("parquet/column.zig");
 pub const NdvStat = ndv.Stat;
@@ -252,6 +253,9 @@ pub const MultiAggArgs = struct {
     msd_working_bytes: ?usize = null,
     byte_records: bool = false,
     byte_records_min_rows: usize = 1 << 20,
+    /// Zero retains the established partition count or ordinary decode admission, respectively.
+    byte_top_partitions: ?usize = null,
+    byte_top_batch_rows: ?usize = null,
     /// `--unordered`: GROUP BY output in no particular order, with floating-point aggregates summed in whatever order
     /// workers finish. Ordered (the default) lists groups where they first appear in the input and gives the same bits
     /// at every `-j`; see `group_blocks_max`.
@@ -1209,7 +1213,7 @@ pub const AggregateExplanation = struct {
 };
 
 pub const RecordAdmission = struct {
-    layout: enum { integer_group_stream, integer_sum_top_h, byte_group_stream, msd_count_top_h },
+    layout: enum { integer_group_stream, integer_sum_top_h, byte_group_stream, byte_sum_top_h, msd_count_top_h },
     reservation: usize,
 };
 
@@ -3869,6 +3873,21 @@ fn prepareAggregateWithMetas(
         false,
     )) |result| return result;
 
+    if (!explain) if (try inlineByteTopAnswer(
+        gpa,
+        arena,
+        args,
+        metas,
+        &plan,
+        work_items.items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return result;
+
     if (!explain) if (try inlineByteAnswer(
         gpa,
         arena,
@@ -4048,6 +4067,20 @@ fn prepareAggregateWithMetas(
         null;
     if (explain) {
         const record_path = try inlineMsdAnswer(gpa, arena, msd_args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse try inlineIntegerAnswer(gpa, arena, args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse
+            try inlineByteTopAnswer(
+                gpa,
+                arena,
+                args,
+                metas,
+                &plan,
+                work_items.items,
+                agg_calls,
+                group_by_keys,
+                group_outputs,
+                n_workers,
+                t,
+                true,
+            ) orelse
             try inlineByteAnswer(gpa, arena, args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true);
         const names = try arena.alloc([]const u8, plan.columns.read.len);
         const labels = try metadata.leafLabels(arena, meta0);
@@ -5070,6 +5103,17 @@ fn byteSampleMayFit(
     work: []const WorkItem,
     key_col: usize,
 ) !bool {
+    return shortSampleMayFit(gpa, args, metas, work, key_col, 16);
+}
+
+fn shortSampleMayFit(
+    gpa: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    work: []const WorkItem,
+    key_col: usize,
+    comptime width: usize,
+) !bool {
     for (work) |item| {
         // Readers have not started. Do not fault their mapping for an optional cost probe.
         if (args.inputs[item.file].gate != null) continue;
@@ -5096,7 +5140,7 @@ fn byteSampleMayFit(
         for (0..sampled) |i| {
             if (strings.def_levels) |d| if (d[i] < strings.max_def) continue;
             const value = if (strings.codes) |codes| strings.dict[codes[i]] else strings.values[i];
-            if (value.len > 16) return false;
+            if (value.len > width) return false;
         }
         return true;
     }
@@ -5321,6 +5365,185 @@ fn buildMsdTopRows(gpa: std.mem.Allocator, output: *AggOutput, groups: []const m
                 break :str .{ .s = copy };
             } else .null_val else if (g.record.fValue()) |v| .{ .i = v } else .null_val,
             .agg => .{ .i = g.count },
+        };
+    }
+    return owned;
+}
+
+fn inlineByteTopAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    n_workers: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const order = args.result_order;
+    const limit = order.limit orelse return null;
+    if (limit == 0) return null;
+    if (!args.byte_records or !allRescannable(args.inputs) or args.filter != null or
+        order.keys.len != 1 or order.having != null or order.hidden.len != 0 or calls.len != 1 or
+        n_workers > 64) return null;
+    const keys = keys_opt orelse return null;
+    const outputs = outputs_opt orelse return null;
+    for (outputs) |out| if (out.derived != null) return null;
+    if (keys.len != 1 or keys[0] != .col_ref or outputs.len != 2) return null;
+    const key = keys[0].col_ref;
+    if (key.physical_type != .BYTE_ARRAY or key.expr_type != .str) return null;
+    const call = calls[0];
+    if (call.func != .sum or call.where != null or call.offset != 0 or call.state or call.result != .i64)
+        return null;
+    const value = call.arg orelse return null;
+    if (value != .col_ref or value.col_ref.physical_type != .INT64 or value.col_ref.expr_type != .i64 or
+        value.col_ref.unsigned_64) return null;
+    const rank = order.keys[0];
+    if (rank.column >= outputs.len or outputs[rank.column].source != .agg) return null;
+    const h = limit +| order.offset;
+    if (h == 0 or h > 1024) return null;
+    var seen: u8 = 0;
+    var names_bytes: usize = outputs.len * @sizeOf([]const u8);
+    for (outputs) |out| {
+        seen |= if (out.source == .key) @as(u8, 1) else 2;
+        names_bytes +|= out.name.len;
+    }
+    if (seen != 3) return null;
+    const starts = arena.alloc(u32, work.len) catch return null;
+    var rows: usize = 0;
+    for (work, starts) |item, *start| {
+        if (rows >= 1 << 27) return null;
+        start.* = @intCast(rows);
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        if (rg.num_rows < 0) return null;
+        rows +|= @intCast(rg.num_rows);
+        // Stored bounds can only decline. Every consumed key still proves its exact length.
+        if (rg.columns.items[key.col_idx].meta_data) |cm| if (cm.statistics) |st| {
+            for ([_]?[]const u8{ st.min_value, st.max_value, st.min, st.max }) |bound| if (bound) |b|
+                if (b.len > 15) return null;
+        };
+    }
+    if (rows < args.byte_records_min_rows or rows >= 1 << 27) return null;
+    if (args.byte_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
+        if (guess < rows / 4) return null;
+    const parts = byte_topk.partitionCount(rows, args.byte_top_partitions);
+    const output_credit = names_bytes +| @as(usize, @intCast(h)) *|
+        (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue) + 15);
+    const quote = byte_topk.State.reservation(rows, n_workers, parts, @intCast(h), output_credit);
+    if (quote > args.max_memory) return null;
+    if (explain_only) return .{ .layout = .byte_sum_top_h, .reservation = quote };
+    if (!try shortSampleMayFit(gpa, args, metas, work, key.col_idx, 15)) return null;
+    const s = (byte_topk.State.init(
+        gpa,
+        args.ledger,
+        rows,
+        n_workers,
+        key.col_idx,
+        value.col_ref.col_idx,
+        .{ .k = @intCast(h), .descending = rank.descending },
+        parts,
+        output_credit,
+    ) catch return null) orelse
+        return null;
+    defer s.deinit();
+    if (args.taken) |taken| taken.insert(.integer_records);
+    const sinks = arena.alloc(consumer.RecordSink, n_workers) catch return error.ExceededMemoryBudget;
+    for (sinks, s.locals) |*sink, *local| sink.* = .{ .byte_top = local };
+    var decoded = args;
+    if (decoded.decode_batch_rows == 0) decoded.decode_batch_rows = byte_topk.batchRows(args.byte_top_batch_rows);
+    const t = runRecordWorkers(
+        gpa,
+        arena,
+        decoded,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        sinks,
+        starts,
+        outputs,
+        timings,
+    ) catch |e| {
+        if (s.width_refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+        return e;
+    };
+    const start = nowMonoNs();
+    s.finish() catch |e| return if (e == error.OutOfMemory) error.ExceededMemoryBudget else e;
+    const prof = profile.threadOf(args.profiler, .main);
+    const fold_end = start + @as(i64, @intCast(s.fold_ns));
+    const release_end = fold_end + @as(i64, @intCast(s.release_ns));
+    profile.record(prof, .byte_top_fold, start, fold_end, profile.args(.{ parts, decoded.decode_batch_rows }));
+    profile.record(prof, .byte_release, fold_end, release_end, profile.args(.{}));
+    profile.record(prof, .byte_top_select, release_end, nowMonoNs(), profile.args(.{}));
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    const names = gpa.alloc([]const u8, outputs.len) catch return error.ExceededMemoryBudget;
+    @memset(names, "");
+    output.group_cols = names;
+    const types = arena.alloc(GroupColType, outputs.len) catch return error.ExceededMemoryBudget;
+    for (outputs, types, names) |out, *ty, *name| {
+        name.* = gpa.dupe(u8, out.name) catch return error.ExceededMemoryBudget;
+        ty.* = .{
+            .lane = if (out.source == .key) .string else .i64,
+            .nullable = true,
+            .source = if (out.source == .key) leafSchemaElem(&metas[0], key.col_idx) else null,
+        };
+    }
+    const answer_bytes = buildByteTopRows(gpa, &output, s.top(), outputs) catch |e|
+        return if (e == error.OutOfMemory) error.ExceededMemoryBudget else e;
+    const owned = answer_bytes +| names_bytes;
+    if (owned > s.output_credit) return error.ExceededMemoryBudget;
+    // This small answer remains drawn until the query ledger dies, as with the other aggregate answers.
+    if (args.ledger != null) s.charged -= owned;
+    var bytes_in: u64 = 0;
+    for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
+    return .{
+        .files_in = args.inputs.len,
+        .rows_in = @intCast(rows),
+        .rows_scanned = @intCast(rows),
+        .rows_matched = @intCast(rows),
+        .bytes_in = bytes_in,
+        .row_groups_in = work.len,
+        .row_groups_pruned = 0,
+        .row_groups_full_match = work.len,
+        .cols_stat_pruned = plan.cols_stat_pruned,
+        .timings = t,
+        .output = output,
+        .part_agg = true,
+        .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
+    };
+}
+
+fn buildByteTopRows(
+    gpa: std.mem.Allocator,
+    output: *AggOutput,
+    groups: []const byte_topk.Group,
+    outputs: []const BoundOutputColumn,
+) !usize {
+    const rows = try gpa.alloc([]const AggValue, groups.len);
+    @memset(rows, &.{});
+    output.group_rows = rows;
+    const slab = try gpa.alloc(AggValue, groups.len * outputs.len);
+    @memset(slab, .null_val);
+    output.slab = slab;
+    var owned = groups.len * (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue));
+    for (groups, rows, 0..) |g, *row, i| {
+        const cells = slab[i * outputs.len ..][0..outputs.len];
+        row.* = cells;
+        for (outputs, cells) |out, *cell| cell.* = switch (out.source) {
+            .key => key: {
+                var storage: [16]u8 = undefined;
+                const bytes = g.keyBytes(&storage) orelse break :key .null_val;
+                const copy = try gpa.dupe(u8, bytes);
+                owned += bytes.len;
+                break :key .{ .s = copy };
+            },
+            .agg => if (g.sumValue()) |v| .{ .i = v } else .null_val,
         };
     }
     return owned;
@@ -13295,7 +13518,8 @@ test "inline records decline released remote windows and retry only through a re
             }
         }
     };
-    for ([_]usize{ 0, 4, 8 }) |requested| for ([_]bool{ false, true }) |mapped| for ([_]bool{ false, true }) |bytes_key| {
+    for ([_]usize{ 0, 4, 8 }) |requested| for ([_]bool{ false, true }) |mapped| for (0..3) |shape| {
+        const bytes_key = shape != 0;
         const parallel_retry = requested == 4;
         var budget: core_memory.SharedBudget = .{ .limit = 512 << 20 };
         // The established answer retains its small materialization charge until the query ledger dies.
@@ -13314,20 +13538,29 @@ test "inline records decline released remote windows and retry only through a re
             .gate = .{ .ctx = &window, .wait = Window.wait, .done = Window.release },
             .plan_bytes = if (mapped) captured.bytes.items else null,
         }};
-        var got = try runMultiAggregate(gpa, a, .{
+        const args: MultiAggArgs = .{
             .inputs = &in,
             .metas = &.{meta},
-            .aggregate = "count(*) AS c,sum(n) AS s",
+            .aggregate = if (shape == 2) "sum(n) AS s" else "count(*) AS c,sum(n) AS s",
             .group_by = if (bytes_key) "k" else "n",
+            .result_order = if (shape == 2)
+                .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2 }
+            else .{},
             .parallelism = if (mapped and !bytes_key) requested else 1,
-            .typed_answer = true,
+            .typed_answer = shape != 2,
             .integer_records_min_rows = 0,
             .byte_records = true,
             .byte_records_min_rows = 0,
             .max_memory = budget.limit,
             .ledger = &budget,
             .min_bytes_per_worker = if (parallel_retry) 1 else std.math.maxInt(usize),
-        });
+        };
+        if (shape == 2) {
+            const path = (try explainAggregate(gpa, a, args)).record_path;
+            if (mapped) try testing.expectEqual(.byte_sum_top_h, path.?.layout) else
+                try testing.expect(path == null);
+        }
+        var got = try runMultiAggregate(gpa, a, args);
         defer got.deinit(gpa);
         try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.waits);
         try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.done);
@@ -13337,6 +13570,14 @@ test "inline records decline released remote windows and retry only through a re
             const stream = got.output.integer_stream.?;
             try testing.expectEqual(@as(usize, 1), stream.state.locals.len);
             try testing.expectEqual(@as(usize, 1), stream.state.group_count);
+        } else if (shape == 2) {
+            try got.output.applyResultOrder(gpa, args.result_order);
+            const rows = got.output.group_rows.?;
+            try testing.expectEqual(@as(usize, 2), rows.len);
+            try testing.expectEqualStrings("a", rows[0][0].s);
+            try testing.expectEqual(@as(i128, n - 1), rows[0][1].i);
+            try testing.expectEqualStrings(strings[n - 1], rows[1][0].s);
+            try testing.expectEqual(@as(i128, 1), rows[1][1].i);
         } else {
             try testing.expect(got.output.integer_stream == null);
             try testing.expectEqual(@as(usize, if (bytes_key) 2 else 1), got.output.typed.?.rows);
@@ -16460,6 +16701,187 @@ test "worker refusal races replay an earlier corrupt row group in either complet
     };
 }
 
+fn byteTopRowsTrial(a: std.mem.Allocator) !void {
+    var output: AggOutput = .{};
+    defer output.deinit(a);
+    const groups = [_]byte_topk.Group{
+        .{ .key = (@as(u128, 'a') << 120) | 2, .sum = @as(i128, std.math.maxInt(i64)) * 2, .first = 0, .flags = 1 },
+        .{ .key = 0, .sum = -7, .first = 1, .flags = 1 },
+        .{ .key = 255, .first = 2 },
+    };
+    const outputs = [_]BoundOutputColumn{
+        .{ .name = "s", .source = .{ .agg = 0 } },
+        .{ .name = "k", .source = .{ .key = 0 } },
+    };
+    const owned = try buildByteTopRows(a, &output, &groups, &outputs);
+    try testing.expect(owned > 2);
+    try testing.expectEqual(groups[0].sum, output.group_rows.?[0][0].i);
+    try testing.expectEqualStrings("a\x00", output.group_rows.?[0][1].s);
+    try testing.expectEqualStrings("", output.group_rows.?[1][1].s);
+    try testing.expect(output.group_rows.?[2][0] == .null_val and output.group_rows.?[2][1] == .null_val);
+}
+
+test "packed byte SUM answer owns its keys across partial allocation failures" {
+    try byteTopRowsTrial(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, byteTopRowsTrial, .{});
+}
+
+test "packed byte SUM selection matches the established rows across ties, offsets, windows and workers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 4000;
+    const keys = try a.alloc([]const u8, n);
+    const defs = try a.alloc(u32, n);
+    const values = try a.alloc(i64, n);
+    const vdefs = try a.alloc(u32, n);
+    var dictionary: [103][]const u8 = undefined;
+    for (&dictionary, 0..) |*key, i| key.* = switch (i) {
+        0 => "ignored",
+        1 => "",
+        2 => "\x00",
+        3 => "a\x00",
+        4 => "0123456789abcde",
+        else => try std.fmt.allocPrint(a, "key-{d:0>6}", .{i}),
+    };
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        a: std.mem.Allocator,
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            try c.bytes.appendSlice(c.a, bytes);
+        }
+    };
+    for (0..3) |shape| {
+        for (keys, defs, values, vdefs, 0..) |*key, *def, *v, *vd, i| {
+            const g = (i * 37) % dictionary.len;
+            key.* = dictionary[g];
+            def.* = @intFromBool(g != 0);
+            vd.* = @intFromBool(g != 6 and i % 19 != 0);
+            v.* = switch (shape) {
+                0 => @as(i64, @intCast((i * 31) % 101)) - 50,
+                1 => 1,
+                else => if (i % 2 == 0) std.math.maxInt(i64) else -1234567,
+            };
+        }
+        const columns = [_]expr_agg.OutputCol{
+            .{
+                .name = "k",
+                .col = .{ .string = .{ .values = keys, .def_levels = defs, .max_def = 1 } },
+                .parquet_type = .BYTE_ARRAY,
+                .nullable = true,
+            },
+            .{
+                .name = "v",
+                .col = .{ .i64 = .{ .values = values, .def_levels = vdefs, .max_def = 1 } },
+                .parquet_type = .INT64,
+                .nullable = true,
+            },
+        };
+        var capture: Capture = .{ .a = a };
+        _ = try consumer.writeAggregateRows(
+            a,
+            .{ .ctx = &capture, .write_fn = Capture.write },
+            &columns,
+            n,
+            .SNAPPY,
+            .{},
+            .{},
+        );
+        var meta = try metadata.open(a, capture.bytes.items);
+        const groups = try a.alloc(schema.RowGroup, 16);
+        @memset(groups, meta.row_groups.items[0]);
+        meta.row_groups.items = groups;
+        meta.num_rows *= 16;
+        const inputs = [_]Input{.{ .name = "packed-keys.parquet", .bytes = capture.bytes.items }};
+        const base: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = &.{meta},
+            .aggregate = "sum(v) AS s",
+            .group_by = "k",
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .max_memory = 512 << 20,
+            .integer_records = false,
+            .msd_records = false,
+            .result_order = .{
+                .keys = &.{.{ .column = 1, .descending = true }},
+                .limit = 7,
+                .offset = 3,
+            },
+        };
+        if (shape == 0) for ([_]usize{ 1, 16 }) |j| for ([_]u64{ 0, 7 }) |offset| {
+            var args = base;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.parallelism = j;
+            args.byte_records = true;
+            args.byte_records_min_rows = 0;
+            args.taken = &taken;
+            args.result_order.limit = 0;
+            args.result_order.offset = offset;
+            const explanation = try explainAggregate(gpa, a, args);
+            try testing.expect(explanation.record_path == null);
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(!taken.contains(.integer_records));
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqual(@as(usize, 0), got.output.group_rows.?.len);
+        };
+        for ([_]bool{ false, true }) |descending| {
+            var ordinary = base;
+            ordinary.result_order.keys = &.{.{ .column = 1, .descending = descending }};
+            var want = try runMultiAggregate(gpa, a, ordinary);
+            defer want.deinit(gpa);
+            try want.output.applyResultOrder(gpa, ordinary.result_order);
+            for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]bool{ false, true }) |encoded|
+                for ([_]usize{ 0, 64 }) |batch_rows| {
+                    var budget: core_memory.SharedBudget = .{ .limit = base.max_memory };
+                    var taken: std.EnumSet(FastPath) = .{};
+                    var args = ordinary;
+                    args.parallelism = j;
+                    args.encoded = encoded;
+                    args.byte_records = true;
+                    args.byte_records_min_rows = 0;
+                    args.byte_top_partitions = 256;
+                    args.byte_top_batch_rows = batch_rows;
+                    args.unordered = j > 1;
+                    args.ledger = &budget;
+                    args.taken = &taken;
+                    const explanation = try explainAggregate(gpa, a, args);
+                    try testing.expectEqual(.byte_sum_top_h, explanation.record_path.?.layout);
+                    var got = try prepareAggregate(gpa, a, args, false);
+                    defer got.deinit(gpa);
+                    try testing.expect(taken.contains(.integer_records));
+                    try got.output.applyResultOrder(gpa, args.result_order);
+                    try testing.expectEqualDeep(want.output.group_cols.?, got.output.group_cols.?);
+                    try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+                    try testing.expect(budget.used.load(.monotonic) < 8192);
+                };
+        }
+        if (shape == 0) {
+            const corrupt = try a.dupe(u8, capture.bytes.items);
+            for (meta.row_groups.items[0].columns.items) |column| {
+                const cm = column.meta_data.?;
+                const offset: usize = @intCast(cm.data_page_offset);
+                var reader = thrift_mod.Reader.init(corrupt[offset..]);
+                const header = try schema.PageHeader.read(&reader);
+                const body = offset + reader.pos;
+                @memset(corrupt[body..][0..@min(12, @as(usize, @intCast(header.compressed_page_size)))], 0xff);
+            }
+            const bad_inputs = [_]Input{.{ .name = "packed-errors.parquet", .bytes = corrupt }};
+            var bad = base;
+            bad.inputs = &bad_inputs;
+            bad.byte_records = true;
+            bad.byte_records_min_rows = 0;
+            try checkRecordDecodeModes(gpa, a, bad, .integer_records, 0);
+            bad.column_order = "s,k";
+            bad.result_order.keys = &.{.{ .column = 0, .descending = true }};
+            try checkRecordDecodeModes(gpa, a, bad, .integer_records, 1);
+        }
+    }
+}
+
 test "retained MSD composite count matches ordered rows across workers, encodings and budgets" {
     try testing.expect(!consumer.isDecodeError(error.RetainedOwnershipViolation));
     const gpa = testing.allocator;
@@ -16799,7 +17221,9 @@ fn checkRecordDecodeModes(
     var expected_page: ?u32 = null;
     for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64, 256 }) |window| for (std.enums.values(Mode)) |mode| {
         const replay = mode == .replay or mode == .mixed_replay;
-        var budget: core_memory.SharedBudget = .{ .limit = if (mode == .declined) 96 << 20 else 1 << 30 };
+        var budget: core_memory.SharedBudget = .{ .limit = if (mode == .declined)
+            (if (base.byte_records) @as(usize, 4 << 20) else 96 << 20)
+        else 1 << 30 };
         var args = base;
         args.parallelism = j;
         args.decode_batch_rows = window;
@@ -16807,7 +17231,7 @@ fn checkRecordDecodeModes(
         args.ledger = &budget;
         args.integer_records = mode != .general and path == .integer_records;
         args.msd_records = mode != .general and path == .msd_records;
-        args.byte_records = false;
+        args.byte_records = mode != .general and base.byte_records;
         args.integer_records_min_rows = 0;
         args.msd_records_min_rows = 0;
         var reader: Reader = .{ .mixed = mode == .mixed_replay };
@@ -17463,4 +17887,91 @@ test "dependent group keys: nullable multi-key trees and canonical float blocks 
         // Derived arithmetic is INT64, even when the retained base is INT32.
         try testing.expect(typed.state.group_col_types.?[1].source == null);
     }
+}
+
+
+test "packed byte SUM declines reconstructed outputs before admission" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const value: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]expr_agg.AggCall{.{ .func = .sum, .arg = value, .where = null, .alias = "s", .result = .i64 }};
+    var outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" },
+        .{ .source = .{ .agg = 0 }, .name = "s" },
+    };
+    const args: MultiAggArgs = .{
+        .inputs = &.{},
+        .aggregate = "sum(v) AS s",
+        .byte_records = true,
+        .byte_records_min_rows = 0,
+        .max_memory = 512 << 20,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    const plan = try agg_plan.Plan.init(a, .{ .filter = null, .calls = &.{}, .group_keys = null }, &.{}, .ignore);
+    // Keep the other admission conditions satisfied: a multi-key SQL fixture alone could mask a missing guard.
+    const admitted = try inlineByteTopAnswer(testing.allocator, a, args, &.{}, &plan, &.{}, &calls, &.{key}, &outputs, 1, .{}, true);
+    try testing.expect(admitted != null);
+    for (&outputs) |*out| {
+        out.derived = key;
+        const refused = try inlineByteTopAnswer(testing.allocator, a, args, &.{}, &plan, &.{}, &calls, &.{key}, &outputs, 1, .{}, true);
+        try testing.expect(refused == null);
+        out.derived = null;
+    }
+}
+
+test "packed byte SUM with a dependent integer output uses general grouping" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const streaming = @import("writer/streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    const k = [_][]const u8{ "b", "a", "b", "a", "", "b" };
+    const f = [_]i32{ 1, -2, 1, -2, 0, 3 };
+    const v = [_]i64{ 3, 5, -1, 5, 10, 10 };
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = false, .col = .{ .string = .{ .values = &k } } },
+        .{ .name = "f", .parquet_type = .INT32, .nullable = false, .col = .{ .i32 = .{ .values = &f } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &v } } },
+    };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 16;
+    const inputs = [_]Input{.{ .name = "dependent-string.parquet", .bytes = sink.buffer.items }};
+    const base: MultiAggArgs = .{
+        .inputs = &inputs,
+        .metas = &.{meta},
+        .aggregate = "sum(v) AS s",
+        .group_by = "k, f, f-1 AS fm",
+        .dependent_keys = false,
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .scan_all = true,
+        .result_order = .{ .keys = &.{.{ .column = 3, .descending = true }}, .limit = 3 },
+    };
+    var want = try runMultiAggregate(testing.allocator, a, base);
+    defer want.deinit(testing.allocator);
+    try want.output.applyResultOrder(testing.allocator, base.result_order);
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 64 << 10, 512 << 20 }) |limit| {
+        var taken: std.EnumSet(FastPath) = .{};
+        var trial = base;
+        trial.dependent_keys = true;
+        trial.byte_records = true;
+        trial.byte_records_min_rows = 0;
+        trial.parallelism = j;
+        trial.max_memory = limit;
+        trial.taken = &taken;
+        const explanation = try explainAggregate(testing.allocator, a, trial);
+        try testing.expect(explanation.record_path == null);
+        var got = try runMultiAggregate(testing.allocator, a, trial);
+        defer got.deinit(testing.allocator);
+        try got.output.applyResultOrder(testing.allocator, trial.result_order);
+        try testing.expect(!taken.contains(.integer_records));
+        try testing.expectEqualDeep(want.output.group_cols.?, got.output.group_cols.?);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+    };
 }

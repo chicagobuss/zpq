@@ -22,6 +22,7 @@
 const std = @import("std");
 const integer_groups = @import("integer_groups.zig");
 const byte_groups = @import("byte_groups.zig");
+const byte_topk = @import("byte_topk.zig");
 const msd_groups = @import("msd_groups.zig");
 const retained_pages = @import("retained_pages.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
@@ -3014,6 +3015,7 @@ pub const AggRowGroup = struct {
 pub const RecordSink = union(enum) {
     integer: *integer_groups.Local,
     bytes: *byte_groups.Local,
+    byte_top: *byte_topk.Local,
     msd: *msd_groups.Local,
 
     pub fn start(s: RecordSink, ordinal_base: u32, item: usize) void {

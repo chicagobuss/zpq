@@ -702,6 +702,14 @@ fn executeAggregateOver(
         else
             null,
         .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
+        .byte_top_partitions = if (ctx.env.getPosix("ZPQ_BYTE_TOP_PARTITIONS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
+        .byte_top_batch_rows = if (ctx.env.getPosix("ZPQ_BYTE_TOP_BATCH_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
         .column_order = args.column_order,
         .max_memory = args.max_memory,
         .ledger = &ledger,

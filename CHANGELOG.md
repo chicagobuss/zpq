@@ -21,6 +21,11 @@ admission; retained allocation failures decline, and later decoder or encoding r
 `--unordered` also admits the exact integer and short-string inline aggregation paths. Relaxing GROUP BY order
 no longer disables these paths; they retain their deterministic first-appearance output and top-k tie breaks.
 
+Unfiltered SUM top-k queries over short byte-string keys can pack each verified key and its length into one
+integer identity. Complete owner partitions retain bounded candidate heaps, avoiding an all-group merge and
+copying key bytes only for the final answer. Exact signed sums, NULLs and first-appearance ties are preserved;
+cache-sized execution windows and partitions do not affect output bytes.
+
 ### What to do
 
 1. **Scripts that parse `zpq query` output must change.** Every query now prints its answer as NDJSON rows on stdout,

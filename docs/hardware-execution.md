@@ -38,6 +38,8 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` keeps legacy expansion |
 | `ZPQ_INTEGER_RECORDS` | Eligible integer inline aggregation; `0` selects the established executor |
 | `ZPQ_BYTE_RECORDS` | Eligible short-key inline aggregation; `0` selects the established executor |
+| `ZPQ_BYTE_TOP_PARTITIONS` | Short-key SUM top-H partitions; unset uses the shared cache budget, `0` keeps 2048, positive values force a power of two in 64–16384 |
+| `ZPQ_BYTE_TOP_BATCH_ROWS` | Short-key SUM top-H decode rows; unset uses shared cache headroom, `0` keeps ordinary decode admission, positive values force a power of two in 64–16384 |
 | `ZPQ_MSD_RECORDS` | Eligible retained-page COUNT top-k; `0` selects the established executor |
 | `ZPQ_MSD_CACHE_ROWS` | Retained-group scratch rows; unset uses shared L2, `0` keeps 4096, positive values force a bounded power of two |
 

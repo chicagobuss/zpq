@@ -4,6 +4,8 @@ These diagnostic environment variables preserve query semantics. Admission still
 ownership and memory budget; forcing a layout never bypasses those checks. Leave them unset in ordinary use.
 
 The shared [hardware execution catalog](hardware-execution.md) lists all execution and hardware overrides.
+The [packed byte-key SUM path](byte_topk.md) sizes both owner partitions and producer windows from the shared
+per-worker L2 budget. Its independent partition/window overrides are listed in that catalog as well.
 Eligible inline paths are enabled by default. For retained grouping, an unset scratch override uses the per-worker
 L2 budget; zero selects the legacy 4096-record window. A positive override rounds down to a power of two after
 clamping to 16–16384 records.

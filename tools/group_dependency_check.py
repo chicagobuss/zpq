@@ -64,6 +64,8 @@ def main():
             "SELECT flag,flag-1,count(*) AS c FROM '{p}' GROUP BY flag,flag-1",
             "SELECT w,w*0,count(*) AS c FROM '{p}' GROUP BY w,w*0",
         ]
+        queries.append("SELECT s,k-1 AS km,sum(w) AS total FROM '{p}' "
+                       "GROUP BY s,k,k-1 ORDER BY total DESC LIMIT 10")
         faults = [
             "SELECT w,w-1,count(*) AS c FROM '{p}' GROUP BY w,w-1 ORDER BY c DESC LIMIT 1",
             "SELECT w,w*2,k,k-1,count(*) AS c FROM '{p}' GROUP BY w,w*2,k,k-1 LIMIT 1",

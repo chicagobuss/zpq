@@ -15,6 +15,8 @@ Unfiltered top-count queries grouped by a byte-string column and a signed INT32 
 grouping over prepaid retained decoder pages. Bounded top-k selection preserves NULL values, full key bytes,
 first-appearance ties and deterministic output across worker counts and memory budgets. Unsupported encodings or
 insufficient reserved capacity retain the existing aggregation path.
+Common prefixes are derived from decoded keys and verified over all non-NULL values. Output keys are funded at
+admission; retained allocation failures decline, and later decoder or encoding refusals retry the established path.
 
 `--unordered` also admits the exact integer and short-string inline aggregation paths. Relaxing GROUP BY order
 no longer disables these paths; they retain their deterministic first-appearance output and top-k tie breaks.

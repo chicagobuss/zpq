@@ -206,6 +206,8 @@ can be read. Give it as bytes, or as a number (fractions allowed) followed by `K
 `B`, in any case, all powers of 1024: `--max-memory 2GB`, `--max-memory 1.5g`, `--max-memory 1073741824`. A space,
 an exponent (`1e9`) or a `MiB` spelling is refused (exit 2).
 
+Diagnostic path and cache layout overrides are documented in [execution overrides](docs/execution_knobs.md).
+
 Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
 It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports the strategy, reasons, column passes,
 conditional fallbacks and NDV upper bounds without reading data pages. Local planning can read dictionary headers and,

@@ -9,12 +9,45 @@ const now = @import("../clock.zig").monoNs;
 const parts = 4096;
 const block_rows = 16;
 const block_claim = 64;
-const cache_rows = 4096;
+const legacy_cache_rows = 4096;
 const none = std.math.maxInt(u32);
 const ordinal_mask: u32 = (1 << 30) - 1;
 const key_null: u32 = 1 << 31;
 const f_null: u32 = 1 << 30;
-const prefix = "https://example.org/";
+const fold_stack_size = 4 << 20;
+pub const output_floor = 64 << 20;
+
+/// Integration seam for the shared hardware module: today's 1.25 MiB L2, shared by two workers.
+/// No topology detection belongs here. The caller supplying the budget must account for cache sharing.
+fn l2BytesPerWorker() usize {
+    return (1280 << 10) / 2;
+}
+
+fn cacheRowsForBudget(bytes: usize) usize {
+    // Keep local metadata and one radix frame hot, then leave half the remainder for input and nested frames.
+    const overhead = @sizeOf(Local) + 3 * 2048 * @sizeOf(usize);
+    const rows = std.math.clamp((bytes -| overhead) / (4 * @sizeOf(Record)), 16, 16384);
+    return @as(usize, 1) << @intCast(std.math.log2_int(usize, rows));
+}
+
+/// Zero forces the legacy window; positive overrides force a bounded power-of-two window on every host.
+pub fn cacheRows(forced: ?usize) usize {
+    if (forced) |rows| {
+        if (rows == 0) return legacy_cache_rows;
+        return @as(usize, 1) << @intCast(std.math.log2_int(usize, std.math.clamp(rows, 16, 16384)));
+    }
+    return cacheRowsForBudget(l2BytesPerWorker());
+}
+
+/// Both views belong to retained owners. A local prefix is shortened against every non-NULL key, then the
+/// completed locals are intersected before refinement starts. No footer value establishes skipped bytes.
+fn commonPrefix(a: []const u8, b: []const u8) []const u8 {
+    const n = @min(a.len, b.len);
+    if (a.ptr == b.ptr or std.mem.eql(u8, a[0..n], b[0..n])) return a[0..n];
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return a[0..i];
+}
 
 pub const Record = extern struct {
     word: u64 align(4),
@@ -110,12 +143,13 @@ pub const Local = struct {
     radix_rows: u64 = 0,
     moves: u64 = 0,
     pruned: u64 = 0,
+    common: ?[]const u8 = null,
 
     pub fn start(l: *Local, ordinal_base: u32, item: usize) void {
         l.ordinal_base = ordinal_base;
         l.owner = &l.state.pages.chunks[item];
     }
-    fn append(l: *Local, r: Record) void {
+    fn append(l: *Local, r: Record) !void {
         const fbits: u32 = @bitCast(r.f);
         const p = ((fbits & 1023) * 4 + ((r.len >> 6) & 3)) ^
             (if (r.ordinal & f_null != 0) @as(u32, 4095) else 0);
@@ -124,7 +158,7 @@ pub const Local = struct {
         if (tail == none or l.state.blocks[tail].len == block_rows) {
             if (l.free_next == l.free_end) {
                 const at = l.state.block_cursor.fetchAdd(block_claim, .monotonic);
-                std.debug.assert(at < l.state.blocks.len);
+                if (at >= l.state.blocks.len) return error.ExceededMemoryBudget;
                 l.free_next = at;
                 l.free_end = @intCast(@min(l.state.blocks.len, @as(usize, at) + block_claim));
             }
@@ -144,7 +178,6 @@ pub const Local = struct {
     pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
         const k = view.cols[lookup[l.state.key_col].?].string;
         const f = view.cols[lookup[l.state.f_col].?];
-        var bad = false;
         for (0..view.num_rows) |i| {
             const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
             const key: []const u8 = if (kn) "" else if (k.codes) |codes| k.dict[codes[i]] else k.values[i];
@@ -154,12 +187,11 @@ pub const Local = struct {
                 .i32 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def) null else if (c.codes) |codes| c.dict[codes[i]] else c.values[i],
                 else => return error.UnexpectedPage,
             };
-            if (!kn and (key.len < prefix.len or !std.mem.eql(u8, key[0..prefix.len], prefix))) bad = true;
+            if (!kn) l.common = if (l.common) |p| commonPrefix(p, key) else key;
             const r: Record = .{ .word = cached(key, key.len -| 8), .ptr = if (key.len == 0) 0 else @intFromPtr(key.ptr), .ordinal = (l.ordinal_base + @as(u32, @intCast(offset + i))) |
                 (if (kn) key_null else 0) | (if (fv == null) f_null else 0), .len = @intCast(key.len), .f = fv orelse 0 };
-            l.append(r);
+            try l.append(r);
         }
-        if (bad) l.state.prefix_bad.store(true, .monotonic);
     }
     fn keep(l: *Local, comptime V: type, v: V) void {
         var first = v.at(0).*;
@@ -187,7 +219,7 @@ pub const Local = struct {
                 l.pruned += v.len();
                 return;
             }
-            if (V == Run) if (v.len() <= cache_rows) {
+            if (V == Run) if (v.len() <= l.a.len) {
                 for (0..v.len()) |i| l.a[i] = v.at(i).*;
                 l.refine(Cache, .{ .records = l.a[0..v.len()] }, l.b[0..v.len()], phase, position);
                 return;
@@ -208,7 +240,7 @@ pub const Local = struct {
                     },
                     .key => {
                         const len = v.at(0).len;
-                        const head: usize = if (l.state.prefix_bad.load(.monotonic)) 0 else prefix.len;
+                        const head = l.state.prefix_len;
                         const covered = head + position * 8;
                         if (covered >= len -| 8) {
                             l.keep(V, v);
@@ -354,35 +386,46 @@ pub const State = struct {
     initialized: usize = 0,
     block_cursor: std.atomic.Value(u32) = .init(0),
     cursor: std.atomic.Value(usize) = .init(0),
-    prefix_bad: std.atomic.Value(bool) = .init(false),
+    prefix_len: usize = 0,
     threshold: std.atomic.Value(u32) = .init(0),
     counts: [parts]usize = @splat(0),
     starts: [parts + 1]usize = @splat(0),
     fold_ns: u64 = 0,
     decode_budget: memory.SharedBudget = .{ .limit = 0 },
+    output_credit: usize = output_floor,
+    phase_credit: usize = 0,
 
     fn blockCapacity(rows: usize, workers: usize) usize {
         return (rows + block_rows - 1) / block_rows + workers * (parts + block_claim - 1);
     }
-    pub fn reservation(rows: usize, workers: usize, k: usize, retained_bytes: usize, items: usize) usize {
+    pub fn reservation(rows: usize, workers: usize, k: usize, retained_bytes: usize, items: usize, cache_count: usize) usize {
         return retained_bytes +| items *| @sizeOf(retained.Chunk) +|
             blockCapacity(rows, workers) *| (@sizeOf(Block) + @sizeOf(u32)) +|
-            workers *| (@sizeOf(Local) + 2 * cache_rows * @sizeOf(Record) + 2 * k * @sizeOf(Group)) +| @sizeOf(State) +| (64 << 20);
+            workers *| (@sizeOf(Local) + 2 * cache_count * @sizeOf(Record) + 2 * k * @sizeOf(Group) + fold_stack_size) +| @sizeOf(State) +| output_floor;
+    }
+    /// Decoder workspace is dead before output keys are copied. Fund their maximum, rather than adding peaks
+    /// that cannot coexist. The fixed output floor is already included by reservation().
+    pub fn phaseFunding(working: usize, output_credit: usize) usize {
+        return @max(working, output_credit -| output_floor);
     }
     pub fn init(a: std.mem.Allocator, ledger: ?*memory.SharedBudget, rows: usize, workers: usize, key_col: usize, f_col: usize, k: usize, capacities: []const usize) !?*State {
-        return initPrepaid(a, ledger, rows, workers, key_col, f_col, k, capacities, 0);
+        return initPrepaid(a, ledger, rows, workers, key_col, f_col, k, capacities, 0, output_floor, cacheRows(null));
     }
-    pub fn initPrepaid(a: std.mem.Allocator, ledger: ?*memory.SharedBudget, rows: usize, workers: usize, key_col: usize, f_col: usize, k: usize, capacities: []const usize, working: usize) !?*State {
-        if (rows >= 1 << 30 or workers == 0 or workers > 64 or k == 0 or k > 1024) return null;
+    pub fn initPrepaid(a: std.mem.Allocator, ledger: ?*memory.SharedBudget, rows: usize, workers: usize, key_col: usize, f_col: usize, k: usize, capacities: []const usize, working: usize, output_credit: usize, cache_count: usize) !?*State {
+        return initAllocated(a, ledger, rows, workers, key_col, f_col, k, capacities, working, output_credit, cache_count) catch null;
+    }
+    fn initAllocated(a: std.mem.Allocator, ledger: ?*memory.SharedBudget, rows: usize, workers: usize, key_col: usize, f_col: usize, k: usize, capacities: []const usize, working: usize, output_credit: usize, cache_count: usize) !?*State {
+        if (rows >= 1 << 30 or workers == 0 or workers > 64 or k == 0 or k > 1024 or cache_count < 16 or cache_count > 16384) return null;
         var raw: usize = 0;
         for (capacities) |cap| raw +|= cap;
-        const charged = reservation(rows, workers, k, raw, capacities.len) +| working;
+        const phase_credit = phaseFunding(working, output_credit);
+        const charged = reservation(rows, workers, k, raw, capacities.len, cache_count) +| phase_credit;
         if (ledger) |l| _ = l.drawExact(charged) orelse return null;
         const s = a.create(State) catch |e| {
             if (ledger) |l| l.release(charged);
             return e;
         };
-        s.* = .{ .gpa = a, .ledger = ledger, .charged = charged, .rows = rows, .key_col = key_col, .f_col = f_col, .k = k, .decode_budget = .{ .limit = working } };
+        s.* = .{ .gpa = a, .ledger = ledger, .charged = charged, .rows = rows, .key_col = key_col, .f_col = f_col, .k = k, .decode_budget = .{ .limit = working }, .output_credit = @max(output_floor, output_credit), .phase_credit = phase_credit };
         errdefer s.deinit();
         s.pages = try retained.Store.init(a, capacities);
         const cap = blockCapacity(rows, workers);
@@ -394,10 +437,18 @@ pub const State = struct {
             l.* = .{ .state = s };
             s.initialized += 1;
             try l.heap.ensureTotalCapacity(a, k);
-            l.a = try a.alloc(Record, cache_rows);
-            l.b = try a.alloc(Record, cache_rows);
+            l.a = try a.alloc(Record, cache_count);
+            l.b = try a.alloc(Record, cache_count);
         }
         return s;
+    }
+    pub fn releaseDecode(s: *State) void {
+        std.debug.assert(s.decode_budget.used.load(.monotonic) == 0);
+        const keep = s.output_credit - output_floor;
+        const released = s.phase_credit - keep;
+        if (s.ledger) |ledger| ledger.release(released);
+        s.charged -= released;
+        s.phase_credit = keep;
     }
     pub fn deinit(s: *State) void {
         const a = s.gpa;
@@ -427,7 +478,12 @@ pub const State = struct {
         }
         s.starts[parts] = at;
         if (rows != s.rows) return error.ShortDecode;
-        if (!spawn.runTree(Local, s.locals, .{ .stack_size = 2 << 20 }, Local.run)) Local.run(&s.locals[0]);
+        var common: ?[]const u8 = null;
+        for (s.locals) |l| if (l.common) |p| {
+            common = if (common) |previous| commonPrefix(previous, p) else p;
+        };
+        s.prefix_len = if (common) |p| p.len else 0;
+        if (!spawn.runTree(Local, s.locals, .{ .stack_size = fold_stack_size }, Local.run)) Local.run(&s.locals[0]);
         const h = &s.locals[0].heap;
         for (s.locals[1..]) |l| for (l.heap.items) |g| {
             if (h.count() == s.k) {
@@ -449,7 +505,7 @@ pub const State = struct {
 fn allocationTrial(a: std.mem.Allocator) !void {
     var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
     defer std.debug.assert(budget.used.load(.monotonic) == 0);
-    const s = (try State.init(a, &budget, 0, 2, 0, 1, 10, &.{ 256, 256 })).?;
+    const s = (try State.init(a, &budget, 0, 2, 0, 1, 10, &.{ 256, 256 })) orelse return error.OutOfMemory;
     defer s.deinit();
     try std.testing.expectEqual(@as(usize, 0), (try s.finish()).len);
 }
@@ -461,7 +517,7 @@ test "cached composite groups release every partially initialized owner" {
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
-fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize) !void {
+fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize, cache_count: usize) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temp = arena.allocator();
@@ -472,7 +528,7 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
         const len = if (mode == 0 and g == 1) 0 else if (mode == 0) (g * 37) % 400 else 80;
         const b = try temp.alloc(u8, len);
         for (b, 0..) |*v, i| v.* = @truncate(g * 73 + i * 13);
-        if (len >= prefix.len) @memcpy(b[0..prefix.len], prefix);
+        if (len >= 24) @memset(b[0..24], 0xab);
         if (len >= 8) std.mem.writeInt(u64, b[len - 8 ..][0..8], g, .little);
         key.* = b;
     }
@@ -483,7 +539,7 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
     var payload: usize = 0;
     for (key_bytes) |k| payload += k.len;
     @memset(&capacities, payload);
-    const s = (try State.init(a, &budget, n, jobs, 0, 1, 10, &capacities)).?;
+    const s = (try State.initPrepaid(a, &budget, n, jobs, 0, 1, 10, &capacities, 0, output_floor, cache_count)).?;
     defer s.deinit();
     var expected: std.ArrayList(Group) = .empty;
     defer expected.deinit(a);
@@ -544,6 +600,7 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
     if (fail_after) |f| spawn.injectFailureAfter(f);
     defer spawn.resetFailure();
     const got = try s.finish();
+    try std.testing.expectEqual(@as(usize, if (mode == 0) 0 else if (mode == 1) 80 else 24), s.prefix_len);
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |x, y| {
         try std.testing.expectEqual(x.count, y.count);
@@ -554,5 +611,50 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
 }
 test "cached composite groups are exact across metadata ranges, NULLs, skew, ties and spawn failures" {
     for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for (0..3) |mode| for ([_]?usize{ null, 0, 2 }) |failed|
-        try exactTrial(std.testing.allocator, j, mode, failed);
+        try exactTrial(std.testing.allocator, j, mode, failed, cacheRows(null));
+}
+
+test "retained grouping prepays output copies and declines failed allocation before input" {
+    const a = std.testing.allocator;
+    var budget: memory.SharedBudget = .{ .limit = 512 << 20 };
+    const output = 128 << 20;
+    const s = (try State.initPrepaid(a, &budget, 0, 1, 0, 1, 1000, &.{0}, 160 << 20, output, cacheRows(null))).?;
+    const rest = budget.drawExact(budget.available()).?;
+    s.releaseDecode();
+    try std.testing.expect(s.charged >= output);
+    try std.testing.expectEqual(@as(usize, output), s.output_credit);
+    try std.testing.expectEqual(@as(usize, 64 << 20), s.phase_credit);
+    budget.release(rest);
+    s.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    try std.testing.expect((try State.init(failure.allocator(), &budget, 0, 1, 0, 1, 10, &.{4096})) == null);
+    try std.testing.expect(failure.has_induced_failure);
+    try std.testing.expectEqual(failure.allocated_bytes, failure.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "retained grouping block exhaustion is checked in release builds" {
+    const s = (try State.init(std.testing.allocator, null, 1, 1, 0, 1, 1, &.{0})).?;
+    defer s.deinit();
+    s.block_cursor.store(@intCast(s.blocks.len), .monotonic);
+    try std.testing.expectError(error.ExceededMemoryBudget, s.locals[0].append(.{
+        .word = 0,
+        .ptr = 0,
+        .ordinal = 0,
+        .len = 0,
+        .f = 0,
+    }));
+}
+
+test "retained scratch budgets and forced variants preserve exact groups and first ordinals" {
+    try std.testing.expectEqual(@as(usize, 4096), cacheRowsForBudget(640 << 10));
+    try std.testing.expectEqual(@as(usize, 2048), cacheRowsForBudget(512 << 10));
+    try std.testing.expectEqual(@as(usize, 8192), cacheRowsForBudget(1024 << 10));
+    try std.testing.expectEqual(@as(usize, 4096), cacheRows(0));
+    try std.testing.expectEqual(@as(usize, 16), cacheRows(1));
+    try std.testing.expectEqual(@as(usize, 16384), cacheRows(std.math.maxInt(usize)));
+    for ([_]usize{ 16, 2048, 16384 }) |rows| for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for (0..3) |mode|
+        try exactTrial(std.testing.allocator, j, mode, null, rows);
 }

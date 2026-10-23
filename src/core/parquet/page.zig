@@ -31,6 +31,8 @@ pub const Error = error{
     PageLargerThanChunk,
     /// `PageReader.budget` cannot take a page's inflated size.
     ExceededMemoryBudget,
+    /// A retained-page layout cannot own this encoding. The scan retries its established decoder.
+    RetainedEncodingUnsupported,
 } || compression.Error;
 
 pub const Page = struct {
@@ -195,6 +197,13 @@ pub const PageReader = struct {
             return error.NegativeSize;
         }
         try checkCounts(header);
+        if (self.retained != null) {
+            const encoding = if (header.data_page_header) |h| h.encoding else if (header.data_page_header_v2) |h| h.encoding else null;
+            if (encoding) |enc| switch (enc) {
+                .PLAIN, .RLE_DICTIONARY, .PLAIN_DICTIONARY => {},
+                else => return error.RetainedEncodingUnsupported,
+            };
+        }
         const csize: usize = @intCast(header.compressed_page_size);
         const usize_: usize = @intCast(header.uncompressed_page_size);
 

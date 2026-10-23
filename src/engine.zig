@@ -694,6 +694,10 @@ fn executeAggregateOver(
         .typed_answer = args.typed_answer and args.output != null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
         .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
+        .msd_cache_rows = if (ctx.env.getPosix("ZPQ_MSD_CACHE_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
         .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
         .column_order = args.column_order,
         .max_memory = args.max_memory,

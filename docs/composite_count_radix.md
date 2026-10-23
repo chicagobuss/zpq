@@ -8,7 +8,6 @@ ordinal tie break. Intern IDs, hashes, worker scheduling and partition numbers n
 
 `src/core/msd_groups.zig` owns this kernel. `src/core/retained_pages.zig` owns payload storage. The consumer's record
 sink connects them to ordinary scan workers without widening the ordinary worker's indirect record handle.
-The standalone alternatives and physical-work measurements are in [composite_count_probe.md](composite_count_probe.md).
 
 ## Admission and ownership
 
@@ -18,14 +17,22 @@ Metadata is used only to decline or reserve storage; it never establishes string
 `--unordered` is admitted: the caller permits any group order, and deterministic first-appearance output remains valid.
 
 Before consuming any rows, one reservation covers all retained page capacity, records and buffered tails, block
-indices, worker caches, bounded heaps, fixed output credit and decoder workspace. Payload capacity uses the existing
+indices, worker caches and stacks, bounded heaps, output credit and decoder workspace. Payload capacity uses the existing
 chunk inflation ceiling plus compressed chunk bytes. The capacity is reserved virtually; only actual decoded pages
 are written. First dictionary headers bound decoder workspace. Reader probes are registered before startup and
 awaited before their bytes are inspected. Probe/header failures decline. Reader-backed inputs never use an unstarted
 planning mapping as a substitute for ready bytes.
 
-Decoder workers draw from a child ledger funded by that reservation, with no incremental parent draw during input
-consumption. A refused initial reservation declines. An admitted query does not switch to a second executor midway.
+The output bound funds H copies of the largest retained chunk capacity plus the output row descriptors. A key is
+contained in one such chunk; dictionary entries can win for several secondary keys, so unique payload bytes alone
+are not a sufficient bound. Decoder workspace is dead before surviving keys are copied, and the reservation uses
+the maximum of those phase credits. Output never requests another parent draw after consumption.
+
+Decoder workers draw from a child ledger funded by that reservation. MSD makes no incremental parent draw during
+consumption; reader-window draws remain the established reader's separate behavior. A refused initial reservation
+or failed retained allocation declines before rows are consumed. A decoder-ledger refusal, allocation failure after
+admission, or unsupported retained encoding releases owners, abandons the reader, and retries the established path
+from its original mapping. Admission requires rescannability for this retry; it never reuses released window bytes.
 The ordinary whole-column-to-sliced decode adaptation can rewind its retained cursor only before emitting records.
 It preserves column decode precedence and never rereads a released row group.
 
@@ -45,10 +52,16 @@ or 0–999 restrictions.
 Private 16-record blocks feed 4096 initial f/length buckets. Hashing is unnecessary: every equal pair necessarily
 has the same initial bucket, and different pairs sharing it are separated by full metadata and byte-digit coverage.
 An owner gathers and compacts its bucket's existing blocks. Large buckets partition in place through compact block
-indices. Small buckets use two reusable 4096-record arrays; at 32 records or fewer, insertion on cached words finishes
+indices. Small buckets use two reusable arrays sized from a per-worker cache budget; at 32 records or fewer,
+insertion on cached words finishes
 the next split. Metadata includes length and both NULL distinctions. Tail words are compared first; equal tails
-advance through all remaining head words. A common 20-byte URL prefix is skipped only if every decoded non-NULL
-key verified it. Any mismatch simply selects coverage from byte zero. Footer statistics cannot enable the skip.
+advance through all remaining head words. Each decoder derives a common prefix from its retained keys, shortening
+it against every non-NULL key. After decoding joins, refinement uses the common prefix of those verified local
+prefixes. Its length therefore depends only on the input bytes; NULL keys are excluded and an empty key forces
+zero skipped bytes. The views remain owned by retained pages. Footer statistics never establish skipped bytes.
+
+The cache-budget integration seam and forced variants are described in [execution overrides](execution_knobs.md).
+The temporary budget preserves the legacy 4096-record window until shared hardware discovery is connected.
 
 A complete leaf gives its exact count and minimum input ordinal. Each worker keeps a bounded top-H heap. Its Hth
 exact count is a safe global lower bound: a bucket containing fewer rows cannot contain a winning group. Pruning
@@ -74,5 +87,11 @@ The whole-column decoder reservation excludes retained payload capacity because 
 workspace quote retains a per-worker arena-rounding margin. Counting payloads twice would force interleaved sliced
 decoding and could change which of two corrupt columns fails first. A PLAIN-page regression checks that a late key
 failure still precedes an early secondary-column failure, at all five worker counts, with complete ledger cleanup.
+Across several corrupt row groups the established worker-index error selection remains unchanged; it does not
+provide a global first-input error order across worker counts.
 An unordered admission regression checks the retained MSD path as well as both existing inline record layouts;
 relaxing order preserves path selection, exact values and the ordered candidate's deterministic output.
+Runtime page headers are checked before retained copying, even when footer encoding lists omit an expansion
+encoding. A late unsupported page retries the ordinary decoder instead of reporting the retained capacity as
+input corruption. Regressions cover that replay, a refusal after an earlier row group emitted records, upfront
+output-credit decline, failed retained allocation, and checked block exhaustion in optimized builds.

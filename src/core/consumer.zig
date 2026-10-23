@@ -1305,9 +1305,9 @@ pub const SliceReader = struct {
             if (k != want) return error.ShortDecode;
             if (r.pages.retained) |owner| {
                 for (dst) |*value| if (!owner.contains(value.*)) {
-                    const owned = try owner.take(value.len);
-                    @memcpy(owned, value.*);
-                    value.* = owned;
+                    // Expanded strings have a different capacity bound. Refuse the retained layout rather than
+                    // misreporting its ownership limit as corrupt input; the rescannable scan retries normally.
+                    return error.RetainedEncodingUnsupported;
                 };
             } else _ = try copyBytes(a, dst);
             got += k;

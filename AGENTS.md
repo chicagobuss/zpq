@@ -140,6 +140,12 @@ tool for isolating per-(encoding × type × bit_width) decode cost from glob/mma
 
 ## Code style
 
+- Execution heuristics must not contain dataset-, benchmark-, or value-specific constants. Derive content
+  properties from input and verify them before using them to skip semantic work.
+- Size execution batches and partitions from runtime cache capacity where possible, with forced-path controls
+  for coverage on every host. Hardware choices must preserve output bytes; floating-point reductions retain
+  their canonical summation order. Document fixed-layout exceptions and the remaining adaptation work.
+
 - Line width is **120 columns** for Zig, Python, and shell. Enforced by convention only — `zig fmt` does not wrap lines
   and will not reflow or complain, so it is on you and on review.
 - The 120 limit governs *source*. Human-facing output — `--help` text, error and diagnostic messages — wraps at **80**

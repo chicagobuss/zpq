@@ -86,20 +86,38 @@ pub fn runTree(comptime Ctx: type, ctxs: []Ctx, config: std.Thread.SpawnConfig, 
         fn runOne(arg: *anyopaque) void {
             const g: *@This() = @ptrCast(@alignCast(arg));
             func(&g.ctxs[g.next.fetchAdd(1, .monotonic)]);
+            done(g);
+        }
+        /// A posted job whose thread never started: it claims no context, which stays unrun.
+        fn cancelOne(arg: *anyopaque) void {
+            done(@ptrCast(@alignCast(arg)));
+        }
+        fn done(g: *@This()) void {
             // The last store the region's caller waits on; nothing of `g` is touched after it.
             if (g.pending.fetchSub(1, .acq_rel) == 1) blocking.io.futexWake(u32, &g.pending.raw, 1);
         }
     };
     var group: Group = .{ .ctxs = ctxs };
-    var started: u32 = 0;
-    for (ctxs) |_| {
-        const slot = Pool.acquire() orelse break;
-        // Counted before it is posted: a fast context must not see the count reach zero while others are posted.
-        _ = group.pending.fetchAdd(1, .monotonic);
-        slot.post(Group.runOne, &group);
-        started += 1;
+    // Counted before any job is posted: a fast context must not see the count reach zero while others are posted.
+    _ = group.pending.fetchAdd(@intCast(ctxs.len), .monotonic);
+    var warm: usize = 0;
+    while (warm < ctxs.len) : (warm += 1) {
+        const slot = Pool.takeIdle() orelse break;
+        slot.post(Group.runOne, Group.cancelOne, &group);
     }
-    if (started == 0) return false;
+    // The rest start as a tree of fresh pooled threads, each starting its children before its own job, so a cold
+    // pool (a short-lived process) starts its last thread after a few spawns, as a spawn tree would.
+    var grown = false;
+    var fresh: []*Pool.Slot = &.{};
+    defer std.heap.page_allocator.free(fresh);
+    if (warm < ctxs.len) {
+        if (std.heap.page_allocator.alloc(*Pool.Slot, ctxs.len - warm)) |slots| {
+            fresh = slots;
+            grown = Pool.grow(fresh, Group.runOne, Group.cancelOne, &group);
+        } else |_| for (warm..ctxs.len) |_| Group.cancelOne(&group);
+    }
+    // Not one thread: every job was cancelled, so nothing ran and nothing still refers to `group`.
+    if (warm == 0 and !grown) return false;
     while (true) {
         const left = group.pending.load(.acquire);
         if (left == 0) break;
@@ -125,12 +143,14 @@ pub const Pool = struct {
         thread: std.Thread = undefined,
         state: std.atomic.Value(u32) = .init(idle_state),
         job: *const fn (*anyopaque) void = undefined,
+        cancel: *const fn (*anyopaque) void = undefined,
         arg: *anyopaque = undefined,
         next_idle: ?*Slot = null,
         next_all: ?*Slot = null,
 
-        fn post(s: *Slot, job: *const fn (*anyopaque) void, arg: *anyopaque) void {
+        fn post(s: *Slot, job: *const fn (*anyopaque) void, cancel: *const fn (*anyopaque) void, arg: *anyopaque) void {
             s.job = job;
+            s.cancel = cancel;
             s.arg = arg;
             s.state.store(posted_state, .release);
             blocking.io.futexWake(u32, &s.state.raw, 1);
@@ -158,14 +178,8 @@ pub const Pool = struct {
     var owner_pid: std.posix.pid_t = 0;
     var holders: usize = 0;
 
-    fn acquire() ?*Slot {
-        if (builtin.is_test) if (fail_after) |limit| {
-            // Every thread a region obtains counts as a spawn, reused or not, so injected failures stay exact.
-            if (success_count.fetchAdd(1, .monotonic) >= limit) {
-                _ = injected_count.fetchAdd(1, .monotonic);
-                return null;
-            }
-        };
+    /// A warm idle thread, or null when none is idle.
+    fn takeIdle() ?*Slot {
         lock.lockUncancelable(blocking.io);
         defer lock.unlock(blocking.io);
         const pid = currentPid();
@@ -175,20 +189,75 @@ pub const Pool = struct {
             all = null;
             owner_pid = pid;
         }
-        if (idle) |s| {
-            idle = s.next_idle;
-            s.next_idle = null;
-            return s;
+        const s = idle orelse return null;
+        if (injectedFailure()) return null;
+        idle = s.next_idle;
+        s.next_idle = null;
+        return s;
+    }
+
+    /// Post the job to `fresh.len` new threads started as a binary tree. A thread that cannot be created cancels its
+    /// job and its subtree's. True when the root started (so at least one job runs). `fresh` is the caller's, and
+    /// must outlive the region: the tree's threads read it until each has started its children.
+    fn grow(fresh: []*Slot, job: *const fn (*anyopaque) void, cancel: *const fn (*anyopaque) void, arg: *anyopaque) bool {
+        const n = fresh.len;
+        var made: usize = 0;
+        while (made < n) : (made += 1) {
+            const s = std.heap.page_allocator.create(Slot) catch break;
+            s.* = .{};
+            s.post(job, cancel, arg);
+            fresh[made] = s;
         }
-        const s = std.heap.page_allocator.create(Slot) catch return null;
-        s.* = .{};
-        s.thread = std.Thread.spawn(.{ .stack_size = stack_size }, Slot.main, .{s}) catch {
-            std.heap.page_allocator.destroy(s);
-            return null;
+        for (made..n) |_| cancel(arg);
+        if (made == 0) return false;
+        // Every spawn below finishes before its parent runs its job, so before the region's count reaches zero.
+        return start(fresh[0..made], 0);
+    }
+
+    fn start(fresh: []*Slot, i: usize) bool {
+        const s = fresh[i];
+        if (injectedFailure()) {
+            cancelSubtree(fresh, i);
+            return false;
+        }
+        const t = std.Thread.spawn(.{ .stack_size = stack_size }, boot, .{ fresh, i }) catch {
+            cancelSubtree(fresh, i);
+            return false;
         };
+        lock.lockUncancelable(blocking.io);
+        defer lock.unlock(blocking.io);
+        s.thread = t;
         s.next_all = all;
         all = s;
-        return s;
+        return true;
+    }
+
+    fn boot(fresh: []*Slot, i: usize) void {
+        for ([_]usize{ 2 * i + 1, 2 * i + 2 }) |c| if (c < fresh.len) {
+            _ = start(fresh, c);
+        };
+        Slot.main(fresh[i]);
+    }
+
+    fn cancelSubtree(fresh: []*Slot, i: usize) void {
+        if (i >= fresh.len) return;
+        cancelSubtree(fresh, 2 * i + 1);
+        cancelSubtree(fresh, 2 * i + 2);
+        // This node's cancel may be the region's last count: nothing of `fresh` is read after it.
+        const s = fresh[i];
+        const cancel = s.cancel;
+        const arg = s.arg;
+        std.heap.page_allocator.destroy(s);
+        cancel(arg);
+    }
+
+    /// Test-only: every thread a region obtains counts as a spawn, warm or fresh, so injected failures stay exact.
+    fn injectedFailure() bool {
+        if (!builtin.is_test) return false;
+        const limit = fail_after orelse return false;
+        if (success_count.fetchAdd(1, .monotonic) < limit) return false;
+        _ = injected_count.fetchAdd(1, .monotonic);
+        return true;
     }
 
     fn release(s: *Slot) void {

@@ -16347,8 +16347,8 @@ test "retained MSD composite count matches ordered rows across workers, encoding
             try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
         }
         if (codec == .SNAPPY) {
-            // A late failure in the first column must win over an early failure in the next column. Retained
-            // payload capacity is prepaid, so counting it again must not force a different decode schedule.
+            // An earlier secondary-column page wins over the late key page in every decode/admission mode.
+            // Keep its header valid so planning admits MSD and the failure actually reaches record workers.
             var plain_capture: Capture = .{ .a = a };
             try plain_capture.bytes.appendSlice(a, capture.bytes.items);
             var plain_meta = try metadata.open(a, capture.bytes.items);
@@ -16368,43 +16368,20 @@ test "retained MSD composite count matches ordered rows across workers, encoding
             const key_end: usize = @intCast(key_cm.data_page_offset + key_cm.total_compressed_size);
             @memset(plain_capture.bytes.items[key_end - 32 .. key_end], 0xff);
             const f_start: usize = @intCast(f_cm.data_page_offset);
-            @memset(plain_capture.bytes.items[f_start..][0..12], 0);
+            var f_header = thrift_mod.Reader.init(plain_capture.bytes.items[f_start..]);
+            const fh = try schema.PageHeader.read(&f_header);
+            const f_body = f_start + f_header.pos;
+            const damaged = @min(12, @as(usize, @intCast(fh.compressed_page_size)));
+            @memset(plain_capture.bytes.items[f_body..][0..damaged], 0xff);
             const plain_rgs = try a.alloc(schema.RowGroup, 16);
             @memset(plain_rgs, plain_meta.row_groups.items[0]);
             plain_meta.row_groups.items = plain_rgs;
             plain_meta.num_rows = n * 16;
             const bad_inputs = [_]Input{.{ .name = "late-key-error.parquet", .bytes = plain_capture.bytes.items }};
-            for ([_]usize{ 1, 2, 4, 8, 16 }) |j| {
-                var budget: core_memory.SharedBudget = .{ .limit = 1 << 30 };
-                var bad = base;
-                bad.inputs = &bad_inputs;
-                bad.metas = &.{plain_meta};
-                bad.max_memory = budget.limit;
-                bad.ledger = &budget;
-                bad.parallelism = j;
-                bad.msd_records_min_rows = 0;
-                const expected_err = failure: {
-                    var unexpected = runMultiAggregate(gpa, a, bad) catch |err| break :failure err;
-                    unexpected.deinit(gpa);
-                    return error.TestUnexpectedResult;
-                };
-                const expected_site = consumer.decodeFailure().?;
-                try testing.expectEqual(@as(usize, 0), expected_site.column);
-                try testing.expect(expected_site.page.? > 0);
-                bad.msd_records = true;
-                const explanation = try explainAggregate(gpa, a, bad);
-                try testing.expectEqual(.msd_count_top_h, explanation.record_path.?.layout);
-                const actual_err = failure: {
-                    var unexpected = runMultiAggregate(gpa, a, bad) catch |err| break :failure err;
-                    unexpected.deinit(gpa);
-                    return error.TestUnexpectedResult;
-                };
-                const actual_site = consumer.decodeFailure().?;
-                try testing.expectEqual(expected_err, actual_err);
-                try testing.expectEqual(expected_site.column, actual_site.column);
-                try testing.expectEqual(expected_site.page, actual_site.page);
-                try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
-            }
+            var bad = base;
+            bad.inputs = &bad_inputs;
+            bad.metas = &.{plain_meta};
+            try checkRecordDecodeModes(gpa, a, bad, .msd_records, 1);
         }
         {
             // A large LIMIT can require more owned output than the fixed floor. Reject its conservative bound
@@ -16589,6 +16566,175 @@ test "retained MSD composite count matches ordered rows across workers, encoding
             try testing.expect(budget.used.load(.monotonic) < 1 << 20);
         }
     }
+}
+
+fn checkRecordDecodeModes(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    base: MultiAggArgs,
+    path: FastPath,
+    column: usize,
+) !void {
+    const Mode = enum { general, records, declined, replay, mixed_replay };
+    const Reader = struct {
+        waits: std.atomic.Value(usize) = .init(0),
+        abandoned: usize = 0,
+        mixed: bool = false,
+        fn start(_: *anyopaque) anyerror!void {}
+        fn probe(_: *anyopaque, _: usize, _: usize, _: u64, _: u64) anyerror!void {}
+        fn ready(_: *anyopaque, _: usize) anyerror!void {}
+        fn refuse(ctx: *anyopaque, rg: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.waits.fetchAdd(1, .monotonic);
+            if (self.mixed and rg != 0) return;
+            return error.ExceededMemoryBudget;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {}
+        fn abandon(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.abandoned += 1;
+        }
+    };
+    var expected: ?anyerror = null;
+    var expected_page: ?u32 = null;
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64, 256 }) |window| for (std.enums.values(Mode)) |mode| {
+        const replay = mode == .replay or mode == .mixed_replay;
+        var budget: core_memory.SharedBudget = .{ .limit = if (mode == .declined) 96 << 20 else 1 << 30 };
+        var args = base;
+        args.parallelism = j;
+        args.decode_batch_rows = window;
+        args.max_memory = budget.limit;
+        args.ledger = &budget;
+        args.integer_records = mode != .general and path == .integer_records;
+        args.msd_records = mode != .general and path == .msd_records;
+        args.byte_records = false;
+        args.integer_records_min_rows = 0;
+        args.msd_records_min_rows = 0;
+        var reader: Reader = .{ .mixed = mode == .mixed_replay };
+        if (replay) {
+            const inputs = try arena.dupe(Input, base.inputs);
+            for (inputs) |*input| {
+                input.plan_bytes = input.bytes;
+                input.gate = .{ .ctx = &reader, .wait = Reader.refuse, .done = Reader.done };
+                input.dict_wait = .{ .ctx = &reader, .wait = Reader.ready };
+            }
+            args.inputs = inputs;
+            args.start_reads = .{ .ctx = &reader, .start = Reader.start, .abandon = Reader.abandon };
+            args.dict_probe = .{ .ctx = &reader, .add = Reader.probe };
+        }
+        var taken: std.EnumSet(FastPath) = .{};
+        args.taken = &taken;
+        if (mode == .records or replay) {
+            const explanation = try explainAggregate(gpa, arena, args);
+            try testing.expect(explanation.record_path != null);
+            try testing.expectEqual(j, explanation.workers);
+        } else {
+            try testing.expect((try explainAggregate(gpa, arena, args)).record_path == null);
+        }
+        const err = failure: {
+            const attempt = if (mode == .records)
+                prepareAggregate(gpa, arena, args, false)
+            else
+                runMultiAggregate(gpa, arena, args);
+            var unexpected = attempt catch |e| break :failure e;
+            unexpected.deinit(gpa);
+            return error.TestUnexpectedResult;
+        };
+        try testing.expect(consumer.isDecodeError(err));
+        if (mode == .records) try testing.expect(taken.contains(path));
+        if (replay) {
+            try testing.expect(reader.waits.load(.monotonic) != 0);
+            try testing.expectEqual(@as(usize, 1), reader.abandoned);
+        }
+        const site = consumer.decodeFailure().?;
+        try testing.expectEqual(column, site.column);
+        try testing.expectEqual(@as(usize, 0), site.first_row);
+        try testing.expect(site.rg == &base.metas.?[0].row_groups.items[0]);
+        try testing.expect(site.page != null);
+        if (expected) |want| {
+            try testing.expectEqual(want, err);
+            try testing.expectEqual(expected_page, site.page);
+        } else {
+            expected = err;
+            expected_page = site.page;
+        }
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    };
+}
+
+test "inline integer decode errors follow projection ties across windows, decline and mapped replay" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const values = try a.alloc(i64, 40000);
+    const defs = try a.alloc(u32, values.len);
+    for (values, defs, 0..) |*v, *d, i| {
+        v.* = @intCast(i % 503);
+        d.* = @intFromBool(i % 11 != 0);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{
+            .name = "n",
+            .col = .{ .i64 = .{ .values = values, .def_levels = defs, .max_def = 1 } },
+            .parquet_type = .INT64,
+            .nullable = true,
+        },
+        .{
+            .name = "v",
+            .col = .{ .i64 = .{ .values = values, .def_levels = defs, .max_def = 1 } },
+            .parquet_type = .INT64,
+            .nullable = true,
+        },
+    };
+    const Capture = struct {
+        a: std.mem.Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+        fn write(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            try c.bytes.appendSlice(c.a, data);
+        }
+    };
+    var capture: Capture = .{ .a = a };
+    _ = try consumer.writeAggregateRows(
+        a,
+        .{ .ctx = &capture, .write_fn = Capture.write },
+        &cols,
+        @intCast(values.len),
+        .UNCOMPRESSED,
+        .{},
+        .{},
+    );
+    const bad = capture.bytes.items;
+    var meta = try metadata.open(a, bad);
+    var key: usize = 0;
+    var value: usize = 0;
+    for (meta.row_groups.items[0].columns.items, 0..) |chunk, ci| {
+        const cm = chunk.meta_data.?;
+        const name = cm.path_in_schema.items[0];
+        if (std.mem.eql(u8, name, "n")) key = ci else if (std.mem.eql(u8, name, "v")) value = ci else continue;
+        var header = thrift_mod.Reader.init(bad[@intCast(cm.data_page_offset)..]);
+        const page = try schema.PageHeader.read(&header);
+        const body = @as(usize, @intCast(cm.data_page_offset)) + header.pos;
+        @memset(bad[body..][0..@min(12, @as(usize, @intCast(page.compressed_page_size)))], 0xff);
+    }
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows = rgs[0].num_rows * 16;
+    const inputs = [_]Input{.{ .name = "integer-projection-errors.parquet", .bytes = bad }};
+    var args: MultiAggArgs = .{
+        .inputs = &inputs,
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c, sum(v) AS s",
+        .group_by = "n",
+        .typed_answer = true,
+        .min_bytes_per_worker = 1,
+        .scan_all = true,
+    };
+    try checkRecordDecodeModes(gpa, a, args, .integer_records, key);
+    args.column_order = "s,n,c";
+    try checkRecordDecodeModes(gpa, a, args, .integer_records, value);
 }
 
 fn msdOutputAllocTrial(a: std.mem.Allocator) !void {

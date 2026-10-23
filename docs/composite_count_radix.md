@@ -91,10 +91,10 @@ single-key full-output and SUM top-k kernels.
 
 The whole-column decoder reservation excludes retained payload capacity because it has already been funded. Its
 workspace quote retains a per-worker arena-rounding margin. Counting payloads twice would force interleaved sliced
-decoding and could change which of two corrupt columns fails first. A PLAIN-page regression checks that a late key
-failure still precedes an early secondary-column failure, at all five worker counts, with complete ledger cleanup.
-Across several corrupt row groups the established worker-index error selection remains unchanged; it does not
-provide a global first-input error order across worker counts.
+decoding. Decode failures follow the shared [canonical page order](decode-errors.md), including input/row-group
+order and projection ties. The record worker receives the complete output projection. Cross-mode regressions cover
+an early secondary-column page against a late key page, and integer projection ties, at all five worker counts,
+whole/64/256-row windows, admission decline and mapped replay, with complete ledger cleanup.
 An unordered admission regression checks the retained MSD path as well as both existing inline record layouts;
 relaxing order preserves path selection, exact values and the ordered candidate's deterministic output.
 Runtime page headers are checked before retained copying, even when footer encoding lists omit an expansion

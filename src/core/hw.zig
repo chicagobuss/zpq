@@ -2,6 +2,8 @@
 //! other logical CPUs and the sharing sets, without assuming a uniform topology or changing thread affinity.
 //! Unknown sizes stay zero and unknown sharing sets stay empty. Execution policy, headroom and forced paths belong
 //! to callers. See docs/hardware-execution.md for the process-wide environment overrides.
+//! Hardware may change performance only: never row-group boundaries, page sizes, float summation blocks, merge
+//! order or anything else that reaches output bytes or float bits.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,8 +41,10 @@ pub const Cpu = struct {
 pub threadlocal var test_cpu: ?Cpu = null;
 var state: std.atomic.Value(u8) = .init(0);
 var detected: [cpu_capacity]Cpu = @splat(.{});
+var process_l2: usize = 0;
 const unknown: Cpu = .{};
 
+/// Diagnostics only; execution policies use the stable process-affinity minimum below.
 pub fn forCpu(id: usize) *const Cpu {
     while (true) switch (state.load(.acquire)) {
         2 => return if (id < detected.len) &detected[id] else &unknown,
@@ -52,14 +56,35 @@ pub fn forCpu(id: usize) *const Cpu {
     };
 }
 
+/// Diagnostics only: the CPU on which this caller happens to execute can change between calls.
 pub fn current() *const Cpu {
     if (test_cpu) |*cpu| return cpu;
     return forCpu(currentId());
 }
 
-/// Conservatively divide private L2 among every logical CPU sharing it, even when one sibling is idle.
+/// Minimum per-worker L2 across the process affinity mask, captured once at discovery. Stable on hybrid CPUs and
+/// conservative about idle SMT siblings. Zero means unknown (including any unknown allowed CPU). Hardware may
+/// change performance only, never output bytes, page/row-group boundaries, float summation blocks or merge order.
 pub fn l2BytesPerWorker() usize {
-    return current().l2.bytesPerWorker();
+    if (test_cpu) |cpu| return cpu.l2.bytesPerWorker();
+    _ = forCpu(0);
+    return process_l2;
+}
+
+/// An explicit execution-policy fallback for platforms without cache/affinity discovery, including macOS arm64.
+pub fn l2BytesPerWorkerOr(default: usize) usize {
+    const bytes = l2BytesPerWorker();
+    return if (bytes == 0) default else bytes;
+}
+
+fn affinityMinimum(cpus: []const Cpu, affinity: CpuSet) usize {
+    var minimum: usize = std.math.maxInt(usize);
+    var it = affinity.iterator(.{});
+    while (it.next()) |id| {
+        if (id >= cpus.len) return 0;
+        minimum = @min(minimum, cpus[id].l2.bytesPerWorker());
+    }
+    return if (minimum == std.math.maxInt(usize)) 0 else minimum;
 }
 
 fn currentId() usize {
@@ -91,13 +116,19 @@ fn discover() void {
             .l2 => "ZPQ_HW_L2_BYTES",
             .l3 => "ZPQ_HW_L3_BYTES",
         };
-        if (std.c.getenv(name)) |raw| if (std.fmt.parseInt(usize, std.mem.span(raw), 10) catch null) |bytes| {
+        if (std.c.getenv(name)) |raw| if (parseSize(std.mem.span(raw))) |bytes| {
             for (&detected) |*cpu| switch (level) {
                 .l1d => cpu.l1d.bytes = bytes,
                 .l2 => cpu.l2.bytes = bytes,
                 .l3 => cpu.l3.bytes = bytes,
             };
         };
+    }
+    if (builtin.os.tag == .linux) {
+        var mask: std.os.linux.cpu_set_t = undefined;
+        // Query the main thread's mask, not an initializing worker's possibly narrower mask.
+        if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0)
+            process_l2 = affinityMinimum(&detected, .{ .masks = mask });
     }
 }
 
@@ -219,4 +250,19 @@ test "hardware cache fixtures preserve sizes, SMT sharing and noncontiguous CCD 
     test_cpu = .{ .l2 = .{ .bytes = 1280 << 10, .cpus = parseCpuList("3,19").? } };
     defer test_cpu = null;
     try std.testing.expectEqual(@as(usize, 640 << 10), l2BytesPerWorker());
+}
+
+test "hardware process budget is the affinity minimum on hybrid CPUs, unknown included" {
+    const cpus = [_]Cpu{
+        .{ .l2 = .{ .bytes = 1280 << 10, .max_sharing = 2 } },
+        .{ .l2 = .{ .bytes = 2 << 20, .max_sharing = 4 } },
+        .{},
+    };
+    try std.testing.expectEqual(@as(usize, 512 << 10), affinityMinimum(&cpus, parseCpuList("0-1").?));
+    try std.testing.expectEqual(@as(usize, 640 << 10), affinityMinimum(&cpus, parseCpuList("0").?));
+    try std.testing.expectEqual(@as(usize, 0), affinityMinimum(&cpus, parseCpuList("0-2").?));
+    test_cpu = .{};
+    defer test_cpu = null;
+    try std.testing.expectEqual(@as(usize, 0), l2BytesPerWorker());
+    try std.testing.expectEqual(@as(usize, 12345), l2BytesPerWorkerOr(12345));
 }

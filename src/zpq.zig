@@ -122,6 +122,8 @@ test {
     _ = @import("core/partagg.zig");
     _ = @import("core/integer_groups.zig");
     _ = @import("core/byte_groups.zig");
+    _ = @import("core/msd_groups.zig");
+    _ = @import("core/retained_pages.zig");
     _ = @import("core/ndv.zig");
     _ = @import("core/expr/agg_coded.zig");
     _ = @import("core/expr/agg_dense.zig");

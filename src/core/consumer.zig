@@ -22,6 +22,8 @@
 const std = @import("std");
 const integer_groups = @import("integer_groups.zig");
 const byte_groups = @import("byte_groups.zig");
+const msd_groups = @import("msd_groups.zig");
+const retained_pages = @import("retained_pages.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 
@@ -1099,6 +1101,14 @@ pub const SliceReader = struct {
         };
     }
 
+    /// Payloads remain owned by the admitted aggregate after this reader's scratch is reset.
+    pub fn retainPayloads(self: *SliceReader, owner: *retained_pages.Chunk) void {
+        switch (self.raw.*) {
+            .bytes => |*r| r.pages.retained = owner,
+            else => unreachable,
+        }
+    }
+
     pub fn deinit(self: *SliceReader) void {
         self.scratch.deinit();
         self.pages.deinit();
@@ -1293,7 +1303,13 @@ pub const SliceReader = struct {
             const dst = values[got..][0..want];
             const k = if (def) |d| try r.decodeWithLevels(dst, d[got..][0..want]) else try r.decode(dst);
             if (k != want) return error.ShortDecode;
-            _ = try copyBytes(a, dst);
+            if (r.pages.retained) |owner| {
+                for (dst) |*value| if (!owner.contains(value.*)) {
+                    const owned = try owner.take(value.len);
+                    @memcpy(owned, value.*);
+                    value.* = owned;
+                };
+            } else _ = try copyBytes(a, dst);
             got += k;
         }
         return got;
@@ -2989,11 +3005,36 @@ pub const AggRowGroup = struct {
 pub const RecordSink = union(enum) {
     integer: *integer_groups.Local,
     bytes: *byte_groups.Local,
+    msd: *msd_groups.Local,
 
-    pub fn start(s: RecordSink, ordinal_base: u32) void {
+    pub fn start(s: RecordSink, ordinal_base: u32, item: usize) void {
         switch (s) {
+            .msd => |local| local.start(ordinal_base, item),
             inline else => |local| local.ordinal_base = ordinal_base,
         }
+    }
+
+    fn retention(s: RecordSink, column: usize) ?*retained_pages.Chunk {
+        return switch (s) {
+            .msd => |local| if (column == local.state.key_col) local.owner else null,
+            else => null,
+        };
+    }
+
+    fn rewindRetained(s: RecordSink) void {
+        switch (s) {
+            .msd => |local| local.owner.?.used = 0,
+            else => {},
+        }
+    }
+
+    fn decodeReservation(s: RecordSink, ordinary: usize) usize {
+        return switch (s) {
+            // Retained payload capacity is already funded outside the decoder. Reserving it again would force
+            // slices, changing which column's decode error wins. Leave the quote's margin for arena rounding.
+            .msd => |local| local.state.decode_budget.limit / local.state.locals.len - (4 << 20),
+            else => ordinary,
+        };
     }
 
     fn batch(s: RecordSink, view: filter_eval.Batch, lookup: []const ?usize, offset: usize) !void {
@@ -3587,7 +3628,11 @@ fn scanRGForAggImpl(
     defer plan_arena.deinit();
     var full_estimate: usize = 0;
     const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
-        const full = decodeEstimate(in, in.read, calls, target == .grouped);
+        const ordinary = decodeEstimate(in, in.read, calls, target == .grouped);
+        const full = if (target == .grouped and target.grouped.records != null)
+            target.grouped.records.?.decodeReservation(ordinary)
+        else
+            ordinary;
         full_estimate = full;
         if (target == .grouped and target.grouped.table.countOnly()) {
             const keys_only = decodeEstimate(in, in.read, &.{}, true);
@@ -3660,6 +3705,8 @@ fn scanRGForAggImpl(
                 ws.rg_arena.nextRowGroup();
                 if (ws.region) |r| r.trim();
             }
+            // No record has been emitted: release the failed whole-decode payload before rereading it in slices.
+            if (target == .grouped) if (target.grouped.records) |records| records.rewindRetained();
             if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) |kept|
                 return kept;
             return err;
@@ -3826,6 +3873,10 @@ fn scanRGSliced(
         var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, decode_options) orelse
             return null;
         if (levels_only[ci]) r.levelsOnly();
+        if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
+            r.retainPayloads(owner);
+            r.raw.bytes.pages.prof = ws.timings.prof;
+        };
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
     }
@@ -3881,7 +3932,9 @@ fn scanRGSliced(
             },
             .grouped => |g| {
                 if (g.records) |records| {
+                    const emit_start = nowMonoNs();
                     try records.batch(batch, lookup, done);
+                    if (records.* == .msd) profile.record(prof, .msd_emit, emit_start, nowMonoNs(), profile.args(.{}));
                     continue;
                 }
                 if (g.part != null) {
@@ -4019,6 +4072,16 @@ const ChunkDecoder = struct {
         decode_options.any_dictionary = switch (self.target) {
             .grouped => |g| g.dense != null and g.keys[0].col_ref.col_idx == ci,
             .scalar => false,
+        };
+        if (self.target == .grouped) if (self.target.grouped.records) |records| if (records.retention(ci)) |owner| {
+            var reader = (try SliceReader.init(a, a, in.rg, in.meta, in.src, ci, decode_options)).?;
+            defer reader.deinit();
+            reader.retainPayloads(owner);
+            reader.raw.bytes.pages.prof = prof;
+            const decoded = try reader.next(a, self.num_rows);
+            try checkRowShape(decoded, self.num_rows);
+            if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
+            return decoded;
         };
         const scratch = self.ws.scratch;
         const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len;

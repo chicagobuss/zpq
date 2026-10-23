@@ -14,6 +14,7 @@
 //! page kind; this layer just walks them.
 
 const std = @import("std");
+const retained_pages = @import("../retained_pages.zig");
 const core_memory = @import("../memory.zig");
 const schema = @import("../schema.zig");
 const thrift = @import("../thrift.zig");
@@ -143,6 +144,8 @@ pub const PageReader = struct {
     /// which the owner gives back as it frees the pages (an uncompressed page is the chunk's own bytes: nothing).
     budget: ?*core_memory.SharedBudget = null,
     drawn: usize = 0,
+    /// A query-owned, prepaid payload region. Scratch reset and input release never invalidate these pages.
+    retained: ?*retained_pages.Chunk = null,
 
     pub fn init(
         chunk: []const u8,
@@ -201,7 +204,7 @@ pub const PageReader = struct {
 
         self.inflated +|= usize_;
         if (self.inflated > self.byte_limit) return error.PageLargerThanChunk;
-        if (self.budget) |b| if (self.codec != .UNCOMPRESSED or header.type == .DATA_PAGE_V2) {
+        if (self.budget) |b| if (self.retained == null and (self.codec != .UNCOMPRESSED or header.type == .DATA_PAGE_V2)) {
             _ = b.drawExact(usize_) orelse return error.ExceededMemoryBudget;
             self.drawn += usize_;
         };
@@ -246,6 +249,16 @@ pub const PageReader = struct {
         // An UNCOMPRESSED page is a slice, not a copy: nothing to time.
         const span = profile.Span.begin(if (self.codec == .UNCOMPRESSED) null else self.prof);
         defer if (span.t != null) span.end(.decompress, self.pageArgs(header, csize, usize_));
+        if (self.retained != null) {
+            if (self.codec == .UNCOMPRESSED) {
+                const out = try self.pageBuffer(payload.len);
+                @memcpy(out, payload);
+                return .{ .header = header, .bytes = out };
+            }
+            const out = try self.pageBuffer(usize_);
+            try compression.decompressInto(payload, self.codec, out);
+            return .{ .header = header, .bytes = out };
+        }
         if (self.scratch == null or self.codec == .UNCOMPRESSED or usize_ == 0) {
             const a = if (header.type == .DICTIONARY_PAGE) self.dictionary_arena orelse self.arena else self.arena;
             const decompressed = try compression.decompress(a, payload, self.codec, usize_);
@@ -308,6 +321,7 @@ pub const PageReader = struct {
     }
 
     fn pageBuffer(self: *PageReader, len: usize) Error![]u8 {
+        if (self.retained) |owner| return owner.take(len);
         if (self.scratch) |s| return s.ensure(u8, 1, &s.page, len);
         return self.arena.alloc(u8, len);
     }

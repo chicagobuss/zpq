@@ -11,6 +11,14 @@ Grouped Parquet answers now use fixed 131,072-row row groups and 20,000-row page
 Large aggregate files therefore have different bytes from earlier releases. Decoded values and row order are
 preserved, and output bytes remain deterministic across worker counts and memory budgets.
 
+Unfiltered top-count queries grouped by a byte-string column and a signed INT32 column can use exact cached radix
+grouping over prepaid retained decoder pages. Bounded top-k selection preserves NULL values, full key bytes,
+first-appearance ties and deterministic output across worker counts and memory budgets. Unsupported encodings or
+insufficient reserved capacity retain the existing aggregation path.
+
+`--unordered` also admits the exact integer and short-string inline aggregation paths. Relaxing GROUP BY order
+no longer disables these paths; they retain their deterministic first-appearance output and top-k tie breaks.
+
 ### What to do
 
 1. **Scripts that parse `zpq query` output must change.** Every query now prints its answer as NDJSON rows on stdout,

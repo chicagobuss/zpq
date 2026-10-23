@@ -693,6 +693,7 @@ fn executeAggregateOver(
         .result_order = cut_args.result_order,
         .typed_answer = args.typed_answer and args.output != null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
+        .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
         .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
         .column_order = args.column_order,
         .max_memory = args.max_memory,

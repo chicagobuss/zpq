@@ -31,6 +31,10 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` selects the legacy full-row-group evaluator |
 | `ZPQ_DECODE_BATCH_ROWS` | Force flat decode windows for fault-free trees; unset, `0`, invalid or overflowing decimal values keep ordinary memory admission |
 | `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` keeps legacy expansion |
+| `ZPQ_INTEGER_RECORDS` | Eligible integer inline aggregation; `0` selects the established executor |
+| `ZPQ_BYTE_RECORDS` | Eligible short-key inline aggregation; `0` selects the established executor |
+| `ZPQ_MSD_RECORDS` | Eligible retained-page COUNT top-k; `0` selects the established executor |
+| `ZPQ_MSD_CACHE_ROWS` | Retained-group scratch rows; unset uses shared L2, `0` keeps 4096, positive values force a bounded power of two |
 
 A positive `ZPQ_DECODE_BATCH_ROWS` rounds down to a multiple of 64, with a
 minimum of 64 rows. It is parsed once from the query context as an unsigned
@@ -43,6 +47,8 @@ zero selects the legacy executor. Cache choices may change evaluation batches
 or partition counts, never result bytes, checked-error precedence, row-group
 boundaries, page sizes, float summation blocks or merge order. A cache size
 must never reach any choice that changes bytes or float bits.
+Retained-group admission, scratch headroom and override bounds are described in
+[aggregation execution overrides](execution_knobs.md).
 
 `python tools/hw_execution_check.py CANDIDATE [BASE]` checks q1-like scalar
 and grouped float answers byte for byte under 256K, 1M and 4M L2 overrides

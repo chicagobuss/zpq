@@ -61,7 +61,8 @@ prefixes. Its length therefore depends only on the input bytes; NULL keys are ex
 zero skipped bytes. The views remain owned by retained pages. Footer statistics never establish skipped bytes.
 
 The cache-budget integration seam and forced variants are described in [execution overrides](execution_knobs.md).
-The temporary budget preserves the legacy 4096-record window until shared hardware discovery is connected.
+Shared hardware discovery supplies the minimum per-worker L2 budget across the process affinity mask; unknown
+topology retains the 640 KiB fallback and the legacy 4096-record window.
 
 A complete leaf gives its exact count and minimum input ordinal. Each worker keeps a bounded top-H heap. Its Hth
 exact count is a safe global lower bound: a bucket containing fewer rows cannot contain a winning group. Pruning

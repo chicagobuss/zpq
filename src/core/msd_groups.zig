@@ -5,6 +5,7 @@ const retained = @import("retained_pages.zig");
 const huge_pages = @import("huge_pages.zig");
 const eval = @import("filter/eval.zig");
 const spawn = @import("spawn.zig");
+const hw = @import("hw.zig");
 const now = @import("../clock.zig").monoNs;
 const parts = 4096;
 const block_rows = 16;
@@ -16,12 +17,6 @@ const key_null: u32 = 1 << 31;
 const f_null: u32 = 1 << 30;
 const fold_stack_size = 4 << 20;
 pub const output_floor = 64 << 20;
-
-/// Integration seam for the shared hardware module: today's 1.25 MiB L2, shared by two workers.
-/// No topology detection belongs here. The caller supplying the budget must account for cache sharing.
-fn l2BytesPerWorker() usize {
-    return (1280 << 10) / 2;
-}
 
 fn cacheRowsForBudget(bytes: usize) usize {
     // Keep local metadata and one radix frame hot, then leave half the remainder for input and nested frames.
@@ -36,7 +31,7 @@ pub fn cacheRows(forced: ?usize) usize {
         if (rows == 0) return legacy_cache_rows;
         return @as(usize, 1) << @intCast(std.math.log2_int(usize, std.math.clamp(rows, 16, 16384)));
     }
-    return cacheRowsForBudget(l2BytesPerWorker());
+    return cacheRowsForBudget(hw.l2BytesPerWorkerOr(640 << 10));
 }
 
 /// Both views belong to retained owners. A local prefix is shortened against every non-NULL key, then the
@@ -720,4 +715,16 @@ test "retained scratch budgets and forced variants preserve exact groups and fir
     try std.testing.expectEqual(@as(usize, 16384), cacheRows(std.math.maxInt(usize)));
     for ([_]usize{ 16, 2048, 16384 }) |rows| for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for (0..3) |mode|
         try exactTrial(std.testing.allocator, j, mode, null, rows, false);
+}
+
+test "retained scratch follows shared cache budgets while forced windows remain host independent" {
+    defer hw.test_cpu = null;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 } };
+    try std.testing.expectEqual(@as(usize, 2048), cacheRows(null));
+    hw.test_cpu.?.l2.bytes = 2 << 20;
+    try std.testing.expectEqual(@as(usize, 8192), cacheRows(null));
+    hw.test_cpu.?.l2.bytes = 0;
+    try std.testing.expectEqual(@as(usize, 4096), cacheRows(null));
+    for ([_]usize{ 0, 16, 2048, 16384 }) |forced|
+        try std.testing.expectEqual(if (forced == 0) @as(usize, 4096) else forced, cacheRows(forced));
 }

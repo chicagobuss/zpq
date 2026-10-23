@@ -223,7 +223,7 @@ pub const MultiAggArgs = struct {
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
     /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
     typed_answer: bool = false,
-    /// Exact inline-record execution for a full signed integer COUNT/SUM answer when its reserved peak fits.
+    /// Exact inline records for a full integer COUNT/SUM answer or a bounded integer SUM cut, when its peak fits.
     integer_records: bool = true,
     /// Tests lower the cost threshold; ordinary execution keeps small answers on the established path.
     integer_records_min_rows: usize = 1 << 20,
@@ -4457,12 +4457,24 @@ fn inlineIntegerAnswer(
     timings: Timings,
 ) !?MultiAggResult {
     const order = args.result_order;
-    if (!args.integer_records or !args.typed_answer or args.unordered or args.filter != null or
-        order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
-        order.hidden.len != 0 or calls.len != 2) return null;
+    if (!args.integer_records or args.unordered or args.filter != null or order.having != null or
+        order.hidden.len != 0) return null;
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
-    if (keys.len != 1 or keys[0] != .col_ref or outputs.len != 3) return null;
+    const full = order.keys.len == 0 and order.limit == null and order.offset == 0;
+    var cut: ?integer_groups.Cut = null;
+    if (full) {
+        if (!args.typed_answer or calls.len != 2) return null;
+    } else {
+        const limit = order.limit orelse return null;
+        if (limit == 0 or calls.len != 1 or order.keys.len != 1) return null;
+        const k = std.math.cast(usize, order.offset +| limit) orelse return null;
+        if (k == 0 or k > 1024) return null;
+        const source = outputs[order.keys[0].column].source;
+        if (source != .agg or source.agg != 0) return null;
+        cut = .{ .k = k, .descending = order.keys[0].descending };
+    }
+    if (keys.len != 1 or keys[0] != .col_ref or outputs.len != calls.len + 1) return null;
     const key = keys[0].col_ref;
     if (key.physical_type != .INT64 or key.expr_type != .i64 or key.unsigned_64) return null;
     var count: ?usize = null;
@@ -4471,7 +4483,7 @@ fn inlineIntegerAnswer(
         if (call.where != null or call.offset != 0 or call.state or call.result != .i64) return null;
         switch (call.func) {
             .count => {
-                if (call.arg != null or count != null) return null;
+                if (cut != null or call.arg != null or count != null) return null;
                 count = i;
             },
             .sum => {
@@ -4483,13 +4495,13 @@ fn inlineIntegerAnswer(
             else => return null,
         }
     }
-    if (count == null or value == null) return null;
+    if ((full and count == null) or value == null) return null;
     var seen: u8 = 0;
     for (outputs) |out| seen |= @as(u8, 1) << @intCast(switch (out.source) {
         .key => @as(usize, 0),
         .agg => |ai| ai + 1,
     });
-    if (seen != 7) return null;
+    if (seen != (if (full) @as(u8, 7) else @as(u8, 3))) return null;
     const starts = try arena.alloc(u32, work.len);
     var rows: usize = 0;
     for (work, starts) |item, *start| {
@@ -4505,14 +4517,23 @@ fn inlineIntegerAnswer(
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
-    const state = (try integer_groups.State.init(
+    const admitted = if (cut) |c| try integer_groups.State.top(
         gpa,
         args.ledger,
         rows,
         n_workers,
         key.col_idx,
         value.?,
-    )) orelse return null;
+        c,
+    ) else try integer_groups.State.init(
+        gpa,
+        args.ledger,
+        rows,
+        n_workers,
+        key.col_idx,
+        value.?,
+    );
+    const state = admitted orelse return null;
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const workers = try arena.alloc(Worker, n_workers);
@@ -4584,10 +4605,18 @@ fn inlineIntegerAnswer(
         name.* = try gpa.dupe(u8, out.name);
         ty.* = .{ .lane = .i64, .nullable = switch (out.source) {
             .key => true,
-            .agg => |ai| ai != count.?,
+            .agg => |ai| count == null or ai != count.?,
         }, .source = if (out.source == .key) leafSchemaElem(&metas[0], key.col_idx) else null };
     }
-    output.integer_stream = .{ .state = state, .outputs = outputs, .count_call = count.? };
+    if (cut != null) {
+        const kept = state.topGroups();
+        try buildIntegerTopRows(gpa, &output, kept, outputs);
+        // As with the general GROUP BY answer, keep its row storage drawn until the query ledger dies. Transfer
+        // that tiny part of the reservation before releasing the records; no owning state remains in the answer.
+        if (args.ledger != null) state.charged -= kept.len *
+            (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue));
+        state.deinit();
+    } else output.integer_stream = .{ .state = state, .outputs = outputs, .count_call = count.? };
     var bytes_in: u64 = 0;
     for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
     return .{
@@ -4605,6 +4634,31 @@ fn inlineIntegerAnswer(
         .part_agg = true,
         .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
     };
+}
+
+fn buildIntegerTopRows(
+    gpa: std.mem.Allocator,
+    output: *AggOutput,
+    groups: []const integer_groups.Group,
+    outputs: []const BoundOutputColumn,
+) !void {
+    const rows = try gpa.alloc([]const AggValue, groups.len);
+    @memset(rows, &.{});
+    output.group_rows = rows;
+    const slab = try gpa.alloc(AggValue, groups.len * outputs.len);
+    @memset(slab, .null_val);
+    output.slab = slab;
+    for (groups, rows, 0..) |g, *row, i| {
+        const cells = slab[i * outputs.len ..][0..outputs.len];
+        row.* = cells;
+        for (outputs, cells) |out, *cell| {
+            const v = switch (out.source) {
+                .key => g.keyValue(),
+                .agg => g.sumValue(),
+            };
+            cell.* = if (v) |x| .{ .i = x } else .null_val;
+        }
+    }
 }
 
 /// min/max of a bare column returns one of that column's values, so its output can carry the column's type.
@@ -11967,6 +12021,70 @@ fn integerWindowAllocTrial(a: std.mem.Allocator, stream: IntegerStream, types: [
     } else {
         try testing.expectEqualSlices(u32, &.{ 0, 1, 1 }, answer.columns[0].i64.defs);
         try testing.expectEqualSlices(u32, &.{ 1, 1, 0 }, answer.columns[2].i64.defs);
+    }
+}
+
+fn integerTopRowsTrial(a: std.mem.Allocator) !void {
+    var output: AggOutput = .{};
+    defer output.deinit(a);
+    const groups = [_]integer_groups.Group{
+        .{ .sum = @as(i128, std.math.maxInt(i64)) * 2, .key = -7, .count = 1 << 31, .first = 0 },
+        .{ .sum = 0, .key = 0, .count = 0, .first = 1 << 31 },
+    };
+    const outputs = [_]BoundOutputColumn{
+        .{ .name = "s", .source = .{ .agg = 0 } },
+        .{ .name = "k", .source = .{ .key = 0 } },
+    };
+    try buildIntegerTopRows(a, &output, &groups, &outputs);
+    try testing.expectEqual(groups[0].sum, output.group_rows.?[0][0].i);
+    try testing.expectEqual(@as(i128, -7), output.group_rows.?[0][1].i);
+    try testing.expect(output.group_rows.?[1][0] == .null_val and output.group_rows.?[1][1] == .null_val);
+}
+
+test "inline integer SUM top rows preserve wide values and free partial allocations" {
+    try testing.checkAllAllocationFailures(testing.allocator, integerTopRowsTrial, .{});
+}
+
+test "inline integer SUM cut matches the established partition cut across workers and spawn failures" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |descending| {
+        const order_keys = [_]expr_ast.OrderKey{.{ .column = 1, .descending = descending }};
+        const base: MultiAggArgs = .{
+            .inputs = &inputs,
+            .aggregate = "sum(n) AS s",
+            .group_by = "n",
+            .result_order = .{ .keys = &order_keys, .limit = 7, .offset = 3 },
+            .max_memory = 512 << 20,
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .integer_records = false,
+        };
+        var want = try runMultiAggregate(testing.allocator, arena.allocator(), base);
+        defer want.deinit(testing.allocator);
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]?usize{ null, 0, 2 }) |fail_after| {
+            var args = base;
+            args.parallelism = j;
+            args.integer_records = true;
+            args.integer_records_min_rows = 0;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            if (fail_after) |n| spawn_util.injectFailureAfter(n);
+            defer spawn_util.resetFailure();
+            var got = try prepareAggregate(testing.allocator, arena.allocator(), args, false);
+            defer got.deinit(testing.allocator);
+            try testing.expect(taken.contains(.integer_records));
+            const rows = got.output.group_rows.?;
+            try testing.expectEqual(want.output.group_rows.?.len, rows.len);
+            for (want.output.group_rows.?, rows) |a, b| for (a, b) |x, y| {
+                try testing.expectEqual(std.meta.activeTag(x), std.meta.activeTag(y));
+                if (x == .i) try testing.expectEqual(x.i, y.i);
+            };
+        };
     }
 }
 

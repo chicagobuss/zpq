@@ -1,5 +1,5 @@
 //! Inline integer records, cache-sized radix partitions and exact first-position winners.
-//! The caller admits this kernel only for a bare signed integer key and COUNT(*) + SUM(signed integer).
+//! The caller admits a bare signed integer key with COUNT(*) + SUM, or a bounded cut by one exact integer SUM.
 const std = @import("std");
 const eval = @import("filter/eval.zig");
 const memory = @import("memory.zig");
@@ -33,6 +33,56 @@ pub const Group = struct {
     }
     pub fn sumValue(g: Group) ?i128 {
         return if (g.count & flag == 0) null else g.sum;
+    }
+};
+
+pub const Cut = struct { k: usize, descending: bool };
+
+// The minimum heap item is the worst retained row. NULL is last in either direction, and an earlier input ordinal
+// wins an equal SUM, exactly as the stable result sort does. The NULL-key flag is not part of the ordinal.
+fn worseSum(descending: bool, a: Group, b: Group) std.math.Order {
+    const an = a.count & flag == 0;
+    const bn = b.count & flag == 0;
+    if (an != bn) return if (an) .lt else .gt;
+    if (!an) {
+        const ord = std.math.order(a.sum, b.sum);
+        if (ord != .eq) return if (descending) ord else ord.invert();
+    }
+    return std.math.order(b.first & mask, a.first & mask);
+}
+
+const SumHeap = std.PriorityQueue(Group, bool, worseSum);
+
+fn keepSum(heap: *SumHeap, a: std.mem.Allocator, k: usize, g: Group) void {
+    if (heap.count() == k) {
+        if (worseSum(heap.context, g, heap.peek().?) != .gt) return;
+        _ = heap.pop();
+    }
+    heap.push(a, g) catch unreachable; // Every worker's bounded capacity is reserved before decoding.
+}
+
+const FoldScratch = struct {
+    groups: []Group = &.{},
+    slots: []u32 = &.{},
+
+    fn deinit(s: *FoldScratch, a: std.mem.Allocator) void {
+        a.free(s.groups);
+        a.free(s.slots);
+    }
+
+    fn ensure(s: *FoldScratch, a: std.mem.Allocator, rows: usize, cap: usize) !void {
+        // Free before growing: old/new overlap would exceed the admitted bound on an adversarially skewed partition.
+        // Each worker retains at most its largest partition; those maxima name disjoint partitions, totaling <= N.
+        if (s.groups.len < rows) {
+            a.free(s.groups);
+            s.groups = &.{};
+            s.groups = try a.alloc(Group, rows);
+        }
+        if (s.slots.len < cap) {
+            a.free(s.slots);
+            s.slots = &.{};
+            s.slots = try a.alloc(u32, cap);
+        }
     }
 };
 
@@ -100,6 +150,9 @@ pub const State = struct {
     block_cursor: std.atomic.Value(u32) = .init(0),
     locals: []Local = &.{},
     groups: []Group = &.{},
+    records: []Record = &.{},
+    cut: ?Cut = null,
+    heaps: []SumHeap = &.{},
     winners: []u32 = &.{},
     bitmap: []u64 = &.{},
     prefix: []u32 = &.{},
@@ -145,6 +198,9 @@ pub const State = struct {
         a.free(s.blocks);
         a.free(s.locals);
         a.free(s.groups);
+        a.free(s.records);
+        for (s.heaps) |*heap| heap.deinit(a);
+        a.free(s.heaps);
         a.free(s.winners);
         a.free(s.bitmap);
         a.free(s.prefix);
@@ -152,17 +208,44 @@ pub const State = struct {
         a.destroy(s);
     }
 
+    pub fn top(
+        a: std.mem.Allocator,
+        ledger: ?*memory.SharedBudget,
+        rows: usize,
+        workers: usize,
+        key_col: usize,
+        value_col: usize,
+        cut: Cut,
+    ) !?*State {
+        if (cut.k == 0 or cut.k > 1024 or workers == 0) return null;
+        const s = (try init(a, ledger, rows, workers, key_col, value_col)) orelse return null;
+        errdefer s.deinit();
+        s.cut = cut;
+        s.heaps = try a.alloc(SumHeap, workers);
+        for (s.heaps) |*heap| heap.* = .initContext(cut.descending);
+        for (s.heaps) |*heap| try heap.ensureTotalCapacity(a, cut.k);
+        return s;
+    }
+
     const Task = struct {
         s: *State,
         cursor: *std.atomic.Value(usize),
-        pass: enum { scatter, fold },
+        pass: enum { scatter, fold, top_scatter, top_fold },
+        heap: ?*SumHeap = null,
         err: ?anyerror = null,
         fn run(t: *Task) void {
-            const end: usize = if (t.pass == .scatter) coarse_n else parts_n;
+            var scratch: FoldScratch = .{};
+            defer scratch.deinit(t.s.gpa);
+            const end: usize = if (t.pass == .scatter or t.pass == .top_scatter) coarse_n else parts_n;
             while (true) {
                 const p = t.cursor.fetchAdd(1, .monotonic);
                 if (p >= end) return;
-                if (t.pass == .scatter) t.s.scatter(p) else t.s.fold(p) catch |e| {
+                (switch (t.pass) {
+                    .scatter => t.s.scatter(p, false),
+                    .top_scatter => t.s.scatter(p, true),
+                    .fold => t.s.fold(p),
+                    .top_fold => t.s.foldTop(p, &scratch, t.heap.?),
+                }) catch |e| {
                     t.err = e;
                     return;
                 };
@@ -174,12 +257,17 @@ pub const State = struct {
         const tasks = try s.gpa.alloc(Task, @max(1, workers));
         defer s.gpa.free(tasks);
         var cursor = std.atomic.Value(usize).init(0);
-        for (tasks) |*t| t.* = .{ .s = s, .cursor = &cursor, .pass = pass };
+        for (tasks, 0..) |*t, i| t.* = .{
+            .s = s,
+            .cursor = &cursor,
+            .pass = pass,
+            .heap = if (pass == .top_fold) &s.heaps[i] else null,
+        };
         if (tasks.len == 1 or !spawn.runTree(Task, tasks, .{ .stack_size = 1 << 20 }, Task.run)) Task.run(&tasks[0]);
         for (tasks) |t| if (t.err) |e| return e;
     }
 
-    fn scatter(s: *State, coarse: usize) void {
+    fn scatter(s: *State, coarse: usize, comptime top_cut: bool) void {
         const base = coarse * fine_n;
         var next: [fine_n]usize = undefined;
         for (&next, 0..) |*n, i| n.* = s.starts[base + i];
@@ -190,13 +278,53 @@ pub const State = struct {
                 for (b.rows[0..b.len]) |r| {
                     const p = (hash(r.key, r.flags & 1 != 0) >> (64 - coarse_bits - fine_bits)) & (fine_n - 1);
                     const start = s.starts[base + p];
-                    const records: [*]Record = @ptrCast(s.groups.ptr + start);
+                    const records: [*]Record = if (top_cut) s.records.ptr + start else @ptrCast(s.groups.ptr + start);
                     records[next[p] - start] = r;
                     next[p] += 1;
                 }
                 id = b.next;
             }
         }
+    }
+
+    fn foldTop(s: *State, p: usize, scratch: *FoldScratch, heap: *SumHeap) !void {
+        const records = s.records[s.starts[p]..s.starts[p + 1]];
+        if (records.len == 0) return;
+        const cap = try std.math.ceilPowerOfTwo(usize, records.len * 2);
+        try scratch.ensure(s.gpa, records.len, cap);
+        const slots = scratch.slots[0..cap];
+        const groups = scratch.groups[0..records.len];
+        @memset(slots, 0);
+        var n: usize = 0;
+        for (records) |r| {
+            const kn = r.flags & 1 != 0;
+            var pos: usize = hash(r.key, kn) & (cap - 1);
+            while (slots[pos] != 0) : (pos = (pos + 1) & (cap - 1)) {
+                const g = &groups[slots[pos] - 1];
+                if ((g.first & flag != 0) == kn and (kn or g.key == r.key)) break;
+            }
+            if (slots[pos] == 0) {
+                slots[pos] = @intCast(n + 1);
+                groups[n] = .{
+                    .sum = 0,
+                    .key = r.key,
+                    .count = 0,
+                    .first = r.ordinal | (if (kn) flag else @as(u32, 0)),
+                };
+                n += 1;
+            }
+            const g = &groups[slots[pos] - 1];
+            g.first = @min(g.first & mask, r.ordinal) | (g.first & flag);
+            if (r.flags & 2 == 0) {
+                g.sum += r.value;
+                g.count |= flag;
+            }
+        }
+        // All records of a key use the same exact hash partition. Selection starts only after every record in this
+        // partition is folded. Keeping top-H across a worker's completed partitions subsumes their individual top-H;
+        // the global top-H is therefore in the union of worker heaps, independent of task scheduling or worker count.
+        for (groups[0..n]) |g| keepSum(heap, s.gpa, s.cut.?.k, g);
+        s.counts[p] = n;
     }
 
     fn fold(s: *State, p: usize) !void {
@@ -250,6 +378,7 @@ pub const State = struct {
     }
 
     pub fn finish(s: *State, workers: usize) !void {
+        if (s.cut != null) return s.finishTop(workers);
         var start = now();
         for (s.locals) |l| s.input_nulls |= l.nulls;
         var at: usize = 0;
@@ -287,6 +416,42 @@ pub const State = struct {
         s.prefix[s.bitmap.len] = total;
         if (total != s.group_count) return error.BadRowCount;
         s.order_ns = @intCast(now() - start);
+    }
+
+    fn finishTop(s: *State, workers: usize) !void {
+        var start = now();
+        var at: usize = 0;
+        for (0..parts_n) |p| {
+            s.starts[p] = at;
+            for (s.locals) |l| at += l.histogram[p];
+        }
+        if (at != s.rows) return error.BadRowCount;
+        s.starts[parts_n] = at;
+        s.records = try s.gpa.alloc(Record, s.rows);
+        try s.parallel(workers, .top_scatter);
+        s.gpa.free(s.blocks);
+        s.blocks = &.{};
+        s.scatter_ns = @intCast(now() - start);
+        start = now();
+        try s.parallel(workers, .top_fold);
+        for (s.counts) |n| s.group_count += n;
+        s.fold_ns = @intCast(now() - start);
+        start = now();
+        const heap = &s.heaps[0];
+        for (s.heaps[1..]) |other| for (other.items) |g| keepSum(heap, s.gpa, s.cut.?.k, g);
+        // The ordinary stable result sort sees these retained rows in their original first-appearance order.
+        std.mem.sort(Group, heap.items, {}, struct {
+            fn less(_: void, a: Group, b: Group) bool {
+                return (a.first & mask) < (b.first & mask);
+            }
+        }.less);
+        s.gpa.free(s.records);
+        s.records = &.{};
+        s.order_ns = @intCast(now() - start);
+    }
+
+    pub fn topGroups(s: *const State) []const Group {
+        return s.heaps[0].items;
     }
 
     /// Ordered references for an output window; neither groups nor 32-byte slots are sorted or copied.
@@ -410,5 +575,69 @@ test "inline integer groups overlap packed records safely for every reduction an
                 try std.testing.expectEqual(ref.sum, group.sumValue());
             }
         };
+    }
+}
+
+fn topTrial(a: std.mem.Allocator, workers: usize, descending: bool, k: usize) !void {
+    const ndv = 1021;
+    var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const state = (try State.top(a, &budget, ndv * 3, workers, 0, 1, .{
+        .k = k,
+        .descending = descending,
+    })).?;
+    defer state.deinit();
+    // Every present SUM is four. Keys, arrival order and first-appearance order differ; duplicates span workers.
+    // Group 5 has a NULL sum and group 11 a NULL key. A partial-partition cut would select incorrect intermediate
+    // sums, and a key-order tie-break would produce a different answer from these hand-known first ordinals.
+    for ([_]usize{ 2, 0, 1 }) |round| for (0..ndv) |i| try state.locals[(ndv - i + round) % workers].append(.{
+        .key = @intCast((i * 73) % ndv),
+        .value = ([_]i64{ 2, -1, 3 })[round],
+        .ordinal = @intCast(round * ndv + i),
+        .flags = if (i == 5) 2 else if (i == 11) 1 else 0,
+    });
+    try state.finish(workers);
+    try std.testing.expectEqual(@as(usize, ndv), state.group_count);
+    try std.testing.expectEqual(@as(usize, 0), state.groups.len);
+    try std.testing.expectEqual(@as(usize, 0), state.winners.len);
+    try std.testing.expectEqual(@as(usize, 0), state.bitmap.len);
+    try std.testing.expectEqual(@min(k, ndv), state.topGroups().len);
+    var ordinal: usize = 0;
+    for (state.topGroups()) |g| {
+        if (k < ndv and ordinal == 5) ordinal += 1;
+        try std.testing.expectEqual(@as(u32, @intCast(ordinal)), g.first & mask);
+        const key: ?i128 = if (ordinal == 11) null else @intCast((ordinal * 73) % ndv);
+        try std.testing.expectEqual(key, g.keyValue());
+        try std.testing.expectEqual(if (ordinal == 5) null else @as(?i128, 4), g.sumValue());
+        ordinal += 1;
+    }
+}
+
+test "inline integer SUM top-H completes keys before stable tie selection at every worker count" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]bool{ false, true }) |descending|
+        for ([_]usize{ 7, 31, 1024 }) |k| try topTrial(std.testing.allocator, j, descending, k);
+}
+
+test "inline integer SUM top-H frees every partial heap and scratch allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, topTrial, .{ 1, true, 7 });
+}
+
+test "inline integer SUM top-H retains wide winning and losing sums without output narrowing" {
+    for ([_]bool{ false, true }) |descending| {
+        const s = (try State.top(std.testing.allocator, null, 6, 2, 0, 1, .{
+            .k = 1,
+            .descending = descending,
+        })).?;
+        defer s.deinit();
+        for (0..6) |i| try s.locals[i % 2].append(.{
+            .key = @intCast(i / 2),
+            .value = if (i < 2) std.math.maxInt(i64) else if (i < 4) std.math.minInt(i64) else 0,
+            .ordinal = @intCast(i),
+            .flags = 0,
+        });
+        try s.finish(2);
+        const g = s.topGroups()[0];
+        const value: i128 = if (descending) std.math.maxInt(i64) else std.math.minInt(i64);
+        try std.testing.expectEqual(value * 2, g.sumValue().?);
     }
 }

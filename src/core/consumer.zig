@@ -20,6 +20,7 @@
 //! any I/O. The `Sink` is opaque; the source is a borrowed slice.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const integer_groups = @import("integer_groups.zig");
 const byte_groups = @import("byte_groups.zig");
 const byte_topk = @import("byte_topk.zig");
@@ -3984,6 +3985,9 @@ fn scanRGForAggImpl(
     const page_indexes = try loadPageIndexes(ra, in, stats);
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     const filter_pages = try pruneFilterPages(ra, in, page_indexes, stats, &sel);
+    // Page pruning left few rows: decode just those, and let them stand for the row group from here on.
+    const keep = if (staged) null else try compactRows(ra, in, page_indexes, &sel, target);
+    const batch_rows = if (keep != null) sel.count() else num_rows;
 
     const t_decode_start = nowMonoNs();
     var dec: ChunkDecoder = .{
@@ -3995,12 +3999,16 @@ fn scanRGForAggImpl(
         .decode_options = decode_options,
         .ws = ws,
         .target = target,
+        .keep = keep,
+        .rows_out = if (keep != null) batch_rows else null,
     };
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     var lookup = try ra.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
     // Pages are pruned by the rows the filter's page statistics leave, as when every column decodes up front.
     const sel_pre = if (staged) try sel.cloneAlloc(ra) else sel;
+    // Compact columns: every kept row is selected so far.
+    if (keep != null) sel = try filter_selection.SelectionVector.init(ra, batch_rows);
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
         if (stage_plan) |sp| if (!sp.base[ci]) continue;
@@ -4038,14 +4046,14 @@ fn scanRGForAggImpl(
         try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const batch: filter_eval.Batch = .{
         .cols = batch_cols.items,
-        .num_rows = num_rows,
+        .num_rows = batch_rows,
         .expr_batch_rows = ws.expr_batch_rows,
     };
     if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
     const selected: usize = if (in.filter != null) sel.count() else num_rows;
-    profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ num_rows, selected }));
+    profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ batch_rows, selected }));
 
     switch (target) {
         .grouped => |g| {
@@ -4095,7 +4103,7 @@ fn scanRGForAggImpl(
                 key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch.restrictedTo(&sel), lookup, key_expr);
             }
 
-            const group_id_arr = try ra.alloc(u32, num_rows);
+            const group_id_arr = try ra.alloc(u32, batch_rows);
             @memset(group_id_arr, 0);
 
             // Never cached across row groups: the resolver's memo holds pointers into `ra`.
@@ -4372,6 +4380,9 @@ const ChunkDecoder = struct {
     decode_options: DecodeOptions,
     ws: AggWorkspace,
     target: AggTarget,
+    /// Decode just these rows (`compactRows`); `rows_out` is their count.
+    keep: ?[]const RowRange = null,
+    rows_out: ?usize = null,
     pages_total: usize = 0,
     pages_skipped: usize = 0,
 
@@ -4393,10 +4404,11 @@ const ChunkDecoder = struct {
         const chunk = in.src.bytes[buf_off .. buf_off + len];
 
         const chunk_span = profile.Span.begin(prof);
-        const prune_info: ?PruningInfo = if (self.page_indexes[ci]) |pi|
+        var prune_info: ?PruningInfo = if (self.page_indexes[ci]) |pi|
             try pagePruning(a, pi, self.filter_pages, ci, if (in.preserve) |p| p[ci] else true, sel, self.num_rows, cm, start)
         else
             null;
+        if (prune_info) |*p| p.keep = self.keep;
         // Encoded execution, on chunks read whole (page pruning decodes values page by page): a column only counted
         // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
@@ -4439,7 +4451,7 @@ const ChunkDecoder = struct {
             std.debug.assert(!uses.value[ci]);
         }
         if (ci < uses.value.len and uses.value[ci]) decoded = try agg_coded.materialize(a, decoded);
-        try checkRowShape(decoded, self.num_rows);
+        try checkRowShape(decoded, self.rows_out orelse self.num_rows);
         if (chunk_span.t != null) {
             chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
             if (prune_info) |pi| {
@@ -6181,7 +6193,49 @@ pub const PruningInfo = struct {
     dictionary_page_offset: ?i64,
     chunk_file_offset: i64,
     col_index: schema.ColumnIndex,
+    /// Decode only these rows, in order, into a column of their total length (`compactRows`).
+    keep: ?[]const RowRange = null,
 };
+
+/// Rows `lo..hi` of a row group.
+pub const RowRange = struct { lo: usize, hi: usize };
+
+/// Test-only: off compares compact decoding with whole columns; the count shows a test reached it.
+pub var compact_rows_in_tests = true;
+pub var compacted_row_groups: std.atomic.Value(usize) = .init(0);
+
+/// The selected runs of a page-pruned row group, when decoding just them is worth it: a filter's page index left at
+/// most half of the rows, and every column the row group decodes can be read page by page (a page index, one value per
+/// row). Their rows, in order, then stand for the row group: page pruning already deselected the rest, and a compact
+/// column keeps relative row order, so first appearances and ties are unchanged. Null decodes whole columns.
+fn compactRows(
+    ra: std.mem.Allocator,
+    in: AggRowGroup,
+    page_indexes: []const ?PageIndex,
+    sel: *const filter_selection.SelectionVector,
+    target: AggTarget,
+) !?[]const RowRange {
+    if (in.filter == null or (builtin.is_test and !compact_rows_in_tests)) return null;
+    if (target == .grouped and target.grouped.records != null) return null;
+    const kept = sel.count();
+    if (kept * 2 > sel.len) return null;
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        if (page_indexes[ci] == null) return null;
+        const cm = in.rg.columns.items[ci].meta_data orelse return null;
+        if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+    }
+    var ranges: std.ArrayList(RowRange) = .empty;
+    var at: usize = 0;
+    while (at < sel.len) {
+        while (at < sel.len and !sel.isActive(at)) at += 1;
+        const lo = at;
+        while (at < sel.len and sel.isActive(at)) at += 1;
+        if (at > lo) try ranges.append(ra, .{ .lo = lo, .hi = at });
+    }
+    if (builtin.is_test) _ = compacted_row_groups.fetchAdd(1, .monotonic);
+    return ranges.items;
+}
 
 fn defaultVal(comptime T: type) T {
     return switch (T) {
@@ -6193,6 +6247,103 @@ fn defaultVal(comptime T: type) T {
     };
 }
 
+/// `decodeWithReaderPruned` for just the rows of `keep` (sorted, disjoint, one value per row): pages with no kept row
+/// are skipped unread, the others decode into a page-sized scratch and their kept rows are copied out in order. The
+/// result has one entry per kept row and never zero-fills the rows it leaves out.
+fn decodeKeptRows(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    reader: *column_mod.ColumnChunkReader(T),
+    levels: schema.Levels,
+    num_leaves: usize,
+    prune: PruningInfo,
+    keep: []const RowRange,
+) !filter_eval.ColumnT(T) {
+    if (levels.max_rep != 0) return error.ShortDecode;
+    var total: usize = 0;
+    for (keep) |r| total += r.hi - r.lo;
+    reader.value_budget = num_leaves;
+    const max_def = levels.max_def;
+    const values = try arena.alloc(T, total);
+    const def_levels: ?[]u32 = if (max_def > 0) try arena.alloc(u32, total) else null;
+    const possible_dict_offset = prune.dictionary_page_offset orelse blk: {
+        if (prune.locations.len > 0 and prune.locations[0].offset > prune.chunk_file_offset)
+            break :blk prune.chunk_file_offset;
+        break :blk null;
+    };
+    if (possible_dict_offset) |dict_off| _ = try reader.seekAndInstallDictionaryPage(dict_off, prune.chunk_file_offset);
+    for (prune.locations) |loc| if (loc.first_row_index > num_leaves) return error.ShortDecode;
+    var page_values: []T = &.{};
+    var page_def: []u32 = &.{};
+    var k: usize = 0; // first range that may meet the current page
+    var out: usize = 0; // where range `k`'s rows go
+    for (prune.locations, 0..) |loc, pi| {
+        const start: usize = @intCast(loc.first_row_index);
+        const end: usize = if (pi + 1 < prune.locations.len) @intCast(prune.locations[pi + 1].first_row_index) else num_leaves;
+        while (k < keep.len and keep[k].hi <= start) : (k += 1) out += keep[k].hi - keep[k].lo;
+        const meets = k < keep.len and keep[k].lo < end;
+        const null_page = pi < prune.col_index.null_pages.items.len and prune.col_index.null_pages.items[pi];
+        const always = prune.page_is_always_match[pi] and (!null_page or def_levels != null);
+        // A skipped page holds no kept row (pruning deselected its rows); one that did would decode below.
+        if (!meets or always) {
+            if (meets) {
+                // An always-match page stands in for its rows as `decodeWithReaderPruned` fills them.
+                const fill: T = if (null_page or T == []const u8 or T == bool) defaultVal(T) else blk: {
+                    const encoded_mod = @import("filter/encoded.zig");
+                    break :blk encoded_mod.readFixedLE(T, prune.col_index.min_values.items[pi]) orelse defaultVal(T);
+                };
+                var j = k;
+                var o = out;
+                while (j < keep.len and keep[j].lo < end) : (j += 1) {
+                    const lo = @max(keep[j].lo, start);
+                    const hi = @min(keep[j].hi, end);
+                    const at = o + (lo - keep[j].lo);
+                    @memset(values[at..][0 .. hi - lo], fill);
+                    if (def_levels) |dl| @memset(dl[at..][0 .. hi - lo], if (null_page) 0 else @intCast(max_def));
+                    if (keep[j].hi > end) break;
+                    o += keep[j].hi - keep[j].lo;
+                }
+            }
+            if (pi + 1 < prune.locations.len) {
+                try reader.pages.seekToPage(prune.locations[pi + 1].offset, prune.chunk_file_offset);
+            } else reader.pages.pos = reader.pages.chunk.len;
+            continue;
+        }
+        _ = try reader.seekAndInstallPage(loc.offset, prune.chunk_file_offset);
+        const want = end - start;
+        if (page_values.len < want) {
+            page_values = try arena.alloc(T, want);
+            if (max_def > 0) page_def = try arena.alloc(u32, want);
+        }
+        // Null slots keep the default the decoder leaves them at.
+        @memset(page_values[0..want], defaultVal(T));
+        const n = if (max_def > 0)
+            try reader.decodeWithLevels(page_values[0..want], page_def[0..want])
+        else
+            try reader.decode(page_values[0..want]);
+        if (n != want) return error.ShortDecode;
+        var j = k;
+        var o = out;
+        while (j < keep.len and keep[j].lo < end) : (j += 1) {
+            const lo = @max(keep[j].lo, start);
+            const hi = @min(keep[j].hi, end);
+            const at = o + (lo - keep[j].lo);
+            @memcpy(values[at..][0 .. hi - lo], page_values[lo - start .. hi - start]);
+            if (def_levels) |dl| @memcpy(dl[at..][0 .. hi - lo], page_def[lo - start .. hi - start]);
+            if (keep[j].hi > end) break;
+            o += keep[j].hi - keep[j].lo;
+        }
+    }
+    return .{
+        .values = values,
+        .def_levels = def_levels,
+        .max_def = @intCast(max_def),
+        .rep_levels = null,
+        .max_rep = 0,
+        .has_nulls = reader.has_nulls,
+    };
+}
+
 fn decodeWithReaderPruned(
     comptime T: type,
     arena: std.mem.Allocator,
@@ -6201,6 +6352,7 @@ fn decodeWithReaderPruned(
     num_leaves: usize,
     prune: PruningInfo,
 ) !filter_eval.ColumnT(T) {
+    if (prune.keep) |keep| return decodeKeptRows(T, arena, reader, levels, num_leaves, prune, keep);
     reader.value_budget = num_leaves;
     const values = try arena.alloc(T, num_leaves);
     @memset(values, defaultVal(T));

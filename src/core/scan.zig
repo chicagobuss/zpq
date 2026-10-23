@@ -11495,6 +11495,69 @@ test "unaliased aggregates keep the function name unless it clashes, then take t
     }
 }
 
+test "page-pruned row groups decode just their kept rows, with the answers of whole columns" {
+    // Tiny pages with a page index, dictionary and plain encoded, nullable columns of every common type.
+    const files = [_][]const u8{
+        "data/parquet-testing/data/alltypes_tiny_pages.parquet",
+        "data/parquet-testing/data/alltypes_tiny_pages_plain.parquet",
+    };
+    // Only conjunctive leaves prune pages: the OR is a control that decodes whole columns.
+    const filters = [_]struct { sql: []const u8, compacts: bool }{
+        .{ .sql = "id >= 3000 AND id < 3100", .compacts = true },
+        .{ .sql = "id < 50", .compacts = true },
+        .{ .sql = "id >= 7000 OR id < 10", .compacts = false },
+        .{ .sql = "id = 4242", .compacts = true },
+        .{ .sql = "id >= 1000 AND id < 1400 AND int_col > 3", .compacts = true },
+    };
+    const shapes = [_]struct { agg: []const u8, group: ?[]const u8 }{
+        .{ .agg = "count(*) AS n, sum(bigint_col) AS sb, count(float_col) AS cf, min(double_col) AS md, " ++
+            "max(string_col) AS ms, min(date_string_col) AS mdate, sum(tinyint_col) AS st, count(bool_col) AS cb", .group = null },
+        .{ .agg = "count(*) AS n, sum(int_col) AS si, max(id) AS hi", .group = "string_col" },
+        .{ .agg = "count(*) AS n, min(id) AS lo", .group = "month, bool_col" },
+    };
+    for (files) |fixture| {
+        const bytes = metadata.readFileSlice(fixture, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) return error.SkipZigTest;
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = fixture, .bytes = bytes }};
+        for (filters) |f| for (shapes) |shape| for ([_]usize{ 1, 4 }) |j| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .filter = f.sql,
+                .aggregate = shape.agg,
+                .group_by = shape.group,
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+            };
+            consumer.compact_rows_in_tests = false;
+            var want = try runMultiAggregate(testing.allocator, a, args);
+            defer want.deinit(testing.allocator);
+            consumer.compact_rows_in_tests = true;
+            const before = consumer.compacted_row_groups.load(.monotonic);
+            var got = try runMultiAggregate(testing.allocator, a, args);
+            defer got.deinit(testing.allocator);
+            testing.expectEqual(f.compacts, consumer.compacted_row_groups.load(.monotonic) > before) catch |e| {
+                std.debug.print("compaction: {s} {s}\n", .{ fixture, f.sql });
+                return e;
+            };
+            testing.expectEqualDeep(want.output.aggs, got.output.aggs) catch |e| {
+                std.debug.print("{s} filter {s} j{d}\n", .{ fixture, f.sql, j });
+                return e;
+            };
+            testing.expectEqualDeep(want.output.group_rows, got.output.group_rows) catch |e| {
+                std.debug.print("{s} grouped filter {s} j{d}\n", .{ fixture, f.sql, j });
+                return e;
+            };
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
+        };
+    }
+}
+
 test "page index: null pages a footer contradicts do not drop rows" {
     // These files flag every page of their two REQUIRED columns all-null in the ColumnIndex, while every page holds
     // values. Pruning on that claim answered 0 for filters every other row satisfies.

@@ -68,11 +68,16 @@ exact count is a safe global lower bound: a bucket containing fewer rows cannot 
 uses strictly smaller counts; equal-count buckets remain, preserving every boundary tie. A pair is complete in one
 partition before selection. The union of worker heaps therefore contains the global top H. Iterating the largest
 child and recursing into the others bounds stack depth even for adversarial skew.
+The radix fold runs on reserved worker stacks. If the root worker cannot start, an iterative in-place heapsort
+over the same block-indexed run compares complete tuple identities, then folds adjacent equal records. It needs
+no additional allocation or recursive radix frames on a library caller's stack. First ordinals and bounded top-H
+selection remain exact; this exceptional fallback trades throughput for bounded stack use.
 
 ## Verification
 
 Focused kernel checks cover full byte-tuple identity, NULL/empty/embedded-zero and long keys, signed metadata,
-flat/skewed counts, ties, worker counts and spawn/allocation failures. Scan checks cover encoded/plain values,
+flat/skewed counts, ties, worker counts and spawn/allocation failures, including root spawn refusal on a small
+caller stack at the maximum admitted H. Scan checks cover encoded/plain values,
 SNAPPY/uncompressed pages, all five worker counts and tight/ample budgets. A destructive-window reader zeros
 released source bytes; a separate check consumes the parent's remaining credit at first consumption. Both require
 the admitted path to finish from owned pages and prepaid decoder storage.

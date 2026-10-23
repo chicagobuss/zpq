@@ -123,6 +123,21 @@ const Run = struct {
         x.count = n;
         return x;
     }
+    fn order(v: Run, a: usize, b: usize) std.math.Order {
+        const x = v.at(a).*;
+        const y = v.at(b).*;
+        for ([_]Phase{ .f, .length }) |phase| {
+            const result = std.math.order(digitWord(x, phase), digitWord(y, phase));
+            if (result != .eq) return result;
+        }
+        return std.mem.order(u8, x.key() orelse "", y.key() orelse "");
+    }
+    pub fn lessThan(v: Run, a: usize, b: usize) bool {
+        return v.order(a, b) == .lt;
+    }
+    pub fn swap(v: Run, a: usize, b: usize) void {
+        std.mem.swap(Record, v.at(a), v.at(b));
+    }
 };
 
 pub const Local = struct {
@@ -335,6 +350,12 @@ pub const Local = struct {
         }
     }
     fn run(l: *Local) void {
+        l.runImpl(false);
+    }
+    fn runWithoutWorker(l: *Local) void {
+        l.runImpl(true);
+    }
+    fn runImpl(l: *Local, comptime caller_stack: bool) void {
         const s = l.state;
         while (true) {
             const p = s.cursor.fetchAdd(1, .monotonic);
@@ -366,7 +387,18 @@ pub const Local = struct {
                 }
             }
             const v: Run = .{ .blocks = s.blocks, .ids = ids[0..dense], .start = 0, .count = n };
-            l.refine(Run, v, &.{}, .f, 0);
+            if (caller_stack) {
+                // Root spawn failure leaves only the caller's possibly small stack. Heapsort is iterative,
+                // uses the existing blocks, and compares full identities without any allocation or recursion.
+                std.sort.heapContext(0, n, v);
+                var at: usize = 0;
+                while (at < n) {
+                    var end = at + 1;
+                    while (end < n and v.order(at, end) == .eq) : (end += 1) {}
+                    l.keep(Run, v.sub(at, end - at));
+                    at = end;
+                }
+            } else l.refine(Run, v, &.{}, .f, 0);
         }
     }
 };
@@ -479,13 +511,14 @@ pub const State = struct {
         s.starts[parts] = at;
         if (rows != s.rows) return error.ShortDecode;
         var common: ?[]const u8 = null;
-        for (s.locals) |l| if (l.common) |p| {
+        for (s.locals) |*l| if (l.common) |p| {
             common = if (common) |previous| commonPrefix(previous, p) else p;
         };
         s.prefix_len = if (common) |p| p.len else 0;
-        if (!spawn.runTree(Local, s.locals, .{ .stack_size = fold_stack_size }, Local.run)) Local.run(&s.locals[0]);
+        if (!spawn.runTree(Local, s.locals, .{ .stack_size = fold_stack_size }, Local.run))
+            Local.runWithoutWorker(&s.locals[0]);
         const h = &s.locals[0].heap;
-        for (s.locals[1..]) |l| for (l.heap.items) |g| {
+        for (s.locals[1..]) |*l| for (l.heap.items) |g| {
             if (h.count() == s.k) {
                 if (worse({}, g, h.peek().?) != .gt) continue;
                 _ = h.pop();
@@ -517,12 +550,20 @@ test "cached composite groups release every partially initialized owner" {
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
-fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize, cache_count: usize) !void {
+fn exactTrial(
+    a: std.mem.Allocator,
+    jobs: usize,
+    mode: usize,
+    fail_after: ?usize,
+    cache_count: usize,
+    small_caller: bool,
+) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temp = arena.allocator();
     const n: usize = if (mode == 1) 100000 else 20000;
     const domain: usize = if (mode == 1) 1 else if (mode == 2) n else 200;
+    const top_n: usize = if (small_caller) 1024 else 10;
     const key_bytes = try temp.alloc([]const u8, domain);
     for (key_bytes, 0..) |*key, g| {
         const len = if (mode == 0 and g == 1) 0 else if (mode == 0) (g * 37) % 400 else 80;
@@ -539,7 +580,7 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
     var payload: usize = 0;
     for (key_bytes) |k| payload += k.len;
     @memset(&capacities, payload);
-    const s = (try State.initPrepaid(a, &budget, n, jobs, 0, 1, 10, &capacities, 0, output_floor, cache_count)).?;
+    const s = (try State.initPrepaid(a, &budget, n, jobs, 0, 1, top_n, &capacities, 0, output_floor, cache_count)).?;
     defer s.deinit();
     var expected: std.ArrayList(Group) = .empty;
     defer expected.deinit(a);
@@ -591,7 +632,7 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
             return worse({}, x, y) == .gt;
         }
     }.less);
-    const want = expected.items[0..@min(expected.items.len, 10)];
+    const want = expected.items[0..@min(expected.items.len, top_n)];
     std.mem.sort(Group, want, {}, struct {
         fn less(_: void, x: Group, y: Group) bool {
             return x.record.first() < y.record.first();
@@ -599,7 +640,8 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
     }.less);
     if (fail_after) |f| spawn.injectFailureAfter(f);
     defer spawn.resetFailure();
-    const got = try s.finish();
+    const got = if (small_caller) try finishOnSmallCaller(s) else try s.finish();
+    if (fail_after != null and fail_after.? == 0) try std.testing.expect(spawn.failuresInjected() > 0);
     try std.testing.expectEqual(@as(usize, if (mode == 0) 0 else if (mode == 1) 80 else 24), s.prefix_len);
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |x, y| {
@@ -611,7 +653,28 @@ fn exactTrial(a: std.mem.Allocator, jobs: usize, mode: usize, fail_after: ?usize
 }
 test "cached composite groups are exact across metadata ranges, NULLs, skew, ties and spawn failures" {
     for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for (0..3) |mode| for ([_]?usize{ null, 0, 2 }) |failed|
-        try exactTrial(std.testing.allocator, j, mode, failed, cacheRows(null));
+        try exactTrial(std.testing.allocator, j, mode, failed, cacheRows(null), false);
+}
+
+fn finishOnSmallCaller(s: *State) ![]const Group {
+    const Caller = struct {
+        state: *State,
+        result: anyerror![]const Group = error.TestUnexpectedResult,
+        fn run(c: *@This()) void {
+            c.result = c.state.finish();
+        }
+    };
+    var caller: Caller = .{ .state = s };
+    // Debug tracing also occupies static TLS in the pthread allocation. Allow for it while retaining a
+    // small caller stack. Bypass the injected failure only to create the library caller being modeled.
+    const thread = try std.Thread.spawn(.{ .stack_size = 640 << 10 }, Caller.run, .{&caller});
+    thread.join();
+    return caller.result;
+}
+
+test "retained grouping survives root spawn refusal on a small caller stack" {
+    for ([_]usize{ 1, 16 }) |jobs| for (0..3) |mode|
+        try exactTrial(std.testing.allocator, jobs, mode, 0, cacheRows(null), true);
 }
 
 test "retained grouping prepays output copies and declines failed allocation before input" {
@@ -656,5 +719,5 @@ test "retained scratch budgets and forced variants preserve exact groups and fir
     try std.testing.expectEqual(@as(usize, 16), cacheRows(1));
     try std.testing.expectEqual(@as(usize, 16384), cacheRows(std.math.maxInt(usize)));
     for ([_]usize{ 16, 2048, 16384 }) |rows| for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for (0..3) |mode|
-        try exactTrial(std.testing.allocator, j, mode, null, rows);
+        try exactTrial(std.testing.allocator, j, mode, null, rows, false);
 }

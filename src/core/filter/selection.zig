@@ -76,6 +76,35 @@ pub const SelectionVector = struct {
         return false;
     }
 
+    /// Deselect rows `lo..hi`, a word at a time.
+    pub fn clearRange(self: *SelectionVector, lo: usize, hi: usize) void {
+        var at = lo;
+        while (at < hi) {
+            const word = at / 64;
+            const n = @min(hi - at, 64 - at % 64);
+            self.mask[word] &= ~bitsAt(at % 64, n);
+            at += n;
+        }
+    }
+
+    /// Whether any row of `lo..hi` is selected, a word at a time.
+    pub fn anyInRange(self: SelectionVector, lo: usize, hi: usize) bool {
+        var at = lo;
+        while (at < hi) {
+            const word = at / 64;
+            const n = @min(hi - at, 64 - at % 64);
+            if (self.mask[word] & bitsAt(at % 64, n) != 0) return true;
+            at += n;
+        }
+        return false;
+    }
+
+    /// `n` (1..64) set bits from bit `shift` up.
+    inline fn bitsAt(shift: usize, n: usize) u64 {
+        const ones: u64 = if (n == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+        return ones << @intCast(shift);
+    }
+
     /// Deselect every row.
     pub fn clearAll(self: *SelectionVector) void {
         @memset(self.mask, 0);
@@ -189,4 +218,32 @@ test "borrowed selection windows reject shifted or interior partial words" {
     try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(1, 64));
     try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(64, 1));
     try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(128, 2));
+}
+
+test "SelectionVector range clears and tests match the per-row reference" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    for (0..200) |_| {
+        const len = r.intRangeAtMost(usize, 1, 300);
+        var fast = try SelectionVector.init(testing.allocator, len);
+        defer fast.deinit();
+        var slow = try SelectionVector.init(testing.allocator, len);
+        defer slow.deinit();
+        for (0..len) |i| if (r.boolean()) {
+            fast.set(i, false);
+            slow.set(i, false);
+        };
+        for (0..8) |_| {
+            const lo = r.uintLessThan(usize, len + 1);
+            const hi = r.intRangeAtMost(usize, lo, len);
+            var want = false;
+            for (lo..hi) |i| want = want or slow.isActive(i);
+            try testing.expectEqual(want, fast.anyInRange(lo, hi));
+            if (r.boolean()) {
+                fast.clearRange(lo, hi);
+                for (lo..hi) |i| slow.set(i, false);
+                try testing.expectEqualSlices(u64, slow.mask, fast.mask);
+            }
+        }
+    }
 }

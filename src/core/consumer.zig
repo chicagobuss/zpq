@@ -5073,10 +5073,7 @@ fn pruneFilterPages(
 
                 if (dec == .skip) {
                     skipped[page_idx] = true;
-                    var r = start;
-                    while (r < end) : (r += 1) {
-                        sel.set(r, false);
-                    }
+                    sel.clearRange(start, end);
                 }
 
                 const is_always = dec == .always_match;
@@ -5124,17 +5121,7 @@ fn pagePruning(
             const start_idx: usize = @intCast(loc.first_row_index);
             const end_idx: usize = if (page_idx + 1 < locs.len) @intCast(locs[page_idx + 1].first_row_index) else num_rows;
 
-            var has_active = false;
-            var r = start_idx;
-            while (r < end_idx) : (r += 1) {
-                if (sel.isActive(r)) {
-                    has_active = true;
-                    break;
-                }
-            }
-            if (!has_active) {
-                s[page_idx] = true;
-            }
+            if (!sel.anyInRange(start_idx, end_idx)) s[page_idx] = true;
         }
         skipped = s;
         always = a;

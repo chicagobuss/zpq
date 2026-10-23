@@ -787,3 +787,52 @@ test "THP advice avoids synchronous compaction without enough free huge blocks" 
     for ([_][]const u8{ "defer", "never" }) |mode| try std.testing.expect(adviceFor(mode, scarce, 4 << 30));
     try std.testing.expect(!adviceFor("unknown", plenty, 4 << 30));
 }
+
+test "retired pairs return every charge and serve the next take on the same mapping" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    drainPairs();
+    defer drainPairs();
+    var budget: core_memory.SharedBudget = .{ .limit = 64 * huge_page_size };
+    var pair = takePair(std.testing.allocator, 8 * huge_page_size);
+    if (pair.arena.mapping.len == 0) return error.SkipZigTest;
+    pair.arena.budget = &budget;
+    pair.scratch.budget = &budget;
+    const mapping = pair.arena.mapping.ptr;
+    {
+        var a = pair.arena.allocator();
+        const block = try a.alloc(u8, 3 * huge_page_size);
+        @memset(block, 7);
+        const spill = try pair.scratch.allocator().alloc(u8, Region.pair_scratch_span * 2);
+        pair.scratch.allocator().free(spill);
+        a.free(block);
+    }
+    try std.testing.expect(budget.used.load(.monotonic) > 0);
+    pair.arena.rewind();
+    retirePair(&pair);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    var next = takePair(std.testing.allocator, 8 * huge_page_size);
+    try std.testing.expectEqual(mapping, next.arena.mapping.ptr);
+    try std.testing.expectEqual(@as(usize, 0), next.arena.charged + next.arena.touched + next.arena.end);
+    next.arena.budget = &budget;
+    const again = try next.arena.allocator().alloc(u8, huge_page_size * 2);
+    @memset(again, 1);
+    next.arena.allocator().free(again);
+    next.arena.rewind();
+    retirePair(&next);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    // A different reserve never takes a kept pair of another size.
+    var other = takePair(std.testing.allocator, 16 * huge_page_size);
+    try std.testing.expect(other.arena.mapping.ptr != mapping);
+    retirePair(&other);
+}
+
+test "a pair whose arena still holds spilled blocks is unmapped, not kept" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    drainPairs();
+    defer drainPairs();
+    var pair = takePair(std.testing.allocator, 2 * huge_page_size);
+    if (pair.arena.mapping.len == 0) return error.SkipZigTest;
+    pair.arena.spilled = 1;
+    retirePair(&pair);
+    try std.testing.expectEqual(@as(usize, 0), pair_cache.len);
+}

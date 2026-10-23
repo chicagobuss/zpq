@@ -201,6 +201,16 @@ pub const Pool = struct {
     fn currentPid() std.posix.pid_t {
         return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
     }
+
+    /// Threads the pool holds, idle or busy.
+    pub fn threadCount() usize {
+        lock.lockUncancelable(blocking.io);
+        defer lock.unlock(blocking.io);
+        var n: usize = 0;
+        var s = all;
+        while (s) |slot| : (s = slot.next_all) n += 1;
+        return n;
+    }
 };
 
 /// Hold the pool for an embedding context. Pair with `releasePool`.
@@ -297,4 +307,49 @@ test "runTree runs every context once, and only a started subtree when spawns fa
     var none: [4]Ctx = @splat(.{});
     try std.testing.expect(!runTree(Ctx, &none, .{}, Ctx.bump));
     for (none) |c| try std.testing.expectEqual(@as(usize, 0), c.runs);
+}
+
+test "pooled regions reuse threads, nest, give every context its own thread and reset thread state" {
+    const Ctx = struct {
+        arrived: *std.atomic.Value(u32),
+        total: u32,
+        nested: bool = false,
+        runs: usize = 0,
+        saw_pairs: bool = false,
+        fn run(c: *@This()) void {
+            c.runs += 1;
+            // Every context waits for all of them: queueing one behind another on a thread would never finish.
+            _ = c.arrived.fetchAdd(1, .acq_rel);
+            while (c.arrived.load(.acquire) < c.total) std.atomic.spinLoopHint();
+            if (c.nested) {
+                var inner_arrived: std.atomic.Value(u32) = .init(0);
+                var inner: [3]@This() = @splat(.{ .arrived = &inner_arrived, .total = 3 });
+                std.debug.assert(runTree(@This(), &inner, .{}, run));
+                for (inner) |i| std.debug.assert(i.runs == 1);
+            }
+            c.saw_pairs = @import("expr/agg.zig").distinct_pairs != null;
+            @import("expr/agg.zig").distinct_pairs = @ptrFromInt(64);
+        }
+    };
+    var arrived: std.atomic.Value(u32) = .init(0);
+    var first: [8]Ctx = @splat(.{ .arrived = &arrived, .total = 8 });
+    first[3].nested = true;
+    try std.testing.expect(runTree(Ctx, &first, .{}, Ctx.run));
+    for (first) |c| try std.testing.expectEqual(@as(usize, 1), c.runs);
+    const threads = Pool.threadCount();
+    try std.testing.expect(threads >= 11);
+    arrived.store(0, .monotonic);
+    var again: [8]Ctx = @splat(.{ .arrived = &arrived, .total = 8 });
+    try std.testing.expect(runTree(Ctx, &again, .{}, Ctx.run));
+    // Warm threads served the second region, and none saw the state the first region's jobs left behind.
+    try std.testing.expectEqual(threads, Pool.threadCount());
+    for (again) |c| {
+        try std.testing.expectEqual(@as(usize, 1), c.runs);
+        try std.testing.expect(!c.saw_pairs);
+    }
+    // A stack past the pool's still runs, on a tree of fresh threads.
+    arrived.store(0, .monotonic);
+    var big: [2]Ctx = @splat(.{ .arrived = &arrived, .total = 2 });
+    try std.testing.expect(runTree(Ctx, &big, .{ .stack_size = Pool.stack_size * 2 }, Ctx.run));
+    for (big) |c| try std.testing.expectEqual(@as(usize, 1), c.runs);
 }

@@ -207,6 +207,8 @@ export fn zpq_open(options_json: ?[*:0]const u8, out_ctx: ?*?*Ctx, out_error: ?*
     };
     // Only when asked: a host that never touches S3 should not open connections to it. zpq_close joins them.
     if (opts.preconnect) service.preconnectS3(ctx.threaded.io(), gpa, env, &ctx.pool);
+    // Scan threads and worker regions persist across this context's queries; the last close releases them.
+    zpq.core.spawn.retainPool();
     out.* = ctx;
     return @backingInt(Status.ok);
 }
@@ -408,6 +410,7 @@ export fn zpq_close(ctx: ?*Ctx) void {
     _ = c.pthread_mutex_unlock(&self.lock);
     self.runners.stop();
     self.pool.deinit();
+    if (zpq.core.spawn.releasePool()) zpq.core.huge_pages.drainPairs();
     self.threaded.deinit();
     signals.release();
     gpa.destroy(self);

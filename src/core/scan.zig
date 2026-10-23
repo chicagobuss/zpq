@@ -1812,10 +1812,7 @@ fn workerRun(w: *Worker) void {
         w.failure = consumer.decodeFailure();
         if (consumer.isDecodeError(e) and w.failure != null and w.failed_gate != null) {
             const probe = w.failure_probe.?;
-            if (w.scratch_region) |*r| r.deinit();
-            if (w.region) |*r| r.deinit();
-            w.scratch_region = null;
-            w.region = null;
+            retireRegions(w);
             probe.lock.lockUncancelable(blocking.io);
             defer probe.lock.unlock(blocking.io);
             const p = FailureProbe.contextOf(w);
@@ -1890,7 +1887,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     // (`Region.initPair`): a small scan faults in one huge page per worker, not one for each region.
     if (w.region == null) {
         std.debug.assert(w.scratch_region == null);
-        const pair = huge_pages.Region.initPair(w.gpa, WORKER_REGION_RESERVE);
+        const pair = huge_pages.takePair(w.gpa, WORKER_REGION_RESERVE);
         w.region = pair.arena;
         w.region.?.budget = w.ledger;
         w.scratch_region = pair.scratch;
@@ -2069,13 +2066,17 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
 }
 
 fn releaseRegions(workers: []Worker) void {
-    for (workers) |*w| {
-        // The scratch first: the arena's region owns the mapping the two share.
-        if (w.scratch_region) |*r| r.deinit();
-        if (w.region) |*r| r.deinit();
-        w.region = null;
-        w.scratch_region = null;
+    for (workers) |*w| retireRegions(w);
+}
+
+/// Hand the worker's region pair back for the next pass or query (`huge_pages.retirePair`).
+fn retireRegions(w: *Worker) void {
+    if (w.region) |arena| {
+        var pair: huge_pages.Region.Pair = .{ .scratch = w.scratch_region.?, .arena = arena };
+        huge_pages.retirePair(&pair);
     }
+    w.region = null;
+    w.scratch_region = null;
 }
 
 fn runWorkers(workers: []Worker) void {

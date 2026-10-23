@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core_memory = @import("memory.zig");
+const blocking = @import("blocking.zig");
 
 pub const huge_page_size: usize = 2 << 20;
 
@@ -318,6 +319,115 @@ pub const Region = struct {
         if (self.isLast(memory)) self.end = self.last;
     }
 };
+
+/// Scan workers' region pairs kept across queries. A query takes its workers' pairs here (`takePair`) and hands
+/// them back when it is done (`retirePair`): the next query reuses the reserved mappings and whatever pages the kernel
+/// has not yet reclaimed, instead of mapping, faulting and zeroing fresh ones and unmapping them serially at the end.
+/// A retired pair holds no charge on any ledger. Its pages past the first huge page (the worker's slack, which every
+/// ceiling already counts) are lazily freed (MADV_FREE): resident until the kernel needs them, never committed, and
+/// re-touching them is a plain write. At most one pair per CPU is kept; `drainPairs` unmaps them.
+pub const pair_cache = struct {
+    var lock: std.Io.Mutex = .init;
+    var pairs: [256]Region.Pair = undefined;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var owner_pid: std.posix.pid_t = 0;
+
+    fn capacity() usize {
+        if (cap == 0) cap = @min(pairs.len, std.Thread.getCpuCount() catch 64);
+        return cap;
+    }
+};
+
+/// A worker's arena and scratch on `reserve` bytes: a retired pair of that size when one is kept, else fresh.
+pub fn takePair(child: std.mem.Allocator, reserve: usize) Region.Pair {
+    {
+        pair_cache.lock.lockUncancelable(blocking.io);
+        defer pair_cache.lock.unlock(blocking.io);
+        if (pair_cache.owner_pid != currentPid()) {
+            // A forked child shares nothing it may reuse safely with the parent's bookkeeping: start empty.
+            pair_cache.len = 0;
+            pair_cache.owner_pid = currentPid();
+        }
+        // initPair's arena span for `reserve`: the mapping rounded to huge pages, less the scratch's span.
+        const span = std.mem.alignForward(usize, reserve + Region.pair_scratch_span, huge_page_size) -
+            Region.pair_scratch_span;
+        var i = pair_cache.len;
+        while (i > 0) {
+            i -= 1;
+            const p = pair_cache.pairs[i];
+            if (p.arena.buf.len != span) continue;
+            pair_cache.pairs[i] = pair_cache.pairs[pair_cache.len - 1];
+            pair_cache.len -= 1;
+            var pair = p;
+            pair.arena.child = child;
+            return pair;
+        }
+    }
+    return Region.initPair(child, reserve);
+}
+
+/// Hand a pair back once nothing carved from it is live: its charges return to their ledger, and it is kept for the
+/// next query or, past the cache's capacity, unmapped.
+pub fn retirePair(pair: *Region.Pair) void {
+    const arena = &pair.arena;
+    // The scratch's span lies in the arena's mapping; only its spills and their charges are its own.
+    pair.scratch.deinit();
+    if (arena.mapping.len == 0 or arena.spilled != 0) {
+        arena.deinit();
+        return;
+    }
+    if (arena.budget) |b| b.release(arena.charged);
+    // Keep the first huge page, the worker's slack, as it is; lazily free what the query touched past it.
+    const first = huge_page_size - arena.phase;
+    if (arena.touched > first) {
+        const page = std.heap.pageSize();
+        const hi = @min(std.mem.alignForward(usize, arena.touched, page), arena.buf.len);
+        lazyFree(@alignCast(arena.buf[first..hi]));
+    }
+    const kept: Region.Pair = .{
+        .scratch = .{ .child = std.heap.page_allocator, .allowance = huge_page_size, .buf = pair.scratch.buf },
+        .arena = .{
+            .child = arena.child,
+            .mapping = arena.mapping,
+            .buf = arena.buf,
+            .phase = arena.phase,
+            .allowance = arena.allowance,
+        },
+    };
+    pair_cache.lock.lockUncancelable(blocking.io);
+    const fits = pair_cache.owner_pid == currentPid() and pair_cache.len < pair_cache.capacity();
+    if (fits) {
+        pair_cache.pairs[pair_cache.len] = kept;
+        pair_cache.len += 1;
+    }
+    pair_cache.lock.unlock(blocking.io);
+    if (!fits) std.posix.munmap(arena.mapping);
+    pair.* = .{ .scratch = .{ .child = std.heap.page_allocator }, .arena = .{ .child = arena.child } };
+}
+
+/// Unmap every kept pair (an embedding context's close).
+pub fn drainPairs() void {
+    pair_cache.lock.lockUncancelable(blocking.io);
+    defer pair_cache.lock.unlock(blocking.io);
+    if (pair_cache.owner_pid == currentPid()) {
+        for (pair_cache.pairs[0..pair_cache.len]) |p| std.posix.munmap(p.arena.mapping);
+    }
+    pair_cache.len = 0;
+}
+
+fn currentPid() std.posix.pid_t {
+    return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+}
+
+/// Let the kernel reclaim `span`'s pages whenever it needs them; until then they stay mapped with their contents.
+fn lazyFree(span: []align(std.heap.page_size_min) u8) void {
+    if (builtin.os.tag == .linux) {
+        // MADV_FREE needs Linux 4.5; DONTNEED gives the same contract (contents undefined) eagerly.
+        if (std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.FREE) != 0)
+            _ = std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.DONTNEED);
+    } else release(span);
+}
 
 /// Drop `span`'s pages now. Linux keeps the mapping and its huge-page advice; Darwin's MADV_DONTNEED may keep the
 /// pages resident, so the span is mapped afresh in place (a failed remap leaves them until `deinit`).

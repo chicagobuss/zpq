@@ -3089,6 +3089,7 @@ pub const AggWorkspace = struct {
     defer_decode_errors: bool = false,
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,
+    cache_hints: ?*CacheHints = null,
     scan_workers: usize = 1,
     expr_batch_rows: ?usize = null,
     scratch: *DecodeScratch,
@@ -3103,6 +3104,8 @@ pub const AggWorkspace = struct {
     /// Where a row group decodes staged or sliced, beside the region: drawn from the query's ledger, as the region is.
     /// Null allocates from the scan's `gpa`.
     charged: ?std.mem.Allocator = null,
+    /// Optional cost hints use their own refusal flags, while charging the same ledger.
+    planning_charged: ?std.mem.Allocator = null,
     /// The ledger `charged` draws from, which a sliced row group sizes its slices to fit.
     ledger: ?*const expr_agg.SharedBudget = null,
 };
@@ -3531,7 +3534,7 @@ pub fn scanRGForAgg(
     if (ws.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
         (target != .grouped or (decode_options.encoded and target.grouped.part == null and
             target.grouped.records == null)))
-        execution.decode_batch_rows = automaticCacheRows(ws.charged orelse gpa, in, target, ws.scan_workers) catch 0;
+        execution.decode_batch_rows = automaticCacheRowsWithHints(ws.planning_charged orelse ws.charged orelse gpa, in, target, ws.scan_workers, ws.cache_hints) catch 0;
     if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
     return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution) catch |err| {
         if (!isDecodeError(err)) return err;
@@ -3559,20 +3562,31 @@ pub fn canonicalDecodeFailure(
     scalar: bool,
     original: decode_order.Failure,
 ) decode_order.Failure {
+    return (probeDecodeFailure(a, in, options, calls, scalar) catch null) orelse original;
+}
+
+/// Probe one full-projection row group. Valid groups contribute no failure; refusal contributes no evidence.
+pub fn probeDecodeFailure(
+    a: std.mem.Allocator,
+    in: AggRowGroup,
+    options: DecodeOptions,
+    calls: []const expr_agg.AggCall,
+    scalar: bool,
+) !?decode_order.Failure {
     var planning = std.heap.ArenaAllocator.init(a);
     defer planning.deinit();
     const pa = planning.allocator();
     var check_in = in;
     check_in.read = in.error_read orelse in.read;
-    if (in.error_ranks) |rank| check_in.error_order = rank.make(rank.ctx, pa, check_in.read.len) catch return original;
-    const only = pa.alloc(bool, check_in.read.len) catch return original;
+    if (in.error_ranks) |rank| check_in.error_order = try rank.make(rank.ctx, pa, check_in.read.len);
+    const only = try pa.alloc(bool, check_in.read.len);
     @memset(only, false);
     if (scalar) {
         const target: AggTarget = .{ .scalar = .{ .calls = calls, .accumulators = &.{} } };
-        const uses = planCodeUses(pa, check_in, target, false) catch return original;
+        const uses = try planCodeUses(pa, check_in, target, false);
         for (only, 0..) |*v, ci| v.* = uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
     }
-    return decode_order.canonical(SliceReader, isDecodeError, a, check_in, options, only, original);
+    return decode_order.probe(SliceReader, isDecodeError, a, check_in, options, only);
 }
 
 // Checked arithmetic keeps its expression-major error order. A forced cache window may change only when
@@ -3600,6 +3614,30 @@ fn floatTreeSafe(e: expr_ast.Expr) bool {
 }
 
 const CacheDictionary = struct { entries: usize, bytes: usize };
+
+/// Query-local header facts, shared across workers/passes. No page or source-buffer pointers are retained.
+/// Optional allocation refusal leaves the cost hint uncached; it never affects decode diagnostics.
+pub const CacheHints = struct {
+    const Key = struct { rg: *const schema.RowGroup, column: usize };
+    lock: std.Io.Mutex = .init,
+    facts: std.AutoHashMapUnmanaged(Key, ?CacheDictionary) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(h: *CacheHints) void {
+        h.facts.deinit(h.allocator);
+        h.facts = .empty;
+    }
+
+    fn get(h: *CacheHints, in: AggRowGroup, ci: usize) ?CacheDictionary {
+        h.lock.lockUncancelable(@import("blocking.zig").io);
+        defer h.lock.unlock(@import("blocking.zig").io);
+        const key: Key = .{ .rg = in.rg, .column = ci };
+        if (h.facts.get(key)) |fact| return fact;
+        const fact = cacheDictionary(in, ci);
+        h.facts.put(h.allocator, key, fact) catch {};
+        return fact;
+    }
+};
 
 /// Header-only proof of a column's finite dictionary domain. It is a cost hint: malformed/incomplete bytes decline
 /// admission and leave all errors to ordinary execution. No statistics or decompression result authorizes a path.
@@ -3671,6 +3709,10 @@ fn wholeFloatTreeBytes(e: expr_ast.Expr) usize {
 /// Admit only computed fault-free float trees. Decoded inputs, all DAG results, key codes, selection and group
 /// IDs share the stable L2 worker budget; pages/dictionaries use the decoder's separate bounded buffers.
 fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize) !usize {
+    return automaticCacheRowsWithHints(gpa, in, target, workers, null);
+}
+
+fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize, hints: ?*CacheHints) !usize {
     var computed = false;
     for (target.calls()) |call| {
         if (call.where != null or call.func == .count_distinct or call.result == .bytes) return 0;
@@ -3699,7 +3741,7 @@ fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget
         if (!SliceReader.supports(in.rg, in.meta, ci)) return 0;
         const cm = in.rg.columns.items[ci].meta_data orelse return 0;
         const n: usize = @intCast(@max(0, cm.num_values));
-        const dictionary = cacheDictionary(in, ci);
+        const dictionary = if (hints) |h| h.get(in, ci) else cacheDictionary(in, ci);
         const lane: usize = if (dictionary != null) 4 else switch (cm.type) {
             .INT32, .FLOAT => 4,
             .BOOLEAN => 1,
@@ -3742,7 +3784,7 @@ fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget
     const whole_dictionaries = fixed_keys;
     var space: usize = 1;
     if (grouped) for (target.grouped.keys) |key| {
-        const d = cacheDictionary(in, key.col_ref.col_idx) orelse return 0;
+        const d = (if (hints) |h| h.get(in, key.col_ref.col_idx) else cacheDictionary(in, key.col_ref.col_idx)) orelse return 0;
         fixed_keys +|= agg_coded.plainKeyScratchBytes(d.entries) orelse return 0;
         space *|= d.entries +| 1;
     };
@@ -8932,6 +8974,20 @@ test "cache decode admission bounds dictionary strings and composite domains fro
         in.src.bytes = bytes;
         columns[1].meta_data.?.total_compressed_size = @intCast(bytes.len);
         const proof = cacheDictionary(in, 1).?;
+        var funding: core_memory.SharedBudget = .{ .limit = 64 << 10 };
+        var charge: core_memory.Charged = .{ .child = testing.allocator, .budget = &funding };
+        var memo: CacheHints = .{ .allocator = charge.allocator() };
+        try testing.expectEqualDeep(proof, memo.get(in, 1).?);
+        try testing.expectEqualDeep(proof, memo.get(in, 1).?);
+        try testing.expectEqual(@as(usize, 1), memo.facts.count());
+        memo.deinit();
+        try testing.expectEqual(@as(usize, 0), funding.used.load(.monotonic));
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        var uncached: CacheHints = .{ .allocator = failing.allocator() };
+        try testing.expectEqualDeep(proof, uncached.get(in, 1).?);
+        try testing.expectEqual(@as(usize, 0), uncached.facts.count());
+        uncached.deinit();
+
         try testing.expectEqual(@as(usize, @intCast(width)), proof.bytes);
         const rows = try automaticCacheRows(testing.allocator, in, target, 16);
         if (width == 24) {

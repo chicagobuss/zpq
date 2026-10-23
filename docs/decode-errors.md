@@ -30,12 +30,22 @@ the exact scan from the start. A located failure or refusal in an ordered
 block stops later blocks while allowing all earlier blocks to finish.
 
 After a decode failure, the scan releases its worker arenas, scratch, group
-tables and partitions before the coordinator probes the chosen row group. A
+tables and partitions before the coordinator replays the full query projection
+in input/row-group order through the chosen row group. The replay ignores optional
+count-pass projections and admit-pass item masks; only the query's ordinary,
+option-dependent statistics pruning applies. Valid files pay no replay cost. A
 local reader releases its input window and the probe reads its mapping. An
 unrescanable stream retains its failed source unit until that worker unwinds
 its arena and scratch, then takes a query-wide probe lock before returning the
 source bytes. Thus probes never run concurrently or stack on failed decode
 arenas. Probes use a bounded allocator charged through the query ledger.
+Before stream workers or tables start drawing, the query prepays a probe quota
+of `min(max_memory / 8, lean_decode / 2)` (at most 16 MiB). The serialized
+stream probe uses only that funded quota, so concurrent worker usage cannot
+change what it can verify. Unused funding returns after the workers stop.
+Failure to reserve the quota is a resource refusal before decoding starts.
+Mapped inputs probe after scan teardown within `max_memory`, after local input
+windows release their charges.
 
 Columns are probed in fixed schema order. Only pages starting at or before the
 best confirmed failure's first row need checking, and those pages are checked
@@ -46,7 +56,10 @@ all their storage before the next column. A nullable column consumed only by
 COUNT keeps its level-only semantics. A worker assigned only some aggregate
 calls still checks the full query projection. Optional filter-cost samples
 decline corruption and leave failure selection to that full scan; they use
-a reader's mapping rather than its not-yet-filled window.
+a reader's mapping rather than its not-yet-filled window. No lower-row unit
+is skipped by an early-stop rule: a column stops only before pages starting
+strictly after an already confirmed failure in the same row group. The prefix
+replay stops after the first row group with confirmed evidence.
 
 If a probe cannot allocate within its bound, that column is left unverified and
 the other columns are still tried. Report the minimum canonical key among
@@ -74,3 +87,9 @@ whole-row-group execution, tight memory, forced 64/256-row decode windows,
 and every worker count from 1 through 16. Tight 64K/128K/256K/1M cases also
 compare mmap, pread and io_uring input paths. `ZPQ_DECODE_BATCH_ROWS` is documented
 with the other execution overrides in [hardware-execution.md](hardware-execution.md).
+
+Core regressions force a count pass to encounter a later corrupt key after
+omitting an earlier corrupt argument, and replay through row groups absent
+from the failed worker's work list. They also fill every unreserved ledger
+byte before a stream probe, reverse worker assignments for residual errors,
+and verify optional hint/refusal flags and memo allocation-failure cleanup.

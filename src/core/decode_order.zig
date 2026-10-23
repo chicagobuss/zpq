@@ -34,6 +34,18 @@ pub fn canonical(
     levels_only: []const bool,
     original: Failure,
 ) Failure {
+    return probe(Reader, isDecodeError, gpa, in, options, levels_only) orelse original;
+}
+
+/// A valid row group contributes no evidence. Used by the error-only full-projection prefix replay.
+pub fn probe(
+    comptime Reader: type,
+    comptime isDecodeError: fn (anyerror) bool,
+    gpa: std.mem.Allocator,
+    in: anytype,
+    options: column.DecodeOptions,
+    levels_only: []const bool,
+) ?Failure {
     var best: ?Failure = null;
     for (in.read, 0..) |needed, ci| {
         if (!needed) continue;
@@ -42,7 +54,7 @@ pub fn canonical(
             if (best == null or less(found.site, best.?.site)) best = found;
         }
     }
-    return best orelse original;
+    return best;
 }
 
 fn checkColumn(

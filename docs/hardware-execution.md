@@ -42,7 +42,9 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 
 A positive `ZPQ_DECODE_BATCH_ROWS` caps windows at that many rows, rounded down
 to a multiple of 64 with a minimum of 64. Ledger admission and its measured
-64-row pilot may select a smaller window. It is parsed once from the query context as an unsigned
+64-row pilot may select a smaller window. The pilot resizes only between
+windows, after the current window has been consumed; live vectors never resize.
+The knob is parsed once from the query context as an unsigned
 decimal integer. `ZPQ_EXPR_BATCH_ROWS=0` also disables automatic cache decode.
 
 Sharing sets remain real under size overrides. Zero means unknown, letting a
@@ -58,7 +60,9 @@ Retained-group admission, scratch headroom and override bounds are described in
 `python tools/hw_execution_check.py CANDIDATE [BASE]` checks q1-like scalar
 and grouped float answers byte for byte under 256K, 1M and 4M L2 overrides
 at j1/3/8/16, L3 overrides of 256K/32M and auto/0/64/256 decode windows.
-It uses an isolated temporary fixture and requires pyarrow.
+It includes nullable, empty and long string keys, mixed dictionary/plain
+encodings, and forced window execution with sparse and empty selections.
+It uses isolated temporary fixtures and requires pyarrow.
 
 Flat level streams are validated eagerly before the value decoder is installed.
 The default retains encoded streams when runs of at least 64 levels cover half
@@ -106,7 +110,12 @@ one copied string even if every row repeats the longest entry; dictionary
 entry counts bound key-domain products. These facts come from page bytes,
 not statistics. Unbounded/plain byte columns, excessive composite state or
 unknown cache sizes decline automatic admission. A failed admission allocation
-also falls back to ordinary execution.
+also falls back to ordinary execution. Header facts are memoized once per
+column chunk per query and shared across workers and passes; they retain only
+sizes/counts, never pointers into input windows. Refusal to allocate the
+optional memo leaves that hint uncached. Optional planning and decode attempts
+have separate refusal flags, reset per attempt, so a declined hint cannot
+misclassify a later host allocation failure.
 
 The row cap is a multiple of 64 within three quarters of the stable per-worker
 L2 share after fixed scratch. Memory admission can shrink it further. Decoded

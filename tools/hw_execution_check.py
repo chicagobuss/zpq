@@ -22,6 +22,7 @@ def main():
         n = 65553
         pq.write_table(pa.table({
             "g": ["abcd"[i % 4] for i in range(n)],
+            "h": [None if i % 19 == 0 else ("" if i % 7 == 0 else "key-" + str(i % 3) + "x" * (i % 3 * 127)) for i in range(n)],
             "price": [(1e16, 1.0, -1e16, 0.1, -0.0)[i % 5] for i in range(n)],
             "discount": [(i % 11) * 0.01 for i in range(n)],
             "tax": [(i % 9) * 0.01 for i in range(n)],
@@ -30,7 +31,9 @@ def main():
         aggs = ("sum(price*(1-discount)) AS s, sum(price*(1-discount)*(1+tax)) AS c, "
                 "avg(price*(1-discount)) AS a, count(*) AS n")
         queries = [f"SELECT {aggs} FROM '{path}' WHERE f < 300",
-                   f"SELECT g, {aggs} FROM '{path}' WHERE f < 300 GROUP BY g ORDER BY g"]
+                   f"SELECT g, {aggs} FROM '{path}' WHERE f < 300 GROUP BY g ORDER BY g",
+                   f"SELECT g, h, {aggs} FROM '{path}' WHERE f < 17 GROUP BY g, h ORDER BY g, h",
+                   f"SELECT h, {aggs} FROM '{path}' WHERE f < 0 GROUP BY h ORDER BY h"]
         env = {k: v for k, v in os.environ.items() if k not in {
             "ZPQ_EXPR_BATCH_ROWS", "ZPQ_DECODE_BATCH_ROWS", "ZPQ_HW_L2_BYTES", "ZPQ_HW_L3_BYTES"}}
 
@@ -38,7 +41,7 @@ def main():
             options = dict(env, ZPQ_HW_L2_BYTES=size, ZPQ_HW_L3_BYTES=l3)
             if decode is not None:
                 options["ZPQ_DECODE_BATCH_ROWS"] = decode
-            p = subprocess.run([binary, "query", "--query", sql, "-j", str(j)],
+            p = subprocess.run([binary, "query", "--query", sql, "--scan-all", "-j", str(j)],
                                env=options, capture_output=True, timeout=60)
             if p.returncode:
                 raise AssertionError((binary, j, size, l3, decode, p.stderr.decode()))
@@ -54,7 +57,7 @@ def main():
                             got = run(candidate, sql, j, size, l3, decode)
                             assert got == want, (size, l3, j, decode, got, want)
                             checks += 1
-        print(f"hardware execution: {checks} byte-identical scalar/GROUP BY answers across "
+        print(f"hardware execution: {checks} byte-identical scalar/string-key GROUP BY answers across "
               "L2 256K/1M/4M, L3 256K/32M, decode auto/0/64/256 and j1/3/8/16")
 
 

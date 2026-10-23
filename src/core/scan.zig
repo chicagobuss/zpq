@@ -1484,6 +1484,12 @@ fn workerErrorRanks(ctx: *const anyopaque, a: std.mem.Allocator, n: usize) anyer
 
 const FailureProbe = struct {
     const Context = struct {
+        // Copy the plan: its stack frame has unwound before mapped-input prefix replay.
+        plan: agg_plan.Plan,
+        metas: []const schema.FileMetaData,
+        inputs: []const Input,
+        file: usize,
+        rg: usize,
         in: consumer.AggRowGroup,
         options: consumer.DecodeOptions,
         calls: []const expr_agg.AggCall,
@@ -1492,9 +1498,22 @@ const FailureProbe = struct {
     };
     lock: std.Io.Mutex = .init,
     limit: usize = 0,
-    ledger: ?*core_memory.SharedBudget = null,
     workers: []const Worker = &.{},
     context: ?Context = null,
+    /// Prepaid before stream workers start; probes never borrow a live worker's headroom.
+    stream_budget: core_memory.SharedBudget = .{ .limit = 0 },
+
+    fn reserveStream(p: *FailureProbe, parent: *core_memory.SharedBudget) !void {
+        const quota = @min(p.limit / 8, core_memory.lean_decode / 2);
+        if (parent.drawExact(quota) == null) return error.ExceededMemoryBudget;
+        p.stream_budget = .{ .limit = quota, .parent = parent, .funded = quota };
+    }
+
+    fn releaseStream(p: *FailureProbe) void {
+        std.debug.assert(p.stream_budget.used.load(.monotonic) == 0);
+        p.stream_budget.releaseFloor();
+        p.stream_budget.parent = null;
+    }
 
     fn releaseGates(p: *FailureProbe) void {
         for (p.workers) |w| if (w.failed_gate) |gate| gate.done(gate.ctx, w.failed_rg, w.items_per_rg);
@@ -1514,6 +1533,11 @@ const FailureProbe = struct {
         const item = w.work[w.failed_item];
         const decision = w.plan.decide(site.rg, &w.metas[item.file]);
         return .{
+            .plan = w.plan.*,
+            .metas = w.metas,
+            .inputs = w.inputs,
+            .file = item.file,
+            .rg = item.rg,
             .in = .{
                 .rg = site.rg,
                 .meta = &w.metas[item.file],
@@ -1530,6 +1554,29 @@ const FailureProbe = struct {
         };
     }
 };
+
+/// Only on failure: count/discovery/admit passes may have omitted arguments or entire work items. Replay the
+/// query's ordinary full projection in input/RG order, including those omissions, after all scan storage is gone.
+fn canonicalFailurePrefix(a: std.mem.Allocator, p: FailureProbe.Context) @import("decode_order.zig").Failure {
+    for (p.metas[0 .. p.file + 1], 0..) |*meta, fi| {
+        // Streams already checked the full projection before returning their bytes; optional passes refuse them.
+        if (!p.inputs[fi].rescannable()) continue;
+        const end = if (fi == p.file) p.rg + 1 else meta.row_groups.items.len;
+        for (meta.row_groups.items[0..end]) |*rg| {
+            const decision = p.plan.decide(rg, meta);
+            if (decision == .skip) continue;
+            var in = p.in;
+            in.rg = rg;
+            in.meta = meta;
+            in.src = .{ .bytes = p.inputs[fi].plan_bytes orelse p.inputs[fi].bytes, .byte_origin = 0 };
+            in.filter = p.plan.filterFor(decision);
+            in.read = p.plan.columns.forRowGroup(decision);
+            in.error_read = null;
+            if (consumer.probeDecodeFailure(a, in, p.options, p.calls, p.scalar) catch null) |found| return found;
+        }
+    }
+    return p.original;
+}
 
 const WorkerFailureKey = struct {
     file: usize,
@@ -1629,6 +1676,7 @@ const Worker = struct {
     expr_batch_rows: ?usize = null,
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,
+    cache_hints: ?*consumer.CacheHints = null,
     error_outputs: ?[]const BoundOutputColumn = null,
     scan_workers: usize = 1,
     failure_probe: ?*FailureProbe = null,
@@ -1693,6 +1741,16 @@ const Worker = struct {
     index: usize = 0,
 };
 
+fn resetAttemptFlags(w: *Worker) void {
+    // These classify this attempt only. Retained mappings and charged allocators survive optional phases.
+    if (w.region) |*r| r.refused = false;
+    if (w.scratch_region) |*r| r.refused = false;
+    if (w.charged) |*c| {
+        c.refused.store(false, .monotonic);
+        c.drew.store(false, .monotonic);
+    }
+}
+
 fn workerRun(w: *Worker) void {
     const prof = profile.threadOf(w.profiler, .scan);
     const span = profile.Span.begin(prof);
@@ -1707,21 +1765,20 @@ fn workerRun(w: *Worker) void {
     defer expr_agg.distinct_pairs = null;
     consumer.setDecodeFailure(null);
     w.failure_work = null;
+    resetAttemptFlags(w);
     workerRunErr(w, prof, &items) catch |e| {
         w.err = workerRefusal(w, e);
         w.failure = consumer.decodeFailure();
         if (consumer.isDecodeError(e) and w.failure != null and w.failed_gate != null) {
             const probe = w.failure_probe.?;
-            probe.lock.lockUncancelable(blocking.io);
-            defer probe.lock.unlock(blocking.io);
             if (w.scratch_region) |*r| r.deinit();
             if (w.region) |*r| r.deinit();
             w.scratch_region = null;
             w.region = null;
+            probe.lock.lockUncancelable(blocking.io);
+            defer probe.lock.unlock(blocking.io);
             const p = FailureProbe.contextOf(w);
-            var own: core_memory.SharedBudget = .{ .limit = probe.limit };
-            var bound: core_memory.SharedBudget = .{ .limit = probe.limit, .parent = probe.ledger orelse w.ledger orelse &own };
-            var charged: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &bound };
+            var charged: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &probe.stream_budget };
             const failure = consumer.canonicalDecodeFailure(
                 charged.allocator(),
                 p.in,
@@ -1803,6 +1860,10 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         // stay resident in its per-thread arenas, held but no longer charged.
         w.charged = .{ .child = std.heap.page_allocator, .budget = l };
     };
+    // Cost hints may decline on a refused allocation. Their flags must not turn a subsequent host OOM into
+    // a ledger refusal; the storage is still charged to exactly the same ledger. Fresh for every attempt.
+    var unbounded_planning: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
+    var planning_charge: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = w.ledger orelse &unbounded_planning };
     const region = &w.region.?;
     defer region.rewind();
     var rg_decode_arena = consumer.RowGroupArena.initOn(region);
@@ -1926,10 +1987,12 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .budget = w.decode_budget,
             .region = region,
             .charged = if (w.charged) |*c| c.allocator() else null,
+            .planning_charged = planning_charge.allocator(),
             .ledger = w.ledger,
             .expr_batch_rows = w.expr_batch_rows,
             .decode_batch_rows = w.decode_batch_rows,
             .auto_decode_batches = w.auto_decode_batches,
+            .cache_hints = w.cache_hints,
             .scan_workers = w.scan_workers,
             .defer_decode_errors = w.failure_probe != null,
         }) catch |err| {
@@ -3020,7 +3083,7 @@ fn clearWorkerErrors(workers: []Worker, expected: anyerror) !void {
         // the query's refusal: discard the trial and let the established scan decide what fits.
         w.err = null;
     };
-    for (workers) |w| if (w.err) |other| return other;
+    if (firstWorkerFailure(workers, null)) |failure| return failure.err;
 }
 
 fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize)) !void {
@@ -3539,7 +3602,7 @@ fn prepareAggregate(
     };
     consumer.setDecodeFailure(null);
 
-    var probe: FailureProbe = .{ .limit = args.max_memory, .ledger = args.ledger };
+    var probe: FailureProbe = .{ .limit = args.max_memory };
     defer probe.releaseGates();
     var execution = args;
     execution.failure_probe = &probe;
@@ -3554,14 +3617,7 @@ fn prepareAggregate(
         // Independent of worker count and cache windows. The outer ledger accounts for any still-live input bytes.
         var bound: core_memory.SharedBudget = .{ .limit = args.max_memory, .parent = ledger };
         var charged: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &bound };
-        const failure = consumer.canonicalDecodeFailure(
-            charged.allocator(),
-            p.in,
-            p.options,
-            p.calls,
-            p.scalar,
-            p.original,
-        );
+        const failure = canonicalFailurePrefix(charged.allocator(), p);
         consumer.setDecodeFailure(failure.site);
         return failure.err;
     };
@@ -3916,8 +3972,7 @@ fn prepareAggregateWithMetas(
         if (msd_args.start_reads) |*starter| starter.planned = null;
     }
     if (!explain) if (inlineMsdAnswer(gpa, arena, msd_args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, false) catch |e| switch (e) {
-        error.OutOfMemory, error.RetainedEncodingUnsupported, error.RetainedOwnershipViolation =>
-            return error.ExceededMemoryBudget,
+        error.OutOfMemory, error.RetainedEncodingUnsupported, error.RetainedOwnershipViolation => return error.ExceededMemoryBudget,
         else => return e,
     }) |result| return result;
     plan_inputs.ndv_stat = ndv_stat;
@@ -3968,6 +4023,14 @@ fn prepareAggregateWithMetas(
     // Tables still share one pool. Only a prepaid private plan's decoders protect funded worker floors.
     var own_budget = expr_agg.SharedBudget{ .limit = args.max_memory };
     const group_budget = args.ledger orelse &own_budget;
+    // Non-rescannable sources must diagnose while their bytes are held, beside live peer workers.
+    // Reserve the error-only quota before any of those workers or tables can draw.
+    if (!allRescannable(args.inputs)) if (args.failure_probe) |p| try p.reserveStream(group_budget);
+    defer if (args.failure_probe) |p| p.releaseStream();
+    // Shared optional header memo: charged separately so a declined hint cannot poison decoder flags.
+    var hint_charge: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = group_budget };
+    var cache_hints: consumer.CacheHints = .{ .allocator = hint_charge.allocator() };
+    defer cache_hints.deinit();
     var private_decode: PrivateDecode = .{};
     // Declared before region cleanup: their actual allocations go before their funding returns to the query.
     defer private_decode.release();
@@ -4202,6 +4265,7 @@ fn prepareAggregateWithMetas(
             .expr_batch_rows = args.expr_batch_rows,
             .decode_batch_rows = args.decode_batch_rows,
             .auto_decode_batches = args.auto_decode_batches,
+            .cache_hints = &cache_hints,
             .scan_workers = n_workers,
             .error_outputs = group_outputs,
             .failure_probe = args.failure_probe,
@@ -4273,6 +4337,7 @@ fn prepareAggregateWithMetas(
     // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
     if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegions(workers);
     private_decode.release();
+    cache_hints.deinit();
     if (firstWorkerFailure(workers, args.failure_probe)) |failure| {
         const e = failure.err;
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
@@ -15794,7 +15859,11 @@ test "regression: counts pairs folded merge in place or under a count cut, as th
 
 test "clearWorkerErrors: a phase's expected failure is cleared on every worker, any other is returned" {
     var ws: [3]Worker = undefined;
-    for (&ws) |*w| w.err = null;
+    for (&ws) |*w| {
+        w.err = null;
+        w.failure_work = null;
+        w.failure = null;
+    }
     // The census trial's budget on one worker, a corrupt page on a later one: the page's error is the query's.
     ws[0].err = error.ExceededMemoryBudget;
     ws[2].err = error.CorruptPage;
@@ -16249,6 +16318,12 @@ test "worker refusal races replay an earlier corrupt row group in either complet
         workers[1 - refusal_worker].failure_work = 0;
         workers[1 - refusal_worker].failure.?.rg = &rgs[0];
         try testing.expectEqual(error.UnexpectedPage, firstWorkerFailure(&workers, null).?.err);
+
+        workers[refusal_worker].err = error.EarlierFailure;
+        workers[refusal_worker].failure_work = 0;
+        workers[1 - refusal_worker].err = error.LaterFailure;
+        workers[1 - refusal_worker].failure_work = 1;
+        try testing.expectError(error.EarlierFailure, clearWorkerErrors(&workers, error.CensusAbandoned));
 
         var chain: Chain = .{ .parts_tried = false };
         var diag: Diag = .{};
@@ -16835,4 +16910,149 @@ test "unordered keeps exact inline integer and byte answers and bounded SUM sele
             try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
         }
     };
+}
+
+test "stream probe funding is independent of peer ledger pressure and unwinds every refusal" {
+    const bytes = (try loadFixture("ci/fixtures/parquet/plain_values_corrupt.parquet")) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const meta = try metadata.open(arena.allocator(), bytes);
+    const in: consumer.AggRowGroup = .{
+        .rg = &meta.row_groups.items[0],
+        .meta = &meta,
+        .src = .{ .bytes = bytes, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{ true, true },
+        .consumed = &.{ true, true },
+    };
+    const original: @import("decode_order.zig").Failure = .{
+        .err = error.UnexpectedPage,
+        .site = .{ .rg = in.rg, .column = 1, .page = 0 },
+    };
+    for ([_]usize{ 64 << 10, 1 << 20 }) |limit| {
+        var expected: ?consumer.DecodeSite = null;
+        // Both orders: an idle peer, then one holding every unreserved byte, then idle again.
+        for ([_]bool{ false, true, false }) |pressure| {
+            var root: core_memory.SharedBudget = .{ .limit = limit };
+            var probe: FailureProbe = .{ .limit = limit };
+            try probe.reserveStream(&root);
+            const held = if (pressure) root.available() else 0;
+            _ = root.drawExact(held).?;
+            var charge: core_memory.Charged = .{ .child = testing.allocator, .budget = &probe.stream_budget };
+            const storage = try charge.allocator().alloc(u8, 4096);
+            try testing.expectEqual(@as(usize, 4096), probe.stream_budget.used.load(.monotonic));
+            charge.allocator().free(storage);
+            const found = consumer.canonicalDecodeFailure(charge.allocator(), in, .{}, &.{}, false, original);
+            try testing.expectEqual(error.UnexpectedPage, found.err);
+            if (expected) |want| try testing.expectEqualDeep(want, found.site) else expected = found.site;
+            try testing.expectEqual(@as(usize, 0), probe.stream_budget.used.load(.monotonic));
+            root.release(held);
+            probe.releaseStream();
+            try testing.expectEqual(@as(usize, 0), root.used.load(.monotonic));
+            try testing.expect(root.peak.load(.monotonic) <= limit);
+        }
+    }
+    var small: core_memory.SharedBudget = .{ .limit = 1 };
+    var probe: FailureProbe = .{ .limit = 1 << 20 };
+    try testing.expectError(error.ExceededMemoryBudget, probe.reserveStream(&small));
+    try testing.expectEqual(@as(usize, 0), small.used.load(.monotonic));
+}
+
+test "canonical full projection prefix includes count arguments and skipped admit items" {
+    const bytes = (try loadFixture("ci/fixtures/parquet/plain_values_corrupt.parquet")) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try metadata.open(a, bytes);
+    const groups = try a.alloc(schema.RowGroup, 3);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    const metas = [_]schema.FileMetaData{meta};
+    const inputs = [_]Input{.{ .name = "omitted.parquet", .bytes = bytes }};
+    const key = try expr_parser.parseExprOnly(a, "b", &meta, null);
+    const arg = try expr_parser.parseExprOnly(a, "s", &meta, null);
+    const calls = [_]expr_agg.AggCall{.{ .func = .min, .arg = arg, .where = null, .alias = "lo", .result = .bytes }};
+    const keys = [_]expr_ast.Expr{key};
+    const plan = try agg_plan.Plan.init(a, .{ .calls = &calls, .group_keys = &keys, .filter = null }, &metas, .ignore);
+    const count_columns = try plan.forCalls(a, &.{});
+    try testing.expect(!count_columns.read[1]);
+    const work = [_]WorkItem{.{ .file = 0, .rg = 2, .agg_start = 0, .agg_len = 1, .columns = count_columns, .accumulators = &.{} }};
+    var w: Worker = undefined;
+    w.plan = &plan;
+    w.metas = &metas;
+    w.inputs = &inputs;
+    w.work = &work;
+    w.failed_item = 0;
+    w.failure = .{ .rg = &groups[2], .column = 1, .page = 0 };
+    w.err = error.UnexpectedPage;
+    w.decode_options = .{};
+    w.agg_calls = &calls;
+    w.group_by_keys = &keys;
+    w.error_outputs = null;
+    // The worker sees only RG2, with a count-only projection. Neither controls the canonical replay.
+    const found = canonicalFailurePrefix(testing.allocator, FailureProbe.contextOf(&w));
+    try testing.expectEqual(error.UnexpectedPage, found.err);
+    try testing.expectEqual(&groups[0], found.site.rg);
+    try testing.expectEqual(@as(usize, 1), found.site.column);
+    // Force actual count passes to encounter a later corrupt key after skipping the earlier corrupt argument.
+    const last_columns = try a.dupe(schema.ColumnChunk, groups[2].columns.items);
+    const old_b = last_columns[0].meta_data.?;
+    last_columns[0].meta_data = last_columns[1].meta_data;
+    last_columns[0].meta_data.?.type = .INT32;
+    last_columns[0].meta_data.?.path_in_schema = old_b.path_in_schema;
+    groups[2].columns.items = last_columns;
+    const selected = try selectList(a, &.{ "b", "count(*) AS n", "min(s) AS lo" });
+    for ([_]usize{ 1, 2, 4, 16 }) |j| for ([_]usize{ 64 << 10, 1 << 20 }) |limit| {
+        for ([_]?bool{ null, false, true }) |fuse| {
+            var diag: Diag = .{};
+            const args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .metas = &metas,
+                .aggregate = "count(*) AS n,min(s) AS lo",
+                .group_by = "b",
+                .select_cols = selected,
+                .scan_all = true,
+                .ndv_policy = false,
+                .plain_rules = false,
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+                .max_memory = limit,
+                .decode_limit = limit / 2,
+                .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 1 },
+                .sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1, .fuse_census = fuse },
+                .diag = &diag,
+            };
+            const ex = try explainAggregate(testing.allocator, a, args);
+            try testing.expectEqual(.sketch, ex.plan.dispatch.strategy);
+            try testing.expectError(error.UnexpectedPage, runMultiAggregate(testing.allocator, a, args));
+            try testing.expectEqual(@as(usize, 0), diag.detail.decode.row_group);
+            try testing.expectEqualStrings("s", diag.detail.decode.column.get());
+        }
+    };
+    // An earlier valid RG must contribute no invented marker. The next omitted RG still wins.
+    const first_columns = try a.dupe(schema.ColumnChunk, groups[0].columns.items);
+    first_columns[1].meta_data.?.num_values = 0;
+    groups[0].columns.items = first_columns;
+    const next = canonicalFailurePrefix(testing.allocator, FailureProbe.contextOf(&w));
+    try testing.expectEqual(&groups[1], next.site.rg);
+}
+
+test "cost hint and previous attempt refusals never classify a later host OOM" {
+    var budget: core_memory.SharedBudget = .{ .limit = 0 };
+    var w: Worker = undefined;
+    w.region = null;
+    w.scratch_region = null;
+    w.charged = .{ .child = testing.allocator, .budget = &budget };
+    try testing.expectError(error.OutOfMemory, w.charged.?.allocator().alloc(u8, 1));
+    try testing.expectEqual(error.ExceededMemoryBudget, workerRefusal(&w, error.OutOfMemory));
+    resetAttemptFlags(&w);
+    var hint: core_memory.Charged = .{ .child = testing.allocator, .budget = &budget };
+    try testing.expectError(error.OutOfMemory, hint.allocator().alloc(u8, 1));
+    try testing.expectEqual(error.OutOfMemory, workerRefusal(&w, error.OutOfMemory));
+    try testing.expect(!decodeHeld(&w));
+    // A real refusal in this attempt still classifies normally.
+    try testing.expectError(error.OutOfMemory, w.charged.?.allocator().alloc(u8, 1));
+    try testing.expectEqual(error.ExceededMemoryBudget, workerRefusal(&w, error.OutOfMemory));
 }

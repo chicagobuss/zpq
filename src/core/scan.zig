@@ -715,6 +715,7 @@ pub const Reason = enum {
     census_needs_uniqueness_evidence,
     census_fixed_width_bail,
     census_short_string_composite,
+    census_short_string_payload,
     high_cardinality_strings,
     worker_copy_memory,
     dictionary_union,
@@ -944,7 +945,7 @@ fn plainDispatch(plan: *ScanPlan, strategy: @FieldType(AggregateDispatch, "strat
     for ([_]Reason{
         .sketch_count_cut,              .first_keys_cut,                   .census_fused,
         .census_on_sketch_bail,         .census_needs_uniqueness_evidence, .census_fixed_width_bail,
-        .census_short_string_composite, .census_distinct,
+        .census_short_string_composite, .census_short_string_payload,      .census_distinct,
     }) |r|
         plan.reasons.remove(r);
     plan.reasons.insert(.plain_scan);
@@ -1105,8 +1106,13 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     // payloads and long keys on the existing path; only the runtime sparse-repeat hint can justify this census.
     const short_composite = !small and stat.string_keys and keys.len > 1 and
         stat.key_bytes < 32 and in.calls.len == 1;
+    // A short byte key plus total payloads can avoid almost all losing-group state. The encoded average width
+    // is a cost hint, bounded by the packed key's 15 bytes plus its length word; complete keys still decide equality.
+    const short_payload = stat.string_keys and keys.len == 1 and keys[0] == .col_ref and
+        keys[0].col_ref.expr_type == .str and in.calls.len > 1 and in.args.filter == null and
+        stat.key_bytes <= 15 + @sizeOf(u32);
     const bail_census = plan.dispatch.strategy == .sketch and plan.dispatch.census_allowed and
-        (expr_agg.fixedGroupStride(keys) != null or short_composite) and !tiny and !cheap_r1;
+        (expr_agg.fixedGroupStride(keys) != null or short_composite or short_payload) and !tiny and !cheap_r1;
     // Dictionary bounds never authorize automatic fusion. A census after a bail is a separate, certified cost bet; it
     // rides along the count pass when a fixed-width key is stored at plain width (`keysLookUnique`), a guess that only
     // decides where the census counts: each worker still drops it once its own cells separate the cut.
@@ -1119,16 +1125,19 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
             expr_agg.fixedGroupStride(keys) != null;
         plan.dispatch.keys_unique = looks_unique;
         plan.dispatch.census_allowed = bail_census;
-        plan.dispatch.census_fused = looks_unique or fixed_composite;
+        plan.dispatch.census_fused = looks_unique or fixed_composite or (bail_census and short_payload);
         plan.dispatch.census_cell_repeat_gate = bail_census and (short_composite or !bounded_census);
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
         if (looks_unique) plan.reasons.insert(.keys_look_unique);
-        if (looks_unique or fixed_composite) plan.reasons.insert(.census_fused);
+        if (plan.dispatch.census_fused) plan.reasons.insert(.census_fused);
         if (plan.dispatch.strategy == .sketch) {
             if (bail_census) {
-                plan.reasons.insert(if (short_composite) .census_short_string_composite else .census_fixed_width_bail);
+                plan.reasons.insert(if (short_composite) .census_short_string_composite else if (short_payload)
+                    .census_short_string_payload
+                else
+                    .census_fixed_width_bail);
                 plan.reasons.insert(.census_on_sketch_bail);
             } else plan.reasons.insert(.census_needs_uniqueness_evidence);
         }
@@ -1177,7 +1186,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         // Recounting unknown string marginals can lose even when grouping is expensive. Keep only the short-tuple
         // sparse-repeat bet here; partial coverage may still retain a useful sketch for skew (ClickBench).
         if (stat.string_keys and stat.covered_rows == 0 and stat.encoding_stats_rows == stat.rows and
-            plan.dispatch.strategy == .sketch and !(short_composite and bail_census))
+            plan.dispatch.strategy == .sketch and !((short_composite or short_payload) and bail_census))
             plainDispatch(plan, .plain_hash);
     }
     const long_strings = stat.string_keys and stat.key_bytes >= 32 and stat.rows >= 65536;
@@ -18588,4 +18597,52 @@ test "COUNT certificate exclusion is strict at ties and never trusts a saturated
     try testing.expect(!saturated.proves(std.math.maxInt(u64)));
     const empty: CountBoundPlan = .{ .bound = 0 };
     try testing.expect(empty.proves(0));
+}
+
+test "COUNT-certified payloads preserve signed SUM, exact integer AVG, NULLs, extrema and complete counts" {
+    var used_certificate = false;
+    var used_payload_policy = false;
+    for ([_][]const u8{ "plain", "dict" }) |encoding| {
+        var held = std.heap.ArenaAllocator.init(testing.allocator);
+        defer held.deinit();
+        const path = try std.fmt.allocPrint(held.allocator(), "ci/fixtures/parquet/count_certificate_{s}.parquet", .{encoding});
+        const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 8 << 20, 512 << 20 }) |budget| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .aggregate = "count(*) AS c, sum(v) AS total, avg(v) AS av, min(v) AS mn, max(v) AS mx",
+                .group_by = "s",
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+                .max_memory = budget,
+                .decode_limit = budget,
+                .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 2 },
+                .dense = false,
+                .ndv_union = false,
+            };
+            var want = try runMultiAggregate(testing.allocator, arena.allocator(), args);
+            defer want.deinit(testing.allocator);
+            var outcome: SketchTopK.Outcome = .ineligible;
+            var trial = args;
+            trial.sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1, .outcome = &outcome };
+            const explained = try explainAggregate(testing.allocator, arena.allocator(), trial);
+            var got = try runMultiAggregate(testing.allocator, arena.allocator(), trial);
+            defer got.deinit(testing.allocator);
+            used_certificate = used_certificate or outcome == .census or outcome == .certified;
+            if (explained.plan.reasons.contains(.census_short_string_payload)) {
+                used_payload_policy = true;
+                try testing.expect(explained.plan.dispatch.census_allowed and explained.plan.dispatch.census_fused);
+            }
+            try want.output.applyResultOrder(testing.allocator, args.result_order);
+            try got.output.applyResultOrder(testing.allocator, args.result_order);
+            try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
+        };
+    }
+    try testing.expect(used_certificate);
+    try testing.expect(used_payload_policy);
 }

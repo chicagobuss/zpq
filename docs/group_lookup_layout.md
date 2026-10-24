@@ -30,3 +30,10 @@ keys and certifies only when its exact cutoff exceeds every excluded bound. The 
 prove that enough complete singleton groups first appear before every excluded tie. Cell and identity candidates
 share the residual scan and verification; discarded count records are released before that scan. Legacy
 `ZPQ_SKETCH_*`/census controls select producers within this certificate, rather than separate COUNT executors.
+
+For unfiltered short byte keys, COUNT-ranked payload cuts can collect identity bounds during the first key pass,
+then fold payload state only for admitted full keys. COUNT alone proves the cut, so signed integer SUM is valid;
+integer AVG keeps its exact sum and non-NULL denominator. MIN/MAX and first positions retain their ordinary
+semantics. Fallible payload expressions, DECIMAL overflow and order-sensitive float folds keep their established
+eligibility exclusions. Payload columns still decode through the normal paths, including losing-group rows;
+a small candidate row count does not imply sparse payload pages or suppress their required decode errors.

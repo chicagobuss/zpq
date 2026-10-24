@@ -17,7 +17,10 @@ def main():
         f[i] = None
     # These rows need cold bounds even if a sample learned only the small central f interval.
     f[-1], f[-2] = -(1 << 63), (1 << 63) - 1
-    table = pa.table({"k": pa.array(k, pa.int64()), "f": pa.array(f, pa.int64())})
+    s = [None if value is None else str(value) for value in k]
+    v = [None if i % 11 == 0 else (i % 31) - 15 for i in range(rows)]
+    table = pa.table({"k": pa.array(k, pa.int64()), "f": pa.array(f, pa.int64()),
+                      "s": pa.array(s, pa.string()), "v": pa.array(v, pa.int64())})
     root = Path(__file__).resolve().parent.parent / "ci/fixtures/parquet"
     for coded in (False, True):
         path = root / f"count_certificate_{'dict' if coded else 'plain'}.parquet"

@@ -45,7 +45,7 @@ pub fn startWriteback(fd: fd_t, offset: u64, len: u64) !void {
     while (true) {
         const rc = linux.syscall4(.sync_file_range, @intCast(fd), @intCast(offset), @intCast(len), 2);
         switch (linux.errno(rc)) {
-            .SUCCESS, .NOSYS, .INVAL, .OPNOTSUPP => return,
+            .SUCCESS, .NOSYS, .INVAL, .OPNOTSUPP, .SPIPE => return,
             .INTR => continue,
             .IO => return error.InputOutput,
             .NOSPC, .DQUOT => return error.NoSpaceLeft,
@@ -823,4 +823,17 @@ test "starting writeback preserves the bytes and the write position" {
     const bytes = try readFile(t.allocator, path);
     defer t.allocator.free(bytes);
     try t.expectEqualStrings("beforeafter", bytes);
+}
+
+
+test "writeback hints leave pipe outputs usable" {
+    var fds: [2]fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer close(fds[0]);
+    defer close(fds[1]);
+    try writeAll(fds[1], "x");
+    try startWriteback(fds[1], 0, 1);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), posix.system.read(fds[0], &byte, 1));
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
 }

@@ -131,7 +131,8 @@ truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) AS
 for workers in (1, 4):
     for census in ("0", "1"):
         result = run(sql, workers, overrides={"ZPQ_SKETCH_CENSUS": census, "ZPQ_SKETCH_TRACE": "1"},
-                     trace_expect=("try=true", "certified=true") if census == "1" else ())
+                     trace_expect=("hash_identity_try=true", "certificate: residual_ms=", "proven=true")
+                     if census == "1" else ())
         assert [tuple(row[c] for c in ("k", "f", "c")) for row in result] == truth, result
 for sql in (f"SELECT k, count(*) AS c FROM '{strings}' GROUP BY k ORDER BY c DESC LIMIT 10",
             f"SELECT k, f, count(*) AS c, sum(pos) AS s FROM '{strings}' GROUP BY k, f ORDER BY c DESC LIMIT 10"):

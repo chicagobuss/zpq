@@ -657,44 +657,39 @@ test "two regions' row-group fit checks can both pass; their draws still hold th
     try std.testing.expectEqual(@as(usize, 0), b.end);
 }
 
-/// The number on `key`'s line for the mapping holding `addr`, as /proc/self/smaps reports it.
-fn smapsFieldForTest(addr: usize, key: []const u8) !usize {
-    const linux = std.os.linux;
-    const rc = linux.open("/proc/self/smaps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
-    const fd: i32 = @intCast(rc);
-    defer _ = linux.close(fd);
-    const buf = try std.testing.allocator.alloc(u8, 8 << 20);
-    defer std.testing.allocator.free(buf);
-    var len: usize = 0;
-    while (true) {
-        const nr = linux.read(fd, buf[len..].ptr, buf.len - len);
-        if (linux.errno(nr) != .SUCCESS or len + nr == buf.len) return error.ReadFailed;
-        if (nr == 0) break;
-        len += nr;
+/// Resident bytes in this owned range. A containing smaps VMA can include neighbouring retained mappings.
+fn rssForTest(addr: usize, len: usize) !usize {
+    const page = std.heap.pageSize();
+    std.debug.assert(std.mem.isAligned(addr, page) and len % page == 0);
+    var vec: [512]u8 = undefined;
+    var offset: usize = 0;
+    var resident: usize = 0;
+    while (offset < len) {
+        const bytes = @min(len - offset, vec.len * page);
+        const rc = std.os.linux.mincore(@ptrFromInt(addr + offset), bytes, &vec);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.ReadFailed;
+        for (vec[0 .. bytes / page]) |v| resident += v & 1;
+        offset += bytes;
     }
-    var inside = false;
-    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
-    while (lines.next()) |line| {
-        const dash = std.mem.indexOfScalar(u8, line, '-');
-        const space = std.mem.indexOfScalar(u8, line, ' ');
-        if (dash != null and space != null and dash.? < space.?) header: {
-            const lo = std.fmt.parseInt(usize, line[0..dash.?], 16) catch break :header;
-            const hi = std.fmt.parseInt(usize, line[dash.? + 1 .. space.?], 16) catch break :header;
-            inside = lo <= addr and addr < hi;
-            continue;
-        }
-        if (inside and std.mem.startsWith(u8, line, key)) {
-            var words = std.mem.tokenizeScalar(u8, line[key.len..], ' ');
-            return std.fmt.parseInt(usize, words.next() orelse return error.ReadFailed, 10);
-        }
-    }
-    return error.SkipZigTest;
+    return resident * page;
 }
 
-/// The resident bytes of the mapping holding `addr`, as /proc/self/smaps reports them.
-fn rssForTest(addr: usize) !usize {
-    return (try smapsFieldForTest(addr, "Rss:")) * 1024;
+test "RSS range excludes resident neighbours in the same VMA" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+    const mapping = try std.posix.mmap(null, 4 * page, .{ .READ = true, .WRITE = true }, flags, -1, 0);
+    defer std.posix.munmap(mapping);
+    // Keep exact base-page residency even on hosts with always-on transparent huge pages.
+    const rc = std.os.linux.madvise(mapping.ptr, mapping.len, std.os.linux.MADV.NOHUGEPAGE);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+    @memset(mapping[0..page], 1);
+    @memset(mapping[2 * page ..], 2);
+    const base = @intFromPtr(mapping.ptr);
+    try std.testing.expectEqual(page, try rssForTest(base, 2 * page));
+    try std.testing.expectEqual(@as(usize, 0), try rssForTest(base + page, page));
+    try std.testing.expectEqual(2 * page, try rssForTest(base + 2 * page, 2 * page));
+    try std.testing.expectEqual(3 * page, try rssForTest(base, mapping.len));
 }
 
 test "a worker's pair of regions shares its first huge page, counted once, and holds no more than it draws past it" {
@@ -735,7 +730,8 @@ test "a worker's pair of regions shares its first huge page, counted once, and h
     try std.testing.expectEqual(huge + span, budget.used.load(.monotonic));
     scratch.allocator().free(big);
     // Resident: never more than drawn plus the one slack page (whole huge pages where THP backs them).
-    try std.testing.expect(try rssForTest(base) <= arena.charged + scratch.charged + huge);
+    const resident = try rssForTest(base, scratch.buf.len + arena.buf.len);
+    try std.testing.expect(resident <= arena.charged + scratch.charged + huge);
     // A budget that refuses the arena's next page refuses the block; what it holds stays.
     budget.limit = budget.used.load(.monotonic);
     try std.testing.expectError(error.OutOfMemory, arena.allocator().alloc(u8, 2 * huge));

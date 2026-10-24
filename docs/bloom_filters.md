@@ -114,8 +114,11 @@ windowed S3 input releases the row group before the footer) and held until the f
 `--max-memory`: its stored size, whatever probability it was written at.
 
 A byte copy keeps each copied chunk's filter, whatever probability it was written at; a requested column whose source
-chunk has none is decoded to build one. A re-encoded row group gets filters only for requested columns. Dropped columns
-lose theirs. BOOLEAN, INT96, nested and FIXED_LEN_BYTE_ARRAY DECIMAL columns take none. The encoder also writes
+chunk has none is decoded to build one. A re-encoded row group gets automatic dictionary filters and any explicitly requested filters. Dropped columns
+lose theirs. Explicit specifications reject BOOLEAN, INT96, nested and FIXED_LEN_BYTE_ARRAY DECIMAL columns.
+Automatic generation also covers copied nested dictionaries and INT96 dictionaries; INT96 entries hash as their
+12 PLAIN bytes, without timestamp conversion. Noncanonical INT96 times of day decline automatic generation: a
+reader can normalize them to a different byte representation of the same instant. The encoder also writes
 `encoding_stats`, so its dictionary-encoded chunks can be pruned on their dictionaries by any reader.
 
 ## Checking it

@@ -2588,7 +2588,12 @@ const AggColumnWave = struct {
                 if (i >= t.cols.len) return;
                 const elem = aggLeafElem(t.cols[i]);
                 t.results[i] = encodeAggOutputCol(
-                    t.arenas[i].allocator(), t.cols[i], &elem, t.codec, t.zstd, t.dictionary_bloom,
+                    t.arenas[i].allocator(),
+                    t.cols[i],
+                    &elem,
+                    t.codec,
+                    t.zstd,
+                    t.dictionary_bloom,
                 );
             }
         }
@@ -5605,7 +5610,7 @@ fn dictionaryBloom(
             i64 => cm.type == .INT64,
             f32 => cm.type == .FLOAT,
             f64 => cm.type == .DOUBLE,
-            []const u8 => cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY,
+            []const u8 => cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY or cm.type == .INT96,
             else => unreachable,
         };
         if (matches) {
@@ -5617,12 +5622,21 @@ fn dictionaryBloom(
                 column_mod.chunkOptions(.{}, meta, cm),
                 null,
             );
-            if (T == []const u8 and cm.type == .FIXED_LEN_BYTE_ARRAY)
-                reader.type_length = flbaWidth(meta.getColumnSchema(cm.path_in_schema.items));
+            if (T == []const u8) {
+                if (cm.type == .INT96) reader.type_length = int96_mod.INT96_WIDTH else if (cm.type == .FIXED_LEN_BYTE_ARRAY)
+                    reader.type_length = flbaWidth(meta.getColumnSchema(cm.path_in_schema.items));
+            }
             const entries = try reader.dictionaryOfEveryPage() orelse return null;
+            if (T == []const u8 and cm.type == .INT96) for (entries) |entry| {
+                // Noncanonical times can equal another day's timestamp; a reader may hash that canonical form.
+                const nanos = std.mem.readInt(i64, entry[0..8], .little);
+                if (nanos < 0 or nanos >= std.time.ns_per_day) return null;
+            };
             const tag = if (T == []const u8) "string" else @typeName(T);
             const col = @unionInit(filter_eval.Batch.Column, tag, .{ .values = entries });
-            return encoder.bloomFilter(a, col, cm.type, 0.01);
+            // INT96 PLAIN is 12 raw bytes, hashed as a fixed byte array, without converting its timestamp.
+            const hash_type = if (cm.type == .INT96) .FIXED_LEN_BYTE_ARRAY else cm.type;
+            return encoder.bloomFilter(a, col, hash_type, 0.01);
         }
     }
     return null;
@@ -9510,7 +9524,6 @@ fn testScalarCache(backing: std.mem.Allocator) !void {
     }
 }
 
-
 test "writeAggregateRows preserves the automatic Bloom policy for small and parallel answers" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -9529,5 +9542,61 @@ test "writeAggregateRows preserves the automatic Bloom policy for small and para
             try std.testing.expect(repeated.dictionary_page_offset != null);
             try std.testing.expectEqual(enabled, repeated.bloom_filter_offset != null);
         };
+    }
+}
+
+test "copied INT96 dictionary filters hash raw entries and decline noncanonical times" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const bloom = @import("parquet/bloom.zig");
+    var elem: schema.SchemaElement = .{
+        .name = "t",
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = int96_mod.INT96_WIDTH,
+        .repetition_type = .REQUIRED,
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var raw: [2][12]u8 = @splat(@splat(0));
+    for (&raw) |*v| std.mem.writeInt(u32, v[8..12], 2440588, .little);
+    var values: [256][]const u8 = undefined;
+    for (&values, 0..) |*v, i| v.* = &raw[i % 2];
+    for ([_]bool{ false, true }) |noncanonical| {
+        std.mem.writeInt(i64, raw[1][0..8], if (noncanonical) std.time.ns_per_day else 2_000_000_000, .little);
+        const encoded = try encoder.encodeColumn(a, .{
+            .values = .{ .string = .{ .values = &values } },
+            .schema_elem = &elem,
+            .path_in_schema = &.{"t"},
+            .dictionary_bloom = false,
+        });
+        var cm = encoded.meta;
+        cm.type = .INT96;
+        var root = elem;
+        root.name = "root";
+        root.type = null;
+        root.type_length = null;
+        root.num_children = 1;
+        var meta: schema.FileMetaData = .{
+            .version = 2,
+            .schema = .empty,
+            .num_rows = values.len,
+            .created_by = schema.ZPQ_CREATED_BY,
+            .row_groups = .empty,
+        };
+        try meta.schema.append(a, root);
+        var leaf = elem;
+        leaf.type = .INT96;
+        leaf.type_length = null;
+        try meta.schema.append(a, leaf);
+        const filter = try dictionaryBloom(a, encoded.bytes, cm, .{ .max_def = 0, .max_rep = 0 }, &meta);
+        if (noncanonical) {
+            try std.testing.expect(filter == null);
+        } else {
+            const bits = bloom.bitset(filter.?).?;
+            for (raw) |v| try std.testing.expect(bloom.Probe.init(bloom.hashBytes(&v)).mightContain(bits));
+        }
     }
 }

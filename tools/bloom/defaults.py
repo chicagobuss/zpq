@@ -6,6 +6,8 @@ Usage: defaults.py ZPQ [LIBZPQ]
 
 import pathlib
 import os
+import datetime as dt
+import struct
 import sys
 import tempfile
 
@@ -95,6 +97,25 @@ def main():
         assert pq.read_table(output).equals(nested_table)
         assert duckdb.sql(f"SELECT count(*) FROM '{output}'").fetchone()[0] == 1000
         assert all(c[2] is not None for c in sbbf.footer_filters(output)[0])
+        int96 = root / "int96.parquet"
+        epoch = dt.datetime(2020, 1, 1)
+        timestamps = [epoch + dt.timedelta(seconds=(i % 64) * 2) for i in range(1000)]
+        int96_table = pa.table({"t": pa.array(timestamps, type=pa.timestamp("ns"))})
+        pq.write_table(int96_table, int96, use_dictionary=True, use_deprecated_int96_timestamps=True)
+        assert pq.ParquetFile(int96).metadata.row_group(0).column(0).physical_type == "INT96"
+        for auto, options in [(True, []), (False, ["--no-bloom-filters"])]:
+            zpq.write(str(int96), str(output), *options)
+            assert pq.read_table(output).equals(int96_table)
+            assert duckdb.sql(f"SELECT count(*),min(t),max(t) FROM '{output}'").fetchone() == (
+                1000, min(timestamps), max(timestamps))
+            path, physical, offset, length = sbbf.footer_filters(output)[0][0]
+            assert physical == "INT96" and (offset is not None) == auto
+            if auto:
+                bits = sbbf.load(output, offset, length)
+                julian = (epoch.date() - dt.date(1970, 1, 1)).days + 2440588
+                for seconds in range(0, 128, 2):
+                    plain = struct.pack("<qI", seconds * 1_000_000_000, julian)
+                    assert sbbf.check(bits, sbbf.xxh64(plain)), seconds
         mixed = root / "mixed.parquet"
         mixed_table = pa.table({"s": [f"long value {i:08d}" for i in range(5000)]})
         pq.write_table(mixed_table, mixed, use_dictionary=True, dictionary_pagesize_limit=128, write_batch_size=64)

@@ -24,6 +24,20 @@ pub fn closeChecked(fd: fd_t) !void {
     }
 }
 
+/// Flush data and the metadata needed to read it before publication. Darwin has no fdatasync.
+pub fn syncData(fd: fd_t) !void {
+    while (true) {
+        const rc = if (builtin.os.tag == .macos) posix.system.fsync(fd) else posix.system.fdatasync(fd);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .IO => return error.InputOutput,
+            .NOSPC, .DQUOT => return error.NoSpaceLeft,
+            else => return error.SyncFailed,
+        }
+    }
+}
+
 pub fn openRead(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
 }

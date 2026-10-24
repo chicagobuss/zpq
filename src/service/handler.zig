@@ -306,6 +306,7 @@ pub fn handle(
             .parallelism = req.parallelism,
             .filter = req.filter,
             .output = req.output_url,
+            .fsync = req.fsync orelse zpq.output_publication.default_fsync,
             .columns = req.columns,
             .select = req.select,
             .aggregate = req.aggregate,
@@ -948,7 +949,7 @@ fn runWrite(
     var diag: Diag = .{};
     var args = qa;
     args.diag = &diag;
-    var publication: zpq.output_publication.OutputPublication = .{};
+    var publication: zpq.output_publication.OutputPublication = .{ .fsync = qa.fsync };
     defer publication.abort();
     args.output = publication.prepare(io, qa.output, qa.inputs) catch |err|
         return engineError(allocator, err, &diag);

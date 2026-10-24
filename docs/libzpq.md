@@ -316,3 +316,10 @@ in perf counters.
 with RSS checks, compares CLI error messages, and overlaps successful and failed SQL on 16 caller threads.
 Set `ZPQ_CLICKBENCH` to the sub1 parquet path and `ZPQ_CLICKBENCH_QUERIES` to the ClickBench queries.sql to
 include its 20-query slice alongside the 30 study shapes. `run.sh` invokes it after the existing gates.
+
+Local `output_url` files are staged in an exclusive sibling temporary file and renamed
+only after a successful write. Failures preserve an existing target and remove staging
+files. The JSON request accepts `"fsync": true` or `"fsync": false` to control syncing
+the output data before rename (the CLI equivalents are `--fsync` and `--no-fsync`).
+This applies to local files; S3 and standard output do not use this option. The parent
+directory is not synced, so this option does not guarantee rename survival after power loss.

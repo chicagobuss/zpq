@@ -67,6 +67,7 @@ usage:
                  Local files publish atomically; failed stdout can
                  contain a partial result. Check pipeline status.
 
+  \-\-fsync / \-\-no\-fsync   Sync local output before rename, or skip sync.
   \-\-codec        output codec. Without it, re\-encoded output is snappy
                  and a plain copy keeps each chunk's codec; with it, a
                  plain copy recompresses chunks stored in another one.

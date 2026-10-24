@@ -23,6 +23,7 @@ const Wire = struct {
     columns: ?std.json.Value = null,
     filter: ?std.json.Value = null,
     output_url: ?std.json.Value = null,
+    fsync: ?std.json.Value = null,
     output_codec: ?std.json.Value = null,
     compress_priority: ?std.json.Value = null,
     select: ?std.json.Value = null,
@@ -52,6 +53,8 @@ pub const Request = struct {
     columns: ?[]const []const u8 = null,
     filter: ?[]const u8 = null,
     output_url: ?[]const u8 = null,
+    /// Sync local output before publication; absent/null uses the shared default.
+    fsync: ?bool = null,
     output_codec: ?[]const u8 = null,
     /// `compress_priority`: "size" or "speed", as the CLI's `--compress-priority` takes them.
     compress_priority: ?[]const u8 = null,
@@ -133,6 +136,11 @@ pub const Request = struct {
         }
         req.filter = try f.string("filter");
         req.output_url = try f.string("output_url");
+        req.fsync = if (parsed.value.fsync) |v| switch (v) {
+            .bool => |b| b,
+            .null => null,
+            else => return f.bad("fsync"),
+        } else null;
         req.output_codec = try f.string("output_codec");
         req.compress_priority = try f.string("compress_priority");
         req.select = try f.string("select");
@@ -452,4 +460,22 @@ test "SQL excludes structured fields, validates options and releases partial all
     const negative = "{\"sql\":\"SELECT * FROM 'a'\",\"parallelism\":-1}";
     try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, negative, &bad));
     try testing.expectEqualStrings("parallelism", bad);
+}
+
+test "fsync accepts both polarities and null; wrong types name the field" {
+    const Check = struct {
+        fn parse(a: std.mem.Allocator) !void {
+            var bad: []const u8 = "";
+            inline for (.{ "true", "false", "null" }) |value| {
+                var req = try Request.parse(a, "{\"inputs\":[\"a\"],\"fsync\":" ++ value ++ "}", &bad);
+                defer req.deinit();
+                const expected: ?bool = if (std.mem.eql(u8, value, "null")) null else std.mem.eql(u8, value, "true");
+                try testing.expectEqual(expected, req.fsync);
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Check.parse, .{});
+    var bad: []const u8 = "";
+    try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, "{\"inputs\":[\"a\"],\"fsync\":1}", &bad));
+    try testing.expectEqualStrings("fsync", bad);
 }

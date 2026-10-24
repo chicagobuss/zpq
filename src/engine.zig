@@ -264,7 +264,9 @@ pub const QueryArgs = struct {
     partagg: bool = false,
     inputs: []const []const u8, // raw paths/URLs (pre-glob — caller globs)
     output: ?[]const u8 = null,
-    /// CLI-only: an already-open sink and an empty scalar result cut.
+    /// Sync local output data before atomic publication (CLI and libzpq).
+    fsync: bool = @import("output_publication.zig").default_fsync,
+    /// An already-open sink and an empty scalar result cut.
     output_fd: ?local_fs.fd_t = null,
     /// CLI-only: the answer is only written to Parquet, so a GROUP BY may build it as typed columns
     /// (`scan.MultiAggArgs.typed_answer`), never read back as rows.

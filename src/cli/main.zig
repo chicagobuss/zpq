@@ -194,6 +194,7 @@ fn runQuery(
     var aggregate: ?[]const u8 = null;
     var explain: bool = false;
     var query: ?[]const u8 = null;
+    var fsync = zpq.output_publication.default_fsync;
     var codec: ?schema.CompressionCodec = null;
     var compress_priority: engine.CompressPriority = .size;
     var parallelism: usize = 0;
@@ -253,6 +254,10 @@ fn runQuery(
                 diagnosticPrint("zpq query: --query requires a value\n", .{});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--fsync")) {
+            fsync = true;
+        } else if (std.mem.eql(u8, tok, "--no-fsync")) {
+            fsync = false;
         } else if (std.mem.eql(u8, tok, "--codec")) {
             const v = iter.next() orelse {
                 diagnosticPrint("zpq query: --codec requires a value\n", .{});
@@ -503,7 +508,7 @@ fn runQuery(
         return error.BadArgs;
     }
     if (group_by != null) result_order.limit = if (limit) |n| @intCast(n) else result_order.limit;
-    var publication: zpq.output_publication.OutputPublication = .{};
+    var publication: zpq.output_publication.OutputPublication = .{ .fsync = fsync };
     defer publication.abort();
     const engine_output = if (explain) output else if (to_stdout) null else publication.prepare(io, output, inputs) catch |err| {
         switch (err) {

@@ -11,10 +11,12 @@ complete -c zpq -l explain
 complete -c zpq -l fast-levels
 complete -c zpq -l filter
 complete -c zpq -l format
+complete -c zpq -l fsync
 complete -c zpq -l group-by
 complete -c zpq -l help
 complete -c zpq -l limit
 complete -c zpq -l max-memory
+complete -c zpq -l no-fsync
 complete -c zpq -l output
 complete -c zpq -l profile
 complete -c zpq -l profile-summary

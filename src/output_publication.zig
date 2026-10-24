@@ -2,9 +2,13 @@
 const std = @import("std");
 const local_fs = @import("local_fs.zig");
 
+// Preserve the existing policy until Joshua selects the shipping default.
+pub const default_fsync = false;
+
 var next_id: std.atomic.Value(u64) = .init(0);
 
 pub const OutputPublication = struct {
+    fsync: bool = default_fsync,
     target: ?[]const u8 = null,
     permissions: ?std.Io.File.Permissions = null,
     fd: ?local_fs.fd_t = null,
@@ -57,6 +61,8 @@ pub const OutputPublication = struct {
             const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
             try file.setPermissions(io, permissions);
         }
+        // Keep ownership until sync succeeds, so abort also closes the fd on a writeback error.
+        if (self.fsync) try local_fs.syncData(fd);
         self.fd = null;
         try local_fs.closeChecked(fd);
         try local_fs.rename(self.path(), target);
@@ -82,7 +88,7 @@ test "publication abort preserves target; concurrent preparations retain separat
     local_fs.close(old);
     var a: OutputPublication = .{};
     defer a.abort();
-    var b: OutputPublication = .{};
+    var b: OutputPublication = .{ .fsync = true };
     defer b.abort();
     _ = try a.prepare(t.io, target, &.{});
     _ = try b.prepare(t.io, target, &.{});

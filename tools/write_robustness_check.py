@@ -391,8 +391,8 @@ def test_case_4_device_error(root: Path, src_clean: Path):
         subprocess.run(['sudo', dmsetup, 'create', dm_name, '--table', f'0 32768 linear {loop} 0'], check=True)
         subprocess.run(['sudo', mkfs, '-F', '-q', dm_dev], check=True)
 
-        # Mount with synchronous writes so device I/O errors are immediately raised to write()
-        subprocess.run(['sudo', 'mount', '-o', 'sync', dm_dev, str(mnt)], check=True)
+        # Async ext4 must report delayed writeback errors at fdatasync before publication.
+        subprocess.run(['sudo', 'mount', '-o', 'async', dm_dev, str(mnt)], check=True)
         subprocess.run(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(mnt)], check=True)
 
         def setup_dm_iteration(existing_content=None):
@@ -400,13 +400,15 @@ def test_case_4_device_error(root: Path, src_clean: Path):
             subprocess.run(['sudo', dmsetup, 'load', dm_name, '--table', f'0 32768 linear {loop} 0'], check=True)
             subprocess.run(['sudo', dmsetup, 'resume', dm_name], check=True)
             subprocess.run(['sudo', mkfs, '-F', '-q', dm_dev], check=True)
-            subprocess.run(['sudo', 'mount', '-o', 'sync', dm_dev, str(mnt)], check=True)
+            subprocess.run(['sudo', 'mount', '-o', 'async', dm_dev, str(mnt)], check=True)
             subprocess.run(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(mnt)], check=True)
 
             dst_path = mnt / 'out.parquet'
             if existing_content is not None:
                 dst_path.write_bytes(existing_content)
                 dst_path.chmod(0o640)
+                with dst_path.open('rb') as f:
+                    os.fsync(f.fileno())
 
             # Now switch table so upper sectors return I/O error
             subprocess.run(['sudo', dmsetup, 'load', dm_name,
@@ -420,9 +422,9 @@ def test_case_4_device_error(root: Path, src_clean: Path):
             for existing in (False, True):
                 dst = setup_dm_iteration(before if existing else None)
 
-                p = run_cli([str(src_clean), '-o', str(dst), '-j', j, '--codec', 'uncompressed'],
+                p = run_cli([str(src_clean), '-o', str(dst), '-j', j, '--codec', 'uncompressed', '--fsync'],
                             code=1, timeout=15)
-                assert b'WriteFailed' in p.stderr, (j, p.stderr)
+                assert b'WriteFailed' in p.stderr or b'InputOutput' in p.stderr, (j, p.stderr)
                 assert not p.stdout
 
                 if existing:
@@ -434,25 +436,24 @@ def test_case_4_device_error(root: Path, src_clean: Path):
 
                 check_directory_clean(mnt)
 
-        # libzpq check on device error
+        # Both a new target and an earlier result must survive delayed writeback failure.
         if HAS_LIBZPQ:
-            dst = setup_dm_iteration(None)
-
             with zpq.Zpq() as z:
-                try:
-                    z.run({'inputs': [str(src_clean)], 'output_url': str(dst), 'output_codec': 'uncompressed'})
-                    assert False, 'Expected write failure on dm error device'
-                except zpq.ZpqError as e:
-                    assert e.response.get('reason') in ('WriteFailed', 'NoSpaceLeft')
-                    log_check('libzpq case 4 device error non-existing')
-                assert not dst.exists(), 'libzpq left partial file on dm error'
-
-                # Unmount error filesystem before testing library recovery
-                subprocess.run(['sudo', 'umount', '-f', str(mnt)], check=False)
-
-                agg = z.run({'inputs': [str(src_clean)], 'aggregate': 'count(*) AS n'})
-                assert agg.get('agg', {}).get('n') == 200_000
-                log_check('libzpq usable after case 4')
+                for previous in (None, before):
+                    dst = setup_dm_iteration(previous)
+                    try:
+                        z.run({'inputs': [str(src_clean)], 'output_url': str(dst),
+                               'output_codec': 'uncompressed', 'fsync': True})
+                        assert False, 'Expected write failure on dm error device'
+                    except zpq.ZpqError as e:
+                        assert e.response.get('reason') in ('WriteFailed', 'NoSpaceLeft', 'InputOutput')
+                        log_check('libzpq case 4 async device error')
+                    assert dst.read_bytes() == previous if previous is not None else not dst.exists()
+                    check_directory_clean(mnt)
+                    subprocess.run(['sudo', 'umount', '-f', str(mnt)], check=False)
+                    agg = z.run({'inputs': [str(src_clean)], 'aggregate': 'count(*) AS n'})
+                    assert agg.get('agg', {}).get('n') == 200_000
+                    log_check('libzpq usable after case 4')
 
     finally:
         subprocess.run(['sudo', 'umount', '-f', str(mnt)], check=False)

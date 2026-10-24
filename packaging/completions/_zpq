@@ -13,10 +13,12 @@ _arguments '*:file:_files' \
   '--fast-levels[zpq option]' \
   '--filter[zpq option]' \
   '--format[zpq option]' \
+  '--fsync[zpq option]' \
   '--group-by[zpq option]' \
   '--help[zpq option]' \
   '--limit[zpq option]' \
   '--max-memory[zpq option]' \
+  '--no-fsync[zpq option]' \
   '--output[zpq option]' \
   '--profile[zpq option]' \
   '--profile-summary[zpq option]' \

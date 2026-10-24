@@ -4362,7 +4362,9 @@ fn scanRGSliced(
                     );
                     continue;
                 }
-                if (!discovering and decode_options.encoded and ws.decode_batch_rows != 0 and cacheExpressionsSafe(target)) {
+                if (!discovering and decode_options.encoded and ws.decode_batch_rows != 0 and
+                    cacheExpressionsSafe(target))
+                {
                     try agg_coded.codePlainKeys(sa, g.keys, cols, lookup);
                     if (try agg_coded.groupedCoded(
                         sa,

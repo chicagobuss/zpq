@@ -78,7 +78,12 @@ fn secondaryHint(sources: []const Source, ci: usize) ?IntegerRange {
     var range: IntegerRange = .{ .min = std.math.maxInt(i64), .max = std.math.minInt(i64) };
     for (sources) |source| {
         if (source.rg.num_rows <= 0) continue;
-        const bounds = @import("parquet/statistics.zig").chunkStats(source.rg, ci, source.meta, .corroborated).bounds orelse
+        const bounds = @import("parquet/statistics.zig").chunkStats(
+            source.rg,
+            ci,
+            source.meta,
+            .corroborated,
+        ).bounds orelse
             return null;
         const cm = source.rg.columns.items[ci].meta_data orelse return null;
         const elem = source.meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
@@ -147,7 +152,15 @@ fn sampleSource(s: *const SampleTasks, i: usize, result: *Sample) !void {
     if (wi == s.windows.strata or s.windows.at(wi).start >= end) return;
     var held = std.heap.ArenaAllocator.init(s.a);
     defer held.deinit();
-    var first = try consumer.SliceReader.init(held.allocator(), s.a, source.rg, source.meta, source.src, s.key, s.options) orelse
+    var first = try consumer.SliceReader.init(
+        held.allocator(),
+        s.a,
+        source.rg,
+        source.meta,
+        source.src,
+        s.key,
+        s.options,
+    ) orelse
         return error.SampleUnsupported;
     defer first.deinit();
     var other: ?consumer.SliceReader = if (if (s.hint == null) s.second else null) |ci|
@@ -366,7 +379,12 @@ pub fn hotPlan(a: std.mem.Allocator, s: Sample, second: bool, h: usize, cells: u
         n += 1;
     }
     if (n == 0 or n * width < h) return null;
-    var plan: HotPlan = .{ .keys = try a.alloc(i64, n), .second = second, .fmin = if (second) s.fmin else 0, .width = width };
+    var plan: HotPlan = .{
+        .keys = try a.alloc(i64, n),
+        .second = second,
+        .fmin = if (second) s.fmin else 0,
+        .width = width,
+    };
     errdefer plan.deinit(a);
     try plan.ids.ensureTotalCapacity(a, @intCast(n));
     for (ranked[0..n], plan.keys, 0..) |e, *key, id| {

@@ -897,7 +897,8 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         result.reasons.insert(census_reason);
     }
     result.facts = planFacts(in, rank_agg != null, first_cut or (count_agg == null and args.sketch_topk != null and
-        args.sketch_topk.?.census and firstCutEligible(args, in.calls, in.keys orelse &.{}, use_blocks, in.work.len, tables)));
+        args.sketch_topk.?.census and
+        firstCutEligible(args, in.calls, in.keys orelse &.{}, use_blocks, in.work.len, tables)));
     if (in.ndv_stat) |stat| applyCostRules(in, stat, &result);
     return result;
 }
@@ -2226,7 +2227,15 @@ fn hotCertificate(
         .src = .{ .bytes = workers[0].inputs[item.file].bytes, .byte_origin = 0 },
     };
     // A failed optional sample is never the query's error; the complete scan establishes canonical failures.
-    var sample = cert.sample(a, sources, keys[0].col_ref.col_idx, if (keys.len == 2) keys[1].col_ref.col_idx else null, h, workers.len, workers[0].decode_options) catch {
+    var sample = cert.sample(
+        a,
+        sources,
+        keys[0].col_ref.col_idx,
+        if (keys.len == 2) keys[1].col_ref.col_idx else null,
+        h,
+        workers.len,
+        workers[0].decode_options,
+    ) catch {
         consumer.setDecodeFailure(null);
         return false;
     };
@@ -2250,7 +2259,11 @@ fn hotCertificate(
     var cells_made: usize = 0;
     defer for (sketches[0..cells_made]) |s| a.free(s.cells);
     for (sketches, hot) |*s, *local| {
-        s.* = .{ .cells = a.alloc(u32, n_cells) catch return false, .shift = @intCast(@as(u7, 64) - bits), .hot = local };
+        s.* = .{
+            .cells = a.alloc(u32, n_cells) catch return false,
+            .shift = @intCast(@as(u7, 64) - bits),
+            .hot = local,
+        };
         @memset(s.cells, 0);
         cells_made += 1;
     }
@@ -2338,7 +2351,8 @@ fn certifiedTopK(
     cfg: SketchTopK,
     decision: AggregateDispatch,
 ) !void {
-    if (!decision.distinct_census and try hotCertificate(gpa, arena, workers, cursor, tables, calls, order, cfg)) return;
+    if (!decision.distinct_census and
+        try hotCertificate(gpa, arena, workers, cursor, tables, calls, order, cfg)) return;
     const k: usize = @intCast(order.offset +| order.limit.?);
     const n_cells = @as(usize, 1) << cfg.cell_bits;
     const sketches = try arena.alloc(expr_agg.CountSketch, workers.len);
@@ -2358,7 +2372,7 @@ fn certifiedTopK(
         t.sketch = null;
     };
     const admit_n = @max(k * cfg.admit_per_row, @min(64, n_cells / 16));
-    // A census (`identityBoundPlan`) rides along the count pass when it fits and the keys look unique (`keysLookUnique`), so
+    // A census (`identityBoundPlan`) rides along when it fits and the keys look unique (`keysLookUnique`), so
     // cells too even to bound anything need no second count pass. It fills the cells too, and stops early wherever a
     // worker's own cells already separate the cut, as the cells will then do without it.
     var dropped: std.atomic.Value(bool) = .init(false);
@@ -2408,11 +2422,35 @@ fn certifiedTopK(
             @divTrunc(t1 - t0, 1_000_000), abandoned,
         });
         if (!abandoned) {
-            var bound_plan = try identityBoundPlan(gpa, arena, workers, tables, censuses, calls, order, a_idx, cfg, t1 - t0);
+            var bound_plan = try identityBoundPlan(
+                gpa,
+                arena,
+                workers,
+                tables,
+                censuses,
+                calls,
+                order,
+                a_idx,
+                cfg,
+                t1 - t0,
+            );
             for (censuses) |*c| c.deinit();
             if (bound_plan) |*plan| {
                 defer plan.deinit(gpa);
-                if (try certifiedResidual(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg, plan))
+                if (try certifiedResidual(
+                    gpa,
+                    arena,
+                    workers,
+                    cursor,
+                    tables,
+                    sketches,
+                    censuses,
+                    calls,
+                    order,
+                    a_idx,
+                    cfg,
+                    plan,
+                ))
                     return;
             }
         }
@@ -2476,7 +2514,20 @@ fn certifiedTopK(
     }
     if (bound_plan) |*plan| {
         defer plan.deinit(gpa);
-        if (try certifiedResidual(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg, plan))
+        if (try certifiedResidual(
+            gpa,
+            arena,
+            workers,
+            cursor,
+            tables,
+            sketches,
+            censuses,
+            calls,
+            order,
+            a_idx,
+            cfg,
+            plan,
+        ))
             return;
     }
     for (tables) |*t| t.sketch = null;
@@ -18499,7 +18550,11 @@ test "COUNT certificate sample reads real pages across row groups and repeated i
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
     const meta = try metadata.open(state.allocator(), bytes);
-    const source: cert.Source = .{ .rg = &meta.row_groups.items[0], .meta = &meta, .src = .{ .bytes = bytes, .byte_origin = 0 } };
+    const source: cert.Source = .{
+        .rg = &meta.row_groups.items[0],
+        .meta = &meta,
+        .src = .{ .bytes = bytes, .byte_origin = 0 },
+    };
     const sources = [_]cert.Source{ source, source, source };
     var sample = try cert.sample(testing.allocator, &sources, 1, 1, 4, 4, .{});
     defer sample.deinit(testing.allocator);
@@ -18514,7 +18569,11 @@ test "hot COUNT certificate matches canonical clustered keys, NULLs, ties, offse
     for ([_][]const u8{ "plain", "dict" }) |encoding| {
         var file_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer file_arena.deinit();
-        const path = try std.fmt.allocPrint(file_arena.allocator(), "ci/fixtures/parquet/count_certificate_{s}.parquet", .{encoding});
+        const path = try std.fmt.allocPrint(
+            file_arena.allocator(),
+            "ci/fixtures/parquet/count_certificate_{s}.parquet",
+            .{encoding},
+        );
         const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
         defer testing.allocator.free(bytes);
         const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
@@ -18530,7 +18589,11 @@ test "hot COUNT certificate matches canonical clustered keys, NULLs, ties, offse
                     .min_bytes_per_worker = 1,
                     .max_memory = budget,
                     .decode_limit = budget,
-                    .result_order = .{ .keys = &.{.{ .column = if (key.len == 1) 1 else 2, .descending = true }}, .limit = 3, .offset = if (key.len == 1) 0 else 2 },
+                    .result_order = .{
+                        .keys = &.{.{ .column = if (key.len == 1) 1 else 2, .descending = true }},
+                        .limit = 3,
+                        .offset = if (key.len == 1) 0 else 2,
+                    },
                     .ndv_policy = false,
                     .plain_rules = false,
                     .dense = false,
@@ -18539,7 +18602,12 @@ test "hot COUNT certificate matches canonical clustered keys, NULLs, ties, offse
                 defer want.deinit(testing.allocator);
                 var outcome: SketchTopK.HotOutcome = .declined;
                 var trial = args;
-                trial.sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1, .hot_outcome = &outcome, .certify = !force_replay };
+                trial.sketch_topk = .{
+                    .cell_bits = 8,
+                    .admit_per_row = 1,
+                    .hot_outcome = &outcome,
+                    .certify = !force_replay,
+                };
                 var got = try runMultiAggregate(testing.allocator, arena.allocator(), trial);
                 defer got.deinit(testing.allocator);
                 certified = certified or outcome == .certified;
@@ -18605,7 +18673,11 @@ test "COUNT-certified payloads preserve signed SUM, exact integer AVG, NULLs, ex
     for ([_][]const u8{ "plain", "dict" }) |encoding| {
         var held = std.heap.ArenaAllocator.init(testing.allocator);
         defer held.deinit();
-        const path = try std.fmt.allocPrint(held.allocator(), "ci/fixtures/parquet/count_certificate_{s}.parquet", .{encoding});
+        const path = try std.fmt.allocPrint(
+            held.allocator(),
+            "ci/fixtures/parquet/count_certificate_{s}.parquet",
+            .{encoding},
+        );
         const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
         defer testing.allocator.free(bytes);
         const inputs = [_]Input{.{ .name = path, .bytes = bytes }};

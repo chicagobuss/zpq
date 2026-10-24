@@ -50,3 +50,7 @@ bounds every full key's distinct score, including NULL arguments that do not add
 candidate set cannot prove the cut, one bounded widening pass admits only new classes and retains completed
 exact groups. A failed certificate releases its trial state and replays the ordinary exact route; budget pressure
 in the trial is a reason to decline. The class maps share one filter, with map lookup deciding exact membership.
+
+A readable, cache-sized integer footer range can choose the secondary hot interval without sampling that column.
+It is a membership hint: complete counts still route NULL and out-of-range values cold, so even misleading bounds
+cannot exclude a winner. Absent, unreadable or wide bounds retain value sampling to tolerate rare outliers.

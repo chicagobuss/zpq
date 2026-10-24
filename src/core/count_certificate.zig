@@ -70,6 +70,37 @@ fn integer(col: @import("filter/eval.zig").Batch.Column, row: usize) ?i64 {
     };
 }
 
+const IntegerRange = struct { min: i64, max: i64 };
+
+// Bounds choose membership only. A narrow (even false) footer range leaves other values cold; an absent or wide
+// range falls back to sampling real values, so a rare outlier cannot prevent finding a useful hot interval.
+fn secondaryHint(sources: []const Source, ci: usize) ?IntegerRange {
+    var range: IntegerRange = .{ .min = std.math.maxInt(i64), .max = std.math.minInt(i64) };
+    for (sources) |source| {
+        if (source.rg.num_rows <= 0) continue;
+        const bounds = @import("parquet/statistics.zig").chunkStats(source.rg, ci, source.meta, .corroborated).bounds orelse
+            return null;
+        const cm = source.rg.columns.items[ci].meta_data orelse return null;
+        const elem = source.meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
+        if (!@import("parquet/statistics.zig").signedIntOrder(elem)) return null;
+        const lo: i64, const hi: i64 = switch (cm.type) {
+            .INT32 => if (bounds.min.len == 4 and bounds.max.len == 4)
+                .{ std.mem.readInt(i32, bounds.min[0..4], .little), std.mem.readInt(i32, bounds.max[0..4], .little) }
+            else
+                return null,
+            .INT64 => if (bounds.min.len == 8 and bounds.max.len == 8)
+                .{ std.mem.readInt(i64, bounds.min[0..8], .little), std.mem.readInt(i64, bounds.max[0..8], .little) }
+            else
+                return null,
+            else => return null,
+        };
+        range.min = @min(range.min, lo);
+        range.max = @max(range.max, hi);
+    }
+    const width = @as(i128, range.max) - range.min + 1;
+    return if (width > 0 and width <= hw.l2BytesPerWorkerOr(640 << 10) / 12) range else null;
+}
+
 /// Only bare signed integer columns are admitted by the caller. Real page encodings feed the existing slice
 /// reader; whole pages between windows are skipped by checked headers. Scratch and sample keys use the caller's
 /// charged allocator. Errors are optional-probe failures: the caller discards the sample and runs its full pass.
@@ -92,6 +123,7 @@ pub fn sample(
     if (h > capacity) return result;
     const count = @min(rows, capacity);
     const windows = Windows.init(rows, count, @max(sources.len, workers));
+    const hint = if (second) |ci| secondaryHint(sources, ci) else null;
     var wi: u64 = 0;
     var base: u64 = 0;
     for (sources) |source| {
@@ -104,7 +136,7 @@ pub fn sample(
         defer held.deinit();
         var first = try consumer.SliceReader.init(held.allocator(), a, source.rg, source.meta, source.src, key, options) orelse return error.SampleUnsupported;
         defer first.deinit();
-        var other: ?consumer.SliceReader = if (second) |ci|
+        var other: ?consumer.SliceReader = if (if (hint == null) second else null) |ci|
             try consumer.SliceReader.init(held.allocator(), a, source.rg, source.meta, source.src, ci, options) orelse
                 return error.SampleUnsupported
         else
@@ -130,6 +162,10 @@ pub fn sample(
             if (hi < window.start + window.len) break;
             wi += 1;
         }
+    }
+    if (hint) |range| {
+        result.fmin = range.min;
+        result.fmax = range.max;
     }
     return result;
 }

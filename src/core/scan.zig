@@ -18684,3 +18684,47 @@ fn distinctBoundPlanTrial(a: std.mem.Allocator) !void {
 test "DISTINCT shares score bounds and widens only to new identities with allocation-safe ownership" {
     try testing.checkAllAllocationFailures(testing.allocator, distinctBoundPlanTrial, .{});
 }
+
+test "hot COUNT footer range hints cannot exclude NULL or out-of-range winners" {
+    const path = "ci/fixtures/parquet/count_certificate_plain.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_][2]i64{ .{ -1, 1 }, .{ 2, 2 } }) |range| for ([_]usize{ 1, 4 }) |j| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const actual = try metadata.open(arena.allocator(), bytes);
+        const hint = try metadata.open(arena.allocator(), bytes);
+        var lo: [8]u8 = undefined;
+        var hi: [8]u8 = undefined;
+        std.mem.writeInt(i64, &lo, range[0], .little);
+        std.mem.writeInt(i64, &hi, range[1], .little);
+        for (hint.row_groups.items) |*rg| {
+            const cm = &rg.columns.items[1].meta_data.?;
+            try testing.expectEqual(schema.Type.INT64, cm.type);
+            cm.statistics.?.min_value = &lo;
+            cm.statistics.?.max_value = &hi;
+        }
+        var args: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = (&actual)[0..1],
+            .aggregate = "count(*) AS c",
+            .group_by = "k,f",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .ndv_policy = false,
+            .plain_rules = false,
+            .dense = false,
+            .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3 },
+        };
+        var want = try runMultiAggregate(testing.allocator, arena.allocator(), args);
+        defer want.deinit(testing.allocator);
+        args.metas = (&hint)[0..1];
+        args.sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1 };
+        var got = try runMultiAggregate(testing.allocator, arena.allocator(), args);
+        defer got.deinit(testing.allocator);
+        try want.output.applyResultOrder(testing.allocator, args.result_order);
+        try got.output.applyResultOrder(testing.allocator, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+    };
+}

@@ -4934,15 +4934,17 @@ pub const GroupTable = struct {
     /// state, each list half again over its length once grown (compact records count their buffer's projected
     /// growth), and the map's entry at its working load. Inline distinct values live in the accumulator; a spilled
     /// set carries its own object charge.
-    inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
-        const state_room = if (self.compact.stride != 0)
-            self.compact.projected(self.groupCount() + 1) - self.compact.held()
-        else
-            @sizeOf(Accumulator) * calls * 3 / 2;
-        const key_block = std.mem.alignForward(usize, key_len, 16) + 16;
+    pub fn variableEntryBytes(key_len: usize, calls: usize) usize {
+        if (key_len > std.math.maxInt(usize) - 15) return std.math.maxInt(usize);
+        const key_block = std.mem.alignForward(usize, key_len, 16) +| 16;
         const slots = (@sizeOf([]const u8) + @sizeOf(u64)) * 3 / 2;
         const map_entry = (@sizeOf([]const u8) + @sizeOf(u32) + 1) * 2;
-        return key_block + slots + state_room + map_entry;
+        return key_block +| slots +| (@sizeOf(Accumulator) *| calls *| 3 / 2) +| map_entry;
+    }
+
+    inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
+        if (self.compact.stride == 0) return variableEntryBytes(key_len, calls);
+        return variableEntryBytes(key_len, 0) + self.compact.projected(self.groupCount() + 1) - self.compact.held();
     }
 
     fn admit(self: *GroupTable, entry_size: usize) !void {

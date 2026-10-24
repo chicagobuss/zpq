@@ -119,6 +119,23 @@ pub const Domain = struct {
         return n;
     }
 
+    pub fn globalFits(d: *const Domain, workers: usize) bool {
+        return d.ids() <= max_ids and workers *| d.ids() <= d.entries();
+    }
+
+    pub fn maxKeyBytes(d: *const Domain) usize {
+        var n: usize = 0;
+        for (d.axes) |axis| switch (axis.values) {
+            .bytes => |values| {
+                var widest: usize = 0;
+                for (values) |value| widest = @max(widest, value.len);
+                n +|= 5 +| widest;
+            },
+            else => n +|= 9,
+        };
+        return n;
+    }
+
     pub fn forRowGroup(d: *const Domain, file: usize, rg: usize) ?[]const u32 {
         if (d.axes.len != 1) return null;
         return d.axes[0].forRowGroup(file, rg);
@@ -140,6 +157,16 @@ pub const Domain = struct {
 /// Whether a lone bare integer key and these calls fold densely: count, and integer sum/min/max/avg of a bare column.
 /// Floats keep their ordered paths, and expressions, DECIMAL, strings and count(DISTINCT) the general ones.
 pub fn shapeOk(calls: []const AggCall, keys: []const expr_ast.Expr) bool {
+    if (countOnly(calls)) {
+        if (keys.len == 0) return false;
+        for (keys) |key| {
+            if (key != .col_ref) return false;
+            const c = key.col_ref;
+            if (!(c.expr_type == .str and c.physical_type == .BYTE_ARRAY) and
+                !(c.expr_type == .i64 and (c.physical_type == .INT32 or c.physical_type == .INT64))) return false;
+        }
+        return true;
+    }
     if (keys.len != 1 or keys[0] != .col_ref) return false;
     const k = keys[0].col_ref;
     if (k.expr_type != .i64 or (k.physical_type != .INT32 and k.physical_type != .INT64)) return false;
@@ -157,7 +184,7 @@ pub fn shapeOk(calls: []const AggCall, keys: []const expr_ast.Expr) bool {
     return true;
 }
 
-fn countOnly(calls: []const AggCall) bool {
+pub fn countOnly(calls: []const AggCall) bool {
     if (calls.len != 1) return false;
     const c = calls[0];
     return c.func == .count and c.arg == null and c.where == null and !c.state and c.offset == 0;
@@ -177,6 +204,12 @@ pub fn laneBytes(ids: usize, calls: []const AggCall, rows: u64) usize {
 pub fn tableBytes(ids: usize, stride: usize, n_calls: usize) usize {
     const slots = std.math.ceilPowerOfTwo(usize, @max(16, ids *| 4 / 3 + 1)) catch std.math.maxInt(usize);
     return ids *| (stride + @sizeOf(u64) + @sizeOf(Accumulator) *| n_calls) +| slots *| (@sizeOf(u64) + @sizeOf(u32) * 2);
+}
+
+/// Variable-key tables use the same per-entry charge as ordinary insertion, including capacity slack.
+pub fn domainTableBytes(d: *const Domain, ids: usize, stride: usize, n_calls: usize) usize {
+    if (stride != 0) return tableBytes(ids, stride, n_calls);
+    return ids *| agg.GroupTable.variableEntryBytes(d.maxKeyBytes(), n_calls);
 }
 
 /// One worker's least positions and states: counters for COUNT(*), otherwise `calls.len` accumulators per id.
@@ -233,6 +266,79 @@ pub const Lanes = struct {
 
     fn addCount(l: *Lanes, id: usize, n: u64) void {
         if (l.counts32.len != 0) l.counts32[id] += @intCast(n) else l.counts64[id] += n;
+    }
+
+    const CountAxis = struct {
+        codes: []const u32,
+        trans: []const u32,
+        ni: @TypeOf(@as(Column, undefined).nullInfo()),
+        stride: usize,
+    };
+
+    /// Validate every axis before changing a lane. PLAIN/mismatched chunks join through the ordinary table.
+    pub fn foldKeys(
+        l: *Lanes,
+        ra: std.mem.Allocator,
+        gpa: std.mem.Allocator,
+        keys: []const expr_ast.Expr,
+        file: usize,
+        rg: usize,
+        pos_base: u64,
+        batch: *const filter_eval.Batch,
+        lookup: []const ?usize,
+        sel: *const Sel,
+    ) !bool {
+        if (keys.len != l.domain.axes.len or !shapeOk(l.calls, keys)) return false;
+        if (keys.len == 1) return l.fold(ra, gpa, keys[0].col_ref, file, rg, pos_base, batch, lookup, sel);
+        if (!countOnly(l.calls) or l.domain.ids() > max_ids) return false;
+        const bindings = try ra.alloc(CountAxis, keys.len);
+        var stride: usize = 1;
+        for (keys, l.domain.axes, bindings) |key, *axis, *b| {
+            const trans = axis.forRowGroup(file, rg) orelse return false;
+            const pos = lookup[key.col_ref.col_idx] orelse return false;
+            const col = batch.cols[pos];
+            if (col.nullInfo().max_rep != 0 or !axis.sameDictionary(col, trans)) return false;
+            const codes = col.codes() orelse return false;
+            const ni = col.nullInfo();
+            if (codes.len < batch.num_rows) return error.BadColumn;
+            if (ni.def_levels) |dl| if (dl.len < batch.num_rows) return error.BadColumn;
+            b.* = .{ .codes = codes, .trans = trans, .ni = ni, .stride = stride };
+            stride *= axis.ids();
+        }
+        try l.ensure(gpa);
+        if (l.counts32.len != 0) {
+            try l.foldProduct(u32, l.counts32, bindings, pos_base, batch.num_rows, sel);
+        } else try l.foldProduct(u64, l.counts64, bindings, pos_base, batch.num_rows, sel);
+        return true;
+    }
+
+    fn foldProduct(
+        l: *Lanes,
+        comptime T: type,
+        counts: []T,
+        axes: []const CountAxis,
+        base: u64,
+        rows: usize,
+        sel: *const Sel,
+    ) !void {
+        var bad = false;
+        agg_coded.forEachActive(sel, rows, struct {
+            fn row(c: anytype, r: usize) void {
+                var id: usize = 0;
+                for (c.axes) |axis| {
+                    const is_null = if (axis.ni.def_levels) |dl| dl[r] < axis.ni.max_def else false;
+                    const code = if (is_null) axis.trans.len - 1 else axis.codes[r];
+                    if (!is_null and code >= axis.trans.len - 1) {
+                        c.bad.* = true;
+                        return;
+                    }
+                    id += axis.trans[code] * axis.stride;
+                }
+                c.counts[id] += 1;
+                c.first[id] = @min(c.first[id], c.base + r);
+            }
+        }.row, .{ .axes = axes, .counts = counts, .first = l.first, .base = base, .bad = &bad });
+        if (bad) return error.BadColumn;
     }
 
     /// Fold a row group whose lone key is column `key` of `batch`. False, having touched nothing, when its
@@ -342,10 +448,11 @@ pub fn intoTable(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     lanes: []Lanes,
-    key: expr_ast.ColRef,
+    keys: []const expr_ast.Expr,
     table: *agg.GroupTable,
     lookup_len: usize,
     n_threads: usize,
+    cut: ?usize,
 ) !void {
     std.debug.assert(table.groupCount() == 0);
     var live: std.ArrayList(*Lanes) = .empty;
@@ -364,22 +471,62 @@ pub fn intoTable(
     for (tasks) |t| if (t.err) |e| return e;
 
     const into = live.items[0];
+    var heap: CountHeap = .initContext(into);
+    defer heap.deinit(gpa);
     var groups: usize = 0;
     for (into.first) |f| groups += @intFromBool(f != unseen);
-    try table.reserveFixed(groups, calls.len);
+    if (cut) |h| {
+        if (!countOnly(calls)) return error.UnsupportedAggType;
+        if (h == 0) return;
+        try heap.ensureTotalCapacityPrecise(gpa, @min(h, groups));
+        for (into.first, 0..) |f, id| if (f != unseen) {
+            const candidate: u32 = @intCast(id);
+            if (heap.count() == h) {
+                if (countOrder(into, candidate, heap.peek().?) != .gt) continue;
+                _ = heap.pop();
+            }
+            try heap.push(gpa, candidate);
+        };
+        groups = heap.count();
+    }
+    if (table.fixed_stride != 0) try table.reserveFixed(groups, calls.len);
 
     // The domain's values as the key column the scan decodes, so each key's image is the one the row path packs.
-    const dict_col = try domain.axes[0].dictionary(arena);
-    const kd = [_]Column{try agg_coded.keyDictColumn(arena, dict_col, key, lookup_len)};
+    const kd = try arena.alloc(Column, keys.len);
+    for (domain.axes, keys, kd) |*axis, key, *out|
+        out.* = try agg_coded.keyDictColumn(arena, try axis.dictionary(arena), key.col_ref, lookup_len);
+    const indices = try arena.alloc(usize, keys.len);
+    var key_scratch: std.ArrayList(u8) = .empty;
     var image: [32]u8 = undefined;
-    for (into.first, 0..) |f, id| if (f != unseen) {
-        const len = agg.packFixedKey(&kd, id, &image) orelse return error.BadGroupKey;
-        const g = try table.getOrInsert(image[0..len], calls, f);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const id: usize = if (cut != null) (if (i < heap.items.len) heap.items[i] else break) else i;
+        const f = into.first[id];
+        if (f == unseen) continue;
+        var rem = id;
+        for (domain.axes, indices) |*axis, *row| {
+            row.* = rem % axis.ids();
+            rem /= axis.ids();
+        }
+        try agg_coded.serializeKeyAt(&key_scratch, arena, kd, indices);
+        const key = if (table.fixed_stride != 0)
+            agg.fixedImage(table.fixed_stride, key_scratch.items, &image) orelse return error.BadGroupKey
+        else
+            key_scratch.items;
+        const g = try table.getOrInsert(key, calls, f);
         var scratch: [16]agg.Accumulator = undefined;
         const dst = table.readGroup(g, calls.len, &scratch);
         if (countOnly(calls)) dst[0] = .{ .count = into.count(id) } else @memcpy(dst, into.accs[id * calls.len ..][0..calls.len]);
         table.writeGroup(g, dst);
-    };
+    }
+}
+
+const CountHeap = std.PriorityQueue(u32, *const Lanes, countOrder);
+
+fn countOrder(lanes: *const Lanes, a: u32, b: u32) std.math.Order {
+    const by_count = std.math.order(lanes.count(a), lanes.count(b));
+    if (by_count != .eq) return by_count;
+    return std.math.order(lanes.first[b], lanes.first[a]);
 }
 
 const MergeCtx = struct { lanes: []const *Lanes, n: usize, gpa: std.mem.Allocator };
@@ -478,8 +625,10 @@ fn expectSameGroups(want: *const agg.GroupTable, got: *const agg.GroupTable, n_c
     for (0..want.groupCount()) |g| {
         const h = got.findKey(want.keyAt(g)) orelse return error.TestExpectedEqual;
         try testing.expectEqual(want.first.items[g], got.first.items[h]);
-        for (want.accumulators.items[g * n_calls ..][0..n_calls], got.accumulators.items[h * n_calls ..][0..n_calls]) |w, x|
-            try testing.expect(std.meta.eql(w, x));
+        for (0..n_calls) |i| try testing.expect(std.meta.eql(
+            want.readAcc(g, i, n_calls),
+            got.readAcc(h, i, n_calls),
+        ));
     }
 }
 
@@ -559,7 +708,7 @@ fn testCountLanes(a: std.mem.Allocator) !void {
             try testing.expect(try agg_coded.groupedCoded(ra, a, &calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null, null));
             try testing.expect(try lanes[wi].fold(ra, a, Fixture.key, 0, rg, pos, &b, &lookup, &sel));
         }
-        try intoTable(a, ra, &lanes, Fixture.key, &got, lookup.len, 2);
+        try intoTable(a, ra, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 2, null);
         try expectSameGroups(&want, &got, calls.len);
         try testing.expectEqual(@as(usize, 4), got.groupCount());
     }
@@ -588,7 +737,7 @@ test "dense fold makes the groups and states grouping by code makes, by value ac
         try testing.expect(try agg_coded.groupedCoded(a, testing.allocator, calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null, null));
         try testing.expect(try lanes[wi].fold(a, testing.allocator, Fixture.key, 0, rg, pos, &b, &lookup, &sel));
     }
-    try intoTable(testing.allocator, a, &lanes, Fixture.key, &got, lookup.len, 2);
+    try intoTable(testing.allocator, a, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 2, null);
     try expectSameGroups(&want, &got, calls.len);
     // Admission reserves the table beside the lanes (`tableBytes`): it must cover what the table then holds.
     try testing.expect(got.allocated_bytes <= tableBytes(d.ids(), 9, calls.len));
@@ -638,7 +787,7 @@ test "dense fold and merge release everything on allocation failure" {
             var got = agg.GroupTable.init(gpa, 1 << 20);
             defer got.deinit();
             got.fixed_stride = 9;
-            try intoTable(gpa, a, &lanes, Fixture.key, &got, lookup.len, 1);
+            try intoTable(gpa, a, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 1, null);
             try testing.expectEqual(@as(usize, 4), got.groupCount());
         }
     }.run, .{});
@@ -654,4 +803,157 @@ test "dense shape: integer count/sum/min/max/avg of bare columns over a lone int
     try testing.expect(!shapeOk(&fsum, &.{k}));
     const distinct = [_]AggCall{.{ .func = .count_distinct, .arg = Fixture.v_arg, .result = .i64, .where = null, .alias = "d" }};
     try testing.expect(!shapeOk(&distinct, &.{k}));
+}
+
+test "dense products preserve composite identity, NULLs, selected first ties and exact top-H with failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, testCountProduct, .{});
+}
+
+fn testCountProduct(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const calls = [_]AggCall{Fixture.calls[0]};
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+    };
+    var ints = [_]u64{ @bitCast(@as(i64, -7)), 11, 99 };
+    var empty: [0]u8 = .{};
+    var embedded = [_]u8{ 'a', 0, 'b' };
+    var z = [_]u8{'z'};
+    var unused = [_]u8{ 'u', 'n', 'u', 's', 'e', 'd' };
+    var strings = [_][]u8{ &empty, &embedded, &z, &unused };
+    var a0 = [_]u32{ 1, 0, 0, 2, 3 };
+    var a1 = [_]u32{ 2, 1, 0, 3 };
+    var b0 = [_]u32{ 2, 0, 1, 1, 3, 4 };
+    var b1 = [_]u32{ 3, 1, 0, 2, 4 };
+    var at = [_][]u32{ &a0, &a1 };
+    var bt = [_][]u32{ &b0, &b1 };
+    var file_base = [_]usize{0};
+    var axes = [_]Axis{
+        .{ .values = .{ .int32 = &ints }, .trans = &at, .file_base = &file_base, .bytes = 0 },
+        .{ .values = .{ .bytes = &strings }, .trans = &bt, .file_base = &file_base, .bytes = 0 },
+    };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    try testing.expect(domain.globalFits(2));
+    const ad0 = [_]i32{ 11, -7, -7, 99 };
+    const ad1 = [_]i32{ 99, 11, -7 };
+    const bd0 = [_][]const u8{ "z", "", "a\x00b", "a\x00b", "unused" };
+    const bd1 = [_][]const u8{ "unused", "a\x00b", "", "z" };
+    var ac: [2][129]u32 = undefined;
+    var bc: [2][129]u32 = undefined;
+    var adef: [129]u32 = undefined;
+    var bdef: [129]u32 = undefined;
+    for (0..129) |r| {
+        ac[0][r] = @intCast(r % 3);
+        ac[1][r] = @intCast(1 + r % 2);
+        bc[0][r] = @intCast(r % 4);
+        bc[1][r] = @intCast(1 + r % 3);
+        adef[r] = @intFromBool(r % 11 != 0);
+        bdef[r] = @intFromBool(r % 17 != 0);
+    }
+    ac[1][128] = 0;
+    bc[1][128] = 0; // Both unused dictionary values occur only in a filtered row.
+    const cols = [_][2]Column{
+        .{
+            .{ .i32 = .{
+                .values = &.{},
+                .codes = &ac[0],
+                .dict = &ad0,
+                .def_levels = &adef,
+                .max_def = 1,
+                .has_nulls = true,
+            } },
+            .{ .string = .{
+                .values = &.{},
+                .codes = &bc[0],
+                .dict = &bd0,
+                .def_levels = &bdef,
+                .max_def = 1,
+                .has_nulls = true,
+            } },
+        },
+        .{
+            .{ .i32 = .{
+                .values = &.{},
+                .codes = &ac[1],
+                .dict = &ad1,
+                .def_levels = &adef,
+                .max_def = 1,
+                .has_nulls = true,
+            } },
+            .{ .string = .{
+                .values = &.{},
+                .codes = &bc[1],
+                .dict = &bd1,
+                .def_levels = &bdef,
+                .max_def = 1,
+                .has_nulls = true,
+            } },
+        },
+    };
+    for ([_]?usize{ null, 3 }) |cut| {
+        var want = agg.GroupTable.init(a, 1 << 20);
+        defer want.deinit();
+        var got = agg.GroupTable.init(a, 1 << 20);
+        defer got.deinit();
+        got.compact.configure(&calls);
+        var lanes = [_]Lanes{
+            .{ .domain = &domain, .calls = &calls, .rows = 258 },
+            .{ .domain = &domain, .calls = &calls, .rows = 258 },
+        };
+        defer for (&lanes) |*l| l.deinit(a);
+        for ([_]usize{ 1, 0 }, 0..) |rg, wi| {
+            const batch: filter_eval.Batch = .{ .cols = &cols[rg], .num_rows = 129 };
+            var sel = try Sel.init(ra, 129);
+            if (rg == 0) sel.clearRange(64, 128) else {
+                for (0..129) |r| if (r % 3 != 0) sel.set(r, false);
+            }
+            sel.set(128, false);
+            const pos = agg.firstPosition(rg, 0);
+            try testing.expect(try agg_coded.groupedCoded(
+                ra,
+                a,
+                &calls,
+                &keys,
+                &want,
+                pos,
+                &batch,
+                &.{ 0, 1 },
+                &sel,
+                null,
+                null,
+            ));
+            try testing.expect(try lanes[wi].foldKeys(ra, a, &keys, 0, rg, pos, &batch, &.{ 0, 1 }, &sel));
+        }
+        try intoTable(a, ra, &lanes, &keys, &got, 2, 2, cut);
+        try testing.expect(got.allocated_bytes <= domainTableBytes(&domain, domain.ids(), 0, calls.len));
+        if (cut) |h| {
+            const ids = try ra.alloc(u32, want.groupCount());
+            for (ids, 0..) |*id, i| id.* = @intCast(i);
+            std.mem.sortUnstable(u32, ids, &want, struct {
+                fn better(t: *const agg.GroupTable, x: u32, y: u32) bool {
+                    const ca = t.accumulators.items[x].count;
+                    const cb = t.accumulators.items[y].count;
+                    return ca > cb or (ca == cb and t.first.items[x] < t.first.items[y]);
+                }
+            }.better);
+            try testing.expectEqual(@min(h, ids.len), got.groupCount());
+            for (ids[0..@min(h, ids.len)]) |id| {
+                const g = got.findKey(want.keyAt(id)) orelse return error.TestExpectedEqual;
+                try testing.expectEqual(want.accumulators.items[id].count, got.readAcc(g, 0, 1).count);
+                try testing.expectEqual(want.first.items[id], got.first.items[g]);
+            }
+        } else try expectSameGroups(&want, &got, calls.len);
+    }
+    var declined: Lanes = .{ .domain = &domain, .calls = &calls, .rows = 129 };
+    defer declined.deinit(a);
+    var mismatch = cols[1];
+    const changed = [_][]const u8{ "unused", "a\x00b", "", "late" };
+    mismatch[1].string.dict = &changed;
+    const batch: filter_eval.Batch = .{ .cols = &mismatch, .num_rows = 129 };
+    var all = try Sel.init(ra, 129);
+    try testing.expect(!try declined.foldKeys(ra, a, &keys, 0, 1, 0, &batch, &.{ 0, 1 }, &all));
+    try testing.expectEqual(@as(usize, 0), declined.first.len);
 }

@@ -780,6 +780,94 @@ def dense_domain_checks(con, tmp):
     return total, fails
 
 
+def dense_product_checks(con, tmp):
+    """Global value domains vs ordinary grouping, including reader windows, selected first ties and refusal."""
+    import numpy as np
+    root = os.path.join(tmp, "dense_products")
+    os.makedirs(root)
+    rng = np.random.default_rng(20261024)
+    n = 262144
+    paths = []
+    for fi in range(2):
+        path = os.path.join(root, f"coded-{fi}.parquet")
+        codes = rng.integers(0, 4, n)
+        names = np.array(["", "a\x00b", "region", "z"], dtype=object)[codes]
+        table = pa.table({
+            "a": pa.array(rng.integers(-8, 9, n).astype(np.int32), mask=rng.random(n) < .03),
+            "b": pa.array(names, pa.string(), mask=rng.random(n) < .02),
+            "f": pa.array(rng.integers(0, 100, n).astype(np.int32)),
+        })
+        pq.write_table(table, path, row_group_size=8192)
+        paths.append(path)
+    src = os.path.join(root, "coded-*.parquet")
+    first = f"min(CASE WHEN filename = '{paths[1]}' THEN {n} ELSE 0 END + file_row_number)"
+    source = f"read_parquet('{src}',filename=true,file_row_number=true)"
+    shapes = [
+        (" WHERE f < 30", "", "ORDER BY c DESC LIMIT 7 OFFSET 2", f"ORDER BY c DESC,{first} LIMIT 7 OFFSET 2"),
+        (" WHERE f < 1", "", "ORDER BY c DESC LIMIT 7", f"ORDER BY c DESC,{first} LIMIT 7"),
+        ("", "", "", ""),
+        ("", "HAVING count(*) > 7000", "ORDER BY c DESC LIMIT 4", f"ORDER BY c DESC,{first} LIMIT 4"),
+        ("", "", "ORDER BY c DESC,a,b LIMIT 9", "ORDER BY c DESC,a,b LIMIT 9"),
+        (" WHERE f < 0", "", "ORDER BY c DESC LIMIT 7", f"ORDER BY c DESC,{first} LIMIT 7"),
+    ]
+    variants = [("legacy", 1, {"ZPQ_DENSE": "0"})]
+    variants += [("dense", j, {"ZPQ_DENSE": "1"}) for j in (1, 2, 4, 8, 16)]
+    variants += [("windows", j, {"ZPQ_DENSE": "1", "ZPQ_DECODE_BATCH_ROWS": "4096"}) for j in (1, 4, 16)]
+    variants += [("values", j, {"ZPQ_DENSE": "1", "ZPQ_ENCODED": "0"}) for j in (1, 16)]
+    total = fails = 0
+    def unordered(rows):
+        return sorted(rows, key=lambda row: tuple((x is not None, x if x is not None else 0) for x in row))
+    for qi, (where, having, order, oracle_order) in enumerate(shapes):
+        sql = f"SELECT a,b,count(*) AS c FROM '{src}'{where} GROUP BY a,b {having} {order}"
+        truth = con.execute(
+            f"SELECT a,b,count(*) AS c FROM {source}{where} GROUP BY a,b {having} {oracle_order}"
+        ).fetchall()
+        reference = None
+        for name, j, env in variants:
+            total += 1
+            result = subprocess.run([ZPQ, "query", "--query", sql, "-j", str(j)], capture_output=True, text=True,
+                                    env={**os.environ, **env})
+            problem = None
+            if result.returncode:
+                problem = result.stderr[:160]
+            else:
+                rows = [tuple(row.values()) for row in read_rows(result.stdout)]
+                if (rows != truth) if order else (unordered(rows) != unordered(truth)):
+                    problem = "independent values/order differ"
+                if reference is None:
+                    reference = result.stdout
+                elif result.stdout != reference:
+                    problem = "bytes differ from ordinary grouping"
+            fails += problem is not None
+            print(f"  {'FAIL' if problem else 'OK  '} product:{qi} {name} -j{j} {problem or ''}", flush=True)
+        if qi == 0:
+            output = os.path.join(root, "top.parquet")
+            result = subprocess.run([ZPQ, "query", "--query", sql, "-j", "16", "-o", output],
+                                    capture_output=True, text=True)
+            total += 1
+            if result.returncode:
+                fails += 1
+            else:
+                rows = list(zip(*(pq.read_table(output)[c].to_pylist() for c in ["a", "b", "c"])))
+                if rows != truth or con.execute(f"SELECT * FROM '{output}'").fetchall() != truth:
+                    fails += 1
+    # A PLAIN string key declines the retained product; its selected result remains exact.
+    plain = os.path.join(root, "plain.parquet")
+    pq.write_table(table, plain, row_group_size=8192, use_dictionary=["a", "f"])
+    for kind, path in [("coded", src), ("plain", plain)]:
+        sql = f"SELECT a,b,count(*) AS c FROM '{path}' WHERE f < 30 GROUP BY a,b ORDER BY c DESC LIMIT 7"
+        for mem in ("128K", "512K", "2M", "8M"):
+            for j in (1, 16):
+                total += 1
+                outputs = [subprocess.run([ZPQ, "query", "--query", sql, "-j", str(j), "--max-memory", mem],
+                            capture_output=True, env={**os.environ, "ZPQ_DENSE": dense}) for dense in ("0", "1")]
+                good = (outputs[0].returncode == outputs[1].returncode and
+                        outputs[0].stdout == outputs[1].stdout and outputs[0].stderr == outputs[1].stderr)
+                fails += not good
+                print(f"  {'OK  ' if good else 'FAIL'} product:{kind} {mem} -j{j}", flush=True)
+    return total, fails
+
+
 def main():
     self_check()
     con = duckdb.connect()
@@ -1965,6 +2053,9 @@ def main():
     dn_total, dn_fails = dense_domain_checks(con, tmp)
     total += dn_total
     fails += dn_fails
+    dp_total, dp_fails = dense_product_checks(con, tmp)
+    total += dp_total
+    fails += dp_fails
     sp_total, sp_fails = sql_pred_checks(con, tmp, fixture)
     total += sp_total
     fails += sp_fails

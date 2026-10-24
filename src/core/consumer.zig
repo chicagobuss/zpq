@@ -4117,7 +4117,17 @@ fn scanRGForAggImpl(
                 return selected;
             }
             const dense = if (g.dense) |d| !staged and decode_options.encoded and
-                try d.fold(ra, gpa, g.keys[0].col_ref, in.file_index, in.rg_index, g.pos_base, &batch, lookup, &sel) else false;
+                try d.foldKeys(
+                    ra,
+                    gpa,
+                    g.keys,
+                    in.file_index,
+                    in.rg_index,
+                    g.pos_base,
+                    &batch,
+                    lookup,
+                    &sel,
+                ) else false;
             if (dense or (!staged and decode_options.encoded and
                 try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget, ws.region)))
             {
@@ -4363,6 +4373,19 @@ fn scanRGSliced(
                     );
                     continue;
                 }
+                if (!discovering and decode_options.encoded) if (g.dense) |d| {
+                    if (try d.foldKeys(
+                        sa,
+                        gpa,
+                        g.keys,
+                        in.file_index,
+                        in.rg_index,
+                        g.pos_base + done,
+                        &batch,
+                        lookup,
+                        &sel,
+                    )) continue;
+                };
                 if (!discovering and decode_options.encoded and ws.decode_batch_rows != 0 and
                     cacheExpressionsSafe(target))
                 {

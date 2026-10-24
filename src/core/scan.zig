@@ -2125,8 +2125,21 @@ fn sketchEligible(
     return rankingCall(.count, cfg, args, outputs, calls, keys, filter_cols, use_blocks, filter_ok);
 }
 
-/// The `func` call ranking a GROUP BY first, descending, under a LIMIT, where a count pass and an admit pass can cut
-/// it: see `sketchEligible`.
+/// Complete dense counts can rank directly only when no later predicate or expression needs losing groups.
+fn denseCountLimit(args: MultiAggArgs, calls: []const expr_agg.AggCall, outputs: ?[]const BoundOutputColumn) ?usize {
+    if (!agg_dense.countOnly(calls)) return null;
+    const outs = outputs orelse return null;
+    const order = args.result_order;
+    const limit = order.limit orelse return null;
+    if (limit == 0 or order.having != null or order.hidden.len != 0 or order.keys.len != 1 or
+        !order.keys[0].descending or order.keys[0].column >= outs.len) return null;
+    for (outs) |out| if (out.derived != null) return null;
+    const source = outs[order.keys[0].column].source;
+    if (source != .agg or source.agg != 0) return null;
+    return std.math.cast(usize, std.math.add(u64, order.offset, limit) catch return null);
+}
+
+/// The `func` call ranking a GROUP BY first, descending, under a LIMIT: see `sketchEligible`.
 fn rankingCall(
     func: expr_agg.AggFunc,
     cfg: SketchTopK,
@@ -4351,7 +4364,8 @@ fn prepareAggregateWithMetas(
         block_bounds = bounds;
     }
     // A dense fold (below) needs one table more, after the workers': the one its lanes merge into.
-    const dense_wanted = domain != null and decision.strategy == .plain_hash and !use_blocks and !part_on;
+    const dense_wanted = domain != null and domain.?.globalFits(n_workers) and
+        decision.strategy == .plain_hash and !use_blocks and !part_on;
     const all_tables = try arena.alloc(expr_agg.GroupTable, n_tables + @intFromBool(dense_wanted));
     const group_tables = all_tables[0..n_tables];
     // Integer and float keys are a fixed-width image: the per-row lookup mixes those bytes in an open-addressed
@@ -4364,7 +4378,8 @@ fn prepareAggregateWithMetas(
         gt.shared = group_budget;
         gt.fixed_stride = fixed_stride;
         // A lone SUM's ranking merge paid more to unpack its state than the smaller scan saved.
-        if (!dense_wanted and !use_blocks and (agg_calls.len != 1 or agg_calls[0].func == .count))
+        if ((!dense_wanted or agg_dense.countOnly(agg_calls)) and !use_blocks and
+            (agg_calls.len != 1 or agg_calls[0].func == .count))
             gt.compact.configure(agg_calls);
     }
     // A process about to exit (`leave_regions`) leaves the tables to it: freeing tens of millions of keys one by one
@@ -4389,8 +4404,36 @@ fn prepareAggregateWithMetas(
     // Fixed-width keys fold into an open-addressed table cheap enough that moving near-unique ones to runs cost more
     // than it saved; string keys, copied into a byte map per worker, gain.
     const rescannable = allRescannable(args.inputs);
-    const spill_on = !part_on and args.spill and decision.strategy == .plain_hash and !use_blocks and
-        fixed_stride == 0 and partAggSupported(args, agg_calls, group_by_keys != null) and rescannable;
+    // Exact dictionary domains fold by global id when the plan groups in per-worker
+    // tables: no group lookups per row group and no hash merge. Taken only when walking every worker's lanes costs no
+    // more than the lookups it replaces (one per dictionary entry per row group), and when the domain and every lane
+    // fit the shared budget, drawn before any worker starts.
+    const dense_cut = denseCountLimit(args, agg_calls, group_outputs);
+    var dense_lanes: []agg_dense.Lanes = &.{};
+    var dense_charge: usize = 0;
+    defer group_budget.release(dense_charge);
+    defer for (dense_lanes) |*l| l.deinit(gpa);
+    // The table the lanes merge into is reserved with them, and handed to it as it is built.
+    var dense_table_charge: usize = 0;
+    if (dense_wanted) dense: {
+        const d = &domain.?;
+        const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls, ndv_stat.?.rows);
+        if (!rescannable) break :dense;
+        dense_table_charge = agg_dense.domainTableBytes(d, d.ids(), fixed_stride, agg_calls.len);
+        const heap_bytes = if (dense_cut) |h| @min(h, d.ids()) *| @sizeOf(u32) else 0;
+        dense_charge = group_budget.drawExact(
+            d.bytes +| lanes_bytes +| dense_table_charge +| heap_bytes,
+        ) orelse break :dense;
+        dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
+        for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls, .rows = ndv_stat.?.rows };
+        if (args.taken) |taken| taken.insert(.dense);
+    }
+    if (dense_lanes.len == 0) if (domain) |*d| {
+        d.deinit(gpa);
+        domain = null;
+    };
+    const spill_on = dense_lanes.len == 0 and !part_on and args.spill and
+        decision.strategy == .plain_hash and !use_blocks and fixed_stride == 0 and partAggSupported(args, agg_calls, group_by_keys != null) and rescannable;
     if (args.taken) |taken| {
         if (spill_on) taken.insert(.spill);
         // Chosen by the cost rules rather than asked for, a partitioned plan has the plain one to fall back to.
@@ -4475,31 +4518,6 @@ fn prepareAggregateWithMetas(
             ps.* = .{ .gpa = gpa, .budget = group_budget, .table = gt, .agg_idx = ai, .active = pairs_from_start };
         }
     }
-    // A lone integer key whose exact domain the union kept folds by global id when the plan groups it in per-worker
-    // tables: no group lookups per row group and no hash merge. Taken only when walking every worker's lanes costs no
-    // more than the lookups it replaces (one per dictionary entry per row group), and when the domain and every lane
-    // fit the shared budget, drawn before any worker starts.
-    var dense_lanes: []agg_dense.Lanes = &.{};
-    var dense_charge: usize = 0;
-    defer group_budget.release(dense_charge);
-    defer for (dense_lanes) |*l| l.deinit(gpa);
-    // The table the lanes merge into is reserved with them, and handed to it as it is built.
-    var dense_table_charge: usize = 0;
-    if (dense_wanted) dense: {
-        const d = &domain.?;
-        const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls, ndv_stat.?.rows);
-        if (!rescannable or d.ids() > agg_dense.max_ids) break :dense;
-        if (spill_on or pairs_call != null or n_workers *| d.ids() > d.entries()) break :dense;
-        dense_table_charge = agg_dense.tableBytes(d.ids(), fixed_stride, agg_calls.len);
-        dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes +| dense_table_charge) orelse break :dense;
-        dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
-        for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls, .rows = ndv_stat.?.rows };
-        if (args.taken) |taken| taken.insert(.dense);
-    }
-    if (dense_lanes.len == 0) if (domain) |*d| {
-        d.deinit(gpa);
-        domain = null;
-    };
     var block_merge: ?BlockMerge = if (use_blocks) .{
         .tables = group_tables,
         .merged = &merged_table,
@@ -4642,10 +4660,16 @@ fn prepareAggregateWithMetas(
     }
     if (dense_lanes.len > 0) {
         const dense_table = &all_tables[n_tables];
-        const key = group_by_keys.?[0].col_ref;
+        const dense_keys = group_by_keys.?;
+        var dense_lookup: usize = 0;
+        for (dense_keys) |key| dense_lookup = @max(dense_lookup, key.col_ref.col_idx + 1);
         group_budget.release(dense_table_charge);
         dense_charge -= dense_table_charge;
-        try agg_dense.intoTable(gpa, arena, dense_lanes, key, dense_table, key.col_idx + 1, n_workers);
+        const cut = if (dense_cut) |h| only_lanes: {
+            for (group_tables) |*table| if (table.groupCount() != 0) break :only_lanes null;
+            break :only_lanes @as(?usize, h);
+        } else null;
+        try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut);
         if (leave_tables) {
             left_lanes = dense_lanes;
             left_domain = domain;
@@ -19655,4 +19679,75 @@ test "budget narrowing requires rescannable inputs for every restart reason" {
         const retry = narrowed(args, args, std.EnumSet(FastPath).initOne(.merge_memory), &chain, false).?;
         try testing.expectEqual(@as(usize, 1), retry.parallelism);
     }
+}
+
+test "dense composite counts arm globally and preserve selected first through windows" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ints: [256]i32 = undefined;
+    var names: [256][]const u8 = undefined;
+    for (&ints, &names, 0..) |*v, *s, i| {
+        v.* = @intCast(i % 3);
+        s.* = if (i % 5 == 0) "a\x00b" else "";
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "a", .col = .{ .i32 = .{ .values = &ints } }, .parquet_type = .INT32, .nullable = false },
+        .{
+            .name = "b",
+            .col = .{ .string = .{ .values = &names } },
+            .parquet_type = .BYTE_ARRAY,
+            .nullable = false,
+        },
+    };
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        a: std.mem.Allocator,
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            try c.bytes.appendSlice(c.a, bytes);
+        }
+    };
+    var capture: Capture = .{ .a = a };
+    _ = try consumer.writeAggregateRows(
+        a,
+        .{ .ctx = &capture, .write_fn = Capture.write },
+        &columns,
+        ints.len,
+        .SNAPPY,
+        .{},
+        .{},
+    );
+    var meta = try metadata.open(a, capture.bytes.items);
+    const groups = try a.alloc(schema.RowGroup, 16);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= 16;
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "product", .bytes = capture.bytes.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "a,b",
+        .filter = "a < 2",
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3, .offset = 1 },
+        .dense = false,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+        var taken: std.EnumSet(FastPath) = .{};
+        args.parallelism = j;
+        args.decode_batch_rows = window;
+        args.dense = true;
+        args.taken = &taken;
+        var got = try prepareAggregate(gpa, a, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.dense));
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+    };
 }

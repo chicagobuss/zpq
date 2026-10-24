@@ -6154,6 +6154,10 @@ fn inlineDistinctAnswer(
             const merge_span = profile.Span.begin(profile.threadOf(args.profiler, .main));
             state.finish() catch |e| return if (e == error.OutOfMemory) error.ExceededMemoryBudget else e;
             merge_span.end(.merge, profile.args(.{parts}));
+            // Scalar writers finalize ScanState, so retain the finished count as well as the JSON value.
+            const finished_calls = try countedCalls(arena, calls, 0);
+            const finished = try arena.alloc(expr_agg.Accumulator, 1);
+            finished[0] = .{ .count = @intCast(state.group_count) };
             const alias = gpa.dupe(u8, call.alias) catch return error.ExceededMemoryBudget;
             errdefer gpa.free(alias);
             const items = gpa.alloc(AggOutputItem, 1) catch return error.ExceededMemoryBudget;
@@ -6174,7 +6178,7 @@ fn inlineDistinctAnswer(
                 .cols_stat_pruned = plan.cols_stat_pruned,
                 .timings = t,
                 .output = .{ .aggs = items },
-                .state = .{ .accumulators = &.{}, .agg_calls = calls },
+                .state = .{ .accumulators = finished, .agg_calls = finished_calls, .agg_sources = &.{null} },
             };
         },
     }
@@ -20297,6 +20301,13 @@ test "scalar owner cardinality survives releasing windows and late width refusal
             var got = try runMultiAggregate(gpa, a, args);
             defer got.deinit(gpa);
             try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
+            if (!late) {
+                try testing.expectEqual(.count, got.state.agg_calls[0].func);
+                try testing.expectEqual(@as(usize, 1), got.state.accumulators.len);
+                try testing.expectEqual(@as(usize, 1), got.state.agg_sources.len);
+                const cols = try expr_agg.finalize(a, got.state.agg_calls[0], got.state.accumulators[0]);
+                try testing.expectEqual(@as(i64, @intCast(want.output.aggs[0].value.i)), cols[0].col.i64.values[0]);
+            }
             try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
             try testing.expectEqual(@as(usize, @intFromBool(late)), window.abandoned);
         };

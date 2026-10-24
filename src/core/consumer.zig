@@ -3032,6 +3032,7 @@ pub const AggRowGroup = struct {
 pub const RecordSink = union(enum) {
     integer: *owner_groups.IntFull.Local,
     integer_top: *owner_groups.IntSumTop.Local,
+    integer_count_top: *owner_groups.IntCountTop.Local,
     bytes: *owner_groups.Full.Local,
     byte_top: *owner_groups.SumTop.Local,
     byte_count_top: *owner_groups.CountTop.Local,

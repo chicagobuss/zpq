@@ -57,14 +57,17 @@ cannot exclude a winner. Absent, unreadable or wide bounds retain value sampling
 Input-wide sample windows run on row-group tasks in the existing worker pool, with private sample maps and
 decode scratch. Their merged counts cover the same global row budget, including windows crossing row groups.
 
-Integer full and SUM top-H answers may fill the same owner state from decoded nondecreasing runs. Footer bounds only select
+Integer full, SUM top-H and COUNT top-H answers may fill the same owner state from decoded nondecreasing runs. Footer bounds only select
 the attempt. Each source verifies every decoded key; NULL or any descent declines and releases the state before
 the ordinary owner-record replay. Partial sums stay i128 through seam folding, including a chain spanning more
 than two sources. Only complete sums are narrowed. Run groups use the existing source-ordinal winner map and
 window writer, preserving first-appearance order and output row-group boundaries. The ordinary owner reservation
 covers their group, winner and ordering arrays; no separate grouped executor or tuning option is introduced.
 
-After all source seams are reconciled, SUM top-H selects complete run groups with the existing per-worker heaps
+After all source seams are reconciled, SUM/COUNT top-H selects complete run groups with the existing per-worker heaps
 and first-ordinal tie rule. Ordinary owner folding also compares each record with the previous complete inline
 key before probing; exact lengths and NULL flags still participate in identity. This shortcut preserves every
 row update, including i128 sums and minimum first ordinals. NULL records take the ordinary probe.
+
+COUNT top-H admits the value-less integer run producer only when the footer order hint selects it. Every decoded key
+and seam must still verify; a refusal returns to the existing general COUNT plan. It decodes no SUM value column.

@@ -131,6 +131,7 @@ pub const SumTop = Owner(.sum_top, .bytes);
 pub const CountTop = Owner(.count_top, .bytes);
 pub const IntFull = Owner(.full, .int64);
 pub const IntSumTop = Owner(.sum_top, .int64);
+pub const IntCountTop = Owner(.count_top, .int64);
 
 pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
     const has_value = kind != .count_top;
@@ -258,8 +259,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
 
             pub fn append(l: *Local, key: ?Key, value: if (has_value) ?i64 else void, ordinal: u32) !void {
                 std.debug.assert(admitsRows(codec, ordinal));
-                if (comptime kind != .count_top and codec == .int64) if (l.state.runs.len != 0) {
-                    l.appendRun(key, value, ordinal);
+                if (comptime codec == .int64) if (l.state.runs.len != 0) {
+                    l.appendRun(key, if (has_value) value else null, ordinal);
                     return;
                 };
                 // Integer keys: their bits, NULL told apart by its flag (full) or a bit no integer sets (top-H).
@@ -307,7 +308,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
 
             pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
-                if (comptime kind != .count_top and codec == .int64)
+                if (comptime codec == .int64)
                     if (l.state.runs.len != 0 and l.state.run_declined.load(.monotonic)) return;
                 const k = if (codec == .bytes) view.cols[lookup[l.state.key_col].?].string else view.cols[lookup[l.state.key_col].?].i64;
                 if (!has_value) {
@@ -467,7 +468,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 parts: usize,
                 items: usize,
             ) !?*State {
-                comptime std.debug.assert(kind != .count_top and codec == .int64);
+                comptime std.debug.assert(codec == .int64);
                 // The ordinary per-row quote also covers one run descriptor per row. Empty-source-heavy inputs
                 // beyond that bound keep the record producer, rather than retaining unquoted descriptors.
                 if (items > rows) return null;
@@ -746,7 +747,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
 
             pub fn finish(s: *State) !void {
-                if (comptime kind != .count_top and codec == .int64) if (s.runs.len != 0) {
+                if (comptime codec == .int64) if (s.runs.len != 0) {
                     const begin = now();
                     try s.finishRuns();
                     s.fold_ns = @intCast(now() - begin);
@@ -1397,14 +1398,21 @@ test "decoded owner runs narrow exact sums only after all seams, including a lat
 }
 
 fn runTopTrial(a: std.mem.Allocator, workers: usize, descending: bool, k: usize) !void {
+    return runTopTrialKind(.sum_top, a, workers, descending, k);
+}
+fn countRunTopTrial(a: std.mem.Allocator, workers: usize, descending: bool, k: usize) !void {
+    return runTopTrialKind(.count_top, a, workers, descending, k);
+}
+fn runTopTrialKind(comptime kind: Kind, a: std.mem.Allocator, workers: usize, descending: bool, k: usize) !void {
+    const O = Owner(kind, .int64);
     const rows = 1024;
     const items = 17;
     var ledger: memory.SharedBudget = .{ .limit = 1 << 30 };
     defer std.debug.assert(ledger.used.load(.monotonic) == 0);
     const cut: Cut = .{ .k = k, .descending = descending };
-    const run = (try IntSumTop.State.initRuns(a, &ledger, rows, workers, 0, 1, cut, 64, items)).?;
+    const run = (try O.State.initRuns(a, &ledger, rows, workers, 0, 1, cut, 64, items)).?;
     defer run.deinit();
-    const hash = (try IntSumTop.State.init(a, &ledger, rows, workers, 0, 1, cut, 64, 0)).?;
+    const hash = (try O.State.init(a, &ledger, rows, workers, 0, 1, cut, 64, 0)).?;
     defer hash.deinit();
     var item: usize = items;
     while (item != 0) {
@@ -1415,8 +1423,8 @@ fn runTopTrial(a: std.mem.Allocator, workers: usize, descending: bool, k: usize)
         for (lo..hi) |row| {
             const key: i64 = @intCast(row / 128); // A group crosses three source seams.
             const value: ?i64 = if (key == 0) null else if (row % 11 == 0) -3 else 1;
-            try run.locals[item % workers].append(key, value, @intCast(row));
-            try hash.locals[item % workers].append(key, value, @intCast(row));
+            try run.locals[item % workers].append(key, if (kind == .sum_top) value else {}, @intCast(row));
+            try hash.locals[item % workers].append(key, if (kind == .sum_top) value else {}, @intCast(row));
         }
     }
     try run.finish();
@@ -1451,4 +1459,38 @@ test "decoded owner runs decline unquoted descriptors for mostly empty sources" 
         2,
     )) == null);
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "decoded owner COUNT top-H preserves seam counts and first-selected ties at every worker count" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]bool{ false, true }) |descending|
+        for ([_]usize{ 1, 7, 16 }) |k| try countRunTopTrial(std.testing.allocator, j, descending, k);
+    spawn.injectFailureAfter(1);
+    defer spawn.resetFailure();
+    try countRunTopTrial(std.testing.allocator, 16, true, 7);
+}
+
+test "decoded owner COUNT top-H releases all failed allocations and ledger charges" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, countRunTopTrial, .{ 1, true, 7 });
+}
+
+test "decoded owner COUNT top-H declines NULL and descending keys before selection" {
+    for ([_][4]?i64{ .{ 1, null, 2, 3 }, .{ 1, 0, 2, 3 }, .{ 1, 2, 1, 3 } }) |keys| {
+        const s = (try IntCountTop.State.initRuns(
+            std.testing.allocator,
+            null,
+            keys.len,
+            2,
+            0,
+            0,
+            .{ .k = 2, .descending = true },
+            64,
+            2,
+        )).?;
+        defer s.deinit();
+        for (0..2) |item| {
+            s.locals[item].start(@intCast(item * 2), item);
+            for (item * 2..item * 2 + 2) |row| try s.locals[item].append(keys[row], {}, @intCast(row));
+        }
+        try std.testing.expectError(error.RunOrderDeclined, s.finish());
+    }
 }

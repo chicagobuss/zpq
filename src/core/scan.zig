@@ -1225,7 +1225,15 @@ pub const AggregateExplanation = struct {
 };
 
 pub const RecordAdmission = struct {
-    layout: enum { integer_group_stream, integer_sum_top_h, byte_group_stream, byte_sum_top_h, byte_count_top_h, msd_count_top_h },
+    layout: enum {
+        integer_group_stream,
+        integer_sum_top_h,
+        integer_count_top_h,
+        byte_group_stream,
+        byte_sum_top_h,
+        byte_count_top_h,
+        msd_count_top_h,
+    },
     reservation: usize,
 };
 
@@ -5971,7 +5979,7 @@ fn inlineIntegerAnswer(
         if (call.where != null or call.offset != 0 or call.state or call.result != .i64) return null;
         switch (call.func) {
             .count => {
-                if (cut != null or call.arg != null or count != null) return null;
+                if (call.arg != null or count != null) return null;
                 count = i;
             },
             .sum => {
@@ -5983,7 +5991,10 @@ fn inlineIntegerAnswer(
             else => return null,
         }
     }
-    if ((full and count == null) or value == null) return null;
+    const count_top = !full and count != null;
+    if ((full and count == null) or (!count_top and value == null)) return null;
+    // COUNT already has ordinary exact routes; ordered runs alone admit this value-less producer.
+    if (count_top and !orderedIntegerHint(metas, work, key.col_idx)) return null;
     var seen: u8 = 0;
     for (outputs) |out| seen |= @as(u8, 1) << @intCast(switch (out.source) {
         .key => @as(usize, 0),
@@ -6000,16 +6011,37 @@ fn inlineIntegerAnswer(
         rows +|= @intCast(n);
     }
     if (rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows) or
-        integerQuote(rows, n_workers, cut, args) > args.max_memory) return null;
+        integerQuote(rows, n_workers, cut, args, count_top) > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
     if (explain_only) return .{
-        .layout = if (cut != null) .integer_sum_top_h else .integer_group_stream,
-        .reservation = integerQuote(rows, n_workers, cut, args),
+        .layout = if (count_top) .integer_count_top_h else if (cut != null) .integer_sum_top_h else .integer_group_stream,
+        .reservation = integerQuote(rows, n_workers, cut, args, count_top),
     };
     if (cut) |c| {
+        if (count_top) return runIntegerOwner(
+            .count_top,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            n_workers,
+            timings,
+            rows,
+            key.col_idx,
+            0,
+            count,
+            starts,
+            c,
+            true,
+        );
         if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
             .sum_top,
             gpa,
@@ -6116,10 +6148,21 @@ fn orderedIntegerHint(metas: []const schema.FileMetaData, work: []const WorkItem
 }
 
 /// The reservation of an admitted integer record layout: the full answer's established quote, or a top-H attempt's.
-fn integerQuote(rows: usize, n_workers: usize, cut: ?owner_groups.Cut, args: MultiAggArgs) usize {
+fn integerQuote(
+    rows: usize,
+    n_workers: usize,
+    cut: ?owner_groups.Cut,
+    args: MultiAggArgs,
+    count_top: bool,
+) usize {
     const c = cut orelse return owner_groups.IntFull.State.reservation(rows, n_workers, owner_groups.full_parts, 0, 0);
-    const parts = owner_groups.IntSumTop.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
-    return owner_groups.IntSumTop.State.reservation(rows, n_workers, parts, c.k, 0);
+    switch (if (count_top) owner_groups.Kind.count_top else owner_groups.Kind.sum_top) {
+        inline else => |kind| {
+            const Owner = owner_groups.Owner(kind, .int64);
+            const parts = Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
+            return Owner.State.reservation(rows, n_workers, parts, c.k, 0);
+        },
+    }
 }
 
 fn runIntegerOwner(
@@ -6155,7 +6198,11 @@ fn runIntegerOwner(
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
-    for (sinks, state.locals) |*sink, *local| sink.* = if (kind == .full) .{ .integer = local } else .{ .integer_top = local };
+    for (sinks, state.locals) |*sink, *local| sink.* = switch (kind) {
+        .full => .{ .integer = local },
+        .sum_top => .{ .integer_top = local },
+        .count_top => .{ .integer_count_top = local },
+    };
     const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, outputs, timings);
     const prof = profile.threadOf(args.profiler, .main);
     const final_start = nowMonoNs();
@@ -6184,7 +6231,7 @@ fn runIntegerOwner(
     }
     if (kind != .full) {
         const kept = state.top();
-        try buildIntegerTopRows(gpa, &output, kept, outputs);
+        try buildIntegerTopRows(kind, gpa, &output, kept, outputs);
         // As with the general GROUP BY answer, keep its row storage drawn until the query ledger dies. Transfer
         // that tiny part of the reservation before releasing the records; no owning state remains in the answer.
         if (args.ledger != null) state.charged -= @min(state.charged, kept.len *
@@ -6288,6 +6335,7 @@ fn runRecordWorkers(
 }
 
 fn buildIntegerTopRows(
+    comptime kind: owner_groups.Kind,
     gpa: std.mem.Allocator,
     output: *AggOutput,
     groups: []const owner_groups.IntSumTop.Group,
@@ -6305,7 +6353,7 @@ fn buildIntegerTopRows(
         for (outputs, cells) |out, *cell| {
             const v: ?i128 = switch (out.source) {
                 .key => if (g.keyValue()) |x| @as(i128, x) else null,
-                .agg => g.sumValue(),
+                .agg => owner_groups.Owner(kind, .int64).rank(g),
             };
             cell.* = if (v) |x| .{ .i = x } else .null_val;
         }
@@ -14290,7 +14338,7 @@ fn integerTopRowsTrial(a: std.mem.Allocator) !void {
         .{ .name = "s", .source = .{ .agg = 0 } },
         .{ .name = "k", .source = .{ .key = 0 } },
     };
-    try buildIntegerTopRows(a, &output, &groups, &outputs);
+    try buildIntegerTopRows(.sum_top, a, &output, &groups, &outputs);
     try testing.expectEqual(groups[0].sum, output.group_rows.?[0][0].i);
     try testing.expectEqual(@as(i128, -7), output.group_rows.?[0][1].i);
     try testing.expect(output.group_rows.?[1][0] == .null_val and output.group_rows.?[1][1] == .null_val);
@@ -19195,20 +19243,29 @@ test "integer owner decoded runs and false sorted hints match the canonical mult
                     try testing.expectEqual(v == .null_val, lane.defs.len != 0 and lane.defs[i] == 0);
                     if (v != .null_val) try testing.expectEqual(v.i, lane.values[i]);
                 };
-                var top_args = base;
-                top_args.aggregate = "sum(v) AS s";
-                top_args.parallelism = j;
-                top_args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2, .offset = 1 };
-                var top_want = try runMultiAggregate(testing.allocator, a, top_args);
-                defer top_want.deinit(testing.allocator);
-                top_args.integer_records = true;
-                top_args.integer_records_min_rows = 0;
-                top_args.typed_answer = true;
-                var top_got = try runMultiAggregate(testing.allocator, a, top_args);
-                defer top_got.deinit(testing.allocator);
-                try top_want.output.applyResultOrder(testing.allocator, top_args.result_order);
-                try top_got.output.applyResultOrder(testing.allocator, top_args.result_order);
-                try testing.expectEqualDeep(top_want.output.group_rows.?, top_got.output.group_rows.?);
+                for ([_][]const u8{ "sum(v) AS s", "count(*) AS c" }) |aggregate| for ([_]bool{ false, true }) |desc| {
+                    var top_args = base;
+                    top_args.aggregate = aggregate;
+                    top_args.parallelism = j;
+                    top_args.result_order = .{ .keys = &.{.{ .column = 1, .descending = desc }}, .limit = 2, .offset = 1 };
+                    var top_want = try runMultiAggregate(testing.allocator, a, top_args);
+                    defer top_want.deinit(testing.allocator);
+                    top_args.integer_records = true;
+                    top_args.integer_records_min_rows = 0;
+                    top_args.typed_answer = true;
+                    var taken: std.EnumSet(FastPath) = .{};
+                    top_args.taken = &taken;
+                    if (!descent and files == 1 and aggregate[0] == 'c') {
+                        const explanation = try explainAggregate(testing.allocator, a, top_args);
+                        try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+                    }
+                    var top_got = try prepareAggregate(testing.allocator, a, top_args, false);
+                    defer top_got.deinit(testing.allocator);
+                    if (!descent and files == 1) try testing.expect(taken.contains(.integer_records));
+                    try top_want.output.applyResultOrder(testing.allocator, top_args.result_order);
+                    try top_got.output.applyResultOrder(testing.allocator, top_args.result_order);
+                    try testing.expectEqualDeep(top_want.output.group_rows.?, top_got.output.group_rows.?);
+                };
             }
         }
     }

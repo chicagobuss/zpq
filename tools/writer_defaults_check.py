@@ -107,7 +107,7 @@ def main():
             n = 1250 if nullable else 1000
             columns = {}
             for ti, dtype in enumerate(types):
-                for cardinality in [150, 200, 201]:
+                for cardinality in [80, 100, 101]:
                     values = [i % cardinality if i < 1000 else None for i in range(n)]
                     columns[f"v{ti}_{cardinality}"] = pa.array(values, type=dtype)
             table = pa.table(columns)
@@ -120,11 +120,11 @@ def main():
                 for ci, name in enumerate(table.column_names):
                     column = metadata.row_group(0).column(ci)
                     cardinality = int(name.split("_")[1])
-                    assert column.has_dictionary_page == (cardinality <= 200), (name, nullable, dictionary)
+                    assert column.has_dictionary_page == (cardinality <= 100), (name, nullable, dictionary)
                     assert column.compression == "SNAPPY"
                     assert column.has_column_index and column.has_offset_index
         check_exactness(binary, root)
-        print("writer defaults: numeric 15%/20%/20.1%, dense/nullable, plain/coded: PyArrow + DuckDB PASS")
+        print("writer defaults: numeric 8%/10%/10.1%, dense/nullable, plain/coded: PyArrow + DuckDB PASS")
 
 
 if __name__ == "__main__":

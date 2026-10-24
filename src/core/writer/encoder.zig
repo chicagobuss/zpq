@@ -593,7 +593,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     // Dict-encode low-cardinality INT32/INT64 columns. The big win is
     // hourly-rounded timestamp columns (24 unique values per daily
     // shard) where dict crushes DELTA: 1.3 bytes/row vs 4.4.
-    // Cardinality cap: num_present / 5.
+    // Cardinality cap: num_present / 10.
     //
     // FLOAT/DOUBLE columns get the same treatment for the same reason:
     // rounded cost / percentage data is heavily repeated (1M cents in
@@ -847,7 +847,7 @@ fn planCoded(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
             if (T != bool and c.max_rep == 0 and num_present >= 64) dict: {
                 const is_string = T == []const u8;
                 const len_prefix: usize = if (in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY) 0 else 4;
-                const max_cardinality = if (is_string) stringDictMaxEntries(num_present) else num_present / 5;
+                const max_cardinality = if (is_string) stringDictMaxEntries(num_present) else num_present / 10;
                 var dict_bytes: usize = 0;
                 const none = std.math.maxInt(u32);
                 const remap = try arena.alloc(u32, c.dict.len);
@@ -1093,7 +1093,7 @@ fn internColumn(
 /// Generic INT32/INT64 dictionary encoder. Same two-page layout as
 /// tryEncodeDictBytes: PLAIN-encoded dictionary page, then a data
 /// page of RLE/bit-packed indices. Returns null when the dictionary
-/// would exceed `num_present / 5` or when there are fewer than 64
+/// would exceed `num_present / 10` or when there are fewer than 64
 /// present values.
 fn tryEncodeDictInt(
     comptime T: type,
@@ -1114,7 +1114,7 @@ fn tryEncodeDictInt(
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
 
-    const max_cardinality = num_present / 5;
+    const max_cardinality = num_present / 10;
     var dict_keys: std.ArrayList(@Int(.unsigned, @bitSizeOf(T))) = .empty;
     try dict_keys.ensureTotalCapacity(arena, max_cardinality);
     const indices = try arena.alloc(u32, num_present);
@@ -1143,7 +1143,7 @@ fn tryEncodeDictInt(
 /// model where NaN != NaN but each specific NaN bit pattern is its
 /// own entry).
 ///
-/// Cardinality cap = num_present / 5 (as the INT path). Returns null
+/// Cardinality cap = num_present / 10 (as the INT path). Returns null
 /// when the dictionary would exceed the cap or when there are fewer
 /// than 64 present values.
 fn tryEncodeDictFloat(
@@ -1167,7 +1167,7 @@ fn tryEncodeDictFloat(
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
 
-    const max_cardinality = num_present / 5;
+    const max_cardinality = num_present / 10;
     var dict_values: std.ArrayList(KeyT) = .empty;
     try dict_values.ensureTotalCapacity(arena, max_cardinality);
     const indices = try arena.alloc(u32, num_present);
@@ -3670,7 +3670,7 @@ test "string statistics say whether their bounds were cut; FIXED_LEN_BYTE_ARRAY 
     try testing.expectEqual(@as(?bool, false), back.is_min_value_exact);
 }
 
-test "numeric dictionaries admit a fifth of present rows in hashed and coded columns" {
+test "numeric dictionaries admit a tenth of present rows in hashed and coded columns" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -3678,7 +3678,7 @@ test "numeric dictionaries admit a fifth of present rows in hashed and coded col
         const tag = @typeName(T);
         const physical: schema.Type = if (T == i32) .INT32 else if (T == i64) .INT64 else
             if (T == f32) .FLOAT else .DOUBLE;
-        for ([_]usize{ 150, 200, 201 }) |cardinality| for ([_]bool{ false, true }) |nullable| {
+        for ([_]usize{ 80, 100, 101 }) |cardinality| for ([_]bool{ false, true }) |nullable| {
             const n: usize = if (nullable) 1250 else 1000;
             const values = try a.alloc(T, n);
             const codes = try a.alloc(u32, n);
@@ -3720,7 +3720,7 @@ test "numeric dictionaries admit a fifth of present rows in hashed and coded col
                 .schema_elem = &elem,
                 .path_in_schema = &.{"v"},
             });
-            try testing.expectEqual(cardinality <= 200, plain.meta.dictionary_page_offset != null);
+            try testing.expectEqual(cardinality <= 100, plain.meta.dictionary_page_offset != null);
             try testing.expectEqualSlices(u8, plain.bytes, got.bytes);
         };
     }

@@ -432,6 +432,129 @@ def cmd_stats_orders(args):
         raise SystemExit(f"has_min_max={usable} pushdown={pushed} truth={truth}")
 
 
+def wire_expr(name, typ):
+    quoted = '"' + name.replace('"', '""') + '"'
+    kind = typ.upper()
+    if kind.startswith("BLOB"):
+        return f"lower(hex({quoted})) AS {quoted}"
+    if kind.startswith("UUID"):
+        return f"lower({quoted}::VARCHAR) AS {quoted}"
+    return quoted
+
+
+def wire_float(value):
+    import math
+
+    if isinstance(value, float) and math.isnan(value):
+        return ("nan",)
+    if isinstance(value, float):
+        return (value, math.copysign(1.0, value))
+    return value
+
+
+def wire_pa_cell(value):
+    import uuid
+
+    if isinstance(value, uuid.UUID):
+        return str(value).lower()
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    return wire_float(value)
+
+
+def wire_duck_cell(value, typ):
+    if value is None:
+        return None
+    kind = typ.upper()
+    if kind.startswith(("DOUBLE", "FLOAT", "REAL")):
+        return wire_float(float(value))
+    if kind.startswith(("BLOB", "UUID")):
+        return str(value).lower()
+    return value
+
+
+def wire_rows(args, sql, cols, types):
+    raw = duck_json(args.duckdb, sql, stable=True)
+    return [tuple(wire_duck_cell(row.get(col), typ) for col, typ in zip(cols, types)) for row in raw]
+
+
+def cmd_wire(args):
+    """Written parquet: values via both readers, uncompressed size, FLBA encodings, float bounds."""
+    import math
+
+    import pyarrow.parquet as pq
+
+    out = args.zpq
+    check = args.check
+    if check == "bytes":
+        meta = pq.ParquetFile(out).metadata
+        ok = all(
+            meta.row_group(g).total_byte_size
+            == sum(meta.row_group(g).column(c).total_uncompressed_size for c in range(meta.num_columns))
+            for g in range(meta.num_row_groups)
+        )
+        if not ok:
+            raise SystemExit("total_byte_size")
+        return
+    if check == "encodings":
+        meta = pq.ParquetFile(out).metadata
+        bad = []
+        for g in range(meta.num_row_groups):
+            for c in range(meta.num_columns):
+                col = meta.row_group(g).column(c)
+                if col.physical_type != "FIXED_LEN_BYTE_ARRAY":
+                    continue
+                if "DELTA_LENGTH_BYTE_ARRAY" in col.encodings:
+                    bad.append(f"rg{g}.{col.path_in_schema}")
+        if bad:
+            raise SystemExit("FLBA " + ",".join(bad))
+        return
+    if check == "bounds":
+        meta = pq.ParquetFile(out).metadata
+        tbl = pq.read_table(out)
+        bad = []
+        for c in range(meta.num_columns):
+            cc = meta.row_group(0).column(c)
+            if cc.physical_type not in ("FLOAT", "DOUBLE"):
+                continue
+            vals = [v for v in tbl.column(cc.path_in_schema).to_pylist() if v is not None and not math.isnan(v)]
+            st = cc.statistics
+            if not vals:
+                if st is not None and st.has_min_max:
+                    bad.append(f"{cc.path_in_schema}: bounds on an all-NaN chunk")
+                continue
+            lo, hi = min(vals), max(vals)
+            lo = -0.0 if lo == 0 else lo
+            hi = 0.0 if hi == 0 else hi
+            if wire_float(st.min) != wire_float(lo) or wire_float(st.max) != wire_float(hi):
+                bad.append(f"{cc.path_in_schema}: [{st.min}, {st.max}] want [{lo}, {hi}]")
+        if bad:
+            raise SystemExit("; ".join(bad)[:300])
+        return
+
+    pf = pq.ParquetFile(out)
+    cols = list(pf.schema_arrow.names)
+    spec = describe(args.duckdb, f"SELECT * FROM '{out}'", stable=True)
+    types = [dict(spec)[col] for col in cols]
+    select = ", ".join(wire_expr(col, typ) for col, typ in zip(cols, types))
+    where = f" WHERE {args.where}" if args.where else ""
+    want = sorted(wire_rows(args, f"SELECT {select} FROM '{args.fixture}'{where}", cols, types), key=repr)
+    if check == "duck":
+        got = sorted(wire_rows(args, f"SELECT {select} FROM '{out}'", cols, types), key=repr)
+    else:
+        pq.read_table(out)
+        got = sorted(
+            (tuple(wire_pa_cell(row[col]) for col in cols) for row in pq.read_table(out).to_pylist()),
+            key=repr,
+        )
+    if got != want:
+        if len(got) != len(want):
+            raise SystemExit(f"zpq={len(got)} truth={len(want)}")
+        for a, b in zip(got, want):
+            if a != b:
+                raise SystemExit(f"row zpq={a} truth={b}"[:400])
+
+
 def cmd_parquet(args):
     import pyarrow.parquet as pq
 
@@ -459,7 +582,7 @@ def cmd_parquet(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders"])
+    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire"])
     p.add_argument("--zpq", required=True)
     p.add_argument("--duckdb")
     p.add_argument("--sql")
@@ -476,8 +599,9 @@ def main():
     p.add_argument("--pred-value")
     p.add_argument("--py-agg")
     p.add_argument("--orders")
+    p.add_argument("--check")
     args = p.parse_args()
-    args.stable = args.mode in ("ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders")
+    args.stable = args.mode in ("ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire")
     if args.mode == "agg":
         cmd_agg(args)
     elif args.mode == "group":
@@ -494,6 +618,8 @@ def main():
         cmd_stats_select(args)
     elif args.mode == "stats_orders":
         cmd_stats_orders(args)
+    elif args.mode == "wire":
+        cmd_wire(args)
     else:
         cmd_parquet(args)
 

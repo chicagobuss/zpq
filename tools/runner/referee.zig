@@ -49,6 +49,7 @@ const Case = struct {
     py_agg: ?[]const u8 = null,
     orders: ?[]const u8 = null,
     trust_stats: bool = false,
+    codec: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -173,6 +174,26 @@ fn runFile(
             try fixtures.put(item.object.get("name").?.string, item.object.get("path").?.string);
         }
     }
+    if (root.get("prepare")) |prep| {
+        const script = prep.object.get("script").?.string;
+        const names = try stringList(arena, prep.object.get("fixtures").?);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        try argv.append(arena, pyarrow);
+        try argv.append(arena, script);
+        for (names) |name| {
+            const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.parquet", .{ work, file_i, name });
+            try argv.append(arena, path);
+            try fixtures.put(name, path);
+        }
+        const prepared = try capture(gpa, io, argv.items);
+        defer gpa.free(prepared.stdout);
+        defer gpa.free(prepared.stderr);
+        if (prepared.code != 0) {
+            std.debug.print("prepare: {s}\n", .{prepared.stderr});
+            return error.Prepare;
+        }
+    }
     const schema_order: []const []const u8 = if (root.get("schema_order")) |v| try stringList(arena, v) else &.{};
     const out_path = try std.fmt.allocPrint(arena, "{s}/f{d}-out.parquet", .{ work, file_i });
     const diff_path = try std.fmt.allocPrint(arena, "{s}/f{d}-diff.csv", .{ work, file_i });
@@ -197,6 +218,8 @@ fn runFile(
             runAnswer(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "stats"))
             runStats(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, work, file_i, case)
+        else if (std.mem.eql(u8, case.kind, "wire"))
+            runWire(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, case)
         else
             runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case);
         const why = failure catch |err| try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
@@ -263,6 +286,7 @@ fn decodeCase(arena: std.mem.Allocator, raw: std.json.Value) !Case {
             .bool => |b| b,
             else => false,
         } else false,
+        .codec = optionalString(obj, "codec"),
     };
 }
 
@@ -1031,13 +1055,13 @@ fn runStats(
     if (std.mem.eql(u8, check, "orders") and case.orders != null and std.mem.eql(u8, case.orders.?, "mixed")) {
         const norm = try std.fmt.allocPrint(gpa, "{s}/f{d}-norm.parquet", .{ work, file_i });
         defer gpa.free(norm);
-        writeCopy(gpa, io, ctx, &.{fixture}, "i > -1", null, null, norm) catch |err| return try queryFailure(gpa, err);
-        writeCopy(gpa, io, ctx, &.{ fixture, norm }, null, null, null, out_path) catch |err| return try queryFailure(gpa, err);
+        writeCopy(gpa, io, ctx, &.{fixture}, "i > -1", null, null, norm, null) catch |err| return try queryFailure(gpa, err);
+        writeCopy(gpa, io, ctx, &.{ fixture, norm }, null, null, null, out_path, null) catch |err| return try queryFailure(gpa, err);
         return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, "stats_orders", true, case);
     }
 
     if (std.mem.eql(u8, check, "orders")) {
-        writeCopy(gpa, io, ctx, &.{fixture}, case.filter, case.columns, null, out_path) catch |err| return try queryFailure(gpa, err);
+        writeCopy(gpa, io, ctx, &.{fixture}, case.filter, case.columns, null, out_path, null) catch |err| return try queryFailure(gpa, err);
         return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, "stats_orders", true, case);
     }
 
@@ -1052,7 +1076,7 @@ fn runStats(
 
     const parquet = std.mem.eql(u8, check, "parquet") or (case.format != null and std.mem.eql(u8, case.format.?, "parquet"));
     if (parquet) {
-        writeCopy(gpa, io, ctx, &.{fixture}, case.filter, case.columns, case.select_z, out_path) catch |err| return try queryFailure(gpa, err);
+        writeCopy(gpa, io, ctx, &.{fixture}, case.filter, case.columns, case.select_z, out_path, null) catch |err| return try queryFailure(gpa, err);
         const mode: []const u8 = if (std.mem.eql(u8, check, "select")) "stats_select" else "stats_rows";
         return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, mode, true, case);
     }
@@ -1081,6 +1105,7 @@ fn writeCopy(
     columns: ?[]const []const u8,
     select: ?[]const u8,
     out_path: []const u8,
+    codec: ?zpq.core.schema.CompressionCodec,
 ) !void {
     std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
     var result = try engine.runQuery(ctx, .{
@@ -1089,8 +1114,39 @@ fn writeCopy(
         .filter = filter,
         .columns = columns,
         .select = select,
+        .codec = codec,
     });
     result.deinit(gpa);
+}
+
+fn parseCodec(name: []const u8) !zpq.core.schema.CompressionCodec {
+    if (std.ascii.eqlIgnoreCase(name, "zstd")) return .ZSTD;
+    if (std.ascii.eqlIgnoreCase(name, "snappy")) return .SNAPPY;
+    if (std.ascii.eqlIgnoreCase(name, "gzip")) return .GZIP;
+    if (std.ascii.eqlIgnoreCase(name, "uncompressed")) return .UNCOMPRESSED;
+    if (std.ascii.eqlIgnoreCase(name, "lz4") or std.ascii.eqlIgnoreCase(name, "lz4_raw")) return .LZ4_RAW;
+    return error.BadCodec;
+}
+
+fn runWire(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    pyarrow: []const u8,
+    fixture: []const u8,
+    out_path: []const u8,
+    case: Case,
+) !?[]const u8 {
+    diag_len = 0;
+    const prev_front = zpq.frontend.diagnostic_fn;
+    zpq.frontend.diagnostic_fn = captureDiag;
+    defer zpq.frontend.diagnostic_fn = prev_front;
+    const codec = if (case.codec) |name| try parseCodec(name) else null;
+    writeCopy(gpa, io, ctx, &.{fixture}, case.filter, case.columns, null, out_path, codec) catch |err| {
+        return try queryFailure(gpa, err);
+    };
+    return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, "wire", false, case);
 }
 
 fn queryFailure(gpa: std.mem.Allocator, err: anyerror) ![]const u8 {
@@ -1121,6 +1177,7 @@ fn statsCmp(
     if (case.pred_value) |text| try argv.appendSlice(gpa, &.{ "--pred-value", text });
     if (case.py_agg) |text| try argv.appendSlice(gpa, &.{ "--py-agg", text });
     if (case.orders) |text| try argv.appendSlice(gpa, &.{ "--orders", text });
+    if (std.mem.eql(u8, mode, "wire")) if (case.check) |text| try argv.appendSlice(gpa, &.{ "--check", text });
     if (parquet) try argv.appendSlice(gpa, &.{ "--parquet", zpq_path });
     const out = try capture(gpa, io, argv.items);
     defer gpa.free(out.stdout);

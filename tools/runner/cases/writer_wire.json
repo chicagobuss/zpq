@@ -1,0 +1,155 @@
+{
+  "prepare": {
+    "script": "tools/runner/prepare_wire.py",
+    "fixtures": [
+      "flba",
+      "floats"
+    ]
+  },
+  "cases": [
+    {
+      "id": "wire:flba-reencode:pyarrow",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "pyarrow",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:flba-reencode:duck",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "duck",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:flba-reencode:bytes",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "bytes",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:flba-reencode:encodings",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "encodings",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:floats-reencode:pyarrow",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "pyarrow",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:floats-reencode:duck",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "duck",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:floats-reencode:bytes",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "bytes",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:floats-reencode:encodings",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "encodings",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:floats-reencode:bounds",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "bounds",
+      "filter": "id >= 1",
+      "where": "id >= 1"
+    },
+    {
+      "id": "wire:floats-recompress:pyarrow",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "pyarrow",
+      "codec": "zstd"
+    },
+    {
+      "id": "wire:floats-recompress:duck",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "duck",
+      "codec": "zstd"
+    },
+    {
+      "id": "wire:floats-recompress:bytes",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "bytes",
+      "codec": "zstd"
+    },
+    {
+      "id": "wire:floats-recompress:encodings",
+      "kind": "wire",
+      "fixture": "floats",
+      "check": "encodings",
+      "codec": "zstd"
+    },
+    {
+      "id": "wire:flba-copy:pyarrow",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "pyarrow",
+      "columns": [
+        "id",
+        "rand",
+        "lo"
+      ]
+    },
+    {
+      "id": "wire:flba-copy:duck",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "duck",
+      "columns": [
+        "id",
+        "rand",
+        "lo"
+      ]
+    },
+    {
+      "id": "wire:flba-copy:bytes",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "bytes",
+      "columns": [
+        "id",
+        "rand",
+        "lo"
+      ]
+    },
+    {
+      "id": "wire:flba-copy:encodings",
+      "kind": "wire",
+      "fixture": "flba",
+      "check": "encodings",
+      "columns": [
+        "id",
+        "rand",
+        "lo"
+      ]
+    }
+  ]
+}

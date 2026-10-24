@@ -20,7 +20,9 @@ scalar aggregate matrix and the GROUP BY matrix, including the parquet each
 GROUP BY writes), `tools/runner/cases/sql_query.json` (ordered GROUP BY,
 spill, distinct, HAVING, and top-rows), and `tools/runner/cases/stats_order.json`
 (statistics order: rows, parquet, aggregates, and the column orders zpq
-writes, with pyarrow as the oracle where DuckDB trusts statistics it should not). A SQL predicate answers as count and sum
+writes, with pyarrow as the oracle where DuckDB trusts statistics it should not),
+and `tools/runner/cases/writer_wire.json` (re-encoded fixed-length bytes, float
+bounds, and row-group sizes, read back by pyarrow and DuckDB). A SQL predicate answers as count and sum
 at `-j` 1, 4 and 16, or refuses with one stable message. An answer must equal
 DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate. Known
 divergences and declared refusals are `tests/known_divergences.json`. This

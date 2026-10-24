@@ -350,6 +350,7 @@ def stage_referee(ctx: Ctx) -> Cmd:
         f"--cases tools/runner/cases/agg.json "
         f"--cases tools/runner/cases/sql_query.json "
         f"--cases tools/runner/cases/stats_order.json "
+        f"--cases tools/runner/cases/writer_wire.json "
         f"--divergences tests/known_divergences.json "
         f"--duckdb {duck} --pyarrow {ctx.python}"
     )

@@ -36,6 +36,12 @@ const Case = struct {
     mean_sum: ?[]const u8 = null,
     mean_count: ?[]const u8 = null,
     mean_alias: ?[]const u8 = null,
+    spill_groups: ?[]const u8 = null,
+    distinct_pairs: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+    expect: ?[]const u8 = null,
+    epoch: bool = false,
+    scan_all: bool = false,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -164,11 +170,17 @@ fn runFile(
     for (root.get("cases").?.array.items) |raw| {
         if (limit) |n| if (total.* >= n) break;
         const case = try decodeCase(arena, raw);
-        const checks: usize = if (std.mem.eql(u8, case.kind, "sql")) @max(case.jobs.len, 1) else 1;
+        const many = std.mem.eql(u8, case.kind, "sql") or std.mem.eql(u8, case.kind, "sql_ordered") or std.mem.eql(u8, case.kind, "sql_rows");
+        const checks: usize = if (many) @max(case.jobs.len, 1) else 1;
         total.* += checks;
-        const fixture = fixtures.get(case.fixture_name) orelse return error.MissingFixture;
+        const fixture = fixtures.get(case.fixture_name) orelse "";
+        if (fixture.len == 0 and !std.mem.eql(u8, case.kind, "sql_ordered") and !std.mem.eql(u8, case.kind, "sql_rows")) return error.MissingFixture;
         const failure = if (std.mem.eql(u8, case.kind, "sql"))
             runSql(gpa, io, ctx, duckdb, fixture, ans_path, case, &counts.refused)
+        else if (std.mem.eql(u8, case.kind, "sql_ordered"))
+            runSqlOrdered(gpa, io, ctx, duckdb, pyarrow, fixture, ans_path, case)
+        else if (std.mem.eql(u8, case.kind, "sql_rows"))
+            runSqlRows(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "agg") or std.mem.eql(u8, case.kind, "groupby"))
             runAnswer(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else
@@ -215,6 +227,18 @@ fn decodeCase(arena: std.mem.Allocator, raw: std.json.Value) !Case {
         .mean_sum = optionalString(obj, "mean_sum"),
         .mean_count = optionalString(obj, "mean_count"),
         .mean_alias = optionalString(obj, "mean_alias"),
+        .spill_groups = optionalString(obj, "spill_groups"),
+        .distinct_pairs = optionalString(obj, "distinct_pairs"),
+        .format = optionalString(obj, "format"),
+        .expect = optionalString(obj, "expect"),
+        .epoch = if (obj.get("epoch")) |v| switch (v) {
+            .bool => |b| b,
+            else => false,
+        } else false,
+        .scan_all = if (obj.get("scan_all")) |v| switch (v) {
+            .bool => |b| b,
+            else => false,
+        } else false,
     };
 }
 
@@ -403,6 +427,10 @@ fn compareAnswer(
         argv[n] = "--mean-alias";
         n += 1;
         argv[n] = name;
+        n += 1;
+    }
+    if (case.epoch) {
+        argv[n] = "--epoch";
         n += 1;
     }
     const out = try capture(gpa, io, argv[0..n]);
@@ -680,6 +708,257 @@ fn diffSql(gpa: std.mem.Allocator, fixture: []const u8, out_path: []const u8, di
     return std.fmt.allocPrint(gpa,
         \\COPY (SELECT count(*) FROM ({s} EXCEPT ALL {s} UNION ALL {s} EXCEPT ALL {s})) TO '{s}' (HEADER false)
     , .{ written, oracle, oracle, written, diff_path });
+}
+
+fn substOpt(arena: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8, key: []const u8, value: []const u8) !void {
+    if (std.mem.indexOf(u8, sql, key) == null) {
+        try buf.appendSlice(arena, sql);
+        return;
+    }
+    try substitute(arena, buf, sql, key, value);
+}
+
+fn posixEnv(name: [*:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.mem.span(v);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setPosixEnv(gpa: std.mem.Allocator, name: [*:0]const u8, value: ?[]const u8) !void {
+    if (value) |v| {
+        const z = try gpa.allocSentinel(u8, v.len, 0);
+        defer gpa.free(z);
+        @memcpy(z[0..v.len], v);
+        if (setenv(name, z, 1) != 0) return error.SetEnv;
+    } else _ = unsetenv(name);
+}
+
+fn runSqlOrdered(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    pyarrow: []const u8,
+    fixture: []const u8,
+    ans_path: []const u8,
+    case: Case,
+) !?[]const u8 {
+    const spill_prev: ?[]u8 = if (case.spill_groups != null) blk: {
+        const cur = posixEnv("ZPQ_SPILL_GROUPS");
+        break :blk if (cur) |c| try gpa.dupe(u8, c) else null;
+    } else null;
+    defer if (spill_prev) |p| gpa.free(p);
+    const distinct_prev: ?[]u8 = if (case.distinct_pairs != null) blk: {
+        const cur = posixEnv("ZPQ_DISTINCT_PAIRS");
+        break :blk if (cur) |c| try gpa.dupe(u8, c) else null;
+    } else null;
+    defer if (distinct_prev) |p| gpa.free(p);
+    if (case.spill_groups) |v| try setPosixEnv(gpa, "ZPQ_SPILL_GROUPS", v);
+    defer if (case.spill_groups != null) setPosixEnv(gpa, "ZPQ_SPILL_GROUPS", spill_prev) catch {};
+    if (case.distinct_pairs) |v| try setPosixEnv(gpa, "ZPQ_DISTINCT_PAIRS", v);
+    defer if (case.distinct_pairs != null) setPosixEnv(gpa, "ZPQ_DISTINCT_PAIRS", distinct_prev) catch {};
+
+    const sql_src = case.sql orelse return error.MissingSql;
+    var sql_buf: std.ArrayList(u8) = .empty;
+    defer sql_buf.deinit(gpa);
+    try substOpt(gpa, &sql_buf, sql_src, "{path}", fixture);
+    var duck_buf: std.ArrayList(u8) = .empty;
+    defer duck_buf.deinit(gpa);
+    try substOpt(gpa, &duck_buf, case.duck orelse sql_src, "{path}", fixture);
+
+    const prev_sql = zpq.core.expr.sql_parser.diagnostic_fn;
+    const prev_front = zpq.frontend.diagnostic_fn;
+    zpq.core.expr.sql_parser.diagnostic_fn = captureDiag;
+    zpq.frontend.diagnostic_fn = captureDiag;
+    defer zpq.core.expr.sql_parser.diagnostic_fn = prev_sql;
+    defer zpq.frontend.diagnostic_fn = prev_front;
+
+    const zpq_path = try std.fmt.allocPrint(gpa, "{s}.json", .{ans_path});
+    defer gpa.free(zpq_path);
+    const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
+    for (jobs) |j| {
+        diag_len = 0;
+        const json_text = querySqlJson(gpa, ctx, sql_buf.items, j) catch |err| {
+            if (diag_len == 0) {
+                var diag: zpq.core.diag.Diag = .{};
+                zpq.frontend.queryError(err, &diag);
+            }
+            const msg = try lastDiagLine(gpa);
+            defer gpa.free(msg);
+            if (msg.len == 0) return try std.fmt.allocPrint(gpa, "{s}", .{@errorName(err)});
+            return try std.fmt.allocPrint(gpa, "{s}", .{msg});
+        };
+        defer gpa.free(json_text);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpq_path, .data = json_text });
+        if (try compareAnswer(gpa, io, pyarrow, duckdb, zpq_path, duck_buf.items, null, "ordered", case)) |why| return why;
+    }
+    return null;
+}
+
+fn runSqlRows(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    pyarrow: []const u8,
+    fixture: []const u8,
+    out_path: []const u8,
+    ans_path: []const u8,
+    case: Case,
+) !?[]const u8 {
+    const sql_src = case.sql orelse return error.MissingSql;
+    var sql_buf: std.ArrayList(u8) = .empty;
+    defer sql_buf.deinit(gpa);
+    try substOpt(gpa, &sql_buf, sql_src, "{path}", fixture);
+    if (std.mem.indexOf(u8, sql_buf.items, "{glob}")) |_| {
+        const glob = try rowsGlob(gpa, fixture);
+        defer gpa.free(glob);
+        var next: std.ArrayList(u8) = .empty;
+        defer next.deinit(gpa);
+        try substitute(gpa, &next, sql_buf.items, "{glob}", glob);
+        sql_buf.clearAndFree(gpa);
+        try sql_buf.appendSlice(gpa, next.items);
+    }
+    var duck_buf: std.ArrayList(u8) = .empty;
+    defer duck_buf.deinit(gpa);
+    try substOpt(gpa, &duck_buf, case.duck orelse sql_src, "{path}", fixture);
+    if (std.mem.indexOf(u8, duck_buf.items, "{glob}")) |_| {
+        const glob = try rowsGlob(gpa, fixture);
+        defer gpa.free(glob);
+        var next: std.ArrayList(u8) = .empty;
+        defer next.deinit(gpa);
+        try substitute(gpa, &next, duck_buf.items, "{glob}", glob);
+        duck_buf.clearAndFree(gpa);
+        try duck_buf.appendSlice(gpa, next.items);
+    }
+
+    const prev_sql = zpq.core.expr.sql_parser.diagnostic_fn;
+    const prev_front = zpq.frontend.diagnostic_fn;
+    zpq.core.expr.sql_parser.diagnostic_fn = captureDiag;
+    zpq.frontend.diagnostic_fn = captureDiag;
+    defer zpq.core.expr.sql_parser.diagnostic_fn = prev_sql;
+    defer zpq.frontend.diagnostic_fn = prev_front;
+
+    const parquet = case.format != null and std.mem.eql(u8, case.format.?, "parquet");
+    const out = if (parquet) out_path else try std.fmt.allocPrint(gpa, "{s}.jsonl", .{ans_path});
+    defer if (!parquet) gpa.free(out);
+    const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
+    for (jobs) |j| {
+        diag_len = 0;
+        zpq.local_fs.removeFile(out);
+        const wrote = printSqlRows(gpa, ctx, sql_buf.items, j, out, parquet, case.scan_all) catch |err| {
+            if (case.expect) |needle| {
+                if (diag_len == 0) {
+                    var diag: zpq.core.diag.Diag = .{};
+                    zpq.frontend.queryError(err, &diag);
+                }
+                const msg = try lastDiagLine(gpa);
+                defer gpa.free(msg);
+                if (std.mem.indexOf(u8, msg, needle) != null) return null;
+                return try std.fmt.allocPrint(gpa, "refused ({s}), want {s}", .{ msg, needle });
+            }
+            if (diag_len == 0) {
+                var diag: zpq.core.diag.Diag = .{};
+                zpq.frontend.queryError(err, &diag);
+            }
+            const msg = try lastDiagLine(gpa);
+            defer gpa.free(msg);
+            if (msg.len == 0) return try std.fmt.allocPrint(gpa, "{s}", .{@errorName(err)});
+            return try std.fmt.allocPrint(gpa, "{s}", .{msg});
+        };
+        _ = wrote;
+        if (case.expect) |needle| return try std.fmt.allocPrint(gpa, "zpq answered, want refusal {s}", .{needle});
+        const why = try compareAnswer(gpa, io, pyarrow, duckdb, out, duck_buf.items, if (parquet) out else null, "rows", case);
+        if (why) |text| return text;
+    }
+    return null;
+}
+
+fn ownedInputs(gpa: std.mem.Allocator, ctx: engine.Context, pattern: []const u8) ![]const []const u8 {
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const raw = try zpq.frontend.expandGlob(scratch.allocator(), ctx.io, pattern, ctx.env);
+    const inputs = try gpa.alloc([]const u8, raw.len);
+    errdefer gpa.free(inputs);
+    for (raw, 0..) |p, i| inputs[i] = try gpa.dupe(u8, p);
+    return inputs;
+}
+
+fn freeInputs(gpa: std.mem.Allocator, inputs: []const []const u8) void {
+    for (inputs) |p| gpa.free(p);
+    gpa.free(inputs);
+}
+
+fn rowsGlob(gpa: std.mem.Allocator, fixture: []const u8) ![]u8 {
+    const suffix = "tie_a.parquet";
+    if (!std.mem.endsWith(u8, fixture, suffix)) return error.BadGlob;
+    return std.fmt.allocPrint(gpa, "{s}tie_*.parquet", .{fixture[0 .. fixture.len - suffix.len]});
+}
+
+fn printSqlRows(
+    gpa: std.mem.Allocator,
+    ctx: engine.Context,
+    sql: []const u8,
+    jobs: usize,
+    out_path: []const u8,
+    parquet: bool,
+    scan_all: bool,
+) !void {
+    const pq = try zpq.core.expr.sql_parser.parseSqlQuery(gpa, sql);
+    defer pq.deinit(gpa);
+    const inputs = try ownedInputs(gpa, ctx, pq.table_name);
+    defer freeInputs(gpa, inputs);
+    const fd = try zpq.local_fs.createFile(out_path);
+    defer zpq.local_fs.close(fd);
+    var diag: zpq.core.diag.Diag = .{};
+    _ = try engine.runPrintTo(ctx, .{
+        .inputs = inputs,
+        .filter = pq.filter_str,
+        .select = pq.select_str,
+        .aggregate = pq.aggregate_str,
+        .group_by = pq.group_by_str,
+        .select_cols = pq.select_cols,
+        .result_order = pq.result_order,
+        .parallelism = jobs,
+        .scan_all = scan_all,
+        .diag = &diag,
+    }, if (parquet) .parquet else .jsonl, if (pq.result_order.limit) |n| @as(usize, @intCast(n)) else null, fd, @intCast(pq.result_order.offset));
+}
+
+fn querySqlJson(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jobs: usize) ![]u8 {
+    const pq = try zpq.core.expr.sql_parser.parseSqlQuery(gpa, sql);
+    defer pq.deinit(gpa);
+    const inputs = try ownedInputs(gpa, ctx, pq.table_name);
+    defer freeInputs(gpa, inputs);
+    var diag: zpq.core.diag.Diag = .{};
+    var result = try engine.runQuery(ctx, .{
+        .inputs = inputs,
+        .aggregate = pq.aggregate_str,
+        .filter = pq.filter_str,
+        .group_by = pq.group_by_str,
+        .select = pq.select_str,
+        .select_cols = pq.select_cols,
+        .result_order = pq.result_order,
+        .parallelism = jobs,
+        .diag = &diag,
+    });
+    defer result.deinit(gpa);
+    const answer = switch (result) {
+        .aggregate => |*ar| ar,
+        .write => return error.NotAggregate,
+    };
+    const n: usize = if (answer.output.group_rows) |groups|
+        groups.len
+    else if (answer.output.no_row)
+        0
+    else
+        1;
+    var w: MemWriter = .{ .gpa = gpa };
+    errdefer w.deinit();
+    try engine.writeAggregateText(&w, answer.output, answer.text_kinds, answer.answer_types, n, .json);
+    return w.buf.toOwnedSlice(gpa);
 }
 
 fn substitute(arena: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8, key: []const u8, value: []const u8) !void {

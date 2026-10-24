@@ -348,13 +348,14 @@ def stage_referee(ctx: Ctx) -> Cmd:
         f"--cases tools/runner/cases/filter_projection.json "
         f"--cases tools/runner/cases/sql_pred.json "
         f"--cases tools/runner/cases/agg.json "
+        f"--cases tools/runner/cases/sql_query.json "
         f"--divergences tests/known_divergences.json "
         f"--duckdb {duck} --pyarrow {ctx.python}"
     )
     return Cmd(
         ["bash", "-c", shell],
         _base_env(ctx),
-        "in-process filter×projection and SQL-predicate referee against the DuckDB CLI",
+        "in-process differential referee against the DuckDB CLI",
         blocked=_need(duck, "DuckDB 2.0 CLI"),
         parse=parse_referee,
     )

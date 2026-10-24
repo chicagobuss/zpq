@@ -41,15 +41,18 @@ def split_state(row):
     return out
 
 
-def duck_json(duckdb, sql):
-    r = subprocess.run([duckdb, "-no-agent", "-json", "-c", sql], capture_output=True, text=True)
+def duck_json(duckdb, sql, stable=False):
+    # The 2.0 CLI sorts NaN with more than one thread in an order that changes between runs. One thread
+    # matches the in-process DuckDB oracle the existing differential uses, and zpq's tie break.
+    text = f"SET threads=1; {sql}" if stable else sql
+    r = subprocess.run([duckdb, "-no-agent", "-json", "-c", text], capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit(r.stderr.strip().splitlines()[-1][:300] if r.stderr.strip() else "duckdb failed")
     return json.loads(r.stdout)
 
 
-def describe(duckdb, sql):
-    rows = duck_json(duckdb, f"DESCRIBE {sql}")
+def describe(duckdb, sql, stable=False):
+    rows = duck_json(duckdb, f"DESCRIBE {sql}", stable=stable)
     return [(row["column_name"], row["column_type"]) for row in rows]
 
 
@@ -104,10 +107,11 @@ def apply_mean(rows, names, lanes, args):
 
 
 def duck_rows(args):
-    spec = describe(args.duckdb, args.sql)
+    stable = getattr(args, "stable", False)
+    spec = describe(args.duckdb, args.sql, stable=stable)
     names = [n for n, _ in spec]
     types = [t for _, t in spec]
-    raw = duck_json(args.duckdb, args.sql)
+    raw = duck_json(args.duckdb, args.sql, stable=stable)
     rows = [[coerce(row.get(name), typ) for name, typ in spec] for row in raw]
     return apply_mean(rows, names, lanes_of(types), args)
 
@@ -148,6 +152,89 @@ def cmd_group(args):
                 raise SystemExit(f"row zpq={a} duck={b}")
 
 
+def load_rows(path):
+    text = Path(path).read_text()
+    if not text.strip():
+        return []
+    if text.lstrip().startswith("["):
+        rows = json.loads(text, parse_float=Decimal)
+        return rows if isinstance(rows, list) else [rows]
+    return [json.loads(line, parse_float=Decimal) for line in text.splitlines() if line.strip()]
+
+
+def to_epoch(val, typ):
+    """JSONL prints a DATE as days and a TIMESTAMP as milliseconds, both since 1970-01-01."""
+    import datetime
+
+    if val is None:
+        return None
+    t = typ.upper()
+    if t.startswith("TIMESTAMP"):
+        text = str(val)
+        if "." in text:
+            head, frac = text.split(".", 1)
+            dt = datetime.datetime.strptime(head, "%Y-%m-%d %H:%M:%S").replace(microsecond=int(frac.ljust(6, "0")[:6]))
+        else:
+            dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        return (dt - datetime.datetime(1970, 1, 1)) // datetime.timedelta(milliseconds=1)
+    if t.startswith("DATE"):
+        day = datetime.date.fromisoformat(str(val)[:10])
+        return (day - datetime.date(1970, 1, 1)).days
+    return val
+
+
+def cmd_rows(args):
+    """Plain ORDER BY rows, in order. Parquet is read back through DuckDB after pyarrow accepts it."""
+    if args.parquet:
+        import pyarrow.parquet as pq
+
+        pq.read_table(args.parquet)
+        written = argparse.Namespace(**vars(args))
+        written.sql = f"SELECT * FROM '{args.parquet}'"
+        written.mean_scale = None
+        got_rows, _, _ = duck_rows(written)
+        want_rows, _, lanes = duck_rows(args)
+        got = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in got_rows]
+        want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in want_rows]
+    else:
+        zraw = load_rows(args.zpq)
+        spec = describe(args.duckdb, args.sql, stable=True)
+        want_rows, _, lanes = duck_rows(args)
+        if args.epoch:
+            types = [t for _, t in spec]
+            want_rows = [[to_epoch(v, types[i]) for i, v in enumerate(row)] for row in want_rows]
+        got = []
+        for row in zraw:
+            vals = from_zpq(list(row.values()), lanes)
+            got.append(tuple(canon(v, lanes[i] if i < len(lanes) else None) for i, v in enumerate(vals)))
+        want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in want_rows]
+    if got != want:
+        if len(got) != len(want):
+            raise SystemExit(f"zpq={len(got)} duck={len(want)}")
+        for a, b in zip(got, want):
+            if a != b:
+                raise SystemExit(f"row zpq={a} duck={b}"[:400])
+
+
+def cmd_ordered(args):
+    """Row order is the answer: ORDER BY, HAVING, spill and distinct."""
+    zraw = load_zpq(args.zpq)
+    if isinstance(zraw, dict):
+        zraw = [zraw]
+    drows, _, lanes = duck_rows(args)
+    got = []
+    for row in zraw:
+        vals = from_zpq(list(row.values()), lanes)
+        got.append(tuple(canon(v, lanes[i] if i < len(lanes) else None) for i, v in enumerate(vals)))
+    want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in drows]
+    if got != want:
+        if len(got) != len(want):
+            raise SystemExit(f"zpq={len(got)} duck={len(want)}")
+        for a, b in zip(got, want):
+            if a != b:
+                raise SystemExit(f"row zpq={a} duck={b}"[:400])
+
+
 def cmd_parquet(args):
     import pyarrow.parquet as pq
 
@@ -175,7 +262,7 @@ def cmd_parquet(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["agg", "group", "parquet"])
+    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows"])
     p.add_argument("--zpq", required=True)
     p.add_argument("--duckdb")
     p.add_argument("--sql")
@@ -184,11 +271,17 @@ def main():
     p.add_argument("--mean-sum")
     p.add_argument("--mean-count")
     p.add_argument("--mean-alias")
+    p.add_argument("--epoch", action="store_true")
     args = p.parse_args()
+    args.stable = args.mode in ("ordered", "rows")
     if args.mode == "agg":
         cmd_agg(args)
     elif args.mode == "group":
         cmd_group(args)
+    elif args.mode == "ordered":
+        cmd_ordered(args)
+    elif args.mode == "rows":
+        cmd_rows(args)
     else:
         cmd_parquet(args)
 

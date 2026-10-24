@@ -3440,20 +3440,30 @@ const PairFoldTask = struct {
     }
 };
 
-const PairApplyTask = struct {
+const PairTableTask = struct {
     tables: []expr_agg.GroupTable,
-    keyed: []const []KeyDistinct,
-    agg_idx: usize,
-    agg_len: usize,
+    keyed: []const []KeyDistinct = &.{},
+    agg_idx: usize = 0,
+    agg_len: usize = 0,
     gpa: std.mem.Allocator,
     cursor: *std.atomic.Value(usize),
+    sinks: ?[]expr_agg.DistinctPairs = null,
+    err: ?anyerror = null,
 
-    fn run(t: *PairApplyTask) void {
+    fn run(t: *PairTableTask) void {
         const Pairs = expr_agg.DistinctPairs;
-        while (true) {
+        while (t.err == null) {
             const ti = t.cursor.fetchAdd(1, .monotonic);
             if (ti >= t.tables.len) return;
             const table = &t.tables[ti];
+            if (t.sinks) |sinks| {
+                const sink = &sinks[ti];
+                if (!sink.active or sink.pending_sets) sink.drainTable(table) catch |e| {
+                    t.err = e;
+                    return;
+                };
+                continue;
+            }
             for (0..table.groupCount()) |g| {
                 const probe = Pairs.pairOf(table.keyAt(g), 0);
                 const acc = &table.accumulators.items[g * t.agg_len + t.agg_idx];
@@ -3479,6 +3489,28 @@ fn findKeyDistinct(list: []KeyDistinct, k0: u64, k1: u64) ?*KeyDistinct {
         if (m.k0 < k0 or (m.k0 == k0 and m.k1 < k1)) lo = mid + 1 else hi = mid;
     }
     return null;
+}
+
+/// Each table owns its stored sets and sink. Drain them in parallel before the shared pair fold, just as the
+/// scan produced pairs in parallel; serial expansion would strand every decoder behind one large group.
+fn drainDistinctPairs(
+    gpa: std.mem.Allocator,
+    sinks: []expr_agg.DistinctPairs,
+    tables: []expr_agg.GroupTable,
+    threads: usize,
+) !void {
+    var cursor: std.atomic.Value(usize) = .init(0);
+    const n = @max(1, @min(threads, tables.len, 64));
+    var tasks: [64]PairTableTask = undefined;
+    for (tasks[0..n]) |*task| task.* = .{
+        .tables = tables,
+        .gpa = gpa,
+        .cursor = &cursor,
+        .sinks = sinks,
+    };
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    if (n == 1 or !spawn_util.runTree(PairTableTask, tasks[0..n], config, PairTableTask.run)) tasks[0].run();
+    for (tasks[0..n]) |task| if (task.err) |e| return e;
 }
 
 /// Turn every worker's pairs into exact count(DISTINCT) states on the worker tables: each key's count on the first
@@ -3516,7 +3548,7 @@ fn foldDistinctPairs(
     // Tasks whose spawn failed leave their share to the ones that started, through the shared cursor.
     var table_cursor: std.atomic.Value(usize) = .init(0);
     const n_apply = @max(1, @min(threads, tables.len, 64));
-    var applies: [64]PairApplyTask = undefined;
+    var applies: [64]PairTableTask = undefined;
     for (applies[0..n_apply]) |*a| a.* = .{
         .tables = tables,
         .keyed = keyed,
@@ -3525,7 +3557,7 @@ fn foldDistinctPairs(
         .gpa = gpa,
         .cursor = &table_cursor,
     };
-    if (n_apply == 1 or !spawn_util.runTree(PairApplyTask, applies[0..n_apply], config, PairApplyTask.run))
+    if (n_apply == 1 or !spawn_util.runTree(PairTableTask, applies[0..n_apply], config, PairTableTask.run))
         applies[0].run();
 }
 
@@ -4696,7 +4728,7 @@ fn prepareAggregateWithMetas(
     for (pair_sinks) |*ps| pairs_used = pairs_used or
         (ps.active and (!ps.allow_coded_sets or ps.hasPairs()));
     if (pairs_used) {
-        for (pair_sinks, group_tables) |*ps, *gt| if (!ps.active or ps.pending_sets) try ps.drainTable(gt);
+        try drainDistinctPairs(gpa, pair_sinks, group_tables, n_workers);
         try foldDistinctPairs(gpa, group_budget, pair_sinks, group_tables, pairs_call.?, agg_calls.len, n_workers);
     }
     // Once one worker has moved to the partition runs every table goes there, so each key is in one partition.
@@ -19975,5 +20007,50 @@ test "distinct coded sets share automatic pairs across releasing windows and ref
             try testing.expectEqual(@as(usize, 1), refused.window.abandoned);
             try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
         }
+    }
+}
+
+test "distinct pairs drain and count complete bitmap states after zero or partial worker starts" {
+    const gpa = testing.allocator;
+    const calls = [_]expr_agg.AggCall{.{
+        .func = .count_distinct,
+        .arg = null,
+        .where = null,
+        .alias = "d",
+        .result = .i64,
+    }};
+    for ([_]usize{ 0, 1, 3 }) |starts| {
+        var budget: core_memory.SharedBudget = .{ .limit = 8 << 20 };
+        defer std.debug.assert(budget.used.load(.monotonic) == 0);
+        var tables: [4]expr_agg.GroupTable = undefined;
+        for (&tables) |*table| {
+            table.* = .init(gpa, 0);
+            table.shared = &budget;
+        }
+        defer for (&tables) |*table| table.deinit();
+        var sinks: [4]expr_agg.DistinctPairs = undefined;
+        for (&sinks, &tables) |*sink, *table| sink.* = .{
+            .gpa = gpa,
+            .budget = &budget,
+            .table = table,
+            .agg_idx = 0,
+            .allow_coded_sets = true,
+            .pending_sets = true,
+        };
+        defer for (&sinks) |*sink| sink.deinit();
+        for (&tables, 0..) |*table, i| {
+            const g = try table.getOrInsert(&.{7}, &calls, i);
+            for (0..128) |v| try table.accumulators.items[g].distinct.insertU64(gpa, i * 64 + v);
+            try testing.expect(table.accumulators.items[g].distinct.heap().?.val_set == .bitmap);
+        }
+        spawn_util.injectFailureAfter(starts);
+        defer spawn_util.resetFailure();
+        try drainDistinctPairs(gpa, &sinks, &tables, 4);
+        try testing.expect(spawn_util.failuresInjected() > 0);
+        for (&sinks) |*sink| try testing.expect(sink.hasPairs());
+        try foldDistinctPairs(gpa, &budget, &sinks, &tables, 0, 1, 4);
+        var total: u64 = 0;
+        for (tables) |table| total += table.accumulators.items[0].count;
+        try testing.expectEqual(@as(u64, 320), total);
     }
 }

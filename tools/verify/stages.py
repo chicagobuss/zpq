@@ -347,6 +347,7 @@ def stage_referee(ctx: Ctx) -> Cmd:
         f"{ctx.zigw} build referee && zig-out/bin/referee "
         f"--cases tools/runner/cases/filter_projection.json "
         f"--cases tools/runner/cases/sql_pred.json "
+        f"--cases tools/runner/cases/agg.json "
         f"--divergences tests/known_divergences.json "
         f"--duckdb {duck} --pyarrow {ctx.python}"
     )

@@ -13,8 +13,10 @@ python tools/verify/verify.py perf
 
 `verify stage referee` builds `tools/runner/referee.zig` and runs the
 filter×projection matrix and the SQL-predicate checks in-process against the
-DuckDB 2.0 CLI. The cases are `tools/runner/cases/filter_projection.json` and
-`tools/runner/cases/sql_pred.json`. A SQL predicate answers as count and sum
+DuckDB 2.0 CLI. The cases are `tools/runner/cases/filter_projection.json`,
+`tools/runner/cases/sql_pred.json`, and `tools/runner/cases/agg.json` (the
+scalar aggregate matrix and the GROUP BY matrix, including the parquet each
+GROUP BY writes). A SQL predicate answers as count and sum
 at `-j` 1, 4 and 16, or refuses with one stable message. An answer must equal
 DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate. Known
 divergences and declared refusals are `tests/known_divergences.json`. This

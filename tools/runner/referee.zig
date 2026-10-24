@@ -27,6 +27,15 @@ const Case = struct {
     select_d: ?[]const u8 = null,
     sql: ?[]const u8 = null,
     jobs: []const usize = &.{},
+    aggregate: ?[]const u8 = null,
+    group_by: ?[]const u8 = null,
+    column_order: ?[]const u8 = null,
+    duck: ?[]const u8 = null,
+    parquet: bool = false,
+    mean_scale: ?i64 = null,
+    mean_sum: ?[]const u8 = null,
+    mean_count: ?[]const u8 = null,
+    mean_alias: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -160,6 +169,8 @@ fn runFile(
         const fixture = fixtures.get(case.fixture_name) orelse return error.MissingFixture;
         const failure = if (std.mem.eql(u8, case.kind, "sql"))
             runSql(gpa, io, ctx, duckdb, fixture, ans_path, case, &counts.refused)
+        else if (std.mem.eql(u8, case.kind, "agg") or std.mem.eql(u8, case.kind, "groupby"))
+            runAnswer(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else
             runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case);
         const why = failure catch |err| try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
@@ -189,7 +200,221 @@ fn decodeCase(arena: std.mem.Allocator, raw: std.json.Value) !Case {
         .select_d = optionalString(obj, "duckdb_select"),
         .sql = optionalString(obj, "sql"),
         .jobs = if (obj.get("jobs")) |v| try jobList(arena, v) else &.{},
+        .aggregate = optionalString(obj, "aggregate"),
+        .group_by = optionalString(obj, "group_by"),
+        .column_order = optionalString(obj, "column_order"),
+        .duck = optionalString(obj, "duck"),
+        .parquet = if (obj.get("parquet")) |v| switch (v) {
+            .bool => |b| b,
+            else => false,
+        } else false,
+        .mean_scale = if (obj.get("mean_scale")) |v| switch (v) {
+            .integer => v.integer,
+            else => null,
+        } else null,
+        .mean_sum = optionalString(obj, "mean_sum"),
+        .mean_count = optionalString(obj, "mean_count"),
+        .mean_alias = optionalString(obj, "mean_alias"),
     };
+}
+
+const MemWriter = struct {
+    gpa: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *@This()) void {
+        self.buf.deinit(self.gpa);
+    }
+
+    pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+        try self.buf.appendSlice(self.gpa, bytes);
+    }
+
+    pub fn writeByte(self: *@This(), c: u8) !void {
+        try self.buf.append(self.gpa, c);
+    }
+
+    pub fn print(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
+        const text = try std.fmt.allocPrint(self.gpa, fmt, args);
+        defer self.gpa.free(text);
+        try self.buf.appendSlice(self.gpa, text);
+    }
+};
+
+fn runAnswer(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    pyarrow: []const u8,
+    fixture: []const u8,
+    out_path: []const u8,
+    ans_path: []const u8,
+    case: Case,
+) !?[]const u8 {
+    const zpq_path = try std.fmt.allocPrint(gpa, "{s}.json", .{ans_path});
+    defer gpa.free(zpq_path);
+    const json_text = try aggregateJson(gpa, ctx, fixture, case, null);
+    defer gpa.free(json_text);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpq_path, .data = json_text });
+
+    if (case.parquet) {
+        std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+        const ignored = aggregateJson(gpa, ctx, fixture, case, out_path) catch |err| {
+            return try std.fmt.allocPrint(gpa, "zpq {s}", .{@errorName(err)});
+        };
+        gpa.free(ignored);
+        return compareAnswer(gpa, io, pyarrow, duckdb, zpq_path, null, out_path, "parquet", case);
+    }
+
+    const sql = try answerSql(gpa, fixture, case);
+    defer gpa.free(sql);
+    const mode: []const u8 = if (std.mem.eql(u8, case.kind, "groupby")) "group" else "agg";
+    return compareAnswer(gpa, io, pyarrow, duckdb, zpq_path, sql, null, mode, case);
+}
+
+fn aggregateJson(
+    gpa: std.mem.Allocator,
+    ctx: engine.Context,
+    fixture: []const u8,
+    case: Case,
+    output: ?[]const u8,
+) ![]u8 {
+    var result = try engine.runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .output = output,
+        .typed_answer = output != null,
+        .filter = case.filter,
+        .aggregate = case.aggregate,
+        .group_by = case.group_by,
+        .column_order = case.column_order,
+    });
+    defer result.deinit(gpa);
+    const answer = switch (result) {
+        .aggregate => |*ar| ar,
+        .write => return error.NotAggregate,
+    };
+    const n: usize = if (answer.output.group_rows) |groups|
+        groups.len
+    else if (answer.output.no_row)
+        0
+    else
+        1;
+    var w: MemWriter = .{ .gpa = gpa };
+    errdefer w.deinit();
+    try engine.writeAggregateText(&w, answer.output, answer.text_kinds, answer.answer_types, n, .json);
+    return w.buf.toOwnedSlice(gpa);
+}
+
+fn answerSql(gpa: std.mem.Allocator, fixture: []const u8, case: Case) ![]u8 {
+    const duck = case.duck orelse return error.MissingSql;
+    if (std.mem.eql(u8, case.kind, "groupby")) {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(gpa);
+        try substitute(gpa, &buf, duck, "{path}", fixture);
+        if (case.where) |w| {
+            const marker = " GROUP BY ";
+            const at = std.mem.indexOf(u8, buf.items, marker) orelse return error.BadDuckSql;
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa);
+            try out.appendSlice(gpa, buf.items[0..at]);
+            try out.appendSlice(gpa, " WHERE ");
+            try out.appendSlice(gpa, w);
+            try out.appendSlice(gpa, buf.items[at..]);
+            buf.deinit(gpa);
+            return out.toOwnedSlice(gpa);
+        }
+        return buf.toOwnedSlice(gpa);
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "SELECT ");
+    try buf.appendSlice(gpa, duck);
+    try buf.appendSlice(gpa, " FROM '");
+    try buf.appendSlice(gpa, fixture);
+    try buf.appendSlice(gpa, "'");
+    if (case.where) |w| {
+        try buf.appendSlice(gpa, " WHERE ");
+        try buf.appendSlice(gpa, w);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn compareAnswer(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    pyarrow: []const u8,
+    duckdb: []const u8,
+    zpq_path: []const u8,
+    sql: ?[]const u8,
+    parquet: ?[]const u8,
+    mode: []const u8,
+    case: Case,
+) !?[]const u8 {
+    var argv: [20][]const u8 = undefined;
+    var n: usize = 0;
+    argv[n] = pyarrow;
+    n += 1;
+    argv[n] = "tools/runner/answer_cmp.py";
+    n += 1;
+    argv[n] = mode;
+    n += 1;
+    argv[n] = "--zpq";
+    n += 1;
+    argv[n] = zpq_path;
+    n += 1;
+    if (sql) |text| {
+        argv[n] = "--duckdb";
+        n += 1;
+        argv[n] = duckdb;
+        n += 1;
+        argv[n] = "--sql";
+        n += 1;
+        argv[n] = text;
+        n += 1;
+    }
+    if (parquet) |path| {
+        argv[n] = "--parquet";
+        n += 1;
+        argv[n] = path;
+        n += 1;
+    }
+    var scale_buf: [32]u8 = undefined;
+    if (case.mean_scale) |scale| {
+        const text = std.fmt.bufPrint(&scale_buf, "{d}", .{scale}) catch return error.Format;
+        argv[n] = "--mean-scale";
+        n += 1;
+        argv[n] = text;
+        n += 1;
+    }
+    if (case.mean_sum) |name| {
+        argv[n] = "--mean-sum";
+        n += 1;
+        argv[n] = name;
+        n += 1;
+    }
+    if (case.mean_count) |name| {
+        argv[n] = "--mean-count";
+        n += 1;
+        argv[n] = name;
+        n += 1;
+    }
+    if (case.mean_alias) |name| {
+        argv[n] = "--mean-alias";
+        n += 1;
+        argv[n] = name;
+        n += 1;
+    }
+    const out = try capture(gpa, io, argv[0..n]);
+    defer gpa.free(out.stdout);
+    defer gpa.free(out.stderr);
+    if (out.code != 0) {
+        const msg = if (out.stderr.len != 0) out.stderr else out.stdout;
+        const line = std.mem.trim(u8, msg, " \t\r\n");
+        const start = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |at| at + 1 else 0;
+        return try gpa.dupe(u8, line[start..]);
+    }
+    return null;
 }
 
 fn jobList(arena: std.mem.Allocator, v: std.json.Value) ![]const usize {

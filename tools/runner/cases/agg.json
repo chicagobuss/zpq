@@ -1,0 +1,1263 @@
+{
+  "fixtures": [
+    {
+      "name": "main",
+      "copy": "COPY (SELECT\n        (i - 2000)::INTEGER AS id,\n        (CASE WHEN i % 11 = 0 THEN NULL ELSE (i - 2000) * 1.5 END)::DOUBLE AS amt,\n        CAST(i AS DECIMAL(18,2)) AS price,\n        (CASE WHEN i % 13 = 0 THEN '' ELSE 'n' || i END) AS name,\n        (CASE WHEN i % 7 = 0 THEN NULL ELSE 'v' || i END) AS nname,\n        (DATE '2020-01-01' + i::INTEGER) AS d,\n        (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 3 = 0) END) AS flag,\n        (CASE WHEN i % 17 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + to_milliseconds(i) END)::TIMESTAMP_MS AS ts\n      FROM range(1, 4000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)"
+    }
+  ],
+  "cases": [
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:none",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:id_gt",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:notnull",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:date_ge",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:ts_ne_sub_ms",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:no_rows",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:sum_count:amt_isnull",
+      "aggregate": "sum(id) AS s, count(id) AS c",
+      "duck": "sum(id), count(id)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:none",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:id_gt",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:notnull",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:date_ge",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:ts_ne_sub_ms",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:no_rows",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:minmax:amt_isnull",
+      "aggregate": "min(amt) AS mn, max(amt) AS mx",
+      "duck": "min(amt), max(amt)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:none",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:id_gt",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:notnull",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:date_ge",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:ts_ne_sub_ms",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:no_rows",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:decimal_sum:amt_isnull",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:none",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:id_gt",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:notnull",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:date_ge",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:ts_ne_sub_ms",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:no_rows",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:count_star:amt_isnull",
+      "aggregate": "count(*) AS n, sum(amt) AS s",
+      "duck": "count(*), sum(amt)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:none",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:id_gt",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:notnull",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:date_ge",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:ts_ne_sub_ms",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:no_rows",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg:amt_isnull",
+      "aggregate": "avg(amt) AS a, min(name) AS mn",
+      "duck": "avg(amt), min(name)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:none",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:id_gt",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6,
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:notnull",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6,
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:date_ge",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6,
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:ts_ne_sub_ms",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6,
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:no_rows",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6,
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:avg_dec:amt_isnull",
+      "aggregate": "avg(price) AS a, avg_state(price) AS sp, avg_state(amt) AS sa",
+      "duck": "sum(price)::VARCHAR, count(price), sum(price), count(price), sum(amt), count(amt)",
+      "mean_scale": 6,
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:none",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:id_gt",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:notnull",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:date_ge",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:ts_ne_sub_ms",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:no_rows",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:strlen:amt_isnull",
+      "aggregate": "avg(strlen(nname)) AS a, sum(strlen(name)) AS s, count(strlen(nname)) AS c",
+      "duck": "avg(strlen(nname)), sum(strlen(name)), count(strlen(nname))",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:none",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:id_gt",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:notnull",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:date_ge",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:ts_ne_sub_ms",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:no_rows",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:case_arg:amt_isnull",
+      "aggregate": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END) AS s, max(CASE WHEN name LIKE 'n1%' THEN id END) AS m",
+      "duck": "sum(CASE WHEN amt IS NULL THEN 0 ELSE id END), max(CASE WHEN name LIKE 'n1%' THEN id END)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:none",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:id_gt",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)",
+      "filter": "id > 500",
+      "where": "id > 500"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:notnull",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)",
+      "filter": "nname IS NOT NULL",
+      "where": "nname IS NOT NULL"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:date_ge",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)",
+      "filter": "d >= '2020-06-01'",
+      "where": "d >= DATE '2020-06-01'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:ts_ne_sub_ms",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)",
+      "filter": "ts != '2020-01-01 00:00:00.0995'",
+      "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:no_rows",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)",
+      "filter": "id < -100000",
+      "where": "id < -100000"
+    },
+    {
+      "kind": "agg",
+      "id": "agg:null_arith:amt_isnull",
+      "aggregate": "sum(amt * 2) AS s, count(amt * 2) AS c, avg(amt + id) AS a, min(amt - 1) AS mn, max(amt * id) AS mx",
+      "duck": "sum(amt * 2), count(amt * 2), avg(amt + id), min(amt - 1), max(amt * id)",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "id": "groupby:gb_simple:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "id": "groupby-o:gb_simple:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_simple:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_simple:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_simple:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_simple:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_simple:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, count(id) AS c FROM '{path}' GROUP BY flag",
+      "aggregate": "count(id) AS c",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_simple:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "id": "groupby:gb_arith:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "id": "groupby-o:gb_arith:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_arith:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_arith:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_arith:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_arith:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_arith:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 1 AS id_plus1",
+      "duck": "SELECT (id + 1) AS id_plus1, sum(price) AS s FROM '{path}' GROUP BY id_plus1",
+      "aggregate": "sum(price) AS s",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_arith:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "id": "groupby:gb_concat:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "id": "groupby-o:gb_concat:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_concat:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_concat:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_concat:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_concat:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_concat:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "name || '_z' AS concat",
+      "duck": "SELECT (name || '_z') AS concat, max(price) AS mx, min(price) AS mn FROM '{path}' GROUP BY concat",
+      "aggregate": "max(price) AS mx, min(price) AS mn",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_concat:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "id": "groupby:gb_coalesce:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "id": "groupby-o:gb_coalesce:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_coalesce:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_coalesce:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_coalesce:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_coalesce:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_coalesce:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "coalesce(nname, 'NA') AS coal",
+      "duck": "SELECT count(id) AS c, coalesce(nname, 'NA') AS coal FROM '{path}' GROUP BY coal",
+      "aggregate": "count(id) AS c",
+      "column_order": "c,coal",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_coalesce:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "id": "groupby:gb_int_plus_float:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "id": "groupby-o:gb_int_plus_float:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_int_plus_float:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_int_plus_float:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_int_plus_float:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_int_plus_float:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_int_plus_float:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id + 0.5 AS h",
+      "duck": "SELECT (id + 0.5) AS h, count(*) AS n FROM '{path}' GROUP BY h",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_int_plus_float:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "id": "groupby:gb_float_times_int:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "id": "groupby-o:gb_float_times_int:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_float_times_int:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_float_times_int:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_float_times_int:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_float_times_int:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_float_times_int:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "amt * 2 AS a2",
+      "duck": "SELECT (amt * 2) AS a2, count(*) AS n FROM '{path}' GROUP BY a2",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_float_times_int:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "id": "groupby:gb_int_times_float:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "id": "groupby-o:gb_int_times_float:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_int_times_float:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_int_times_float:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_int_times_float:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_int_times_float:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_int_times_float:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "id * amt AS p",
+      "duck": "SELECT (id * amt) AS p, count(*) AS n FROM '{path}' GROUP BY p",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_int_times_float:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "id": "groupby:gb_decimal_plus_int:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "id": "groupby-o:gb_decimal_plus_int:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_decimal_plus_int:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_decimal_plus_int:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_decimal_plus_int:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_decimal_plus_int:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_decimal_plus_int:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "price + id AS q",
+      "duck": "SELECT (price + id) AS q, count(*) AS n FROM '{path}' GROUP BY q",
+      "aggregate": "count(*) AS n",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_decimal_plus_int:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "id": "groupby:gb_null_input:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "id": "groupby-o:gb_null_input:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_null_input:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_null_input:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_null_input:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_null_input:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_null_input:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx FROM '{path}' GROUP BY flag",
+      "aggregate": "sum(amt) AS s, min(amt) AS mn, count(amt) AS c, avg(amt) AS a, max(name) AS mx",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_null_input:no_rows",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "id": "groupby:gb_avg_state:none"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "id": "groupby-o:gb_avg_state:none",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby:gb_avg_state:id_gt"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "filter": "id > 500",
+      "where": "id > 500",
+      "id": "groupby-o:gb_avg_state:id_gt",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby:gb_avg_state:amt_isnull"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "filter": "amt IS NULL",
+      "where": "amt IS NULL",
+      "id": "groupby-o:gb_avg_state:amt_isnull",
+      "parquet": true
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby:gb_avg_state:no_rows"
+    },
+    {
+      "kind": "groupby",
+      "group_by": "flag",
+      "duck": "SELECT flag, sum(amt) AS a__sum, count(amt) AS a__count, sum(price) AS p__sum, count(price) AS p__count, NULL::VARCHAR AS m FROM '{path}' GROUP BY flag",
+      "mean_scale": 6,
+      "mean_sum": "p__sum",
+      "mean_count": "p__count",
+      "mean_alias": "m",
+      "aggregate": "avg_state(amt) AS a, avg_state(price) AS p, avg(price) AS m",
+      "filter": "id < -100000",
+      "where": "id < -100000",
+      "id": "groupby-o:gb_avg_state:no_rows",
+      "parquet": true
+    }
+  ]
+}

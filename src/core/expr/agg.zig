@@ -21,6 +21,7 @@
 //! at the end.
 
 const std = @import("std");
+const count_certificate = @import("../count_certificate.zig");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
@@ -4085,6 +4086,7 @@ fn splitMix64(x: u64) u64 {
 /// only keys in `admit` cells get groups, and every other row is dropped.
 pub const CountSketch = struct {
     cells: []u32,
+    hot: ?*count_certificate.Hot = null,
     /// `cells.len == 1 << (64 - shift)`; a key's cell is the top bits of its hash (`sketchHash`, or a fixed table's).
     shift: u6,
     /// The admit pass's cells, one bit each; null in the count pass.
@@ -4107,7 +4109,11 @@ pub const CountSketch = struct {
     }
 
     /// The sink id a key with `hash`, asked for at `pos`, takes instead of a group; null when it gets a group.
-    inline fn route(self: *CountSketch, hash: u64, pos: u64) !?u32 {
+    inline fn route(self: *CountSketch, hash: u64, pos: u64, key: []const u8) !?u32 {
+        if (self.hot) |hot| if (hot.plan.slot(key)) |id| {
+            hot.first[id] = @min(hot.first[id], pos);
+            return sinkId(@intCast(self.cells.len + id));
+        };
         if (self.census) |c| if (!c.off) {
             if (c.admitted == null) return try c.slot(hash);
             return if (c.admits(hash, pos)) null else sinkId(0);
@@ -4447,10 +4453,14 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
         };
         return;
     };
-    const floor = CountSketch.sinkId(@intCast(s.cells.len - 1));
+    const hot_lanes = if (s.hot) |hot| hot.counts.len else 0;
+    const floor = CountSketch.sinkId(@intCast(s.cells.len + hot_lanes - 1));
     for (ids, 0..) |id, r| {
         if (id < floor or !sel.isActive(r)) continue;
-        if (s.admit == null and (if (s.census) |c| c.off else true)) s.cells[std.math.maxInt(u32) - id] +|= 1;
+        if (s.admit == null and (if (s.census) |c| c.off else true)) {
+            const lane = std.math.maxInt(u32) - id;
+            if (lane >= s.cells.len) s.hot.?.add(lane - s.cells.len) else s.cells[lane] +|= 1;
+        }
         sel.set(r, false);
     }
 }
@@ -4659,7 +4669,7 @@ pub const GroupTable = struct {
             const image = expandFixed(self.fixed_stride, key, &buf) orelse return error.BadGroupKey;
             return self.getOrInsertFixed(image, agg_calls, pos);
         }
-        if (self.sketch) |s| if (try s.route(s.keyHash(key), pos)) |id| return id;
+        if (self.sketch) |s| if (try s.route(s.keyHash(key), pos, key)) |id| return id;
         const hashed: CachedKey = .{ .bytes = key, .hash = std.hash.Wyhash.hash(0, key) };
         if (self.map.unmanaged.available == 0) if (self.map.getAdapted(hashed, CachedKeyCtx{})) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
@@ -4735,7 +4745,7 @@ pub const GroupTable = struct {
         full_hash: u64,
     ) !u32 {
         std.debug.assert(key.len == self.fixed_stride);
-        if (self.sketch) |s| if (try s.route(full_hash, pos)) |id| return id;
+        if (self.sketch) |s| if (try s.route(full_hash, pos, key)) |id| return id;
         const hash: u32 = @truncate(full_hash);
         const probe = self.probeFixed(key, full_hash);
         if (probe.id) |id| {

@@ -172,3 +172,138 @@ test "sample owns bounded exact keys, ignores NULL membership and frees failed a
     try std.testing.expectEqual(@as(u64, 2), s.rows);
     try std.testing.expectEqual(@as(usize, 0), s.counts.count());
 }
+
+pub const HotPlan = struct {
+    keys: []i64,
+    ids: std.AutoHashMapUnmanaged(i64, usize) = .empty,
+    second: bool,
+    fmin: i64,
+    width: usize,
+
+    pub fn deinit(self: *HotPlan, a: std.mem.Allocator) void {
+        self.ids.deinit(a);
+        a.free(self.keys);
+    }
+
+    pub fn lanes(self: HotPlan) usize {
+        return self.keys.len * self.width;
+    }
+
+    /// The canonical fixed key image includes a presence byte per integer. NULL and values outside the sampled
+    /// interval remain cold; the sample never proves a range or removes those rows from the bound.
+    pub inline fn slot(self: *const HotPlan, key: []const u8) ?usize {
+        if (key.len != (if (self.second) @as(usize, 18) else 9) or key[0] == 0) return null;
+        const k = std.mem.readInt(i64, key[1..9], .little);
+        const hot = self.ids.get(k) orelse return null;
+        const offset: usize = if (self.second) f: {
+            if (key[9] == 0) return null;
+            const value = std.mem.readInt(i64, key[10..18], .little);
+            const d: i128 = @as(i128, value) - self.fmin;
+            if (d < 0 or d >= self.width) return null;
+            break :f @intCast(d);
+        } else 0;
+        return hot * self.width + offset;
+    }
+
+    pub fn image(self: HotPlan, slot_id: usize, out: *[18]u8) []const u8 {
+        out[0] = 1;
+        std.mem.writeInt(i64, out[1..9], self.keys[slot_id / self.width], .little);
+        if (!self.second) return out[0..9];
+        out[9] = 1;
+        std.mem.writeInt(i64, out[10..18], @intCast(@as(i128, self.fmin) + slot_id % self.width), .little);
+        return out;
+    }
+};
+
+pub const Hot = struct {
+    plan: *const HotPlan,
+    counts: []u32,
+    first: []u64,
+    overflow: bool = false,
+
+    pub fn init(a: std.mem.Allocator, plan: *const HotPlan) !Hot {
+        const counts = try a.alloc(u32, plan.lanes());
+        errdefer a.free(counts);
+        const first = try a.alloc(u64, plan.lanes());
+        @memset(counts, 0);
+        @memset(first, std.math.maxInt(u64));
+        return .{ .plan = plan, .counts = counts, .first = first };
+    }
+
+    pub fn deinit(self: Hot, a: std.mem.Allocator) void {
+        a.free(self.counts);
+        a.free(self.first);
+    }
+
+    pub inline fn add(self: *Hot, id: usize) void {
+        if (self.counts[id] == std.math.maxInt(u32)) self.overflow = true;
+        self.counts[id] +|= 1;
+    }
+};
+
+/// Retain primary keys whose estimated pair counts pay for cold-cell noise. This is a cost decision only. Dense
+/// count/first lanes and cold cells must share a worker's L2, including lookup state and decode headroom.
+pub fn hotPlan(a: std.mem.Allocator, s: Sample, second: bool, h: usize, cells: usize) !?HotPlan {
+    if (s.counts.count() == 0 or s.rows == 0 or h == 0) return null;
+    const width = if (second) std.math.cast(usize, @as(i128, s.fmax) - s.fmin + 1) orelse return null else 1;
+    if (width == 0) return null;
+    const room = hw.l2BytesPerWorkerOr(640 << 10) -| cells *| @sizeOf(u32) -| (64 << 10);
+    const capacity = @min(s.counts.count(), room / (@as(usize, 12) *| width +| 64));
+    if (capacity == 0) return null;
+    const Entry = struct { key: i64, count: u64 };
+    const ranked = try a.alloc(Entry, s.counts.count());
+    defer a.free(ranked);
+    var it = s.counts.iterator();
+    var n: usize = 0;
+    while (it.next()) |e| : (n += 1) ranked[n] = .{ .key = e.key_ptr.*, .count = e.value_ptr.* };
+    std.mem.sortUnstable(Entry, ranked, {}, struct {
+        fn less(_: void, x: Entry, y: Entry) bool {
+            return x.count > y.count or (x.count == y.count and x.key < y.key);
+        }
+    }.less);
+    n = 0;
+    const noise_work = 1 + std.math.log2_int(usize, h);
+    for (ranked[0..capacity]) |e| {
+        if (@as(u128, e.count) * cells <= @as(u128, s.rows) * width * noise_work) break;
+        n += 1;
+    }
+    if (n == 0 or n * width < h) return null;
+    var plan: HotPlan = .{ .keys = try a.alloc(i64, n), .second = second, .fmin = if (second) s.fmin else 0, .width = width };
+    errdefer plan.deinit(a);
+    try plan.ids.ensureTotalCapacity(a, @intCast(n));
+    for (ranked[0..n], plan.keys, 0..) |e, *key, id| {
+        key.* = e.key;
+        plan.ids.putAssumeCapacity(e.key, id);
+    }
+    return plan;
+}
+
+fn hotAllocation(a: std.mem.Allocator) !void {
+    var s: Sample = .{};
+    defer s.deinit(a);
+    for (0..300) |i| try s.add(a, @intCast(i % 3), @as(i64, @intCast(i % 5)) - 2);
+    var plan = (try hotPlan(a, s, true, 3, 256)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+    var hot = try Hot.init(a, &plan);
+    defer hot.deinit(a);
+    for (0..plan.lanes()) |id| {
+        var bytes: [18]u8 = undefined;
+        try std.testing.expectEqual(id, plan.slot(plan.image(id, &bytes)).?);
+        hot.add(id);
+        try std.testing.expectEqual(@as(u32, 1), hot.counts[id]);
+    }
+    var bytes: [18]u8 = undefined;
+    _ = plan.image(0, &bytes);
+    bytes[0] = 0;
+    try std.testing.expect(plan.slot(&bytes) == null);
+    bytes[0] = 1;
+    std.mem.writeInt(i64, bytes[10..18], std.math.minInt(i64), .little);
+    try std.testing.expect(plan.slot(&bytes) == null);
+    hot.counts[0] = std.math.maxInt(u32);
+    hot.add(0);
+    try std.testing.expect(hot.overflow);
+}
+
+test "hot certificate membership compares complete keys, preserves late cold values and frees failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, hotAllocation, .{});
+}

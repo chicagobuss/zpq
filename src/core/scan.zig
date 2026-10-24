@@ -306,6 +306,9 @@ pub const MultiAggArgs = struct {
 
 /// Tuning of `sketchTopK`.
 pub const SketchTopK = struct {
+    /// Hot-state producer; tests can force the identity-bound producer instead.
+    hot: bool = true,
+    hot_outcome: ?*HotOutcome = null,
     /// Cells admitted per row of the cut (`offset + limit`).
     admit_per_row: usize = 16,
     /// log2 of the cells per worker: 2^18 four-byte cells fit a core's L2.
@@ -326,6 +329,7 @@ pub const SketchTopK = struct {
     census_fp_bits: u6 = 40,
 
     pub const Outcome = enum { ineligible, bailed, certified, fell_back, census, census_short };
+    pub const HotOutcome = enum { declined, certified, residual };
 };
 
 /// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
@@ -2181,6 +2185,135 @@ fn distinctCensusMinGroups(args: MultiAggArgs) u64 {
     return (order.offset +| (order.limit orelse 0)) *| admit *| 64;
 }
 
+/// Hot membership is sampled; each hot lane is then counted completely and every other row contributes to a
+/// saturating cold bound. The exact residual includes equality at the cut, preserving all secondary ordering.
+fn hotCertificate(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    workers: []Worker,
+    cursor: *std.atomic.Value(usize),
+    tables: []expr_agg.GroupTable,
+    calls: []const expr_agg.AggCall,
+    order: expr_ast.ResultOrder,
+    cfg: SketchTopK,
+) !bool {
+    const cert = @import("count_certificate.zig");
+    if (cfg.hot_outcome) |outcome| outcome.* = .declined;
+    if (!cfg.hot) return false;
+    const keys = workers[0].group_by_keys orelse return false;
+    if (keys.len == 0 or keys.len > 2 or calls.len != 1 or calls[0].func != .count or calls[0].arg != null or
+        calls[0].where != null or calls[0].offset != 0 or calls[0].state or
+        workers[0].plan.query.filter != null or tables[0].fixed_stride != keys.len * 9) return false;
+    for (keys) |key| {
+        if (key != .col_ref or key.col_ref.expr_type != .i64 or key.col_ref.unsigned_64) return false;
+        if (key.col_ref.physical_type != .INT32 and key.col_ref.physical_type != .INT64) return false;
+    }
+    const h: usize = @intCast(order.offset +| order.limit.?);
+    var unlimited: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
+    var charge: core_memory.Charged = .{ .child = gpa, .budget = tables[0].shared orelse &unlimited };
+    const a = charge.allocator();
+    const sources = a.alloc(cert.Source, workers[0].work.len) catch return false;
+    defer a.free(sources);
+    for (workers[0].work, sources) |item, *source| source.* = .{
+        .rg = &workers[0].metas[item.file].row_groups.items[item.rg],
+        .meta = &workers[0].metas[item.file],
+        .src = .{ .bytes = workers[0].inputs[item.file].bytes, .byte_origin = 0 },
+    };
+    // A failed optional sample is never the query's error; the complete scan establishes canonical failures.
+    var sample = cert.sample(a, sources, keys[0].col_ref.col_idx, if (keys.len == 2) keys[1].col_ref.col_idx else null, h, workers.len, workers[0].decode_options) catch {
+        consumer.setDecodeFailure(null);
+        return false;
+    };
+    defer sample.deinit(a);
+    const cell_capacity = @max(16, @import("hw.zig").l2BytesPerWorkerOr(640 << 10) / (2 * @sizeOf(u32)));
+    const bits = @min(cfg.cell_bits, std.math.log2_int(usize, cell_capacity));
+    const n_cells = @as(usize, 1) << @intCast(bits);
+    var plan = (cert.hotPlan(a, sample, keys.len == 2, h, n_cells) catch return false) orelse return false;
+    defer plan.deinit(a);
+    sample.deinit(a);
+    const hot = a.alloc(cert.Hot, workers.len) catch return false;
+    defer a.free(hot);
+    var made: usize = 0;
+    defer for (hot[0..made]) |local| local.deinit(a);
+    for (hot) |*local| {
+        local.* = cert.Hot.init(a, &plan) catch return false;
+        made += 1;
+    }
+    const sketches = a.alloc(expr_agg.CountSketch, workers.len) catch return false;
+    defer a.free(sketches);
+    var cells_made: usize = 0;
+    defer for (sketches[0..cells_made]) |s| a.free(s.cells);
+    for (sketches, hot) |*s, *local| {
+        s.* = .{ .cells = a.alloc(u32, n_cells) catch return false, .shift = @intCast(@as(u7, 64) - bits), .hot = local };
+        @memset(s.cells, 0);
+        cells_made += 1;
+    }
+    const totals = a.alloc(u64, plan.lanes()) catch return false;
+    defer a.free(totals);
+    @memset(totals, 0);
+    const ranked = a.alloc(u64, plan.lanes()) catch return false;
+    defer a.free(ranked);
+    const saved = try arena.dupe(Worker, workers);
+    var accepted = false;
+    defer if (!accepted) restoreCounts(workers, saved);
+    for (tables, sketches) |*t, *s| t.sketch = s;
+    defer for (tables) |*t| {
+        t.sketch = null;
+    };
+    const t0 = nowMonoNs();
+    try runPhase(workers, cursor);
+    for (hot) |local| {
+        if (local.overflow) return false;
+        for (totals, local.counts) |*total, count| total.* += count;
+        for (hot[0].first, local.first) |*first, ordinal| first.* = @min(first.*, ordinal);
+    }
+    @memcpy(ranked, totals);
+    std.mem.sortUnstable(u64, ranked, {}, std.sort.desc(u64));
+    const cut = ranked[h - 1];
+    if (cut == 0) return false;
+    const cells = sketches[0].cells;
+    for (sketches[1..]) |s| for (cells, s.cells) |*cell, count| {
+        cell.* +|= count;
+    };
+    var residual: u64 = 0;
+    for (cells) |cell| if (cell == std.math.maxInt(u32)) {
+        // A saturated cell is infinity, including when an exact hot score exceeds u32.
+        return false;
+    } else if (cell >= cut) {
+        residual +|= cell;
+    };
+    if (cfg.trace) std.debug.print("certificate: hot={d} width={d} cut={d} residual_bound={d} count_ms={d}\n", .{
+        plan.keys.len, plan.width, cut, residual, @divTrunc(nowMonoNs() - t0, 1_000_000),
+    });
+    // If the trial would group most rows, let the ordinary identity-bound policy choose its exact finish.
+    var rows: u64 = 0;
+    for (sources) |source| rows +|= @intCast(@max(0, source.rg.num_rows));
+    if (residual >= rows / 2 or !cfg.certify) return false;
+    if (residual > 0) {
+        const admit = try a.alloc(u64, (n_cells + 63) / 64);
+        defer a.free(admit);
+        @memset(admit, 0);
+        for (cells, 0..) |cell, i| if (cell >= cut) {
+            admit[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+        };
+        for (sketches) |*s| s.admit = admit;
+        restoreCounts(workers, saved);
+        try runPhase(workers, cursor);
+    }
+    // Each hot key is complete in one lane, even when its cold hash cell was also admitted. The residual drops
+    // hot rows; materializing the complete lane once cannot double-count them.
+    for (tables) |*t| t.sketch = null;
+    for (totals, hot[0].first, 0..) |total, first, id| if (total != 0) {
+        var image: [18]u8 = undefined;
+        const g = try tables[0].getOrInsert(plan.image(id, &image), calls, first);
+        tables[0].writeAcc(g, 0, 1, .{ .count = total });
+    };
+    if (cfg.outcome) |o| o.* = .certified;
+    if (cfg.hot_outcome) |o| o.* = if (residual == 0) .certified else .residual;
+    accepted = true;
+    return true;
+}
+
 /// A COUNT-descending cut of `k = offset + limit` groups, grouping only the keys that can make it. The count pass
 /// gives no key a group: each row adds one to its key's hash cell. The cells, summed over workers, bound every key's
 /// total. The admit pass groups, exactly and with first appearance, every key of the `T` fullest cells, and drops the
@@ -2199,6 +2332,7 @@ fn sketchTopK(
     cfg: SketchTopK,
     decision: AggregateDispatch,
 ) !void {
+    if (!decision.distinct_census and try hotCertificate(gpa, arena, workers, cursor, tables, calls, order, cfg)) return;
     const k: usize = @intCast(order.offset +| order.limit.?);
     const n_cells = @as(usize, 1) << cfg.cell_bits;
     const sketches = try arena.alloc(expr_agg.CountSketch, workers.len);
@@ -13825,7 +13959,8 @@ test "inline records decline released remote windows and retry only through a re
             .group_by = if (bytes_key) "k" else "n",
             .result_order = if (shape == 2)
                 .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2 }
-            else .{},
+            else
+                .{},
             .parallelism = if (mapped and !bytes_key) requested else 1,
             .typed_answer = shape != 2,
             .integer_records_min_rows = 0,
@@ -13837,8 +13972,7 @@ test "inline records decline released remote windows and retry only through a re
         };
         if (shape == 2) {
             const path = (try explainAggregate(gpa, a, args)).record_path;
-            if (mapped) try testing.expectEqual(.byte_sum_top_h, path.?.layout) else
-                try testing.expect(path == null);
+            if (mapped) try testing.expectEqual(.byte_sum_top_h, path.?.layout) else try testing.expect(path == null);
         }
         var got = try runMultiAggregate(gpa, a, args);
         defer got.deinit(gpa);
@@ -17505,7 +17639,8 @@ fn checkRecordDecodeModes(
         const replay = mode == .replay or mode == .mixed_replay;
         var budget: core_memory.SharedBudget = .{ .limit = if (mode == .declined)
             (if (base.byte_records) @as(usize, 4 << 20) else 96 << 20)
-        else 1 << 30 };
+        else
+            1 << 30 };
         var args = base;
         args.parallelism = j;
         args.decode_batch_rows = window;
@@ -18171,7 +18306,6 @@ test "dependent group keys: nullable multi-key trees and canonical float blocks 
     }
 }
 
-
 test "packed byte SUM declines reconstructed outputs before admission" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -18397,4 +18531,84 @@ test "COUNT certificate sample reads real pages across row groups and repeated i
     try testing.expectEqual(@as(u64, @intCast(source.rg.num_rows * 3)), sample.rows);
     try testing.expect(sample.counts.count() > 0);
     try testing.expect(sample.fmax >= sample.fmin);
+}
+
+test "hot COUNT certificate matches canonical clustered keys, NULLs, ties, offsets and late cold values" {
+    var certified = false;
+    var residual = false;
+    for ([_][]const u8{ "plain", "dict" }) |encoding| {
+        var file_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer file_arena.deinit();
+        const path = try std.fmt.allocPrint(file_arena.allocator(), "ci/fixtures/parquet/count_certificate_{s}.parquet", .{encoding});
+        const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+        defer testing.allocator.free(bytes);
+        const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+        for ([_][]const u8{ "k", "k, f" }) |key| for ([_]usize{ 1, 2, 4, 8, 16 }) |j| {
+            for ([_]usize{ 1 << 20, 512 << 20 }) |budget| for ([_]bool{ false, true }) |force_replay| {
+                var arena = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena.deinit();
+                const args: MultiAggArgs = .{
+                    .inputs = &inputs,
+                    .aggregate = "count(*) AS c",
+                    .group_by = key,
+                    .parallelism = j,
+                    .min_bytes_per_worker = 1,
+                    .max_memory = budget,
+                    .decode_limit = budget,
+                    .result_order = .{ .keys = &.{.{ .column = if (key.len == 1) 1 else 2, .descending = true }}, .limit = 3, .offset = if (key.len == 1) 0 else 2 },
+                    .ndv_policy = false,
+                    .plain_rules = false,
+                    .dense = false,
+                };
+                var want = try runMultiAggregate(testing.allocator, arena.allocator(), args);
+                defer want.deinit(testing.allocator);
+                var outcome: SketchTopK.HotOutcome = .declined;
+                var trial = args;
+                trial.sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1, .hot_outcome = &outcome, .certify = !force_replay };
+                var got = try runMultiAggregate(testing.allocator, arena.allocator(), trial);
+                defer got.deinit(testing.allocator);
+                certified = certified or outcome == .certified;
+                residual = residual or outcome == .residual;
+                try testing.expectEqual(want.rows_in, got.rows_in);
+                try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+                try testing.expectEqual(want.rows_matched, got.rows_matched);
+                try want.output.applyResultOrder(testing.allocator, args.result_order);
+                try got.output.applyResultOrder(testing.allocator, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+            };
+        };
+    }
+    try testing.expect(certified);
+    try testing.expect(residual);
+}
+
+fn runHotCertificateAndFree(gpa: std.mem.Allocator, inputs: []const Input, meta: *const schema.FileMetaData) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var result = try runMultiAggregate(gpa, arena.allocator(), .{
+        .inputs = inputs,
+        .metas = meta[0..1],
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .parallelism = 1,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+        .ndv_policy = false,
+        .plain_rules = false,
+        .dense = false,
+        .sketch_topk = .{ .cell_bits = 8, .admit_per_row = 1, .census = false },
+    });
+    result.deinit(gpa);
+}
+
+test "hot COUNT certificate releases every trial allocation and its ledger charge on failure" {
+    const path = "ci/fixtures/parquet/count_certificate_plain.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var meta = try metadata.open(arena.allocator(), bytes);
+    meta.row_groups.items = meta.row_groups.items[meta.row_groups.items.len - 1 ..];
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    try testing.checkAllAllocationFailures(fixed.allocator(), runHotCertificateAndFree, .{ &inputs, &meta });
 }

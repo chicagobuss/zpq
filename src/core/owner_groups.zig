@@ -468,6 +468,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 items: usize,
             ) !?*State {
                 comptime std.debug.assert(kind != .count_top and codec == .int64);
+                // The ordinary per-row quote also covers one run descriptor per row. Empty-source-heavy inputs
+                // beyond that bound keep the record producer, rather than retaining unquoted descriptors.
+                if (items > rows) return null;
                 return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, 0, items);
             }
 
@@ -1432,4 +1435,20 @@ test "decoded owner run top-H completes seam chains before SUM ranking and first
 
 test "decoded owner run top-H releases failed heaps, group buffers and ledger reservations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, runTopTrial, .{ 1, true, 7 });
+}
+
+test "decoded owner runs decline unquoted descriptors for mostly empty sources" {
+    var ledger: memory.SharedBudget = .{ .limit = 512 << 20 };
+    try std.testing.expect((try IntFull.State.initRuns(
+        std.testing.allocator,
+        &ledger,
+        1,
+        1,
+        0,
+        1,
+        {},
+        full_parts,
+        2,
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }

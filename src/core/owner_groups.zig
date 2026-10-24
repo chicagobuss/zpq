@@ -207,9 +207,52 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             nulls: u32 = 0,
             free_next: u32 = 0,
             free_end: u32 = 0,
+            run_item: usize = 0,
+
+            pub fn start(l: *Local, ordinal: u32, item: usize) void {
+                l.ordinal_base = ordinal;
+                l.run_item = item;
+            }
+
+            fn appendRun(l: *Local, key: ?Key, value: ?i64, ordinal: u32) void {
+                const s = l.state;
+                const run = &s.runs[l.run_item];
+                run.rows += 1;
+                const k = key orelse {
+                    s.run_declined.store(true, .monotonic);
+                    return;
+                };
+                if (run.groups != 0) {
+                    const prev = &s.groups[run.last];
+                    const pk = prev.keyValue().?;
+                    if (k < pk) s.run_declined.store(true, .monotonic);
+                    if (k == pk) {
+                        prev.count += 1;
+                        if (value) |v| {
+                            prev.sum += v;
+                            prev.count |= Group.sum_present;
+                        }
+                        return;
+                    }
+                }
+                s.groups[ordinal] = .{
+                    .key = @bitCast(k),
+                    .count = 1 | (if (value != null) Group.sum_present else @as(u32, 0)),
+                    .sum = value orelse 0,
+                    .first = ordinal,
+                };
+                s.winners[ordinal] = ordinal + 1;
+                if (run.groups == 0) run.first = ordinal;
+                run.last = ordinal;
+                run.groups += 1;
+            }
 
             pub fn append(l: *Local, key: ?Key, value: if (has_value) ?i64 else void, ordinal: u32) !void {
                 std.debug.assert(admitsRows(codec, ordinal));
+                if (comptime kind == .full and codec == .int64) if (l.state.runs.len != 0) {
+                    l.appendRun(key, value, ordinal);
+                    return;
+                };
                 // Integer keys: their bits, NULL told apart by its flag (full) or a bit no integer sets (top-H).
                 const bits: KeyBits = if (codec == .int64)
                     (if (key) |k| @bitCast(k) else 0)
@@ -346,6 +389,10 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             // Top-H: each worker's best groups among the partitions it completed.
             heaps: []Heap = &.{},
             select_ns: u64 = 0,
+            // Decoded run partials occupy disjoint source-ordinal ranges of the existing group/winner arrays.
+            runs: []Run = &.{},
+            run_declined: std.atomic.Value(bool) = .init(false),
+            const Run = struct { rows: usize = 0, groups: usize = 0, first: u32 = 0, last: u32 = 0 };
 
             fn blockCount(rows: usize, workers: usize, parts: usize) usize {
                 return (rows + block_rows - 1) / block_rows + workers * (parts + block_claim);
@@ -371,6 +418,36 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 cut: if (kind == .full) void else Cut,
                 parts: usize,
                 output_credit: usize,
+            ) !?*State {
+                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, 0);
+            }
+
+            /// The same full-answer state, filled with decoded run partials instead of hash records. Its ordinary
+            /// reservation covers the groups, winners and ordering arrays, and is returned before a declined replay.
+            pub fn initRuns(
+                a: std.mem.Allocator,
+                ledger: ?*memory.SharedBudget,
+                rows: usize,
+                workers: usize,
+                key_col: usize,
+                value_col: usize,
+                items: usize,
+            ) !?*State {
+                comptime std.debug.assert(kind == .full and codec == .int64);
+                return initMode(a, ledger, rows, workers, key_col, value_col, {}, full_parts, 0, items);
+            }
+
+            fn initMode(
+                a: std.mem.Allocator,
+                ledger: ?*memory.SharedBudget,
+                rows: usize,
+                workers: usize,
+                key_col: usize,
+                value_col: usize,
+                cut: if (kind == .full) void else Cut,
+                parts: usize,
+                output_credit: usize,
+                run_items: usize,
             ) !?*State {
                 if (!admitsRows(codec, rows) or workers == 0 or workers > 64 or parts < 64 or parts > 16384 or
                     !std.math.isPowerOfTwo(parts)) return null;
@@ -406,6 +483,14 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         h.cap = storage.len;
                     }
                 }
+                if (run_items != 0) {
+                    s.runs = try a.alloc(Run, run_items);
+                    @memset(s.runs, .{});
+                    s.groups = try a.alloc(Group, rows);
+                    s.winners = try a.alloc(u32, rows);
+                    @memset(s.winners, 0);
+                    return s;
+                }
                 s.blocks = try a.alloc(Block, blockCount(rows, workers, parts));
                 for (s.locals) |*l| {
                     l.heads = try a.alloc(u32, parts);
@@ -425,6 +510,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     a.free(l.histogram);
                 }
                 a.free(s.locals);
+                a.free(s.runs);
                 for (s.heaps) |*h| h.deinit(a);
                 a.free(s.heaps);
                 a.free(s.blocks);
@@ -560,7 +646,54 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 }
             }
 
+            fn finishRuns(s: *State) !void {
+                if (s.run_declined.load(.monotonic)) return error.RunOrderDeclined;
+                var rows: usize = 0;
+                var last: ?u32 = null;
+                for (s.runs) |run| {
+                    rows += run.rows;
+                    s.group_count += run.groups;
+                    if (run.groups == 0) continue;
+                    if (last) |prev| {
+                        const left = &s.groups[prev];
+                        const right = &s.groups[run.first];
+                        if (left.keyValue().? > right.keyValue().?) return error.RunOrderDeclined;
+                        if (left.key == right.key) {
+                            left.sum += right.sum;
+                            left.count = (left.count & Group.sum_present) | (right.count & Group.sum_present) |
+                                @as(u32, @intCast(left.countValue() + right.countValue()));
+                            s.winners[run.first] = 0;
+                            s.group_count -= 1;
+                            if (run.groups == 1) continue; // Keep the original owner across any number of seams.
+                        }
+                    }
+                    last = run.last;
+                }
+                if (rows != s.rows) return error.BadRowCount;
+                for (s.winners, 0..) |winner, i| if (winner != 0) {
+                    const g = s.groups[i];
+                    if (g.sumValue() != null and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
+                };
+                s.bitmap = try s.gpa.alloc(u64, (s.rows + 63) / 64);
+                s.prefix = try s.gpa.alloc(u32, s.bitmap.len + 1);
+                try s.parallel(.order);
+                var total: u32 = 0;
+                for (s.prefix[0..s.bitmap.len]) |*n| {
+                    const count = n.*;
+                    n.* = total;
+                    total += count;
+                }
+                s.prefix[s.bitmap.len] = total;
+                if (total != s.group_count) return error.BadRowCount;
+            }
+
             pub fn finish(s: *State) !void {
+                if (comptime kind == .full and codec == .int64) if (s.runs.len != 0) {
+                    const begin = now();
+                    try s.finishRuns();
+                    s.fold_ns = @intCast(now() - begin);
+                    return;
+                };
                 var start = now();
                 var contributed: usize = 0;
                 for (s.locals) |l| {
@@ -1118,5 +1251,85 @@ test "integer owner folding keeps high ordinals and 31-bit counts separate from 
         try t.expectEqual(@as(?i64, null), groups[0].keyValue());
         try t.expectEqual(@as(u32, early), groups[0].ordinal());
         try t.expectEqual(@as(?i128, 5), groups[0].sumValue());
+    }
+}
+
+fn runTrial(a: std.mem.Allocator, workers: usize) !void {
+    const keys = [_]i64{ -9, -9, -2, -2, -2, -2, -2, -2, 8, 8, 11, 12 };
+    const starts = [_]u32{ 0, 3, 3, 5, 7, 10 };
+    var ledger: memory.SharedBudget = .{ .limit = 512 << 20 };
+    defer std.debug.assert(ledger.used.load(.monotonic) == 0);
+    const s = (try IntFull.State.initRuns(a, &ledger, keys.len, workers, 0, 1, starts.len)).?;
+    defer s.deinit();
+    // Reverse completion order, an empty source, and one group through three source seams.
+    var item = starts.len;
+    while (item != 0) {
+        item -= 1;
+        const local = &s.locals[item % workers];
+        local.start(starts[item], item);
+        const end = if (item + 1 == starts.len) keys.len else starts[item + 1];
+        for (starts[item]..end) |row|
+            try local.append(keys[row], if (row % 3 == 0) null else @as(i64, @intCast(row)) - 6, @intCast(row));
+    }
+    try s.finish();
+    const ids = try s.window(a, 0, s.group_count);
+    defer a.free(ids);
+    var group: usize = 0;
+    for (keys, 0..) |key, row| {
+        if (row != 0 and key == keys[row - 1]) continue;
+        const got = s.groups[ids[group]];
+        group += 1;
+        var count: i64 = 0;
+        var sum: ?i128 = null;
+        for (row..keys.len) |r| {
+            if (keys[r] != key) break;
+            count += 1;
+            if (r % 3 != 0) sum = (sum orelse 0) + @as(i128, @intCast(r)) - 6;
+        }
+        try std.testing.expectEqual(@as(?i64, key), got.keyValue());
+        try std.testing.expectEqual(@as(u32, @intCast(row)), got.ordinal());
+        try std.testing.expectEqual(count, got.countValue());
+        try std.testing.expectEqual(sum, got.sumValue());
+    }
+    try std.testing.expectEqual(group, ids.len);
+}
+
+test "decoded owner runs fold empty sources and seam chains in source order at every worker count" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| try runTrial(std.testing.allocator, j);
+}
+
+test "decoded owner runs release every failed allocation and ledger reservation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, runTrial, .{2});
+}
+
+test "decoded owner runs decline NULL, an interior descent or an overlapping source before output" {
+    const a = std.testing.allocator;
+    for ([_][4]?i64{ .{ 1, null, 2, 3 }, .{ 1, 0, 2, 3 }, .{ 1, 2, 1, 3 } }) |keys| {
+        const s = (try IntFull.State.initRuns(a, null, keys.len, 2, 0, 1, 2)).?;
+        defer s.deinit();
+        for (0..2) |item| {
+            s.locals[item].start(@intCast(item * 2), item);
+            for (item * 2..item * 2 + 2) |row| try s.locals[item].append(keys[row], 1, @intCast(row));
+        }
+        try std.testing.expectError(error.RunOrderDeclined, s.finish());
+    }
+}
+
+test "decoded owner runs narrow exact sums only after all seams, including a later cancellation" {
+    const a = std.testing.allocator;
+    for ([_]i64{ -std.math.maxInt(i64), 0 }) |last| {
+        const s = (try IntFull.State.initRuns(a, null, 3, 1, 0, 1, 3)).?;
+        defer s.deinit();
+        for ([_]i64{ std.math.maxInt(i64), 1, last }, 0..) |value, item| {
+            s.locals[0].start(@intCast(item), item);
+            try s.locals[0].append(7, value, @intCast(item));
+        }
+        if (last == 0) {
+            try std.testing.expectError(error.AggIntTooWide, s.finish());
+        } else {
+            try s.finish();
+            try std.testing.expectEqual(@as(?i128, 1), s.groups[0].sumValue());
+            try std.testing.expectEqual(@as(i64, 3), s.groups[0].countValue());
+        }
     }
 }

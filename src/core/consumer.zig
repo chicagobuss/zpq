@@ -3040,7 +3040,7 @@ pub const RecordSink = union(enum) {
     pub fn start(s: RecordSink, ordinal_base: u32, item: usize) void {
         switch (s) {
             .msd => |local| local.start(ordinal_base, item),
-            inline else => |local| local.ordinal_base = ordinal_base,
+            inline else => |local| local.start(ordinal_base, item),
         }
     }
 

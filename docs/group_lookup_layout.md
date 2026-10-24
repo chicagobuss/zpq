@@ -56,3 +56,10 @@ It is a membership hint: complete counts still route NULL and out-of-range value
 cannot exclude a winner. Absent, unreadable or wide bounds retain value sampling to tolerate rare outliers.
 Input-wide sample windows run on row-group tasks in the existing worker pool, with private sample maps and
 decode scratch. Their merged counts cover the same global row budget, including windows crossing row groups.
+
+Integer full answers may fill the same owner state from decoded nondecreasing runs. Footer bounds only select
+the attempt. Each source verifies every decoded key; NULL or any descent declines and releases the state before
+the ordinary owner-record replay. Partial sums stay i128 through seam folding, including a chain spanning more
+than two sources. Only complete sums are narrowed. Run groups use the existing source-ordinal winner map and
+window writer, preserving first-appearance order and output row-group boundaries. The ordinary owner reservation
+covers their group, winner and ordering arrays; no separate grouped executor or tuning option is introduced.

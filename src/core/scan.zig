@@ -6009,8 +6009,47 @@ fn inlineIntegerAnswer(
         .layout = if (cut != null) .integer_sum_top_h else .integer_group_stream,
         .reservation = integerQuote(rows, n_workers, cut, args),
     };
-    if (cut) |c| return try runIntegerOwner(.sum_top, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, c);
-    return try runIntegerOwner(.full, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, {});
+    if (cut) |c| return try runIntegerOwner(.sum_top, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, c, false);
+    if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
+        .full,
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        outputs,
+        n_workers,
+        timings,
+        rows,
+        key.col_idx,
+        value.?,
+        count,
+        starts,
+        {},
+        true,
+    )) |answer| return answer;
+    return try runIntegerOwner(.full, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, {}, false);
+}
+
+/// Footer bounds select an attempt; every decoded key and every source seam must still prove the order.
+fn orderedIntegerHint(metas: []const schema.FileMetaData, work: []const WorkItem, column: usize) bool {
+    const statistics = @import("parquet/statistics.zig");
+    var previous: ?i64 = null;
+    for (work) |item| {
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        if (rg.num_rows == 0) continue;
+        const b = statistics.chunkStats(rg, column, meta, .corroborated).bounds orelse return false;
+        if (b.min.len != 8 or b.max.len != 8) return false;
+        const lo = std.mem.readInt(i64, b.min[0..8], .little);
+        const hi = std.mem.readInt(i64, b.max[0..8], .little);
+        if (previous) |p| if (lo < p) return false;
+        previous = hi;
+    }
+    return previous != null;
 }
 
 /// The reservation of an admitted integer record layout: the full answer's established quote, or a top-H attempt's.
@@ -6039,14 +6078,17 @@ fn runIntegerOwner(
     count: ?usize,
     starts: []u32,
     cut: if (kind == .full) void else owner_groups.Cut,
+    ordered: bool,
 ) !?MultiAggResult {
     const Owner = owner_groups.Owner(kind, .int64);
     const parts = if (kind == .full)
         owner_groups.full_parts
     else
         Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
-    const state = (try Owner.State.init(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, 0)) orelse
-        return null;
+    const state = (if (kind == .full and ordered)
+        try Owner.State.initRuns(gpa, args.ledger, rows, n_workers, key_col, value_col, work.len)
+    else
+        try Owner.State.init(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, 0)) orelse return null;
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
@@ -6054,7 +6096,11 @@ fn runIntegerOwner(
     const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, outputs, timings);
     const prof = profile.threadOf(args.profiler, .main);
     const final_start = nowMonoNs();
-    try state.finish();
+    state.finish() catch |err| {
+        if (err != error.RunOrderDeclined) return err;
+        state.deinit();
+        return null;
+    };
     const scatter_end = final_start + @as(i64, @intCast(state.partition_ns));
     const fold_end = scatter_end + @as(i64, @intCast(state.fold_ns));
     profile.record(prof, .integer_scatter, final_start, scatter_end, profile.args(.{}));
@@ -19009,4 +19055,79 @@ test "COUNT residual never turns a real decode failure into a budget fallback" {
     const offset: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
     sink.buffer.items[offset] = 0xaf;
     try countResidualBudgetTrial(testing.allocator, sink.buffer.items, &meta, true);
+}
+
+test "integer owner decoded runs and false sorted hints match the canonical multi-file answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const streaming = @import("writer/streaming.zig");
+    for ([_]bool{ false, true }) |descent| {
+        var sink: streaming.MemorySink = .{ .arena = a };
+        var file = try consumer.AggregateFile.init(a, sink.sink());
+        defer file.deinit();
+        for (0..4) |item| {
+            var keys = [_]i64{ 2, 2, 2, 2 };
+            if (item == 0) keys[0] = 1;
+            if (item == 3) keys[3] = 3;
+            if (descent and item == 2) keys[2] = -1;
+            const values = [_]i64{ 3, -4, 6, 5 };
+            const cols = [_]expr_agg.OutputCol{
+                .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &keys } } },
+                .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &values } } },
+            };
+            try file.append(&cols, keys.len, .SNAPPY, .{}, .{});
+        }
+        _ = try file.finish(&.{
+            .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+            .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+        });
+        const meta = try metadata.open(a, sink.buffer.items);
+        if (descent) for (meta.row_groups.items) |*rg| {
+            var zero: [8]u8 = @splat(0);
+            const st = &rg.columns.items[0].meta_data.?.statistics.?;
+            st.min_value = try a.dupe(u8, &zero);
+            st.max_value = try a.dupe(u8, &zero);
+        };
+        // Two files force a source seam that descends; one file exercises a three-row-group equality chain.
+        const input: Input = .{ .name = "runs.parquet", .bytes = sink.buffer.items };
+        for ([_]usize{ 1, 2 }) |files| {
+            const inputs = [_]Input{ input, input };
+            const metas = [_]schema.FileMetaData{ meta, meta };
+            const base: MultiAggArgs = .{
+                .inputs = inputs[0..files],
+                .metas = metas[0..files],
+                .aggregate = "count(*) AS c, sum(v) AS s",
+                .group_by = "k",
+                .max_memory = 512 << 20,
+                .parallelism = 1,
+                .min_bytes_per_worker = 1,
+                .integer_records = false,
+                .scan_all = true,
+            };
+            var want = try runMultiAggregate(testing.allocator, a, base);
+            defer want.deinit(testing.allocator);
+            for ([_]usize{ 1, 2, 4, 8, 16 }) |j| {
+                var args = base;
+                args.integer_records = true;
+                args.integer_records_min_rows = 0;
+                args.typed_answer = true;
+                args.parallelism = j;
+                args.decode_batch_rows = 2;
+                var got = try runMultiAggregate(testing.allocator, a, args);
+                defer got.deinit(testing.allocator);
+                const stream = got.output.integer_stream.?;
+                const rows = want.output.group_rows.?;
+                try testing.expectEqual(!descent and files == 1, stream.state.runs.len != 0);
+                try testing.expectEqual(rows.len, stream.state.group_count);
+                var window = try stream.window(testing.allocator, got.state.group_col_types.?, 0, rows.len, j);
+                defer window.deinit(testing.allocator);
+                for (rows, 0..) |row, i| for (row, window.columns) |v, col| {
+                    const lane = col.i64;
+                    try testing.expectEqual(v == .null_val, lane.defs.len != 0 and lane.defs[i] == 0);
+                    if (v != .null_val) try testing.expectEqual(v.i, lane.values[i]);
+                };
+            }
+        }
+    }
 }

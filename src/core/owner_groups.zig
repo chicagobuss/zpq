@@ -208,25 +208,33 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             free_next: u32 = 0,
             free_end: u32 = 0,
             run_item: usize = 0,
+            run_stopped: bool = false,
 
             pub fn start(l: *Local, ordinal: u32, item: usize) void {
                 l.ordinal_base = ordinal;
                 l.run_item = item;
+                l.run_stopped = false;
             }
 
             fn appendRun(l: *Local, key: ?Key, value: ?i64, ordinal: u32) void {
+                if (l.run_stopped) return;
                 const s = l.state;
                 const run = &s.runs[l.run_item];
                 if (value == null) l.nulls |= 2;
                 run.rows += 1;
                 const k = key orelse {
+                    l.run_stopped = true;
                     s.run_declined.store(true, .monotonic);
                     return;
                 };
                 if (run.groups != 0) {
                     const prev = &s.groups[run.last];
                     const pk = prev.keyValue().?;
-                    if (k < pk) s.run_declined.store(true, .monotonic);
+                    if (k < pk) {
+                        l.run_stopped = true;
+                        s.run_declined.store(true, .monotonic);
+                        return;
+                    }
                     if (k == pk) {
                         prev.count += 1;
                         if (value) |v| {
@@ -299,6 +307,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
 
             pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
+                if (comptime kind != .count_top and codec == .int64)
+                    if (l.state.runs.len != 0 and l.state.run_declined.load(.monotonic)) return;
                 const k = if (codec == .bytes) view.cols[lookup[l.state.key_col].?].string else view.cols[lookup[l.state.key_col].?].i64;
                 if (!has_value) {
                     for (0..view.num_rows) |i| {
@@ -611,7 +621,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         while (id != none) {
                             const b = &s.blocks[id];
                             if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
-                            for (b.rows[0..b.len]) |r| previous = foldAdjacent(r, s.groups[lo..hi], slots, lo, &n, previous);
+                            for (b.rows[0..b.len]) |r|
+                                previous = foldAdjacent(r, s.groups[lo..hi], slots, lo, &n, previous);
                             id = b.next;
                         }
                     }

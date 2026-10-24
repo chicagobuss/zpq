@@ -6031,7 +6031,27 @@ fn inlineIntegerAnswer(
             c,
             true,
         )) |answer| return answer;
-        return try runIntegerOwner(.sum_top, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, c, false);
+        return try runIntegerOwner(
+            .sum_top,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            n_workers,
+            timings,
+            rows,
+            key.col_idx,
+            value.?,
+            count,
+            starts,
+            c,
+            false,
+        );
     }
     if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
         .full,
@@ -6054,7 +6074,27 @@ fn inlineIntegerAnswer(
         {},
         true,
     )) |answer| return answer;
-    return try runIntegerOwner(.full, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, {}, false);
+    return try runIntegerOwner(
+        .full,
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        outputs,
+        n_workers,
+        timings,
+        rows,
+        key.col_idx,
+        value.?,
+        count,
+        starts,
+        {},
+        false,
+    );
 }
 
 /// Footer bounds select an attempt; every decoded key and every source seam must still prove the order.
@@ -19097,7 +19137,12 @@ test "integer owner decoded runs and false sorted hints match the canonical mult
             const values = [_]i64{ 3, -4, 6, 5 };
             const cols = [_]expr_agg.OutputCol{
                 .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &keys } } },
-                .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &values, .def_levels = &.{ 0, 1, 1, 0 }, .max_def = 1 } } },
+                .{
+                    .name = "v",
+                    .parquet_type = .INT64,
+                    .nullable = true,
+                    .col = .{ .i64 = .{ .values = &values, .def_levels = &.{ 0, 1, 1, 0 }, .max_def = 1 } },
+                },
             };
             try file.append(&cols, keys.len, .SNAPPY, .{}, .{});
         }

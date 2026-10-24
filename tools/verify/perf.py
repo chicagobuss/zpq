@@ -254,8 +254,16 @@ def run_perf(ctx, book, args) -> None:
         return
     rows = json.loads(summary_log.read_text())
     (ctx.run_dir / "scorecard-summary.json").write_text(json.dumps(rows, indent=2) + "\n")
+    runtime = {
+        key: record["counts"][key]
+        for key in ("power_profile", "power_profile_via", "timing_lock")
+        if key in record["counts"]
+    }
     if args.profile != "cold":
-        finished = _finish_status(report, extra={"rows": len(rows), "shipbar": "not applied; in-process is a separate metric"})
+        finished = _finish_status(
+            report,
+            extra={"rows": len(rows), "shipbar": "not applied; in-process is a separate metric", **runtime},
+        )
         record.update(finished)
         commit(record)
         return
@@ -282,6 +290,7 @@ def run_perf(ctx, book, args) -> None:
                 "behind": scored["behind"],
                 "shipbar": "MET" if scored["met"] else "NOT MET",
                 "control_geomean": None if not scored["control"] else round(scored["control"]["geomean"], 3),
+                **runtime,
             },
         )
     )

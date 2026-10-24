@@ -324,9 +324,9 @@ pub const Region = struct {
 /// them back when it is done (`retirePair`): the next query reuses the reserved mappings and whatever pages the kernel
 /// has not yet reclaimed, instead of mapping, faulting and zeroing fresh ones and unmapping them serially at the end.
 /// A retired pair holds no charge on any ledger. It keeps its first `retained_span` as it is (resident, ready for the
-/// next small query without a fault or a system call) and lazily frees what lies past it (MADV_FREE): resident only
-/// until the kernel needs the pages, never committed, and re-touching them is a plain write. At most one pair per CPU
-/// is kept, so idle workers hold at most `retained_span` per CPU; `drainPairs` unmaps them.
+/// next small query without a fault or a system call) and gives back what lies past it at once: lazily freed pages
+/// would stay resident until memory pressure and inflate the peak of whatever the query allocates next. At most one
+/// pair per CPU is kept, so idle workers hold at most `retained_span` per CPU; `drainPairs` unmaps them.
 pub const retained_span: usize = 4 * huge_page_size;
 
 pub const pair_cache = struct {
@@ -381,12 +381,12 @@ pub fn retirePair(pair: *Region.Pair) void {
         return;
     }
     if (arena.budget) |b| b.release(arena.charged);
-    // Keep the first pages as they are; lazily free what the query touched past them.
+    // Keep the first pages as they are; give back what the query touched past them.
     const first = retained_span - arena.phase;
     if (arena.touched > first) {
         const page = std.heap.pageSize();
         const hi = @min(std.mem.alignForward(usize, arena.touched, page), arena.buf.len);
-        lazyFree(@alignCast(arena.buf[first..hi]));
+        release(@alignCast(arena.buf[first..hi]));
     }
     const kept: Region.Pair = .{
         .scratch = .{ .child = std.heap.page_allocator, .allowance = huge_page_size, .buf = pair.scratch.buf },
@@ -421,15 +421,6 @@ pub fn drainPairs() void {
 
 fn currentPid() std.posix.pid_t {
     return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
-}
-
-/// Let the kernel reclaim `span`'s pages whenever it needs them; until then they stay mapped with their contents.
-fn lazyFree(span: []align(std.heap.page_size_min) u8) void {
-    if (builtin.os.tag == .linux) {
-        // MADV_FREE needs Linux 4.5; DONTNEED gives the same contract (contents undefined) eagerly.
-        if (std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.FREE) != 0)
-            _ = std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.DONTNEED);
-    } else release(span);
 }
 
 /// Drop `span`'s pages now. Linux keeps the mapping and its huge-page advice; Darwin's MADV_DONTNEED may keep the

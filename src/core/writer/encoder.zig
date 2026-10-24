@@ -587,7 +587,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     // Dict-encode low-cardinality INT32/INT64 columns. The big win is
     // hourly-rounded timestamp columns (24 unique values per daily
     // shard) where dict crushes DELTA: 1.3 bytes/row vs 4.4.
-    // Cardinality cap: num_present / 10.
+    // Cardinality cap: num_present / 5.
     //
     // FLOAT/DOUBLE columns get the same treatment for the same reason:
     // rounded cost / percentage data is heavily repeated (1M cents in
@@ -839,7 +839,7 @@ fn planCoded(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
             if (T != bool and c.max_rep == 0 and num_present >= 64) dict: {
                 const is_string = T == []const u8;
                 const len_prefix: usize = if (in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY) 0 else 4;
-                const max_cardinality = if (is_string) stringDictMaxEntries(num_present) else num_present / 10;
+                const max_cardinality = if (is_string) stringDictMaxEntries(num_present) else num_present / 5;
                 var dict_bytes: usize = 0;
                 const none = std.math.maxInt(u32);
                 const remap = try arena.alloc(u32, c.dict.len);
@@ -1085,7 +1085,7 @@ fn internColumn(
 /// Generic INT32/INT64 dictionary encoder. Same two-page layout as
 /// tryEncodeDictBytes: PLAIN-encoded dictionary page, then a data
 /// page of RLE/bit-packed indices. Returns null when the dictionary
-/// would exceed `num_present / 10` or when there are fewer than 64
+/// would exceed `num_present / 5` or when there are fewer than 64
 /// present values.
 fn tryEncodeDictInt(
     comptime T: type,
@@ -1106,7 +1106,7 @@ fn tryEncodeDictInt(
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
 
-    const max_cardinality = num_present / 10;
+    const max_cardinality = num_present / 5;
     var dict_keys: std.ArrayList(@Int(.unsigned, @bitSizeOf(T))) = .empty;
     try dict_keys.ensureTotalCapacity(arena, max_cardinality);
     const indices = try arena.alloc(u32, num_present);
@@ -1135,7 +1135,7 @@ fn tryEncodeDictInt(
 /// model where NaN != NaN but each specific NaN bit pattern is its
 /// own entry).
 ///
-/// Cardinality cap = num_present / 10 (as the INT path). Returns null
+/// Cardinality cap = num_present / 5 (as the INT path). Returns null
 /// when the dictionary would exceed the cap or when there are fewer
 /// than 64 present values.
 fn tryEncodeDictFloat(
@@ -1159,7 +1159,7 @@ fn tryEncodeDictFloat(
     const num_present = countPresent(values.len, def_levels, max_def);
     if (num_present < 64) return null;
 
-    const max_cardinality = num_present / 10;
+    const max_cardinality = num_present / 5;
     var dict_values: std.ArrayList(KeyT) = .empty;
     try dict_values.ensureTotalCapacity(arena, max_cardinality);
     const indices = try arena.alloc(u32, num_present);
@@ -3652,4 +3652,59 @@ test "string statistics say whether their bounds were cut; FIXED_LEN_BYTE_ARRAY 
     const back = try schema.Statistics.read(&r);
     try testing.expectEqual(@as(?bool, false), back.is_max_value_exact);
     try testing.expectEqual(@as(?bool, false), back.is_min_value_exact);
+}
+
+test "numeric dictionaries admit a fifth of present rows in hashed and coded columns" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    inline for (.{ i32, i64, f32, f64 }) |T| {
+        const tag = @typeName(T);
+        const physical: schema.Type = if (T == i32) .INT32 else if (T == i64) .INT64 else if (T == f32) .FLOAT else .DOUBLE;
+        for ([_]usize{ 150, 200, 201 }) |cardinality| for ([_]bool{ false, true }) |nullable| {
+            const n: usize = if (nullable) 1250 else 1000;
+            const values = try a.alloc(T, n);
+            const codes = try a.alloc(u32, n);
+            const defs = try a.alloc(u32, n);
+            const dict = try a.alloc(T, cardinality);
+            for (dict, 0..) |*v, i| v.* = if (T == f32 or T == f64) @floatFromInt(i) else @intCast(i);
+            for (values, codes, defs, 0..) |*v, *k, *d, i| {
+                k.* = @intCast(i % cardinality);
+                v.* = dict[k.*];
+                d.* = @intFromBool(i < 1000);
+            }
+            const elem: schema.SchemaElement = .{
+                .name = "v",
+                .type = physical,
+                .type_length = null,
+                .repetition_type = if (nullable) .OPTIONAL else .REQUIRED,
+                .num_children = 0,
+                .scale = null,
+                .precision = null,
+                .field_id = null,
+            };
+            const Col = filter_eval.ColumnT(T);
+            const common: Col = .{
+                .values = values,
+                .def_levels = if (nullable) defs else null,
+                .max_def = @intFromBool(nullable),
+            };
+            var coded = common;
+            coded.values = &.{};
+            coded.codes = codes;
+            coded.dict = dict;
+            const plain = try encodeColumn(a, .{
+                .values = @unionInit(filter_eval.Batch.Column, tag, common),
+                .schema_elem = &elem,
+                .path_in_schema = &.{"v"},
+            });
+            const got = try encodeColumn(a, .{
+                .values = @unionInit(filter_eval.Batch.Column, tag, coded),
+                .schema_elem = &elem,
+                .path_in_schema = &.{"v"},
+            });
+            try testing.expectEqual(cardinality <= 200, plain.meta.dictionary_page_offset != null);
+            try testing.expectEqualSlices(u8, plain.bytes, got.bytes);
+        };
+    }
 }

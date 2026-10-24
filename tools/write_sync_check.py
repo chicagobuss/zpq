@@ -19,7 +19,7 @@ def library_worker(root):
         z.run({'inputs': [str(src)], 'output_url': str(dst), 'fsync': False})
         dst.write_bytes(b'old library answer')
         try:
-            z.run({'inputs': [str(src)], 'output_url': str(dst), 'fsync': True})
+            z.run({'inputs': [str(src)], 'output_url': str(dst)})
             raise AssertionError('injected fdatasync error was missed')
         except zpq.ZpqError as e:
             assert e.response['reason'] == 'InputOutput', e.response
@@ -43,7 +43,7 @@ def main(binary):
                 else:
                     dst.write_bytes(old)
                 p = subprocess.run([*inject, binary, 'query', str(src), '--select', 'v + 1 AS v',
-                                    '--format', fmt, '--fsync', '-o', str(dst)], capture_output=True, timeout=20)
+                                    '--format', fmt, '-o', str(dst)], capture_output=True, timeout=20)
                 assert p.returncode == 1 and b'InputOutput' in p.stderr and not p.stdout, (p.returncode, p.stderr)
                 assert dst.read_bytes() == old if old is not None else not dst.exists()
                 assert not list(root.glob('*.zpq-tmp'))

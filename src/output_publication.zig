@@ -2,8 +2,8 @@
 const std = @import("std");
 const local_fs = @import("local_fs.zig");
 
-// Preserve the existing policy until Joshua selects the shipping default.
-pub const default_fsync = false;
+// Detect delayed writeback errors before publishing a local result.
+pub const default_fsync = true;
 
 var next_id: std.atomic.Value(u64) = .init(0);
 
@@ -131,4 +131,11 @@ test "publication owns its target after the caller releases the request string" 
     const bytes = try local_fs.readFile(t.allocator, expected);
     defer t.allocator.free(bytes);
     try t.expectEqualStrings("answer", bytes);
+}
+
+test "local publication syncs by default and permits an explicit opt out" {
+    const defaults: OutputPublication = .{};
+    const opted_out: OutputPublication = .{ .fsync = false };
+    try std.testing.expect(defaults.fsync);
+    try std.testing.expect(!opted_out.fsync);
 }

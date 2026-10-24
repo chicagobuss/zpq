@@ -321,5 +321,6 @@ Local `output_url` files are staged in an exclusive sibling temporary file and r
 only after a successful write. Failures preserve an existing target and remove staging
 files. The JSON request accepts `"fsync": true` or `"fsync": false` to control syncing
 the output data before rename (the CLI equivalents are `--fsync` and `--no-fsync`).
+Syncing is on by default; use `"fsync": false` or `--no-fsync` to opt out.
 This applies to local files; S3 and standard output do not use this option. The parent
 directory is not synced, so this option does not guarantee rename survival after power loss.

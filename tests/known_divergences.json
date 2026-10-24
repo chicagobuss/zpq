@@ -1,0 +1,34 @@
+{
+  "records": [
+    {
+      "id": "ci/fixtures/parquet/deprecated_stats.parquet",
+      "engine": "duckdb",
+      "class": "stats-order",
+      "reason": "DuckDB prunes on the deprecated min/max pair, which is signed-ordered, for columns whose order is not"
+    },
+    {
+      "id": "ci/fixtures/parquet/column_order.parquet",
+      "engine": "duckdb",
+      "class": "stats-order",
+      "reason": "DuckDB prunes on the bounds of a column whose declared column order it does not implement"
+    },
+    {
+      "id": "ci/fixtures/parquet/nan_stats.parquet",
+      "engine": "duckdb",
+      "class": "stats-order",
+      "reason": "DuckDB trusts float bounds that leave NaN out, both to drop and to keep NaN rows"
+    },
+    {
+      "id": "alltypes_plain/int96:cli-write",
+      "engine": "zpq",
+      "class": "documented-refusal",
+      "reason": "D1 (documented) INT96 re-encoding refused"
+    },
+    {
+      "id": "alltypes_plain/int96:py-write",
+      "engine": "zpq",
+      "class": "documented-refusal",
+      "reason": "D1 (documented) INT96 re-encoding refused"
+    }
+  ]
+}

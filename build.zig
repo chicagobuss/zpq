@@ -73,6 +73,21 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("cli", "Build the CLI binary (zpq)");
     cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
 
+    // Differential referee: JSON cases, in-process zpq, DuckDB CLI as the oracle.
+    const referee = b.addExecutable(.{
+        .name = "referee",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/runner/referee.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zpq", .module = cli_zpq.zpq },
+            },
+        }),
+    });
+    const referee_step = b.step("referee", "Build the in-process differential referee");
+    referee_step.dependOn(&b.addInstallArtifact(referee, .{}).step);
+
     const cli_tests = b.addTest(.{ .root_module = cli_zpq.root });
     const test_cli_step = b.step("test-cli", "Run CLI inspection tests");
     test_cli_step.dependOn(&b.addRunArtifact(cli_tests).step);

@@ -11,6 +11,12 @@ python tools/verify/verify.py soak --hours 10
 python tools/verify/verify.py perf
 ```
 
+`verify stage referee` builds `tools/runner/referee.zig` and runs the
+filter×projection matrix in-process against the DuckDB 2.0 CLI. The cases are
+`tools/runner/cases/filter_projection.json`. Known divergences and declared
+refusals are `tests/known_divergences.json`. This stage is not part of `full`
+until it covers the rest of `tools/differential.py`.
+
 No arguments prints the tiers, every stage, and the exit codes. A run writes
 `summary.json` under `~/code/zpq-wt/verify-v2-out/<run-id>/`. The writer refuses
 to open a directory that already has a summary. A rerun is a new directory;

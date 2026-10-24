@@ -57,6 +57,18 @@ def parse_tests(text):
     return counts
 
 
+def parse_referee(text):
+    found = re.search(r"referee: (\d+)/(\d+) checks match", text)
+    expected = re.search(r"referee: expected (\d+)", text)
+    counts = {}
+    if found:
+        counts["matched"] = int(found.group(1))
+        counts["total"] = int(found.group(2))
+    if expected:
+        counts["expected"] = int(expected.group(1))
+    return counts
+
+
 def parse_modules(text):
     match = _last(r"test-module coverage: (\d+) modules, (\d+) tests", text)
     if not match:
@@ -329,6 +341,23 @@ def stage_modules(ctx: Ctx) -> Cmd:
     return Cmd([ctx.python, "tools/check_test_modules.py"], _base_env(ctx), "test-module coverage", parse=parse_modules)
 
 
+def stage_referee(ctx: Ctx) -> Cmd:
+    duck = Path(ctx.duckdb)
+    shell = (
+        f"{ctx.zigw} build referee && zig-out/bin/referee "
+        f"--cases tools/runner/cases/filter_projection.json "
+        f"--divergences tests/known_divergences.json "
+        f"--duckdb {duck} --pyarrow {ctx.python}"
+    )
+    return Cmd(
+        ["bash", "-c", shell],
+        _base_env(ctx),
+        "in-process filter×projection referee against the DuckDB CLI",
+        blocked=_need(duck, "DuckDB 2.0 CLI"),
+        parse=parse_referee,
+    )
+
+
 def stage_conform(ctx: Ctx) -> Cmd:
     corpus = ctx.repo / "data" / "parquet-testing" / "data"
     return Cmd(
@@ -372,6 +401,7 @@ REGISTRY = [
     ("cross-aarch64-macos", ("full",), lambda ctx: _cross(ctx, "aarch64-macos", None)),
     ("cross-x86_64-macos", ("full",), lambda ctx: _cross(ctx, "x86_64-macos", None)),
     ("release-smoke", ("full",), stage_release_smoke),
+    ("referee", ("extra",), stage_referee),
     ("conform", ("extra",), stage_conform),
     ("triangulate", ("extra",), stage_triangulate),
 ]

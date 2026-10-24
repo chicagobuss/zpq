@@ -1233,6 +1233,8 @@ pub const RecordAdmission = struct {
         byte_sum_top_h,
         byte_count_top_h,
         msd_count_top_h,
+        integer_distinct,
+        byte_distinct,
     },
     reservation: usize,
 };
@@ -4091,6 +4093,19 @@ fn prepareAggregateWithMetas(
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
+    if (!explain) if (try inlineDistinctAnswer(
+        gpa,
+        arena,
+        args,
+        metas,
+        &plan,
+        work_items.items,
+        agg_calls,
+        n_workers,
+        t,
+        false,
+    )) |result| return result;
+
     if (!explain) if (try inlineIntegerAnswer(
         gpa,
         arena,
@@ -4299,7 +4314,18 @@ fn prepareAggregateWithMetas(
     else
         null;
     if (explain) {
-        const record_path = try inlineMsdAnswer(gpa, arena, msd_args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse try inlineIntegerAnswer(gpa, arena, &args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse
+        const record_path = try inlineDistinctAnswer(
+            gpa,
+            arena,
+            args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            n_workers,
+            t,
+            true,
+        ) orelse try inlineMsdAnswer(gpa, arena, msd_args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse try inlineIntegerAnswer(gpa, arena, &args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse
             try inlineByteTopAnswer(
                 gpa,
                 arena,
@@ -6005,6 +6031,153 @@ fn inlineByteAnswer(
         .part_agg = true,
         .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
     };
+}
+
+// Scalar cardinality reuses count-only owner records and the complete partition fold.
+fn inlineDistinctAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    n_workers: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const order = args.result_order;
+    if (args.group_by != null or args.filter != null or !allRescannable(args.inputs) or calls.len != 1 or
+        n_workers > 64 or
+        order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
+        order.hidden.len != 0) return null;
+    const call = calls[0];
+    if (call.func != .count_distinct or call.where != null or call.offset != 0 or call.state or
+        call.result != .i64) return null;
+    const arg = call.arg orelse return null;
+    if (arg != .col_ref) return null;
+    const key = arg.col_ref;
+    const codec: owner_groups.Codec = if (key.physical_type == .INT64 and key.expr_type == .i64 and
+        !key.unsigned_64) .int64 else if (key.physical_type == .BYTE_ARRAY and key.expr_type == .str)
+        .bytes
+    else
+        return null;
+    if (if (codec == .int64) !args.integer_records else !args.byte_records) return null;
+    const threshold = if (codec == .int64) args.integer_records_min_rows else args.byte_records_min_rows;
+    const starts = try arena.alloc(u32, work.len);
+    var rows: usize = 0;
+    var range_known = true;
+    var key_lo: i64 = std.math.maxInt(i64);
+    var key_hi: i64 = std.math.minInt(i64);
+    for (work, starts) |item, *start| {
+        if (rows >= std.math.maxInt(u32)) return null;
+        start.* = @intCast(rows);
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        const cm = rg.columns.items[key.col_idx].meta_data orelse return null;
+        if (meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+        if (codec == .bytes) if (cm.statistics) |st| {
+            for ([_]?[]const u8{ st.min_value, st.max_value, st.min, st.max }) |bound| if (bound) |bytes|
+                if (bytes.len > 15) return null;
+        };
+        const n = rg.num_rows;
+        if (n < 0) return null;
+        rows +|= @intCast(n);
+        if (codec == .int64 and threshold != 0 and n != 0) {
+            const bounds = @import("parquet/statistics.zig").chunkStats(rg, key.col_idx, meta, .corroborated).bounds;
+            if (bounds) |b| {
+                if (b.min.len == 8 and b.max.len == 8) {
+                    key_lo = @min(key_lo, std.mem.readInt(i64, b.min[0..8], .little));
+                    key_hi = @max(key_hi, std.mem.readInt(i64, b.max[0..8], .little));
+                } else range_known = false;
+            } else range_known = false;
+        }
+    }
+    if (rows == 0 or rows < threshold) return null;
+    // A narrow footer range favors D1 even when PLAIN pages make dictionary cardinality unknown.
+    // This only declines the owner attempt; ordinary decoding still validates every value.
+    if (codec == .int64 and threshold != 0 and range_known and key_lo <= key_hi) {
+        const span: u128 = @intCast(@as(i128, key_hi) - key_lo + 1);
+        if (span < rows / 4) return null;
+    }
+    if (threshold != 0) if (ndv.footerEntries(metas, &.{arg})) |guess| if (guess < rows / 4) return null;
+    switch (codec) {
+        inline else => |c| {
+            const Owner = owner_groups.Owner(.count_top, c);
+            if (!owner_groups.admitsRows(c, rows)) return null;
+            const batch_rows = if (args.decode_batch_rows != 0)
+                args.decode_batch_rows
+            else
+                owner_groups.batchRows(args.byte_top_batch_rows);
+            const parts = Owner.partitionCount(rows, n_workers, batch_rows, args.byte_top_partitions);
+            const credit = @sizeOf(AggOutputItem) +| call.alias.len;
+            const quote = Owner.State.reservation(rows, n_workers, parts, 0, credit);
+            if (quote > args.max_memory) return null;
+            if (explain_only) return .{
+                .layout = if (c == .int64) .integer_distinct else .byte_distinct,
+                .reservation = quote,
+            };
+            if (c == .bytes and !try shortSampleMayFit(gpa, args, metas, work, key.col_idx, 15)) return null;
+            const state = (try Owner.State.initCardinality(
+                gpa,
+                args.ledger,
+                rows,
+                n_workers,
+                key.col_idx,
+                parts,
+                credit,
+            )) orelse return null;
+            defer state.deinit();
+            if (args.taken) |taken| taken.insert(.integer_records);
+            const sinks = try arena.alloc(consumer.RecordSink, n_workers);
+            for (sinks, state.locals) |*sink, *local|
+                sink.* = if (c == .int64) .{ .integer_count_top = local } else .{ .byte_count_top = local };
+            var decoded = args;
+            decoded.decode_batch_rows = batch_rows;
+            const t = runRecordWorkers(
+                gpa,
+                arena,
+                decoded,
+                metas,
+                plan,
+                work,
+                calls,
+                &.{arg},
+                sinks,
+                starts,
+                &.{},
+                timings,
+            ) catch |e| {
+                if (state.width_refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+                return e;
+            };
+            const merge_span = profile.Span.begin(profile.threadOf(args.profiler, .main));
+            state.finish() catch |e| return if (e == error.OutOfMemory) error.ExceededMemoryBudget else e;
+            merge_span.end(.merge, profile.args(.{parts}));
+            const alias = gpa.dupe(u8, call.alias) catch return error.ExceededMemoryBudget;
+            errdefer gpa.free(alias);
+            const items = gpa.alloc(AggOutputItem, 1) catch return error.ExceededMemoryBudget;
+            items[0] = .{ .alias = alias, .value = .{ .i = @intCast(state.group_count) } };
+            if (args.ledger != null) state.charged -= credit;
+            for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+            var bytes_in: u64 = 0;
+            for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
+            return .{
+                .files_in = args.inputs.len,
+                .rows_in = @intCast(rows),
+                .rows_scanned = @intCast(rows),
+                .rows_matched = @intCast(rows),
+                .bytes_in = bytes_in,
+                .row_groups_in = work.len,
+                .row_groups_pruned = 0,
+                .row_groups_full_match = work.len,
+                .cols_stat_pruned = plan.cols_stat_pruned,
+                .timings = t,
+                .output = .{ .aggs = items },
+                .state = .{ .accumulators = &.{}, .agg_calls = calls },
+            };
+        },
+    }
 }
 
 fn inlineIntegerAnswer(
@@ -20052,5 +20225,88 @@ test "distinct pairs drain and count complete bitmap states after zero or partia
         var total: u64 = 0;
         for (tables) |table| total += table.accumulators.items[0].count;
         try testing.expectEqual(@as(u64, 320), total);
+    }
+}
+
+test "scalar owner cardinality survives releasing windows and late width refusal through mapped rewind" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |late| {
+        var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+        var file = try consumer.AggregateFile.init(a, sink.sink());
+        defer file.deinit();
+        for (0..16) |rg| {
+            var values: [512][]const u8 = undefined;
+            var defs: [512]u32 = undefined;
+            for (&values, &defs, 0..) |*v, *d, r| {
+                const k = (r + rg * 17) % 128;
+                v.* = if (k == 0) "" else if (k == 1) "a\x00" else try std.fmt.allocPrint(a, "key-{d}", .{k});
+                d.* = @intFromBool(r % 17 != 0);
+            }
+            if (late and rg == 15) values[511] = "late key beyond fifteen bytes";
+            const cols = [_]expr_agg.OutputCol{.{
+                .name = "k",
+                .parquet_type = .BYTE_ARRAY,
+                .nullable = true,
+                .col = .{ .string = .{ .values = &values, .def_levels = &defs, .max_def = 1 } },
+            }};
+            try file.append(&cols, values.len, .SNAPPY, .{}, .{});
+        }
+        _ = try file.finish(&.{.{
+            .name = "k",
+            .parquet_type = .BYTE_ARRAY,
+            .nullable = true,
+            .col = .{ .string = .{ .values = &.{} } },
+        }});
+        const bytes = sink.buffer.items;
+        const meta = try metadata.open(a, bytes);
+        for (meta.row_groups.items) |*rg| rg.columns.items[0].meta_data.?.statistics = null;
+        const mapped = [_]Input{.{ .name = "scalar-distinct.parquet", .bytes = bytes }};
+        var args: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = (&meta)[0..1],
+            .aggregate = "count(DISTINCT k) AS cardinality",
+            .integer_records = false,
+            .byte_records = false,
+            .dense = false,
+            .ndv_policy = false,
+            .plain_rules = false,
+            .scan_all = true,
+            .min_bytes_per_worker = 1,
+            .max_memory = 64 << 20,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch| {
+            var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+            const inputs = [_]Input{window.input(bytes)};
+            args.inputs = &inputs;
+            args.byte_records = true;
+            args.byte_records_min_rows = 0;
+            args.parallelism = j;
+            args.decode_batch_rows = batch;
+            args.start_reads = .{
+                .ctx = &window,
+                .start = ReleasingScanWindow.start,
+                .abandon = ReleasingScanWindow.abandon,
+            };
+            const explanation = try explainAggregate(gpa, a, args);
+            try testing.expectEqual(.byte_distinct, explanation.record_path.?.layout);
+            var got = try runMultiAggregate(gpa, a, args);
+            defer got.deinit(gpa);
+            try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
+            try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+            try testing.expectEqual(@as(usize, @intFromBool(late)), window.abandoned);
+        };
+        // The same remote input without a retained mapping must decline before consuming any records.
+        var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+        var input = window.input(bytes);
+        input.plan_bytes = null;
+        args.inputs = (&input)[0..1];
+        args.start_reads = null;
+        const remote = try explainAggregate(gpa, a, args);
+        try testing.expect(remote.record_path == null);
     }
 }

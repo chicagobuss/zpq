@@ -4,7 +4,8 @@
 //! first-appearance order, and bounded top-H selections ranked by one signed INT64 SUM or by COUNT(*). A key of at
 //! most 16 bytes (15 for top-H) is held inline, with exact length and NULL identity, so NULL, empty and
 //! embedded-zero keys are distinct; a longer key declines the attempt. Every key is complete in one owner partition
-//! before it is folded, ordered or selected.
+//! before it is folded, ordered or selected. A scalar DISTINCT counts the complete non-NULL owners without
+//! retaining groups or merging worker sets.
 const std = @import("std");
 const eval = @import("filter/eval.zig");
 const memory = @import("memory.zig");
@@ -458,6 +459,31 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, 0);
             }
 
+            /// Scalar COUNT DISTINCT finishes complete owner partitions with no retained top-H groups.
+            pub fn initCardinality(
+                a: std.mem.Allocator,
+                ledger: ?*memory.SharedBudget,
+                rows: usize,
+                workers: usize,
+                key_col: usize,
+                parts: usize,
+                output_credit: usize,
+            ) !?*State {
+                comptime std.debug.assert(kind == .count_top);
+                return initMode(
+                    a,
+                    ledger,
+                    rows,
+                    workers,
+                    key_col,
+                    0,
+                    .{ .k = 0, .descending = true },
+                    parts,
+                    output_credit,
+                    0,
+                );
+            }
+
             /// The same full-answer state, filled with decoded run partials instead of hash records. Its ordinary
             /// reservation covers the groups, winners and ordering arrays, and is returned before a declined replay.
             pub fn initRuns(
@@ -493,7 +519,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 if (!admitsRows(codec, rows) or workers == 0 or workers > 64 or parts < 64 or parts > 16384 or
                     !std.math.isPowerOfTwo(parts)) return null;
                 const k: usize = if (kind == .full) 0 else cut.k;
-                if (kind != .full and (k == 0 or k > 1024)) return null;
+                if (kind != .full and (k > 1024 or (kind != .count_top and k == 0))) return null;
                 const charge = reservation(rows, workers, parts, k, output_credit);
                 if (ledger) |l| _ = l.drawExact(charge) orelse return null;
                 const s = a.create(State) catch |e| {
@@ -667,8 +693,14 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     }
                     // Every key is complete in this owner partition before it can be discarded. A worker's top-H
                     // across its completed partitions subsumes every partition's top-H, so their union is sufficient.
-                    for (t.groups[0..n]) |g| s.keep(t.heap.?, g);
-                    t.group_count += n;
+                    var complete = n;
+                    for (t.groups[0..n]) |g| {
+                        if (s.cut.k != 0) s.keep(t.heap.?, g) else {
+                            const is_null = if (codec == .int64) g.first & null_key != 0 else g.key >> 120 == 255;
+                            complete -= @intFromBool(is_null);
+                        }
+                    }
+                    t.group_count += complete;
                 }
             };
 
@@ -1497,5 +1529,52 @@ test "decoded owner COUNT top-H declines NULL and descending keys before selecti
             for (item * 2..item * 2 + 2) |row| try s.locals[item].append(keys[row], {}, @intCast(row));
         }
         try std.testing.expectError(error.RunOrderDeclined, s.finish());
+    }
+}
+
+test "owner cardinality counts complete integer and byte identities once and excludes NULL with failures" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| try ownerCardinalityTrial(std.testing.allocator, j);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ownerCardinalityTrial, .{1});
+}
+
+fn ownerCardinalityTrial(a: std.mem.Allocator, workers: usize) !void {
+    inline for (.{ Codec.int64, Codec.bytes }) |codec| {
+        const O = Owner(.count_top, codec);
+        const rows = 24;
+        var budget: memory.SharedBudget = .{ .limit = 64 << 20 };
+        const state = (try O.State.initCardinality(a, &budget, rows, workers, 0, 64, 0)) orelse
+            return error.TestUnexpectedResult;
+        {
+            defer state.deinit();
+            for (0..rows) |r| {
+                const key = if (codec == .int64) ([_]?i64{
+                    null, std.math.minInt(i64), std.math.maxInt(i64), 0, -1, 1,
+                })[r % 6] else ([_]?[]const u8{
+                    null, "", "a", "a\x00", "\x00", "123456789012345",
+                })[r % 6];
+                try state.locals[r % workers].append(key, {}, @intCast(r));
+            }
+            try state.finish();
+            try std.testing.expectEqual(@as(usize, 5), state.group_count);
+            try std.testing.expectEqual(@as(usize, 0), state.top().len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        const empty = (try O.State.initCardinality(a, &budget, 0, 1, 0, 64, 0)) orelse
+            return error.TestUnexpectedResult;
+        {
+            defer empty.deinit();
+            try empty.finish();
+            try std.testing.expectEqual(@as(usize, 0), empty.group_count);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        const all_null = (try O.State.initCardinality(a, &budget, 8, workers, 0, 64, 0)) orelse
+            return error.TestUnexpectedResult;
+        {
+            defer all_null.deinit();
+            for (0..8) |r| try all_null.locals[r % workers].append(null, {}, @intCast(r));
+            try all_null.finish();
+            try std.testing.expectEqual(@as(usize, 0), all_null.group_count);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     }
 }

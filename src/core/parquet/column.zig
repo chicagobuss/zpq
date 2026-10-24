@@ -563,42 +563,14 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     }
                     const want = @min(num_leaves - written, remaining_in_page);
                     const out = codes[written..][0..want];
-                    const idx = &self.active.rle_dict.indices;
                     const page_has_levels = !self.current_def_all_present and self.hasDefLevels();
                     if (max_def > 0 and def_out == null and page_has_levels) {
                         def_out = try self.arena.alloc(u32, num_leaves);
                         @memset(def_out.?[0..written], max_def);
                     }
-                    if (def_out == null or self.current_def_all_present or !self.hasDefLevels()) {
-                        if (def_out) |dl| @memset(dl[written..][0..want], max_def);
-                        const got = idx.decode(out) catch return error.UnexpectedPage;
-                        if (got != want) return error.UnexpectedPage;
-                        try self.checkCodes(out);
-                    } else {
-                        const src = def_out.?[written..][0..want];
-                        try self.readDefLevels(src);
-                        var num_present: usize = 0;
-                        for (src) |dv| num_present += @intFromBool(dv == max_def);
-                        if (num_present > 0) {
-                            const got = idx.decode(out[0..num_present]) catch return error.UnexpectedPage;
-                            if (got != num_present) return error.UnexpectedPage;
-                            try self.checkCodes(out[0..num_present]);
-                        }
-                        if (num_present != want) {
-                            self.has_nulls = true;
-                            var read: usize = num_present;
-                            var i: usize = want;
-                            while (i > 0) {
-                                i -= 1;
-                                if (src[i] == max_def) {
-                                    read -= 1;
-                                    out[i] = out[read];
-                                } else out[i] = 0;
-                            }
-                        }
-                    }
+                    if (!try self.readPageCodes(out, if (def_out) |dl| dl[written..][0..want] else null))
+                        return error.UnexpectedPage;
                     written += want;
-                    self.current_def_pos += want;
                     continue;
                 }
                 self.resetPageState();
@@ -609,6 +581,48 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const dict = self.dictionary orelse return null;
             const owned: []const T = if (T == []const u8) dict else try self.arena.dupe(T, dict);
             return .{ .codes = .{ .codes = codes, .dict = owned, .def_levels = def_out, .has_nulls = self.has_nulls } };
+        }
+
+        /// Read codes from the active page only. A non-dictionary page declines without consuming a leaf;
+        /// the sliced caller can gather earlier codes and continue through its ordinary value reader.
+        pub fn readPageCodes(self: *Self, out: []u32, def_out: ?[]u32) Error!bool {
+            if (T == bool) return false;
+            if (self.active != .rle_dict or self.dictionary == null) return false;
+            std.debug.assert(out.len <= self.pageValuesLeft());
+            const max_def: u32 = @intCast(self.levels.max_def);
+            std.debug.assert(def_out != null or self.current_def_all_present or !self.hasDefLevels());
+            if (def_out) |d| std.debug.assert(d.len == out.len);
+            const idx = &self.active.rle_dict.indices;
+            if (def_out == null or self.current_def_all_present or !self.hasDefLevels()) {
+                if (def_out) |dl| @memset(dl, max_def);
+                const got = idx.decode(out) catch return error.UnexpectedPage;
+                if (got != out.len) return error.UnexpectedPage;
+                try self.checkCodes(out);
+            } else {
+                const src = def_out.?;
+                try self.readDefLevels(src);
+                var num_present: usize = 0;
+                for (src) |dv| num_present += @intFromBool(dv == max_def);
+                if (num_present > 0) {
+                    const got = idx.decode(out[0..num_present]) catch return error.UnexpectedPage;
+                    if (got != num_present) return error.UnexpectedPage;
+                    try self.checkCodes(out[0..num_present]);
+                }
+                if (num_present != out.len) {
+                    self.has_nulls = true;
+                    var read: usize = num_present;
+                    var i: usize = out.len;
+                    while (i > 0) {
+                        i -= 1;
+                        if (src[i] == max_def) {
+                            read -= 1;
+                            out[i] = out[read];
+                        } else out[i] = 0;
+                    }
+                }
+            }
+            self.current_def_pos += out.len;
+            return true;
         }
 
         pub const HistLeaves = struct {
@@ -2685,6 +2699,23 @@ test "readAllCodes falling back to values skips levels on all-present pages unti
         const levels: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
         var reader = ColumnChunkReader(i64).init(chunk.items, .UNCOMPRESSED, levels, arena);
         const got = (try reader.readAllCodes(n)).?.values;
+        var sliced = ColumnChunkReader(i64).initWithOptions(chunk.items, .UNCOMPRESSED, levels, arena, .{ .any_dictionary = true, .fast_levels = true }, null);
+        sliced.value_budget = n;
+        var done: usize = 0;
+        while (done < n) {
+            if (sliced.pageValuesLeft() == 0) try testing.expect(try sliced.nextPage());
+            const take = @min(7, sliced.pageValuesLeft());
+            var codes: [7]u32 = undefined;
+            var defs: [7]u32 = undefined;
+            try testing.expect(try sliced.readPageCodes(codes[0..take], defs[0..take]));
+            for (0..take) |i| {
+                try testing.expectEqual(want_levels.items[done + i], defs[i]);
+                if (defs[i] != 0)
+                    try testing.expectEqual(want_values.items[done + i], sliced.dictionary.?[codes[i]]);
+            }
+            done += take;
+        }
+
         try testing.expectEqualSlices(i64, want_values.items, got.values);
         if (n_pages == 2) {
             // Every page all-present: no level array at all, meaning level 1 everywhere.

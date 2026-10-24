@@ -19739,7 +19739,7 @@ test "dense composite counts arm globally and preserve selected first through wi
     var names: [256][]const u8 = undefined;
     for (&ints, &names, 0..) |*v, *s, i| {
         v.* = @intCast(i % 3);
-        s.* = if (i % 5 == 0) "a\x00b" else "";
+        s.* = try std.fmt.allocPrint(a, "name\x00-{d}", .{i % 64});
     }
     const columns = [_]expr_agg.OutputCol{
         .{ .name = "a", .col = .{ .i32 = .{ .values = &ints } }, .parquet_type = .INT32, .nullable = false },

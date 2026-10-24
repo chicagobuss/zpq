@@ -1181,6 +1181,13 @@ pub const SliceReader = struct {
         enterChunk(self.site.rg, self.site.column);
         const n = @min(n_want, self.left);
         self.left -= n;
+        if (n != 0 and !self.levels_only and self.dec == null and !self.float16 and !self.int96) {
+            switch (self.raw.*) {
+                inline .i32, .i64, .bytes => |*r| if (r.options.any_dictionary and r.options.encoded)
+                    return self.nextCoded(@TypeOf(r.*).Value, r, a, n),
+                else => {},
+            }
+        }
         if (self.levels_only) {
             const max_def: u32 = @intCast(self.levels.max_def);
             const def = try a.alloc(u32, n);
@@ -1275,6 +1282,56 @@ pub const SliceReader = struct {
                 };
             },
         }
+    }
+
+    fn nextCoded(
+        self: *SliceReader,
+        comptime T: type,
+        r: *column_mod.ColumnChunkReader(T),
+        a: std.mem.Allocator,
+        n: usize,
+    ) !filter_eval.Batch.Column {
+        r.options.fast_levels = true;
+        const codes = try a.alloc(u32, n);
+        const max_def: u32 = @intCast(self.levels.max_def);
+        const def: ?[]u32 = if (max_def > 0) try a.alloc(u32, n) else null;
+        var got: usize = 0;
+        while (got < n) {
+            if (r.pageValuesLeft() == 0) {
+                if (T == []const u8) {
+                    self.resetPages();
+                    r.releaseExpansion();
+                }
+                if (!try r.nextPage()) return error.ShortDecode;
+                if (T == []const u8) try self.holdDictionary(r);
+                continue;
+            }
+            const want = @min(n - got, r.pageValuesLeft());
+            if (!try r.readPageCodes(codes[got..][0..want], if (def) |d| d[got..][0..want] else null)) {
+                const values = try a.alloc(T, n);
+                const dict = r.dictionary;
+                for (0..got) |i| values[i] = if (def != null and def.?[i] < max_def)
+                    if (T == []const u8) "" else 0
+                else
+                    dict.?[codes[i]];
+                r.options.fast_levels = false;
+                const read = if (T == []const u8)
+                    try self.decodeBytes(r, a, values[got..], if (def) |d| d[got..] else null)
+                else
+                    try decodeSome(T, r, values[got..], if (def) |d| d[got..] else null);
+                if (read != n - got) return error.ShortDecode;
+                const col = valuesCol(T, .{
+                    .values = values,
+                    .def_levels = def,
+                    .has_nulls = r.has_nulls,
+                }, self.levels);
+                return @unionInit(filter_eval.Batch.Column, if (T == []const u8) "string" else @typeName(T), col);
+            }
+            got += want;
+        }
+        const dict = r.dictionary orelse return error.DictionaryMissing;
+        const col = codedCol(T, .{ .codes = codes, .def_levels = def, .has_nulls = r.has_nulls }, dict, self.levels);
+        return @unionInit(filter_eval.Batch.Column, if (T == []const u8) "string" else @typeName(T), col);
     }
 
     fn decodeSome(comptime T: type, r: *column_mod.ColumnChunkReader(T), values: []T, def: ?[]u32) !usize {
@@ -3096,6 +3153,13 @@ pub const AggTarget = union(enum) {
         records: ?*const RecordSink = null,
     },
 
+    fn denseKey(self: AggTarget, ci: usize) bool {
+        if (self == .grouped and self.grouped.dense != null) {
+            for (self.grouped.keys) |key| if (key == .col_ref and key.col_ref.col_idx == ci) return true;
+        }
+        return false;
+    }
+
     fn calls(self: AggTarget) []const expr_agg.AggCall {
         return switch (self) {
             inline else => |t| t.calls,
@@ -4280,6 +4344,7 @@ fn scanRGSliced(
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
         var options = decode_options;
+        options.any_dictionary = target.denseKey(ci);
         if (payload) |p| if (p[ci]) {
             options.row_gate = &survivors;
         };
@@ -4556,10 +4621,7 @@ const ChunkDecoder = struct {
             std.debug.assert(self.gate != null);
             decode_options.row_gate = self.gate;
         };
-        decode_options.any_dictionary = switch (self.target) {
-            .grouped => |g| g.dense != null and g.keys[0].col_ref.col_idx == ci,
-            .scalar => false,
-        };
+        decode_options.any_dictionary = self.target.denseKey(ci);
         if (self.target == .grouped) if (self.target.grouped.records) |records| if (records.retention(ci)) |owner| {
             var reader = (try SliceReader.init(a, a, in.rg, in.meta, in.src, ci, decode_options)).?;
             defer reader.deinit();
@@ -9628,4 +9690,151 @@ test "copied INT96 dictionary filters hash raw entries and decline noncanonical 
             for (raw) |v| try std.testing.expect(bloom.Probe.init(bloom.hashBytes(&v)).mightContain(bits));
         }
     }
+}
+
+test "dense key dictionaries keep codes for later keys and bounded slices" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var ints: [256]i32 = undefined;
+    var names: [256][]const u8 = undefined;
+    for (&ints, &names, 0..) |*k, *v, i| {
+        k.* = @intCast(i % 2);
+        v.* = try std.fmt.allocPrint(a, "dictionary-value-{d}", .{i % 64});
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "a", .parquet_type = .INT32, .nullable = false, .col = .{ .i32 = .{ .values = &ints } } },
+        .{ .name = "b", .parquet_type = .BYTE_ARRAY, .nullable = false, .col = .{ .string = .{ .values = &names } } },
+    };
+    var capture: AnswerCapture = .{ .a = a };
+    _ = try writeAggregateRows(a, capture.sink(), &cols, ints.len, .SNAPPY, .{}, .{});
+    const meta = try metadata.open(a, capture.bytes.items);
+    const rg = &meta.row_groups.items[0];
+    const src: RGSrc = .{ .bytes = capture.bytes.items, .byte_origin = 0 };
+    var lanes: agg_dense.Lanes = undefined;
+    const target: AggTarget = .{ .grouped = .{
+        .calls = &.{},
+        .keys = &.{
+            .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } },
+            .{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+        },
+        .dense = &lanes,
+        .table = undefined,
+        .pos_base = 0,
+    } };
+    try testing.expect(target.denseKey(0));
+    try testing.expect(target.denseKey(1));
+    try testing.expect(!target.denseKey(2));
+    const cm = rg.columns.items[1].meta_data.?;
+    const start: usize = @intCast(cm.dictionary_page_offset.?);
+    const chunk = capture.bytes.items[start..][0..@intCast(cm.total_compressed_size)];
+    for ([_]bool{ false, true }) |force| {
+        const options: DecodeOptions = .{ .encoded = true, .any_dictionary = force and target.denseKey(1) };
+        var scratch = DecodeScratch.init(testing.allocator);
+        defer scratch.deinit();
+        const col = (try decodeAggColumnCoded(a, chunk, cm, &meta, options, &scratch)).?;
+        try testing.expectEqual(force, col.codes() != null);
+        if (!force) continue;
+        for ([_]usize{ 1, 17, 64, 256 }) |step| {
+            var reader = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 1, options)).?;
+            defer reader.deinit();
+            var slice = std.heap.ArenaAllocator.init(testing.allocator);
+            defer slice.deinit();
+            var done: usize = 0;
+            while (done < names.len) {
+                _ = slice.reset(.free_all);
+                const got = try reader.next(slice.allocator(), step);
+                const codes = got.codes().?;
+                try testing.expect(got.string.dict.len > names.len / 8);
+                for (codes, 0..) |code, i|
+                    try testing.expectEqualStrings(names[done + i], got.string.dict[code]);
+                done += codes.len;
+            }
+        }
+    }
+    // A slice spanning the dictionary/PLAIN boundary must gather its prefix without rereading pages.
+    var mixed: std.ArrayList(u8) = .empty;
+    var coded_body: std.ArrayList(u8) = .empty;
+    try coded_body.append(a, 1);
+    try coded_body.appendSlice(a, try @import("parquet/encoding/hybrid_rle.zig").encode(a, &.{ 0, 1, 0, 1 }, 1));
+    const dict_values = [_]i32{ 10, 20 };
+    const plain_values = [_]i32{ 30, 40, 50, 60 };
+    const bodies = [_][]const u8{ std.mem.asBytes(&dict_values), coded_body.items, std.mem.asBytes(&plain_values) };
+    for (bodies, 0..) |body, i| {
+        var w = thrift.Writer.init(a);
+        const h: schema.PageHeader = .{
+            .type = if (i == 0) .DICTIONARY_PAGE else .DATA_PAGE,
+            .uncompressed_page_size = @intCast(body.len),
+            .compressed_page_size = @intCast(body.len),
+            .crc = null,
+            .data_page_header_v2 = null,
+            .data_page_header = if (i == 0) null else .{
+                .num_values = 4,
+                .encoding = if (i == 1) .RLE_DICTIONARY else .PLAIN,
+                .definition_level_encoding = .RLE,
+                .repetition_level_encoding = .RLE,
+            },
+            .dictionary_page_header = if (i == 0) .{ .num_values = 2, .encoding = .PLAIN, .is_sorted = null } else null,
+        };
+        try h.write(&w);
+        try mixed.appendSlice(a, w.bytes());
+        try mixed.appendSlice(a, body);
+    }
+    var mixed_rg = rg.*;
+    mixed_rg.columns.items = try a.dupe(schema.ColumnChunk, rg.columns.items);
+    const mixed_cm = &mixed_rg.columns.items[0].meta_data.?;
+    mixed_cm.codec = .UNCOMPRESSED;
+    mixed_cm.dictionary_page_offset = 0;
+    mixed_cm.data_page_offset = 0;
+    mixed_cm.total_compressed_size = @intCast(mixed.items.len);
+    mixed_cm.num_values = 8;
+    const expected = [_]i32{ 10, 20, 10, 20, 30, 40, 50, 60 };
+    for ([_]usize{ 1, 3, 5, 8 }) |step| {
+        var r = (try SliceReader.init(
+            a,
+            testing.allocator,
+            &mixed_rg,
+            &meta,
+            .{ .bytes = mixed.items, .byte_origin = 0 },
+            0,
+            .{ .encoded = true, .any_dictionary = true },
+        )).?;
+        defer r.deinit();
+        var done: usize = 0;
+        while (done < expected.len) {
+            const c = (try r.next(a, step)).i32;
+            const n = if (c.codes) |codes| codes.len else c.values.len;
+            for (0..n) |i| try testing.expectEqual(
+                expected[done + i],
+                if (c.codes) |codes| c.dict[codes[i]] else c.values[i],
+            );
+            done += n;
+        }
+    }
+    const Trial = struct {
+        fn run(gpa: std.mem.Allocator, bytes: []const u8, m: *const schema.FileMetaData) !void {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            var reader = (try SliceReader.init(
+                alloc,
+                gpa,
+                &m.row_groups.items[0],
+                m,
+                .{ .bytes = bytes, .byte_origin = 0 },
+                1,
+                .{ .encoded = true, .any_dictionary = true },
+            )).?;
+            defer reader.deinit();
+            var slice = std.heap.ArenaAllocator.init(gpa);
+            defer slice.deinit();
+            while (reader.left != 0) {
+                _ = slice.reset(.free_all);
+                const c = try reader.next(slice.allocator(), 17);
+                try std.testing.expect(c.codes() != null);
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Trial.run, .{ capture.bytes.items, &meta });
 }

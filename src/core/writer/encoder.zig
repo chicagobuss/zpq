@@ -818,6 +818,8 @@ fn flbaDecimalStats(
         @memcpy(hib, be[16 - width ..]);
         stats.min_value = lob;
         stats.max_value = hib;
+        stats.is_min_value_exact = true;
+        stats.is_max_value_exact = true;
     }
     stats.null_count = nulls;
     return stats;
@@ -1982,6 +1984,8 @@ fn statsTyped(arena: std.mem.Allocator, comptime T: type, values: []const T, def
         .max = max_buf,
         .min_value = min_buf,
         .max_value = max_buf,
+        .is_min_value_exact = true,
+        .is_max_value_exact = true,
         .null_count = null_count,
     };
 }
@@ -2026,6 +2030,8 @@ fn statsTypedFloat(arena: std.mem.Allocator, comptime T: type, values: []const T
         .max = max_buf,
         .min_value = min_buf,
         .max_value = max_buf,
+        .is_min_value_exact = true,
+        .is_max_value_exact = true,
         .null_count = null_count,
         .nan_count = nan_count,
     };
@@ -2146,14 +2152,13 @@ fn statsBytes(
     // Bytewise unsigned is a byte array's type-defined order. The deprecated min/max are defined as signed, so they
     // are left unset rather than written in an order a legacy reader would misread. A cut bound says so, and readers
     // then take it as a bound only (zpq's own full-match proof needs an exact max).
-    const cuts = cut != .none;
     return .{
         .min_value = lo_owned,
         .max_value = hi_owned,
         .null_count = null_count,
-        .is_min_value_exact = if (cuts) lo_cut.len == lo.len else null,
+        .is_min_value_exact = lo_cut.len == lo.len,
         // `cutMax` hands back `hi` itself when it needs no cut.
-        .is_max_value_exact = if (cuts and hi_cut != null) hi_cut.?.ptr == hi.ptr else null,
+        .is_max_value_exact = if (hi_cut) |h| h.ptr == hi.ptr else null,
     };
 }
 
@@ -2182,6 +2187,8 @@ fn statsBool(arena: std.mem.Allocator, values: []const bool, def_levels: ?[]cons
         .max = max_buf,
         .min_value = min_buf,
         .max_value = max_buf,
+        .is_min_value_exact = true,
+        .is_max_value_exact = true,
         .null_count = null_count,
     };
 }
@@ -2194,6 +2201,8 @@ const testing = std.testing;
 const metadata = @import("../parquet/metadata.zig");
 
 fn expectMirroredStats(stats: schema.Statistics) !void {
+    try testing.expectEqual(@as(?bool, true), stats.is_min_value_exact);
+    try testing.expectEqual(@as(?bool, true), stats.is_max_value_exact);
     try testing.expect(stats.min != null);
     try testing.expect(stats.max != null);
     try testing.expect(stats.min_value != null);
@@ -3643,7 +3652,8 @@ test "string statistics say whether their bounds were cut; FIXED_LEN_BYTE_ARRAY 
     const fixed = flbaElem(200, .REQUIRED);
     const flba = computeStats(a, .{ .string = .{ .values = &.{ big, big } } }, null, 0, &fixed).?;
     try testing.expectEqual(@as(usize, 200), flba.max_value.?.len);
-    try testing.expect(flba.is_max_value_exact == null and flba.is_min_value_exact == null);
+    try testing.expectEqual(@as(?bool, true), flba.is_min_value_exact);
+    try testing.expectEqual(@as(?bool, true), flba.is_max_value_exact);
 
     // The flags survive the footer.
     var w: thrift.Writer = .init(a);

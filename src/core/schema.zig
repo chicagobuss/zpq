@@ -817,7 +817,7 @@ pub const Statistics = struct {
     min_value: ?[]const u8 = null,
     /// False means `max_value` (`min_value`) is a cut bound rather than a value present in the chunk: it prunes but
     /// answers nothing. Written back, so a chunk copied byte for byte keeps what its writer said, and set by zpq's own
-    /// writer on every BYTE_ARRAY chunk (`encoder.statsBytes`).
+    /// writer wherever it writes a bound (`encoder.computeStats`).
     is_max_value_exact: ?bool = null,
     is_min_value_exact: ?bool = null,
     /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. The writer counts its own chunks' NaN, and a

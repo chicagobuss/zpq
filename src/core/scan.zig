@@ -18381,3 +18381,20 @@ test "integer owner EXPLAIN admits synthetic rows through the shared 31-bit boun
         }
     }
 }
+
+test "COUNT certificate sample reads real pages across row groups and repeated input files" {
+    const cert = @import("count_certificate.zig");
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const meta = try metadata.open(state.allocator(), bytes);
+    const source: cert.Source = .{ .rg = &meta.row_groups.items[0], .meta = &meta, .src = .{ .bytes = bytes, .byte_origin = 0 } };
+    const sources = [_]cert.Source{ source, source, source };
+    var sample = try cert.sample(testing.allocator, &sources, 1, 1, 4, 4, .{});
+    defer sample.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, @intCast(source.rg.num_rows * 3)), sample.rows);
+    try testing.expect(sample.counts.count() > 0);
+    try testing.expect(sample.fmax >= sample.fmin);
+}

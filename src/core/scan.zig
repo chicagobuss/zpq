@@ -2351,8 +2351,18 @@ fn certifiedTopK(
     cfg: SketchTopK,
     decision: AggregateDispatch,
 ) !void {
-    if (!decision.distinct_census and
-        try hotCertificate(gpa, arena, workers, cursor, tables, calls, order, cfg)) return;
+    if (!decision.distinct_census) {
+        const hot = hotCertificate(gpa, arena, workers, cursor, tables, calls, order, cfg) catch |e| {
+            if (e != error.ExceededMemoryBudget) return e;
+            // The hot trial has released its lanes/cells and restored scan counts before replay owns the tables.
+            try clearWorkerErrors(workers, error.ExceededMemoryBudget);
+            clearTables(gpa, tables);
+            if (cfg.outcome) |o| o.* = .fell_back;
+            try runPhase(workers, cursor);
+            return;
+        };
+        if (hot) return;
+    }
     const k: usize = @intCast(order.offset +| order.limit.?);
     const n_cells = @as(usize, 1) << cfg.cell_bits;
     const sketches = try arena.alloc(expr_agg.CountSketch, workers.len);
@@ -2917,7 +2927,7 @@ fn certifiedResidual(
             }
         }
         runPhase(workers, cursor) catch |e| {
-            if (!plan.distinct or e != error.ExceededMemoryBudget) return e;
+            if (e != error.ExceededMemoryBudget) return e;
             try clearWorkerErrors(workers, error.ExceededMemoryBudget);
             restoreCounts(workers, counted);
             clearTables(gpa, tables);
@@ -18830,4 +18840,173 @@ test "COUNT input-wide sample survives every partial worker start" {
         var it = want.counts.iterator();
         while (it.next()) |entry| try testing.expectEqual(entry.value_ptr.*, got.counts.get(entry.key_ptr.*).?);
     }
+}
+
+fn countResidualBudgetTrial(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    meta: *const schema.FileMetaData,
+    corrupt: bool,
+) !void {
+    defer consumer.setDecodeFailure(null);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inputs = [_]Input{.{ .name = "count-budget.parquet", .bytes = bytes }};
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+    const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2 };
+    const plan = try agg_plan.Plan.init(
+        a,
+        .{ .filter = null, .calls = &calls, .group_keys = &keys },
+        meta[0..1],
+        .ignore,
+    );
+    const columns: agg_plan.Columns = .{ .read = &.{true}, .consumed = &.{true}, .preserve = &.{true} };
+    const work = [_]WorkItem{.{
+        .file = 0,
+        .rg = 0,
+        .agg_start = 0,
+        .agg_len = 1,
+        .columns = columns,
+        .accumulators = &.{},
+    }};
+    var budget: core_memory.SharedBudget = .{ .limit = 4096, .block = 1 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    var tables = [_]expr_agg.GroupTable{expr_agg.GroupTable.init(gpa, 0)};
+    tables[0].shared = &budget;
+    tables[0].fixed_stride = 9;
+    defer tables[0].deinit();
+    var cursor: std.atomic.Value(usize) = .init(0);
+    var workers = [_]Worker{.{
+        .gpa = gpa,
+        .inputs = &inputs,
+        .metas = meta[0..1],
+        .work = &work,
+        .cursor = &cursor,
+        .agg_calls = &calls,
+        .plan = &plan,
+        .decode_options = .{},
+        .group_by_keys = &keys,
+        .group_tables = &tables,
+        .index = 0,
+    }};
+    defer releaseRegions(&workers);
+    var cells = [_]u32{ 0, 0 };
+    var admitted = [_]u64{3};
+    var sketches = [_]expr_agg.CountSketch{.{ .cells = &cells, .shift = 63, .admit = &admitted }};
+    tables[0].sketch = &sketches[0];
+    defer tables[0].sketch = null;
+    var bound: CutBoundPlan = .{ .bound = 0, .cells = &admitted };
+    var outcome: SketchTopK.Outcome = .ineligible;
+    // Retained prefix state and a still-live certificate leave room for a few residual groups, not their growth.
+    // The complete plain table fits this same ledger after the trial releases its reservation.
+    var prefix: [9]u8 = undefined;
+    prefix[0] = 1;
+    std.mem.writeInt(i64, prefix[1..9], 7, .little);
+    tables[0].sketch = null;
+    _ = try tables[0].getOrInsertFixed(&prefix, &calls, 0);
+    tables[0].sketch = &sketches[0];
+    const held = budget.drawExact(budget.available() - 64).?;
+    var retained = true;
+    defer if (retained) budget.release(held);
+    const accepted = certifiedResidual(
+        gpa,
+        a,
+        &workers,
+        &cursor,
+        &tables,
+        &sketches,
+        &.{},
+        &calls,
+        order,
+        0,
+        .{ .outcome = &outcome },
+        &bound,
+    ) catch |err| {
+        if (!corrupt) return err;
+        try testing.expect(consumer.isDecodeError(err));
+        return;
+    };
+    if (corrupt) return error.TestExpectedError;
+    try testing.expect(!accepted);
+    try testing.expectEqual(.fell_back, outcome);
+    try testing.expectEqual(@as(usize, 0), tables[0].groupCount());
+    try testing.expectEqual(held, budget.used.load(.monotonic));
+    try testing.expect(workers[0].err == null);
+    try testing.expectEqual(@as(i64, 0), workers[0].rows_matched);
+    budget.release(held);
+    retained = false;
+    tables[0].sketch = null;
+    try runPhase(&workers, &cursor);
+    var want = try runMultiAggregate(gpa, a, .{
+        .inputs = &inputs,
+        .metas = meta[0..1],
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .max_memory = budget.limit,
+        .parallelism = 1,
+        .scan_all = true,
+        .dense = false,
+        .ndv_policy = false,
+        .plain_rules = false,
+    });
+    defer want.deinit(gpa);
+    const rows = want.output.group_rows.?;
+    try testing.expectEqual(rows.len, tables[0].groupCount());
+    var previous: ?u64 = null;
+    for (rows) |row| {
+        var image: [9]u8 = undefined;
+        image[0] = 1;
+        std.mem.writeInt(i64, image[1..9], @intCast(row[0].i), .little);
+        const id = tables[0].findKey(&image) orelse return error.TestExpectedEqual;
+        const first = tables[0].first.items[id];
+        if (previous) |p| try testing.expect(first > p);
+        previous = first;
+        try testing.expectEqual(row[1].i, @as(i128, tables[0].readAcc(id, 0, 1).count));
+    }
+    try testing.expectEqual(want.rows_matched, workers[0].rows_matched);
+}
+
+test "COUNT residual budget refusal releases trial groups and restores counts before the fitting plain scan" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    const keys = [_]i64{ 7, 3, 7, 9, 3, 7, 11, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
+    const cols = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .parquet_type = .INT64,
+        .nullable = false,
+        .col = .{ .i64 = .{ .values = &keys } },
+    }};
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, keys.len, .SNAPPY, .{}, .{});
+    const meta = try metadata.open(a, sink.buffer.items);
+    try countResidualBudgetTrial(testing.allocator, sink.buffer.items, &meta, false);
+    var fixed: NoInPlaceResize = .{ .child = testing.allocator };
+    try testing.checkAllAllocationFailures(
+        fixed.allocator(),
+        countResidualBudgetTrial,
+        .{ sink.buffer.items, &meta, false },
+    );
+}
+
+test "COUNT residual never turns a real decode failure into a budget fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    const keys = [_]i64{ 1, 2, 1, 3 };
+    const cols = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .parquet_type = .INT64,
+        .nullable = false,
+        .col = .{ .i64 = .{ .values = &keys } },
+    }};
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, keys.len, .SNAPPY, .{}, .{});
+    const meta = try metadata.open(a, sink.buffer.items);
+    const cm = meta.row_groups.items[0].columns.items[0].meta_data.?;
+    const offset: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+    sink.buffer.items[offset] = 0xaf;
+    try countResidualBudgetTrial(testing.allocator, sink.buffer.items, &meta, true);
 }

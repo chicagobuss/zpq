@@ -3,9 +3,10 @@
 One module, `src/core/owner_groups.zig`, groups short byte keys over owned records in complete owner partitions for
 three shapes: an unfiltered `GROUP BY k` with COUNT(*) and one signed INT64 SUM (every group, first-appearance order),
 and the same key with one signed INT64 SUM, or COUNT(*), under `ORDER BY` that aggregate and a bounded LIMIT. A key
-of at most 16 decoded bytes is held inline, zero-padded, with its exact length beside the input ordinal and a NULL
-flag, so empty, embedded-zero, variable-length and NULL keys remain distinct. COUNT top-H owns no value lane: its
-record is the key, ordinal and cached hash (24 bytes, in 512-byte blocks).
+of at most 16 decoded bytes is held inline for full answers, with its length beside the input ordinal and a NULL
+flag. Top-H keys admit at most 15 bytes, reserving the last identity byte for length/NULL. Both layouts distinguish
+empty, embedded-zero, variable-length and NULL keys. COUNT top-H owns no value lane: its record is the key,
+ordinal and cached hash (24 bytes, in 512-byte blocks).
 Decoded bytes establish every identity; metadata or an optional first-page sample may only decline the path.
 
 Each owned record contains the packed identity, signed contribution, input ordinal, value-NULL bit and cached
@@ -23,9 +24,10 @@ unsupported types, wider keys and larger cuts retain the established executor.
 LIMIT 0 also declines this layout, including with a nonzero OFFSET. Outputs reconstructed from removed
 dependent GROUP BY keys use the established executor; packed output reconstruction handles only bare keys.
 
-A key wider than 16 bytes discovered after admission abandons the attempt and replays the established executor
-from the beginning. A late long key can therefore waste nearly a full scan before replay. Footer bounds and the
-bounded first-page sample can decline early, but never replace the check on every decoded key.
+A decoded key wider than the layout's limit (16 bytes for full answers, 15 for top-H) abandons the attempt and
+replays the established executor from the beginning. A late long key can therefore waste nearly a full scan
+before replay. Footer bounds and the bounded first-page sample can decline early, but never replace the check
+on every decoded key.
 
 The upfront ledger quote covers buffered records and worker tail fragmentation, bounded heaps, worker stacks,
 all concurrent scratch high-water marks, and owned output descriptors/keys/names. Group scratch uses at most
@@ -52,4 +54,4 @@ and budget; decoded values, row order and output bytes remain identical.
 `src/core/owner_groups.zig` owns key identity, reservation, buffered partitions, the full answer's first-appearance
 order and the complete-group heaps. The scan owns
 shape admission and copying the final answer, and the ordinary consumer routes decoded batches through its
-indirect record handle. The full-output short-key executor remains separate.
+indirect record handle. Full answers and top-H share this module's codecs, scatter and group state.

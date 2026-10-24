@@ -2,7 +2,7 @@
 //!
 //! One record layout, one scatter and one group state serve every admitted shape: a COUNT(*) + SUM full answer in
 //! first-appearance order, and bounded top-H selections ranked by one signed INT64 SUM or by COUNT(*). A key of at
-//! most 16 bytes is held inline (zero-padded, with its exact length and a NULL bit beside it), so NULL, empty and
+//! most 16 bytes (15 for top-H) is held inline, with exact length and NULL identity, so NULL, empty and
 //! embedded-zero keys are distinct; a longer key declines the attempt. Every key is complete in one owner partition
 //! before it is folded, ordered or selected.
 const std = @import("std");
@@ -16,7 +16,6 @@ const block_claim = 128;
 const none = std.math.maxInt(u32);
 const ordinal_bits = 27;
 const ordinal_mask: u32 = (1 << ordinal_bits) - 1;
-pub const ordinal_limit = 1 << ordinal_bits;
 const present: u32 = 1 << 30;
 const null_key: u32 = 1 << 31;
 const stack_size = 1 << 20;
@@ -68,30 +67,34 @@ inline fn mixKey(bits: u128, len: u32) u64 {
 /// A group's exact state over keys of `KeyBits` (u128 inline bytes, u64 integer bits).
 pub fn GroupOf(comptime KeyBits: type) type {
     return struct {
-    // Eight-byte alignment keeps this state at 40 bytes without narrowing the exact sum.
-    sum: i128 align(8) = 0,
-    key: KeyBits align(8),
-    /// Low 30 bits count rows; high bits mark a present SUM and a NULL key.
-    count: u32,
-    /// Low 27 bits are the minimum input ordinal; high five bits hold the key length.
-    first: u32,
+        const integer = KeyBits == u64;
+        const first_mask: u32 = if (integer) (1 << 31) - 1 else ordinal_mask;
+        const sum_present: u32 = if (integer) 1 << 31 else present;
 
-    pub fn ordinal(g: @This()) u32 {
-        return g.first & ordinal_mask;
-    }
-    pub fn keyBytes(g: *const @This()) ?[]const u8 {
-        return if (g.count & null_key != 0) null else std.mem.asBytes(&g.key)[0 .. g.first >> ordinal_bits];
-    }
-    pub fn countValue(g: @This()) i64 {
-        return g.count & (present - 1);
-    }
-    pub fn sumValue(g: @This()) ?i128 {
-        return if (g.count & present != 0) g.sum else null;
-    }
-    /// An integer key (`Codec.int64`); null for the NULL key.
-    pub fn keyValue(g: @This()) ?i64 {
-        return if (g.count & null_key != 0) null else @bitCast(@as(u64, @truncate(g.key)));
-    }
+        // Eight-byte alignment keeps this state at 40 bytes without narrowing the exact sum.
+        sum: i128 align(8) = 0,
+        key: KeyBits align(8),
+        /// Integer keys: 31 count bits and a SUM-present bit. Byte keys: 30 count bits, SUM-present and key-NULL.
+        count: u32,
+        /// Integer keys: 31 ordinal bits and a key-NULL bit. Byte keys: 27 ordinal bits and five length bits.
+        first: u32,
+
+        pub fn ordinal(g: @This()) u32 {
+            return g.first & first_mask;
+        }
+        pub fn keyBytes(g: *const @This()) ?[]const u8 {
+            return if (g.count & null_key != 0) null else std.mem.asBytes(&g.key)[0 .. g.first >> ordinal_bits];
+        }
+        pub fn countValue(g: @This()) i64 {
+            return g.count & (sum_present - 1);
+        }
+        pub fn sumValue(g: @This()) ?i128 {
+            return if (g.count & sum_present != 0) g.sum else null;
+        }
+        /// An integer key (`Codec.int64`); null for the NULL key.
+        pub fn keyValue(g: @This()) ?i64 {
+            return if (g.first & null_key != 0) null else @bitCast(@as(u64, @truncate(g.key)));
+        }
     };
 }
 comptime {
@@ -113,6 +116,16 @@ fn powerOfTwo(n: usize, lo: usize, hi: usize) usize {
 /// How a key is held: up to 16 bytes inline, or a signed 64-bit integer.
 pub const Codec = enum { bytes, int64 };
 
+/// Exclusive row-count bound shared by admission, EXPLAIN and record construction. Byte keys reserve five
+/// ordinal bits for their length; integer keys use one for NULL and keep the old 31-bit row/count capacity.
+pub fn rowLimit(comptime codec: Codec) usize {
+    return @as(usize, 1) << (if (codec == .int64) @as(u6, 31) else ordinal_bits);
+}
+
+pub fn admitsRows(comptime codec: Codec, rows: usize) bool {
+    return rows < rowLimit(codec);
+}
+
 pub const Full = Owner(.full, .bytes);
 pub const SumTop = Owner(.sum_top, .bytes);
 pub const CountTop = Owner(.count_top, .bytes);
@@ -131,7 +144,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
         pub const Record = if (has_value) extern struct {
             key: KeyBits align(8),
             value: i64,
-            /// Low 27 bits are the ordinal, high five bits the exact key length.
+            /// Integer keys use the full ordinal; byte keys keep their exact length in the high five bits.
             ordinal: u32,
             /// Key NULL, value NULL, then 30 hash bits.
             flags: u32,
@@ -196,6 +209,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             free_end: u32 = 0,
 
             pub fn append(l: *Local, key: ?Key, value: if (has_value) ?i64 else void, ordinal: u32) !void {
+                std.debug.assert(admitsRows(codec, ordinal));
                 // Integer keys: their bits, NULL told apart by its flag (full) or a bit no integer sets (top-H).
                 const bits: KeyBits = if (codec == .int64)
                     (if (key) |k| @bitCast(k) else 0)
@@ -270,26 +284,33 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
         inline fn foldRecord(r: Record, groups: []Group, slots: []u32, base: usize, n: *usize) void {
             const cap = slots.len;
             const kn = r.flags & 1 != 0;
-            const len = r.ordinal >> ordinal_bits;
+            const len = if (codec == .int64) 0 else r.ordinal >> ordinal_bits;
             var pos: usize = (r.flags >> 2) & (cap - 1);
             while (slots[pos] != 0) : (pos = (pos + 1) & (cap - 1)) {
                 const g = &groups[slots[pos] - 1 - base];
-                if (if (!tagged)
+                if (if (codec == .int64)
+                    (g.first & null_key != 0) == kn and (kn or g.key == r.key)
+                else if (!tagged)
                     (g.count & null_key != 0) == kn and (kn or (g.first >> ordinal_bits == len and g.key == r.key))
                 else
                     g.key == r.key) break;
             }
             if (slots[pos] == 0) {
                 slots[pos] = @intCast(base + n.* + 1);
-                groups[n.*] = .{ .key = r.key, .count = if (kn) null_key else 0, .first = r.ordinal };
+                groups[n.*] = .{
+                    .key = r.key,
+                    .count = if (codec == .bytes and kn) null_key else 0,
+                    .first = r.ordinal | (if (codec == .int64 and kn) null_key else @as(u32, 0)),
+                };
                 n.* += 1;
             }
             const g = &groups[slots[pos] - 1 - base];
             g.count += 1;
-            g.first = (g.first & ~ordinal_mask) | @min(g.ordinal(), r.ordinal & ordinal_mask);
+            const mask = Group.first_mask;
+            g.first = (g.first & ~mask) | @min(g.ordinal(), r.ordinal & mask);
             if (has_value and r.flags & 2 == 0) {
                 g.sum += r.value;
-                g.count |= present;
+                g.count |= Group.sum_present;
             }
         }
 
@@ -351,7 +372,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 parts: usize,
                 output_credit: usize,
             ) !?*State {
-                if (rows >= ordinal_limit or workers == 0 or workers > 64 or parts < 64 or parts > 16384 or
+                if (!admitsRows(codec, rows) or workers == 0 or workers > 64 or parts < 64 or parts > 16384 or
                     !std.math.isPowerOfTwo(parts)) return null;
                 const k: usize = if (kind == .full) 0 else cut.k;
                 if (kind != .full and (k == 0 or k > 1024)) return null;
@@ -472,7 +493,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         }
                     }
                     for (s.groups[lo..][0..n], lo..) |g, i| {
-                        if (g.count & present != 0 and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
+                        if (g.sumValue() != null and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
                         s.winners[g.ordinal()] = @intCast(i + 1);
                     }
                     s.counts[p] = n;
@@ -1013,5 +1034,89 @@ test "owned integer SUM top-H retains wide winning and losing sums without outpu
         const g = s.top()[0];
         const value: i128 = if (descending) std.math.maxInt(i64) else std.math.minInt(i64);
         try std.testing.expectEqual(value * 2, g.sumValue().?);
+    }
+}
+
+test "owner row limits preserve the integer 31-bit range and the byte length field" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 1) << 31, rowLimit(.int64));
+    try t.expectEqual(@as(usize, 1) << 27, rowLimit(.bytes));
+    for ([_]usize{ (1 << 27) - 1, 1 << 27, 180_000_000, 1 << 30, (1 << 31) - 1 }) |rows| {
+        try t.expect(admitsRows(.int64, rows));
+    }
+    try t.expect(!admitsRows(.int64, 1 << 31));
+    try t.expect(!admitsRows(.int64, std.math.maxInt(usize)));
+    try t.expect(admitsRows(.bytes, (1 << 27) - 1));
+    try t.expect(!admitsRows(.bytes, 1 << 27));
+    // The restored range must not widen the hot records or group scratch.
+    try t.expectEqual(@as(usize, 24), @sizeOf(IntFull.Record));
+    try t.expectEqual(@as(usize, 32), @sizeOf(IntFull.Group));
+}
+
+test "integer owner execution admits synthetic rows through the shared 31-bit boundary" {
+    inline for (.{ Kind.full, Kind.sum_top }) |kind| {
+        const O = Owner(kind, .int64);
+        // An empty allocator fails at the State object, proving that a valid row count passed admission without
+        // allocating records for that many rows. An out-of-range count must decline before that first allocation.
+        var empty: [0]u8 = .{};
+        var fixed = std.heap.FixedBufferAllocator.init(&empty);
+        const cut = if (kind == .full) {} else Cut{ .k = 7, .descending = true };
+        for ([_]usize{ 1 << 27, 180_000_000, (1 << 31) - 1 }) |rows| {
+            try std.testing.expectError(error.OutOfMemory, O.State.init(
+                fixed.allocator(),
+                null,
+                rows,
+                1,
+                0,
+                1,
+                cut,
+                full_parts,
+                0,
+            ));
+        }
+        try std.testing.expectEqual(@as(?*O.State, null), try O.State.init(
+            fixed.allocator(),
+            null,
+            rowLimit(.int64),
+            1,
+            0,
+            1,
+            cut,
+            full_parts,
+            0,
+        ));
+    }
+}
+
+test "integer owner folding keeps high ordinals and 31-bit counts separate from NULL and SUM flags" {
+    const t = std.testing;
+    inline for (.{ Kind.full, Kind.sum_top }) |kind| {
+        const O = Owner(kind, .int64);
+        var groups: [2]O.Group = undefined;
+        var slots: [8]u32 = @splat(0);
+        var n: usize = 0;
+        const late = (1 << 31) - 2;
+        const early = (1 << 27) + 5;
+        // NULL and zero share a payload, but remain separate even when ordinals set the former length bits.
+        O.foldRecord(.{ .key = 0, .value = 0, .ordinal = late, .flags = 3 }, &groups, &slots, 0, &n);
+        O.foldRecord(.{ .key = 0, .value = -7, .ordinal = early + 1, .flags = 0 }, &groups, &slots, 0, &n);
+        O.foldRecord(.{ .key = 0, .value = 5, .ordinal = early, .flags = 1 }, &groups, &slots, 0, &n);
+        try t.expectEqual(@as(usize, 2), n);
+        try t.expectEqual(@as(?i64, null), groups[0].keyValue());
+        try t.expectEqual(@as(?i64, 0), groups[1].keyValue());
+        try t.expectEqual(@as(u32, early), groups[0].ordinal());
+        try t.expectEqual(@as(u32, early + 1), groups[1].ordinal());
+        try t.expectEqual(@as(?i128, 5), groups[0].sumValue());
+        try t.expectEqual(@as(?i128, -7), groups[1].sumValue());
+        // Seed a synthetic large count to exercise both upper boundaries without allocating a huge input.
+        groups[0].count = O.Group.sum_present | ((1 << 30) - 1);
+        O.foldRecord(.{ .key = 0, .value = 0, .ordinal = late, .flags = 3 }, &groups, &slots, 0, &n);
+        try t.expectEqual(@as(i64, 1) << 30, groups[0].countValue());
+        groups[0].count = O.Group.sum_present | ((1 << 31) - 2);
+        O.foldRecord(.{ .key = 0, .value = 0, .ordinal = late, .flags = 3 }, &groups, &slots, 0, &n);
+        try t.expectEqual((@as(i64, 1) << 31) - 1, groups[0].countValue());
+        try t.expectEqual(@as(?i64, null), groups[0].keyValue());
+        try t.expectEqual(@as(u32, early), groups[0].ordinal());
+        try t.expectEqual(@as(?i128, 5), groups[0].sumValue());
     }
 }

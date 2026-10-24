@@ -5423,7 +5423,7 @@ fn inlineByteTopAnswer(
     const starts = arena.alloc(u32, work.len) catch return null;
     var rows: usize = 0;
     for (work, starts) |item, *start| {
-        if (rows >= 1 << 27) return null;
+        if (!owner_groups.admitsRows(.bytes, rows)) return null;
         start.* = @intCast(rows);
         const rg = &metas[item.file].row_groups.items[item.rg];
         if (rg.num_rows < 0) return null;
@@ -5434,7 +5434,7 @@ fn inlineByteTopAnswer(
                 if (b.len > 15) return null;
         };
     }
-    if (rows < args.byte_records_min_rows or rows >= 1 << 27) return null;
+    if (rows < args.byte_records_min_rows or !owner_groups.admitsRows(.bytes, rows)) return null;
     if (args.byte_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
     const producer_rows = if (args.decode_batch_rows != 0)
@@ -5669,7 +5669,7 @@ fn inlineByteAnswer(
     const starts = try arena.alloc(u32, work.len);
     var rows: usize = 0;
     for (work, starts) |item, *start| {
-        if (rows >= 1 << 27) return null;
+        if (!owner_groups.admitsRows(.bytes, rows)) return null;
         start.* = @intCast(rows);
         const rg = &metas[item.file].row_groups.items[item.rg];
         if (rg.num_rows < 0) return null;
@@ -5680,7 +5680,7 @@ fn inlineByteAnswer(
                 if (b.len > 16) return null;
         };
     }
-    if (rows < args.byte_records_min_rows or rows >= 1 << 27 or
+    if (rows < args.byte_records_min_rows or !owner_groups.admitsRows(.bytes, rows) or
         owner_groups.Full.State.reservation(rows, n_workers, owner_groups.full_parts, 0, 0) > args.max_memory) return null;
     if (args.byte_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
@@ -5818,13 +5818,13 @@ fn inlineIntegerAnswer(
     const starts = try arena.alloc(u32, work.len);
     var rows: usize = 0;
     for (work, starts) |item, *start| {
-        if (rows >= 1 << 31) return null;
+        if (!owner_groups.admitsRows(.int64, rows)) return null;
         start.* = @intCast(rows);
         const n = metas[item.file].row_groups.items[item.rg].num_rows;
         if (n < 0) return null;
         rows +|= @intCast(n);
     }
-    if (rows < args.integer_records_min_rows or rows >= 1 << 31 or
+    if (rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows) or
         integerQuote(rows, n_workers, cut, args) > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
@@ -13997,10 +13997,10 @@ test "inline byte stream matches full rows across workers, windows, allocation a
 fn integerTopRowsTrial(a: std.mem.Allocator) !void {
     var output: AggOutput = .{};
     defer output.deinit(a);
-    // A present SUM (bit 30) and key -7; then a NULL key (bit 31) with no SUM.
+    // Integer groups keep SUM-present in count bit 31 and key-NULL in first bit 31.
     const groups = [_]owner_groups.IntSumTop.Group{
-        .{ .sum = @as(i128, std.math.maxInt(i64)) * 2, .key = @as(u64, @bitCast(@as(i64, -7))), .count = 1 << 30, .first = 0 },
-        .{ .sum = 0, .key = 0, .count = 1 << 31, .first = 1 },
+        .{ .sum = @as(i128, std.math.maxInt(i64)) * 2, .key = @as(u64, @bitCast(@as(i64, -7))), .count = 1 << 31, .first = 0 },
+        .{ .sum = 0, .key = 0, .count = 0, .first = (1 << 31) | 1 },
     };
     const outputs = [_]BoundOutputColumn{
         .{ .name = "s", .source = .{ .agg = 0 } },
@@ -18339,4 +18339,45 @@ test "packed byte SUM with a dependent integer output uses general grouping" {
         try testing.expectEqualDeep(want.output.group_cols.?, got.output.group_cols.?);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     };
+}
+
+test "integer owner EXPLAIN admits synthetic rows through the shared 31-bit boundary" {
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var held = std.heap.ArenaAllocator.init(testing.allocator);
+    defer held.deinit();
+    var meta = try metadata.open(held.allocator(), bytes);
+    meta.row_groups.items.len = 1;
+    const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
+    for ([_]usize{ (1 << 27) - 1, 1 << 27, 180_000_000, (1 << 31) - 1, 1 << 31 }) |rows| {
+        meta.num_rows = @intCast(rows);
+        meta.row_groups.items[0].num_rows = @intCast(rows);
+        for ([_]bool{ false, true }) |top| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .metas = (&meta)[0..1],
+                .aggregate = if (top) "sum(n) AS s" else "count(*) AS c, sum(n) AS s",
+                .group_by = "n",
+                .result_order = if (top) .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 7 } else .{},
+                .typed_answer = true,
+                .integer_records = true,
+                .integer_records_min_rows = 0,
+                .max_memory = std.math.maxInt(usize),
+                .parallelism = 1,
+                .scan_all = true,
+            };
+            const ex = try explainAggregate(testing.allocator, arena.allocator(), args);
+            try testing.expectEqual(owner_groups.admitsRows(.int64, rows), ex.record_path != null);
+            if (ex.record_path) |record| {
+                const expected: @FieldType(RecordAdmission, "layout") = if (top)
+                    .integer_sum_top_h
+                else
+                    .integer_group_stream;
+                try testing.expectEqual(expected, record.layout);
+            }
+        }
+    }
 }

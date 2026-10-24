@@ -3016,7 +3016,8 @@ pub const AggRowGroup = struct {
 pub const RecordSink = union(enum) {
     integer: *integer_groups.Local,
     bytes: *byte_groups.Local,
-    byte_top: *byte_topk.Local,
+    byte_top: *byte_topk.Sum.Local,
+    byte_count_top: *byte_topk.Count.Local,
     msd: *msd_groups.Local,
 
     pub fn start(s: RecordSink, ordinal_base: u32, item: usize) void {

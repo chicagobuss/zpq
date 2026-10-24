@@ -1,7 +1,8 @@
-# Packed byte-key SUM selection
+# Packed byte-key SUM and COUNT selection
 
-Unfiltered single-key `GROUP BY` with one signed INT64 SUM and `ORDER BY` that SUM under a bounded LIMIT can
-keep complete owner partitions and a small answer. The executor accepts at most 15 decoded key bytes, leaving
+Unfiltered single-key `GROUP BY` with one signed INT64 SUM, or with COUNT(*), and `ORDER BY` that aggregate under a
+bounded LIMIT can keep complete owner partitions and a small answer. COUNT owns no value lane: its record is the
+packed identity, input ordinal and cached hash (24 bytes, in 512-byte blocks), and its group a 64-bit count. The executor accepts at most 15 decoded key bytes, leaving
 the low byte of a big-endian u128 for the exact length. The distinct NULL identity uses low byte 255. Empty,
 embedded-zero and variable-length keys therefore remain distinct under one integer equality comparison.
 Decoded bytes establish every identity; metadata or an optional first-page sample may only decline the path.

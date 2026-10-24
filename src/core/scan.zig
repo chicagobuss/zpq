@@ -1213,7 +1213,7 @@ pub const AggregateExplanation = struct {
 };
 
 pub const RecordAdmission = struct {
-    layout: enum { integer_group_stream, integer_sum_top_h, byte_group_stream, byte_sum_top_h, msd_count_top_h },
+    layout: enum { integer_group_stream, integer_sum_top_h, byte_group_stream, byte_sum_top_h, byte_count_top_h, msd_count_top_h },
     reservation: usize,
 };
 
@@ -5398,11 +5398,19 @@ fn inlineByteTopAnswer(
     const key = keys[0].col_ref;
     if (key.physical_type != .BYTE_ARRAY or key.expr_type != .str) return null;
     const call = calls[0];
-    if (call.func != .sum or call.where != null or call.offset != 0 or call.state or call.result != .i64)
-        return null;
-    const value = call.arg orelse return null;
-    if (value != .col_ref or value.col_ref.physical_type != .INT64 or value.col_ref.expr_type != .i64 or
-        value.col_ref.unsigned_64) return null;
+    if (call.where != null or call.offset != 0 or call.state or call.result != .i64) return null;
+    // COUNT(*) has no value lane; SUM needs one signed INT64 column.
+    var value_col: usize = 0;
+    switch (call.func) {
+        .count => if (call.arg != null) return null,
+        .sum => {
+            const value = call.arg orelse return null;
+            if (value != .col_ref or value.col_ref.physical_type != .INT64 or value.col_ref.expr_type != .i64 or
+                value.col_ref.unsigned_64) return null;
+            value_col = value.col_ref.col_idx;
+        },
+        else => return null,
+    }
     const rank = order.keys[0];
     if (rank.column >= outputs.len or outputs[rank.column].source != .agg) return null;
     const h = limit +| order.offset;
@@ -5435,21 +5443,77 @@ fn inlineByteTopAnswer(
         args.decode_batch_rows
     else
         byte_topk.batchRows(args.byte_top_batch_rows);
-    const parts = byte_topk.partitionCount(rows, n_workers, producer_rows, args.byte_top_partitions);
     const output_credit = names_bytes +| @as(usize, @intCast(h)) *|
         (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue) + 15);
-    const quote = byte_topk.State.reservation(rows, n_workers, parts, @intCast(h), output_credit);
+    return switch (call.func) {
+        inline .sum, .count => |func| runByteTop(
+            if (func == .sum) .sum else .count,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            n_workers,
+            timings,
+            explain_only,
+            .{ .key = key, .value_col = value_col, .rows = rows, .h = @intCast(h), .descending = rank.descending, .starts = starts, .producer_rows = producer_rows, .output_credit = output_credit, .names_bytes = names_bytes },
+        ),
+        else => unreachable,
+    };
+}
+
+const ByteTopShape = struct {
+    key: expr_ast.ColRef,
+    value_col: usize,
+    rows: usize,
+    h: usize,
+    descending: bool,
+    starts: []u32,
+    producer_rows: usize,
+    output_credit: usize,
+    names_bytes: usize,
+};
+
+fn runByteTop(
+    comptime kind: byte_topk.Kind,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    n_workers: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+    shape: ByteTopShape,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const Topk = byte_topk.Topk(kind);
+    const key = shape.key;
+    const rows = shape.rows;
+    const starts = shape.starts;
+    const producer_rows = shape.producer_rows;
+    const output_credit = shape.output_credit;
+    const names_bytes = shape.names_bytes;
+    const parts = Topk.partitionCount(rows, n_workers, producer_rows, args.byte_top_partitions);
+    const quote = Topk.State.reservation(rows, n_workers, parts, shape.h, output_credit);
     if (quote > args.max_memory) return null;
-    if (explain_only) return .{ .layout = .byte_sum_top_h, .reservation = quote };
+    if (explain_only) return .{ .layout = if (kind == .sum) .byte_sum_top_h else .byte_count_top_h, .reservation = quote };
     if (!try shortSampleMayFit(gpa, args, metas, work, key.col_idx, 15)) return null;
-    const s = (byte_topk.State.init(
+    const s = (Topk.State.init(
         gpa,
         args.ledger,
         rows,
         n_workers,
         key.col_idx,
-        value.col_ref.col_idx,
-        .{ .k = @intCast(h), .descending = rank.descending },
+        shape.value_col,
+        .{ .k = shape.h, .descending = shape.descending },
         parts,
         output_credit,
     ) catch return null) orelse
@@ -5457,7 +5521,7 @@ fn inlineByteTopAnswer(
     defer s.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = arena.alloc(consumer.RecordSink, n_workers) catch return error.ExceededMemoryBudget;
-    for (sinks, s.locals) |*sink, *local| sink.* = .{ .byte_top = local };
+    for (sinks, s.locals) |*sink, *local| sink.* = if (kind == .sum) .{ .byte_top = local } else .{ .byte_count_top = local };
     var decoded = args;
     decoded.decode_batch_rows = producer_rows;
     const t = runRecordWorkers(
@@ -5527,7 +5591,7 @@ fn inlineByteTopAnswer(
 fn buildByteTopRows(
     gpa: std.mem.Allocator,
     output: *AggOutput,
-    groups: []const byte_topk.Group,
+    groups: anytype,
     outputs: []const BoundOutputColumn,
 ) !usize {
     const rows = try gpa.alloc([]const AggValue, groups.len);
@@ -5548,7 +5612,7 @@ fn buildByteTopRows(
                 owned += bytes.len;
                 break :key .{ .s = copy };
             },
-            .agg => if (g.sumValue()) |v| .{ .i = v } else .null_val,
+            .agg => if (g.rank()) |v| .{ .i = v } else .null_val,
         };
     }
     return owned;
@@ -16897,7 +16961,7 @@ test "worker refusal races replay an earlier corrupt row group in either complet
 fn byteTopRowsTrial(a: std.mem.Allocator) !void {
     var output: AggOutput = .{};
     defer output.deinit(a);
-    const groups = [_]byte_topk.Group{
+    const groups = [_]byte_topk.SumGroup{
         .{ .key = (@as(u128, 'a') << 120) | 2, .sum = @as(i128, std.math.maxInt(i64)) * 2, .first = 0, .flags = 1 },
         .{ .key = 0, .sum = -7, .first = 1, .flags = 1 },
         .{ .key = 255, .first = 2 },
@@ -16906,7 +16970,7 @@ fn byteTopRowsTrial(a: std.mem.Allocator) !void {
         .{ .name = "s", .source = .{ .agg = 0 } },
         .{ .name = "k", .source = .{ .key = 0 } },
     };
-    const owned = try buildByteTopRows(a, &output, &groups, &outputs);
+    const owned = try buildByteTopRows(a, &output, @as([]const byte_topk.SumGroup, &groups), &outputs);
     try testing.expect(owned > 2);
     try testing.expectEqual(groups[0].sum, output.group_rows.?[0][0].i);
     try testing.expectEqualStrings("a\x00", output.group_rows.?[0][1].s);
@@ -18138,6 +18202,63 @@ test "packed byte SUM declines reconstructed outputs before admission" {
         try testing.expect(refused == null);
         out.derived = null;
     }
+}
+
+test "packed byte COUNT top-H answers as the general path, with NULL, empty and embedded-zero keys and ties" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const streaming = @import("writer/streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    const words = [_][]const u8{ "b", "a", "", "a\x00", "zz", "a", "q", "b", "", "r" };
+    const n = 4000;
+    const k = try a.alloc([]const u8, n);
+    const k_def = try a.alloc(u32, n);
+    for (0..n) |i| {
+        // Skewed, with many equal counts at the cut: ties go to first appearance.
+        k[i] = words[(i * 7 + i / 13) % words.len];
+        k_def[i] = @intFromBool(i % 17 != 4);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = k, .def_levels = k_def, .max_def = 1 } } },
+    };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, n, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 8);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 8;
+    const inputs = [_]Input{.{ .name = "count-keys.parquet", .bytes = sink.buffer.items }};
+    for ([_]bool{ true, false }) |descending| for ([_]u64{ 0, 2 }) |offset| {
+        const base: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c",
+            .group_by = "k",
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = descending }}, .limit = 3, .offset = offset },
+        };
+        var want = try runMultiAggregate(testing.allocator, a, base);
+        defer want.deinit(testing.allocator);
+        try want.output.applyResultOrder(testing.allocator, base.result_order);
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 4 << 20, 512 << 20 }) |limit| {
+            var trial = base;
+            trial.byte_records = true;
+            trial.byte_records_min_rows = 0;
+            trial.parallelism = j;
+            trial.max_memory = limit;
+            const explanation = try explainAggregate(testing.allocator, a, trial);
+            const admitted = explanation.record_path != null and explanation.record_path.?.layout == .byte_count_top_h;
+            var got = try runMultiAggregate(testing.allocator, a, trial);
+            defer got.deinit(testing.allocator);
+            try got.output.applyResultOrder(testing.allocator, trial.result_order);
+            // A tight budget declines the layout and answers through the general path.
+            try testing.expectEqual(limit == 512 << 20, admitted);
+            try testing.expectEqualDeep(want.output.group_cols.?, got.output.group_cols.?);
+            try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+        };
+    };
 }
 
 test "packed byte SUM with a dependent integer output uses general grouping" {

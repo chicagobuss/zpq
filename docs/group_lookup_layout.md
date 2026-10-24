@@ -44,3 +44,9 @@ can then stop discovery. The existing slice decoder bounds its read windows even
 budget. Reconciliation compares complete keys and minimum selected ordinals; the complete-input pass then counts
 those keys exactly once. Discovery never supplies partial counts as the answer. HAVING, fallible key expressions,
 order-sensitive folds, gated sources and fallible aggregate calls retain the ordinary route.
+
+COUNT DISTINCT uses the same hash-class membership, residual scan and strict cutoff proof. A class's row count
+bounds every full key's distinct score, including NULL arguments that do not add to that score. If the first
+candidate set cannot prove the cut, one bounded widening pass admits only new classes and retains completed
+exact groups. A failed certificate releases its trial state and replays the ordinary exact route; budget pressure
+in the trial is a reason to decline. The class maps share one filter, with map lookup deciding exact membership.

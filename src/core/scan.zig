@@ -319,7 +319,7 @@ pub const SketchTopK = struct {
     certify: bool = true,
     /// Tests: where the scan went.
     outcome: ?*Outcome = null,
-    /// When the cells bail, try a census of key fingerprints (`countIdentityPlan`) before the plain scan.
+    /// When the cells bail, try a census of key fingerprints (`identityBoundPlan`) before the plain scan.
     census: bool = true,
     /// Tests: whether the census rides along the cell count pass, in place of `keysLookUnique`.
     fuse_census: ?bool = null,
@@ -761,7 +761,7 @@ pub const AggregateDispatch = struct {
     census_allowed: bool,
     census_fused: bool,
     census_cell_repeat_gate: bool = false,
-    /// `count_agg` is a count(DISTINCT) the census certifies (`censusDistinctTopK`), not a COUNT.
+    /// `count_agg` is a count(DISTINCT) the census certifies (`certifiedTopK`), not a COUNT.
     distinct_census: bool = false,
 };
 
@@ -1714,8 +1714,6 @@ const Worker = struct {
     /// Relaxed ordering suffices: this only hands out disjoint indices, and the post-join merge is the real
     /// synchronization edge.
     cursor: *std.atomic.Value(usize),
-    /// Items a census admit pass passes over (`countIdentityPlan`).
-    skip: ?[]const bool = null,
     /// Set once a pass is abandoned (`Census.distinct`): the worker claims no more items.
     stop: ?*const std.atomic.Value(bool) = null,
     /// What a sketch's count pass reads: the outer filter's columns and the keys, no aggregate's (`Plan.forCalls`).
@@ -1951,7 +1949,6 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             release_span = .begin(prof);
             break;
         };
-        if (w.skip) |skip| if (skip[idx]) continue;
         if (table) |gt| if (gt.discoveryDone(expr_agg.firstPosition(idx, 0))) continue;
         errdefer w.failure_work = idx;
         items.* += 1;
@@ -2159,7 +2156,7 @@ fn rankingCall(
     return a_idx;
 }
 
-/// The count(DISTINCT) call a census can certify a cut by (`censusDistinctTopK`): the first sort key is that call,
+/// The count(DISTINCT) call a census can certify a cut by (`certifiedTopK`): the first sort key is that call,
 /// descending, under a LIMIT, over inputs read whole, and a census of every row fits. A key has no more distinct
 /// values than rows, so the census's row counts bound them as they bound a COUNT.
 fn distinctCensusEligible(in: PlanInputs, use_blocks: bool, sketch_fits: bool, filter_ok: bool) ?usize {
@@ -2361,7 +2358,7 @@ fn certifiedTopK(
         t.sketch = null;
     };
     const admit_n = @max(k * cfg.admit_per_row, @min(64, n_cells / 16));
-    // A census (`countIdentityPlan`) rides along the count pass when it fits and the keys look unique (`keysLookUnique`), so
+    // A census (`identityBoundPlan`) rides along the count pass when it fits and the keys look unique (`keysLookUnique`), so
     // cells too even to bound anything need no second count pass. It fills the cells too, and stops early wherever a
     // worker's own cells already separate the cut, as the cells will then do without it.
     var dropped: std.atomic.Value(bool) = .init(false);
@@ -2410,7 +2407,15 @@ fn certifiedTopK(
         if (cfg.trace) std.debug.print("census distinct: count_ms={d} abandoned={}\n", .{
             @divTrunc(t1 - t0, 1_000_000), abandoned,
         });
-        if (!abandoned and try censusDistinctTopK(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg)) return;
+        if (!abandoned) {
+            var bound_plan = try identityBoundPlan(gpa, arena, workers, tables, censuses, calls, order, a_idx, cfg, t1 - t0);
+            for (censuses) |*c| c.deinit();
+            if (bound_plan) |*plan| {
+                defer plan.deinit(gpa);
+                if (try certifiedResidual(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg, plan))
+                    return;
+            }
+        }
         if (abandoned) if (cfg.outcome) |o| {
             o.* = .bailed;
         };
@@ -2441,7 +2446,7 @@ fn certifiedTopK(
         (!decision.census_cell_repeat_gate or censusCellBet(sum, calls.len > 1));
     if (cfg.trace and !viable and decision.census_cell_repeat_gate)
         std.debug.print("certificate: hash_identity_try={}\n", .{census_try});
-    var bound_plan: ?CountBoundPlan = null;
+    var bound_plan: ?CutBoundPlan = null;
     if (census_try) {
         if (!fused or dropped.load(.monotonic)) {
             // The census did not ride along, or a worker's cells misjudged the whole: count again, census only.
@@ -2458,7 +2463,7 @@ fn certifiedTopK(
             for (sketches) |*s| s.census = null;
             if (cfg.trace) std.debug.print("census: recount_ms={d}\n", .{@divTrunc(t1 - t2, 1_000_000)});
         }
-        bound_plan = try countIdentityPlan(gpa, arena, workers, tables, censuses, calls, order, a_idx, cfg, t1 - t0);
+        bound_plan = try identityBoundPlan(gpa, arena, workers, tables, censuses, calls, order, a_idx, cfg, t1 - t0);
     }
     for (censuses) |*c| c.deinit();
     if (viable) {
@@ -2471,7 +2476,7 @@ fn certifiedTopK(
     }
     if (bound_plan) |*plan| {
         defer plan.deinit(gpa);
-        if (try countResidual(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg, plan))
+        if (try certifiedResidual(gpa, arena, workers, cursor, tables, sketches, censuses, calls, order, a_idx, cfg, plan))
             return;
     }
     for (tables) |*t| t.sketch = null;
@@ -2789,26 +2794,29 @@ fn reduceCensus(
 
 /// A producer's excluded-class bound and candidate membership. Cell and identity producers share the same
 /// exact grouping pass and proof. A prefix additionally proves that excluded singleton ties appear later.
-const CountBoundPlan = struct {
+const CutBoundPlan = struct {
     bound: u64,
+    distinct: bool = false,
+    widen: ?struct { identities: expr_agg.FingerprintSet, bound: u64 } = null,
     cells: ?[]u64 = null,
     identities: ?expr_agg.FingerprintSet = null,
     prefix: ?struct { item_rows: []const u64, sure_need: u64, short_need: u64 } = null,
 
-    fn proves(p: CountBoundPlan, score: u64) bool {
+    fn proves(p: CutBoundPlan, score: u64) bool {
         return p.bound == 0 or score > p.bound;
     }
 
-    fn deinit(p: *CountBoundPlan, a: std.mem.Allocator) void {
+    fn deinit(p: *CutBoundPlan, a: std.mem.Allocator) void {
         if (p.cells) |cells| a.free(cells);
         if (p.identities) |*set| {
             set.map.deinit(a);
             a.free(set.filter);
         }
+        if (p.widen) |*more| more.identities.map.deinit(a);
     }
 };
 
-fn countResidual(
+fn certifiedResidual(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     workers: []Worker,
@@ -2820,7 +2828,7 @@ fn countResidual(
     order: expr_ast.ResultOrder,
     a_idx: usize,
     cfg: SketchTopK,
-    plan: *CountBoundPlan,
+    plan: *CutBoundPlan,
 ) !bool {
     const k: usize = @intCast(order.offset +| order.limit.?);
     const counted = try arena.dupe(Worker, workers);
@@ -2857,7 +2865,14 @@ fn countResidual(
                 s.admit = plan.cells.?;
             }
         }
-        try runPhase(workers, cursor);
+        runPhase(workers, cursor) catch |e| {
+            if (!plan.distinct or e != error.ExceededMemoryBudget) return e;
+            try clearWorkerErrors(workers, error.ExceededMemoryBudget);
+            restoreCounts(workers, counted);
+            clearTables(gpa, tables);
+            if (cfg.outcome) |o| o.* = .fell_back;
+            return false;
+        };
         restoreCounts(workers, counted);
         var short = false;
         const proven = if (plan.prefix) |prefix| prefix_proof: {
@@ -2872,7 +2887,15 @@ fn countResidual(
             short = true;
             break :prefix_proof true;
         } else count_proof: {
-            const kth = try kthTotal(arena, tables, calls.len, a_idx, k);
+            const kth = if (plan.distinct)
+                kthDistinct(gpa, arena, tables, calls.len, a_idx, k) catch |e| {
+                    if (e != error.ExceededMemoryBudget) return e;
+                    clearTables(gpa, tables);
+                    if (cfg.outcome) |o| o.* = .fell_back;
+                    return false;
+                }
+            else
+                try kthTotal(arena, tables, calls.len, a_idx, k);
             break :count_proof plan.proves(kth);
         };
         if (cfg.trace) std.debug.print("certificate: residual_ms={d} excluded_bound={d} prefix={} proven={}\n", .{
@@ -2885,6 +2908,14 @@ fn countResidual(
                 .certified;
             return true;
         }
+        if (plan.widen) |more| {
+            // Keep completed exact groups; the next map contains only newly admitted classes.
+            plan.identities.?.map.deinit(gpa);
+            plan.identities = more.identities;
+            plan.bound = more.bound;
+            plan.widen = null;
+            continue;
+        }
         if (cfg.outcome) |o| o.* = .fell_back;
         clearTables(gpa, tables);
         return false;
@@ -2893,7 +2924,62 @@ fn countResidual(
 
 /// Produce a complete hash-class bound and candidate superset; full-key equality is deferred to the shared
 /// residual. Collisions can retain more classes or decline, never exclude a possible winner.
-fn countIdentityPlan(
+/// The filter may contain a superset of bits when two batches share it; full identity lookup still admits only
+/// the map's classes. Separate maps allow widening without counting any previously admitted row twice.
+fn identitySet(
+    gpa: std.mem.Allocator,
+    filter: []u64,
+    classes: []const Repeat,
+) !expr_agg.FingerprintSet {
+    var set: expr_agg.FingerprintSet = .{ .filter = filter, .map = .empty };
+    errdefer set.map.deinit(gpa);
+    try set.map.ensureTotalCapacity(gpa, @intCast(classes.len));
+    for (classes) |class| {
+        set.map.putAssumeCapacity(class.fp, {});
+        const bit = class.fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
+        filter[bit / 64] |= @as(u64, 1) << @intCast(bit % 64);
+    }
+    return set;
+}
+
+fn distinctScorePlan(
+    gpa: std.mem.Allocator,
+    reduced: *const CensusRepeats,
+    item_rows: []const u64,
+    k: usize,
+    cfg: SketchTopK,
+) !?CutBoundPlan {
+    const classes = reduced.repeats.items;
+    const n = @min(classes.len, @max(k *| cfg.admit_per_row, 1));
+    const wider = @min(classes.len, n *| 4);
+    var rows: u64 = 0;
+    for (item_rows) |count| rows += count;
+    var admitted_rows: u64 = 0;
+    for (classes[0..n]) |class| admitted_rows += class.count;
+    if (n < k or admitted_rows *| 4 > rows) return null;
+    const filter = try gpa.alloc(u64, (1 << expr_agg.FingerprintSet.filter_bits) / 64);
+    @memset(filter, 0);
+    var plan: CutBoundPlan = .{
+        .bound = @max(reduced.omitted, if (n < classes.len) classes[n].count else 1),
+        .distinct = true,
+        .identities = identitySet(gpa, filter, classes[0..n]) catch |e| {
+            gpa.free(filter);
+            return e;
+        },
+    };
+    errdefer plan.deinit(gpa);
+    for (classes[n..wider]) |class| admitted_rows += class.count;
+    if (cfg.certify and wider > n and admitted_rows *| 4 <= rows) {
+        const more = try identitySet(gpa, filter, classes[n..wider]);
+        plan.widen = .{
+            .bound = @max(reduced.omitted, if (wider < classes.len) classes[wider].count else 1),
+            .identities = more,
+        };
+    }
+    return plan;
+}
+
+fn identityBoundPlan(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     workers: []Worker,
@@ -2904,18 +2990,21 @@ fn countIdentityPlan(
     a_idx: usize,
     cfg: SketchTopK,
     count_ns: i128,
-) !?CountBoundPlan {
+) !?CutBoundPlan {
     const k: usize = @intCast(order.offset +| order.limit.?);
     const item_rows = censuses[0].item_rows;
     const t1 = nowMonoNs();
     const count_ms = @divTrunc(count_ns, 1_000_000);
 
+    const distinct = calls[a_idx].func == .count_distinct;
     const cap = @max(k *| cfg.admit_per_row *| 64, 1 << 20);
-    var reduced = (try reduceCensus(gpa, arena, workers.len, censuses, @max(k *| cfg.admit_per_row, 1), cap)) orelse {
+    const keep = @max(k *| cfg.admit_per_row, 1) *| @as(usize, if (distinct) 4 else 1);
+    var reduced = (try reduceCensus(gpa, arena, workers.len, censuses, keep, cap)) orelse {
         if (cfg.trace) std.debug.print("census: count_ms={d} repeated>{d}, too many\n", .{ count_ms, cap });
         return null;
     };
     defer reduced.deinit(gpa);
+    if (distinct) return distinctScorePlan(gpa, &reduced, item_rows, k, cfg);
     if (cfg.trace) std.debug.print("census: reduce_ms={d}\n", .{@divTrunc(nowMonoNs() - t1, 1_000_000)});
     const items = reduced.repeats.items;
     const t: u64 = if (items.len >= k) items[k - 1].count else 2;
@@ -2973,105 +3062,6 @@ fn countIdentityPlan(
         .identities = set,
         .prefix = if (prefix) .{ .item_rows = item_rows, .sure_need = sure_need, .short_need = short_need } else null,
     };
-}
-
-/// A count(DISTINCT) cut of `k = offset + limit` groups from the census of a count pass (`Census.distinct`). A key has
-/// no more distinct values than rows, nor more rows than its fingerprint's total, so admitting the most frequent
-/// fingerprints with every row of theirs leaves out only keys whose distinct count is at most `bound`, the largest total
-/// not admitted. The admit pass counts the admitted keys exactly, and when the k-th largest distinct count exceeds
-/// `bound` every key the cut keeps was admitted, ties at the cut included: strictly, as a key left out may tie at
-/// `bound` and appear earlier. Short of that, four times the fingerprints are admitted once, their keys grouped beside
-/// the first ones'. Admitted keys holding over a quarter of the rows, or a bound never beaten, empty the tables and
-/// return false.
-fn censusDistinctTopK(
-    gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
-    workers: []Worker,
-    cursor: *std.atomic.Value(usize),
-    tables: []expr_agg.GroupTable,
-    sketches: []expr_agg.CountSketch,
-    censuses: []expr_agg.Census,
-    calls: []const expr_agg.AggCall,
-    order: expr_ast.ResultOrder,
-    a_idx: usize,
-    cfg: SketchTopK,
-) !bool {
-    const k: usize = @intCast(order.offset +| order.limit.?);
-    const t1 = nowMonoNs();
-    const admit_n = @max(k *| cfg.admit_per_row, 1);
-    const wide_n = admit_n *| 4;
-    var reduced = (try reduceCensus(gpa, arena, workers.len, censuses, wide_n, @max(admit_n *| 64, 1 << 20))) orelse {
-        if (cfg.trace) std.debug.print("census distinct: too many repeats\n", .{});
-        return false;
-    };
-    defer reduced.deinit(gpa);
-    const items = reduced.repeats.items;
-    var total_rows: u64 = 0;
-    for (censuses[0].item_rows) |n| total_rows += n;
-
-    const work = workers[0].work;
-    const skip = try arena.alloc(bool, work.len);
-    const counted = try arena.dupe(Worker, workers);
-    defer for (workers) |*w| {
-        w.skip = null;
-    };
-    const filter = try gpa.alloc(u64, (1 << expr_agg.FingerprintSet.filter_bits) / 64);
-    defer gpa.free(filter);
-    var set: expr_agg.FingerprintSet = .{ .filter = filter, .map = .empty };
-    defer set.map.deinit(gpa);
-    var lo: usize = 0;
-    var hi = @min(items.len, admit_n);
-    var admit_rows: u64 = 0;
-    const certified = while (true) {
-        const bound = @max(reduced.omitted, if (hi < items.len) items[hi].count else 1);
-        for (items[lo..hi]) |r| admit_rows += r.count;
-        if (hi < k or admit_rows *| 4 > total_rows) break false;
-        // Only the fingerprints new to this pass: keys admitted before keep their groups and are not read again.
-        @memset(filter, 0);
-        set.map.clearRetainingCapacity();
-        try set.map.ensureTotalCapacity(gpa, @intCast(hi - lo));
-        @memset(skip, false);
-        for (items[lo..hi]) |r| {
-            set.map.putAssumeCapacity(r.fp, {});
-            const b = r.fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
-            filter[b / 64] |= @as(u64, 1) << @intCast(b % 64);
-        }
-        for (sketches, censuses) |*s, *c| {
-            c.admitted = &set;
-            s.census = c;
-        }
-        for (workers) |*w| w.skip = skip;
-        // The trial's tables and the threshold's copies of their sets are memory the exact scan never holds: a
-        // budget they exceed is the certificate failing, never the query.
-        runPhase(workers, cursor) catch |e| {
-            if (e != error.ExceededMemoryBudget) return e;
-            try clearWorkerErrors(workers, error.ExceededMemoryBudget);
-            if (cfg.trace) std.debug.print("census distinct: trial over budget, exact scan\n", .{});
-            break false;
-        };
-        restoreCounts(workers, counted);
-        const tau = kthDistinct(gpa, arena, tables, calls.len, a_idx, k) catch |e| {
-            if (e != error.ExceededMemoryBudget) return e;
-            if (cfg.trace) std.debug.print("census distinct: trial over budget, exact scan\n", .{});
-            break false;
-        };
-        if (cfg.trace) std.debug.print("census distinct: repeated={d} omitted={d} admit={d} admit_rows={d} bound={d} kth_distinct={d} admit_ms={d}\n", .{
-            items.len, reduced.omitted, hi, admit_rows, bound, tau, @divTrunc(nowMonoNs() - t1, 1_000_000),
-        });
-        if (cfg.certify and tau > bound) break true;
-        if (lo > 0 or hi == items.len) break false;
-        lo = hi;
-        hi = @min(items.len, wide_n);
-    };
-    for (sketches) |*s| s.census = null;
-    if (certified) {
-        if (cfg.outcome) |o| o.* = .census;
-        return true;
-    }
-    if (cfg.outcome) |o| o.* = .fell_back;
-    for (workers) |*w| w.skip = null;
-    clearTables(gpa, tables);
-    return false;
 }
 
 /// The k-th largest count(DISTINCT) of call `a_idx` over the keys of `tables`, each key's values merged across the
@@ -18599,13 +18589,13 @@ test "hot COUNT certificate releases every trial allocation and its ledger charg
 }
 
 test "COUNT certificate exclusion is strict at ties and never trusts a saturated bound" {
-    const finite: CountBoundPlan = .{ .bound = 7 };
+    const finite: CutBoundPlan = .{ .bound = 7 };
     try testing.expect(!finite.proves(6));
     try testing.expect(!finite.proves(7));
     try testing.expect(finite.proves(8));
-    const saturated: CountBoundPlan = .{ .bound = std.math.maxInt(u64) };
+    const saturated: CutBoundPlan = .{ .bound = std.math.maxInt(u64) };
     try testing.expect(!saturated.proves(std.math.maxInt(u64)));
-    const empty: CountBoundPlan = .{ .bound = 0 };
+    const empty: CutBoundPlan = .{ .bound = 0 };
     try testing.expect(empty.proves(0));
 }
 
@@ -18665,4 +18655,32 @@ test "bounded first discovery declines HAVING before choosing its candidate pref
     const having: expr_ast.Having = .{ .null_check = .{ .column = 0, .is_not = true } };
     args.result_order.having = &having;
     try testing.expect(!firstCutEligible(args, &calls, &keys, false, 1, 1));
+}
+
+fn distinctBoundPlanTrial(a: std.mem.Allocator) !void {
+    var classes = [_]Repeat{
+        .{ .fp = 1, .count = 100 }, .{ .fp = 2, .count = 80 }, .{ .fp = 3, .count = 60 },
+        .{ .fp = 4, .count = 40 },  .{ .fp = 5, .count = 20 },
+    };
+    var borrowed = std.ArrayList(Repeat).initBuffer(&classes);
+    borrowed.items = &classes;
+    const reduced: CensusRepeats = .{ .tasks = &.{}, .repeats = borrowed, .omitted = 1 };
+    var plan = (try distinctScorePlan(a, &reduced, &.{4096}, 1, .{ .admit_per_row = 1 })) orelse
+        return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+    try testing.expect(plan.distinct);
+    try testing.expectEqual(@as(u64, 80), plan.bound);
+    try testing.expect(!plan.proves(80));
+    try testing.expect(plan.proves(81));
+    try testing.expect(plan.identities.?.contains(1));
+    try testing.expect(!plan.identities.?.contains(2));
+    const wider = plan.widen.?;
+    try testing.expectEqual(@as(u64, 20), wider.bound);
+    try testing.expect(!wider.identities.contains(1));
+    for (2..5) |fp| try testing.expect(wider.identities.contains(fp));
+    try testing.expect(!wider.identities.contains(5));
+}
+
+test "DISTINCT shares score bounds and widens only to new identities with allocation-safe ownership" {
+    try testing.checkAllAllocationFailures(testing.allocator, distinctBoundPlanTrial, .{});
 }

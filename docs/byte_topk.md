@@ -1,10 +1,11 @@
-# Packed byte-key SUM and COUNT selection
+# Owned byte-key grouping: full answers and SUM/COUNT selection
 
-Unfiltered single-key `GROUP BY` with one signed INT64 SUM, or with COUNT(*), and `ORDER BY` that aggregate under a
-bounded LIMIT can keep complete owner partitions and a small answer. COUNT owns no value lane: its record is the
-packed identity, input ordinal and cached hash (24 bytes, in 512-byte blocks), and its group a 64-bit count. The executor accepts at most 15 decoded key bytes, leaving
-the low byte of a big-endian u128 for the exact length. The distinct NULL identity uses low byte 255. Empty,
-embedded-zero and variable-length keys therefore remain distinct under one integer equality comparison.
+One module, `src/core/owner_groups.zig`, groups short byte keys over owned records in complete owner partitions for
+three shapes: an unfiltered `GROUP BY k` with COUNT(*) and one signed INT64 SUM (every group, first-appearance order),
+and the same key with one signed INT64 SUM, or COUNT(*), under `ORDER BY` that aggregate and a bounded LIMIT. A key
+of at most 16 decoded bytes is held inline, zero-padded, with its exact length beside the input ordinal and a NULL
+flag, so empty, embedded-zero, variable-length and NULL keys remain distinct. COUNT top-H owns no value lane: its
+record is the key, ordinal and cached hash (24 bytes, in 512-byte blocks).
 Decoded bytes establish every identity; metadata or an optional first-page sample may only decline the path.
 
 Each owned record contains the packed identity, signed contribution, input ordinal, value-NULL bit and cached
@@ -22,7 +23,7 @@ unsupported types, wider keys and larger cuts retain the established executor.
 LIMIT 0 also declines this layout, including with a nonzero OFFSET. Outputs reconstructed from removed
 dependent GROUP BY keys use the established executor; packed output reconstruction handles only bare keys.
 
-A key wider than 15 bytes discovered after admission abandons the attempt and replays the established executor
+A key wider than 16 bytes discovered after admission abandons the attempt and replays the established executor
 from the beginning. A late long key can therefore waste nearly a full scan before replay. Footer bounds and the
 bounded first-page sample can decline early, but never replace the check on every decoded key.
 
@@ -48,6 +49,7 @@ Partition counts contribute to the reservation, so cache sizes can change admiss
 boundary. Different hosts may choose the owned-record layout or the established executor for the same query
 and budget; decoded values, row order and output bytes remain identical.
 
-`src/core/byte_topk.zig` owns packing, reservation, buffered partitions and complete-group heaps. The scan owns
+`src/core/owner_groups.zig` owns key identity, reservation, buffered partitions, the full answer's first-appearance
+order and the complete-group heaps. The scan owns
 shape admission and copying the final answer, and the ordinary consumer routes decoded batches through its
 indirect record handle. The full-output short-key executor remains separate.

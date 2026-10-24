@@ -38,8 +38,7 @@ const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const integer_groups = @import("integer_groups.zig");
-const byte_groups = @import("byte_groups.zig");
-const byte_topk = @import("byte_topk.zig");
+const owner_groups = @import("owner_groups.zig");
 const msd_groups = @import("msd_groups.zig");
 const column_mod = @import("parquet/column.zig");
 pub const NdvStat = ndv.Stat;
@@ -4999,7 +4998,7 @@ pub const ByteWindow = struct {
 };
 
 pub const ByteStream = struct {
-    state: *byte_groups.State,
+    state: *owner_groups.Full.State,
     outputs: []const BoundOutputColumn,
     count_call: usize,
 
@@ -5017,7 +5016,7 @@ pub const ByteStream = struct {
         const ids = try s.state.window(a, lo, hi);
         defer a.free(ids);
         const Fill = struct {
-            state: *const byte_groups.State,
+            state: *const owner_groups.Full.State,
             ids: []const u32,
             window: *ByteWindow,
             cursor: *std.atomic.Value(usize),
@@ -5034,7 +5033,7 @@ pub const ByteStream = struct {
                         const g = &f.state.groups[f.ids[i]];
                         const bytes = g.keyBytes();
                         const slot = win.key_bytes[i * 16 ..][0..16];
-                        slot.* = g.key;
+                        slot.* = std.mem.toBytes(g.key);
                         win.key_values[i] = slot[0..if (bytes) |b| b.len else 0];
                         if (win.key_defs.len != 0) {
                             win.key_defs[i] = @intFromBool(bytes != null);
@@ -5442,12 +5441,12 @@ fn inlineByteTopAnswer(
     const producer_rows = if (args.decode_batch_rows != 0)
         args.decode_batch_rows
     else
-        byte_topk.batchRows(args.byte_top_batch_rows);
+        owner_groups.batchRows(args.byte_top_batch_rows);
     const output_credit = names_bytes +| @as(usize, @intCast(h)) *|
         (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue) + 15);
     return switch (call.func) {
         inline .sum, .count => |func| runByteTop(
-            if (func == .sum) .sum else .count,
+            if (func == .sum) .sum_top else .count_top,
             gpa,
             arena,
             args,
@@ -5479,7 +5478,7 @@ const ByteTopShape = struct {
 };
 
 fn runByteTop(
-    comptime kind: byte_topk.Kind,
+    comptime kind: owner_groups.Kind,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     args: MultiAggArgs,
@@ -5494,7 +5493,7 @@ fn runByteTop(
     comptime explain_only: bool,
     shape: ByteTopShape,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
-    const Topk = byte_topk.Topk(kind);
+    const Topk = owner_groups.Owner(kind);
     const key = shape.key;
     const rows = shape.rows;
     const starts = shape.starts;
@@ -5504,7 +5503,7 @@ fn runByteTop(
     const parts = Topk.partitionCount(rows, n_workers, producer_rows, args.byte_top_partitions);
     const quote = Topk.State.reservation(rows, n_workers, parts, shape.h, output_credit);
     if (quote > args.max_memory) return null;
-    if (explain_only) return .{ .layout = if (kind == .sum) .byte_sum_top_h else .byte_count_top_h, .reservation = quote };
+    if (explain_only) return .{ .layout = if (kind == .sum_top) .byte_sum_top_h else .byte_count_top_h, .reservation = quote };
     if (!try shortSampleMayFit(gpa, args, metas, work, key.col_idx, 15)) return null;
     const s = (Topk.State.init(
         gpa,
@@ -5521,7 +5520,7 @@ fn runByteTop(
     defer s.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = arena.alloc(consumer.RecordSink, n_workers) catch return error.ExceededMemoryBudget;
-    for (sinks, s.locals) |*sink, *local| sink.* = if (kind == .sum) .{ .byte_top = local } else .{ .byte_count_top = local };
+    for (sinks, s.locals) |*sink, *local| sink.* = if (kind == .sum_top) .{ .byte_top = local } else .{ .byte_count_top = local };
     var decoded = args;
     decoded.decode_batch_rows = producer_rows;
     const t = runRecordWorkers(
@@ -5563,7 +5562,7 @@ fn runByteTop(
             .source = if (out.source == .key) leafSchemaElem(&metas[0], key.col_idx) else null,
         };
     }
-    const answer_bytes = buildByteTopRows(gpa, &output, s.top(), outputs) catch |e|
+    const answer_bytes = buildByteTopRows(kind, gpa, &output, s.top(), outputs) catch |e|
         return if (e == error.OutOfMemory) error.ExceededMemoryBudget else e;
     const owned = answer_bytes +| names_bytes;
     if (owned > s.output_credit) return error.ExceededMemoryBudget;
@@ -5589,9 +5588,10 @@ fn runByteTop(
 }
 
 fn buildByteTopRows(
+    comptime kind: owner_groups.Kind,
     gpa: std.mem.Allocator,
     output: *AggOutput,
-    groups: anytype,
+    groups: []const owner_groups.Group,
     outputs: []const BoundOutputColumn,
 ) !usize {
     const rows = try gpa.alloc([]const AggValue, groups.len);
@@ -5601,18 +5601,17 @@ fn buildByteTopRows(
     @memset(slab, .null_val);
     output.slab = slab;
     var owned = groups.len * (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue));
-    for (groups, rows, 0..) |g, *row, i| {
+    for (groups, rows, 0..) |*g, *row, i| {
         const cells = slab[i * outputs.len ..][0..outputs.len];
         row.* = cells;
         for (outputs, cells) |out, *cell| cell.* = switch (out.source) {
             .key => key: {
-                var storage: [16]u8 = undefined;
-                const bytes = g.keyBytes(&storage) orelse break :key .null_val;
+                const bytes = g.keyBytes() orelse break :key .null_val;
                 const copy = try gpa.dupe(u8, bytes);
                 owned += bytes.len;
                 break :key .{ .s = copy };
             },
-            .agg => if (g.rank()) |v| .{ .i = v } else .null_val,
+            .agg => if (owner_groups.Owner(kind).rank(g.*)) |v| .{ .i = v } else .null_val,
         };
     }
     return owned;
@@ -5683,12 +5682,12 @@ fn inlineByteAnswer(
         };
     }
     if (rows < args.byte_records_min_rows or rows >= 1 << 27 or
-        byte_groups.State.reservation(rows) > args.max_memory) return null;
+        owner_groups.Full.State.reservation(rows, n_workers, owner_groups.full_parts, 0, 0) > args.max_memory) return null;
     if (args.byte_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
-    if (explain_only) return .{ .layout = .byte_group_stream, .reservation = byte_groups.State.reservation(rows) };
+    if (explain_only) return .{ .layout = .byte_group_stream, .reservation = owner_groups.Full.State.reservation(rows, n_workers, owner_groups.full_parts, 0, 0) };
     if (!try byteSampleMayFit(gpa, args, metas, work, key.col_idx)) return null;
-    const state = (try byte_groups.State.init(gpa, args.ledger, rows, n_workers, key.col_idx, value.?)) orelse
+    const state = (try owner_groups.Full.State.init(gpa, args.ledger, rows, n_workers, key.col_idx, value.?, {}, owner_groups.full_parts, 0)) orelse
         return null;
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
@@ -5713,7 +5712,7 @@ fn inlineByteAnswer(
     };
     const prof = profile.threadOf(args.profiler, .main);
     const begin = nowMonoNs();
-    try state.finish(n_workers);
+    try state.finish();
     const scatter_end = begin + @as(i64, @intCast(state.partition_ns));
     const fold_end = scatter_end + @as(i64, @intCast(state.fold_ns));
     const release_end = fold_end + @as(i64, @intCast(state.release_ns));
@@ -13861,7 +13860,7 @@ test "inline records decline released remote windows and retry only through a re
         const explanation = try explainAggregate(gpa, a, args);
         const expected: RecordAdmission = .{
             .layout = if (bytes_key) .byte_group_stream else .integer_group_stream,
-            .reservation = if (bytes_key) byte_groups.State.reservation(n) else integer_groups.State.reservation(n),
+            .reservation = if (bytes_key) owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0) else integer_groups.State.reservation(n),
         };
         try testing.expectEqual(expected, explanation.record_path.?);
     }
@@ -16965,16 +16964,17 @@ test "worker refusal races replay an earlier corrupt row group in either complet
 fn byteTopRowsTrial(a: std.mem.Allocator) !void {
     var output: AggOutput = .{};
     defer output.deinit(a);
-    const groups = [_]byte_topk.SumGroup{
-        .{ .key = (@as(u128, 'a') << 120) | 2, .sum = @as(i128, std.math.maxInt(i64)) * 2, .first = 0, .flags = 1 },
-        .{ .key = 0, .sum = -7, .first = 1, .flags = 1 },
-        .{ .key = 255, .first = 2 },
+    // Present SUMs (bit 30); key lengths in the high ordinal bits; bit 31 is a NULL key.
+    const groups = [_]owner_groups.Group{
+        .{ .key = 'a', .sum = @as(i128, std.math.maxInt(i64)) * 2, .count = 1 << 30, .first = 0 | 2 << 27 },
+        .{ .key = 0, .sum = -7, .count = 1 << 30, .first = 1 },
+        .{ .key = 0, .count = 1 << 31, .first = 2 },
     };
     const outputs = [_]BoundOutputColumn{
         .{ .name = "s", .source = .{ .agg = 0 } },
         .{ .name = "k", .source = .{ .key = 0 } },
     };
-    const owned = try buildByteTopRows(a, &output, @as([]const byte_topk.SumGroup, &groups), &outputs);
+    const owned = try buildByteTopRows(.sum_top, a, &output, &groups, &outputs);
     try testing.expect(owned > 2);
     try testing.expectEqual(groups[0].sum, output.group_rows.?[0][0].i);
     try testing.expectEqualStrings("a\x00", output.group_rows.?[0][1].s);

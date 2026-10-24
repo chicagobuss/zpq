@@ -11560,6 +11560,8 @@ test "unaliased aggregates keep the function name unless it clashes, then take t
 }
 
 test "page-pruned row groups decode just their kept rows, with the answers of whole columns" {
+    const prior_compact = consumer.compact_rows_in_tests;
+    defer consumer.compact_rows_in_tests = prior_compact;
     // Tiny pages with a page index, dictionary and plain encoded, nullable columns of every common type.
     const files = [_][]const u8{
         "data/parquet-testing/data/alltypes_tiny_pages.parquet",
@@ -11623,6 +11625,8 @@ test "page-pruned row groups decode just their kept rows, with the answers of wh
 }
 
 test "page-pruned DECIMAL and INT96 columns decode whole and answer as with compaction off" {
+    const prior_compact = consumer.compact_rows_in_tests;
+    defer consumer.compact_rows_in_tests = prior_compact;
     // INT32/INT64/FLBA-backed DECIMAL(9/18/38) and INT96, required and optional, behind a page index: their exact
     // decoders read whole chunks, so a row group reading them decodes whole columns rather than compacting.
     const fixture = "ci/fixtures/parquet/decimal_int96_page_index.parquet";

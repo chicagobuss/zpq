@@ -4488,7 +4488,7 @@ fn prepareAggregateWithMetas(
     if (dense_wanted) dense: {
         const d = &domain.?;
         const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls, ndv_stat.?.rows);
-        if (!rescannable) break :dense;
+        if (!rescannable or d.ids() > agg_dense.max_ids) break :dense;
         if (spill_on or pairs_call != null or n_workers *| d.ids() > d.entries()) break :dense;
         dense_table_charge = agg_dense.tableBytes(d.ids(), fixed_stride, agg_calls.len);
         dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes +| dense_table_charge) orelse break :dense;

@@ -1,16 +1,11 @@
 //! Dense GROUP BY over a retained exact key domain.
 //!
-//! The planner's dictionary union (`ndv.unionBound`) decodes every dictionary of a lone integer key to bound its
-//! distinct values. When asked, it also keeps what it found: each distinct value once, under a global id, and for
-//! every row group a translation from its dictionary codes to those ids. A scan worker then folds a row group into
-//! accumulators indexed by global id (`Lanes`) through the same per-composite folds `agg_coded.groupedCoded` runs, with
-//! the translation standing where the composite-to-group map would be: no key is serialized or looked up per row
-//! group, and the workers' lanes merge by index instead of through a hash merge.
+//! The planner's dictionary union can retain value-equal axes and their per-row-group code translations. Workers
+//! fold an admitted domain by global ID, so keys are not serialized or resolved again for every row group.
 //!
-//! Exact because identity is by value: a row group's dictionary is checked entry for entry against the domain before
-//! its codes are trusted, and one that differs (or lacks a translation) folds through the worker's table as before.
-//! Unused dictionary entries leave their lanes untouched, so only ids some selected row reached become groups, at the
-//! least position any worker saw them, exactly as a merged table would hold them.
+//! Every dictionary is checked against its translation before consumption. A missing or mismatched dictionary uses
+//! the ordinary worker table; those partials join the lanes before final ranking. Unused entries stay untouched,
+//! and each reached ID retains its least selected ordinal. String values are owned independently of reader windows.
 
 const std = @import("std");
 const agg = @import("agg.zig");
@@ -25,35 +20,42 @@ const AggCall = agg.AggCall;
 const Column = filter_eval.Batch.Column;
 const Sel = filter_selection.SelectionVector;
 
-/// Largest domain kept, nulls' id included: the lanes are walked whole at the merge.
+/// Largest retained axis and largest product folded globally, including NULL slots: lanes are walked at merge.
 pub const max_ids: usize = 1 << 20;
 const unseen = std.math.maxInt(u64);
 
-/// The distinct values of a lone INT32/INT64 key over every row group, as raw 64-bit patterns (INT32 sign-extended,
-/// as the union reads it), and each row group's code-to-id translation. Id `values.len` is the null key.
-pub const Domain = struct {
-    values: []u64,
-    int32: bool,
-    /// Per row group, in (file, row group) order: one id per dictionary entry, then the null id.
+/// One exact value domain. Dictionary codes are local; these owned values and translations establish identity.
+pub const Axis = struct {
+    values: union(enum) { int32: []u64, int64: []u64, bytes: [][]u8 },
     trans: [][]u32,
-    /// Index into `trans` of each file's first row group.
     file_base: []usize,
-    /// Bytes `values` and `trans` hold.
     bytes: usize,
 
-    pub fn deinit(d: *Domain, gpa: std.mem.Allocator) void {
+    pub fn len(d: *const Axis) usize {
+        return switch (d.values) {
+            inline else => |v| v.len,
+        };
+    }
+
+    pub fn ids(d: *const Axis) usize {
+        return d.len() + 1;
+    }
+
+    pub fn deinit(d: *Axis, gpa: std.mem.Allocator) void {
         for (d.trans) |t| gpa.free(t);
         gpa.free(d.trans);
         gpa.free(d.file_base);
-        gpa.free(d.values);
+        switch (d.values) {
+            .bytes => |v| {
+                for (v) |key| gpa.free(key);
+                gpa.free(v);
+            },
+            inline else => |v| gpa.free(v),
+        }
         d.* = undefined;
     }
 
-    pub fn ids(d: *const Domain) usize {
-        return d.values.len + 1;
-    }
-
-    pub fn forRowGroup(d: *const Domain, file: usize, rg: usize) ?[]const u32 {
+    pub fn forRowGroup(d: *const Axis, file: usize, rg: usize) ?[]const u32 {
         if (file >= d.file_base.len) return null;
         const i = d.file_base[file] + rg;
         const end = if (file + 1 < d.file_base.len) d.file_base[file + 1] else d.trans.len;
@@ -61,10 +63,76 @@ pub const Domain = struct {
         return if (d.trans[i].len == 0) null else d.trans[i];
     }
 
-    /// Entries the translations hold over all row groups: what grouping by code resolves, one group lookup each.
+    pub fn sameDictionary(d: *const Axis, col: Column, trans: []const u32) bool {
+        if (trans.len != col.dictLen() + 1 or trans[trans.len - 1] != d.len()) return false;
+        switch (d.values) {
+            .int64 => |values| {
+                if (col != .i64) return false;
+                for (col.i64.dict, trans[0..col.dictLen()]) |v, id|
+                    if (id >= values.len or values[id] != @as(u64, @bitCast(v))) return false;
+            },
+            .int32 => |values| {
+                if (col != .i32) return false;
+                for (col.i32.dict, trans[0..col.dictLen()]) |v, id|
+                    if (id >= values.len or values[id] != @as(u64, @bitCast(@as(i64, v)))) return false;
+            },
+            .bytes => |values| {
+                if (col != .string) return false;
+                for (col.string.dict, trans[0..col.dictLen()]) |v, id|
+                    if (id >= values.len or !std.mem.eql(u8, values[id], v)) return false;
+            },
+        }
+        return true;
+    }
+
+    fn dictionary(d: *const Axis, arena: std.mem.Allocator) !Column {
+        return switch (d.values) {
+            .int64 => |values| .{ .i64 = .{ .values = &.{}, .dict = @ptrCast(values) } },
+            .int32 => |values| blk: {
+                const out = try arena.alloc(i32, values.len);
+                for (out, values) |*v, raw| v.* = @truncate(@as(i64, @bitCast(raw)));
+                break :blk .{ .i32 = .{ .values = &.{}, .dict = out } };
+            },
+            .bytes => |values| blk: {
+                const out = try arena.alloc([]const u8, values.len);
+                for (out, values) |*v, key| v.* = key;
+                break :blk .{ .string = .{ .values = &.{}, .dict = out } };
+            },
+        };
+    }
+};
+
+/// Mixed-radix IDs over value-equal axes. Unused dictionary entries only enlarge the possible product.
+pub const Domain = struct {
+    axes: []Axis,
+    bytes: usize,
+
+    pub fn deinit(d: *Domain, gpa: std.mem.Allocator) void {
+        for (d.axes) |*axis| axis.deinit(gpa);
+        gpa.free(d.axes);
+        d.* = undefined;
+    }
+
+    pub fn ids(d: *const Domain) usize {
+        var n: usize = 1;
+        for (d.axes) |*axis| n *|= axis.ids();
+        return n;
+    }
+
+    pub fn forRowGroup(d: *const Domain, file: usize, rg: usize) ?[]const u32 {
+        if (d.axes.len != 1) return null;
+        return d.axes[0].forRowGroup(file, rg);
+    }
+
+    /// Possible local composites the established coded fold resolves, summed across row groups.
     pub fn entries(d: *const Domain) usize {
+        if (d.axes.len == 0) return 0;
         var n: usize = 0;
-        for (d.trans) |t| n += t.len;
+        for (d.axes[0].trans, 0..) |_, rg| {
+            var product: usize = 1;
+            for (d.axes) |*axis| product *|= axis.trans[rg].len;
+            n +|= product;
+        }
         return n;
     }
 };
@@ -262,21 +330,7 @@ pub const Lanes = struct {
     }
 
     fn sameDictionary(l: *const Lanes, col: Column, trans: []const u32) bool {
-        const values = l.domain.values;
-        switch (col) {
-            .i64 => |c| {
-                if (l.domain.int32) return false;
-                for (c.dict, trans[0..c.dict.len]) |v, id| if (id >= values.len or values[id] != @as(u64, @bitCast(v))) return false;
-            },
-            .i32 => |c| {
-                if (!l.domain.int32) return false;
-                for (c.dict, trans[0..c.dict.len]) |v, id| {
-                    if (id >= values.len or values[id] != @as(u64, @bitCast(@as(i64, v)))) return false;
-                }
-            },
-            else => return false,
-        }
-        return trans[trans.len - 1] == values.len;
+        return l.domain.axes.len == 1 and l.domain.axes[0].sameDictionary(col, trans);
     }
 };
 
@@ -315,11 +369,7 @@ pub fn intoTable(
     try table.reserveFixed(groups, calls.len);
 
     // The domain's values as the key column the scan decodes, so each key's image is the one the row path packs.
-    const dict_col: Column = if (domain.int32) blk: {
-        const d = try arena.alloc(i32, domain.values.len);
-        for (d, domain.values) |*o, v| o.* = @truncate(@as(i64, @bitCast(v)));
-        break :blk .{ .i32 = .{ .values = &.{}, .dict = d } };
-    } else .{ .i64 = .{ .values = &.{}, .dict = @ptrCast(domain.values) } };
+    const dict_col = try domain.axes[0].dictionary(arena);
     const kd = [_]Column{try agg_coded.keyDictColumn(arena, dict_col, key, lookup_len)};
     var image: [32]u8 = undefined;
     for (into.first, 0..) |f, id| if (f != unseen) {
@@ -395,8 +445,10 @@ const Fixture = struct {
     const vals1 = [_]i64{ 4, 9, 0, 6, -1, 11, 13, 2 };
     const vdef1 = [_]u32{ 1, 1, 0, 1, 1, 1, 1, 1 };
 
+    var axes = [_]Axis{.{ .values = .{ .int64 = &values }, .trans = &trans, .file_base = &file_base, .bytes = 0 }};
+
     fn domain() Domain {
-        return .{ .values = &values, .int32 = false, .trans = &trans, .file_base = &file_base, .bytes = 0 };
+        return .{ .axes = &axes, .bytes = 0 };
     }
 
     fn batch(rg: usize) filter_eval.Batch {

@@ -18728,3 +18728,34 @@ test "hot COUNT footer range hints cannot exclude NULL or out-of-range winners" 
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     };
 }
+
+test "COUNT input-wide sample survives every partial worker start" {
+    const cert = @import("count_certificate.zig");
+    const path = "ci/fixtures/parquet/topk_skew.parquet";
+    const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const meta = try metadata.open(arena.allocator(), bytes);
+    const source: cert.Source = .{
+        .rg = &meta.row_groups.items[0],
+        .meta = &meta,
+        .src = .{ .bytes = bytes, .byte_origin = 0 },
+    };
+    const sources = [_]cert.Source{ source, source, source };
+    var want = try cert.sample(testing.allocator, &sources, 1, 1, 4, 4, .{});
+    defer want.deinit(testing.allocator);
+    for (0..3) |started| {
+        spawn_util.injectFailureAfter(started);
+        defer spawn_util.resetFailure();
+        var got = try cert.sample(testing.allocator, &sources, 1, 1, 4, 4, .{});
+        defer got.deinit(testing.allocator);
+        try testing.expect(spawn_util.failuresInjected() > 0);
+        try testing.expectEqual(want.rows, got.rows);
+        try testing.expectEqual(want.fmin, got.fmin);
+        try testing.expectEqual(want.fmax, got.fmax);
+        try testing.expectEqual(want.counts.count(), got.counts.count());
+        var it = want.counts.iterator();
+        while (it.next()) |entry| try testing.expectEqual(entry.value_ptr.*, got.counts.get(entry.key_ptr.*).?);
+    }
+}

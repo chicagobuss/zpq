@@ -54,5 +54,5 @@ in the trial is a reason to decline. The class maps share one filter, with map l
 A readable, cache-sized integer footer range can choose the secondary hot interval without sampling that column.
 It is a membership hint: complete counts still route NULL and out-of-range values cold, so even misleading bounds
 cannot exclude a winner. Absent, unreadable or wide bounds retain value sampling to tolerate rare outliers.
-The optional sample queues mapped reads for the complete key chunks used by its following unfiltered count pass.
-This uses the existing prefetch advice and leaves all decode and error checks in the ordinary consumers.
+Input-wide sample windows run on row-group tasks in the existing worker pool, with private sample maps and
+decode scratch. Their merged counts cover the same global row budget, including windows crossing row groups.

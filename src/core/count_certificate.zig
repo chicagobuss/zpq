@@ -101,30 +101,82 @@ fn secondaryHint(sources: []const Source, ci: usize) ?IntegerRange {
     return if (width > 0 and width <= hw.l2BytesPerWorkerOr(640 << 10) / 12) range else null;
 }
 
-// These complete key chunks are needed by the following unfiltered count pass. Queue their reads together,
-// rather than making input-wide sampling serialize cold faults across every row group. Advice changes no decode.
-fn prefetchKeys(sources: []const Source, key: usize, second: ?usize) void {
-    const membership = @import("filter/membership.zig");
-    for (sources) |source| {
-        const files = [_][]const u8{source.src.bytes};
-        const mapped: membership.MappedSource = .{ .files = &files };
-        for ([_]?usize{ key, second }) |maybe_ci| {
-            const ci = maybe_ci orelse continue;
-            if (ci >= source.rg.columns.items.len) continue;
-            const cm = source.rg.columns.items[ci].meta_data orelse continue;
-            const begin = @min(cm.data_page_offset, cm.dictionary_page_offset orelse cm.data_page_offset);
-            const absolute = std.math.cast(u64, begin) orelse continue;
-            const bytes = std.math.cast(u64, cm.total_compressed_size) orelse continue;
-            if (absolute < source.src.byte_origin) continue;
-            const start = absolute - source.src.byte_origin;
-            mapped.source().prefetch(&.{.{ .file = 0, .start = start, .end = start +| bytes }});
+const SampleTasks = struct {
+    a: std.mem.Allocator,
+    sources: []const Source,
+    bases: []const u64,
+    windows: Windows,
+    key: usize,
+    second: ?usize,
+    hint: ?IntegerRange,
+    options: consumer.DecodeOptions,
+    cursor: std.atomic.Value(usize) = .init(0),
+
+    const Task = struct {
+        shared: *SampleTasks,
+        result: Sample = .{},
+        err: ?anyerror = null,
+
+        fn run(task: *Task) void {
+            const s = task.shared;
+            while (true) {
+                const i = s.cursor.fetchAdd(1, .monotonic);
+                if (i >= s.sources.len) return;
+                sampleSource(s, i, &task.result) catch |e| {
+                    task.err = e;
+                    return;
+                };
+            }
         }
+    };
+};
+
+fn sampleSource(s: *const SampleTasks, i: usize, result: *Sample) !void {
+    const source = s.sources[i];
+    const base = s.bases[i];
+    const end = base + @as(u64, @intCast(@max(0, source.rg.num_rows)));
+    if (end == base) return;
+    // Find the first overlapping window without revisiting every stratum in every row group.
+    var wi: u64 = 0;
+    var high = s.windows.strata;
+    while (wi < high) {
+        const middle = wi + (high - wi) / 2;
+        const w = s.windows.at(middle);
+        if (w.start + w.len <= base) wi = middle + 1 else high = middle;
+    }
+    if (wi == s.windows.strata or s.windows.at(wi).start >= end) return;
+    var held = std.heap.ArenaAllocator.init(s.a);
+    defer held.deinit();
+    var first = try consumer.SliceReader.init(held.allocator(), s.a, source.rg, source.meta, source.src, s.key, s.options) orelse
+        return error.SampleUnsupported;
+    defer first.deinit();
+    var other: ?consumer.SliceReader = if (if (s.hint == null) s.second else null) |ci|
+        try consumer.SliceReader.init(held.allocator(), s.a, source.rg, source.meta, source.src, ci, s.options) orelse
+            return error.SampleUnsupported
+    else
+        null;
+    defer if (other) |*r| r.deinit();
+    var scratch = std.heap.ArenaAllocator.init(s.a);
+    defer scratch.deinit();
+    var position = base;
+    while (wi < s.windows.strata) : (wi += 1) {
+        const window = s.windows.at(wi);
+        if (window.start >= end) break;
+        const lo = @max(base, window.start);
+        const hi = @min(end, window.start + window.len);
+        _ = scratch.reset(.retain_capacity);
+        try first.skip(scratch.allocator(), @intCast(lo - position));
+        if (other) |*r| try r.skip(scratch.allocator(), @intCast(lo - position));
+        const n: usize = @intCast(hi - lo);
+        const ks = try first.next(scratch.allocator(), n);
+        const fs = if (other) |*r| try r.next(scratch.allocator(), n) else null;
+        for (0..n) |r| try result.add(s.a, integer(ks, r), if (fs) |f| integer(f, r) else 0);
+        position = hi;
     }
 }
 
-/// Only bare signed integer columns are admitted by the caller. Real page encodings feed the existing slice
-/// reader; whole pages between windows are skipped by checked headers. Scratch and sample keys use the caller's
-/// charged allocator. Errors are optional-probe failures: the caller discards the sample and runs its full pass.
+/// Samples only choose membership. Row-group tasks use the existing pool and private decode/sample state,
+/// so input-wide windows do not serialize cold faults. Joining precedes every merge, failure or release.
 pub fn sample(
     a: std.mem.Allocator,
     sources: []const Source,
@@ -136,56 +188,44 @@ pub fn sample(
 ) !Sample {
     var result: Sample = .{};
     errdefer result.deinit(a);
+    const bases = try a.alloc(u64, sources.len);
+    defer a.free(bases);
     var rows: u64 = 0;
-    for (sources) |source| rows = std.math.add(u64, rows, @intCast(@max(0, source.rg.num_rows))) catch return result;
-    // A sample table and its decode window share one worker's L2 allowance. A cut larger than that sample
-    // declines this policy; cache capacity, rather than a fixture constant, bounds sampling effort.
+    for (sources, bases) |source, *base| {
+        base.* = rows;
+        rows = std.math.add(u64, rows, @intCast(@max(0, source.rg.num_rows))) catch return result;
+    }
     const capacity = hw.l2BytesPerWorkerOr(640 << 10) / (2 * (8 + 8 + 1));
-    if (h > capacity) return result;
-    prefetchKeys(sources, key, second);
-    const count = @min(rows, capacity);
-    const windows = Windows.init(rows, count, @max(sources.len, workers));
-    const hint = if (second) |ci| secondaryHint(sources, ci) else null;
-    var wi: u64 = 0;
-    var base: u64 = 0;
-    for (sources) |source| {
-        const end = base + @as(u64, @intCast(@max(0, source.rg.num_rows)));
-        defer base = end;
-        if (wi == windows.strata) break;
-        var window = windows.at(wi);
-        if (window.start >= end) continue;
-        var held = std.heap.ArenaAllocator.init(a);
-        defer held.deinit();
-        var first = try consumer.SliceReader.init(held.allocator(), a, source.rg, source.meta, source.src, key, options) orelse return error.SampleUnsupported;
-        defer first.deinit();
-        var other: ?consumer.SliceReader = if (if (hint == null) second else null) |ci|
-            try consumer.SliceReader.init(held.allocator(), a, source.rg, source.meta, source.src, ci, options) orelse
-                return error.SampleUnsupported
-        else
-            null;
-        defer if (other) |*r| r.deinit();
-        var scratch = std.heap.ArenaAllocator.init(a);
-        defer scratch.deinit();
-        var position = base;
-        while (wi < windows.strata) {
-            window = windows.at(wi);
-            if (window.start >= end) break;
-            const lo = @max(base, window.start);
-            const hi = @min(end, window.start + window.len);
-            _ = scratch.reset(.retain_capacity);
-            try first.skip(scratch.allocator(), @intCast(lo - position));
-            if (other) |*r| try r.skip(scratch.allocator(), @intCast(lo - position));
-            const n: usize = @intCast(hi - lo);
-            const ks = try first.next(scratch.allocator(), n);
-            const fs = if (other) |*r| try r.next(scratch.allocator(), n) else null;
-            for (0..n) |r| try result.add(a, integer(ks, r), if (fs) |f| integer(f, r) else 0);
-            position = hi;
-            // A stratum may cross row groups/files; consume the remainder there, once.
-            if (hi < window.start + window.len) break;
-            wi += 1;
+    if (h > capacity or rows == 0) return result;
+    var shared: SampleTasks = .{
+        .a = a,
+        .sources = sources,
+        .bases = bases,
+        .windows = Windows.init(rows, @min(rows, capacity), @max(sources.len, workers)),
+        .key = key,
+        .second = second,
+        .hint = if (second) |ci| secondaryHint(sources, ci) else null,
+        .options = options,
+    };
+    const tasks = try a.alloc(SampleTasks.Task, @min(sources.len, @max(1, workers)));
+    defer a.free(tasks);
+    for (tasks) |*task| task.* = .{ .shared = &shared };
+    defer for (tasks) |*task| task.result.deinit(a);
+    const spawn = @import("spawn.zig");
+    if (tasks.len == 1 or !spawn.runTree(SampleTasks.Task, tasks, .{}, SampleTasks.Task.run)) tasks[0].run();
+    for (tasks) |task| {
+        if (task.err) |e| return e;
+        result.rows += task.result.rows;
+        result.fmin = @min(result.fmin, task.result.fmin);
+        result.fmax = @max(result.fmax, task.result.fmax);
+        var it = task.result.counts.iterator();
+        while (it.next()) |entry| {
+            const out = try result.counts.getOrPut(a, entry.key_ptr.*);
+            if (!out.found_existing) out.value_ptr.* = 0;
+            out.value_ptr.* += entry.value_ptr.*;
         }
     }
-    if (hint) |range| {
+    if (shared.hint) |range| {
         result.fmin = range.min;
         result.fmax = range.max;
     }

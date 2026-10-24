@@ -6009,7 +6009,30 @@ fn inlineIntegerAnswer(
         .layout = if (cut != null) .integer_sum_top_h else .integer_group_stream,
         .reservation = integerQuote(rows, n_workers, cut, args),
     };
-    if (cut) |c| return try runIntegerOwner(.sum_top, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, c, false);
+    if (cut) |c| {
+        if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
+            .sum_top,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            n_workers,
+            timings,
+            rows,
+            key.col_idx,
+            value.?,
+            count,
+            starts,
+            c,
+            true,
+        )) |answer| return answer;
+        return try runIntegerOwner(.sum_top, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, c, false);
+    }
     if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
         .full,
         gpa,
@@ -6085,8 +6108,8 @@ fn runIntegerOwner(
         owner_groups.full_parts
     else
         Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
-    const state = (if (kind == .full and ordered)
-        try Owner.State.initRuns(gpa, args.ledger, rows, n_workers, key_col, value_col, work.len)
+    const state = (if (ordered)
+        try Owner.State.initRuns(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, work.len)
     else
         try Owner.State.init(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, 0)) orelse return null;
     errdefer state.deinit();
@@ -19074,13 +19097,13 @@ test "integer owner decoded runs and false sorted hints match the canonical mult
             const values = [_]i64{ 3, -4, 6, 5 };
             const cols = [_]expr_agg.OutputCol{
                 .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &keys } } },
-                .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &values } } },
+                .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &values, .def_levels = &.{ 0, 1, 1, 0 }, .max_def = 1 } } },
             };
             try file.append(&cols, keys.len, .SNAPPY, .{}, .{});
         }
         _ = try file.finish(&.{
             .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
-            .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+            .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
         });
         const meta = try metadata.open(a, sink.buffer.items);
         if (descent) for (meta.row_groups.items) |*rg| {
@@ -19127,6 +19150,20 @@ test "integer owner decoded runs and false sorted hints match the canonical mult
                     try testing.expectEqual(v == .null_val, lane.defs.len != 0 and lane.defs[i] == 0);
                     if (v != .null_val) try testing.expectEqual(v.i, lane.values[i]);
                 };
+                var top_args = base;
+                top_args.aggregate = "sum(v) AS s";
+                top_args.parallelism = j;
+                top_args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2, .offset = 1 };
+                var top_want = try runMultiAggregate(testing.allocator, a, top_args);
+                defer top_want.deinit(testing.allocator);
+                top_args.integer_records = true;
+                top_args.integer_records_min_rows = 0;
+                top_args.typed_answer = true;
+                var top_got = try runMultiAggregate(testing.allocator, a, top_args);
+                defer top_got.deinit(testing.allocator);
+                try top_want.output.applyResultOrder(testing.allocator, top_args.result_order);
+                try top_got.output.applyResultOrder(testing.allocator, top_args.result_order);
+                try testing.expectEqualDeep(top_want.output.group_rows.?, top_got.output.group_rows.?);
             }
         }
     }

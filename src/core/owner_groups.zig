@@ -217,6 +217,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             fn appendRun(l: *Local, key: ?Key, value: ?i64, ordinal: u32) void {
                 const s = l.state;
                 const run = &s.runs[l.run_item];
+                if (value == null) l.nulls |= 2;
                 run.rows += 1;
                 const k = key orelse {
                     s.run_declined.store(true, .monotonic);
@@ -249,7 +250,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
 
             pub fn append(l: *Local, key: ?Key, value: if (has_value) ?i64 else void, ordinal: u32) !void {
                 std.debug.assert(admitsRows(codec, ordinal));
-                if (comptime kind == .full and codec == .int64) if (l.state.runs.len != 0) {
+                if (comptime kind != .count_top and codec == .int64) if (l.state.runs.len != 0) {
                     l.appendRun(key, value, ordinal);
                     return;
                 };
@@ -323,31 +324,51 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
         };
 
-        /// Fold one record into the open-addressed `slots` over `groups`, creating its group at `groups[n]`.
-        inline fn foldRecord(r: Record, groups: []Group, slots: []u32, base: usize, n: *usize) void {
-            const cap = slots.len;
+        fn sameRecord(r: Record, g: Group) bool {
             const kn = r.flags & 1 != 0;
-            const len = if (codec == .int64) 0 else r.ordinal >> ordinal_bits;
-            var pos: usize = (r.flags >> 2) & (cap - 1);
-            while (slots[pos] != 0) : (pos = (pos + 1) & (cap - 1)) {
-                const g = &groups[slots[pos] - 1 - base];
-                if (if (codec == .int64)
-                    (g.first & null_key != 0) == kn and (kn or g.key == r.key)
-                else if (!tagged)
-                    (g.count & null_key != 0) == kn and (kn or (g.first >> ordinal_bits == len and g.key == r.key))
-                else
-                    g.key == r.key) break;
-            }
-            if (slots[pos] == 0) {
-                slots[pos] = @intCast(base + n.* + 1);
-                groups[n.*] = .{
-                    .key = r.key,
-                    .count = if (codec == .bytes and kn) null_key else 0,
-                    .first = r.ordinal | (if (codec == .int64 and kn) null_key else @as(u32, 0)),
-                };
-                n.* += 1;
-            }
-            const g = &groups[slots[pos] - 1 - base];
+            return if (codec == .int64)
+                (g.first & null_key != 0) == kn and (kn or g.key == r.key)
+            else if (!tagged)
+                (g.count & null_key != 0) == kn and
+                    (kn or (g.first >> ordinal_bits == r.ordinal >> ordinal_bits and g.key == r.key))
+            else
+                g.key == r.key;
+        }
+
+        inline fn foldRecord(r: Record, groups: []Group, slots: []u32, base: usize, n: *usize) void {
+            _ = foldAdjacent(r, groups, slots, base, n, null);
+        }
+
+        /// Equality uses the complete inline key and flags; adjacent runs skip the hash probe without changing the
+        /// aggregate's row order. NULL breaks the shortcut, and the ordinary probe remains authoritative.
+        inline fn foldAdjacent(
+            r: Record,
+            groups: []Group,
+            slots: []u32,
+            base: usize,
+            n: *usize,
+            previous: ?usize,
+        ) usize {
+            const kn = r.flags & 1 != 0;
+            const id = blk: {
+                if (!kn) if (previous) |id| if (sameRecord(r, groups[id])) break :blk id;
+                const cap = slots.len;
+                var pos: usize = (r.flags >> 2) & (cap - 1);
+                while (slots[pos] != 0) : (pos = (pos + 1) & (cap - 1)) {
+                    if (sameRecord(r, groups[slots[pos] - 1 - base])) break;
+                }
+                if (slots[pos] == 0) {
+                    slots[pos] = @intCast(base + n.* + 1);
+                    groups[n.*] = .{
+                        .key = r.key,
+                        .count = if (codec == .bytes and kn) null_key else 0,
+                        .first = r.ordinal | (if (codec == .int64 and kn) null_key else @as(u32, 0)),
+                    };
+                    n.* += 1;
+                }
+                break :blk slots[pos] - 1 - base;
+            };
+            const g = &groups[id];
             g.count += 1;
             const mask = Group.first_mask;
             g.first = (g.first & ~mask) | @min(g.ordinal(), r.ordinal & mask);
@@ -355,6 +376,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 g.sum += r.value;
                 g.count |= Group.sum_present;
             }
+            return id;
         }
 
         pub const State = struct {
@@ -431,10 +453,12 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 workers: usize,
                 key_col: usize,
                 value_col: usize,
+                cut: if (kind == .full) void else Cut,
+                parts: usize,
                 items: usize,
             ) !?*State {
-                comptime std.debug.assert(kind == .full and codec == .int64);
-                return initMode(a, ledger, rows, workers, key_col, value_col, {}, full_parts, 0, items);
+                comptime std.debug.assert(kind != .count_top and codec == .int64);
+                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, 0, items);
             }
 
             fn initMode(
@@ -527,7 +551,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             const Task = struct {
                 s: *State,
                 cursor: *std.atomic.Value(usize),
-                pass: enum { fold, order } = .fold,
+                pass: enum { fold, order, run_top } = .fold,
                 heap: ?*Heap = null,
                 groups: []Group = &.{},
                 slots: []u32 = &.{},
@@ -537,18 +561,30 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 fn run(t: *Task) void {
                     defer t.s.gpa.free(t.groups);
                     defer t.s.gpa.free(t.slots);
-                    const end = if (t.pass == .order) (t.s.bitmap.len + 1023) / 1024 else t.s.parts;
+                    const end = switch (t.pass) {
+                        .order => (t.s.bitmap.len + 1023) / 1024,
+                        .run_top => t.s.runs.len,
+                        .fold => t.s.parts,
+                    };
                     while (true) {
                         const p = t.cursor.fetchAdd(1, .monotonic);
                         if (p >= end) return;
                         (switch (t.pass) {
                             .fold => if (kind == .full) t.foldFull(p) else t.foldTop(p),
                             .order => t.s.orderBlock(p),
+                            .run_top => if (kind != .full) t.runTop(p),
                         }) catch |e| {
                             t.err = e;
                             return;
                         };
                     }
+                }
+
+                fn runTop(t: *Task, item: usize) void {
+                    const r = t.s.runs[item];
+                    if (r.groups == 0) return;
+                    for (r.first..@as(usize, r.last) + 1) |i| if (t.s.winners[i] != 0)
+                        t.s.keep(t.heap.?, t.s.groups[i]);
                 }
 
                 fn ensureSlots(t: *Task, cap: usize) ![]u32 {
@@ -569,12 +605,13 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     if (lo == hi) return;
                     const slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, (hi - lo) * 2));
                     var n: usize = 0;
+                    var previous: ?usize = null;
                     for (s.locals) |local| {
                         var id = local.heads[p];
                         while (id != none) {
                             const b = &s.blocks[id];
                             if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
-                            for (b.rows[0..b.len]) |r| foldRecord(r, s.groups[lo..hi], slots, lo, &n);
+                            for (b.rows[0..b.len]) |r| previous = foldAdjacent(r, s.groups[lo..hi], slots, lo, &n, previous);
                             id = b.next;
                         }
                     }
@@ -598,12 +635,13 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     }
                     const slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, rows * 2));
                     var n: usize = 0;
+                    var previous: ?usize = null;
                     for (s.locals) |l| {
                         var id = l.heads[p];
                         while (id != none) {
                             const b = &s.blocks[id];
                             if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
-                            for (b.rows[0..b.len]) |r| foldRecord(r, t.groups, slots, 0, &n);
+                            for (b.rows[0..b.len]) |r| previous = foldAdjacent(r, t.groups, slots, 0, &n, previous);
                             id = b.next;
                         }
                     }
@@ -649,6 +687,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             fn finishRuns(s: *State) !void {
                 if (s.run_declined.load(.monotonic)) return error.RunOrderDeclined;
                 var rows: usize = 0;
+                for (s.locals) |local| s.input_nulls |= local.nulls;
                 var last: ?u32 = null;
                 for (s.runs) |run| {
                     rows += run.rows;
@@ -670,6 +709,11 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     last = run.last;
                 }
                 if (rows != s.rows) return error.BadRowCount;
+                if (kind != .full) {
+                    try s.parallel(.run_top);
+                    s.combineTop();
+                    return;
+                }
                 for (s.winners, 0..) |winner, i| if (winner != 0) {
                     const g = s.groups[i];
                     if (g.sumValue() != null and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
@@ -688,7 +732,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
 
             pub fn finish(s: *State) !void {
-                if (comptime kind == .full and codec == .int64) if (s.runs.len != 0) {
+                if (comptime kind != .count_top and codec == .int64) if (s.runs.len != 0) {
                     const begin = now();
                     try s.finishRuns();
                     s.fold_ns = @intCast(now() - begin);
@@ -741,15 +785,19 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     if (total != s.group_count) return error.BadRowCount;
                     s.order_ns = @intCast(now() - start);
                 } else {
-                    for (s.heaps[1..]) |other| for (other.items) |g| s.keep(&s.heaps[0], g);
-                    // The stable result sorter receives the surviving H rows in canonical first-appearance order.
-                    std.mem.sort(Group, s.heaps[0].items, {}, struct {
-                        fn less(_: void, x: Group, y: Group) bool {
-                            return x.ordinal() < y.ordinal();
-                        }
-                    }.less);
+                    s.combineTop();
                     s.select_ns = @intCast(now() - start);
                 }
+            }
+
+            fn combineTop(s: *State) void {
+                for (s.heaps[1..]) |other| for (other.items) |g| s.keep(&s.heaps[0], g);
+                // The stable result sorter receives the surviving H rows in canonical first-appearance order.
+                std.mem.sort(Group, s.heaps[0].items, {}, struct {
+                    fn less(_: void, x: Group, y: Group) bool {
+                        return x.ordinal() < y.ordinal();
+                    }
+                }.less);
             }
 
             /// Top-H: the surviving groups in first-appearance order.
@@ -1259,7 +1307,7 @@ fn runTrial(a: std.mem.Allocator, workers: usize) !void {
     const starts = [_]u32{ 0, 3, 3, 5, 7, 10 };
     var ledger: memory.SharedBudget = .{ .limit = 512 << 20 };
     defer std.debug.assert(ledger.used.load(.monotonic) == 0);
-    const s = (try IntFull.State.initRuns(a, &ledger, keys.len, workers, 0, 1, starts.len)).?;
+    const s = (try IntFull.State.initRuns(a, &ledger, keys.len, workers, 0, 1, {}, full_parts, starts.len)).?;
     defer s.deinit();
     // Reverse completion order, an empty source, and one group through three source seams.
     var item = starts.len;
@@ -1305,7 +1353,7 @@ test "decoded owner runs release every failed allocation and ledger reservation"
 test "decoded owner runs decline NULL, an interior descent or an overlapping source before output" {
     const a = std.testing.allocator;
     for ([_][4]?i64{ .{ 1, null, 2, 3 }, .{ 1, 0, 2, 3 }, .{ 1, 2, 1, 3 } }) |keys| {
-        const s = (try IntFull.State.initRuns(a, null, keys.len, 2, 0, 1, 2)).?;
+        const s = (try IntFull.State.initRuns(a, null, keys.len, 2, 0, 1, {}, full_parts, 2)).?;
         defer s.deinit();
         for (0..2) |item| {
             s.locals[item].start(@intCast(item * 2), item);
@@ -1318,7 +1366,7 @@ test "decoded owner runs decline NULL, an interior descent or an overlapping sou
 test "decoded owner runs narrow exact sums only after all seams, including a later cancellation" {
     const a = std.testing.allocator;
     for ([_]i64{ -std.math.maxInt(i64), 0 }) |last| {
-        const s = (try IntFull.State.initRuns(a, null, 3, 1, 0, 1, 3)).?;
+        const s = (try IntFull.State.initRuns(a, null, 3, 1, 0, 1, {}, full_parts, 3)).?;
         defer s.deinit();
         for ([_]i64{ std.math.maxInt(i64), 1, last }, 0..) |value, item| {
             s.locals[0].start(@intCast(item), item);
@@ -1332,4 +1380,45 @@ test "decoded owner runs narrow exact sums only after all seams, including a lat
             try std.testing.expectEqual(@as(i64, 3), s.groups[0].countValue());
         }
     }
+}
+
+fn runTopTrial(a: std.mem.Allocator, workers: usize, descending: bool, k: usize) !void {
+    const rows = 1024;
+    const items = 17;
+    var ledger: memory.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(ledger.used.load(.monotonic) == 0);
+    const cut: Cut = .{ .k = k, .descending = descending };
+    const run = (try IntSumTop.State.initRuns(a, &ledger, rows, workers, 0, 1, cut, 64, items)).?;
+    defer run.deinit();
+    const hash = (try IntSumTop.State.init(a, &ledger, rows, workers, 0, 1, cut, 64, 0)).?;
+    defer hash.deinit();
+    var item: usize = items;
+    while (item != 0) {
+        item -= 1;
+        const lo = rows * item / items;
+        const hi = rows * (item + 1) / items;
+        run.locals[item % workers].start(@intCast(lo), item);
+        for (lo..hi) |row| {
+            const key: i64 = @intCast(row / 128); // A group crosses three source seams.
+            const value: ?i64 = if (key == 0) null else if (row % 11 == 0) -3 else 1;
+            try run.locals[item % workers].append(key, value, @intCast(row));
+            try hash.locals[item % workers].append(key, value, @intCast(row));
+        }
+    }
+    try run.finish();
+    try hash.finish();
+    try std.testing.expectEqual(hash.group_count, run.group_count);
+    try std.testing.expectEqualDeep(hash.top(), run.top());
+}
+
+test "decoded owner run top-H completes seam chains before SUM ranking and first-ordinal ties" {
+    for ([_]usize{ 1, 2, 4, 16 }) |j| for ([_]bool{ false, true }) |descending|
+        for ([_]usize{ 1, 7, 16 }) |k| try runTopTrial(std.testing.allocator, j, descending, k);
+    spawn.injectFailureAfter(1);
+    defer spawn.resetFailure();
+    try runTopTrial(std.testing.allocator, 16, true, 7);
+}
+
+test "decoded owner run top-H releases failed heaps, group buffers and ledger reservations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, runTopTrial, .{ 1, true, 7 });
 }

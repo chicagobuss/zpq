@@ -948,6 +948,11 @@ fn runWrite(
     var diag: Diag = .{};
     var args = qa;
     args.diag = &diag;
+    var publication: zpq.output_publication.OutputPublication = .{};
+    defer publication.abort();
+    args.output = publication.prepare(io, qa.output, qa.inputs) catch |err|
+        return engineError(allocator, err, &diag);
+    args.output_fd = publication.fd;
 
     if (pool.per_call_stats) pool.resetStats();
     const result = engine.runQuery(.{
@@ -968,7 +973,13 @@ fn runWrite(
         // container. Inserts/evictions are LRU-state, not per-invoke.
         break :blk s;
     } else .{};
-    return writeResponse(allocator, output_url_str, wr, total_ms, pool.stats(), cache_stats);
+    // Allocate the response before publishing: even an allocation failure must preserve an earlier target.
+    const response = try writeResponse(allocator, output_url_str, wr, total_ms, pool.stats(), cache_stats);
+    publication.commit(io) catch |err| {
+        allocator.free(response);
+        return engineError(allocator, err, &diag);
+    };
+    return response;
 }
 
 /// The success response for a write. `output` is the caller's URL or path, so it is escaped like every other string

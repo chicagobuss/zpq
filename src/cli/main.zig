@@ -503,9 +503,16 @@ fn runQuery(
         return error.BadArgs;
     }
     if (group_by != null) result_order.limit = if (limit) |n| @intCast(n) else result_order.limit;
-    var publication: OutputPublication = .{};
+    var publication: zpq.output_publication.OutputPublication = .{};
     defer publication.abort();
-    const engine_output = if (explain) output else if (to_stdout) null else try publication.prepare(io, output, inputs);
+    const engine_output = if (explain) output else if (to_stdout) null else publication.prepare(io, output, inputs) catch |err| {
+        switch (err) {
+            error.InputOutputSame => diagnosticPrint("zpq query: input and output must be different files\n", .{}),
+            error.OutputNotRegular => diagnosticPrint("zpq query: output must be a regular file\n", .{}),
+            else => return err,
+        }
+        return error.BadArgs;
+    };
     const max_mem_limit = max_memory orelse zpq.core.system.discoverAvailableMemory(env);
 
     var profiler: ?*zpq.profile.Profiler = null;
@@ -708,76 +715,6 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;
 }
-
-// Publication belongs to the CLI: service callers retain their own destination lifecycle.
-const OutputPublication = struct {
-    target: ?[]const u8 = null,
-    permissions: ?std.Io.File.Permissions = null,
-    fd: ?local_fs.fd_t = null,
-    buffer: [std.fs.max_path_bytes]u8 = undefined,
-    len: usize = 0,
-
-    fn path(self: *const OutputPublication) []const u8 {
-        return self.buffer[0..self.len];
-    }
-
-    fn prepare(self: *OutputPublication, io: std.Io, output: ?[]const u8, inputs: []const []const u8) !?[]const u8 {
-        const target = output orelse return null;
-        if (std.mem.startsWith(u8, target, "s3://")) {
-            for (inputs) |input| if (std.mem.eql(u8, input, target)) {
-                diagnosticPrint("zpq query: input and output must be different files\n", .{});
-                return error.BadArgs;
-            };
-            return target;
-        }
-        const cwd = std.Io.Dir.cwd();
-        if (cwd.statFile(io, target, .{})) |st| {
-            self.permissions = st.permissions;
-            if (st.kind != .file) {
-                diagnosticPrint("zpq query: output must be a regular file\n", .{});
-                return error.BadArgs;
-            }
-            for (inputs) |input| {
-                if (std.mem.startsWith(u8, input, "s3://")) continue;
-                const same = local_fs.sameFile(input, target) catch continue;
-                if (same) {
-                    diagnosticPrint("zpq query: input and output must be different files\n", .{});
-                    return error.BadArgs;
-                }
-            }
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
-        const pid: u32 = @bitCast(std.posix.system.getpid());
-        const tmp = try std.fmt.bufPrint(&self.buffer, "{s}.{d}.zpq-tmp", .{ target, pid });
-        // Retain the exclusive fd: reopening even this empty file with O_TRUNC makes ext4 flush at final close.
-        self.fd = try local_fs.createNewFile(tmp);
-        self.len = tmp.len;
-        self.target = target;
-        return self.path();
-    }
-
-    fn commit(self: *OutputPublication, io: std.Io) !void {
-        const target = self.target orelse return;
-        const fd = self.fd orelse unreachable;
-        if (self.permissions) |permissions| {
-            const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-            try file.setPermissions(io, permissions);
-        }
-        self.fd = null;
-        try local_fs.closeChecked(fd);
-        try local_fs.rename(self.path(), target);
-        self.target = null;
-    }
-
-    fn abort(self: *OutputPublication) void {
-        if (self.fd) |fd| local_fs.close(fd);
-        self.fd = null;
-        if (self.target != null) local_fs.removeFile(self.path());
-        self.target = null;
-    }
-};
 
 /// Where `--profile` and `--profile-summary` send a finished profile.
 const ProfileOut = struct {

@@ -65,6 +65,12 @@ writes, votes-local). Each suite is checked on its own. A suite whose inputs
 are missing is recorded under `suites_skipped` with the reason, and it is not
 planned. The suites that resolve are planned together, so one missing dataset
 does not throw away the rest. A skipped suite makes the perf stage `blocked`.
+`verify perf` holds `~/.cache/zpq-bench.lock` and passes it as fd 9. That is
+the harness parent protocol: the child then does not call `powerprofilesctl`
+itself. This session's polkit denies `switch-profile`, so the parent sets
+`performance` with `sudo -n` and restores the previous profile when the run
+ends.
+
 The harness pins its own `.venv` as an engine dependency. That tree is not
 created here. When the pinned interpreter is absent, the emitted config points
 it at the python that is running verify. The harness worktree stays untouched.

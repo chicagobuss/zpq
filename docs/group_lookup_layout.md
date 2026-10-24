@@ -19,3 +19,14 @@ A useful local reduction can clear its fixed table while retaining allocated buf
 remains charged to the shared budget; no group ids or owned aggregate values survive the clear. Abandoned and
 final flushes release the buffers, including final flushes whose table is already empty. Variable-key tables
 continue to release their owned keys on reset.
+
+COUNT top-K uses one certificate with hot counters, cell bounds and hash-class bounds as state choices. An input-wide
+sample chooses integer hot membership; a complete pass counts those lanes exactly and counts every cold row into
+its bound. Late, NULL and out-of-range values remain cold. Saturated bounds cannot certify an exclusion.
+
+When cells do not separate the cut, owner partitions collect four-byte hash fragments in 512-byte frontiers. The
+partition supplies eight additional identity bits. A collision only raises a bound: the residual groups complete
+keys and certifies only when its exact cutoff exceeds every excluded bound. The COUNT singleton case may instead
+prove that enough complete singleton groups first appear before every excluded tie. Cell and identity candidates
+share the residual scan and verification; discarded count records are released before that scan. Legacy
+`ZPQ_SKETCH_*`/census controls select producers within this certificate, rather than separate COUNT executors.

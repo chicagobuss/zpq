@@ -4139,9 +4139,8 @@ pub const CountSketch = struct {
 };
 
 /// The count pass a sketched top-k falls back to when its cells are too even to bound anything (near-unique keys).
-/// Each row records its key's 48-bit fingerprint (`fingerprint`), partitioned by the top 8 bits, with the work item it
-/// was read in, so an admit pass reads only the items that hold a key it admits. Two keys share a
-/// fingerprint only by a hash collision, so a fingerprint's total bounds the total of every key under it, as a cell's
+/// Each row records 32 identity bits; its owner partition supplies another 8. Colliding keys stay in one class,
+/// so a class's complete count bounds every key under it, as a cell's
 /// does, but almost exactly. In the count pass a key takes a slot id (`slot`) naming its hash in `batch`, and
 /// `sinkSketchRows` records a fingerprint per row and adds it to its cell too, so one count pass serves both. In the
 /// admit pass a key gets a group when its fingerprint is in `admitted`, or when it is asked for in the prefix: any
@@ -4149,13 +4148,12 @@ pub const CountSketch = struct {
 pub const Census = struct {
     pub const PART_BITS = 8;
     pub const N_PARTS = 1 << PART_BITS;
-    pub const CHUNK = 1024;
-    /// An entry: the fingerprint's low 40 bits (its partition gives the rest), then the work item in the low 24.
-    pub const Chunk = [CHUNK]u64;
-    pub const ITEM_BITS = 24;
+    /// A 512-byte producer frontier. Owner bits live in the partition, never in each row's record.
+    pub const CHUNK = 512 / @sizeOf(u32);
+    pub const Chunk = [CHUNK]u32;
     /// Chunks are carved from slabs this many at a time, so recording rarely calls the allocator.
     pub const SLAB = 64;
-    pub const max_items = 1 << ITEM_BITS;
+    pub const max_items = 1 << 24;
     /// Rows a worker records before its own cells judge whether the census is needed (`dropped`).
     pub const check_rows = 1 << 18;
     /// The same for a count(DISTINCT) census (`distinct`): skew shows in far fewer rows, and every row read before an
@@ -4175,8 +4173,6 @@ pub const Census = struct {
     /// The chunk each partition is filling, and how much of it is filled.
     open: [N_PARTS]?*Chunk = @splat(null),
     fill: [N_PARTS]u16 = @splat(0),
-    /// The work item being scanned.
-    item: u64 = 0,
     recorded: u64 = 0,
     /// Riding along a cell count pass: once `check_rows` rows in, a worker whose own cells already separate the cut
     /// (`cellsSeparate`) sets `dropped`, and every census stops (`off`) and frees what it holds, as the cells will
@@ -4190,7 +4186,7 @@ pub const Census = struct {
     distinct: bool = false,
     check_after: u64 = check_rows,
     /// Tests: the fingerprint bits kept below the partition's, fewer to make keys collide.
-    fp_mask: u64 = (1 << 40) - 1,
+    fp_mask: u64 = std.math.maxInt(u32),
     checked: bool = false,
     /// A count(DISTINCT) census has judged its first keys asked for (`sampleSkew`).
     sampled: bool = false,
@@ -4201,7 +4197,7 @@ pub const Census = struct {
     prefix_row: u64 = 0,
 
     pub fn fingerprint(self: *const Census, hash: u64) u64 {
-        return (hash >> 16) & (0xff_00_0000_0000 | self.fp_mask);
+        return (hash >> 16) & (0xff_00_0000_0000 | (self.fp_mask & std.math.maxInt(u32)));
     }
 
     /// Frees every chunk; safe to call again.
@@ -4322,7 +4318,7 @@ pub const Census = struct {
             self.open[p] = try self.newChunk();
             self.fill[p] = 0;
         }
-        self.open[p].?[self.fill[p]] = ((fp & ((1 << 40) - 1)) << ITEM_BITS) | self.item;
+        self.open[p].?[self.fill[p]] = @truncate(fp);
         self.fill[p] += 1;
         self.recorded += 1;
     }
@@ -6812,4 +6808,29 @@ test "regression: a count(DISTINCT) merge sizes its tables for the result, so no
         };
         dest.deinit(gpa);
     };
+}
+
+fn compactBoundsTrial(a: std.mem.Allocator) !void {
+    var bounds: Census = .{ .gpa = a, .item_rows = &.{} };
+    defer bounds.deinit();
+    // Different hashes in ignored bits deliberately collide; each occurrence must survive in the complete class.
+    const h: u64 = 0x37ab_1234_5678_0000;
+    for (0..1000) |i| try bounds.record(h | @as(u64, @intCast(i)));
+    const part: usize = @intCast(bounds.fingerprint(h) >> 40);
+    try std.testing.expectEqual(@as(usize, 1000), bounds.partLen(part));
+    try std.testing.expectEqual(bounds.fingerprint(h), bounds.fingerprint(h ^ (@as(u64, 255) << 48)));
+    for (bounds.full[part].items) |chunk| for (chunk) |fragment| {
+        try std.testing.expectEqual(@as(u32, @truncate(bounds.fingerprint(h))), fragment);
+    };
+    for (bounds.open[part].?[0..bounds.fill[part]]) |fragment| {
+        try std.testing.expectEqual(@as(u32, @truncate(bounds.fingerprint(h))), fragment);
+    }
+    for (0..Census.N_PARTS) |p| try bounds.record(@as(u64, @intCast(p)) << 56);
+    try std.testing.expectEqual(@as(u64, 1000 + Census.N_PARTS), bounds.recorded);
+}
+
+test "hash identity bounds use four-byte rows and bounded frontiers and free all failed allocations" {
+    try std.testing.expectEqual(@as(usize, 512), @sizeOf(Census.Chunk));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(@as(Census.Chunk, undefined)[0])));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, compactBoundsTrial, .{});
 }

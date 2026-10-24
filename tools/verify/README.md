@@ -12,10 +12,13 @@ python tools/verify/verify.py perf
 ```
 
 `verify stage referee` builds `tools/runner/referee.zig` and runs the
-filter×projection matrix in-process against the DuckDB 2.0 CLI. The cases are
-`tools/runner/cases/filter_projection.json`. Known divergences and declared
-refusals are `tests/known_divergences.json`. This stage is not part of `full`
-until it covers the rest of `tools/differential.py`.
+filter×projection matrix and the SQL-predicate checks in-process against the
+DuckDB 2.0 CLI. The cases are `tools/runner/cases/filter_projection.json` and
+`tools/runner/cases/sql_pred.json`. A SQL predicate answers as count and sum
+at `-j` 1, 4 and 16, or refuses with one stable message. An answer must equal
+DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate. Known
+divergences and declared refusals are `tests/known_divergences.json`. This
+stage is not part of `full` until it covers the rest of `tools/differential.py`.
 
 No arguments prints the tiers, every stage, and the exit codes. A run writes
 `summary.json` under `~/code/zpq-wt/verify-v2-out/<run-id>/`. The writer refuses

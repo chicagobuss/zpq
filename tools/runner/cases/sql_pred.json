@@ -1,0 +1,2236 @@
+{
+  "fixtures": [
+    {
+      "name": "main",
+      "copy": "COPY (SELECT\n        (i - 2000)::INTEGER AS id,\n        (CASE WHEN i % 11 = 0 THEN NULL ELSE (i - 2000) * 1.5 END)::DOUBLE AS amt,\n        CAST(i AS DECIMAL(18,2)) AS price,\n        (CASE WHEN i % 13 = 0 THEN '' ELSE 'n' || i END) AS name,\n        (CASE WHEN i % 7 = 0 THEN NULL ELSE 'v' || i END) AS nname,\n        (DATE '2020-01-01' + i::INTEGER) AS d,\n        (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 3 = 0) END) AS flag,\n        (CASE WHEN i % 17 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + to_milliseconds(i) END)::TIMESTAMP_MS AS ts\n      FROM range(1, 4000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)"
+    },
+    {
+      "name": "unit",
+      "copy": "COPY (SELECT\n        (CASE WHEN i % 9 = 0 THEN NULL ELSE (i % 13) - 3 END)::INTEGER AS x,\n        (CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 11) - 4 END)::INTEGER AS y,\n        (CASE WHEN i % 10 = 0 THEN NULL ELSE (i % 5) - 1 END)::INTEGER AS z,\n        (CASE WHEN i % 8 = 0 THEN NULL ELSE (['a', 'b', 'a OR b = 1', 'rock AND roll', 'x BETWEEN y', 'O''Brien', 'a,b', 'c', 'NULL', '', 'a#%', 'a%', 'ab', 'A', 'abb', 'a or b', 't'])[1 + i % 17] END) AS s,\n        (CASE WHEN i % 6 = 0 THEN NULL ELSE (['a', 'b', 'a OR b = 1', 'rock AND roll', 'x BETWEEN y', 'O''Brien', 'a,b', 'c', 'NULL', '', 'a#%', 'a%', 'ab', 'A', 'abb', 'a or b', 't'])[1 + (i * 7) % 17] END) AS t,\n        (CASE WHEN i % 4 = 0 THEN NULL ELSE i % 3 = 0 END) AS b,\n        (DATE '2020-05-01' + (i % 90)::INTEGER) AS d,\n        (i % 4)::INTEGER AS \"a OR b\"\n      FROM range(1, 1200) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 300)"
+    }
+  ],
+  "cases": [
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:0",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt > 5 AND id < 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:0",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt > 5 AND id < 3)) AS c, sum(id) FILTER (WHERE NOT (amt > 5 AND id < 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:1",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt > 5 OR id < -1000)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:1",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt > 5 OR id < -1000)) AS c, sum(id) FILTER (WHERE NOT (amt > 5 OR id < -1000)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:2",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT NOT (amt > 5 OR id < -1000)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:2",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT NOT (amt > 5 OR id < -1000)) AS c, sum(id) FILTER (WHERE NOT NOT (amt > 5 OR id < -1000)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:3",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id > 0 AND NOT (amt > 1000 OR nname LIKE 'v3%')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:3",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE id > 0 AND NOT (amt > 1000 OR nname LIKE 'v3%')) AS c, sum(id) FILTER (WHERE id > 0 AND NOT (amt > 1000 OR nname LIKE 'v3%')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:4",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt > 1000 OR nname LIKE 'v3%') AND id > 0",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:4",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt > 1000 OR nname LIKE 'v3%') AND id > 0) AS c, sum(id) FILTER (WHERE NOT (amt > 1000 OR nname LIKE 'v3%') AND id > 0) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:5",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id < -1500 OR NOT (amt > 0 AND nname IS NOT NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:5",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE id < -1500 OR NOT (amt > 0 AND nname IS NOT NULL)) AS c, sum(id) FILTER (WHERE id < -1500 OR NOT (amt > 0 AND nname IS NOT NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:6",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT ((amt > 0 OR nname LIKE 'v2%') AND (id > 100 OR nname IS NULL))",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:6",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT ((amt > 0 OR nname LIKE 'v2%') AND (id > 100 OR nname IS NULL))) AS c, sum(id) FILTER (WHERE NOT ((amt > 0 OR nname LIKE 'v2%') AND (id > 100 OR nname IS NULL))) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:7",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (id IN (1, 5, 999) AND amt > 0)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:7",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (id IN (1, 5, 999) AND amt > 0)) AS c, sum(id) FILTER (WHERE NOT (id IN (1, 5, 999) AND amt > 0)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:8",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (id NOT IN (1, 5, 999) OR nname IS NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:8",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (id NOT IN (1, 5, 999) OR nname IS NULL)) AS c, sum(id) FILTER (WHERE NOT (id NOT IN (1, 5, 999) OR nname IS NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:9",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt NOT BETWEEN -100 AND 100)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:9",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt NOT BETWEEN -100 AND 100)) AS c, sum(id) FILTER (WHERE NOT (amt NOT BETWEEN -100 AND 100)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:10",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE amt NOT BETWEEN -100 AND 100 AND id > 0",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:10",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE amt NOT BETWEEN -100 AND 100 AND id > 0) AS c, sum(id) FILTER (WHERE amt NOT BETWEEN -100 AND 100 AND id > 0) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:11",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt BETWEEN -100 AND 100 OR id > 1000)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:11",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt BETWEEN -100 AND 100 OR id > 1000)) AS c, sum(id) FILTER (WHERE NOT (amt BETWEEN -100 AND 100 OR id > 1000)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:12",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (nname LIKE 'v1%' AND name NOT LIKE '%3')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:12",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (nname LIKE 'v1%' AND name NOT LIKE '%3')) AS c, sum(id) FILTER (WHERE NOT (nname LIKE 'v1%' AND name NOT LIKE '%3')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:13",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (nname IS NULL OR amt IS NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:13",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (nname IS NULL OR amt IS NULL)) AS c, sum(id) FILTER (WHERE NOT (nname IS NULL OR amt IS NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:14",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt <= 10 AND amt >= -10)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:14",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt <= 10 AND amt >= -10)) AS c, sum(id) FILTER (WHERE NOT (amt <= 10 AND amt >= -10)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:15",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE amt > 0 OR (id < -1000 OR nname IS NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:15",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE amt > 0 OR (id < -1000 OR nname IS NULL)) AS c, sum(id) FILTER (WHERE amt > 0 OR (id < -1000 OR nname IS NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:16",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT ((amt > 5 AND id < 3) OR nname LIKE 'v2%')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:16",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT ((amt > 5 AND id < 3) OR nname LIKE 'v2%')) AS c, sum(id) FILTER (WHERE NOT ((amt > 5 AND id < 3) OR nname LIKE 'v2%')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:17",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id > 0 AND (amt > 5 OR nname LIKE 'v2%')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:17",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE id > 0 AND (amt > 5 OR nname LIKE 'v2%')) AS c, sum(id) FILTER (WHERE id > 0 AND (amt > 5 OR nname LIKE 'v2%')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:18",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:18",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%') AS c, sum(id) FILTER (WHERE NOT (amt > 5 AND id < 3) AND nname LIKE 'v2%') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:19",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE nname = 'a OR id > 0'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:19",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE nname = 'a OR id > 0') AS c, sum(id) FILTER (WHERE nname = 'a OR id > 0') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:20",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE name LIKE 'n1%' ESCAPE '#'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:20",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE name LIKE 'n1%' ESCAPE '#') AS c, sum(id) FILTER (WHERE name LIKE 'n1%' ESCAPE '#') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:21",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (id > -5 AND amt < 1.5E+3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:21",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (id > -5 AND amt < 1.5E+3)) AS c, sum(id) FILTER (WHERE NOT (id > -5 AND amt < 1.5E+3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:22",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (price > 1e2 OR d >= '2020-06-01') OR ts < '2020-01-01 00:00:00.0995'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:22",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (price > 1e2 OR d >= '2020-06-01') OR ts < '2020-01-01 00:00:00.0995') AS c, sum(id) FILTER (WHERE NOT (price > 1e2 OR d >= '2020-06-01') OR ts < '2020-01-01 00:00:00.0995') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:23",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE nname NOT IN ('v1', NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:23",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE nname NOT IN ('v1', NULL)) AS c, sum(id) FILTER (WHERE nname NOT IN ('v1', NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:24",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (nname IN ('v1', NULL))",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:24",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (nname IN ('v1', NULL))) AS c, sum(id) FILTER (WHERE NOT (nname IN ('v1', NULL))) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:25",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE nname != NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:25",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE nname != NULL) AS c, sum(id) FILTER (WHERE nname != NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:26",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE name = nname",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:26",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE name = nname) AS c, sum(id) FILTER (WHERE name = nname) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:27",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE name = 'n' || '1'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:27",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE name = 'n' || '1') AS c, sum(id) FILTER (WHERE name = 'n' || '1') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:28",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE nname LIKE NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:28",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE nname LIKE NULL) AS c, sum(id) FILTER (WHERE nname LIKE NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:29",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE nname NOT LIKE NULL OR id = 7",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:29",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE nname NOT LIKE NULL OR id = 7) AS c, sum(id) FILTER (WHERE nname NOT LIKE NULL OR id = 7) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:30",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (nname LIKE NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:30",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (nname LIKE NULL)) AS c, sum(id) FILTER (WHERE NOT (nname LIKE NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:31",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id BETWEEN NULL AND 5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:31",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE id BETWEEN NULL AND 5) AS c, sum(id) FILTER (WHERE id BETWEEN NULL AND 5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:32",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id NOT BETWEEN NULL AND 5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:32",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE id NOT BETWEEN NULL AND 5) AS c, sum(id) FILTER (WHERE id NOT BETWEEN NULL AND 5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:33",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (id BETWEEN -5 AND NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:33",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (id BETWEEN -5 AND NULL)) AS c, sum(id) FILTER (WHERE NOT (id BETWEEN -5 AND NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:34",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE amt < +2.5e3 AND amt > -1.5E2",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:34",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE amt < +2.5e3 AND amt > -1.5E2) AS c, sum(id) FILTER (WHERE amt < +2.5e3 AND amt > -1.5E2) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:35",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE price BETWEEN -1.5 AND 1e2",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:35",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE price BETWEEN -1.5 AND 1e2) AS c, sum(id) FILTER (WHERE price BETWEEN -1.5 AND 1e2) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:36",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE flag",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:36",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE flag) AS c, sum(id) FILTER (WHERE flag) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:37",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT flag",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:37",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT flag) AS c, sum(id) FILTER (WHERE NOT flag) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:38",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE \"flag\"",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:38",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE \"flag\") AS c, sum(id) FILTER (WHERE \"flag\") AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:39",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE flag AND id > 0",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:39",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE flag AND id > 0) AS c, sum(id) FILTER (WHERE flag AND id > 0) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:40",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT flag OR nname IS NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:40",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT flag OR nname IS NULL) AS c, sum(id) FILTER (WHERE NOT flag OR nname IS NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:41",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE NOT (flag AND amt > 0)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:41",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (flag AND amt > 0)) AS c, sum(id) FILTER (WHERE NOT (flag AND amt > 0)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:42",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE flag OR NOT flag",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:42",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE flag OR NOT flag) AS c, sum(id) FILTER (WHERE flag OR NOT flag) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:43",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE (flag OR id < -1900) AND NOT (nname LIKE 'v1%')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:43",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE (flag OR id < -1900) AND NOT (nname LIKE 'v1%')) AS c, sum(id) FILTER (WHERE (flag OR id < -1900) AND NOT (nname LIKE 'v1%')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:where:44",
+      "fixture": "main",
+      "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:diff:filter:44",
+      "fixture": "main",
+      "sql": "SELECT count(*) FILTER (WHERE id) AS c, sum(id) FILTER (WHERE id) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:0",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x > 5 AND y < 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:0",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x > 5 AND y < 3)) AS c, sum(x) FILTER (WHERE NOT (x > 5 AND y < 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:1",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x > 5 OR y < 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:1",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x > 5 OR y < 3)) AS c, sum(x) FILTER (WHERE NOT (x > 5 OR y < 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:2",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT NOT (x > 5 OR y < 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:2",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT NOT (x > 5 OR y < 3)) AS c, sum(x) FILTER (WHERE NOT NOT (x > 5 OR y < 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:3",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT NOT NOT x > 5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:3",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT NOT NOT x > 5) AS c, sum(x) FILTER (WHERE NOT NOT NOT x > 5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:4",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE z = 1 AND NOT (x > 5 OR y < 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:4",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE z = 1 AND NOT (x > 5 OR y < 3)) AS c, sum(x) FILTER (WHERE z = 1 AND NOT (x > 5 OR y < 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:5",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x > 5 OR y < 3) AND z = 1",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:5",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x > 5 OR y < 3) AND z = 1) AS c, sum(x) FILTER (WHERE NOT (x > 5 OR y < 3) AND z = 1) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:6",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x > 5 AND y < 3) OR z = 1",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:6",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x > 5 AND y < 3) OR z = 1) AS c, sum(x) FILTER (WHERE NOT (x > 5 AND y < 3) OR z = 1) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:7",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE z = 1 OR NOT (x > 5 AND y < 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:7",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE z = 1 OR NOT (x > 5 AND y < 3)) AS c, sum(x) FILTER (WHERE z = 1 OR NOT (x > 5 AND y < 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:8",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:8",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))) AS c, sum(x) FILTER (WHERE NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:9",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x IN (1, 2) AND y = 1)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:9",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x IN (1, 2) AND y = 1)) AS c, sum(x) FILTER (WHERE NOT (x IN (1, 2) AND y = 1)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:10",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x NOT IN (1, 2) OR y = 1)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:10",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x NOT IN (1, 2) OR y = 1)) AS c, sum(x) FILTER (WHERE NOT (x NOT IN (1, 2) OR y = 1)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:11",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x NOT BETWEEN 1 AND 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:11",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x NOT BETWEEN 1 AND 3)) AS c, sum(x) FILTER (WHERE NOT (x NOT BETWEEN 1 AND 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:12",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x NOT BETWEEN 1 AND 3 OR y = 1",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:12",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x NOT BETWEEN 1 AND 3 OR y = 1) AS c, sum(x) FILTER (WHERE x NOT BETWEEN 1 AND 3 OR y = 1) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:13",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x BETWEEN 1 AND 3 OR y = 1)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:13",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x BETWEEN 1 AND 3 OR y = 1)) AS c, sum(x) FILTER (WHERE NOT (x BETWEEN 1 AND 3 OR y = 1)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:14",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (s LIKE 'a%' AND s NOT LIKE '%b')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:14",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (s LIKE 'a%' AND s NOT LIKE '%b')) AS c, sum(x) FILTER (WHERE NOT (s LIKE 'a%' AND s NOT LIKE '%b')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:15",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (s IS NULL OR s IS NOT NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:15",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (s IS NULL OR s IS NOT NULL)) AS c, sum(x) FILTER (WHERE NOT (s IS NULL OR s IS NOT NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:16",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x = 1 OR (y = 2 OR z = 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:16",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x = 1 OR (y = 2 OR z = 3)) AS c, sum(x) FILTER (WHERE x = 1 OR (y = 2 OR z = 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:17",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x = 1 AND (y = 2 AND (z = 3 AND x = 4))",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:17",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x = 1 AND (y = 2 AND (z = 3 AND x = 4))) AS c, sum(x) FILTER (WHERE x = 1 AND (y = 2 AND (z = 3 AND x = 4))) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:18",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE (x = 1 AND y = 2) OR z = 3",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:18",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE (x = 1 AND y = 2) OR z = 3) AS c, sum(x) FILTER (WHERE (x = 1 AND y = 2) OR z = 3) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:19",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x BETWEEN 1 AND 2 OR s = 'a or b'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:19",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x BETWEEN 1 AND 2 OR s = 'a or b') AS c, sum(x) FILTER (WHERE x BETWEEN 1 AND 2 OR s = 'a or b') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:20",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x > -5 AND y < +2.5e3 AND z IN (-1, 2)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:20",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x > -5 AND y < +2.5e3 AND z IN (-1, 2)) AS c, sum(x) FILTER (WHERE x > -5 AND y < +2.5e3 AND z IN (-1, 2)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:21",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x BETWEEN -1.5 AND 1e2 OR s = ''",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:21",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x BETWEEN -1.5 AND 1e2 OR s = '') AS c, sum(x) FILTER (WHERE x BETWEEN -1.5 AND 1e2 OR s = '') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:22",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE d >= '2020-06-01' AND s IS NOT NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:22",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE d >= '2020-06-01' AND s IS NOT NULL) AS c, sum(x) FILTER (WHERE d >= '2020-06-01' AND s IS NOT NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:23",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT ((x > 5 AND y < 3) OR z = 1)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:23",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT ((x > 5 AND y < 3) OR z = 1)) AS c, sum(x) FILTER (WHERE NOT ((x > 5 AND y < 3) OR z = 1)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:24",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x = 1 AND (y = 2 OR z = 3)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:24",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x = 1 AND (y = 2 OR z = 3)) AS c, sum(x) FILTER (WHERE x = 1 AND (y = 2 OR z = 3)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:25",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE (x = 1 OR y = 2) AND z = 3",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:25",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE (x = 1 OR y = 2) AND z = 3) AS c, sum(x) FILTER (WHERE (x = 1 OR y = 2) AND z = 3) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:26",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:26",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5) AS c, sum(x) FILTER (WHERE NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:27",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (x = 1 AND y = 2) AND z = 3",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:27",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (x = 1 AND y = 2) AND z = 3) AS c, sum(x) FILTER (WHERE NOT (x = 1 AND y = 2) AND z = 3) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:28",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = 'a OR b = 1'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:28",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = 'a OR b = 1') AS c, sum(x) FILTER (WHERE s = 'a OR b = 1') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:29",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = 'rock AND roll'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:29",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = 'rock AND roll') AS c, sum(x) FILTER (WHERE s = 'rock AND roll') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:30",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = 'x BETWEEN y'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:30",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = 'x BETWEEN y') AS c, sum(x) FILTER (WHERE s = 'x BETWEEN y') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:31",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = 'O''Brien'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:31",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = 'O''Brien') AS c, sum(x) FILTER (WHERE s = 'O''Brien') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:32",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s IN ('a,b', 'c')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:32",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s IN ('a,b', 'c')) AS c, sum(x) FILTER (WHERE s IN ('a,b', 'c')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:33",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE \"a OR b\" = 1",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:33",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE \"a OR b\" = 1) AS c, sum(x) FILTER (WHERE \"a OR b\" = 1) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:34",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s LIKE 'a#%' ESCAPE '#'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:34",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s LIKE 'a#%' ESCAPE '#') AS c, sum(x) FILTER (WHERE s LIKE 'a#%' ESCAPE '#') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:35",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s NOT IN ('a', NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:35",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s NOT IN ('a', NULL)) AS c, sum(x) FILTER (WHERE s NOT IN ('a', NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:36",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE NOT (s IN ('a', NULL))",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:36",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE NOT (s IN ('a', NULL))) AS c, sum(x) FILTER (WHERE NOT (s IN ('a', NULL))) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:37",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s IN (NULL)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:37",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s IN (NULL)) AS c, sum(x) FILTER (WHERE s IN (NULL)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:38",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s != NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:38",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s != NULL) AS c, sum(x) FILTER (WHERE s != NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:39",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s > NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:39",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s > NULL) AS c, sum(x) FILTER (WHERE s > NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:40",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s LIKE NULL",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:40",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s LIKE NULL) AS c, sum(x) FILTER (WHERE s LIKE NULL) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:41",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x BETWEEN NULL AND 5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:41",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x BETWEEN NULL AND 5) AS c, sum(x) FILTER (WHERE x BETWEEN NULL AND 5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:42",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s IS 'a'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:42",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s IS 'a') AS c, sum(x) FILTER (WHERE s IS 'a') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:43",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE b = TRUE",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:43",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE b = TRUE) AS c, sum(x) FILTER (WHERE b = TRUE) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:44",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = t",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:44",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = t) AS c, sum(x) FILTER (WHERE s = t) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:45",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = \"t\"",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:45",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = \"t\") AS c, sum(x) FILTER (WHERE s = \"t\") AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:46",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = 'a' || 'b'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:46",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = 'a' || 'b') AS c, sum(x) FILTER (WHERE s = 'a' || 'b') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:47",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = 'a' COLLATE NOCASE",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:47",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = 'a' COLLATE NOCASE) AS c, sum(x) FILTER (WHERE s = 'a' COLLATE NOCASE) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:48",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = upper('a')",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:48",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = upper('a')) AS c, sum(x) FILTER (WHERE s = upper('a')) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:49",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = CAST('a' AS TEXT)",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:49",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = CAST('a' AS TEXT)) AS c, sum(x) FILTER (WHERE s = CAST('a' AS TEXT)) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:50",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s = x'61'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:50",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s = x'61') AS c, sum(x) FILTER (WHERE s = x'61') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:51",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x > 2 + 3",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:51",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x > 2 + 3) AS c, sum(x) FILTER (WHERE x > 2 + 3) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:52",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x > - -5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:52",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x > - -5) AS c, sum(x) FILTER (WHERE x > - -5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:53",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE 5 < x",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:53",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE 5 < x) AS c, sum(x) FILTER (WHERE 5 < x) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:54",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE x + 1 > 5",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:54",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE x + 1 > 5) AS c, sum(x) FILTER (WHERE x + 1 > 5) AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:where:55",
+      "fixture": "unit",
+      "sql": "SELECT count(*) AS c, sum(x) AS s FROM '{path}' WHERE s GLOB 'a*'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    },
+    {
+      "kind": "sql",
+      "id": "sql_pred:unit:filter:55",
+      "fixture": "unit",
+      "sql": "SELECT count(*) FILTER (WHERE s GLOB 'a*') AS c, sum(x) FILTER (WHERE s GLOB 'a*') AS s FROM '{path}'",
+      "jobs": [
+        1,
+        4,
+        16
+      ]
+    }
+  ]
+}

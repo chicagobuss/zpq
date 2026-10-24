@@ -2,6 +2,7 @@
 //! DuckDB is the CLI. Pyarrow is the strict reader for files zpq writes.
 //!
 //!   referee --cases tools/runner/cases/filter_projection.json \
+//!           --cases tools/runner/cases/sql_pred.json \
 //!           --divergences tests/known_divergences.json \
 //!           [--duckdb PATH] [--pyarrow PATH] [--limit N]
 
@@ -17,11 +18,15 @@ const usage =
 
 const Case = struct {
     id: []const u8,
+    kind: []const u8,
+    fixture_name: []const u8,
     filter: ?[]const u8 = null,
     where: ?[]const u8 = null,
     columns: ?[]const []const u8 = null,
     select_z: ?[]const u8 = null,
     select_d: ?[]const u8 = null,
+    sql: ?[]const u8 = null,
+    jobs: []const usize = &.{},
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -31,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var cases_path: ?[]const u8 = null;
+    var case_files: std.ArrayList([]const u8) = .empty;
     var divergences_path: ?[]const u8 = null;
     var duckdb: []const u8 = "";
     var pyarrow: []const u8 = ".venv/bin/python";
@@ -45,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("{s}", .{usage});
             return;
         } else if (std.mem.eql(u8, arg, "--cases")) {
-            cases_path = iter.next() orelse return error.BadArgs;
+            try case_files.append(arena, iter.next() orelse return error.BadArgs);
         } else if (std.mem.eql(u8, arg, "--divergences")) {
             divergences_path = iter.next() orelse return error.BadArgs;
         } else if (std.mem.eql(u8, arg, "--duckdb")) {
@@ -59,17 +64,14 @@ pub fn main(init: std.process.Init) !void {
             limit = try std.fmt.parseInt(usize, text, 10);
         } else return error.BadArgs;
     }
-    const cases_file = cases_path orelse return error.BadArgs;
+    if (case_files.items.len == 0) return error.BadArgs;
     const divergences_file = divergences_path orelse return error.BadArgs;
     if (duckdb.len == 0) {
         const home = std.mem.span(std.c.getenv("HOME") orelse return error.BadArgs);
         duckdb = try std.fmt.allocPrint(arena, "{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
     }
 
-    const cases_text = try std.Io.Dir.cwd().readFileAlloc(io, cases_file, arena, .limited(16 << 20));
     const div_text = try std.Io.Dir.cwd().readFileAlloc(io, divergences_file, arena, .limited(1 << 20));
-    var cases_parsed = try std.json.parseFromSlice(std.json.Value, arena, cases_text, .{});
-    defer cases_parsed.deinit();
     var div_parsed = try std.json.parseFromSlice(std.json.Value, arena, div_text, .{});
     defer div_parsed.deinit();
 
@@ -79,56 +81,257 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try std.Io.Dir.cwd().createDirPath(io, work);
-    const fixture = try std.fmt.allocPrint(arena, "{s}/fixture.parquet", .{work});
-    const out_path = try std.fmt.allocPrint(arena, "{s}/out.parquet", .{work});
-    const diff_path = try std.fmt.allocPrint(arena, "{s}/diff.csv", .{work});
-    const copy_sql = cases_parsed.value.object.get("fixture_copy").?.string;
-    var copy_buf: std.ArrayList(u8) = .empty;
-    try substitute(arena, &copy_buf, copy_sql, "{path}", fixture);
-    try duckExec(gpa, io, duckdb, copy_buf.items);
-
-    const schema_order = try stringList(arena, cases_parsed.value.object.get("schema_order").?);
-    const case_values = cases_parsed.value.object.get("cases").?.array.items;
     const ctx: engine.Context = .{ .gpa = gpa, .env = init.minimal.environ, .io = io };
+    zpq.core.expr.sql_parser.diagnostic_fn = swallowDiagnostic;
+    defer zpq.core.expr.sql_parser.diagnostic_fn = null;
     var matched: usize = 0;
     var expected: usize = 0;
     var failed: usize = 0;
+    var refused: usize = 0;
     var total: usize = 0;
-
-    for (case_values) |raw| {
+    for (case_files.items, 0..) |cases_file, file_i| {
+        const outcome = try runFile(gpa, arena, io, ctx, duckdb, pyarrow, work, file_i, cases_file, &known, limit, &total);
+        matched += outcome.matched;
+        expected += outcome.expected;
+        failed += outcome.failed;
+        refused += outcome.refused;
         if (limit) |n| if (total >= n) break;
-        total += 1;
-        const case = try decodeCase(arena, raw);
-        const failure = runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case) catch |err| blk: {
-            break :blk try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
-        };
-        if (failure) |why| {
-            if (known.contains(case.id)) {
-                expected += 1;
-                std.debug.print("EXPECTED {s}  {s}\n", .{ case.id, why });
-            } else {
-                failed += 1;
-                std.debug.print("FAIL {s}  {s}\n", .{ case.id, why });
-            }
-        } else matched += 1;
     }
 
     std.debug.print("referee: {d}/{d} checks match\n", .{ matched, total });
     std.debug.print("referee: expected {d}\n", .{expected});
+    std.debug.print("referee: refusals {d}\n", .{refused});
     std.debug.print("referee: divergences {d}\n", .{known.count()});
     if (failed != 0) std.process.exit(1);
+}
+
+fn swallowDiagnostic(_: []const u8) void {}
+
+const Counts = struct { matched: usize = 0, expected: usize = 0, failed: usize = 0, refused: usize = 0 };
+
+fn runFile(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    pyarrow: []const u8,
+    work: []const u8,
+    file_i: usize,
+    cases_file: []const u8,
+    known: *std.StringHashMap(void),
+    limit: ?usize,
+    total: *usize,
+) !Counts {
+    const cases_text = try std.Io.Dir.cwd().readFileAlloc(io, cases_file, arena, .limited(32 << 20));
+    var cases_parsed = try std.json.parseFromSlice(std.json.Value, arena, cases_text, .{});
+    defer cases_parsed.deinit();
+    const root = cases_parsed.value.object;
+
+    var fixtures = std.StringHashMap([]const u8).init(arena);
+    if (root.get("fixture_copy")) |copy| {
+        const path = try std.fmt.allocPrint(arena, "{s}/f{d}-main.parquet", .{ work, file_i });
+        var buf: std.ArrayList(u8) = .empty;
+        try substitute(arena, &buf, copy.string, "{path}", path);
+        try duckExec(gpa, io, duckdb, buf.items);
+        try fixtures.put("main", path);
+    }
+    if (root.get("fixtures")) |listed| {
+        for (listed.array.items) |item| {
+            const name = item.object.get("name").?.string;
+            const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.parquet", .{ work, file_i, name });
+            var buf: std.ArrayList(u8) = .empty;
+            try substitute(arena, &buf, item.object.get("copy").?.string, "{path}", path);
+            try duckExec(gpa, io, duckdb, buf.items);
+            try fixtures.put(name, path);
+        }
+    }
+    const schema_order: []const []const u8 = if (root.get("schema_order")) |v| try stringList(arena, v) else &.{};
+    const out_path = try std.fmt.allocPrint(arena, "{s}/f{d}-out.parquet", .{ work, file_i });
+    const diff_path = try std.fmt.allocPrint(arena, "{s}/f{d}-diff.csv", .{ work, file_i });
+    const ans_path = try std.fmt.allocPrint(arena, "{s}/f{d}-ans.csv", .{ work, file_i });
+
+    var counts: Counts = .{};
+    for (root.get("cases").?.array.items) |raw| {
+        if (limit) |n| if (total.* >= n) break;
+        const case = try decodeCase(arena, raw);
+        const checks: usize = if (std.mem.eql(u8, case.kind, "sql")) @max(case.jobs.len, 1) else 1;
+        total.* += checks;
+        const fixture = fixtures.get(case.fixture_name) orelse return error.MissingFixture;
+        const failure = if (std.mem.eql(u8, case.kind, "sql"))
+            runSql(gpa, io, ctx, duckdb, fixture, ans_path, case, &counts.refused)
+        else
+            runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case);
+        const why = failure catch |err| try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        if (why) |text| {
+            if (known.contains(case.id)) {
+                counts.expected += checks;
+                std.debug.print("EXPECTED {s}  {s}\n", .{ case.id, text });
+            } else {
+                counts.failed += checks;
+                std.debug.print("FAIL {s}  {s}\n", .{ case.id, text });
+            }
+        } else counts.matched += checks;
+    }
+    return counts;
 }
 
 fn decodeCase(arena: std.mem.Allocator, raw: std.json.Value) !Case {
     const obj = raw.object;
     return .{
         .id = obj.get("id").?.string,
+        .kind = optionalString(obj, "kind") orelse "write",
+        .fixture_name = optionalString(obj, "fixture") orelse "main",
         .filter = optionalString(obj, "filter"),
         .where = optionalString(obj, "where"),
         .columns = if (obj.get("columns")) |v| if (v == .null) null else try stringList(arena, v) else null,
         .select_z = optionalString(obj, "select"),
         .select_d = optionalString(obj, "duckdb_select"),
+        .sql = optionalString(obj, "sql"),
+        .jobs = if (obj.get("jobs")) |v| try jobList(arena, v) else &.{},
     };
+}
+
+fn jobList(arena: std.mem.Allocator, v: std.json.Value) ![]const usize {
+    const items = v.array.items;
+    const out = try arena.alloc(usize, items.len);
+    for (items, 0..) |item, i| {
+        out[i] = switch (item) {
+            .integer => |n| @intCast(n),
+            else => return error.BadJobs,
+        };
+    }
+    return out;
+}
+
+threadlocal var diag_buf: [8192]u8 = undefined;
+threadlocal var diag_len: usize = 0;
+
+fn captureDiag(msg: []const u8) void {
+    const room = diag_buf.len -| diag_len;
+    const n = @min(msg.len, room);
+    if (n == 0) return;
+    @memcpy(diag_buf[diag_len..][0..n], msg[0..n]);
+    diag_len += n;
+}
+
+fn lastDiagLine(gpa: std.mem.Allocator) ![]u8 {
+    const text = std.mem.trim(u8, diag_buf[0..diag_len], " \t\r\n");
+    const line = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |at|
+        std.mem.trim(u8, text[at + 1 ..], " \t\r\n")
+    else
+        text;
+    return gpa.dupe(u8, line);
+}
+
+fn runSql(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    fixture: []const u8,
+    ans_path: []const u8,
+    case: Case,
+    refusals: *usize,
+) !?[]const u8 {
+    const sql_src = case.sql orelse return error.MissingSql;
+    var sql_buf: std.ArrayList(u8) = .empty;
+    defer sql_buf.deinit(gpa);
+    try substitute(gpa, &sql_buf, sql_src, "{path}", fixture);
+    const wrapped = try std.fmt.allocPrint(gpa,
+        \\COPY (SELECT c::VARCHAR, CASE WHEN s IS NULL THEN 'NULL' ELSE s::VARCHAR END FROM ({s}) q(c, s)) TO '{s}' (HEADER false)
+    , .{ sql_buf.items, ans_path });
+    defer gpa.free(wrapped);
+    const duck = try capture(gpa, io, &.{ duckdb, "-no-agent", "-c", wrapped });
+    defer gpa.free(duck.stdout);
+    defer gpa.free(duck.stderr);
+    const duck_refused = duck.code != 0;
+    const want: []u8 = if (duck_refused) "" else blk: {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, ans_path, gpa, .limited(1 << 20));
+        defer gpa.free(text);
+        break :blk try stripQuotes(gpa, std.mem.trim(u8, text, " \t\r\n"));
+    };
+    defer if (want.len != 0 or !duck_refused) gpa.free(want);
+
+    const prev_sql = zpq.core.expr.sql_parser.diagnostic_fn;
+    const prev_front = zpq.frontend.diagnostic_fn;
+    zpq.core.expr.sql_parser.diagnostic_fn = captureDiag;
+    zpq.frontend.diagnostic_fn = captureDiag;
+    defer zpq.core.expr.sql_parser.diagnostic_fn = prev_sql;
+    defer zpq.frontend.diagnostic_fn = prev_front;
+
+    const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
+    var first_refusal: ?[]u8 = null;
+    defer if (first_refusal) |msg| gpa.free(msg);
+    // A refusal with one stable message is a pass, including when DuckDB can
+    // answer. That is the sql_pred gate: zpq may refuse more, and an answer
+    // must equal DuckDB. An answer where DuckDB refuses is a failure.
+    var answered = false;
+    for (jobs) |j| {
+        diag_len = 0;
+        var diag: zpq.core.diag.Diag = .{};
+        const got = queryAggregate(gpa, ctx, sql_buf.items, j, &diag) catch |err| {
+            if (answered) return try std.fmt.allocPrint(gpa, "differs across -j", .{});
+            if (diag_len == 0) zpq.frontend.queryError(err, &diag);
+            const msg = try lastDiagLine(gpa);
+            defer gpa.free(msg);
+            if (msg.len == 0) return try std.fmt.allocPrint(gpa, "refused without a message ({s})", .{@errorName(err)});
+            if (first_refusal) |prev| {
+                if (!std.mem.eql(u8, prev, msg)) return try std.fmt.allocPrint(gpa, "differs across -j: {s} vs {s}", .{ prev, msg });
+            } else first_refusal = try gpa.dupe(u8, msg);
+            continue;
+        };
+        defer gpa.free(got);
+        if (first_refusal != null) return try std.fmt.allocPrint(gpa, "differs across -j", .{});
+        answered = true;
+        if (duck_refused) return try std.fmt.allocPrint(gpa, "zpq answered {s}; duckdb refuses", .{got});
+        if (!std.mem.eql(u8, got, want)) return try std.fmt.allocPrint(gpa, "zpq {s} duck {s}", .{ got, want });
+    }
+    if (!answered) refusals.* += jobs.len;
+    return null;
+}
+
+fn stripQuotes(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (text) |c| if (c != '"') try buf.append(gpa, c);
+    return buf.toOwnedSlice(gpa);
+}
+
+fn queryAggregate(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jobs: usize, diag: *zpq.core.diag.Diag) ![]u8 {
+    const pq = try zpq.core.expr.sql_parser.parseSqlQuery(gpa, sql);
+    defer pq.deinit(gpa);
+    var result = try engine.runQuery(ctx, .{
+        .inputs = &.{pq.table_name},
+        .aggregate = pq.aggregate_str,
+        .filter = pq.filter_str,
+        .group_by = pq.group_by_str,
+        .select = pq.select_str,
+        .select_cols = pq.select_cols,
+        .result_order = pq.result_order,
+        .parallelism = jobs,
+        .diag = diag,
+    });
+    defer result.deinit(gpa);
+    const aggs = switch (result) {
+        .aggregate => |*answer| answer.output.aggs,
+        .write => return error.NotAggregate,
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (aggs, 0..) |item, i| {
+        if (i != 0) try buf.append(gpa, ',');
+        switch (item.value) {
+            .i => |n| {
+                var tmp: [64]u8 = undefined;
+                const text = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch return error.Format;
+                try buf.appendSlice(gpa, text);
+            },
+            .null_val => try buf.appendSlice(gpa, "NULL"),
+            else => return error.UnexpectedAgg,
+        }
+    }
+    return buf.toOwnedSlice(gpa);
 }
 
 fn optionalString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {

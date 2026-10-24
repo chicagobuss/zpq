@@ -71,3 +71,7 @@ row update, including i128 sums and minimum first ordinals. NULL records take th
 
 COUNT top-H admits the value-less integer run producer only when the footer order hint selects it. Every decoded key
 and seam must still verify; a refusal returns to the existing general COUNT plan. It decodes no SUM value column.
+
+Run fragments are contiguous within each source's disjoint row reservation. Their first ordinals still index the
+winner map, which resolves to compact fragment ids. Seam removal and top-H selection consult that map through a
+group's ordinal; output windows already resolve the same indirection. The reservation and row limit are unchanged.

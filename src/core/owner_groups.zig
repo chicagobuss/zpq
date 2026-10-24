@@ -245,15 +245,18 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         return;
                     }
                 }
-                s.groups[ordinal] = .{
+                // Keep fragments contiguous inside this source's disjoint row reservation. The winner map carries
+                // the source ordinal separately, avoiding physical pages for the gaps between repeated keys.
+                const id = l.ordinal_base + @as(u32, @intCast(run.groups));
+                s.groups[id] = .{
                     .key = @bitCast(k),
                     .count = 1 | (if (value != null) Group.sum_present else @as(u32, 0)),
                     .sum = value orelse 0,
                     .first = ordinal,
                 };
-                s.winners[ordinal] = ordinal + 1;
-                if (run.groups == 0) run.first = ordinal;
-                run.last = ordinal;
+                s.winners[ordinal] = id + 1;
+                if (run.groups == 0) run.first = id;
+                run.last = id;
                 run.groups += 1;
             }
 
@@ -597,8 +600,10 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 fn runTop(t: *Task, item: usize) void {
                     const r = t.s.runs[item];
                     if (r.groups == 0) return;
-                    for (r.first..@as(usize, r.last) + 1) |i| if (t.s.winners[i] != 0)
-                        t.s.keep(t.heap.?, t.s.groups[i]);
+                    for (r.first..@as(usize, r.last) + 1) |i| {
+                        const g = t.s.groups[i];
+                        if (t.s.winners[g.ordinal()] != 0) t.s.keep(t.heap.?, g);
+                    }
                 }
 
                 fn ensureSlots(t: *Task, cap: usize) ![]u32 {
@@ -716,7 +721,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                             left.sum += right.sum;
                             left.count = (left.count & Group.sum_present) | (right.count & Group.sum_present) |
                                 @as(u32, @intCast(left.countValue() + right.countValue()));
-                            s.winners[run.first] = 0;
+                            s.winners[right.ordinal()] = 0;
                             s.group_count -= 1;
                             if (run.groups == 1) continue; // Keep the original owner across any number of seams.
                         }
@@ -729,8 +734,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     s.combineTop();
                     return;
                 }
-                for (s.winners, 0..) |winner, i| if (winner != 0) {
-                    const g = s.groups[i];
+                for (s.winners) |winner| if (winner != 0) {
+                    const g = s.groups[winner - 1];
                     if (g.sumValue() != null and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
                 };
                 s.bitmap = try s.gpa.alloc(u64, (s.rows + 63) / 64);

@@ -6321,6 +6321,9 @@ fn compactRows(
         if (page_indexes[ci] == null) return null;
         const cm = in.rg.columns.items[ci].meta_data orelse return null;
         if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+        // Exact DECIMAL and INT96 decoders read whole chunks, not kept rows (`decodeAggColumn`).
+        if (cm.type == .INT96) return null;
+        if (in.meta.getColumnSchema(cm.path_in_schema.items)) |se| if (decimal_mod.exactKind(&se) != null) return null;
     }
     var ranges: std.ArrayList(RowRange) = .empty;
     var at: usize = 0;

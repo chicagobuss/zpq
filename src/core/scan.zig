@@ -11558,6 +11558,47 @@ test "page-pruned row groups decode just their kept rows, with the answers of wh
     }
 }
 
+test "page-pruned DECIMAL and INT96 columns decode whole and answer as with compaction off" {
+    // INT32/INT64/FLBA-backed DECIMAL(9/18/38) and INT96, required and optional, behind a page index: their exact
+    // decoders read whole chunks, so a row group reading them decodes whole columns rather than compacting.
+    const fixture = "ci/fixtures/parquet/decimal_int96_page_index.parquet";
+    const bytes = metadata.readFileSlice(fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    const inputs = [_]Input{.{ .name = fixture, .bytes = bytes }};
+    const shapes = [_]struct { agg: []const u8, compacts: ?bool }{
+        .{ .agg = "count(*) AS n, sum(d9) AS a, sum(d18) AS b, max(d38) AS c", .compacts = false },
+        .{ .agg = "count(*) AS n, sum(d9o) AS a, min(d18o) AS b, max(d38o) AS c, count(d38o) AS cc", .compacts = false },
+        .{ .agg = "count(*) AS n, min(ts) AS t, max(tso) AS u, count(tso) AS cu", .compacts = false },
+        // A control reading neither: whether it compacts is not this test's subject, only that answers agree.
+        .{ .agg = "count(*) AS n, max(id) AS hi", .compacts = null },
+    };
+    for ([_][]const u8{ "id >= 100 AND id < 140", "id >= 1490 AND id < 1510", "id = 2999" }) |f| for (shapes) |shape|
+        for ([_]usize{ 1, 4 }) |j| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const args: MultiAggArgs = .{
+                .inputs = &inputs,
+                .filter = f,
+                .aggregate = shape.agg,
+                .parallelism = j,
+                .min_bytes_per_worker = 1,
+            };
+            consumer.compact_rows_in_tests = false;
+            var want = try runMultiAggregate(testing.allocator, a, args);
+            defer want.deinit(testing.allocator);
+            consumer.compact_rows_in_tests = true;
+            const before = consumer.compacted_row_groups.load(.monotonic);
+            var got = try runMultiAggregate(testing.allocator, a, args);
+            defer got.deinit(testing.allocator);
+            if (shape.compacts) |c| try testing.expectEqual(c, consumer.compacted_row_groups.load(.monotonic) > before);
+            try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
+        };
+}
+
 test "a payload page whose rows the filter rejects is not decoded; one with a selected row reports its corruption" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

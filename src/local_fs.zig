@@ -38,6 +38,22 @@ pub fn syncData(fd: fd_t) !void {
     }
 }
 
+/// Start Linux writeback without waiting for completion; publication still needs its final data sync.
+pub fn startWriteback(fd: fd_t, offset: u64, len: u64) !void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+    while (true) {
+        const rc = linux.syscall4(.sync_file_range, @intCast(fd), @intCast(offset), @intCast(len), 2);
+        switch (linux.errno(rc)) {
+            .SUCCESS, .NOSYS, .INVAL, .OPNOTSUPP => return,
+            .INTR => continue,
+            .IO => return error.InputOutput,
+            .NOSPC, .DQUOT => return error.NoSpaceLeft,
+            else => return error.SyncFailed,
+        }
+    }
+}
+
 pub fn openRead(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
 }
@@ -790,4 +806,21 @@ test "parallel mapping release keeps bytes intact and falls back when concurrenc
         releaseMappingPages(mapped.bytes, runtime.io());
         try testing.expectEqualSlices(u8, data, mapped.bytes);
     }
+}
+
+test "starting writeback preserves the bytes and the write position" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/writeback", .{tmp.sub_path});
+    const fd = try createNewFile(path);
+    defer close(fd);
+    try writeAll(fd, "before");
+    try startWriteback(fd, 0, 6);
+    try writeAll(fd, "after");
+    try syncData(fd);
+    const bytes = try readFile(t.allocator, path);
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("beforeafter", bytes);
 }

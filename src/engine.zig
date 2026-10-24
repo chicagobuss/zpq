@@ -6077,11 +6077,16 @@ fn groupedDecColumn(
 const FdSink = struct {
     fd: local_fs.fd_t,
     written: u64 = 0,
+    writeback_to: u64 = 0,
 
     pub fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FdSink = @ptrCast(@alignCast(ctx));
         try local_fs.writeAll(self.fd, bytes);
         self.written += bytes.len;
+        if (self.written - self.writeback_to >= 64 << 20) {
+            try local_fs.startWriteback(self.fd, self.writeback_to, self.written - self.writeback_to);
+            self.writeback_to = self.written;
+        }
     }
 };
 

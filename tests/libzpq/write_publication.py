@@ -15,7 +15,7 @@ import zpq
 
 with tempfile.TemporaryDirectory(prefix='zpq-lib-publication-') as d:
     root = Path(d)
-    src, bad_src, dst = (root / n for n in ('input.parquet', 'bad.parquet', 'out.parquet'))
+    src, bad_src, dst = (root / n for n in ('input.parquet', 'bad.parquet', 'out"quoted.parquet'))
     table = pa.table({'k': [1, 2, 1], 'v': [3, 4, 5]})
     pq.write_table(table, src)
     bad = pa.Array.from_buffers(pa.decimal128(20, 0), 10_000,

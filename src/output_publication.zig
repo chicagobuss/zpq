@@ -12,6 +12,7 @@ pub const OutputPublication = struct {
     target: ?[]const u8 = null,
     permissions: ?std.Io.File.Permissions = null,
     fd: ?local_fs.fd_t = null,
+    target_buffer: [std.fs.max_path_bytes]u8 = undefined,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
 
@@ -50,7 +51,9 @@ pub const OutputPublication = struct {
         // Retain the exclusive fd: reopening even this empty file with O_TRUNC makes ext4 flush at final close.
         self.fd = try local_fs.createNewFile(tmp);
         self.len = tmp.len;
-        self.target = target;
+        // The library publishes after the request parser has released its strings.
+        @memcpy(self.target_buffer[0..target.len], target);
+        self.target = self.target_buffer[0..target.len];
         return self.path();
     }
 
@@ -108,4 +111,24 @@ test "publication abort preserves target; concurrent preparations retain separat
     var alias: OutputPublication = .{};
     defer alias.abort();
     try t.expectError(error.InputOutputSame, alias.prepare(t.io, target, &.{target}));
+}
+
+test "publication owns its target after the caller releases the request string" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var source_buf: [256]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buf, ".zig-cache/tmp/{s}/answer", .{tmp.sub_path});
+    var expected_buf: [256]u8 = undefined;
+    @memcpy(expected_buf[0..source.len], source);
+    const expected = expected_buf[0..source.len];
+    var publication: OutputPublication = .{};
+    defer publication.abort();
+    _ = try publication.prepare(t.io, source, &.{});
+    @memset(source, 'x');
+    try local_fs.writeAll(publication.fd.?, "answer");
+    try publication.commit(t.io);
+    const bytes = try local_fs.readFile(t.allocator, expected);
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("answer", bytes);
 }

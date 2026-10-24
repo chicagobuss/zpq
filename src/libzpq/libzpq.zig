@@ -232,10 +232,11 @@ export fn zpq_run(
     defer self.leave();
 
     var call: Call = .{ .ctx = self, .body = body };
+    defer call.publication.abort();
     if (stackLeft() >= inline_stack) call.run() else {
         self.runners.run(&call) catch return fail(out_json, .einternal, "ThreadSpawnFailed");
     }
-    const response = call.result catch |err|
+    var response = call.result catch |err|
         return switch (err) {
             error.OutOfMemory => @backingInt(Status.enomem),
             error.ContextClosed => fail(out_json, .eclosed, "Closed"),
@@ -243,10 +244,19 @@ export fn zpq_run(
         };
     // The response is already the C heap's (`gpa` is `c_allocator`): grown by its NUL and handed over, not copied,
     // so a large answer is not held twice.
-    const buf: [*]u8 = @ptrCast(c.realloc(response.ptr, response.len + 1) orelse {
+    var buf: [*]u8 = @ptrCast(c.realloc(response.ptr, response.len + 1) orelse {
         gpa.free(response);
         return @backingInt(Status.enomem);
     });
+    // Publish only after the final response allocation, including its C terminator, has succeeded.
+    call.publication.commit(self.threaded.io()) catch |err| {
+        c.free(buf);
+        response = service.publicationError(gpa, err) catch return @backingInt(Status.enomem);
+        buf = @ptrCast(c.realloc(response.ptr, response.len + 1) orelse {
+            gpa.free(response);
+            return @backingInt(Status.enomem);
+        });
+    };
     buf[response.len] = 0;
     out_json.?.* = buf[0..response.len :0].ptr;
     if (out_len) |l| l.* = response.len;
@@ -300,12 +310,21 @@ fn stackLeft() usize {
 const Call = struct {
     ctx: *Ctx,
     body: []const u8,
+    publication: zpq.output_publication.OutputPublication = .{},
     result: @typeInfo(@TypeOf(service.handle)).@"fn".return_type.? = undefined,
     next: ?*Call = null,
     finished: bool = false,
 
     fn run(call: *Call) void {
-        call.result = service.handle(call.ctx.threaded.io(), gpa, processEnviron(), call.body, &call.ctx.pool, null);
+        call.result = service.handleStaged(
+            call.ctx.threaded.io(),
+            gpa,
+            processEnviron(),
+            call.body,
+            &call.ctx.pool,
+            null,
+            &call.publication,
+        );
     }
 };
 

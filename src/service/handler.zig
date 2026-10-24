@@ -193,6 +193,19 @@ pub fn handle(
     pool: *PersistentPool,
     legacy: ?Legacy,
 ) ![]u8 {
+    return handleStaged(io, allocator, env, body, pool, legacy, null);
+}
+
+/// An embedding caller may retain publication until its response is fully allocated. It must commit or abort.
+pub fn handleStaged(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: std.process.Environ,
+    body: []const u8,
+    pool: *PersistentPool,
+    legacy: ?Legacy,
+    staged: ?*zpq.output_publication.OutputPublication,
+) ![]u8 {
     if (body.len == 0) {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"empty_body\"}}", .{});
     }
@@ -344,7 +357,7 @@ pub fn handle(
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
         if (qa.output != null) {
-            const response = try runWrite(io, allocator, env, pool, qa);
+            const response = try runWrite(io, allocator, env, pool, qa, staged);
             const p = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
@@ -749,6 +762,10 @@ fn uploadTrace(
 }
 
 /// The response for a failed query: the error, and the column or input file it is about when `diag` names one.
+pub fn publicationError(allocator: std.mem.Allocator, err: anyerror) ![]u8 {
+    return engineError(allocator, err, &.{});
+}
+
 fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -942,6 +959,7 @@ fn runWrite(
     env: std.process.Environ,
     pool: *PersistentPool,
     qa: engine.QueryArgs,
+    staged: ?*zpq.output_publication.OutputPublication,
 ) ![]u8 {
     const t_start = nowMonoNs();
 
@@ -949,8 +967,11 @@ fn runWrite(
     var diag: Diag = .{};
     var args = qa;
     args.diag = &diag;
-    var publication: zpq.output_publication.OutputPublication = .{ .fsync = qa.fsync };
-    defer publication.abort();
+    var local_publication: zpq.output_publication.OutputPublication = .{};
+    const publication = staged orelse &local_publication;
+    publication.fsync = qa.fsync;
+    var written = false;
+    defer if (!written or staged == null) publication.abort();
     args.output = publication.prepare(io, qa.output, qa.inputs) catch |err|
         return engineError(allocator, err, &diag);
     args.output_fd = publication.fd;
@@ -976,10 +997,11 @@ fn runWrite(
     } else .{};
     // Allocate the response before publishing: even an allocation failure must preserve an earlier target.
     const response = try writeResponse(allocator, output_url_str, wr, total_ms, pool.stats(), cache_stats);
-    publication.commit(io) catch |err| {
+    if (staged == null) publication.commit(io) catch |err| {
         allocator.free(response);
         return engineError(allocator, err, &diag);
     };
+    written = true;
     return response;
 }
 

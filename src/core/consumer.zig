@@ -21,7 +21,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const integer_groups = @import("integer_groups.zig");
 const owner_groups = @import("owner_groups.zig");
 const msd_groups = @import("msd_groups.zig");
 const retained_pages = @import("retained_pages.zig");
@@ -3013,7 +3012,8 @@ pub const AggRowGroup = struct {
 
 /// The owned-record layouts share worker startup and decoded-batch routing.
 pub const RecordSink = union(enum) {
-    integer: *integer_groups.Local,
+    integer: *owner_groups.IntFull.Local,
+    integer_top: *owner_groups.IntSumTop.Local,
     bytes: *owner_groups.Full.Local,
     byte_top: *owner_groups.SumTop.Local,
     byte_count_top: *owner_groups.CountTop.Local,

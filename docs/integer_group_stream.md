@@ -7,7 +7,7 @@ ORDER BY, LIMIT, OFFSET, HAVING and hidden output columns retain the general exe
 estimate also retains the coded fold. Compression can make that estimate low; it is a cost decision, never a
 key-identity proof.
 
-`integer_groups.State` reserves a conservative peak from the query ledger before decoding starts. Its quote depends
+`owner_groups.IntFull.State` (the integer codec of [owned byte-key grouping](byte_topk.md)) reserves a conservative peak from the query ledger before decoding starts. Its quote depends
 on row count, with headroom for at most 64 workers and bounded output windows. Refused admission takes the existing
 path without consuming input. Only rescannable inputs admit the path: released remote windows cannot be replayed.
 A later parallel decode-memory refusal releases the state and retries this layout with one worker before entering
@@ -15,12 +15,10 @@ the existing exact restart chain with the executor disabled. Local reader retrie
 Source descriptors, decoded pages and dictionary codes never escape their
 usual lifetimes: each record owns the key, integer value, dense input ordinal and NULL flags.
 
-Workers append records to private coarse-partition block chains, collecting fine-partition counts at the same time.
-A second radix level places equal keys in one of
-2,048 fine partitions, then one worker owns each fine table. Full integer equality and a separate NULL identity
-resolve collisions. Packed 24-byte records share the 32-byte-per-row final-state allocation: folding backwards and
-placing groups from each partition's end cannot overwrite unread records. This avoids a separate final-state
-allocation and record-buffer teardown. COUNT is exact and SUM remains i128 until checked narrowing. Since admitted row counts are below
+Workers append 24-byte records (key bits, value, ordinal with NULL flags) to private block chains of
+2,048 partitions by key hash, then one worker owns each partition table. Full integer equality and a separate NULL identity
+resolve collisions. Each partition folds into contiguous 32-byte groups (an i128 SUM, the key bits, a count with
+NULL flags and the first ordinal), and the record blocks are released once every partition has folded. COUNT is exact and SUM remains i128 until checked narrowing. Since admitted row counts are below
 2^31, neither count nor the exact sum can overflow their internal representation; the high bits of the count and first
 ordinal can carry SUM-presence and NULL-key flags. An out-of-range final i64 SUM is rejected after every decode has
 completed and before the writer opens the output. Decoder failures therefore retain precedence over narrowing.

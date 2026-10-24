@@ -37,7 +37,6 @@ const core_memory = @import("memory.zig");
 const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
-const integer_groups = @import("integer_groups.zig");
 const owner_groups = @import("owner_groups.zig");
 const msd_groups = @import("msd_groups.zig");
 const column_mod = @import("parquet/column.zig");
@@ -4875,7 +4874,7 @@ fn prepareAggregateWithMetas(
 }
 
 pub const IntegerStream = struct {
-    state: *integer_groups.State,
+    state: *owner_groups.IntFull.State,
     outputs: []const BoundOutputColumn,
     count_call: usize,
 
@@ -4917,7 +4916,7 @@ pub const IntegerStream = struct {
             },
         };
         const Fill = struct {
-            state: *const integer_groups.State,
+            state: *const owner_groups.IntFull.State,
             ids: []const u32,
             key: *TypedAnswer.Lane(i64),
             count: *TypedAnswer.Lane(i64),
@@ -4939,7 +4938,7 @@ pub const IntegerStream = struct {
                             const key_value = g.keyValue();
                             key_values[i] = if (key_value) |x| @intCast(x) else 0;
                             key_defs[i] = @intFromBool(key_value != null);
-                        } else key_values[i] = g.key;
+                        } else key_values[i] = g.keyValue().?;
                         count_values[i] = @intCast(g.countValue());
                         if (sum_defs.len != 0) {
                             sum_values[i] = 0;
@@ -5493,7 +5492,7 @@ fn runByteTop(
     comptime explain_only: bool,
     shape: ByteTopShape,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
-    const Topk = owner_groups.Owner(kind);
+    const Topk = owner_groups.Owner(kind, .bytes);
     const key = shape.key;
     const rows = shape.rows;
     const starts = shape.starts;
@@ -5591,7 +5590,7 @@ fn buildByteTopRows(
     comptime kind: owner_groups.Kind,
     gpa: std.mem.Allocator,
     output: *AggOutput,
-    groups: []const owner_groups.Group,
+    groups: []const owner_groups.Full.Group,
     outputs: []const BoundOutputColumn,
 ) !usize {
     const rows = try gpa.alloc([]const AggValue, groups.len);
@@ -5611,7 +5610,7 @@ fn buildByteTopRows(
                 owned += bytes.len;
                 break :key .{ .s = copy };
             },
-            .agg => if (owner_groups.Owner(kind).rank(g.*)) |v| .{ .i = v } else .null_val,
+            .agg => if (owner_groups.Owner(kind, .bytes).rank(g.*)) |v| .{ .i = v } else .null_val,
         };
     }
     return owned;
@@ -5776,7 +5775,7 @@ fn inlineIntegerAnswer(
     const outputs = outputs_opt orelse return null;
     for (outputs) |out| if (out.derived != null) return null;
     const full = order.keys.len == 0 and order.limit == null and order.offset == 0;
-    var cut: ?integer_groups.Cut = null;
+    var cut: ?owner_groups.Cut = null;
     if (full) {
         if (!args.typed_answer or calls.len != 2) return null;
     } else {
@@ -5826,41 +5825,62 @@ fn inlineIntegerAnswer(
         rows +|= @intCast(n);
     }
     if (rows < args.integer_records_min_rows or rows >= 1 << 31 or
-        integer_groups.State.reservation(rows) > args.max_memory) return null;
+        integerQuote(rows, n_workers, cut, args) > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
     if (explain_only) return .{
         .layout = if (cut != null) .integer_sum_top_h else .integer_group_stream,
-        .reservation = integer_groups.State.reservation(rows),
+        .reservation = integerQuote(rows, n_workers, cut, args),
     };
-    const admitted = if (cut) |c| try integer_groups.State.top(
-        gpa,
-        args.ledger,
-        rows,
-        n_workers,
-        key.col_idx,
-        value.?,
-        c,
-    ) else try integer_groups.State.init(
-        gpa,
-        args.ledger,
-        rows,
-        n_workers,
-        key.col_idx,
-        value.?,
-    );
-    const state = admitted orelse return null;
+    if (cut) |c| return try runIntegerOwner(.sum_top, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, c);
+    return try runIntegerOwner(.full, gpa, arena, args, metas, plan, work, calls, keys, outputs, n_workers, timings, rows, key.col_idx, value.?, count, starts, {});
+}
+
+/// The reservation of an admitted integer record layout: the full answer's established quote, or a top-H attempt's.
+fn integerQuote(rows: usize, n_workers: usize, cut: ?owner_groups.Cut, args: MultiAggArgs) usize {
+    const c = cut orelse return owner_groups.IntFull.State.reservation(rows, n_workers, owner_groups.full_parts, 0, 0);
+    const parts = owner_groups.IntSumTop.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
+    return owner_groups.IntSumTop.State.reservation(rows, n_workers, parts, c.k, 0);
+}
+
+fn runIntegerOwner(
+    comptime kind: owner_groups.Kind,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    n_workers: usize,
+    timings: Timings,
+    rows: usize,
+    key_col: usize,
+    value_col: usize,
+    count: ?usize,
+    starts: []u32,
+    cut: if (kind == .full) void else owner_groups.Cut,
+) !?MultiAggResult {
+    const Owner = owner_groups.Owner(kind, .int64);
+    const parts = if (kind == .full)
+        owner_groups.full_parts
+    else
+        Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
+    const state = (try Owner.State.init(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, 0)) orelse
+        return null;
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
-    for (sinks, state.locals) |*sink, *local| sink.* = .{ .integer = local };
+    for (sinks, state.locals) |*sink, *local| sink.* = if (kind == .full) .{ .integer = local } else .{ .integer_top = local };
     const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, outputs, timings);
     const prof = profile.threadOf(args.profiler, .main);
     const final_start = nowMonoNs();
-    try state.finish(n_workers);
-    const scatter_end = final_start + @as(i64, @intCast(state.scatter_ns));
+    try state.finish();
+    const scatter_end = final_start + @as(i64, @intCast(state.partition_ns));
     const fold_end = scatter_end + @as(i64, @intCast(state.fold_ns));
     profile.record(prof, .integer_scatter, final_start, scatter_end, profile.args(.{}));
     profile.record(prof, .integer_fold, scatter_end, fold_end, profile.args(.{}));
@@ -5876,15 +5896,15 @@ fn inlineIntegerAnswer(
         ty.* = .{ .lane = .i64, .nullable = switch (out.source) {
             .key => true,
             .agg => |ai| count == null or ai != count.?,
-        }, .source = if (out.source == .key) leafSchemaElem(&metas[0], key.col_idx) else null };
+        }, .source = if (out.source == .key) leafSchemaElem(&metas[0], key_col) else null };
     }
-    if (cut != null) {
-        const kept = state.topGroups();
+    if (kind != .full) {
+        const kept = state.top();
         try buildIntegerTopRows(gpa, &output, kept, outputs);
         // As with the general GROUP BY answer, keep its row storage drawn until the query ledger dies. Transfer
         // that tiny part of the reservation before releasing the records; no owning state remains in the answer.
-        if (args.ledger != null) state.charged -= kept.len *
-            (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue));
+        if (args.ledger != null) state.charged -= @min(state.charged, kept.len *
+            (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue)));
         state.deinit();
     } else output.integer_stream = .{ .state = state, .outputs = outputs, .count_call = count.? };
     var bytes_in: u64 = 0;
@@ -5986,7 +6006,7 @@ fn runRecordWorkers(
 fn buildIntegerTopRows(
     gpa: std.mem.Allocator,
     output: *AggOutput,
-    groups: []const integer_groups.Group,
+    groups: []const owner_groups.IntSumTop.Group,
     outputs: []const BoundOutputColumn,
 ) !void {
     const rows = try gpa.alloc([]const AggValue, groups.len);
@@ -5999,8 +6019,8 @@ fn buildIntegerTopRows(
         const cells = slab[i * outputs.len ..][0..outputs.len];
         row.* = cells;
         for (outputs, cells) |out, *cell| {
-            const v = switch (out.source) {
-                .key => g.keyValue(),
+            const v: ?i128 = switch (out.source) {
+                .key => if (g.keyValue()) |x| @as(i128, x) else null,
                 .agg => g.sumValue(),
             };
             cell.* = if (v) |x| .{ .i = x } else .null_val;
@@ -13789,7 +13809,7 @@ test "inline records decline released remote windows and retry only through a re
             .bytes = buffer,
             .meta = &meta,
             .budget = &budget,
-            .refuse_at = integer_groups.State.reservation(n),
+            .refuse_at = owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, 0),
             .force_decode = !bytes_key,
         };
         const in = [_]Input{.{
@@ -13860,7 +13880,7 @@ test "inline records decline released remote windows and retry only through a re
         const explanation = try explainAggregate(gpa, a, args);
         const expected: RecordAdmission = .{
             .layout = if (bytes_key) .byte_group_stream else .integer_group_stream,
-            .reservation = if (bytes_key) owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0) else integer_groups.State.reservation(n),
+            .reservation = if (bytes_key) owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0) else owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, 0),
         };
         try testing.expectEqual(expected, explanation.record_path.?);
     }
@@ -13977,9 +13997,10 @@ test "inline byte stream matches full rows across workers, windows, allocation a
 fn integerTopRowsTrial(a: std.mem.Allocator) !void {
     var output: AggOutput = .{};
     defer output.deinit(a);
-    const groups = [_]integer_groups.Group{
-        .{ .sum = @as(i128, std.math.maxInt(i64)) * 2, .key = -7, .count = 1 << 31, .first = 0 },
-        .{ .sum = 0, .key = 0, .count = 0, .first = 1 << 31 },
+    // A present SUM (bit 30) and key -7; then a NULL key (bit 31) with no SUM.
+    const groups = [_]owner_groups.IntSumTop.Group{
+        .{ .sum = @as(i128, std.math.maxInt(i64)) * 2, .key = @as(u64, @bitCast(@as(i64, -7))), .count = 1 << 30, .first = 0 },
+        .{ .sum = 0, .key = 0, .count = 1 << 31, .first = 1 },
     };
     const outputs = [_]BoundOutputColumn{
         .{ .name = "s", .source = .{ .agg = 0 } },
@@ -14040,7 +14061,7 @@ test "inline integer SUM cut matches the established partition cut across worker
 
 test "inline integer stream windows free every partial typed allocation" {
     for ([_]bool{ false, true }) |nulls| {
-        const state = (try integer_groups.State.init(testing.allocator, null, 5, 1, 0, 1)).?;
+        const state = (try owner_groups.IntFull.State.init(testing.allocator, null, 5, 1, 0, 1, {}, owner_groups.full_parts, 0)).?;
         defer state.deinit();
         const k = [_]i64{ 0, 1, 2, 1, 0 };
         const v = [_]i64{ 0, 7, 0, -2, 3 };
@@ -14060,7 +14081,7 @@ test "inline integer stream windows free every partial typed allocation" {
                 .has_nulls = nulls,
             } },
         } }, &.{ 0, 1 }, 0);
-        try state.finish(1);
+        try state.finish();
         const outputs = [_]BoundOutputColumn{
             .{ .source = .{ .key = 0 }, .name = "k" },
             .{ .source = .{ .agg = 0 }, .name = "c" },
@@ -16965,7 +16986,7 @@ fn byteTopRowsTrial(a: std.mem.Allocator) !void {
     var output: AggOutput = .{};
     defer output.deinit(a);
     // Present SUMs (bit 30); key lengths in the high ordinal bits; bit 31 is a NULL key.
-    const groups = [_]owner_groups.Group{
+    const groups = [_]owner_groups.Full.Group{
         .{ .key = 'a', .sum = @as(i128, std.math.maxInt(i64)) * 2, .count = 1 << 30, .first = 0 | 2 << 27 },
         .{ .key = 0, .sum = -7, .count = 1 << 30, .first = 1 },
         .{ .key = 0, .count = 1 << 31, .first = 2 },

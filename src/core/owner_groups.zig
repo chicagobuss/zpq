@@ -65,30 +65,37 @@ inline fn mixKey(bits: u128, len: u32) u64 {
     return @as(u64, @truncate(m)) ^ @as(u64, @truncate(m >> 64));
 }
 
-pub const Group = struct {
+/// A group's exact state over keys of `KeyBits` (u128 inline bytes, u64 integer bits).
+pub fn GroupOf(comptime KeyBits: type) type {
+    return struct {
     // Eight-byte alignment keeps this state at 40 bytes without narrowing the exact sum.
     sum: i128 align(8) = 0,
-    key: u128 align(8),
+    key: KeyBits align(8),
     /// Low 30 bits count rows; high bits mark a present SUM and a NULL key.
     count: u32,
     /// Low 27 bits are the minimum input ordinal; high five bits hold the key length.
     first: u32,
 
-    pub fn ordinal(g: Group) u32 {
+    pub fn ordinal(g: @This()) u32 {
         return g.first & ordinal_mask;
     }
-    pub fn keyBytes(g: *const Group) ?[]const u8 {
+    pub fn keyBytes(g: *const @This()) ?[]const u8 {
         return if (g.count & null_key != 0) null else std.mem.asBytes(&g.key)[0 .. g.first >> ordinal_bits];
     }
-    pub fn countValue(g: Group) i64 {
+    pub fn countValue(g: @This()) i64 {
         return g.count & (present - 1);
     }
-    pub fn sumValue(g: Group) ?i128 {
+    pub fn sumValue(g: @This()) ?i128 {
         return if (g.count & present != 0) g.sum else null;
     }
-};
+    /// An integer key (`Codec.int64`); null for the NULL key.
+    pub fn keyValue(g: @This()) ?i64 {
+        return if (g.count & null_key != 0) null else @bitCast(@as(u64, @truncate(g.key)));
+    }
+    };
+}
 comptime {
-    std.debug.assert(@sizeOf(Group) == 40);
+    std.debug.assert(@sizeOf(GroupOf(u128)) == 40 and @sizeOf(GroupOf(u64)) == 32);
 }
 
 fn cacheBudget() usize {
@@ -103,28 +110,38 @@ fn powerOfTwo(n: usize, lo: usize, hi: usize) usize {
     return @as(usize, 1) << @intCast(std.math.log2_int(usize, std.math.clamp(n, lo, hi)));
 }
 
-pub const Full = Owner(.full);
-pub const SumTop = Owner(.sum_top);
-pub const CountTop = Owner(.count_top);
+/// How a key is held: up to 16 bytes inline, or a signed 64-bit integer.
+pub const Codec = enum { bytes, int64 };
 
-pub fn Owner(comptime kind: Kind) type {
+pub const Full = Owner(.full, .bytes);
+pub const SumTop = Owner(.sum_top, .bytes);
+pub const CountTop = Owner(.count_top, .bytes);
+pub const IntFull = Owner(.full, .int64);
+pub const IntSumTop = Owner(.sum_top, .int64);
+
+pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
     const has_value = kind != .count_top;
+    const Key = if (codec == .bytes) []const u8 else i64;
+    const KeyBits = if (codec == .bytes) u128 else u64;
+    // Byte top-H identities carry their length and NULL in the bits; integers and full answers compare a flag.
+    const tagged = codec == .bytes and kind != .full;
     return struct {
         const Self = @This();
+        pub const Group = GroupOf(KeyBits);
         pub const Record = if (has_value) extern struct {
-            key: u128 align(8),
+            key: KeyBits align(8),
             value: i64,
             /// Low 27 bits are the ordinal, high five bits the exact key length.
             ordinal: u32,
             /// Key NULL, value NULL, then 30 hash bits.
             flags: u32,
         } else extern struct {
-            key: u128 align(8),
+            key: KeyBits align(8),
             ordinal: u32,
             flags: u32,
         };
         // Sixteen 32-byte records with their link; a value-less record fills a 512-byte block.
-        const block_rows = if (has_value) 16 else (512 - 8) / @sizeOf(Record);
+        const block_rows = if (@sizeOf(Record) == 32) 16 else (512 - 8) / @sizeOf(Record);
         const Block = extern struct { next: u32 = none, len: u32 = 0, rows: [block_rows]Record };
         /// Worst-case group scratch plus fewer than four u32 hash slots per input row after rounding.
         const table_row_bytes = @sizeOf(Group) + 16;
@@ -178,12 +195,16 @@ pub fn Owner(comptime kind: Kind) type {
             free_next: u32 = 0,
             free_end: u32 = 0,
 
-            pub fn append(l: *Local, key: ?[]const u8, value: if (has_value) ?i64 else void, ordinal: u32) !void {
-                const bits = inlineKey(key, kind != .full) catch |e| {
-                    l.state.width_refused.store(true, .monotonic);
-                    return e;
-                };
-                const len: u32 = if (key) |k| @intCast(k.len) else 0;
+            pub fn append(l: *Local, key: ?Key, value: if (has_value) ?i64 else void, ordinal: u32) !void {
+                // Integer keys: their bits, NULL told apart by its flag (full) or a bit no integer sets (top-H).
+                const bits: KeyBits = if (codec == .int64)
+                    (if (key) |k| @bitCast(k) else 0)
+                else
+                    inlineKey(key, tagged) catch |e| {
+                        l.state.width_refused.store(true, .monotonic);
+                        return e;
+                    };
+                const len: u32 = if (codec == .int64) 0 else if (key) |k| @intCast(k.len) else 0;
                 // The length separates keys equal after padding; NULL has a hash of its own.
                 const h: u64 = if (key == null)
                     0x621985775bcbd930
@@ -220,7 +241,7 @@ pub fn Owner(comptime kind: Kind) type {
             }
 
             pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
-                const k = view.cols[lookup[l.state.key_col].?].string;
+                const k = if (codec == .bytes) view.cols[lookup[l.state.key_col].?].string else view.cols[lookup[l.state.key_col].?].i64;
                 if (!has_value) {
                     for (0..view.num_rows) |i| {
                         const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
@@ -253,7 +274,7 @@ pub fn Owner(comptime kind: Kind) type {
             var pos: usize = (r.flags >> 2) & (cap - 1);
             while (slots[pos] != 0) : (pos = (pos + 1) & (cap - 1)) {
                 const g = &groups[slots[pos] - 1 - base];
-                if (if (kind == .full)
+                if (if (!tagged)
                     (g.count & null_key != 0) == kn and (kn or (g.first >> ordinal_bits == len and g.key == r.key))
                 else
                     g.key == r.key) break;
@@ -313,8 +334,8 @@ pub fn Owner(comptime kind: Kind) type {
             pub fn reservation(rows: usize, workers: usize, parts: usize, k: usize, output_credit: usize) usize {
                 const shared = blockCount(rows, workers, parts) *| @sizeOf(Block) +| workers *| parts *| 3 *| @sizeOf(u32) +|
                     @sizeOf(State) +| (8 << 20);
-                // The full answer keeps its established quote, which covers its blocks and ordering arrays.
-                if (kind == .full) return rows *| 96 +| (192 << 20);
+                // The full answers keep their established quotes, which cover blocks and ordering arrays.
+                if (kind == .full) return if (codec == .int64) rows *| 88 +| (128 << 20) else rows *| 96 +| (192 << 20);
                 return shared +| rows *| table_row_bytes +|
                     workers *| (stack_size + @sizeOf(Local) + @sizeOf(Heap) + @sizeOf(Task)) +|
                     workers *| k *| @sizeOf(Group) +| output_credit;
@@ -710,7 +731,7 @@ fn topTrial(comptime kind: Kind, a: std.mem.Allocator, workers: usize, descendin
     };
     var budget: memory.SharedBudget = .{ .limit = 256 << 20 };
     defer std.debug.assert(budget.used.load(.monotonic) == 0);
-    const T = Owner(kind);
+    const T = Owner(kind, .bytes);
     const s = (try T.State.init(a, &budget, rows, workers, 0, 1, .{ .k = 8, .descending = descending }, parts, 0)) orelse
         return error.OutOfMemory;
     defer s.deinit();
@@ -847,4 +868,150 @@ test "packed byte top-H cache policy uses shared hardware and supports every for
     try std.testing.expectEqual(@as(usize, 4096), SumTop.partitionCount(30000000, 12, 4096, null));
     hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 2 }, .l3 = .{ .bytes = 32 << 20 } };
     try std.testing.expectEqual(@as(usize, 2048), SumTop.partitionCount(30000000, 16, batchRows(null), null));
+}
+
+fn intKey(key: i64, flags: u32) ?i64 {
+    return if (flags & 1 != 0) null else key;
+}
+fn intValue(value: i64, flags: u32) ?i64 {
+    return if (flags & 2 != 0) null else value;
+}
+fn widen(v: ?i64) ?i128 {
+    return if (v) |x| x else null;
+}
+
+fn intTrial(a: std.mem.Allocator, workers: usize) !void {
+    var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const s = (try IntFull.State.init(a, &budget, 1001, workers, 0, 1, {}, full_parts, 0)).?;
+    defer s.deinit();
+    for (0..1001) |i| try s.locals[i % workers].append(intKey(@intCast(i % 71), if (i % 71 == 0) 1 else if (i % 71 == 2) 2 else 0), intValue(@as(i64, @intCast(i)) - 500, if (i % 71 == 0) 1 else if (i % 71 == 2) 2 else 0), @intCast(i));
+    try s.finish();
+    try std.testing.expectEqual(@as(usize, 71), s.group_count);
+    const ids = try s.window(a, 0, s.group_count);
+    defer a.free(ids);
+    for (ids, 0..) |id, i| {
+        const g = s.groups[id];
+        try std.testing.expectEqual(@as(u32, @intCast(i)), g.ordinal());
+        try std.testing.expectEqual(if (i == 0) null else @as(?i128, @intCast(i)), widen(g.keyValue()));
+        var sum: i128 = 0;
+        var count: i128 = 0;
+        var row = i;
+        while (row < 1001) : (row += 71) {
+            count += 1;
+            sum += @as(i128, @intCast(row)) - 500;
+        }
+        try std.testing.expectEqual(count, @as(i128, g.countValue()));
+        try std.testing.expectEqual(if (i == 2) null else @as(?i128, sum), g.sumValue());
+    }
+    const slice = try s.window(a, 7, 69);
+    defer a.free(slice);
+    try std.testing.expectEqualSlices(u32, ids[7..69], slice);
+}
+
+test "owned integer groups preserve exact sums, NULLs and first order" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| try intTrial(std.testing.allocator, j);
+}
+test "owned integer groups release every allocation and reservation on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, intTrial, .{1});
+}
+
+test "owned integer groups reject a wide exact sum before any output window" {
+    for ([_]usize{ 1, 2, 8 }) |j| for ([_]i64{ std.math.maxInt(i64), std.math.minInt(i64) }) |value| {
+        const s = (try IntFull.State.init(std.testing.allocator, null, 2, j, 0, 1, {}, full_parts, 0)).?;
+        defer s.deinit();
+        for (0..2) |i| try s.locals[i % j].append(intKey(1, 0), intValue(value, 0), @intCast(i));
+        try std.testing.expectError(error.AggIntTooWide, s.finish());
+    };
+}
+
+test "owned integer groups overlap packed records safely for every reduction and partition tail" {
+    const a = std.testing.allocator;
+    const Ref = struct { key: ?i64, count: i128 = 0, sum: ?i128 = null };
+    for ([_]usize{ 1, 2, 3, 4, 7, 31, 64, 65, 127, 257 }) |n| {
+        for ([_]usize{ 1, @max(1, n / 2), n }) |ndv| for ([_]usize{ 1, 4, 16 }) |j| {
+            const state = (try IntFull.State.init(a, null, n, j, 0, 1, {}, full_parts, 0)).?;
+            defer state.deinit();
+            var expected: std.ArrayList(Ref) = .empty;
+            defer expected.deinit(a);
+            for (0..n) |i| {
+                const key: ?i64 = if (i % 37 == 0) null else @as(i64, @intCast(i % ndv)) - @as(i64, @intCast(ndv / 2));
+                const value: ?i64 = if (i % 13 == 0) null else @as(i64, @intCast((i * 730201) % 1000)) - 500;
+                var id = expected.items.len;
+                for (expected.items, 0..) |r, ri| if (r.key == key) {
+                    id = ri;
+                    break;
+                };
+                if (id == expected.items.len) try expected.append(a, .{ .key = key });
+                const ref = &expected.items[id];
+                ref.count += 1;
+                if (value) |v| ref.sum = (ref.sum orelse 0) + v;
+                try state.locals[(n - i) % j].append(intKey(key orelse 0, @as(u32, @intFromBool(key == null)) | (@as(u32, @intFromBool(value == null)) << 1)), intValue(value orelse 0, @as(u32, @intFromBool(key == null)) | (@as(u32, @intFromBool(value == null)) << 1)), @intCast(i));
+            }
+            try state.finish();
+            try std.testing.expectEqual(expected.items.len, state.group_count);
+            const ids = try state.window(a, 0, state.group_count);
+            defer a.free(ids);
+            for (expected.items, ids) |ref, id| {
+                const group = state.groups[id];
+                try std.testing.expectEqual(if (ref.key) |k| @as(?i128, k) else null, widen(group.keyValue()));
+                try std.testing.expectEqual(ref.count, @as(i128, group.countValue()));
+                try std.testing.expectEqual(ref.sum, group.sumValue());
+            }
+        };
+    }
+}
+
+fn intTopTrial(a: std.mem.Allocator, workers: usize, descending: bool, k: usize) !void {
+    const ndv = 1021;
+    var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const state = (try IntSumTop.State.init(a, &budget, ndv * 3, workers, 0, 1, .{
+        .k = k,
+        .descending = descending,
+    }, 64, 0)).?;
+    defer state.deinit();
+    // Every present SUM is four. Keys, arrival order and first-appearance order differ; duplicates span workers.
+    // Group 5 has a NULL sum and group 11 a NULL key. A partial-partition cut would select incorrect intermediate
+    // sums, and a key-order tie-break would produce a different answer from these hand-known first ordinals.
+    for ([_]usize{ 2, 0, 1 }) |round| for (0..ndv) |i| try state.locals[(ndv - i + round) % workers].append(intKey(@intCast((i * 73) % ndv), if (i == 5) 2 else if (i == 11) 1 else 0), intValue(([_]i64{ 2, -1, 3 })[round], if (i == 5) 2 else if (i == 11) 1 else 0), @intCast(round * ndv + i));
+    try state.finish();
+    try std.testing.expectEqual(@as(usize, ndv), state.group_count);
+    try std.testing.expectEqual(@as(usize, 0), state.groups.len);
+    try std.testing.expectEqual(@as(usize, 0), state.winners.len);
+    try std.testing.expectEqual(@as(usize, 0), state.bitmap.len);
+    try std.testing.expectEqual(@min(k, ndv), state.top().len);
+    var ordinal: usize = 0;
+    for (state.top()) |g| {
+        if (k < ndv and ordinal == 5) ordinal += 1;
+        try std.testing.expectEqual(@as(u32, @intCast(ordinal)), g.ordinal());
+        const key: ?i128 = if (ordinal == 11) null else @intCast((ordinal * 73) % ndv);
+        try std.testing.expectEqual(key, widen(g.keyValue()));
+        try std.testing.expectEqual(if (ordinal == 5) null else @as(?i128, 4), g.sumValue());
+        ordinal += 1;
+    }
+}
+
+test "owned integer SUM top-H completes keys before stable tie selection at every worker count" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]bool{ false, true }) |descending|
+        for ([_]usize{ 7, 31, 1024 }) |k| try intTopTrial(std.testing.allocator, j, descending, k);
+}
+
+test "owned integer SUM top-H frees every partial heap and scratch allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, intTopTrial, .{ 1, true, 7 });
+}
+
+test "owned integer SUM top-H retains wide winning and losing sums without output narrowing" {
+    for ([_]bool{ false, true }) |descending| {
+        const s = (try IntSumTop.State.init(std.testing.allocator, null, 6, 2, 0, 1, .{
+            .k = 1,
+            .descending = descending,
+        }, 64, 0)).?;
+        defer s.deinit();
+        for (0..6) |i| try s.locals[i % 2].append(intKey(@intCast(i / 2), 0), intValue(if (i < 2) std.math.maxInt(i64) else if (i < 4) std.math.minInt(i64) else 0, 0), @intCast(i));
+        try s.finish();
+        const g = s.top()[0];
+        const value: i128 = if (descending) std.math.maxInt(i64) else std.math.minInt(i64);
+        try std.testing.expectEqual(value * 2, g.sumValue().?);
+    }
 }

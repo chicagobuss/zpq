@@ -2151,7 +2151,13 @@ fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions,
     const job = w.jobs[i];
     try job.arrive();
     if (job.passthrough) return copyRGToBuffer(
-        w.outAlloc(), ma, job, w.kept_set, prof, w.bloom_leaves, w.dictionary_bloom,
+        w.outAlloc(),
+        ma,
+        job,
+        w.kept_set,
+        prof,
+        w.bloom_leaves,
+        w.dictionary_bloom,
     );
     // The filter's (and computed outputs') columns must fit; the kept rows are checked once the filter has run.
     const early = decodeBytes(job, w.early_arr);
@@ -3236,10 +3242,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
         fd_sink.fd = args.output_fd orelse try createFile(out_path);
         remove_on_error = args.output_fd == null;
         sink_owns_fd = args.output_fd == null;
-        sink = .{
-            .ctx = @ptrCast(&fd_sink),
-            .write_fn = FdSink.writeFn,
-        };
+        sink = fd_sink.sink();
     }
 
     // 5. Stream output. PAR1 magic, then per-file × per-RG
@@ -5657,7 +5660,7 @@ fn writeOneRowParquet(
     defer if (fd_open) local_fs.close(fd);
     errdefer if (output_fd == null) local_fs.removeFile(out_path);
     var fd_sink: FdSink = .{ .fd = fd };
-    const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
+    const sink: streaming.Sink = fd_sink.sink();
 
     var all_outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (agg_calls, 0..) |call, i| {
@@ -5727,7 +5730,7 @@ fn writeGroupedParquet(
     var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
-    const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
+    const sink: streaming.Sink = fd_sink.sink();
     const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd, encode);
     if (fd_open) {
         fd_open = false;
@@ -5778,7 +5781,7 @@ fn writeTypedParquet(
     var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
-    const sink: streaming.Sink = .{ .ctx = @ptrCast(&fd_sink), .write_fn = FdSink.writeFn };
+    const sink: streaming.Sink = fd_sink.sink();
     const rows: i64 = @intCast(answer.rows);
     const written = try consumer.writeAggregateRows(arena, sink, outs.items, rows, codec, zstd, encode);
     if (fd_open) {
@@ -5804,7 +5807,7 @@ fn writeIntegerStream(
     var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
-    var file = try consumer.AggregateFile.init(arena, .{ .ctx = &fd_sink, .write_fn = FdSink.writeFn });
+    var file = try consumer.AggregateFile.init(arena, fd_sink.sink());
     defer file.deinit();
     try file.reserveIntegerWorkspace(encode);
     var window = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -5853,7 +5856,7 @@ fn writeByteStream(
     var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
     var fd_sink: FdSink = .{ .fd = fd };
-    var file = try consumer.AggregateFile.init(arena, .{ .ctx = &fd_sink, .write_fn = FdSink.writeFn });
+    var file = try consumer.AggregateFile.init(arena, fd_sink.sink());
     defer file.deinit();
     try file.reserveByteWorkspace(encode);
     var window = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -6100,10 +6103,45 @@ const FdSink = struct {
     written: u64 = 0,
     writeback_to: u64 = 0,
 
+    fn sink(self: *FdSink) streaming.Sink {
+        return .{ .ctx = self, .write_fn = writeFn, .write_segments_fn = writeSegmentsFn };
+    }
+
     pub fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FdSink = @ptrCast(@alignCast(ctx));
         try local_fs.writeAll(self.fd, bytes);
-        self.written += bytes.len;
+        try self.advance(bytes.len);
+    }
+
+    pub fn writeSegmentsFn(ctx: *anyopaque, segments: []const []const u8) anyerror!void {
+        const self: *FdSink = @ptrCast(@alignCast(ctx));
+        var item: usize = 0;
+        var offset: usize = 0;
+        while (item < segments.len) {
+            var batch: [64][]const u8 = undefined;
+            var count: usize = 0;
+            var bytes: usize = 0;
+            const room = (64 << 20) - (self.written - self.writeback_to);
+            while (item < segments.len and count < batch.len and bytes < room) {
+                const segment = segments[item][offset..];
+                const take = @min(segment.len, room - bytes);
+                if (take != 0) {
+                    batch[count] = segment[0..take];
+                    count += 1;
+                    bytes += take;
+                }
+                if (take == segment.len) {
+                    item += 1;
+                    offset = 0;
+                } else offset += take;
+            }
+            try local_fs.writeSegments(self.fd, batch[0..count]);
+            try self.advance(bytes);
+        }
+    }
+
+    fn advance(self: *FdSink, bytes: usize) !void {
+        self.written += bytes;
         if (self.written - self.writeback_to >= 64 << 20) {
             try local_fs.startWriteback(self.fd, self.writeback_to, self.written - self.writeback_to);
             self.writeback_to = self.written;
@@ -8453,7 +8491,7 @@ const ParquetPrint = struct {
     dictionary_bloom: bool = true,
 
     fn sink(self: *ParquetPrint) streaming.Sink {
-        return .{ .ctx = @ptrCast(&self.fd_sink), .write_fn = FdSink.writeFn };
+        return self.fd_sink.sink();
     }
 
     fn start(self: *ParquetPrint) !void {
@@ -13137,4 +13175,22 @@ test "windowed dispatch drains a producer failure despite cancellation midway th
         try std.testing.expectEqual(error.InjectedProducerFailure, fake.answer.?);
         try std.testing.expectEqual(Fake.n, fake.finished);
     }
+}
+
+test "FdSink segments keep one contiguous writeback range across page and vector boundaries" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    defer local_fs.close(fd);
+    var buffer: [1 << 20]u8 = @splat(0x5a);
+    var segments: [130][]const u8 = @splat(&buffer);
+    segments[0] = "";
+    segments[64] = "";
+    var sink: FdSink = .{ .fd = fd };
+    try FdSink.writeFn(&sink, "header");
+    try FdSink.writeSegmentsFn(&sink, &segments);
+    try std.testing.expectEqual(@as(u64, (128 << 20) + 6), sink.written);
+    try std.testing.expectEqual(@as(u64, 128 << 20), sink.writeback_to);
+    try FdSink.writeFn(&sink, "footer");
+    try std.testing.expectEqual(@as(u64, (128 << 20) + 12), sink.written);
+    try std.testing.expectEqual(@as(u64, 128 << 20), sink.writeback_to);
 }

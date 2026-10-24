@@ -22,6 +22,12 @@ const fastpath = @import("fastpath.zig");
 pub const Sink = struct {
     ctx: *anyopaque,
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    write_segments_fn: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
+
+    pub fn writeSegments(self: Sink, segments: []const []const u8) anyerror!void {
+        if (self.write_segments_fn) |write_segments| return write_segments(self.ctx, segments);
+        for (segments) |bytes| try self.write(bytes);
+    }
 
     pub fn write(self: Sink, bytes: []const u8) anyerror!void {
         return self.write_fn(self.ctx, bytes);

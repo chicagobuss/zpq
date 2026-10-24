@@ -144,6 +144,44 @@ pub fn writeAll(fd: fd_t, bytes: []const u8) error{ WriteFailed, BrokenPipe, NoS
     }
 }
 
+/// Write ordered buffers without joining them. A bounded vector stays below Linux and Darwin's IOV_MAX; short
+/// writes may stop inside a buffer, so advance both the vector index and its first remaining base before retrying.
+pub fn writeSegments(fd: fd_t, segments: []const []const u8) error{ WriteFailed, BrokenPipe, NoSpaceLeft }!void {
+    var at: usize = 0;
+    while (at < segments.len) {
+        var vectors: [64]posix.iovec_const = undefined;
+        var n: usize = 0;
+        while (at < segments.len and n < vectors.len) : (at += 1) {
+            const bytes = segments[at];
+            if (bytes.len == 0) continue;
+            vectors[n] = .{ .base = bytes.ptr, .len = bytes.len };
+            n += 1;
+        }
+        var first: usize = 0;
+        while (first < n) {
+            const rc = posix.system.writev(fd, vectors[first..n].ptr, @intCast(n - first));
+            switch (posix.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                .PIPE => return error.BrokenPipe,
+                .NOSPC, .DQUOT => return error.NoSpaceLeft,
+                else => return error.WriteFailed,
+            }
+            var written: usize = @intCast(rc);
+            if (written == 0) return error.WriteFailed;
+            while (written >= vectors[first].len) {
+                written -= vectors[first].len;
+                first += 1;
+                if (first == n) break;
+            }
+            if (first != n) {
+                vectors[first].base += written;
+                vectors[first].len -= written;
+            }
+        }
+    }
+}
+
 /// Read a whole file into an `allocator`-owned buffer. A missing file is `error.FileNotFound`, which fixture-reading
 /// tests turn into a skip.
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -825,7 +863,6 @@ test "starting writeback preserves the bytes and the write position" {
     try t.expectEqualStrings("beforeafter", bytes);
 }
 
-
 test "writeback hints leave pipe outputs usable" {
     var fds: [2]fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
@@ -836,4 +873,30 @@ test "writeback hints leave pipe outputs usable" {
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 1), posix.system.read(fds[0], &byte, 1));
     try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+}
+
+test "ordered segment writes preserve empty buffers and vector batch boundaries and surface sink errors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/vectors", .{tmp.sub_path});
+    var segments: [193][]const u8 = undefined;
+    for (&segments, 0..) |*s, i| s.* = if (i % 7 == 0) "" else try std.fmt.allocPrint(a, "{d};", .{i});
+    const fd = try createFile(path);
+    defer close(fd);
+    try writeSegments(fd, &segments);
+    try writeSegments(fd, &.{});
+    const got = try readFile(a, path);
+    try testing.expectEqualSlices(u8, try std.mem.concat(a, u8, &segments), got);
+    if (builtin.os.tag == .linux) {
+        const full = try posix.openat(posix.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0);
+        defer close(full);
+        try testing.expectError(error.NoSpaceLeft, writeSegments(full, &.{ "a", "", "b" }));
+        const pipe = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        close(pipe[0]);
+        defer close(pipe[1]);
+        try testing.expectError(error.BrokenPipe, writeSegments(pipe[1], &.{ "", "a", "b" }));
+    }
 }

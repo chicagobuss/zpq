@@ -132,7 +132,7 @@ pub const EncodedColumn = struct {
 
     pub fn writeTo(self: EncodedColumn, sink: anytype) !void {
         if (self.segments.len == 0) return sink.write(self.bytes);
-        for (self.segments) |segment| try sink.write(segment);
+        return sink.writeSegments(self.segments);
     }
 };
 
@@ -3844,6 +3844,9 @@ fn segmentFinishTrial(allocator: std.mem.Allocator) !void {
         written: usize = 0,
         calls: usize = 0,
         fail_at: usize,
+        pub fn writeSegments(s: *@This(), buffers: []const []const u8) !void {
+            for (buffers) |bytes| try s.write(bytes);
+        }
         pub fn write(s: *@This(), bytes: []const u8) !void {
             if (s.calls == s.fail_at) return error.SegmentSinkFailed;
             s.calls += 1;

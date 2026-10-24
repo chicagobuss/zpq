@@ -19,3 +19,8 @@ only when every page uses that dictionary. An explicit Bloom probability keeps p
 The [Parquet chunk contract](https://parquet.apache.org/docs/file-format/data-pages/columnchunks/) requires the
 single dictionary page, when present, to precede its data pages. A [Bloom filter](https://parquet.apache.org/docs/file-format/bloomfilter/)
 describes a whole column chunk. Segment ownership and placement do not weaken either requirement.
+
+A sink may accept a vector of buffers; sinks without that callback consume them in order through their usual write
+callback. Local files use bounded `writev` vectors, retrying interrupted and partial writes. `FdSink` splits a
+vector at the next 64 MiB writeback boundary and accounts only completed writes, so the hint always covers one
+contiguous written prefix. This is still only a writeback hint; the final data sync and rename remain unchanged.

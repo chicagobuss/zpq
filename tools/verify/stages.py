@@ -180,7 +180,7 @@ def stage_fd(ctx: Ctx) -> Cmd:
     return Cmd(
         [ctx.python, "tools/group_dependency_check.py", str(ctx.binary), ctx.base or ""],
         _base_env(ctx),
-        "group-dependency exactness against a base binary",
+        "group-dependency exactness against the required --base binary",
         blocked=blocked,
         parse=parse_fd,
     )

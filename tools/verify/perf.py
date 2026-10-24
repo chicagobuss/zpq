@@ -4,41 +4,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import shipbar
-
-EMIT = r"""
-import json, sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from bench.engines import defaults, pin_engine
-from bench.suites.local import cold_profile, inprocess_profile
-
-spec = json.loads(Path(sys.argv[2]).read_text())
-binary = spec["binary"]
-suites = spec["suites"].split(",") if spec.get("suites") else None
-reps = spec["reps"]
-if spec["profile"] == "in-process":
-    config = inprocess_profile(binary, spec["library"], suites, reps)
-elif spec["profile"] == "cold":
-    engines = spec["engines"].split(",")
-    config = cold_profile(binary, suites, engines, reps)
-    control = spec.get("control")
-    if control:
-        previous = pin_engine(defaults(control)["zpq"])
-        previous["session_policy"] = "fresh process"
-        config["engines"]["zpq_prev"] = previous
-        for case in config["cases"]:
-            if "zpq_prev" not in case["engines"]:
-                case["engines"] = list(case["engines"]) + ["zpq_prev"]
-else:
-    raise SystemExit("profile must be cold or in-process")
-config["coverage_note"] = spec["note"]
-Path(sys.argv[3]).write_text(json.dumps(config))
-print(len(config["cases"]), "cases;", ",".join(config["engines"]), flush=True)
-"""
 
 
 def pin_line(repo: Path) -> tuple[str, str]:
@@ -64,6 +33,41 @@ def check_harness(path: Path, sha: str) -> str | None:
     return None
 
 
+def _public_skip(row: dict) -> dict:
+    return {key: row[key] for key in ("suite", "reason", "missing", "unmatched") if key in row}
+
+
+def _suite_counts(report: dict) -> dict:
+    rows = report.get("suites") or []
+    skipped = [row for row in rows if row.get("status") == "skipped"]
+    return {
+        "suites_requested": report.get("suites_requested") or [],
+        "cases_requested": report.get("cases_requested"),
+        "suites_ran": [row["suite"] for row in rows if row.get("status") == "ran"],
+        "suites_skipped": [
+            _public_skip(row) for row in skipped if row.get("reason") != "excluded by case filter"
+        ],
+        "suites_filtered": [
+            _public_skip(row) for row in skipped if row.get("reason") == "excluded by case filter"
+        ],
+    }
+
+
+def _finish_status(report: dict, planned: bool = False, met: bool | None = None, extra: dict | None = None) -> dict:
+    counts = _suite_counts(report)
+    if extra:
+        counts.update(extra)
+    if planned:
+        counts["planned"] = True
+    if not counts["suites_ran"]:
+        return {"status": "blocked", "rc": 2, "counts": counts}
+    if met is False:
+        return {"status": "fail", "rc": 1, "counts": counts}
+    if counts["suites_skipped"]:
+        return {"status": "blocked", "rc": 2, "counts": counts}
+    return {"status": "pass", "rc": 0, "counts": counts}
+
+
 def _run(argv, cwd, log: Path) -> int:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w") as handle:
@@ -77,6 +81,11 @@ def run_perf(ctx, book, args) -> None:
     harness = Path(args.harness).expanduser()
     problem = check_harness(harness, sha)
     sealed = ctx.run_dir / "scorecard" / args.profile
+    started = time.monotonic()
+
+    def commit(record: dict) -> None:
+        record["duration_s"] = round(time.monotonic() - started, 3)
+        book.add_stage(record)
     record = {
         "name": "perf",
         "status": "blocked",
@@ -92,27 +101,27 @@ def run_perf(ctx, book, args) -> None:
     }
     if problem:
         record["counts"] = {"reason": problem}
-        book.add_stage(record)
+        commit(record)
         print(f"perf blocked  {problem}", flush=True)
         return
     if args.resume and args.plan_only:
         record["counts"] = {"reason": "--resume and --plan-only together do not make sense"}
-        book.add_stage(record)
+        commit(record)
         return
     binary = Path(args.binary).expanduser()
     if not binary.is_file():
         record["counts"] = {"reason": f"missing candidate binary {binary}"}
-        book.add_stage(record)
+        commit(record)
         print(record["counts"]["reason"], flush=True)
         return
     if args.profile == "in-process" and not Path(args.library).expanduser().is_file():
         record["counts"] = {"reason": f"missing --library {args.library}"}
-        book.add_stage(record)
+        commit(record)
         return
     control = None if args.no_control or args.profile != "cold" else str(Path(args.control).expanduser())
     if control and not Path(control).is_file():
         record["counts"] = {"reason": f"missing control binary {control}"}
-        book.add_stage(record)
+        commit(record)
         print(record["counts"]["reason"], flush=True)
         return
 
@@ -123,7 +132,7 @@ def run_perf(ctx, book, args) -> None:
         record["counts"] = {
             "reason": "sealed manifest already exists; refusing to reseal. Use --resume or a new run directory."
         }
-        book.add_stage(record)
+        commit(record)
         print(record["counts"]["reason"], flush=True)
         return
 
@@ -132,6 +141,7 @@ def run_perf(ctx, book, args) -> None:
         "profile": args.profile,
         "library": str(Path(args.library).expanduser()) if args.library else None,
         "suites": args.suites,
+        "cases": args.cases,
         "reps": args.reps,
         "engines": args.engines,
         "control": control,
@@ -139,20 +149,36 @@ def run_perf(ctx, book, args) -> None:
     }
     spec_path = ctx.run_dir / "perf-spec.json"
     config_path = ctx.run_dir / "scorecard-config.json"
+    report_path = ctx.run_dir / "suite-filter.json"
     spec_path.write_text(json.dumps(spec, indent=2) + "\n")
-    emitter = ctx.run_dir / "emit_config.py"
-    emitter.write_text(EMIT)
     if not manifest.exists():
         rc = _run(
-            [ctx.python, str(emitter), str(harness), str(spec_path), str(config_path)],
+            [
+                ctx.python,
+                str(ctx.repo / "tools/verify/emit_config.py"),
+                str(harness),
+                str(spec_path),
+                str(config_path),
+                str(report_path),
+            ],
             harness,
             ctx.run_dir / "logs" / "perf-emit.log",
         )
+        report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+        record["counts"] = _suite_counts(report)
+        if rc == 2:
+            record["counts"]["reason"] = "suite filter names a suite this profile does not have"
+            commit(record)
+            return
+        if rc == 3:
+            record["counts"]["reason"] = "every requested suite was skipped"
+            commit(record)
+            return
         if rc != 0:
             record["status"] = "fail"
             record["rc"] = rc
-            record["counts"] = {"reason": "config emit failed"}
-            book.add_stage(record)
+            record["counts"]["reason"] = "config emit failed"
+            commit(record)
             return
         rc = _run(
             [ctx.python, "bench/scorecard.py", "plan", "--config", str(config_path), "--run-dir", str(sealed)],
@@ -162,17 +188,17 @@ def run_perf(ctx, book, args) -> None:
         if rc != 0:
             record["status"] = "fail"
             record["rc"] = rc
-            record["counts"] = {"reason": "scorecard plan failed"}
-            book.add_stage(record)
+            record["counts"]["reason"] = "scorecard plan failed"
+            commit(record)
             return
         if args.plan_only:
-            record["status"] = "pass"
-            record["rc"] = 0
-            record["counts"] = {"planned": True}
-            book.add_stage(record)
+            record.update(_finish_status(report, planned=True))
+            commit(record)
             return
     else:
         print(f"perf resume {sealed}", flush=True)
+        report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+        record["counts"] = _suite_counts(report)
 
     rc = _run(
         [ctx.python, "bench/scorecard.py", "run", "--run-dir", str(sealed)],
@@ -188,16 +214,17 @@ def run_perf(ctx, book, args) -> None:
     if rc != 0 or summary_rc != 0:
         record["status"] = "fail"
         record["rc"] = rc or summary_rc
-        record["counts"] = {"reason": "scorecard run or summary failed", "run_rc": rc, "summary_rc": summary_rc}
-        book.add_stage(record)
+        record["counts"]["reason"] = "scorecard run or summary failed"
+        record["counts"]["run_rc"] = rc
+        record["counts"]["summary_rc"] = summary_rc
+        commit(record)
         return
     rows = json.loads(summary_log.read_text())
     (ctx.run_dir / "scorecard-summary.json").write_text(json.dumps(rows, indent=2) + "\n")
     if args.profile != "cold":
-        record["status"] = "pass"
-        record["rc"] = 0
-        record["counts"] = {"rows": len(rows), "shipbar": "skipped; in-process uses publisher_ns, not the cold ship bar"}
-        book.add_stage(record)
+        finished = _finish_status(report, extra={"rows": len(rows), "shipbar": "not applied; in-process is a separate metric"})
+        record.update(finished)
+        commit(record)
         return
     cold = [row for row in rows if row.get("lane") == "cold"]
     try:
@@ -205,19 +232,24 @@ def run_perf(ctx, book, args) -> None:
     except SystemExit as error:
         record["status"] = "fail"
         record["rc"] = 1
-        record["counts"] = {"reason": str(error), "cold_rows": len(cold)}
-        book.add_stage(record)
+        record["counts"]["reason"] = str(error)
+        record["counts"]["cold_rows"] = len(cold)
+        commit(record)
         return
     text = shipbar.render(scored)
     (ctx.run_dir / "shipbar.txt").write_text(text)
     print(text, flush=True)
-    record["status"] = "pass" if scored["met"] else "fail"
-    record["rc"] = 0 if scored["met"] else 1
-    record["counts"] = {
-        "cells": scored["n"],
-        "geomean": round(scored["geomean"], 3),
-        "behind": scored["behind"],
-        "shipbar": "MET" if scored["met"] else "NOT MET",
-        "control_geomean": None if not scored["control"] else round(scored["control"]["geomean"], 3),
-    }
-    book.add_stage(record)
+    record.update(
+        _finish_status(
+            report,
+            met=scored["met"],
+            extra={
+                "cells": scored["n"],
+                "geomean": round(scored["geomean"], 3),
+                "behind": scored["behind"],
+                "shipbar": "MET" if scored["met"] else "NOT MET",
+                "control_geomean": None if not scored["control"] else round(scored["control"]["geomean"], 3),
+            },
+        )
+    )
+    commit(record)

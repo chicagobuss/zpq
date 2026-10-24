@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Registry-free checks for the summary writer and the ship bar."""
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -9,9 +11,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
+import scorecard_select
 import shipbar
 import stages
 import summary
+import verify
 
 
 def cell(engine, ns, query="q", failures=None, checked=3):
@@ -69,6 +73,55 @@ class JudgeTest(unittest.TestCase):
         status, counts = execute.judge(cmd, 0, "{'PASS': 40, 'FAIL': 2}\n")
         self.assertEqual(counts["fail"], 2)
         self.assertEqual(status, "fail")
+
+
+class SelectTest(unittest.TestCase):
+    def test_missing_input_skips_the_suite_whole(self):
+        cases = [
+            {"suite": "pdsh", "dataset": "sf1", "query_id": "1", "inputs": ["/no/such/lineitem.parquet"]},
+            {"suite": "pdsh", "dataset": "sf1", "query_id": "2", "inputs": ["/no/such/lineitem.parquet"]},
+        ]
+        decision = scorecard_select.classify_built("pdsh", cases, None)
+        self.assertEqual(decision["status"], "skipped")
+        self.assertEqual(decision["reason"], "missing inputs")
+        self.assertNotIn("queries", decision)
+
+    def test_present_file_runs_and_case_filter_narrows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hits.parquet"
+            path.write_bytes(b"x")
+            cases = [
+                {"suite": "clickbench", "dataset": "hits", "query_id": "0", "inputs": [str(path)]},
+                {"suite": "clickbench", "dataset": "hits", "query_id": "1", "inputs": [str(path)]},
+            ]
+            decision = scorecard_select.classify_built("clickbench", cases, ["clickbench/hits/0"])
+            self.assertEqual(decision["status"], "ran")
+            self.assertEqual(decision["queries"], ["clickbench/hits/0"])
+
+    def test_unknown_case_does_not_run_a_subset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hits.parquet"
+            path.write_bytes(b"x")
+            cases = [{"suite": "clickbench", "dataset": "hits", "query_id": "0", "inputs": [str(path)]}]
+            decision = scorecard_select.classify_built("clickbench", cases, ["clickbench/hits/0", "clickbench/hits/99"])
+            self.assertEqual(decision["status"], "skipped")
+            self.assertEqual(decision["unmatched"], ["clickbench/hits/99"])
+
+
+class FullTierTest(unittest.TestCase):
+    def test_full_refuses_without_base(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = verify.main(["full"])
+        self.assertEqual(code, 2)
+        self.assertIn("--base", err.getvalue())
+
+    def test_full_refuses_a_missing_base_file(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = verify.main(["full", "--base", "/no/such/zpq"])
+        self.assertEqual(code, 2)
+        self.assertIn("not a file", err.getvalue())
 
 
 class ShipBarTest(unittest.TestCase):

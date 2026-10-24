@@ -46,7 +46,9 @@ def guide() -> str:
         "  quick     core unit tests (zig build test-core). The edit loop.",
         "  commit    test-core, ReleaseFast -Drevision=HEAD -Dcpu=raptorlake, then differential.",
         "            Extra arguments are forwarded to tools/differential.py (the affected slice).",
-        "  full      the stages listed below. One summary.json per run directory.",
+        "  full      the stages listed below. Requires --base PATH, the previously integrated",
+        "            binary the candidate is checked against. The path is recorded in the",
+        "            summary. There is no default.",
         "",
         "Modes",
         "  soak      one ReleaseFast build, then seeded rounds of agg fuzz, differential, unit, and",
@@ -54,9 +56,11 @@ def guide() -> str:
         "            loop continues. --rounds N stops after N rounds.",
         "  perf      calls the pinned scorecard worktree: plan, run, summary. Refuses to reseal a",
         "            directory that already has manifest.jsonl (--resume continues it). Ship-bar",
-        "            text and host provenance stay outside the sealed directory. Default profile",
-        "            is cold (zpq, duckdb20, polars, plus zpq_prev). --profile in-process is separate",
-        "            and is not scored on the cold ship bar.",
+        "            text and host provenance stay outside the sealed directory.",
+        "            --suites and --cases are the declared filter. The default --suites list is",
+        "            the profile's full set. A suite whose inputs are missing is skipped and",
+        "            recorded; the suites that resolve are still planned. A skipped suite is",
+        "            not a pass. --profile in-process is a separate metric from the cold ship bar.",
         "  stage X   one stage. conform and triangulate are not part of full.",
         "  stages    the registry.",
         "  self-test summary writer and ship bar. Does not compile zpq.",
@@ -64,7 +68,8 @@ def guide() -> str:
         "Exit codes",
         "  0  every required stage passed, or was a declared refusal",
         "  1  any unexpected failure. The summary lists it, and a later run does not erase it.",
-        "  2  a stage was blocked (missing binary, fixture, or --base) or the invocation is bad.",
+        "  2  a stage was blocked (missing binary, fixture, --base, or a skipped scorecard",
+        "     suite) or the invocation is bad.",
         "",
         "repro-skspill expects exit 1 and the text",
         '  "the query needs more memory than --max-memory allows"',
@@ -164,9 +169,18 @@ def open_run(args, tier: str, revision: str) -> tuple[Path, summary.Summary]:
             "rerun_of": args.rerun_of,
             "host": host,
             "binary_sha256": execute.file_sha256(REPO / "zig-out/bin/zpq"),
+            "parameters": _parameters(args),
         },
     )
     return run_dir, book
+
+
+def _parameters(args) -> dict:
+    parameters = {}
+    base = getattr(args, "base", None)
+    if base:
+        parameters["base"] = str(Path(base).expanduser().resolve())
+    return parameters
 
 
 def finish(book: summary.Summary) -> int:
@@ -180,7 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--out", help=f"parent for the run directory (default {DEFAULT_OUT})")
     common.add_argument("--run-id")
-    common.add_argument("--base", help="comparison binary for the fd stage")
+    common.add_argument(
+        "--base",
+        help="previously integrated binary the candidate is checked against (required for full; recorded, not defaulted)",
+    )
     common.add_argument("-j", type=int, default=12)
     common.add_argument("--cpu", default="raptorlake", help="zig -Dcpu for native ReleaseFast builds")
     common.add_argument("--rerun-of", help="earlier run id this record follows; that summary is not modified")
@@ -207,7 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--control", default=str(FAIR / "zpq-588a80c"))
     score.add_argument("--no-control", action="store_true")
     score.add_argument("--profile", choices=("cold", "in-process"), default="cold")
-    score.add_argument("--suites", help="comma-separated harness suites; default is the profile's own list")
+    score.add_argument("--suites", help="comma-separated suites; default is the profile's full list")
+    score.add_argument("--cases", help="comma-separated query ids or suite/dataset/query_id")
     score.add_argument("--engines", default="zpq,duckdb20,polars")
     score.add_argument("--reps", type=int, default=3)
     score.add_argument("--plan-only", action="store_true")
@@ -234,6 +252,17 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "j", 12) < 1:
         print("refusing -j below 1", file=sys.stderr)
         return 2
+    if args.command == "full":
+        if not getattr(args, "base", None):
+            print(
+                "full requires --base PATH, the previously integrated binary the candidate is checked against. "
+                "It is recorded in the summary and is not given a default.",
+                file=sys.stderr,
+            )
+            return 2
+        if not Path(args.base).expanduser().is_file():
+            print(f"--base is not a file: {args.base}", file=sys.stderr)
+            return 2
     if args.command == "stage":
         try:
             stages.get(args.name)

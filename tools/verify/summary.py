@@ -29,6 +29,7 @@ class Summary:
             "tier": meta["tier"],
             "sha": meta["sha"],
             "binary_sha256": meta.get("binary_sha256"),
+            "parameters": meta.get("parameters") or {},
             "host": meta.get("host") or {},
             "started": now(),
             "finished": None,

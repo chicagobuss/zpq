@@ -71,6 +71,8 @@ def run_stage(ctx: stages.Ctx, name: str, heavy: bool) -> dict:
     text = log_path.read_text(errors="replace")
     status, counts = judge(cmd, rc, text)
     record = _record(name, status, rc, duration, log_path, counts, cmd)
+    if name == "fd" and ctx.base:
+        record["base"] = str(Path(ctx.base).expanduser().resolve())
     print(f"{name} {status} rc={rc} {duration:.0f}s", flush=True)
     return record
 

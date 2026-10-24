@@ -6,7 +6,7 @@ One entry point for the 0.5.0 gate set, the seeded soak, and the scorecard ship 
 python tools/verify/verify.py
 python tools/verify/verify.py quick
 python tools/verify/verify.py commit -- --only sql_pred
-python tools/verify/verify.py full
+python tools/verify/verify.py full --base /path/to/previous-zpq
 python tools/verify/verify.py soak --hours 10
 python tools/verify/verify.py perf
 ```
@@ -28,6 +28,11 @@ the summary. aarch64 and macOS cross builds do not take that model.
 Compile and test stages run under `systemd-run --user --scope -p MemoryMax=20G`
 and `nice -n 10`, with at most `-j12`. `tools/verify/zigw` is `ZIG` for scripts
 that call `zig build` themselves, so they pick up the same cap.
+
+`full` requires `--base`, the previously integrated binary the candidate is checked
+against. For the e4c6878 equivalence run that is `~/bench/zpq-fair/zpq-588a80c`.
+In normal use it is the integ tip before the change. The path is stored in
+`summary.json` under `parameters.base`. It is not defaulted.
 
 ## Scorecard
 
@@ -53,6 +58,20 @@ different metric and is not folded into the cold geomean.
 The harness keeps its own CPU placement (timing 0–7 and 16–23, housekeeping
 8–15). This machine has those logical CPUs. perf does not add a 20G scope
 around the harness, and it does not apply the granite Zen affinity string.
+
+`--suites` and `--cases` are the declared filter. With no `--suites`, the
+profile's full list is the filter (cold: clickbench, study, pdsh, reads-sf1,
+writes, votes-local). Each suite is checked on its own. A suite whose inputs
+are missing is recorded under `suites_skipped` with the reason, and it is not
+planned. The suites that resolve are planned together, so one missing dataset
+does not throw away the rest. A skipped suite makes the perf stage `blocked`.
+The harness pins its own `.venv` as an engine dependency. That tree is not
+created here. When the pinned interpreter is absent, the emitted config points
+it at the python that is running verify. The harness worktree stays untouched.
+
+On this host the proof is `verify perf --suites clickbench`. The other suites
+live on granite and [redacted] and are not copied here. The same entry point runs
+the full matrix there once those inputs exist.
 
 ## What this branch does not do
 

@@ -37,3 +37,10 @@ integer AVG keeps its exact sum and non-NULL denominator. MIN/MAX and first posi
 semantics. Fallible payload expressions, DECIMAL overflow and order-sensitive float folds keep their established
 eligibility exclusions. Payload columns still decode through the normal paths, including losing-group rows;
 a small candidate row count does not imply sparse payload pages or suppress their required decode errors.
+
+A grouped LIMIT without ORDER BY discovers the H least first positions, where H includes OFFSET. Each worker
+retains at most H exact keys and lowers a shared discovery ordinal when its own Hth key appears. Later ranges
+can then stop discovery. The existing slice decoder bounds its read windows even without an explicit decode
+budget. Reconciliation compares complete keys and minimum selected ordinals; the complete-input pass then counts
+those keys exactly once. Discovery never supplies partial counts as the answer. HAVING, fallible key expressions,
+order-sensitive folds, gated sources and fallible aggregate calls retain the ordinary route.

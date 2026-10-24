@@ -845,7 +845,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
     else
         null else null;
     const first_cut = count_agg == null and args.sketch_topk != null and args.sketch_topk.?.census and
-        firstCutEligible(args, in.calls, use_blocks, in.work.len, tables);
+        firstCutEligible(args, in.calls, in.keys orelse &.{}, use_blocks, in.work.len, tables);
     const distinct_agg = if (count_agg == null)
         distinctCensusEligible(in, use_blocks, sketch_fits, (keys_unique and in.ndv_stat == null) or filter_small)
     else
@@ -897,7 +897,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
         result.reasons.insert(census_reason);
     }
     result.facts = planFacts(in, rank_agg != null, first_cut or (count_agg == null and args.sketch_topk != null and
-        args.sketch_topk.?.census and firstCutEligible(args, in.calls, use_blocks, in.work.len, tables)));
+        args.sketch_topk.?.census and firstCutEligible(args, in.calls, in.keys orelse &.{}, use_blocks, in.work.len, tables)));
     if (in.ndv_stat) |stat| applyCostRules(in, stat, &result);
     return result;
 }
@@ -1952,6 +1952,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             break;
         };
         if (w.skip) |skip| if (skip[idx]) continue;
+        if (table) |gt| if (gt.discoveryDone(expr_agg.firstPosition(idx, 0))) continue;
         errdefer w.failure_work = idx;
         items.* += 1;
         const item = w.work[idx];
@@ -3109,25 +3110,31 @@ fn kthDistinct(
     return counts[k - 1];
 }
 
-/// A LIMIT with no ORDER BY over a grouped scan of whole inputs (`firstKeysCut`).
-fn firstCutEligible(args: MultiAggArgs, calls: []const expr_agg.AggCall, use_blocks: bool, n_items: usize, n_tables: usize) bool {
+/// A LIMIT with no ORDER BY over a grouped scan of whole inputs (`firstAppearanceCut`).
+fn firstCutEligible(
+    args: MultiAggArgs,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    use_blocks: bool,
+    n_items: usize,
+    n_tables: usize,
+) bool {
     const order = args.result_order;
     // Rows after the prefix are read only for the keys it found: a failing call on another key's row must not vanish.
     if (!callsTotal(calls)) return false;
+    // Discovery omits payloads; a fallible key expression must retain the ordinary projection/error order.
+    for (keys) |key| if (key != .col_ref and key != .literal) return false;
     const limit = order.limit orelse return false;
-    if (use_blocks or n_tables == 0 or order.keys.len != 0 or order.offset +| limit == 0) return false;
+    if (use_blocks or n_tables == 0 or order.keys.len != 0 or order.having != null or
+        order.offset +| limit == 0) return false;
     if (n_items == 0 or n_items >= expr_agg.Census.max_items) return false;
     for (args.inputs) |in| if (in.gate != null) return false;
     return true;
 }
 
-/// A LIMIT with no ORDER BY returns the first `k = offset + limit` groups to appear, so only those need their
-/// aggregates. A discovery pass groups the first work items, twice as many each time, until k keys have appeared; the
-/// k-th key's first row ends a prefix, which holds exactly the first k keys. The admit pass then groups every row of
-/// the prefix, and every later row whose key's fingerprint is one of the k (`expr_agg.Census`, admitting). A key that
-/// shares a fingerprint with one of them gets a group too, but it first appears after the prefix, so the cut never
-/// keeps it. When the discovery has read everything, its tables are the answer.
-fn firstKeysCut(
+/// Discover at most H exact keys per worker. A worker's local Hth first position bounds the global Hth position,
+/// so it can stop later discovery; every selected key is still counted through the entire input afterwards.
+fn firstAppearanceCut(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     workers: []Worker,
@@ -3137,79 +3144,82 @@ fn firstKeysCut(
     cfg: SketchTopK,
 ) !void {
     const k: usize = @intCast(order.offset +| order.limit.?);
-    const work = workers[0].work;
     const saved = try arena.dupe(Worker, workers);
-    const skip = try arena.alloc(bool, work.len);
-    defer for (workers) |*w| {
-        w.skip = null;
+    var threshold: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+    for (tables) |*table| table.discovery = .{ .limit = k, .threshold = &threshold };
+    defer for (tables) |*table| {
+        table.discovery = null;
     };
-    const First = struct { first: u64, table: usize, g: u32 };
-    var firsts: std.ArrayList(First) = .empty;
-    defer firsts.deinit(gpa);
-    var m: usize = 1;
-    while (true) : (m *|= 2) {
-        for (skip, 0..) |*sk, i| sk.* = i >= m;
-        for (workers) |*w| w.skip = if (m >= work.len) null else skip;
-        restoreCounts(workers, saved);
-        try runPhase(workers, cursor);
-        if (m >= work.len) {
-            if (cfg.trace) std.debug.print("first: discovery read everything\n", .{});
-            return;
-        }
-        // Each key's first appearance over every table.
-        var seen: std.StringArrayHashMapUnmanaged(First) = .empty;
-        defer seen.deinit(gpa);
-        for (tables, 0..) |*t, ti| for (0..t.groupCount()) |g| {
-            const e = try seen.getOrPut(gpa, t.keyAt(g));
-            const f: First = .{ .first = t.first.items[g], .table = ti, .g = @intCast(g) };
-            if (!e.found_existing or f.first < e.value_ptr.first) e.value_ptr.* = f;
-        };
-        if (seen.count() < k) {
-            clearTables(gpa, tables);
-            continue;
-        }
-        firsts.clearRetainingCapacity();
-        try firsts.appendSlice(gpa, seen.values());
-        break;
+    const SavedWindow = struct { rows: usize, budget: ?*consumer.DecodeBudget };
+    const windows = try arena.alloc(SavedWindow, workers.len);
+    var discovery_budget: consumer.DecodeBudget = .{
+        .limit = if (tables[0].shared) |budget| budget.limit else std.math.maxInt(usize),
+        .workers = workers.len,
+    };
+    for (workers, windows) |*w, *window| {
+        window.* = .{ .rows = w.decode_batch_rows, .budget = w.decode_budget };
+        w.decode_batch_rows = owner_groups.batchRows(null);
+        if (w.decode_budget == null) w.decode_budget = &discovery_budget;
     }
-    std.mem.sortUnstable(First, firsts.items, {}, struct {
-        fn earlier(_: void, a: First, b: First) bool {
-            return a.first < b.first;
+    defer for (workers, windows) |*w, window| {
+        w.decode_batch_rows = window.rows;
+        w.decode_budget = window.budget;
+    };
+    try runPhase(workers, cursor);
+    for (workers, windows) |*w, window| {
+        w.decode_batch_rows = window.rows;
+        w.decode_budget = window.budget;
+    }
+    for (tables) |*table| table.discovery = null;
+
+    const First = struct { first: u64, table: usize, group: usize };
+    var seen: std.StringArrayHashMapUnmanaged(First) = .empty;
+    defer seen.deinit(gpa);
+    for (tables, 0..) |*table, ti| for (0..table.groupCount()) |group| {
+        const entry = try seen.getOrPut(gpa, table.keyAt(group));
+        const first: First = .{ .first = table.first.items[group], .table = ti, .group = group };
+        if (!entry.found_existing or first.first < entry.value_ptr.first) entry.value_ptr.* = first;
+    };
+    std.mem.sortUnstable(First, seen.values(), {}, struct {
+        fn earlier(_: void, x: First, y: First) bool {
+            return x.first < y.first;
         }
     }.earlier);
-    const last = firsts.items[k - 1].first;
-
-    const censuses = try arena.alloc(expr_agg.Census, workers.len);
-    for (censuses) |*c| c.* = .{ .gpa = gpa, .item_rows = &.{}, .prefix_item = last >> 32, .prefix_row = (last & 0xffff_ffff) + 1 };
-    defer for (censuses) |*c| c.deinit();
-    var set: expr_agg.FingerprintSet = .{ .filter = undefined, .map = .empty };
-    defer set.map.deinit(gpa);
+    const n = @min(k, seen.count());
     const filter = try gpa.alloc(u64, (1 << expr_agg.FingerprintSet.filter_bits) / 64);
     defer gpa.free(filter);
+    var set: expr_agg.FingerprintSet = .{ .filter = filter, .map = .empty };
+    defer set.map.deinit(gpa);
     @memset(filter, 0);
-    try set.map.ensureTotalCapacity(gpa, @intCast(k));
-    for (firsts.items[0..k]) |f| {
-        const fp = censuses[0].fingerprint(tables[f.table].routeHash(f.g));
+    try set.map.ensureTotalCapacity(gpa, @intCast(n));
+    const identity: expr_agg.Census = .{ .gpa = gpa, .item_rows = &.{}, .fp_mask = censusMask(cfg) };
+    for (seen.values()[0..n]) |first| {
+        const fp = identity.fingerprint(tables[first.table].routeHash(first.group));
         set.map.putAssumeCapacity(fp, {});
-        const b = fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
-        filter[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+        filter[fp % (1 << expr_agg.FingerprintSet.filter_bits) / 64] |=
+            @as(u64, 1) << @intCast(fp % 64);
     }
-    set.filter = filter;
-    for (censuses) |*c| c.admitted = &set;
-
+    // The first scan only discovered keys. Replay every row once for complete counts/payloads; hash collisions
+    // merely admit extra keys whose first positions are later than the H retained keys.
+    clearTables(gpa, tables);
+    const censuses = try arena.alloc(expr_agg.Census, workers.len);
+    defer for (censuses) |*c| c.deinit();
+    for (censuses) |*c| c.* = .{ .gpa = gpa, .item_rows = &.{}, .admitted = &set, .fp_mask = identity.fp_mask };
     var no_cells = [1]u32{0};
     const sketches = try arena.alloc(expr_agg.CountSketch, workers.len);
-    for (sketches, censuses) |*s, *c| s.* = .{ .cells = &no_cells, .shift = 63, .census = c };
-    clearTables(gpa, tables);
-    for (tables, sketches) |*t, *s| t.sketch = s;
-    defer for (tables) |*t| {
-        t.sketch = null;
+    for (sketches, censuses, tables) |*s, *c, *table| {
+        s.* = .{ .cells = &no_cells, .shift = 63, .census = c };
+        table.sketch = s;
+    }
+    defer for (tables) |*table| {
+        table.sketch = null;
     };
-    for (workers) |*w| w.skip = null;
     restoreCounts(workers, saved);
     const t0 = nowMonoNs();
     try runPhase(workers, cursor);
-    if (cfg.trace) std.debug.print("first: discovery_items={d} admit_ms={d}\n", .{ m, @divTrunc(nowMonoNs() - t0, 1_000_000) });
+    if (cfg.trace) std.debug.print("first: bounded_keys={d} threshold={d} count_ms={d}\n", .{
+        n, threshold.load(.monotonic), @divTrunc(nowMonoNs() - t0, 1_000_000),
+    });
 }
 
 /// Puts back the row and row-group counts a discarded pass added.
@@ -4496,7 +4506,7 @@ fn prepareAggregateWithMetas(
     };
     const order = args.result_order;
     const passes: anyerror!void = switch (decision.strategy) {
-        .first_keys => firstKeysCut(gpa, arena, workers, &work_cursor, group_tables, order, args.sketch_topk.?),
+        .first_keys => firstAppearanceCut(gpa, arena, workers, &work_cursor, group_tables, order, args.sketch_topk.?),
         .sketch => certifiedTopK(
             gpa,
             arena,
@@ -14772,7 +14782,7 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
     else
         null else null;
     const first_cut = sketch_count == null and args.sketch_topk != null and args.sketch_topk.?.census and
-        firstCutEligible(args, in.calls, use_blocks, in.work.len, tables);
+        firstCutEligible(args, in.calls, in.keys orelse &.{}, use_blocks, in.work.len, tables);
     const census_fits = blk: {
         if (in.work.len >= expr_agg.Census.max_items) break :blk false;
         var rows: u64 = 0;
@@ -18645,4 +18655,14 @@ test "COUNT-certified payloads preserve signed SUM, exact integer AVG, NULLs, ex
     }
     try testing.expect(used_certificate);
     try testing.expect(used_payload_policy);
+}
+
+test "bounded first discovery declines HAVING before choosing its candidate prefix" {
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+    var args: MultiAggArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS c", .result_order = .{ .limit = 3 } };
+    try testing.expect(firstCutEligible(args, &calls, &keys, false, 1, 1));
+    const having: expr_ast.Having = .{ .null_check = .{ .column = 0, .is_not = true } };
+    args.result_order.having = &having;
+    try testing.expect(!firstCutEligible(args, &calls, &keys, false, 1, 1));
 }

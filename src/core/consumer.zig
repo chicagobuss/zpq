@@ -3974,7 +3974,8 @@ fn scanRGForAggImpl(
         // Too big for this worker's share, or for what the query's ledger has left: a slice of rows at a time when
         // every column has a sliced form, else one aggregate's columns at a time.
         const fits_share = full <= b.share();
-        const force_cache = ws.decode_batch_rows != 0 and cacheExpressionsSafe(target);
+        const discovering = target == .grouped and target.grouped.table.discovery != null;
+        const force_cache = ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target));
         const whole = !force_cache and fits_share and admitWhole(ws, full);
         if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
         if (!whole) if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) |kept|
@@ -4285,7 +4286,8 @@ fn scanRGSliced(
     // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
     // answer, only how many rows decode at once.
     const room = if (ws.ledger) |l| l.sliceAvailable() / 2 else std.math.maxInt(usize);
-    const forced = if (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target))
+    const discovering = target == .grouped and target.grouped.table.discovery != null;
+    const forced = if (ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target)))
         ws.decode_batch_rows
     else
         std.math.maxInt(usize);
@@ -4360,7 +4362,7 @@ fn scanRGSliced(
                     );
                     continue;
                 }
-                if (decode_options.encoded and ws.decode_batch_rows != 0 and cacheExpressionsSafe(target)) {
+                if (!discovering and decode_options.encoded and ws.decode_batch_rows != 0 and cacheExpressionsSafe(target)) {
                     try agg_coded.codePlainKeys(sa, g.keys, cols, lookup);
                     if (try agg_coded.groupedCoded(
                         sa,
@@ -4391,6 +4393,7 @@ fn scanRGSliced(
                 };
             },
         }
+        if (discovering and target.grouped.table.discoveryDone(target.grouped.pos_base + done + n)) break;
     }
     const t1 = nowMonoNs();
     ws.timings.decode_ns += @intCast(t1 - t0);
@@ -4641,7 +4644,7 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, stage
     // So does a lone GROUP BY key that only counts read, its groups resolved from the histogram
     // (`agg_coded.groupedCoded`). A staged, windowed or sketched fold reads codes per row.
     if (in.filter == null and !staged) switch (target) {
-        .grouped => |g| if (g.part == null and g.table.sketch == null) {
+        .grouped => |g| if (g.part == null and g.table.sketch == null and g.table.discovery == null) {
             if (agg_coded.histGroupKey(g.calls, g.keys)) |key| if (key < n) {
                 u.hist_ok[key] = true;
             };

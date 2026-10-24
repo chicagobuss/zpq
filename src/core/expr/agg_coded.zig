@@ -507,6 +507,7 @@ pub fn groupedCoded(
     /// The region `ra` allocates from, whose ledger must take that scratch too.
     region: ?*huge_pages.Region,
 ) !bool {
+    if (table.discovery != null) return false;
     const num_rows = batch.num_rows;
     if (keys.len == 1 and keys[0] == .col_ref) if (lookup[keys[0].col_ref.col_idx]) |pos| {
         if (batch.cols[pos].hist() != null) {

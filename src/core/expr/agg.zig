@@ -4495,6 +4495,20 @@ pub const GroupTable = struct {
     /// A certified top-k pass: keys outside the admitted cells get a cell's id (`CountSketch.sinkId`) rather than a
     /// group. The id is the key's alone to take, so callers that memoize ids per key stay correct.
     sketch: ?*CountSketch = null,
+    /// Discovery retains only a worker's first H exact keys. The shared ordinal bounds discovery, never counts.
+    discovery: ?Discovery = null,
+
+    pub const Discovery = struct { limit: usize, threshold: *std.atomic.Value(u64) };
+
+    pub fn discoveryDone(self: *const GroupTable, pos: u64) bool {
+        return if (self.discovery) |d| pos >= d.threshold.load(.monotonic) else false;
+    }
+
+    fn discovered(self: *GroupTable, pos: u64) void {
+        if (self.discovery) |d| if (self.groupCount() >= d.limit) {
+            _ = d.threshold.fetchMin(pos, .monotonic);
+        };
+    }
 
     const empty_id: u32 = std.math.maxInt(u32);
     // The projected hash rejects candidates; only a complete normalized key comparison admits one.
@@ -4604,6 +4618,7 @@ pub const GroupTable = struct {
 
     /// Whether a sketch's count pass is running: rows take no group, and aggregates neither fold nor read.
     pub fn countOnly(self: *const GroupTable) bool {
+        if (self.discovery != null) return true;
         return if (self.sketch) |s| s.counting() else false;
     }
 
@@ -4659,6 +4674,7 @@ pub const GroupTable = struct {
     /// The group of `key`, made if new. `pos` is where the row asking for it sits in the input (`firstPosition`); a
     /// group remembers the least it was asked from.
     pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
+        if (self.discoveryDone(pos)) return CountSketch.sinkId(0);
         if (self.fixed_stride != 0) {
             if (key.len == self.fixed_stride) return self.getOrInsertFixed(key, agg_calls, pos);
             var buf: [32]u8 = undefined;
@@ -4724,7 +4740,7 @@ pub const GroupTable = struct {
         self.first.appendAssumeCapacity(pos);
 
         self.allocated_bytes += entry_size;
-
+        self.discovered(pos);
         return group_id;
     }
 
@@ -4741,6 +4757,7 @@ pub const GroupTable = struct {
         full_hash: u64,
     ) !u32 {
         std.debug.assert(key.len == self.fixed_stride);
+        if (self.discoveryDone(pos)) return CountSketch.sinkId(0);
         if (self.sketch) |s| if (try s.route(full_hash, pos, key)) |id| return id;
         const hash: u32 = @truncate(full_hash);
         const probe = self.probeFixed(key, full_hash);
@@ -4828,6 +4845,7 @@ pub const GroupTable = struct {
         self.first.appendAssumeCapacity(pos);
         self.fixed_len = id + 1;
         self.allocated_bytes = self.fixedHeld();
+        self.discovered(pos);
         return id;
     }
 
@@ -6833,4 +6851,44 @@ test "hash identity bounds use four-byte rows and bounded frontiers and free all
     try std.testing.expectEqual(@as(usize, 512), @sizeOf(Census.Chunk));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(@TypeOf(@as(Census.Chunk, undefined)[0])));
     try std.testing.checkAllAllocationFailures(std.testing.allocator, compactBoundsTrial, .{});
+}
+
+test "bounded first discovery keeps at most H exact keys and only lowers the shared ordinal" {
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    for ([_]bool{ false, true }) |fixed| {
+        var threshold: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+        var early = GroupTable.init(std.testing.allocator, 1 << 20);
+        defer early.deinit();
+        var late = GroupTable.init(std.testing.allocator, 1 << 20);
+        defer late.deinit();
+        early.fixed_stride = if (fixed) 9 else 0;
+        late.fixed_stride = early.fixed_stride;
+        early.discovery = .{ .limit = 3, .threshold = &threshold };
+        late.discovery = early.discovery;
+        try std.testing.expect(early.countOnly());
+        for (0..3) |i| {
+            var key: [9]u8 = @splat(0);
+            key[0] = 1;
+            std.mem.writeInt(u64, key[1..9], i, .little);
+            _ = try late.getOrInsert(&key, &calls, 100 + i);
+        }
+        try std.testing.expectEqual(@as(u64, 102), threshold.load(.monotonic));
+        for (0..3) |i| {
+            var key: [9]u8 = @splat(0);
+            key[0] = 1;
+            std.mem.writeInt(u64, key[1..9], i, .little);
+            _ = try early.getOrInsert(&key, &calls, 1 + i);
+        }
+        try std.testing.expectEqual(@as(u64, 3), threshold.load(.monotonic));
+        for (3..1000) |i| {
+            var key: [9]u8 = @splat(0);
+            key[0] = 1;
+            std.mem.writeInt(u64, key[1..9], i, .little);
+            try std.testing.expectEqual(CountSketch.sinkId(0), try early.getOrInsert(&key, &calls, i + 1));
+            try std.testing.expectEqual(CountSketch.sinkId(0), try late.getOrInsert(&key, &calls, i + 100));
+        }
+        try std.testing.expectEqual(@as(usize, 3), early.groupCount());
+        try std.testing.expectEqual(@as(usize, 3), late.groupCount());
+        try std.testing.expectEqual(@as(u64, 3), threshold.load(.monotonic));
+    }
 }

@@ -12156,38 +12156,43 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
 test "explainAggregate: local IO and environment knobs preserve dispatch, and every read mode bounds dictionaries" {
     const gpa = std.testing.allocator;
     const modes = [_][*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" };
-    for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled| {
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const lines = [_:null]?[*:0]const u8{
-            mode, if (disabled) "ZPQ_SKETCH_TOPK=0" else "ZPQ_SKETCH_TOPK=1", "ZPQ_ENCODED=0", "ZPQ_SKETCH_BITS=10",
+    for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled|
+        for ([_]bool{ false, true }) |dense| {
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const lines = [_:null]?[*:0]const u8{
+                mode,
+                if (disabled) "ZPQ_SKETCH_TOPK=0" else "ZPQ_SKETCH_TOPK=1",
+                if (dense) "ZPQ_DENSE=1" else "ZPQ_DENSE=0",
+                "ZPQ_ENCODED=0",
+                "ZPQ_SKETCH_BITS=10",
+            };
+            const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
+            const explained = try explainAggregate(ctx, arena_state.allocator(), .{
+                .inputs = &.{"ci/fixtures/parquet/topk_skew.parquet"},
+                .group_by = "k",
+                .aggregate = "count(*) AS c",
+                .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
+            });
+            try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
+            // Selected dictionary COUNT domains need the exact union beside readers too. With dense disabled,
+            // headers suffice. Off Linux every mode uses the mapping, which always collects the exact union.
+            const mapped = i == 0 or @import("builtin").os.tag != .linux;
+            const reasons = explained.aggregate.plan.reasons;
+            try std.testing.expect(reasons.contains(.small_ndv));
+            try std.testing.expectEqual(mapped or dense, reasons.contains(.dictionary_union));
+            // EXPLAIN reports the facts actually collected, including the reader's domain probe.
+            const planning = explained.aggregate.plan.facts.planning.?;
+            if (mapped or dense) {
+                try std.testing.expectEqual(.dictionary_union, planning.source);
+                const why: @TypeOf(planning.why) = if (mapped) .mapped else .reader_probe;
+                try std.testing.expectEqual(why, planning.why);
+            } else {
+                try std.testing.expectEqual(.dictionary_headers, planning.source);
+                try std.testing.expectEqual(.reader_no_choice, planning.why);
+            }
+            try std.testing.expect(!explained.encoded);
         };
-        const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
-        const explained = try explainAggregate(ctx, arena_state.allocator(), .{
-            .inputs = &.{"ci/fixtures/parquet/topk_skew.parquet"},
-            .group_by = "k",
-            .aggregate = "count(*) AS c",
-            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 },
-        });
-        try std.testing.expectEqual(.plain_hash, explained.aggregate.plan.dispatch.strategy);
-        // A reader's input bounds its key by the dictionary headers its probe reads first, so the plan is the same
-        // whatever the read mode; it unions them only where a choice turns on it (no dense fold or pairs here). Off
-        // Linux there is no reader (`executeAggregateOver`): every mode reads through the mapping.
-        const mapped = i == 0 or @import("builtin").os.tag != .linux;
-        const reasons = explained.aggregate.plan.reasons;
-        try std.testing.expect(reasons.contains(.small_ndv));
-        try std.testing.expectEqual(mapped, reasons.contains(.dictionary_union));
-        // Explain says which facts it planned from and why: the union over the mapping, the headers beside a reader.
-        const planning = explained.aggregate.plan.facts.planning.?;
-        if (mapped) {
-            try std.testing.expectEqual(.dictionary_union, planning.source);
-            try std.testing.expectEqual(.mapped, planning.why);
-        } else {
-            try std.testing.expectEqual(.dictionary_headers, planning.source);
-            try std.testing.expectEqual(.reader_no_choice, planning.why);
-        }
-        try std.testing.expect(!explained.encoded);
-    };
 }
 
 test "a row group past half the query's budget is read through the mapping, whatever read mode is asked for" {

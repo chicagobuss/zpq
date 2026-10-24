@@ -997,6 +997,42 @@ fn foldGroupedValue(
     // A count(DISTINCT) a pair sink answers takes the values fold below, which sends it the pairs; a histogram would
     // fill the sets the sink stands in for.
     const to_pairs = call.func == .count_distinct and if (agg.distinct_pairs) |dp| dp.active else false;
+    if (call.func == .count_distinct and !to_pairs and call.arg.? == .col_ref and arg_col.?.codes() != null) {
+        const col = arg_col.?;
+        const card = col.dictLen();
+        const words = (card + 63) / 64;
+        const bytes = space *| words *| @sizeOf(u64);
+        if (bytes <= @min(MAX_HIST * 8, @import("../hw.zig").l2BytesPerWorkerOr(256 << 10))) {
+            const bits = try ra.alloc(u64, space * words);
+            @memset(bits, 0);
+            var bad = false;
+            forEachActive(sel, comp.len, struct {
+                fn row(c: anytype, r: usize) void {
+                    const code = c.codes[r];
+                    if (code >= c.card) {
+                        c.bad.* = true;
+                        return;
+                    }
+                    const word = &c.bits[@as(usize, c.comp[r]) * c.words + code / 64];
+                    word.* |= @as(u64, 1) << @as(u6, @truncate(code));
+                }
+            }.row, .{ .bits = bits, .comp = comp, .words = words, .codes = col.codes().?, .card = card, .bad = &bad });
+            if (bad) return error.BadColumn;
+            const dict = try widenDict(ra, col, call.arg.?.col_ref);
+            for (0..space) |cp| {
+                for (bits[cp * words ..][0..words], 0..) |word, wi| {
+                    if (word == 0) continue;
+                    var local: Accumulator = undefined;
+                    const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+                    var pending = word;
+                    while (pending != 0) : (pending &= pending - 1)
+                        try st.distinct.insertColRow(gpa, dict, wi * 64 + @ctz(pending));
+                    if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
+                }
+            }
+            return;
+        }
+    }
     if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
         !float_sum and !to_pairs)
     {
@@ -1852,5 +1888,101 @@ test "groupedCoded over a key histogram with first rows makes the groups, positi
             tables[0].accumulators.items[g * calls.len + ai].count,
             tables[1].accumulators.items[g * calls.len + ai].count,
         );
+    }
+}
+
+test "distinct coded bitmaps fold only selected present identities across words and free failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctCodesTrial, .{});
+}
+
+fn distinctCodesTrial(a: std.mem.Allocator) !void {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    var dictionary: [129]i64 = undefined;
+    var codes: [129]u32 = undefined;
+    var defs: [129]u32 = undefined;
+    var comp: [129]u32 = undefined;
+    for (&dictionary, &codes, &defs, &comp, 0..) |*v, *c, *d, *cp, i| {
+        v.* = @intCast(i);
+        c.* = @intCast(i);
+        d.* = @intFromBool(i % 11 != 0);
+        cp.* = @intCast(i % 3);
+    }
+    dictionary[1] = -7;
+    dictionary[64] = 63;
+    const call: AggCall = .{
+        .func = .count_distinct,
+        .arg = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+        .result = .i64,
+        .where = null,
+        .alias = "d",
+    };
+    const column: Column = .{ .i64 = .{
+        .values = &.{},
+        .dict = &dictionary,
+        .codes = &codes,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const batch: filter_eval.Batch = .{ .cols = &.{column}, .num_rows = codes.len };
+    for (0..3) |shape| {
+        var table = agg.GroupTable.init(a, 1 << 20);
+        defer table.deinit();
+        const calls = [_]AggCall{call};
+        for (0..3) |g| {
+            const key = [_]u8{@intCast(g)};
+            _ = try table.getOrInsert(&key, &calls, g);
+        }
+        var selected = try Sel.init(ra, codes.len);
+        var expected: [3][137]bool = @splat(@splat(false));
+        for (0..codes.len) |r| {
+            const keep = shape == 0 or (shape == 1 and r % 5 == 0);
+            selected.set(r, keep);
+            if (keep and defs[r] != 0) expected[comp[r]][@intCast(dictionary[r] + 7)] = true;
+        }
+        try foldGroupedCall(
+            ra,
+            a,
+            table.accumulators.items,
+            &.{ 0, 1, 2 },
+            &comp,
+            3,
+            0,
+            1,
+            call,
+            &batch,
+            &.{0},
+            &selected,
+            &table,
+        );
+        for (expected, 0..) |bits, g| {
+            var n: usize = 0;
+            for (bits) |bit| n += @intFromBool(bit);
+            try testing.expectEqual(n, table.readAcc(g, 0, 1).distinct.count());
+        }
+        codes[128] = 129;
+        selected.set(128, true);
+        if (foldGroupedCall(
+            ra,
+            a,
+            table.accumulators.items,
+            &.{ 0, 1, 2 },
+            &comp,
+            3,
+            0,
+            1,
+            call,
+            &batch,
+            &.{0},
+            &selected,
+            &table,
+        )) return error.TestExpectedError else |e| {
+            if (e == error.OutOfMemory) return e;
+            try testing.expectEqual(error.BadColumn, e);
+        }
+        codes[128] = 128;
     }
 }

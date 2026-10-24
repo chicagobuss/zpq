@@ -212,6 +212,7 @@ pub const DistinctSet = struct {
         inline_i128: InlineI128,
         inline_bytes: InlineBytes,
         u64: std.AutoHashMapUnmanaged(u64, void),
+        bitmap: U64Bitmap,
         i128: std.AutoHashMapUnmanaged(i128, void),
         bytes: KeyHashMapUnmanaged(void),
     } = .none,
@@ -292,6 +293,7 @@ pub const DistinctSet = struct {
         switch (self.val_set) {
             .none, .inline_u64, .inline_i128, .inline_bytes => {},
             .u64 => |*s| s.deinit(allocator),
+            .bitmap => |b| allocator.free(b.words),
             .i128 => |*s| s.deinit(allocator),
             .bytes => |*s| s.deinit(allocator),
         }
@@ -341,6 +343,7 @@ pub const DistinctSet = struct {
             .inline_i128 => |s| s.len,
             .inline_bytes => |s| s.len,
             .u64 => |s| s.count(),
+            .bitmap => |b| b.count,
             .i128 => |s| s.count(),
             .bytes => |s| s.count(),
         };
@@ -434,7 +437,12 @@ pub const DistinctSet = struct {
                 self.allocated_bytes += entry_size;
                 self.val_set = .{ .u64 = map };
             },
+            .bitmap => try self.insertBitmap(allocator, v),
             .u64 => |*s| {
+                if (s.available == 0) {
+                    if (s.contains(v)) return;
+                    if (try self.bitmapFromMap(allocator, v)) return;
+                }
                 const gop = try s.getOrPut(allocator, v);
                 if (gop.found_existing) return;
                 const entry_size = 24;
@@ -446,6 +454,109 @@ pub const DistinctSet = struct {
             },
             else => return error.UnsupportedAggType, // one column feeds one value type: anything else is a bug, never a dropped value
         }
+    }
+
+    const U64Bitmap = struct {
+        base: u64,
+        words: []u64,
+        count: usize,
+
+        fn last(b: U64Bitmap) u64 {
+            return b.base + (b.words.len * 64 - 1);
+        }
+
+        pub fn iterator(b: U64Bitmap) std.bit_set.Dynamic.Iterator(.{}) {
+            return b.view().iterator(.{});
+        }
+
+        fn view(b: U64Bitmap) std.bit_set.Dynamic {
+            return .{ .bit_length = b.words.len * 64, .masks = @ptrCast(b.words.ptr) };
+        }
+
+        fn insert(b: *U64Bitmap, v: u64) void {
+            const offset: usize = @intCast(v - b.base);
+            const mask = @as(u64, 1) << @as(u6, @truncate(offset));
+            const word = &b.words[offset / 64];
+            b.count += @intFromBool(word.* & mask == 0);
+            word.* |= mask;
+        }
+    };
+
+    /// Actual identities prove this range. Prefer bits only when their clear/OR traffic fits one cache share and
+    /// their storage costs less than the hash entries they replace. Wide/scrambled values keep the exact map.
+    fn bitmapShape(lo: u64, hi: u64, entries: usize) ?struct { base: u64, words: usize } {
+        const base = lo & ~@as(u64, 63);
+        const need = (hi - base) / 64 + 1;
+        const room = @min(@import("../hw.zig").l2BytesPerWorkerOr(256 << 10), entries *| 8) / 8;
+        if (need > room) return null;
+        const n: usize = @intCast(need);
+        const rounded = std.math.ceilPowerOfTwo(usize, n) catch n;
+        const available = (std.math.maxInt(u64) - base) / 64 + 1;
+        return .{ .base = base, .words = if (rounded <= room and rounded <= available) rounded else n };
+    }
+
+    fn bitmapFromMap(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !bool {
+        var old = self.val_set.u64;
+        var lo = v;
+        var hi = v;
+        var it = old.keyIterator();
+        while (it.next()) |key| {
+            lo = @min(lo, key.*);
+            hi = @max(hi, key.*);
+            if (bitmapShape(lo, hi, old.count() + 1) == null) return false;
+        }
+        const shape = bitmapShape(lo, hi, old.count() + 1) orelse return false;
+        // Retain the established per-identity reservation: a late wide value can always return to the map
+        // under the same budget, without replaying an input window. Bits use at most a third of that credit.
+        try self.drawMore(24);
+        const words = try allocator.alloc(u64, shape.words);
+        @memset(words, 0);
+        var bits: U64Bitmap = .{ .base = shape.base, .words = words, .count = 0 };
+        it = old.keyIterator();
+        while (it.next()) |key| bits.insert(key.*);
+        bits.insert(v);
+        self.allocated_bytes += 24;
+        old.deinit(allocator);
+        self.val_set = .{ .bitmap = bits };
+        return true;
+    }
+
+    /// Grow around complete stored words, preserving their identity alignment. False leaves a range too sparse
+    /// for a bitmap unchanged; the caller can merge or insert its complete values through the ordinary map.
+    fn bitmapRange(self: *DistinctSet, allocator: std.mem.Allocator, lo: u64, hi: u64, extra: usize) !bool {
+        const old = self.val_set.bitmap;
+        if (lo >= old.base and hi <= old.last()) return true;
+        const shape = bitmapShape(@min(lo, old.base), @max(hi, old.last()), old.count +| extra) orelse return false;
+        const words = try allocator.alloc(u64, shape.words);
+        @memset(words, 0);
+        const start: usize = @intCast((old.base - shape.base) / 64);
+        @memcpy(words[start..][0..old.words.len], old.words);
+        allocator.free(old.words);
+        self.val_set = .{ .bitmap = .{ .base = shape.base, .words = words, .count = old.count } };
+        return true;
+    }
+
+    fn insertBitmap(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
+        const old = self.val_set.bitmap;
+        if (v >= old.base and v <= old.last()) {
+            const offset: usize = @intCast(v - old.base);
+            if (old.words[offset / 64] & (@as(u64, 1) << @as(u6, @truncate(offset))) != 0) return;
+        }
+        try self.drawMore(24);
+        if (try self.bitmapRange(allocator, v, v, 1)) {
+            self.val_set.bitmap.insert(v);
+            self.allocated_bytes += 24;
+            return;
+        }
+        var map: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        errdefer map.deinit(allocator);
+        try map.ensureTotalCapacity(allocator, std.math.cast(u32, old.count + 1) orelse return error.OutOfMemory);
+        var it = old.iterator();
+        while (it.next()) |bit| map.putAssumeCapacity(old.base + bit, {});
+        map.putAssumeCapacity(v, {});
+        self.val_set = .{ .u64 = map };
+        self.allocated_bytes += 24;
+        allocator.free(old.words);
     }
 
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
@@ -590,6 +701,36 @@ pub const DistinctSet = struct {
     }
 
     pub fn merge(self: *DistinctSet, other: *const DistinctSet, allocator: std.mem.Allocator) !void {
+        if (self.parts == null and other.parts == null and other.val_set == .bitmap) {
+            const src = other.val_set.bitmap;
+            if (self.val_set == .none) {
+                try self.drawMore(src.count * 24);
+                const words = try allocator.dupe(u64, src.words);
+                self.val_set = .{ .bitmap = .{ .base = src.base, .words = words, .count = src.count } };
+                self.allocated_bytes += src.count * 24;
+                return;
+            }
+            if (self.val_set == .bitmap) {
+                const old = self.val_set.bitmap;
+                var novel = src.count;
+                for (src.words, 0..) |word, wi| {
+                    const base = src.base + wi * 64;
+                    if (base >= old.base and base <= old.last())
+                        novel -= @popCount(word & old.words[@intCast((base - old.base) / 64)]);
+                }
+                try self.drawMore(novel * 24);
+                if (try self.bitmapRange(allocator, src.base, src.last(), novel)) {
+                    const dst = &self.val_set.bitmap;
+                    const start: usize = @intCast((src.base - dst.base) / 64);
+                    for (dst.words[start..][0..src.words.len], src.words) |*word, bits| {
+                        dst.count += @popCount(bits & ~word.*);
+                        word.* |= bits;
+                    }
+                    self.allocated_bytes += novel * 24;
+                    return;
+                }
+            }
+        }
         // A table's values come out in its slot order, which is hash order. Inserted into a table that grows as they
         // arrive, a larger table's hash-ordered prefix wraps onto the smaller one's slots unevenly, some ranges a lap
         // ahead of the rest, and at the 80% load where it grows those ranges are full: long linear-probe runs, and a
@@ -614,6 +755,10 @@ pub const DistinctSet = struct {
                     },
                     .inline_bytes => |s| {
                         for (s.vals[0..s.len]) |k| try self.insertBytes(allocator, k);
+                    },
+                    .bitmap => |bits| {
+                        var it = bits.iterator();
+                        while (it.next()) |bit| try self.insertU64(allocator, bits.base + bit);
                     },
                     .u64 => |s| {
                         var it = s.keyIterator();
@@ -647,6 +792,10 @@ pub const DistinctSet = struct {
             },
             .inline_bytes => |s| {
                 for (s.vals[0..s.len]) |k| try self.insertBytes(allocator, k);
+            },
+            .bitmap => |bits| {
+                var it = bits.iterator();
+                while (it.next()) |bit| try self.insertU64(allocator, bits.base + bit);
             },
             .u64 => |s| {
                 var it = s.keyIterator();
@@ -5199,6 +5348,10 @@ pub const DistinctPairs = struct {
         switch (ds.val_set) {
             .none => {},
             .inline_u64 => |v| for (v.vals[0..v.len]) |x| try self.add(gid, x),
+            .bitmap => |bits| {
+                var it = bits.iterator();
+                while (it.next()) |bit| try self.add(gid, bits.base + bit);
+            },
             .u64 => |m| {
                 var it = m.keyIterator();
                 while (it.next()) |x| try self.add(gid, x.*);
@@ -6892,5 +7045,86 @@ test "bounded first discovery keeps at most H exact keys and only lowers the sha
         try std.testing.expectEqual(@as(usize, 3), early.groupCount());
         try std.testing.expectEqual(@as(usize, 3), late.groupCount());
         try std.testing.expectEqual(@as(u64, 3), threshold.load(.monotonic));
+    }
+}
+
+test "distinct bitmaps preserve complete identities across ranges, partitions and late wide values with failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctBitmapTrial, .{});
+}
+
+fn distinctBitmapTrial(a: std.mem.Allocator) !void {
+    const hw = @import("../hw.zig");
+    hw.test_cpu = .{ .l2 = .{ .bytes = 64 << 10, .max_sharing = 1 } };
+    defer hw.test_cpu = null;
+    for ([_]bool{ false, true }) |partitioned| {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        {
+            var left: DistinctSet = .{ .shared = &budget };
+            defer left.deinit(a);
+            var right: DistinctSet = .{ .shared = &budget };
+            defer right.deinit(a);
+            if (partitioned) {
+                try left.initPartitions(a, &budget);
+                try right.initPartitions(a, &budget);
+            }
+            // Different aligned bases and overlap. OR must preserve identity, never add cardinalities.
+            for (128..384) |v| try left.insertU64(a, v);
+            for (0..256) |v| try right.insertU64(a, v);
+            if (!partitioned) {
+                try testing.expect(left.val_set == .bitmap);
+                try testing.expect(right.val_set == .bitmap);
+            }
+            try left.merge(&right, a);
+            try testing.expectEqual(@as(usize, 384), left.count());
+            try left.merge(&right, a);
+            try testing.expectEqual(@as(usize, 384), left.count());
+            // A late sparse value migrates the whole set without another input pass.
+            try left.insertU64(a, @as(u64, 1) << 48);
+            try testing.expectEqual(@as(usize, 385), left.count());
+            if (!partitioned) try testing.expect(left.val_set == .u64);
+            for (0..384) |v| try left.insertU64(a, v);
+            try testing.expectEqual(@as(usize, 385), left.count());
+            var empty: DistinctSet = .{ .shared = &budget };
+            defer empty.deinit(a);
+            try empty.merge(&right, a);
+            try empty.merge(&left, a);
+            try testing.expectEqual(@as(usize, 385), empty.count());
+            var negative: DistinctSet = .{ .shared = &budget };
+            defer negative.deinit(a);
+            for (0..128) |i| try negative.insertU64(a, std.math.maxInt(u64) - i);
+            try testing.expect(negative.val_set == .bitmap);
+            try testing.expectEqual(std.math.maxInt(u64), negative.val_set.bitmap.last());
+            try negative.merge(&right, a);
+            try testing.expectEqual(@as(usize, 384), negative.count());
+            try testing.expect(negative.val_set == .u64);
+        }
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+}
+
+test "distinct bitmaps retain the hash reservation so a late outlier has identical budget admission" {
+    const hw = @import("../hw.zig");
+    defer hw.test_cpu = null;
+    for ([_]usize{ 144, 256, 512, 1024, 4096, 8192 }) |limit| {
+        var outcomes: [2]bool = undefined;
+        for ([_]usize{ 1, 64 << 10 }, 0..) |cache, mode| {
+            hw.test_cpu = .{ .l2 = .{ .bytes = cache, .max_sharing = 1 } };
+            var budget: SharedBudget = .{ .limit = limit };
+            {
+                var set: DistinctSet = .{ .shared = &budget };
+                defer set.deinit(testing.allocator);
+                outcomes[mode] = true;
+                for (0..129) |i| {
+                    const v: u64 = if (i == 128) 1 << 48 else i;
+                    set.insertU64(testing.allocator, v) catch |e| {
+                        try testing.expectEqual(error.ExceededMemoryBudget, e);
+                        outcomes[mode] = false;
+                        break;
+                    };
+                }
+            }
+            try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        }
+        try testing.expectEqual(outcomes[0], outcomes[1]);
     }
 }

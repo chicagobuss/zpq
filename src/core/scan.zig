@@ -7157,6 +7157,10 @@ fn eachDistinctU64(ds: *const expr_agg.DistinctSet, ctx: anytype, comptime f: fn
         fn set(d: *const expr_agg.DistinctSet, c: @TypeOf(ctx)) void {
             switch (d.val_set) {
                 .inline_u64 => |s| for (s.vals[0..s.len]) |v| f(c, v),
+                .bitmap => |bits| {
+                    var it = bits.iterator();
+                    while (it.next()) |bit| f(c, bits.base + bit);
+                },
                 .u64 => |s| {
                     var it = s.keyIterator();
                     while (it.next()) |k| f(c, k.*);
@@ -19309,14 +19313,18 @@ const ReleasingScanWindow = struct {
     waits: std.atomic.Value(usize) = .init(0),
     releases: std.atomic.Value(usize) = .init(0),
     abandoned: usize = 0,
+    completed: ?[]std.atomic.Value(usize) = null,
 
     fn wait(ctx: *anyopaque, _: usize) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         _ = self.waits.fetchAdd(1, .monotonic);
     }
 
-    fn release(ctx: *anyopaque, rg: usize, _: usize) void {
+    fn release(ctx: *anyopaque, rg: usize, items: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.completed) |counts| {
+            if (counts[rg].fetchAdd(1, .acq_rel) + 1 != items) return;
+        } else std.debug.assert(items == 1);
         for (self.meta.row_groups.items[rg].columns.items) |chunk| {
             const cm = chunk.meta_data.?;
             const lo: usize = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
@@ -19750,4 +19758,81 @@ test "dense composite counts arm globally and preserve selected first through wi
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     };
+}
+
+test "distinct bitmaps retain identities after releasing windows and late wide fallback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    for (0..4) |rg| {
+        var keys: [512]i64 = undefined;
+        var values: [512]i64 = undefined;
+        var defs: [512]u32 = undefined;
+        for (&keys, &values, &defs, 0..) |*k, *v, *d, r| {
+            k.* = @intCast(r % 3);
+            v.* = @intCast((r + rg * 31) % 128);
+            d.* = @intFromBool(r % 17 != 0);
+        }
+        if (rg == 3) values[511] = 1 << 48;
+        const cols = [_]expr_agg.OutputCol{
+            .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &keys } } },
+            .{
+                .name = "v",
+                .parquet_type = .INT64,
+                .nullable = true,
+                .col = .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1 } },
+            },
+        };
+        try file.append(&cols, keys.len, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&.{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+    });
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    const mapped = [_]Input{.{ .name = "distinct.parquet", .bytes = bytes }};
+    for ([_]?[]const u8{ null, "k" }) |group_by| {
+        var args: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = (&meta)[0..1],
+            .aggregate = "count(DISTINCT v) AS d, count(*) AS c",
+            .group_by = group_by,
+            .integer_records = false,
+            .ndv_policy = false,
+            .plain_rules = false,
+            .distinct_pairs = .off,
+            .dense = false,
+            .scan_all = true,
+            .min_bytes_per_worker = 1,
+        };
+        var want = try runMultiAggregate(testing.allocator, a, args);
+        defer want.deinit(testing.allocator);
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch_rows| {
+            var completed: [4]std.atomic.Value(usize) = @splat(.init(0));
+            var window: ReleasingScanWindow = .{
+                .bytes = try a.dupe(u8, bytes),
+                .meta = &meta,
+                .completed = &completed,
+            };
+            // No mapped planning view: a retry would have to read already released bytes.
+            const inputs = [_]Input{.{
+                .name = "distinct.parquet",
+                .bytes = window.bytes,
+                .gate = .{ .ctx = &window, .wait = ReleasingScanWindow.wait, .done = ReleasingScanWindow.release },
+            }};
+            args.inputs = &inputs;
+            args.parallelism = j;
+            args.decode_batch_rows = batch_rows;
+            var got = try runMultiAggregate(testing.allocator, a, args);
+            defer got.deinit(testing.allocator);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
+            try testing.expect(window.waits.load(.monotonic) >= meta.row_groups.items.len);
+            try testing.expectEqual(meta.row_groups.items.len, window.releases.load(.monotonic));
+        };
+    }
 }

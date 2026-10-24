@@ -15,6 +15,7 @@ usage:
             [\-\-compress\-priority size|speed]
             [\-\-scan\-all] [\-\-trust\-stats] [\-\-fast\-levels] [\-\-unordered]
             [\-\-max\-memory SIZE] [\-\-bloom\-filter COL[:FPP] ...]
+            [\-\-no\-bloom\-filters]
             [\-\-format ndjson|json|csv|parquet] [\-\-limit N] [\-\-summary=json]
             [\-\-explain] [\-\-profile TRACE.json] [\-\-profile\-summary[=text|json]]
   zpq query \-\-query "<sql query>" [\-\-output <out.parquet>]
@@ -104,6 +105,10 @@ usage:
                  above max, or a null count outside the chunk, is
                  ignored either way; a null count the bounds contradict
                  or fail to back is used only with this flag.
+  \-\-no\-bloom\-filters
+                 Skip automatic dictionary Bloom filters (on by default).
+                 Explicit \-\-bloom\-filter specs still apply; copied source
+                 filters are preserved. Automatic filters use FPP 0.01.
   \-\-bloom\-filter write a split\-block Bloom filter for output column COL
                  (repeatable), at false\-positive probability FPP
                  (default 0.01). Readers then skip row groups an `=`

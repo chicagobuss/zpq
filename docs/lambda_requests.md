@@ -22,6 +22,7 @@ the CLI flags of the same name.
 | `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
 | `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
 | `fsync` | bool | Sync local output data before rename, on by default; `false` opts out. No effect on S3 output. |
+| `bloom_filters_enabled` | bool | Automatic dictionary filters, on by default; `false` disables creation. Explicit `bloom_filters` still apply. |
 | `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
 | `row_group_size` | positive integer | As `--row-group-size`: rows per re-encoded output row group (default 131072). |
 | `row_group_bytes` | positive number, or size string | As `--row-group-bytes`: uncompressed bytes per re-encoded output row group (default 64MB). A `max_memory` the request names caps it at a sixteenth of that. |

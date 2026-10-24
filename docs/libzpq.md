@@ -74,6 +74,8 @@ as before. `run()` continues to return the response envelope, including for SQL.
 
 SQL excludes the structured fields `inputs`, `s3_url`, `filter`, `columns`, `select`, `aggregate`, `group_by`,
 `column_order`, `output_url`, `output_codec`, `compress_priority`, and `bloom_filters` (null counts as absent).
+Automatic dictionary Bloom filters default on; `"bloom_filters_enabled": false` opts out.
+Explicit `bloom_filters` specifications still apply, and copied source filters are preserved.
 `parallelism` is a nonnegative integer (0 chooses automatically). Common options remain available: `max_memory`,
 `budget_wait_ms`, `ordered`, `scan_all`, `trust_stats`, `profile`, and `profile_url`. Read mode is selected through
 `ZPQ_IO_PROFILE`, exactly as for the CLI. Shutdown has the existing semantics: queued queries are refused; running
@@ -321,6 +323,8 @@ Local `output_url` files are staged in an exclusive sibling temporary file and r
 only after a successful write. Failures preserve an existing target and remove staging
 files. The JSON request accepts `"fsync": true` or `"fsync": false` to control syncing
 the output data before rename (the CLI equivalents are `--fsync` and `--no-fsync`).
-Syncing is on by default; use `"fsync": false` or `--no-fsync` to opt out.
+Syncing is on by default; use `"fsync": false` or `--no-fsync` to opt out. On Linux,
+large Parquet writes also start writeback in roughly 64 MiB ranges while later output
+is encoded. This hint does not wait for completion; the final data sync remains the fence.
 This applies to local files; S3 and standard output do not use this option. The parent
 directory is not synced, so this option does not guarantee rename survival after power loss.

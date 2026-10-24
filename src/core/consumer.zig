@@ -1977,6 +1977,7 @@ fn encodeAggColumn(
         .codec = output_codec,
         .zstd = zstd,
         .bloom_fpp = bloom_write.at(i),
+        .dictionary_bloom = bloom_write.dictionary_bloom,
     });
     if (span.t != null) {
         const em = e.meta;
@@ -2300,6 +2301,7 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
             .codec = ctx.codec,
             .zstd = ctx.zstd,
             .bloom_fpp = ctx.bloom_write.at(i),
+            .dictionary_bloom = ctx.bloom_write.dictionary_bloom,
         }) catch |err| {
             ctx.err = err;
             return;
@@ -2500,6 +2502,7 @@ fn encodeAggOutputCol(
     leaf_elem: *const schema.SchemaElement,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
+    dictionary_bloom: bool,
 ) !encoder.EncodedColumn {
     const path_buf = try arena.alloc([]const u8, 1);
     path_buf[0] = out_col.name;
@@ -2510,6 +2513,7 @@ fn encodeAggOutputCol(
         .codec = codec,
         .zstd = zstd,
         .distinct = out_col.distinct,
+        .dictionary_bloom = dictionary_bloom,
     });
 }
 
@@ -2517,6 +2521,7 @@ fn encodeAggOutputCol(
 /// the columns in flight at once charged at most `budget` bytes (`aggEncodeCharge`). The default encodes them one at
 /// a time, as every column of a small answer is.
 pub const AggEncode = struct {
+    dictionary_bloom: bool = true,
     workers: usize = 1,
     budget: u64 = 0,
     /// The query's ledger: what the columns in flight hold is drawn from it before they encode, a wave narrowing to
@@ -2574,6 +2579,7 @@ const AggColumnWave = struct {
         codec: schema.CompressionCodec,
         zstd: compression.ZstdPlan,
         cursor: *std.atomic.Value(usize),
+        dictionary_bloom: bool,
 
         /// Claim columns until none remain: one a failed spawn left unclaimed is taken by a thread that did start.
         fn run(t: *Task) void {
@@ -2581,7 +2587,9 @@ const AggColumnWave = struct {
                 const i = t.cursor.fetchAdd(1, .monotonic);
                 if (i >= t.cols.len) return;
                 const elem = aggLeafElem(t.cols[i]);
-                t.results[i] = encodeAggOutputCol(t.arenas[i].allocator(), t.cols[i], &elem, t.codec, t.zstd);
+                t.results[i] = encodeAggOutputCol(
+                    t.arenas[i].allocator(), t.cols[i], &elem, t.codec, t.zstd, t.dictionary_bloom,
+                );
             }
         }
     };
@@ -2604,6 +2612,7 @@ const AggColumnWave = struct {
         cols: []const expr_agg.OutputCol,
         codec: schema.CompressionCodec,
         zstd: compression.ZstdPlan,
+        dictionary_bloom: bool,
     ) void {
         std.debug.assert(cols.len <= w.arenas.len);
         var cursor = std.atomic.Value(usize).init(0);
@@ -2615,6 +2624,7 @@ const AggColumnWave = struct {
             .codec = codec,
             .zstd = zstd,
             .cursor = &cursor,
+            .dictionary_bloom = dictionary_bloom,
         };
         if (!spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) Task.run(&tasks[0]);
     }
@@ -2658,7 +2668,7 @@ pub fn writeAggregateRows(
         answer_rg_rows,
         codec,
         zstd,
-        if (together) encode else .{ .ledger = encode.ledger },
+        if (together) encode else .{ .ledger = encode.ledger, .dictionary_bloom = encode.dictionary_bloom },
     );
 }
 
@@ -2844,7 +2854,7 @@ fn appendAggregateRows(
                     }
                     charged -= aggEncodeCharge(units[wave_hi - 1]);
                 };
-                if (wave_hi - i > 1) w.run(units[i..wave_hi], codec, zstd);
+                if (wave_hi - i > 1) w.run(units[i..wave_hi], codec, zstd, encode.dictionary_bloom);
             }
             if (wave_hi - i == 1) if (encode.ledger) |l| {
                 drawn = l.drawExact(aggEncodeCharge(out_col)) orelse return error.ExceededMemoryBudget;
@@ -2858,7 +2868,7 @@ fn appendAggregateRows(
         const enc = if (in_wave)
             try wave.?.results[i - wave_lo]
         else
-            try encodeAggOutputCol(alone.allocator(), out_col, &leaf_elem, codec, zstd);
+            try encodeAggOutputCol(alone.allocator(), out_col, &leaf_elem, codec, zstd, encode.dictionary_bloom);
         const col_start: i64 = @intCast(off);
         var em = try ownColumnMeta(arena, enc.meta);
         em.data_page_offset += col_start;
@@ -2877,6 +2887,7 @@ fn appendAggregateRows(
             .file_path = null,
             .file_offset = col_start,
             .meta_data = em,
+            .bloom_out = try arena.dupe(u8, enc.bloom),
         });
         if (rg_columns.items.len == output_cols.len) {
             const g = new_row_groups.items.len;
@@ -2911,7 +2922,9 @@ fn aggregateFooter(
     new_row_groups: std.ArrayListUnmanaged(schema.RowGroup),
     start: u64,
 ) !u64 {
-    var off = start;
+    var out: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(start) };
+    try fastpath.placeFilters(&out, new_row_groups.items);
+    var off: u64 = out.offset;
     var new_schema: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
     try new_schema.append(arena, .{
         .type = null,
@@ -5539,7 +5552,8 @@ fn requestedFilter(
         copied.bloom_out = try out_arena.dupe(u8, copied.bloom_out);
         return;
     }
-    const fpp = bloom_write.at(ci) orelse return;
+    const explicit = bloom_write.at(ci);
+    if (explicit == null and !bloom_write.dictionary_bloom) return;
     const meta = bloom_write.meta orelse return;
     var scratch = std.heap.ArenaAllocator.init(bloom_write.scratch orelse return);
     defer scratch.deinit();
@@ -5549,6 +5563,13 @@ fn requestedFilter(
     const range = fastpath.chunkRange(&cm, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
     const bytes = try sourceBytes(src, range);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    if (explicit == null) {
+        if (cm.dictionary_page_offset == null) return;
+        const filter = try dictionaryBloom(a, bytes, cm, levels, meta) orelse return;
+        copied.bloom_out = try out_arena.dupe(u8, filter);
+        return;
+    }
+    const fpp = explicit.?;
     const n: usize = @intCast(cm.num_values);
     const col: filter_eval.Batch.Column = switch (cm.type) {
         .INT32 => .{ .i32 = try decodeColumnT(i32, a, bytes, cm.codec, levels, n) },
@@ -5568,6 +5589,43 @@ fn requestedFilter(
     };
     const filter = try encoder.bloomFilter(a, col, cm.type, fpp) orelse return;
     copied.bloom_out = try out_arena.dupe(u8, filter);
+}
+
+/// Verify every data page uses the dictionary before filtering its entries; mixed chunks must never omit values.
+fn dictionaryBloom(
+    a: std.mem.Allocator,
+    bytes: []const u8,
+    cm: schema.ColumnMetaData,
+    levels: schema.Levels,
+    meta: *const schema.FileMetaData,
+) !?[]u8 {
+    inline for (.{ i32, i64, f32, f64, []const u8 }) |T| {
+        const matches = switch (T) {
+            i32 => cm.type == .INT32,
+            i64 => cm.type == .INT64,
+            f32 => cm.type == .FLOAT,
+            f64 => cm.type == .DOUBLE,
+            []const u8 => cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY,
+            else => unreachable,
+        };
+        if (matches) {
+            var reader = column_mod.ColumnChunkReader(T).initWithOptions(
+                bytes,
+                cm.codec,
+                levels,
+                a,
+                column_mod.chunkOptions(.{}, meta, cm),
+                null,
+            );
+            if (T == []const u8 and cm.type == .FIXED_LEN_BYTE_ARRAY)
+                reader.type_length = flbaWidth(meta.getColumnSchema(cm.path_in_schema.items));
+            const entries = try reader.dictionaryOfEveryPage() orelse return null;
+            const tag = if (T == []const u8) "string" else @typeName(T);
+            const col = @unionInit(filter_eval.Batch.Column, tag, .{ .values = entries });
+            return encoder.bloomFilter(a, col, cm.type, 0.01);
+        }
+    }
+    return null;
 }
 
 /// The bytes of `range`, a span of the source file, in `src`. An S3 input holds only the chunks its plan fetched, so
@@ -5625,6 +5683,7 @@ fn carryChunk(
 /// by output column for `encodeAggregator`, by source leaf for `copyRG`, where a copied chunk that carries no filter
 /// of its own is decoded (through `meta`, on `scratch`) to build one.
 pub const BloomWrite = struct {
+    dictionary_bloom: bool = true,
     fpp: []const ?f64 = &.{},
     meta: ?*const schema.FileMetaData = null,
     scratch: ?std.mem.Allocator = null,
@@ -8483,9 +8542,16 @@ test "writeAggregateRows: on threads, an allocation failure frees everything" {
 }
 
 /// The bytes between a written answer's leading magic and its footer: its column chunks, in order.
-fn answerChunks(file: []const u8) []const u8 {
+fn answerChunks(a: std.mem.Allocator, file: []const u8) ![]const u8 {
+    const meta = try answerFooter(a, file);
     const footer_len = std.mem.readInt(u32, file[file.len - 8 ..][0..4], .little);
-    return file[4 .. file.len - 8 - footer_len];
+    var end = file.len - 8 - footer_len;
+    for (meta.row_groups.items) |rg| for (rg.columns.items) |c| {
+        if (c.meta_data) |cm| {
+            if (cm.bloom_filter_offset) |off| end = @min(end, @as(usize, @intCast(off)));
+        }
+    };
+    return file[4..end];
 }
 
 fn answerFooter(a: std.mem.Allocator, file: []const u8) !schema.FileMetaData {
@@ -8519,9 +8585,9 @@ test "writeAggregateRows: big answers use fixed row groups with serial chunks at
         for (cols, part) |c, *p| p.* = sliceOutputCol(c, lo, hi);
         var alone: AnswerCapture = .{ .a = a };
         _ = try writeAggregateRowsEncoded(a, alone.sink(), part, @intCast(hi - lo), rg, .SNAPPY, .{}, .{});
-        try want.appendSlice(a, answerChunks(alone.bytes.items));
+        try want.appendSlice(a, try answerChunks(a, alone.bytes.items));
     }
-    try std.testing.expectEqualSlices(u8, want.items, answerChunks(serial.bytes.items));
+    try std.testing.expectEqualSlices(u8, want.items, try answerChunks(a, serial.bytes.items));
     // The same file whatever the workers, the budget's waves, or failing spawns.
     const two = aggEncodeCharge(sliceOutputCol(cols[0], 0, rg)) + aggEncodeCharge(sliceOutputCol(cols[1], 0, rg));
     const Run = struct { encode: AggEncode, fail_after: ?usize = null };
@@ -9440,6 +9506,28 @@ fn testScalarCache(backing: std.mem.Allocator) !void {
             },
             .count => |count| try testing.expectEqual(count, g.count),
             else => unreachable,
+        };
+    }
+}
+
+
+test "writeAggregateRows preserves the automatic Bloom policy for small and parallel answers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_]usize{ 1000, 70000 }) |n| {
+        const cols = try aggAnswerCols(a, n, null);
+        for ([_]bool{ false, true }) |enabled| for ([_]usize{ 1, 3 }) |workers| {
+            var capture: AnswerCapture = .{ .a = a };
+            _ = try writeAggregateRows(a, capture.sink(), cols, @intCast(n), .SNAPPY, .{}, .{
+                .dictionary_bloom = enabled,
+                .workers = workers,
+                .budget = std.math.maxInt(u64),
+            });
+            const meta = try answerFooter(a, capture.bytes.items);
+            const repeated = meta.row_groups.items[0].columns.items[1].meta_data.?;
+            try std.testing.expect(repeated.dictionary_page_offset != null);
+            try std.testing.expectEqual(enabled, repeated.bloom_filter_offset != null);
         };
     }
 }

@@ -81,6 +81,19 @@ The query summary's `membership` object reports what was probed, read and pruned
 
 ## Writing them
 
+By default, every fully dictionary-encoded output chunk gets a split-block filter at false-positive probability
+0.01, built from its dictionary entries rather than by hashing every row. A re-encoded dictionary contains exactly
+the distinct present values. A copied dictionary may also contain unused entries, which only add false positives;
+the copy path checks every page header for dictionary encoding before building a filter, without decoding data pages.
+A chunk that falls back to non-dictionary pages gets no automatic filter. Existing source filters are preserved.
+Automatic filters are initially sized from the dictionary entry count; their retained bytes, like explicitly requested
+filters, are outside `--max-memory`.
+
+`--no-bloom-filters` (JSON: `"bloom_filters_enabled": false`) disables automatic creation. Explicit
+`--bloom-filter COL[:FPP]` specifications still apply, including to columns without dictionary encoding. The opt out
+also applies to aggregate and limited Parquet output. BOOLEAN columns are not dictionary encoded.
+
+
 `--bloom-filter COL[:FPP]` (Lambda: `bloom_filters`) asks for a filter on an output column, at false-positive
 probability FPP (default 0.01). A filter is sized for every present value of the chunk being distinct, filled, then
 halved for as long as its estimated false-positive probability, measured from the bits actually set, stays within FPP.

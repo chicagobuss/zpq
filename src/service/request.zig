@@ -39,6 +39,7 @@ const Wire = struct {
     profile: ?std.json.Value = null,
     profile_url: ?std.json.Value = null,
     bloom_filters: ?std.json.Value = null,
+    bloom_filters_enabled: ?std.json.Value = null,
     row_group_size: ?std.json.Value = null,
     row_group_bytes: ?std.json.Value = null,
 };
@@ -78,6 +79,7 @@ pub const Request = struct {
     profile_url: ?[]const u8 = null,
     /// `bloom_filters`: `"col"` or `"col:fpp"` per written column, as the CLI's `--bloom-filter` takes them.
     bloom_filters: []const []const u8 = &.{},
+    bloom_filters_enabled: bool = true,
     /// `row_group_size` (rows) and `row_group_bytes` (a byte count or size string): as the CLI's
     /// `--row-group-size` and `--row-group-bytes`; null for the defaults.
     row_group_size: ?usize = null,
@@ -163,6 +165,11 @@ pub const Request = struct {
         if (req.output_url) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad("output_url");
         if (req.profile_url) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad("profile_url");
         if (try f.strings(arena, "bloom_filters", true)) |b| req.bloom_filters = b;
+        req.bloom_filters_enabled = if (parsed.value.bloom_filters_enabled) |v| switch (v) {
+            .null => true,
+            .bool => |b| b,
+            else => return f.bad("bloom_filters_enabled"),
+        } else true;
         if (parsed.value.max_memory) |v| req.max_memory = switch (v) {
             .null => null,
             .integer => |n| if (n >= 0) .{ .bytes = @intCast(n) } else return f.bad("max_memory"),
@@ -478,4 +485,20 @@ test "fsync accepts both polarities and null; wrong types name the field" {
     var bad: []const u8 = "";
     try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, "{\"inputs\":[\"a\"],\"fsync\":1}", &bad));
     try testing.expectEqualStrings("fsync", bad);
+}
+
+test "automatic Bloom filters accept both polarities and default on for absent or null" {
+    inline for (.{ "", ",\"bloom_filters_enabled\":null", ",\"bloom_filters_enabled\":true",
+        ",\"bloom_filters_enabled\":false" }) |field| {
+        const body = "{\"inputs\":[\"a\"]" ++ field ++ "}";
+        var bad: []const u8 = "";
+        var req = try Request.parse(std.testing.allocator, body, &bad);
+        defer req.deinit();
+        try std.testing.expectEqual(std.mem.indexOf(u8, body, "false") == null, req.bloom_filters_enabled);
+    }
+    var bad: []const u8 = "";
+    try std.testing.expectError(error.BadFieldType, Request.parse(
+        std.testing.allocator, "{\"inputs\":[\"a\"],\"bloom_filters_enabled\":1}", &bad,
+    ));
+    try std.testing.expectEqualStrings("bloom_filters_enabled", bad);
 }

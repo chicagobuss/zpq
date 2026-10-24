@@ -165,6 +165,8 @@ pub const ColumnInput = struct {
     zstd: compression.ZstdPlan = .{},
     /// Build a split-block Bloom filter of the chunk at this false-positive probability.
     bloom_fpp: ?f64 = null,
+    /// Automatically filter dictionary chunks; an explicit probability takes precedence.
+    dictionary_bloom: bool = true,
     /// The caller proves present values unique, so a dictionary attempt would decline without changing the bytes.
     distinct: bool = false,
     /// The data page target (`default_page_bytes`, `default_page_rows`). A repeated column is one page.
@@ -385,7 +387,11 @@ pub const Plan = struct {
             },
             .pages = infos,
         };
-        if (self.in.bloom_fpp) |fpp| out.bloom = try bloomFilter(arena, self.in.values, out.meta.type, fpp) orelse &.{};
+        if (self.in.bloom_fpp) |fpp| {
+            out.bloom = try bloomFilter(arena, self.in.values, out.meta.type, fpp) orelse &.{};
+        } else if (self.in.dictionary_bloom and self.kind == .dict) {
+            out.bloom = try bloomFilter(arena, self.kind.dict.entries, out.meta.type, 0.01) orelse &.{};
+        }
         return out;
     }
 };
@@ -3670,7 +3676,8 @@ test "numeric dictionaries admit a fifth of present rows in hashed and coded col
     const a = arena_state.allocator();
     inline for (.{ i32, i64, f32, f64 }) |T| {
         const tag = @typeName(T);
-        const physical: schema.Type = if (T == i32) .INT32 else if (T == i64) .INT64 else if (T == f32) .FLOAT else .DOUBLE;
+        const physical: schema.Type = if (T == i32) .INT32 else if (T == i64) .INT64 else
+            if (T == f32) .FLOAT else .DOUBLE;
         for ([_]usize{ 150, 200, 201 }) |cardinality| for ([_]bool{ false, true }) |nullable| {
             const n: usize = if (nullable) 1250 else 1000;
             const values = try a.alloc(T, n);
@@ -3717,4 +3724,46 @@ test "numeric dictionaries admit a fifth of present rows in hashed and coded col
             try testing.expectEqualSlices(u8, plain.bytes, got.bytes);
         };
     }
+}
+
+test "dictionary Bloom defaults use the entries and an explicit probability wins over opt out" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var values: [1000]i64 = undefined;
+    for (&values, 0..) |*v, i| v.* = @intCast(i % 100);
+    var elem = flbaElem(0, .REQUIRED);
+    elem.type = .INT64;
+    const input: ColumnInput = .{
+        .values = .{ .i64 = .{ .values = &values } },
+        .schema_elem = &elem,
+        .path_in_schema = &.{"v"},
+    };
+    const enc = try encodeColumn(a, input);
+    const bits = bloom.bitset(enc.bloom).?;
+    for (0..100) |i| {
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(i64, @intCast(i)));
+        try testing.expect(bloom.Probe.init(bloom.hashBytes(&bytes)).mightContain(bits));
+    }
+    var opts = input;
+    opts.dictionary_bloom = false;
+    const disabled = try encodeColumn(a, opts);
+    try testing.expectEqual(@as(usize, 0), disabled.bloom.len);
+    try testing.expectEqualSlices(u8, enc.bytes, disabled.bytes);
+    opts.bloom_fpp = 0.000001;
+    const explicit = try encodeColumn(a, opts);
+    try testing.expect(explicit.bloom.len > enc.bloom.len);
+    const entries: filter_eval.Batch.Column = .{ .i64 = .{ .values = values[0..100] } };
+    const expected = (try bloomFilter(a, entries, .INT64, 0.01)).?;
+    try testing.expectEqualSlices(u8, expected, enc.bloom);
+}
+
+test "dictionary Bloom construction releases every failed allocation" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            const entries: filter_eval.Batch.Column = .{ .i64 = .{ .values = &.{ 1, 4, 9 } } };
+            const bytes = (try bloomFilter(a, entries, .INT64, 0.01)).?;
+            defer a.free(bytes);
+        }
+    }.run, .{});
 }

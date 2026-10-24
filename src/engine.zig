@@ -331,6 +331,7 @@ pub const QueryArgs = struct {
     /// Output columns to write split-block Bloom filters for (`--bloom-filter`). A copied chunk keeps the filter it
     /// has; one without is decoded to build one.
     bloom_filters: []const BloomSpec = &.{},
+    bloom_filters_enabled: bool = true,
 };
 
 pub const CompressPriority = compression.CompressPriority;
@@ -861,6 +862,7 @@ fn executeAggregateOver(
             .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
             .budget = args.max_memory / 4,
             .ledger = &ledger,
+            .dictionary_bloom = args.bloom_filters_enabled,
         };
         ledger.limit += core_memory.finalize_allowance;
         defer ledger.limit -= core_memory.finalize_allowance;
@@ -1250,6 +1252,7 @@ fn copyRGToBuffer(
     kept_set: ?[]const bool,
     prof: ?*profile.Thread,
     bloom_leaves: []const ?f64,
+    dictionary_bloom: bool,
 ) !EncodedRG {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -1260,6 +1263,7 @@ fn copyRGToBuffer(
     const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
     const out = try consumer.copyRG(meta_alloc, job.rg, src, kept_set, sink, &local_off, &timings, false, null, .{
         .fpp = bloom_leaves,
+        .dictionary_bloom = dictionary_bloom,
         .meta = job.meta,
         .scratch = gpa,
     });
@@ -1861,6 +1865,7 @@ const EncodeState = struct {
             .codec = w.codec,
             .zstd = w.zstd,
             .bloom_fpp = if (i < w.bloom_outputs.len) w.bloom_outputs[i] else null,
+            .dictionary_bloom = w.dictionary_bloom,
         };
         job.encs = try ja.alloc(encoder.EncodedColumn, n_cols);
         state.parts = try ja.alloc(consumer.BufRange, job.ranges.len);
@@ -1997,6 +2002,7 @@ const WinCtx = struct {
     /// The Bloom filters asked for: per output column for re-encoded row groups, per source leaf for copied ones.
     bloom_outputs: []const ?f64 = &.{},
     bloom_leaves: []const ?f64 = &.{},
+    dictionary_bloom: bool = true,
     slots: []Slot,
     /// One per producer that can run at once and one per encode job that can be pending, and one more: whoever starts
     /// work claims a free one, so an encode job lands on the pages a finished producer leaves warm.
@@ -2144,7 +2150,9 @@ fn winProducer(w: *WinCtx, i: usize) void {
 fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions, prof: ?*profile.Thread) !EncodedRG {
     const job = w.jobs[i];
     try job.arrive();
-    if (job.passthrough) return copyRGToBuffer(w.outAlloc(), ma, job, w.kept_set, prof, w.bloom_leaves);
+    if (job.passthrough) return copyRGToBuffer(
+        w.outAlloc(), ma, job, w.kept_set, prof, w.bloom_leaves, w.dictionary_bloom,
+    );
     // The filter's (and computed outputs') columns must fit; the kept rows are checked once the filter has run.
     const early = decodeBytes(job, w.early_arr);
     if (try sliceRG(job, w.fetch_arr, early * 2, w.decode_share)) return .{ .deferred = true };
@@ -2539,6 +2547,7 @@ const RecompressCtx = struct {
     page_workers: usize = 1,
     /// Bloom filter probability per leaf (`--bloom-filter`), for copied chunks that carry none.
     bloom_leaves: []const ?f64 = &.{},
+    dictionary_bloom: bool = true,
     slots: []RecompressSlot,
     window: *std.Io.Semaphore,
     /// The window's permit size and count (`jobUnits`).
@@ -2648,7 +2657,12 @@ fn recompressWriter(w: *RecompressCtx) void {
                     .scratch = w.gpa,
                     .done = if (slot.deferred) null else slot.chunks,
                 },
-                .{ .fpp = w.bloom_leaves, .meta = job.meta, .scratch = w.gpa },
+                .{
+                    .fpp = w.bloom_leaves,
+                    .meta = job.meta,
+                    .scratch = w.gpa,
+                    .dictionary_bloom = w.dictionary_bloom,
+                },
             )) |out| {
                 if (out.rg) |rg| w.new_row_groups.append(w.arena, rg) catch |e| {
                     w.first_err = e;
@@ -3348,6 +3362,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 .codec = args.codec.?,
                 .zstd = zstd,
                 .bloom_leaves = blooms.leaves,
+                .dictionary_bloom = args.bloom_filters_enabled,
                 .slots = slots,
                 .window = &window_sem,
                 .completions = &completions_sem,
@@ -3389,7 +3404,12 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
                 if (in.gate) |g| try g.wait(g.ctx, ri);
                 defer skipRowGroup(in, ri);
-                const bloom_write: consumer.BloomWrite = .{ .fpp = blooms.leaves, .meta = &meta_i, .scratch = ctx.gpa };
+                const bloom_write: consumer.BloomWrite = .{
+                    .fpp = blooms.leaves,
+                    .meta = &meta_i,
+                    .scratch = ctx.gpa,
+                    .dictionary_bloom = args.bloom_filters_enabled,
+                };
                 const out = try consumer.copyRG(
                     arena,
                     src_rg,
@@ -3532,6 +3552,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
                 .bloom_outputs = blooms.outputs,
                 .bloom_leaves = blooms.leaves,
+                .dictionary_bloom = args.bloom_filters_enabled,
                 .slots = slots,
                 .regions = regions,
                 .window = &window_sem,
@@ -8429,6 +8450,7 @@ const ParquetPrint = struct {
     pending: ?consumer.OutputAggregator = null,
     pending_arena: ?std.heap.ArenaAllocator = null,
     pending_bits: u64 = 0,
+    dictionary_bloom: bool = true,
 
     fn sink(self: *ParquetPrint) streaming.Sink {
         return .{ .ctx = @ptrCast(&self.fd_sink), .write_fn = FdSink.writeFn };
@@ -8522,7 +8544,7 @@ const ParquetPrint = struct {
             &timings,
             1,
             true,
-            .{},
+            .{ .dictionary_bloom = self.dictionary_bloom },
         );
         if (out.rg) |rg| try self.rgs.append(self.arena, rg);
     }
@@ -8535,6 +8557,9 @@ const ParquetPrint = struct {
 
     fn finish(self: *ParquetPrint, rows: usize) !void {
         try self.flushPending();
+        var out: streaming.SinkOut = .{ .sink = self.sink(), .offset = @intCast(self.out_offset) };
+        try fastpath.placeFilters(&out, self.rgs.items);
+        self.out_offset = out.offset;
         const meta: schema.FileMetaData = .{
             .version = 2,
             .schema = self.schema_items,
@@ -8710,6 +8735,7 @@ fn runPrintSinkOver(
         .arena = arena,
         .gpa = ctx.gpa,
         .fd_sink = .{ .fd = fd },
+        .dictionary_bloom = args.bloom_filters_enabled,
         .codec = args.codec orelse .SNAPPY,
         .zstd = .{ .lambda = args.compress_priority.lambda() },
         .schema_items = try buildSelectSchema(arena, meta0, output_specs),
@@ -9395,7 +9421,7 @@ test "a byte-copied row group its ledger refuses holds nothing after" {
         var ledger: core_memory.SharedBudget = .{ .limit = limit };
         var charged: core_memory.Charged = .{ .child = a, .budget = &ledger };
         const ca = charged.allocator();
-        if (copyRGToBuffer(ca, arena_state.allocator(), job, &kept, null, &.{})) |out| {
+        if (copyRGToBuffer(ca, arena_state.allocator(), job, &kept, null, &.{}, true)) |out| {
             ca.free(out.bytes);
         } else |err| {
             try std.testing.expectEqual(error.ExceededMemoryBudget, charged.refusal(err));

@@ -212,6 +212,7 @@ fn runQuery(
     var result_order: zpq.core.expr.ast.ResultOrder = .{};
     var column_order: ?[]const u8 = null;
     var profile_out: ProfileOut = .{};
+    var bloom_filters_enabled = true;
     var bloom_filters: std.ArrayList(engine.BloomSpec) = .empty;
     defer bloom_filters.deinit(gpa);
 
@@ -295,6 +296,8 @@ fn runQuery(
                 diagnosticPrint("zpq query: invalid threads value: {s}\n", .{v});
                 return error.BadArgs;
             };
+        } else if (std.mem.eql(u8, tok, "--no-bloom-filters")) {
+            bloom_filters_enabled = false;
         } else if (std.mem.eql(u8, tok, "--bloom-filter")) {
             const v = iter.next() orelse {
                 diagnosticPrint("zpq query: --bloom-filter requires a value\n", .{});
@@ -598,6 +601,7 @@ fn runQuery(
         .result_order = result_order,
         .column_order = column_order,
         .bloom_filters = bloom_filters.items,
+        .bloom_filters_enabled = bloom_filters_enabled,
         .diag = diag,
         .profiler = profiler,
     };

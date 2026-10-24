@@ -113,7 +113,10 @@ pub const Error = error{
 pub const EncodedColumn = struct {
     /// Page headers and their (compressed) payloads, ready to concatenate: the dictionary page, if any, then the
     /// data pages in row order.
-    bytes: []u8,
+    bytes: []u8 = &.{},
+    /// Borrowed ordered page buffers; their arenas must live through placement. Empty for a contiguous result.
+    segments: []const []const u8 = &.{},
+
     /// ColumnMetaData for the file footer. data_page_offset is relative
     /// to the start of `bytes`; the caller adds the column's absolute
     /// position in the output file.
@@ -122,6 +125,15 @@ pub const EncodedColumn = struct {
     bloom: []const u8 = &.{},
     /// One per data page, in order: what the chunk's page index (ColumnIndex and OffsetIndex) is built from.
     pages: []const PageInfo = &.{},
+
+    pub fn byteLen(self: EncodedColumn) usize {
+        return @intCast(self.meta.total_compressed_size);
+    }
+
+    pub fn writeTo(self: EncodedColumn, sink: anytype) !void {
+        if (self.segments.len == 0) return sink.write(self.bytes);
+        for (self.segments) |segment| try sink.write(segment);
+    }
 };
 
 /// A data page as its chunk's page index describes it.
@@ -193,6 +205,14 @@ pub fn encodeColumn(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColu
     const pages = try arena.alloc(BuiltPage, p.pageCount());
     for (pages, 0..) |*pg, i| pg.* = try p.page(arena, i);
     return p.finish(arena, pages);
+}
+
+/// The same chunk with its ordered pages retained individually, avoiding the final whole-column join.
+pub fn encodeColumnSegments(arena: std.mem.Allocator, in: ColumnInput) Error!EncodedColumn {
+    const p = try plan(arena, in);
+    const pages = try arena.alloc(BuiltPage, p.pageCount());
+    for (pages, 0..) |*pg, i| pg.* = try p.page(arena, i);
+    return p.finishSegments(arena, pages);
 }
 
 /// How a column chunk is written, decided once over all its rows (`plan`): its encoding, statistics, dictionary page
@@ -328,6 +348,16 @@ pub const Plan = struct {
 
     /// The chunk: the dictionary page, then `pages` (one per `page(i)`, in order), and its metadata, all on `arena`.
     pub fn finish(self: *const Plan, arena: std.mem.Allocator, pages: []const BuiltPage) Error!EncodedColumn {
+        var out = try self.finishSegments(arena, pages);
+        out.bytes = try std.mem.concat(arena, u8, out.segments);
+        out.segments = &.{};
+        return out;
+    }
+
+    /// Metadata still describes the complete chunk. The dictionary coverage proof and Bloom are decided once by
+    /// this plan, never independently per page; only the final byte join is omitted. Pages remain borrowed until
+    /// placement completes, while statistics and page-index bounds are owned by `arena`.
+    pub fn finishSegments(self: *const Plan, arena: std.mem.Allocator, pages: []const BuiltPage) Error!EncodedColumn {
         std.debug.assert(pages.len == self.ends.len);
         var total: usize = self.dict_page.len;
         var uncompressed: usize = self.dict_page_uncompressed;
@@ -335,12 +365,13 @@ pub const Plan = struct {
             total += pg.bytes.len;
             uncompressed += pg.uncompressed;
         }
-        const bytes = try arena.alloc(u8, total);
-        @memcpy(bytes[0..self.dict_page.len], self.dict_page);
+        const has_dictionary = self.dict_page.len != 0;
+        const segments = try arena.alloc([]const u8, pages.len + @intFromBool(has_dictionary));
+        if (has_dictionary) segments[0] = self.dict_page;
         const infos = try arena.alloc(PageInfo, pages.len);
         var pos: usize = self.dict_page.len;
-        for (pages, infos) |pg, *info| {
-            @memcpy(bytes[pos..][0..pg.bytes.len], pg.bytes);
+        for (pages, infos, segments[@intFromBool(has_dictionary)..]) |pg, *info, *segment| {
+            segment.* = pg.bytes;
             info.* = pg.info;
             info.offset = pos;
             if (info.min) |v| info.min = try arena.dupe(u8, v);
@@ -370,7 +401,7 @@ pub const Plan = struct {
             .count = @intCast(pages.len),
         });
         var out: EncodedColumn = .{
-            .bytes = bytes,
+            .segments = segments,
             .meta = .{
                 .type = self.in.schema_elem.type.?,
                 .encodings = encodings,
@@ -378,7 +409,7 @@ pub const Plan = struct {
                 .codec = self.in.codec,
                 .num_values = self.num_values,
                 .total_uncompressed_size = @intCast(uncompressed),
-                .total_compressed_size = @intCast(bytes.len),
+                .total_compressed_size = @intCast(total),
                 .data_page_offset = @intCast(self.dict_page.len),
                 .dictionary_page_offset = if (has_dict) 0 else null,
                 .index_page_offset = null,
@@ -3276,6 +3307,16 @@ test "a chunk is cut into pages at the page target, decodes whole, and pages bui
         }
         const again = try p.finish(a, built);
         try testing.expectEqualSlices(u8, enc.bytes, again.bytes);
+        const segmented = try p.finishSegments(a, built);
+        try testing.expectEqual(@as(usize, 0), segmented.bytes.len);
+        try testing.expectEqual(enc.bytes.len, segmented.byteLen());
+        try testing.expectEqualSlices(u8, enc.bytes, try std.mem.concat(a, u8, segmented.segments));
+        try testing.expectEqualDeep(enc.meta, segmented.meta);
+        try testing.expectEqualDeep(enc.pages, segmented.pages);
+        try testing.expectEqualSlices(u8, enc.bloom, segmented.bloom);
+        const dict_count: usize = @intFromBool(p.dict_page.len != 0);
+        for (built, segmented.segments[dict_count..]) |pg, bytes|
+            try testing.expectEqual(@intFromPtr(pg.bytes.ptr), @intFromPtr(bytes.ptr));
         // Every row reads back, and each page's bounds and counts are those of its rows.
         const levels: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
         for (enc.pages) |pg| {
@@ -3676,8 +3717,11 @@ test "numeric dictionaries admit a tenth of present rows in hashed and coded col
     const a = arena_state.allocator();
     inline for (.{ i32, i64, f32, f64 }) |T| {
         const tag = @typeName(T);
-        const physical: schema.Type = if (T == i32) .INT32 else if (T == i64) .INT64 else
-            if (T == f32) .FLOAT else .DOUBLE;
+        const physical: schema.Type = switch (@typeInfo(T)) {
+            .int => if (T == i32) .INT32 else .INT64,
+            .float => if (T == f32) .FLOAT else .DOUBLE,
+            else => unreachable,
+        };
         for ([_]usize{ 80, 100, 101 }) |cardinality| for ([_]bool{ false, true }) |nullable| {
             const n: usize = if (nullable) 1250 else 1000;
             const values = try a.alloc(T, n);
@@ -3766,4 +3810,63 @@ test "dictionary Bloom construction releases every failed allocation" {
             defer a.free(bytes);
         }
     }.run, .{});
+}
+
+fn segmentFinishTrial(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const elem: schema.SchemaElement = .{
+        .name = "v",
+        .type = .INT64,
+        .repetition_type = .REQUIRED,
+        .type_length = null,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var values: [256]i64 = undefined;
+    for (&values, 0..) |*v, i| v.* = @intCast(i % 3);
+    const input: ColumnInput = .{
+        .values = .{ .i64 = .{ .values = &values } },
+        .schema_elem = &elem,
+        .path_in_schema = &.{"v"},
+        .page_rows = 31,
+        .codec = .UNCOMPRESSED,
+        .bloom_fpp = 0.001,
+    };
+    const flat = try encodeColumn(a, input);
+    const segments = try encodeColumnSegments(a, input);
+    try testing.expectEqualSlices(u8, flat.bytes, try std.mem.concat(a, u8, segments.segments));
+    try testing.expectEqualSlices(u8, flat.bloom, segments.bloom);
+    const Sink = struct {
+        written: usize = 0,
+        calls: usize = 0,
+        fail_at: usize,
+        pub fn write(s: *@This(), bytes: []const u8) !void {
+            if (s.calls == s.fail_at) return error.SegmentSinkFailed;
+            s.calls += 1;
+            s.written += bytes.len;
+        }
+    };
+    for (0..segments.segments.len) |fail_at| {
+        var sink: Sink = .{ .fail_at = fail_at };
+        try testing.expectError(error.SegmentSinkFailed, segments.writeTo(&sink));
+        try testing.expectEqual(fail_at, sink.calls);
+        var expected: usize = 0;
+        for (segments.segments[0..fail_at]) |bytes| expected += bytes.len;
+        try testing.expectEqual(expected, sink.written);
+    }
+    var sink: Sink = .{ .fail_at = segments.segments.len };
+    try segments.writeTo(&sink);
+    try testing.expectEqual(flat.bytes.len, sink.written);
+}
+
+test "ordered page segments retain whole-chunk metadata and Bloom and stop at a failed sink" {
+    try segmentFinishTrial(testing.allocator);
+}
+
+test "ordered page segments release every partial plan, page, index and Bloom allocation" {
+    try testing.checkAllAllocationFailures(testing.allocator, segmentFinishTrial, .{});
 }

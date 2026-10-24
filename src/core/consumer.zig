@@ -1970,7 +1970,7 @@ fn encodeAggColumn(
             .def_levels = if (b.max_def > 0) b.def_levels.items else null,
             .max_def = b.max_def,
         }, &agg.schema_elems[i], agg.paths[i], output_codec, zstd);
-    } else try encoder.encodeColumn(arena, .{
+    } else try encoder.encodeColumnSegments(arena, .{
         .values = try aggBatchColumn(agg, i, arena),
         .schema_elem = &agg.schema_elems[i],
         .path_in_schema = agg.paths[i],
@@ -2222,8 +2222,8 @@ pub fn placeChunk(
         if (p.min) |v| p.min = try out_arena.dupe(u8, v);
         if (p.max) |v| p.max = try out_arena.dupe(u8, v);
     }
-    try sink.write(enc.bytes);
-    out_offset.* += enc.bytes.len;
+    try enc.writeTo(sink);
+    out_offset.* += enc.byteLen();
     return .{
         .chunk = .{
             .file_path = null,
@@ -2252,11 +2252,11 @@ const ChunkPlacer = struct {
         em.data_page_offset += col_start_in_file;
         if (em.dictionary_page_offset) |dpo| em.dictionary_page_offset = dpo + col_start_in_file;
         const t_sink_start = nowMonoNs();
-        try self.sink.write(enc.bytes);
+        try enc.writeTo(self.sink);
         const t_sink_end = nowMonoNs();
         self.timings.sink_ns += @intCast(t_sink_end - t_sink_start);
-        profile.record(self.timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{enc.bytes.len}));
-        self.out_offset.* += enc.bytes.len;
+        profile.record(self.timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{enc.byteLen()}));
+        self.out_offset.* += enc.byteLen();
         self.total.* += enc.meta.total_uncompressed_size;
 
         var chunk: schema.ColumnChunk = .{
@@ -2294,7 +2294,7 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
     var i = ctx.start;
     while (i < ctx.batch_cols.len) : (i += ctx.stride) {
         if (ctx.results[i] != null) continue; // FLBA decimal done in pre-pass
-        ctx.results[i] = encoder.encodeColumn(ctx.arena, .{
+        ctx.results[i] = encoder.encodeColumnSegments(ctx.arena, .{
             .values = ctx.batch_cols[i],
             .schema_elem = &ctx.schema_elems[i],
             .path_in_schema = ctx.paths[i],
@@ -2506,7 +2506,7 @@ fn encodeAggOutputCol(
 ) !encoder.EncodedColumn {
     const path_buf = try arena.alloc([]const u8, 1);
     path_buf[0] = out_col.name;
-    return encoder.encodeColumn(arena, .{
+    return encoder.encodeColumnSegments(arena, .{
         .values = out_col.col,
         .schema_elem = leaf_elem,
         .path_in_schema = path_buf,
@@ -2885,8 +2885,8 @@ fn appendAggregateRows(
             st.min_value = null;
             st.max_value = null;
         };
-        try sink.write(enc.bytes);
-        off += enc.bytes.len;
+        try enc.writeTo(sink);
+        off += enc.byteLen();
         rg_total += em.total_uncompressed_size;
         try rg_columns.append(arena, .{
             .file_path = null,

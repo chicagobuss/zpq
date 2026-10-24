@@ -60,11 +60,8 @@ pub fn build(b: *std.Build) void {
     // ----- CLI binary -----
     const cli_zpq = addBinaryModules(b, deps, target, optimize, .cli, sql, strip);
     const cli_version = b.addOptions();
-    var revision_status: u8 = 0;
-    const revision_args: []const []const u8 = &.{ "git", "describe", "--always", "--dirty", "--exclude=*", "--abbrev=12" };
-    const revision = b.runAllowFail(revision_args, &revision_status, .ignore) catch "unknown";
     const artifact_revision = b.option([]const u8, "revision", "Revision recorded in the artifact manifest") orelse
-        std.mem.trim(u8, revision, "\r\n");
+        @import("tools/build_revision.zig").current(b);
     cli_version.addOption([]const u8, "revision", artifact_revision);
     cli_zpq.root.addImport("cli_version", cli_version.createModule());
     const cli = b.addExecutable(.{

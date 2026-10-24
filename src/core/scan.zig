@@ -4515,7 +4515,14 @@ fn prepareAggregateWithMetas(
     if (pairs_call) |ai| {
         pair_sinks = try arena.alloc(expr_agg.DistinctPairs, n_tables);
         for (pair_sinks, group_tables) |*ps, *gt| {
-            ps.* = .{ .gpa = gpa, .budget = group_budget, .table = gt, .agg_idx = ai, .active = pairs_from_start };
+            ps.* = .{
+                .gpa = gpa,
+                .budget = group_budget,
+                .table = gt,
+                .agg_idx = ai,
+                .active = pairs_from_start,
+                .allow_coded_sets = args.distinct_pairs == .auto,
+            };
         }
     }
     var block_merge: ?BlockMerge = if (use_blocks) .{
@@ -4683,11 +4690,13 @@ fn prepareAggregateWithMetas(
         dense_charge = 0;
         dense_merged = true;
     }
-    // Once any worker sends pairs every table does, so each key's values meet in one partition.
+    // Coded sets stay on their ordinary union when no worker emitted a pair. Otherwise every complete identity
+    // joins the same pair fold, including sets a coded chunk retained beside an active sink.
     var pairs_used = false;
-    for (pair_sinks) |*ps| pairs_used = pairs_used or ps.active;
+    for (pair_sinks) |*ps| pairs_used = pairs_used or
+        (ps.active and (!ps.allow_coded_sets or ps.hasPairs()));
     if (pairs_used) {
-        for (pair_sinks, group_tables) |*ps, *gt| if (!ps.active) try ps.drainTable(gt);
+        for (pair_sinks, group_tables) |*ps, *gt| if (!ps.active or ps.pending_sets) try ps.drainTable(gt);
         try foldDistinctPairs(gpa, group_budget, pair_sinks, group_tables, pairs_call.?, agg_calls.len, n_workers);
     }
     // Once one worker has moved to the partition runs every table goes there, so each key is in one partition.
@@ -19834,5 +19843,137 @@ test "distinct bitmaps retain identities after releasing windows and late wide f
             try testing.expect(window.waits.load(.monotonic) >= meta.row_groups.items.len);
             try testing.expectEqual(meta.row_groups.items.len, window.releases.load(.monotonic));
         };
+    }
+}
+
+test "distinct coded sets share automatic pairs across releasing windows and refused final drains" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |mixed| {
+        var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+        var file = try consumer.AggregateFile.init(a, sink.sink());
+        defer file.deinit();
+        for (0..16) |rg| {
+            var keys: [2048]i64 = undefined;
+            var values: [2048]i64 = undefined;
+            var kd: [2048]u32 = undefined;
+            var vd: [2048]u32 = undefined;
+            for (&keys, &values, &kd, &vd, 0..) |*k, *v, *kn, *vn, r| {
+                k.* = @intCast(r % 3);
+                v.* = @intCast(if (mixed and rg == 7) 5000 + r else (r / 3) % 64 + rg * 128);
+                kn.* = @intFromBool(r % 23 != 0);
+                vn.* = @intFromBool(r % 17 != 0);
+            }
+            const cols = [_]expr_agg.OutputCol{
+                .{
+                    .name = "k",
+                    .parquet_type = .INT64,
+                    .nullable = true,
+                    .col = .{ .i64 = .{ .values = &keys, .def_levels = &kd, .max_def = 1 } },
+                },
+                .{
+                    .name = "v",
+                    .parquet_type = .INT64,
+                    .nullable = true,
+                    .col = .{ .i64 = .{ .values = &values, .def_levels = &vd, .max_def = 1 } },
+                },
+            };
+            try file.append(&cols, keys.len, .SNAPPY, .{}, .{});
+        }
+        _ = try file.finish(&.{
+            .{ .name = "k", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+            .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+        });
+        const bytes = sink.buffer.items;
+        const meta = try metadata.open(a, bytes);
+        const mapped = [_]Input{.{ .name = "mixed-distinct.parquet", .bytes = bytes }};
+        var args: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = (&meta)[0..1],
+            .aggregate = "count(DISTINCT v) AS d",
+            .group_by = "k",
+            .scan_all = true,
+            .plain_rules = false,
+            .distinct_pairs = .off,
+            .pairs_pilot_rows = 1,
+            .min_bytes_per_worker = 1,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        args.distinct_pairs = .auto;
+        var mapped_auto = try runMultiAggregate(gpa, a, args);
+        defer mapped_auto.deinit(gpa);
+        try testing.expectEqualDeep(want.output.group_rows, mapped_auto.output.group_rows);
+        try testing.expectEqual(mixed, mapped_auto.distinct_pairs);
+        for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |batch|
+            for ([_]@FieldType(MultiAggArgs, "distinct_pairs"){ .on, .auto }) |mode| {
+                var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+                const inputs = [_]Input{window.input(bytes)};
+                args.inputs = &inputs;
+                args.parallelism = j;
+                args.decode_batch_rows = batch;
+                args.distinct_pairs = mode;
+                var got = try runMultiAggregate(gpa, a, args);
+                defer got.deinit(gpa);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+                try testing.expectEqual(mode == .on or mixed, got.distinct_pairs);
+                try testing.expectEqual(meta.row_groups.items.len, window.releases.load(.monotonic));
+            };
+        if (mixed) {
+            const Refusal = struct {
+                window: ReleasingScanWindow,
+                budget: *core_memory.SharedBudget,
+                held: usize = 0,
+                denied: std.atomic.Value(bool) = .init(false),
+                fn wait(ctx: *anyopaque, rg: usize) anyerror!void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    try ReleasingScanWindow.wait(&self.window, rg);
+                }
+                fn done(ctx: *anyopaque, rg: usize, items: usize) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    ReleasingScanWindow.release(&self.window, rg, items);
+                    if (self.window.releases.load(.acquire) == self.window.meta.row_groups.items.len and
+                        self.denied.cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
+                    {
+                        self.held = self.budget.limit + core_memory.finalize_allowance;
+                        self.budget.force(self.held);
+                    }
+                }
+                fn start(_: *anyopaque) anyerror!void {}
+                fn abandon(ctx: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    self.budget.release(self.held);
+                    self.held = 0;
+                    ReleasingScanWindow.abandon(&self.window);
+                }
+            };
+            var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+            var refused: Refusal = .{
+                .window = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta },
+                .budget = &budget,
+            };
+            defer budget.release(refused.held);
+            const inputs = [_]Input{.{
+                .name = "mixed-distinct.parquet",
+                .bytes = refused.window.bytes,
+                .plan_bytes = bytes,
+                .gate = .{ .ctx = &refused, .wait = Refusal.wait, .done = Refusal.done },
+            }};
+            args.inputs = &inputs;
+            args.parallelism = 4;
+            args.decode_batch_rows = 0;
+            args.distinct_pairs = .auto;
+            args.max_memory = 64 << 20;
+            args.decode_limit = 64 << 20;
+            args.ledger = &budget;
+            args.start_reads = .{ .ctx = &refused, .start = Refusal.start, .abandon = Refusal.abandon };
+            var got = try runMultiAggregate(gpa, a, args);
+            defer got.deinit(gpa);
+            try testing.expect(refused.denied.load(.monotonic));
+            try testing.expectEqual(@as(usize, 1), refused.window.abandoned);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        }
     }
 }

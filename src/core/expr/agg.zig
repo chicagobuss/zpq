@@ -5305,6 +5305,10 @@ pub const DistinctPairs = struct {
     agg_idx: usize,
     /// Rows go to the sets until this is set (`drainTable` moves what they hold so far).
     active: bool = true,
+    /// Automatic selection can retain cache-admitted coded sets beside pairs from other chunks.
+    allow_coded_sets: bool = false,
+    /// Those sets must join emitted pairs before either representation is counted.
+    pending_sets: bool = false,
     /// Values the sets took meanwhile: rows that passed the filter, NULLs left out, which `scan.pairsPayRuntime`
     /// judges the sets by.
     seen: u64 = 0,
@@ -5313,6 +5317,11 @@ pub const DistinctPairs = struct {
     recent: [1 << recent_bits]Pair = undefined,
     /// Which `recent` slots hold a pair.
     recent_valid: [(1 << recent_bits) / 64]u64 = @splat(0),
+
+    pub fn hasPairs(self: *const DistinctPairs) bool {
+        for (self.parts) |part| if (part.items.len != 0) return true;
+        return false;
+    }
 
     /// Safe to call again.
     pub fn deinit(self: *DistinctPairs) void {

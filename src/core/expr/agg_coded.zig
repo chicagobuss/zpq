@@ -994,10 +994,13 @@ fn foldGroupedValue(
     }
 
     const float_sum = floatSum(call);
-    // A count(DISTINCT) a pair sink answers takes the values fold below, which sends it the pairs; a histogram would
-    // fill the sets the sink stands in for.
+    // Ordinary histograms defer to pair sinks. Cache-admitted coded bits can retain exact sets beside an automatic
+    // sink; the final fold drains them if any chunk emits pairs, or keeps the normal union otherwise.
     const to_pairs = call.func == .count_distinct and if (agg.distinct_pairs) |dp| dp.active else false;
-    if (call.func == .count_distinct and !to_pairs and call.arg.? == .col_ref and arg_col.?.codes() != null) {
+    const keep_coded_sets = to_pairs and agg.distinct_pairs.?.allow_coded_sets;
+    if (call.func == .count_distinct and (!to_pairs or keep_coded_sets) and
+        call.arg.? == .col_ref and arg_col.?.codes() != null)
+    {
         const col = arg_col.?;
         const card = col.dictLen();
         const words = (card + 63) / 64;
@@ -1019,6 +1022,7 @@ fn foldGroupedValue(
             }.row, .{ .bits = bits, .comp = comp, .words = words, .codes = col.codes().?, .card = card, .bad = &bad });
             if (bad) return error.BadColumn;
             const dict = try widenDict(ra, col, call.arg.?.col_ref);
+            if (keep_coded_sets) agg.distinct_pairs.?.pending_sets = true;
             for (0..space) |cp| {
                 for (bits[cp * words ..][0..words], 0..) |word, wi| {
                     if (word == 0) continue;
@@ -1892,10 +1896,14 @@ test "groupedCoded over a key histogram with first rows makes the groups, positi
 }
 
 test "distinct coded bitmaps fold only selected present identities across words and free failed allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctCodesTrial, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctCodesTrial, .{false});
 }
 
-fn distinctCodesTrial(a: std.mem.Allocator) !void {
+test "distinct coded sets coexist with active pairs and drain complete identities with failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctCodesTrial, .{true});
+}
+
+fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
     const testing = std.testing;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1931,6 +1939,19 @@ fn distinctCodesTrial(a: std.mem.Allocator) !void {
     for (0..3) |shape| {
         var table = agg.GroupTable.init(a, 1 << 20);
         defer table.deinit();
+        var budget: agg.SharedBudget = .{ .limit = 1 << 20 };
+        var pairs: agg.DistinctPairs = .{
+            .gpa = a,
+            .budget = &budget,
+            .table = &table,
+            .agg_idx = 0,
+            .active = active_pairs,
+            .allow_coded_sets = true,
+        };
+        defer pairs.deinit();
+        const old_pairs = agg.distinct_pairs;
+        agg.distinct_pairs = &pairs;
+        defer agg.distinct_pairs = old_pairs;
         const calls = [_]AggCall{call};
         for (0..3) |g| {
             const key = [_]u8{@intCast(g)};
@@ -1984,5 +2005,41 @@ fn distinctCodesTrial(a: std.mem.Allocator) !void {
             try testing.expectEqual(error.BadColumn, e);
         }
         codes[128] = 128;
+        if (active_pairs) {
+            try testing.expect(pairs.pending_sets);
+            try testing.expectEqual(@as(usize, 0), pairs.charged);
+            var one = try Sel.init(ra, 1);
+            one.set(0, true);
+            try agg.updateOneGroupedValues(
+                ra,
+                a,
+                table.accumulators.items,
+                &.{0},
+                0,
+                1,
+                call,
+                .{ .i64 = .{ .values = &.{5000} } },
+                &one,
+                false,
+            );
+            try testing.expect(pairs.charged != 0);
+            try pairs.drainTable(&table);
+            var found: [3][137]bool = @splat(@splat(false));
+            var found_plain = false;
+            for (pairs.parts) |part| for (part.items) |pair| {
+                const group: usize = @intCast(pair.k0);
+                try testing.expect(group < 3);
+                const v: i64 = @bitCast(pair.x);
+                if (v == 5000) {
+                    try testing.expectEqual(@as(usize, 0), group);
+                    found_plain = true;
+                } else {
+                    try testing.expect(v >= -7 and v <= 128);
+                    found[group][@intCast(v + 7)] = true;
+                }
+            };
+            try testing.expect(found_plain);
+            try testing.expectEqualDeep(expected, found);
+        }
     }
 }

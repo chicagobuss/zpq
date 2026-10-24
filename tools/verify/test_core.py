@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Registry-free checks for the summary writer and the ship bar."""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import execute
+import shipbar
+import stages
+import summary
+
+
+def cell(engine, ns, query="q", failures=None, checked=3):
+    return {
+        "suite": "clickbench",
+        "dataset": "hits",
+        "query_id": query,
+        "engine": engine,
+        "median_ns": ns,
+        "checked": checked,
+        "failures": failures or [],
+    }
+
+
+class SummaryTest(unittest.TestCase):
+    def test_refuses_to_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "run-a"
+            summary.Summary(run, {"tier": "quick", "sha": "abc"})
+            with self.assertRaises(FileExistsError):
+                summary.Summary(run, {"tier": "quick", "sha": "abc"})
+
+    def test_expected_is_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = summary.Summary(Path(directory) / "run-b", {"tier": "full", "sha": "abc", "rerun_of": "run-a"})
+            run.add_stage({"name": "repro-skspill", "status": "expected", "rc": 1})
+            run.add_stage({"name": "differential", "status": "fail", "rc": 1})
+            self.assertEqual(run.data["expected"], ["repro-skspill"])
+            self.assertEqual(run.data["failures"], ["differential"])
+            self.assertEqual(run.data["rerun_of"], "run-a")
+            self.assertEqual(summary.exit_code(run), 1)
+            saved = json.loads((Path(directory) / "run-b" / "summary.json").read_text())
+            self.assertEqual(saved["failures"], ["differential"])
+
+
+class JudgeTest(unittest.TestCase):
+    def test_declared_refusal(self):
+        cmd = stages.Cmd(
+            [],
+            {},
+            "spill",
+            expect="refusal",
+            expect_rc=1,
+            expect_text="the query needs more memory than --max-memory allows",
+        )
+        status, _counts = execute.judge(
+            cmd, 1, "error: the query needs more memory than --max-memory allows\n"
+        )
+        self.assertEqual(status, "expected")
+        status, _counts = execute.judge(cmd, 0, "rows\n")
+        self.assertEqual(status, "fail")
+
+    def test_clickbench_fail_is_not_hidden_by_exit_zero(self):
+        cmd = stages.Cmd([], {}, "cb", parse=stages.parse_clickbench)
+        status, counts = execute.judge(cmd, 0, "{'PASS': 40, 'FAIL': 2}\n")
+        self.assertEqual(counts["fail"], 2)
+        self.assertEqual(status, "fail")
+
+
+class ShipBarTest(unittest.TestCase):
+    def test_met_when_majority_and_no_trap(self):
+        rows = []
+        # One cell of five is 1.1x behind: 20% is the bar's inclusive edge, and 4/5 is a majority.
+        for query, zpq in (("a", 80), ("b", 90), ("c", 80), ("d", 90), ("e", 110)):
+            rows += [cell("zpq", zpq, query), cell("duckdb20", 100, query), cell("polars", 100, query)]
+        result = shipbar.evaluate(rows)
+        self.assertTrue(result["met"])
+        self.assertIn("SHIP BAR (majority vs each, <=20% behind, none >1.5x): MET\n", shipbar.render(result))
+
+    def test_trap_over_1_5_misses(self):
+        rows = []
+        for query, zpq in (("a", 80), ("b", 90), ("c", 160)):
+            rows += [cell("zpq", zpq, query), cell("duckdb20", 100, query), cell("polars", 100, query)]
+        self.assertFalse(shipbar.evaluate(rows)["met"])
+
+    def test_control_does_not_flip_the_bar(self):
+        rows = []
+        for query, zpq in (("a", 80), ("b", 90), ("c", 80), ("d", 90), ("e", 110)):
+            rows += [
+                cell("zpq", zpq, query),
+                cell("duckdb20", 100, query),
+                cell("polars", 100, query),
+                cell("zpq_prev", 50, query),
+            ]
+        result = shipbar.evaluate(rows)
+        self.assertTrue(result["met"])
+        self.assertGreater(result["control"]["geomean"], 1)
+        self.assertIn("not part of the ship bar", shipbar.render(result))
+
+
+if __name__ == "__main__":
+    unittest.main()

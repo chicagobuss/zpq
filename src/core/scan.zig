@@ -3605,7 +3605,7 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
 /// A joined attempt may have returned every gated row group's pages. Replays read the stable mappings,
 /// never the reader's ready-but-released window. Allocate the view before abandoning any reader state.
 fn rewindInputs(arena: std.mem.Allocator, args: *MultiAggArgs) !void {
-    std.debug.assert(allRescannable(args.inputs));
+    if (!allRescannable(args.inputs)) return error.ExceededMemoryBudget;
     const inputs = try arena.dupe(Input, args.inputs);
     for (inputs) |*input| if (input.plan_bytes) |b| {
         input.bytes = b;
@@ -3732,6 +3732,8 @@ fn narrowed(
     chain: *Chain,
     may_fit: bool,
 ) ?MultiAggArgs {
+    // A finished windowed source may already have discarded its pages. No budget retry can read it again.
+    if (!allRescannable(attempt.inputs)) return null;
     var next = attempt;
     if (taken.contains(.msd_records)) {
         // Retained pages and decoder scratch have been released. Admission required complete rescannability,
@@ -19506,4 +19508,151 @@ test "phase-four replay policies decline releasing gates before certificate resi
                     try testing.expectEqual(.ineligible, outcome);
                 };
         };
+}
+
+test "windowed S3 merge refusal never retries consumed non-rescannable inputs" {
+    const s3_window = @import("../io/s3_window.zig");
+    if (!s3_window.supported) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    const keys = [_]i64{ 7, 3, 7, 9, 3, 7, 11, 11, 12, 13, 14, 15, 16, 17, 18, 19 };
+    const cols = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .parquet_type = .INT64,
+        .nullable = false,
+        .col = .{ .i64 = .{ .values = &keys } },
+    }};
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &cols, keys.len, .SNAPPY, .{}, .{});
+    const meta = try metadata.open(a, sink.buffer.items);
+    const Refusal = struct {
+        gate: RowGroupGate,
+        total: *std.atomic.Value(usize),
+        budget: *core_memory.SharedBudget,
+        held: *usize,
+        waits: std.atomic.Value(usize) = .init(0),
+
+        fn wait(ctx: *anyopaque, rg: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.waits.fetchAdd(1, .monotonic);
+            try self.gate.wait(self.gate.ctx, rg);
+        }
+
+        fn done(ctx: *anyopaque, rg: usize, items: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.gate.done(self.gate.ctx, rg, items);
+            if (self.total.fetchAdd(1, .acq_rel) + 1 != 2) return;
+            // All work is finished. Hold the entire merge ceiling, even if other scan charges return before
+            // merging. This injects a merge-only refusal independently of which worker claimed each item.
+            self.held.* = self.budget.limit + core_memory.finalize_allowance;
+            self.budget.force(self.held.*);
+        }
+    };
+    for ([_]usize{ 2, 4, 16 }) |j| for ([_]bool{ false, true }) |mixed| {
+        var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        var held: usize = 0;
+        defer budget.release(held);
+        var total: std.atomic.Value(usize) = .init(0);
+        var groups: [2]s3_window.RowGroup = undefined;
+        var order = [_]*s3_window.RowGroup{ &groups[0], &groups[1] };
+        var window: s3_window.Window = .{
+            .gpa = gpa,
+            .order = &order,
+            .limit = 2 * s3_window.page,
+            .batch = s3_window.page,
+        };
+        const first = try s3_window.mapBuffer(sink.buffer.items.len);
+        defer s3_window.unmapBuffer(first);
+        const second = try s3_window.mapBuffer(sink.buffer.items.len);
+        defer s3_window.unmapBuffer(second);
+        const buffers = [_][]align(s3_window.page) u8{ first, second };
+        var rgs = [2][1]?*s3_window.RowGroup{ .{&groups[0]}, .{&groups[1]} };
+        var files: [2]s3_window.File = undefined;
+        var refusals: [2]Refusal = undefined;
+        var inputs: [2]Input = undefined;
+        for (0..2) |i| {
+            @memcpy(buffers[i][0..sink.buffer.items.len], sink.buffer.items);
+            // Already fetched: s3_window's ready state. Its real gate releases these anonymous pages.
+            groups[i] = .{
+                .jobs = &.{},
+                .bytes = buffers[i].len,
+                .seg = buffers[i],
+                .admitted = true,
+                .window = &window,
+                .state = .init(1),
+            };
+            files[i] = .{ .rgs = &rgs[i] };
+            refusals[i] = .{ .gate = files[i].gate(), .total = &total, .budget = &budget, .held = &held };
+            inputs[i] = .{
+                .name = if (mixed and i == 0) "local.parquet" else "s3://bucket/window.parquet",
+                .bytes = buffers[i][0..sink.buffer.items.len],
+                .plan_bytes = if (mixed and i == 0) sink.buffer.items else null,
+                .gate = .{ .ctx = &refusals[i], .wait = Refusal.wait, .done = Refusal.done },
+            };
+        }
+        if (runMultiAggregate(gpa, a, .{
+            .inputs = &inputs,
+            .metas = &.{ meta, meta },
+            .aggregate = "count(*) AS c",
+            .group_by = "k",
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .scan_all = true,
+            .max_memory = budget.limit,
+            .ledger = &budget,
+            .charge_decode = false,
+            .ndv_policy = false,
+            .plain_rules = false,
+            .dense = false,
+            .partition_cost = false,
+            .spill = false,
+            .distinct_pairs = .off,
+        })) |got| {
+            var unexpected = got;
+            unexpected.deinit(gpa);
+            return error.TestExpectedError;
+        } else |err| try testing.expectEqual(error.ExceededMemoryBudget, err);
+        try testing.expect(held != 0);
+        try testing.expectEqual(held, budget.used.load(.monotonic));
+        try testing.expectEqual(@as(usize, 2), total.load(.monotonic));
+        for (&groups, &refusals, buffers) |*rg, *refusal, buffer| {
+            try testing.expectEqual(@as(usize, 1), refusal.waits.load(.monotonic));
+            try testing.expectEqual(@as(u32, 1), rg.items_done.load(.monotonic));
+            try testing.expectEqual(@as(u8, 0), buffer[0]); // Actual MADV_DONTNEED, not a retained test buffer.
+        }
+    };
+}
+
+test "budget narrowing requires rescannable inputs for every restart reason" {
+    const Gate = struct {
+        fn wait(_: *anyopaque, _: usize) anyerror!void {
+            unreachable;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {
+            unreachable;
+        }
+    };
+    var marker: u8 = 0;
+    var inputs = [_]Input{.{
+        .name = "s3://bucket/window.parquet",
+        .bytes = &.{},
+        .gate = .{ .ctx = &marker, .wait = Gate.wait, .done = Gate.done },
+    }};
+    var args: MultiAggArgs = .{ .inputs = &inputs, .aggregate = "", .parallelism = 4 };
+    for (std.enums.values(FastPath)) |path| {
+        var chain: Chain = .{ .parts_tried = false };
+        try testing.expect(narrowed(args, args, std.EnumSet(FastPath).initOne(path), &chain, true) == null);
+    }
+    // The helper also declines at runtime, before allocating a view or abandoning a reader.
+    try testing.expectError(error.ExceededMemoryBudget, rewindInputs(testing.allocator, &args));
+    try testing.expectEqual(inputs[0..].ptr, args.inputs.ptr);
+    for ([_]bool{ false, true }) |mapped| {
+        inputs[0].gate = if (mapped) .{ .ctx = &marker, .wait = Gate.wait, .done = Gate.done } else null;
+        inputs[0].plan_bytes = if (mapped) &.{} else null;
+        var chain: Chain = .{ .parts_tried = false };
+        const retry = narrowed(args, args, std.EnumSet(FastPath).initOne(.merge_memory), &chain, false).?;
+        try testing.expectEqual(@as(usize, 1), retry.parallelism);
+    }
 }

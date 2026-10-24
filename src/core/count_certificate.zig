@@ -101,6 +101,27 @@ fn secondaryHint(sources: []const Source, ci: usize) ?IntegerRange {
     return if (width > 0 and width <= hw.l2BytesPerWorkerOr(640 << 10) / 12) range else null;
 }
 
+// These complete key chunks are needed by the following unfiltered count pass. Queue their reads together,
+// rather than making input-wide sampling serialize cold faults across every row group. Advice changes no decode.
+fn prefetchKeys(sources: []const Source, key: usize, second: ?usize) void {
+    const membership = @import("filter/membership.zig");
+    for (sources) |source| {
+        const files = [_][]const u8{source.src.bytes};
+        const mapped: membership.MappedSource = .{ .files = &files };
+        for ([_]?usize{ key, second }) |maybe_ci| {
+            const ci = maybe_ci orelse continue;
+            if (ci >= source.rg.columns.items.len) continue;
+            const cm = source.rg.columns.items[ci].meta_data orelse continue;
+            const begin = @min(cm.data_page_offset, cm.dictionary_page_offset orelse cm.data_page_offset);
+            const absolute = std.math.cast(u64, begin) orelse continue;
+            const bytes = std.math.cast(u64, cm.total_compressed_size) orelse continue;
+            if (absolute < source.src.byte_origin) continue;
+            const start = absolute - source.src.byte_origin;
+            mapped.source().prefetch(&.{.{ .file = 0, .start = start, .end = start +| bytes }});
+        }
+    }
+}
+
 /// Only bare signed integer columns are admitted by the caller. Real page encodings feed the existing slice
 /// reader; whole pages between windows are skipped by checked headers. Scratch and sample keys use the caller's
 /// charged allocator. Errors are optional-probe failures: the caller discards the sample and runs its full pass.
@@ -121,6 +142,7 @@ pub fn sample(
     // declines this policy; cache capacity, rather than a fixture constant, bounds sampling effort.
     const capacity = hw.l2BytesPerWorkerOr(640 << 10) / (2 * (8 + 8 + 1));
     if (h > capacity) return result;
+    prefetchKeys(sources, key, second);
     const count = @min(rows, capacity);
     const windows = Windows.init(rows, count, @max(sources.len, workers));
     const hint = if (second) |ci| secondaryHint(sources, ci) else null;

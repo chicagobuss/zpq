@@ -242,7 +242,7 @@ pub const Source = struct {
         return self.cost;
     }
 
-    fn prefetch(self: Source, spans: []const Span) void {
+    pub fn prefetch(self: Source, spans: []const Span) void {
         if (spans.len > 0) if (self.vtable.prefetch) |f| f(self.ctx, spans);
     }
 

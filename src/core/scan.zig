@@ -4487,13 +4487,13 @@ fn prepareAggregateWithMetas(
     var dense_table_charge: usize = 0;
     if (dense_wanted) dense: {
         const d = &domain.?;
-        const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls.len);
+        const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls, ndv_stat.?.rows);
         if (!rescannable) break :dense;
         if (spill_on or pairs_call != null or n_workers *| d.ids() > d.entries()) break :dense;
         dense_table_charge = agg_dense.tableBytes(d.ids(), fixed_stride, agg_calls.len);
         dense_charge = group_budget.drawExact(d.bytes +| lanes_bytes +| dense_table_charge) orelse break :dense;
         dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
-        for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls };
+        for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls, .rows = ndv_stat.?.rows };
         if (args.taken) |taken| taken.insert(.dense);
     }
     if (dense_lanes.len == 0) if (domain) |*d| {

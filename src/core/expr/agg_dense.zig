@@ -89,9 +89,20 @@ pub fn shapeOk(calls: []const AggCall, keys: []const expr_ast.Expr) bool {
     return true;
 }
 
-/// Bytes one worker's lanes take for `ids` ids and `n_calls` calls.
-pub fn laneBytes(ids: usize, n_calls: usize) usize {
-    return ids *| (@sizeOf(u64) + @sizeOf(Accumulator) *| n_calls);
+fn countOnly(calls: []const AggCall) bool {
+    if (calls.len != 1) return false;
+    const c = calls[0];
+    return c.func == .count and c.arg == null and c.where == null and !c.state and c.offset == 0;
+}
+
+pub fn countBytes(rows: u64) usize {
+    return if (rows <= std.math.maxInt(u32)) @sizeOf(u32) else @sizeOf(u64);
+}
+
+/// The same row bound chooses storage and its prepaid quote. Selection can only lower a lane's count.
+pub fn laneBytes(ids: usize, calls: []const AggCall, rows: u64) usize {
+    const state = if (countOnly(calls)) countBytes(rows) else @sizeOf(Accumulator) *| calls.len;
+    return ids *| (@sizeOf(u64) +| state);
 }
 
 /// Bytes at most the table `intoTable` fills holds for `ids` groups: what `GroupTable.reserveFixed` charges.
@@ -100,19 +111,34 @@ pub fn tableBytes(ids: usize, stride: usize, n_calls: usize) usize {
     return ids *| (stride + @sizeOf(u64) + @sizeOf(Accumulator) *| n_calls) +| slots *| (@sizeOf(u64) + @sizeOf(u32) * 2);
 }
 
-/// One worker's accumulators, `calls.len` per id, and each id's least position. Allocated on the worker's first row
-/// group, so the pages are first touched by the thread that fills them.
+/// One worker's least positions and states: counters for COUNT(*), otherwise `calls.len` accumulators per id.
+/// Allocated on its first row group, so the worker first touches the pages it fills.
 pub const Lanes = struct {
     domain: *const Domain,
     calls: []const AggCall,
     accs: []Accumulator = &.{},
     first: []u64 = &.{},
+    rows: u64 = std.math.maxInt(u64),
+    counts32: []u32 = &.{},
+    counts64: []u64 = &.{},
 
     fn ensure(l: *Lanes, gpa: std.mem.Allocator) !void {
         if (l.first.len != 0) return;
         const n = l.domain.ids();
         const first = try gpa.alloc(u64, n);
         errdefer gpa.free(first);
+        if (countOnly(l.calls)) {
+            if (countBytes(l.rows) == @sizeOf(u32)) {
+                l.counts32 = try gpa.alloc(u32, n);
+                @memset(l.counts32, 0);
+            } else {
+                l.counts64 = try gpa.alloc(u64, n);
+                @memset(l.counts64, 0);
+            }
+            @memset(first, unseen);
+            l.first = first;
+            return;
+        }
         const accs = try gpa.alloc(Accumulator, n * l.calls.len);
         @memset(first, unseen);
         for (0..n) |i| for (l.calls, accs[i * l.calls.len ..][0..l.calls.len]) |call, *acc| {
@@ -125,8 +151,20 @@ pub const Lanes = struct {
     pub fn deinit(l: *Lanes, gpa: std.mem.Allocator) void {
         gpa.free(l.accs);
         gpa.free(l.first);
+        gpa.free(l.counts32);
+        gpa.free(l.counts64);
         l.accs = &.{};
         l.first = &.{};
+        l.counts32 = &.{};
+        l.counts64 = &.{};
+    }
+
+    fn count(l: *const Lanes, id: usize) u64 {
+        return if (l.counts32.len != 0) l.counts32[id] else l.counts64[id];
+    }
+
+    fn addCount(l: *Lanes, id: usize, n: u64) void {
+        if (l.counts32.len != 0) l.counts32[id] += @intCast(n) else l.counts64[id] += n;
     }
 
     /// Fold a row group whose lone key is column `key` of `batch`. False, having touched nothing, when its
@@ -159,12 +197,22 @@ pub const Lanes = struct {
                 if (fr == std.math.maxInt(u32)) return error.UnsupportedAggType;
                 const id = trans[code];
                 l.first[id] = @min(l.first[id], pos_base + fr);
-                for (l.accs[id * n_calls ..][0..n_calls]) |*acc| acc.count += n;
+                if (countOnly(l.calls)) {
+                    l.addCount(id, n);
+                } else for (l.accs[id * n_calls ..][0..n_calls]) |*acc| acc.count += n;
             }
             return true;
         }
         const codes = col.codes() orelse return false;
         const ni = col.nullInfo();
+        if (countOnly(l.calls)) {
+            if (codes.len < batch.num_rows) return error.BadColumn;
+            if (ni.def_levels) |dl| if (dl.len < batch.num_rows) return error.BadColumn;
+            if (l.counts32.len != 0) {
+                try l.foldCounts(u32, l.counts32, codes, trans, ni, pos_base, batch.num_rows, sel);
+            } else try l.foldCounts(u64, l.counts64, codes, trans, ni, pos_base, batch.num_rows, sel);
+            return true;
+        }
         const space = trans.len;
         const comp: []const u32 = if (ni.def_levels) |dl| comp: {
             const out = try ra.alloc(u32, batch.num_rows);
@@ -183,6 +231,34 @@ pub const Lanes = struct {
             });
         }
         return true;
+    }
+
+    fn foldCounts(
+        l: *Lanes,
+        comptime T: type,
+        counts: []T,
+        codes: []const u32,
+        trans: []const u32,
+        ni: @TypeOf(@as(Column, undefined).nullInfo()),
+        pos_base: u64,
+        rows: usize,
+        sel: *const Sel,
+    ) !void {
+        var bad_code = false;
+        agg_coded.forEachActive(sel, rows, struct {
+            fn row(c: anytype, r: usize) void {
+                const is_null = if (c.ni.def_levels) |dl| dl[r] < c.ni.max_def else false;
+                const code = if (is_null) c.trans.len - 1 else c.codes[r];
+                if (!is_null and code >= c.trans.len - 1) {
+                    c.bad.* = true;
+                    return;
+                }
+                const id = c.trans[code];
+                c.counts[id] += 1;
+                c.first[id] = @min(c.first[id], c.base + r);
+            }
+        }.row, .{ .counts = counts, .first = l.first, .codes = codes, .trans = trans, .ni = ni, .base = pos_base, .bad = &bad_code });
+        if (bad_code) return error.BadColumn;
     }
 
     fn sameDictionary(l: *const Lanes, col: Column, trans: []const u32) bool {
@@ -251,7 +327,7 @@ pub fn intoTable(
         const g = try table.getOrInsert(image[0..len], calls, f);
         var scratch: [16]agg.Accumulator = undefined;
         const dst = table.readGroup(g, calls.len, &scratch);
-        @memcpy(dst, into.accs[id * calls.len ..][0..calls.len]);
+        if (countOnly(calls)) dst[0] = .{ .count = into.count(id) } else @memcpy(dst, into.accs[id * calls.len ..][0..calls.len]);
         table.writeGroup(g, dst);
     };
 }
@@ -279,6 +355,10 @@ const MergeTask = struct {
         for (t.ctx.lanes[1..]) |src| for (t.lo..t.hi) |id| {
             if (src.first[id] == unseen) continue;
             into.first[id] = @min(into.first[id], src.first[id]);
+            if (countOnly(into.calls)) {
+                into.addCount(id, src.count(id));
+                continue;
+            }
             const dst = into.accs[id * n_calls ..][0..n_calls];
             for (dst, src.accs[id * n_calls ..][0..n_calls]) |*d, s| try d.merge(s, t.ctx.gpa);
         };
@@ -348,6 +428,88 @@ fn expectSameGroups(want: *const agg.GroupTable, got: *const agg.GroupTable, n_c
         try testing.expectEqual(want.first.items[g], got.first.items[h]);
         for (want.accumulators.items[g * n_calls ..][0..n_calls], got.accumulators.items[h * n_calls ..][0..n_calls]) |w, x|
             try testing.expect(std.meta.eql(w, x));
+    }
+}
+
+test "dense count lanes share the row-width boundary with their quote" {
+    const calls = [_]AggCall{Fixture.calls[0]};
+    const last = std.math.maxInt(u32);
+    try testing.expectEqual(@as(usize, 4), countBytes(last));
+    try testing.expectEqual(@as(usize, 8), countBytes(@as(u64, last) + 1));
+    try testing.expectEqual(@as(usize, 60), laneBytes(5, &calls, last));
+    try testing.expectEqual(@as(usize, 80), laneBytes(5, &calls, @as(u64, last) + 1));
+    const d = Fixture.domain();
+    for ([_]u64{ last, @as(u64, last) + 1 }) |rows| {
+        var l: Lanes = .{ .domain = &d, .calls = &calls, .rows = rows };
+        defer l.deinit(testing.allocator);
+        try l.ensure(testing.allocator);
+        l.addCount(0, rows);
+        try testing.expectEqual(rows, l.count(0));
+        try testing.expectEqual(laneBytes(d.ids(), &calls, rows), l.first.len * 8 + l.counts32.len * 4 + l.counts64.len * 8);
+        try testing.expectEqual(@as(usize, 0), l.accs.len);
+    }
+}
+
+test "dense count lanes preserve selected first rows, NULLs and allocation failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, testCountLanes, .{});
+}
+
+test "dense count lanes consume full, empty and tail words and propagate a late bad code" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const calls = [_]AggCall{Fixture.calls[0]};
+    const d = Fixture.domain();
+    var l: Lanes = .{ .domain = &d, .calls = &calls, .rows = 129 };
+    defer l.deinit(a);
+    var codes: [129]u32 = undefined;
+    for (&codes, 0..) |*c, r| c.* = @intCast(r % 3);
+    const cols = [_]Column{.{ .i64 = .{ .values = &.{}, .codes = &codes, .dict = &Fixture.dict0 } }};
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = codes.len };
+    var sel = try Sel.init(ra, codes.len);
+    sel.clearRange(64, 128);
+    try testing.expect(try l.fold(ra, a, Fixture.key, 0, 0, 0, &batch, &.{0}, &sel));
+    try testing.expectEqual(@as(u64, 22), l.count(0));
+    try testing.expectEqual(@as(u64, 22), l.count(1));
+    try testing.expectEqual(@as(u64, 21), l.count(3));
+    try testing.expectEqual(@as(u64, 2), l.first[0]);
+    try testing.expectEqual(unseen, l.first[2]);
+    var bad: Lanes = .{ .domain = &d, .calls = &calls, .rows = 129 };
+    defer bad.deinit(a);
+    codes[128] = 99;
+    try testing.expectError(error.BadColumn, bad.fold(ra, a, Fixture.key, 0, 0, 0, &batch, &.{0}, &sel));
+}
+
+fn testCountLanes(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const calls = [_]AggCall{Fixture.calls[0]};
+    const lookup = [_]?usize{ 0, 1 };
+    const d = Fixture.domain();
+    for ([_]u64{ 16, std.math.maxInt(u64) }) |rows| {
+        var want = agg.GroupTable.init(a, 1 << 20);
+        defer want.deinit();
+        want.fixed_stride = 9;
+        var got = agg.GroupTable.init(a, 1 << 20);
+        defer got.deinit();
+        got.fixed_stride = 9;
+        var lanes = [_]Lanes{
+            .{ .domain = &d, .calls = &calls, .rows = rows },
+            .{ .domain = &d, .calls = &calls, .rows = rows },
+        };
+        defer for (&lanes) |*l| l.deinit(a);
+        for ([_]usize{ 1, 0 }, 0..) |rg, wi| {
+            const b = Fixture.batch(rg);
+            var sel = try Fixture.selection(ra, rg);
+            const pos = agg.firstPosition(rg, 0);
+            try testing.expect(try agg_coded.groupedCoded(ra, a, &calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null, null));
+            try testing.expect(try lanes[wi].fold(ra, a, Fixture.key, 0, rg, pos, &b, &lookup, &sel));
+        }
+        try intoTable(a, ra, &lanes, Fixture.key, &got, lookup.len, 2);
+        try expectSameGroups(&want, &got, calls.len);
+        try testing.expectEqual(@as(usize, 4), got.groupCount());
     }
 }
 

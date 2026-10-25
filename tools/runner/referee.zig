@@ -162,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
             gpa,
             arena,
             io,
-            ctx,
+            &ctx,
             duckdb,
             pyarrow,
             work,
@@ -201,7 +201,7 @@ fn runFile(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     io: std.Io,
-    ctx: engine.Context,
+    ctx: *engine.Context,
     duckdb: []const u8,
     pyarrow: []const u8,
     work: []const u8,
@@ -275,6 +275,7 @@ fn runFile(
     const default_jobs = if (root.get("jobs")) |v| try jobList(arena, v) else &.{};
     var counts: Counts = .{};
     for (root.get("cases").?.array.items) |raw| {
+        forcing.refresh(ctx);
         if (limit) |n| if (total.* >= n) break;
         var case = try decodeCase(arena, raw);
         if (raw.object.get("jobs") == null) case.jobs = default_jobs;
@@ -300,26 +301,24 @@ fn runFile(
         total.* += checks;
         const fixture = fixtures.get(case.fixture_name) orelse "";
         if (fixture.len == 0 and !std.mem.eql(u8, case.kind, "sql_ordered") and !std.mem.eql(u8, case.kind, "sql_rows")) return error.MissingFixture;
-        var current = ctx;
-        forcing.refresh(&current);
         const failure = if (std.mem.eql(u8, case.kind, "sql"))
-            runSql(gpa, io, current, duckdb, fixture, ans_path, case, &counts.refused)
+            runSql(gpa, io, ctx.*, duckdb, fixture, ans_path, case, &counts.refused)
         else if (std.mem.eql(u8, case.kind, "sql_ordered"))
-            runSqlOrdered(gpa, io, current, duckdb, pyarrow, fixture, ans_path, case)
+            runSqlOrdered(gpa, io, ctx, duckdb, pyarrow, fixture, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "sql_rows"))
-            runSqlRows(gpa, io, current, duckdb, pyarrow, fixture, out_path, ans_path, case)
+            runSqlRows(gpa, io, ctx.*, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "agg") or std.mem.eql(u8, case.kind, "groupby"))
-            runAnswer(gpa, io, current, duckdb, pyarrow, fixture, out_path, ans_path, case)
+            runAnswer(gpa, io, ctx.*, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "stats"))
-            runStats(gpa, io, current, duckdb, pyarrow, fixture, out_path, ans_path, work, file_i, case)
+            runStats(gpa, io, ctx.*, duckdb, pyarrow, fixture, out_path, ans_path, work, file_i, case)
         else if (std.mem.eql(u8, case.kind, "wire"))
-            runWire(gpa, io, current, duckdb, pyarrow, fixture, out_path, case)
+            runWire(gpa, io, ctx.*, duckdb, pyarrow, fixture, out_path, case)
         else if (std.mem.eql(u8, case.kind, "product"))
-            runProduct(gpa, io, current, duckdb, pyarrow, fixture, out_path, ans_path, case)
+            runProduct(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "dense") or std.mem.eql(u8, case.kind, "pair") or std.mem.eql(u8, case.kind, "tail"))
-            runTail(gpa, io, current, duckdb, pyarrow, fixture, out_path, ans_path, case)
+            runTail(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "write"))
-            runCase(gpa, io, current, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case)
+            runCase(gpa, io, ctx.*, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case)
         else
             return error.BadCaseKind;
         const why = failure catch |err| try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
@@ -925,23 +924,22 @@ fn substOpt(arena: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8, 
 fn runSqlOrdered(
     gpa: std.mem.Allocator,
     io: std.Io,
-    initial_ctx: engine.Context,
+    ctx: *engine.Context,
     duckdb: []const u8,
     pyarrow: []const u8,
     fixture: []const u8,
     ans_path: []const u8,
     case: Case,
 ) !?[]const u8 {
-    var ctx = initial_ctx;
-    var spill_env = try forcing.bind(gpa, &ctx, "ZPQ_SPILL_GROUPS", case.spill_groups);
+    var spill_env = try forcing.bind(gpa, ctx, "ZPQ_SPILL_GROUPS", case.spill_groups);
     defer spill_env.deinit();
-    var distinct_env = try forcing.bind(gpa, &ctx, "ZPQ_DISTINCT_PAIRS", case.distinct_pairs);
+    var distinct_env = try forcing.bind(gpa, ctx, "ZPQ_DISTINCT_PAIRS", case.distinct_pairs);
     defer distinct_env.deinit();
-    var enc_env = try forcing.bind(gpa, &ctx, "ZPQ_ENCODED", case.encoded);
+    var enc_env = try forcing.bind(gpa, ctx, "ZPQ_ENCODED", case.encoded);
     defer enc_env.deinit();
-    var dense_env = try forcing.bind(gpa, &ctx, "ZPQ_DENSE", case.dense);
+    var dense_env = try forcing.bind(gpa, ctx, "ZPQ_DENSE", case.dense);
     defer dense_env.deinit();
-    var sketch_env = try forcing.bind(gpa, &ctx, "ZPQ_SKETCH_TOPK", case.sketch_topk);
+    var sketch_env = try forcing.bind(gpa, ctx, "ZPQ_SKETCH_TOPK", case.sketch_topk);
     defer sketch_env.deinit();
 
     const sql_src = case.sql orelse return error.MissingSql;
@@ -964,7 +962,7 @@ fn runSqlOrdered(
     const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
     for (jobs) |j| {
         diag_len = 0;
-        const json_text = querySqlJson(gpa, ctx, sql_buf.items, j, case) catch |err| {
+        const json_text = querySqlJson(gpa, ctx.*, sql_buf.items, j, case) catch |err| {
             if (diag_len == 0) {
                 var diag: zpq.core.diag.Diag = .{};
                 zpq.frontend.queryError(err, &diag);
@@ -1140,43 +1138,42 @@ fn memoryOf(case: Case) !?usize {
 fn runParity(
     gpa: std.mem.Allocator,
     io: std.Io,
-    initial_ctx: engine.Context,
+    ctx: *engine.Context,
     fixture: []const u8,
     work: []const u8,
     case: Case,
 ) !void {
-    var ctx = initial_ctx;
     var spill = try forcing.bind(
         gpa,
-        &ctx,
+        ctx,
         "ZPQ_SPILL_GROUPS",
         if (forcing.isForced("ZPQ_SPILL_GROUPS")) null else case.spill_groups,
     );
     defer spill.deinit();
     var pairs = try forcing.bind(
         gpa,
-        &ctx,
+        ctx,
         "ZPQ_DISTINCT_PAIRS",
         if (forcing.isForced("ZPQ_DISTINCT_PAIRS")) null else case.distinct_pairs,
     );
     defer pairs.deinit();
     var encoded = try forcing.bind(
         gpa,
-        &ctx,
+        ctx,
         "ZPQ_ENCODED",
         if (forcing.isForced("ZPQ_ENCODED")) null else case.encoded,
     );
     defer encoded.deinit();
     var dense = try forcing.bind(
         gpa,
-        &ctx,
+        ctx,
         "ZPQ_DENSE",
         if (forcing.isForced("ZPQ_DENSE")) null else case.dense,
     );
     defer dense.deinit();
     var sketch = try forcing.bind(
         gpa,
-        &ctx,
+        ctx,
         "ZPQ_SKETCH_TOPK",
         if (forcing.isForced("ZPQ_SKETCH_TOPK")) null else case.sketch_topk,
     );
@@ -1194,18 +1191,18 @@ fn runParity(
     defer gpa.free(proof_path);
     const jobs = if (case.jobs.len > 0) case.jobs[0] else 16;
     if (aggregate) {
-        const bytes = try querySqlJson(gpa, ctx, sql, jobs, case);
+        const bytes = try querySqlJson(gpa, ctx.*, sql, jobs, case);
         defer gpa.free(bytes);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = bytes });
-    } else try printSqlRows(gpa, ctx, sql, jobs, json_path, false, case);
+    } else try printSqlRows(gpa, ctx.*, sql, jobs, json_path, false, case);
     const json_proof = try std.json.Stringify.valueAlloc(gpa, forcing.last_proof, .{});
     defer gpa.free(json_proof);
     const json_proof_path = try std.fmt.allocPrint(gpa, "{s}/parity-json-proof.json", .{work});
     defer gpa.free(json_proof_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_proof_path, .data = json_proof });
     if (aggregate) {
-        try querySqlOutput(gpa, ctx, sql, jobs, case, parquet_path);
-    } else try printSqlRows(gpa, ctx, sql, jobs, parquet_path, true, case);
+        try querySqlOutput(gpa, ctx.*, sql, jobs, case, parquet_path);
+    } else try printSqlRows(gpa, ctx.*, sql, jobs, parquet_path, true, case);
     const proof = try std.json.Stringify.valueAlloc(gpa, .{
         .case_id = case.id,
         .parquet = forcing.last_proof,
@@ -1443,7 +1440,7 @@ fn runWire(
 fn runTail(
     gpa: std.mem.Allocator,
     io: std.Io,
-    initial_ctx: engine.Context,
+    ctx: *engine.Context,
     duckdb: []const u8,
     pyarrow: []const u8,
     fixture: []const u8,
@@ -1451,13 +1448,12 @@ fn runTail(
     ans_path: []const u8,
     case: Case,
 ) !?[]const u8 {
-    var ctx = initial_ctx;
     if (std.mem.eql(u8, case.kind, "dense")) return runDense(gpa, io, ctx, duckdb, pyarrow, fixture, ans_path, case);
     if (std.mem.eql(u8, case.kind, "pair")) return runPair(gpa, io, ctx, duckdb, pyarrow, fixture, ans_path, case);
     const check = case.check orelse return error.MissingCheck;
-    var enc_env = try forcing.bind(gpa, &ctx, "ZPQ_ENCODED", case.encoded);
+    var enc_env = try forcing.bind(gpa, ctx, "ZPQ_ENCODED", case.encoded);
     defer enc_env.deinit();
-    var sketch_env = try forcing.bind(gpa, &ctx, "ZPQ_SKETCH_TOPK", case.sketch_topk);
+    var sketch_env = try forcing.bind(gpa, ctx, "ZPQ_SKETCH_TOPK", case.sketch_topk);
     defer sketch_env.deinit();
     const prev_front = zpq.frontend.diagnostic_fn;
     zpq.frontend.diagnostic_fn = captureDiag;
@@ -1471,15 +1467,15 @@ fn runTail(
         var canonical: ?[]u8 = null;
         defer if (canonical) |bytes| gpa.free(bytes);
         for ([_][]const u8{ "0", "1" }) |enabled| {
-            var record_env = try forcing.bind(gpa, &ctx, "ZPQ_BYTE_RECORDS", enabled);
+            var record_env = try forcing.bind(gpa, ctx, "ZPQ_BYTE_RECORDS", enabled);
             defer record_env.deinit();
             const jobs = if (case.jobs.len > 0) case.jobs[0] else 16;
             const parquet = case.format != null and std.mem.eql(u8, case.format.?, "parquet");
             const bytes = if (parquet) blk: {
-                querySqlOutput(gpa, ctx, sql, jobs, case, out_path) catch |err|
+                querySqlOutput(gpa, ctx.*, sql, jobs, case, out_path) catch |err|
                     return try queryFailure(gpa, err);
                 break :blk try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(64 << 20));
-            } else querySqlJson(gpa, ctx, sql, jobs, case) catch |err| return try queryFailure(gpa, err);
+            } else querySqlJson(gpa, ctx.*, sql, jobs, case) catch |err| return try queryFailure(gpa, err);
             if (canonical) |reference| {
                 defer gpa.free(bytes);
                 if (!std.mem.eql(u8, reference, bytes))
@@ -1491,14 +1487,14 @@ fn runTail(
     if (std.mem.eql(u8, check, "sketch")) {
         const sql = try fillSql(gpa, case.sql.?, fixture);
         defer gpa.free(sql);
-        var off = try forcing.bind(gpa, &ctx, "ZPQ_SKETCH_TOPK", "0");
-        const reference = querySqlJson(gpa, ctx, sql, 16, case) catch |err| {
+        var off = try forcing.bind(gpa, ctx, "ZPQ_SKETCH_TOPK", "0");
+        const reference = querySqlJson(gpa, ctx.*, sql, 16, case) catch |err| {
             off.deinit();
             return try queryFailure(gpa, err);
         };
         off.deinit();
         defer gpa.free(reference);
-        const got = querySqlJson(gpa, ctx, sql, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| return try queryFailure(gpa, err);
+        const got = querySqlJson(gpa, ctx.*, sql, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| return try queryFailure(gpa, err);
         defer gpa.free(got);
         if (!std.mem.eql(u8, reference, got)) return try gpa.dupe(u8, "sketch differs from ZPQ_SKETCH_TOPK=0");
         return null;
@@ -1508,7 +1504,7 @@ fn runTail(
             const sql = try fillSql(gpa, raw, fixture);
             defer gpa.free(sql);
             diag_len = 0;
-            const json_text = querySqlJson(gpa, ctx, sql, 0, case) catch |err| {
+            const json_text = querySqlJson(gpa, ctx.*, sql, 0, case) catch |err| {
                 if (diag_len == 0) {
                     var diag: zpq.core.diag.Diag = .{};
                     zpq.frontend.queryError(err, &diag);
@@ -1520,7 +1516,7 @@ fn runTail(
             break :blk true;
         } else blk: {
             diag_len = 0;
-            const json_text = aggregateJson(gpa, ctx, fixture, case, null) catch |err| {
+            const json_text = aggregateJson(gpa, ctx.*, fixture, case, null) catch |err| {
                 if (diag_len == 0) {
                     var diag: zpq.core.diag.Diag = .{};
                     zpq.frontend.queryError(err, &diag);
@@ -1544,7 +1540,7 @@ fn runTail(
         var first: ?[]u8 = null;
         defer if (first) |p| gpa.free(p);
         for (jobs) |j| {
-            const json_text = querySqlJson(gpa, ctx, sql, j, case) catch |err| return try queryFailure(gpa, err);
+            const json_text = querySqlJson(gpa, ctx.*, sql, j, case) catch |err| return try queryFailure(gpa, err);
             if (first) |prev| {
                 defer gpa.free(json_text);
                 if (!std.mem.eql(u8, prev, json_text)) return try gpa.dupe(u8, "avg differs across -j");
@@ -1554,15 +1550,15 @@ fn runTail(
         return statsCmp(gpa, io, pyarrow, duckdb, zpq_path, fixture, "tail", false, case);
     }
     if (std.mem.eql(u8, check, "levels")) {
-        var on = try forcing.bind(gpa, &ctx, "ZPQ_ENCODED", "1");
-        const a = aggregateJson(gpa, ctx, fixture, case, null) catch |err| {
+        var on = try forcing.bind(gpa, ctx, "ZPQ_ENCODED", "1");
+        const a = aggregateJson(gpa, ctx.*, fixture, case, null) catch |err| {
             on.deinit();
             return try queryFailure(gpa, err);
         };
         on.deinit();
-        var off = try forcing.bind(gpa, &ctx, "ZPQ_ENCODED", "0");
+        var off = try forcing.bind(gpa, ctx, "ZPQ_ENCODED", "0");
         defer off.deinit();
-        const b = aggregateJson(gpa, ctx, fixture, case, null) catch |err| return try queryFailure(gpa, err);
+        const b = aggregateJson(gpa, ctx.*, fixture, case, null) catch |err| return try queryFailure(gpa, err);
         defer gpa.free(b);
         if (!std.mem.eql(u8, a, b)) {
             gpa.free(a);
@@ -1579,10 +1575,10 @@ fn runTail(
         defer gpa.free(sql);
         var plain = case;
         plain.max_memory = null;
-        printSqlRows(gpa, ctx, sql, 0, whole_path, false, plain) catch |err| return try queryFailure(gpa, err);
+        printSqlRows(gpa, ctx.*, sql, 0, whole_path, false, plain) catch |err| return try queryFailure(gpa, err);
         const part_path = try std.fmt.allocPrint(gpa, "{s}.part.jsonl", .{ans_path});
         defer gpa.free(part_path);
-        printSqlRows(gpa, ctx, sql, 0, part_path, false, case) catch |err| return try queryFailure(gpa, err);
+        printSqlRows(gpa, ctx.*, sql, 0, part_path, false, case) catch |err| return try queryFailure(gpa, err);
         const whole = try std.Io.Dir.cwd().readFileAlloc(io, whole_path, gpa, .limited(64 << 20));
         defer gpa.free(whole);
         const part = try std.Io.Dir.cwd().readFileAlloc(io, part_path, gpa, .limited(64 << 20));
@@ -1600,9 +1596,9 @@ fn runTail(
         const filled: ?[]u8 = if (case.sql) |raw| try fillSql(gpa, raw, fixture) else null;
         defer if (filled) |s| gpa.free(s);
         const json_text = if (filled) |sql|
-            querySqlJson(gpa, ctx, sql, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| return try queryFailure(gpa, err)
+            querySqlJson(gpa, ctx.*, sql, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| return try queryFailure(gpa, err)
         else
-            aggregateJson(gpa, ctx, fixture, case, null) catch |err| return try queryFailure(gpa, err);
+            aggregateJson(gpa, ctx.*, fixture, case, null) catch |err| return try queryFailure(gpa, err);
         defer gpa.free(json_text);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpq_path, .data = json_text });
         return statsCmp(gpa, io, pyarrow, duckdb, zpq_path, fixture, "tail", false, case);
@@ -1610,7 +1606,7 @@ fn runTail(
     if (std.mem.eql(u8, check, "order") or std.mem.eql(u8, check, "select_order") or std.mem.startsWith(u8, check, "sliced_write")) {
         const jobs: ?usize = if (case.jobs.len > 0) case.jobs[0] else null;
         const mem = try memoryOf(case);
-        writeCopy(gpa, io, ctx, &.{fixture}, case.filter, case.columns, case.select_z, out_path, null, jobs, mem) catch |err| return try queryFailure(gpa, err);
+        writeCopy(gpa, io, ctx.*, &.{fixture}, case.filter, case.columns, case.select_z, out_path, null, jobs, mem) catch |err| return try queryFailure(gpa, err);
         return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, "tail", true, case);
     }
     if (std.mem.eql(u8, check, "sliced_print") or std.mem.eql(u8, check, "sliced_limit")) {
@@ -1619,11 +1615,11 @@ fn runTail(
         const sql = try fillSql(gpa, case.sql.?, fixture);
         defer gpa.free(sql);
         const jobs: usize = if (case.jobs.len > 0) case.jobs[0] else 0;
-        printSqlRows(gpa, ctx, sql, jobs, path, false, case) catch |err| return try queryFailure(gpa, err);
+        printSqlRows(gpa, ctx.*, sql, jobs, path, false, case) catch |err| return try queryFailure(gpa, err);
         return statsCmp(gpa, io, pyarrow, duckdb, path, fixture, "tail", false, case);
     }
     if (std.mem.eql(u8, check, "typed") or std.mem.eql(u8, check, "decimal")) {
-        const ignored = aggregateJson(gpa, ctx, fixture, case, out_path) catch |err| return try queryFailure(gpa, err);
+        const ignored = aggregateJson(gpa, ctx.*, fixture, case, out_path) catch |err| return try queryFailure(gpa, err);
         gpa.free(ignored);
         return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, "tail", true, case);
     }
@@ -1675,7 +1671,7 @@ fn fillTwo(gpa: std.mem.Allocator, sql: []const u8, path: []const u8, file1: []c
 fn runProduct(
     gpa: std.mem.Allocator,
     io: std.Io,
-    initial_ctx: engine.Context,
+    ctx: *engine.Context,
     duckdb: []const u8,
     pyarrow: []const u8,
     fixture: []const u8,
@@ -1683,7 +1679,6 @@ fn runProduct(
     ans_path: []const u8,
     case: Case,
 ) !?[]const u8 {
-    var ctx = initial_ctx;
     const prev_front = zpq.frontend.diagnostic_fn;
     zpq.frontend.diagnostic_fn = captureDiag;
     defer zpq.frontend.diagnostic_fn = prev_front;
@@ -1704,13 +1699,13 @@ fn runProduct(
     var base: ?[]u8 = null;
     defer if (base) |p| gpa.free(p);
     for (product_variants) |variant| {
-        var enc = try forcing.bind(gpa, &ctx, "ZPQ_ENCODED", variant.encoded);
+        var enc = try forcing.bind(gpa, ctx, "ZPQ_ENCODED", variant.encoded);
         defer enc.deinit();
-        var den = try forcing.bind(gpa, &ctx, "ZPQ_DENSE", variant.dense);
+        var den = try forcing.bind(gpa, ctx, "ZPQ_DENSE", variant.dense);
         defer den.deinit();
-        var batch = try forcing.bind(gpa, &ctx, "ZPQ_DECODE_BATCH_ROWS", variant.decode_batch);
+        var batch = try forcing.bind(gpa, ctx, "ZPQ_DECODE_BATCH_ROWS", variant.decode_batch);
         defer batch.deinit();
-        const json_text = querySqlJson(gpa, ctx, sql, variant.jobs, case) catch |err| return try queryFailure(gpa, err);
+        const json_text = querySqlJson(gpa, ctx.*, sql, variant.jobs, case) catch |err| return try queryFailure(gpa, err);
         if (base == null) {
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpq_path, .data = json_text });
             var cmp = case;
@@ -1727,7 +1722,7 @@ fn runProduct(
         }
     }
     if (!case.parquet) return null;
-    querySqlOutput(gpa, ctx, sql, 16, case, out_path) catch |err| return try queryFailure(gpa, err);
+    querySqlOutput(gpa, ctx.*, sql, 16, case, out_path) catch |err| return try queryFailure(gpa, err);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ pyarrow, "tools/runner/answer_cmp.py", "product", "--zpq", zpq_path, "--duckdb", duckdb, "--parquet", out_path });
@@ -1737,19 +1732,18 @@ fn runProduct(
 fn runDense(
     gpa: std.mem.Allocator,
     io: std.Io,
-    initial_ctx: engine.Context,
+    ctx: *engine.Context,
     duckdb: []const u8,
     pyarrow: []const u8,
     fixture: []const u8,
     ans_path: []const u8,
     case: Case,
 ) !?[]const u8 {
-    var ctx = initial_ctx;
     if (case.skip_duck) {
         const note = case.oracle_note orelse return error.MissingOracleNote;
         std.debug.print("BYTE-PARITY {s}: {s}\n", .{ case.id, note });
     }
-    var sketch_env = try forcing.bind(gpa, &ctx, "ZPQ_SKETCH_TOPK", case.sketch_topk);
+    var sketch_env = try forcing.bind(gpa, ctx, "ZPQ_SKETCH_TOPK", case.sketch_topk);
     defer sketch_env.deinit();
     const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
     var dense_list: [2][]const u8 = .{ "0", "1" };
@@ -1766,10 +1760,10 @@ fn runDense(
     defer duck_buf.deinit(gpa);
     try substOpt(gpa, &duck_buf, case.duck orelse sql_buf.items, "{path}", fixture);
     for (dense_list[0..n_dense]) |dense| {
-        var denv = try forcing.bind(gpa, &ctx, "ZPQ_DENSE", dense);
+        var denv = try forcing.bind(gpa, ctx, "ZPQ_DENSE", dense);
         defer denv.deinit();
         for (jobs) |j| {
-            const json_text = querySqlJson(gpa, ctx, sql_buf.items, j, case) catch |err| return try queryFailure(gpa, err);
+            const json_text = querySqlJson(gpa, ctx.*, sql_buf.items, j, case) catch |err| return try queryFailure(gpa, err);
             if (base == null) {
                 if (!case.skip_duck) {
                     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpq_path, .data = json_text });
@@ -1793,7 +1787,7 @@ fn runDense(
 fn runPair(
     gpa: std.mem.Allocator,
     io: std.Io,
-    ctx: engine.Context,
+    ctx: *engine.Context,
     duckdb: []const u8,
     pyarrow: []const u8,
     fixture: []const u8,
@@ -1821,23 +1815,22 @@ fn runPair(
     return null;
 }
 
-fn runPairOnce(gpa: std.mem.Allocator, initial_ctx: engine.Context, fixture: []const u8, case: Case) ![]u8 {
-    var ctx = initial_ctx;
+fn runPairOnce(gpa: std.mem.Allocator, ctx: *engine.Context, fixture: []const u8, case: Case) ![]u8 {
     diag_len = 0;
-    var denv = try forcing.bind(gpa, &ctx, "ZPQ_DENSE", case.dense);
+    var denv = try forcing.bind(gpa, ctx, "ZPQ_DENSE", case.dense);
     defer denv.deinit();
     if (case.sql) |sql| {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
         try substOpt(gpa, &buf, sql, "{path}", fixture);
-        return querySqlJson(gpa, ctx, buf.items, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| {
+        return querySqlJson(gpa, ctx.*, buf.items, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| {
             if (err != error.ExceededMemoryBudget and err != error.RowGroupTooLarge) return err;
             const msg = try queryFailure(gpa, err);
             defer gpa.free(msg);
             return try std.fmt.allocPrint(gpa, "ERR {s}", .{msg});
         };
     }
-    return aggregateJson(gpa, ctx, fixture, case, null) catch |err| {
+    return aggregateJson(gpa, ctx.*, fixture, case, null) catch |err| {
         if (err != error.ExceededMemoryBudget and err != error.RowGroupTooLarge) return err;
         const msg = try queryFailure(gpa, err);
         defer gpa.free(msg);

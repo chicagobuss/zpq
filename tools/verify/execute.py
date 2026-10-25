@@ -70,6 +70,13 @@ def judge(cmd: stages.Cmd, rc: int, text: str) -> tuple[str, dict]:
     if cmd.expect == "refusal":
         declared = rc == cmd.expect_rc and cmd.expect_text in text
         return ("expected" if declared else "fail"), counts
+    if cmd.parse is stages.parse_path_parity:
+        verified, unverified = counts.get("verified", 0), counts.get("unverified", 0)
+        if rc != 0 or verified + unverified == 0 or counts.get("format_checks") != 2 * (verified + unverified):
+            return "fail", counts
+        if len(counts.get("unverified_knobs", [])) != unverified:
+            return "fail", counts
+        return ("unverified" if unverified else "pass"), counts
     if counts.get("fail"):
         return "fail", counts
     if counts.get("limited"):

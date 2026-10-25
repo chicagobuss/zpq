@@ -41,6 +41,7 @@ def check_evidence(kind, before, after):
         return "no existing trace/EXPLAIN assertion; follow-up"
     owner = {
         "byte_owner": ["byte_fold", "byte_top_fold"],
+        "dense": ["dense_fold"],
         "integer_owner": ["integer_fold"],
         "msd_owner": ["msd_fold"],
     }
@@ -54,6 +55,8 @@ def check_evidence(kind, before, after):
     a, b = (json.loads(p["explain"]) for p in (before, after))
     if kind == "encoded":
         assert a["encoded"] is True and b["encoded"] is False
+    elif kind == "partitioned":
+        assert a["strategy"] != "partitioned_hash" and b["strategy"] == "partitioned_hash"
     elif kind == "union":
         assert a["ndv"]["union_complete"] is True
         assert b["ndv"]["union_attempted"] is False
@@ -87,9 +90,8 @@ def run(args):
     started = time.monotonic()
     for knob in knobs:
         for index, case_id in enumerate(knob["cases"]):
-            modes = [("default", None), ("off", knob["off"])]
-            if "on" in knob:
-                modes.append(("on", knob["on"]))
+            alternate = "alternate" if "alternate" in knob else "off"
+            modes = [("default", None), (alternate, knob[alternate])]
             folders = {}
             for mode, value in modes:
                 assert time.monotonic() - started < 900, "path-parity stage exceeded 15 minutes"
@@ -103,7 +105,10 @@ def run(args):
                     proc = subprocess.run(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=120)
                 assert proc.returncode == 0, f"{knob['name']} {mode}: see {work.name}.log"
                 folders[mode] = work
-            record = {"knob": knob["name"], "case": case_id, "formats": {}}
+            status = "unverified" if knob["evidence"] == "unavailable" else "pass"
+            record = {"knob": knob["name"], "case": case_id, "status": status, "formats": {},
+                      "pair_kind": knob.get("pair_kind", "disable"), "note": knob.get("note"),
+                      "alternate_value": knob[alternate]}
             for fmt in ("json", "parquet"):
                 reference = (folders["default"] / f"parity.{fmt}").read_bytes()
                 for mode, work in folders.items():
@@ -123,12 +128,18 @@ def run(args):
                             for line in text.splitlines():
                                 json.loads(line)
                 proof = check_evidence(knob["evidence"], read_proof(folders["default"], fmt),
-                                       read_proof(folders["off"], fmt))
-                record["formats"][fmt] = {"sha256": hashlib.sha256(reference).hexdigest(), "evidence": proof}
+                                       read_proof(folders[alternate], fmt))
+                record["formats"][fmt] = {"sha256": hashlib.sha256(reference).hexdigest(),
+                                          "status": status, "byte_parity": "pass", "evidence": proof}
             records.append(record)
             (args.out / "results.json").write_text(json.dumps(records, indent=2) + "\n")
-            print(f"PARITY {knob['name']} {case_id}: JSON+Parquet identical", flush=True)
-    print(f"path parity: {len(records)} knobs, {len(records) * 2} format checks", flush=True)
+            label = "UNVERIFIED" if status == "unverified" else "VERIFIED"
+            print(f"{label} {knob['name']} {case_id}: JSON+Parquet bytes identical", flush=True)
+    missing = [r["knob"] for r in records if r["status"] == "unverified"]
+    counts = {"verified": len(records) - len(missing), "unverified": len(missing),
+              "format_checks": len(records) * 2, "unverified_knobs": missing}
+    (args.out / "summary.json").write_text(json.dumps(counts, indent=2) + "\n")
+    print("PATH_PARITY_SUMMARY " + json.dumps(counts), flush=True)
 
 
 if __name__ == "__main__":

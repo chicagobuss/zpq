@@ -13,7 +13,7 @@
     "cases": [
       "dense:2"
     ],
-    "evidence": "unavailable"
+    "evidence": "dense"
   },
   {
     "name": "ZPQ_DISTINCT_PAIRS",
@@ -105,51 +105,61 @@
   },
   {
     "name": "ZPQ_EXPR_BATCH_ROWS",
-    "off": "0",
     "cases": [
       "parity:float-batches"
     ],
-    "evidence": "unavailable"
+    "evidence": "unavailable",
+    "alternate": "0",
+    "pair_kind": "sizing_override",
+    "note": "legacy batch sizing override"
   },
   {
     "name": "ZPQ_DECODE_BATCH_ROWS",
-    "off": "0",
     "cases": [
       "parity:float-batches"
     ],
-    "evidence": "unavailable"
+    "evidence": "unavailable",
+    "alternate": "0",
+    "pair_kind": "sizing_override",
+    "note": "legacy batch sizing override"
   },
   {
     "name": "ZPQ_BYTE_TOP_PARTITIONS",
-    "off": "0",
     "cases": [
       "filtered-records:bytes"
     ],
-    "evidence": "unavailable"
+    "evidence": "unavailable",
+    "alternate": "0",
+    "pair_kind": "sizing_override",
+    "note": "forces 2048 partitions; may equal the host default"
   },
   {
     "name": "ZPQ_BYTE_TOP_BATCH_ROWS",
-    "off": "0",
     "cases": [
       "filtered-records:bytes"
     ],
-    "evidence": "unavailable"
+    "evidence": "unavailable",
+    "alternate": "0",
+    "pair_kind": "sizing_override",
+    "note": "legacy batch sizing override"
   },
   {
     "name": "ZPQ_MSD_CACHE_ROWS",
-    "off": "0",
     "cases": [
       "filtered-records:retained"
     ],
-    "evidence": "unavailable"
+    "evidence": "unavailable",
+    "alternate": "0",
+    "pair_kind": "sizing_override",
+    "note": "forces the legacy 4096-row window; may equal the host default"
   },
   {
     "name": "ZPQ_PARTAGG",
-    "off": "0",
-    "on": "1",
     "cases": [
       "spill:spill_composite:g8"
     ],
-    "evidence": "unavailable"
+    "evidence": "partitioned",
+    "alternate": "1",
+    "pair_kind": "enable_partitioned"
   }
 ]

@@ -37,6 +37,7 @@ class Summary:
             "failures": [],
             "expected": [],
             "blocked": [],
+            "unverified": {},
             "skipped": {},
         }
         self.flush()
@@ -61,6 +62,8 @@ class Summary:
             self.data["expected"].append(name)
         elif status == "blocked":
             self.data["blocked"].append(name)
+        elif status == "unverified":
+            self.data["unverified"][name] = record.get("counts", {}).get("unverified_knobs", [])
         self.flush()
 
     def finish(self, exit_code: int) -> None:

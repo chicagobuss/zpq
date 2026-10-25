@@ -6405,7 +6405,8 @@ fn writeCsvParts(writer: anytype, parts: []const []const u8) !void {
 /// The same single-object JSON convention as query results. Passes describe permitted work, not a runtime trace.
 /// The facts a plan was made from, each with how far it can be trusted (`exact`, `bound`, `estimate`), the strategies
 /// whose exactness preconditions hold, and the one the cost rules chose (its `reasons` say why).
-fn writeExplainFacts(writer: anytype, plan: scan.ScanPlan) !void {
+fn writeExplainFacts(writer: anytype, explanation: scan.AggregateExplanation) !void {
+    const plan = explanation.plan;
     const f = plan.facts;
     try writer.print(",\"facts\":{{\"rows\":{{\"value\":{d},\"provenance\":\"exact\"}},\"row_groups\":{{\"value\":{d},\"provenance\":\"exact\"}}", .{ f.rows, f.row_groups });
     if (plan.ndv_stat) |stat| {
@@ -6427,7 +6428,8 @@ fn writeExplainFacts(writer: anytype, plan: scan.ScanPlan) !void {
         try writer.print("{s}{{\"strategy\":\"{s}\",\"admissible\":{}}}", .{ sep, @tagName(kind), f.admissible.contains(kind) });
         sep = ",";
     }
-    try writer.print("],\"winner\":\"{s}\",\"rule\":\"{s}\"", .{ @tagName(plan.dispatch.strategy), @tagName(scan.decidingRule(plan)) });
+    try writer.print("{s}{{\"strategy\":\"dense\",\"admissible\":{}}}", .{ sep, explanation.dense });
+    try writer.print("],\"winner\":\"{s}\",\"rule\":\"{s}\"", .{ explanation.strategyName(), @tagName(scan.decidingRule(plan)) });
 }
 
 pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExplanation) !void {
@@ -6435,8 +6437,8 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
     const d = a.plan.dispatch;
     const merge = if (d.strategy == .partitioned_hash) "shared_partitions" else if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
     try writer.print("{{\"ok\":true,\"explain\":true,\"strategy\":\"{s}\",\"merge\":\"{s}\",\"io\":\"{s}\",\"workers\":{d},\"tables\":{d},\"work_items\":{d},\"max_memory\":{d},\"encoded\":{},\"reasons\":[", .{
-        @tagName(d.strategy), merge,                  @tagName(explanation.io_mode), a.workers, d.tables,
-        a.work_items,         explanation.max_memory, explanation.encoded,
+        a.strategyName(), merge,                  @tagName(explanation.io_mode), a.workers, d.tables,
+        a.work_items,     explanation.max_memory, explanation.encoded,
     });
     var sep: []const u8 = "";
     var reasons = a.plan.reasons.iterator();
@@ -6471,9 +6473,11 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
         if (stat.estimate) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
         try writer.writeAll("}");
     } else try writer.writeAll("null");
-    try writeExplainFacts(writer, a.plan);
+    try writeExplainFacts(writer, a);
     try writer.writeAll(",\"plain_bytes_estimate\":");
     if (a.plan.plain_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
+    try writer.writeAll(",\"group_bytes_estimate\":");
+    if (a.plan.group_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
     try writer.print(",\"shared_tables\":{d},\"count_agg\":", .{
         @as(usize, if (d.strategy == .partitioned_hash) 32 else 0),
     });

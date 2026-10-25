@@ -256,6 +256,21 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(status, "fail")
 
 
+class PathParityTest(unittest.TestCase):
+    def test_unverified_is_preserved_and_never_passes(self):
+        cmd = stages.Cmd([], {}, "parity", parse=stages.parse_path_parity)
+        payload = {"verified": 8, "unverified": 1, "format_checks": 18, "unverified_knobs": ["ZPQ_SPILL"]}
+        text = "PATH_PARITY_SUMMARY " + json.dumps(payload)
+        status, counts = execute.judge(cmd, 0, text)
+        self.assertEqual(status, "unverified")
+        with tempfile.TemporaryDirectory() as directory:
+            book = summary.Summary(Path(directory), {"tier": "full", "sha": "abc"})
+            book.add_stage({"name": "path-parity", "status": status, "counts": counts})
+            self.assertEqual(book.data["unverified"], {"path-parity": ["ZPQ_SPILL"]})
+        self.assertEqual(execute.judge(cmd, 1, text)[0], "fail")
+        self.assertEqual(execute.judge(cmd, 0, "")[0], "fail")
+
+
 class SelectTest(unittest.TestCase):
     def test_missing_input_skips_the_suite_whole(self):
         cases = [

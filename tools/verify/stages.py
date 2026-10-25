@@ -75,6 +75,11 @@ def parse_referee(text):
     return counts
 
 
+def parse_path_parity(text):
+    match = _last(r"PATH_PARITY_SUMMARY (\{.*\})", text)
+    return json.loads(match.group(1)) if match else {}
+
+
 def parse_modules(text):
     match = _last(r"test-module coverage: (\d+) modules, (\d+) tests", text)
     if not match:
@@ -378,7 +383,7 @@ def stage_path_parity(ctx: Ctx) -> Cmd:
         "--duckdb", ctx.duckdb, "--out", str(ctx.run_dir / "path-parity"),
     ])
     return Cmd(["bash", "-c", shell], _base_env(ctx), "JSON/Parquet parity across in-process execution overrides",
-               blocked=_need(Path(ctx.duckdb), "DuckDB 2.0 CLI"))
+               blocked=_need(Path(ctx.duckdb), "DuckDB 2.0 CLI"), parse=parse_path_parity)
 
 
 def stage_conform(ctx: Ctx) -> Cmd:

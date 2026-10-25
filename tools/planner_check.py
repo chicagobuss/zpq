@@ -72,14 +72,16 @@ for rg in range(metadata.num_row_groups):
         b[start:end] = bytes(end - start)
 bounded.write_bytes(b)
 plan = run(f"SELECT k, count(*) AS c FROM '{bounded}' GROUP BY k ORDER BY c DESC LIMIT 10", explain=True)
-assert plan["strategy"] == "plain_hash" and "small_ndv" in plan["reasons"], plan
+assert plan["strategy"] == "dense" and "small_ndv" in plan["reasons"], plan
+assert plan["group_bytes_estimate"] <= plan["max_memory"] // 8, plan
+assert plan["winner"] == "dense", plan
 assert plan["ndv"]["hi"] == 100 and plan["ndv"]["union_complete"], plan
 assert plan["ndv"]["estimate"] == 100 and plan["ndv"]["lo"] == 0, plan
 assert len(plan["passes"]) == 1 and plan["count_agg"] is None, plan
 # A LIMIT with no ORDER BY over few dictionary entries groups every key in one plain pass (the union proves the
 # domain small); the plan still reads no data page.
 plan = run(f"SELECT k, count(*) AS c FROM '{bounded}' GROUP BY k LIMIT 10", explain=True)
-assert plan["strategy"] == "plain_hash" and "few_dictionary_entries" in plan["reasons"], plan
+assert plan["strategy"] == "dense" and "few_dictionary_entries" in plan["reasons"], plan
 assert plan["ndv"]["union_complete"] and plan["rule"] == "few_dictionary_entries", plan
 
 # Unknown DISTINCT state must not be admitted by the small-group memory estimate.
@@ -94,7 +96,7 @@ pq.write_table(pa.table({"k": [i % 25_000 for i in range(400_000)],
 sql = (f"SELECT k, count(*) AS c, sum(v) AS s, avg(v) AS av, min(v) AS mn, max(v) AS mx "
        f"FROM '{moderate}' GROUP BY k ORDER BY c DESC LIMIT 10")
 plan = run(sql, explain=True)
-assert plan["strategy"] == "plain_hash" and "repeated_dictionary_entries" in plan["reasons"], plan
+assert plan["strategy"] == "dense" and "repeated_dictionary_entries" in plan["reasons"], plan
 truth = con.execute(sql.replace("ORDER BY c DESC", "ORDER BY c DESC, min(pos) ASC")).fetchall()
 for workers in (1, 4):
     for census in ("0", "1"):

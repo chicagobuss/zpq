@@ -820,6 +820,7 @@ pub const Planning = struct {
 pub const ScanPlan = struct {
     ndv_stat: ?NdvStat = null,
     plain_bytes: ?u64 = null,
+    group_bytes: ?u64 = null,
     dispatch: AggregateDispatch,
     reasons: std.EnumSet(Reason) = .{},
     facts: PlanFacts = .{},
@@ -1093,6 +1094,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         return;
     }
     const group_bytes = if (in.args.plain_rules) in.dense_bytes orelse copies else copies;
+    if (!state_unknown) plan.group_bytes = group_bytes;
     const small = stat.confidence == .upper_bound and stat.hi <= 1 << 20 and
         !state_unknown and group_bytes <= in.args.max_memory / 8;
     const bounded_census = stat.confidence == .upper_bound and stat.hi <= 1 << 20;
@@ -1225,6 +1227,11 @@ pub const AggregateExplanation = struct {
     work_items: usize,
     /// Preferred bounded record executor, subject to its ledger draw and runtime key/decode guards.
     record_path: ?RecordAdmission = null,
+    dense: bool = false,
+
+    pub fn strategyName(self: AggregateExplanation) []const u8 {
+        return if (self.dense) "dense" else @tagName(self.plan.dispatch.strategy);
+    }
 };
 
 pub const RecordAdmission = struct {
@@ -4285,9 +4292,7 @@ fn prepareAggregateWithMetas(
     plan_inputs.ndv_stat = ndv_stat;
     if (args.encoded) if (domain) |*d| {
         const initial = planAggregate(plan_inputs).dispatch;
-        if (d.globalFits(n_workers) and allRescannable(args.inputs) and !initial.use_blocks and
-            initial.strategy != .partitioned_hash)
-        {
+        if (d.globalFits(n_workers) and allRescannable(args.inputs) and !initial.use_blocks) {
             const stride = expr_agg.fixedGroupStride(group_by_keys.?) orelse 0;
             plan_inputs.dense_bytes = agg_dense.charge(
                 d,
@@ -4416,6 +4421,11 @@ fn prepareAggregateWithMetas(
             .workers = n_workers,
             .work_items = work_items.items.len,
             .record_path = record_path,
+            .dense = record_path == null and decision.strategy == .plain_hash and
+                if (plan_inputs.dense_bytes) |bytes|
+                    bytes <= if (args.ledger) |l| l.available() else args.max_memory
+                else
+                    false,
         };
     }
     // Tables still share one pool. Only a prepaid private plan's decoders protect funded worker floors.
@@ -4532,7 +4542,7 @@ fn prepareAggregateWithMetas(
     const dense_rule = if (plan_inputs.dense_bytes != null and decision.strategy == .plain_hash) rule: {
         var ordinary = plan_inputs;
         ordinary.dense_bytes = null;
-        break :rule planAggregate(ordinary).dispatch.strategy == .sketch;
+        break :rule planAggregate(ordinary).dispatch.strategy != .plain_hash;
     } else false;
     if (dense_rule) if (args.taken) |taken| taken.insert(.plain_rule);
     var dense_lanes: []agg_dense.Lanes = &.{};
@@ -4547,7 +4557,7 @@ fn prepareAggregateWithMetas(
         const quote = agg_dense.charge(d, n_workers, agg_calls, ndv_stat.?.rows, fixed_stride, dense_cut);
         dense_table_charge = quote.table;
         dense_charge = group_budget.drawExact(quote.total) orelse {
-            // Only the lanes justified this plain plan: a crowded ledger must retry the certified cut before rows.
+            // Only the lanes justified this plain plan: retry the displaced strategy before consuming rows.
             if (dense_rule) return error.ExceededMemoryBudget;
             break :dense;
         };
@@ -4803,7 +4813,15 @@ fn prepareAggregateWithMetas(
             for (group_tables) |*table| if (table.groupCount() != 0) break :only_lanes null;
             break :only_lanes @as(?usize, h);
         } else null;
+        const dense_start = if (prof != null) nowMonoNs() else 0;
         try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut);
+        if (prof != null and dense_table.groupCount() != 0) profile.record(
+            prof,
+            .dense_fold,
+            dense_start,
+            nowMonoNs(),
+            profile.args(.{ dense_table.groupCount(), n_workers }),
+        );
         if (leave_tables) {
             left_lanes = dense_lanes;
             left_domain = domain;
@@ -20449,6 +20467,7 @@ test "dense composite counts arm globally and preserve selected first through wi
         args.taken = &taken;
         const explanation = try explainAggregate(gpa, a, args);
         try testing.expectEqual(.plain_hash, explanation.plan.dispatch.strategy);
+        try testing.expectEqualStrings("dense", explanation.strategyName());
         try testing.expectEqual(j, explanation.workers);
         if (j == 16) try testing.expect(explanation.plan.plain_bytes.? > args.max_memory / 8);
         var got = try prepareAggregate(gpa, a, args, false);
@@ -20460,6 +20479,7 @@ test "dense composite counts arm globally and preserve selected first through wi
     args.encoded = false;
     const legacy = try explainAggregate(gpa, a, args);
     try testing.expectEqual(.sketch, legacy.plan.dispatch.strategy);
+    try testing.expectEqualStrings("sketch", legacy.strategyName());
     args.encoded = true;
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const held = ledger.drawExact(args.max_memory - 1).?;
@@ -22114,5 +22134,87 @@ test "filtered COUNT sorted NULLs and known seams use one exact record pass with
         defer got.deinit(gpa);
         try testing.expect(!taken.contains(.integer_records));
         try testing.expectEqual(@as(i64, 2), got.rows_matched);
+    }
+}
+
+test "dense quote refusal restores displaced partitions before consuming rows" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names: [4096][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = try std.fmt.allocPrint(
+        a,
+        "a-long-dictionary-value-with-a-stable-shared-prefix-and-identity-{d}",
+        .{i % 256},
+    );
+    const columns = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .col = .{ .string = .{ .values = &names } },
+        .parquet_type = .BYTE_ARRAY,
+        .nullable = false,
+    }};
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        a: std.mem.Allocator,
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.bytes.appendSlice(self.a, bytes);
+        }
+    };
+    var capture: Capture = .{ .a = a };
+    _ = try consumer.writeAggregateRows(
+        a,
+        .{ .ctx = &capture, .write_fn = Capture.write },
+        &columns,
+        names.len,
+        .SNAPPY,
+        .{},
+        .{},
+    );
+    var meta = try metadata.open(a, capture.bytes.items);
+    const groups = try a.alloc(schema.RowGroup, 64);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "long-keys", .bytes = capture.bytes.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .parallelism = 64,
+        .min_bytes_per_worker = 1,
+        .max_memory = 4 << 20,
+        .dense = true,
+        .plain_rules = false,
+    };
+    const ordinary = try explainAggregate(gpa, a, args);
+    try testing.expectEqual(.partitioned_hash, ordinary.plan.dispatch.strategy);
+    args.plain_rules = true;
+    const dense = try explainAggregate(gpa, a, args);
+    try testing.expectEqualStrings("dense", dense.strategyName());
+    try testing.expect(dense.plan.group_bytes.? <= args.max_memory / 8);
+    try testing.expect(dense.plan.plain_bytes.? > args.max_memory / 8);
+    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const held = ledger.drawExact(args.max_memory - 1).?;
+    args.ledger = &ledger;
+    var taken: std.EnumSet(FastPath) = .{};
+    args.taken = &taken;
+    try testing.expectError(error.ExceededMemoryBudget, prepareAggregate(gpa, a, args, false));
+    try testing.expect(taken.contains(.plain_rule));
+    try testing.expect(!taken.contains(.dense) and !taken.contains(.worker_tables));
+    try testing.expectEqual(held, ledger.used.load(.monotonic));
+    var chain: Chain = .{ .parts_tried = false };
+    const fallback = narrowed(args, args, taken, &chain, false).?;
+    const restored = try explainAggregate(gpa, a, fallback);
+    try testing.expectEqual(.partitioned_hash, restored.plan.dispatch.strategy);
+    ledger.release(held);
+    {
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        var got = try runMultiAggregate(gpa, a, fallback);
+        defer got.deinit(gpa);
+        try testing.expect(got.part_agg);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     }
 }

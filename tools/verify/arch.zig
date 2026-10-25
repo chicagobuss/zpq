@@ -544,7 +544,8 @@ fn finalizeTimings(r: *Runner) !void {
                 .stop_reason = reason: {
                     if (values.items.len == r.opt.reps) break :reason "fixed rep target reached";
                     if (r.opt.hash_only) break :reason "hash-only host";
-                    if (eql(engine, "polars") and !eql(q.polars, "pass")) break :reason "Polars skipped";
+                    if (eql(engine, "polars") and std.mem.startsWith(u8, q.polars, "skipped:"))
+                        break :reason "Polars skipped";
                     if (r.opt.tiny) break :reason "host tiny perf policy";
                     break :reason r.book.stop_reason;
                 },

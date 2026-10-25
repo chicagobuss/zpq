@@ -20680,3 +20680,106 @@ test "sliced consumer reuses payload survivors across releasing reader windows" 
         }
     }
 }
+
+test "compact physical integer views survive releasing windows and partition scatter" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    for (0..16) |rg| {
+        var ka: [257]i64 = undefined;
+        var kb: [257]i64 = undefined;
+        var v: [257]i32 = undefined;
+        var w: [257]i32 = undefined;
+        var vd: [257]u32 = undefined;
+        var wd: [257]u32 = undefined;
+        for (&ka, &kb, &v, &w, &vd, &wd, 0..) |*x, *y, *sv, *uv, *sd, *ud, r| {
+            x.* = @intCast((r + rg * 7) % 29);
+            y.* = @intCast((r + rg * 3) % 11);
+            sv.* = @intCast(@as(i64, @intCast(r * 137)) - 15000);
+            uv.* = if (r % 7 == 0) -1 else @intCast(r % 53);
+            sd.* = @intFromBool(r % 17 != 0 and x.* != 0);
+            ud.* = @intFromBool(r % 19 != 0);
+        }
+        const cols = [_]expr_agg.OutputCol{
+            .{ .name = "ka", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &ka } } },
+            .{ .name = "kb", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &kb } } },
+            .{
+                .name = "v",
+                .parquet_type = .INT32,
+                .nullable = true,
+                .col = .{ .i32 = .{ .values = &v, .def_levels = &vd, .max_def = 1 } },
+            },
+            .{
+                .name = "w",
+                .parquet_type = .INT32,
+                .converted_type = .UINT_32,
+                .nullable = true,
+                .col = .{ .i32 = .{ .values = &w, .def_levels = &wd, .max_def = 1 } },
+            },
+        };
+        try file.append(&cols, ka.len, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&.{
+        .{ .name = "ka", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+        .{ .name = "kb", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+        .{ .name = "v", .parquet_type = .INT32, .nullable = true, .col = .{ .i32 = .{ .values = &.{} } } },
+        .{
+            .name = "w",
+            .parquet_type = .INT32,
+            .converted_type = .UINT_32,
+            .nullable = true,
+            .col = .{ .i32 = .{ .values = &.{} } },
+        },
+    });
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    for (meta.row_groups.items) |*rg| {
+        for (rg.columns.items) |*col| col.meta_data.?.statistics = null;
+    }
+    const mapped = [_]Input{.{ .name = "compact-physical.parquet", .bytes = bytes }};
+    var args: MultiAggArgs = .{
+        .inputs = &mapped,
+        .metas = (&meta)[0..1],
+        .aggregate = "count(*) AS c,sum(v) AS s,avg(w) AS av,min(v) AS lo,max(w) AS hi,count(v) AS n",
+        .group_by = "ka,kb",
+        .filter = "kb<7",
+        .encoded = false,
+        .integer_records = false,
+        .byte_records = false,
+        .dense = false,
+        .ndv_policy = false,
+        .plain_rules = false,
+        .partition_cost = false,
+        .scan_all = true,
+        .min_bytes_per_worker = 1,
+        .max_memory = 64 << 20,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    for ([_]bool{ false, true }) |partitioned| for ([_]usize{ 1, 2, 4, 8, 16 }) |j| {
+        for ([_]usize{ 0, 64 }) |batch| {
+            var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+            const inputs = [_]Input{window.input(bytes)};
+            args.inputs = &inputs;
+            args.parallelism = j;
+            args.decode_batch_rows = batch;
+            args.partagg = partitioned;
+            args.part_cap = 8;
+            args.part_probe = 64;
+            args.start_reads = .{
+                .ctx = &window,
+                .start = ReleasingScanWindow.start,
+                .abandon = ReleasingScanWindow.abandon,
+            };
+            var got = try runMultiAggregate(gpa, a, args);
+            defer got.deinit(gpa);
+            try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+            try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+            try testing.expectEqual(@as(usize, 0), window.abandoned);
+        }
+    };
+}

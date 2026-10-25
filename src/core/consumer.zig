@@ -3464,7 +3464,7 @@ fn scatterGrouped(
         at[p] += 1;
     }
     const ids = try ra.alloc(u32, n);
-    var preps = try expr_agg.prepareGrouped(ra, g.calls, &win, lookup, win_sel);
+    var preps = try expr_agg.prepareGrouped(ra, g.calls, &win, lookup, win_sel, g.table.compact.stride != 0);
     defer preps.deinit();
     if (!part.usesRuns(local)) {
         for (part.parts, 0..) |*pt, p| {

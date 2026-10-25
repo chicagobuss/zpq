@@ -4492,6 +4492,9 @@ fn scanRGSliced(
                         null,
                     )) continue;
                 }
+                // A refused dictionary product may leave one key coded and another PLAIN. The ordinary key
+                // resolver reads value lanes, so materialize before crossing that fallback boundary.
+                for (cols) |*col| col.* = try agg_coded.materialize(sa, col.*);
                 const key_cols = try sa.alloc(filter_eval.Batch.Column, g.keys.len);
                 const keyed = batch.restrictedTo(&sel);
                 for (g.keys, key_cols) |k, *kc| kc.* = try expr_eval.evalGroupKeyExpr(sa, &keyed, lookup, k);

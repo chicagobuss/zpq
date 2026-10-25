@@ -20706,7 +20706,7 @@ test "multi aggregate dictionary keys survive releasing slices and materialized 
         var bd: [257]u32 = undefined;
         for (0..257) |r| {
             k[r] = if (r % 2 == 0) "A" else "B";
-            b[r] = try std.fmt.allocPrint(a, "dictionary-{d}", .{(r + rg) % 64});
+            b[r] = try std.fmt.allocPrint(a, "dictionary-{d}", .{if (rg == 14) r else (r + rg) % 64});
             x[r] = switch (r % 5) {
                 0 => 1e16,
                 1 => 1,
@@ -20751,7 +20751,7 @@ test "multi aggregate dictionary keys survive releasing slices and materialized 
         };
         var want = try runMultiAggregate(gpa, a, args);
         defer want.deinit(gpa);
-        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch| {
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64, 4096 }) |batch| {
             var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
             const inputs = [_]Input{window.input(bytes)};
             args.inputs = &inputs;

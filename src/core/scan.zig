@@ -6255,8 +6255,8 @@ fn inlineIntegerAnswer(
             .sum, .count_distinct => {
                 if (call.func == .count_distinct) {
                     if (full) return null;
+                    // Grouped DISTINCT keeps its established optional output schema, unlike bare COUNT.
                     distinct = true;
-                    count = i;
                 }
                 const arg = call.arg orelse return null;
                 if (arg != .col_ref or arg.col_ref.physical_type != .INT64 or arg.col_ref.expr_type != .i64 or
@@ -20473,6 +20473,7 @@ test "distinct owner radix completes full pairs after releasing every reader win
         try testing.expect(taken.contains(.integer_records));
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+        try testing.expectEqual(want.state.group_col_types.?[1].nullable, got.state.group_col_types.?[1].nullable);
         try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
         try testing.expectEqual(@as(usize, 0), window.abandoned);
     };

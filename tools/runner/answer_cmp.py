@@ -736,9 +736,28 @@ def cmd_tail(args):
     raise SystemExit(f"bad tail check {check}")
 
 
+def cmd_product(args):
+    """Parquet written by the first product shape, in order, and DuckDB's read of that file."""
+    import pyarrow.parquet as pq
+
+    truth = load_zpq(args.zpq)
+    if isinstance(truth, dict):
+        truth = [truth]
+    want = [tuple(row[c] for c in ("a", "b", "c")) for row in truth]
+    table = pq.read_table(args.parquet, columns=["a", "b", "c"])
+    got = list(zip(*(table[c].to_pylist() for c in ("a", "b", "c"))))
+    if got != want:
+        raise SystemExit(f"product parquet zpq={got[:2]} json={want[:2]}")
+    spec = describe(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)
+    raw = duck_json(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)
+    back = [tuple(coerce(row.get(name), typ) for name, typ in spec) for row in raw]
+    if back != want:
+        raise SystemExit(f"product readback duck={back[:2]} json={want[:2]}")
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire", "dense", "usame", "tail"])
+    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire", "dense", "usame", "tail", "product"])
     p.add_argument("--zpq", required=True)
     p.add_argument("--duckdb")
     p.add_argument("--sql")
@@ -784,6 +803,8 @@ def main():
         cmd_usame(args)
     elif args.mode == "tail":
         cmd_tail(args)
+    elif args.mode == "product":
+        cmd_product(args)
     else:
         cmd_parquet(args)
 

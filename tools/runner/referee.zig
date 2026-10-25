@@ -58,6 +58,7 @@ const Case = struct {
     duck_refuse: bool = false,
     skip_duck: bool = false,
     dense_both: bool = false,
+    keep_order: bool = false,
     names: ?[]const []const u8 = null,
     row_count: ?usize = null,
     want_types: ?[]const []const u8 = null,
@@ -223,7 +224,13 @@ fn runFile(
         if (limit) |n| if (total.* >= n) break;
         const case = try decodeCase(arena, raw);
         const many = std.mem.eql(u8, case.kind, "sql") or std.mem.eql(u8, case.kind, "sql_ordered") or std.mem.eql(u8, case.kind, "sql_rows") or std.mem.eql(u8, case.kind, "dense");
-        const checks: usize = if (many) @max(case.jobs.len, 1) * (if (case.dense_both) @as(usize, 2) else 1) else 1;
+        const product = std.mem.eql(u8, case.kind, "product");
+        const checks: usize = if (product)
+            product_variants.len + @intFromBool(case.parquet)
+        else if (many)
+            @max(case.jobs.len, 1) * (if (case.dense_both) @as(usize, 2) else 1)
+        else
+            1;
         total.* += checks;
         const fixture = fixtures.get(case.fixture_name) orelse "";
         if (fixture.len == 0 and !std.mem.eql(u8, case.kind, "sql_ordered") and !std.mem.eql(u8, case.kind, "sql_rows")) return error.MissingFixture;
@@ -239,6 +246,8 @@ fn runFile(
             runStats(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, work, file_i, case)
         else if (std.mem.eql(u8, case.kind, "wire"))
             runWire(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, case)
+        else if (std.mem.eql(u8, case.kind, "product"))
+            runProduct(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "dense") or std.mem.eql(u8, case.kind, "pair") or std.mem.eql(u8, case.kind, "tail"))
             runTail(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else
@@ -325,6 +334,10 @@ fn decodeCase(arena: std.mem.Allocator, raw: std.json.Value) !Case {
             else => false,
         } else false,
         .dense_both = if (obj.get("dense_both")) |v| switch (v) {
+            .bool => |b| b,
+            else => false,
+        } else false,
+        .keep_order = if (obj.get("ordered")) |v| switch (v) {
             .bool => |b| b,
             else => false,
         } else false,
@@ -1130,6 +1143,39 @@ fn querySqlJson(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jo
     return w.buf.toOwnedSlice(gpa);
 }
 
+fn querySqlOutput(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jobs: usize, case: Case, output: []const u8) !void {
+    const pq = try zpq.core.expr.sql_parser.parseSqlQuery(gpa, sql);
+    defer pq.deinit(gpa);
+    const inputs = try ownedInputs(gpa, ctx, pq.table_name);
+    defer freeInputs(gpa, inputs);
+    const mem = try memoryOf(case);
+    var diag: zpq.core.diag.Diag = .{};
+    var qargs: engine.QueryArgs = .{
+        .inputs = inputs,
+        .output = output,
+        .typed_answer = true,
+        .aggregate = pq.aggregate_str,
+        .filter = pq.filter_str,
+        .group_by = pq.group_by_str,
+        .select = pq.select_str,
+        .select_cols = pq.select_cols,
+        .result_order = pq.result_order,
+        .parallelism = jobs,
+        .trust_stats = case.trust_stats,
+        .scan_all = case.scan_all,
+        .diag = &diag,
+    };
+    if (mem) |n| {
+        qargs.max_memory = n;
+        qargs.max_memory_explicit = n;
+    }
+    var result = engine.runQuery(ctx, qargs) catch |err| {
+        if (diag_len == 0) zpq.frontend.queryError(err, &diag);
+        return err;
+    };
+    result.deinit(gpa);
+}
+
 fn runStats(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1439,6 +1485,118 @@ fn runTail(
         return statsCmp(gpa, io, pyarrow, duckdb, out_path, fixture, "tail", true, case);
     }
     return error.BadCheck;
+}
+
+const ProductVariant = struct {
+    jobs: usize,
+    dense: []const u8,
+    encoded: ?[]const u8 = null,
+    decode_batch: ?[]const u8 = null,
+};
+
+const product_variants = [_]ProductVariant{
+    .{ .jobs = 1, .dense = "0" },
+    .{ .jobs = 1, .dense = "1" },
+    .{ .jobs = 2, .dense = "1" },
+    .{ .jobs = 4, .dense = "1" },
+    .{ .jobs = 8, .dense = "1" },
+    .{ .jobs = 16, .dense = "1" },
+    .{ .jobs = 1, .dense = "1", .decode_batch = "4096" },
+    .{ .jobs = 4, .dense = "1", .decode_batch = "4096" },
+    .{ .jobs = 16, .dense = "1", .decode_batch = "4096" },
+    .{ .jobs = 1, .dense = "1", .encoded = "0" },
+    .{ .jobs = 16, .dense = "1", .encoded = "0" },
+};
+
+extern "c" fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
+
+fn absolutePath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len > 0 and path[0] == '/') return gpa.dupe(u8, path);
+    var buf: [4096]u8 = undefined;
+    const cwd = std.mem.span(getcwd(&buf, buf.len) orelse return error.GetCwd);
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ cwd, path });
+}
+
+fn fillTwo(gpa: std.mem.Allocator, sql: []const u8, path: []const u8, file1: []const u8) ![]u8 {
+    var first: std.ArrayList(u8) = .empty;
+    errdefer first.deinit(gpa);
+    try substOpt(gpa, &first, sql, "{path}", path);
+    if (std.mem.indexOf(u8, first.items, "{file1}") == null) return first.toOwnedSlice(gpa);
+    var second: std.ArrayList(u8) = .empty;
+    errdefer second.deinit(gpa);
+    try substOpt(gpa, &second, first.items, "{file1}", file1);
+    first.deinit(gpa);
+    return second.toOwnedSlice(gpa);
+}
+
+fn runProduct(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ctx: engine.Context,
+    duckdb: []const u8,
+    pyarrow: []const u8,
+    fixture: []const u8,
+    out_path: []const u8,
+    ans_path: []const u8,
+    case: Case,
+) !?[]const u8 {
+    const prev_front = zpq.frontend.diagnostic_fn;
+    zpq.frontend.diagnostic_fn = captureDiag;
+    defer zpq.frontend.diagnostic_fn = prev_front;
+    const abs_fix = try absolutePath(gpa, fixture);
+    defer gpa.free(abs_fix);
+    const needle = "coded-*.parquet";
+    const file1 = if (std.mem.endsWith(u8, abs_fix, needle))
+        try std.fmt.allocPrint(gpa, "{s}coded-1.parquet", .{abs_fix[0 .. abs_fix.len - needle.len]})
+    else
+        try gpa.dupe(u8, abs_fix);
+    defer gpa.free(file1);
+    const sql = try fillTwo(gpa, case.sql.?, abs_fix, file1);
+    defer gpa.free(sql);
+    const duck_sql = try fillTwo(gpa, case.duck orelse case.sql.?, abs_fix, file1);
+    defer gpa.free(duck_sql);
+    const zpq_path = try std.fmt.allocPrint(gpa, "{s}.json", .{ans_path});
+    defer gpa.free(zpq_path);
+    var base: ?[]u8 = null;
+    defer if (base) |p| gpa.free(p);
+    for (product_variants) |variant| {
+        var enc = try bindEnv(gpa, "ZPQ_ENCODED", variant.encoded);
+        defer enc.deinit();
+        var den = try bindEnv(gpa, "ZPQ_DENSE", variant.dense);
+        defer den.deinit();
+        var batch = try bindEnv(gpa, "ZPQ_DECODE_BATCH_ROWS", variant.decode_batch);
+        defer batch.deinit();
+        const json_text = querySqlJson(gpa, ctx, sql, variant.jobs, case) catch |err| return try queryFailure(gpa, err);
+        if (base == null) {
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpq_path, .data = json_text });
+            var cmp = case;
+            cmp.duck = duck_sql;
+            const mode: []const u8 = if (case.keep_order) "ordered" else "dense";
+            if (try statsCmp(gpa, io, pyarrow, duckdb, zpq_path, abs_fix, mode, false, cmp)) |why| {
+                gpa.free(json_text);
+                return why;
+            }
+            base = json_text;
+        } else {
+            defer gpa.free(json_text);
+            if (!std.mem.eql(u8, json_text, base.?)) return try gpa.dupe(u8, "bytes differ from ordinary grouping");
+        }
+    }
+    if (!case.parquet) return null;
+    querySqlOutput(gpa, ctx, sql, 16, case, out_path) catch |err| return try queryFailure(gpa, err);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ pyarrow, "tools/runner/answer_cmp.py", "product", "--zpq", zpq_path, "--duckdb", duckdb, "--parquet", out_path });
+    const out = try capture(gpa, io, argv.items);
+    defer gpa.free(out.stdout);
+    defer gpa.free(out.stderr);
+    if (out.code != 0) {
+        const msg = if (out.stderr.len != 0) out.stderr else out.stdout;
+        const line = std.mem.trim(u8, msg, " \t\r\n");
+        const start = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |at| at + 1 else 0;
+        return try gpa.dupe(u8, line[start..]);
+    }
+    return null;
 }
 
 fn runDense(

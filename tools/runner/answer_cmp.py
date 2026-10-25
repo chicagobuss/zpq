@@ -678,9 +678,12 @@ def cmd_product(args):
     truth = load_zpq(args.zpq)
     if isinstance(truth, dict):
         truth = [truth]
-    want = [tuple(row[c] for c in ("a", "b", "c")) for row in truth]
-    table = pq.read_table(args.parquet, columns=["a", "b", "c"])
-    got = list(zip(*(table[c].to_pylist() for c in ("a", "b", "c"))))
+    table = pq.read_table(args.parquet)
+    names = list(truth[0]) if truth else table.column_names
+    if table.column_names != names:
+        raise SystemExit(f"product parquet columns={table.column_names} json={names}")
+    want = [tuple(row[c] for c in names) for row in truth]
+    got = list(zip(*(table[c].to_pylist() for c in names)))
     if got != want:
         raise SystemExit(f"product parquet zpq={got[:2]} json={want[:2]}")
     spec = describe(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)

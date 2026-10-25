@@ -4,6 +4,14 @@
     {
       "name": "indexed",
       "path": "ci/fixtures/parquet/filtered_records_indexed.parquet"
+    },
+    {
+      "name": "ordered",
+      "path": "ci/fixtures/parquet/filtered_records_ordered.parquet"
+    },
+    {
+      "name": "seams",
+      "path": "ci/fixtures/parquet/filtered_records_seams.parquet"
     }
   ],
   "cases": [
@@ -115,6 +123,87 @@
       "sql": "SELECT b,count(*) AS c FROM '{path}' WHERE b LIKE 's-1%' GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
       "duck": "SELECT b,count(*) AS c FROM '{path}' WHERE b LIKE 's-1%' GROUP BY b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
       "ordered": true
+    },
+    {
+      "id": "filtered-records:ordered:json",
+      "kind": "product",
+      "fixture": "ordered",
+      "sql": "SELECT k,count(*) AS c FROM '{path}' WHERE f=1 GROUP BY k ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k,count(*) AS c FROM read_parquet('{path}',file_row_number=true) WHERE f=1 GROUP BY k ORDER BY c DESC,min(file_row_number) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:ordered:parquet",
+      "kind": "product",
+      "fixture": "ordered",
+      "sql": "SELECT k,count(*) AS c FROM '{path}' WHERE f=1 GROUP BY k ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k,count(*) AS c FROM read_parquet('{path}',file_row_number=true) WHERE f=1 GROUP BY k ORDER BY c DESC,min(file_row_number) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "filtered-records:seams:json",
+      "kind": "product",
+      "fixture": "seams",
+      "sql": "SELECT k,count(*) AS c FROM '{path}' WHERE f=1 GROUP BY k ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k,count(*) AS c FROM read_parquet('{path}',file_row_number=true) WHERE f=1 GROUP BY k ORDER BY c DESC,min(file_row_number) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:bytes:parquet",
+      "kind": "product",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "filtered-records:bytes:unfiltered:parquet",
+      "kind": "product",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b,count(*) AS c FROM '{path}' GROUP BY b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "filtered-records:byte-owner-parity:False:json",
+      "kind": "tail",
+      "check": "byte_records",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "format": "json",
+      "jobs": [
+        16
+      ]
+    },
+    {
+      "id": "filtered-records:byte-owner-parity:False:parquet",
+      "kind": "tail",
+      "check": "byte_records",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "format": "parquet",
+      "jobs": [
+        16
+      ]
+    },
+    {
+      "id": "filtered-records:byte-owner-parity:True:json",
+      "kind": "tail",
+      "check": "byte_records",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "format": "json",
+      "jobs": [
+        16
+      ]
+    },
+    {
+      "id": "filtered-records:byte-owner-parity:True:parquet",
+      "kind": "tail",
+      "check": "byte_records",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "format": "parquet",
+      "jobs": [
+        16
+      ]
     }
   ]
 }

@@ -44,6 +44,29 @@ pub const SelectionVector = struct {
         return .{ .allocator = self.allocator, .len = n, .mask = self.mask[lo / 64 ..][0 .. (n + 63) / 64] };
     }
 
+    /// Visits active row indices, clipping padding and borrowed storage to the logical row count.
+    pub fn iterator(self: SelectionVector) Iterator {
+        return .{ .words = self.mask[0..@min(self.mask.len, self.len / 64 + @intFromBool(self.len % 64 != 0))], .len = self.len };
+    }
+
+    pub const Iterator = struct {
+        words: []const u64,
+        len: usize,
+        word: usize = 0,
+        base: usize = 0,
+        bits: std.bit_set.IntegerBitSet(64) = .empty,
+
+        pub fn next(self: *Iterator) ?usize {
+            while (true) {
+                if (self.bits.toggleFirstSet()) |bit| return self.base + bit;
+                if (self.word == self.words.len) return null;
+                self.base = self.word * 64;
+                self.bits.mask = self.words[self.word] & bitsAt(0, @min(64, self.len - self.base));
+                self.word += 1;
+            }
+        }
+    };
+
     pub fn deinit(self: *SelectionVector) void {
         self.allocator.free(self.mask);
         self.* = undefined;
@@ -246,4 +269,16 @@ test "SelectionVector range clears and tests match the per-row reference" {
             }
         }
     }
+}
+
+test "SelectionVector iterator clips dirty padding and extra words" {
+    var mask = [_]u64{ 0, 1 | (@as(u64, 1) << 63), ~@as(u64, 0) };
+    const sel: SelectionVector = .{ .allocator = testing.allocator, .len = 65, .mask = &mask };
+    var it = sel.iterator();
+    try testing.expectEqual(@as(?usize, 64), it.next());
+    try testing.expectEqual(@as(?usize, null), it.next());
+    var empty = sel;
+    empty.len = 0;
+    it = empty.iterator();
+    try testing.expectEqual(@as(?usize, null), it.next());
 }

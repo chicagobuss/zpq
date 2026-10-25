@@ -200,10 +200,8 @@ pub const Local = struct {
         const k = view.cols[lookup[l.state.key_col].?].string;
         const f = view.cols[lookup[l.state.f_col].?];
         if (selected) |sel| {
-            for (sel.mask, 0..) |mask, word| {
-                var it = (std.bit_set.IntegerBitSet(64){ .mask = mask }).iterator(.{});
-                while (it.next()) |bit| try l.batchRow(k, f, offset, word * 64 + bit);
-            }
+            var it = sel.iterator();
+            while (it.next()) |row| try l.batchRow(k, f, offset, row);
         } else for (0..view.num_rows) |i| try l.batchRow(k, f, offset, i);
     }
 

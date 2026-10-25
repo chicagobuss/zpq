@@ -3123,10 +3123,8 @@ pub const IntegerCountSink = struct {
             return;
         }
         if (selected) |sel| {
-            for (sel.mask, 0..) |mask, word| {
-                var it = (std.bit_set.IntegerBitSet(64){ .mask = mask }).iterator(.{});
-                while (it.next()) |bit| try s.packedRow(p, offset, word * 64 + bit);
-            }
+            var it = sel.iterator();
+            while (it.next()) |row| try s.packedRow(p, offset, row);
         } else for (0..view.num_rows) |r| try s.packedRow(p, offset, r);
     }
 

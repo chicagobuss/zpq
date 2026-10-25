@@ -1386,6 +1386,34 @@ fn runTail(
     const zpq_path = try std.fmt.allocPrint(gpa, "{s}.json", .{ans_path});
     defer gpa.free(zpq_path);
 
+    if (std.mem.eql(u8, check, "byte_records")) {
+        const sql = try fillSql(gpa, case.sql.?, fixture);
+        defer gpa.free(sql);
+        var canonical: ?[]u8 = null;
+        defer if (canonical) |bytes| gpa.free(bytes);
+        for ([_][]const u8{ "0", "1" }) |enabled| {
+            var record_env = try bindEnv(gpa, "ZPQ_BYTE_RECORDS", enabled);
+            defer record_env.deinit();
+            // setenv may replace libc's environment array; the process-start snapshot cannot force this path.
+            var current = ctx;
+            current.env = .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+            if (!std.mem.eql(u8, current.env.getPosix("ZPQ_BYTE_RECORDS") orelse "", enabled))
+                return error.SetEnv;
+            const jobs = if (case.jobs.len > 0) case.jobs[0] else 16;
+            const parquet = case.format != null and std.mem.eql(u8, case.format.?, "parquet");
+            const bytes = if (parquet) blk: {
+                querySqlOutput(gpa, current, sql, jobs, case, out_path) catch |err|
+                    return try queryFailure(gpa, err);
+                break :blk try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(64 << 20));
+            } else querySqlJson(gpa, current, sql, jobs, case) catch |err| return try queryFailure(gpa, err);
+            if (canonical) |reference| {
+                defer gpa.free(bytes);
+                if (!std.mem.eql(u8, reference, bytes))
+                    return try gpa.dupe(u8, "byte-owner output differs from ZPQ_BYTE_RECORDS=0");
+            } else canonical = bytes;
+        }
+        return null;
+    }
     if (std.mem.eql(u8, check, "sketch")) {
         const sql = try fillSql(gpa, case.sql.?, fixture);
         defer gpa.free(sql);

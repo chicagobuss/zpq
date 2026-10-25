@@ -2328,10 +2328,10 @@ fn hotCertificate(
     if (cfg.trace) std.debug.print("certificate: hot={d} width={d} cut={d} residual_bound={d} count_ms={d}\n", .{
         plan.keys.len, plan.width, cut, residual, @divTrunc(nowMonoNs() - t0, 1_000_000),
     });
-    // If the trial would group most rows, let the ordinary identity-bound policy choose its exact finish.
-    var rows: u64 = 0;
-    for (sources) |source| rows +|= @intCast(@max(0, source.rg.num_rows));
-    if (residual >= rows / 2 or !cfg.certify) return false;
+    // The residual counts survivors, so compare it with this pass's selected rows, excluding earlier phases.
+    var selected_rows: u64 = 0;
+    for (workers, saved) |w, before| selected_rows +|= @intCast(w.rows_matched - before.rows_matched);
+    if (residual >= selected_rows / 2 or !cfg.certify) return false;
     if (residual > 0) {
         const admit = try a.alloc(u64, (n_cells + 63) / 64);
         defer a.free(admit);
@@ -5898,7 +5898,7 @@ fn runByteTop(
         name.* = gpa.dupe(u8, out.name) catch return error.ExceededMemoryBudget;
         ty.* = .{
             .lane = if (out.source == .key) .string else .i64,
-            .nullable = true,
+            .nullable = out.source == .key or kind != .count_top,
             .source = if (out.source == .key) leafSchemaElem(&metas[0], key.col_idx) else null,
         };
     }
@@ -6525,7 +6525,7 @@ fn inlineIntegerAnswer(
     if ((full and count == null) or (!count_top and value == null)) return null;
     if (args.filter != null and !count_top) return null;
     const ordered_count = count_top and orderedIntegerHint(metas, work, key.col_idx);
-    // Filtered high-NDV counts can avoid a sketch rescan; the stored-domain cost gate below still favors coded folds.
+    // Filtered counts can avoid a sketch rescan; dictionary and survivor-domain cost gates below favor small folds.
     if (count_top and !ordered_count and args.filter == null) return null;
     // Leave compressed/skew keys on the established distinct certifier. This is a cost hint over all work,
     // never a bound on identity or a reason to skip a decoded value.
@@ -6559,8 +6559,26 @@ fn inlineIntegerAnswer(
     if (quote > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
-    if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
-        if (guess < rows / 4) return null;
+    if (args.integer_records_min_rows != 0) {
+        if (ndv.footerEntries(metas, keys)) |guess| {
+            if (guess < rows / 4) return null;
+        } else if (count_top and !ordered_count and plan.query.filter != null) {
+            var survivors: f64 = 0;
+            var range: IntegerRangeHint = .{};
+            for (work) |item| {
+                const meta = &metas[item.file];
+                const rg = &meta.row_groups.items[item.rg];
+                const decision = plan.decide(rg, meta);
+                if (decision == .skip) continue;
+                const share = if (decision == .full_match) 1 else filter_prune.passFraction(plan.query.filter.?, rg, meta);
+                survivors += @as(f64, @floatFromInt(@max(0, rg.num_rows))) * share;
+                range.include(rg, meta, key.col_idx);
+            }
+            // An estimated survivor count also caps its domain for costing. Never bounds or skips decoded identities.
+            const kept: usize = @intFromFloat(survivors);
+            if (kept < args.integer_records_min_rows or range.small(kept)) return null;
+        }
+    }
     if (explain_only) return .{
         .layout = if (distinct) .integer_distinct_top_h else if (count_top)
             .integer_count_top_h
@@ -6705,7 +6723,10 @@ fn orderedIntegerHint(metas: []const schema.FileMetaData, work: []const WorkItem
         const meta = &metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
         if (rg.num_rows == 0) continue;
-        const b = statistics.chunkStats(rg, column, meta, .corroborated).bounds orelse return false;
+        const stats = statistics.chunkStats(rg, column, meta, .corroborated);
+        // Bounds exclude NULLs. A run cannot represent them; unknown nullability cannot admit a run either.
+        if ((stats.null_count orelse -1) != 0) return false;
+        const b = stats.bounds orelse return false;
         if (b.min.len != 8 or b.max.len != 8) return false;
         const lo = std.mem.readInt(i64, b.min[0..8], .little);
         const hi = std.mem.readInt(i64, b.max[0..8], .little);
@@ -6805,7 +6826,8 @@ fn runIntegerOwner(
             parts,
             names_credit,
         )) orelse return null;
-    errdefer state.deinit();
+    var state_live = true;
+    errdefer if (state_live) state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
     for (sinks, state.locals) |*sink, *local| sink.* = switch (kind) {
@@ -6833,6 +6855,29 @@ fn runIntegerOwner(
         if (err != error.RunOrderDeclined) return err;
         try rewindInputs(arena, args);
         state.deinit();
+        state_live = false;
+        if (kind == .count_top) return runIntegerOwner(
+            kind,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            n_workers,
+            timings,
+            rows,
+            key_col,
+            value_col,
+            count,
+            starts,
+            cut,
+            false,
+        );
+        if (args.taken) |taken| taken.remove(.integer_records);
         return null;
     };
     const scatter_end = final_start + @as(i64, @intCast(state.partition_ns));
@@ -20011,12 +20056,15 @@ fn releasingOrderedTrial(
             },
         };
         const explanation = try explainAggregate(gpa, a, args);
-        try testing.expect(explanation.record_path != null);
+        const known_null = for (meta.row_groups.items) |rg| {
+            if ((rg.columns.items[0].meta_data.?.statistics.?.null_count orelse 0) > 0) break true;
+        } else false;
+        try testing.expect((explanation.record_path != null) == !(known_null and mode == 2));
         var got = try runMultiAggregate(gpa, a, args);
         defer got.deinit(gpa);
         try testing.expectEqual(meta.row_groups.items.len, window.waits.load(.monotonic));
         try testing.expectEqual(meta.row_groups.items.len, window.releases.load(.monotonic));
-        try testing.expectEqual(@as(usize, 1), window.abandoned);
+        try testing.expectEqual(@as(usize, if (known_null) 0 else 1), window.abandoned);
         if (mode == 0) {
             const stream = got.output.integer_stream.?;
             try testing.expectEqual(@as(usize, 0), stream.state.runs.len);
@@ -21938,5 +21986,82 @@ test "filtered record pruning preserves canonical failures and stable replay of 
                 };
             }
         }
+    }
+}
+
+test "filtered COUNT sorted NULLs and known seams use one exact record pass with honest admission" {
+    const gpa = testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    for ([_][]const u8{ "ordered", "seams" }) |shape| {
+        const path = try std.fmt.allocPrint(a, "ci/fixtures/parquet/filtered_records_{s}.parquet", .{shape});
+        const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
+        defer gpa.free(bytes);
+        const meta = try metadata.open(a, bytes);
+        const mapped = [_]Input{.{ .name = path, .bytes = bytes }};
+        const base: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c",
+            .group_by = "k",
+            .filter = "f = 1",
+            .integer_records = false,
+            .byte_records = false,
+            .msd_records = false,
+            .ndv_policy = false,
+            .dense = false,
+            .plain_rules = false,
+            .sketch_topk = null,
+            .max_memory = 128 << 20,
+            .min_bytes_per_worker = 1,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10, .offset = 2 },
+        };
+        var want = try runMultiAggregate(gpa, a, base);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, base.result_order);
+        for (1..17) |j| for ([_]usize{ 0, 64 }) |batch| for ([_]bool{ false, true }) |gated| {
+            var trial = std.heap.ArenaAllocator.init(gpa);
+            defer trial.deinit();
+            const ta = trial.allocator();
+            var window: ReleasingScanWindow = .{ .bytes = try ta.dupe(u8, bytes), .meta = &meta };
+            const inputs = [_]Input{window.input(bytes)};
+            var args = base;
+            args.inputs = if (gated) &inputs else &mapped;
+            args.start_reads = if (gated) .{
+                .ctx = &window,
+                .start = ReleasingScanWindow.start,
+                .abandon = ReleasingScanWindow.abandon,
+            } else null;
+            args.integer_records = true;
+            args.integer_records_min_rows = 0;
+            args.parallelism = j;
+            args.decode_batch_rows = batch;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            const explanation = try explainAggregate(gpa, ta, args);
+            try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+            var got = try prepareAggregate(gpa, ta, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.integer_records));
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            try testing.expectEqual(want.rows_matched, got.rows_matched);
+            try testing.expectEqual(@as(usize, 0), window.abandoned);
+            if (gated) try testing.expectEqual(meta.row_groups.items.len, window.waits.load(.monotonic));
+        };
+        // The unknown PLAIN domain has at most a few estimated survivors, despite thousands of raw rows.
+        var selective = base;
+        selective.filter = "rid < 2";
+        selective.integer_records = true;
+        selective.integer_records_min_rows = 100;
+        const explanation = try explainAggregate(gpa, a, selective);
+        try testing.expect(explanation.record_path == null);
+        var taken: std.EnumSet(FastPath) = .{};
+        selective.taken = &taken;
+        var got = try prepareAggregate(gpa, a, selective, false);
+        defer got.deinit(gpa);
+        try testing.expect(!taken.contains(.integer_records));
+        try testing.expectEqual(@as(i64, 2), got.rows_matched);
     }
 }

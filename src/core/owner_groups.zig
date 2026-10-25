@@ -328,10 +328,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 const k = if (codec == .bytes) view.cols[lookup[l.state.key_col].?].string else view.cols[lookup[l.state.key_col].?].i64;
                 const v = if (has_value) view.cols[lookup[l.state.value_col].?].i64 else {};
                 if (selected) |sel| {
-                    for (sel.mask, 0..) |mask, word| {
-                        var it = (std.bit_set.IntegerBitSet(64){ .mask = mask }).iterator(.{});
-                        while (it.next()) |bit| try l.batchRow(k, v, offset, word * 64 + bit);
-                    }
+                    var it = sel.iterator();
+                    while (it.next()) |row| try l.batchRow(k, v, offset, row);
                 } else for (0..view.num_rows) |i| try l.batchRow(k, v, offset, i);
             }
 

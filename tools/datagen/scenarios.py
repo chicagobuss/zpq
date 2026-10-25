@@ -600,3 +600,22 @@ def filtered_records(out_dir):
     assert all(pq.ParquetFile(path).metadata.row_group(g).column(c).has_offset_index
                for g in range(16) for c in range(3))
     print(path)
+
+
+def filtered_records_ordered(out_dir):
+    """Sorted nullable keys and overlapping row-group seams for filtered COUNT admission."""
+    import numpy as np
+    rg_rows = 1281
+    r = np.arange(16 * rg_rows, dtype=np.int64)
+    for seam in (False, True):
+        k = (r % rg_rows if seam else r) // 3
+        table = pa.table({
+            'k': pa.array(k, mask=None if seam else r % rg_rows == 64),
+            'f': pa.array((r % 7 != 0).astype(np.int32)),
+            'rid': pa.array(r),
+        })
+        path = out_dir / ('filtered_records_seams.parquet' if seam else 'filtered_records_ordered.parquet')
+        pq.write_table(table, path, row_group_size=rg_rows, compression='NONE', use_dictionary=False,
+                       write_page_index=True, data_page_size=512, write_batch_size=128)
+        assert pq.read_table(path).equals(table)
+        print(path)

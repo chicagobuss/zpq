@@ -11,6 +11,10 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 import zpq  # noqa: E402
@@ -192,66 +196,136 @@ def wait_inflight(z, timeout=10):
         time.sleep(0.001)
 
 
-def wait_running(z, timeout=10):
-    """Wait until a query holds the whole ceiling: a probe that may not wait for its budget is then refused. Counting
-    the binding's own calls is not enough, as close ends a call that has not yet been admitted."""
-    probe = {"sql": f"SELECT count(*) AS n FROM '{FIX}'", "budget_wait_ms": 0}
-    end = time.monotonic() + timeout
-    while z.run(probe, check=False).get("reason") != "WaitTimeout":
-        if time.monotonic() > end:
-            raise TimeoutError("no query running")
+@contextmanager
+def admitted_slow():
+    """Hold SLOW at an input GET, which is reached only after its budget is admitted."""
+    admitted, release = threading.Event(), threading.Event()
+    body = Path(FIX).read_bytes()
+
+    class Input(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            admitted.set()
+            if not release.wait(10):
+                self.send_error(504, "test did not release input")
+                return
+            r = self.headers["Range"].removeprefix("bytes=")
+            if r.startswith("-"):
+                lo, hi = max(0, len(body) - int(r[1:])), len(body) - 1
+            else:
+                lo, hi = map(int, r.split("-"))
+                hi = min(hi, len(body) - 1)
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {lo}-{hi}/{len(body)}")
+            self.send_header("Content-Length", str(hi - lo + 1))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.wfile.write(body[lo:hi + 1])
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Input)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    env = {"S3_ENDPOINT_URL": f"http://127.0.0.1:{server.server_port}",
+           "S3_NO_SIGN_REQUEST": "1", "AWS_REGION": "us-east-1"}
+    try:
+        with patch.dict(os.environ, env):
+            yield {**SLOW, "inputs": ["s3://test/mixed.parquet", *SLOW["inputs"][1:]]}, admitted, release
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def wait_running(admitted, timeout=10):
+    # WaitTimeout also occurs behind an earlier queued waiter with no reserved budget; it cannot prove admission.
+    if not admitted.wait(timeout):
+        raise TimeoutError("SLOW did not reach its post-admission input GET")
+
+
+def release_when_closing(z, release):
+    def unblock():
+        end = time.monotonic() + 10
+        with z._cond:
+            while not z._closing and time.monotonic() < end:
+                z._cond.wait(0.01)
+            # close has called shutdown and released the condition while waiting for this admitted call.
+            check(z._closing and z._inflight > 0, "close did not wait for the admitted call")
+        release.set()
+
+    t = threading.Thread(target=unblock)
+    t.start()
+    return t
 
 
 def test_close_drains():
-    """close() waits for a call in flight, then refuses new ones; the context is never freed under a query."""
-    z = zpq.Zpq()
-    done = {}
+    """close() waits for an admitted call, then refuses new ones; the context is never freed under a query."""
+    with admitted_slow() as (request, admitted, release):
+        z = zpq.Zpq()
+        done = {}
 
-    def slow():
-        done["agg"] = z.run(SLOW)["agg"]
-        done["t"] = time.monotonic()
+        def slow():
+            done["agg"] = z.run(request)["agg"]
 
-    t = threading.Thread(target=slow)
-    t.start()
-    wait_running(z)
-    z.close()
-    closed_at = time.monotonic()
-    t.join()
-    check(done.get("agg") == {"s": SLOW_SUM}, f"in-flight call answered {done}")
-    check(done.get("t", closed_at + 1) <= closed_at, "close returned before the call in flight finished")
-    try:
-        z.run({"inputs": [FIX], "aggregate": "count(*) AS n"})
-        check(False, "run after close did not raise")
-    except zpq.ZpqClosed:
-        pass
-    z.close()  # idempotent
+        t = threading.Thread(target=slow)
+        t.start()
+        try:
+            wait_running(admitted)
+            unblock = release_when_closing(z, release)
+            z.close()
+            unblock.join()
+        finally:
+            release.set()
+            t.join()
+            z.close()
+        check(done.get("agg") == {"s": SLOW_SUM}, f"in-flight call answered {done}")
+        try:
+            z.run({"inputs": [FIX], "aggregate": "count(*) AS n"})
+            check(False, "run after close did not raise")
+        except zpq.ZpqClosed:
+            pass
+        z.close()  # idempotent
 
 
 def test_close_ends_waiters():
-    """close() ends a query still waiting for its memory budget with ZpqClosed rather than waiting for it to run; the
-    running one answers."""
-    z = zpq.Zpq(max_memory="64MB")
-    got = {}
+    """close() ends a query waiting for its memory budget with ZpqClosed; the admitted query answers."""
+    with admitted_slow() as (request, admitted, release):
+        z = zpq.Zpq(max_memory="64MB")
+        got = {}
 
-    def call(name):
+        def call(name, query):
+            try:
+                got[name] = z.run(query)["agg"]
+            except zpq.ZpqClosed as e:
+                got[name] = e
+
+        running = threading.Thread(target=call, args=("running", request))
+        running.start()
+        waiting = None
         try:
-            got[name] = z.run(SLOW)["agg"]
-        except zpq.ZpqClosed as e:
-            got[name] = e
-
-    running = threading.Thread(target=call, args=("running",))
-    running.start()
-    wait_running(z)
-    waiting = threading.Thread(target=call, args=("waiting",))
-    waiting.start()
-    end = time.monotonic() + 10
-    while z._inflight < 2 and time.monotonic() < end:
-        time.sleep(0.001)
-    z.close()
-    running.join()
-    waiting.join()
-    check(got.get("running") == {"s": SLOW_SUM}, f"running call answered {got.get('running')}")
-    check(isinstance(got.get("waiting"), zpq.ZpqClosed), f"waiting call: {got.get('waiting')!r}")
+            wait_running(admitted)
+            waiting = threading.Thread(target=call, args=("waiting", SLOW))
+            waiting.start()
+            end = time.monotonic() + 10
+            while z._inflight < 2 and time.monotonic() < end:
+                time.sleep(0.001)
+            check(z._inflight == 2, "second call did not enter the binding")
+            unblock = release_when_closing(z, release)
+            z.close()
+            unblock.join()
+        finally:
+            release.set()
+            running.join()
+            if waiting is not None:
+                waiting.join()
+            z.close()
+        check(got.get("running") == {"s": SLOW_SUM}, f"running call answered {got.get('running')}")
+        check(isinstance(got.get("waiting"), zpq.ZpqClosed), f"waiting call: {got.get('waiting')!r}")
 
 
 def serve(z):

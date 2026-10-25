@@ -238,7 +238,7 @@ pub const MultiAggArgs = struct {
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
     /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
     typed_answer: bool = false,
-    /// Exact inline records for a full integer COUNT/SUM answer or a bounded integer SUM cut, when its peak fits.
+    /// Exact inline records for integer COUNT/SUM answers, SUM/DISTINCT cuts, and scalar distinct, when prepaid.
     integer_records: bool = true,
     /// Tests lower the cost threshold; ordinary execution keeps small answers on the established path.
     integer_records_min_rows: usize = 1 << 20,
@@ -1233,6 +1233,7 @@ pub const RecordAdmission = struct {
         byte_sum_top_h,
         byte_count_top_h,
         msd_count_top_h,
+        integer_distinct_top_h,
         integer_distinct,
         byte_distinct,
     },
@@ -2574,21 +2575,28 @@ fn certifiedTopK(
 /// they bail.
 fn keysLookUnique(metas: []const schema.FileMetaData, work: []const WorkItem, keys: []const expr_ast.Expr) bool {
     if (work.len == 0) return false;
-    const rg = &metas[work[0].file].row_groups.items[work[0].rg];
-    if (rg.num_rows <= 0) return false;
-    for (keys) |key| {
-        if (key != .col_ref) continue;
-        const col = key.col_ref.col_idx;
-        if (col >= rg.columns.items.len) continue;
-        const md = rg.columns.items[col].meta_data orelse continue;
-        const width: i64 = switch (md.type) {
+    for (keys) |key| if (key == .col_ref and wideKey(metas, work[0..1], key.col_ref.col_idx)) return true;
+    return false;
+}
+
+/// Stored width is a cost proxy for wide/near-unique fixed-width keys, without reading optional pages.
+fn wideKey(metas: []const schema.FileMetaData, work: []const WorkItem, col: usize) bool {
+    var raw: u64 = 0;
+    var stored: u64 = 0;
+    for (work) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        if (rg.num_rows <= 0) continue;
+        if (col >= rg.columns.items.len) return false;
+        const cm = rg.columns.items[col].meta_data orelse return false;
+        const width: u64 = switch (cm.type) {
             .INT32, .FLOAT => 4,
             .INT64, .DOUBLE => 8,
-            else => continue,
+            else => return false,
         };
-        if (md.total_uncompressed_size *| 4 >= rg.num_rows *| width *| 3) return true;
+        raw +|= @as(u64, @intCast(rg.num_rows)) *| width;
+        stored +|= @intCast(@max(0, cm.total_uncompressed_size));
     }
-    return false;
+    return raw != 0 and stored *| 4 >= raw *| 3;
 }
 
 /// Whether a census after a sketch bail is worth recounting for. Its repeats no longer bound its use (the census keeps
@@ -6033,6 +6041,32 @@ fn inlineByteAnswer(
     };
 }
 
+/// A footer-range cost hint shared by scalar and grouped distinct admission; it never supplies an answer.
+const IntegerRangeHint = struct {
+    known: bool = true,
+    lo: i64 = std.math.maxInt(i64),
+    hi: i64 = std.math.minInt(i64),
+
+    fn include(self: *@This(), rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) void {
+        if (rg.num_rows <= 0) return;
+        const bounds = @import("parquet/statistics.zig").chunkStats(rg, ci, meta, .corroborated).bounds;
+        if (bounds) |b| {
+            if (b.min.len == 8 and b.max.len == 8) {
+                self.lo = @min(self.lo, std.mem.readInt(i64, b.min[0..8], .little));
+                self.hi = @max(self.hi, std.mem.readInt(i64, b.max[0..8], .little));
+                return;
+            }
+        }
+        self.known = false;
+    }
+
+    fn small(self: @This(), rows: usize) bool {
+        if (!self.known or self.lo > self.hi) return false;
+        const span: u128 = @intCast(@as(i128, self.hi) - self.lo + 1);
+        return span < rows / 4;
+    }
+};
+
 // Scalar cardinality reuses count-only owner records and the complete partition fold.
 fn inlineDistinctAnswer(
     gpa: std.mem.Allocator,
@@ -6066,9 +6100,7 @@ fn inlineDistinctAnswer(
     const threshold = if (codec == .int64) args.integer_records_min_rows else args.byte_records_min_rows;
     const starts = try arena.alloc(u32, work.len);
     var rows: usize = 0;
-    var range_known = true;
-    var key_lo: i64 = std.math.maxInt(i64);
-    var key_hi: i64 = std.math.minInt(i64);
+    var key_range: IntegerRangeHint = .{};
     for (work, starts) |item, *start| {
         if (rows >= std.math.maxInt(u32)) return null;
         start.* = @intCast(rows);
@@ -6083,23 +6115,12 @@ fn inlineDistinctAnswer(
         const n = rg.num_rows;
         if (n < 0) return null;
         rows +|= @intCast(n);
-        if (codec == .int64 and threshold != 0 and n != 0) {
-            const bounds = @import("parquet/statistics.zig").chunkStats(rg, key.col_idx, meta, .corroborated).bounds;
-            if (bounds) |b| {
-                if (b.min.len == 8 and b.max.len == 8) {
-                    key_lo = @min(key_lo, std.mem.readInt(i64, b.min[0..8], .little));
-                    key_hi = @max(key_hi, std.mem.readInt(i64, b.max[0..8], .little));
-                } else range_known = false;
-            } else range_known = false;
-        }
+        if (codec == .int64 and threshold != 0) key_range.include(rg, meta, key.col_idx);
     }
     if (rows == 0 or rows < threshold) return null;
     // A narrow footer range favors D1 even when PLAIN pages make dictionary cardinality unknown.
     // This only declines the owner attempt; ordinary decoding still validates every value.
-    if (codec == .int64 and threshold != 0 and range_known and key_lo <= key_hi) {
-        const span: u128 = @intCast(@as(i128, key_hi) - key_lo + 1);
-        if (span < rows / 4) return null;
-    }
+    if (codec == .int64 and threshold != 0 and key_range.small(rows)) return null;
     if (threshold != 0) if (ndv.footerEntries(metas, &.{arg})) |guess| if (guess < rows / 4) return null;
     switch (codec) {
         inline else => |c| {
@@ -6223,6 +6244,7 @@ fn inlineIntegerAnswer(
     if (key.physical_type != .INT64 or key.expr_type != .i64 or key.unsigned_64) return null;
     var count: ?usize = null;
     var value: ?usize = null;
+    var distinct = false;
     for (calls, 0..) |call, i| {
         if (call.where != null or call.offset != 0 or call.state or call.result != .i64) return null;
         switch (call.func) {
@@ -6230,7 +6252,12 @@ fn inlineIntegerAnswer(
                 if (call.arg != null or count != null) return null;
                 count = i;
             },
-            .sum => {
+            .sum, .count_distinct => {
+                if (call.func == .count_distinct) {
+                    if (full) return null;
+                    distinct = true;
+                    count = i;
+                }
                 const arg = call.arg orelse return null;
                 if (arg != .col_ref or arg.col_ref.physical_type != .INT64 or arg.col_ref.expr_type != .i64 or
                     arg.col_ref.unsigned_64 or value != null) return null;
@@ -6239,10 +6266,17 @@ fn inlineIntegerAnswer(
             else => return null,
         }
     }
-    const count_top = !full and count != null;
+    const count_top = !full and count != null and !distinct;
     if ((full and count == null) or (!count_top and value == null)) return null;
     // COUNT already has ordinary exact routes; ordered runs alone admit this value-less producer.
     if (count_top and !orderedIntegerHint(metas, work, key.col_idx)) return null;
+    // Leave compressed/skew keys on the established distinct certifier. This is a cost hint over all work,
+    // never a bound on identity or a reason to skip a decoded value.
+    if (distinct and (args.distinct_pairs == .on or
+        (args.integer_records_min_rows != 0 and !wideKey(metas, work, key.col_idx)))) return null;
+    var owner_args = args.*;
+    if (distinct and owner_args.decode_batch_rows == 0)
+        owner_args.decode_batch_rows = owner_groups.batchRows(args.byte_top_batch_rows);
     var seen: u8 = 0;
     for (outputs) |out| seen |= @as(u8, 1) << @intCast(switch (out.source) {
         .key => @as(usize, 0),
@@ -6251,24 +6285,52 @@ fn inlineIntegerAnswer(
     if (seen != (if (full) @as(u8, 7) else @as(u8, 3))) return null;
     const starts = try arena.alloc(u32, work.len);
     var rows: usize = 0;
+    var key_range: IntegerRangeHint = .{};
     for (work, starts) |item, *start| {
         if (!owner_groups.admitsRows(.int64, rows)) return null;
         start.* = @intCast(rows);
-        const n = metas[item.file].row_groups.items[item.rg].num_rows;
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        const n = rg.num_rows;
         if (n < 0) return null;
         rows +|= @intCast(n);
+        if (distinct and args.integer_records_min_rows != 0) key_range.include(rg, meta, key.col_idx);
     }
+    if (distinct and args.integer_records_min_rows != 0 and key_range.small(rows)) return null;
     if (rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows) or
-        integerQuote(rows, n_workers, cut, args.*, count_top) > args.max_memory) return null;
+        integerQuote(rows, n_workers, cut, owner_args, count_top) > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) if (ndv.footerEntries(metas, keys)) |guess|
         if (guess < rows / 4) return null;
     if (explain_only) return .{
-        .layout = if (count_top) .integer_count_top_h else if (cut != null) .integer_sum_top_h else .integer_group_stream,
-        .reservation = integerQuote(rows, n_workers, cut, args.*, count_top),
+        .layout = if (distinct) .integer_distinct_top_h else if (count_top)
+            .integer_count_top_h
+        else if (cut != null) .integer_sum_top_h else .integer_group_stream,
+        .reservation = integerQuote(rows, n_workers, cut, owner_args, count_top),
     };
     if (cut) |c| {
+        if (distinct) return runIntegerOwner(
+            .sum_top,
+            gpa,
+            arena,
+            &owner_args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            n_workers,
+            timings,
+            rows,
+            key.col_idx,
+            value.?,
+            count,
+            starts,
+            c,
+            false,
+        );
         if (count_top) return runIntegerOwner(
             .count_top,
             gpa,
@@ -6439,7 +6501,10 @@ fn runIntegerOwner(
         owner_groups.full_parts
     else
         Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
-    const state = (if (ordered)
+    const distinct = kind == .sum_top and calls.len == 1 and calls[0].func == .count_distinct;
+    const state = (if (kind == .sum_top and distinct)
+        try Owner.State.initDistinctTop(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, 0)
+    else if (ordered)
         try Owner.State.initRuns(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, work.len)
     else
         try Owner.State.init(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, 0)) orelse return null;
@@ -20320,4 +20385,108 @@ test "scalar owner cardinality survives releasing windows and late width refusal
         const remote = try explainAggregate(gpa, a, args);
         try testing.expect(remote.record_path == null);
     }
+}
+
+test "distinct owner radix completes full pairs after releasing every reader window" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    for (0..16) |rg| {
+        var keys: [512]i64 = undefined;
+        var vals: [512]i64 = undefined;
+        var kd: [512]u32 = undefined;
+        var vd: [512]u32 = undefined;
+        for (&keys, &vals, &kd, &vd, 0..) |*k, *v, *kn, *vn, r| {
+            k.* = @as(i64, @intCast((r + rg * 7) % 13)) * (1 << 48) - (1 << 49);
+            v.* = @as(i64, @intCast((r * 3 + rg * 11) % 17)) * (1 << 41) - (1 << 45);
+            kn.* = @intFromBool(r % 23 != 0);
+            vn.* = @intFromBool(r % 17 != 0 and k.* != 0);
+        }
+        keys[1] = std.math.minInt(i64);
+        vals[1] = std.math.maxInt(i64);
+        vals[2] = std.math.minInt(i64);
+        const cols = [_]expr_agg.OutputCol{
+            .{
+                .name = "k",
+                .parquet_type = .INT64,
+                .nullable = true,
+                .col = .{ .i64 = .{ .values = &keys, .def_levels = &kd, .max_def = 1 } },
+            },
+            .{
+                .name = "x",
+                .parquet_type = .INT64,
+                .nullable = true,
+                .col = .{ .i64 = .{ .values = &vals, .def_levels = &vd, .max_def = 1 } },
+            },
+        };
+        try file.append(&cols, keys.len, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&.{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+        .{ .name = "x", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+    });
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    const mapped = [_]Input{.{ .name = "pair-radix.parquet", .bytes = bytes }};
+    var args: MultiAggArgs = .{
+        .inputs = &mapped,
+        .metas = (&meta)[0..1],
+        .aggregate = "count(DISTINCT x) AS d",
+        .group_by = "k",
+        .integer_records = false,
+        .byte_records = false,
+        .dense = false,
+        .distinct_pairs = .off,
+        .ndv_policy = false,
+        .plain_rules = false,
+        .scan_all = true,
+        .min_bytes_per_worker = 1,
+        .max_memory = 64 << 20,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 4, .offset = 2 },
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch| {
+        var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+        const inputs = [_]Input{window.input(bytes)};
+        var taken: std.EnumSet(FastPath) = .{};
+        args.inputs = &inputs;
+        args.integer_records = true;
+        args.integer_records_min_rows = 0;
+        args.parallelism = j;
+        args.decode_batch_rows = batch;
+        args.taken = &taken;
+        args.start_reads = .{
+            .ctx = &window,
+            .start = ReleasingScanWindow.start,
+            .abandon = ReleasingScanWindow.abandon,
+        };
+        const explanation = try explainAggregate(gpa, a, args);
+        try testing.expectEqual(.integer_distinct_top_h, explanation.record_path.?.layout);
+        var got = try prepareAggregate(gpa, a, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.integer_records));
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+        try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), window.abandoned);
+    };
+    args.start_reads = null;
+    args.inputs = &mapped;
+    args.distinct_pairs = .on;
+    args.taken = null;
+    const forced = try explainAggregate(gpa, a, args);
+    try testing.expect(forced.record_path == null);
+    var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+    var input = window.input(bytes);
+    input.plan_bytes = null;
+    args.inputs = (&input)[0..1];
+    args.distinct_pairs = .off;
+    const remote = try explainAggregate(gpa, a, args);
+    try testing.expect(remote.record_path == null);
 }

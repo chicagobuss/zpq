@@ -409,6 +409,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             blocks: []Block = &.{},
             block_cursor: std.atomic.Value(u32) = .init(0),
             width_refused: std.atomic.Value(bool) = .init(false),
+            /// Exact pair scores reuse the integer SUM top-H record and score layout.
+            distinct_top: bool = false,
             locals: []Local = &.{},
             group_count: usize = 0,
             input_nulls: u32 = 0,
@@ -482,6 +484,34 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     output_credit,
                     0,
                 );
+            }
+
+            /// Exact pair deduplication inside complete integer-key owners, ranked through the existing SUM lane.
+            pub fn initDistinctTop(
+                a: std.mem.Allocator,
+                ledger: ?*memory.SharedBudget,
+                rows: usize,
+                workers: usize,
+                key_col: usize,
+                value_col: usize,
+                cut: Cut,
+                parts: usize,
+                output_credit: usize,
+            ) !?*State {
+                comptime std.debug.assert(kind == .sum_top and codec == .int64);
+                const state = (try init(
+                    a,
+                    ledger,
+                    rows,
+                    workers,
+                    key_col,
+                    value_col,
+                    cut,
+                    parts,
+                    output_credit,
+                )) orelse return null;
+                state.distinct_top = true;
+                return state;
             }
 
             /// The same full-answer state, filled with decoded run partials instead of hash records. Its ordinary
@@ -598,12 +628,14 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 heap: ?*Heap = null,
                 groups: []Group = &.{},
                 slots: []u32 = &.{},
+                records: []Record = &.{},
                 group_count: usize = 0,
                 err: ?anyerror = null,
 
                 fn run(t: *Task) void {
                     defer t.s.gpa.free(t.groups);
                     defer t.s.gpa.free(t.slots);
+                    defer t.s.gpa.free(t.records);
                     const end = switch (t.pass) {
                         .order => (t.s.bitmap.len + 1023) / 1024,
                         .run_top => t.s.runs.len,
@@ -613,7 +645,10 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         const p = t.cursor.fetchAdd(1, .monotonic);
                         if (p >= end) return;
                         (switch (t.pass) {
-                            .fold => if (kind == .full) t.foldFull(p) else t.foldTop(p),
+                            .fold => if (kind == .full) t.foldFull(p) else if (kind == .sum_top and codec == .int64)
+                                if (t.s.distinct_top) t.foldDistinct(p) else t.foldTop(p)
+                            else
+                                t.foldTop(p),
                             .order => t.s.orderBlock(p),
                             .run_top => if (kind != .full) t.runTop(p),
                         }) catch |e| {
@@ -666,6 +701,108 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         s.winners[g.ordinal()] = @intCast(i + 1);
                     }
                     s.counts[p] = n;
+                }
+
+                const PairField = enum { value, value_null, key, key_null };
+                fn pairField(comptime field: PairField, r: Record) u64 {
+                    return switch (field) {
+                        .value => @bitCast(r.value),
+                        .value_null => @intFromBool(r.flags & 2 != 0),
+                        .key => r.key,
+                        .key_null => r.flags & 1,
+                    };
+                }
+
+                fn sortPairField(comptime field: PairField, src: *[]Record, dst: *[]Record) void {
+                    if (src.len < 2) return;
+                    var varying: u64 = 0;
+                    const first = pairField(field, src.*[0]);
+                    for (src.*) |r| varying |= first ^ pairField(field, r);
+                    if (varying == 0) return;
+                    // The digit cap bounds private prefixes to 16 KiB, inside the existing 1 MiB owner stack.
+                    const radix_bits = 11;
+                    var counts: [1 << radix_bits]usize = undefined;
+                    const lo: usize = @ctz(varying);
+                    const span = 64 - @clz(varying) - lo;
+                    const passes = std.math.divCeil(usize, span, radix_bits) catch unreachable;
+                    const bits = std.math.divCeil(usize, span, passes) catch unreachable;
+                    const buckets = @as(usize, 1) << @intCast(bits);
+                    var shift = lo;
+                    while (shift < lo + span) : (shift += bits) {
+                        const sh: u6 = @intCast(shift);
+                        if ((varying >> sh) & (buckets - 1) == 0) continue;
+                        @memset(counts[0..buckets], 0);
+                        for (src.*) |r| counts[(pairField(field, r) >> sh) & (buckets - 1)] += 1;
+                        var at: usize = 0;
+                        for (counts[0..buckets]) |*c| {
+                            const n = c.*;
+                            c.* = at;
+                            at += n;
+                        }
+                        for (src.*) |r| {
+                            const digit = (pairField(field, r) >> sh) & (buckets - 1);
+                            dst.*[counts[digit]] = r;
+                            counts[digit] += 1;
+                        }
+                        std.mem.swap([]Record, src, dst);
+                    }
+                }
+
+                fn foldDistinct(t: *Task, p: usize) !void {
+                    comptime std.debug.assert(kind == .sum_top and codec == .int64);
+                    comptime std.debug.assert(2 * @sizeOf(Record) <= table_row_bytes);
+                    const s = t.s;
+                    var rows: usize = 0;
+                    for (s.locals) |l| rows += l.histogram[p];
+                    if (rows == 0) return;
+                    if (t.records.len < rows * 2) {
+                        s.gpa.free(t.records);
+                        t.records = &.{};
+                        t.records = try s.gpa.alloc(Record, rows * 2);
+                    }
+                    var src = t.records[0..rows];
+                    var dst = t.records[rows..][0..rows];
+                    var at: usize = 0;
+                    for (s.locals) |l| {
+                        var id = l.heads[p];
+                        while (id != none) {
+                            const b = &s.blocks[id];
+                            std.mem.copyForwards(Record, src[at..][0..b.len], b.rows[0..b.len]);
+                            at += b.len;
+                            id = b.next;
+                        }
+                    }
+                    std.debug.assert(at == rows);
+                    // Stable least-significant-field passes retain full values, keys and separate NULL flags.
+                    inline for (.{ PairField.value, PairField.value_null, PairField.key, PairField.key_null }) |field|
+                        sortPairField(field, &src, &dst);
+                    at = 0;
+                    while (at < rows) {
+                        const head = src[at];
+                        var end = at + 1;
+                        while (end < rows and head.key == src[end].key and
+                            (head.flags & 1) == (src[end].flags & 1)) : (end += 1)
+                        {}
+                        var first = head.ordinal;
+                        var last: ?u64 = null;
+                        var score: u64 = 0;
+                        for (src[at..end]) |r| {
+                            first = @min(first, r.ordinal);
+                            if (r.flags & 2 != 0) continue;
+                            const x: u64 = @bitCast(r.value);
+                            if (last == null or last.? != x) score += 1;
+                            last = x;
+                        }
+                        // NULL arguments leave their key with a present zero score.
+                        s.keep(t.heap.?, .{
+                            .key = head.key,
+                            .sum = score,
+                            .count = Group.sum_present,
+                            .first = first | (if (head.flags & 1 != 0) null_key else @as(u32, 0)),
+                        });
+                        t.group_count += 1;
+                        at = end;
+                    }
                 }
 
                 /// Partition `p`'s complete groups, of which only this worker's best H are kept.
@@ -1577,4 +1714,83 @@ fn ownerCardinalityTrial(a: std.mem.Allocator, workers: usize) !void {
         }
         try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     }
+}
+
+test "distinct owner radix keeps full pairs NULLs and earliest ties across workers and failures" {
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 7, 128 }) |h|
+        try distinctOwnerTrial(std.testing.allocator, j, h);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctOwnerTrial, .{ 1, 128 });
+    for ([_]usize{ 0, 1, 3 }) |after| {
+        spawn.injectFailureAfter(after);
+        defer spawn.resetFailure();
+        try distinctOwnerTrial(std.testing.allocator, 4, 128);
+        try std.testing.expect(spawn.failuresInjected() != 0);
+    }
+}
+
+fn distinctOwnerTrial(a: std.mem.Allocator, workers: usize, h: usize) !void {
+    const O = Owner(.sum_top, .int64);
+    const Ref = struct { key: ?i64, first: u32, values: std.AutoHashMap(i64, void) };
+    var refs: std.ArrayList(Ref) = .empty;
+    defer {
+        for (refs.items) |*ref| ref.values.deinit();
+        refs.deinit(a);
+    }
+    var budget: memory.SharedBudget = .{ .limit = 64 << 20 };
+    const state = (try O.State.initDistinctTop(
+        a,
+        &budget,
+        512,
+        workers,
+        0,
+        1,
+        .{ .k = h, .descending = true },
+        64,
+        0,
+    )) orelse return error.TestUnexpectedResult;
+    {
+        defer state.deinit();
+        const keys = [_]?i64{
+            null,    0,             1,             -1, std.math.minInt(i64), std.math.maxInt(i64),
+            1 << 48, (1 << 48) + 1, (1 << 48) - 1, 11, 37,
+        };
+        const vals = [_]i64{ std.math.minInt(i64), std.math.maxInt(i64), 0, -1, 1, 1 << 40 };
+        for (0..512) |r| {
+            const key = keys[(r * 17) % keys.len];
+            const value: ?i64 = if (key == 0 or r % 17 == 0) null else vals[(r / keys.len + r / 3) % vals.len];
+            try state.locals[r % workers].append(key, value, @intCast(r));
+            var at = refs.items.len;
+            for (refs.items, 0..) |ref, i| if (ref.key == key) {
+                at = i;
+                break;
+            };
+            if (at == refs.items.len) try refs.append(a, .{
+                .key = key,
+                .first = @intCast(r),
+                .values = std.AutoHashMap(i64, void).init(a),
+            });
+            if (value) |v| try refs.items[at].values.put(v, {});
+        }
+        try state.finish();
+        try std.testing.expectEqual(refs.items.len, state.group_count);
+        std.mem.sort(Ref, refs.items, {}, struct {
+            fn less(_: void, x: Ref, y: Ref) bool {
+                return x.values.count() > y.values.count() or
+                    (x.values.count() == y.values.count() and x.first < y.first);
+            }
+        }.less);
+        const n = @min(h, refs.items.len);
+        std.mem.sort(Ref, refs.items[0..n], {}, struct {
+            fn less(_: void, x: Ref, y: Ref) bool {
+                return x.first < y.first;
+            }
+        }.less);
+        try std.testing.expectEqual(n, state.top().len);
+        for (refs.items[0..n], state.top()) |ref, got| {
+            try std.testing.expectEqual(ref.key, got.keyValue());
+            try std.testing.expectEqual(ref.first, got.ordinal());
+            try std.testing.expectEqual(@as(i128, @intCast(ref.values.count())), O.rank(got).?);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }

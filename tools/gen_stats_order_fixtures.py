@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the statistics-order fixtures for the pruning tests in src/core/scan.zig and tools/differential.py.
+"""Generate the statistics-order fixtures for the pruning tests in src/core/scan.zig and the referee.
 
 unsigned_order.parquet: four row groups of 256 rows, 64-row pages with a page index. Every unsigned width holds values
 on both sides of its signed range, so stats or rows read as signed put them in the wrong order.

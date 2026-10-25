@@ -28,7 +28,7 @@ ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/finalize_failure.py
 if [[ $(uname -s) == Linux ]] && command -v strace >/dev/null; then
   ZPQ_LIB="$lib/libzpq.so" "$PY" tools/write_sync_check.py zig-out/bin/zpq
 fi
-# The differential corpus needs DuckDB and pyarrow (tools/differential.py), as the repository's own gate does.
+# The differential corpus needs DuckDB and pyarrow (tests/libzpq/corpus.py), as the repository's own gate does.
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/differential.py
 
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/sql_differential.py

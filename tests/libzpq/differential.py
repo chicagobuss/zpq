@@ -1,4 +1,4 @@
-"""libzpq against the CLI and the Lambda on the differential corpus (tools/differential.py), byte for byte: every
+"""libzpq against the CLI and the Lambda on the differential corpus (tests/libzpq/corpus.py), byte for byte: every
 filter x projection and filter x select written by all three must be the same file, and every filter x aggregate
 answer must have identical bytes, including numeric text and key order. The CLI and the Lambda are the built
 zig-out/bin binaries; the Lambda runs behind a
@@ -14,9 +14,10 @@ import tempfile
 import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools"))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "python"))
-import differential as corpus  # noqa: E402
+import corpus  # noqa: E402
 import duckdb  # noqa: E402
 import zpq  # noqa: E402
 

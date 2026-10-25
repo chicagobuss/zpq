@@ -109,6 +109,19 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
     deadline = time.time() + hours * 3600
     done = 0
     failures = 0
+    ref_log = ctx.run_dir / "logs" / "soak-referee-build.log"
+    print("== soak referee build", flush=True)
+    ref_rc, ref_duration = launch(
+        [ctx.zigw, "build", "-Doptimize=ReleaseSafe", "referee"],
+        stages._base_env(ctx),
+        ctx.repo,
+        ref_log,
+        heavy,
+    )
+    print(f"soak referee build rc={ref_rc} {ref_duration:.0f}s", flush=True)
+    if ref_rc != 0:
+        failures += 1
+        shutil.copy(ref_log, fail_dir / "referee-build.log")
     while True:
         if rounds is not None and done >= rounds:
             break
@@ -131,7 +144,7 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
                     str(scratch),
                 ],
             ),
-            ("differential", [ctx.python, "tools/differential.py"]),
+            ("differential", stages.referee_argv(ctx)),
             ("unit", [ctx.zigw, "build", "test", "--summary", "line", f"-j{ctx.j}"]),
             (
                 "fuzz",

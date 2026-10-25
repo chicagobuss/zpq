@@ -307,7 +307,7 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
 - `tests/libzpq/test_python.py`: the binding, its options and queued budgets, 480 calls from 16 threads, and the
   HTTP service. It also checks `close` and service shutdown with a query in flight and a keep-alive connection idle
   (no request thread may still run when the context closes), and malformed `Content-Length` values;
-- `tests/libzpq/differential.py`: the differential corpus (`tools/differential.py`) through libzpq, the CLI and the
+- `tests/libzpq/differential.py`: the differential corpus (`tests/libzpq/corpus.py`) through libzpq, the CLI and the
   Lambda. Every filter × projection and filter × select writes the same file, byte for byte, and every
   filter × aggregate gives the same `"agg"` text.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pyarrow fixtures for the tail of tools/differential.py. Paths are positional, in this order:
+"""Pyarrow fixtures for the referee tail cases. Paths are positional, in this order:
 
 cut budget plain u64 keys typed levels_dictionary levels_delta levels_delta_length legacy dense_0 dense_1 manycalls
 """

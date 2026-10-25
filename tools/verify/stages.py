@@ -76,6 +76,13 @@ def parse_modules(text):
     return {"modules": int(match.group(1)), "tests": int(match.group(2))}
 
 
+def parse_cli_tier(text):
+    match = _last(r"cli-tier: (\d+)/(\d+) checks match", text)
+    if not match:
+        return {}
+    return {"matched": int(match.group(1)), "total": int(match.group(2))}
+
+
 def parse_differential(text):
     match = _last(r"differential(?: --only \S+)?: (\d+)/(\d+) checks match", text)
     if not match:
@@ -175,11 +182,13 @@ def stage_integration(ctx: Ctx) -> Cmd:
 
 
 def stage_differential(ctx: Ctx) -> Cmd:
+    cmd = stage_referee(ctx)
     return Cmd(
-        [ctx.python, "tools/differential.py", *ctx.differential_args],
-        _base_env(ctx),
-        "row-by-row differential against DuckDB",
-        parse=parse_differential,
+        cmd.argv,
+        cmd.env,
+        "in-process differential referee against the DuckDB CLI",
+        blocked=cmd.blocked,
+        parse=cmd.parse,
     )
 
 
@@ -341,20 +350,48 @@ def stage_modules(ctx: Ctx) -> Cmd:
     return Cmd([ctx.python, "tools/check_test_modules.py"], _base_env(ctx), "test-module coverage", parse=parse_modules)
 
 
+REFEREE_CASES = [
+    "tools/runner/cases/filter_projection.json",
+    "tools/runner/cases/sql_pred.json",
+    "tools/runner/cases/agg.json",
+    "tools/runner/cases/sql_query.json",
+    "tools/runner/cases/stats_order.json",
+    "tools/runner/cases/writer_wire.json",
+    "tools/runner/cases/tail.json",
+    "tools/runner/cases/product.json",
+]
+
+
+def referee_argv(ctx: Ctx) -> list[str]:
+    argv = ["zig-out/bin/referee"]
+    for path in REFEREE_CASES:
+        argv.extend(["--cases", path])
+    argv.extend(
+        [
+            "--divergences",
+            "tests/known_divergences.json",
+            "--duckdb",
+            str(Path(ctx.duckdb)),
+            "--pyarrow",
+            ctx.python,
+        ]
+    )
+    return argv
+
+
+def stage_cli_tier(ctx: Ctx) -> Cmd:
+    return Cmd(
+        [ctx.python, "tools/runner/cli_tier.py", str(ctx.binary)],
+        _base_env(ctx),
+        "CLI argument parsing and json, jsonl, parquet formatting",
+        blocked=_need(ctx.binary, "candidate binary"),
+        parse=parse_cli_tier,
+    )
+
+
 def stage_referee(ctx: Ctx) -> Cmd:
     duck = Path(ctx.duckdb)
-    shell = (
-        f"{ctx.zigw} build referee && zig-out/bin/referee "
-        f"--cases tools/runner/cases/filter_projection.json "
-        f"--cases tools/runner/cases/sql_pred.json "
-        f"--cases tools/runner/cases/agg.json "
-        f"--cases tools/runner/cases/sql_query.json "
-        f"--cases tools/runner/cases/stats_order.json "
-        f"--cases tools/runner/cases/writer_wire.json "
-        f"--cases tools/runner/cases/tail.json "
-        f"--divergences tests/known_divergences.json "
-        f"--duckdb {duck} --pyarrow {ctx.python}"
-    )
+    shell = f"{ctx.zigw} build -Doptimize=ReleaseSafe referee && {' '.join(referee_argv(ctx))}"
     return Cmd(
         ["bash", "-c", shell],
         _base_env(ctx),
@@ -388,6 +425,7 @@ REGISTRY = [
     ("modules", ("full",), stage_modules),
     ("test-core", ("quick", "commit"), stage_test_core),
     ("build-fast", ("commit", "full"), stage_build_fast),
+    ("cli-tier", ("commit", "full"), stage_cli_tier),
     ("test-full", ("full",), stage_test_full),
     ("integration", ("full",), stage_integration),
     ("differential", ("commit", "full"), stage_differential),

@@ -44,8 +44,8 @@ def guide() -> str:
         "",
         "Tiers",
         "  quick     core unit tests (zig build test-core). The edit loop.",
-        "  commit    test-core, ReleaseFast -Drevision=HEAD -Dcpu=raptorlake, then differential.",
-        "            Extra arguments are forwarded to tools/differential.py (the affected slice).",
+        "  commit    test-core, ReleaseFast -Drevision=HEAD -Dcpu=raptorlake, a CLI tier, then",
+        "            the ReleaseSafe referee.",
         "  full      the stages listed below. Requires --base PATH, the previously integrated",
         "            binary the candidate is checked against. The path is recorded in the",
         "            summary. There is no default.",
@@ -251,6 +251,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if getattr(args, "j", 12) < 1:
         print("refusing -j below 1", file=sys.stderr)
+        return 2
+    if args.command == "commit" and list(getattr(args, "diff_args", []) or []) not in ([], ["--"]):
+        print(
+            "commit runs the full ReleaseSafe referee. A differential slice is no longer a separate script.",
+            file=sys.stderr,
+        )
         return 2
     if args.command == "full":
         if not getattr(args, "base", None):

@@ -5,7 +5,7 @@ One entry point for the 0.5.0 gate set, the seeded soak, and the scorecard ship 
 ```sh
 python tools/verify/verify.py
 python tools/verify/verify.py quick
-python tools/verify/verify.py commit -- --only sql_pred
+python tools/verify/verify.py commit
 python tools/verify/verify.py full --base /path/to/previous-zpq
 python tools/verify/verify.py soak --hours 10
 python tools/verify/verify.py perf
@@ -23,14 +23,20 @@ spill, distinct, HAVING, and top-rows), and `tools/runner/cases/stats_order.json
 writes, with pyarrow as the oracle where DuckDB trusts statistics it should not),
 and `tools/runner/cases/writer_wire.json` (re-encoded fixed-length bytes, float
 bounds, and row-group sizes, read back by pyarrow and DuckDB), and
-`tools/runner/cases/tail.json` (the rest of the differential: cut errors, memory
-budgets, exact averages, typed and decimal output, sliced writes, levels, names,
-row order, and the dense-domain matrix). A SQL predicate answers as count and sum
-at `-j` 1, 4 and 16, or refuses with one stable message. An answer must equal
-DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate. Known
-divergences and declared refusals are `tests/known_divergences.json`. The
-referee now covers `tools/differential.py`. `verify stage referee` is still an
-extra stage, beside the differential stage, until that script is retired.
+`tools/runner/cases/tail.json` (cut errors, memory budgets, exact averages, typed
+and decimal output, sliced writes, levels, names, row order, and the dense-domain
+matrix), and `tools/runner/cases/product.json` (dense product shapes, reader
+windows, selected ties, and dense-versus-legacy memory pairs). The verify stages
+build that referee with `-Doptimize=ReleaseSafe`. A SQL predicate answers as count
+and sum at `-j` 1, 4 and 16, or refuses with one stable message. An answer must
+equal DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate.
+Known divergences and declared refusals are `tests/known_divergences.json`.
+`commit` and `full` run this referee as the differential stage. `cli-tier` runs a
+handful of cases through `zig-out/bin/zpq` so argument parsing and json, jsonl,
+and parquet formatting stay covered. `tools/triangulate.py`,
+`tests/libzpq/differential.py`, and `tests/handoff/run.py` are still separate
+gates: the referee does not drive Hardwood, the libzpq/Lambda byte compare, or
+the Python hand-off.
 
 No arguments prints the tiers, every stage, and the exit codes. A run writes
 `summary.json` under `~/code/zpq-wt/verify-v2-out/<run-id>/`. The writer refuses

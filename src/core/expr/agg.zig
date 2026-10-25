@@ -1636,7 +1636,7 @@ pub fn updateOne(
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
     if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel)) return;
-    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, true, false);
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, true);
     defer input.deinit(arena);
     const sel = input.selection();
     const values = input.values;
@@ -1913,9 +1913,20 @@ const PreparedAggInput = struct {
         batch: *const filter_eval.Batch,
         column_lookup: []const ?usize,
         outer_sel: *const filter_selection.SelectionVector,
+        rowless: bool,
+    ) Error!PreparedAggInput {
+        return initWidth(arena, call, batch, column_lookup, outer_sel, rowless, false);
+    }
+
+    fn initWidth(
+        arena: std.mem.Allocator,
+        call: AggCall,
+        batch: *const filter_eval.Batch,
+        column_lookup: []const ?usize,
+        outer_sel: *const filter_selection.SelectionVector,
         /// A fold over the selected values alone (not by row, as a grouped fold is) lets `evalArg` gather rows.
         rowless: bool,
-        comptime physical_integer: bool,
+        physical_integer: bool,
     ) Error!PreparedAggInput {
         var in: PreparedAggInput = .{ .outer_sel = outer_sel };
         errdefer in.deinit(arena);
@@ -2009,7 +2020,7 @@ const PreparedAggInput = struct {
         batch: *const filter_eval.Batch,
         column_lookup: []const ?usize,
         c: expr_ast.ColRef,
-        comptime physical_integer: bool,
+        physical_integer: bool,
     ) Error!void {
         const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
         const raw = batch.cols[pos];
@@ -3096,7 +3107,7 @@ test "prepared aggregate input owns its widened copy and nothing it borrows" {
 
     const narrow_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
     const sum_narrow: AggCall = .{ .func = .sum, .arg = narrow_arg, .where = null, .alias = "s", .result = .i64 };
-    var widened: PreparedAggInput = try .init(a, sum_narrow, &batch, &lookup, &sel, true, false);
+    var widened: PreparedAggInput = try .init(a, sum_narrow, &batch, &lookup, &sel, true);
     try testing.expect(widened.values_owned);
     try testing.expect(widened.own_sel == null);
     try testing.expectEqual(&sel, widened.selection());
@@ -3107,7 +3118,7 @@ test "prepared aggregate input owns its widened copy and nothing it borrows" {
 
     const wide_arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
     const sum_wide: AggCall = .{ .func = .sum, .arg = wide_arg, .where = null, .alias = "s", .result = .i64 };
-    var borrowed: PreparedAggInput = try .init(a, sum_wide, &batch, &lookup, &sel, true, false);
+    var borrowed: PreparedAggInput = try .init(a, sum_wide, &batch, &lookup, &sel, true);
     defer borrowed.deinit(a);
     try testing.expect(!borrowed.values_owned);
     try testing.expectEqual(@as([*]const i64, &wide), borrowed.values.?.i64.values.ptr);
@@ -5251,7 +5262,7 @@ pub fn updateOneGrouped(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, false, false);
+    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, false);
     defer input.deinit(arena);
     try updateOneGroupedValues(
         arena,
@@ -5291,7 +5302,7 @@ pub fn updateTableGrouped(
         outer,
     );
     if (table.compact.fields[i].shared_sum) return;
-    var input: PreparedAggInput = try .init(arena, calls[i], batch, lookup, outer, false, true);
+    var input: PreparedAggInput = try .initWidth(arena, calls[i], batch, lookup, outer, false, true);
     defer input.deinit(arena);
     table.compact.foldRows(i, input.values, input.selection(), ids, null, calls[i].offset);
 }
@@ -5397,10 +5408,15 @@ pub fn prepareGrouped(
     var n: usize = 0;
     errdefer for (mem[0..n]) |*p| p.deinit(arena);
     for (calls) |call| {
-        mem[n] = if (physical_integer)
-            try PreparedAggInput.init(arena, call, batch, column_lookup, outer_sel, false, true)
-        else
-            try PreparedAggInput.init(arena, call, batch, column_lookup, outer_sel, false, false);
+        mem[n] = try PreparedAggInput.initWidth(
+            arena,
+            call,
+            batch,
+            column_lookup,
+            outer_sel,
+            false,
+            physical_integer,
+        );
         n += 1;
     }
     return .{ .mem = mem, .arena = arena };

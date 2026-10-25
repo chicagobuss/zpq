@@ -85,6 +85,18 @@ pub const Axis = struct {
         return true;
     }
 
+    // Whole UINT32 code decode zero-extends the dictionary to i64; slices retain physical i32 bits.
+    fn sameUnsigned32Dictionary(d: *const Axis, col: Column, trans: []const u32) bool {
+        if (col != .i64 or d.values != .int32) return d.sameDictionary(col, trans);
+        if (trans.len != col.dictLen() + 1 or trans[trans.len - 1] != d.len()) return false;
+        const values = d.values.int32;
+        for (col.i64.dict, trans[0..col.dictLen()]) |value, id| {
+            if (id >= values.len or value < 0 or value > std.math.maxInt(u32)) return false;
+            if (@as(u32, @truncate(values[id])) != @as(u64, @intCast(value))) return false;
+        }
+        return true;
+    }
+
     fn dictionary(d: *const Axis, arena: std.mem.Allocator) !Column {
         return switch (d.values) {
             .int64 => |values| .{ .i64 = .{ .values = &.{}, .dict = @ptrCast(values) } },
@@ -162,7 +174,11 @@ pub const Domain = struct {
             const trans = axis.forRowGroup(file, rg) orelse return false;
             const pos = lookup[key.col_ref.col_idx] orelse return false;
             const col = batch.cols[pos];
-            if (col.nullInfo().max_rep != 0 or !axis.sameDictionary(col, trans)) return false;
+            const same = if (key.col_ref.unsigned_32)
+                axis.sameUnsigned32Dictionary(col, trans)
+            else
+                axis.sameDictionary(col, trans);
+            if (col.nullInfo().max_rep != 0 or !same) return false;
             const codes = col.codes() orelse return false;
             const ni = col.nullInfo();
             if (codes.len < batch.num_rows) return error.BadColumn;
@@ -1070,4 +1086,55 @@ test "packed identities check product overflow and distinguish NULL from every c
     try std.testing.expectEqual(@as(usize, 0), try productId(bindings, 1, true));
     try std.testing.expectEqual(@as(usize, 2), try productId(bindings, 2, true));
     try std.testing.expectError(error.BadColumn, productId(bindings, 2, false));
+}
+
+test "packed unsigned32 axes bind exact widened and physical dictionary codes" {
+    // The retained union stores sign-extended physical i32 bits, not the zero-extended logical value.
+    var values = [_]u64{ @bitCast(@as(i64, std.math.minInt(i32))), @bitCast(@as(i64, -1)), 0 };
+    var translation = [_]u32{ 2, 0, 1, 3 };
+    var translations = [_][]u32{&translation};
+    var file_base = [_]usize{0};
+    var axes = [_]Axis{.{
+        .values = .{ .int32 = &values },
+        .trans = &translations,
+        .file_base = &file_base,
+        .bytes = 0,
+    }};
+    var domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    var key: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT32,
+        .expr_type = .i64,
+        .unsigned_32 = true,
+    } };
+    const codes = [_]u32{ 0, 1, 2, 0 };
+    const defs = [_]u32{ 1, 1, 1, 0 };
+    var wide = [_]i64{ 0, 1 << 31, std.math.maxInt(u32) };
+    const physical = [_]i32{ 0, std.math.minInt(i32), -1 };
+    var bindings: [1]CountAxis = undefined;
+    var batch: filter_eval.Batch = .{ .num_rows = codes.len, .cols = &.{.{ .i64 = .{
+        .values = &.{},
+        .dict = &wide,
+        .codes = &codes,
+        .def_levels = &defs,
+        .max_def = 1,
+    } }} };
+    try std.testing.expect(try domain.bind((&key)[0..1], 0, 0, &batch, &.{0}, &bindings));
+    for ([_]usize{ 2, 0, 1, 3 }, 0..) |id, r| try std.testing.expectEqual(id, try productId(bindings, r, true));
+    wide[1] += 1;
+    try std.testing.expect(!try domain.bind((&key)[0..1], 0, 0, &batch, &.{0}, &bindings));
+    wide[1] = @as(i64, 1) << 32;
+    try std.testing.expect(!try domain.bind((&key)[0..1], 0, 0, &batch, &.{0}, &bindings));
+    wide[1] = @as(i64, 1) << 31;
+    key.col_ref.unsigned_32 = false;
+    try std.testing.expect(!try domain.bind((&key)[0..1], 0, 0, &batch, &.{0}, &bindings));
+    key.col_ref.unsigned_32 = true;
+    batch.cols = &.{.{ .i32 = .{
+        .values = &.{},
+        .dict = &physical,
+        .codes = &codes,
+        .def_levels = &defs,
+        .max_def = 1,
+    } }};
+    try std.testing.expect(try domain.bind((&key)[0..1], 0, 0, &batch, &.{0}, &bindings));
 }

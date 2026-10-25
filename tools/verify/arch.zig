@@ -266,7 +266,8 @@ const Runner = struct {
             const parsed = try std.json.parseFromSlice(std.json.Value, self.a, try self.duck(sql), .{});
             return !parsed.value.array.items[0].object.get("bad").?.bool;
         }
-        const description = try std.json.parseFromSlice(std.json.Value, self.a, try self.duck(try self.text("DESCRIBE {s}", .{try self.caseSql(c)})), .{});
+        const describe_sql = try self.text("DESCRIBE {s}", .{try self.caseSql(c)});
+        const description = try std.json.parseFromSlice(std.json.Value, self.a, try self.duck(describe_sql), .{});
         const types = description.value.array.items;
         const zrows = try parseRows(self.a, try self.read(zpath), true);
         const rrows = try parseRows(self.a, try self.read(output), false);
@@ -770,7 +771,11 @@ test "budget stop reports actual reps and null for missing samples" {
 test "integer precision and text bytes cannot use numeric tolerance" {
     try std.testing.expect(!same(.{ .integer = 9007199254740993 }, .{ .integer = 9007199254740992 }, 1e-4));
     try std.testing.expect(!same(.{ .string = "01001" }, .{ .string = "1001" }, 1e-4));
-    try std.testing.expect(!same(.{ .number_string = "12345678901234567890123456789.01" }, .{ .number_string = "12345678901234567890123456789.02" }, 1e-4));
+    try std.testing.expect(!same(
+        .{ .number_string = "12345678901234567890123456789.01" },
+        .{ .number_string = "12345678901234567890123456789.02" },
+        1e-4,
+    ));
     try std.testing.expect(same(.{ .number_string = "1.10" }, .{ .number_string = "1.1" }, 0));
 }
 
@@ -778,7 +783,9 @@ test "schema preserves decimal tokens and restricts float tolerance to float col
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const types = (try std.json.parseFromSlice(std.json.Value, a, "[{\"column_type\":\"DECIMAL(38,2)\"},{\"column_type\":\"VARCHAR\"},{\"column_type\":\"DOUBLE\"}]", .{})).value.array.items;
+    const schema = "[{\"column_type\":\"DECIMAL(38,2)\"}," ++
+        "{\"column_type\":\"VARCHAR\"},{\"column_type\":\"DOUBLE\"}]";
+    const types = (try std.json.parseFromSlice(std.json.Value, a, schema, .{})).value.array.items;
     const z = try parseRows(a, "{\"d\":12345678901234567890123456789.01,\"s\":\"01001\",\"f\":1.00001}\n", true);
     const d = try parseRows(a, "[[\"12345678901234567890123456789.01\",\"01001\",1.00002]]", false);
     try typeRows(z, types);

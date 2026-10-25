@@ -93,6 +93,20 @@ class TestStageAccountingTest(unittest.TestCase):
             (repo / "fixture.parquet").touch()
             self.assertEqual(stages.skip_allowances(repo, "test-full"), {})
 
+    def test_cpu_skip_allowance_requires_known_missing_feature(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            policy = repo / "tools/verify/skip_policy.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(json.dumps({"waivers": [{"test": "AVX test", "stages": ["test-full"],
+                "missing_cpu_flags": ["avx512f"], "reason": "AVX-512 unavailable"}]}))
+            with patch.object(stages, "cpu_flags", return_value=set()):
+                self.assertEqual(stages.skip_allowances(repo, "test-full"), {"AVX test": "AVX-512 unavailable"})
+            with patch.object(stages, "cpu_flags", return_value={"avx512f"}):
+                self.assertEqual(stages.skip_allowances(repo, "test-full"), {})
+            with patch.object(stages, "cpu_flags", return_value=None):
+                self.assertEqual(stages.skip_allowances(repo, "test-full"), {})
+
     def test_soak_unit_round_uses_the_same_nonempty_accounting(self):
         with tempfile.TemporaryDirectory() as d:
             ctx = verify.dummy_ctx()

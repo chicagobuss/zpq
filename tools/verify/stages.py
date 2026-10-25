@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import platform
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -155,7 +156,8 @@ def _python(ctx: Ctx, script: str, about: str, *args, needs=(), parse=None) -> C
 
 
 def stage_test_core(ctx: Ctx) -> Cmd:
-    return Cmd(_zig_build(ctx, "test-core", "-Dobserve-tests=true", "--summary", "all"), _base_env(ctx), "core unit tests", parse=parse_tests)
+    return Cmd(_zig_build(ctx, "test-core", "-Dobserve-tests=true", "--summary", "all"),
+               _base_env(ctx), "core unit tests", parse=parse_tests)
 
 
 def stage_build_fast(ctx: Ctx) -> Cmd:
@@ -172,7 +174,8 @@ def stage_build_fast(ctx: Ctx) -> Cmd:
 
 
 def stage_test_full(ctx: Ctx) -> Cmd:
-    return Cmd(_zig_build(ctx, "test", "-Dobserve-tests=true", "--summary", "all"), _base_env(ctx), "unit tests", parse=parse_tests)
+    return Cmd(_zig_build(ctx, "test", "-Dobserve-tests=true", "--summary", "all"),
+               _base_env(ctx), "unit tests", parse=parse_tests)
 
 
 def stage_integration(ctx: Ctx) -> Cmd:
@@ -449,14 +452,33 @@ def describe(name: str, ctx: Ctx) -> Cmd:
     return command
 
 
+def cpu_flags() -> set[str] | None:
+    if platform.machine().lower() not in ("x86_64", "amd64", "i386", "i686"):
+        return set()
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("flags"):
+                return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return None
+
+
 def skip_allowances(repo: Path, stage: str) -> dict[str, str]:
     policy = json.loads((repo / "tools/verify/skip_policy.json").read_text())
     allowed = {}
     for waiver in policy["waivers"]:
-        if stage not in waiver["stages"] or not all(not (repo / p).exists() for p in waiver["missing"]):
+        missing, flags = waiver.get("missing", []), waiver.get("missing_cpu_flags", [])
+        if not waiver["reason"] or not (missing or flags):
+            raise ValueError("skip waiver needs a reason and a verifiable condition")
+        if stage not in waiver["stages"] or any((repo / p).exists() for p in missing):
             continue
-        if waiver["test"] in allowed or not waiver["reason"] or not waiver["missing"]:
-            raise ValueError("invalid or duplicate skip waiver")
+        if flags:
+            available = cpu_flags()
+            if available is None or any(flag in available for flag in flags):
+                continue
+        if waiver["test"] in allowed:
+            raise ValueError("duplicate skip waiver")
         allowed[waiver["test"]] = waiver["reason"]
     return allowed
 

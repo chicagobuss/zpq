@@ -45,6 +45,14 @@ class RowAdapterTest(unittest.TestCase):
                 patch.object(answer_cmp, "duck_rows", return_value=(want, ["d", "k"], ["exact", None])):
             answer_cmp.cmd_usame(args)
 
+    def test_unordered_float_rows_share_the_canonical_bucket_before_pairing(self):
+        args = argparse.Namespace(zpq="unused")
+        got = [{"v": Decimal("1.0000001"), "k": "b"}, {"v": Decimal("1.0000002"), "k": "a"}]
+        want = [(1.0000002, "b"), (1.0000001, "a")]
+        with patch.object(answer_cmp, "load_zpq", return_value=got), \
+                patch.object(answer_cmp, "duck_rows", return_value=(want, ["v", "k"], [None, None])):
+            answer_cmp.cmd_usame(args)
+
     def test_dense_rows_follow_oracle_column_names(self):
         args = argparse.Namespace(zpq="unused")
         with patch.object(answer_cmp, "load_zpq", return_value=[{"b": 2, "a": 1}]), \

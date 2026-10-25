@@ -777,14 +777,79 @@ fn evalBinOp(
 // Exact DECIMAL
 // ============================================================
 
+/// Whole-batch exact CSE. Evaluate roots on demand in aggregate order: fallible expression trees cannot be
+/// evaluated window-first without changing which error wins. Operand normalization stays left-before-right.
+pub const ExactPlan = struct {
+    nodes: std.ArrayList(Node) = .empty,
+    const Node = struct { expr: ast.Expr, value: ?Batch.Column = null };
+
+    pub fn add(
+        self: *ExactPlan,
+        a: std.mem.Allocator,
+        batch: *const Batch,
+        lookup: []const ?usize,
+        e: ast.Expr,
+    ) std.mem.Allocator.Error!?usize {
+        for (self.nodes.items, 0..) |node, i| if (node.expr.eql(e)) return i;
+        switch (e) {
+            .literal => |l| if (l == .str or l == .f64) return null,
+            .col_ref => |c| {
+                if (c.expr_type != .dec and c.expr_type != .i64) return null;
+                if (c.unsigned_64 or c.unsigned_32) return null;
+                const col = batch.cols[lookup[c.col_idx] orelse return null];
+                if (col.codes() != null or col.levelsOnly() or col.nullInfo().max_rep != 0) return null;
+            },
+            .binop => |b| {
+                if (b.result_type != .dec or b.op == .div or b.op == .concat) return null;
+                _ = (try self.add(a, batch, lookup, b.left.*)) orelse return null;
+                _ = (try self.add(a, batch, lookup, b.right.*)) orelse return null;
+            },
+            else => return null,
+        }
+        try self.nodes.append(a, .{ .expr = e });
+        return self.nodes.items.len - 1;
+    }
+
+    pub fn evaluate(
+        self: *ExactPlan,
+        a: std.mem.Allocator,
+        batch: *const Batch,
+        lookup: []const ?usize,
+        root: usize,
+    ) Error!Batch.Column {
+        if (self.nodes.items[root].value) |v| return v;
+        const e = self.nodes.items[root].expr;
+        const v = if (e == .binop)
+            try decBinOpLaneCached(a, batch, lookup, e.binop, self)
+        else if (e == .col_ref and e.typeOf() == .dec)
+            try exactColumn(batch.cols[lookup[e.col_ref.col_idx] orelse return error.BadColumn])
+        else
+            try evalGroupKeyExpr(a, batch, lookup, e);
+        self.nodes.items[root].value = v;
+        return v;
+    }
+
+    fn operand(
+        self: *ExactPlan,
+        a: std.mem.Allocator,
+        batch: *const Batch,
+        lookup: []const ?usize,
+        e: ast.Expr,
+    ) Error!Batch.Column {
+        for (self.nodes.items, 0..) |node, i| if (node.expr.eql(e)) return self.evaluate(a, batch, lookup, i);
+        unreachable;
+    }
+};
+
 /// A decoded DECIMAL column's exact values under its null layout, in the lane of the width they were decoded at
 /// (`.i32`, `.i64` or `.i128`, borrowed); refused, not approximated, when it has none.
 pub fn exactColumn(col: Batch.Column) Error!Batch.Column {
     switch (col) {
         .i128 => return col,
-        .f64 => |c| {
+        inline .f64, .i32, .i64 => |c, physical_tag| {
             if (c.max_rep > 0) return error.NestedNotSupported;
-            const u = c.unscaled orelse return error.DecimalUnavailable;
+            const u = c.unscaled orelse
+                return if (physical_tag == .f64) error.DecimalUnavailable else error.TypeMismatch;
             return switch (u) {
                 inline else => |vals, tag| @unionInit(Batch.Column, @tagName(tag), .{
                     .values = vals,
@@ -885,12 +950,13 @@ const DecOperand = union(enum) {
 };
 
 /// `e` as an exact operand at `scale`, and its null layout.
-fn decOperand(
+fn decOperandCached(
     arena: std.mem.Allocator,
     batch: *const Batch,
     column_lookup: []const ?usize,
     e: ast.Expr,
     scale: u8,
+    plan: ?*ExactPlan,
 ) Error!struct { op: DecOperand, nulls: ?Batch.Column } {
     if (e == .literal) {
         const one = try decColumnAt(arena, try literalAsColumn(arena, e.literal, 1), e, scale, null);
@@ -899,7 +965,9 @@ fn decOperand(
     // A DECIMAL column is read from the decoder's integers, a DECIMAL binop at its narrowest lane; anything else is
     // evaluated first.
     var raw: Batch.Column = undefined;
-    if (e == .col_ref and e.typeOf() == .dec) {
+    if (plan) |p| {
+        raw = try p.operand(arena, batch, column_lookup, e);
+    } else if (e == .col_ref and e.typeOf() == .dec) {
         const col = batch.cols[column_lookup[e.col_ref.col_idx] orelse return error.BadColumn];
         raw = try exactColumn(col);
     } else if (e == .binop and e.binop.result_type == .dec) {
@@ -957,14 +1025,24 @@ fn decBinOpLane(
     column_lookup: []const ?usize,
     b: ast.BinOp,
 ) Error!Batch.Column {
+    return decBinOpLaneCached(arena, batch, column_lookup, b, null);
+}
+
+fn decBinOpLaneCached(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    b: ast.BinOp,
+    plan: ?*ExactPlan,
+) Error!Batch.Column {
     const spec = b.dec.?;
     const lhs_scale, const rhs_scale = switch (b.op) {
         .add, .sub => .{ spec.scale, spec.scale },
         .mul => .{ b.left.decSpec().?.scale, b.right.decSpec().?.scale },
         .div, .concat => unreachable,
     };
-    const l = try decOperand(arena, batch, column_lookup, b.left.*, lhs_scale);
-    const r = try decOperand(arena, batch, column_lookup, b.right.*, rhs_scale);
+    const l = try decOperandCached(arena, batch, column_lookup, b.left.*, lhs_scale, plan);
+    const r = try decOperandCached(arena, batch, column_lookup, b.right.*, rhs_scale, plan);
     const n = batch.num_rows;
     const bound: u128 = @intCast(spec.bound());
     // `+` and `-` first bring both sides to their common type, as the SQL engines cast them: a value that does not
@@ -988,6 +1066,35 @@ fn decBinOpLane(
         const is_null = (l.nulls != null and rowIsNull(l.nulls.?, i)) or (r.nulls != null and rowIsNull(r.nulls.?, i));
         dv.* = @intFromBool(!is_null);
     };
+    // A physical int64 result also fits every logical precision above 18. A failed checked lane retries the
+    // canonical wide kernel before any root reaches an aggregate; NULL and inactive overflow remain non-errors.
+    if (plan != null and spec.precision > 18) {
+        switch (b.op) {
+            inline .add, .sub, .mul => |op| switch (l.op) {
+                inline .scalar, .i64 => |lv, lt| switch (r.op) {
+                    inline .scalar, .i64 => |rv, rt| {
+                        const ls = if (lt == .scalar) std.math.cast(i64, lv) else @as(?i64, 0);
+                        const rs = if (rt == .scalar) std.math.cast(i64, rv) else @as(?i64, 0);
+                        if (ls != null and rs != null) {
+                            const out = try arena.alloc(i64, n);
+                            if (decChecked64(op, lt, rt, lv, rv, out, def, operand_bound, batch.sel)) {
+                                return .{ .i64 = .{
+                                    .values = out,
+                                    .def_levels = def,
+                                    .max_def = if (def != null) 1 else 0,
+                                    .has_nulls = def != null,
+                                } };
+                            }
+                            arena.free(out);
+                        }
+                    },
+                    else => {},
+                },
+                else => {},
+            },
+            else => unreachable,
+        }
+    }
     // Under 10^18 every value fits i64, which the bound check enforces.
     const narrow = spec.precision <= 18;
     switch (b.op) {
@@ -1010,6 +1117,44 @@ fn decBinOpLane(
         .div, .concat => unreachable,
     }
     unreachable;
+}
+
+fn decChecked64(
+    comptime op: ast.Op,
+    comptime lt: std.meta.Tag(DecOperand),
+    comptime rt: std.meta.Tag(DecOperand),
+    l: anytype,
+    r: anytype,
+    out: []i64,
+    def: ?[]const u32,
+    operand_bound: u128,
+    sel: ?*const selection.SelectionVector,
+) bool {
+    for (out, 0..) |*v, i| {
+        if (def != null and def.?[i] == 0) {
+            v.* = 0;
+            continue;
+        }
+        const x: i64 = if (lt == .scalar) @intCast(l) else l[i];
+        const y: i64 = if (rt == .scalar) @intCast(r) else r[i];
+        const result = switch (op) {
+            .add => @addWithOverflow(x, y),
+            .sub => @subWithOverflow(x, y),
+            .mul => @mulWithOverflow(x, y),
+            else => comptime unreachable,
+        };
+        if (result[1] != 0 or (op != .mul and (@as(u128, @abs(x)) >= operand_bound or
+            @as(u128, @abs(y)) >= operand_bound)))
+        {
+            if (sel != null and !sel.?.isActive(i)) {
+                v.* = 0;
+                continue;
+            }
+            return false;
+        }
+        v.* = result[0];
+    }
+    return true;
 }
 
 /// Row `i` of an operand, unscaled at the binop's scale.
@@ -2494,4 +2639,89 @@ test "float DAG batches propagate independent FLOAT and DOUBLE nulls through sha
             );
         };
     }
+}
+
+test "exact DAG checks physical overflow and shares subexpressions without widening small roots" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exactDagTrial, .{});
+}
+
+fn exactDagTrial(gpa: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var xvals = [_]i64{ 10, 20, 30, 40 };
+    var yvals = [_]i64{ 2, 3, 4, 5 };
+    const defs = [_]u32{ 1, 1, 0, 1 };
+    const cols = [_]Batch.Column{
+        .{ .f64 = .{
+            .values = &.{ 10, 20, 30, 40 },
+            .unscaled = .{ .i64 = &xvals },
+            .def_levels = &defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+        .{ .f64 = .{ .values = &.{ 2, 3, 4, 5 }, .unscaled = .{ .i64 = &yvals } } },
+    };
+    var sel = try selection.SelectionVector.init(a, 4);
+    defer sel.deinit();
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4, .sel = &sel };
+    const lookup = [_]?usize{ 0, 1 };
+    var x: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .dec, .dec = .{
+        .precision = 15,
+        .scale = 0,
+    } } };
+    var y: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .dec, .dec = .{
+        .precision = 15,
+        .scale = 0,
+    } } };
+    var product: ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &x,
+        .right = &y,
+        .result_type = .dec,
+        .dec = .{ .precision = 31, .scale = 0 },
+        .depth = 2,
+    } };
+    const twice: ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &product,
+        .right = &product,
+        .result_type = .dec,
+        .dec = .{ .precision = 32, .scale = 0 },
+        .depth = 3,
+    } };
+    var plan: ExactPlan = .{};
+    const root = (try plan.add(a, &batch, &lookup, product)).?;
+    const top = (try plan.add(a, &batch, &lookup, twice)).?;
+    try std.testing.expectEqual(@as(usize, 4), plan.nodes.items.len);
+    const narrow = try plan.evaluate(a, &batch, &lookup, root);
+    try std.testing.expect(narrow == .i64);
+    try std.testing.expectEqualSlices(i64, &.{ 20, 60, 0, 200 }, narrow.i64.values);
+    const both = try plan.evaluate(a, &batch, &lookup, top);
+    try std.testing.expectEqualSlices(i64, &.{ 40, 120, 0, 400 }, both.i64.values);
+    try std.testing.expectEqual(
+        @intFromPtr(narrow.i64.values.ptr),
+        @intFromPtr((try plan.evaluate(a, &batch, &lookup, root)).i64.values.ptr),
+    );
+    // A checked physical overflow retries wide, preserving a logical DECIMAL(31,0) result.
+    xvals[0] = 1 << 40;
+    yvals[0] = 1 << 30;
+    for (plan.nodes.items) |*node| node.value = null;
+    const wide = try plan.evaluate(a, &batch, &lookup, root);
+    try std.testing.expect(wide == .i128);
+    try std.testing.expectEqual(@as(i128, 1) << 70, wide.i128.values[0]);
+    const canonical = try evalExpr(a, &batch, &lookup, product);
+    try std.testing.expectEqualDeep(canonical, wide);
+    // Overflowing unselected and NULL rows cannot become new errors or force the wide fallback.
+    sel.set(0, false);
+    xvals[2] = std.math.maxInt(i64);
+    yvals[2] = std.math.maxInt(i64);
+    for (plan.nodes.items) |*node| node.value = null;
+    try std.testing.expect((try plan.evaluate(a, &batch, &lookup, root)) == .i64);
+    sel.set(0, true);
+    xvals[0] = std.math.maxInt(i64);
+    yvals[0] = std.math.maxInt(i64);
+    for (plan.nodes.items) |*node| node.value = null;
+    try std.testing.expectError(error.DecimalOverflow, plan.evaluate(a, &batch, &lookup, root));
+    try std.testing.expectError(error.DecimalOverflow, evalExpr(a, &batch, &lookup, product));
 }

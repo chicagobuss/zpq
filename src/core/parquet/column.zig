@@ -135,6 +135,8 @@ pub const DecodeOptions = struct {
     /// Keep codes however near-unique the dictionary: a key folded by a retained domain translates its codes, so
     /// they never cost per-entry work (`agg_dense`).
     any_dictionary: bool = false,
+    /// Exact aggregate operands need their annotated physical integers; request a scaled view only for float users.
+    decimal_exact_only: bool = false,
     /// The most bytes one chunk's pages may inflate to (`PageReader.byte_limit`); set per chunk from its footer.
     page_bytes_limit: usize = std.math.maxInt(usize),
     /// The most bytes one page's DELTA_BYTE_ARRAY values may expand to: the query's memory budget, which a page past

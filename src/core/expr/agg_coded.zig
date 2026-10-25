@@ -90,7 +90,8 @@ fn widenDict(arena: std.mem.Allocator, col: Column, c: expr_ast.ColRef) Error!Co
         .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, d) } },
         .str => d,
         .dec => switch (col) {
-            .f64 => |f| switch (f.dict_unscaled orelse return error.DecimalUnavailable) {
+            inline .f64, .i32, .i64 => |f, physical_tag| switch (f.dict_unscaled orelse
+                return if (physical_tag == .f64) error.DecimalUnavailable else error.TypeMismatch) {
                 inline else => |vals, tag| @unionInit(Column, @tagName(tag), .{ .values = vals }),
             },
             else => error.TypeMismatch,
@@ -603,6 +604,7 @@ pub fn groupedCoded(
         if (table.countOnly()) return true;
         break :blk &sunk;
     } else sel;
+    if (try foldExactBatch(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     if (try foldFloatBatches(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     const agg_len = calls.len;
     for (calls, 0..) |call, ai| {
@@ -711,6 +713,102 @@ fn seedable(ra: std.mem.Allocator, gid_of: []const u32) !bool {
     if (gids.items.len < 2) return true;
     std.mem.sortUnstable(u32, gids.items, {}, std.sort.asc(u32));
     for (gids.items[1..], gids.items[0 .. gids.items.len - 1]) |a, b| if (a == b) return false;
+    return true;
+}
+
+/// Exact roots stay whole-batch and call-major. Per-root SUM/count deltas can feed SUM and AVG without copying
+/// accumulated state: a group may already contain contributions from earlier row groups or statistics shortcuts.
+fn foldExactBatch(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    table: *agg.GroupTable,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) !bool {
+    if (table.compact.stride != 0) return false;
+    var computed = false;
+    for (calls) |call| {
+        if (call.where != null or call.offset != 0 or call.func == .count_distinct) return false;
+        if (call.arg) |arg| {
+            if (arg.typeOf() != .dec) return false;
+            computed = computed or arg == .binop;
+        } else if (call.func != .count) return false;
+    }
+    if (!computed) return false;
+    var plan: expr_eval.ExactPlan = .{};
+    const roots = try ra.alloc(?usize, calls.len);
+    for (calls, roots) |call, *root| {
+        root.* = if (call.arg) |arg| (try plan.add(ra, batch, lookup, arg)) orelse return false else null;
+    }
+    const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+    @memset(partials, null);
+    const restricted = batch.restrictedTo(outer);
+    for (calls, roots, 0..) |call, root, ai| {
+        if (root) |r| {
+            const v = try plan.evaluate(ra, &restricted, lookup, r);
+            if (call.func == .sum or call.func == .avg) {
+                if (partials[r] == null) {
+                    const delta = try ra.alloc(agg.DecSum, space);
+                    @memset(delta, .{});
+                    switch (v) {
+                        inline .i32, .i64, .i128 => |col| for (comp, 0..) |cp, row| {
+                            if (!outer.isActive(row) or (col.def_levels != null and
+                                col.def_levels.?[row] < col.max_def)) continue;
+                            delta[cp].add(col.values[row], 1);
+                        },
+                        else => return error.TypeMismatch,
+                    }
+                    partials[r] = delta;
+                }
+                for (partials[r].?, gid_of) |delta, gid| {
+                    if (delta.n == 0) continue;
+                    const acc = &table.accumulators.items[gid * calls.len + ai];
+                    switch (acc.*) {
+                        .sum_d, .avg_d => |*d| d.add(delta.get(), delta.n),
+                        else => return error.UnsupportedAggType,
+                    }
+                }
+                continue;
+            }
+            try foldGroupedValue(
+                ra,
+                gpa,
+                table.accumulators.items,
+                gid_of,
+                comp,
+                space,
+                ai,
+                calls.len,
+                call,
+                batch,
+                lookup,
+                outer,
+                table,
+                v,
+            );
+        } else {
+            try foldGroupedCall(
+                ra,
+                gpa,
+                table.accumulators.items,
+                gid_of,
+                comp,
+                space,
+                ai,
+                calls.len,
+                call,
+                batch,
+                lookup,
+                outer,
+                table,
+            );
+        }
+    }
     return true;
 }
 

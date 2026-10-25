@@ -320,6 +320,35 @@ pub fn decodeColumnAsF64WithOptions(
 /// A DECIMAL column as `decodeColumnAsF64WithOptions` decodes it, plus its exact unscaled integers in `unscaled`
 /// (see `filter_eval.ColumnT.unscaled`). The f64 view converts those same integers the same way, so it is bit for bit
 /// what the f64 decode gives and filters see no change. A nested column gets no exact view: nothing exact reads one.
+/// Consumer-selected exact physical view. Other consumers retain the established scaled/exact pair.
+pub fn decodeAggregateColumn(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+    options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
+) Error!filter_eval.Batch.Column {
+    if (options.decimal_exact_only and levels.max_rep == 0) switch (kind.physical) {
+        inline .INT32, .INT64 => |phys| {
+            const T = if (phys == .INT32) i32 else i64;
+            var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, options, scratch);
+            const raw = try readAll(T, &reader, num_leaves);
+            return @unionInit(filter_eval.Batch.Column, @typeName(T), .{
+                .values = raw.values,
+                .def_levels = raw.def_levels,
+                .max_def = @intCast(levels.max_def),
+                .has_nulls = raw.has_nulls,
+                .unscaled = @unionInit(filter_eval.Exact, @typeName(T), raw.values),
+            });
+        },
+        else => {},
+    };
+    return .{ .f64 = try decodeColumnExact(arena, chunk, codec, levels, num_leaves, kind, options, scratch) };
+}
+
 pub fn decodeColumnExact(
     arena: std.mem.Allocator,
     chunk: []const u8,

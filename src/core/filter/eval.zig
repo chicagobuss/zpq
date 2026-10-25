@@ -509,14 +509,21 @@ pub fn evaluate(
             evalLeaf(f64, col.f64.values, col.f64.def_levels, col.f64.max_def, leaf.op, leaf.value, sel);
         },
         .decimal => |leaf| {
-            const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
-            const col = batch.cols[col_pos];
-            if (col != .f64) return error.TypeMismatch;
-            try rejectIfNested(col.f64);
-            switch (col.f64.unscaled orelse return error.DecimalUnavailable) {
-                inline else => |v| {
-                    evalLeafExact(@TypeOf(v[0]), v, col.f64.def_levels, col.f64.max_def, leaf.op, leaf.value, sel);
+            const col = batch.cols[column_lookup[leaf.col_idx] orelse return error.BadColumn];
+            switch (col) {
+                inline .f64, .i32, .i64 => |c, tag| {
+                    try rejectIfNested(c);
+                    const exact = c.unscaled orelse return if (tag == .f64)
+                        error.DecimalUnavailable
+                    else
+                        error.TypeMismatch;
+                    switch (exact) {
+                        inline else => |v| {
+                            evalLeafExact(@TypeOf(v[0]), v, c.def_levels, c.max_def, leaf.op, leaf.value, sel);
+                        },
+                    }
                 },
+                else => return error.TypeMismatch,
             }
         },
         .string => |leaf| {

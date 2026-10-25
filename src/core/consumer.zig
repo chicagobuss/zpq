@@ -1007,6 +1007,7 @@ pub const SliceReader = struct {
     held_drawn: usize = 0,
     levels: schema.Levels,
     dec: ?decimal_mod.Kind,
+    exact_only: bool = false,
     float16: bool,
     int96: bool,
     left: usize,
@@ -1096,6 +1097,7 @@ pub const SliceReader = struct {
             .held = a,
             .levels = levels,
             .dec = dec,
+            .exact_only = decode_options.decimal_exact_only,
             .float16 = if (se) |e| schema.isFloat16(e) else false,
             .int96 = cm.type == .INT96,
             .left = @intCast(cm.num_values),
@@ -1247,7 +1249,14 @@ pub const SliceReader = struct {
                     .max_def = max_def,
                     .has_nulls = has_nulls,
                 };
-                if (self.dec) |k| return .{ .f64 = try exactSlice(T, a, col, k) };
+                if (self.dec) |k| {
+                    if (self.exact_only and (T == i32 or T == i64)) {
+                        var exact = col;
+                        exact.unscaled = @unionInit(filter_eval.Exact, @typeName(T), col.values);
+                        return @unionInit(filter_eval.Batch.Column, @typeName(T), exact);
+                    }
+                    return .{ .f64 = try exactSlice(T, a, col, k) };
+                }
                 if (T == []const u8 and self.int96) {
                     const out = try a.alloc(i64, n);
                     for (values, out) |b, *o| o.* = if (b.len == int96_mod.INT96_WIDTH)
@@ -3153,6 +3162,29 @@ pub const AggTarget = union(enum) {
         records: ?*const RecordSink = null,
     },
 
+    fn exactInputs(self: AggTarget) bool {
+        if (self != .grouped or self.grouped.records != null) return false;
+        // Decimal keys and mixed float consumers retain their existing scaled views. This request concerns only
+        // exact arithmetic operands, not their logical types or the decoder used for unsupported expressions.
+        for (self.grouped.keys) |key| if (key.typeOf() == .dec) return false;
+        for (self.grouped.calls) |call| {
+            if (call.where != null or call.func == .count_distinct) return false;
+            if (call.arg) |arg| {
+                if (arg.typeOf() != .dec or !exactTree(arg)) return false;
+            } else if (call.func != .count) return false;
+        }
+        return true;
+    }
+
+    fn exactTree(e: expr_ast.Expr) bool {
+        return switch (e) {
+            .literal => |l| l == .dec or l == .i64,
+            .col_ref => |c| c.expr_type == .dec or c.expr_type == .i64,
+            .binop => |b| b.result_type == .dec and exactTree(b.left.*) and exactTree(b.right.*),
+            else => false,
+        };
+    }
+
     fn codedKey(self: AggTarget, ci: usize) bool {
         // The ordinary multi-aggregate consumer can fold dictionary products too. Keeping the original codes
         // avoids expanding strings only to intern them again; the row fallback materializes only if it needs to.
@@ -4363,6 +4395,7 @@ fn scanRGSliced(
         if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
         var options = decode_options;
         options.any_dictionary = target.codedKey(ci);
+        options.decimal_exact_only = target.exactInputs();
         if (payload) |p| if (p[ci]) {
             options.row_gate = &survivors;
         };
@@ -4648,6 +4681,7 @@ const ChunkDecoder = struct {
             decode_options.row_gate = self.gate;
         };
         decode_options.any_dictionary = self.target.codedKey(ci);
+        decode_options.decimal_exact_only = self.target.exactInputs();
         if (self.target == .grouped) if (self.target.grouped.records) |records| if (records.retention(ci)) |owner| {
             var reader = (try SliceReader.init(a, a, in.rg, in.meta, in.src, ci, decode_options)).?;
             defer reader.deinit();
@@ -5401,9 +5435,16 @@ fn decodeAggColumn(
     const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
     const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.exactKind(&se) else null;
 
-    if (dec_kind) |k| return .{
-        .f64 = try decimal_mod.decodeColumnExact(ra, chunk, cm.codec, levels, n_leaves, k, decode_options, scratch),
-    };
+    if (dec_kind) |k| return decimal_mod.decodeAggregateColumn(
+        ra,
+        chunk,
+        cm.codec,
+        levels,
+        n_leaves,
+        k,
+        decode_options,
+        scratch,
+    );
     if (schema_elem != null and schema.isFloat16(schema_elem.?)) return .{
         .f64 = try decodeFloat16ColumnAsF64Pruned(
             ra,

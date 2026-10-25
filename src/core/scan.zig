@@ -4283,7 +4283,7 @@ fn prepareAggregateWithMetas(
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
-    if (domain) |*d| {
+    if (args.encoded) if (domain) |*d| {
         const initial = planAggregate(plan_inputs).dispatch;
         if (d.globalFits(n_workers) and allRescannable(args.inputs) and !initial.use_blocks and
             initial.strategy != .partitioned_hash)
@@ -4298,7 +4298,7 @@ fn prepareAggregateWithMetas(
                 denseCountLimit(args, agg_calls, group_outputs),
             ).total;
         }
-    }
+    };
     var scan_plan = planAggregate(plan_inputs);
     var packed_record_path: ?RecordAdmission = null;
     // Keep the established small-domain table/dense choice; owners replace a multi-pass count cut.
@@ -20457,6 +20457,10 @@ test "dense composite counts arm globally and preserve selected first through wi
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     };
+    args.encoded = false;
+    const legacy = try explainAggregate(gpa, a, args);
+    try testing.expectEqual(.sketch, legacy.plan.dispatch.strategy);
+    args.encoded = true;
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const held = ledger.drawExact(args.max_memory - 1).?;
     defer ledger.release(held);

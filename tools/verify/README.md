@@ -1,127 +1,66 @@
 # verify
 
-One entry point for the 0.5.0 gate set, the seeded soak, and the scorecard ship bar.
+Run from the repository root with a Python that has PyArrow and DuckDB:
 
 ```sh
-python tools/verify/verify.py
+python tools/verify/verify.py --help
 python tools/verify/verify.py quick
 python tools/verify/verify.py commit
 python tools/verify/verify.py full --base /path/to/previous-zpq
+python tools/verify/verify.py stage differential
 python tools/verify/verify.py soak --hours 10
-python tools/verify/verify.py perf
+python tools/verify/verify.py perf --help
 ```
 
-`verify stage referee` builds `tools/runner/referee.zig` and runs the
-filter×projection matrix, the SQL-predicate checks, the aggregate and GROUP BY
-matrix, and the ordered-SQL and top-row checks in-process against the
-DuckDB 2.0 CLI. The cases are `tools/runner/cases/filter_projection.json`,
-`tools/runner/cases/sql_pred.json`, and `tools/runner/cases/agg.json` (the
-scalar aggregate matrix and the GROUP BY matrix, including the parquet each
-GROUP BY writes), `tools/runner/cases/sql_query.json` (ordered GROUP BY,
-spill, distinct, HAVING, and top-rows), and `tools/runner/cases/stats_order.json`
-(statistics order: rows, parquet, aggregates, and the column orders zpq
-writes, with pyarrow as the oracle where DuckDB trusts statistics it should not),
-and `tools/runner/cases/writer_wire.json` (re-encoded fixed-length bytes, float
-bounds, and row-group sizes, read back by pyarrow and DuckDB), and
-`tools/runner/cases/tail.json` (cut errors, memory budgets, exact averages, typed
-and decimal output, sliced writes, levels, names, row order, and the dense-domain
-matrix), and `tools/runner/cases/product.json` (dense product shapes, reader
-windows, selected ties, and dense-versus-legacy memory pairs). The verify stages
-build that referee with `-Doptimize=ReleaseSafe`. A SQL predicate answers as count
-and sum at `-j` 1, 4 and 16, or refuses with one stable message. An answer must
-equal DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate.
-Known divergences and declared refusals are `tests/known_divergences.json`.
-`commit` and `full` run this referee as the differential stage. `cli-tier` runs a
-handful of cases through `zig-out/bin/zpq` so argument parsing and json, jsonl,
-and parquet formatting stay covered. `tools/triangulate.py`,
-`tests/libzpq/differential.py`, and `tests/handoff/run.py` are still separate
-gates: the referee does not drive Hardwood, the libzpq/Lambda byte compare, or
-the Python hand-off.
+No arguments and `--help` show every stage, tier, requirement and exit code.
+`quick` runs core tests. `commit` builds the CLI, checks its argument parsing
+and JSON/JSONL/Parquet formatting, and runs the full differential referee.
+`full` adds integration, ABI, robustness, ClickBench and release checks.
+`--base` is the previously integrated comparison binary; it is required for
+`full` and is recorded without a default. Native builds default to
+`--cpu raptorlake`; select the appropriate CPU explicitly on other hosts.
 
-No arguments prints the tiers, every stage, and the exit codes. A run writes
-`summary.json` under `~/code/zpq-wt/verify-v2-out/<run-id>/`. The writer refuses
-to open a directory that already has a summary. A rerun is a new directory;
-`--rerun-of` records the earlier id and leaves that file alone.
+Each run writes `zig-out/verify/<run-id>/summary.json` (override with `--out`).
+Stages retain status, duration, command, counts, logs and binary hashes.
+The record includes the engine source tree, working-tree state and host.
+Run directories are immutable. Reruns use a new directory and `--rerun-of ID`.
+Exit 0 means required checks passed or matched their declared refusals;
+1 means failure; 2 means a missing prerequisite or incomplete run.
+Build/test stages use a 20 GiB systemd scope, low priority and at most `-j8`.
 
-`repro-skspill` is a declared refusal: exit 1 and the message
-`the query needs more memory than --max-memory allows` (`-j 8 --max-memory 500MB`)
-is status `expected`, not a failure.
+The referee runs the engine in-process, built with `-Doptimize=ReleaseSafe`.
+Its JSON cases live in `tools/runner/cases/`; `oracle_compare.py` owns numeric
+comparison policy. Decimal digits remain exact through JSON, canonicalization
+and decimal means. Written Parquet is checked by strict PyArrow readers;
+wire and value checks also use DuckDB. SQL refusals declare exact query and
+error kind in `tests/known_divergences.json`; other refusal cases declare
+`expected_error` beside the expected diagnostic. Registry metadata cannot
+waive a failed value comparison. Refusal counts survive into the summary.
+Dense cases marked `skip_duck` explain their narrower byte-parity contract;
+other dense cases check independent values. Empty or limited runs cannot pass.
 
-Native ReleaseFast builds pass `-Dcpu=raptorlake`. On the seriousbusiness
-i7-13700HX, Zig's `raptorlake` model enables AVX2 and AVX-VNNI and leaves
-AVX-512 off, which is what that chip can run. The flag is `host.zig_cpu` in
-the summary. aarch64 and macOS cross builds do not take that model.
+The real CLI tier and `tests/libzpq/run.sh` retain CLI/libzpq/Lambda byte
+parity, C ABI, ASan, Python/service, SQL-session, RSS and write-sync checks.
+`tools/triangulate.py` and `tests/handoff/run.py` also remain: the referee
+does not replace their Hardwood and Python handoff coverage.
+The `repro-skspill` stage expects exit 1 and the declared memory-budget
+message. Missing fixtures, runtimes and oracles are never successful checks.
 
-Compile and test stages run under `systemd-run --user --scope -p MemoryMax=20G`
-and `nice -n 10`, with at most `-j12`. `tools/verify/zigw` is `ZIG` for scripts
-that call `zig build` themselves, so they pick up the same cap.
+For harness regression checks, build the referee, then run
+`tools/runner/test_harness.py` with `DUCKDB` naming the DuckDB CLI.
+`tools/runner/coverage.py LEGACY_CHECKOUT OUTPUT.json` instruments every
+counted check in the retired a01ec00 differential and compares its inventory
+with the JSON cases. The legacy checkout needs its matching binary/fixtures.
 
-`full` requires `--base`, the previously integrated binary the candidate is checked
-against. For the e4c6878 equivalence run that is `~/bench/zpq-fair/zpq-588a80c`.
-In normal use it is the integ tip before the change. The path is stored in
-`summary.json` under `parameters.base`. It is not defaulted.
+`perf` calls the clean scorecard worktree pinned in `tools/verify/HARNESS`;
+it preserves plan/run/summary semantics. `--suites` and `--cases` declare the
+filter; missing suites make the result blocked. Cold scoring requires a
+majority of wins against each rival, at most 20% behind the best rival, and
+no cell slower than 1.5x. The same-host control is reported separately.
+The in-process profile is a separate metric. `--plan-only` only plans;
+`--resume RUN_DIR` continues the prior sealed run in a new labelled record.
+Timing holds the benchmark lock before changing the host power profile and
+restores that profile before releasing the lock.
 
-## Scorecard
-
-`tools/verify/HARNESS` pins forgejo `bench/scorecard-inproc` at `2d8b109`.
-That commit fast-forwards `bench/scorecard` at `c2aba06`. The harness stays a
-separate clean worktree (`~/code/zpq-wt/scorecard-inproc`). `verify perf` runs,
-with that worktree as cwd:
-
-```sh
-python bench/scorecard.py plan --config CONFIG --run-dir SEALED
-python bench/scorecard.py run --run-dir SEALED
-python bench/scorecard.py summary --run-dir SEALED
-```
-
-`plan` refuses a directory that already contains `manifest.jsonl`. `--resume`
-calls `run` again on that directory. Ship-bar text (`shipbar.txt`) and host
-provenance stay in the verify run directory. The cold ship bar is: majority
-against DuckDB 2.0 and Polars 2.0, at most 20% of cells behind, no cell over
-1.5x. `zpq_prev` (default `~/bench/zpq-fair/zpq-588a80c`) is reported as a
-same-host control and is not part of that boolean. `--profile in-process` is a
-different metric and is not folded into the cold geomean.
-
-The harness keeps its own CPU placement (timing 0–7 and 16–23, housekeeping
-8–15). This machine has those logical CPUs. perf does not add a 20G scope
-around the harness, and it does not apply the granite Zen affinity string.
-
-`--suites` and `--cases` are the declared filter. With no `--suites`, the
-profile's full list is the filter (cold: clickbench, study, pdsh, reads-sf1,
-writes, votes-local). Each suite is checked on its own. A suite whose inputs
-are missing is recorded under `suites_skipped` with the reason, and it is not
-planned. The suites that resolve are planned together, so one missing dataset
-does not throw away the rest. A skipped suite makes the perf stage `blocked`.
-`verify perf` holds `~/.cache/zpq-bench.lock` and passes it as fd 9. That is
-the harness parent protocol: the child then does not call `powerprofilesctl`
-itself. This session's polkit denies `switch-profile`, so the parent sets
-`performance` with `sudo -n` and restores the previous profile when the run
-ends.
-
-The harness pins its own `.venv` as an engine dependency. That tree is not
-created here. When the pinned interpreter is absent, the emitted config points
-it at the python that is running verify. The harness worktree stays untouched.
-
-On this host the proof is `verify perf --suites clickbench`. The other suites
-live on granite and [redacted] and are not copied here. The same entry point runs
-the full matrix there once those inputs exist.
-
-## What this branch does not do
-
-The outside review's `.ztest` language, `zpq-gen` rewrite, second benchmark
-runner, and re-pinned uv environment are not in this branch. Existing check
-scripts stay the stage bodies.
-
-| Retired invocation | Reason |
-| --- | --- |
-| Separate `write_sync_check.py` process | `tests/libzpq/run.sh` already runs it on Linux when `strace` is present |
-| sol1's extra `aarch64-linux-musl:lambda` skip | `release-smoke` follows lead-gates: skip the two macOS runs, run the Linux ones |
-| Merging or copying `bench/` onto `integ/050-perf` | Histories diverged at `16b02572`. The pin is the join |
-| `chain-e4c.sh` service stop/restore | This host is shared. perf does not stop other campaigns |
-| Granite `0-7,16-23` affinity as a config override | That string is a Zen CCD layout. The harness default placement is unchanged |
-
-`fd` is blocked until `--base` names a comparison binary. ClickBench smoke uses
-`~/bench/zpq-fair/data/clickbench/sub{1,16}` and the SQL repo at
-`~/bench/zpq-fair/repos/ClickBench` (shallow clone `b113475`). The scorecard's
-own cold ClickBench case still wants `data/clickbench/hits.parquet`, which is
-not on this host; `plan` fails closed when a suite's inputs are missing.
+The fixture-generator rewrite, generator deletion and broad directory moves
+remain separate work. Existing fixture generators and profiling tools stay.

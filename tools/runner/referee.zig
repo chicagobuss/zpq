@@ -269,8 +269,10 @@ fn runFile(
             runProduct(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
         else if (std.mem.eql(u8, case.kind, "dense") or std.mem.eql(u8, case.kind, "pair") or std.mem.eql(u8, case.kind, "tail"))
             runTail(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, ans_path, case)
+        else if (std.mem.eql(u8, case.kind, "write"))
+            runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case)
         else
-            runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case);
+            return error.BadCaseKind;
         const why = failure catch |err| try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
         if (why) |text| {
             counts.failed += checks;
@@ -573,16 +575,7 @@ fn compareAnswer(
         argv[n] = "--epoch";
         n += 1;
     }
-    const out = try capture(gpa, io, argv[0..n]);
-    defer gpa.free(out.stdout);
-    defer gpa.free(out.stderr);
-    if (out.code != 0) {
-        const msg = if (out.stderr.len != 0) out.stderr else out.stdout;
-        const line = std.mem.trim(u8, msg, " \t\r\n");
-        const start = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |at| at + 1 else 0;
-        return try gpa.dupe(u8, line[start..]);
-    }
-    return null;
+    return compareProcess(gpa, io, argv[0..n]);
 }
 
 fn jobList(arena: std.mem.Allocator, v: std.json.Value) ![]const usize {
@@ -1633,16 +1626,7 @@ fn runProduct(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ pyarrow, "tools/runner/answer_cmp.py", "product", "--zpq", zpq_path, "--duckdb", duckdb, "--parquet", out_path });
-    const out = try capture(gpa, io, argv.items);
-    defer gpa.free(out.stdout);
-    defer gpa.free(out.stderr);
-    if (out.code != 0) {
-        const msg = if (out.stderr.len != 0) out.stderr else out.stdout;
-        const line = std.mem.trim(u8, msg, " \t\r\n");
-        const start = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |at| at + 1 else 0;
-        return try gpa.dupe(u8, line[start..]);
-    }
-    return null;
+    return compareProcess(gpa, io, argv.items);
 }
 
 fn runDense(
@@ -1805,16 +1789,7 @@ fn statsCmp(
         try argv.appendSlice(gpa, &.{ "--types", types_buf.? });
     }
     if (parquet) try argv.appendSlice(gpa, &.{ "--parquet", zpq_path });
-    const out = try capture(gpa, io, argv.items);
-    defer gpa.free(out.stdout);
-    defer gpa.free(out.stderr);
-    if (out.code != 0) {
-        const msg = if (out.stderr.len != 0) out.stderr else out.stdout;
-        const line = std.mem.trim(u8, msg, " \t\r\n");
-        const start = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |at| at + 1 else 0;
-        return try gpa.dupe(u8, line[start..]);
-    }
-    return null;
+    return compareProcess(gpa, io, argv.items);
 }
 
 fn fillSql(gpa: std.mem.Allocator, sql: []const u8, fixture: []const u8) ![]u8 {
@@ -1864,7 +1839,9 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Captur
     var multi_reader: std.Io.File.MultiReader = undefined;
     multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer multi_reader.deinit();
-    while (multi_reader.fill(4096, .none)) |_| {} else |_| {}
+    while (multi_reader.fill(4096, .none)) |_| {} else |err| {
+        if (err != error.EndOfStream) return err;
+    }
     const term = try child.wait(io);
     const code: u8 = switch (term) {
         .exited => |c| c,
@@ -1875,4 +1852,17 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Captur
         .stdout = try multi_reader.toOwnedSlice(0),
         .stderr = try multi_reader.toOwnedSlice(1),
     };
+}
+
+fn compareProcess(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !?[]const u8 {
+    const out = try capture(gpa, io, argv);
+    defer gpa.free(out.stdout);
+    defer gpa.free(out.stderr);
+    if (out.code != 0) {
+        const msg = if (out.stderr.len != 0) out.stderr else out.stdout;
+        const line = std.mem.trim(u8, msg, " \t\r\n");
+        const start = if (std.mem.lastIndexOfScalar(u8, line, '\n')) |at| at + 1 else 0;
+        return try gpa.dupe(u8, line[start..]);
+    }
+    return null;
 }

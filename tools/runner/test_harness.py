@@ -95,6 +95,10 @@ class RefereeTest(unittest.TestCase):
                 result = self.run_cases(case, limit=limit)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
 
+    def test_unknown_case_kind_does_not_fall_back_to_a_write(self):
+        result = self.run_cases({"id": "misspelled-kind", "kind": "aggregate-typo"})
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

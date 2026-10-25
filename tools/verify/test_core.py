@@ -2,15 +2,19 @@
 """Registry-free checks for the summary writer and the ship bar."""
 
 import contextlib
+import argparse
+import fcntl
 import io
 import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
+import perf
 import scorecard_select
 import shipbar
 import stages
@@ -134,6 +138,45 @@ class FullTierTest(unittest.TestCase):
             code = verify.main(["full", "--base", "/no/such/zpq"])
         self.assertEqual(code, 2)
         self.assertIn("not a file", err.getvalue())
+
+
+class PerfRecordTest(unittest.TestCase):
+    def test_busy_timing_lock_leaves_host_profile_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".cache").mkdir()
+            with (home / ".cache/zpq-bench.lock").open("a+") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(perf.Path, "home", return_value=home), patch.object(perf, "subprocess") as calls:
+                    with self.assertRaises(BlockingIOError):
+                        perf._run(["unused"], home, home / "log", timing_lock=True)
+                    calls.run.assert_not_called()
+                    calls.check_output.assert_not_called()
+
+    def test_resume_keeps_prior_manifest_and_records_new_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "prior", Path(tmp) / "rerun"
+            sealed = source / "scorecard/cold"
+            sealed.mkdir(parents=True)
+            (sealed / "manifest.jsonl").write_text("sealed\n")
+            binary = source / "zpq"
+            binary.write_bytes(b"binary")
+            (source / "perf-spec.json").write_text(json.dumps({"binary": str(binary), "control": None}))
+            (source / "suite-filter.json").write_text(json.dumps({
+                "suites_requested": ["clickbench"], "suites": [{"suite": "clickbench", "status": "ran"}]
+            }))
+            ctx = verify.dummy_ctx()
+            ctx.run_dir = target
+            book = summary.Summary(target, {"tier": "perf", "sha": "abc", "rerun_of": "prior"})
+            args = argparse.Namespace(harness="unused", profile="cold", resume=str(source), plan_only=False,
+                                      suites=None, cases=None, reps=3, engines="zpq,duckdb20,polars")
+            with patch.object(perf, "check_harness", return_value=None), patch.object(perf, "_run", return_value=7):
+                perf.run_perf(ctx, book, args)
+            record = book.data["stages"][0]
+            self.assertEqual(record["sealed"], str(sealed))
+            self.assertEqual(record["status"], "fail")
+            self.assertEqual(record["resumed_from"], str(source))
+            self.assertEqual((sealed / "manifest.jsonl").read_text(), "sealed\n")
 
 
 class ShipBarTest(unittest.TestCase):

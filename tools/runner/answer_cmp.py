@@ -13,22 +13,12 @@ import json
 import subprocess
 import sys
 from decimal import Decimal
-from fractions import Fraction
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from oracle_compare import canon, same  # noqa: E402
+from oracle_compare import canon, canon_rows, decimal_mean as avg_dec, require_rows, same  # noqa: E402
 
 EXACT = "exact"
-
-
-def avg_dec(total, n, scale):
-    """zpq's avg over a DECIMAL: exact sum over n, half away from zero, at `scale` digits."""
-    if not n:
-        return None
-    q = Fraction(Decimal(str(total))) / n * 10**scale
-    m = (2 * abs(q.numerator) + q.denominator) // (2 * q.denominator)
-    return Decimal(f"{'-' if q < 0 else ''}{m}E-{scale}")
 
 
 def split_state(row):
@@ -67,7 +57,8 @@ def coerce(val, typ):
         return float(val)
     if t.startswith("BOOL"):
         return bool(val)
-    if t.startswith(("HUGEINT", "BIGINT", "INTEGER", "SMALLINT", "TINYINT", "INT", "UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT")):
+    if t.startswith(("HUGEINT", "BIGINT", "INTEGER", "SMALLINT", "TINYINT", "INT",
+                     "UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT")):
         return int(val)
     return val
 
@@ -81,7 +72,8 @@ def lanes_of(types):
 
 
 def from_zpq(vals, lanes):
-    return [float(v) if isinstance(v, Decimal) and (lanes is None or lanes[i] != EXACT) else v for i, v in enumerate(vals)]
+    return [float(v) if isinstance(v, Decimal) and (lanes is None or lanes[i] != EXACT) else v
+            for i, v in enumerate(vals)]
 
 
 def apply_mean(rows, names, lanes, args):
@@ -117,13 +109,6 @@ def duck_rows(args):
     return apply_mean(rows, names, lanes_of(types), args)
 
 
-def canon_rows(rows, lanes):
-    return sorted(
-        (tuple(canon(v, lanes[i] if lanes else None) for i, v in enumerate(row)) for row in rows),
-        key=repr,
-    )
-
-
 def cmd_agg(args):
     zrows = load_zpq(args.zpq)
     if len(zrows) != 1:
@@ -141,16 +126,11 @@ def cmd_group(args):
     zraw = load_zpq(args.zpq)
     drows, names, lanes = duck_rows(args)
     zrows = canon_rows(
-        [from_zpq([split_state(row).get(c) for c in names], lanes) for row in zraw],
+        [from_zpq([split_state(row)[c] for c in names], lanes) for row in zraw],
         lanes,
     )
     want = canon_rows(drows, lanes)
-    if zrows != want:
-        if len(zrows) != len(want):
-            raise SystemExit(f"zpq={len(zrows)} duck={len(want)}")
-        for a, b in zip(zrows, want):
-            if a != b:
-                raise SystemExit(f"row zpq={a} duck={b}")
+    require_rows(zrows, want)
 
 
 def load_rows(path):
@@ -199,9 +179,9 @@ def cmd_rows(args):
         want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in want_rows]
     else:
         zraw = load_rows(args.zpq)
-        spec = describe(args.duckdb, args.sql, stable=True)
         want_rows, _, lanes = duck_rows(args)
         if args.epoch:
+            spec = describe(args.duckdb, args.sql, stable=True)
             types = [t for _, t in spec]
             want_rows = [[to_epoch(v, types[i]) for i, v in enumerate(row)] for row in want_rows]
         got = []
@@ -209,31 +189,7 @@ def cmd_rows(args):
             vals = from_zpq(list(row.values()), lanes)
             got.append(tuple(canon(v, lanes[i] if i < len(lanes) else None) for i, v in enumerate(vals)))
         want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in want_rows]
-    if got != want:
-        if len(got) != len(want):
-            raise SystemExit(f"zpq={len(got)} duck={len(want)}")
-        for a, b in zip(got, want):
-            if a != b:
-                raise SystemExit(f"row zpq={a} duck={b}"[:400])
-
-
-def cmd_ordered(args):
-    """Row order is the answer: ORDER BY, HAVING, spill and distinct."""
-    zraw = load_zpq(args.zpq)
-    if isinstance(zraw, dict):
-        zraw = [zraw]
-    drows, _, lanes = duck_rows(args)
-    got = []
-    for row in zraw:
-        vals = from_zpq(list(row.values()), lanes)
-        got.append(tuple(canon(v, lanes[i] if i < len(lanes) else None) for i, v in enumerate(vals)))
-    want = [tuple(canon(v, lanes[i]) for i, v in enumerate(row)) for row in drows]
-    if got != want:
-        if len(got) != len(want):
-            raise SystemExit(f"zpq={len(got)} duck={len(want)}")
-        for a, b in zip(got, want):
-            if a != b:
-                raise SystemExit(f"row zpq={a} duck={b}"[:400])
+    require_rows(got, want)
 
 
 def stats_sql(args, select):
@@ -301,12 +257,7 @@ def cmd_stats_rows(args):
             lanes,
         )
         want = canon_rows(want_rows, lanes)
-    if got != want:
-        if len(got) != len(want):
-            raise SystemExit(f"zpq={len(got)} truth={len(want)}")
-        for a, b in zip(got, want):
-            if a != b:
-                raise SystemExit(f"row zpq={a} truth={b}"[:400])
+    require_rows(got, want, "truth")
 
 
 def py_aggregate(name, rows):
@@ -373,12 +324,7 @@ def cmd_stats_select(args):
     else:
         raw = load_rows(args.zpq)
     got = sorted((tuple(row[name] for name in names) for row in raw), key=repr)
-    if got != want:
-        if len(got) != len(want):
-            raise SystemExit(f"zpq={len(got)} truth={len(want)}")
-        for a, b in zip(got, want):
-            if a != b:
-                raise SystemExit(f"row zpq={a} truth={b}"[:400])
+    require_rows(got, want, "truth")
 
 
 def declared_column_orders(path):
@@ -548,12 +494,7 @@ def cmd_wire(args):
             (tuple(wire_pa_cell(row[col]) for col in cols) for row in pq.read_table(out).to_pylist()),
             key=repr,
         )
-    if got != want:
-        if len(got) != len(want):
-            raise SystemExit(f"zpq={len(got)} truth={len(want)}")
-        for a, b in zip(got, want):
-            if a != b:
-                raise SystemExit(f"row zpq={a} truth={b}"[:400])
+    require_rows(got, want, "truth")
 
 
 def cmd_parquet(args):
@@ -601,14 +542,10 @@ def cmd_usame(args):
     if isinstance(zraw, dict):
         zraw = [zraw]
     drows, names, lanes = duck_rows(args)
-    got = sorted((tuple(from_zpq([row.get(c) for c in names], lanes)) for row in zraw), key=repr)
+    got = sorted((tuple(from_zpq([row[c] for c in names], lanes)) for row in zraw), key=repr)
     want = sorted((tuple(row) for row in drows), key=repr)
     if len(got) != len(want) or not all(same(g, w) for gr, wr in zip(got, want) for g, w in zip(gr, wr)):
         raise SystemExit(f"zpq={got[:2]} duck={want[:2]}")
-
-
-def _canon_table(rows, lanes):
-    return canon_rows(rows, lanes)
 
 
 def cmd_tail(args):
@@ -683,7 +620,7 @@ def cmd_tail(args):
                 return v.isoformat()
             return v
 
-        zrows = _canon_table([[norm_cell(v) for v in row.values()] for row in tbl.to_pylist()], lanes)
+        zrows = canon_rows([[norm_cell(v) for v in row.values()] for row in tbl.to_pylist()], lanes)
         drows, names, dlane = duck_rows(args)
         if check == "decimal" and args.orders:
             scales = {}
@@ -700,7 +637,7 @@ def cmd_tail(args):
                 fixed.append(row[: len(want_types)])
             drows = fixed
             dlane = lanes
-        want = _canon_table([[norm_cell(v) for v in row] for row in drows], dlane if check == "decimal" else lanes)
+        want = canon_rows([[norm_cell(v) for v in row] for row in drows], dlane if check == "decimal" else lanes)
         if zrows != want:
             raise SystemExit(f"rows zpq={zrows[:2]} duck={want[:2]}")
         back = duck_json(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)
@@ -708,7 +645,7 @@ def cmd_tail(args):
             # The file DuckDB reads back must carry the same values pyarrow did.
             spec = describe(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)
             brows = [[coerce(row.get(n), t) for n, t in spec] for row in back]
-            if _canon_table(brows, lanes) != zrows:
+            if canon_rows(brows, lanes) != zrows:
                 raise SystemExit("DuckDB reads other values back")
         return
     if check == "sliced_write":
@@ -729,7 +666,7 @@ def cmd_tail(args):
         if check == "sliced_limit":
             drows = drows[:7]
         zraw = [json.loads(line, parse_float=Decimal) for line in text if line.strip()]
-        zrows = canon_rows([from_zpq([row.get(c) for c in names], lanes) for row in zraw], lanes)
+        zrows = canon_rows([from_zpq([row[c] for c in names], lanes) for row in zraw], lanes)
         want = canon_rows(drows, lanes)
         if zrows != want:
             raise SystemExit(f"sliced print zpq={len(zrows)} duck={len(want)}")
@@ -758,7 +695,8 @@ def cmd_product(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire", "dense", "usame", "tail", "product"])
+    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg",
+                                    "stats_select", "stats_orders", "wire", "dense", "usame", "tail", "product"])
     p.add_argument("--zpq", required=True)
     p.add_argument("--duckdb")
     p.add_argument("--sql")
@@ -779,14 +717,13 @@ def main():
     p.add_argument("--names")
     p.add_argument("--types")
     args = p.parse_args()
-    args.stable = args.mode in ("ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire", "dense", "usame", "tail")
+    args.stable = args.mode in ("ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders",
+                               "wire", "dense", "usame", "tail")
     if args.mode == "agg":
         cmd_agg(args)
     elif args.mode == "group":
         cmd_group(args)
-    elif args.mode == "ordered":
-        cmd_ordered(args)
-    elif args.mode == "rows":
+    elif args.mode in ("ordered", "rows"):
         cmd_rows(args)
     elif args.mode == "stats_rows":
         cmd_stats_rows(args)

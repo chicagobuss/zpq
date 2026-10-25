@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -26,7 +26,6 @@ class Ctx:
     skspill: Path
     sigpipe: Path
     duckdb: str
-    differential_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -82,13 +81,6 @@ def parse_modules(text):
 
 def parse_cli_tier(text):
     match = _last(r"cli-tier: (\d+)/(\d+) checks match", text)
-    if not match:
-        return {}
-    return {"matched": int(match.group(1)), "total": int(match.group(2))}
-
-
-def parse_differential(text):
-    match = _last(r"differential(?: --only \S+)?: (\d+)/(\d+) checks match", text)
     if not match:
         return {}
     return {"matched": int(match.group(1)), "total": int(match.group(2))}
@@ -155,6 +147,11 @@ def _zig_build(ctx: Ctx, *args: str) -> list[str]:
     return [ctx.zigw, "build", f"-j{ctx.j}", *args]
 
 
+def _python(ctx: Ctx, script: str, about: str, *args, needs=(), parse=None) -> Cmd:
+    blocked = next((reason for path, label in needs if (reason := _need(path, label))), None)
+    return Cmd([ctx.python, script, *map(str, args)], _base_env(ctx), about, blocked=blocked, parse=parse)
+
+
 def stage_test_core(ctx: Ctx) -> Cmd:
     return Cmd(_zig_build(ctx, "test-core", "--summary", "all"), _base_env(ctx), "core unit tests", parse=parse_tests)
 
@@ -186,14 +183,7 @@ def stage_integration(ctx: Ctx) -> Cmd:
 
 
 def stage_differential(ctx: Ctx) -> Cmd:
-    cmd = stage_referee(ctx)
-    return Cmd(
-        cmd.argv,
-        cmd.env,
-        "in-process differential referee against the DuckDB CLI",
-        blocked=cmd.blocked,
-        parse=cmd.parse,
-    )
+    return stage_referee(ctx)
 
 
 def stage_fd(ctx: Ctx) -> Cmd:
@@ -212,13 +202,8 @@ def stage_fd(ctx: Ctx) -> Cmd:
 
 
 def stage_canonical(ctx: Ctx) -> Cmd:
-    return Cmd(
-        [ctx.python, "tools/decode_error_check.py", str(ctx.binary)],
-        _base_env(ctx),
-        "canonical error precedence",
-        blocked=_need(ctx.binary, "candidate binary"),
-        parse=parse_canonical,
-    )
+    return _python(ctx, "tools/decode_error_check.py", "canonical error precedence", ctx.binary,
+                   needs=((ctx.binary, "candidate binary"),), parse=parse_canonical)
 
 
 def stage_cli_smoke(ctx: Ctx) -> Cmd:
@@ -351,7 +336,7 @@ def stage_release_smoke(ctx: Ctx) -> Cmd:
 
 
 def stage_modules(ctx: Ctx) -> Cmd:
-    return Cmd([ctx.python, "tools/check_test_modules.py"], _base_env(ctx), "test-module coverage", parse=parse_modules)
+    return _python(ctx, "tools/check_test_modules.py", "test-module coverage", parse=parse_modules)
 
 
 REFEREE_CASES = [
@@ -387,13 +372,8 @@ def referee_argv(ctx: Ctx) -> list[str]:
 
 
 def stage_cli_tier(ctx: Ctx) -> Cmd:
-    return Cmd(
-        [ctx.python, "tools/runner/cli_tier.py", str(ctx.binary)],
-        _base_env(ctx),
-        "CLI argument parsing and json, jsonl, parquet formatting",
-        blocked=_need(ctx.binary, "candidate binary"),
-        parse=parse_cli_tier,
-    )
+    return _python(ctx, "tools/runner/cli_tier.py", "CLI argument parsing and json, jsonl, parquet formatting",
+                   ctx.binary, needs=((ctx.binary, "candidate binary"),), parse=parse_cli_tier)
 
 
 def stage_referee(ctx: Ctx) -> Cmd:
@@ -411,21 +391,13 @@ def stage_referee(ctx: Ctx) -> Cmd:
 
 def stage_conform(ctx: Ctx) -> Cmd:
     corpus = ctx.repo / "data" / "parquet-testing" / "data"
-    return Cmd(
-        [ctx.python, "tools/conformance.py", "--corpus", str(corpus), "--min-pass", "72"],
-        _base_env(ctx),
-        "apache parquet-testing corpus",
-        blocked=_need(corpus, "parquet-testing corpus"),
-    )
+    return _python(ctx, "tools/conformance.py", "apache parquet-testing corpus", "--corpus", corpus,
+                   "--min-pass", "72", needs=((corpus, "parquet-testing corpus"),))
 
 
 def stage_triangulate(ctx: Ctx) -> Cmd:
-    return Cmd(
-        [ctx.python, "tools/triangulate.py"],
-        _base_env(ctx),
-        "ZPQ vs DuckDB vs Hardwood, when Hardwood is present",
-        blocked=_need(ctx.binary, "candidate binary"),
-    )
+    return _python(ctx, "tools/triangulate.py", "ZPQ vs DuckDB vs Hardwood, when Hardwood is present",
+                   needs=((ctx.binary, "candidate binary"),))
 
 
 # name, tiers, builder. Order inside a tier follows this list.

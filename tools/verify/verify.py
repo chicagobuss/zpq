@@ -3,7 +3,7 @@
 
     python tools/verify/verify.py            tiers, stages, exit codes
     python tools/verify/verify.py quick      core unit tests
-    python tools/verify/verify.py commit     test-core, ReleaseFast, differential slice
+    python tools/verify/verify.py commit     test-core, ReleaseFast, full referee
     python tools/verify/verify.py full       the release gate set
     python tools/verify/verify.py soak       seeded loop for a number of hours
     python tools/verify/verify.py perf       pinned scorecard plan/run/summary, then the ship bar
@@ -39,60 +39,46 @@ FAIR = Path.home() / "bench/zpq-fair"
 
 
 def guide() -> str:
-    blurbs = {name: builder(dummy_ctx()).about for name, _tiers, builder in stages.REGISTRY}
-    lines = [
-        "zpq verify — gates, soak, and the scorecard ship bar.",
-        "",
-        "Tiers",
-        "  quick     core unit tests (zig build test-core). The edit loop.",
-        "  commit    test-core, ReleaseFast -Drevision=HEAD -Dcpu=raptorlake, a CLI tier, then",
-        "            the ReleaseSafe referee.",
-        "  full      the stages listed below. Requires --base PATH, the previously integrated",
-        "            binary the candidate is checked against. The path is recorded in the",
-        "            summary. There is no default.",
-        "",
-        "Modes",
-        "  soak      one ReleaseFast build, then seeded rounds of agg fuzz, differential, unit, and",
-        "            zig build fuzz until --hours (default 10). Failures are copied to fail/ and the",
-        "            loop continues. --rounds N stops after N rounds.",
-        "  perf      calls the pinned scorecard worktree: plan, run, summary. Refuses to reseal a",
-        "            directory that already has manifest.jsonl (--resume continues it). Ship-bar",
-        "            text and host provenance stay outside the sealed directory.",
-        "            --suites and --cases are the declared filter. The default --suites list is",
-        "            the profile's full set. A suite whose inputs are missing is skipped and",
-        "            recorded; the suites that resolve are still planned. A skipped suite is",
-        "            not a pass. --profile in-process is a separate metric from the cold ship bar.",
-        "  stage X   one stage. conform and triangulate are not part of full.",
-        "  stages    the registry.",
-        "  self-test summary writer and ship bar. Does not compile zpq.",
-        "",
-        "Exit codes",
-        "  0  every required stage passed, or was a declared refusal",
-        "  1  any unexpected failure. The summary lists it, and a later run does not erase it.",
-        "  2  a stage was blocked (missing binary, fixture, --base, or a skipped scorecard",
-        "     suite) or the invocation is bad.",
-        "",
-        "repro-skspill expects exit 1 and the text",
-        '  "the query needs more memory than --max-memory allows"',
-        "  with -j 8 --max-memory 500MB. That result is status expected.",
-        "",
-        "Host builds default to -Dcpu=raptorlake; --cpu selects another native target.",
-        "The flag is stored in the summary as zig_cpu.",
-        "Cross builds of aarch64 and macOS do not take that Intel model.",
-        "Stages that compile or run the engine use systemd-run --user --scope -p MemoryMax=20G",
-        "and nice -n 10, with at most -j8. perf does not add a second cap around the harness.",
-        "",
-        "Outputs land in zig-out/verify/<run-id>/summary.json unless --out is set.",
-        "",
-        "Full and commit stages",
-    ]
-    for name, tiers, _builder in stages.REGISTRY:
-        where = ",".join(tier for tier in tiers if tier != "extra") or "stage-only"
-        lines.append(f"  {name:<28} {where:<16} {blurbs[name]}")
-    lines.append("")
-    lines.append("Pinned harness: tools/verify/HARNESS (bench/scorecard-inproc, not merged into this branch).")
-    return "\n".join(textwrap.fill(line, width=80, subsequent_indent="    ") if len(line) > 80 else line
-                     for line in lines) + "\n"
+    lines = ["zpq verify — gates, soak, and the scorecard ship bar.", "",
+             "Usage: python tools/verify/verify.py COMMAND [OPTIONS]", "",
+             "Tiers"]
+    tiers = {
+        "quick": "Core unit tests (zig build test-core). The edit loop.",
+        "commit": "Core tests, ReleaseFast CLI, real CLI formatting checks, and the full ReleaseSafe referee.",
+        "full": "Every full stage below. Requires --base PATH: the previously integrated comparison binary.",
+    }
+    modes = {
+        "soak": "Seeded aggregate fuzz, differential, unit and coverage fuzz. --hours sets the duration; "
+                "--rounds optionally bounds it. Every round keeps its logs, seed and verdict.",
+        "perf": "Pinned scorecard plan/run/summary. --suites and --cases select inputs; missing suites "
+                "are blocked. Cold ship-bar scoring and in-process timing are separate metrics. "
+                "--resume RUN_DIR continues a prior sealed run in a new record.",
+        "stage X": "One stage from the registry below. conform and triangulate are stage-only.",
+        "stages": "Show this guide and the registry.",
+        "self-test": "Check summary records and scoring without compiling the engine.",
+    }
+    for section, descriptions in ((None, tiers), ("Modes", modes)):
+        if section:
+            lines.extend(["", section])
+        for name, description in descriptions.items():
+            lines.append(textwrap.fill(description, width=80, initial_indent=f"  {name:<10}",
+                                       subsequent_indent=" " * 12))
+    lines.extend(["", "COMMAND --help lists that command's flags.",
+                  "Exit codes: 0 passed/declared refusal; 1 failure; 2 blocked or invalid.",
+                  "Outputs: zig-out/verify/<run-id>/summary.json; --out changes the parent.",
+                  "Reruns: new directory, --rerun-of ID; earlier failures stay recorded.",
+                  "Builds: 20 GiB systemd scope, nice 10, at most -j8; --cpu defaults to",
+                  "raptorlake for native ReleaseFast builds. Select another CPU explicitly.",
+                  "Dependencies: Zig, Python with PyArrow/DuckDB, and the DuckDB CLI.",
+                  "repro-skspill expects exit 1 plus the declared memory-budget message.",
+                  "Pinned scorecard: tools/verify/HARNESS; --harness selects its clean checkout.",
+                  "", "Stages (tier membership)"])
+    for name, tier_names, builder in stages.REGISTRY:
+        where = ",".join(t for t in tier_names if t != "extra") or "stage-only"
+        lines.append(f"  {name} [{where}]")
+        lines.append(textwrap.fill(builder(dummy_ctx()).about, width=80, initial_indent="    ",
+                                   subsequent_indent="    "))
+    return "\n".join(lines) + "\n"
 
 
 def dummy_ctx() -> stages.Ctx:
@@ -127,9 +113,6 @@ def python_for() -> str:
 
 
 def make_ctx(args, run_dir: Path, revision: str) -> stages.Ctx:
-    diff = list(getattr(args, "diff_args", []) or [])
-    if diff[:1] == ["--"]:
-        diff = diff[1:]
     return stages.Ctx(
         repo=REPO,
         python=python_for(),
@@ -140,13 +123,12 @@ def make_ctx(args, run_dir: Path, revision: str) -> stages.Ctx:
         revision=revision,
         binary=REPO / "zig-out/bin/zpq",
         lib=REPO / "zig-out/lib/libzpq.so",
-        base=args.base,
+        base=str(Path(args.base).expanduser().resolve()) if args.base else None,
         clickbench_root=CLICKBENCH,
         clickbench_sql=CLICKBENCH_SQL,
         skspill=SKSPILL,
         sigpipe=SIGPIPE,
         duckdb=str(DUCKDB20),
-        differential_args=diff,
     )
 
 
@@ -198,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--run-id")
     common.add_argument(
         "--base",
-        help="previously integrated binary the candidate is checked against (required for full; recorded, not defaulted)",
+        help="previously integrated comparison binary (required for full; recorded, not defaulted)",
     )
     common.add_argument("-j", type=int, default=8)
     common.add_argument("--cpu", default="raptorlake", help="zig -Dcpu for native ReleaseFast builds")
@@ -209,8 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="verify")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("quick", parents=[common], help="core unit tests")
-    commit = sub.add_parser("commit", parents=[common], help="test-core, ReleaseFast, differential")
-    commit.add_argument("diff_args", nargs=argparse.REMAINDER)
+    sub.add_parser("commit", parents=[common], help="test-core, ReleaseFast, differential")
     sub.add_parser("full", parents=[common], help="release gate set")
     soak = sub.add_parser("soak", parents=[common], help="seeded fuzz/differential loop")
     soak.add_argument("--hours", type=float, default=10)
@@ -231,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--engines", default="zpq,duckdb20,polars")
     score.add_argument("--reps", type=int, default=3)
     score.add_argument("--plan-only", action="store_true")
-    score.add_argument("--resume", action="store_true", help="continue a sealed dir; do not call plan")
+    score.add_argument("--resume", metavar="RUN_DIR", help="continue a sealed prior run in a new labelled record")
     return parser
 
 
@@ -254,12 +235,6 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "j", 8) < 1:
         print("refusing -j below 1", file=sys.stderr)
         return 2
-    if args.command == "commit" and list(getattr(args, "diff_args", []) or []) not in ([], ["--"]):
-        print(
-            "commit runs the full ReleaseSafe referee. A differential slice is no longer a separate script.",
-            file=sys.stderr,
-        )
-        return 2
     if args.command == "soak" and (args.hours <= 0 or args.rounds is not None and args.rounds <= 0):
         print("soak needs positive --hours and --rounds", file=sys.stderr)
         return 2
@@ -280,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         except KeyError:
             print(f"unknown stage {args.name}", file=sys.stderr)
             return 2
+    if args.command == "perf" and args.resume and not args.rerun_of:
+        args.rerun_of = Path(args.resume).expanduser().resolve().name
     revision = head_sha()
     try:
         run_dir, book = open_run(args, args.command if args.command != "stage" else f"stage-{args.name}", revision)

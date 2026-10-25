@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+from contextlib import ExitStack
 import json
 import os
 import subprocess
@@ -71,36 +72,25 @@ def _finish_status(report: dict, planned: bool = False, met: bool | None = None,
 
 
 def _run(argv, cwd, log: Path, timing_lock: bool = False) -> int:
-    """Run a harness command. `timing_lock` holds ~/.cache/zpq-bench.lock on fd 9.
-
-    The scorecard runner switches the power profile itself unless a parent
-    already holds that lock. This session cannot switch it (polkit denies
-    switch-profile); sudo can. The parent sets performance, holds the lock,
-    and passes fd 9, which is the harness's own parent protocol.
-    """
+    """Hold the timing lock before changing host state; fd 9 is the harness protocol."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = None
-    previous = None
     passed = {}
-    if timing_lock:
-        previous = subprocess.check_output(["powerprofilesctl", "get"], text=True, timeout=10).strip()
-        subprocess.run(["sudo", "-n", "powerprofilesctl", "set", "performance"], check=True, timeout=15)
-    try:
+    with ExitStack() as cleanup:
         if timing_lock:
             lock_path = Path.home() / ".cache/zpq-bench.lock"
-            lock_file = lock_path.open("a+")
+            lock_file = cleanup.enter_context(lock_path.open("a+"))
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            cleanup.callback(fcntl.flock, lock_file, fcntl.LOCK_UN)
+            previous = subprocess.check_output(["powerprofilesctl", "get"], text=True, timeout=10).strip()
+            cleanup.callback(subprocess.run, ["sudo", "-n", "powerprofilesctl", "set", previous],
+                             check=False, timeout=15)
+            subprocess.run(["sudo", "-n", "powerprofilesctl", "set", "performance"], check=True, timeout=15)
             if lock_file.fileno() != 9:
                 os.dup2(lock_file.fileno(), 9)
+                cleanup.callback(os.close, 9)
             passed["pass_fds"] = (9,)
         with log.open("w") as handle:
             completed = subprocess.run(argv, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT, **passed)
-    finally:
-        if previous and previous != "performance":
-            subprocess.run(["sudo", "-n", "powerprofilesctl", "set", previous], check=False, timeout=15)
-        if lock_file is not None:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.close()
     print(log.read_text(errors="replace")[-2000:], flush=True)
     return completed.returncode
 
@@ -109,7 +99,8 @@ def run_perf(ctx, book, args) -> None:
     branch, sha = pin_line(ctx.repo)
     harness = Path(args.harness).expanduser()
     problem = check_harness(harness, sha)
-    sealed = ctx.run_dir / "scorecard" / args.profile
+    source_run = Path(args.resume).expanduser().resolve() if args.resume else ctx.run_dir
+    sealed = source_run / "scorecard" / args.profile
     started = time.monotonic()
 
     def commit(record: dict) -> None:
@@ -127,6 +118,7 @@ def run_perf(ctx, book, args) -> None:
         "harness_path": str(harness),
         "sealed": str(sealed),
         "profile": args.profile,
+        "resumed_from": str(source_run) if args.resume else None,
     }
     if problem:
         record["counts"] = {"reason": problem}
@@ -137,6 +129,14 @@ def run_perf(ctx, book, args) -> None:
         record["counts"] = {"reason": "--resume and --plan-only together do not make sense"}
         commit(record)
         return
+    if args.resume:
+        if not (sealed / "manifest.jsonl").is_file():
+            record["counts"] = {"reason": f"no sealed manifest under {source_run}"}
+            commit(record)
+            return
+        original = json.loads((source_run / "perf-spec.json").read_text())
+        args.binary, args.library = original["binary"], original.get("library")
+        args.control, args.no_control = original.get("control"), not original.get("control")
     binary = Path(args.binary).expanduser()
     if not binary.is_file():
         record["counts"] = {"reason": f"missing candidate binary {binary}"}
@@ -178,7 +178,7 @@ def run_perf(ctx, book, args) -> None:
     }
     spec_path = ctx.run_dir / "perf-spec.json"
     config_path = ctx.run_dir / "scorecard-config.json"
-    report_path = ctx.run_dir / "suite-filter.json"
+    report_path = source_run / "suite-filter.json"
     spec_path.write_text(json.dumps(spec, indent=2) + "\n")
     if not manifest.exists():
         rc = _run(
@@ -230,7 +230,7 @@ def run_perf(ctx, book, args) -> None:
         record["counts"] = _suite_counts(report)
 
     record["counts"]["power_profile"] = "performance"
-    record["counts"]["power_profile_via"] = "sudo -n; the session polkit denies switch-profile"
+    record["counts"]["power_profile_via"] = "configured host profile controller"
     record["counts"]["timing_lock"] = "fd 9 held by verify, which is how the harness skips its own switch"
     rc = _run(
         [ctx.python, "bench/scorecard.py", "run", "--run-dir", str(sealed)],

@@ -24,6 +24,7 @@ Run directly to check the comparator itself: .venv/bin/python tools/oracle_compa
 import datetime
 import decimal
 import math
+from fractions import Fraction
 from typing import Any, Optional
 
 REL_TOL = 1e-4
@@ -31,6 +32,30 @@ REL_TOL = 1e-4
 FLOAT_DIGITS = 6
 # The result was computed in zpq's f64 lane, whatever type the oracle reports or the JSON number looks like.
 F64 = "f64"
+
+
+def decimal_mean(total, n, scale):
+    """Exact decimal mean, rounded half away from zero at the result's scale."""
+    if not n:
+        return None
+    q = Fraction(decimal.Decimal(str(total))) / n * 10**scale
+    m = (2 * abs(q.numerator) + q.denominator) // (2 * q.denominator)
+    return decimal.Decimal(f"{'-' if q < 0 else ''}{m}E-{scale}")
+
+
+def canon_rows(rows, lanes=None):
+    return sorted((tuple(canon(v, lanes[i] if lanes else None) for i, v in enumerate(row)) for row in rows),
+                  key=repr)
+
+
+def require_rows(got, want, source="duck"):
+    """Require equality after the caller applies its ordered or multiset policy."""
+    if got == want:
+        return
+    if len(got) != len(want):
+        raise SystemExit(f"zpq={len(got)} {source}={len(want)}")
+    first = next((a, b) for a, b in zip(got, want) if a != b)
+    raise SystemExit(f"row zpq={first[0]} {source}={first[1]}"[:400])
 
 # Fixtures (repo paths) whose statistics DuckDB trusts although the spec says not to, so its filtered answers on them
 # can be wrong. The fixtures come from tools/gen_stats_order_fixtures.py.

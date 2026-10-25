@@ -328,7 +328,7 @@ def _cross(ctx: Ctx, target: str, cpu: str | None) -> Cmd:
     args = ["-Dtarget=" + target, "-Doptimize=ReleaseFast", f"-Drevision={ctx.revision}"]
     if cpu:
         args.append(f"-Dcpu={cpu}")
-    args.append(f"--prefix={prefix}")
+    args.extend(["--prefix", str(prefix)])
     return Cmd(_zig_build(ctx, *args), _base_env(ctx), f"ReleaseFast cross build {target}")
 
 

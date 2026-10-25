@@ -21283,6 +21283,8 @@ test "packed composite count survives releasing windows and late dictionary refu
             var reader: Reader = .{ .window = .{ .bytes = try ta.dupe(u8, bytes), .meta = &meta }, .fault = fault };
             var input = reader.window.input(bytes);
             input.dict_wait = .{ .ctx = &reader, .wait = Reader.ready };
+            var budget: core_memory.SharedBudget = .{ .limit = args.max_memory };
+            args.ledger = &budget;
             args.inputs = (&input)[0..1];
             args.parallelism = j;
             args.decode_batch_rows = batch;
@@ -21318,14 +21320,66 @@ test "packed composite count survives releasing windows and late dictionary refu
             try testing.expectEqual(@as(usize, 16), reader.window.releases.load(.monotonic));
             try testing.expectEqual(@as(usize, @intFromBool(fault)), reader.window.abandoned);
             try testing.expectEqual(fault, reader.changed);
+            try testing.expect(budget.used.load(.monotonic) < 1 << 20);
         };
         if (shape == 1) {
             args.inputs = &mapped;
             args.start_reads = null;
             args.dict_probe = null;
             args.taken = null;
+            args.ledger = null;
             args.parallelism = 1;
             args.decode_batch_rows = 64;
+            const bad = try a.dupe(u8, bytes);
+            for ([_]usize{ 0, 2 }) |rg| for ([_]usize{ 0, 2 }) |ci| {
+                const cm = meta.row_groups.items[rg].columns.items[ci].meta_data.?;
+                var header = thrift_mod.Reader.init(bad[@intCast(cm.data_page_offset)..]);
+                const page = try schema.PageHeader.read(&header);
+                const body = @as(usize, @intCast(cm.data_page_offset)) + header.pos;
+                @memset(bad[body..][0..@min(12, @as(usize, @intCast(page.compressed_page_size)))], 0xff);
+            };
+            var failure_args = args;
+            var expected_error: ?anyerror = null;
+            var expected_page: ?u32 = null;
+            for (1..17) |j| for ([_]usize{ 0, 64 }) |batch| for ([_]bool{ false, true }) |records| {
+                var trial = std.heap.ArenaAllocator.init(gpa);
+                defer trial.deinit();
+                var reader: Reader = .{
+                    .window = .{ .bytes = try trial.allocator().dupe(u8, bad), .meta = &meta },
+                    .fault = false,
+                };
+                var input = reader.window.input(bad);
+                input.dict_wait = .{ .ctx = &reader, .wait = Reader.ready };
+                failure_args.inputs = (&input)[0..1];
+                failure_args.dict_probe = .{ .ctx = &reader, .add = Reader.probe };
+                failure_args.start_reads = .{ .ctx = &reader, .start = Reader.start, .abandon = Reader.abandon };
+                var budget: core_memory.SharedBudget = .{ .limit = args.max_memory };
+                failure_args.ledger = &budget;
+                failure_args.parallelism = j;
+                failure_args.decode_batch_rows = batch;
+                failure_args.integer_records = records;
+                var taken: std.EnumSet(FastPath) = .{};
+                failure_args.taken = &taken;
+                const err = failure: {
+                    var unexpected = prepareAggregate(gpa, trial.allocator(), failure_args, false) catch |e|
+                        break :failure e;
+                    unexpected.deinit(gpa);
+                    return error.TestUnexpectedResult;
+                };
+                try testing.expect(consumer.isDecodeError(err));
+                if (records) try testing.expect(taken.contains(.integer_records));
+                const site = consumer.decodeFailure().?;
+                try testing.expectEqual(@as(usize, 0), site.column);
+                try testing.expect(site.rg == &meta.row_groups.items[0]);
+                if (expected_error) |want_error| {
+                    try testing.expectEqual(want_error, err);
+                    try testing.expectEqual(expected_page, site.page);
+                } else {
+                    expected_error = err;
+                    expected_page = site.page;
+                }
+                try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+            };
             var fixed: NoInPlaceResize = .{ .child = gpa };
             try testing.checkAllAllocationFailures(fixed.allocator(), packedAllocationTrial, .{
                 args, want.output.group_rows.?,

@@ -14711,6 +14711,12 @@ test "inline records decline released remote windows and retry only through a re
             }
         }
     };
+    const integer_outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "n" },
+        .{ .source = .{ .agg = 0 }, .name = "c" },
+        .{ .source = .{ .agg = 1 }, .name = "s" },
+    };
+    const names_credit = outputNamesBytes(&integer_outputs);
     for ([_]usize{ 0, 4, 8 }) |requested| for ([_]bool{ false, true }) |mapped| for (0..3) |shape| {
         const bytes_key = shape != 0;
         const parallel_retry = requested == 4;
@@ -14722,7 +14728,7 @@ test "inline records decline released remote windows and retry only through a re
             .bytes = buffer,
             .meta = &meta,
             .budget = &budget,
-            .refuse_at = owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, 0),
+            .refuse_at = owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, names_credit),
             .force_decode = !bytes_key,
         };
         const in = [_]Input{.{
@@ -14793,7 +14799,10 @@ test "inline records decline released remote windows and retry only through a re
         const explanation = try explainAggregate(gpa, a, args);
         const expected: RecordAdmission = .{
             .layout = if (bytes_key) .byte_group_stream else .integer_group_stream,
-            .reservation = if (bytes_key) owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0) else owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, 0),
+            .reservation = if (bytes_key)
+                owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0)
+            else
+                integerQuote(n, 1, null, args, false, names_credit),
         };
         try testing.expectEqual(expected, explanation.record_path.?);
     }

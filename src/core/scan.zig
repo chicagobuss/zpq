@@ -20491,3 +20491,78 @@ test "distinct owner radix completes full pairs after releasing every reader win
     const remote = try explainAggregate(gpa, a, args);
     try testing.expect(remote.record_path == null);
 }
+
+test "shared integer scalar consumer owns answers after releasing each full or sliced reader window" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    var sum: i128 = 0;
+    var present: u64 = 0;
+    var all: u64 = 0;
+    var lo: i64 = std.math.maxInt(i64);
+    var hi: i64 = std.math.minInt(i64);
+    for (0..16) |rg| {
+        var values: [193]i64 = undefined;
+        var defs: [193]u32 = undefined;
+        for (&values, &defs, 0..) |*v, *d, r| {
+            v.* = @as(i64, @intCast(r * 137 + rg * 73)) - 15000;
+            d.* = @intFromBool(r % 11 != 0);
+            all += 1;
+            if (d.* != 0) {
+                sum += v.*;
+                present += 1;
+                lo = @min(lo, v.*);
+                hi = @max(hi, v.*);
+            }
+        }
+        try file.append(&.{.{
+            .name = "v",
+            .parquet_type = .INT64,
+            .nullable = true,
+            .col = .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1 } },
+        }}, values.len, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&.{.{
+        .name = "v",
+        .parquet_type = .INT64,
+        .nullable = true,
+        .col = .{ .i64 = .{ .values = &.{} } },
+    }});
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    for (meta.row_groups.items) |*rg| rg.columns.items[0].meta_data.?.statistics = null;
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch| {
+        var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+        const inputs = [_]Input{window.input(bytes)};
+        var got = try runMultiAggregate(gpa, a, .{
+            .inputs = &inputs,
+            .metas = (&meta)[0..1],
+            .aggregate = "count(*) AS c,sum(v) AS s,min(v) AS lo,max(v) AS hi,avg(v) AS av,count(v) AS n",
+            .parallelism = j,
+            .decode_batch_rows = batch,
+            .encoded = false,
+            .scan_all = true,
+            .min_bytes_per_worker = 1,
+            .start_reads = .{
+                .ctx = &window,
+                .start = ReleasingScanWindow.start,
+                .abandon = ReleasingScanWindow.abandon,
+            },
+        });
+        defer got.deinit(gpa);
+        const acc = got.state.accumulators;
+        try testing.expectEqual(all, acc[0].count);
+        try testing.expectEqual(sum, acc[1].sum_i.?);
+        try testing.expectEqual(lo, acc[2].min_i.?);
+        try testing.expectEqual(hi, acc[3].max_i.?);
+        try testing.expectEqual(sum, acc[4].avg.isum);
+        try testing.expectEqual(present, acc[4].avg.count);
+        try testing.expectEqual(present, acc[5].count);
+        try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), window.abandoned);
+    };
+}

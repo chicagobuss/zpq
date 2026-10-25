@@ -4245,9 +4245,18 @@ fn scanRGForAggImpl(
             // before the next row group, or one worker's local table keeps every key it has seen.
             if (g.part) |p| if (g.local) |local| try p.pump(local, g.table, @intCast(sel.count()));
         },
-        .scalar => |s| {
+        .scalar => |s| scalar: {
             // Update only the aggs that weren't handled via stats. The agg's
             // own per-WHERE predicate (if any) is composed inside updateOne.
+            if (!staged and try expr_agg.updateSharedInteger(
+                ra,
+                s.calls,
+                s.accumulators,
+                handled_via_stats,
+                &batch,
+                lookup,
+                &sel,
+            )) break :scalar;
             for (s.calls, s.accumulators, handled_via_stats, 0..) |call, *acc, handled, i| {
                 if (handled) continue;
                 var call_arena = std.heap.ArenaAllocator.init(side);
@@ -4408,6 +4417,8 @@ fn scanRGSliced(
             .scalar => |s| {
                 if (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target) and
                     try foldScalarCache(sa, gpa, s.calls, s.accumulators, handled, &batch, lookup, &sel)) continue;
+                if (try expr_agg.updateSharedInteger(sa, s.calls, s.accumulators, handled, &batch, lookup, &sel))
+                    continue;
                 for (s.calls, s.accumulators, handled) |call, *acc, h| {
                     if (h) continue;
                     try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);

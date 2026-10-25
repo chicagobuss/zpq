@@ -1658,6 +1658,118 @@ pub fn updateOne(
     }
 }
 
+/// Several scalar calls on one flat signed integer input share one selection and one value pass. Admission is
+/// complete before any state changes; expressions, per-call filters and coded histogram folds keep updateOne.
+pub fn updateSharedInteger(
+    arena: std.mem.Allocator,
+    calls: []const AggCall,
+    states: []Accumulator,
+    handled: []const bool,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const filter_selection.SelectionVector,
+) Error!bool {
+    var col_idx: ?usize = null;
+    var value_calls: usize = 0;
+    var ops: u3 = 0;
+    for (calls, handled) |call, h| {
+        if (h) continue;
+        if (call.where != null or call.func == .count_distinct) return false;
+        const arg = call.arg orelse {
+            if (call.func != .count) return false;
+            continue;
+        };
+        if (arg != .col_ref or arg.col_ref.expr_type != .i64 or arg.col_ref.unsigned_64) return false;
+        if (col_idx) |ci| {
+            if (ci != arg.col_ref.col_idx) return false;
+        } else col_idx = arg.col_ref.col_idx;
+        value_calls += 1;
+        switch (call.func) {
+            .sum, .avg => ops |= 1,
+            .min => ops |= 2,
+            .max => ops |= 4,
+            .count => {},
+            .count_distinct => unreachable,
+        }
+    }
+    if (value_calls < 2) return false;
+    const ci = col_idx orelse return false;
+    if (ci >= lookup.len) return false;
+    const pos = lookup[ci] orelse return false;
+    const col = batch.cols[pos];
+    if (col != .i32 and col != .i64) return false;
+    if (col.codes() != null or col.nullInfo().max_rep != 0) return false;
+    var selected: ?filter_selection.SelectionVector = null;
+    defer if (selected) |*mask| mask.deinit();
+    if (columnHasNulls(col)) {
+        selected = try outer.cloneAlloc(arena);
+        intersectPresentMask(&selected.?, col);
+    }
+    const sel = if (selected) |*mask| mask else outer;
+    const stats = switch (col) {
+        inline .i32, .i64 => |c| blk: {
+            // Dispatch once, keeping unused operations outside the inner loop.
+            switch (ops) {
+                inline 0...7 => |mask| break :blk sharedIntegerStats(mask, c.values, sel),
+            }
+        },
+        else => unreachable,
+    };
+    const outer_count = outer.count();
+    for (calls, states, handled) |call, *state, h| {
+        if (h) continue;
+        switch (call.func) {
+            .count => state.count += if (call.arg == null) outer_count else stats.count,
+            .sum => if (stats.count != 0) {
+                state.sum_i = (state.sum_i orelse 0) + stats.sum + @as(i128, call.offset) * stats.count;
+            },
+            .min => if (stats.count != 0) {
+                state.min_i = if (state.min_i) |v| @min(v, stats.min) else stats.min;
+            },
+            .max => if (stats.count != 0) {
+                state.max_i = if (state.max_i) |v| @max(v, stats.max) else stats.max;
+            },
+            .avg => {
+                state.avg.isum += stats.sum;
+                state.avg.count += stats.count;
+            },
+            .count_distinct => unreachable,
+        }
+    }
+    return true;
+}
+
+const IntegerStats = struct {
+    sum: i128 = 0,
+    min: i64 = std.math.maxInt(i64),
+    max: i64 = std.math.minInt(i64),
+    count: u64 = 0,
+};
+
+fn sharedIntegerStats(comptime ops: u3, vals: anytype, sel: *const filter_selection.SelectionVector) IntegerStats {
+    var out: IntegerStats = .{};
+    for (sel.mask, 0..) |word, w| {
+        // SelectionVector clears unused tail bits. Do not read placeholder values in inactive or NULL rows.
+        out.count += @popCount(word);
+        if (word == std.math.maxInt(u64)) {
+            for (vals[w * 64 ..][0..64]) |v| {
+                if (ops & 1 != 0) out.sum += @as(i128, v);
+                if (ops & 2 != 0) out.min = @min(out.min, v);
+                if (ops & 4 != 0) out.max = @max(out.max, v);
+            }
+        } else {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const v = vals[w * 64 + @ctz(bits)];
+                if (ops & 1 != 0) out.sum += @as(i128, v);
+                if (ops & 2 != 0) out.min = @min(out.min, v);
+                if (ops & 4 != 0) out.max = @max(out.max, v);
+            }
+        }
+    }
+    return out;
+}
+
 fn foldDistinct(
     persist: std.mem.Allocator,
     state: *Accumulator,
@@ -7136,4 +7248,93 @@ test "distinct bitmaps retain the hash reservation so a late outlier has identic
         }
         try testing.expectEqual(outcomes[0], outcomes[1]);
     }
+}
+
+test "shared integer scalar folds preserve exact lanes, NULLs, selections and refusal before mutation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testSharedInteger, .{});
+}
+
+fn testSharedInteger(a: std.mem.Allocator) !void {
+    const n = 193;
+    var values: [n]i64 = undefined;
+    var narrow: [n]i32 = undefined;
+    var defs: [n]u32 = undefined;
+    for (&values, &narrow, &defs, 0..) |*v, *v32, *d, r| {
+        v.* = switch (r % 5) {
+            0 => std.math.minInt(i64),
+            1 => std.math.maxInt(i64),
+            else => @as(i64, @intCast(r)) - 97,
+        };
+        v32.* = @intCast(@as(i64, @intCast(r)) - 97);
+        d.* = @intFromBool(r % 11 != 0);
+    }
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "all" },
+        .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "s", .offset = -17 },
+        .{ .func = .min, .arg = arg, .result = .i64, .where = null, .alias = "lo" },
+        .{ .func = .max, .arg = arg, .result = .i64, .where = null, .alias = "hi" },
+        .{ .func = .avg, .arg = arg, .result = .avg_f64, .where = null, .alias = "a" },
+        .{ .func = .count, .arg = arg, .result = .i64, .where = null, .alias = "present" },
+        .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "again", .offset = 31 },
+    };
+    for ([_]bool{ false, true }) |is_narrow| {
+        const col: filter_eval.Batch.Column = if (is_narrow)
+            .{ .i32 = .{ .values = &narrow, .def_levels = &defs, .max_def = 1, .has_nulls = true } }
+        else
+            .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
+        const batch: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = n };
+        for (0..4) |mode| {
+            var sel = try filter_selection.SelectionVector.init(a, n);
+            defer sel.deinit();
+            for (0..n) |r| sel.set(r, switch (mode) {
+                0 => true,
+                1 => false,
+                2 => r % 3 != 0,
+                else => r % 71 == 0,
+            });
+            // Exercise every compile-time operation mask and repeat updates from nonempty states.
+            for (0..8) |mask| {
+                var handled: [calls.len]bool = @splat(false);
+                handled[1] = mask & 1 == 0;
+                handled[2] = mask & 2 == 0;
+                handled[3] = mask & 4 == 0;
+                handled[4] = mask & 1 == 0;
+                handled[6] = mask & 1 == 0;
+                // At least two value calls are needed to justify the common-input kernel.
+                if (mask == 0) handled[2] = false;
+                var want: [calls.len]Accumulator = undefined;
+                var got: [calls.len]Accumulator = undefined;
+                for (calls, &want, &got) |call, *w, *g| {
+                    w.* = .init(call);
+                    g.* = .init(call);
+                }
+                for (0..2) |_| {
+                    for (calls, &want, handled) |call, *w, h| if (!h) {
+                        try updateOne(a, a, w, call, &batch, &.{0}, &sel);
+                    };
+                    try std.testing.expect(try updateSharedInteger(a, &calls, &got, &handled, &batch, &.{0}, &sel));
+                }
+                for (want, got) |w, g| try std.testing.expectEqualDeep(w, g);
+            }
+        }
+    }
+    var sel = try filter_selection.SelectionVector.init(a, n);
+    defer sel.deinit();
+    var states: [calls.len]Accumulator = undefined;
+    for (calls, &states) |call, *state| state.* = .init(call);
+    const before = states;
+    var unsupported = calls;
+    unsupported[calls.len - 1].arg.?.col_ref.unsigned_64 = true;
+    const batch: filter_eval.Batch = .{ .cols = &.{.{ .i64 = .{ .values = &values } }}, .num_rows = n };
+    try std.testing.expect(!try updateSharedInteger(
+        a,
+        &unsupported,
+        &states,
+        &@as([calls.len]bool, @splat(false)),
+        &batch,
+        &.{0},
+        &sel,
+    ));
+    try std.testing.expectEqualDeep(before, states);
 }

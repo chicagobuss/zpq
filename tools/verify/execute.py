@@ -123,6 +123,8 @@ def _record(name, status, rc, duration, log_path, counts, cmd: stages.Cmd) -> di
         "counts": counts,
         "command": cmd.argv,
     }
+    if cmd.optimize:
+        record["optimize"] = cmd.optimize
     if cmd.expect:
         record["expect"] = cmd.expect
         record["expect_rc"] = cmd.expect_rc

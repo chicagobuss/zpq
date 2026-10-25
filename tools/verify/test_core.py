@@ -58,6 +58,27 @@ class CpuTest(unittest.TestCase):
             query.assert_not_called()
 
 
+class TestOptimizeTest(unittest.TestCase):
+    def test_edit_tiers_keep_unfiltered_safe_units_and_full_keeps_debug(self):
+        ctx = verify.dummy_ctx()
+        for tier in ("quick", "commit", "full"):
+            units = [stages.describe(name, ctx) for name in stages.names_for(tier)
+                     if name in ("test-core", "test-full")]
+            self.assertEqual(len(units), 1)
+            cmd = units[0]
+            mode = "Debug" if tier == "full" else "ReleaseSafe"
+            self.assertIn(f"-Doptimize={mode}", cmd.argv)
+            self.assertEqual(cmd.optimize, mode)
+            self.assertFalse(any("test-filter" in arg for arg in cmd.argv))
+            record = execute._record("units", "pass", 0, 1.0, Path("units.log"), {}, cmd)
+            with tempfile.TemporaryDirectory() as d:
+                book = summary.Summary(Path(d), {"tier": tier, "sha": "a" * 40})
+                book.add_stage(record)
+                saved = json.loads(book.path.read_text())["stages"][0]
+                self.assertEqual(saved["optimize"], mode)
+                self.assertEqual(saved["command"], cmd.argv)
+
+
 class EnvironmentTest(unittest.TestCase):
     def test_missing_and_wrong_versions_stop_before_host_probes(self):
         installed = {"duckdb": "1.4.3"}

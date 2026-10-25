@@ -208,8 +208,11 @@ pub fn build(b: *std.Build) void {
     // self-hosted linker that incremental builds use does not.
     const dev_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
     const dev_tests = b.addTest(.{ .root_module = dev_core.zpq, .filters = test_filters });
-    const test_core_step = b.step("test-core", "Run the core unit tests only (src/zpq.zig and what it imports)");
+    // verify quick/commit select ReleaseSafe; the full `test` gate retains Debug and every exhaustive sweep.
+    const test_core_step = b.step("test-core", "Run all core unit tests (-Doptimize selects mode; default Debug)");
     test_core_step.dependOn(&observedTest(b, dev_tests, observe_tests).step);
+    const test_core_bin_step = b.step("test-core-bin", "Install the same core test binary without running it");
+    test_core_bin_step.dependOn(&b.addInstallArtifact(dev_tests, .{ .dest_sub_path = "zpq-core-test" }).step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(test_cli_step);

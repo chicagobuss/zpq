@@ -43,9 +43,9 @@ def guide() -> str:
              "Usage: python tools/verify/verify.py COMMAND [OPTIONS]", "",
              "Tiers"]
     tiers = {
-        "quick": "Core unit tests (zig build test-core). The edit loop.",
-        "commit": "Core tests, ReleaseFast CLI, unified CLI contracts/readback, and the full ReleaseSafe referee.",
-        "full": "Every full stage below. Requires --base PATH: the previously integrated comparison binary.",
+        "quick": "All core unit tests in ReleaseSafe, with unchanged scales. The edit loop.",
+        "commit": "ReleaseSafe core tests, ReleaseFast CLI, CLI contracts/readback, and the full ReleaseSafe referee.",
+        "full": "Every full stage below, with Debug units. Requires --base PATH: the previous comparison binary.",
     }
     modes = {
         "soak": "Seeded aggregate fuzz, differential, unit and coverage fuzz. --hours sets the duration; "

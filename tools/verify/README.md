@@ -15,9 +15,16 @@ python tools/verify/verify.py perf --help
 ```
 
 No arguments and `--help` show every stage, tier, requirement and exit code.
-`quick` runs core tests. `commit` builds the CLI, runs the CLI contracts and independent reader checks, and runs the full
-differential referee.
+`quick` runs every core test in ReleaseSafe, with safety checks and unchanged
+test scales. `commit` uses the same core tests, builds the CLI, runs the CLI
+contracts and independent reader checks, and runs the full differential referee.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
+`full`'s unit tests stay in Debug, including the environment-clearing and SIGPIPE
+handler identity ABI tests. No test or exhaustive sweep is moved or omitted
+from quick/commit; the core optimization mode is their only coverage change.
+Each unit stage records `optimize` beside its exact command in summary.json.
+For separate compile/run measurements, `zig build test-core-bin -Doptimize=MODE`
+installs `zig-out/bin/zpq-core-test`; run it from the repository root.
 Versioned Parquet corpora must match the existing `just fetch-corpus` pin;
 a mismatch stops before gates and its revision is recorded in provenance.
 `--base` is the previously integrated comparison binary; it is required for

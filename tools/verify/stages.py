@@ -41,6 +41,7 @@ class Cmd:
     expect_text: str = ""
     parse: object | None = None
     expected_skips: dict[str, str] = field(default_factory=dict)
+    optimize: str | None = None
 
 
 def _last(pattern, text):
@@ -161,8 +162,9 @@ def _python(ctx: Ctx, script: str, about: str, *args, needs=(), parse=None) -> C
 
 
 def stage_test_core(ctx: Ctx) -> Cmd:
-    return Cmd(_zig_build(ctx, "test-core", "-Dobserve-tests=true", "--summary", "all"),
-               _base_env(ctx), "core unit tests", parse=parse_tests)
+    return Cmd(_zig_build(ctx, "test-core", "-Doptimize=ReleaseSafe", "-Dobserve-tests=true", "--summary", "all"),
+               _base_env(ctx), "ReleaseSafe core unit tests (all tests, unchanged scales)",
+               parse=parse_tests, optimize="ReleaseSafe")
 
 
 def stage_build_fast(ctx: Ctx) -> Cmd:
@@ -179,8 +181,8 @@ def stage_build_fast(ctx: Ctx) -> Cmd:
 
 
 def stage_test_full(ctx: Ctx) -> Cmd:
-    return Cmd(_zig_build(ctx, "test", "-Dobserve-tests=true", "--summary", "all"),
-               _base_env(ctx), "unit tests", parse=parse_tests)
+    return Cmd(_zig_build(ctx, "test", "-Doptimize=Debug", "-Dobserve-tests=true", "--summary", "all"),
+               _base_env(ctx), "Debug unit tests", parse=parse_tests, optimize="Debug")
 
 
 def stage_integration(ctx: Ctx) -> Cmd:

@@ -107,7 +107,7 @@ jobs:
           git -C data/parquet-testing checkout --quiet 1a2a75127be06fc0123f03ebd36c966f7beda27d
 
       - name: Generate nested edges fixture
-        run: python3 tools/gen_nested_fixture.py
+        run: python3 tools/zpq-gen nested --out data
 
       # Step 1: builds zpq + zpq-lambda for native linux-x86_64. The build
       # downloads the pinned BoringSSL prebuilts (sha256-checked against

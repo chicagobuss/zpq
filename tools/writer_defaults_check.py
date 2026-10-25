@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 
-from gen_stats_order_fixtures import Reader, T_STRUCT, field
+from datagen.parquet import Reader, T_STRUCT, field
 
 
 def write(binary, source, output, names):

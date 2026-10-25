@@ -44,7 +44,7 @@ def guide() -> str:
              "Tiers"]
     tiers = {
         "quick": "Core unit tests (zig build test-core). The edit loop.",
-        "commit": "Core tests, ReleaseFast CLI, real CLI formatting checks, and the full ReleaseSafe referee.",
+        "commit": "Core tests, ReleaseFast CLI, unified CLI contracts/readback, and the full ReleaseSafe referee.",
         "full": "Every full stage below. Requires --base PATH: the previously integrated comparison binary.",
     }
     modes = {

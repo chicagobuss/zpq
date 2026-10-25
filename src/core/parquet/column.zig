@@ -1961,7 +1961,7 @@ test "malformed-file fixtures decode or fail cleanly instead of trapping" {
 }
 
 test "a file whose schema root carries a physical type decodes its columns" {
-    // segmentio/parquet-go types the root as well as giving it children; see tools/gen_typed_root_fixture.py.
+    // segmentio/parquet-go types the root as well as giving it children; see tools/zpq-gen typed_root.
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();

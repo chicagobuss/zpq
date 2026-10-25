@@ -228,29 +228,15 @@ pub fn build(b: *std.Build) void {
     }), .filters = test_filters });
     test_step.dependOn(&observedTest(b, libzpq_tests, observe_tests).step);
 
-    // Build the unit-test executables without running them, so a cross-compiled pair can be copied to and run on
+    // Build the unit-test executables without running them, so they can be copied to and run on
     // the target (tools/macos_bundle.sh). Run them from the repo root (or a bundle mirroring it): fixtures are
     // cwd-relative.
-    const test_bin_step = b.step("test-bin", "Install the unit-test executables (zpq-test, zpq-lambda-test) without running them");
+    const test_bin_step = b.step("test-bin", "Install all unit-test executables without running them");
     test_bin_step.dependOn(&b.addInstallArtifact(lib_tests, .{ .dest_sub_path = "zpq-test" }).step);
     test_bin_step.dependOn(&b.addInstallArtifact(lambda_tests, .{ .dest_sub_path = "zpq-lambda-test" }).step);
-
-    // Opt-in soak tests for edge-case regressions. Kept out of the default
-    // unit-test step so Tier 1/Tier 2 stay fast; `just gauntlet` runs these.
-    const soak_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/soak.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zpq", .module = test_zpq_mod },
-            },
-        }),
-    });
-    const run_soak_tests = observedTest(b, soak_tests, observe_tests);
-
-    const soak_step = b.step("test-soak", "Run opt-in soak/regression tests");
-    soak_step.dependOn(&run_soak_tests.step);
+    test_bin_step.dependOn(&b.addInstallArtifact(cli_tests, .{ .dest_sub_path = "zpq-cli-test" }).step);
+    test_bin_step.dependOn(&b.addInstallArtifact(service_tests, .{ .dest_sub_path = "zpq-service-test" }).step);
+    test_bin_step.dependOn(&b.addInstallArtifact(libzpq_tests, .{ .dest_sub_path = "zpq-libzpq-test" }).step);
 
     // ----- Integration tests (Lambda fake runtime) -----
     // Spawns the built zpq-lambda binary against an in-process fake

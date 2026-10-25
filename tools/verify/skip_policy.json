@@ -8,8 +8,7 @@
     ],
     "full": [
       "test-full",
-      "integration",
-      "test-soak"
+      "integration"
     ],
     "soak": [
       "test-full"

@@ -154,7 +154,7 @@ PY
 # ...nor is it confused with the field b of a group a, whose path joins to the
 # same "a.b": both columns read, --columns a.b names the top-level one, and the
 # bare b binds to the nested field.
-"$PY" "$(dirname "$0")/gen_dotted_twin_fixture.py" "$DIR/dotted_twin.parquet" > /dev/null
+"$PY" "$(dirname "$0")/zpq-gen" dotted_twin --out "$DIR" > /dev/null
 "$ZPQ" query "$DIR/dotted_twin.parquet" -o "$DIR/dotted_twin_top.parquet" --columns a.b 2> /dev/null
 "$ZPQ" query "$DIR/dotted_twin.parquet" -o "$DIR/dotted_twin_both.parquet" --columns a.b,a 2> /dev/null
 "$ZPQ" query "$DIR/dotted_twin.parquet" -o "$DIR/dotted_twin_filtered.parquet" --filter 'b > 10' 2> /dev/null

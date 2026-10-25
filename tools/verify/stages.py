@@ -82,11 +82,11 @@ def parse_modules(text):
     return {"modules": int(match.group(1)), "tests": int(match.group(2))}
 
 
-def parse_cli_tier(text):
-    match = _last(r"cli-tier: (\d+)/(\d+) checks match", text)
+def parse_cli_contracts(text):
+    match = _last(r"CLI contract checks passed \((\d+) invocations;", text)
     if not match:
         return {}
-    return {"matched": int(match.group(1)), "total": int(match.group(2))}
+    return {"matched": int(match.group(1)), "total": int(match.group(1))}
 
 
 def parse_fd(text):
@@ -212,7 +212,8 @@ def stage_cli_smoke(ctx: Ctx) -> Cmd:
     return Cmd(
         ["tools/cli_smoke.sh", str(ctx.binary)],
         _base_env(ctx),
-        "CLI smoke and pyarrow readback",
+        "CLI contracts and PyArrow/DuckDB readback",
+        parse=parse_cli_contracts,
         blocked=_need(ctx.binary, "candidate binary"),
     )
 
@@ -296,24 +297,6 @@ def stage_write_robustness(ctx: Ctx) -> Cmd:
     )
 
 
-def stage_test_soak(ctx: Ctx) -> Cmd:
-    shell = " && ".join(
-        [
-            shlex.join(_zig_build(ctx, "test-soak", "-Dobserve-tests=true", "--summary", "all")),
-            shlex.join(
-                _zig_build(
-                    ctx,
-                    "-Doptimize=ReleaseFast",
-                    f"-Drevision={ctx.revision}",
-                    f"-Dcpu={ctx.cpu}",
-                )
-            ),
-            shlex.join([ctx.python, "tools/soak.py"]),
-        ]
-    )
-    return Cmd(["bash", "-c", shell], _base_env(ctx), "edge-case soak (distinct from verify soak)", parse=parse_tests)
-
-
 def _cross(ctx: Ctx, target: str, cpu: str | None) -> Cmd:
     prefix = ctx.run_dir / f"cross-{target}"
     args = ["-Dtarget=" + target, "-Doptimize=ReleaseFast", f"-Drevision={ctx.revision}"]
@@ -374,11 +357,6 @@ def referee_argv(ctx: Ctx) -> list[str]:
     return argv
 
 
-def stage_cli_tier(ctx: Ctx) -> Cmd:
-    return _python(ctx, "tools/runner/cli_tier.py", "CLI argument parsing and json, jsonl, parquet formatting",
-                   ctx.binary, needs=((ctx.binary, "candidate binary"),), parse=parse_cli_tier)
-
-
 def stage_referee(ctx: Ctx) -> Cmd:
     duck = Path(ctx.duckdb)
     shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"))
@@ -408,13 +386,12 @@ REGISTRY = [
     ("modules", ("full",), stage_modules),
     ("test-core", ("quick", "commit"), stage_test_core),
     ("build-fast", ("commit", "full"), stage_build_fast),
-    ("cli-tier", ("commit", "full"), stage_cli_tier),
     ("test-full", ("full",), stage_test_full),
     ("integration", ("full",), stage_integration),
     ("differential", ("commit", "full"), stage_referee),
     ("fd", ("full",), stage_fd),
     ("canonical", ("full",), stage_canonical),
-    ("cli-smoke", ("full",), stage_cli_smoke),
+    ("cli-smoke", ("commit", "full"), stage_cli_smoke),
     ("duckdb-smoke", ("full",), stage_duckdb_smoke),
     ("cb-sub1", ("full",), stage_cb_sub1),
     ("cb-sub16", ("full",), stage_cb_sub16),
@@ -422,7 +399,6 @@ REGISTRY = [
     ("libzpq", ("full",), stage_libzpq),
     ("repro-sigpipe", ("full",), stage_sigpipe),
     ("write-robustness", ("full",), stage_write_robustness),
-    ("test-soak", ("full",), stage_test_soak),
     ("cross-x86_64-linux-musl", ("full",), lambda ctx: _cross(ctx, "x86_64-linux-musl", ctx.cpu)),
     ("cross-aarch64-linux-musl", ("full",), lambda ctx: _cross(ctx, "aarch64-linux-musl", None)),
     ("cross-aarch64-macos", ("full",), lambda ctx: _cross(ctx, "aarch64-macos", None)),

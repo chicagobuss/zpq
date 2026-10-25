@@ -129,883 +129,357 @@
     },
     {
       "kind": "sql_ordered",
-      "id": "spill:spill_full:g8:j1",
+      "id": "spill:spill_full:g8",
       "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
       "jobs": [
-        1
+        1,
+        3,
+        16
       ],
       "spill_groups": "8"
     },
     {
       "kind": "sql_ordered",
-      "id": "spill:spill_full:g8:j3",
+      "id": "spill:spill_full:g262144",
       "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
       "jobs": [
-        3
-      ],
-      "spill_groups": "8"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_full:g8:j16",
-      "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
-      "jobs": [
-        16
-      ],
-      "spill_groups": "8"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_full:g262144:j1",
-      "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
-      "jobs": [
-        1
-      ],
-      "spill_groups": "262144"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_full:g262144:j3",
-      "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
-      "jobs": [
-        3
-      ],
-      "spill_groups": "262144"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_full:g262144:j16",
-      "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "spill_groups": "262144"
     },
     {
       "kind": "sql_ordered",
-      "id": "spill:spill_cut:g8:j1",
+      "id": "spill:spill_cut:g8",
       "sql": "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{path}' GROUP BY nname ORDER BY s DESC, nname LIMIT 7",
       "jobs": [
-        1
+        1,
+        3,
+        16
       ],
       "spill_groups": "8"
     },
     {
       "kind": "sql_ordered",
-      "id": "spill:spill_cut:g8:j3",
+      "id": "spill:spill_cut:g262144",
       "sql": "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{path}' GROUP BY nname ORDER BY s DESC, nname LIMIT 7",
       "jobs": [
-        3
-      ],
-      "spill_groups": "8"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_cut:g8:j16",
-      "sql": "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{path}' GROUP BY nname ORDER BY s DESC, nname LIMIT 7",
-      "jobs": [
-        16
-      ],
-      "spill_groups": "8"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_cut:g262144:j1",
-      "sql": "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{path}' GROUP BY nname ORDER BY s DESC, nname LIMIT 7",
-      "jobs": [
-        1
-      ],
-      "spill_groups": "262144"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_cut:g262144:j3",
-      "sql": "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{path}' GROUP BY nname ORDER BY s DESC, nname LIMIT 7",
-      "jobs": [
-        3
-      ],
-      "spill_groups": "262144"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_cut:g262144:j16",
-      "sql": "SELECT nname, sum(id) AS s, max(id) AS mx FROM '{path}' GROUP BY nname ORDER BY s DESC, nname LIMIT 7",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "spill_groups": "262144"
     },
     {
       "kind": "sql_ordered",
-      "id": "spill:spill_composite:g8:j1",
+      "id": "spill:spill_composite:g8",
       "sql": "SELECT name, flag, count(*) AS c FROM '{path}' WHERE id > -1000 GROUP BY name, flag ORDER BY name, flag",
       "jobs": [
-        1
-      ],
-      "spill_groups": "8"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_composite:g8:j3",
-      "sql": "SELECT name, flag, count(*) AS c FROM '{path}' WHERE id > -1000 GROUP BY name, flag ORDER BY name, flag",
-      "jobs": [
-        3
-      ],
-      "spill_groups": "8"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_composite:g8:j16",
-      "sql": "SELECT name, flag, count(*) AS c FROM '{path}' WHERE id > -1000 GROUP BY name, flag ORDER BY name, flag",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "spill_groups": "8"
     },
     {
       "kind": "sql_ordered",
-      "id": "spill:spill_composite:g262144:j1",
+      "id": "spill:spill_composite:g262144",
       "sql": "SELECT name, flag, count(*) AS c FROM '{path}' WHERE id > -1000 GROUP BY name, flag ORDER BY name, flag",
       "jobs": [
-        1
-      ],
-      "spill_groups": "262144"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_composite:g262144:j3",
-      "sql": "SELECT name, flag, count(*) AS c FROM '{path}' WHERE id > -1000 GROUP BY name, flag ORDER BY name, flag",
-      "jobs": [
-        3
-      ],
-      "spill_groups": "262144"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "spill:spill_composite:g262144:j16",
-      "sql": "SELECT name, flag, count(*) AS c FROM '{path}' WHERE id > -1000 GROUP BY name, flag ORDER BY name, flag",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "spill_groups": "262144"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_flag:p1:j1",
+      "id": "distinct:cd_flag:p1",
       "sql": "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{path}' GROUP BY flag ORDER BY flag",
       "jobs": [
-        1
+        1,
+        3,
+        16
       ],
       "distinct_pairs": "1"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_flag:p1:j3",
+      "id": "distinct:cd_flag:p0",
       "sql": "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{path}' GROUP BY flag ORDER BY flag",
       "jobs": [
-        3
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_flag:p1:j16",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
-        16
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_flag:p0:j1",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
-        1
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_flag:p0:j3",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_flag:p0:j16",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d, count(*) AS c FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "0"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_expr_key:p1:j1",
+      "id": "distinct:cd_expr_key:p1",
       "sql": "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{path}' WHERE id BETWEEN -40 AND 40 GROUP BY k ORDER BY k",
       "jobs": [
-        1
+        1,
+        3,
+        16
       ],
       "distinct_pairs": "1"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_expr_key:p1:j3",
+      "id": "distinct:cd_expr_key:p0",
       "sql": "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{path}' WHERE id BETWEEN -40 AND 40 GROUP BY k ORDER BY k",
       "jobs": [
-        3
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_expr_key:p1:j16",
-      "sql": "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{path}' WHERE id BETWEEN -40 AND 40 GROUP BY k ORDER BY k",
-      "jobs": [
-        16
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_expr_key:p0:j1",
-      "sql": "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{path}' WHERE id BETWEEN -40 AND 40 GROUP BY k ORDER BY k",
-      "jobs": [
-        1
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_expr_key:p0:j3",
-      "sql": "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{path}' WHERE id BETWEEN -40 AND 40 GROUP BY k ORDER BY k",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_expr_key:p0:j16",
-      "sql": "SELECT id - 1 AS k, count(DISTINCT amt) AS d FROM '{path}' WHERE id BETWEEN -40 AND 40 GROUP BY k ORDER BY k",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "0"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_int_date:p1:j1",
+      "id": "distinct:cd_int_date:p1",
       "sql": "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{path}' WHERE id > -1500 GROUP BY flag ORDER BY flag",
       "jobs": [
-        1
+        1,
+        3,
+        16
       ],
       "distinct_pairs": "1"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_int_date:p1:j3",
+      "id": "distinct:cd_int_date:p0",
       "sql": "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{path}' WHERE id > -1500 GROUP BY flag ORDER BY flag",
       "jobs": [
-        3
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_int_date:p1:j16",
-      "sql": "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{path}' WHERE id > -1500 GROUP BY flag ORDER BY flag",
-      "jobs": [
-        16
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_int_date:p0:j1",
-      "sql": "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{path}' WHERE id > -1500 GROUP BY flag ORDER BY flag",
-      "jobs": [
-        1
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_int_date:p0:j3",
-      "sql": "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{path}' WHERE id > -1500 GROUP BY flag ORDER BY flag",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_int_date:p0:j16",
-      "sql": "SELECT flag, count(DISTINCT d) AS d, sum(id) AS s FROM '{path}' WHERE id > -1500 GROUP BY flag ORDER BY flag",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "0"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_filter:p1:j1",
+      "id": "distinct:cd_filter:p1",
       "sql": "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{path}' GROUP BY flag ORDER BY flag",
       "jobs": [
-        1
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_filter:p1:j3",
-      "sql": "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_filter:p1:j16",
-      "sql": "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "1"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_filter:p0:j1",
+      "id": "distinct:cd_filter:p0",
       "sql": "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{path}' GROUP BY flag ORDER BY flag",
       "jobs": [
-        1
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_filter:p0:j3",
-      "sql": "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_filter:p0:j16",
-      "sql": "SELECT flag, count(DISTINCT id) FILTER (WHERE amt > 0) AS d FROM '{path}' GROUP BY flag ORDER BY flag",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "0"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_cut:p1:j1",
+      "id": "distinct:cd_cut:p1",
       "sql": "SELECT flag, count(DISTINCT amt) AS d FROM '{path}' WHERE amt IS NULL OR amt < 2000 GROUP BY flag ORDER BY d DESC, flag LIMIT 2",
       "jobs": [
-        1
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_cut:p1:j3",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d FROM '{path}' WHERE amt IS NULL OR amt < 2000 GROUP BY flag ORDER BY d DESC, flag LIMIT 2",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "1"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_cut:p1:j16",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d FROM '{path}' WHERE amt IS NULL OR amt < 2000 GROUP BY flag ORDER BY d DESC, flag LIMIT 2",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "1"
     },
     {
       "kind": "sql_ordered",
-      "id": "distinct:cd_cut:p0:j1",
+      "id": "distinct:cd_cut:p0",
       "sql": "SELECT flag, count(DISTINCT amt) AS d FROM '{path}' WHERE amt IS NULL OR amt < 2000 GROUP BY flag ORDER BY d DESC, flag LIMIT 2",
       "jobs": [
-        1
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_cut:p0:j3",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d FROM '{path}' WHERE amt IS NULL OR amt < 2000 GROUP BY flag ORDER BY d DESC, flag LIMIT 2",
-      "jobs": [
-        3
-      ],
-      "distinct_pairs": "0"
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "distinct:cd_cut:p0:j16",
-      "sql": "SELECT flag, count(DISTINCT amt) AS d FROM '{path}' WHERE amt IS NULL OR amt < 2000 GROUP BY flag ORDER BY d DESC, flag LIMIT 2",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "distinct_pairs": "0"
     },
     {
       "kind": "sql_ordered",
-      "id": "having:0:j1",
+      "id": "having:0",
       "fixture": "having",
       "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
       "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:0:j3",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:0:j16",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) < 400 ORDER BY c DESC LIMIT 5",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:1:j1",
+      "id": "having:1",
       "fixture": "having",
       "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
       "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:1:j3",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:1:j16",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING c < 400 ORDER BY c DESC LIMIT 5 OFFSET 3",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:2:j1",
+      "id": "having:2",
       "fixture": "having",
       "sql": "SELECT g FROM '{path}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
       "duck": "SELECT g FROM '{path}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:2:j3",
-      "fixture": "having",
-      "sql": "SELECT g FROM '{path}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
-      "duck": "SELECT g FROM '{path}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:2:j16",
-      "fixture": "having",
-      "sql": "SELECT g FROM '{path}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
-      "duck": "SELECT g FROM '{path}' GROUP BY g HAVING sum(v) < 5000000 ORDER BY sum(v) DESC LIMIT 4",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:3:j1",
+      "id": "having:3",
       "fixture": "having",
       "sql": "SELECT g, max(v) AS m FROM '{path}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
       "duck": "SELECT g, max(v) AS m FROM '{path}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:3:j3",
-      "fixture": "having",
-      "sql": "SELECT g, max(v) AS m FROM '{path}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
-      "duck": "SELECT g, max(v) AS m FROM '{path}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:3:j16",
-      "fixture": "having",
-      "sql": "SELECT g, max(v) AS m FROM '{path}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
-      "duck": "SELECT g, max(v) AS m FROM '{path}' GROUP BY g HAVING min(v) BETWEEN 1000 AND 2000 ORDER BY m",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:4:j1",
+      "id": "having:4",
       "fixture": "having",
       "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
       "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:4:j3",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:4:j16",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) > 0 ORDER BY g",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:5:j1",
+      "id": "having:5",
       "fixture": "having",
       "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
       "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:5:j3",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:5:j16",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING NOT (sum(x) > 0) ORDER BY g",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:6:j1",
+      "id": "having:6",
       "fixture": "having",
       "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
       "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:6:j3",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:6:j16",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' WHERE g BETWEEN 5 AND 9 GROUP BY g HAVING sum(x) IS NULL OR g = 5 ORDER BY g",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:7:j1",
+      "id": "having:7",
       "fixture": "having",
       "sql": "SELECT g, sum(p) AS sp FROM '{path}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) ORDER BY g",
       "duck": "SELECT g, sum(p) AS sp FROM '{path}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) ORDER BY g",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:7:j3",
-      "fixture": "having",
-      "sql": "SELECT g, sum(p) AS sp FROM '{path}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) ORDER BY g",
-      "duck": "SELECT g, sum(p) AS sp FROM '{path}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) ORDER BY g",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:7:j16",
-      "fixture": "having",
-      "sql": "SELECT g, sum(p) AS sp FROM '{path}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) ORDER BY g",
-      "duck": "SELECT g, sum(p) AS sp FROM '{path}' WHERE g < 30 GROUP BY g HAVING sum(p) >= 12345.67 AND g NOT IN (20, 21) ORDER BY g",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:8:j1",
+      "id": "having:8",
       "fixture": "having",
       "sql": "SELECT s, count(*) AS c FROM '{path}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
       "duck": "SELECT s, count(*) AS c FROM '{path}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:8:j3",
-      "fixture": "having",
-      "sql": "SELECT s, count(*) AS c FROM '{path}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
-      "duck": "SELECT s, count(*) AS c FROM '{path}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:8:j16",
-      "fixture": "having",
-      "sql": "SELECT s, count(*) AS c FROM '{path}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
-      "duck": "SELECT s, count(*) AS c FROM '{path}' GROUP BY s HAVING s > 's5' AND avg(v) > 499999.5 ORDER BY s",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:9:j1",
+      "id": "having:9",
       "fixture": "having",
       "sql": "SELECT h, s, count(*) AS c FROM '{path}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
       "duck": "SELECT h, s, count(*) AS c FROM '{path}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:9:j3",
-      "fixture": "having",
-      "sql": "SELECT h, s, count(*) AS c FROM '{path}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
-      "duck": "SELECT h, s, count(*) AS c FROM '{path}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:9:j16",
-      "fixture": "having",
-      "sql": "SELECT h, s, count(*) AS c FROM '{path}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
-      "duck": "SELECT h, s, count(*) AS c FROM '{path}' GROUP BY h, s HAVING count(*) >= 19608 ORDER BY c DESC, h, s LIMIT 3",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:10:j1",
+      "id": "having:10",
       "fixture": "having",
       "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) > 300 LIMIT 4",
       "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) > 300 ORDER BY g LIMIT 4",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:10:j3",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) > 300 LIMIT 4",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) > 300 ORDER BY g LIMIT 4",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:10:j16",
-      "fixture": "having",
-      "sql": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) > 300 LIMIT 4",
-      "duck": "SELECT g, count(*) AS c FROM '{path}' GROUP BY g HAVING count(*) > 300 ORDER BY g LIMIT 4",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:11:j1",
+      "id": "having:11",
       "fixture": "having",
       "sql": "SELECT count(*) AS c, sum(v) AS sv FROM '{path}' HAVING count(*) > 5",
       "duck": "SELECT count(*) AS c, sum(v) AS sv FROM '{path}' HAVING count(*) > 5",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:11:j3",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c, sum(v) AS sv FROM '{path}' HAVING count(*) > 5",
-      "duck": "SELECT count(*) AS c, sum(v) AS sv FROM '{path}' HAVING count(*) > 5",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:11:j16",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c, sum(v) AS sv FROM '{path}' HAVING count(*) > 5",
-      "duck": "SELECT count(*) AS c, sum(v) AS sv FROM '{path}' HAVING count(*) > 5",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:12:j1",
+      "id": "having:12",
       "fixture": "having",
       "sql": "SELECT count(*) AS c FROM '{path}' HAVING sum(v) < 0",
       "duck": "SELECT count(*) AS c FROM '{path}' HAVING sum(v) < 0",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:12:j3",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c FROM '{path}' HAVING sum(v) < 0",
-      "duck": "SELECT count(*) AS c FROM '{path}' HAVING sum(v) < 0",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:12:j16",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c FROM '{path}' HAVING sum(v) < 0",
-      "duck": "SELECT count(*) AS c FROM '{path}' HAVING sum(v) < 0",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:13:j1",
+      "id": "having:13",
       "fixture": "having",
       "sql": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) = 0",
       "duck": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) = 0",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:13:j3",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) = 0",
-      "duck": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) = 0",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:13:j16",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) = 0",
-      "duck": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) = 0",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
     {
       "kind": "sql_ordered",
-      "id": "having:14:j1",
+      "id": "having:14",
       "fixture": "having",
       "sql": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) > 0",
       "duck": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) > 0",
       "jobs": [
-        1
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:14:j3",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) > 0",
-      "duck": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) > 0",
-      "jobs": [
-        3
-      ]
-    },
-    {
-      "kind": "sql_ordered",
-      "id": "having:14:j16",
-      "fixture": "having",
-      "sql": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) > 0",
-      "duck": "SELECT count(*) AS c FROM '{path}' WHERE v < 0 HAVING count(*) > 0",
-      "jobs": [
+        1,
+        3,
         16
       ]
     },
@@ -1356,32 +830,12 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:ties:k:LIMIT 7:j1",
+      "id": "top:ties:k:LIMIT 7",
       "fixture": "tie_a",
       "format": "jsonl",
       "jobs": [
-        1
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k LIMIT 7",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k, filename, file_row_number LIMIT 7"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k:LIMIT 7:j3",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
-        3
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k LIMIT 7",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k, filename, file_row_number LIMIT 7"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k:LIMIT 7:j16",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k LIMIT 7",
@@ -1389,32 +843,12 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:ties:k DESC:LIMIT 9 OFFSET 2:j1",
+      "id": "top:ties:k DESC:LIMIT 9 OFFSET 2",
       "fixture": "tie_a",
       "format": "jsonl",
       "jobs": [
-        1
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC LIMIT 9 OFFSET 2",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k DESC, filename, file_row_number LIMIT 9 OFFSET 2"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k DESC:LIMIT 9 OFFSET 2:j3",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
-        3
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC LIMIT 9 OFFSET 2",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k DESC, filename, file_row_number LIMIT 9 OFFSET 2"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k DESC:LIMIT 9 OFFSET 2:j16",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC LIMIT 9 OFFSET 2",
@@ -1422,32 +856,12 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:ties:k DESC, v:LIMIT 11:j1",
+      "id": "top:ties:k DESC, v:LIMIT 11",
       "fixture": "tie_a",
       "format": "jsonl",
       "jobs": [
-        1
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC, v LIMIT 11",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k DESC, v, filename, file_row_number LIMIT 11"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k DESC, v:LIMIT 11:j3",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
-        3
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC, v LIMIT 11",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k DESC, v, filename, file_row_number LIMIT 11"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k DESC, v:LIMIT 11:j16",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC, v LIMIT 11",
@@ -1455,32 +869,12 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:ties:k:LIMIT 3000:j1",
+      "id": "top:ties:k:LIMIT 3000",
       "fixture": "tie_a",
       "format": "jsonl",
       "jobs": [
-        1
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k LIMIT 3000",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k, filename, file_row_number LIMIT 3000"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k:LIMIT 3000:j3",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
-        3
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k LIMIT 3000",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k, filename, file_row_number LIMIT 3000"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k:LIMIT 3000:j16",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k LIMIT 3000",
@@ -1488,32 +882,12 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:ties:k DESC:LIMIT 5 OFFSET 5990:j1",
+      "id": "top:ties:k DESC:LIMIT 5 OFFSET 5990",
       "fixture": "tie_a",
       "format": "jsonl",
       "jobs": [
-        1
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC LIMIT 5 OFFSET 5990",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k DESC, filename, file_row_number LIMIT 5 OFFSET 5990"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k DESC:LIMIT 5 OFFSET 5990:j3",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
-        3
-      ],
-      "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC LIMIT 5 OFFSET 5990",
-      "duck": "SELECT src, id, k, v FROM read_parquet('{glob}', filename=true, file_row_number=true) ORDER BY k DESC, filename, file_row_number LIMIT 5 OFFSET 5990"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:ties:k DESC:LIMIT 5 OFFSET 5990:j16",
-      "fixture": "tie_a",
-      "format": "jsonl",
-      "jobs": [
+        1,
+        3,
         16
       ],
       "sql": "SELECT src, id, k, v FROM '{glob}' ORDER BY k DESC LIMIT 5 OFFSET 5990",
@@ -1521,21 +895,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:s DESC:k > 3:LIMIT 9 OFFSET 4:j1",
+      "id": "top:gather:s DESC:k > 3:LIMIT 9 OFFSET 4",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE k > 3 ORDER BY s DESC LIMIT 9 OFFSET 4",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) WHERE k > 3 ORDER BY s DESC, filename, file_row_number LIMIT 9 OFFSET 4"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:s DESC:k > 3:LIMIT 9 OFFSET 4:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE k > 3 ORDER BY s DESC LIMIT 9 OFFSET 4",
@@ -1543,21 +907,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:f:all:LIMIT 12:j1",
+      "id": "top:gather:f:all:LIMIT 12",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY f LIMIT 12",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) ORDER BY f, filename, file_row_number LIMIT 12"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:f:all:LIMIT 12:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY f LIMIT 12",
@@ -1565,21 +919,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:f DESC:all:LIMIT 12:j1",
+      "id": "top:gather:f DESC:all:LIMIT 12",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY f DESC LIMIT 12",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) ORDER BY f DESC, filename, file_row_number LIMIT 12"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:f DESC:all:LIMIT 12:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY f DESC LIMIT 12",
@@ -1587,21 +931,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:u DESC:all:LIMIT 5:j1",
+      "id": "top:gather:u DESC:all:LIMIT 5",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY u DESC LIMIT 5",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) ORDER BY u DESC, filename, file_row_number LIMIT 5"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:u DESC:all:LIMIT 5:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY u DESC LIMIT 5",
@@ -1609,21 +943,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:dec DESC, id:all:LIMIT 8:j1",
+      "id": "top:gather:dec DESC, id:all:LIMIT 8",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY dec DESC, id LIMIT 8",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) ORDER BY dec DESC, id, filename, file_row_number LIMIT 8"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:dec DESC, id:all:LIMIT 8:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY dec DESC, id LIMIT 8",
@@ -1631,21 +955,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:k DESC, s:s LIKE 's01%':LIMIT 20:j1",
+      "id": "top:gather:k DESC, s:s LIKE 's01%':LIMIT 20",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE s LIKE 's01%' ORDER BY k DESC, s LIMIT 20",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) WHERE s LIKE 's01%' ORDER BY k DESC, s, filename, file_row_number LIMIT 20"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:k DESC, s:s LIKE 's01%':LIMIT 20:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE s LIKE 's01%' ORDER BY k DESC, s LIMIT 20",
@@ -1653,21 +967,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:ts:all:LIMIT 1500:j1",
+      "id": "top:gather:ts:all:LIMIT 1500",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY ts LIMIT 1500",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) ORDER BY ts, filename, file_row_number LIMIT 1500"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:ts:all:LIMIT 1500:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' ORDER BY ts LIMIT 1500",
@@ -1675,21 +979,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:c:c != '':LIMIT 6:j1",
+      "id": "top:gather:c:c != '':LIMIT 6",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE c != '' ORDER BY c LIMIT 6",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) WHERE c != '' ORDER BY c, filename, file_row_number LIMIT 6"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:c:c != '':LIMIT 6:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE c != '' ORDER BY c LIMIT 6",
@@ -1697,21 +991,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:c DESC:c != '':LIMIT 6 OFFSET 2:j1",
+      "id": "top:gather:c DESC:c != '':LIMIT 6 OFFSET 2",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE c != '' ORDER BY c DESC LIMIT 6 OFFSET 2",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) WHERE c != '' ORDER BY c DESC, filename, file_row_number LIMIT 6 OFFSET 2"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:c DESC:c != '':LIMIT 6 OFFSET 2:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE c != '' ORDER BY c DESC LIMIT 6 OFFSET 2",
@@ -1719,21 +1003,11 @@
     },
     {
       "kind": "sql_rows",
-      "id": "top:gather:c, k DESC:k > 30:LIMIT 9:j1",
+      "id": "top:gather:c, k DESC:k > 30:LIMIT 9",
       "format": "jsonl",
       "epoch": true,
       "jobs": [
-        1
-      ],
-      "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE k > 30 ORDER BY c, k DESC LIMIT 9",
-      "duck": "SELECT * EXCLUDE (filename, file_row_number) FROM read_parquet('ci/fixtures/parquet/topn_gather_*.parquet', filename=true, file_row_number=true) WHERE k > 30 ORDER BY c, k DESC, filename, file_row_number LIMIT 9"
-    },
-    {
-      "kind": "sql_rows",
-      "id": "top:gather:c, k DESC:k > 30:LIMIT 9:j16",
-      "format": "jsonl",
-      "epoch": true,
-      "jobs": [
+        1,
         16
       ],
       "sql": "SELECT * FROM 'ci/fixtures/parquet/topn_gather_*.parquet' WHERE k > 30 ORDER BY c, k DESC LIMIT 9",

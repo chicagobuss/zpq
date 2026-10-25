@@ -107,8 +107,8 @@ test-modules:
 
 # Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
 # fetch-corpus first so `test` picks up the real decimal/etc. fixtures.
-gauntlet: fetch-corpus test test-integration smoke duckdb-smoke soak (conform "data/parquet-testing") triangulate
-    @echo "gauntlet: all tiers green (corpus-backed cross-impl + soak + conformance + triangulation)."
+gauntlet: fetch-corpus test test-integration smoke duckdb-smoke differential (conform "data/parquet-testing") triangulate
+    @echo "gauntlet: all tiers green (corpus-backed cross-impl + differential + conformance + triangulation)."
 
 # Fetch the same apache/parquet-testing revision used by CI into the gitignored
 # data directory. Pinning keeps the local release gate from changing whenever
@@ -188,21 +188,9 @@ triangulate: fetch-corpus
     zig build -Doptimize=ReleaseFast
     {{python}} tools/triangulate.py
 
-# Edge-case soak checks (Tier 3 only): malformed synthetic streams and
-# external-oracle fixtures that are too narrow for the critical path.
-soak:
-    zig build test-soak --summary all
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/soak.py
-
-
-# Coverage-guided fuzzing of the parquet decode path (Q0a/Q1). NOTE: blocked
-# on a Zig 0.16.0 bug — its bundled test_runner.zig won't compile in `-ffuzz`
-# mode (passes @errorReturnTrace() to writeStackTrace, wrong StackTrace type).
-# Until a toolchain fix, the fuzz-lite PRNG loop in fuzz_decode.zig runs under
-# `just test` (Tier 1). This is the real-fuzzer entry for when --fuzz works.
+# Coverage-guided fuzzing on the pinned Zig toolchain; the fuzz-lite seeds also run in `test`.
 fuzz filter="fuzz:":
-    zig build test --fuzz -- {{filter}}
+    zig build fuzz -Dtest-filter={{filter}} --fuzz
 
 # === Perf regression ===
 

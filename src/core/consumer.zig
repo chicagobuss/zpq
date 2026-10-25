@@ -8453,7 +8453,7 @@ test "a key chunk whose statistics claim no nulls but holds one declines the fir
 test "SliceReader.skip reads the rows after it as decoding every row would, passing whole pages unread" {
     const testing = std.testing;
     // V1 and V2 pages of about 40 rows, a dictionary turning PLAIN part-way through `s`, NULLs, NaN, DECIMAL
-    // (tools/gen_topn_gather_fixture.py).
+    // (tools/zpq-gen topn_gather).
     for ([_][]const u8{ "ci/fixtures/parquet/topn_gather_a.parquet", "ci/fixtures/parquet/topn_gather_b.parquet" }) |path| {
         const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
             if (err == error.FileNotFound) return error.SkipZigTest;

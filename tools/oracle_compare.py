@@ -13,11 +13,11 @@ One policy for the in-process referee and tools/triangulate.py:
 - Floats compare with a relative tolerance (REL_TOL, absolute below 1.0): engines sum in different orders. NaN equals
   NaN and each infinity itself. Float min/max order NaN above every number in zpq, as in DuckDB, Postgres and Spark:
   max is NaN if any value is, min skips NaN unless every value is NaN. DuckDB answers the same natively.
-- Booleans equal 1/0: zpq's aggregate JSON spells a BOOLEAN key or extreme as an integer.
+- Booleans retain their type in rows, keys and extrema: JSON true/false never equals numeric 1/0.
 - Temporals compare exactly, never with a tolerance: a filter literal finer than the column's unit must select
   exactly the rows that DuckDB's typed TIMESTAMP literal selects. Timezone-aware values compare as naive UTC.
-- DuckDB is not an oracle where it trusts statistics the spec says not to (DUCKDB_STATS_DIVERGENCES); the truth
-  there comes from rows decoded without statistics, or from Hardwood.
+- Synthetic files with false statistics use rows decoded without statistics as the oracle; a majority vote
+  among readers does not establish their answer.
 
 Run directly to check the comparator itself: .venv/bin/python tools/oracle_compare.py
 """
@@ -57,25 +57,13 @@ def require_rows(got, want, source="duck"):
     first = next((a, b) for a, b in zip(got, want) if a != b)
     raise SystemExit(f"row zpq={first[0]} {source}={first[1]}"[:400])
 
-# Fixtures (repo paths) whose statistics DuckDB trusts although the spec says not to, so its filtered answers on them
-# can be wrong. The fixtures come from tools/gen_stats_order_fixtures.py.
-DUCKDB_STATS_DIVERGENCES = {
-    "ci/fixtures/parquet/deprecated_stats.parquet":
-        "DuckDB prunes on the deprecated min/max pair, which is signed-ordered, for columns whose order is not",
-    "ci/fixtures/parquet/column_order.parquet":
-        "DuckDB prunes on the bounds of a column whose declared column order it does not implement",
-    "ci/fixtures/parquet/nan_stats.parquet":
-        "DuckDB trusts float bounds that leave NaN out, both to drop and to keep NaN rows",
-}
-
-
 def _number(v: Any, lane: Optional[str]) -> Any:
     """v as None, int, Decimal (exact, non-integral), float (finite, non-integral) or a NaN/Infinity token; any other
     value unchanged."""
     if v is None or isinstance(v, str):
         return v
     if isinstance(v, bool):
-        return int(v)
+        return v
     if isinstance(v, (int, float, decimal.Decimal)):
         if isinstance(v, decimal.Decimal) and not v.is_finite() or isinstance(v, float) and not math.isfinite(v):
             return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")
@@ -93,6 +81,8 @@ def _number(v: Any, lane: Optional[str]) -> Any:
 
 def same(got: Any, want: Any, lane: Optional[str] = None) -> bool:
     """Whether zpq's `got` equals the oracle's `want` under the policy above."""
+    if isinstance(got, bool) or isinstance(want, bool):
+        return type(got) is bool and type(want) is bool and got == want
     g, w = _number(got, lane), _number(want, lane)
     if isinstance(g, float) or isinstance(w, float):
         if isinstance(g, (int, float, decimal.Decimal)) and isinstance(w, (int, float, decimal.Decimal)):
@@ -108,6 +98,8 @@ def canon(v: Any, lane: Optional[str] = None) -> Any:
     rounded to FLOAT_DIGITS significant digits instead of compared with a tolerance. canon() sees one value at a time,
     so it cannot infer the f64 lane from the other side as same() does: a DECIMAL result that zpq answers in f64 needs
     lane=F64 on both sides."""
+    if isinstance(v, bool):
+        return ("BOOLEAN", v)
     n = _number(v, lane)
     if isinstance(n, float):
         r = float(f"{n:.{FLOAT_DIGITS}g}")
@@ -158,7 +150,9 @@ def self_check() -> None:
         (float("nan"), "NaN", None, True),
         (float("inf"), float("inf"), None, True),
         (float("inf"), float("-inf"), None, False),
-        (True, 1, None, True),
+        (True, 1, None, False),
+        (False, 0, None, False),
+        (True, True, None, True),
         (datetime.datetime(2020, 1, 1, 0, 0, 0, 99500), datetime.datetime(2020, 1, 1, 0, 0, 0, 99000), None, False),
         (datetime.datetime(2020, 1, 1, 1, tzinfo=datetime.timezone(datetime.timedelta(hours=1))),
          datetime.datetime(2020, 1, 1), None, True),

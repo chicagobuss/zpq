@@ -10937,7 +10937,7 @@ test "runMultiAggregate: a sketched COUNT cut answers as the full scan, certifie
 }
 
 test "runMultiAggregate: a census cut answers as the full scan, certified or not" {
-    // Near-unique keys in shuffled order (tools/gen_census_fixture.py): the cells bail, and the census decides.
+    // Near-unique keys in shuffled order (tools/zpq-gen census): the cells bail, and the census decides.
     const path = "ci/fixtures/parquet/census_topk.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
@@ -11009,7 +11009,7 @@ test "runMultiAggregate: a census cut answers as the full scan, certified or not
 }
 
 test "runMultiAggregate: a count(DISTINCT) census cut answers as the full scan, certified or not" {
-    // tools/gen_census_fixture.py. By `t` four keys hold five rows and twelve hold three, so a cut of 10 ties at 3 and
+    // tools/zpq-gen census. By `t` four keys hold five rows and twelve hold three, so a cut of 10 ties at 3 and
     // each key's distinct `u` is its rows; by `u` three keys hold two rows, so every distinct count ties at the
     // census bound and nothing certifies; `s` is `u` as a string, hashed whole; `n` is NULL through the first row
     // group, so keys read only there count 0 distinct.
@@ -11229,7 +11229,7 @@ test "planAggregate: a count(DISTINCT) census needs a LIMIT HAVING leaves, a cen
 }
 
 test "runMultiAggregate: behind heavy keys a census cut certifies on a short prefix, and answers as the full scan" {
-    // tools/gen_census_fixture.py: three keys hold 4500 of 8000 rows, the rest are unique, so a cut of 10 ties at 1.
+    // tools/zpq-gen census: three keys hold 4500 of 8000 rows, the rest are unique, so a cut of 10 ties at 1.
     const path = "ci/fixtures/parquet/census_heavy.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);
@@ -11469,7 +11469,7 @@ test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns 
     // satisfy the "injection fired" check while the scan loop quietly runs single-threaded.
     //
     // Tracked fixtures, not data/ (gitignored, so a test pointed there would skip in a clean clone): regenerate with
-    // tools/gen_spawn_budget_fixture.py.
+    // tools/zpq-gen spawn_budget.
     const files = [_][]const u8{
         "ci/fixtures/parquet/spawn_budget_a.parquet",
         "ci/fixtures/parquet/spawn_budget_b.parquet",
@@ -11704,7 +11704,7 @@ test "parseFooters: serial path reports the lowest bad index too" {
 // Where statistics prove every row of a row group passes the filter, the scan neither evaluates the filter there nor
 // fetches/decodes columns only the filter reads. Every answer is checked against `--scan-all`, which disables all
 // statistics use and evaluates the filter on every row, so the two paths share nothing but the decoders and folds.
-// Fixture layout (tools/gen_full_match_fixture.py): 8 row groups x 200 rows, `ts` = 0..1599 sorted, so `ts >= 500`
+// Fixture layout (tools/zpq-gen full_match): 8 row groups x 200 rows, `ts` = 0..1599 sorted, so `ts >= 500`
 // skips row groups 0-1, leaves 2 partial and proves 3-7.
 // ============================================================
 
@@ -11815,7 +11815,7 @@ fn loadFullMatchFixture() !?[]u8 {
 }
 
 test "min-fill: a column the filter also reads under an OR decodes the pages its conjunct is proven on" {
-    // ci/fixtures/parquet/min_fill_or.parquet (tools/gen_min_fill_fixture.py): c alternates 1, 2 with no nulls, in
+    // ci/fixtures/parquet/min_fill_or.parquet (tools/zpq-gen min_fill): c alternates 1, 2 with no nulls, in
     // pages of 50 with a page index; b is 1 on every seventh row. Each page proves `c IS NOT NULL` (and, trusting
     // statistics, `c >= 0`); standing the page minimum in for c would drop every c = 2 row the OR keeps.
     const path = "ci/fixtures/parquet/min_fill_or.parquet";
@@ -12149,7 +12149,7 @@ test "full match: filter-only chunks of proven row groups are never read" {
 
 // ------------------------------------------------------------
 // Statistics order: filters and pruning on columns whose order is not the signed one their bytes suggest.
-// Fixtures from tools/gen_stats_order_fixtures.py; expected answers are hand-computed from the generator's formulas.
+// Fixtures from tools/zpq-gen stats_order; expected answers are hand-computed from the generator's formulas.
 // ------------------------------------------------------------
 
 const unsigned_order_fixture = "ci/fixtures/parquet/unsigned_order.parquet";
@@ -13032,7 +13032,7 @@ test "poisoned stats: page locations out of page order drop the page index, by d
 
 // ============================================================ All-null pages.
 //
-// The fixture's ColumnIndex flags whole pages of `v` and `s.b` all-null (see tools/gen_null_pages_fixture.py). A
+// The fixture's ColumnIndex flags whole pages of `v` and `s.b` all-null (see tools/zpq-gen null_pages). A
 // null check proves such a page always-match; its rows must still read as null wherever the filter is evaluated.
 // ============================================================
 
@@ -15099,7 +15099,7 @@ test "statistics never invent a zero of the other sign: --trust-stats answers ze
 
 // ============================================================ Exact DECIMAL.
 //
-// The fixture (tools/gen_decimal_exact_fixture.py) stores decimals as INT32, INT64 and FLBA(16), dictionary-encoded,
+// The fixture (tools/zpq-gen decimal_exact) stores decimals as INT32, INT64 and FLBA(16), dictionary-encoded,
 // in three row groups. Every expected value is DuckDB's answer for the same query, as unscaled integer and type.
 
 const decimal_exact_fixture = "ci/fixtures/parquet/decimal_exact.parquet";
@@ -15403,7 +15403,7 @@ test "a decode budget that slices row groups keeps where each group first appear
 }
 
 test "a first-keys cut under a decode budget ends inside a later slice where the full scan does" {
-    // Keys 3-9 count 7; the ninth group to appear is key 8 (tools/gen_census_fixture.py).
+    // Keys 3-9 count 7; the ninth group to appear is key 8 (tools/zpq-gen census).
     const path = "ci/fixtures/parquet/census_sliced.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
     defer testing.allocator.free(bytes);

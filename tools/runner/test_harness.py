@@ -22,6 +22,19 @@ DUCKDB = os.environ.get("DUCKDB", "duckdb")
 
 
 class DecimalTest(unittest.TestCase):
+    def test_triangulation_keeps_decimal_digits_and_reserves_tolerance_for_floats(self):
+        import triangulate as tri
+        output = '{"d":12345678901234567890123456789.01}\n'
+        with patch.object(tri.subprocess, "run", return_value=argparse.Namespace(
+            returncode=0, stdout=output, stderr=""
+        )):
+            got = tri.run_zpq_agg("unused", "sum(d) AS d")[0]["d"]
+        self.assertEqual(got, Decimal("12345678901234567890123456789.01"))
+        decimal_lane = tri._lane(tri.AggItem("sum", "d", "d", tri.pa.decimal128(38, 2)))
+        self.assertFalse(tri.compare_values(got, Decimal("12345678901234567890123456789.02"), decimal_lane))
+        float_lane = tri._lane(tri.AggItem("sum", "f", "f", tri.pa.float64()))
+        self.assertTrue(tri.compare_values(1, 1.00001, float_lane))
+
     def test_numeric_json_keeps_all_decimal_digits(self):
         output = '[{"d":12345678901234567890123456789.01}]'
         with patch.object(answer_cmp.subprocess, "run", return_value=argparse.Namespace(
@@ -65,7 +78,7 @@ class RowAdapterTest(unittest.TestCase):
 
 
 class RefereeTest(unittest.TestCase):
-    def run_cases(self, case, records=(), limit=None):
+    def run_cases(self, case, records=(), limit=None, jobs=None):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             cases = {
@@ -74,6 +87,8 @@ class RefereeTest(unittest.TestCase):
                 "schema_order": ["id"],
                 "cases": [case] if case else [],
             }
+            if jobs is not None:
+                cases["jobs"] = jobs
             path = tmp / "cases.json"
             path.write_text(json.dumps(cases))
             registry = tmp / "known.json"
@@ -83,6 +98,15 @@ class RefereeTest(unittest.TestCase):
             if limit is not None:
                 argv.extend(["--limit", str(limit)])
             return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
+
+    def test_file_job_defaults_are_counted_and_a_case_can_override_them(self):
+        case = {"id": "jobs", "kind": "sql", "sql": "SELECT count(*) AS c, sum(id) AS s FROM '{path}'"}
+        for override, total in ((None, 2), ([1], 1)):
+            with self.subTest(override=override):
+                current = dict(case, **({"jobs": override} if override else {}))
+                result = self.run_cases(current, jobs=[1, 4])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"referee: {total}/{total} checks match", result.stderr)
 
     def test_extra_missing_changed_duplicate_and_null_rows_fail(self):
         for where in ("id = 1", "id IS NOT NULL", "id <> 2", "id IS NULL"):

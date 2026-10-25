@@ -964,3 +964,12 @@ test "encodeFast writes the same bytes as encode" {
         }
     }
 }
+
+test "a malformed i64 miniblock width is rejected before its dispatcher" {
+    var bytes: [310]u8 = @splat(0);
+    // 128-value block, four 32-value miniblocks, 33 values; i64 cannot take width 65.
+    @memcpy(bytes[0..7], &[_]u8{ 0x80, 0x01, 0x04, 0x21, 0, 0, 65 });
+    var decoder = try Decoder(i64).init(&bytes);
+    var out: [33]i64 = undefined;
+    try std.testing.expectError(error.InvalidHeader, decoder.decode(&out));
+}

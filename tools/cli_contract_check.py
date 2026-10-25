@@ -32,6 +32,14 @@ def ndjson(body):
     return [json.loads(line) for line in body.splitlines()]
 
 
+# Front-door parsing is part of the same contract as channels and destinations.
+p = subprocess.run([binary], capture_output=True)
+assert p.returncode == 0 and p.stdout.startswith(b'usage:')
+for args in (['query', '--not-a-flag'], ['query', 'nope.parquet', '--format']):
+    p = subprocess.run([binary, *args], capture_output=True)
+    assert p.returncode != 0 and p.stderr
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
     root = Path(d)
     src = root / 'input.parquet'
@@ -282,4 +290,60 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
     finally:
         os.close(master)
         os.close(slave)
+    # Malformed input is a typed decode failure, independent of reader voting.
+    for name, code in [('decimal_precision0', 'NotParquet'), ('flba_length0', 'NotParquet'),
+                       ('page_bomb', 'PageLargerThanChunk'), ('uint8_out_of_range', 'IntOutOfRange'),
+                       ('v1_def_run_corrupt', 'UnexpectedPage'), ('v2_def_run_corrupt', 'UnexpectedPage')]:
+        path = fixtures / f'{name}.parquet'
+        p = run(path, '--summary=json', code=1)
+        assert json.loads(p.stderr)['code'] == code, p.stderr
+    # A mixed typed aggregate must propagate a late narrow-integer decode error too.
+    mix = ', '.join(f'{fn}({col}) AS {col}_{fn}'
+                    for col in ('i32', 'i64', 'u8', 'f64', 's', 'dec')
+                    for fn in (('min', 'max') if col == 's' else ('sum', 'min', 'max')))
+    p = run(fixtures / 'uint8_out_of_range.parquet', '--aggregate', mix + ', count(*) AS total_rows',
+            '--summary=json', code=1)
+    assert json.loads(p.stderr)['code'] == 'IntOutOfRange', p.stderr
+    p = run(fixtures / 'decimal_precision40.parquet', '--aggregate', 'sum(value) AS s', '--summary=json', code=1)
+    assert json.loads(p.stderr)['code'] == 'InvalidDecimalType', p.stderr
+    p = run(fixtures / 'ARROW-RS-GH-6229-DICTHEADER.parquet', '--aggregate', 'sum(region_key) AS s',
+            '--summary=json', code=1)
+    assert json.loads(p.stderr)['code'] == 'MissingChunkBytes', p.stderr
+
+    # Current public contracts behind the former print-only handoff repros.
+    src = root / 'contracts.parquet'
+    pq.write_table(pa.table({'id': [1, 2, 3], 'b': [True, False, True],
+                            'u': pa.array([1, 2**64 - 1, 2**63], pa.uint64()),
+                            'st': [{'a': 1}, {'a': 2}, {'a': 3}], 'l': [[1, 2], None, []]}), src)
+
+    def sql_rows(sql):
+        return json.loads(run('--query', sql, '--format', 'json').stdout)
+
+    # BOOLEAN aggregate output must carry JSON booleans, including min/max.
+    grouped = sql_rows(f"SELECT b, count(*) AS n FROM '{src}' GROUP BY b")
+    extremes = sql_rows(f"SELECT min(b) AS mn, max(b) AS mx FROM '{src}'")
+    assert sorted(grouped, key=lambda r: r['b']) == [{'b': False, 'n': 1}, {'b': True, 'n': 2}]
+    assert all(type(r['b']) is bool for r in grouped)
+    assert extremes == [{'mn': False, 'mx': True}] and all(type(v) is bool for v in extremes[0].values())
+    # Bare predicates and searched CASE follow SQL BOOLEAN semantics.
+    assert [sql_rows(f"SELECT count(*) AS n FROM '{src}' WHERE {p}")[0]['n']
+            for p in ('b', 'NOT b', 'b = true')] == [2, 1, 2]
+    assert sql_rows(f"SELECT CASE WHEN b THEN 1 ELSE 0 END AS c FROM '{src}'") == [{'c': 1}, {'c': 0}, {'c': 1}]
+    # UINT64 extrema retain their type and every bit in a Parquet write.
+    unsigned = root / 'unsigned.parquet'
+    run('--query', f"SELECT min(u) AS lo, max(u) AS hi FROM '{src}'", '-o', str(unsigned))
+    result = pq.read_table(unsigned)
+    assert all(pa.types.is_uint64(field.type) for field in result.schema)
+    assert result.to_pylist() == [{'lo': 1, 'hi': 2**64 - 1}]
+    assert con.execute(f"SELECT lo, hi FROM '{unsigned}'").fetchall() == [(1, 2**64 - 1)]
+    # Row output names leaves and refuses nested parents with a typed diagnostic.
+    assert sql_rows(f"SELECT st.a FROM '{src}'") == [{'st.a': 1}, {'st.a': 2}, {'st.a': 3}]
+    for name in ('st', 'l'):
+        p = run('--query', f"SELECT {name} FROM '{src}'", '--summary=json', code=2)
+        assert not p.stdout and json.loads(p.stderr)['code'] == 'NestedColumnSelected'
+    # Unsupported modulo identifies the operator in SELECT and WHERE.
+    for sql in (f"SELECT id FROM '{src}' WHERE id % 2 = 1", f"SELECT id % 2 AS p FROM '{src}'"):
+        p = run('--query', sql, '--summary=json', code=2)
+        assert not p.stdout and json.loads(p.stderr)['code'] == 'ModuloNotSupported'
+        assert '%' in json.loads(p.stderr)['message']
 print(f'CLI contract checks passed ({checks} invocations; pyarrow + DuckDB validation)')

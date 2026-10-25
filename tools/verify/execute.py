@@ -47,7 +47,7 @@ def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool) -
 
 def judge(cmd: stages.Cmd, rc: int, text: str) -> tuple[str, dict]:
     counts = cmd.parse(text) if cmd.parse else {}
-    if cmd.parse in (stages.parse_referee, stages.parse_cli_tier):
+    if cmd.parse in (stages.parse_referee, stages.parse_cli_contracts):
         if not counts.get("total") or counts.get("matched") != counts.get("total"):
             return "fail", counts
     if cmd.parse is stages.parse_tests:

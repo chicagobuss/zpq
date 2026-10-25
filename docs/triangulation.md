@@ -55,8 +55,11 @@ The write-mode section adds projection variants, nested passthrough, clean rejec
 unfiltered `SELECT * --codec X` does not report a codec it did not apply.
 
 ### ZPQ read correctness
-Corpus: `apache/parquet-testing` (`data/parquet-testing/data`), ZPQ's own `ci/fixtures/parquet`, and Hardwood's test
-fixtures. Each file is labelled by source (`parquet-testing:…`, `zpq-ci:…`, `hardwood:<path>`).
+Corpus: `apache/parquet-testing` (`data/parquet-testing/data`) and Hardwood's test fixtures. Each file is labelled by
+source (`parquet-testing:…`, `hardwood:<path>`). Four named CI interop witnesses retain unsigned/decimal
+dictionary folds, half floats and non-finite JSON values. Synthetic adversarial files in `ci/fixtures/parquet` belong to the
+hand-known unit and referee contracts: a majority vote is unsuitable for intentionally malformed files or false
+statistics that another reader accepts.
 
 Per file, the harness runs these probes:
 - **agg** — `sum`/`min`/`max` of every flat numeric column, `min`/`max` of every flat string column, and `count(*)`.
@@ -104,9 +107,8 @@ REFEREE_OVERRIDES = {
 ```
 
 - `"authority": "hardwood"` — for strict-spec cases. DuckDB still runs and its answer is shown, but it gets no vote.
-  Without Hardwood, DuckDB can confirm ZPQ on such a file but not fail it: a disagreement is `INFO`. Every fixture in
-  `DUCKDB_STATS_DIVERGENCES` (`tools/oracle_compare.py`), where DuckDB prunes on statistics the spec says not to trust,
-  gets this override; the in-process referee judges the same fixtures against rows pyarrow decodes.
+  Without Hardwood, DuckDB can confirm ZPQ on such a file but not fail it: a disagreement is `INFO`. Synthetic
+  false-statistics files are judged in the in-process referee against rows PyArrow decodes.
 - `"expected"` — per result column (the probe's alias, e.g. `x_sum`, `total_rows`, `x_gt_count`); use when no engine
   can be trusted or Hardwood may be absent. `None` means SQL NULL.
 - `"why"` is required and printed with any non-OK result. Keep entries narrow: an override switches a referee off.
@@ -119,9 +121,8 @@ renders the rest as text; when one side of a pair is text, it is coerced toward 
   JSON export spells null `null`; its CSV export writes an empty field for null (`--null-string` overrides), which CSV
   cannot tell apart from an empty string, so the harness reads JSON.
 - **Integers:** exact, including integral results DuckDB widens to `DECIMAL`/`HUGEINT` (its integer `SUM`s).
-- **Decimals:** exact against each other. ZPQ prints DECIMAL results exactly, but this harness still reads its JSON
-  numbers as floats, so those results compare as floats here (the referee compares them exactly);
-  Hardwood prints plain decimal strings and DuckDB returns `Decimal`.
+- **Decimals:** exact, including every JSON digit. Hardwood prints decimal strings and DuckDB returns `Decimal`;
+  both compare with ZPQ's exact decimal output. Only float-typed aggregates use tolerance.
 - **Floats:** Compared using a relative tolerance ($1e-4$) to ignore precision jitter. `NaN` and `±Infinity` (strings
   in Hardwood's JSON) compare by token.
 - **Temporals:** ISO-8601 text with a `T` separator, trailing fractional zeros trimmed, UTC offset dropped. Hardwood

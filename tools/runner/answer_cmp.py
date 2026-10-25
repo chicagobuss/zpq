@@ -327,7 +327,7 @@ def cmd_stats_select(args):
 
 def declared_column_orders(path):
     """FileMetaData.column_orders member ids (0 = an empty union), or None when the file declares none."""
-    from gen_stats_order_fixtures import Reader, T_STRUCT, field
+    from datagen.parquet import Reader, T_STRUCT, field
 
     data = open(path, "rb").read()
     n = int.from_bytes(data[-8:-4], "little")

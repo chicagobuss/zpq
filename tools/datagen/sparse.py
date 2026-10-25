@@ -1,17 +1,8 @@
-#!/usr/bin/env python3
-"""Create a valid Parquet file with a large sparse gap before the footer.
-
-The resulting file keeps the column chunk offsets from a normal DuckDB-written
-Parquet file, then moves the footer to the end of a much larger logical object.
-Readers locate the footer from the trailer and still find the original chunks by
-absolute offset, while S3 Content-Range reports the inflated object size.
-"""
-
+"""A valid Parquet body with a bounded sparse gap before its footer."""
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -74,31 +65,3 @@ def inflate_with_gap(base: Path, out: Path, target_size: int) -> int:
             f.seek(gap, os.SEEK_CUR)
         f.write(trailer)
     return gap
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="/mnt/b/Work/side-projects/parquet-testing/zpq-sparse-oom")
-    ap.add_argument("--rows", type=int, default=1_000_000)
-    ap.add_argument("--target-size", type=parse_size, default=parse_size("4g"))
-    ap.add_argument("--duckdb", default=shutil.which("duckdb") or "duckdb")
-    args = ap.parse_args()
-
-    out_dir = Path(args.dir)
-    base = out_dir / "base.parquet"
-    sparse = out_dir / f"sparse_{args.target_size // (1024 * 1024)}m.parquet"
-
-    make_base(base, args.rows, args.duckdb)
-    gap = inflate_with_gap(base, sparse, args.target_size)
-
-    for label, path in [("base", base), ("sparse", sparse)]:
-        st = path.stat()
-        print(
-            f"{label}: path={path} logical_bytes={st.st_size} "
-            f"allocated_bytes={allocated_bytes(path)}"
-        )
-    print(f"inserted_gap_bytes={gap}")
-
-
-if __name__ == "__main__":
-    main()

@@ -33,7 +33,7 @@ except ImportError:
     print("Missing dependencies: please run via .venv/bin/python (needs pyarrow and duckdb)")
     sys.exit(2)
 
-from oracle_compare import DUCKDB_STATS_DIVERGENCES, F64, duckdb_agg, nan_ordered_extreme, same, self_check
+from oracle_compare import F64, duckdb_agg, nan_ordered_extreme, same, self_check
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZPQ_BIN = "zig-out/bin/zpq"
@@ -59,10 +59,6 @@ REFEREE_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "authority": "hardwood",
         "why": "chunk path_in_schema contradicts the schema's leaf order; a reader must reject, not guess",
     },
-    # Where DuckDB trusts statistics it should not (the list lives in oracle_compare.py), Hardwood, which prunes on
-    # none of them, decides.
-    **{f"zpq-ci:{os.path.basename(path)}": {"authority": "hardwood", "why": why}
-       for path, why in DUCKDB_STATS_DIVERGENCES.items()},
 }
 
 
@@ -287,7 +283,7 @@ def run_zpq_agg(path: str, agg: str, flt: Optional[str] = None) -> List[Dict]:
     if proc.returncode != 0:
         raise RuntimeError(f"ZPQ Read Error: {proc.stderr.strip()[:200]}")
     try:
-        data = read_rows(proc.stdout)
+        data = read_rows(proc.stdout, parse_float=decimal.Decimal)
     except json.JSONDecodeError:
         raise RuntimeError(f"ZPQ JSON Error: {proc.stdout[:200]}")
     return data
@@ -598,9 +594,13 @@ def build_corpus_list(hw_fixtures: Optional[str]) -> List[Tuple[str, str]]:
     if os.path.isdir(corpus_dir):
         files += [(f"parquet-testing:{f}", os.path.join(corpus_dir, f))
                   for f in os.listdir(corpus_dir) if f.endswith(".parquet")]
-    ci_dir = os.path.join("ci", "fixtures", "parquet")
-    if os.path.isdir(ci_dir):
-        files += [(f"zpq-ci:{f}", os.path.join(ci_dir, f)) for f in os.listdir(ci_dir) if f.endswith(".parquet")]
+    # These valid interop witnesses reach unsigned and decimal dictionary folds
+    # and half-float extrema that the foreign corpus alone does not cover.
+    for name in ('nullable_mix.parquet', 'ARROW-GH-43605.parquet', 'decimal_int_dictionary.parquet',
+                 'float16_rows.parquet', 'json_escape.parquet'):
+        files.append((f"zpq-ci:{name}", os.path.join('ci/fixtures/parquet', name)))
+    # Synthetic adversarial fixtures have hand-known unit/referee contracts. Majority
+    # votes over those malformed files or false statistics are not an independent oracle.
     if hw_fixtures:
         for root, _dirs, fnames in os.walk(hw_fixtures):
             for f in fnames:
@@ -718,8 +718,8 @@ def coerce_scalar(v: Any, typ: Optional["pa.DataType"]) -> Any:
 
 
 def _lane(i: AggItem) -> Optional[str]:
-    """zpq answers sum/min/max of a DECIMAL column from its f64 lane."""
-    return F64 if i.func != "count" and i.typ is not None and pa.types.is_decimal(i.typ) else None
+    """Only float-typed aggregate results use the tolerant lane."""
+    return F64 if i.func != "count" and i.typ is not None and pa.types.is_floating(i.typ) else None
 
 
 def _sql_item(i: AggItem, duckdb_sql: bool) -> str:

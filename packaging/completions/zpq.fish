@@ -16,6 +16,7 @@ complete -c zpq -l group-by
 complete -c zpq -l help
 complete -c zpq -l limit
 complete -c zpq -l max-memory
+complete -c zpq -l no-bloom-filters
 complete -c zpq -l no-fsync
 complete -c zpq -l output
 complete -c zpq -l profile

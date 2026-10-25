@@ -92,6 +92,13 @@ class TestStageAccountingTest(unittest.TestCase):
                 self.assertEqual(execute.judge(cmd, 0, text)[0], "fail")
         self.assertEqual(execute.judge(cmd, 0, "4/5 tests passed (1 skipped)")[0], "blocked")
 
+    def test_cli_contract_output_requires_actual_invocations(self):
+        cmd = stages.Cmd([], {}, "cli", parse=stages.parse_cli_contracts)
+        for text in ("", "CLI contract checks passed (0 invocations; validation)"):
+            self.assertEqual(execute.judge(cmd, 0, text)[0], "fail")
+        text = "CLI contract checks passed (303 invocations; pyarrow + DuckDB validation)"
+        self.assertEqual(execute.judge(cmd, 0, text)[0], "pass")
+
     def test_only_named_declared_skips_fit_the_budget(self):
         cmd = stages.Cmd(["test"], {}, "test", parse=stages.parse_tests,
                          expected_skips={"fixture test": "fixture absent"})

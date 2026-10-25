@@ -49,7 +49,7 @@ extrema, and both trust modes. `ci/fixtures/parquet/writer_stats.parquet` contai
 real PyArrow-encoded nullable STRING/FLBA DECIMAL/UINT32 pages with deliberately
 false chunk and page statistics and a rewritten old-writer footer. It is synthetic,
 not an artifact produced by an historical writer. The generator is
-`write_writer_stats()` in `tools/gen_stats_order_fixtures.py`; PyArrow's writer does
+`write_writer_stats()` in `tools/zpq-gen stats_order`; PyArrow's writer does
 not expose a `created_by` override, so the Compact Thrift footer is rewritten.
 Core tests rewrite its writer strings, check pruning/count/min fallback and the
 CDH/equal-extrema cases, and compare against `--scan-all` under tight budgets.

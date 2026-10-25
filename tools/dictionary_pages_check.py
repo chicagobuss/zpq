@@ -18,7 +18,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from gen_stats_order_fixtures import Reader, T_STRUCT, field
+from datagen.parquet import Reader, T_STRUCT, field
 
 
 def duck_check(connection, source, output):

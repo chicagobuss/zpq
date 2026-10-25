@@ -1080,7 +1080,7 @@ test "byte copies carry each kept chunk's Bloom filter, after the row groups, an
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // tools/gen_bloom_fixture.py: `id` and `s` carry filters in every row group; `cat` and `x` none.
+    // tools/zpq-gen bloom: `id` and `s` carry filters in every row group; `cat` and `x` none.
     const bytes = metadata.readFileSlice("ci/fixtures/parquet/bloom_keys.parquet", arena) catch |err| {
         if (err == error.FileNotFound) return error.SkipZigTest;
         return err;

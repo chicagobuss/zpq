@@ -1049,7 +1049,7 @@ test "footer open rejects counts, offsets and sizes no valid file can have" {
         try testing.expectError(mut.err, openFooter(arena, w.bytes()));
     }
 
-    // A typed root with children is tolerated: segmentio/parquet-go writes one (tools/gen_typed_root_fixture.py).
+    // A typed root with children is tolerated: segmentio/parquet-go writes one (tools/zpq-gen typed_root).
     {
         const root_bytes = try readFileSlice("ci/fixtures/parquet/typed_root.parquet", testing.allocator);
         defer testing.allocator.free(root_bytes);

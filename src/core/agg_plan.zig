@@ -192,7 +192,7 @@ const testing = std.testing;
 const expr_parser = @import("expr/parser.zig");
 const filter_parser = @import("filter/parser.zig");
 
-/// Columns of ci/fixtures/parquet/full_match.parquet (see tools/gen_full_match_fixture.py).
+/// Columns of ci/fixtures/parquet/full_match.parquet (see tools/zpq-gen full_match).
 const TS = 0;
 const B = 1;
 const X = 3;

@@ -3509,7 +3509,7 @@ test "dictionaries prune what statistics and Bloom filters cannot, and compose w
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    // tools/gen_bloom_fixture.py: group g's `cat` holds "a-g", "m-g", "z-g" (dictionary-encoded, no Bloom filter,
+    // tools/zpq-gen bloom: group g's `cat` holds "a-g", "m-g", "z-g" (dictionary-encoded, no Bloom filter,
     // bounds "a-g".."z-g" so statistics keep every group); `id` holds even numbers, with Bloom filters.
     const fx = try openFixture(a, "ci/fixtures/parquet/bloom_keys.parquet");
     const metas = [_]schema.FileMetaData{fx.meta};

@@ -18,6 +18,7 @@ _arguments '*:file:_files' \
   '--help[zpq option]' \
   '--limit[zpq option]' \
   '--max-memory[zpq option]' \
+  '--no-bloom-filters[zpq option]' \
   '--no-fsync[zpq option]' \
   '--output[zpq option]' \
   '--profile[zpq option]' \

@@ -24,7 +24,9 @@ SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
                 "share/fish/vendor_completions.d/zpq.fish": ROOT / "packaging/completions/zpq.fish",
                 "share/zpq/tiny.parquet": ROOT / "packaging/fixtures/tiny.parquet",
                 **{"share/doc/zpq/" + n: ROOT / "docs" / n
-                   for n in ("getting-started.md", "output-format.md", "binary-output.md")}}
+                   for n in ("getting-started.md", "output-format.md", "binary-output.md",
+                             "writer-statistics.md", "decode-errors.md", "hardware-execution.md",
+                             "execution_knobs.md", "byte_topk.md")}}
 PACKAGE_ARCHES = {"x86_64-linux-musl": ("amd64", "x86_64"), "aarch64-linux-musl": ("arm64", "aarch64")}
 
 

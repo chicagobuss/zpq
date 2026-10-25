@@ -10063,7 +10063,7 @@ test "a recompressing copy drops page-index offsets that are not its chunk's, in
 
 test "an overflow or a zero divisor fails a query only on a row whose value it consumes" {
     // Row 500 holds 9e18 in p (plain) and a (dictionary-coded), whose doubles overflow, and 0 in the divisor d
-    // (tools/gen_overflow_rows_fixture.py). Every query that leaves row 500 out answers as if it were absent: a WHERE
+    // (tools/zpq-gen overflow_rows). Every query that leaves row 500 out answers as if it were absent: a WHERE
     // that keeps the selection dense, a later conjunct, an aggregate's own FILTER, the group-key path, the coded path.
     // Every one that takes it in still fails.
     const fixture = "ci/fixtures/parquet/overflow_rows.parquet";

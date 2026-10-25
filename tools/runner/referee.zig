@@ -234,10 +234,12 @@ fn runFile(
     const diff_path = try std.fmt.allocPrint(arena, "{s}/f{d}-diff.csv", .{ work, file_i });
     const ans_path = try std.fmt.allocPrint(arena, "{s}/f{d}-ans.csv", .{ work, file_i });
 
+    const default_jobs = if (root.get("jobs")) |v| try jobList(arena, v) else &.{};
     var counts: Counts = .{};
     for (root.get("cases").?.array.items) |raw| {
         if (limit) |n| if (total.* >= n) break;
         var case = try decodeCase(arena, raw);
+        if (raw.object.get("jobs") == null) case.jobs = default_jobs;
         if (known.get(case.id)) |refusal| {
             if (!std.mem.eql(u8, case.sql orelse return error.BadRefusal, refusal.sql)) return error.StaleRefusal;
             case.expected_error = refusal.kind;

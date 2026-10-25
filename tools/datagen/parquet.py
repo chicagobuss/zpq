@@ -1,44 +1,4 @@
-#!/usr/bin/env python3
-"""Generate the statistics-order fixtures for the pruning tests in src/core/scan.zig and the referee.
-
-unsigned_order.parquet: four row groups of 256 rows, 64-row pages with a page index. Every unsigned width holds values
-on both sides of its signed range, so stats or rows read as signed put them in the wrong order.
-
-  i    int32, 0..1023                     row number, for spotting rows
-  u8   uint8, i % 256                     crosses 2^7 inside every row group
-  u16  uint16, (i * 257) % 65536          crosses 2^15
-  u32  uint32                             rg0 0..255, rg1 2^31-128..2^31+127, rg2 3e9+, rg3 2^32-256..2^32-1
-  u64  uint64                             the same layout around 2^63 and 2^64
-  n32  uint32, nullable                   u32 with every third row null; rg3 all null
-
-deprecated_stats.parquet: two row groups of three rows whose chunks carry ONLY the deprecated Statistics.min/max
-(fields 1/2), computed as the spec defines them: by signed comparison, whatever the type. pyarrow writes min_value/
-max_value instead, so the footer is rewritten. Row group 0 is chosen so the signed pair is a plausible-looking range
-that excludes a stored value; a reader that trusts it there drops matching rows.
-
-  s    utf8            rg0 'é','b','a'     signed bytewise: 'é' (0xC3..) is the minimum, so 'a' is "below" the range
-  dec  decimal(9, 2)   rg0 1.00,1.28,2.56  FLBA(4); 1.28 ends in 0x80, so signed bytes put it below 1.00
-  u    uint32          rg0 1,2,3e9         3e9 is negative as i32
-  i    int64           rg0 1,2,3           signed order is the type order: the deprecated pair stays usable
-  d    double          rg0 0.5,1.5,2.5     likewise
-  idec decimal(9, 2)   rg0 1.00,1.28,2.56  over INT32: signed is its numeric order, so the pair stays usable
-
-column_order.parquet: two row groups of three rows, with a page index. The footer declares a column order this reader
-does not implement for `s` (ColumnOrder union member 3), standing in for a writer with a collation of its own, and
-its chunk and page bounds are written in that case-insensitive order: row group 0 holds 'B','a','c' and records
-['a', 'c'], which read bytewise excludes 'B'. `i` keeps TYPE_DEFINED_ORDER and must still prune.
-
-  s    utf8     rg0 'B','a','c'    rg1 'x','Y','z'
-  i    int64    rg0 1,2,3          rg1 101,102,103
-
-nan_stats.parquet: three row groups of three rows, `d` double and `i` int64. Bounds leave NaN out, so every row group
-records [0, 0]; `d != 0` holds for the NaN rows. The footer adds Statistics.nan_count (field 9) where noted.
-
-  d    double   rg0 0,NaN,0 (no nan_count)   rg1 0,0,0 (nan_count 0)   rg2 0,NaN,0 (nan_count 1)
-
-Usage:  .venv/bin/python tools/gen_stats_order_fixtures.py
-"""
-
+"""Statistics fixtures and compact-Thrift edits shared with footer assertions."""
 import decimal
 import pathlib
 import struct
@@ -46,7 +6,6 @@ import struct
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-OUT_DIR = pathlib.Path(__file__).resolve().parent.parent / "ci" / "fixtures" / "parquet"
 ROWS_PER_GROUP = 256
 
 U32_BASES = [0, 2**31 - 128, 3_000_000_000, 2**32 - 256]
@@ -275,8 +234,8 @@ def to_collated_order(meta: list, body: bytearray) -> None:
         body += encoded
 
 
-def write_collated() -> None:
-    out = OUT_DIR / "column_order.parquet"
+def write_collated(out_dir) -> None:
+    out = out_dir / "column_order.parquet"
     table = pa.table(
         {
             "s": pa.array([v for rg in COLLATED_ROW_GROUPS for v in rg["s"]], type=pa.string()),
@@ -300,8 +259,8 @@ def add_nan_counts(meta: list, _body: bytearray) -> None:
             stats.append([9, T_I64, nan_count])
 
 
-def write_nan() -> None:
-    out = OUT_DIR / "nan_stats.parquet"
+def write_nan(out_dir) -> None:
+    out = out_dir / "nan_stats.parquet"
     d = [v for rg in NAN_ROW_GROUPS for v in rg]
     table = pa.table({"d": pa.array(d, type=pa.float64()), "i": pa.array(range(len(d)), type=pa.int64())})
     pq.write_table(table, out, row_group_size=3, compression="snappy", use_dictionary=False, write_page_index=True)
@@ -309,25 +268,25 @@ def write_nan() -> None:
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
-def main() -> None:
-    write_unsigned()
-    write_deprecated()
-    write_collated()
-    write_nan()
-    write_false_bounds()
-    write_writer_stats()
-    write_writer_headers()
+def stats_order(out_dir) -> None:
+    write_unsigned(out_dir)
+    write_deprecated(out_dir)
+    write_collated(out_dir)
+    write_nan(out_dir)
+    write_false_bounds(out_dir)
+    write_writer_stats(out_dir)
+    write_writer_headers(out_dir)
 
 
-def write_deprecated() -> None:
-    out = OUT_DIR / "deprecated_stats.parquet"
+def write_deprecated(out_dir) -> None:
+    out = out_dir / "deprecated_stats.parquet"
     pq.write_table(deprecated_table(), out, row_group_size=3, compression="snappy", use_dictionary=False)
     rewrite_footer(out, to_deprecated_stats)
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
-def write_unsigned() -> None:
-    out = OUT_DIR / "unsigned_order.parquet"
+def write_unsigned(out_dir) -> None:
+    out = out_dir / "unsigned_order.parquet"
     pq.write_table(
         unsigned_table(),
         out,
@@ -341,9 +300,9 @@ def write_unsigned() -> None:
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
-def write_false_bounds() -> None:
+def write_false_bounds(out_dir) -> None:
     """Pin the existing trust boundary: internally consistent footer bounds can still be false."""
-    out = OUT_DIR / "false_bounds.parquet"
+    out = out_dir / "false_bounds.parquet"
     pq.write_table(pa.table({"x": [100000, 100001, 100002], "v": [10, 20, 30]}),
                    out, use_dictionary=False, compression=None)
 
@@ -359,9 +318,9 @@ def write_false_bounds() -> None:
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
-def write_writer_stats() -> None:
+def write_writer_stats(out_dir) -> None:
     """Modern encoded pages with an old-writer footer and plausible but false chunk/page statistics."""
-    out = OUT_DIR / "writer_stats.parquet"
+    out = out_dir / "writer_stats.parquet"
     table = pa.table({
         "s": pa.array(["a", None, "b"], type=pa.string()),
         "d": pa.array([decimal.Decimal("1.00"), None, decimal.Decimal("2.00")], type=pa.decimal128(9, 2)),
@@ -392,7 +351,7 @@ def write_writer_stats() -> None:
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
-def write_writer_headers() -> None:
+def write_writer_headers(out_dir) -> None:
     """Poison V1/V2 header statistics as well as footer statistics, leaving page bodies and CRCs intact."""
     table = pa.table({
         "s": pa.array(["a", None, "b"], type=pa.string()),
@@ -443,13 +402,9 @@ def write_writer_headers() -> None:
             field(rg, 2)[2] = raw_total
 
     for version in ["1.0", "2.0"]:
-        out = OUT_DIR / f"writer_headers_v{version[0]}.parquet"
+        out = out_dir / f"writer_headers_v{version[0]}.parquet"
         pq.write_table(table, out, use_dictionary=True, compression="snappy", data_page_version=version,
                        write_statistics=True, write_page_index=False, write_page_checksum=True)
         rewrite_footer(out, edit)
         assert pq.read_table(out, page_checksum_verification=True).equals(table)
         print(f"wrote {out} ({out.stat().st_size} bytes)")
-
-
-if __name__ == "__main__":
-    main()

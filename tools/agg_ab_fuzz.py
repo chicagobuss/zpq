@@ -24,7 +24,7 @@ def same(a, b):
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
     if isinstance(a, bool) or isinstance(b, bool):
-        return int(a) == int(b)
+        return type(a) is bool and type(b) is bool and a == b
     if isinstance(a, int) and isinstance(b, int):
         return a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):

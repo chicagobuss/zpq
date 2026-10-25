@@ -15,8 +15,8 @@ python tools/verify/verify.py perf --help
 ```
 
 No arguments and `--help` show every stage, tier, requirement and exit code.
-`quick` runs core tests. `commit` builds the CLI, checks its argument parsing
-and JSON/JSONL/Parquet formatting, and runs the full differential referee.
+`quick` runs core tests. `commit` builds the CLI, runs the CLI contracts and independent reader checks, and runs the full
+differential referee.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
 `--base` is the previously integrated comparison binary; it is required for
 `full` and is recorded without a default. Native builds default to
@@ -44,7 +44,8 @@ waive a failed value comparison. Refusal counts survive into the summary.
 Dense cases marked `skip_duck` explain their narrower byte-parity contract;
 other dense cases check independent values. Empty or limited runs cannot pass.
 
-The real CLI tier and `tests/libzpq/run.sh` retain CLI/libzpq/Lambda byte
+CLI smoke runs the single `tools/cli_contract_check.py` runner.
+`tests/libzpq/run.sh` retains CLI/libzpq/Lambda byte
 parity, C ABI, ASan, Python/service, SQL-session, RSS and write-sync checks.
 `tools/triangulate.py` and `tests/handoff/run.py` also remain: the referee
 does not replace their Hardwood and Python handoff coverage.
@@ -53,9 +54,10 @@ message. Missing fixtures, runtimes and oracles are never successful checks.
 
 For harness regression checks, build the referee, then run
 `tools/runner/test_harness.py` with `DUCKDB` naming the DuckDB CLI.
-`tools/runner/coverage.py LEGACY_CHECKOUT OUTPUT.json` instruments every
-counted check in the retired a01ec00 differential and compares its inventory
-with the JSON cases. The legacy checkout needs its matching binary/fixtures.
+A case file may declare `jobs` once; an individual case can override it.
+Parser-focused cases run once, while scheduling and byte-identity corpora keep
+their worker matrices. Nullable wide-decimal and malformed-stream regressions
+run in the referee and normal units, respectively.
 
 `perf` calls the clean scorecard worktree pinned in `tools/verify/HARNESS`;
 it preserves plan/run/summary semantics. `--suites` and `--cases` declare the
@@ -67,8 +69,12 @@ The in-process profile is a separate metric. `--plan-only` only plans;
 Timing holds the benchmark lock before changing the host power profile and
 restores that profile before releasing the lock.
 
-The fixture-generator rewrite, generator deletion and broad directory moves
-remain separate work. Existing fixture generators and profiling tools stay.
+Generate fixtures with `.venv/bin/python tools/zpq-gen SCENARIO --out DIR`.
+`--help` lists the recipes and the few scenario-specific options. The recipes
+retain the former scripts' values, seeds, page layouts and footer edits.
+`--rows` is available for descending Top-N and sparse files; `--target-size`
+sets the sparse logical size. Uploading a nested fixture requires an explicit
+`--upload-bucket`. Existing binary fixtures and profiling tools stay.
 
 Test stages require a nonempty parsed result with passed + skipped = total.
 `skip_policy.json` declares each tier's budget through named, fixture-dependent

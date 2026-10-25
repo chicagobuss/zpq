@@ -307,7 +307,14 @@ const Runner = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    run(init) catch |err| {
+        std.debug.print("arch blocked: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+}
+
+fn run(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const a = arena.allocator();

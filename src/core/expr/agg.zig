@@ -1701,7 +1701,12 @@ pub fn updateSharedInteger(
     const pos = lookup[ci] orelse return false;
     const col = batch.cols[pos];
     if (col != .i32 and col != .i64) return false;
-    if (col.codes() != null or col.nullInfo().max_rep != 0) return false;
+    if (col.codes() != null or col.levelsOnly() or col.nullInfo().max_rep != 0) return false;
+    // COUNT-only decoding may carry rows in levels without a value lane. The shared kernel reads values.
+    if (switch (col) {
+        inline .i32, .i64 => |c| c.values.len < outer.len,
+        else => unreachable,
+    }) return false;
     var selected: ?filter_selection.SelectionVector = null;
     defer if (selected) |*mask| mask.deinit();
     if (columnHasNulls(col)) {
@@ -7352,4 +7357,72 @@ fn testSharedInteger(a: std.mem.Allocator) !void {
         &sel,
     ));
     try std.testing.expectEqualDeep(before, states);
+}
+
+test "shared integer duplicate counts decline levels-only and short value lanes before mutation" {
+    const a = std.testing.allocator;
+    const n = 193;
+    var defs: [n]u32 = undefined;
+    var vals: [n]i64 = @splat(7);
+    var narrow: [n]i32 = @splat(7);
+    for (&defs, 0..) |*d, i| d.* = @intFromBool(i % 11 != 0);
+    for ([_]bool{ false, true }) |is32| for ([_]usize{ 0, n - 1 }) |len| {
+        const col: filter_eval.Batch.Column = if (is32)
+            .{ .i32 = .{
+                .values = narrow[0..len],
+                .def_levels = &defs,
+                .max_def = 1,
+                .has_nulls = true,
+                .levels_only_rows = if (len == 0) n else 0,
+            } }
+        else
+            .{ .i64 = .{
+                .values = vals[0..len],
+                .def_levels = &defs,
+                .max_def = 1,
+                .has_nulls = true,
+                .levels_only_rows = if (len == 0) n else 0,
+            } };
+        const arg: expr_ast.Expr = .{ .col_ref = .{
+            .col_idx = 0,
+            .physical_type = if (is32) .INT32 else .INT64,
+            .expr_type = .i64,
+            .nullable = true,
+        } };
+        const calls = [_]AggCall{
+            .{ .func = .count, .arg = arg, .where = null, .alias = "a", .result = .i64 },
+            .{ .func = .count, .arg = arg, .where = null, .alias = "b", .result = .i64 },
+        };
+        const batch: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = n };
+        for (0..3) |mode| {
+            var sel = try filter_selection.SelectionVector.init(a, n);
+            defer sel.deinit();
+            for (0..n) |r| sel.set(r, switch (mode) {
+                0 => true,
+                1 => false,
+                else => r % 3 != 0,
+            });
+            var states: [2]Accumulator = .{ .{ .count = 7 }, .{ .count = 19 } };
+            const before = states;
+            try std.testing.expect(!try updateSharedInteger(
+                a,
+                &calls,
+                &states,
+                &.{ false, false },
+                &batch,
+                &.{0},
+                &sel,
+            ));
+            try std.testing.expectEqualDeep(before, states);
+            if (len == 0) {
+                var present: u64 = 0;
+                for (defs, 0..) |d, r| if (d != 0 and sel.isActive(r)) {
+                    present += 1;
+                };
+                for (calls, &states) |call, *state| try updateOne(a, a, state, call, &batch, &.{0}, &sel);
+                try std.testing.expectEqual(7 + present, states[0].count);
+                try std.testing.expectEqual(19 + present, states[1].count);
+            }
+        }
+    };
 }

@@ -20868,3 +20868,80 @@ test "exact multi aggregate roots preserve state through releasing reader window
         args.inputs = &mapped;
     }
 }
+
+test "duplicate integer counts keep levels-only rows through releasing readers" {
+    const Batch = @import("filter/eval.zig").Batch;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ i32, i64 }) |T| {
+        const phys: schema.Type = if (T == i32) .INT32 else .INT64;
+        var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+        var file = try consumer.AggregateFile.init(a, sink.sink());
+        defer file.deinit();
+        var expected: [3]u64 = @splat(0);
+        for (0..16) |rg| {
+            var values: [193]T = undefined;
+            var f: [193]i64 = undefined;
+            var defs: [193]u32 = undefined;
+            for (&values, &f, &defs, 0..) |*v, *fv, *d, r| {
+                v.* = @intCast(@as(i64, @intCast(r * 137 + rg * 73)) - 15000);
+                fv.* = @intCast((r + rg) % 13);
+                d.* = @intFromBool(r % 11 != 0 and rg != 15);
+                if (d.* != 0) {
+                    expected[0] += 1;
+                    if (fv.* < 7) expected[1] += 1;
+                }
+            }
+            try file.append(&.{
+                .{ .name = "v", .parquet_type = phys, .nullable = true, .col = @unionInit(Batch.Column, @typeName(T), .{
+                    .values = &values,
+                    .def_levels = &defs,
+                    .max_def = 1,
+                }) },
+                .{ .name = "f", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &f } } },
+            }, values.len, .SNAPPY, .{}, .{});
+        }
+        _ = try file.finish(&.{
+            .{
+                .name = "v",
+                .parquet_type = phys,
+                .nullable = true,
+                .col = @unionInit(Batch.Column, @typeName(T), .{ .values = &.{} }),
+            },
+            .{ .name = "f", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+        });
+        const bytes = sink.buffer.items;
+        const meta = try metadata.open(a, bytes);
+        for (meta.row_groups.items) |*rg| for (rg.columns.items) |*c| {
+            c.meta_data.?.statistics = null;
+        };
+        for ([_]?[]const u8{ null, "f<7", "f<0" }, expected) |filter, want| {
+            for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch| {
+                var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+                const inputs = [_]Input{window.input(bytes)};
+                var got = try runMultiAggregate(gpa, a, .{
+                    .inputs = &inputs,
+                    .metas = (&meta)[0..1],
+                    .filter = filter,
+                    .aggregate = "count(v) AS a,count(v) AS b",
+                    .parallelism = j,
+                    .decode_batch_rows = batch,
+                    .scan_all = true,
+                    .min_bytes_per_worker = 1,
+                    .start_reads = .{
+                        .ctx = &window,
+                        .start = ReleasingScanWindow.start,
+                        .abandon = ReleasingScanWindow.abandon,
+                    },
+                });
+                defer got.deinit(gpa);
+                try testing.expectEqual(want, got.state.accumulators[0].count);
+                try testing.expectEqual(want, got.state.accumulators[1].count);
+                try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+                try testing.expectEqual(@as(usize, 0), window.abandoned);
+            };
+        }
+    }
+}

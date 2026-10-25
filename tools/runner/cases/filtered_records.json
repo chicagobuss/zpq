@@ -1,5 +1,5 @@
 {
-  "fixture_copy": "COPY (SELECT CASE WHEN i%101=0 THEN NULL WHEN i%1000=0 THEN '-9223372036854775808'::BIGINT ELSE (i%1000)*35184372088832-18014398509481984 END AS k, CASE WHEN i%97=0 THEN NULL ELSE ((i//1000)%1000-500)::INTEGER END AS f, CASE WHEN i%89=0 THEN NULL WHEN i%107=0 THEN '' WHEN i%109=0 THEN 'a'||chr(0)||'b' ELSE 's-'||CAST(i%400003 AS VARCHAR) END AS b,CASE WHEN i%79=0 THEN NULL ELSE ((i*37)%400003)*1048576-274877906944 END AS x,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)",
+  "fixture_copy": "COPY (SELECT CASE WHEN i%101=0 THEN NULL WHEN i%1000=0 THEN '-9223372036854775808'::BIGINT ELSE (i%1000)*35184372088832-18014398509481984 END AS k, CASE WHEN i%97=0 THEN NULL ELSE ((i//1000)%1000-500)::INTEGER END AS f, CASE WHEN i%89=0 THEN NULL WHEN i%107=0 THEN '' WHEN i%109=0 THEN 'a'||chr(0)||'b' ELSE 's-'||CAST(i%400003 AS VARCHAR) END AS b,CASE WHEN i%79=0 THEN NULL ELSE ((i*37)%400003)*1048576-274877906944 END AS x,CAST('9007199254740'||lpad(CAST(i%1000 AS VARCHAR),3,'0')||'.01' AS DECIMAL(18,2)) AS d64,CAST('99999999999999999999999999999999.'||lpad(CAST(i%1000 AS VARCHAR),4,'0') AS DECIMAL(38,4)) AS d128,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)",
   "fixture_files": [
     {
       "name": "indexed",
@@ -93,6 +93,27 @@
       "fixture": "indexed",
       "sql": "SELECT b,f,count(*) AS c FROM '{path}' WHERE f<160 GROUP BY b,f ORDER BY c DESC LIMIT 10 OFFSET 2",
       "duck": "SELECT b,f,count(*) AS c FROM read_parquet('{path}',file_row_number=true) WHERE f<160 GROUP BY b,f ORDER BY c DESC,min(file_row_number) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:decimal64",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE d64>9007199254740500.00 GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE d64>9007199254740500.00 GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:decimal128",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE d128>99999999999999999999999999999999.0500 GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE d128>99999999999999999999999999999999.0500 GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:like",
+      "kind": "product",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' WHERE b LIKE 's-1%' GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b,count(*) AS c FROM '{path}' WHERE b LIKE 's-1%' GROUP BY b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
       "ordered": true
     }
   ]

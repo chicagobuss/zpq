@@ -371,6 +371,16 @@ def stage_referee(ctx: Ctx) -> Cmd:
     )
 
 
+def stage_path_parity(ctx: Ctx) -> Cmd:
+    shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"))
+    shell += " && " + shlex.join([
+        ctx.python, "tools/verify/path_parity.py", "--referee", str(ctx.repo / "zig-out/bin/referee"),
+        "--duckdb", ctx.duckdb, "--out", str(ctx.run_dir / "path-parity"),
+    ])
+    return Cmd(["bash", "-c", shell], _base_env(ctx), "JSON/Parquet parity across in-process execution overrides",
+               blocked=_need(Path(ctx.duckdb), "DuckDB 2.0 CLI"))
+
+
 def stage_conform(ctx: Ctx) -> Cmd:
     corpus = ctx.repo / "data" / "parquet-testing" / "data"
     return _python(ctx, "tools/conformance.py", "apache parquet-testing corpus", "--corpus", corpus,
@@ -390,6 +400,7 @@ REGISTRY = [
     ("test-full", ("full",), stage_test_full),
     ("integration", ("full",), stage_integration),
     ("differential", ("commit", "full"), stage_referee),
+    ("path-parity", ("full",), stage_path_parity),
     ("fd", ("full",), stage_fd),
     ("canonical", ("full",), stage_canonical),
     ("cli-smoke", ("commit", "full"), stage_cli_smoke),

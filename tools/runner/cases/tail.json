@@ -1342,6 +1342,38 @@
         16
       ],
       "max_memory": "64M"
+    },
+    {
+      "id": "parity:dependent-keys",
+      "kind": "sql_ordered",
+      "fixture": "main",
+      "sql": "SELECT id,id-1 AS km,count(*) AS c FROM '{path}' GROUP BY id,id-1 ORDER BY id",
+      "jobs": [
+        1
+      ],
+      "parquet": true
+    },
+    {
+      "id": "parity:level-runs",
+      "kind": "sql_ordered",
+      "fixture": "levels_dictionary",
+      "sql": "SELECT count(h) AS n,min(h) AS lo,max(h) AS hi FROM '{path}'",
+      "jobs": [
+        1
+      ],
+      "scan_all": true,
+      "parquet": true
+    },
+    {
+      "id": "parity:float-batches",
+      "kind": "sql_ordered",
+      "fixture": "plain",
+      "sql": "SELECT sum(x*(1-x)) AS s,avg(x*(1-x)) AS a FROM '{path}'",
+      "jobs": [
+        1
+      ],
+      "scan_all": true,
+      "parquet": true
     }
   ]
 }

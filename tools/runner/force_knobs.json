@@ -1,0 +1,155 @@
+[
+  {
+    "name": "ZPQ_BYTE_RECORDS",
+    "off": "0",
+    "cases": [
+      "filtered-records:bytes"
+    ],
+    "evidence": "byte_owner"
+  },
+  {
+    "name": "ZPQ_DENSE",
+    "off": "0",
+    "cases": [
+      "dense:2"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_DISTINCT_PAIRS",
+    "off": "0",
+    "cases": [
+      "distinct:cd_flag:p1"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_ENCODED",
+    "off": "0",
+    "cases": [
+      "dense:2"
+    ],
+    "evidence": "encoded"
+  },
+  {
+    "name": "ZPQ_GROUP_KEY_FD",
+    "off": "0",
+    "cases": [
+      "parity:dependent-keys"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_INTEGER_RECORDS",
+    "off": "0",
+    "cases": [
+      "parity:integer-order"
+    ],
+    "evidence": "integer_owner"
+  },
+  {
+    "name": "ZPQ_LEVEL_RUNS",
+    "off": "0",
+    "cases": [
+      "parity:level-runs"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_MSD_RECORDS",
+    "off": "0",
+    "cases": [
+      "filtered-records:retained"
+    ],
+    "evidence": "msd_owner"
+  },
+  {
+    "name": "ZPQ_NDV_UNION",
+    "off": "0",
+    "cases": [
+      "dense:2"
+    ],
+    "evidence": "union"
+  },
+  {
+    "name": "ZPQ_SKETCH_CENSUS",
+    "off": "0",
+    "cases": [
+      "cut-budget:-j3"
+    ],
+    "evidence": "census_off"
+  },
+  {
+    "name": "ZPQ_SKETCH_TOPK",
+    "off": "0",
+    "cases": [
+      "cut-budget:-j3"
+    ],
+    "evidence": "sketch_off"
+  },
+  {
+    "name": "ZPQ_SPILL",
+    "off": "0",
+    "cases": [
+      "spill:spill_full:g8"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_TOPN_GATHER",
+    "off": "0",
+    "cases": [
+      "top:gather:f:all:LIMIT 12"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_EXPR_BATCH_ROWS",
+    "off": "0",
+    "cases": [
+      "parity:float-batches"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_DECODE_BATCH_ROWS",
+    "off": "0",
+    "cases": [
+      "parity:float-batches"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_BYTE_TOP_PARTITIONS",
+    "off": "0",
+    "cases": [
+      "filtered-records:bytes"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_BYTE_TOP_BATCH_ROWS",
+    "off": "0",
+    "cases": [
+      "filtered-records:bytes"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_MSD_CACHE_ROWS",
+    "off": "0",
+    "cases": [
+      "filtered-records:retained"
+    ],
+    "evidence": "unavailable"
+  },
+  {
+    "name": "ZPQ_PARTAGG",
+    "off": "0",
+    "on": "1",
+    "cases": [
+      "spill:spill_composite:g8"
+    ],
+    "evidence": "unavailable"
+  }
+]

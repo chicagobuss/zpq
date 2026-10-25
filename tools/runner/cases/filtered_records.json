@@ -204,6 +204,13 @@
       "jobs": [
         16
       ]
+    },
+    {
+      "id": "parity:integer-order",
+      "kind": "product",
+      "sql": "SELECT rid,count(*) AS c FROM '{path}' GROUP BY rid ORDER BY c DESC LIMIT 10",
+      "duck": "SELECT rid,count(*) AS c FROM '{path}' GROUP BY rid ORDER BY c DESC,rid LIMIT 10",
+      "ordered": true
     }
   ]
 }

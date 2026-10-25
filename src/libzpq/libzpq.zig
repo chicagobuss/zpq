@@ -454,7 +454,7 @@ export fn zpq_strerror(status: c_int) [*:0]const u8 {
 /// The process environment as it is now (libc's `environ`). After `clearenv()` glibc leaves `environ` NULL, which
 /// std declares as never null: read it through an optional instead, and treat NULL as an empty environment.
 fn processEnviron() std.process.Environ {
-    const environ_ptr = @extern(*const ?[*:null]const ?[*:0]const u8, .{ .name = "environ" });
+    const environ_ptr = @extern(*?[*:null]const ?[*:0]const u8, .{ .name = "environ" });
     const live = environ_ptr.* orelse return .{ .block = .{ .slice = &no_environ } };
     return .{ .block = .{ .slice = std.mem.span(live) } };
 }

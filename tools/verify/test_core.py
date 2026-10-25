@@ -37,6 +37,27 @@ def cell(engine, ns, query="q", failures=None, checked=3):
     }
 
 
+class CpuTest(unittest.TestCase):
+    def test_native_default_and_explicit_override_reach_builds(self):
+        parser = verify.build_parser()
+        self.assertEqual(parser.parse_args(["commit"]).cpu, "native")
+        self.assertEqual(parser.parse_args(["commit", "--cpu", "baseline"]).cpu, "baseline")
+        ctx = verify.dummy_ctx()
+        self.assertEqual(ctx.cpu, "native")
+        self.assertIn("-Dcpu=native", stages.stage_build_fast(ctx).argv)
+        ctx.cpu = "znver5"
+        self.assertIn("-Dcpu=znver5", stages.stage_build_fast(ctx).argv)
+
+    def test_native_cpu_provenance_resolves_zig_model_on_each_architecture(self):
+        for model in ("znver5", "neoverse_n1"):
+            output = '.{ .native = .{ .cpu = .{ .name = "' + model + '" } } }'
+            with patch.object(provenance, "_run", return_value=argparse.Namespace(returncode=0, stdout=output)):
+                self.assertEqual(provenance.resolved_cpu(verify.REPO, "native"), model)
+        with patch.object(provenance, "_run") as query:
+            self.assertEqual(provenance.resolved_cpu(verify.REPO, "baseline"), "baseline")
+            query.assert_not_called()
+
+
 class EnvironmentTest(unittest.TestCase):
     def test_missing_and_wrong_versions_stop_before_host_probes(self):
         installed = {"duckdb": "1.4.3"}

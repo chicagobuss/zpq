@@ -20,7 +20,8 @@ and JSON/JSONL/Parquet formatting, and runs the full differential referee.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
 `--base` is the previously integrated comparison binary; it is required for
 `full` and is recorded without a default. Native builds default to
-`--cpu raptorlake`; select the appropriate CPU explicitly on other hosts.
+`--cpu native`, using the host CPU. `--cpu` remains an explicit override.
+Provenance records both the requested setting and the resolved Zig CPU model.
 
 Each run writes `zig-out/verify/<run-id>/summary.json` (override with `--out`).
 Stages retain status, duration, command, counts, logs and binary hashes.

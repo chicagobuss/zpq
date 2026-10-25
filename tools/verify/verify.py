@@ -68,7 +68,7 @@ def guide() -> str:
                   "Outputs: zig-out/verify/<run-id>/summary.json; --out changes the parent.",
                   "Reruns: new directory, --rerun-of ID; earlier failures stay recorded.",
                   "Builds: 20 GiB systemd scope, nice 10, at most -j8; --cpu defaults to",
-                  "raptorlake for native ReleaseFast builds. Select another CPU explicitly.",
+                  "native (the host CPU). Use --cpu to override the build CPU.",
                   "Dependencies: Zig, the DuckDB CLI, and tools/verify/requirements.txt pins.",
                   "Python dependency mismatches stop before any build or host probe.",
                   "repro-skspill expects exit 1 plus the declared memory-budget message.",
@@ -89,7 +89,7 @@ def dummy_ctx() -> stages.Ctx:
         zigw=str(REPO / "tools/verify/zigw"),
         run_dir=Path("/tmp"),
         j=8,
-        cpu="raptorlake",
+        cpu="native",
         revision="0" * 40,
         binary=REPO / "zig-out/bin/zpq",
         lib=REPO / "zig-out/lib/libzpq.so",
@@ -184,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="previously integrated comparison binary (required for full; recorded, not defaulted)",
     )
     common.add_argument("-j", type=int, default=8)
-    common.add_argument("--cpu", default="raptorlake", help="zig -Dcpu for native ReleaseFast builds")
+    common.add_argument("--cpu", default="native", help="zig -Dcpu (default: native host CPU; override explicitly)")
     common.add_argument("--rerun-of", help="earlier run id this record follows; that summary is not modified")
     common.add_argument("--label")
     common.add_argument("--no-scope", action="store_true", help="do not wrap stages in the 20G systemd scope")

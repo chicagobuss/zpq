@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import re
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import socket
@@ -87,6 +88,17 @@ def python_environment(repo: Path) -> dict:
     }
 
 
+def resolved_cpu(repo: Path, requested: str) -> str:
+    if requested != "native" and not requested.startswith(("native+", "native-")):
+        return requested
+    ran = _run([str(repo / "tools/verify/zigw"), "targets"], timeout=30)
+    # The pinned Zig release emits ZON; read its detected model from the native CPU block.
+    match = re.search(r'\.native\s*=\s*\.\{.*?\.cpu\s*=\s*\.\{.*?\.name\s*=\s*"([^"]+)"', ran.stdout, re.S)
+    if ran.returncode != 0 or not match:
+        raise RuntimeError("could not resolve native CPU from zig targets")
+    return match.group(1) + requested[len("native"):]
+
+
 def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
     diff = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=repo)
@@ -96,6 +108,7 @@ def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
         "cpu_model": cpu_model(),
         "logical_cpus": os_cpu_count(),
         "zig_cpu": zig_cpu,
+        "zig_cpu_resolved": resolved_cpu(repo, zig_cpu),
         "python": platform.python_version(),
         "python_environment": python_environment(repo),
         "engine_tree": subprocess.check_output(["git", "rev-parse", "HEAD:src"], cwd=repo, text=True).strip(),

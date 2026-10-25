@@ -91,7 +91,7 @@ def hardwood_version() -> str:
 # renders everything else as text: decimals as plain strings, NaN/±Infinity as strings, temporals as ISO-8601 (INT96
 # and UTC-adjusted timestamps with a trailing Z), UUIDs canonically, binary as UTF-8 text or 0x-hex, nested values as
 # native JSON. When exactly one side of a pair is a string, it is coerced toward the other side's type. Numbers then
-# compare under oracle_compare.same: NULL, integers and DECIMAL exactly, floats and zpq's f64 lane with a tolerance.
+# compare under oracle_compare.same: NULL, integers and DECIMAL exactly, float-typed values with a tolerance.
 
 def is_nan(v: Any) -> bool:
     return isinstance(v, float) and math.isnan(v)
@@ -187,7 +187,7 @@ def normalize_value(v: Any) -> Any:
             return "NaN"
         if v.is_infinite():
             return "Infinity" if v > 0 else "-Infinity"
-        return v  # exact; same() compares it as a float only against a float or in zpq's f64 lane
+        return v  # exact unless the aggregate has a float-typed result
     if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
         return canon_temporal(v)
     if isinstance(v, (bytes, bytearray)):
@@ -198,7 +198,7 @@ def normalize_value(v: Any) -> Any:
 
 
 def compare_values(v1: Any, v2: Any, lane: Optional[str] = None) -> bool:
-    """`lane` is oracle_compare's: F64 when zpq computed the value in its f64 lane."""
+    """`lane` is oracle_compare's: F64 only for float-typed aggregate results."""
     if isinstance(v1, dict) and isinstance(v2, dict):
         return v1.keys() == v2.keys() and all(compare_values(v1[k], v2[k]) for k in v1)
     if isinstance(v1, list) and isinstance(v2, list):
@@ -750,10 +750,10 @@ def eval_probe(probe: Probe, rows: List[Dict]) -> List[Dict]:
                 with decimal.localcontext() as ctx:
                     ctx.prec = 80
                     total = sum(vals, decimal.Decimal(0))
-                # A DECIMAL sum past 38 digits overflows in every engine (zpq and DuckDB both raise); so must the oracle.
-                scale = it.typ.scale if it.typ is not None and pa.types.is_decimal(it.typ) else 0
-                if abs(total.scaleb(scale)) >= decimal.Decimal(10) ** 38:
-                    raise RuntimeError(f"DECIMAL sum of {it.col} overflows 38 digits")
+                    # Check the scaled boundary at the same precision as the exact sum.
+                    scale = it.typ.scale if it.typ is not None and pa.types.is_decimal(it.typ) else 0
+                    if abs(total.scaleb(scale)) >= decimal.Decimal(10) ** 38:
+                        raise RuntimeError(f"DECIMAL sum of {it.col} overflows 38 digits")
                 out[it.alias] = total
             elif isinstance(vals[0], float):
                 try:

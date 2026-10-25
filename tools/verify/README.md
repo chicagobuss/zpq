@@ -74,6 +74,8 @@ restores that profile before releasing the lock.
 Generate fixtures with `.venv/bin/python tools/zpq-gen SCENARIO --out DIR`.
 `--help` lists the recipes and the few scenario-specific options. The recipes
 retain the former scripts' values, seeds, page layouts and footer edits.
+`packed_count` regenerates the indexed nullable composite-COUNT fixture;
+its bytes match the original packed-count generator.
 `--rows` is available for descending Top-N and sparse files; `--target-size`
 sets the sparse logical size. Uploading a nested fixture requires an explicit
 `--upload-bucket`. Existing binary fixtures and profiling tools stay.

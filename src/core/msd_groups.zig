@@ -4,6 +4,7 @@ const memory = @import("memory.zig");
 const retained = @import("retained_pages.zig");
 const huge_pages = @import("huge_pages.zig");
 const eval = @import("filter/eval.zig");
+const Selection = @import("filter/selection.zig").SelectionVector;
 const spawn = @import("spawn.zig");
 const hw = @import("hw.zig");
 const now = @import("../clock.zig").monoNs;
@@ -186,22 +187,50 @@ pub const Local = struct {
         b.len += 1;
     }
     pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
+        return l.batchSelected(view, lookup, offset, null);
+    }
+
+    pub fn batchSelected(
+        l: *Local,
+        view: eval.Batch,
+        lookup: []const ?usize,
+        offset: usize,
+        selected: ?*const Selection,
+    ) !void {
         const k = view.cols[lookup[l.state.key_col].?].string;
         const f = view.cols[lookup[l.state.f_col].?];
-        for (0..view.num_rows) |i| {
-            const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
-            const key: []const u8 = if (kn) "" else if (k.codes) |codes| k.dict[codes[i]] else k.values[i];
-            if (!kn and !l.owner.?.contains(key)) return error.RetainedOwnershipViolation;
-            const fv: ?i32 = switch (f) {
-                .i64 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def) null else @intCast(if (c.codes) |codes| c.dict[codes[i]] else c.values[i]),
-                .i32 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def) null else if (c.codes) |codes| c.dict[codes[i]] else c.values[i],
-                else => return error.UnexpectedPage,
-            };
-            if (!kn) l.common = if (l.common) |p| commonPrefix(p, key) else key;
-            const r: Record = .{ .word = cached(key, key.len -| 8), .ptr = if (key.len == 0) 0 else @intFromPtr(key.ptr), .ordinal = (l.ordinal_base + @as(u32, @intCast(offset + i))) |
-                (if (kn) key_null else 0) | (if (fv == null) f_null else 0), .len = @intCast(key.len), .f = fv orelse 0 };
-            try l.append(r);
-        }
+        if (selected) |sel| {
+            for (sel.mask, 0..) |mask, word| {
+                var it = (std.bit_set.IntegerBitSet(64){ .mask = mask }).iterator(.{});
+                while (it.next()) |bit| try l.batchRow(k, f, offset, word * 64 + bit);
+            }
+        } else for (0..view.num_rows) |i| try l.batchRow(k, f, offset, i);
+    }
+
+    inline fn batchRow(l: *Local, k: anytype, f: eval.Batch.Column, offset: usize, i: usize) !void {
+        const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
+        const key: []const u8 = if (kn) "" else if (k.codes) |codes| k.dict[codes[i]] else k.values[i];
+        if (!kn and !l.owner.?.contains(key)) return error.RetainedOwnershipViolation;
+        const fv: ?i32 = switch (f) {
+            .i64 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def)
+                null
+            else
+                @intCast(if (c.codes) |codes| c.dict[codes[i]] else c.values[i]),
+            .i32 => |c| if (c.def_levels != null and c.def_levels.?[i] < c.max_def)
+                null
+            else if (c.codes) |codes| c.dict[codes[i]] else c.values[i],
+            else => return error.UnexpectedPage,
+        };
+        if (!kn) l.common = if (l.common) |p| commonPrefix(p, key) else key;
+        const r: Record = .{
+            .word = cached(key, key.len -| 8),
+            .ptr = if (key.len == 0) 0 else @intFromPtr(key.ptr),
+            .ordinal = (l.ordinal_base + @as(u32, @intCast(offset + i))) |
+                (if (kn) key_null else 0) | (if (fv == null) f_null else 0),
+            .len = @intCast(key.len),
+            .f = fv orelse 0,
+        };
+        try l.append(r);
     }
     fn keep(l: *Local, comptime V: type, v: V) void {
         var first = v.at(0).*;
@@ -492,6 +521,11 @@ pub const State = struct {
         a.destroy(s);
     }
     pub fn finish(s: *State) ![]const Group {
+        return s.finishSelected(s.rows);
+    }
+
+    pub fn finishSelected(s: *State, selected_rows: usize) ![]const Group {
+        if (selected_rows > s.rows) return error.ShortDecode;
         const begin = now();
         var at: usize = 0;
         var rows: usize = 0;
@@ -504,7 +538,7 @@ pub const State = struct {
             rows += s.counts[p];
         }
         s.starts[parts] = at;
-        if (rows != s.rows) return error.ShortDecode;
+        if (rows != selected_rows) return error.ShortDecode;
         var common: ?[]const u8 = null;
         for (s.locals) |*l| if (l.common) |p| {
             common = if (common) |previous| commonPrefix(previous, p) else p;

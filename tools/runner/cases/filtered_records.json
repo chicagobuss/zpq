@@ -1,0 +1,99 @@
+{
+  "fixture_copy": "COPY (SELECT CASE WHEN i%101=0 THEN NULL WHEN i%1000=0 THEN '-9223372036854775808'::BIGINT ELSE (i%1000)*35184372088832-18014398509481984 END AS k, CASE WHEN i%97=0 THEN NULL ELSE ((i//1000)%1000-500)::INTEGER END AS f, CASE WHEN i%89=0 THEN NULL WHEN i%107=0 THEN '' WHEN i%109=0 THEN 'a'||chr(0)||'b' ELSE 's-'||CAST(i%400003 AS VARCHAR) END AS b,CASE WHEN i%79=0 THEN NULL ELSE ((i*37)%400003)*1048576-274877906944 END AS x,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)",
+  "fixture_files": [
+    {
+      "name": "indexed",
+      "path": "ci/fixtures/parquet/filtered_records_indexed.parquet"
+    }
+  ],
+  "cases": [
+    {
+      "id": "filtered-records:integer",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:bytes",
+      "kind": "product",
+      "sql": "SELECT b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:packed",
+      "kind": "product",
+      "sql": "SELECT k,f,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY k,f ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k,f,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY k,f ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:retained",
+      "kind": "product",
+      "sql": "SELECT b,f,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b,f ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b,f,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b,f ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:null-filter",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE f IS NULL GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE f IS NULL GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:empty",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE f<0 AND f>0 GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE f<0 AND f>0 GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:key-filter",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE x>0 GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE x>0 GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:all-match",
+      "kind": "product",
+      "sql": "SELECT x,count(*) AS c FROM '{path}' WHERE f IS NULL OR f>=-500 GROUP BY x ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT x,count(*) AS c FROM '{path}' WHERE f IS NULL OR f>=-500 GROUP BY x ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:packed:parquet",
+      "kind": "product",
+      "sql": "SELECT k AS a,f AS b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY k,f ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k AS a,f AS b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY k,f ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "filtered-records:retained:parquet",
+      "kind": "product",
+      "sql": "SELECT b AS a,f AS b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b,f ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b AS a,f AS b,count(*) AS c FROM '{path}' WHERE f<0 GROUP BY b,f ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "filtered-records:indexed-packed",
+      "kind": "product",
+      "fixture": "indexed",
+      "sql": "SELECT k,f,count(*) AS c FROM '{path}' WHERE f<160 GROUP BY k,f ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k,f,count(*) AS c FROM read_parquet('{path}',file_row_number=true) WHERE f<160 GROUP BY k,f ORDER BY c DESC,min(file_row_number) LIMIT 10 OFFSET 2",
+      "ordered": true
+    },
+    {
+      "id": "filtered-records:indexed-retained",
+      "kind": "product",
+      "fixture": "indexed",
+      "sql": "SELECT b,f,count(*) AS c FROM '{path}' WHERE f<160 GROUP BY b,f ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT b,f,count(*) AS c FROM read_parquet('{path}',file_row_number=true) WHERE f<160 GROUP BY b,f ORDER BY c DESC,min(file_row_number) LIMIT 10 OFFSET 2",
+      "ordered": true
+    }
+  ]
+}

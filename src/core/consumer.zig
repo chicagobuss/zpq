@@ -3108,18 +3108,32 @@ pub const IntegerCountSink = struct {
     local: *owner_groups.IntCountTop.Local,
     packing: ?*PackedCount = null,
 
-    fn batch(s: IntegerCountSink, view: filter_eval.Batch, lookup: []const ?usize, offset: usize) !void {
-        const p = s.packing orelse return s.local.batch(view, lookup, offset);
+    fn batch(
+        s: IntegerCountSink,
+        view: filter_eval.Batch,
+        lookup: []const ?usize,
+        offset: usize,
+        selected: ?*const filter_selection.SelectionVector,
+    ) !void {
+        const p = s.packing orelse return s.local.batchSelected(view, lookup, offset, selected);
         if (p.refused.load(.monotonic)) return;
         const source = p.sources[s.local.run_item];
         if (!try p.domain.bind(p.keys, source.file, source.rg, &view, lookup, p.bindings)) {
             p.refused.store(true, .monotonic);
             return;
         }
-        for (0..view.num_rows) |r| {
-            const id = try agg_dense.productId(p.bindings, r, true);
-            try s.local.append(@bitCast(@as(u64, @intCast(id))), {}, s.local.ordinal_base + @as(u32, @intCast(offset + r)));
-        }
+        if (selected) |sel| {
+            for (sel.mask, 0..) |mask, word| {
+                var it = (std.bit_set.IntegerBitSet(64){ .mask = mask }).iterator(.{});
+                while (it.next()) |bit| try s.packedRow(p, offset, word * 64 + bit);
+            }
+        } else for (0..view.num_rows) |r| try s.packedRow(p, offset, r);
+    }
+
+    inline fn packedRow(s: IntegerCountSink, p: *const PackedCount, offset: usize, r: usize) !void {
+        const id = try agg_dense.productId(p.bindings, r, true);
+        const ordinal = s.local.ordinal_base + @as(u32, @intCast(offset + r));
+        try s.local.append(@bitCast(@as(u64, @intCast(id))), {}, ordinal);
     }
 };
 
@@ -3164,10 +3178,19 @@ pub const RecordSink = union(enum) {
         };
     }
 
-    fn batch(s: RecordSink, view: filter_eval.Batch, lookup: []const ?usize, offset: usize) !void {
+    fn batch(
+        s: RecordSink,
+        view: filter_eval.Batch,
+        lookup: []const ?usize,
+        offset: usize,
+        sel: *const filter_selection.SelectionVector,
+    ) !void {
+        const count = sel.count();
+        if (count == 0) return;
+        const selected: ?*const filter_selection.SelectionVector = if (count == view.num_rows) null else sel;
         switch (s) {
-            .integer_count_top => |s0| try s0.batch(view, lookup, offset),
-            inline else => |local| try local.batch(view, lookup, offset),
+            .integer_count_top => |s0| try s0.batch(view, lookup, offset, selected),
+            inline else => |local| try local.batchSelected(view, lookup, offset, selected),
         }
     }
 };
@@ -4230,7 +4253,7 @@ fn scanRGForAggImpl(
     switch (target) {
         .grouped => |g| {
             if (g.records) |records| {
-                try records.batch(batch, lookup, 0);
+                try records.batch(batch, lookup, 0, &sel);
                 const end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, end, profile.args(.{ selected, calls.len }));
@@ -4487,7 +4510,12 @@ fn scanRGSliced(
         };
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
-        for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
+        for (readers.items, cols) |*r, *c| c.* = r.next(sa, n) catch |err| {
+            // A record slice may read pages that the ordinary indexed plan skips. Replay establishes its error.
+            if (in.filter != null and target == .grouped and target.grouped.records != null and isDecodeError(err))
+                return error.RetainedEncodingUnsupported;
+            return err;
+        };
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
         var sel = if (payload != null)
             try survivors.alignedWindow(done, n)
@@ -4509,7 +4537,7 @@ fn scanRGSliced(
             .grouped => |g| {
                 if (g.records) |records| {
                     const emit_start = nowMonoNs();
-                    try records.batch(batch, lookup, done);
+                    try records.batch(batch, lookup, done, &sel);
                     if (records.* == .msd) profile.record(prof, .msd_emit, emit_start, nowMonoNs(), profile.args(.{}));
                     continue;
                 }
@@ -4719,21 +4747,33 @@ const ChunkDecoder = struct {
         };
         decode_options.any_dictionary = self.target.codedKey(ci);
         decode_options.decimal_exact_only = self.target.exactInputs();
+        const pruned_pages = if (prune_info) |p|
+            std.mem.indexOfScalar(bool, p.page_is_skipped, true) != null
+        else
+            false;
         if (self.target == .grouped) if (self.target.grouped.records) |records| if (records.retention(ci)) |owner| {
             var reader = (try SliceReader.init(a, a, in.rg, in.meta, in.src, ci, decode_options)).?;
             defer reader.deinit();
             reader.retainPayloads(owner);
             reader.raw.bytes.pages.prof = prof;
-            const decoded = try reader.next(a, self.num_rows);
+            const decoded = reader.next(a, self.num_rows) catch |err| {
+                // Retention reads complete pages. The ordinary pruned replay decides whether a corrupt page matters.
+                if (pruned_pages and isDecodeError(err)) return error.RetainedEncodingUnsupported;
+                return err;
+            };
             try checkRowShape(decoded, self.num_rows);
             if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
             return decoded;
         };
         const scratch = self.ws.scratch;
-        // An index that excludes no rows or pages needs no value expansion. Retain keyed dictionaries there;
-        // actual pruning and compact/gated views still use the page-wise value decoder.
+        const packed_codes = self.target == .grouped and if (self.target.grouped.records) |r|
+            r.* == .integer_count_top and r.integer_count_top.packing != null
+        else
+            false;
+        // Packed owners need the original dictionary. Read complete codes and apply the survivor mask at the sink;
+        // pruned replay remains authoritative for failures on pages the query does not need.
         const keyed_whole = decode_options.any_dictionary and self.keep == null and
-            (if (prune_info) |p| std.mem.indexOfScalar(bool, p.page_is_skipped, true) == null else true);
+            (!pruned_pages or packed_codes);
         const encoded = decode_options.encoded and (prune_info == null or keyed_whole) and ci < uses.code.len and
             decode_options.row_gate == null;
         const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and
@@ -4744,15 +4784,20 @@ const ChunkDecoder = struct {
             try decodeAggColumnHist(a, chunk, cm, in.meta, decode_options, scratch, self.num_rows, firsts)
         else
             null;
+        var read_whole_codes = false;
         var decoded = if (hist_col) |hc|
             hc
         else if (levels_only)
             try decodeLevelsOnly(a, chunk, cm, in.meta, decode_options, scratch, self.num_rows)
-        else if (encoded and (uses.code[ci] or uses.levels[ci]))
-            (try decodeAggColumnCoded(a, chunk, cm, in.meta, decode_options, scratch)) orelse
-                try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch)
-        else
-            try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch);
+        else if (encoded and (uses.code[ci] or uses.levels[ci])) coded: {
+            const col = decodeAggColumnCoded(a, chunk, cm, in.meta, decode_options, scratch) catch |err| {
+                if (!packed_codes or !pruned_pages or !isDecodeError(err)) return err;
+                enterChunk(in.rg, ci);
+                break :coded try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch);
+            };
+            read_whole_codes = col != null;
+            break :coded col orelse try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch);
+        } else try decodeAggColumn(a, chunk, cm, in.meta, prune_info, decode_options, scratch);
         if (self.target == .grouped and self.target.grouped.table.countOnly() and !in.consumed[ci] and decoded.codes() != null) {
             std.debug.assert(!uses.value[ci]);
         }
@@ -4762,7 +4807,7 @@ const ChunkDecoder = struct {
             chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
             if (prune_info) |pi| {
                 self.pages_total += pi.page_is_skipped.len;
-                self.pages_skipped += std.mem.count(bool, pi.page_is_skipped, &.{true});
+                if (!read_whole_codes) self.pages_skipped += std.mem.count(bool, pi.page_is_skipped, &.{true});
             }
         }
         return decoded;

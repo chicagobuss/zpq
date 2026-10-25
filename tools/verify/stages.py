@@ -334,6 +334,7 @@ REFEREE_CASES = [
     "tools/runner/cases/tail.json",
     "tools/runner/cases/product.json",
     "tools/runner/cases/packed_count.json",
+    "tools/runner/cases/filtered_records.json",
     "tools/runner/cases/oracle_precision.json",
 ]
 

@@ -8,6 +8,7 @@
 //! retaining groups or merging worker sets.
 const std = @import("std");
 const eval = @import("filter/eval.zig");
+const Selection = @import("filter/selection.zig").SelectionVector;
 const memory = @import("memory.zig");
 const spawn = @import("spawn.zig");
 const hw = @import("hw.zig");
@@ -312,30 +313,40 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
 
             pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
+                return l.batchSelected(view, lookup, offset, null);
+            }
+
+            pub fn batchSelected(
+                l: *Local,
+                view: eval.Batch,
+                lookup: []const ?usize,
+                offset: usize,
+                selected: ?*const Selection,
+            ) !void {
                 if (comptime codec == .int64)
                     if (l.state.runs.len != 0 and l.state.run_declined.load(.monotonic)) return;
                 const k = if (codec == .bytes) view.cols[lookup[l.state.key_col].?].string else view.cols[lookup[l.state.key_col].?].i64;
-                if (!has_value) {
-                    for (0..view.num_rows) |i| {
-                        const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
-                        try l.append(
-                            if (kn) null else if (k.codes) |codes| k.dict[codes[i]] else k.values[i],
-                            {},
-                            l.ordinal_base + @as(u32, @intCast(offset + i)),
-                        );
+                const v = if (has_value) view.cols[lookup[l.state.value_col].?].i64 else {};
+                if (selected) |sel| {
+                    for (sel.mask, 0..) |mask, word| {
+                        var it = (std.bit_set.IntegerBitSet(64){ .mask = mask }).iterator(.{});
+                        while (it.next()) |bit| try l.batchRow(k, v, offset, word * 64 + bit);
                     }
-                    return;
-                }
-                const v = view.cols[lookup[l.state.value_col].?].i64;
-                for (0..view.num_rows) |i| {
-                    const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
+                } else for (0..view.num_rows) |i| try l.batchRow(k, v, offset, i);
+            }
+
+            inline fn batchRow(l: *Local, k: anytype, v: anytype, offset: usize, i: usize) !void {
+                const kn = if (k.def_levels) |d| d[i] < k.max_def else false;
+                const key = if (kn) null else if (k.codes) |codes| k.dict[codes[i]] else k.values[i];
+                const ordinal = l.ordinal_base + @as(u32, @intCast(offset + i));
+                if (has_value) {
                     const vn = if (v.def_levels) |d| d[i] < v.max_def else false;
                     try l.append(
-                        if (kn) null else if (k.codes) |codes| k.dict[codes[i]] else k.values[i],
+                        key,
                         if (vn) null else if (v.codes) |codes| v.dict[codes[i]] else v.values[i],
-                        l.ordinal_base + @as(u32, @intCast(offset + i)),
+                        ordinal,
                     );
-                }
+                } else try l.append(key, {}, ordinal);
             }
         };
 
@@ -877,7 +888,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 }
             }
 
-            fn finishRuns(s: *State) !void {
+            fn finishRuns(s: *State, selected_rows: usize) !void {
                 if (s.run_declined.load(.monotonic)) return error.RunOrderDeclined;
                 var rows: usize = 0;
                 for (s.locals) |local| s.input_nulls |= local.nulls;
@@ -901,7 +912,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     }
                     last = run.last;
                 }
-                if (rows != s.rows) return error.BadRowCount;
+                if (rows != selected_rows) return error.BadRowCount;
                 if (kind != .full) {
                     try s.parallel(.run_top);
                     s.combineTop();
@@ -925,9 +936,15 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             }
 
             pub fn finish(s: *State) !void {
+                return s.finishSelected(s.rows);
+            }
+
+            /// Capacity and original ordinals still use the raw row bound; only emitted rows must match survivors.
+            pub fn finishSelected(s: *State, selected_rows: usize) !void {
+                if (selected_rows > s.rows) return error.BadRowCount;
                 if (comptime codec == .int64) if (s.runs.len != 0) {
                     const begin = now();
-                    try s.finishRuns();
+                    try s.finishRuns(selected_rows);
                     s.fold_ns = @intCast(now() - begin);
                     return;
                 };
@@ -937,7 +954,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     s.input_nulls |= l.nulls;
                     for (l.histogram) |n| contributed += n;
                 }
-                if (contributed != s.rows) return error.BadRowCount;
+                if (contributed != selected_rows) return error.BadRowCount;
                 if (kind == .full) {
                     s.starts = try s.gpa.alloc(usize, s.parts + 1);
                     s.counts = try s.gpa.alloc(usize, s.parts);

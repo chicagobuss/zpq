@@ -16,6 +16,7 @@ import argparse
 import subprocess
 import sys
 import unittest
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,7 +29,7 @@ import summary
 
 
 REPO = Path(__file__).resolve().parents[2]
-DEFAULT_OUT = Path.home() / "code/zpq-wt/verify-v2-out"
+DEFAULT_OUT = REPO / "zig-out/verify"
 DUCKDB20 = Path.home() / ".cache/zpq-duckdb2/bin-2.0.0/duckdb"
 CLICKBENCH = Path.home() / "bench/zpq-fair/data/clickbench"
 CLICKBENCH_SQL = Path.home() / "bench/zpq-fair/repos/ClickBench/duckdb-parquet"
@@ -75,13 +76,13 @@ def guide() -> str:
         '  "the query needs more memory than --max-memory allows"',
         "  with -j 8 --max-memory 500MB. That result is status expected.",
         "",
-        "Host builds pass -Dcpu=raptorlake. On this i7-13700HX that Zig model enables AVX2/AVX-VNNI",
-        "and leaves AVX-512 off, which matches the chip. The flag is stored in the summary as zig_cpu.",
+        "Host builds default to -Dcpu=raptorlake; --cpu selects another native target.",
+        "The flag is stored in the summary as zig_cpu.",
         "Cross builds of aarch64 and macOS do not take that Intel model.",
         "Stages that compile or run the engine use systemd-run --user --scope -p MemoryMax=20G",
-        "and nice -n 10, with at most -j12. perf does not add a second cap around the harness.",
+        "and nice -n 10, with at most -j8. perf does not add a second cap around the harness.",
         "",
-        "Outputs land in ~/code/zpq-wt/verify-v2-out/<run-id>/summary.json unless --out is set.",
+        "Outputs land in zig-out/verify/<run-id>/summary.json unless --out is set.",
         "",
         "Full and commit stages",
     ]
@@ -90,7 +91,8 @@ def guide() -> str:
         lines.append(f"  {name:<28} {where:<16} {blurbs[name]}")
     lines.append("")
     lines.append("Pinned harness: tools/verify/HARNESS (bench/scorecard-inproc, not merged into this branch).")
-    return "\n".join(lines) + "\n"
+    return "\n".join(textwrap.fill(line, width=80, subsequent_indent="    ") if len(line) > 80 else line
+                     for line in lines) + "\n"
 
 
 def dummy_ctx() -> stages.Ctx:
@@ -99,7 +101,7 @@ def dummy_ctx() -> stages.Ctx:
         python=sys.executable,
         zigw=str(REPO / "tools/verify/zigw"),
         run_dir=Path("/tmp"),
-        j=12,
+        j=8,
         cpu="raptorlake",
         revision="0" * 40,
         binary=REPO / "zig-out/bin/zpq",
@@ -150,7 +152,7 @@ def make_ctx(args, run_dir: Path, revision: str) -> stages.Ctx:
 
 def open_run(args, tier: str, revision: str) -> tuple[Path, summary.Summary]:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    parent = Path(args.out).expanduser() if args.out else DEFAULT_OUT
+    parent = Path(args.out).expanduser().resolve() if args.out else DEFAULT_OUT
     run_id = args.run_id or f"{tier}-{revision[:12]}-{stamp}"
     run_dir = parent / run_id
     if (run_dir / "summary.json").exists():
@@ -158,7 +160,7 @@ def open_run(args, tier: str, revision: str) -> tuple[Path, summary.Summary]:
             f"{run_dir / 'summary.json'} already exists. A rerun is a new directory; the first record stays."
         )
     probe = tier in ("full", "soak", "perf")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
     host = provenance.collect(REPO, run_dir, args.cpu, probe)
     book = summary.Summary(
         run_dir,
@@ -198,7 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--base",
         help="previously integrated binary the candidate is checked against (required for full; recorded, not defaulted)",
     )
-    common.add_argument("-j", type=int, default=12)
+    common.add_argument("-j", type=int, default=8)
     common.add_argument("--cpu", default="raptorlake", help="zig -Dcpu for native ReleaseFast builds")
     common.add_argument("--rerun-of", help="earlier run id this record follows; that summary is not modified")
     common.add_argument("--label")
@@ -246,10 +248,10 @@ def main(argv: list[str] | None = None) -> int:
         suite = unittest.defaultTestLoader.loadTestsFromName("test_core")
         result = unittest.TextTestRunner(verbosity=1).run(suite)
         return 0 if result.wasSuccessful() else 1
-    if getattr(args, "j", 12) > 12:
-        print("refusing -j above 12", file=sys.stderr)
+    if getattr(args, "j", 8) > 8:
+        print("refusing -j above 8", file=sys.stderr)
         return 2
-    if getattr(args, "j", 12) < 1:
+    if getattr(args, "j", 8) < 1:
         print("refusing -j below 1", file=sys.stderr)
         return 2
     if args.command == "commit" and list(getattr(args, "diff_args", []) or []) not in ([], ["--"]):
@@ -257,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
             "commit runs the full ReleaseSafe referee. A differential slice is no longer a separate script.",
             file=sys.stderr,
         )
+        return 2
+    if args.command == "soak" and (args.hours <= 0 or args.rounds is not None and args.rounds <= 0):
+        print("soak needs positive --hours and --rounds", file=sys.stderr)
         return 2
     if args.command == "full":
         if not getattr(args, "base", None):
@@ -299,10 +304,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(guide())
             return 2
-    except KeyError:
-        print(f"unknown stage {getattr(args, 'name', '')}", file=sys.stderr)
-        book.finish(2)
-        return 2
+    except Exception as error:
+        log_path = run_dir / "logs" / "runner-error.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(f"{type(error).__name__}: {error}\n")
+        book.add_stage({"name": "runner-error", "status": "fail", "rc": 1,
+                        "duration_s": 0.0, "log": str(log_path), "counts": {"error": str(error)}})
     return finish(book)
 
 

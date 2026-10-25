@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,13 +60,16 @@ def parse_tests(text):
 
 def parse_referee(text):
     found = re.search(r"referee: (\d+)/(\d+) checks match", text)
-    expected = re.search(r"referee: expected (\d+)", text)
     counts = {}
     if found:
         counts["matched"] = int(found.group(1))
         counts["total"] = int(found.group(2))
-    if expected:
-        counts["expected"] = int(expected.group(1))
+    for field, label in (("expected", "expected"), ("refusals", "refusals"),
+                         ("refusal_declarations", "refusal declarations")):
+        match = re.search(rf"referee: {label} (\d+)", text)
+        if match:
+            counts[field] = int(match.group(1))
+    counts["limited"] = "referee: limited run" in text
     return counts
 
 
@@ -308,8 +312,8 @@ def stage_write_robustness(ctx: Ctx) -> Cmd:
 def stage_test_soak(ctx: Ctx) -> Cmd:
     shell = " && ".join(
         [
-            " ".join(_zig_build(ctx, "test-soak", "--summary", "all")),
-            " ".join(
+            shlex.join(_zig_build(ctx, "test-soak", "--summary", "all")),
+            shlex.join(
                 _zig_build(
                     ctx,
                     "-Doptimize=ReleaseFast",
@@ -317,7 +321,7 @@ def stage_test_soak(ctx: Ctx) -> Cmd:
                     f"-Dcpu={ctx.cpu}",
                 )
             ),
-            f"{ctx.python} tools/soak.py",
+            shlex.join([ctx.python, "tools/soak.py"]),
         ]
     )
     return Cmd(["bash", "-c", shell], _base_env(ctx), "edge-case soak (distinct from verify soak)", parse=parse_tests)
@@ -359,6 +363,7 @@ REFEREE_CASES = [
     "tools/runner/cases/writer_wire.json",
     "tools/runner/cases/tail.json",
     "tools/runner/cases/product.json",
+    "tools/runner/cases/oracle_precision.json",
 ]
 
 
@@ -374,6 +379,8 @@ def referee_argv(ctx: Ctx) -> list[str]:
             str(Path(ctx.duckdb)),
             "--pyarrow",
             ctx.python,
+            "--work",
+            str(ctx.run_dir / "referee-work"),
         ]
     )
     return argv
@@ -391,7 +398,8 @@ def stage_cli_tier(ctx: Ctx) -> Cmd:
 
 def stage_referee(ctx: Ctx) -> Cmd:
     duck = Path(ctx.duckdb)
-    shell = f"{ctx.zigw} build -Doptimize=ReleaseSafe referee && {' '.join(referee_argv(ctx))}"
+    shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"))
+    shell += " && " + shlex.join(referee_argv(ctx))
     return Cmd(
         ["bash", "-c", shell],
         _base_env(ctx),

@@ -1,0 +1,36 @@
+{
+  "fixture_copy": "COPY (SELECT CAST(d AS DECIMAL(38,2)) AS d FROM (VALUES ('12345678901234567890123456789.01'), ('12345678901234567890123456789.02'), ('-12345678901234567890123456789.00')) t(d)) TO '{path}' (FORMAT PARQUET)",
+  "schema_order": [
+    "d"
+  ],
+  "cases": [
+    {
+      "id": "precision:write-all"
+    },
+    {
+      "id": "precision:filter",
+      "filter": "d > 0",
+      "where": "d > 0"
+    },
+    {
+      "id": "precision:aggregate",
+      "kind": "agg",
+      "aggregate": "sum(d) AS s, min(d) AS lo, max(d) AS hi",
+      "duck": "sum(d), min(d), max(d)"
+    },
+    {
+      "id": "precision:mean",
+      "kind": "agg",
+      "aggregate": "avg(d) AS a",
+      "duck": "sum(d), count(d)",
+      "mean_scale": 2
+    },
+    {
+      "id": "precision:group",
+      "kind": "groupby",
+      "group_by": "d",
+      "aggregate": "count(*) AS n",
+      "duck": "SELECT d, count(*) AS n FROM '{path}' GROUP BY d"
+    }
+  ]
+}

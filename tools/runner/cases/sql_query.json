@@ -1744,7 +1744,8 @@
       "id": "top:fallible:default",
       "fixture": "err",
       "sql": "SELECT 100 / id AS z FROM '{path}' ORDER BY k LIMIT 1",
-      "expect": "division by zero"
+      "expect": "division by zero",
+      "expected_error": "DivisionByZero"
     },
     {
       "kind": "sql_rows",
@@ -1752,7 +1753,8 @@
       "fixture": "err",
       "sql": "SELECT 100 / id AS z FROM '{path}' ORDER BY k LIMIT 1",
       "expect": "division by zero",
-      "scan_all": true
+      "scan_all": true,
+      "expected_error": "DivisionByZero"
     }
   ]
 }

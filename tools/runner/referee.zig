@@ -10,6 +10,7 @@ const std = @import("std");
 const zpq = @import("zpq");
 
 const engine = zpq.engine;
+const Refusal = struct { kind: []const u8, sql: []const u8 };
 
 const usage =
     \\referee --cases CASES.json --divergences DIVERGENCES.json [--duckdb PATH] [--pyarrow PATH] [--work DIR] [--limit N]
@@ -40,6 +41,7 @@ const Case = struct {
     distinct_pairs: ?[]const u8 = null,
     format: ?[]const u8 = null,
     expect: ?[]const u8 = null,
+    expected_error: ?[]const u8 = null,
     epoch: bool = false,
     scan_all: bool = false,
     check: ?[]const u8 = null,
@@ -57,6 +59,7 @@ const Case = struct {
     sort_rows: bool = false,
     duck_refuse: bool = false,
     skip_duck: bool = false,
+    oracle_note: ?[]const u8 = null,
     dense_both: bool = false,
     keep_order: bool = false,
     names: ?[]const []const u8 = null,
@@ -110,9 +113,16 @@ pub fn main(init: std.process.Init) !void {
     var div_parsed = try std.json.parseFromSlice(std.json.Value, arena, div_text, .{});
     defer div_parsed.deinit();
 
-    var known = std.StringHashMap(void).init(arena);
+    var known = std.StringHashMap(Refusal).init(arena);
     for (div_parsed.value.object.get("records").?.array.items) |rec| {
-        try known.put(rec.object.get("id").?.string, {});
+        const obj = rec.object;
+        if (optionalString(obj, "error_kind")) |kind| {
+            if (!std.mem.eql(u8, obj.get("engine").?.string, "zpq") or
+                !std.mem.eql(u8, obj.get("class").?.string, "documented-refusal")) return error.BadRefusal;
+            const id = obj.get("id").?.string;
+            if (known.contains(id)) return error.DuplicateRefusal;
+            try known.put(id, .{ .kind = kind, .sql = obj.get("sql").?.string });
+        }
     }
 
     try std.Io.Dir.cwd().createDirPath(io, work);
@@ -136,8 +146,13 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("referee: {d}/{d} checks match\n", .{ matched, total });
     std.debug.print("referee: expected {d}\n", .{expected});
     std.debug.print("referee: refusals {d}\n", .{refused});
-    std.debug.print("referee: divergences {d}\n", .{known.count()});
+    std.debug.print("referee: refusal declarations {d}\n", .{known.count()});
     if (failed != 0) std.process.exit(1);
+    if (total == 0) return error.NoChecks;
+    if (limit != null) {
+        std.debug.print("referee: limited run; full coverage not established\n", .{});
+        std.process.exit(2);
+    }
 }
 
 fn swallowDiagnostic(_: []const u8) void {}
@@ -154,7 +169,7 @@ fn runFile(
     work: []const u8,
     file_i: usize,
     cases_file: []const u8,
-    known: *std.StringHashMap(void),
+    known: *std.StringHashMap(Refusal),
     limit: ?usize,
     total: *usize,
 ) !Counts {
@@ -222,7 +237,11 @@ fn runFile(
     var counts: Counts = .{};
     for (root.get("cases").?.array.items) |raw| {
         if (limit) |n| if (total.* >= n) break;
-        const case = try decodeCase(arena, raw);
+        var case = try decodeCase(arena, raw);
+        if (known.get(case.id)) |refusal| {
+            if (!std.mem.eql(u8, case.sql orelse return error.BadRefusal, refusal.sql)) return error.StaleRefusal;
+            case.expected_error = refusal.kind;
+        }
         const many = std.mem.eql(u8, case.kind, "sql") or std.mem.eql(u8, case.kind, "sql_ordered") or std.mem.eql(u8, case.kind, "sql_rows") or std.mem.eql(u8, case.kind, "dense");
         const product = std.mem.eql(u8, case.kind, "product");
         const checks: usize = if (product)
@@ -254,14 +273,12 @@ fn runFile(
             runCase(gpa, io, ctx, duckdb, pyarrow, fixture, out_path, diff_path, schema_order, case);
         const why = failure catch |err| try std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
         if (why) |text| {
-            if (known.contains(case.id)) {
-                counts.expected += checks;
-                std.debug.print("EXPECTED {s}  {s}\n", .{ case.id, text });
-            } else {
-                counts.failed += checks;
-                std.debug.print("FAIL {s}  {s}\n", .{ case.id, text });
-            }
-        } else counts.matched += checks;
+            counts.failed += checks;
+            std.debug.print("FAIL {s}  {s}\n", .{ case.id, text });
+        } else {
+            counts.matched += checks;
+            if (case.expected_error != null or case.expect != null or case.duck_refuse) counts.expected += checks;
+        }
     }
     return counts;
 }
@@ -298,6 +315,8 @@ fn decodeCase(arena: std.mem.Allocator, raw: std.json.Value) !Case {
         .distinct_pairs = optionalString(obj, "distinct_pairs"),
         .format = optionalString(obj, "format"),
         .expect = optionalString(obj, "expect"),
+        .expected_error = optionalString(obj, "expected_error"),
+        .oracle_note = optionalString(obj, "oracle_note"),
         .epoch = if (obj.get("epoch")) |v| switch (v) {
             .bool => |b| b,
             else => false,
@@ -598,6 +617,16 @@ fn lastDiagLine(gpa: std.mem.Allocator) ![]u8 {
     return gpa.dupe(u8, line);
 }
 
+fn expectedRefusal(case: Case, err: anyerror) bool {
+    const kind = case.expected_error orelse return false;
+    if (!std.mem.eql(u8, kind, @errorName(err))) return false;
+    if (case.expect) |needle| {
+        if (std.mem.indexOf(u8, diag_buf[0..diag_len], needle) == null) return false;
+    }
+    std.debug.print("EXPECTED {s} {s}\n", .{ case.id, kind });
+    return true;
+}
+
 fn runSql(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -637,14 +666,20 @@ fn runSql(
     const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
     var first_refusal: ?[]u8 = null;
     defer if (first_refusal) |msg| gpa.free(msg);
-    // A refusal with one stable message is a pass, including when DuckDB can
-    // answer. That is the sql_pred gate: zpq may refuse more, and an answer
-    // must equal DuckDB. An answer where DuckDB refuses is a failure.
+    // Refusals are case-specific: an engine failure must not look like a
+    // previously documented unsupported predicate.
     var answered = false;
     for (jobs) |j| {
         diag_len = 0;
         var diag: zpq.core.diag.Diag = .{};
         const got = queryAggregate(gpa, ctx, sql_buf.items, j, &diag) catch |err| {
+            const expected_error = case.expected_error orelse
+                return try std.fmt.allocPrint(gpa, "unexpected refusal {s} at -j{d}", .{ @errorName(err), j });
+            if (!std.mem.eql(u8, expected_error, @errorName(err))) {
+                return try std.fmt.allocPrint(gpa, "refused {s}, expected {s} at -j{d}", .{
+                    @errorName(err), expected_error, j,
+                });
+            }
             if (answered) return try std.fmt.allocPrint(gpa, "differs across -j", .{});
             if (diag_len == 0) zpq.frontend.queryError(err, &diag);
             const msg = try lastDiagLine(gpa);
@@ -656,12 +691,18 @@ fn runSql(
             continue;
         };
         defer gpa.free(got);
+        if (case.expected_error) |kind| {
+            return try std.fmt.allocPrint(gpa, "zpq answered, expected refusal {s}", .{kind});
+        }
         if (first_refusal != null) return try std.fmt.allocPrint(gpa, "differs across -j", .{});
         answered = true;
         if (duck_refused) return try std.fmt.allocPrint(gpa, "zpq answered {s}; duckdb refuses", .{got});
         if (!std.mem.eql(u8, got, want)) return try std.fmt.allocPrint(gpa, "zpq {s} duck {s}", .{ got, want });
     }
-    if (!answered) refusals.* += jobs.len;
+    if (!answered) {
+        refusals.* += jobs.len;
+        std.debug.print("EXPECTED {s} {s} ({d} jobs)\n", .{ case.id, case.expected_error.?, jobs.len });
+    }
     return null;
 }
 
@@ -827,7 +868,7 @@ fn diffSql(gpa: std.mem.Allocator, fixture: []const u8, out_path: []const u8, di
     const written = try std.fmt.allocPrint(gpa, "SELECT {s} FROM '{s}'", .{ cols.items, out_path });
     defer gpa.free(written);
     return std.fmt.allocPrint(gpa,
-        \\COPY (SELECT count(*) FROM ({s} EXCEPT ALL {s} UNION ALL {s} EXCEPT ALL {s})) TO '{s}' (HEADER false)
+        \\COPY (SELECT count(*) FROM (({s} EXCEPT ALL {s}) UNION ALL ({s} EXCEPT ALL {s}))) TO '{s}' (HEADER false)
     , .{ written, oracle, oracle, written, diff_path });
 }
 
@@ -913,14 +954,16 @@ fn runSqlOrdered(
                 zpq.frontend.queryError(err, &diag);
             }
             if (case.expect) |needle| {
-                if (std.mem.indexOf(u8, diag_buf[0..diag_len], needle) != null) continue;
+                _ = needle;
+                if (expectedRefusal(case, err)) continue;
                 return try queryFailure(gpa, err);
             }
             if (case.duck_refuse) {
+                if (!expectedRefusal(case, err)) return try queryFailure(gpa, err);
                 const ducked = try capture(gpa, io, &.{ duckdb, "-no-agent", "-c", duck_buf.items });
                 defer gpa.free(ducked.stdout);
                 defer gpa.free(ducked.stderr);
-                if (ducked.code != 0) continue;
+                if (ducked.code != 0 and std.mem.startsWith(u8, ducked.stderr, "Binder Error:")) continue;
                 return try gpa.dupe(u8, "duck answered, zpq refused");
             }
             return try queryFailure(gpa, err);
@@ -996,7 +1039,7 @@ fn runSqlRows(
                     var diag: zpq.core.diag.Diag = .{};
                     zpq.frontend.queryError(err, &diag);
                 }
-                if (std.mem.indexOf(u8, diag_buf[0..diag_len], needle) != null) return null;
+                if (expectedRefusal(case, err)) continue;
                 const msg = try lastDiagLine(gpa);
                 defer gpa.free(msg);
                 return try std.fmt.allocPrint(gpa, "refused ({s}), want {s}", .{ msg, needle });
@@ -1211,7 +1254,8 @@ fn runStats(
                 zpq.frontend.queryError(err, &diag);
             }
             if (case.expect) |needle| {
-                if (std.mem.indexOf(u8, diag_buf[0..diag_len], needle) != null) return null;
+                _ = needle;
+                if (expectedRefusal(case, err)) return null;
             }
             return try queryFailure(gpa, err);
         };
@@ -1372,6 +1416,7 @@ fn runTail(
                     var diag: zpq.core.diag.Diag = .{};
                     zpq.frontend.queryError(err, &diag);
                 }
+                if (!expectedRefusal(case, err)) return try queryFailure(gpa, err);
                 break :blk false;
             };
             gpa.free(json_text);
@@ -1383,6 +1428,7 @@ fn runTail(
                     var diag: zpq.core.diag.Diag = .{};
                     zpq.frontend.queryError(err, &diag);
                 }
+                if (!expectedRefusal(case, err)) return try queryFailure(gpa, err);
                 break :blk false;
             };
             gpa.free(json_text);
@@ -1609,6 +1655,10 @@ fn runDense(
     ans_path: []const u8,
     case: Case,
 ) !?[]const u8 {
+    if (case.skip_duck) {
+        const note = case.oracle_note orelse return error.MissingOracleNote;
+        std.debug.print("BYTE-PARITY {s}: {s}\n", .{ case.id, note });
+    }
     var sketch_env = try bindEnv(gpa, "ZPQ_SKETCH_TOPK", case.sketch_topk);
     defer sketch_env.deinit();
     const jobs: []const usize = if (case.jobs.len == 0) &.{0} else case.jobs;
@@ -1690,12 +1740,14 @@ fn runPairOnce(gpa: std.mem.Allocator, ctx: engine.Context, fixture: []const u8,
         defer buf.deinit(gpa);
         try substOpt(gpa, &buf, sql, "{path}", fixture);
         return querySqlJson(gpa, ctx, buf.items, if (case.jobs.len > 0) case.jobs[0] else 0, case) catch |err| {
+            if (err != error.ExceededMemoryBudget and err != error.RowGroupTooLarge) return err;
             const msg = try queryFailure(gpa, err);
             defer gpa.free(msg);
             return try std.fmt.allocPrint(gpa, "ERR {s}", .{msg});
         };
     }
     return aggregateJson(gpa, ctx, fixture, case, null) catch |err| {
+        if (err != error.ExceededMemoryBudget and err != error.RowGroupTooLarge) return err;
         const msg = try queryFailure(gpa, err);
         defer gpa.free(msg);
         return try std.fmt.allocPrint(gpa, "ERR {s}", .{msg});

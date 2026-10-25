@@ -55,7 +55,8 @@
         3,
         16
       ],
-      "expect": "division by zero"
+      "expect": "division by zero",
+      "expected_error": "DivisionByZero"
     },
     {
       "id": "cut-errors:1",
@@ -67,7 +68,8 @@
         3,
         16
       ],
-      "expect": "division by zero"
+      "expect": "division by zero",
+      "expected_error": "DivisionByZero"
     },
     {
       "id": "cut-errors:2",
@@ -79,7 +81,8 @@
         3,
         16
       ],
-      "expect": "division by zero"
+      "expect": "division by zero",
+      "expected_error": "DivisionByZero"
     },
     {
       "id": "cut-budget:-j3",
@@ -108,13 +111,15 @@
       "kind": "sql_rows",
       "sql": "SELECT * FROM '{path}' ORDER BY name",
       "max_memory": "300000",
-      "expect": "max-memory"
+      "expect": "max-memory",
+      "expected_error": "ExceededMemoryBudget"
     },
     {
       "id": "group-by:column-before-alias",
       "kind": "sql_ordered",
       "sql": "SELECT amt AS name, count(*) AS c FROM '{path}' GROUP BY name",
-      "duck_refuse": true
+      "duck_refuse": true,
+      "expected_error": "ColumnMustBeGrouped"
     },
     {
       "id": "sum-offset:0",
@@ -763,14 +768,16 @@
       "check": "refuse",
       "expect": "output column `name`",
       "group_by": "name AS k",
-      "aggregate": "sum(amt) AS name"
+      "aggregate": "sum(amt) AS name",
+      "expected_error": "AmbiguousOutputColumn"
     },
     {
       "id": "name-clash:dup_alias",
       "kind": "tail",
       "check": "refuse",
       "expect": "output column `a`",
-      "aggregate": "sum(amt) AS a, min(amt) AS a"
+      "aggregate": "sum(amt) AS a, min(amt) AS a",
+      "expected_error": "DuplicateOutputColumn"
     },
     {
       "id": "name-clash:dup_alias_gb",
@@ -778,14 +785,16 @@
       "check": "refuse",
       "expect": "output column `C`",
       "group_by": "flag",
-      "aggregate": "count(*) AS c, sum(amt) AS C"
+      "aggregate": "count(*) AS c, sum(amt) AS C",
+      "expected_error": "DuplicateOutputColumn"
     },
     {
       "id": "name-clash:sql_dup_alias",
       "kind": "tail",
       "check": "refuse",
       "sql": "SELECT flag, count(*) AS c, sum(amt) AS c FROM '{path}' GROUP BY flag",
-      "expect": "output column `c`"
+      "expect": "output column `c`",
+      "expected_error": "DuplicateOutputColumn"
     },
     {
       "id": "agg-names:lone",
@@ -865,7 +874,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:1",
@@ -878,7 +888,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:2",
@@ -904,7 +915,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:4",
@@ -917,7 +929,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:5",
@@ -943,7 +956,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:7",
@@ -956,7 +970,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:8",
@@ -982,7 +997,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:10",
@@ -995,7 +1011,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:11",
@@ -1021,7 +1038,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:13",
@@ -1034,7 +1052,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:14",
@@ -1060,7 +1079,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:16",
@@ -1073,7 +1093,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:17",
@@ -1099,7 +1120,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:19",
@@ -1112,7 +1134,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:20",
@@ -1138,7 +1161,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:22",
@@ -1151,7 +1175,8 @@
         16
       ],
       "dense_both": true,
-      "skip_duck": true
+      "skip_duck": true,
+      "oracle_note": "Inherited dense-domain check: byte parity across dense modes and jobs; LIMIT ties and float averages lack an identical DuckDB ordering contract. Other dense cases compare independent oracle values."
     },
     {
       "id": "dense:23",

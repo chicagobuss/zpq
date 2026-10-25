@@ -52,6 +52,18 @@ class SummaryTest(unittest.TestCase):
 
 
 class JudgeTest(unittest.TestCase):
+    def test_referee_refusals_survive_summary_serialization(self):
+        text = "referee: 606/606 checks match\nreferee: expected 120\nreferee: refusals 120\n"
+        text += "referee: refusal declarations 40\n"
+        counts = stages.parse_referee(text)
+        with tempfile.TemporaryDirectory() as directory:
+            book = summary.Summary(Path(directory), {"tier": "commit", "sha": "abc"})
+            book.add_stage({"name": "differential", "status": "pass", "counts": counts})
+            saved = json.loads(book.path.read_text())["stages"][0]["counts"]
+        self.assertEqual(saved["refusals"], 120)
+        self.assertEqual(saved["expected"], 120)
+        self.assertEqual(saved["refusal_declarations"], 40)
+
     def test_declared_refusal(self):
         cmd = stages.Cmd(
             [],

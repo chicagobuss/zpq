@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zig wrapper that caps `zig build` at -j12 unless the caller already passed -j.
+"""zig wrapper that caps `zig build` at -j8 unless the caller already passed -j.
 
 release_smoke.sh and tests/libzpq/run.sh invoke $ZIG build without a job cap.
 Point ZIG at this file. ZPQ_ZIG selects the real compiler (default: zig on PATH).
@@ -10,5 +10,5 @@ import sys
 zig = os.environ.get("ZPQ_ZIG", "zig")
 args = sys.argv[1:]
 if args and args[0] == "build" and not any(a == "-j" or (a.startswith("-j") and a[2:3].isdigit()) for a in args):
-    args = [args[0], "-j12", *args[1:]]
+    args = [args[0], "-j8", *args[1:]]
 os.execvp(zig, [zig, *args])

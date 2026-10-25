@@ -47,11 +47,16 @@ def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool) -
 
 def judge(cmd: stages.Cmd, rc: int, text: str) -> tuple[str, dict]:
     counts = cmd.parse(text) if cmd.parse else {}
+    if cmd.parse in (stages.parse_referee, stages.parse_cli_tier):
+        if not counts.get("total") or counts.get("matched") != counts.get("total"):
+            return "fail", counts
     if cmd.expect == "refusal":
         declared = rc == cmd.expect_rc and cmd.expect_text in text
         return ("expected" if declared else "fail"), counts
     if counts.get("fail"):
         return "fail", counts
+    if counts.get("limited"):
+        return "blocked", counts
     if rc == 0:
         return "pass", counts
     return "fail", counts
@@ -67,10 +72,17 @@ def run_stage(ctx: stages.Ctx, name: str, heavy: bool) -> dict:
         record = _record(name, "blocked", 2, 0.0, log_path, {}, cmd)
         print(f"{name} blocked  {cmd.blocked}", flush=True)
         return record
-    rc, duration = launch(cmd.argv, cmd.env, ctx.repo, log_path, heavy)
+    try:
+        rc, duration = launch(cmd.argv, cmd.env, ctx.repo, log_path, heavy)
+    except (OSError, subprocess.SubprocessError) as error:
+        log_path.write_text(f"could not run stage: {error}\n")
+        return _record(name, "fail", 1, 0.0, log_path, {"error": str(error)}, cmd)
     text = log_path.read_text(errors="replace")
     status, counts = judge(cmd, rc, text)
     record = _record(name, status, rc, duration, log_path, counts, cmd)
+    record["binary_sha256"] = file_sha256(ctx.binary)
+    if name in ("differential", "referee"):
+        record["referee_sha256"] = file_sha256(ctx.repo / "zig-out/bin/referee")
     if name == "fd" and ctx.base:
         record["base"] = str(Path(ctx.base).expanduser().resolve())
     print(f"{name} {status} rc={rc} {duration:.0f}s", flush=True)
@@ -85,9 +97,12 @@ def _record(name, status, rc, duration, log_path, counts, cmd: stages.Cmd) -> di
         "duration_s": round(duration, 1),
         "log": str(log_path),
         "counts": counts,
+        "command": cmd.argv,
     }
     if cmd.expect:
         record["expect"] = cmd.expect
+        record["expect_rc"] = cmd.expect_rc
+        record["expect_text"] = cmd.expect_text
     return record
 
 
@@ -112,16 +127,18 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
     ref_log = ctx.run_dir / "logs" / "soak-referee-build.log"
     print("== soak referee build", flush=True)
     ref_rc, ref_duration = launch(
-        [ctx.zigw, "build", "-Doptimize=ReleaseSafe", "referee"],
+        stages._zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"),
         stages._base_env(ctx),
         ctx.repo,
         ref_log,
         heavy,
     )
     print(f"soak referee build rc={ref_rc} {ref_duration:.0f}s", flush=True)
+    book.add_stage({"name": "soak-referee-build", "status": "pass" if ref_rc == 0 else "fail",
+                    "rc": ref_rc, "duration_s": round(ref_duration, 1), "log": str(ref_log), "counts": {}})
     if ref_rc != 0:
-        failures += 1
         shutil.copy(ref_log, fail_dir / "referee-build.log")
+        return
     while True:
         if rounds is not None and done >= rounds:
             break
@@ -164,6 +181,10 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
             log_path = ctx.run_dir / "logs" / f"soak-r{done}-{name}.log"
             print(f"== soak round {done} {name} seed={seed}", flush=True)
             rc, duration = launch(argv, stages._base_env(ctx), ctx.repo, log_path, heavy)
+            counts = stages.parse_referee(log_path.read_text()) if name == "differential" else {}
+            book.add_stage({"name": f"soak-r{done}-{name}", "status": "pass" if rc == 0 else "fail",
+                            "rc": rc, "duration_s": round(duration, 1), "log": str(log_path),
+                            "counts": counts, "round": done, "seed": seed, "command": argv})
             if rc != 0:
                 failures += 1
                 shutil.copy(log_path, fail_dir / f"r{done}-{name}-{seed}.log")
@@ -174,7 +195,7 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
             "name": "soak",
             "status": "pass" if failures == 0 else "fail",
             "rc": 0 if failures == 0 else 1,
-            "duration_s": None,
+            "duration_s": round(hours * 3600 - (deadline - time.time()), 1),
             "log": str(ctx.run_dir / "logs"),
             "counts": {"rounds": done, "failures": failures},
         }

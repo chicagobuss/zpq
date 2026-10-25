@@ -88,7 +88,10 @@ def canon(v: Any, lane: Optional[str] = None) -> Any:
         r = float(f"{n:.{FLOAT_DIGITS}g}")
         return int(r) if r.is_integer() and abs(r) < 2**53 else r
     if isinstance(n, decimal.Decimal) and lane is None:
-        return n.normalize()
+        # normalize() otherwise rounds DECIMAL(38, s) to the ambient 28 digits.
+        with decimal.localcontext() as context:
+            context.prec = max(context.prec, len(n.as_tuple().digits))
+            return n.normalize()
     return n
 
 
@@ -121,6 +124,7 @@ def self_check() -> None:
         (6, D("6"), None, True),
         (D("1.10"), D("1.1"), None, True),
         (D("12345678901234567.01"), D("12345678901234567.02"), None, False),  # DECIMAL vs DECIMAL is exact
+        (D("12345678901234567890123456789.01"), D("12345678901234567890123456789.02"), None, False),
         (1.1, D("1.10"), None, True),     # zpq's f64 lane vs the oracle's DECIMAL
         (12345678901234567168, D("12345678901234567123.00"), F64, True),
         (12345678901234567168, D("12345678901234567123.00"), None, False),

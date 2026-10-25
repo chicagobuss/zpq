@@ -147,8 +147,7 @@ duckdb-smoke:
 # (it found the dict-index bit-width-0 write corruption). Needs duckdb+pyarrow in
 # the .venv. Tier 2.
 differential:
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/differential.py
+    {{python}} tools/verify/verify.py stage differential
 
 # Reducing samples must return their private funding without adding a scan for a large dictionary tail.
 private-decode-check:

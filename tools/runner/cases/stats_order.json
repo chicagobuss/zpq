@@ -691,7 +691,8 @@
       "fixture": "unsigned",
       "check": "refuse",
       "select": "u64 + 1 AS x",
-      "expect": "UINT64"
+      "expect": "UINT64",
+      "expected_error": "Unsigned64Operand"
     }
   ]
 }

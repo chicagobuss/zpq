@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import hashlib
 import socket
 import subprocess
 from pathlib import Path
@@ -29,7 +30,8 @@ def bandwidth(repo: Path, out: Path) -> dict:
     compiled = _run(["gcc", "-O2", "-fopenmp", "-o", str(binary), str(source)])
     if compiled.returncode != 0:
         return {"error": (compiled.stderr or compiled.stdout or "gcc failed").strip()[-500:]}
-    ran = _run([str(binary)], timeout=180)
+    ran = _run(["systemd-run", "--user", "--scope", "-p", "MemoryMax=20G", "-q", "--",
+                "nice", "-n", "10", str(binary)], timeout=180)
     if ran.returncode != 0:
         return {"error": (ran.stderr or ran.stdout or "bw failed").strip()[-500:]}
     return {"lines": [line for line in ran.stdout.splitlines() if line.strip()]}
@@ -67,15 +69,24 @@ def memory_modules() -> dict:
 
 
 def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
+    dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
+    diff = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=repo)
     host = {
         "hostname": socket.gethostname(),
         "uname": " ".join(platform.uname()),
         "cpu_model": cpu_model(),
         "logical_cpus": os_cpu_count(),
         "zig_cpu": zig_cpu,
+        "python": platform.python_version(),
+        "engine_tree": subprocess.check_output(["git", "rev-parse", "HEAD:src"], cwd=repo, text=True).strip(),
+        "working_tree_status": dirty.splitlines(),
+        "diff_sha256": hashlib.sha256(diff).hexdigest() if diff else None,
     }
     if probe:
-        host["bw"] = bandwidth(repo, out)
+        try:
+            host["bw"] = bandwidth(repo, out)
+        except (OSError, subprocess.SubprocessError) as error:
+            host["bw"] = {"error": str(error)}
         host["dimm"] = memory_modules()
     return host
 

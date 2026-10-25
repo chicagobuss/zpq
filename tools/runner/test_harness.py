@@ -1,0 +1,100 @@
+"""Adversarial checks of the referee itself. Run after `zig build referee`.
+
+Requires DUCKDB to name the oracle CLI, and a Python with pyarrow.
+"""
+
+import argparse
+from decimal import Decimal
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import answer_cmp
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DUCKDB = os.environ.get("DUCKDB", "duckdb")
+
+
+class DecimalTest(unittest.TestCase):
+    def test_numeric_json_keeps_all_decimal_digits(self):
+        output = '[{"d":12345678901234567890123456789.01}]'
+        with patch.object(answer_cmp.subprocess, "run", return_value=argparse.Namespace(
+            returncode=0, stdout=output, stderr=""
+        )):
+            row = answer_cmp.duck_json("unused", "SELECT d")[0]
+        self.assertEqual(row["d"], Decimal("12345678901234567890123456789.01"))
+
+    def test_decimal_json_and_strings_are_exact(self):
+        rows = answer_cmp.duck_json(DUCKDB, "SELECT '12345678901234567890123456789.01'::DECIMAL(38,2) AS d")
+        self.assertEqual(answer_cmp.coerce(rows[0]["d"], "DECIMAL(38,2)"),
+                         Decimal("12345678901234567890123456789.01"))
+
+
+class RefereeTest(unittest.TestCase):
+    def run_cases(self, case, records=(), limit=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cases = {
+                "fixture_copy": "COPY (SELECT * FROM (VALUES (1), (2), (2), (NULL)) t(id)) "
+                                "TO '{path}' (FORMAT PARQUET)",
+                "schema_order": ["id"],
+                "cases": [case] if case else [],
+            }
+            path = tmp / "cases.json"
+            path.write_text(json.dumps(cases))
+            registry = tmp / "known.json"
+            registry.write_text(json.dumps({"records": list(records)}))
+            argv = [str(ROOT / "zig-out/bin/referee"), "--cases", str(path), "--divergences", str(registry),
+                    "--duckdb", DUCKDB, "--pyarrow", sys.executable, "--work", str(tmp / "work")]
+            if limit is not None:
+                argv.extend(["--limit", str(limit)])
+            return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
+
+    def test_extra_missing_changed_duplicate_and_null_rows_fail(self):
+        for where in ("id = 1", "id IS NOT NULL", "id <> 2", "id IS NULL"):
+            with self.subTest(where=where):
+                result = self.run_cases({"id": "extra", "where": where})
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("row mismatch", result.stderr)
+        result = self.run_cases({"id": "missing", "filter": "id = 1"})
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("row mismatch", result.stderr)
+        result = self.run_cases({"id": "equal"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_refusal_requires_the_declared_error_kind(self):
+        sql = "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id = id"
+        case = {"id": "refuse", "kind": "sql", "sql": sql, "jobs": [1, 4]}
+        record = {"id": "refuse", "engine": "zpq", "class": "documented-refusal", "sql": sql,
+                  "error_kind": "BadValue"}
+        result = self.run_cases(case, [record])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("referee: refusals 2", result.stderr)
+        self.assertIn("referee: expected 2", result.stderr)
+        result = self.run_cases(case)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unexpected refusal BadValue", result.stderr)
+        result = self.run_cases(case, [{**record, "error_kind": "BadOperator"}])
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refused BadValue, expected BadOperator", result.stderr)
+
+    def test_divergence_metadata_cannot_waive_wrong_values(self):
+        record = {"id": "wrong", "engine": "duckdb", "class": "stats-order", "reason": "test"}
+        result = self.run_cases({"id": "wrong", "where": "id = 1"}, [record])
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+
+    def test_empty_and_limited_runs_do_not_pass(self):
+        for case, limit in ((None, None), ({"id": "partial"}, 1)):
+            with self.subTest(case=case, limit=limit):
+                result = self.run_cases(case, limit=limit)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

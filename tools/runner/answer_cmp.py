@@ -48,7 +48,8 @@ def duck_json(duckdb, sql, stable=False):
     r = subprocess.run([duckdb, "-no-agent", "-json", "-c", text], capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit(r.stderr.strip().splitlines()[-1][:300] if r.stderr.strip() else "duckdb failed")
-    return json.loads(r.stdout)
+    # Preserve the CLI's decimal digits before the DESCRIBE type chooses a lane.
+    return json.loads(r.stdout, parse_float=Decimal)
 
 
 def describe(duckdb, sql, stable=False):

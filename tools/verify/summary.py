@@ -16,11 +16,10 @@ class Summary:
     def __init__(self, directory: Path, meta: dict):
         self.directory = Path(directory)
         self.path = self.directory / "summary.json"
-        if self.path.exists():
-            raise FileExistsError(
-                f"{self.path} already exists. A rerun is a new directory; the first record stays."
-            )
         self.directory.mkdir(parents=True, exist_ok=True)
+        # Reserve before writing: simultaneous invocations must not share logs.
+        descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.close(descriptor)
         self.data = {
             "schema": 1,
             "run_id": self.directory.name,

@@ -297,13 +297,14 @@ pub const HotPlan = struct {
     }
 
     pub fn lanes(self: HotPlan) usize {
-        return self.keys.len * self.width;
+        return self.keys.len * self.width + @intFromBool(!self.second);
     }
 
-    /// The canonical fixed key image includes a presence byte per integer. NULL and values outside the sampled
-    /// interval remain cold; the sample never proves a range or removes those rows from the bound.
+    /// A lone NULL has one exact lane, even when absent from the sample. Composite NULLs and values outside the
+    /// sampled interval remain cold; the sample never proves a range or removes those rows from the bound.
     pub inline fn slot(self: *const HotPlan, key: []const u8) ?usize {
-        if (key.len != (if (self.second) @as(usize, 18) else 9) or key[0] == 0) return null;
+        if (key.len != (if (self.second) @as(usize, 18) else 9)) return null;
+        if (key[0] == 0) return if (self.second) null else self.keys.len;
         const k = std.mem.readInt(i64, key[1..9], .little);
         const hot = self.ids.get(k) orelse return null;
         const offset: usize = if (self.second) f: {
@@ -317,6 +318,10 @@ pub const HotPlan = struct {
     }
 
     pub fn image(self: HotPlan, slot_id: usize, out: *[18]u8) []const u8 {
+        if (!self.second and slot_id == self.keys.len) {
+            @memset(out[0..9], 0);
+            return out[0..9];
+        }
         out[0] = 1;
         std.mem.writeInt(i64, out[1..9], self.keys[slot_id / self.width], .little);
         if (!self.second) return out[0..9];
@@ -379,6 +384,9 @@ pub fn hotPlan(a: std.mem.Allocator, s: Sample, second: bool, h: usize, cells: u
         n += 1;
     }
     if (n == 0 or n * width < h) return null;
+    // A sample past the lane capacity can rank chance repeats in a flat domain as hot. Require the cut's primary
+    // key to beat a flat distribution over those lanes before paying a complete trial. Exact bounds still decide.
+    if (ranked.len > capacity and @as(u128, ranked[(h - 1) / width].count) * capacity <= s.rows) return null;
     var plan: HotPlan = .{
         .keys = try a.alloc(i64, n),
         .second = second,
@@ -422,4 +430,21 @@ fn hotAllocation(a: std.mem.Allocator) !void {
 
 test "hot certificate membership compares complete keys, preserves late cold values and frees failed allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, hotAllocation, .{});
+}
+
+test "hot certificate declines weak repeats past its lane capacity but retains a concentrated winner" {
+    const a = std.testing.allocator;
+    var s: Sample = .{};
+    defer s.deinit(a);
+    const rows = 2 * ((hw.l2BytesPerWorkerOr(640 << 10) -| 256 * 4 -| (64 << 10)) / 76) + 1;
+    for (0..rows) |i| try s.add(a, @intCast(i), 0);
+    try std.testing.expect((try hotPlan(a, s, false, 1, 256)) == null);
+    for (0..rows) |_| try s.add(a, 0, 0);
+    var plan = (try hotPlan(a, s, false, 1, 256)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(a);
+    try std.testing.expectEqual(@as(i64, 0), plan.keys[0]);
+    var image: [18]u8 = undefined;
+    const null_key = plan.image(plan.keys.len, &image);
+    try std.testing.expectEqualSlices(u8, &@as([9]u8, @splat(0)), null_key);
+    try std.testing.expectEqual(plan.keys.len, plan.slot(null_key).?);
 }

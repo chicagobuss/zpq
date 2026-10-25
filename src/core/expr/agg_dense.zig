@@ -321,6 +321,8 @@ pub const Lanes = struct {
         rows: usize,
         sel: *const Sel,
     ) !void {
+        if (axes.len == 2 and axes[0].ni.def_levels == null and axes[1].ni.def_levels == null)
+            return l.foldPair(T, counts, axes[0], axes[1], base, rows, sel);
         var bad = false;
         agg_coded.forEachActive(sel, rows, struct {
             fn row(c: anytype, r: usize) void {
@@ -338,6 +340,34 @@ pub const Lanes = struct {
                 c.first[id] = @min(c.first[id], c.base + r);
             }
         }.row, .{ .axes = axes, .counts = counts, .first = l.first, .base = base, .bad = &bad });
+        if (bad) return error.BadColumn;
+    }
+
+    // Bind the two present code streams once; the general product walks a runtime axis slice for every row.
+    fn foldPair(
+        l: *Lanes,
+        comptime T: type,
+        counts: []T,
+        left: CountAxis,
+        right: CountAxis,
+        base: u64,
+        rows: usize,
+        sel: *const Sel,
+    ) !void {
+        var bad = false;
+        agg_coded.forEachActive(sel, rows, struct {
+            fn row(c: anytype, r: usize) void {
+                const x = c.left.codes[r];
+                const y = c.right.codes[r];
+                if (x >= c.left.trans.len - 1 or y >= c.right.trans.len - 1) {
+                    c.bad.* = true;
+                    return;
+                }
+                const id = c.left.trans[x] * c.left.stride + c.right.trans[y] * c.right.stride;
+                c.counts[id] += 1;
+                c.first[id] = @min(c.first[id], c.base + r);
+            }
+        }.row, .{ .left = left, .right = right, .counts = counts, .first = l.first, .base = base, .bad = &bad });
         if (bad) return error.BadColumn;
     }
 
@@ -810,6 +840,47 @@ test "dense products preserve composite identity, NULLs, selected first ties and
 }
 
 fn testCountProduct(a: std.mem.Allocator) !void {
+    try testCountProductMode(a, true);
+}
+
+test "dense present pairs preserve selected first ties and top-H across dictionary permutations" {
+    try testCountProductMode(testing.allocator, false);
+}
+
+test "dense present pairs validate selected codes at tail words for both count widths" {
+    const a = testing.allocator;
+    var codes: [129]u32 = undefined;
+    for (&codes, 0..) |*code, r| code.* = @intCast(r % 2);
+    codes[128] = std.math.maxInt(u32);
+    const trans = [_]u32{ 0, 1, 2 };
+    const left: Lanes.CountAxis = .{
+        .codes = &codes,
+        .trans = &trans,
+        .ni = .{ .def_levels = null, .max_def = 0, .max_rep = 0 },
+        .stride = 1,
+    };
+    var right = left;
+    right.stride = 3;
+    const axes = [_]Lanes.CountAxis{ left, right };
+    var sel = try Sel.init(a, codes.len);
+    defer sel.deinit();
+    sel.set(128, false);
+    inline for (.{ u32, u64 }) |T| {
+        var counts: [9]T = @splat(0);
+        var first: [9]u64 = @splat(unseen);
+        var lanes: Lanes = .{ .domain = undefined, .calls = &.{}, .first = &first };
+        try lanes.foldProduct(T, &counts, &axes, 17, codes.len, &sel);
+        try testing.expectEqual(@as(T, 64), counts[0]);
+        try testing.expectEqual(@as(T, 64), counts[4]);
+        try testing.expectEqual(@as(u64, 17), first[0]);
+        try testing.expectEqual(@as(u64, 18), first[4]);
+        sel.set(128, true);
+        try testing.expectError(error.BadColumn, lanes.foldProduct(T, &counts, &axes, 17, codes.len, &sel));
+        sel.set(128, false);
+    }
+}
+
+fn testCountProductMode(a: std.mem.Allocator, nullable: bool) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ra = arena.allocator();
@@ -855,7 +926,7 @@ fn testCountProduct(a: std.mem.Allocator) !void {
     }
     ac[1][128] = 0;
     bc[1][128] = 0; // Both unused dictionary values occur only in a filtered row.
-    const cols = [_][2]Column{
+    var cols = [_][2]Column{
         .{
             .{ .i32 = .{
                 .values = &.{},
@@ -891,6 +962,12 @@ fn testCountProduct(a: std.mem.Allocator) !void {
                 .max_def = 1,
                 .has_nulls = true,
             } },
+        },
+    };
+    if (!nullable) for (&cols) |*rg| for (rg) |*col| switch (col.*) {
+        inline else => |*c| {
+            c.def_levels = null;
+            c.has_nulls = false;
         },
     };
     for ([_]?usize{ null, 3 }) |cut| {

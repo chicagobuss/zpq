@@ -1669,6 +1669,8 @@ pub fn updateSharedInteger(
     lookup: []const ?usize,
     outer: *const filter_selection.SelectionVector,
 ) Error!bool {
+    // COUNT(*) plus one argument cannot share value work. Keep that common case outside the typed setup.
+    if (calls.len < 2 or (calls.len == 2 and (calls[0].arg == null or calls[1].arg == null))) return false;
     var col_idx: ?usize = null;
     var value_calls: usize = 0;
     var ops: u3 = 0;
@@ -1679,7 +1681,8 @@ pub fn updateSharedInteger(
             if (call.func != .count) return false;
             continue;
         };
-        if (arg != .col_ref or arg.col_ref.expr_type != .i64 or arg.col_ref.unsigned_64) return false;
+        if (arg != .col_ref or arg.col_ref.expr_type != .i64 or
+            arg.col_ref.unsigned_64 or arg.col_ref.unsigned_32) return false;
         if (col_idx) |ci| {
             if (ci != arg.col_ref.col_idx) return false;
         } else col_idx = arg.col_ref.col_idx;
@@ -7327,6 +7330,18 @@ fn testSharedInteger(a: std.mem.Allocator) !void {
     var unsupported = calls;
     unsupported[calls.len - 1].arg.?.col_ref.unsigned_64 = true;
     const batch: filter_eval.Batch = .{ .cols = &.{.{ .i64 = .{ .values = &values } }}, .num_rows = n };
+    try std.testing.expect(!try updateSharedInteger(
+        a,
+        &unsupported,
+        &states,
+        &@as([calls.len]bool, @splat(false)),
+        &batch,
+        &.{0},
+        &sel,
+    ));
+    try std.testing.expectEqualDeep(before, states);
+    unsupported[calls.len - 1].arg.?.col_ref.unsigned_64 = false;
+    unsupported[calls.len - 1].arg.?.col_ref.unsigned_32 = true;
     try std.testing.expect(!try updateSharedInteger(
         a,
         &unsupported,

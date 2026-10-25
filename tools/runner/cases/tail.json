@@ -1,0 +1,1322 @@
+{
+  "fixture_copy": "COPY (SELECT\n        (i - 2000)::INTEGER AS id,\n        (CASE WHEN i % 11 = 0 THEN NULL ELSE (i - 2000) * 1.5 END)::DOUBLE AS amt,\n        CAST(i AS DECIMAL(18,2)) AS price,\n        (CASE WHEN i % 13 = 0 THEN '' ELSE 'n' || i END) AS name,\n        (CASE WHEN i % 7 = 0 THEN NULL ELSE 'v' || i END) AS nname,\n        (DATE '2020-01-01' + i::INTEGER) AS d,\n        (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 3 = 0) END) AS flag,\n        (CASE WHEN i % 17 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + to_milliseconds(i) END)::TIMESTAMP_MS AS ts\n      FROM range(1, 4000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)",
+  "fixtures": [
+    {
+      "name": "sum_offset",
+      "copy": "COPY (SELECT (i // 2048)::INTEGER AS c, (i % 5)::INTEGER AS g, (CASE WHEN i % 9 = 0 OR i % 5 = 4 AND i >= 2048 THEN NULL ELSE i - 2000 END)::INTEGER AS n, (i * 3)::BIGINT AS big FROM range(0, 4000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)"
+    },
+    {
+      "name": "huge",
+      "copy": "COPY (SELECT (i % 7)::INTEGER AS g, ((1::BIGINT << 60) + i * 1000003)::BIGINT AS v, (i % 1000)::INTEGER AS w FROM range(0, 60000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+    },
+    {
+      "name": "big",
+      "copy": "COPY (SELECT i::BIGINT AS id, (i % 97)::INTEGER AS g, CAST(i * 0.01 AS DECIMAL(18,2)) AS price, 'n' || (i % 1000) AS name, (CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.5 END)::DOUBLE AS amt, CAST(i * 1000000007.01 AS DECIMAL(38,2)) AS wide, CASE WHEN i % 5 = 0 THEN NULL ELSE repeat('x', i % 300) END AS pad FROM range(0, 50000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 100000)"
+    }
+  ],
+  "fixture_files": [
+    {
+      "name": "decimal",
+      "path": "ci/fixtures/parquet/decimal_exact.parquet"
+    }
+  ],
+  "prepare": {
+    "script": "tools/runner/prepare_tail.py",
+    "fixtures": [
+      "cut",
+      "budget",
+      "plain",
+      "u64",
+      "keys",
+      "typed",
+      "levels_dictionary",
+      "levels_delta",
+      "levels_delta_length",
+      "legacy",
+      "dense_0",
+      "dense_1",
+      "manycalls"
+    ]
+  },
+  "fixture_globs": [
+    {
+      "name": "dense_glob",
+      "pattern": "dense_*.parquet"
+    }
+  ],
+  "cases": [
+    {
+      "id": "cut-errors:0",
+      "kind": "sql_ordered",
+      "fixture": "cut",
+      "sql": "SELECT k, count(DISTINCT 1000000000000 / q) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "expect": "division by zero"
+    },
+    {
+      "id": "cut-errors:1",
+      "kind": "sql_ordered",
+      "fixture": "cut",
+      "sql": "SELECT k, count(DISTINCT q) AS d, sum(1000000000000 / q) AS s FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "expect": "division by zero"
+    },
+    {
+      "id": "cut-errors:2",
+      "kind": "sql_ordered",
+      "fixture": "cut",
+      "sql": "SELECT k, count(*) AS c, sum(1000000000000 / q) AS s FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 10",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "expect": "division by zero"
+    },
+    {
+      "id": "cut-budget:-j3",
+      "kind": "tail",
+      "check": "sketch",
+      "fixture": "budget",
+      "sql": "SELECT k, count(DISTINCT s) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10",
+      "jobs": [
+        3
+      ],
+      "max_memory": "140MB"
+    },
+    {
+      "id": "cut-budget:-j16",
+      "kind": "tail",
+      "check": "sketch",
+      "fixture": "budget",
+      "sql": "SELECT k, count(DISTINCT s) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10",
+      "jobs": [
+        16
+      ],
+      "max_memory": "140MB"
+    },
+    {
+      "id": "top-rows:budget",
+      "kind": "sql_rows",
+      "sql": "SELECT * FROM '{path}' ORDER BY name",
+      "max_memory": "300000",
+      "expect": "max-memory"
+    },
+    {
+      "id": "group-by:column-before-alias",
+      "kind": "sql_ordered",
+      "sql": "SELECT amt AS name, count(*) AS c FROM '{path}' GROUP BY name",
+      "duck_refuse": true
+    },
+    {
+      "id": "sum-offset:0",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(c + 3) AS a, sum(c - 1) AS b FROM '{path}'",
+      "encoded": "1",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:0-rows",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(c + 3) AS a, sum(c - 1) AS b FROM '{path}'",
+      "encoded": "0",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:0-trust",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(c + 3) AS a, sum(c - 1) AS b FROM '{path}'",
+      "encoded": "1",
+      "trust_stats": true,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:1",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(c + 3) AS a, sum(3 + c) AS b, sum(c - 7) AS d, sum(n + 1) AS e, sum(g + 4) AS f, sum(big + 2) AS h FROM '{path}'",
+      "encoded": "1",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:1-rows",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(c + 3) AS a, sum(3 + c) AS b, sum(c - 7) AS d, sum(n + 1) AS e, sum(g + 4) AS f, sum(big + 2) AS h FROM '{path}'",
+      "encoded": "0",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:1-trust",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(c + 3) AS a, sum(3 + c) AS b, sum(c - 7) AS d, sum(n + 1) AS e, sum(g + 4) AS f, sum(big + 2) AS h FROM '{path}'",
+      "encoded": "1",
+      "trust_stats": true,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:2",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(n + 11) AS a, sum(c - 1) AS b, count(n) AS k FROM '{path}' WHERE n > 10",
+      "encoded": "1",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:2-rows",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(n + 11) AS a, sum(c - 1) AS b, count(n) AS k FROM '{path}' WHERE n > 10",
+      "encoded": "0",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:2-trust",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(n + 11) AS a, sum(c - 1) AS b, count(n) AS k FROM '{path}' WHERE n > 10",
+      "encoded": "1",
+      "trust_stats": true,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:3",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(n - 5) AS a FROM '{path}' WHERE n IS NULL",
+      "encoded": "1",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:3-rows",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(n - 5) AS a FROM '{path}' WHERE n IS NULL",
+      "encoded": "0",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:3-trust",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT sum(n - 5) AS a FROM '{path}' WHERE n IS NULL",
+      "encoded": "1",
+      "trust_stats": true,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:4",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT g, sum(n + 5) AS s, sum(c - 2) AS t, sum(g + 9) AS u FROM '{path}' GROUP BY g",
+      "encoded": "1",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:4-rows",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT g, sum(n + 5) AS s, sum(c - 2) AS t, sum(g + 9) AS u FROM '{path}' GROUP BY g",
+      "encoded": "0",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:4-trust",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT g, sum(n + 5) AS s, sum(c - 2) AS t, sum(g + 9) AS u FROM '{path}' GROUP BY g",
+      "encoded": "1",
+      "trust_stats": true,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:5",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT g, sum(n + 5) AS s FROM '{path}' WHERE c > 0 GROUP BY g",
+      "encoded": "1",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:5-rows",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT g, sum(n + 5) AS s FROM '{path}' WHERE c > 0 GROUP BY g",
+      "encoded": "0",
+      "trust_stats": false,
+      "sort": true
+    },
+    {
+      "id": "sum-offset:5-trust",
+      "kind": "sql_ordered",
+      "fixture": "sum_offset",
+      "sql": "SELECT g, sum(n + 5) AS s FROM '{path}' WHERE c > 0 GROUP BY g",
+      "encoded": "1",
+      "trust_stats": true,
+      "sort": true
+    },
+    {
+      "id": "avg-exact",
+      "kind": "tail",
+      "check": "avg_exact",
+      "fixture": "huge",
+      "sql": "SELECT g, avg(v) AS a, avg(w) AS b, count(*) AS n, avg_state(v) AS st FROM '{path}' GROUP BY g",
+      "duck": "SELECT g, sum(v)::HUGEINT AS sv, count(v) AS nv, sum(w)::HUGEINT AS sw, count(w) AS nw FROM '{path}' GROUP BY g",
+      "jobs": [
+        1,
+        2,
+        4,
+        16
+      ]
+    },
+    {
+      "id": "plain-keys:0",
+      "kind": "sql_ordered",
+      "fixture": "plain",
+      "sql": "SELECT f, s, count(*) AS n, sum(x) AS t, avg(x) AS a FROM '{path}' GROUP BY f, s",
+      "sort": true
+    },
+    {
+      "id": "plain-keys:1",
+      "kind": "sql_ordered",
+      "fixture": "plain",
+      "sql": "SELECT f, count(*) AS n FROM '{path}' WHERE x > 50 GROUP BY f",
+      "sort": true
+    },
+    {
+      "id": "plain-keys:2",
+      "kind": "sql_ordered",
+      "fixture": "plain",
+      "sql": "SELECT u, count(*) AS n FROM '{path}' GROUP BY u",
+      "sort": true
+    },
+    {
+      "id": "avg-u64:0:encoded-1",
+      "kind": "sql_ordered",
+      "fixture": "u64",
+      "sql": "SELECT k, avg(u) AS a FROM '{path}' GROUP BY k",
+      "encoded": "1",
+      "check": "same"
+    },
+    {
+      "id": "avg-u64:0:encoded-0",
+      "kind": "sql_ordered",
+      "fixture": "u64",
+      "sql": "SELECT k, avg(u) AS a FROM '{path}' GROUP BY k",
+      "encoded": "0",
+      "check": "same"
+    },
+    {
+      "id": "avg-u64:1:encoded-1",
+      "kind": "sql_ordered",
+      "fixture": "u64",
+      "sql": "SELECT avg(u) AS a FROM '{path}'",
+      "encoded": "1",
+      "check": "same"
+    },
+    {
+      "id": "avg-u64:1:encoded-0",
+      "kind": "sql_ordered",
+      "fixture": "u64",
+      "sql": "SELECT avg(u) AS a FROM '{path}'",
+      "encoded": "0",
+      "check": "same"
+    },
+    {
+      "id": "key-framing:0",
+      "kind": "sql_ordered",
+      "fixture": "keys",
+      "sql": "SELECT a, b, count(*) AS n FROM '{path}' GROUP BY a, b",
+      "sort": true
+    },
+    {
+      "id": "key-framing:1",
+      "kind": "sql_ordered",
+      "fixture": "keys",
+      "sql": "SELECT h, s, count(*) AS n FROM '{path}' GROUP BY h, s",
+      "sort": true
+    },
+    {
+      "id": "key-framing:2",
+      "kind": "sql_ordered",
+      "fixture": "keys",
+      "sql": "SELECT a AS aa, g AS a, count(*) AS c FROM '{path}' GROUP BY a, g",
+      "sort": true
+    },
+    {
+      "id": "key-framing:3",
+      "kind": "sql_ordered",
+      "fixture": "keys",
+      "sql": "SELECT a AS g, g AS a, count(*) AS c FROM '{path}' GROUP BY a, g ORDER BY g, a",
+      "sort": false
+    },
+    {
+      "id": "typed-o:s",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "s",
+      "aggregate": "min(s) AS lo, max(s) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT s AS \"s\", min(s) AS lo, max(s) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "string",
+        "string",
+        "string",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:bin",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "bin",
+      "aggregate": "min(bin) AS lo, max(bin) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT lower(hex(\"bin\")) AS \"bin\", min(lower(hex(\"bin\"))) AS lo, max(lower(hex(\"bin\"))) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "binary",
+        "binary",
+        "binary",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:d",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "d",
+      "aggregate": "min(d) AS lo, max(d) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT d AS \"d\", min(d) AS lo, max(d) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "date32[day]",
+        "date32[day]",
+        "date32[day]",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:ts",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "ts",
+      "aggregate": "min(ts) AS lo, max(ts) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT ts AS \"ts\", min(ts) AS lo, max(ts) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "timestamp[ms]",
+        "timestamp[ms]",
+        "timestamp[ms]",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:tsz",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "tsz",
+      "aggregate": "min(tsz) AS lo, max(tsz) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT timezone('UTC', tsz) AS \"tsz\", min(timezone('UTC', tsz)) AS lo, max(timezone('UTC', tsz)) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "timestamp[us, tz=UTC]",
+        "timestamp[us, tz=UTC]",
+        "timestamp[us, tz=UTC]",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:b",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "b",
+      "aggregate": "min(b) AS lo, max(b) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT b AS \"b\", min(b) AS lo, max(b) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "bool",
+        "bool",
+        "bool",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:i8",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "i8",
+      "aggregate": "min(i8) AS lo, max(i8) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT i8 AS \"i8\", min(i8) AS lo, max(i8) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "int8",
+        "int8",
+        "int8",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:u32",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "u32",
+      "aggregate": "min(u32) AS lo, max(u32) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT u32 AS \"u32\", min(u32) AS lo, max(u32) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "uint32",
+        "uint32",
+        "uint32",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:u64",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "u64",
+      "aggregate": "min(u64) AS lo, max(u64) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT u64 AS \"u64\", min(u64) AS lo, max(u64) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "uint64",
+        "uint64",
+        "uint64",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:f",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "f",
+      "aggregate": "min(f) AS lo, max(f) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT f AS \"f\", min(f) AS lo, max(f) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "float",
+        "float",
+        "float",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:tm",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "tm",
+      "aggregate": "min(tm) AS lo, max(tm) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT tm AS \"tm\", min(tm) AS lo, max(tm) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "time32[ms]",
+        "time32[ms]",
+        "time32[ms]",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "typed-o:dec",
+      "kind": "tail",
+      "check": "typed",
+      "fixture": "typed",
+      "group_by": "dec",
+      "aggregate": "min(dec) AS lo, max(dec) AS hi, count(*) AS n, sum(i8) AS si",
+      "duck": "SELECT dec AS \"dec\", min(dec) AS lo, max(dec) AS hi, count(*) AS n, sum(i8) AS si FROM '{path}' GROUP BY 1",
+      "want_types": [
+        "decimal128(9, 2)",
+        "decimal128(9, 2)",
+        "decimal128(9, 2)",
+        "int64",
+        "int64"
+      ]
+    },
+    {
+      "id": "decimal-o:scalar",
+      "kind": "tail",
+      "check": "decimal",
+      "fixture": "decimal",
+      "aggregate": "sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, avg_state(dn) AS a, avg(dn) AS m, avg(d38) AS m38",
+      "duck": "SELECT sum(d9) AS s, min(d38) AS mn, sum(d9 * d18) AS p, sum(dn) AS a__sum, count(dn) AS a__count, CAST(NULL AS DECIMAL(19,6)) AS m, CAST(NULL AS DECIMAL(38,10)) AS m38, sum(dn) AS m__sum, count(dn) AS m__count, sum(d38) AS m38__sum, count(d38) AS m38__count FROM '{path}'",
+      "orders": "m:6|m38:10",
+      "want_types": [
+        "decimal128(38, 2)",
+        "decimal128(38, 10)",
+        "decimal128(38, 6)",
+        "decimal128(38, 2)",
+        "int64",
+        "decimal128(19, 6)",
+        "decimal128(38, 10)"
+      ]
+    },
+    {
+      "id": "decimal-o:grouped",
+      "kind": "tail",
+      "check": "decimal",
+      "fixture": "decimal",
+      "group_by": "k",
+      "aggregate": "sum(d18 * q) AS p, max(dn) AS mx, avg(dn) AS m",
+      "duck": "SELECT k, sum(d18 * q) AS p, max(dn) AS mx, CAST(NULL AS DECIMAL(19,6)) AS m, sum(dn) AS m__sum, count(dn) AS m__count FROM '{path}' GROUP BY k",
+      "orders": "m:6",
+      "want_types": [
+        "string",
+        "decimal128(38, 6)",
+        "decimal128(15, 2)",
+        "decimal128(19, 6)"
+      ]
+    },
+    {
+      "id": "sliced:write",
+      "kind": "tail",
+      "check": "sliced_write",
+      "fixture": "big",
+      "filter": "id >= 100",
+      "select": "id, price * 2 AS p, name, amt, wide, pad",
+      "jobs": [
+        2
+      ],
+      "max_memory": "2M",
+      "duck": "SELECT id, price * 2 AS p, name, amt, wide, pad FROM '{path}' WHERE id >= 100"
+    },
+    {
+      "id": "sliced:print",
+      "kind": "tail",
+      "check": "sliced_print",
+      "fixture": "big",
+      "sql": "SELECT * FROM '{path}' WHERE g = 3",
+      "duck": "SELECT * FROM '{path}' WHERE g = 3",
+      "jobs": [
+        2
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "sliced:print-limit",
+      "kind": "tail",
+      "check": "sliced_limit",
+      "fixture": "big",
+      "sql": "SELECT * FROM '{path}' LIMIT 7",
+      "duck": "SELECT * FROM '{path}'",
+      "jobs": [
+        2
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "sliced:aggregate",
+      "kind": "agg",
+      "fixture": "big",
+      "aggregate": "sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t, sum(wide) AS w, max(pad) AS x, count(pad) AS n",
+      "duck": "sum(price) AS s, count(amt) AS c, max(name) AS m, sum(price * 3) AS t, sum(wide) AS w, max(pad) AS x, count(pad) AS n",
+      "jobs": [
+        2
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "sliced:grouped",
+      "kind": "groupby",
+      "fixture": "big",
+      "aggregate": "sum(price) AS s, min(amt) AS a",
+      "group_by": "g",
+      "duck": "SELECT g, sum(price) AS s, min(amt) AS a FROM '{path}' GROUP BY g",
+      "jobs": [
+        2
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "sliced:tiny-budget",
+      "kind": "agg",
+      "fixture": "big",
+      "aggregate": "sum(price) AS s",
+      "duck": "sum(price) AS s",
+      "max_memory": "100K"
+    },
+    {
+      "id": "sliced:int96-float16",
+      "kind": "tail",
+      "check": "int96",
+      "fixture": "legacy",
+      "sql": "SELECT * FROM '{path}'",
+      "max_memory": "200K",
+      "row_count": 20000
+    },
+    {
+      "id": "levels-only:dictionary:h",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_dictionary",
+      "aggregate": "count(h) AS n, min(h) AS lo, max(h) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(h) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:dictionary:s",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_dictionary",
+      "aggregate": "count(s) AS n, min(s) AS lo, max(s) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(s) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:dictionary:f",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_dictionary",
+      "aggregate": "count(f) AS n, min(f) AS lo, max(f) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(f) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:delta:h",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_delta",
+      "aggregate": "count(h) AS n, min(h) AS lo, max(h) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(h) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:delta:s",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_delta",
+      "aggregate": "count(s) AS n, min(s) AS lo, max(s) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(s) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:delta:f",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_delta",
+      "aggregate": "count(f) AS n, min(f) AS lo, max(f) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(f) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:delta-length:h",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_delta_length",
+      "aggregate": "count(h) AS n, min(h) AS lo, max(h) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(h) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:delta-length:s",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_delta_length",
+      "aggregate": "count(s) AS n, min(s) AS lo, max(s) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(s) AS n FROM '{path}'"
+    },
+    {
+      "id": "levels-only:delta-length:f",
+      "kind": "tail",
+      "check": "levels",
+      "fixture": "levels_delta_length",
+      "aggregate": "count(f) AS n, min(f) AS lo, max(f) AS hi",
+      "scan_all": true,
+      "duck": "SELECT count(f) AS n FROM '{path}'"
+    },
+    {
+      "id": "name-clash:key_vs_alias",
+      "kind": "tail",
+      "check": "refuse",
+      "expect": "output column `name`",
+      "group_by": "name AS k",
+      "aggregate": "sum(amt) AS name"
+    },
+    {
+      "id": "name-clash:dup_alias",
+      "kind": "tail",
+      "check": "refuse",
+      "expect": "output column `a`",
+      "aggregate": "sum(amt) AS a, min(amt) AS a"
+    },
+    {
+      "id": "name-clash:dup_alias_gb",
+      "kind": "tail",
+      "check": "refuse",
+      "expect": "output column `C`",
+      "group_by": "flag",
+      "aggregate": "count(*) AS c, sum(amt) AS C"
+    },
+    {
+      "id": "name-clash:sql_dup_alias",
+      "kind": "tail",
+      "check": "refuse",
+      "sql": "SELECT flag, count(*) AS c, sum(amt) AS c FROM '{path}' GROUP BY flag",
+      "expect": "output column `c`"
+    },
+    {
+      "id": "agg-names:lone",
+      "kind": "tail",
+      "check": "names",
+      "names": [
+        "sum"
+      ],
+      "aggregate": "sum(amt)"
+    },
+    {
+      "id": "agg-names:two_sums",
+      "kind": "tail",
+      "check": "names",
+      "names": [
+        "sum(amt)",
+        "sum(id)"
+      ],
+      "aggregate": "sum(amt), sum(id)"
+    },
+    {
+      "id": "agg-names:gb_two_mins",
+      "kind": "tail",
+      "check": "names",
+      "names": [
+        "flag",
+        "min(amt)",
+        "min(id)"
+      ],
+      "group_by": "flag",
+      "aggregate": "min(amt), min(id)"
+    },
+    {
+      "id": "agg-names:sql_two_sums",
+      "kind": "tail",
+      "check": "names",
+      "names": [
+        "sum(amt)",
+        "sum(id)"
+      ],
+      "sql": "SELECT sum(amt), sum(id) FROM '{path}'"
+    },
+    {
+      "id": "agg-names:sql_gb_unaliased",
+      "kind": "tail",
+      "check": "names",
+      "names": [
+        "flag",
+        "count(*)",
+        "sum(id)"
+      ],
+      "sql": "SELECT flag, count(*), sum(id) FROM '{path}' GROUP BY flag"
+    },
+    {
+      "id": "row-order",
+      "kind": "tail",
+      "check": "order",
+      "filter": "id > 0",
+      "columns": [
+        "id"
+      ]
+    },
+    {
+      "id": "select-order",
+      "kind": "tail",
+      "check": "select_order",
+      "select": "name AS name, id AS id"
+    },
+    {
+      "id": "dense:0",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k, count(*) AS c FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:1",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k, count(*) AS c FROM '{path}' WHERE f < 30 GROUP BY k ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:2",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:3",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k, sum(v) AS s FROM '{path}' GROUP BY k ORDER BY s DESC LIMIT 9 OFFSET 2",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:4",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k, avg(v) AS a, count(*) FILTER (WHERE f > 50) AS c FROM '{path}' WHERE v IS NOT NULL GROUP BY k HAVING count(*) > 3 ORDER BY a DESC LIMIT 5",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:5",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k, min(v) AS lo FROM '{path}' WHERE f = 7 GROUP BY k",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:6",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k32, count(*) AS c FROM '{path}' GROUP BY k32 ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:7",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k32, count(*) AS c FROM '{path}' WHERE f < 30 GROUP BY k32 ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:8",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k32, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k32",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:9",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k32, sum(v) AS s FROM '{path}' GROUP BY k32 ORDER BY s DESC LIMIT 9 OFFSET 2",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:10",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k32, avg(v) AS a, count(*) FILTER (WHERE f > 50) AS c FROM '{path}' WHERE v IS NOT NULL GROUP BY k32 HAVING count(*) > 3 ORDER BY a DESC LIMIT 5",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:11",
+      "kind": "dense",
+      "fixture": "dense_0",
+      "sql": "SELECT k32, min(v) AS lo FROM '{path}' WHERE f = 7 GROUP BY k32",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:12",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:13",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c FROM '{path}' WHERE f < 30 GROUP BY k ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:14",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:15",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, sum(v) AS s FROM '{path}' GROUP BY k ORDER BY s DESC LIMIT 9 OFFSET 2",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:16",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, avg(v) AS a, count(*) FILTER (WHERE f > 50) AS c FROM '{path}' WHERE v IS NOT NULL GROUP BY k HAVING count(*) > 3 ORDER BY a DESC LIMIT 5",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:17",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, min(v) AS lo FROM '{path}' WHERE f = 7 GROUP BY k",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:18",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32, count(*) AS c FROM '{path}' GROUP BY k32 ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:19",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32, count(*) AS c FROM '{path}' WHERE f < 30 GROUP BY k32 ORDER BY c DESC LIMIT 7",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:20",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k32",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:21",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32, sum(v) AS s FROM '{path}' GROUP BY k32 ORDER BY s DESC LIMIT 9 OFFSET 2",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:22",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32, avg(v) AS a, count(*) FILTER (WHERE f > 50) AS c FROM '{path}' WHERE v IS NOT NULL GROUP BY k32 HAVING count(*) > 3 ORDER BY a DESC LIMIT 5",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": true
+    },
+    {
+      "id": "dense:23",
+      "kind": "dense",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32, min(v) AS lo FROM '{path}' WHERE f = 7 GROUP BY k32",
+      "jobs": [
+        1,
+        3,
+        16
+      ],
+      "dense_both": true,
+      "skip_duck": false
+    },
+    {
+      "id": "dense:many-calls:24:2M:-j1",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23",
+      "jobs": [
+        1
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "dense:many-calls:24:2M:-j3",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23",
+      "jobs": [
+        3
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "dense:many-calls:24:2M:-j16",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23",
+      "jobs": [
+        16
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "dense:many-calls:48:4M:-j1",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23, sum(v) AS s24, sum(v) AS s25, sum(v) AS s26, sum(v) AS s27, sum(v) AS s28, sum(v) AS s29, sum(v) AS s30, sum(v) AS s31, sum(v) AS s32, sum(v) AS s33, sum(v) AS s34, sum(v) AS s35, sum(v) AS s36, sum(v) AS s37, sum(v) AS s38, sum(v) AS s39, sum(v) AS s40, sum(v) AS s41, sum(v) AS s42, sum(v) AS s43, sum(v) AS s44, sum(v) AS s45, sum(v) AS s46, sum(v) AS s47",
+      "jobs": [
+        1
+      ],
+      "max_memory": "4M"
+    },
+    {
+      "id": "dense:many-calls:48:4M:-j3",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23, sum(v) AS s24, sum(v) AS s25, sum(v) AS s26, sum(v) AS s27, sum(v) AS s28, sum(v) AS s29, sum(v) AS s30, sum(v) AS s31, sum(v) AS s32, sum(v) AS s33, sum(v) AS s34, sum(v) AS s35, sum(v) AS s36, sum(v) AS s37, sum(v) AS s38, sum(v) AS s39, sum(v) AS s40, sum(v) AS s41, sum(v) AS s42, sum(v) AS s43, sum(v) AS s44, sum(v) AS s45, sum(v) AS s46, sum(v) AS s47",
+      "jobs": [
+        3
+      ],
+      "max_memory": "4M"
+    },
+    {
+      "id": "dense:many-calls:48:4M:-j16",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23, sum(v) AS s24, sum(v) AS s25, sum(v) AS s26, sum(v) AS s27, sum(v) AS s28, sum(v) AS s29, sum(v) AS s30, sum(v) AS s31, sum(v) AS s32, sum(v) AS s33, sum(v) AS s34, sum(v) AS s35, sum(v) AS s36, sum(v) AS s37, sum(v) AS s38, sum(v) AS s39, sum(v) AS s40, sum(v) AS s41, sum(v) AS s42, sum(v) AS s43, sum(v) AS s44, sum(v) AS s45, sum(v) AS s46, sum(v) AS s47",
+      "jobs": [
+        16
+      ],
+      "max_memory": "4M"
+    },
+    {
+      "id": "dense:many-calls:48:3500K:-j1",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23, sum(v) AS s24, sum(v) AS s25, sum(v) AS s26, sum(v) AS s27, sum(v) AS s28, sum(v) AS s29, sum(v) AS s30, sum(v) AS s31, sum(v) AS s32, sum(v) AS s33, sum(v) AS s34, sum(v) AS s35, sum(v) AS s36, sum(v) AS s37, sum(v) AS s38, sum(v) AS s39, sum(v) AS s40, sum(v) AS s41, sum(v) AS s42, sum(v) AS s43, sum(v) AS s44, sum(v) AS s45, sum(v) AS s46, sum(v) AS s47",
+      "jobs": [
+        1
+      ],
+      "max_memory": "3500K"
+    },
+    {
+      "id": "dense:many-calls:48:3500K:-j3",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23, sum(v) AS s24, sum(v) AS s25, sum(v) AS s26, sum(v) AS s27, sum(v) AS s28, sum(v) AS s29, sum(v) AS s30, sum(v) AS s31, sum(v) AS s32, sum(v) AS s33, sum(v) AS s34, sum(v) AS s35, sum(v) AS s36, sum(v) AS s37, sum(v) AS s38, sum(v) AS s39, sum(v) AS s40, sum(v) AS s41, sum(v) AS s42, sum(v) AS s43, sum(v) AS s44, sum(v) AS s45, sum(v) AS s46, sum(v) AS s47",
+      "jobs": [
+        3
+      ],
+      "max_memory": "3500K"
+    },
+    {
+      "id": "dense:many-calls:48:3500K:-j16",
+      "kind": "pair",
+      "check": "calls",
+      "fixture": "manycalls",
+      "group_by": "k",
+      "aggregate": "sum(v) AS s0, sum(v) AS s1, sum(v) AS s2, sum(v) AS s3, sum(v) AS s4, sum(v) AS s5, sum(v) AS s6, sum(v) AS s7, sum(v) AS s8, sum(v) AS s9, sum(v) AS s10, sum(v) AS s11, sum(v) AS s12, sum(v) AS s13, sum(v) AS s14, sum(v) AS s15, sum(v) AS s16, sum(v) AS s17, sum(v) AS s18, sum(v) AS s19, sum(v) AS s20, sum(v) AS s21, sum(v) AS s22, sum(v) AS s23, sum(v) AS s24, sum(v) AS s25, sum(v) AS s26, sum(v) AS s27, sum(v) AS s28, sum(v) AS s29, sum(v) AS s30, sum(v) AS s31, sum(v) AS s32, sum(v) AS s33, sum(v) AS s34, sum(v) AS s35, sum(v) AS s36, sum(v) AS s37, sum(v) AS s38, sum(v) AS s39, sum(v) AS s40, sum(v) AS s41, sum(v) AS s42, sum(v) AS s43, sum(v) AS s44, sum(v) AS s45, sum(v) AS s46, sum(v) AS s47",
+      "jobs": [
+        16
+      ],
+      "max_memory": "3500K"
+    },
+    {
+      "id": "dense:budget:2M",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k",
+      "jobs": [
+        16
+      ],
+      "max_memory": "2M"
+    },
+    {
+      "id": "dense:budget:6M",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k",
+      "jobs": [
+        16
+      ],
+      "max_memory": "6M"
+    },
+    {
+      "id": "dense:budget:16M",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k",
+      "jobs": [
+        16
+      ],
+      "max_memory": "16M"
+    },
+    {
+      "id": "dense:budget:64M",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "dense_glob",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s, min(v) AS lo, max(v) AS hi, count(v) AS cv FROM '{path}' GROUP BY k",
+      "jobs": [
+        16
+      ],
+      "max_memory": "64M"
+    }
+  ]
+}

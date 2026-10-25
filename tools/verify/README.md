@@ -22,11 +22,15 @@ spill, distinct, HAVING, and top-rows), and `tools/runner/cases/stats_order.json
 (statistics order: rows, parquet, aggregates, and the column orders zpq
 writes, with pyarrow as the oracle where DuckDB trusts statistics it should not),
 and `tools/runner/cases/writer_wire.json` (re-encoded fixed-length bytes, float
-bounds, and row-group sizes, read back by pyarrow and DuckDB). A SQL predicate answers as count and sum
+bounds, and row-group sizes, read back by pyarrow and DuckDB), and
+`tools/runner/cases/tail.json` (the rest of the differential: cut errors, memory
+budgets, exact averages, typed and decimal output, sliced writes, levels, names,
+row order, and the dense-domain matrix). A SQL predicate answers as count and sum
 at `-j` 1, 4 and 16, or refuses with one stable message. An answer must equal
 DuckDB. A refusal with a message is a pass, which is the `sql_pred` gate. Known
-divergences and declared refusals are `tests/known_divergences.json`. This
-stage is not part of `full` until it covers the rest of `tools/differential.py`.
+divergences and declared refusals are `tests/known_divergences.json`. The
+referee now covers `tools/differential.py`. `verify stage referee` is still an
+extra stage, beside the differential stage, until that script is retired.
 
 No arguments prints the tiers, every stage, and the exit codes. A run writes
 `summary.json` under `~/code/zpq-wt/verify-v2-out/<run-id>/`. The writer refuses

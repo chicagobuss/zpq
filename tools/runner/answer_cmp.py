@@ -580,9 +580,165 @@ def cmd_parquet(args):
         raise SystemExit(f"rows parquet={got[:2]} ({len(got)}) json={want[:2]} ({len(want)})")
 
 
+def nulls_first(row):
+    return tuple((x is not None, x if x is not None else 0) for x in row)
+
+
+def cmd_dense(args):
+    zraw = load_zpq(args.zpq)
+    if isinstance(zraw, dict):
+        zraw = [zraw]
+    got = sorted((tuple(row.values()) for row in zraw), key=nulls_first)
+    drows, _, _ = duck_rows(args)
+    want = sorted((tuple(row) for row in drows), key=nulls_first)
+    if got != want:
+        raise SystemExit(f"duckdb differs: zpq={got[:2]} duck={want[:2]}")
+
+
+def cmd_usame(args):
+    zraw = load_zpq(args.zpq)
+    if isinstance(zraw, dict):
+        zraw = [zraw]
+    drows, names, lanes = duck_rows(args)
+    got = sorted((tuple(from_zpq([row.get(c) for c in names], lanes)) for row in zraw), key=repr)
+    want = sorted((tuple(row) for row in drows), key=repr)
+    if len(got) != len(want) or not all(same(g, w) for gr, wr in zip(got, want) for g, w in zip(gr, wr)):
+        raise SystemExit(f"zpq={got[:2]} duck={want[:2]}")
+
+
+def _canon_table(rows, lanes):
+    return canon_rows(rows, lanes)
+
+
+def cmd_tail(args):
+    import datetime
+    import pyarrow.parquet as pq
+
+    check = args.check
+    if check == "names":
+        rows = load_zpq(args.zpq)
+        if isinstance(rows, dict):
+            rows = [rows]
+        want = args.names.split("|")
+        for row in rows:
+            got = list(row.keys())
+            if got != want:
+                raise SystemExit(f"names {got} want {want}")
+        return
+    if check == "order":
+        got = pq.read_table(args.parquet or args.zpq).column("id").to_pylist()
+        src = pq.read_table(args.fixture).column("id").to_pylist()
+        want = [v for v in src if v is not None and v > 0]
+        if got != want:
+            raise SystemExit(f"order zpq={len(got)} input={len(want)}")
+        return
+    if check == "select_order":
+        got = list(pq.read_table(args.parquet or args.zpq).column_names)
+        if got != ["name", "id"]:
+            raise SystemExit(f"columns {got}")
+        return
+    if check == "avg_exact":
+        rows = load_zpq(args.zpq)
+        by_g = {row["g"]: row for row in rows}
+        for drow in duck_json(args.duckdb, args.sql, stable=True):
+            g = drow["g"]
+            # The exact sum is wider than f64. The check is the float of that sum, which is what zpq prints.
+            sv, nv = float(int(drow["sv"])), int(drow["nv"])
+            sw, nw = float(int(drow["sw"])), int(drow["nw"])
+            got = by_g[g]
+            if float(got["a"]) != sv / nv or float(got["b"]) != sw / nw:
+                raise SystemExit(f"avg g={g} zpq={got['a']},{got['b']} want {sv / nv},{sw / nw}")
+            st = got["st"]
+            if float(st["sum"]) != sv or st["count"] != nv:
+                raise SystemExit(f"avg_state g={g} {st} want {sv},{nv}")
+        if len(by_g) != len(duck_json(args.duckdb, args.sql, stable=True)):
+            raise SystemExit("avg group count")
+        return
+    if check == "levels":
+        raw = load_zpq(args.zpq)
+        row = raw[0] if isinstance(raw, list) else raw
+        want = duck_json(args.duckdb, args.sql, stable=True)[0]["n"]
+        if int(row["n"]) != int(want):
+            raise SystemExit(f"count {row['n']} want {want}")
+        return
+    if check in ("typed", "decimal"):
+        tbl = pq.read_table(args.parquet)
+        got_types = [str(field.type) for field in tbl.schema]
+        want_types = args.types.split("|")
+        if got_types != want_types:
+            raise SystemExit(f"types {got_types} want {want_types}")
+        lanes = [EXACT if t.startswith("decimal") else None for t in got_types]
+
+        def norm_cell(v):
+            if isinstance(v, (bytes, bytearray)):
+                return v.hex()
+            if isinstance(v, datetime.datetime):
+                if v.tzinfo is not None:
+                    v = v.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                return v.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip("0").rstrip(".")
+            if isinstance(v, datetime.date) and not isinstance(v, datetime.datetime):
+                return v.isoformat()
+            if isinstance(v, datetime.time):
+                return v.isoformat()
+            return v
+
+        zrows = _canon_table([[norm_cell(v) for v in row.values()] for row in tbl.to_pylist()], lanes)
+        drows, names, dlane = duck_rows(args)
+        if check == "decimal" and args.orders:
+            scales = {}
+            for part in args.orders.split("|"):
+                name, scale = part.split(":")
+                scales[name] = int(scale)
+            fixed = []
+            for row in drows:
+                row = list(row)
+                for name, scale in scales.items():
+                    si, ci = names.index(f"{name}__sum"), names.index(f"{name}__count")
+                    mi = names.index(name)
+                    row[mi] = avg_dec(row[si], row[ci], scale)
+                fixed.append(row[: len(want_types)])
+            drows = fixed
+            dlane = lanes
+        want = _canon_table([[norm_cell(v) for v in row] for row in drows], dlane if check == "decimal" else lanes)
+        if zrows != want:
+            raise SystemExit(f"rows zpq={zrows[:2]} duck={want[:2]}")
+        back = duck_json(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)
+        if check == "decimal":
+            # The file DuckDB reads back must carry the same values pyarrow did.
+            spec = describe(args.duckdb, f"SELECT * FROM '{args.parquet}'", stable=True)
+            brows = [[coerce(row.get(n), t) for n, t in spec] for row in back]
+            if _canon_table(brows, lanes) != zrows:
+                raise SystemExit("DuckDB reads other values back")
+        return
+    if check == "sliced_write":
+        import pyarrow.parquet as pq2
+
+        pf = pq2.ParquetFile(args.parquet)
+        if pf.metadata.num_row_groups < 2:
+            raise SystemExit("one row group out: the write was not sliced")
+        drows, names, lanes = duck_rows(args)
+        tbl = pq2.read_table(args.parquet)
+        zrows = canon_rows([[row[c] for c in names] for row in tbl.to_pylist()], lanes)
+        if zrows != canon_rows(drows, lanes):
+            raise SystemExit(f"sliced write zpq={len(zrows)} duck={len(drows)}")
+        return
+    if check in ("sliced_print", "sliced_limit"):
+        text = Path(args.zpq).read_text().splitlines()
+        drows, names, lanes = duck_rows(args)
+        if check == "sliced_limit":
+            drows = drows[:7]
+        zraw = [json.loads(line, parse_float=Decimal) for line in text if line.strip()]
+        zrows = canon_rows([from_zpq([row.get(c) for c in names], lanes) for row in zraw], lanes)
+        want = canon_rows(drows, lanes)
+        if zrows != want:
+            raise SystemExit(f"sliced print zpq={len(zrows)} duck={len(want)}")
+        return
+    raise SystemExit(f"bad tail check {check}")
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire"])
+    p.add_argument("mode", choices=["agg", "group", "parquet", "ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire", "dense", "usame", "tail"])
     p.add_argument("--zpq", required=True)
     p.add_argument("--duckdb")
     p.add_argument("--sql")
@@ -600,8 +756,10 @@ def main():
     p.add_argument("--py-agg")
     p.add_argument("--orders")
     p.add_argument("--check")
+    p.add_argument("--names")
+    p.add_argument("--types")
     args = p.parse_args()
-    args.stable = args.mode in ("ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire")
+    args.stable = args.mode in ("ordered", "rows", "stats_rows", "stats_agg", "stats_select", "stats_orders", "wire", "dense", "usame", "tail")
     if args.mode == "agg":
         cmd_agg(args)
     elif args.mode == "group":
@@ -620,6 +778,12 @@ def main():
         cmd_stats_orders(args)
     elif args.mode == "wire":
         cmd_wire(args)
+    elif args.mode == "dense":
+        cmd_dense(args)
+    elif args.mode == "usame":
+        cmd_usame(args)
+    elif args.mode == "tail":
+        cmd_tail(args)
     else:
         cmd_parquet(args)
 

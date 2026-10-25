@@ -4708,7 +4708,7 @@ const ChunkDecoder = struct {
         else
             null;
         if (prune_info) |*p| p.keep = self.keep;
-        // Encoded execution, on chunks read whole (page pruning decodes values page by page): a column only counted
+        // Encoded execution on whole chunks: a column only counted
         // reads its levels; one only bare aggregates read, over every row, folds straight into a histogram of its
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
         const uses = self.uses;
@@ -4730,8 +4730,11 @@ const ChunkDecoder = struct {
             return decoded;
         };
         const scratch = self.ws.scratch;
-        // A gated column decodes values: the code paths read every page.
-        const encoded = decode_options.encoded and prune_info == null and ci < uses.code.len and
+        // An index that excludes no rows or pages needs no value expansion. Retain keyed dictionaries there;
+        // actual pruning and compact/gated views still use the page-wise value decoder.
+        const keyed_whole = decode_options.any_dictionary and self.keep == null and
+            (if (prune_info) |p| std.mem.indexOfScalar(bool, p.page_is_skipped, true) == null else true);
+        const encoded = decode_options.encoded and (prune_info == null or keyed_whole) and ci < uses.code.len and
             decode_options.row_gate == null;
         const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and
             self.target == .scalar;

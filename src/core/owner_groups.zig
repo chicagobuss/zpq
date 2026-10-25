@@ -442,7 +442,10 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 const shared = blockCount(rows, workers, parts) *| @sizeOf(Block) +| workers *| parts *| 3 *| @sizeOf(u32) +|
                     @sizeOf(State) +| (8 << 20);
                 // The full answers keep their established quotes, which cover blocks and ordering arrays.
-                if (kind == .full) return if (codec == .int64) rows *| 88 +| (128 << 20) else rows *| 96 +| (192 << 20);
+                if (kind == .full) return (if (codec == .int64)
+                    rows *| 88 +| (128 << 20)
+                else
+                    rows *| 96 +| (192 << 20)) +| output_credit;
                 return shared +| rows *| table_row_bytes +|
                     workers *| (stack_size + @sizeOf(Local) + @sizeOf(Heap) + @sizeOf(Task)) +|
                     workers *| k *| @sizeOf(Group) +| output_credit;
@@ -526,12 +529,13 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 cut: if (kind == .full) void else Cut,
                 parts: usize,
                 items: usize,
+                output_credit: usize,
             ) !?*State {
                 comptime std.debug.assert(codec == .int64);
                 // The ordinary per-row quote also covers one run descriptor per row. Empty-source-heavy inputs
                 // beyond that bound keep the record producer, rather than retaining unquoted descriptors.
                 if (items > rows) return null;
-                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, 0, items);
+                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, items);
             }
 
             fn initMode(
@@ -1496,7 +1500,7 @@ fn runTrial(a: std.mem.Allocator, workers: usize) !void {
     const starts = [_]u32{ 0, 3, 3, 5, 7, 10 };
     var ledger: memory.SharedBudget = .{ .limit = 512 << 20 };
     defer std.debug.assert(ledger.used.load(.monotonic) == 0);
-    const s = (try IntFull.State.initRuns(a, &ledger, keys.len, workers, 0, 1, {}, full_parts, starts.len)).?;
+    const s = (try IntFull.State.initRuns(a, &ledger, keys.len, workers, 0, 1, {}, full_parts, starts.len, 0)).?;
     defer s.deinit();
     // Reverse completion order, an empty source, and one group through three source seams.
     var item = starts.len;
@@ -1542,7 +1546,7 @@ test "decoded owner runs release every failed allocation and ledger reservation"
 test "decoded owner runs decline NULL, an interior descent or an overlapping source before output" {
     const a = std.testing.allocator;
     for ([_][4]?i64{ .{ 1, null, 2, 3 }, .{ 1, 0, 2, 3 }, .{ 1, 2, 1, 3 } }) |keys| {
-        const s = (try IntFull.State.initRuns(a, null, keys.len, 2, 0, 1, {}, full_parts, 2)).?;
+        const s = (try IntFull.State.initRuns(a, null, keys.len, 2, 0, 1, {}, full_parts, 2, 0)).?;
         defer s.deinit();
         for (0..2) |item| {
             s.locals[item].start(@intCast(item * 2), item);
@@ -1555,7 +1559,7 @@ test "decoded owner runs decline NULL, an interior descent or an overlapping sou
 test "decoded owner runs narrow exact sums only after all seams, including a later cancellation" {
     const a = std.testing.allocator;
     for ([_]i64{ -std.math.maxInt(i64), 0 }) |last| {
-        const s = (try IntFull.State.initRuns(a, null, 3, 1, 0, 1, {}, full_parts, 3)).?;
+        const s = (try IntFull.State.initRuns(a, null, 3, 1, 0, 1, {}, full_parts, 3, 0)).?;
         defer s.deinit();
         for ([_]i64{ std.math.maxInt(i64), 1, last }, 0..) |value, item| {
             s.locals[0].start(@intCast(item), item);
@@ -1584,7 +1588,7 @@ fn runTopTrialKind(comptime kind: Kind, a: std.mem.Allocator, workers: usize, de
     var ledger: memory.SharedBudget = .{ .limit = 1 << 30 };
     defer std.debug.assert(ledger.used.load(.monotonic) == 0);
     const cut: Cut = .{ .k = k, .descending = descending };
-    const run = (try O.State.initRuns(a, &ledger, rows, workers, 0, 1, cut, 64, items)).?;
+    const run = (try O.State.initRuns(a, &ledger, rows, workers, 0, 1, cut, 64, items, 0)).?;
     defer run.deinit();
     const hash = (try O.State.init(a, &ledger, rows, workers, 0, 1, cut, 64, 0)).?;
     defer hash.deinit();
@@ -1631,6 +1635,7 @@ test "decoded owner runs decline unquoted descriptors for mostly empty sources" 
         {},
         full_parts,
         2,
+        0,
     )) == null);
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }
@@ -1659,6 +1664,7 @@ test "decoded owner COUNT top-H declines NULL and descending keys before selecti
             .{ .k = 2, .descending = true },
             64,
             2,
+            0,
         )).?;
         defer s.deinit();
         for (0..2) |item| {

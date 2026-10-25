@@ -69,7 +69,8 @@ def guide() -> str:
                   "Reruns: new directory, --rerun-of ID; earlier failures stay recorded.",
                   "Builds: 20 GiB systemd scope, nice 10, at most -j8; --cpu defaults to",
                   "raptorlake for native ReleaseFast builds. Select another CPU explicitly.",
-                  "Dependencies: Zig, Python with PyArrow/DuckDB, and the DuckDB CLI.",
+                  "Dependencies: Zig, the DuckDB CLI, and tools/verify/requirements.txt pins.",
+                  "Python dependency mismatches stop before any build or host probe.",
                   "repro-skspill expects exit 1 plus the declared memory-budget message.",
                   "Pinned scorecard: tools/verify/HARNESS; --harness selects its clean checkout.",
                   "", "Stages (tier membership)"])
@@ -261,6 +262,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if args.command == "perf" and args.resume and not args.rerun_of:
         args.rerun_of = Path(args.resume).expanduser().resolve().name
+    environment = provenance.python_environment(REPO)
+    if environment["mismatches"]:
+        print("verify: Python environment mismatch (no gates started):", file=sys.stderr)
+        for mismatch in environment["mismatches"]:
+            print(f"  {mismatch}", file=sys.stderr)
+        print("Install pins and run verify with that environment:\n"
+              "  uv pip install --python .venv/bin/python -r tools/verify/requirements.txt\n"
+              "  .venv/bin/python tools/verify/verify.py COMMAND", file=sys.stderr)
+        return 2
     revision = head_sha()
     try:
         run_dir, book = open_run(args, args.command if args.command != "stage" else f"stage-{args.name}", revision)

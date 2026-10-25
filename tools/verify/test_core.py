@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
 import perf
+import provenance
 import scorecard_select
 import shipbar
 import stages
@@ -32,6 +33,32 @@ def cell(engine, ns, query="q", failures=None, checked=3):
         "checked": checked,
         "failures": failures or [],
     }
+
+
+class EnvironmentTest(unittest.TestCase):
+    def test_missing_and_wrong_versions_stop_before_host_probes(self):
+        installed = {"duckdb": "1.4.3"}
+
+        def lookup(name):
+            if name not in installed:
+                raise provenance.PackageNotFoundError(name)
+            return installed[name]
+
+        with patch.object(provenance, "version", side_effect=lookup), \
+                patch.object(verify, "open_run") as open_run, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(verify.main(["quick"]), 2)
+        open_run.assert_not_called()
+        self.assertIn("duckdb: need 1.5.5, installed 1.4.3", err.getvalue())
+        self.assertIn("pyarrow: need 25.0.0, installed missing", err.getvalue())
+        self.assertIn("uv pip install", err.getvalue())
+
+    def test_exact_pins_are_recorded(self):
+        required = provenance.python_environment(verify.REPO)["required"]
+        with patch.object(provenance, "version", side_effect=required.__getitem__):
+            actual = provenance.python_environment(verify.REPO)
+        self.assertEqual(actual["installed"], required)
+        self.assertEqual(actual["mismatches"], [])
+        self.assertEqual(len(actual["requirements_sha256"]), 64)
 
 
 class SummaryTest(unittest.TestCase):

@@ -1,8 +1,10 @@
 # verify
 
-Run from the repository root with a Python that has PyArrow and DuckDB:
+Install the pinned gate dependencies, then run from the repository root:
 
 ```sh
+uv pip install --python .venv/bin/python -r tools/verify/requirements.txt
+. .venv/bin/activate
 python tools/verify/verify.py --help
 python tools/verify/verify.py quick
 python tools/verify/verify.py commit
@@ -22,7 +24,9 @@ and JSON/JSONL/Parquet formatting, and runs the full differential referee.
 
 Each run writes `zig-out/verify/<run-id>/summary.json` (override with `--out`).
 Stages retain status, duration, command, counts, logs and binary hashes.
-The record includes the engine source tree, working-tree state and host.
+The record includes the engine source tree, working-tree state, host and exact
+Python dependency versions. A dependency mismatch exits 2 before any build or
+host probe; align the environment with `tools/verify/requirements.txt` first.
 Run directories are immutable. Reruns use a new directory and `--rerun-of ID`.
 Exit 0 means required checks passed or matched their declared refusals;
 1 means failure; 2 means a missing prerequisite or incomplete run.

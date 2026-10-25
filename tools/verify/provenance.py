@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import hashlib
+from importlib.metadata import PackageNotFoundError, version
 import socket
 import subprocess
 from pathlib import Path
@@ -68,6 +69,24 @@ def memory_modules() -> dict:
     return {"error": "dmidecode unavailable", "attempts": attempts}
 
 
+def python_environment(repo: Path) -> dict:
+    pins = repo / "tools/verify/requirements.txt"
+    required = dict(line.split("==") for line in pins.read_text().splitlines() if line and not line.startswith("#"))
+    installed = {}
+    for name in required:
+        try:
+            installed[name] = version(name)
+        except PackageNotFoundError:
+            installed[name] = None
+    return {
+        "requirements_sha256": hashlib.sha256(pins.read_bytes()).hexdigest(),
+        "required": required,
+        "installed": installed,
+        "mismatches": [f"{name}: need {want}, installed {installed[name] or 'missing'}"
+                       for name, want in required.items() if installed[name] != want],
+    }
+
+
 def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
     diff = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=repo)
@@ -78,6 +97,7 @@ def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
         "logical_cpus": os_cpu_count(),
         "zig_cpu": zig_cpu,
         "python": platform.python_version(),
+        "python_environment": python_environment(repo),
         "engine_tree": subprocess.check_output(["git", "rev-parse", "HEAD:src"], cwd=repo, text=True).strip(),
         "working_tree_status": dirty.splitlines(),
         "diff_sha256": hashlib.sha256(diff).hexdigest() if diff else None,

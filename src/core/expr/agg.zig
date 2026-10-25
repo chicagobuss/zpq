@@ -1913,20 +1913,8 @@ const PreparedAggInput = struct {
         batch: *const filter_eval.Batch,
         column_lookup: []const ?usize,
         outer_sel: *const filter_selection.SelectionVector,
-        rowless: bool,
-    ) Error!PreparedAggInput {
-        return initWidth(arena, call, batch, column_lookup, outer_sel, rowless, false);
-    }
-
-    fn initWidth(
-        arena: std.mem.Allocator,
-        call: AggCall,
-        batch: *const filter_eval.Batch,
-        column_lookup: []const ?usize,
-        outer_sel: *const filter_selection.SelectionVector,
         /// A fold over the selected values alone (not by row, as a grouped fold is) lets `evalArg` gather rows.
         rowless: bool,
-        physical_integer: bool,
     ) Error!PreparedAggInput {
         var in: PreparedAggInput = .{ .outer_sel = outer_sel };
         errdefer in.deinit(arena);
@@ -1937,7 +1925,7 @@ const PreparedAggInput = struct {
         // A bare col_ref tolerates OPTIONAL columns and narrows the selection by their nulls; a computed argument goes
         // to the general evaluator, which still rejects nullable inputs.
         if (call.arg) |arg| switch (arg) {
-            .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c, physical_integer),
+            .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
             else => {
                 // A float sum folds gathered values in their rows' blocks (`gathered_from`), which a NULL found after
                 // the gather would shift: such an argument is evaluated in place, its coded columns materialized.
@@ -2020,7 +2008,6 @@ const PreparedAggInput = struct {
         batch: *const filter_eval.Batch,
         column_lookup: []const ?usize,
         c: expr_ast.ColRef,
-        physical_integer: bool,
     ) Error!void {
         const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
         const raw = batch.cols[pos];
@@ -2040,11 +2027,6 @@ const PreparedAggInput = struct {
         switch (c.expr_type) {
             // Already the lane's type: borrowed, not copied.
             .i64 => {
-                // Compact integer records consume the source lane directly, including UINT32 zero extension.
-                if (physical_integer and raw == .i32) {
-                    self.values = raw;
-                    return;
-                }
                 self.values = .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, raw, c) } };
                 self.values_owned = raw != .i64;
             },
@@ -5302,7 +5284,7 @@ pub fn updateTableGrouped(
         outer,
     );
     if (table.compact.fields[i].shared_sum) return;
-    var input: PreparedAggInput = try .initWidth(arena, calls[i], batch, lookup, outer, false, true);
+    var input: PreparedAggInput = try .init(arena, calls[i], batch, lookup, outer, false);
     defer input.deinit(arena);
     table.compact.foldRows(i, input.values, input.selection(), ids, null, calls[i].offset);
 }
@@ -5401,21 +5383,19 @@ pub fn prepareGrouped(
     batch: *const filter_eval.Batch,
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
-    physical_integer: bool,
 ) !GroupedPreps {
     const mem = try arena.alloc(PreparedAggInput, calls.len);
     errdefer arena.free(mem);
     var n: usize = 0;
     errdefer for (mem[0..n]) |*p| p.deinit(arena);
     for (calls) |call| {
-        mem[n] = try PreparedAggInput.initWidth(
+        mem[n] = try PreparedAggInput.init(
             arena,
             call,
             batch,
             column_lookup,
             outer_sel,
             false,
-            physical_integer,
         );
         n += 1;
     }
@@ -7372,91 +7352,4 @@ fn testSharedInteger(a: std.mem.Allocator) !void {
         &sel,
     ));
     try std.testing.expectEqualDeep(before, states);
-}
-
-test "compact grouped inputs borrow signed and unsigned INT32 lanes with exact NULL-aware results" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompactPhysicalInputs, .{});
-}
-
-fn testCompactPhysicalInputs(a: std.mem.Allocator) !void {
-    const n = 193;
-    const groups = 7;
-    var vals: [n]i32 = undefined;
-    var defs: [n]u32 = undefined;
-    var ids: [n]u32 = undefined;
-    var rows: [n]u32 = undefined;
-    for (&vals, &defs, &ids, &rows, 0..) |*v, *d, *id, *r, i| {
-        v.* = switch (i % 4) {
-            0 => std.math.minInt(i32),
-            1 => -1,
-            else => @intCast(i),
-        };
-        d.* = @intFromBool(i % 11 != 0);
-        id.* = @intCast(i % groups);
-        r.* = @intCast(i);
-    }
-    const col: filter_eval.Batch.Column = .{ .i32 = .{
-        .values = &vals,
-        .def_levels = &defs,
-        .max_def = 1,
-        .has_nulls = true,
-    } };
-    const batch: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = n };
-    for ([_]bool{ false, true }) |unsigned| {
-        const arg: expr_ast.Expr = .{ .col_ref = .{
-            .col_idx = 0,
-            .physical_type = .INT32,
-            .expr_type = .i64,
-            .unsigned_32 = unsigned,
-        } };
-        const calls = [_]AggCall{
-            .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "all" },
-            .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "s" },
-            .{ .func = .avg, .arg = arg, .result = .avg_f64, .where = null, .alias = "av" },
-            .{ .func = .min, .arg = arg, .result = .i64, .where = null, .alias = "lo" },
-            .{ .func = .max, .arg = arg, .result = .i64, .where = null, .alias = "hi" },
-            .{ .func = .count, .arg = arg, .result = .i64, .where = null, .alias = "present" },
-            .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "shifted", .offset = -31 },
-        };
-        for ([_]bool{ false, true }) |empty| {
-            var sel = try filter_selection.SelectionVector.init(a, n);
-            defer sel.deinit();
-            for (0..n) |r| sel.set(r, !empty and r % 3 != 0);
-            var want: [groups * calls.len]Accumulator = undefined;
-            for (0..groups) |g| for (calls, 0..) |call, i| {
-                want[g * calls.len + i] = .init(call);
-            };
-            var compact: @import("agg_state.zig").State = .{};
-            defer compact.words.deinit(a);
-            compact.configure(&calls);
-            try std.testing.expect(compact.stride != 0);
-            try compact.reserve(a, groups);
-            for (0..groups) |_| compact.append();
-            var preps = try prepareGrouped(a, &calls, &batch, &.{0}, &sel, true);
-            defer preps.deinit();
-            for (preps.mem, calls) |prep, call| if (call.arg != null) {
-                try std.testing.expect(prep.values.? == .i32);
-                try std.testing.expectEqual(@intFromPtr(&vals), @intFromPtr(prep.values.?.i32.values.ptr));
-                try std.testing.expect(!prep.values_owned);
-            };
-            for (0..2) |_| {
-                for (calls, 0..) |call, i| try updateOneGrouped(
-                    a,
-                    a,
-                    &want,
-                    &ids,
-                    i,
-                    calls.len,
-                    call,
-                    &batch,
-                    &.{0},
-                    &sel,
-                );
-                try preps.fold(a, &.{}, &ids, &rows, &calls, &compact);
-            }
-            for (0..groups) |g| for (calls, 0..) |_, i| {
-                try std.testing.expectEqualDeep(want[g * calls.len + i], compact.read(g, i));
-            };
-        }
-    }
 }

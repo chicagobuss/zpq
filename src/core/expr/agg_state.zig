@@ -10,7 +10,6 @@ const Field = struct {
     kind: Kind,
     off: u16,
     unsigned: bool = false,
-    unsigned_32: bool = false,
     shared_sum: bool = false,
 };
 
@@ -39,7 +38,6 @@ pub const State = struct {
                 a == .col_ref and a.col_ref.unsigned_64
             else
                 false };
-            self.fields[i].unsigned_32 = if (c.arg) |arg| arg == .col_ref and arg.col_ref.unsigned_32 else false;
             nullable = nullable or kind == .sum or kind == .min or kind == .max;
         }
         // Sharing must not delay the first argument evaluation past another call's possible error.
@@ -143,7 +141,7 @@ pub const State = struct {
             return;
         }
         const v: i128 = switch (values.?) {
-            .i32 => |c| if (f.unsigned_32) @as(u32, @bitCast(c.values[r])) else c.values[r],
+            .i32 => |c| c.values[r],
             .i64 => |c| if (f.unsigned) @as(u64, @bitCast(c.values[r])) else c.values[r],
             else => unreachable,
         };

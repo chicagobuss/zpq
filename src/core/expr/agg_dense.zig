@@ -102,6 +102,25 @@ pub const Axis = struct {
     }
 };
 
+pub const CountAxis = struct {
+    codes: []const u32,
+    trans: []const u32,
+    ni: @TypeOf(@as(Column, undefined).nullInfo()),
+    stride: usize,
+};
+
+/// Exact tuple identity; NULL occupies the trailing slot of each translated axis.
+pub inline fn productId(axes: anytype, r: usize, comptime nullable: bool) !usize {
+    var id: usize = 0;
+    for (axes) |axis| {
+        const is_null = if (nullable) (if (axis.ni.def_levels) |dl| dl[r] < axis.ni.max_def else false) else false;
+        const code = if (is_null) axis.trans.len - 1 else axis.codes[r];
+        if (!is_null and code >= axis.trans.len - 1) return error.BadColumn;
+        id += axis.trans[code] * axis.stride;
+    }
+    return id;
+}
+
 /// Mixed-radix IDs over value-equal axes. Unused dictionary entries only enlarge the possible product.
 pub const Domain = struct {
     axes: []Axis,
@@ -117,6 +136,41 @@ pub const Domain = struct {
         var n: usize = 1;
         for (d.axes) |*axis| n *|= axis.ids();
         return n;
+    }
+
+    /// A packed identity is a value-equal tuple, not a hash. Reject products outside one machine word.
+    pub fn packedIds(d: *const Domain) ?usize {
+        var n: usize = 1;
+        for (d.axes) |*axis| n = std.math.mul(usize, n, axis.ids()) catch return null;
+        return n;
+    }
+
+    /// Every page must still carry the dictionary the union translated. Refuse before any row changes state.
+    pub fn bind(
+        d: *const Domain,
+        keys: []const expr_ast.Expr,
+        file: usize,
+        rg: usize,
+        batch: *const filter_eval.Batch,
+        lookup: []const ?usize,
+        bindings: []CountAxis,
+    ) !bool {
+        if (keys.len != d.axes.len or bindings.len != keys.len) return false;
+        var stride: usize = 1;
+        for (keys, d.axes, bindings) |key, *axis, *b| {
+            if (key != .col_ref or key.col_ref.col_idx >= lookup.len) return false;
+            const trans = axis.forRowGroup(file, rg) orelse return false;
+            const pos = lookup[key.col_ref.col_idx] orelse return false;
+            const col = batch.cols[pos];
+            if (col.nullInfo().max_rep != 0 or !axis.sameDictionary(col, trans)) return false;
+            const codes = col.codes() orelse return false;
+            const ni = col.nullInfo();
+            if (codes.len < batch.num_rows) return error.BadColumn;
+            if (ni.def_levels) |dl| if (dl.len < batch.num_rows) return error.BadColumn;
+            b.* = .{ .codes = codes, .trans = trans, .ni = ni, .stride = stride };
+            stride = std.math.mul(usize, stride, axis.ids()) catch return false;
+        }
+        return true;
     }
 
     pub fn globalFits(d: *const Domain, workers: usize) bool {
@@ -268,13 +322,6 @@ pub const Lanes = struct {
         if (l.counts32.len != 0) l.counts32[id] += @intCast(n) else l.counts64[id] += n;
     }
 
-    const CountAxis = struct {
-        codes: []const u32,
-        trans: []const u32,
-        ni: @TypeOf(@as(Column, undefined).nullInfo()),
-        stride: usize,
-    };
-
     /// Validate every axis before changing a lane. PLAIN/mismatched chunks join through the ordinary table.
     pub fn foldKeys(
         l: *Lanes,
@@ -292,19 +339,7 @@ pub const Lanes = struct {
         if (keys.len == 1) return l.fold(ra, gpa, keys[0].col_ref, file, rg, pos_base, batch, lookup, sel);
         if (!countOnly(l.calls) or l.domain.ids() > max_ids) return false;
         const bindings = try ra.alloc(CountAxis, keys.len);
-        var stride: usize = 1;
-        for (keys, l.domain.axes, bindings) |key, *axis, *b| {
-            const trans = axis.forRowGroup(file, rg) orelse return false;
-            const pos = lookup[key.col_ref.col_idx] orelse return false;
-            const col = batch.cols[pos];
-            if (col.nullInfo().max_rep != 0 or !axis.sameDictionary(col, trans)) return false;
-            const codes = col.codes() orelse return false;
-            const ni = col.nullInfo();
-            if (codes.len < batch.num_rows) return error.BadColumn;
-            if (ni.def_levels) |dl| if (dl.len < batch.num_rows) return error.BadColumn;
-            b.* = .{ .codes = codes, .trans = trans, .ni = ni, .stride = stride };
-            stride *= axis.ids();
-        }
+        if (!try l.domain.bind(keys, file, rg, batch, lookup, bindings)) return false;
         try l.ensure(gpa);
         if (l.counts32.len != 0) {
             try l.foldProduct(u32, l.counts32, bindings, pos_base, batch.num_rows, sel);
@@ -322,34 +357,16 @@ pub const Lanes = struct {
         sel: *const Sel,
     ) !void {
         if (axes.len == 2 and axes[0].ni.def_levels == null and axes[1].ni.def_levels == null)
-            return l.foldPair(T, counts, axes[0], axes[1], base, rows, sel);
-        var bad = false;
-        agg_coded.forEachActive(sel, rows, struct {
-            fn row(c: anytype, r: usize) void {
-                var id: usize = 0;
-                for (c.axes) |axis| {
-                    const is_null = if (axis.ni.def_levels) |dl| dl[r] < axis.ni.max_def else false;
-                    const code = if (is_null) axis.trans.len - 1 else axis.codes[r];
-                    if (!is_null and code >= axis.trans.len - 1) {
-                        c.bad.* = true;
-                        return;
-                    }
-                    id += axis.trans[code] * axis.stride;
-                }
-                c.counts[id] += 1;
-                c.first[id] = @min(c.first[id], c.base + r);
-            }
-        }.row, .{ .axes = axes, .counts = counts, .first = l.first, .base = base, .bad = &bad });
-        if (bad) return error.BadColumn;
+            return l.foldProductRows(T, counts, axes[0..2].*, false, base, rows, sel);
+        return l.foldProductRows(T, counts, axes, true, base, rows, sel);
     }
 
-    // Bind the two present code streams once; the general product walks a runtime axis slice for every row.
-    fn foldPair(
+    fn foldProductRows(
         l: *Lanes,
         comptime T: type,
         counts: []T,
-        left: CountAxis,
-        right: CountAxis,
+        axes: anytype,
+        comptime nullable: bool,
         base: u64,
         rows: usize,
         sel: *const Sel,
@@ -357,17 +374,14 @@ pub const Lanes = struct {
         var bad = false;
         agg_coded.forEachActive(sel, rows, struct {
             fn row(c: anytype, r: usize) void {
-                const x = c.left.codes[r];
-                const y = c.right.codes[r];
-                if (x >= c.left.trans.len - 1 or y >= c.right.trans.len - 1) {
+                const id = productId(c.axes, r, nullable) catch {
                     c.bad.* = true;
                     return;
-                }
-                const id = c.left.trans[x] * c.left.stride + c.right.trans[y] * c.right.stride;
+                };
                 c.counts[id] += 1;
                 c.first[id] = @min(c.first[id], c.base + r);
             }
-        }.row, .{ .left = left, .right = right, .counts = counts, .first = l.first, .base = base, .bad = &bad });
+        }.row, .{ .axes = axes, .counts = counts, .first = l.first, .base = base, .bad = &bad });
         if (bad) return error.BadColumn;
     }
 
@@ -853,7 +867,7 @@ test "dense present pairs validate selected codes at tail words for both count w
     for (&codes, 0..) |*code, r| code.* = @intCast(r % 2);
     codes[128] = std.math.maxInt(u32);
     const trans = [_]u32{ 0, 1, 2 };
-    const left: Lanes.CountAxis = .{
+    const left: CountAxis = .{
         .codes = &codes,
         .trans = &trans,
         .ni = .{ .def_levels = null, .max_def = 0, .max_rep = 0 },
@@ -861,7 +875,7 @@ test "dense present pairs validate selected codes at tail words for both count w
     };
     var right = left;
     right.stride = 3;
-    const axes = [_]Lanes.CountAxis{ left, right };
+    const axes = [_]CountAxis{ left, right };
     var sel = try Sel.init(a, codes.len);
     defer sel.deinit();
     sel.set(128, false);
@@ -1033,4 +1047,27 @@ fn testCountProductMode(a: std.mem.Allocator, nullable: bool) !void {
     var all = try Sel.init(ra, 129);
     try testing.expect(!try declined.foldKeys(ra, a, &keys, 0, 1, 0, &batch, &.{ 0, 1 }, &all));
     try testing.expectEqual(@as(usize, 0), declined.first.len);
+}
+
+test "packed identities check product overflow and distinguish NULL from every code" {
+    var values = [_]u64{ 0, 1 };
+    const axis: Axis = .{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 };
+    var axes: [41]Axis = @splat(axis);
+    var domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    try std.testing.expect(domain.packedIds() == null);
+    domain.axes = axes[0..2];
+    try std.testing.expectEqual(@as(?usize, 9), domain.packedIds());
+    const trans = [_]u32{ 1, 0, 2 };
+    const codes = [_]u32{ 0, 1, std.math.maxInt(u32) };
+    const defs = [_]u32{ 1, 1, 0 };
+    const bindings = [_]CountAxis{.{
+        .codes = &codes,
+        .trans = &trans,
+        .ni = .{ .def_levels = &defs, .max_def = 1, .max_rep = 0 },
+        .stride = 1,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try productId(bindings, 0, true));
+    try std.testing.expectEqual(@as(usize, 0), try productId(bindings, 1, true));
+    try std.testing.expectEqual(@as(usize, 2), try productId(bindings, 2, true));
+    try std.testing.expectError(error.BadColumn, productId(bindings, 2, false));
 }

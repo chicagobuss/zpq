@@ -3094,11 +3094,40 @@ pub const AggRowGroup = struct {
     preserve: ?[]const bool = null,
 };
 
+pub const PackedCount = struct {
+    pub const Source = struct { file: usize, rg: usize };
+
+    domain: *const agg_dense.Domain,
+    keys: []const expr_ast.Expr,
+    sources: []const Source,
+    bindings: []agg_dense.CountAxis,
+    refused: *std.atomic.Value(bool),
+};
+
+pub const IntegerCountSink = struct {
+    local: *owner_groups.IntCountTop.Local,
+    packing: ?*PackedCount = null,
+
+    fn batch(s: IntegerCountSink, view: filter_eval.Batch, lookup: []const ?usize, offset: usize) !void {
+        const p = s.packing orelse return s.local.batch(view, lookup, offset);
+        if (p.refused.load(.monotonic)) return;
+        const source = p.sources[s.local.run_item];
+        if (!try p.domain.bind(p.keys, source.file, source.rg, &view, lookup, p.bindings)) {
+            p.refused.store(true, .monotonic);
+            return;
+        }
+        for (0..view.num_rows) |r| {
+            const id = try agg_dense.productId(p.bindings, r, true);
+            try s.local.append(@bitCast(@as(u64, @intCast(id))), {}, s.local.ordinal_base + @as(u32, @intCast(offset + r)));
+        }
+    }
+};
+
 /// The owned-record layouts share worker startup and decoded-batch routing.
 pub const RecordSink = union(enum) {
     integer: *owner_groups.IntFull.Local,
     integer_top: *owner_groups.IntSumTop.Local,
-    integer_count_top: *owner_groups.IntCountTop.Local,
+    integer_count_top: IntegerCountSink,
     bytes: *owner_groups.Full.Local,
     byte_top: *owner_groups.SumTop.Local,
     byte_count_top: *owner_groups.CountTop.Local,
@@ -3107,6 +3136,7 @@ pub const RecordSink = union(enum) {
     pub fn start(s: RecordSink, ordinal_base: u32, item: usize) void {
         switch (s) {
             .msd => |local| local.start(ordinal_base, item),
+            .integer_count_top => |s0| s0.local.start(ordinal_base, item),
             inline else => |local| local.start(ordinal_base, item),
         }
     }
@@ -3136,6 +3166,7 @@ pub const RecordSink = union(enum) {
 
     fn batch(s: RecordSink, view: filter_eval.Batch, lookup: []const ?usize, offset: usize) !void {
         switch (s) {
+            .integer_count_top => |s0| try s0.batch(view, lookup, offset),
             inline else => |local| try local.batch(view, lookup, offset),
         }
     }
@@ -3186,6 +3217,12 @@ pub const AggTarget = union(enum) {
     }
 
     fn codedKey(self: AggTarget, ci: usize) bool {
+        if (self == .grouped) if (self.grouped.records) |r| {
+            if (r.* == .integer_count_top and r.integer_count_top.packing != null)
+                for (r.integer_count_top.packing.?.keys) |key| {
+                    if (key.col_ref.col_idx == ci) return true;
+                };
+        };
         // The ordinary multi-aggregate consumer can fold dictionary products too. Keeping the original codes
         // avoids expanding strings only to intern them again; the row fallback materializes only if it needs to.
         if (self == .grouped and (self.grouped.dense != null or self.grouped.records == null)) {

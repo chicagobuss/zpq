@@ -4279,6 +4279,43 @@ fn prepareAggregateWithMetas(
         };
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
+    plan_inputs.ndv_stat = ndv_stat;
+    var scan_plan = planAggregate(plan_inputs);
+    var packed_record_path: ?RecordAdmission = null;
+    // Keep the established small-domain table/dense choice; owners replace a multi-pass count cut.
+    if (plan_inputs.readers or scan_plan.dispatch.strategy == .sketch) if (domain) |*d| {
+        if (explain) {
+            packed_record_path = try inlinePackedAnswer(
+                gpa,
+                arena,
+                args,
+                metas,
+                &plan,
+                work_items.items,
+                agg_calls,
+                group_by_keys,
+                group_outputs,
+                d,
+                n_workers,
+                t,
+                true,
+            );
+        } else if (try inlinePackedAnswer(
+            gpa,
+            arena,
+            args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            d,
+            n_workers,
+            t,
+            false,
+        )) |answer| return answer;
+    };
     var msd_args = args;
     msd_args.msd_records = msd_probe != null;
     // Low-NDV composite keys benefit from reducing rows directly. This existing bound only declines a layout.
@@ -4294,8 +4331,6 @@ fn prepareAggregateWithMetas(
         error.OutOfMemory, error.RetainedEncodingUnsupported, error.RetainedOwnershipViolation => return error.ExceededMemoryBudget,
         else => return e,
     }) |result| return result;
-    plan_inputs.ndv_stat = ndv_stat;
-    var scan_plan = planAggregate(plan_inputs);
     if (scan_plan.wants_sample) {
         const options: consumer.DecodeOptions = .{
             .fast_levels = args.fast_levels,
@@ -4322,7 +4357,7 @@ fn prepareAggregateWithMetas(
     else
         null;
     if (explain) {
-        const record_path = try inlineDistinctAnswer(
+        const record_path = packed_record_path orelse try inlineDistinctAnswer(
             gpa,
             arena,
             args,
@@ -6152,7 +6187,7 @@ fn inlineDistinctAnswer(
             if (args.taken) |taken| taken.insert(.integer_records);
             const sinks = try arena.alloc(consumer.RecordSink, n_workers);
             for (sinks, state.locals) |*sink, *local|
-                sink.* = if (c == .int64) .{ .integer_count_top = local } else .{ .byte_count_top = local };
+                sink.* = if (c == .int64) .{ .integer_count_top = .{ .local = local } } else .{ .byte_count_top = local };
             var decoded = args;
             decoded.decode_batch_rows = batch_rows;
             const t = runRecordWorkers(
@@ -6203,6 +6238,186 @@ fn inlineDistinctAnswer(
             };
         },
     }
+}
+
+/// Retained value-equal axes form a complete tuple identity inside the existing integer COUNT owner.
+fn inlinePackedAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    domain: *const agg_dense.Domain,
+    n_workers: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const order = args.result_order;
+    if (!args.integer_records or !args.encoded or !allRescannable(args.inputs) or
+        args.filter != null or calls.len != 1 or
+        order.having != null or order.hidden.len != 0 or order.keys.len != 1 or !order.keys[0].descending)
+        return null;
+    const keys = keys_opt orelse return null;
+    const outputs = outputs_opt orelse return null;
+    if (keys.len < 2 or keys.len != domain.axes.len or domain.packedIds() == null) return null;
+    const call = calls[0];
+    if (call.func != .count or call.arg != null or call.where != null or call.offset != 0 or call.state or
+        call.result != .i64) return null;
+    for (outputs) |out| if (out.derived != null) return null;
+    const ranked = outputs[order.keys[0].column].source;
+    if (ranked != .agg or ranked.agg != 0) return null;
+    const limit = order.limit orelse return null;
+    const k = std.math.cast(usize, order.offset +| limit) orelse return null;
+    if (limit == 0 or k == 0 or k > 1024) return null;
+    var rows: usize = 0;
+    for (work) |item| {
+        const n = std.math.cast(usize, metas[item.file].row_groups.items[item.rg].num_rows) orelse return null;
+        rows = std.math.add(usize, rows, n) catch return null;
+    }
+    if (rows == 0 or rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows)) return null;
+    const Owner = owner_groups.IntCountTop;
+    const parts = Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
+    var key_credit: usize = 0;
+    for (outputs) |out| if (out.source == .key) switch (domain.axes[out.source.key].values) {
+        .bytes => |values| {
+            var widest: usize = 0;
+            for (values) |value| widest = @max(widest, value.len);
+            key_credit +|= widest;
+        },
+        else => {},
+    };
+    const out_credit = k *| (@sizeOf([]const AggValue) +| outputs.len *| @sizeOf(AggValue) +| key_credit);
+    const scratch = n_workers *| (keys.len *| @sizeOf(agg_dense.CountAxis) +| @sizeOf(consumer.PackedCount)) +|
+        work.len *| (@sizeOf(consumer.PackedCount.Source) +| @sizeOf(u32));
+    const credit = domain.bytes +| scratch +| out_credit;
+    const quote = Owner.State.reservation(rows, n_workers, parts, k, credit);
+    if (quote > args.max_memory) return null;
+    if (explain_only) return .{ .layout = .integer_count_top_h, .reservation = quote };
+    const state = (try Owner.State.init(
+        gpa,
+        args.ledger,
+        rows,
+        n_workers,
+        keys[0].col_ref.col_idx,
+        0,
+        .{ .k = k, .descending = true },
+        parts,
+        credit,
+    )) orelse return null;
+    defer state.deinit();
+    const sources = try arena.alloc(consumer.PackedCount.Source, work.len);
+    const starts = try arena.alloc(u32, work.len);
+    var at: usize = 0;
+    for (sources, starts, work) |*source, *start, item| {
+        source.* = .{ .file = item.file, .rg = item.rg };
+        start.* = @intCast(at);
+        at += @intCast(metas[item.file].row_groups.items[item.rg].num_rows);
+    }
+    var refused: std.atomic.Value(bool) = .init(false);
+    const sinks = try arena.alloc(consumer.RecordSink, n_workers);
+    const packings = try arena.alloc(consumer.PackedCount, n_workers);
+    for (sinks, packings, state.locals) |*sink, *packing, *local| {
+        packing.* = .{
+            .domain = domain,
+            .keys = keys,
+            .sources = sources,
+            .bindings = try arena.alloc(agg_dense.CountAxis, keys.len),
+            .refused = &refused,
+        };
+        sink.* = .{ .integer_count_top = .{ .local = local, .packing = packing } };
+    }
+    if (args.taken) |taken| taken.insert(.integer_records);
+    const t = try runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, outputs, timings);
+    // A late PLAIN/mismatched page leaves only private records. Joined workers have released their source pages;
+    // the established narrowing chain disables this attempt and rewinds stable mappings before exact fallback.
+    if (refused.load(.monotonic)) return error.ExceededMemoryBudget;
+    const prof = profile.threadOf(args.profiler, .main);
+    const finish_start = nowMonoNs();
+    try state.finish();
+    const scatter_end = finish_start + @as(i64, @intCast(state.partition_ns));
+    const fold_end = scatter_end + @as(i64, @intCast(state.fold_ns));
+    profile.record(prof, .integer_scatter, finish_start, scatter_end, profile.args(.{}));
+    profile.record(prof, .integer_fold, scatter_end, fold_end, profile.args(.{}));
+    profile.record(prof, .integer_order, fold_end, nowMonoNs(), profile.args(.{}));
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    const types = try arena.alloc(GroupColType, outputs.len);
+    for (outputs, names, types) |out, *name, *ty| {
+        name.* = try gpa.dupe(u8, out.name);
+        ty.* = switch (out.source) {
+            .key => |ki| .{
+                .lane = if (keys[ki].col_ref.expr_type == .str) .string else .i64,
+                .nullable = true,
+                .source = leafSchemaElem(&metas[0], keys[ki].col_ref.col_idx),
+            },
+            .agg => .{ .lane = .i64, .nullable = false },
+        };
+    }
+    const kept = state.top();
+    const out_rows = try gpa.alloc([]const AggValue, kept.len);
+    @memset(out_rows, &.{});
+    output.group_rows = out_rows;
+    const slab = try gpa.alloc(AggValue, kept.len * outputs.len);
+    @memset(slab, .null_val);
+    output.slab = slab;
+    const indices = try arena.alloc(usize, keys.len);
+    var held = kept.len * (@sizeOf([]const AggValue) + outputs.len * @sizeOf(AggValue));
+    for (kept, out_rows, 0..) |group, *row, ri| {
+        var rem: u64 = group.key;
+        for (domain.axes, indices) |*axis, *index| {
+            index.* = @intCast(rem % axis.ids());
+            rem /= axis.ids();
+        }
+        row.* = slab[ri * outputs.len ..][0..outputs.len];
+        for (outputs, slab[ri * outputs.len ..][0..outputs.len]) |out, *cell| switch (out.source) {
+            .agg => cell.* = .{ .i = group.countValue() },
+            .key => |ki| {
+                const axis = &domain.axes[ki];
+                const id = indices[ki];
+                if (id == axis.len()) continue;
+                cell.* = switch (axis.values) {
+                    .bytes => |values| b: {
+                        const copy = try gpa.dupe(u8, values[id]);
+                        held += copy.len;
+                        break :b .{ .s = copy };
+                    },
+                    .int32 => |values| .{ .i = if (keys[ki].col_ref.unsigned_32)
+                        @as(u32, @truncate(values[id]))
+                    else
+                        @as(i64, @bitCast(values[id])) },
+                    .int64 => |values| .{ .i = if (keys[ki].col_ref.unsigned_64)
+                        @as(i128, values[id])
+                    else
+                        @as(i64, @bitCast(values[id])) },
+                };
+            },
+        };
+    }
+    if (args.ledger != null) state.charged -= @min(state.charged, held);
+    var bytes_in: u64 = 0;
+    for (args.inputs) |input| bytes_in += if (input.logical_size != 0) input.logical_size else input.bytes.len;
+    return .{
+        .files_in = args.inputs.len,
+        .rows_in = @intCast(rows),
+        .rows_scanned = @intCast(rows),
+        .rows_matched = @intCast(rows),
+        .bytes_in = bytes_in,
+        .row_groups_in = work.len,
+        .row_groups_pruned = 0,
+        .row_groups_full_match = work.len,
+        .cols_stat_pruned = plan.cols_stat_pruned,
+        .timings = t,
+        .output = output,
+        .part_agg = true,
+        .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
+    };
 }
 
 fn inlineIntegerAnswer(
@@ -6514,7 +6729,7 @@ fn runIntegerOwner(
     for (sinks, state.locals) |*sink, *local| sink.* = switch (kind) {
         .full => .{ .integer = local },
         .sum_top => .{ .integer_top = local },
-        .count_top => .{ .integer_count_top = local },
+        .count_top => .{ .integer_count_top = .{ .local = local } },
     };
     const t = try runRecordWorkers(gpa, arena, args.*, metas, plan, work, calls, keys, sinks, starts, outputs, timings);
     const prof = profile.threadOf(args.profiler, .main);
@@ -20942,6 +21157,179 @@ test "duplicate integer counts keep levels-only rows through releasing readers" 
                 try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
                 try testing.expectEqual(@as(usize, 0), window.abandoned);
             };
+        }
+    }
+}
+
+fn packedAllocationTrial(gpa: std.mem.Allocator, base: MultiAggArgs, expected: []const []const AggValue) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const bytes = base.inputs[0].bytes;
+    var window: ReleasingScanWindow = .{
+        .bytes = try arena.allocator().dupe(u8, bytes),
+        .meta = &base.metas.?[0],
+    };
+    const Probe = struct {
+        fn add(_: *anyopaque, _: usize, _: usize, _: u64, _: u64) anyerror!void {}
+    };
+    var input = window.input(bytes);
+    input.dict_wait = .{ .ctx = &window, .wait = ReleasingScanWindow.wait };
+    var args = base;
+    args.inputs = (&input)[0..1];
+    args.dict_probe = .{ .ctx = &window, .add = Probe.add };
+    args.start_reads = .{ .ctx = &window, .start = ReleasingScanWindow.start, .abandon = ReleasingScanWindow.abandon };
+    var got = try runMultiAggregate(gpa, arena.allocator(), args);
+    defer got.deinit(gpa);
+    try got.output.applyResultOrder(gpa, args.result_order);
+    try testing.expectEqualDeep(expected, got.output.group_rows.?);
+}
+
+test "packed composite count survives releasing windows and late dictionary refusal" {
+    const gpa = testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    const empty = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+        .{ .name = "b", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = &.{} } } },
+        .{ .name = "f", .parquet_type = .INT32, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+    };
+    for (0..16) |rg| {
+        var k: [257]i64 = undefined;
+        var b: [257][]const u8 = undefined;
+        var f: [257]i64 = undefined;
+        var kd: [257]u32 = undefined;
+        var bd: [257]u32 = undefined;
+        var fd: [257]u32 = undefined;
+        for (0..257) |r| {
+            k[r] = switch ((r + rg) % 7) {
+                0 => std.math.minInt(i64),
+                1 => std.math.maxInt(i64),
+                else => @as(i64, @intCast((r + rg) % 7)) - 5,
+            };
+            b[r] = switch ((r + rg) % 3) {
+                0 => "",
+                1 => "a\x00b",
+                else => "last",
+            };
+            f[r] = @as(i64, @intCast((r * 3 + rg) % 5)) - 3;
+            kd[r] = @intFromBool(r % 17 != 0);
+            bd[r] = @intFromBool(r % 19 != 0);
+            fd[r] = @intFromBool(r % 23 != 0);
+        }
+        var cols = empty;
+        cols[0].col = .{ .i64 = .{ .values = &k, .def_levels = &kd, .max_def = 1 } };
+        cols[1].col = .{ .string = .{ .values = &b, .def_levels = &bd, .max_def = 1 } };
+        cols[2].col = .{ .i64 = .{ .values = &f, .def_levels = &fd, .max_def = 1 } };
+        try file.append(&cols, k.len, .UNCOMPRESSED, .{}, .{});
+    }
+    _ = try file.finish(&empty);
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    for (meta.row_groups.items) |*rg| for (rg.columns.items) |*c| {
+        c.meta_data.?.statistics = null;
+    };
+    const mapped = [_]Input{.{ .name = "packed.parquet", .bytes = bytes }};
+    const Reader = struct {
+        window: ReleasingScanWindow,
+        fault: bool,
+        changed: bool = false,
+        fn probe(_: *anyopaque, _: usize, _: usize, _: u64, _: u64) anyerror!void {}
+        fn ready(_: *anyopaque, _: usize) anyerror!void {}
+        fn start(_: *anyopaque) anyerror!void {}
+        fn planned(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.fault or self.changed) return;
+            self.changed = true;
+            // The union owns the original dictionary. A late reader page now has another valid value.
+            const cm = self.window.meta.row_groups.items[15].columns.items[0].meta_data.?;
+            const offset: usize = @intCast(cm.dictionary_page_offset.?);
+            var reader = thrift_mod.Reader.init(self.window.bytes[offset..]);
+            _ = schema.PageHeader.read(&reader) catch unreachable;
+            std.mem.writeInt(i64, self.window.bytes[offset + reader.pos ..][0..8], 987654321, .little);
+        }
+        fn abandon(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ReleasingScanWindow.abandon(&self.window);
+        }
+    };
+    for ([_][]const u8{ "k,f", "k,b,f" }, 0..) |keys, shape| {
+        var args: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = (&meta)[0..1],
+            .aggregate = "count(*) AS c",
+            .group_by = keys,
+            .integer_records = false,
+            .msd_records = false,
+            .byte_records = false,
+            .typed_answer = false,
+            .plain_rules = false,
+            .scan_all = true,
+            .min_bytes_per_worker = 1,
+            .max_memory = 256 << 20,
+            .sketch_topk = .{ .cell_bits = 10, .admit_per_row = 1 },
+            .result_order = .{ .keys = &.{.{ .column = shape + 2, .descending = true }}, .limit = 3, .offset = 2 },
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        for (1..17) |j| for ([_]usize{ 0, 64 }) |batch| for ([_]bool{ false, true }) |fault| {
+            var trial = std.heap.ArenaAllocator.init(gpa);
+            defer trial.deinit();
+            const ta = trial.allocator();
+            var reader: Reader = .{ .window = .{ .bytes = try ta.dupe(u8, bytes), .meta = &meta }, .fault = fault };
+            var input = reader.window.input(bytes);
+            input.dict_wait = .{ .ctx = &reader, .wait = Reader.ready };
+            args.inputs = (&input)[0..1];
+            args.parallelism = j;
+            args.decode_batch_rows = batch;
+            args.integer_records = true;
+            args.integer_records_min_rows = 0;
+            args.start_reads = .{
+                .ctx = &reader,
+                .start = Reader.start,
+                .planned = Reader.planned,
+                .abandon = Reader.abandon,
+            };
+            args.dict_probe = .{ .ctx = &reader, .add = Reader.probe };
+            const explanation = try explainAggregate(gpa, ta, args);
+            try testing.expect(explanation.record_path != null);
+            try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            if (fault) {
+                var got = try runMultiAggregate(gpa, ta, args);
+                defer got.deinit(gpa);
+                try got.output.applyResultOrder(gpa, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            } else {
+                if (j == 16) spawn_util.injectFailureAfter(if (batch == 0) 0 else 3);
+                defer spawn_util.resetFailure();
+                var got = try prepareAggregate(gpa, ta, args, false);
+                defer got.deinit(gpa);
+                try testing.expect(taken.contains(.integer_records));
+                if (j == 16) try testing.expect(spawn_util.failuresInjected() > 0);
+                try got.output.applyResultOrder(gpa, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            }
+            try testing.expectEqual(@as(usize, 16), reader.window.releases.load(.monotonic));
+            try testing.expectEqual(@as(usize, @intFromBool(fault)), reader.window.abandoned);
+            try testing.expectEqual(fault, reader.changed);
+        };
+        if (shape == 1) {
+            args.inputs = &mapped;
+            args.start_reads = null;
+            args.dict_probe = null;
+            args.taken = null;
+            args.parallelism = 1;
+            args.decode_batch_rows = 64;
+            var fixed: NoInPlaceResize = .{ .child = gpa };
+            try testing.checkAllAllocationFailures(fixed.allocator(), packedAllocationTrial, .{
+                args, want.output.group_rows.?,
+            });
         }
     }
 }

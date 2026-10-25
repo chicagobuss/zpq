@@ -112,7 +112,7 @@ def canon(v: Any, lane: Optional[str] = None) -> Any:
     if isinstance(n, float):
         r = float(f"{n:.{FLOAT_DIGITS}g}")
         return int(r) if r.is_integer() and abs(r) < 2**53 else r
-    if isinstance(n, decimal.Decimal) and lane is None:
+    if isinstance(n, decimal.Decimal) and lane != F64:
         # normalize() otherwise rounds DECIMAL(38, s) to the ambient 28 digits.
         with decimal.localcontext() as context:
             context.prec = max(context.prec, len(n.as_tuple().digits))

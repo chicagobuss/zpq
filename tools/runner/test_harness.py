@@ -36,6 +36,26 @@ class DecimalTest(unittest.TestCase):
                          Decimal("12345678901234567890123456789.01"))
 
 
+class RowAdapterTest(unittest.TestCase):
+    def test_unordered_rows_normalize_decimal_scale_before_sorting(self):
+        args = argparse.Namespace(zpq="unused")
+        got = [{"d": Decimal("1.10"), "k": "b"}, {"d": Decimal("1.1"), "k": "a"}]
+        want = [(Decimal("1.1"), "b"), (Decimal("1.10"), "a")]
+        with patch.object(answer_cmp, "load_zpq", return_value=got), \
+                patch.object(answer_cmp, "duck_rows", return_value=(want, ["d", "k"], ["exact", None])):
+            answer_cmp.cmd_usame(args)
+
+    def test_dense_rows_follow_oracle_column_names(self):
+        args = argparse.Namespace(zpq="unused")
+        with patch.object(answer_cmp, "load_zpq", return_value=[{"b": 2, "a": 1}]), \
+                patch.object(answer_cmp, "duck_rows", return_value=([(1, 2)], ["a", "b"], [None, None])):
+            answer_cmp.cmd_dense(args)
+
+    def test_exact_decimal_scale_has_one_canonical_representation(self):
+        self.assertEqual(repr(answer_cmp.canon(Decimal("1.10"), "exact")),
+                         repr(answer_cmp.canon(Decimal("1.1"), "exact")))
+
+
 class RefereeTest(unittest.TestCase):
     def run_cases(self, case, records=(), limit=None):
         with tempfile.TemporaryDirectory() as tmp:

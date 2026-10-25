@@ -50,6 +50,23 @@ def judge(cmd: stages.Cmd, rc: int, text: str) -> tuple[str, dict]:
     if cmd.parse in (stages.parse_referee, stages.parse_cli_tier):
         if not counts.get("total") or counts.get("matched") != counts.get("total"):
             return "fail", counts
+    if cmd.parse is stages.parse_tests:
+        total, skipped = counts.get("total", 0), counts.get("skipped", 0)
+        if total <= 0 or counts.get("passed", -1) + skipped != total:
+            return "fail", counts
+        details = counts.get("skip_details", [])
+        counts["expected_skip_budget"] = len(cmd.expected_skips)
+        seen = set()
+        for item in details:
+            name = item["test"]
+            if name in seen or name not in cmd.expected_skips:
+                counts["unexpected_skip"] = name
+                return "blocked", counts
+            seen.add(name)
+            item["reason"] = cmd.expected_skips[name]
+        if len(details) != skipped:
+            counts["skip_accounting_error"] = "runner did not name every skipped test"
+            return "blocked", counts
     if cmd.expect == "refusal":
         declared = rc == cmd.expect_rc and cmd.expect_text in text
         return ("expected" if declared else "fail"), counts
@@ -162,7 +179,7 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
                 ],
             ),
             ("differential", stages.referee_argv(ctx)),
-            ("unit", [ctx.zigw, "build", "test", "--summary", "line", f"-j{ctx.j}"]),
+            ("unit", stages.describe("test-full", ctx).argv),
             (
                 "fuzz",
                 [
@@ -181,11 +198,13 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
             log_path = ctx.run_dir / "logs" / f"soak-r{done}-{name}.log"
             print(f"== soak round {done} {name} seed={seed}", flush=True)
             rc, duration = launch(argv, stages._base_env(ctx), ctx.repo, log_path, heavy)
-            counts = stages.parse_referee(log_path.read_text()) if name == "differential" else {}
-            book.add_stage({"name": f"soak-r{done}-{name}", "status": "pass" if rc == 0 else "fail",
+            command = stages.describe("test-full", ctx) if name == "unit" else stages.Cmd(
+                argv, {}, name, parse=stages.parse_referee if name == "differential" else None)
+            status, counts = judge(command, rc, log_path.read_text())
+            book.add_stage({"name": f"soak-r{done}-{name}", "status": status,
                             "rc": rc, "duration_s": round(duration, 1), "log": str(log_path),
                             "counts": counts, "round": done, "seed": seed, "command": argv})
-            if rc != 0:
+            if status != "pass":
                 failures += 1
                 shutil.copy(log_path, fail_dir / f"r{done}-{name}-{seed}.log")
             print(f"soak {name} rc={rc} {duration:.0f}s", flush=True)

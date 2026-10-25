@@ -20,7 +20,8 @@ command. A reference must have the same engine revision and manifest hash.
 Zpq receives the scorecard SQL unchanged except source substitution; the two
 write cases use the scorecard's original native CLI arguments. No ORDER BY or
 tie-break is added. Rival top-k answers are checked against full grouped truth,
-allowing equal-count ties. Numeric tolerance applies only to rival comparisons.
+allowing equal-count ties. Rival schemas select comparison lanes: integers and decimals compare exactly,
+text compares as bytes, and tolerance applies only to FLOAT/DOUBLE columns.
 ClickBench binary keys are decoded only for rival comparisons. Raw zpq hashes
 remain untouched.
 

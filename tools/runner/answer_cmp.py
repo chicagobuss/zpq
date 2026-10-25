@@ -169,7 +169,6 @@ def cmd_rows(args):
     if args.parquet:
         import pyarrow.parquet as pq
 
-        pq.read_table(args.parquet)
         written = argparse.Namespace(**vars(args))
         written.sql = f"SELECT * FROM '{args.parquet}'"
         written.mean_scale = None
@@ -319,7 +318,6 @@ def cmd_stats_select(args):
     want_rows, names, _ = duck_rows(typed)
     want = sorted((tuple(row) for row in want_rows), key=repr)
     if args.parquet:
-        pq.read_table(args.parquet)
         raw = pq.read_table(args.zpq).to_pylist()
     else:
         raw = load_rows(args.zpq)
@@ -489,7 +487,6 @@ def cmd_wire(args):
     if check == "duck":
         got = sorted(wire_rows(args, f"SELECT {select} FROM '{out}'", cols, types), key=repr)
     else:
-        pq.read_table(out)
         got = sorted(
             (tuple(wire_pa_cell(row[col]) for col in cols) for row in pq.read_table(out).to_pylist()),
             key=repr,
@@ -530,8 +527,8 @@ def cmd_dense(args):
     zraw = load_zpq(args.zpq)
     if isinstance(zraw, dict):
         zraw = [zraw]
-    got = sorted((tuple(row.values()) for row in zraw), key=nulls_first)
-    drows, _, _ = duck_rows(args)
+    drows, names, _ = duck_rows(args)
+    got = sorted((tuple(row[name] for name in names) for row in zraw), key=nulls_first)
     want = sorted((tuple(row) for row in drows), key=nulls_first)
     if got != want:
         raise SystemExit(f"duckdb differs: zpq={got[:2]} duck={want[:2]}")
@@ -542,8 +539,8 @@ def cmd_usame(args):
     if isinstance(zraw, dict):
         zraw = [zraw]
     drows, names, lanes = duck_rows(args)
-    got = sorted((tuple(from_zpq([row[c] for c in names], lanes)) for row in zraw), key=repr)
-    want = sorted((tuple(row) for row in drows), key=repr)
+    got = canon_rows([from_zpq([row[c] for c in names], lanes) for row in zraw], lanes)
+    want = canon_rows(drows, lanes)
     if len(got) != len(want) or not all(same(g, w) for gr, wr in zip(got, want) for g, w in zip(gr, wr)):
         raise SystemExit(f"zpq={got[:2]} duck={want[:2]}")
 

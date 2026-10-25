@@ -266,14 +266,19 @@ const Runner = struct {
             const parsed = try std.json.parseFromSlice(std.json.Value, self.a, try self.duck(sql), .{});
             return !parsed.value.array.items[0].object.get("bad").?.bool;
         }
+        const description = try std.json.parseFromSlice(std.json.Value, self.a, try self.duck(try self.text("DESCRIBE {s}", .{try self.caseSql(c)})), .{});
+        const types = description.value.array.items;
         const zrows = try parseRows(self.a, try self.read(zpath), true);
         const rrows = try parseRows(self.a, try self.read(output), false);
+        try typeRows(zrows, types);
+        try typeRows(rrows, types);
         if (c.blob_keys and eql(engine, "duckdb")) try decodeBlobRows(self.a, rrows);
         if (zrows.len != rrows.len) return false;
         if (eql(c.kind, "top")) {
             const original = try self.caseSql(c);
             const order = std.mem.indexOf(u8, original, " ORDER BY ") orelse return error.BadTopQuery;
             const truth = try parseRows(self.a, try self.duck(original[0..order]), false);
+            try typeRows(truth, types);
             if (c.blob_keys) try decodeBlobRows(self.a, truth);
             for ([_][]const []const std.json.Value{ zrows, rrows }) |answer_rows| {
                 for (answer_rows, 0..) |row, row_i| {
@@ -588,17 +593,45 @@ fn parseRows(a: A, text: []const u8, ndjson: bool) ![]const []const std.json.Val
     if (ndjson) {
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            const v = (try std.json.parseFromSlice(std.json.Value, a, line, .{})).value;
+            const v = (try std.json.parseFromSlice(std.json.Value, a, line, .{ .parse_numbers = false })).value;
             try rows.append(a, try a.dupe(std.json.Value, v.object.values()));
         }
     } else {
-        const v = (try std.json.parseFromSlice(std.json.Value, a, text, .{})).value;
+        const v = (try std.json.parseFromSlice(std.json.Value, a, text, .{ .parse_numbers = false })).value;
         for (v.array.items) |row| try rows.append(a, if (row == .object)
             try a.dupe(std.json.Value, row.object.values())
         else
             row.array.items);
     }
+    for (rows.items) |row| for (@constCast(row)) |*v| {
+        if (v.* == .number_string) {
+            if (std.fmt.parseInt(i64, v.number_string, 10)) |n| v.* = .{ .integer = n } else |_| {}
+        }
+    };
     return rows.toOwnedSlice(a);
+}
+fn typeRows(rows: []const []const std.json.Value, types: []const std.json.Value) !void {
+    for (rows) |row| {
+        if (row.len != types.len) return error.BadRowWidth;
+        for (@constCast(row), types) |*v, column| {
+            if (v.* == .null) continue;
+            const t = column.object.get("column_type").?.string;
+            const floating = eql(t, "DOUBLE") or eql(t, "FLOAT") or eql(t, "REAL");
+            const decimal = std.mem.startsWith(u8, t, "DECIMAL");
+            const integer = std.mem.endsWith(u8, t, "INT") or eql(t, "INTEGER") or eql(t, "UINTEGER");
+            const value = v.*;
+            if (floating) {
+                v.* = .{ .float = switch (value) {
+                    .integer => |n| @floatFromInt(n),
+                    .number_string, .string => |n| try std.fmt.parseFloat(f64, n),
+                    .float => |n| n,
+                    else => return error.BadNumericType,
+                } };
+            } else if ((decimal or integer) and v.* == .string) {
+                v.* = .{ .number_string = value.string };
+            }
+        }
+    }
 }
 fn decodeBlobRows(a: A, rows: []const []const std.json.Value) !void {
     for (rows) |row| {
@@ -620,20 +653,58 @@ fn decodeBlobRows(a: A, rows: []const []const std.json.Value) !void {
         }
     }
 }
-fn number(v: std.json.Value) ?f64 {
-    return switch (v) {
-        .integer => |x| @floatFromInt(x),
-        .float => |x| x,
-        .number_string, .string => |s| std.fmt.parseFloat(f64, s) catch null,
-        else => null,
-    };
-}
+const ExactNumber = struct {
+    coefficient: i256,
+    exponent: i32,
+
+    fn normalized(n: i256, e: i32) ExactNumber {
+        var coefficient = n;
+        var exponent = e;
+        if (coefficient == 0) return .{ .coefficient = 0, .exponent = 0 };
+        while (@rem(coefficient, 10) == 0) {
+            coefficient = @divTrunc(coefficient, 10);
+            exponent = std.math.add(i32, exponent, 1) catch return .{ .coefficient = n, .exponent = e };
+        }
+        return .{ .coefficient = coefficient, .exponent = exponent };
+    }
+    fn parse(v: std.json.Value) ?ExactNumber {
+        if (v == .integer) return normalized(v.integer, 0);
+        if (v != .number_string) return null;
+        const s = v.number_string;
+        const end = std.mem.indexOfAny(u8, s, "eE") orelse s.len;
+        var exponent: i32 = if (end < s.len) std.fmt.parseInt(i32, s[end + 1 ..], 10) catch return null else 0;
+        var coefficient: i256 = 0;
+        var fraction = false;
+        var digits: usize = 0;
+        for (s[0..end], 0..) |c, i| {
+            if (i == 0 and (c == '-' or c == '+')) continue;
+            if (c == '.' and !fraction) {
+                fraction = true;
+                continue;
+            }
+            if (c < '0' or c > '9') return null;
+            coefficient = std.math.mul(i256, coefficient, 10) catch return null;
+            coefficient = std.math.add(i256, coefficient, c - '0') catch return null;
+            if (fraction) exponent = std.math.sub(i32, exponent, 1) catch return null;
+            digits += 1;
+        }
+        if (digits == 0) return null;
+        if (s[0] == '-') coefficient = -coefficient;
+        return normalized(coefficient, exponent);
+    }
+};
 fn same(a: std.json.Value, b: std.json.Value, tolerance: f64) bool {
     if (a == .null or b == .null) return a == .null and b == .null;
-    if (number(a)) |x| if (number(b)) |y|
-        return x == y or @abs(x - y) <= tolerance * @max(1, @abs(x), @abs(y));
     if (a == .string and b == .string) return eql(a.string, b.string);
     if (a == .bool and b == .bool) return a.bool == b.bool;
+    if (a == .float and b == .float) {
+        const x = a.float;
+        const y = b.float;
+        return x == y or (std.math.isNan(x) and std.math.isNan(y)) or
+            (std.math.isFinite(x) and std.math.isFinite(y) and @abs(x - y) <= tolerance * @max(1, @abs(x), @abs(y)));
+    }
+    if (ExactNumber.parse(a)) |x| if (ExactNumber.parse(b)) |y|
+        return x.coefficient == y.coefficient and x.exponent == y.exponent;
     return false;
 }
 fn sameRow(a: []const std.json.Value, b: []const std.json.Value, tolerance: f64) bool {
@@ -657,7 +728,7 @@ test "raw JSON order is preserved and rival rows compare by values" {
     try std.testing.expect(!sameRow(z[1], d[0], 0));
 }
 test "numeric tolerance and medians" {
-    try std.testing.expect(same(.{ .float = 1.00001 }, .{ .string = "1.00002" }, 1e-4));
+    try std.testing.expect(same(.{ .float = 1.00001 }, .{ .float = 1.00002 }, 1e-4));
     try std.testing.expect(!same(.{ .integer = 1 }, .{ .integer = 2 }, 1e-9));
     try std.testing.expectEqual(@as(?f64, 2), median(&.{ 1, 2, 3 }));
     try std.testing.expectEqual(@as(?f64, 2.5), median(&.{ 1, 2, 3, 4 }));
@@ -694,4 +765,28 @@ test "budget stop reports actual reps and null for missing samples" {
     try std.testing.expectEqualStrings("wall time budget", q[0].timings.items[0].stop_reason);
     try std.testing.expectEqual(@as(?f64, null), q[0].timings.items[1].median_ms);
     try std.testing.expectEqual(@as(?f64, null), q[0].zpq_over_best_rival);
+}
+
+test "integer precision and text bytes cannot use numeric tolerance" {
+    try std.testing.expect(!same(.{ .integer = 9007199254740993 }, .{ .integer = 9007199254740992 }, 1e-4));
+    try std.testing.expect(!same(.{ .string = "01001" }, .{ .string = "1001" }, 1e-4));
+    try std.testing.expect(!same(.{ .number_string = "12345678901234567890123456789.01" }, .{ .number_string = "12345678901234567890123456789.02" }, 1e-4));
+    try std.testing.expect(same(.{ .number_string = "1.10" }, .{ .number_string = "1.1" }, 0));
+}
+
+test "schema preserves decimal tokens and restricts float tolerance to float columns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const types = (try std.json.parseFromSlice(std.json.Value, a, "[{\"column_type\":\"DECIMAL(38,2)\"},{\"column_type\":\"VARCHAR\"},{\"column_type\":\"DOUBLE\"}]", .{})).value.array.items;
+    const z = try parseRows(a, "{\"d\":12345678901234567890123456789.01,\"s\":\"01001\",\"f\":1.00001}\n", true);
+    const d = try parseRows(a, "[[\"12345678901234567890123456789.01\",\"01001\",1.00002]]", false);
+    try typeRows(z, types);
+    try typeRows(d, types);
+    try std.testing.expect(sameRow(z[0], d[0], 1e-4));
+    @constCast(d[0])[0] = .{ .number_string = "12345678901234567890123456789.02" };
+    try std.testing.expect(!sameRow(z[0], d[0], 1e-4));
+    @constCast(d[0])[0] = z[0][0];
+    @constCast(d[0])[1] = .{ .string = "1001" };
+    try std.testing.expect(!sameRow(z[0], d[0], 1e-4));
 }

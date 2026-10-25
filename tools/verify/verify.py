@@ -161,7 +161,7 @@ def open_run(args, tier: str, revision: str) -> tuple[Path, summary.Summary]:
 
 
 def _parameters(args) -> dict:
-    parameters = {}
+    parameters = {"expected_skip_budgets": stages.tier_skip_budgets(REPO)}
     base = getattr(args, "base", None)
     if base:
         parameters["base"] = str(Path(base).expanduser().resolve())

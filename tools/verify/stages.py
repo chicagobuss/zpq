@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -38,6 +39,7 @@ class Cmd:
     expect_rc: int = 1
     expect_text: str = ""
     parse: object | None = None
+    expected_skips: dict[str, str] = field(default_factory=dict)
 
 
 def _last(pattern, text):
@@ -52,8 +54,8 @@ def parse_tests(text):
     if not match:
         return {}
     counts = {"passed": int(match.group(1)), "total": int(match.group(2))}
-    if match.group(3):
-        counts["skipped"] = int(match.group(3))
+    counts["skipped"] = int(match.group(3) or 0)
+    counts["skip_details"] = [json.loads(m.group(1)) for m in re.finditer(r"ZPQ_TEST_SKIP (\{.*\})", text)]
     return counts
 
 
@@ -153,7 +155,7 @@ def _python(ctx: Ctx, script: str, about: str, *args, needs=(), parse=None) -> C
 
 
 def stage_test_core(ctx: Ctx) -> Cmd:
-    return Cmd(_zig_build(ctx, "test-core", "--summary", "all"), _base_env(ctx), "core unit tests", parse=parse_tests)
+    return Cmd(_zig_build(ctx, "test-core", "-Dobserve-tests=true", "--summary", "all"), _base_env(ctx), "core unit tests", parse=parse_tests)
 
 
 def stage_build_fast(ctx: Ctx) -> Cmd:
@@ -170,20 +172,17 @@ def stage_build_fast(ctx: Ctx) -> Cmd:
 
 
 def stage_test_full(ctx: Ctx) -> Cmd:
-    return Cmd(_zig_build(ctx, "test", "--summary", "all"), _base_env(ctx), "unit tests", parse=parse_tests)
+    return Cmd(_zig_build(ctx, "test", "-Dobserve-tests=true", "--summary", "all"), _base_env(ctx), "unit tests", parse=parse_tests)
 
 
 def stage_integration(ctx: Ctx) -> Cmd:
     return Cmd(
-        _zig_build(ctx, "test-integration", "--summary", "line"),
+        _zig_build(ctx, "test-integration", "-Dobserve-tests=true", "--summary", "line"),
         _base_env(ctx),
         "Lambda integration tests",
         parse=parse_tests,
     )
 
-
-def stage_differential(ctx: Ctx) -> Cmd:
-    return stage_referee(ctx)
 
 
 def stage_fd(ctx: Ctx) -> Cmd:
@@ -297,7 +296,7 @@ def stage_write_robustness(ctx: Ctx) -> Cmd:
 def stage_test_soak(ctx: Ctx) -> Cmd:
     shell = " && ".join(
         [
-            shlex.join(_zig_build(ctx, "test-soak", "--summary", "all")),
+            shlex.join(_zig_build(ctx, "test-soak", "-Dobserve-tests=true", "--summary", "all")),
             shlex.join(
                 _zig_build(
                     ctx,
@@ -408,7 +407,7 @@ REGISTRY = [
     ("cli-tier", ("commit", "full"), stage_cli_tier),
     ("test-full", ("full",), stage_test_full),
     ("integration", ("full",), stage_integration),
-    ("differential", ("commit", "full"), stage_differential),
+    ("differential", ("commit", "full"), stage_referee),
     ("fd", ("full",), stage_fd),
     ("canonical", ("full",), stage_canonical),
     ("cli-smoke", ("full",), stage_cli_smoke),
@@ -425,7 +424,6 @@ REGISTRY = [
     ("cross-aarch64-macos", ("full",), lambda ctx: _cross(ctx, "aarch64-macos", None)),
     ("cross-x86_64-macos", ("full",), lambda ctx: _cross(ctx, "x86_64-macos", None)),
     ("release-smoke", ("full",), stage_release_smoke),
-    ("referee", ("extra",), stage_referee),
     ("conform", ("extra",), stage_conform),
     ("triangulate", ("extra",), stage_triangulate),
 ]
@@ -436,6 +434,7 @@ def names_for(tier: str) -> list[str]:
 
 
 def get(name: str):
+    name = "differential" if name == "referee" else name
     for item in REGISTRY:
         if item[0] == name:
             return item
@@ -444,4 +443,25 @@ def get(name: str):
 
 def describe(name: str, ctx: Ctx) -> Cmd:
     _name, _tiers, builder = get(name)
-    return builder(ctx)
+    command = builder(ctx)
+    if command.parse is parse_tests:
+        command.expected_skips = skip_allowances(ctx.repo, name)
+    return command
+
+
+def skip_allowances(repo: Path, stage: str) -> dict[str, str]:
+    policy = json.loads((repo / "tools/verify/skip_policy.json").read_text())
+    allowed = {}
+    for waiver in policy["waivers"]:
+        if stage not in waiver["stages"] or not all(not (repo / p).exists() for p in waiver["missing"]):
+            continue
+        if waiver["test"] in allowed or not waiver["reason"] or not waiver["missing"]:
+            raise ValueError("invalid or duplicate skip waiver")
+        allowed[waiver["test"]] = waiver["reason"]
+    return allowed
+
+
+def tier_skip_budgets(repo: Path) -> dict:
+    policy = json.loads((repo / "tools/verify/skip_policy.json").read_text())
+    return {tier: {stage: len(skip_allowances(repo, stage)) for stage in names}
+            for tier, names in policy["tiers"].items()}

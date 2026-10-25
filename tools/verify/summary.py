@@ -37,6 +37,7 @@ class Summary:
             "failures": [],
             "expected": [],
             "blocked": [],
+            "skipped": {},
         }
         self.flush()
 
@@ -50,6 +51,8 @@ class Summary:
 
     def add_stage(self, record: dict) -> None:
         self.data["stages"].append(record)
+        if record.get("counts", {}).get("skipped"):
+            self.data["skipped"][record["name"]] = record["counts"]["skipped"]
         status = record["status"]
         name = record["name"]
         if status == "fail":

@@ -1,0 +1,61 @@
+{
+  "tiers": {
+    "quick": [
+      "test-core"
+    ],
+    "commit": [
+      "test-core"
+    ],
+    "full": [
+      "test-full",
+      "integration",
+      "test-soak"
+    ],
+    "soak": [
+      "test-full"
+    ],
+    "perf": []
+  },
+  "waivers": [
+    {
+      "test": "inspect.test.inspect reports a float chunk's NaN count, null when the writer left it out",
+      "stages": [
+        "test-full"
+      ],
+      "missing": [
+        "data/parquet-testing/data/floating_orders_nan_count.parquet"
+      ],
+      "reason": "Optional fixture data/parquet-testing/data/floating_orders_nan_count.parquet is absent; the test returns SkipZigTest before executing its assertions."
+    },
+    {
+      "test": "lambda_integration.test.lambda decodes int8 column from a real Parquet file",
+      "stages": [
+        "integration"
+      ],
+      "missing": [
+        "data/benchmark_100mb.parquet"
+      ],
+      "reason": "Optional fixture data/benchmark_100mb.parquet is absent; the test returns SkipZigTest before executing its assertions."
+    },
+    {
+      "test": "lambda_integration.test.lambda handles back-to-back invocations",
+      "stages": [
+        "integration"
+      ],
+      "missing": [
+        "data/benchmark_100mb.parquet"
+      ],
+      "reason": "Optional fixture data/benchmark_100mb.parquet is absent; the test returns SkipZigTest before executing its assertions."
+    },
+    {
+      "test": "lambda_integration.test.lambda aggregate over no rows answers NULL for sum/avg/min/max, 0 for count",
+      "stages": [
+        "integration"
+      ],
+      "missing": [
+        "data/parquet-testing/data/alltypes_plain.parquet"
+      ],
+      "reason": "Optional fixture data/parquet-testing/data/alltypes_plain.parquet is absent; the test returns SkipZigTest before executing its assertions."
+    }
+  ]
+}

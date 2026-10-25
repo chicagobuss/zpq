@@ -68,3 +68,11 @@ restores that profile before releasing the lock.
 
 The fixture-generator rewrite, generator deletion and broad directory moves
 remain separate work. Existing fixture generators and profiling tools stay.
+
+Test stages require a nonempty parsed result with passed + skipped = total.
+`skip_policy.json` declares each tier's budget through named, fixture-dependent
+allowances. `-Dobserve-tests=true` forwards the stock Zig protocol and records
+every skipped test. An unnamed or undeclared skip blocks the stage, even when
+the process exits 0. Summary counts retain each test and its reason, the active
+budget, and a top-level `skipped` map. Installing a missing fixture removes its
+allowance. Soak unit rounds use the same policy.

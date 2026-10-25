@@ -8,6 +8,7 @@ import io
 import json
 import sys
 import tempfile
+import struct
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -20,6 +21,7 @@ import scorecard_select
 import shipbar
 import stages
 import summary
+import test_observer
 import verify
 
 
@@ -59,6 +61,76 @@ class EnvironmentTest(unittest.TestCase):
         self.assertEqual(actual["installed"], required)
         self.assertEqual(actual["mismatches"], [])
         self.assertEqual(len(actual["requirements_sha256"]), 64)
+
+
+class TestStageAccountingTest(unittest.TestCase):
+    def test_empty_unparsed_or_incomplete_test_suites_fail(self):
+        cmd = stages.Cmd(["test"], {}, "test", parse=stages.parse_tests)
+        for text in ("", "0/0 tests passed", "2/5 tests passed (1 skipped)"):
+            with self.subTest(text=text):
+                self.assertEqual(execute.judge(cmd, 0, text)[0], "fail")
+        self.assertEqual(execute.judge(cmd, 0, "4/5 tests passed (1 skipped)")[0], "blocked")
+
+    def test_only_named_declared_skips_fit_the_budget(self):
+        cmd = stages.Cmd(["test"], {}, "test", parse=stages.parse_tests,
+                         expected_skips={"fixture test": "fixture absent"})
+        text = 'ZPQ_TEST_SKIP {"test":"fixture test","binary":"test"}\n4/5 tests passed (1 skipped)'
+        status, counts = execute.judge(cmd, 0, text)
+        self.assertEqual(status, "pass")
+        self.assertEqual(counts["expected_skip_budget"], 1)
+        self.assertEqual(counts["skip_details"][0]["reason"], "fixture absent")
+        self.assertEqual(execute.judge(cmd, 0, text.replace("fixture test", "unexpected"))[0], "blocked")
+        self.assertEqual(execute.judge(cmd, 0, "4/5 tests passed (1 skipped)")[0], "blocked")
+
+    def test_fixture_presence_removes_its_skip_allowance(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            policy = repo / "tools/verify/skip_policy.json"
+            policy.parent.mkdir(parents=True)
+            policy.write_text(json.dumps({"waivers": [{"test": "fixture test", "stages": ["test-full"],
+                "missing": ["fixture.parquet"], "reason": "optional fixture absent"}]}))
+            self.assertEqual(stages.skip_allowances(repo, "test-full"), {"fixture test": "optional fixture absent"})
+            (repo / "fixture.parquet").touch()
+            self.assertEqual(stages.skip_allowances(repo, "test-full"), {})
+
+    def test_soak_unit_round_uses_the_same_nonempty_accounting(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = verify.dummy_ctx()
+            ctx.run_dir = Path(d)
+            book = summary.Summary(ctx.run_dir, {"tier": "soak", "sha": "a"})
+
+            def launch(argv, env, cwd, log, heavy):
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text("0/0 tests passed" if "test" in argv else "referee: 1/1 checks match")
+                return 0, 0.1
+
+            with patch.object(execute, "run_stage", return_value={"name": "build-fast", "status": "pass"}), \
+                    patch.object(execute, "launch", side_effect=launch):
+                execute.run_soak(ctx, book, False, 1, 1)
+            self.assertIn("soak-r1-unit", book.data["failures"])
+            self.assertEqual(summary.exit_code(book), 1)
+
+    def test_skips_are_surfaced_even_in_blocked_stages(self):
+        with tempfile.TemporaryDirectory() as d:
+            book = summary.Summary(Path(d), {"tier": "full", "sha": "a"})
+            book.add_stage({"name": "test-full", "status": "blocked", "counts": {"skipped": 1}})
+            self.assertEqual(book.data["skipped"], {"test-full": 1})
+
+
+class ObserverTest(unittest.TestCase):
+    def test_protocol_is_forwarded_unchanged_and_skip_is_named(self):
+        name = b"fixture test\0"
+        metadata = struct.pack("<IIII", len(name), 1, 0, 0) + name
+        result = struct.pack("<IQ", 0, 2)
+        protocol = struct.pack("<II", 3, len(metadata)) + metadata + struct.pack("<II", 4, len(result)) + result
+        child = argparse.Namespace(stdout=io.BytesIO(protocol), wait=lambda: 0, poll=lambda: 0)
+        output, errors = io.BytesIO(), io.StringIO()
+        with patch.object(test_observer.subprocess, "Popen", return_value=child):
+            self.assertEqual(test_observer.observe(["test"], output, errors), 0)
+        self.assertEqual(output.getvalue(), protocol)
+        self.assertIn('"test": "fixture test"', errors.getvalue())
+        with self.assertRaises(EOFError):
+            test_observer.read_exact(io.BytesIO(b"short"), 8)
 
 
 class SummaryTest(unittest.TestCase):

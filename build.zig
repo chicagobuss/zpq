@@ -88,9 +88,10 @@ pub fn build(b: *std.Build) void {
     const referee_step = b.step("referee", "Build the in-process differential referee");
     referee_step.dependOn(&b.addInstallArtifact(referee, .{}).step);
 
+    const observe_tests = b.option(bool, "observe-tests", "Record named skips through the test protocol") orelse false;
     const cli_tests = b.addTest(.{ .root_module = cli_zpq.root });
     const test_cli_step = b.step("test-cli", "Run CLI inspection tests");
-    test_cli_step.dependOn(&b.addRunArtifact(cli_tests).step);
+    test_cli_step.dependOn(&observedTest(b, cli_tests, observe_tests).step);
 
     // ----- Lambda binary -----
     const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, sql, strip);
@@ -171,7 +172,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_zpq_mod,
         .filters = test_filters,
     });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
+    const run_lib_tests = observedTest(b, lib_tests, observe_tests);
 
     // Lambda binary tests (runtime.zig and anything else lambda-only).
     // Reuses the same zpq module so import paths match the production build.
@@ -190,10 +191,10 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const run_lambda_tests = b.addRunArtifact(lambda_tests);
+    const run_lambda_tests = observedTest(b, lambda_tests, observe_tests);
     // The shared JSON handler's own tests (src/service).
     const service_tests = b.addTest(.{ .root_module = test_service_mod, .filters = test_filters });
-    const run_service_tests = b.addRunArtifact(service_tests);
+    const run_service_tests = observedTest(b, service_tests, observe_tests);
 
     // The fuzz targets (`test "fuzz: ..."`) live in the core unit tests alone; `zig build fuzz --fuzz[=N]` searches
     // them without the other test binaries, which have none and so no coverage to report. LLVM-built: the coverage
@@ -208,7 +209,7 @@ pub fn build(b: *std.Build) void {
     const dev_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
     const dev_tests = b.addTest(.{ .root_module = dev_core.zpq, .filters = test_filters });
     const test_core_step = b.step("test-core", "Run the core unit tests only (src/zpq.zig and what it imports)");
-    test_core_step.dependOn(&b.addRunArtifact(dev_tests).step);
+    test_core_step.dependOn(&observedTest(b, dev_tests, observe_tests).step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(test_cli_step);
@@ -225,7 +226,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "service", .module = test_service_mod },
         },
     }), .filters = test_filters });
-    test_step.dependOn(&b.addRunArtifact(libzpq_tests).step);
+    test_step.dependOn(&observedTest(b, libzpq_tests, observe_tests).step);
 
     // Build the unit-test executables without running them, so a cross-compiled pair can be copied to and run on
     // the target (tools/macos_bundle.sh). Run them from the repo root (or a bundle mirroring it): fixtures are
@@ -246,7 +247,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_soak_tests = b.addRunArtifact(soak_tests);
+    const run_soak_tests = observedTest(b, soak_tests, observe_tests);
 
     const soak_step = b.step("test-soak", "Run opt-in soak/regression tests");
     soak_step.dependOn(&run_soak_tests.step);
@@ -274,7 +275,7 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
     integration_tests.step.dependOn(&lambda_install.step);
-    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const run_integration_tests = observedTest(b, integration_tests, observe_tests);
 
     const integration_step = b.step("test-integration", "Run Lambda integration tests");
     integration_step.dependOn(&run_integration_tests.step);
@@ -832,4 +833,15 @@ fn validPrerelease(pre: []const u8) bool {
         for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
     }
     return true;
+}
+
+fn observedTest(b: *std.Build, exe: *std.Build.Step.Compile, observe: bool) *std.Build.Step.Run {
+    const run = b.addRunArtifact(exe);
+    if (observe) {
+        run.has_side_effects = true; // Every gate needs current named test results, including skips.
+        run.addFileArg(b.path("tools/verify/test_observer.py"));
+        const observer = run.argv.pop().?;
+        run.argv.insert(b.allocator, 0, observer) catch @panic("out of memory");
+    }
+    return run;
 }

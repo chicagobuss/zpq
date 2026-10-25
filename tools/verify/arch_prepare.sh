@@ -20,12 +20,19 @@ mkdir -p "$output"
 sql_quote() { printf '%s' "$1" | sed "s/'/''/g"; }
 copy_subset() {
     local source=$1 name=$2 count=$3
-    "$duckdb" -no-agent -init /dev/null -c "SET threads=1; COPY (SELECT * FROM '$(sql_quote "$source")' LIMIT $count) TO '$(sql_quote "$output/$name.parquet")' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536);"
+    local source_sql sink_sql query
+    source_sql=$(sql_quote "$source")
+    sink_sql=$(sql_quote "$output/$name.parquet")
+    query="SET threads=1; COPY (SELECT * FROM '$source_sql' LIMIT $count) TO '$sink_sql'"
+    query+=" (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536);"
+    "$duckdb" -no-agent -init /dev/null -c "$query"
 }
 for name in card100k comp100k lstr100k; do copy_subset "$study/$name.parquet" "$name" 250000; done
 copy_subset "$lineitem" lineitem 500000
 copy_subset "$clickbench" clickbench 100000
-jq '. + {files:{}, preparation:"first 250k study /500k PDS-H SF1 /100k ClickBench sub1 rows; DuckDB 2.0 CLI single-thread COPY once, Snappy 64k row groups"}' \
+preparation='first 250k study /500k PDS-H SF1 /100k ClickBench sub1 rows; '
+preparation+='DuckDB 2.0 CLI single-thread COPY once, Snappy 64k row groups'
+jq --arg preparation "$preparation" '. + {files:{}, preparation:$preparation}' \
     "$here/arch_cases.json" > "$output/manifest.tmp"
 for file in "$output"/*.parquet; do
     digest=$(sha256sum "$file" | cut -d' ' -f1)

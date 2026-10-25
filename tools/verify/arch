@@ -77,11 +77,12 @@ threads=$(get '.hosts[$h].threads // 0')
 if [ "$threads" -gt 0 ]; then extra+=(--threads "$threads"); fi
 if [ "$(get '.hosts[$h].hash_only // false')" = true ]; then extra+=(--hash-only); fi
 if [ "$(get '.hosts[$h].tiny_perf // false')" = true ]; then extra+=(--tiny-perf); fi
-notify '.hosts[$h].hold' "Arch matrix timing window: please hold heavy jobs for 2 minutes starting now; release will follow."
+notify '.hosts[$h].hold' 'Arch timing window: hold heavy jobs for 2 minutes starting now; release will follow.'
 release() { notify '.hosts[$h].hold' 'Arch matrix timing window ended; heavy jobs may resume.'; }
 trap release EXIT
 remote uptime
-remote bash -c 'if [ "$(uname -s)" = Darwin ]; then top -l 1 -n 5; else top -b -n 1 -w 180 | head -14; fi' | tee "$local_dir/preflight.txt"
+top_probe='if [ "$(uname -s)" = Darwin ]; then top -l 1 -n 5; else top -b -n 1 -w 180 | head -14; fi'
+remote bash -c "$top_probe" | tee "$local_dir/preflight.txt"
 set +e
 remote bash "$cache_root/arch_remote.sh" run "$cache_root" "$memory_max" "$nice_level" "$disk_cap_kb" \
     "$cache_root/runner-$runner_sha/arch-runner" --data "$cache_root/data-$manifest_sha" \
@@ -94,7 +95,9 @@ rc=${PIPESTATUS[0]}
 set -e
 release
 trap - EXIT
-if [ "$rc" -eq 3 ]; then notify '.notify' "P0 arch matrix HASH MISMATCH on $host; $run_dir; retrieving exact output now."; fi
+if [ "$rc" -eq 3 ]; then
+    notify '.notify' "P0 arch matrix HASH MISMATCH on $host; $run_dir; retrieving exact output now."
+fi
 if ! rsync -a "$host:$run_dir/" "$local_dir/"; then
     echo "collection failed; remote evidence retained at $host:$run_dir" >&2
     exit 2

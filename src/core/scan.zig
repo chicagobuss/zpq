@@ -704,6 +704,8 @@ pub const PlanInputs = struct {
     filter: ?filter_ast.Filter = null,
     /// The share of rows the filter passes in the first row group the scan reads, counted (`sampledPassShare`).
     sampled_pass: ?f64 = null,
+    /// Exact retained-domain reservation, only when the existing dense fold can consume this plan.
+    dense_bytes: ?usize = null,
     /// The count was asked for but the inputs' bytes do not hold that row group (S3, explained from its footer): the
     /// estimate decides alone, as the execution reading them would not.
     sample_unread: bool = false,
@@ -1090,8 +1092,9 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         }
         return;
     }
+    const group_bytes = if (in.args.plain_rules) in.dense_bytes orelse copies else copies;
     const small = stat.confidence == .upper_bound and stat.hi <= 1 << 20 and
-        !state_unknown and copies <= in.args.max_memory / 8;
+        !state_unknown and group_bytes <= in.args.max_memory / 8;
     const bounded_census = stat.confidence == .upper_bound and stat.hi <= 1 << 20;
     const tiny = bounded_census and stat.hi <= 1 << 14;
     const keys = in.keys orelse &.{};
@@ -1159,7 +1162,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     // rows in ten at a thousandth): the row groups the statistics leave in must hold few rows, or the groups' bound
     // fit the sketch's own share of the budget, or the first row group the scan reads pass few rows, counted. A
     // refusal of the plain table still runs the cut (`FastPath.plain_rule`).
-    const groups_fit = stat.confidence == .upper_bound and !state_unknown and copies <= in.args.max_memory / 8;
+    const groups_fit = stat.confidence == .upper_bound and !state_unknown and group_bytes <= in.args.max_memory / 8;
     if (in.args.plain_rules and plan.dispatch.strategy == .sketch and !plan.dispatch.distinct_census and
         passShare(in) <= selective_share)
     select: {
@@ -4280,6 +4283,22 @@ fn prepareAggregateWithMetas(
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
+    if (domain) |*d| {
+        const initial = planAggregate(plan_inputs).dispatch;
+        if (d.globalFits(n_workers) and allRescannable(args.inputs) and !initial.use_blocks and
+            initial.strategy != .partitioned_hash)
+        {
+            const stride = expr_agg.fixedGroupStride(group_by_keys.?) orelse 0;
+            plan_inputs.dense_bytes = agg_dense.charge(
+                d,
+                n_workers,
+                agg_calls,
+                ndv_stat.?.rows,
+                stride,
+                denseCountLimit(args, agg_calls, group_outputs),
+            ).total;
+        }
+    }
     var scan_plan = planAggregate(plan_inputs);
     var packed_record_path: ?RecordAdmission = null;
     // Keep the established small-domain table/dense choice; owners replace a multi-pass count cut.
@@ -4510,6 +4529,12 @@ fn prepareAggregateWithMetas(
     // more than the lookups it replaces (one per dictionary entry per row group), and when the domain and every lane
     // fit the shared budget, drawn before any worker starts.
     const dense_cut = denseCountLimit(args, agg_calls, group_outputs);
+    const dense_rule = if (plan_inputs.dense_bytes != null and decision.strategy == .plain_hash) rule: {
+        var ordinary = plan_inputs;
+        ordinary.dense_bytes = null;
+        break :rule planAggregate(ordinary).dispatch.strategy == .sketch;
+    } else false;
+    if (dense_rule) if (args.taken) |taken| taken.insert(.plain_rule);
     var dense_lanes: []agg_dense.Lanes = &.{};
     var dense_charge: usize = 0;
     defer group_budget.release(dense_charge);
@@ -4518,13 +4543,14 @@ fn prepareAggregateWithMetas(
     var dense_table_charge: usize = 0;
     if (dense_wanted) dense: {
         const d = &domain.?;
-        const lanes_bytes = n_workers *| agg_dense.laneBytes(d.ids(), agg_calls, ndv_stat.?.rows);
         if (!rescannable) break :dense;
-        dense_table_charge = agg_dense.domainTableBytes(d, d.ids(), fixed_stride, agg_calls.len);
-        const heap_bytes = if (dense_cut) |h| @min(h, d.ids()) *| @sizeOf(u32) else 0;
-        dense_charge = group_budget.drawExact(
-            d.bytes +| lanes_bytes +| dense_table_charge +| heap_bytes,
-        ) orelse break :dense;
+        const quote = agg_dense.charge(d, n_workers, agg_calls, ndv_stat.?.rows, fixed_stride, dense_cut);
+        dense_table_charge = quote.table;
+        dense_charge = group_budget.drawExact(quote.total) orelse {
+            // Only the lanes justified this plain plan: a crowded ledger must retry the certified cut before rows.
+            if (dense_rule) return error.ExceededMemoryBudget;
+            break :dense;
+        };
         dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
         for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls, .rows = ndv_stat.?.rows };
         if (args.taken) |taken| taken.insert(.dense);
@@ -20409,6 +20435,8 @@ test "dense composite counts arm globally and preserve selected first through wi
         .min_bytes_per_worker = 1,
         .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3, .offset = 1 },
         .dense = false,
+        .max_memory = 4 << 20,
+        .sketch_topk = .{ .cell_bits = 12 },
     };
     var want = try runMultiAggregate(gpa, a, args);
     defer want.deinit(gpa);
@@ -20419,12 +20447,31 @@ test "dense composite counts arm globally and preserve selected first through wi
         args.decode_batch_rows = window;
         args.dense = true;
         args.taken = &taken;
+        const explanation = try explainAggregate(gpa, a, args);
+        try testing.expectEqual(.plain_hash, explanation.plan.dispatch.strategy);
+        try testing.expectEqual(j, explanation.workers);
+        if (j == 16) try testing.expect(explanation.plan.plain_bytes.? > args.max_memory / 8);
         var got = try prepareAggregate(gpa, a, args, false);
         defer got.deinit(gpa);
         try testing.expect(taken.contains(.dense));
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     };
+    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const held = ledger.drawExact(args.max_memory - 1).?;
+    defer ledger.release(held);
+    args.ledger = &ledger;
+    var refused: std.EnumSet(FastPath) = .{};
+    args.taken = &refused;
+    try testing.expectError(error.ExceededMemoryBudget, prepareAggregate(gpa, a, args, false));
+    try testing.expect(refused.contains(.plain_rule));
+    try testing.expect(!refused.contains(.dense));
+    try testing.expectEqual(held, ledger.used.load(.monotonic));
+    var chain: Chain = .{ .parts_tried = false };
+    const fallback = narrowed(args, args, refused, &chain, false).?;
+    try testing.expect(!fallback.plain_rules);
+    const after = try explainAggregate(gpa, a, fallback);
+    try testing.expectEqual(.sketch, after.plan.dispatch.strategy);
 }
 
 test "distinct bitmaps retain identities after releasing windows and late wide fallback" {

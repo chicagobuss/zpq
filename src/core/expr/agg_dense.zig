@@ -282,6 +282,22 @@ pub fn domainTableBytes(d: *const Domain, ids: usize, stride: usize, n_calls: us
     return ids *| agg.GroupTable.variableEntryBytes(d.maxKeyBytes(), n_calls);
 }
 
+/// The reservation includes the retained domain, every worker lane, the merge table and ranking scratch.
+/// Planning and admission share this quote; the table credit transfers to GroupTable at merge.
+pub fn charge(
+    d: *const Domain,
+    workers: usize,
+    calls: []const AggCall,
+    rows: u64,
+    stride: usize,
+    cut: ?usize,
+) struct { total: usize, table: usize } {
+    const ids = d.ids();
+    const table = domainTableBytes(d, ids, stride, calls.len);
+    const heap = if (cut) |h| @min(h, ids) *| @sizeOf(u32) else 0;
+    return .{ .total = d.bytes +| workers *| laneBytes(ids, calls, rows) +| table +| heap, .table = table };
+}
+
 /// One worker's least positions and states: counters for COUNT(*), otherwise `calls.len` accumulators per id.
 /// Allocated on its first row group, so the worker first touches the pages it fills.
 pub const Lanes = struct {
@@ -708,6 +724,17 @@ test "dense count lanes share the row-width boundary with their quote" {
         try testing.expectEqual(rows, l.count(0));
         try testing.expectEqual(laneBytes(d.ids(), &calls, rows), l.first.len * 8 + l.counts32.len * 4 + l.counts64.len * 8);
         try testing.expectEqual(@as(usize, 0), l.accs.len);
+        for ([_]usize{ 0, 9 }) |stride| {
+            const quoted = charge(&d, 3, &calls, rows, stride, 2);
+            const owned = d.bytes + 3 * (l.first.len * 8 + l.counts32.len * 4 + l.counts64.len * 8);
+            try testing.expectEqual(owned + quoted.table + 2 * @sizeOf(u32), quoted.total);
+            var ledger: agg.SharedBudget = .{ .limit = quoted.total - 1 };
+            try testing.expectEqual(null, ledger.drawExact(quoted.total));
+            ledger.limit = quoted.total;
+            const held = ledger.drawExact(quoted.total).?;
+            ledger.release(held);
+            try testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+        }
     }
 }
 

@@ -1374,6 +1374,24 @@
       ],
       "scan_all": true,
       "parquet": true
+    },
+    {
+      "id": "q0:dense-budget-count",
+      "kind": "product",
+      "fixture": "dense_0",
+      "sql": "SELECT k32,count(*) AS c FROM '{path}' WHERE f<30 GROUP BY k32 ORDER BY c DESC,k32 LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true,
+      "max_memory": "8M"
+    },
+    {
+      "id": "q0:dense-budget-calls",
+      "kind": "product",
+      "fixture": "dense_glob",
+      "sql": "SELECT k32,count(*) AS c,sum(v) AS s,min(v) AS lo,max(v) AS hi FROM '{path}' GROUP BY k32 ORDER BY k32",
+      "ordered": true,
+      "parquet": true,
+      "max_memory": "8M"
     }
   ]
 }

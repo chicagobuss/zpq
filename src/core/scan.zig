@@ -20566,3 +20566,117 @@ test "shared integer scalar consumer owns answers after releasing each full or s
         try testing.expectEqual(@as(usize, 0), window.abandoned);
     };
 }
+
+test "sliced consumer reuses payload survivors across releasing reader windows" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    const empty = [_]expr_agg.OutputCol{
+        .{ .name = "d", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &.{} } } },
+        .{ .name = "q", .parquet_type = .DOUBLE, .nullable = true, .col = .{ .f64 = .{ .values = &.{} } } },
+        .{ .name = "discount", .parquet_type = .DOUBLE, .nullable = true, .col = .{ .f64 = .{ .values = &.{} } } },
+        .{ .name = "price", .parquet_type = .DOUBLE, .nullable = true, .col = .{ .f64 = .{ .values = &.{} } } },
+    };
+    for (0..16) |rg| {
+        var dates: [257]i64 = undefined;
+        var quantity: [257]f64 = undefined;
+        var discount: [257]f64 = undefined;
+        var price: [257]f64 = undefined;
+        var defs: [257]u32 = undefined;
+        for (&dates, &quantity, &discount, &price, &defs, 0..) |*d, *q, *disc, *p, *dl, r| {
+            d.* = @intCast((r + rg * 3) % 23);
+            q.* = @floatFromInt(r % 51);
+            disc.* = @as(f64, @floatFromInt(r % 11)) / 100;
+            p.* = switch (r % 5) {
+                0 => 1e16,
+                1 => 1,
+                2 => -1e16,
+                3 => -0.0,
+                else => 0.1,
+            };
+            dl.* = @intFromBool(r % 17 != 0);
+        }
+        const cols = [_]expr_agg.OutputCol{
+            .{
+                .name = "d",
+                .parquet_type = .INT64,
+                .nullable = true,
+                .col = .{ .i64 = .{ .values = &dates, .def_levels = &defs, .max_def = 1 } },
+            },
+            .{
+                .name = "q",
+                .parquet_type = .DOUBLE,
+                .nullable = true,
+                .col = .{ .f64 = .{ .values = &quantity, .def_levels = &defs, .max_def = 1 } },
+            },
+            .{
+                .name = "discount",
+                .parquet_type = .DOUBLE,
+                .nullable = true,
+                .col = .{ .f64 = .{ .values = &discount, .def_levels = &defs, .max_def = 1 } },
+            },
+            .{
+                .name = "price",
+                .parquet_type = .DOUBLE,
+                .nullable = true,
+                .col = .{ .f64 = .{ .values = &price, .def_levels = &defs, .max_def = 1 } },
+            },
+        };
+        try file.append(&cols, dates.len, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&empty);
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    for (meta.row_groups.items) |*rg| {
+        for (rg.columns.items) |*col| col.meta_data.?.statistics = null;
+    }
+    const mapped = [_]Input{.{ .name = "survivors.parquet", .bytes = bytes }};
+    for ([_][]const u8{
+        "d>=3 AND d<17 AND discount>=0.05 AND discount<=0.07 AND q<24",
+        "d<0 AND q<24",
+        "d>=0 AND q>=0",
+    }) |filter| {
+        var args: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = (&meta)[0..1],
+            .aggregate = "sum(price*discount) AS revenue,avg(price*discount) AS av,count(*) AS n",
+            .filter = filter,
+            .scan_all = true,
+            .min_bytes_per_worker = 1,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| {
+            var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+            const inputs = [_]Input{window.input(bytes)};
+            args.inputs = &inputs;
+            args.parallelism = j;
+            args.decode_batch_rows = 64;
+            args.start_reads = .{
+                .ctx = &window,
+                .start = ReleasingScanWindow.start,
+                .abandon = ReleasingScanWindow.abandon,
+            };
+            var got = try runMultiAggregate(gpa, a, args);
+            defer got.deinit(gpa);
+            for (want.state.accumulators, got.state.accumulators) |w, g| switch (w) {
+                .sum_f => |value| {
+                    try testing.expectEqual(value != null, g.sum_f != null);
+                    if (value) |v| try testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(g.sum_f.?)));
+                },
+                .avg => |avg| {
+                    try testing.expectEqual(avg.count, g.avg.count);
+                    try testing.expectEqual(@as(u64, @bitCast(avg.sum)), @as(u64, @bitCast(g.avg.sum)));
+                },
+                .count => |count| try testing.expectEqual(count, g.count),
+                else => unreachable,
+            };
+            try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+            try testing.expectEqual(@as(usize, 0), window.abandoned);
+        }
+    }
+}

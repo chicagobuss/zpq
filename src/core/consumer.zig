@@ -4352,6 +4352,9 @@ fn scanRGSliced(
         return null;
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
+        // The first pass already validated and evaluated filter-only columns. Keep only the values the consumer
+        // reads; a column shared by the filter and an aggregate still needs its value lane here.
+        if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
         var options = decode_options;
         options.any_dictionary = target.denseKey(ci);
         if (payload) |p| if (p[ci]) {
@@ -4410,8 +4413,11 @@ fn scanRGSliced(
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
-        var sel = try filter_selection.SelectionVector.init(sa, n);
-        if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
+        var sel = if (payload != null)
+            try survivors.alignedWindow(done, n)
+        else
+            try filter_selection.SelectionVector.init(sa, n);
+        if (payload == null) if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
         matched += if (in.filter != null) sel.count() else n;
         switch (target) {
             .scalar => |s| {

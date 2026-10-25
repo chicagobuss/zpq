@@ -7,8 +7,8 @@
 //! occurs to a group id once (through the same serialized key the row path builds, so groups are identical), and
 //! folds per composite rather than per row.
 //!
-//! Integer results are exact. Float sums are reassociated (count·value instead of value added count times), which
-//! differs from the row-order sum only in rounding.
+//! Integer results are exact. Float SUM/AVG keep canonical scalar blocks or grouped row order; their values are
+//! never reassociated into histogram-weighted sums.
 
 const std = @import("std");
 const filter_eval = @import("../filter/eval.zig");

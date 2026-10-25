@@ -20680,3 +20680,91 @@ test "sliced consumer reuses payload survivors across releasing reader windows" 
         }
     }
 }
+
+test "multi aggregate dictionary keys survive releasing slices and materialized fallback" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    const empty = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = &.{} } } },
+        .{ .name = "b", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = &.{} } } },
+        .{ .name = "x", .parquet_type = .DOUBLE, .nullable = true, .col = .{ .f64 = .{ .values = &.{} } } },
+        .{ .name = "y", .parquet_type = .DOUBLE, .nullable = true, .col = .{ .f64 = .{ .values = &.{} } } },
+        .{ .name = "f", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &.{} } } },
+    };
+    for (0..16) |rg| {
+        var k: [257][]const u8 = undefined;
+        var b: [257][]const u8 = undefined;
+        var x: [257]f64 = undefined;
+        var y: [257]f64 = undefined;
+        var f: [257]i64 = undefined;
+        var d: [257]u32 = undefined;
+        var bd: [257]u32 = undefined;
+        for (0..257) |r| {
+            k[r] = if (r % 2 == 0) "A" else "B";
+            b[r] = try std.fmt.allocPrint(a, "dictionary-{d}", .{(r + rg) % 64});
+            x[r] = switch (r % 5) {
+                0 => 1e16,
+                1 => 1,
+                2 => -1e16,
+                3 => -0.0,
+                else => 0.1,
+            };
+            y[r] = @as(f64, @floatFromInt(r % 11)) / 100;
+            f[r] = @intCast(r % 13);
+            d[r] = @intFromBool(r % 17 != 0);
+            bd[r] = @intFromBool(rg != 15 and r % 19 != 0);
+        }
+        var cols = empty;
+        cols[0].col = .{ .string = .{ .values = &k, .def_levels = &d, .max_def = 1 } };
+        cols[1].col = .{ .string = .{ .values = &b, .def_levels = &bd, .max_def = 1 } };
+        cols[2].col = .{ .f64 = .{ .values = &x, .def_levels = &d, .max_def = 1 } };
+        cols[3].col = .{ .f64 = .{ .values = &y, .def_levels = &bd, .max_def = 1 } };
+        cols[4].col = .{ .i64 = .{ .values = &f } };
+        try file.append(&cols, 257, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&empty);
+    const bytes = sink.buffer.items;
+    const meta = try metadata.open(a, bytes);
+    for (meta.row_groups.items) |*rg| for (rg.columns.items) |*c| {
+        c.meta_data.?.statistics = null;
+    };
+    const mapped = [_]Input{.{ .name = "coded-multi.parquet", .bytes = bytes }};
+    for ([_][]const u8{ "f<7", "f<0", "f>=0" }) |filter| {
+        var args: MultiAggArgs = .{
+            .inputs = &mapped,
+            .metas = (&meta)[0..1],
+            .filter = filter,
+            .aggregate = "sum(x) AS s,avg(x) AS av,sum(x*(1-y)) AS discounted,sum(x*(1-y)*(1+y)) AS charge,avg(y) AS ay,count(*) AS n,count(y) AS ny",
+            .group_by = "k,b",
+            .encoded = false,
+            .dense = false,
+            .integer_records = false,
+            .byte_records = false,
+            .ndv_policy = false,
+            .scan_all = true,
+            .min_bytes_per_worker = 1,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        for ([_]usize{ 1, 2, 4, 8, 16 }) |j| for ([_]usize{ 0, 64 }) |batch| {
+            var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+            const inputs = [_]Input{window.input(bytes)};
+            args.inputs = &inputs;
+            args.parallelism = j;
+            args.decode_batch_rows = batch;
+            args.encoded = true;
+            args.start_reads = .{ .ctx = &window, .start = ReleasingScanWindow.start, .abandon = ReleasingScanWindow.abandon };
+            var got = try runMultiAggregate(gpa, a, args);
+            defer got.deinit(gpa);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            try testing.expectEqual(@as(usize, 16), window.releases.load(.monotonic));
+            try testing.expectEqual(@as(usize, 0), window.abandoned);
+        };
+        args.inputs = &mapped;
+    }
+}

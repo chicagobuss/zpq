@@ -3153,8 +3153,14 @@ pub const AggTarget = union(enum) {
         records: ?*const RecordSink = null,
     },
 
-    fn denseKey(self: AggTarget, ci: usize) bool {
-        if (self == .grouped and self.grouped.dense != null) {
+    fn codedKey(self: AggTarget, ci: usize) bool {
+        // The ordinary multi-aggregate consumer can fold dictionary products too. Keeping the original codes
+        // avoids expanding strings only to intern them again; the row fallback materializes only if it needs to.
+        if (self == .grouped and (self.grouped.dense != null or self.grouped.records == null)) {
+            // Float extrema keep their established representation: histogram order can choose another NaN payload.
+            if (self.grouped.dense == null) for (self.grouped.calls) |call| {
+                if (call.result == .f64 and (call.func == .min or call.func == .max)) return false;
+            };
             for (self.grouped.keys) |key| if (key == .col_ref and key.col_ref.col_idx == ci) return true;
         }
         return false;
@@ -4356,7 +4362,7 @@ fn scanRGSliced(
         // reads; a column shared by the filter and an aggregate still needs its value lane here.
         if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
         var options = decode_options;
-        options.any_dictionary = target.denseKey(ci);
+        options.any_dictionary = target.codedKey(ci);
         if (payload) |p| if (p[ci]) {
             options.row_gate = &survivors;
         };
@@ -4638,7 +4644,7 @@ const ChunkDecoder = struct {
             std.debug.assert(self.gate != null);
             decode_options.row_gate = self.gate;
         };
-        decode_options.any_dictionary = self.target.denseKey(ci);
+        decode_options.any_dictionary = self.target.codedKey(ci);
         if (self.target == .grouped) if (self.target.grouped.records) |records| if (records.retention(ci)) |owner| {
             var reader = (try SliceReader.init(a, a, in.rg, in.meta, in.src, ci, decode_options)).?;
             defer reader.deinit();
@@ -9709,7 +9715,7 @@ test "copied INT96 dictionary filters hash raw entries and decline noncanonical 
     }
 }
 
-test "dense key dictionaries keep codes for later keys and bounded slices" {
+test "grouped key dictionaries keep later-key codes with and without dense lanes" {
     const testing = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -9730,7 +9736,7 @@ test "dense key dictionaries keep codes for later keys and bounded slices" {
     const rg = &meta.row_groups.items[0];
     const src: RGSrc = .{ .bytes = capture.bytes.items, .byte_origin = 0 };
     var lanes: agg_dense.Lanes = undefined;
-    const target: AggTarget = .{ .grouped = .{
+    var target: AggTarget = .{ .grouped = .{
         .calls = &.{},
         .keys = &.{
             .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } },
@@ -9740,14 +9746,17 @@ test "dense key dictionaries keep codes for later keys and bounded slices" {
         .table = undefined,
         .pos_base = 0,
     } };
-    try testing.expect(target.denseKey(0));
-    try testing.expect(target.denseKey(1));
-    try testing.expect(!target.denseKey(2));
+    try testing.expect(target.codedKey(0));
+    try testing.expect(target.codedKey(1));
+    try testing.expect(!target.codedKey(2));
+    target.grouped.dense = null;
+    try testing.expect(target.codedKey(0));
+    try testing.expect(target.codedKey(1));
     const cm = rg.columns.items[1].meta_data.?;
     const start: usize = @intCast(cm.dictionary_page_offset.?);
     const chunk = capture.bytes.items[start..][0..@intCast(cm.total_compressed_size)];
     for ([_]bool{ false, true }) |force| {
-        const options: DecodeOptions = .{ .encoded = true, .any_dictionary = force and target.denseKey(1) };
+        const options: DecodeOptions = .{ .encoded = true, .any_dictionary = force and target.codedKey(1) };
         var scratch = DecodeScratch.init(testing.allocator);
         defer scratch.deinit();
         const col = (try decodeAggColumnCoded(a, chunk, cm, &meta, options, &scratch)).?;

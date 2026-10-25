@@ -7,6 +7,15 @@ import pyarrow.parquet as pq
 from .parquet import T_I32, field, rewrite_footer
 
 
+def lambda_int8(out_dir):
+    """Four row groups straddling the diagnostic decoder's 4096-value batch."""
+    values = [-128, -2, -1, 0, 1, 2, 126, 127] * 2049
+    table = pa.table({'int8': pa.array(values[:4097 * 4], type=pa.int8())})
+    path = out_dir / 'lambda_int8.parquet'
+    pq.write_table(table, path, row_group_size=4097)
+    print(path)
+
+
 def bloom(out_dir):
     """ci/fixtures/parquet/bloom_keys.parquet, the fixture for row-group pruning by membership (Bloom filters
 and dictionaries) in the unit and Lambda integration tests."""

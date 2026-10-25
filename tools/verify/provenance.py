@@ -99,6 +99,16 @@ def resolved_cpu(repo: Path, requested: str) -> str:
     return match.group(1) + requested[len("native"):]
 
 
+def corpus_environment(repo: Path) -> dict:
+    expected = re.search(r'parquet_testing_sha := "([0-9a-f]{40})"', (repo / "justfile").read_text()).group(1)
+    path = repo / "data/parquet-testing"
+    actual = None
+    if (path / ".git").exists():
+        result = _run(["git", "-C", str(path), "rev-parse", "HEAD"], timeout=5)
+        actual = result.stdout.strip() if result.returncode == 0 else "unreadable"
+    return {"expected": expected, "actual": actual, "mismatch": actual is not None and actual != expected}
+
+
 def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
     dirty = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True)
     diff = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=repo)
@@ -111,6 +121,7 @@ def collect(repo: Path, out: Path, zig_cpu: str, probe: bool) -> dict:
         "zig_cpu_resolved": resolved_cpu(repo, zig_cpu),
         "python": platform.python_version(),
         "python_environment": python_environment(repo),
+        "parquet_testing": corpus_environment(repo),
         "engine_tree": subprocess.check_output(["git", "rev-parse", "HEAD:src"], cwd=repo, text=True).strip(),
         "working_tree_status": dirty.splitlines(),
         "diff_sha256": hashlib.sha256(diff).hexdigest() if diff else None,

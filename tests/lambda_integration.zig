@@ -88,6 +88,7 @@ const Request = struct {
     fn deinit(self: *Request) void {
         sysClose(self.conn);
         self.allocator.free(self.raw);
+        self.* = undefined;
     }
 
     fn replyAndClose(
@@ -97,6 +98,7 @@ const Request = struct {
         extra_headers: []const u8,
         body: []const u8,
     ) !void {
+        defer self.deinit();
         const status_text = switch (status) {
             200 => "OK",
             202 => "Accepted",
@@ -116,9 +118,6 @@ const Request = struct {
             if (n == 0) break;
             off += n;
         }
-        sysClose(self.conn);
-        self.allocator.free(self.raw);
-        self.* = undefined;
     }
 };
 
@@ -492,104 +491,39 @@ test "lambda rejects empty body cleanly" {
     try resp.replyAndClose(std.testing.allocator, 202, "", "");
 }
 
-test "lambda decodes int8 column from a real Parquet file" {
-    const fixture_path = "data/benchmark_100mb.parquet";
-    const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
-        if (err == error.FileNotFound) {
-            std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return error.SkipZigTest;
-        }
-        return err;
-    };
+test "lambda bounds raw events and decodes int8 on cold and warm invocations" {
+    const file_bytes = try readFileSlice(std.testing.allocator, "ci/fixtures/parquet/lambda_int8.parquet");
     defer std.testing.allocator.free(file_bytes);
-
     var server = try FakeServer.start();
     defer server.deinit();
-
-    const endpoint = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "127.0.0.1:{d}",
-        .{server.port},
-    );
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
     defer std.testing.allocator.free(endpoint);
-
     var child = try spawnLambda(std.testing.allocator, endpoint);
     defer killChild(&child);
 
-    var poll = try server.acceptRequest(std.testing.allocator);
-    try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
-    try poll.replyAndClose(
-        std.testing.allocator,
-        200,
-        "Lambda-Runtime-Aws-Request-Id: req-decode\r\n" ++
-            "Content-Type: application/octet-stream\r\n",
-        file_bytes,
-    );
-
-    var resp = try server.acceptRequest(std.testing.allocator);
-    try std.testing.expectEqualStrings("POST", resp.method);
-    try std.testing.expectEqualStrings(
-        "/2018-06-01/runtime/invocation/req-decode/response",
-        resp.path,
-    );
-
-    // Expect the success envelope with all 524288 rows decoded.
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"column\":\"int8\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rows\":524288") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"row_groups\":4") != null);
-    std.debug.print("[lambda decode] response: {s}\n", .{resp.body});
-    try resp.replyAndClose(std.testing.allocator, 202, "", "");
-}
-
-test "lambda handles back-to-back invocations" {
-    const fixture_path = "data/benchmark_100mb.parquet";
-    const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
-        if (err == error.FileNotFound) return error.SkipZigTest;
-        return err;
+    // A runaway event is refused before dispatch; the same process resumes polling.
+    const oversized = try std.testing.allocator.alloc(u8, (32 << 20) + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 0);
+    var rejected = try server.acceptRequest(std.testing.allocator);
+    rejected.replyAndClose(std.testing.allocator, 200, "Lambda-Runtime-Aws-Request-Id: oversized\r\n", oversized) catch |err| {
+        if (err != error.WriteFailed) return err; // The bounded reader may close before the send finishes.
     };
-    defer std.testing.allocator.free(file_bytes);
 
-    var server = try FakeServer.start();
-    defer server.deinit();
-
-    const endpoint = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "127.0.0.1:{d}",
-        .{server.port},
-    );
-    defer std.testing.allocator.free(endpoint);
-
-    var child = try spawnLambda(std.testing.allocator, endpoint);
-    defer killChild(&child);
-
-    const ids = [_][]const u8{ "req-A", "req-B" };
-    for (ids) |id| {
+    for ([_][]const u8{ "cold", "warm" }) |id| {
         var poll = try server.acceptRequest(std.testing.allocator);
         try std.testing.expectEqualStrings("GET", poll.method);
-
-        const headers = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "Lambda-Runtime-Aws-Request-Id: {s}\r\n" ++
-                "Content-Type: application/octet-stream\r\n",
-            .{id},
-        );
+        try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
+        const headers = try std.fmt.allocPrint(std.testing.allocator, "Lambda-Runtime-Aws-Request-Id: {s}\r\nContent-Type: application/octet-stream\r\n", .{id});
         defer std.testing.allocator.free(headers);
         try poll.replyAndClose(std.testing.allocator, 200, headers, file_bytes);
-
-        var resp = try server.acceptRequest(std.testing.allocator);
-        try std.testing.expectEqualStrings("POST", resp.method);
-        const expected_path = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "/2018-06-01/runtime/invocation/{s}/response",
-            .{id},
-        );
-        defer std.testing.allocator.free(expected_path);
-        try std.testing.expectEqualStrings(expected_path, resp.path);
-
-        // Each invocation should yield the success envelope.
-        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rows\":524288") != null);
-        try resp.replyAndClose(std.testing.allocator, 202, "", "");
+        var response = try server.acceptRequest(std.testing.allocator);
+        try std.testing.expectEqualStrings("POST", response.method);
+        const path = try std.fmt.allocPrint(std.testing.allocator, "/2018-06-01/runtime/invocation/{s}/response", .{id});
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqualStrings(path, response.path);
+        try std.testing.expectEqualStrings("{\"ok\":true,\"column\":\"int8\",\"rows\":16388,\"min\":-128,\"max\":127,\"sum\":255869,\"row_groups\":4}", response.body);
+        try response.replyAndClose(std.testing.allocator, 202, "", "");
     }
 }
 
@@ -1075,7 +1009,7 @@ test "lambda reopens S3 connections the server dropped while it sat idle, withou
 const BLOOM_FIXTURE = "ci/fixtures/parquet/bloom_keys.parquet";
 
 test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" {
-    // The fixture's statistics prune no equality (tools/gen_bloom_fixture.py); its Bloom filters prune all but the
+    // The fixture's statistics prune no equality (tools/zpq-gen bloom); its Bloom filters prune all but the
     // group holding the key. Filters the 1 MiB suffix already holds are copied from it, so that cold probe makes
     // no HTTP GET. Filters outside the tail are fetched. By a case's third invocation a cached filter is not read
     // again; dictionaries are.

@@ -271,6 +271,14 @@ def main(argv: list[str] | None = None) -> int:
               "  uv pip install --python .venv/bin/python -r tools/verify/requirements.txt\n"
               "  .venv/bin/python tools/verify/verify.py COMMAND", file=sys.stderr)
         return 2
+    uses_corpus = args.command in ("quick", "commit", "full", "soak") or (
+        args.command == "stage" and args.name in ("test-core", "test-full", "integration", "conform", "triangulate"))
+    if uses_corpus:
+        corpus = provenance.corpus_environment(REPO)
+        if corpus["mismatch"]:
+            print(f"verify: Parquet corpus revision mismatch: {corpus['actual']}; expected {corpus['expected']}. "
+                  "Run just fetch-corpus (no gates started).", file=sys.stderr)
+            return 2
     revision = head_sha()
     try:
         run_dir, book = open_run(args, args.command if args.command != "stage" else f"stage-{args.name}", revision)

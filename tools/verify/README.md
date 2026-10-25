@@ -18,6 +18,8 @@ No arguments and `--help` show every stage, tier, requirement and exit code.
 `quick` runs core tests. `commit` builds the CLI, runs the CLI contracts and independent reader checks, and runs the full
 differential referee.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
+Versioned Parquet corpora must match the existing `just fetch-corpus` pin;
+a mismatch stops before gates and its revision is recorded in provenance.
 `--base` is the previously integrated comparison binary; it is required for
 `full` and is recorded without a default. Native builds default to
 `--cpu native`, using the host CPU. `--cpu` remains an explicit override.

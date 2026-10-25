@@ -84,6 +84,30 @@ class EnvironmentTest(unittest.TestCase):
         self.assertEqual(len(actual["requirements_sha256"]), 64)
 
 
+class CorpusEnvironmentTest(unittest.TestCase):
+    def test_mismatch_stops_before_host_probes(self):
+        corpus = {"expected": "a" * 40, "actual": "b" * 40, "mismatch": True}
+        with patch.object(provenance, "corpus_environment", return_value=corpus), \
+                patch.object(provenance, "python_environment", return_value={"mismatches": []}), \
+                patch.object(verify, "open_run") as open_run, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(verify.main(["quick"]), 2)
+        open_run.assert_not_called()
+        self.assertIn("corpus revision mismatch", err.getvalue())
+        self.assertIn("just fetch-corpus", err.getvalue())
+
+    def test_optional_corpus_is_unversioned_or_matches_the_declared_pin(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            pin = "a" * 40
+            (repo / "justfile").write_text(f'parquet_testing_sha := "{pin}"\n')
+            self.assertFalse(provenance.corpus_environment(repo)["mismatch"])
+            (repo / "data/parquet-testing/.git").mkdir(parents=True)
+            for actual, mismatch in ((pin, False), ("b" * 40, True)):
+                result = argparse.Namespace(returncode=0, stdout=actual)
+                with patch.object(provenance, "_run", return_value=result):
+                    self.assertEqual(provenance.corpus_environment(repo)["mismatch"], mismatch)
+
+
 class TestStageAccountingTest(unittest.TestCase):
     def test_empty_unparsed_or_incomplete_test_suites_fail(self):
         cmd = stages.Cmd(["test"], {}, "test", parse=stages.parse_tests)

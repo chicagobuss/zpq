@@ -350,6 +350,7 @@ REFEREE_CASES = [
     "tools/runner/cases/writer_wire.json",
     "tools/runner/cases/tail.json",
     "tools/runner/cases/product.json",
+    "tools/runner/cases/packed_count.json",
     "tools/runner/cases/oracle_precision.json",
 ]
 

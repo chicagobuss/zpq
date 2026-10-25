@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "${1:-}" = arch ]; then
+    shift
+    exec bash "$(dirname "$0")/arch" "$@"
+fi
+exec python3 "$(dirname "$0")/verify.py" "$@"

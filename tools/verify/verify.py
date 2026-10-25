@@ -218,6 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["arch"]:
+        import os
+
+        os.execv("/bin/bash", ["bash", str(REPO / "tools/verify/arch"), *argv[1:]])
     if not argv or argv in (["-h"], ["--help"], ["help"]):
         sys.stdout.write(guide())
         return 0

@@ -7,7 +7,7 @@ from . import parquet, scenarios, sparse
 SCENARIOS = {
     name: getattr(scenarios, name) for name in (
         'bloom', 'census', 'count_certificate', 'decimal_exact', 'dotted_twin', 'full_match',
-        'json_escape', 'list_int64', 'many_tiny', 'min_fill', 'mixed_codec', 'nested', 'nested_key',
+        'filtered_records', 'json_escape', 'list_int64', 'many_tiny', 'min_fill', 'mixed_codec', 'nested', 'nested_key',
         'null_pages', 'overflow_rows', 'packed_count', 'partagg_budget', 'repeat_keys', 'scalar_strings', 'lambda_int8',
         'skew_filter', 'spawn_budget', 'topk', 'topn_budget', 'topn_descending', 'topn_gather', 'typed_root',
     )

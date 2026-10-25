@@ -346,4 +346,14 @@ with tempfile.TemporaryDirectory(prefix='zpq-contract-') as d:
         p = run('--query', sql, '--summary=json', code=2)
         assert not p.stdout and json.loads(p.stderr)['code'] == 'ModuloNotSupported'
         assert '%' in json.loads(p.stderr)['message']
+    # The explicit local reader includes page indexes and preserves exact filtered aggregates.
+    indexed = fixtures / 'packed_count_indexed.parquet'
+    aggregate = ('sum(k) AS k_sum, min(k) AS k_min, max(k) AS k_max, min(b) AS b_min, '
+                 'max(b) AS b_max, sum(f) AS f_sum, min(f) AS f_min, max(f) AS f_max, count(*) AS total_rows')
+    predicate = 'k > -13510798882111488'
+    p = run(indexed, '--aggregate', aggregate, '--filter', predicate,
+            env=dict(os.environ, ZPQ_IO_PROFILE='pread'))
+    oracle = con.execute(f"SELECT {aggregate} FROM '{indexed}' WHERE {predicate}")
+    expected = dict(zip((column[0] for column in oracle.description), oracle.fetchone()))
+    assert ndjson(p.stdout) == [expected], (p.stdout, expected)
 print(f'CLI contract checks passed ({checks} invocations; pyarrow + DuckDB validation)')

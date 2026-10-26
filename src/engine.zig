@@ -6244,7 +6244,7 @@ fn writeAggregateTextValue(
         try emitOwnerText(&emit, answer.group_cols.?, stream);
     } else if (answer.byte_stream) |stream| {
         try emitOwnerText(&emit, answer.group_cols.?, stream);
-    } else if (rows > 0) {
+    } else if (rows > 0 and answer.group_cols == null) {
         try emit.beginRow();
         for (answer.aggs, 0..) |item, ci| try emit.field(item.alias, item.value, ci);
         try emit.endRow();
@@ -6424,6 +6424,22 @@ test "owner text matches materialized rows for wide sums, NULLs and every text f
         try std.testing.expect(drained.integer_stream == null and drained.byte_stream == null);
         try std.testing.expectEqual(@as(usize, 3), drained.rowCount());
         try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+}
+
+test "released group metadata never emits a scalar phantom row" {
+    const answer: scan.AggOutput = .{
+        .group_cols = &.{ "k", "c", "s" },
+        .typed = .{ .rows = 5, .columns = &.{} },
+    };
+    try std.testing.expectEqual(@as(usize, 5), answer.rowCount());
+    const formats = [_]PrintFormat{ .json, .jsonl, .csv };
+    const expected = [_][]const u8{ "[]\n", "", "k,c,s\n" };
+    for (formats, expected) |format, want| {
+        var buf: [64]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        try writeAggregateText(&writer, answer, &.{}, &.{}, answer.rowCount(), format);
+        try std.testing.expectEqualStrings(want, writer.buffered());
     }
 }
 

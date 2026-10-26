@@ -1125,6 +1125,33 @@ test "regression: a query's default memory budget leaves room for the warm Bloom
     }
 }
 
+test "a released grouped Parquet answer has no phantom object in the service envelope" {
+    const a = std.testing.allocator;
+    var pool: PersistentPool = .sized(256 << 20);
+    defer pool.deinit();
+    const ar: engine.AggResult = .{
+        .files_in = 1,
+        .rows_in = 5,
+        .rows_scanned = 5,
+        .rows_matched = 5,
+        .bytes_in = 0,
+        .bytes_out = 0,
+        .row_groups_in = 1,
+        .row_groups_pruned = 0,
+        .row_groups_full_match = 0,
+        .cols_stat_pruned = 0,
+        .timings = .{},
+        .output = .{ .group_cols = &.{ "k", "c", "s" }, .typed = .{ .rows = 5, .columns = &.{} } },
+    };
+    var writer: std.Io.Writer.Allocating = .init(a);
+    defer writer.deinit();
+    try aggregateResponse(&writer.writer, ar, 0, &pool);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, writer.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("agg").?.array.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, writer.written(), "\"agg\":[],") != null);
+}
+
 test "the write response escapes the output name" {
     const a = std.testing.allocator;
     const wr: engine.WriteResult = .{

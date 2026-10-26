@@ -5,6 +5,7 @@
 //! must remain free of allocations beyond what callers pass in.
 
 pub const core = struct {
+    pub const selected_batch = @import("core/selected_batch.zig");
     pub const schema = @import("core/schema.zig");
     pub const thrift = @import("core/thrift.zig");
     pub const consumer = @import("core/consumer.zig");
@@ -96,6 +97,7 @@ pub const io = struct {
 test {
     // Keep these as direct imports: tools/check_test_modules.py uses this block
     // as the manifest of modules whose tests the library test artifact roots.
+    _ = @import("core/selected_batch.zig");
     _ = @import("core/schema.zig");
     _ = @import("core/thrift.zig");
     _ = @import("core/consumer.zig");

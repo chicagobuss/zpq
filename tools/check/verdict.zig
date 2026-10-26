@@ -1445,10 +1445,14 @@ fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
     }
     if (got.len != t.rows.len) return fail(in, "zpq={d} rows duck={d}", .{ got.len, t.rows.len });
     for (got, t.rows) |g, w| if (g.len != w.len) return fail(in, "shape differs", .{});
-    // zpq prints a DATE as its day number, other engines as ISO text: both compare as days.
+    // zpq prints a DATE as its day number and a TIMESTAMP as its stored integer (docs/output-format.md), other
+    // engines as ISO text: both compare as days, or as the integer in the unit the oracle's type names.
     for (t.types, 0..) |ty, c| if (std.ascii.eqlIgnoreCase(ty, "DATE")) {
         for (t.rows) |row| row[c] = try toEpoch(row[c], ty);
         for (got) |row| row[c] = try toEpoch(row[c], ty);
+    } else if (timestampUnit(ty)) |per_second| {
+        for (t.rows) |row| row[c] = try timestampIn(row[c], per_second);
+        for (got) |row| row[c] = try timestampIn(row[c], per_second);
     };
     const positional = for (got, t.rows) |g, w| {
         const equal = for (g, w) |a, b| {
@@ -1556,15 +1560,46 @@ fn isIntegerType(t: []const u8) bool {
     return false;
 }
 
-/// A zpq value as a DuckDB literal of the oracle's column type. DATEs arrive as days since 1970-01-01.
+/// Ticks per second of a DuckDB timestamp type without a zone (TIMESTAMP counts microseconds), or null.
+fn timestampUnit(ty: []const u8) ?i64 {
+    const units = [_]struct { []const u8, i64 }{
+        .{ "TIMESTAMP", 1_000_000 },        .{ "TIMESTAMP_US", 1_000_000 }, .{ "TIMESTAMP_MS", 1_000 },
+        .{ "TIMESTAMP_NS", 1_000_000_000 }, .{ "TIMESTAMP_S", 1 },
+    };
+    for (units) |u| if (std.ascii.eqlIgnoreCase(ty, u[0])) return u[1];
+    return null;
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.fraction]` as an integer count of 1/per_second since 1970-01-01; other values unchanged.
+fn timestampIn(v: Val, per_second: i64) !Val {
+    if (v != .text or v.text.len < 19) return v;
+    const s = v.text;
+    const days = try epochDays(s[0..10]);
+    const secs = days * 86400 + try std.fmt.parseInt(i64, s[11..13], 10) * 3600 +
+        try std.fmt.parseInt(i64, s[14..16], 10) * 60 + try std.fmt.parseInt(i64, s[17..19], 10);
+    var frac: [9]u8 = @splat('0');
+    if (s.len > 20 and s[19] == '.') {
+        const digits = s[20..@min(s.len, 29)];
+        @memcpy(frac[0..digits.len], digits);
+    }
+    const nanos = try std.fmt.parseInt(i64, &frac, 10);
+    return .{ .int = secs * per_second + @divFloor(nanos * per_second, 1_000_000_000) };
+}
+
+/// A zpq value as a DuckDB literal of the oracle's column type. DATEs arrive as days since 1970-01-01, timestamps
+/// as integers in their type's unit.
 fn sqlLiteral(arena: Allocator, q: *std.ArrayList(u8), v: Val, ty: []const u8) !void {
     var buf: [200]u8 = undefined;
     switch (v) {
         .null => return q.print(arena, "CAST(NULL AS {s})", .{ty}),
         .int => |n| if (std.ascii.eqlIgnoreCase(ty, "DATE"))
             return q.print(arena, "(DATE '1970-01-01' + {d})", .{n})
-        else
-            return q.print(arena, "CAST({d} AS {s})", .{ n, ty }),
+        else if (timestampUnit(ty)) |per_second| return switch (per_second) {
+            1 => q.print(arena, "CAST(make_timestamp(CAST({d} AS BIGINT) * 1000000) AS {s})", .{ n, ty }),
+            1_000 => q.print(arena, "CAST(epoch_ms(CAST({d} AS BIGINT)) AS {s})", .{ n, ty }),
+            1_000_000 => q.print(arena, "CAST(make_timestamp(CAST({d} AS BIGINT)) AS {s})", .{ n, ty }),
+            else => q.print(arena, "CAST(make_timestamp_ns(CAST({d} AS BIGINT)) AS {s})", .{ n, ty }),
+        } else return q.print(arena, "CAST({d} AS {s})", .{ n, ty }),
         .dec => |d| return q.print(arena, "CAST('{s}' AS {s})", .{ compare.decText(&buf, d), ty }),
         .float => |f| return q.print(arena, "CAST('{e}' AS {s})", .{ f, ty }),
         .special => |sp| return q.print(arena, "CAST('{s}' AS {s})", .{ sp.token(), ty }),

@@ -1078,6 +1078,20 @@ fn fewEntries(stat: NdvStat, keys: []const expr_ast.Expr) bool {
     return stat.hi <= few_union.values or n >= stat.hi *| few_union.recur;
 }
 
+fn plainGroupRowBytes(stat: NdvStat, calls: usize) u64 {
+    return (stat.key_bytes +| (@as(u64, @sizeOf(expr_agg.Accumulator)) *| calls) +| 32) *| 2;
+}
+
+/// Profitability only: selected rows cap how much ordinary group state this pass can touch. Dense lanes still
+/// reserve their full domain; neither this estimate nor an NDV hint may lower a correctness/memory bound.
+fn selectedGroupBytes(stat: NdvStat, calls: usize, workers: usize, share: f64) u64 {
+    const fraction = std.math.clamp(share, 0, 1);
+    const raw: f64 = @floatFromInt(stat.rows);
+    const estimate = raw * fraction;
+    const selected: u64 = if (estimate >= raw) stat.rows else if (estimate <= 0) 0 else @intFromFloat(estimate);
+    return @min(selected, stat.hi *| workers) *| plainGroupRowBytes(stat, calls);
+}
+
 fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     plan.ndv_stat = stat;
     if (stat.union_complete) {
@@ -1090,7 +1104,7 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     for (in.calls) |call| {
         state_unknown = state_unknown or call.func == .count_distinct or call.result == .bytes;
     }
-    const per_group = (stat.key_bytes +| (@as(u64, @sizeOf(expr_agg.Accumulator)) *| in.calls.len) +| 32) *| 2;
+    const per_group = plainGroupRowBytes(stat, in.calls.len);
     const single = stat.hi *| per_group;
     const copies = single *| plan.dispatch.tables;
     if (!state_unknown) plan.plain_bytes = copies else plan.reasons.insert(.state_memory_unknown);
@@ -4300,11 +4314,12 @@ fn prepareAggregateWithMetas(
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
+    var dense_profitable = true;
     if (args.encoded) if (domain) |*d| {
         const initial = planAggregate(plan_inputs).dispatch;
         if (d.globalFits(n_workers) and allRescannable(args.inputs) and !initial.use_blocks) {
             const stride = expr_agg.fixedGroupStride(group_by_keys.?) orelse 0;
-            plan_inputs.dense_bytes = agg_dense.charge(
+            const quote = agg_dense.charge(
                 d,
                 n_workers,
                 agg_calls,
@@ -4312,12 +4327,21 @@ fn prepareAggregateWithMetas(
                 stride,
                 denseCountLimit(args, agg_calls, group_outputs),
             ).total;
+            // The full dense footprint must beat ordinary state on this pass's survivors. A raw-row quote
+            // displaced a cheaper packed owner on selective COUNT cuts, despite allocating every dense lane.
+            if (args.filter != null and passShare(plan_inputs) <= selective_share and
+                denseCountLimit(args, agg_calls, group_outputs) != null)
+            {
+                const ordinary = selectedGroupBytes(ndv_stat.?, agg_calls.len, n_workers, passShare(plan_inputs));
+                dense_profitable = quote <= ordinary;
+            }
+            if (dense_profitable) plan_inputs.dense_bytes = quote;
         }
     };
     var scan_plan = planAggregate(plan_inputs);
     var packed_record_path: ?RecordAdmission = null;
     // Keep the established small-domain table/dense choice; owners replace a multi-pass count cut.
-    if (plan_inputs.readers or scan_plan.dispatch.strategy == .sketch) if (domain) |*d| {
+    if (plan_inputs.readers or scan_plan.dispatch.strategy == .sketch or !dense_profitable) if (domain) |*d| {
         if (explain) {
             packed_record_path = try inlinePackedAnswer(
                 gpa,
@@ -4511,7 +4535,7 @@ fn prepareAggregateWithMetas(
         block_bounds = bounds;
     }
     // A dense fold (below) needs one table more, after the workers': the one its lanes merge into.
-    const dense_wanted = domain != null and domain.?.globalFits(n_workers) and
+    const dense_wanted = dense_profitable and domain != null and domain.?.globalFits(n_workers) and
         decision.strategy == .plain_hash and !use_blocks and !part_on;
     const all_tables = try arena.alloc(expr_agg.GroupTable, n_tables + @intFromBool(dense_wanted));
     const group_tables = all_tables[0..n_tables];
@@ -22475,4 +22499,98 @@ test "integer and packed COUNT owner caps agree with EXPLAIN beyond sixty four w
             try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
         }
     }
+}
+
+test "dense profitability costs selected rows without discounting allocated lanes" {
+    const stat: NdvStat = .{ .rows = 30_000_000, .hi = 1_000_000, .key_bytes = 18 };
+    const dense_bytes = 395_185_450;
+    try testing.expect(selectedGroupBytes(stat, 1, 16, 0.01) < dense_bytes);
+    try testing.expect(selectedGroupBytes(stat, 1, 16, 0.30) > dense_bytes);
+    try testing.expectEqual(@as(u64, 0), selectedGroupBytes(stat, 1, 16, 0));
+    try testing.expectEqual(plainGroupRowBytes(stat, 1) * stat.hi * 16, selectedGroupBytes(stat, 1, 16, 1));
+    const wide: NdvStat = .{ .rows = std.math.maxInt(u64), .hi = std.math.maxInt(u64), .key_bytes = 18 };
+    try testing.expectEqual(std.math.maxInt(u64), selectedGroupBytes(wide, 1, 16, 1));
+}
+
+test "selective composite COUNT keeps its packed owner while wider filters retain dense lanes" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ints: [8192]i32 = undefined;
+    var names: [8192][]const u8 = undefined;
+    var filter: [8192]i32 = undefined;
+    for (&ints, &names, &filter, 0..) |*v, *s, *f, i| {
+        v.* = @intCast(i % 3);
+        s.* = try std.fmt.allocPrint(a, "key-{d}", .{i % 1024});
+        f.* = @intCast(i);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "a", .col = .{ .i32 = .{ .values = &ints } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "b", .col = .{ .string = .{ .values = &names } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+        .{ .name = "f", .col = .{ .i32 = .{ .values = &filter } }, .parquet_type = .INT32, .nullable = false },
+    };
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        a: std.mem.Allocator,
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            try c.bytes.appendSlice(c.a, bytes);
+        }
+    };
+    var capture: Capture = .{ .a = a };
+    _ = try consumer.writeAggregateRows(
+        a,
+        .{ .ctx = &capture, .write_fn = Capture.write },
+        &columns,
+        ints.len,
+        .SNAPPY,
+        .{},
+        .{},
+    );
+    var meta = try metadata.open(a, capture.bytes.items);
+    const groups = try a.alloc(schema.RowGroup, 16);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= 16;
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "selective-product", .bytes = capture.bytes.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "a,b",
+        .filter = "f < 1",
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .max_memory = 64 << 20,
+        .integer_records_min_rows = 0,
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3 },
+        .dense = false,
+        .integer_records = false,
+        .sketch_topk = .{ .cell_bits = 12 },
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+        var taken: std.EnumSet(FastPath) = .{};
+        args.parallelism = j;
+        args.decode_batch_rows = window;
+        args.dense = true;
+        args.integer_records = true;
+        args.taken = &taken;
+        const explanation = try explainAggregate(gpa, a, args);
+        try testing.expect(explanation.record_path != null);
+        try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+        try testing.expect(!explanation.dense);
+        var got = try prepareAggregate(gpa, a, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.integer_records));
+        try testing.expect(!taken.contains(.dense));
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+    };
+    args.filter = "f < 1000";
+    args.taken = null;
+    const wider = try explainAggregate(gpa, a, args);
+    try testing.expect(wider.dense);
 }

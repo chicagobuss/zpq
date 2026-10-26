@@ -73,6 +73,14 @@
       "duck": "SELECT u AS a,v AS b,count(*) AS c FROM '{path}' GROUP BY u,v ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
       "ordered": true,
       "parquet": true
+    },
+    {
+      "id": "packed-count:selected-domain-cost",
+      "kind": "product",
+      "sql": "SELECT k AS a,b,count(*) AS c FROM '{path}' WHERE f < -499 GROUP BY k,b ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT k AS a,b,count(*) AS c FROM '{path}' WHERE f < -499 GROUP BY k,b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "parquet": true
     }
   ]
 }

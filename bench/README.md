@@ -52,7 +52,9 @@ placement, every engine's sha256 and version, zpq-check's sha256, the cases' has
 A rep whose answer hashes like a validated answer of the same case and engine takes its verdict; anything else is
 judged again. `--resume RUN` continues a run whose pins are unchanged.
 
-Polars answers keep `EventTime` as epoch seconds only when it is still a timestamp (ClickBench q18 groups on a
+zpq has no views, so its ClickBench SQL is the query in DuckDB's fair form: create.sql's view and macro written in
+place (`EventDate` as `make_date(EventDate)`, `toDateTime(t)` as `epoch_ms(t * 1000)`); DuckDB and the oracle read
+through the view itself. Polars answers keep `EventTime` as epoch seconds only when it is still a timestamp (ClickBench q18 groups on a
 derived minute of that name). Writes use each shape's codec; zstd at level 3 where the engine takes a level.
 
 `python -m unittest discover -s bench/tests` checks the rules (the `bench-self` stage of the commit tier).

@@ -80,6 +80,14 @@ def case(suite, dataset, query_id, inputs, zpq, duck_sql, polars, truth_sql=None
             "truth": {"setup": setup, "sql": truth_sql, "mode": mode, "ranks": ranks(truth_sql)}}
 
 
+def fair_form(sql, path):
+    """zpq's form of a ClickBench query: zpq has no views, so DuckDB's create.sql view and macro are written into it
+    (`EventDate` read through make_date, `toDateTime(t)` as epoch_ms(t * 1000)) and `FROM hits` names the file."""
+    sql = re.sub(r"\bEventDate\b", "make_date(EventDate)", sql)
+    sql = re.sub(r"\btoDateTime\(([^()]*)\)", r"epoch_ms(\1 * 1000)", sql)
+    return re.sub(r"\bFROM hits\b", f"FROM {quote(path)}", sql)
+
+
 def clickbench():
     path = FAIR / "data/clickbench/hits.parquet"
     sqls = (CLICKBENCH / "duckdb-parquet/queries.sql").read_text().splitlines()
@@ -91,9 +99,8 @@ def clickbench():
     for i, sql in enumerate(s.strip().rstrip(";") for s in sqls):
         # STRLEN counts bytes; the published Polars form counts characters.
         expr = exprs[i].replace(".str.len_chars()", ".str.len_bytes()")
-        out.append(case("clickbench", "hits", i, [path], ["query", "--query", sql.replace("FROM hits",
-                        f"FROM {quote(path)}")], sql, {"form": "clickbench", "expr": expr, "columns": columns.get(i)},
-                        setup=setup))
+        out.append(case("clickbench", "hits", i, [path], ["query", "--query", fair_form(sql, path)], sql,
+                        {"form": "clickbench", "expr": expr, "columns": columns.get(i)}, setup=setup))
     return out
 
 

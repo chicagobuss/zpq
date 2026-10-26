@@ -27,6 +27,8 @@ test {
     _ = @import("owner_packed.zig");
     _ = @import("owner_pairs.zig");
     _ = @import("owner_sink.zig");
+    _ = @import("owner_result.zig");
+    _ = @import("owner_cost.zig");
 }
 
 const none = std.math.maxInt(u32);

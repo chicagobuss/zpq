@@ -81,6 +81,66 @@
       "duck": "SELECT k AS a,b,count(*) AS c FROM '{path}' WHERE f < -499 GROUP BY k,b ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
       "ordered": true,
       "parquet": true
+    },
+    {
+      "id": "packed-count:m1-int32-dual",
+      "kind": "product",
+      "sql": "SELECT f,v,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY f,v ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT f,v,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY f,v ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "dense": "0",
+      "encoded": "0",
+      "jobs": [
+        1,
+        4,
+        16
+      ],
+      "parquet": false
+    },
+    {
+      "id": "packed-count:m1-int32-dual:parquet",
+      "kind": "product",
+      "sql": "SELECT f,v,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY f,v ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT f,v,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY f,v ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "dense": "0",
+      "encoded": "0",
+      "jobs": [
+        1,
+        4,
+        16
+      ],
+      "parquet": true
+    },
+    {
+      "id": "packed-count:m1-uint64",
+      "kind": "product",
+      "sql": "SELECT u,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY u ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT u,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY u ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "dense": "0",
+      "encoded": "0",
+      "jobs": [
+        1,
+        4,
+        16
+      ],
+      "parquet": false
+    },
+    {
+      "id": "packed-count:m1-uint64:parquet",
+      "kind": "product",
+      "sql": "SELECT u,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY u ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT u,count(*) AS c,count(*) AS d FROM '{path}' WHERE rid>100 GROUP BY u ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "ordered": true,
+      "dense": "0",
+      "encoded": "0",
+      "jobs": [
+        1,
+        4,
+        16
+      ],
+      "parquet": true
     }
   ]
 }

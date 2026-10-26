@@ -1289,6 +1289,7 @@ pub const RecordAdmission = struct {
         integer_group_stream,
         integer_sum_top_h,
         integer_count_top_h,
+        packed_count_top_h,
         byte_group_stream,
         byte_sum_top_h,
         byte_count_top_h,
@@ -2083,7 +2084,10 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
         expr_agg.winner_charge = if (table == null) w.winners else null;
-        if (w.records) |records| records.start(w.record_starts[idx], idx);
+        if (w.records) |records| switch (records.*) {
+            .selected => |arm| arm.start(w.record_starts[idx], idx),
+            else => records.start(w.record_starts[idx], idx),
+        };
         defer expr_agg.winner_charge = null;
         const matched = consumer.scanRGForAgg(w.gpa, .{
             .rg = rg,
@@ -4393,6 +4397,51 @@ fn prepareAggregateWithMetas(
         }
     };
     var scan_plan = planAggregate(plan_inputs);
+    var selected_record_path: ?RecordAdmission = null;
+    // Keep the accepted dense choice. Sparse typed identities otherwise have one shared record/finish quote.
+    if (plan_inputs.dense_bytes == null or !dense_profitable) {
+        if (explain) {
+            selected_record_path = try inlineSelectedCount(
+                gpa,
+                arena,
+                args,
+                metas,
+                &plan,
+                work_items.items,
+                agg_calls,
+                group_by_keys,
+                group_outputs,
+                if (domain) |*d| d else null,
+                ndv_stat,
+                if (plan_inputs.sampled_pass) |sampled|
+                    provenPassShare(plan_inputs) * sampled
+                else
+                    passShare(plan_inputs),
+                n_workers,
+                t,
+                true,
+            );
+        } else if (try inlineSelectedCount(
+            gpa,
+            arena,
+            args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            if (domain) |*d| d else null,
+            ndv_stat,
+            if (plan_inputs.sampled_pass) |sampled|
+                provenPassShare(plan_inputs) * sampled
+            else
+                passShare(plan_inputs),
+            n_workers,
+            t,
+            false,
+        )) |answer| return answer;
+    }
     var packed_record_path: ?RecordAdmission = null;
     // Keep the established small-domain table/dense choice; owners replace a multi-pass count cut.
     if (plan_inputs.readers or scan_plan.dispatch.strategy == .sketch or !dense_profitable) if (domain) |*d| {
@@ -4470,7 +4519,7 @@ fn prepareAggregateWithMetas(
     else
         null;
     if (explain) {
-        const record_path = packed_record_path orelse try inlineDistinctAnswer(
+        const record_path = selected_record_path orelse packed_record_path orelse try inlineDistinctAnswer(
             gpa,
             arena,
             args,
@@ -4511,6 +4560,7 @@ fn prepareAggregateWithMetas(
                 .integer_group_stream,
                 .integer_sum_top_h,
                 .integer_count_top_h,
+                .packed_count_top_h,
                 .integer_distinct_top_h,
                 => @min(n_workers, owner_groups.max_workers),
                 else => n_workers,
@@ -6464,6 +6514,318 @@ fn outputNamesBytes(outputs: []const BoundOutputColumn) usize {
     var bytes = outputs.len *| @sizeOf([]const u8);
     for (outputs) |out| bytes +|= out.name.len;
     return bytes;
+}
+
+/// Equal-width raw numeric identities avoid a dictionary-wide comparison on every sliced callback. Retain coded
+/// identities where they make the physical record narrower, or where strings have no raw numeric image.
+fn ownerIdentity(
+    gpa: std.mem.Allocator,
+    keys: []const expr_ast.Expr,
+    domain: ?*const agg_dense.Domain,
+) !?key_pack.Plan {
+    var best = try key_pack.Plan.init(gpa, keys, null);
+    errdefer if (best) |*p| p.deinit(gpa);
+    if (domain) |d| if (best == null or !best.?.fitsBits(u64)) {
+        var coded = (try key_pack.Plan.init(gpa, keys, d)) orelse return best;
+        if (best == null or coded.fitsBits(u64)) {
+            if (best) |*p| p.deinit(gpa);
+            return coded;
+        }
+        coded.deinit(gpa);
+    };
+    return best;
+}
+
+fn inlineSelectedCount(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    domain: ?*const agg_dense.Domain,
+    stat: ?NdvStat,
+    pass_share: f64,
+    requested_workers: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    if (!args.integer_records or !allRescannable(args.inputs)) return null;
+    const keys = keys_opt orelse return null;
+    const outputs = outputs_opt orelse return null;
+    const program = agg_plan.OwnerProgram.init(calls) orelse return null;
+    if (program.len != 0 or program.distinct_arg != null or calls.len == 0) return null;
+    for (outputs) |out| if (out.derived != null) return null;
+    // Preserve P1's nullable INT64 sidecar and 16-byte producer while extending physical INT32 and tuples.
+    if (keys.len == 1 and keys[0] == .col_ref and keys[0].col_ref.physical_type == .INT64 and
+        !keys[0].col_ref.unsigned_64) return null;
+    const order = args.result_order;
+    if (order.keys.len != 1 or order.having != null or order.hidden.len != 0) return null;
+    if (order.keys[0].column >= outputs.len or outputs[order.keys[0].column].source != .agg) return null;
+    const limit = order.limit orelse return null;
+    const k = std.math.cast(usize, limit +| order.offset) orelse return null;
+    if (limit == 0 or k == 0 or k > 1024 or work.len == 0) return null;
+    const input_rows = RecordOrdinals.rows(metas) orelse return null;
+    if (input_rows >= @as(usize, 1) << 31) return null;
+    var rows: usize = 0;
+    for (work) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        rows = std.math.add(usize, rows, std.math.cast(usize, rg.num_rows) orelse return null) catch return null;
+        for (keys) |key| {
+            if (key != .col_ref) return null;
+            const cm = rg.columns.items[key.col_ref.col_idx].meta_data orelse return null;
+            if (metas[item.file].getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+        }
+    }
+    var identity = (try ownerIdentity(gpa, keys, domain)) orelse return null;
+    defer identity.deinit(gpa);
+    const workers = @min(requested_workers, owner_groups.max_workers);
+    switch (identity.kind()) {
+        .dense_u32, .packed_u64 => return selectedCountBits(
+            u64,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            &identity,
+            if (domain) |d| d.bytes else 0,
+            program,
+            stat,
+            pass_share,
+            input_rows,
+            rows,
+            workers,
+            k,
+            timings,
+            explain_only,
+        ),
+        .packed_u128 => return selectedCountBits(
+            u128,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            &identity,
+            if (domain) |d| d.bytes else 0,
+            program,
+            stat,
+            pass_share,
+            input_rows,
+            rows,
+            workers,
+            k,
+            timings,
+            explain_only,
+        ),
+        .decline => return null,
+    }
+}
+
+fn selectedCountBits(
+    comptime Bits: type,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    identity: *const key_pack.Plan,
+    domain_credit: usize,
+    program: agg_plan.OwnerProgram,
+    stat: ?NdvStat,
+    pass_share: f64,
+    input_rows: usize,
+    rows: usize,
+    workers: usize,
+    k: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const O = owner_groups.Packed(Bits, &.{}, u32);
+    const S = owner_groups.SelectedOwner(Bits, &.{}, u32);
+    const T = @import("owner_result.zig").Top(O.Group, bool, struct {
+        fn worse(desc: bool, x: O.Group, y: O.Group) std.math.Order {
+            if (x.weight != y.weight) return if (desc)
+                std.math.order(x.weight, y.weight)
+            else
+                std.math.order(y.weight, x.weight);
+            return std.math.order(y.first, x.first);
+        }
+    }.worse);
+    var key_bytes: usize = 0;
+    if (identity.domain) |d| for (outputs) |out| if (out.source == .key)
+        switch (d.axes[out.source.key].values) {
+            .bytes => |values| {
+                var widest: usize = 0;
+                for (values) |v| widest = @max(widest, v.len);
+                key_bytes +|= std.mem.alignForward(usize, widest, 16) +| 16;
+            },
+            else => {},
+        };
+    const names_credit = outputNamesBytes(outputs);
+    const per_row = @sizeOf([]const AggValue) +| outputs.len *| @sizeOf(AggValue) +| key_bytes;
+    const output_credit = names_credit +| k *| per_row;
+    const scratch_credit = workers *| (keys.len *| @sizeOf(key_pack.Plan.Binding) +|
+        @sizeOf(S) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
+        work.len *| (@sizeOf(S.Source) +| @sizeOf(u32)) +| identity.retainedBytes() +| domain_credit +|
+        k *| @sizeOf(MergedSlot) +| keys.len *| @sizeOf(KeyType) +| outputs.len *| @sizeOf(GroupColType);
+    const result_credit = T.bytes(workers, k) +| scratch_credit +| output_credit;
+    const selected: usize = @intFromFloat(@ceil(@as(f64, @floatFromInt(rows)) * std.math.clamp(pass_share, 0, 1)));
+    const q = @import("owner_cost.zig").quote(
+        Bits,
+        &.{},
+        u32,
+        rows,
+        selected,
+        workers,
+        result_credit,
+        args.byte_top_partitions,
+    ) orelse return null;
+    if (q.peak > args.max_memory) return null;
+    if (stat) |s| if (args.plain_rules and s.confidence == .upper_bound and
+        q.work > selectedGroupBytes(s, calls.len, workers, pass_share)) return null;
+    if (explain_only) return .{ .layout = .packed_count_top_h, .reservation = q.peak };
+    var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const ledger = args.ledger orelse &private_ledger;
+    const extra_credit = scratch_credit +| output_credit;
+    _ = ledger.drawExact(extra_credit) orelse return error.ExceededMemoryBudget;
+    var held: usize = 0;
+    defer ledger.release(extra_credit - held);
+    const state = (try O.State.init(gpa, ledger, input_rows, rows, workers, q.parts)) orelse
+        return error.ExceededMemoryBudget;
+    defer state.deinit();
+    var top = try T.init(gpa, ledger, workers, k, args.result_order.keys[0].descending);
+    defer top.deinit();
+    const starts = try arena.alloc(u32, work.len);
+    if (!RecordOrdinals.fill(metas, work, starts)) return error.BadColumn;
+    const sources = try arena.alloc(S.Source, work.len);
+    for (sources, work) |*s, item| s.* = .{ .file = item.file, .rg = item.rg };
+    const adapters = try arena.alloc(S, workers);
+    const sinks = try arena.alloc(consumer.RecordSink, workers);
+    var refused: std.atomic.Value(bool) = .init(false);
+    for (adapters, sinks, state.locals) |*adapter, *sink, *local| {
+        adapter.* = .{
+            .local = local,
+            .identity = identity,
+            .program = program,
+            .sources = sources,
+            .bindings = try arena.alloc(key_pack.Plan.Binding, keys.len),
+            .refused = &refused,
+        };
+        sink.* = .{ .selected = .{ .ctx = adapter, .startFn = S.startErased, .batchFn = S.batchErased } };
+    }
+    if (args.taken) |taken| taken.insert(.integer_records);
+    const run = runRecordWorkers(
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        sinks,
+        starts,
+        outputs,
+        timings,
+    ) catch |e| {
+        if (refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+        return e;
+    };
+    const prof = profile.threadOf(args.profiler, .main);
+    const begin = nowMonoNs();
+    try state.finish(top.receivers, T.Receiver.receive);
+    const fold_end = nowMonoNs();
+    profile.record(prof, .integer_fold, begin, fold_end, profile.args(.{}));
+    const groups = top.finish();
+    profile.record(prof, .integer_order, fold_end, nowMonoNs(), profile.args(.{}));
+    const slots = try arena.alloc(MergedSlot, groups.len);
+    for (groups, slots, 0..) |g, *slot, i| slot.* = .{ .key = &.{}, .first = g.first, .idx = i };
+    const View = struct {
+        groups: []const O.Group,
+        fn key(ctx: *const anyopaque, i: usize) u128 {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return v.groups[i].key;
+        }
+        fn integer(ctx: *const anyopaque, i: usize, _: usize) anyerror!?i128 {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return v.groups[i].weight;
+        }
+        fn value(ctx: *const anyopaque, _: std.mem.Allocator, i: usize, _: usize) anyerror!AggValue {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return .{ .i = v.groups[i].weight };
+        }
+    };
+    const view: View = .{ .groups = groups };
+    const key_types = try arena.alloc(KeyType, keys.len);
+    for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
+    const row_source: RowSource = .{
+        .slots = slots,
+        .outputs = outputs,
+        .calls = calls,
+        .key_types = key_types,
+        .key_exprs = keys,
+        .accs = &.{},
+        .folded = false,
+        .fixed_keys = false,
+        .identity = identity,
+        .owner = .{ .ctx = &view, .key = View.key, .integer = View.integer, .value = View.value },
+    };
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    const types = try arena.alloc(GroupColType, outputs.len);
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    for (outputs, names, types) |out, *name, *ty| {
+        name.* = try gpa.dupe(u8, out.name);
+        ty.* = .{
+            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else .i64,
+            .nullable = out.source == .key,
+            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
+        };
+    }
+    const out_rows = try gpa.alloc([]const AggValue, groups.len);
+    @memset(out_rows, &.{});
+    output.group_rows = out_rows;
+    try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+    // Arena metadata and result columns remain live until the query ends. The temporary identity/domain, owned
+    // records, heaps and fold tables do not; their credit returns as each phase releases them.
+    if (args.ledger != null) held = scratch_credit - domain_credit - identity.retainedBytes() +|
+        names_credit +| groups.len *| per_row;
+    var bytes_in: u64 = 0;
+    for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
+    return .{
+        .files_in = args.inputs.len,
+        .rows_in = run.rows_in,
+        .rows_scanned = run.rows_scanned,
+        .rows_matched = run.rows_matched,
+        .bytes_in = bytes_in,
+        .row_groups_in = run.row_groups_in,
+        .row_groups_pruned = run.row_groups_pruned,
+        .row_groups_full_match = run.row_groups_full_match,
+        .cols_stat_pruned = plan.cols_stat_pruned,
+        .timings = run.timings,
+        .output = output,
+        .part_agg = true,
+        .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
+    };
 }
 
 /// Retained value-equal axes form a complete tuple identity inside the existing integer COUNT owner.
@@ -23086,4 +23448,138 @@ test "selective composite COUNT keeps its packed owner while wider filters retai
     args.taken = null;
     const wider = try explainAggregate(gpa, a, args);
     try testing.expect(wider.dense);
+}
+
+test "selected packed COUNT runs the typed owner for INT32 keys with original NULL ties and sliced files" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var keys: [256]i32 = undefined;
+    var defs: [256]u32 = undefined;
+    var filter_values: [256]i32 = undefined;
+    for (&keys, &defs, &filter_values, 0..) |*key, *def, *f, i| {
+        key.* = @as(i32, @intCast(i % 17)) - 8;
+        def.* = @intFromBool(i % 23 != 0);
+        f.* = @intCast(i % 3);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{
+            .name = "k",
+            .col = .{ .i32 = .{ .values = &keys, .def_levels = &defs, .max_def = 1 } },
+            .parquet_type = .INT32,
+            .nullable = true,
+        },
+        .{ .name = "f", .col = .{ .i32 = .{ .values = &filter_values } }, .parquet_type = .INT32, .nullable = false },
+    };
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        allocator: std.mem.Allocator,
+        fn write(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            try c.bytes.appendSlice(c.allocator, bytes);
+        }
+    };
+    var capture: Capture = .{ .allocator = a };
+    _ = try consumer.writeAggregateRows(
+        a,
+        .{ .ctx = &capture, .write_fn = Capture.write },
+        &columns,
+        keys.len,
+        .SNAPPY,
+        .{},
+        .{},
+    );
+    var meta = try metadata.open(a, capture.bytes.items);
+    const groups = try a.alloc(schema.RowGroup, 32);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    var args: MultiAggArgs = .{
+        .inputs = &.{
+            .{ .name = "first", .bytes = capture.bytes.items },
+            .{ .name = "second", .bytes = capture.bytes.items },
+        },
+        .metas = &.{ meta, meta },
+        .aggregate = "count(*) AS c,count(*) AS d",
+        .group_by = "k",
+        .filter = "f < 1",
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .max_memory = 512 << 20,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 7, .offset = 2 },
+        .dense = false,
+        .encoded = false,
+        .plain_rules = false,
+        .integer_records = false,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    for ([_]usize{ 1, 4, 16 }) |jobs| for ([_]usize{ 0, 64 }) |window| {
+        var taken: std.EnumSet(FastPath) = .{};
+        args.integer_records = true;
+        args.parallelism = jobs;
+        args.decode_batch_rows = window;
+        args.taken = &taken;
+        const explanation = try explainAggregate(gpa, a, args);
+        try testing.expectEqual(.packed_count_top_h, explanation.record_path.?.layout);
+        var got = try prepareAggregate(gpa, a, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.integer_records));
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+        try testing.expect(!got.state.group_col_types.?[1].nullable);
+    };
+    args.parallelism = 96;
+    try testing.expectEqual(@as(usize, 64), (try explainAggregate(gpa, a, args)).workers);
+}
+
+test "sparse owner identity prefers raw numeric words but retains narrower coded or string keys" {
+    const Trial = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var values = [_]u64{9};
+            var trans = [_]u32{ 0, 1 };
+            var translations = [_][]u32{&trans};
+            var files = [_]usize{0};
+            var axes = [_]agg_dense.Axis{.{
+                .values = .{ .int32 = &values },
+                .trans = &translations,
+                .file_base = &files,
+                .bytes = 0,
+            }};
+            const domain: agg_dense.Domain = .{ .axes = &axes, .bytes = 0 };
+            const key: expr_ast.Expr = .{ .col_ref = .{
+                .col_idx = 0,
+                .physical_type = .INT32,
+                .expr_type = .i64,
+            } };
+            var raw = (try ownerIdentity(a, &.{key}, &domain)).?;
+            defer raw.deinit(a);
+            try testing.expect(raw.encoding.source == .raw and raw.domain == null and raw.fitsBits(u64));
+            const wide: expr_ast.Expr = .{ .col_ref = .{
+                .col_idx = 0,
+                .physical_type = .INT64,
+                .expr_type = .i64,
+                .unsigned_64 = true,
+            } };
+            axes[0].values = .{ .int64 = &values };
+            var coded = (try ownerIdentity(a, &.{wide}, &domain)).?;
+            defer coded.deinit(a);
+            try testing.expect(coded.encoding.source == .dictionary and coded.fitsBits(u64));
+            var chars = [_]u8{'x'};
+            var strings = [_][]u8{&chars};
+            axes[0].values = .{ .bytes = &strings };
+            const string: expr_ast.Expr = .{ .col_ref = .{
+                .col_idx = 0,
+                .physical_type = .BYTE_ARRAY,
+                .expr_type = .str,
+            } };
+            var text = (try ownerIdentity(a, &.{string}, &domain)).?;
+            defer text.deinit(a);
+            try testing.expect(text.encoding.source == .dictionary);
+        }
+    };
+    try Trial.run(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, Trial.run, .{});
 }

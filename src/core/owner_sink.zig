@@ -20,6 +20,17 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
         bindings: []key_plan.Plan.Binding,
         item: ?usize = null,
         input_base: u64 = 0,
+        refused: ?*std.atomic.Value(bool) = null,
+
+        pub fn startErased(ctx: *anyopaque, original_input_base: u64, item: usize) void {
+            const s: *Self = @ptrCast(@alignCast(ctx));
+            s.start(original_input_base, item);
+        }
+
+        pub fn batchErased(ctx: *anyopaque, source: SelectedBatch, lookup: []const ?usize) anyerror!void {
+            const s: *Self = @ptrCast(@alignCast(ctx));
+            return s.batch(source, lookup);
+        }
 
         pub fn start(s: *Self, original_input_base: u64, item: usize) void {
             s.item = item;
@@ -33,8 +44,10 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
             // DISTINCT has its own exact pair identity/reduction. Never accept it as an ordinary lane program.
             if (s.program.distinct_arg != null or !s.identity.fitsBits(Bits)) return error.BadAggArg;
             const at = s.sources[item];
-            const keys = (try s.identity.bindInto(s.bindings, source, lookup, at.file, at.rg)) orelse
+            const keys = (try s.identity.bindInto(s.bindings, source, lookup, at.file, at.rg)) orelse {
+                if (s.refused) |flag| flag.store(true, .monotonic);
                 return error.ExceededMemoryBudget;
+            };
             const payload = try L.bind(s.program, source.batch, lookup);
             const Callback = struct {
                 local: *O.Local,
@@ -170,18 +183,21 @@ test "owner sink late dictionary decline requests whole-attempt replay without a
     };
     const view: @import("filter/eval.zig").Batch = .{ .num_rows = 1, .cols = &columns };
     var binding: [1]key_plan.Plan.Binding = undefined;
+    var refused: std.atomic.Value(bool) = .init(false);
     var sink: S = .{
         .local = &owner.locals[0],
         .identity = &identity,
         .program = .{},
         .sources = &.{.{ .file = 0, .rg = 0 }},
         .bindings = &binding,
+        .refused = &refused,
     };
     sink.start(0, 0);
     try sink.batch(.{ .batch = &view }, &.{0});
     try std.testing.expectEqual(@as(usize, 1), owner.locals[0].accepted);
     columns[0].i32.dict = &.{42};
     try std.testing.expectError(error.ExceededMemoryBudget, sink.batch(.{ .batch = &view, .input_base = 1 }, &.{0}));
+    try std.testing.expect(refused.load(.monotonic));
     columns[0] = .{ .i32 = .{ .values = &.{9} } };
     try std.testing.expectError(error.ExceededMemoryBudget, sink.batch(.{ .batch = &view, .input_base = 1 }, &.{0}));
     try std.testing.expectEqual(@as(usize, 1), owner.locals[0].accepted);

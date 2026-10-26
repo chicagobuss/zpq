@@ -30,7 +30,7 @@ def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool) -
             "--user",
             "--scope",
             "-p",
-            "MemoryMax=20G",
+            "MemoryMax=16G",
             "-q",
             "--",
             "nice",

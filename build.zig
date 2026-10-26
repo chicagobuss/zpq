@@ -274,9 +274,6 @@ pub fn build(b: *std.Build) void {
     const release_smoke = b.addSystemCommand(&.{"tools/release_smoke.sh"});
     release_smoke.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     release_smoke.has_side_effects = true;
-    // An option, not the environment: the configured build graph is cached with the environment it first saw.
-    if (b.option([]const u8, "release-smoke-skip", "Runs release-smoke may skip: targets or <target>:lambda, comma-separated")) |skip|
-        release_smoke.addArgs(&.{ "--skip", skip });
     b.step("release-smoke", "Build every release target and run its CLI and Lambda where this host can")
         .dependOn(&release_smoke.step);
 

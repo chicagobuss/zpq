@@ -81,35 +81,11 @@ Use when:
 
 Don't use for TDD — fake (#1) is much faster and integrates with `zig build`.
 
-## 3. Cross-arch testing — qemu user + binfmt_misc
+## 3. Native architecture checks
 
-For testing the ARM64 Lambda binary on an x86_64 dev machine (or x86_64 binary on an ARM64 dev machine). **Process-level
-emulation, not a container** — gdb, ptrace, perf all work.
-
-### Linux
-
-```bash
-sudo apt install qemu-user-static binfmt-support
-# binfmt_misc auto-registers; foreign-arch ELF binaries run transparently
-zig build -Dtarget=aarch64-linux-musl lambda
-./zig-out/bin/zpq-lambda  # ARM64 binary, runs via qemu transparently
-
-# Same for the test runner:
-zig build -Dtarget=aarch64-linux-musl test-integration
-```
-
-Caveats:
-- Slower than native (~2–3× for compute, less for syscall-heavy code).
-- For correctness testing, perfect. For benchmarks, deploy to a real ARM host or use `benchmarks/`.
-- The kernel still reports x86_64 in `uname -m` to the emulated binary's perspective is mostly fine, but anything that
-  introspects via `/proc/cpuinfo` will see the host arch.
-
-### macOS
-
-QEMU's user-mode emulation (`qemu-aarch64`, `qemu-x86_64`) runs Linux binaries on a Linux kernel only; Homebrew's
-`qemu` on macOS provides full-system emulators, not user mode. `zpq-lambda` is a Linux binary (its runtime client and
-event loop make Linux system calls directly), so on a Mac run it inside a Linux VM (any Linux guest, with the qemu-user
-setup above for the other architecture) or test against a real Lambda.
+`tools/verify/verify arch --rev SHA --host oci-zt` builds and runs the ARM64
+CLI and Lambda bootstrap natively. See [arch.md](../tools/verify/arch.md).
+Foreign targets in local release-smoke report `elsewhere: verify arch`.
 
 ## What's intentionally *not* here
 

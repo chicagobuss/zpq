@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
 import perf
+import placement
 import provenance
 import scorecard_select
 import shipbar
@@ -35,6 +36,18 @@ def cell(engine, ns, query="q", failures=None, checked=3):
         "checked": checked,
         "failures": failures or [],
     }
+
+
+class RevisionTest(unittest.TestCase):
+    def test_reference_is_fixed_independent_of_host_order(self):
+        cfg = {"reference_host": "builder", "hosts": {"builder": {"target": "x86_64-linux-musl"}}}
+        self.assertEqual(placement.host_plan(cfg, ["arm", "mac"]), (["builder", "arm", "mac"], "builder"))
+        self.assertEqual(placement.host_plan(cfg, ["mac", "arm"]), (["builder", "arm", "mac"], "builder"))
+        self.assertTrue(cfg["hosts"]["builder"]["hash_only"])
+        self.assertEqual(placement.host_plan(cfg, ["arm"]), (["arm"], None))
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            verify.build_parser().parse_args(["full", "--base", "/bin/zpq", "--base-rev", "HEAD"])
 
 
 class CpuTest(unittest.TestCase):

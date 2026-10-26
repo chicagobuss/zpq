@@ -6,6 +6,40 @@ shift
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
 }
+if [ "$action" = release ]; then
+    cache_root=$1
+    revision=$2
+    target=$3
+    memory_max=$4
+    nice_level=$5
+    tree="$cache_root/source-$revision"
+    mkdir -p "$tree"
+    if [ ! -f "$tree/.ready" ]; then
+        tar -xf "$tree.tar" -C "$tree"
+        touch "$tree/.ready"
+        rm "$tree.tar"
+    fi
+    cp "$cache_root/release_smoke.sh" "$tree/tools/release_smoke.sh"
+    export PATH="$HOME/.local/bin:$HOME/zig-bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
+    cd "$tree"
+    mkdir -p "release/$target/bin"
+    cp "$cache_root/engine-$6/zpq" "release/$target/bin/zpq"
+    if [[ "$target" == *-linux-musl ]]; then
+        export ZIG_GLOBAL_CACHE_DIR="${cache_root%/*}/zig-cache"
+        export ZIG_LOCAL_CACHE_DIR="$tree/.zig-cache"
+        export ZIG="$(command -v zig || command -v anyzig)"
+        test "$("$ZIG" version)" = "$(cat .zig-version)" || { echo 'pinned Zig required' >&2; exit 2; }
+    fi
+    case "$(uname -s)/$(uname -m)/$target" in
+        Linux/aarch64/aarch64-linux-musl|Darwin/arm64/aarch64-macos) ;;
+        *) echo 'release target is not native to this host' >&2; exit 2 ;;
+    esac
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        exec systemd-run --user --scope --quiet -p "MemoryMax=$memory_max" \
+            nice -n "$nice_level" bash tools/release_smoke.sh --run-only "$tree/release" "$target"
+    fi
+    exec nice -n "$nice_level" bash tools/release_smoke.sh --run-only "$tree/release" "$target"
+fi
 if [ "$action" = setup ]; then
     cache_root=$1
     duck_platform=$2

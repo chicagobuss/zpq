@@ -15,9 +15,8 @@ name: Verify
 #      row counts) always fail; the full-pass count must not drop
 #      below the recorded baseline (72: legacy LZ4 joined the 69).
 #
-# The release-smoke job builds every release target and runs the Linux ones
-# (aarch64 under qemu); docs/macos.md covers running the macOS build on a
-# Mac. The verify job guards the production target.
+# Release smoke cross-builds every target and runs native checks.
+# Foreign runtime checks are placed by verify arch.
 
 on:
   push:
@@ -199,10 +198,7 @@ jobs:
       - name: libzpq (C ABI, sanitizers, Python, differential)
         run: OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
-  # Every release artifact built as it ships and RUN (tools/release_smoke.sh): the x86_64 CLI and Lambda bootstrap
-  # natively, the aarch64 ones under qemu (qemu-user-binfmt runs the bootstrap child the integration harness spawns).
-  # The macOS targets are built and explicitly skipped: they run on a Mac. A separate job, so its four ReleaseFast
-  # builds stay off the verify job's budget.
+  # Build every release artifact; run native CLI and Lambda checks.
   release-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -214,12 +210,5 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Install qemu for aarch64 (skipped where it is already there)
-        run: |
-          if ! command -v qemu-aarch64 >/dev/null || ! grep -qs '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq qemu-user qemu-user-binfmt
-          fi
-
       - name: Build and run the release artifacts
-        run: zig build release-smoke -Drelease-smoke-skip=aarch64-macos,x86_64-macos
+        run: zig build release-smoke

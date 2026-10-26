@@ -561,7 +561,7 @@ def topn_budget(out_dir):
 def topn_descending(out_dir, rows=100_000):
     """ci/fixtures/parquet/topn_descending.parquet: one row group of 100000 required INT32 values, descending, no
 statistics, so an ascending Top-N's every row improves on the last and evicts the row before it (the serial Top-N's
-kept-key memory under its budget). tools/memory_gate_fixtures.py writes the same shape at 4M rows."""
+kept-key memory under its budget)."""
     out = out_dir / "topn_descending.parquet"
     values = pa.array(range(rows - 1, -1, -1), pa.int32())
     table = pa.Table.from_arrays([values], schema=pa.schema([pa.field("k", pa.int32(), nullable=False)]))

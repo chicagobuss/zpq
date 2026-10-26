@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 
@@ -102,7 +103,8 @@ def run(args):
             assert cid not in cases, f"duplicate case id: {cid}"
             cases[cid] = path
     env = {k: v for k, v in os.environ.items() if k not in names}
-    args.out.mkdir(parents=True, exist_ok=False)
+    shutil.rmtree(args.out, ignore_errors=True)  # scratch: a rerun never reads an earlier run's outputs
+    args.out.mkdir(parents=True)
     records = []
     con = duckdb.connect()
     con.execute("SET threads=2")

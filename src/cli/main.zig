@@ -1270,5 +1270,6 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
 }
 
 test {
-    _ = @import("inspect.zig");
+    // The test-bearing files under this root, listed by build.zig (tests.gen.zig).
+    _ = @import("tests.gen.zig");
 }

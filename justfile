@@ -32,9 +32,11 @@ build-debug:
 build-minimal:
     zig build -Dsql=false -Doptimize=ReleaseFast cli
 
-# Build releases and run native CLI/Lambda; foreign checks: verify arch.
+# The shipped CLI as it ships (ReleaseFast, stripped) through the release cases; CI runs this on each native runner.
 release-smoke:
-    zig build release-smoke
+    zig build -Doptimize=ReleaseFast -Dstrip=true --prefix zig-out/release cli
+    zig build check-runner -Doptimize=ReleaseSafe
+    zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq zig-out/release/bin/zpq --no-cache
 
 # The Lambda deploy zips (musl static, ReleaseFast) for both archs, built by
 # tools/serverless/aws.sh. ReleaseFast, not ReleaseSmall: on Lambda the small
@@ -63,72 +65,43 @@ bootstrap:
     PATH="$HOME/.zvm/$ZV:$PATH" zig build --summary none
     echo "bootstrap done — add ~/.zvm/$ZV to PATH (or alias zig)"
 
-# === Tests (three tiers, fastest first) ===
+# === Tests: the gates are build.zig steps (tools/check/README.md) ===
 #
-#   Tier 1  `just test`      inner loop — pure-Zig, no external deps,
-#                            safety-checked (Debug). Known-output unit tests
-#                            + the fuzz-lite PRNG loop. Seconds. Run as you go.
-#   Tier 2  `just check`     pre-commit / per-PR — Tier 1 + lambda integration
-#                            + cross-impl smoke (ZPQ writes → pyarrow reads).
-#                            Needs pyarrow. ~1 min. Mirrors CI.
-#   Tier 3  `just gauntlet`  occasional / pre-release — fetches the
-#                            apache/parquet-testing corpus into
-#                            data/parquet-testing so the fixture-gated decode
-#                            tests run against real Spark/foreign-writer files
-#                            (cross-impl decode validation), then the full
-#                            suite + conformance + smoke.
-#
-# Cross-impl validation lives in Tiers 2-3 by design (Tier-2 doctrine:
-# "synthetic fixtures lie"). Tier 1 stays dependency-free for speed; it
-# checks our work against hand-known outputs, the gauntlet checks it against
-# the rest of the ecosystem.
+#   edit    `just test-core [filter]` (`zig build check -Dtier=edit`)  core unit tests, ReleaseSafe
+#   commit  `just check`     (`zig build check -Dtier=commit`)  fixtures, core units, the runner's self-test and
+#                            every commit-tier case against the cached DuckDB oracle
+#   full    `just full`      (`zig build check -Dtier=full`)  Debug units, integration, every case uncached, the
+#                            parquet-testing corpus, ClickBench, path parity, OS contracts, libzpq
+#   fleet   `just fleet`     the full tier's shards over the fleet (tools/check/fleet.sh), one verdict
+# Each stage leaves a log and a receipt in zig-out/receipts; a tier passes only on clean receipts for HEAD.
 
-# Tier 1 — inner loop. Pass a filter substring to narrow, e.g. `just test decimal`.
+# The unit tests in Debug. Pass a filter substring to narrow, e.g. `just test decimal`.
 test *args="":
     zig build test --summary all -- {{args}}
 
-# Tier 2 — run before every commit.
-check: test-modules test test-integration differential libzpq
+test-core filter="":
+    zig build check -Dtier=edit {{ if filter != "" { "-Dtest-filter=" + filter } else { "" } }}
 
-# Static guard for Zig's lazy test discovery. Every src file containing a
-# top-level test must be directly rooted by one of the two test artifacts.
-test-modules:
-    python3 tools/check_test_modules.py
+check:
+    zig build check -Dtier=commit
 
-# Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
-# fetch-corpus first so `test` picks up the real decimal/etc. fixtures.
-gauntlet: fetch-corpus test test-integration differential corpus contracts
-    @echo "gauntlet: all tiers green (corpus-backed cross-impl + differential + conformance)."
+full:
+    zig build check -Dtier=full
 
-# Fetch the same apache/parquet-testing revision used by CI into the gitignored
-# data directory. Pinning keeps the local release gate from changing whenever
-# upstream adds a new format fixture; bump this SHA and CI's together.
-parquet_testing_sha := "3acde70509f990c4ddfe34bf3ab05890657e766c"
-fetch-corpus:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    corpus=data/parquet-testing
-    if [[ ! -d "$corpus/.git" ]]; then
-      git clone --filter=blob:none --no-checkout https://github.com/apache/parquet-testing "$corpus"
-    fi
-    git -C "$corpus" fetch --quiet --depth 1 origin {{parquet_testing_sha}}
-    git -C "$corpus" checkout --quiet --detach {{parquet_testing_sha}}
+fleet *args:
+    tools/check/fleet.sh {{args}}
+
+# apache/parquet-testing at tools/check/corpus.pin, and the generated fixtures (every tier runs this first).
+fixtures:
+    tools/check/fixtures.sh
 
 # Lambda integration tests — spawns the binary against an in-process fake.
 test-integration:
     zig build test-integration --summary all
 
-# Differential test (adopted from Hardwood): ZPQ vs DuckDB ROW-BY-ROW across a
-# matrix of filter × projection × select × aggregate shapes, on an adversarial
-# multi-row-group fixture. Catches composition bugs aggregate-scalar checks miss
-# (it found the dict-index bit-width-0 write corruption). Needs duckdb+pyarrow in
-# the .venv. Tier 2.
-differential:
-    {{python}} tools/verify/verify.py stage differential
-
-# libzpq, the C ABI (Tier 2): its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close
-# cycles), the Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte
-# for byte. Needs gcc (the sanitizer runtime) and duckdb+pyarrow in the .venv.
+# libzpq, the C ABI: its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close cycles), the
+# Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte for byte.
+# Needs gcc (the sanitizer runtime) and duckdb+pyarrow in the .venv. Part of the full tier.
 libzpq:
     PYTHON={{python}} OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
@@ -142,10 +115,14 @@ handoff *args:
     {{python}} -I tests/handoff/run.py {{args}}
 
 # Every apache/parquet-testing file against its declared outcome (tools/check/cases/corpus.json).
-corpus: fetch-corpus
-    zig build -Doptimize=ReleaseFast
-    zig build -Doptimize=ReleaseSafe check
-    zig-out/bin/zpq-check --cases tools/check/cases/corpus.json --no-cache
+corpus:
+    zig build check -Dtier=full -Dshard=corpus
+
+# Idle-gap work (no gate waits on it): the encoded/materialized A/B aggregate fuzz against the same binary, then
+# coverage-guided fuzzing. Commit any crasher as a fixture with a case.
+idle seed="1234" queries="600":
+    zig build -Doptimize=ReleaseSafe cli
+    {{python}} tools/agg_ab_fuzz.py --zpq zig-out/bin/zpq --seed {{seed}} --queries {{queries}}
 
 # Coverage-guided fuzzing on the pinned Zig toolchain; the fuzz-lite seeds also run in `test`.
 fuzz filter="fuzz:":
@@ -225,7 +202,7 @@ clean:
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
 
-# OS-level contracts (publication, permissions, pipes, S3 uploads, sync and write faults); full tier. The
+# OS-level contracts (publication, permissions, pipes, S3 uploads, sync and write faults); full tier's `os` shard. The
 # loop-device and device-mapper contracts skip by name: on a dedicated host with passwordless sudo, add --privileged.
 contracts:
     zig build -Doptimize=ReleaseFast

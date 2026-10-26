@@ -464,7 +464,8 @@ const no_environ = [_:null]?[*:0]const u8{};
 const testing = std.testing;
 
 test {
-    _ = @import("budget.zig");
+    // The test-bearing files under this root, listed by build.zig (tests.gen.zig).
+    _ = @import("tests.gen.zig");
 }
 
 test "options: a ceiling, a wait, nothing, or an error" {

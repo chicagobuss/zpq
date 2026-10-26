@@ -91,7 +91,7 @@ def python_environment(repo: Path) -> dict:
 def resolved_cpu(repo: Path, requested: str) -> str:
     if requested != "native" and not requested.startswith(("native+", "native-")):
         return requested
-    ran = _run([str(repo / "tools/verify/zigw"), "targets"], timeout=30)
+    ran = _run(["zig", "targets"], timeout=30)
     # The pinned Zig release emits ZON; read its detected model from the native CPU block.
     match = re.search(r'\.native\s*=\s*\.\{.*?\.cpu\s*=\s*\.\{.*?\.name\s*=\s*"([^"]+)"', ran.stdout, re.S)
     if ran.returncode != 0 or not match:
@@ -100,7 +100,7 @@ def resolved_cpu(repo: Path, requested: str) -> str:
 
 
 def corpus_environment(repo: Path) -> dict:
-    expected = re.search(r'parquet_testing_sha := "([0-9a-f]{40})"', (repo / "justfile").read_text()).group(1)
+    expected = (repo / "tools/check/corpus.pin").read_text().strip()
     path = repo / "data/parquet-testing"
     actual = None
     if (path / ".git").exists():

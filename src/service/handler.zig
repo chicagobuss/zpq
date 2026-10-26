@@ -1290,7 +1290,8 @@ test "a rejected filter echoes its expression escaped" {
 }
 
 test {
-    _ = @import("request.zig");
+    // The test-bearing files under this root, listed by build.zig (tests.gen.zig).
+    _ = @import("tests.gen.zig");
 }
 
 test "an engine error names the failed S3 request, its phase, and its error or status and S3 code" {

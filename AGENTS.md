@@ -44,18 +44,17 @@ So:
 
 ### Test tiers (fastest first)
 
-The workflow is tiered so the inner loop stays fast while cross-impl validation still happens on a cadence. Don't skip
-the gauntlet before a release.
+The gates are build.zig steps (tools/check/README.md); each stage leaves a receipt, and a tier passes only on clean
+receipts for HEAD with nothing failed or skipped. Don't skip the full tier before a release.
 
-- **Tier 1 — `just test`**: inner loop. Pure-Zig, no external deps, safety-checked. Known-output unit tests + the
-  fuzz-lite PRNG loop. Seconds. Run constantly as you work. Checks our logic against *hand-known outputs* — fast, but
-  self-referential by nature.
-- **Tier 2 — `just check`**: before every commit. Tier 1 + lambda integration + the cross-impl smoke (ZPQ writes →
-  pyarrow reads). Needs pyarrow. Mirrors CI.
-- **Tier 3 — `just gauntlet`**: on a cadence and before releases. Fetches the `apache/parquet-testing` corpus into
-  `data/parquet-testing` so the fixture-gated decode tests run against real Spark/foreign-writer files (the cross-impl
-  decode validation), then the full suite + conformance + smoke. This is what catches the "almost right" wire-format
-  bugs above — a Tier-1 self-round-trip will not.
+- **edit — `zig build check -Dtier=edit [-Dtest-filter=X]`** (`just test-core`): the core unit tests in ReleaseSafe.
+  Run constantly as you work. Checks our logic against *hand-known outputs* — fast, but self-referential by nature.
+- **commit — `zig build check -Dtier=commit`** (`just check`): before every commit. Fixtures, the core units, the
+  runner's self-test, and every case against the cached DuckDB oracle, written files read back by PyArrow. Mirrors CI.
+- **full — `zig build check -Dtier=full`** (`just full`, or `tools/check/fleet.sh` across the fleet): on a cadence
+  and before releases. Debug units, integration, every case uncached, the pinned `apache/parquet-testing` corpus with
+  a declared outcome per file, ClickBench, path parity, OS contracts, libzpq, and the architecture check. This is
+  what catches the "almost right" wire-format bugs above — a self-round-trip will not.
 
 ## Documentation discipline
 

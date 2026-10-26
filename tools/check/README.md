@@ -73,3 +73,33 @@ values within the scalar tolerance; `dense`, `stats_select` and `product` compar
 its exact binary value; corpus modes compare each float at its column's width.
 
 Empty, limited (`--only`, `--limit`) and failed runs never exit 0.
+
+## Tiers
+
+The gates are build.zig steps; CI and the justfile call them.
+
+| Tier | Command | Stages |
+|---|---|---|
+| edit | `zig build check -Dtier=edit [-Dtest-filter=X]` | core unit tests (ReleaseSafe) |
+| commit | `zig build check -Dtier=commit` | fixtures, core unit tests, the runner's self-test, every commit-tier case file against the cached oracle |
+| full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-test, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, libzpq |
+| fleet | `tools/check/fleet.sh` | the full tier's shards (tools/check/shards.json) over the fleet, plus the architecture check |
+
+Each stage runs through `zpq-check stage` under its timeout (a hang fails the stage, its process group killed) and
+leaves `zig-out/receipts/NAME.log` and `NAME.json`: the SHA and whether the tree was clean, the host, compiler and
+oracle, the case files' tree hash, the fixtures, and the counts its runner printed. `zpq-check verdict` passes a tier
+only when every stage has a receipt for HEAD from a clean tree, its log still hashes as recorded, it ran something,
+failed nothing and skipped nothing. Unit-test skips are named and never allowed: `tools/check/fixtures.sh` puts
+apache/parquet-testing at `tools/check/corpus.pin` and generates the unit tests' large fixtures (`tools/zpq-gen
+bench`, `nested`) before anything runs. Contracts skip only by a named need (`--privileged`).
+
+Every test root imports the `tests.gen.zig` build.zig writes beside it, listing the files under it that declare tests,
+so no test file goes unrooted.
+
+The architecture check runs every case answers-only (`--answers-only --reuse-fixtures --manifest`) on each fleet host
+from a shipped bundle, and `zpq-check manifest-diff` requires the host's answers to equal this host's, case for case.
+Placement: granted-mbp runs only with `--host` or `--release`, and a host that is timing (an active `zpq-*` unit, a
+held `/mnt/fast/zpq-out/timing.lock`, a running full gate) is skipped.
+
+The release tier is the GitHub native matrix: each runner builds the CLI as it ships and runs `cases/release.json`
+through it, and on Linux the shipped Lambda through the fake runtime (`zig build integration-bin`).

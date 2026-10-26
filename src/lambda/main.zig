@@ -504,6 +504,6 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filte
 }
 
 test {
-    _ = @import("runtime.zig");
-    _ = @import("scan.zig");
+    // The test-bearing files under this root, listed by build.zig (tests.gen.zig).
+    _ = @import("tests.gen.zig");
 }

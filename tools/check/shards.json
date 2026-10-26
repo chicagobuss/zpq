@@ -1,0 +1,13 @@
+{
+  "about": "Full-tier shards: static, sized from measured stage times (minutes); tools/check/fleet.sh places them. Only units-core and units ship to fleet hosts (test binaries need no toolchain); the rest run on the build host.",
+  "shards": {
+    "units-core": {"stages": ["units-core"], "minutes": 25},
+    "units": {"stages": ["units-lambda", "units-cli", "units-service", "units-libzpq"], "minutes": 3},
+    "cases": {"stages": ["integration", "check-self", "cases-fresh"], "minutes": 9},
+    "corpus": {"stages": ["corpus", "canonical"], "minutes": 2},
+    "clickbench": {"stages": ["clickbench"], "minutes": 4, "needs": ["clickbench"]},
+    "os": {"stages": ["contracts", "path-parity"], "minutes": 4},
+    "cpu": {"stages": ["cpu-parity"], "minutes": 6},
+    "libzpq": {"stages": ["libzpq"], "minutes": 8}
+  }
+}

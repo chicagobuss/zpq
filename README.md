@@ -442,8 +442,8 @@ R2 and checks them against the sha256 digests in `vendor/boring_tls/prebuilt.sha
 
 ```bash
 just build           # ReleaseFast — both binaries
-just test            # unit tests (fixture-dependent ones report as
-                     # skipped unless the parquet-testing corpus is present)
+just check           # the commit gate: fixtures, unit tests, every case against DuckDB
+just full            # the full gate (tools/check/README.md)
 just test-integration  # Lambda integration tests
 just lambda-build    # static musl Lambda zips (ReleaseFast), both archs
 just lambda-deploy zpq-filter-s3 x86_64   # push to AWS

@@ -71,3 +71,7 @@ perf.data.old
 
 # local scratch scripts/folders
 scratch/
+
+# Written by build.zig (generateTestRoots) on every build
+src/**/tests.gen.zig
+src/tests.gen.zig

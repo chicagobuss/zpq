@@ -607,7 +607,11 @@ pub fn groupedCoded(
     if (try foldExactBatch(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     if (try foldFloatBatches(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     const agg_len = calls.len;
+    const fused = try ra.alloc(bool, calls.len);
+    @memset(fused, false);
+    try fuseBareFloats(ra, table, gid_of, comp, space, calls, batch, lookup, fold_sel, fused);
     for (calls, 0..) |call, ai| {
+        if (fused[ai]) continue;
         const accs = table.accumulators.items;
         // Inlining the large reduction kernel into the scan increases register pressure on dense controls.
         try @call(.never_inline, foldGroupedCall, .{
@@ -855,11 +859,14 @@ fn foldFloatBatches(
         }
     }
     if (!computed) return false;
+    const fused = try ra.alloc(bool, calls.len);
+    @memset(fused, false);
+    try fuseBareFloats(ra, table, gid_of, comp, space, calls, batch, lookup, outer, fused);
     const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) + space *| 32;
     const batch_rows = expr_eval.floatBatchRows(plan.liveBytesPerRow(), fixed, batch.expr_batch_rows);
     if (batch_rows == 0) return false;
     // Bare columns already have dictionary/histogram folds: leave those full-column shortcuts in place.
-    for (calls, roots, 0..) |call, root, ai| if (root == null) {
+    for (calls, roots, 0..) |call, root, ai| if (root == null and !fused[ai]) {
         try foldGroupedCall(
             ra,
             gpa,
@@ -879,6 +886,7 @@ fn foldFloatBatches(
     const cols = try pa.alloc(Column, batch.cols.len);
     var scratch = @import("../row_group_arena.zig").RowGroupArena.init(ra);
     defer scratch.deinit();
+    const share_rows = try seedable(ra, gid_of);
     var off: usize = 0;
     while (off < batch.num_rows) {
         scratch.nextRowGroup();
@@ -888,7 +896,34 @@ fn foldFloatBatches(
         const sel = try outer.alignedWindow(off, n);
         const win: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .sel = &sel };
         const values = try plan.evaluate(a, &win, lookup);
+        const expr_fused = try a.alloc(bool, calls.len);
+        @memset(expr_fused, false);
+        if (share_rows) {
+            const expr_roots = try a.alloc(FloatRoot, calls.len);
+            var nexpr: usize = 0;
+            for (calls, roots, 0..) |call, root, ai| if (root) |r| {
+                const slice = exprFloatValues(call, values[r], table, ai) orelse continue;
+                if (slice.len != n) continue;
+                expr_roots[nexpr] = .{ .ai = ai, .values = slice };
+                nexpr += 1;
+            };
+            if (nexpr >= 2) {
+                try foldFloatPartials(
+                    a,
+                    table.accumulators.items,
+                    gid_of,
+                    comp[off..][0..n],
+                    space,
+                    calls.len,
+                    &sel,
+                    table,
+                    expr_roots[0..nexpr],
+                );
+                for (expr_roots[0..nexpr]) |root| expr_fused[root.ai] = true;
+            }
+        }
         for (calls, roots, 0..) |call, root, ai| if (root) |r| {
+            if (expr_fused[ai]) continue;
             try foldGroupedValue(
                 a,
                 gpa,
@@ -990,6 +1025,91 @@ fn testFloatBatches(a: std.mem.Allocator) !void {
     try std.testing.expectEqualDeep(want.accumulators.items, got.accumulators.items);
 }
 
+test "fused float sums match call-major row order" {
+    try testFusedFloatSums(std.testing.allocator);
+}
+
+fn testFusedFloatSums(a: std.mem.Allocator) !void {
+    const old = expr_eval.forced_batch_rows;
+    expr_eval.forced_batch_rows = 4096;
+    defer expr_eval.forced_batch_rows = old;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n = 32769;
+    const xs = try ra.alloc(f64, n);
+    const ys = try ra.alloc(f64, n);
+    const comp = try ra.alloc(u32, n);
+    for (xs, ys, comp, 0..) |*x, *y, *c, r| {
+        x.* = switch (r % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
+        };
+        y.* = switch (r % 5) {
+            0 => 1e16,
+            1 => -1,
+            2 => 1e16,
+            3 => 0.5,
+            else => -1e16,
+        };
+        c.* = @intCast(r % 4);
+    }
+    const cols = [_]Column{
+        .{ .f64 = .{ .values = xs } },
+        .{ .f64 = .{ .values = ys } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1 };
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var y: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    const sum_xy: expr_ast.Expr = .{ .binop = .{
+        .op = .add, .left = &x, .right = &y, .result_type = .f64, .depth = 2,
+    } };
+    const x_plus: expr_ast.Expr = .{ .binop = .{
+        .op = .add, .left = &x, .right = &one, .result_type = .f64, .depth = 2,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = x, .result = .f64, .where = null, .alias = "sx" },
+        .{ .func = .sum, .arg = y, .result = .f64, .where = null, .alias = "sy" },
+        .{ .func = .sum, .arg = sum_xy, .result = .f64, .where = null, .alias = "sxy" },
+        .{ .func = .avg, .arg = x_plus, .result = .avg_f64, .where = null, .alias = "ax" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 11 == 0) sel.set(r, false);
+    var want = agg.GroupTable.init(a, 1 << 24);
+    defer want.deinit();
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    const keys = [_][]const u8{ "a", "b", "c", "d" };
+    for (keys) |key| {
+        _ = try want.getOrInsert(key, &calls, 0);
+        _ = try got.getOrInsert(key, &calls, 0);
+    }
+    const gids = [_]u32{ 0, 1, 2, 3 };
+    for (calls, 0..) |call, ai| try foldGroupedCall(
+        ra,
+        a,
+        want.accumulators.items,
+        &gids,
+        comp,
+        4,
+        ai,
+        calls.len,
+        call,
+        &batch,
+        &lookup,
+        &sel,
+        &want,
+    );
+    fuse_probe.passes = 0;
+    try std.testing.expect(try foldFloatBatches(ra, a, &got, &gids, comp, 4, &calls, &batch, &lookup, &sel));
+    try std.testing.expect(fuse_probe.passes >= 2);
+    try std.testing.expectEqualDeep(want.accumulators.items, got.accumulators.items);
+}
+
 pub fn foldGroupedCall(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -1021,6 +1141,126 @@ pub fn foldGroupedCall(
         maybe_table,
         null,
     );
+}
+
+const FloatRoot = struct { ai: usize, values: []const f64 };
+
+const fuse_probe = if (@import("builtin").is_test) struct {
+    threadlocal var passes: usize = 0;
+} else struct {};
+
+/// Float SUM/AVG roots that share a selection. One walk visits rows in `forEachActive` order; each root adds
+/// into its own partial, starting from that group's running sum, so the bits match a separate pass per root.
+fn foldFloatPartials(
+    ra: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    agg_len: usize,
+    sel: *const Sel,
+    table: ?*agg.GroupTable,
+    roots: []const FloatRoot,
+) !void {
+    if (comptime @import("builtin").is_test) {
+        if (roots.len >= 2) fuse_probe.passes += 1;
+    }
+    const parts = try ra.alloc([]f64, roots.len);
+    for (roots, parts) |root, *part| {
+        const p = try ra.alloc(f64, space);
+        for (p, gid_of) |*slot, g| {
+            slot.* = if (g == unresolved) 0 else switch (accs[g * agg_len + root.ai]) {
+                .sum_f => |t| t orelse 0,
+                .avg => |a| a.sum,
+                else => 0,
+            };
+        }
+        part.* = p;
+    }
+    const seen = try ra.alloc(u64, space);
+    @memset(seen, 0);
+    forEachActive(sel, comp.len, struct {
+        fn f(ctx: anytype, r: usize) void {
+            const cp = ctx.comp[r];
+            ctx.seen[cp] += 1;
+            for (ctx.roots, ctx.parts) |root, part| part[cp] += root.values[r];
+        }
+    }.f, .{ .comp = comp, .seen = seen, .roots = roots, .parts = parts });
+    for (roots, parts) |root, part| {
+        for (0..space) |cp| {
+            if (seen[cp] == 0) continue;
+            var local: Accumulator = undefined;
+            const st = statePtr(table, accs, gid_of[cp], root.ai, agg_len, &local);
+            switch (st.*) {
+                .sum_f => |*s| s.* = part[cp],
+                .avg => |*a| {
+                    a.sum = part[cp];
+                    a.count += seen[cp];
+                },
+                else => return error.UnsupportedAggType,
+            }
+            if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], root.ai, agg_len, st.*);
+        }
+    }
+}
+
+fn floatFoldSkipped(table: *agg.GroupTable, ai: usize) bool {
+    return table.compact.stride != 0 and table.compact.fields[ai].shared_sum;
+}
+
+fn exprFloatValues(call: AggCall, col: Column, table: *agg.GroupTable, ai: usize) ?[]const f64 {
+    if (!floatSum(call) or call.where != null or floatFoldSkipped(table, ai)) return null;
+    if (col != .f64 or col.f64.has_nulls) return null;
+    return col.f64.values;
+}
+
+fn bareFloatValues(
+    ra: std.mem.Allocator,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    table: *agg.GroupTable,
+    ai: usize,
+) !?[]const f64 {
+    if (!floatSum(call) or call.where != null or floatFoldSkipped(table, ai)) return null;
+    const arg = call.arg orelse return null;
+    if (arg != .col_ref or arg.col_ref.expr_type != .f64) return null;
+    const pos = lookup[arg.col_ref.col_idx] orelse return null;
+    const col = batch.cols[pos];
+    if (col.nullInfo().max_rep > 0) return null;
+    const has_nulls = switch (col) {
+        inline else => |c| c.has_nulls,
+    };
+    if (has_nulls) return null;
+    const raw = try materialize(ra, col);
+    return try expr_eval.widenToF64(ra, raw);
+}
+
+/// Two or more bare float sums share one pass. Fewer than two leaves every call on its own path.
+fn fuseBareFloats(
+    ra: std.mem.Allocator,
+    table: *agg.GroupTable,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    fused: []bool,
+) !void {
+    if (calls.len < 2 or !try seedable(ra, gid_of)) return;
+    const roots = try ra.alloc(FloatRoot, calls.len);
+    var n: usize = 0;
+    for (calls, 0..) |call, ai| {
+        const values = (try bareFloatValues(ra, call, batch, lookup, table, ai)) orelse continue;
+        if (values.len != comp.len) continue;
+        roots[n] = .{ .ai = ai, .values = values };
+        n += 1;
+    }
+    if (n < 2) return;
+    try foldFloatPartials(ra, table.accumulators.items, gid_of, comp, space, calls.len, outer, table, roots[0..n]);
+    for (roots[0..n]) |root| fused[root.ai] = true;
 }
 
 fn foldGroupedValue(
@@ -1200,6 +1440,11 @@ fn foldGroupedValue(
     @memset(seen, 0);
     switch (vals_col) {
         .f64 => |vc| {
+            if (call.func == .sum or call.func == .avg) {
+                const one = [_]FloatRoot{.{ .ai = ai, .values = vc.values }};
+                try foldFloatPartials(ra, accs, gid_of, comp, space, agg_len, sel, table, &one);
+                return;
+            }
             const v = vc.values;
             const is_min = call.func == .min;
             const part = try ra.alloc(f64, space);

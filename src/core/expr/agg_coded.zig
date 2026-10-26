@@ -777,6 +777,8 @@ fn foldExactBatch(
     const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
     @memset(partials, null);
     const restricted = batch.restrictedTo(outer);
+    // Selected rows per composite, shared by every root whose lane has no levels.
+    var present: ?[]u64 = null;
     for (calls, roots, 0..) |call, root, ai| {
         if (root) |r| {
             const v = try plan.evaluate(ra, &restricted, lookup, r);
@@ -785,7 +787,13 @@ fn foldExactBatch(
                     const delta = try ra.alloc(agg.DecSum, space);
                     @memset(delta, .{});
                     switch (v) {
-                        inline .i32, .i64, .i128 => |col| for (comp, 0..) |cp, row| {
+                        inline .i32, .i64 => |col| {
+                            const counted = col.def_levels != null or present == null;
+                            const sums, const counts = try narrowSums(ra, space, comp, col, outer, counted);
+                            if (col.def_levels == null and present == null) present = counts;
+                            for (delta, sums, counts orelse present.?) |*d, sum, n| d.add(sum, n);
+                        },
+                        .i128 => |col| for (comp, 0..) |cp, row| {
                             if (!outer.isActive(row) or (col.def_levels != null and
                                 col.def_levels.?[row] < col.max_def)) continue;
                             delta[cp].add(col.values[row], 1);
@@ -1054,6 +1062,131 @@ fn testFloatBatches(a: std.mem.Allocator) !void {
     try std.testing.expectEqualDeep(want.accumulators.items, got.accumulators.items);
 }
 
+test "exact batches sum 64-bit DECIMAL lanes in i128 at their extremes, with NULLs, selections and i128 inputs" {
+    // Few composites take interleaved partials; past a quarter of the rows each composite takes one.
+    for ([_]usize{ 5, 9000 }) |space| try testExactBatches(std.testing.allocator, space);
+}
+
+fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    // Not a multiple of 64, so the last selection word is partial.
+    const n = 32769;
+    const max18: i64 = 999_999_999_999_999_999;
+    const wide: i128 = std.math.pow(i128, 10, 37);
+    const big = try ra.alloc(i64, n);
+    const half = try ra.alloc(i64, n);
+    const small = try ra.alloc(i32, n);
+    const huge = try ra.alloc(i128, n);
+    const shadow = try ra.alloc(f64, n);
+    const defs = try ra.alloc(u32, n);
+    const comp = try ra.alloc(u32, n);
+    for (big, half, small, huge, shadow, defs, comp, 0..) |*b, *h, *sm, *hg, *f, *d, *c, r| {
+        // Runs of one sign at DECIMAL(18)'s extremes: any 64-bit running sum would overflow.
+        b.* = if (r % 6 < 3) max18 else -max18 + @as(i64, @intCast(r % 5));
+        h.* = if (r % 2 == 0) @divTrunc(max18, 2) else -@as(i64, @intCast(r));
+        sm.* = if (r % 3 == 0) -999_999_999 else @intCast(r);
+        hg.* = if (r % 4 == 0) -wide else wide - @as(i128, @intCast(r));
+        f.* = 0;
+        d.* = @intFromBool(r % 19 != 0);
+        // A null row's slot holds garbage the fold must not read as a value.
+        if (d.* == 0) h.* = std.math.minInt(i64);
+        c.* = @intCast((r * 7 + r / 3) % space);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = big, .unscaled = .{ .i64 = big } } },
+        .{ .i64 = .{
+            .values = half,
+            .unscaled = .{ .i64 = half },
+            .def_levels = defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+        .{ .i32 = .{ .values = small, .unscaled = .{ .i32 = small } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = huge } } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1, 2, 3 };
+    const d18: expr_ast.Dec = .{ .precision = 18, .scale = 2 };
+    var c0: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .dec, .dec = d18 } };
+    var c1: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .dec, .dec = d18 } };
+    const c2: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 2,
+        .physical_type = .INT32,
+        .expr_type = .dec,
+        .dec = .{ .precision = 9, .scale = 2 },
+    } };
+    const c3: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 3,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = .{ .precision = 38, .scale = 2 },
+    } };
+    // DECIMAL(19, 2): past 18 digits, computed in the checked 64-bit lane while its values fit one.
+    const plus: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c1,
+        .right = &c0,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = .{ .precision = 19, .scale = 2 },
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = c0, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .avg, .arg = c1, .result = .avg_dec, .where = null, .alias = "b" },
+        .{ .func = .sum, .arg = plus, .result = .dec, .where = null, .alias = "c" },
+        .{ .func = .avg, .arg = c2, .result = .avg_dec, .where = null, .alias = "d" },
+        .{ .func = .sum, .arg = c3, .result = .dec, .where = null, .alias = "e" },
+        .{ .func = .sum, .arg = c1, .result = .dec, .where = null, .alias = "f" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 7 == 0 or r / 64 == 80) sel.set(r, false);
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    const gids = try ra.alloc(u32, space);
+    var key: [8]u8 = undefined;
+    for (gids, 0..) |*g, cp| {
+        std.mem.writeInt(u64, &key, cp, .little);
+        g.* = try got.getOrInsert(&key, &calls, 0);
+    }
+    try std.testing.expect(try foldExactBatch(ra, a, &got, gids, comp, space, &calls, &batch, &lookup, &sel));
+    // Row by row, at 192 bits.
+    const want_sum = try ra.alloc(i192, space * calls.len);
+    const want_n = try ra.alloc(u64, space * calls.len);
+    @memset(want_sum, 0);
+    @memset(want_n, 0);
+    for (0..n) |r| {
+        if (!sel.isActive(r)) continue;
+        const present = defs[r] == 1;
+        const row = [_]?i192{
+            big[r],
+            if (present) half[r] else null,
+            if (present) @as(i192, half[r]) + big[r] else null,
+            small[r],
+            huge[r],
+            if (present) half[r] else null,
+        };
+        for (row, 0..) |v, ai| if (v) |x| {
+            want_sum[comp[r] * calls.len + ai] += x;
+            want_n[comp[r] * calls.len + ai] += 1;
+        };
+    }
+    var sizable = false;
+    for (gids, 0..) |g, cp| for (calls[0 .. calls.len - 1], 0..) |_, ai| {
+        const d = switch (got.accumulators.items[g * calls.len + ai]) {
+            .sum_d, .avg_d => |d| d,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(want_sum[cp * calls.len + ai], d.get());
+        try std.testing.expectEqual(want_n[cp * calls.len + ai], d.n);
+        if (@abs(d.get()) > std.math.maxInt(i64)) sizable = true;
+    };
+    // With few composites the 64-bit lanes reach sums no 64-bit accumulator holds.
+    if (space * sum_lanes <= n) try std.testing.expect(sizable);
+}
+
 test "fused float sums match call-major row order" {
     try testFusedFloatSums(std.testing.allocator);
 }
@@ -1094,10 +1227,18 @@ fn testFusedFloatSums(a: std.mem.Allocator) !void {
     var y: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
     var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
     const sum_xy: expr_ast.Expr = .{ .binop = .{
-        .op = .add, .left = &x, .right = &y, .result_type = .f64, .depth = 2,
+        .op = .add,
+        .left = &x,
+        .right = &y,
+        .result_type = .f64,
+        .depth = 2,
     } };
     const x_plus: expr_ast.Expr = .{ .binop = .{
-        .op = .add, .left = &x, .right = &one, .result_type = .f64, .depth = 2,
+        .op = .add,
+        .left = &x,
+        .right = &one,
+        .result_type = .f64,
+        .depth = 2,
     } };
     const calls = [_]AggCall{
         .{ .func = .sum, .arg = x, .result = .f64, .where = null, .alias = "sx" },
@@ -1255,10 +1396,18 @@ fn mixedFloatOracle(a: std.mem.Allocator) !struct { bits: [7]u64, count: u64, or
     const zref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 3, .physical_type = .DOUBLE, .expr_type = .f64 } };
     const wref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 4, .physical_type = .DOUBLE, .expr_type = .f64 } };
     const sum_xy: expr_ast.Expr = .{ .binop = .{
-        .op = .add, .left = &xref, .right = &yref, .result_type = .f64, .depth = 2,
+        .op = .add,
+        .left = &xref,
+        .right = &yref,
+        .result_type = .f64,
+        .depth = 2,
     } };
     const sum_xmy: expr_ast.Expr = .{ .binop = .{
-        .op = .sub, .left = &xref, .right = &yref, .result_type = .f64, .depth = 2,
+        .op = .sub,
+        .left = &xref,
+        .right = &yref,
+        .result_type = .f64,
+        .depth = 2,
     } };
     const calls = [_]AggCall{
         .{ .func = .sum, .arg = xref, .result = .f64, .where = null, .alias = "sx" },
@@ -1283,7 +1432,17 @@ fn mixedFloatOracle(a: std.mem.Allocator) !struct { bits: [7]u64, count: u64, or
     var stub_sel = try Sel.init(ra, 1);
     const stub_batch: filter_eval.Batch = .{ .cols = &stub_cols, .num_rows = 1 };
     try std.testing.expect(try groupedCoded(
-        ra, a, &calls, &.{key}, &table, 0, &stub_batch, &lookup, &stub_sel, null, null,
+        ra,
+        a,
+        &calls,
+        &.{key},
+        &table,
+        0,
+        &stub_batch,
+        &lookup,
+        &stub_sel,
+        null,
+        null,
     ));
     const seed_z: f64 = -0.0;
     table.accumulators.items[0] = .{ .sum_f = 0 };
@@ -1299,7 +1458,17 @@ fn mixedFloatOracle(a: std.mem.Allocator) !struct { bits: [7]u64, count: u64, or
     for (0..n) |r| if (r % 17 == 0) sel.set(r, false);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
     try std.testing.expect(try groupedCoded(
-        ra, a, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null,
+        ra,
+        a,
+        &calls,
+        &.{key},
+        &table,
+        0,
+        &batch,
+        &lookup,
+        &sel,
+        null,
+        null,
     ));
 
     var ox: f64 = 0;
@@ -1841,6 +2010,71 @@ pub fn compositeFirstRows(
         }
     }
     return first;
+}
+
+/// Interleaved partials per composite in `narrowSums`: a run of rows in one composite adds into as many independent
+/// slots, so no add waits on the store of the one before it.
+const sum_lanes = 4;
+
+/// A 64-bit (or narrower) exact lane's sums per composite over `sel`'s non-null rows, and with `counted` how many rows
+/// each took. Fewer than 2^64 values under 2^63 sum inside i128, so there is no bound to prove, and the 192-bit
+/// `DecSum` add runs once per composite rather than per row. Inactive and null rows add zero rather than branch.
+fn narrowSums(
+    ra: std.mem.Allocator,
+    space: usize,
+    comp: []const u32,
+    col: anytype,
+    sel: *const Sel,
+    counted: bool,
+) !struct { []i128, ?[]u64 } {
+    // Lanes only where their scratch stays within a row-sized buffer.
+    if (space * sum_lanes <= comp.len) {
+        if (counted) return narrowSumsAt(sum_lanes, true, ra, space, comp, col, sel);
+        return narrowSumsAt(sum_lanes, false, ra, space, comp, col, sel);
+    }
+    if (counted) return narrowSumsAt(1, true, ra, space, comp, col, sel);
+    return narrowSumsAt(1, false, ra, space, comp, col, sel);
+}
+
+fn narrowSumsAt(
+    comptime lanes: usize,
+    comptime counted: bool,
+    ra: std.mem.Allocator,
+    space: usize,
+    comp: []const u32,
+    col: anytype,
+    sel: *const Sel,
+) !struct { []i128, ?[]u64 } {
+    const V = @TypeOf(col.values[0]);
+    const part = try ra.alloc(i128, space * lanes);
+    @memset(part, 0);
+    const cnt = if (counted) try ra.alloc(u64, space * lanes) else {};
+    if (counted) @memset(cnt, 0);
+    const n = comp.len;
+    for (sel.mask, 0..) |word, w| {
+        if (word == 0) continue;
+        const base = w * 64;
+        for (base..@min(base + 64, n)) |r| {
+            var keep: u1 = @truncate(word >> @intCast(r - base));
+            if (col.def_levels) |dl| keep &= @intFromBool(dl[r] >= col.max_def);
+            const slot = @as(usize, comp[r]) * lanes + r % lanes;
+            part[slot] += col.values[r] & -%@as(V, keep);
+            if (counted) cnt[slot] += keep;
+        }
+    }
+    if (lanes == 1) return .{ part, if (counted) cnt else null };
+    const sums = try ra.alloc(i128, space);
+    for (sums, 0..) |*s, cp| {
+        s.* = 0;
+        for (part[cp * lanes ..][0..lanes]) |p| s.* += p;
+    }
+    if (!counted) return .{ sums, null };
+    const counts = try ra.alloc(u64, space);
+    for (counts, 0..) |*c, cp| {
+        c.* = 0;
+        for (cnt[cp * lanes ..][0..lanes]) |p| c.* += p;
+    }
+    return .{ sums, counts };
 }
 
 fn compositeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u64 {

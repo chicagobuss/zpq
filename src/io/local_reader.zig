@@ -1261,11 +1261,19 @@ fn rewindSq(ring: *linux.IoUring) void {
 }
 
 fn sqHolds(ring: *linux.IoUring, idx: usize) bool {
+    const want: u64 = idx;
     var i = @atomicLoad(u32, ring.sq.head, .acquire);
     const tail = @atomicLoad(u32, ring.sq.tail, .acquire);
     while (i != tail) : (i +%= 1) {
         const at = ring.sq.array[i & ring.sq.mask];
-        if (ring.sq.sqes[at].user_data == @as(u64, idx)) return true;
+        if (ring.sq.sqes[at].user_data == want) return true;
+    }
+    // `read` queues here before `flush_sq` publishes the shared array. A failure between those two
+    // leaves them unsubmitted; waiting on a completion for one never returns.
+    var q = ring.sq.sqe_head;
+    const qtail = ring.sq.sqe_tail;
+    while (q != qtail) : (q +%= 1) {
+        if (ring.sq.sqes[q & ring.sq.mask].user_data == want) return true;
     }
     return false;
 }

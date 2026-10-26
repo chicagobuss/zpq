@@ -755,10 +755,16 @@ fn gatherRows(
             if (c.max_rep > 0 or c.levels_only_rows != 0 or c.hist != null) return null;
             const T = @typeInfo(@TypeOf(c.values)).pointer.child;
             var out = c;
-            if (!c.codesOnly()) {
+            // A length-only string column has no value slices. Compacting the empty buffer would read past it.
+            if (!c.codesOnly() and (c.byte_lengths == null or c.values.len != 0)) {
                 const vals = try arena.alloc(T, surviving);
                 encoder.compactByMask(T, c.values, sel.mask, vals);
                 out.values = vals;
+            }
+            if (c.byte_lengths) |lens| {
+                const kept_lens = try arena.alloc(u32, surviving);
+                encoder.compactByMask(u32, lens, sel.mask, kept_lens);
+                out.byte_lengths = kept_lens;
             }
             if (c.codes) |k| {
                 const codes = try arena.alloc(u32, surviving);
@@ -3204,6 +3210,61 @@ test "a selected window keeps original indexes and rejects a gather past the win
     try std.testing.expectEqual(@as(u64, 40), try slice.ordinal(0));
 }
 
+test "a selected record arm keeps group-key codes and original gathered rows" {
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+    };
+    const Capture = struct {
+        n: usize = 0,
+        ords: [2]u64 = undefined,
+        fn start(_: *anyopaque, _: u64, _: usize) void {}
+        fn batch(ctx: *anyopaque, view: SelectedBatch, _: []const ?usize) !void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            for (0..view.batch.num_rows) |i| {
+                c.ords[c.n] = try view.ordinal(i);
+                c.n += 1;
+            }
+        }
+    };
+    var cap: Capture = .{};
+    var arm: RecordSink = .{ .selected = .{
+        .ctx = @ptrCast(&cap),
+        .startFn = Capture.start,
+        .batchFn = Capture.batch,
+    } };
+    var target: AggTarget = .{ .grouped = .{
+        .calls = &.{},
+        .keys = &keys,
+        .table = undefined,
+        .pos_base = 0,
+        .records = &arm,
+    } };
+    try std.testing.expect(target.codedKey(0));
+    try std.testing.expect(target.codedKey(1));
+    try std.testing.expect(!target.codedKey(2));
+
+    const batch: filter_eval.Batch = .{ .cols = &.{}, .num_rows = 2 };
+    var mask = [_]u64{0b11};
+    const sel: filter_selection.SelectionVector = .{ .allocator = std.testing.allocator, .len = 2, .mask = &mask };
+    const gathered = try selectedWindow(&batch, null, 100, &.{ 4, 9 }, 10);
+    try arm.emit(gathered, &.{}, 0, &sel);
+    try std.testing.expectEqual(@as(u64, 104), cap.ords[0]);
+    try std.testing.expectEqual(@as(u64, 109), cap.ords[1]);
+
+    cap.n = 0;
+    const plain = try selectedWindow(&batch, null, 50, null, 2);
+    try arm.emit(plain, &.{}, 7, &sel);
+    try std.testing.expectEqual(@as(u64, 50), cap.ords[0]);
+    try std.testing.expectEqual(@as(u64, 51), cap.ords[1]);
+
+    const backwards = try selectedWindow(&batch, null, 100, &.{ 9, 4 }, 10);
+    try std.testing.expectError(error.RetainedEncodingUnsupported, arm.emit(backwards, &.{}, 0, &sel));
+    var dummy: owner_groups.IntFull.Local = undefined;
+    const legacy: RecordSink = .{ .integer = &dummy };
+    try std.testing.expectError(error.RetainedEncodingUnsupported, legacy.emit(gathered, &.{}, 0, &sel));
+}
+
 pub const PackedCount = struct {
     pub const Source = struct { file: usize, rg: usize };
 
@@ -3245,7 +3306,25 @@ pub const IntegerCountSink = struct {
     }
 };
 
-/// The owned-record layouts share worker startup and decoded-batch routing.
+/// One callback for every key and lane layout. `startFn` receives the original global row of the item, pruned rows
+/// included. `batchFn` borrows the view until it returns; `row` indexes that view, and order and ties use
+/// `SelectedBatch.ordinal` only. A gathered `input_rows` is window-relative.
+pub const SelectedRecords = struct {
+    ctx: *anyopaque,
+    startFn: *const fn (*anyopaque, u64, usize) void,
+    batchFn: *const fn (*anyopaque, SelectedBatch, []const ?usize) anyerror!void,
+
+    pub fn start(s: SelectedRecords, original_input_base: u64, item: usize) void {
+        s.startFn(s.ctx, original_input_base, item);
+    }
+
+    pub fn batch(s: SelectedRecords, view: SelectedBatch, lookup: []const ?usize) !void {
+        return s.batchFn(s.ctx, view, lookup);
+    }
+};
+
+/// The owned-record layouts share worker startup and decoded-batch routing. `.selected` is the only arm that may
+/// see a gathered view. The other tags keep packed `ordinal_base + offset + i` for an ungathered window.
 pub const RecordSink = union(enum) {
     integer: *owner_groups.IntFull.Local,
     integer_top: *owner_groups.IntSumTop.Local,
@@ -3254,9 +3333,12 @@ pub const RecordSink = union(enum) {
     byte_top: *owner_groups.SumTop.Local,
     byte_count_top: *owner_groups.CountTop.Local,
     msd: *msd_groups.Local,
+    selected: SelectedRecords,
 
     pub fn start(s: RecordSink, ordinal_base: u32, item: usize) void {
         switch (s) {
+            // Packed work-item base. The scan starts `.selected` through `SelectedRecords.start` instead.
+            .selected => unreachable,
             .msd => |local| local.start(ordinal_base, item),
             .integer_count_top => |s0| s0.local.start(ordinal_base, item),
             inline else => |local| local.start(ordinal_base, item),
@@ -3297,11 +3379,155 @@ pub const RecordSink = union(enum) {
         if (count == 0) return;
         const selected: ?*const filter_selection.SelectionVector = if (count == view.num_rows) null else sel;
         switch (s) {
+            .selected => unreachable,
             .integer_count_top => |s0| try s0.batch(view, lookup, offset, selected),
             inline else => |local| try local.batchSelected(view, lookup, offset, selected),
         }
     }
+
+    /// A gathered view goes only to `.selected`, and only when `input_rows` is strictly increasing. Any other tag
+    /// declines, so those original indexes cannot be read as `offset + i`. An ungathered `.selected` view uses
+    /// `input_base` (the slice offset already included) and ignores `legacy_offset`.
+    pub fn emit(
+        s: RecordSink,
+        view: SelectedBatch,
+        lookup: []const ?usize,
+        legacy_offset: usize,
+        legacy_sel: *const filter_selection.SelectionVector,
+    ) !void {
+        if (view.input_rows) |rows| {
+            if (!strictlyAscending(rows)) return error.RetainedEncodingUnsupported;
+            if (rows.len != 0) {
+                _ = view.ordinal(0) catch |err| switch (err) {
+                    error.Overflow => return error.RetainedEncodingUnsupported,
+                    error.BadColumn => return error.BadColumn,
+                };
+                _ = view.ordinal(rows.len - 1) catch |err| switch (err) {
+                    error.Overflow => return error.RetainedEncodingUnsupported,
+                    error.BadColumn => return error.BadColumn,
+                };
+            }
+            switch (s) {
+                .selected => |arm| return arm.batch(view, lookup),
+                else => return error.RetainedEncodingUnsupported,
+            }
+        }
+        switch (s) {
+            .selected => |arm| return arm.batch(view, lookup),
+            else => return s.batch(view.batch.*, lookup, legacy_offset, legacy_sel),
+        }
+    }
 };
+
+fn strictlyAscending(rows: []const u32) bool {
+    if (rows.len < 2) return true;
+    var prev = rows[0];
+    for (rows[1..]) |row| {
+        if (row <= prev) return false;
+        prev = row;
+    }
+    return true;
+}
+
+/// `.selected` with a partial mask gathers every column into ascending window indexes and emits those rows.
+/// A column that cannot be gathered (nested, histogram, levels-only) keeps the mask and `input_rows` null.
+fn emitRecords(
+    arena: std.mem.Allocator,
+    records: *const RecordSink,
+    batch: *const filter_eval.Batch,
+    sel: *const filter_selection.SelectionVector,
+    input_base: u64,
+    legacy_offset: usize,
+    lookup: []const ?usize,
+) !void {
+    const kept = sel.count();
+    if (records.* != .selected or kept == batch.num_rows or batch.num_rows > std.math.maxInt(u32)) {
+        const window = try selectedWindow(batch, sel, input_base, null, batch.num_rows);
+        return records.emit(window, lookup, legacy_offset, sel);
+    }
+    const rows = try arena.alloc(u32, kept);
+    var w: usize = 0;
+    for (0..sel.len) |i| if (sel.isActive(i)) {
+        rows[w] = @intCast(i);
+        w += 1;
+    };
+    const cols = try arena.alloc(filter_eval.Batch.Column, batch.cols.len);
+    for (batch.cols, cols) |c, *o| {
+        o.* = (try gatherRows(arena, c, sel, kept)) orelse {
+            const window = try selectedWindow(batch, sel, input_base, null, batch.num_rows);
+            return records.emit(window, lookup, legacy_offset, sel);
+        };
+    }
+    const gathered: filter_eval.Batch = .{ .cols = cols, .num_rows = kept };
+    const window = try selectedWindow(&gathered, null, input_base, rows, batch.num_rows);
+    var ones = try filter_selection.SelectionVector.init(arena, kept);
+    return records.emit(window, lookup, legacy_offset, &ones);
+}
+
+/// Group keys and aggregates over the rows `sel` kept. A sparse selection is gathered first, so `resolveBatch`
+/// walks survivors and each group's first row stays the original ordinal (`pos + ordinals[i]`). A sketch clears
+/// the caller's selection as it counts, which a gathered copy would not, so that path keeps the mask.
+fn foldGroupedBatch(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    resolver: *expr_agg.GroupKeyResolver,
+    table: *expr_agg.GroupTable,
+    calls: []const expr_agg.AggCall,
+    key_cols: []const filter_eval.Batch.Column,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *filter_selection.SelectionVector,
+    ids: []u32,
+    pos: u64,
+) !void {
+    const kept = sel.count();
+    if (table.sketch == null and kept != 0 and kept != sel.len and sel.len <= std.math.maxInt(u32)) {
+        if (try gatherUnder(arena, batch.cols, key_cols, sel, kept)) |g| {
+            try resolver.resolveBatch(arena, table, g.key_cols, calls, pos, &g.sel, ids, g.ordinals);
+            if (!table.countOnly()) for (calls, 0..) |_, i| {
+                try expr_agg.updateTableGrouped(arena, gpa, table, ids, i, calls, &g.batch, lookup, &g.sel);
+            };
+            return;
+        }
+    }
+    try resolver.resolveBatch(arena, table, key_cols, calls, pos, sel, ids, null);
+    try expr_agg.sinkSketchRows(table, ids, sel);
+    if (!table.countOnly()) for (calls, 0..) |_, i| {
+        try expr_agg.updateTableGrouped(arena, gpa, table, ids, i, calls, batch, lookup, sel);
+    };
+}
+
+const GatheredFold = struct {
+    key_cols: []filter_eval.Batch.Column,
+    batch: filter_eval.Batch,
+    sel: filter_selection.SelectionVector,
+    ordinals: []u32,
+};
+
+fn gatherUnder(
+    arena: std.mem.Allocator,
+    cols: []const filter_eval.Batch.Column,
+    key_cols: []const filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    kept: usize,
+) !?GatheredFold {
+    const rows = try arena.alloc(u32, kept);
+    var w: usize = 0;
+    for (0..sel.len) |i| if (sel.isActive(i)) {
+        rows[w] = @intCast(i);
+        w += 1;
+    };
+    const out_cols = try arena.alloc(filter_eval.Batch.Column, cols.len);
+    for (cols, out_cols) |c, *o| o.* = (try gatherRows(arena, c, sel, kept)) orelse return null;
+    const out_keys = try arena.alloc(filter_eval.Batch.Column, key_cols.len);
+    for (key_cols, out_keys) |c, *o| o.* = (try gatherRows(arena, c, sel, kept)) orelse return null;
+    return .{
+        .key_cols = out_keys,
+        .batch = .{ .cols = out_cols, .num_rows = kept },
+        .sel = try filter_selection.SelectionVector.init(arena, kept),
+        .ordinals = rows,
+    };
+}
 
 /// What `scanRGForAgg` folds a row group's surviving rows into. The caller owns the state, which persists across
 /// row groups of one query.
@@ -3353,6 +3579,11 @@ pub const AggTarget = union(enum) {
                 for (r.integer_count_top.packing.?.keys) |key| {
                     if (key.col_ref.col_idx == ci) return true;
                 };
+            // The generic arm keeps dictionary codes for every group key. Materializing them makes bind decline.
+            if (r.* == .selected) {
+                for (self.grouped.keys) |key| if (key == .col_ref and key.col_ref.col_idx == ci) return true;
+                return false;
+            }
         };
         // The ordinary multi-aggregate consumer can fold dictionary products too. Keeping the original codes
         // avoids expanding strings only to intern them again; the row fallback materializes only if it needs to.
@@ -3574,6 +3805,9 @@ fn sliceColumn(col: filter_eval.Batch.Column, lo: usize, n: usize) filter_eval.B
             if (c.rep_levels) |rl| if (rl.len >= lo + n) {
                 o.rep_levels = rl[lo..][0..n];
             };
+            if (c.byte_lengths) |lens| {
+                if (lens.len >= lo + n) o.byte_lengths = lens[lo..][0..n];
+            }
             if (c.unscaled) |u| o.unscaled = switch (u) {
                 .i32 => |v| if (v.len >= lo + n) .{ .i32 = v[lo..][0..n] } else u,
                 .i64 => |v| if (v.len >= lo + n) .{ .i64 = v[lo..][0..n] } else u,
@@ -3799,11 +4033,7 @@ fn foldGroupedWindows(
         @memset(ids, 0);
         var resolver = expr_agg.GroupKeyResolver.init(key_cols);
         defer resolver.deinit(wa);
-        try resolver.resolveBatch(wa, g.table, key_cols, g.calls, pos, &win_sel, ids);
-        try expr_agg.sinkSketchRows(g.table, ids, &win_sel);
-        if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-            try expr_agg.updateTableGrouped(wa, gpa, g.table, ids, i, g.calls, &win, lookup, &win_sel);
-        };
+        try foldGroupedBatch(wa, gpa, &resolver, g.table, g.calls, key_cols, &win, lookup, &win_sel, ids, pos);
         try part.pump(local, g.table, @intCast(win_sel.count()));
         off += n;
     }
@@ -4306,6 +4536,8 @@ fn scanRGForAggImpl(
     if (keep != null) sel = try filter_selection.SelectionVector.init(ra, batch_rows);
     // Payload columns decode after the filter, gated by its survivors; a staged plan decodes them with its calls.
     dec.payload = try payloadColumns(ra, in, target);
+    var length_of = try ra.alloc(bool, in.read.len);
+    @memset(length_of, false);
     var filtered = false;
     for ([_]bool{ false, true }) |late| for (in.read, 0..) |needed, ci| {
         if (late and dec.payload == null) break;
@@ -4338,6 +4570,7 @@ fn scanRGForAggImpl(
                 return kept;
             return err;
         };
+        if (col == .string and col.string.byte_lengths != null) length_of[ci] = true;
         try batch_cols.append(ra, col);
     };
     const t_decode_end = nowMonoNs();
@@ -4348,8 +4581,6 @@ fn scanRGForAggImpl(
         t.record(.decode, t_decode_start, t_decode_end, decode_args);
     }
 
-    if (target == .grouped and target.grouped.records == null and !staged and decode_options.encoded)
-        try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const batch: filter_eval.Batch = .{
         .cols = batch_cols.items,
         .num_rows = batch_rows,
@@ -4357,7 +4588,20 @@ fn scanRGForAggImpl(
     };
     if (in.filter) |f| if (!filtered) try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     // A staged plan's call columns decode below, after the filter: payload among them is gated the same way.
-    if (dec.payload != null) dec.gate = &sel;
+    // Length-only predicate columns refill here when the fold or an owner still reads the bytes, and only the
+    // rows the filter kept. `codePlainKeys` has to see those bytes, not the empty length-only placeholders.
+    if (dec.payload != null or in.filter != null) dec.gate = &sel;
+    dec.allow_lengths = false;
+    if (in.filter != null) {
+        dec.refill = true;
+        for (length_of, 0..) |was, ci| if (was and columnFeedsFold(target, ci)) {
+            const pos = lookup[ci] orelse continue;
+            batch_cols.items[pos] = try dec.column(ra, ci, &sel);
+        };
+        dec.refill = false;
+    }
+    if (target == .grouped and target.grouped.records == null and !staged and decode_options.encoded)
+        try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
     const selected: usize = if (in.filter != null) sel.count() else num_rows;
@@ -4366,7 +4610,8 @@ fn scanRGForAggImpl(
     switch (target) {
         .grouped => |g| {
             if (g.records) |records| {
-                try records.batch(batch, lookup, 0, &sel);
+                // Partial selections gather into ascending `input_rows`. A full window stays `row_base + i`.
+                try emitRecords(ra, records, &batch, &sel, in.row_base, 0, lookup);
                 const end = nowMonoNs();
                 ws.timings.encode_ns += @intCast(end - t_eval_end);
                 profile.record(prof, .aggregate, t_eval_end, end, profile.args(.{ selected, calls.len }));
@@ -4428,30 +4673,63 @@ fn scanRGForAggImpl(
             var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
             defer key_resolver.deinit(ra);
 
-            try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, &sel, group_id_arr);
-            try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
-
-            // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
-            if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                var call_arena = std.heap.ArenaAllocator.init(side);
-                defer call_arena.deinit();
-                const ca = if (staged) call_arena.allocator() else ra;
-                const cb = if (stage_plan) |sp|
-                    try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, true)
-                else
-                    CallBatch{ .batch = batch, .lookup = lookup };
-                try expr_agg.updateTableGrouped(
-                    ca,
-                    gpa,
+            const sparse = g.table.sketch == null and stage_plan == null and sel.count() != sel.len and
+                sel.len <= std.math.maxInt(u32);
+            if (sparse) if (try gatherUnder(ra, batch.cols, key_cols, &sel, sel.count())) |gathered| {
+                try key_resolver.resolveBatch(
+                    ra,
                     g.table,
-                    group_id_arr,
-                    i,
+                    gathered.key_cols,
                     g.calls,
-                    &cb.batch,
-                    cb.lookup,
-                    &sel,
+                    g.pos_base,
+                    &gathered.sel,
+                    group_id_arr,
+                    gathered.ordinals,
                 );
-            };
+                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+                    try expr_agg.updateTableGrouped(
+                        ra,
+                        gpa,
+                        g.table,
+                        group_id_arr,
+                        i,
+                        g.calls,
+                        &gathered.batch,
+                        lookup,
+                        &gathered.sel,
+                    );
+                };
+            } else {
+                try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, &sel, group_id_arr, null);
+                try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
+                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+                    try expr_agg.updateTableGrouped(ra, gpa, g.table, group_id_arr, i, g.calls, &batch, lookup, &sel);
+                };
+            } else {
+                try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, &sel, group_id_arr, null);
+                try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
+                // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
+                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+                    var call_arena = std.heap.ArenaAllocator.init(side);
+                    defer call_arena.deinit();
+                    const ca = if (staged) call_arena.allocator() else ra;
+                    const cb = if (stage_plan) |sp|
+                        try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, true)
+                    else
+                        CallBatch{ .batch = batch, .lookup = lookup };
+                    try expr_agg.updateTableGrouped(
+                        ca,
+                        gpa,
+                        g.table,
+                        group_id_arr,
+                        i,
+                        g.calls,
+                        &cb.batch,
+                        cb.lookup,
+                        &sel,
+                    );
+                };
+            }
             // The windowed path returned above. A staged row group folded whole still has to enter the partitions
             // before the next row group, or one worker's local table keeps every key it has seen.
             if (g.part) |p| if (g.local) |local| try p.pump(local, g.table, @intCast(sel.count()));
@@ -4776,7 +5054,7 @@ fn scanRGSliced(
             .grouped => |g| {
                 if (g.records) |records| {
                     const emit_start = nowMonoNs();
-                    try records.batch(batch, lookup, done, &sel);
+                    try emitRecords(sa, records, window.batch, &sel, window.input_base, done, lookup);
                     if (records.* == .msd) profile.record(prof, .msd_emit, emit_start, nowMonoNs(), profile.args(.{}));
                     continue;
                 }
@@ -4840,11 +5118,19 @@ fn scanRGSliced(
                 var resolver = expr_agg.GroupKeyResolver.init(key_cols);
                 defer resolver.deinit(sa);
                 // First appearance counts rows from the row group's start, as when it decodes whole.
-                try resolver.resolveBatch(sa, g.table, key_cols, g.calls, g.pos_base + done, &sel, ids);
-                try expr_agg.sinkSketchRows(g.table, ids, &sel);
-                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                    try expr_agg.updateTableGrouped(sa, gpa, g.table, ids, i, g.calls, window.batch, lookup, &sel);
-                };
+                try foldGroupedBatch(
+                    sa,
+                    gpa,
+                    &resolver,
+                    g.table,
+                    g.calls,
+                    key_cols,
+                    window.batch,
+                    lookup,
+                    &sel,
+                    ids,
+                    g.pos_base + done,
+                );
             },
         }
         if (discovering and target.grouped.table.discoveryDone(target.grouped.pos_base + done + n)) break;
@@ -4916,10 +5202,11 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
 
 /// Payload columns: what a filtered row group reads past `baseColumns`, flat. Every decode path (whole, compact,
 /// staged, sliced) decodes them after the filter, gated by its survivors (`DecodeOptions.row_gate`), so which of their
-/// pages decode depends on the input and the query alone. Null when there are none.
+/// pages decode depends on the input and the query alone. An owner query (`records`) is included: its payload is
+/// still not read for rows the filter dropped. Null when there is no filter — nothing has selected rows yet — or
+/// when every read column is already in the pre-filter set.
 fn payloadColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !?[]const bool {
     if (in.filter == null) return null;
-    if (target == .grouped and target.grouped.records != null) return null;
     const base = try baseColumns(a, in, target);
     var any = false;
     for (base, in.read, 0..) |*b, r, ci| {
@@ -4931,6 +5218,125 @@ fn payloadColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !?[]
         any = any or b.*;
     }
     return if (any) base else null;
+}
+
+const EmptyWant = enum { absent, empty, nonempty };
+
+/// `ci` is only compared to an empty string, and every such comparison wants the same side. Null when `ci` is
+/// tested any other way, so the caller decodes the bytes.
+fn emptinessWant(f: filter_ast.Filter, ci: usize) ?EmptyWant {
+    switch (f) {
+        .string => |l| {
+            if (l.col_idx != ci) return .absent;
+            if (l.value.len != 0) return null;
+            return switch (l.op) {
+                .Eq => .empty,
+                .NotEq => .nonempty,
+                else => null,
+            };
+        },
+        .and_filter, .or_filter => |c| {
+            var found: EmptyWant = .absent;
+            for (c.children) |child| {
+                const want = emptinessWant(child, ci) orelse return null;
+                if (want == .absent) continue;
+                if (found != .absent and found != want) return null;
+                found = want;
+            }
+            return found;
+        },
+        .like => |l| return if (l.col_idx == ci) null else .absent,
+        .null_check => |l| return if (l.col_idx == ci) null else .absent,
+        inline else => |l| return if (l.col_idx == ci) null else .absent,
+    }
+}
+
+fn plainValueEncodings(encodings: []const schema.Encoding) bool {
+    var saw_plain = false;
+    for (encodings) |e| switch (e) {
+        .PLAIN => saw_plain = true,
+        .RLE, .BIT_PACKED => {},
+        else => return false,
+    };
+    return saw_plain;
+}
+
+fn exprMentions(e: expr_ast.Expr, ci: usize) bool {
+    return switch (e) {
+        .literal => false,
+        .col_ref => |c| c.col_idx == ci,
+        .binop => |b| exprMentions(b.left.*, ci) or exprMentions(b.right.*, ci),
+        .call => |c| for (c.args) |arg| {
+            if (exprMentions(arg.*, ci)) break true;
+        } else false,
+        .case_ => |c| blk: {
+            for (c.whens) |w| {
+                if (filterMentions(w.cond, ci)) break :blk true;
+                if (w.then) |t| if (exprMentions(t.*, ci)) break :blk true;
+            }
+            if (c.else_) |other| if (exprMentions(other.*, ci)) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+fn filterMentions(f: filter_ast.Filter, ci: usize) bool {
+    return switch (f) {
+        .and_filter, .or_filter => |c| for (c.children) |child| {
+            if (filterMentions(child, ci)) break true;
+        } else false,
+        inline else => |l| l.col_idx == ci,
+    };
+}
+
+/// The fold reads `ci` after the filter: a group key, an aggregate argument, or a per-aggregate FILTER.
+fn columnFeedsFold(target: AggTarget, ci: usize) bool {
+    switch (target) {
+        .scalar => |s| for (s.calls) |call| {
+            if (call.arg) |arg| if (exprMentions(arg, ci)) return true;
+            if (call.where) |w| if (filterMentions(w, ci)) return true;
+        },
+        .grouped => |g| {
+            for (g.keys) |k| if (exprMentions(k, ci)) return true;
+            for (g.calls) |call| {
+                if (call.arg) |arg| if (exprMentions(arg, ci)) return true;
+                if (call.where) |w| if (filterMentions(w, ci)) return true;
+            }
+            if (g.records != null) return true;
+        },
+    }
+    return false;
+}
+
+/// PLAIN BYTE_ARRAY lengths when `ci`'s only predicate is `= ''` or `<> ''`. Null when the chunk is not that
+/// shape; the caller decodes values. The payloads are not copied.
+fn plainLengthColumn(
+    a: std.mem.Allocator,
+    in: AggRowGroup,
+    ci: usize,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+) !?filter_eval.Batch.Column {
+    if (cm.type != .BYTE_ARRAY) return null;
+    const filter = in.filter orelse return null;
+    const want = emptinessWant(filter, ci) orelse return null;
+    if (want == .absent) return null;
+    if (!plainValueEncodings(cm.encodings.items)) return null;
+    const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
+    if (levels.max_rep != 0) return null;
+    const n: usize = @intCast(cm.num_values);
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(chunk, cm.codec, levels, a, .{}, null);
+    const got = reader.readPlainLengths(n) catch |err| switch (err) {
+        error.UnsupportedEncoding => return null,
+        else => return err,
+    };
+    return .{ .string = .{
+        .values = &.{},
+        .byte_lengths = got.lengths,
+        .def_levels = got.def_levels,
+        .max_def = @intCast(levels.max_def),
+        .has_nulls = got.has_nulls,
+    } };
 }
 
 /// Decodes one row group's column chunks into batch lanes, the way every column of `in.read` is decoded.
@@ -4949,6 +5355,10 @@ const ChunkDecoder = struct {
     /// `payloadColumns`, gated by `gate` (the filter's survivors, in batch rows) once the filter has run.
     payload: ?[]const bool = null,
     gate: ?*const filter_selection.SelectionVector = null,
+    /// The pre-filter pass may decode a PLAIN `<> ''` / `= ''` column as lengths. A later pass (`refill`) reads
+    /// the bytes the fold still needs, and only on the rows the filter kept.
+    allow_lengths: bool = true,
+    refill: bool = false,
     pages_total: usize = 0,
     pages_skipped: usize = 0,
 
@@ -4984,6 +5394,9 @@ const ChunkDecoder = struct {
             std.debug.assert(self.gate != null);
             decode_options.row_gate = self.gate;
         };
+        if (self.refill) {
+            if (self.gate) |g| decode_options.row_gate = g;
+        }
         decode_options.any_dictionary = self.target.codedKey(ci);
         decode_options.decimal_exact_only = self.target.exactInputs();
         const pruned_pages = if (prune_info) |p|
@@ -5004,6 +5417,13 @@ const ChunkDecoder = struct {
             if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
             return decoded;
         };
+        if (self.allow_lengths and !self.refill and self.keep == null and !pruned_pages) {
+            if (try plainLengthColumn(a, in, ci, chunk, cm)) |col| {
+                try checkRowShape(col, self.rows_out orelse self.num_rows);
+                if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
+                return col;
+            }
+        }
         const scratch = self.ws.scratch;
         const packed_codes = self.target == .grouped and if (self.target.grouped.records) |r|
             r.* == .integer_count_top and r.integer_count_top.packing != null
@@ -7745,6 +8165,174 @@ fn flEncodePage(
 }
 
 const fl_levels = schema.Levels{ .max_def = 1, .max_rep = 0 };
+
+const req_i32_elem = schema.SchemaElement{
+    .type = .INT32,
+    .type_length = null,
+    .repetition_type = .REQUIRED,
+    .name = "v",
+    .num_children = 0,
+    .converted_type = null,
+    .logical_type = null,
+    .scale = null,
+    .precision = null,
+    .field_id = null,
+};
+
+test "a required row gate skips an unread page and defaults the unselected slots of a partial page" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+
+    // i32/i64 pages are DELTA_BINARY_PACKED, which has to be read in order. PLAIN f64 is the within-page gather.
+    const req_f64 = schema.SchemaElement{
+        .type = .DOUBLE,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "v",
+        .num_children = 0,
+        .converted_type = null,
+        .logical_type = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var one_page: [32]f64 = undefined;
+    for (&one_page, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+    const whole = try encoder.encodeColumn(arena, .{
+        .values = .{ .f64 = .{ .values = &one_page } },
+        .schema_elem = &req_f64,
+        .path_in_schema = &.{"v"},
+        .codec = .UNCOMPRESSED,
+        .dictionary_bloom = false,
+        .distinct = true,
+        .page_rows = 64,
+    });
+    try testing.expect(plainValueEncodings(whole.meta.encodings.items));
+    const full = try decodeColumnT(f64, arena, whole.bytes, .UNCOMPRESSED, levels, one_page.len);
+    var odds_off = try filter_selection.SelectionVector.init(arena, one_page.len);
+    for (0..one_page.len) |i| if (i % 2 == 1) odds_off.set(i, false);
+    const gathered = try decodeColumnTWithOptions(f64, arena, whole.bytes, .UNCOMPRESSED, levels, one_page.len, .{
+        .row_gate = &odds_off,
+    });
+    for (full.values, gathered.values, 0..) |want, got, i| {
+        try testing.expectEqual(if (i % 2 == 0) want else 0, got);
+    }
+
+    var paged: [32]i32 = undefined;
+    for (&paged, 0..) |*v, i| v.* = @intCast(i + 1);
+    const pages = try encoder.encodeColumn(arena, .{
+        .values = .{ .i32 = .{ .values = &paged } },
+        .schema_elem = &req_i32_elem,
+        .path_in_schema = &.{"v"},
+        .codec = .UNCOMPRESSED,
+        .dictionary_bloom = false,
+        .distinct = true,
+        .page_rows = 16,
+    });
+    const clean = try decodeColumnT(i32, arena, pages.bytes, .UNCOMPRESSED, levels, paged.len);
+    var corrupt = try arena.dupe(u8, pages.bytes);
+    var walker = page_mod.PageReader.init(corrupt, .UNCOMPRESSED, arena);
+    const first = (try walker.peek()) orelse return error.UnexpectedPage;
+    const header_len = first.size - @as(usize, @intCast(first.header.compressed_page_size));
+    try testing.expect(first.header.compressed_page_size > 4);
+    corrupt[walker.pos + header_len + 4] ^= 0xff;
+    const page_rows: usize = @intCast(first.header.data_page_header.?.num_values);
+    var tail = try filter_selection.SelectionVector.init(arena, paged.len);
+    for (0..page_rows) |i| tail.set(i, false);
+    const skipped = try decodeColumnTWithOptions(i32, arena, corrupt, .UNCOMPRESSED, levels, paged.len, .{
+        .row_gate = &tail,
+    });
+    for (clean.values, skipped.values, 0..) |want, got, i| {
+        try testing.expectEqual(if (i < page_rows) 0 else want, got);
+    }
+}
+
+test "PLAIN byte-array lengths record emptiness without the payloads" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The column encoder writes strings as delta or dictionary, never PLAIN. This page is the length-prefix layout.
+    var body: std.ArrayList(u8) = .empty;
+    var len = [_]u8{ 0, 0, 0, 0 };
+    try body.appendSlice(arena, &len);
+    std.mem.writeInt(u32, &len, 2, .little);
+    try body.appendSlice(arena, &len);
+    try body.appendSlice(arena, "ab");
+    const header = schema.PageHeader{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.items.len),
+        .compressed_page_size = @intCast(body.items.len),
+        .crc = null,
+        .data_page_header = .{
+            .num_values = 2,
+            .encoding = .PLAIN,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    var w: thrift.Writer = .init(arena);
+    try header.write(&w);
+    var chunk: std.ArrayList(u8) = .empty;
+    try chunk.appendSlice(arena, w.bytes());
+    try chunk.appendSlice(arena, body.items);
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk.items,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        .{},
+        null,
+    );
+    const got = try reader.readPlainLengths(2);
+    try testing.expectEqualSlices(u32, &.{ 0, 2 }, got.lengths);
+    try testing.expect(got.def_levels == null);
+}
+
+test "a partial record batch gathers ascending original rows" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const values = [_]i32{ 1, 2, 3, 4 };
+    const cols = [_]filter_eval.Batch.Column{.{ .i32 = .{ .values = &values } }};
+    const rows: filter_eval.Batch = .{ .cols = &cols, .num_rows = values.len };
+    var sel = try filter_selection.SelectionVector.init(testing.allocator, values.len);
+    defer sel.deinit();
+    sel.set(0, false);
+    sel.set(2, false);
+    const Capture = struct {
+        n: usize = 0,
+        ords: [2]u64 = undefined,
+        vals: [2]i32 = undefined,
+        fn start(_: *anyopaque, _: u64, _: usize) void {}
+        fn batch(ctx: *anyopaque, view: SelectedBatch, _: []const ?usize) !void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            for (0..view.batch.num_rows) |i| {
+                c.ords[c.n] = try view.ordinal(i);
+                c.vals[c.n] = view.batch.cols[0].i32.values[i];
+                c.n += 1;
+            }
+        }
+    };
+    var cap: Capture = .{};
+    var arm: RecordSink = .{ .selected = .{
+        .ctx = @ptrCast(&cap),
+        .startFn = Capture.start,
+        .batchFn = Capture.batch,
+    } };
+    try emitRecords(arena, &arm, &rows, &sel, 50, 7, &.{});
+    try testing.expectEqual(@as(u64, 51), cap.ords[0]);
+    try testing.expectEqual(@as(u64, 53), cap.ords[1]);
+    try testing.expectEqual(@as(i32, 2), cap.vals[0]);
+    try testing.expectEqual(@as(i32, 4), cap.vals[1]);
+}
 
 test "fast-levels: all-present OPTIONAL column decodes identically with the flag on" {
     const testing = std.testing;

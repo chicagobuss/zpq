@@ -4065,10 +4065,19 @@ pub const GroupKeyResolver = struct {
         pos: u64,
         sel: *const filter_selection.SelectionVector,
         ids: []u32,
+        /// Original row of each batch row, when the batch was gathered down to the selection. Null: row `r` is
+        /// original row `r`, and `pos + r` is where it first appears. The group's first row stays that ordinal.
+        ordinals: ?[]const u32,
     ) !void {
+        const place = struct {
+            fn at(base: u64, rows: ?[]const u32, index: usize) u64 {
+                return if (rows) |o| base + o[index] else base + index;
+            }
+        }.at;
+        if (ordinals) |o| std.debug.assert(o.len >= sel.len);
         if (table.fixed_stride == 0) {
             for (0..sel.len) |r| if (sel.isActive(r)) {
-                ids[r] = try self.resolve(allocator, table, cols, r, calls, pos);
+                ids[r] = try self.resolveAt(allocator, table, cols, r, calls, place(pos, ordinals, r));
             };
             return;
         }
@@ -4091,9 +4100,14 @@ pub const GroupKeyResolver = struct {
             };
             for (0..n) |i| if (sel.isActive(off + i)) {
                 ids[off + i] = if (packed_mask & (@as(u64, 1) << @intCast(i)) != 0)
-                    try table.getOrInsertFixedHashed(images[i][0..table.fixed_stride], calls, pos + off + i, hashes[i])
+                    try table.getOrInsertFixedHashed(
+                        images[i][0..table.fixed_stride],
+                        calls,
+                        place(pos, ordinals, off + i),
+                        hashes[i],
+                    )
                 else
-                    try self.resolve(allocator, table, cols, off + i, calls, pos);
+                    try self.resolveAt(allocator, table, cols, off + i, calls, place(pos, ordinals, off + i));
             };
         }
     }
@@ -4107,12 +4121,24 @@ pub const GroupKeyResolver = struct {
         agg_calls: []const AggCall,
         pos_base: u64,
     ) !u32 {
+        return self.resolveAt(allocator, table, key_cols, row, agg_calls, pos_base + row);
+    }
+
+    fn resolveAt(
+        self: *GroupKeyResolver,
+        allocator: std.mem.Allocator,
+        table: *GroupTable,
+        key_cols: []const filter_eval.Batch.Column,
+        row: usize,
+        agg_calls: []const AggCall,
+        at: u64,
+    ) !u32 {
         // Fixed-width keys never touch the scratch list: the image is a stack buffer, and the table hashes that
         // instead of the serialized bytes.
         if (table.fixed_stride != 0) {
             var image: [32]u8 = undefined;
             if (packFixedKey(key_cols, row, &image)) |n| if (n == table.fixed_stride) {
-                return table.getOrInsertFixed(image[0..n], agg_calls, pos_base + row);
+                return table.getOrInsertFixed(image[0..n], agg_calls, at);
             };
         }
         if (self.fast_path and !isRowNull(key_cols[0], row)) {
@@ -4120,7 +4146,7 @@ pub const GroupKeyResolver = struct {
             if (table.sketch != null) if (try table.sketchRaw(s)) |id| return id;
             if (!self.memo_on) {
                 try serializeRowKey(&self.scratch, allocator, key_cols, row);
-                return table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
+                return table.getOrInsert(self.scratch.items, agg_calls, at);
             }
             if (self.memo_rows < memo_trial) {
                 self.memo_rows += 1;
@@ -4130,7 +4156,7 @@ pub const GroupKeyResolver = struct {
                     self.memo_on = false;
                     self.memo.clearAndFree(allocator);
                     try serializeRowKey(&self.scratch, allocator, key_cols, row);
-                    return table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
+                    return table.getOrInsert(self.scratch.items, agg_calls, at);
                 }
             }
             const id: SliceId = .{ .ptr = @intFromPtr(s.ptr), .len = s.len };
@@ -4142,13 +4168,13 @@ pub const GroupKeyResolver = struct {
             // On error the entry just reserved would hold an undefined value.
             errdefer _ = self.memo.remove(id);
             try serializeRowKey(&self.scratch, allocator, key_cols, row);
-            const gid = try table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
+            const gid = try table.getOrInsert(self.scratch.items, agg_calls, at);
             gop.value_ptr.* = gid;
             return gid;
         }
 
         try serializeRowKey(&self.scratch, allocator, key_cols, row);
-        return table.getOrInsert(self.scratch.items, agg_calls, pos_base + row);
+        return table.getOrInsert(self.scratch.items, agg_calls, at);
     }
 };
 
@@ -6951,13 +6977,31 @@ test "batched fixed lookups preserve sparse selections nulls NaNs and signed zer
     var resolver = GroupKeyResolver.init(&cols);
     defer resolver.deinit(std.testing.allocator);
     var ids: [n]u32 = @splat(0);
-    try resolver.resolveBatch(std.testing.allocator, &batched, &cols, &calls, 1000, &sel, &ids);
+    try resolver.resolveBatch(std.testing.allocator, &batched, &cols, &calls, 1000, &sel, &ids, null);
     for (0..n) |r| if (sel.isActive(r)) {
         const id = try resolver.resolve(std.testing.allocator, &scalar, &cols, r, &calls, 1000);
         try std.testing.expectEqual(id, ids[r]);
     };
     try std.testing.expectEqual(scalar.groupCount(), batched.groupCount());
     try std.testing.expectEqualSlices(u64, scalar.first.items, batched.first.items);
+}
+
+test "resolveBatch on a gathered selection keeps the original first row" {
+    const values = [_]i32{ 10, 30 };
+    const cols = [_]filter_eval.Batch.Column{.{ .i32 = .{ .values = &values } }};
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var sel = try filter_selection.SelectionVector.init(std.testing.allocator, 2);
+    defer sel.deinit();
+    var table = GroupTable.init(std.testing.allocator, 1 << 20);
+    defer table.deinit();
+    var resolver = GroupKeyResolver.init(&cols);
+    defer resolver.deinit(std.testing.allocator);
+    var ids: [2]u32 = @splat(0);
+    const ordinals = [_]u32{ 1, 3 };
+    try resolver.resolveBatch(std.testing.allocator, &table, &cols, &calls, 100, &sel, &ids, &ordinals);
+    try std.testing.expectEqual(@as(usize, 2), table.first.items.len);
+    try std.testing.expectEqual(@as(u64, 101), table.first.items[0]);
+    try std.testing.expectEqual(@as(u64, 103), table.first.items[1]);
 }
 
 test "compact variable insertion keeps retained capacity charged after allocation failure" {

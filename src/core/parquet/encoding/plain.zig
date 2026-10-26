@@ -174,6 +174,27 @@ pub const ByteArrayDecoder = struct {
         return i;
     }
 
+    /// The next value's length, without retaining its bytes.
+    pub fn writeOneLength(self: *ByteArrayDecoder) Error!u32 {
+        if (self.pos + 4 > self.bytes.len) return error.UnexpectedEndOfPage;
+        const len = readLe(u32, self.bytes[self.pos..][0..4]);
+        self.pos += 4;
+        const ulen: usize = len;
+        if (self.pos + ulen > self.bytes.len) return error.UnexpectedEndOfPage;
+        self.pos += ulen;
+        return len;
+    }
+
+    /// One length per dest slot. The bytes stay in the page.
+    pub fn writeLengths(self: *ByteArrayDecoder, dest: []u32) Error!usize {
+        var i: usize = 0;
+        while (i < dest.len) : (i += 1) {
+            if (self.pos >= self.bytes.len) break;
+            dest[i] = try self.writeOneLength();
+        }
+        return i;
+    }
+
     pub fn remaining(self: *const ByteArrayDecoder) i64 {
         // Cheap to compute? Not without walking. -1 = unknown.
         if (self.pos >= self.bytes.len) return 0;

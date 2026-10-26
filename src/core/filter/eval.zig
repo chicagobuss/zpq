@@ -209,6 +209,49 @@ pub fn evalLike(
     }
 }
 
+/// One compare per dictionary entry, then a code lookup. A codes-only column has no per-row bytes.
+fn evalStringColumn(
+    col: ColumnT([]const u8),
+    op: ast.Operator,
+    needle: []const u8,
+    sel: *selection.SelectionVector,
+    arena: std.mem.Allocator,
+) !void {
+    if (col.codes) |codes| {
+        const match = try arena.alloc(u8, col.dict.len);
+        for (col.dict, match) |entry, *bit| bit.* = @intFromBool(ast.applyOpStr(entry, op, needle));
+        applyCodeMatch(codes, match, col.def_levels, col.max_def, sel);
+        return;
+    }
+    if (col.byte_lengths) |lens| {
+        if (needle.len == 0 and (op == .Eq or op == .NotEq)) {
+            evalLengths(lens, col.def_levels, col.max_def, op == .NotEq, sel);
+            return;
+        }
+    }
+    evalLeafStr(col.values, col.def_levels, col.max_def, op, needle, sel);
+}
+
+/// `= ''` / `<> ''` from PLAIN lengths. `want_nonempty` keeps rows whose length is not 0.
+fn evalLengths(
+    lengths: []const u32,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    want_nonempty: bool,
+    sel: *selection.SelectionVector,
+) void {
+    std.debug.assert(lengths.len == sel.len);
+    var i: usize = 0;
+    while (i < lengths.len) : (i += 1) {
+        if (!sel.isActive(i)) continue;
+        if (rowIsNull(def_levels, max_def, i)) {
+            sel.set(i, false);
+            continue;
+        }
+        if ((lengths[i] != 0) != want_nonempty) sel.set(i, false);
+    }
+}
+
 /// String predicate: byte-comparison.
 pub fn evalLeafStr(
     values: []const []const u8,
@@ -322,10 +365,16 @@ pub fn ColumnT(comptime T: type) type {
         unscaled: ?Exact = null,
         /// The same for a coded column's dictionary: entry for entry with `dict`.
         dict_unscaled: ?Exact = null,
+        /// PLAIN BYTE_ARRAY lengths, one per row, when the payload was not copied. An empty compare (`= ''`,
+        /// `<> ''`) reads these. Null rows stay in `def_levels` and hold length 0 here.
+        byte_lengths: ?[]const u32 = null,
 
         pub fn rowCount(self: @This()) usize {
             if (self.levels_only_rows != 0) return self.levels_only_rows;
-            return if (self.codes) |c| c.len else self.values.len;
+            if (self.codes) |c| return c.len;
+            if (self.values.len != 0) return self.values.len;
+            if (self.byte_lengths) |b| return b.len;
+            return 0;
         }
 
         /// Values not materialized: only the codes are present.
@@ -531,7 +580,7 @@ pub fn evaluate(
             const col = batch.cols[col_pos];
             if (col != .string) return error.TypeMismatch;
             try rejectIfNested(col.string);
-            evalLeafStr(col.string.values, col.string.def_levels, col.string.max_def, leaf.op, leaf.value, sel);
+            try evalStringColumn(col.string, leaf.op, leaf.value, sel, arena);
         },
         .boolean => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
@@ -551,7 +600,16 @@ pub fn evaluate(
             const col = batch.cols[col_pos];
             if (col != .string) return error.TypeMismatch;
             try rejectIfNested(col.string);
-            evalLike(col.string.values, col.string.def_levels, col.string.max_def, m, sel);
+            if (col.string.codes) |codes| {
+                const match = try arena.alloc(u8, col.string.dict.len);
+                for (col.string.dict, match) |entry, *bit| {
+                    const hit = ast.likeMatches(m.kind, m.operand, entry);
+                    bit.* = @intFromBool(hit != m.negate);
+                }
+                applyCodeMatch(codes, match, col.string.def_levels, col.string.max_def, sel);
+            } else {
+                evalLike(col.string.values, col.string.def_levels, col.string.max_def, m, sel);
+            }
         },
         .and_filter => |c| {
             if (c.neverTrue(true)) return sel.clearAll();
@@ -1106,6 +1164,49 @@ test "a coded column filters exactly as its values do, nulls and same-column AND
         try evaluate(f, &.{ .cols = &coded_cols, .num_rows = vals.len }, &got, &lookup, a);
         try testing.expectEqualSlices(u64, want.mask, got.mask);
     }
+}
+
+test "a codes-only string compares once per dictionary entry, including an empty literal" {
+    const dict = [_][]const u8{ "", "ab", "a" };
+    const codes = [_]u32{ 1, 0, 2, 1 };
+    const coded: Batch.Column = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } };
+    const plain_vals = [_][]const u8{ "ab", "", "a", "ab" };
+    const plain: Batch.Column = .{ .string = .{ .values = &plain_vals } };
+    const lookup = [_]?usize{0};
+    for ([_]ast.Filter{
+        .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "ab" } },
+        .{ .string = .{ .col_idx = 0, .op = .NotEq, .value = "" } },
+        .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "" } },
+    }) |f| {
+        var want = try selection.SelectionVector.init(testing.allocator, codes.len);
+        defer want.deinit();
+        var got = try selection.SelectionVector.init(testing.allocator, codes.len);
+        defer got.deinit();
+        try evaluate(f, &.{ .cols = &.{plain}, .num_rows = codes.len }, &want, &lookup, testing.allocator);
+        try evaluate(f, &.{ .cols = &.{coded}, .num_rows = codes.len }, &got, &lookup, testing.allocator);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
+    }
+}
+
+test "an empty compare reads PLAIN lengths and does not need the bytes" {
+    const lengths = [_]u32{ 0, 4, 0, 1 };
+    const defs = [_]u32{ 1, 1, 0, 1 };
+    const col: Batch.Column = .{ .string = .{
+        .values = &.{},
+        .byte_lengths = &lengths,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const lookup = [_]?usize{0};
+    const nonempty: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .NotEq, .value = "" } };
+    var sv = try selection.SelectionVector.init(testing.allocator, lengths.len);
+    defer sv.deinit();
+    try evaluate(nonempty, &.{ .cols = &.{col}, .num_rows = lengths.len }, &sv, &lookup, testing.allocator);
+    try testing.expect(!sv.isActive(0));
+    try testing.expect(sv.isActive(1));
+    try testing.expect(!sv.isActive(2));
+    try testing.expect(sv.isActive(3));
 }
 
 test "leaf kernels select exactly what a row-by-row compare does: every op, nulls, NaN, ±0, unsigned, ragged tails" {

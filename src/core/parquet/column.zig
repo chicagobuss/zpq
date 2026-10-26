@@ -90,6 +90,8 @@ fn ActiveDecoder(comptime T: type) type {
         flba: if (bytes) plain.FixedLenByteArrayDecoder else void,
         /// RLE-encoded BOOLEAN values: a bit-width-1 hybrid stream, distinct from PLAIN's bit-packed booleans.
         bool_rle: if (T == bool) hybrid_rle.BooleanRleDecoder else void,
+        /// A required page the row gate did not select. `decode` yields this many defaults and reads no values.
+        skipped: usize,
     };
 }
 
@@ -144,9 +146,10 @@ pub const DecodeOptions = struct {
     expand_limit: usize = std.math.maxInt(usize),
     /// Per chunk (`chunkOptions`): the range an INT32 column's narrow integer annotation allows.
     int_range: ?IntRange = null,
-    /// The row group's rows a query still needs (its filter's survivors). A data page of an optional flat column
-    /// with none of them is passed by its header alone, never decompressed, and reads as nulls: those rows are never
-    /// read. Only the input and the query decide which pages that is, never the decode path, workers or budget.
+    /// The row group's rows a query still needs (its filter's survivors). A data page of a flat column with none
+    /// of them is passed by its header alone, never decompressed. An optional page reads as nulls; a required page
+    /// reads as the type's default. Those rows are never read. Only the input and the query decide which pages
+    /// that is, never the decode path, workers or budget.
     row_gate: ?*const selection.SelectionVector = null,
 };
 
@@ -297,7 +300,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// The installed DELTA_BYTE_ARRAY page's expansion, not yet charged to `expanded`: a count(col) that reads
         /// only its levels never builds the values, and must not be refused for them.
         pending_expansion: usize = 0,
-        /// `DecodeOptions.row_gate`, kept only for an optional flat column, and the rows its data pages so far hold.
+        /// `DecodeOptions.row_gate`, kept for a flat column, and the rows its data pages so far hold.
         gate: ?*const selection.SelectionVector = null,
         gate_row: usize = 0,
 
@@ -329,7 +332,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 .levels = levels,
                 .options = options,
                 .scratch = scratch,
-                .gate = if (levels.max_def > 0 and levels.max_rep == 0) options.row_gate else null,
+                .gate = if (levels.max_rep == 0) options.row_gate else null,
             };
         }
 
@@ -435,6 +438,48 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// lives as long as `arena`: the buffers are allocated there, and `[]const u8` values are slices into page
         /// bytes, which a byte-array reader never routes through a scratch. Adapters that convert the values (decimal,
         /// FLOAT16, unsigned widening) allocate the converted buffer themselves and reuse the levels unchanged.
+        /// PLAIN BYTE_ARRAY lengths for `num_leaves` rows. The payloads are not copied. A page that is not PLAIN
+        /// length-prefixed BYTE_ARRAY is `error.UnsupportedEncoding` — the caller decodes values instead. Optional
+        /// nulls are length 0 and `def_levels` below `max_def`.
+        pub fn readPlainLengths(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!struct {
+            lengths: []u32,
+            def_levels: ?[]u32,
+            has_nulls: bool,
+        } {
+            if (comptime T != []const u8) return error.UnsupportedEncoding;
+            if (self.type_length != 0) return error.UnsupportedEncoding;
+            const lengths = try self.arena.alloc(u32, num_leaves);
+            const max_def: u32 = @intCast(self.levels.max_def);
+            const defs: ?[]u32 = if (max_def > 0) try self.arena.alloc(u32, num_leaves) else null;
+            var w: usize = 0;
+            while (w < num_leaves) {
+                if (!try self.advancePage()) break;
+                if (self.active != .plain) return error.UnsupportedEncoding;
+                const rows = self.current_page_num_values;
+                if (rows == 0 or w + rows > num_leaves) return error.UnexpectedPage;
+                if (max_def == 0 or self.current_def_all_present) {
+                    const n = self.active.plain.writeLengths(lengths[w..][0..rows]) catch return error.UnexpectedPage;
+                    if (n != rows) return error.ShortDecode;
+                    if (defs) |d| @memset(d[w..][0..rows], max_def);
+                } else {
+                    const d = defs orelse return error.UnexpectedPage;
+                    try self.readDefLevels(d[w..][0..rows]);
+                    var i: usize = 0;
+                    while (i < rows) : (i += 1) {
+                        if (d[w + i] == max_def) {
+                            lengths[w + i] = self.active.plain.writeOneLength() catch return error.UnexpectedPage;
+                        } else {
+                            lengths[w + i] = 0;
+                            self.has_nulls = true;
+                        }
+                    }
+                }
+                w += rows;
+            }
+            if (w != num_leaves) return error.ShortDecode;
+            return .{ .lengths = lengths, .def_levels = defs, .has_nulls = self.has_nulls };
+        }
+
         pub fn readAll(self: *Self, num_leaves: usize) (Error || error{ShortDecode})!Leaves {
             // Pages may claim no more values between them than the chunk holds.
             self.value_budget = num_leaves;
@@ -1049,6 +1094,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// REQUIRED-column path: ask the active per-page decoder for
         /// `dest.len` values directly.
         fn decodePageSlicePresent(self: *Self, dest: []T) Error!void {
+            if (try self.copySelectedPlain(dest)) return;
             const got = try self.decodePackedFromCurrentPage(dest);
             if (got != dest.len) return error.UnexpectedPage;
         }
@@ -1068,6 +1114,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             if (self.current_def_all_present) {
                 @memset(def_levels_out, @intCast(self.levels.max_def));
                 if (rep_levels_out) |rl_out| @memset(rl_out, 0);
+                if (try self.copySelectedPlain(values)) return;
                 const got = try self.decodePackedFromCurrentPage(values);
                 if (got != values.len) return error.UnexpectedPage;
                 return;
@@ -1129,10 +1176,54 @@ pub fn ColumnChunkReader(comptime T: type) type {
             }
         }
 
+        /// PLAIN fixed-width slots the row gate kept, in place. Unselected slots stay the type default and their
+        /// bytes are not copied. False when the page is not a partial PLAIN fixed-width gate, so the caller decodes
+        /// every value. A page no selected row touches is never installed (`advancePage`).
+        fn copySelectedPlain(self: *Self, dest: []T) Error!bool {
+            if (comptime !(T == i32 or T == i64 or T == f32 or T == f64)) return false;
+            const gate = self.gate orelse return false;
+            if (self.active != .plain or self.options.int_range != null) return false;
+            if (self.current_page_num_values == 0 or self.gate_row < self.current_page_num_values) return false;
+            const row0 = self.gate_row - self.current_page_num_values + self.current_def_pos;
+            if (row0 + dest.len > gate.len) return false;
+            var partial = false;
+            for (0..dest.len) |i| if (!gate.isActive(row0 + i)) {
+                partial = true;
+                break;
+            };
+            if (!partial) return false;
+            const dec = &self.active.plain;
+            const width = @sizeOf(T);
+            const need = dest.len * width;
+            if (dec.pos + need > dec.bytes.len) return error.UnexpectedPage;
+            for (dest, 0..) |*out, i| {
+                if (!gate.isActive(row0 + i)) {
+                    out.* = defaultValue();
+                    continue;
+                }
+                const raw = dec.bytes[dec.pos + i * width ..][0..width];
+                out.* = switch (T) {
+                    i32 => @bitCast(std.mem.readInt(u32, raw[0..4], .little)),
+                    i64 => @bitCast(std.mem.readInt(u64, raw[0..8], .little)),
+                    f32 => @bitCast(std.mem.readInt(u32, raw[0..4], .little)),
+                    f64 => @bitCast(std.mem.readInt(u64, raw[0..8], .little)),
+                    else => unreachable,
+                };
+            }
+            dec.pos += need;
+            return true;
+        }
+
         fn decodePackedFromCurrentPage(self: *Self, dest: []T) Error!usize {
             if (self.pending_expansion > 0) try self.chargeExpansion();
             const got = switch (self.active) {
                 .idle => 0,
+                .skipped => |*left| blk: {
+                    const n = @min(dest.len, left.*);
+                    @memset(dest[0..n], defaultValue());
+                    left.* -= n;
+                    break :blk n;
+                },
                 inline else => |*d| if (@TypeOf(d.*) == void)
                     unreachable
                 else
@@ -1285,7 +1376,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     if (!gate.anyInRange(lo, @min(self.gate_row +| rows, gate.len))) {
                         self.pages.pass(p);
                         self.pages.ordinal +|= 1;
-                        try self.installNullPage(rows);
+                        if (self.levels.max_def == 0)
+                            try self.installDefaultPage(rows)
+                        else
+                            try self.installNullPage(rows);
                         self.gate_row +|= rows;
                         return true;
                     }
@@ -1318,6 +1412,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
             else
                 return error.UnexpectedPage;
             return std.math.cast(usize, n) orelse error.UnexpectedPage;
+        }
+
+        /// A required page the gate did not select: `rows` defaults, and the body was not read.
+        fn installDefaultPage(self: *Self, rows: usize) Error!void {
+            self.data_page_seen = true;
+            try self.beginPage(rows);
+            self.active = .{ .skipped = rows };
         }
 
         /// A page of `rows` nulls, standing for a gated page: every slot reads as absent.

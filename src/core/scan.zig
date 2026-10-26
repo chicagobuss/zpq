@@ -23462,6 +23462,106 @@ test "selective composite COUNT keeps its packed owner while wider filters retai
     try testing.expect(wider.dense);
 }
 
+test "selected owner coded identity replays a late dictionary mismatch after earlier records" {
+    const gpa = testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse
+        return error.SkipZigTest;
+    defer gpa.free(bytes);
+    const meta = try metadata.open(a, bytes);
+    const base: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "selected-replay", .bytes = bytes }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c,count(*) AS d",
+        .group_by = "k,b,f",
+        .integer_records = false,
+        .integer_records_min_rows = 0,
+        .byte_records = false,
+        .msd_records = false,
+        .plain_rules = false,
+        .min_bytes_per_worker = 1,
+        .max_memory = 512 << 20,
+        .result_order = .{ .keys = &.{.{ .column = 3, .descending = true }}, .limit = 3, .offset = 2 },
+    };
+    var want = try runMultiAggregate(gpa, a, base);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, base.result_order);
+    const Reader = struct {
+        window: ReleasingScanWindow,
+        fault: bool,
+        changed: bool = false,
+        earlier: usize = 0,
+        fn probe(_: *anyopaque, _: usize, _: usize, _: u64, _: u64) anyerror!void {}
+        fn ready(_: *anyopaque, _: usize) anyerror!void {}
+        fn start(_: *anyopaque) anyerror!void {}
+        fn wait(ctx: *anyopaque, rg: usize) anyerror!void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            try ReleasingScanWindow.wait(&r.window, rg);
+            if (!r.fault or rg != 15 or r.changed) return;
+            r.earlier = r.window.releases.load(.acquire);
+            // Planning retained the original dictionary; change only the late streamed copy, after other RGs
+            // emitted records. Replay must abandon this view and read the unchanged retained mapping.
+            const cm = r.window.meta.row_groups.items[rg].columns.items[0].meta_data.?;
+            try testing.expectEqual(.UNCOMPRESSED, cm.codec);
+            const offset: usize = @intCast(cm.dictionary_page_offset.?);
+            var header = thrift_mod.Reader.init(r.window.bytes[offset..]);
+            _ = try schema.PageHeader.read(&header);
+            std.mem.writeInt(i64, r.window.bytes[offset + header.pos ..][0..8], 987654321, .little);
+            r.changed = true;
+        }
+        fn done(ctx: *anyopaque, rg: usize, items: usize) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            ReleasingScanWindow.release(&r.window, rg, items);
+        }
+        fn abandon(ctx: *anyopaque) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            ReleasingScanWindow.abandon(&r.window);
+        }
+    };
+    for ([_]usize{ 1, 4 }) |jobs| for ([_]usize{ 0, 64 }) |window| for ([_]bool{ false, true }) |fault| {
+        var trial = std.heap.ArenaAllocator.init(gpa);
+        defer trial.deinit();
+        const ta = trial.allocator();
+        var reader: Reader = .{
+            .window = .{ .bytes = try ta.dupe(u8, bytes), .meta = &meta },
+            .fault = fault,
+        };
+        var input = reader.window.input(bytes);
+        input.gate = .{ .ctx = &reader, .wait = Reader.wait, .done = Reader.done };
+        input.dict_wait = .{ .ctx = &reader, .wait = Reader.ready };
+        var ledger: core_memory.SharedBudget = .{ .limit = base.max_memory };
+        var taken: std.EnumSet(FastPath) = .{};
+        var args = base;
+        args.inputs = (&input)[0..1];
+        args.integer_records = true;
+        args.parallelism = jobs;
+        args.decode_batch_rows = window;
+        args.ledger = &ledger;
+        args.taken = &taken;
+        args.start_reads = .{ .ctx = &reader, .start = Reader.start, .abandon = Reader.abandon };
+        args.dict_probe = .{ .ctx = &reader, .add = Reader.probe };
+        const explanation = try explainAggregate(gpa, ta, args);
+        try testing.expectEqual(.packed_count_top_h, explanation.record_path.?.layout);
+        var got = if (fault)
+            try runMultiAggregate(gpa, ta, args)
+        else
+            try prepareAggregate(gpa, ta, args, false);
+        defer got.deinit(gpa);
+        if (!fault) try testing.expect(taken.contains(.integer_records));
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+        try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        try testing.expectEqual(fault, reader.changed);
+        if (fault) try testing.expect(reader.earlier > 0);
+        try testing.expectEqual(@as(usize, @intFromBool(fault)), reader.window.abandoned);
+        try testing.expectEqual(@as(usize, 16), reader.window.releases.load(.monotonic));
+        try testing.expect(ledger.used.load(.monotonic) < 1 << 20);
+    };
+}
+
 test "selected packed COUNT runs the typed owner for INT32 keys with original NULL ties and sliced files" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);

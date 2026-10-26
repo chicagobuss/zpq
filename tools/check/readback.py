@@ -4,12 +4,14 @@
   readback.py FILE [--filter COL OP VALUE]...
   readback.py FILE --stored
   readback.py FILE --bloom
+  readback.py FILE --footer
 
 `--bloom` prints, per row group, each column chunk's physical type, its non-null values in physical form (integers,
 floats, or {"$bytes"} for the bytes a BYTE_ARRAY, FLBA or INT96 stores), whether it has a dictionary page, and its
-Bloom filter's bitset as hex (null without one), read from the footer directly. `--stored` prints {names, types,
-annotations, rows} as zpq's row output names them: structs flattened to dotted leaf names, and dates, times and
-timestamps as their stored integers (days, or the column's unit).
+Bloom filter's bitset as hex (null without one), read from the footer directly. `--footer` prints {num_rows, leaves}
+from the footer alone (leaf column paths, dotted). `--stored` prints {names, types, annotations, rows} as zpq's row
+output names them: structs flattened to dotted leaf names, and dates, times and timestamps as their stored integers
+(days, or the column's unit).
 
 Prints {names, types, nullable, rows, row_groups (per-column metadata, with the raw footer's statistics bounds and
 exactness flags), column_orders, stats_kept (PyArrow's metadata keeps those flags), pushed}. Values are JSON scalars, or
@@ -373,10 +375,23 @@ def bloom(path):
     print(json.dumps(groups))
 
 
+def footer(path):
+    """The footer alone, as PyArrow reads it: no page is decoded."""
+    md = pq.read_metadata(path)
+    print(json.dumps({"num_rows": md.num_rows,
+                      "leaves": [md.schema.column(i).path for i in range(md.num_columns)]}))
+
+
 def main():
     path = sys.argv[1]
     if sys.argv[2:] == ["--bloom"]:
         return bloom(path)
+    if sys.argv[2:] == ["--footer"]:
+        try:
+            return footer(path)
+        except Exception as e:  # noqa: BLE001 - the reader's verdict is the output
+            print(f"pyarrow rejected {path}: {e}", file=sys.stderr)
+            sys.exit(1)
     if sys.argv[2:] == ["--stored"]:
         try:
             return stored(path)

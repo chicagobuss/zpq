@@ -52,6 +52,10 @@ pub const Spec = struct {
     /// The answer comes from an engine that prints wide numbers as JSON strings (DuckDB's HUGEINT): a string in a
     /// numeric oracle column is read as that number. Never set for zpq, whose number output is pinned.
     text_numbers: bool = false,
+    /// `conform`: the one decode status (`UnsupportedCodec`, ...) the file's failing columns report.
+    decode_status: ?[]const u8 = null,
+    /// `conform`: PyArrow cannot read the file (its error holds this), so only zpq's side is checked.
+    py_refuses: ?[]const u8 = null,
 };
 
 pub const Mean = struct { scale: u16, sum: ?[]const u8 = null, count: ?[]const u8 = null, alias: ?[]const u8 = null };
@@ -143,6 +147,7 @@ pub fn run(in_raw: Inputs, spec: Spec) !Reason {
         .{ "exact_ordered", modeDense },
         .{ "plan", modePlan },
         .{ "written_sql", modeWrittenSql },
+        .{ "conform", modeConform },
         .{ "footer", modeFooter },
         .{ "page_index", modePageIndex },
     };
@@ -1549,6 +1554,54 @@ fn modeWrittenSql(in: Inputs, spec: Spec) !Reason {
     if (t.rows[0][0] != .int or t.rows[0][0].int != 0)
         return fail(in, "{s} rows differ from the oracle's", .{compare.show(in.arena, t.rows[0][0])});
     return null;
+}
+
+/// `zpq conform`'s structural view of a file against PyArrow's footer read (readback.py --footer): the same row count
+/// (the footer's, which a file may misstate) and leaf columns in order,
+/// and every leaf decoding cleanly, or failing with exactly `decode_status` (a declared unsupported codec or
+/// encoding, a corrupt page) at least once.
+fn modeConform(in: Inputs, spec: Spec) !Reason {
+    const z = (try compare.parse(in.arena, in.text)).object;
+    if (z.get("tree_build_failed")) |why| return fail(in, "tree build failed: {s}", .{why.string});
+    var failed: usize = 0;
+    for (z.get("decode").?.array.items) |d| {
+        const status = d.object.get("status").?.string;
+        if (std.mem.eql(u8, status, "ok") or std.mem.eql(u8, status, "skip_int96")) continue;
+        if (spec.decode_status == null or !std.mem.eql(u8, status, spec.decode_status.?))
+            return fail(in, "column {s}: {s}", .{ d.object.get("name").?.string, status });
+        failed += 1;
+    }
+    if (spec.decode_status != null and failed == 0) return fail(in, "no column failed {s}", .{spec.decode_status.?});
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(in.arena, &.{ in.python, "tools/check/readback.py", in.fixture, "--footer" });
+    const out = try oracle_mod.capture(in.gpa, in.io, argv.items);
+    defer in.gpa.free(out.stdout);
+    defer in.gpa.free(out.stderr);
+    if (spec.py_refuses) |why| {
+        if (out.code != 0 and std.mem.indexOf(u8, out.stderr, why) != null) return null;
+        return fail(in, "PyArrow did not refuse with {s}: {s}", .{ why, std.mem.trim(u8, out.stderr, " \n") });
+    }
+    if (out.code != 0) return fail(in, "{s}", .{std.mem.trim(u8, out.stderr, " \t\r\n")});
+    const py = (try compare.parse(in.arena, try in.arena.dupe(u8, out.stdout))).object;
+    const rows = try jsonInt(py.get("num_rows").?);
+    const want_rows = try jsonInt(z.get("num_rows").?);
+    if (rows != want_rows) return fail(in, "zpq rows {d}, PyArrow {d}", .{ want_rows, rows });
+    const cols = py.get("leaves").?.array.items;
+    const leaves = z.get("leaves").?.array.items;
+    if (cols.len != leaves.len) return fail(in, "zpq {d} leaves, PyArrow {d}", .{ leaves.len, cols.len });
+    for (cols, leaves) |c, l| {
+        const got = l.object.get("path").?.string;
+        if (!std.mem.eql(u8, got, c.string)) return fail(in, "leaf {s}, PyArrow {s}", .{ got, c.string });
+    }
+    return null;
+}
+
+fn jsonInt(v: std.json.Value) !i64 {
+    return switch (v) {
+        .integer => |n| n,
+        .number_string => |t| std.fmt.parseInt(i64, t, 10),
+        else => error.NotAnInteger,
+    };
 }
 
 fn isIntegerType(t: []const u8) bool {

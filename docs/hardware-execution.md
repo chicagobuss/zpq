@@ -79,12 +79,10 @@ must never reach any choice that changes bytes or float bits.
 Retained-group admission, scratch headroom and override bounds are described in
 [aggregation execution overrides](execution_knobs.md).
 
-`python tools/hw_execution_check.py CANDIDATE [BASE]` checks q1-like scalar
-and grouped float answers byte for byte under 256K, 1M and 4M L2 overrides
-at j1/3/8/16, L3 overrides of 256K/32M and auto/0/64/256 decode windows.
-It includes nullable, empty and long string keys, mixed dictionary/plain
-encodings, and forced window execution with sparse and empty selections.
-It uses isolated temporary fixtures and requires pyarrow.
+`tools/check/cases/hardware.json` runs q1-like scalar and grouped float
+answers through the CLI and requires the bytes of the 1M-L2, 32M-L3, j1 answer
+under 256K, 1M and 4M L2 overrides, 256K/32M L3 overrides, j1/3/8/16 and
+auto/0/64/256 decode windows.
 
 Flat level streams are validated eagerly before the value decoder is installed.
 The default retains encoded streams when runs of at least 64 levels cover half

@@ -5,11 +5,17 @@ const std = @import("std");
 pub const SelectedBatch = @import("../selected_batch.zig").SelectedBatch;
 pub const Plan = @import("key_plan.zig").Plan;
 pub const KeyId = @import("key_plan.zig").KeyId;
+pub const Binding = Plan.Binding;
 
 pub fn planBytes(keys: usize, dictionary: bool, raw: bool) usize {
     return keys *| (@sizeOf(@import("ast.zig").ColRef) +|
         (if (dictionary) @as(usize, @sizeOf(u64)) else 0) +|
         (if (raw) @as(usize, @sizeOf(RawField)) else 0));
+}
+
+/// Per active producer, independent of the Cartesian domain and number of consumed windows.
+pub fn bindingBytes(keys: usize) usize {
+    return keys *| @sizeOf(Binding);
 }
 
 pub const Error = error{ BadKey, KeyTooWide };
@@ -107,12 +113,20 @@ pub const RawField = struct {
     }
 
     pub fn encode(f: RawField, value: ?i128) Error!u128 {
-        const v = value orelse return @as(u128, 1) << f.bits;
+        return f.encodeAs(u128, value);
+    }
+
+    pub fn encodeAs(f: RawField, comptime Bits: type, value: ?i128) Error!Bits {
+        comptime requireBits(Bits);
+        if (f.bits == 0 or f.bits > 64) return error.BadKey;
+        if (@as(usize, f.bits) + 1 > @bitSizeOf(Bits)) return error.KeyTooWide;
+        const shift: std.math.Log2Int(Bits) = @intCast(f.bits);
+        const v = value orelse return @as(Bits, 1) << shift;
         if (f.signed) {
             const bound = @as(i128, 1) << (f.bits - 1);
             if (v < -bound or v >= bound) return error.BadKey;
         } else if (v < 0 or v > f.mask()) return error.BadKey;
-        return @as(u128, @bitCast(v)) & f.mask();
+        return @as(Bits, @truncate(@as(u128, @bitCast(v)))) & ((@as(Bits, 1) << shift) - 1);
     }
 
     fn decode(f: RawField, word: u128) Error!?i128 {
@@ -127,6 +141,10 @@ pub const RawField = struct {
         return value;
     }
 };
+
+pub fn requireBits(comptime Bits: type) void {
+    if (Bits != u32 and Bits != u64 and Bits != u128) @compileError("KeyPack requires u32, u64 or u128");
+}
 
 pub fn rawBits(fields: []const RawField) Error!u7 {
     if (fields.len == 0) return error.BadKey;
@@ -161,6 +179,19 @@ pub fn unpackRaw(fields: []const RawField, id: u128, axis: usize) Error!?i128 {
 }
 
 const testing = std.testing;
+
+test "key pack typed raw lanes preserve payload and NULL bits without narrowing" {
+    const signed: RawField = .{ .bits = 32, .signed = true };
+    try testing.expectEqual(@as(u64, 0x8000_0000), try signed.encodeAs(u64, std.math.minInt(i32)));
+    try testing.expectEqual(@as(u64, 0xffff_ffff), try signed.encodeAs(u64, -1));
+    try testing.expectEqual(@as(u64, 1) << 32, try signed.encodeAs(u64, null));
+    try testing.expectError(error.KeyTooWide, signed.encodeAs(u32, 0));
+    const wide: RawField = .{ .bits = 64, .signed = false };
+    try testing.expectEqual(@as(u128, std.math.maxInt(u64)), try wide.encodeAs(u128, std.math.maxInt(u64)));
+    try testing.expectEqual(@as(u128, 1) << 64, try wide.encodeAs(u128, null));
+    try testing.expectError(error.KeyTooWide, wide.encodeAs(u64, 0));
+    try testing.expectError(error.BadKey, (RawField{ .bits = 0, .signed = true }).encodeAs(u64, 0));
+}
 
 test "key pack plans dense, dictionary word/wide, raw word/wide or decline and unpacks each form" {
     const fields = [_]RawField{ .{ .bits = 16, .signed = true }, .{ .bits = 32, .signed = false } };

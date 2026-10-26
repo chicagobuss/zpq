@@ -173,7 +173,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             const l2 = cacheBudget();
             const known_l1 = hw.l1dBytesPerWorker();
             const l1 = if (known_l1 == 0) l2 / 16 else known_l1;
-            const bytes = @min(l1 / 4, l2 / 64, cache_headroom / 4);
+            // Hot identities may exceed L1; bound this direct cache by the private L2 share and
+            // an L1-scale allowance, with the existing owner headroom as the unknown/small-L1 floor.
+            const bytes = @min(l2 / 16, @max(l1 / 2, cache_headroom / 4));
             const line = @max(hw.cacheLineBytes(), @sizeOf(CountEntry));
             if (bytes < line) return 0;
             return @as(usize, 1) << @intCast(std.math.log2_int(usize, (bytes / line * line) / @sizeOf(CountEntry)));
@@ -369,7 +371,6 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         .flags = flags,
                     };
                 const p: usize = @intCast(h >> l.state.shift);
-                l.histogram[p] += 1;
                 var tail = l.tails[p];
                 if (tail == none or l.state.blocks[tail].len == block_rows) {
                     if (l.free_next == l.free_end) {
@@ -389,6 +390,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 const b = &l.state.blocks[tail];
                 b.rows[b.len] = r;
                 b.len += 1;
+                l.histogram[p] += 1;
                 if (cached_count) l.contributed_rows += weight;
             }
 
@@ -539,6 +541,21 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             /// What the attempt draws before it consumes anything. The full answer holds a 40-byte group and a
             /// winner slot per input row besides its blocks; top-H holds cache-sized scratch, heaps and stacks.
             pub fn reservation(rows: usize, workers: usize, parts: usize, k: usize, output_credit: usize) usize {
+                return reservationMode(rows, workers, parts, k, output_credit, false);
+            }
+
+            pub fn runReservation(rows: usize, workers: usize, parts: usize, k: usize, output_credit: usize) usize {
+                return reservationMode(rows, workers, parts, k, output_credit, true);
+            }
+
+            fn reservationMode(
+                rows: usize,
+                workers: usize,
+                parts: usize,
+                k: usize,
+                output_credit: usize,
+                runs: bool,
+            ) usize {
                 const shared = blockCount(rows, workers, parts) *| @sizeOf(Block) +| workers *| parts *| 3 *| @sizeOf(u32) +|
                     @sizeOf(State) +| (8 << 20);
                 // The full answers keep their established quotes, which cover blocks and ordering arrays.
@@ -549,7 +566,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 return shared +| rows *| table_row_bytes +|
                     workers *| (stack_size + @sizeOf(Local) + @sizeOf(Heap) + @sizeOf(Task)) +|
                     workers *| k *| @sizeOf(Group) +|
-                    workers *| countCacheEntries() *| @sizeOf(CountEntry) +| output_credit;
+                    (if (runs) 0 else workers *| countCacheEntries() *| @sizeOf(CountEntry)) +| output_credit;
             }
             pub fn init(
                 a: std.mem.Allocator,
@@ -655,7 +672,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     !std.math.isPowerOfTwo(parts)) return null;
                 const k: usize = if (kind == .full) 0 else cut.k;
                 if (kind != .full and (k > 1024 or (kind != .count_top and k == 0))) return null;
-                const charge = reservation(rows, workers, parts, k, output_credit);
+                const charge = reservationMode(rows, workers, parts, k, output_credit, run_items != 0);
                 if (ledger) |l| _ = l.drawExact(charge) orelse return null;
                 const s = a.create(State) catch |e| {
                     if (ledger) |l| l.release(charge);
@@ -931,7 +948,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         t.groups = &.{};
                         t.groups = try s.gpa.alloc(Group, rows);
                     }
-                    const slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, rows * 2));
+                    const initial_groups = if (cached_count) @min(rows, @max(1, cacheBudget() / table_row_bytes)) else rows;
+                    var slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, initial_groups * 2));
                     var n: usize = 0;
                     var previous: ?usize = null;
                     for (s.locals) |l| {
@@ -939,7 +957,23 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         while (id != none) {
                             const b = &s.blocks[id];
                             if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
-                            for (b.rows[0..b.len]) |r| previous = foldAdjacent(r, t.groups, slots, 0, &n, previous);
+                            for (b.rows[0..b.len]) |r| {
+                                if (cached_count and n >= slots.len / 2 and n < rows) {
+                                    // A cache-sized pointer table avoids faulting rows-sized scratch for a hot owner.
+                                    // Only discovered groups trigger growth; the existing worst-case quote covers it.
+                                    slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, @min(rows, n * 2) * 2));
+                                    for (t.groups[0..n], 0..) |g, i| {
+                                        const h = if (g.first & null_key != 0)
+                                            @as(u64, 0x621985775bcbd930)
+                                        else
+                                            mixKey(g.key, 0);
+                                        var pos: usize = (@as(u32, @truncate(h)) & 0x3fffffff) & (slots.len - 1);
+                                        while (slots[pos] != 0) pos = (pos + 1) & (slots.len - 1);
+                                        slots[pos] = @intCast(i + 1);
+                                    }
+                                }
+                                previous = foldAdjacent(r, t.groups, slots, 0, &n, previous);
+                            }
                             id = b.next;
                         }
                     }
@@ -2027,12 +2061,12 @@ test "hot integer COUNT cache capacity follows cache lines and L1 L2 shares" {
     defer hw.test_cpu = null;
     hw.test_cpu = .{ .l1d = .{ .bytes = 32 << 10, .line_bytes = 64 }, .l2 = .{ .bytes = 1 << 20 } };
     const wide = IntCountTop.countCacheEntries();
-    try std.testing.expectEqual(@as(usize, 512), wide);
+    try std.testing.expectEqual(@as(usize, 1024), wide);
     hw.test_cpu.?.l1d.max_sharing = 2;
-    try std.testing.expectEqual(wide / 2, IntCountTop.countCacheEntries());
+    try std.testing.expectEqual(wide, IntCountTop.countCacheEntries());
     hw.test_cpu.?.l2.bytes = 64 << 10;
-    try std.testing.expectEqual(@as(usize, 64), IntCountTop.countCacheEntries());
-    hw.test_cpu.?.l1d.line_bytes = 2048;
+    try std.testing.expectEqual(@as(usize, 256), IntCountTop.countCacheEntries());
+    hw.test_cpu.?.l1d.line_bytes = 8192;
     try std.testing.expectEqual(@as(usize, 0), IntCountTop.countCacheEntries());
     try std.testing.expectEqual(@as(usize, 0), CountTop.countCacheEntries());
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(IntCountTop.Record));
@@ -2061,4 +2095,54 @@ test "hot integer COUNT cache bypasses a nonreducing source and retries later ho
     try std.testing.expectEqual(@as(i64, 256), winner.countValue());
     try std.testing.expectEqual(@as(u32, 256), winner.ordinal());
     try std.testing.expectEqual(@as(usize, rows), local.contributed_rows);
+}
+
+test "hot integer COUNT run quote excludes its unallocated cache and failed claims preserve histograms" {
+    defer hw.test_cpu = null;
+    hw.test_cpu = .{ .l1d = .{ .bytes = 32 << 10, .line_bytes = 64 }, .l2 = .{ .bytes = 1 << 20 } };
+    const O = IntCountTop;
+    const Entry = @typeInfo(@FieldType(O.State, "count_caches")).pointer.child;
+    const rows = 128;
+    var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
+    const ordinary = O.State.reservation(rows, 1, 64, 4, 0);
+    const run_quote = O.State.runReservation(rows, 1, 64, 4, 0);
+    try std.testing.expectEqual(O.countCacheEntries() * @sizeOf(Entry), ordinary - run_quote);
+    const run = (try O.State.initRuns(std.testing.allocator, &budget, rows, 1, 0, 0, .{ .k = 4, .descending = true }, 64, 1, 0)).?;
+    try std.testing.expectEqual(run_quote, budget.used.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), run.count_caches.len);
+    run.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    const s = (try O.State.init(std.testing.allocator, &budget, rows, 1, 0, 0, .{ .k = 4, .descending = true }, 64, 0)).?;
+    defer s.deinit();
+    const blocks = s.blocks;
+    s.blocks = blocks[0..0];
+    defer s.blocks = blocks;
+    const local = &s.locals[0];
+    var entry: Entry = .{ .key = 9, .first = 0, .count = 2 };
+    try std.testing.expectError(error.ExceededMemoryBudget, local.flushCount(&entry));
+    try std.testing.expectEqual(@as(u32, 2), entry.count);
+    for (local.histogram) |n| try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(@as(usize, 0), local.contributed_rows);
+}
+
+fn countScratchGrowthTrial(a: std.mem.Allocator) !void {
+    var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const s = (try IntCountTop.State.init(a, &budget, 1028, 1, 0, 0, .{ .k = 257, .descending = true }, 64, 0)).?;
+    defer s.deinit();
+    for (0..1028) |i| try s.locals[0].append(if (i % 257 == 0) null else @intCast(i % 257), {}, @intCast(i));
+    try s.finish();
+    try std.testing.expectEqual(@as(usize, 257), s.group_count);
+    for (s.top(), 0..) |g, i| {
+        try std.testing.expectEqual(@as(i64, 4), g.countValue());
+        try std.testing.expectEqual(@as(u32, @intCast(i)), g.ordinal());
+        try std.testing.expectEqual(if (i == 0) null else @as(?i64, @intCast(i)), g.keyValue());
+    }
+}
+
+test "hot integer COUNT scratch grows from exact groups preserving NULL ties and all failed allocations" {
+    defer hw.test_cpu = null;
+    hw.test_cpu = .{ .l1d = .{ .bytes = 256, .line_bytes = 64 }, .l2 = .{ .bytes = 128 } };
+    try countScratchGrowthTrial(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, countScratchGrowthTrial, .{});
 }

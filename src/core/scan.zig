@@ -6619,7 +6619,7 @@ fn inlineIntegerAnswer(
     }
     if (distinct and args.integer_records_min_rows != 0 and key_range.small(rows)) return null;
     if (rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows)) return null;
-    const quote = integerQuote(rows, n_workers, cut, owner_args, count_top, outputNamesBytes(outputs));
+    const quote = integerQuote(rows, n_workers, cut, owner_args, count_top, ordered_count, outputNamesBytes(outputs));
     if (quote > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
@@ -6816,6 +6816,7 @@ fn integerQuote(
     cut: ?owner_groups.Cut,
     args: MultiAggArgs,
     count_top: bool,
+    ordered: bool,
     names_credit: usize,
 ) usize {
     const c = cut orelse return owner_groups.IntFull.State.reservation(
@@ -6829,7 +6830,10 @@ fn integerQuote(
         inline else => |kind| {
             const Owner = owner_groups.Owner(kind, .int64);
             const parts = Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
-            return Owner.State.reservation(rows, n_workers, parts, c.k, names_credit);
+            return if (ordered)
+                Owner.State.runReservation(rows, n_workers, parts, c.k, names_credit)
+            else
+                Owner.State.reservation(rows, n_workers, parts, c.k, names_credit);
         },
     }
 }
@@ -14991,7 +14995,7 @@ test "inline records decline released remote windows and retry only through a re
             .reservation = if (bytes_key)
                 owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0)
             else
-                integerQuote(n, 1, null, args, false, names_credit),
+                integerQuote(n, 1, null, args, false, false, names_credit),
         };
         try testing.expectEqual(expected, explanation.record_path.?);
     }

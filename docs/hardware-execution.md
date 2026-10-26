@@ -26,14 +26,18 @@ affinity/cache discovery, including macOS arm64, return zero;
 `hw.l1dBytesPerWorker()` uses the same affinity minimum and sharing rule.
 `hw.cacheLineBytes()` returns the widest discovered L1 data-cache line in that
 snapshot, with Zig's target cache-line estimate when unknown. Integer COUNT
-owners reserve a worker-local exact preaggregation cache within one quarter
-of the L1 share, one sixty-fourth of the L2 share and one quarter of the existing
-owner headroom. Unknown L1 uses one sixteenth of the L2 share. Capacity rounds
+owners reserve a worker-local exact preaggregation cache bounded by one
+sixteenth of the L2 share and an L1-scale allowance (the larger of half the L1
+share and one quarter of existing owner headroom). Unknown L1 uses one sixteenth of the L2 share. Capacity rounds
 down to whole cache lines and then a power of two of 16-byte entries; less
 than one line disables the cache. NULL uses the ordinary cache with a separate
 identity bit. Evictions retain the exact count and minimum source ordinal,
 so cache capacity changes work and memory only, including first-row ties.
-The reservation includes every worker's cache before scanning any rows.
+The record reservation includes every worker's cache before scanning any rows;
+ordered run owners omit it because they allocate no cache. COUNT owner fold
+pointer tables start within the L2 share and grow from the exact groups seen,
+without clearing a rows-sized table for a hot partition. The worst-case group
+array remains reserved, with only discovered groups initialized.
 Each input source tries two cache-line-widths of probes per slot. If fewer
 than one record per slot was eliminated, the worker flushes exact partials
 and bypasses the cache until the next source; later skew can still benefit.

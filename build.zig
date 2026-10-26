@@ -277,33 +277,6 @@ pub fn build(b: *std.Build) void {
     b.step("release-smoke", "Build every release target and run its CLI and Lambda where this host can")
         .dependOn(&release_smoke.step);
 
-    // probe_simd_decoders: compare zigzag, bit-unpacking, and gather performance
-    const probe_simd_decoders = b.addExecutable(.{
-        .name = "probe_simd_decoders",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("probes/probe_simd_decoders/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    const probe_simd_decoders_step = b.step("probe-simd-decoders", "Build the SIMD decoders microbenchmark probe");
-    probe_simd_decoders_step.dependOn(&b.addInstallArtifact(probe_simd_decoders, .{}).step);
-
-    // probe_decompress: zpq's codec entry point on dumped page payloads, apart from scan and decode.
-    const probe_decompress = b.addExecutable(.{
-        .name = "probe_decompress",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("probes/probe_decompress/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{.{ .name = "zpq", .module = cli_zpq.zpq }},
-        }),
-    });
-    b.step("probe-decompress", "Build the page decompression probe")
-        .dependOn(&b.addInstallArtifact(probe_decompress, .{}).step);
-
     // microbench: time decode of one column-chunk in isolation.
     // Used to map ns/value across (encoding × type × bit_width × null
     // rate) — without the glob/mmap/aggregate noise of the full

@@ -1056,7 +1056,7 @@ const PAR1: [4]u8 = .{ 'P', 'A', 'R', '1' };
 //
 // Idiom: this is the same std.Io concurrency the S3 paths already use, applied
 // to CPU work — replacing raw std.Thread.spawn + buffer-all. (See the
-// probe_io_concurrency / probe_backpressure spikes for why async + async_limit,
+// probe_io_concurrency / probe_backpressure spikes at e76a1e3 for why async + async_limit,
 // not concurrent, and why a sliding window rather than byte credits.)
 
 /// A Sink that appends into an in-memory buffer (offsets relative to 0).

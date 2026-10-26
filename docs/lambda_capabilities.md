@@ -24,11 +24,11 @@ on its own; zpq copes with that, it just does not depend on it.
 ## Probe results
 
 **Run date**: 2026-06-13
-**Probe binary**: `probes/probe_lambda_caps/main.zig` (165 KB static musl)
+**Probe binary**: `probes/probe_lambda_caps/main.zig` at e76a1e3 (165 KB static musl; removed from the tree since)
 **Runtime**: `provided.al2023`
 **Region**: `us-west-2`
 **Account**: sandbox staging (id redacted)
-**Schema**: v1 — see top of `probes/probe_lambda_caps/main.zig`
+**Schema**: v1 — see top of the probe source at e76a1e3
 
 ## TL;DR
 
@@ -185,7 +185,7 @@ These findings should drive the current architecture, not be appended to it:
    files and ship on demand. Reasoning: Tier-1 "if we can't fix it, we don't use it" + binary-size discipline + the
    S3-streaming workload is narrow enough to want a purpose-built loop.
 4. **Use raw socket helpers for the Lambda runtime API loop.** Low-frequency, plain HTTP/1.1, stays in epoll-land —
-   `probes/probe_lambda_caps/main.zig` already has the pattern (~30 LoC of socket code). Don't reach for `std.http` or
+   the probe (`probes/probe_lambda_caps/main.zig` at e76a1e3) has the pattern (~30 LoC of socket code). Don't reach for `std.http` or
    `std.Io.Net` here; the runtime API is a poor fit for vtable-based abstractions.
 5. **Consider `MSG_ZEROCOPY` for S3 upload payloads.** `SO_ZEROCOPY` allowed means we can zero-copy *outbound* sends,
    which is exactly the S3 multipart upload story. This is independent of io_uring availability.
@@ -201,25 +201,9 @@ These findings should drive the current architecture, not be appended to it:
 
 ## Reproducing
 
-```bash
-# Build
-zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
-  -target aarch64-linux-musl \
-  -femit-bin=zig-out/probe_lambda_caps_arm64
-
-# Local CLI run (builds the native probe first)
-just probe-local
-
-# Lambda deploy + invoke (functions exist in sandbox account)
-source .env
-aws lambda invoke \
-  --function-name zpq-probe-caps-arm64 \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{}' \
-  --region us-west-2 \
-  out.json
-jq < out.json
-```
+Restore the probe with `git restore --source=e76a1e3 -- probes/probe_lambda_caps`, then build it with
+`zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall -target aarch64-linux-musl`, deploy the binary as a
+`provided.al2023` function's `bootstrap`, and invoke it with an empty payload. In CLI mode it prints the same JSON.
 
 The probe is idempotent and free to run repeatedly. Re-run if AWS announces runtime changes — the seccomp filter is
 policy, not API contract, so it can shift without warning.

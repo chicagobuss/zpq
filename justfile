@@ -228,25 +228,6 @@ lambda-invoke fn payload="{}":
 lambda-logs fn:
     @./tools/serverless/aws.sh logs {{fn}}
 
-# === Lambda capability probe ===
-
-# Run the Lambda capability probe locally (CLI mode prints JSON to stdout).
-probe-local:
-    zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
-        -femit-bin=zig-out/probe_lambda_caps_native
-    @./zig-out/probe_lambda_caps_native | jq
-
-# Build + invoke the probe in Lambda. Re-run to recheck AWS's seccomp policy.
-probe-lambda arch="arm64":
-    zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
-        -target {{arch}}-linux-musl \
-        -femit-bin=zig-out/probe_lambda_caps_{{arch}}
-    @mkdir -p zig-out/lambda_probe
-    @cp zig-out/probe_lambda_caps_{{arch}} zig-out/lambda_probe/bootstrap
-    @cd zig-out/lambda_probe && zip -j -q probe_lambda_caps_{{arch}}.zip bootstrap && rm bootstrap
-    @./tools/serverless/aws.sh deploy zpq-probe-caps-{{arch}} zig-out/lambda_probe/probe_lambda_caps_{{arch}}.zip {{arch}}
-    @./tools/serverless/aws.sh invoke zpq-probe-caps-{{arch}} '{}'
-
 # === Profiling ===
 
 # Record a perf trace of `zpq <args>` and render a flamegraph SVG.

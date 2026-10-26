@@ -552,23 +552,13 @@ src/
     local_reader.zig     Gated local reads: pread / io_uring into a windowed buffer
     sigv4.zig            SigV4 signer
 
-probes/probe_lambda_caps/   Empirical Lambda capability prober
 benchmarks/                 Selectivity / cold-start / partition sweeps
 tools/serverless/aws.sh     Lambda lifecycle (build, deploy, invoke)
 docs/                       Demos, capability findings, measurements, validation notes
 vendor/boring_tls/          Vendored prebuilt-only BoringSSL bindings
 ```
 
-## Lambda capability probe
-
-`probe_lambda_caps` enumerates what AWS Lambda actually allows (seccomp filter, kernel version, allowed setsockopt, CPU
-affinity at each memory tier, `/tmp` throughput). Re-run any time AWS announces a runtime change — seccomp is not API
-contract.
-
-```bash
-just probe-local         # JSON to stdout from your workstation
-just probe-lambda        # deploy + invoke in AWS, prints JSON
-```
+## Lambda capabilities
 
 Findings driving the architecture are in [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md).
 

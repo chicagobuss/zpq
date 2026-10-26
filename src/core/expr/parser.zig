@@ -21,6 +21,7 @@ const metadata = @import("../parquet/metadata.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_parser = @import("../filter/parser.zig");
+const regex = @import("regex.zig");
 const Diag = @import("../diag.zig").Diag;
 
 pub const Error = error{
@@ -64,7 +65,9 @@ pub const Error = error{
     /// A CASE zpq does not evaluate: the simple form (`CASE x WHEN 1 ...`), branches of types with no common one, or
     /// every branch NULL.
     UnsupportedCase,
-} || std.mem.Allocator.Error || filter_parser.Error;
+    /// A `date_trunc`/`date_part` part zpq does not have, or one the function does not take.
+    UnsupportedDatePart,
+} || std.mem.Allocator.Error || filter_parser.Error || regex.Error;
 
 /// A bare UINT64 reference is fine on its own (selected, grouped by, aggregated); as an operand it is not.
 fn rejectUnsigned64Operand(e: ast.Expr) Error!void {
@@ -525,6 +528,7 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
                     .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
                     .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
                     .dec = dec,
+                    .temporal = columnTemporal(&elem),
                     .nullable = blk: {
                         const path = (try metadata.leafPathSegments(arena, file, col_idx)) orelse break :blk true;
                         break :blk file.getColumnLevels(path).max_def > 0;
@@ -580,7 +584,7 @@ fn parseCall(
         }
     }
 
-    const result_type = try resolveCallType(func, args.items);
+    const result_type = try resolveCallType(func, args.items, file);
     var dec: ?ast.Dec = null;
     if (result_type == .dec) {
         dec = args.items[0].decSpec().?;
@@ -590,13 +594,69 @@ fn parseCall(
     for (args.items) |a| deepest = @max(deepest, a.depth());
     const depth = 1 + deepest;
     if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-    return .{ .call = .{
-        .func = func,
-        .args = args.items,
-        .result_type = result_type,
-        .depth = depth,
-        .dec = dec,
-    } };
+    return .{
+        .call = .{
+            .func = func,
+            .args = args.items,
+            .result_type = result_type,
+            .depth = depth,
+            .dec = dec,
+            .temporal = switch (func) {
+                .make_date => .date,
+                .epoch_ms, .date_trunc => .ts_us,
+                // Values of one unit keep it; mixed ones are no time zpq could name.
+                .coalesce => for (args.items[1..]) |a| {
+                    if (a.temporal() != args.items[0].temporal()) break null;
+                } else args.items[0].temporal(),
+                .strlen, .date_part, .regexp_replace => null,
+            },
+            .part = switch (func) {
+                .date_trunc, .date_part => ast.DatePart.parse(args.items[0].literal.str) orelse unreachable,
+                else => null,
+            },
+            .replace = if (func == .regexp_replace) blk: {
+                const r = try arena.create(regex.Replace);
+                const a = args.items;
+                r.* = try .compile(arena, a[1].literal.str, a[2].literal.str, if (a.len > 3) a[3].literal.str else "");
+                break :blk r;
+            } else null,
+        },
+    };
+}
+
+/// The unit a DATE or TIMESTAMP column's integers count; INT96 decodes to nanoseconds.
+fn columnTemporal(elem: *const schema.SchemaElement) ?ast.Temporal {
+    if (elem.type == .INT96) return .ts_ns;
+    return switch (elem.effectiveLogicalType() orelse return null) {
+        .DATE => .date,
+        .TIMESTAMP => |ts| switch (ts.unit) {
+            .MILLIS => .ts_ms,
+            .MICROS => .ts_us,
+            .NANOS => .ts_ns,
+        },
+        else => null,
+    };
+}
+
+/// Whether DuckDB types `e` INTEGER or narrower, as `make_date` takes it: such a column (not BIGINT or UINTEGER), a
+/// literal in range, and `+`, `-`, `*`, CASE and coalesce over those, whose results `make_date` range-checks.
+fn integerArgument(e: ast.Expr, file: *const schema.FileMetaData) bool {
+    if (e.typeOf() != .i64 or e.temporal() != null or e.isBoolean()) return false;
+    return switch (e) {
+        .literal => |l| std.math.cast(i32, l.i64) != null,
+        .col_ref => |c| blk: {
+            const elem = metadata.leafSchemaElement(file, c.col_idx) orelse break :blk false;
+            break :blk filter_parser.integerDays(&elem);
+        },
+        .binop => |b| b.op != .div and integerArgument(b.left.*, file) and integerArgument(b.right.*, file),
+        .case_ => |c| for (0..c.whens.len + 1) |i| {
+            const v = (if (i < c.whens.len) c.whens[i].then else c.else_) orelse continue;
+            if (!integerArgument(v.*, file)) break false;
+        } else true,
+        .call => |c| c.func == .coalesce and for (c.args) |arg| {
+            if (!integerArgument(arg.*, file)) break false;
+        } else true,
+    };
 }
 
 /// A searched `CASE WHEN cond THEN value ... [ELSE value] END`, `CASE` already read. Each condition is a predicate
@@ -708,12 +768,17 @@ fn findThen(src: []const u8, from: usize) Error!?usize {
 fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "coalesce")) return .coalesce;
     if (asciiEqIgnoreCase(name, "strlen")) return .strlen;
+    if (asciiEqIgnoreCase(name, "make_date")) return .make_date;
+    if (asciiEqIgnoreCase(name, "epoch_ms")) return .epoch_ms;
+    if (asciiEqIgnoreCase(name, "date_trunc")) return .date_trunc;
+    if (asciiEqIgnoreCase(name, "date_part") or asciiEqIgnoreCase(name, "datepart")) return .date_part;
+    if (asciiEqIgnoreCase(name, "regexp_replace")) return .regexp_replace;
     return null;
 }
 
 /// Validate arity + argument types per function and return the result
 /// type. coalesce requires ≥2 args, all promotable to a common type.
-fn resolveCallType(func: ast.Func, args: []const *ast.Expr) Error!ast.Type {
+fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.FileMetaData) Error!ast.Type {
     switch (func) {
         .coalesce => {
             if (args.len < 2) return error.WrongArity;
@@ -729,6 +794,36 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr) Error!ast.Type {
             if (args.len != 1) return error.WrongArity;
             if (args[0].typeOf() != .str) return error.TypeMismatch;
             return .i64;
+        },
+        .make_date => {
+            if (args.len != 1) return error.WrongArity;
+            if (!integerArgument(args[0].*, file)) return error.TypeMismatch;
+            return .i64;
+        },
+        .epoch_ms => {
+            if (args.len != 1) return error.WrongArity;
+            const a = args[0];
+            if (a.typeOf() != .i64 or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
+            return .i64;
+        },
+        .date_trunc, .date_part => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].* != .literal or args[0].literal != .str) return error.TypeMismatch;
+            const part = ast.DatePart.parse(args[0].literal.str) orelse return error.UnsupportedDatePart;
+            if (args[1].temporal() == null) return error.TypeMismatch;
+            if (func == .date_trunc and switch (part) {
+                .dow, .isodow, .doy => true,
+                else => false,
+            }) return error.UnsupportedDatePart;
+            return .i64;
+        },
+        .regexp_replace => {
+            if (args.len != 3 and args.len != 4) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            // The pattern, replacement and options compile once, so they must be constants (DuckDB also takes them
+            // per row).
+            for (args[1..]) |a| if (a.* != .literal or a.literal != .str) return error.TypeMismatch;
+            return .str;
         },
     }
 }
@@ -1031,7 +1126,7 @@ test "parse: nesting past MAX_EXPR_DEPTH is rejected" {
     const ok_parens = try a.alloc(u8, (MAX_EXPR_DEPTH - 1) * 2 + 1);
     @memset(ok_parens[0 .. MAX_EXPR_DEPTH - 1], '(');
     ok_parens[MAX_EXPR_DEPTH - 1] = '1';
-    @memset(ok_parens[MAX_EXPR_DEPTH ..], ')');
+    @memset(ok_parens[MAX_EXPR_DEPTH..], ')');
     _ = try parseExprOnly(a, ok_parens, &file, null);
 }
 
@@ -1622,4 +1717,49 @@ test "regression: GROUP BY binds an alias by its exact text, not one that differ
     const exact = [_]ast.SelectColumn{.{ .expr = "id + 1", .alias = "x", .role = .key }};
     const keys = try parseGroupByOf(a, "x", &file, null, &exact);
     try testing.expect(keys[0].expr == .binop);
+}
+
+test "parse: date/time functions bind DuckDB's argument types and carry their unit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var file = try fakeFile(a, &.{ "i", "b", "tms", "s" }, &.{ .INT32, .INT64, .INT64, .BYTE_ARRAY });
+    file.schema.items[3].logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } };
+
+    const d = try parseExprOnly(a, "make_date(i)", &file, null);
+    try testing.expectEqual(ast.Temporal.date, d.temporal().?);
+    const m = try parseExprOnly(a, "date_part('minute', epoch_ms(b * 1000))", &file, null);
+    try testing.expectEqual(ast.DatePart.minute, m.call.part.?);
+    try testing.expectEqual(@as(?ast.Temporal, null), m.temporal());
+    try testing.expectEqual(ast.Temporal.ts_us, m.call.args[1].temporal().?);
+    // A TIMESTAMP column carries its own unit; a plural part names the same part.
+    const t = try parseExprOnly(a, "DATE_TRUNC('Hours', tms)", &file, null);
+    try testing.expectEqual(ast.DatePart.hour, t.call.part.?);
+    try testing.expectEqual(ast.Temporal.ts_ms, t.call.args[1].temporal().?);
+    try testing.expect(!t.eql(try parseExprOnly(a, "date_trunc('minute', tms)", &file, null)));
+
+    _ = try parseExprOnly(a, "make_date(coalesce(-i * 2 + 1, 0))", &file, null);
+    for ([_][]const u8{
+        "make_date(b)",                      "make_date(2147483648)", "make_date(make_date(i))", "make_date(i + b)",
+        "make_date(date_part('year', tms))", "epoch_ms(tms)",         "date_trunc('minute', b)", "date_part(s, tms)",
+    }) |src|
+        try testing.expectError(error.TypeMismatch, parseExprOnly(a, src, &file, null));
+    try testing.expectError(error.UnsupportedDatePart, parseExprOnly(a, "date_trunc('dow', tms)", &file, null));
+    try testing.expectError(error.UnsupportedDatePart, parseExprOnly(a, "date_part('fortnight', tms)", &file, null));
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "date_part('minute')", &file, null));
+}
+
+test "parse: regexp_replace compiles its constant pattern, replacement and options once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "s", "i" }, &.{ .BYTE_ARRAY, .INT64 });
+    const e = try parseExprOnly(a, "REGEXP_REPLACE(s, '^https?://([^/]+)/', '\\1', 'g')", &file, null);
+    try testing.expectEqual(ast.Type.str, e.typeOf());
+    try testing.expect(e.call.replace.?.global);
+    try testing.expectEqual(@as(u32, 2), e.call.replace.?.re.groups);
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "regexp_replace(i, 'a', 'b')", &file, null));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "regexp_replace(s, s, 'b')", &file, null));
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "regexp_replace(s, 'a')", &file, null));
+    try testing.expectError(error.InvalidRegex, parseExprOnly(a, "regexp_replace(s, 'a', '\\2')", &file, null));
 }

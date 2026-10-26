@@ -460,8 +460,8 @@ fn parseInList(
     // A parenthesized list, split at its outermost commas: a comma inside a quoted value is part of the value.
     const vals = (try groupBody(list)) orelse return error.BadOperator;
 
-    const col_idx = try resolveCol(file, col_name, diag);
-    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    const operand = try resolveOperand(file, col_name, diag);
+    const col_idx = operand.col_idx;
 
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
@@ -475,7 +475,7 @@ fn parseInList(
         if (v.len == 0) return error.BadValue;
         // The NULL literal is no value to compare with, on a string column as on any other.
         if (isNullLiteral(v)) null_member = true else {
-            try leaves.append(arena, try buildTypedComparison(arena, file, col_idx, &elem, leaf_op, v, diag));
+            try leaves.append(arena, try buildOperandComparison(arena, file, operand, leaf_op, v, diag));
         }
         start = (comma orelse break) + 1;
     }
@@ -609,15 +609,14 @@ fn parseBetween(
     const y_str = trimSpace(expr[after_between + and_at + " AND ".len ..]);
     if (col_name.len == 0 or x_str.len == 0 or y_str.len == 0) return error.BadOperator;
 
-    const col_idx = try resolveCol(file, col_name, diag);
-    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    const operand = try resolveOperand(file, col_name, diag);
 
     // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
     // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals. A NULL bound is the
     // UNKNOWN `x >= NULL` is, so `x NOT BETWEEN NULL AND 5` still keeps the rows past 5.
     return ast.join(arena, true, &.{
-        if (isNullLiteral(x_str)) unknown else try buildTypedComparison(arena, file, col_idx, &elem, .GtEq, x_str, diag),
-        if (isNullLiteral(y_str)) unknown else try buildTypedComparison(arena, file, col_idx, &elem, .LtEq, y_str, diag),
+        if (isNullLiteral(x_str)) unknown else try buildOperandComparison(arena, file, operand, .GtEq, x_str, diag),
+        if (isNullLiteral(y_str)) unknown else try buildOperandComparison(arena, file, operand, .LtEq, y_str, diag),
     });
 }
 
@@ -636,15 +635,56 @@ fn parseComparisonLeaf(
     const val_str = trimSpace(expr[found_at + found_len ..]);
     if (col_name.len == 0 or val_str.len == 0) return error.BadOperator;
     if (isNullLiteral(val_str)) {
-        _ = try resolveCol(file, col_name, diag);
+        _ = try resolveOperand(file, col_name, diag);
         return unknown;
     }
-    // What parentheses are left here are no grouping: `(a + b) = 1` or `f(x) = 1`, which no leaf compares.
-    if (std.mem.indexOfScalar(u8, col_name, '(') != null) return error.BadOperator;
+    return buildOperandComparison(arena, file, try resolveOperand(file, col_name, diag), op, val_str, diag);
+}
 
-    const col_idx = try resolveCol(file, col_name, diag);
+/// A comparison's column side: a column, or `make_date(c)` over an integer column. That is the DATE its integer
+/// counts, the same number, so the leaf compares (and statistics prune) the stored days themselves.
+const Operand = struct { col_idx: usize, elem: schema.SchemaElement, make_date: bool };
+
+fn resolveOperand(file: *const schema.FileMetaData, text: []const u8, diag: ?*Diag) Error!Operand {
+    const open = std.mem.indexOfScalar(u8, text, '(') orelse {
+        const col_idx = try resolveCol(file, text, diag);
+        const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+        return .{ .col_idx = col_idx, .elem = elem, .make_date = false };
+    };
+    // What parentheses are left here are no grouping: `(a + b) = 1` or `f(x) = 1`, which no leaf compares.
+    if (!std.ascii.eqlIgnoreCase(trimSpace(text[0..open]), "make_date")) return error.BadOperator;
+    const arg = (try groupBody(text[open..])) orelse return error.BadOperator;
+    const col_idx = try resolveCol(file, arg, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-    return try buildTypedComparison(arena, file, col_idx, &elem, op, val_str, diag);
+    if (!integerDays(&elem)) {
+        Diag.setColumn(diag, metadata.unquoteIdent(arg));
+        return error.UnsupportedType;
+    }
+    return .{ .col_idx = col_idx, .elem = elem, .make_date = true };
+}
+
+/// An INT32 column DuckDB's `make_date(INTEGER)` takes: plain, or an integer annotation it casts to INTEGER (signed
+/// up to 32 bits, unsigned up to 16), never a DATE, TIME or DECIMAL.
+pub fn integerDays(elem: *const schema.SchemaElement) bool {
+    if (elem.type != .INT32) return false;
+    const lt = elem.effectiveLogicalType() orelse return true;
+    return lt == .INTEGER and lt.INTEGER.bitWidth <= @as(i8, if (lt.INTEGER.isSigned) 32 else 16);
+}
+
+fn buildOperandComparison(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
+    operand: Operand,
+    op: ast.Operator,
+    val_str: []const u8,
+    diag: ?*Diag,
+) Error!ast.Filter {
+    if (!operand.make_date) return buildTypedComparison(arena, file, operand.col_idx, &operand.elem, op, val_str, diag);
+    // DuckDB casts the literal to the DATE's type, so a time of day is dropped, not compared: `make_date(x) =
+    // '2013-07-01 12:00'` holds on that day.
+    const lit = try parseDateTimeNs(stripStringQuotes(val_str));
+    const lane: Lane = if (schema.isUnsignedInt(operand.elem)) .uint64 else .int32;
+    return markStored(bindExact(operand.col_idx, op, lane, @divFloor(lit.ns, ns_per_day), false));
 }
 
 /// A leaf that is a column's name alone (`b`, `"b"`, `t.b`): SQL's bare BOOLEAN predicate, the same leaf as `b = true`
@@ -814,7 +854,8 @@ const TemporalKind = struct {
     ns_per_tick: i128,
     lane: Lane,
 };
-const Lane = enum { int32, int64 };
+/// `.uint64` is the lane an unsigned column's leaves compare in (`buildUnsignedLeaf`).
+const Lane = enum { int32, int64, uint64 };
 
 const ns_per_s: i128 = 1_000_000_000;
 const ns_per_day: i128 = 86_400 * ns_per_s;
@@ -880,6 +921,7 @@ fn bindExact(col_idx: usize, op: ast.Operator, lane: Lane, floor: i128, inexact:
     return switch (lane) {
         .int32 => .{ .int32 = ast.exactLeaf(i32, col_idx, op, floor, inexact) },
         .int64 => .{ .int64 = ast.exactLeaf(i64, col_idx, op, floor, inexact) },
+        .uint64 => .{ .uint64 = ast.exactLeaf(u64, col_idx, op, floor, inexact) },
     };
 }
 
@@ -1034,17 +1076,19 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
             .op = op,
             .value = stripStringQuotes(val_str),
         } },
-        .BOOLEAN => .{ .boolean = .{
-            .col_idx = col_idx,
-            .op = op,
-            // Any letter case: SQL prints the literal as TRUE.
-            .value = if (std.ascii.eqlIgnoreCase(val_str, "true") or std.mem.eql(u8, val_str, "1"))
-                true
-            else if (std.ascii.eqlIgnoreCase(val_str, "false") or std.mem.eql(u8, val_str, "0"))
-                false
-            else
-                return error.BadValue,
-        } },
+        .BOOLEAN => .{
+            .boolean = .{
+                .col_idx = col_idx,
+                .op = op,
+                // Any letter case: SQL prints the literal as TRUE.
+                .value = if (std.ascii.eqlIgnoreCase(val_str, "true") or std.mem.eql(u8, val_str, "1"))
+                    true
+                else if (std.ascii.eqlIgnoreCase(val_str, "false") or std.mem.eql(u8, val_str, "0"))
+                    false
+                else
+                    return error.BadValue,
+            },
+        },
         .INT96 => return error.UnsupportedType,
     };
 }
@@ -1700,6 +1744,60 @@ test "regression: DECIMAL literals bind exactly at the column's scale, a fractio
     for (bad ++ [_][]const u8{"dec = 1__0"}) |text| {
         try testing.expectError(error.BadValue, parse(a, text, &meta, null));
     }
+}
+
+test "make_date(c) compares the DATE an integer column counts, on its stored days" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const ints = [_]struct { name: []const u8, type: schema.Type, lt: ?schema.LogicalType }{
+        .{ .name = "u16", .type = .INT32, .lt = .{ .INTEGER = .{ .bitWidth = 16, .isSigned = false } } },
+        .{ .name = "u32", .type = .INT32, .lt = .{ .INTEGER = .{ .bitWidth = 32, .isSigned = false } } },
+        .{ .name = "big", .type = .INT64, .lt = null },
+    };
+    meta.schema.items[0].num_children.? += ints.len;
+    for (ints) |t| try meta.schema.append(a, .{
+        .type = t.type,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = t.name,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = t.lt,
+    });
+
+    const signed = try parse(a, "make_date(id) >= '2013-07-01'", &meta, null);
+    try testing.expectEqual(ast.Operator.GtEq, signed.int32.op);
+    try testing.expectEqual(@as(i32, 15887), signed.int32.value);
+    try testing.expect(signed.int32.stored);
+    // An unsigned column compares in its own lane, as `u16 <= 15917` would.
+    const unsigned = try parse(a, "MAKE_DATE( u16 ) <= '2013-07-31'", &meta, null);
+    try testing.expectEqual(ast.Operator.LtEq, unsigned.uint64.op);
+    try testing.expectEqual(@as(u64, 15917), unsigned.uint64.value);
+    // The literal is cast to DATE, as DuckDB casts it: its time of day is dropped, before the epoch too.
+    const noon = try parse(a, "make_date(id) = '2013-07-01 12:00:00'", &meta, null);
+    try testing.expectEqual(ast.Operator.Eq, noon.int32.op);
+    try testing.expectEqual(@as(i32, 15887), noon.int32.value);
+    const before_epoch = try parse(a, "make_date(id) < '1969-12-31T23:00:00'", &meta, null);
+    try testing.expectEqual(@as(i32, -1), before_epoch.int32.value);
+    const between = try parse(a, "make_date(u16) BETWEEN '2013-07-01' AND '2013-07-31'", &meta, null);
+    try testing.expectEqual(@as(usize, 2), between.and_filter.children.len);
+    const in_list = try parse(a, "make_date(u16) IN ('2013-07-01', '2013-07-02')", &meta, null);
+    try testing.expect(in_list.or_filter.in_set != null);
+    try testing.expectEqual(@as(usize, 0), (try parse(a, "make_date(id) = NULL", &meta, null)).or_filter.children.len);
+
+    // DuckDB's make_date takes an INTEGER: no UINTEGER, BIGINT, DATE or string, and no other function binds.
+    for ([_][]const u8{
+        "make_date(u32) = '2013-07-01'", "make_date(big) = '2013-07-01'",
+        "make_date(d) = '2013-07-01'",   "make_date(status) = '2013-07-01'",
+    }) |src|
+        try testing.expectError(error.UnsupportedType, parse(a, src, &meta, null));
+    try testing.expectError(error.BadOperator, parse(a, "abs(id) = 1", &meta, null));
+    try testing.expectError(error.BadValue, parse(a, "make_date(id) = 'July'", &meta, null));
 }
 
 test "parse DATE/TIMESTAMP literals → epoch ints" {
@@ -2649,8 +2747,8 @@ test "regression: a SQL predicate handed on as text selects the rows it was writ
     defer meta.deinit(a);
     const Col = struct { name: []const u8, type: schema.Type, lt: ?schema.LogicalType = null };
     const columns = [_]Col{
-        .{ .name = "x", .type = .INT32 },                               .{ .name = "y", .type = .INT32 },
-        .{ .name = "z", .type = .INT32 },                               .{ .name = "s", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } },
+        .{ .name = "x", .type = .INT32 },                                .{ .name = "y", .type = .INT32 },
+        .{ .name = "z", .type = .INT32 },                                .{ .name = "s", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } },
         .{ .name = "t", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } }, .{ .name = "b", .type = .BOOLEAN },
         .{ .name = "d", .type = .INT32, .lt = .{ .DATE = .{} } },        .{ .name = "a OR b", .type = .INT32 },
     };

@@ -133,6 +133,8 @@ test {
     _ = @import("core/expr/agg_coded.zig");
     _ = @import("core/expr/agg_dense.zig");
     _ = @import("core/expr/key_pack.zig");
+    _ = @import("core/expr/calendar.zig");
+    _ = @import("core/expr/regex.zig");
     _ = @import("core/expr/key_plan.zig");
     _ = @import("core/expr/sql_parser.zig");
     _ = @import("core/writer/fastpath.zig");

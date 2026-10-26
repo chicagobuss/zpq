@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """ClickBench's 43 queries, unmodified: does zpq run each, and does it answer as DuckDB does?
 
-DuckDB reads the file through ClickBench's own view (duckdb-parquet/create.sql). zpq reads the file as it is, with
-`FROM hits` pointed at the path: no rewrites. A zpq error is a coverage result, not a failure.
+DuckDB reads the file through ClickBench's own view (duckdb-parquet/create.sql). zpq has no views, so it gets the
+same setup written into the query (`fair_form`): `EventDate` is `make_date(EventDate)` and the `toDateTime(t)` macro
+is `epoch_ms(t * 1000)`, nothing more, and `FROM hits` points at the path. A zpq error is a coverage result, not a
+failure.
 
 Rows compare under tools/oracle_compare.py's policy. ORDER BY ... LIMIT may cut through a run of tied sort keys,
 where any choice of tied rows is a right answer; so a result that differs from DuckDB's in order or membership passes
@@ -37,9 +39,16 @@ def duck():
     return con
 
 
+def fair_form(sql):
+    """The query as zpq runs it: DuckDB's create.sql view and macro applied in place."""
+    sql = re.sub(r"\bEventDate\b", "make_date(EventDate)", sql)
+    sql = re.sub(r"\btoDateTime\(([^()]*)\)", r"epoch_ms(\1 * 1000)", sql)
+    return re.sub(r"\bFROM hits\b", f"FROM '{PARQUET}'", sql)
+
+
 def zpq_rows(sql):
     """(rows, None, seconds) or (None, error text, seconds). Rows are lists in SELECT order."""
-    zsql = re.sub(r"\bFROM hits\b", f"FROM '{PARQUET}'", sql)
+    zsql = fair_form(sql)
     t = time.monotonic()
     try:
         p = subprocess.run([ZPQ, "query", "--query", zsql], capture_output=True, text=True, timeout=TIMEOUT_S)
@@ -53,9 +62,11 @@ def zpq_rows(sql):
 
 
 def as_answer(v, like):
-    """zpq's JSON value as the answer it stands for: a column the file stores as days since the epoch (ClickBench's
-    EventDate, which DuckDB's view turns into a DATE) is that date."""
-    if isinstance(like, datetime.date) and not isinstance(like, datetime.datetime) and isinstance(v, int):
+    """zpq's JSON value as the answer it stands for: zpq prints a DATE as its days since the epoch and a TIMESTAMP
+    as its microseconds, where DuckDB answers a date or datetime."""
+    if isinstance(like, datetime.datetime) and isinstance(v, int):
+        return datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=v)
+    if isinstance(like, datetime.date) and isinstance(v, int):
         return datetime.date(1970, 1, 1) + datetime.timedelta(days=v)
     return v
 

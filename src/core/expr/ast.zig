@@ -24,6 +24,7 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
+const regex = @import("regex.zig");
 
 /// Binary operators. Numeric ops (`add`/`sub`/`mul`/`div`) work on
 /// `i64` or `f64`; `concat` works on `str` and is the SQL `||`
@@ -198,6 +199,8 @@ pub const ColRef = struct {
     dec: ?Dec = null,
     /// The column can hold NULL (a definition level above zero). Unknown is assumed nullable.
     nullable: bool = true,
+    /// A DATE or TIMESTAMP column: the unit its integers count.
+    temporal: ?Temporal = null,
 };
 
 pub const BinOp = struct {
@@ -221,6 +224,63 @@ pub const Func = enum {
     coalesce,
     /// A string's length in bytes, as DuckDB's `strlen`; NULL for NULL.
     strlen,
+    /// `make_date(days)`: the DATE `days` after 1970-01-01, as DuckDB's one-argument form (an INTEGER argument).
+    make_date,
+    /// `epoch_ms(ms)`: the TIMESTAMP `ms` milliseconds after the epoch, held in microseconds as DuckDB holds it.
+    epoch_ms,
+    /// `date_trunc('part', t)`: `t` floored to the part, a TIMESTAMP in microseconds (a DATE argument too, as DuckDB).
+    date_trunc,
+    /// `date_part('part', t)`, which `EXTRACT(part FROM t)` is: the part's BIGINT value.
+    date_part,
+    /// `regexp_replace(s, 'pattern', 'replacement'[, 'options'])`, in RE2's dialect as DuckDB's (`regex.zig`).
+    regexp_replace,
+};
+
+/// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
+/// the stored integer, as it does for a DATE or TIMESTAMP column.
+pub const Temporal = enum {
+    date,
+    ts_ms,
+    ts_us,
+    ts_ns,
+
+    /// Nanoseconds per stored unit.
+    pub fn nsPerTick(self: Temporal) i64 {
+        return switch (self) {
+            .date => 86_400 * std.time.ns_per_s,
+            .ts_ms => std.time.ns_per_ms,
+            .ts_us => std.time.ns_per_us,
+            .ts_ns => 1,
+        };
+    }
+};
+
+/// The parts `date_trunc` and `date_part` take, by DuckDB's names (singular or plural). `date_trunc` takes the ones
+/// up to `.year` except `.dow`, `.isodow` and `.doy`.
+pub const DatePart = enum {
+    microsecond,
+    millisecond,
+    second,
+    minute,
+    hour,
+    day,
+    week,
+    month,
+    quarter,
+    year,
+    dow,
+    isodow,
+    doy,
+
+    pub fn parse(name: []const u8) ?DatePart {
+        for (std.enums.values(DatePart)) |p| {
+            const tag = @tagName(p);
+            if (std.ascii.eqlIgnoreCase(name, tag)) return p;
+            if (name.len == tag.len + 1 and (name[tag.len] | 0x20) == 's' and
+                std.ascii.eqlIgnoreCase(name[0..tag.len], tag)) return p;
+        }
+        return null;
+    }
 };
 
 pub const Call = struct {
@@ -231,6 +291,12 @@ pub const Call = struct {
     depth: u32,
     /// The result's DECIMAL type when `result_type == .dec`.
     dec: ?Dec = null,
+    /// What the result stands for in time (`Expr.temporal`).
+    temporal: ?Temporal = null,
+    /// `date_trunc`/`date_part`'s part, resolved from the literal first argument.
+    part: ?DatePart = null,
+    /// `regexp_replace`'s pattern and replacement, compiled from its literal arguments; shared read-only by workers.
+    replace: ?*const regex.Replace = null,
 };
 
 /// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
@@ -261,6 +327,16 @@ pub const Expr = union(enum) {
             .binop => |b| b.result_type,
             .call => |c| c.result_type,
             .case_ => |c| c.result_type,
+        };
+    }
+
+    /// The unit an integer expression counts time in: a DATE or TIMESTAMP column, or a date/time function's result.
+    /// Arithmetic leaves it, as `ts + 1` is no longer a time zpq could print as one.
+    pub fn temporal(self: Expr) ?Temporal {
+        return switch (self) {
+            .col_ref => |c| c.temporal,
+            .call => |c| c.temporal,
+            .literal, .binop, .case_ => null,
         };
     }
 
@@ -380,7 +456,8 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace => c.args[0].mayBeNull(),
+                .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
                 } else true,

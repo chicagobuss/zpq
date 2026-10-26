@@ -216,6 +216,18 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.UnterminatedString => diagnosticPrint("zpq query: unterminated string literal in expression\n", .{}),
         error.TypeMismatch => diagnosticPrint("zpq query: type mismatch in expression\n", .{}),
         error.UnknownFunction => diagnosticPrint("zpq query: unknown scalar function in expression\n", .{}),
+        error.UnsupportedDatePart => diagnosticPrint("zpq query: unsupported part for date_trunc/date_part\n", .{}),
+        error.DateOutOfRange => diagnosticPrint("zpq query: make_date argument is outside INTEGER's range\n", .{}),
+        error.TimestampOutOfRange => diagnosticPrint("zpq query: timestamp outside the TIMESTAMP range\n", .{}),
+        error.InfiniteDate => diagnosticPrint("zpq query: an infinite DATE has no calendar fields\n", .{}),
+        error.InvalidRegex => diagnosticPrint("zpq query: invalid regular expression or replacement\n", .{}),
+        error.UnsupportedRegex => diagnosticPrint(
+            "zpq query: regular expression uses syntax zpq does not support\n" ++
+                "(\\p classes, \\C, \\Q..\\E, backreferences, or case-insensitive\n" ++
+                "non-ASCII text)\n",
+            .{},
+        ),
+        error.RegexTooBig => diagnosticPrint("zpq query: regular expression is too large\n", .{}),
         error.UnknownAggFunc => diagnosticPrint("zpq query: unknown aggregate function in expression\n", .{}),
         error.WrongArity => diagnosticPrint("zpq query: wrong number of arguments for function\n", .{}),
         error.BadAggArg => diagnosticPrint("zpq query: invalid argument for aggregate function\n", .{}),

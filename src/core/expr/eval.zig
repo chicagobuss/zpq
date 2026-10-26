@@ -28,6 +28,8 @@ const filter_eval = @import("../filter/eval.zig");
 const schema = @import("../schema.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const selection = @import("../filter/selection.zig");
+const calendar = @import("calendar.zig");
+const regex = @import("regex.zig");
 
 pub const Error = error{
     BadColumn,
@@ -50,7 +52,7 @@ pub const Error = error{
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.
     NestedFilterNotSupported,
-} || std.mem.Allocator.Error;
+} || std.mem.Allocator.Error || calendar.Error || regex.Error;
 
 const Batch = filter_eval.Batch;
 const ColumnT = filter_eval.ColumnT;
@@ -1265,7 +1267,130 @@ fn evalCall(
     switch (c.func) {
         .coalesce => return evalCoalesce(arena, batch, column_lookup, c.args, c.result_type, c.dec),
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
+        .make_date, .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
+        .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c),
     }
+}
+
+/// `regexp_replace` over a string column: a dictionary-coded column is replaced once per entry and read back by code,
+/// a plain one row by row, skipping NULL rows and rows the batch does not want. A text without a match is borrowed,
+/// not copied; replaced texts share one buffer.
+fn evalRegexpReplace(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    c: ast.Call,
+) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const col = if (arg == .col_ref)
+        batch.cols[column_lookup[arg.col_ref.col_idx] orelse return error.BadColumn]
+    else
+        try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const s = switch (col) {
+        .string => |v| v,
+        else => return error.TypeMismatch,
+    };
+    if (s.max_rep > 0) return error.NestedNotSupported;
+    const replace = c.replace.?;
+    var scratch: regex.Scratch = .init(arena);
+    var bytes: std.ArrayList(u8) = .empty;
+    const inputs = if (s.codes != null) s.dict else s.values;
+    // Ends in `bytes` of each replaced text, recorded as offsets because the buffer moves as it grows.
+    const ends = try arena.alloc(?[2]usize, inputs.len);
+    // Neighbouring rows often repeat a text (a visit's hits share a Referer), so the last one's answer is kept.
+    var last: ?usize = null;
+    for (inputs, ends, 0..) |text, *end, i| {
+        end.* = null;
+        if (s.codes == null and (rowIsNull(col, i) or (batch.sel != null and !batch.sel.?.isActive(i)))) continue;
+        if (last) |l| if (std.mem.eql(u8, inputs[l], text)) {
+            end.* = ends[l];
+            continue;
+        };
+        last = i;
+        const start = bytes.items.len;
+        if (try replace.apply(&scratch, &bytes, text)) end.* = .{ start, bytes.items.len };
+    }
+    const mapped = try arena.alloc([]const u8, inputs.len);
+    for (inputs, ends, mapped) |text, end, *m| m.* = if (end) |e| bytes.items[e[0]..e[1]] else text;
+    const values = if (s.codes) |codes| blk: {
+        const out = try arena.alloc([]const u8, codes.len);
+        for (codes, out) |code, *o| o.* = if (code < mapped.len) mapped[code] else "";
+        break :blk out;
+    } else mapped;
+    return .{ .string = .{
+        .values = values,
+        .def_levels = s.def_levels,
+        .max_def = s.max_def,
+        .has_nulls = s.has_nulls,
+    } };
+}
+
+/// `out[i] = f(t, in[i])` over an i64 column, a fault counting only at a present row `sel` wants.
+inline fn mapRows(
+    col: Batch.Column,
+    sel: ?*const selection.SelectionVector,
+    out: []i64,
+    comptime f: fn (?ast.Temporal, i64) calendar.Error!i64,
+    t: ?ast.Temporal,
+) Error!void {
+    for (col.i64.values, out, 0..) |v, *o, i| o.* = f(t, v) catch |err| fault: {
+        if (rowIsNull(col, i) or (sel != null and !sel.?.isActive(i))) break :fault 0;
+        return err;
+    };
+}
+
+/// The date/time functions, integer to integer row by row: a NULL stays NULL, and only a row the batch wants
+/// (`batch.sel`) can fault, as in arithmetic.
+fn evalTemporal(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    c: ast.Call,
+) Error!Batch.Column {
+    const arg = c.args[c.args.len - 1].*;
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const in = switch (col) {
+        .i64 => |v| v,
+        else => return error.TypeMismatch,
+    };
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    const out = try arena.alloc(i64, in.values.len);
+    const t = arg.temporal();
+    // The function and part are fixed for the call, so each pair gets its own loop with constant divisors.
+    switch (c.func) {
+        .make_date => try mapRows(col, batch.sel, out, struct {
+            fn f(_: ?ast.Temporal, v: i64) calendar.Error!i64 {
+                return if (std.math.cast(i32, v) != null) v else error.DateOutOfRange;
+            }
+        }.f, t),
+        .epoch_ms => try mapRows(col, batch.sel, out, struct {
+            fn f(_: ?ast.Temporal, v: i64) calendar.Error!i64 {
+                return std.math.mul(i64, v, std.time.us_per_ms) catch error.TimestampOutOfRange;
+            }
+        }.f, t),
+        .date_trunc => switch (c.part.?) {
+            .dow, .isodow, .doy => unreachable,
+            inline else => |p| try mapRows(col, batch.sel, out, struct {
+                fn f(tt: ?ast.Temporal, v: i64) calendar.Error!i64 {
+                    return calendar.trunc(p, tt.?, v);
+                }
+            }.f, t),
+        },
+        .date_part => switch (c.part.?) {
+            inline else => |p| try mapRows(col, batch.sel, out, struct {
+                fn f(tt: ?ast.Temporal, v: i64) calendar.Error!i64 {
+                    return calendar.part(p, tt.?, v);
+                }
+            }.f, t),
+        },
+        .coalesce, .strlen, .regexp_replace => unreachable,
+    }
+    return .{ .i64 = .{
+        .values = out,
+        .def_levels = in.def_levels,
+        .max_def = in.max_def,
+        .has_nulls = in.has_nulls,
+    } };
 }
 
 /// Byte length of each string; a NULL string's row stays NULL (its definition level carries over). A dictionary-coded
@@ -2724,4 +2849,101 @@ fn exactDagTrial(gpa: std.mem.Allocator) !void {
     for (plan.nodes.items) |*node| node.value = null;
     try std.testing.expectError(error.DecimalOverflow, plan.evaluate(a, &batch, &lookup, root));
     try std.testing.expectError(error.DecimalOverflow, evalExpr(a, &batch, &lookup, product));
+}
+
+test "date/time functions keep NULL rows NULL and fault only at rows the batch wants" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Milliseconds: 2013-07-31 19:59:59.123, 1969-12-31 23:59:59.999, and a NULL row holding a value no TIMESTAMP has.
+    const ms = [_]i64{ 1375300799123, -1, std.math.maxInt(i64) };
+    const def = [_]u32{ 1, 1, 0 };
+    const nullable: Batch.Column = .{ .i64 = .{ .values = &ms, .def_levels = &def, .max_def = 1, .has_nulls = true } };
+    const batch: Batch = .{ .cols = &.{nullable}, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+    const col: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const ts_args = [_]*const ast.Expr{&col};
+    const ts: ast.Expr = .{ .call = .{
+        .func = .epoch_ms,
+        .args = @ptrCast(&ts_args),
+        .result_type = .i64,
+        .depth = 2,
+        .temporal = .ts_us,
+    } };
+    const got = try evalExpr(a, &batch, &lookup, ts);
+    try std.testing.expectEqualSlices(i64, &.{ 1375300799123000, -1000 }, got.i64.values[0..2]);
+    try std.testing.expectEqualSlices(u32, &def, got.i64.def_levels.?);
+
+    const minute: ast.Expr = .{ .literal = .{ .str = "minute" } };
+    const part_args = [_]*const ast.Expr{ &minute, &ts };
+    const part: ast.Expr = .{ .call = .{
+        .func = .date_part,
+        .args = @ptrCast(&part_args),
+        .result_type = .i64,
+        .depth = 3,
+        .part = .minute,
+    } };
+    const parts = try evalGroupKeyExpr(a, &batch, &lookup, part);
+    try std.testing.expectEqualSlices(i64, &.{ 59, 59 }, parts.i64.values[0..2]);
+    var trunc = part;
+    trunc.call.func = .date_trunc;
+    trunc.call.temporal = .ts_us;
+    const truncs = try evalExpr(a, &batch, &lookup, trunc);
+    try std.testing.expectEqualSlices(i64, &.{ 1375300740000000, -60000000 }, truncs.i64.values[0..2]);
+
+    // The same out-of-range value at a present row faults, unless the batch does not want that row.
+    const present: Batch = .{ .cols = &.{col_i64(&ms)}, .num_rows = 3 };
+    try std.testing.expectError(error.TimestampOutOfRange, evalExpr(a, &present, &lookup, ts));
+    var sel = try selection.SelectionVector.init(a, 3);
+    sel.set(2, false);
+    _ = try evalExpr(a, &present.restrictedTo(&sel), &lookup, ts);
+
+    // make_date takes an INTEGER's range; date_trunc of a DATE is a TIMESTAMP, as DuckDB has it.
+    const days = [_]i64{ 15900, 1 << 31 };
+    const day_batch: Batch = .{ .cols = &.{col_i64(&days)}, .num_rows = 2 };
+    var date = ts;
+    date.call.func = .make_date;
+    date.call.temporal = .date;
+    try std.testing.expectError(error.DateOutOfRange, evalExpr(a, &day_batch, &lookup, date));
+    const month: ast.Expr = .{ .literal = .{ .str = "month" } };
+    const month_args = [_]*const ast.Expr{ &month, &date };
+    var by_month = trunc;
+    by_month.call.args = @ptrCast(&month_args);
+    by_month.call.part = .month;
+    const first = try evalExpr(a, &.{ .cols = &.{col_i64(days[0..1])}, .num_rows = 1 }, &lookup, by_month);
+    try std.testing.expectEqual(@as(i64, 15887 * 86_400_000_000), first.i64.values[0]);
+}
+
+test "regexp_replace replaces a coded column once per entry, and keeps NULL and unmatched rows as they are" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const r = try a.create(regex.Replace);
+    r.* = try .compile(a, "^https?://(?:www\\.)?([^/]+)/.*$", "\\1", "");
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const pattern: ast.Expr = .{ .literal = .{ .str = "" } };
+    const args = [_]*const ast.Expr{ &arg, &pattern, &pattern };
+    const call: ast.Expr = .{ .call = .{
+        .func = .regexp_replace,
+        .args = @ptrCast(&args),
+        .result_type = .str,
+        .depth = 2,
+        .replace = r,
+    } };
+    const lookup = [_]?usize{0};
+    const strs = [_][]const u8{ "http://www.a.ru/x", "", "ftp://b/", "http://www.a.ru/x" };
+    const def = [_]u32{ 1, 0, 1, 1 };
+    const plain: Batch.Column = .{ .string = .{ .values = &strs, .def_levels = &def, .max_def = 1, .has_nulls = true } };
+    const got = try evalExpr(a, &.{ .cols = &.{plain}, .num_rows = 4 }, &lookup, call);
+    try std.testing.expectEqualStrings("a.ru", got.string.values[0]);
+    try std.testing.expectEqualStrings("ftp://b/", got.string.values[2]);
+    try std.testing.expectEqualStrings("a.ru", got.string.values[3]);
+    try std.testing.expectEqualSlices(u32, &def, got.string.def_levels.?);
+    const dict = [_][]const u8{ "https://c.ru/", "nope" };
+    const codes = [_]u32{ 1, 0, 0 };
+    const coded: Batch.Column = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } };
+    const via_codes = try evalExpr(a, &.{ .cols = &.{coded}, .num_rows = 3 }, &lookup, call);
+    try std.testing.expectEqualStrings("nope", via_codes.string.values[0]);
+    try std.testing.expectEqualStrings("c.ru", via_codes.string.values[1]);
+    try std.testing.expectEqual(@as(?[]const u32, null), via_codes.string.codes);
 }

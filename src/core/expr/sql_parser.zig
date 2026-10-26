@@ -255,8 +255,16 @@ fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
             const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
             const bad = switch (node.*.kind) {
                 c.LP_EXPR_BINARY_OP => switch (node.*.u.binary.op) {
-                    c.LP_OP_EQ, c.LP_OP_NE, c.LP_OP_LT, c.LP_OP_LE, c.LP_OP_GT, c.LP_OP_GE, c.LP_OP_LIKE, c.LP_OP_GLOB,
-                    c.LP_OP_IS, c.LP_OP_ISNOT,
+                    c.LP_OP_EQ,
+                    c.LP_OP_NE,
+                    c.LP_OP_LT,
+                    c.LP_OP_LE,
+                    c.LP_OP_GT,
+                    c.LP_OP_GE,
+                    c.LP_OP_LIKE,
+                    c.LP_OP_GLOB,
+                    c.LP_OP_IS,
+                    c.LP_OP_ISNOT,
                     => readsColumn(node.*.u.binary.right) or readsColumn(node.*.u.binary.escape),
                     else => false,
                 },
@@ -371,12 +379,82 @@ fn aliasText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     return std.mem.replaceOwned(u8, allocator, raw[1 .. raw.len - 1], "\"\"", "\"");
 }
 
+/// `sql` with every `EXTRACT(part FROM x)` written `date_part('part', x)`, which is what it means (DuckDB's own
+/// rewrite) and the call form liteparser's grammar has; quoted text is left as it is.
+fn extractAsDatePart(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const word = struct {
+        fn isByte(ch: u8) bool {
+            return std.ascii.isAlphanumeric(ch) or ch == '_';
+        }
+        fn end(src: []const u8, from: usize) usize {
+            var j = from;
+            while (j < src.len and isByte(src[j])) j += 1;
+            return j;
+        }
+        fn skipSpace(src: []const u8, from: usize) usize {
+            var j = from;
+            while (j < src.len and std.ascii.isWhitespace(src[j])) j += 1;
+            return j;
+        }
+    };
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            // A quoted span, its doubled quotes included, copies through whole.
+            var j = i + 1;
+            while (j < sql.len) : (j += 1) if (sql[j] == ch) {
+                if (j + 1 < sql.len and sql[j + 1] == ch) j += 1 else break;
+            };
+            const stop = @min(j + 1, sql.len);
+            try out.appendSlice(allocator, sql[i..stop]);
+            i = stop;
+            continue;
+        }
+        if (!word.isByte(ch)) {
+            try out.append(allocator, ch);
+            i += 1;
+            continue;
+        }
+        const w_end = word.end(sql, i);
+        if (i == 0 or !word.isByte(sql[i - 1])) if (std.ascii.eqlIgnoreCase(sql[i..w_end], "extract")) {
+            const open = word.skipSpace(sql, w_end);
+            if (open < sql.len and sql[open] == '(') {
+                // The part is a word, or one quoted as a string or a name (`EXTRACT('year' FROM d)`).
+                var p_start = word.skipSpace(sql, open + 1);
+                const quote: ?u8 = if (p_start < sql.len and (sql[p_start] == '\'' or sql[p_start] == '"'))
+                    sql[p_start]
+                else
+                    null;
+                if (quote != null) p_start += 1;
+                var p_end = word.end(sql, p_start);
+                if (quote) |q| p_end = if (p_end < sql.len and sql[p_end] == q) p_end + 1 else p_start;
+                const from = word.skipSpace(sql, p_end);
+                const from_end = word.end(sql, from);
+                const part = sql[p_start .. p_end - @intFromBool(quote != null and p_end > p_start)];
+                if (part.len > 0 and from > p_end and std.ascii.eqlIgnoreCase(sql[from..from_end], "from") and
+                    from_end < sql.len and !word.isByte(sql[from_end]))
+                {
+                    try out.print(allocator, "date_part('{s}', ", .{part});
+                    i = word.skipSpace(sql, from_end);
+                    continue;
+                }
+            }
+        };
+        try out.appendSlice(allocator, sql[i..w_end]);
+        i = w_end;
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
+}
+
 pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    const sql_c = try allocator.dupeSentinel(u8, sql, 0);
+    const sql_c = try extractAsDatePart(allocator, sql);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses
@@ -947,8 +1025,12 @@ fn HavingBuilder(comptime Sel: type) type {
             // The tested operand names a result; an integer here is a value, never an ORDER BY-style position
             // (`HAVING 1 IN (2, 3)` kept the groups whose first column was 2 or 3).
             switch (node.kind) {
-                c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_NULL,
-                c.LP_EXPR_LITERAL_BOOL, c.LP_EXPR_LITERAL_BLOB,
+                c.LP_EXPR_LITERAL_INT,
+                c.LP_EXPR_LITERAL_FLOAT,
+                c.LP_EXPR_LITERAL_STRING,
+                c.LP_EXPR_LITERAL_NULL,
+                c.LP_EXPR_LITERAL_BOOL,
+                c.LP_EXPR_LITERAL_BLOB,
                 => {
                     diagnosticPrint("sql: HAVING tests a literal; it compares a result or key with literals\n", .{});
                     return error.HavingNotSupported;
@@ -1403,7 +1485,6 @@ test "sql_parser reads unquoted true and false as boolean literals" {
     try std.testing.expectEqualStrings("flag = TRUE AND NOT b = FALSE AND \"true\" = 1", q.filter_str.?);
 }
 
-
 test "sql_parser binds ORDER BY over plain rows to row expressions" {
     const a = std.testing.allocator;
     const q = try parseSqlQuery(a, "SELECT SearchPhrase AS p FROM 't' WHERE SearchPhrase <> '' ORDER BY EventTime, p DESC, 1 LIMIT 10 OFFSET 2");
@@ -1431,4 +1512,21 @@ test "regression: a quoted alias names its text, a doubled quote one quote" {
     try std.testing.expectEqualStrings("a\"b", q.select_cols[0].alias.?);
     try std.testing.expectEqualStrings("n m", q.select_cols[1].alias.?);
     try std.testing.expectEqualStrings("s", q.select_cols[2].alias.?);
+}
+
+test "sql_parser reads EXTRACT(part FROM x) as date_part('part', x), quoted text left alone" {
+    const a = std.testing.allocator;
+    const got = try extractAsDatePart(a, "SELECT extract(minute FROM epoch_ms(t)) AS m, 'extract(x FROM y)', " ++
+        "\"extract\" FROM f WHERE EXTRACT ( year\nfrom d) = 2013");
+    defer a.free(got);
+    try std.testing.expectEqualStrings("SELECT date_part('minute', epoch_ms(t)) AS m, 'extract(x FROM y)', " ++
+        "\"extract\" FROM f WHERE date_part('year', d) = 2013", got);
+    const quoted = try extractAsDatePart(a, "SELECT EXTRACT('year' FROM d), extract(\"month\" from d), " ++
+        "extract('' FROM d)");
+    defer a.free(quoted);
+    try std.testing.expectEqualStrings("SELECT date_part('year', d), date_part('month', d), " ++
+        "extract('' FROM d)", quoted);
+    const q = try parseSqlQuery(a, "SELECT extract(minute FROM t) AS m, count(*) FROM f GROUP BY m");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("date_part('minute', t)", q.select_cols[0].expr);
 }

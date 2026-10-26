@@ -515,3 +515,14 @@ def unknown_encodings(out_dir):
                     patched += 1
             assert patched == 3
         rewrite_footer(unknown, edit)
+
+
+def skspill(out_dir):
+    """4M rows of 16-byte dictionary strings, most distinct, in 16 row groups: string-key GROUP BY spill refuses a
+    500MB budget at -j8 that the no-spill path answers (planner review P1-1), pinned as the declared refusal."""
+    import numpy as np
+
+    rng = np.random.default_rng(20261016)
+    keys = np.char.add("key-", np.char.zfill(rng.integers(0, 3_500_000, 4_000_000).astype(str), 12))
+    pq.write_table(pa.table({"s": pa.array(keys.astype(object), pa.string())}), out_dir / "skspill.parquet",
+                   row_group_size=250_000, compression="snappy")

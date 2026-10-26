@@ -660,3 +660,62 @@ def filtered_records_ordered(out_dir):
                        write_page_index=True, data_page_size=512, write_batch_size=128)
         assert pq.read_table(path).equals(table)
         print(path)
+
+
+def bench(out_dir):
+    """data/benchmark_100mb.parquet and data/bench_types.parquet, the unit tests' large fixtures, made here instead of
+    downloaded: 27 flat OPTIONAL leaves (as Polars writes them), int8 then int16 then int32_sorted, several row groups, a
+    PLAIN int32_nullable and a dictionary string_nullable with real NULLs; and 5M typed rows for scan-volume tests."""
+    import numpy as np
+
+    rng = np.random.default_rng(20261026)
+    n = 1_000_000
+
+    def nulls(p):
+        return rng.random(n) < p
+
+    words = np.array(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"], dtype=object)
+    high = np.array([f"user-{i:06d}" for i in range(50_000)], dtype=object)
+    cols = {
+        "int8": pa.array(rng.integers(-128, 128, n).astype(np.int8)),
+        "int16": pa.array(rng.integers(-2**15, 2**15, n).astype(np.int16)),
+        "int32_sorted": pa.array(np.sort(rng.integers(-2**31, 2**31, n)).astype(np.int32)),
+        "int64_sorted": pa.array(np.sort(rng.integers(-2**62, 2**62, n))),
+        "bool": pa.array(rng.random(n) < 0.5),
+        "string_dict_low": pa.array(words[rng.integers(0, len(words), n)], pa.string()),
+        "int32_nullable": pa.array(rng.integers(-2**31, 2**31, n).astype(np.int32), mask=nulls(0.1)),
+        "string_nullable": pa.array(words[rng.integers(0, len(words), n)], pa.string(), mask=nulls(0.15)),
+        "int32": pa.array(rng.integers(-2**31, 2**31, n).astype(np.int32)),
+        "int64": pa.array(rng.integers(-2**63, 2**63 - 1, n)),
+        "uint32": pa.array(rng.integers(0, 2**32, n).astype(np.uint32)),
+        "float32": pa.array(rng.normal(0, 1000, n).astype(np.float32)),
+        "float64": pa.array(rng.normal(0, 1e6, n)),
+        "float64_nullable": pa.array(rng.normal(0, 1, n), mask=nulls(0.2)),
+        "float64_sorted": pa.array(np.sort(rng.uniform(-1e9, 1e9, n))),
+        "int64_nullable": pa.array(rng.integers(-2**40, 2**40, n), mask=nulls(0.3)),
+        "bool_nullable": pa.array(rng.random(n) < 0.3, mask=nulls(0.25)),
+        "int8_nullable": pa.array(rng.integers(-128, 128, n).astype(np.int8), mask=nulls(0.05)),
+        "date": pa.array(rng.integers(0, 20_000, n).astype(np.int32)).cast(pa.date32()),
+        "timestamp_ms": pa.array(rng.integers(0, 2**41, n)).cast(pa.timestamp("ms")),
+        "timestamp_us": pa.array(rng.integers(0, 2**51, n)).cast(pa.timestamp("us")),
+        "string_dict_high": pa.array(high[rng.integers(0, len(high), n)], pa.string()),
+        "string_unique": pa.array([f"row-{i:08d}" for i in range(n)], pa.string()),
+        "decimal_15_2": pa.array(rng.integers(-10**9, 10**9, n)).cast(pa.decimal128(19, 0)).cast(pa.decimal128(15, 2)),
+        "int32_low_card": pa.array(rng.integers(0, 16, n).astype(np.int32)),
+        "int64_mod": pa.array(np.arange(n) % 1000),
+        "string_short": pa.array(np.array(["a", "bb", "", "ccc"], dtype=object)[rng.integers(0, 4, n)], pa.string()),
+    }
+    table = pa.table(cols)
+    assert table.num_columns == 27
+    pq.write_table(table, out_dir / "benchmark_100mb.parquet", row_group_size=250_000, compression="zstd",
+                   use_dictionary=["string_dict_low", "string_nullable", "string_dict_high", "string_short"])
+    m = 5_000_000
+    ids = np.arange(m)
+    pq.write_table(pa.table({
+        "id": pa.array(ids),
+        "price": pa.array(rng.integers(0, 10**8, m)).cast(pa.decimal128(19, 0)).cast(pa.decimal128(15, 2)),
+        "name": pa.array(high[rng.integers(0, len(high), m)], pa.string()),
+        "d": pa.array(rng.integers(14_000, 19_000, m).astype(np.int32)).cast(pa.date32()),
+        "ts": pa.array(rng.integers(1_400_000_000_000_000, 1_600_000_000_000_000, m)).cast(pa.timestamp("us")),
+        "flag": pa.array(rng.random(m) < 0.5),
+    }), out_dir / "bench_types.parquet", row_group_size=500_000, compression="snappy")

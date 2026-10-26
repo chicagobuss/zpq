@@ -27,6 +27,8 @@ SCENARIOS['layout'] = contracts.layout
 SCENARIOS['private_decode'] = contracts.private_decode
 SCENARIOS['smoke'] = contracts.smoke
 SCENARIOS['unknown_encodings'] = contracts.unknown_encodings
+SCENARIOS['bench'] = scenarios.bench
+SCENARIOS['skspill'] = contracts.skspill
 
 
 def main():

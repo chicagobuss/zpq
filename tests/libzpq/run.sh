@@ -24,6 +24,8 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:use_sigaltstack=0 "$out/test_abi_as
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/test_python.py
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/write_publication.py
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/finalize_failure.py
+# Opening and closing libzpq leaves a host's SIGPIPE disposition as it was, and a closed peer kills nothing.
+"$PY" tests/libzpq/sigpipe.py "$lib/libzpq.so" x
 # The differential corpus needs DuckDB and pyarrow (tests/libzpq/corpus.py), as the repository's own gate does.
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/differential.py
 

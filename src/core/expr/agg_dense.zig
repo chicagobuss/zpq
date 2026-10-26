@@ -17,6 +17,7 @@ const spawn = @import("../spawn.zig");
 const hw = @import("../hw.zig");
 const SelectedBatch = @import("../selected_batch.zig").SelectedBatch;
 const key_pack = @import("key_pack.zig");
+const expr_eval = @import("eval.zig");
 
 const Accumulator = agg.Accumulator;
 const AggCall = agg.AggCall;
@@ -257,7 +258,7 @@ pub const Domain = struct {
 /// Lone integer calls, composite COUNT(*), or a composite signed SUM with optional COUNT(*), over retained keys.
 /// Floats keep their ordered paths, and expressions, DECIMAL, strings and count(DISTINCT) the general ones.
 pub fn shapeOk(calls: []const AggCall, keys: []const expr_ast.Expr) bool {
-    if (countOnly(calls) or (keys.len > 1 and sumCall(calls) != null)) {
+    if (countOnly(calls) or (keys.len > 1 and (sumCall(calls) != null or numericCalls(calls)))) {
         if (keys.len == 0) return false;
         for (keys) |key| {
             if (key != .col_ref) return false;
@@ -312,6 +313,41 @@ pub fn countOnly(calls: []const AggCall) bool {
     return c.func == .count and c.arg == null and c.where == null and !c.state and c.offset == 0;
 }
 
+/// Numeric multi-call states use the established exact/float folds. Float extrema retain their ordinary path.
+pub fn numericCalls(calls: []const AggCall) bool {
+    if (calls.len == 0) return false;
+    for (calls) |call| {
+        if (call.where != null or call.offset != 0 or call.state or call.result == .bytes) return false;
+        switch (call.func) {
+            .count => if (call.arg != null) return false,
+            .sum, .avg => if (call.arg == null or call.arg.?.typeOf() == .str) return false,
+            .min, .max => if (call.arg == null or call.arg.?.typeOf() == .f64 or
+                call.arg.?.typeOf() == .str) return false,
+            .count_distinct => return false,
+        }
+    }
+    return true;
+}
+
+pub fn orderSensitive(calls: []const AggCall) bool {
+    for (calls) |call| {
+        if (call.func == .count) continue;
+        if (call.result == .f64 or (call.result == .avg_f64 and call.arg.?.typeOf() != .i64)) return true;
+    }
+    return false;
+}
+
+/// Generic states are useful only while the complete id domain fits the worker's cache.
+pub fn numericFits(ids: usize, calls: []const AggCall) bool {
+    return ids <= max_ids and numericCalls(calls) and
+        ids *| (@sizeOf(u64) +| calls.len *| @sizeOf(Accumulator)) <= hw.l2BytesPerWorkerOr(256 << 10);
+}
+
+/// Per-id row-group scratch; decoded columns, selections and expression DAGs use the ordinary batch reservation.
+pub fn numericScratchBytes(ids: usize, calls: []const AggCall) usize {
+    return ids *| (@sizeOf(u32) +| calls.len *| (@sizeOf(agg.DecSum) + @sizeOf(i64) + @sizeOf(u64)));
+}
+
 pub fn countBytes(rows: u64) usize {
     return if (rows <= std.math.maxInt(u32)) @sizeOf(u32) else @sizeOf(u64);
 }
@@ -359,16 +395,20 @@ pub fn charge(
     const table = domainTableBytes(d, ids, stride, calls.len);
     const heap = if (cut) |h| @min(h, ids) *| @sizeOf(u32) else 0;
     const product_sum = d.axes.len > 1 and sumCall(calls) != null;
+    const product_numeric = d.axes.len > 1 and !countOnly(calls) and !product_sum;
     const positions = if (product_sum and rows < compact_present)
         (d.axes[0].trans.len +| 1) *| @sizeOf(u32)
     else
         0;
     const lanes = laneBytes(ids, calls, rows, product_sum);
-    const partials = if (product_sum) partialBytes(ids, rows) else 0;
+    const partials = if (product_sum) partialBytes(ids, rows) else if (product_numeric)
+        numericScratchBytes(ids, calls)
+    else
+        0;
     const raw_keys = for (d.axes) |axis| {
         if (axis.values == .bytes) break false;
     } else true;
-    const identity = if (product_sum) key_pack.planBytes(d.axes.len, true, raw_keys) else 0;
+    const identity = if (product_sum or product_numeric) key_pack.planBytes(d.axes.len, true, raw_keys) else 0;
     return .{
         .total = d.bytes +| identity +| workers *| (lanes +| partials) +| table +| heap +|
             ids *| @sizeOf(u32) +| positions,
@@ -513,6 +553,116 @@ fn activeRange(sel: ?*const Sel, lo: usize, hi: usize, comptime row: anytype, ct
     }
 }
 
+fn exactDelta(
+    ra: std.mem.Allocator,
+    values: anytype,
+    comp: []const u32,
+    ids: usize,
+    sel: *const Sel,
+) ![]agg.DecSum {
+    if (values.values.len < comp.len) return error.BadColumn;
+    if (values.def_levels) |dl| if (dl.len < comp.len) return error.BadColumn;
+    const delta = try ra.alloc(agg.DecSum, ids);
+    @memset(delta, .{});
+    var maximum: u128 = 0;
+    activeRange(sel, 0, comp.len, struct {
+        fn row(c: anytype, r: usize) void {
+            if (c.values.def_levels) |dl| if (dl[r] < c.values.max_def) return;
+            c.maximum.* = @max(c.maximum.*, @as(u128, @abs(c.values.values[r])));
+        }
+    }.row, .{ .values = values, .maximum = &maximum });
+    const safe_rows: usize = if (maximum == 0) comp.len else @intCast(@min(comp.len, std.math.maxInt(i64) / maximum));
+    const mini = @min(partialRows(comp.len), safe_rows);
+    if (mini <= 1) {
+        activeRange(sel, 0, comp.len, struct {
+            fn row(c: anytype, r: usize) void {
+                if (c.values.def_levels) |dl| if (dl[r] < c.values.max_def) return;
+                c.delta[c.comp[r]].add(c.values.values[r], 1);
+            }
+        }.row, .{ .values = values, .comp = comp, .delta = delta });
+        return delta;
+    }
+    const partials = try ra.alloc(i64, ids);
+    const counts = try ra.alloc(u64, ids);
+    var off: usize = 0;
+    while (off < comp.len) {
+        const end = off + @min(mini, comp.len - off);
+        @memset(partials, 0);
+        @memset(counts, 0);
+        activeRange(sel, off, end, struct {
+            fn row(c: anytype, r: usize) void {
+                if (c.values.def_levels) |dl| if (dl[r] < c.values.max_def) return;
+                const id = c.comp[r];
+                c.partials[id] += @intCast(c.values.values[r]);
+                c.counts[id] += 1;
+            }
+        }.row, .{ .values = values, .comp = comp, .partials = partials, .counts = counts });
+        for (delta, partials, counts) |*d, sum, n| if (n != 0) d.add(sum, n);
+        off = end;
+    }
+    return delta;
+}
+
+/// Root evaluation stays call-major, including checked DECIMAL errors. SUM and AVG share each exact root's delta.
+fn foldExactNumeric(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gids: []const u32,
+    comp: []const u32,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const Sel,
+) !bool {
+    for (calls) |call| {
+        if (call.func == .count and call.arg == null) continue;
+        if ((call.func != .sum and call.func != .avg) or call.arg == null or call.arg.?.typeOf() != .dec)
+            return false;
+    }
+    var plan: expr_eval.ExactPlan = .{};
+    const roots = try ra.alloc(?usize, calls.len);
+    for (calls, roots) |call, *root| {
+        root.* = if (call.arg) |arg| (try plan.add(ra, batch, lookup, arg)) orelse return false else null;
+    }
+    const deltas = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+    @memset(deltas, null);
+    const restricted = batch.restrictedTo(sel);
+    for (calls, roots, 0..) |call, root, ai| {
+        if (root) |r| {
+            if (deltas[r] == null) {
+                const values = try plan.evaluate(ra, &restricted, lookup, r);
+                deltas[r] = switch (values) {
+                    inline .i32, .i64, .i128 => |col| try exactDelta(ra, col, comp, gids.len, sel),
+                    else => return error.TypeMismatch,
+                };
+            }
+            for (deltas[r].?, gids) |delta, gid| {
+                if (delta.n == 0) continue;
+                switch (accs[gid * calls.len + ai]) {
+                    .sum_d, .avg_d => |*d| d.add(delta.get(), delta.n),
+                    else => return error.UnsupportedAggType,
+                }
+            }
+        } else try agg_coded.foldGroupedCall(
+            ra,
+            gpa,
+            accs,
+            gids,
+            comp,
+            gids.len,
+            ai,
+            calls.len,
+            call,
+            batch,
+            lookup,
+            sel,
+            null,
+        );
+    }
+    return true;
+}
+
 /// One worker's least positions and states: COUNT counters, exact composite SUM lanes, or generic accumulators.
 /// Allocated on its first row group, so the worker first touches the pages it fills.
 pub const Lanes = struct {
@@ -553,6 +703,8 @@ pub const Lanes = struct {
         if (l.allocated()) return;
         const n = l.domain.ids();
         if (n > max_ids) return error.UnsupportedAggType;
+        if (l.domain.axes.len > 1 and !countOnly(l.calls) and sumCall(l.calls) == null and
+            !numericFits(n, l.calls)) return error.UnsupportedAggType;
         if (l.domain.axes.len > 1 and sumCall(l.calls) != null and l.rows >= present)
             return error.RowCountTooLarge;
         if (l.domain.axes.len > 1 and sumCall(l.calls) != null and l.rows < compact_present) {
@@ -649,8 +801,17 @@ pub const Lanes = struct {
         if (keys.len != l.domain.axes.len or !shapeOk(l.calls, keys)) return false;
         if (keys.len == 1) return l.fold(ra, gpa, keys[0].col_ref, file, rg, pos_base, batch, lookup, sel);
         if (l.domain.ids() > max_ids or (!countOnly(l.calls) and l.rows >= present)) return false;
+        if (!countOnly(l.calls) and sumCall(l.calls) == null and !numericFits(l.domain.ids(), l.calls)) return false;
         const bindings = try ra.alloc(CountAxis, keys.len);
-        if (!try l.domain.bind(keys, file, rg, batch, lookup, bindings)) return false;
+        if (!try l.domain.bind(keys, file, rg, batch, lookup, bindings)) {
+            // Ordered blocks cannot mix dense and table partials without changing float addition order.
+            if (orderSensitive(l.calls)) return error.ExceededMemoryBudget;
+            return false;
+        }
+        if (!countOnly(l.calls) and sumCall(l.calls) == null) {
+            try l.foldNumeric(ra, gpa, bindings, .{ .base = pos_base }, batch, lookup, sel);
+            return true;
+        }
         if (sumCall(l.calls)) |ai| {
             if (l.rows < compact_present) {
                 const positions = l.positions orelse return false;
@@ -698,6 +859,7 @@ pub const Lanes = struct {
         if (!l.global_ordinals or keys.len != l.domain.axes.len or !shapeOk(l.calls, keys)) return false;
         if (keys.len == 1 and !countOnly(l.calls)) return false;
         if (l.domain.ids() > max_ids or (!countOnly(l.calls) and l.rows >= present)) return false;
+        if (!countOnly(l.calls) and sumCall(l.calls) == null and !numericFits(l.domain.ids(), l.calls)) return false;
         try source.validate();
         const rows = source.batch.num_rows;
         const ordinals: RowOrdinals = .{
@@ -709,7 +871,19 @@ pub const Lanes = struct {
             for (0..rows) |r| _ = try ordinals.at(r);
         } else if (rows != 0) _ = try ordinals.at(rows - 1);
         const bindings = try ra.alloc(CountAxis, keys.len);
-        if (!try l.domain.bind(keys, file, rg, source.batch, lookup, bindings)) return false;
+        if (!try l.domain.bind(keys, file, rg, source.batch, lookup, bindings)) {
+            if (orderSensitive(l.calls)) return error.ExceededMemoryBudget;
+            return false;
+        }
+        if (!countOnly(l.calls) and sumCall(l.calls) == null) {
+            var all: Sel = undefined;
+            const sel = source.selected orelse blk: {
+                all = try Sel.init(ra, rows);
+                break :blk &all;
+            };
+            try l.foldNumeric(ra, gpa, bindings, ordinals, source.batch, lookup, sel);
+            return true;
+        }
         if (sumCall(l.calls)) |ai| {
             if (rows == 0) return true;
             const ref = l.calls[ai].arg.?.col_ref;
@@ -736,6 +910,42 @@ pub const Lanes = struct {
             } else try l.foldProductOrdinals(u64, l.counts64, bindings, ordinals, rows, source.selected);
         }
         return true;
+    }
+
+    fn foldNumeric(
+        l: *Lanes,
+        ra: std.mem.Allocator,
+        gpa: std.mem.Allocator,
+        bindings: []const CountAxis,
+        ordinals: RowOrdinals,
+        batch: *const filter_eval.Batch,
+        lookup: []const ?usize,
+        sel: *const Sel,
+    ) !void {
+        try (SelectedBatch{ .batch = batch, .selected = sel }).validate();
+        try l.ensure(gpa);
+        const comp = try ra.alloc(u32, batch.num_rows);
+        @memset(comp, 0);
+        var failure: ?anyerror = null;
+        activeRange(sel, 0, batch.num_rows, struct {
+            fn row(c: anytype, r: usize) void {
+                const id = productId(c.bindings, r, true) catch |e| {
+                    c.failure.* = e;
+                    return;
+                };
+                const ordinal = c.ordinals.at(r) catch |e| {
+                    c.failure.* = e;
+                    return;
+                };
+                c.comp[r] = @intCast(id);
+                c.first[id] = @min(c.first[id], ordinal);
+            }
+        }.row, .{ .bindings = bindings, .ordinals = ordinals, .comp = comp, .first = l.first, .failure = &failure });
+        if (failure) |e| return e;
+        const gids = try ra.alloc(u32, l.domain.ids());
+        for (gids, 0..) |*gid, id| gid.* = @intCast(id);
+        if (try foldExactNumeric(ra, gpa, l.accs, gids, comp, l.calls, batch, lookup, sel)) return;
+        try agg_coded.foldDenseCalls(ra, gpa, l.accs, gids, comp, l.calls, batch, lookup, sel);
     }
 
     fn foldSum(
@@ -891,6 +1101,11 @@ pub const Lanes = struct {
     }
 
     pub fn integer(l: *const Lanes, id: usize, ai: usize) ?i128 {
+        if (l.accs.len != 0) return switch (l.accs[id * l.calls.len + ai]) {
+            .count => |n| n,
+            .sum_i, .min_i, .max_i => |n| n,
+            else => null,
+        };
         if (l.calls[ai].func == .count) return l.count(id);
         if (l.compact_sums.len != 0) return l.compact_sums[id].sum();
         const s = l.sums[id];
@@ -1198,6 +1413,17 @@ const MergeTask = struct {
     fn runErr(t: *MergeTask) !void {
         const into = t.ctx.lanes[0];
         const n_calls = into.calls.len;
+        // The ordinary ordered block merge starts from fresh states, including its first floating partial.
+        if (into.accs.len != 0 and orderSensitive(into.calls)) {
+            for (t.lo..t.hi) |id| {
+                if (!into.seen(id)) continue;
+                for (into.calls, into.accs[id * n_calls ..][0..n_calls]) |call, *acc| {
+                    var initial: Accumulator = .init(call);
+                    try initial.merge(acc.*, t.ctx.gpa);
+                    acc.* = initial;
+                }
+            }
+        }
         for (t.ctx.lanes[1..]) |src| for (t.lo..t.hi) |id| {
             if (!src.seen(id)) continue;
             if (into.compact_sums.len != 0) {
@@ -1352,6 +1578,311 @@ test "dense mini-batch magnitude proofs include negative extremes and reject uns
     const col = Column{ .i64 = .{ .values = &.{ -9, undefined, 7 }, .def_levels = &.{ 1, 0, 1 }, .max_def = 1 } };
     try testing.expectEqual(@as(?u64, 9), magnitude(col.i64, 3));
     try testing.expectEqual(@as(?u64, @as(u64, 1) << 31), magnitude((Column{ .i32 = .{ .values = &.{} } }).i32, 8));
+}
+
+test "dense selected SUM refuses magnitude 2^63 at the fold and admits zero without changing exact sums" {
+    const a = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const fixture = Fixture.domain();
+    var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    const keys = [_]expr_ast.Expr{ .{ .col_ref = Fixture.key }, .{ .col_ref = Fixture.key } };
+    const lo = std.math.minInt(i64);
+    for ([_][2]i64{ .{ lo, lo }, .{ lo, 0 }, .{ 0, 0 }, .{ std.math.maxInt(i64), 0 } }, 0..) |values, i| {
+        var lanes: Lanes = .{
+            .domain = &domain,
+            .calls = Fixture.calls[0..2],
+            .rows = 2,
+            .global_ordinals = true,
+        };
+        defer lanes.deinit(a);
+        const batch: filter_eval.Batch = .{ .num_rows = 2, .cols = &.{
+            .{ .i64 = .{ .values = &.{}, .codes = &.{ 0, 0 }, .dict = &Fixture.dict0 } },
+            .{ .i64 = .{ .values = &values } },
+        } };
+        try testing.expect(try lanes.foldSelected(arena.allocator(), a, &keys, 0, 0, .{ .batch = &batch }, &.{ 0, 1 }));
+        const id = Fixture.t0[0] * (axes[0].ids() + 1);
+        const sum = @as(i128, values[0]) + values[1];
+        try testing.expectEqual(@as(?i128, sum), lanes.integer(id, 1));
+        if (i == 0) try testing.expectEqual(-(@as(i128, 1) << 64), sum);
+        try testing.expectEqual(i == 2, lanes.partials.len != 0);
+    }
+}
+
+test "dense numeric calls match canonical coded blocks for DECIMAL and float expressions with allocation failures" {
+    try testing.checkAllAllocationFailures(testing.allocator, testNumericLanes, .{false});
+    try testNumericLanes(testing.allocator, true);
+}
+
+fn testNumericLanes(a: std.mem.Allocator, floating: bool) !void {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const old_cpu = hw.test_cpu;
+    defer hw.test_cpu = old_cpu;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 32 << 10 } };
+    const old_batch = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old_batch;
+    expr_eval.forced_batch_rows = 64;
+    const fixture = Fixture.domain();
+    var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    const keys = [_]expr_ast.Expr{ .{ .col_ref = Fixture.key }, .{ .col_ref = Fixture.key } };
+    var x: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 1,
+        .physical_type = if (floating) .DOUBLE else .INT64,
+        .expr_type = if (floating) .f64 else .dec,
+        .dec = if (floating) null else .{ .precision = 15, .scale = 2 },
+    } };
+    var two: expr_ast.Expr = .{ .literal = .{ .i64 = 2 } };
+    const twice: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &x,
+        .right = &two,
+        .result_type = if (floating) .f64 else .dec,
+        .dec = if (floating) null else .{ .precision = 35, .scale = 2 },
+        .depth = 2,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = x, .result = if (floating) .f64 else .dec, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = x, .result = if (floating) .avg_f64 else .avg_dec, .where = null, .alias = "a" },
+        .{ .func = .sum, .arg = twice, .result = if (floating) .f64 else .dec, .where = null, .alias = "d" },
+        .{ .func = .avg, .arg = twice, .result = if (floating) .avg_f64 else .avg_dec, .where = null, .alias = "b" },
+        Fixture.calls[0],
+    };
+    try testing.expect(shapeOk(&calls, &keys));
+    try testing.expect(numericFits(domain.ids(), &calls));
+    const n = 257;
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var key_defs: [n]u32 = undefined;
+    var exact: [n]i64 = undefined;
+    var floats: [n]f64 = undefined;
+    for (&codes, &defs, &key_defs, &exact, &floats, 0..) |*code, *def, *kd, *v, *f, r| {
+        code.* = @intCast(r % 3);
+        def.* = @intFromBool(r % 19 != 0);
+        kd.* = @intFromBool(r % 23 != 0);
+        v.* = if (def.* == 0) undefined else @as(i64, @intCast(r)) - 100;
+        f.* = if (def.* == 0) undefined else switch (r % 4) {
+            0 => 1e16,
+            1 => 1,
+            2 => -1e16,
+            else => -0.0,
+        };
+    }
+    const batch: filter_eval.Batch = .{ .num_rows = n, .cols = &.{
+        .{ .i64 = .{
+            .values = &.{},
+            .codes = &codes,
+            .dict = &Fixture.dict0,
+            .def_levels = &key_defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+        if (floating) .{ .f64 = .{
+            .values = &floats,
+            .def_levels = &defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } } else .{ .i64 = .{
+            .values = &exact,
+            .unscaled = .{ .i64 = &exact },
+            .def_levels = &defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+    } };
+    var sel = try Sel.init(ra, n);
+    sel.clearRange(64, 128);
+    sel.set(256, false);
+    var lanes: [3]Lanes = @splat(.{ .domain = &domain, .calls = &calls, .rows = n * 6 });
+    defer for (&lanes) |*lane| lane.deinit(a);
+    var want = agg.GroupTable.init(a, 1 << 24);
+    defer want.deinit();
+    for (&lanes, 0..) |*lane, block| {
+        var ordinary = agg.GroupTable.init(a, 1 << 24);
+        defer ordinary.deinit();
+        for (0..2) |window| {
+            const base = agg.firstPosition(block * 2 + window, 0);
+            try testing.expect(try agg_coded.groupedCoded(
+                ra,
+                a,
+                &calls,
+                &keys,
+                &ordinary,
+                base,
+                &batch,
+                &.{ 0, 1 },
+                &sel,
+                null,
+                null,
+            ));
+            try testing.expect(try lane.foldKeys(ra, a, &keys, 0, 0, base, &batch, &.{ 0, 1 }, &sel));
+        }
+        for (0..ordinary.groupCount()) |g| {
+            const dst = try want.getOrInsert(ordinary.keyAt(g), &calls, ordinary.first.items[g]);
+            for (0..calls.len) |ai| try want.accumulators.items[dst * calls.len + ai].merge(
+                ordinary.readAcc(g, ai, calls.len),
+                a,
+            );
+        }
+    }
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    try intoTable(a, ra, &lanes, &keys, &got, 2, 4, null);
+    try testing.expectEqual(want.groupCount(), got.groupCount());
+    for (0..want.groupCount()) |g| {
+        const id = got.findKey(want.keyAt(g)) orelse return error.TestExpectedEqual;
+        try testing.expectEqual(want.first.items[g], got.first.items[id]);
+        for (0..calls.len) |ai| try expectNumericAcc(want.readAcc(g, ai, calls.len), got.readAcc(id, ai, calls.len));
+    }
+    var plain = batch;
+    var plain_cols = [_]Column{ .{ .i64 = .{ .values = &exact } }, batch.cols[1] };
+    plain.cols = &plain_cols;
+    if (floating) {
+        try testing.expectError(error.ExceededMemoryBudget, lanes[0].foldKeys(
+            ra,
+            a,
+            &keys,
+            0,
+            0,
+            0,
+            &plain,
+            &.{ 0, 1 },
+            &sel,
+        ));
+    } else try testing.expect(!try lanes[0].foldKeys(ra, a, &keys, 0, 0, 0, &plain, &.{ 0, 1 }, &sel));
+}
+
+fn expectNumericAcc(want: Accumulator, got: Accumulator) !void {
+    try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+    switch (want) {
+        .sum_f => |v| {
+            try testing.expectEqual(v != null, got.sum_f != null);
+            if (v) |x| try testing.expectEqual(@as(u64, @bitCast(x)), @as(u64, @bitCast(got.sum_f.?)));
+        },
+        .avg => |v| {
+            try testing.expectEqual(v.count, got.avg.count);
+            try testing.expectEqual(v.isum, got.avg.isum);
+            try testing.expectEqual(@as(u64, @bitCast(v.sum)), @as(u64, @bitCast(got.avg.sum)));
+        },
+        else => try testing.expectEqualDeep(want, got),
+    }
+}
+
+test "dense numeric selected DECIMAL keeps 192-bit cancellation and gathered original ordinals" {
+    const a = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const fixture = Fixture.domain();
+    var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    const keys = [_]expr_ast.Expr{ .{ .col_ref = Fixture.key }, .{ .col_ref = Fixture.key } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 1,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = .{ .precision = 38, .scale = 0 },
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = arg, .result = .dec, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = arg, .result = .avg_dec, .where = null, .alias = "a" },
+        Fixture.calls[0],
+    };
+    const h: i128 = @as(i128, 1) << 125;
+    const values = [_]i128{ h, h, h, h, h, -h, -h, -h, undefined };
+    const codes: [values.len]u32 = @splat(0);
+    const batch: filter_eval.Batch = .{ .num_rows = values.len, .cols = &.{
+        .{ .i64 = .{ .values = &.{}, .codes = &codes, .dict = &Fixture.dict0 } },
+        .{ .i128 = .{
+            .values = &values,
+            .def_levels = &.{ 1, 1, 1, 1, 1, 1, 1, 1, 0 },
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+    } };
+    var lane: Lanes = .{ .domain = &domain, .calls = &calls, .rows = 2000, .global_ordinals = true };
+    defer lane.deinit(a);
+    try testing.expect(try lane.foldSelected(arena.allocator(), a, &keys, 0, 0, .{
+        .batch = &batch,
+        .input_base = 1000,
+        .input_rows = &.{ 99, 4, 40, 22, 200, 5, 3, 9, 0 },
+    }, &.{ 0, 1 }));
+    const id = Fixture.t0[0] * (axes[0].ids() + 1);
+    try testing.expectEqual(@as(i192, 2 * h), lane.accumulator(id, 0).sum_d.get());
+    try testing.expectEqual(@as(u64, 8), lane.accumulator(id, 0).sum_d.n);
+    try testing.expectEqualDeep(lane.accumulator(id, 0).sum_d, lane.accumulator(id, 1).avg_d);
+    try testing.expectEqual(@as(?i128, 9), lane.integer(id, 2));
+    try testing.expectEqual(@as(u64, 1000), lane.firstOrdinal(id));
+}
+
+test "dense numeric cache refusal allocates no lanes and quotes all per-id scratch" {
+    const old_cpu = hw.test_cpu;
+    defer hw.test_cpu = old_cpu;
+    const fixture = Fixture.domain();
+    var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    const calls = Fixture.calls[0..3];
+    const bytes = laneBytes(domain.ids(), calls, 8, false);
+    hw.test_cpu = .{ .l2 = .{ .bytes = bytes - 1 } };
+    var lane: Lanes = .{ .domain = &domain, .calls = calls, .rows = 8 };
+    var no_alloc = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.UnsupportedAggType, lane.ensure(no_alloc.allocator()));
+    try testing.expect(!no_alloc.has_induced_failure);
+    hw.test_cpu = .{ .l2 = .{ .bytes = bytes } };
+    try testing.expect(numericFits(domain.ids(), calls));
+    const quote = charge(&domain, 3, calls, 8, 0, null);
+    try testing.expectEqual(
+        key_pack.planBytes(2, true, true) + 3 * (bytes + numericScratchBytes(domain.ids(), calls)) +
+            quote.table + domain.ids() * @sizeOf(u32),
+        quote.total,
+    );
+}
+
+test "dense ordered merge includes fresh identity and retains block order for signed zero and NaN payloads" {
+    const a = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const fixture = Fixture.domain();
+    var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = arg, .result = .f64, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = arg, .result = .avg_f64, .where = null, .alias = "a" },
+    };
+    for ([_]usize{ 1, 4, 16 }) |threads| {
+        var lanes: [4]Lanes = @splat(.{ .domain = &domain, .calls = &calls, .rows = 16 });
+        defer for (&lanes) |*lane| lane.deinit(a);
+        for (&lanes, 0..) |*lane, block| {
+            try lane.ensure(a);
+            for (0..3) |id| {
+                const v: f64 = switch (id) {
+                    0 => -0.0,
+                    1 => switch (block) {
+                        0 => 1e16,
+                        1 => 1,
+                        2 => -1e16,
+                        else => 2,
+                    },
+                    else => @bitCast(@as(u64, 0x7ff8000000000011) + block),
+                };
+                lane.first[id] = agg.firstPosition(block, id);
+                lane.accs[id * 2] = .{ .sum_f = v };
+                lane.accs[id * 2 + 1] = .{ .avg = .{ .sum = v, .count = 1 } };
+            }
+        }
+        var expected: [3][2]Accumulator = undefined;
+        for (&expected, 0..) |*group, id| {
+            for (calls, group) |call, *acc| acc.* = .init(call);
+            for (&lanes) |*lane| for (group, 0..) |*acc, ai| try acc.merge(lane.accumulator(id, ai), a);
+        }
+        const merged = (try merge(a, arena.allocator(), &lanes, threads)).?;
+        for (expected, 0..) |group, id| for (group, 0..) |want, ai| {
+            try expectNumericAcc(want, merged.accumulator(id, ai));
+        };
+    }
 }
 
 test "dense selected adapters validate ordinal metadata before allocation and free failed partial scratch" {

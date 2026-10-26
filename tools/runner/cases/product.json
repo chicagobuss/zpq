@@ -343,6 +343,38 @@
         16
       ],
       "max_memory": "8M"
+    },
+    {
+      "id": "product:numeric",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s,min(v) AS lo,max(v) AS hi,avg(v) AS av FROM '{path}' WHERE f < 30 GROUP BY a,b ORDER BY a,b",
+      "ordered": true,
+      "parquet": false
+    },
+    {
+      "id": "product:decimal",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(d) AS s,sum(d * 2) AS twice,min(d) AS lo,max(d) AS hi FROM '{path}' WHERE f < 30 GROUP BY a,b ORDER BY a,b",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "product:decimal-plain",
+      "kind": "product",
+      "fixture": "plain",
+      "sql": "SELECT a,b,count(*) AS c,sum(d) AS s,sum(d * 2) AS twice FROM '{path}' WHERE f < 30 GROUP BY a,b ORDER BY a,b",
+      "ordered": true,
+      "parquet": true
+    },
+    {
+      "id": "product:float",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(w) AS s,sum(w * 2) AS twice,avg(w) AS av FROM '{path}' WHERE f < 30 GROUP BY a,b ORDER BY a,b",
+      "ordered": true,
+      "parquet": false
     }
   ]
 }

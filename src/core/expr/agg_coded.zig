@@ -704,6 +704,31 @@ pub fn serializeKeyAt(
 
 const unresolved = std.math.maxInt(u32);
 
+/// Dense numeric lanes borrow only the accumulator array; these folds neither insert keys nor own that storage.
+pub fn foldDenseCalls(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) !void {
+    var view = agg.GroupTable.init(gpa, 0);
+    view.accumulators.items = accs;
+    view.accumulators.capacity = accs.len;
+    const space = gid_of.len;
+    if (try foldExactBatch(ra, gpa, &view, gid_of, comp, space, calls, batch, lookup, outer)) return;
+    if (try foldFloatBatches(ra, gpa, &view, gid_of, comp, space, calls, batch, lookup, outer)) return;
+    for (calls, 0..) |call, ai| {
+        try @call(.never_inline, foldGroupedCall, .{
+            ra, gpa, accs, gid_of, comp, space, ai, calls.len, call, batch, lookup, outer, null,
+        });
+    }
+}
+
 /// Whether a float sum's partials can start from their groups' sums: every composite that occurs is its own group,
 /// and few enough to check. Two composites of one group (a float key's 0.0 and -0.0 entries) would each start from
 /// the same sum and the second write back would drop the first's rows.

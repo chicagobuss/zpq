@@ -31,6 +31,8 @@ for path in (coded0, coded1):
         "a": pa.array(rng.integers(-8, 9, n).astype(np.int32), mask=rng.random(n) < 0.03),
         "b": pa.array(names, pa.string(), mask=rng.random(n) < 0.02),
         "v": pa.array(values, mask=value_nulls),
+        "d": pa.array(values, mask=value_nulls).cast(pa.decimal128(19, 0)).cast(pa.decimal128(15, 2)),
+        "w": pa.array(values.astype(np.float64) / 8, mask=value_nulls),
         "f": pa.array(rng.integers(0, 100, n).astype(np.int32)),
     })
     pq.write_table(table, path, row_group_size=8192)

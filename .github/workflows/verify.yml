@@ -1,6 +1,6 @@
 name: Verify
 
-# One job, one platform (linux-x86_64), <2 min target. Verifies the
+# The main Linux x86 job verifies the
 # things that, if broken, mean a real user has a bad day:
 #   1. Both binaries compile (CLI + Lambda), and the lean-core CLI
 #      (-Dsql=false) compiles too and is genuinely SQL-free.
@@ -15,8 +15,8 @@ name: Verify
 #      row counts) always fail; the full-pass count must not drop
 #      below the recorded baseline (72: legacy LZ4 joined the 69).
 #
-# Release smoke cross-builds every target and runs native checks.
-# Foreign runtime checks are placed by verify arch.
+# A separate native matrix builds and runs Linux x86, Linux ARM and Apple
+# silicon release artifacts. Intel macOS runtime coverage is deferred by name.
 
 on:
   push:
@@ -198,7 +198,7 @@ jobs:
       - name: libzpq (C ABI, sanitizers, Python, differential)
         run: OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
-  # Build every release artifact; run native CLI and Lambda checks.
+  # Each native job runs its installed CLI and, on Linux, Lambda artifacts.
   release-smoke:
     name: Native release smoke (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

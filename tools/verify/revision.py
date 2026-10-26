@@ -113,11 +113,11 @@ def build(sha, target=None, cpu="native", jobs=8, heavy=True, steps=("cli",)):
     return prefix / "bin/zpq"
 
 
-def integration(tree, dest, target, heavy):
+def integration(tree, dest, target, heavy, runtime=None):
     options = dest / "integration_opts.zig"
-    runtime = f"release/{target}/bin"
-    options.write_text(f'pub const lambda_bin = "{runtime}/zpq-lambda";\n'
-                       f'pub const cli_bin = "{runtime}/zpq";\n')
+    runtime = runtime or f"release/{target}/bin"
+    options.write_text(f'pub const lambda_bin = {json.dumps(f"{runtime}/zpq-lambda")};\n'
+                       f'pub const cli_bin = {json.dumps(f"{runtime}/zpq")};\n')
     zig = os.environ.get("ZPQ_ZIG", "zig")
     zig_sha = compiler(zig, tree)
     argv = [zig, "test", "-j8", "--test-no-exec", "-O", "ReleaseFast",

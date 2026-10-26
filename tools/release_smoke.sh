@@ -87,6 +87,7 @@ for t in "$@"; do
     fi
     if [ "$t" != "$native" ]; then
         if python3 tools/verify/release_coverage.py --sha "$revision" --target "$t" \
+            --bin-dir "$OUT/$t/bin" \
             "${summaries[@]+"${summaries[@]}"}"; then
             verified+=("$t (verify arch; same SHA)")
         else
@@ -99,11 +100,16 @@ for t in "$@"; do
     if [[ "$t" == *-linux-musl ]]; then
         mkdir -p zig-out
         if "$build"; then
-            "$ZIG" build -j8 -Dtarget="$t" -Doptimize=ReleaseFast -Dstrip=true \
-                -Drevision="$revision" test-integration --summary failures
-        else
-            "$OUT/$t/bin/zpq-integration"
+            ZPQ_ZIG="$ZIG" python3 - "$OUT/$t/bin" "$t" <<'PY_INTEGRATION'
+import sys
+from pathlib import Path
+sys.path.insert(0, "tools/verify")
+import revision
+dest = Path(sys.argv[1]).resolve()
+revision.integration(Path.cwd(), dest, sys.argv[2], False, runtime=str(dest))
+PY_INTEGRATION
         fi
+        "$OUT/$t/bin/zpq-integration"
         ran+=("$t:lambda")
     fi
 done

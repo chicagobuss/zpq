@@ -1,12 +1,21 @@
 """Accept only explicit runtime evidence for this release revision and target."""
 
 import argparse
+import hashlib
 import json
 import re
 from pathlib import Path
 
 
-def proves(doc, sha, target):
+def matches(path, digest):
+    try:
+        with path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest() == digest
+    except OSError:
+        return False
+
+
+def proves(doc, sha, target, bin_dir):
     if not isinstance(doc, dict):
         return False
     smoke = doc.get("release_smoke", {})
@@ -21,6 +30,7 @@ def proves(doc, sha, target):
             and smoke.get("status") == "pass" and smoke.get("sha") == sha
             and smoke.get("cli") is True and ("linux" not in target or smoke.get("lambda") is True)
             and all(isinstance(binaries.get(name), str) and re.fullmatch(r"[0-9a-f]{64}", binaries[name])
+                    and matches(bin_dir / name, binaries[name])
                     for name in required))
 
 
@@ -28,10 +38,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sha", required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--summary", action="append", default=[])
     args = parser.parse_args()
     for path in args.summary:
-        if proves(json.loads(Path(path).read_text()), args.sha, args.target):
+        if proves(json.loads(Path(path).read_text()), args.sha, args.target, args.bin_dir):
             return 0
     return 2
 

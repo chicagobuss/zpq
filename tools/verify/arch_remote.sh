@@ -43,7 +43,6 @@ if [ "$action" = release ]; then
     cp "$cache_root/release_smoke.sh" "$tree/tools/release_smoke.sh"
     mkdir -p "$tree/release/$target/bin" "$tree/zig-out" "$tree/tmp"
     export TMPDIR="$tree/tmp"
-    export ZIG_GLOBAL_CACHE_DIR="$cache_root/zig"
     cp "$cache_root/engine-$engine_sha/zpq" "$tree/release/$target/bin/"
     if [[ "$target" == *-linux-musl ]]; then
         cp "$cache_root/engine-$engine_sha/zpq-lambda" "$cache_root/engine-$engine_sha/zpq-integration" \

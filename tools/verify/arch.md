@@ -57,7 +57,7 @@ runs are deleted; failures retain only summaries and logs, with setup cached. Ex
 
 Release-smoke blocks with `NOT RUN` and exit 2 for foreign targets without
 same-SHA evidence. Supply each successful native summary with `--arch-summary
-PATH` to release-smoke or verify full. Evidence must include the executed CLI,
-Lambda and integration binary hashes for Linux. Intel macOS is explicitly
+PATH` to release-smoke or verify full. Evidence hashes must match the files in
+the release prefix, including CLI, Lambda and integration binaries for Linux. Intel macOS is explicitly
 `NOT RUN (deferred)`; only `--accept-deferred x86_64-macos` accepts that policy.
 The release workflows require native Linux x86, Linux ARM and Apple silicon jobs.

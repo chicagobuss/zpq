@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import execute
 import placement
+import provenance
 import release_coverage
 import revision
 import stages
@@ -33,11 +34,11 @@ def executable(path, text):
     return path
 
 
-def proof(target=ARM):
+def proof(bin_dir, target=ARM):
     names = ("zpq", "zpq-lambda", "zpq-integration") if "linux" in target else ("zpq",)
     return {"sha": SHA, "target": target, "exit": 0,
             "release_smoke": {"status": "pass", "sha": SHA, "cli": True, "lambda": "linux" in target,
-                              "binaries": {n: "b" * 64 for n in names}}}
+                              "binaries": {n: execute.file_sha256(bin_dir / n) for n in names}}}
 
 
 FAKE_CLI = '''#!/bin/bash
@@ -86,8 +87,9 @@ class SmokeTest(unittest.TestCase):
         self.env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", RELEASE_SMOKE_REVISION=SHA,
                         FAKE_OS="Linux", FAKE_ARCH="aarch64", TRACE=str(self.root / "trace"), FAIL_AT="")
 
-    def run_smoke(self, targets, options=(), **env):
-        return subprocess.run(["bash", str(REPO / "tools/release_smoke.sh"), "--run-only", *options,
+    def run_smoke(self, targets, options=(), build=False, **env):
+        mode = [] if build else ["--run-only"]
+        return subprocess.run(["bash", str(REPO / "tools/release_smoke.sh"), *mode, *options,
                                str(self.out), *targets], env=dict(self.env, **env), text=True, capture_output=True)
 
     def test_foreign_and_unknown_hosts_block_without_evidence(self):
@@ -100,16 +102,39 @@ class SmokeTest(unittest.TestCase):
 
     def test_only_same_sha_complete_native_proof_closes_coverage(self):
         path = self.root / "summary.json"
-        for doc, code in ((proof(), 0), ({**proof(), "sha": "c" * 40}, 2), ({**proof(), "exit": 1}, 2)):
+        bin_dir = self.out / ARM / "bin"
+        valid = proof(bin_dir)
+        for doc, code in ((valid, 0), ({**valid, "sha": "c" * 40}, 2), ({**valid, "exit": 1}, 2)):
             path.write_text(json.dumps(doc))
             ran = self.run_smoke([ARM], ("--arch-summary", str(path)), FAKE_ARCH="x86_64")
             self.assertEqual(ran.returncode, code, ran.stderr)
         for change in ({"lambda": False}, {"binaries": {}}, {"status": "not run"}, {"sha": "c" * 40}):
-            doc = proof()
+            doc = proof(bin_dir)
             doc["release_smoke"].update(change)
-            self.assertFalse(release_coverage.proves(doc, SHA, ARM))
-        self.assertFalse(release_coverage.proves({**proof(), "exit": False}, SHA, ARM))
-        self.assertFalse(release_coverage.proves(proof(MAC), SHA, ARM))
+            self.assertFalse(release_coverage.proves(doc, SHA, ARM, bin_dir))
+        self.assertFalse(release_coverage.proves({**valid, "exit": False}, SHA, ARM, bin_dir))
+        self.assertFalse(release_coverage.proves(proof(self.out / MAC / "bin", MAC), SHA, ARM, bin_dir))
+
+    def test_foreign_proof_requires_each_installed_binary_to_match(self):
+        path = self.root / "summary.json"
+        for target in (ARM, MAC):
+            bin_dir = self.out / target / "bin"
+            for name in proof(bin_dir, target)["release_smoke"]["binaries"]:
+                with self.subTest(target=target, binary=name):
+                    doc = proof(bin_dir, target)
+                    doc["release_smoke"]["binaries"][name] = "b" * 64
+                    path.write_text(json.dumps(doc))
+                    run = self.run_smoke([target], ("--arch-summary", str(path)), FAKE_ARCH="x86_64")
+                    self.assertEqual(run.returncode, 2, run.stderr)
+                    self.assertIn(f"NOT RUN {target}", run.stdout)
+                    path.write_text(json.dumps(proof(bin_dir, target)))
+                    binary = bin_dir / name
+                    content = binary.read_bytes()
+                    binary.unlink()
+                    self.assertFalse(release_coverage.proves(json.loads(path.read_text()), SHA, target, bin_dir))
+                    binary.write_bytes(content + b"\n# replaced build\n")
+                    self.assertFalse(release_coverage.proves(json.loads(path.read_text()), SHA, target, bin_dir))
+                    binary.write_bytes(content)
 
     def test_intel_macos_requires_its_named_deferral(self):
         self.assertEqual(self.run_smoke(["x86_64-macos"]).returncode, 2)
@@ -130,6 +155,37 @@ class SmokeTest(unittest.TestCase):
         trace = (self.root / "trace").read_text()
         self.assertIn("SHIPPED_INTEGRATION", trace)
         self.assertIn("SHIPPED_LAMBDA", trace)
+
+    def test_build_mode_compiles_only_the_harness_and_runs_the_installed_lambda(self):
+        harness = executable(self.root / 'harness', FAKE_INTEGRATION)
+        zig = executable(self.root / 'tools/zig', '''#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+if args == ['version']:
+    print('0.17.0')
+elif args == ['env']:
+    print('.zig_exe = ' + json.dumps(__file__))
+elif args[0] == 'build':
+    assert 'test-integration' not in args, 'must not rebuild the Lambda for integration'
+    with open(os.environ['TRACE'], 'a') as out: out.write('BUILD_BUNDLE\\n')
+else:
+    assert args[0] == 'test' and '--test-no-exec' in args
+    opts = pathlib.Path(next(a.split('=', 1)[1] for a in args if a.startswith('-Mintegration_opts=')))
+    prefix = pathlib.Path(os.environ['EXPECTED_PREFIX'])
+    for name, binary in (('lambda_bin', 'zpq-lambda'), ('cli_bin', 'zpq')):
+        assert f'pub const {name} = {json.dumps(str(prefix / binary))};' in opts.read_text()
+    dest = next(a.split('=', 1)[1] for a in args if a.startswith('-femit-bin='))
+    shutil.copy2(os.environ['HARNESS_SOURCE'], dest)
+''')
+        for point, code in (('', 0), ('integration', 7), ('lambda', 7)):
+            with self.subTest(point=point):
+                run = self.run_smoke([ARM], build=True, ZIG=str(zig), FAIL_AT=point,
+                                     EXPECTED_PREFIX=str(self.out / ARM / 'bin'), HARNESS_SOURCE=str(harness))
+                self.assertEqual(run.returncode, code, run.stderr)
+        trace = (self.root / 'trace').read_text()
+        self.assertEqual(trace.count('BUILD_BUNDLE'), 3)
+        self.assertIn('SHIPPED_INTEGRATION', trace)
+        self.assertIn('SHIPPED_LAMBDA', trace)
 
     def test_release_stage_never_accepts_elsewhere_or_empty_stdout(self):
         cmd = stages.stage_release_smoke(__import__("verify").dummy_ctx())
@@ -348,7 +404,7 @@ class TransportTest(unittest.TestCase):
             root = Path(tmp)
             run, path, cache = self.fixture(root, 0, 'reference host')
             self.assertEqual(run.returncode, 0, run.stderr)
-            self.assertTrue(release_coverage.proves(json.loads(path.read_text()), SHA, ARM))
+            self.assertTrue(release_coverage.proves(json.loads(path.read_text()), SHA, ARM, root / 'bin' / ARM))
             self.assertFalse(list((cache / 'runs').glob('*')))
             self.assertEqual((root / "collection").read_text().splitlines(), ['summary.json'])
 
@@ -401,6 +457,14 @@ class TransportTest(unittest.TestCase):
 
 
 class PlacementInputTest(unittest.TestCase):
+    def test_bandwidth_probe_keeps_the_sixteen_gib_scope(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="bandwidth fixture\n", stderr="")
+        with patch.object(provenance, '_run', return_value=completed) as run:
+            self.assertEqual(provenance.bandwidth(REPO, Path('/tmp/probe-fixture')),
+                             {'lines': ['bandwidth fixture']})
+        self.assertEqual(run.call_args.args[0][:8],
+                         ['systemd-run', '--user', '--scope', '-p', 'MemoryMax=16G', '-q', '--', 'nice'])
+
     def test_default_reference_is_fixed_without_consulting_the_invoking_hostname(self):
         cfg = {"hosts": {"[redacted]": {"target": "x86_64-linux-musl"}}}
         hosts, reference = placement.host_plan(cfg, ["mac", "arm"])

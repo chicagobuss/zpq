@@ -2,8 +2,8 @@ name: Release
 
 # Tag-driven release. Builds the CLI for 4 platforms, packages each as
 # a tar.gz with sha256, uploads to R2 (public, CDN-fronted) and
-# attaches to a GitHub Release. No CI handoff, no artifact reuse —
-# releases are rare and a clean rebuild is worth the simplicity.
+# attaches to a GitHub Release. Native smoke jobs run the build job's
+# artifacts before publication.
 #
 # Lambda binaries are NOT shipped here. They're author-deployed via
 # `just lambda-deploy`; `tools/serverless/aws.sh build` is what
@@ -63,7 +63,7 @@ jobs:
             dist/*.tar.gz*
             dist/release.json
 
-      - name: Build shipped Linux bootstrap and integration harness
+      - name: Prepare shipped native smoke bundle
         if: matrix.target != 'x86_64-macos'
         env:
           TARGET: ${{ matrix.target }}

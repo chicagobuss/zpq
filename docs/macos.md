@@ -2,7 +2,8 @@
 
 The macOS CLIs are cross-compiled on Linux (`zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast cli`, likewise
 `x86_64-macos`; the build fetches the pinned macOS BoringSSL prebuilts, or uses `vendor/boring_tls/prebuilt/<target>`
-when present). CI cannot run them, so two scripts carry a check to a real Mac.
+when present). CI runs the Apple silicon CLI on a native macOS runner; Intel macOS runtime coverage is explicitly
+deferred. The scripts below carry broader checks to a real Mac.
 
 Local file I/O goes through `src/local_fs.zig` (`std.posix`, libc on every zpq binary), so the same code serves Linux
 and macOS. The one Linux-only fast path kept is the batched `getdents64` directory read behind glob expansion; macOS

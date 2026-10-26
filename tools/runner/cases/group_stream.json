@@ -83,6 +83,39 @@
         16
       ],
       "keep_order": true
+    },
+    {
+      "id": "group-stream:ki:count-top-desc",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT ki,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT ki,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:ki:count-top-asc",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT ki,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY c ASC LIMIT 10 OFFSET 2",
+      "duck": "SELECT ki,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY c ASC,min(rid) LIMIT 10 OFFSET 2",
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:ki:count-top-desc:parquet",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT ki,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY c DESC LIMIT 10 OFFSET 2",
+      "duck": "SELECT ki,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY c DESC,min(rid) LIMIT 10 OFFSET 2",
+      "keep_order": true,
+      "parquet": true
+    },
+    {
+      "id": "group-stream:v:count-small-domain",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT v,count(*) AS c FROM '{path}' GROUP BY v ORDER BY c DESC LIMIT 10",
+      "duck": "SELECT v,count(*) AS c FROM '{path}' GROUP BY v ORDER BY c DESC,min(rid) LIMIT 10",
+      "keep_order": true
     }
   ]
 }

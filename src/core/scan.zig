@@ -6580,8 +6580,8 @@ fn inlineIntegerAnswer(
     if ((full and count == null) or (!count_top and value == null)) return null;
     if (args.filter != null and !count_top) return null;
     const ordered_count = count_top and orderedIntegerHint(metas, work, key.col_idx);
-    // Filtered counts can avoid a sketch rescan; dictionary and survivor-domain cost gates below favor small folds.
-    if (count_top and !ordered_count and args.filter == null) return null;
+    // Raw integer identities need no retained dictionary union. The cost gates below leave small domains on
+    // their coded folds, while wide count cuts avoid a sketch and its certification rescan.
     // Leave compressed/skew keys on the established distinct certifier. This is a cost hint over all work,
     // never a bound on identity or a reason to skip a decoded value.
     if (distinct and (args.distinct_pairs == .on or
@@ -6617,7 +6617,7 @@ fn inlineIntegerAnswer(
     if (args.integer_records_min_rows != 0) {
         if (ndv.footerEntries(metas, keys)) |guess| {
             if (guess < rows / 4) return null;
-        } else if (count_top and !ordered_count and plan.query.filter != null) {
+        } else if (count_top and !ordered_count) {
             var survivors: f64 = 0;
             var range: IntegerRangeHint = .{};
             for (work) |item| {
@@ -6625,7 +6625,10 @@ fn inlineIntegerAnswer(
                 const rg = &meta.row_groups.items[item.rg];
                 const decision = plan.decide(rg, meta);
                 if (decision == .skip) continue;
-                const share = if (decision == .full_match) 1 else filter_prune.passFraction(plan.query.filter.?, rg, meta);
+                const share = if (decision == .full_match or plan.query.filter == null)
+                    1
+                else
+                    filter_prune.passFraction(plan.query.filter.?, rg, meta);
                 survivors += @as(f64, @floatFromInt(@max(0, rg.num_rows))) * share;
                 range.include(rg, meta, key.col_idx);
             }
@@ -21828,6 +21831,88 @@ test "filtered COUNT record owners consume only survivors on indexed mapped and 
                 }
             };
         };
+}
+
+test "unfiltered integer COUNT owns raw nullable keys without a dictionary union across readers and workers" {
+    const gpa = testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    var columns = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .parquet_type = .INT64,
+        .nullable = true,
+        .col = .{ .i64 = .{ .values = &.{} } },
+    }};
+    for (0..16) |rg| {
+        var values: [257]i64 = undefined;
+        var defs: [257]u32 = undefined;
+        for (&values, &defs, 0..) |*v, *d, r| {
+            v.* = @as(i64, @intCast((r * 37 + rg) % 193)) * (1 << 40) - (1 << 50);
+            d.* = @intFromBool((r + rg) % 17 != 0);
+        }
+        columns[0].col = .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1 } };
+        try file.append(&columns, values.len, .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&columns);
+    const meta = try metadata.open(a, sink.buffer.items);
+    const mapped = [_]Input{.{ .name = "raw-count.parquet", .bytes = sink.buffer.items }};
+    const base: MultiAggArgs = .{
+        .inputs = &mapped,
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .integer_records = false,
+        .integer_records_min_rows = 1,
+        .byte_records = false,
+        .msd_records = false,
+        .ndv_policy = false,
+        .dense = false,
+        .sketch_topk = null,
+        .min_bytes_per_worker = 1,
+        .max_memory = 128 << 20,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10, .offset = 2 },
+    };
+    var want = try runMultiAggregate(gpa, a, base);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, base.result_order);
+    for (1..17) |j| for ([_]usize{ 0, 64 }) |batch| for ([_]bool{ false, true }) |gated| {
+        var trial = std.heap.ArenaAllocator.init(gpa);
+        defer trial.deinit();
+        const ta = trial.allocator();
+        var window: ReleasingScanWindow = .{ .bytes = try ta.dupe(u8, sink.buffer.items), .meta = &meta };
+        const inputs = [_]Input{window.input(sink.buffer.items)};
+        var args = base;
+        args.inputs = if (gated) &inputs else &mapped;
+        args.start_reads = if (gated) .{
+            .ctx = &window,
+            .start = ReleasingScanWindow.start,
+            .abandon = ReleasingScanWindow.abandon,
+        } else null;
+        args.integer_records = true;
+        args.parallelism = j;
+        args.decode_batch_rows = batch;
+        var budget: core_memory.SharedBudget = .{ .limit = base.max_memory };
+        args.ledger = &budget;
+        var taken: std.EnumSet(FastPath) = .{};
+        args.taken = &taken;
+        const explanation = try explainAggregate(gpa, ta, args);
+        try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+        var got = try prepareAggregate(gpa, ta, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.integer_records));
+        try testing.expectEqual(ownedGroupOutputBytes(got.output), budget.used.load(.monotonic));
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        try testing.expectEqual(want.rows_matched, got.rows_matched);
+        if (gated) {
+            try testing.expectEqual(meta.row_groups.items.len, window.waits.load(.monotonic));
+            try testing.expectEqual(@as(usize, 0), window.abandoned);
+        }
+    };
 }
 
 test "filtered hot COUNT certificate proves selected counts and first appearances" {

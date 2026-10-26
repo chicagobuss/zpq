@@ -65,8 +65,9 @@ fi
 busy() {
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" '
     systemctl --user list-units --state=active --no-legend "zpq-*" 2>/dev/null | grep -q . && exit 0
-    lock=/mnt/fast/zpq-out/timing.lock
-    [ -e "$lock" ] && command -v flock >/dev/null && ! flock -n "$lock" true && exit 0
+    for lock in /mnt/fast/zpq-out/timing.lock "$HOME/.cache/zpq-bench.lock"; do  # the second is bench/'s
+      [ -e "$lock" ] && command -v flock >/dev/null && ! flock -n "$lock" true && exit 0
+    done
     pgrep -f "[v]erify.py full|[D]tier=full" >/dev/null && exit 0  # bracketed: never this shell
     exit 1' 2>/dev/null
 }

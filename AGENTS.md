@@ -65,10 +65,12 @@ receipts for HEAD with nothing failed or skipped. Don't skip the full tier befor
 
 ## Performance tracking
 
-`python tools/verify/verify.py perf` runs the scorecard harness pinned in `tools/verify/HARNESS` against DuckDB 2.0 and
-Polars 2.0 and counts only validated answers. Re-run it **before AND after** a perf change on the same host and keep
-both records; don't change suite or case filters between the two runs. AWS-side noise is real: if a single remote cell
-jumps and the others don't, suspect the network before the diff.
+`python -m bench run --host H --lane cold|hot|engine --prev ZPQ_PREV` (bench/README.md) runs zpq against DuckDB 2.0
+and Polars 2.0, with the previous build as a same-host control, and counts only answers `zpq-check compare` validates.
+Re-run it **before AND after** a perf change on the same host and keep both records; don't change suite or case
+filters between the two runs. A lane that is INCOMPLETE (a stalled case quarantined past 2%) or UNCERTIFIED (no PSI)
+proves nothing: re-run it on a quiet host. AWS-side noise is real: if a single remote cell jumps and the others don't,
+suspect the network before the diff.
 
 ## Profiling
 

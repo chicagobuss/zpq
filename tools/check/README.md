@@ -48,7 +48,11 @@ Then exactly one expectation, checked at the first point (a case with none, two,
 when the file loads, as is a file with no cases):
 
 - `oracle`: `{"compare": MODE, "sql": ...}` plus the mode's fields (`where`, `mean`, `epoch`, `pred`, `py_agg`,
-  `names`, `types`, `orders`, `row_count`, `duck_select`). The modes are in `verdict.zig`.
+  `names`, `types`, `orders`, `row_count`, `duck_select`, `ranks`). The modes are in `verdict.zig`. `tied_rows`
+  takes rows in any order where the query does not fix one and any tie at a `LIMIT` cut, but each printed row must
+  occur in DuckDB's whole answer at least as often as it is printed, and the `ranks` columns (the ORDER BY
+  positions) must match row by row. `written_sql` checks a written file against a query: names, types (an integer
+  at another width compares exactly) and the multiset of rows.
 - `refuse`: `{"error": KIND, "diag": SUBSTRING, "exit": N, "no_output": true, "binder_sql": SQL}`, the declared
   refusal of this exact query (a CLI refusal's kind is its JSON `code`, its `(Name)`, else `exit N`);
   with `binder_sql`, DuckDB must refuse that SQL with a Binder Error too. A file-level `refuse` map declares
@@ -74,6 +78,12 @@ its exact binary value; corpus modes compare each float at its column's width.
 
 Empty, limited (`--only`, `--limit`) and failed runs never exit 0.
 
+`zpq-check compare` judges other engines' answers with the same modes, for `bench/`: one JSON request per stdin
+line, `{"fixture", "answer", "parquet", "spec"}` with `spec` a case's oracle expectation, and one
+`{"ok", "reason"}` line back. It keeps file hashes for the oracle cache between requests, and `--threads N` gives
+DuckDB N threads (part of every cache key). `text_numbers` in a spec reads a JSON string in a numeric column as
+its number: DuckDB prints HUGEINT that way; zpq never may.
+
 ## Tiers
 
 The gates are build.zig steps; CI and the justfile call them.
@@ -81,8 +91,8 @@ The gates are build.zig steps; CI and the justfile call them.
 | Tier | Command | Stages |
 |---|---|---|
 | edit | `zig build check -Dtier=edit [-Dtest-filter=X]` | core unit tests (ReleaseSafe) |
-| commit | `zig build check -Dtier=commit` | fixtures, core unit tests, the runner's self-test, every commit-tier case file against the cached oracle |
-| full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-test, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, libzpq |
+| commit | `zig build check -Dtier=commit` | fixtures, core unit tests, the runner's self-test, the bench's rules, every commit-tier case file against the cached oracle |
+| full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-tests, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, libzpq |
 | fleet | `tools/check/fleet.sh` | the full tier's shards (tools/check/shards.json) over the fleet, plus the architecture check |
 
 Each stage runs through `zpq-check stage` under its timeout (a hang fails the stage, its process group killed) and
@@ -99,7 +109,7 @@ so no test file goes unrooted.
 The architecture check runs every case answers-only (`--answers-only --reuse-fixtures --manifest`) on each fleet host
 from a shipped bundle, and `zpq-check manifest-diff` requires the host's answers to equal this host's, case for case.
 Placement: granted-mbp runs only with `--host` or `--release`, and a host that is timing (an active `zpq-*` unit, a
-held `/mnt/fast/zpq-out/timing.lock`, a running full gate) is skipped.
+held `/mnt/fast/zpq-out/timing.lock` or bench lock `~/.cache/zpq-bench.lock`, a running full gate) is skipped.
 
 The release tier is the GitHub native matrix: each runner builds the CLI as it ships and runs `cases/release.json`
 through it, and on Linux the shipped Lambda through the fake runtime (`zig build integration-bin`).

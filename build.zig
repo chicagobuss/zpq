@@ -368,6 +368,10 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         r.addArgs(&.{ "--self-test", "--no-cache", "--duckdb", duckdb, "--python", python, "--work", "zig-out/check-self", "--zpq" });
         r.addArtifactArg(fast.cli);
     };
+    // The scorecard's rules decide what a timing counts for (stalls, quarantine, the denominator): a gate too.
+    if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "bench-self", "plain", 300)) |r| {
+        r.addArgs(&.{ "--", python, "-m", "unittest", "discover", "-s", "bench/tests" });
+    };
     const Cases = struct { name: []const u8, files: []const []const u8, fresh: bool, timeout: u32, data: ?[]const u8 = null };
     const case_stages: []const Cases = switch (tier) {
         .edit => &.{},

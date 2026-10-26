@@ -1147,113 +1147,153 @@ pub fn foldGroupedCall(
     );
 }
 
-// A scalar walk, not `foldFloatPartials`: the refusal path and an admitted batch must both match it, including a
-// preseeded `-0.0` and a NaN. Batching off and an empty L2 share are the cases a worker count can produce.
-test "a refused float batch folds each grouped root once" {
+// Scalar `+=` in selected-row order. Not `foldFloatPartials` and not `foldGroupedCall`.
+// Sharing stands in for `-j`: L2 is split by `max_sharing`. Forced 0 is batching off, a zero L2 refuses a batch,
+// and forced 64 admits one. Only the admitted path fuses two or more roots.
+test "mixed float roots match a scalar oracle across batch admission" {
     const hw = @import("../hw.zig");
     defer hw.test_cpu = null;
     defer expr_eval.forced_batch_rows = null;
-    const modes = [_]struct { forced: ?usize, l2: usize }{
-        .{ .forced = 0, .l2 = 1 << 20 },
-        .{ .forced = null, .l2 = 0 },
-        .{ .forced = 64, .l2 = 1 << 20 },
+    const sharing = [_]usize{ 1, 3, 8, 16 };
+    const modes = [_]struct { forced: ?usize, l2: usize, admit: bool }{
+        .{ .forced = 0, .l2 = 1 << 20, .admit = false },
+        .{ .forced = null, .l2 = 0, .admit = false },
+        .{ .forced = 64, .l2 = 1 << 20, .admit = true },
     };
-    var first: ?[4]u64 = null;
+    var first: ?[7]u64 = null;
     var first_count: ?u64 = null;
-    for (modes) |mode| {
-        expr_eval.forced_batch_rows = mode.forced;
-        hw.test_cpu = .{ .l2 = .{ .bytes = mode.l2, .max_sharing = 1 } };
-        const got = try refusedFloatOnce(std.testing.allocator);
-        try std.testing.expectEqual(got.oracle, got.bits);
-        try std.testing.expectEqual(got.oracle_count, got.count);
-        if (first) |prev| {
-            try std.testing.expectEqual(prev, got.bits);
-            try std.testing.expectEqual(first_count.?, got.count);
-        } else {
-            first = got.bits;
-            first_count = got.count;
+    for (sharing) |workers| {
+        for (modes) |mode| {
+            expr_eval.forced_batch_rows = mode.forced;
+            hw.test_cpu = .{ .l2 = .{ .bytes = mode.l2, .max_sharing = workers } };
+            const got = try mixedFloatOracle(std.testing.allocator);
+            try std.testing.expectEqual(got.oracle, got.bits);
+            try std.testing.expectEqual(got.oracle_count, got.count);
+            try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), got.bits[5]);
+            // Bare roots share one pass on every mode. A second pass is the per-batch expression fusion.
+            if (mode.admit) {
+                try std.testing.expect(fuse_probe.passes > 1);
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), fuse_probe.passes);
+            }
+            if (first) |prev| {
+                try std.testing.expectEqual(prev, got.bits);
+                try std.testing.expectEqual(first_count.?, got.count);
+            } else {
+                first = got.bits;
+                first_count = got.count;
+            }
         }
     }
 }
 
-fn refusedFloatOnce(a: std.mem.Allocator) !struct { bits: [4]u64, count: u64, oracle: [4]u64, oracle_count: u64 } {
+fn mixedFloatOracle(a: std.mem.Allocator) !struct { bits: [7]u64, count: u64, oracle: [7]u64, oracle_count: u64 } {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ra = arena.allocator();
-    const n: usize = 80;
-    const keys = [_][]const u8{"k"};
+    const n: usize = 192;
+    const nan_a: f64 = @bitCast(@as(u64, 0x7ff0_0000_0000_0001));
+    const nan_b: f64 = @bitCast(@as(u64, 0xfff0_0000_0000_0002));
+    try std.testing.expect(@as(u64, @bitCast(nan_a)) != @as(u64, @bitCast(nan_b)));
+    const keys = [_][]const u8{"g"};
     const key_codes = try ra.alloc(u32, n);
     @memset(key_codes, 0);
     const xs = try ra.alloc(f64, n);
     const ys = try ra.alloc(f64, n);
-    for (xs, ys, 0..) |*x, *y, r| {
-        x.* = switch (r) {
-            0 => -0.0,
-            1 => 0.0,
-            else => @floatFromInt(r),
+    const zs = try ra.alloc(f64, n);
+    const ws = try ra.alloc(f64, n);
+    for (xs, ys, zs, ws, 0..) |*x, *y, *z, *w, r| {
+        x.* = switch (r % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
         };
-        y.* = if (r == n - 1) std.math.nan(f64) else @as(f64, @floatFromInt(r % 5));
+        y.* = switch (r % 3) {
+            0 => 0.5,
+            1 => -0.25,
+            else => 0.25,
+        };
+        z.* = -0.0;
+        w.* = if (r == 1) nan_a else if (r == 2) nan_b else 0;
     }
     const cols = [_]Column{
         .{ .string = .{ .values = &.{}, .codes = key_codes, .dict = &keys } },
         .{ .f64 = .{ .values = xs } },
         .{ .f64 = .{ .values = ys } },
+        .{ .f64 = .{ .values = zs } },
+        .{ .f64 = .{ .values = ws } },
     };
-    const lookup = [_]?usize{ 0, 1, 2 };
+    const lookup = [_]?usize{ 0, 1, 2, 3, 4 };
     const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
     var xref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
     var yref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const zref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 3, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const wref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 4, .physical_type = .DOUBLE, .expr_type = .f64 } };
     const sum_xy: expr_ast.Expr = .{ .binop = .{
         .op = .add, .left = &xref, .right = &yref, .result_type = .f64, .depth = 2,
+    } };
+    const sum_xmy: expr_ast.Expr = .{ .binop = .{
+        .op = .sub, .left = &xref, .right = &yref, .result_type = .f64, .depth = 2,
     } };
     const calls = [_]AggCall{
         .{ .func = .sum, .arg = xref, .result = .f64, .where = null, .alias = "sx" },
         .{ .func = .sum, .arg = yref, .result = .f64, .where = null, .alias = "sy" },
         .{ .func = .avg, .arg = xref, .result = .avg_f64, .where = null, .alias = "ax" },
         .{ .func = .sum, .arg = sum_xy, .result = .f64, .where = null, .alias = "sxy" },
+        .{ .func = .sum, .arg = sum_xmy, .result = .f64, .where = null, .alias = "sxmy" },
+        .{ .func = .sum, .arg = zref, .result = .f64, .where = null, .alias = "sz" },
+        .{ .func = .sum, .arg = wref, .result = .f64, .where = null, .alias = "sw" },
     };
     var table = agg.GroupTable.init(a, 1 << 20);
     defer table.deinit();
-    // One row creates the group. Its fold is then replaced, so the payload adds to a seed this call did not produce.
     const stub_codes = [_]u32{0};
     const stub_x = [_]f64{0};
-    const stub_y = [_]f64{0};
     const stub_cols = [_]Column{
         .{ .string = .{ .values = &.{}, .codes = &stub_codes, .dict = &keys } },
         .{ .f64 = .{ .values = &stub_x } },
-        .{ .f64 = .{ .values = &stub_y } },
+        .{ .f64 = .{ .values = &stub_x } },
+        .{ .f64 = .{ .values = &stub_x } },
+        .{ .f64 = .{ .values = &stub_x } },
     };
     var stub_sel = try Sel.init(ra, 1);
     const stub_batch: filter_eval.Batch = .{ .cols = &stub_cols, .num_rows = 1 };
     try std.testing.expect(try groupedCoded(
         ra, a, &calls, &.{key}, &table, 0, &stub_batch, &lookup, &stub_sel, null, null,
     ));
-    const seed_x: f64 = -0.0;
-    const seed_y: f64 = 4;
-    const seed_xy: f64 = 7;
-    const seed_avg: f64 = -0.0;
-    const seed_count: u64 = 3;
-    table.accumulators.items[0] = .{ .sum_f = seed_x };
-    table.accumulators.items[1] = .{ .sum_f = seed_y };
-    table.accumulators.items[2] = .{ .avg = .{ .sum = seed_avg, .count = seed_count } };
-    table.accumulators.items[3] = .{ .sum_f = seed_xy };
+    const seed_z: f64 = -0.0;
+    table.accumulators.items[0] = .{ .sum_f = 0 };
+    table.accumulators.items[1] = .{ .sum_f = 0 };
+    table.accumulators.items[2] = .{ .avg = .{ .sum = 0, .count = 0 } };
+    table.accumulators.items[3] = .{ .sum_f = 0 };
+    table.accumulators.items[4] = .{ .sum_f = 0 };
+    table.accumulators.items[5] = .{ .sum_f = seed_z };
+    table.accumulators.items[6] = .{ .sum_f = 0 };
+    if (comptime @import("builtin").is_test) fuse_probe.passes = 0;
 
     var sel = try Sel.init(ra, n);
-    for (0..n) |r| if (r % 11 == 0) sel.set(r, false);
+    for (0..n) |r| if (r % 17 == 0) sel.set(r, false);
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
-    try std.testing.expect(try groupedCoded(ra, a, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null));
+    try std.testing.expect(try groupedCoded(
+        ra, a, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null,
+    ));
 
-    var oracle_x = seed_x;
-    var oracle_y = seed_y;
-    var oracle_xy = seed_xy;
-    var oracle_avg = seed_avg;
-    var oracle_count = seed_count;
+    var ox: f64 = 0;
+    var oy: f64 = 0;
+    var oavg: f64 = 0;
+    var ocount: u64 = 0;
+    var oxy: f64 = 0;
+    var oxmy: f64 = 0;
+    var oz: f64 = seed_z;
+    var ow: f64 = 0;
     for (0..n) |r| if (sel.isActive(r)) {
-        oracle_x += xs[r];
-        oracle_y += ys[r];
-        oracle_xy += xs[r] + ys[r];
-        oracle_avg += xs[r];
-        oracle_count += 1;
+        ox += xs[r];
+        oy += ys[r];
+        oavg += xs[r];
+        ocount += 1;
+        oxy += xs[r] + ys[r];
+        oxmy += xs[r] - ys[r];
+        oz += zs[r];
+        ow += ws[r];
     };
     const acc = table.accumulators.items;
     return .{
@@ -1262,15 +1302,21 @@ fn refusedFloatOnce(a: std.mem.Allocator) !struct { bits: [4]u64, count: u64, or
             @bitCast(acc[1].sum_f.?),
             @bitCast(acc[2].avg.sum),
             @bitCast(acc[3].sum_f.?),
+            @bitCast(acc[4].sum_f.?),
+            @bitCast(acc[5].sum_f.?),
+            @bitCast(acc[6].sum_f.?),
         },
         .count = acc[2].avg.count,
         .oracle = .{
-            @bitCast(oracle_x),
-            @bitCast(oracle_y),
-            @bitCast(oracle_avg),
-            @bitCast(oracle_xy),
+            @bitCast(ox),
+            @bitCast(oy),
+            @bitCast(oavg),
+            @bitCast(oxy),
+            @bitCast(oxmy),
+            @bitCast(oz),
+            @bitCast(ow),
         },
-        .oracle_count = oracle_count,
+        .oracle_count = ocount,
     };
 }
 

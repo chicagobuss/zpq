@@ -56,7 +56,9 @@ Each mode falls back rather than fails:
   completions. A failed `pread` fails the read;
 - `EINTR` while waiting for a completion is retried without counting. A submitted read waits for its completion.
   It is not read again with `pread` while the ring can still write that buffer. A completion of `-EAGAIN` is
-  resubmitted a few times, and then that finished unit is read with `pread`.
+  resubmitted a few times, and then that finished unit is read with `pread`;
+- on any error or stop, nothing further is submitted. Reads already in the kernel are reaped until none remain.
+  They are reads of a regular file, so they complete. The ring is not closed before that.
 
 No registered buffers are used, so the default `memlock` limit is enough.
 

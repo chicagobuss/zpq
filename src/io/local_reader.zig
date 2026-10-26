@@ -177,17 +177,28 @@ fn residencyFrom(hits: u64, seen: u64, total: u64) Residency {
     };
 }
 
+/// Running planned-page weight. `share` is 0 when nothing was planned.
+pub const Weight = struct {
+    pages: f64 = 0,
+    hits: f64 = 0,
+
+    pub fn add(self: *Weight, part: Residency) void {
+        const n: f64 = @floatFromInt(part.pages);
+        self.pages += n;
+        self.hits += part.share * n;
+    }
+
+    pub fn share(self: Weight) f64 {
+        return if (self.pages == 0) 0 else self.hits / self.pages;
+    }
+};
+
 /// Sum of per-file estimates, each weighted by that file's planned pages. An unknown file (`share` 0, `pages` set)
 /// pulls the total down instead of disappearing from it.
 pub fn weightShare(parts: []const Residency) f64 {
-    var pages: f64 = 0;
-    var hits: f64 = 0;
-    for (parts) |part| {
-        const n: f64 = @floatFromInt(part.pages);
-        pages += n;
-        hits += part.share * n;
-    }
-    return if (pages == 0) 0 else hits / pages;
+    var weight: Weight = .{};
+    for (parts) |part| weight.add(part);
+    return weight.share();
 }
 
 /// Past this many pages a planned-range sample strides, and a stride is not proof the bytes are cold.
@@ -452,13 +463,13 @@ const Faults = struct {
     early_ready: bool = false,
     fail_pread: bool = false,
     preads: u32 = 0,
-    /// First real completion is treated as a hard error (`-EIO`). Cleared once it fires.
-    hard_cqe: bool = false,
-    /// Units after the first read this fd with offset -1, so the read blocks (a pipe) and stays submitted.
-    block_fd: ?i32 = null,
-    inflight_at_error: usize = 0,
+    /// Wait to copy until at least this many CQEs are ready, so one batch holds several units.
+    hold_batch: u32 = 0,
+    /// How many CQEs the last copy took.
+    batch_n: u32 = 0,
+    /// The first CQE of a multi-completion batch reports a short read, so its repair pread runs.
+    short_first: bool = false,
     inflight_at_deinit: usize = std.math.maxInt(usize),
-    drained: u32 = 0,
 };
 
 pub const Reader = struct {
@@ -960,10 +971,10 @@ pub const Reader = struct {
         defer self.gpa.free(held);
         const tries = try self.gpa.alloc(u8, held.len);
         defer self.gpa.free(tries);
-        // Runs before the frees and before `ring.deinit`. Closing the fd cancels a submitted read
-        // asynchronously; the late store can land in a buffer already given back. Every exit reaps first.
+        // Runs before the frees and before `ring.deinit`. A submitted read of a regular file completes;
+        // closing the fd before that store lands can write a buffer already given back.
         defer {
-            self.reapBeforeClose(&ring, held, tries, &nheld, &inflight);
+            reapSubmitted(&ring, held, tries, &nheld, &inflight);
             if (builtin.is_test) if (self.faults) |f| {
                 f.inflight_at_deinit = inflight;
             };
@@ -978,7 +989,7 @@ pub const Reader = struct {
         while (true) {
             if (draining and inflight == 0) {
                 if (stalled_err) |e| return e;
-                try self.finishHeld(&.{}, pending);
+                try self.finishHeld(pending);
                 return;
             }
             const cancelled = self.cancel.load(.acquire);
@@ -1004,12 +1015,6 @@ pub const Reader = struct {
                 tries[nheld] = 0;
                 nheld += 1;
                 const buf = f.buf[@intCast(u.off)..][0..u.len];
-                // A test pipe stays submitted until cancel: offset -1 is a blocking read, not pread.
-                if (builtin.is_test) if (self.faults) |fault| if (fault.block_fd) |bfd| if (idx != 0) {
-                    _ = try ring.read(idx, bfd, .{ .buffer = buf }, std.math.maxInt(u64));
-                    inflight += 1;
-                    continue;
-                };
                 _ = try ring.read(idx, f.fd, .{ .buffer = buf }, u.off);
                 inflight += 1;
             }
@@ -1029,8 +1034,16 @@ pub const Reader = struct {
                 },
                 else => |e| return e,
             };
-            for (cqes[0..n], 0..) |c, i| {
-                inflight -= 1;
+            // The whole batch is already off the CQ. Count it before any pread or resubmit can fail.
+            inflight -= n;
+            if (builtin.is_test) if (self.faults) |fault| {
+                fault.batch_n = n;
+            };
+            for (cqes[0..n], 0..) |*c, i| {
+                if (builtin.is_test) if (self.faults) |fault| if (fault.short_first and i == 0 and n >= 2) {
+                    fault.short_first = false;
+                    c.res = 0;
+                };
                 const idx: usize = @intCast(c.user_data);
                 const u = units[idx];
                 const f = self.files.items[u.file];
@@ -1054,40 +1067,24 @@ pub const Reader = struct {
                     self.unitDone(u);
                     continue;
                 }
-                const hard = builtin.is_test and blk: {
-                    if (self.faults) |fault| {
-                        if (fault.hard_cqe) {
-                            fault.hard_cqe = false;
-                            break :blk true;
-                        }
-                    }
-                    break :blk false;
-                };
-                // `-EIO` / `-EINVAL`, or the test's stand-in. The rest of this batch was already copied.
-                if (hard or c.res < 0) {
-                    if (i + 1 < n) inflight -= n - i - 1;
-                    if (builtin.is_test) if (self.faults) |fault| {
-                        fault.inflight_at_error = inflight;
-                    };
-                    return error.ReadFailed;
-                }
+                // `-EIO` / `-EINVAL`. Siblings in this batch are already counted; still-submitted reads are reaped.
+                if (c.res < 0) return error.ReadFailed;
                 if (slot) |s| heldRemove(held, tries, &nheld, s);
                 const want = @min(@as(u64, u.len), f.size - u.off);
                 // O_DIRECT reads the file's unaligned tail short; anything else short is finished with pread.
                 const got: u64 = @intCast(c.res);
-                if (got < want) try preadAll(f, u.off + got, u.off + want);
+                if (got < want) {
+                    if (builtin.is_test) if (self.faults) |fault| if (fault.fail_pread) return error.ReadFailed;
+                    try preadAll(f, u.off + got, u.off + want);
+                }
                 self.unitDone(u);
             }
         }
     }
 
-    /// Units queued on this thread but never flushed, then anything claimed but not queued, then the shared cursor.
-    /// Flushed units are not in `outstanding`: their buffers stay with the ring until the completion arrives.
-    fn finishHeld(self: *Reader, outstanding: []const usize, pending: ?usize) !void {
-        for (outstanding) |i| {
-            try self.readUnit(i);
-            self.unitDone(self.units.items[i]);
-        }
+    /// The unit claimed but not yet queued, then the shared cursor. A read the kernel accepted is not here:
+    /// its buffer stays with the ring until the completion arrives.
+    fn finishHeld(self: *Reader, pending: ?usize) !void {
         if (pending) |i| {
             const u = self.units.items[i];
             while (!self.admit(u)) {
@@ -1131,6 +1128,14 @@ pub const Reader = struct {
                 if (self.cancel.load(.acquire)) return error.ReadFailed;
                 std.Thread.yield() catch {};
                 continue;
+            };
+            // A test gathers several completions into one copy. Ready CQEs are not submitted again.
+            if (builtin.is_test) if (self.faults) |f| if (f.hold_batch > 1) {
+                const queued = ring.cq_ready();
+                if (queued > 0 and queued < f.hold_batch) {
+                    std.Thread.yield() catch {};
+                    continue;
+                }
             };
             const n = ring.copy_cqes(cqes, 0) catch |err| switch (err) {
                 error.SignalInterrupt, error.SystemResources, error.CompletionQueueOvercommitted => {
@@ -1179,36 +1184,27 @@ pub const Reader = struct {
         }
     }
 
-    /// Every exit: SQEs the kernel never took are rewound, and submitted reads are cancelled and reaped.
-    /// `EINTR` retries with no bound; the outstanding completions are the bound. Nothing here is published.
-    fn reapBeforeClose(
-        self: *Reader,
+    /// Every exit: SQEs the kernel never took are dropped, then submitted reads are reaped to `inflight == 0`.
+    /// Nothing is submitted and nothing is published. A regular-file read completes, so the wait ends. `EINTR`,
+    /// `EAGAIN` and `EBUSY` on the wait are retried; CQEs already queued are copied without entering.
+    fn reapSubmitted(
         ring: *linux.IoUring,
         held: []usize,
         tries: []u8,
         nheld: *usize,
         inflight: *usize,
     ) void {
-        if (inflight.* == 0) return;
         const dropped_n = splitUnconsumed(ring, held, tries, nheld);
         if (inflight.* >= dropped_n) inflight.* -= dropped_n else inflight.* = 0;
         rewindSq(ring);
-        if (inflight.* == 0) return;
-        // One cancel per accepted unit. Its CQE, and the read's, both arrive before the ring may close.
-        var cancels: usize = 0;
-        for (held[0..nheld.*]) |idx| {
-            const mark: u64 = 0x8000_0000_0000_0000 + cancels;
-            _ = ring.cancel(mark, idx, 0) catch break;
-            cancels += 1;
-        }
-        var left = inflight.* + cancels;
         var cqes: [64]linux.io_uring_cqe = undefined;
-        while (left > 0) {
-            const ready = ring.flush_sq();
-            _ = ring.enter(ready, 1, linux.IORING_ENTER_GETEVENTS) catch {
-                std.Thread.yield() catch {};
-                continue;
-            };
+        while (inflight.* > 0) {
+            if (ring.cq_ready() == 0) {
+                _ = ring.enter(0, 1, linux.IORING_ENTER_GETEVENTS) catch {
+                    std.Thread.yield() catch {};
+                    continue;
+                };
+            }
             const n = ring.copy_cqes(&cqes, 0) catch {
                 std.Thread.yield() catch {};
                 continue;
@@ -1217,13 +1213,9 @@ pub const Reader = struct {
                 std.Thread.yield() catch {};
                 continue;
             }
-            if (builtin.is_test) if (self.faults) |f| {
-                f.drained +%= n;
-            };
             const got: usize = n;
-            left = if (got >= left) 0 else left - got;
+            inflight.* = if (got >= inflight.*) 0 else inflight.* - got;
         }
-        inflight.* = 0;
     }
 
     fn rowGroupReady(self: *Reader) bool {
@@ -1988,7 +1980,7 @@ fn readFaulted(path: []const u8, data: []const u8, faults: *Faults) !void {
     var range = [_]Range{.{ .start = 0, .end = data.len }};
     var plans = [_]?[]Range{&range};
     try rd.planFile(f, &plans, 0);
-    const expect_fail = faults.fail_pread or faults.hard_cqe;
+    const expect_fail = faults.fail_pread;
     try rd.start();
     const gate = f.gate();
     if (expect_fail) {
@@ -2035,26 +2027,18 @@ test "io_uring past the retry bound finishes the unit with pread" {
     try testing.expectEqual(@as(u32, 2), partial.preads);
 }
 
-test "a hard io_uring completion drains submitted reads before the ring closes" {
+test "a short repair pread failure reaps the rest of its completion batch" {
     if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
-    var fds: [2]i32 = undefined;
-    const opened = linux.pipe2(&fds, .{ .CLOEXEC = true });
-    if (linux.errno(opened) != .SUCCESS) return error.SkipZigTest;
-    defer {
-        _ = linux.close(fds[0]);
-        _ = linux.close(fds[1]);
-    }
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const data = try testing.allocator.alloc(u8, 192 << 10);
+    const data = try testing.allocator.alloc(u8, 128 << 10);
     defer testing.allocator.free(data);
     @memset(data, 7);
     var path_buf: [256]u8 = undefined;
-    const path = try testFile(&tmp, "hard.bin", data, &path_buf);
-    var faults: Faults = .{ .hard_cqe = true, .block_fd = fds[0] };
+    const path = try testFile(&tmp, "batch.bin", data, &path_buf);
+    var faults: Faults = .{ .hold_batch = 2, .short_first = true, .fail_pread = true };
     try readFaulted(path, data, &faults);
-    try testing.expect(faults.inflight_at_error > 0);
-    try testing.expect(faults.drained > 0);
+    try testing.expect(faults.batch_n >= 2);
     try testing.expectEqual(@as(usize, 0), faults.inflight_at_deinit);
 }
 

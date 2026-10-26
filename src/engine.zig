@@ -2338,9 +2338,15 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
         w.core.encode_ns += timings.encode_ns;
     }
     var readers: SliceReaders = undefined;
-    try readers.init(w, gpa, job, 0);
+    readers.init(w, gpa, job, 0) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        // Init failed before a reader was left alive: its errdefer dropped them. Historical scratch can be the refusal.
+        if (w.slice_pool) |pool| pool.evictIdle();
+        try readers.init(w, gpa, job, 0);
+    };
     defer readers.deinit();
     var done: usize = 0;
+    var one_evicted = false;
     // Per-slice working memory (the decoded slice and its selection), its pages kept from one to the next.
     var slice = std.heap.ArenaAllocator.init(gpa);
     defer slice.deinit();
@@ -2350,8 +2356,9 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
         _ = slice.reset(.retain_capacity);
         const piece = sliceToPiece(w, job, &readers, &slice, n, &timings) catch |e| {
             const m = w.slicing_now orelse return e;
-            if (e != error.OutOfMemory or !m.refused.load(.monotonic) or n == 1) return e;
-            // Refused: decode the same rows again, half as many at a time.
+            if (e != error.OutOfMemory or !m.refused.load(.monotonic)) return e;
+            // One row cannot be halved. Evict idle scratch and decode that row once more.
+            if (n == 1 and one_evicted) return e;
             m.refused.store(false, .monotonic);
             _ = slice.reset(.free_all);
             w.trimIdle();
@@ -2362,7 +2369,7 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
                 readers = .{ .pages = .init(gpa), .lookup = &.{} };
                 return re;
             };
-            slice_rows = @max(1, n / 2);
+            if (n == 1) one_evicted = true else slice_rows = @max(1, n / 2);
             continue;
         };
         done += n;
@@ -4581,8 +4588,7 @@ fn allLocal(opened: OpenedInputs) bool {
 /// that file's pages as not cached. No plan is share 0, so it does not take the cached mapping.
 fn plannedResidency(gpa: std.mem.Allocator, opened: OpenedInputs, plan: ?LocalPlan) f64 {
     const lp = plan orelse return 0;
-    var parts: std.ArrayList(local_reader.Residency) = .empty;
-    defer parts.deinit(gpa);
+    var weight: local_reader.Weight = .{};
     for (lp.files, opened.mmaps) |per_rg, m_opt| {
         const m = m_opt orelse continue;
         var list: std.ArrayList(local_reader.Range) = .empty;
@@ -4592,9 +4598,9 @@ fn plannedResidency(gpa: std.mem.Allocator, opened: OpenedInputs, plan: ?LocalPl
             list.appendSlice(gpa, rs) catch return 0;
         }
         if (list.items.len == 0) continue;
-        parts.append(gpa, local_reader.sampleRanges(gpa, m.bytes, list.items)) catch return 0;
+        weight.add(local_reader.sampleRanges(gpa, m.bytes, list.items));
     }
-    return local_reader.weightShare(parts.items);
+    return weight.share();
 }
 
 /// Per local input, per row group, the byte ranges the scan reads (null when pruned): needed chunks and their page

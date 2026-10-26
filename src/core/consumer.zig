@@ -1198,10 +1198,8 @@ pub const SliceReader = struct {
     /// Between probe units no value refers to the drained page. Keep only its decoded dictionary.
     pub fn releaseProbePage(self: *SliceReader) void {
         invariant.assert(self.pageLeft() == 0);
-        if (self.retained) {
-            _ = self.pages.reset(.retain_capacity);
-            return;
-        }
+        // The probe reader is unpooled. A pooled slot's buffers belong to the worker pool.
+        invariant.assert(!self.retained);
         _ = self.pages.reset(.free_all);
         const s = self.scratch;
         s.gpa.free(s.page);
@@ -4556,8 +4554,83 @@ fn filterSurvivors(
     return survivors;
 }
 
+fn openSlicedPayload(
+    pages: std.mem.Allocator,
+    side: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    pool: *SliceScratch,
+    readers: *std.ArrayList(SliceReader),
+    lookup: []?usize,
+    levels_only: []const bool,
+    payload: ?[]const bool,
+    survivors: ?*filter_selection.SelectionVector,
+    ws: AggWorkspace,
+) !?void {
+    @memset(lookup, null);
+    var n_readers: usize = 0;
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
+        n_readers += 1;
+    }
+    pool.rewind();
+    try pool.reserve(n_readers);
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        // The first pass already validated and evaluated filter-only columns. Keep only the values the consumer
+        // reads; a column shared by the filter and an aggregate still needs its value lane here.
+        if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
+        var options = decode_options;
+        options.any_dictionary = target.codedKey(ci);
+        options.decimal_exact_only = target.exactInputs();
+        if (payload) |p| if (p[ci]) if (survivors) |sv| {
+            options.row_gate = sv;
+        };
+        var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
+        if (levels_only[ci]) r.levelsOnly();
+        if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
+            r.retainPayloads(owner);
+            r.raw.bytes.pages.prof = ws.timings.prof;
+        };
+        lookup[ci] = readers.items.len;
+        try readers.append(pages, r);
+    }
+}
+
+/// Readers are gone, so the pool's retained peaks are idle. Drop them and open the same columns again, positioned
+/// at `done` so rows already folded stay folded.
+fn recoverSlicedReaders(
+    pages: std.mem.Allocator,
+    side: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    pool: *SliceScratch,
+    readers: *std.ArrayList(SliceReader),
+    lookup: []?usize,
+    levels_only: []const bool,
+    payload: ?[]const bool,
+    survivors: ?*filter_selection.SelectionVector,
+    ws: AggWorkspace,
+    done: usize,
+) !?void {
+    for (readers.items) |*r| r.deinit();
+    readers.clearRetainingCapacity();
+    pool.evictIdle();
+    try openSlicedPayload(
+        pages, side, in, decode_options, target, pool, readers, lookup, levels_only, payload, survivors, ws,
+    ) orelse return null;
+    if (done == 0) return;
+    var skipping = std.heap.ArenaAllocator.init(side);
+    defer skipping.deinit();
+    for (readers.items) |*r| try r.skip(skipping.allocator(), done);
+}
+
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
-/// A charged allocation that fails before any row is folded drops idle scratch and tries the row group once more.
+/// A charged allocation that fails with no reader still aliasing the pool drops that idle scratch and retries once.
+/// Rows already folded are not decoded again.
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -4609,36 +4682,21 @@ fn scanRGSlicedOnce(
     var survivors: filter_selection.SelectionVector = undefined;
     if (payload) |p| survivors = (try filterSurvivors(pages.allocator(), side, in, decode_options, p, num_rows, ws)) orelse
         return null;
-    var n_readers: usize = 0;
-    for (in.read, 0..) |needed, ci| {
-        if (!needed or ci >= in.rg.columns.items.len) continue;
-        if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
-        n_readers += 1;
-    }
     // The filter pass has released its readers. The same slots decode the payload.
-    pool.rewind();
-    try pool.reserve(n_readers);
-    for (in.read, 0..) |needed, ci| {
-        if (!needed or ci >= in.rg.columns.items.len) continue;
-        // The first pass already validated and evaluated filter-only columns. Keep only the values the consumer
-        // reads; a column shared by the filter and an aggregate still needs its value lane here.
-        if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
-        var options = decode_options;
-        options.any_dictionary = target.codedKey(ci);
-        options.decimal_exact_only = target.exactInputs();
-        if (payload) |p| if (p[ci]) {
-            options.row_gate = &survivors;
-        };
-        var r = try SliceReader.initPooled(pages.allocator(), side, in.rg, in.meta, in.src, ci, options, pool) orelse
-            return null;
-        if (levels_only[ci]) r.levelsOnly();
-        if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
-            r.retainPayloads(owner);
-            r.raw.bytes.pages.prof = ws.timings.prof;
-        };
-        lookup[ci] = readers.items.len;
-        try readers.append(pages.allocator(), r);
-    }
+    try openSlicedPayload(
+        pages.allocator(),
+        side,
+        in,
+        decode_options,
+        target,
+        pool,
+        &readers,
+        lookup,
+        levels_only,
+        payload,
+        if (payload != null) &survivors else null,
+        ws,
+    ) orelse return null;
     const per_row = @max(1, full / num_rows);
     // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
     // answer, only how many rows decode at once.
@@ -4671,9 +4729,13 @@ fn scanRGSlicedOnce(
     defer _ = slice.reset(.retain_capacity);
     var took: ?usize = null;
     var matched: u64 = 0;
+    var slice_retried = false;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
-        defer done += n;
+        var advance = true;
+        defer if (advance) {
+            done += n;
+        };
         if (on_region) ws.rg_arena.nextRowGroup() else _ = slice.reset(.retain_capacity);
         defer if (ws.ledger) |l| {
             const kept = if (on_region) ws.region.?.end else slice.queryCapacity();
@@ -4681,14 +4743,38 @@ fn scanRGSlicedOnce(
             rows_now = sliceRows(@min(@min(reserved, l.sliceAvailable() / 2 + kept) / took.?, forced), num_rows);
         };
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
-        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
-        for (readers.items, cols) |*r, *c| c.* = r.next(sa, n) catch |err| {
-            // A record slice may read pages that the ordinary indexed plan skips. Replay establishes its error.
-            if (in.filter != null and target == .grouped and target.grouped.records != null and isDecodeError(err))
-                return error.RetainedEncodingUnsupported;
-            return err;
+        const cols = sa.alloc(filter_eval.Batch.Column, readers.items.len) catch |err| {
+            if (err != error.OutOfMemory or slice_retried) return err;
+            advance = false;
+            slice_retried = true;
+            try recoverSlicedReaders(
+                pages.allocator(), side, in, decode_options, target, pool, &readers, lookup, levels_only,
+                payload, if (payload != null) &survivors else null, ws, done,
+            ) orelse return null;
+            continue;
         };
-        // The page scratch is in use from here. A later failure must not scan this row group again.
+        var refused = false;
+        for (readers.items, cols) |*r, *c| {
+            c.* = r.next(sa, n) catch |err| {
+                // A record slice may read pages that the ordinary indexed plan skips. Replay establishes its error.
+                if (in.filter != null and target == .grouped and target.grouped.records != null and isDecodeError(err))
+                    return error.RetainedEncodingUnsupported;
+                if (err != error.OutOfMemory or slice_retried) return err;
+                refused = true;
+                break;
+            };
+        }
+        if (refused) {
+            advance = false;
+            slice_retried = true;
+            try recoverSlicedReaders(
+                pages.allocator(), side, in, decode_options, target, pool, &readers, lookup, levels_only,
+                payload, if (payload != null) &survivors else null, ws, done,
+            ) orelse return null;
+            continue;
+        }
+        slice_retried = false;
+        // Folded rows must not be scanned again. A later refusal retries this slice only.
         committed.* = true;
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
         var sel = if (payload != null)

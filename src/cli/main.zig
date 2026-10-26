@@ -552,6 +552,7 @@ fn runQuery(
             .inputs = inputs,
             .output = if (fmt == .parquet) engine_output orelse "-" else null,
             .typed_answer = fmt == .parquet,
+            .text_output = if (fmt != .parquet) .{ .format = fmt } else null,
             .filter = filter,
             .aggregate = aggregate orelse "",
             .parallelism = parallelism,
@@ -580,6 +581,10 @@ fn runQuery(
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet) (if (to_stdout) 1 else publication.fd) else null,
         .typed_answer = fmt == .parquet,
+        .text_output = if (fmt != .parquet) .{
+            .format = fmt,
+            .fd = if (to_stdout) 1 else publication.fd orelse return error.BadOutputUrl,
+        } else null,
         .quiet_diagnostics = machine_diagnostics,
         .empty_scalar = group_by == null and (limit == 0 or result_order.offset > 0),
         .filter = filter,
@@ -616,16 +621,9 @@ fn runQuery(
         defer result.deinit(gpa);
         const ar = result.aggregate;
         const answer = ar.output;
-        rows = if (answer.group_rows) |groups| groups.len else if (answer.typed) |t| t.rows else if (query_args.empty_scalar or answer.no_row) 0 else 1;
-        if (fmt != .parquet) {
-            output_started_ns = nowMonoNs();
-            const fd: local_fs.fd_t = if (to_stdout) 1 else publication.fd orelse return error.BadOutputUrl;
-            var w: StdoutWriter = .{ .fd = fd };
-            try engine.writeAggregateText(&w, answer, ar.text_kinds, ar.answer_types, rows, fmt);
-            try w.flush();
-            text_bytes_out = if (w.inner) |inner| inner.bytes_written else 0;
-        }
-        if (fmt == .parquet) output_started_ns = ar.timings.output_started_ns;
+        rows = if (query_args.empty_scalar) 0 else answer.rowCount();
+        output_started_ns = ar.timings.output_started_ns;
+        if (fmt != .parquet) text_bytes_out = ar.bytes_out;
         stats = .{ .aggregate = true, .rows_in = ar.rows_in, .rows_scanned = ar.rows_scanned, .rows_matched = ar.rows_matched, .bytes_in = ar.bytes_in, .bytes_out = if (fmt == .parquet) ar.bytes_out else text_bytes_out, .files_in = ar.files_in, .row_groups_in = ar.row_groups_in, .row_groups_pruned = ar.row_groups_pruned, .row_groups_full_match = ar.row_groups_full_match, .cols_stat_pruned = ar.cols_stat_pruned, .membership = ar.membership, .timings = ar.timings };
     } else if (fmt == .parquet and limit == null and result_order.offset == 0 and result_order.rows.len == 0) {
         const result = (try engine.runQuery(ctx, query_args)).write;

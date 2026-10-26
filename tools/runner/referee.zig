@@ -245,11 +245,17 @@ fn runFile(
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(arena);
         try argv.append(arena, pyarrow);
-        try argv.append(arena, prep.object.get("script").?.string);
-        for (names) |name| {
-            const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.parquet", .{ work, file_i, name });
-            try argv.append(arena, path);
-            try fixtures.put(name, path);
+        if (prep.object.get("recipe")) |recipe| {
+            const dir = try std.fmt.allocPrint(arena, "{s}/f{d}-recipe", .{ work, file_i });
+            try argv.appendSlice(arena, &.{ "tools/zpq-gen", recipe.string, "--out", dir });
+            for (names) |name| try fixtures.put(name, try std.fmt.allocPrint(arena, "{s}/{s}.parquet", .{ dir, name }));
+        } else {
+            try argv.append(arena, prep.object.get("script").?.string);
+            for (names) |name| {
+                const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.parquet", .{ work, file_i, name });
+                try argv.append(arena, path);
+                try fixtures.put(name, path);
+            }
         }
         const prepared = try capture(gpa, io, argv.items);
         defer gpa.free(prepared.stdout);
@@ -1217,9 +1223,12 @@ fn querySqlJson(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jo
     const inputs = try ownedInputs(gpa, ctx, pq.table_name);
     defer freeInputs(gpa, inputs);
     const mem = try memoryOf(case);
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
     var diag: zpq.core.diag.Diag = .{};
     var qargs: engine.QueryArgs = .{
         .inputs = inputs,
+        .text_output = .{ .format = .json, .sink = &text.writer },
         .aggregate = pq.aggregate_str,
         .filter = pq.filter_str,
         .group_by = pq.group_by_str,
@@ -1236,24 +1245,13 @@ fn querySqlJson(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jo
         qargs.max_memory_explicit = n;
     }
     var result = forcing.runQuery(ctx, qargs) catch |err| {
-        if (diag_len == 0) zpq.frontend.queryError(err, &diag);
-        return err;
+        const failure = if (err == error.WriteFailed) error.OutOfMemory else err;
+        if (diag_len == 0) zpq.frontend.queryError(failure, &diag);
+        return failure;
     };
     defer result.deinit(gpa);
-    const answer = switch (result) {
-        .aggregate => |*ar| ar,
-        .write => return error.NotAggregate,
-    };
-    const n: usize = if (answer.output.group_rows) |groups|
-        groups.len
-    else if (answer.output.no_row)
-        0
-    else
-        1;
-    var w: MemWriter = .{ .gpa = gpa };
-    errdefer w.deinit();
-    try engine.writeAggregateText(&w, answer.output, answer.text_kinds, answer.answer_types, n, .json);
-    return w.buf.toOwnedSlice(gpa);
+    if (result != .aggregate) return error.NotAggregate;
+    return text.toOwnedSlice();
 }
 
 fn querySqlOutput(gpa: std.mem.Allocator, ctx: engine.Context, sql: []const u8, jobs: usize, case: Case, output: []const u8) !void {

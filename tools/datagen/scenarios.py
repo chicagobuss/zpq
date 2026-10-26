@@ -7,6 +7,25 @@ import pyarrow.parquet as pq
 from .parquet import T_I32, field, rewrite_footer
 
 
+def group_stream(out_dir):
+    """High-cardinality nullable integer/short-byte keys for full record-stream sinks."""
+    import numpy as np
+    r = np.arange((1 << 20) + 16, dtype=np.int64)
+    g = (r * 730201) % ((1 << 19) + 7)
+    keys = np.array([f'k-{x},"' for x in g], dtype=object)
+    table = pa.table({
+        'ki': pa.array(g * (1 << 40) - (1 << 60), mask=g % 101 == 0),
+        'kb': pa.array(keys, mask=g % 101 == 0),
+        'v': pa.array(r % 1000 - 500, mask=g % 97 == 0),
+        'wide': pa.array(np.full(len(r), np.iinfo(np.int64).max, dtype=np.int64)),
+        'rid': pa.array(r),
+    })
+    path = out_dir / 'group_stream.parquet'
+    pq.write_table(table, path, row_group_size=65536, compression='snappy',
+                   use_dictionary=False, write_page_index=True, data_page_size=65536)
+    print(path)
+
+
 def packed_count(out_dir):
     """Indexed nullable dictionary tuples for packed composite COUNT."""
     import numpy as np

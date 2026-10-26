@@ -573,11 +573,10 @@ fn executeSql(
     var decimal: engine.DecimalColumns = .{ .gpa = allocator };
     defer decimal.deinit();
     if (qa.aggregate != null or qa.group_by != null) {
+        qa.text_output = .{ .format = .jsonl, .sink = &rows.writer };
         var result = try engine.runQuery(ctx, qa);
         defer result.deinit(allocator);
         const answer = result.aggregate.output;
-        const n: usize = if (answer.group_rows) |groups| groups.len else if (qa.empty_scalar or answer.no_row) 0 else 1;
-        try engine.writeAggregateText(&rows.writer, answer, result.aggregate.text_kinds, &.{}, n, .jsonl);
         for (result.aggregate.answer_types, 0..) |ty, ci| if (ty.decimal) {
             const name = if (answer.group_cols) |cols| cols[ci] else answer.aggs[ci].alias;
             try decimal.names.append(allocator, try allocator.dupe(u8, name));
@@ -852,6 +851,25 @@ fn runAggregate(
     var args = qa;
     args.diag = &diag;
 
+    var capped: Capped = .{ .parent = allocator, .cap = result_cap.memory() };
+    var aw: std.Io.Writer.Allocating = .init(capped.allocator());
+    defer aw.deinit();
+    const Envelope = struct {
+        writer: *std.Io.Writer,
+        started: i64,
+        pool: *PersistentPool,
+        failure: ?anyerror = null,
+        fn write(ctx: *anyopaque, ar: engine.AggResult) !void {
+            const e: *@This() = @ptrCast(@alignCast(ctx));
+            const total_ms = @divTrunc(nowMonoNs() - e.started, std.time.ns_per_ms);
+            aggregateResponse(e.writer, ar, total_ms, e.pool) catch |err| {
+                e.failure = err;
+                return err;
+            };
+        }
+    };
+    var envelope: Envelope = .{ .writer = &aw.writer, .started = t_start, .pool = pool };
+    args.aggregate_sink = .{ .ctx = &envelope, .write_fn = Envelope.write };
     if (pool.per_call_stats) pool.resetStats();
     var result = engine.runQuery(.{
         .gpa = allocator,
@@ -860,15 +878,18 @@ fn runAggregate(
         .pool_registry = &registry,
         .meta_cache = pool.metaCache(),
         .worker_io = pool.worker_io,
-    }, args) catch |err| return engineError(allocator, err, &diag);
+    }, args) catch |err| {
+        if (capped.hit) return resultTooLarge(allocator, result_cap);
+        if (envelope.failure) |failure| return failure;
+        return engineError(allocator, err, &diag);
+    };
     defer result.deinit(allocator);
-    const ar = result.aggregate;
-    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
-
-    var capped: Capped = .{ .parent = allocator, .cap = result_cap.memory() };
-    var aw: std.Io.Writer.Allocating = .init(capped.allocator());
-    defer aw.deinit();
-    aggregateResponse(&aw.writer, ar, total_ms, pool) catch |err| {
+    if (args.output != null) aggregateResponse(
+        &aw.writer,
+        result.aggregate,
+        @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms),
+        pool,
+    ) catch |err| {
         if (capped.hit) return resultTooLarge(allocator, result_cap);
         return err;
     };
@@ -900,24 +921,13 @@ fn writeDecimalList(w: *std.Io.Writer, names: []const []const u8) !void {
 
 /// `runAggregate`'s response for `ar`, onto `w`.
 fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool) !void {
-    if (ar.output.group_rows) |rows| {
-        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
+    if (ar.output.group_cols != null) {
+        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":", .{
             ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,
             ar.row_groups_in, ar.row_groups_pruned, ar.row_groups_full_match, ar.cols_stat_pruned,
             ar.bytes_in,
         });
-        for (rows, 0..) |row_vals, row_idx| {
-            if (row_idx > 0) try w.writeByte(',');
-            try w.writeByte('{');
-            for (ar.output.group_cols.?, 0..) |col_name, col_idx| {
-                if (col_idx > 0) try w.writeByte(',');
-                try engine.writeJsonQuoted(w, col_name);
-                try w.writeByte(':');
-                try engine.writeTypedAggValueJson(w, row_vals[col_idx], engine.kindAt(ar.text_kinds, col_idx));
-            }
-            try w.writeByte('}');
-        }
-        try w.writeByte(']');
+        try engine.writeAggregateJsonValue(w, ar.output, ar.text_kinds, ar.output.rowCount());
     } else {
         try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
             ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,

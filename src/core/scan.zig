@@ -238,6 +238,8 @@ pub const MultiAggArgs = struct {
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
     /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
     typed_answer: bool = false,
+    /// A synchronous text consumer can drain full owners without narrowing their exact SUMs to Parquet lanes.
+    record_answer: bool = false,
     /// Exact inline records for integer COUNT/SUM answers, SUM/DISTINCT cuts, and scalar distinct, when prepaid.
     integer_records: bool = true,
     /// Tests lower the cost threshold; ordinary execution keeps small answers on the established path.
@@ -385,6 +387,14 @@ pub const AggOutput = struct {
     typed: ?TypedAnswer = null,
     integer_stream: ?IntegerStream = null,
     byte_stream: ?ByteStream = null,
+
+    pub fn rowCount(self: AggOutput) usize {
+        if (self.group_rows) |rows| return rows.len;
+        if (self.typed) |answer| return answer.rows;
+        if (self.integer_stream) |stream| return stream.state.group_count;
+        if (self.byte_stream) |stream| return stream.state.group_count;
+        return if (self.no_row or self.aggs.len == 0) 0 else 1;
+    }
 
     pub fn deinit(self: *AggOutput, gpa: std.mem.Allocator) void {
         for (self.aggs) |item| {
@@ -6016,7 +6026,7 @@ fn inlineByteAnswer(
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const order = args.result_order;
-    if (!args.byte_records or !allRescannable(args.inputs) or !args.typed_answer or
+    if (!args.byte_records or !allRescannable(args.inputs) or !(args.typed_answer or args.record_answer) or
         args.filter != null or
         order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
         order.hidden.len != 0 or calls.len != 2) return null;
@@ -6073,6 +6083,7 @@ fn inlineByteAnswer(
     if (!try byteSampleMayFit(gpa, args, metas, work, key.col_idx)) return null;
     const state = (try owner_groups.Full.State.init(gpa, args.ledger, rows, n_workers, key.col_idx, value.?, {}, owner_groups.full_parts, 0)) orelse
         return null;
+    state.wide_sums = args.record_answer and !args.typed_answer;
     errdefer state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
@@ -6528,7 +6539,7 @@ fn inlineIntegerAnswer(
     const full = order.keys.len == 0 and order.limit == null and order.offset == 0;
     var cut: ?owner_groups.Cut = null;
     if (full) {
-        if (!args.typed_answer or calls.len != 2) return null;
+        if (!(args.typed_answer or args.record_answer) or calls.len != 2) return null;
     } else {
         const limit = order.limit orelse return null;
         if (limit == 0 or calls.len != 1 or order.keys.len != 1) return null;
@@ -6870,6 +6881,7 @@ fn runIntegerOwner(
             parts,
             names_credit,
         )) orelse return null;
+    if (kind == .full) state.wide_sums = args.record_answer and !args.typed_answer;
     var state_live = true;
     errdefer if (state_live) state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
@@ -14870,72 +14882,78 @@ test "inline records decline released remote windows and retry only through a re
         .{ .source = .{ .agg = 1 }, .name = "s" },
     };
     const names_credit = outputNamesBytes(&integer_outputs);
-    for ([_]usize{ 0, 4, 8 }) |requested| for ([_]bool{ false, true }) |mapped| for (0..3) |shape| {
-        const bytes_key = shape != 0;
-        const parallel_retry = requested == 4;
-        var budget: core_memory.SharedBudget = .{ .limit = 512 << 20 };
-        // The established answer retains its small materialization charge until the query ledger dies.
-        defer std.debug.assert(budget.used.load(.monotonic) < 1 << 20);
-        const buffer = try a.dupe(u8, captured.bytes.items);
-        var window: Window = .{
-            .bytes = buffer,
-            .meta = &meta,
-            .budget = &budget,
-            .refuse_at = owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, names_credit),
-            .force_decode = !bytes_key,
+    for ([_]usize{ 0, 4, 8 }) |requested| for ([_]bool{ false, true }) |mapped| for (0..3) |shape|
+        for ([_]bool{ false, true }) |text| {
+            const bytes_key = shape != 0;
+            const parallel_retry = requested == 4;
+            var budget: core_memory.SharedBudget = .{ .limit = 512 << 20 };
+            // The established answer retains its small materialization charge until the query ledger dies.
+            defer std.debug.assert(budget.used.load(.monotonic) < 1 << 20);
+            const buffer = try a.dupe(u8, captured.bytes.items);
+            var window: Window = .{
+                .bytes = buffer,
+                .meta = &meta,
+                .budget = &budget,
+                .refuse_at = owner_groups.IntFull.State.reservation(n, 1, owner_groups.full_parts, 0, names_credit),
+                .force_decode = !bytes_key,
+            };
+            const in = [_]Input{.{
+                .name = if (mapped) "window.parquet" else "s3://bucket/window.parquet",
+                .bytes = buffer,
+                .gate = .{ .ctx = &window, .wait = Window.wait, .done = Window.release },
+                .plan_bytes = if (mapped) captured.bytes.items else null,
+            }};
+            const args: MultiAggArgs = .{
+                .inputs = &in,
+                .metas = &.{meta},
+                .aggregate = if (shape == 2) "sum(n) AS s" else "count(*) AS c,sum(n) AS s",
+                .group_by = if (bytes_key) "k" else "n",
+                .result_order = if (shape == 2)
+                    .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2 }
+                else
+                    .{},
+                .parallelism = if (mapped and !bytes_key) requested else 1,
+                .typed_answer = shape != 2 and !text,
+                .record_answer = text,
+                .integer_records_min_rows = 0,
+                .byte_records = true,
+                .byte_records_min_rows = 0,
+                .max_memory = budget.limit,
+                .ledger = &budget,
+                .min_bytes_per_worker = if (parallel_retry) 1 else std.math.maxInt(usize),
+            };
+            if (shape == 2) {
+                const path = (try explainAggregate(gpa, a, args)).record_path;
+                if (mapped)
+                    try testing.expectEqual(.byte_sum_top_h, path.?.layout)
+                else
+                    try testing.expect(path == null);
+            }
+            var got = try runMultiAggregate(gpa, a, args);
+            defer got.deinit(gpa);
+            try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.waits);
+            try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.done);
+            try testing.expect(got.output.byte_stream == null);
+            if (mapped and !bytes_key and parallel_retry) {
+                // The injected parallel decode refusal must keep the inline layout for its deterministic serial retry.
+                const stream = got.output.integer_stream.?;
+                try testing.expectEqual(@as(usize, 1), stream.state.locals.len);
+                try testing.expectEqual(@as(usize, 1), stream.state.group_count);
+            } else if (shape == 2) {
+                try got.output.applyResultOrder(gpa, args.result_order);
+                const rows = got.output.group_rows.?;
+                try testing.expectEqual(@as(usize, 2), rows.len);
+                try testing.expectEqualStrings("a", rows[0][0].s);
+                try testing.expectEqual(@as(i128, n - 1), rows[0][1].i);
+                try testing.expectEqualStrings(strings[n - 1], rows[1][0].s);
+                try testing.expectEqual(@as(i128, 1), rows[1][1].i);
+            } else {
+                try testing.expect(got.output.integer_stream == null);
+                try testing.expectEqual(@as(usize, if (bytes_key) 2 else 1), got.output.rowCount());
+                if (text) try testing.expect(got.output.group_rows != null);
+            }
+            try testing.expectEqual(mapped and !bytes_key, window.refused);
         };
-        const in = [_]Input{.{
-            .name = if (mapped) "window.parquet" else "s3://bucket/window.parquet",
-            .bytes = buffer,
-            .gate = .{ .ctx = &window, .wait = Window.wait, .done = Window.release },
-            .plan_bytes = if (mapped) captured.bytes.items else null,
-        }};
-        const args: MultiAggArgs = .{
-            .inputs = &in,
-            .metas = &.{meta},
-            .aggregate = if (shape == 2) "sum(n) AS s" else "count(*) AS c,sum(n) AS s",
-            .group_by = if (bytes_key) "k" else "n",
-            .result_order = if (shape == 2)
-                .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 2 }
-            else
-                .{},
-            .parallelism = if (mapped and !bytes_key) requested else 1,
-            .typed_answer = shape != 2,
-            .integer_records_min_rows = 0,
-            .byte_records = true,
-            .byte_records_min_rows = 0,
-            .max_memory = budget.limit,
-            .ledger = &budget,
-            .min_bytes_per_worker = if (parallel_retry) 1 else std.math.maxInt(usize),
-        };
-        if (shape == 2) {
-            const path = (try explainAggregate(gpa, a, args)).record_path;
-            if (mapped) try testing.expectEqual(.byte_sum_top_h, path.?.layout) else try testing.expect(path == null);
-        }
-        var got = try runMultiAggregate(gpa, a, args);
-        defer got.deinit(gpa);
-        try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.waits);
-        try testing.expectEqualSlices(usize, &.{ 1, 1 }, &window.done);
-        try testing.expect(got.output.byte_stream == null);
-        if (mapped and !bytes_key and parallel_retry) {
-            // The injected parallel decode refusal must keep the inline layout for its deterministic serial retry.
-            const stream = got.output.integer_stream.?;
-            try testing.expectEqual(@as(usize, 1), stream.state.locals.len);
-            try testing.expectEqual(@as(usize, 1), stream.state.group_count);
-        } else if (shape == 2) {
-            try got.output.applyResultOrder(gpa, args.result_order);
-            const rows = got.output.group_rows.?;
-            try testing.expectEqual(@as(usize, 2), rows.len);
-            try testing.expectEqualStrings("a", rows[0][0].s);
-            try testing.expectEqual(@as(i128, n - 1), rows[0][1].i);
-            try testing.expectEqualStrings(strings[n - 1], rows[1][0].s);
-            try testing.expectEqual(@as(i128, 1), rows[1][1].i);
-        } else {
-            try testing.expect(got.output.integer_stream == null);
-            try testing.expectEqual(@as(usize, if (bytes_key) 2 else 1), got.output.typed.?.rows);
-        }
-        try testing.expectEqual(mapped and !bytes_key, window.refused);
-    };
     for ([_]bool{ false, true }) |bytes_key| {
         const inputs = [_]Input{.{ .name = "mapped.parquet", .bytes = captured.bytes.items }};
         const args: MultiAggArgs = .{

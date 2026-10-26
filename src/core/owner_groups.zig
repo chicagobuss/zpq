@@ -407,6 +407,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             gpa: std.mem.Allocator,
             ledger: ?*memory.SharedBudget,
             charged: usize,
+            /// Text preserves exact i128 SUMs; Parquet retains its checked physical INT64 lane.
+            wide_sums: bool = false,
             output_credit: usize = 0,
             rows: usize,
             key_col: usize,
@@ -710,7 +712,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         }
                     }
                     for (s.groups[lo..][0..n], lo..) |g, i| {
-                        if (g.sumValue() != null and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
+                        if (!s.wide_sums and g.sumValue() != null and std.math.cast(i64, g.sum) == null)
+                            return error.AggIntTooWide;
                         s.winners[g.ordinal()] = @intCast(i + 1);
                     }
                     s.counts[p] = n;
@@ -918,7 +921,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 }
                 for (s.winners) |winner| if (winner != 0) {
                     const g = s.groups[winner - 1];
-                    if (g.sumValue() != null and std.math.cast(i64, g.sum) == null) return error.AggIntTooWide;
+                    if (!s.wide_sums and g.sumValue() != null and std.math.cast(i64, g.sum) == null)
+                        return error.AggIntTooWide;
                 };
                 s.bitmap = try s.gpa.alloc(u64, (s.rows + 63) / 64);
                 s.prefix = try s.gpa.alloc(u32, s.bitmap.len + 1);
@@ -1013,34 +1017,46 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 return s.heaps[0].items;
             }
 
-            /// The full answer's groups `lo..hi` in first-appearance order, as indexes into `groups`.
-            pub fn window(s: *const State, a: std.mem.Allocator, lo: usize, hi: usize) ![]u32 {
-                std.debug.assert(lo <= hi and hi <= s.group_count);
-                const ids = try a.alloc(u32, hi - lo);
-                if (ids.len == 0) return ids;
+            /// Traverses the same ordinal bitmap for text and bounded Parquet windows.
+            pub const Cursor = struct {
+                state: *const State,
+                word: usize,
+                bits: u64 = 0,
+
+                pub fn next(it: *Cursor) ?u32 {
+                    while (it.word < it.state.bitmap.len) {
+                        if (it.bits != 0) {
+                            const bit = @ctz(it.bits);
+                            it.bits &= it.bits - 1;
+                            return it.state.winners[it.word * 64 + bit] - 1;
+                        }
+                        it.word += 1;
+                        if (it.word < it.state.bitmap.len) it.bits = it.state.bitmap[it.word];
+                    }
+                    return null;
+                }
+            };
+
+            pub fn orderedCursor(s: *const State, lo: usize) Cursor {
+                std.debug.assert(lo <= s.group_count);
+                if (lo == s.group_count) return .{ .state = s, .word = s.bitmap.len };
                 var left: usize = 0;
                 var right = s.bitmap.len;
                 while (left < right) {
                     const mid = left + (right - left) / 2;
                     if (s.prefix[mid + 1] <= lo) left = mid + 1 else right = mid;
                 }
-                var wi = left;
-                var skip = lo - s.prefix[wi];
-                var n: usize = 0;
-                while (n < ids.len) : (wi += 1) {
-                    var bits = s.bitmap[wi];
-                    while (bits != 0) {
-                        const bit = @ctz(bits);
-                        bits &= bits - 1;
-                        if (skip != 0) {
-                            skip -= 1;
-                            continue;
-                        }
-                        ids[n] = s.winners[wi * 64 + bit] - 1;
-                        n += 1;
-                        if (n == ids.len) break;
-                    }
-                }
+                var bits = s.bitmap[left];
+                for (0..lo - s.prefix[left]) |_| bits &= bits - 1;
+                return .{ .state = s, .word = left, .bits = bits };
+            }
+
+            /// The full answer's groups `lo..hi` in first-appearance order, as indexes into `groups`.
+            pub fn window(s: *const State, a: std.mem.Allocator, lo: usize, hi: usize) ![]u32 {
+                std.debug.assert(lo <= hi and hi <= s.group_count);
+                const ids = try a.alloc(u32, hi - lo);
+                var it = s.orderedCursor(lo);
+                for (ids) |*id| id.* = it.next().?;
                 return ids;
             }
         };

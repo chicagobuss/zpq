@@ -271,6 +271,13 @@ pub const QueryArgs = struct {
     /// CLI-only: the answer is only written to Parquet, so a GROUP BY may build it as typed columns
     /// (`scan.MultiAggArgs.typed_answer`), never read back as rows.
     typed_answer: bool = false,
+    /// Consumed synchronously while query inputs, bound output types and the ledger are alive.
+    text_output: ?struct { format: PrintFormat, fd: local_fs.fd_t = 1, sink: ?*std.Io.Writer = null } = null,
+    /// Envelope consumers also drain inside the query lifetime; the borrowed answer must not escape the callback.
+    aggregate_sink: ?struct {
+        ctx: *anyopaque,
+        write_fn: *const fn (*anyopaque, AggResult) anyerror!void,
+    } = null,
     empty_scalar: bool = false,
     quiet_diagnostics: bool = false,
     filter: ?[]const u8 = null,
@@ -698,6 +705,7 @@ fn executeAggregateOver(
         .select_cols = args.select_cols,
         .result_order = cut_args.result_order,
         .typed_answer = args.typed_answer and args.output != null,
+        .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
         .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
         .msd_cache_rows = if (ctx.env.getPosix("ZPQ_MSD_CACHE_ROWS")) |v|
@@ -889,25 +897,25 @@ fn executeAggregateOver(
             try writeGroupedParquet(arena, out_path, names.?, st.group_col_types.?, rows, codec, zstd, encode, fd)
         else
             try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, args.output_fd, args.empty_scalar or r.output.no_row);
-        if (r.output.integer_stream) |stream| {
-            const rows = stream.state.group_count;
-            stream.state.deinit();
-            r.output.integer_stream = null;
-            r.output.typed = .{ .rows = rows, .columns = &.{} };
-        }
-        if (r.output.byte_stream) |stream| {
-            const rows = stream.state.group_count;
-            stream.state.deinit();
-            r.output.byte_stream = null;
-            r.output.typed = .{ .rows = rows, .columns = &.{} };
-        }
+        releaseStreamAnswer(&r.output);
         const t_footer_end = nowMonoNs();
         t.footer_ns += @intCast(t_footer_end - t_footer);
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
     }
 
+    // Text used to print only after runQuery returned: preserve its input/error check before the first byte.
     try opened.intact();
-    return .{
+    if (args.output == null) if (args.text_output) |text| {
+        t.output_started_ns = nowMonoNs();
+        var writer: StdoutWriter = .{ .fd = text.fd, .sink = text.sink };
+        const rows = if (args.empty_scalar) 0 else r.output.rowCount();
+        try writeAggregateText(&writer, r.output, text_kinds, answer_types, rows, text.format);
+        try writer.flush();
+        bytes_out = writer.bytes_written;
+        // Both stream states hold the query's ledger, and their bound outputs borrow this arena.
+        releaseStreamAnswer(&r.output);
+    };
+    var answer: AggResult = .{
         .files_in = r.files_in,
         .rows_in = r.rows_in,
         .rows_scanned = r.rows_scanned,
@@ -924,12 +932,33 @@ fn executeAggregateOver(
         .text_kinds = text_kinds,
         .answer_types = answer_types,
     };
+    if (args.output == null) if (args.aggregate_sink) |sink| {
+        std.debug.assert(args.text_output == null);
+        try sink.write_fn(sink.ctx, answer);
+        releaseStreamAnswer(&answer.output);
+    };
+    return answer;
+}
+
+fn releaseStreamAnswer(answer: *scan.AggOutput) void {
+    if (answer.integer_stream) |stream| {
+        const rows = stream.state.group_count;
+        stream.state.deinit();
+        answer.integer_stream = null;
+        answer.typed = .{ .rows = rows, .columns = &.{} };
+    }
+    if (answer.byte_stream) |stream| {
+        const rows = stream.state.group_count;
+        stream.state.deinit();
+        answer.byte_stream = null;
+        answer.typed = .{ .rows = rows, .columns = &.{} };
+    }
 }
 
 /// The `AnswerType` of each answer column: a DATE/TIME/TIMESTAMP from the column its values pass through, and
 /// whether it is an avg_state pair.
 fn answerTypes(gpa: std.mem.Allocator, out: scan.AggOutput, state: scan.ScanState) ![]AnswerType {
-    if (out.typed != null or out.integer_stream != null or out.byte_stream != null) return &.{};
+    if (out.typed != null) return &.{};
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
     const types = try gpa.alloc(AnswerType, n);
     for (types, 0..) |*ty, ci| {
@@ -963,7 +992,7 @@ fn answerTextKinds(
     check: bool,
     diag: ?*Diag,
 ) ![]TextKind {
-    if (out.typed != null or out.integer_stream != null or out.byte_stream != null) return &.{};
+    if (out.typed != null) return &.{};
     const grouped = out.group_cols != null;
     const n = if (out.group_cols) |cols| cols.len else out.aggs.len;
     const kinds = try gpa.alloc(TextKind, n);
@@ -977,6 +1006,9 @@ fn answerTextKinds(
         const name = if (source) |src| src.name else if (out.group_cols) |cols| cols[ci] else out.aggs[ci].alias;
         if (out.group_rows) |rows| {
             for (rows) |row| try checkUtf8(row[ci], name, diag);
+        } else if (out.byte_stream) |stream| {
+            var it = stream.state.orderedCursor(0);
+            while (it.next()) |id| try checkUtf8(ownerTextValue(stream, id, stream.outputs[ci]), name, diag);
         } else if (!grouped) try checkUtf8(out.aggs[ci].value, name, diag);
     }
     return kinds;
@@ -6163,7 +6195,7 @@ fn createFile(path: []const u8) !local_fs.fd_t {
 
 pub const PrintFormat = enum { csv, jsonl, json, parquet };
 
-/// Shared text serialization keeps SQL ABI responses byte-identical to CLI rows.
+/// Shared row framing and value formatting for materialized and owner answers, on every text target.
 pub fn writeAggregateText(
     writer: anytype,
     answer: scan.AggOutput,
@@ -6172,70 +6204,271 @@ pub fn writeAggregateText(
     rows: usize,
     format: PrintFormat,
 ) !void {
-    if (format == .csv) return writeAggregateCsv(writer, answer, kinds, types, rows);
-    if (format == .json) try writer.writeByte('[');
-    if (answer.group_rows) |groups| {
-        for (groups, 0..) |values, ri| {
-            if (format == .json and ri > 0) try writer.writeByte(',');
-            try writer.writeByte('{');
-            for (answer.group_cols.?, values, 0..) |name, value, ci| {
-                if (ci > 0) try writer.writeByte(',');
-                try writer.writeByte('"');
-                try writeJsonString(writer, name);
-                try writer.writeAll("\":");
-                try writeTypedAggValueJson(writer, value, kindAt(kinds, ci));
-            }
-            try writer.writeAll(if (format == .json) "}" else "}\n");
-        }
-    } else if (rows > 0) {
-        try writer.writeByte('{');
-        for (answer.aggs, 0..) |item, ci| {
-            if (ci > 0) try writer.writeByte(',');
-            try writer.writeByte('"');
-            try writeJsonString(writer, item.alias);
-            try writer.writeAll("\":");
-            try writeTypedAggValueJson(writer, item.value, kindAt(kinds, ci));
-        }
-        try writer.writeAll(if (format == .json) "}" else "}\n");
-    }
-    if (format == .json) try writer.writeAll("]\n");
+    return writeAggregateTextValue(writer, answer, kinds, types, rows, format, true);
 }
 
-/// The answer as CSV: a header row, then its rows (none past `rows`, as the JSON forms). An avg_state is two cells,
-/// `<name>__sum` and `<name>__count`, as `-o` writes it; every other value prints as its column's rows do.
-fn writeAggregateCsv(
+/// A grouped JSON array inside a service envelope, without changing its wire whitespace.
+pub fn writeAggregateJsonValue(
+    writer: anytype,
+    answer: scan.AggOutput,
+    kinds: []const TextKind,
+    rows: usize,
+) !void {
+    return writeAggregateTextValue(writer, answer, kinds, &.{}, rows, .json, false);
+}
+
+fn writeAggregateTextValue(
     writer: anytype,
     answer: scan.AggOutput,
     kinds: []const TextKind,
     types: []const AnswerType,
     rows: usize,
+    format: PrintFormat,
+    trailing_newline: bool,
 ) !void {
-    const n = if (answer.group_cols) |cols| cols.len else answer.aggs.len;
-    for (0..n) |ci| {
-        if (ci > 0) try writer.writeByte(',');
-        const name = if (answer.group_cols) |cols| cols[ci] else answer.aggs[ci].alias;
-        if (typeAt(types, ci).avg) {
-            try writeCsvParts(writer, &.{ name, "__sum" });
-            try writer.writeByte(',');
-            try writeCsvParts(writer, &.{ name, "__count" });
-        } else try writeCsvString(writer, name);
-    }
-    try writer.writeByte('\n');
+    var emit = AggregateTextEmitter(@TypeOf(writer)){
+        .writer = writer,
+        .kinds = kinds,
+        .types = types,
+        .format = format,
+        .trailing_newline = trailing_newline,
+    };
+    try emit.start(answer);
     if (answer.group_rows) |groups| {
         for (groups) |values| {
-            for (values, 0..) |value, ci| {
-                if (ci > 0) try writer.writeByte(',');
-                try writeAggValueCsv(writer, value, kindAt(kinds, ci), typeAt(types, ci));
-            }
-            try writer.writeByte('\n');
+            try emit.beginRow();
+            for (answer.group_cols.?, values, 0..) |name, value, ci| try emit.field(name, value, ci);
+            try emit.endRow();
         }
+    } else if (answer.integer_stream) |stream| {
+        try emitOwnerText(&emit, answer.group_cols.?, stream);
+    } else if (answer.byte_stream) |stream| {
+        try emitOwnerText(&emit, answer.group_cols.?, stream);
     } else if (rows > 0) {
-        for (answer.aggs, 0..) |item, ci| {
-            if (ci > 0) try writer.writeByte(',');
-            try writeAggValueCsv(writer, item.value, kindAt(kinds, ci), typeAt(types, ci));
-        }
-        try writer.writeByte('\n');
+        try emit.beginRow();
+        for (answer.aggs, 0..) |item, ci| try emit.field(item.alias, item.value, ci);
+        try emit.endRow();
     }
+    try emit.finish();
+}
+
+fn AggregateTextEmitter(comptime Writer: type) type {
+    return struct {
+        writer: Writer,
+        kinds: []const TextKind,
+        types: []const AnswerType,
+        format: PrintFormat,
+        emitted: usize = 0,
+        trailing_newline: bool,
+
+        fn start(e: *@This(), answer: scan.AggOutput) !void {
+            if (e.format == .json) try e.writer.writeByte('[');
+            if (e.format != .csv) return;
+            const n = if (answer.group_cols) |cols| cols.len else answer.aggs.len;
+            for (0..n) |ci| {
+                if (ci > 0) try e.writer.writeByte(',');
+                const name = if (answer.group_cols) |cols| cols[ci] else answer.aggs[ci].alias;
+                if (typeAt(e.types, ci).avg) {
+                    try writeCsvParts(e.writer, &.{ name, "__sum" });
+                    try e.writer.writeByte(',');
+                    try writeCsvParts(e.writer, &.{ name, "__count" });
+                } else try writeCsvString(e.writer, name);
+            }
+            try e.writer.writeByte('\n');
+        }
+
+        fn beginRow(e: *@This()) !void {
+            if (e.format == .csv) return;
+            if (e.format == .json and e.emitted > 0) try e.writer.writeByte(',');
+            try e.writer.writeByte('{');
+        }
+
+        fn field(e: *@This(), name: []const u8, value: scan.AggValue, ci: usize) !void {
+            if (ci > 0) try e.writer.writeByte(',');
+            if (e.format == .csv) return writeAggValueCsv(e.writer, value, kindAt(e.kinds, ci), typeAt(e.types, ci));
+            try e.writer.writeByte('"');
+            try writeJsonString(e.writer, name);
+            try e.writer.writeAll("\":");
+            try writeTypedAggValueJson(e.writer, value, kindAt(e.kinds, ci));
+        }
+
+        fn endRow(e: *@This()) !void {
+            try e.writer.writeAll(switch (e.format) {
+                .csv => "\n",
+                .json => "}",
+                else => "}\n",
+            });
+            e.emitted += 1;
+        }
+
+        fn finish(e: *@This()) !void {
+            if (e.format == .json) try e.writer.writeAll(if (e.trailing_newline) "]\n" else "]");
+        }
+    };
+}
+
+fn ownerTextValue(stream: anytype, id: u32, out: anytype) scan.AggValue {
+    const group = &stream.state.groups[id];
+    return switch (out.source) {
+        .key => if (@TypeOf(stream) == scan.IntegerStream)
+            (if (group.keyValue()) |v| .{ .i = v } else .null_val)
+        else
+            (if (group.keyBytes()) |v| .{ .s = v } else .null_val),
+        .agg => |ai| if (ai == stream.count_call)
+            .{ .i = group.countValue() }
+        else if (group.sumValue()) |v| .{ .i = v } else .null_val,
+    };
+}
+
+fn emitOwnerText(emit: anytype, names: []const []const u8, stream: anytype) !void {
+    var it = stream.state.orderedCursor(0);
+    while (it.next()) |id| {
+        try emit.beginRow();
+        for (names, stream.outputs, 0..) |name, out, ci| try emit.field(name, ownerTextValue(stream, id, out), ci);
+        try emit.endRow();
+    }
+}
+
+test "owner text matches materialized rows for wide sums, NULLs and every text format" {
+    const owner = @import("core/owner_groups.zig");
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "s", "key", "c" };
+    const wide: i128 = @as(i128, std.math.maxInt(i64)) * 2;
+    inline for (.{ false, true }) |bytes_key| {
+        const O = if (bytes_key) owner.Full else owner.IntFull;
+        var budget: core_memory.SharedBudget = .{ .limit = 256 << 20 };
+        defer std.debug.assert(budget.used.load(.monotonic) == 0);
+        const state = (try O.State.init(a, &budget, 6, 2, 0, 1, {}, owner.full_parts, 0)).?;
+        var live = true;
+        defer if (live) state.deinit();
+        state.wide_sums = true;
+        for (0..6) |i| {
+            const k = i % 3;
+            const v: ?i64 = switch (i) {
+                0, 3 => std.math.maxInt(i64),
+                2 => 3,
+                4 => -4,
+                else => null,
+            };
+            if (bytes_key) {
+                try state.locals[i % 2].append(switch (k) {
+                    0 => "z",
+                    1 => null,
+                    else => "a,\n\"",
+                }, v, @intCast(i));
+            } else {
+                try state.locals[i % 2].append(
+                    if (k == 1) null else @as(?i64, if (k == 0) 17 else -5),
+                    v,
+                    @intCast(i),
+                );
+            }
+        }
+        try state.finish();
+        const Stream = if (bytes_key) scan.ByteStream else scan.IntegerStream;
+        const stream: Stream = .{
+            .state = state,
+            .count_call = 0,
+            .outputs = &.{
+                .{ .source = .{ .agg = 1 }, .name = names[0] },
+                .{ .source = .{ .key = 0 }, .name = names[1] },
+                .{ .source = .{ .agg = 0 }, .name = names[2] },
+            },
+        };
+        const r0 = [_]scan.AggValue{ .{ .i = wide }, if (bytes_key) .{ .s = "z" } else .{ .i = 17 }, .{ .i = 2 } };
+        const r1 = [_]scan.AggValue{ .{ .i = -4 }, .null_val, .{ .i = 2 } };
+        const r2 = [_]scan.AggValue{ .{ .i = 3 }, if (bytes_key) .{ .s = "a,\n\"" } else .{ .i = -5 }, .{ .i = 2 } };
+        const rows = [_][]const scan.AggValue{ &r0, &r1, &r2 };
+        const kinds = [_]TextKind{ .bytes, .utf8, .bytes };
+        const answer: scan.AggOutput = if (bytes_key)
+            .{ .group_cols = &names, .byte_stream = stream }
+        else
+            .{ .group_cols = &names, .integer_stream = stream };
+        try std.testing.expectEqual(@as(usize, 3), answer.rowCount());
+        for ([_]PrintFormat{ .json, .jsonl, .csv }) |format| {
+            var expected: std.Io.Writer.Allocating = .init(a);
+            defer expected.deinit();
+            var got: std.Io.Writer.Allocating = .init(a);
+            defer got.deinit();
+            try writeAggregateText(
+                &expected.writer,
+                .{ .group_cols = &names, .group_rows = &rows },
+                &kinds,
+                &.{},
+                3,
+                format,
+            );
+            try writeAggregateText(&got.writer, answer, &kinds, &.{}, 3, format);
+            try std.testing.expectEqualStrings(expected.written(), got.written());
+        }
+        var envelope: std.Io.Writer.Allocating = .init(a);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"agg\":");
+        try writeAggregateJsonValue(&envelope.writer, answer, &kinds, 3);
+        try envelope.writer.writeByte('}');
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, envelope.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 3), parsed.value.object.get("agg").?.array.items.len);
+        try std.testing.expect(std.mem.endsWith(u8, envelope.written(), "]}"));
+        var tiny: [4]u8 = undefined;
+        var failing: std.Io.Writer = .fixed(&tiny);
+        try std.testing.expectError(error.WriteFailed, writeAggregateText(&failing, answer, &kinds, &.{}, 3, .json));
+        var cursor = state.orderedCursor(1);
+        const ids = try state.window(a, 1, 3);
+        defer a.free(ids);
+        for (ids) |id| try std.testing.expectEqual(id, cursor.next().?);
+        try std.testing.expect(cursor.next() == null);
+        var drained = answer;
+        releaseStreamAnswer(&drained);
+        live = false;
+        try std.testing.expect(drained.integer_stream == null and drained.byte_stream == null);
+        try std.testing.expectEqual(@as(usize, 3), drained.rowCount());
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+}
+
+test "owner text checks every UTF8 key before emission, including the last ordinal" {
+    const owner = @import("core/owner_groups.zig");
+    const a = std.testing.allocator;
+    const state = (try owner.Full.State.init(a, null, 3, 2, 0, 1, {}, owner.full_parts, 0)).?;
+    defer state.deinit();
+    for ([_][]const u8{ "first", "second", "last\xff" }, 0..) |key, i|
+        try state.locals[i % 2].append(key, 1, @intCast(i));
+    try state.finish();
+    const names = [_][]const u8{ "alias", "c", "s" };
+    const stream: scan.ByteStream = .{
+        .state = state,
+        .count_call = 0,
+        .outputs = &.{
+            .{ .source = .{ .key = 0 }, .name = names[0] },
+            .{ .source = .{ .agg = 0 }, .name = names[1] },
+            .{ .source = .{ .agg = 1 }, .name = names[2] },
+        },
+    };
+    const source: schema.SchemaElement = .{
+        .type = .BYTE_ARRAY,
+        .name = "original",
+        .converted_type = .UTF8,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const columns = [_]scan.GroupColType{
+        .{ .lane = .string, .nullable = true, .source = source },
+        .{ .lane = .i64, .nullable = false },
+        .{ .lane = .i64, .nullable = true },
+    };
+    const st: scan.ScanState = .{ .accumulators = &.{}, .agg_calls = &.{}, .group_col_types = &columns };
+    const answer: scan.AggOutput = .{ .group_cols = &names, .byte_stream = stream };
+    var diag: Diag = .{};
+    try std.testing.expectError(error.InvalidUtf8, answerTextKinds(a, answer, st, true, &diag));
+    try std.testing.expectEqualStrings("original", diag.column.get());
+    const kinds = try answerTextKinds(a, answer, st, false, null);
+    defer a.free(kinds);
+    try std.testing.expectEqual(TextKind.utf8, kinds[0]);
 }
 
 fn typeAt(types: []const AnswerType, ci: usize) AnswerType {

@@ -1,0 +1,88 @@
+{
+  "prepare": {
+    "recipe": "group_stream",
+    "fixtures": [
+      "group_stream"
+    ]
+  },
+  "jobs": [
+    1,
+    16
+  ],
+  "cases": [
+    {
+      "id": "group-stream:ki:v",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT sum(v) AS s,ki AS k,count(*) AS c FROM '{path}' GROUP BY ki",
+      "duck": "SELECT sum(v) AS s,ki AS k,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY min(rid)",
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:ki:v:parquet",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT sum(v) AS s,ki AS k,count(*) AS c FROM '{path}' GROUP BY ki",
+      "duck": "SELECT sum(v) AS s,ki AS k,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY min(rid)",
+      "parquet": true,
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:ki:wide",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT sum(wide) AS s,ki AS k,count(*) AS c FROM '{path}' GROUP BY ki",
+      "duck": "SELECT sum(wide) AS s,ki AS k,count(*) AS c FROM '{path}' GROUP BY ki ORDER BY min(rid)",
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:kb:v",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT sum(v) AS s,kb AS k,count(*) AS c FROM '{path}' GROUP BY kb",
+      "duck": "SELECT sum(v) AS s,kb AS k,count(*) AS c FROM '{path}' GROUP BY kb ORDER BY min(rid)",
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:kb:v:parquet",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT sum(v) AS s,kb AS k,count(*) AS c FROM '{path}' GROUP BY kb",
+      "duck": "SELECT sum(v) AS s,kb AS k,count(*) AS c FROM '{path}' GROUP BY kb ORDER BY min(rid)",
+      "parquet": true,
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:kb:wide",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT sum(wide) AS s,kb AS k,count(*) AS c FROM '{path}' GROUP BY kb",
+      "duck": "SELECT sum(wide) AS s,kb AS k,count(*) AS c FROM '{path}' GROUP BY kb ORDER BY min(rid)",
+      "keep_order": true
+    },
+    {
+      "id": "group-stream:filter",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT ki,count(*) AS c,sum(v) AS s FROM '{path}' WHERE v<0 GROUP BY ki",
+      "duck": "SELECT ki,count(*) AS c,sum(v) AS s FROM '{path}' WHERE v<0 GROUP BY ki",
+      "jobs": [
+        1,
+        16
+      ],
+      "keep_order": false
+    },
+    {
+      "id": "group-stream:order",
+      "kind": "product",
+      "fixture": "group_stream",
+      "sql": "SELECT ki,count(*) AS c,sum(v) AS s FROM '{path}' GROUP BY ki ORDER BY c DESC,ki LIMIT 9",
+      "duck": "SELECT ki,count(*) AS c,sum(v) AS s FROM '{path}' GROUP BY ki ORDER BY c DESC,ki LIMIT 9",
+      "jobs": [
+        1,
+        16
+      ],
+      "keep_order": true
+    }
+  ]
+}

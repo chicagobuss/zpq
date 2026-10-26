@@ -121,8 +121,7 @@ started an upload zpq never hears of. Give the output bucket a lifecycle rule wi
 
 ## Performance
 
-Numbers and trade-offs are dated and contextualised as they're captured in [`docs/measurements/`](docs/measurements/);
-the latest cold-start figures are in
+The latest cold-start figures, with their method, are in
 [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
 
 <!-- 0.5.0 release figures go here once the release benchmark run is reviewed. -->

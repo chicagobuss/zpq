@@ -8,7 +8,7 @@
 //! scan, output — lives here.
 //!
 //! The architecture comes from the comparables synthesis in
-//! `docs/measurements/comparables.md`: a per-file `scan.Input`
+//! Tracker `zpq/measurements/comparables.md`: a per-file `scan.Input`
 //! abstraction at the engine level (Polars' `DynByteSource`) and a
 //! storage-shaped helper underneath that materializes Inputs from any
 //! backend (`local` mmap, `s3` parallel range-fetch). Single-file vs

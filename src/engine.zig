@@ -2311,8 +2311,12 @@ const SliceReaders = struct {
 /// None of this shows in the output, whose row groups the assembler cuts from the rows alone.
 fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assembler) !void {
     const gpa = if (w.slicing_now) |m| m.allocator() else w.gpa;
-    // The ledger these slices draw from, or the query allowance when the pool is uncharged.
-    const allowance = if (w.slicing_now) |m| m.budget.limit else w.decode_options.expand_limit;
+    // The ledger these slices draw from. The writer's lean ledger is its own 32 MiB, so its carry is an eighth of
+    // that and not of the query ceiling: anything more would leave the slice no room to decode.
+    const allowance = if (w.slicing_now) |m| blk: {
+        if (w.lean != null and m == w.lean.?) break :blk core_memory.lean_decode;
+        break :blk m.budget.limit;
+    } else w.decode_options.expand_limit;
     defer if (w.slice_pool) |pool| pool.trimAbove(core_memory.retainedCarry(allowance));
     const rg = job.rg;
     const num_rows: usize = @intCast(@max(0, rg.num_rows));
@@ -2341,20 +2345,34 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
     try readers.init(w, gpa, job, 0);
     defer readers.deinit();
     var done: usize = 0;
-    // Per-slice working memory (the decoded slice and its selection), its pages kept from one to the next.
+    // Per-slice working memory (the decoded slice and its selection). The piece keeps the rows; this keeps the carry.
     var slice = std.heap.ArenaAllocator.init(gpa);
     defer slice.deinit();
     while (done < num_rows) {
-        if (ledger) |l| if (l.tight()) w.trimIdle();
+        // A sealed group keeps its pieces and its encode reservation until that encode finishes. The next slice
+        // on top of them is what fills an explicit budget, so drain first. Those rows already fit; this is not a retry.
+        if (ledger) |l| if (l.tight()) {
+            w.trimIdle();
+            try asm_.writeReady(true);
+        };
         const n = @min(slice_rows, num_rows - done);
-        _ = slice.reset(.retain_capacity);
+        // Keep at most the carry. The piece holds this slice's rows; retaining the slice's high water as well
+        // charged both, and the next wider page grew that node again.
+        _ = slice.reset(.{ .retain_with_limit = core_memory.retainedCarry(allowance) });
         const piece = try sliceToPiece(w, job, &readers, &slice, n, &timings);
         done += n;
         if (ledger) |l| {
-            const took = @max(1, (slice.queryCapacity() + piece.arena.queryCapacity()) / n);
+            // `per_row` is three times the footer estimate, which kept every slice at a handful of rows. A wide
+            // piece's arena then costs more than the row group it is filling, and the rows never get sealed.
+            const foot_row = @max(1, (est / 3) / @max(1, num_rows));
+            const took = @max(foot_row, (slice.queryCapacity() + piece.arena.queryCapacity()) / n);
             // Each piece owns column buffers and schema metadata. Shrinking the next batch below the initial 64
             // rows makes that fixed cost dominate, until an unfinished output row group can exhaust the ledger.
-            slice_rows = @min(num_rows, @max(64, @min(w.decode_share, l.available() / 2) / took));
+            // One slice stays within one output row group, never cheaper than the footer's per-row estimate, and
+            // at most doubles: a run of tiny values must not size the next slice for every remaining row.
+            const byte_cap = @min(w.decode_share, @as(usize, @intCast(w.rg_target.bytes)));
+            const grew = @min(num_rows, @max(64, @min(byte_cap, l.available() / 2) / took));
+            slice_rows = @min(grew, slice_rows *| 2);
         }
         try asm_.feed(piece);
     }

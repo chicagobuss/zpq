@@ -1114,8 +1114,10 @@ pub const SliceReader = struct {
             },
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => blk: {
                 const Reader = column_mod.ColumnChunkReader([]const u8);
-                // On `a` until the dictionary is in (`holdDictionary`), which then lives there without a copy.
-                var r = Reader.initWithOptions(chunk, cm.codec, levels, a, decode_options, null);
+                // A retained column keeps its dictionary on its own slot. The shared bookkeeping arena would
+                // grow a new node for every column's dictionary and keep the old ones.
+                const pages_alloc = if (slot) |s| s.pages.allocator() else a;
+                var r = Reader.initWithOptions(chunk, cm.codec, levels, pages_alloc, decode_options, null);
                 r.value_budget = @intCast(cm.num_values);
                 r.type_length = switch (cm.type) {
                     .FIXED_LEN_BYTE_ARRAY => flbaWidth(se),
@@ -1151,8 +1153,8 @@ pub const SliceReader = struct {
 
     pub fn deinit(self: *SliceReader) void {
         if (self.retained) {
-            // The next reader of this slot must not see this chunk's page bytes.
-            _ = self.pages.reset(.retain_capacity);
+            // The dictionary node is this row group's. The next group must not inherit it on top of its page.
+            _ = self.pages.reset(.free_all);
         } else {
             self.scratch.deinit();
             self.pages.deinit();
@@ -1244,6 +1246,7 @@ pub const SliceReader = struct {
                     if (r.pageValuesLeft() == 0) {
                         if (@TypeOf(r.*).Value == []const u8) {
                             self.resetPages();
+                            self.armBytePage(r);
                             if (!try r.nextPage()) break;
                             try self.holdDictionary(r);
                         } else if (!try r.nextPage()) break;
@@ -1353,6 +1356,7 @@ pub const SliceReader = struct {
                 if (T == []const u8) {
                     self.resetPages();
                     r.releaseExpansion();
+                    self.armBytePage(r);
                 }
                 if (!try r.nextPage()) return error.ShortDecode;
                 if (T == []const u8) try self.holdDictionary(r);
@@ -1413,6 +1417,7 @@ pub const SliceReader = struct {
             if (r.pageValuesLeft() == 0) {
                 self.resetPages();
                 r.releaseExpansion();
+                self.armBytePage(r);
                 if (!try r.nextPage()) break;
                 try self.holdDictionary(r);
                 continue;
@@ -1431,6 +1436,13 @@ pub const SliceReader = struct {
             got += k;
         }
         return got;
+    }
+
+    /// A retained column's compressed pages replace two scratch buffers: the dictionary, then each data page.
+    /// Set before `nextPage`, which installs the dictionary and the first data page in one call.
+    fn armBytePage(self: *SliceReader, r: *column_mod.ColumnChunkReader([]const u8)) void {
+        if (!self.retained) return;
+        r.pages.scratch = self.scratch;
     }
 
     /// A byte-array chunk reads on `held` until its dictionary is in, which so lives as long as the reader without a
@@ -1468,6 +1480,8 @@ pub const SliceReader = struct {
 
     /// Reset `pages`, giving back what its pages drew.
     fn resetPages(self: *SliceReader) void {
+        // The slot arena holds the dictionary for the whole row group. Data pages replace `scratch.page`.
+        if (self.retained) return;
         _ = self.pages.reset(.retain_capacity);
         if (self.page_budget) |b| switch (self.raw.*) {
             .bytes => |*r| {
@@ -1495,6 +1509,7 @@ pub const SliceReader = struct {
                         if (T == []const u8) {
                             self.resetPages();
                             r.releaseExpansion();
+                            self.armBytePage(r);
                         }
                         const passed = try r.passPageWithin(left);
                         if (T == []const u8) try self.holdDictionary(r);
@@ -1503,6 +1518,7 @@ pub const SliceReader = struct {
                             self.pages_passed += 1;
                             continue;
                         }
+                        if (T == []const u8) self.armBytePage(r);
                         if (!try r.nextPage()) return error.ShortDecode;
                         if (T == []const u8) try self.holdDictionary(r);
                         continue;

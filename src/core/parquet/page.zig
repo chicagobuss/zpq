@@ -108,8 +108,9 @@ pub const DecodeScratch = struct {
         self.* = undefined;
     }
 
-    /// First `n` elements of `buf`, regrown (contents discarded) when too short. 1.5x headroom so a run of slightly
-    /// larger pages doesn't trade one buffer of fresh pages for another every time.
+    /// First `n` elements of `buf`, reused when long enough. A larger page frees this buffer before the new one is
+    /// allocated, so a retained page never charges the old bytes and the new ones together. 1.5x headroom when it
+    /// fits, otherwise the exact size: the headroom is not part of the page the row group has to hold.
     pub fn ensure(
         self: *DecodeScratch,
         comptime T: type,
@@ -117,12 +118,19 @@ pub const DecodeScratch = struct {
         buf: *[]align(alignment) T,
         n: usize,
     ) std.mem.Allocator.Error![]align(alignment) T {
-        if (buf.len < n) {
-            const fresh = try self.gpa.alignedAlloc(T, .fromByteUnits(alignment), @max(n, buf.len + buf.len / 2));
-            self.gpa.free(buf.*);
-            buf.* = fresh;
-        }
-        return buf.*[0..n];
+        if (buf.len >= n) return buf.*[0..n];
+        const old = buf.*;
+        const old_n = old.len;
+        buf.* = &.{};
+        self.gpa.free(old);
+        const grown = std.math.add(usize, old_n, old_n / 2) catch n;
+        const padded: usize = if (old_n == 0) n else @max(n, grown);
+        const fresh = self.gpa.alignedAlloc(T, .fromByteUnits(alignment), padded) catch |err| {
+            if (padded == n) return err;
+            return self.gpa.alignedAlloc(T, .fromByteUnits(alignment), n);
+        };
+        buf.* = fresh;
+        return fresh[0..n];
     }
 };
 
@@ -208,15 +216,22 @@ pub const SliceScratch = struct {
         return &self.slots.items[self.next - 1];
     }
 
-    /// Words for a row group's survivor mask, grown to the widest group and not freed before `deinit`.
+    /// Words for a row group's survivor mask, grown to the widest group and not freed before `deinit`. A wider mask
+    /// frees the old one first, so the two are never charged together.
     pub fn survivorWords(self: *SliceScratch, n_rows: usize) ![]u64 {
         const words: usize = if (n_rows == 0) 0 else (n_rows + 63) / 64;
-        if (self.survivors.len < words) {
-            const n = @max(words, self.survivors.len + self.survivors.len / 2);
-            const fresh = try self.alloc.alloc(u64, n);
-            self.alloc.free(self.survivors);
-            self.survivors = fresh;
-        }
+        if (self.survivors.len >= words) return self.survivors[0..words];
+        const old = self.survivors;
+        const old_n = old.len;
+        self.survivors = &.{};
+        self.alloc.free(old);
+        const grown = std.math.add(usize, old_n, old_n / 2) catch words;
+        const n: usize = if (old_n == 0) words else @max(words, grown);
+        self.survivors = self.alloc.alloc(u64, n) catch |err| {
+            if (n == words) return err;
+            self.survivors = try self.alloc.alloc(u64, words);
+            return self.survivors;
+        };
         return self.survivors[0..words];
     }
 
@@ -326,6 +341,21 @@ test "scratch above the decode allowance is released at row-group end" {
     try std.testing.expect(slot.scratch.page.len >= 64);
 }
 
+test "a larger retained page frees the smaller buffer before allocating" {
+    const page = std.heap.pageSize();
+    var budget: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
+    var charged: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget };
+    var scratch = DecodeScratch.init(charged.allocator());
+    defer scratch.deinit();
+    _ = try scratch.ensure(u8, 1, &scratch.page, page);
+    const held = budget.used.load(.monotonic);
+    // Room for the replacement alone. Keeping the old page would refuse the draw.
+    budget.limit = held - page + page * 2;
+    _ = try scratch.ensure(u8, 1, &scratch.page, page * 2);
+    try std.testing.expect(scratch.page.len >= page * 2);
+    try std.testing.expect(budget.used.load(.monotonic) <= budget.limit);
+}
+
 test "scratch retention across columns stays within one decode allowance" {
     const page = std.heap.pageSize();
     var budget: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
@@ -399,8 +429,9 @@ pub const PageReader = struct {
     arena: std.mem.Allocator,
     /// Error probes keep dictionary backing bytes while releasing every data page before the next unit.
     dictionary_arena: ?std.mem.Allocator = null,
-    /// When set, every page (dictionary included) is materialised into `scratch.page` and is only valid until the
-    /// next `next()`. Null keeps the arena behaviour: page bytes live as long as `arena`.
+    /// When set, every page read from here on is materialised into `scratch.page` and is only valid until the next
+    /// `next()`. A retained byte-array reader sets this after its dictionary page, so data pages replace one buffer
+    /// instead of accumulating on `arena`. Null keeps the arena behaviour: page bytes live as long as `arena`.
     scratch: ?*DecodeScratch = null,
     /// Records a `decompress` span per compressed page when set. Separate from `scratch`, which byte-array readers
     /// leave unset.
@@ -543,14 +574,19 @@ pub const PageReader = struct {
             try compression.decompressInto(payload, self.codec, out);
             return .{ .header = header, .bytes = out };
         }
-        if (self.scratch == null or self.codec == .UNCOMPRESSED or usize_ == 0) {
-            const a = if (header.type == .DICTIONARY_PAGE) self.dictionary_arena orelse self.arena else self.arena;
-            const decompressed = try compression.decompress(a, payload, self.codec, usize_);
-            return .{ .header = header, .bytes = decompressed };
+        // Compressed pages reuse one data buffer and one dictionary buffer. An uncompressed page is a view of
+        // the source: copying it would charge the ledger for bytes the file already holds.
+        if (self.scratch != null and self.codec != .UNCOMPRESSED and usize_ != 0) {
+            const out = if (header.type == .DICTIONARY_PAGE)
+                try self.dictionaryBuffer(usize_)
+            else
+                try self.pageBuffer(usize_);
+            try compression.decompressInto(payload, self.codec, out);
+            return .{ .header = header, .bytes = out };
         }
-        const out = try self.pageBuffer(usize_);
-        try compression.decompressInto(payload, self.codec, out);
-        return .{ .header = header, .bytes = out };
+        const a = if (header.type == .DICTIONARY_PAGE) self.dictionary_arena orelse self.arena else self.arena;
+        const decompressed = try compression.decompress(a, payload, self.codec, usize_);
+        return .{ .header = header, .bytes = decompressed };
     }
 
     pub const Peeked = struct {
@@ -608,6 +644,13 @@ pub const PageReader = struct {
         if (self.retained) |owner| return owner.take(len);
         if (self.scratch) |s| return s.ensure(u8, 1, &s.page, len);
         return self.arena.alloc(u8, len);
+    }
+
+    /// The dictionary page, into the scratch buffer data pages do not reuse. Slices into it stay valid while later
+    /// data pages replace `scratch.page`.
+    fn dictionaryBuffer(self: *PageReader, len: usize) Error![]u8 {
+        const s = self.scratch orelse return (self.dictionary_arena orelse self.arena).alloc(u8, len);
+        return s.ensure(u8, DecodeScratch.dict_align, &s.dict, len);
     }
 
     /// Reposition the reader's cursor to an absolute file offset.

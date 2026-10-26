@@ -23,6 +23,8 @@ pub const Oracle = struct {
     io: std.Io,
     duckdb: []const u8,
     duckdb_sha: [64]u8,
+    /// False when the binary is absent: golden-only runs (the release smoke) need no oracle, and any question fails.
+    present: bool = true,
     tz: []const u8,
     cache_dir: ?[]const u8,
     hits: usize = 0,
@@ -40,13 +42,18 @@ pub const Oracle = struct {
             .gpa = gpa,
             .io = io,
             .duckdb = duckdb,
-            .duckdb_sha = try fileSha(gpa, io, duckdb),
+            .duckdb_sha = fileSha(gpa, io, duckdb) catch |err| switch (err) {
+                error.FileNotFound => @splat('0'),
+                else => return err,
+            },
+            .present = if (std.Io.Dir.cwd().access(io, duckdb, .{})) |_| true else |_| false,
             .tz = if (tz.len == 0) "UTC" else tz,
             .cache_dir = cache_dir,
         };
     }
 
     fn run(self: *Oracle, args: []const []const u8) !Captured {
+        if (!self.present) return error.NoOracle;
         var env = std.process.Environ.Map.init(self.gpa);
         defer env.deinit();
         try env.put("TZ", self.tz);

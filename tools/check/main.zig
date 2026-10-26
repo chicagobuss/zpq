@@ -14,12 +14,21 @@ const forcing = @import("forcing.zig");
 const compare = @import("compare.zig");
 const oracle_mod = @import("oracle.zig");
 const verdict = @import("verdict.zig");
+const receipt = @import("receipt.zig");
 
 const usage =
     \\zpq-check --cases FILE [--cases FILE ...] [--duckdb PATH] [--python PATH] [--zpq PATH] [--data DIR] [--work DIR]
     \\          [--cache DIR | --no-cache] [--only ID] [--limit N] [--parity-case ID --force K=V ...]
     \\          [--bless]     rewrite goldens from this run's output (never exits 0)
     \\zpq-check --self-test      the runner fails on the answers and refusals it must reject
+    \\zpq-check stage --name N --dir D --kind units|cases|contracts|plain
+    \\          [--timeout S] [--artifact NAME=PATH]... -- ARGV...
+    \\                           run one tier stage; leave its log and receipt in D
+    \\zpq-check --cases ... --manifest PATH [--answers-only --reuse-fixtures]
+    \\                           hash each case's answer; manifest-diff compares hosts
+    \\zpq-check manifest-diff REF OTHER
+    \\zpq-check verdict --dir D --expect STAGE,... [--sha SHA]
+    \\                           pass only on a receipt per stage for SHA (HEAD)
     \\
 ;
 
@@ -132,6 +141,14 @@ const Run = struct {
     data: ?[]const u8 = null,
     only: ?[]const u8 = null,
     limit: ?usize = null,
+    /// Lives as long as the run: the answers manifest's lines.
+    keep: std.mem.Allocator = undefined,
+    /// Per case, the hash of what zpq produced: diffed across hosts (`manifest-diff`), the architecture check.
+    manifest: ?*std.ArrayList([]const u8) = null,
+    /// Record outcomes without judging them: a host with no oracle or PyArrow hashes answers for the manifest.
+    answers_only: bool = false,
+    /// Keep fixtures already in the work directory (shipped from the reference host) instead of making them.
+    reuse_fixtures: bool = false,
     total: usize = 0,
     matched: usize = 0,
     failed: usize = 0,
@@ -161,9 +178,22 @@ pub fn main(init: std.process.Init) !void {
     var parity_case: ?[]const u8 = null;
     var forced: std.ArrayList([]const u8) = .empty;
     var self_test = false;
+    var manifest_path: ?[]const u8 = null;
+    var answers_only = false;
+    var reuse_fixtures = false;
 
     var iter = std.process.Args.Iterator.init(init.minimal.args);
     _ = iter.next();
+    {
+        var rest: std.ArrayList([]const u8) = .empty;
+        var peek = std.process.Args.Iterator.init(init.minimal.args);
+        _ = peek.next();
+        const sub = peek.next() orelse "";
+        while (peek.next()) |a| try rest.append(arena, a);
+        if (std.mem.eql(u8, sub, "stage")) std.process.exit(try receipt.stageMain(arena, io, gpa, rest.items));
+        if (std.mem.eql(u8, sub, "verdict")) std.process.exit(try receipt.verdictMain(arena, io, rest.items));
+        if (std.mem.eql(u8, sub, "manifest-diff")) std.process.exit(try receipt.manifestDiffMain(arena, io, rest.items));
+    }
     while (iter.next()) |arg| {
         const eq = std.mem.eql;
         if (eq(u8, arg, "--help") or eq(u8, arg, "-h")) {
@@ -195,6 +225,12 @@ pub fn main(init: std.process.Init) !void {
             parity_case = iter.next() orelse return error.BadArgs;
         } else if (eq(u8, arg, "--force")) {
             try forced.append(arena, iter.next() orelse return error.BadArgs);
+        } else if (eq(u8, arg, "--manifest")) {
+            manifest_path = iter.next() orelse return error.BadArgs;
+        } else if (eq(u8, arg, "--answers-only")) {
+            answers_only = true;
+        } else if (eq(u8, arg, "--reuse-fixtures")) {
+            reuse_fixtures = true;
         } else if (eq(u8, arg, "--limit")) {
             limit = try std.fmt.parseInt(usize, iter.next() orelse return error.BadArgs, 10);
         } else return error.BadArgs;
@@ -227,6 +263,8 @@ pub fn main(init: std.process.Init) !void {
     defer zpq.frontend.diagnostic_fn = null;
 
     var oracle = try oracle_mod.Oracle.init(gpa, io, duckdb, cache, tz);
+    var manifest: std.ArrayList([]const u8) = .empty;
+    defer manifest.deinit(gpa);
     var run: Run = .{
         .gpa = gpa,
         .io = io,
@@ -239,6 +277,10 @@ pub fn main(init: std.process.Init) !void {
         .bless = bless,
         .only = only,
         .limit = limit,
+        .keep = arena,
+        .manifest = if (manifest_path != null) &manifest else null,
+        .answers_only = answers_only,
+        .reuse_fixtures = reuse_fixtures,
     };
 
     if (self_test) return selfTest(&run, arena);
@@ -260,7 +302,7 @@ pub fn main(init: std.process.Init) !void {
         if (parity_case) |want| {
             for (file.cases) |c| if (std.mem.eql(u8, c.id, want)) {
                 const fixtures = try prepareFixtures(&run, arena, file, file_i);
-                try runParity(&run, arena, fixtures, fixtures.get(c.fixture) orelse return error.MissingFixture, c);
+                try runParity(&run, arena, fixtures, fixtures.get(c.fixture) orelse return error.MissingFixture, file, c);
                 std.debug.print("check: path-parity case {s}\n", .{c.id});
                 return;
             };
@@ -285,6 +327,11 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingCase;
     }
 
+    if (manifest_path) |path| {
+        std.mem.sort([]const u8, manifest.items, {}, compare.lessText);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try std.mem.join(arena, "", manifest.items) });
+        std.debug.print("check: answers manifest {s} ({d} cases)\n", .{ path, manifest.items.len });
+    }
     std.debug.print("check: {d}/{d} checks match\n", .{ run.matched, run.total });
     std.debug.print("check: expected {d}\n", .{run.expected});
     std.debug.print("check: refusals {d}\n", .{run.refusals});
@@ -463,7 +510,7 @@ fn prepareFixtures(run: *Run, arena: std.mem.Allocator, file: File, file_i: usiz
     for (file.fixtures) |f| {
         if (f.copy) |sql| {
             const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.parquet", .{ run.work, file_i, f.name.? });
-            try run.oracle.exec(try replace(arena, sql, "{path}", path));
+            if (!(run.reuse_fixtures and exists(run, path))) try run.oracle.exec(try replace(arena, sql, "{path}", path));
             try out.put(f.name.?, path);
         } else if (f.path) |path| {
             try out.put(f.name.?, path);
@@ -499,6 +546,12 @@ fn prepareFixtures(run: *Run, arena: std.mem.Allocator, file: File, file_i: usiz
                     try out.put(n, path);
                 }
             }
+            if (run.reuse_fixtures) {
+                const all = for (names) |n| {
+                    if (!exists(run, out.get(n).?)) break false;
+                } else true;
+                if (all) continue;
+            }
             const made = try oracle_mod.capture(run.gpa, run.io, argv.items);
             defer run.gpa.free(made.stdout);
             defer run.gpa.free(made.stderr);
@@ -509,6 +562,10 @@ fn prepareFixtures(run: *Run, arena: std.mem.Allocator, file: File, file_i: usiz
         }
     }
     return out;
+}
+
+fn exists(run: *Run, path: []const u8) bool {
+    return if (std.Io.Dir.cwd().access(run.io, path, .{})) |_| true else |_| false;
 }
 
 fn replace(arena: std.mem.Allocator, text: []const u8, key: []const u8, value: []const u8) ![]const u8 {
@@ -633,6 +690,10 @@ fn checkCase(
         } else first = got;
     }
     const base = first.?;
+    if (run.manifest) |m| if (!hostDependent(c)) {
+        try m.append(run.gpa, try std.fmt.allocPrint(run.keep, "{s}\t{s}\n", .{ c.id, &(try outcomeDigest(arena, base, fixture, out_path)) }));
+    };
+    if (run.answers_only) return null;
     if (base == .refused and (std.mem.eql(u8, base.refused.kind, "signal") or
         std.mem.eql(u8, base.refused.kind, "timeout")))
         return try std.fmt.allocPrint(arena, "zpq {s}: {s}", .{ base.refused.kind, base.refused.line });
@@ -775,6 +836,32 @@ fn writesOut(c: Case) bool {
     // `{out.answer}` and the like are written files too: the verdict reads what they name.
     for (args) |a| if (std.mem.indexOf(u8, a, "{out") != null) return true;
     return false;
+}
+
+/// Outputs a host shapes by design, left out of the answers manifest: an explanation sizes the plan from the host's
+/// caches and cores, and a profile trace records time.
+fn hostDependent(c: Case) bool {
+    const args = c.cli orelse return false;
+    for (args) |arg| if (std.mem.eql(u8, arg, "--explain") or std.mem.eql(u8, arg, "--profile")) return true;
+    return false;
+}
+
+/// What a host's answer is, for comparing hosts: the bytes, or the refusal's kind, exit and diagnostic, with this
+/// run's own paths taken out.
+fn outcomeDigest(arena: std.mem.Allocator, o: Outcome, fixture: []const u8, out_path: []const u8) ![64]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    switch (o) {
+        .ok => |bytes| h.update(bytes),
+        .ok_cli => |x| h.update(try verdict.unpathed(arena, x.bytes, fixture, out_path)),
+        .refused => |x| {
+            h.update(try std.fmt.allocPrint(arena, "refused {s} exit {d}\n", .{ x.kind, x.code }));
+            h.update(try verdict.unpathed(arena, x.diag, fixture, out_path));
+            h.update(x.stdout);
+        },
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn sameOutcome(a: Outcome, b: Outcome) bool {
@@ -1165,6 +1252,7 @@ fn runParity(
     arena: std.mem.Allocator,
     fixtures: std.StringHashMap([]const u8),
     fixture: []const u8,
+    file: File,
     raw: Case,
 ) !void {
     var c = raw;
@@ -1174,7 +1262,7 @@ fn runParity(
     var at = c;
     at.jobs = c.jobs orelse 16;
     if (c.axes != null) {
-        const points = try pointsOf(arena, .{ .cases = &.{} }, c);
+        const points = try pointsOf(arena, file, c);
         if (points[0].jobs) |j| at.jobs = j;
     }
     const parsed = try zpq.core.expr.sql_parser.parseSqlQuery(run.gpa, c.sql.?);
@@ -1344,6 +1432,11 @@ fn selfTest(run: *Run, arena: std.mem.Allocator) !void {
         "{\"id\": \"points\", \"query\": {\"aggregate\": \"sum(id) AS s\"}, \"axes\": [{}, {\"max_memory\": " ++
             "\"not-a-size\"}], \"oracle\": {\"compare\": \"agg\", \"sql\": \"SELECT sum(id) FROM '{path}'\"}}",
     )).failed == 2, "points with different outcomes fail", &problems);
+    // A LIMIT through tied rows may pick any of them, never a row DuckDB's whole answer lacks.
+    const tied = "{\"id\": \"tied\", \"sql\": \"SELECT id, 1 AS k FROM '{path}' WHERE id IS NOT NULL ORDER BY k LIMIT 1\", " ++
+        "\"emit\": \"rows\", \"oracle\": {\"compare\": \"tied_rows\", \"sql\": \"";
+    expect((try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ tied, "SELECT id, 1 AS k FROM '{path}' WHERE id IS NOT NULL ORDER BY k, id DESC LIMIT 1\"}}" }))).failed == 0, "another of the tied rows passes", &problems);
+    expect((try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ tied, "SELECT id + 10 AS id, 1 AS k FROM '{path}' WHERE id IS NOT NULL ORDER BY k LIMIT 1\"}}" }))).failed == 1, "a row outside the whole answer fails", &problems);
     // A second front door must give the same bytes.
     const twin =
         "{\"id\": \"same-as\", \"cli\": [\"query\", \"{path}\", \"--aggregate\", \"count(*) AS n\"], \"same\": " ++
@@ -1397,6 +1490,7 @@ test {
     _ = compare;
     _ = oracle_mod;
     _ = verdict;
+    _ = receipt;
 }
 
 test "a list variable splices into a template list and nests elsewhere" {

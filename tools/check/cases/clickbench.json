@@ -54,25 +54,5 @@
       },
       "case": {"id": "clickbench:${s}:${q}", "input": "${input}", "cli": ["query", "--query", "${zsql}", "--max-memory", "8GB"], "timeout_s": 600, "oracle": {"compare": "tied_rows", "sql": "${dsql}", "setup": "SET memory_limit='6GB';\nCREATE VIEW hits AS\nSELECT *\n    REPLACE (make_date(EventDate) AS EventDate)\nFROM read_parquet('{path}', binary_as_string=True);\n\nCREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);"}}
     }
-  ],
-  "refuse": {
-    "clickbench:sub1:Q18": {"error": "exit 2", "diag": "sql parse error"},
-    "clickbench:sub1:Q28": {"error": "exit 2", "diag": "unknown scalar function in expression"},
-    "clickbench:sub1:Q36": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub1:Q37": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub1:Q38": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub1:Q39": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub1:Q40": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub1:Q41": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub1:Q42": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q18": {"error": "exit 2", "diag": "sql parse error"},
-    "clickbench:sub16:Q28": {"error": "exit 2", "diag": "unknown scalar function in expression"},
-    "clickbench:sub16:Q36": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q37": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q38": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q39": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q40": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q41": {"error": "exit 2", "diag": "invalid value in filter"},
-    "clickbench:sub16:Q42": {"error": "exit 2", "diag": "invalid value in filter"}
-  }
+  ]
 }

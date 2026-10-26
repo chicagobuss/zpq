@@ -1,7 +1,7 @@
 // Generated for ZPQ vendor/snappy from cmake/config.h.in. Tuned for
 // modern Linux toolchains (clang/gcc 8+). Architecture-specific
-// intrinsics follow the target's CPU features (see below); NEON CRC32
-// stays off.
+// intrinsics follow the target's CPU features (see below); both CRC32
+// hashes stay off, so every build writes the same bytes.
 
 #ifndef THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_
 #define THIRD_PARTY_SNAPPY_OPENSOURCE_CMAKE_CONFIG_H_
@@ -29,11 +29,8 @@
 #define SNAPPY_HAVE_SSSE3 0
 #endif
 
-#ifdef __SSE4_2__
-#define SNAPPY_HAVE_X86_CRC32 1
-#else
+// Off: its hash would change the compressed bytes SSE4.2 builds write (as NEON CRC32 below).
 #define SNAPPY_HAVE_X86_CRC32 0
-#endif
 
 #ifdef __BMI2__
 #define SNAPPY_HAVE_BMI2 1

@@ -28,6 +28,7 @@ pub const core = struct {
         pub const partition = @import("core/filter/partition.zig");
     };
     pub const expr = struct {
+        pub const key_pack = @import("core/expr/key_pack.zig");
         pub const ast = @import("core/expr/ast.zig");
         pub const parser = @import("core/expr/parser.zig");
         pub const eval = @import("core/expr/eval.zig");
@@ -95,6 +96,7 @@ pub const io = struct {
 };
 
 test {
+    _ = @import("core/selected_batch.zig");
     // Keep these as direct imports: tools/check_test_modules.py uses this block
     // as the manifest of modules whose tests the library test artifact roots.
     _ = @import("core/selected_batch.zig");
@@ -130,6 +132,8 @@ test {
     _ = @import("core/ndv.zig");
     _ = @import("core/expr/agg_coded.zig");
     _ = @import("core/expr/agg_dense.zig");
+    _ = @import("core/expr/key_pack.zig");
+    _ = @import("core/expr/key_plan.zig");
     _ = @import("core/expr/sql_parser.zig");
     _ = @import("core/writer/fastpath.zig");
     _ = @import("core/writer/encoder.zig");

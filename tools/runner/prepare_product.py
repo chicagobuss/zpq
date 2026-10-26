@@ -25,9 +25,12 @@ table = None
 for path in (coded0, coded1):
     codes = rng.integers(0, 4, n)
     names = np.array(["", "a\x00b", "region", "z"], dtype=object)[codes]
+    values = rng.integers(-1000, 1001, n).astype(np.int64)
+    value_nulls = (codes == 0) | (rng.random(n) < 0.1)
     table = pa.table({
         "a": pa.array(rng.integers(-8, 9, n).astype(np.int32), mask=rng.random(n) < 0.03),
         "b": pa.array(names, pa.string(), mask=rng.random(n) < 0.02),
+        "v": pa.array(values, mask=value_nulls),
         "f": pa.array(rng.integers(0, 100, n).astype(np.int32)),
     })
     pq.write_table(table, path, row_group_size=8192)

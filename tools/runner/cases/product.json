@@ -238,6 +238,111 @@
         16
       ],
       "max_memory": "8M"
+    },
+    {
+      "id": "product:sum-full",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' GROUP BY a,b",
+      "duck": "SELECT a,b,count(*) AS c,sum(v) AS s FROM read_parquet('{path}',filename=true,file_row_number=true) GROUP BY a,b",
+      "parquet": true,
+      "ordered": false
+    },
+    {
+      "id": "product:sum-selected",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,sum(v) AS s FROM '{path}' WHERE f < 30 GROUP BY a,b ORDER BY s DESC LIMIT 7 OFFSET 2",
+      "duck": "SELECT a,b,sum(v) AS s FROM read_parquet('{path}',filename=true,file_row_number=true) WHERE f < 30 GROUP BY a,b ORDER BY s DESC,min(CASE WHEN filename = '{file1}' THEN 262144 ELSE 0 END + file_row_number) LIMIT 7 OFFSET 2",
+      "parquet": true,
+      "ordered": true
+    },
+    {
+      "id": "product:sum-all-null",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,sum(v) AS s FROM '{path}' WHERE b = '' GROUP BY a,b ORDER BY s DESC LIMIT 7",
+      "duck": "SELECT a,b,sum(v) AS s FROM read_parquet('{path}',filename=true,file_row_number=true) WHERE b = '' GROUP BY a,b ORDER BY s DESC,min(CASE WHEN filename = '{file1}' THEN 262144 ELSE 0 END + file_row_number) LIMIT 7",
+      "parquet": false,
+      "ordered": true
+    },
+    {
+      "id": "product:sum-having",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' GROUP BY a,b HAVING count(*) > 7000 ORDER BY s DESC LIMIT 4",
+      "duck": "SELECT a,b,count(*) AS c,sum(v) AS s FROM read_parquet('{path}',filename=true,file_row_number=true) GROUP BY a,b HAVING count(*) > 7000 ORDER BY s DESC,min(CASE WHEN filename = '{file1}' THEN 262144 ELSE 0 END + file_row_number) LIMIT 4",
+      "parquet": false,
+      "ordered": true
+    },
+    {
+      "id": "product:sum-key-ties",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,sum(v) AS s FROM '{path}' GROUP BY a,b ORDER BY s DESC,a,b LIMIT 9",
+      "duck": "SELECT a,b,sum(v) AS s FROM read_parquet('{path}',filename=true,file_row_number=true) GROUP BY a,b ORDER BY s DESC,a,b LIMIT 9",
+      "parquet": false,
+      "ordered": true
+    },
+    {
+      "id": "product:sum-empty",
+      "kind": "product",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,sum(v) AS s FROM '{path}' WHERE f < 0 GROUP BY a,b ORDER BY s DESC LIMIT 7",
+      "duck": "SELECT a,b,sum(v) AS s FROM read_parquet('{path}',filename=true,file_row_number=true) WHERE f < 0 GROUP BY a,b ORDER BY s DESC,min(CASE WHEN filename = '{file1}' THEN 262144 ELSE 0 END + file_row_number) LIMIT 7",
+      "parquet": false,
+      "ordered": true
+    },
+    {
+      "id": "product:sum-plain",
+      "kind": "product",
+      "fixture": "plain",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' GROUP BY a,b",
+      "parquet": true
+    },
+    {
+      "id": "product:sum:128K:j1",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' WHERE f < 30 GROUP BY a,b",
+      "jobs": [
+        1
+      ],
+      "max_memory": "128K"
+    },
+    {
+      "id": "product:sum:128K:j16",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' WHERE f < 30 GROUP BY a,b",
+      "jobs": [
+        16
+      ],
+      "max_memory": "128K"
+    },
+    {
+      "id": "product:sum:8M:j1",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' WHERE f < 30 GROUP BY a,b",
+      "jobs": [
+        1
+      ],
+      "max_memory": "8M"
+    },
+    {
+      "id": "product:sum:8M:j16",
+      "kind": "pair",
+      "check": "budget",
+      "fixture": "coded_glob",
+      "sql": "SELECT a,b,count(*) AS c,sum(v) AS s FROM '{path}' WHERE f < 30 GROUP BY a,b",
+      "jobs": [
+        16
+      ],
+      "max_memory": "8M"
     }
   ]
 }

@@ -24,6 +24,7 @@ pub const Plan = struct {
     pub fn init(gpa: std.mem.Allocator, keys: []const ast.Expr, domain: ?*const dense.Domain) !?Plan {
         if (keys.len == 0) return null;
         var raw = true;
+        var raw_bits: usize = 0;
         for (keys) |key| {
             if (key != .col_ref) return null;
             const ref = key.col_ref;
@@ -33,9 +34,19 @@ pub const Plan = struct {
                 raw = false;
             } else if (ref.expr_type != .i64 or (ref.physical_type != .INT32 and ref.physical_type != .INT64))
                 return null;
+            raw_bits +|= if (ref.physical_type == .INT32) @as(usize, 33) else 65;
         }
         if (!raw and domain == null) return null;
         if (domain) |d| if (d.axes.len != keys.len) return null;
+        const dictionary_width = if (domain) |d| width: {
+            var n: u128 = 1;
+            for (d.axes) |*axis| {
+                n = std.math.mul(u128, n, axis.ids()) catch break :width null;
+                if (n > @as(u128, 1) << arithmetic.max_bits) break :width null;
+            }
+            break :width arithmetic.productWidth(n, dense.max_ids);
+        } else null;
+        if (dictionary_width == null and (!raw or raw_bits > arithmetic.max_bits)) return null;
         const refs = try gpa.alloc(ast.ColRef, keys.len);
         errdefer gpa.free(refs);
         for (keys, refs) |key, *ref| ref.* = key.col_ref;
@@ -50,14 +61,8 @@ pub const Plan = struct {
         if (domain) |d| for (radices, d.axes) |*radix, *axis| {
             radix.* = axis.ids();
         };
-        const encoding = arithmetic.KeyPack.plan(if (domain != null) radices else null, fields, dense.max_ids);
-        if (encoding == null) {
-            gpa.free(radices);
-            gpa.free(fields);
-            gpa.free(refs);
-            return null;
-        }
-        return .{ .keys = refs, .radices = radices, .fields = fields, .encoding = encoding.?, .domain = domain };
+        const encoding = arithmetic.KeyPack.plan(if (domain != null) radices else null, fields, dense.max_ids).?;
+        return .{ .keys = refs, .radices = radices, .fields = fields, .encoding = encoding, .domain = domain };
     }
 
     pub fn deinit(p: *Plan, gpa: std.mem.Allocator) void {
@@ -338,6 +343,31 @@ test "key plan allocations release all owned certificates on failure and decline
             try testing.expectEqual(null, try Plan.init(a, &.{ key, key, key, key }, null));
         }
     }.run, .{});
+}
+
+test "key plan impossible raw widths and dictionary products decline without an allocation attempt" {
+    const key: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectEqual(null, try Plan.init(failing.allocator(), &.{ key, key, key, key }, null));
+    var value = [_]u8{'x'};
+    var values = [_][]u8{&value};
+    var axes: [127]dense.Axis = @splat(.{
+        .values = .{ .bytes = &values },
+        .trans = &.{},
+        .file_base = &.{},
+        .bytes = 0,
+    });
+    const domain: dense.Domain = .{ .axes = &axes, .bytes = 0 };
+    const keys: [127]ast.Expr = @splat(.{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .BYTE_ARRAY,
+        .expr_type = .str,
+    } });
+    try testing.expectEqual(null, try Plan.init(failing.allocator(), &keys, &domain));
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectError(error.OutOfMemory, Plan.init(failing.allocator(), &.{key}, null));
+    try testing.expect(failing.has_induced_failure);
 }
 
 test "key plan dictionary products wider than u64 bind and unpack without machine-word strides" {

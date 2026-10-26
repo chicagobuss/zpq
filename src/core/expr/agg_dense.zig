@@ -898,6 +898,7 @@ pub const Lanes = struct {
     }
 
     pub fn accumulator(l: *const Lanes, id: usize, ai: usize) Accumulator {
+        if (l.counts32.len != 0 or l.counts64.len != 0) return .{ .count = l.count(id) };
         if (l.sums.len == 0 and l.compact_sums.len == 0) return l.accs[id * l.calls.len + ai];
         return if (l.calls[ai].func == .count) .{ .count = l.count(id) } else .{ .sum_i = l.integer(id, ai) };
     }
@@ -1125,9 +1126,9 @@ pub fn merge(gpa: std.mem.Allocator, arena: std.mem.Allocator, lanes: []Lanes, n
     var ctx: MergeCtx = .{ .lanes = live.items, .n = n, .gpa = gpa };
     const tasks = try arena.alloc(MergeTask, @max(1, @min(n_threads, n / 16384)));
     for (tasks, 0..) |*t, i| t.* = .{ .ctx = &ctx, .lo = i * n / tasks.len, .hi = (i + 1) * n / tasks.len };
-    if (tasks.len == 1 or !spawn.runTree(MergeTask, tasks, .{ .stack_size = 1 << 20 }, MergeTask.run)) {
-        for (tasks) |*t| if (!t.ran) t.run();
-    }
+    if (tasks.len != 1) _ = spawn.runTree(MergeTask, tasks, .{ .stack_size = 1 << 20 }, MergeTask.run);
+    // Partial pool startup can succeed while leaving exclusive ranges unrun.
+    for (tasks) |*t| if (!t.ran) t.run();
     for (tasks) |t| if (t.err) |e| return e;
     return live.items[0];
 }
@@ -1477,6 +1478,7 @@ test "dense count lanes share the row-width boundary with their quote" {
         try l.ensure(testing.allocator);
         l.addCount(0, rows);
         try testing.expectEqual(rows, l.count(0));
+        try testing.expectEqualDeep(Accumulator{ .count = rows }, l.accumulator(0, 0));
         const owned_lanes = l.first.len * 8 + l.counts32.len * 4 + l.counts64.len * 8;
         try testing.expectEqual(laneBytes(d.ids(), &calls, rows, false), owned_lanes);
         try testing.expectEqual(@as(usize, 0), l.accs.len);
@@ -1490,6 +1492,65 @@ test "dense count lanes share the row-width boundary with their quote" {
             const held = ledger.drawExact(quoted.total).?;
             ledger.release(held);
             try testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+        }
+    }
+}
+
+test "dense merge recovers every exclusive range after partial spawn startup for SUM and both COUNT widths" {
+    const a = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const values = try arena.allocator().alloc(u64, 255);
+    for (values, 0..) |*value, i| value.* = i;
+    var axes: [2]Axis = @splat(.{
+        .values = .{ .int64 = values },
+        .trans = &.{},
+        .file_base = &.{},
+        .bytes = 0,
+    });
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    try testing.expectEqual(@as(usize, 4), domain.ids() / 16384);
+    const Layout = enum { count32, count64, sum };
+    for ([_]Layout{ .count32, .count64, .sum }) |layout| {
+        for (0..4) |allowed| {
+            const rows: u64 = if (layout == .count64) @as(u64, 1) << 40 else 64;
+            const calls = Fixture.calls[0..if (layout == .sum) 2 else 1];
+            var lanes: [2]Lanes = @splat(.{
+                .domain = &domain,
+                .calls = calls,
+                .rows = rows,
+                .positions = Ordinals.init(&.{ 0, 64 }),
+            });
+            defer for (&lanes) |*lane| lane.deinit(a);
+            for (&lanes) |*lane| try lane.ensure(a);
+            const weight: u64 = if (layout == .count64) @as(u64, 1) << 32 else 1;
+            for (0..4) |range| {
+                const id = range * 16384 + 123;
+                if (layout == .sum) {
+                    lanes[0].compact_sums[id].add(null, @intCast(40 + range));
+                    lanes[1].compact_sums[id].add(-17 * @as(i64, @intCast(range + 1)), @intCast(10 + range));
+                } else {
+                    lanes[0].first[id] = 40 + range;
+                    lanes[1].first[id] = 10 + range;
+                    lanes[0].addCount(id, weight);
+                    lanes[1].addCount(id, 2 * weight);
+                }
+            }
+            spawn.injectFailureAfter(allowed);
+            defer spawn.resetFailure();
+            const merged = (try merge(a, arena.allocator(), &lanes, 4)).?;
+            try testing.expect(spawn.failuresInjected() > 0);
+            try testing.expectEqual(@as(usize, 4), merged.groupCount());
+            for (0..4) |range| {
+                const id = range * 16384 + 123;
+                try testing.expectEqual(@as(u64, 10 + range), merged.firstOrdinal(id));
+                const count: u64 = if (layout == .sum) 2 else 3 * weight;
+                try testing.expectEqualDeep(Accumulator{ .count = count }, merged.accumulator(id, 0));
+                if (layout == .sum) try testing.expectEqualDeep(
+                    Accumulator{ .sum_i = -17 * @as(i128, @intCast(range + 1)) },
+                    merged.accumulator(id, 1),
+                );
+            }
         }
     }
 }

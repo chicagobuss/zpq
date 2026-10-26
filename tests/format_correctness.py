@@ -530,9 +530,48 @@ def unsupported_encodings(tmp):
         p = query(unknown, '--columns', 'float_plain', ok=False)
         assert f'unsupported encoding UNKNOWN (id {encoding_id})' in p.stderr, p.stderr
 
+
+def unsupported_decimal_encodings(tmp):
+    sys.path.insert(0, str(FIXTURES.parents[2] / 'tools'))
+    from datagen.parquet import Reader, T_STRUCT, field, rewrite_footer, write_value
+    for encoding_id in [31, -17]:
+        unknown = tmp / f'unknown-decimal-encoding-{encoding_id}.parquet'
+        unknown.write_bytes((FIXTURES / 'decimal_exact.parquet').read_bytes())
+        def edit(meta, body):
+            patched = 0
+            for rg in field(meta, 4)[2][1]:
+                for chunk in field(rg, 1)[2][1]:
+                    cm = field(chunk, 3)[2]
+                    if field(cm, 3)[2][1] != [b'd38']:
+                        continue
+                    field(cm, 2)[2][1].append(encoding_id)
+                    start = field(cm, 9)[2]
+                    parser = Reader(body[start:])
+                    header = parser.value(T_STRUCT)
+                    assert field(header, 1)[2] == 0  # V1 data page, after its dictionary.
+                    field(field(header, 5)[2], 2)[2] = encoding_id
+                    encoded = write_value(T_STRUCT, header)
+                    assert len(encoded) == parser.pos
+                    body[start:start + parser.pos] = encoded
+                    patched += 1
+            assert patched == 3
+        rewrite_footer(unknown, edit)
+        p = subprocess.run([ZPQ, 'inspect', str(unknown), '--detail', '--format', 'json'],
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0 and f'UNKNOWN({encoding_id})' in p.stdout, (p.returncode, p.stderr, p.stdout)
+        for jobs in [1, 3]:
+            for args in [['--columns', 'd38'], ['--aggregate', 'sum(d38) AS s']]:
+                p = query(unknown, *args, '--scan-all', '-j', str(jobs), ok=False)
+                expected = (f'zpq query: cannot decode input file {unknown}\n'
+                            '  row group 0, column `d38`, page 1:\n'
+                            f'  unsupported encoding UNKNOWN (id {encoding_id}) (UnsupportedEncoding)\n')
+                assert p.returncode == 1 and not p.stdout and p.stderr == expected, (jobs, args, p.stderr)
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     int96_signed_days(Path(directory))
     unsupported_encodings(Path(directory))
+    unsupported_decimal_encodings(Path(directory))
     logical_annotations(Path(directory))
     binary_text(Path(directory))
     repeated_fields(Path(directory))

@@ -996,7 +996,7 @@ fn decodeFlbaDataPage(
                 }
             }
         },
-        else => return error.UnsupportedDecimalEncoding,
+        else => return error.UnsupportedEncoding,
     }
 
     written.* += page_num_values;

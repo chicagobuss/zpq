@@ -2176,21 +2176,24 @@ fn foldExactWindows(
         (distinct + 1) *| space *| NarrowAcc.bytesPerComposite(space, batch.num_rows);
     const rows = expr_eval.floatBatchRows(exactLiveBytesPerRow(plan), fixed, batch.expr_batch_rows);
     if (rows == 0 or rows >= batch.num_rows) return;
-    // Everything the windows hold goes with them, so a failed pass leaves the whole-batch fold what it always had.
+    // The finished sums, taken before anything speculative so the windows' own storage stays the newest in `ra`
+    // and goes with them: a failed pass leaves the whole-batch fold no more than this block.
+    const out = ra.alloc(agg.DecSum, distinct *| space) catch return;
     var speculative = std.heap.ArenaAllocator.init(ra);
     defer speculative.deinit();
     // The cached values belong to the windows' scratch.
     defer for (plan.nodes.items) |*node| {
         node.value = null;
     };
-    windowedSums(ra, speculative.allocator(), plan, roots, partials, space, comp, batch, lookup, outer, rows) catch
+    windowedSums(speculative.allocator(), out, plan, roots, partials, space, comp, batch, lookup, outer, rows) catch
         @memset(partials, null);
 }
 
-/// Fills `partials` for every root, published in `ra` only once every window has folded; the rest lives in `sa`.
+/// Fills `partials` for every root from `sums`, a `DecSum` per composite per distinct root, only once every window has
+/// folded and with nothing left to fail; everything else lives in `sa`.
 fn windowedSums(
-    ra: std.mem.Allocator,
     sa: std.mem.Allocator,
+    sums: []agg.DecSum,
     plan: *expr_eval.ExactPlan,
     roots: []const ?usize,
     partials: []?[]agg.DecSum,
@@ -2225,8 +2228,12 @@ fn windowedSums(
     }
     var present: ?[]u64 = null;
     for (accs) |*acc| if (acc.*) |*ac| try ac.finish(sa, &present, comp, outer);
+    var next: usize = 0;
     for (accs, partials) |acc, *p| if (acc) |ac| {
-        p.* = try ra.dupe(agg.DecSum, ac.delta);
+        const dst = sums[next..][0..space];
+        @memcpy(dst, ac.delta);
+        p.* = dst;
+        next += space;
     };
 }
 

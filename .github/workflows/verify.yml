@@ -100,14 +100,6 @@ jobs:
       - name: Test CLI inspection
         run: zig build test-cli --summary all -j8
 
-      - name: Fetch parquet-testing corpus
-        run: |
-          git clone https://github.com/apache/parquet-testing data/parquet-testing
-          git -C data/parquet-testing checkout --quiet 3acde70509f990c4ddfe34bf3ab05890657e766c
-
-      - name: Generate nested edges fixture
-        run: python3 tools/zpq-gen nested --out data
-
       # Step 1: builds zpq + zpq-lambda for native linux-x86_64. The build
       # downloads the pinned BoringSSL prebuilts (sha256-checked against
       # vendor/boring_tls/prebuilt.sha256) and keeps them in .zig-cache.
@@ -164,33 +156,30 @@ jobs:
           file /tmp/lambda-check/bootstrap | grep -q "statically linked"
           grep -aFq "/2018-06-01/runtime/invocation/" /tmp/lambda-check/bootstrap
 
-      - name: Test module coverage
-        run: python3 tools/check_test_modules.py
-
-      - name: Unit tests
-        run: zig build test --summary all
-
-      - name: Lambda integration tests
-        run: zig build test-integration --summary all
-
-      # Every declared case (answers against DuckDB, written files through PyArrow, CLI contracts, goldens), then
-      # every parquet-testing file (pinned above; bump deliberately) against its declared outcome.
-      - name: zpq-check cases and the parquet-testing corpus
+      # The oracle: DuckDB 2.0's CLI, pinned by the archive's sha256.
+      - name: Install DuckDB 2.0
         run: |
-          zig build -Doptimize=ReleaseFast
-          zig build -Doptimize=ReleaseSafe check
-          # ClickBench needs its 14 GB partitions, which only verify full's hosts keep.
-          cases=(); for f in tools/check/cases/*.json; do [[ $f == *clickbench.json ]] || cases+=(--cases "$f"); done
-          zig-out/bin/zpq-check "${cases[@]}" --no-cache --python .venv/bin/python
+          mkdir -p ~/.cache/zpq-duckdb2/bin-2.0.0 && cd ~/.cache/zpq-duckdb2
+          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
+          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  cli.tar.gz" | sha256sum -c -
+          tar -xzf cli.tar.gz -C bin-2.0.0 duckdb
 
-      # libzpq: the C ABI test, plain and under ASan/LeakSanitizer (gcc), the Python binding and service, and the
-      # differential corpus answered byte for byte as the CLI and the Lambda do. ReleaseFast reuses the build above.
-      - name: libzpq (C ABI, sanitizers, Python, differential)
-        run: OPTIMIZE=ReleaseFast tests/libzpq/run.sh
+      # The commit tier, then every full-tier shard but ClickBench (its 14 GB partitions live on the fleet). Each
+      # writes receipts; each `check` step fails unless its verdict passes for this SHA.
+      - name: Commit tier
+        run: zig build check -Dtier=commit -j8
+      - name: Full tier (units, integration, uncached cases, corpus, OS contracts, libzpq)
+        run: |
+          for shard in units-core units cases corpus os libzpq; do
+            zig build check -Dtier=full -Dshard=$shard -j8
+          done
 
-      # Publication, permissions, pipes, S3 uploads, sync and write faults (a missing sudo or strace skips by name).
-      - name: OS-level contracts
-        run: .venv/bin/python tools/check/contracts.py zig-out/bin/zpq --lib zig-out/lib/libzpq.so
+      - name: Keep the receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipts
+          path: zig-out/receipts
 
   # Each native job runs its installed CLI and, on Linux, Lambda artifacts.
   release-smoke:
@@ -203,13 +192,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-linux-musl
-            deferred: x86_64-macos
           - runner: ubuntu-24.04-arm
             target: aarch64-linux-musl
-            deferred: ''
           - runner: macos-14
             target: aarch64-macos
-            deferred: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -218,7 +204,15 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Build and run the release artifacts
-        run: >-
-          tools/release_smoke.sh --accept-deferred x86_64-macos
-          zig-out/release ${{ matrix.target }} ${{ matrix.deferred }}
+      # The shipped CLI, built as it ships, through the release cases on its own platform.
+      - name: Build and smoke the release artifacts
+        run: |
+          zig build -j8 -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dstrip=true -Drevision=$GITHUB_SHA \
+            --prefix zig-out/release cli lambda
+          zig-out/release/bin/zpq --version | grep -q "$GITHUB_SHA"
+          zig build check-runner -Doptimize=ReleaseSafe -j8
+          zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq zig-out/release/bin/zpq --no-cache
+
+      - name: Lambda against the fake runtime
+        if: runner.os == 'Linux'
+        run: zig build test-integration -Doptimize=ReleaseFast -j8

@@ -463,7 +463,7 @@ pub const SchemaElement = struct {
         var reader = thrift.Reader.init(self.logical_type_raw);
         const field = reader.readFieldBegin() catch return null;
         if (field.type == .Stop) return null;
-        return @enumFromInt(field.id);
+        return @fromBackingInt(@intCast(field.id));
     }
 
     pub fn read(reader: *thrift.Reader) !SchemaElement {
@@ -1476,6 +1476,8 @@ fn mirrors(deprecated: ?[]const u8, typed: ?[]const u8) bool {
 /// `ColumnOrder` member id for IEEE_754_TOTAL_ORDER (FLOAT/DOUBLE/FLOAT16): bounds are the least and greatest non-NaN
 /// values, NaN only for a chunk or page of nothing but NaN, and nan_count is mandatory.
 pub const COLUMN_ORDER_IEEE_754_TOTAL: i16 = 2;
+/// Chronological INT96 order: signed i32 Julian day, then signed i64 nanoseconds of day.
+pub const COLUMN_ORDER_INT96_TIMESTAMP: i16 = 3;
 
 pub const FileMetaData = struct {
     version: i32,

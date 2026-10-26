@@ -214,8 +214,10 @@ fn writtenBounds(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const 
 /// as equal.
 pub fn boundsReadable(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const schema.FileMetaData) bool {
     if (col_idx >= rg.columns.items.len) return false;
-    const fm = file_meta orelse return true;
     const cm = rg.columns.items[col_idx].meta_data orelse return false;
+    // TYPE_ORDER has no INT96 bounds; chronological INT96 statistics are not implemented.
+    if (cm.type == .INT96) return false;
+    const fm = file_meta orelse return true;
     if (fm.column_orders) |co| {
         if (col_idx >= co.items.len) return false;
         const float = cm.type == .FLOAT or cm.type == .DOUBLE;
@@ -901,5 +903,19 @@ test "writer statistics: page suppression includes null-only predicates and drop
         fx.fm.created_by = "parquet-cpp version 1.3.0";
         try testing.expectEqual(prune.Decision.skip, prune.prunePage(&fx.rg, 0, filter, &indexes, &fx.fm, trust));
         fx.fm.created_by = old_cpp;
+    }
+}
+
+test "INT96 bounds are ignored for absent, type-defined and chronological orders" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fx = try ColumnForTest.init(a, leafForTest(.INT96), .{ .min_value = "lo", .max_value = "hi" });
+    try testing.expect(!boundsReadable(&fx.rg, 0, null));
+    try testing.expect(chunkStats(&fx.rg, 0, &fx.fm, .corroborated).bounds == null);
+    for ([_]i16{ schema.COLUMN_ORDER_TYPE_DEFINED, schema.COLUMN_ORDER_INT96_TIMESTAMP }) |order| {
+        fx.fm.column_orders = .empty;
+        try fx.fm.column_orders.?.append(a, order);
+        try testing.expect(chunkStats(&fx.rg, 0, &fx.fm, .corroborated).bounds == null);
     }
 }

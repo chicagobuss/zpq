@@ -438,7 +438,43 @@ def alias_spaces(tmp):
         assert pq.read_table(out).column_names == names, (sql, pq.read_table(out).column_names)
 
 
+def int96_signed_days(tmp):
+    src = FIXTURES / 'int96_from_spark.parquet'
+    exact = -9357363680509551616000
+    rows = [json.loads(line)['a'] for line in query(src).stdout.splitlines()]
+    assert rows[-1] == exact, rows
+    # Both readers overflow microseconds on the last row. The other rows remain independent oracles.
+    arrow = pq.read_table(src, coerce_int96_timestamp_unit='us')['a'].cast(pa.int64()).to_pylist()
+    duck = duckdb.connect().execute('SELECT epoch_us(a) FROM read_parquet(?)', [str(src)]).fetchall()
+    for got, a, (d,) in zip(rows[:-1], arrow[:-1], duck[:-1]):
+        assert got == (a * 1000 if a is not None else None) == (d * 1000 if d is not None else None)
+    for flags in [[], ['--trust-stats'], ['--scan-all']]:
+        got = query(src, '--filter', f'a = {exact}', *flags)
+        assert [json.loads(line)['a'] for line in got.stdout.splitlines()] == [exact], got
+        got = query(src, '--aggregate', 'min(a) AS lo, max(a) AS hi', *flags)
+        assert json.loads(got.stdout) == {'lo': exact, 'hi': 253402225200000000000}, got.stdout
+    # Decimal integer literals are exact; an unrepresentable i128 or calendar literal must refuse.
+    for literal in [str(-(2**127) - 1), "'-999999999999-01-01'"]:
+        query(src, '--filter', f'a = {literal}', ok=False)
+    p = query(src, '--filter', f'a = {exact}', '--format', 'csv')
+    assert p.stdout.splitlines()[-1] == '-294554-12-13 14:58:10.448384000', p.stdout
+    out = tmp / 'int96-too-wide.parquet'
+    p = query(src, '--group-by', 'a', '--aggregate', 'count(*) AS n', '-o', str(out), ok=False)
+    assert 'Int96OutOfRange' in p.stderr or '64-bit nanoseconds' in p.stderr, p.stderr
+    p = query(src, '--filter', 'a < 0', '-o', str(out), ok=False)
+    assert 'INT96 re-encoding' in p.stderr, p.stderr
+    out.unlink(missing_ok=True)
+    query(src, '--filter', "a >= '2000-01-01' AND a < '2100-01-01'", '--group-by', 'a',
+          '--aggregate', 'count(*) AS n', '-o', str(out))
+    got = pq.read_table(out)
+    expected = sorted((v, 1) for v in rows if v is not None and 0 < v < 2**63)
+    assert sorted(zip(got['a'].cast(pa.int64()).to_pylist(), got['n'].to_pylist())) == expected
+    readback = duckdb.connect().execute('SELECT epoch_ns(a), n FROM read_parquet(?)', [str(out)]).fetchall()
+    assert sorted(readback) == expected, readback
+
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
+    int96_signed_days(Path(directory))
     logical_annotations(Path(directory))
     binary_text(Path(directory))
     repeated_fields(Path(directory))

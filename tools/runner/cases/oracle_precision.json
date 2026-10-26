@@ -47,6 +47,24 @@
       "fixture": "nullable_flba",
       "aggregate": "sum(price) AS s, count(price) AS c, min(price) AS lo, max(price) AS hi",
       "duck": "sum(price), count(price), min(price), max(price)"
+    },
+    {
+      "id": "precision:int96-signed-day-exact",
+      "kind": "sql_rows",
+      "fixture": "int96_signed",
+      "sql": "SELECT a FROM '{path}' WHERE a < 0",
+      "duck": "SELECT CAST('-9357363680509551616000' AS HUGEINT) AS a",
+      "jobs": [
+        1,
+        3
+      ],
+      "oracle_note": "Exact signed i32 day arithmetic; Arrow and DuckDB overflow i64 microseconds for this Spark row."
+    }
+  ],
+  "fixture_files": [
+    {
+      "name": "int96_signed",
+      "path": "ci/fixtures/parquet/int96_from_spark.parquet"
     }
   ]
 }

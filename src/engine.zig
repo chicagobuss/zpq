@@ -10982,11 +10982,17 @@ test "regression: an INT96 past what 64-bit nanoseconds hold reads, compares and
         },
         // Spark's: 9999-12-31 03:00 among 2024 dates, and a day count past any calendar.
         .{ .file = "int96_from_spark.parquet", .aggregate = "min(a) AS m, max(a) AS x, count(a) AS n", .values = &.{
-            1704070800000000000, 361727810693890448384000, 5,
+            -9357363680509551616000, 253402225200000000000, 5,
         } },
         .{ .file = "int96_from_spark.parquet", .aggregate = "count(*) AS n", .filter = "a > '2262-12-31'", .values = &.{
-            2,
+            1,
         } },
+        .{
+            .file = "int96_from_spark.parquet",
+            .aggregate = "count(*) AS n",
+            .filter = "a = -9357363680509551616000",
+            .values = &.{1},
+        },
         // `dt3` holds `dt2`'s seconds as nanoseconds, back to 0000-01-01: 1678 of 1971 rows wrapped.
         .{ .file = "int96_bug4903.parquet", .aggregate = "sum(dt3) AS s, min(dt3) AS m", .values = &.{
             -61265237128709000000000, -62167402800000000000,

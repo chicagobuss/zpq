@@ -560,6 +560,7 @@ fn executeAggregate(
     agg_str: []const u8,
     comptime explain: bool,
 ) !if (explain) AggregateExplanation else AggResult {
+    if (args.text_output != null and args.aggregate_sink != null) return error.ConflictingAggregateSinks;
     var changed = false;
     return executeAggregateOver(ctx, arena, args, agg_str, explain, &changed) catch |err|
         if (changed) error.InputChanged else err;
@@ -933,7 +934,6 @@ fn executeAggregateOver(
         .answer_types = answer_types,
     };
     if (args.output == null) if (args.aggregate_sink) |sink| {
-        std.debug.assert(args.text_output == null);
         try sink.write_fn(sink.ctx, answer);
         releaseStreamAnswer(&answer.output);
     };
@@ -6424,6 +6424,67 @@ test "owner text matches materialized rows for wide sums, NULLs and every text f
         try std.testing.expect(drained.integer_stream == null and drained.byte_stream == null);
         try std.testing.expectEqual(@as(usize, 3), drained.rowCount());
         try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+}
+
+test "aggregate consumers conflict before input opening or output in every build mode" {
+    const a = std.testing.allocator;
+    const ctx: Context = .{ .gpa = a, .env = .empty, .io = std.testing.io };
+    var buf: [8]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    var called = false;
+    const Callback = struct {
+        fn write(raw: *anyopaque, _: AggResult) !void {
+            const flag: *bool = @ptrCast(@alignCast(raw));
+            flag.* = true;
+        }
+    };
+    const args: QueryArgs = .{
+        .inputs = &.{"missing-must-not-open.parquet"},
+        .aggregate = "count(*) AS c",
+        .text_output = .{ .format = .json, .sink = &writer },
+        .aggregate_sink = .{ .ctx = &called, .write_fn = Callback.write },
+    };
+    try std.testing.expectError(error.ConflictingAggregateSinks, runQuery(ctx, args));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.ConflictingAggregateSinks, explainAggregate(ctx, arena.allocator(), args));
+    try std.testing.expect(!called);
+    try std.testing.expectEqual(@as(usize, 0), writer.buffered().len);
+}
+
+test "aggregate drains retain input-change precedence over a later write error" {
+    const a = std.testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", a);
+    defer a.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/changed.parquet", .{tmp.sub_path});
+    const Callback = struct {
+        path: []const u8,
+        failure: anyerror,
+        called: bool = false,
+        fn write(raw: *anyopaque, _: AggResult) !void {
+            const c: *@This() = @ptrCast(@alignCast(raw));
+            const fd = try local_fs.createFile(c.path);
+            local_fs.close(fd);
+            c.called = true;
+            return c.failure;
+        }
+    };
+    const ctx: Context = .{ .gpa = a, .env = .empty, .io = std.testing.io };
+    for ([_]anyerror{ error.BrokenPipe, error.NoSpaceLeft, error.WriteFailed }) |failure| {
+        const fd = try local_fs.createFile(path);
+        try local_fs.writeAll(fd, bytes);
+        local_fs.close(fd);
+        var callback: Callback = .{ .path = path, .failure = failure };
+        try std.testing.expectError(error.InputChanged, runQuery(ctx, .{
+            .inputs = &.{path},
+            .aggregate = "count(*) AS c",
+            .aggregate_sink = .{ .ctx = &callback, .write_fn = Callback.write },
+        }));
+        try std.testing.expect(callback.called);
     }
 }
 

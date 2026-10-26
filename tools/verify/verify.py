@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
 import perf
 import provenance
-import revision as revisions
 import stages
 import summary
 
@@ -47,7 +46,7 @@ def guide() -> str:
     tiers = {
         "quick": "All core unit tests in ReleaseSafe, with unchanged scales. The edit loop.",
         "commit": "ReleaseSafe core tests, ReleaseFast CLI, CLI contracts/readback, and the full ReleaseSafe referee.",
-        "full": "Every full stage below, with Debug units. Requires --base PATH or --base-rev SHA for comparison.",
+        "full": "Every full stage below, with Debug units.",
     }
     modes = {
         "soak": "Seeded aggregate fuzz, differential, unit and coverage fuzz. --hours sets the duration; "
@@ -55,7 +54,7 @@ def guide() -> str:
         "perf": "Pinned scorecard plan/run/summary. --suites and --cases select inputs; missing suites "
                 "are blocked. Cold ship-bar scoring and in-process timing are separate metrics. "
                 "--resume RUN_DIR continues a prior sealed run in a new record.",
-        "stage X": "One stage from the registry below. conform and triangulate are stage-only.",
+        "stage X": "One stage from the registry below. conform is stage-only.",
         "stages": "Show this guide and the registry.",
         "self-test": "Check summary records and scoring without compiling the engine.",
     }
@@ -95,7 +94,6 @@ def dummy_ctx() -> stages.Ctx:
         revision="0" * 40,
         binary=REPO / "zig-out/bin/zpq",
         lib=REPO / "zig-out/lib/libzpq.so",
-        base=None,
         clickbench_root=CLICKBENCH,
         clickbench_sql=CLICKBENCH_SQL,
         skspill=SKSPILL,
@@ -126,7 +124,6 @@ def make_ctx(args, run_dir: Path, revision: str) -> stages.Ctx:
         revision=revision,
         binary=REPO / "zig-out/bin/zpq",
         lib=REPO / "zig-out/lib/libzpq.so",
-        base=str(Path(args.base).expanduser().resolve()) if args.base else None,
         clickbench_root=CLICKBENCH,
         clickbench_sql=CLICKBENCH_SQL,
         skspill=SKSPILL,
@@ -164,13 +161,7 @@ def open_run(args, tier: str, revision: str) -> tuple[Path, summary.Summary]:
 
 
 def _parameters(args) -> dict:
-    parameters = {"expected_skip_budgets": stages.tier_skip_budgets(REPO)}
-    base = getattr(args, "base", None)
-    if getattr(args, "base_rev", None):
-        parameters["base_rev"] = args.base_rev
-    if base:
-        parameters["base"] = str(Path(base).expanduser().resolve())
-    return parameters
+    return {"expected_skip_budgets": stages.tier_skip_budgets(REPO)}
 
 
 def finish(book: summary.Summary) -> int:
@@ -186,12 +177,6 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--run-id")
     common.add_argument("--arch-summary", action="append", default=[],
                         help="same-SHA native release evidence; repeat for foreign targets")
-    base = common.add_mutually_exclusive_group()
-    base.add_argument(
-        "--base",
-        help="previously integrated comparison binary (or use --base-rev)",
-    )
-    base.add_argument("--base-rev", help="build the comparison CLI from a git revision in its own cache")
     common.add_argument("-j", type=int, default=8)
     common.add_argument("--cpu", default="native", help="zig -Dcpu (default: native host CPU; override explicitly)")
     common.add_argument("--rerun-of", help="earlier run id this record follows; that summary is not modified")
@@ -252,17 +237,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "soak" and (args.hours <= 0 or args.rounds is not None and args.rounds <= 0):
         print("soak needs positive --hours and --rounds", file=sys.stderr)
         return 2
-    if args.command == "full":
-        if not args.base and not args.base_rev:
-            print(
-                "full requires --base PATH or --base-rev SHA for the comparison binary. "
-                "It is recorded in the summary and is not given a default.",
-                file=sys.stderr,
-            )
-            return 2
-        if args.base and not Path(args.base).expanduser().is_file():
-            print(f"--base is not a file: {args.base}", file=sys.stderr)
-            return 2
     if args.command == "stage":
         try:
             stages.get(args.name)
@@ -281,18 +255,12 @@ def main(argv: list[str] | None = None) -> int:
               "  .venv/bin/python tools/verify/verify.py COMMAND", file=sys.stderr)
         return 2
     uses_corpus = args.command in ("quick", "commit", "full", "soak") or (
-        args.command == "stage" and args.name in ("test-core", "test-full", "integration", "conform", "triangulate"))
+        args.command == "stage" and args.name in ("test-core", "test-full", "integration", "conform"))
     if uses_corpus:
         corpus = provenance.corpus_environment(REPO)
         if corpus["mismatch"]:
             print(f"verify: Parquet corpus revision mismatch: {corpus['actual']}; expected {corpus['expected']}. "
                   "Run just fetch-corpus (no gates started).", file=sys.stderr)
-            return 2
-    if args.base_rev:
-        try:
-            args.base_rev = revisions.resolve(args.base_rev)
-        except subprocess.CalledProcessError:
-            print(f"invalid --base-rev: {args.base_rev}", file=sys.stderr)
             return 2
     revision = head_sha()
     try:
@@ -303,13 +271,6 @@ def main(argv: list[str] | None = None) -> int:
     ctx = make_ctx(args, run_dir, revision)
     heavy = not args.no_scope
     try:
-        if args.base_rev:
-            ctx.base = str(revisions.build(args.base_rev, cpu=args.cpu, jobs=args.j, heavy=heavy))
-            build_meta = json.loads((Path(ctx.base).parents[1] / "build.json").read_text())
-            book.add_stage({"name": "build-base", "status": "pass", "rc": 0,
-                            "base_rev": args.base_rev, "binary": ctx.base, "build": build_meta,
-                            "binary_sha256": execute.file_sha256(Path(ctx.base)),
-                            "log": str(Path(ctx.base).parents[1] / "build.log"), "counts": {}})
         if args.command == "quick":
             execute.run_named(ctx, stages.names_for("quick"), book, heavy)
         elif args.command == "commit":

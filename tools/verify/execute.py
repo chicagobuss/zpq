@@ -114,8 +114,6 @@ def run_stage(ctx: stages.Ctx, name: str, heavy: bool) -> dict:
     record["binary_sha256"] = file_sha256(ctx.binary)
     if name in ("differential", "referee"):
         record["referee_sha256"] = file_sha256(ctx.repo / "zig-out/bin/referee")
-    if name == "fd" and ctx.base:
-        record["base"] = str(Path(ctx.base).expanduser().resolve())
     print(f"{name} {status} rc={rc} {duration:.0f}s", flush=True)
     return record
 

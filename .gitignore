@@ -53,9 +53,6 @@ CURRENT_CONTEXT.md
 # Probe outputs (regeneratable)
 output/
 
-# Vendored hardwood CLI (downloaded prebuilt; large, regeneratable)
-tools/hardwood/
-
 # Conformance report (churns every run)
 tools/conformance_report.tsv
 

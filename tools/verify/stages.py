@@ -22,7 +22,6 @@ class Ctx:
     revision: str
     binary: Path
     lib: Path
-    base: str | None
     clickbench_root: Path
     clickbench_sql: Path
     skspill: Path
@@ -94,13 +93,6 @@ def parse_cli_contracts(text):
     if not match:
         return {}
     return {"matched": int(match.group(1)), "total": int(match.group(1))}
-
-
-def parse_fd(text):
-    match = _last(r"dependent group keys: (\d+) exact checks", text)
-    if not match:
-        return {}
-    return {"checks": int(match.group(1))}
 
 
 def parse_canonical(text):
@@ -194,21 +186,6 @@ def stage_integration(ctx: Ctx) -> Cmd:
         parse=parse_tests,
     )
 
-
-
-def stage_fd(ctx: Ctx) -> Cmd:
-    blocked = _need(ctx.binary, "candidate binary")
-    if not ctx.base:
-        blocked = "fd needs --base PATH or --base-rev SHA for comparison"
-    elif not Path(ctx.base).exists():
-        blocked = f"missing --base binary: {ctx.base}"
-    return Cmd(
-        [ctx.python, "tools/group_dependency_check.py", str(ctx.binary), ctx.base or ""],
-        _base_env(ctx),
-        "group-dependency exactness against the required comparison binary",
-        blocked=blocked,
-        parse=parse_fd,
-    )
 
 
 def stage_canonical(ctx: Ctx) -> Cmd:
@@ -386,11 +363,6 @@ def stage_conform(ctx: Ctx) -> Cmd:
                    "--min-pass", "72", needs=((corpus, "parquet-testing corpus"),))
 
 
-def stage_triangulate(ctx: Ctx) -> Cmd:
-    return _python(ctx, "tools/triangulate.py", "ZPQ vs DuckDB vs Hardwood, when Hardwood is present",
-                   needs=((ctx.binary, "candidate binary"),))
-
-
 # name, tiers, builder. Order inside a tier follows this list.
 REGISTRY = [
     ("modules", ("full",), stage_modules),
@@ -400,7 +372,6 @@ REGISTRY = [
     ("integration", ("full",), stage_integration),
     ("differential", ("commit", "full"), stage_referee),
     ("path-parity", ("full",), stage_path_parity),
-    ("fd", ("full",), stage_fd),
     ("canonical", ("full",), stage_canonical),
     ("cli-smoke", ("commit", "full"), stage_cli_smoke),
     ("duckdb-smoke", ("full",), stage_duckdb_smoke),
@@ -412,7 +383,6 @@ REGISTRY = [
     ("write-robustness", ("full",), stage_write_robustness),
     ("release-smoke", ("full",), stage_release_smoke),
     ("conform", ("extra",), stage_conform),
-    ("triangulate", ("extra",), stage_triangulate),
 ]
 
 

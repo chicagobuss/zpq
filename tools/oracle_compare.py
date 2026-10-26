@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""How zpq's answers are compared with an oracle's (DuckDB, Hardwood, rows decoded by pyarrow).
+"""How zpq's answers are compared with an oracle's (DuckDB, rows decoded by pyarrow).
 
-One policy for the in-process referee and tools/triangulate.py:
+One policy for the in-process referee and the ClickBench check:
 
 - NULL equals only NULL. sum/min/max/avg over no values is NULL on every engine, zpq included; count is never NULL.
 - Integers compare exactly. That includes integral results an oracle widens to DECIMAL or HUGEINT (DuckDB's SUM of

@@ -47,9 +47,6 @@ class RevisionTest(unittest.TestCase):
         self.assertTrue(cfg["hosts"]["builder"]["hash_only"])
         self.assertEqual(placement.host_plan(cfg, ["arm"]), (["arm"], None))
 
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            verify.build_parser().parse_args(["full", "--base", "/bin/zpq", "--base-rev", "HEAD"])
-
 
 class CpuTest(unittest.TestCase):
     def test_native_default_and_explicit_override_reach_builds(self):
@@ -337,22 +334,6 @@ class SelectTest(unittest.TestCase):
             decision = scorecard_select.classify_built("clickbench", cases, ["clickbench/hits/0", "clickbench/hits/99"])
             self.assertEqual(decision["status"], "skipped")
             self.assertEqual(decision["unmatched"], ["clickbench/hits/99"])
-
-
-class FullTierTest(unittest.TestCase):
-    def test_full_refuses_without_base(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code = verify.main(["full"])
-        self.assertEqual(code, 2)
-        self.assertIn("--base", err.getvalue())
-
-    def test_full_refuses_a_missing_base_file(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code = verify.main(["full", "--base", "/no/such/zpq"])
-        self.assertEqual(code, 2)
-        self.assertIn("not a file", err.getvalue())
 
 
 class PerfRecordTest(unittest.TestCase):

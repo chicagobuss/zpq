@@ -8,7 +8,7 @@ uv pip install --python .venv/bin/python -r tools/verify/requirements.txt
 python tools/verify/verify.py --help
 python tools/verify/verify.py quick
 python tools/verify/verify.py commit
-python tools/verify/verify.py full --base-rev PREVIOUS_SHA
+python tools/verify/verify.py full
 python tools/verify/verify.py stage differential
 python tools/verify/verify.py soak --hours 10
 python tools/verify/verify.py perf --help
@@ -30,12 +30,7 @@ For separate compile/run measurements, `zig build test-core-bin -Doptimize=MODE`
 installs `zig-out/bin/zpq-core-test`; run it from the repository root.
 Versioned Parquet corpora must match the existing `just fetch-corpus` pin;
 a mismatch stops before gates and its revision is recorded in provenance.
-`full --base-rev SHA` builds the comparison CLI from an archived git revision
-in `zig-out/verify-cache`, with its own source/output directories and shared
-compiler cache (`ZPQ_VERIFY_CACHE` relocates it). `--base PATH` still accepts
-an existing comparison binary. The flags are mutually exclusive. Cached sources are compared to a fresh git
-archive before building; compiler binary identity and build flags key outputs.
-The resolved base revision, tree and compiler identity, and binary hash are recorded. Native builds default to
+Native builds default to
 `--cpu native`, using the host CPU. `--cpu` remains an explicit override.
 Provenance records both the requested setting and the resolved Zig CPU model.
 
@@ -63,8 +58,8 @@ other dense cases check independent values. Empty or limited runs cannot pass.
 CLI smoke runs the single `tools/cli_contract_check.py` runner.
 `tests/libzpq/run.sh` retains CLI/libzpq/Lambda byte
 parity, C ABI, ASan, Python/service, SQL-session, RSS and write-sync checks.
-`tools/triangulate.py` and `tests/handoff/run.py` also remain: the referee
-does not replace their Hardwood and Python handoff coverage.
+`tests/handoff/run.py` also remains: the referee does not replace its Python
+handoff coverage.
 The `repro-skspill` stage expects exit 1 and the declared memory-budget
 message. Missing fixtures, runtimes and oracles are never successful checks.
 

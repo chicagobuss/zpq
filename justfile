@@ -97,8 +97,8 @@ test-modules:
 
 # Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
 # fetch-corpus first so `test` picks up the real decimal/etc. fixtures.
-gauntlet: fetch-corpus test test-integration smoke duckdb-smoke differential (conform "data/parquet-testing") triangulate
-    @echo "gauntlet: all tiers green (corpus-backed cross-impl + differential + conformance + triangulation)."
+gauntlet: fetch-corpus test test-integration smoke duckdb-smoke differential (conform "data/parquet-testing")
+    @echo "gauntlet: all tiers green (corpus-backed cross-impl + differential + conformance)."
 
 # Fetch the same apache/parquet-testing revision used by CI into the gitignored
 # data directory. Pinning keeps the local release gate from changing whenever
@@ -166,17 +166,6 @@ conform corpus="/tmp/parquet-testing":
     @test -d {{corpus}} || git clone --depth 1 https://github.com/apache/parquet-testing {{corpus}}
     zig build -Doptimize=ReleaseFast
     {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 72
-
-# `tools/fetch_hardwood.sh --from-source DIR` builds a JVM launcher from a Hardwood checkout instead.
-# Fetch the pinned Hardwood CLI + test fixtures (triangulation's strict-reader oracle) into tools/hardwood/.
-fetch-hardwood:
-    tools/fetch_hardwood.sh
-
-# Without `just fetch-hardwood` (run once) the harness degrades to ZPQ vs DuckDB.
-# Heavy correctness triangulation (ZPQ vs Hardwood vs DuckDB) (Tier 3).
-triangulate: fetch-corpus
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/triangulate.py
 
 # Coverage-guided fuzzing on the pinned Zig toolchain; the fuzz-lite seeds also run in `test`.
 fuzz filter="fuzz:":

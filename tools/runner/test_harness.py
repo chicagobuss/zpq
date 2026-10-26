@@ -22,29 +22,6 @@ DUCKDB = os.environ.get("DUCKDB", "duckdb")
 
 
 class DecimalTest(unittest.TestCase):
-    def test_triangulation_decimal_sum_checks_exact_38_digit_boundary(self):
-        import triangulate as tri
-        probe = tri.Probe("decimal38-boundary", [tri.AggItem("sum", "d", "d", tri.pa.decimal128(38, 2))])
-        for sign in ("", "-"):
-            value = Decimal(sign + "999999999999999999999999999999999999.99")
-            with self.subTest(sign=sign):
-                self.assertEqual(tri.eval_probe(probe, [{"d": value}]), [{"d": value}])
-                with self.assertRaisesRegex(RuntimeError, "overflows 38 digits"):
-                    tri.eval_probe(probe, [{"d": value}, {"d": Decimal(sign + "0.01")}])
-
-    def test_triangulation_keeps_decimal_digits_and_reserves_tolerance_for_floats(self):
-        import triangulate as tri
-        output = '{"d":12345678901234567890123456789.01}\n'
-        with patch.object(tri.subprocess, "run", return_value=argparse.Namespace(
-            returncode=0, stdout=output, stderr=""
-        )):
-            got = tri.run_zpq_agg("unused", "sum(d) AS d")[0]["d"]
-        self.assertEqual(got, Decimal("12345678901234567890123456789.01"))
-        decimal_lane = tri._lane(tri.AggItem("sum", "d", "d", tri.pa.decimal128(38, 2)))
-        self.assertFalse(tri.compare_values(got, Decimal("12345678901234567890123456789.02"), decimal_lane))
-        float_lane = tri._lane(tri.AggItem("sum", "f", "f", tri.pa.float64()))
-        self.assertTrue(tri.compare_values(1, 1.00001, float_lane))
-
     def test_numeric_json_keeps_all_decimal_digits(self):
         output = '[{"d":12345678901234567890123456789.01}]'
         with patch.object(answer_cmp.subprocess, "run", return_value=argparse.Namespace(

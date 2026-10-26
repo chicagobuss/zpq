@@ -13402,7 +13402,7 @@ test "summary row counters: every input row, the rows read, and the rows the fil
 }
 
 test "a page that fails to decode is named by file, row group, column and page, on every query kind" {
-    // The torture case dict_index_oob_rle_500: an RLE_DICTIONARY index of 500 into a 12-entry dictionary, in data page
+    // The crafted case dict_index_oob_rle_500: an RLE_DICTIONARY index of 500 into a 12-entry dictionary, in data page
     // 1 (page 0 the dictionary) of `z`; its sibling is valid, so the failure is in the second input.
     const bad = "ci/fixtures/parquet/dict_index_oob.parquet";
     const good = "ci/fixtures/parquet/dict_index_ok.parquet";

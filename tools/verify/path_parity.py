@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Byte parity of referee output cases under the registered in-process execution overrides."""
+"""Byte parity of zpq-check output cases under the registered in-process execution overrides."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 
 
 ROOT = Path(__file__).resolve().parents[2]
-REGISTRY = ROOT / "tools/runner/force_knobs.json"
+REGISTRY = ROOT / "tools/check/force_knobs.json"
 
 
 def normalized(value):
@@ -71,6 +71,23 @@ def check_evidence(kind, before, after):
     return "existing EXPLAIN proves the forced choice"
 
 
+def matrix_ids(m):
+    """Case ids a matrix expands to (zpq-check's `expand`): only ids are needed to find a case's file."""
+    import itertools
+    dims = list(m["vars"])
+    for combo in itertools.product(*(list(m["vars"][d]) for d in dims)):
+        if "cells" in m and combo[1] not in m["cells"].get(combo[0], []):
+            continue
+        env = {}
+        for d, name in zip(dims, combo):
+            env[d] = name
+            env.update(m["vars"][d][name])
+        cid = m["case"]["id"]
+        for _ in range(4):
+            cid = re.sub(r"\$\{([^}]+)\}", lambda x: str(env.get(x.group(1)) or ""), cid)
+        yield cid
+
+
 def run(args):
     knobs = json.loads(REGISTRY.read_text())
     names = {k["name"] for k in knobs}
@@ -78,10 +95,12 @@ def run(args):
     switches = set(re.findall(r'envDisables\([^\n]*?"(ZPQ_[A-Z0-9_]+)"', engine))
     assert switches <= names, f"unregistered execution switches: {switches - names}"
     cases = {}
-    for path in sorted((ROOT / "tools/runner/cases").glob("*.json")):
-        for case in json.loads(path.read_text()).get("cases", []):
-            assert case["id"] not in cases, f"duplicate case id: {case['id']}"
-            cases[case["id"]] = path
+    for path in sorted((ROOT / "tools/check/cases").glob("*.json")):
+        doc = json.loads(path.read_text())
+        ids = [c["id"] for c in doc.get("cases", [])] + [cid for m in doc.get("matrices", []) for cid in matrix_ids(m)]
+        for cid in ids:
+            assert cid not in cases, f"duplicate case id: {cid}"
+            cases[cid] = path
     env = {k: v for k, v in os.environ.items() if k not in names}
     args.out.mkdir(parents=True, exist_ok=False)
     records = []
@@ -96,9 +115,8 @@ def run(args):
             for mode, value in modes:
                 assert time.monotonic() - started < 900, "path-parity stage exceeded 15 minutes"
                 work = args.out / f"{knob['name']}-{index}-{mode}"
-                cmd = [str(args.referee), "--cases", str(cases[case_id]),
-                       "--divergences", "tests/known_divergences.json", "--duckdb", str(args.duckdb),
-                       "--pyarrow", os.sys.executable, "--work", str(work), "--parity-case", case_id]
+                cmd = [str(args.check), "--cases", str(cases[case_id]), "--duckdb", str(args.duckdb),
+                       "--python", os.sys.executable, "--work", str(work), "--parity-case", case_id]
                 if value is not None:
                     cmd.extend(["--force", f"{knob['name']}={value}"])
                 with (args.out / f"{work.name}.log").open("w") as log:
@@ -144,7 +162,7 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--referee", type=Path, required=True)
+    parser.add_argument("--check", type=Path, required=True)
     parser.add_argument("--duckdb", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     run(parser.parse_args())

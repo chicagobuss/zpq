@@ -199,7 +199,7 @@ class TestStageAccountingTest(unittest.TestCase):
 
             def launch(argv, env, cwd, log, heavy):
                 log.parent.mkdir(parents=True, exist_ok=True)
-                log.write_text("0/0 tests passed" if "test" in argv else "referee: 1/1 checks match")
+                log.write_text("0/0 tests passed" if "test" in argv else "check: 1/1 checks match")
                 return 0, 0.1
 
             with patch.object(execute, "run_stage", return_value={"name": "build-fast", "status": "pass"}), \
@@ -254,8 +254,8 @@ class SummaryTest(unittest.TestCase):
 
 class JudgeTest(unittest.TestCase):
     def test_referee_refusals_survive_summary_serialization(self):
-        text = "referee: 606/606 checks match\nreferee: expected 120\nreferee: refusals 120\n"
-        text += "referee: refusal declarations 40\n"
+        text = "check: 606/606 checks match\ncheck: expected 120\ncheck: refusals 120\n"
+        text += "check: refusal declarations 40\n"
         counts = stages.parse_referee(text)
         with tempfile.TemporaryDirectory() as directory:
             book = summary.Summary(Path(directory), {"tier": "commit", "sha": "abc"})

@@ -62,17 +62,17 @@ def parse_tests(text):
 
 
 def parse_referee(text):
-    found = re.search(r"referee: (\d+)/(\d+) checks match", text)
+    found = re.search(r"check: (\d+)/(\d+) checks match", text)
     counts = {}
     if found:
         counts["matched"] = int(found.group(1))
         counts["total"] = int(found.group(2))
     for field, label in (("expected", "expected"), ("refusals", "refusals"),
                          ("refusal_declarations", "refusal declarations")):
-        match = re.search(rf"referee: {label} (\d+)", text)
+        match = re.search(rf"check: {label} (\d+)", text)
         if match:
             counts[field] = int(match.group(1))
-    counts["limited"] = "referee: limited run" in text
+    counts["limited"] = "check: limited run" in text
     return counts
 
 
@@ -299,58 +299,44 @@ def stage_modules(ctx: Ctx) -> Cmd:
     return _python(ctx, "tools/check_test_modules.py", "test-module coverage", parse=parse_modules)
 
 
-REFEREE_CASES = [
-    "tools/runner/cases/filter_projection.json",
-    "tools/runner/cases/sql_pred.json",
-    "tools/runner/cases/agg.json",
-    "tools/runner/cases/sql_query.json",
-    "tools/runner/cases/stats_order.json",
-    "tools/runner/cases/writer_wire.json",
-    "tools/runner/cases/tail.json",
-    "tools/runner/cases/product.json",
-    "tools/runner/cases/packed_count.json",
-    "tools/runner/cases/filtered_records.json",
-    "tools/runner/cases/group_stream.json",
-    "tools/runner/cases/oracle_precision.json",
-]
+CHECK_CASES = sorted(str(p.relative_to(Path(__file__).resolve().parents[2]))
+                     for p in (Path(__file__).resolve().parents[2] / "tools/check/cases").glob("*.json"))
 
 
-def referee_argv(ctx: Ctx) -> list[str]:
-    argv = ["zig-out/bin/referee"]
-    for path in REFEREE_CASES:
+def referee_argv(ctx: Ctx, cached: bool = True) -> list[str]:
+    argv = ["zig-out/bin/zpq-check"]
+    for path in CHECK_CASES:
         argv.extend(["--cases", path])
-    argv.extend(
-        [
-            "--divergences",
-            "tests/known_divergences.json",
-            "--duckdb",
-            str(Path(ctx.duckdb)),
-            "--pyarrow",
-            ctx.python,
-            "--work",
-            str(ctx.run_dir / "referee-work"),
-        ]
-    )
+    argv.extend(["--duckdb", str(Path(ctx.duckdb)), "--python", ctx.python, "--work", str(ctx.run_dir / "check-work")])
+    if not cached:
+        argv.append("--no-cache")
     return argv
 
 
+def _check(ctx: Ctx, about: str, argv: list[str], parse=None) -> Cmd:
+    shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "check")) + " && " + shlex.join(argv)
+    return Cmd(["bash", "-c", shell], _base_env(ctx), about, blocked=_need(Path(ctx.duckdb), "DuckDB 2.0 CLI"),
+               parse=parse)
+
+
 def stage_referee(ctx: Ctx) -> Cmd:
-    duck = Path(ctx.duckdb)
-    shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"))
-    shell += " && " + shlex.join(referee_argv(ctx))
-    return Cmd(
-        ["bash", "-c", shell],
-        _base_env(ctx),
-        "in-process differential referee against the DuckDB CLI",
-        blocked=_need(duck, "DuckDB 2.0 CLI"),
-        parse=parse_referee,
-    )
+    return _check(ctx, "zpq-check against cached DuckDB 2.0 answers", referee_argv(ctx), parse_referee)
+
+
+def stage_referee_fresh(ctx: Ctx) -> Cmd:
+    return _check(ctx, "zpq-check against fresh DuckDB 2.0 answers", referee_argv(ctx, cached=False), parse_referee)
+
+
+def stage_check_self(ctx: Ctx) -> Cmd:
+    argv = ["zig-out/bin/zpq-check", "--self-test", "--no-cache", "--duckdb", ctx.duckdb, "--python", ctx.python,
+            "--work", str(ctx.run_dir / "check-self")]
+    return _check(ctx, "zpq-check rejects the wrong answers and refusals it must", argv)
 
 
 def stage_path_parity(ctx: Ctx) -> Cmd:
-    shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"))
+    shell = shlex.join(_zig_build(ctx, "-Doptimize=ReleaseSafe", "check"))
     shell += " && " + shlex.join([
-        ctx.python, "tools/verify/path_parity.py", "--referee", str(ctx.repo / "zig-out/bin/referee"),
+        ctx.python, "tools/verify/path_parity.py", "--check", str(ctx.repo / "zig-out/bin/zpq-check"),
         "--duckdb", ctx.duckdb, "--out", str(ctx.run_dir / "path-parity"),
     ])
     return Cmd(["bash", "-c", shell], _base_env(ctx), "JSON/Parquet parity across in-process execution overrides",
@@ -370,7 +356,9 @@ REGISTRY = [
     ("build-fast", ("commit", "full"), stage_build_fast),
     ("test-full", ("full",), stage_test_full),
     ("integration", ("full",), stage_integration),
-    ("differential", ("commit", "full"), stage_referee),
+    ("check-self", ("commit", "full"), stage_check_self),
+    ("differential", ("commit",), stage_referee),
+    ("differential-fresh", ("full",), stage_referee_fresh),
     ("path-parity", ("full",), stage_path_parity),
     ("canonical", ("full",), stage_canonical),
     ("cli-smoke", ("commit", "full"), stage_cli_smoke),

@@ -17,7 +17,7 @@ python tools/verify/verify.py perf --help
 No arguments and `--help` show every stage, tier, requirement and exit code.
 `quick` runs every core test in ReleaseSafe, with safety checks and unchanged
 test scales. `commit` uses the same core tests, builds the CLI, runs the CLI
-contracts and independent reader checks, and runs the full differential referee.
+contracts and independent reader checks, and runs zpq-check.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
 Release checks block on non-native targets unless `--arch-summary PATH` supplies
 matching-SHA native evidence (repeat for each target). The Intel macOS runtime
@@ -44,31 +44,19 @@ Exit 0 means required checks passed or matched their declared refusals;
 1 means failure; 2 means a missing prerequisite or incomplete run.
 Build/test stages use a 16 GiB systemd scope, low priority and at most `-j8`.
 
-The referee runs the engine in-process, built with `-Doptimize=ReleaseSafe`.
-Its JSON cases live in `tools/runner/cases/`; `oracle_compare.py` owns numeric
-comparison policy. Decimal digits remain exact through JSON, canonicalization
-and decimal means. Written Parquet is checked by strict PyArrow readers;
-wire and value checks also use DuckDB. SQL refusals declare exact query and
-error kind in `tests/known_divergences.json`; other refusal cases declare
-`expected_error` beside the expected diagnostic. Registry metadata cannot
-waive a failed value comparison. Refusal counts survive into the summary.
-Dense cases marked `skip_duck` explain their narrower byte-parity contract;
-other dense cases check independent values. Empty or limited runs cannot pass.
+Answers are checked by `zpq-check` (`tools/check/README.md`): the engine in-process, built
+with `-Doptimize=ReleaseSafe`, against DuckDB 2.0. `commit` uses the oracle cache and
+`full` asks DuckDB afresh; both run `--self-test` first, which proves the runner rejects
+wrong values, undeclared or misnamed refusals, diverging axis points and empty runs.
 
 CLI smoke runs the single `tools/cli_contract_check.py` runner.
 `tests/libzpq/run.sh` retains CLI/libzpq/Lambda byte
 parity, C ABI, ASan, Python/service, SQL-session, RSS and write-sync checks.
-`tests/handoff/run.py` also remains: the referee does not replace its Python
+`tests/handoff/run.py` also remains: zpq-check does not replace its Python
 handoff coverage.
 The `repro-skspill` stage expects exit 1 and the declared memory-budget
 message. Missing fixtures, runtimes and oracles are never successful checks.
 
-For harness regression checks, build the referee, then run
-`tools/runner/test_harness.py` with `DUCKDB` naming the DuckDB CLI.
-A case file may declare `jobs` once; an individual case can override it.
-Parser-focused cases run once, while scheduling and byte-identity corpora keep
-their worker matrices. Nullable wide-decimal and malformed-stream regressions
-run in the referee and normal units, respectively.
 
 `perf` calls the clean scorecard worktree pinned in `tools/verify/HARNESS`;
 it preserves plan/run/summary semantics. `--suites` and `--cases` declare the

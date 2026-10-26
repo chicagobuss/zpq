@@ -112,8 +112,8 @@ def run_stage(ctx: stages.Ctx, name: str, heavy: bool) -> dict:
     status, counts = judge(cmd, rc, text)
     record = _record(name, status, rc, duration, log_path, counts, cmd)
     record["binary_sha256"] = file_sha256(ctx.binary)
-    if name in ("differential", "referee"):
-        record["referee_sha256"] = file_sha256(ctx.repo / "zig-out/bin/referee")
+    if name.startswith("differential") or name == "check-self":
+        record["check_sha256"] = file_sha256(ctx.repo / "zig-out/bin/zpq-check")
     print(f"{name} {status} rc={rc} {duration:.0f}s", flush=True)
     return record
 
@@ -155,20 +155,20 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
     deadline = time.time() + hours * 3600
     done = 0
     failures = 0
-    ref_log = ctx.run_dir / "logs" / "soak-referee-build.log"
-    print("== soak referee build", flush=True)
+    ref_log = ctx.run_dir / "logs" / "soak-check-build.log"
+    print("== soak check build", flush=True)
     ref_rc, ref_duration = launch(
-        stages._zig_build(ctx, "-Doptimize=ReleaseSafe", "referee"),
+        stages._zig_build(ctx, "-Doptimize=ReleaseSafe", "check"),
         stages._base_env(ctx),
         ctx.repo,
         ref_log,
         heavy,
     )
-    print(f"soak referee build rc={ref_rc} {ref_duration:.0f}s", flush=True)
-    book.add_stage({"name": "soak-referee-build", "status": "pass" if ref_rc == 0 else "fail",
+    print(f"soak check build rc={ref_rc} {ref_duration:.0f}s", flush=True)
+    book.add_stage({"name": "soak-check-build", "status": "pass" if ref_rc == 0 else "fail",
                     "rc": ref_rc, "duration_s": round(ref_duration, 1), "log": str(ref_log), "counts": {}})
     if ref_rc != 0:
-        shutil.copy(ref_log, fail_dir / "referee-build.log")
+        shutil.copy(ref_log, fail_dir / "check-build.log")
         return
     while True:
         if rounds is not None and done >= rounds:
@@ -192,7 +192,7 @@ def run_soak(ctx: stages.Ctx, book: summary_mod.Summary, heavy: bool, hours: flo
                     str(scratch),
                 ],
             ),
-            ("differential", stages.referee_argv(ctx)),
+            ("differential", stages.referee_argv(ctx, cached=False)),
             ("unit", stages.describe("test-full", ctx).argv),
             (
                 "fuzz",

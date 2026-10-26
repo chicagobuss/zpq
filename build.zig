@@ -73,20 +73,20 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("cli", "Build the CLI binary (zpq)");
     cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
 
-    // Differential referee: JSON cases, in-process zpq, DuckDB CLI as the oracle.
-    const referee = b.addExecutable(.{
-        .name = "referee",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/runner/referee.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
+    // The correctness runner: JSON cases, in-process zpq, the DuckDB CLI as the oracle.
+    const check_module = b.createModule(.{
+        .root_source_file = b.path("tools/check/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zpq", .module = cli_zpq.zpq },
+        },
     });
-    const referee_step = b.step("referee", "Build the in-process differential referee");
-    referee_step.dependOn(&b.addInstallArtifact(referee, .{}).step);
+    const check_exe = b.addExecutable(.{ .name = "zpq-check", .root_module = check_module });
+    b.step("check", "Build the correctness runner (zpq-check)").dependOn(&b.addInstallArtifact(check_exe, .{}).step);
+    const check_tests = b.addTest(.{ .root_module = check_module });
+    b.step("check-test", "Run the correctness runner's own tests").dependOn(&b.addRunArtifact(check_tests).step);
 
     const observe_tests = b.option(bool, "observe-tests", "Record named skips through the test protocol") orelse false;
     const cli_tests = b.addTest(.{ .root_module = cli_zpq.root });

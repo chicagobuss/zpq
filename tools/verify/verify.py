@@ -3,7 +3,7 @@
 
     python tools/verify/verify.py            tiers, stages, exit codes
     python tools/verify/verify.py quick      core unit tests
-    python tools/verify/verify.py commit     test-core, ReleaseFast, full referee
+    python tools/verify/verify.py commit     test-core, ReleaseFast, zpq-check
     python tools/verify/verify.py full       the release gate set
     python tools/verify/verify.py soak       seeded loop for a number of hours
     python tools/verify/verify.py perf       pinned scorecard plan/run/summary, then the ship bar
@@ -45,7 +45,7 @@ def guide() -> str:
              "Tiers"]
     tiers = {
         "quick": "All core unit tests in ReleaseSafe, with unchanged scales. The edit loop.",
-        "commit": "ReleaseSafe core tests, ReleaseFast CLI, CLI contracts/readback, and the full ReleaseSafe referee.",
+        "commit": "ReleaseSafe core tests, ReleaseFast CLI, CLI contracts/readback, and zpq-check (cached oracle).",
         "full": "Every full stage below, with Debug units.",
     }
     modes = {

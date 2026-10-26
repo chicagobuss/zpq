@@ -6745,7 +6745,9 @@ fn writeExplainFacts(writer: anytype, explanation: scan.AggregateExplanation) !v
 pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExplanation) !void {
     const a = explanation.aggregate;
     const d = a.plan.dispatch;
-    const merge = if (d.strategy == .partitioned_hash) "shared_partitions" else if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
+    const merge = if (a.dense) "dense_ids" else if (d.strategy == .partitioned_hash)
+        "shared_partitions"
+    else if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
     try writer.print("{{\"ok\":true,\"explain\":true,\"strategy\":\"{s}\",\"merge\":\"{s}\",\"io\":\"{s}\",\"workers\":{d},\"tables\":{d},\"work_items\":{d},\"max_memory\":{d},\"encoded\":{},\"reasons\":[", .{
         a.strategyName(), merge,                  @tagName(explanation.io_mode), a.workers, d.tables,
         a.work_items,     explanation.max_memory, explanation.encoded,

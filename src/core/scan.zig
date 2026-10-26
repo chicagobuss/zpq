@@ -37,6 +37,7 @@ const core_memory = @import("memory.zig");
 const partagg = @import("partagg.zig");
 const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
+const key_pack = @import("expr/key_pack.zig");
 const owner_groups = @import("owner_groups.zig");
 const msd_groups = @import("msd_groups.zig");
 const column_mod = @import("parquet/column.zig");
@@ -2163,9 +2164,9 @@ fn sketchEligible(
     return rankingCall(.count, cfg, args, outputs, calls, keys, filter_cols, use_blocks, filter_ok);
 }
 
-/// Complete dense counts can rank directly only when no later predicate or expression needs losing groups.
-fn denseCountLimit(args: MultiAggArgs, calls: []const expr_agg.AggCall, outputs: ?[]const BoundOutputColumn) ?usize {
-    if (!agg_dense.countOnly(calls)) return null;
+/// Complete dense COUNT or signed SUM ranks need no losing groups when no later predicate or expression reads them.
+fn denseLimit(args: MultiAggArgs, calls: []const expr_agg.AggCall, outputs: ?[]const BoundOutputColumn) ?usize {
+    const ai = if (agg_dense.countOnly(calls)) 0 else agg_dense.sumCall(calls) orelse return null;
     const outs = outputs orelse return null;
     const order = args.result_order;
     const limit = order.limit orelse return null;
@@ -2173,7 +2174,7 @@ fn denseCountLimit(args: MultiAggArgs, calls: []const expr_agg.AggCall, outputs:
         !order.keys[0].descending or order.keys[0].column >= outs.len) return null;
     for (outs) |out| if (out.derived != null) return null;
     const source = outs[order.keys[0].column].source;
-    if (source != .agg or source.agg != 0) return null;
+    if (source != .agg or source.agg != ai) return null;
     return std.math.cast(usize, std.math.add(u64, order.offset, limit) catch return null);
 }
 
@@ -4315,8 +4316,14 @@ fn prepareAggregateWithMetas(
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
+    // Generic composite states share their cache-bound admission with execution and EXPLAIN.
+    const dense_supported = if (domain) |*d|
+        d.axes.len == 1 or agg_dense.countOnly(agg_calls) or agg_dense.sumCall(agg_calls) != null or
+            (!agg_dense.orderSensitive(agg_calls) and agg_dense.numericFits(d.ids(), agg_calls))
+    else
+        false;
     var dense_profitable = true;
-    if (args.encoded) if (domain) |*d| {
+    if (args.encoded and dense_supported) if (domain) |*d| {
         const initial = planAggregate(plan_inputs).dispatch;
         if (d.globalFits(n_workers) and allRescannable(args.inputs) and !initial.use_blocks) {
             const stride = expr_agg.fixedGroupStride(group_by_keys.?) orelse 0;
@@ -4326,12 +4333,12 @@ fn prepareAggregateWithMetas(
                 agg_calls,
                 ndv_stat.?.rows,
                 stride,
-                denseCountLimit(args, agg_calls, group_outputs),
+                denseLimit(args, agg_calls, group_outputs),
             ).total;
             // Uniform bounds can hide skew. Before replacing dense by survivor-sized state, require a proven
             // share or count a sample. A budget retry disables this cost rule and can restore the lanes.
             if (args.plain_rules and args.filter != null and passShare(plan_inputs) <= selective_share and
-                denseCountLimit(args, agg_calls, group_outputs) != null and
+                denseLimit(args, agg_calls, group_outputs) != null and
                 quote > selectedGroupBytes(ndv_stat.?, agg_calls.len, n_workers, passShare(plan_inputs)))
             {
                 var share = provenPassShare(plan_inputs);
@@ -4558,7 +4565,7 @@ fn prepareAggregateWithMetas(
         block_bounds = bounds;
     }
     // A dense fold (below) needs one table more, after the workers': the one its lanes merge into.
-    const dense_wanted = dense_profitable and domain != null and domain.?.globalFits(n_workers) and
+    const dense_wanted = dense_supported and dense_profitable and domain != null and domain.?.globalFits(n_workers) and
         decision.strategy == .plain_hash and !use_blocks and !part_on;
     const all_tables = try arena.alloc(expr_agg.GroupTable, n_tables + @intFromBool(dense_wanted));
     const group_tables = all_tables[0..n_tables];
@@ -4602,13 +4609,15 @@ fn prepareAggregateWithMetas(
     // tables: no group lookups per row group and no hash merge. Taken only when walking every worker's lanes costs no
     // more than the lookups it replaces (one per dictionary entry per row group), and when the domain and every lane
     // fit the shared budget, drawn before any worker starts.
-    const dense_cut = denseCountLimit(args, agg_calls, group_outputs);
+    const dense_cut = denseLimit(args, agg_calls, group_outputs);
     const dense_rule = if (plan_inputs.dense_bytes != null and decision.strategy == .plain_hash) rule: {
         var ordinary = plan_inputs;
         ordinary.dense_bytes = null;
         break :rule planAggregate(ordinary).dispatch.strategy != .plain_hash;
     } else false;
     if (dense_rule) if (args.taken) |taken| taken.insert(.plain_rule);
+    var dense_identity: ?key_pack.Plan = null;
+    defer if (dense_identity) |*identity| identity.deinit(gpa);
     var dense_lanes: []agg_dense.Lanes = &.{};
     var dense_charge: usize = 0;
     defer group_budget.release(dense_charge);
@@ -4625,14 +4634,46 @@ fn prepareAggregateWithMetas(
             if (dense_rule) return error.ExceededMemoryBudget;
             break :dense;
         };
+        var positions: ?agg_dense.Ordinals = null;
+        if (d.axes.len > 1 and agg_dense.sumCall(agg_calls) != null) {
+            dense_identity = try key_pack.Plan.init(gpa, group_by_keys.?, d);
+            if (dense_identity == null or dense_identity.?.kind() != .dense_u32) break :dense;
+            if (ndv_stat.?.rows < @as(u64, 1) << 31) {
+                if (work_items.items.len > d.axes[0].trans.len) break :dense;
+                const starts = try arena.alloc(u32, work_items.items.len + 1);
+                starts[0] = 0;
+                var total: u64 = 0;
+                for (work_items.items, 0..) |item, i| {
+                    const rows = metas[item.file].row_groups.items[item.rg].num_rows;
+                    total = std.math.add(u64, total, @intCast(@max(0, rows))) catch break :dense;
+                    if (total >= @as(u64, 1) << 31) break :dense;
+                    starts[i + 1] = @intCast(total);
+                }
+                positions = agg_dense.Ordinals.init(starts) orelse break :dense;
+                if (positions.?.rows() != ndv_stat.?.rows) break :dense;
+            }
+        }
         dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
-        for (dense_lanes) |*l| l.* = .{ .domain = d, .calls = agg_calls, .rows = ndv_stat.?.rows };
+        for (dense_lanes) |*l| l.* = .{
+            .domain = d,
+            .calls = agg_calls,
+            .rows = ndv_stat.?.rows,
+            .positions = positions,
+        };
         if (args.taken) |taken| taken.insert(.dense);
     }
-    if (dense_lanes.len == 0) if (domain) |*d| {
-        d.deinit(gpa);
-        domain = null;
-    };
+    if (dense_lanes.len == 0) {
+        group_budget.release(dense_charge);
+        dense_charge = 0;
+        dense_table_charge = 0;
+        if (dense_identity) |*identity| identity.deinit(gpa);
+        dense_identity = null;
+        if (dense_rule) return error.ExceededMemoryBudget;
+        if (domain) |*d| {
+            d.deinit(gpa);
+            domain = null;
+        }
+    }
     const spill_on = dense_lanes.len == 0 and !part_on and args.spill and
         decision.strategy == .plain_hash and !use_blocks and fixed_stride == 0 and partAggSupported(args, agg_calls, group_by_keys != null) and rescannable;
     if (args.taken) |taken| {
@@ -4859,6 +4900,7 @@ fn prepareAggregateWithMetas(
     // the process, when it is about to exit, as the tables do). Row groups no lane took sit in the worker tables, which
     // then merge with it as usual.
     var dense_merged = false;
+    var dense_direct: ?*agg_dense.Lanes = null;
     // Left to the exit with the tables, but freed if a later refusal runs the scan again (`runMultiAggregate`).
     var left_lanes: []agg_dense.Lanes = &.{};
     var left_domain: ?agg_dense.Domain = null;
@@ -4874,29 +4916,41 @@ fn prepareAggregateWithMetas(
         group_budget.release(dense_table_charge);
         dense_charge -= dense_table_charge;
         const cut = if (dense_cut) |h| only_lanes: {
+            if (!agg_dense.countOnly(agg_calls) and dense_keys.len == 1) break :only_lanes null;
             for (group_tables) |*table| if (table.groupCount() != 0) break :only_lanes null;
             break :only_lanes @as(?usize, h);
         } else null;
         const dense_start = if (prof != null) nowMonoNs() else 0;
-        try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut);
-        if (prof != null and dense_table.groupCount() != 0) profile.record(
+        const direct = only_lanes: {
+            if (agg_dense.sumCall(agg_calls) == null or dense_keys.len < 2) break :only_lanes false;
+            for (group_outputs.?) |out| if (out.derived != null) break :only_lanes false;
+            for (group_tables) |gt| if (gt.groupCount() != 0) break :only_lanes false;
+            break :only_lanes true;
+        };
+        if (direct) {
+            dense_direct = try agg_dense.merge(gpa, arena, dense_lanes, n_workers);
+        } else try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut);
+        if (prof != null) profile.record(
             prof,
             .dense_fold,
             dense_start,
             nowMonoNs(),
-            profile.args(.{ dense_table.groupCount(), n_workers }),
+            profile.args(.{ if (dense_direct) |d| d.groupCount() else dense_table.groupCount(), n_workers }),
         );
-        if (leave_tables) {
-            left_lanes = dense_lanes;
-            left_domain = domain;
-        } else {
-            for (dense_lanes) |*l| l.deinit(gpa);
-            domain.?.deinit(gpa);
+        // Direct answers borrow the lanes and domain until this frame returns.
+        if (dense_direct == null) {
+            if (leave_tables) {
+                left_lanes = dense_lanes;
+                left_domain = domain;
+            } else {
+                for (dense_lanes) |*l| l.deinit(gpa);
+                domain.?.deinit(gpa);
+            }
+            dense_lanes = &.{};
+            domain = null;
+            group_budget.release(dense_charge);
+            dense_charge = 0;
         }
-        dense_lanes = &.{};
-        domain = null;
-        group_budget.release(dense_charge);
-        dense_charge = 0;
         dense_merged = true;
     }
     // Coded sets stay on their ordinary union when no worker emitted a pair. Otherwise every complete identity
@@ -4983,7 +5037,9 @@ fn prepareAggregateWithMetas(
             try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);
         const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
         // One table already holds complete ranks; its top-H heap avoids materializing every losing group.
-        const cut: ?[]const u32 = if (candidates == null and out_tables.len == 1)
+        const cut: ?[]const u32 = if (dense_direct) |d|
+            try agg_dense.reached(arena, d, dense_cut)
+        else if (candidates == null and out_tables.len == 1)
             try resultLimitGroups(
                 arena,
                 &out_tables[0],
@@ -5080,7 +5136,15 @@ fn prepareAggregateWithMetas(
         var in_place_tables: []const expr_agg.GroupTable = &.{};
         // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
         // borrowed until the rows are built.
-        if (spilled) {
+        if (dense_direct) |d| {
+            try slots.ensureTotalCapacity(lists, group_refs.len);
+            for (group_refs) |ref| slots.appendAssumeCapacity(.{
+                .key = &.{},
+                .first = d.position(ref.group),
+                .idx = ref.group,
+            });
+            folded = false;
+        } else if (spilled) {
             const ps = &part_state.?;
             try fillFromPartitions(
                 gpa,
@@ -5146,6 +5210,8 @@ fn prepareAggregateWithMetas(
             .in_place = in_place_tables,
             .single = if (folded) null else &out_tables[0],
             .fixed_keys = if (spilled) fixed_stride != 0 else out_tables[0].fixed_stride != 0,
+            .dense = dense_direct,
+            .identity = if (dense_identity) |*identity| identity else null,
         };
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
             order.hidden.len == 0;
@@ -5154,7 +5220,8 @@ fn prepareAggregateWithMetas(
         // stays drawn while the query holds it (the engine's ledger outlives it). Refused, it is the merge's refusal:
         // on one worker the tables it reads are one.
         if (args.ledger != null) {
-            const bytes = answerBytes(slots.items, col_types, key_types, typed);
+            const bytes = answerBytes(slots.items, col_types, key_types, typed) +|
+                row_src.denseStringBytes();
             answer_charge = group_budget.drawExact(bytes) orelse {
                 if (args.taken) |taken| taken.insert(.merge_memory);
                 return error.ExceededMemoryBudget;
@@ -7383,6 +7450,38 @@ const RowSource = struct {
     single: ?*const expr_agg.GroupTable = null,
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
+    dense: ?*const agg_dense.Lanes = null,
+    identity: ?*const key_pack.Plan = null,
+
+    fn denseStringBytes(s: *const RowSource) usize {
+        const d = s.dense orelse return 0;
+        var per_row: usize = 0;
+        for (s.outputs) |out| if (out.source == .key) {
+            switch (d.domain.axes[out.source.key].values) {
+                .bytes => |values| {
+                    var widest: usize = 0;
+                    for (values) |v| widest = @max(widest, v.len);
+                    per_row +|= std.mem.alignForward(usize, widest, 16) +| 16;
+                },
+                else => {},
+            }
+        };
+        return s.slots.len *| per_row;
+    }
+
+    fn outputKey(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, out: BoundOutputColumn) !AggValue {
+        if (s.dense != null) {
+            const identity = s.identity orelse return error.BadGroupKey;
+            return switch (try identity.keyValue(.{ .dense_u32 = @intCast(slot.idx) }, out.source.key)) {
+                .null_val => .null_val,
+                .i => |v| .{ .i = v },
+                .s => |v| .{ .s = try gpa.dupe(u8, v) },
+            };
+        }
+        var buf: [48]u8 = undefined;
+        const bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &buf) else slot.key;
+        return s.keyValue(gpa, bytes, out);
+    }
 
     fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn) !AggValue {
         const e = out.derived orelse return deserializeKeyColumn(gpa, bytes, out.source.key, s.key_types);
@@ -7430,8 +7529,10 @@ const RowSource = struct {
         group: usize,
         accs: []const expr_agg.Accumulator,
         folded: bool,
+        dense: ?*const agg_dense.Lanes = null,
 
         inline fn value(r: IntegerRow, ai: usize, func: expr_agg.AggFunc) !?i128 {
+            if (r.dense) |d| return d.integer(r.group, ai);
             const x: ?i128 = if (r.table != null and r.table.?.compact.stride != 0)
                 r.table.?.compact.integer(r.group, ai)
             else switch (func) {
@@ -7448,6 +7549,13 @@ const RowSource = struct {
     };
 
     fn integerRow(s: *const RowSource, slot: MergedSlot) IntegerRow {
+        if (s.dense) |d| return .{
+            .table = null,
+            .group = slot.idx,
+            .accs = &.{},
+            .folded = false,
+            .dense = d,
+        };
         const table = if (s.in_place.len > 0) &s.in_place[slot.idx >> 32] else s.single;
         const group = if (s.in_place.len > 0) @as(u32, @truncate(slot.idx)) else slot.idx;
         const compact = table != null and table.?.compact.stride != 0;
@@ -7466,6 +7574,13 @@ const RowSource = struct {
     /// Fill `vals`, the row's slab cells, all NULL, for `slot`. Each value is set only once built, so on an error the
     /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
     fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
+        if (s.dense) |d| {
+            for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
+                .key => try s.outputKey(gpa, slot, out),
+                .agg => |ai| try materializeOne(gpa, s.calls[ai], d.accumulator(slot.idx, ai)),
+            };
+            return;
+        }
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
         const table: ?*const expr_agg.GroupTable = if (s.in_place.len > 0)
             &s.in_place[slot.idx >> 32]
@@ -7477,11 +7592,8 @@ const RowSource = struct {
             table.?.accumulators.items[@as(usize, group) * s.calls.len ..][0..s.calls.len]
         else
             s.accs[at..][0..s.calls.len];
-        // A fixed image pads a null column with zeros; the reader wants that payload omitted.
-        var ser_buf: [48]u8 = undefined;
-        const key_bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &ser_buf) else slot.key;
         for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
-            .key => try s.keyValue(gpa, key_bytes, out),
+            .key => try s.outputKey(gpa, slot, out),
             .agg => |a_idx| blk: {
                 const acc = if (compact) table.?.readAcc(group, a_idx, s.calls.len) else accs[a_idx];
                 break :blk try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
@@ -7889,11 +8001,9 @@ const ColumnBuildTask = struct {
         const s = t.src;
         const slot = s.slots[i];
         const row = s.integerRow(slot);
-        var buf: [48]u8 = undefined;
-        const key = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &buf) else slot.key;
         for (s.outputs, t.types, t.answer.columns, 0..) |out, ty, *col, ci| switch (out.source) {
             .key => {
-                const v = try s.keyValue(t.gpa, key, out);
+                const v = try s.outputKey(t.gpa, slot, out);
                 TypedAnswer.put(col, ty, i, v) catch |e| {
                     if (v == .s) t.gpa.free(v.s);
                     t.narrowing(e, ci, i);
@@ -20489,14 +20599,24 @@ test "budget narrowing requires rescannable inputs for every restart reason" {
 }
 
 test "dense composite counts arm globally and preserve selected first through windows" {
+    try denseProductScan(false);
+}
+
+test "dense composite SUM arms globally and preserves selected first through windows" {
+    try denseProductScan(true);
+}
+
+fn denseProductScan(with_sum: bool) !void {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var ints: [256]i32 = undefined;
     var names: [256][]const u8 = undefined;
+    var values: [256]i64 = undefined;
     for (&ints, &names, 0..) |*v, *s, i| {
         v.* = @intCast(i % 3);
+        values[i] = @as(i64, @intCast(i % 7)) - 3;
         s.* = try std.fmt.allocPrint(a, "name\x00-{d}", .{i % 64});
     }
     const columns = [_]expr_agg.OutputCol{
@@ -20507,6 +20627,7 @@ test "dense composite counts arm globally and preserve selected first through wi
             .parquet_type = .BYTE_ARRAY,
             .nullable = false,
         },
+        .{ .name = "v", .col = .{ .i64 = .{ .values = &values } }, .parquet_type = .INT64, .nullable = false },
     };
     const Capture = struct {
         bytes: std.ArrayList(u8) = .empty,
@@ -20534,12 +20655,16 @@ test "dense composite counts arm globally and preserve selected first through wi
     var args: MultiAggArgs = .{
         .inputs = &.{.{ .name = "product", .bytes = capture.bytes.items }},
         .metas = &.{meta},
-        .aggregate = "count(*) AS c",
+        .aggregate = if (with_sum) "count(*) AS c,sum(v) AS s" else "count(*) AS c",
         .group_by = "a,b",
         .filter = "a < 2",
         .parallelism = 1,
         .min_bytes_per_worker = 1,
-        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3, .offset = 1 },
+        .result_order = .{
+            .keys = &.{.{ .column = if (with_sum) 3 else 2, .descending = true }},
+            .limit = 3,
+            .offset = 1,
+        },
         .dense = false,
         .max_memory = 4 << 20,
         .sketch_topk = .{ .cell_bits = 12 },
@@ -20557,13 +20682,32 @@ test "dense composite counts arm globally and preserve selected first through wi
         try testing.expectEqual(.plain_hash, explanation.plan.dispatch.strategy);
         try testing.expectEqualStrings("dense", explanation.strategyName());
         try testing.expectEqual(j, explanation.workers);
-        if (j == 16) try testing.expect(explanation.plan.plain_bytes.? > args.max_memory / 8);
+        if (j == 16 and !with_sum) try testing.expect(explanation.plan.plain_bytes.? > args.max_memory / 8);
         var got = try prepareAggregate(gpa, a, args, false);
         defer got.deinit(gpa);
         try testing.expect(taken.contains(.dense));
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
     };
+    if (with_sum) {
+        args.result_order = .{};
+        args.dense = false;
+        args.taken = null;
+        var full = try runMultiAggregate(gpa, a, args);
+        defer full.deinit(gpa);
+        for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+            var taken: std.EnumSet(FastPath) = .{};
+            args.parallelism = j;
+            args.decode_batch_rows = window;
+            args.dense = true;
+            args.taken = &taken;
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.dense));
+            try testing.expectEqualDeep(full.output.group_rows.?, got.output.group_rows.?);
+        };
+        return;
+    }
     args.encoded = false;
     const legacy = try explainAggregate(gpa, a, args);
     try testing.expectEqual(.sketch, legacy.plan.dispatch.strategy);

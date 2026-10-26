@@ -225,7 +225,8 @@ clean:
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
 
-# OS-level contracts (publication, permissions, pipes, S3 uploads, sync and write faults); full tier.
+# OS-level contracts (publication, permissions, pipes, S3 uploads, sync and write faults); full tier. The
+# loop-device and device-mapper contracts skip by name: on a dedicated host with passwordless sudo, add --privileged.
 contracts:
     zig build -Doptimize=ReleaseFast
     zig build libzpq -Doptimize=ReleaseFast

@@ -3,10 +3,12 @@
 write faults. Everything a query answers lives in tools/check/cases; this file holds only what needs the operating
 system staged around the process.
 
-  contracts.py ZPQ_BIN [--lib LIBZPQ_SO] [--only NAME]
+  contracts.py ZPQ_BIN [--lib LIBZPQ_SO] [--only NAME] [--privileged]
 
-Each contract is a function named for what it pins. A contract may skip only for a named environmental need in
-NEEDS (sudo for loop devices, strace, libzpq); any other skip, and any failure, exits 1. Runs in the full tier.
+Each contract is a function named for what it pins. A contract may skip only for a named need in NEEDS; any other
+skip, and any failure, exits 1. Runs in the full tier. The filesystem-fault contracts mount loop devices and
+device-mapper targets, a change to the host: they run only with --privileged, on a dedicated host with passwordless
+sudo, and otherwise skip by name.
 """
 import argparse
 import multiprocessing
@@ -31,13 +33,15 @@ import pyarrow.parquet as pq
 
 REPO = Path(__file__).resolve().parents[2]
 NEEDS = {
-    "sudo": "loop-mounted filesystems and device-mapper error targets need passwordless sudo",
+    "privileged": "loop-mounted filesystems and device-mapper error targets change the host: run with --privileged",
+    "sudo": "--privileged needs passwordless sudo",
     "strace": "syscall tracing and fault injection need strace",
     "libzpq": "library recovery needs libzpq.so (zig build libzpq)",
 }
 EARLIER = b"earlier result must remain"
 CONTRACTS = []
 ZPQ = LIB = None
+PRIVILEGED = False
 
 
 class Skip(Exception):
@@ -278,9 +282,12 @@ def publication_stages_exclusively_and_renames_last(root, clean, corrupt, distin
     p = subprocess.run([*strace("-e", "trace=openat,close,fchmod,renameat", "-o", trace), ZPQ, "query", small,
                         "-o", dst], capture_output=True, timeout=30)
     assert p.returncode == 0 and not p.stdout, p.stderr
-    opens = [line for line in trace.read_text().splitlines() if line.startswith("openat(") and '.zpq-tmp"' in line]
+    calls = [re.sub(r"^\d+ +", "", line) for line in trace.read_text().splitlines()]  # -f prefixes thread ids
+    opens = [line for line in calls if line.startswith("openat(") and '.zpq-tmp"' in line]
     assert len(opens) == 1 and "O_EXCL" in opens[0] and "O_TRUNC" not in opens[0], opens
-    assert f"fchmod({re.search(r'= (\d+)$', opens[0]).group(1)}," in trace.read_text()
+    fd = re.search(r"= (\d+)$", opens[0]).group(1)
+    assert any(line.startswith(f"fchmod({fd},") for line in calls)
+    assert pq.read_table(dst).num_rows == 3
     dst.write_bytes(EARLIER)
     p = subprocess.run([*strace("-e", "inject=renameat:error=EIO:when=1", "-o", trace), ZPQ, "query", small,
                         "-o", dst], capture_output=True, timeout=30)
@@ -433,7 +440,7 @@ def a_profile_trace_publishes_only_when_complete(root, clean, corrupt, distinct,
     body = __import__("json").loads(trace.read_text())
     assert body["traceEvents"] and body["zpq"]["omitted_events"] == 0, body["zpq"]
     never = root / "prof_never.parquet"
-    p = run(small, "-o", never, "--profile", root / "no/such/dir/t.json", code=1)
+    p = run(small, "-o", never, "--profile", root / "no/such/dir/t.json", code=2)
     assert not never.exists() and not p.stdout and b"cannot write profile" in p.stderr, p
     kept = root / "prof_kept.json"
     kept.write_text("earlier\n")
@@ -443,13 +450,15 @@ def a_profile_trace_publishes_only_when_complete(root, clean, corrupt, distinct,
     (root / "prof_dir").mkdir()
     out = root / "prof_dir_out.parquet"
     out.write_text("earlier\n")
-    assert not run(small, "-o", out, "--profile", root / "prof_dir", code=1).stdout and out.read_text() == "earlier\n"
-    run(small, "-o", root / "prof_dev_out.parquet", "--profile", "/dev/null", code=1)
+    assert not run(small, "-o", out, "--profile", root / "prof_dir", code=2).stdout and out.read_text() == "earlier\n"
+    run(small, "-o", root / "prof_dev_out.parquet", "--profile", "/dev/null", code=2)
     assert not (root / "prof_dev_out.parquet").exists()
     no_staging(root)
 
 
 def sudo(*args):
+    if not PRIVILEGED:
+        raise Skip("privileged")
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
         raise Skip("sudo")
     subprocess.run(["sudo", *map(str, args)], check=True, capture_output=True)
@@ -463,10 +472,10 @@ class Loop:
         self.dm, self.loop = (f"zpq_contract_{os.getpid()}_{name}" if error_target else None), None
 
     def __enter__(self):
+        sudo("true")  # skips by name before anything touches the host
         self.mnt.mkdir()
         subprocess.run(["truncate", "-s", "16M", self.img], check=True)
         if self.dm:
-            sudo("true")
             self.loop = subprocess.check_output(["sudo", "losetup", "--find", "--show", self.img]).decode().strip()
             sudo("dmsetup", "create", self.dm, "--table", f"0 32768 linear {self.loop} 0")
             self.dev = f"/dev/mapper/{self.dm}"
@@ -534,14 +543,16 @@ def a_failing_device_keeps_the_earlier_target(root, clean, corrupt, distinct, sm
 
 
 def main():
-    global ZPQ, LIB
+    global ZPQ, LIB, PRIVILEGED
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("zpq", nargs="?")
     ap.add_argument("--lib")
     ap.add_argument("--only")
     ap.add_argument("--lib-sync-worker", type=Path)
+    ap.add_argument("--privileged", action="store_true", help="also run the contracts that mount loop devices")
     args = ap.parse_args()
     LIB = Path(args.lib).resolve() if args.lib else None
+    PRIVILEGED = args.privileged
     if args.lib_sync_worker:
         return lib_sync_worker(args.lib_sync_worker)
     ZPQ = str(Path(args.zpq).resolve())

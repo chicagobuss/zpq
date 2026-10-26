@@ -50,9 +50,11 @@ with `-Doptimize=ReleaseSafe`, against DuckDB 2.0. `commit` uses the oracle cach
 wrong values, undeclared or misnamed refusals, diverging axis points and empty runs.
 
 The CLI's answers, text and written files are zpq-check cases (`tools/check/cases/cli_*.json`, goldens under
-`tools/check/goldens`); what needs the operating system staged around the process is `tools/check/contracts.py`,
-the full tier's `contracts` stage. `tests/libzpq/run.sh` retains CLI/libzpq/Lambda byte parity, C ABI, ASan,
-Python/service, SQL-session and RSS checks.
+`tools/check/goldens`); what needs the operating system staged around the process is `tools/check/contracts.py`, the
+full tier's `contracts` stage. Its filesystem-fault contracts mount loop devices and device-mapper targets, so no
+tier runs them: they skip by name unless `--privileged` is given, on a dedicated host with passwordless sudo.
+`tests/libzpq/run.sh` retains CLI/libzpq/Lambda byte parity, C ABI, ASan, Python/service, SQL-session and RSS
+checks.
 `tests/handoff/run.py` also remains: zpq-check does not replace its Python
 handoff coverage.
 The `repro-skspill` stage expects exit 1 and the declared memory-budget

@@ -1853,6 +1853,9 @@ const Worker = struct {
     /// The decode scratch's (page and dictionary buffers, kept across row groups), beside `region`, which the row
     /// group arena has to itself (`consumer.RowGroupArena.initOn`). Drawn from `ledger` as `region` is.
     scratch_region: ?huge_pages.Region = null,
+    /// A single final pass can retire its regions on the owning worker instead of a serial post-join tail.
+    retire_after_run: bool = false,
+    retired_decode_held: bool = false,
     decode_budget: ?*consumer.DecodeBudget = null,
     /// The query's ledger, which the region and `charged` draw from; null draws nothing.
     ledger: ?*expr_agg.SharedBudget = null,
@@ -1867,6 +1870,7 @@ const Worker = struct {
 
 fn resetAttemptFlags(w: *Worker) void {
     // These classify this attempt only. Retained mappings and charged allocators survive optional phases.
+    w.retired_decode_held = false;
     if (w.region) |*r| r.refused = false;
     if (w.scratch_region) |*r| r.refused = false;
     if (w.charged) |*c| {
@@ -1890,6 +1894,13 @@ fn workerRun(w: *Worker) void {
     consumer.setDecodeFailure(null);
     w.failure_work = null;
     resetAttemptFlags(w);
+    defer if (w.retire_after_run) {
+        // Keep refusal classification after returning the actual pages and their ledger charges.
+        w.retired_decode_held = decodeHeld(w);
+        const release = profile.Span.begin(prof);
+        retireRegions(w);
+        release.end(.worker_release, profile.args(.{w.index}));
+    };
     workerRunErr(w, prof, &items) catch |e| {
         w.err = workerRefusal(w, e);
         w.failure = consumer.decodeFailure();
@@ -1945,6 +1956,7 @@ fn ownedWinnerBytes(accs: []const expr_agg.Accumulator) usize {
 
 /// Whether the worker drew decode memory from the query's ledger, past its region's allowance, or was refused it.
 fn decodeHeld(w: *const Worker) bool {
+    if (w.retired_decode_held) return true;
     if (w.region) |r| if (r.charged > 0 or r.spilled > 0 or r.refused) return true;
     if (w.scratch_region) |r| if (r.charged > 0 or r.spilled > 0 or r.refused) return true;
     if (w.charged) |c| return c.drew.load(.monotonic) or c.refused.load(.monotonic);
@@ -4978,6 +4990,11 @@ fn prepareAggregateWithMetas(
             .auto_decode_batches = args.auto_decode_batches,
             .cache_hints = &cache_hints,
             .scan_workers = n_workers,
+            .retire_after_run = args.leave_regions and (args.ledger != null or private_decode.held > 0) and
+                switch (decision.strategy) {
+                    .scalar, .plain_hash, .partitioned_hash => true,
+                    .first_keys, .sketch => false,
+                },
             .error_outputs = error_outputs,
             .error_group_keys = error_group_keys,
             .failure_probe = args.failure_probe,
@@ -20615,6 +20632,54 @@ test "cost hint and previous attempt refusals never classify a later host OOM" {
     // A real refusal in this attempt still classifies normally.
     try testing.expectError(error.OutOfMemory, w.charged.?.allocator().alloc(u8, 1));
     try testing.expectEqual(error.ExceededMemoryBudget, workerRefusal(&w, error.OutOfMemory));
+}
+
+test "exiting final-pass workers retire charged regions before join and preserve refusal history" {
+    const gpa = testing.allocator;
+    const plan: agg_plan.Plan = undefined; // Empty work never consults the query plan.
+    for ([_]bool{ false, true }) |retire| {
+        var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        var cursor: std.atomic.Value(usize) = .init(0);
+        var workers: [4]Worker = undefined;
+        for (&workers, 0..) |*w, i| {
+            var pair = huge_pages.takePair(gpa, WORKER_REGION_RESERVE);
+            pair.arena.budget = &budget;
+            pair.scratch.budget = &budget;
+            const pages = try pair.arena.allocator().alloc(u8, 4 << 20);
+            @memset(pages, 17);
+            w.* = .{
+                .gpa = gpa,
+                .inputs = &.{},
+                .metas = &.{},
+                .work = &.{},
+                .cursor = &cursor,
+                .agg_calls = &.{},
+                .plan = &plan,
+                .decode_options = .{},
+                .ledger = &budget,
+                .region = pair.arena,
+                .scratch_region = pair.scratch,
+                .retire_after_run = retire,
+                .index = i,
+            };
+        }
+        defer releaseRegions(&workers);
+        try testing.expect(budget.used.load(.monotonic) > 0);
+        runWorkers(&workers);
+        for (&workers) |*w| {
+            try testing.expect(w.err == null);
+            try testing.expectEqual(retire, w.region == null);
+            try testing.expectEqual(retire, w.scratch_region == null);
+            try testing.expect(decodeHeld(w));
+            if (retire) {
+                resetAttemptFlags(w);
+                try testing.expect(!decodeHeld(w));
+            }
+        }
+        if (retire) try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        releaseRegions(&workers);
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
 }
 
 test "false but corroborated footer bounds pin the default and scan-all trust boundary" {

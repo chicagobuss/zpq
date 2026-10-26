@@ -35,6 +35,7 @@ const blocking = @import("blocking.zig");
 const schema = @import("schema.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_eval = @import("filter/eval.zig");
+pub const SelectedBatch = @import("selected_batch.zig").SelectedBatch;
 const filter_selection = @import("filter/selection.zig");
 const filter_prune = @import("filter/prune.zig");
 const expr_ast = @import("expr/ast.zig");
@@ -3151,7 +3152,44 @@ pub const AggRowGroup = struct {
     consumed: []const bool,
     /// Columns that must decode their stored values (`agg_plan.Columns.preserve`). Null preserves every column.
     preserve: ?[]const bool = null,
+    /// Original global row of this row group's first row, including pruned rows. Zero until the scan sets the
+    /// file prefix. A slice adds its own offset; this is not the packed first-position tag.
+    row_base: u64 = 0,
 };
+
+/// Borrowed owner view of one decoded window. `input_rows` are indexes into that window. The shared adapter
+/// checks lengths and ordinal arithmetic; a gather index past `window_rows` is rejected here. A window that
+/// does not fit in `u32` cannot be gathered.
+pub fn selectedWindow(
+    batch: *const filter_eval.Batch,
+    selected: ?*const filter_selection.SelectionVector,
+    input_base: u64,
+    input_rows: ?[]const u32,
+    window_rows: usize,
+) error{BadColumn}!SelectedBatch {
+    if (input_rows) |rows| {
+        if (window_rows > std.math.maxInt(u32)) return error.BadColumn;
+        const limit: u32 = @intCast(window_rows);
+        for (rows) |row| if (row >= limit) return error.BadColumn;
+    }
+    const view: SelectedBatch = .{
+        .batch = batch,
+        .selected = selected,
+        .input_base = input_base,
+        .input_rows = input_rows,
+    };
+    try view.validate();
+    return view;
+}
+
+test "a selected window keeps original indexes and rejects a gather past the window" {
+    const batch: filter_eval.Batch = .{ .cols = &.{}, .num_rows = 2 };
+    const open = try selectedWindow(&batch, null, 40, &.{ 1, 3 }, 4);
+    try std.testing.expectEqual(@as(u64, 43), try open.ordinal(1));
+    try std.testing.expectError(error.BadColumn, selectedWindow(&batch, null, 40, &.{ 1, 4 }, 4));
+    const slice = try selectedWindow(&batch, null, 40, null, 2);
+    try std.testing.expectEqual(@as(u64, 40), try slice.ordinal(0));
+}
 
 pub const PackedCount = struct {
     pub const Source = struct { file: usize, rg: usize };
@@ -4663,15 +4701,18 @@ fn scanRGSliced(
             try filter_selection.SelectionVector.init(sa, n);
         if (payload == null) if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
         matched += if (in.filter != null) sel.count() else n;
+        const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
+        const window = try selectedWindow(&batch, &sel, input_base, null, n);
         switch (target) {
             .scalar => |s| {
                 if (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target) and
-                    try foldScalarCache(sa, gpa, s.calls, s.accumulators, handled, &batch, lookup, &sel)) continue;
-                if (try expr_agg.updateSharedInteger(sa, s.calls, s.accumulators, handled, &batch, lookup, &sel))
+                    try foldScalarCache(sa, gpa, s.calls, s.accumulators, handled, window.batch, lookup, &sel))
+                    continue;
+                if (try expr_agg.updateSharedInteger(sa, s.calls, s.accumulators, handled, window.batch, lookup, &sel))
                     continue;
                 for (s.calls, s.accumulators, handled) |call, *acc, h| {
                     if (h) continue;
-                    try expr_agg.updateOne(sa, gpa, acc, call, &batch, lookup, &sel);
+                    try expr_agg.updateOne(sa, gpa, acc, call, window.batch, lookup, &sel);
                 }
             },
             .grouped => |g| {
@@ -4707,7 +4748,7 @@ fn scanRGSliced(
                         in.file_index,
                         in.rg_index,
                         g.pos_base + done,
-                        &batch,
+                        window.batch,
                         lookup,
                         &sel,
                     )) continue;
@@ -4723,7 +4764,7 @@ fn scanRGSliced(
                         g.keys,
                         g.table,
                         g.pos_base + done,
-                        &batch,
+                        window.batch,
                         lookup,
                         &sel,
                         ws.budget,
@@ -4744,7 +4785,7 @@ fn scanRGSliced(
                 try resolver.resolveBatch(sa, g.table, key_cols, g.calls, g.pos_base + done, &sel, ids);
                 try expr_agg.sinkSketchRows(g.table, ids, &sel);
                 if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                    try expr_agg.updateTableGrouped(sa, gpa, g.table, ids, i, g.calls, &batch, lookup, &sel);
+                    try expr_agg.updateTableGrouped(sa, gpa, g.table, ids, i, g.calls, window.batch, lookup, &sel);
                 };
             },
         }

@@ -6771,13 +6771,16 @@ fn selectedCountBits(
     var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const ledger = args.ledger orelse &private_ledger;
     const extra_credit = scratch_credit +| output_credit;
-    _ = ledger.drawExact(extra_credit) orelse return error.ExceededMemoryBudget;
+    // No input has been consumed: setup funding refusal leaves the ordinary grouping plan available.
+    _ = ledger.drawExact(extra_credit) orelse return null;
     var held: usize = 0;
     defer ledger.release(extra_credit - held);
-    const state = (try O.State.init(gpa, ledger, input_rows, rows, workers, q.parts)) orelse
-        return error.ExceededMemoryBudget;
+    const state = (try O.State.init(gpa, ledger, input_rows, rows, workers, q.parts)) orelse return null;
     defer state.deinit();
-    var top = try T.init(gpa, ledger, workers, k, args.result_order.keys[0].descending);
+    var top = T.init(gpa, ledger, workers, k, args.result_order.keys[0].descending) catch |err| {
+        if (err == error.ExceededMemoryBudget) return null;
+        return err;
+    };
     defer top.deinit();
     var temporary = std.heap.ArenaAllocator.init(gpa);
     defer temporary.deinit();
@@ -23644,6 +23647,86 @@ test "selected owner coded identity replays a late dictionary mismatch after ear
         try testing.expectEqual(@as(usize, 16), reader.window.releases.load(.monotonic));
         try testing.expect(ledger.used.load(.monotonic) < 1 << 20);
     };
+}
+
+test "selected COUNT setup refusal preserves an occupied ledger and falls back to ordinary grouping" {
+    const gpa = testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(gpa);
+    defer fixture.deinit();
+    const fa = fixture.allocator();
+    const values = try fa.alloc(i32, 1 << 20);
+    for (values, 0..) |*value, i| value.* = @intCast(i % 17);
+    const columns = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .col = .{ .i32 = .{ .values = values } },
+        .parquet_type = .INT32,
+        .nullable = false,
+    }};
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = fa };
+    _ = try consumer.writeAggregateRows(fa, sink.sink(), &columns, @intCast(values.len), .SNAPPY, .{}, .{});
+    const meta = try metadata.open(fa, sink.buffer.items);
+    const base: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "occupied", .bytes = sink.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .parallelism = 1,
+        .max_memory = 64 << 20,
+        .charge_decode = false,
+        .dense = false,
+        .plain_rules = false,
+        .msd_records = false,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    const occupied = 60 << 20;
+    var baseline_rows: ?[][]const AggValue = null;
+    var baseline_types: ?[]const GroupColType = null;
+    var retained: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |enabled, mode| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var ledger: core_memory.SharedBudget = .{ .limit = base.max_memory };
+        _ = ledger.drawExact(occupied).?;
+        var args = base;
+        args.ledger = &ledger;
+        args.integer_records = enabled;
+        if (enabled) {
+            const explanation = try explainAggregate(gpa, a, args);
+            try testing.expectEqual(.packed_count_top_h, explanation.record_path.?.layout);
+            try testing.expect(explanation.record_path.?.reservation <= args.max_memory);
+            const O = owner_groups.Packed(u64, &.{}, u32);
+            try testing.expect(O.State.charge(values.len, 1, 64) > args.max_memory - occupied);
+        }
+        var got = runMultiAggregate(gpa, a, args) catch |err| {
+            std.debug.print("owner enabled={any}: {s}\n", .{ enabled, @errorName(err) });
+            return err;
+        };
+        defer got.deinit(gpa);
+        try testing.expect(!got.part_agg);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        const rows = got.output.group_rows.?;
+        try testing.expectEqual(@as(usize, 10), rows.len);
+        if (!enabled) {
+            const saved = try fa.alloc([]const AggValue, rows.len);
+            for (saved, rows) |*row, original| row.* = try fa.dupe(AggValue, original);
+            baseline_rows = saved;
+            baseline_types = try fa.dupe(GroupColType, got.state.group_col_types.?);
+        } else {
+            try testing.expectEqualDeep(baseline_rows.?, rows);
+            try testing.expectEqualDeep(baseline_types.?, got.state.group_col_types.?);
+        }
+        for (rows, 0..) |row, i| {
+            try testing.expectEqual(@as(i64, @intCast(i)), row[0].i);
+            try testing.expectEqual(@as(i64, 61681), row[1].i);
+        }
+        // Ordinary output retains its small query-lifetime credit. Setup refusal must add nothing to that credit.
+        retained[mode] = ledger.used.load(.monotonic);
+        try testing.expect(retained[mode] >= occupied);
+        ledger.release(occupied);
+        try testing.expectEqual(retained[mode] - occupied, ledger.used.load(.monotonic));
+    }
+    try testing.expectEqual(retained[0], retained[1]);
 }
 
 test "selected packed COUNT runs the typed owner for INT32 keys with original NULL ties and sliced files" {

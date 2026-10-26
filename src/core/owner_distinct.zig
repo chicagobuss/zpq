@@ -20,6 +20,8 @@ pub fn Pipeline(comptime Bits: type) type {
                 if (plan.encoding.source == .dictionary) {
                     var product: u128 = 1;
                     for (plan.radices[0..n]) |r| product = try std.math.mul(u128, product, r);
+                    if (Bits == u64 and product == @as(u128, 1) << 64)
+                        return .{ .mask = std.math.maxInt(Bits) };
                     return .{ .modulus = std.math.cast(Bits, product) orelse return error.BadKey };
                 }
                 var width: usize = 0;
@@ -171,4 +173,24 @@ test "owner DISTINCT completed-pair records fund physical contributions independ
     try std.testing.expectEqual(@as(?i128, 2), g.integer(0));
     try std.testing.expectEqual(@as(u32, 1000000), g.weight);
     try std.testing.expectEqual(@as(u32, 2), g.first);
+}
+
+test "owner DISTINCT empty argument axis preserves the full 2^64 group-prefix domain" {
+    const ast = @import("expr/ast.zig");
+    var keys = [_]ast.ColRef{
+        .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 },
+        .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64 },
+        .{ .col_idx = 2, .physical_type = .INT32, .expr_type = .i64 },
+    };
+    var radices = [_]u64{ 1 << 32, 1 << 32, 1 };
+    const plan: Plan = .{
+        .keys = &keys,
+        .radices = &radices,
+        .fields = &.{},
+        .domain = null,
+        .encoding = .{ .width = .word, .source = .{ .dictionary = &radices } },
+    };
+    const prefix = try Pipeline(u64).Prefix.init(&plan);
+    for ([_]u64{ 0, 1, 1 << 32, std.math.maxInt(u64) }) |id|
+        try std.testing.expectEqual(id, prefix.group(id));
 }

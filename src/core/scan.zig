@@ -5212,10 +5212,19 @@ fn prepareAggregateWithMetas(
             try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);
         // Candidate nomination scans every partial group. With several workers, route those groups directly to
         // the parallel merge and let each partition keep its own H candidates instead of a serial nomination pass.
-        const candidates = if (n_workers == 1)
+        const first_parallel = n_workers > 1 and args.result_order.keys.len == 0 and
+            args.result_order.having == null and args.result_order.hidden.len == 0;
+        const first_k = if (args.result_order.limit) |limit|
+            std.math.cast(usize, args.result_order.offset +| limit)
+        else
+            null;
+        const candidates = if (first_parallel and first_k != null)
+            try firstCandidatesParallel(lists, out_tables, first_k.?, n_workers)
+        else if (n_workers == 1)
             try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order)
         else
             null;
+        defer if (first_parallel) if (candidates) |kept| lists.free(kept);
         // One table already holds complete ranks; its top-H heap avoids materializing every losing group.
         const cut: ?[]const u32 = if (dense_direct) |d|
             try agg_dense.reached(arena, d, dense_cut)
@@ -6684,6 +6693,8 @@ fn pairAnswerBits(
     }
     // A NULL presence row or one completed pair is the only possible second-stage contribution. Its duplicate
     // weight still uses the original row bound. Global DISTINCT therefore reserves by values, never rows twice.
+    // Footer NULL counts are speculative: the weighted owner requests whole-attempt replay if physical records
+    // exceed this quote, even when scatter tail capacity happened to accommodate them.
     const group_records = @min(rows, pair_bound +| null_rows);
     const gq = cost.quote(
         Bits,
@@ -10414,6 +10425,7 @@ fn countLimitGroups(
         }
     }.cmp;
     var heap: std.PriorityQueue(Item, void, worse) = .empty;
+    defer heap.deinit(arena);
     try heap.ensureTotalCapacity(arena, k);
     for (0..n) |g| {
         const item: Item = .{
@@ -10439,6 +10451,99 @@ fn countLimitGroups(
 /// keeps the `k` that appeared first. Each of those is among the `k` earliest groups of the table that first saw it,
 /// since any group that table saw earlier appeared earlier overall, so the union of every table's `k` earliest holds
 /// them all. Null when that would not shrink the merge.
+/// Per-range first-H nominees contain the first H global keys: each winning key's earliest ref is among its
+/// range's H earliest distinct keys. Taking minima over those nominees therefore gives exact original ordinals.
+/// Only bounded nominees meet on the caller; source keys remain borrowed and the returned outer slice is owned.
+fn firstCandidatesParallel(
+    a: std.mem.Allocator,
+    tables: []const expr_agg.GroupTable,
+    k: usize,
+    requested: usize,
+) !?[]const []const u8 {
+    if (k == 0) return &.{};
+    var groups: usize = 0;
+    for (tables) |t| groups += t.groupCount();
+    if (groups <= k *| 4) return null;
+    const Item = struct { first: u64, key: []const u8 };
+    const later = struct {
+        fn cmp(_: void, x: Item, y: Item) std.math.Order {
+            return std.math.order(y.first, x.first);
+        }
+    }.cmp;
+    const Heap = std.PriorityQueue(Item, void, later);
+    const Task = struct {
+        allocator: std.mem.Allocator,
+        tables: []const expr_agg.GroupTable,
+        chunks: usize,
+        k: usize,
+        cursor: *std.atomic.Value(usize),
+        heap: Heap = .empty,
+        keys: KeyHashMapUnmanaged(u64) = .empty,
+        err: ?anyerror = null,
+        fn offer(queue: *Heap, allocator: std.mem.Allocator, limit: usize, item: Item) void {
+            if (queue.count() == limit) {
+                if (item.first >= queue.peek().?.first) return;
+                _ = queue.pop();
+            }
+            queue.push(allocator, item) catch unreachable;
+        }
+        fn run(t: *@This()) void {
+            while (t.err == null) {
+                const job = t.cursor.fetchAdd(1, .monotonic);
+                if (job >= t.tables.len * t.chunks) return;
+                const table = &t.tables[job % t.tables.len];
+                const width = std.math.divCeil(usize, table.groupCount(), t.chunks) catch unreachable;
+                const lo = @min(table.groupCount(), (job / t.tables.len) * width);
+                t.heap.clearRetainingCapacity();
+                for (lo..@min(table.groupCount(), lo + width)) |gi| offer(
+                    &t.heap,
+                    t.allocator,
+                    t.k,
+                    .{ .first = table.first.items[gi], .key = table.keyAt(gi) },
+                );
+                for (t.heap.items) |item| {
+                    const entry = t.keys.getOrPut(t.allocator, item.key) catch |e| {
+                        t.err = e;
+                        return;
+                    };
+                    entry.value_ptr.* = if (entry.found_existing) @min(entry.value_ptr.*, item.first) else item.first;
+                }
+            }
+        }
+    };
+    const chunks = @max(1, @min(64, requested, groups / @max(1, k *| tables.len *| 4)));
+    var storage: [64]Task = undefined;
+    const tasks = storage[0..@max(1, @min(storage.len, requested, tables.len * chunks))];
+    var cursor = std.atomic.Value(usize).init(0);
+    for (tasks) |*t| t.* = .{ .allocator = a, .tables = tables, .chunks = chunks, .k = k, .cursor = &cursor };
+    defer for (tasks) |*t| {
+        t.keys.deinit(a);
+        t.heap.deinit(a);
+    };
+    for (tasks) |*t| try t.heap.ensureTotalCapacity(a, k);
+    if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run))
+        tasks[0].run();
+    var nominees: KeyHashMapUnmanaged(u64) = .empty;
+    defer nominees.deinit(a);
+    for (tasks) |*t| {
+        if (t.err) |e| return e;
+        var it = t.keys.iterator();
+        while (it.next()) |entry| {
+            const to = try nominees.getOrPut(a, entry.key_ptr.*);
+            to.value_ptr.* = if (to.found_existing) @min(to.value_ptr.*, entry.value_ptr.*) else entry.value_ptr.*;
+        }
+    }
+    var heap: Heap = .empty;
+    defer heap.deinit(a);
+    try heap.ensureTotalCapacity(a, k);
+    var it = nominees.iterator();
+    while (it.next()) |entry|
+        Task.offer(&heap, a, k, .{ .first = entry.value_ptr.*, .key = entry.key_ptr.* });
+    const keys = try a.alloc([]const u8, heap.count());
+    for (keys, heap.items) |*key, item| key.* = item.key;
+    return keys;
+}
+
 fn firstCandidates(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable, k: usize) error{OutOfMemory}!?[]const []const u8 {
     if (k == 0) return &.{};
     var groups: usize = 0;
@@ -22536,7 +22641,12 @@ test "distinct owner radix completes full pairs after releasing every reader win
     args.distinct_pairs = .on;
     args.taken = null;
     const forced = try explainAggregate(gpa, a, args);
-    try testing.expect(forced.record_path == null);
+    try testing.expectEqual(.pair_distinct, forced.record_path.?.layout);
+    var shared_pairs = try prepareAggregate(gpa, a, args, false);
+    defer shared_pairs.deinit(gpa);
+    try testing.expect(shared_pairs.distinct_pairs);
+    try shared_pairs.output.applyResultOrder(gpa, args.result_order);
+    try testing.expectEqualDeep(want.output.group_rows, shared_pairs.output.group_rows);
     var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
     var input = window.input(bytes);
     input.plan_bytes = null;
@@ -24746,13 +24856,105 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
     }
 }
 
+test "M1 finish DISTINCT poisoned NULL record bounds replay with and without count star" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const P = @import("owner_distinct.zig").Pipeline(u64);
+    const cache_slots = @import("owner_cache.zig").capacity(@sizeOf(P.Groups.Record));
+    // Cycle a domain well beyond the producer cache. NULL presence records cannot be bounded by its NDV:
+    // eviction and the low-hit bypass can emit one record per input row, even for the same group.
+    const groups = @max(4096, cache_slots * 8);
+    // The writer requires at least 64 present values and at most 10% distinct integer keys for dictionaries.
+    const rows = groups * 16 + 64;
+    const k = try a.alloc(i32, rows);
+    const x = try a.alloc(i32, rows);
+    const defs = try a.alloc(u32, rows);
+    for (k, 0..) |*key, i| key.* = @intCast(i % groups);
+    @memset(x, 7);
+    @memset(defs, 0);
+    @memset(defs[rows - 64 ..], 1);
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i32 = .{ .values = k } }, .parquet_type = .INT32, .nullable = false },
+        .{
+            .name = "x",
+            .col = .{ .i32 = .{ .values = x, .def_levels = defs, .max_def = 1 } },
+            .parquet_type = .INT32,
+            .nullable = true,
+        },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, @intCast(rows), .SNAPPY, .{}, .{});
+    const poisoned = try rewritten(bytes.buffer.items, .{ .footer = struct {
+        fn edit(meta: *schema.FileMetaData) void {
+            for (meta.row_groups.items) |*rg| rg.columns.items[1].meta_data.?.statistics.?.null_count = 0;
+        }
+    }.edit });
+    defer gpa.free(poisoned);
+    const meta = try metadata.open(a, poisoned);
+    try testing.expectEqual(@as(?i64, 0), meta.row_groups.items[0].columns.items[1].meta_data.?.statistics.?.null_count);
+    for (meta.row_groups.items[0].columns.items) |col|
+        try testing.expect(col.meta_data.?.dictionary_page_offset != null);
+    for ([_][]const u8{ "count(DISTINCT x) AS d", "count(DISTINCT x) AS d,count(*) AS c" }) |aggregate| {
+        var ledger: core_memory.SharedBudget = .{ .limit = 1 << 30 };
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "M1-poisoned-NULL", .bytes = poisoned }},
+            .aggregate = aggregate,
+            .group_by = "k",
+            .parallelism = 1,
+            .max_memory = ledger.limit,
+            .ledger = &ledger,
+            .integer_records_min_rows = 0,
+            .integer_records = false,
+            .distinct_pairs = .off,
+            .byte_records = false,
+            .msd_records = false,
+            .dense = false,
+            .plain_rules = false,
+            .trust_stats = false,
+            // Ensure the underestimated stream reaches the physical-record check instead of exhausting
+            // scatter capacity first; both refusals must take the same established replay.
+            .byte_top_partitions = 16384,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try testing.expectEqual(groups, want.output.group_rows.?.len);
+        for (want.output.group_rows.?, 0..) |row, i| {
+            try testing.expectEqual(@as(i64, @intFromBool(i < 64)), row[1].i);
+            if (row.len == 3) try testing.expectEqual(@as(i64, if (i < 64) 17 else 16), row[2].i);
+        }
+        args.integer_records = true;
+        args.distinct_pairs = .on;
+        var taken: std.EnumSet(FastPath) = .{};
+        args.taken = &taken;
+        try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+        const ledger_before = ledger.used.load(.monotonic);
+        const refusal: anyerror = if (prepareAggregate(gpa, a, args, false)) |result| blk: {
+            var unexpected = result;
+            unexpected.deinit(gpa);
+            break :blk error.TestUnexpectedResult;
+        } else |err| err;
+        try testing.expectEqual(error.ExceededMemoryBudget, refusal);
+        try testing.expect(taken.contains(.integer_records));
+        try testing.expectEqual(ledger_before, ledger.used.load(.monotonic));
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        // The canonical fallback may itself use foldDistinctPairs; its result flag does not identify the owner.
+        // The armed refusal above and successful runMultiAggregate prove the whole-attempt retry.
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+    }
+}
+
 test "M1 finish partitions full and top-H states including preparation cleanup ties and failed starts" {
     const a = testing.allocator;
     const calls = [_]expr_agg.AggCall{
         .{ .func = .count, .alias = "c", .result = .i64, .arg = null, .where = null },
         .{ .func = .min, .alias = "lo", .result = .bytes, .arg = null, .where = null },
     };
-    for ([_]usize{ 1, 16 }) |workers| for ([_]bool{ false, true }) |top| {
+    for ([_]usize{ 1, 16 }) |workers| for ([_]enum { full, top, first }{ .full, .top, .first }) |mode| {
+        const top = mode == .top;
         var tables: [3]expr_agg.GroupTable = undefined;
         for (&tables) |*t| t.* = .init(a, 256 << 20);
         defer {
@@ -24785,14 +24987,19 @@ test "M1 finish partitions full and top-H states including preparation cleanup t
         const cut: ?ResultCut = if (top) .{ .a_idx = 0, .k = 7 } else null;
         if (workers == 16) spawn_util.injectFailureAfter(1);
         defer spawn_util.resetFailure();
-        try mergeFoldedRefs(a, a, &tables, refs, &calls, workers, cut, false, &slots, &accs);
+        if (mode == .first) {
+            const keys = (try firstCandidatesParallel(a, &tables, 7, workers)).?;
+            defer a.free(keys);
+            try testing.expectEqual(@as(usize, 7), keys.len);
+            try mergeCandidates(a, a, &tables, keys, &calls, workers, &slots, &accs);
+        } else try mergeFoldedRefs(a, a, &tables, refs, &calls, workers, cut, false, &slots, &accs);
         if (top) try keepCountTop(a, a, &calls, .{ .a_idx = 0, .k = 7 }, &slots, &accs);
         try sortSlotsByFirst(a, slots.items, workers);
         for ([_]bool{ false, true }) |typed| try testing.expectEqual(
             answerBytes(slots.items, &.{.{ .lane = .string, .nullable = true }}, &.{.string}, typed),
             answerBytesParallel(slots.items, &.{.{ .lane = .string, .nullable = true }}, &.{.string}, typed, workers),
         );
-        try testing.expectEqual(@as(usize, if (top) 7 else n), slots.items.len);
+        try testing.expectEqual(@as(usize, if (mode != .full) 7 else n), slots.items.len);
         for (slots.items, 0..) |slot, i| {
             const id = if (top) 6 + i * 7 else i;
             try testing.expectEqual(@as(u64, id * 5), slot.first);

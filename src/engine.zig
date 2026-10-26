@@ -13710,3 +13710,65 @@ test "M1 DISTINCT writes identical canonical Parquet with sixteen actual produce
             };
     }
 }
+
+test "M1 first-H finishes materialize only the original first keys at j1 and sixteen actual producers" {
+    const fixture = "ci/fixtures/parquet/packed_count_indexed.parquet";
+    const a = std.testing.allocator;
+    const bytes = try metadata.readFileSlice(fixture, a);
+    defer a.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/first.parquet", .{tmp.sub_path});
+    var expected: ?[]u8 = null;
+    defer if (expected) |b| a.free(b);
+    for ([_]usize{ 1, 16 }) |workers| for ([_]usize{ 0, 64 }) |window| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const meta = try metadata.open(temp, bytes);
+        const args: scan.MultiAggArgs = .{
+            .inputs = &.{.{ .name = fixture, .bytes = bytes }},
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c,sum(f) AS s",
+            .group_by = "k,b,f",
+            .parallelism = workers,
+            .min_bytes_per_worker = 1,
+            .decode_batch_rows = window,
+            .integer_records = false,
+            .byte_records = false,
+            .msd_records = false,
+            .dense = false,
+            .plain_rules = false,
+            .spill = false,
+            .sketch_topk = null,
+            .ndv_policy = false,
+            .max_memory = 512 << 20,
+            .result_order = .{ .limit = 3, .offset = 1 },
+        };
+        const explanation = try scan.explainAggregate(a, temp, args);
+        try std.testing.expectEqual(workers, explanation.workers);
+        try std.testing.expectEqual(.plain_hash, explanation.plan.dispatch.strategy);
+        try std.testing.expect(explanation.record_path == null);
+        var result = try scan.runMultiAggregate(a, temp, args);
+        defer result.deinit(a);
+        try std.testing.expectEqual(@as(usize, 4), result.output.group_rows.?.len);
+        try result.output.applyResultOrder(a, args.result_order);
+        _ = try writeGroupedParquet(
+            temp,
+            path,
+            result.output.group_cols.?,
+            result.state.group_col_types.?,
+            result.output.group_rows.?,
+            .SNAPPY,
+            .{},
+            .{},
+            null,
+        );
+        const encoded = try metadata.readFileSlice(path, a);
+        if (expected) |want| {
+            defer a.free(encoded);
+            try std.testing.expectEqualSlices(u8, want, encoded);
+        } else expected = encoded;
+    };
+}

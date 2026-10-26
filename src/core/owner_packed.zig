@@ -176,7 +176,10 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                     for (s.locals) |l| {
                         for (l.frontier.histogram) |n| physical += n;
                     }
-                    if (physical > s.record_rows) return error.BadPartial;
+                    // A weighted reduction may reserve from speculative footer bounds (for example DISTINCT
+                    // NULL-presence rows). Underestimation is a private-attempt budget refusal, not a malformed
+                    // decoded partial: replay without the owner before any receiver publishes output.
+                    if (physical > s.record_rows) return error.ExceededMemoryBudget;
                 }
                 const scratch = Fold.concurrentBytes(s, s.parts, s.locals.len, partitionRows);
                 if (scratch == std.math.maxInt(usize)) return error.ExceededMemoryBudget;

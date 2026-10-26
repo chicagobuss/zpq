@@ -105,15 +105,6 @@ test-integration:
 libzpq:
     PYTHON={{python}} OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
-# Python hand-off gate (not yet in `check`): zpq from Python (python/zpq.py over libzpq) and the CLI answer as DuckDB
-# does on the source; the Parquet they write reads back whole in pyarrow and DuckDB with the same values and logical
-# types; and files DuckDB and pyarrow write read back in zpq alike. Cells with a filed finding are listed in
-# tests/handoff/known.json. Large study tables come from $ZPQ_HANDOFF_STUDY when present. Needs duckdb+pyarrow.
-handoff *args:
-    zig build -Doptimize=ReleaseFast
-    zig build libzpq -Doptimize=ReleaseFast
-    {{python}} -I tests/handoff/run.py {{args}}
-
 # Every apache/parquet-testing file against its declared outcome (tools/check/cases/corpus.json).
 corpus:
     zig build check -Dtier=full -Dshard=corpus

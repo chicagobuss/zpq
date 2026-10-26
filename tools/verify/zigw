@@ -5,9 +5,13 @@ release_smoke.sh and tests/libzpq/run.sh invoke $ZIG build without a job cap.
 Point ZIG at this file. ZPQ_ZIG selects the real compiler (default: zig on PATH).
 """
 import os
+import shutil
 import sys
 
 zig = os.environ.get("ZPQ_ZIG", "zig")
+# ZPQ_ZIG naming this wrapper would exec itself forever; fall back to the real compiler on PATH.
+if os.path.realpath(shutil.which(zig) or zig) == os.path.realpath(__file__):
+    zig = "zig"
 args = sys.argv[1:]
 if args and args[0] == "build" and not any(a == "-j" or (a.startswith("-j") and a[2:3].isdigit()) for a in args):
     args = [args[0], "-j8", *args[1:]]

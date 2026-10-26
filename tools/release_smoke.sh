@@ -100,7 +100,7 @@ for t in "$@"; do
     if [[ "$t" == *-linux-musl ]]; then
         mkdir -p zig-out
         if "$build"; then
-            ZPQ_ZIG="$ZIG" python3 - "$OUT/$t/bin" "$t" <<'PY_INTEGRATION'
+            ZPQ_ZIG="${ZPQ_ZIG:-$ZIG}" python3 - "$OUT/$t/bin" "$t" <<'PY_INTEGRATION'
 import sys
 from pathlib import Path
 sys.path.insert(0, "tools/verify")

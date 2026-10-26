@@ -1,5 +1,8 @@
 # Lambda Overture comparison — 2026-08-21
 
+The `benchmarks/` scripts named here were removed after e76a1e3; restore them with
+`git restore --source=e76a1e3 -- benchmarks`.
+
 This is a warm Lambda figure for the 0.3.2 candidate, collected by
 `benchmarks/run_lambda_overture_compare.sh` with run id
 `20260821Tlambda032clean`.

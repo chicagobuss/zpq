@@ -276,57 +276,6 @@ pub fn build(b: *std.Build) void {
     release_smoke.has_side_effects = true;
     b.step("release-smoke", "Build every release target and run its CLI and Lambda where this host can")
         .dependOn(&release_smoke.step);
-
-    // microbench: time decode of one column-chunk in isolation.
-    // Used to map ns/value across (encoding × type × bit_width × null
-    // rate) — without the glob/mmap/aggregate noise of the full
-    // pipeline. See benchmarks/microbench/.
-    const microbench = b.addExecutable(.{
-        .name = "microbench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/microbench/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
-    });
-    // in-bench: IN-list evaluation over one in-memory batch, with user-space instruction and cycle counters.
-    const in_bench = b.addExecutable(.{
-        .name = "in_bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/in_bench/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
-    });
-    b.step("in-bench", "Build the IN-list evaluation microbenchmark").dependOn(&b.addInstallArtifact(in_bench, .{}).step);
-
-    const microbench_step = b.step("microbench", "Build the decode-path microbenchmark");
-    microbench_step.dependOn(&b.addInstallArtifact(microbench, .{}).step);
-
-    // bench-labels: time output labelling on wide schemas, with and without colliding names. Opt-in, so wall-clock
-    // limits stay out of the unit tests. See benchmarks/labels/.
-    const bench_labels = b.addExecutable(.{
-        .name = "bench_labels",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/labels/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "zpq", .module = cli_zpq.zpq },
-            },
-        }),
-    });
-    const bench_labels_step = b.step("bench-labels", "Time output labelling on wide and colliding schemas");
-    bench_labels_step.dependOn(&b.addRunArtifact(bench_labels).step);
 }
 
 /// Third-party modules and libraries every zpq module instance links. Built

@@ -50,31 +50,17 @@ CURRENT_CONTEXT.md
 .claude/
 .cursor/
 
-# Benchmark binaries
-benchmarks/bootstrap
-benchmarks/zpq
-benchmarks/*.zip
-
-
 # Probe outputs (regeneratable)
 output/
 
 # Vendored hardwood CLI (downloaded prebuilt; large, regeneratable)
 tools/hardwood/
 
-# Bench result snapshots (churn every run; commit only curated measurements)
-benchmarks/coldstart_results.tsv
-benchmarks/partition_results.tsv
-benchmarks/selectivity_results.tsv
-benchmarks/common_four_results.tsv
-benchmarks/*.local.tsv
+# Conformance report (churns every run)
 tools/conformance_report.tsv
 
 # Zig package cache
 zig-pkg/
-
-# Regression harness scratch
-benchmarks/regression/.tmp_glob/
 
 prof/
 

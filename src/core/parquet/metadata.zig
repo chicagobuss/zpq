@@ -1350,7 +1350,7 @@ pub fn wideSchemaForTest(arena: std.mem.Allocator, structs: usize, shape: WideSh
 }
 
 test "leafLabels on wide schemas, with and without colliding names" {
-    // Timing lives in `zig build bench-labels`; this checks the labels and that a sample binds back.
+    // Checks the labels and that a sample binds back; wall-clock timing stays out of the unit tests.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

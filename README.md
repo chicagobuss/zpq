@@ -121,15 +121,9 @@ started an upload zpq never hears of. Give the output bucket a lifecycle rule wi
 
 ## Performance
 
-Numbers and trade-offs are dated and contextualised as they're captured. Harnesses:
-
-* `benchmarks/storage_compare.py` — workstation-direct comparison of zpq / duckdb / polars across local files, S3, and
-  R2.
-* `benchmarks/run_selectivity.sh` — Lambda S3-to-S3 sweep across selectivity levels (zpq vs Python lambda running polars
-  + duckdb).
-* `benchmarks/run_coldstart.sh` — cold-start comparison; the latest cold-start figures are in
-  [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
-* `benchmarks/regression/runner.py` — golden-output regression net.
+Numbers and trade-offs are dated and contextualised as they're captured in [`docs/measurements/`](docs/measurements/);
+the latest cold-start figures are in
+[`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
 
 <!-- 0.5.0 release figures go here once the release benchmark run is reviewed. -->
 
@@ -552,7 +546,6 @@ src/
     local_reader.zig     Gated local reads: pread / io_uring into a windowed buffer
     sigv4.zig            SigV4 signer
 
-benchmarks/                 Selectivity / cold-start / partition sweeps
 tools/serverless/aws.sh     Lambda lifecycle (build, deploy, invoke)
 docs/                       Demos, capability findings, measurements, validation notes
 vendor/boring_tls/          Vendored prebuilt-only BoringSSL bindings

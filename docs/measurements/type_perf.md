@@ -1,5 +1,8 @@
 # Type/operator perf — ZPQ vs DuckDB vs polars
 
+The `benchmarks/` scripts named here were removed after e76a1e3; restore them with
+`git restore --source=e76a1e3 -- benchmarks`.
+
 Cross-engine wall-clock for the filter/aggregate surface across ZPQ's full
 type set (decimal, string, date/timestamp, bool, IN). Two axes captured:
 **cold** (full process invocation — ZPQ's serverless pitch) and **warm**

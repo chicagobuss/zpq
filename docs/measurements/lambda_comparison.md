@@ -1,5 +1,8 @@
 # Lambda comparison protocol
 
+The `benchmarks/` scripts named here were removed after e76a1e3; restore them with
+`git restore --source=e76a1e3 -- benchmarks`.
+
 ZPQ's claim is a narrow one: S3-to-S3 Parquet filtering, projection, and
 compaction in a Lambda. A chart is useful only when every engine runs that
 same shape under the same Lambda configuration.

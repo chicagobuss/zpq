@@ -64,53 +64,12 @@ the gauntlet before a release.
   will go stale as soon as priorities change, keep it out of the repo.
 - Other docs (`docs/<topic>_design.md`) are reference material edited when the underlying thing changes.
 
-## The "Common 4" perf-tracking suite
+## Performance tracking
 
-`benchmarks/common_four.py` is the canonical end-to-end suite we re-run every time we touch a hot path. Same four cells,
-same fixtures, same query shapes — so wins/regressions show up in the same shape across branches.
-
-**The four cells:**
-
-1. **`lambda_s3_to_s3`** — Lambda invocation that reads `benchmark_100mb.parquet` from S3, applies `int8 BETWEEN -10 AND
-   10` + 3-column projection, writes back to S3 (the iceberg-compaction shape). Wall is end-to-end including invoke RTT.
-2. **`local_from_s3`** — workstation `zpq query` against the same S3 file, decode-heavy aggregate (`count +
-   sum(int64_sorted) + max(int8)`). No write.
-3. **`local_from_local`** — same aggregate, against `data/benchmark_100mb.parquet` on local disk. Pure-decode ceiling —
-   no network.
-4. **`local_from_r2`** — workstation `zpq query` against
-   `s3://${R2_BUCKET}/demo/nyc-taxi/yellow/yellow_tripdata_2023-01.parquet` on Cloudflare R2 (NYC taxi yellow, 47 MB / 3
-   M rows). Same shape aggregate but on the f64 fare/tip columns.
-
-**Run it:**
-
-```bash
-just build
-set -a; source .env; set +a   # creds + bucket names
-python3 benchmarks/common_four.py --runs 5
-# or to test a single cell:
-python3 benchmarks/common_four.py --runs 5 --cells local_from_local
-```
-
-Output is TSV: `cell  min_ms  median_ms  p95_ms`. Saved to `benchmarks/common_four_results.tsv` by default; pass `--out
-PATH` to capture a baseline alongside a perf change.
-
-**Required setup:**
-
-- `.env` loaded with `AWS_S3_BUCKET`, `R2_*`, `LAMBDA_FUNCTION_NAME`.
-- `data/benchmark_100mb.parquet` present locally.
-- `s3://${AWS_S3_BUCKET}/zpq_test_data/benchmark/benchmark_100mb.parquet` uploaded.
-- NYC taxi yellow_tripdata_2023-01 in R2 (or any S3-compat at `${R2_BUCKET}/demo/nyc-taxi/yellow/`).
-- Lambda function `${LAMBDA_FUNCTION_NAME}` deployed with current binary, ≥1024 MB memory, ≥60 s timeout. (Re-deploy via
-  `./tools/serverless/aws.sh deploy "$LAMBDA_FUNCTION_NAME" zig-out/lambda/zpq-lambda-arm64.zip arm64 1024` after any
-  change to `src/lambda/` or `src/zpq.zig` shared core.)
-
-**Discipline:**
-
-- Always re-run **before AND after** a perf change; commit the baseline file alongside the change so the delta is on the
-  record.
-- AWS-side noise is real. If a single cell jumps and the others don't, suspect the network before suspecting the diff.
-- Don't change query shapes between baseline and post-change runs. If you need a different shape for a specific
-  investigation, add a *new* cell rather than mutating an existing one.
+`python tools/verify/verify.py perf` runs the scorecard harness pinned in `tools/verify/HARNESS` against DuckDB 2.0 and
+Polars 2.0 and counts only validated answers. Re-run it **before AND after** a perf change on the same host and keep
+both records; don't change suite or case filters between the two runs. AWS-side noise is real: if a single remote cell
+jumps and the others don't, suspect the network before the diff.
 
 ## Profiling
 
@@ -127,8 +86,7 @@ Sub-100 ms runs are too short to sample — wrap in a 50× shell loop or use a m
 Open the SVG in a browser; click frames to zoom. `just flamegraph-bpf <secs>` attaches via `profile-bpfcc` for
 long-running processes (needs sudo).
 
-When picking a perf target, the flamegraph is the verdict. The microbench harness (`just microbench`) is a complementary
-tool for isolating per-(encoding × type × bit_width) decode cost from glob/mmap noise.
+When picking a perf target, the flamegraph is the verdict.
 
 ## Tone and scope reminders
 

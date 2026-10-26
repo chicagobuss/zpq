@@ -182,38 +182,6 @@ triangulate: fetch-corpus
 fuzz filter="fuzz:":
     zig build fuzz -Dtest-filter={{filter}} --fuzz
 
-# === Perf regression ===
-
-# Lock-in regression suite. Runs canonical CLI query shapes, asserts
-# golden outputs + wall/RSS bounds. Pass --lambda to also exercise the
-# deployed function. See benchmarks/regression/README.md.
-bench-regression *args:
-    zig build -Doptimize=ReleaseFast
-    {{python}} benchmarks/regression/runner.py {{args}}
-
-# Re-capture goldens + baseline.json from the current build. Run this
-# after intentional behavior changes; commit the result alongside the
-# code.
-bench-regression-update *args:
-    zig build -Doptimize=ReleaseFast
-    {{python}} benchmarks/regression/runner.py --update-golden --update-baseline {{args}}
-
-# Cross-engine perf comparison over ZPQ's type/operator surface (zpq vs
-# duckdb-cli vs polars-py), best-of-N cold wall-clock. Generates the 5M-row
-# typed fixture if absent. Needs duckdb + the .venv (polars). Results log:
-# docs/measurements/type_perf.md — append a dated block on meaningful runs.
-type-bench runs="5":
-    @test -f data/bench_types.parquet || duckdb -c "COPY (SELECT i::INTEGER AS id, (i*1.5)::DOUBLE AS amt, CAST(i % 100000 AS DECIMAL(18,2)) AS price, ('row'||(i%1000)) AS name, (DATE '2015-01-01' + (i%4000)::INTEGER) AS d, (TIMESTAMP '2015-01-01 00:00:00' + ((i%4000)::INTEGER * INTERVAL 1 HOUR)) AS ts, (i%3=0) AS flag FROM range(5000000) t(i)) TO 'data/bench_types.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-    zig build -Doptimize=ReleaseFast
-    {{python}} benchmarks/type_bench.py -n {{runs}}
-
-# Decode-path microbench. Times consumer.decodeColumnT against every
-# column of data/benchmark_100mb.parquet — strips glob/mmap/aggregate
-# noise so per-(encoding × type × bit_width) decode cost is visible.
-microbench fixture="data/benchmark_100mb.parquet" runs="7" warmup="2":
-    zig build microbench -Doptimize=ReleaseFast
-    @benchmarks/microbench/run.sh {{fixture}} {{runs}} {{warmup}}
-
 # === Lambda lifecycle ===
 
 # Deploy a Lambda function (function-name + arch). Loads .env for AWS creds.

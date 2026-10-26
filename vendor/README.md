@@ -58,8 +58,7 @@ as patch files in `vendor/zstd/patches/`, each applied to the tree and listed he
   with `(size_t)-1`. It declines when the CPU or OS lacks AVX-512 F, BW, VL, VBMI or VBMI2 (checked once, with CPUID
   and XGETBV), when `ZPQ_ZSTD_SCALAR` is set to anything but `0`, and for tables over 11 bits; off x86-64 the file is
   a stub that always declines. Guarded by `ZPQ_HUF4X_AVX512`, which `zstdLibrary` defines: without it the file is
-  upstream's. `vendor/zstd/zpq/huf4x_check.c` compares the two encoders for the unit tests, and
-  `tools/zstd-avx512` over any corpus.
+  upstream's. `vendor/zstd/zpq/huf4x_check.c` compares the two encoders for the unit tests.
 
 To check the tree against the release: unpack zstd 1.5.7, apply the patches with `patch -p1`, and compare
 `vendor/zstd/lib` with its `lib` (only the files listed above are vendored).
@@ -72,8 +71,7 @@ only the decompression sources (`libdeflateLibrary` in `build.zig`: `deflate_dec
 to read GZIP pages; the compressor stays vendored for a later GZIP writer. libdeflate picks its CPU-specific paths at
 run time (BMI2, AVX2/AVX-512, PCLMUL/VPCLMUL on x86; PMULL/CRC32 on arm) and falls back to portable code.
 `ZPQ_GZIP_STD` set to anything but `0` reads GZIP pages with Zig's `std.compress.flate` instead, to compare
-the two or to fall back. `tools/gzip-inflate` compares libdeflate with zlib over any corpus, its portable paths
-included.
+the two or to fall back.
 
 Local changes are kept as patch files in `vendor/libdeflate/patches/`, each applied to the tree and listed here.
 

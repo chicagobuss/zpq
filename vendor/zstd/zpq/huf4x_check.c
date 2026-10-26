@@ -1,5 +1,5 @@
 /* zpq: compares the AVX-512 4-stream Huffman encoder with zstd's own over generated literal distributions, for the
- * unit tests (linked only into binaries that call it). tools/zstd-avx512 runs the same comparison over a large corpus. */
+ * unit tests (linked only into binaries that call it). */
 
 #include <stdint.h>
 #include <stdlib.h>

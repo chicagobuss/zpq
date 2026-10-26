@@ -97,9 +97,8 @@ still permits its existing single-run all-present proof under `0`.
 RLE spans contribute weighted counts directly to histogram consumers. Other
 consumers expand only their requested row window, without a page-sized level
 array. Nested levels keep their established expanded representation.
-`python tools/level_runs_check.py CANDIDATE [BASE]` checks both forced variants
-on nullable V1/V2 pages, scalar/grouped arithmetic, dictionary histograms,
-BOOLEAN filters, and memory-driven row slices.
+The `path-parity` verify stage forces both `ZPQ_LEVEL_RUNS` variants over the
+referee corpus and requires identical JSON and Parquet bytes.
 
 Expression DAGs count every live input, widened lane, intermediate, null layout,
 selection and group ID. Their row budget uses three quarters of each SMT

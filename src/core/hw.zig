@@ -14,6 +14,7 @@ pub const CpuSet = std.StaticBitSet(cpu_capacity);
 pub const Level = enum { l1d, l2, l3 };
 pub const Cache = struct {
     bytes: usize = 0,
+    line_bytes: usize = 0,
     /// Logical CPUs that can share this cache, including SMT siblings. Empty when the OS provides no mapping.
     cpus: CpuSet = .empty,
     /// CPUID's maximum sharing count when a concrete sharing set is unavailable.
@@ -41,6 +42,8 @@ pub const Cpu = struct {
 pub threadlocal var test_cpu: ?Cpu = null;
 var state: std.atomic.Value(u8) = .init(0);
 var detected: [cpu_capacity]Cpu = @splat(.{});
+var process_l1d: usize = 0;
+var process_line: usize = 0;
 var process_l2: usize = 0;
 var process_l3: usize = 0;
 const unknown: Cpu = .{};
@@ -61,6 +64,18 @@ pub fn forCpu(id: usize) *const Cpu {
 pub fn current() *const Cpu {
     if (test_cpu) |*cpu| return cpu;
     return forCpu(currentId());
+}
+
+/// Stable L1 share and widest cache line in the captured affinity; zero L1 means unknown.
+pub fn l1dBytesPerWorker() usize {
+    if (test_cpu) |cpu| return cpu.l1d.bytesPerWorker();
+    _ = forCpu(0);
+    return process_l1d;
+}
+pub fn cacheLineBytes() usize {
+    if (test_cpu) |cpu| return if (cpu.l1d.line_bytes != 0) cpu.l1d.line_bytes else std.atomic.cache_line;
+    _ = forCpu(0);
+    return if (process_line != 0) process_line else std.atomic.cache_line;
 }
 
 /// Minimum per-worker L2 across the process affinity mask, captured once at discovery. Stable on hybrid CPUs and
@@ -148,6 +163,14 @@ fn discover() void {
         var mask: std.os.linux.cpu_set_t = undefined;
         // Query the main thread's mask, not an initializing worker's possibly narrower mask.
         if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0) {
+            const affinity: CpuSet = .{ .masks = mask };
+            process_l1d = std.math.maxInt(usize);
+            var it = affinity.iterator(.{});
+            while (it.next()) |cpu_id| {
+                process_l1d = @min(process_l1d, detected[cpu_id].l1d.bytesPerWorker());
+                process_line = @max(process_line, detected[cpu_id].l1d.line_bytes);
+            }
+            if (process_l1d == std.math.maxInt(usize)) process_l1d = 0;
             process_l2 = affinityMinimum(&detected, .{ .masks = mask });
             process_l3 = affinityL3Minimum(&detected, .{ .masks = mask });
         }
@@ -184,6 +207,13 @@ fn readSysfs(cpu: usize, out: *Cpu) void {
         if (cache.bytes == 0) {
             if (readFile(size_path, &buf)) |text| cache.bytes = parseSize(text) orelse 0;
         }
+        const line_path = std.fmt.bufPrintSentinel(
+            &path,
+            prefix,
+            .{ cpu, index, "coherency_line_size" },
+            0,
+        ) catch return;
+        if (readFile(line_path, &buf)) |text| cache.line_bytes = std.fmt.parseInt(usize, text, 10) catch 0;
         const share_path = std.fmt.bufPrintSentinel(&path, prefix, .{ cpu, index, "shared_cpu_list" }, 0) catch return;
         if (readFile(share_path, &buf)) |text| cache.cpus = parseCpuList(text) orelse .empty;
     }
@@ -256,12 +286,13 @@ fn decodeLeaf(regs: [4]u32) ?Cache {
     bytes = std.math.mul(usize, bytes, ((regs[1] >> 12) & 0x3ff) + 1) catch return null;
     bytes = std.math.mul(usize, bytes, (regs[1] >> 22) + 1) catch return null;
     bytes = std.math.mul(usize, bytes, @as(usize, regs[2]) + 1) catch return null;
-    return .{ .bytes = bytes, .max_sharing = ((regs[0] >> 14) & 0xfff) + 1 };
+    return .{ .bytes = bytes, .line_bytes = (regs[1] & 0xfff) + 1, .max_sharing = ((regs[0] >> 14) & 0xfff) + 1 };
 }
 
 test "hardware cache fixtures preserve sizes, SMT sharing and noncontiguous CCD domains" {
     const l2 = decodeLeaf(.{ 3 | (2 << 5) | (1 << 14), 63 | (7 << 22), 2047, 0 }).?;
     try std.testing.expectEqual(@as(usize, 1 << 20), l2.bytes);
+    try std.testing.expectEqual(@as(usize, 64), l2.line_bytes);
     try std.testing.expectEqual(@as(usize, 512 << 10), l2.bytesPerWorker());
     try std.testing.expectEqual(@as(?usize, 1280 << 10), parseSize("1280K"));
     const domain = parseCpuList("0-7,16-23\n").?;

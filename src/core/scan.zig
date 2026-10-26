@@ -4428,7 +4428,14 @@ fn prepareAggregateWithMetas(
             .column_names = names,
             .columns = plan.columns,
             .count_columns = count_columns,
-            .workers = n_workers,
+            .workers = if (record_path) |path| switch (path.layout) {
+                .integer_group_stream,
+                .integer_sum_top_h,
+                .integer_count_top_h,
+                .integer_distinct_top_h,
+                => @min(n_workers, owner_groups.max_workers),
+                else => n_workers,
+            } else n_workers,
             .work_items = work_items.items.len,
             .record_path = record_path,
             .dense = record_path == null and decision.strategy == .plain_hash and
@@ -6332,10 +6339,11 @@ fn inlinePackedAnswer(
     keys_opt: ?[]const expr_ast.Expr,
     outputs_opt: ?[]const BoundOutputColumn,
     domain: *const agg_dense.Domain,
-    n_workers: usize,
+    requested_workers: usize,
     timings: Timings,
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const n_workers = @min(requested_workers, owner_groups.max_workers);
     const order = args.result_order;
     if (!args.integer_records or !args.encoded or !allRescannable(args.inputs) or
         calls.len != 1 or
@@ -6525,10 +6533,11 @@ fn inlineIntegerAnswer(
     calls: []const expr_agg.AggCall,
     keys_opt: ?[]const expr_ast.Expr,
     outputs_opt: ?[]const BoundOutputColumn,
-    n_workers: usize,
+    requested_workers: usize,
     timings: Timings,
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const n_workers = @min(requested_workers, owner_groups.max_workers);
     const order = args.result_order;
     if (!args.integer_records or !allRescannable(args.inputs) or
         order.having != null or
@@ -6618,11 +6627,11 @@ fn inlineIntegerAnswer(
         if (ndv.footerEntries(metas, keys)) |guess| {
             // An unfiltered count cut stays coded when its summed dictionary domain fits the existing dense
             // domain limit. A fraction of the rows can still mean millions of distinct integer identities.
-            const small = if (count_top and !ordered_count and args.filter == null)
+            const prefer_coded = if (count_top and !ordered_count and args.filter == null)
                 guess <= agg_dense.max_ids
             else
                 guess < rows / 4;
-            if (small) return null;
+            if (prefer_coded) return null;
         } else if (count_top and !ordered_count) {
             var survivors: f64 = 0;
             var range: IntegerRangeHint = .{};
@@ -22374,5 +22383,92 @@ test "dense quote refusal restores displaced partitions before consuming rows" {
         defer got.deinit(gpa);
         try testing.expect(got.part_agg);
         try testing.expectEqualDeep(want.output.group_rows.?, got.output.group_rows.?);
+    }
+}
+
+test "integer and packed COUNT owner caps agree with EXPLAIN beyond sixty four workers" {
+    const gpa = testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    var keys: [1025]i64 = undefined;
+    var flags: [1025]i64 = undefined;
+    for (&keys, &flags, 0..) |*key, *flag, i| {
+        key.* = @as(i64, @intCast(i * 17 % 61)) * (1 << 40);
+        flag.* = @intCast(i % 3);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &keys } } },
+        .{ .name = "f", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &flags } } },
+    };
+    try file.append(&columns, keys.len, .SNAPPY, .{}, .{});
+    _ = try file.finish(&columns);
+    const meta = try metadata.open(a, sink.buffer.items);
+    for (meta.row_groups.items[0].columns.items) |column|
+        try testing.expect(column.meta_data.?.dictionary_page_offset != null);
+    const inputs: [128]Input = @splat(.{ .name = "owner-cap.parquet", .bytes = sink.buffer.items });
+    const metas: [128]schema.FileMetaData = @splat(meta);
+    for ([_][]const u8{ "k", "k,f" }, 0..) |group_by, shape| {
+        const base: MultiAggArgs = .{
+            .inputs = &inputs,
+            .metas = &metas,
+            .aggregate = "count(*) AS c",
+            .group_by = group_by,
+            .integer_records = false,
+            .byte_records = false,
+            .msd_records = false,
+            .ndv_policy = false,
+            .dense = false,
+            .plain_rules = false,
+            .sketch_topk = null,
+            .min_bytes_per_worker = 1,
+            .max_memory = 256 << 20,
+            .result_order = .{ .keys = &.{.{ .column = shape + 1, .descending = true }}, .limit = 10, .offset = 2 },
+        };
+        var want = try runMultiAggregate(gpa, a, base);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, base.result_order);
+        for ([_]usize{ 64, 65, 96, 128 }) |j| {
+            var trial = std.heap.ArenaAllocator.init(gpa);
+            defer trial.deinit();
+            var args = base;
+            args.parallelism = j;
+            args.integer_records = true;
+            args.integer_records_min_rows = 0;
+            var ready: u8 = 0;
+            const Ready = struct {
+                fn wait(_: *anyopaque, _: usize) anyerror!void {}
+                fn done(_: *anyopaque, _: usize, _: usize) void {}
+            };
+            var readers = inputs;
+            if (shape == 1) {
+                for (&readers) |*input| {
+                    input.plan_bytes = input.bytes;
+                    input.gate = .{ .ctx = &ready, .wait = Ready.wait, .done = Ready.done };
+                    input.dict_wait = .{ .ctx = &ready, .wait = Ready.wait };
+                }
+                args.inputs = &readers;
+                args.ndv_policy = true;
+                args.dense = true;
+            }
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            const explanation = try explainAggregate(gpa, trial.allocator(), args);
+            try testing.expectEqual(@as(usize, owner_groups.max_workers), explanation.workers);
+            if (explanation.record_path == null) std.debug.print(
+                "owner cap shape={d} j={d} has no record admission\n",
+                .{ shape, j },
+            );
+            try testing.expect(explanation.record_path != null);
+            try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+            var got = try prepareAggregate(gpa, trial.allocator(), args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.integer_records));
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        }
     }
 }

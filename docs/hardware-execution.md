@@ -23,6 +23,21 @@ An unknown allowed CPU makes the execution budget zero. Platforms without
 affinity/cache discovery, including macOS arm64, return zero;
 `hw.l2BytesPerWorkerOr(default)` lets each caller supply an explicit fallback.
 
+`hw.l1dBytesPerWorker()` uses the same affinity minimum and sharing rule.
+`hw.cacheLineBytes()` returns the widest discovered L1 data-cache line in that
+snapshot, with Zig's target cache-line estimate when unknown. Integer COUNT
+owners reserve a worker-local exact preaggregation cache within one quarter
+of the L1 share, one sixty-fourth of the L2 share and one quarter of the existing
+owner headroom. Unknown L1 uses one sixteenth of the L2 share. Capacity rounds
+down to whole cache lines and then a power of two of 16-byte entries; less
+than one line disables the cache. NULL uses the ordinary cache with a separate
+identity bit. Evictions retain the exact count and minimum source ordinal,
+so cache capacity changes work and memory only, including first-row ties.
+The reservation includes every worker's cache before scanning any rows.
+Each input source tries two cache-line-widths of probes per slot. If fewer
+than one record per slot was eliminated, the worker flushes exact partials
+and bypasses the cache until the next source; later skew can still benefit.
+
 Tests can set the thread-local `hw.test_cpu` fixture without affecting other
 threads. Process-wide environment overrides are read at discovery; sizes
 accept decimal bytes or uppercase `K` / `M` binary suffixes:

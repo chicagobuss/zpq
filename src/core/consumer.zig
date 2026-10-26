@@ -4873,9 +4873,11 @@ fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, stage
     // read it as a bare argument.
     @memset(u.hist_ok, in.filter == null and target == .scalar);
     // So does a lone GROUP BY key that only counts read, its groups resolved from the histogram
-    // (`agg_coded.groupedCoded`). A staged, windowed or sketched fold reads codes per row.
+    // (`agg_coded.groupedCoded`). A staged, windowed, sketched or owned-record fold needs per-row identities.
     if (in.filter == null and !staged) switch (target) {
-        .grouped => |g| if (g.part == null and g.table.sketch == null and g.table.discovery == null) {
+        .grouped => |g| if (g.records == null and g.part == null and g.table.sketch == null and
+            g.table.discovery == null)
+        {
             if (agg_coded.histGroupKey(g.calls, g.keys)) |key| if (key < n) {
                 u.hist_ok[key] = true;
             };

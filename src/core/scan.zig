@@ -6616,7 +6616,13 @@ fn inlineIntegerAnswer(
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) {
         if (ndv.footerEntries(metas, keys)) |guess| {
-            if (guess < rows / 4) return null;
+            // An unfiltered count cut stays coded when its summed dictionary domain fits the existing dense
+            // domain limit. A fraction of the rows can still mean millions of distinct integer identities.
+            const small = if (count_top and !ordered_count and args.filter == null)
+                guess <= agg_dense.max_ids
+            else
+                guess < rows / 4;
+            if (small) return null;
         } else if (count_top and !ordered_count) {
             var survivors: f64 = 0;
             var range: IntegerRangeHint = .{};
@@ -21911,6 +21917,54 @@ test "unfiltered integer COUNT owns raw nullable keys without a dictionary union
         if (gated) {
             try testing.expectEqual(meta.row_groups.items.len, window.waits.load(.monotonic));
             try testing.expectEqual(@as(usize, 0), window.abandoned);
+        }
+    };
+}
+
+test "unfiltered record COUNT retains row identities instead of a dictionary histogram" {
+    const gpa = testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    var values: [4096]i64 = undefined;
+    for (&values, 0..) |*v, i| v.* = @as(i64, @intCast(i * 7 % 16)) * (1 << 40);
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "unused", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &values } } },
+        .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &values } } },
+    };
+    for (0..2) |_| try file.append(&columns, values.len, .SNAPPY, .{}, .{});
+    _ = try file.finish(&columns);
+    const meta = try metadata.open(a, sink.buffer.items);
+    const base: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "hist-count.parquet", .bytes = sink.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .integer_records_min_rows = 0,
+        .ndv_policy = false,
+        .sketch_topk = null,
+        .max_memory = 128 << 20,
+        .scan_all = true,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    for ([_]usize{ 0, 64 }) |batch| for ([_]bool{ false, true }) |encoded| {
+        var args = base;
+        args.decode_batch_rows = batch;
+        args.encoded = encoded;
+        var taken: std.EnumSet(FastPath) = .{};
+        args.taken = &taken;
+        var got = try prepareAggregate(gpa, a, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.integer_records));
+        try testing.expectEqual(@as(i64, 8192), got.rows_matched);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqual(@as(usize, 10), got.output.group_rows.?.len);
+        for (got.output.group_rows.?, 0..) |row, i| {
+            try testing.expectEqual(@as(i128, @intCast(i * 7 % 16)) * (1 << 40), row[0].i);
+            try testing.expectEqual(@as(i128, 512), row[1].i);
         }
     };
 }

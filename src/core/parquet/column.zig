@@ -456,7 +456,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (!try self.advancePage()) break;
                 if (self.active != .plain) return error.UnsupportedEncoding;
                 const rows = self.current_page_num_values;
-                if (rows == 0 or w + rows > num_leaves) return error.UnexpectedPage;
+                // A zero-row data page is legal; the value decoder accepts it (`beginPage(0)`). Skipping it
+                // keeps the next page's lengths aligned. A page that would write past the chunk is still rejected.
+                if (rows == 0) continue;
+                if (w + rows > num_leaves) return error.UnexpectedPage;
                 if (max_def == 0 or self.current_def_all_present) {
                     const n = self.active.plain.writeLengths(lengths[w..][0..rows]) catch return error.UnexpectedPage;
                     if (n != rows) return error.ShortDecode;

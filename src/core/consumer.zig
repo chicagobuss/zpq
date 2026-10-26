@@ -5316,6 +5316,7 @@ fn plainLengthColumn(
     ci: usize,
     chunk: []const u8,
     cm: schema.ColumnMetaData,
+    options: DecodeOptions,
 ) !?filter_eval.Batch.Column {
     if (cm.type != .BYTE_ARRAY) return null;
     const filter = in.filter orelse return null;
@@ -5325,7 +5326,9 @@ fn plainLengthColumn(
     const levels = in.meta.getColumnLevels(cm.path_in_schema.items);
     if (levels.max_rep != 0) return null;
     const n: usize = @intCast(cm.num_values);
-    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(chunk, cm.codec, levels, a, .{}, null);
+    // The caller's options already carry the chunk's inflate cap. An empty literal would decode a page the
+    // value path rejects for claiming more bytes than the chunk.
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(chunk, cm.codec, levels, a, options, null);
     const got = reader.readPlainLengths(n) catch |err| switch (err) {
         error.UnsupportedEncoding => return null,
         else => return err,
@@ -5418,7 +5421,7 @@ const ChunkDecoder = struct {
             return decoded;
         };
         if (self.allow_lengths and !self.refill and self.keep == null and !pruned_pages) {
-            if (try plainLengthColumn(a, in, ci, chunk, cm)) |col| {
+            if (try plainLengthColumn(a, in, ci, chunk, cm, decode_options)) |col| {
                 try checkRowShape(col, self.rows_out orelse self.num_rows);
                 if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(in.file_index, in.rg_index, ci, cm));
                 return col;
@@ -7382,7 +7385,9 @@ fn decodeKeptRows(
                 o += keep[j].hi - keep[j].lo;
             }
             if (!any) {
-                // Reads as nulls; `values` and levels for its kept rows are filled below as for a null page.
+                // The page survived page pruning and the filter then dropped every kept row. Fill those slots and
+                // leave `k`/`out` so the next page still lines up. Required columns have no definition levels; a
+                // missing slice panics, and writing 0 there would call present defaults null.
                 var j2 = k;
                 var o2 = out;
                 while (j2 < keep.len and keep[j2].lo < end) : (j2 += 1) {
@@ -7390,7 +7395,7 @@ fn decodeKeptRows(
                     const hi = @min(keep[j2].hi, end);
                     const at = o2 + (lo - keep[j2].lo);
                     @memset(values[at..][0 .. hi - lo], defaultVal(T));
-                    @memset(def_levels.?[at..][0 .. hi - lo], 0);
+                    if (def_levels) |dl| @memset(dl[at..][0 .. hi - lo], 0);
                     if (keep[j2].hi > end) break;
                     o2 += keep[j2].hi - keep[j2].lo;
                 }
@@ -8293,6 +8298,242 @@ test "PLAIN byte-array lengths record emptiness without the payloads" {
     const got = try reader.readPlainLengths(2);
     try testing.expectEqualSlices(u32, &.{ 0, 2 }, got.lengths);
     try testing.expect(got.def_levels == null);
+}
+
+fn appendV1Plain(
+    arena: std.mem.Allocator,
+    chunk: *std.ArrayList(u8),
+    num_values: i32,
+    body: []const u8,
+    claimed: i32,
+) !void {
+    const header = schema.PageHeader{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = claimed,
+        .compressed_page_size = @intCast(body.len),
+        .crc = null,
+        .data_page_header = .{
+            .num_values = num_values,
+            .encoding = .PLAIN,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    var w: thrift.Writer = .init(arena);
+    try header.write(&w);
+    try chunk.appendSlice(arena, w.bytes());
+    try chunk.appendSlice(arena, body);
+}
+
+test "PLAIN lengths and values both reject a page past the chunk's inflate cap" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Header claims 4 KiB behind a 4-byte body. Under the cap both paths refuse before inflating it; without the
+    // cap the length reader would accept a page the value reader rejects.
+    var chunk: std.ArrayList(u8) = .empty;
+    try appendV1Plain(arena, &chunk, 1, &[_]u8{ 0, 0, 0, 0 }, 4096);
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+    const options: DecodeOptions = .{ .page_bytes_limit = 32 };
+    var lengths = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk.items,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        options,
+        null,
+    );
+    try testing.expectError(error.PageLargerThanChunk, lengths.readPlainLengths(1));
+    var values = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk.items,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        options,
+        null,
+    );
+    var dest: [1][]const u8 = undefined;
+    try testing.expectError(error.PageLargerThanChunk, values.decode(&dest));
+
+    var encs = [_]schema.Encoding{.PLAIN};
+    var path = [_][]const u8{"s"};
+    const cm = schema.ColumnMetaData{
+        .type = .BYTE_ARRAY,
+        .encodings = .{ .items = &encs, .capacity = 1, .pointer_stability = .{} },
+        .path_in_schema = .{ .items = &path, .capacity = 1, .pointer_stability = .{} },
+        .codec = .UNCOMPRESSED,
+        .num_values = 1,
+        .total_uncompressed_size = @intCast(chunk.items.len),
+        .total_compressed_size = @intCast(chunk.items.len),
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+    };
+    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = 1 };
+    const meta: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .empty,
+        .num_rows = 1,
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    const in: AggRowGroup = .{
+        .rg = &rg,
+        .meta = &meta,
+        .src = .{ .bytes = chunk.items, .byte_origin = 0 },
+        .filter = .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "" } },
+        .read = &.{true},
+        .consumed = &.{false},
+    };
+    try testing.expectError(error.PageLargerThanChunk, plainLengthColumn(arena, in, 0, chunk.items, cm, options));
+}
+
+test "PLAIN lengths skip a leading or intermediate zero-row page and still reject an oversized count" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ab: [8]u8 = undefined;
+    std.mem.writeInt(u32, ab[0..4], 2, .little);
+    @memcpy(ab[4..6], "ab");
+    var chunk: std.ArrayList(u8) = .empty;
+    try appendV1Plain(arena, &chunk, 0, &.{}, 0);
+    try appendV1Plain(arena, &chunk, 1, ab[0..6], 6);
+    try appendV1Plain(arena, &chunk, 0, &.{}, 0);
+    try appendV1Plain(arena, &chunk, 1, &[_]u8{ 0, 0, 0, 0 }, 4);
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk.items,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        .{},
+        null,
+    );
+    const lengths = try reader.readPlainLengths(2);
+    try testing.expectEqualSlices(u32, &.{ 2, 0 }, lengths.lengths);
+    var again = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk.items,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        .{},
+        null,
+    );
+    var dest: [2][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), try again.decode(&dest));
+    try testing.expectEqualStrings("ab", dest[0]);
+    try testing.expectEqualStrings("", dest[1]);
+
+    var over: std.ArrayList(u8) = .empty;
+    try appendV1Plain(arena, &over, 0, &.{}, 0);
+    try appendV1Plain(arena, &over, 5, &.{}, 0);
+    var bad = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        over.items,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        .{},
+        null,
+    );
+    try testing.expectError(error.UnexpectedPage, bad.readPlainLengths(2));
+}
+
+/// Compaction (`compact_rows_in_tests`) decodes `keep`. A page inside those rows can still have no SQL survivor.
+/// Filling it must not move the next page's values.
+fn compactionAlignsNextPage(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    elem: *const schema.SchemaElement,
+    col: filter_eval.Batch.Column,
+    plain: []const T,
+) !void {
+    const path = [_][]const u8{elem.name};
+    const enc = try encoder.encodeColumn(arena, .{
+        .values = col,
+        .schema_elem = elem,
+        .path_in_schema = &path,
+        .codec = .UNCOMPRESSED,
+        .distinct = true,
+        .page_rows = 4,
+    });
+    try std.testing.expect(enc.pages.len >= 2);
+    const split: usize = @intCast(enc.pages[0].rows);
+    try std.testing.expect(split > 0 and split < plain.len);
+    try std.testing.expect(enc.pages[1].offset > 0);
+    // That page is not decoded. Its last byte would fail a reader that opened it.
+    enc.bytes[@as(usize, @intCast(enc.pages[1].offset)) - 1] ^= 0xff;
+    const locs = try arena.alloc(schema.PageLocation, enc.pages.len);
+    for (enc.pages, locs) |p, *loc| loc.* = .{
+        .offset = @intCast(p.offset),
+        .compressed_page_size = @intCast(p.size),
+        .first_row_index = @intCast(p.first_row),
+    };
+    const quiet = try arena.alloc(bool, locs.len);
+    @memset(quiet, false);
+    const keep = [_]RowRange{.{ .lo = 0, .hi = plain.len }};
+    const prune = PruningInfo{
+        .locations = locs,
+        .page_is_skipped = quiet,
+        .page_is_always_match = quiet,
+        .dictionary_page_offset = if (enc.pages[0].offset > 0) @as(?i64, 0) else null,
+        .chunk_file_offset = 0,
+        .col_index = .{},
+        .keep = &keep,
+    };
+    var gate = try filter_selection.SelectionVector.init(arena, plain.len);
+    defer gate.deinit();
+    for (0..split) |i| gate.set(i, false);
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(
+        enc.bytes,
+        .UNCOMPRESSED,
+        levels,
+        arena,
+        .{ .row_gate = &gate },
+        null,
+    );
+    const got = try decodeWithReaderPruned(T, arena, &reader, levels, plain.len, prune);
+    try std.testing.expectEqual(plain.len, got.values.len);
+    try std.testing.expect(got.def_levels == null);
+    if (comptime T == []const u8) {
+        for (got.values[0..split]) |v| try std.testing.expectEqualStrings("", v);
+        for (plain[split..], got.values[split..]) |want, g| try std.testing.expectEqualStrings(want, g);
+    } else {
+        for (got.values[0..split]) |v| try std.testing.expectEqual(defaultVal(T), v);
+        try std.testing.expectEqualSlices(T, plain[split..], got.values[split..]);
+    }
+}
+
+test "compaction fills a kept required page with no SQL survivors and aligns the next page" {
+    const testing = std.testing;
+    const prior = compact_rows_in_tests;
+    defer compact_rows_in_tests = prior;
+    compact_rows_in_tests = true;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const nums = [_]i32{ 10, 11, 12, 13, 20, 21, 22, 23 };
+    try compactionAlignsNextPage(i32, arena, &req_i32_elem, .{ .i32 = .{ .values = &nums } }, &nums);
+
+    const req_ba = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "s",
+        .num_children = 0,
+        .converted_type = null,
+        .logical_type = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const strs = [_][]const u8{ "a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3" };
+    try compactionAlignsNextPage([]const u8, arena, &req_ba, .{ .string = .{ .values = &strs } }, &strs);
 }
 
 test "a partial record batch gathers ascending original rows" {

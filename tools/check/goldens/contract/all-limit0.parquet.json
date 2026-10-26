@@ -1,0 +1,1 @@
+{"names": ["k", "v", "s"], "types": ["int64", "int64", "string"], "nullable": [true, true, true], "rows": [], "row_groups": [], "column_orders": [1, 1, 1], "stats_kept": true, "pushed": []}

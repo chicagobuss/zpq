@@ -7,7 +7,6 @@ count x value) or fail alike.
 
 Usage: .venv/bin/python tools/agg_ab_fuzz.py [--zpq zig-out/bin/zpq] [--queries 600] [--seed 1234] [--dir DIR]
 """
-from cli_output import read_rows
 import argparse, decimal, json, os, random, subprocess, sys, tempfile
 import numpy as np, pyarrow as pa, pyarrow.parquet as pq
 
@@ -105,7 +104,7 @@ def run(b, path, args, env):
     p = subprocess.run([b, "query", path] + args, capture_output=True, text=True, env=env)
     if p.returncode != 0:
         return ("ERR", (p.stderr.strip().splitlines() or [""])[-1][:200])
-    return ("OK", read_rows(p.stdout))
+    return ("OK", [json.loads(line) for line in p.stdout.splitlines() if line.strip()])
 
 def main():
     ap = argparse.ArgumentParser()

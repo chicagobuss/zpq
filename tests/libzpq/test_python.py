@@ -437,6 +437,60 @@ def test_bad_lengths(z):
         server.server_close()
 
 
+def test_bloom_options(z):
+    """Bloom options through the library write the CLI's bytes; tools/check/cases/bloom.json checks the CLI's."""
+    import subprocess
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src.parquet")
+        low = [(i % 64) * 2 for i in range(4000)]
+        pq.write_table(pa.table({"low": pa.array(low, pa.int32()), "high": pa.array(range(4000), pa.int64())}), src,
+                       row_group_size=1000)
+        for auto, explicit, flags in [(True, False, []), (False, False, ["--no-bloom-filters"]),
+                                      (False, True, ["--no-bloom-filters", "--bloom-filter", "high:0.001"])]:
+            lib_out, cli_out = os.path.join(d, "lib.parquet"), os.path.join(d, "cli.parquet")
+            request = {"inputs": [src], "select": "low,high", "output_url": lib_out, "bloom_filters_enabled": auto}
+            if explicit:
+                request["bloom_filters"] = ["high:0.001"]
+            z.run(request)
+            subprocess.run([os.environ.get("ZPQ_BIN", "zig-out/bin/zpq"), "query", src, "--select", "low,high", "-o",
+                            cli_out, *flags], check=True)
+            check(Path(lib_out).read_bytes() == Path(cli_out).read_bytes(), f"Bloom options {flags} differ from CLI")
+
+
+def test_binary_text(z):
+    """The library prints binary, UUID and annotated byte columns as the CLI does, and names invalid UTF-8; the CLI's
+    own output is pinned in tools/check/cases/cli_formats.json."""
+    import struct
+    import subprocess
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    cli = os.environ.get("ZPQ_BIN", "zig-out/bin/zpq")
+    with tempfile.TemporaryDirectory() as d:
+        blob, uuids, invalid = (os.path.join(d, n) for n in ("blob.parquet", "uuid.parquet", "invalid.parquet"))
+        pq.write_table(pa.table({"v": [b"\xff", b"\xfe", b"ASCII", b"", None, b"\x00", b"/w==", "\u00e9".encode(),
+                                       bytes(range(256)) * 13]}), blob)
+        pq.write_table(pa.table({"v": pa.array([b"\xff" * 16, None, bytes(range(16))], pa.binary(16)).cast(pa.uuid())}),
+                       uuids)
+        fixtures = "ci/fixtures/parquet"
+        for src in (blob, uuids, f"{fixtures}/format_geometry.parquet", f"{fixtures}/format_interval.parquet"):
+            for sql in (f"SELECT * FROM '{src}'", f"SELECT min(v) AS lo, max(v) AS hi FROM '{src}'",
+                        f"SELECT v, count(*) AS n FROM '{src}' GROUP BY v"):
+                want = subprocess.run([cli, "query", "--query", sql], capture_output=True, text=True, check=True).stdout
+                check(z.query_raw(sql, parallelism=1) == want, f"library text differs from the CLI's: {sql}")
+        bad = pa.Array.from_buffers(pa.string(), 2, [None, pa.py_buffer(struct.pack("<iii", 0, 1, 3)),
+                                                     pa.py_buffer(b"\xff\xfe\x80")])
+        pq.write_table(pa.table({"bad": bad}), invalid)
+        for sql in (f"SELECT * FROM '{invalid}'", f"SELECT max(bad) AS hi FROM '{invalid}'"):
+            r = z.run({"sql": sql}, check=False)
+            check(r.get("reason") == "InvalidUtf8" and r.get("column") == "bad", f"invalid UTF-8 {r}")
+
+
 def test_options_and_budget():
     for bad in ({"max_memory": "lots"}, {"budget_wait_ms": -1}):
         try:
@@ -466,6 +520,8 @@ def main():
         test_threads(z)
         test_service(z)
         test_bad_lengths(z)
+        test_bloom_options(z)
+        test_binary_text(z)
     test_close_drains()
     test_close_ends_waiters()
     test_service_shutdown()

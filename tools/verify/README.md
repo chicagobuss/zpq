@@ -19,6 +19,9 @@ No arguments and `--help` show every stage, tier, requirement and exit code.
 test scales. `commit` uses the same core tests, builds the CLI, runs the CLI
 contracts and independent reader checks, and runs the full differential referee.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
+Release checks block on non-native targets unless `--arch-summary PATH` supplies
+matching-SHA native evidence (repeat for each target). The Intel macOS runtime
+is explicitly deferred and accepted by name in the stage command.
 `full`'s unit tests stay in Debug, including the environment-clearing and SIGPIPE
 handler identity ABI tests. No test or exhaustive sweep is moved or omitted
 from quick/commit; the core optimization mode is their only coverage change.
@@ -30,8 +33,9 @@ a mismatch stops before gates and its revision is recorded in provenance.
 `full --base-rev SHA` builds the comparison CLI from an archived git revision
 in `zig-out/verify-cache`, with its own source/output directories and shared
 compiler cache (`ZPQ_VERIFY_CACHE` relocates it). `--base PATH` still accepts
-an existing comparison binary. The flags are mutually exclusive and the
-resolved base revision and binary hash are recorded. Native builds default to
+an existing comparison binary. The flags are mutually exclusive. Cached sources are compared to a fresh git
+archive before building; compiler binary identity and build flags key outputs.
+The resolved base revision, tree and compiler identity, and binary hash are recorded. Native builds default to
 `--cpu native`, using the host CPU. `--cpu` remains an explicit override.
 Provenance records both the requested setting and the resolved Zig CPU model.
 

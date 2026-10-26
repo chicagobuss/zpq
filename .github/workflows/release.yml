@@ -63,24 +63,88 @@ jobs:
             dist/*.tar.gz*
             dist/release.json
 
-  # Build every release artifact; run native checks (foreign checks: verify arch).
+      - name: Build shipped Linux bootstrap and integration harness
+        if: matrix.target != 'x86_64-macos'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 - <<'PY_SMOKE'
+          import hashlib, os, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, "tools/verify")
+          import revision
+          target = os.environ["TARGET"]
+          dest = (Path("dist") / target / "bin").resolve()
+          names = ["zpq"]
+          if target.endswith("linux-musl"):
+              sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              subprocess.run(["zig", "build", "lambda", "-j8", "-Doptimize=ReleaseFast", "-Dcpu=baseline",
+                              "-Dstrip=true", f"-Dtarget={target}", f"-Drevision={sha}",
+                              "--prefix", str(dest.parent)], check=True)
+              revision.integration(Path.cwd(), dest, target, False)
+              names += ["zpq-lambda", "zpq-integration"]
+          with (dest / "SHA256SUMS").open("w") as out:
+              for name in names:
+                  out.write(hashlib.sha256((dest / name).read_bytes()).hexdigest() + "  " + name + "\n")
+          PY_SMOKE
+
+      - name: Upload native smoke bundle
+        if: matrix.target != 'x86_64-macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.target }}/bin/zpq
+            dist/${{ matrix.target }}/bin/zpq-lambda
+            dist/${{ matrix.target }}/bin/zpq-integration
+            dist/${{ matrix.target }}/bin/SHA256SUMS
+
+  # Execute the packaged CLI and the shipped bootstrap/harness on native runners.
   smoke:
-    name: Run release artifacts (Linux)
-    runs-on: ubuntu-latest
+    needs: build
+    name: Native release smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-musl
+            deferred: x86_64-macos
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            deferred: ''
+          - runner: macos-14
+            target: aarch64-macos
+            deferred: ''
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Install Zig (anyzig pins to build.zig.zon)
-        run: |
-          mkdir -p $HOME/zig-bin
-          curl -fsSL "https://github.com/marler8997/anyzig/releases/latest/download/anyzig-x86_64-linux.tar.gz" \
-            | tar -xz -C $HOME/zig-bin
-          echo "$HOME/zig-bin" >> $GITHUB_PATH
+      - name: Download shipped smoke bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: release/${{ matrix.target }}/bin
 
-      - name: Build and run the release artifacts
-        run: zig build release-smoke
+      - name: Verify and enable shipped binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "release/$TARGET/bin"
+          if command -v sha256sum >/dev/null; then
+            sha256sum -c SHA256SUMS
+          else
+            shasum -a 256 -c SHA256SUMS
+          fi
+          chmod +x zpq*
+
+      - name: Run the shipped release artifacts
+        run: >-
+          tools/release_smoke.sh --run-only --accept-deferred x86_64-macos
+          release ${{ matrix.target }} ${{ matrix.deferred }}
 
   release:
     name: Create Release

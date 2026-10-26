@@ -29,7 +29,7 @@ budget=$(get '.budget_seconds // 90')
 archive_sha=$(jq -er --arg p "$duck_platform" '.platforms[$p].archive_sha256' "$here/arch_duckdb.json")
 duck_sha=$(jq -er --arg p "$duck_platform" '.platforms[$p].binary_sha256' "$here/arch_duckdb.json")
 manifest_sha=$(sha256sum "$data/manifest.json" | cut -d' ' -f1)
-engine_sha=$(sha256sum "$binaries/$target/zpq" | cut -d' ' -f1)
+engine_sha=$(sha256sum "$binaries/$target/SHA256SUMS" | cut -d' ' -f1)
 runner_sha=$(sha256sum "$binaries/$target/arch-runner" | cut -d' ' -f1)
 remote mkdir -p "$cache_root"
 cache_root=$(remote bash -c 'cd "$1" && pwd' bash "$cache_root" | tail -n 1)
@@ -39,31 +39,47 @@ if ! remote test -f "$cache_root/data-$manifest_sha/manifest.json"; then
     rsync -a "$data/" "$host:$cache_root/data-$manifest_sha/"
 fi
 if ! remote test -f "$cache_root/engine-$engine_sha/zpq"; then
-    rsync -a "$binaries/$target/zpq" "$host:$cache_root/engine-$engine_sha/"
+    rsync -a --include=SHA256SUMS --include=zpq --include=zpq-lambda --include=zpq-integration \
+        --exclude='*' "$binaries/$target/" "$host:$cache_root/engine-$engine_sha/"
 fi
 if ! remote test -f "$cache_root/runner-$runner_sha/arch-runner"; then
     rsync -a "$binaries/$target/arch-runner" "$host:$cache_root/runner-$runner_sha/"
 fi
+remote bash "$cache_root/arch_remote.sh" verify "$cache_root/engine-$engine_sha" "$engine_sha"
 if "$setup_only"; then echo "$host setup cached"; exit 0; fi
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
 run_dir="$cache_root/runs/$run_id"
 local_dir="$out/$host/$run_id"
 mkdir -p "$local_dir"
-release_status=elsewhere
-if [[ "$target" == aarch64-* ]]; then
+holding=false
+rc=1
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if "$holding"; then release || true; fi
+    if ! remote bash "$cache_root/arch_remote.sh" clean "$cache_root" "$run_dir" "$status"; then
+        echo "remote cleanup failed: $host:$run_dir" >&2
+        if [ "$status" -eq 0 ]; then status=2; fi
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+release_status="not run"
+if [[ "$target" == aarch64-* || "$target" == x86_64-linux-musl ]]; then
     source=$(get '.source')
-    if ! remote test -f "$cache_root/source-$revision/.ready"; then
-        rsync -a "$source" "$host:$cache_root/source-$revision.tar"
+    source_sha=$(sha256sum "$source" | cut -d' ' -f1)
+    if ! remote test -f "$cache_root/source-$source_sha.tar"; then
+        rsync -az "$source" "$host:$cache_root/source-$source_sha.tar"
     fi
     set +e
     remote bash "$cache_root/arch_remote.sh" release "$cache_root" "$revision" "$target" \
-        "$memory_max" "$nice_level" "$engine_sha" 2>&1 | tee "$local_dir/release-smoke.log"
+        "$memory_max" "$nice_level" "$engine_sha" "$source_sha" "$disk_cap_kb" 2>&1 | tee "$local_dir/release-smoke.log"
     release_rc=${PIPESTATUS[0]}
     set -e
     release_status=pass
     if [ "$release_rc" -ne 0 ]; then
-        jq -n --arg revision "$revision" \
-            '{revision: $revision, release_smoke: {status: "fail", log: "release-smoke.log"}}' \
+        jq -n --arg sha "$revision" --arg target "$target" --argjson code "$release_rc" \
+            '{sha: $sha, target: $target, exit: $code, release_smoke: {status: "fail", log: "release-smoke.log"}}' \
             > "$local_dir/summary.json"
         exit "$release_rc"
     fi
@@ -79,9 +95,9 @@ threads=$(get '.hosts[$h].threads // 0')
 if [ "$threads" -gt 0 ]; then extra+=(--threads "$threads"); fi
 if [ "$(get '.hosts[$h].hash_only // false')" = true ]; then extra+=(--hash-only); fi
 if [ "$(get '.hosts[$h].tiny_perf // false')" = true ]; then extra+=(--tiny-perf); fi
-notify '.hosts[$h].hold' 'Arch timing window: hold heavy jobs for 2 minutes starting now; release will follow.'
 release() { notify '.hosts[$h].hold' 'Arch matrix timing window ended; heavy jobs may resume.'; }
-trap release EXIT
+holding=true
+notify '.hosts[$h].hold' 'Arch timing window: hold heavy jobs for 2 minutes starting now; release will follow.'
 remote uptime
 top_probe='if [ "$(uname -s)" = Darwin ]; then top -l 1 -n 5; else top -b -n 1 -w 180 | head -14; fi'
 remote bash -c "$top_probe" | tee "$local_dir/preflight.txt"
@@ -96,12 +112,12 @@ remote bash "$cache_root/arch_remote.sh" run "$cache_root" "$memory_max" "$nice_
 rc=${PIPESTATUS[0]}
 set -e
 release
-trap - EXIT
+holding=false
 if [ "$rc" -eq 3 ]; then
     notify '.notify' "P0 arch matrix HASH MISMATCH on $host; $run_dir; retrieving exact output now." || true
 fi
 if ! rsync -az "$host:$run_dir/summary.json" "$local_dir/"; then
-    echo "collection failed; remote evidence retained at $host:$run_dir" >&2
+    echo "collection failed; compact summary/logs retained at $host:$run_dir" >&2
     exit 2
 fi
 if [ "$rc" -eq 3 ]; then
@@ -110,12 +126,25 @@ if [ "$rc" -eq 3 ]; then
     done < <(jq -r '.queries[] | select(.correctness == "HASH_MISMATCH") |
         .error_text | split("; exact output ")[1] | split("/")[-1]' "$local_dir/summary.json")
 fi
-jq --arg status "$release_status" --arg comparison "$(get '.comparison // "no cross-host comparison"')" \
-    '.release_smoke = {status: $status, log: "release-smoke.log"} | .cross_host_comparison = $comparison |
-     if $comparison == "no cross-host comparison" then .exit = 2 else . end' \
+comparison=$(get '.comparison // "no cross-host comparison"')
+recorded=$(jq -er '.exit | numbers' "$local_dir/summary.json")
+if [ "$recorded" -ne "$rc" ]; then
+    jq '.exit = 1 | .transport_error = "runner exit disagrees with summary"' \
+        "$local_dir/summary.json" > "$local_dir/summary.tmp"
+    mv "$local_dir/summary.tmp" "$local_dir/summary.json"
+    rc=1
+    echo 'runner exit disagrees with summary' >&2
+    exit 1
+fi
+if [ "$comparison" = "no cross-host comparison" ] && [ "$rc" -eq 0 ]; then rc=2; fi
+artifacts=$(jq -Rn '[inputs | split("  ") | {(.[1]): .[0]}] | add' < "$binaries/$target/SHA256SUMS")
+jq --arg status "$release_status" --arg comparison "$comparison" --arg sha "$revision" \
+    --arg target "$target" --argjson artifacts "$artifacts" --argjson code "$rc" \
+    '.release_smoke = {status: $status, sha: $sha, cli: ($status == "pass"),
+        lambda: ($status == "pass" and ($target | endswith("linux-musl"))), binaries: $artifacts,
+        log: "release-smoke.log"} | .cross_host_comparison = $comparison | .exit = $code' \
     "$local_dir/summary.json" > "$local_dir/summary.tmp"
 mv "$local_dir/summary.tmp" "$local_dir/summary.json"
 ln -sfn "$run_id/summary.json" "$out/$host/latest.json"
 echo "summary $local_dir/summary.json"
-if [ "$rc" -eq 0 ]; then remote rm -rf "$run_dir"; fi
 exit "$rc"

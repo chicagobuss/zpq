@@ -23,6 +23,7 @@ import shipbar
 import stages
 import summary
 import test_observer
+import test_place
 import verify
 
 
@@ -422,6 +423,11 @@ class ShipBarTest(unittest.TestCase):
         self.assertTrue(result["met"])
         self.assertGreater(result["control"]["geomean"], 1)
         self.assertIn("not part of the ship bar", shipbar.render(result))
+
+
+def load_tests(loader, tests, pattern):
+    tests.addTests(loader.loadTestsFromModule(test_place))
+    return tests
 
 
 if __name__ == "__main__":

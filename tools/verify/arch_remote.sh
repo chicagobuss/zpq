@@ -6,39 +6,65 @@ shift
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
 }
+if [ "$action" = verify ]; then
+    bundle=$1
+    engine_sha=$2
+    test "$(hash_file "$bundle/SHA256SUMS" | awk '{print $1}')" = "$engine_sha"
+    cd "$bundle"
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi
+    exit 0
+fi
+if [ "$action" = clean ]; then
+    cache_root=$1
+    run_dir=$2
+    status=$3
+    case "$run_dir" in "$cache_root"/runs/*) ;; *) echo 'invalid run directory' >&2; exit 2 ;; esac
+    [ -d "$run_dir" ] || exit 0
+    if [ "$status" -eq 0 ]; then rm -rf "$run_dir"; exit 0; fi
+    find "$run_dir" -type f ! -name summary.json ! -name '*.log' -delete
+    find "$run_dir" -type l -delete
+    find "$run_dir" -depth -type d -empty -delete
+    exit 0
+fi
 if [ "$action" = release ]; then
     cache_root=$1
     revision=$2
     target=$3
     memory_max=$4
     nice_level=$5
-    tree="$cache_root/source-$revision"
-    mkdir -p "$tree"
-    if [ ! -f "$tree/.ready" ]; then
-        tar -xf "$tree.tar" -C "$tree"
-        touch "$tree/.ready"
-        rm "$tree.tar"
-    fi
+    engine_sha=$6
+    source_sha=$7
+    disk_cap_kb=$8
+    bash "$0" verify "$cache_root/engine-$engine_sha" "$engine_sha"
+    test "$(hash_file "$cache_root/source-$source_sha.tar" | awk '{print $1}')" = "$source_sha"
+    tree=$(mktemp -d "$cache_root/release.XXXXXX")
+    trap 'rm -rf "$tree"' EXIT
+    tar -xf "$cache_root/source-$source_sha.tar" -C "$tree"
     cp "$cache_root/release_smoke.sh" "$tree/tools/release_smoke.sh"
-    export PATH="$HOME/.local/bin:$HOME/zig-bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
-    cd "$tree"
-    mkdir -p "release/$target/bin"
-    cp "$cache_root/engine-$6/zpq" "release/$target/bin/zpq"
+    mkdir -p "$tree/release/$target/bin" "$tree/zig-out" "$tree/tmp"
+    export TMPDIR="$tree/tmp"
+    export ZIG_GLOBAL_CACHE_DIR="$cache_root/zig"
+    cp "$cache_root/engine-$engine_sha/zpq" "$tree/release/$target/bin/"
     if [[ "$target" == *-linux-musl ]]; then
-        export ZIG_GLOBAL_CACHE_DIR="${cache_root%/*}/zig-cache"
-        export ZIG_LOCAL_CACHE_DIR="$tree/.zig-cache"
-        export ZIG="$(command -v zig || command -v anyzig)"
-        test "$("$ZIG" version)" = "$(cat .zig-version)" || { echo 'pinned Zig required' >&2; exit 2; }
+        cp "$cache_root/engine-$engine_sha/zpq-lambda" "$cache_root/engine-$engine_sha/zpq-integration" \
+            "$tree/release/$target/bin/"
     fi
+    cd "$tree"
     case "$(uname -s)/$(uname -m)/$target" in
-        Linux/aarch64/aarch64-linux-musl|Darwin/arm64/aarch64-macos) ;;
+        Linux/aarch64/aarch64-linux-musl|Linux/x86_64/x86_64-linux-musl|Darwin/arm64/aarch64-macos) ;;
         *) echo 'release target is not native to this host' >&2; exit 2 ;;
     esac
+    test "$(du -sk "$cache_root" | awk '{print $1}')" -le "$disk_cap_kb" || {
+        echo 'campaign disk cap exceeded' >&2; exit 2;
+    }
+    export RELEASE_SMOKE_REVISION="$revision"
     if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
-        exec systemd-run --user --scope --quiet -p "MemoryMax=$memory_max" \
+        systemd-run --user --scope --quiet -p "MemoryMax=$memory_max" \
             nice -n "$nice_level" bash tools/release_smoke.sh --run-only "$tree/release" "$target"
+    else
+        nice -n "$nice_level" bash tools/release_smoke.sh --run-only "$tree/release" "$target"
     fi
-    exec nice -n "$nice_level" bash tools/release_smoke.sh --run-only "$tree/release" "$target"
+    exit 0
 fi
 if [ "$action" = setup ]; then
     cache_root=$1
@@ -76,7 +102,7 @@ if [ "$action" = setup ]; then
     fi
     exit 0
 fi
-if [ "$action" != run ]; then echo 'expected setup or run' >&2; exit 2; fi
+if [ "$action" != run ]; then echo 'expected setup, verify, release, run or clean' >&2; exit 2; fi
 cache_root=$1
 memory_max=$2
 nice_level=$3

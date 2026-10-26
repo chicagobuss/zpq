@@ -394,6 +394,7 @@ fn run(init: std.process.Init) !void {
         .ignore_unknown_fields = true,
     });
     runner.cases = parsed_cases.value;
+    try requireCases(runner.cases.len);
     runner.raw_cases = manifest.value.object.get("cases").?.array.items;
     runner.reference = if (opt.reference) |path|
         (try std.json.parseFromSlice(std.json.Value, a, try runner.read(path), .{})).value
@@ -450,6 +451,15 @@ fn run(init: std.process.Init) !void {
         summary_path, code, runner.book.wall_seconds, runner.book.stop_reason,
     });
     std.process.exit(code);
+}
+
+fn requireCases(count: usize) !void {
+    if (count == 0) return error.EmptyCases;
+}
+
+test "empty case lists cannot establish cross-host agreement" {
+    try std.testing.expectError(error.EmptyCases, requireCases(0));
+    try requireCases(1);
 }
 
 fn runMatrix(r: *Runner) !u8 {

@@ -5,7 +5,6 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import subprocess
 from pathlib import Path
 
@@ -17,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 
 def host_plan(config, hosts):
     hosts = sorted(set(hosts))
-    reference = config.get("reference_host", socket.gethostname()) if len(hosts) > 1 else None
+    reference = config.get("reference_host", "[redacted]") if len(hosts) > 1 else None
     if reference:
         policy = config["hosts"].get(reference, {})
         if policy.get("target") != "x86_64-linux-musl" or not policy.get("enabled", True):
@@ -34,27 +33,48 @@ def main():
     parser.add_argument("--config", default=os.environ.get(
         "ZPQ_ARCH_CONFIG", "/mnt/fast/zpq-out/arch-matrix/fleet.json"))
     parser.add_argument("--setup-only", action="store_true")
+    parser.add_argument("--no-scope", action="store_true", help="caller supplies resource limits")
     args = parser.parse_args()
-    config = json.loads(Path(args.config).expanduser().read_text())
+    try:
+        config = json.loads(Path(args.config).expanduser().read_text())
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     hosts = args.host or [h for h, v in config["hosts"].items() if v.get("enabled", True)]
     for host in hosts:
         if host not in config["hosts"] or not config["hosts"][host].get("enabled", True):
             parser.error(f"host absent or disabled in inventory: {host}")
-    hosts, reference = host_plan(config, hosts)
-    sha = revision.resolve(args.rev or config["revision"])
+    try:
+        hosts, reference = host_plan(config, hosts)
+        if not hosts or not json.loads((Path(config["data"]) / "manifest.json").read_text()).get("cases"):
+            raise ValueError("enabled hosts and a nonempty case list are required")
+    except ValueError as error:
+        parser.error(str(error))
+    try:
+        sha = revision.resolve(args.rev or config["revision"])
+    except subprocess.CalledProcessError:
+        parser.error("invalid engine revision")
     root = revision.CACHE / sha
     binaries = root / "binaries"
     targets = sorted({config["hosts"][h]["target"] for h in hosts})
     for target in targets:
-        binary = revision.build(sha, target, cpu="baseline")
+        linux = target.endswith("linux-musl")
+        binary = revision.build(sha, target, cpu="baseline", heavy=not args.no_scope,
+                                steps=("cli", "lambda") if linux else ("cli",))
         dest = binaries / target
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copy2(binary, dest / "zpq")
-        argv = [os.environ.get("ZPQ_ZIG", "zig"), "build-exe", str(HERE / "arch.zig"), "-lc",
+        if linux:
+            shutil.copy2(binary.parent / "zpq-lambda", dest / "zpq-lambda")
+            revision.integration(revision.source(sha), dest, target, not args.no_scope)
+        names = ("zpq", "zpq-lambda", "zpq-integration") if linux else ("zpq",)
+        (dest / "SHA256SUMS").write_text("".join(f"{execute.file_sha256(dest / n)}  {n}\n" for n in names))
+        argv = [os.environ.get("ZPQ_ZIG", "zig"), "build-exe", "-j8", str(HERE / "arch.zig"), "-lc",
                 "-O", "ReleaseSafe", "-mcpu", "baseline", "-target", target,
                 f"-femit-bin={dest / 'arch-runner'}"]
-        rc, _ = execute.launch(argv, dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(revision.CACHE / "zig")),
-                               revision.source(sha), dest / "runner-build.log", True)
+        tree = revision.source(sha)
+        zig_sha = revision.compiler(os.environ.get("ZPQ_ZIG", "zig"), tree)
+        rc, _ = execute.launch(argv, revision.environment(zig_sha, dest / f"runner-cache-{zig_sha}"),
+                               tree, dest / "runner-build.log", not args.no_scope)
         if rc:
             raise RuntimeError(f"runner build failed: {dest / 'runner-build.log'}")
     config.update(revision=sha, binaries=str(binaries))

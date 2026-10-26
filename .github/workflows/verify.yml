@@ -200,8 +200,22 @@ jobs:
 
   # Build every release artifact; run native CLI and Lambda checks.
   release-smoke:
-    runs-on: ubuntu-latest
+    name: Native release smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-musl
+            deferred: x86_64-macos
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            deferred: ''
+          - runner: macos-14
+            target: aarch64-macos
+            deferred: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -211,4 +225,6 @@ jobs:
           version: 0.17.0
 
       - name: Build and run the release artifacts
-        run: zig build release-smoke
+        run: >-
+          tools/release_smoke.sh --accept-deferred x86_64-macos
+          zig-out/release ${{ matrix.target }} ${{ matrix.deferred }}

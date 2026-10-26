@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import unittest
@@ -131,6 +132,7 @@ def make_ctx(args, run_dir: Path, revision: str) -> stages.Ctx:
         skspill=SKSPILL,
         sigpipe=SIGPIPE,
         duckdb=str(DUCKDB20),
+        arch_summaries=tuple(str(Path(p).expanduser().resolve()) for p in args.arch_summary),
     )
 
 
@@ -182,6 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--out", help=f"parent for the run directory (default {DEFAULT_OUT})")
     common.add_argument("--run-id")
+    common.add_argument("--arch-summary", action="append", default=[],
+                        help="same-SHA native release evidence; repeat for foreign targets")
     base = common.add_mutually_exclusive_group()
     base.add_argument(
         "--base",
@@ -301,8 +305,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.base_rev:
             ctx.base = str(revisions.build(args.base_rev, cpu=args.cpu, jobs=args.j, heavy=heavy))
+            build_meta = json.loads((Path(ctx.base).parents[1] / "build.json").read_text())
             book.add_stage({"name": "build-base", "status": "pass", "rc": 0,
-                            "base_rev": args.base_rev, "binary": ctx.base,
+                            "base_rev": args.base_rev, "binary": ctx.base, "build": build_meta,
                             "binary_sha256": execute.file_sha256(Path(ctx.base)),
                             "log": str(Path(ctx.base).parents[1] / "build.log"), "counts": {}})
         if args.command == "quick":

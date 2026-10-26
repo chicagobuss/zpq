@@ -28,6 +28,7 @@ class Ctx:
     skspill: Path
     sigpipe: Path
     duckdb: str
+    arch_summaries: tuple[str, ...] = ()
 
 
 @dataclass
@@ -126,12 +127,12 @@ def parse_clickbench(text):
 
 
 def parse_release(text):
-    runtime = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip().startswith("RAN") or "elsewhere: verify arch" in line
-    ]
-    return {"runtime": runtime} if runtime else {}
+    runtime = [line.strip() for line in text.splitlines()
+               if line.strip().startswith(("RAN ", "VERIFIED ", "NOT RUN "))]
+    accepted = "NOT RUN x86_64-macos (deferred; accepted by name)"
+    blocked = any(line.startswith("NOT RUN ") and line != accepted for line in runtime)
+    blocked = blocked or "elsewhere:" in text
+    return {"runtime": runtime, "blocked": blocked}
 
 
 def _need(path: Path, what: str) -> str | None:
@@ -307,11 +308,12 @@ def stage_write_robustness(ctx: Ctx) -> Cmd:
 def stage_release_smoke(ctx: Ctx) -> Cmd:
     return Cmd(
         [
-            "tools/release_smoke.sh",
+            "tools/release_smoke.sh", "--accept-deferred", "x86_64-macos",
+            *(arg for path in ctx.arch_summaries for arg in ("--arch-summary", path)),
             str(ctx.run_dir / "release-smoke"),
         ],
         _base_env(ctx),
-        "cross-build releases; run native CLI and Lambda, foreign checks: verify arch",
+        "native CLI/Lambda plus same-SHA arch evidence; Intel macOS deferred by name",
         parse=parse_release,
     )
 

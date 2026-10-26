@@ -8,7 +8,7 @@ usage:
             [--row-group-size ROWS] [--row-group-bytes SIZE]
             [--threads N | -j N]
             [--compress-priority size|speed]
-            [--scan-all] [--trust-stats] [--fast-levels] [--unordered]
+            [--scan-all] [--trust-stats] [--fast-levels] [--unordered] [--cache]
             [--max-memory SIZE] [--bloom-filter COL[:FPP] ...]
             [--no-bloom-filters]
             [--format ndjson|json|csv|parquet] [--limit N] [--summary=json]
@@ -17,7 +17,7 @@ usage:
             [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
             [--threads N | -j N]
             [--compress-priority size|speed]
-            [--scan-all] [--trust-stats] [--max-memory SIZE]
+            [--scan-all] [--trust-stats] [--cache] [--max-memory SIZE]
             [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
             [--format ndjson|json|csv|parquet] [--limit N] [--summary=json]
   zpq schema <file.parquet>
@@ -141,6 +141,7 @@ usage:
                  Written bytes never depend on -j; an explicit
                  --max-memory caps re-encoded row groups at a sixteenth
                  of it, so they may depend on its value.
+  --cache        read through the page cache so the next query runs warm.
   --explain      print an aggregate plan as JSON using only file footers;
                  accepts SQL or --aggregate / --group-by, then exits.
   --profile      write a Chrome Trace Event JSON trace of the query

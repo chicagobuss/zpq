@@ -92,13 +92,14 @@ A memory-refused attempt never saves a decode diagnostic that could mask a
 later exact retry's failure. These checks and projection ranking run only on
 decode errors.
 
-`python tools/decode_error_check.py CANDIDATE` creates corrupt multi-column,
-multi-page V1/V2 fixtures. It asserts known winners and byte-identical error
-output for scalar and grouped queries, reversed projections, multiple inputs,
-whole-row-group execution, tight memory, forced 64/256-row decode windows,
-and every worker count from 1 through 16. Tight 64K/128K/256K/1M cases also
-compare mmap, pread and io_uring input paths. `ZPQ_DECODE_BATCH_ROWS` is documented
-with the other execution overrides in [hardware-execution.md](hardware-execution.md).
+`tools/check/cases/decode_errors.json` runs the CLI on corrupt multi-column,
+multi-page V1/V2 fixtures (`tools/zpq-gen decode_errors`). It declares the
+known winners and requires byte-identical error output for scalar and grouped
+queries, reversed projections, multiple inputs, whole-row-group execution,
+tight memory, forced 64/256-row decode windows, and every worker count from 1
+through 16. Tight 64K/128K/256K/1M cases also compare mmap, pread and io_uring
+input paths. `ZPQ_DECODE_BATCH_ROWS` is documented with the other execution
+overrides in [hardware-execution.md](hardware-execution.md).
 
 Core regressions force a count pass to encounter a later corrupt key after
 omitting an earlier corrupt argument, and replay through row groups absent

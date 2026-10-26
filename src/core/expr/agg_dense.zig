@@ -558,12 +558,38 @@ fn activeRange(sel: ?*const Sel, lo: usize, hi: usize, comptime row: anytype, ct
         const n = @min(64 - at % 64, hi - at);
         const mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(64 - n));
         var bits = (selected.mask[at / 64] >> @as(u6, @intCast(at % 64))) & mask;
+        if (n == 64 and bits == std.math.maxInt(u64)) {
+            for (at..at + 64) |r| row(ctx, r);
+            at += n;
+            continue;
+        }
         while (bits != 0) {
             row(ctx, at + @ctz(bits));
             bits &= bits - 1;
         }
         at += n;
     }
+}
+
+test "dense active ranges preserve full words, sparse words and clipped original row windows" {
+    var mask = [_]u64{ std.math.maxInt(u64), 0, 0xaaaaaaaaaaaaaaaa, std.math.maxInt(u64), std.math.maxInt(u64) };
+    const sel: Sel = .{ .allocator = testing.allocator, .len = 257, .mask = &mask };
+    const Visit = struct {
+        fn row(seen: *[257]u8, r: usize) void {
+            seen[r] += 1;
+        }
+    };
+    for ([_][2]usize{ .{ 0, 257 }, .{ 1, 256 }, .{ 64, 257 }, .{ 128, 193 }, .{ 192, 256 } }) |range| {
+        var seen: [257]u8 = @splat(0);
+        activeRange(&sel, range[0], range[1], Visit.row, &seen);
+        for (seen, 0..) |visits, r| {
+            const selected = mask[r / 64] & (@as(u64, 1) << @as(u6, @intCast(r % 64))) != 0;
+            try testing.expectEqual(@as(u8, @intFromBool(r >= range[0] and r < range[1] and selected)), visits);
+        }
+    }
+    var seen: [257]u8 = @splat(0);
+    activeRange(null, 1, 256, Visit.row, &seen);
+    for (seen, 0..) |visits, r| try testing.expectEqual(@as(u8, @intFromBool(r >= 1 and r < 256)), visits);
 }
 
 fn exactDelta(

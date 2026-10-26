@@ -4179,6 +4179,7 @@ fn prepareAggregateWithMetas(
         false,
     )) |result| return result;
 
+    var integer_needs_union = false;
     if (!explain) if (try inlineIntegerAnswer(
         gpa,
         arena,
@@ -4191,6 +4192,7 @@ fn prepareAggregateWithMetas(
         group_outputs,
         n_workers,
         t,
+        .{ .pending = &integer_needs_union },
         false,
     )) |result| return result;
 
@@ -4345,6 +4347,43 @@ fn prepareAggregateWithMetas(
     };
     if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
     plan_inputs.ndv_stat = ndv_stat;
+    if (!explain and integer_needs_union) {
+        const bounds: IntegerCountBounds = .{ .refined = ndv_stat };
+        if (try inlineIntegerAnswer(
+            gpa,
+            arena,
+            &args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            bounds,
+            true,
+        )) |_| {
+            // This owner does not retain the union. Release it before its independently quoted records draw.
+            if (domain) |*d| d.deinit(gpa);
+            domain = null;
+            if (try inlineIntegerAnswer(
+                gpa,
+                arena,
+                &args,
+                metas,
+                &plan,
+                work_items.items,
+                agg_calls,
+                group_by_keys,
+                group_outputs,
+                n_workers,
+                t,
+                bounds,
+                false,
+            )) |answer| return answer;
+        }
+    }
     // Generic composite states share their cache-bound admission with execution and EXPLAIN.
     const dense_supported = if (domain) |*d|
         d.axes.len == 1 or agg_dense.countOnly(agg_calls) or agg_dense.sumCall(agg_calls) != null or
@@ -4530,7 +4569,34 @@ fn prepareAggregateWithMetas(
             n_workers,
             t,
             true,
-        ) orelse try inlineMsdAnswer(gpa, arena, msd_args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse try inlineIntegerAnswer(gpa, arena, &args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true) orelse
+        ) orelse try inlineMsdAnswer(
+            gpa,
+            arena,
+            msd_args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            true,
+        ) orelse try inlineIntegerAnswer(
+            gpa,
+            arena,
+            &args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            .{ .refined = ndv_stat },
+            true,
+        ) orelse
             try inlineByteTopAnswer(
                 gpa,
                 arena,
@@ -7028,6 +7094,16 @@ fn inlinePackedAnswer(
     };
 }
 
+const IntegerCountBounds = union(enum) {
+    pending: *bool,
+    refined: ?NdvStat,
+
+    fn guess(bounds: @This(), footer: u64) u64 {
+        if (bounds == .refined) if (bounds.refined) |stat| if (stat.union_complete) return stat.hi;
+        return footer;
+    }
+};
+
 fn inlineIntegerAnswer(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -7040,6 +7116,7 @@ fn inlineIntegerAnswer(
     outputs_opt: ?[]const BoundOutputColumn,
     requested_workers: usize,
     timings: Timings,
+    bounds: IntegerCountBounds,
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const n_workers = @min(requested_workers, owner_groups.max_workers);
@@ -7130,10 +7207,17 @@ fn inlineIntegerAnswer(
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) {
         if (ndv.footerEntries(metas, keys)) |guess| {
-            // An unfiltered count cut stays coded when its summed dictionary domain fits the existing dense
-            // domain limit. A fraction of the rows can still mean millions of distinct integer identities.
+            // Summed dictionaries can repeat the same small domain in every RG. A reduction hint defers the
+            // decision until the union is known; only a complete union replaces the summed footer estimate.
+            const refine = args.ndv_policy and args.ndv_union and guess < rows / 4;
+            if (count_top and !ordered_count and args.filter == null and bounds == .pending and
+                refine and guess > agg_dense.max_ids)
+            {
+                bounds.pending.* = true;
+                return null;
+            }
             const prefer_coded = if (count_top and !ordered_count and args.filter == null)
-                guess <= agg_dense.max_ids
+                (if (refine) bounds.guess(guess) else guess) <= agg_dense.max_ids
             else
                 guess < rows / 4;
             if (prefer_coded) return null;
@@ -23695,4 +23779,82 @@ test "sparse owner identity prefers raw numeric words but retains narrower coded
     };
     try Trial.run(testing.allocator);
     try testing.checkAllAllocationFailures(testing.allocator, Trial.run, .{});
+}
+
+test "integer COUNT domain cost trusts only a complete dictionary union" {
+    const summed: u64 = 29 * 100000;
+    try testing.expectEqual(summed, (IntegerCountBounds{ .refined = null }).guess(summed));
+    try testing.expectEqual(summed, (IntegerCountBounds{ .refined = .{
+        .hi = 100000,
+        .union_complete = false,
+    } }).guess(summed));
+    try testing.expectEqual(@as(u64, 100000), (IntegerCountBounds{ .refined = .{
+        .hi = 100000,
+        .union_complete = true,
+    } }).guess(summed));
+    try testing.expectEqual(summed, (IntegerCountBounds{ .refined = .{
+        .hi = summed,
+        .union_complete = true,
+    } }).guess(summed));
+}
+
+test "integer COUNT repeated RG dictionaries stay coded after complete union refinement" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const values = try a.alloc(i64, 65536);
+    for (values, 0..) |*value, i| value.* = @intCast((i % 4096) * 7919);
+    const columns = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .col = .{ .i64 = .{ .values = values } },
+        .parquet_type = .INT64,
+        .nullable = false,
+    }};
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, @intCast(values.len), .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const key: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .i64,
+    } };
+    const single = ndv.footerEntries(&.{meta}, &.{key}).?;
+    try testing.expect(single != 0);
+    const copies: usize = @intCast(agg_dense.max_ids / single + 1);
+    const groups = try a.alloc(schema.RowGroup, copies);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(copies);
+    const summed = ndv.footerEntries(&.{meta}, &.{key}).?;
+    try testing.expect(summed > agg_dense.max_ids and summed < @as(u64, @intCast(meta.num_rows)) / 4);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "repeated", .bytes = sink.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .parallelism = 4,
+        .min_bytes_per_worker = 1,
+        .max_memory = 8 << 30,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    const explanation = try explainAggregate(gpa, a, args);
+    try testing.expect(explanation.plan.ndv_stat.?.union_complete);
+    try testing.expectEqual(@as(u64, 4096), explanation.plan.ndv_stat.?.hi);
+    try testing.expect(explanation.record_path == null);
+    var taken: std.EnumSet(FastPath) = .{};
+    args.taken = &taken;
+    var got = try prepareAggregate(gpa, a, args, false);
+    defer got.deinit(gpa);
+    try testing.expect(!taken.contains(.integer_records));
+    try got.output.applyResultOrder(gpa, args.result_order);
+    const rows = got.output.group_rows.?;
+    try testing.expectEqual(@as(usize, 10), rows.len);
+    for (rows, 0..) |row, i| {
+        try testing.expectEqual(@as(i64, @intCast(i * 7919)), row[0].i);
+        try testing.expectEqual(@as(i64, @intCast(copies * 16)), row[1].i);
+    }
+    args.ndv_union = false;
+    const no_union = try explainAggregate(gpa, a, args);
+    try testing.expectEqual(.integer_count_top_h, no_union.record_path.?.layout);
 }

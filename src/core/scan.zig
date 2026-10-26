@@ -20130,7 +20130,8 @@ fn releasingOrderedTrial(
         const known_null = for (meta.row_groups.items) |rg| {
             if ((rg.columns.items[0].meta_data.?.statistics.?.null_count orelse 0) > 0) break true;
         } else false;
-        try testing.expect((explanation.record_path != null) == !(known_null and mode == 2));
+        // NULLs decline the ordered run, but COUNT can now use the same raw owner as SUM and full grouping.
+        try testing.expect(explanation.record_path != null);
         var got = try runMultiAggregate(gpa, a, args);
         defer got.deinit(gpa);
         try testing.expectEqual(meta.row_groups.items.len, window.waits.load(.monotonic));

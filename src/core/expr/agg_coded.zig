@@ -745,8 +745,9 @@ fn seedable(ra: std.mem.Allocator, gid_of: []const u32) !bool {
     return true;
 }
 
-/// Exact roots stay whole-batch and call-major. Per-root SUM/count deltas can feed SUM and AVG without copying
-/// accumulated state: a group may already contain contributions from earlier row groups or statistics shortcuts.
+/// Exact roots fold call-major, over the whole batch or, for SUM and AVG alone, in cache-sized windows of it
+/// (`foldExactWindows`). Per-root SUM/count deltas can feed SUM and AVG without copying accumulated state: a group may
+/// already contain contributions from earlier row groups or statistics shortcuts.
 fn foldExactBatch(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -778,7 +779,7 @@ fn foldExactBatch(
     @memset(partials, null);
     // Composites' selected rows, shared by the roots that sum in interleaved slots.
     var present: ?[]u64 = null;
-    foldExactWindows(ra, &plan, calls, roots, partials, &present, space, comp, batch, lookup, outer);
+    foldExactWindows(ra, &plan, calls, roots, partials, space, comp, batch, lookup, outer);
     const restricted = batch.restrictedTo(outer);
     for (calls, roots, 0..) |call, root, ai| {
         if (root) |r| {
@@ -1178,6 +1179,18 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         g.* = try got.getOrInsert(&key, &calls, 0);
     }
     try std.testing.expect(try foldExactBatch(ra, a, &got, gids, comp, space, &calls, &batch, &lookup, &sel));
+    // Forced windows fold every root themselves, rather than leaving them to the whole batch.
+    if (expr_eval.forced_batch_rows != 0) {
+        var plan: expr_eval.ExactPlan = .{};
+        const roots = try ra.alloc(?usize, calls.len);
+        for (calls, roots) |call, *root| {
+            root.* = if (call.arg) |arg| (try plan.add(ra, &batch, &lookup, arg)).? else null;
+        }
+        const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+        @memset(partials, null);
+        foldExactWindows(ra, &plan, &calls, roots, partials, space, comp, &batch, &lookup, &sel);
+        for (roots) |root| if (root) |r| try std.testing.expect(partials[r] != null);
+    }
     // The per-row fold this replaced, at 192 bits, as the oracle.
     const want_sum = try ra.alloc(i192, space * calls.len);
     const want_n = try ra.alloc(u64, space * calls.len);
@@ -2147,7 +2160,6 @@ fn foldExactWindows(
     calls: []const AggCall,
     roots: []const ?usize,
     partials: []?[]agg.DecSum,
-    present: *?[]u64,
     space: usize,
     comp: []const u32,
     batch: *const filter_eval.Batch,
@@ -2156,23 +2168,32 @@ fn foldExactWindows(
 ) void {
     // Any other call folds values of its own between the roots' evaluations.
     for (calls) |call| if (call.arg != null and call.func != .sum and call.func != .avg) return;
-    const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) + space *| 32;
+    var distinct: usize = 0;
+    for (roots, 0..) |root, i| if (root) |r| {
+        distinct += @intFromBool(std.mem.indexOfScalar(?usize, roots[0..i], r) == null);
+    };
+    const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) +
+        (distinct + 1) *| space *| NarrowAcc.bytesPerComposite(space, batch.num_rows);
     const rows = expr_eval.floatBatchRows(exactLiveBytesPerRow(plan), fixed, batch.expr_batch_rows);
     if (rows == 0 or rows >= batch.num_rows) return;
+    // Everything the windows hold goes with them, so a failed pass leaves the whole-batch fold what it always had.
+    var speculative = std.heap.ArenaAllocator.init(ra);
+    defer speculative.deinit();
     // The cached values belong to the windows' scratch.
     defer for (plan.nodes.items) |*node| {
         node.value = null;
     };
-    windowedSums(ra, plan, roots, partials, present, space, comp, batch, lookup, outer, rows) catch
+    windowedSums(ra, speculative.allocator(), plan, roots, partials, space, comp, batch, lookup, outer, rows) catch
         @memset(partials, null);
 }
 
+/// Fills `partials` for every root, published in `ra` only once every window has folded; the rest lives in `sa`.
 fn windowedSums(
     ra: std.mem.Allocator,
+    sa: std.mem.Allocator,
     plan: *expr_eval.ExactPlan,
     roots: []const ?usize,
     partials: []?[]agg.DecSum,
-    present: *?[]u64,
     space: usize,
     comp: []const u32,
     batch: *const filter_eval.Batch,
@@ -2180,13 +2201,13 @@ fn windowedSums(
     outer: *const Sel,
     rows: usize,
 ) !void {
-    const accs = try ra.alloc(?NarrowAcc, plan.nodes.items.len);
+    const accs = try sa.alloc(?NarrowAcc, plan.nodes.items.len);
     @memset(accs, null);
     for (roots) |root| if (root) |r| if (accs[r] == null) {
-        accs[r] = try NarrowAcc.init(ra, space, batch.num_rows);
+        accs[r] = try NarrowAcc.init(sa, space, batch.num_rows);
     };
-    const cols = try ra.alloc(Column, batch.cols.len);
-    var scratch = @import("../row_group_arena.zig").RowGroupArena.init(ra);
+    const cols = try sa.alloc(Column, batch.cols.len);
+    var scratch = @import("../row_group_arena.zig").RowGroupArena.init(sa);
     defer scratch.deinit();
     var off: usize = 0;
     while (off < batch.num_rows) {
@@ -2202,9 +2223,10 @@ fn windowedSums(
         };
         off += n;
     }
-    for (accs, partials) |*acc, *p| if (acc.*) |*ac| {
-        try ac.finish(ra, present, comp, outer);
-        p.* = ac.delta;
+    var present: ?[]u64 = null;
+    for (accs) |*acc| if (acc.*) |*ac| try ac.finish(sa, &present, comp, outer);
+    for (accs, partials) |acc, *p| if (acc) |ac| {
+        p.* = try ra.dupe(agg.DecSum, ac.delta);
     };
 }
 
@@ -2238,12 +2260,22 @@ const NarrowAcc = struct {
     /// Without `part`: whether `delta` holds whole `DecSum`s yet. Until then `lo` carries an i128 sum.
     widened: bool = false,
 
+    /// Bytes `init` takes per composite: the `DecSum`, then each slot's partial and skipped count.
+    fn bytesPerComposite(space: usize, rows: usize) usize {
+        const slots: usize = if (interleaved(space, rows)) sum_lanes * (@sizeOf(i128) + @sizeOf(u64)) else 0;
+        return @sizeOf(agg.DecSum) + slots;
+    }
+
+    fn interleaved(space: usize, rows: usize) bool {
+        return space <= MAX_COMPOSITE and space * sum_lanes <= rows;
+    }
+
     /// Interleaved slots only within the free composite spaces, where their scratch stays within row-sized buffers;
     /// otherwise no scratch past `delta`, so a budgeted space stays within its reservation.
     fn init(ra: std.mem.Allocator, space: usize, rows: usize) !NarrowAcc {
         const delta = try ra.alloc(agg.DecSum, space);
         @memset(delta, .{});
-        if (space > MAX_COMPOSITE or space * sum_lanes > rows) {
+        if (!interleaved(space, rows)) {
             return .{ .delta = delta, .part = &.{}, .skipped = &.{} };
         }
         const part = try ra.alloc(i128, space * sum_lanes);

@@ -13,6 +13,136 @@ const expr_ast = @import("expr/ast.zig");
 const expr_agg = @import("expr/agg.zig");
 const filter_ast = @import("filter/ast.zig");
 const filter_prune = @import("filter/prune.zig");
+const owner_lane = @import("owner_lanes.zig").Lane;
+
+/// One normalized integer program for every owner finish. Integer AVG already uses exact isum in the canonical
+/// accumulator, so SUM/count sharing changes neither its rounding nor its partial order. FLOAT stays canonical.
+pub const OwnerProgram = struct {
+    pub const Arg = struct { kind: owner_lane, col: expr_ast.ColRef };
+    pub const Projection = union(enum) {
+        weight,
+        lane: usize,
+        avg: struct { sum: usize, count: usize },
+        distinct,
+    };
+    args: [4]Arg = undefined,
+    len: usize = 0,
+    distinct_arg: ?expr_ast.ColRef = null,
+
+    pub fn init(calls: []const expr_agg.AggCall) ?OwnerProgram {
+        var p: OwnerProgram = .{};
+        for (calls) |call| {
+            if (call.where != null or call.offset != 0 or call.state) return null;
+            if (call.arg == null) {
+                if (call.func != .count or call.result != .i64) return null;
+                continue;
+            }
+            const arg = call.arg.?;
+            if (arg != .col_ref) return null;
+            const col = arg.col_ref;
+            if (call.func == .count) {
+                if (call.result != .i64 or !p.add(.present_count, col)) return null;
+                continue;
+            }
+            if (col.expr_type != .i64 or (col.physical_type != .INT32 and col.physical_type != .INT64))
+                return null;
+            if (call.func == .count_distinct) {
+                if (call.result != .i64) return null;
+                if (p.distinct_arg) |other| if (other.col_idx != col.col_idx) return null;
+                p.distinct_arg = col;
+                continue;
+            }
+            // A UINT64 row may already exceed the signed partial lane before any coalescing takes place.
+            if (col.unsigned_64) return null;
+            switch (call.func) {
+                .sum, .min, .max => {
+                    if (call.result != .i64) return null;
+                    const kind: owner_lane = switch (call.func) {
+                        .sum => .sum,
+                        .min => .min,
+                        .max => .max,
+                        else => unreachable,
+                    };
+                    if (!p.add(kind, col)) return null;
+                },
+                .avg => if (call.result != .avg_f64 or !p.add(.sum, col) or !p.add(.present_count, col))
+                    return null,
+                else => unreachable,
+            }
+        }
+        std.mem.sort(Arg, p.args[0..p.len], {}, struct {
+            fn less(_: void, a: Arg, b: Arg) bool {
+                if (a.kind == b.kind) return a.col.col_idx < b.col.col_idx;
+                return @backingInt(a.kind) < @backingInt(b.kind);
+            }
+        }.less);
+        return p;
+    }
+
+    fn add(p: *OwnerProgram, kind: owner_lane, col: expr_ast.ColRef) bool {
+        if (p.find(kind, col.col_idx) != null) return true;
+        if (p.len == p.args.len) return false;
+        p.args[p.len] = .{ .kind = kind, .col = col };
+        p.len += 1;
+        return true;
+    }
+
+    fn find(p: OwnerProgram, kind: owner_lane, column: usize) ?usize {
+        for (p.args[0..p.len], 0..) |arg, i| if (arg.kind == kind and arg.col.col_idx == column) return i;
+        return null;
+    }
+
+    pub fn matches(p: OwnerProgram, comptime kinds: []const owner_lane) bool {
+        if (p.len != kinds.len) return false;
+        inline for (kinds, 0..) |kind, i| if (p.args[i].kind != kind) return false;
+        return true;
+    }
+
+    pub fn projection(p: OwnerProgram, call: expr_agg.AggCall) ?Projection {
+        if (call.arg == null) return if (call.func == .count) .weight else null;
+        if (call.arg.? != .col_ref) return null;
+        const col = call.arg.?.col_ref.col_idx;
+        return switch (call.func) {
+            .count => .{ .lane = p.find(.present_count, col) orelse return null },
+            .sum => .{ .lane = p.find(.sum, col) orelse return null },
+            .min => .{ .lane = p.find(.min, col) orelse return null },
+            .max => .{ .lane = p.find(.max, col) orelse return null },
+            .avg => .{ .avg = .{
+                .sum = p.find(.sum, col) orelse return null,
+                .count = p.find(.present_count, col) orelse return null,
+            } },
+            .count_distinct => if (p.distinct_arg != null and p.distinct_arg.?.col_idx == col) .distinct else null,
+        };
+    }
+
+    pub fn integer(p: OwnerProgram, group: anytype, call: expr_agg.AggCall, distinct: ?u64) !?i128 {
+        return switch (p.projection(call) orelse return error.BadAggArg) {
+            .weight => @intCast(group.weight),
+            .lane => |i| group.integerAt(i),
+            .distinct => if (distinct) |n| @as(i128, n) else error.BadAggArg,
+            .avg => error.BadAggArg,
+        };
+    }
+
+    pub fn accumulator(p: OwnerProgram, group: anytype, call: expr_agg.AggCall) !expr_agg.Accumulator {
+        if (call.func == .avg) {
+            const slots = (p.projection(call) orelse return error.BadAggArg).avg;
+            return .{ .avg = .{
+                .sum = 0,
+                .isum = (try group.integerAt(slots.sum)) orelse 0,
+                .count = @intCast((try group.integerAt(slots.count)).?),
+            } };
+        }
+        const value = try p.integer(group, call, null);
+        return switch (call.func) {
+            .count => .{ .count = @intCast(value.?) },
+            .sum => .{ .sum_i = value },
+            .min => .{ .min_i = value },
+            .max => .{ .max_i = value },
+            else => error.BadAggArg,
+        };
+    }
+};
 
 /// How far a query may rely on file statistics. One mode rather than `--scan-all` and `--trust-stats` as two flags,
 /// whose combination would otherwise need its own rule at every use: `--scan-all` wins.
@@ -191,6 +321,69 @@ fn markFilterColumns(arena: std.mem.Allocator, f: filter_ast.Filter, cols: []boo
 const testing = std.testing;
 const expr_parser = @import("expr/parser.zig");
 const filter_parser = @import("filter/parser.zig");
+
+fn ownerCall(func: expr_agg.AggFunc, column: ?usize) expr_agg.AggCall {
+    return .{
+        .func = func,
+        .where = null,
+        .alias = "v",
+        .result = if (func == .avg) .avg_f64 else .i64,
+        .arg = if (column) |ci| .{ .col_ref = .{
+            .col_idx = ci,
+            .physical_type = .INT32,
+            .expr_type = .i64,
+        } } else null,
+    };
+}
+
+test "owner program shares exact integer SUM AVG and COUNT lanes under one four-lane bound" {
+    const calls = [_]expr_agg.AggCall{
+        ownerCall(.count, null), ownerCall(.sum, 0), ownerCall(.avg, 0),
+        ownerCall(.count, 0),    ownerCall(.min, 1), ownerCall(.max, 1),
+    };
+    const p = OwnerProgram.init(&calls).?;
+    try testing.expect(p.matches(&.{ .sum, .min, .max, .present_count }));
+    try testing.expectEqualDeep(OwnerProgram.Projection.weight, p.projection(calls[0]).?);
+    try testing.expectEqualDeep(p.projection(calls[1]).?.lane, p.projection(calls[2]).?.avg.sum);
+    try testing.expectEqualDeep(p.projection(calls[3]).?.lane, p.projection(calls[2]).?.avg.count);
+    const too_many = calls ++ .{ownerCall(.sum, 2)};
+    try testing.expectEqual(null, OwnerProgram.init(&too_many));
+    const cb = [_]expr_agg.AggCall{ ownerCall(.count, null), ownerCall(.sum, 1), ownerCall(.avg, 2) };
+    const q = OwnerProgram.init(&cb).?;
+    try testing.expect(q.matches(&.{ .sum, .sum, .present_count }));
+    try testing.expectEqual(@as(usize, 1), q.args[0].col.col_idx);
+    try testing.expectEqual(@as(usize, 2), q.args[1].col.col_idx);
+    try testing.expectEqual(@as(usize, 2), q.args[2].col.col_idx);
+}
+
+test "owner program separates DISTINCT identity and declines unsupported numeric semantics before allocation" {
+    const calls = [_]expr_agg.AggCall{
+        ownerCall(.count, null), ownerCall(.count_distinct, 2), ownerCall(.count_distinct, 2),
+    };
+    const p = OwnerProgram.init(&calls).?;
+    try testing.expectEqual(@as(usize, 0), p.len);
+    try testing.expectEqual(@as(usize, 2), p.distinct_arg.?.col_idx);
+    try testing.expectEqualDeep(OwnerProgram.Projection.distinct, p.projection(calls[1]).?);
+    try testing.expectEqual(null, OwnerProgram.init(&(calls ++ .{ownerCall(.count_distinct, 3)})));
+    var call = ownerCall(.sum, 0);
+    call.offset = 1;
+    try testing.expectEqual(null, OwnerProgram.init(&.{call}));
+    call = ownerCall(.avg, 0);
+    call.state = true;
+    try testing.expectEqual(null, OwnerProgram.init(&.{call}));
+    call.state = false;
+    call.arg.?.col_ref.expr_type = .f64;
+    call.arg.?.col_ref.physical_type = .DOUBLE;
+    try testing.expectEqual(null, OwnerProgram.init(&.{call}));
+    call = ownerCall(.sum, 0);
+    call.arg.?.col_ref.physical_type = .INT64;
+    call.arg.?.col_ref.unsigned_64 = true;
+    try testing.expectEqual(null, OwnerProgram.init(&.{call}));
+    call.func = .count;
+    try testing.expect(OwnerProgram.init(&.{call}) != null);
+    call.func = .count_distinct;
+    try testing.expect(OwnerProgram.init(&.{call}) != null);
+}
 
 /// Columns of ci/fixtures/parquet/full_match.parquet (see tools/zpq-gen full_match).
 const TS = 0;

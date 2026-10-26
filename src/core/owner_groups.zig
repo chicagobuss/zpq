@@ -13,8 +13,22 @@ const memory = @import("memory.zig");
 const spawn = @import("spawn.zig");
 const hw = @import("hw.zig");
 const now = @import("../clock.zig").monoNs;
+pub const Lane = @import("owner_lanes.zig").Lane;
+pub const PackedLayout = @import("owner_lanes.zig").Layout;
+pub const Packed = @import("owner_packed.zig").Owner;
+pub const Pairs = @import("owner_pairs.zig").Owner;
+pub const SelectedOwner = @import("owner_sink.zig").Packed;
 
-const block_claim = 128;
+test {
+    _ = @import("owner_lanes.zig");
+    _ = @import("owner_cache.zig");
+    _ = @import("owner_records.zig");
+    _ = @import("owner_fold.zig");
+    _ = @import("owner_packed.zig");
+    _ = @import("owner_pairs.zig");
+    _ = @import("owner_sink.zig");
+}
+
 const none = std.math.maxInt(u32);
 const ordinal_bits = 27;
 const ordinal_mask: u32 = (1 << ordinal_bits) - 1;
@@ -144,6 +158,33 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
     const tagged = codec == .bytes and kind != .full;
     const cached_count = codec == .int64 and kind == .count_top;
     const CountEntry = struct { key: u64 = 0, first: u32 = 0, count: u32 = 0 };
+    const CountPolicy = struct {
+        pub const Entry = CountEntry;
+        pub fn validate(r: Entry) error{BadPartial}!void {
+            if (r.count == 0 or r.count >= null_key) return error.BadPartial;
+        }
+        pub fn active(r: Entry) bool {
+            return r.count != 0;
+        }
+        pub fn same(a: Entry, b: Entry) bool {
+            return (a.first & null_key) == (b.first & null_key) and a.key == b.key;
+        }
+        pub fn hash(r: Entry) u64 {
+            return if (r.first & null_key != 0) 0x621985775bcbd930 else mixKey(r.key, 0);
+        }
+        pub fn clear(r: *Entry) void {
+            r.count = 0;
+        }
+        pub fn coalesce(a: *Entry, b: Entry) error{}!bool {
+            const count = std.math.add(u32, a.count, b.count) catch return false;
+            a.count = count;
+            a.first = @min(a.first, b.first);
+            return true;
+        }
+    };
+    const CountCache = @import("owner_cache.zig").Local(CountPolicy);
+    const CountLayout = PackedLayout(u128, &.{}, u32);
+    const CountFold = @import("owner_fold.zig").Table(CountLayout);
     // Ordinals are below 2^31. A tagged COUNT partial stores its exact weight in flags, with NULL in bit zero.
     const partial: u32 = 1 << 31;
 
@@ -162,23 +203,13 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             ordinal: u32,
             flags: u32,
         };
-        // Sixteen 32-byte records with their link; a value-less record fills a 512-byte block.
-        const block_rows = if (@sizeOf(Record) == 32) 16 else (512 - 8) / @sizeOf(Record);
-        const Block = extern struct { next: u32 = none, len: u32 = 0, rows: [block_rows]Record };
+        const Records = @import("owner_records.zig").Writer(Record, u32);
+        const Block = Records.Block;
         /// Worst-case group scratch plus fewer than four u32 hash slots per input row after rounding.
         const table_row_bytes = @sizeOf(Group) + 16;
 
         fn countCacheEntries() usize {
-            if (!cached_count) return 0;
-            const l2 = cacheBudget();
-            const known_l1 = hw.l1dBytesPerWorker();
-            const l1 = if (known_l1 == 0) l2 / 16 else known_l1;
-            // Hot identities may exceed L1; bound this direct cache by the private L2 share and
-            // an L1-scale allowance, with the existing owner headroom as the unknown/small-L1 floor.
-            const bytes = @min(l2 / 16, @max(l1 / 2, cache_headroom / 4));
-            const line = @max(hw.cacheLineBytes(), @sizeOf(CountEntry));
-            if (bytes < line) return 0;
-            return @as(usize, 1) << @intCast(std.math.log2_int(usize, (bytes / line * line) / @sizeOf(CountEntry)));
+            return if (cached_count) @import("owner_cache.zig").capacity(@sizeOf(CountEntry)) else 0;
         }
 
         /// The aggregate a top-H layout ranks by: COUNT, or SUM (NULL when no value was present).
@@ -222,31 +253,36 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
         pub const Local = struct {
             state: *State,
             ordinal_base: u32 = 0,
-            heads: []u32 = &.{},
-            tails: []u32 = &.{},
-            histogram: []u32 = &.{},
+            records: Records.Frontier = .{},
             /// Key and value NULL bits seen (the full answer's column nullability).
             nulls: u32 = 0,
-            free_next: u32 = 0,
-            free_end: u32 = 0,
             run_item: usize = 0,
             run_stopped: bool = false,
-            count_cache: []CountEntry = &.{},
+            count_cache: CountCache = .{},
             contributed_rows: usize = 0,
             cache_seen: u32 = 0,
             cache_hits: u32 = 0,
             cache_disabled: bool = false,
 
-            fn flushCount(l: *Local, entry: *CountEntry) error{ExceededMemoryBudget}!void {
-                if (entry.count == 0) return;
+            fn emitCount(l: *Local, entry: CountEntry) error{ExceededMemoryBudget}!void {
                 const kn = entry.first & null_key != 0;
-                const hash = if (kn) @as(u64, 0x621985775bcbd930) else mixKey(entry.key, 0);
-                try l.appendRecord(entry.key, {}, entry.first & Group.first_mask, kn, 0, hash, entry.count);
-                entry.count = 0;
+                try l.appendRecord(
+                    entry.key,
+                    {},
+                    entry.first & Group.first_mask,
+                    kn,
+                    0,
+                    CountPolicy.hash(entry),
+                    entry.count,
+                );
+            }
+
+            fn flushCount(l: *Local, entry: *CountEntry) error{ExceededMemoryBudget}!void {
+                try CountCache.flushEntry(entry, l, emitCount);
             }
 
             fn flushCounts(l: *Local) !void {
-                if (cached_count) for (l.count_cache) |*entry| try l.flushCount(entry);
+                if (cached_count) try l.count_cache.flush(l, emitCount);
             }
 
             pub fn start(l: *Local, ordinal: u32, item: usize) void {
@@ -256,6 +292,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 l.cache_seen = 0;
                 l.cache_hits = 0;
                 l.cache_disabled = false;
+                l.count_cache.last = null;
             }
 
             fn appendRun(l: *Local, key: ?Key, value: ?i64, ordinal: u32) void {
@@ -316,32 +353,25 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         return e;
                     };
                 const len: u32 = if (codec == .int64) 0 else if (key) |k| @intCast(k.len) else 0;
-                // The length separates keys equal after padding; NULL has a hash of its own.
-                const h: u64 = if (key == null)
-                    0x621985775bcbd930
-                else
-                    mixKey(bits, len);
-                if (cached_count) if (!l.cache_disabled and l.count_cache.len != 0) {
+                if (cached_count) if (!l.cache_disabled and l.count_cache.entries.len != 0) {
                     const probe = l.cache_seen < l.state.cache_trial_rows;
                     if (probe) l.cache_seen += 1;
-                    const entry = &l.count_cache[@as(usize, @truncate(h)) & (l.count_cache.len - 1)];
-                    const kn = key == null;
-                    if (entry.count != 0 and (entry.first & null_key != 0) == kn and (kn or entry.key == bits)) {
-                        entry.count += 1;
-                        if (probe) l.cache_hits += 1;
-                        entry.first = @min(entry.first & Group.first_mask, ordinal) | @as(u32, if (kn) null_key else 0);
-                    } else {
-                        try l.flushCount(entry);
-                        entry.* = .{ .key = bits, .first = ordinal | @as(u32, if (kn) null_key else 0), .count = 1 };
-                    }
-                    // Probe two cache-line-widths per slot. Without even one eliminated record per slot,
-                    // flush exactly and bypass this source; start() retries for a later, possibly skewed source.
-                    if (probe and l.cache_seen == l.state.cache_trial_rows and l.cache_hits < l.count_cache.len) {
+                    const hit = try l.count_cache.push(.{
+                        .key = bits,
+                        .first = ordinal | @as(u32, if (key == null) null_key else 0),
+                        .count = 1,
+                    }, l, emitCount);
+                    if (probe and hit) l.cache_hits += 1;
+                    // Flush exactly before bypassing a nonreducing source; start() retries on the next source.
+                    if (probe and l.cache_seen == l.state.cache_trial_rows and
+                        l.cache_hits < l.count_cache.entries.len)
+                    {
                         try l.flushCounts();
                         l.cache_disabled = true;
                     }
                     return;
                 };
+                const h: u64 = if (key == null) 0x621985775bcbd930 else mixKey(bits, len);
                 try l.appendRecord(bits, value, ordinal, key == null, len, h, 1);
             }
 
@@ -371,26 +401,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         .flags = flags,
                     };
                 const p: usize = @intCast(h >> l.state.shift);
-                var tail = l.tails[p];
-                if (tail == none or l.state.blocks[tail].len == block_rows) {
-                    if (l.free_next == l.free_end) {
-                        const at = l.state.block_cursor.fetchAdd(block_claim, .monotonic);
-                        if (at >= l.state.blocks.len) return error.ExceededMemoryBudget;
-                        l.free_next = at;
-                        l.free_end = @intCast(@min(l.state.blocks.len, @as(usize, at) + block_claim));
-                    }
-                    const fresh = l.free_next;
-                    l.free_next += 1;
-                    l.state.blocks[fresh].next = none;
-                    l.state.blocks[fresh].len = 0;
-                    if (tail == none) l.heads[p] = fresh else l.state.blocks[tail].next = fresh;
-                    tail = fresh;
-                    l.tails[p] = tail;
-                }
-                const b = &l.state.blocks[tail];
-                b.rows[b.len] = r;
-                b.len += 1;
-                l.histogram[p] += 1;
+                try Records.append(&l.records, l.state.blocks, &l.state.block_cursor, p, r);
                 if (cached_count) l.contributed_rows += weight;
             }
 
@@ -536,7 +547,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             const Run = struct { rows: usize = 0, groups: usize = 0, first: u32 = 0, last: u32 = 0 };
 
             fn blockCount(rows: usize, workers: usize, parts: usize) usize {
-                return (rows + block_rows - 1) / block_rows + workers * (parts + block_claim);
+                return Records.blockCount(rows, workers, parts);
             }
             /// What the attempt draws before it consumes anything. The full answer holds a 40-byte group and a
             /// winner slot per input row besides its blocks; top-H holds cache-sized scratch, heaps and stacks.
@@ -556,8 +567,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 output_credit: usize,
                 runs: bool,
             ) usize {
-                const shared = blockCount(rows, workers, parts) *| @sizeOf(Block) +| workers *| parts *| 3 *| @sizeOf(u32) +|
-                    @sizeOf(State) +| (8 << 20);
+                const shared = blockCount(rows, workers, parts) *| @sizeOf(Block) +|
+                    Records.frontierBytes(workers, parts) +| @sizeOf(State) +| (8 << 20);
                 // The full answers keep their established quotes, which cover blocks and ordering arrays.
                 if (kind == .full) return (if (codec == .int64)
                     rows *| 88 +| (128 << 20)
@@ -712,29 +723,25 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 }
                 const cache_entries = countCacheEntries();
                 if (cache_entries != 0) {
-                    const probes_per_slot = @max(2, hw.cacheLineBytes() / @sizeOf(CountEntry) *| 2);
-                    s.cache_trial_rows = @intCast(cache_entries * probes_per_slot);
+                    s.cache_trial_rows = @intCast(@import("owner_cache.zig").trialRows(
+                        cache_entries,
+                        @sizeOf(CountEntry),
+                    ));
                     s.count_caches = try a.alloc(CountEntry, workers * cache_entries);
                     @memset(s.count_caches, .{});
-                    for (s.locals, 0..) |*l, i| l.count_cache = s.count_caches[i * cache_entries ..][0..cache_entries];
+                    for (s.locals, 0..) |*l, i|
+                        l.count_cache.entries = s.count_caches[i * cache_entries ..][0..cache_entries];
                 }
                 s.blocks = try a.alloc(Block, blockCount(rows, workers, parts));
                 for (s.locals) |*l| {
-                    l.heads = try a.alloc(u32, parts);
-                    l.tails = try a.alloc(u32, parts);
-                    l.histogram = try a.alloc(u32, parts);
-                    @memset(l.heads, none);
-                    @memset(l.tails, none);
-                    @memset(l.histogram, 0);
+                    l.records = try Records.Frontier.init(a, parts);
                 }
                 return s;
             }
             pub fn deinit(s: *State) void {
                 const a = s.gpa;
                 for (s.locals) |l| {
-                    a.free(l.heads);
-                    a.free(l.tails);
-                    a.free(l.histogram);
+                    l.records.deinit(a);
                 }
                 a.free(s.count_caches);
                 a.free(s.locals);
@@ -760,6 +767,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 groups: []Group = &.{},
                 slots: []u32 = &.{},
                 records: []Record = &.{},
+                count_fold: CountFold = .{},
                 group_count: usize = 0,
                 err: ?anyerror = null,
 
@@ -767,6 +775,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     defer t.s.gpa.free(t.groups);
                     defer t.s.gpa.free(t.slots);
                     defer t.s.gpa.free(t.records);
+                    defer t.count_fold.deinit(t.s.gpa);
                     const end = switch (t.pass) {
                         .order => (t.s.bitmap.len + 1023) / 1024,
                         .run_top => t.s.runs.len,
@@ -818,7 +827,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     var n: usize = 0;
                     var previous: ?usize = null;
                     for (s.locals) |local| {
-                        var id = local.heads[p];
+                        var id = local.records.heads[p];
                         while (id != none) {
                             const b = &s.blocks[id];
                             if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
@@ -885,7 +894,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     comptime std.debug.assert(2 * @sizeOf(Record) <= table_row_bytes);
                     const s = t.s;
                     var rows: usize = 0;
-                    for (s.locals) |l| rows += l.histogram[p];
+                    for (s.locals) |l| rows += l.records.histogram[p];
                     if (rows == 0) return;
                     if (t.records.len < rows * 2) {
                         s.gpa.free(t.records);
@@ -896,7 +905,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     var dst = t.records[rows..][0..rows];
                     var at: usize = 0;
                     for (s.locals) |l| {
-                        var id = l.heads[p];
+                        var id = l.records.heads[p];
                         while (id != none) {
                             const b = &s.blocks[id];
                             std.mem.copyForwards(Record, src[at..][0..b.len], b.rows[0..b.len]);
@@ -937,41 +946,65 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     }
                 }
 
-                /// Partition `p`'s complete groups, of which only this worker's best H are kept.
-                fn foldTop(t: *Task, p: usize) !void {
+                fn foldCount(t: *Task, p: usize) !void {
                     const s = t.s;
                     var rows: usize = 0;
-                    for (s.locals) |l| rows += l.histogram[p];
+                    for (s.locals) |l| rows += l.records.histogram[p];
+                    if (rows == 0) return;
+                    const initial = @max(1, cacheBudget() / (@sizeOf(CountLayout.Group) + 16));
+                    try t.count_fold.reset(s.gpa, rows, initial);
+                    for (s.locals) |l| {
+                        var id = l.records.heads[p];
+                        while (id != none) {
+                            const b = &s.blocks[id];
+                            if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
+                            for (b.rows[0..b.len]) |r| {
+                                const kn = r.flags & 1 != 0;
+                                try t.count_fold.append(s.gpa, .{
+                                    // A temporary 65-bit identity preserves all raw-i64 values plus NULL. Owned
+                                    // producer records remain the P1 16B layout; no NULL/payload bit is discarded.
+                                    .key = if (kn) @as(u128, 1) << 64 else r.key,
+                                    .ordinal = r.ordinal & Group.first_mask,
+                                    .weight = if (r.ordinal & partial != 0) r.flags >> 1 else 1,
+                                });
+                            }
+                            id = b.next;
+                        }
+                    }
+                    var complete = t.count_fold.used;
+                    for (t.count_fold.items()) |g| {
+                        const kn = g.key >> 64 != 0;
+                        const legacy: Group = .{
+                            .key = @truncate(g.key),
+                            .count = g.weight,
+                            .first = g.first | @as(u32, if (kn) null_key else 0),
+                        };
+                        if (s.cut.k != 0) s.keep(t.heap.?, legacy) else complete -= @intFromBool(kn);
+                    }
+                    t.group_count += complete;
+                }
+
+                /// Partition `p`'s complete groups, of which only this worker's best H are kept.
+                fn foldTop(t: *Task, p: usize) !void {
+                    if (cached_count) return t.foldCount(p);
+                    const s = t.s;
+                    var rows: usize = 0;
+                    for (s.locals) |l| rows += l.records.histogram[p];
                     if (rows == 0) return;
                     if (t.groups.len < rows) {
                         s.gpa.free(t.groups);
                         t.groups = &.{};
                         t.groups = try s.gpa.alloc(Group, rows);
                     }
-                    const initial_groups = if (cached_count) @min(rows, @max(1, cacheBudget() / table_row_bytes)) else rows;
-                    var slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, initial_groups * 2));
+                    const slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, rows * 2));
                     var n: usize = 0;
                     var previous: ?usize = null;
                     for (s.locals) |l| {
-                        var id = l.heads[p];
+                        var id = l.records.heads[p];
                         while (id != none) {
                             const b = &s.blocks[id];
                             if (b.next != none) @prefetch(&s.blocks[b.next], .{ .rw = .read, .locality = 1 });
                             for (b.rows[0..b.len]) |r| {
-                                if (cached_count and n >= slots.len / 2 and n < rows) {
-                                    // A cache-sized pointer table avoids faulting rows-sized scratch for a hot owner.
-                                    // Only discovered groups trigger growth; the existing worst-case quote covers it.
-                                    slots = try t.ensureSlots(try std.math.ceilPowerOfTwo(usize, @min(rows, n * 2) * 2));
-                                    for (t.groups[0..n], 0..) |g, i| {
-                                        const h = if (g.first & null_key != 0)
-                                            @as(u64, 0x621985775bcbd930)
-                                        else
-                                            mixKey(g.key, 0);
-                                        var pos: usize = (@as(u32, @truncate(h)) & 0x3fffffff) & (slots.len - 1);
-                                        while (slots[pos] != 0) pos = (pos + 1) & (slots.len - 1);
-                                        slots[pos] = @intCast(i + 1);
-                                    }
-                                }
                                 previous = foldAdjacent(r, t.groups, slots, 0, &n, previous);
                             }
                             id = b.next;
@@ -1091,7 +1124,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     if (cached_count) {
                         contributed += l.contributed_rows;
                     } else {
-                        for (l.histogram) |n| contributed += n;
+                        for (l.records.histogram) |n| contributed += n;
                     }
                 }
                 if (contributed != selected_rows) return error.BadRowCount;
@@ -1102,7 +1135,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     var at: usize = 0;
                     for (0..s.parts) |p| {
                         s.starts[p] = at;
-                        for (s.locals) |l| at += l.histogram[p];
+                        for (s.locals) |l| at += l.records.histogram[p];
                     }
                     s.starts[s.parts] = at;
                     s.groups = try s.gpa.alloc(Group, s.rows);
@@ -1317,7 +1350,7 @@ fn topTrial(comptime kind: Kind, a: std.mem.Allocator, workers: usize, descendin
         } else if (v) |value| refs[at].sum = (refs[at].sum orelse 0) + value;
         try s.locals[(rows - i) % workers].append(key, if (kind == .sum_top) v else {}, @intCast(i));
     }
-    if (collisions) for (s.locals) |l| for (l.heads) |head| {
+    if (collisions) for (s.locals) |l| for (l.records.heads) |head| {
         var id = head;
         while (id != none) {
             const b = &s.blocks[id];
@@ -1995,7 +2028,7 @@ fn hotCountTrial(a: std.mem.Allocator, workers: usize) !void {
         var weighted_zero = false;
         for (s.locals) |*local| {
             try local.flushCounts();
-            for (local.heads) |head| {
+            for (local.records.heads) |head| {
                 var id = head;
                 while (id != none) : (id = s.blocks[id].next) {
                     const block = &s.blocks[id];
@@ -2020,7 +2053,7 @@ fn hotCountTrial(a: std.mem.Allocator, workers: usize) !void {
         var emitted: usize = 0;
         var contributed: usize = 0;
         for (s.locals) |local| {
-            for (local.histogram) |n| emitted += n;
+            for (local.records.histogram) |n| emitted += n;
             contributed += local.contributed_rows;
         }
         try std.testing.expectEqual(@as(usize, rows), contributed);
@@ -2083,7 +2116,7 @@ test "hot integer COUNT cache bypasses a nonreducing source and retries later ho
     local.start(0, 0);
     for (0..256) |r| try local.append(@intCast(r), {}, @intCast(r));
     try std.testing.expect(local.cache_disabled);
-    for (local.count_cache) |entry| try std.testing.expectEqual(@as(u32, 0), entry.count);
+    for (local.count_cache.entries) |entry| try std.testing.expectEqual(@as(u32, 0), entry.count);
     local.start(256, 1);
     try std.testing.expect(!local.cache_disabled);
     for (256..rows) |r| try local.append(null, {}, @intCast(r));
@@ -2121,7 +2154,7 @@ test "hot integer COUNT run quote excludes its unallocated cache and failed clai
     var entry: Entry = .{ .key = 9, .first = 0, .count = 2 };
     try std.testing.expectError(error.ExceededMemoryBudget, local.flushCount(&entry));
     try std.testing.expectEqual(@as(u32, 2), entry.count);
-    for (local.histogram) |n| try std.testing.expectEqual(@as(u32, 0), n);
+    for (local.records.histogram) |n| try std.testing.expectEqual(@as(u32, 0), n);
     try std.testing.expectEqual(@as(usize, 0), local.contributed_rows);
 }
 

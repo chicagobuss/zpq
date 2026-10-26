@@ -699,6 +699,30 @@ const WorkItem = struct {
     accumulators: []expr_agg.Accumulator,
 };
 
+const RecordOrdinals = struct {
+    fn rows(metas: []const schema.FileMetaData) ?usize {
+        var n: usize = 0;
+        for (metas) |meta| for (meta.row_groups.items) |rg| {
+            n = std.math.add(usize, n, std.math.cast(usize, rg.num_rows) orelse return null) catch return null;
+        };
+        return n;
+    }
+
+    /// Work is in input/RG order, but may omit pruned sources. Prefixes include those omissions and empty groups;
+    /// neither a survivor count nor gathered position can become an original ordinal.
+    fn fill(metas: []const schema.FileMetaData, work: []const WorkItem, starts: []u32) bool {
+        if (starts.len != work.len or (rows(metas) orelse return false) >= @as(usize, 1) << 31) return false;
+        var base: usize = 0;
+        var at: usize = 0;
+        for (metas, 0..) |meta, fi| for (meta.row_groups.items, 0..) |rg, ri| {
+            while (at < work.len and work[at].file == fi and work[at].rg == ri) : (at += 1)
+                starts[at] = @intCast(base);
+            base += @intCast(rg.num_rows);
+        };
+        return at == work.len;
+    }
+};
+
 /// Bound query and footer facts only: choosing a strategy neither allocates nor reads the input.
 pub const PlanInputs = struct {
     ndv_stat: ?NdvStat = null,
@@ -2065,6 +2089,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
+            .row_base = if (w.records != null) w.record_starts[idx] else 0,
             .meta = meta,
             .src = rg_src,
             .filter = w.plan.filterFor(decision),
@@ -7433,6 +7458,14 @@ const SlotRadix = struct {
     }
 };
 
+/// Final groups stay typed through the common row/column writer. Dispatch occurs at output cells, never at records.
+const OwnerRows = struct {
+    ctx: *const anyopaque,
+    key: *const fn (*const anyopaque, usize) u128,
+    integer: *const fn (*const anyopaque, usize, usize) anyerror!?i128,
+    value: *const fn (*const anyopaque, std.mem.Allocator, usize, usize) anyerror!AggValue,
+};
+
 /// What the GROUP BY answer's rows are built from: the merged groups and the output columns they fill.
 const RowSource = struct {
     slots: []const MergedSlot,
@@ -7451,13 +7484,17 @@ const RowSource = struct {
     /// The keys are fixed-width images, not the serialized framing `deserializeKeyColumn` reads.
     fixed_keys: bool,
     dense: ?*const agg_dense.Lanes = null,
+    owner: ?OwnerRows = null,
     identity: ?*const key_pack.Plan = null,
 
     fn denseStringBytes(s: *const RowSource) usize {
-        const d = s.dense orelse return 0;
+        const domain = if (s.dense) |d| d.domain else if (s.owner != null)
+            (s.identity orelse return 0).domain orelse return 0
+        else
+            return 0;
         var per_row: usize = 0;
         for (s.outputs) |out| if (out.source == .key) {
-            switch (d.domain.axes[out.source.key].values) {
+            switch (domain.axes[out.source.key].values) {
                 .bytes => |values| {
                     var widest: usize = 0;
                     for (values) |v| widest = @max(widest, v.len);
@@ -7470,9 +7507,13 @@ const RowSource = struct {
     }
 
     fn outputKey(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, out: BoundOutputColumn) !AggValue {
-        if (s.dense != null) {
+        if (s.dense != null or s.owner != null) {
             const identity = s.identity orelse return error.BadGroupKey;
-            return switch (try identity.keyValue(.{ .dense_u32 = @intCast(slot.idx) }, out.source.key)) {
+            const key = if (s.owner) |owner|
+                try identity.keyValueAs(u128, owner.key(owner.ctx, slot.idx), out.source.key)
+            else
+                try identity.keyValue(.{ .dense_u32 = @intCast(slot.idx) }, out.source.key);
+            return switch (key) {
                 .null_val => .null_val,
                 .i => |v| .{ .i = v },
                 .s => |v| .{ .s = try gpa.dupe(u8, v) },
@@ -7516,6 +7557,7 @@ const RowSource = struct {
                 const call = s.calls[ai];
                 switch (call.func) {
                     .count => {},
+                    .count_distinct => if (s.owner == null) return false,
                     .sum, .min, .max => if (call.result != .i64) return false,
                     else => return false,
                 }
@@ -7530,8 +7572,10 @@ const RowSource = struct {
         accs: []const expr_agg.Accumulator,
         folded: bool,
         dense: ?*const agg_dense.Lanes = null,
+        owner: ?OwnerRows = null,
 
         inline fn value(r: IntegerRow, ai: usize, func: expr_agg.AggFunc) !?i128 {
+            if (r.owner) |owner| return owner.integer(owner.ctx, r.group, ai);
             if (r.dense) |d| return d.integer(r.group, ai);
             const x: ?i128 = if (r.table != null and r.table.?.compact.stride != 0)
                 r.table.?.compact.integer(r.group, ai)
@@ -7549,6 +7593,13 @@ const RowSource = struct {
     };
 
     fn integerRow(s: *const RowSource, slot: MergedSlot) IntegerRow {
+        if (s.owner) |owner| return .{
+            .table = null,
+            .group = slot.idx,
+            .accs = &.{},
+            .folded = false,
+            .owner = owner,
+        };
         if (s.dense) |d| return .{
             .table = null,
             .group = slot.idx,
@@ -7574,6 +7625,13 @@ const RowSource = struct {
     /// Fill `vals`, the row's slab cells, all NULL, for `slot`. Each value is set only once built, so on an error the
     /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
     fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
+        if (s.owner) |owner| {
+            for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
+                .key => try s.outputKey(gpa, slot, out),
+                .agg => |ai| try owner.value(owner.ctx, gpa, slot.idx, ai),
+            };
+            return;
+        }
         if (s.dense) |d| {
             for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
                 .key => try s.outputKey(gpa, slot, out),
@@ -14661,6 +14719,167 @@ fn directIntegerColumnsTrial(gpa: std.mem.Allocator, compact: bool, in_place: bo
             if (v != .null_val) try testing.expectEqual(v.i, col.i64.values[i]);
         }
     }
+}
+
+fn ownerColumnsTrial(a: std.mem.Allocator, j: usize) !void {
+    const L = owner_groups.PackedLayout(u128, &.{ .sum, .present_count }, u32);
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64 } },
+    };
+    var identity = (try key_pack.Plan.init(a, &keys, null)).?;
+    defer identity.deinit(a);
+    const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 2, .cols = &.{
+        .{ .i32 = .{ .values = &.{ -1, 0 }, .def_levels = &.{ 1, 0 }, .max_def = 1 } },
+        .{ .i32 = .{ .values = &.{ 0, 5 } } },
+    } };
+    var bindings: [2]key_pack.Binding = undefined;
+    const bound = (try identity.bindInto(&bindings, .{ .batch = &batch }, &.{ 0, 1 }, 0, 0)).?;
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .alias = "c", .result = .i64, .where = null, .arg = null },
+        .{ .func = .sum, .alias = "s", .result = .i64, .where = null, .arg = arg },
+        .{ .func = .avg, .alias = "a", .result = .avg_f64, .where = null, .arg = arg },
+        .{ .func = .count, .alias = "n", .result = .i64, .where = null, .arg = arg },
+    };
+    const groups = [_]L.Group{
+        try L.Group.init(.{ .key = try bound.packAs(u128, 0), .ordinal = 2, .weight = 3, .values = .{ 17, 2 } }),
+        try L.Group.init(.{
+            .key = try bound.packAs(u128, 1),
+            .ordinal = 9,
+            .weight = 2,
+            .values = .{ 0, 0 },
+            .argument_nulls = 1,
+        }),
+    };
+    const Ctx = struct {
+        groups: []const L.Group,
+        calls: []const expr_agg.AggCall,
+        program: agg_plan.OwnerProgram,
+        fn key(ctx: *const anyopaque, row: usize) u128 {
+            const c: *const @This() = @ptrCast(@alignCast(ctx));
+            return c.groups[row].key;
+        }
+        fn integer(ctx: *const anyopaque, row: usize, ai: usize) !?i128 {
+            const c: *const @This() = @ptrCast(@alignCast(ctx));
+            return c.program.integer(c.groups[row], c.calls[ai], null);
+        }
+        fn value(ctx: *const anyopaque, gpa: std.mem.Allocator, row: usize, ai: usize) !AggValue {
+            const c: *const @This() = @ptrCast(@alignCast(ctx));
+            return materializeOne(gpa, c.calls[ai], try c.program.accumulator(c.groups[row], c.calls[ai]));
+        }
+    };
+    const ctx: Ctx = .{ .groups = &groups, .calls = &calls, .program = agg_plan.OwnerProgram.init(&calls).? };
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .key = 1 }, .name = "f" },
+        .{ .source = .{ .agg = 0 }, .name = "c" }, .{ .source = .{ .agg = 1 }, .name = "s" },
+        .{ .source = .{ .agg = 2 }, .name = "a" }, .{ .source = .{ .agg = 3 }, .name = "n" },
+    };
+    const slots = [_]MergedSlot{ .{ .key = "", .first = 2, .idx = 0 }, .{ .key = "", .first = 9, .idx = 1 } };
+    const src: RowSource = .{
+        .slots = &slots,
+        .outputs = &outputs,
+        .calls = &calls,
+        .key_types = &.{ .i64, .i64 },
+        .accs = &.{},
+        .folded = false,
+        .fixed_keys = false,
+        .identity = &identity,
+        .owner = .{ .ctx = &ctx, .key = Ctx.key, .integer = Ctx.integer, .value = Ctx.value },
+    };
+    const types = [_]GroupColType{
+        .{ .lane = .i64, .nullable = true },  .{ .lane = .i64, .nullable = true },
+        .{ .lane = .i64, .nullable = false }, .{ .lane = .i64, .nullable = true },
+        .{ .lane = .f64, .nullable = true },  .{ .lane = .i64, .nullable = false },
+    };
+    var answer: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+    defer answer.deinit(a);
+    try buildGroupColumns(a, &answer, src, &types, j);
+    const expected = [_][6]AggValue{
+        .{ .{ .i = -1 }, .{ .i = 0 }, .{ .i = 3 }, .{ .i = 17 }, .{ .f = 8.5 }, .{ .i = 2 } },
+        .{ .null_val, .{ .i = 5 }, .{ .i = 2 }, .null_val, .null_val, .{ .i = 0 } },
+    };
+    for (slots, expected, 0..) |slot, want, ri| {
+        var row: [6]AggValue = @splat(.null_val);
+        try src.buildRow(a, slot, &row);
+        try testing.expectEqualDeep(want, row);
+        for (answer.columns, row) |column, v| switch (column) {
+            .i64 => |col| {
+                try testing.expectEqual(@as(u32, @intFromBool(v != .null_val)), col.defs[ri]);
+                if (v != .null_val) try testing.expectEqual(v.i, col.values[ri]);
+            },
+            .f64 => |col| {
+                try testing.expectEqual(@as(u32, @intFromBool(v != .null_val)), col.defs[ri]);
+                if (v != .null_val) try testing.expectEqual(
+                    @as(u64, @bitCast(v.f)),
+                    @as(u64, @bitCast(col.values[ri])),
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    const integer_src = blk: {
+        var s = src;
+        s.outputs = outputs[0..4];
+        break :blk s;
+    };
+    var integers: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+    defer integers.deinit(a);
+    try testing.expect(integer_src.integerOutputs(types[0..4]));
+    try buildGroupColumns(a, &integers, integer_src, types[0..4], j);
+    for (integers.columns, answer.columns[0..4]) |actual, want|
+        try testing.expectEqualDeep(want, actual);
+}
+
+test "owner original ordinals include pruned and empty row groups across files before compact narrowing" {
+    const Make = struct {
+        fn rg(n: i64) schema.RowGroup {
+            return .{ .num_rows = n, .columns = .empty, .total_byte_size = 0 };
+        }
+        fn meta(rgs: []schema.RowGroup) schema.FileMetaData {
+            var list: std.ArrayListUnmanaged(schema.RowGroup) = .initBuffer(rgs);
+            list.items = rgs;
+            return .{
+                .version = 1,
+                .schema = .empty,
+                .num_rows = 0,
+                .created_by = null,
+                .row_groups = list,
+            };
+        }
+        fn work(file: usize, rg_index: usize) WorkItem {
+            return .{
+                .file = file,
+                .rg = rg_index,
+                .agg_start = 0,
+                .agg_len = 1,
+                .accumulators = &.{},
+                .columns = .{ .read = &.{}, .consumed = &.{}, .preserve = &.{} },
+            };
+        }
+    };
+    var rgs0 = [_]schema.RowGroup{ Make.rg(10), Make.rg(0), Make.rg(20) };
+    var rgs1 = [_]schema.RowGroup{ Make.rg(5), Make.rg(7) };
+    var metas = [_]schema.FileMetaData{ Make.meta(&rgs0), Make.meta(&rgs1) };
+    const work = [_]WorkItem{ Make.work(0, 2), Make.work(1, 1) };
+    var starts: [2]u32 = undefined;
+    try testing.expectEqual(@as(?usize, 42), RecordOrdinals.rows(&metas));
+    try testing.expect(RecordOrdinals.fill(&metas, &work, &starts));
+    try testing.expectEqualDeep([_]u32{ 10, 35 }, starts);
+    try testing.expect(!RecordOrdinals.fill(&metas, &.{ work[1], work[0] }, &starts));
+    try testing.expect(!RecordOrdinals.fill(&metas, &work, starts[0..1]));
+    rgs0[0].num_rows = 1 << 31;
+    try testing.expect(!RecordOrdinals.fill(&metas, &work, &starts));
+    rgs0[0].num_rows = -1;
+    try testing.expectEqual(null, RecordOrdinals.rows(&metas));
+    rgs0[0].num_rows = std.math.maxInt(i64);
+    rgs0[2].num_rows = std.math.maxInt(i64);
+    try testing.expectEqual(null, RecordOrdinals.rows(&metas));
+}
+
+test "owner typed finish shares KeyPlan unpack integer AVG NULLs and column narrowing with row output" {
+    for ([_]usize{ 1, 3, 16 }) |j| try ownerColumnsTrial(testing.allocator, j);
+    try testing.checkAllAllocationFailures(testing.allocator, ownerColumnsTrial, .{1});
 }
 
 test "direct integer columns: scalar rows' values with compact/generic states, all thread counts and failures" {

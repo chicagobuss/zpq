@@ -307,10 +307,10 @@ pub fn collectRetaining(
     };
     stat.hi = stat.rows;
     if (keys.len == 0) return stat;
-    for (keys) |key| {
-        stat.string_keys = stat.string_keys or key.typeOf() == .str;
-        if (key != .col_ref) return stat;
-    }
+    // Every key's facts first, then the return for a computed one: stopping at the first made the stat depend on
+    // the keys' order (`UserID, extract(...), SearchPhrase` never saw its string key).
+    for (keys) |key| stat.string_keys = stat.string_keys or key.typeOf() == .str;
+    for (keys) |key| if (key != .col_ref) return stat;
     // The footer's half of every read below, shared with `probeRanges` so a reader fetches exactly what this reads.
     // Null only for a nested key, which returns before any read.
     const fold: FoldOnly = if (fold_only) workers else null;
@@ -1650,4 +1650,37 @@ test "M1 speculative identity retains dictionary translations without strengthen
         }
         try std.testing.expectEqualDeep(bound, try collect(a, temp, &files, &.{meta}, &keys, 4, 512 << 20, true));
     }
+}
+
+test "ndv: a computed key gives the same stat wherever it sits among the keys" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    const arena = state.allocator();
+    const meta = try metadata.open(arena, bytes);
+    const files = [_]File{.{ .bytes = bytes, .local = true }};
+    var int_key: expr.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    var one: expr.Expr = .{ .literal = .{ .i64 = 1 } };
+    const computed: expr.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &int_key,
+        .right = &one,
+        .result_type = .i64,
+        .depth = 2,
+    } };
+    const str_key: expr.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    // q18's shape: `UserID, extract(minute ...), SearchPhrase` against the computed key last.
+    const middle = [_]expr.Expr{ int_key, computed, str_key };
+    const last = [_]expr.Expr{ int_key, str_key, computed };
+    const ms = &.{meta};
+    const got = try collectRetaining(a, arena, &files, ms, &middle, 4, 512 << 20, true, true, null, .{});
+    const want = try collectRetaining(a, arena, &files, ms, &last, 4, 512 << 20, true, true, null, .{});
+    try std.testing.expect(want.string_keys);
+    try std.testing.expectEqual(want.string_keys, got.string_keys);
+    try std.testing.expectEqual(want.rows, got.rows);
+    try std.testing.expectEqual(want.hi, got.hi);
+    try std.testing.expectEqual(want.confidence, got.confidence);
 }

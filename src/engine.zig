@@ -668,16 +668,12 @@ fn executeAggregateOver(
     const resident = residency.share;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
     // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
-    // the page cache's, not the query's. That does not override a read that cannot fit in memory.
+    // the page cache's, not the query's.
     const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
-    const planned: u64 = if (local_plan) |lp| lp.planned else 0;
     var choice: local_reader.Choice = if (!choose_io)
         .{ .mode = .mmap, .reason = if (all_local) .mapping else .remote }
     else
-        io_policy.choose(resident, residency.body, coverage, planned, local_reader.memAvailable(), residency.proven);
-    choice = choice.keepDirect(fits_reader);
-    // The same open the reader would do, closed immediately, so EXPLAIN names the mode execute will use.
-    if (choice.directRead() and !directWouldOpen(opened)) choice = choice.withoutDirect();
+        io_policy.choose(resident, coverage);
     choice = choice.keepDirect(fits_reader);
     const io_mode = choice.mode;
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
@@ -4586,50 +4582,29 @@ fn allLocal(opened: OpenedInputs) bool {
     return true;
 }
 
-const LocalResidency = struct { share: f64 = 0, body: f64 = 0, proven: bool = false };
+const LocalResidency = struct { share: f64 = 0 };
 
-/// Residency of the bytes the query will read, weighted by pages mincore actually saw. Unknown (a failed mincore,
-/// a stride, or no plan) is not a cold file: `proven` stays false and `body` is 1.
+/// Residency of the bytes the query will read, weighted by pages mincore actually saw. A failed mincore or no plan
+/// is share 0, so it does not take the cached mapping.
 fn plannedResidency(gpa: std.mem.Allocator, opened: OpenedInputs, plan: ?LocalPlan) LocalResidency {
-    const lp = plan orelse return .{ .body = 1 };
+    const lp = plan orelse return .{};
     var hits: u64 = 0;
     var pages: u64 = 0;
-    var proven = true;
-    var any = false;
     for (lp.files, opened.mmaps) |per_rg, m_opt| {
         const m = m_opt orelse continue;
         var list: std.ArrayList(local_reader.Range) = .empty;
         defer list.deinit(gpa);
         for (per_rg) |rs_opt| {
             const rs = rs_opt orelse continue;
-            list.appendSlice(gpa, rs) catch return .{ .body = 1 };
+            list.appendSlice(gpa, rs) catch return .{};
         }
         if (list.items.len == 0) continue;
-        any = true;
         const sample = local_reader.sampleRanges(gpa, m.bytes, list.items);
-        if (!sample.proven) proven = false;
         hits += sample.hits;
         pages += sample.pages;
     }
-    if (!any or pages == 0) return .{ .body = 1 };
-    const share = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(pages));
-    return .{ .share = share, .body = if (proven) share else 1, .proven = proven };
-}
-
-/// The open execute will attempt, tried now and closed, so the choice does not change between EXPLAIN and the read.
-/// Direct only when every local input opens; one refusal keeps the scan buffered.
-fn directWouldOpen(opened: OpenedInputs) bool {
-    var checks: std.ArrayList(bool) = .empty;
-    defer checks.deinit(opened.gpa);
-    for (opened.mmaps, opened.inputs) |m_opt, in| {
-        const m = m_opt orelse continue;
-        const ok = if (m.fd) |fd|
-            local_reader.directOpenable(fd)
-        else
-            local_reader.directOpenablePath(in.name);
-        checks.append(opened.gpa, ok) catch return false;
-    }
-    return local_reader.everyDirect(checks.items);
+    if (pages == 0) return .{};
+    return .{ .share = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(pages)) };
 }
 
 /// Per local input, per row group, the byte ranges the scan reads (null when pruned): needed chunks and their page
@@ -8772,12 +8747,9 @@ fn printRowGroupSliced(
     var local_slot: ?*consumer.SliceScratch = null;
     const slot = o.scratch orelse &local_slot;
     defer if (o.scratch == null) consumer.releaseSlicePool(slot);
-    const pool = if (slot.*) |p| p else blk: {
-        const p = try gpa.create(consumer.SliceScratch);
-        p.* = .init(gpa);
-        slot.* = p;
-        break :blk p;
-    };
+    const pool = try consumer.poolOn(slot, gpa);
+    // Readers and the value slice release their references first. The pool itself is destroyed after this.
+    defer pool.trimAbove(core_memory.lean_decode);
     var n_cols: usize = 0;
     for (fetch_arr, 0..) |needed, ci| {
         if (needed and ci < rg.columns.items.len) n_cols += 1;

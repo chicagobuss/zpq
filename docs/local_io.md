@@ -24,38 +24,38 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 |---|---|
 | `mmap` | the mapping, faulted in by the decode workers (also what writes and printed rows always use) |
 | `pread` | `ZPQ_IO_THREADS` reader threads, each with blocking `pread` of 1 MiB at a time |
-| `uring` | `ZPQ_IO_THREADS` reader threads, each with its own io_uring and 32 reads of 1 MiB in flight. Buffered, unless the profile is the explicit `uring` or `auto` decided the read cannot fit in memory: those open a separate `O_DIRECT` descriptor |
+| `uring` | reader threads, each with its own io_uring. Buffered, unless the profile is the explicit `uring`, which opens its own `O_DIRECT` descriptor |
 
-`ZPQ_IO_PROFILE` chooses one: `mmap`, `pread`, `uring`, or `auto` (the default). `uring` is the explicit direct option. With `auto`:
+`ZPQ_IO_PROFILE` chooses one: `mmap`, `pread`, `uring`, or `auto` (the default).
+`uring` is the explicit direct option. With `auto`:
 
 - on Lambda (`AWS_LAMBDA_FUNCTION_NAME` set), or on any OS but Linux: `mmap`;
 - when an estimated 80% or more of the bytes this query will read are already in the page cache: `mmap`. The estimate
   is `mincore` over those planned ranges (column chunks and their page indexes), not the rest of the file, so a warm
   repeat of a query that reads a slice of a large file maps. Every page of that range is counted while it is at most
-  4 GiB of pages; past that, a stride still estimates the share but does not prove the range is cold. A failed
-  `mincore` is unknown, and unknown is not cold;
-- when those bytes exceed the tightest of MemAvailable and the ancestor cgroups (`memory.max - memory.current`, or
-  the v1 `memory.limit_in_bytes - memory.usage_in_bytes`; the token `max` and an unreadable file are unbounded, a
-  readable 0 is a real limit), and mincore proved none of them are resident: io_uring with `O_DIRECT`. The
-  descriptor is one the reader opens (`/proc/self/fd/N` with `O_DIRECT`); a borrowed or mapped descriptor is never
-  changed with `F_SETFL`. Whether that open works, and whether a ring of the reader's queue depth can be set up,
-  is tried at plan time and closed, reading no column data, so `--explain` and the run name the same mode;
+  4 GiB of pages; past that, a stride still estimates the share. A failed `mincore` is unknown, and unknown does not
+  take the cached mapping;
 - otherwise a query that plans to read at least half the inputs' bytes uses buffered io_uring, and a narrower read
   uses `pread`. Both fill the page cache, so the next run of the same ranges takes the mapping.
 
+Automatic `O_DIRECT` is not a 0.5.0 choice. The explicit `uring` profile opens its own descriptor
+(`/proc/self/fd/N` with `O_DIRECT`); a borrowed or mapped descriptor is never changed with `F_SETFL`. If that open
+is refused the file reads through the page cache.
+
 The footers are parsed and the query planned before the choice, so pruned row groups and unread columns don't count
-toward the share read. `--explain` reports the mode and one reason (`cached`, `cold_buffered`, or `exceeds_memory`,
-plus the explicit and fallback reasons) and does not read column data to decide. A row group the reader cannot hold
-is read through the mapping (`over_budget`), unless the read cannot fit in memory: that stays `exceeds_memory`.
+toward the share read. `--explain` reports the mode and one reason (`cached` or `cold_buffered`, plus the explicit
+and fallback reasons) and does not read column data to decide. A row group the reader cannot hold is read through
+the mapping (`over_budget`), including when the profile asked for direct.
 
 Each mode falls back rather than fails:
 
 - `uring` falls back to `pread` when io_uring is unavailable (seccomp in containers and sandboxes, or
   `kernel.io_uring_disabled`);
-- a transient io_uring refusal (`EAGAIN`, `EINTR`, `EBUSY`) is retried a few times per enter and per unit.
-  Past that the unit is read with `pread`, and a failed `pread` fails the read;
-- direct is used only when every input accepts `O_DIRECT`. One refusal (tmpfs, some FUSE file systems) reads
-  through the page cache instead.
+- a submit that the kernel refuses before it has the reads (`EAGAIN`, `EBUSY`) is retried a few times, and then
+  those units, which were never submitted, are read with `pread`. A failed `pread` fails the read;
+- `EINTR` while waiting for a completion is retried without counting. A submitted read waits for its completion.
+  It is not read again with `pread` while the ring can still write that buffer. A completion of `-EAGAIN` is
+  resubmitted a few times, and then that finished unit is read with `pread`.
 
 No registered buffers are used, so the default `memlock` limit is enough.
 

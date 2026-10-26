@@ -124,26 +124,6 @@ pub const DecodeScratch = struct {
         }
         return buf.*[0..n];
     }
-
-    /// Drop a buffer grown past `bound` bytes. The next page allocates again; the spike is not kept.
-    pub fn releaseAbove(self: *DecodeScratch, bound: usize) void {
-        self.releaseBuf(u8, 1, &self.page, bound);
-        self.releaseBuf(u8, dict_align, &self.dict, bound);
-        self.releaseBuf(u32, @alignOf(u32), &self.def_levels, bound);
-        self.releaseBuf(u32, @alignOf(u32), &self.rep_levels, bound);
-    }
-
-    fn releaseBuf(
-        self: *DecodeScratch,
-        comptime T: type,
-        comptime alignment: usize,
-        buf: *[]align(alignment) T,
-        bound: usize,
-    ) void {
-        if (buf.len * @sizeOf(T) <= bound) return;
-        self.gpa.free(buf.*);
-        buf.* = &.{};
-    }
 };
 
 /// Page buffers and the survivor mask of one worker's sliced scans. One slot per column in flight, grown to the
@@ -160,10 +140,9 @@ pub const SliceScratch = struct {
     next: usize = 0,
     survivors: []u64 = &.{},
     /// Filter slices and payload slices stay apart: each pass sizes itself from its own high water.
-    values: std.heap.ArenaAllocator = undefined,
-    values_on: bool = false,
-    scan_values: std.heap.ArenaAllocator = undefined,
-    scan_on: bool = false,
+    /// `ArenaAllocator.init` allocates no backing.
+    values: std.heap.ArenaAllocator,
+    scan_values: std.heap.ArenaAllocator,
 
     pub const Slot = struct {
         scratch: DecodeScratch,
@@ -181,7 +160,11 @@ pub const SliceScratch = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator) SliceScratch {
-        return .{ .alloc = alloc };
+        return .{
+            .alloc = alloc,
+            .values = .init(alloc),
+            .scan_values = .init(alloc),
+        };
     }
 
     pub fn deinit(self: *SliceScratch) void {
@@ -191,8 +174,8 @@ pub const SliceScratch = struct {
         }
         self.slots.deinit(self.alloc);
         self.alloc.free(self.survivors);
-        if (self.values_on) self.values.deinit();
-        if (self.scan_on) self.scan_values.deinit();
+        self.values.deinit();
+        self.scan_values.deinit();
         self.* = undefined;
     }
 
@@ -234,35 +217,124 @@ pub const SliceScratch = struct {
 
     /// Decoded slice values and per-slice selections. Reset between slices; the chunks stay until `deinit`.
     pub fn valueArena(self: *SliceScratch) *std.heap.ArenaAllocator {
-        if (!self.values_on) {
-            self.values = .init(self.alloc);
-            self.values_on = true;
-        }
         return &self.values;
     }
 
     /// Payload slices. Separate from `valueArena` so a filter pass's high water is not this pass's row size.
     pub fn scanArena(self: *SliceScratch) *std.heap.ArenaAllocator {
-        if (!self.scan_on) {
-            self.scan_values = .init(self.alloc);
-            self.scan_on = true;
-        }
         return &self.scan_values;
     }
 
-    /// At the end of a row group, give back buffers past `bound`. `bound` is the ledger's one-decode allowance
-    /// (`lean_decode`): a wider page is a spike for this group, and the next group starts from that allowance.
-    pub fn trimAbove(self: *SliceScratch, bound: usize) void {
+    /// Bytes this pool still holds: every slot's decode buffers and page arena, both value arenas, and the
+    /// survivor mask. Call only after the row group's readers are gone. A checked-out slot's dictionary and
+    /// byte-array slices alias these buffers.
+    pub fn retainedBytes(self: *const SliceScratch) usize {
+        var n: usize = self.survivors.len * @sizeOf(u64);
+        n += self.values.queryCapacity();
+        n += self.scan_values.queryCapacity();
         for (self.slots.items) |*slot| {
-            slot.scratch.releaseAbove(bound);
-            _ = slot.pages.reset(.{ .retain_with_limit = bound });
+            n += slot.scratch.page.len;
+            n += slot.scratch.dict.len;
+            n += slot.scratch.def_levels.len * @sizeOf(u32);
+            n += slot.scratch.rep_levels.len * @sizeOf(u32);
+            n += slot.pages.queryCapacity();
         }
-        if (self.survivors.len * @sizeOf(u64) > bound) {
-            self.alloc.free(self.survivors);
-            self.survivors = &.{};
+        return n;
+    }
+
+    /// At the end of a row group, free the largest retained piece until the pool is within `bound`. `bound` is
+    /// the ledger's one-decode allowance (`lean_decode`). Each piece used to keep its own allowance, so a wide
+    /// scan accumulated every column's historical peak.
+    pub fn trimAbove(self: *SliceScratch, bound: usize) void {
+        while (self.retainedBytes() > bound) {
+            if (!self.releaseLargest()) break;
         }
-        if (self.values_on) _ = self.values.reset(.{ .retain_with_limit = bound });
-        if (self.scan_on) _ = self.scan_values.reset(.{ .retain_with_limit = bound });
+    }
+
+    fn releaseLargest(self: *SliceScratch) bool {
+        const Piece = enum { none, survivors, values, scan, page, dict, def, rep, pages };
+        var best: usize = 0;
+        var kind: Piece = .none;
+        var slot_i: usize = 0;
+        const surv = self.survivors.len * @sizeOf(u64);
+        if (surv > best) {
+            best = surv;
+            kind = .survivors;
+        }
+        const values_n = self.values.queryCapacity();
+        if (values_n > best) {
+            best = values_n;
+            kind = .values;
+        }
+        const scan_n = self.scan_values.queryCapacity();
+        if (scan_n > best) {
+            best = scan_n;
+            kind = .scan;
+        }
+        for (self.slots.items, 0..) |*slot, i| {
+            const page_n = slot.scratch.page.len;
+            if (page_n > best) {
+                best = page_n;
+                kind = .page;
+                slot_i = i;
+            }
+            const dict_n = slot.scratch.dict.len;
+            if (dict_n > best) {
+                best = dict_n;
+                kind = .dict;
+                slot_i = i;
+            }
+            const def_n = slot.scratch.def_levels.len * @sizeOf(u32);
+            if (def_n > best) {
+                best = def_n;
+                kind = .def;
+                slot_i = i;
+            }
+            const rep_n = slot.scratch.rep_levels.len * @sizeOf(u32);
+            if (rep_n > best) {
+                best = rep_n;
+                kind = .rep;
+                slot_i = i;
+            }
+            const arena_n = slot.pages.queryCapacity();
+            if (arena_n > best) {
+                best = arena_n;
+                kind = .pages;
+                slot_i = i;
+            }
+        }
+        if (best == 0) return false;
+        switch (kind) {
+            .none => return false,
+            .survivors => {
+                self.alloc.free(self.survivors);
+                self.survivors = &.{};
+            },
+            .values => _ = self.values.reset(.{ .retain_with_limit = 0 }),
+            .scan => _ = self.scan_values.reset(.{ .retain_with_limit = 0 }),
+            .page => {
+                const slot = &self.slots.items[slot_i];
+                slot.scratch.gpa.free(slot.scratch.page);
+                slot.scratch.page = &.{};
+            },
+            .dict => {
+                const slot = &self.slots.items[slot_i];
+                slot.scratch.gpa.free(slot.scratch.dict);
+                slot.scratch.dict = &.{};
+            },
+            .def => {
+                const slot = &self.slots.items[slot_i];
+                slot.scratch.gpa.free(slot.scratch.def_levels);
+                slot.scratch.def_levels = &.{};
+            },
+            .rep => {
+                const slot = &self.slots.items[slot_i];
+                slot.scratch.gpa.free(slot.scratch.rep_levels);
+                slot.scratch.rep_levels = &.{};
+            },
+            .pages => _ = self.slots.items[slot_i].pages.reset(.{ .retain_with_limit = 0 }),
+        }
+        return true;
     }
 };
 
@@ -286,6 +358,28 @@ test "scratch above the decode allowance is released at row-group end" {
     try std.testing.expect(arena.queryCapacity() <= bound);
     _ = try slot.scratch.ensure(u8, 1, &slot.scratch.page, 64);
     try std.testing.expect(slot.scratch.page.len >= 64);
+}
+
+test "scratch retention across columns stays within one decode allowance" {
+    const page = std.heap.pageSize();
+    var budget: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
+    var charged: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget };
+    var pool = SliceScratch.init(charged.allocator());
+    defer pool.deinit();
+    try pool.reserve(3);
+    // The slot list is charged too. The two page peaks are what have to fit beside it, and what trim frees.
+    const overhead = budget.used.load(.monotonic);
+    budget.limit = overhead + page * 6;
+    const a = pool.checkout();
+    const b = pool.checkout();
+    _ = try a.scratch.ensure(u8, 1, &a.scratch.page, page * 3);
+    _ = try b.scratch.ensure(u8, 1, &b.scratch.page, page * 3);
+    try std.testing.expectEqual(overhead + page * 6, budget.used.load(.monotonic));
+    pool.trimAbove(page * 3);
+    try std.testing.expect(pool.retainedBytes() <= page * 3);
+    try std.testing.expect(budget.used.load(.monotonic) <= overhead + page * 3);
+    const c = pool.checkout();
+    _ = try c.scratch.ensure(u8, 1, &c.scratch.page, page * 3);
 }
 
 /// The ordinal in its column chunk (0 the first, a dictionary page counted) of the page this thread last began to

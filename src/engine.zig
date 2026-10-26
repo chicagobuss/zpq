@@ -661,11 +661,10 @@ fn executeAggregateOver(
         break :blk m;
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
-    const residency: LocalResidency = if (choose_io and io_policy.profile == .auto)
+    const resident: f64 = if (choose_io and io_policy.profile == .auto)
         plannedResidency(ctx.gpa, opened, local_plan)
     else
-        .{};
-    const resident = residency.share;
+        0;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
     // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
     // the page cache's, not the query's.
@@ -674,7 +673,7 @@ fn executeAggregateOver(
         .{ .mode = .mmap, .reason = if (all_local) .mapping else .remote }
     else
         io_policy.choose(resident, coverage);
-    choice = choice.keepDirect(fits_reader);
+    choice = choice.withinReader(fits_reader);
     const io_mode = choice.mode;
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         io_policy.profile,
@@ -2101,12 +2100,6 @@ const WinCtx = struct {
     lean_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
     encode_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
 
-    /// The write's sliced page buffers, charged to the allocator of the current job. A later row group on another
-    /// ledger (the write's, or the lean one beside it) gets a new pool so the previous ledger sees the free.
-    fn writerSlicePool(w: *WinCtx, alloc: std.mem.Allocator) !*consumer.SliceScratch {
-        return consumer.poolOn(&w.slice_pool, alloc);
-    }
-
     /// What a deferred row group's slices draw from (`slicing`, `lean`): the writer alone has the write's ledger and
     /// the slack's room past it. Beside producers still fetching it has the write's ledger while that holds more than
     /// the slack's worth, its own small ledger only once the write's is that short: never a wait on the producers,
@@ -2284,7 +2277,7 @@ const SliceReaders = struct {
         self.lookup = try pa.alloc(?usize, w.fetch_arr.len);
         @memset(self.lookup, null);
         const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
-        const pool = try w.writerSlicePool(gpa);
+        const pool = try consumer.poolOn(&w.slice_pool, gpa);
         var n_cols: usize = 0;
         for (w.fetch_arr, 0..) |needed, ci| {
             if (needed and ci < job.rg.columns.items.len) n_cols += 1;
@@ -2363,6 +2356,8 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
             _ = slice.reset(.free_all);
             w.trimIdle();
             readers.deinit();
+            // Readers no longer alias the pool. Historical page peaks can be what the ledger refused.
+            if (w.slice_pool) |pool| pool.evictIdle();
             readers.init(w, gpa, job, done) catch |re| {
                 readers = .{ .pages = .init(gpa), .lookup = &.{} };
                 return re;
@@ -4582,29 +4577,24 @@ fn allLocal(opened: OpenedInputs) bool {
     return true;
 }
 
-const LocalResidency = struct { share: f64 = 0 };
-
-/// Residency of the bytes the query will read, weighted by pages mincore actually saw. A failed mincore or no plan
-/// is share 0, so it does not take the cached mapping.
-fn plannedResidency(gpa: std.mem.Allocator, opened: OpenedInputs, plan: ?LocalPlan) LocalResidency {
-    const lp = plan orelse return .{};
-    var hits: u64 = 0;
-    var pages: u64 = 0;
+/// Residency of the bytes the query will read, each file weighted by its planned pages. A failed mincore counts
+/// that file's pages as not cached. No plan is share 0, so it does not take the cached mapping.
+fn plannedResidency(gpa: std.mem.Allocator, opened: OpenedInputs, plan: ?LocalPlan) f64 {
+    const lp = plan orelse return 0;
+    var parts: std.ArrayList(local_reader.Residency) = .empty;
+    defer parts.deinit(gpa);
     for (lp.files, opened.mmaps) |per_rg, m_opt| {
         const m = m_opt orelse continue;
         var list: std.ArrayList(local_reader.Range) = .empty;
         defer list.deinit(gpa);
         for (per_rg) |rs_opt| {
             const rs = rs_opt orelse continue;
-            list.appendSlice(gpa, rs) catch return .{};
+            list.appendSlice(gpa, rs) catch return 0;
         }
         if (list.items.len == 0) continue;
-        const sample = local_reader.sampleRanges(gpa, m.bytes, list.items);
-        hits += sample.hits;
-        pages += sample.pages;
+        parts.append(gpa, local_reader.sampleRanges(gpa, m.bytes, list.items)) catch return 0;
     }
-    if (pages == 0) return .{};
-    return .{ .share = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(pages)) };
+    return local_reader.weightShare(parts.items);
 }
 
 /// Per local input, per row group, the byte ranges the scan reads (null when pruned): needed chunks and their page

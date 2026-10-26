@@ -33,8 +33,8 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 - when an estimated 80% or more of the bytes this query will read are already in the page cache: `mmap`. The estimate
   is `mincore` over those planned ranges (column chunks and their page indexes), not the rest of the file, so a warm
   repeat of a query that reads a slice of a large file maps. Every page of that range is counted while it is at most
-  4 GiB of pages; past that, a stride still estimates the share. A failed `mincore` is unknown, and unknown does not
-  take the cached mapping;
+  4 GiB of pages; past that, a stride still estimates the share. Each file is weighted by its planned pages, not by
+  how many samples it contributed. A failed `mincore` counts that file's pages as not cached;
 - otherwise a query that plans to read at least half the inputs' bytes uses buffered io_uring, and a narrower read
   uses `pread`. Both fill the page cache, so the next run of the same ranges takes the mapping.
 
@@ -51,8 +51,9 @@ Each mode falls back rather than fails:
 
 - `uring` falls back to `pread` when io_uring is unavailable (seccomp in containers and sandboxes, or
   `kernel.io_uring_disabled`);
-- a submit that the kernel refuses before it has the reads (`EAGAIN`, `EBUSY`) is retried a few times, and then
-  those units, which were never submitted, are read with `pread`. A failed `pread` fails the read;
+- a submit that the kernel refuses (`EAGAIN`, `EBUSY`), including a real `io_uring_enter`, is retried a few times.
+  SQEs the kernel never consumed are then read with `pread`. SQEs an earlier enter already accepted wait for their
+  completions. A failed `pread` fails the read;
 - `EINTR` while waiting for a completion is retried without counting. A submitted read waits for its completion.
   It is not read again with `pread` while the ring can still write that buffer. A completion of `-EAGAIN` is
   resubmitted a few times, and then that finished unit is read with `pread`.

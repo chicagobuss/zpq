@@ -1051,24 +1051,11 @@ pub const SliceReader = struct {
         ci: usize,
         decode_options_in: DecodeOptions,
     ) !?SliceReader {
-        return open(a, gpa, rg, meta, src, ci, decode_options_in, null);
+        return initPooled(a, gpa, rg, meta, src, ci, decode_options_in, null);
     }
 
-    /// As `init`, drawing the page scratch from `pool` so the next row group reuses it.
+    /// As `init`. `pool`, when set, keeps the page scratch for the next row group.
     pub fn initPooled(
-        a: std.mem.Allocator,
-        gpa: std.mem.Allocator,
-        rg: *const schema.RowGroup,
-        meta: *const schema.FileMetaData,
-        src: RGSrc,
-        ci: usize,
-        decode_options_in: DecodeOptions,
-        pool: *SliceScratch,
-    ) !?SliceReader {
-        return open(a, gpa, rg, meta, src, ci, decode_options_in, pool);
-    }
-
-    fn open(
         a: std.mem.Allocator,
         gpa: std.mem.Allocator,
         rg: *const schema.RowGroup,
@@ -4476,21 +4463,7 @@ fn scanRGForAggImpl(
     return selected;
 }
 
-/// `scanRGForAgg`'s decode and fold, a slice of rows at a time (`SliceReader`), each slice on memory of its own:
-/// for a row group too big for a worker's share of `budget`. The rows the outer filter kept; null, having done
-/// nothing, when some column has no sliced form.
-/// The worker's sliced page and survivor scratch, created on `alloc` (the ledger's charged allocator when there is
-/// one) and freed with the worker's `DecodeScratch`.
-fn slicePool(ws: AggWorkspace, alloc: std.mem.Allocator) !*SliceScratch {
-    if (ws.scratch.slice) |pool| return pool;
-    const pool = try alloc.create(SliceScratch);
-    pool.* = .init(alloc);
-    ws.scratch.slice = pool;
-    return pool;
-}
-
-/// The pool on `slot`, charged to `alloc`. A later job whose allocator is a different ledger drops the old pool
-/// first, so its charge is that job's and the previous ledger sees the free.
+/// The pool on `slot`, charged to `alloc`. A different ledger drops the old pool first.
 pub fn poolOn(slot: *?*SliceScratch, alloc: std.mem.Allocator) !*SliceScratch {
     if (slot.*) |pool| {
         if (pool.alloc.ptr == alloc.ptr and pool.alloc.vtable == alloc.vtable) return pool;
@@ -4543,7 +4516,7 @@ fn filterSurvivors(
     num_rows: usize,
     ws: AggWorkspace,
 ) !?filter_selection.SelectionVector {
-    const pool = try slicePool(ws, side);
+    const pool = try poolOn(&ws.scratch.slice, side);
     var n_readers: usize = 0;
     for (in.read, payload, 0..) |needed, late, ci| {
         if (!needed or late or ci >= in.rg.columns.items.len) continue;
@@ -4583,6 +4556,8 @@ fn filterSurvivors(
     return survivors;
 }
 
+/// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
+/// A charged allocation that fails before any row is folded drops idle scratch and tries the row group once more.
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -4593,10 +4568,29 @@ fn scanRGSliced(
     handled: []const bool,
     full: usize,
 ) !?u64 {
+    var committed = false;
+    return scanRGSlicedOnce(gpa, in, decode_options, target, ws, budget, handled, full, &committed) catch |e| {
+        if (e != error.OutOfMemory or committed) return e;
+        if (ws.scratch.slice) |pool| pool.evictIdle();
+        return scanRGSlicedOnce(gpa, in, decode_options, target, ws, budget, handled, full, &committed);
+    };
+}
+
+fn scanRGSlicedOnce(
+    gpa: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+    budget: *DecodeBudget,
+    handled: []const bool,
+    full: usize,
+    committed: *bool,
+) !?u64 {
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
-    const pool = try slicePool(ws, side);
+    const pool = try poolOn(&ws.scratch.slice, side);
     // lean_decode is the ledger's one-decode allowance. Wider page scratch is a spike for this row group.
     defer pool.trimAbove(core_memory.lean_decode);
     var pages = std.heap.ArenaAllocator.init(side);
@@ -4694,6 +4688,8 @@ fn scanRGSliced(
                 return error.RetainedEncodingUnsupported;
             return err;
         };
+        // The page scratch is in use from here. A later failure must not scan this row group again.
+        committed.* = true;
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
         var sel = if (payload != null)
             try survivors.alignedWindow(done, n)

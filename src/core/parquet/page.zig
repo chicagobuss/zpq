@@ -251,88 +251,56 @@ pub const SliceScratch = struct {
         }
     }
 
+    /// Drop every retained buffer. Call only when no reader still aliases this pool: a charged allocation failed
+    /// at a row-group boundary, and the next attempt has to fit in the ledger.
+    pub fn evictIdle(self: *SliceScratch) void {
+        self.trimAbove(0);
+    }
+
     fn releaseLargest(self: *SliceScratch) bool {
-        const Piece = enum { none, survivors, values, scan, page, dict, def, rep, pages };
+        // 1 survivors, 2 value arena, 3 scan arena, then five ids per slot: page, dict, def, rep, page arena.
         var best: usize = 0;
-        var kind: Piece = .none;
-        var slot_i: usize = 0;
-        const surv = self.survivors.len * @sizeOf(u64);
-        if (surv > best) {
-            best = surv;
-            kind = .survivors;
-        }
-        const values_n = self.values.queryCapacity();
-        if (values_n > best) {
-            best = values_n;
-            kind = .values;
-        }
-        const scan_n = self.scan_values.queryCapacity();
-        if (scan_n > best) {
-            best = scan_n;
-            kind = .scan;
-        }
+        var pick: usize = 0;
+        const note = struct {
+            fn apply(best_n: *usize, pick_id: *usize, n: usize, id: usize) void {
+                if (n > best_n.*) {
+                    best_n.* = n;
+                    pick_id.* = id;
+                }
+            }
+        }.apply;
+        note(&best, &pick, self.survivors.len * @sizeOf(u64), 1);
+        note(&best, &pick, self.values.queryCapacity(), 2);
+        note(&best, &pick, self.scan_values.queryCapacity(), 3);
         for (self.slots.items, 0..) |*slot, i| {
-            const page_n = slot.scratch.page.len;
-            if (page_n > best) {
-                best = page_n;
-                kind = .page;
-                slot_i = i;
-            }
-            const dict_n = slot.scratch.dict.len;
-            if (dict_n > best) {
-                best = dict_n;
-                kind = .dict;
-                slot_i = i;
-            }
-            const def_n = slot.scratch.def_levels.len * @sizeOf(u32);
-            if (def_n > best) {
-                best = def_n;
-                kind = .def;
-                slot_i = i;
-            }
-            const rep_n = slot.scratch.rep_levels.len * @sizeOf(u32);
-            if (rep_n > best) {
-                best = rep_n;
-                kind = .rep;
-                slot_i = i;
-            }
-            const arena_n = slot.pages.queryCapacity();
-            if (arena_n > best) {
-                best = arena_n;
-                kind = .pages;
-                slot_i = i;
-            }
+            const base = 4 + i * 5;
+            const buffers = .{
+                slot.scratch.page.len,
+                slot.scratch.dict.len,
+                slot.scratch.def_levels.len * @sizeOf(u32),
+                slot.scratch.rep_levels.len * @sizeOf(u32),
+            };
+            inline for (buffers, 0..) |n, k| note(&best, &pick, n, base + k);
+            note(&best, &pick, slot.pages.queryCapacity(), base + 4);
         }
         if (best == 0) return false;
-        switch (kind) {
-            .none => return false,
-            .survivors => {
+        switch (pick) {
+            1 => {
                 self.alloc.free(self.survivors);
                 self.survivors = &.{};
             },
-            .values => _ = self.values.reset(.{ .retain_with_limit = 0 }),
-            .scan => _ = self.scan_values.reset(.{ .retain_with_limit = 0 }),
-            .page => {
-                const slot = &self.slots.items[slot_i];
-                slot.scratch.gpa.free(slot.scratch.page);
-                slot.scratch.page = &.{};
+            2 => _ = self.values.reset(.{ .retain_with_limit = 0 }),
+            3 => _ = self.scan_values.reset(.{ .retain_with_limit = 0 }),
+            else => {
+                const slot = &self.slots.items[(pick - 4) / 5];
+                switch ((pick - 4) % 5) {
+                    0 => { slot.scratch.gpa.free(slot.scratch.page); slot.scratch.page = &.{}; },
+                    1 => { slot.scratch.gpa.free(slot.scratch.dict); slot.scratch.dict = &.{}; },
+                    2 => { slot.scratch.gpa.free(slot.scratch.def_levels); slot.scratch.def_levels = &.{}; },
+                    3 => { slot.scratch.gpa.free(slot.scratch.rep_levels); slot.scratch.rep_levels = &.{}; },
+                    else => _ = slot.pages.reset(.{ .retain_with_limit = 0 }),
+                }
             },
-            .dict => {
-                const slot = &self.slots.items[slot_i];
-                slot.scratch.gpa.free(slot.scratch.dict);
-                slot.scratch.dict = &.{};
-            },
-            .def => {
-                const slot = &self.slots.items[slot_i];
-                slot.scratch.gpa.free(slot.scratch.def_levels);
-                slot.scratch.def_levels = &.{};
-            },
-            .rep => {
-                const slot = &self.slots.items[slot_i];
-                slot.scratch.gpa.free(slot.scratch.rep_levels);
-                slot.scratch.rep_levels = &.{};
-            },
-            .pages => _ = self.slots.items[slot_i].pages.reset(.{ .retain_with_limit = 0 }),
         }
         return true;
     }
@@ -380,6 +348,38 @@ test "scratch retention across columns stays within one decode allowance" {
     try std.testing.expect(budget.used.load(.monotonic) <= overhead + page * 3);
     const c = pool.checkout();
     _ = try c.scratch.ensure(u8, 1, &c.scratch.page, page * 3);
+}
+
+test "rotating page peaks under the decode allowance yield when the next group needs the room" {
+    const lean = core_memory.lean_decode;
+    const peak = 12 << 20;
+    var budget: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
+    var charged: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget };
+    var pool = SliceScratch.init(charged.allocator());
+    defer pool.deinit();
+    try pool.reserve(3);
+    _ = pool.checkout();
+    _ = pool.checkout();
+    _ = pool.checkout();
+    pool.rewind();
+    budget.limit = budget.used.load(.monotonic) + lean;
+    const a = pool.checkout();
+    _ = try a.scratch.ensure(u8, 1, &a.scratch.page, peak);
+    pool.trimAbove(lean);
+    pool.rewind();
+    _ = pool.checkout();
+    const b = pool.checkout();
+    _ = try b.scratch.ensure(u8, 1, &b.scratch.page, peak);
+    pool.trimAbove(lean);
+    try std.testing.expect(pool.retainedBytes() > peak);
+    pool.rewind();
+    _ = pool.checkout();
+    _ = pool.checkout();
+    const c = pool.checkout();
+    try std.testing.expectError(error.OutOfMemory, c.scratch.ensure(u8, 1, &c.scratch.page, peak));
+    pool.evictIdle();
+    _ = try c.scratch.ensure(u8, 1, &c.scratch.page, peak);
+    try std.testing.expect(budget.used.load(.monotonic) <= budget.limit);
 }
 
 /// The ordinal in its column chunk (0 the first, a dictionary page counted) of the page this thread last began to

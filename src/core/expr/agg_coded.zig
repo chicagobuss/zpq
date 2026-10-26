@@ -777,7 +777,7 @@ fn foldExactBatch(
     const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
     @memset(partials, null);
     const restricted = batch.restrictedTo(outer);
-    // Selected rows per composite, shared by every root whose lane has no levels.
+    // Selected rows per composite, shared by the interleaved roots whose lane has no levels.
     var present: ?[]u64 = null;
     for (calls, roots, 0..) |call, root, ai| {
         if (root) |r| {
@@ -787,12 +787,7 @@ fn foldExactBatch(
                     const delta = try ra.alloc(agg.DecSum, space);
                     @memset(delta, .{});
                     switch (v) {
-                        inline .i32, .i64 => |col| {
-                            const counted = col.def_levels != null or present == null;
-                            const sums, const counts = try narrowSums(ra, space, comp, col, outer, counted);
-                            if (col.def_levels == null and present == null) present = counts;
-                            for (delta, sums, counts orelse present.?) |*d, sum, n| d.add(sum, n);
-                        },
+                        inline .i32, .i64 => |col| try narrowSums(ra, delta, comp, col, outer, &present),
                         .i128 => |col| for (comp, 0..) |cp, row| {
                             if (!outer.isActive(row) or (col.def_levels != null and
                                 col.def_levels.?[row] < col.max_def)) continue;
@@ -1092,7 +1087,8 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         d.* = @intFromBool(r % 19 != 0);
         // A null row's slot holds garbage the fold must not read as a value.
         if (d.* == 0) h.* = std.math.minInt(i64);
-        c.* = @intCast((r * 7 + r / 3) % space);
+        // Half the rows in one composite, so even one slot per composite runs past 64 bits.
+        c.* = if (r % 2 == 0) 0 else @intCast((r * 7 + r / 3) % space);
     }
     const cols = [_]Column{
         .{ .i64 = .{ .values = big, .unscaled = .{ .i64 = big } } },
@@ -1181,10 +1177,10 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         };
         try std.testing.expectEqual(want_sum[cp * calls.len + ai], d.get());
         try std.testing.expectEqual(want_n[cp * calls.len + ai], d.n);
-        if (@abs(d.get()) > std.math.maxInt(i64)) sizable = true;
+        if (ai != 4 and @abs(d.get()) > std.math.maxInt(i64)) sizable = true;
     };
-    // With few composites the 64-bit lanes reach sums no 64-bit accumulator holds.
-    if (space * sum_lanes <= n) try std.testing.expect(sizable);
+    // The 64-bit lanes reach sums no 64-bit accumulator holds.
+    try std.testing.expect(sizable);
 }
 
 test "fused float sums match call-major row order" {
@@ -2016,65 +2012,89 @@ pub fn compositeFirstRows(
 /// slots, so no add waits on the store of the one before it.
 const sum_lanes = 4;
 
-/// A 64-bit (or narrower) exact lane's sums per composite over `sel`'s non-null rows, and with `counted` how many rows
-/// each took. Fewer than 2^64 values under 2^63 sum inside i128, so there is no bound to prove, and the 192-bit
-/// `DecSum` add runs once per composite rather than per row. Inactive and null rows add zero rather than branch.
+/// Folds a 64-bit (or narrower) exact lane's selected non-null rows into `delta`, a zeroed `DecSum` per composite.
+/// Fewer than 2^64 values of magnitude at most 2^63 sum inside i128, so there is no bound to prove, and the 192-bit
+/// add runs once per composite rather than per row. Inactive and null rows add zero rather than branch.
 fn narrowSums(
     ra: std.mem.Allocator,
-    space: usize,
+    delta: []agg.DecSum,
     comp: []const u32,
     col: anytype,
     sel: *const Sel,
-    counted: bool,
-) !struct { []i128, ?[]u64 } {
-    // Lanes only where their scratch stays within a row-sized buffer.
-    if (space * sum_lanes <= comp.len) {
-        if (counted) return narrowSumsAt(sum_lanes, true, ra, space, comp, col, sel);
-        return narrowSumsAt(sum_lanes, false, ra, space, comp, col, sel);
+    /// Selected rows per composite, filled by the first interleaved lane without levels for the rest to reuse.
+    present: *?[]u64,
+) !void {
+    // Interleaved slots only within the free composite spaces, whose scratch stays within row-sized buffers.
+    if (delta.len <= MAX_COMPOSITE and delta.len * sum_lanes <= comp.len) {
+        if (present.*) |counts| if (col.def_levels == null) {
+            return narrowSumsLanes(false, ra, delta, comp, col, sel, counts);
+        };
+        const counts = try narrowSumsLanes(true, ra, delta, comp, col, sel, null);
+        if (col.def_levels == null) present.* = counts;
+        return;
     }
-    if (counted) return narrowSumsAt(1, true, ra, space, comp, col, sel);
-    return narrowSumsAt(1, false, ra, space, comp, col, sel);
+    // One slot per composite: the i128 sum runs in `lo` and the count in `n`, and no scratch is taken.
+    const V = @TypeOf(col.values[0]);
+    forEachWordRow(sel, comp.len, struct {
+        fn f(c: anytype, word: u64, r: usize) void {
+            var keep: u1 = @truncate(word >> @intCast(r % 64));
+            if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+            const d = &c.delta[c.comp[r]];
+            d.lo +%= @bitCast(@as(i128, c.col.values[r] & -%@as(V, keep)));
+            d.n += keep;
+        }
+    }.f, .{ .delta = delta, .comp = comp, .col = col });
+    for (delta) |*d| d.hi = if (@as(i128, @bitCast(d.lo)) < 0) -1 else 0;
 }
 
-fn narrowSumsAt(
-    comptime lanes: usize,
+/// `narrowSums` in `sum_lanes` slots per composite. Counts its own rows when `counted` (returning those counts), and
+/// otherwise takes `shared`.
+fn narrowSumsLanes(
     comptime counted: bool,
     ra: std.mem.Allocator,
-    space: usize,
+    delta: []agg.DecSum,
     comp: []const u32,
     col: anytype,
     sel: *const Sel,
-) !struct { []i128, ?[]u64 } {
+    shared: ?[]const u64,
+) !if (counted) []u64 else void {
     const V = @TypeOf(col.values[0]);
-    const part = try ra.alloc(i128, space * lanes);
+    const part = try ra.alloc(i128, delta.len * sum_lanes);
     @memset(part, 0);
-    const cnt = if (counted) try ra.alloc(u64, space * lanes) else {};
+    const cnt = if (counted) try ra.alloc(u64, delta.len * sum_lanes) else {};
     if (counted) @memset(cnt, 0);
-    const n = comp.len;
+    forEachWordRow(sel, comp.len, struct {
+        fn f(c: anytype, word: u64, r: usize) void {
+            var keep: u1 = @truncate(word >> @intCast(r % 64));
+            if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+            const slot = @as(usize, c.comp[r]) * sum_lanes + r % sum_lanes;
+            c.part[slot] += c.col.values[r] & -%@as(V, keep);
+            if (counted) c.cnt[slot] += keep;
+        }
+    }.f, .{ .part = part, .cnt = cnt, .comp = comp, .col = col });
+    const counts = if (counted) try ra.alloc(u64, delta.len) else {};
+    for (delta, 0..) |*d, cp| {
+        var sum: i128 = 0;
+        for (part[cp * sum_lanes ..][0..sum_lanes]) |p| sum += p;
+        var n: u64 = undefined;
+        if (counted) {
+            n = 0;
+            for (cnt[cp * sum_lanes ..][0..sum_lanes]) |c| n += c;
+            counts[cp] = n;
+        } else n = shared.?[cp];
+        d.add(sum, n);
+    }
+    return counts;
+}
+
+/// Calls `f(ctx, word, r)` for every row `r < n` of a word of `sel` with any row active, `word` holding `r`'s bit.
+inline fn forEachWordRow(sel: *const Sel, n: usize, comptime f: anytype, ctx: anytype) void {
     for (sel.mask, 0..) |word, w| {
         if (word == 0) continue;
         const base = w * 64;
-        for (base..@min(base + 64, n)) |r| {
-            var keep: u1 = @truncate(word >> @intCast(r - base));
-            if (col.def_levels) |dl| keep &= @intFromBool(dl[r] >= col.max_def);
-            const slot = @as(usize, comp[r]) * lanes + r % lanes;
-            part[slot] += col.values[r] & -%@as(V, keep);
-            if (counted) cnt[slot] += keep;
-        }
+        if (base >= n) break;
+        for (base..@min(base + 64, n)) |r| f(ctx, word, r);
     }
-    if (lanes == 1) return .{ part, if (counted) cnt else null };
-    const sums = try ra.alloc(i128, space);
-    for (sums, 0..) |*s, cp| {
-        s.* = 0;
-        for (part[cp * lanes ..][0..lanes]) |p| s.* += p;
-    }
-    if (!counted) return .{ sums, null };
-    const counts = try ra.alloc(u64, space);
-    for (counts, 0..) |*c, cp| {
-        c.* = 0;
-        for (cnt[cp * lanes ..][0..lanes]) |p| c.* += p;
-    }
-    return .{ sums, counts };
 }
 
 fn compositeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u64 {

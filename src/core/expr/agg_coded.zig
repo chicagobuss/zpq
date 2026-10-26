@@ -776,26 +776,19 @@ fn foldExactBatch(
     }
     const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
     @memset(partials, null);
-    const restricted = batch.restrictedTo(outer);
-    // Selected rows per composite, shared by the interleaved roots whose lane has no levels.
+    // Composites' selected rows, shared by the roots that sum in interleaved slots.
     var present: ?[]u64 = null;
+    foldExactWindows(ra, &plan, calls, roots, partials, &present, space, comp, batch, lookup, outer);
+    const restricted = batch.restrictedTo(outer);
     for (calls, roots, 0..) |call, root, ai| {
         if (root) |r| {
-            const v = try plan.evaluate(ra, &restricted, lookup, r);
             if (call.func == .sum or call.func == .avg) {
                 if (partials[r] == null) {
-                    const delta = try ra.alloc(agg.DecSum, space);
-                    @memset(delta, .{});
-                    switch (v) {
-                        inline .i32, .i64 => |col| try narrowSums(ra, delta, comp, col, outer, &present),
-                        .i128 => |col| for (comp, 0..) |cp, row| {
-                            if (!outer.isActive(row) or (col.def_levels != null and
-                                col.def_levels.?[row] < col.max_def)) continue;
-                            delta[cp].add(col.values[row], 1);
-                        },
-                        else => return error.TypeMismatch,
-                    }
-                    partials[r] = delta;
+                    const v = try plan.evaluate(ra, &restricted, lookup, r);
+                    var acc = try NarrowAcc.init(ra, space, comp.len);
+                    try acc.fold(comp, v, outer);
+                    try acc.finish(ra, &present, comp, outer);
+                    partials[r] = acc.delta;
                 }
                 for (partials[r].?, gid_of) |delta, gid| {
                     if (delta.n == 0) continue;
@@ -807,6 +800,7 @@ fn foldExactBatch(
                 }
                 continue;
             }
+            const v = try plan.evaluate(ra, &restricted, lookup, r);
             try foldGroupedValue(
                 ra,
                 gpa,
@@ -1058,8 +1052,14 @@ fn testFloatBatches(a: std.mem.Allocator) !void {
 }
 
 test "exact batches sum 64-bit DECIMAL lanes in i128 at their extremes, with NULLs, selections and i128 inputs" {
-    // Few composites take interleaved partials; past a quarter of the rows each composite takes one.
-    for ([_]usize{ 5, 9000 }) |space| try testExactBatches(std.testing.allocator, space);
+    const old = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old;
+    // Few composites take interleaved partials; past a quarter of the rows each composite takes one. The whole
+    // batch at once, then windows of one selection word and of several.
+    for ([_]usize{ 5, 9000 }) |space| for ([_]usize{ 0, 64, 4096 }) |rows| {
+        expr_eval.forced_batch_rows = rows;
+        try testExactBatches(std.testing.allocator, space);
+    };
 }
 
 fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
@@ -1075,15 +1075,19 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
     const small = try ra.alloc(i32, n);
     const huge = try ra.alloc(i128, n);
     const shadow = try ra.alloc(f64, n);
+    const times = try ra.alloc(i64, n);
     const defs = try ra.alloc(u32, n);
     const comp = try ra.alloc(u32, n);
-    for (big, half, small, huge, shadow, defs, comp, 0..) |*b, *h, *sm, *hg, *f, *d, *c, r| {
+    for (big, half, small, huge, shadow, times, defs, comp, 0..) |*b, *h, *sm, *hg, *f, *t, *d, *c, r| {
         // Runs of one sign at DECIMAL(18)'s extremes: any 64-bit running sum would overflow.
         b.* = if (r % 6 < 3) max18 else -max18 + @as(i64, @intCast(r % 5));
         h.* = if (r % 2 == 0) @divTrunc(max18, 2) else -@as(i64, @intCast(r));
         sm.* = if (r % 3 == 0) -999_999_999 else @intCast(r);
         hg.* = if (r % 4 == 0) -wide else wide - @as(i128, @intCast(r));
         f.* = 0;
+        // Every third selection word's products leave 64 bits: their windows take the i128 lane, the rest do not.
+        // Those products sum past 2^127, beyond what an i128 partial could carry.
+        t.* = if (r / 64 % 3 != 1) 1 else if (b.* > 0) 100_000_000_000_000_000 else 10;
         d.* = @intFromBool(r % 19 != 0);
         // A null row's slot holds garbage the fold must not read as a value.
         if (d.* == 0) {
@@ -1110,9 +1114,10 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
             .has_nulls = true,
         } },
         .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = huge } } },
+        .{ .i64 = .{ .values = times, .unscaled = .{ .i64 = times } } },
     };
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
-    const lookup = [_]?usize{ 0, 1, 2, 3 };
+    const lookup = [_]?usize{ 0, 1, 2, 3, 4 };
     const d18: expr_ast.Dec = .{ .precision = 18, .scale = 2 };
     var c0: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .dec, .dec = d18 } };
     var c1: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .dec, .dec = d18 } };
@@ -1137,6 +1142,21 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         .depth = 2,
         .dec = .{ .precision = 19, .scale = 2 },
     } };
+    var c4: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 4,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 0 },
+    } };
+    // DECIMAL(36, 2), in the checked 64-bit lane in a window whose products fit, else in i128.
+    const product: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &c0,
+        .right = &c4,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = .{ .precision = 36, .scale = 2 },
+    } };
     const calls = [_]AggCall{
         .{ .func = .sum, .arg = c0, .result = .dec, .where = null, .alias = "a" },
         .{ .func = .avg, .arg = c1, .result = .avg_dec, .where = null, .alias = "b" },
@@ -1144,6 +1164,7 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         .{ .func = .avg, .arg = c2, .result = .avg_dec, .where = null, .alias = "d" },
         .{ .func = .sum, .arg = c3, .result = .dec, .where = null, .alias = "e" },
         .{ .func = .sum, .arg = c1, .result = .dec, .where = null, .alias = "f" },
+        .{ .func = .sum, .arg = product, .result = .dec, .where = null, .alias = "g" },
         .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
     };
     var sel = try Sel.init(ra, n);
@@ -1175,6 +1196,7 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
             if (present) small[r] else null,
             huge[r],
             if (present) half[r] else null,
+            @as(i192, big[r]) * times[r],
         };
         for (row, 0..) |v, ai| if (v) |x| {
             want_sum[comp[r] * calls.len + ai] += x;
@@ -1194,8 +1216,100 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
     for (gids, 0..) |g, cp| {
         try std.testing.expectEqual(want_rows[cp], got.accumulators.items[g * calls.len + calls.len - 1].count);
     }
-    // The 64-bit lanes reach sums no 64-bit accumulator holds.
+    // The 64-bit lanes reach sums no 64-bit accumulator holds, and the windowed product one no i128 holds.
     try std.testing.expect(sizable);
+    try std.testing.expect(for (gids) |g| {
+        if (@abs(got.accumulators.items[g * calls.len + 6].sum_d.get()) > std.math.maxInt(i128)) break true;
+    } else false);
+}
+
+test "exact windows fail as the whole batch does, leaving the table as it leaves it" {
+    const old = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old;
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n = 1000;
+    const vals = try ra.alloc(i64, n);
+    const late = try ra.alloc(i128, n);
+    const early = try ra.alloc(i128, n);
+    const shadow = try ra.alloc(f64, n);
+    const comp = try ra.alloc(u32, n);
+    const near38: i128 = 9 * std.math.pow(i128, 10, 37);
+    for (vals, late, early, shadow, comp, 0..) |*v, *l, *e, *f, *c, r| {
+        v.* = @intCast(r);
+        // Doubled, each overflows 38 digits in one row: the second call's in the first window, the first's in the
+        // last, so windows meet the calls' errors in the opposite order to the whole batch.
+        l.* = if (r == n - 3) near38 else 1;
+        e.* = if (r == 5) near38 else 1;
+        f.* = 0;
+        c.* = @intCast(r % 3);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = vals, .unscaled = .{ .i64 = vals } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = late } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = early } } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    const d38: expr_ast.Dec = .{ .precision = 38, .scale = 0 };
+    const c0: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 0 },
+    } };
+    var c1: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 1,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = d38,
+    } };
+    var c2: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 2,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = d38,
+    } };
+    const twice_late: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c1,
+        .right = &c1,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = d38,
+    } };
+    const twice_early: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c2,
+        .right = &c2,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = d38,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = c0, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .sum, .arg = twice_late, .result = .dec, .where = null, .alias = "b" },
+        .{ .func = .avg, .arg = twice_early, .result = .avg_dec, .where = null, .alias = "c" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    const sel = try Sel.init(ra, n);
+    const gids = [_]u32{ 0, 1, 2 };
+    var tables: [2]agg.GroupTable = undefined;
+    for (&tables, [_]usize{ 0, 64 }) |*table, rows| {
+        expr_eval.forced_batch_rows = rows;
+        table.* = agg.GroupTable.init(a, 1 << 24);
+        for ([_][]const u8{ "a", "b", "c" }) |key| _ = try table.getOrInsert(key, &calls, 0);
+        try std.testing.expectError(
+            error.DecimalOverflow,
+            foldExactBatch(ra, a, table, &gids, comp, 3, &calls, &batch, &lookup, &sel),
+        );
+    }
+    defer for (&tables) |*table| table.deinit();
+    try std.testing.expectEqualDeep(tables[0].accumulators.items, tables[1].accumulators.items);
+    // The whole batch folds the first call before the second fails.
+    try std.testing.expect(tables[1].accumulators.items[0].sum_d.n != 0);
 }
 
 test "fused float sums match call-major row order" {
@@ -2023,81 +2137,208 @@ pub fn compositeFirstRows(
     return first;
 }
 
-/// Interleaved partials per composite in `narrowSums`: a run of rows in one composite adds into as many independent
+/// `foldExactBatch`'s SUM and AVG roots evaluated in L2-sized windows of rows, sized as `foldFloatBatches` sizes its
+/// own, so each expression lane stays in cache rather than streaming a row group's worth through DRAM. Windows
+/// change which of two failing roots fails first, so any failure clears `partials` and leaves every root to the
+/// whole-batch fold, which reports the error it always did; nothing reaches the table before that.
+fn foldExactWindows(
+    ra: std.mem.Allocator,
+    plan: *expr_eval.ExactPlan,
+    calls: []const AggCall,
+    roots: []const ?usize,
+    partials: []?[]agg.DecSum,
+    present: *?[]u64,
+    space: usize,
+    comp: []const u32,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) void {
+    // Any other call folds values of its own between the roots' evaluations.
+    for (calls) |call| if (call.arg != null and call.func != .sum and call.func != .avg) return;
+    const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) + space *| 32;
+    const rows = expr_eval.floatBatchRows(exactLiveBytesPerRow(plan), fixed, batch.expr_batch_rows);
+    if (rows == 0 or rows >= batch.num_rows) return;
+    // The cached values belong to the windows' scratch.
+    defer for (plan.nodes.items) |*node| {
+        node.value = null;
+    };
+    windowedSums(ra, plan, roots, partials, present, space, comp, batch, lookup, outer, rows) catch
+        @memset(partials, null);
+}
+
+fn windowedSums(
+    ra: std.mem.Allocator,
+    plan: *expr_eval.ExactPlan,
+    roots: []const ?usize,
+    partials: []?[]agg.DecSum,
+    present: *?[]u64,
+    space: usize,
+    comp: []const u32,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    rows: usize,
+) !void {
+    const accs = try ra.alloc(?NarrowAcc, plan.nodes.items.len);
+    @memset(accs, null);
+    for (roots) |root| if (root) |r| if (accs[r] == null) {
+        accs[r] = try NarrowAcc.init(ra, space, batch.num_rows);
+    };
+    const cols = try ra.alloc(Column, batch.cols.len);
+    var scratch = @import("../row_group_arena.zig").RowGroupArena.init(ra);
+    defer scratch.deinit();
+    var off: usize = 0;
+    while (off < batch.num_rows) {
+        scratch.nextRowGroup();
+        const a = scratch.allocator();
+        const n = @min(rows, batch.num_rows - off);
+        for (batch.cols, cols) |col, *out| out.* = try col.sliceRows(off, n);
+        const sel = try outer.alignedWindow(off, n);
+        const win: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .sel = &sel };
+        for (plan.nodes.items) |*node| node.value = null;
+        for (accs, 0..) |*acc, r| if (acc.*) |*ac| {
+            try ac.fold(comp[off..][0..n], try plan.evaluate(a, &win, lookup, r), &sel);
+        };
+        off += n;
+    }
+    for (accs, partials) |*acc, *p| if (acc.*) |*ac| {
+        try ac.finish(ra, present, comp, outer);
+        p.* = ac.delta;
+    };
+}
+
+/// An exact plan's bytes in flight per row: the composite and selection, then each node's lane and levels, at i128
+/// for an expression whose product may not fit 64 bits.
+fn exactLiveBytesPerRow(plan: *const expr_eval.ExactPlan) usize {
+    var bytes: usize = 8;
+    for (plan.nodes.items) |node| bytes += switch (node.expr) {
+        .literal => 8,
+        .col_ref => 12,
+        else => 20,
+    };
+    return bytes;
+}
+
+/// Interleaved partials per composite in `NarrowAcc`: a run of rows in one composite adds into as many independent
 /// slots, so no add waits on the store of the one before it.
 const sum_lanes = 4;
 
-/// Folds a 64-bit (or narrower) exact lane's selected non-null rows into `delta`, a zeroed `DecSum` per composite.
-/// Fewer than 2^64 values of magnitude at most 2^63 sum inside i128, so there is no bound to prove, and the 192-bit
-/// add runs once per composite rather than per row. Inactive and null rows add zero rather than branch.
-fn narrowSums(
-    ra: std.mem.Allocator,
+/// One exact root's sums per composite across a batch's windows, widened into `delta` once by `finish`. A 64-bit (or
+/// narrower) lane sums in i128: fewer than 2^64 values of magnitude at most 2^63 cannot leave it, so there is no
+/// bound to prove, and the 192-bit add runs once per composite rather than per row. Inactive and null rows add zero
+/// rather than branch. An i128 lane, which a checked 64-bit product falls back to, folds row by row as before.
+const NarrowAcc = struct {
+    /// Zeroed `DecSum` per composite.
     delta: []agg.DecSum,
-    comp: []const u32,
-    col: anytype,
-    sel: *const Sel,
-    /// Selected rows per composite, filled by the first interleaved lane without levels for the rest to reuse.
-    present: *?[]u64,
-) !void {
-    // Interleaved slots only within the free composite spaces, whose scratch stays within row-sized buffers.
-    if (delta.len <= MAX_COMPOSITE and delta.len * sum_lanes <= comp.len) {
-        if (present.*) |counts| if (col.def_levels == null) {
-            return narrowSumsLanes(false, ra, delta, comp, col, sel, counts);
-        };
-        const counts = try narrowSumsLanes(true, ra, delta, comp, col, sel, null);
-        if (col.def_levels == null) present.* = counts;
-        return;
-    }
-    // One slot per composite: the i128 sum runs in `lo` and the count in `n`, and no scratch is taken.
-    const V = std.meta.Elem(@TypeOf(col.values));
-    forEachWordRow(sel, comp.len, struct {
-        fn f(c: anytype, word: u64, r: usize) void {
-            var keep: u1 = @truncate(word >> @intCast(r % 64));
-            if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
-            const d = &c.delta[c.comp[r]];
-            d.lo +%= @bitCast(@as(i128, c.col.values[r] & -%@as(V, keep)));
-            d.n += keep;
-        }
-    }.f, .{ .delta = delta, .comp = comp, .col = col });
-    for (delta) |*d| d.hi = if (@as(i128, @bitCast(d.lo)) < 0) -1 else 0;
-}
+    /// `sum_lanes` partial sums per composite, or empty when `delta` takes the sums itself.
+    part: []i128,
+    /// Beside `part`: selected rows per slot the partials did not take, null rows and every row of an i128 window.
+    skipped: []u64,
+    /// Without `part`: whether `delta` holds whole `DecSum`s yet. Until then `lo` carries an i128 sum.
+    widened: bool = false,
 
-/// `narrowSums` in `sum_lanes` slots per composite. Counts its own rows when `counted` (returning those counts), and
-/// otherwise takes `shared`.
-fn narrowSumsLanes(
-    comptime counted: bool,
-    ra: std.mem.Allocator,
-    delta: []agg.DecSum,
-    comp: []const u32,
-    col: anytype,
-    sel: *const Sel,
-    shared: ?[]const u64,
-) !if (counted) []u64 else void {
-    const V = std.meta.Elem(@TypeOf(col.values));
-    const part = try ra.alloc(i128, delta.len * sum_lanes);
-    @memset(part, 0);
-    const cnt = if (counted) try ra.alloc(u64, delta.len * sum_lanes) else {};
-    if (counted) @memset(cnt, 0);
+    /// Interleaved slots only within the free composite spaces, where their scratch stays within row-sized buffers;
+    /// otherwise no scratch past `delta`, so a budgeted space stays within its reservation.
+    fn init(ra: std.mem.Allocator, space: usize, rows: usize) !NarrowAcc {
+        const delta = try ra.alloc(agg.DecSum, space);
+        @memset(delta, .{});
+        if (space > MAX_COMPOSITE or space * sum_lanes > rows) {
+            return .{ .delta = delta, .part = &.{}, .skipped = &.{} };
+        }
+        const part = try ra.alloc(i128, space * sum_lanes);
+        @memset(part, 0);
+        const skipped = try ra.alloc(u64, space * sum_lanes);
+        @memset(skipped, 0);
+        return .{ .delta = delta, .part = part, .skipped = skipped };
+    }
+
+    fn fold(self: *NarrowAcc, comp: []const u32, v: Column, sel: *const Sel) !void {
+        switch (v) {
+            inline .i32, .i64 => |col| {
+                const V = std.meta.Elem(@TypeOf(col.values));
+                const ctx = .{ .acc = self, .comp = comp, .col = col };
+                if (self.part.len != 0) forEachWordRow(sel, comp.len, struct {
+                    fn f(c: anytype, word: u64, r: usize) void {
+                        const active: u1 = @truncate(word >> @intCast(r % 64));
+                        var keep = active;
+                        if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+                        const slot = @as(usize, c.comp[r]) * sum_lanes + r % sum_lanes;
+                        c.acc.part[slot] += c.col.values[r] & -%@as(V, keep);
+                        if (c.col.def_levels != null) c.acc.skipped[slot] += active & ~keep;
+                    }
+                }.f, ctx) else if (!self.widened) forEachWordRow(sel, comp.len, struct {
+                    fn f(c: anytype, word: u64, r: usize) void {
+                        var keep: u1 = @truncate(word >> @intCast(r % 64));
+                        if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+                        const d = &c.acc.delta[c.comp[r]];
+                        d.lo +%= @bitCast(@as(i128, c.col.values[r] & -%@as(V, keep)));
+                        d.n += keep;
+                    }
+                }.f, ctx) else foldWide(self, comp, col, sel);
+            },
+            .i128 => |col| {
+                if (self.part.len == 0 and !self.widened) self.widen();
+                foldWide(self, comp, col, sel);
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    fn foldWide(self: *NarrowAcc, comp: []const u32, col: anytype, sel: *const Sel) void {
+        forEachWordRow(sel, comp.len, struct {
+            fn f(c: anytype, word: u64, r: usize) void {
+                const active: u1 = @truncate(word >> @intCast(r % 64));
+                var keep = active;
+                if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+                if (keep == 1) c.acc.delta[c.comp[r]].add(c.col.values[r], 1);
+                if (c.acc.part.len != 0) c.acc.skipped[@as(usize, c.comp[r]) * sum_lanes + r % sum_lanes] += active;
+            }
+        }.f, .{ .acc = self, .comp = comp, .col = col });
+    }
+
+    /// The i128 sums in `lo` as whole `DecSum`s.
+    fn widen(self: *NarrowAcc) void {
+        for (self.delta) |*d| d.hi = if (@as(i128, @bitCast(d.lo)) < 0) -1 else 0;
+        self.widened = true;
+    }
+
+    /// `present`: every composite's selected rows over the whole batch, counted once for every root with slots.
+    fn finish(self: *NarrowAcc, ra: std.mem.Allocator, present: *?[]u64, comp: []const u32, sel: *const Sel) !void {
+        if (self.part.len == 0) {
+            if (!self.widened) self.widen();
+            return;
+        }
+        const counts = present.* orelse counts: {
+            const c = try activeCounts(ra, comp, self.delta.len, sel);
+            present.* = c;
+            break :counts c;
+        };
+        for (self.delta, counts, 0..) |*d, active, cp| {
+            var sum: i128 = 0;
+            var skip: u64 = 0;
+            for (self.part[cp * sum_lanes ..][0..sum_lanes], self.skipped[cp * sum_lanes ..][0..sum_lanes]) |p, k| {
+                sum += p;
+                skip += k;
+            }
+            d.add(sum, active - skip);
+        }
+    }
+};
+
+/// Selected rows per composite, in `sum_lanes` interleaved slots like `NarrowAcc`'s.
+fn activeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u64 {
+    const slots = try ra.alloc(u64, space * sum_lanes);
+    @memset(slots, 0);
     forEachWordRow(sel, comp.len, struct {
         fn f(c: anytype, word: u64, r: usize) void {
-            var keep: u1 = @truncate(word >> @intCast(r % 64));
-            if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
-            const slot = @as(usize, c.comp[r]) * sum_lanes + r % sum_lanes;
-            c.part[slot] += c.col.values[r] & -%@as(V, keep);
-            if (counted) c.cnt[slot] += keep;
+            c.slots[@as(usize, c.comp[r]) * sum_lanes + r % sum_lanes] += @as(u1, @truncate(word >> @intCast(r % 64)));
         }
-    }.f, .{ .part = part, .cnt = cnt, .comp = comp, .col = col });
-    const counts = if (counted) try ra.alloc(u64, delta.len) else {};
-    for (delta, 0..) |*d, cp| {
-        var sum: i128 = 0;
-        for (part[cp * sum_lanes ..][0..sum_lanes]) |p| sum += p;
-        var n: u64 = undefined;
-        if (counted) {
-            n = 0;
-            for (cnt[cp * sum_lanes ..][0..sum_lanes]) |c| n += c;
-            counts[cp] = n;
-        } else n = shared.?[cp];
-        d.add(sum, n);
+    }.f, .{ .slots = slots, .comp = comp });
+    const counts = try ra.alloc(u64, space);
+    for (counts, 0..) |*c, cp| {
+        c.* = 0;
+        for (slots[cp * sum_lanes ..][0..sum_lanes]) |k| c.* += k;
     }
     return counts;
 }

@@ -403,9 +403,9 @@ fn details(src: *Source, col: *Column, cm: schema.ColumnMetaData) !void {
             col.detail_state = "malformed";
             break;
         }
-        const enc = if (h.data_page_header) |d| @tagName(d.encoding) else blk: {
-            if (h.data_page_header_v2) |d| break :blk @tagName(d.encoding);
-            if (h.dictionary_page_header) |d| break :blk @tagName(d.encoding);
+        const enc = if (h.data_page_header) |d| try encodingName(src.arena, d.encoding) else blk: {
+            if (h.data_page_header_v2) |d| break :blk try encodingName(src.arena, d.encoding);
+            if (h.dictionary_page_header) |d| break :blk try encodingName(src.arena, d.encoding);
             break :blk null;
         };
         try pages.append(src.arena, .{
@@ -418,6 +418,11 @@ fn details(src: *Source, col: *Column, cm: schema.ColumnMetaData) !void {
         off += r.pos + @as(usize, @intCast(h.compressed_page_size));
     }
     col.pages = try pages.toOwnedSlice(src.arena);
+}
+
+fn encodingName(arena: std.mem.Allocator, encoding: schema.Encoding) ![]const u8 {
+    return std.enums.tagName(schema.Encoding, encoding) orelse
+        try std.fmt.allocPrint(arena, "UNKNOWN({d})", .{@backingInt(encoding)});
 }
 
 pub fn inspect(arena: std.mem.Allocator, env: std.process.Environ, path: []const u8, detail: bool) !Report {
@@ -440,7 +445,7 @@ pub fn inspect(arena: std.mem.Allocator, env: std.process.Environ, path: []const
             const cm = chunk.meta_data orelse return error.EncryptedMetadataUnsupported;
             const elem = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.BadMetadata;
             const encs = try arena.alloc([]const u8, cm.encodings.items.len);
-            for (cm.encodings.items, encs) |e, *name| name.* = @tagName(e);
+            for (cm.encodings.items, encs) |e, *name| name.* = try encodingName(arena, e);
             const st = cm.statistics;
             var lo = try bound(
                 arena,

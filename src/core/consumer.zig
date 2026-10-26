@@ -127,12 +127,14 @@ threadlocal var decode_site: ?DecodeSite = null;
 pub fn enterChunk(rg: *const schema.RowGroup, column: usize) void {
     decode_site = .{ .rg = rg, .column = column };
     page_mod.last_page = null;
+    page_mod.last_encoding = null;
 }
 
 /// This thread's decode site, with the page it last began, for a worker to hand over with its error.
 pub fn decodeFailure() ?DecodeSite {
     var site = decode_site orelse return null;
     site.page = page_mod.last_page;
+    site.encoding = page_mod.last_encoding;
     return site;
 }
 
@@ -140,6 +142,7 @@ pub fn decodeFailure() ?DecodeSite {
 pub fn setDecodeFailure(site: ?DecodeSite) void {
     decode_site = site;
     page_mod.last_page = if (site) |s| s.page else null;
+    page_mod.last_encoding = if (site) |s| s.encoding else null;
 }
 
 /// After a failure ended a query over `metas`, whose `inputs` each have a `name`: this thread's decode site as the
@@ -166,7 +169,13 @@ pub fn resolveDecodeFailure(diag: ?*Diag, metas: []const schema.FileMetaData, in
         }
         break;
     };
-    d.detail = .{ .decode = .{ .input = inputs[file].name, .row_group = rg, .column = path, .page = site.page } };
+    d.detail = .{ .decode = .{
+        .input = inputs[file].name,
+        .row_group = rg,
+        .column = path,
+        .page = site.page,
+        .encoding = site.encoding,
+    } };
 }
 
 /// Errors raised by reading a column chunk's pages, whose message names where: the corrupt or unsupported encodings

@@ -118,6 +118,7 @@ fn decodeColumnNanos(
             .DICTIONARY_PAGE => {
                 if (dict_i64 != null or data_seen) return error.UnexpectedDictionaryPage;
                 const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
+                if (dh.encoding != .PLAIN and dh.encoding != .PLAIN_DICTIONARY) return error.UnsupportedEncoding;
                 const dict_count: usize = @intCast(dh.num_values);
                 const expected_bytes = dict_count * INT96_WIDTH;
                 if (pg.bytes.len < expected_bytes) return error.ShortDecode;
@@ -164,6 +165,7 @@ fn decodeDataPage(
     var encoding: schema.Encoding = .PLAIN;
     if (pg.header.type == .DATA_PAGE) {
         const dph = pg.header.data_page_header orelse return error.UnexpectedPage;
+        try page_mod.checkV1LevelEncodings(dph, levels);
         page_num_values = @intCast(dph.num_values);
         encoding = dph.encoding;
     } else {

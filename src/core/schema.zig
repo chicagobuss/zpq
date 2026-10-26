@@ -354,6 +354,8 @@ pub const Encoding = enum(i32) {
     DELTA_BYTE_ARRAY = 7,
     RLE_DICTIONARY = 8,
     BYTE_STREAM_SPLIT = 9,
+    ALP = 10,
+    _,
 };
 
 pub const CompressionCodec = enum(i32) {
@@ -2396,4 +2398,54 @@ test "dropForeignDeprecatedBounds keeps a mirrored pair and drops one a foreign 
         try std.testing.expectEqual(c.st.max_value, st.max_value);
     }
     try std.testing.expect(std.mem.startsWith(u8, ZPQ_CREATED_BY, "zpq version "));
+}
+
+test "ALP and unknown encoding ids survive metadata and every page header" {
+    const a = std.testing.allocator;
+    for ([_]i32{ 10, 12345, -17 }) |id| {
+        const encoding = std.enums.fromInt(Encoding, id).?;
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        w.writeStructBegin();
+        try w.writeFieldListBegin(2, .I32, 1);
+        try w.writeZigZag(id);
+        try w.writeStructEnd();
+        var r = thrift.Reader.init(w.bytes());
+        var cm = try ColumnMetaData.read(a, &r);
+        defer cm.deinit(a);
+        try std.testing.expectEqual(encoding, cm.encodings.items[0]);
+        var round = thrift.Writer.init(a);
+        defer round.deinit();
+        try cm.write(&round);
+        var rr = thrift.Reader.init(round.bytes());
+        var again = try ColumnMetaData.read(a, &rr);
+        defer again.deinit(a);
+        try std.testing.expectEqual(id, @backingInt(again.encodings.items[0]));
+        const d1 = DataPageHeader{
+            .num_values = 1,
+            .encoding = encoding,
+            .definition_level_encoding = encoding,
+            .repetition_level_encoding = encoding,
+        };
+        var v1 = thrift.Writer.init(a);
+        defer v1.deinit();
+        try d1.write(&v1);
+        var r1 = thrift.Reader.init(v1.bytes());
+        const h1 = try DataPageHeader.read(&r1);
+        try std.testing.expectEqual(encoding, h1.encoding);
+        try std.testing.expectEqual(encoding, h1.definition_level_encoding);
+        try std.testing.expectEqual(encoding, h1.repetition_level_encoding);
+        var dict = thrift.Writer.init(a);
+        defer dict.deinit();
+        try (DictionaryPageHeader{ .num_values = 1, .encoding = encoding, .is_sorted = null }).write(&dict);
+        var rd = thrift.Reader.init(dict.bytes());
+        try std.testing.expectEqual(encoding, (try DictionaryPageHeader.read(&rd)).encoding);
+        var v2 = thrift.Writer.init(a);
+        defer v2.deinit();
+        v2.writeStructBegin();
+        try v2.writeFieldI32(4, id);
+        try v2.writeStructEnd();
+        var r2 = thrift.Reader.init(v2.bytes());
+        try std.testing.expectEqual(encoding, (try DataPageHeaderV2.read(&r2)).encoding);
+    }
 }

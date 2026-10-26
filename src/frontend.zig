@@ -320,6 +320,15 @@ fn decodeError(err: anyerror, diag: *const Diag) void {
     const at = diag.detail.decode;
     var page_buf: [24]u8 = undefined;
     const page = if (at.page) |p| std.fmt.bufPrint(&page_buf, ", page {d}", .{p}) catch "" else "";
+    if (err == error.UnsupportedEncoding) if (at.encoding) |encoding| {
+        const name = std.enums.tagName(zpq.core.schema.Encoding, encoding) orelse "UNKNOWN";
+        diagnosticPrint("zpq query: cannot decode input file {s}\n" ++
+            "  row group {d}, column `{s}`{s}:\n" ++
+            "  unsupported encoding {s} (id {d}) (UnsupportedEncoding)\n", .{
+            at.input, at.row_group, at.column.get(), page, name, @backingInt(encoding),
+        });
+        return;
+    };
     diagnosticPrint("zpq query: cannot decode input file {s}\n  row group {d}, column `{s}`{s}:\n  {s} ({s})\n", .{
         at.input, at.row_group, at.column.get(), page, decodeCause(err), @errorName(err),
     });

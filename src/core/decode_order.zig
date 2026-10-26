@@ -9,6 +9,7 @@ pub const Site = struct {
     rg: *const schema.RowGroup,
     column: usize,
     page: ?u32 = null,
+    encoding: ?schema.Encoding = null,
     // An unverified execution marker must not sort ahead of a reproduced page.
     first_row: usize = std.math.maxInt(usize),
     projection: usize = std.math.maxInt(usize),
@@ -100,6 +101,7 @@ fn makeSite(in: anytype, ci: usize, page: ?u32) Site {
         .rg = in.rg,
         .column = ci,
         .page = page,
+        .encoding = @import("parquet/page.zig").last_encoding,
         .first_row = firstRow(in.rg, in.src, ci, page),
         .projection = if (in.error_order) |order| order[ci] else ci,
     };

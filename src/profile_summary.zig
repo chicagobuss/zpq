@@ -584,6 +584,8 @@ fn shortEncoding(v: u64) []const u8 {
         .DELTA_LENGTH_BYTE_ARRAY => "DELTA_LEN",
         .DELTA_BYTE_ARRAY => "DELTA_BA",
         .BYTE_STREAM_SPLIT => "BSS",
+        .ALP => "ALP",
+        else => "?",
     };
 }
 

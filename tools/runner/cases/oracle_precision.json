@@ -59,12 +59,40 @@
         3
       ],
       "oracle_note": "Exact signed i32 day arithmetic; Arrow and DuckDB overflow i64 microseconds for this Spark row."
+    },
+    {
+      "id": "precision:alp-supported-count",
+      "kind": "sql_ordered",
+      "fixture": "alp",
+      "sql": "SELECT count(float_plain) AS n FROM '{path}'",
+      "jobs": [
+        1,
+        3
+      ],
+      "duck": "SELECT 9024 AS n",
+      "oracle_note": "PyArrow confirms 9024 non-null values. DuckDB 2.0 cannot parse the ALP source footer; CLI regressions compare projected values and both strict readbacks."
+    },
+    {
+      "id": "precision:alp-declared-refusal",
+      "kind": "sql_ordered",
+      "fixture": "alp",
+      "sql": "SELECT sum(float_alp_1024) AS s FROM '{path}'",
+      "expected_error": "UnsupportedEncoding",
+      "expect": "unsupported encoding ALP (id 10)",
+      "jobs": [
+        1,
+        3
+      ]
     }
   ],
   "fixture_files": [
     {
       "name": "int96_signed",
       "path": "ci/fixtures/parquet/int96_from_spark.parquet"
+    },
+    {
+      "name": "alp",
+      "path": "ci/fixtures/parquet/alp_extended.zstd.parquet"
     }
   ]
 }

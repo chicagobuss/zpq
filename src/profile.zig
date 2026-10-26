@@ -944,7 +944,7 @@ pub const Profiler = struct {
 
 pub fn enumName(comptime E: type, v: u64) []const u8 {
     const e = std.enums.fromInt(E, v) orelse return "?";
-    return @tagName(e);
+    return std.enums.tagName(E, e) orelse "?";
 }
 
 /// `s` as a quoted JSON string under the Lambda's JSON policy (`engine.writeJsonString`): escapes, and every byte
@@ -1024,16 +1024,17 @@ pub fn chunkEncoding(encodings: []const schema.Encoding) schema.Encoding {
     return if (encodings.len > 0) encodings[0] else .PLAIN;
 }
 
+// Type slots in the profile wire layout are one byte; future i32 IDs must not spill into the adjacent slot.
 pub fn chunkTypes(codec: schema.CompressionCodec, encoding: schema.Encoding, physical: schema.Type) u64 {
     return @as(u64, @intCast(@backingInt(codec))) |
-        (@as(u64, @intCast(@backingInt(encoding))) << 8) |
+        (@as(u64, std.math.cast(u8, @backingInt(encoding)) orelse 0xff) << 8) |
         (@as(u64, @intCast(@backingInt(physical))) << 16);
 }
 
 pub fn pageTypes(codec: schema.CompressionCodec, page_type: schema.PageType, encoding: ?schema.Encoding) u64 {
     return @as(u64, @intCast(@backingInt(codec))) |
         (@as(u64, @intCast(@backingInt(page_type))) << 8) |
-        (@as(u64, if (encoding) |e| @intCast(@backingInt(e)) else 0xff) << 16);
+        (@as(u64, if (encoding) |e| std.math.cast(u8, @backingInt(e)) orelse 0xff else 0xff) << 16);
 }
 
 pub fn httpFlags(status: u16, attempts: u8, reused: bool) u64 {

@@ -3,6 +3,7 @@
 import base64
 from decimal import Decimal
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -473,8 +474,65 @@ def int96_signed_days(tmp):
     assert sorted(readback) == expected, readback
 
 
+def unsupported_encodings(tmp):
+    src = FIXTURES / 'alp_extended.zstd.parquet'
+    for detail in [[], ['--detail']]:
+        p = subprocess.run([ZPQ, 'inspect', str(src), '--format', 'json', *detail],
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0 and 'ALP' in p.stdout, (p.returncode, p.stderr, p.stdout)
+        json.loads(p.stdout)
+    # The PLAIN columns of the same file remain queryable; every written result has two strict readbacks.
+    cols = ['float_plain', 'double_plain']
+    expected = pq.read_table(src, columns=cols)
+    out = tmp / 'alp-plain.parquet'
+    query(src, '--columns', ','.join(cols), '-o', str(out))
+    def values(table):
+        return {k: ['nan' if v is not None and math.isnan(v) else v for v in vals]
+                for k, vals in table.to_pydict().items()}
+    assert pq.read_table(out).schema == expected.schema
+    assert values(pq.read_table(out)) == values(expected)
+    got = duckdb.connect().execute('SELECT * FROM read_parquet(?)', [str(out)]).to_arrow_table()
+    assert values(got) == values(expected), got
+    for column in ['float_alp_1024', 'double_alp_4096']:
+        p = query(src, '--columns', column, ok=False)
+        assert 'unsupported encoding ALP (id 10)' in p.stderr and 'UnsupportedEncoding' in p.stderr, p.stderr
+        assert 'BadMetadata' not in p.stderr, p.stderr
+    # Future enum values must be inspectable and reach the same refusal, including with profiling enabled.
+    sys.path.insert(0, str(FIXTURES.parents[2] / 'tools'))
+    from datagen.parquet import Reader, T_STRUCT, field, rewrite_footer, write_value
+    for encoding_id in [31, -17]:
+        unknown = tmp / f'unknown-encoding-{encoding_id}.parquet'
+        unknown.write_bytes(src.read_bytes())
+        def edit(meta, body):
+            for rg in field(meta, 4)[2][1]:
+                for column, chunk in enumerate(field(rg, 1)[2][1]):
+                    cm = field(chunk, 3)[2]
+                    encodings = field(cm, 2)[2][1]
+                    encodings[:] = [encoding_id if e == 10 else e for e in encodings]
+                    start = field(cm, 9)[2]
+                    parser = Reader(body[start:])
+                    header = parser.value(T_STRUCT)
+                    data_header = field(header, 5) or field(header, 8)
+                    enc = field(data_header[2], 2 if field(header, 5) else 4)
+                    if enc[2] == 10:
+                        enc[2] = encoding_id
+                    if column == 0:
+                        field(data_header[2], 3)[2] = encoding_id
+                    encoded = write_value(T_STRUCT, header)
+                    assert len(encoded) == parser.pos
+                    body[start:start + parser.pos] = encoded
+        rewrite_footer(unknown, edit)
+        p = subprocess.run([ZPQ, 'inspect', str(unknown), '--detail', '--format', 'json'],
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0 and f'UNKNOWN({encoding_id})' in p.stdout, (p.returncode, p.stderr, p.stdout)
+        p = query(unknown, '--columns', 'float_alp_1024', '--profile', str(tmp / 'unknown.trace.json'), ok=False)
+        assert f'unsupported encoding UNKNOWN (id {encoding_id})' in p.stderr, p.stderr
+        p = query(unknown, '--columns', 'float_plain', ok=False)
+        assert f'unsupported encoding UNKNOWN (id {encoding_id})' in p.stderr, p.stderr
+
 with tempfile.TemporaryDirectory(prefix='zpq-formats-') as directory:
     int96_signed_days(Path(directory))
+    unsupported_encodings(Path(directory))
     logical_annotations(Path(directory))
     binary_text(Path(directory))
     repeated_fields(Path(directory))

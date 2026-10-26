@@ -88,7 +88,13 @@ pub const Detail = union(enum) {
     /// `column`, page `page` (0 the first, a dictionary page counted) when known. Set on any failure past the first
     /// decode, so a frontend reads it only for a decode error (`consumer.isDecodeError`); it leaves `Diag.column` and
     /// `Diag.input` to the error they describe.
-    decode: struct { input: []const u8, row_group: usize, column: Text, page: ?u32 },
+    decode: struct {
+        input: []const u8,
+        row_group: usize,
+        column: Text,
+        page: ?u32,
+        encoding: ?@import("schema.zig").Encoding = null,
+    },
     /// The S3 request behind the error failed: which one, at what point, and how.
     s3_request: S3Failure,
 };

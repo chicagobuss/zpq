@@ -1352,6 +1352,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         fn installDictionary(self: *Self, pg: page_mod.Page) Error!void {
             if (self.dictionary != null or self.data_page_seen) return error.UnexpectedDictionaryPage;
             const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
+            if (dh.encoding != .PLAIN and dh.encoding != .PLAIN_DICTIONARY) return error.UnsupportedEncoding;
             const num: usize = @intCast(dh.num_values);
             // BOOLEAN never gets dictionary encoding in practice — the
             // type's tiny cardinality makes it pointless. Reject early.
@@ -1398,6 +1399,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
         fn installDataPageDecoder(self: *Self, pg: page_mod.Page) Error!void {
             self.data_page_seen = true;
             const dph = pg.header.data_page_header orelse return error.UnexpectedPage;
+            try page_mod.checkV1LevelEncodings(dph, self.levels);
 
             const num_values: usize = @intCast(dph.num_values);
             try self.beginPage(num_values);

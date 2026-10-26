@@ -13519,3 +13519,24 @@ test "FdSink segments keep one contiguous writeback range across page and vector
     try std.testing.expectEqual(@as(u64, (128 << 20) + 12), sink.written);
     try std.testing.expectEqual(@as(u64, 128 << 20), sink.writeback_to);
 }
+
+test "ALP metadata opens and only a decoded ALP column refuses" {
+    const path = "ci/fixtures/parquet/alp_extended.zstd.parquet";
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var plain = try runQuery(ctx, .{
+        .inputs = &.{path},
+        .aggregate = "count(float_plain) AS n",
+    });
+    defer plain.deinit(gpa);
+    try std.testing.expect(plain.aggregate.output.aggs[0].value.i > 0);
+    var diag: Diag = .{};
+    try std.testing.expectError(error.UnsupportedEncoding, runQuery(ctx, .{
+        .inputs = &.{path},
+        .aggregate = "sum(float_alp_1024) AS s",
+        .diag = &diag,
+        .scan_all = true,
+    }));
+    try std.testing.expect(diag.detail == .decode);
+    try std.testing.expectEqual(schema.Encoding.ALP, diag.detail.decode.encoding.?);
+}

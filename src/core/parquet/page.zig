@@ -120,6 +120,20 @@ pub const DecodeScratch = struct {
 /// The ordinal in its column chunk (0 the first, a dictionary page counted) of the page this thread last began to
 /// read: where a decode error was raised, for its message (`consumer.decodeFailure`).
 pub threadlocal var last_page: ?u32 = null;
+/// Encoding of that page, copied into the failure site before a worker exits.
+pub threadlocal var last_encoding: ?schema.Encoding = null;
+
+/// V1 declares level encodings independently of values; never interpret an unfamiliar one as RLE.
+pub fn checkV1LevelEncodings(header: schema.DataPageHeader, levels: schema.Levels) error{UnsupportedEncoding}!void {
+    const unsupported = if (levels.max_rep > 0 and header.repetition_level_encoding != .RLE)
+        header.repetition_level_encoding
+    else if (levels.max_def > 0 and header.definition_level_encoding != .RLE)
+        header.definition_level_encoding
+    else
+        return;
+    last_encoding = unsupported;
+    return error.UnsupportedEncoding;
+}
 
 pub const PageReader = struct {
     /// The full column chunk bytes (compressed pages back-to-back).
@@ -185,12 +199,19 @@ pub const PageReader = struct {
     pub fn next(self: *PageReader) Error!?Page {
         if (self.pos >= self.chunk.len) return null;
         last_page = self.ordinal;
+        last_encoding = null;
         self.ordinal +|= 1;
 
         // Parse the thrift-encoded header. Reader.pos tells us how
         // many bytes we consumed.
         var rdr = thrift.Reader.init(self.chunk[self.pos..]);
         const header = schema.PageHeader.read(&rdr) catch return error.BadPageHeader;
+        last_encoding = switch (header.type) {
+            .DATA_PAGE => if (header.data_page_header) |h| h.encoding else null,
+            .DATA_PAGE_V2 => if (header.data_page_header_v2) |h| h.encoding else null,
+            .DICTIONARY_PAGE => if (header.dictionary_page_header) |h| h.encoding else null,
+            .INDEX_PAGE => null,
+        };
         const header_size = rdr.pos;
 
         if (header.compressed_page_size < 0 or header.uncompressed_page_size < 0) {

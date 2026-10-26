@@ -246,12 +246,15 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## 8. Malformed-file test fixtures (Apache Parquet testing data, Hardwood)
+## 8. Test fixtures (Apache Parquet testing data, Hardwood)
 
-Three small files in `ci/fixtures/parquet/` are copied unmodified for regression tests:
+Files in `ci/fixtures/parquet/` are copied unmodified for regression tests:
 
 - `ARROW-GH-43605.parquet`, `ARROW-RS-GH-6229-DICTHEADER.parquet` from Apache parquet-testing (`bad_data/`, commit
   1a2a751). **Home page**: https://github.com/apache/parquet-testing. **Copyright**: The Apache Software Foundation.
+- `alp_extended.zstd.parquet` from Apache parquet-testing (`data/`, commit
+  3acde70509f990c4ddfe34bf3ab05890657e766c). **Home page**: https://github.com/apache/parquet-testing.
+  **Copyright**: The Apache Software Foundation.
 - `negative_data_page_offset.parquet` from Hardwood (`core/src/test/resources/`, commit d116cc32). **Home page**:
   https://github.com/hardwood-hq/hardwood. **Copyright**: The original authors.
 

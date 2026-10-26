@@ -384,7 +384,7 @@ fn chargedScratch(space: usize, calls: []const AggCall) usize {
     return bytes;
 }
 /// Per-call (composite × code) histograms above this fall back to the per-row typed fold.
-const MAX_HIST: usize = 1 << 20;
+pub const MAX_HIST: usize = 1 << 20;
 
 /// Distinct values past which a plain string key is left as it is.
 const max_coded_plain = 256;

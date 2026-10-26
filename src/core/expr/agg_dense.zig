@@ -343,9 +343,22 @@ pub fn numericFits(ids: usize, calls: []const AggCall) bool {
         ids *| (@sizeOf(u64) +| calls.len *| @sizeOf(Accumulator)) <= hw.l2BytesPerWorkerOr(256 << 10);
 }
 
-/// Per-id row-group scratch; decoded columns, selections and expression DAGs use the ordinary batch reservation.
+/// Numeric row-group scratch, including capped coded-argument histograms and any widened dictionary copy.
+/// Decoded columns, selections and expression DAGs use the ordinary batch reservation.
 pub fn numericScratchBytes(ids: usize, calls: []const AggCall) usize {
-    return ids *| (@sizeOf(u32) +| calls.len *| (@sizeOf(agg.DecSum) + @sizeOf(i64) + @sizeOf(u64)));
+    var bytes = ids *| @sizeOf(u32);
+    for (calls) |call| {
+        var call_bytes = ids *| (@sizeOf(agg.DecSum) + @sizeOf(i64) + @sizeOf(u64));
+        if (call.arg) |arg| if (arg == .col_ref and !agg_coded.floatSum(call)) {
+            const widened = if (arg.col_ref.expr_type == .i64 and arg.col_ref.physical_type == .INT32)
+                agg_coded.MAX_HIST / @max(1, ids) * @sizeOf(i64)
+            else
+                0;
+            call_bytes = @max(call_bytes, agg_coded.MAX_HIST * @sizeOf(u64) +| widened);
+        };
+        bytes +|= call_bytes;
+    }
+    return bytes;
 }
 
 pub fn countBytes(rows: u64) usize {
@@ -679,6 +692,7 @@ pub const Lanes = struct {
     global_ordinals: bool = false,
     partials: []i64 = &.{},
     touched: []u32 = &.{},
+    ordered_last: u64 = unseen,
 
     fn allocated(l: *const Lanes) bool {
         return l.first.len != 0 or l.compact_sums.len != 0;
@@ -763,6 +777,7 @@ pub const Lanes = struct {
         l.compact_sums = &.{};
         l.partials = &.{};
         l.touched = &.{};
+        l.ordered_last = unseen;
     }
 
     fn ensurePartials(l: *Lanes, gpa: std.mem.Allocator) !void {
@@ -867,7 +882,9 @@ pub const Lanes = struct {
             .input_rows = source.input_rows,
             .limit = l.rows,
         };
-        if (source.input_rows != null) {
+        if (orderSensitive(l.calls)) {
+            _ = try l.orderedEnd(ordinals, rows);
+        } else if (source.input_rows != null) {
             for (0..rows) |r| _ = try ordinals.at(r);
         } else if (rows != 0) _ = try ordinals.at(rows - 1);
         const bindings = try ra.alloc(CountAxis, keys.len);
@@ -912,6 +929,22 @@ pub const Lanes = struct {
         return true;
     }
 
+    fn orderedEnd(l: *const Lanes, ordinals: RowOrdinals, rows: usize) !?u64 {
+        if (!orderSensitive(l.calls) or rows == 0) return null;
+        var previous = l.ordered_last;
+        if (ordinals.input_rows != null) {
+            for (0..rows) |r| {
+                const ordinal = try ordinals.at(r);
+                if (previous != unseen and ordinal <= previous) return error.ExceededMemoryBudget;
+                previous = ordinal;
+            }
+            return previous;
+        }
+        const first = try ordinals.at(0);
+        if (previous != unseen and first <= previous) return error.ExceededMemoryBudget;
+        return try ordinals.at(rows - 1);
+    }
+
     fn foldNumeric(
         l: *Lanes,
         ra: std.mem.Allocator,
@@ -923,6 +956,7 @@ pub const Lanes = struct {
         sel: *const Sel,
     ) !void {
         try (SelectedBatch{ .batch = batch, .selected = sel }).validate();
+        const last = try l.orderedEnd(ordinals, batch.num_rows);
         try l.ensure(gpa);
         const comp = try ra.alloc(u32, batch.num_rows);
         @memset(comp, 0);
@@ -944,8 +978,9 @@ pub const Lanes = struct {
         if (failure) |e| return e;
         const gids = try ra.alloc(u32, l.domain.ids());
         for (gids, 0..) |*gid, id| gid.* = @intCast(id);
-        if (try foldExactNumeric(ra, gpa, l.accs, gids, comp, l.calls, batch, lookup, sel)) return;
-        try agg_coded.foldDenseCalls(ra, gpa, l.accs, gids, comp, l.calls, batch, lookup, sel);
+        if (!try foldExactNumeric(ra, gpa, l.accs, gids, comp, l.calls, batch, lookup, sel))
+            try agg_coded.foldDenseCalls(ra, gpa, l.accs, gids, comp, l.calls, batch, lookup, sel);
+        if (last) |ordinal| l.ordered_last = ordinal;
     }
 
     fn foldSum(
@@ -1815,6 +1850,151 @@ test "dense numeric selected DECIMAL keeps 192-bit cancellation and gathered ori
     try testing.expectEqualDeep(lane.accumulator(id, 0).sum_d, lane.accumulator(id, 1).avg_d);
     try testing.expectEqual(@as(?i128, 9), lane.integer(id, 2));
     try testing.expectEqual(@as(u64, 1000), lane.firstOrdinal(id));
+}
+
+test "dense selected floats reject reordered gathers and callback overlap before touching lanes" {
+    const a = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const fixture = Fixture.domain();
+    var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    const keys = [_]expr_ast.Expr{ .{ .col_ref = Fixture.key }, .{ .col_ref = Fixture.key } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = arg, .result = .f64, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = arg, .result = .avg_f64, .where = null, .alias = "a" },
+    };
+    var lane: Lanes = .{ .domain = &domain, .calls = &calls, .rows = 20, .global_ordinals = true };
+    defer lane.deinit(a);
+    var cols = [_]Column{
+        .{ .i64 = .{ .values = &.{}, .codes = &.{ 0, 0, 0 }, .dict = &Fixture.dict0 } },
+        .{ .f64 = .{ .values = &.{ 1e16, -1e16, 1 } } },
+    };
+    var batch: filter_eval.Batch = .{ .num_rows = 3, .cols = &cols };
+    var no_alloc = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for ([_][3]u32{ .{ 0, 2, 1 }, .{ 0, 0, 2 } }) |rows| {
+        try testing.expectError(error.ExceededMemoryBudget, lane.foldSelected(
+            no_alloc.allocator(),
+            no_alloc.allocator(),
+            &keys,
+            0,
+            0,
+            .{ .batch = &batch, .input_rows = &rows },
+            &.{ 0, 1 },
+        ));
+        try testing.expectEqual(@as(usize, 0), lane.accs.len);
+        try testing.expectEqual(@as(usize, 0), lane.first.len);
+        try testing.expectEqual(unseen, lane.ordered_last);
+    }
+    try testing.expect(!no_alloc.has_induced_failure);
+    cols[1].f64.values = &.{ 1e16, 1, -1e16 };
+    try testing.expect(try lane.foldSelected(ra, a, &keys, 0, 0, .{
+        .batch = &batch,
+        .input_rows = &.{ 0, 1, 2 },
+    }, &.{ 0, 1 }));
+    const id = Fixture.t0[0] * (axes[0].ids() + 1);
+    try testing.expectEqualDeep(Accumulator{ .sum_f = 0 }, lane.accumulator(id, 0));
+    try testing.expectEqualDeep(Accumulator{ .avg = .{ .sum = 0, .count = 3 } }, lane.accumulator(id, 1));
+    try testing.expectEqual(@as(u64, 2), lane.ordered_last);
+    const states = try ra.dupe(Accumulator, lane.accs);
+    const first = try ra.dupe(u64, lane.first);
+    for ([_][3]u32{ .{ 2, 4, 5 }, .{ 0, 1, 2 }, .{ 4, 6, 5 } }) |rows| {
+        try testing.expectError(error.ExceededMemoryBudget, lane.foldSelected(
+            no_alloc.allocator(),
+            no_alloc.allocator(),
+            &keys,
+            0,
+            0,
+            .{ .batch = &batch, .input_rows = &rows },
+            &.{ 0, 1 },
+        ));
+        try testing.expectEqualDeep(states, lane.accs);
+        try testing.expectEqualSlices(u64, first, lane.first);
+        try testing.expectEqual(@as(u64, 2), lane.ordered_last);
+    }
+    cols[0].i64.codes = &.{ 0, 0 };
+    cols[1].f64.values = &.{ 2, 3 };
+    batch.num_rows = 2;
+    try testing.expect(try lane.foldSelected(ra, a, &keys, 0, 0, .{
+        .batch = &batch,
+        .input_base = 10,
+        .input_rows = &.{ 0, 3 },
+    }, &.{ 0, 1 }));
+    try testing.expectEqualDeep(Accumulator{ .sum_f = 5 }, lane.accumulator(id, 0));
+    try testing.expectEqualDeep(Accumulator{ .avg = .{ .sum = 5, .count = 5 } }, lane.accumulator(id, 1));
+    try testing.expectEqual(@as(u64, 13), lane.ordered_last);
+    try testing.expectError(error.ExceededMemoryBudget, lane.foldSelected(
+        no_alloc.allocator(),
+        no_alloc.allocator(),
+        &keys,
+        0,
+        0,
+        .{ .batch = &batch, .input_base = 12 },
+        &.{ 0, 1 },
+    ));
+    try testing.expect(!no_alloc.has_induced_failure);
+    try testing.expectEqualDeep(Accumulator{ .sum_f = 5 }, lane.accumulator(id, 0));
+}
+
+test "dense numeric scratch covers tracked capped coded histograms and INT32 dictionary widening" {
+    const a = testing.allocator;
+    const ids = 16;
+    const rows = 129;
+    inline for (.{ i32, i64 }) |T| {
+        var setup: std.heap.ArenaAllocator = .init(a);
+        defer setup.deinit();
+        const dict = try setup.allocator().alloc(T, agg_coded.MAX_HIST / ids);
+        for (dict, 0..) |*value, i| value.* = @as(T, @intCast(i)) - 32768;
+        const arg: expr_ast.Expr = .{ .col_ref = .{
+            .col_idx = 0,
+            .physical_type = if (T == i32) .INT32 else .INT64,
+            .expr_type = .i64,
+        } };
+        const calls = [_]AggCall{
+            .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "s" },
+            .{ .func = .avg, .arg = arg, .result = .avg_f64, .where = null, .alias = "a" },
+            Fixture.calls[0],
+        };
+        try testing.expect(numericFits(ids, &calls));
+        var codes: [rows]u32 = undefined;
+        var comp: [rows]u32 = undefined;
+        var gids: [ids]u32 = undefined;
+        var accs: [ids * calls.len]Accumulator = undefined;
+        for (&codes, &comp, 0..) |*code, *cp, r| {
+            code.* = @intCast(r * 101 % dict.len);
+            cp.* = @intCast(r % ids);
+        }
+        for (&gids, 0..) |*gid, i| {
+            gid.* = @intCast(i);
+            for (calls, accs[i * calls.len ..][0..calls.len]) |call, *acc| acc.* = .init(call);
+        }
+        const col: Column = if (T == i32)
+            .{ .i32 = .{ .values = &.{}, .dict = dict, .codes = &codes } }
+        else
+            .{ .i64 = .{ .values = &.{}, .dict = dict, .codes = &codes } };
+        const batch: filter_eval.Batch = .{ .num_rows = rows, .cols = &.{col} };
+        var sel = try Sel.init(setup.allocator(), rows);
+        var scratch: std.heap.ArenaAllocator = .init(a);
+        defer scratch.deinit();
+        var tracked = testing.FailingAllocator.init(scratch.allocator(), .{});
+        try agg_coded.foldDenseCalls(tracked.allocator(), a, &accs, &gids, &comp, &calls, &batch, &.{0}, &sel);
+        try testing.expect(tracked.allocated_bytes >= 2 * agg_coded.MAX_HIST * @sizeOf(u64));
+        try testing.expect(tracked.allocated_bytes <= numericScratchBytes(ids, &calls));
+        for (0..ids) |id| {
+            var sum: i128 = 0;
+            var count: u64 = 0;
+            for (codes, comp) |code, cp| if (cp == id) {
+                sum += dict[code];
+                count += 1;
+            };
+            try testing.expectEqualDeep(Accumulator{ .sum_i = sum }, accs[id * calls.len]);
+            const average: Accumulator = .{ .avg = .{ .sum = 0, .isum = sum, .count = count } };
+            try testing.expectEqualDeep(average, accs[id * calls.len + 1]);
+            try testing.expectEqualDeep(Accumulator{ .count = count }, accs[id * calls.len + 2]);
+        }
+    }
 }
 
 test "dense numeric cache refusal allocates no lanes and quotes all per-id scratch" {

@@ -64,6 +64,9 @@ pub const DecodeScratch = struct {
     /// Ticket of the reader whose turn it is, and the last ticket issued. Safe builds only.
     owner: Ticket = no_ticket,
     issued: Ticket = no_ticket,
+    /// Sliced-scan page and survivor buffers for this worker. Null on a slot scratch and until the first sliced row
+    /// group. Freed here, when the worker releases its scratch, which is what gives the ledger's charge back.
+    slice: ?*SliceScratch = null,
 
     pub const dict_align = 16;
 
@@ -92,6 +95,12 @@ pub const DecodeScratch = struct {
     }
 
     pub fn deinit(self: *DecodeScratch) void {
+        if (self.slice) |pool| {
+            const alloc = pool.alloc;
+            self.slice = null;
+            pool.deinit();
+            alloc.destroy(pool);
+        }
         self.gpa.free(self.page);
         self.gpa.free(self.dict);
         self.gpa.free(self.def_levels);
@@ -115,7 +124,169 @@ pub const DecodeScratch = struct {
         }
         return buf.*[0..n];
     }
+
+    /// Drop a buffer grown past `bound` bytes. The next page allocates again; the spike is not kept.
+    pub fn releaseAbove(self: *DecodeScratch, bound: usize) void {
+        self.releaseBuf(u8, 1, &self.page, bound);
+        self.releaseBuf(u8, dict_align, &self.dict, bound);
+        self.releaseBuf(u32, @alignOf(u32), &self.def_levels, bound);
+        self.releaseBuf(u32, @alignOf(u32), &self.rep_levels, bound);
+    }
+
+    fn releaseBuf(
+        self: *DecodeScratch,
+        comptime T: type,
+        comptime alignment: usize,
+        buf: *[]align(alignment) T,
+        bound: usize,
+    ) void {
+        if (buf.len * @sizeOf(T) <= bound) return;
+        self.gpa.free(buf.*);
+        buf.* = &.{};
+    }
 };
+
+/// Page buffers and the survivor mask of one worker's sliced scans. One slot per column in flight, grown to the
+/// largest page that column has decompressed and then reused for every later row group. `alloc` is the ledger's
+/// charged allocator when the scan has one: a buffer is drawn when it grows, and the draw stands until `deinit` (the
+/// worker's release), which unmaps it. Safe builds fill a reused page with `reuse_poison` so a decoder that handed
+/// back stale bytes fails instead of agreeing with itself.
+pub const SliceScratch = struct {
+    pub const reuse_poison: u8 = 0xA5;
+
+    alloc: std.mem.Allocator,
+    slots: std.ArrayList(Slot) = .empty,
+    /// Next slot `checkout` hands out. `rewind` at the start of a pass, while no reader still holds a slot.
+    next: usize = 0,
+    survivors: []u64 = &.{},
+    /// Filter slices and payload slices stay apart: each pass sizes itself from its own high water.
+    values: std.heap.ArenaAllocator = undefined,
+    values_on: bool = false,
+    scan_values: std.heap.ArenaAllocator = undefined,
+    scan_on: bool = false,
+
+    pub const Slot = struct {
+        scratch: DecodeScratch,
+        pages: std.heap.ArenaAllocator,
+
+        fn prepareReuse(self: *Slot) void {
+            if (std.debug.runtime_safety) {
+                @memset(self.scratch.page, reuse_poison);
+                @memset(self.scratch.dict, reuse_poison);
+                @memset(std.mem.sliceAsBytes(self.scratch.def_levels), reuse_poison);
+                @memset(std.mem.sliceAsBytes(self.scratch.rep_levels), reuse_poison);
+            }
+            _ = self.pages.reset(.retain_capacity);
+        }
+    };
+
+    pub fn init(alloc: std.mem.Allocator) SliceScratch {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *SliceScratch) void {
+        for (self.slots.items) |*slot| {
+            slot.scratch.deinit();
+            slot.pages.deinit();
+        }
+        self.slots.deinit(self.alloc);
+        self.alloc.free(self.survivors);
+        if (self.values_on) self.values.deinit();
+        if (self.scan_on) self.scan_values.deinit();
+        self.* = undefined;
+    }
+
+    /// Make room for `n` more checkouts. Call before the pass's readers exist: growing the slot list moves it.
+    pub fn reserve(self: *SliceScratch, n: usize) !void {
+        try self.slots.ensureTotalCapacity(self.alloc, self.next + n);
+    }
+
+    pub fn rewind(self: *SliceScratch) void {
+        self.next = 0;
+    }
+
+    pub fn checkout(self: *SliceScratch) *Slot {
+        if (self.next < self.slots.items.len) {
+            const slot = &self.slots.items[self.next];
+            self.next += 1;
+            slot.prepareReuse();
+            return slot;
+        }
+        self.slots.appendAssumeCapacity(.{
+            .scratch = .init(self.alloc),
+            .pages = .init(self.alloc),
+        });
+        self.next += 1;
+        return &self.slots.items[self.next - 1];
+    }
+
+    /// Words for a row group's survivor mask, grown to the widest group and not freed before `deinit`.
+    pub fn survivorWords(self: *SliceScratch, n_rows: usize) ![]u64 {
+        const words: usize = if (n_rows == 0) 0 else (n_rows + 63) / 64;
+        if (self.survivors.len < words) {
+            const n = @max(words, self.survivors.len + self.survivors.len / 2);
+            const fresh = try self.alloc.alloc(u64, n);
+            self.alloc.free(self.survivors);
+            self.survivors = fresh;
+        }
+        return self.survivors[0..words];
+    }
+
+    /// Decoded slice values and per-slice selections. Reset between slices; the chunks stay until `deinit`.
+    pub fn valueArena(self: *SliceScratch) *std.heap.ArenaAllocator {
+        if (!self.values_on) {
+            self.values = .init(self.alloc);
+            self.values_on = true;
+        }
+        return &self.values;
+    }
+
+    /// Payload slices. Separate from `valueArena` so a filter pass's high water is not this pass's row size.
+    pub fn scanArena(self: *SliceScratch) *std.heap.ArenaAllocator {
+        if (!self.scan_on) {
+            self.scan_values = .init(self.alloc);
+            self.scan_on = true;
+        }
+        return &self.scan_values;
+    }
+
+    /// At the end of a row group, give back buffers past `bound`. `bound` is the ledger's one-decode allowance
+    /// (`lean_decode`): a wider page is a spike for this group, and the next group starts from that allowance.
+    pub fn trimAbove(self: *SliceScratch, bound: usize) void {
+        for (self.slots.items) |*slot| {
+            slot.scratch.releaseAbove(bound);
+            _ = slot.pages.reset(.{ .retain_with_limit = bound });
+        }
+        if (self.survivors.len * @sizeOf(u64) > bound) {
+            self.alloc.free(self.survivors);
+            self.survivors = &.{};
+        }
+        if (self.values_on) _ = self.values.reset(.{ .retain_with_limit = bound });
+        if (self.scan_on) _ = self.scan_values.reset(.{ .retain_with_limit = bound });
+    }
+};
+
+test "scratch above the decode allowance is released at row-group end" {
+    var pool = SliceScratch.init(std.testing.allocator);
+    defer pool.deinit();
+    try pool.reserve(1);
+    const slot = pool.checkout();
+    // Call sites pass `core_memory.lean_decode`, the ledger's one-decode allowance. A page is enough to prove
+    // the release.
+    const bound = std.heap.pageSize();
+    const big = bound + 1;
+    _ = try slot.scratch.ensure(u8, 1, &slot.scratch.page, big);
+    try std.testing.expect(slot.scratch.page.len > bound);
+    const arena = pool.scanArena();
+    _ = try arena.allocator().alloc(u8, big);
+    try std.testing.expect(slot.pages.queryCapacity() <= bound);
+    try std.testing.expect(arena.queryCapacity() > bound);
+    pool.trimAbove(bound);
+    try std.testing.expect(slot.scratch.page.len <= bound);
+    try std.testing.expect(arena.queryCapacity() <= bound);
+    _ = try slot.scratch.ensure(u8, 1, &slot.scratch.page, 64);
+    try std.testing.expect(slot.scratch.page.len >= 64);
+}
 
 /// The ordinal in its column chunk (0 the first, a dictionary page counted) of the page this thread last began to
 /// read: where a decode error was raised, for its message (`consumer.decodeFailure`).
@@ -455,6 +626,47 @@ test "page headers with negative or inconsistent counts are rejected before any 
     // Two hostile i64 offsets whose difference overflows.
     var pr = PageReader.init("", .UNCOMPRESSED, arena);
     try testing.expectError(error.UnexpectedEndOfChunk, pr.seekToPage(std.math.maxInt(i64), -10));
+}
+
+test "slice scratch keeps page and survivor bytes charged until release" {
+    var budget: core_memory.SharedBudget = .{ .limit = 1 << 20 };
+    var charged: core_memory.Charged = .{ .child = testing.allocator, .budget = &budget };
+    const alloc = charged.allocator();
+    const pool = try alloc.create(SliceScratch);
+    pool.* = .init(alloc);
+    try pool.reserve(2);
+    const first = pool.checkout();
+    const page = try first.scratch.ensure(u8, 1, &first.scratch.page, 128);
+    @memset(page, 1);
+    const kept = first.scratch.page.ptr;
+    const drawn = budget.used.load(.monotonic);
+    try testing.expect(drawn >= 128);
+    const second = pool.checkout();
+    try testing.expect(first != second);
+    pool.rewind();
+    try testing.expectEqual(drawn, budget.used.load(.monotonic));
+    const again = pool.checkout();
+    try testing.expectEqual(kept, again.scratch.page.ptr);
+    if (std.debug.runtime_safety) try testing.expectEqual(SliceScratch.reuse_poison, again.scratch.page[0]);
+    const words = try pool.survivorWords(64);
+    try testing.expectEqual(@as(usize, 1), words.len);
+    const wide = try pool.survivorWords(10_000);
+    try testing.expect(wide.len >= (10_000 + 63) / 64);
+    try testing.expect(budget.used.load(.monotonic) >= drawn);
+    const held = budget.used.load(.monotonic);
+    const values = pool.valueArena();
+    _ = try values.allocator().alloc(u8, 4096);
+    try testing.expect(budget.used.load(.monotonic) > held);
+    const after_values = budget.used.load(.monotonic);
+    _ = values.reset(.retain_capacity);
+    try testing.expectEqual(after_values, budget.used.load(.monotonic));
+    const scan = pool.scanArena();
+    _ = try scan.allocator().alloc(u8, 2048);
+    try testing.expect(budget.used.load(.monotonic) > after_values);
+    _ = scan.reset(.retain_capacity);
+    pool.deinit();
+    alloc.destroy(pool);
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
 // ----- File-read helper duplicated from metadata.zig tests -----

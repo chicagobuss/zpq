@@ -66,6 +66,7 @@ const huge_pages = @import("huge_pages.zig");
 
 pub const DecodeOptions = column_mod.DecodeOptions;
 pub const DecodeScratch = column_mod.DecodeScratch;
+pub const SliceScratch = page_mod.SliceScratch;
 pub const RowGroupArena = @import("row_group_arena.zig").RowGroupArena;
 
 /// Error set the consumer functions can return. Inferred from the
@@ -1006,6 +1007,8 @@ pub const SliceReader = struct {
     /// In place for the reader's life: a reader holds pointers into itself once it has decoded.
     raw: *Raw,
     scratch: *DecodeScratch,
+    /// The scratch and page arena belong to the worker's `SliceScratch` and outlive this reader.
+    retained: bool = false,
     /// A byte-array reader's page allocations, reset whenever a page is drained.
     pages: *std.heap.ArenaAllocator,
     /// Holds a byte-array dictionary for the chunk, copied off `pages` once installed.
@@ -1047,6 +1050,33 @@ pub const SliceReader = struct {
         ci: usize,
         decode_options_in: DecodeOptions,
     ) !?SliceReader {
+        return open(a, gpa, rg, meta, src, ci, decode_options_in, null);
+    }
+
+    /// As `init`, drawing the page scratch from `pool` so the next row group reuses it.
+    pub fn initPooled(
+        a: std.mem.Allocator,
+        gpa: std.mem.Allocator,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        src: RGSrc,
+        ci: usize,
+        decode_options_in: DecodeOptions,
+        pool: *SliceScratch,
+    ) !?SliceReader {
+        return open(a, gpa, rg, meta, src, ci, decode_options_in, pool);
+    }
+
+    fn open(
+        a: std.mem.Allocator,
+        gpa: std.mem.Allocator,
+        rg: *const schema.RowGroup,
+        meta: *const schema.FileMetaData,
+        src: RGSrc,
+        ci: usize,
+        decode_options_in: DecodeOptions,
+        pool: ?*SliceScratch,
+    ) !?SliceReader {
         if (!supports(rg, meta, ci)) return null;
         enterChunk(rg, ci);
         const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
@@ -1065,11 +1095,19 @@ pub const SliceReader = struct {
         const buf_off = start - @as(usize, @intCast(src.byte_origin));
         if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
         const chunk = src.bytes[buf_off .. buf_off + len];
-        const scratch = try a.create(DecodeScratch);
-        scratch.* = .init(gpa);
-        errdefer scratch.deinit();
-        const pages = try a.create(std.heap.ArenaAllocator);
-        pages.* = .init(gpa);
+        const slot = if (pool) |p| p.checkout() else null;
+        const scratch = if (slot) |s| &s.scratch else blk: {
+            const created = try a.create(DecodeScratch);
+            created.* = .init(gpa);
+            break :blk created;
+        };
+        errdefer if (slot == null) scratch.deinit();
+        const pages = if (slot) |s| &s.pages else blk: {
+            const created = try a.create(std.heap.ArenaAllocator);
+            created.* = .init(gpa);
+            break :blk created;
+        };
+        errdefer if (slot == null) pages.deinit();
         const raw = try a.create(Raw);
         raw.* = switch (cm.type) {
             inline .INT32, .INT64, .FLOAT, .DOUBLE, .BOOLEAN => |t| blk: {
@@ -1102,6 +1140,7 @@ pub const SliceReader = struct {
         return .{
             .raw = raw,
             .scratch = scratch,
+            .retained = slot != null,
             .pages = pages,
             .held = a,
             .levels = levels,
@@ -1123,8 +1162,13 @@ pub const SliceReader = struct {
     }
 
     pub fn deinit(self: *SliceReader) void {
-        self.scratch.deinit();
-        self.pages.deinit();
+        if (self.retained) {
+            // The next reader of this slot must not see this chunk's page bytes.
+            _ = self.pages.reset(.retain_capacity);
+        } else {
+            self.scratch.deinit();
+            self.pages.deinit();
+        }
         if (self.page_budget) |b| {
             b.release(self.held_drawn);
             switch (self.raw.*) {
@@ -1166,6 +1210,10 @@ pub const SliceReader = struct {
     /// Between probe units no value refers to the drained page. Keep only its decoded dictionary.
     pub fn releaseProbePage(self: *SliceReader) void {
         invariant.assert(self.pageLeft() == 0);
+        if (self.retained) {
+            _ = self.pages.reset(.retain_capacity);
+            return;
+        }
         _ = self.pages.reset(.free_all);
         const s = self.scratch;
         s.gpa.free(s.page);
@@ -1420,6 +1468,8 @@ pub const SliceReader = struct {
     /// and given back as `pages` is reset, rather than on an arena that draws a node half again past each one. Right
     /// after `init`, before any page is read.
     pub fn chargePages(self: *SliceReader, raw: std.mem.Allocator, budget: *core_memory.SharedBudget) void {
+        // Replacing `pages` would drop a retained slot's buffers without returning their charge.
+        std.debug.assert(!self.retained);
         switch (self.raw.*) {
             .bytes => |*r| {
                 self.pages.* = .init(raw);
@@ -3318,9 +3368,14 @@ fn dropRegion(ws: AggWorkspace) void {
     const r = ws.region orelse return;
     if (ws.rg_arena.region == null) {
         const prof = ws.scratch.prof;
+        // The slice pool is drawn from the ledger, beside the region. Dropping the region rewinds the scratch
+        // the pool hangs off; the pool itself stays mapped until the worker releases it.
+        const kept = ws.scratch.slice;
+        ws.scratch.slice = null;
         ws.scratch.deinit();
         ws.scratch.* = .init(r.allocator());
         ws.scratch.prof = prof;
+        ws.scratch.slice = kept;
         ws.rg_arena.deinit();
         ws.rg_arena.* = .init(r.allocator());
     }
@@ -4386,6 +4441,60 @@ fn scanRGForAggImpl(
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time (`SliceReader`), each slice on memory of its own:
 /// for a row group too big for a worker's share of `budget`. The rows the outer filter kept; null, having done
 /// nothing, when some column has no sliced form.
+/// The worker's sliced page and survivor scratch, created on `alloc` (the ledger's charged allocator when there is
+/// one) and freed with the worker's `DecodeScratch`.
+fn slicePool(ws: AggWorkspace, alloc: std.mem.Allocator) !*SliceScratch {
+    if (ws.scratch.slice) |pool| return pool;
+    const pool = try alloc.create(SliceScratch);
+    pool.* = .init(alloc);
+    ws.scratch.slice = pool;
+    return pool;
+}
+
+/// The pool on `slot`, charged to `alloc`. A later job whose allocator is a different ledger drops the old pool
+/// first, so its charge is that job's and the previous ledger sees the free.
+pub fn poolOn(slot: *?*SliceScratch, alloc: std.mem.Allocator) !*SliceScratch {
+    if (slot.*) |pool| {
+        if (pool.alloc.ptr == alloc.ptr and pool.alloc.vtable == alloc.vtable) return pool;
+        releaseSlicePool(slot);
+    }
+    const pool = try alloc.create(SliceScratch);
+    pool.* = .init(alloc);
+    slot.* = pool;
+    return pool;
+}
+
+test "a slice pool follows the allocator of the current job" {
+    // Two arenas, not `page_allocator`: its `.ptr` is undefined, and comparing that is illegal.
+    var first = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer first.deinit();
+    var second = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer second.deinit();
+    var slot: ?*SliceScratch = null;
+    defer releaseSlicePool(&slot);
+    const a_alloc = first.allocator();
+    const b_alloc = second.allocator();
+    const a = try poolOn(&slot, a_alloc);
+    const again = try poolOn(&slot, a_alloc);
+    try std.testing.expect(again == a);
+    try a.reserve(1);
+    const b = try poolOn(&slot, b_alloc);
+    try std.testing.expect(b != a);
+    try std.testing.expect(b.alloc.ptr == b_alloc.ptr);
+    try std.testing.expect(b.alloc.vtable == b_alloc.vtable);
+    const again_b = try poolOn(&slot, b_alloc);
+    try std.testing.expect(again_b == b);
+}
+
+/// Give back a pool created for a write or a print, including its ledger charge.
+pub fn releaseSlicePool(slot: *?*SliceScratch) void {
+    const pool = slot.* orelse return;
+    const alloc = pool.alloc;
+    slot.* = null;
+    pool.deinit();
+    alloc.destroy(pool);
+}
+
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.
 fn filterSurvivors(
     a: std.mem.Allocator,
@@ -4396,19 +4505,29 @@ fn filterSurvivors(
     num_rows: usize,
     ws: AggWorkspace,
 ) !?filter_selection.SelectionVector {
-    var survivors = try filter_selection.SelectionVector.init(a, num_rows);
+    const pool = try slicePool(ws, side);
+    var n_readers: usize = 0;
+    for (in.read, payload, 0..) |needed, late, ci| {
+        if (!needed or late or ci >= in.rg.columns.items.len) continue;
+        n_readers += 1;
+    }
+    pool.rewind();
+    try pool.reserve(n_readers);
+    const words = try pool.survivorWords(num_rows);
+    var survivors = filter_selection.SelectionVector.borrowed(words, num_rows);
     var readers: std.ArrayList(SliceReader) = .empty;
     defer for (readers.items) |*r| r.deinit();
     const lookup = try a.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
     for (in.read, payload, 0..) |needed, late, ci| {
         if (!needed or late or ci >= in.rg.columns.items.len) continue;
-        const r = try SliceReader.init(a, side, in.rg, in.meta, in.src, ci, decode_options) orelse return null;
+        const r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, decode_options, pool) orelse
+            return null;
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
     }
-    var slice = std.heap.ArenaAllocator.init(side);
-    defer slice.deinit();
+    const slice = pool.valueArena();
+    defer _ = slice.reset(.retain_capacity);
     // A memory granule over the filter's own columns; it never changes which rows survive.
     const step: usize = 1 << 16;
     var done: usize = 0;
@@ -4439,6 +4558,9 @@ fn scanRGSliced(
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
+    const pool = try slicePool(ws, side);
+    // lean_decode is the ledger's one-decode allowance. Wider page scratch is a spike for this row group.
+    defer pool.trimAbove(core_memory.lean_decode);
     var pages = std.heap.ArenaAllocator.init(side);
     defer pages.deinit();
     var readers: std.ArrayList(SliceReader) = .empty;
@@ -4455,6 +4577,15 @@ fn scanRGSliced(
     var survivors: filter_selection.SelectionVector = undefined;
     if (payload) |p| survivors = (try filterSurvivors(pages.allocator(), side, in, decode_options, p, num_rows, ws)) orelse
         return null;
+    var n_readers: usize = 0;
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
+        n_readers += 1;
+    }
+    // The filter pass has released its readers. The same slots decode the payload.
+    pool.rewind();
+    try pool.reserve(n_readers);
     for (in.read, 0..) |needed, ci| {
         if (!needed or ci >= in.rg.columns.items.len) continue;
         // The first pass already validated and evaluated filter-only columns. Keep only the values the consumer
@@ -4466,7 +4597,7 @@ fn scanRGSliced(
         if (payload) |p| if (p[ci]) {
             options.row_gate = &survivors;
         };
-        var r = try SliceReader.init(pages.allocator(), side, in.rg, in.meta, in.src, ci, options) orelse
+        var r = try SliceReader.initPooled(pages.allocator(), side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
         if (levels_only[ci]) r.levelsOnly();
         if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
@@ -4502,8 +4633,10 @@ fn scanRGSliced(
     // (nothing is on it by now: the row group starts over here), whose blocks are what the slice asked for; an
     // `ArenaAllocator` reserves past that, and its reservation was charged as if used.
     const on_region = ws.region != null and ws.rg_arena.region != null;
-    var slice = std.heap.ArenaAllocator.init(side);
-    defer slice.deinit();
+    // Retained across row groups. A later group's first slice may see an earlier group's high water, so its
+    // bytes-per-row comes out high and the next slice gets smaller; it does not come out low.
+    const slice = pool.scanArena();
+    defer _ = slice.reset(.retain_capacity);
     var took: ?usize = null;
     var matched: u64 = 0;
     while (done < num_rows) {
@@ -8502,6 +8635,73 @@ test "a key chunk whose statistics claim no nulls but holds one declines the fir
         next += 1;
     };
     try testing.expectEqualSlices(i64, &.{ 400, 100, 300, 200 }, got.dict);
+}
+
+fn expectSameColumn(want: filter_eval.Batch.Column, got: filter_eval.Batch.Column) !void {
+    const testing = std.testing;
+    try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+    switch (want) {
+        inline else => |w, tag| {
+            const g = @field(got, @tagName(tag));
+            const T = @typeInfo(@TypeOf(w.values)).pointer.child;
+            try testing.expectEqual(w.values.len, g.values.len);
+            if (T == []const u8) {
+                for (w.values, g.values) |x, y| try testing.expectEqualStrings(x, y);
+                try testing.expectEqual(w.dict.len, g.dict.len);
+                for (w.dict, g.dict) |x, y| try testing.expectEqualStrings(x, y);
+            } else {
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w.values), std.mem.sliceAsBytes(g.values));
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w.dict), std.mem.sliceAsBytes(g.dict));
+            }
+            if (w.codes) |c| try testing.expectEqualSlices(u32, c, g.codes.?) else try testing.expect(g.codes == null);
+            if (w.def_levels) |d|
+                try testing.expectEqualSlices(u32, d, g.def_levels.?)
+            else
+                try testing.expect(g.def_levels == null);
+        },
+    }
+}
+
+test "a pooled slice reader reuses its page and decodes the same rows" {
+    const testing = std.testing;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/topn_gather_a.parquet", testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(bytes);
+    var meta = try metadata.open(testing.allocator, bytes);
+    defer meta.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+    const rg = &meta.row_groups.items[1];
+    var pool = SliceScratch.init(testing.allocator);
+    defer pool.deinit();
+    try pool.reserve(1);
+    for (0..rg.columns.items.len) |ci| {
+        var owned = (try SliceReader.init(a, testing.allocator, rg, &meta, src, ci, .{})).?;
+        defer owned.deinit();
+        const n: usize = @intCast(rg.num_rows);
+        const want = try owned.next(a, n);
+        pool.rewind();
+        var pooled = (try SliceReader.initPooled(a, testing.allocator, rg, &meta, src, ci, .{}, &pool)).?;
+        const got = try pooled.next(a, n);
+        try expectSameColumn(want, got);
+        const page_ptr = pooled.scratch.page.ptr;
+        const page_len = pooled.scratch.page.len;
+        pooled.deinit();
+        pool.rewind();
+        if (page_len > 0) {
+            const slot = pool.checkout();
+            try testing.expectEqual(page_ptr, slot.scratch.page.ptr);
+            if (std.debug.runtime_safety) try testing.expectEqual(SliceScratch.reuse_poison, slot.scratch.page[0]);
+            pool.rewind();
+        }
+        var again = (try SliceReader.initPooled(a, testing.allocator, rg, &meta, src, ci, .{}, &pool)).?;
+        defer again.deinit();
+        try expectSameColumn(want, try again.next(a, n));
+    }
 }
 
 test "SliceReader.skip reads the rows after it as decoding every row would, passing whole pages unread" {

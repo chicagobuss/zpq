@@ -21,18 +21,27 @@ pub const SelectionVector = struct {
     allocator: std.mem.Allocator,
     len: usize,
     mask: []u64,
+    /// False when `mask` belongs to a retained scratch: `deinit` must not free it.
+    owned: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, len: usize) !SelectionVector {
         const num_words = (len + 63) / 64;
         const mask = try allocator.alloc(u64, num_words);
-        // Initialize as all active.
-        @memset(mask, ~@as(u64, 0));
-        // Clear extra bits in the final word so popcount is correct.
-        const extra = num_words * 64 - len;
-        if (extra > 0) {
-            mask[num_words - 1] &= ~@as(u64, 0) >> @intCast(extra);
-        }
+        paintAll(mask, len);
         return .{ .allocator = allocator, .len = len, .mask = mask };
+    }
+
+    /// All rows active, in a mask the caller keeps. `mask` is `(len + 63) / 64` words.
+    pub fn borrowed(mask: []u64, len: usize) SelectionVector {
+        std.debug.assert(mask.len == (len + 63) / 64);
+        paintAll(mask, len);
+        return .{ .allocator = undefined, .len = len, .mask = mask, .owned = false };
+    }
+
+    fn paintAll(mask: []u64, len: usize) void {
+        @memset(mask, ~@as(u64, 0));
+        const extra = mask.len * 64 - len;
+        if (extra > 0) mask[mask.len - 1] &= ~@as(u64, 0) >> @intCast(extra);
     }
 
     /// Borrow whole mask words. A partial final word is valid only at the original selection's end.
@@ -41,7 +50,12 @@ pub const SelectionVector = struct {
         if (lo % 64 != 0 or lo > self.len or n > self.len - lo or
             (n % 64 != 0 and n != self.len - lo) or self.mask.len < (self.len + 63) / 64)
             return error.UnalignedSelectionWindow;
-        return .{ .allocator = self.allocator, .len = n, .mask = self.mask[lo / 64 ..][0 .. (n + 63) / 64] };
+        return .{
+            .allocator = self.allocator,
+            .len = n,
+            .mask = self.mask[lo / 64 ..][0 .. (n + 63) / 64],
+            .owned = false,
+        };
     }
 
     /// Visits active row indices, clipping padding and borrowed storage to the logical row count.
@@ -68,7 +82,7 @@ pub const SelectionVector = struct {
     };
 
     pub fn deinit(self: *SelectionVector) void {
-        self.allocator.free(self.mask);
+        if (self.owned) self.allocator.free(self.mask);
         self.* = undefined;
     }
 
@@ -281,4 +295,15 @@ test "SelectionVector iterator clips dirty padding and extra words" {
     empty.len = 0;
     it = empty.iterator();
     try testing.expectEqual(@as(?usize, null), it.next());
+}
+
+test "a borrowed selection does not free its words" {
+    const mask = try testing.allocator.alloc(u64, 2);
+    var sel = SelectionVector.borrowed(mask, 100);
+    try testing.expect(sel.isActive(0));
+    try testing.expect(sel.isActive(99));
+    sel.set(3, false);
+    try testing.expect(!sel.isActive(3));
+    sel.deinit();
+    testing.allocator.free(mask);
 }

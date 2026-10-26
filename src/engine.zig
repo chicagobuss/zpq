@@ -2096,12 +2096,20 @@ const WinCtx = struct {
     lean: ?*core_memory.Charged = null,
     /// The one of them the row group being sliced draws from.
     slicing_now: ?*core_memory.Charged = null,
+    /// Page buffers for sliced row groups, kept for the write and released with it.
+    slice_pool: ?*consumer.SliceScratch = null,
     /// Pieces and encodings are fresh memory, waiting or worked on whole: in huge pages, a fault per 2 MiB rather
     /// than per 4 KiB. One advisor per child, at a fixed address, as the arenas over them hold it until they are freed.
     piece_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
     slicing_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
     lean_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
     encode_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
+
+    /// The write's sliced page buffers, charged to the allocator of the current job. A later row group on another
+    /// ledger (the write's, or the lean one beside it) gets a new pool so the previous ledger sees the free.
+    fn writerSlicePool(w: *WinCtx, alloc: std.mem.Allocator) !*consumer.SliceScratch {
+        return consumer.poolOn(&w.slice_pool, alloc);
+    }
 
     /// What a deferred row group's slices draw from (`slicing`, `lean`): the writer alone has the write's ledger and
     /// the slack's room past it. Beside producers still fetching it has the write's ledger while that holds more than
@@ -2280,9 +2288,16 @@ const SliceReaders = struct {
         self.lookup = try pa.alloc(?usize, w.fetch_arr.len);
         @memset(self.lookup, null);
         const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
+        const pool = try w.writerSlicePool(gpa);
+        var n_cols: usize = 0;
+        for (w.fetch_arr, 0..) |needed, ci| {
+            if (needed and ci < job.rg.columns.items.len) n_cols += 1;
+        }
+        pool.rewind();
+        try pool.reserve(n_cols);
         for (w.fetch_arr, 0..) |needed, ci| {
             if (!needed or ci >= job.rg.columns.items.len) continue;
-            var r = try consumer.SliceReader.init(pa, gpa, job.rg, job.meta, src, ci, w.decode_options) orelse
+            var r = try consumer.SliceReader.initPooled(pa, gpa, job.rg, job.meta, src, ci, w.decode_options, pool) orelse
                 return error.UnsupportedColumnType; // `sliceRG` checked every column
             errdefer r.deinit();
             if (skip > 0) {
@@ -2307,6 +2322,8 @@ const SliceReaders = struct {
 /// its rows, down to one, before the write is refused. None of this shows in the output, whose row groups the
 /// assembler cuts from the rows alone.
 fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assembler) !void {
+    // Same allowance as the scan: page scratch past one decode is a spike for this row group.
+    defer if (w.slice_pool) |pool| pool.trimAbove(core_memory.lean_decode);
     const gpa = if (w.slicing_now) |m| m.allocator() else w.gpa;
     const rg = job.rg;
     const num_rows: usize = @intCast(@max(0, rg.num_rows));
@@ -3623,6 +3640,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
             w.cpu_budget = sizing.budget;
             w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
             defer w.piece_pool.deinit();
+            defer consumer.releaseSlicePool(&w.slice_pool);
             w.piece_pages.child = w.outAlloc();
             w.slicing_pages.child = slicing.allocator();
             w.lean_pages.child = lean.allocator();
@@ -8711,6 +8729,8 @@ const SlicedPrint = struct {
     force: bool = false,
     /// Where the rows each slice read and kept are counted: only slices read count, as printing stops at the limit.
     counts: *consumer.Timings,
+    /// Retained across the print's row groups when set. Null keeps the scratch for this row group only.
+    scratch: ?*?*consumer.SliceScratch = null,
 };
 
 /// Print `rg` a slice of rows at a time when its decoded columns would take more than `o.budget`, or a limit is set:
@@ -8749,6 +8769,21 @@ fn printRowGroupSliced(
         return false;
     }
 
+    var local_slot: ?*consumer.SliceScratch = null;
+    const slot = o.scratch orelse &local_slot;
+    defer if (o.scratch == null) consumer.releaseSlicePool(slot);
+    const pool = if (slot.*) |p| p else blk: {
+        const p = try gpa.create(consumer.SliceScratch);
+        p.* = .init(gpa);
+        slot.* = p;
+        break :blk p;
+    };
+    var n_cols: usize = 0;
+    for (fetch_arr, 0..) |needed, ci| {
+        if (needed and ci < rg.columns.items.len) n_cols += 1;
+    }
+    pool.rewind();
+    try pool.reserve(n_cols);
     var pages = std.heap.ArenaAllocator.init(gpa);
     defer pages.deinit();
     var readers: std.ArrayList(consumer.SliceReader) = .empty;
@@ -8757,8 +8792,16 @@ fn printRowGroupSliced(
     @memset(lookup, null);
     for (fetch_arr, 0..) |needed, ci| {
         if (!needed or ci >= rg.columns.items.len) continue;
-        const r = try consumer.SliceReader.init(pages.allocator(), gpa, rg, meta, src, ci, o.decode_options) orelse
-            unreachable; // every column was checked above
+        const r = try consumer.SliceReader.initPooled(
+            pages.allocator(),
+            gpa,
+            rg,
+            meta,
+            src,
+            ci,
+            o.decode_options,
+            pool,
+        ) orelse unreachable; // every column was checked above
         lookup[ci] = readers.items.len;
         try readers.append(pages.allocator(), r);
     }
@@ -8769,11 +8812,12 @@ fn printRowGroupSliced(
     var slice_rows = if (wanted) |w| std.math.clamp(w *| 2, @min(64, max_rows), max_rows) else max_rows;
 
     var done: usize = 0;
+    const slice = pool.valueArena();
+    defer _ = slice.reset(.retain_capacity);
     while (done < num_rows) {
         if (o.limit) |lim| if (o.total_printed.* >= lim) break;
         const n = @min(slice_rows, num_rows - done);
-        var slice = std.heap.ArenaAllocator.init(gpa);
-        defer slice.deinit();
+        _ = slice.reset(.retain_capacity);
         const sa = slice.allocator();
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
@@ -9261,75 +9305,49 @@ fn runPrintSinkOver(
         const print_span = profile.Span.begin(prof);
         try flushAggregator(&ranked, names, &stdout_writer, is_jsonl, limit, &total_printed);
         print_span.end(.sink_write, profile.args(.{ranked.num_rows}));
-    } else for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
-        const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
-        const meta_const = meta_i;
-        for (meta_const.row_groups.items, 0..) |*src_rg, rg_i| {
-            if (limit) |lim| {
-                if (total_printed >= lim) break;
-            }
-
-            rgs_in += 1;
-
-            const rg_span = profile.Span.begin(prof);
-            var skipped = false;
-            defer {
-                const decision: u8 = if (skipped) 0 else 2;
-                rg_span.end(.row_group, profile.args(.{ file_i, rg_i, decision, src_rg.num_rows }));
-            }
-            if (filter_opt) |f| if (!args.scan_all) {
-                if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
-                    skipped = true;
-                    rgs_pruned += 1;
-                    skipRowGroup(in, rg_i);
-                    continue;
+    } else {
+        var print_scratch: ?*consumer.SliceScratch = null;
+        defer consumer.releaseSlicePool(&print_scratch);
+        for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
+            const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
+            const meta_const = meta_i;
+            for (meta_const.row_groups.items, 0..) |*src_rg, rg_i| {
+                if (limit) |lim| {
+                    if (total_printed >= lim) break;
                 }
-            };
-            if (in.gate) |g| try g.wait(g.ctx, rg_i);
-            defer skipRowGroup(in, rg_i);
 
-            // A row group too big to hold decoded prints a slice of rows at a time.
-            const sliced: SlicedPrint = .{
-                .names = names,
-                .writer = &stdout_writer,
-                .is_jsonl = is_jsonl,
-                .limit = limit,
-                .total_printed = &total_printed,
-                .budget = args.max_memory / 2,
-                .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
-                .counts = &t.core,
-            };
-            const printed = try printRowGroupSliced(
-                ctx.gpa,
-                &agg,
-                src_rg,
-                &meta_const,
-                rg_src,
-                filter_opt,
-                fetch_arr,
-                output_specs,
-                sliced,
-            );
-            if (printed) continue;
+                rgs_in += 1;
 
-            const matched = consumer.appendProjectedRGWithOptions(
-                &agg,
-                ctx.gpa,
-                src_rg,
-                &meta_const,
-                rg_src,
-                filter_opt,
-                fetch_arr,
-                output_specs,
-                &t.core,
-                .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
-            ) catch |err| {
-                // Values that expand past the budget held whole may still print a slice of rows at a time.
-                if (err != error.DecodeExceededBudget) return err;
-                consumer.resetAggregator(&agg);
-                var streamed = sliced;
-                streamed.force = true;
-                const ok = try printRowGroupSliced(
+                const rg_span = profile.Span.begin(prof);
+                var skipped = false;
+                defer {
+                    const decision: u8 = if (skipped) 0 else 2;
+                    rg_span.end(.row_group, profile.args(.{ file_i, rg_i, decision, src_rg.num_rows }));
+                }
+                if (filter_opt) |f| if (!args.scan_all) {
+                    if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
+                        skipped = true;
+                        rgs_pruned += 1;
+                        skipRowGroup(in, rg_i);
+                        continue;
+                    }
+                };
+                if (in.gate) |g| try g.wait(g.ctx, rg_i);
+                defer skipRowGroup(in, rg_i);
+
+                // A row group too big to hold decoded prints a slice of rows at a time.
+                const sliced: SlicedPrint = .{
+                    .names = names,
+                    .writer = &stdout_writer,
+                    .is_jsonl = is_jsonl,
+                    .limit = limit,
+                    .total_printed = &total_printed,
+                    .budget = args.max_memory / 2,
+                    .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+                    .counts = &t.core,
+                    .scratch = &print_scratch,
+                };
+                const printed = try printRowGroupSliced(
                     ctx.gpa,
                     &agg,
                     src_rg,
@@ -9338,18 +9356,49 @@ fn runPrintSinkOver(
                     filter_opt,
                     fetch_arr,
                     output_specs,
-                    streamed,
+                    sliced,
                 );
-                if (!ok) return err;
-                continue;
-            };
-            t.core.rows_scanned += @intCast(src_rg.num_rows);
-            t.core.rows_matched += matched;
+                if (printed) continue;
 
-            const print_span = profile.Span.begin(prof);
-            try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
-            print_span.end(.sink_write, profile.args(.{agg.num_rows}));
-            consumer.resetAggregator(&agg);
+                const matched = consumer.appendProjectedRGWithOptions(
+                    &agg,
+                    ctx.gpa,
+                    src_rg,
+                    &meta_const,
+                    rg_src,
+                    filter_opt,
+                    fetch_arr,
+                    output_specs,
+                    &t.core,
+                    .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+                ) catch |err| {
+                    // Values that expand past the budget held whole may still print a slice of rows at a time.
+                    if (err != error.DecodeExceededBudget) return err;
+                    consumer.resetAggregator(&agg);
+                    var streamed = sliced;
+                    streamed.force = true;
+                    const ok = try printRowGroupSliced(
+                        ctx.gpa,
+                        &agg,
+                        src_rg,
+                        &meta_const,
+                        rg_src,
+                        filter_opt,
+                        fetch_arr,
+                        output_specs,
+                        streamed,
+                    );
+                    if (!ok) return err;
+                    continue;
+                };
+                t.core.rows_scanned += @intCast(src_rg.num_rows);
+                t.core.rows_matched += matched;
+
+                const print_span = profile.Span.begin(prof);
+                try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
+                print_span.end(.sink_write, profile.args(.{agg.num_rows}));
+                consumer.resetAggregator(&agg);
+            }
         }
     }
 

@@ -13,8 +13,9 @@
 //! Backends (`Mode`): `pread` threads, or one io_uring per reader thread. `Policy.choose` picks one; `ZPQ_IO_PROFILE`
 //! overrides it. `auto` maps a planned read that is already mostly cached. A cold one that fits the reader uses
 //! `O_DIRECT` io_uring, wide or narrow. Anything in between is buffered, which is also what `--cache` asks for, so
-//! the next query finds the file warm. A file system that refuses the direct open reads that file through the page
-//! cache. The descriptor is one this reader opened.
+//! the next query finds the file warm. The buffered descriptor stays open beside the direct one. A file system that
+//! refuses the open, or a finished read that comes back `EINVAL`, uses that descriptor. Nothing else in flight is
+//! retargeted.
 const std = @import("std");
 const builtin = @import("builtin");
 const core_memory = @import("../core/memory.zig");
@@ -136,7 +137,7 @@ pub const Reason = enum(u8) {
             .not_linux => "not linux",
             .remote => "remote input",
             .mapping => "read through the mapping",
-            .cold_direct => "cold, O_DIRECT; --cache reads through the page cache",
+            .cold_direct => "cold, O_DIRECT where the file allows it; --cache reads through the page cache",
             .page_cache => "through the page cache (--cache)",
         };
     }
@@ -352,10 +353,17 @@ pub const File = struct {
     reader: *Reader,
     fd: i32,
     size: u64,
-    /// Opened O_DIRECT; false when the mode is pread or the file system refused it.
+    /// The descriptor opened without `O_DIRECT`, kept when `fd` is direct. -1 when there is only one.
+    buffered_fd: i32 = -1,
+    /// Opened O_DIRECT. Stays true when a later read falls back; `read_fallback` records that.
     direct: bool,
+    /// A finished direct read was `EINVAL`. That unit was pread through `buffered_fd`. The direct descriptor
+    /// stays as it is: other reads already submitted still name it.
+    read_fallback: std.atomic.Value(bool) = .init(false),
     /// `fd` is the reader's to close (`Reader.openFile`), not borrowed (`Reader.borrowFile`).
     owned: bool = false,
+    /// `buffered_fd` is the reader's to close. False when it is borrowed, or when there is none.
+    own_buffered: bool = false,
     /// Anonymous, laid out like the file; only planned pages are ever written.
     buf: []align(std.heap.page_size_min) u8,
     /// 0 until the row group's reads are in, 1 once they are, 2 when a read failed.
@@ -487,6 +495,9 @@ const Faults = struct {
     batch_n: u32 = 0,
     /// The first CQE of a multi-completion batch reports a short read, so its repair pread runs.
     short_first: bool = false,
+    /// Completions left to report as `EINVAL`, as a direct read the file system accepted the open for and then
+    /// refused. The unit is pread through the buffered descriptor.
+    reject_direct: u8 = 0,
     inflight_at_deinit: usize = std.math.maxInt(usize),
 };
 
@@ -545,17 +556,22 @@ pub const Reader = struct {
     }
 
     fn addFile(self: *Reader, fd: i32, size: u64, borrowed: bool) !*File {
-        // O_DIRECT is a new open of `/proc/self/fd/N`, never F_SETFL on `fd`. A borrowed descriptor stays as the
-        // caller handed it over. A file system that refuses the open (tmpfs, some FUSE) reads through the page cache.
+        // O_DIRECT is a new open of `/proc/self/fd/N`, never F_SETFL on `fd`. The buffered descriptor stays: a read
+        // the direct one rejects is pread through it, and a borrowed descriptor is never closed or retargeted.
+        // A file system that refuses the open (tmpfs, some FUSE) has no second descriptor and reads buffered.
         var read_fd = fd;
+        var buffered_fd: i32 = -1;
         var owned = !borrowed;
+        var own_buffered = false;
         var direct = false;
         errdefer {
             if (owned) _ = linux.close(read_fd);
+            if (own_buffered) _ = linux.close(buffered_fd);
         }
         if (self.cfg.direct) {
             if (openSibling(fd)) |dfd| {
-                if (!borrowed) _ = linux.close(fd);
+                buffered_fd = fd;
+                own_buffered = !borrowed;
                 read_fd = dfd;
                 owned = true;
                 direct = true;
@@ -573,7 +589,16 @@ pub const Reader = struct {
         errdefer posix.munmap(buf);
         // THP on this buffer backed the gaps between projected chunks too: RSS 3-7x for nothing.
         _ = linux.madvise(buf.ptr, buf.len, linux.MADV.NOHUGEPAGE);
-        f.* = .{ .reader = self, .fd = read_fd, .size = size, .direct = direct, .owned = owned, .buf = buf };
+        f.* = .{
+            .reader = self,
+            .fd = read_fd,
+            .size = size,
+            .buffered_fd = buffered_fd,
+            .direct = direct,
+            .owned = owned,
+            .own_buffered = own_buffered,
+            .buf = buf,
+        };
         try self.files.append(self.gpa, f);
         return f;
     }
@@ -835,6 +860,7 @@ pub const Reader = struct {
         for (self.files.items) |f| {
             posix.munmap(f.buf);
             if (f.owned) _ = linux.close(f.fd);
+            if (f.own_buffered) _ = linux.close(f.buffered_fd);
             self.gpa.free(f.rg_ready);
             self.gpa.free(f.rg_items_done);
             self.gpa.free(f.rg_units_left);
@@ -944,7 +970,10 @@ pub const Reader = struct {
     /// What the reads actually went through, valid once `start` returns.
     pub fn backends(self: *const Reader) Backends {
         var direct: u32 = 0;
-        for (self.files.items) |f| direct += @intFromBool(f.direct);
+        for (self.files.items) |f| {
+            const stayed = f.direct and !f.read_fallback.load(.monotonic);
+            direct += @intFromBool(stayed);
+        }
         return .{
             .uring_threads = self.uring_threads,
             .pread_threads = self.pread_threads,
@@ -1065,6 +1094,10 @@ pub const Reader = struct {
                 const idx: usize = @intCast(c.user_data);
                 const u = units[idx];
                 const f = self.files.items[u.file];
+                if (builtin.is_test) if (self.faults) |fault| if (fault.reject_direct > 0 and f.buffered_fd >= 0) {
+                    fault.reject_direct -= 1;
+                    c.res = -@as(i32, @backingInt(linux.E.INVAL));
+                };
                 const again = c.res == -@as(i32, @backingInt(linux.E.AGAIN));
                 const replay = builtin.is_test and self.faults != null and self.faults.?.cqe_replays > 0;
                 const slot = heldSlot(held[0..nheld], idx);
@@ -1085,7 +1118,18 @@ pub const Reader = struct {
                     self.unitDone(u);
                     continue;
                 }
-                // `-EIO` / `-EINVAL`. Siblings in this batch are already counted; still-submitted reads are reaped.
+                // A finished direct read the file system rejected. This unit is pread through the buffered
+                // descriptor. `fd` is left alone: a sibling still in the kernel is a read of that descriptor.
+                const rejected = c.res == -@as(i32, @backingInt(linux.E.INVAL));
+                if (rejected and f.buffered_fd >= 0) {
+                    if (slot) |s| heldRemove(held, tries, &nheld, s);
+                    try self.readUnit(idx);
+                    f.read_fallback.store(true, .release);
+                    self.unitDone(u);
+                    continue;
+                }
+                // `-EIO` and any other failure. Siblings in this batch are already counted; still-submitted reads
+                // are reaped.
                 if (c.res < 0) return error.ReadFailed;
                 if (slot) |s| heldRemove(held, tries, &nheld, s);
                 const want = @min(@as(u64, u.len), f.size - u.off);
@@ -1299,13 +1343,15 @@ fn heldRemove(held: []usize, tries: []u8, n: *usize, slot: usize) void {
     tries[slot] = tries[n.*];
 }
 
-/// pread `[lo, hi)` of `f` into its buffer. With O_DIRECT the offset and length must be page multiples, which every
-/// unit is but the last page of the file; a direct read of it returns what there is.
+/// pread `[lo, hi)` of `f` into its buffer. A direct file keeps its buffered descriptor for this: the tail past
+/// the last full page is not a legal `O_DIRECT` read, and neither is a completion of `EINVAL`. `f.fd` stays as the
+/// ring submitted it.
 fn preadAll(f: *File, lo: u64, hi: u64) !void {
+    const fd = if (f.buffered_fd >= 0) f.buffered_fd else f.fd;
     var off = lo;
     while (off < hi) {
         const len = std.mem.alignForward(u64, hi - off, pageLen());
-        const rc = linux.pread(f.fd, f.buf.ptr + off, @intCast(@min(len, f.buf.len - off)), @intCast(off));
+        const rc = linux.pread(fd, f.buf.ptr + off, @intCast(@min(len, f.buf.len - off)), @intCast(off));
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -1852,7 +1898,7 @@ test "auto maps a warm file, buffers a partly warm one, and reads a cold one dir
         try testing.expectEqual(Reason.cold_direct, cold_wide.reason);
         try testing.expect(cold_wide.directRead());
         try testing.expectEqualStrings(
-            "cold, O_DIRECT; --cache reads through the page cache",
+            "cold, O_DIRECT where the file allows it; --cache reads through the page cache",
             cold_wide.reason.phrase(),
         );
         const cold_narrow = auto.choose(Policy.cold_resident - 0.01, 0.1);
@@ -2163,6 +2209,86 @@ test "a file that cannot open O_DIRECT is still read through the page cache" {
     gate.done(gate.ctx, 0, 1);
 }
 
+test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 128 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 4);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "reject.bin", data, &path_buf);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const before = linux.fcntl(fd, linux.F.GETFL, 0);
+    try testing.expect(linux.errno(before) == .SUCCESS);
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .block = 64 << 10,
+        .direct = true,
+    });
+    defer rd.destroy();
+    var faults: Faults = .{ .hold_batch = 2, .reject_direct = 1 };
+    rd.faults = &faults;
+    const f = try rd.borrowFile(fd, data.len);
+    if (!f.direct) return error.SkipZigTest;
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    try testing.expect(f.read_fallback.load(.acquire));
+    try testing.expect(faults.batch_n >= 2);
+    const backs = rd.backends();
+    try testing.expectEqual(@as(u32, 0), backs.direct_files);
+    try testing.expectEqual(@as(u32, 1), backs.buffered_files);
+    const after = linux.fcntl(fd, linux.F.GETFL, 0);
+    try testing.expectEqual(before, after);
+    const live = linux.fcntl(f.fd, linux.F.GETFL, 0);
+    try testing.expect(linux.errno(live) == .SUCCESS);
+    gate.done(gate.ctx, 0, 1);
+}
+
+test "an unaligned direct tail is read through the buffered fd and stays direct" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, (64 << 10) + 100);
+    defer testing.allocator.free(data);
+    @memset(data, 8);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "tail.bin", data, &path_buf);
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .block = 64 << 10,
+        .direct = true,
+    });
+    defer rd.destroy();
+    const f = try rd.openFile(path, data.len);
+    if (!f.direct) return error.SkipZigTest;
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    try testing.expect(!f.read_fallback.load(.acquire));
+    const backs = rd.backends();
+    try testing.expectEqual(@as(u32, 1), backs.direct_files);
+    try testing.expectEqual(@as(u32, 0), backs.buffered_files);
+    gate.done(gate.ctx, 0, 1);
+}
+
 test "direct io opens its own fd and does not change a borrowed one" {
     if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
@@ -2189,9 +2315,12 @@ test "direct io opens its own fd and does not change a borrowed one" {
     if (f.direct) {
         try testing.expect(f.fd != fd);
         try testing.expect(f.owned);
+        try testing.expectEqual(fd, f.buffered_fd);
+        try testing.expect(!f.own_buffered);
     } else {
         try testing.expectEqual(fd, f.fd);
         try testing.expect(!f.owned);
+        try testing.expectEqual(@as(i32, -1), f.buffered_fd);
     }
     var range = [_]Range{.{ .start = 0, .end = data.len }};
     var plans = [_]?[]Range{&range};

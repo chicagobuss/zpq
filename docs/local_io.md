@@ -41,13 +41,17 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 - otherwise a query that plans to read at least half the inputs' bytes uses buffered io_uring, and a narrower read
   uses `pread`. Both fill the page cache.
 
-The direct open is a new descriptor (`/proc/self/fd/N` with `O_DIRECT`); a borrowed or mapped descriptor is never
-changed with `F_SETFL`. If that open is refused the file reads through the page cache and the query continues.
+The direct open is a new descriptor (`/proc/self/fd/N` with `O_DIRECT`); the buffered descriptor stays open beside
+it. A borrowed or mapped descriptor is never changed with `F_SETFL` and is never closed while a read of it is in
+flight. If that open is refused, or a finished direct read returns `EINVAL`, that file is read through the page
+cache and the query continues. A short read of the file's last page is finished the same way and the file stays
+direct.
 
 The footers are parsed and the query planned before the choice, so pruned row groups and unread columns don't count
-toward the share read. `--explain` and the profile summary name the choice (`cold, O_DIRECT; --cache reads through
-the page cache`, or `through the page cache (--cache)`) and do not read column data to decide. A row group the
-reader cannot hold is read through the mapping (`over_budget`), including when the profile asked for direct.
+toward the share read. `--explain` names the choice before any file is opened (`cold, O_DIRECT where the file
+allows it; --cache reads through the page cache`, or `through the page cache (--cache)`). The profile summary says
+what the reads actually used, per file. Neither reads column data to decide. A row group the reader cannot hold is
+read through the mapping (`over_budget`), including when the profile asked for direct.
 
 Each mode falls back rather than fails:
 

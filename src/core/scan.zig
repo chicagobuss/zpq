@@ -1297,6 +1297,7 @@ pub const RecordAdmission = struct {
         integer_distinct_top_h,
         integer_distinct,
         byte_distinct,
+        pair_distinct,
     },
     reservation: usize,
 };
@@ -4179,6 +4180,37 @@ fn prepareAggregateWithMetas(
         false,
     )) |result| return result;
 
+    var pair_record_path: ?RecordAdmission = null;
+    if (explain) {
+        pair_record_path = try inlinePairAnswer(
+            gpa,
+            arena,
+            args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            true,
+        );
+    } else if (try inlinePairAnswer(
+        gpa,
+        arena,
+        args,
+        metas,
+        &plan,
+        work_items.items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return result;
+
     var integer_needs_union = false;
     if (!explain) if (try inlineIntegerAnswer(
         gpa,
@@ -4558,18 +4590,19 @@ fn prepareAggregateWithMetas(
     else
         null;
     if (explain) {
-        const record_path = selected_record_path orelse packed_record_path orelse try inlineDistinctAnswer(
-            gpa,
-            arena,
-            args,
-            metas,
-            &plan,
-            work_items.items,
-            agg_calls,
-            n_workers,
-            t,
-            true,
-        ) orelse try inlineMsdAnswer(
+        const record_path = pair_record_path orelse selected_record_path orelse packed_record_path orelse
+            try inlineDistinctAnswer(
+                gpa,
+                arena,
+                args,
+                metas,
+                &plan,
+                work_items.items,
+                agg_calls,
+                n_workers,
+                t,
+                true,
+            ) orelse try inlineMsdAnswer(
             gpa,
             arena,
             msd_args,
@@ -4628,6 +4661,7 @@ fn prepareAggregateWithMetas(
                 .integer_count_top_h,
                 .packed_count_top_h,
                 .integer_distinct_top_h,
+                .pair_distinct,
                 => @min(n_workers, owner_groups.max_workers),
                 else => n_workers,
             } else n_workers,
@@ -5176,11 +5210,16 @@ fn prepareAggregateWithMetas(
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         if (result_cut == null or !result_cut.?.ranking_first)
             try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);
-        const candidates = try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order);
+        // Candidate nomination scans every partial group. With several workers, route those groups directly to
+        // the parallel merge and let each partition keep its own H candidates instead of a serial nomination pass.
+        const candidates = if (n_workers == 1)
+            try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order)
+        else
+            null;
         // One table already holds complete ranks; its top-H heap avoids materializing every losing group.
         const cut: ?[]const u32 = if (dense_direct) |d|
             try agg_dense.reached(arena, d, dense_cut)
-        else if (candidates == null and out_tables.len == 1)
+        else if (n_workers == 1 and candidates == null and out_tables.len == 1)
             try resultLimitGroups(
                 arena,
                 &out_tables[0],
@@ -5203,7 +5242,10 @@ fn prepareAggregateWithMetas(
         const group_refs_buf = try lists.alloc(MergeGroupRef, total_group_refs);
         defer lists.free(group_refs_buf);
         var ref_i: usize = 0;
-        for (out_tables, 0..) |gt, ti| {
+        if (cut == null and candidates == null) {
+            finishGroupRanges(out_tables, group_refs_buf, null, n_workers, false);
+            ref_i = total_group_refs;
+        } else for (out_tables, 0..) |gt, ti| {
             if (cut) |ids| {
                 if (ti == 0) for (ids) |gi| {
                     group_refs_buf[ref_i] = .{ .table = 0, .group = gi };
@@ -5214,9 +5256,6 @@ fn prepareAggregateWithMetas(
                     group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = gi };
                     ref_i += 1;
                 };
-            } else for (0..gt.groupCount()) |gi| {
-                group_refs_buf[ref_i] = .{ .table = @intCast(ti), .group = @intCast(gi) };
-                ref_i += 1;
             }
         }
         const group_refs = group_refs_buf[0..ref_i];
@@ -5269,10 +5308,10 @@ fn prepareAggregateWithMetas(
         // its groups are already distinct, so rows read that table directly.
         var merged_accs: std.ArrayList(expr_agg.Accumulator) = .empty;
         defer {
-            freeOwnedAccumulatorStrings(gpa, merged_accs.items);
+            freeAccumulatorRanges(gpa, merged_accs.items, n_workers);
             merged_accs.deinit(lists);
         }
-        var folded = out_tables.len > 1;
+        var folded = out_tables.len > 1 or (n_workers > 1 and result_cut != null and dense_direct == null);
         // Set when the merge left each group's state in its source table (`mergeInPlace`).
         var in_place_tables: []const expr_agg.GroupTable = &.{};
         // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
@@ -5297,6 +5336,7 @@ fn prepareAggregateWithMetas(
                 args.result_order,
                 args.unordered,
                 result_cut,
+                n_workers,
                 &slots,
                 &merged_accs,
             );
@@ -5325,7 +5365,10 @@ fn prepareAggregateWithMetas(
         } else {
             const gt = &out_tables[0];
             try slots.ensureTotalCapacity(lists, group_refs.len);
-            for (group_refs) |ref| {
+            if (cut == null and candidates == null) {
+                slots.items.len = group_refs.len;
+                finishGroupRanges(out_tables, null, slots.items, n_workers, false);
+            } else for (group_refs) |ref| {
                 slots.appendAssumeCapacity(.{
                     .key = gt.keyAt(ref.group),
                     .first = gt.first.items[ref.group],
@@ -5334,7 +5377,9 @@ fn prepareAggregateWithMetas(
             }
         }
         if (folded) if (result_cut) |rc| {
-            if (rc.ranking_first) try keepResultTop(gpa, lists, agg_calls, rc, &slots, &merged_accs);
+            if (rc.ranking_first) {
+                try keepResultTop(gpa, lists, agg_calls, rc, &slots, &merged_accs);
+            } else try keepCountTop(gpa, lists, agg_calls, .{ .a_idx = rc.a_idx, .k = rc.k }, &slots, &merged_accs);
         };
         if (!args.unordered) try sortSlotsByFirst(lists, slots.items, n_workers);
 
@@ -5361,7 +5406,7 @@ fn prepareAggregateWithMetas(
         // stays drawn while the query holds it (the engine's ledger outlives it). Refused, it is the merge's refusal:
         // on one worker the tables it reads are one.
         if (args.ledger != null) {
-            const bytes = answerBytes(slots.items, col_types, key_types, typed) +|
+            const bytes = answerBytesParallel(slots.items, col_types, key_types, typed, n_workers) +|
                 row_src.denseStringBytes();
             answer_charge = group_budget.drawExact(bytes) orelse {
                 if (args.taken) |taken| taken.insert(.merge_memory);
@@ -5395,8 +5440,9 @@ fn prepareAggregateWithMetas(
         // winners can now be released before returning (the deferred deinit
         // then finds them empty).
         if (!leave_tables) {
+            finishGroupRanges(out_tables, null, null, n_workers, true);
             for (out_tables) |*gt| {
-                gt.deinit();
+                gt.deinitStorage();
                 gt.* = expr_agg.GroupTable.init(gpa, 0);
             }
         }
@@ -6436,6 +6482,454 @@ const IntegerRangeHint = struct {
         return span < rows / 4;
     }
 };
+
+/// A DISTINCT program uses one exact pair identity, plus optional count(*) calls sharing its duplicate weights.
+/// Other aggregates retain the ordinary partition merge; no partial result crosses an identity refusal.
+fn inlinePairAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    requested: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    if (!args.integer_records or args.distinct_pairs == .off or !allRescannable(args.inputs) or work.len == 0)
+        return null;
+    var distinct: ?usize = null;
+    for (calls, 0..) |call, i| {
+        if (call.where != null or call.state or call.offset != 0 or call.result != .i64) return null;
+        if (call.func == .count_distinct) {
+            if (distinct != null or call.arg == null or call.arg.? != .col_ref) return null;
+            distinct = i;
+        } else if (call.func != .count or call.arg != null) return null;
+    }
+    const di = distinct orelse return null;
+    const keys = keys_opt orelse &.{};
+    const outputs = outputs_opt orelse &.{};
+    for (outputs) |out| if (out.derived != null) return null;
+    const input_rows = RecordOrdinals.rows(metas) orelse return null;
+    if (input_rows >= @as(usize, 1) << 31) return null;
+    var rows: usize = 0;
+    for (work) |item| rows +|= @intCast(metas[item.file].row_groups.items[item.rg].num_rows);
+    if (rows == 0 or (rows < args.integer_records_min_rows and args.distinct_pairs != .on)) return null;
+    const axes = try arena.alloc(expr_ast.Expr, keys.len + 1);
+    @memcpy(axes[0..keys.len], keys);
+    axes[keys.len] = calls[di].arg.?;
+    for (axes) |axis| {
+        if (axis != .col_ref) return null;
+        const c = axis.col_ref;
+        if (c.expr_type != .i64 and c.expr_type != .str) return null;
+        for (work) |item| {
+            const cm = metas[item.file].row_groups.items[item.rg].columns.items[c.col_idx].meta_data orelse return null;
+            if (metas[item.file].getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+        }
+    }
+    // Rescannable readers retain a complete mapping for planning/replay. Union only dictionary pages from that
+    // mapping; it never borrows a released remote window or depends on the streaming reader's current position.
+    const files = try arena.alloc(ndv.File, args.inputs.len);
+    for (args.inputs, files) |input, *file| {
+        const bytes = input.plan_bytes orelse input.bytes;
+        if (input.logical_size != 0 and input.logical_size != bytes.len) return null;
+        file.* = .{ .bytes = bytes, .local = !std.mem.startsWith(u8, input.name, "s3://") };
+    }
+    const workers = @min(requested, owner_groups.max_workers);
+    var domain: ?agg_dense.Domain = null;
+    defer if (domain) |*d| d.deinit(gpa);
+    if (args.encoded and args.ndv_union)
+        domain = try ndv.retainIdentity(gpa, arena, files, metas, axes, workers, args.max_memory, input_rows + 1);
+    var identity = (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
+    defer identity.deinit(gpa);
+    const top = if (keys_opt != null) countCut(outputs, calls, args.result_order) else null;
+    if (identity.fitsBits(u64)) {
+        if (top) |cut| if (cut.k > 0) return pairAnswerBits(
+            u64,
+            true,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            &identity,
+            di,
+            rows,
+            input_rows,
+            workers,
+            cut,
+            timings,
+            explain_only,
+        );
+        return pairAnswerBits(
+            u64,
+            false,
+            gpa,
+            arena,
+            args,
+            metas,
+            plan,
+            work,
+            calls,
+            keys,
+            outputs,
+            &identity,
+            di,
+            rows,
+            input_rows,
+            workers,
+            null,
+            timings,
+            explain_only,
+        );
+    }
+    if (top) |cut| if (cut.k > 0) return pairAnswerBits(
+        u128,
+        true,
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        outputs,
+        &identity,
+        di,
+        rows,
+        input_rows,
+        workers,
+        cut,
+        timings,
+        explain_only,
+    );
+    return pairAnswerBits(
+        u128,
+        false,
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        keys,
+        outputs,
+        &identity,
+        di,
+        rows,
+        input_rows,
+        workers,
+        null,
+        timings,
+        explain_only,
+    );
+}
+
+fn pairAnswerBits(
+    comptime Bits: type,
+    comptime top: bool,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    identity: *const key_pack.Plan,
+    distinct: usize,
+    rows: usize,
+    input_rows: usize,
+    workers: usize,
+    cut: ?CountCut,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const P = @import("owner_distinct.zig").Pipeline(Bits);
+    const G = P.Groups;
+    const F = @import("owner_result.zig").Full(G.Group);
+    const T = @import("owner_result.zig").Top(G.Group, bool, struct {
+        fn worse(by_distinct: bool, a: G.Group, b: G.Group) std.math.Order {
+            const x = if (by_distinct) a.integer(0).? else a.weight;
+            const y = if (by_distinct) b.integer(0).? else b.weight;
+            return if (x != y) std.math.order(x, y) else std.math.order(b.first, a.first);
+        }
+    }.worse);
+    const prefix = try P.Prefix.init(identity);
+    const cost = @import("owner_cost.zig");
+    const pq = cost.quote(Bits, &.{}, u32, rows, rows, workers, 0, args.byte_top_partitions) orelse return null;
+    var null_rows: usize = 0;
+    for (work) |item| {
+        const rg = metas[item.file].row_groups.items[item.rg];
+        const cm = rg.columns.items[identity.keys[identity.keys.len - 1].col_idx].meta_data.?;
+        const n = if (cm.statistics) |st| st.null_count orelse rg.num_rows else rg.num_rows;
+        if (n < 0 or n > rg.num_rows) return null;
+        null_rows +|= @intCast(n);
+    }
+    var pair_bound: usize = rows;
+    if (identity.encoding.source == .dictionary) {
+        var product: u128 = 1;
+        for (identity.radices) |r| product = std.math.mul(u128, product, r) catch rows;
+        pair_bound = @intCast(@min(rows, product));
+    }
+    // A NULL presence row or one completed pair is the only possible second-stage contribution. Its duplicate
+    // weight still uses the original row bound. Global DISTINCT therefore reserves by values, never rows twice.
+    const group_records = @min(rows, pair_bound +| null_rows);
+    const gq = cost.quote(
+        Bits,
+        &.{.present_count},
+        u32,
+        group_records,
+        group_records,
+        workers,
+        0,
+        args.byte_top_partitions,
+    ) orelse return null;
+    const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);
+    const domain_bytes = if (identity.domain) |d| d.bytes else 0;
+    const scratch = domain_bytes +| identity.retainedBytes() +|
+        workers *| (identity.keys.len *| @sizeOf(key_pack.Plan.Binding) +| @sizeOf(P.Sink) +|
+            @sizeOf(P.Reducer) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
+        work.len *| (@sizeOf(P.Sink.Source) +| @sizeOf(u32));
+    const peak = scratch +| pq.records +| gq.records +| @max(pq.finish, gq.finish) +| result_credit;
+    if (peak > args.max_memory) return null;
+    if (explain_only) return .{ .layout = .pair_distinct, .reservation = peak };
+    var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const ledger = args.ledger orelse &private_ledger;
+    _ = ledger.drawExact(scratch) orelse return null;
+    var held: usize = 0;
+    defer ledger.release(scratch - held);
+    const pairs = (try P.Pairs.State.init(gpa, ledger, input_rows, rows, workers, pq.parts)) orelse return null;
+    defer pairs.deinit();
+    const groups = (try G.State.initWeighted(
+        gpa,
+        ledger,
+        input_rows,
+        rows,
+        group_records,
+        workers,
+        gq.parts,
+    )) orelse return null;
+    defer groups.deinit();
+    const result = if (top)
+        T.init(gpa, ledger, workers, cut.?.k, cut.?.a_idx == distinct)
+    else
+        F.init(gpa, ledger, workers, gq.parts);
+    var receiver = result catch |e| {
+        if (e == error.ExceededMemoryBudget) return null;
+        return e;
+    };
+    defer receiver.deinit();
+    var temporary = std.heap.ArenaAllocator.init(gpa);
+    defer temporary.deinit();
+    const a = temporary.allocator();
+    const starts = try a.alloc(u32, work.len);
+    if (!RecordOrdinals.fill(metas, work, starts)) return error.BadColumn;
+    const sources = try a.alloc(P.Sink.Source, work.len);
+    for (sources, work) |*s, item| s.* = .{ .file = item.file, .rg = item.rg };
+    const adapters = try a.alloc(P.Sink, workers);
+    const sinks = try a.alloc(consumer.RecordSink, workers);
+    const reducers = try a.alloc(P.Reducer, workers);
+    var refused: std.atomic.Value(bool) = .init(false);
+    for (adapters, sinks, reducers, pairs.locals, groups.locals) |*s, *sink, *r, *pl, *gl| {
+        s.* = .{
+            .pairs = pl,
+            .groups = gl,
+            .identity = identity,
+            .prefix = prefix,
+            .sources = sources,
+            .bindings = try a.alloc(key_pack.Plan.Binding, identity.keys.len),
+            .refused = &refused,
+        };
+        sink.* = .{ .selected = .{ .ctx = s, .startFn = P.Sink.startErased, .batchFn = P.Sink.batchErased } };
+        r.* = .{ .local = gl, .prefix = prefix, .count_rows = calls.len > 1 };
+    }
+    if (args.taken) |taken| taken.insert(.integer_records);
+    const pair_keys = try a.alloc(expr_ast.Expr, identity.keys.len);
+    for (pair_keys, identity.keys) |*k, ref| k.* = .{ .col_ref = ref };
+    const run = runRecordWorkers(
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        pair_keys,
+        sinks,
+        starts,
+        outputs,
+        timings,
+    ) catch |e| {
+        if (refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+        return e;
+    };
+    const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
+    try pairs.finish(reducers, P.Reducer.receive);
+    try groups.finish(receiver.receivers, if (top) T.Receiver.receive else F.Receiver.receive);
+    span.end(.merge, profile.args(.{gq.parts}));
+    const top_groups = if (top) receiver.finish() else &.{};
+    const n = if (top) top_groups.len else receiver.count();
+    const slots = try a.alloc(MergedSlot, n);
+    if (top) {
+        for (top_groups, slots, 0..) |g, *s, i| s.* = .{ .key = &.{}, .first = g.first, .idx = i };
+    } else try receiver.fill(MergedSlot, slots, struct {
+        fn make(g: G.Group, index: u64) MergedSlot {
+            return .{ .key = &.{}, .first = g.first, .idx = @intCast(index) };
+        }
+    }.make);
+    if (!args.unordered) try sortSlotsByFirst(a, slots, workers);
+    const View = struct {
+        groups: []const G.Group,
+        full: ?*F,
+        distinct: usize,
+        fn at(v: *const @This(), i: usize) *const G.Group {
+            return if (v.full) |f| f.at(i) else &v.groups[i];
+        }
+        fn key(ctx: *const anyopaque, i: usize) u128 {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return v.at(i).key;
+        }
+        fn integer(ctx: *const anyopaque, i: usize, call: usize) anyerror!?i128 {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return if (call == v.distinct) v.at(i).integer(0) else v.at(i).weight;
+        }
+        fn value(ctx: *const anyopaque, _: std.mem.Allocator, i: usize, call: usize) anyerror!AggValue {
+            return .{ .i = (try integer(ctx, i, call)).? };
+        }
+    };
+    const view: View = .{ .groups = top_groups, .full = if (top) null else receiver, .distinct = distinct };
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    const names_credit = outputNamesBytes(outputs);
+    var output_charge: usize = 0;
+    defer ledger.release(output_charge);
+    if (args.group_by == null) {
+        output_charge = calls.len *| @sizeOf(AggOutputItem);
+        for (calls) |c| output_charge +|= c.alias.len;
+        _ = ledger.drawExact(output_charge) orelse {
+            output_charge = 0;
+            return error.ExceededMemoryBudget;
+        };
+        const items = try gpa.alloc(AggOutputItem, calls.len);
+        @memset(items, .{ .alias = "", .value = .null_val });
+        output.aggs = items;
+        const accs = try arena.alloc(expr_agg.Accumulator, calls.len);
+        for (items, calls, accs, 0..) |*item, call, *acc, ci| {
+            const count: u64 = if (n == 0) 0 else @intCast((try View.integer(&view, slots[0].idx, ci)).?);
+            item.* = .{ .alias = try gpa.dupe(u8, call.alias), .value = .{ .i = count } };
+            acc.* = .{ .count = count };
+        }
+        for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+        // The retained scalar output is released by the enclosing query ledger with its output.
+        const finished = try countedCalls(arena, calls, distinct);
+        const sources_out = try arena.alloc(?schema.SchemaElement, calls.len);
+        @memset(sources_out, null);
+        if (args.ledger != null) {
+            held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+            output_charge = 0;
+        }
+        return pairResult(args, plan, run, output, .{
+            .accumulators = accs,
+            .agg_calls = finished,
+            .agg_sources = sources_out,
+        });
+    }
+    const types = try arena.alloc(GroupColType, outputs.len);
+    const key_types = try a.alloc(KeyType, keys.len);
+    for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
+    var key_bytes: usize = 0;
+    for (outputs, types) |out, *ty| {
+        ty.* = .{
+            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else .i64,
+            .nullable = out.source == .key or calls[out.source.agg].func != .count,
+            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
+        };
+        if (out.source == .key) if (identity.domain) |d| switch (d.axes[out.source.key].values) {
+            .bytes => |values| {
+                var widest: usize = 0;
+                for (values) |v| widest = @max(widest, v.len);
+                key_bytes +|= widest;
+            },
+            else => {},
+        };
+    }
+    const row_source: RowSource = .{
+        .slots = slots,
+        .outputs = outputs,
+        .calls = calls,
+        .key_types = key_types,
+        .key_exprs = keys,
+        .accs = &.{},
+        .folded = false,
+        .fixed_keys = false,
+        .identity = identity,
+        .owner = .{ .ctx = &view, .key = View.key, .integer = View.integer, .value = View.value },
+    };
+    const typed = args.typed_answer and args.result_order.keys.len == 0 and args.result_order.limit == null and
+        args.result_order.offset == 0 and args.result_order.having == null and args.result_order.hidden.len == 0;
+    output_charge = answerBytesParallel(slots, types, key_types, typed, workers) +| names_credit +| n *| key_bytes;
+    _ = ledger.drawExact(output_charge) orelse {
+        output_charge = 0;
+        return error.ExceededMemoryBudget;
+    };
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    for (outputs, names) |out, *name| name.* = try gpa.dupe(u8, out.name);
+    if (typed) {
+        output.typed = .{ .rows = 0, .columns = &.{} };
+        try buildGroupColumns(gpa, &output.typed.?, row_source, types, workers);
+    } else {
+        const out_rows = try gpa.alloc([]const AggValue, n);
+        @memset(out_rows, &.{});
+        output.group_rows = out_rows;
+        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+    }
+    for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+    if (args.ledger != null) {
+        held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+        output_charge = 0; // retain the successful output credit in the query's enclosing ledger
+    }
+    return pairResult(args, plan, run, output, .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types });
+}
+
+fn pairResult(
+    args: MultiAggArgs,
+    plan: *const agg_plan.Plan,
+    run: RecordRun,
+    output: AggOutput,
+    state: ScanState,
+) MultiAggResult {
+    var bytes_in: u64 = 0;
+    for (args.inputs) |input| bytes_in +|= if (input.logical_size != 0) input.logical_size else input.bytes.len;
+    return .{
+        .files_in = args.inputs.len,
+        .rows_in = run.rows_in,
+        .rows_scanned = run.rows_scanned,
+        .rows_matched = run.rows_matched,
+        .bytes_in = bytes_in,
+        .row_groups_in = run.row_groups_in,
+        .row_groups_pruned = run.row_groups_pruned,
+        .row_groups_full_match = run.row_groups_full_match,
+        .cols_stat_pruned = plan.cols_stat_pruned,
+        .timings = run.timings,
+        .output = output,
+        .distinct_pairs = true,
+        .part_agg = true,
+        .state = state,
+    };
+}
 
 // Scalar cardinality reuses count-only owner records and the complete partition fold.
 fn inlineDistinctAnswer(
@@ -8155,14 +8649,44 @@ fn buildGroupRows(
 /// What a GROUP BY answer of `slots` holds once built (`buildGroupColumns` or `buildGroupRows`): its values, their
 /// lanes and NULL flags, and its string keys' heap blocks. A string aggregate's own value is not counted.
 fn answerBytes(slots: []const MergedSlot, cols: []const GroupColType, key_types: []const KeyType, typed: bool) usize {
+    return answerBytesParallel(slots, cols, key_types, typed, 1);
+}
+
+fn answerBytesParallel(
+    slots: []const MergedSlot,
+    cols: []const GroupColType,
+    key_types: []const KeyType,
+    typed: bool,
+    workers: usize,
+) usize {
     const rows = slots.len;
     // Each string key value is a heap block of its own: rounded to 16 bytes, with a header.
     var string_keys: usize = 0;
     for (key_types) |kt| string_keys += @intFromBool(kt == .string);
     var strings: usize = 0;
-    if (string_keys > 0) for (slots) |sl| {
-        strings +|= std.mem.alignForward(usize, sl.key.len, 16) + string_keys * 16;
-    };
+    if (string_keys > 0) {
+        const Task = struct {
+            slots: []const MergedSlot,
+            keys: usize,
+            bytes: usize = 0,
+            cursor: *std.atomic.Value(usize),
+            fn run(t: *@This()) void {
+                while (true) {
+                    const lo = t.cursor.fetchAdd(row_block, .monotonic);
+                    if (lo >= t.slots.len) return;
+                    for (t.slots[lo..@min(t.slots.len, lo + row_block)]) |sl|
+                        t.bytes +|= std.mem.alignForward(usize, sl.key.len, 16) +| t.keys *| 16;
+                }
+            }
+        };
+        var storage: [64]Task = undefined;
+        const tasks = storage[0..@max(1, @min(storage.len, workers, rows / row_block + 1))];
+        var cursor = std.atomic.Value(usize).init(0);
+        for (tasks) |*t| t.* = .{ .slots = slots, .keys = string_keys, .cursor = &cursor };
+        if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run))
+            tasks[0].run();
+        for (tasks) |t| strings +|= t.bytes;
+    }
     if (!typed) return rows *| (cols.len *| @sizeOf(AggValue) +| @sizeOf([]const AggValue)) +| strings;
     var per_row: usize = 0;
     for (cols) |c| per_row += @sizeOf(u32) + switch (c.lane) {
@@ -9238,6 +9762,96 @@ fn mergeEntryBytes(n_calls: usize) usize {
     return @sizeOf([]const u8) + @sizeOf(u32) + 1 + @sizeOf(MergedSlot) + n_calls * @sizeOf(expr_agg.Accumulator);
 }
 
+/// Preparation and reclamation are part of the finish too: neither may walk millions of groups on the caller.
+/// Stable contiguous ranges retain table/input order before the radix scatter, including canonical float partials.
+fn finishGroupRanges(
+    tables: []expr_agg.GroupTable,
+    refs: ?[]MergeGroupRef,
+    slots: ?[]MergedSlot,
+    requested: usize,
+    cleanup: bool,
+) void {
+    var total: usize = 0;
+    for (tables) |t| total += t.groupCount();
+    if (total == 0) return;
+    const Task = struct {
+        tables: []expr_agg.GroupTable,
+        refs: ?[]MergeGroupRef,
+        slots: ?[]MergedSlot,
+        total: usize,
+        chunks: usize,
+        cleanup: bool,
+        cursor: *std.atomic.Value(usize),
+        fn run(t: *@This()) void {
+            const width = std.math.divCeil(usize, t.total, t.chunks) catch unreachable;
+            while (true) {
+                const chunk = t.cursor.fetchAdd(1, .monotonic);
+                if (chunk >= t.chunks) return;
+                const lo = chunk * width;
+                const hi = @min(t.total, lo + width);
+                var base: usize = 0;
+                for (t.tables, 0..) |*table, ti| {
+                    const end = base + table.groupCount();
+                    if (lo < end and hi > base) {
+                        const first = @max(lo, base) - base;
+                        const last = @min(hi, end) - base;
+                        if (t.cleanup) {
+                            table.deinitRange(first, last);
+                        } else for (first..last) |gi| {
+                            if (t.refs) |r| r[base + gi] = .{ .table = @intCast(ti), .group = @intCast(gi) };
+                            if (t.slots) |s| s[base + gi] = .{
+                                .key = table.keyAt(gi),
+                                .first = table.first.items[gi],
+                                .idx = gi,
+                            };
+                        }
+                    }
+                    base = end;
+                    if (base >= hi) break;
+                }
+            }
+        }
+    };
+    var storage: [64]Task = undefined;
+    const count = @min(storage.len, @max(1, @min(requested, total / 8192 + 1)));
+    const tasks = storage[0..count];
+    var cursor = std.atomic.Value(usize).init(0);
+    for (tasks) |*t| t.* = .{
+        .tables = tables,
+        .refs = refs,
+        .slots = slots,
+        .total = total,
+        .chunks = count,
+        .cleanup = cleanup,
+        .cursor = &cursor,
+    };
+    if (count == 1 or !spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) tasks[0].run();
+}
+
+fn freeAccumulatorRanges(gpa: std.mem.Allocator, accs: []expr_agg.Accumulator, workers: usize) void {
+    const Task = struct {
+        gpa: std.mem.Allocator,
+        accs: []expr_agg.Accumulator,
+        chunks: usize,
+        cursor: *std.atomic.Value(usize),
+        fn run(t: *@This()) void {
+            const width = std.math.divCeil(usize, t.accs.len, t.chunks) catch unreachable;
+            while (true) {
+                const chunk = t.cursor.fetchAdd(1, .monotonic);
+                if (chunk >= t.chunks) return;
+                const lo = @min(t.accs.len, chunk * width);
+                freeOwnedAccumulatorStrings(t.gpa, t.accs[lo..@min(t.accs.len, lo + width)]);
+            }
+        }
+    };
+    var storage: [64]Task = undefined;
+    const count = @min(storage.len, @max(1, @min(workers, accs.len / 8192 + 1)));
+    const tasks = storage[0..count];
+    var cursor = std.atomic.Value(usize).init(0);
+    for (tasks) |*t| t.* = .{ .gpa = gpa, .accs = accs, .chunks = count, .cursor = &cursor };
+    if (count == 1 or !spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) tasks[0].run();
+}
+
 const MergePart = struct {
     refs: []const MergeGroupRef,
     hashes: []const u64,
@@ -9874,13 +10488,50 @@ fn premergeLargeDistinctSets(
         var large_keys: KeyHashMapUnmanaged(void) = .empty;
         defer large_keys.deinit(gpa);
 
-        for (tables) |gt| {
-            for (0..gt.groupCount()) |gi| {
-                const acc = gt.accumulators.items[gi * calls.len + ci];
-                if (acc == .distinct and acc.distinct.count() >= 16384) {
-                    try large_keys.put(gpa, gt.keyAt(gi), {});
+        const Task = struct {
+            allocator: std.mem.Allocator,
+            tables: []const expr_agg.GroupTable,
+            stride: usize,
+            call: usize,
+            chunks: usize,
+            cursor: *std.atomic.Value(usize),
+            keys: KeyHashMapUnmanaged(void) = .empty,
+            err: ?anyerror = null,
+            fn run(t: *@This()) void {
+                while (t.err == null) {
+                    const job = t.cursor.fetchAdd(1, .monotonic);
+                    if (job >= t.tables.len * t.chunks) return;
+                    const table = &t.tables[job % t.tables.len];
+                    const width = std.math.divCeil(usize, table.groupCount(), t.chunks) catch unreachable;
+                    const lo = @min(table.groupCount(), (job / t.tables.len) * width);
+                    for (lo..@min(table.groupCount(), lo + width)) |gi| {
+                        const acc = table.readAcc(gi, t.call, t.stride);
+                        if (acc == .distinct and acc.distinct.count() >= 16384)
+                            t.keys.put(t.allocator, table.keyAt(gi), {}) catch |e| {
+                                t.err = e;
+                                return;
+                            };
+                    }
                 }
             }
+        };
+        var storage: [64]Task = undefined;
+        const tasks = storage[0..@max(1, @min(storage.len, n_workers))];
+        var cursor = std.atomic.Value(usize).init(0);
+        for (tasks) |*task| task.* = .{
+            .allocator = gpa,
+            .tables = tables,
+            .stride = calls.len,
+            .call = ci,
+            .chunks = tasks.len,
+            .cursor = &cursor,
+        };
+        defer for (tasks) |*task| task.keys.deinit(gpa);
+        if (!spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) tasks[0].run();
+        for (tasks) |*task| {
+            if (task.err) |e| return e;
+            var keys = task.keys.keyIterator();
+            while (keys.next()) |key| try large_keys.put(gpa, key.*, {});
         }
 
         if (large_keys.count() == 0) continue;
@@ -10127,46 +10778,90 @@ fn fillFromPartitions(
     order: expr_ast.ResultOrder,
     unordered: bool,
     result_cut: ?ResultCut,
+    n_workers: usize,
     slots: *std.ArrayList(MergedSlot),
     accs: *std.ArrayList(expr_agg.Accumulator),
 ) !void {
     _ = gpa;
+    _ = arena;
     const ma = if (result_cut) |c| c.memory orelse lists else lists;
+    const Piece = struct { ids: ?[]u32 = null, n: usize = 0, offset: usize = 0 };
+    const pieces = try ma.alloc(Piece, parts.len);
+    @memset(pieces, .{});
+    defer {
+        for (pieces) |p| if (p.ids) |ids| ma.free(ids);
+        ma.free(pieces);
+    }
+    const Task = struct {
+        ma: std.mem.Allocator,
+        parts: []partagg.Part,
+        pieces: []Piece,
+        calls: []const expr_agg.AggCall,
+        outputs: []const BoundOutputColumn,
+        order: expr_ast.ResultOrder,
+        unordered: bool,
+        slots: []MergedSlot = &.{},
+        accs: []expr_agg.Accumulator = &.{},
+        copy: bool = false,
+        cursor: *std.atomic.Value(usize),
+        err: ?anyerror = null,
+        fn run(t: *@This()) void {
+            while (t.err == null) {
+                const p = t.cursor.fetchAdd(1, .monotonic);
+                if (p >= t.parts.len) return;
+                const gt = &t.parts[p].table;
+                const piece = &t.pieces[p];
+                if (!t.copy) {
+                    piece.ids = resultLimitGroups(t.ma, gt, t.outputs, t.calls, t.order, t.unordered, t.ma) catch |e| {
+                        t.err = e;
+                        return;
+                    };
+                    piece.n = if (piece.ids) |ids| ids.len else gt.groupCount();
+                } else for (0..piece.n) |i| {
+                    const g = if (piece.ids) |ids| ids[i] else i;
+                    var scratch: [16]expr_agg.Accumulator = undefined;
+                    const src = gt.readGroup(g, t.calls.len, &scratch);
+                    const at = piece.offset + i;
+                    @memcpy(t.accs[at * t.calls.len ..][0..t.calls.len], src);
+                    for (src) |*a| detachOwned(a);
+                    t.slots[at] = .{ .key = gt.keyAt(g), .first = gt.first.items[g], .idx = at * t.calls.len };
+                }
+            }
+        }
+    };
+    var storage: [64]Task = undefined;
+    const tasks = storage[0..@max(1, @min(n_workers, parts.len, storage.len))];
+    var cursor = std.atomic.Value(usize).init(0);
+    for (tasks) |*t| t.* = .{
+        .ma = ma,
+        .parts = parts,
+        .pieces = pieces,
+        .calls = calls,
+        .outputs = outputs,
+        .order = order,
+        .unordered = unordered,
+        .cursor = &cursor,
+    };
+    const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
+    if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, config, Task.run)) tasks[0].run();
+    for (tasks) |t| if (t.err) |e| return e;
     var total: usize = 0;
-    for (parts) |*p| total += if (resultCut(outputs, calls, order, unordered) != null)
-        @min(p.table.groupCount(), order.limit.? +| order.offset)
-    else
-        p.table.groupCount();
+    for (pieces) |*p| {
+        p.offset = total;
+        total += p.n;
+    }
     try slots.ensureTotalCapacity(ma, total);
     try accs.ensureTotalCapacity(ma, total * calls.len);
-    const len = calls.len;
-    for (parts) |*p| {
-        const gt = &p.table;
-        const cut = try resultLimitGroups(
-            arena,
-            gt,
-            outputs,
-            calls,
-            order,
-            unordered,
-            if (result_cut) |c| c.memory else null,
-        );
-        defer if (cut) |ids| if (result_cut != null and result_cut.?.memory != null) ma.free(ids);
-        const n = if (cut) |ids| ids.len else gt.groupCount();
-        for (0..n) |i| {
-            const g = if (cut) |ids| ids[i] else i;
-            var src_scratch: [16]expr_agg.Accumulator = undefined;
-            const src = gt.readGroup(g, len, &src_scratch);
-            const idx = accs.items.len;
-            try accs.appendSlice(ma, src);
-            for (src) |*a| detachOwned(a);
-            slots.appendAssumeCapacity(.{
-                .key = gt.keyAt(g),
-                .first = gt.first.items[g],
-                .idx = idx,
-            });
-        }
+    // The copy cannot fail. From this point these lists own every moved winner, even after a failed thread spawn.
+    slots.items.len = total;
+    accs.items.len = total * calls.len;
+    cursor.store(0, .monotonic);
+    for (tasks) |*t| {
+        t.copy = true;
+        t.slots = slots.items;
+        t.accs = accs.items;
     }
+    if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, config, Task.run)) tasks[0].run();
 }
 
 fn mergeOwnedAccumulator(
@@ -23549,7 +24244,7 @@ test "selective composite COUNT keeps its packed owner while wider filters retai
     try testing.expect(wider.dense);
 }
 
-test "selected owner coded identity replays a late dictionary mismatch after earlier records" {
+fn selectedIdentityReplayTrial(distinct: bool) !void {
     const gpa = testing.allocator;
     var held = std.heap.ArenaAllocator.init(gpa);
     defer held.deinit();
@@ -23561,8 +24256,9 @@ test "selected owner coded identity replays a late dictionary mismatch after ear
     const base: MultiAggArgs = .{
         .inputs = &.{.{ .name = "selected-replay", .bytes = bytes }},
         .metas = &.{meta},
-        .aggregate = "count(*) AS c,count(*) AS d",
-        .group_by = "k,b,f",
+        .aggregate = if (distinct) "count(DISTINCT k) AS d,count(*) AS c" else "count(*) AS c,count(*) AS d",
+        .group_by = if (distinct) "b" else "k,b,f",
+        .distinct_pairs = if (distinct) .on else .auto,
         .integer_records = false,
         .integer_records_min_rows = 0,
         .byte_records = false,
@@ -23570,7 +24266,11 @@ test "selected owner coded identity replays a late dictionary mismatch after ear
         .plain_rules = false,
         .min_bytes_per_worker = 1,
         .max_memory = 512 << 20,
-        .result_order = .{ .keys = &.{.{ .column = 3, .descending = true }}, .limit = 3, .offset = 2 },
+        .result_order = .{
+            .keys = &.{.{ .column = if (distinct) 1 else 3, .descending = true }},
+            .limit = 3,
+            .offset = 2,
+        },
     };
     var want = try runMultiAggregate(gpa, a, base);
     defer want.deinit(gpa);
@@ -23630,7 +24330,10 @@ test "selected owner coded identity replays a late dictionary mismatch after ear
         args.start_reads = .{ .ctx = &reader, .start = Reader.start, .abandon = Reader.abandon };
         args.dict_probe = .{ .ctx = &reader, .add = Reader.probe };
         const explanation = try explainAggregate(gpa, ta, args);
-        try testing.expectEqual(.packed_count_top_h, explanation.record_path.?.layout);
+        try testing.expectEqual(
+            @as(@FieldType(RecordAdmission, "layout"), if (distinct) .pair_distinct else .packed_count_top_h),
+            explanation.record_path.?.layout,
+        );
         var got = if (fault)
             try runMultiAggregate(gpa, ta, args)
         else
@@ -23647,6 +24350,14 @@ test "selected owner coded identity replays a late dictionary mismatch after ear
         try testing.expectEqual(@as(usize, 16), reader.window.releases.load(.monotonic));
         try testing.expect(ledger.used.load(.monotonic) < 1 << 20);
     };
+}
+
+test "selected owner coded identity replays a late dictionary mismatch after earlier records" {
+    try selectedIdentityReplayTrial(false);
+}
+
+test "M1 finish DISTINCT replays a late argument dictionary mismatch after completed groups and NULL presence" {
+    try selectedIdentityReplayTrial(true);
 }
 
 test "selected COUNT setup refusal preserves an occupied ledger and falls back to ordinary grouping" {
@@ -23940,4 +24651,153 @@ test "integer COUNT repeated RG dictionaries stay coded after complete union ref
     args.ndv_union = false;
     const no_union = try explainAggregate(gpa, a, args);
     try testing.expectEqual(.integer_count_top_h, no_union.record_path.?.layout);
+}
+
+test "M1 finish DISTINCT selected owners match sets for skew NULL groups arguments and the empty global group" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [4096]i32 = undefined;
+    var x: [4096]i64 = undefined;
+    var s: [4096][]const u8 = undefined;
+    var kd: [4096]u32 = undefined;
+    var xd: [4096]u32 = undefined;
+    for (&k, &x, &s, &kd, &xd, 0..) |*key, *arg, *word, *key_def, *arg_def, i| {
+        key.* = if (i % 8 == 0) 0 else if (i % 4 != 0) 1 else @intCast(i % 17);
+        arg.* = @intCast(i % 13);
+        word.* = try std.fmt.allocPrint(a, "dictionary-string-with-shared-prefix-{d}", .{i % 7});
+        key_def.* = @intFromBool(i % 97 != 0);
+        arg_def.* = @intFromBool(key.* != 0 and i % 11 != 0);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{
+            .name = "k",
+            .col = .{ .i32 = .{ .values = &k, .def_levels = &kd, .max_def = 1 } },
+            .parquet_type = .INT32,
+            .nullable = true,
+        },
+        .{
+            .name = "x",
+            .col = .{ .i64 = .{ .values = &x, .def_levels = &xd, .max_def = 1 } },
+            .parquet_type = .INT64,
+            .nullable = true,
+        },
+        .{ .name = "s", .col = .{ .string = .{ .values = &s } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 16;
+    const Case = struct { group: ?[]const u8, agg: []const u8, filter: ?[]const u8 = null, top: bool = false };
+    const cases = [_]Case{
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c" },
+        .{ .group = "s", .agg = "count(*) AS c,count(DISTINCT x) AS d", .top = true },
+        .{ .group = "k,s", .agg = "count(DISTINCT x) AS d" },
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d", .filter = "k = 0" },
+        .{ .group = null, .agg = "count(DISTINCT s) AS d,count(*) AS c" },
+        .{ .group = null, .agg = "count(DISTINCT s) AS d", .filter = "k < 0" },
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d", .filter = "k < 0" },
+    };
+    for (cases) |c| {
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "M1-distinct", .bytes = bytes.buffer.items }},
+            .metas = &.{meta},
+            .aggregate = c.agg,
+            .group_by = c.group,
+            .filter = c.filter,
+            .max_memory = 512 << 20,
+            .min_bytes_per_worker = 1,
+            .integer_records_min_rows = 0,
+            .integer_records = false,
+            .byte_records = false,
+            .msd_records = false,
+            .dense = false,
+            .distinct_pairs = .off,
+            .plain_rules = false,
+            .result_order = if (c.top) .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3 } else .{},
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        for ([_]bool{ false, true }) |raw| for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+            if (raw and (c.group == null or std.mem.indexOf(u8, c.group.?, "s") != null)) continue;
+            args.ndv_union = !raw;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.integer_records = true;
+            args.distinct_pairs = .on;
+            args.parallelism = j;
+            args.decode_batch_rows = window;
+            args.taken = &taken;
+            const explanation = try explainAggregate(gpa, a, args);
+            try testing.expectEqual(.pair_distinct, explanation.record_path.?.layout);
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.integer_records));
+            try testing.expect(got.distinct_pairs);
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
+            try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+        };
+    }
+}
+
+test "M1 finish partitions full and top-H states including preparation cleanup ties and failed starts" {
+    const a = testing.allocator;
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .alias = "c", .result = .i64, .arg = null, .where = null },
+        .{ .func = .min, .alias = "lo", .result = .bytes, .arg = null, .where = null },
+    };
+    for ([_]usize{ 1, 16 }) |workers| for ([_]bool{ false, true }) |top| {
+        var tables: [3]expr_agg.GroupTable = undefined;
+        for (&tables) |*t| t.* = .init(a, 256 << 20);
+        defer {
+            finishGroupRanges(&tables, null, null, workers, true);
+            for (&tables) |*t| t.deinitStorage();
+        }
+        const n = 16391;
+        for (&tables, 0..) |*t, ti| for (0..n) |i| {
+            var key: [32]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&key, "g-{d}", .{i});
+            const id = try t.getOrInsert(bytes, &calls, i * 5 + 2 - ti);
+            const at = @as(usize, id) * calls.len;
+            t.accumulators.items[at] = .{ .count = i % 7 + 1 };
+            t.accumulators.items[at + 1] = .{ .min_bytes = try a.dupe(u8, if (ti == 1) "best" else "other") };
+        };
+        const refs = try a.alloc(MergeGroupRef, n * tables.len);
+        defer a.free(refs);
+        finishGroupRanges(&tables, refs, null, workers, false);
+        for (refs, 0..) |ref, i| {
+            try testing.expectEqual(@as(u32, @intCast(i / n)), ref.table);
+            try testing.expectEqual(@as(u32, @intCast(i % n)), ref.group);
+        }
+        var slots: std.ArrayList(MergedSlot) = .empty;
+        defer slots.deinit(a);
+        var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+        defer {
+            freeAccumulatorRanges(a, accs.items, workers);
+            accs.deinit(a);
+        }
+        const cut: ?ResultCut = if (top) .{ .a_idx = 0, .k = 7 } else null;
+        if (workers == 16) spawn_util.injectFailureAfter(1);
+        defer spawn_util.resetFailure();
+        try mergeFoldedRefs(a, a, &tables, refs, &calls, workers, cut, false, &slots, &accs);
+        if (top) try keepCountTop(a, a, &calls, .{ .a_idx = 0, .k = 7 }, &slots, &accs);
+        try sortSlotsByFirst(a, slots.items, workers);
+        for ([_]bool{ false, true }) |typed| try testing.expectEqual(
+            answerBytes(slots.items, &.{.{ .lane = .string, .nullable = true }}, &.{.string}, typed),
+            answerBytesParallel(slots.items, &.{.{ .lane = .string, .nullable = true }}, &.{.string}, typed, workers),
+        );
+        try testing.expectEqual(@as(usize, if (top) 7 else n), slots.items.len);
+        for (slots.items, 0..) |slot, i| {
+            const id = if (top) 6 + i * 7 else i;
+            try testing.expectEqual(@as(u64, id * 5), slot.first);
+            try testing.expectEqual(@as(u64, 3 * (id % 7 + 1)), accs.items[slot.idx].count);
+            try testing.expectEqualStrings("best", accs.items[slot.idx + 1].min_bytes.?);
+        }
+    };
 }

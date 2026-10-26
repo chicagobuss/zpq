@@ -4822,15 +4822,22 @@ pub const GroupTable = struct {
     /// releases it. A shared budget charges the set instead, so this is not a second bill.
     fn chargeSpilledSet(self: *GroupTable) error{ExceededMemoryBudget}!void {
         const n = @sizeOf(DistinctSet);
-        if (self.allocated_bytes + n > self.max_memory_bytes) return error.ExceededMemoryBudget;
-        self.set_objects += n;
-        self.allocated_bytes += n;
+        var before = @atomicLoad(usize, &self.allocated_bytes, .monotonic);
+        while (true) {
+            const after = std.math.add(usize, before, n) catch return error.ExceededMemoryBudget;
+            if (after > self.max_memory_bytes) return error.ExceededMemoryBudget;
+            before = @cmpxchgWeak(usize, &self.allocated_bytes, before, after, .monotonic, .monotonic) orelse break;
+        }
+        _ = @atomicRmw(usize, &self.set_objects, .Add, n, .monotonic);
     }
 
     fn releaseSpilledSet(self: *GroupTable) void {
         const n = @sizeOf(DistinctSet);
-        self.set_objects -= n;
-        self.allocated_bytes -= n;
+        // Disjoint merge/cleanup partitions can grow or release sets charged to the same source table. Scanning
+        // and table growth have joined; only the atomic set-object charges/releases overlap in that phase.
+        const objects = @atomicRmw(usize, &self.set_objects, .Sub, n, .monotonic);
+        const bytes = @atomicRmw(usize, &self.allocated_bytes, .Sub, n, .monotonic);
+        std.debug.assert(objects >= n and bytes >= n);
     }
 
     pub fn init(allocator: std.mem.Allocator, max_memory_bytes: usize) GroupTable {
@@ -4845,13 +4852,22 @@ pub const GroupTable = struct {
     }
 
     pub fn deinit(self: *GroupTable) void {
-        for (self.keys.items) |key| {
-            self.allocator.free(key);
-        }
-        self.keys.deinit(self.allocator);
-        self.first.deinit(self.allocator);
+        self.deinitRange(0, self.groupCount());
+        self.deinitStorage();
+    }
 
-        for (self.accumulators.items) |*acc| {
+    /// Disjoint group ranges can release their owned payloads concurrently. Storage remains live until every
+    /// range has joined; callers then use deinitStorage, rather than walking all groups again on the main thread.
+    pub fn deinitRange(self: *GroupTable, begin: usize, end: usize) void {
+        std.debug.assert(begin <= end and end <= self.groupCount());
+        if (self.fixed_stride == 0) for (self.keys.items[begin..end]) |key| self.allocator.free(key);
+        // An allocation failure may leave the last group only partly initialized. Partition the actual cell
+        // slice, including that tail; an empty table's destructor must also release any cells it already owns.
+        const groups = self.groupCount();
+        const cells = self.accumulators.items.len;
+        const lo: usize = if (groups == 0) 0 else @intCast(@as(u128, cells) * begin / groups);
+        const hi: usize = if (groups == 0) cells else @intCast(@as(u128, cells) * end / groups);
+        for (self.accumulators.items[lo..hi]) |*acc| {
             switch (acc.*) {
                 .min_bytes => |mb| if (mb) |s| self.allocator.free(s),
                 .max_bytes => |mb| if (mb) |s| self.allocator.free(s),
@@ -4859,6 +4875,12 @@ pub const GroupTable = struct {
                 else => {},
             }
         }
+    }
+
+    /// Requires that deinitRange has released every group exactly once.
+    pub fn deinitStorage(self: *GroupTable) void {
+        self.keys.deinit(self.allocator);
+        self.first.deinit(self.allocator);
         self.accumulators.deinit(self.allocator);
         self.compact.words.deinit(self.allocator);
         self.map.deinit();
@@ -7469,4 +7491,37 @@ test "shared integer duplicate counts decline levels-only and short value lanes 
             }
         }
     };
+}
+
+test "M1 parallel DISTINCT source charges and releases preserve the private ceiling" {
+    const a = std.testing.allocator;
+    var table = GroupTable.init(a, 8 * @sizeOf(DistinctSet));
+    defer table.deinit();
+    const Task = struct {
+        table: *GroupTable,
+        allocator: std.mem.Allocator,
+        cursor: *std.atomic.Value(usize),
+        err: ?anyerror = null,
+        fn run(t: *@This()) void {
+            while (t.err == null) {
+                const job = t.cursor.fetchAdd(1, .monotonic);
+                if (job >= 256) return;
+                var set = t.table.freshDistinct();
+                defer set.deinit(t.allocator);
+                for (0..4) |i| set.insertU64(t.allocator, job * 7 + i) catch |e| {
+                    t.err = e;
+                    return;
+                };
+                std.debug.assert(set.count() == 4);
+            }
+        }
+    };
+    var tasks: [8]Task = undefined;
+    var cursor = std.atomic.Value(usize).init(0);
+    for (&tasks) |*t| t.* = .{ .table = &table, .allocator = a, .cursor = &cursor };
+    const spawn = @import("../spawn.zig");
+    if (!spawn.runTree(Task, &tasks, .{ .stack_size = 1 << 20 }, Task.run)) tasks[0].run();
+    for (tasks) |t| if (t.err) |e| return e;
+    try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), table.set_objects);
 }

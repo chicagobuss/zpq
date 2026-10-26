@@ -7,6 +7,28 @@ import pyarrow.parquet as pq
 from .parquet import T_I32, field, rewrite_footer
 
 
+def m1_finish(out_dir):
+    """NULL-preserving packed DISTINCT and full/top-H partition finishes, with indexed RG dictionary permutations."""
+    import numpy as np
+    r = np.arange(32 * 1024, dtype=np.int64)
+    k = np.where(r % 8 == 0, 0, np.where(r % 4 != 0, 1, (r // 4) % 61 + 2)).astype(np.int32)
+    words = np.array([f"long-dictionary-value-{i}-with-shared-prefix" for i in range(29)], dtype=object)
+    table = pa.table({
+        'k': pa.array(k, mask=r % 97 == 0),
+        'x': pa.array(r % 17, mask=(k == 0) | (r % 11 == 0)),
+        's': pa.array(words[(r + r // 1024) % len(words)], mask=r % 13 == 0),
+        'v': pa.array(r % 31 - 15, mask=r % 19 == 0),
+        'd': pa.array((r % 31 - 15) / 7.0, mask=r % 19 == 0),
+        'rid': pa.array(r),
+    })
+    for coded in (True, False):
+        path = out_dir / f"m1_finish_{'dict' if coded else 'plain'}.parquet"
+        pq.write_table(table, path, row_group_size=1024, compression='snappy', use_dictionary=coded,
+                       write_page_index=True, data_page_size=256, write_batch_size=32)
+        assert pq.read_table(path).equals(table)
+        print(path)
+
+
 def group_stream(out_dir):
     """High-cardinality nullable integer/short-byte keys for full record-stream sinks."""
     import numpy as np

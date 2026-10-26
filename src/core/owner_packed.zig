@@ -40,7 +40,7 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
 
             pub inline fn append(l: *Local, r: Record) !void {
                 try L.validate(r);
-                if (L.ordinal(r) >= l.state.input_rows or r.weight > l.state.record_rows -| l.accepted)
+                if (L.ordinal(r) >= l.state.input_rows or r.weight > l.state.weight_rows -| l.accepted)
                     return error.BadPartial;
                 if (!l.bypass and l.hot.entries.len != 0) {
                     const trial = l.seen < l.state.trial_rows;
@@ -67,6 +67,7 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
             charged: usize,
             input_rows: usize,
             record_rows: usize,
+            weight_rows: usize,
             parts: usize,
             shift: u6,
             trial_rows: usize,
@@ -98,8 +99,22 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                 workers: usize,
                 parts: usize,
             ) !?*State {
+                return initWeighted(a, ledger, input_rows, record_rows, record_rows, workers, parts);
+            }
+
+            /// A completed pair emits one physical COUNT contribution but can carry many duplicate rows for
+            /// count(*). The caller proves the contribution bound separately from its total weight/ordinal bound.
+            pub fn initWeighted(
+                a: std.mem.Allocator,
+                ledger: *memory.SharedBudget,
+                input_rows: usize,
+                weight_rows: usize,
+                record_rows: usize,
+                workers: usize,
+                parts: usize,
+            ) !?*State {
                 if (workers == 0 or workers > 64 or parts < 2 or parts > 16384 or
-                    !std.math.isPowerOfTwo(parts) or record_rows > input_rows) return null;
+                    !std.math.isPowerOfTwo(parts) or record_rows > weight_rows or weight_rows > input_rows) return null;
                 if (!L.admitsRows(input_rows)) return null;
                 const blocks = Scatter.blockCount(record_rows, workers, parts);
                 if (blocks >= std.math.maxInt(u32) - workers * 128 or record_rows > std.math.maxInt(Ordinal))
@@ -118,6 +133,7 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                     .charged = quote,
                     .input_rows = input_rows,
                     .record_rows = record_rows,
+                    .weight_rows = weight_rows,
                     .parts = parts,
                     .shift = @intCast(@as(usize, 64) - std.math.log2_int(usize, parts)),
                     .trial_rows = cache.trialRows(slots, @sizeOf(Record)),
@@ -154,7 +170,14 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                     try l.hot.flush(l, Local.emit);
                     accepted = std.math.add(usize, accepted, l.accepted) catch return error.BadPartial;
                 }
-                if (accepted > s.record_rows) return error.BadPartial;
+                if (accepted > s.weight_rows) return error.BadPartial;
+                if (s.weight_rows != s.record_rows) {
+                    var physical: usize = 0;
+                    for (s.locals) |l| {
+                        for (l.frontier.histogram) |n| physical += n;
+                    }
+                    if (physical > s.record_rows) return error.BadPartial;
+                }
                 const scratch = Fold.concurrentBytes(s, s.parts, s.locals.len, partitionRows);
                 if (scratch == std.math.maxInt(usize)) return error.ExceededMemoryBudget;
                 // Refusal discards private records and requests the established stable-input replay, before any

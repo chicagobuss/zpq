@@ -13622,3 +13622,91 @@ test "ALP metadata opens and only a decoded ALP column refuses" {
     try std.testing.expect(diag.detail == .decode);
     try std.testing.expectEqual(schema.Encoding.ALP, diag.detail.decode.encoding.?);
 }
+
+test "M1 DISTINCT writes identical canonical Parquet with sixteen actual producers and both selected readers" {
+    const fixture = "ci/fixtures/parquet/packed_count_indexed.parquet";
+    const gpa = std.testing.allocator;
+    const bytes = try metadata.readFileSlice(fixture, gpa);
+    defer gpa.free(bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/m1.parquet", .{tmp.sub_path});
+    const Case = struct { grouped: bool, filter: ?[]const u8 = null, top: bool = false };
+    for ([_]Case{
+        .{ .grouped = true },
+        .{ .grouped = true, .top = true },
+        .{ .grouped = true, .filter = "k IS NULL" },
+        .{ .grouped = false, .filter = "f < -1000" },
+    }) |c| {
+        var expected: ?[]u8 = null;
+        defer if (expected) |b| gpa.free(b);
+        for ([_]bool{ false, true }) |owner| for ([_]usize{ 1, 16 }) |workers|
+            for ([_]usize{ 0, 64 }) |window| {
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const meta = try metadata.open(a, bytes);
+                const args: scan.MultiAggArgs = .{
+                    .inputs = &.{.{ .name = fixture, .bytes = bytes }},
+                    .metas = &.{meta},
+                    .aggregate = if (c.grouped) "count(DISTINCT k) AS d,count(*) AS c" else "count(DISTINCT b) AS d",
+                    .group_by = if (c.grouped) "b" else null,
+                    .filter = c.filter,
+                    .parallelism = workers,
+                    .min_bytes_per_worker = 1,
+                    .decode_batch_rows = window,
+                    .integer_records = owner,
+                    .integer_records_min_rows = 0,
+                    .byte_records = false,
+                    .msd_records = false,
+                    .dense = false,
+                    .plain_rules = false,
+                    .max_memory = 512 << 20,
+                    .distinct_pairs = if (owner) .on else .off,
+                    .result_order = if (c.top) .{
+                        .keys = &.{.{ .column = 1, .descending = true }},
+                        .limit = 3,
+                    } else .{},
+                };
+                const explain = try scan.explainAggregate(gpa, a, args);
+                try std.testing.expectEqual(workers, explain.workers);
+                var result = try scan.runMultiAggregate(gpa, a, args);
+                defer result.deinit(gpa);
+                // runMultiAggregate owns its replay markers. These string-key/scalar cases cannot use the old
+                // fixed-key pair fold, so this result flag proves the selected pair owner actually completed.
+                try std.testing.expectEqual(owner, result.distinct_pairs);
+                try result.output.applyResultOrder(gpa, args.result_order);
+                if (result.output.group_rows) |rows| {
+                    _ = try writeGroupedParquet(
+                        a,
+                        path,
+                        result.output.group_cols.?,
+                        result.state.group_col_types.?,
+                        rows,
+                        .SNAPPY,
+                        .{},
+                        .{},
+                        null,
+                    );
+                } else {
+                    _ = try writeOneRowParquet(
+                        a,
+                        path,
+                        result.state.agg_calls,
+                        result.state.accumulators,
+                        result.state.agg_sources,
+                        .SNAPPY,
+                        .{},
+                        null,
+                        false,
+                    );
+                }
+                const encoded = try metadata.readFileSlice(path, gpa);
+                if (expected) |want| {
+                    defer gpa.free(encoded);
+                    try std.testing.expectEqualSlices(u8, want, encoded);
+                } else expected = encoded;
+            };
+    }
+}

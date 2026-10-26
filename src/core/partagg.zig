@@ -190,9 +190,27 @@ pub const PartAgg = struct {
 
     pub fn deinit(self: *PartAgg) void {
         self.budget.release(self.run_credit.load(.monotonic));
-        for (self.runs) |*rs| for (rs) |*r| r.free(self.gpa, self.budget);
+        // Runs and tables are partition-private after the scan/merge joins. Reclaim strings and winners beside
+        // their partition; serial destruction otherwise costs a second full group-count tail after typed fill.
+        const Task = struct {
+            state: *PartAgg,
+            cursor: *std.atomic.Value(usize),
+            fn run(t: *@This()) void {
+                const s = t.state;
+                while (true) {
+                    const p = t.cursor.fetchAdd(1, .monotonic);
+                    if (p >= n_parts) return;
+                    for (s.runs) |*rs| rs[p].free(s.gpa, s.budget);
+                    if (p < s.parts.len) s.parts[p].table.deinit();
+                }
+            }
+        };
+        var storage: [64]Task = undefined;
+        const tasks = storage[0..@max(1, @min(storage.len, self.runs.len))];
+        var cursor = std.atomic.Value(usize).init(0);
+        for (tasks) |*t| t.* = .{ .state = self, .cursor = &cursor };
+        if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, .{ .stack_size = 1 << 20 }, Task.run)) tasks[0].run();
         self.gpa.free(self.runs);
-        for (self.parts) |*p| p.table.deinit();
         self.gpa.free(self.parts);
         self.budget.release(self.private_metadata);
         self.* = undefined;

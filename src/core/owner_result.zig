@@ -43,7 +43,7 @@ pub fn Top(
         }
 
         pub fn init(a: std.mem.Allocator, ledger: *memory.SharedBudget, workers: usize, k: usize, ctx: Context) !Self {
-            if (workers == 0 or workers > 64 or k == 0 or k > 1024) return error.BadPartial;
+            if (workers == 0 or workers > 64 or k == 0) return error.BadPartial;
             const quote = bytes(workers, k);
             _ = ledger.drawExact(quote) orelse return error.ExceededMemoryBudget;
             var s: Self = .{ .gpa = a, .ledger = ledger, .charged = quote };

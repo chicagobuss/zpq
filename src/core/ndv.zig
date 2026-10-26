@@ -488,6 +488,78 @@ pub fn collectRetaining(
     return stat;
 }
 
+/// Speculative sparse identity, never NDV evidence. Missing encoding_stats cannot certify complete dictionary
+/// coverage, but the decoder can validate every callback and replay the entire owner on a later PLAIN page.
+/// Retention has the same byte cap as the certified union; u32 translations have an independent cardinality cap.
+pub fn retainIdentity(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    files: []const File,
+    metas: []const schema.FileMetaData,
+    keys: []const expr.Expr,
+    workers: usize,
+    max_memory: usize,
+    identity_limit: usize,
+) !?agg_dense.Domain {
+    if (keys.len == 0 or max_memory < 1 << 20) return null;
+    var refs: std.ArrayList(Ref) = .empty;
+    for (metas, 0..) |m, fi| for (m.row_groups.items, 0..) |_, ri|
+        try refs.append(arena, .{ .file = fi, .rg = ri });
+    if (refs.items.len == 0) return null;
+    const axes = try gpa.alloc(agg_dense.Axis, keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (axes[0..initialized]) |*axis| axis.deinit(gpa);
+        gpa.free(axes);
+    }
+    var bytes = axes.len * @sizeOf(agg_dense.Axis);
+    for (keys, axes) |key, *axis| {
+        if (key != .col_ref) break;
+        const ci = key.col_ref.col_idx;
+        var flat = true;
+        for (refs.items) |ref| {
+            const m = metas[ref.file];
+            if (ci >= m.row_groups.items[ref.rg].columns.items.len) {
+                flat = false;
+                break;
+            }
+            const cm = m.row_groups.items[ref.rg].columns.items[ci].meta_data orelse {
+                flat = false;
+                break;
+            };
+            if (m.getColumnLevels(cm.path_in_schema.items).max_rep != 0) {
+                flat = false;
+                break;
+            }
+        }
+        if (!flat) break;
+        var kept: ?agg_dense.Axis = null;
+        _ = try unionBoundForIdentity(
+            gpa,
+            arena,
+            files,
+            metas,
+            refs.items,
+            ci,
+            workers,
+            max_memory,
+            &kept,
+            max_memory / 16 -| bytes,
+            identity_limit,
+            true,
+            null,
+        );
+        const retained = kept orelse break;
+        axis.* = retained;
+        bytes += axis.bytes;
+        initialized += 1;
+    }
+    if (initialized == axes.len) return .{ .axes = axes, .bytes = bytes };
+    for (axes[0..initialized]) |*axis| axis.deinit(gpa);
+    gpa.free(axes);
+    return null;
+}
+
 const P = agg.NUM_PARTS;
 const Partition = struct {
     lock: std.atomic.Value(bool) align(64) = .init(false),
@@ -544,7 +616,8 @@ const Shared = struct {
     dropped: std.atomic.Value(bool) = .init(true),
     retained: std.atomic.Value(usize) = .init(0),
     retain_limit: usize = 0,
-    /// Values all partitions hold, and whether passing `agg_dense.max_ids` of them (or dropping retention) fails the
+    identity_limit: usize = agg_dense.max_ids,
+    /// Values all partitions hold, and whether passing the identity limit (or dropping retention) fails the
     /// union.
     distinct: std.atomic.Value(usize) = .init(0),
     strict: bool = false,
@@ -678,7 +751,7 @@ fn retainRun(s: *Shared, p: *Partition, pi: u32, ints: []const u64, js: []const 
     for (js) |j| {
         const gop = p.ids.getOrPut(s.gpa, ints[j]) catch return s.drop();
         if (!gop.found_existing) {
-            if (p.vals.items.len >= agg_dense.max_ids) {
+            if (p.vals.items.len >= @min(s.identity_limit, 1 << part_shift)) {
                 p.ids.removeByPtr(gop.key_ptr);
                 return s.drop();
             }
@@ -691,7 +764,7 @@ fn retainRun(s: *Shared, p: *Partition, pi: u32, ints: []const u64, js: []const 
         packed_ids[j] = (pi << part_shift) | gop.value_ptr.*;
     }
     const added = p.vals.items.len - before;
-    if (s.distinct.fetchAdd(added, .monotonic) + added >= agg_dense.max_ids) return s.drop();
+    if (s.distinct.fetchAdd(added, .monotonic) + added >= s.identity_limit) return s.drop();
     // A map entry and its value, kept on the high side; the presized share is paid already.
     const over = p.vals.items.len -| p.charged;
     p.charged += over;
@@ -708,7 +781,7 @@ fn retainBytes(s: *Shared, p: *Partition, pi: u32, values: []const []const u8, j
         }
         const n = p.byte_vals.items.len;
         const over = n + 1 -| p.charged;
-        if (n >= agg_dense.max_ids or !s.charge(over * 64 +| values[j].len)) return s.drop();
+        if (n >= @min(s.identity_limit, 1 << part_shift) or !s.charge(over * 64 +| values[j].len)) return s.drop();
         p.charged += over;
         const owned = s.gpa.dupe(u8, values[j]) catch return s.drop();
         p.byte_vals.append(s.gpa, owned) catch {
@@ -723,7 +796,7 @@ fn retainBytes(s: *Shared, p: *Partition, pi: u32, values: []const []const u8, j
         ids[j] = (pi << part_shift) | @as(u32, @intCast(n));
     }
     const added = p.byte_vals.items.len - before;
-    if (s.distinct.fetchAdd(added, .monotonic) + added >= agg_dense.max_ids) return s.drop();
+    if (s.distinct.fetchAdd(added, .monotonic) + added >= s.identity_limit) return s.drop();
     return true;
 }
 
@@ -738,6 +811,40 @@ fn unionBound(
     max_memory: usize,
     retain: ?*?agg_dense.Axis,
     retain_limit: usize,
+    /// Past the cost gate: fail (no bound) rather than outgrow a domain or give retention up.
+    strict: bool,
+    /// Fail (no bound) once the union holds more values than this.
+    stop: ?u64,
+) !?u64 {
+    return unionBoundForIdentity(
+        gpa,
+        arena,
+        files,
+        metas,
+        refs,
+        col,
+        workers,
+        max_memory,
+        retain,
+        retain_limit,
+        agg_dense.max_ids,
+        strict,
+        stop,
+    );
+}
+
+fn unionBoundForIdentity(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    files: []const File,
+    metas: []const schema.FileMetaData,
+    refs: []const Ref,
+    col: usize,
+    workers: usize,
+    max_memory: usize,
+    retain: ?*?agg_dense.Axis,
+    retain_limit: usize,
+    identity_limit: usize,
     /// Past the cost gate: fail (no bound) rather than outgrow a domain or give retention up.
     strict: bool,
     /// Fail (no bound) once the union holds more values than this.
@@ -790,6 +897,7 @@ fn unionBound(
         .parts = &parts,
         .page_limit = @min(16 * 1024 * 1024, max_memory / 8 / n_workers),
         .stop = stop,
+        .identity_limit = @min(identity_limit, std.math.maxInt(u32)),
     };
     const physical = if (refs.len > 0)
         metas[refs[0].file].row_groups.items[refs[0].rg].columns.items[col].meta_data.?.type
@@ -809,7 +917,7 @@ fn unionBound(
         @memset(shared.trans, &.{});
         shared.dropped = .init(false);
         // The largest dictionary is a floor on the domain: its share of it, sized once, spares each map its growth.
-        const each: u32 = @intCast(@min(max_entries, agg_dense.max_ids) / P + 64);
+        const each: u32 = @intCast(@min(max_entries, shared.identity_limit) / P + 64);
         for (&parts) |*p| {
             p.mapped = true;
             p.string_key = physical == .BYTE_ARRAY;
@@ -850,7 +958,7 @@ fn unionBound(
     const kept = for (&parts) |*p| {
         if (!p.mapped) break false;
     } else true;
-    if (shared.trans.len > 0 and kept and shared.retaining() and count < agg_dense.max_ids) {
+    if (shared.trans.len > 0 and kept and shared.retaining() and count < shared.identity_limit) {
         retain.?.* = try buildAxis(gpa, metas, refs, col, &parts, shared.trans, @intCast(count));
         shared.trans = &.{};
     }
@@ -1511,4 +1619,35 @@ test "ndv: composite retention survives worker spawn refusal and shares the unio
     try std.testing.expect(d.ids() >= stat.hi);
     try std.testing.expect(d.bytes <= (512 << 20) / 16);
     try std.testing.expect(spawn.failuresInjected() > 0);
+}
+
+test "M1 speculative identity retains dictionary translations without strengthening unknown NDV evidence" {
+    const a = std.testing.allocator;
+    const metadata = @import("parquet/metadata.zig");
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const meta = try metadata.open(temp, bytes);
+    for (meta.row_groups.items) |*rg| for (rg.columns.items) |*col| {
+        if (col.meta_data) |*cm| cm.encoding_stats = null;
+    };
+    const files = [_]File{.{ .bytes = bytes, .local = true }};
+    const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } }};
+    const bound = try collect(a, temp, &files, &.{meta}, &keys, 4, 512 << 20, true);
+    try std.testing.expectEqual(.unknown, bound.source);
+    for ([_]usize{ 2, agg_dense.max_ids * 4 }) |limit| {
+        var domain = try retainIdentity(a, temp, &files, &.{meta}, &keys, 4, 512 << 20, limit);
+        defer if (domain) |*d| d.deinit(a);
+        try std.testing.expectEqual(limit > 2, domain != null);
+        if (domain) |d| {
+            for (0..meta.row_groups.items.len) |rg| {
+                const translation = d.axes[0].forRowGroup(0, rg).?;
+                try std.testing.expectEqual(d.axes[0].len(), translation[translation.len - 1]);
+                for (translation) |id| try std.testing.expect(id < d.axes[0].ids());
+            }
+        }
+        try std.testing.expectEqualDeep(bound, try collect(a, temp, &files, &.{meta}, &keys, 4, 512 << 20, true));
+    }
 }

@@ -35,8 +35,7 @@ def main():
         "ZPQ_ARCH_CONFIG", "/mnt/fast/zpq-out/arch-matrix/fleet.json"))
     parser.add_argument("--setup-only", action="store_true")
     args = parser.parse_args()
-    inventory = Path(args.config).expanduser().resolve()
-    config = json.loads(inventory.read_text())
+    config = json.loads(Path(args.config).expanduser().read_text())
     hosts = args.host or [h for h, v in config["hosts"].items() if v.get("enabled", True)]
     for host in hosts:
         if host not in config["hosts"] or not config["hosts"][host].get("enabled", True):

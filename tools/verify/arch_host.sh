@@ -98,15 +98,17 @@ set -e
 release
 trap - EXIT
 if [ "$rc" -eq 3 ]; then
-    notify '.notify' "P0 arch matrix HASH MISMATCH on $host; $run_dir; retrieving exact output now."
+    notify '.notify' "P0 arch matrix HASH MISMATCH on $host; $run_dir; retrieving exact output now." || true
 fi
-if ! rsync -az "$host:$run_dir/" "$local_dir/"; then
+if ! rsync -az "$host:$run_dir/summary.json" "$local_dir/"; then
     echo "collection failed; remote evidence retained at $host:$run_dir" >&2
     exit 2
 fi
-if [ ! -f "$local_dir/summary.json" ]; then
-    echo "summary missing; remote evidence retained at $host:$run_dir" >&2
-    exit 2
+if [ "$rc" -eq 3 ]; then
+    while IFS= read -r file; do
+        rsync -az "$host:$run_dir/$file" "$local_dir/"
+    done < <(jq -r '.queries[] | select(.correctness == "HASH_MISMATCH") |
+        .error_text | split("; exact output ")[1] | split("/")[-1]' "$local_dir/summary.json")
 fi
 jq --arg status "$release_status" --arg comparison "$(get '.comparison // "no cross-host comparison"')" \
     '.release_smoke = {status: $status, log: "release-smoke.log"} | .cross_host_comparison = $comparison |
@@ -115,6 +117,5 @@ jq --arg status "$release_status" --arg comparison "$(get '.comparison // "no cr
 mv "$local_dir/summary.tmp" "$local_dir/summary.json"
 ln -sfn "$run_id/summary.json" "$out/$host/latest.json"
 echo "summary $local_dir/summary.json"
-# Answers are collected above; cached setup is retained for the next integration push.
 if [ "$rc" -eq 0 ]; then remote rm -rf "$run_dir"; fi
 exit "$rc"

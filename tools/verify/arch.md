@@ -45,6 +45,7 @@ The 90-second budget (max 120) covers correctness and fresh-process measurements
 setup/collection are separate. One initial sample precedes three hot samples.
 Ratios never stop sampling; missing samples stay null. Hash-only has no timings.
 
-Each run collects `summary.json` and exact answers locally, then removes successful
-remote answers, retaining cached setup. Exits: 0 passed, 1 failed, 2 incomplete
+Each run collects only `summary.json` (including host-computed hashes) and small
+logs. A hash mismatch fetches only that cell's exact output. Successful remote
+answers are deleted; setup stays cached. Exits: 0 passed, 1 failed, 2 incomplete
 (including correctness budget exhaustion), 3 raw zpq mismatch (preserve/notify).

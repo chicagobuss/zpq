@@ -127,7 +127,9 @@ pub const DecodeScratch = struct {
 };
 
 /// Page buffers and the survivor mask of one worker's sliced scans. One slot per column in flight, grown to the
-/// largest page that column has decompressed and then reused for every later row group. `alloc` is the ledger's
+/// largest page that column has decompressed and then reused for every later row group. At the end of a row group
+/// the pool is trimmed to at most one eighth of the ledger it is charged to, so the next group can draw the rest.
+/// `alloc` is the ledger's
 /// charged allocator when the scan has one: a buffer is drawn when it grows, and the draw stands until `deinit` (the
 /// worker's release), which unmaps it. Safe builds fill a reused page with `reuse_poison` so a decoder that handed
 /// back stale bytes fails instead of agreeing with itself.
@@ -135,6 +137,9 @@ pub const SliceScratch = struct {
     pub const reuse_poison: u8 = 0xA5;
 
     alloc: std.mem.Allocator,
+    /// Owner of `alloc`. A stateless allocator is its vtable alone; it has no context pointer.
+    owner_ctx: usize = 0,
+    owner_vt: usize = 0,
     slots: std.ArrayList(Slot) = .empty,
     /// Next slot `checkout` hands out. `rewind` at the start of a pass, while no reader still holds a slot.
     next: usize = 0,
@@ -242,19 +247,13 @@ pub const SliceScratch = struct {
         return n;
     }
 
-    /// At the end of a row group, free the largest retained piece until the pool is within `bound`. `bound` is
-    /// the ledger's one-decode allowance (`lean_decode`). Each piece used to keep its own allowance, so a wide
-    /// scan accumulated every column's historical peak.
+    /// At the end of a row group, free the largest retained piece until the pool is within `bound`. Callers pass
+    /// one eighth of the ledger this pool is charged to (`memory.retainedCarry`). A wider peak is a spike for the
+    /// group that made it; the next group can draw the other seven eighths, and is refused if it still does not fit.
     pub fn trimAbove(self: *SliceScratch, bound: usize) void {
         while (self.retainedBytes() > bound) {
             if (!self.releaseLargest()) break;
         }
-    }
-
-    /// Drop every retained buffer. Call only when no reader still aliases this pool: a charged allocation failed
-    /// at a row-group boundary, and the next attempt has to fit in the ledger.
-    pub fn evictIdle(self: *SliceScratch) void {
-        self.trimAbove(0);
     }
 
     fn releaseLargest(self: *SliceScratch) bool {
@@ -311,8 +310,7 @@ test "scratch above the decode allowance is released at row-group end" {
     defer pool.deinit();
     try pool.reserve(1);
     const slot = pool.checkout();
-    // Call sites pass `core_memory.lean_decode`, the ledger's one-decode allowance. A page is enough to prove
-    // the release.
+    // Callers pass one eighth of the ledger allowance. A page is enough to prove the release.
     const bound = std.heap.pageSize();
     const big = bound + 1;
     _ = try slot.scratch.ensure(u8, 1, &slot.scratch.page, big);
@@ -350,35 +348,26 @@ test "scratch retention across columns stays within one decode allowance" {
     _ = try c.scratch.ensure(u8, 1, &c.scratch.page, page * 3);
 }
 
-test "rotating page peaks under the decode allowance yield when the next group needs the room" {
-    const lean = core_memory.lean_decode;
-    const peak = 12 << 20;
+test "row-group scratch keeps at most an eighth of the ledger it is charged to" {
+    const page = std.heap.pageSize();
     var budget: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
     var charged: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget };
     var pool = SliceScratch.init(charged.allocator());
     defer pool.deinit();
-    try pool.reserve(3);
-    _ = pool.checkout();
-    _ = pool.checkout();
-    _ = pool.checkout();
+    try pool.reserve(1);
+    const overhead = budget.used.load(.monotonic);
+    const allowance = page * 8;
+    budget.limit = overhead + allowance;
+    const slot = pool.checkout();
+    _ = try slot.scratch.ensure(u8, 1, &slot.scratch.page, page * 4);
+    const carry = core_memory.retainedCarry(budget.limit);
+    try std.testing.expect(pool.retainedBytes() > carry);
+    pool.trimAbove(carry);
+    try std.testing.expect(pool.retainedBytes() <= carry);
+    // Seven eighths of the allowance remain, so the same peak fits. Nothing is evicted and retried.
     pool.rewind();
-    budget.limit = budget.used.load(.monotonic) + lean;
-    const a = pool.checkout();
-    _ = try a.scratch.ensure(u8, 1, &a.scratch.page, peak);
-    pool.trimAbove(lean);
-    pool.rewind();
-    _ = pool.checkout();
-    const b = pool.checkout();
-    _ = try b.scratch.ensure(u8, 1, &b.scratch.page, peak);
-    pool.trimAbove(lean);
-    try std.testing.expect(pool.retainedBytes() > peak);
-    pool.rewind();
-    _ = pool.checkout();
-    _ = pool.checkout();
-    const c = pool.checkout();
-    try std.testing.expectError(error.OutOfMemory, c.scratch.ensure(u8, 1, &c.scratch.page, peak));
-    pool.evictIdle();
-    _ = try c.scratch.ensure(u8, 1, &c.scratch.page, peak);
+    const again = pool.checkout();
+    _ = try again.scratch.ensure(u8, 1, &again.scratch.page, page * 4);
     try std.testing.expect(budget.used.load(.monotonic) <= budget.limit);
 }
 

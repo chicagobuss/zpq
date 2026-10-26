@@ -4461,38 +4461,61 @@ fn scanRGForAggImpl(
     return selected;
 }
 
-/// The pool on `slot`, charged to `alloc`. A different ledger drops the old pool first.
+const AllocatorOwner = struct { ctx: usize, vt: usize };
+
+/// Identity of `alloc`. `page_allocator`, `smp_allocator` and (where linked) `c_allocator` have no context, so the
+/// vtable is the whole id. Every other allocator's context is its own pointer.
+fn allocatorOwner(alloc: std.mem.Allocator) AllocatorOwner {
+    const vt = @intFromPtr(alloc.vtable);
+    if (alloc.vtable == std.heap.page_allocator.vtable) return .{ .ctx = 0, .vt = vt };
+    if (alloc.vtable == std.heap.smp_allocator.vtable) return .{ .ctx = 0, .vt = vt };
+    if (comptime builtin.link_libc) {
+        if (alloc.vtable == std.heap.c_allocator.vtable) return .{ .ctx = 0, .vt = vt };
+    }
+    if (comptime builtin.target.cpu.arch.isWasm()) {
+        if (alloc.vtable == std.heap.wasm_allocator.vtable) return .{ .ctx = 0, .vt = vt };
+    }
+    return .{ .ctx = @intFromPtr(alloc.ptr), .vt = vt };
+}
+
+/// The pool on `slot`, charged to `alloc`. A different owner drops the old pool first.
 pub fn poolOn(slot: *?*SliceScratch, alloc: std.mem.Allocator) !*SliceScratch {
+    const owner = allocatorOwner(alloc);
     if (slot.*) |pool| {
-        if (pool.alloc.ptr == alloc.ptr and pool.alloc.vtable == alloc.vtable) return pool;
+        if (pool.owner_ctx == owner.ctx and pool.owner_vt == owner.vt) return pool;
         releaseSlicePool(slot);
     }
     const pool = try alloc.create(SliceScratch);
     pool.* = .init(alloc);
+    pool.owner_ctx = owner.ctx;
+    pool.owner_vt = owner.vt;
     slot.* = pool;
     return pool;
 }
 
 test "a slice pool follows the allocator of the current job" {
-    // Two arenas, not `page_allocator`: its `.ptr` is undefined, and comparing that is illegal.
-    var first = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer first.deinit();
-    var second = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer second.deinit();
     var slot: ?*SliceScratch = null;
     defer releaseSlicePool(&slot);
-    const a_alloc = first.allocator();
-    const b_alloc = second.allocator();
+    // A real singleton: its context pointer is not an identity.
+    const pages = std.heap.page_allocator;
+    const page_pool = try poolOn(&slot, pages);
+    try std.testing.expect(try poolOn(&slot, pages) == page_pool);
+
+    var budget_a: core_memory.SharedBudget = .{ .limit = 1 << 20 };
+    var budget_b: core_memory.SharedBudget = .{ .limit = 1 << 20 };
+    var charged_a: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget_a };
+    var charged_b: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget_b };
+    const a_alloc = charged_a.allocator();
+    const b_alloc = charged_b.allocator();
     const a = try poolOn(&slot, a_alloc);
-    const again = try poolOn(&slot, a_alloc);
-    try std.testing.expect(again == a);
+    try std.testing.expect(a != page_pool);
     try a.reserve(1);
+    try std.testing.expect(try poolOn(&slot, a_alloc) == a);
     const b = try poolOn(&slot, b_alloc);
     try std.testing.expect(b != a);
     try std.testing.expect(b.alloc.ptr == b_alloc.ptr);
     try std.testing.expect(b.alloc.vtable == b_alloc.vtable);
-    const again_b = try poolOn(&slot, b_alloc);
-    try std.testing.expect(again_b == b);
+    try std.testing.expect(try poolOn(&slot, b_alloc) == b);
 }
 
 /// Give back a pool created for a write or a print, including its ledger charge.
@@ -4599,38 +4622,9 @@ fn openSlicedPayload(
     }
 }
 
-/// Readers are gone, so the pool's retained peaks are idle. Drop them and open the same columns again, positioned
-/// at `done` so rows already folded stay folded.
-fn recoverSlicedReaders(
-    pages: std.mem.Allocator,
-    side: std.mem.Allocator,
-    in: AggRowGroup,
-    decode_options: DecodeOptions,
-    target: AggTarget,
-    pool: *SliceScratch,
-    readers: *std.ArrayList(SliceReader),
-    lookup: []?usize,
-    levels_only: []const bool,
-    payload: ?[]const bool,
-    survivors: ?*filter_selection.SelectionVector,
-    ws: AggWorkspace,
-    done: usize,
-) !?void {
-    for (readers.items) |*r| r.deinit();
-    readers.clearRetainingCapacity();
-    pool.evictIdle();
-    try openSlicedPayload(
-        pages, side, in, decode_options, target, pool, readers, lookup, levels_only, payload, survivors, ws,
-    ) orelse return null;
-    if (done == 0) return;
-    var skipping = std.heap.ArenaAllocator.init(side);
-    defer skipping.deinit();
-    for (readers.items) |*r| try r.skip(skipping.allocator(), done);
-}
-
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
-/// A charged allocation that fails with no reader still aliasing the pool drops that idle scratch and retries once.
-/// Rows already folded are not decoded again.
+/// At the end of the group, retained scratch is at most one eighth of the ledger it is charged to. A group that
+/// still does not fit is refused.
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -4641,31 +4635,13 @@ fn scanRGSliced(
     handled: []const bool,
     full: usize,
 ) !?u64 {
-    var committed = false;
-    return scanRGSlicedOnce(gpa, in, decode_options, target, ws, budget, handled, full, &committed) catch |e| {
-        if (e != error.OutOfMemory or committed) return e;
-        if (ws.scratch.slice) |pool| pool.evictIdle();
-        return scanRGSlicedOnce(gpa, in, decode_options, target, ws, budget, handled, full, &committed);
-    };
-}
-
-fn scanRGSlicedOnce(
-    gpa: std.mem.Allocator,
-    in: AggRowGroup,
-    decode_options: DecodeOptions,
-    target: AggTarget,
-    ws: AggWorkspace,
-    budget: *DecodeBudget,
-    handled: []const bool,
-    full: usize,
-    committed: *bool,
-) !?u64 {
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
     const pool = try poolOn(&ws.scratch.slice, side);
-    // lean_decode is the ledger's one-decode allowance. Wider page scratch is a spike for this row group.
-    defer pool.trimAbove(core_memory.lean_decode);
+    // One eighth of the ledger this pool draws from. The next group can use the other seven eighths.
+    const carry = core_memory.retainedCarry(if (ws.ledger) |l| l.limit else decode_options.expand_limit);
+    defer pool.trimAbove(carry);
     var pages = std.heap.ArenaAllocator.init(side);
     defer pages.deinit();
     var readers: std.ArrayList(SliceReader) = .empty;
@@ -4729,13 +4705,9 @@ fn scanRGSlicedOnce(
     defer _ = slice.reset(.retain_capacity);
     var took: ?usize = null;
     var matched: u64 = 0;
-    var slice_retried = false;
     while (done < num_rows) {
         const n = @min(rows_now, num_rows - done);
-        var advance = true;
-        defer if (advance) {
-            done += n;
-        };
+        defer done += n;
         if (on_region) ws.rg_arena.nextRowGroup() else _ = slice.reset(.retain_capacity);
         defer if (ws.ledger) |l| {
             const kept = if (on_region) ws.region.?.end else slice.queryCapacity();
@@ -4743,39 +4715,15 @@ fn scanRGSlicedOnce(
             rows_now = sliceRows(@min(@min(reserved, l.sliceAvailable() / 2 + kept) / took.?, forced), num_rows);
         };
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
-        const cols = sa.alloc(filter_eval.Batch.Column, readers.items.len) catch |err| {
-            if (err != error.OutOfMemory or slice_retried) return err;
-            advance = false;
-            slice_retried = true;
-            try recoverSlicedReaders(
-                pages.allocator(), side, in, decode_options, target, pool, &readers, lookup, levels_only,
-                payload, if (payload != null) &survivors else null, ws, done,
-            ) orelse return null;
-            continue;
-        };
-        var refused = false;
+        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| {
             c.* = r.next(sa, n) catch |err| {
                 // A record slice may read pages that the ordinary indexed plan skips. Replay establishes its error.
                 if (in.filter != null and target == .grouped and target.grouped.records != null and isDecodeError(err))
                     return error.RetainedEncodingUnsupported;
-                if (err != error.OutOfMemory or slice_retried) return err;
-                refused = true;
-                break;
+                return err;
             };
         }
-        if (refused) {
-            advance = false;
-            slice_retried = true;
-            try recoverSlicedReaders(
-                pages.allocator(), side, in, decode_options, target, pool, &readers, lookup, levels_only,
-                payload, if (payload != null) &survivors else null, ws, done,
-            ) orelse return null;
-            continue;
-        }
-        slice_retried = false;
-        // Folded rows must not be scanned again. A later refusal retries this slice only.
-        committed.* = true;
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
         var sel = if (payload != null)
             try survivors.alignedWindow(done, n)

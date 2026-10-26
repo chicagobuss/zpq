@@ -2307,13 +2307,13 @@ const SliceReaders = struct {
 
 /// Decode, filter and project `job`'s row group a slice of rows at a time on the writer, in its turn, each slice's
 /// kept rows a piece for the assembler: neither the decoded row group nor its output is ever held whole. Slices are
-/// sized by what rows took so far, within half the ledger's room; a slice the ledger refuses is decoded again at half
-/// its rows, down to one, before the write is refused. None of this shows in the output, whose row groups the
-/// assembler cuts from the rows alone.
+/// sized by what rows took so far, within half the ledger's room. A slice the ledger cannot hold refuses the write.
+/// None of this shows in the output, whose row groups the assembler cuts from the rows alone.
 fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assembler) !void {
-    // Same allowance as the scan: page scratch past one decode is a spike for this row group.
-    defer if (w.slice_pool) |pool| pool.trimAbove(core_memory.lean_decode);
     const gpa = if (w.slicing_now) |m| m.allocator() else w.gpa;
+    // The ledger these slices draw from, or the query allowance when the pool is uncharged.
+    const allowance = if (w.slicing_now) |m| m.budget.limit else w.decode_options.expand_limit;
+    defer if (w.slice_pool) |pool| pool.trimAbove(core_memory.retainedCarry(allowance));
     const rg = job.rg;
     const num_rows: usize = @intCast(@max(0, rg.num_rows));
     const est = consumer.decodeEstimate(.{
@@ -2338,15 +2338,9 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
         w.core.encode_ns += timings.encode_ns;
     }
     var readers: SliceReaders = undefined;
-    readers.init(w, gpa, job, 0) catch |err| {
-        if (err != error.OutOfMemory) return err;
-        // Init failed before a reader was left alive: its errdefer dropped them. Historical scratch can be the refusal.
-        if (w.slice_pool) |pool| pool.evictIdle();
-        try readers.init(w, gpa, job, 0);
-    };
+    try readers.init(w, gpa, job, 0);
     defer readers.deinit();
     var done: usize = 0;
-    var one_evicted = false;
     // Per-slice working memory (the decoded slice and its selection), its pages kept from one to the next.
     var slice = std.heap.ArenaAllocator.init(gpa);
     defer slice.deinit();
@@ -2354,30 +2348,12 @@ fn projectRGSliced(w: *WinCtx, job: RGJob, prof: ?*profile.Thread, asm_: *Assemb
         if (ledger) |l| if (l.tight()) w.trimIdle();
         const n = @min(slice_rows, num_rows - done);
         _ = slice.reset(.retain_capacity);
-        const piece = sliceToPiece(w, job, &readers, &slice, n, &timings) catch |e| {
-            const m = w.slicing_now orelse return e;
-            if (e != error.OutOfMemory or !m.refused.load(.monotonic)) return e;
-            // One row cannot be halved. Evict idle scratch and decode that row once more.
-            if (n == 1 and one_evicted) return e;
-            m.refused.store(false, .monotonic);
-            _ = slice.reset(.free_all);
-            w.trimIdle();
-            readers.deinit();
-            // Readers no longer alias the pool. Historical page peaks can be what the ledger refused.
-            if (w.slice_pool) |pool| pool.evictIdle();
-            readers.init(w, gpa, job, done) catch |re| {
-                readers = .{ .pages = .init(gpa), .lookup = &.{} };
-                return re;
-            };
-            if (n == 1) one_evicted = true else slice_rows = @max(1, n / 2);
-            continue;
-        };
+        const piece = try sliceToPiece(w, job, &readers, &slice, n, &timings);
         done += n;
         if (ledger) |l| {
             const took = @max(1, (slice.queryCapacity() + piece.arena.queryCapacity()) / n);
             // Each piece owns column buffers and schema metadata. Shrinking the next batch below the initial 64
             // rows makes that fixed cost dominate, until an unfinished output row group can exhaust the ledger.
-            // Actual allocation refusals still halve below this hint, down to one row.
             slice_rows = @min(num_rows, @max(64, @min(w.decode_share, l.available() / 2) / took));
         }
         try asm_.feed(piece);
@@ -8744,8 +8720,8 @@ fn printRowGroupSliced(
     const slot = o.scratch orelse &local_slot;
     defer if (o.scratch == null) consumer.releaseSlicePool(slot);
     const pool = try consumer.poolOn(slot, gpa);
-    // Readers and the value slice release their references first. The pool itself is destroyed after this.
-    defer pool.trimAbove(core_memory.lean_decode);
+    // Readers release their references first. An eighth of the query allowance stays for the next group.
+    defer pool.trimAbove(core_memory.retainedCarry(o.decode_options.expand_limit));
     var n_cols: usize = 0;
     for (fetch_arr, 0..) |needed, ci| {
         if (needed and ci < rg.columns.items.len) n_cols += 1;

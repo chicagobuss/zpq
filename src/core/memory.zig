@@ -7,6 +7,11 @@
 //! merge and answer hold beside its tables, and `lean_decode` bytes for one decode: a refusal chain's last scan
 //! (`scan.narrowed`), or a write's row group sliced on its writer (past the write's limit while its producers are
 //! idle, else on a ledger of its own).
+//!
+//! Sliced page and survivor scratch stays with the worker. At the end of each row group it is trimmed to at most
+//! one eighth of the ledger that scratch is charged to (`retainedCarry` of that ledger's `limit`). The next group
+//! can draw the other seven eighths. A group that still does not fit is refused. Nothing drops that scratch and
+//! retries underneath a live reader or a survivor mask.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +23,12 @@ pub const finalize_allowance: usize = 16 << 20;
 
 /// The ledger a refusal chain's last scan decodes on, one worker's, beside the query's.
 pub const lean_decode: usize = 32 << 20;
+
+/// Bytes of sliced scratch a row group may leave behind: one eighth of `allowance`, the `limit` of the ledger that
+/// scratch is charged to. The next group can draw the other seven eighths. One that still does not fit is refused.
+pub fn retainedCarry(allowance: usize) usize {
+    return allowance / 8;
+}
 
 /// Whether the C heap is glibc's, the only one with `malloc_trim` and `mallopt`: decided at compile time from the
 /// target, so a build without them (musl, macOS, Windows, no libc) never references them. A weak extern's null check

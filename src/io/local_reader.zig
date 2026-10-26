@@ -47,6 +47,8 @@ pub const Config = struct {
     fail_unit: ?usize = null,
     /// Test hook: the ring of reader thread `i` fails to set up when bit `i` is set, as seccomp or memlock can make it.
     fail_rings: u64 = 0,
+    /// Test hook: the `O_DIRECT` sibling open fails, as tmpfs and some FUSE do.
+    fail_direct_open: bool = false,
     /// io_uring reads with O_DIRECT. The reader opens that descriptor itself.
     direct: bool = false,
 };
@@ -575,7 +577,7 @@ pub const Reader = struct {
             if (owned) _ = linux.close(read_fd);
             if (own_buffered) _ = linux.close(buffered_fd);
         }
-        if (self.cfg.direct) {
+        if (self.cfg.direct and !self.cfg.fail_direct_open) {
             if (openSibling(fd)) |dfd| {
                 buffered_fd = fd;
                 own_buffered = !borrowed;
@@ -2231,29 +2233,36 @@ test "a submitted io_uring read is not published while its wait is interrupted" 
 
 test "a file that cannot open O_DIRECT is still read through the page cache" {
     if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
     defer testing.allocator.free(data);
     @memset(data, 5);
-    const rc = linux.memfd_create("zpq-direct", 0);
-    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "nodirect.bin", data, &path_buf);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
     const fd: i32 = @intCast(rc);
     defer _ = linux.close(fd);
-    var wrote: usize = 0;
-    while (wrote < data.len) {
-        const n = linux.write(fd, data.ptr + wrote, data.len - wrote);
-        if (linux.errno(n) != .SUCCESS or n == 0) return error.WriteFailed;
-        wrote += n;
-    }
-    if (openSibling(fd)) |dfd| {
-        _ = linux.close(dfd);
-        return error.SkipZigTest;
-    }
-    const rd = try Reader.create(testing.allocator, .{ .mode = .uring, .threads = 1, .direct = true });
+    const before = linux.fcntl(fd, linux.F.GETFL, 0);
+    try testing.expect(linux.errno(before) == .SUCCESS);
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .direct = true,
+        .fail_direct_open = true,
+    });
     defer rd.destroy();
     const f = try rd.borrowFile(fd, data.len);
     try testing.expect(!f.direct);
     try testing.expectEqual(fd, f.fd);
     try testing.expect(!f.owned);
+    try testing.expectEqual(@as(i32, -1), f.buffered_fd);
+    const after = linux.fcntl(fd, linux.F.GETFL, 0);
+    try testing.expectEqual(before, after);
     var range = [_]Range{.{ .start = 0, .end = data.len }};
     var plans = [_]?[]Range{&range};
     try rd.planFile(f, &plans, 0);

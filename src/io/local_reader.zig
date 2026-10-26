@@ -10,8 +10,12 @@
 //! The file stays mapped read-only beside the buffer: the footer is parsed from the mapping, Bloom filters and
 //! dictionaries are probed through it, and `mincore` on it says how much of the file the page cache already holds.
 //!
-//! Backends (`Mode`): `pread` threads, or one io_uring per reader thread reading with O_DIRECT. `Policy.choose` picks
-//! one; `ZPQ_IO_PROFILE` overrides it.
+//! Backends (`Mode`): `pread` threads, or one io_uring per reader thread. `Policy.choose` picks one; `ZPQ_IO_PROFILE`
+//! overrides it. `auto` reads a wide scan with buffered io_uring and a narrow one with pread. It uses O_DIRECT only
+//! when the planned bytes cannot fit in memory and mincore proved those bytes are not cached. Unknown residency
+//! (a failed mincore, or a sample that did not see every planned page) is not a cold file. The descriptor is one the
+//! reader opened, never a flag flipped on a shared fd. `ZPQ_IO_PROFILE=uring` is that direct reader, asked for
+//! explicitly.
 const std = @import("std");
 const builtin = @import("builtin");
 const core_memory = @import("../core/memory.zig");
@@ -23,7 +27,8 @@ pub const Mode = enum {
     mmap,
     /// `threads` reader threads, each a blocking pread(2) of one `block` at a time.
     pread,
-    /// `threads` reader threads, each with its own io_uring keeping `qd` O_DIRECT reads of `block` in flight.
+    /// `threads` reader threads, each with its own io_uring keeping `qd` reads of `block` in flight.
+    /// O_DIRECT only when `Config.direct` is set, and then on a descriptor this reader opened.
     uring,
 };
 
@@ -42,6 +47,8 @@ pub const Config = struct {
     fail_unit: ?usize = null,
     /// Test hook: the ring of reader thread `i` fails to set up when bit `i` is set, as seccomp or memlock can make it.
     fail_rings: u64 = 0,
+    /// io_uring reads with O_DIRECT. The reader opens that descriptor itself.
+    direct: bool = false,
 };
 
 /// How a query reads local files: the mode `ZPQ_IO_PROFILE` names (`mmap`, `pread`, `uring`), or with `auto` (the
@@ -69,23 +76,98 @@ pub const Policy = struct {
     /// The share of the files' bytes a query must read before `auto` treats it as a full scan.
     pub const wide_scan: f64 = 0.5;
 
-    /// The mode for files of which `resident` (0..1) is in the page cache and `coverage` (0..1) the share a query
-    /// plans to read. Mostly resident files read fastest as they are. Otherwise io_uring where the kernel allows it;
-    /// failing that, pread for a narrow read, but the plain mapping for a wide one: on a full scan its readahead
-    /// beats blocking reads, and beat advising the planned ranges MADV_WILLNEED ahead of the workers too.
-    pub fn choose(self: Policy, resident: f64, coverage: f64) Mode {
-        return switch (self.profile) {
-            .mmap => .mmap,
-            .pread => .pread,
-            .uring => if (uringAvailable()) .uring else .pread,
-            .auto => if (builtin.os.tag != .linux or resident >= 0.8)
-                .mmap
-            else if (uringAvailable())
-                .uring
-            else if (coverage >= wide_scan)
-                .mmap
-            else
-                .pread,
+    /// The mode for a query of which `resident` (0..1) of the planned bytes are in the page cache and `coverage`
+    /// (0..1) is the share of the inputs those bytes are. `body` is that share when `proven`, which is true only
+    /// when mincore saw every planned page: a failed or sparse sample is not a cold file, so it never selects
+    /// O_DIRECT. `planned` is the bytes the query will read and `available` is the tightest of MemAvailable and
+    /// the ancestor cgroups, at plan time.
+    /// A mostly resident planned read stays on the mapping. Otherwise a wide scan uses buffered io_uring and a
+    /// narrow one pread, so a second run finds those bytes warm. O_DIRECT only when `planned` cannot fit in
+    /// `available` and the planned bytes are proven empty: caching that read is impossible.
+    pub fn choose(
+        self: Policy,
+        resident: f64,
+        body: f64,
+        coverage: f64,
+        planned: u64,
+        available: u64,
+        proven: bool,
+    ) Choice {
+        switch (self.profile) {
+            .mmap => return .{ .mode = .mmap, .reason = .explicit },
+            .pread => return .{ .mode = .pread, .reason = .explicit },
+            // An explicit uring that the kernel refuses stays on pread. Callers of ZPQ_IO_PROFILE=uring get
+            // O_DIRECT io_uring: the explicit direct option.
+            .uring => return .{
+                .mode = if (uringAvailable()) .uring else .pread,
+                .reason = if (uringAvailable()) .explicit else .no_uring,
+            },
+            .auto => {},
+        }
+        if (resident >= 0.8) return .{ .mode = .mmap, .reason = .cached };
+        if (builtin.os.tag != .linux) return .{ .mode = .mmap, .reason = .not_linux };
+        if (proven and body == 0 and planned > available and uringAvailable()) {
+            return .{ .mode = .uring, .reason = .exceeds_memory };
+        }
+        if (coverage >= wide_scan and uringAvailable()) return .{ .mode = .uring, .reason = .cold_buffered };
+        if (coverage >= wide_scan) return .{ .mode = .pread, .reason = .no_uring };
+        return .{ .mode = .pread, .reason = .cold_buffered };
+    }
+};
+
+/// Why `auto` (or an explicit profile) picked a mode. EXPLAIN and the profile summary report it.
+pub const Reason = enum(u8) {
+    explicit = 0,
+    cached = 1,
+    cold_buffered = 2,
+    exceeds_memory = 3,
+    no_uring = 4,
+    over_budget = 5,
+    not_linux = 6,
+    remote = 7,
+    /// The mapping, because the reader was not in play (descriptors given back, or nothing local to weigh).
+    mapping = 8,
+    /// The plan asked for O_DIRECT and the open was refused. Execute reads buffered; EXPLAIN says so too.
+    direct_refused = 9,
+
+    pub fn phrase(self: Reason) []const u8 {
+        return switch (self) {
+            .explicit => "profile asked for this",
+            .cached => "cached",
+            .cold_buffered => "cold file fits in memory",
+            .exceeds_memory => "read exceeds available memory",
+            .no_uring => "io_uring unavailable",
+            .over_budget => "row group over the memory budget",
+            .not_linux => "not linux",
+            .remote => "remote input",
+            .mapping => "read through the mapping",
+            .direct_refused => "O_DIRECT refused",
+        };
+    }
+};
+
+pub const Choice = struct {
+    mode: Mode,
+    reason: Reason,
+
+    /// O_DIRECT io_uring: the explicit profile, or a read that cannot fit in memory. Buffered io_uring is not this.
+    pub fn directRead(self: Choice) bool {
+        return self.mode == .uring and (self.reason == .explicit or self.reason == .exceeds_memory);
+    }
+
+    /// A row group the reader cannot hold goes through the mapping, except a proven read that cannot fit in
+    /// memory: that one stays direct. `over_budget` must not hide `exceeds_memory`.
+    pub fn keepDirect(self: Choice, fits_reader: bool) Choice {
+        if (fits_reader or self.reason == .exceeds_memory) return self;
+        return .{ .mode = .mmap, .reason = .over_budget };
+    }
+
+    /// The open probe refused O_DIRECT. The mode that remains is the one execute will use.
+    pub fn withoutDirect(self: Choice) Choice {
+        if (!self.directRead()) return self;
+        return .{
+            .mode = if (uringAvailable()) .uring else .pread,
+            .reason = .direct_refused,
         };
     }
 };
@@ -100,7 +182,9 @@ pub fn uringAvailable() bool {
         2 => return false,
         else => {},
     }
-    var ring = linux.IoUring.init(2, 0) catch {
+    // The reader opens rings of `Config.qd` entries (32). A 2-entry probe can succeed where that ring will not,
+    // and EXPLAIN would then name a backend execute does not use.
+    var ring = linux.IoUring.init(32, 0) catch {
         uring_probe.store(2, .monotonic);
         return false;
     };
@@ -109,32 +193,404 @@ pub fn uringAvailable() bool {
     return true;
 }
 
+/// Test-only stand-ins. Release builds have no field to set, so `memAvailable` reads the host.
+const seam = if (builtin.is_test) struct {
+    threadlocal var available: ?u64 = null;
+    threadlocal var cgroup: ?u64 = null;
+    threadlocal var cgroup_forced: bool = false;
+} else struct {
+    const available: ?u64 = null;
+    const cgroup: ?u64 = null;
+    const cgroup_forced: bool = false;
+};
+
+/// Bytes the page cache could still hold: the tighter of MemAvailable and every ancestor cgroup, measured when
+/// the plan is chosen. Unknown MemAvailable is unbounded. An unreadable cgroup file is unbounded too; a readable
+/// max of 0 is a real limit. A test seam replaces the host value, and does not consult the real cgroup unless the
+/// cgroup seam is set.
+pub fn memAvailable() u64 {
+    if (builtin.is_test) if (seam.available) |host| {
+        if (seam.cgroup_forced) if (seam.cgroup) |cg| return @min(host, cg);
+        return host;
+    };
+    const host = readMemAvailable() orelse std.math.maxInt(u64);
+    const cg = cgroupHeadroom() orelse return host;
+    return @min(host, cg);
+}
+
+/// Force the MemAvailable half of `memAvailable` for the calling test thread. `null` reads the host again.
+pub fn testingSetMemAvailable(v: ?u64) void {
+    if (comptime builtin.is_test) seam.available = v;
+}
+
+/// Force the cgroup half. `null` is an unreadable cgroup: unbounded, so it does not tighten the host value.
+/// A readable 0 is a real limit. `testingClearCgroup` goes back to the host's cgroup files.
+pub fn testingSetCgroup(v: ?u64) void {
+    if (comptime builtin.is_test) {
+        seam.cgroup_forced = true;
+        seam.cgroup = v;
+    }
+}
+
+pub fn testingClearCgroup() void {
+    if (comptime builtin.is_test) {
+        seam.cgroup_forced = false;
+        seam.cgroup = null;
+    }
+}
+
+fn readMemAvailable() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    const fd = posix.openatZ(posix.AT.FDCWD, "/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = linux.close(fd);
+    var buf: [2048]u8 = undefined;
+    const n = posix.read(fd, &buf) catch return null;
+    var it = std.mem.tokenizeAny(u8, buf[0..n], "\n");
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
+        var parts = std.mem.tokenizeAny(u8, line["MemAvailable:".len..], " \t");
+        const num = parts.next() orelse return null;
+        const kb = std.fmt.parseInt(u64, num, 10) catch return null;
+        return kb * 1024;
+    }
+    return null;
+}
+
+/// Headroom of one cgroup memory controller: `max - current`, or null when the limit is the token `max`, the
+/// file is missing, or the text is not a number. A readable 0 is a real limit. v1's huge "unlimited" integer is
+/// a number; the host MemAvailable still bounds the result.
+fn memoryHeadroom(max_text: []const u8, cur_text: []const u8) ?u64 {
+    const max = parseLimit(max_text) orelse return null;
+    const cur = parseLimit(cur_text) orelse return null;
+    return if (max > cur) max - cur else 0;
+}
+
+fn parseLimit(text: []const u8) ?u64 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len == 0 or std.mem.eql(u8, t, "max")) return null;
+    return std.fmt.parseInt(u64, t, 10) catch null;
+}
+
+fn readNamed(dir: []const u8, name: []const u8, buf: []u8) ?[]u8 {
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir, name }, 0) catch return null;
+    const fd = posix.openatZ(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = linux.close(fd);
+    const n = posix.read(fd, buf) catch return null;
+    if (n == 0 or n == buf.len) return null;
+    return buf[0..n];
+}
+
+fn readPair(dir: []const u8, max_name: []const u8, cur_name: []const u8) ?u64 {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const max_text = readNamed(dir, max_name, &a) orelse return null;
+    const cur_text = readNamed(dir, cur_name, &b) orelse return null;
+    return memoryHeadroom(max_text, cur_text);
+}
+
+fn dirHeadroom(dir: []const u8) ?u64 {
+    if (readPair(dir, "memory.max", "memory.current")) |v| return v;
+    return readPair(dir, "memory.limit_in_bytes", "memory.usage_in_bytes");
+}
+
+/// Tightest headroom along `root` and `root/rel` and every directory between them. A directory with no readable
+/// memory files does not tighten.
+fn walkCgroup(root: []const u8, rel: []const u8) ?u64 {
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const trimmed = std.mem.trim(u8, rel, "/");
+    const len_full: usize = if (trimmed.len == 0) root.len else blk: {
+        const full = std.fmt.bufPrint(&path, "{s}/{s}", .{ root, trimmed }) catch return null;
+        break :blk full.len;
+    };
+    if (trimmed.len == 0) {
+        if (root.len >= path.len) return null;
+        @memcpy(path[0..root.len], root);
+    }
+    var len = len_full;
+    var best: ?u64 = null;
+    while (true) {
+        if (dirHeadroom(path[0..len])) |v| best = if (best) |b| @min(b, v) else v;
+        if (len <= root.len) break;
+        const parent = std.mem.lastIndexOfScalar(u8, path[0..len], '/') orelse break;
+        if (parent < root.len) break;
+        len = parent;
+    }
+    return best;
+}
+
+fn cgroupLineHeadroom(line: []const u8) ?u64 {
+    const c1 = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const rest = line[c1 + 1 ..];
+    const c2 = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const controllers = rest[0..c2];
+    const rel = rest[c2 + 1 ..];
+    const v2 = controllers.len == 0;
+    if (!v2 and std.mem.indexOf(u8, controllers, "memory") == null) return null;
+    const root = if (v2) "/sys/fs/cgroup" else "/sys/fs/cgroup/memory";
+    return walkCgroup(root, rel);
+}
+
+/// Tightest ancestor cgroup headroom, or null when no controller publishes a numeric limit. A truncated
+/// `/proc/self/cgroup` is unknown rather than parsed as zero.
+fn cgroupHeadroom() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [8192]u8 = undefined;
+    const fd = posix.openatZ(posix.AT.FDCWD, "/proc/self/cgroup", .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = linux.close(fd);
+    const n = posix.read(fd, &buf) catch return null;
+    if (n == 0 or n == buf.len) return null;
+    var best: ?u64 = null;
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        const h = cgroupLineHeadroom(line) orelse continue;
+        best = if (best) |b| @min(b, h) else h;
+    }
+    return best;
+}
+
+pub const Residency = struct {
+    /// Share of sampled pages the page cache holds.
+    share: f64 = 0,
+    /// Share of the pages that count as the file body. For a whole-file sample that excludes the footer tail this
+    /// process just parsed. For a planned-range sample it is `share` when `proven`, and 1 when it is not: an
+    /// unknown sample is not a cold file.
+    body: f64 = 0,
+    /// mincore saw every page. A failed call or a stride sample is not this, so it cannot select O_DIRECT.
+    proven: bool = false,
+    pages: u64 = 0,
+    hits: u64 = 0,
+};
+
+/// `proven` only when every one of `total` pages was counted. A short sample still yields `share` (a warm planned
+/// read maps) and sets `body` to 1 so it is not cold.
+fn residencyFrom(hits: u64, seen: u64, total: u64, mincore_ok: bool) Residency {
+    if (!mincore_ok or seen == 0 or total == 0) return .{ .body = 1 };
+    const share = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(seen));
+    const proven = seen == total;
+    return .{
+        .share = share,
+        .body = if (proven) share else 1,
+        .proven = proven,
+        .hits = hits,
+        .pages = seen,
+    };
+}
+
 /// The share (0..1) of `bytes`' pages the page cache holds, by `mincore`; 0 when it can't tell. Past a few thousand
 /// pages it samples evenly spaced windows: mincore costs a page-cache lookup per page, milliseconds over a file of
 /// tens of thousands, which every local aggregate would pay before its first decode.
 pub fn residentShare(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_min) const u8) f64 {
-    if (builtin.os.tag != .linux or bytes.len == 0) return 0;
-    const page = pageLen();
+    return sampleResidency(gpa, bytes).share;
+}
+
+pub fn sampleResidency(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_min) const u8) Residency {
+    if (builtin.os.tag != .linux or bytes.len == 0) return .{};
+    const page: usize = @intCast(pageLen());
     const pages = (bytes.len + page - 1) / page;
     const windows: usize = 64;
     const window_pages: usize = 32;
     const sampled = if (pages <= windows * window_pages) pages else windows * window_pages;
-    const vec = gpa.alloc(u8, sampled) catch return 0;
+    const vec = gpa.alloc(u8, sampled) catch return residencyFrom(0, 0, 1, false);
     defer gpa.free(vec);
-    if (sampled == pages) {
-        if (linux.errno(linux.mincore(@constCast(bytes.ptr), bytes.len, vec.ptr)) != .SUCCESS) return 0;
+    const full = sampled == pages;
+    if (full) {
+        if (linux.errno(linux.mincore(@constCast(bytes.ptr), bytes.len, vec.ptr)) != .SUCCESS) {
+            return residencyFrom(0, 0, 1, false);
+        }
     } else {
         const stride = pages / windows;
         for (0..windows) |w| {
             const first = w * stride;
             const out = vec[w * window_pages ..][0..window_pages];
             const p: [*]u8 = @constCast(bytes.ptr + first * page);
-            if (linux.errno(linux.mincore(p, window_pages * page, out.ptr)) != .SUCCESS) return 0;
+            if (linux.errno(linux.mincore(p, window_pages * page, out.ptr)) != .SUCCESS) {
+                return residencyFrom(0, 0, 1, false);
+            }
         }
     }
+    var hits: usize = 0;
+    var body_hits: usize = 0;
+    var body_n: usize = 0;
+    if (full) {
+        const tail = @min(pages, window_pages);
+        for (vec, 0..) |v, i| {
+            const resident = v & 1 == 1;
+            hits += @intFromBool(resident);
+            if (i + tail < pages) {
+                body_n += 1;
+                body_hits += @intFromBool(resident);
+            }
+        }
+    } else {
+        for (0..windows) |w| {
+            const tail = w + 1 == windows;
+            for (0..window_pages) |i| {
+                const resident = vec[w * window_pages + i] & 1 == 1;
+                hits += @intFromBool(resident);
+                if (!tail) {
+                    body_n += 1;
+                    body_hits += @intFromBool(resident);
+                }
+            }
+        }
+    }
+    return .{
+        .share = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(sampled)),
+        .body = if (body_n == 0) 0 else @as(f64, @floatFromInt(body_hits)) / @as(f64, @floatFromInt(body_n)),
+        // A stride across the whole file did not see every page. Only a full mincore proves the body is cold.
+        .proven = full,
+        .pages = sampled,
+        .hits = hits,
+    };
+}
+
+/// Past this many pages a planned-range sample strides, and a stride is not proof the bytes are cold.
+/// 4 GiB of 4 KiB pages. A query's planned ranges are usually under it and are mincore'd in full, so a warm
+/// slice of a cold file still maps.
+const dense_pages: u64 = 1 << 20;
+
+/// Residency of `ranges` inside `bytes` (the mapping of one file). Page-aligned, overlapping ranges merged.
+/// Every page when there are at most `dense_pages` of them; otherwise an even stride whose `proven` is false.
+/// A failed mincore is unknown, not cold.
+pub fn sampleRanges(
+    gpa: std.mem.Allocator,
+    bytes: []align(std.heap.page_size_min) const u8,
+    ranges: []const Range,
+) Residency {
+    if (builtin.os.tag != .linux or bytes.len == 0 or ranges.len == 0) return residencyFrom(0, 0, 1, false);
+    const page = pageLen();
+    const limit = std.mem.alignForward(u64, bytes.len, page);
+    const aligned = gpa.alloc(Range, ranges.len) catch return residencyFrom(0, 0, 1, false);
+    defer gpa.free(aligned);
     var n: usize = 0;
-    for (vec) |v| n += v & 1;
-    return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(sampled));
+    for (ranges) |r| {
+        if (r.end <= r.start) continue;
+        const start = r.start / page * page;
+        if (start >= bytes.len) continue;
+        var end = std.mem.alignForward(u64, r.end, page);
+        if (end > limit) end = limit;
+        if (end <= start) continue;
+        aligned[n] = .{ .start = start, .end = end };
+        n += 1;
+    }
+    if (n == 0) return residencyFrom(0, 0, 1, false);
+    std.mem.sort(Range, aligned[0..n], {}, struct {
+        fn less(_: void, a: Range, b: Range) bool {
+            return a.start < b.start;
+        }
+    }.less);
+    var m: usize = 0;
+    for (aligned[1..n]) |r| {
+        if (r.start <= aligned[m].end) {
+            if (r.end > aligned[m].end) aligned[m].end = r.end;
+        } else {
+            m += 1;
+            aligned[m] = r;
+        }
+    }
+    const merged = aligned[0 .. m + 1];
+    var pages: u64 = 0;
+    for (merged) |r| pages += (r.end - r.start) / page;
+    if (pages == 0) return residencyFrom(0, 0, 1, false);
+    if (pages <= dense_pages) {
+        var hits: u64 = 0;
+        var seen: u64 = 0;
+        for (merged) |r| {
+            const c = countResident(bytes, r.start, r.end) orelse return residencyFrom(0, 0, 1, false);
+            hits += c.hits;
+            seen += c.pages;
+        }
+        return residencyFrom(hits, seen, pages, true);
+    }
+    const sparse = sampleStride(bytes, merged, pages) orelse return residencyFrom(0, 0, 1, false);
+    return residencyFrom(sparse.hits, sparse.pages, pages, true);
+}
+
+const PageCount = struct { hits: u64, pages: u64 };
+
+fn countResident(bytes: []align(std.heap.page_size_min) const u8, start: u64, end: u64) ?PageCount {
+    const page = pageLen();
+    var vec: [128]u8 = undefined;
+    var off = start;
+    var hits: u64 = 0;
+    var pages: u64 = 0;
+    while (off < end) {
+        const n_pages: u64 = @min(vec.len, (end - off) / page);
+        const p: [*]u8 = @constCast(bytes.ptr + off);
+        if (linux.errno(linux.mincore(p, n_pages * page, &vec)) != .SUCCESS) return null;
+        for (vec[0..n_pages]) |v| {
+            pages += 1;
+            hits += @intFromBool(v & 1 == 1);
+        }
+        off += n_pages * page;
+    }
+    return .{ .hits = hits, .pages = pages };
+}
+
+fn sampleStride(bytes: []align(std.heap.page_size_min) const u8, merged: []const Range, pages: u64) ?PageCount {
+    const page = pageLen();
+    const want: u64 = 2048;
+    const stride = @max(pages / want, 1);
+    var index: u64 = 0;
+    var hits: u64 = 0;
+    var seen: u64 = 0;
+    var vec: [1]u8 = undefined;
+    for (merged) |r| {
+        var off = r.start;
+        while (off < r.end) {
+            if (index % stride == 0) {
+                const p: [*]u8 = @constCast(bytes.ptr + off);
+                if (linux.errno(linux.mincore(p, page, &vec)) != .SUCCESS) return null;
+                seen += 1;
+                hits += @intFromBool(vec[0] & 1 == 1);
+            }
+            index += 1;
+            off += page;
+        }
+    }
+    if (seen == 0) return null;
+    return .{ .hits = hits, .pages = seen };
+}
+
+fn openSibling(fd: i32, direct: bool) ?i32 {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/self/fd/{d}", .{fd}, 0) catch return null;
+    var flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+    if (direct) flags.DIRECT = true;
+    const rc = linux.open(path, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return @intCast(rc);
+}
+
+/// Whether this file can be opened O_DIRECT. Opens a sibling and closes it; reads nothing, and does not change
+/// `fd`. EXPLAIN and execute both decide from this, so they name the same mode.
+pub fn directOpenable(fd: i32) bool {
+    if (builtin.os.tag != .linux) return false;
+    const owned = openSibling(fd, true) orelse return false;
+    _ = linux.close(owned);
+    return true;
+}
+
+/// Direct is taken only when every input opens. Empty is a refusal: there is nothing to read that way.
+pub fn everyDirect(openable: []const bool) bool {
+    if (openable.len == 0) return false;
+    for (openable) |ok| if (!ok) return false;
+    return true;
+}
+
+/// Same probe for a path, when the mapping no longer holds a descriptor.
+pub fn directOpenablePath(path: []const u8) bool {
+    if (builtin.os.tag != .linux or path.len >= std.fs.max_path_bytes) return false;
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    var flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true };
+    flags.DIRECT = true;
+    const rc = linux.open(path_z[0..path.len :0], flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    return true;
 }
 
 pub const Range = struct { start: u64, end: u64 };
@@ -296,19 +752,29 @@ pub const Reader = struct {
     /// Probe units not yet read, over every file: no row group's read is admitted before they are all in, so planning's
     /// small reads never queue at the device behind the window's large ones.
     probes_out: std.atomic.Value(u32) = .init(0),
-
-    fn setDirect(fd: i32) bool {
-        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-        if (linux.errno(flags) != .SUCCESS) return false;
-        const direct: usize = @as(u32, @bitCast(linux.O{ .DIRECT = true }));
-        return linux.errno(linux.fcntl(fd, linux.F.SETFL, flags | direct)) == .SUCCESS;
-    }
+    /// Test only: enter calls to fail with EAGAIN before a real one, and completions to treat as -EAGAIN and resubmit.
+    enter_faults: std.atomic.Value(u8) = .init(0),
+    cqe_replays: std.atomic.Value(u8) = .init(0),
+    /// Test only: `readUnit` fails, so a pread fallback after the retry bound fails the read instead of hanging.
+    fail_pread: bool = false,
 
     pub fn create(gpa: std.mem.Allocator, cfg: Config) !*Reader {
         std.debug.assert(cfg.mode != .mmap);
         const r = try gpa.create(Reader);
         r.* = .{ .gpa = gpa, .cfg = cfg };
         return r;
+    }
+
+    /// One-shot faults for the io_uring retry test. Release builds ignore them.
+    pub fn testingIoFaults(self: *Reader, enter: u8, cqe: u8) void {
+        if (!builtin.is_test) return;
+        self.enter_faults.store(enter, .monotonic);
+        self.cqe_replays.store(cqe, .monotonic);
+    }
+
+    pub fn testingFailPread(self: *Reader) void {
+        if (!builtin.is_test) return;
+        self.fail_pread = true;
     }
 
     /// Open `path` for reading into a buffer of `size` bytes.
@@ -320,23 +786,33 @@ pub const Reader = struct {
         const rc = linux.open(@ptrCast(&path_z), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
         const fd: i32 = @intCast(rc);
-        errdefer _ = linux.close(fd);
-        const f = try self.addFile(fd, size);
-        f.owned = true;
-        return f;
+        return self.addFile(fd, size, false);
     }
 
     /// Read the file open on `fd` into a buffer of `size` bytes: the very file the caller opened, whatever its path
-    /// names by now. Borrowed: the caller closes it, after `destroy`.
+    /// names by now. Borrowed: the caller closes it, after `destroy`. A direct read opens another descriptor and
+    /// leaves this one's flags alone.
     pub fn borrowFile(self: *Reader, fd: i32, size: u64) !*File {
-        return self.addFile(fd, size);
+        return self.addFile(fd, size, true);
     }
 
-    fn addFile(self: *Reader, fd: i32, size: u64) !*File {
-        // O_DIRECT set on the descriptor, not at an open, so a borrowed one takes it too. A file system that refuses
-        // it (tmpfs, some FUSE) reads through the page cache.
-        const direct = self.cfg.mode == .uring and setDirect(fd);
-        if (self.cfg.mode == .uring and !direct) self.direct_refused = true;
+    fn addFile(self: *Reader, fd: i32, size: u64, borrowed: bool) !*File {
+        // O_DIRECT is a new open of `/proc/self/fd/N`, never F_SETFL on `fd`. A borrowed descriptor stays as the
+        // caller handed it over. A file system that refuses the open (tmpfs, some FUSE) reads through the page cache.
+        var read_fd = fd;
+        var owned = !borrowed;
+        var direct = false;
+        errdefer {
+            if (owned) _ = linux.close(read_fd);
+        }
+        if (self.cfg.direct) {
+            if (openSibling(fd, true)) |dfd| {
+                if (!borrowed) _ = linux.close(fd);
+                read_fd = dfd;
+                owned = true;
+                direct = true;
+            } else self.direct_refused = true;
+        }
 
         const f = try self.gpa.create(File);
         errdefer self.gpa.destroy(f);
@@ -349,7 +825,7 @@ pub const Reader = struct {
         errdefer posix.munmap(buf);
         // THP on this buffer backed the gaps between projected chunks too: RSS 3-7x for nothing.
         _ = linux.madvise(buf.ptr, buf.len, linux.MADV.NOHUGEPAGE);
-        f.* = .{ .reader = self, .fd = fd, .size = size, .direct = direct, .buf = buf };
+        f.* = .{ .reader = self, .fd = read_fd, .size = size, .direct = direct, .owned = owned, .buf = buf };
         try self.files.append(self.gpa, f);
         return f;
     }
@@ -710,7 +1186,12 @@ pub const Reader = struct {
         ran catch self.failAll();
     }
 
-    pub const Backends = struct { uring_threads: u32, pread_threads: u32, direct_files: u32, buffered_files: u32 };
+    pub const Backends = struct {
+        uring_threads: u32,
+        pread_threads: u32,
+        direct_files: u32,
+        buffered_files: u32,
+    };
 
     /// What the reads actually went through, valid once `start` returns.
     pub fn backends(self: *const Reader) Backends {
@@ -727,6 +1208,7 @@ pub const Reader = struct {
     /// Read unit `i` with a blocking pread, retrying short reads; the tail of the file reads short by design.
     fn readUnit(self: *Reader, i: usize) !void {
         if (self.cfg.fail_unit == i) return error.ReadFailed;
+        if (builtin.is_test and self.fail_pread) return error.ReadFailed;
         const u = self.units.items[i];
         const f = self.files.items[u.file];
         try preadAll(f, u.off, @min(u.off + u.len, f.size));
@@ -750,6 +1232,11 @@ pub const Reader = struct {
         var ring = ring_in;
         defer ring.deinit();
         const units = self.units.items;
+        const held = try self.gpa.alloc(usize, @max(self.cfg.qd, 1));
+        defer self.gpa.free(held);
+        const tries = try self.gpa.alloc(u8, held.len);
+        defer self.gpa.free(tries);
+        var nheld: usize = 0;
         var inflight: usize = 0;
         var cqes: [64]linux.io_uring_cqe = undefined;
         // A unit claimed off the shared cursor but not yet admitted by the window.
@@ -775,6 +1262,9 @@ pub const Reader = struct {
                 pending = null;
                 if (self.cfg.fail_unit == idx) return error.ReadFailed;
                 const f = self.files.items[u.file];
+                held[nheld] = idx;
+                tries[nheld] = 0;
+                nheld += 1;
                 _ = try ring.read(idx, f.fd, .{ .buffer = f.buf[@intCast(u.off)..][0..u.len] }, u.off);
                 inflight += 1;
             }
@@ -783,12 +1273,41 @@ pub const Reader = struct {
                 self.waitRelease();
                 continue;
             }
-            _ = try ring.submit_and_wait(1);
-            const n = try ring.copy_cqes(&cqes, 0);
+            const n = self.takeCqes(&ring, &cqes) catch |err| switch (err) {
+                // Those SQEs may still complete into a ring this thread is about to drop, so the units are
+                // finished here, once, and the rest of this thread's cursor goes to pread.
+                error.UringStalled => {
+                    try self.finishHeld(held[0..nheld], pending);
+                    return;
+                },
+                else => |e| return e,
+            };
             for (cqes[0..n]) |c| {
                 inflight -= 1;
-                const u = units[@intCast(c.user_data)];
+                const idx: usize = @intCast(c.user_data);
+                const u = units[idx];
                 const f = self.files.items[u.file];
+                const again = c.res == -@as(i32, @backingInt(linux.E.AGAIN));
+                const replay = builtin.is_test and self.cqe_replays.load(.monotonic) > 0;
+                const slot = heldSlot(held[0..nheld], idx);
+                if (again or replay) {
+                    if (replay) _ = self.cqe_replays.fetchSub(1, .monotonic);
+                    if (slot) |s| {
+                        tries[s] += 1;
+                        if (tries[s] < uring_retry_bound) {
+                            // The same buffer and offset: the kernel asked us to try this read again.
+                            const buf = f.buf[@intCast(u.off)..][0..u.len];
+                            _ = try ring.read(idx, f.fd, .{ .buffer = buf }, u.off);
+                            inflight += 1;
+                            continue;
+                        }
+                        heldRemove(held, tries, &nheld, s);
+                    }
+                    try self.readUnit(idx);
+                    self.unitDone(u);
+                    continue;
+                }
+                if (slot) |s| heldRemove(held, tries, &nheld, s);
                 const want = @min(@as(u64, u.len), f.size - u.off);
                 if (c.res < 0) return error.ReadFailed;
                 // O_DIRECT reads the file's unaligned tail short; anything else short is finished with pread.
@@ -798,7 +1317,76 @@ pub const Reader = struct {
             }
         }
     }
+
+    /// The units this thread submitted, then anything it claimed but did not submit, then the shared cursor.
+    fn finishHeld(self: *Reader, outstanding: []const usize, pending: ?usize) !void {
+        for (outstanding) |i| {
+            try self.readUnit(i);
+            self.unitDone(self.units.items[i]);
+        }
+        if (pending) |i| {
+            const u = self.units.items[i];
+            while (!self.admit(u)) {
+                if (self.cancel.load(.acquire)) return;
+                self.waitRelease();
+            }
+            try self.readUnit(i);
+            self.unitDone(u);
+        }
+        try self.preadRun();
+    }
+
+    /// submit_and_wait plus copy_cqes. EAGAIN, EINTR and EBUSY are retried `uring_retry_bound` times; then the
+    /// caller reads the outstanding units with pread. A cancel during a retry stops the scan.
+    fn takeCqes(self: *Reader, ring: *linux.IoUring, cqes: []linux.io_uring_cqe) !u32 {
+        var tries: u8 = 0;
+        while (tries < uring_retry_bound) {
+            if (builtin.is_test and self.enter_faults.load(.monotonic) > 0) {
+                _ = self.enter_faults.fetchSub(1, .monotonic);
+                tries += 1;
+                std.Thread.yield() catch {};
+                continue;
+            }
+            _ = ring.submit_and_wait(1) catch |err| switch (err) {
+                error.SystemResources, error.SignalInterrupt, error.CompletionQueueOvercommitted => {
+                    if (self.cancel.load(.acquire)) return error.ReadFailed;
+                    tries += 1;
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                else => |e| return e,
+            };
+            const n = ring.copy_cqes(cqes, 0) catch |err| switch (err) {
+                error.SystemResources, error.SignalInterrupt, error.CompletionQueueOvercommitted => {
+                    if (self.cancel.load(.acquire)) return error.ReadFailed;
+                    tries += 1;
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                else => |e| return e,
+            };
+            if (n != 0) return n;
+            tries += 1;
+            std.Thread.yield() catch {};
+        }
+        return error.UringStalled;
+    }
 };
+
+/// Transient io_uring failures (EAGAIN, EINTR, EBUSY, or an empty completion batch) before that wait's units are
+/// read with pread. One unit gets the same number of -EAGAIN resubmits. A protocol budget, not a file property.
+const uring_retry_bound: u8 = 8;
+
+fn heldSlot(held: []const usize, idx: usize) ?usize {
+    for (held, 0..) |h, i| if (h == idx) return i;
+    return null;
+}
+
+fn heldRemove(held: []usize, tries: []u8, n: *usize, slot: usize) void {
+    n.* -= 1;
+    held[slot] = held[n.*];
+    tries[slot] = tries[n.*];
+}
 
 /// pread `[lo, hi)` of `f` into its buffer. With O_DIRECT the offset and length must be page multiples, which every
 /// unit is but the last page of the file; a direct read of it returns what there is.
@@ -1325,22 +1913,407 @@ test "residentShare bounds sampled allocation and partial-page windows" {
     try testing.expectEqual(@as(f64, 0), residentShare(bounded.allocator(), mapping[0..0]));
 }
 
-test "auto never reads a wide scan with pread" {
+test "auto keeps a warm file mapped and a cold one buffered unless the read cannot fit" {
     const auto: Policy = .{};
-    // Cached: the mapping, whatever the share read.
-    try testing.expectEqual(Mode.mmap, auto.choose(0.9, 1.0));
     const pinned: Policy = .{ .profile = .pread };
-    try testing.expectEqual(Mode.pread, pinned.choose(0.0, 1.0));
-    if (builtin.os.tag != .linux) return;
-    const wide = auto.choose(0.0, 0.99);
-    const narrow = auto.choose(0.0, 0.2);
+    try testing.expectEqual(Mode.pread, pinned.choose(0, 0, 1, 1 << 40, 1, true).mode);
+    try testing.expectEqual(Reason.explicit, pinned.choose(0, 0, 1, 1 << 40, 1, true).reason);
+    const asked: Policy = .{ .profile = .uring };
     if (uringAvailable()) {
-        try testing.expectEqual(Mode.uring, wide);
-        try testing.expectEqual(Mode.uring, narrow);
-    } else {
-        try testing.expectEqual(Mode.mmap, wide);
-        try testing.expectEqual(Mode.pread, narrow);
+        const direct = asked.choose(0, 0, 0.1, 1, std.math.maxInt(u64), true);
+        try testing.expectEqual(Mode.uring, direct.mode);
+        try testing.expect(direct.directRead());
     }
+    // Cached wins before the memory check, even when the planned read is larger than memory.
+    const hot = auto.choose(0.8, 0, 1, 1 << 40, 1, true);
+    try testing.expectEqual(Mode.mmap, hot.mode);
+    try testing.expectEqual(Reason.cached, hot.reason);
+    if (builtin.os.tag != .linux) return;
+    const fits: u64 = 1 << 30;
+    if (uringAvailable()) {
+        const wide = auto.choose(0, 0, 0.9, fits, fits, true);
+        try testing.expectEqual(Mode.uring, wide.mode);
+        try testing.expectEqual(Reason.cold_buffered, wide.reason);
+        try testing.expect(!wide.directRead());
+        const huge = auto.choose(0, 0, 0.2, fits + 1, fits, true);
+        try testing.expectEqual(Mode.uring, huge.mode);
+        try testing.expectEqual(Reason.exceeds_memory, huge.reason);
+        try testing.expect(huge.directRead());
+    } else {
+        try testing.expectEqual(Mode.pread, auto.choose(0, 0, 0.9, fits, fits, true).mode);
+        try testing.expectEqual(Reason.no_uring, auto.choose(0, 0, 0.9, fits, fits, true).reason);
+    }
+    // A resident body is not direct, even when the planned read is larger than memory.
+    const partial = auto.choose(0.2, 0.2, 0.9, fits + 1, fits, true);
+    try testing.expect(!partial.directRead());
+    if (uringAvailable()) {
+        try testing.expectEqual(Reason.cold_buffered, partial.reason);
+    } else {
+        try testing.expectEqual(Reason.no_uring, partial.reason);
+    }
+    const narrow = auto.choose(0, 0, 0.2, fits, fits, true);
+    try testing.expectEqual(Mode.pread, narrow.mode);
+    try testing.expectEqual(Reason.cold_buffered, narrow.reason);
+}
+
+test "the MemAvailable seam is what auto compares the planned read with" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    testingSetMemAvailable(4096);
+    defer testingSetMemAvailable(null);
+    try testing.expectEqual(@as(u64, 4096), memAvailable());
+    const auto: Policy = .{};
+    const over = auto.choose(0, 0, 0.9, 4097, memAvailable(), true);
+    try testing.expectEqual(Reason.exceeds_memory, over.reason);
+    testingSetMemAvailable(1 << 40);
+    const under = auto.choose(0, 0, 0.9, 4097, memAvailable(), true);
+    try testing.expectEqual(Reason.cold_buffered, under.reason);
+    try testing.expect(!under.directRead());
+}
+
+test "unknown residency is not cold, and over_budget does not hide exceeds_memory" {
+    const auto: Policy = .{};
+    const fits: u64 = 1 << 30;
+    // A failed mincore or a stride sample: the numbers look cold, and still must not go direct.
+    const unknown = auto.choose(0, 0, 0.9, fits + 1, fits, false);
+    try testing.expect(!unknown.directRead());
+    try testing.expect(unknown.reason != .exceeds_memory);
+    const sparse = residencyFrom(0, 32, 10_000, true);
+    try testing.expect(!sparse.proven);
+    try testing.expect(sparse.body != 0);
+    const from_sample = auto.choose(sparse.share, sparse.body, 0.9, fits + 1, fits, sparse.proven);
+    try testing.expect(!from_sample.directRead());
+    const failed = residencyFrom(0, 0, 10, false);
+    try testing.expect(!failed.proven);
+    if (builtin.os.tag != .linux or !uringAvailable()) return;
+    const proven_cold = residencyFrom(0, 100, 100, true);
+    try testing.expect(proven_cold.proven);
+    try testing.expectEqual(@as(f64, 0), proven_cold.body);
+    const huge = auto.choose(0, proven_cold.body, 0.2, fits + 1, fits, proven_cold.proven);
+    try testing.expectEqual(Reason.exceeds_memory, huge.reason);
+    // The row group does not fit the reader window. exceeds_memory stays; a buffered choice becomes the mapping.
+    const kept = huge.keepDirect(false);
+    try testing.expectEqual(Reason.exceeds_memory, kept.reason);
+    try testing.expect(kept.directRead());
+    const wide = auto.choose(0, 0, 0.9, fits, fits, true);
+    const mapped = wide.keepDirect(false);
+    try testing.expectEqual(Mode.mmap, mapped.mode);
+    try testing.expectEqual(Reason.over_budget, mapped.reason);
+    // The open was refused. What remains is what execute will do, and a second budget check can still map it.
+    const refused = huge.withoutDirect();
+    try testing.expect(!refused.directRead());
+    try testing.expectEqual(Reason.direct_refused, refused.reason);
+    try testing.expectEqual(Mode.uring, refused.mode);
+    const then_budget = refused.keepDirect(false);
+    try testing.expectEqual(Reason.over_budget, then_budget.reason);
+}
+
+test "headroom is the tighter of MemAvailable and the cgroup, and an unreadable cgroup is unbounded" {
+    try testing.expect(memoryHeadroom("max", "1") == null);
+    try testing.expect(memoryHeadroom("nope", "1") == null);
+    try testing.expectEqual(@as(?u64, 0), memoryHeadroom("0\n", "0\n"));
+    try testing.expectEqual(@as(?u64, 60), memoryHeadroom("100\n", " 40\n"));
+    try testing.expectEqual(@as(?u64, 0), memoryHeadroom("40", "100"));
+    try testing.expect(dirHeadroom("/no/such/zpq-cgroup") == null);
+    if (builtin.os.tag != .linux) return;
+    testingSetMemAvailable(1000);
+    defer testingSetMemAvailable(null);
+    defer testingClearCgroup();
+    testingSetCgroup(100);
+    try testing.expectEqual(@as(u64, 100), memAvailable());
+    testingSetCgroup(null);
+    try testing.expectEqual(@as(u64, 1000), memAvailable());
+    testingSetCgroup(0);
+    try testing.expectEqual(@as(u64, 0), memAvailable());
+    testingSetCgroup(5000);
+    try testing.expectEqual(@as(u64, 1000), memAvailable());
+}
+
+test "residency follows the planned ranges, not the rest of the file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    const pages: usize = 512;
+    const size = page * pages;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    @memset(data, 7);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "ranges.bin", data, &path_buf);
+    try forgetFile(path, size);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const warm_bytes = page * 4;
+    const scratch = try testing.allocator.alloc(u8, warm_bytes);
+    defer testing.allocator.free(scratch);
+    const got = linux.pread(fd, scratch.ptr, warm_bytes, 0);
+    if (linux.errno(got) != .SUCCESS) return error.ReadFailed;
+    const map = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    defer posix.munmap(map);
+    const warm_r = [_]Range{.{ .start = 0, .end = warm_bytes }};
+    const warm = sampleRanges(testing.allocator, map, &warm_r);
+    try testing.expect(warm.proven);
+    try testing.expect(warm.share >= 0.8);
+    const whole = residentShare(testing.allocator, map);
+    try testing.expect(whole < 0.8);
+    const cached = (Policy{}).choose(warm.share, warm.body, 0.2, warm_bytes, std.math.maxInt(u64), warm.proven);
+    try testing.expectEqual(Reason.cached, cached.reason);
+    try testing.expectEqual(Mode.mmap, cached.mode);
+}
+
+test "O_DIRECT openability is decided without reading the file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // proc refuses O_DIRECT. The probe opens a sibling and closes it; it does not read.
+    const proc = linux.open("/proc/self/comm", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(proc) != .SUCCESS) return error.OpenFailed;
+    const proc_fd: i32 = @intCast(proc);
+    defer _ = linux.close(proc_fd);
+    try testing.expect(!directOpenable(proc_fd));
+    if (!uringAvailable()) return;
+    const asked = (Policy{}).choose(0, 0, 0.2, 100, 1, true);
+    try testing.expect(asked.directRead());
+    const refused = asked.withoutDirect();
+    try testing.expect(!refused.directRead());
+    try testing.expectEqual(Reason.direct_refused, refused.reason);
+    try testing.expectEqual(Mode.uring, refused.mode);
+    // A regular file on a filesystem that accepts O_DIRECT stays direct. The probe still reads nothing.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "direct.bin", "ok", &path_buf);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const before = fileSize(fd);
+    try testing.expect(directOpenable(fd));
+    try testing.expectEqual(before, fileSize(fd));
+    try testing.expect(asked.directRead());
+    // Order does not matter: one refusal, anywhere, keeps the scan off direct.
+    const file_ok = directOpenable(fd);
+    const proc_ok = directOpenable(proc_fd);
+    try testing.expect(everyDirect(&.{file_ok}));
+    try testing.expect(!everyDirect(&.{}));
+    try testing.expect(!everyDirect(&.{ file_ok, proc_ok }));
+    try testing.expect(!everyDirect(&.{ proc_ok, file_ok }));
+}
+
+fn fileSize(fd: i32) u64 {
+    var st = std.mem.zeroes(linux.Statx);
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    return st.size;
+}
+
+fn readWhole(path: []const u8, data: []const u8, cfg: Config) !void {
+    const rd = try Reader.create(testing.allocator, cfg);
+    defer rd.destroy();
+    const f = try rd.openFile(path, data.len);
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    gate.done(gate.ctx, 0, 1);
+}
+
+test "pread, buffered io_uring and direct io_uring read the same bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prng = std.Random.DefaultPrng.init(0x10);
+    const data = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(data);
+    prng.random().bytes(data);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    try readWhole(path, data, .{ .mode = .pread, .threads = 2, .block = 64 << 10 });
+    if (!uringAvailable()) return;
+    try readWhole(path, data, .{ .mode = .uring, .threads = 2, .block = 64 << 10, .direct = false });
+    try readWhole(path, data, .{ .mode = .uring, .threads = 2, .block = 64 << 10, .direct = true });
+}
+
+test "io_uring retries a refused enter and resubmits an EAGAIN completion" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 64 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 3);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "retry.bin", data, &path_buf);
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .block = 64 << 10,
+        .direct = false,
+    });
+    defer rd.destroy();
+    rd.testingIoFaults(2, 1);
+    const f = try rd.openFile(path, data.len);
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    gate.done(gate.ctx, 0, 1);
+    try testing.expectEqual(@as(u8, 0), rd.enter_faults.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), rd.cqe_replays.load(.monotonic));
+}
+
+fn readFaulted(path: []const u8, data: []const u8, enter: u8, cqe: u8, fail_pread: bool) !void {
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .block = 64 << 10,
+        .direct = false,
+    });
+    defer rd.destroy();
+    rd.testingIoFaults(enter, cqe);
+    if (fail_pread) rd.testingFailPread();
+    const f = try rd.openFile(path, data.len);
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    if (fail_pread) {
+        try testing.expectError(error.LocalReadFailed, gate.wait(gate.ctx, 0));
+        return;
+    }
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    gate.done(gate.ctx, 0, 1);
+    if (enter > uring_retry_bound) {
+        try testing.expectEqual(enter - uring_retry_bound, rd.enter_faults.load(.monotonic));
+    }
+    if (cqe > uring_retry_bound) {
+        try testing.expectEqual(cqe - uring_retry_bound, rd.cqe_replays.load(.monotonic));
+    }
+}
+
+test "io_uring past the retry bound finishes the unit with pread" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 64 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 5);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "bound.bin", data, &path_buf);
+    // More faults than the bound: the enter gives up, and so does one unit's -EAGAIN resubmit. Both still match.
+    try readFaulted(path, data, 100, 0, false);
+    try readFaulted(path, data, 0, 100, false);
+    try readFaulted(path, data, 100, 0, true);
+}
+
+test "direct io opens its own fd and does not change a borrowed one" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 64 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 9);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const before = linux.fcntl(fd, linux.F.GETFL, 0);
+    try testing.expect(linux.errno(before) == .SUCCESS);
+    const rd = try Reader.create(testing.allocator, .{ .mode = .uring, .threads = 1, .direct = true });
+    defer rd.destroy();
+    const f = try rd.borrowFile(fd, data.len);
+    const after = linux.fcntl(fd, linux.F.GETFL, 0);
+    try testing.expectEqual(before, after);
+    if (f.direct) {
+        try testing.expect(f.fd != fd);
+        try testing.expect(f.owned);
+    } else {
+        try testing.expectEqual(fd, f.fd);
+        try testing.expect(!f.owned);
+    }
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    gate.done(gate.ctx, 0, 1);
+}
+
+fn fileResidency(path: []const u8, size: usize) !f64 {
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_z.len) return error.NameTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const map = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    defer posix.munmap(map);
+    return residentShare(testing.allocator, map);
+}
+
+fn forgetFile(path: []const u8, size: usize) !void {
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (path.len >= path_z.len) return error.NameTooLong;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const rc = linux.open(path_z[0..path.len :0], .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    _ = linux.fsync(fd);
+    _ = linux.fadvise(fd, 0, 0, linux.POSIX_FADV.DONTNEED);
+    const map = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    defer posix.munmap(map);
+    _ = linux.madvise(map.ptr, map.len, linux.MADV.DONTNEED);
+}
+
+test "a buffered read of a cold file leaves it cached for the next choice" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const page = std.heap.pageSize();
+    const size = page * 128;
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    @memset(data, 4);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "data.bin", data, &path_buf);
+    try forgetFile(path, size);
+    const cold = try fileResidency(path, size);
+    try readWhole(path, data, .{ .mode = .uring, .threads = 2, .block = 64 << 10, .direct = false });
+    const warm = try fileResidency(path, size);
+    // The cold choice is buffered, which is what filled the cache. The next choice sees that and stays mapped.
+    const auto: Policy = .{};
+    const first = auto.choose(cold, 0, 1, size, std.math.maxInt(u64), true);
+    try testing.expectEqual(Reason.cold_buffered, first.reason);
+    try testing.expect(!first.directRead());
+    try testing.expect(warm >= 0.8);
+    try testing.expect(warm > cold);
+    const second = auto.choose(warm, warm, 1, size, std.math.maxInt(u64), true);
+    try testing.expectEqual(Mode.mmap, second.mode);
+    try testing.expectEqual(Reason.cached, second.reason);
 }
 
 test "row groups draw their bytes from the query's ledger as they are admitted, and give them back as released" {

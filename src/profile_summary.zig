@@ -14,6 +14,7 @@
 const std = @import("std");
 const profile = @import("profile.zig");
 const schema = @import("core/schema.zig");
+const local_reader = @import("io/local_reader.zig");
 
 const Phase = profile.Phase;
 const Kind = profile.Kind;
@@ -78,6 +79,8 @@ pub const IoStat = struct {
     io_mode: u64 = 0,
     io_resident_permille: u64 = 0,
     io_coverage_permille: u64 = 0,
+    /// `local_reader.Reason`, valid when `io_choice_seen` is set.
+    io_reason: u64 = 0,
 
     pub fn requests(self: IoStat) u64 {
         return self.gets + self.puts;
@@ -358,6 +361,7 @@ fn tally(
             s.io.io_mode = a[1];
             s.io.io_resident_permille = a[2];
             s.io.io_coverage_permille = a[3];
+            s.io.io_reason = a[4];
         },
         .zstd_plan => s.zstd = .{
             .seen = 1,
@@ -506,13 +510,15 @@ fn writeIoChoice(w: *std.Io.Writer, io: IoStat) !void {
         modes[@min(io.io_mode, modes.len - 1)],
     });
     if (io.io_profile == 0) {
-        try w.print(" ({d}% cached", .{io.io_resident_permille / 10});
+        try w.print(" ({d}% of the planned read cached", .{io.io_resident_permille / 10});
         if (io.io_coverage_permille <= 1000) {
             try w.print(", plans to read {d}% of the bytes", .{io.io_coverage_permille / 10});
         }
         try w.writeAll(")");
     }
     try w.writeAll("\n");
+    const reason = std.enums.fromInt(local_reader.Reason, io.io_reason) orelse return;
+    try w.print("       why: {s}\n", .{reason.phrase()});
 }
 
 /// `compression.CompressPriority`'s names, by value.
@@ -1023,6 +1029,14 @@ test "the local reader line names the backends actually used, mixed ones include
         .{
             .io = .{ .local_mode = 1, .local_pread_threads = 4, .local_buffered_files = 3 },
             .want = "pread (4 threads), through the page cache",
+        },
+        .{
+            .io = .{
+                .local_mode = 2,
+                .local_uring_threads = 8,
+                .local_buffered_files = 1,
+            },
+            .want = "io_uring (8 threads), through the page cache",
         },
     };
     for (cases) |c| {

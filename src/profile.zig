@@ -55,11 +55,11 @@ pub const Kind = enum(u8) {
     /// threads, worker stalls waiting on reads and their total ns, waits for the window.
     local_read,
     /// What that reader actually read with: threads on io_uring, threads on pread (a pread mode, or a ring that failed
-    /// to set up), files opened O_DIRECT, files read through the page cache.
+    /// to set up), files opened O_DIRECT, and files read through the page cache.
     local_backend,
     /// How a query's local inputs are read: the ZPQ_IO_PROFILE asked for (0 auto, 1 mmap, 2 pread, 3 uring), the mode
-    /// chosen (0 mmap, 1 pread, 2 uring), and the share of the inputs cached and of them the query plans to read (per
-    /// mille; coverage 2^32-1 when not weighed).
+    /// chosen (0 mmap, 1 pread, 2 uring), the share of the planned read that is cached and the share of the inputs
+    /// the query plans to read (per mille; coverage 2^32-1 when not weighed), and `local_reader.Reason` for why.
     io_choice,
     /// How a zstd write compressed its pages: the `CompressPriority` (0 size, 1 speed), the pages each
     /// `ZstdMode` took (raw blocks, literals only, level 1, level 3), and the pages whose cheaper form failed its
@@ -186,7 +186,7 @@ pub const Kind = enum(u8) {
             .open_file, .footer_parse => &.{ "file", "bytes" },
             .local_read => &.{ "mode", "bytes", "threads", "stalls", "stall_ns", "window_waits" },
             .local_backend => &.{ "uring_threads", "pread_threads", "direct_files", "buffered_files" },
-            .io_choice => &.{ "profile", "mode", "resident_permille", "coverage_permille" },
+            .io_choice => &.{ "profile", "mode", "resident_permille", "coverage_permille", "reason" },
             .zstd_plan => &.{ "priority", "raw_pages", "literals_pages", "level1_pages", "level3_pages", "rechecked" },
             .footer_fetch => &.{ "file", "cache" },
             .plan => &.{ "work_items", "workers", "row_groups" },

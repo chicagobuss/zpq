@@ -515,6 +515,8 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
 pub const AggregateExplanation = struct {
     aggregate: scan.AggregateExplanation,
     io_mode: enum { mmap, pread, uring, s3_buffered, s3_windowed },
+    /// Why `io_mode` was chosen. Remote plans use `remote`.
+    io_reason: local_reader.Reason = .remote,
     encoded: bool,
     max_memory: usize,
     sketch: ?scan.SketchTopK,
@@ -643,11 +645,9 @@ fn executeAggregateOver(
     const all_local = on_linux and allLocal(opened);
     // Files mapped when descriptors ran short gave theirs back: read through the mapping unless a mode is asked for.
     const choose_io = all_local and (io_policy.profile != .auto or opened.descriptorsHeld());
-    const resident: f64 = if (choose_io and io_policy.profile == .auto) localResidency(ctx.gpa, opened) else 0;
     // Anything but the plain mapping needs the footers and the plan here: the explicit modes to read by them, and
-    // `auto` over uncached files to weigh how much of them the query reads.
-    const plan_io = choose_io and (io_policy.profile == .pread or io_policy.profile == .uring or
-        (io_policy.profile == .auto and resident < 0.8));
+    // `auto` to weigh the bytes this query will read (a warm slice of a cold file still maps).
+    const plan_io = choose_io and io_policy.profile != .mmap;
     var probed = opened.membership;
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
         steer_metas != null)
@@ -661,16 +661,31 @@ fn executeAggregateOver(
         break :blk m;
     } else null;
     const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
+    const residency: LocalResidency = if (choose_io and io_policy.profile == .auto)
+        plannedResidency(ctx.gpa, opened, local_plan)
+    else
+        .{};
+    const resident = residency.share;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
     // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
-    // the page cache's, not the query's.
+    // the page cache's, not the query's. That does not override a read that cannot fit in memory.
     const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
-    const io_mode: local_reader.Mode = if (choose_io and fits_reader) io_policy.choose(resident, coverage) else .mmap;
+    const planned: u64 = if (local_plan) |lp| lp.planned else 0;
+    var choice: local_reader.Choice = if (!choose_io)
+        .{ .mode = .mmap, .reason = if (all_local) .mapping else .remote }
+    else
+        io_policy.choose(resident, residency.body, coverage, planned, local_reader.memAvailable(), residency.proven);
+    choice = choice.keepDirect(fits_reader);
+    // The same open the reader would do, closed immediately, so EXPLAIN names the mode execute will use.
+    if (choice.directRead() and !directWouldOpen(opened)) choice = choice.withoutDirect();
+    choice = choice.keepDirect(fits_reader);
+    const io_mode = choice.mode;
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         io_policy.profile,
         io_mode,
         @as(u64, @intFromFloat(resident * 1000)),
         @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
+        choice.reason,
     }));
     const decode_rows_env = ctx.env.getPosix("ZPQ_DECODE_BATCH_ROWS");
     var scan_args: scan.MultiAggArgs = .{
@@ -763,6 +778,7 @@ fn executeAggregateOver(
                 .pread => .pread,
                 .uring => .uring,
             } else if (hasGatedInputs(opened.inputs)) .s3_windowed else .s3_buffered,
+            .io_reason = choice.reason,
             .encoded = scan_args.encoded,
             .max_memory = args.max_memory,
             .sketch = scan_args.sketch_topk,
@@ -785,6 +801,7 @@ fn executeAggregateOver(
             .threads = io_policy.threads,
             .window = io_policy.window orelse s3_window.windowFor(args.max_memory),
             .ledger = &ledger,
+            .direct = choice.directRead(),
         },
         &reader,
     );
@@ -4551,17 +4568,50 @@ fn allLocal(opened: OpenedInputs) bool {
     return true;
 }
 
-/// The share (0..1) of the local inputs' bytes the page cache holds.
-fn localResidency(gpa: std.mem.Allocator, opened: OpenedInputs) f64 {
-    var total: f64 = 0;
-    var resident: f64 = 0;
-    for (opened.mmaps) |m_opt| {
+const LocalResidency = struct { share: f64 = 0, body: f64 = 0, proven: bool = false };
+
+/// Residency of the bytes the query will read, weighted by pages mincore actually saw. Unknown (a failed mincore,
+/// a stride, or no plan) is not a cold file: `proven` stays false and `body` is 1.
+fn plannedResidency(gpa: std.mem.Allocator, opened: OpenedInputs, plan: ?LocalPlan) LocalResidency {
+    const lp = plan orelse return .{ .body = 1 };
+    var hits: u64 = 0;
+    var pages: u64 = 0;
+    var proven = true;
+    var any = false;
+    for (lp.files, opened.mmaps) |per_rg, m_opt| {
         const m = m_opt orelse continue;
-        const n: f64 = @floatFromInt(m.bytes.len);
-        total += n;
-        resident += n * local_reader.residentShare(gpa, m.bytes);
+        var list: std.ArrayList(local_reader.Range) = .empty;
+        defer list.deinit(gpa);
+        for (per_rg) |rs_opt| {
+            const rs = rs_opt orelse continue;
+            list.appendSlice(gpa, rs) catch return .{ .body = 1 };
+        }
+        if (list.items.len == 0) continue;
+        any = true;
+        const sample = local_reader.sampleRanges(gpa, m.bytes, list.items);
+        if (!sample.proven) proven = false;
+        hits += sample.hits;
+        pages += sample.pages;
     }
-    return if (total == 0) 0 else resident / total;
+    if (!any or pages == 0) return .{ .body = 1 };
+    const share = @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(pages));
+    return .{ .share = share, .body = if (proven) share else 1, .proven = proven };
+}
+
+/// The open execute will attempt, tried now and closed, so the choice does not change between EXPLAIN and the read.
+/// Direct only when every local input opens; one refusal keeps the scan buffered.
+fn directWouldOpen(opened: OpenedInputs) bool {
+    var checks: std.ArrayList(bool) = .empty;
+    defer checks.deinit(opened.gpa);
+    for (opened.mmaps, opened.inputs) |m_opt, in| {
+        const m = m_opt orelse continue;
+        const ok = if (m.fd) |fd|
+            local_reader.directOpenable(fd)
+        else
+            local_reader.directOpenablePath(in.name);
+        checks.append(opened.gpa, ok) catch return false;
+    }
+    return local_reader.everyDirect(checks.items);
 }
 
 /// Per local input, per row group, the byte ranges the scan reads (null when pruned): needed chunks and their page
@@ -6748,10 +6798,22 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
     const merge = if (a.dense) "dense_ids" else if (d.strategy == .partitioned_hash)
         "shared_partitions"
     else if (d.use_blocks) "ordered_blocks" else if (d.strategy == .scalar) "scalar" else "partitions";
-    try writer.print("{{\"ok\":true,\"explain\":true,\"strategy\":\"{s}\",\"merge\":\"{s}\",\"io\":\"{s}\",\"workers\":{d},\"tables\":{d},\"work_items\":{d},\"max_memory\":{d},\"encoded\":{},\"reasons\":[", .{
-        a.strategyName(), merge,                  @tagName(explanation.io_mode), a.workers, d.tables,
-        a.work_items,     explanation.max_memory, explanation.encoded,
-    });
+    try writer.print(
+        "{{\"ok\":true,\"explain\":true,\"strategy\":\"{s}\",\"merge\":\"{s}\",\"io\":\"{s}\"," ++
+            "\"io_reason\":\"{s}\"," ++
+            "\"workers\":{d},\"tables\":{d},\"work_items\":{d},\"max_memory\":{d},\"encoded\":{},\"reasons\":[",
+        .{
+            a.strategyName(),
+            merge,
+            @tagName(explanation.io_mode),
+            @tagName(explanation.io_reason),
+            a.workers,
+            d.tables,
+            a.work_items,
+            explanation.max_memory,
+            explanation.encoded,
+        },
+    );
     var sep: []const u8 = "";
     var reasons = a.plan.reasons.iterator();
     while (reasons.next()) |reason| {
@@ -12555,6 +12617,9 @@ test "explainAggregate: the facts a plan was made from, the admissible strategie
     const json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
     defer json.deinit();
     const facts = json.value.object.get("facts").?.object;
+    try std.testing.expectEqualStrings("mmap", json.value.object.get("io").?.string);
+    try std.testing.expectEqualStrings("explicit", json.value.object.get("io_reason").?.string);
+    try std.testing.expect(json.value.object.get("io_fallback") == null);
     try std.testing.expectEqual(@as(i64, 20000), facts.get("rows").?.object.get("value").?.integer);
     try std.testing.expectEqualStrings("exact", facts.get("row_groups").?.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("bound", facts.get("groups").?.object.get("provenance").?.string);

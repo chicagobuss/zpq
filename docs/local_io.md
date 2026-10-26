@@ -24,27 +24,38 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 |---|---|
 | `mmap` | the mapping, faulted in by the decode workers (also what writes and printed rows always use) |
 | `pread` | `ZPQ_IO_THREADS` reader threads, each with blocking `pread` of 1 MiB at a time |
-| `uring` | `ZPQ_IO_THREADS` reader threads, each with its own io_uring and 32 `O_DIRECT` reads of 1 MiB in flight |
+| `uring` | `ZPQ_IO_THREADS` reader threads, each with its own io_uring and 32 reads of 1 MiB in flight. Buffered, unless the profile is the explicit `uring` or `auto` decided the read cannot fit in memory: those open a separate `O_DIRECT` descriptor |
 
-`ZPQ_IO_PROFILE` chooses one: `mmap`, `pread`, `uring`, or `auto` (the default). With `auto`:
+`ZPQ_IO_PROFILE` chooses one: `mmap`, `pread`, `uring`, or `auto` (the default). `uring` is the explicit direct option. With `auto`:
 
 - on Lambda (`AWS_LAMBDA_FUNCTION_NAME` set), or on any OS but Linux: `mmap`;
-- when an estimated 80% or more of the inputs' bytes are already in the page cache: `mmap`, since a warm mapping reads
-  fastest as it is. The estimate comes from `mincore` over 64 evenly spaced windows of 32 pages per file (every page
-  of a file under 2048 pages), so it costs microseconds however big the file;
-- otherwise `uring` where the kernel allows an io_uring;
-- without one, a query that plans to read at least half of the inputs' bytes (a full or wide scan) uses `mmap`:
-  blocking `pread` loses to the kernel's readahead there (and so, measured, did advising the planned ranges
-  `MADV_WILLNEED` ahead of the workers). A narrower read uses `pread`.
+- when an estimated 80% or more of the bytes this query will read are already in the page cache: `mmap`. The estimate
+  is `mincore` over those planned ranges (column chunks and their page indexes), not the rest of the file, so a warm
+  repeat of a query that reads a slice of a large file maps. Every page of that range is counted while it is at most
+  4 GiB of pages; past that, a stride still estimates the share but does not prove the range is cold. A failed
+  `mincore` is unknown, and unknown is not cold;
+- when those bytes exceed the tightest of MemAvailable and the ancestor cgroups (`memory.max - memory.current`, or
+  the v1 `memory.limit_in_bytes - memory.usage_in_bytes`; the token `max` and an unreadable file are unbounded, a
+  readable 0 is a real limit), and mincore proved none of them are resident: io_uring with `O_DIRECT`. The
+  descriptor is one the reader opens (`/proc/self/fd/N` with `O_DIRECT`); a borrowed or mapped descriptor is never
+  changed with `F_SETFL`. Whether that open works, and whether a ring of the reader's queue depth can be set up,
+  is tried at plan time and closed, reading no column data, so `--explain` and the run name the same mode;
+- otherwise a query that plans to read at least half the inputs' bytes uses buffered io_uring, and a narrower read
+  uses `pread`. Both fill the page cache, so the next run of the same ranges takes the mapping.
 
 The footers are parsed and the query planned before the choice, so pruned row groups and unread columns don't count
-toward the share read.
+toward the share read. `--explain` reports the mode and one reason (`cached`, `cold_buffered`, or `exceeds_memory`,
+plus the explicit and fallback reasons) and does not read column data to decide. A row group the reader cannot hold
+is read through the mapping (`over_budget`), unless the read cannot fit in memory: that stays `exceeds_memory`.
 
 Each mode falls back rather than fails:
 
 - `uring` falls back to `pread` when io_uring is unavailable (seccomp in containers and sandboxes, or
   `kernel.io_uring_disabled`);
-- a file that refuses `O_DIRECT` (tmpfs, some FUSE file systems) is read through the page cache instead.
+- a transient io_uring refusal (`EAGAIN`, `EINTR`, `EBUSY`) is retried a few times per enter and per unit.
+  Past that the unit is read with `pread`, and a failed `pread` fails the read;
+- direct is used only when every input accepts `O_DIRECT`. One refusal (tmpfs, some FUSE file systems) reads
+  through the page cache instead.
 
 No registered buffers are used, so the default `memlock` limit is enough.
 
@@ -52,12 +63,13 @@ No registered buffers are used, so the default `memlock` limit is enough.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ZPQ_IO_PROFILE` | `auto` | `auto`, `mmap`, `pread` or `uring` |
+| `ZPQ_IO_PROFILE` | `auto` | `auto`, `mmap`, `pread`, or `uring` (explicit direct) |
 | `ZPQ_IO_WINDOW_MIB` | 1024 | bytes read ahead of the workers and not yet released |
 | `ZPQ_IO_THREADS` | 8 | reader threads |
 
 `--profile-summary` names the backend a query used, and on a `read mode:` line what `ZPQ_IO_PROFILE` asked for, what was
-chosen and, for `auto`, the cached share and the share the query plans to read. With a reader it adds a line with what
-the reads actually went through (reader threads on io_uring and on pread, the latter including any whose ring failed to
-set up; files read `O_DIRECT` and through the page cache), the bytes read, how often and how long workers waited on
-reads, and how often the reader waited for the window.
+chosen and, for `auto`, the cached share and the share the query plans to read, plus a `why:` line for that choice.
+`--explain` reports the same choice as `io` and `io_reason`. With a reader it adds a line with what the reads actually
+went through (reader threads on io_uring and on pread, the latter including any whose ring failed to set up; files
+read `O_DIRECT` and through the page cache), the bytes read, how often and how long workers waited on reads, and how
+often the reader waited for the window.

@@ -905,6 +905,9 @@ fn buildTemporalLeaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8, 
         .date_time => try parseDateTimeNs(val_str),
         .time_of_day => try parseTimeOfDayNs(val_str),
     };
+    // A DATE takes the literal as a DATE, as DuckDB casts an untyped string to the column's type: its time of day is
+    // dropped, not compared (`d = '2024-01-01 12:00:00'` holds on that day), as for `make_date`.
+    if (tk.ns_per_tick == ns_per_day) return bindExact(col_idx, op, tk.lane, @divFloor(lit.ns, ns_per_day), false);
     const inexact = lit.sub_ns or @mod(lit.ns, tk.ns_per_tick) != 0;
     return bindExact(col_idx, op, tk.lane, @divFloor(lit.ns, tk.ns_per_tick), inexact);
 }
@@ -1880,11 +1883,12 @@ test "parse binds temporal literals finer than the column's unit exactly" {
     try expectLeaf(i64, try parse(a, "tsns > '1600-01-01'", &meta, null), .LtEq, max64);
     try expectLeaf(i64, try parse(a, "tsns <= '1600-01-01'", &meta, null), .Gt, max64);
 
-    // DATE vs a timestamp literal compares as a timestamp: noon is after the date's midnight.
-    try expectLeaf(i32, try parse(a, "d >= '2024-01-01 12:00:00'", &meta, null), .Gt, 19723);
-    try expectLeaf(i32, try parse(a, "d < '2024-01-01 12:00:00'", &meta, null), .LtEq, 19723);
-    try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00.000000001'", &meta, null), .Gt, max32);
+    // A DATE casts a date-time literal to DATE, as DuckDB does, dropping the time of day, before the epoch too.
+    try expectLeaf(i32, try parse(a, "d >= '2024-01-01 12:00:00'", &meta, null), .GtEq, 19723);
+    try expectLeaf(i32, try parse(a, "d < '2024-01-01 12:00:00'", &meta, null), .Lt, 19723);
+    try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00.000000001'", &meta, null), .Eq, 19723);
     try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00'", &meta, null), .Eq, 19723);
+    try expectLeaf(i32, try parse(a, "d = '1969-12-31 23:00:00'", &meta, null), .Eq, -1);
 
     // TIME32 (millis, INT32) and TIME64 (nanos, INT64).
     try expectLeaf(i32, try parse(a, "tm >= '00:01:40.0005'", &meta, null), .Gt, 100_000);

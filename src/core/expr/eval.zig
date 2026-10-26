@@ -1291,6 +1291,8 @@ fn evalRegexpReplace(
         else => return error.TypeMismatch,
     };
     if (s.max_rep > 0) return error.NestedNotSupported;
+    // A column decoded to lengths alone (for `= ''`) has no texts to replace.
+    if (s.codes == null and s.values.len != s.rowCount()) return error.BadColumn;
     const replace = c.replace.?;
     var scratch: regex.Scratch = .init(arena);
     var bytes: std.ArrayList(u8) = .empty;

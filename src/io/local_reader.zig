@@ -1064,7 +1064,9 @@ pub const Reader = struct {
         var submit_tries: u8 = 0;
         var flushed = false;
         while (true) {
-            if (!flushed and builtin.is_test and self.enter_faults.load(.monotonic) > 0) {
+            // Not comptime-gated: ReleaseFast would otherwise drop `UringStalled` from the error set and the
+            // caller's fallback would not type-check. The counter stays zero outside tests.
+            if (!flushed and self.enter_faults.load(.monotonic) > 0) {
                 _ = self.enter_faults.fetchSub(1, .monotonic);
                 submit_tries += 1;
                 if (submit_tries >= uring_retry_bound) return error.UringStalled;

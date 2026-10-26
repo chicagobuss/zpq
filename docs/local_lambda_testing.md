@@ -83,12 +83,10 @@ Don't use for TDD — fake (#1) is much faster and integrates with `zig build`.
 
 ## 3. Native architecture checks
 
-`tools/verify/verify arch --rev SHA --host [redacted] --host oci-zt` cross-builds the
-ARM64 CLI, Lambda and integration executable, then runs those shipped binaries
-natively on oci-zt. No remote compiler is used. See [arch.md](../tools/verify/arch.md).
-A single selected host reports no cross-host comparison and returns 2 only if its
-native checks passed; failures keep their original exit. Local release-smoke
-blocks foreign targets without same-SHA native evidence.
+`tools/check/fleet.sh --host oci-zt` cross-builds the ARM64 bundle (unit tests, runner, CLI), runs it natively on
+oci-zt with no remote compiler, and requires its answers to every case to equal this host's
+([tools/check/README.md](../tools/check/README.md)). CI's ARM runner runs the shipped ARM64 CLI through the release
+cases and the shipped Lambda through the fake runtime.
 
 ## What's intentionally *not* here
 

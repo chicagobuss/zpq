@@ -102,7 +102,8 @@ def main() -> int:
             engine = {**engine, "python": sys.executable}
         config["engines"][name] = pin_engine(engine)
     if tokens is not None:
-        config["cases"] = [case for case in config["cases"] if f"{case['suite']}/{case['dataset']}/{case['query_id']}" in kept_ids]
+        config["cases"] = [case for case in config["cases"]
+                           if f"{case['suite']}/{case['dataset']}/{case['query_id']}" in kept_ids]
     skipped = [row["suite"] for row in report["suites"] if row["status"] == "skipped"]
     config["coverage_note"] = (
         f"verify filter ran={','.join(runnable) or '-'} skipped={','.join(skipped) or '-'}; {spec['note']}"

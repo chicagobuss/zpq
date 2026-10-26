@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -23,7 +24,14 @@ def file_sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool) -> tuple[int, float]:
+TIMED_OUT = 124
+DEFAULT_TIMEOUT_S = 3600
+
+
+def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool,
+           timeout_s: float = DEFAULT_TIMEOUT_S) -> tuple[int, float]:
+    """Run to completion or `timeout_s`. A hang kills the whole process group (wrappers and their children) and
+    returns TIMED_OUT with the reason as the log's last line: a hung stage is a failed stage, never a wait."""
     if heavy:
         argv = [
             "systemd-run",
@@ -41,13 +49,23 @@ def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool) -
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     with log_path.open("w") as log:
-        completed = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
-    return completed.returncode, time.monotonic() - started
+        child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            rc = child.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            log.write(f"\nverify: timed out after {timeout_s:.0f}s\n")
+            rc = TIMED_OUT
+    return rc, time.monotonic() - started
 
 
 def judge(cmd: stages.Cmd, rc: int, text: str) -> tuple[str, dict]:
     counts = cmd.parse(text) if cmd.parse else {}
-    if cmd.parse in (stages.parse_referee, stages.parse_cli_contracts):
+    if cmd.parse in (stages.parse_referee, stages.parse_contracts):
         if not counts.get("total") or counts.get("matched") != counts.get("total"):
             return "fail", counts
     if cmd.parse is stages.parse_tests:
@@ -104,12 +122,16 @@ def run_stage(ctx: stages.Ctx, name: str, heavy: bool) -> dict:
         print(f"{name} blocked  {cmd.blocked}", flush=True)
         return record
     try:
-        rc, duration = launch(cmd.argv, cmd.env, ctx.repo, log_path, heavy)
+        rc, duration = launch(cmd.argv, cmd.env, ctx.repo, log_path, heavy, cmd.timeout_s)
     except (OSError, subprocess.SubprocessError) as error:
         log_path.write_text(f"could not run stage: {error}\n")
         return _record(name, "fail", 1, 0.0, log_path, {"error": str(error)}, cmd)
     text = log_path.read_text(errors="replace")
-    status, counts = judge(cmd, rc, text)
+    if rc == TIMED_OUT and text.endswith(f"verify: timed out after {cmd.timeout_s:.0f}s\n"):
+        status, counts = "fail", {"timeout_s": cmd.timeout_s}
+        print(f"{name} TIMED OUT after {cmd.timeout_s:.0f}s", flush=True)
+    else:
+        status, counts = judge(cmd, rc, text)
     record = _record(name, status, rc, duration, log_path, counts, cmd)
     record["binary_sha256"] = file_sha256(ctx.binary)
     if name.startswith("differential") or name == "check-self":

@@ -103,7 +103,7 @@ jobs:
       - name: Fetch parquet-testing corpus
         run: |
           git clone https://github.com/apache/parquet-testing data/parquet-testing
-          git -C data/parquet-testing checkout --quiet 1a2a75127be06fc0123f03ebd36c966f7beda27d
+          git -C data/parquet-testing checkout --quiet 3acde70509f990c4ddfe34bf3ab05890657e766c
 
       - name: Generate nested edges fixture
         run: python3 tools/zpq-gen nested --out data
@@ -173,30 +173,24 @@ jobs:
       - name: Lambda integration tests
         run: zig build test-integration --summary all
 
-      # Cross-impl smoke: write parquet via ZPQ, read via pyarrow.
-      # Catches the codec class of bug (e.g. snappy round-tripping
-      # through our own decoder but failing in cramjam) and the
-      # output-schema class (e.g. computed string columns missing the
-      # UTF8 annotation). Lives in tools/cli_smoke.sh so the same
-      # checks run locally (`just smoke`) and here.
-      - name: CLI smoke + cross-impl validation
-        run: tools/cli_smoke.sh
-
-      - name: Private decoder funding regression
-        run: .venv/bin/python tools/private_decode_check.py zig-out/bin/zpq --out-dir zig-out/private-decode-check
-
-      # Step 6: conformance with a regression floor. The corpus clone is
-      # pinned to a known SHA so upstream additions can't fail us
-      # surprise-style; bump the SHA + floor together, deliberately.
-      - name: Conformance (apache/parquet-testing)
+      # Every declared case (answers against DuckDB, written files through PyArrow, CLI contracts, goldens), then
+      # every parquet-testing file (pinned above; bump deliberately) against its declared outcome.
+      - name: zpq-check cases and the parquet-testing corpus
         run: |
           zig build -Doptimize=ReleaseFast
-          python3 tools/conformance.py --corpus data/parquet-testing/data --min-pass 72
+          zig build -Doptimize=ReleaseSafe check
+          # ClickBench needs its 14 GB partitions, which only verify full's hosts keep.
+          cases=(); for f in tools/check/cases/*.json; do [[ $f == *clickbench.json ]] || cases+=(--cases "$f"); done
+          zig-out/bin/zpq-check "${cases[@]}" --no-cache --python .venv/bin/python
 
       # libzpq: the C ABI test, plain and under ASan/LeakSanitizer (gcc), the Python binding and service, and the
       # differential corpus answered byte for byte as the CLI and the Lambda do. ReleaseFast reuses the build above.
       - name: libzpq (C ABI, sanitizers, Python, differential)
         run: OPTIMIZE=ReleaseFast tests/libzpq/run.sh
+
+      # Publication, permissions, pipes, S3 uploads, sync and write faults (a missing sudo or strace skips by name).
+      - name: OS-level contracts
+        run: .venv/bin/python tools/check/contracts.py zig-out/bin/zpq --lib zig-out/lib/libzpq.so
 
   # Each native job runs its installed CLI and, on Linux, Lambda artifacts.
   release-smoke:

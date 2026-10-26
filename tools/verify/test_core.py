@@ -6,9 +6,11 @@ import argparse
 import fcntl
 import io
 import json
+import os
 import sys
 import tempfile
 import struct
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -148,11 +150,12 @@ class TestStageAccountingTest(unittest.TestCase):
                 self.assertEqual(execute.judge(cmd, 0, text)[0], "fail")
         self.assertEqual(execute.judge(cmd, 0, "4/5 tests passed (1 skipped)")[0], "blocked")
 
-    def test_cli_contract_output_requires_actual_invocations(self):
-        cmd = stages.Cmd([], {}, "cli", parse=stages.parse_cli_contracts)
-        for text in ("", "CLI contract checks passed (0 invocations; validation)"):
+    def test_contracts_need_a_summary_with_passes_and_no_failures(self):
+        cmd = stages.Cmd([], {}, "contracts", parse=stages.parse_contracts)
+        for text in ("", "contracts: 0 passed, 3 skipped by named need, 0 failed",
+                     "contracts: 12 passed, 0 skipped by named need, 1 failed"):
             self.assertEqual(execute.judge(cmd, 0, text)[0], "fail")
-        text = "CLI contract checks passed (303 invocations; pyarrow + DuckDB validation)"
+        text = "contracts: 13 passed, 3 skipped by named need, 0 failed"
         self.assertEqual(execute.judge(cmd, 0, text)[0], "pass")
 
     def test_only_named_declared_skips_fit_the_budget(self):
@@ -229,6 +232,27 @@ class ObserverTest(unittest.TestCase):
         self.assertIn('"test": "fixture test"', errors.getvalue())
         with self.assertRaises(EOFError):
             test_observer.read_exact(io.BytesIO(b"short"), 8)
+
+
+class TimeoutTest(unittest.TestCase):
+    def test_a_hung_stage_fails_by_name_and_its_children_die(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = verify.dummy_ctx()
+            ctx.run_dir = Path(d)
+            pid_file = Path(d) / "child.pid"
+            hang = stages.Cmd(["sh", "-c", f"sleep 60 & echo $! > {pid_file}; wait"], {}, "hangs", timeout_s=0.5)
+            with patch.object(stages, "describe", return_value=hang):
+                record = execute.run_stage(ctx, "hang", False)
+            self.assertEqual((record["status"], record["counts"]), ("fail", {"timeout_s": 0.5}))
+            child = int(pid_file.read_text())
+            for _ in range(100):  # killed, then reaped by whoever inherits it
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("the stage's child outlived the timeout")
 
 
 class SummaryTest(unittest.TestCase):

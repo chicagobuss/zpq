@@ -42,6 +42,8 @@ class Cmd:
     parse: object | None = None
     expected_skips: dict[str, str] = field(default_factory=dict)
     optimize: str | None = None
+    # Every stage ends: past this the runner kills it and fails it by name.
+    timeout_s: float = 3600
 
 
 def _last(pattern, text):
@@ -88,34 +90,12 @@ def parse_modules(text):
     return {"modules": int(match.group(1)), "tests": int(match.group(2))}
 
 
-def parse_cli_contracts(text):
-    match = _last(r"CLI contract checks passed \((\d+) invocations;", text)
+def parse_contracts(text):
+    match = _last(r"contracts: (\d+) passed, (\d+) skipped by named need, (\d+) failed", text)
     if not match:
         return {}
-    return {"matched": int(match.group(1)), "total": int(match.group(1))}
-
-
-def parse_canonical(text):
-    match = _last(r"canonical decode errors: (\d+) byte-identical failures", text)
-    if not match:
-        return {}
-    return {"checks": int(match.group(1))}
-
-
-def parse_clickbench(text):
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                raw = ast.literal_eval(line)
-            except (SyntaxError, ValueError):
-                continue
-            if isinstance(raw, dict):
-                counts = {str(key).lower(): value for key, value in raw.items()}
-                if "fail" in counts:
-                    counts["fail"] = int(counts["fail"])
-                return counts
-    return {}
+    return {"matched": int(match.group(1)), "total": int(match.group(1)) + int(match.group(3)),
+            "skipped": int(match.group(2)), "fail": int(match.group(3))}
 
 
 def parse_release(text):
@@ -189,58 +169,21 @@ def stage_integration(ctx: Ctx) -> Cmd:
 
 
 def stage_canonical(ctx: Ctx) -> Cmd:
-    return _python(ctx, "tools/decode_error_check.py", "canonical error precedence", ctx.binary,
-                   needs=((ctx.binary, "candidate binary"),), parse=parse_canonical)
+    argv = ["zig-out/bin/zpq-check", "--cases", "tools/check/cases/decode_errors.json",
+            "--cases", "tools/check/cases/hardware.json", "--zpq", str(ctx.binary),
+            "--no-cache", "--duckdb", ctx.duckdb, "--python", ctx.python, "--work", str(ctx.run_dir / "decode-work")]
+    return _check(ctx, "canonical decode errors and hardware-size byte parity at every point", argv, parse_referee)
 
 
-def stage_cli_smoke(ctx: Ctx) -> Cmd:
-    return Cmd(
-        ["tools/cli_smoke.sh", str(ctx.binary)],
-        _base_env(ctx),
-        "CLI contracts and PyArrow/DuckDB readback",
-        parse=parse_cli_contracts,
-        blocked=_need(ctx.binary, "candidate binary"),
-    )
 
-
-def stage_duckdb_smoke(ctx: Ctx) -> Cmd:
-    env = _base_env(ctx)
-    env["ZPQ"] = str(ctx.binary)
-    blocked = _need(ctx.binary, "candidate binary") or _need(Path(ctx.duckdb), "DuckDB 2.0 CLI")
-    return Cmd(
-        ["tools/duckdb_smoke.sh"],
-        env,
-        "DuckDB writes, zpq reads",
-        blocked=blocked,
-    )
-
-
-def _clickbench(ctx: Ctx, name: str, glob: str) -> Cmd:
-    sql = ctx.clickbench_sql / "queries.sql"
-    blocked = _need(ctx.binary, "candidate binary") or _need(sql, "ClickBench SQL")
-    parquet = str(ctx.clickbench_root / glob)
-    return Cmd(
-        [
-            ctx.python,
-            "tools/clickbench_check.py",
-            str(ctx.binary),
-            parquet,
-            str(ctx.repo),
-            str(ctx.run_dir / f"{name}.json"),
-        ],
-        _base_env(ctx),
-        f"ClickBench smoke on {glob}",
-        blocked=blocked,
-        parse=parse_clickbench,
-    )
-
-
-def stage_cb_sub1(ctx: Ctx) -> Cmd:
-    return _clickbench(ctx, "cb-sub1", "sub1/*.parquet")
-
-
-def stage_cb_sub16(ctx: Ctx) -> Cmd:
-    return _clickbench(ctx, "cb-sub16", "sub16/*.parquet")
+def stage_clickbench(ctx: Ctx) -> Cmd:
+    argv = ["zig-out/bin/zpq-check", "--cases", "tools/check/cases/clickbench.json", "--zpq", str(ctx.binary),
+            "--data", str(ctx.clickbench_root), "--no-cache", "--duckdb", ctx.duckdb, "--python", ctx.python,
+            "--work", str(ctx.run_dir / "clickbench-work")]
+    cmd = _check(ctx, "ClickBench's 43 queries on 1 and 16 partitions against DuckDB", argv, parse_referee)
+    cmd.blocked = cmd.blocked or _need(ctx.clickbench_root / "sub16", "ClickBench partitions")
+    cmd.timeout_s = 7200
+    return cmd
 
 
 def stage_skspill(ctx: Ctx) -> Cmd:
@@ -271,13 +214,12 @@ def stage_sigpipe(ctx: Ctx) -> Cmd:
     )
 
 
-def stage_write_robustness(ctx: Ctx) -> Cmd:
-    env = _base_env(ctx)
-    env["ZPQ_LIB"] = str(ctx.lib)
+def stage_contracts(ctx: Ctx) -> Cmd:
     return Cmd(
-        [ctx.python, "tools/write_robustness_check.py", str(ctx.binary)],
-        env,
-        "interrupted writes and sync failures",
+        [ctx.python, "tools/check/contracts.py", str(ctx.binary), "--lib", str(ctx.lib)],
+        _base_env(ctx),
+        "OS-level contracts: publication, permissions, pipes, S3 uploads, sync and write faults",
+        parse=parse_contracts,
         blocked=_need(ctx.binary, "candidate binary") or _need(ctx.lib, "libzpq.so"),
     )
 
@@ -299,15 +241,20 @@ def stage_modules(ctx: Ctx) -> Cmd:
     return _python(ctx, "tools/check_test_modules.py", "test-module coverage", parse=parse_modules)
 
 
+# Case files whose CLI sweeps belong to the full tier only.
+FULL_CASES = ("corpus.json", "decode_errors.json", "hardware.json", "clickbench.json")
 CHECK_CASES = sorted(str(p.relative_to(Path(__file__).resolve().parents[2]))
-                     for p in (Path(__file__).resolve().parents[2] / "tools/check/cases").glob("*.json"))
+                     for p in (Path(__file__).resolve().parents[2] / "tools/check/cases").glob("*.json")
+                     if p.name not in FULL_CASES)
 
 
 def referee_argv(ctx: Ctx, cached: bool = True) -> list[str]:
-    argv = ["zig-out/bin/zpq-check"]
+    argv = ["zig-out/bin/zpq-check", "--zpq", str(ctx.binary)]
     for path in CHECK_CASES:
         argv.extend(["--cases", path])
-    argv.extend(["--duckdb", str(Path(ctx.duckdb)), "--python", ctx.python, "--work", str(ctx.run_dir / "check-work")])
+    # A stable work directory keeps fixture paths, and so the oracle cache keys that name them, the same across runs.
+    argv.extend(["--duckdb", str(Path(ctx.duckdb)), "--python", ctx.python,
+                 "--work", str(ctx.repo / "zig-out/check-work")])
     if not cached:
         argv.append("--no-cache")
     return argv
@@ -343,10 +290,10 @@ def stage_path_parity(ctx: Ctx) -> Cmd:
                blocked=_need(Path(ctx.duckdb), "DuckDB 2.0 CLI"), parse=parse_path_parity)
 
 
-def stage_conform(ctx: Ctx) -> Cmd:
-    corpus = ctx.repo / "data" / "parquet-testing" / "data"
-    return _python(ctx, "tools/conformance.py", "apache parquet-testing corpus", "--corpus", corpus,
-                   "--min-pass", "72", needs=((corpus, "parquet-testing corpus"),))
+def stage_corpus(ctx: Ctx) -> Cmd:
+    argv = ["zig-out/bin/zpq-check", "--cases", "tools/check/cases/corpus.json", "--zpq", str(ctx.binary), "--no-cache",
+            "--duckdb", ctx.duckdb, "--python", ctx.python, "--work", str(ctx.run_dir / "corpus-work")]
+    return _check(ctx, "every apache/parquet-testing file against its declared outcome", argv, parse_referee)
 
 
 # name, tiers, builder. Order inside a tier follows this list.
@@ -361,16 +308,13 @@ REGISTRY = [
     ("differential-fresh", ("full",), stage_referee_fresh),
     ("path-parity", ("full",), stage_path_parity),
     ("canonical", ("full",), stage_canonical),
-    ("cli-smoke", ("commit", "full"), stage_cli_smoke),
-    ("duckdb-smoke", ("full",), stage_duckdb_smoke),
-    ("cb-sub1", ("full",), stage_cb_sub1),
-    ("cb-sub16", ("full",), stage_cb_sub16),
+    ("clickbench", ("full",), stage_clickbench),
     ("repro-skspill", ("full",), stage_skspill),
     ("libzpq", ("full",), stage_libzpq),
     ("repro-sigpipe", ("full",), stage_sigpipe),
-    ("write-robustness", ("full",), stage_write_robustness),
+    ("contracts", ("full",), stage_contracts),
     ("release-smoke", ("full",), stage_release_smoke),
-    ("conform", ("extra",), stage_conform),
+    ("corpus", ("full",), stage_corpus),
 ]
 
 

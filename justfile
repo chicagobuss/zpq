@@ -88,7 +88,7 @@ test *args="":
     zig build test --summary all -- {{args}}
 
 # Tier 2 — run before every commit.
-check: test-modules test test-integration smoke duckdb-smoke differential write-layout-check write-failure-check private-decode-check libzpq
+check: test-modules test test-integration differential libzpq
 
 # Static guard for Zig's lazy test discovery. Every src file containing a
 # top-level test must be directly rooted by one of the two test artifacts.
@@ -97,13 +97,13 @@ test-modules:
 
 # Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
 # fetch-corpus first so `test` picks up the real decimal/etc. fixtures.
-gauntlet: fetch-corpus test test-integration smoke duckdb-smoke differential (conform "data/parquet-testing")
+gauntlet: fetch-corpus test test-integration differential corpus contracts
     @echo "gauntlet: all tiers green (corpus-backed cross-impl + differential + conformance)."
 
 # Fetch the same apache/parquet-testing revision used by CI into the gitignored
 # data directory. Pinning keeps the local release gate from changing whenever
 # upstream adds a new format fixture; bump this SHA and CI's together.
-parquet_testing_sha := "1a2a75127be06fc0123f03ebd36c966f7beda27d"
+parquet_testing_sha := "3acde70509f990c4ddfe34bf3ab05890657e766c"
 fetch-corpus:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -118,19 +118,6 @@ fetch-corpus:
 test-integration:
     zig build test-integration --summary all
 
-# CLI smoke + cross-impl validation (ZPQ writes → pyarrow reads). Needs
-# pyarrow on python3's path. Part of Tier 2 (`just check`).
-smoke:
-    zig build -Doptimize=ReleaseFast
-    tools/cli_smoke.sh
-
-# Cross-impl decode validation, the other direction: DuckDB writes parquet →
-# ZPQ reads/filters/aggregates, compared against DuckDB's own answer. Catches
-# decode bugs a ZPQ-vs-ZPQ round-trip can't. Needs the duckdb CLI. Tier 2.
-duckdb-smoke:
-    zig build -Doptimize=ReleaseFast
-    tools/duckdb_smoke.sh
-
 # Differential test (adopted from Hardwood): ZPQ vs DuckDB ROW-BY-ROW across a
 # matrix of filter × projection × select × aggregate shapes, on an adversarial
 # multi-row-group fixture. Catches composition bugs aggregate-scalar checks miss
@@ -138,11 +125,6 @@ duckdb-smoke:
 # the .venv. Tier 2.
 differential:
     {{python}} tools/verify/verify.py stage differential
-
-# Reducing samples must return their private funding without adding a scan for a large dictionary tail.
-private-decode-check:
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/private_decode_check.py zig-out/bin/zpq --out-dir zig-out/private-decode-check
 
 # libzpq, the C ABI (Tier 2): its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close
 # cycles), the Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte
@@ -159,13 +141,11 @@ handoff *args:
     zig build libzpq -Doptimize=ReleaseFast
     {{python}} -I tests/handoff/run.py {{args}}
 
-# Conformance against apache/parquet-testing (Tier 3). Clones the corpus on
-# first run. Floor of 72 full-passes (was 64; +5: RLE-BOOLEAN, multi-member GZIP, empty datapage,
-# dict-page-offset-zero; +3: the legacy LZ4 files); hard failures always fail.
-conform corpus="/tmp/parquet-testing":
-    @test -d {{corpus}} || git clone --depth 1 https://github.com/apache/parquet-testing {{corpus}}
+# Every apache/parquet-testing file against its declared outcome (tools/check/cases/corpus.json).
+corpus: fetch-corpus
     zig build -Doptimize=ReleaseFast
-    {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 72
+    zig build -Doptimize=ReleaseSafe check
+    zig-out/bin/zpq-check --cases tools/check/cases/corpus.json --no-cache
 
 # Coverage-guided fuzzing on the pinned Zig toolchain; the fuzz-lite seeds also run in `test`.
 fuzz filter="fuzz:":
@@ -245,13 +225,8 @@ clean:
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
 
-# Re-encoding writes: bytes the same at every -j, explicit budgets at every codec (T9/T10), row-group and page
-# targets, and every page index checked against its values.
-write-layout-check:
+# OS-level contracts (publication, permissions, pipes, S3 uploads, sync and write faults); full tier.
+contracts:
     zig build -Doptimize=ReleaseFast
-    {{python}} tools/write_layout_check.py
-
-# Every failure probe has a timeout, including sink errors with encodes pending.
-write-failure-check:
-    zig build
-    {{python}} tools/write_failure_check.py zig-out/bin/zpq
+    zig build libzpq -Doptimize=ReleaseFast
+    {{python}} tools/check/contracts.py zig-out/bin/zpq --lib zig-out/lib/libzpq.so

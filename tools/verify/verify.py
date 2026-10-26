@@ -54,7 +54,7 @@ def guide() -> str:
         "perf": "Pinned scorecard plan/run/summary. --suites and --cases select inputs; missing suites "
                 "are blocked. Cold ship-bar scoring and in-process timing are separate metrics. "
                 "--resume RUN_DIR continues a prior sealed run in a new record.",
-        "stage X": "One stage from the registry below. conform is stage-only.",
+        "stage X": "One stage from the registry below.",
         "stages": "Show this guide and the registry.",
         "self-test": "Check summary records and scoring without compiling the engine.",
     }
@@ -255,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
               "  .venv/bin/python tools/verify/verify.py COMMAND", file=sys.stderr)
         return 2
     uses_corpus = args.command in ("quick", "commit", "full", "soak") or (
-        args.command == "stage" and args.name in ("test-core", "test-full", "integration", "conform"))
+        args.command == "stage" and args.name in ("test-core", "test-full", "integration", "corpus"))
     if uses_corpus:
         corpus = provenance.corpus_environment(REPO)
         if corpus["mismatch"]:

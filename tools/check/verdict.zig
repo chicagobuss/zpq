@@ -1444,29 +1444,55 @@ fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
     const sql = try oracleSql(in, spec);
     const upper = try std.ascii.allocUpperString(in.arena, sql);
     const cut = std.mem.lastIndexOf(u8, upper, " LIMIT ") orelse return compare.sameMultiset(in.arena, got, t.rows);
-    const whole = duck(in, sql[0..cut]) catch |err| return refusedReason(in, err);
-    for (whole.rows) |row| for (row, 0..) |*v, i| {
-        if (std.ascii.eqlIgnoreCase(whole.types[i], "DATE")) v.* = try toEpoch(v.*, "DATE");
-    };
-    var nan: usize = 0;
-    var have = std.StringHashMap(void).init(in.arena);
-    for (whole.rows) |row| try have.put(try exactRow(in.arena, row, &nan), {});
-    for (got) |g| if (!have.contains(try exactRow(in.arena, g, &nan)))
-        return fail(in, "zpq row not in DuckDB's whole answer: {s}", .{try compare.rowKey(in.arena, g)});
+    // Membership in DuckDB, as the old check did: an unlimited answer can be every row of the input (Q32's 16M
+    // groups), which zpq-check must never hold. A zpq row matches a whole-answer row column for column, exactly.
+    var q: std.ArrayList(u8) = .empty;
+    try q.print(in.arena, "WITH whole AS ({s}) SELECT count(*) AS missing FROM (VALUES ", .{sql[0..cut]});
+    for (got, 0..) |row, r| {
+        try q.appendSlice(in.arena, if (r == 0) "(" else ", (");
+        for (row, t.types, 0..) |v, ty, c| {
+            if (c != 0) try q.appendSlice(in.arena, ", ");
+            try sqlLiteral(in.arena, &q, v, ty);
+        }
+        try q.append(in.arena, ')');
+    }
+    try q.appendSlice(in.arena, ") AS g(");
+    for (t.names, 0..) |_, c| try q.print(in.arena, "{s}g{d}", .{ if (c == 0) "" else ", ", c });
+    try q.appendSlice(in.arena, ") WHERE NOT EXISTS (SELECT 1 FROM whole w WHERE ");
+    for (t.names, 0..) |name, c| {
+        try q.print(in.arena, "{s}w.\"{s}\" IS NOT DISTINCT FROM g.g{d}", .{ if (c == 0) "" else " AND ", name, c });
+    }
+    try q.append(in.arena, ')');
+    const m = duck(in, q.items) catch |err| return refusedReason(in, err);
+    const missing = m.rows[0][0];
+    if (missing != .int or missing.int != 0)
+        return fail(in, "{s} zpq rows not in DuckDB's whole answer", .{compare.show(in.arena, missing)});
     return null;
 }
 
-fn exactRow(arena: Allocator, row: []const Val, nan: *usize) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (row) |v| {
-        // DuckDB's IS NOT DISTINCT FROM: a NaN matches a NaN here, as in the old SQL membership test.
-        const k = if (v == .special)
-            try std.fmt.allocPrint(arena, "f{s}", .{v.special.token()})
+/// A zpq value as a DuckDB literal of the oracle's column type. DATEs arrive as days since 1970-01-01.
+fn sqlLiteral(arena: Allocator, q: *std.ArrayList(u8), v: Val, ty: []const u8) !void {
+    var buf: [200]u8 = undefined;
+    switch (v) {
+        .null => return q.print(arena, "CAST(NULL AS {s})", .{ty}),
+        .int => |n| if (std.ascii.eqlIgnoreCase(ty, "DATE"))
+            return q.print(arena, "(DATE '1970-01-01' + {d})", .{n})
         else
-            try compare.exactKey(arena, v, nan);
-        try out.print(arena, "{d}:{s}|", .{ k.len, k });
+            return q.print(arena, "CAST({d} AS {s})", .{ n, ty }),
+        .dec => |d| return q.print(arena, "CAST('{s}' AS {s})", .{ compare.decText(&buf, d), ty }),
+        .float => |f| return q.print(arena, "CAST('{e}' AS {s})", .{ f, ty }),
+        .special => |sp| return q.print(arena, "CAST('{s}' AS {s})", .{ sp.token(), ty }),
+        .boolean => |b| return q.print(arena, "CAST({} AS {s})", .{ b, ty }),
+        .text => |text| {
+            try q.appendSlice(arena, "CAST('");
+            for (text) |ch| {
+                if (ch == '\'') try q.append(arena, '\'');
+                try q.append(arena, ch);
+            }
+            return q.print(arena, "' AS {s})", .{ty});
+        },
+        .nested => return error.NestedInTiedCut,
     }
-    return out.items;
 }
 
 // ---- goldens: reviewed output, pinned byte for byte (stable text, written files as PyArrow reads them)

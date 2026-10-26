@@ -1003,16 +1003,19 @@ pub fn chunkDictionary(
 /// for a row group too big to hold decoded at once. Each reader keeps its own page buffers, so the memory held is a
 /// slice of values plus a page per column (and a byte-array column's dictionary): fixed-width readers recycle theirs
 /// (`scratch`); byte-array readers decode a page at a time onto `pages`, copy the slice's bytes out and free the page
-/// once it is drained.
+/// once it is drained. A retained byte column keeps the dictionary on `dict_store` for the chunk and resets `pages`
+/// between pages. Only decompression goes through `scratch`.
 pub const SliceReader = struct {
     /// In place for the reader's life: a reader holds pointers into itself once it has decoded.
     raw: *Raw,
     scratch: *DecodeScratch,
     /// The scratch and page arena belong to the worker's `SliceScratch` and outlive this reader.
     retained: bool = false,
-    /// A byte-array reader's page allocations, reset whenever a page is drained.
+    /// A byte-array reader's page allocations (levels, delta lengths, reconstructed strings). Reset when a page drains.
     pages: *std.heap.ArenaAllocator,
-    /// Holds a byte-array dictionary for the chunk, copied off `pages` once installed.
+    /// Retained byte-array dictionary. Chunk lifetime, not reset between pages.
+    dict_store: ?*std.heap.ArenaAllocator = null,
+    /// Non-retained byte-array dictionary until `holdDictionary`, and the probe's dictionary after `beginProbe`.
     held: std.mem.Allocator,
     dict_held: bool = false,
     /// Set by `chargePages`: what the pages draw from, and what the pages on `held` drew.
@@ -1114,10 +1117,14 @@ pub const SliceReader = struct {
             },
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => blk: {
                 const Reader = column_mod.ColumnChunkReader([]const u8);
-                // A retained column keeps its dictionary on its own slot. The shared bookkeeping arena would
-                // grow a new node for every column's dictionary and keep the old ones.
+                // The dictionary is the slot's chunk store. Page-local decoder memory stays on the page arena,
+                // which resets between pages. The shared bookkeeping arena would grow a node per column and keep it.
                 const pages_alloc = if (slot) |s| s.pages.allocator() else a;
                 var r = Reader.initWithOptions(chunk, cm.codec, levels, pages_alloc, decode_options, null);
+                if (slot) |s| {
+                    r.dictionary_arena = s.dictionary.allocator();
+                    r.pages.dictionary_arena = s.dictionary.allocator();
+                }
                 r.value_budget = @intCast(cm.num_values);
                 r.type_length = switch (cm.type) {
                     .FIXED_LEN_BYTE_ARRAY => flbaWidth(se),
@@ -1132,6 +1139,11 @@ pub const SliceReader = struct {
             .scratch = scratch,
             .retained = slot != null,
             .pages = pages,
+            .dict_store = if (slot != null and
+                (cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY or cm.type == .INT96))
+                &slot.?.dictionary
+            else
+                null,
             .held = a,
             .levels = levels,
             .dec = dec,
@@ -1153,8 +1165,9 @@ pub const SliceReader = struct {
 
     pub fn deinit(self: *SliceReader) void {
         if (self.retained) {
-            // The dictionary node is this row group's. The next group must not inherit it on top of its page.
+            // Both stores are this row group's. The next group must not inherit them on top of its own page.
             _ = self.pages.reset(.free_all);
+            if (self.dict_store) |d| _ = d.reset(.free_all);
         } else {
             self.scratch.deinit();
             self.pages.deinit();
@@ -1438,8 +1451,8 @@ pub const SliceReader = struct {
         return got;
     }
 
-    /// A retained column's compressed pages replace two scratch buffers: the dictionary, then each data page.
-    /// Set before `nextPage`, which installs the dictionary and the first data page in one call.
+    /// Decompression of a retained column replaces two scratch buffers: the dictionary, then each data page.
+    /// Decoder allocations stay on the page arena. Set before `nextPage`, which installs both in one call.
     fn armBytePage(self: *SliceReader, r: *column_mod.ColumnChunkReader([]const u8)) void {
         if (!self.retained) return;
         r.pages.scratch = self.scratch;
@@ -1478,11 +1491,10 @@ pub const SliceReader = struct {
         }
     }
 
-    /// Reset `pages`, giving back what its pages drew.
+    /// Reset `pages`, giving back what its pages drew. The dictionary store is the chunk's and stays.
     fn resetPages(self: *SliceReader) void {
-        // The slot arena holds the dictionary for the whole row group. Data pages replace `scratch.page`.
-        if (self.retained) return;
         _ = self.pages.reset(.retain_capacity);
+        if (self.retained) return;
         if (self.page_budget) |b| switch (self.raw.*) {
             .bytes => |*r| {
                 b.release(r.pages.drawn);
@@ -8884,6 +8896,134 @@ test "a sliced string reader under chargePages draws each page and its dictionar
     r.chargePages(testing.allocator, &tiny);
     try testing.expectError(error.ExceededMemoryBudget, r.next(a, rows));
     try testing.expectEqual(@as(usize, 0), tiny.used.load(.monotonic));
+}
+
+test "retained delta pages reset under the decode ledger, including optional levels" {
+    const testing = std.testing;
+    var build = std.heap.ArenaAllocator.init(testing.allocator);
+    defer build.deinit();
+    const arena = build.allocator();
+    // Shared prefixes so the chunk is DELTA_BYTE_ARRAY. Each page reconstructs about a mebibyte of strings, and
+    // enough pages that keeping those strings would pass the 32 MiB decode ledger. Every fifth row is null.
+    const value_len = 2048;
+    const prefix_len = 2000;
+    const per_page = (1 << 20) / (value_len + 4);
+    const n = per_page * 40 * 5 / 4;
+    const prefix = try arena.alloc(u8, prefix_len);
+    @memset(prefix, 'p');
+    const values = try arena.alloc([]const u8, n);
+    const defs = try arena.alloc(u32, n);
+    for (values, defs, 0..) |*v, *d, i| {
+        const present = i % 5 != 0;
+        d.* = @intFromBool(present);
+        if (!present) {
+            v.* = "";
+            continue;
+        }
+        const buf = try arena.alloc(u8, value_len);
+        @memcpy(buf[0..prefix_len], prefix);
+        _ = std.fmt.bufPrint(buf[prefix_len..], "{d:0>48}", .{i}) catch unreachable;
+        v.* = buf;
+    }
+    const elem: schema.SchemaElement = .{
+        .name = "s",
+        .type = .BYTE_ARRAY,
+        .repetition_type = .OPTIONAL,
+        .type_length = null,
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const enc = try encoder.encodeColumn(arena, .{
+        .values = .{ .string = .{
+            .values = values,
+            .def_levels = defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+        .schema_elem = &elem,
+        .path_in_schema = &.{"s"},
+        .codec = .UNCOMPRESSED,
+        .distinct = true,
+        .dictionary_bloom = false,
+        .page_bytes = 1 << 20,
+    });
+    var delta = false;
+    for (enc.meta.encodings.items) |e| if (e == .DELTA_BYTE_ARRAY) {
+        delta = true;
+    };
+    try testing.expect(delta);
+    try testing.expect(enc.pages.len >= 8);
+    var present_bytes: usize = 0;
+    for (values, defs) |v, d| if (d == 1) {
+        present_bytes += v.len;
+    };
+    try testing.expect(present_bytes > core_memory.lean_decode);
+
+    var file_meta = schema.FileMetaData{
+        .version = 2,
+        .schema = .empty,
+        .num_rows = @intCast(n),
+        .created_by = null,
+        .row_groups = .empty,
+    };
+    try file_meta.schema.append(arena, .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "schema",
+        .num_children = 1,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    try file_meta.schema.append(arena, elem);
+    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    try columns.append(arena, .{ .file_path = null, .file_offset = 0, .meta_data = enc.meta });
+    try file_meta.row_groups.append(arena, .{
+        .columns = columns,
+        .total_byte_size = @intCast(enc.bytes.len),
+        .num_rows = @intCast(n),
+    });
+
+    var budget: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
+    var charged: core_memory.Charged = .{ .child = testing.allocator, .budget = &budget };
+    var pool = SliceScratch.init(charged.allocator());
+    defer pool.deinit();
+    try pool.reserve(1);
+    const overhead = budget.used.load(.monotonic);
+    const src: RGSrc = .{ .bytes = enc.bytes, .byte_origin = 0 };
+    const rg = &file_meta.row_groups.items[0];
+    var reader = (try SliceReader.initPooled(arena, testing.allocator, rg, &file_meta, src, 0, .{}, &pool)).?;
+    errdefer reader.deinit();
+    const first: usize = @intCast(enc.pages[0].rows);
+    var at: usize = 0;
+    var after_one: usize = 0;
+    const mid = n / 2;
+    while (at < n) {
+        const k = @min(n - at, first);
+        const got = try reader.next(arena, k);
+        if (at == 0) {
+            try testing.expect(got.string.has_nulls);
+            try testing.expectEqual(@as(u32, 1), got.string.max_def);
+            try testing.expectEqual(@as(u32, 0), got.string.def_levels.?[0]);
+            try testing.expectEqualStrings(values[1], got.string.values[1]);
+            after_one = reader.pages.queryCapacity();
+            try testing.expect(after_one > 0);
+        }
+        if (at <= mid and at + k > mid and defs[mid] == 1) {
+            try testing.expectEqualStrings(values[mid], got.string.values[mid - at]);
+        }
+        at += k;
+    }
+    const after_all = reader.pages.queryCapacity();
+    try testing.expect(after_all <= after_one * 2);
+    try testing.expect(after_all < core_memory.lean_decode / 2);
+    try testing.expect(reader.dict_store.?.queryCapacity() < core_memory.lean_decode / 8);
+    try testing.expect(budget.used.load(.monotonic) <= core_memory.lean_decode);
+    reader.deinit();
+    try testing.expect(budget.used.load(.monotonic) <= overhead);
 }
 
 test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {

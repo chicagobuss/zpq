@@ -65,8 +65,15 @@ pub fn Decoder(comptime T: type) type {
             const native_endian = comptime @import("builtin").cpu.arch.endian();
             if (native_endian == .little) {
                 const byte_count = n * elem_size;
-                const dst_ptr: [*]u8 = @ptrCast(dest.ptr);
-                @memcpy(dst_ptr[0..byte_count], self.bytes[self.pos..][0..byte_count]);
+                const dst: []u8 = @as([*]u8, @ptrCast(dest.ptr))[0..byte_count];
+                const src = self.bytes[self.pos..][0..byte_count];
+                // A fixed-width dictionary is decompressed into the scratch buffer its PLAIN values then occupy.
+                // Those ranges are the same bytes; @memcpy rejects the overlap, and a partial overlap has to move.
+                const d0 = @intFromPtr(dst.ptr);
+                const s0 = @intFromPtr(src.ptr);
+                if (d0 != s0) {
+                    if (d0 < s0 +% src.len and s0 < d0 +% dst.len) @memmove(dst, src) else @memcpy(dst, src);
+                }
                 self.pos += byte_count;
                 return n;
             }
@@ -223,6 +230,22 @@ test "Decoder(i32) decodes raw little-endian ints" {
     try testing.expectEqual(@as(i32, 2), out[1]);
     try testing.expectEqual(@as(i32, -1), out[2]);
     try testing.expectEqual(@as(i64, 0), dec.remaining());
+}
+
+test "plain fixed-width decode accepts a dictionary sitting in its output" {
+    var same = [_]i32{ 1, 2 };
+    var onto = Decoder(i32).init(std.mem.sliceAsBytes(same[0..]));
+    try testing.expectEqual(@as(usize, 2), try onto.decode(same[0..]));
+    try testing.expectEqual(@as(i32, 1), same[0]);
+    try testing.expectEqual(@as(i32, 2), same[1]);
+
+    // dest starts inside src, so a forward copy would clobber a value before it is read.
+    var raw align(4) = [_]u8{ 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0 };
+    var over = Decoder(i32).init(raw[0..8]);
+    const dest = std.mem.bytesAsSlice(i32, raw[4..12]);
+    try testing.expectEqual(@as(usize, 2), try over.decode(dest));
+    try testing.expectEqual(@as(i32, 1), dest[0]);
+    try testing.expectEqual(@as(i32, 2), dest[1]);
 }
 
 test "Decoder(i64) decodes raw little-endian ints" {

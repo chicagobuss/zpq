@@ -125,9 +125,11 @@ pub const DecodeScratch = struct {
         self.gpa.free(old);
         const grown = std.math.add(usize, old_n, old_n / 2) catch n;
         const padded: usize = if (old_n == 0) n else @max(n, grown);
-        const fresh = self.gpa.alignedAlloc(T, .fromByteUnits(alignment), padded) catch |err| {
+        // Both sizes install through `buf`. Returning the exact fallback directly would hand the caller memory
+        // scratch no longer owns, so the next page cannot reuse it and teardown cannot free it.
+        const fresh = self.gpa.alignedAlloc(T, .fromByteUnits(alignment), padded) catch |err| exact: {
             if (padded == n) return err;
-            return self.gpa.alignedAlloc(T, .fromByteUnits(alignment), n);
+            break :exact self.gpa.alignedAlloc(T, .fromByteUnits(alignment), n) catch |fallback| return fallback;
         };
         buf.* = fresh;
         return fresh[0..n];
@@ -159,7 +161,10 @@ pub const SliceScratch = struct {
 
     pub const Slot = struct {
         scratch: DecodeScratch,
+        /// Page-local decoder memory (levels, delta strings). Reset between pages.
         pages: std.heap.ArenaAllocator,
+        /// Chunk-lifetime dictionary slices. Not reset between pages.
+        dictionary: std.heap.ArenaAllocator,
 
         fn prepareReuse(self: *Slot) void {
             if (std.debug.runtime_safety) {
@@ -169,6 +174,7 @@ pub const SliceScratch = struct {
                 @memset(std.mem.sliceAsBytes(self.scratch.rep_levels), reuse_poison);
             }
             _ = self.pages.reset(.retain_capacity);
+            _ = self.dictionary.reset(.free_all);
         }
     };
 
@@ -184,6 +190,7 @@ pub const SliceScratch = struct {
         for (self.slots.items) |*slot| {
             slot.scratch.deinit();
             slot.pages.deinit();
+            slot.dictionary.deinit();
         }
         self.slots.deinit(self.alloc);
         self.alloc.free(self.survivors);
@@ -211,6 +218,7 @@ pub const SliceScratch = struct {
         self.slots.appendAssumeCapacity(.{
             .scratch = .init(self.alloc),
             .pages = .init(self.alloc),
+            .dictionary = .init(self.alloc),
         });
         self.next += 1;
         return &self.slots.items[self.next - 1];
@@ -258,6 +266,7 @@ pub const SliceScratch = struct {
             n += slot.scratch.def_levels.len * @sizeOf(u32);
             n += slot.scratch.rep_levels.len * @sizeOf(u32);
             n += slot.pages.queryCapacity();
+            n += slot.dictionary.queryCapacity();
         }
         return n;
     }
@@ -272,7 +281,8 @@ pub const SliceScratch = struct {
     }
 
     fn releaseLargest(self: *SliceScratch) bool {
-        // 1 survivors, 2 value arena, 3 scan arena, then five ids per slot: page, dict, def, rep, page arena.
+        // 1 survivors, 2 value arena, 3 scan arena, then six ids per slot: page, dict, def, rep, page arena,
+        // dictionary arena.
         var best: usize = 0;
         var pick: usize = 0;
         const note = struct {
@@ -287,7 +297,7 @@ pub const SliceScratch = struct {
         note(&best, &pick, self.values.queryCapacity(), 2);
         note(&best, &pick, self.scan_values.queryCapacity(), 3);
         for (self.slots.items, 0..) |*slot, i| {
-            const base = 4 + i * 5;
+            const base = 4 + i * 6;
             const buffers = .{
                 slot.scratch.page.len,
                 slot.scratch.dict.len,
@@ -296,6 +306,7 @@ pub const SliceScratch = struct {
             };
             inline for (buffers, 0..) |n, k| note(&best, &pick, n, base + k);
             note(&best, &pick, slot.pages.queryCapacity(), base + 4);
+            note(&best, &pick, slot.dictionary.queryCapacity(), base + 5);
         }
         if (best == 0) return false;
         switch (pick) {
@@ -306,13 +317,14 @@ pub const SliceScratch = struct {
             2 => _ = self.values.reset(.{ .retain_with_limit = 0 }),
             3 => _ = self.scan_values.reset(.{ .retain_with_limit = 0 }),
             else => {
-                const slot = &self.slots.items[(pick - 4) / 5];
-                switch ((pick - 4) % 5) {
+                const slot = &self.slots.items[(pick - 4) / 6];
+                switch ((pick - 4) % 6) {
                     0 => { slot.scratch.gpa.free(slot.scratch.page); slot.scratch.page = &.{}; },
                     1 => { slot.scratch.gpa.free(slot.scratch.dict); slot.scratch.dict = &.{}; },
                     2 => { slot.scratch.gpa.free(slot.scratch.def_levels); slot.scratch.def_levels = &.{}; },
                     3 => { slot.scratch.gpa.free(slot.scratch.rep_levels); slot.scratch.rep_levels = &.{}; },
-                    else => _ = slot.pages.reset(.{ .retain_with_limit = 0 }),
+                    4 => _ = slot.pages.reset(.{ .retain_with_limit = 0 }),
+                    else => _ = slot.dictionary.reset(.{ .retain_with_limit = 0 }),
                 }
             },
         }
@@ -354,6 +366,29 @@ test "a larger retained page frees the smaller buffer before allocating" {
     _ = try scratch.ensure(u8, 1, &scratch.page, page * 2);
     try std.testing.expect(scratch.page.len >= page * 2);
     try std.testing.expect(budget.used.load(.monotonic) <= budget.limit);
+}
+
+test "exact page growth installs the fallback when only the exact size fits" {
+    const page = std.heap.pageSize();
+    // 8 pages held, 9 wanted, padded growth is 12. After the old buffer is freed only 9 fit.
+    const old_n = page * 8;
+    const n = page * 9;
+    var budget: core_memory.SharedBudget = .{ .limit = std.math.maxInt(usize) };
+    var charged: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &budget };
+    {
+        var scratch = DecodeScratch.init(charged.allocator());
+        defer scratch.deinit();
+        _ = try scratch.ensure(u8, 1, &scratch.page, old_n);
+        budget.limit = n;
+        _ = try scratch.ensure(u8, 1, &scratch.page, n);
+        try std.testing.expect(scratch.page.len >= n);
+        try std.testing.expect(budget.used.load(.monotonic) <= n);
+        // The installed buffer is the one the next page reuses; a second draw of the same size adds nothing.
+        const used = budget.used.load(.monotonic);
+        _ = try scratch.ensure(u8, 1, &scratch.page, n);
+        try std.testing.expectEqual(used, budget.used.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
 test "scratch retention across columns stays within one decode allowance" {

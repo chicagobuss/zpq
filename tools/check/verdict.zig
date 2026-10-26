@@ -46,6 +46,12 @@ pub const Spec = struct {
     /// `pinned`: the expected rows, and why no rival reader is the oracle for them.
     rows: ?[]const std.json.Value = null,
     why: ?[]const u8 = null,
+    /// `tied_rows`: the positions of the ORDER BY columns in the answer. A tie at the cut may pick other rows, never
+    /// other ranks: when rows differ by position these columns must still match row by row.
+    ranks: ?[]const usize = null,
+    /// The answer comes from an engine that prints wide numbers as JSON strings (DuckDB's HUGEINT): a string in a
+    /// numeric oracle column is read as that number. Never set for zpq, whose number output is pinned.
+    text_numbers: bool = false,
 };
 
 pub const Mean = struct { scale: u16, sum: ?[]const u8 = null, count: ?[]const u8 = null, alias: ?[]const u8 = null };
@@ -136,6 +142,7 @@ pub fn run(in_raw: Inputs, spec: Spec) !Reason {
         .{ "bloom", modeBloom },
         .{ "exact_ordered", modeDense },
         .{ "plan", modePlan },
+        .{ "written_sql", modeWrittenSql },
         .{ "footer", modeFooter },
         .{ "page_index", modePageIndex },
     };
@@ -1426,14 +1433,23 @@ fn widthOf(type_name: []const u8, annotation: []const u8) u8 {
 /// oracle's whole answer (exactly). A DATE the oracle's view makes of stored days is compared as those days.
 fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
     const t = duck(in, try oracleSql(in, spec)) catch |err| return refusedReason(in, err);
-    for (t.rows) |row| for (row, 0..) |*v, i| {
-        if (std.ascii.eqlIgnoreCase(t.types[i], "DATE")) v.* = try toEpoch(v.*, "DATE");
-    };
     const z = try zpqRows(in);
-    const got = try in.arena.alloc([]const Val, z.len);
-    for (z, 0..) |row, i| got[i] = try zpqValues(in, row, t.lanes);
+    const got = try in.arena.alloc([]Val, z.len);
+    for (z, 0..) |row, i| {
+        got[i] = try zpqValues(in, row, t.lanes);
+        if (spec.text_numbers) for (row.values(), 0..) |v, c| if (v == .string and c < t.types.len and
+            (isIntegerType(t.types[c]) or compare.isFloatType(t.types[c]) or compare.laneOf(t.types[c]) == .exact))
+        {
+            got[i][c] = compare.fromOracle(v, t.types[c]) catch got[i][c];
+        };
+    }
     if (got.len != t.rows.len) return fail(in, "zpq={d} rows duck={d}", .{ got.len, t.rows.len });
     for (got, t.rows) |g, w| if (g.len != w.len) return fail(in, "shape differs", .{});
+    // zpq prints a DATE as its day number, other engines as ISO text: both compare as days.
+    for (t.types, 0..) |ty, c| if (std.ascii.eqlIgnoreCase(ty, "DATE")) {
+        for (t.rows) |row| row[c] = try toEpoch(row[c], ty);
+        for (got) |row| row[c] = try toEpoch(row[c], ty);
+    };
     const positional = for (got, t.rows) |g, w| {
         const equal = for (g, w) |a, b| {
             if (!compare.same(a, b)) break false;
@@ -1441,13 +1457,19 @@ fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
         if (!equal) break false;
     } else true;
     if (positional) return null;
+    for (spec.ranks orelse &.{}) |c| {
+        if (c >= t.names.len) return fail(in, "rank column {d} not in the answer", .{c});
+        for (got, t.rows, 0..) |g, w, r| if (!compare.same(g[c], w[c])) return fail(in, "rank {s} differs at row " ++
+            "{d}: {s} want {s}", .{ t.names[c], r, compare.show(in.arena, g[c]), compare.show(in.arena, w[c]) });
+    }
     const sql = try oracleSql(in, spec);
     const upper = try std.ascii.allocUpperString(in.arena, sql);
     const cut = std.mem.lastIndexOf(u8, upper, " LIMIT ") orelse return compare.sameMultiset(in.arena, got, t.rows);
     // Membership in DuckDB, as the old check did: an unlimited answer can be every row of the input (Q32's 16M
-    // groups), which zpq-check must never hold. A zpq row matches a whole-answer row column for column, exactly.
+    // groups), which zpq-check must never hold. Each distinct zpq row needs at least as many exact matches in the
+    // whole answer as zpq printed copies of it.
     var q: std.ArrayList(u8) = .empty;
-    try q.print(in.arena, "WITH whole AS ({s}) SELECT count(*) AS missing FROM (VALUES ", .{sql[0..cut]});
+    try q.print(in.arena, "WITH whole AS ({s}), g AS (SELECT * FROM (VALUES ", .{sql[0..cut]});
     for (got, 0..) |row, r| {
         try q.appendSlice(in.arena, if (r == 0) "(" else ", (");
         for (row, t.types, 0..) |v, ty, c| {
@@ -1456,11 +1478,12 @@ fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
         }
         try q.append(in.arena, ')');
     }
-    try q.appendSlice(in.arena, ") AS g(");
+    try q.appendSlice(in.arena, ") AS v(");
     for (t.names, 0..) |_, c| try q.print(in.arena, "{s}g{d}", .{ if (c == 0) "" else ", ", c });
-    try q.appendSlice(in.arena, ") WHERE NOT EXISTS (SELECT 1 FROM whole w WHERE ");
+    try q.appendSlice(in.arena, ")) SELECT count(*) AS missing FROM (SELECT *, count(*) AS n FROM g GROUP BY ALL) " ++
+        "AS d WHERE d.n > (SELECT count(*) FROM whole w WHERE ");
     for (t.names, 0..) |name, c| {
-        try q.print(in.arena, "{s}w.\"{s}\" IS NOT DISTINCT FROM g.g{d}", .{ if (c == 0) "" else " AND ", name, c });
+        try q.print(in.arena, "{s}w.\"{s}\" IS NOT DISTINCT FROM d.g{d}", .{ if (c == 0) "" else " AND ", name, c });
     }
     try q.append(in.arena, ')');
     const m = duck(in, q.items) catch |err| return refusedReason(in, err);
@@ -1468,6 +1491,69 @@ fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
     if (missing != .int or missing.int != 0)
         return fail(in, "{s} zpq rows not in DuckDB's whole answer", .{compare.show(in.arena, missing)});
     return null;
+}
+
+/// A written Parquet file holds exactly the rows of `sql`: the same column names in order, and the same multiset
+/// of rows under each column's oracle type. An integer column may be written at another integer width (a sum
+/// kept in INT64, where the oracle widens to HUGEINT): its values compare exactly after the cast, and a wrapped
+/// value would differ. A DOUBLE where the oracle has an integer (a writer that widened) passes only if every value
+/// is integral and in range, so no rounding hides behind the cast; an exact DECIMAL never degrades to floating
+/// point.
+fn modeWrittenSql(in: Inputs, spec: Spec) !Reason {
+    const sql = try oracleSql(in, spec);
+    const want = duck(in, try std.fmt.allocPrint(in.arena, "SELECT * FROM ({s}) LIMIT 0", .{sql})) catch |err|
+        return refusedReason(in, err);
+    const file = try std.fmt.allocPrint(in.arena, "read_parquet('{s}')", .{in.path});
+    const got = duck(in, try std.fmt.allocPrint(in.arena, "SELECT * FROM {s} LIMIT 0", .{file})) catch |err|
+        return refusedReason(in, err);
+    const got_names = try std.mem.join(in.arena, ",", got.names);
+    const want_names = try std.mem.join(in.arena, ",", want.names);
+    if (!std.mem.eql(u8, got_names, want_names)) return fail(in, "columns {s} want {s}", .{ got_names, want_names });
+    var cols: std.ArrayList(u8) = .empty;
+    var integral: std.ArrayList(u8) = .empty;
+    for (want.names, want.types, got.types, 0..) |name, wt, gt, i| {
+        if (i != 0) try cols.appendSlice(in.arena, ", ");
+        if (std.mem.eql(u8, wt, gt)) {
+            try cols.print(in.arena, "\"{s}\"", .{name});
+            continue;
+        }
+        const float_for_int = compare.isFloatType(gt) and isIntegerType(wt);
+        if (!float_for_int and !(isIntegerType(gt) and isIntegerType(wt)))
+            return fail(in, "column {s} is {s}, want {s}", .{ name, gt, wt });
+        try cols.print(in.arena, "CAST(\"{s}\" AS {s}) AS \"{s}\"", .{ name, wt, name });
+        if (!float_for_int) continue;
+        try integral.print(in.arena, "{s}(\"{s}\" IS NOT NULL AND (NOT isfinite(\"{s}\") OR \"{s}\" != " ++
+            "trunc(\"{s}\") OR TRY_CAST(\"{s}\" AS {s}) IS NULL))", .{
+            if (integral.items.len == 0) "" else " OR ", name, name, name, name, name, wt,
+        });
+    }
+    if (integral.items.len != 0) {
+        const bad = duck(in, try std.fmt.allocPrint(in.arena, "SELECT count(*) AS n FROM {s} WHERE {s}", .{
+            file,
+            integral.items,
+        })) catch |err| return refusedReason(in, err);
+        if (bad.rows[0][0] != .int or bad.rows[0][0].int != 0) return fail(in, "{s} widened values are not exact " ++
+            "integers", .{compare.show(in.arena, bad.rows[0][0])});
+    }
+    const written = try std.fmt.allocPrint(in.arena, "SELECT {s} FROM {s}", .{ cols.items, file });
+    const diff = try std.fmt.allocPrint(
+        in.arena,
+        "SELECT count(*) AS n FROM ((({s}) EXCEPT ALL ({s})) UNION ALL (({s}) EXCEPT ALL ({s})))",
+        .{ written, sql, sql, written },
+    );
+    const t = duck(in, diff) catch |err| return refusedReason(in, err);
+    if (t.rows[0][0] != .int or t.rows[0][0].int != 0)
+        return fail(in, "{s} rows differ from the oracle's", .{compare.show(in.arena, t.rows[0][0])});
+    return null;
+}
+
+fn isIntegerType(t: []const u8) bool {
+    const names = [_][]const u8{
+        "TINYINT",  "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+        "UHUGEINT",
+    };
+    for (names) |n| if (std.ascii.eqlIgnoreCase(t, n)) return true;
+    return false;
 }
 
 /// A zpq value as a DuckDB literal of the oracle's column type. DATEs arrive as days since 1970-01-01.

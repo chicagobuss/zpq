@@ -29,6 +29,10 @@ pub const Oracle = struct {
     cache_dir: ?[]const u8,
     hits: usize = 0,
     misses: usize = 0,
+    /// DuckDB's worker threads, part of every key. One by default: parallel float sums fold in varying order.
+    threads: u16 = 1,
+    /// File hashes already taken, by path, for a long-lived oracle (`zpq-check compare`). Null: hash every time.
+    memo: ?*Memo = null,
 
     /// `tz` is the zone DuckDB runs in: UTC when the caller has none, never the host's unstated default.
     pub fn init(
@@ -102,7 +106,12 @@ pub const Oracle = struct {
             }
         };
         self.misses += 1;
-        const full = try std.fmt.allocPrint(arena, "SET threads=1; {s}\nDESCRIBE {s}; {s}", .{ setup, sql, sql });
+        const full = try std.fmt.allocPrint(arena, "SET threads={d}; {s}\nDESCRIBE {s}; {s}", .{
+            self.threads,
+            setup,
+            sql,
+            sql,
+        });
         const out = try self.run(&.{ "-json", "-c", full });
         defer self.gpa.free(out.stdout);
         defer self.gpa.free(out.stderr);
@@ -149,9 +158,9 @@ pub const Oracle = struct {
 
     fn keyMaterialAfter(self: *Oracle, arena: std.mem.Allocator, setup: []const u8, sql: []const u8) !?[]const u8 {
         var out: std.ArrayList(u8) = .empty;
-        try out.print(arena, "zpq-oracle v3\nduckdb {s} -no-agent -no-init threads=1\nTZ={s} LC_ALL=C\nsetup " ++
+        try out.print(arena, "zpq-oracle v3\nduckdb {s} -no-agent -no-init threads={d}\nTZ={s} LC_ALL=C\nsetup " ++
             "{d}:{s}\nsql {d}:{s}\n", .{
-            &self.duckdb_sha, self.tz, setup.len, setup, sql.len, sql,
+            &self.duckdb_sha, self.threads, self.tz, setup.len, setup, sql.len, sql,
         });
         const both = try std.mem.concat(arena, u8, &.{ setup, "\n", sql });
         var i: usize = 0;
@@ -170,10 +179,20 @@ pub const Oracle = struct {
 
     const Content = union(enum) { not_a_file, unhashable, hashed: []const u8 };
 
+    fn hashOf(self: *Oracle, path: []const u8) ![64]u8 {
+        const memo = self.memo orelse return fileSha(self.gpa, self.io, path);
+        const st = try std.Io.Dir.cwd().statFile(self.io, path, .{});
+        const id: Memo.Id = .{ .inode = st.inode, .size = st.size, .mtime = st.mtime.nanoseconds };
+        if (memo.files.get(path)) |e| if (std.meta.eql(e.id, id)) return e.sha;
+        const h = try fileSha(self.gpa, self.io, path);
+        try memo.files.put(memo.arena, try memo.arena.dupe(u8, path), .{ .id = id, .sha = h });
+        return h;
+    }
+
     fn contentOf(self: *Oracle, arena: std.mem.Allocator, literal: []const u8) !Content {
         if (literal.len == 0 or std.mem.indexOfScalar(u8, literal, '\n') != null) return .not_a_file;
         if (std.mem.indexOfScalar(u8, literal, '*') == null) {
-            const h = fileSha(self.gpa, self.io, literal) catch |err| return switch (err) {
+            const h = self.hashOf(literal) catch |err| return switch (err) {
                 error.FileNotFound, error.IsDir, error.NotDir, error.NameTooLong, error.BadPathName => .not_a_file,
                 else => .unhashable,
             };
@@ -183,11 +202,19 @@ pub const Oracle = struct {
         if (matches.len == 0) return .not_a_file;
         var out: std.ArrayList(u8) = .empty;
         for (matches) |m| {
-            const h = fileSha(self.gpa, self.io, m) catch return .unhashable;
+            const h = self.hashOf(m) catch return .unhashable;
             try out.print(arena, "{s}={s} ", .{ m, &h });
         }
         return .{ .hashed = out.items };
     }
+};
+
+/// A file is hashed again when its inode, size or mtime moves; the caller keeps inputs immutable otherwise.
+pub const Memo = struct {
+    arena: std.mem.Allocator,
+    files: std.StringHashMapUnmanaged(struct { id: Id, sha: [64]u8 }) = .empty,
+
+    const Id = struct { inode: std.Io.File.INode, size: u64, mtime: i96 };
 };
 
 fn sha(bytes: []const u8) [64]u8 {

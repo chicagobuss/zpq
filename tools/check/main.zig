@@ -29,6 +29,9 @@ const usage =
     \\zpq-check manifest-diff REF OTHER
     \\zpq-check verdict --dir D --expect STAGE,... [--sha SHA]
     \\                           pass only on a receipt per stage for SHA (HEAD)
+    \\zpq-check compare [--duckdb PATH] [--python PATH] [--cache DIR | --no-cache] [--threads N]
+    \\                           judge other engines' answers (bench/): one JSON request per
+    \\                           stdin line, one {"ok", "reason"} line back
     \\
 ;
 
@@ -193,6 +196,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, sub, "stage")) std.process.exit(try receipt.stageMain(arena, io, gpa, rest.items));
         if (std.mem.eql(u8, sub, "verdict")) std.process.exit(try receipt.verdictMain(arena, io, rest.items));
         if (std.mem.eql(u8, sub, "manifest-diff")) std.process.exit(try receipt.manifestDiffMain(arena, io, rest.items));
+        if (std.mem.eql(u8, sub, "compare")) return compareMain(gpa, io, rest.items);
     }
     while (iter.next()) |arg| {
         const eq = std.mem.eql;
@@ -830,6 +834,79 @@ fn checkCase(
     return null;
 }
 
+/// One question per line, `{"fixture", "answer", "parquet", "spec"}`: the answer file (JSON rows, or Parquet when
+/// `parquet`) is judged by `spec`, a case's oracle expectation, exactly as a case's output would be.
+fn compareMain(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    var keep_state = std.heap.ArenaAllocator.init(gpa);
+    defer keep_state.deinit();
+    const keep = keep_state.allocator();
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.BadArgs);
+    var duckdb = try std.fmt.allocPrint(keep, "{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
+    var python: []const u8 = ".venv/bin/python";
+    var cache: ?[]const u8 = try std.fmt.allocPrint(keep, "{s}/.cache/zpq-check/oracle", .{home});
+    var threads: u16 = 1;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        const value = if (i + 1 < args.len) args[i + 1] else "";
+        if (std.mem.eql(u8, a, "--no-cache")) {
+            cache = null;
+            continue;
+        }
+        i += 1;
+        if (std.mem.eql(u8, a, "--duckdb")) duckdb = try keep.dupe(u8, value) else if (std.mem.eql(u8, a, "--python"))
+            python = value
+        else if (std.mem.eql(u8, a, "--cache")) cache = value else if (std.mem.eql(u8, a, "--threads"))
+            threads = try std.fmt.parseInt(u16, value, 10)
+        else
+            return error.BadArgs;
+    }
+    const tz = if (std.c.getenv("TZ")) |t| std.mem.span(t) else "";
+    var memo: oracle_mod.Memo = .{ .arena = keep };
+    var oracle = try oracle_mod.Oracle.init(gpa, io, duckdb, cache, tz);
+    oracle.threads = threads;
+    oracle.memo = &memo;
+    var in_buf: [1 << 20]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io, &in_buf);
+    var out_buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &out_buf);
+    const Request = struct { fixture: []const u8 = "", answer: []const u8, parquet: bool = false, spec: verdict.Spec };
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const why: ?[]const u8 = judged: {
+            const req = std.json.parseFromSliceLeaky(Request, arena, line, .{}) catch |err|
+                break :judged try std.fmt.allocPrint(arena, "bad request: {t}", .{err});
+            const text = if (req.parquet) "" else std.Io.Dir.cwd().readFileAlloc(
+                io,
+                req.answer,
+                arena,
+                .limited(1 << 30),
+            ) catch |err|
+                break :judged try std.fmt.allocPrint(arena, "answer unreadable: {t}", .{err});
+            const in: verdict.Inputs = .{
+                .arena = arena,
+                .io = io,
+                .gpa = gpa,
+                .oracle = &oracle,
+                .python = python,
+                .fixture = req.fixture,
+                .text = text,
+                .path = if (req.parquet) req.answer else "",
+            };
+            break :judged verdict.run(in, req.spec) catch |err| try std.fmt.allocPrint(arena, "error: {t}", .{err});
+        };
+        try std.json.Stringify.value(.{ .ok = why == null, .reason = why }, .{}, &writer.interface);
+        try writer.interface.writeByte('\n');
+        try writer.interface.flush();
+    }
+}
+
 /// A CLI case that writes `{out}`: its verdict reads that file.
 fn writesOut(c: Case) bool {
     const args = c.cli orelse return false;
@@ -1437,6 +1514,42 @@ fn selfTest(run: *Run, arena: std.mem.Allocator) !void {
         "\"emit\": \"rows\", \"oracle\": {\"compare\": \"tied_rows\", \"sql\": \"";
     expect((try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ tied, "SELECT id, 1 AS k FROM '{path}' WHERE id IS NOT NULL ORDER BY k, id DESC LIMIT 1\"}}" }))).failed == 0, "another of the tied rows passes", &problems);
     expect((try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ tied, "SELECT id + 10 AS id, 1 AS k FROM '{path}' WHERE id IS NOT NULL ORDER BY k LIMIT 1\"}}" }))).failed == 1, "a row outside the whole answer fails", &problems);
+    // A tied cut never prints a row more often than the whole answer holds it, nor moves the ranks.
+    const twice = "{\"id\": \"twice\", \"sql\": \"SELECT id FROM '{path}' WHERE id = 2\", \"emit\": \"rows\", " ++
+        "\"oracle\": {\"compare\": \"tied_rows\", \"sql\": \"SELECT DISTINCT id FROM '{path}' WHERE id IS NOT NULL " ++
+        "LIMIT 2\"}}";
+    expect(
+        (try selfCase(run, arena, "", twice)).failed == 1,
+        "a row printed more often than the answer has it fails",
+        &problems,
+    );
+    const ranked = "{\"id\": \"ranks\", \"sql\": \"SELECT id, count(*) AS c FROM '{path}' WHERE id IS NOT NULL " ++
+        "GROUP BY id ORDER BY c LIMIT 2\", \"oracle\": {\"compare\": \"tied_rows\", \"sql\": \"SELECT id, " ++
+        "count(*) AS c FROM '{path}' WHERE id IS NOT NULL GROUP BY id ORDER BY c DESC LIMIT 2\"";
+    expect(
+        (try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ ranked, "}}" }))).failed == 0,
+        "rows in another order pass without ranks",
+        &problems,
+    );
+    expect(
+        (try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ ranked, ", \"ranks\": [1]}}" }))).failed == 1,
+        "rows out of rank order fail",
+        &problems,
+    );
+    // A written file holds exactly the query's rows, NULLs included.
+    const written = "{\"id\": \"written\", \"emit\": \"copy\", \"oracle\": {\"compare\": \"written_sql\", " ++
+        "\"sql\": \"SELECT * FROM '{path}'";
+    const lacking = try std.mem.concat(arena, u8, &.{ written, " WHERE id IS NOT NULL\"}}" });
+    expect(
+        (try selfCase(run, arena, "", lacking)).failed == 1,
+        "a written file with a row the query lacks fails",
+        &problems,
+    );
+    expect(
+        (try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ written, "\"}}" }))).matched == 1,
+        "a written file of the query's rows passes",
+        &problems,
+    );
     // A second front door must give the same bytes.
     const twin =
         "{\"id\": \"same-as\", \"cli\": [\"query\", \"{path}\", \"--aggregate\", \"count(*) AS n\"], \"same\": " ++

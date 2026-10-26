@@ -5429,7 +5429,7 @@ const ChunkDecoder = struct {
         }
         const scratch = self.ws.scratch;
         const packed_codes = self.target == .grouped and if (self.target.grouped.records) |r|
-            r.* == .integer_count_top and r.integer_count_top.packing != null
+            r.* == .selected or (r.* == .integer_count_top and r.integer_count_top.packing != null)
         else
             false;
         // Packed owners need the original dictionary. Read complete codes and apply the survivor mask at the sink;

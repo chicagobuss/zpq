@@ -6580,6 +6580,7 @@ fn inlineSelectedCount(
             if (metas[item.file].getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
         }
     }
+    if (rows < args.integer_records_min_rows) return null;
     var identity = (try ownerIdentity(gpa, keys, domain)) orelse return null;
     defer identity.deinit(gpa);
     const workers = @min(requested_workers, owner_groups.max_workers);
@@ -6712,12 +6713,15 @@ fn selectedCountBits(
     defer state.deinit();
     var top = try T.init(gpa, ledger, workers, k, args.result_order.keys[0].descending);
     defer top.deinit();
-    const starts = try arena.alloc(u32, work.len);
+    var temporary = std.heap.ArenaAllocator.init(gpa);
+    defer temporary.deinit();
+    const scratch = temporary.allocator();
+    const starts = try scratch.alloc(u32, work.len);
     if (!RecordOrdinals.fill(metas, work, starts)) return error.BadColumn;
-    const sources = try arena.alloc(S.Source, work.len);
+    const sources = try scratch.alloc(S.Source, work.len);
     for (sources, work) |*s, item| s.* = .{ .file = item.file, .rg = item.rg };
-    const adapters = try arena.alloc(S, workers);
-    const sinks = try arena.alloc(consumer.RecordSink, workers);
+    const adapters = try scratch.alloc(S, workers);
+    const sinks = try scratch.alloc(consumer.RecordSink, workers);
     var refused: std.atomic.Value(bool) = .init(false);
     for (adapters, sinks, state.locals) |*adapter, *sink, *local| {
         adapter.* = .{
@@ -6725,7 +6729,7 @@ fn selectedCountBits(
             .identity = identity,
             .program = program,
             .sources = sources,
-            .bindings = try arena.alloc(key_pack.Plan.Binding, keys.len),
+            .bindings = try scratch.alloc(key_pack.Plan.Binding, keys.len),
             .refused = &refused,
         };
         sink.* = .{ .selected = .{ .ctx = adapter, .startFn = S.startErased, .batchFn = S.batchErased } };
@@ -6755,7 +6759,7 @@ fn selectedCountBits(
     profile.record(prof, .integer_fold, begin, fold_end, profile.args(.{}));
     const groups = top.finish();
     profile.record(prof, .integer_order, fold_end, nowMonoNs(), profile.args(.{}));
-    const slots = try arena.alloc(MergedSlot, groups.len);
+    const slots = try scratch.alloc(MergedSlot, groups.len);
     for (groups, slots, 0..) |g, *slot, i| slot.* = .{ .key = &.{}, .first = g.first, .idx = i };
     const View = struct {
         groups: []const O.Group,
@@ -6773,7 +6777,7 @@ fn selectedCountBits(
         }
     };
     const view: View = .{ .groups = groups };
-    const key_types = try arena.alloc(KeyType, keys.len);
+    const key_types = try scratch.alloc(KeyType, keys.len);
     for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
     const row_source: RowSource = .{
         .slots = slots,
@@ -6805,10 +6809,10 @@ fn selectedCountBits(
     @memset(out_rows, &.{});
     output.group_rows = out_rows;
     try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
-    // Arena metadata and result columns remain live until the query ends. The temporary identity/domain, owned
-    // records, heaps and fold tables do not; their credit returns as each phase releases them.
-    if (args.ledger != null) held = scratch_credit - domain_credit - identity.retainedBytes() +|
-        names_credit +| groups.len *| per_row;
+    // FailureProbe borrows Worker metadata through canonical diagnostics in prepareAggregate. Keep that query
+    // arena credit beside output schema/rows; the temporary bindings, sources and finish views are gone.
+    if (args.ledger != null) held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
+        outputs.len *| @sizeOf(GroupColType) +| names_credit +| groups.len *| per_row;
     var bytes_in: u64 = 0;
     for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
     return .{
@@ -22599,9 +22603,12 @@ test "filtered COUNT record owners consume only survivors on indexed mapped and 
                     };
                 }
                 const explanation = try explainAggregate(gpa, ta, args);
+                const selected_owner = mode == 3 and explanation.record_path.?.layout == .packed_count_top_h;
                 try testing.expectEqual(
                     @as(@FieldType(RecordAdmission, "layout"), if (mode == 1) .byte_count_top_h else if (mode == 2)
                         .msd_count_top_h
+                    else if (selected_owner)
+                        .packed_count_top_h
                     else
                         .integer_count_top_h),
                     explanation.record_path.?.layout,
@@ -22614,7 +22621,12 @@ test "filtered COUNT record owners consume only survivors on indexed mapped and 
                 try testing.expectEqual(want.rows_matched, got.rows_matched);
                 try testing.expectEqual(want.row_groups_pruned, got.row_groups_pruned);
                 try testing.expectEqual(want.row_groups_full_match, got.row_groups_full_match);
-                try testing.expectEqual(ownedGroupOutputBytes(got.output), budget.used.load(.monotonic));
+                const schema_credit = if (selected_owner)
+                    got.state.group_col_types.?.len * @sizeOf(GroupColType) +
+                        explanation.workers * (@sizeOf(Worker) + @sizeOf(expr_agg.GroupTable))
+                else
+                    0;
+                try testing.expectEqual(ownedGroupOutputBytes(got.output) + schema_credit, budget.used.load(.monotonic));
                 try got.output.applyResultOrder(gpa, args.result_order);
                 try testing.expectEqualDeep(want.output.group_rows orelse &.{}, got.output.group_rows orelse &.{});
                 if (gated) {
@@ -23435,7 +23447,7 @@ test "selective composite COUNT keeps its packed owner while wider filters retai
         args.taken = &taken;
         const explanation = try explainAggregate(gpa, a, args);
         try testing.expect(explanation.record_path != null);
-        try testing.expectEqual(.integer_count_top_h, explanation.record_path.?.layout);
+        try testing.expectEqual(.packed_count_top_h, explanation.record_path.?.layout);
         try testing.expect(!explanation.dense);
         var got = try prepareAggregate(gpa, a, args, false);
         defer got.deinit(gpa);
@@ -23512,6 +23524,7 @@ test "selected packed COUNT runs the typed owner for INT32 keys with original NU
         .encoded = false,
         .plain_rules = false,
         .integer_records = false,
+        .integer_records_min_rows = 0,
     };
     var want = try runMultiAggregate(gpa, a, args);
     defer want.deinit(gpa);

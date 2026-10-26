@@ -357,7 +357,8 @@ pub const File = struct {
     buffered_fd: i32 = -1,
     /// Opened O_DIRECT. Stays true when a later read falls back; `read_fallback` records that.
     direct: bool,
-    /// A finished direct read was `EINVAL`. That unit was pread through `buffered_fd`. The direct descriptor
+    /// A whole unit was pread through `buffered_fd`: the ring never started, a submit gave up, or the direct
+    /// read returned `EINVAL`. The short tail of a direct completion does not set this. The direct descriptor
     /// stays as it is: other reads already submitted still name it.
     read_fallback: std.atomic.Value(bool) = .init(false),
     /// `fd` is the reader's to close (`Reader.openFile`), not borrowed (`Reader.borrowFile`).
@@ -495,6 +496,12 @@ const Faults = struct {
     batch_n: u32 = 0,
     /// The first CQE of a multi-completion batch reports a short read, so its repair pread runs.
     short_first: bool = false,
+    /// The first positive completion reports this many bytes, so the repair pread starts at an unaligned offset.
+    /// 0 does not inject.
+    short_got: u32 = 0,
+    /// Set once that repair pread runs. `repair_at` is the offset it started at.
+    repaired: bool = false,
+    repair_at: u64 = 0,
     /// Completions left to report as `EINVAL`, as a direct read the file system accepted the open for and then
     /// refused. The unit is pread through the buffered descriptor.
     reject_direct: u8 = 0,
@@ -967,7 +974,8 @@ pub const Reader = struct {
         buffered_files: u32,
     };
 
-    /// What the reads actually went through, valid once `start` returns.
+    /// What the reads actually went through. Thread counts are known once `start` returns; a direct file counts as
+    /// buffered once a whole unit was pread (`read_fallback`), which is known once that read has finished.
     pub fn backends(self: *const Reader) Backends {
         var direct: u32 = 0;
         for (self.files.items) |f| {
@@ -992,6 +1000,9 @@ pub const Reader = struct {
         const u = self.units.items[i];
         const f = self.files.items[u.file];
         try preadAll(f, u.off, @min(u.off + u.len, f.size));
+        // The whole unit went through the buffered descriptor. A direct completion's short tail calls `preadAll`
+        // itself and does not land here, so that file stays direct.
+        if (f.buffered_fd >= 0) f.read_fallback.store(true, .release);
     }
 
     fn preadRun(self: *Reader) !void {
@@ -1091,6 +1102,10 @@ pub const Reader = struct {
                     fault.short_first = false;
                     c.res = 0;
                 };
+                if (builtin.is_test) if (self.faults) |fault| if (fault.short_got != 0 and c.res > 0) {
+                    c.res = @intCast(fault.short_got);
+                    fault.short_got = 0;
+                };
                 const idx: usize = @intCast(c.user_data);
                 const u = units[idx];
                 const f = self.files.items[u.file];
@@ -1136,7 +1151,12 @@ pub const Reader = struct {
                 // O_DIRECT reads the file's unaligned tail short; anything else short is finished with pread.
                 const got: u64 = @intCast(c.res);
                 if (got < want) {
-                    if (builtin.is_test) if (self.faults) |fault| if (fault.fail_pread) return error.ReadFailed;
+                    if (builtin.is_test) if (self.faults) |fault| {
+                        fault.repaired = true;
+                        fault.repair_at = u.off + got;
+                        fault.preads += 1;
+                        if (fault.fail_pread) return error.ReadFailed;
+                    };
                     try preadAll(f, u.off + got, u.off + want);
                 }
                 self.unitDone(u);
@@ -1722,6 +1742,41 @@ test "threads whose ring fails to set up read with pread, and say so" {
     }
 }
 
+test "a direct file whose rings never start is counted through the page cache" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 128 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 4);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "norings.bin", data, &path_buf);
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .block = 64 << 10,
+        .direct = true,
+        .fail_rings = 1,
+    });
+    defer rd.destroy();
+    const f = try rd.openFile(path, data.len);
+    if (!f.direct) return error.SkipZigTest;
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    try testing.expect(f.read_fallback.load(.acquire));
+    const b = rd.backends();
+    try testing.expectEqual(@as(u32, 0), b.uring_threads);
+    try testing.expectEqual(@as(u32, 1), b.pread_threads);
+    try testing.expectEqual(@as(u32, 0), b.direct_files);
+    try testing.expectEqual(@as(u32, 1), b.buffered_files);
+    gate.done(gate.ctx, 0, 1);
+}
+
 fn virtualBytesForTest() !u64 {
     const rc = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
@@ -2286,6 +2341,43 @@ test "an unaligned direct tail is read through the buffered fd and stays direct"
     const backs = rd.backends();
     try testing.expectEqual(@as(u32, 1), backs.direct_files);
     try testing.expectEqual(@as(u32, 0), backs.buffered_files);
+    gate.done(gate.ctx, 0, 1);
+}
+
+test "a positive short completion repairs from an unaligned offset and stays direct" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 64 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 2);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "short.bin", data, &path_buf);
+    const rd = try Reader.create(testing.allocator, .{
+        .mode = .uring,
+        .threads = 1,
+        .block = 64 << 10,
+        .direct = true,
+    });
+    defer rd.destroy();
+    var faults: Faults = .{ .short_got = 100 };
+    rd.faults = &faults;
+    const f = try rd.openFile(path, data.len);
+    if (!f.direct) return error.SkipZigTest;
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    try testing.expect(faults.repaired);
+    try testing.expect(faults.repair_at % pageLen() != 0);
+    try testing.expectEqual(@as(u64, 100), faults.repair_at);
+    try testing.expect(!f.read_fallback.load(.acquire));
+    const b = rd.backends();
+    try testing.expectEqual(@as(u32, 1), b.direct_files);
+    try testing.expectEqual(@as(u32, 0), b.buffered_files);
     gate.done(gate.ctx, 0, 1);
 }
 

@@ -1015,8 +1015,8 @@ test "the local reader line names the backends actually used, mixed ones include
             .want = "io_uring (8 threads), O_DIRECT",
         },
         .{
-            .io = .{ .local_mode = 2, .local_pread_threads = 8, .local_direct_files = 1 },
-            .want = "pread (8 threads, io_uring setup failed), O_DIRECT",
+            .io = .{ .local_mode = 2, .local_pread_threads = 8, .local_buffered_files = 1 },
+            .want = "pread (8 threads, io_uring setup failed), through the page cache",
         },
         .{
             .io = .{

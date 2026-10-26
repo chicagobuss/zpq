@@ -130,5 +130,3 @@ reader can normalize them to a different byte representation of the same instant
   simulated remote.
 - `tools/bloom/check.py` (CI, via `tools/cli_smoke.sh`) checks with an independent Python SBBF that every value of
   pyarrow- and zpq-written chunks tests present, and that zpq's lookups match pyarrow's counts.
-- `tools/bloom/interop.py` checks that DuckDB and Hardwood read zpq-written filters and prune with them, and that zpq's
-  lookups on files they and pyarrow wrote match DuckDB and `--scan-all`.

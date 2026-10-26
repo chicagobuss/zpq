@@ -30,7 +30,7 @@ def launch(argv: list[str], env: dict, cwd: Path, log_path: Path, heavy: bool) -
             "--user",
             "--scope",
             "-p",
-            "MemoryMax=20G",
+            "MemoryMax=16G",
             "-q",
             "--",
             "nice",
@@ -67,6 +67,13 @@ def judge(cmd: stages.Cmd, rc: int, text: str) -> tuple[str, dict]:
         if len(details) != skipped:
             counts["skip_accounting_error"] = "runner did not name every skipped test"
             return "blocked", counts
+    if cmd.parse is stages.parse_release:
+        if rc not in (0, 2):
+            return "fail", counts
+        if rc == 2 or counts.get("blocked"):
+            return "blocked", counts
+        if rc != 0 or not counts.get("runtime"):
+            return "fail", counts
     if cmd.expect == "refusal":
         declared = rc == cmd.expect_rc and cmd.expect_text in text
         return ("expected" if declared else "fail"), counts

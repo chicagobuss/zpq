@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import unittest
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
 import perf
 import provenance
+import revision as revisions
 import stages
 import summary
 
@@ -45,7 +47,7 @@ def guide() -> str:
     tiers = {
         "quick": "All core unit tests in ReleaseSafe, with unchanged scales. The edit loop.",
         "commit": "ReleaseSafe core tests, ReleaseFast CLI, CLI contracts/readback, and the full ReleaseSafe referee.",
-        "full": "Every full stage below, with Debug units. Requires --base PATH: the previous comparison binary.",
+        "full": "Every full stage below, with Debug units. Requires --base PATH or --base-rev SHA for comparison.",
     }
     modes = {
         "soak": "Seeded aggregate fuzz, differential, unit and coverage fuzz. --hours sets the duration; "
@@ -67,7 +69,7 @@ def guide() -> str:
                   "Exit codes: 0 passed/declared refusal; 1 failure; 2 blocked or invalid.",
                   "Outputs: zig-out/verify/<run-id>/summary.json; --out changes the parent.",
                   "Reruns: new directory, --rerun-of ID; earlier failures stay recorded.",
-                  "Builds: 20 GiB systemd scope, nice 10, at most -j8; --cpu defaults to",
+                  "Builds: 16 GiB systemd scope, nice 10, at most -j8; --cpu defaults to",
                   "native (the host CPU). Use --cpu to override the build CPU.",
                   "Dependencies: Zig, the DuckDB CLI, and tools/verify/requirements.txt pins.",
                   "Python dependency mismatches stop before any build or host probe.",
@@ -130,6 +132,7 @@ def make_ctx(args, run_dir: Path, revision: str) -> stages.Ctx:
         skspill=SKSPILL,
         sigpipe=SIGPIPE,
         duckdb=str(DUCKDB20),
+        arch_summaries=tuple(str(Path(p).expanduser().resolve()) for p in args.arch_summary),
     )
 
 
@@ -163,6 +166,8 @@ def open_run(args, tier: str, revision: str) -> tuple[Path, summary.Summary]:
 def _parameters(args) -> dict:
     parameters = {"expected_skip_budgets": stages.tier_skip_budgets(REPO)}
     base = getattr(args, "base", None)
+    if getattr(args, "base_rev", None):
+        parameters["base_rev"] = args.base_rev
     if base:
         parameters["base"] = str(Path(base).expanduser().resolve())
     return parameters
@@ -179,15 +184,19 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--out", help=f"parent for the run directory (default {DEFAULT_OUT})")
     common.add_argument("--run-id")
-    common.add_argument(
+    common.add_argument("--arch-summary", action="append", default=[],
+                        help="same-SHA native release evidence; repeat for foreign targets")
+    base = common.add_mutually_exclusive_group()
+    base.add_argument(
         "--base",
-        help="previously integrated comparison binary (required for full; recorded, not defaulted)",
+        help="previously integrated comparison binary (or use --base-rev)",
     )
+    base.add_argument("--base-rev", help="build the comparison CLI from a git revision in its own cache")
     common.add_argument("-j", type=int, default=8)
     common.add_argument("--cpu", default="native", help="zig -Dcpu (default: native host CPU; override explicitly)")
     common.add_argument("--rerun-of", help="earlier run id this record follows; that summary is not modified")
     common.add_argument("--label")
-    common.add_argument("--no-scope", action="store_true", help="do not wrap stages in the 20G systemd scope")
+    common.add_argument("--no-scope", action="store_true", help="do not wrap stages in the 16G systemd scope")
 
     parser = argparse.ArgumentParser(prog="verify")
     sub = parser.add_subparsers(dest="command")
@@ -244,14 +253,14 @@ def main(argv: list[str] | None = None) -> int:
         print("soak needs positive --hours and --rounds", file=sys.stderr)
         return 2
     if args.command == "full":
-        if not getattr(args, "base", None):
+        if not args.base and not args.base_rev:
             print(
-                "full requires --base PATH, the previously integrated binary the candidate is checked against. "
+                "full requires --base PATH or --base-rev SHA for the comparison binary. "
                 "It is recorded in the summary and is not given a default.",
                 file=sys.stderr,
             )
             return 2
-        if not Path(args.base).expanduser().is_file():
+        if args.base and not Path(args.base).expanduser().is_file():
             print(f"--base is not a file: {args.base}", file=sys.stderr)
             return 2
     if args.command == "stage":
@@ -279,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"verify: Parquet corpus revision mismatch: {corpus['actual']}; expected {corpus['expected']}. "
                   "Run just fetch-corpus (no gates started).", file=sys.stderr)
             return 2
+    if args.base_rev:
+        try:
+            args.base_rev = revisions.resolve(args.base_rev)
+        except subprocess.CalledProcessError:
+            print(f"invalid --base-rev: {args.base_rev}", file=sys.stderr)
+            return 2
     revision = head_sha()
     try:
         run_dir, book = open_run(args, args.command if args.command != "stage" else f"stage-{args.name}", revision)
@@ -288,6 +303,13 @@ def main(argv: list[str] | None = None) -> int:
     ctx = make_ctx(args, run_dir, revision)
     heavy = not args.no_scope
     try:
+        if args.base_rev:
+            ctx.base = str(revisions.build(args.base_rev, cpu=args.cpu, jobs=args.j, heavy=heavy))
+            build_meta = json.loads((Path(ctx.base).parents[1] / "build.json").read_text())
+            book.add_stage({"name": "build-base", "status": "pass", "rc": 0,
+                            "base_rev": args.base_rev, "binary": ctx.base, "build": build_meta,
+                            "binary_sha256": execute.file_sha256(Path(ctx.base)),
+                            "log": str(Path(ctx.base).parents[1] / "build.log"), "counts": {}})
         if args.command == "quick":
             execute.run_named(ctx, stages.names_for("quick"), book, heavy)
         elif args.command == "commit":

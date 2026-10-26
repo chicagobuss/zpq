@@ -1,6 +1,6 @@
 name: Verify
 
-# One job, one platform (linux-x86_64), <2 min target. Verifies the
+# The main Linux x86 job verifies the
 # things that, if broken, mean a real user has a bad day:
 #   1. Both binaries compile (CLI + Lambda), and the lean-core CLI
 #      (-Dsql=false) compiles too and is genuinely SQL-free.
@@ -15,9 +15,8 @@ name: Verify
 #      row counts) always fail; the full-pass count must not drop
 #      below the recorded baseline (72: legacy LZ4 joined the 69).
 #
-# The release-smoke job builds every release target and runs the Linux ones
-# (aarch64 under qemu); docs/macos.md covers running the macOS build on a
-# Mac. The verify job guards the production target.
+# A separate native matrix builds and runs Linux x86, Linux ARM and Apple
+# silicon release artifacts. Intel macOS runtime coverage is deferred by name.
 
 on:
   push:
@@ -199,13 +198,24 @@ jobs:
       - name: libzpq (C ABI, sanitizers, Python, differential)
         run: OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
-  # Every release artifact built as it ships and RUN (tools/release_smoke.sh): the x86_64 CLI and Lambda bootstrap
-  # natively, the aarch64 ones under qemu (qemu-user-binfmt runs the bootstrap child the integration harness spawns).
-  # The macOS targets are built and explicitly skipped: they run on a Mac. A separate job, so its four ReleaseFast
-  # builds stay off the verify job's budget.
+  # Each native job runs its installed CLI and, on Linux, Lambda artifacts.
   release-smoke:
-    runs-on: ubuntu-latest
+    name: Native release smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-musl
+            deferred: x86_64-macos
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+            deferred: ''
+          - runner: macos-14
+            target: aarch64-macos
+            deferred: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -214,12 +224,7 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Install qemu for aarch64 (skipped where it is already there)
-        run: |
-          if ! command -v qemu-aarch64 >/dev/null || ! grep -qs '^enabled' /proc/sys/fs/binfmt_misc/qemu-aarch64; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq qemu-user qemu-user-binfmt
-          fi
-
       - name: Build and run the release artifacts
-        run: zig build release-smoke -Drelease-smoke-skip=aarch64-macos,x86_64-macos
+        run: >-
+          tools/release_smoke.sh --accept-deferred x86_64-macos
+          zig-out/release ${{ matrix.target }} ${{ matrix.deferred }}

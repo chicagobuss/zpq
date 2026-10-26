@@ -8,7 +8,7 @@ uv pip install --python .venv/bin/python -r tools/verify/requirements.txt
 python tools/verify/verify.py --help
 python tools/verify/verify.py quick
 python tools/verify/verify.py commit
-python tools/verify/verify.py full --base /path/to/previous-zpq
+python tools/verify/verify.py full --base-rev PREVIOUS_SHA
 python tools/verify/verify.py stage differential
 python tools/verify/verify.py soak --hours 10
 python tools/verify/verify.py perf --help
@@ -19,6 +19,9 @@ No arguments and `--help` show every stage, tier, requirement and exit code.
 test scales. `commit` uses the same core tests, builds the CLI, runs the CLI
 contracts and independent reader checks, and runs the full differential referee.
 `full` adds integration, ABI, robustness, ClickBench and release checks.
+Release checks block on non-native targets unless `--arch-summary PATH` supplies
+matching-SHA native evidence (repeat for each target). The Intel macOS runtime
+is explicitly deferred and accepted by name in the stage command.
 `full`'s unit tests stay in Debug, including the environment-clearing and SIGPIPE
 handler identity ABI tests. No test or exhaustive sweep is moved or omitted
 from quick/commit; the core optimization mode is their only coverage change.
@@ -27,8 +30,12 @@ For separate compile/run measurements, `zig build test-core-bin -Doptimize=MODE`
 installs `zig-out/bin/zpq-core-test`; run it from the repository root.
 Versioned Parquet corpora must match the existing `just fetch-corpus` pin;
 a mismatch stops before gates and its revision is recorded in provenance.
-`--base` is the previously integrated comparison binary; it is required for
-`full` and is recorded without a default. Native builds default to
+`full --base-rev SHA` builds the comparison CLI from an archived git revision
+in `zig-out/verify-cache`, with its own source/output directories and shared
+compiler cache (`ZPQ_VERIFY_CACHE` relocates it). `--base PATH` still accepts
+an existing comparison binary. The flags are mutually exclusive. Cached sources are compared to a fresh git
+archive before building; compiler binary identity and build flags key outputs.
+The resolved base revision, tree and compiler identity, and binary hash are recorded. Native builds default to
 `--cpu native`, using the host CPU. `--cpu` remains an explicit override.
 Provenance records both the requested setting and the resolved Zig CPU model.
 
@@ -40,7 +47,7 @@ host probe; align the environment with `tools/verify/requirements.txt` first.
 Run directories are immutable. Reruns use a new directory and `--rerun-of ID`.
 Exit 0 means required checks passed or matched their declared refusals;
 1 means failure; 2 means a missing prerequisite or incomplete run.
-Build/test stages use a 20 GiB systemd scope, low priority and at most `-j8`.
+Build/test stages use a 16 GiB systemd scope, low priority and at most `-j8`.
 
 The referee runs the engine in-process, built with `-Doptimize=ReleaseSafe`.
 Its JSON cases live in `tools/runner/cases/`; `oracle_compare.py` owns numeric

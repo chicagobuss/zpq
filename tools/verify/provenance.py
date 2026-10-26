@@ -32,7 +32,7 @@ def bandwidth(repo: Path, out: Path) -> dict:
     compiled = _run(["gcc", "-O2", "-fopenmp", "-o", str(binary), str(source)])
     if compiled.returncode != 0:
         return {"error": (compiled.stderr or compiled.stdout or "gcc failed").strip()[-500:]}
-    ran = _run(["systemd-run", "--user", "--scope", "-p", "MemoryMax=20G", "-q", "--",
+    ran = _run(["systemd-run", "--user", "--scope", "-p", "MemoryMax=16G", "-q", "--",
                 "nice", "-n", "10", str(binary)], timeout=180)
     if ran.returncode != 0:
         return {"error": (ran.stderr or ran.stdout or "bw failed").strip()[-500:]}

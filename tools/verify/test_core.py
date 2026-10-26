@@ -16,12 +16,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execute
 import perf
+import placement
 import provenance
 import scorecard_select
 import shipbar
 import stages
 import summary
 import test_observer
+import test_place
 import verify
 
 
@@ -35,6 +37,18 @@ def cell(engine, ns, query="q", failures=None, checked=3):
         "checked": checked,
         "failures": failures or [],
     }
+
+
+class RevisionTest(unittest.TestCase):
+    def test_reference_is_fixed_independent_of_host_order(self):
+        cfg = {"reference_host": "builder", "hosts": {"builder": {"target": "x86_64-linux-musl"}}}
+        self.assertEqual(placement.host_plan(cfg, ["arm", "mac"]), (["builder", "arm", "mac"], "builder"))
+        self.assertEqual(placement.host_plan(cfg, ["mac", "arm"]), (["builder", "arm", "mac"], "builder"))
+        self.assertTrue(cfg["hosts"]["builder"]["hash_only"])
+        self.assertEqual(placement.host_plan(cfg, ["arm"]), (["arm"], None))
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            verify.build_parser().parse_args(["full", "--base", "/bin/zpq", "--base-rev", "HEAD"])
 
 
 class CpuTest(unittest.TestCase):
@@ -409,6 +423,11 @@ class ShipBarTest(unittest.TestCase):
         self.assertTrue(result["met"])
         self.assertGreater(result["control"]["geomean"], 1)
         self.assertIn("not part of the ship bar", shipbar.render(result))
+
+
+def load_tests(loader, tests, pattern):
+    tests.addTests(loader.loadTestsFromModule(test_place))
+    return tests
 
 
 if __name__ == "__main__":

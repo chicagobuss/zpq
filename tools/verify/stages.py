@@ -28,6 +28,7 @@ class Ctx:
     skspill: Path
     sigpipe: Path
     duckdb: str
+    arch_summaries: tuple[str, ...] = ()
 
 
 @dataclass
@@ -126,12 +127,12 @@ def parse_clickbench(text):
 
 
 def parse_release(text):
-    runtime = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip().startswith(("RAN", "SKIPPED", "NOT RUN"))
-    ]
-    return {"runtime": runtime} if runtime else {}
+    runtime = [line.strip() for line in text.splitlines()
+               if line.strip().startswith(("RAN ", "VERIFIED ", "NOT RUN "))]
+    accepted = "NOT RUN x86_64-macos (deferred; accepted by name)"
+    blocked = any(line.startswith("NOT RUN ") and line != accepted for line in runtime)
+    blocked = blocked or "elsewhere:" in text
+    return {"runtime": runtime, "blocked": blocked}
 
 
 def _need(path: Path, what: str) -> str | None:
@@ -198,13 +199,13 @@ def stage_integration(ctx: Ctx) -> Cmd:
 def stage_fd(ctx: Ctx) -> Cmd:
     blocked = _need(ctx.binary, "candidate binary")
     if not ctx.base:
-        blocked = "fd needs --base, the comparison binary (sol1 GATE_BASE)"
+        blocked = "fd needs --base PATH or --base-rev SHA for comparison"
     elif not Path(ctx.base).exists():
         blocked = f"missing --base binary: {ctx.base}"
     return Cmd(
         [ctx.python, "tools/group_dependency_check.py", str(ctx.binary), ctx.base or ""],
         _base_env(ctx),
-        "group-dependency exactness against the required --base binary",
+        "group-dependency exactness against the required comparison binary",
         blocked=blocked,
         parse=parse_fd,
     )
@@ -304,25 +305,15 @@ def stage_write_robustness(ctx: Ctx) -> Cmd:
     )
 
 
-def _cross(ctx: Ctx, target: str, cpu: str | None) -> Cmd:
-    prefix = ctx.run_dir / f"cross-{target}"
-    args = ["-Dtarget=" + target, "-Doptimize=ReleaseFast", f"-Drevision={ctx.revision}"]
-    if cpu:
-        args.append(f"-Dcpu={cpu}")
-    args.extend(["--prefix", str(prefix)])
-    return Cmd(_zig_build(ctx, *args), _base_env(ctx), f"ReleaseFast cross build {target}")
-
-
 def stage_release_smoke(ctx: Ctx) -> Cmd:
     return Cmd(
         [
-            "tools/release_smoke.sh",
-            "--skip",
-            "aarch64-macos,x86_64-macos",
+            "tools/release_smoke.sh", "--accept-deferred", "x86_64-macos",
+            *(arg for path in ctx.arch_summaries for arg in ("--arch-summary", path)),
             str(ctx.run_dir / "release-smoke"),
         ],
         _base_env(ctx),
-        "run Linux CLI and Lambda, including ARM under qemu",
+        "native CLI/Lambda plus same-SHA arch evidence; Intel macOS deferred by name",
         parse=parse_release,
     )
 
@@ -419,10 +410,6 @@ REGISTRY = [
     ("libzpq", ("full",), stage_libzpq),
     ("repro-sigpipe", ("full",), stage_sigpipe),
     ("write-robustness", ("full",), stage_write_robustness),
-    ("cross-x86_64-linux-musl", ("full",), lambda ctx: _cross(ctx, "x86_64-linux-musl", ctx.cpu)),
-    ("cross-aarch64-linux-musl", ("full",), lambda ctx: _cross(ctx, "aarch64-linux-musl", None)),
-    ("cross-aarch64-macos", ("full",), lambda ctx: _cross(ctx, "aarch64-macos", None)),
-    ("cross-x86_64-macos", ("full",), lambda ctx: _cross(ctx, "x86_64-macos", None)),
     ("release-smoke", ("full",), stage_release_smoke),
     ("conform", ("extra",), stage_conform),
     ("triangulate", ("extra",), stage_triangulate),

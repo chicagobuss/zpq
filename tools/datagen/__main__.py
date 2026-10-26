@@ -2,7 +2,7 @@
 import argparse
 from pathlib import Path
 
-from . import parquet, scenarios, sparse
+from . import contracts, corrupt, parquet, scenarios, sparse
 
 SCENARIOS = {
     name: getattr(scenarios, name) for name in (
@@ -15,6 +15,18 @@ SCENARIOS = {
     )
 }
 SCENARIOS['stats_order'] = parquet.stats_order
+SCENARIOS['decode_errors'] = corrupt.decode_errors
+SCENARIOS['avg_types'] = contracts.avg_types
+SCENARIOS['formats'] = contracts.formats
+SCENARIOS['contract'] = contracts.contract
+SCENARIOS['bloom_filters'] = contracts.bloom_filters
+SCENARIOS['order'] = contracts.order
+SCENARIOS['planner'] = contracts.planner
+SCENARIOS['writer_defaults'] = contracts.writer_defaults
+SCENARIOS['layout'] = contracts.layout
+SCENARIOS['private_decode'] = contracts.private_decode
+SCENARIOS['smoke'] = contracts.smoke
+SCENARIOS['unknown_encodings'] = contracts.unknown_encodings
 
 
 def main():

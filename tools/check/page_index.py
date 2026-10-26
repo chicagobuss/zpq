@@ -6,7 +6,7 @@ then check the OffsetIndex (one location per data page: offset, size with header
 page null flag, min/max of the page's present values, null count, NaN count, boundary order) against the values
 pyarrow decodes for each page's rows. Flat columns only, which is what zpq re-encodes.
 
-    page_index_check.py FILE [--require-index] [--quiet]
+    page_index.py FILE [--require-index] [--quiet]
 
 Prints one summary line per file (row groups, pages, rows per page) and exits 1 on the first mismatch.
 """
@@ -143,7 +143,8 @@ def check_file(path, require_index, quiet):
             cm = chunk[3]
             phys = PHYS[cm[1]]
             elem = leaves[ci]
-            unsigned = elem.get(6) in (11, 12, 13, 14) or (10 in elem and 10 in elem[10] and not elem[10][10].get(2, True))
+            int_type = elem.get(10, {}).get(10)
+            unsigned = elem.get(6) in (11, 12, 13, 14) or (int_type is not None and not int_type.get(2, True))
             start = cm.get(11) if cm.get(11) is not None else cm[9]
             end = start + cm[7]
             pos = start
@@ -166,7 +167,8 @@ def check_file(path, require_index, quiet):
             if (cm.get(11) is not None) != any(p["type"] == DICTIONARY_PAGE for p in pages):
                 fail(f"rg {rgi} col {ci}: dictionary_page_offset disagrees with the pages")
             if data_pages and data_pages[0]["offset"] != cm[9]:
-                fail(f"rg {rgi} col {ci}: data_page_offset {cm[9]} is not the first data page {data_pages[0]['offset']}")
+                first = data_pages[0]["offset"]
+                fail(f"rg {rgi} col {ci}: data_page_offset {cm[9]} is not the first data page {first}")
             total_pages += len(data_pages)
             rows_per_page += [p["values"] for p in data_pages]
             if 4 not in chunk and 6 not in chunk:
@@ -235,7 +237,8 @@ def check_file(path, require_index, quiet):
                     if not py:
                         continue
                 if hasattr(py[0], "timestamp") or not isinstance(py[0], (int, float, bytes, bool)):
-                    py = [as_key(phys, v) for v in pc.cast(present, "int64" if phys == "INT64" else "int32").to_pylist()]
+                    ints = pc.cast(present, "int64" if phys == "INT64" else "int32")
+                    py = [as_key(phys, v) for v in ints.to_pylist()]
                 lo, hi = decode_bound(phys, mins[pi], not unsigned), decode_bound(phys, maxs[pi], not unsigned)
                 if phys == "FLBA" and py and isinstance(py[0], bytes) and raw and isinstance(raw[0], decimal.Decimal):
                     # Decimal bounds order as signed integers, not bytes.

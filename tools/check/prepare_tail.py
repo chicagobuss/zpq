@@ -29,7 +29,8 @@ def main():
         many,
     ) = sys.argv[1:]
 
-    rows_err = [(k, q) for k in range(160) for q in range(1, 31)] + [(k, 0) for k in range(160, 2160) for _ in range(23)]
+    rows_err = [(k, q) for k in range(160) for q in range(1, 31)]
+    rows_err += [(k, 0) for k in range(160, 2160) for _ in range(23)]
     random.Random(1991).shuffle(rows_err)
     pq.write_table(
         pa.table({"k": [r[0] for r in rows_err], "q": [r[1] for r in rows_err]}),
@@ -82,7 +83,8 @@ def main():
                 "a": pa.array([None, "r", "xy", "xy", None, "x"] * 50, pa.string()),
                 "b": pa.array(["abc", "abc", "abcdef", "abcdefg", "y" * 57, "y" * 57] * 50, pa.string()),
                 "h": pa.array([None, 1, 2, None, 3, 4] * 50, pa.int64()),
-                "s": pa.array(["abcX\x01\x00\x00\x00Qjkl", "q", "", "zz", "abcX\x01\x00\x00\x00Qjkl", "w"] * 50, pa.string()),
+                "s": pa.array(["abcX\x01\x00\x00\x00Qjkl", "q", "", "zz", "abcX\x01\x00\x00\x00Qjkl", "w"] * 50,
+                              pa.string()),
                 "g": pa.array([5, 1, 3, 1, 2, 4] * 50, pa.int32()),
             }
         ),

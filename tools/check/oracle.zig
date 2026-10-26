@@ -1,9 +1,11 @@
 //! The one oracle: the DuckDB 2.0 CLI, one process per question, with an optional answer cache.
 //!
-//! A cache entry is keyed by the DuckDB binary's sha256, TZ (TIMESTAMPTZ prints in local time), and the SQL with
-//! every quoted path it names replaced by the sha256 of that file's bytes (a glob by its sorted matches). The entry
-//! stores the key material and is used only when it matches exactly; anything else (missing, unreadable, truncated,
-//! foreign) is a miss that asks DuckDB again. Commit runs use the cache; full runs pass no cache directory.
+//! DuckDB runs with no init file (`-no-init`: ~/.duckdbrc could change any default) and only TZ, LC_ALL=C and PATH
+//! in its environment. A cache key is that configuration, the DuckDB binary's sha256, the SQL verbatim, and the
+//! sha256 of every file a quoted literal in it names (a glob by its sorted matches). A named file that cannot be
+//! hashed makes the question uncacheable. An entry is used only when its stored key matches exactly, its answer
+//! matches its stored digest, and the answer decodes; anything else is a miss that asks DuckDB again. Commit runs
+//! use the cache; full runs pass no cache directory.
 
 const std = @import("std");
 const compare = @import("compare.zig");
@@ -26,26 +28,51 @@ pub const Oracle = struct {
     hits: usize = 0,
     misses: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, duckdb: []const u8, cache_dir: ?[]const u8, tz: []const u8) !Oracle {
+    /// `tz` is the zone DuckDB runs in: UTC when the caller has none, never the host's unstated default.
+    pub fn init(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        duckdb: []const u8,
+        cache_dir: ?[]const u8,
+        tz: []const u8,
+    ) !Oracle {
         return .{
             .gpa = gpa,
             .io = io,
             .duckdb = duckdb,
             .duckdb_sha = try fileSha(gpa, io, duckdb),
-            .tz = tz,
+            .tz = if (tz.len == 0) "UTC" else tz,
             .cache_dir = cache_dir,
         };
     }
 
+    fn run(self: *Oracle, args: []const []const u8) !Captured {
+        var env = std.process.Environ.Map.init(self.gpa);
+        defer env.deinit();
+        try env.put("TZ", self.tz);
+        try env.put("LC_ALL", "C");
+        if (std.c.getenv("PATH")) |path| try env.put("PATH", std.mem.span(path));
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(self.gpa);
+        try argv.appendSlice(self.gpa, &.{ self.duckdb, "-no-agent", "-no-init" });
+        try argv.appendSlice(self.gpa, args);
+        return captureEnv(self.gpa, self.io, argv.items, &env);
+    }
+
     /// Run `sql`, a single SELECT, and its DESCRIBE. Results live in `arena`.
     pub fn ask(self: *Oracle, arena: std.mem.Allocator, sql: []const u8) !Answer {
-        const raw = try self.rawAnswer(arena, sql);
+        return self.askAfter(arena, "", sql);
+    }
+
+    /// `ask` after `setup` statements (views, macros, settings) that print nothing.
+    pub fn askAfter(self: *Oracle, arena: std.mem.Allocator, setup: []const u8, sql: []const u8) !Answer {
+        const raw = try self.rawAnswer(arena, setup, sql);
         return decode(arena, raw);
     }
 
     /// Execute statements for their side effects (fixture COPY). Never cached.
     pub fn exec(self: *Oracle, sql: []const u8) !void {
-        const out = try capture(self.gpa, self.io, &.{ self.duckdb, "-no-agent", "-c", sql });
+        const out = try self.run(&.{ "-c", sql });
         defer self.gpa.free(out.stdout);
         defer self.gpa.free(out.stderr);
         if (out.code != 0) {
@@ -54,90 +81,113 @@ pub const Oracle = struct {
         }
     }
 
-    fn rawAnswer(self: *Oracle, arena: std.mem.Allocator, sql: []const u8) ![]const u8 {
-        const material = try self.keyMaterial(arena, sql);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(material, &digest, .{});
-        const hex = std.fmt.bytesToHex(digest, .lower);
+    fn rawAnswer(self: *Oracle, arena: std.mem.Allocator, setup: []const u8, sql: []const u8) ![]const u8 {
+        // Hashing every named file is the cost of a key: an uncached run never pays it.
+        const material = if (self.cache_dir == null) null else try self.keyMaterialAfter(arena, setup, sql);
         var path: ?[]const u8 = null;
-        if (self.cache_dir) |dir| {
-            path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ dir, hex });
-            if (self.lookup(arena, path.?, material)) |hit| {
+        if (self.cache_dir) |dir| if (material) |m| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(m, &digest, .{});
+            path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ dir, &std.fmt.bytesToHex(digest, .lower) });
+            if (self.lookup(arena, path.?, m)) |hit| {
                 self.hits += 1;
                 return hit;
             }
-        }
+        };
         self.misses += 1;
-        const full = try std.fmt.allocPrint(arena, "SET threads=1; DESCRIBE {s}; {s}", .{ sql, sql });
-        const out = try capture(self.gpa, self.io, &.{ self.duckdb, "-no-agent", "-json", "-c", full });
+        const full = try std.fmt.allocPrint(arena, "SET threads=1; {s}\nDESCRIBE {s}; {s}", .{ setup, sql, sql });
+        const out = try self.run(&.{ "-json", "-c", full });
         defer self.gpa.free(out.stdout);
         defer self.gpa.free(out.stderr);
         const raw = if (out.code == 0)
             try std.fmt.allocPrint(arena, "O{s}", .{out.stdout})
         else
             try std.fmt.allocPrint(arena, "E{s}", .{std.mem.trim(u8, out.stderr, " \t\r\n")});
-        if (path) |p| self.store(arena, p, material, raw) catch |err| std.debug.print("oracle cache: {s}\n", .{@errorName(err)});
+        if (path) |p| self.store(arena, p, material.?, raw) catch |err|
+            std.debug.print("oracle cache: {s}\n", .{@errorName(err)});
         return raw;
     }
 
     fn lookup(self: *Oracle, arena: std.mem.Allocator, path: []const u8, material: []const u8) ?[]const u8 {
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(256 << 20)) catch return null;
-        const entry = std.json.parseFromSliceLeaky(struct { material: []const u8, answer: []const u8 }, arena, text, .{}) catch return null;
+        const Entry = struct { material: []const u8, answer: []const u8, answer_sha256: []const u8 };
+        const entry = std.json.parseFromSliceLeaky(Entry, arena, text, .{}) catch return null;
         if (!std.mem.eql(u8, entry.material, material)) return null;
+        if (!std.mem.eql(u8, entry.answer_sha256, &sha(entry.answer))) return null;
         if (entry.answer.len == 0 or (entry.answer[0] != 'O' and entry.answer[0] != 'E')) return null;
+        _ = decode(arena, entry.answer) catch return null;
         return entry.answer;
     }
 
     fn store(self: *Oracle, arena: std.mem.Allocator, path: []const u8, material: []const u8, raw: []const u8) !void {
         try std.Io.Dir.cwd().createDirPath(self.io, self.cache_dir.?);
-        const text = try std.json.Stringify.valueAlloc(arena, .{ .material = material, .answer = raw }, .{});
+        const text = try std.json.Stringify.valueAlloc(
+            arena,
+            .{
+                .material = material,
+                .answer = raw,
+                .answer_sha256 = &sha(raw),
+            },
+            .{},
+        );
         const tmp = try std.fmt.allocPrint(arena, "{s}.{d}.tmp", .{ path, std.c.getpid() });
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = tmp, .data = text });
         try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, self.io);
     }
 
-    /// The bytes that decide an answer: DuckDB, TZ and the SQL with each named file replaced by its content hash.
-    pub fn keyMaterial(self: *Oracle, arena: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    /// The bytes that decide an answer, or null when a file the SQL names cannot be hashed (no cache then).
+    pub fn keyMaterial(self: *Oracle, arena: std.mem.Allocator, sql: []const u8) !?[]const u8 {
+        return self.keyMaterialAfter(arena, "", sql);
+    }
+
+    fn keyMaterialAfter(self: *Oracle, arena: std.mem.Allocator, setup: []const u8, sql: []const u8) !?[]const u8 {
         var out: std.ArrayList(u8) = .empty;
-        try out.print(arena, "zpq-oracle v2\nduckdb {s}\nTZ={s}\n", .{ &self.duckdb_sha, self.tz });
+        try out.print(arena, "zpq-oracle v3\nduckdb {s} -no-agent -no-init threads=1\nTZ={s} LC_ALL=C\nsetup " ++
+            "{d}:{s}\nsql {d}:{s}\n", .{
+            &self.duckdb_sha, self.tz, setup.len, setup, sql.len, sql,
+        });
+        const both = try std.mem.concat(arena, u8, &.{ setup, "\n", sql });
         var i: usize = 0;
-        while (i < sql.len) {
-            if (sql[i] != '\'') {
-                try out.append(arena, sql[i]);
-                i += 1;
-                continue;
-            }
-            const end = std.mem.indexOfScalarPos(u8, sql, i + 1, '\'') orelse {
-                try out.appendSlice(arena, sql[i..]);
-                break;
-            };
-            const literal = sql[i + 1 .. end];
-            if (try self.contentOf(arena, literal)) |hashes| {
-                try out.print(arena, "<files {s}>", .{hashes});
-            } else {
-                try out.appendSlice(arena, sql[i .. end + 1]);
-            }
+        while (std.mem.indexOfScalarPos(u8, both, i, '\'')) |start| {
+            const end = std.mem.indexOfScalarPos(u8, both, start + 1, '\'') orelse break;
+            const literal = both[start + 1 .. end];
             i = end + 1;
+            switch (try self.contentOf(arena, literal)) {
+                .not_a_file => {},
+                .unhashable => return null,
+                .hashed => |h| try out.print(arena, "file {d}:{s} {s}\n", .{ literal.len, literal, h }),
+            }
         }
         return out.items;
     }
 
-    fn contentOf(self: *Oracle, arena: std.mem.Allocator, literal: []const u8) !?[]const u8 {
-        if (literal.len == 0 or std.mem.indexOfScalar(u8, literal, '\n') != null) return null;
+    const Content = union(enum) { not_a_file, unhashable, hashed: []const u8 };
+
+    fn contentOf(self: *Oracle, arena: std.mem.Allocator, literal: []const u8) !Content {
+        if (literal.len == 0 or std.mem.indexOfScalar(u8, literal, '\n') != null) return .not_a_file;
         if (std.mem.indexOfScalar(u8, literal, '*') == null) {
-            const sha = fileSha(self.gpa, self.io, literal) catch return null;
-            return try arena.dupe(u8, &sha);
+            const h = fileSha(self.gpa, self.io, literal) catch |err| return switch (err) {
+                error.FileNotFound, error.IsDir, error.NotDir, error.NameTooLong, error.BadPathName => .not_a_file,
+                else => .unhashable,
+            };
+            return .{ .hashed = try arena.dupe(u8, &h) };
         }
-        const matches = try globFiles(arena, self.io, literal);
-        if (matches.len == 0) return null;
+        const matches = globFiles(arena, self.io, literal) catch return .unhashable;
+        if (matches.len == 0) return .not_a_file;
         var out: std.ArrayList(u8) = .empty;
         for (matches) |m| {
-            const sha = try fileSha(self.gpa, self.io, m);
-            try out.print(arena, "{s} ", .{&sha});
+            const h = fileSha(self.gpa, self.io, m) catch return .unhashable;
+            try out.print(arena, "{s}={s} ", .{ m, &h });
         }
-        return out.items;
+        return .{ .hashed = out.items };
     }
 };
+
+fn sha(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
 
 /// Files matching a pattern whose `*` wildcards are in the last path component, sorted.
 pub fn globFiles(arena: std.mem.Allocator, io: std.Io, pattern: []const u8) ![]const []const u8 {
@@ -168,11 +218,23 @@ fn wildMatch(pattern: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// sha256 of a file's bytes, streamed: no size limit.
 pub fn fileSha(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![64]u8 {
-    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 << 30));
-    defer gpa.free(data);
+    _ = gpa;
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    if ((try file.stat(io)).kind == .directory) return error.IsDir;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [1 << 16]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    var chunk: [1 << 16]u8 = undefined;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+    }
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    hasher.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
 }
 
@@ -180,9 +242,9 @@ pub fn fileSha(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![64]u8 {
 fn decode(arena: std.mem.Allocator, raw: []const u8) !Answer {
     if (raw[0] == 'E') return .{ .refused = raw[1..] };
     const arrays = try topLevelArrays(arena, raw[1..]);
-    if (arrays.len != 2) return error.BadOracleOutput;
-    const describe = try compare.parse(arena, arrays[0]);
-    const rows = try compare.parse(arena, arrays[1]);
+    if (arrays.len < 2) return error.BadOracleOutput;
+    const describe = try compare.parse(arena, arrays[arrays.len - 2]);
+    const rows = try compare.parse(arena, arrays[arrays.len - 1]);
     const n = describe.array.items.len;
     const names = try arena.alloc([]const u8, n);
     const types = try arena.alloc([]const u8, n);
@@ -234,11 +296,22 @@ pub const Captured = struct {
 };
 
 pub fn capture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Captured {
+    return captureEnv(gpa, io, argv, null);
+}
+
+/// Run `argv` to completion; `env` replaces the child's environment when given.
+pub fn captureEnv(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    env: ?*const std.process.Environ.Map,
+) !Captured {
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = env,
     });
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -262,104 +335,189 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Ca
 
 const testing = std.testing;
 
-/// A stand-in DuckDB that answers one row and counts its invocations in `calls`.
+/// A stand-in DuckDB that answers one row (`value`), and logs its arguments and environment to `calls`.
 fn fakeDuck(io: std.Io, dir: []const u8, value: []const u8) ![]const u8 {
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/duckdb", .{dir});
     const script = try std.fmt.allocPrint(testing.allocator,
         \\#!/bin/sh
-        \\echo x >> {s}/calls
+        \\echo "call $* TZ=$TZ LC_ALL=$LC_ALL HOME=$HOME" >> {s}/calls
         \\echo '[{{"column_name":"a","column_type":"INTEGER"}}]'
         \\echo '[{{"a":{s}}}]'
         \\
     , .{ dir, value });
     defer testing.allocator.free(script);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script, .flags = .{ .permissions = .fromMode(0o755) } });
+    try std.Io.Dir.cwd().writeFile(
+        io,
+        .{
+            .sub_path = path,
+            .data = script,
+            .flags = .{ .permissions = .fromMode(0o755) },
+        },
+    );
     return path;
 }
 
-fn calls(io: std.Io, dir: []const u8) !usize {
-    const p = try std.fmt.allocPrint(testing.allocator, "{s}/calls", .{dir});
-    defer testing.allocator.free(p);
-    const text = std.Io.Dir.cwd().readFileAlloc(io, p, testing.allocator, .limited(1 << 20)) catch return 0;
-    defer testing.allocator.free(text);
-    return std.mem.count(u8, text, "\n");
+fn callLog(io: std.Io, arena: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    const p = try std.fmt.allocPrint(arena, "{s}/calls", .{dir});
+    return std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(1 << 20)) catch "";
 }
 
-test "the cache never answers for other inputs: changed files, binaries, corrupt or foreign entries miss" {
+fn calls(io: std.Io, arena: std.mem.Allocator, dir: []const u8) !usize {
+    // The question spans lines (setup, then the SQL and its DESCRIBE): count the calls, not the lines.
+    return std.mem.count(u8, try callLog(io, arena, dir), "call -no-agent");
+}
+
+const Sandbox = struct {
+    tmp: std.testing.TmpDir,
+    arena_state: std.heap.ArenaAllocator,
+    root: []const u8 = "",
+
+    fn init() !Sandbox {
+        var b: Sandbox = .{ .tmp = testing.tmpDir(.{}), .arena_state = .init(testing.allocator) };
+        b.root = try std.fmt.allocPrint(b.arena_state.allocator(), ".zig-cache/tmp/{s}", .{&b.tmp.sub_path});
+        return b;
+    }
+    fn deinit(b: *Sandbox) void {
+        b.arena_state.deinit();
+        b.tmp.cleanup();
+    }
+    fn file(b: *Sandbox, name: []const u8, data: []const u8) ![]const u8 {
+        const path = try std.fmt.allocPrint(b.arena_state.allocator(), "{s}/{s}", .{ b.root, name });
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = data });
+        return path;
+    }
+};
+
+fn entryPath(o: *Oracle, a: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    const m = (try o.keyMaterial(a, sql)).?;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(m, &digest, .{});
+    return std.fmt.allocPrint(a, "{s}/{s}.json", .{ o.cache_dir.?, &std.fmt.bytesToHex(digest, .lower) });
+}
+
+test "the cache never answers for other inputs: changed files, binaries or zones miss" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    const duck = try fakeDuck(io, root, "1");
+    var box = try Sandbox.init();
+    defer box.deinit();
+    const a = box.arena_state.allocator();
+    const duck = try fakeDuck(io, box.root, "1");
     defer testing.allocator.free(duck);
-    const cache = try std.fmt.allocPrint(a, "{s}/cache", .{root});
-    const fixture = try std.fmt.allocPrint(a, "{s}/f.parquet", .{root});
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fixture, .data = "one" });
+    const cache = try std.fmt.allocPrint(a, "{s}/cache", .{box.root});
+    const fixture = try box.file("f.parquet", "one");
     const sql = try std.fmt.allocPrint(a, "SELECT a FROM '{s}'", .{fixture});
 
-    var o = try Oracle.init(testing.allocator, io, duck, cache, "UTC");
+    var o = try Oracle.init(testing.allocator, io, duck, cache, "");
     _ = try o.ask(a, sql);
     _ = try o.ask(a, sql);
-    try testing.expectEqual(@as(usize, 1), try calls(io, root)); // a hit
+    try testing.expectEqual(@as(usize, 1), try calls(io, a, box.root));
     try testing.expectEqual(@as(usize, 1), o.hits);
-
     // The same SQL over different bytes is a different question.
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fixture, .data = "two" });
+    _ = try box.file("f.parquet", "two");
     _ = try o.ask(a, sql);
-    try testing.expectEqual(@as(usize, 2), try calls(io, root));
-
-    // A truncated, empty or foreign entry is a miss, never an answer.
-    const material = try o.keyMaterial(a, sql);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(material, &digest, .{});
-    const entry = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ cache, &std.fmt.bytesToHex(digest, .lower) });
-    for ([_][]const u8{ "", "{\"material\":", "{\"material\":\"other\",\"answer\":\"O[][]\"}" }) |bad| {
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = entry, .data = bad });
-        const before = try calls(io, root);
-        const got = try o.ask(a, sql);
-        try testing.expectEqual(before + 1, try calls(io, root));
-        try testing.expectEqual(@as(usize, 1), got.rows.len);
-    }
-
+    try testing.expectEqual(@as(usize, 2), try calls(io, a, box.root));
     // Another DuckDB binary never reuses this one's answers.
-    var tmp2 = testing.tmpDir(.{});
-    defer tmp2.cleanup();
-    const root2 = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp2.sub_path});
-    const duck2 = try fakeDuck(io, root2, "2");
+    var box2 = try Sandbox.init();
+    defer box2.deinit();
+    const duck2 = try fakeDuck(io, box2.root, "2");
     defer testing.allocator.free(duck2);
-    var o2 = try Oracle.init(testing.allocator, io, duck2, cache, "UTC");
+    var o2 = try Oracle.init(testing.allocator, io, duck2, cache, "");
     const other = try o2.ask(a, sql);
-    try testing.expectEqual(@as(usize, 1), try calls(io, root2));
     try testing.expectEqualStrings("2", other.rows[0].get("a").?.number_string);
-
     // Nor does another time zone.
     var o3 = try Oracle.init(testing.allocator, io, duck, cache, "America/Chicago");
-    const before = try calls(io, root);
+    const before = try calls(io, a, box.root);
     _ = try o3.ask(a, sql);
-    try testing.expectEqual(before + 1, try calls(io, root));
+    try testing.expectEqual(before + 1, try calls(io, a, box.root));
 }
 
-test "a glob is keyed by every file it matches" {
+test "a truncated, foreign, corrupted or undecodable entry is a miss that asks DuckDB again" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    const duck = try fakeDuck(io, root, "1");
+    var box = try Sandbox.init();
+    defer box.deinit();
+    const a = box.arena_state.allocator();
+    const duck = try fakeDuck(io, box.root, "42");
     defer testing.allocator.free(duck);
-    for ([_][]const u8{ "t_a.parquet", "t_b.parquet" }) |name| {
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, name }), .data = name });
+    var o = try Oracle.init(testing.allocator, io, duck, try std.fmt.allocPrint(a, "{s}/cache", .{box.root}), "");
+    const sql = try std.fmt.allocPrint(a, "SELECT a FROM '{s}'", .{try box.file("f.parquet", "x")});
+    _ = try o.ask(a, sql);
+    const entry = try entryPath(&o, a, sql);
+    const good = try std.Io.Dir.cwd().readFileAlloc(io, entry, a, .limited(1 << 20));
+    const material = try std.json.Stringify.valueAlloc(a, (try o.keyMaterial(a, sql)).?, .{});
+    const bad = [_][]const u8{
+        "",
+        "{\"material\":",
+        "{\"material\":\"other\",\"answer\":\"O[][]\",\"answer_sha256\":\"x\"}",
+        // The answer changed under an intact key: its digest no longer matches.
+        try std.mem.replaceOwned(u8, a, good, "\"a\\\":42", "\"a\\\":43"),
+        // A malformed answer whose digest matches: it must not decode into a hit.
+        try std.fmt.allocPrint(a, "{{\"material\":{s},\"answer\":\"O[\",\"answer_sha256\":\"{s}\"}}", .{
+            material,
+            &sha("O["),
+        }),
+    };
+    try testing.expect(!std.mem.eql(u8, bad[3], good));
+    for (bad) |text| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = entry, .data = text });
+        const before = try calls(io, a, box.root);
+        const got = try o.ask(a, sql);
+        try testing.expectEqual(before + 1, try calls(io, a, box.root));
+        try testing.expectEqualStrings("42", got.rows[0].get("a").?.number_string);
     }
-    var o = try Oracle.init(testing.allocator, io, duck, null, "UTC");
-    const sql = try std.fmt.allocPrint(a, "SELECT * FROM '{s}/t_*.parquet'", .{root});
-    const k1 = try o.keyMaterial(a, sql);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/t_b.parquet", .{root}), .data = "changed" });
-    const k2 = try o.keyMaterial(a, sql);
+}
+
+test "paths stay in the key: the same bytes under two names are two questions" {
+    const io = testing.io;
+    var box = try Sandbox.init();
+    defer box.deinit();
+    const a = box.arena_state.allocator();
+    const duck = try fakeDuck(io, box.root, "1");
+    defer testing.allocator.free(duck);
+    var o = try Oracle.init(testing.allocator, io, duck, null, "");
+    const one = try box.file("one.parquet", "same");
+    const two = try box.file("two.parquet", "same");
+    const k1 = (try o.keyMaterial(a, try std.fmt.allocPrint(a, "SELECT '{s}' AS p", .{one}))).?;
+    const k2 = (try o.keyMaterial(a, try std.fmt.allocPrint(a, "SELECT '{s}' AS p", .{two}))).?;
     try testing.expect(!std.mem.eql(u8, k1, k2));
-    try testing.expect(std.mem.indexOf(u8, k1, root) == null);
+    try testing.expect(std.mem.indexOf(u8, k1, one) != null);
+    // A glob is keyed by every file it matches.
+    const glob = try std.fmt.allocPrint(a, "SELECT * FROM '{s}/*.parquet'", .{box.root});
+    const g1 = (try o.keyMaterial(a, glob)).?;
+    _ = try box.file("two.parquet", "changed");
+    try testing.expect(!std.mem.eql(u8, g1, (try o.keyMaterial(a, glob)).?));
+}
+
+test "a named file that cannot be hashed makes the question uncacheable" {
+    const io = testing.io;
+    var box = try Sandbox.init();
+    defer box.deinit();
+    const a = box.arena_state.allocator();
+    const duck = try fakeDuck(io, box.root, "1");
+    defer testing.allocator.free(duck);
+    var o = try Oracle.init(testing.allocator, io, duck, try std.fmt.allocPrint(a, "{s}/cache", .{box.root}), "");
+    const locked = try box.file("locked.parquet", "secret");
+    try std.Io.Dir.cwd().setFilePermissions(io, locked, .fromMode(0o000), .{});
+    defer std.Io.Dir.cwd().setFilePermissions(io, locked, .fromMode(0o644), .{}) catch {};
+    const sql = try std.fmt.allocPrint(a, "SELECT a FROM '{s}'", .{locked});
+    if (std.c.getuid() == 0) return error.SkipZigTest; // root reads any file
+    try testing.expect((try o.keyMaterial(a, sql)) == null);
+    _ = try o.ask(a, sql);
+    _ = try o.ask(a, sql);
+    try testing.expectEqual(@as(usize, 2), try calls(io, a, box.root));
+    try testing.expectEqual(@as(usize, 0), o.hits);
+}
+
+test "DuckDB runs without an init file, in a pinned environment that the key names" {
+    const io = testing.io;
+    var box = try Sandbox.init();
+    defer box.deinit();
+    const a = box.arena_state.allocator();
+    const duck = try fakeDuck(io, box.root, "1");
+    defer testing.allocator.free(duck);
+    var o = try Oracle.init(testing.allocator, io, duck, null, "");
+    _ = try o.ask(a, "SELECT 1 AS a");
+    const log = try callLog(io, a, box.root);
+    try testing.expect(std.mem.indexOf(u8, log, "-no-init") != null);
+    try testing.expect(std.mem.indexOf(u8, log, "TZ=UTC LC_ALL=C HOME=\n") != null);
+    const k = (try o.keyMaterial(a, "SELECT 1 AS a")).?;
+    try testing.expect(std.mem.indexOf(u8, k, "-no-init") != null and std.mem.indexOf(u8, k, "TZ=UTC") != null);
 }

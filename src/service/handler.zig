@@ -327,6 +327,7 @@ pub fn handleStaged(
             .compress_priority = compress_priority,
             .scan_all = req.scan_all,
             .trust_stats = req.trust_stats,
+            .cache = req.cache,
             .unordered = req.unordered,
             .max_memory = if (profiler != null) budget -| prof_opts.reservedBytes() else budget,
             .max_memory_explicit = max_memory,

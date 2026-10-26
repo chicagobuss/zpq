@@ -314,6 +314,9 @@ pub const QueryArgs = struct {
     /// Row-group pruning still uses stats regardless (that path only skips
     /// provably-non-matching groups, so it can't produce a wrong value).
     trust_stats: bool = false,
+    /// `--cache` and libzpq `"cache"`: read local files through the page cache, never `O_DIRECT`, so the next
+    /// query on them runs warm. Off, a cold planned read that fits the reader uses `O_DIRECT` io_uring.
+    cache: bool = false,
     /// `--fast-levels`: skip materialising definition levels for data
     /// pages proven to have no nulls. Off by default — it is new, and a
     /// wrong answer here would be silent. See `core/parquet/column.zig`
@@ -607,6 +610,7 @@ fn executeAggregateOver(
     //    Local files may be read explicitly rather than faulted in (`io/local_reader.zig`); their footers are then
     //    parsed here from the mapping, since the scan's copy of the bytes holds only what the reader plans.
     var io_policy = local_reader.Policy.fromEnv(ctx.env);
+    io_policy.cache = args.cache;
     // A GROUP BY cut by a plain COUNT or a count(DISTINCT) first and descending (sketch, census), or by a LIMIT with
     // no ORDER BY (first keys), reads the input twice: the mapping serves both passes (the first warms the page cache for the second),
     // where the explicit reader reads each row group once and so rules those cuts out. Even cold, the two cheap
@@ -6789,7 +6793,7 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
             a.strategyName(),
             merge,
             @tagName(explanation.io_mode),
-            @tagName(explanation.io_reason),
+            explanation.io_reason.phrase(),
             a.workers,
             d.tables,
             a.work_items,
@@ -12629,7 +12633,7 @@ test "explainAggregate: the facts a plan was made from, the admissible strategie
     defer json.deinit();
     const facts = json.value.object.get("facts").?.object;
     try std.testing.expectEqualStrings("mmap", json.value.object.get("io").?.string);
-    try std.testing.expectEqualStrings("explicit", json.value.object.get("io_reason").?.string);
+    try std.testing.expectEqualStrings("profile asked for this", json.value.object.get("io_reason").?.string);
     try std.testing.expect(json.value.object.get("io_fallback") == null);
     try std.testing.expectEqual(@as(i64, 20000), facts.get("rows").?.object.get("value").?.integer);
     try std.testing.expectEqualStrings("exact", facts.get("row_groups").?.object.get("provenance").?.string);

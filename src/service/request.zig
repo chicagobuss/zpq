@@ -32,6 +32,7 @@ const Wire = struct {
     column_order: ?std.json.Value = null,
     scan_all: ?std.json.Value = null,
     trust_stats: ?std.json.Value = null,
+    cache: ?std.json.Value = null,
     ordered: ?std.json.Value = null,
     max_memory: ?std.json.Value = null,
     budget_wait_ms: ?std.json.Value = null,
@@ -65,6 +66,8 @@ pub const Request = struct {
     column_order: ?[]const u8 = null,
     scan_all: bool = false,
     trust_stats: bool = false,
+    /// `"cache": true`. Read through the page cache, never `O_DIRECT`.
+    cache: bool = false,
     /// `"ordered": false`; ordered when absent or null.
     unordered: bool = false,
     /// `max_memory`: a byte count, or a size string the caller parses (`"512MB"`).
@@ -151,6 +154,7 @@ pub const Request = struct {
         req.column_order = try f.string("column_order");
         req.scan_all = try f.boolean("scan_all");
         req.trust_stats = try f.boolean("trust_stats");
+        req.cache = try f.boolean("cache");
         req.unordered = if (parsed.value.ordered) |v| switch (v) {
             .bool => |b| !b,
             .null => false,
@@ -306,6 +310,13 @@ test "request: s3_url shorthand, numeric max_memory, nulls as absent" {
     , &bad);
     defer unordered.deinit();
     try testing.expect(unordered.unordered);
+    try testing.expect(!nulls.cache);
+
+    var cached = try Request.parse(testing.allocator,
+        \\{"s3_url":"s3://b/k","cache":true}
+    , &bad);
+    defer cached.deinit();
+    try testing.expect(cached.cache);
 
     var prof = try Request.parse(testing.allocator,
         \\{"s3_url":"s3://b/k","profile_url":"s3://b/trace.json"}
@@ -341,6 +352,7 @@ test "malformed requests are errors, wrong-typed fields named" {
         .{ .body = "{\"inputs\":[\"a\"],\"filter\":5}", .err = error.BadFieldType, .field = "filter" },
         .{ .body = "{\"inputs\":[\"a\"],\"columns\":\"x\"}", .err = error.BadFieldType, .field = "columns" },
         .{ .body = "{\"inputs\":[\"a\"],\"scan_all\":1}", .err = error.BadFieldType, .field = "scan_all" },
+        .{ .body = "{\"inputs\":[\"a\"],\"cache\":1}", .err = error.BadFieldType, .field = "cache" },
         .{ .body = "{\"inputs\":[\"a\"],\"profile\":\"yes\"}", .err = error.BadFieldType, .field = "profile" },
         .{ .body = "{\"inputs\":[\"a\"],\"profile_url\":7}", .err = error.BadFieldType, .field = "profile_url" },
         .{ .body = "{\"inputs\":[\"a\"],\"max_memory\":-1}", .err = error.BadFieldType, .field = "max_memory" },
@@ -488,8 +500,7 @@ test "fsync accepts both polarities and null; wrong types name the field" {
 }
 
 test "automatic Bloom filters accept both polarities and default on for absent or null" {
-    inline for (.{ "", ",\"bloom_filters_enabled\":null", ",\"bloom_filters_enabled\":true",
-        ",\"bloom_filters_enabled\":false" }) |field| {
+    inline for (.{ "", ",\"bloom_filters_enabled\":null", ",\"bloom_filters_enabled\":true", ",\"bloom_filters_enabled\":false" }) |field| {
         const body = "{\"inputs\":[\"a\"]" ++ field ++ "}";
         var bad: []const u8 = "";
         var req = try Request.parse(std.testing.allocator, body, &bad);
@@ -498,7 +509,9 @@ test "automatic Bloom filters accept both polarities and default on for absent o
     }
     var bad: []const u8 = "";
     try std.testing.expectError(error.BadFieldType, Request.parse(
-        std.testing.allocator, "{\"inputs\":[\"a\"],\"bloom_filters_enabled\":1}", &bad,
+        std.testing.allocator,
+        "{\"inputs\":[\"a\"],\"bloom_filters_enabled\":1}",
+        &bad,
     ));
     try std.testing.expectEqualStrings("bloom_filters_enabled", bad);
 }

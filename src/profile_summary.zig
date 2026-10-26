@@ -820,6 +820,9 @@ pub fn writeJson(s: Summary, p: *const profile.Profiler, w: *std.Io.Writer) !voi
     {
         var io = try o.object("io");
         try io.ints(s.io);
+        if (s.io.io_choice_seen != 0) {
+            if (std.enums.fromInt(local_reader.Reason, s.io.io_reason)) |reason| try io.str("why", reason.phrase());
+        }
         try io.int("peak_in_flight", s.peak_requests_in_flight);
         try io.int("peak_bytes_in_flight", s.peak_bytes_in_flight);
         try io.end();

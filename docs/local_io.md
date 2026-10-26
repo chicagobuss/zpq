@@ -24,7 +24,7 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
 |---|---|
 | `mmap` | the mapping, faulted in by the decode workers (also what writes and printed rows always use) |
 | `pread` | `ZPQ_IO_THREADS` reader threads, each with blocking `pread` of 1 MiB at a time |
-| `uring` | reader threads, each with its own io_uring. Buffered, unless the profile is the explicit `uring`, which opens its own `O_DIRECT` descriptor |
+| `uring` | reader threads, each with its own io_uring. Buffered, unless the choice is direct: the explicit `uring` profile, or a cold `auto` read |
 
 `ZPQ_IO_PROFILE` chooses one: `mmap`, `pread`, `uring`, or `auto` (the default).
 `uring` is the explicit direct option. With `auto`:
@@ -34,18 +34,20 @@ Linux an aggregate query can instead read the column chunks it needs explicitly 
   is `mincore` over those planned ranges (column chunks and their page indexes), not the rest of the file, so a warm
   repeat of a query that reads a slice of a large file maps. Every page of that range is counted while it is at most
   4 GiB of pages; past that, a stride still estimates the share. Each file is weighted by its planned pages, not by
-  how many samples it contributed. A failed `mincore` counts that file's pages as not cached;
+  how many samples it contributed. A failed `mincore` counts that file's pages as not cached, which is a cold read;
+- when less than about 20% of the planned bytes are cached and the largest row group fits the reader: `O_DIRECT`
+  io_uring, whether the read is wide or narrow. That leaves the page cache alone. `--cache` (libzpq `"cache": true`)
+  opts out and reads through the page cache instead, so the next query on the file runs warm;
 - otherwise a query that plans to read at least half the inputs' bytes uses buffered io_uring, and a narrower read
-  uses `pread`. Both fill the page cache, so the next run of the same ranges takes the mapping.
+  uses `pread`. Both fill the page cache.
 
-Automatic `O_DIRECT` is not a 0.5.0 choice. The explicit `uring` profile opens its own descriptor
-(`/proc/self/fd/N` with `O_DIRECT`); a borrowed or mapped descriptor is never changed with `F_SETFL`. If that open
-is refused the file reads through the page cache.
+The direct open is a new descriptor (`/proc/self/fd/N` with `O_DIRECT`); a borrowed or mapped descriptor is never
+changed with `F_SETFL`. If that open is refused the file reads through the page cache and the query continues.
 
 The footers are parsed and the query planned before the choice, so pruned row groups and unread columns don't count
-toward the share read. `--explain` reports the mode and one reason (`cached` or `cold_buffered`, plus the explicit
-and fallback reasons) and does not read column data to decide. A row group the reader cannot hold is read through
-the mapping (`over_budget`), including when the profile asked for direct.
+toward the share read. `--explain` and the profile summary name the choice (`cold, O_DIRECT; --cache reads through
+the page cache`, or `through the page cache (--cache)`) and do not read column data to decide. A row group the
+reader cannot hold is read through the mapping (`over_budget`), including when the profile asked for direct.
 
 Each mode falls back rather than fails:
 

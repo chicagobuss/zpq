@@ -11,9 +11,10 @@
 //! dictionaries are probed through it, and `mincore` on it says how much of the file the page cache already holds.
 //!
 //! Backends (`Mode`): `pread` threads, or one io_uring per reader thread. `Policy.choose` picks one; `ZPQ_IO_PROFILE`
-//! overrides it. `auto` maps a planned read that is already mostly cached, and otherwise reads a wide scan with
-//! buffered io_uring and a narrow one with pread. Only the explicit `uring` profile opens `O_DIRECT`, on a descriptor
-//! this reader opened.
+//! overrides it. `auto` maps a planned read that is already mostly cached. A cold one that fits the reader uses
+//! `O_DIRECT` io_uring, wide or narrow. Anything in between is buffered, which is also what `--cache` asks for, so
+//! the next query finds the file warm. A file system that refuses the direct open reads that file through the page
+//! cache. The descriptor is one this reader opened.
 const std = @import("std");
 const builtin = @import("builtin");
 const core_memory = @import("../core/memory.zig");
@@ -53,6 +54,8 @@ pub const Config = struct {
 /// default) the backend this host and these files suit.
 pub const Policy = struct {
     profile: Profile = .auto,
+    /// `--cache` and the libzpq `"cache"` field. Read through the page cache, never `O_DIRECT`.
+    cache: bool = false,
     /// `ZPQ_IO_WINDOW_MIB`; null sizes the window from the query's budget (`windowFor`).
     window: ?u64 = null,
     threads: usize = 8,
@@ -73,28 +76,37 @@ pub const Policy = struct {
 
     /// The share of the files' bytes a query must read before `auto` treats it as a full scan.
     pub const wide_scan: f64 = 0.5;
+    /// Below this share of the planned bytes, the read is cold.
+    pub const cold_resident: f64 = 0.2;
+    /// At or above this share, the planned read stays on the mapping.
+    pub const warm_resident: f64 = 0.8;
 
     /// The mode for a query of which `resident` (0..1) of the planned bytes are in the page cache and `coverage`
     /// (0..1) is the share of the inputs those bytes are. A mostly resident planned read stays on the mapping.
-    /// Otherwise a wide scan uses buffered io_uring and a narrow one pread, so a second run finds those bytes
-    /// warm. Automatic O_DIRECT is not a 0.5.0 choice: only the explicit `uring` profile opens a direct descriptor.
+    /// A cold one uses `O_DIRECT` io_uring for both a wide and a narrow read, when the kernel allows a ring and
+    /// the row group fits the reader (`Choice.withinReader`). Between those, a wide scan uses buffered io_uring
+    /// and a narrow one pread. `cache` is that buffered path even when the read is cold, so the page cache fills.
     pub fn choose(self: Policy, resident: f64, coverage: f64) Choice {
         switch (self.profile) {
-            .mmap => return .{ .mode = .mmap, .reason = .explicit },
-            .pread => return .{ .mode = .pread, .reason = .explicit },
-            // An explicit uring that the kernel refuses stays on pread. Callers of ZPQ_IO_PROFILE=uring get
-            // O_DIRECT io_uring: the explicit direct option.
+            .mmap => return .{ .mode = .mmap, .reason = if (self.cache) .page_cache else .explicit },
+            .pread => return .{ .mode = .pread, .reason = if (self.cache) .page_cache else .explicit },
+            // An explicit uring that the kernel refuses stays on pread. Without `cache` it is O_DIRECT.
             .uring => return .{
                 .mode = if (uringAvailable()) .uring else .pread,
-                .reason = if (uringAvailable()) .explicit else .no_uring,
+                .reason = if (self.cache) .page_cache else if (uringAvailable()) .explicit else .no_uring,
             },
             .auto => {},
         }
-        if (resident >= 0.8) return .{ .mode = .mmap, .reason = .cached };
+        if (resident >= warm_resident) return .{ .mode = .mmap, .reason = .cached };
         if (builtin.os.tag != .linux) return .{ .mode = .mmap, .reason = .not_linux };
-        if (coverage >= wide_scan and uringAvailable()) return .{ .mode = .uring, .reason = .cold_buffered };
-        if (coverage >= wide_scan) return .{ .mode = .pread, .reason = .no_uring };
-        return .{ .mode = .pread, .reason = .cold_buffered };
+        const cold = resident < cold_resident;
+        if (cold and !self.cache and uringAvailable()) return .{ .mode = .uring, .reason = .cold_direct };
+        const fill = self.cache and cold;
+        if (coverage >= wide_scan and uringAvailable()) {
+            return .{ .mode = .uring, .reason = if (fill) .page_cache else .cold_buffered };
+        }
+        if (coverage >= wide_scan) return .{ .mode = .pread, .reason = if (fill) .page_cache else .no_uring };
+        return .{ .mode = .pread, .reason = if (fill) .page_cache else .cold_buffered };
     }
 };
 
@@ -109,6 +121,10 @@ pub const Reason = enum(u8) {
     remote = 6,
     /// The mapping, because the reader was not in play (descriptors given back, or nothing local to weigh).
     mapping = 7,
+    /// Cold planned read, `O_DIRECT` io_uring. Appended so earlier profile traces keep their reason numbers.
+    cold_direct = 8,
+    /// `--cache` or `"cache": true`: through the page cache, never `O_DIRECT`.
+    page_cache = 9,
 
     pub fn phrase(self: Reason) []const u8 {
         return switch (self) {
@@ -120,6 +136,8 @@ pub const Reason = enum(u8) {
             .not_linux => "not linux",
             .remote => "remote input",
             .mapping => "read through the mapping",
+            .cold_direct => "cold, O_DIRECT; --cache reads through the page cache",
+            .page_cache => "through the page cache (--cache)",
         };
     }
 };
@@ -128,9 +146,9 @@ pub const Choice = struct {
     mode: Mode,
     reason: Reason,
 
-    /// O_DIRECT io_uring: the explicit profile only. Buffered io_uring is not this.
+    /// O_DIRECT io_uring: the explicit profile, or a cold planned read. Buffered io_uring is not this.
     pub fn directRead(self: Choice) bool {
-        return self.mode == .uring and self.reason == .explicit;
+        return self.mode == .uring and (self.reason == .explicit or self.reason == .cold_direct);
     }
 
     /// A row group the reader cannot hold is mapped, including an explicit direct profile.
@@ -1812,7 +1830,7 @@ test "planned-range residency bounds its allocation and partial-page windows" {
     try testing.expectEqual(@as(f64, 0), wholeShare(bounded.allocator(), mapping[0..0]));
 }
 
-test "auto keeps a warm file mapped and a cold one buffered" {
+test "auto maps a warm file, buffers a partly warm one, and reads a cold one direct" {
     const auto: Policy = .{};
     const pinned: Policy = .{ .profile = .pread };
     try testing.expectEqual(Mode.pread, pinned.choose(0, 1).mode);
@@ -1823,44 +1841,80 @@ test "auto keeps a warm file mapped and a cold one buffered" {
         try testing.expectEqual(Mode.uring, direct.mode);
         try testing.expect(direct.directRead());
     }
-    const hot = auto.choose(0.8, 1);
+    const hot = auto.choose(Policy.warm_resident, 1);
     try testing.expectEqual(Mode.mmap, hot.mode);
     try testing.expectEqual(Reason.cached, hot.reason);
     try testing.expect(!hot.directRead());
     if (builtin.os.tag != .linux) return;
     if (uringAvailable()) {
-        const wide = auto.choose(0, 0.9);
-        try testing.expectEqual(Mode.uring, wide.mode);
-        try testing.expectEqual(Reason.cold_buffered, wide.reason);
-        try testing.expect(!wide.directRead());
+        const cold_wide = auto.choose(0, 0.9);
+        try testing.expectEqual(Mode.uring, cold_wide.mode);
+        try testing.expectEqual(Reason.cold_direct, cold_wide.reason);
+        try testing.expect(cold_wide.directRead());
+        try testing.expectEqualStrings(
+            "cold, O_DIRECT; --cache reads through the page cache",
+            cold_wide.reason.phrase(),
+        );
+        const cold_narrow = auto.choose(Policy.cold_resident - 0.01, 0.1);
+        try testing.expectEqual(Mode.uring, cold_narrow.mode);
+        try testing.expect(cold_narrow.directRead());
+        const warm_wide = auto.choose(0.5, 0.9);
+        try testing.expectEqual(Mode.uring, warm_wide.mode);
+        try testing.expectEqual(Reason.cold_buffered, warm_wide.reason);
+        try testing.expect(!warm_wide.directRead());
     } else {
         try testing.expectEqual(Mode.pread, auto.choose(0, 0.9).mode);
         try testing.expectEqual(Reason.no_uring, auto.choose(0, 0.9).reason);
+        try testing.expect(!auto.choose(0, 0.9).directRead());
     }
-    const narrow = auto.choose(0, 0.2);
-    try testing.expectEqual(Mode.pread, narrow.mode);
-    try testing.expectEqual(Reason.cold_buffered, narrow.reason);
-    try testing.expect(!narrow.directRead());
+    const warm_narrow = auto.choose(Policy.cold_resident, 0.2);
+    try testing.expectEqual(Mode.pread, warm_narrow.mode);
+    try testing.expectEqual(Reason.cold_buffered, warm_narrow.reason);
+    try testing.expect(!warm_narrow.directRead());
 }
 
-test "unknown residency stays buffered, and a row group over the reader budget maps" {
+test "--cache reads through the page cache and never O_DIRECT" {
+    const cache: Policy = .{ .cache = true };
+    const wide = cache.choose(0, 0.9);
+    const narrow = cache.choose(0, 0.1);
+    try testing.expect(!wide.directRead());
+    try testing.expect(!narrow.directRead());
+    try testing.expectEqual(Reason.page_cache, wide.reason);
+    try testing.expectEqual(Reason.page_cache, narrow.reason);
+    try testing.expectEqualStrings("through the page cache (--cache)", wide.reason.phrase());
+    if (builtin.os.tag == .linux and uringAvailable()) {
+        try testing.expectEqual(Mode.uring, wide.mode);
+    } else if (builtin.os.tag == .linux) {
+        try testing.expectEqual(Mode.pread, wide.mode);
+    }
+    try testing.expectEqual(Mode.pread, narrow.mode);
+    const hot = cache.choose(Policy.warm_resident, 1);
+    try testing.expectEqual(Mode.mmap, hot.mode);
+    try testing.expectEqual(Reason.cached, hot.reason);
+    const asked: Policy = .{ .profile = .uring, .cache = true };
+    try testing.expect(!asked.choose(0, 1).directRead());
+    try testing.expectEqual(Reason.page_cache, asked.choose(0, 1).reason);
+}
+
+test "a cold read that does not fit the reader is mapped" {
     const auto: Policy = .{};
     const unknown = auto.choose(0, 0.9);
-    try testing.expect(!unknown.directRead());
     if (builtin.os.tag == .linux and uringAvailable()) {
-        try testing.expectEqual(Mode.uring, unknown.mode);
-        try testing.expectEqual(Reason.cold_buffered, unknown.reason);
+        try testing.expect(unknown.directRead());
+        try testing.expectEqual(Reason.cold_direct, unknown.reason);
+    } else {
+        try testing.expect(!unknown.directRead());
     }
     const sparse = residencyFrom(0, 32, 10_000);
     try testing.expectEqual(@as(u64, 10_000), sparse.pages);
     const from_sample = auto.choose(sparse.share, 0.9);
-    try testing.expect(!from_sample.directRead());
+    try testing.expectEqual(unknown.directRead(), from_sample.directRead());
     const failed: Residency = .{ .pages = 10 };
     try testing.expectEqual(@as(f64, 0), failed.share);
-    const wide = auto.choose(0, 0.9);
-    const mapped = wide.withinReader(false);
+    const mapped = unknown.withinReader(false);
     try testing.expectEqual(Mode.mmap, mapped.mode);
     try testing.expectEqual(Reason.over_budget, mapped.reason);
+    try testing.expect(!mapped.directRead());
     const explicit: Policy = .{ .profile = .uring };
     if (uringAvailable()) {
         const asked = explicit.choose(0, 0.2);
@@ -2074,6 +2128,41 @@ test "a submitted io_uring read is not published while its wait is interrupted" 
     gate.done(gate.ctx, 0, 1);
 }
 
+test "a file that cannot open O_DIRECT is still read through the page cache" {
+    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    const data = try testing.allocator.alloc(u8, 64 << 10);
+    defer testing.allocator.free(data);
+    @memset(data, 5);
+    const rc = linux.memfd_create("zpq-direct", 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var wrote: usize = 0;
+    while (wrote < data.len) {
+        const n = linux.write(fd, data.ptr + wrote, data.len - wrote);
+        if (linux.errno(n) != .SUCCESS or n == 0) return error.WriteFailed;
+        wrote += n;
+    }
+    if (openSibling(fd)) |dfd| {
+        _ = linux.close(dfd);
+        return error.SkipZigTest;
+    }
+    const rd = try Reader.create(testing.allocator, .{ .mode = .uring, .threads = 1, .direct = true });
+    defer rd.destroy();
+    const f = try rd.borrowFile(fd, data.len);
+    try testing.expect(!f.direct);
+    try testing.expectEqual(fd, f.fd);
+    try testing.expect(!f.owned);
+    var range = [_]Range{.{ .start = 0, .end = data.len }};
+    var plans = [_]?[]Range{&range};
+    try rd.planFile(f, &plans, 0);
+    try rd.start();
+    const gate = f.gate();
+    try gate.wait(gate.ctx, 0);
+    try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+    gate.done(gate.ctx, 0, 1);
+}
+
 test "direct io opens its own fd and does not change a borrowed one" {
     if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
@@ -2159,12 +2248,14 @@ test "a buffered read of a cold file leaves it cached for the next choice" {
     const cold = try fileResidency(path, size);
     try readWhole(path, data, .{ .mode = .uring, .threads = 2, .block = 64 << 10, .direct = false });
     const warm = try fileResidency(path, size);
-    // The cold choice is buffered, which is what filled the cache. The next choice sees that and stays mapped.
+    // This read was buffered on purpose. Auto on a cold file is O_DIRECT and would have left it cold.
     const auto: Policy = .{};
     const first = auto.choose(cold, 1);
-    try testing.expectEqual(Reason.cold_buffered, first.reason);
-    try testing.expect(!first.directRead());
-    try testing.expect(warm >= 0.8);
+    if (cold < Policy.cold_resident) {
+        try testing.expectEqual(Reason.cold_direct, first.reason);
+        try testing.expect(first.directRead());
+    }
+    try testing.expect(warm >= Policy.warm_resident);
     try testing.expect(warm > cold);
     const second = auto.choose(warm, 1);
     try testing.expectEqual(Mode.mmap, second.mode);

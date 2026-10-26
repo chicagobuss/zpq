@@ -77,8 +77,9 @@ SQL excludes the structured fields `inputs`, `s3_url`, `filter`, `columns`, `sel
 Automatic dictionary Bloom filters default on; `"bloom_filters_enabled": false` opts out.
 Explicit `bloom_filters` specifications still apply, and copied source filters are preserved.
 `parallelism` is a nonnegative integer (0 chooses automatically). Common options remain available: `max_memory`,
-`budget_wait_ms`, `ordered`, `scan_all`, `trust_stats`, `profile`, and `profile_url`. Read mode is selected through
-`ZPQ_IO_PROFILE`, exactly as for the CLI. Shutdown has the existing semantics: queued queries are refused; running
+`budget_wait_ms`, `ordered`, `scan_all`, `trust_stats`, `cache`, `profile`, and `profile_url`. `"cache": true` is the
+CLI's `--cache`: read through the page cache, never `O_DIRECT`, so the next query on the file runs warm. Read mode
+is otherwise selected through `ZPQ_IO_PROFILE`, exactly as for the CLI. Shutdown has the existing semantics: queued queries are refused; running
 queries finish. No per-query cancellation API exists.
 
 SQL failures use the existing `ZPQ_OK` plus error envelope contract. Parser/binder/engine errors carry

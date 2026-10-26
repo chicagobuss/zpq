@@ -52,10 +52,10 @@ fn wantsJsonSummary(args: std.process.Args) bool {
         if (std.mem.eql(u8, a, "--summary=json")) return true;
         // Values are opaque, even when their text happens to spell a flag.
         const values = [_][]const u8{
-            "--output",       "-o",       "--filter", "-f",         "--columns",      "-c",                  "--select",  "-s",
-            "--aggregate",    "-a",       "--query",  "-q",         "--codec",        "--compress-priority", "--threads", "-j",
-            "--bloom-filter", "--format", "--limit",  "--group-by", "--column-order", "--max-memory",        "--profile",
-            "--row-group-size", "--row-group-bytes",
+            "--output",          "-o",       "--filter", "-f",         "--columns",      "-c",                  "--select",  "-s",
+            "--aggregate",       "-a",       "--query",  "-q",         "--codec",        "--compress-priority", "--threads", "-j",
+            "--bloom-filter",    "--format", "--limit",  "--group-by", "--column-order", "--max-memory",        "--profile", "--row-group-size",
+            "--row-group-bytes",
         };
         for (values) |flag| if (std.mem.eql(u8, a, flag)) {
             _ = it.next();
@@ -200,6 +200,7 @@ fn runQuery(
     var parallelism: usize = 0;
     var scan_all: bool = false;
     var trust_stats: bool = false;
+    var cache: bool = false;
     var fast_levels: bool = false;
     var unordered: bool = false;
     var format: ?engine.PrintFormat = null;
@@ -309,6 +310,8 @@ fn runQuery(
             });
         } else if (std.mem.eql(u8, tok, "--scan-all")) {
             scan_all = true; // valueless: disable all stats shortcuts, decode everything
+        } else if (std.mem.eql(u8, tok, "--cache")) {
+            cache = true;
         } else if (std.mem.eql(u8, tok, "--trust-stats")) {
             trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
         } else if (std.mem.eql(u8, tok, "--fast-levels")) {
@@ -558,6 +561,7 @@ fn runQuery(
             .parallelism = parallelism,
             .scan_all = scan_all,
             .trust_stats = trust_stats,
+            .cache = cache,
             .fast_levels = fast_levels,
             .unordered = unordered,
             .max_memory = engine_max_mem,
@@ -596,6 +600,7 @@ fn runQuery(
         .parallelism = parallelism,
         .scan_all = scan_all,
         .trust_stats = trust_stats,
+        .cache = cache,
         .fast_levels = fast_levels,
         .unordered = unordered,
         .max_memory = engine_max_mem,
@@ -682,8 +687,8 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
         try w.writeByte('"');
     } else try w.writeAll("null");
     try w.print(",\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"files_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"codec\":", .{
-        s.rows_in,     s.rows_scanned,      s.rows_matched,          s.bytes_in,         s.bytes_out,
-        s.files_in,    s.row_groups_in,     s.row_groups_pruned,     s.row_groups_full_match, s.cols_stat_pruned,
+        s.rows_in,  s.rows_scanned,  s.rows_matched,      s.bytes_in,              s.bytes_out,
+        s.files_in, s.row_groups_in, s.row_groups_pruned, s.row_groups_full_match, s.cols_stat_pruned,
     });
     if (s.codec) |codec| try w.print("\"{s}\",", .{@tagName(codec)}) else try w.writeAll(if (s.codec_applicable) "\"MIXED\"," else "null,");
     try engine.writeMembershipJson(&w, s.membership);
@@ -692,9 +697,9 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
     const c = s.timings.core;
     const ms = std.time.ns_per_ms;
     try w.print(",\"total_ms\":{d},\"total_us\":{d},\"output_us\":{d},\"wall_ms\":{{\"open\":{d},\"parse\":{d},\"scan\":{d},\"footer\":{d}}},\"worker_ms\":{{\"decode\":{d},\"filter\":{d},\"fold\":{d},\"encode\":{d},\"sink\":{d}}}}}\n", .{
-        @divTrunc(elapsed, std.time.ns_per_ms), @divTrunc(elapsed, std.time.ns_per_us), s.output_ns / std.time.ns_per_us,
-        s.timings.read_ns / ms,                 s.timings.parse_ns / ms,                s.timings.decode_wall_ns / ms,
-        s.timings.footer_ns / ms,               c.decode_ns / ms,                       c.eval_ns / ms,
+        @divTrunc(elapsed, std.time.ns_per_ms),   @divTrunc(elapsed, std.time.ns_per_us),   s.output_ns / std.time.ns_per_us,
+        s.timings.read_ns / ms,                   s.timings.parse_ns / ms,                  s.timings.decode_wall_ns / ms,
+        s.timings.footer_ns / ms,                 c.decode_ns / ms,                         c.eval_ns / ms,
         if (s.aggregate) c.encode_ns / ms else 0, if (s.aggregate) 0 else c.encode_ns / ms, c.sink_ns / ms,
     });
     try w.flush();
@@ -704,20 +709,19 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
     if (err == error.BrokenPipe) return 141;
     if (execution_started) return 1;
     const usage = [_][]const u8{
-        "BadArgs",                     "NoInputs",                  "NoMatches",                    "SqlNotCompiledIn",     "UnknownColumn",        "UnknownFunction",
-        "UnknownAggFunc",              "WrongArity",                "EmptyExpr",                    "EmptyAggregate",       "EmptyColumnList",      "UnexpectedChar",
-        "UnexpectedEnd",               "BadNumber",                 "UnterminatedString",           "TypeMismatch",         "ExpectedLParen",       "ExpectedRParen",
-        "ExpectedIdentifier",          "ExpectedWhere",             "ExpectedAggFunc",              "StarOnlyValidInCount", "TrailingTokens",       "BadAggArg",
-        "AggregateMutexWithSelect",    "DuplicateOutputColumn",     "AmbiguousOutputColumn",        "AmbiguousColumn",      "ExpressionTooDeep",    "GroupKeyAliasRequired",
-        "SqlParseError",               "OrderByNotSupported",       "LimitNotSupported",            "DistinctNotSupported", "HavingNotSupported",   "MixedSelectNotSupported",
-        "UnsupportedStatement",        "SubqueryNotSupported",      "WindowNotSupported",           "ColumnMustBeGrouped",  "BadOutputUrl",         "BadOperator",
-        "BadValue",                    "BloomFilterNeedsRows",      "BloomFilterUnsupportedColumn", "Unsigned64Operand",    "NullableNotSupported", "NestedNotSupported",
-        "NestedRowOutputNotSupported", "UnbalancedParentheses",     "FilterTooDeep",                "AggregateInGroupBy",   "HavingTypeMismatch",   "UnsupportedCase",
-        "UnsupportedType",             "DecimalScaleTooLarge",      "MissingOutputOrAggregate",     "MultipleStatements",   "CteNotSupported",      "AggregateInWhere",
-        "MissingFromClause",           "MissingTableName",          "UnsupportedFromClause",        "UnsupportedAggType",   "UnsupportedCoalesce",  "UnsupportedColumnType",
-        "UnlabelledColumn",            "INT96ReencodeNotSupported", "NestedReencodeNotSupported",   "NestedFilterNotSupported",
-        "ModuloNotSupported",          "ExpressionInPredicate",     "NestedColumnSelected",         "NestedAggregateNotSupported",
-        "NestedGroupKeyNotSupported",
+        "BadArgs",                     "NoInputs",                    "NoMatches",                    "SqlNotCompiledIn",         "UnknownColumn",        "UnknownFunction",
+        "UnknownAggFunc",              "WrongArity",                  "EmptyExpr",                    "EmptyAggregate",           "EmptyColumnList",      "UnexpectedChar",
+        "UnexpectedEnd",               "BadNumber",                   "UnterminatedString",           "TypeMismatch",             "ExpectedLParen",       "ExpectedRParen",
+        "ExpectedIdentifier",          "ExpectedWhere",               "ExpectedAggFunc",              "StarOnlyValidInCount",     "TrailingTokens",       "BadAggArg",
+        "AggregateMutexWithSelect",    "DuplicateOutputColumn",       "AmbiguousOutputColumn",        "AmbiguousColumn",          "ExpressionTooDeep",    "GroupKeyAliasRequired",
+        "SqlParseError",               "OrderByNotSupported",         "LimitNotSupported",            "DistinctNotSupported",     "HavingNotSupported",   "MixedSelectNotSupported",
+        "UnsupportedStatement",        "SubqueryNotSupported",        "WindowNotSupported",           "ColumnMustBeGrouped",      "BadOutputUrl",         "BadOperator",
+        "BadValue",                    "BloomFilterNeedsRows",        "BloomFilterUnsupportedColumn", "Unsigned64Operand",        "NullableNotSupported", "NestedNotSupported",
+        "NestedRowOutputNotSupported", "UnbalancedParentheses",       "FilterTooDeep",                "AggregateInGroupBy",       "HavingTypeMismatch",   "UnsupportedCase",
+        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
+        "MissingFromClause",           "MissingTableName",            "UnsupportedFromClause",        "UnsupportedAggType",       "UnsupportedCoalesce",  "UnsupportedColumnType",
+        "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
+        "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

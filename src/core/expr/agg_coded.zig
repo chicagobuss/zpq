@@ -1086,7 +1086,10 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         f.* = 0;
         d.* = @intFromBool(r % 19 != 0);
         // A null row's slot holds garbage the fold must not read as a value.
-        if (d.* == 0) h.* = std.math.minInt(i64);
+        if (d.* == 0) {
+            h.* = std.math.minInt(i64);
+            sm.* = std.math.minInt(i32);
+        }
         // Half the rows in one composite, so even one slot per composite runs past 64 bits.
         c.* = if (r % 2 == 0) 0 else @intCast((r * 7 + r / 3) % space);
     }
@@ -1099,7 +1102,13 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
             .max_def = 1,
             .has_nulls = true,
         } },
-        .{ .i32 = .{ .values = small, .unscaled = .{ .i32 = small } } },
+        .{ .i32 = .{
+            .values = small,
+            .unscaled = .{ .i32 = small },
+            .def_levels = defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
         .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = huge } } },
     };
     const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
@@ -1148,19 +1157,22 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         g.* = try got.getOrInsert(&key, &calls, 0);
     }
     try std.testing.expect(try foldExactBatch(ra, a, &got, gids, comp, space, &calls, &batch, &lookup, &sel));
-    // Row by row, at 192 bits.
+    // The per-row fold this replaced, at 192 bits, as the oracle.
     const want_sum = try ra.alloc(i192, space * calls.len);
     const want_n = try ra.alloc(u64, space * calls.len);
     @memset(want_sum, 0);
     @memset(want_n, 0);
+    const want_rows = try ra.alloc(u64, space);
+    @memset(want_rows, 0);
     for (0..n) |r| {
         if (!sel.isActive(r)) continue;
+        want_rows[comp[r]] += 1;
         const present = defs[r] == 1;
         const row = [_]?i192{
             big[r],
             if (present) half[r] else null,
             if (present) @as(i192, half[r]) + big[r] else null,
-            small[r],
+            if (present) small[r] else null,
             huge[r],
             if (present) half[r] else null,
         };
@@ -1179,6 +1191,9 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         try std.testing.expectEqual(want_n[cp * calls.len + ai], d.n);
         if (ai != 4 and @abs(d.get()) > std.math.maxInt(i64)) sizable = true;
     };
+    for (gids, 0..) |g, cp| {
+        try std.testing.expectEqual(want_rows[cp], got.accumulators.items[g * calls.len + calls.len - 1].count);
+    }
     // The 64-bit lanes reach sums no 64-bit accumulator holds.
     try std.testing.expect(sizable);
 }
@@ -2034,7 +2049,7 @@ fn narrowSums(
         return;
     }
     // One slot per composite: the i128 sum runs in `lo` and the count in `n`, and no scratch is taken.
-    const V = @TypeOf(col.values[0]);
+    const V = std.meta.Elem(@TypeOf(col.values));
     forEachWordRow(sel, comp.len, struct {
         fn f(c: anytype, word: u64, r: usize) void {
             var keep: u1 = @truncate(word >> @intCast(r % 64));
@@ -2058,7 +2073,7 @@ fn narrowSumsLanes(
     sel: *const Sel,
     shared: ?[]const u64,
 ) !if (counted) []u64 else void {
-    const V = @TypeOf(col.values[0]);
+    const V = std.meta.Elem(@TypeOf(col.values));
     const part = try ra.alloc(i128, delta.len * sum_lanes);
     @memset(part, 0);
     const cnt = if (counted) try ra.alloc(u64, delta.len * sum_lanes) else {};
@@ -2089,6 +2104,7 @@ fn narrowSumsLanes(
 
 /// Calls `f(ctx, word, r)` for every row `r < n` of a word of `sel` with any row active, `word` holding `r`'s bit.
 inline fn forEachWordRow(sel: *const Sel, n: usize, comptime f: anytype, ctx: anytype) void {
+    std.debug.assert(sel.mask.len * 64 >= n);
     for (sel.mask, 0..) |word, w| {
         if (word == 0) continue;
         const base = w * 64;

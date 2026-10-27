@@ -194,7 +194,7 @@ fn fit38(v: i192) expr_eval.Error!i128 {
     return @intCast(v);
 }
 
-pub const NUM_PARTS: usize = 16;
+pub const NUM_PARTS: usize = 64;
 
 /// A value's partition, from the middle of its hash: each partition's map takes its fingerprint from the top bits and
 /// its slot from the low ones, and fixing either inside a partition would make its probes collide more.
@@ -207,6 +207,58 @@ pub const InlineU64 = struct { len: u8, vals: [INLINE_CAP]u64 };
 pub const InlineI128 = struct { len: u8, vals: [INLINE_CAP]i128 };
 pub const InlineBytes = struct { len: u8, vals: [INLINE_CAP][]const u8 };
 
+/// Hashes travel with owned string keys, so partition routing, table growth and merge do not rescan bytes.
+const DistinctBytes = struct {
+    const Key = struct { bytes: []const u8, hash: u64 };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            return key.hash;
+        }
+        pub fn eql(_: @This(), a: Key, b: Key) bool {
+            return a.hash == b.hash and keyEql(a.bytes, b.bytes);
+        }
+    };
+    const Map = std.HashMapUnmanaged(Key, void, Context, std.hash_map.default_max_load_percentage);
+    map: Map = .empty,
+    pub const empty: DistinctBytes = .{};
+    pub fn count(s: DistinctBytes) u32 {
+        return s.map.count();
+    }
+    pub fn deinit(s: *DistinctBytes, a: std.mem.Allocator) void {
+        s.map.deinit(a);
+    }
+    pub fn ensureTotalCapacity(s: *DistinctBytes, a: std.mem.Allocator, n: u32) !void {
+        try s.map.ensureTotalCapacity(a, n);
+    }
+    pub fn ensureUnusedCapacity(s: *DistinctBytes, a: std.mem.Allocator, n: u32) !void {
+        try s.map.ensureUnusedCapacity(a, n);
+    }
+    pub fn putAssumeCapacity(s: *DistinctBytes, bytes: []const u8, _: void) void {
+        s.putHashed(bytes, std.hash.Wyhash.hash(0, bytes));
+    }
+    fn putHashed(s: *DistinctBytes, bytes: []const u8, hash: u64) void {
+        s.map.putAssumeCapacity(.{ .bytes = bytes, .hash = hash }, {});
+    }
+    const Result = struct { key_ptr: *[]const u8, found_existing: bool };
+    fn getHashed(s: *DistinctBytes, a: std.mem.Allocator, bytes: []const u8, hash: u64) !Result {
+        const got = try s.map.getOrPut(a, .{ .bytes = bytes, .hash = hash });
+        return .{ .key_ptr = &got.key_ptr.bytes, .found_existing = got.found_existing };
+    }
+    fn removeHashed(s: *DistinctBytes, bytes: []const u8, hash: u64) void {
+        _ = s.map.remove(.{ .bytes = bytes, .hash = hash });
+    }
+    const KeyIterator = struct {
+        inner: Map.KeyIterator,
+        pub fn next(it: *@This()) ?*[]const u8 {
+            const key = it.inner.next() orelse return null;
+            return &key.bytes;
+        }
+    };
+    pub fn keyIterator(s: *const DistinctBytes) KeyIterator {
+        return .{ .inner = s.map.keyIterator() };
+    }
+};
+
 pub const DistinctSet = struct {
     val_set: union(enum) {
         none,
@@ -216,7 +268,7 @@ pub const DistinctSet = struct {
         u64: std.AutoHashMapUnmanaged(u64, void),
         bitmap: U64Bitmap,
         i128: std.AutoHashMapUnmanaged(i128, void),
-        bytes: KeyHashMapUnmanaged(void),
+        bytes: DistinctBytes,
     } = .none,
     allocated_bytes: usize = 0,
     max_memory_bytes: usize = 0,
@@ -629,14 +681,14 @@ pub const DistinctSet = struct {
     }
 
     pub fn insertBytes(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8) !void {
-        if (self.parts) |parts| {
-            const h = std.hash.Wyhash.hash(0, v);
-            const p = partOf(h);
-            return parts[p].insertBytes(allocator, v);
-        }
+        return self.insertBytesHashed(allocator, v, std.hash.Wyhash.hash(0, v));
+    }
+
+    fn insertBytesHashed(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8, h: u64) !void {
+        if (self.parts) |parts| return parts[partOf(h)].insertBytesHashed(allocator, v, h);
         switch (self.val_set) {
             .none => {
-                const entry_size = 32 + v.len;
+                const entry_size = 48 + v.len;
                 try self.drawMore(entry_size);
                 const str_alloc = try self.getOrCreateArena(allocator);
                 const owned = try str_alloc.dupe(u8, v);
@@ -649,7 +701,7 @@ pub const DistinctSet = struct {
                 for (s.vals[0..s.len]) |existing| {
                     if (keyEql(existing, v)) return;
                 }
-                const entry_size = 32 + v.len;
+                const entry_size = 48 + v.len;
                 try self.drawMore(entry_size);
                 const str_alloc = try self.getOrCreateArena(allocator);
                 const owned = try str_alloc.dupe(u8, v);
@@ -659,27 +711,27 @@ pub const DistinctSet = struct {
                     self.allocated_bytes += entry_size;
                     return;
                 }
-                var map: KeyHashMapUnmanaged(void) = .empty;
+                var map: DistinctBytes = .empty;
                 try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
                 for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
-                map.putAssumeCapacity(owned, {});
+                map.putHashed(owned, h);
                 self.allocated_bytes += entry_size;
                 self.val_set = .{ .bytes = map };
             },
             .bytes => |*s| {
-                const gop = try s.getOrPut(allocator, v);
+                const gop = try s.getHashed(allocator, v, h);
                 if (gop.found_existing) return;
-                const entry_size = 32 + v.len;
+                const entry_size = 48 + v.len;
                 self.drawMore(entry_size) catch |err| {
-                    _ = s.remove(v);
+                    s.removeHashed(v, h);
                     return err;
                 };
                 const str_alloc = self.getOrCreateArena(allocator) catch |err| {
-                    _ = s.remove(v);
+                    s.removeHashed(v, h);
                     return err;
                 };
                 const owned = str_alloc.dupe(u8, v) catch |err| {
-                    _ = s.remove(v);
+                    s.removeHashed(v, h);
                     return err;
                 };
                 gop.key_ptr.* = owned;
@@ -771,8 +823,8 @@ pub const DistinctSet = struct {
                         while (it.next()) |k| try self.insertI128(allocator, k.*);
                     },
                     .bytes => |s| {
-                        var it = s.keyIterator();
-                        while (it.next()) |k| try self.insertBytes(allocator, k.*);
+                        var it = s.map.keyIterator();
+                        while (it.next()) |k| try self.insertBytesHashed(allocator, k.bytes, k.hash);
                     },
                 }
                 return;
@@ -808,8 +860,8 @@ pub const DistinctSet = struct {
                 while (it.next()) |k| try self.insertI128(allocator, k.*);
             },
             .bytes => |s| {
-                var it = s.keyIterator();
-                while (it.next()) |k| try self.insertBytes(allocator, k.*);
+                var it = s.map.keyIterator();
+                while (it.next()) |k| try self.insertBytesHashed(allocator, k.bytes, k.hash);
             },
         }
     }
@@ -7970,4 +8022,28 @@ test "grouped string winner replacement funds both live copies before allocating
         try testing.expectEqualStrings(old, (if (is_min) state.min_bytes else state.max_bytes).?);
         try testing.expect(ledger.peak.load(.monotonic) <= ledger.limit);
     }
+}
+
+fn cachedDistinctTrial(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var left: DistinctSet = .{};
+    defer left.deinit(a);
+    var right: DistinctSet = .{};
+    defer right.deinit(a);
+    for (0..4096) |i| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "long-shared-prefix-{d:0>10}-suffix", .{i % 1001});
+        try left.insertBytes(a, text);
+        if (i % 2 == 0) try right.insertBytes(a, text);
+    }
+    try left.insertBytes(a, "");
+    try right.merge(&left, a);
+    try testing.expectEqual(@as(usize, 1002), right.count());
+    var it = right.val_set.bytes.map.keyIterator();
+    while (it.next()) |key| try testing.expectEqual(std.hash.Wyhash.hash(0, key.bytes), key.hash);
+}
+
+test "cached string DISTINCT grows and merges exact bytes through allocation refusals" {
+    try cachedDistinctTrial(testing.allocator);
+    try testing.checkAllAllocationFailures(testing.allocator, cachedDistinctTrial, .{});
 }

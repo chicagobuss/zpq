@@ -6664,6 +6664,7 @@ fn inlinePairAnswer(
     const di = distinct orelse return null;
     const keys = keys_opt orelse &.{};
     const outputs = outputs_opt orelse &.{};
+    if (args.distinct_pairs == .auto and keys.len == 0) return null;
     // Single-key owners use a checked raw certificate, so dictionary fallback pages cannot force a replay.
     // String identities keep the existing sets/sketch choice; forced owners still exercise retained dictionaries.
     const automatic_single = args.distinct_pairs == .auto and keys.len == 1;
@@ -25801,4 +25802,52 @@ test "raw DISTINCT batch owners preserve NULLs and replay speculative footer ran
             };
         }
     }
+}
+
+test "scalar long string DISTINCT keeps NULL empty and windowed answers across the cached partition fanout" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: [2048][]const u8 = undefined;
+    var defs: [2048]u32 = undefined;
+    const long = try a.alloc(u8, 70001);
+    @memset(long, 'x');
+    for (&text, &defs, 0..) |*t, *d, i| {
+        t.* = switch (i % 33) {
+            0 => "",
+            1 => long,
+            else => try std.fmt.allocPrint(a, "key-{d}", .{i % 33}),
+        };
+        d.* = @intFromBool(i % 17 != 0);
+    }
+    const columns = [_]expr_agg.OutputCol{.{
+        .name = "k",
+        .col = .{ .string = .{ .values = &text, .def_levels = &defs, .max_def = 1 } },
+        .parquet_type = .BYTE_ARRAY,
+        .nullable = true,
+    }};
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, text.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const groups = try a.alloc(schema.RowGroup, 16);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    for ([_]bool{ false, true }) |encoded| for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+        const args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "long-distinct", .bytes = sink.buffer.items }},
+            .metas = &.{meta},
+            .aggregate = "count(DISTINCT k) AS d",
+            .max_memory = 256 << 20,
+            .parallelism = j,
+            .min_bytes_per_worker = 1,
+            .encoded = encoded,
+            .decode_batch_rows = window,
+        };
+        try testing.expect((try explainAggregate(gpa, a, args)).record_path == null);
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expectEqual(@as(i128, 33), got.output.aggs[0].value.i);
+    };
 }

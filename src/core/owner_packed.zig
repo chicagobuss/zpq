@@ -16,16 +16,34 @@ pub fn Owner(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime O
 /// DISTINCT pairs specialize the identity policy and partition hash, retaining this same producer/fold machinery.
 pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHash: anytype) type {
     const Scatter = records.Writer(L.Record, Ordinal);
+    // Equal row capacity also shrinks each reserved producer/partition tail; equal byte-size blocks would
+    // erase the payload saving at high partition counts before any input was decoded.
+    const Small = records.WriterRows(lanes.SharedRecord, Ordinal, Scatter.block_rows);
+    const small_eligible = if (@hasDecl(L, "sharedEligible")) L.sharedEligible else false;
     const Cache = cache.Local(L.CachePolicy);
     const Fold = @import("owner_fold.zig").Table(L);
     return struct {
         pub const Record = L.Record;
         pub const Group = L.Group;
 
+        const SmallStorage = struct {
+            frontiers: []Small.Frontier = &.{},
+            blocks: []Small.Block = &.{},
+            cursor: std.atomic.Value(u32) = .init(0),
+
+            fn deinit(s: *@This(), a: std.mem.Allocator) void {
+                for (s.frontiers) |f| f.deinit(a);
+                a.free(s.frontiers);
+                a.free(s.blocks);
+                a.destroy(s);
+            }
+        };
+
         pub const Local = struct {
             state: *State,
             frontier: Scatter.Frontier = .{},
             hot: Cache = .{},
+            small: ?*Small.Frontier = null,
             accepted: usize = 0,
             seen: usize = 0,
             hits: usize = 0,
@@ -42,6 +60,53 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                 try L.validate(r);
                 if (L.ordinal(r) >= l.state.input_rows or r.weight > l.state.weight_rows -| l.accepted)
                     return error.BadPartial;
+                try l.appendOwned(r);
+                l.accepted += @intCast(r.weight);
+            }
+
+            /// False leaves the owner untouched for its existing row fallback. Errors invalidate this private
+            /// attempt, as an append/scatter failure already does; no partial window can publish an answer.
+            pub fn appendWindow(l: *Local, images: anytype, first: u64, off: usize, payload: anytype) !bool {
+                if (images.len == 0) return true;
+                if (first >= l.state.input_rows or images.len > l.state.input_rows - @as(usize, @intCast(first)) or
+                    images.len > l.state.weight_rows -| l.accepted) return error.BadPartial;
+                const window = (try payload.requiredWindow(off, images.len)) orelse return false;
+                switch (window) {
+                    inline else => |values, tag| {
+                        if (l.bypass)
+                            try l.appendWindowRows(true, tag, values, images, first)
+                        else
+                            try l.appendWindowRows(false, tag, values, images, first);
+                    },
+                }
+                l.accepted += images.len;
+                return true;
+            }
+
+            inline fn appendWindowRows(
+                l: *Local,
+                comptime direct: bool,
+                comptime tag: anytype,
+                values: anytype,
+                images: anytype,
+                first: u64,
+            ) !void {
+                for (images, 0..) |key, i| {
+                    // The window proved the entire ordinal span, code range and all-present payload before mutation.
+                    const r = checked: {
+                        @setRuntimeSafety(false);
+                        const value = switch (tag) {
+                            .count_only => 0,
+                            .plain => values[i],
+                            .coded => values.dict[values.codes[i]],
+                        };
+                        break :checked L.requiredRecord(key, @intCast(first + i), value);
+                    };
+                    if (direct) try emit(l, r) else try l.appendOwned(r);
+                }
+            }
+
+            inline fn appendOwned(l: *Local, r: Record) !void {
                 if (!l.bypass and l.hot.entries.len != 0) {
                     const trial = l.seen < l.state.trial_rows;
                     if (trial) l.seen += 1;
@@ -57,11 +122,15 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                         l.bypass = true;
                     }
                 } else try emit(l, r);
-                l.accepted += @intCast(r.weight);
             }
 
             inline fn emit(l: *Local, r: Record) !void {
                 const p: usize = @intCast(partitionHash(r) >> l.state.shift);
+                if (small_eligible) if (l.small) |frontier| if (r.weight == 1) {
+                    const s = l.state.small.?;
+                    try Small.append(frontier, s.blocks, &s.cursor, p, try L.compressSingleton(r));
+                    return;
+                };
                 try Scatter.append(&l.frontier, l.state.blocks, &l.state.cursor, p, r);
             }
         };
@@ -80,6 +149,7 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
             blocks: []Scatter.Block = &.{},
             entries: []Record = &.{},
             cursor: std.atomic.Value(u32) = .init(0),
+            small: ?*SmallStorage = null,
             const TaskStorage = struct {
                 state: *State,
                 cursor: *std.atomic.Value(usize),
@@ -90,7 +160,18 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
             /// Identity, decoded columns and retained answers are quoted by their owners. Records are funded before
             /// decode; the finish draws its exact concurrently live histogram bound before allocating any table.
             pub fn charge(record_rows: usize, workers: usize, parts: usize) usize {
-                return Scatter.blockCount(record_rows, workers, parts) *| @sizeOf(Scatter.Block) +|
+                return chargeStorage(record_rows, workers, parts, false);
+            }
+
+            pub fn chargeStorage(record_rows: usize, workers: usize, parts: usize, compact: bool) usize {
+                if (compact and !small_eligible) return std.math.maxInt(usize);
+                const extra = if (compact) Small.blockCount(record_rows, workers, parts) *| @sizeOf(Small.Block) +|
+                    Small.frontierBytes(workers, parts) +| workers *| @sizeOf(Small.Frontier) +|
+                    @sizeOf(SmallStorage) else 0;
+                // In compact mode every wide record owns >=2 disjoint original rows. Singles use the other list;
+                // retaining weighted lanes verbatim avoids inventing a shared v for different SUM/MIN/MAX values.
+                const wide_rows = if (compact) record_rows / 2 else record_rows;
+                return extra +| Scatter.blockCount(wide_rows, workers, parts) *| @sizeOf(Scatter.Block) +|
                     Scatter.frontierBytes(workers, parts) +|
                     workers *| cache.capacity(@sizeOf(Record)) *| @sizeOf(Record) +|
                     workers *| (stack_size +| @sizeOf(Local) +| @sizeOf(TaskStorage)) +| @sizeOf(State);
@@ -107,6 +188,18 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                 return initWeighted(a, ledger, input_rows, record_rows, record_rows, workers, parts);
             }
 
+            pub fn initStorage(
+                a: std.mem.Allocator,
+                ledger: *memory.SharedBudget,
+                input_rows: usize,
+                record_rows: usize,
+                workers: usize,
+                parts: usize,
+                compact: bool,
+            ) !?*State {
+                return initWeightedStorage(a, ledger, input_rows, record_rows, record_rows, workers, parts, compact);
+            }
+
             /// A completed pair emits one physical COUNT contribution but can carry many duplicate rows for
             /// count(*). The caller proves the contribution bound separately from its total weight/ordinal bound.
             pub fn initWeighted(
@@ -118,13 +211,29 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                 workers: usize,
                 parts: usize,
             ) !?*State {
+                return initWeightedStorage(a, ledger, input_rows, weight_rows, record_rows, workers, parts, false);
+            }
+
+            fn initWeightedStorage(
+                a: std.mem.Allocator,
+                ledger: *memory.SharedBudget,
+                input_rows: usize,
+                weight_rows: usize,
+                record_rows: usize,
+                workers: usize,
+                parts: usize,
+                compact: bool,
+            ) !?*State {
                 if (workers == 0 or workers > 64 or parts < 2 or parts > 16384 or
                     !std.math.isPowerOfTwo(parts) or record_rows > weight_rows or weight_rows > input_rows) return null;
+                if (compact and (!small_eligible or record_rows != weight_rows)) return null;
                 if (!L.admitsRows(input_rows)) return null;
-                const blocks = Scatter.blockCount(record_rows, workers, parts);
+                const blocks = Scatter.blockCount(if (compact) record_rows / 2 else record_rows, workers, parts);
                 if (blocks >= std.math.maxInt(u32) - workers * 128 or record_rows > std.math.maxInt(Ordinal))
                     return null;
-                const quote = charge(record_rows, workers, parts);
+                const small_blocks = if (compact) Small.blockCount(record_rows, workers, parts) else 0;
+                if (small_blocks >= std.math.maxInt(u32) - workers * 128) return null;
+                const quote = chargeStorage(record_rows, workers, parts, compact);
                 if (quote == std.math.maxInt(usize)) return null;
                 _ = ledger.drawExact(quote) orelse return null;
                 const s = a.create(State) catch |e| {
@@ -153,11 +262,24 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                     l.hot.entries = s.entries[i * slots ..][0..slots];
                     l.frontier = try Scatter.Frontier.init(a, parts);
                 }
+                if (compact) {
+                    const extra = try a.create(SmallStorage);
+                    extra.* = .{};
+                    s.small = extra;
+                    extra.frontiers = try a.alloc(Small.Frontier, workers);
+                    @memset(extra.frontiers, .{});
+                    for (extra.frontiers, s.locals) |*f, *l| {
+                        f.* = try Small.Frontier.init(a, parts);
+                        l.small = f;
+                    }
+                    extra.blocks = try a.alloc(Small.Block, small_blocks);
+                }
                 s.blocks = try a.alloc(Scatter.Block, blocks);
                 return s;
             }
 
             pub fn deinit(s: *State) void {
+                if (s.small) |extra| extra.deinit(s.gpa);
                 for (s.locals) |l| l.frontier.deinit(s.gpa);
                 s.gpa.free(s.locals);
                 s.gpa.free(s.entries);
@@ -180,6 +302,9 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                     var physical: usize = 0;
                     for (s.locals) |l| {
                         for (l.frontier.histogram) |n| physical += n;
+                        if (l.small) |f| for (f.histogram) |n| {
+                            physical += n;
+                        };
                     }
                     // A weighted reduction may reserve from speculative footer bounds (for example DISTINCT
                     // NULL-presence rows). Underestimation is a private-attempt budget refusal, not a malformed
@@ -225,6 +350,17 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                                 for (b.rows[0..b.len]) |r| try table.append(a, r);
                                 id = b.next;
                             }
+                            if (small_eligible) if (l.small) |f| {
+                                const extra = t.state.small.?;
+                                id = f.heads[p];
+                                while (id != records.none) {
+                                    const b = &extra.blocks[id];
+                                    if (b.next != records.none)
+                                        @prefetch(&extra.blocks[b.next], .{ .rw = .read, .locality = 1 });
+                                    for (b.rows[0..b.len]) |r| try table.append(a, try L.expandSingleton(r));
+                                    id = b.next;
+                                }
+                            };
                         }
                         try receive(t.receiver, p, table.items());
                     }
@@ -242,6 +378,9 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
             fn partitionRows(s: *const State, p: usize) usize {
                 var n: usize = 0;
                 for (s.locals) |l| n += @intCast(l.frontier.histogram[p]);
+                if (s.small) |extra| for (extra.frontiers) |f| {
+                    n += @intCast(f.histogram[p]);
+                };
                 return n;
             }
         };
@@ -356,4 +495,270 @@ test "wide payload cache retains a useful trial below the bare COUNT hit thresho
     try std.testing.expectEqual(n / 4, local.hits);
     try std.testing.expect(local.hits < local.hot.entries.len);
     try std.testing.expect(!local.bypass);
+}
+
+test "owner window append keeps row records, cache trials and exact wide results for plain and coded payloads" {
+    const a = std.testing.allocator;
+    const ast = @import("expr/ast.zig");
+    const Call = @import("expr/agg.zig").AggCall;
+    const Program = @import("agg_plan.zig").OwnerProgram;
+    const Lane = lanes.Lane;
+    const kinds = &.{ Lane.sum, Lane.min, Lane.max, Lane.present_count };
+    const L = lanes.Layout(u64, kinds, u32);
+    const O = Owner(u64, kinds, u32);
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]Call{
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .min, .alias = "lo", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .max, .alias = "hi", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .count, .alias = "n", .result = .i64, .arg = arg, .where = null },
+    };
+    const program = Program.init(&calls).?;
+    const count = 4096;
+    var keys: [count]u64 = undefined;
+    var values: [count]i64 = undefined;
+    var codes: [count]u32 = undefined;
+    const dict = [_]i64{ std.math.minInt(i64), 11, std.math.maxInt(i64) };
+    var levels: [count]u32 = @splat(1);
+    for (0..count) |i| {
+        keys[i] = std.math.maxInt(u64) - i % 17;
+        codes[i] = @intCast(i % dict.len);
+        values[i] = dict[codes[i]];
+    }
+    const Receiver = struct {
+        groups: [17]?O.Group = @splat(null),
+        fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+            for (groups) |g| {
+                const id: usize = @intCast(std.math.maxInt(u64) - g.key);
+                try std.testing.expect(r.groups[id] == null);
+                r.groups[id] = g;
+            }
+        }
+    };
+    for ([_]usize{ 1, 4 }) |workers| for ([_]bool{ false, true }) |coded| {
+        for ([_]bool{ false, true }) |direct| {
+            var budget: memory.SharedBudget = .{ .limit = 128 << 20 };
+            {
+                const old = (try O.State.init(a, &budget, 1000 + count, count, workers, 64)).?;
+                defer old.deinit();
+                const bulk = (try O.State.init(a, &budget, 1000 + count, count, workers, 64)).?;
+                defer bulk.deinit();
+                for (old.locals, bulk.locals) |*x, *y| {
+                    x.bypass = direct;
+                    y.bypass = direct;
+                }
+                const batch: @import("filter/eval.zig").Batch = .{ .num_rows = count, .cols = &.{.{ .i64 = .{
+                    .values = if (coded) &.{} else &values,
+                    .codes = if (coded) &codes else null,
+                    .dict = if (coded) &dict else &.{},
+                    .def_levels = &levels,
+                    .max_def = 1,
+                } }} };
+                const payload = try L.bind(program, &batch, &.{0});
+                var off: usize = 0;
+                while (off < count) {
+                    const n = @min(count - off, ([_]usize{ 17, 1, 64, 3 })[off % 4]);
+                    const wi = off / 64 % workers;
+                    for (off..off + n) |i| try old.locals[wi].append(try payload.record(keys[i], i, 1000 + i));
+                    try std.testing.expect(try bulk.locals[wi].appendWindow(
+                        keys[off..][0..n],
+                        1000 + off,
+                        off,
+                        &payload,
+                    ));
+                    off += n;
+                }
+                for (old.locals, bulk.locals) |x, y| {
+                    try std.testing.expectEqual(x.accepted, y.accepted);
+                    try std.testing.expectEqual(x.bypass, y.bypass);
+                    try std.testing.expectEqual(x.seen, y.seen);
+                    try std.testing.expectEqual(x.hits, y.hits);
+                }
+                const x = try a.alloc(Receiver, workers);
+                defer a.free(x);
+                const y = try a.alloc(Receiver, workers);
+                defer a.free(y);
+                @memset(x, .{});
+                @memset(y, .{});
+                try old.finish(x, Receiver.receive);
+                try bulk.finish(y, Receiver.receive);
+                for (0..17) |key| {
+                    var want: ?O.Group = null;
+                    var got: ?O.Group = null;
+                    for (x) |r| if (r.groups[key]) |g| {
+                        want = g;
+                    };
+                    for (y) |r| if (r.groups[key]) |g| {
+                        got = g;
+                    };
+                    try std.testing.expect(want != null and got != null);
+                    try std.testing.expectEqualDeep(want, got);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        }
+    };
+}
+
+test "owner window validates entire code, ordinal and weight spans before mutating and declines NULL poison" {
+    const a = std.testing.allocator;
+    const ast = @import("expr/ast.zig");
+    const L = lanes.Layout(u64, &.{.sum}, u32);
+    const O = Owner(u64, &.{.sum}, u32);
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]@import("expr/agg.zig").AggCall{
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = arg, .where = null },
+    };
+    const p = @import("agg_plan.zig").OwnerProgram.init(&calls).?;
+    var levels = [_]u32{ 1, 1, 1 };
+    const cols = [_]@import("filter/eval.zig").Batch.Column{.{ .i64 = .{
+        .values = &.{},
+        .codes = &.{ 0, 0, 999 },
+        .dict = &.{7},
+        .def_levels = &levels,
+        .max_def = 1,
+    } }};
+    const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 3, .cols = &cols };
+    const payload = try L.bind(p, &batch, &.{0});
+    var ledger: memory.SharedBudget = .{ .limit = 32 << 20 };
+    {
+        const s = (try O.State.init(a, &ledger, 3, 3, 1, 64)).?;
+        defer s.deinit();
+        const keys = [_]u64{ 9, 9, 9 };
+        try std.testing.expectError(error.BadPartial, s.locals[0].appendWindow(&keys, 1, 0, &payload));
+        try std.testing.expectError(error.BadColumn, s.locals[0].appendWindow(&keys, 0, 0, &payload));
+        try std.testing.expectEqual(@as(usize, 0), s.locals[0].accepted);
+        try std.testing.expectEqual(@as(u32, 0), s.cursor.load(.monotonic));
+        levels[2] = 0;
+        try std.testing.expect(!try s.locals[0].appendWindow(&keys, 0, 0, &payload));
+        try std.testing.expectEqual(@as(usize, 0), s.locals[0].accepted);
+        for (keys, 0..) |key, i| try s.locals[0].append(try payload.record(key, i, i));
+        try std.testing.expectEqual(@as(usize, 3), s.locals[0].accepted);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "owner window count-only program needs no values and retains contiguous first ordinals" {
+    const a = std.testing.allocator;
+    const L = lanes.Layout(u64, &.{}, u32);
+    const O = Owner(u64, &.{}, u32);
+    var ledger: memory.SharedBudget = .{ .limit = 32 << 20 };
+    {
+        const s = (try O.State.init(a, &ledger, 68, 4, 1, 64)).?;
+        defer s.deinit();
+        const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 4, .cols = &.{} };
+        const p: @import("agg_plan.zig").OwnerProgram = .{};
+        const payload = try L.bind(p, &batch, &.{});
+        const keys = [_]u64{ 1, 2, 1, 2 };
+        try std.testing.expect(try s.locals[0].appendWindow(&keys, 64, 0, &payload));
+        const Receiver = struct {
+            rows: usize = 0,
+            fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+                for (groups) |g| {
+                    try std.testing.expectEqual(@as(u32, 2), g.weight);
+                    try std.testing.expectEqual(@as(u32, @intCast(63 + g.key)), g.first);
+                    r.rows += g.weight;
+                }
+            }
+        };
+        var receiver = [_]Receiver{.{}};
+        try s.finish(&receiver, Receiver.receive);
+        try std.testing.expectEqual(@as(usize, 4), receiver[0].rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+fn mixedStorageTrial(a: std.mem.Allocator, workers: usize, direct: bool) !void {
+    const O = Owner(u64, &.{ .sum, .min, .max, .present_count }, u32);
+    const count = 4096;
+    const Receiver = struct {
+        groups: [34]?O.Group = @splat(null),
+        fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+            for (groups) |g| {
+                const id: usize = if (g.key == 0) 33 else @intCast(std.math.maxInt(u64) - g.key);
+                try std.testing.expect(r.groups[id] == null);
+                r.groups[id] = g;
+            }
+        }
+    };
+    var ledger: memory.SharedBudget = .{ .limit = 128 << 20 };
+    defer std.debug.assert(ledger.used.load(.monotonic) == 0);
+    const old = (try O.State.init(a, &ledger, count + 64, count, workers, 64)).?;
+    defer old.deinit();
+    const mixed = (try O.State.initStorage(a, &ledger, count + 64, count, workers, 64, true)).?;
+    defer mixed.deinit();
+    for (0..count) |i| {
+        const id = if (i < count - 17) i % 17 else 17 + i - (count - 17);
+        const wi = i / 31 % workers;
+        if (i % 31 == 0) {
+            old.locals[wi].start();
+            mixed.locals[wi].start();
+            old.locals[wi].bypass = direct;
+            mixed.locals[wi].bypass = direct;
+        }
+        const absent = id == 0 or id == 17;
+        const value = ([_]i64{ std.math.minInt(i64), 11, std.math.maxInt(i64) })[i % 3];
+        const r: O.Record = .{
+            .key = if (id == 33) 0 else std.math.maxInt(u64) - id,
+            .ordinal = @intCast(64 + count - 1 - i),
+            .weight = 1,
+            .values = if (absent) .{ 0, 0, 0, 0 } else .{ value, value, value, 1 },
+            .argument_nulls = if (absent) 15 else 0,
+        };
+        try old.locals[wi].append(r);
+        try mixed.locals[wi].append(r);
+    }
+    const x = try a.alloc(Receiver, workers);
+    defer a.free(x);
+    const y = try a.alloc(Receiver, workers);
+    defer a.free(y);
+    @memset(x, .{});
+    @memset(y, .{});
+    try old.finish(x, Receiver.receive);
+    try mixed.finish(y, Receiver.receive);
+    var wide_rows: usize = 0;
+    var small_rows: usize = 0;
+    for (mixed.locals) |l| for (l.frontier.histogram) |n| {
+        wide_rows += n;
+    };
+    for (mixed.small.?.frontiers) |f| for (f.histogram) |n| {
+        small_rows += n;
+    };
+    try std.testing.expect(small_rows != 0);
+    if (direct) try std.testing.expectEqual(@as(usize, 0), wide_rows) else try std.testing.expect(wide_rows != 0);
+    try std.testing.expect(small_rows + 2 * wide_rows <= count);
+    for (0..34) |id| {
+        var want: ?O.Group = null;
+        var got: ?O.Group = null;
+        for (x) |r| if (r.groups[id]) |g| {
+            want = g;
+        };
+        for (y) |r| if (r.groups[id]) |g| {
+            got = g;
+        };
+        try std.testing.expect(want != null and got != null);
+        try std.testing.expectEqualDeep(want, got);
+    }
+}
+
+test "owner shared storage mixes singles and exact weighted lanes at every worker count and allocation failure" {
+    for ([_]usize{ 1, 3, 16 }) |workers| for ([_]bool{ false, true }) |direct| {
+        try mixedStorageTrial(std.testing.allocator, workers, direct);
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, mixedStorageTrial, .{ 1, false });
+}
+
+test "owner shared storage recovers partial startup and returns an occupied ledger on setup refusal" {
+    defer spawn.resetFailure();
+    for (0..4) |n| {
+        spawn.injectFailureAfter(n);
+        try mixedStorageTrial(std.testing.allocator, 4, false);
+    }
+    spawn.resetFailure();
+    const O = Owner(u64, &.{ .sum, .min, .max, .present_count }, u32);
+    var ledger: memory.SharedBudget = .{ .limit = 128 << 20 };
+    const occupied = ledger.drawExact(ledger.limit - 1).?;
+    try std.testing.expect((try O.State.initStorage(std.testing.allocator, &ledger, 4096, 4096, 1, 64, true)) == null);
+    try std.testing.expectEqual(occupied, ledger.used.load(.monotonic));
+    ledger.release(occupied);
 }

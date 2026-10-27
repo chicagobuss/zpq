@@ -4,6 +4,9 @@ const eval = @import("filter/eval.zig");
 
 pub const Lane = enum { sum, min, max, present_count };
 
+/// A single original value, with its shared-argument NULL tag in the proved spare ordinal bit.
+pub const SharedRecord = extern struct { key: u64, ordinal: u32, weight: u32 = 1, value: i64 };
+
 const Wide = extern struct { value: i128 align(8) = 0 };
 
 /// The full key remains authoritative. This multiply-fold is shared by cache, scatter and owner probe.
@@ -35,6 +38,7 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
     const Values = @Tuple(&value_types);
     return struct {
         const Self = @This();
+        pub const sharedEligible = Bits == u64 and Ordinal == u32 and n != 0;
         pub const Record = if (n == 0) extern struct {
             key: Bits align(8),
             ordinal: Ordinal,
@@ -52,6 +56,45 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
             unsigned32: [n]bool,
             reuse: [n]u8 = @splat(255),
             rows: usize,
+
+            pub const RequiredWindow = union(enum) {
+                count_only,
+                plain: []const i64,
+                coded: struct { codes: []const u32, dict: []const i64 },
+            };
+
+            /// No mutation has happened when this declines. A nullable schema can still prove a window all-present;
+            /// a NULL or mixed source keeps the row kernel, which never reads NULL/rejected dictionary poison.
+            pub fn requiredWindow(b: *const Bound, off: usize, len: usize) !?RequiredWindow {
+                if (off > b.rows or len > b.rows - off) return error.BadColumn;
+                if (n == 0) return .count_only;
+                const end = off + len;
+                inline for (kinds, 0..) |kind, i| {
+                    if (b.reuse[i] == 255) {
+                        const ni = b.columns[i].nullInfo();
+                        if (ni.max_rep != 0) return null;
+                        if (ni.def_levels) |dl| {
+                            if (dl.len < end) return error.BadColumn;
+                            var least = ni.max_def;
+                            for (dl[off..end]) |d| least = @min(least, d);
+                            if (least < ni.max_def) return null;
+                        }
+                    }
+                    if (kind != .present_count and i != 0 and b.reuse[i] != 0) return null;
+                }
+                if (kinds[0] == .present_count) return .count_only;
+                if (b.columns[0] != .i64) return null;
+                const c = b.columns[0].i64;
+                if (c.codes) |codes| {
+                    if (codes.len < end) return error.BadColumn;
+                    var highest: u32 = 0;
+                    for (codes[off..end]) |code| highest = @max(highest, code);
+                    if (len != 0 and highest >= c.dict.len) return error.BadColumn;
+                    return .{ .coded = .{ .codes = codes[off..end], .dict = c.dict } };
+                }
+                if (c.values.len < end) return error.BadColumn;
+                return .{ .plain = c.values[off..end] };
+            }
 
             pub inline fn record(b: *const Bound, key: Bits, row: usize, input_ordinal: u64) !Record {
                 if (row >= b.rows) return error.BadColumn;
@@ -74,6 +117,49 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
             }
         };
 
+        /// Only requiredWindow's all-present proof and the owner's ordinal-span proof may call this constructor.
+        pub inline fn requiredRecord(key: Bits, pos: Ordinal, value: i64) Record {
+            var r: Record = .{ .key = key, .ordinal = pos, .weight = 1 };
+            if (n != 0) inline for (kinds, 0..) |kind, i| {
+                r.values[i] = if (kind == .present_count) 1 else value;
+            };
+            return r;
+        }
+
+        pub fn compressSingleton(r: Record) error{BadPartial}!SharedRecord {
+            if (!sharedEligible) return error.BadPartial;
+            try validate(r);
+            if (r.weight != 1 or r.ordinal >= @as(u32, 1) << 31 or
+                (r.argument_nulls != 0 and r.argument_nulls != mask)) return error.BadPartial;
+            const absent = r.argument_nulls != 0;
+            var value: i64 = 0;
+            if (!absent) {
+                inline for (kinds, 0..) |kind, i| if (kind != .present_count) {
+                    value = r.values[i];
+                    break;
+                };
+                inline for (kinds, 0..) |kind, i| {
+                    if (r.values[i] != (if (kind == .present_count) @as(i64, 1) else value))
+                        return error.BadPartial;
+                }
+            }
+            return .{
+                .key = r.key,
+                .ordinal = r.ordinal | (@as(u32, @intFromBool(absent)) << 31),
+                .value = value,
+            };
+        }
+
+        pub fn expandSingleton(r: SharedRecord) error{BadPartial}!Record {
+            if (!sharedEligible or r.weight != 1) return error.BadPartial;
+            var wide = requiredRecord(r.key, r.ordinal & 0x7fff_ffff, r.value);
+            if (r.ordinal >> 31 != 0) {
+                wide.argument_nulls = mask;
+                @memset(&wide.values, 0);
+            }
+            return wide;
+        }
+
         /// Borrow payloads once per callback. COUNT(col) needs only definition levels, including an empty values
         /// view; value-lane bounds and dictionary poison are checked only for selected non-NULL arguments.
         pub fn bind(program: anytype, view: *const eval.Batch, lookup: []const ?usize) !Bound {
@@ -94,14 +180,14 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
                 b.columns[i] = col;
                 b.unsigned32[i] = col_ref.unsigned_32;
                 // SUM/MIN/MAX over the same source read one original row value. Coalescing happens afterwards.
-                if (kind != .present_count) inline for (0..i) |j| {
+                inline for (0..i) |j| {
                     if (kinds[j] != .present_count and program.args[j].col.col_idx == col_ref.col_idx and
                         program.args[j].col.unsigned_32 == col_ref.unsigned_32)
                     {
                         b.reuse[i] = @intCast(j);
                         break;
                     }
-                };
+                }
             }
             return b;
         }
@@ -294,6 +380,35 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
 }
 
 const testing = std.testing;
+
+test "owner shared singleton is 24 bytes and keeps NULL, full keys, extrema and spare ordinal proof" {
+    const L = Layout(u64, &.{ .sum, .min, .max, .present_count }, u32);
+    try testing.expectEqual(@as(usize, 24), @sizeOf(SharedRecord));
+    for ([_]u64{ 0, std.math.maxInt(u64) }) |key| {
+        for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |value| {
+            const r = L.requiredRecord(key, (1 << 31) - 1, value);
+            try testing.expectEqualDeep(r, try L.expandSingleton(try L.compressSingleton(r)));
+            var absent = r;
+            absent.argument_nulls = 15;
+            @memset(&absent.values, 0);
+            try testing.expectEqualDeep(absent, try L.expandSingleton(try L.compressSingleton(absent)));
+        }
+    }
+    var bad = L.requiredRecord(7, 0, 4);
+    bad.values[1] = -4;
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    bad = L.requiredRecord(7, 0, 4);
+    bad.argument_nulls = 1;
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    bad = L.requiredRecord(7, 1 << 31, 4);
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    bad = L.requiredRecord(7, 0, 4);
+    bad.weight = 2;
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    var small: SharedRecord = .{ .key = 7, .ordinal = 0, .value = 4 };
+    small.weight = 2;
+    try testing.expectError(error.BadPartial, L.expandSingleton(small));
+}
 
 test "owner lanes retain the compact COUNT record and omit unused group lanes" {
     const C = Layout(u64, &.{}, u32);

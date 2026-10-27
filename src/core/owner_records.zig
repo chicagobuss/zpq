@@ -4,8 +4,13 @@ pub const none = std.math.maxInt(u32);
 const claim_blocks = 128;
 
 pub fn Writer(comptime Record: type, comptime Count: type) type {
+    return WriterRows(Record, Count, if (@sizeOf(Record) == 32) 16 else (512 - 8) / @sizeOf(Record));
+}
+
+pub fn WriterRows(comptime Record: type, comptime Count: type, comptime capacity: usize) type {
+    std.debug.assert(capacity > 0);
     return struct {
-        pub const block_rows = if (@sizeOf(Record) == 32) 16 else (512 - 8) / @sizeOf(Record);
+        pub const block_rows = capacity;
         pub const Block = extern struct { next: u32 = none, len: u32 = 0, rows: [block_rows]Record };
 
         pub const Frontier = struct {

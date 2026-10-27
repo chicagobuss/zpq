@@ -306,7 +306,7 @@ fn compressZstd(arena: std.mem.Allocator, src: []const u8, plan: ZstdPlan) Error
         } else arena.free(l3);
         if (plan.counts) |c| _ = c.rechecked.fetchAdd(1, .monotonic);
     }
-    if (plan.counts) |c| _ = c.pages[@intFromEnum(mode)].fetchAdd(1, .monotonic);
+    if (plan.counts) |c| _ = c.pages[@backingInt(mode)].fetchAdd(1, .monotonic);
     return out;
 }
 
@@ -348,7 +348,7 @@ fn chooseZstdMode(arena: std.mem.Allocator, cctx: *c_zstd.ZSTD_CCtx, src: []cons
     for (std.meta.tags(ZstdMode)) |m| {
         const out: f64 = @floatFromInt(try zstdWith(cctx, m, scratch, &sample));
         const estimate = n * out / @as(f64, @floatFromInt(sample.len));
-        const cost = mode_price[@intFromEnum(m)] * n + lambda * estimate;
+        const cost = mode_price[@backingInt(m)] * n + lambda * estimate;
         if (cost < best_cost) {
             best_cost = cost;
             best = .{ .mode = m, .estimate = estimate };
@@ -1086,9 +1086,22 @@ test "the byte entropy bound: none for one value, eight bits for every value onc
 extern fn ZPQ_huf4x_select(mode: c_int) c_int;
 extern fn ZPQ_huf4x_check(iters: c_ulong, seed: c_ulonglong, checked: *c_ulong) c_long;
 
+/// Whether the dispatcher must pick the AVX-512 encoder here, read apart from it: Zig's own CPUID and XGETBV reading
+/// of the host (a fleet bundle targets a baseline CPU, so `builtin.cpu` is not it), less ZPQ_ZSTD_SCALAR. The guards
+/// below check the dispatcher against it, so their skip means the encoder cannot run here, never that it was declined.
+/// The verdict accepts the skip only on a host its receipt records as lacking the features (tools/check/receipt.zig).
+fn huf4xExpected() !bool {
+    const host = try std.zig.system.resolveTargetQuery(testing.io, .{});
+    const forced = if (std.c.getenv("ZPQ_ZSTD_SCALAR")) |e| std.mem.span(e) else "";
+    if (forced.len != 0 and !std.mem.eql(u8, forced, "0")) return false;
+    const needs = .{ .avx512f, .avx512bw, .avx512vl, .avx512vbmi, .avx512vbmi2 };
+    return host.cpu.arch == .x86_64 and std.Target.x86.featureSetHasAll(host.cpu.features, needs);
+}
+
 test "the AVX-512 Huffman encoder writes zstd's bytes for every literal distribution" {
     var checked: c_ulong = 0;
     const mismatches = ZPQ_huf4x_check(3000, 0x5eed, &checked);
+    try testing.expectEqual(try huf4xExpected(), mismatches >= 0);
     if (mismatches < 0) return error.SkipZigTest; // no AVX-512 VBMI2 here, or ZPQ_ZSTD_SCALAR set
     try testing.expect(checked > 3000);
     try testing.expectEqual(@as(c_long, 0), mismatches);
@@ -1096,6 +1109,7 @@ test "the AVX-512 Huffman encoder writes zstd's bytes for every literal distribu
 
 test "zstd frames are the same bytes with the AVX-512 Huffman encoder and without" {
     defer _ = ZPQ_huf4x_select(0);
+    try testing.expectEqual(try huf4xExpected(), ZPQ_huf4x_select(0) != 0);
     if (ZPQ_huf4x_select(0) == 0) return error.SkipZigTest; // no AVX-512 VBMI2 here, or ZPQ_ZSTD_SCALAR set
     var prng = std.Random.DefaultPrng.init(0x4f4e);
     const r = prng.random();
@@ -1182,7 +1196,7 @@ test "GZIP pages: libdeflate and the stdlib inflate every block kind, level and 
     const r = prng.random();
     const flate = std.compress.flate.Compress.Options;
     const forms = [_]GzipForm{
-        .stored,                    .huffman,
+        .stored,                     .huffman,
         .{ .level = flate.level_1 }, .{ .level = flate.level_2 },
         .{ .level = flate.level_3 }, .{ .level = flate.level_4 },
         .{ .level = flate.level_5 }, .{ .level = flate.level_6 },

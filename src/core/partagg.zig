@@ -44,6 +44,8 @@ pub const Run = struct {
     first: std.ArrayList(u64) = .empty,
     accs: std.ArrayList(expr_agg.Accumulator) = .empty,
     compact: @import("expr/agg_state.zig").State = .{},
+    strings: ?*expr_agg.KeyArena = null,
+    owner: ?*PartAgg = null,
     /// Bytes drawn from the shared budget for the capacities above.
     charged: usize = 0,
 
@@ -74,7 +76,18 @@ pub const Run = struct {
 
     fn held(self: *const Run) usize {
         return self.keys.capacity + self.ends.capacity * @sizeOf(u32) + self.first.capacity * @sizeOf(u64) +
-            self.accs.capacity * @sizeOf(expr_agg.Accumulator) + self.compact.held();
+            self.accs.capacity * @sizeOf(expr_agg.Accumulator) + self.compact.held() +
+            if (self.strings) |strings| strings.held() + @sizeOf(expr_agg.KeyArena) else 0;
+    }
+
+    fn reserveStrings(ctx: *anyopaque, n: usize) expr_agg.Error!void {
+        const run: *Run = @ptrCast(@alignCast(ctx));
+        run.charged += try run.owner.?.takeCredit(n);
+    }
+
+    fn settleStrings(ctx: *anyopaque) void {
+        const run: *Run = @ptrCast(@alignCast(ctx));
+        run.owner.?.settle(run);
     }
 
     fn free(self: *Run, gpa: std.mem.Allocator, budget: *expr_agg.SharedBudget) void {
@@ -84,6 +97,10 @@ pub const Run = struct {
         self.first.deinit(gpa);
         self.accs.deinit(gpa);
         self.compact.words.deinit(gpa);
+        if (self.strings) |strings| {
+            strings.deinit(gpa);
+            gpa.destroy(strings);
+        }
         budget.release(self.charged);
         self.* = .{};
     }
@@ -382,7 +399,7 @@ pub const PartAgg = struct {
             const dst = run.readGroup(at, len, &dst_scratch);
             var scratch: [16]expr_agg.Accumulator = undefined;
             const src = table.readGroup(g, len, &scratch);
-            for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
+            for (dst, src) |*d, *s| try expr_agg.mergePersistent(d, s, self.gpa, self.merge);
             run.writeGroup(at, dst);
         }
         self.reset(table, retain);
@@ -440,7 +457,7 @@ pub const PartAgg = struct {
             var src_scratch: [16]expr_agg.Accumulator = undefined;
             const dst = part.table.readGroup(id, len, &dst_scratch);
             const src = local.readGroup(gi, len, &src_scratch);
-            for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
+            for (dst, src) |*d, *s| try expr_agg.mergePersistent(d, s, self.gpa, self.merge);
             part.table.writeGroup(id, dst);
         }
     }
@@ -454,6 +471,15 @@ pub const PartAgg = struct {
         // A skewed partition can reach the offset limit before the whole query's ledger is full.
         const end = if (self.stride == 0) try Run.keyEnd(run.keys.items.len, key.len) else 0;
         const len = self.calls.len;
+        if (run.strings == null) for (self.calls) |call| {
+            if (call.result != .bytes or (call.func != .min and call.func != .max)) continue;
+            run.charged += try self.takeCredit(@sizeOf(expr_agg.KeyArena));
+            const strings = try self.gpa.create(expr_agg.KeyArena);
+            run.owner = self;
+            strings.* = .{ .allocator = self.gpa, .owner = run, .reserveFn = Run.reserveStrings, .settleFn = Run.settleStrings };
+            run.strings = strings;
+            break;
+        };
         if (self.compact and run.compact.stride == 0) run.compact.configure(self.calls);
         if (run.first.items.len == run.first.capacity or run.keys.items.len + key.len > run.keys.capacity or
             (if (run.compact.stride != 0)
@@ -474,7 +500,8 @@ pub const PartAgg = struct {
             const accs_cap = if (run.compact.stride != 0) 0 else @max(run.accs.capacity, want * len);
             const compact_cap = @max(run.compact.words.capacity, first_cap * run.compact.stride);
             const target = keys_cap + ends_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) +
-                accs_cap * @sizeOf(expr_agg.Accumulator) + compact_cap * @sizeOf(u64);
+                accs_cap * @sizeOf(expr_agg.Accumulator) + compact_cap * @sizeOf(u64) +
+                if (run.strings) |strings| strings.held() + @sizeOf(expr_agg.KeyArena) else 0;
             if (target > run.charged) {
                 run.charged += try self.takeCredit(target - run.charged);
             }
@@ -499,7 +526,12 @@ pub const PartAgg = struct {
         if (run.compact.stride != 0) {
             run.compact.append();
         } else {
-            for (self.calls) |call| run.accs.appendAssumeCapacity(expr_agg.Accumulator.init(call));
+            for (self.calls) |call| run.accs.appendAssumeCapacity(if (call.result == .bytes and call.func == .min)
+                .{ .min_arena = .{ .store = run.strings.? } }
+            else if (call.result == .bytes and call.func == .max)
+                .{ .max_arena = .{ .store = run.strings.? } }
+            else
+                expr_agg.Accumulator.init(call));
         }
         return at;
     }
@@ -557,7 +589,7 @@ pub const PartAgg = struct {
                 const dst = table.readGroup(id, len, &scratch);
                 var src_scratch: [16]expr_agg.Accumulator = undefined;
                 const src = run.readGroup(i, len, &src_scratch);
-                for (dst, src) |*d, *s| try self.merge(d, s, self.gpa);
+                for (dst, src) |*d, *s| try expr_agg.mergePersistent(d, s, self.gpa, self.merge);
                 table.writeGroup(id, dst);
             }
             run.free(self.gpa, self.budget);
@@ -566,8 +598,8 @@ pub const PartAgg = struct {
 
     fn reset(self: *PartAgg, table: *expr_agg.GroupTable, retain: bool) void {
         // Keep capacity only for useful local reductions; abandoned and final tables return their charge.
-        if (retain and table.fixed_stride != 0) {
-            table.clearFixedRetainingCapacity();
+        if (retain) {
+            table.clearRetainingCapacity();
             return;
         }
         const gpa = table.allocator;

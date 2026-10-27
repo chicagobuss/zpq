@@ -374,6 +374,22 @@ pub const AggOutputItem = struct {
 /// The aggregate answer, owned in the `gpa` passed to `runMultiAggregate`; `deinit` frees all of it, including a
 /// partly built one. Without GROUP BY, `aggs` holds one value per aggregate; with it, `group_rows` holds one row per
 /// group, its values in `group_cols` order.
+const BorrowedSpan = struct {
+    lo: usize,
+    hi: usize,
+
+    fn contains(spans: []const BorrowedSpan, value: []const u8) bool {
+        const at = @intFromPtr(value.ptr);
+        var lo: usize = 0;
+        var hi = spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (spans[mid].lo <= at) lo = mid + 1 else hi = mid;
+        }
+        return lo > 0 and at < spans[lo - 1].hi and value.len <= spans[lo - 1].hi - at;
+    }
+};
+
 pub const AggOutput = struct {
     aggs: []AggOutputItem = &.{},
     group_cols: ?[]const []const u8 = null,
@@ -388,6 +404,8 @@ pub const AggOutput = struct {
     typed: ?TypedAnswer = null,
     integer_stream: ?IntegerStream = null,
     byte_stream: ?ByteStream = null,
+    string_arenas: []*expr_agg.KeyArena = &.{},
+    borrowed_strings: []BorrowedSpan = &.{},
 
     pub fn rowCount(self: AggOutput) usize {
         if (self.group_rows) |rows| return rows.len;
@@ -400,7 +418,7 @@ pub const AggOutput = struct {
     pub fn deinit(self: *AggOutput, gpa: std.mem.Allocator) void {
         for (self.aggs) |item| {
             gpa.free(item.alias);
-            freeValue(gpa, item.value);
+            self.freeValue(gpa, item.value);
         }
         gpa.free(self.aggs);
         if (self.group_rows) |rows| {
@@ -415,12 +433,18 @@ pub const AggOutput = struct {
             for (cols) |c| gpa.free(c);
             gpa.free(cols);
         }
+        for (self.string_arenas) |strings| {
+            strings.deinit(gpa);
+            gpa.destroy(strings);
+        }
+        gpa.free(self.string_arenas);
+        gpa.free(self.borrowed_strings);
         self.* = .{};
     }
 
     /// Free what row `row` owns: its values' strings, and the row itself unless it lies in `slab`.
     pub fn releaseRow(self: *const AggOutput, gpa: std.mem.Allocator, row: []const AggValue) void {
-        for (row) |v| freeValue(gpa, v);
+        for (row) |v| self.freeValue(gpa, v);
         self.releaseRowSlice(gpa, row);
     }
 
@@ -463,11 +487,68 @@ pub const AggOutput = struct {
         self.group_rows = views;
     }
 
-    fn freeValue(gpa: std.mem.Allocator, v: AggValue) void {
+    fn freeValue(self: *const AggOutput, gpa: std.mem.Allocator, v: AggValue) void {
         switch (v) {
-            .s => |s| gpa.free(s),
+            .s => |s| if (!BorrowedSpan.contains(self.borrowed_strings, s)) gpa.free(s),
             else => {},
         }
+    }
+
+    fn takeTableArenas(
+        self: *AggOutput,
+        gpa: std.mem.Allocator,
+        tables: []const *expr_agg.GroupTable,
+        budget: *core_memory.SharedBudget,
+    ) !usize {
+        var n: usize = 0;
+        var blocks: usize = 0;
+        for (tables) |t| if (t.strings) |strings| {
+            n += 1;
+            blocks += strings.blocks.items.len;
+        };
+        if (n == 0) return 0;
+        const metadata_bytes = n * @sizeOf(*expr_agg.KeyArena) + blocks * @sizeOf(BorrowedSpan);
+        _ = budget.drawExact(metadata_bytes) orelse return error.ExceededMemoryBudget;
+        errdefer budget.release(metadata_bytes);
+        const arenas = try gpa.alloc(*expr_agg.KeyArena, n);
+        errdefer gpa.free(arenas);
+        const spans = try gpa.alloc(BorrowedSpan, blocks);
+        var at: usize = 0;
+        var si: usize = 0;
+        var credit = metadata_bytes;
+        for (tables) |t| if (t.strings) |strings| {
+            arenas[at] = strings;
+            at += 1;
+            for (strings.blocks.items) |b| {
+                spans[si] = .{ .lo = @intFromPtr(b.bytes.ptr), .hi = @intFromPtr(b.bytes.ptr) + b.bytes.len };
+                si += 1;
+            }
+            const held = strings.held() + @sizeOf(expr_agg.KeyArena);
+            // Transfer the live allocation's credit rather than drawing for a duplicate string copy. Final
+            // partition tables normally use this ledger; a private child first stops protecting its old floor.
+            if (t.shared) |source| {
+                if (source != budget) {
+                    source.releaseFloor();
+                    source.release(held);
+                    _ = budget.drawExact(held) orelse unreachable; // Joined scan; source just returned these bytes.
+                }
+                t.max_memory_bytes -= held;
+                credit += held;
+            }
+            t.allocated_bytes -= held;
+            t.strings = null;
+            strings.owner = null;
+            strings.reserveFn = null;
+            strings.settleFn = null;
+        };
+        std.mem.sortUnstable(BorrowedSpan, spans, {}, struct {
+            fn less(_: void, a: BorrowedSpan, b: BorrowedSpan) bool {
+                return a.lo < b.lo;
+            }
+        }.less);
+        self.string_arenas = arenas;
+        self.borrowed_strings = spans;
+        return credit;
     }
 
     /// Sort, then cut, the GROUP BY rows per `order`. Stable, so ties keep first-appearance order and the answer is
@@ -1475,7 +1556,7 @@ const BlockMerge = struct {
                 const id = try self.merged.getOrInsert(src.keyAt(g), self.calls, src.first.items[g]);
                 const dst = self.merged.accumulators.items[@as(usize, id) * len ..][0..len];
                 for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| {
-                    try mergeOwnedAccumulator(d, sa, self.gpa);
+                    try expr_agg.mergePersistent(d, sa, self.gpa, mergeOwnedAccumulator);
                 }
             }
             src.deinit();
@@ -5412,7 +5493,7 @@ fn prepareAggregateWithMetas(
 
         // Owned by `output` from allocation on, every slot valid at every step, so its `deinit` frees a partly built
         // answer: unbuilt values NULL. One slab holds every row's cells (`AggOutput.slab`), not an allocation a row.
-        const row_src: RowSource = .{
+        var row_src: RowSource = .{
             .slots = slots.items,
             .outputs = outputs,
             .calls = agg_calls,
@@ -5426,6 +5507,14 @@ fn prepareAggregateWithMetas(
             .dense = dense_direct,
             .identity = if (dense_identity) |*identity| identity else null,
         };
+        if (dense_direct == null) {
+            const source_tables = try arena.alloc(*expr_agg.GroupTable, if (spilled) part_state.?.parts.len else out_tables.len);
+            if (spilled) {
+                for (part_state.?.parts, source_tables) |*p, *dest| dest.* = &p.table;
+            } else for (out_tables, source_tables) |*gt, *dest| dest.* = gt;
+            answer_charge += try output.takeTableArenas(gpa, source_tables, group_budget);
+            row_src.borrowed_strings = output.borrowed_strings;
+        }
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
             order.hidden.len == 0;
         const typed = args.typed_answer and as_is;
@@ -5433,9 +5522,9 @@ fn prepareAggregateWithMetas(
         // stays drawn while the query holds it (the engine's ledger outlives it). Refused, it is the merge's refusal:
         // on one worker the tables it reads are one.
         if (args.ledger != null) {
-            const bytes = answerBytesParallel(slots.items, col_types, key_types, typed, n_workers) +|
+            const bytes = answerBytesParallel(slots.items, col_types, if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
                 row_src.denseStringBytes();
-            answer_charge = group_budget.drawExact(bytes) orelse {
+            answer_charge += group_budget.drawExact(bytes) orelse {
                 if (args.taken) |taken| taken.insert(.merge_memory);
                 return error.ExceededMemoryBudget;
             };
@@ -5463,9 +5552,8 @@ fn prepareAggregateWithMetas(
         output.group_cols = cols;
         for (outputs, cols) |out, *col| col.* = try gpa.dupe(u8, out.name);
 
-        // Result rows own any strings they need; table keys and accumulator
-        // winners can now be released before returning (the deferred deinit
-        // then finds them empty).
+        // Result strings either own their copy or borrow the arenas now held by output. The table
+        // payload/storage can be released before returning; the deferred deinit then finds it empty.
         if (!leave_tables) {
             finishGroupRanges(out_tables, null, null, n_workers, true);
             for (out_tables) |*gt| {
@@ -8480,6 +8568,7 @@ const RowSource = struct {
     dense: ?*const agg_dense.Lanes = null,
     owner: ?OwnerRows = null,
     identity: ?*const key_pack.Plan = null,
+    borrowed_strings: []const BorrowedSpan = &.{},
 
     fn denseStringBytes(s: *const RowSource) usize {
         const domain = if (s.dense) |d| d.domain else if (s.owner != null)
@@ -8519,7 +8608,7 @@ const RowSource = struct {
     }
 
     fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn) !AggValue {
-        const e = out.derived orelse return deserializeKeyColumn(gpa, bytes, out.source.key, s.key_types);
+        const e = out.derived orelse return deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, s.borrowed_strings.len != 0);
         const Reader = struct {
             src: *const RowSource,
             gpa: std.mem.Allocator,
@@ -8648,6 +8737,8 @@ const RowSource = struct {
             .key => try s.outputKey(gpa, slot, out),
             .agg => |a_idx| blk: {
                 const acc = if (compact) table.?.readAcc(group, a_idx, s.calls.len) else accs[a_idx];
+                if (s.borrowed_strings.len != 0 and (acc == .min_arena or acc == .max_arena))
+                    break :blk if (acc.stringValue()) |bytes| .{ .s = bytes } else .null_val;
                 break :blk try materializeOne(gpa, s.calls[a_idx], if (s.in_place.len > 0)
                     try foldedAcc(gpa, s.calls[a_idx], acc)
                 else
@@ -8749,10 +8840,11 @@ fn answerBytesParallel(
 /// A GROUP BY answer as typed columns, one per output column in `group_cols` order, built straight from the merged
 /// groups for a Parquet write, so no row of `AggValue`s (112 bytes a value) is ever held. Values are made by the same
 /// functions the rows are (`RowSource`) and narrowed by the rules the row writer applies, so the file and the error a
-/// query stops with are the same either way. Strings are owned, a present one each.
+/// query stops with are the same either way. String slices may borrow the arenas retained by AggOutput.
 pub const TypedAnswer = struct {
     rows: usize,
     columns: []TypedColumn,
+    borrowed_strings: []const BorrowedSpan = &.{},
 
     pub fn Lane(comptime T: type) type {
         return struct {
@@ -8779,7 +8871,8 @@ pub const TypedAnswer = struct {
             .f64 => |l| freeLane(gpa, f64, l),
             .dec => |l| freeLane(gpa, i128, l),
             .string => |l| {
-                for (l.values, l.defs) |v, d| if (d == 1) gpa.free(v);
+                for (l.values, l.defs) |v, d| if (d == 1 and
+                    !BorrowedSpan.contains(self.borrowed_strings, v)) gpa.free(v);
                 freeLane(gpa, []const u8, l);
             },
             .avg => |a| {
@@ -8984,6 +9077,7 @@ fn buildGroupColumns(
     n_workers: usize,
 ) !void {
     try TypedAnswer.init(gpa, types, src.slots.len, out, n_workers);
+    out.borrowed_strings = src.borrowed_strings;
     const n = src.slots.len;
     if (n == 0) return;
     const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, n, row_block) catch unreachable));
@@ -9052,7 +9146,7 @@ const ColumnBuildTask = struct {
                 // Every value built passes to its column, whatever happens to the rest of the row.
                 for (t.answer.columns, t.types, t.vals, 0..) |*col, ty, v, ci| {
                     TypedAnswer.put(col, ty, i, v) catch |e| {
-                        if (v == .s) t.gpa.free(v.s);
+                        if (v == .s and !BorrowedSpan.contains(t.src.borrowed_strings, v.s)) t.gpa.free(v.s);
                         if (t.narrow_err == null or ci < t.narrow_col or (ci == t.narrow_col and i < t.narrow_row)) {
                             t.narrow_err = e;
                             t.narrow_col = ci;
@@ -9087,7 +9181,7 @@ const ColumnBuildTask = struct {
             .key => {
                 const v = try s.outputKey(t.gpa, slot, out);
                 TypedAnswer.put(col, ty, i, v) catch |e| {
-                    if (v == .s) t.gpa.free(v.s);
+                    if (v == .s and !BorrowedSpan.contains(t.src.borrowed_strings, v.s)) t.gpa.free(v.s);
                     t.narrowing(e, ci, i);
                 };
             },
@@ -9560,7 +9654,7 @@ fn foldsToItself(acc: expr_agg.Accumulator) bool {
         .distinct => false,
         .sum_f => |x| if (x) |v| plainFloat(v) else true,
         .avg => |a| plainFloat(a.sum),
-        .sum_i, .min_i, .min_f, .max_i, .max_f, .min_bytes, .max_bytes, .sum_d, .avg_d, .min_d, .max_d => true,
+        .sum_i, .min_i, .min_f, .max_i, .max_f, .min_bytes, .max_bytes, .min_arena, .max_arena, .sum_d, .avg_d, .min_d, .max_d => true,
     };
 }
 
@@ -11035,6 +11129,8 @@ fn mergeOwnedAccumulator(
     switch (src.*) {
         .min_bytes => src.* = .{ .min_bytes = null },
         .max_bytes => src.* = .{ .max_bytes = null },
+        .min_arena => src.min_arena.ref = null,
+        .max_arena => src.max_arena.ref = null,
         else => {},
     }
 }
@@ -11531,6 +11627,16 @@ pub fn deserializeKeyColumn(
     target_idx: usize,
     key_types: []const KeyType,
 ) !AggValue {
+    return deserializeKeyColumnMode(allocator, key_bytes, target_idx, key_types, false);
+}
+
+fn deserializeKeyColumnMode(
+    allocator: std.mem.Allocator,
+    key_bytes: []const u8,
+    target_idx: usize,
+    key_types: []const KeyType,
+    borrow: bool,
+) !AggValue {
     var cursor: usize = 0;
     var current_idx: usize = 0;
     while (current_idx <= target_idx) : (current_idx += 1) {
@@ -11570,6 +11676,7 @@ pub fn deserializeKeyColumn(
                 cursor += 4;
                 if (cursor + len > key_bytes.len) return error.BadGroupKey;
                 if (current_idx == target_idx) {
+                    if (borrow) return .{ .s = key_bytes[cursor .. cursor + len] };
                     const buf = try allocator.alloc(u8, len);
                     @memcpy(buf, key_bytes[cursor .. cursor + len]);
                     return .{ .s = buf };
@@ -11606,14 +11713,14 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         .min => switch (call.result) {
             .i64 => if (state.min_i) |v| .{ .i = v } else .null_val,
             .f64 => if (state.min_f) |v| .{ .f = v } else .null_val,
-            .bytes => if (state.min_bytes) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
+            .bytes => if (state.stringValue()) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
             .dec => decValue(state.min_d, expr_agg.resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
         .max => switch (call.result) {
             .i64 => if (state.max_i) |v| .{ .i = v } else .null_val,
             .f64 => if (state.max_f) |v| .{ .f = v } else .null_val,
-            .bytes => if (state.max_bytes) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
+            .bytes => if (state.stringValue()) |b| .{ .s = try gpa.dupe(u8, b) } else .null_val,
             .dec => decValue(state.max_d, expr_agg.resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
@@ -15208,10 +15315,10 @@ test "parallel hash merge matches one thread, including a failed spawn" {
     defer b.deinit();
     try fillCountTables(&a, &b, &calls, n);
     const tables = [_]expr_agg.GroupTable{ a, b };
-    const refs = try testing.allocator.alloc(MergeGroupRef, a.keys.items.len + b.keys.items.len);
+    const refs = try testing.allocator.alloc(MergeGroupRef, a.refs.items.len + b.refs.items.len);
     defer testing.allocator.free(refs);
-    for (a.keys.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
-    for (b.keys.items, 0..) |_, i| refs[a.keys.items.len + i] = .{ .table = 1, .group = @intCast(i) };
+    for (a.refs.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
+    for (b.refs.items, 0..) |_, i| refs[a.refs.items.len + i] = .{ .table = 1, .group = @intCast(i) };
 
     var serial_slots: std.ArrayList(MergedSlot) = .empty;
     defer serial_slots.deinit(testing.allocator);
@@ -15261,10 +15368,10 @@ test "a merge drawn from the query's ledger gives all of it back, and past it is
     defer b.deinit();
     try fillCountTables(&a, &b, &calls, n);
     const tables = [_]expr_agg.GroupTable{ a, b };
-    const refs = try testing.allocator.alloc(MergeGroupRef, a.keys.items.len + b.keys.items.len);
+    const refs = try testing.allocator.alloc(MergeGroupRef, a.refs.items.len + b.refs.items.len);
     defer testing.allocator.free(refs);
-    for (a.keys.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
-    for (b.keys.items, 0..) |_, i| refs[a.keys.items.len + i] = .{ .table = 1, .group = @intCast(i) };
+    for (a.refs.items, 0..) |_, i| refs[i] = .{ .table = 0, .group = @intCast(i) };
+    for (b.refs.items, 0..) |_, i| refs[a.refs.items.len + i] = .{ .table = 1, .group = @intCast(i) };
     for ([_]usize{ 1, 8 }) |workers| for ([_]bool{ false, true }) |in_place| {
         var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
         var charged: core_memory.Charged = .{ .child = testing.allocator, .budget = &budget };
@@ -25178,4 +25285,99 @@ test "R11 partition COUNT cut builds only limit plus offset when no partition re
         try got.output.applyResultOrder(gpa, order);
         try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
     }
+}
+
+test "STRGROUP grouped strings survive local partition and typed output ownership" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 768;
+    var keys: [n][]const u8 = undefined;
+    var vals: [n][]const u8 = undefined;
+    var kd: [n]u32 = undefined;
+    var vd: [n]u32 = undefined;
+    const long = try a.alloc(u8, 70001);
+    @memset(long, 'q');
+    for (&keys, &vals, &kd, &vd, 0..) |*k, *v, *dk, *dv, i| {
+        k.* = switch (i % 193) {
+            0 => "",
+            1 => long,
+            else => try std.fmt.allocPrint(a, "key-{d}", .{i % 193}),
+        };
+        v.* = try std.fmt.allocPrint(a, "value-{d:0>4}", .{n - i});
+        dk.* = @intFromBool(i % 31 != 0);
+        dv.* = @intFromBool(i % 17 != 0);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .string = .{ .values = &keys, .def_levels = &kd, .max_def = 1 } }, .parquet_type = .BYTE_ARRAY, .nullable = true },
+        .{ .name = "v", .col = .{ .string = .{ .values = &vals, .def_levels = &vd, .max_def = 1 } }, .parquet_type = .BYTE_ARRAY, .nullable = true },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, n, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= @intCast(rgs.len);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "STRGROUP", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c,min(k) AS lk,max(k) AS hk,min(v) AS lv,max(v) AS hv",
+        .group_by = "k",
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .scan_all = true,
+        .integer_records = false,
+        .byte_records = false,
+        .msd_records = false,
+        .dense = false,
+        .part_cap = 8,
+        .part_probe = 16,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    const rows = want.output.group_rows.?;
+    try testing.expectEqual(@as(usize, 194), rows.len);
+    for (rows) |row| {
+        var count: i64 = 0;
+        var lo: ?[]const u8 = null;
+        var hi: ?[]const u8 = null;
+        for (keys, vals, kd, vd) |k, v, dk, dv| {
+            const same = if (row[0] == .null_val) dk == 0 else dk == 1 and std.mem.eql(u8, row[0].s, k);
+            if (!same) continue;
+            count += 16;
+            if (dv == 0) continue;
+            if (lo == null or std.mem.order(u8, v, lo.?) == .lt) lo = v;
+            if (hi == null or std.mem.order(u8, v, hi.?) == .gt) hi = v;
+        }
+        try testing.expectEqual(count, row[1].i);
+        try testing.expectEqualDeep(row[0], row[2]);
+        try testing.expectEqualDeep(row[0], row[3]);
+        if (lo) |v| try testing.expectEqualStrings(v, row[4].s) else try testing.expect(row[4] == .null_val);
+        if (hi) |v| try testing.expectEqualStrings(v, row[5].s) else try testing.expect(row[5] == .null_val);
+    }
+    for ([_]bool{ false, true }) |parts| for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| for ([_]bool{ false, true }) |typed| {
+        args.partagg = parts;
+        args.parallelism = j;
+        args.decode_batch_rows = window;
+        args.typed_answer = typed;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(got.output.string_arenas.len > 0);
+        if (!typed) {
+            try testing.expectEqualDeep(rows, got.output.group_rows.?);
+        } else {
+            const out = got.output.typed.?;
+            try testing.expectEqual(rows.len, out.rows);
+            for (rows, 0..) |row, r| for (row, out.columns) |v, col| switch (col) {
+                .i64 => |lane| try testing.expectEqual(v.i, lane.values[r]),
+                .string => |lane| {
+                    try testing.expectEqual(@as(u32, @intFromBool(v != .null_val)), lane.defs[r]);
+                    if (v == .s) try testing.expectEqualStrings(v.s, lane.values[r]);
+                },
+                else => return error.TestUnexpectedResult,
+            };
+        }
+    };
 }

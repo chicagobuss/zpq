@@ -1075,6 +1075,8 @@ pub const Accumulator = union(enum) {
     /// `null` = no value seen yet.
     min_bytes: ?[]const u8,
     max_bytes: ?[]const u8,
+    min_arena: ArenaBytes,
+    max_arena: ArenaBytes,
     /// Avg always lands as f64. Internal sum is f64 even for int
     /// input — for huge int sums this loses precision past 2^53;
     /// document the caveat. DECIMAL avg is exact: `avg_d`.
@@ -1085,6 +1087,44 @@ pub const Accumulator = union(enum) {
     avg_d: DecSum,
     min_d: ?i128,
     max_d: ?i128,
+
+    pub const ArenaBytes = struct {
+        store: *KeyArena,
+        ref: ?u32 = null,
+        key: ?u32 = null,
+        skip: u8 = 0,
+
+        pub fn bytes(self: ArenaBytes) ?[]const u8 {
+            return if (self.ref) |ref| self.store.get(ref)[self.skip..] else null;
+        }
+
+        pub fn consider(self: *ArenaBytes, value: []const u8, is_min: bool) !void {
+            if (self.bytes()) |cur| {
+                const order = std.mem.order(u8, value, cur);
+                if (if (is_min) order != .lt else order != .gt) return;
+            }
+            if (self.key) |key| {
+                const framed = self.store.get(key);
+                if (framed.len == value.len + 5 and framed[0] == 1 and
+                    std.mem.readInt(u32, framed[1..5], .little) == value.len and keyEql(framed[5..], value))
+                {
+                    self.ref = key;
+                    self.skip = 5;
+                    return;
+                }
+            }
+            self.ref = try self.store.append(value);
+            self.skip = 0;
+        }
+    };
+
+    pub fn stringValue(self: Accumulator) ?[]const u8 {
+        return switch (self) {
+            .min_bytes, .max_bytes => |b| b,
+            .min_arena, .max_arena => |b| b.bytes(),
+            else => null,
+        };
+    }
 
     pub fn init(call: AggCall) Accumulator {
         return switch (call.func) {
@@ -1120,6 +1160,26 @@ pub const Accumulator = union(enum) {
     /// means "no values seen"; merging skips it.
     /// A count past i64 (footers whose bounded row counts add up past it across files) is `RowCountTooLarge`.
     pub fn merge(dst: *Accumulator, src: Accumulator, allocator: std.mem.Allocator) !void {
+        const strings: ?bool = switch (dst.*) {
+            .min_bytes, .min_arena => true,
+            .max_bytes, .max_arena => false,
+            else => null,
+        };
+        if (strings) |is_min| {
+            const sv = src.stringValue() orelse return;
+            const cur = dst.stringValue();
+            const wins = cur == null or (if (is_min)
+                std.mem.order(u8, sv, cur.?) == .lt
+            else
+                std.mem.order(u8, sv, cur.?) == .gt);
+            const loser = if (wins) dst.* else src;
+            switch (loser) {
+                .min_bytes, .max_bytes => |b| if (b) |owned| allocator.free(owned),
+                else => {},
+            }
+            if (wins) dst.* = src;
+            return;
+        }
         switch (dst.*) {
             .count => |*c| c.* = try addRowCount(c.*, src.count),
             .distinct => |*d| try d.mergeFrom(src.distinct, allocator),
@@ -1165,6 +1225,7 @@ pub const Accumulator = union(enum) {
                     }
                 }
             },
+            .min_arena, .max_arena => unreachable,
             .avg => |*a| {
                 a.sum += src.avg.sum;
                 a.isum += src.avg.isum;
@@ -1181,6 +1242,36 @@ pub const Accumulator = union(enum) {
         }
     }
 };
+
+/// A destination still being scanned must copy borrowed winners before its source arena can be reset.
+pub fn mergePersistent(
+    dst: *Accumulator,
+    src: *Accumulator,
+    allocator: std.mem.Allocator,
+    merge: anytype,
+) !void {
+    switch (dst.*) {
+        .min_arena, .max_arena => |*value| {
+            if (src.stringValue()) |bytes| try value.consider(bytes, dst.* == .min_arena);
+            switch (src.*) {
+                .min_bytes, .max_bytes => |b| if (b) |owned| allocator.free(owned),
+                else => {},
+            }
+            if (src.* == .min_arena) src.min_arena.ref = null;
+            if (src.* == .max_arena) src.max_arena.ref = null;
+            if (src.* == .min_bytes) src.min_bytes = null;
+            if (src.* == .max_bytes) src.max_bytes = null;
+        },
+        else => {
+            // Fixed-key destinations keep their established owned-string payload.
+            if (src.* == .min_arena or src.* == .max_arena) {
+                const bytes = if (src.stringValue()) |b| try allocator.dupe(u8, b) else null;
+                src.* = if (src.* == .min_arena) .{ .min_bytes = bytes } else .{ .max_bytes = bytes };
+            }
+            try merge(dst, src, allocator);
+        },
+    }
+}
 
 /// avg over a non-DECIMAL argument: integer values summed exactly in `isum`, float values in `sum`. An integer avg
 /// therefore never rounds before its one division, whatever order its partials merge in, so it needs no fixed merge
@@ -2620,14 +2711,14 @@ pub fn finalize(
         .min => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.min_i), true),
             .f64 => try emitOneF64(arena, call.alias, state.min_f),
-            .bytes => try emitOneString(arena, call.alias, state.min_bytes),
+            .bytes => try emitOneString(arena, call.alias, state.stringValue()),
             .dec => try emitOneDec(arena, call.alias, state.min_d, resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
         .max => switch (call.result) {
             .i64 => try emitOneI64(arena, call.alias, u64Bits(call, state.max_i), true),
             .f64 => try emitOneF64(arena, call.alias, state.max_f),
-            .bytes => try emitOneString(arena, call.alias, state.max_bytes),
+            .bytes => try emitOneString(arena, call.alias, state.stringValue()),
             .dec => try emitOneDec(arena, call.alias, state.max_d, resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
@@ -4768,16 +4859,143 @@ const CachedKeyCtx = struct {
     }
 };
 
+/// Stable 32-bit references into append-only 64 KiB chunks. Records never straddle separately allocated blocks.
+/// Reset reuses blocks; handing the arena to an answer preserves every borrowed key until that answer is dropped.
+pub const KeyArena = struct {
+    pub const chunk_size = 1 << 16;
+    const Block = struct { bytes: []u8, start: u32 };
+    blocks: std.ArrayList(Block) = .empty,
+    chunks: std.ArrayList([*]u8) = .empty,
+    block: usize = 0,
+    used: usize = 0,
+    /// A tiny query ceiling can bootstrap below one chunk without changing the logical 64 KiB offset geometry.
+    bootstrap: usize = chunk_size,
+    allocator: std.mem.Allocator = undefined,
+    owner: ?*anyopaque = null,
+    reserveFn: ?*const fn (*anyopaque, usize) Error!void = null,
+    settleFn: ?*const fn (*anyopaque) void = null,
+
+    pub fn append(self: *KeyArena, value: []const u8) !u32 {
+        if (self.reserveFn) |reserve| try reserve(self.owner.?, (try self.projected(value.len)) - self.held());
+        defer if (self.settleFn) |settle| settle(self.owner.?);
+        return self.put(self.allocator, value);
+    }
+
+    fn header(len: usize, out: *[5]u8) !usize {
+        var n = std.math.cast(u32, len) orelse return error.ExceededMemoryBudget;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            out[i] = @as(u8, @truncate(n)) & 0x7f;
+            n >>= 7;
+            if (n == 0) return i + 1;
+            out[i] |= 0x80;
+        }
+    }
+
+    const Place = struct { block: usize, used: usize, need: usize, capacity: usize };
+    fn place(self: *const KeyArena, len: usize) !Place {
+        var hdr: [5]u8 = undefined;
+        const need = len + try header(len, &hdr);
+        var b = self.block;
+        var at = self.used;
+        while (b < self.blocks.items.len) : (b += 1) {
+            const cap = self.blocks.items[b].bytes.len;
+            if (need <= chunk_size and at / chunk_size != (at + need - 1) / chunk_size)
+                at = std.mem.alignForward(usize, at, chunk_size);
+            if (at <= cap and need <= cap - at) return .{ .block = b, .used = at, .need = need, .capacity = 0 };
+            at = 0;
+        }
+        const cap = if (self.blocks.items.len == 0 and need <= self.bootstrap)
+            self.bootstrap
+        else
+            std.mem.alignForward(usize, need, chunk_size);
+        const logical = std.mem.alignForward(usize, cap, chunk_size);
+        if (@as(u64, self.chunks.items.len) * chunk_size + logical > @as(u64, 1) << 32)
+            return error.ExceededMemoryBudget;
+        return .{ .block = b, .used = 0, .need = need, .capacity = cap };
+    }
+
+    pub fn held(self: *const KeyArena) usize {
+        var bytes = self.blocks.capacity * @sizeOf(Block) + self.chunks.capacity * @sizeOf([*]u8);
+        for (self.blocks.items) |b| bytes += b.bytes.len;
+        return bytes;
+    }
+
+    pub fn projected(self: *const KeyArena, len: usize) !usize {
+        const p = try self.place(len);
+        if (p.capacity == 0) return self.held();
+        const blocks = self.blocks.items.len + 1;
+        const chunks = self.chunks.items.len + (p.capacity + chunk_size - 1) / chunk_size;
+        return self.held() + p.capacity +
+            (if (blocks > self.blocks.capacity)
+                (@max(blocks, self.blocks.capacity * 2) - self.blocks.capacity) * @sizeOf(Block)
+            else
+                0) +
+            (if (chunks > self.chunks.capacity)
+                (@max(chunks, self.chunks.capacity * 2) - self.chunks.capacity) * @sizeOf([*]u8)
+            else
+                0);
+    }
+
+    pub fn put(self: *KeyArena, a: std.mem.Allocator, value: []const u8) !u32 {
+        const p = try self.place(value.len);
+        if (p.capacity != 0) {
+            if (self.blocks.items.len == self.blocks.capacity)
+                try self.blocks.ensureTotalCapacityPrecise(a, @max(1, self.blocks.capacity * 2));
+            const nc = (p.capacity + chunk_size - 1) / chunk_size;
+            if (self.chunks.items.len + nc > self.chunks.capacity)
+                try self.chunks.ensureTotalCapacityPrecise(a, @max(self.chunks.items.len + nc, self.chunks.capacity * 2));
+            const bytes = try a.alloc(u8, p.capacity);
+            self.blocks.appendAssumeCapacity(.{ .bytes = bytes, .start = @intCast(self.chunks.items.len * chunk_size) });
+            for (0..nc) |i| self.chunks.appendAssumeCapacity(bytes.ptr + i * chunk_size);
+        }
+        const b = self.blocks.items[p.block];
+        var hdr: [5]u8 = undefined;
+        const hn = try header(value.len, &hdr);
+        @memcpy(b.bytes[p.used..][0..hn], hdr[0..hn]);
+        @memcpy(b.bytes[p.used + hn ..][0..value.len], value);
+        self.block = p.block;
+        self.used = p.used + p.need;
+        return @intCast(@as(usize, b.start) + p.used);
+    }
+
+    pub fn get(self: *const KeyArena, ref: u32) []const u8 {
+        const p = self.chunks.items[ref >> 16] + (ref & (chunk_size - 1));
+        var len: u32 = 0;
+        var shift: u5 = 0;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const b = p[i];
+            len |= @as(u32, b & 0x7f) << shift;
+            if (b < 0x80) return p[i + 1 ..][0..len];
+            shift += 7;
+        }
+    }
+
+    pub fn reset(self: *KeyArena) void {
+        self.block = 0;
+        self.used = 0;
+    }
+
+    pub fn deinit(self: *KeyArena, a: std.mem.Allocator) void {
+        for (self.blocks.items) |b| a.free(b.bytes);
+        self.blocks.deinit(a);
+        self.chunks.deinit(a);
+        self.* = .{};
+    }
+};
+
 pub const GroupTable = struct {
     compact: @import("agg_state.zig").State = .{},
     // 16-aligned: a private distinct acc stores this pointer with bit 3 set (`DistinctAcc.table_flag`).
     allocator: std.mem.Allocator align(16),
-    keys: std.ArrayList([]const u8),
+    refs: std.ArrayList(u32) = .empty,
+    strings: ?*KeyArena = null,
+    slots: []FixedSlot = &.{},
     /// Where each group first appeared, `first_position` of the row that created it (see `getOrInsert`): the ordered
     /// output lists groups in this order.
     first: std.ArrayList(u64) = .empty,
     accumulators: std.ArrayList(Accumulator),
-    map: KeyHashMap(u32),
     allocated_bytes: usize,
     max_memory_bytes: usize,
     shared: ?*SharedBudget = null,
@@ -4845,9 +5063,7 @@ pub const GroupTable = struct {
     pub fn init(allocator: std.mem.Allocator, max_memory_bytes: usize) GroupTable {
         return .{
             .allocator = allocator,
-            .keys = .empty,
             .accumulators = .empty,
-            .map = KeyHashMap(u32).init(allocator),
             .allocated_bytes = 0,
             .max_memory_bytes = max_memory_bytes,
         };
@@ -4862,7 +5078,6 @@ pub const GroupTable = struct {
     /// range has joined; callers then use deinitStorage, rather than walking all groups again on the main thread.
     pub fn deinitRange(self: *GroupTable, begin: usize, end: usize) void {
         std.debug.assert(begin <= end and end <= self.groupCount());
-        if (self.fixed_stride == 0) for (self.keys.items[begin..end]) |key| self.allocator.free(key);
         // An allocation failure may leave the last group only partly initialized. Partition the actual cell
         // slice, including that tail; an empty table's destructor must also release any cells it already owns.
         const groups = self.groupCount();
@@ -4881,11 +5096,15 @@ pub const GroupTable = struct {
 
     /// Requires that deinitRange has released every group exactly once.
     pub fn deinitStorage(self: *GroupTable) void {
-        self.keys.deinit(self.allocator);
+        self.refs.deinit(self.allocator);
+        if (self.strings) |strings| {
+            strings.deinit(self.allocator);
+            self.allocator.destroy(strings);
+        }
+        self.allocator.free(self.slots);
         self.first.deinit(self.allocator);
         self.accumulators.deinit(self.allocator);
         self.compact.words.deinit(self.allocator);
-        self.map.deinit();
         if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
         if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
         // A shared table starts at a zero ceiling, so all of `max_memory_bytes` came from the pool. Given back last:
@@ -4913,13 +5132,13 @@ pub const GroupTable = struct {
     }
 
     pub fn groupCount(self: *const GroupTable) usize {
-        return if (self.fixed_stride == 0) self.keys.items.len else self.fixed_len;
+        return if (self.fixed_stride == 0) self.refs.items.len else self.fixed_len;
     }
 
     /// Key bytes of group `g`. For a fixed-width table this is the inline image, stable until the next insert that
     /// grows `fixed_keys`.
     pub fn keyAt(self: *const GroupTable, g: usize) []const u8 {
-        if (self.fixed_stride == 0) return self.keys.items[g];
+        if (self.fixed_stride == 0) return self.strings.?.get(self.refs.items[g]);
         const s: usize = self.fixed_stride;
         return self.fixed_keys[g * s ..][0..s];
     }
@@ -4958,7 +5177,7 @@ pub const GroupTable = struct {
     }
 
     pub fn findKey(self: *const GroupTable, key: []const u8) ?u32 {
-        if (self.fixed_stride == 0) return self.map.get(key);
+        if (self.fixed_stride == 0) return self.probeVariable(key, std.hash.Wyhash.hash(0, key)).id;
         if (key.len == self.fixed_stride) return self.findFixed(key, hashFixed(key));
         var buf: [32]u8 = undefined;
         const image = expandFixed(self.fixed_stride, key, &buf) orelse return null;
@@ -4993,6 +5212,7 @@ pub const GroupTable = struct {
     /// The group of `key`, made if new. `pos` is where the row asking for it sits in the input (`firstPosition`); a
     /// group remembers the least it was asked from.
     pub fn getOrInsert(self: *GroupTable, key: []const u8, agg_calls: []const AggCall, pos: u64) !u32 {
+        if (self.strings) |strings| strings.owner = self;
         if (self.discoveryDone(pos)) return CountSketch.sinkId(0);
         if (self.fixed_stride != 0) {
             if (key.len == self.fixed_stride) return self.getOrInsertFixed(key, agg_calls, pos);
@@ -5001,66 +5221,107 @@ pub const GroupTable = struct {
             return self.getOrInsertFixed(image, agg_calls, pos);
         }
         if (self.sketch) |s| if (try s.route(s.keyHash(key), pos, key)) |id| return id;
-        const hashed: CachedKey = .{ .bytes = key, .hash = std.hash.Wyhash.hash(0, key) };
-        if (self.map.unmanaged.available == 0) if (self.map.getAdapted(hashed, CachedKeyCtx{})) |id| {
-            self.first.items[id] = @min(self.first.items[id], pos);
-            return id;
-        };
-
-        if (self.map.unmanaged.available == 0) {
-            try self.admit(self.variableEntrySize(key.len, agg_calls.len));
-            try self.map.ensureUnusedCapacity(1);
-        }
-        const gop = self.map.getOrPutAssumeCapacityAdapted(hashed, CachedKeyCtx{});
-        if (gop.found_existing) {
-            const id = gop.value_ptr.*;
+        const hash = std.hash.Wyhash.hash(0, key);
+        const probe = self.probeVariable(key, hash);
+        if (probe.id) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
-        // The key stays borrowed until every owned buffer is ready. A failed admit or allocation removes the slot.
-        gop.key_ptr.* = key;
-        gop.value_ptr.* = 0;
-        errdefer _ = self.map.remove(key);
-        const entry_size = self.variableEntrySize(key.len, agg_calls.len);
-        try self.admit(entry_size);
-        const old_record_capacity = self.compact.words.capacity;
-        // A later allocation may fail after this buffer grew; slack release must retain its reservation.
-        errdefer self.allocated_bytes += (self.compact.words.capacity - old_record_capacity) * @sizeOf(u64);
-
-        const key_copy = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(key_copy);
-
-        const group_id = std.math.cast(u32, self.keys.items.len) orelse return error.OutOfMemory;
-
-        const old_accumulators_len = self.accumulators.items.len;
-        if (self.compact.stride != 0)
-            try self.compact.reserve(self.allocator, self.groupCount() + 1)
+        const n = self.groupCount();
+        if (n == empty_id) return error.ExceededMemoryBudget;
+        if (self.strings == null) {
+            try self.admit(@sizeOf(KeyArena));
+            self.strings = try self.allocator.create(KeyArena);
+            self.strings.?.* = .{
+                .allocator = self.allocator,
+                .owner = self,
+                .reserveFn = stringReserve,
+                .settleFn = stringSettle,
+            };
+            self.allocated_bytes += @sizeOf(KeyArena);
+        }
+        if (self.strings.?.blocks.items.len == 0) {
+            const limit = if (self.shared) |b| b.limit else self.max_memory_bytes;
+            self.strings.?.bootstrap = @min(KeyArena.chunk_size, if (limit < 4) 1 else @as(usize, 1) << @intCast(std.math.log2_int(usize, limit / 4)));
+        }
+        const grow = self.slots.len == 0 or (n + 1) * 4 > self.slots.len * 3;
+        const cap = if (grow) @max(self.slots.len * 2, 16) else self.slots.len;
+        const refs_cap = if (n + 1 > self.refs.capacity) std.ArrayList(u32).growCapacity(n + 1) else self.refs.capacity;
+        const first_cap = if (n + 1 > self.first.capacity) std.ArrayList(u64).growCapacity(n + 1) else self.first.capacity;
+        const cells = self.accumulators.items.len + if (self.compact.stride == 0) agg_calls.len else 0;
+        const acc_cap = if (cells > self.accumulators.capacity)
+            std.ArrayList(Accumulator).growCapacity(cells)
         else
-            try self.accumulators.ensureUnusedCapacity(self.allocator, agg_calls.len);
-        // A failure past here unmakes the group's state, count(DISTINCT) sets included.
-        errdefer {
-            for (self.accumulators.items[old_accumulators_len..]) |*acc| {
-                if (acc.* == .distinct) acc.distinct.deinit(self.allocator);
-            }
-            self.accumulators.shrinkRetainingCapacity(old_accumulators_len);
+            self.accumulators.capacity;
+        const projected = @sizeOf(KeyArena) + try self.strings.?.projected(key.len) + cap * @sizeOf(FixedSlot) +
+            refs_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) +
+            (if (self.compact.stride != 0) self.compact.projected(n + 1) else 0) + self.set_objects;
+        try self.admit(projected -| self.allocated_bytes);
+        // Failed allocation can leave already-grown buffers live, but never publishes a partial key/id.
+        defer self.allocated_bytes = self.variableHeld();
+        if (grow) {
+            const fresh = try self.allocator.alloc(FixedSlot, cap);
+            @memset(fresh, .{ .hash = 0, .id = empty_id });
+            for (self.slots) |slot| if (slot.id != empty_id) {
+                var i = @as(usize, slot.hash) & (cap - 1);
+                while (fresh[i].id != empty_id) i = (i + 1) & (cap - 1);
+                fresh[i] = slot;
+            };
+            self.allocator.free(self.slots);
+            self.slots = fresh;
         }
+        try self.refs.ensureTotalCapacity(self.allocator, n + 1);
+        try self.first.ensureTotalCapacity(self.allocator, n + 1);
+        if (self.compact.stride != 0) try self.compact.reserve(self.allocator, n + 1);
+        try self.accumulators.ensureTotalCapacity(self.allocator, cells);
+        const ref = try self.strings.?.put(self.allocator, key);
         if (self.compact.stride == 0) for (agg_calls) |call| {
-            var acc = Accumulator.init(call);
-            if (call.func == .count_distinct) acc = .{ .distinct = self.freshDistinct() };
-            self.accumulators.appendAssumeCapacity(acc);
+            self.accumulators.appendAssumeCapacity(if (call.func == .count_distinct)
+                .{ .distinct = self.freshDistinct() }
+            else if (call.result == .bytes and call.func == .min)
+                .{ .min_arena = .{ .store = self.strings.?, .key = ref } }
+            else if (call.result == .bytes and call.func == .max)
+                .{ .max_arena = .{ .store = self.strings.?, .key = ref } }
+            else
+                Accumulator.init(call));
         };
-
-        try self.first.ensureUnusedCapacity(self.allocator, 1);
-        try self.keys.ensureUnusedCapacity(self.allocator, 1);
-        gop.key_ptr.* = key_copy;
-        gop.value_ptr.* = group_id;
-        self.keys.appendAssumeCapacity(key_copy);
-        if (self.compact.stride != 0) self.compact.append();
+        const id: u32 = @intCast(n);
+        var at = @as(usize, @as(u32, @truncate(hash))) & (self.slots.len - 1);
+        while (self.slots[at].id != empty_id) at = (at + 1) & (self.slots.len - 1);
+        self.slots[at] = .{ .hash = @truncate(hash), .id = id };
+        self.refs.appendAssumeCapacity(ref);
         self.first.appendAssumeCapacity(pos);
-
-        self.allocated_bytes += entry_size;
+        if (self.compact.stride != 0) self.compact.append();
         self.discovered(pos);
-        return group_id;
+        return id;
+    }
+
+    fn stringReserve(ctx: *anyopaque, n: usize) Error!void {
+        const self: *GroupTable = @ptrCast(@alignCast(ctx));
+        try self.admit(n);
+    }
+
+    fn stringSettle(ctx: *anyopaque) void {
+        const self: *GroupTable = @ptrCast(@alignCast(ctx));
+        self.allocated_bytes = self.variableHeld();
+    }
+
+    fn variableHeld(self: *const GroupTable) usize {
+        return (if (self.strings) |strings| strings.held() + @sizeOf(KeyArena) else 0) + self.slots.len * @sizeOf(FixedSlot) +
+            self.refs.capacity * @sizeOf(u32) + self.first.capacity * @sizeOf(u64) +
+            self.accumulators.capacity * @sizeOf(Accumulator) + self.compact.held() + self.set_objects;
+    }
+
+    fn probeVariable(self: *const GroupTable, key: []const u8, full_hash: u64) FixedProbe {
+        if (self.slots.len == 0) return .{ .id = null, .slot = 0 };
+        const hash: u32 = @truncate(full_hash);
+        const mask = self.slots.len - 1;
+        var i = @as(usize, hash) & mask;
+        while (true) : (i = (i + 1) & mask) {
+            const slot = self.slots[i];
+            if (slot.id == empty_id) return .{ .id = null, .slot = i };
+            if (slot.hash == hash and keyEql(self.keyAt(slot.id), key)) return .{ .id = slot.id, .slot = i };
+        }
     }
 
     /// `key` is the fixed image (`fixed_stride` bytes). Copied in; the caller may reuse its buffer.
@@ -5248,17 +5509,25 @@ pub const GroupTable = struct {
         self.releaseSlack();
     }
 
-    /// What one byte-keyed group holds, kept on the high side as the fixed-width table's capacities are: the key's
-    /// own heap block (the C heap rounds to 16 bytes and keeps a header), its slots in `keys` and `first` and its
-    /// state, each list half again over its length once grown (compact records count their buffer's projected
-    /// growth), and the map's entry at its working load. Inline distinct values live in the accumulator; a spilled
-    /// set carries its own object charge.
+    pub fn clearRetainingCapacity(self: *GroupTable) void {
+        if (self.fixed_stride != 0) return self.clearFixedRetainingCapacity();
+        self.deinitRange(0, self.groupCount());
+        self.accumulators.clearRetainingCapacity();
+        self.refs.clearRetainingCapacity();
+        self.first.clearRetainingCapacity();
+        self.compact.words.clearRetainingCapacity();
+        if (self.strings) |strings| strings.reset();
+        @memset(self.slots, .{ .hash = 0, .id = empty_id });
+        self.allocated_bytes = self.variableHeld();
+        self.releaseSlack();
+    }
+
+    /// Amortized conservative group width for planning. Runtime admission quotes the actual slot/list capacities
+    /// and arena chunks before allocating; a spilled distinct set carries its own object charge.
     pub fn variableEntryBytes(key_len: usize, calls: usize) usize {
         if (key_len > std.math.maxInt(usize) - 15) return std.math.maxInt(usize);
-        const key_block = std.mem.alignForward(usize, key_len, 16) +| 16;
-        const slots = (@sizeOf([]const u8) + @sizeOf(u64)) * 3 / 2;
-        const map_entry = (@sizeOf([]const u8) + @sizeOf(u32) + 1) * 2;
-        return key_block +| slots +| (@sizeOf(Accumulator) *| calls *| 3 / 2) +| map_entry;
+        return key_len +| 5 +| 32 +| (@sizeOf(u32) + @sizeOf(u64)) * 3 / 2 +|
+            (@sizeOf(Accumulator) *| calls *| 3 / 2);
     }
 
     inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
@@ -5853,6 +6122,10 @@ fn foldMinMaxBytesGroupedOne(
     r: usize,
 ) !void {
     const sv = col.string.values[r];
+    switch (state.*) {
+        .min_arena, .max_arena => |*value| return value.consider(sv, is_min),
+        else => {},
+    }
     const m_ptr = if (is_min) &state.min_bytes else &state.max_bytes;
     if (m_ptr.* == null) {
         m_ptr.* = try persist.dupe(u8, sv);
@@ -5877,6 +6150,99 @@ fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
         else => return error.UnsupportedAggType,
     }
     state.avg.count += 1;
+}
+
+test "STRGROUP stable arena records cover empty embedded-zero and multi-chunk values" {
+    const a = std.testing.allocator;
+    var arena: KeyArena = .{};
+    defer arena.deinit(a);
+    var refs: [7]u32 = undefined;
+    const sizes = [_]usize{ 0, 1, 127, 65530, 65536, 131073, 3 };
+    for (sizes, &refs) |n, *ref| {
+        const bytes = try a.alloc(u8, n);
+        defer a.free(bytes);
+        @memset(bytes, 0);
+        if (n > 0) bytes[n - 1] = 17;
+        ref.* = try arena.put(a, bytes);
+        try std.testing.expectEqualStrings(bytes, arena.get(ref.*));
+    }
+    for (sizes, refs) |n, ref| {
+        const bytes = arena.get(ref);
+        try std.testing.expectEqual(n, bytes.len);
+        if (n > 0) try std.testing.expectEqual(@as(u8, 17), bytes[n - 1]);
+    }
+    const blocks = arena.blocks.items.len;
+    const held = arena.held();
+    arena.reset();
+    try std.testing.expectEqualStrings("reuse", arena.get(try arena.put(a, "reuse")));
+    try std.testing.expectEqual(blocks, arena.blocks.items.len);
+    try std.testing.expectEqual(held, arena.held());
+}
+
+test "STRGROUP slots grow without key relocation and local clear reuses arena capacity" {
+    const a = std.testing.allocator;
+    var table = GroupTable.init(a, 64 << 20);
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .result = .i64, .arg = null, .where = null, .alias = "c" }};
+    var buf: [128]u8 = undefined;
+    var first_ptr: ?[*]const u8 = null;
+    for (0..20000) |i| {
+        const key = try std.fmt.bufPrint(&buf, "long-key-prefix-with-embedded-\x00-byte-{d}", .{i});
+        const id = try table.getOrInsert(key, &calls, i + 1);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), id);
+        if (i == 0) first_ptr = table.keyAt(0).ptr;
+        try std.testing.expect(first_ptr.? == table.keyAt(0).ptr);
+    }
+    for (0..20000) |i| {
+        const key = try std.fmt.bufPrint(&buf, "long-key-prefix-with-embedded-\x00-byte-{d}", .{i});
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findKey(key));
+        try std.testing.expectEqual(@as(u32, @intCast(i)), try table.getOrInsert(key, &calls, 0));
+        try std.testing.expectEqual(@as(u64, 0), table.first.items[i]);
+    }
+    const blocks = table.strings.?.blocks.items.len;
+    const slots = table.slots.ptr;
+    table.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+    for (0..1000) |i| {
+        const key = try std.fmt.bufPrint(&buf, "reused-{d}", .{i});
+        _ = try table.getOrInsert(key, &calls, i);
+    }
+    try std.testing.expect(slots == table.slots.ptr);
+    try std.testing.expectEqual(blocks, table.strings.?.blocks.items.len);
+}
+
+test "STRGROUP failed arena inserts and winner allocations preserve ids and ledger cleanup" {
+    const Trial = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var budget: SharedBudget = .{ .limit = 16 << 20 };
+            var table = GroupTable.init(a, 0);
+            table.shared = &budget;
+            defer {
+                table.deinit();
+                std.debug.assert(budget.used.load(.monotonic) == 0);
+            }
+            const calls = [_]AggCall{.{ .func = .min, .result = .bytes, .arg = null, .where = null, .alias = "lo" }};
+            var buf: [128]u8 = undefined;
+            for (0..64) |i| {
+                const key = try std.fmt.bufPrint(&buf, "variable-key-{d}", .{i});
+                const id = try table.getOrInsert(key, &calls, i);
+                try table.accumulators.items[id].min_arena.consider("winner-b", true);
+                try table.accumulators.items[id].min_arena.consider("winner-a", true);
+                try std.testing.expectEqualStrings("winner-a", table.accumulators.items[id].stringValue().?);
+            }
+            const before = table.groupCount();
+            table.releaseSlack();
+            budget.limit = budget.used.load(.monotonic);
+            const long = try a.alloc(u8, 131073);
+            defer a.free(long);
+            @memset(long, 'x');
+            try std.testing.expectError(error.ExceededMemoryBudget, table.getOrInsert(long, &calls, 0));
+            try std.testing.expectEqual(before, table.groupCount());
+            try std.testing.expectEqual(@as(?u32, 0), table.findKey("variable-key-0"));
+        }
+    };
+    try Trial.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Trial.run, .{});
 }
 
 test "GroupTable basic grouping, float normalization, and memory capping" {
@@ -5977,7 +6343,7 @@ test "SharedBudget: tables share one budget instead of owning fixed slices" {
         const key = std.fmt.bufPrint(&key_buf, "k{d}", .{placed}) catch unreachable;
         _ = b.getOrInsert(key, &agg_calls, 0) catch break;
     }
-    try std.testing.expect(b.keys.items.len > 0);
+    try std.testing.expect(b.refs.items.len > 0);
     try std.testing.expect(budget.used.load(.monotonic) > 4096 / 2);
     try std.testing.expect(a.max_memory_bytes == 0); // the idle table reserved nothing
 

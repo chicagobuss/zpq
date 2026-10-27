@@ -295,8 +295,8 @@ fn foldHist(
                 if (is_min) agg.foldExtremeF(true, m, v) else agg.foldExtremeF(false, m, v);
             }
         },
-        .min_bytes, .max_bytes => |*m| {
-            const is_min = state.* == .min_bytes;
+        .min_bytes, .max_bytes, .min_arena, .max_arena => {
+            const is_min = state.* == .min_bytes or state.* == .min_arena;
             var best: ?[]const u8 = null;
             for (hist, dict.string.values) |h, v| {
                 if (h == 0) continue;
@@ -306,11 +306,17 @@ fn foldHist(
                 } else best = v;
             }
             const cand = best.?;
-            if (m.*) |cur| {
-                const ord = std.mem.order(u8, cand, cur);
-                if (!((is_min and ord == .lt) or (!is_min and ord == .gt))) return;
+            switch (state.*) {
+                .min_arena, .max_arena => |*value| try value.consider(cand, is_min),
+                .min_bytes, .max_bytes => |*m| {
+                    if (m.*) |cur| {
+                        const ord = std.mem.order(u8, cand, cur);
+                        if (!((is_min and ord == .lt) or (!is_min and ord == .gt))) return;
+                    }
+                    try agg.persistWinner(persist, m, cand);
+                },
+                else => unreachable,
             }
-            try agg.persistWinner(persist, m, cand);
         },
         .avg => |*a| {
             const vals: []const f64 = switch (dict) {
@@ -2982,7 +2988,7 @@ test "groupedCoded over a key histogram with first rows makes the groups, positi
     try testing.expectEqual(tables[0].groupCount(), tables[1].groupCount());
     try testing.expectEqualSlices(u64, tables[0].first.items, tables[1].first.items);
     for (0..tables[0].groupCount()) |g| {
-        try testing.expectEqualStrings(tables[0].keys.items[g], tables[1].keys.items[g]);
+        try testing.expectEqualStrings(tables[0].keyAt(g), tables[1].keyAt(g));
         for (0..calls.len) |ai| try testing.expectEqual(
             tables[0].accumulators.items[g * calls.len + ai].count,
             tables[1].accumulators.items[g * calls.len + ai].count,

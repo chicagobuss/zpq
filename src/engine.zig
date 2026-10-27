@@ -6811,8 +6811,8 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
     }
     try writer.writeAll("],\"record_path\":");
     if (a.record_path) |r| {
-        try writer.print("{{\"layout\":\"{s}\",\"reservation\":{d},\"partitions\":2048,\"conditional\":true}}", .{
-            @tagName(r.layout), r.reservation,
+        try writer.print("{{\"layout\":\"{s}\",\"reservation\":{d},\"partitions\":{d},\"conditional\":true}}", .{
+            @tagName(r.layout), r.reservation, r.partitions,
         });
     } else try writer.writeAll("null");
     try writer.writeAll(",\"ndv\":");

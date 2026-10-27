@@ -43,7 +43,11 @@ queries = [
 for template in queries:
     sql = template.format(path=path)
     plan = run(sql, explain=True)
-    assert plan["strategy"] == "partitioned_hash", plan
+    expected = "shared_string_table" if template == queries[-1] else "partitioned_hash"
+    assert plan["strategy"] == expected, plan
+    if expected == "shared_string_table":
+        assert plan["record_path"]["layout"] == expected, plan
+        assert plan["record_path"]["partitions"] == 1024, plan
     assert plan["ndv"]["source"] == "unknown" and not plan["sketch"]["census_allowed"], plan
     truth_sql = sql
     if "ORDER BY c DESC," not in sql:

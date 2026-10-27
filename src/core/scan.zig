@@ -1397,6 +1397,7 @@ pub const RecordAdmission = struct {
         shared_string_table,
     },
     reservation: usize,
+    partitions: usize = 2048,
 };
 
 /// Ordered GROUP BY folds the work list in at most this many fixed blocks, each into a table of its own (see
@@ -3815,7 +3816,7 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // memory the query's ledger refused also runs on one worker (`FastPath.decode_memory`), and there once more on a
     // small decode budget, so the tables have nearly all of the ledger. A plain grouping a cost rule chose over a cut
     // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`): at most seven general scans,
-    // plus an admitted record scan and its serial decode retry before entering the general chain,
+    // plus the shared-string prefix, an admitted record scan and its serial decode retry before the general chain,
     // and each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = args;
     var chain: Chain = .{ .parts_tried = args.partagg };
@@ -7403,7 +7404,11 @@ fn inlineSharedStrings(
     const quote = setup +| string_table.State.setupBytes(workers, args.max_memory);
     if (quote > args.max_memory / 4 or
         (args.ledger != null and quote > args.ledger.?.available())) return null;
-    if (explain_only) return .{ .layout = .shared_string_table, .reservation = quote };
+    if (explain_only) return .{
+        .layout = .shared_string_table,
+        .reservation = quote,
+        .partitions = @as(usize, 1) << partagg.partBits(args.max_memory),
+    };
     var own_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const ledger = args.ledger orelse &own_ledger;
     _ = ledger.drawExact(setup) orelse return null;
@@ -19636,8 +19641,8 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
             var candidates: [std.enums.values(FastPath).len]FastPath = undefined;
             var count: usize = 0;
             for (std.enums.values(FastPath)) |path| {
-                // The independent retained-page prefix is checked separately below this general-chain walk.
-                if (path == .msd_records) continue;
+                // Independent retained-page and shared-string prefixes are checked below this general-chain walk.
+                if (path == .msd_records or path == .shared_strings) continue;
                 if (path == .integer_records and (!st.a.integer_records or !st.a.typed_answer)) continue;
                 candidates[count] = path;
                 count += 1;
@@ -19682,6 +19687,13 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
     const declined = narrowed(integer_args, integer_args, S.initMany(&.{.integer_records}), &integer_chain, false).?;
     try testing.expect(!declined.integer_records and declined.parallelism == args.parallelism);
     try testing.expect(!integer_chain.parts_tried);
+    var strings_chain: Chain = .{ .parts_tried = false };
+    const strings_declined = narrowed(args, args, S.initMany(&.{.shared_strings}), &strings_chain, false).?;
+    try testing.expect(!strings_declined.shared_strings);
+    try testing.expectEqual(args.parallelism, strings_declined.parallelism);
+    try testing.expectEqual(args.integer_records, strings_declined.integer_records);
+    try testing.expectEqual(args.dense, strings_declined.dense);
+    try testing.expect(!strings_chain.parts_tried);
     var msd_chain: Chain = .{ .parts_tried = false };
     const msd_declined = narrowed(args, args, S.initMany(&.{ .msd_records, .decode_memory }), &msd_chain, false).?;
     try testing.expect(!msd_declined.msd_records);

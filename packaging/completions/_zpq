@@ -4,6 +4,7 @@ if (( CURRENT == 2 )); then _values command conform help inspect query schema ve
 _arguments '*:file:_files' \
   '--aggregate[zpq option]' \
   '--bloom-filter[zpq option]' \
+  '--cache[zpq option]' \
   '--codec[zpq option]' \
   '--column-order[zpq option]' \
   '--columns[zpq option]' \

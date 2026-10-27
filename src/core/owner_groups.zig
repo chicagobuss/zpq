@@ -12,6 +12,7 @@ const Selection = @import("filter/selection.zig").SelectionVector;
 const memory = @import("memory.zig");
 const spawn = @import("spawn.zig");
 const hw = @import("hw.zig");
+const HugePageAdvisor = @import("huge_pages.zig").HugePageAdvisor;
 const now = @import("../clock.zig").monoNs;
 pub const Lane = @import("owner_lanes.zig").Lane;
 pub const PackedLayout = @import("owner_lanes.zig").Layout;
@@ -185,6 +186,46 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
         }
     };
     const CountCache = @import("owner_cache.zig").Local(CountPolicy);
+    // The integer full answer's exact local partials: COUNT, a checked i64 SUM and the first ordinal per key.
+    const cached_full = codec == .int64 and kind == .full;
+    const FullEntry = struct { key: u64 = 0, sum: i64 = 0, first: u32 = 0, count: u32 = 0 };
+    // A partial's weight shares its record's flags with the key and value NULL bits, so it stays below 2^30.
+    const full_count_mask: u32 = (1 << 30) - 1;
+    const full_present: u32 = 1 << 31;
+    const FullPolicy = struct {
+        pub const Entry = FullEntry;
+        pub fn validate(r: Entry) error{BadPartial}!void {
+            if (r.count & full_count_mask == 0) return error.BadPartial;
+        }
+        pub fn active(r: Entry) bool {
+            return r.count & full_count_mask != 0;
+        }
+        pub fn same(a: Entry, b: Entry) bool {
+            return (a.first & null_key) == (b.first & null_key) and a.key == b.key;
+        }
+        pub fn hash(r: Entry) u64 {
+            return CountPolicy.hash(.{ .key = r.key, .first = r.first });
+        }
+        pub fn clear(r: *Entry) void {
+            r.count = 0;
+        }
+        /// All or nothing: a COUNT past the weight bits or an i64 SUM overflow leaves `a` unchanged for a flush.
+        pub fn coalesce(a: *Entry, b: Entry) error{}!bool {
+            const count = (a.count & full_count_mask) + (b.count & full_count_mask);
+            if (count > full_count_mask) return false;
+            var sum = a.sum;
+            if (b.count & full_present != 0) {
+                const add = @addWithOverflow(a.sum, b.sum);
+                if (add[1] != 0) return false;
+                sum = add[0];
+            }
+            a.count = count | ((a.count | b.count) & full_present);
+            a.sum = sum;
+            a.first = @min(a.first, b.first);
+            return true;
+        }
+    };
+    const FullCache = @import("owner_cache.zig").Local(FullPolicy);
     const CountLayout = PackedLayout(u128, &.{}, u32);
     const CountFold = @import("owner_fold.zig").Table(CountLayout);
     // Ordinals are below 2^31. A tagged COUNT partial stores its exact weight in flags, with NULL in bit zero.
@@ -212,6 +253,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
 
         fn countCacheEntries() usize {
             return if (cached_count) @import("owner_cache.zig").capacity(@sizeOf(CountEntry)) else 0;
+        }
+        fn fullCacheEntries() usize {
+            return if (cached_full) @import("owner_cache.zig").tableCapacity(@sizeOf(FullEntry)) else 0;
         }
 
         /// The aggregate a top-H layout ranks by: COUNT, or SUM (NULL when no value was present).
@@ -261,6 +305,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             run_item: usize = 0,
             run_stopped: bool = false,
             count_cache: CountCache = .{},
+            full_cache: FullCache = .{},
             contributed_rows: usize = 0,
             cache_seen: u32 = 0,
             cache_hits: u32 = 0,
@@ -283,8 +328,21 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 try CountCache.flushEntry(entry, l, emitCount);
             }
 
+            fn emitFull(l: *Local, entry: FullEntry) error{ExceededMemoryBudget}!void {
+                try l.appendRecord(
+                    entry.key,
+                    if (entry.count & full_present != 0) entry.sum else null,
+                    entry.first & Group.first_mask,
+                    entry.first & null_key != 0,
+                    0,
+                    FullPolicy.hash(entry),
+                    entry.count & full_count_mask,
+                );
+            }
+
             fn flushCounts(l: *Local) !void {
                 if (cached_count) try l.count_cache.flush(l, emitCount);
+                if (cached_full) try l.full_cache.flush(l, emitFull);
             }
 
             pub fn start(l: *Local, ordinal: u32, item: usize) void {
@@ -295,6 +353,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 l.cache_hits = 0;
                 l.cache_disabled = false;
                 l.count_cache.last = null;
+                l.full_cache.last = null;
             }
 
             fn appendRun(l: *Local, key: ?Key, value: ?i64, ordinal: u32) void {
@@ -373,6 +432,26 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     }
                     return;
                 };
+                if (cached_full) if (!l.cache_disabled and l.full_cache.entries.len != 0) {
+                    // Column nullability is recorded per row: a partial's value-NULL bit means only all-NULL.
+                    l.nulls |= @intFromBool(key == null) | @as(u32, @intFromBool(value == null)) << 1;
+                    const probe = l.cache_seen < l.state.cache_trial_rows;
+                    if (probe) l.cache_seen += 1;
+                    const hit = try l.full_cache.push(.{
+                        .key = bits,
+                        .sum = value orelse 0,
+                        .first = ordinal | @as(u32, if (key == null) null_key else 0),
+                        .count = 1 | @as(u32, if (value != null) full_present else 0),
+                    }, l, emitFull);
+                    if (probe and hit) l.cache_hits += 1;
+                    if (probe and l.cache_seen == l.state.cache_trial_rows and
+                        l.cache_hits < l.full_cache.entries.len)
+                    {
+                        try l.flushCounts();
+                        l.cache_disabled = true;
+                    }
+                    return;
+                };
                 const h: u64 = if (key == null) 0x621985775bcbd930 else mixKey(bits, len);
                 try l.appendRecord(bits, value, ordinal, key == null, len, h, 1);
             }
@@ -392,10 +471,15 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 var flags: u32 = (@as(u32, @truncate(h)) & 0x3fffffff) << 2 | @intFromBool(kn);
                 if (has_value) flags |= @as(u32, @intFromBool(value == null)) << 1;
                 if (kind == .full) l.nulls |= flags & 3;
-                const weighted = cached_count and weight > 1;
-                if (weighted) flags = weight << 1 | @intFromBool(kn);
+                const weighted = (cached_count or cached_full) and weight > 1;
+                if (weighted) flags = if (has_value) weight << 2 | (flags & 3) else weight << 1 | @intFromBool(kn);
                 const r: Record = if (has_value)
-                    .{ .key = bits, .value = value orelse 0, .ordinal = ordinal | len << ordinal_bits, .flags = flags }
+                    .{
+                        .key = bits,
+                        .value = value orelse 0,
+                        .ordinal = ordinal | len << ordinal_bits | @as(u32, if (weighted) partial else 0),
+                        .flags = flags,
+                    }
                 else
                     .{
                         .key = bits,
@@ -404,7 +488,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     };
                 const p: usize = @intCast(h >> l.state.shift);
                 try Records.append(&l.records, l.state.blocks, &l.state.block_cursor, p, r);
-                if (cached_count) l.contributed_rows += weight;
+                if (cached_count or cached_full) l.contributed_rows += weight;
             }
 
             pub fn batch(l: *Local, view: eval.Batch, lookup: []const ?usize, offset: usize) !void {
@@ -469,9 +553,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             previous: ?usize,
         ) usize {
             const kn = r.flags & 1 != 0;
-            const weighted = cached_count and r.ordinal & partial != 0;
-            const weight = if (weighted) r.flags >> 1 else 1;
-            const ordinal = if (cached_count) r.ordinal & Group.first_mask else r.ordinal;
+            const weighted = (cached_count or cached_full) and r.ordinal & partial != 0;
+            const weight = if (weighted) r.flags >> (if (has_value) 2 else 1) else 1;
+            const ordinal = if (cached_count or cached_full) r.ordinal & Group.first_mask else r.ordinal;
             const id = blk: {
                 if (!kn) if (previous) |id| if (sameRecord(r, groups[id])) break :blk id;
                 const cap = slots.len;
@@ -532,10 +616,14 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             // The full answer: every group, contiguous per partition, and their first-appearance order.
             groups: []Group = &.{},
             winners: []u32 = &.{},
+            /// The full answer's winner map came from page_allocator (zero-filled), not `gpa`.
+            winners_fresh: bool = false,
             bitmap: []u64 = &.{},
             prefix: []u32 = &.{},
             starts: []usize = &.{},
             counts: []usize = &.{},
+            /// The full answer's fold claims partitions largest first, so the hottest owner starts at time zero.
+            fold_order: []u32 = &.{},
             partition_ns: u64 = 0,
             order_ns: u64 = 0,
             // Top-H: each worker's best groups among the partitions it completed.
@@ -545,6 +633,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             runs: []Run = &.{},
             run_declined: std.atomic.Value(bool) = .init(false),
             count_caches: []CountEntry = &.{},
+            full_caches: []FullEntry = &.{},
             cache_trial_rows: u32 = 0,
             const Run = struct { rows: usize = 0, groups: usize = 0, first: u32 = 0, last: u32 = 0 };
 
@@ -573,7 +662,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     Records.frontierBytes(workers, parts) +| @sizeOf(State) +| (8 << 20);
                 // The full answers keep their established quotes, which cover blocks and ordering arrays.
                 if (kind == .full) return (if (codec == .int64)
-                    rows *| 88 +| (128 << 20)
+                    // One quote for both producers, so EXPLAIN matches either; runs leave the partials unallocated.
+                    rows *| 88 +| (128 << 20) +| workers *| fullCacheEntries() *| @sizeOf(FullEntry)
                 else
                     rows *| 96 +| (192 << 20)) +| output_credit;
                 return shared +| rows *| table_row_bytes +|
@@ -734,7 +824,20 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     for (s.locals, 0..) |*l, i|
                         l.count_cache.entries = s.count_caches[i * cache_entries ..][0..cache_entries];
                 }
-                s.blocks = try a.alloc(Block, blockCount(rows, workers, parts));
+                // The full answer's blocks are claimed densely front to back: advise them for huge pages.
+                var dense: HugePageAdvisor = .{ .child = a };
+                const full_entries = fullCacheEntries();
+                if (full_entries != 0) {
+                    s.cache_trial_rows = @intCast(@import("owner_cache.zig").trialRows(
+                        full_entries,
+                        @sizeOf(FullEntry),
+                    ));
+                    s.full_caches = try a.alloc(FullEntry, workers * full_entries);
+                    @memset(s.full_caches, .{});
+                    for (s.locals, 0..) |*l, i|
+                        l.full_cache.entries = s.full_caches[i * full_entries ..][0..full_entries];
+                }
+                s.blocks = try (if (kind == .full) dense.allocator() else a).alloc(Block, blockCount(rows, workers, parts));
                 for (s.locals) |*l| {
                     l.records = try Records.Frontier.init(a, parts);
                 }
@@ -746,17 +849,19 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     l.records.deinit(a);
                 }
                 a.free(s.count_caches);
+                a.free(s.full_caches);
                 a.free(s.locals);
                 a.free(s.runs);
                 for (s.heaps) |*h| h.deinit(a);
                 a.free(s.heaps);
                 a.free(s.blocks);
                 a.free(s.groups);
-                a.free(s.winners);
+                if (s.winners_fresh) std.heap.page_allocator.free(s.winners) else a.free(s.winners);
                 a.free(s.bitmap);
                 a.free(s.prefix);
                 a.free(s.starts);
                 a.free(s.counts);
+                a.free(s.fold_order);
                 if (s.ledger) |l| l.release(s.charged);
                 a.destroy(s);
             }
@@ -784,8 +889,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         .fold => t.s.parts,
                     };
                     while (true) {
-                        const p = t.cursor.fetchAdd(1, .monotonic);
-                        if (p >= end) return;
+                        const claim = t.cursor.fetchAdd(1, .monotonic);
+                        if (claim >= end) return;
+                        const p = if (t.pass == .fold and t.s.fold_order.len != 0) t.s.fold_order[claim] else claim;
                         (switch (t.pass) {
                             .fold => if (kind == .full) t.foldFull(p) else if (kind == .sum_top and codec == .int64)
                                 if (t.s.distinct_top) t.foldDistinct(p) else t.foldTop(p)
@@ -1123,7 +1229,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 var contributed: usize = 0;
                 for (s.locals) |l| {
                     s.input_nulls |= l.nulls;
-                    if (cached_count) {
+                    if (cached_count or cached_full) {
                         contributed += l.contributed_rows;
                     } else {
                         for (l.records.histogram) |n| contributed += n;
@@ -1140,9 +1246,26 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         for (s.locals) |l| at += l.records.histogram[p];
                     }
                     s.starts[s.parts] = at;
+                    s.fold_order = try s.gpa.alloc(u32, s.parts);
+                    for (s.fold_order, 0..) |*o, p| o.* = @intCast(p);
+                    std.mem.sort(u32, s.fold_order, s.starts, struct {
+                        fn larger(starts: []const usize, x: u32, y: u32) bool {
+                            const nx = starts[x + 1] - starts[x];
+                            const ny = starts[y + 1] - starts[y];
+                            return if (nx != ny) nx > ny else x < y;
+                        }
+                    }.larger);
                     s.groups = try s.gpa.alloc(Group, s.rows);
-                    s.winners = try s.gpa.alloc(u32, s.rows);
-                    @memset(s.winners, 0);
+                    // The order pass reads every winner slot: advise the map for huge pages. It is mapped afresh
+                    // (page_allocator's anonymous mmap or committed Windows pages read as zero), so no serial clear.
+                    // rawAlloc, unlike alloc, does not fill safe builds' new memory with `undefined`.
+                    if (s.rows != 0) {
+                        var dense: HugePageAdvisor = .{ .child = std.heap.page_allocator };
+                        const raw = dense.allocator().rawAlloc(s.rows * @sizeOf(u32), .of(u32), @returnAddress()) orelse
+                            return error.OutOfMemory;
+                        s.winners = @as([*]u32, @ptrCast(@alignCast(raw)))[0..s.rows];
+                        s.winners_fresh = true;
+                    }
                     s.partition_ns = @intCast(now() - start);
                     start = now();
                 }
@@ -1522,6 +1645,36 @@ test "owned integer groups reject a wide exact sum before any output window" {
         for (0..2) |i| try s.locals[i % j].append(intKey(1, 0), intValue(value, 0), @intCast(i));
         try std.testing.expectError(error.AggIntTooWide, s.finish());
     };
+}
+
+test "owned integer local partials flush before an i64 overflow and keep exact cancelling sums and NULLs" {
+    const a = std.testing.allocator;
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    // Key 1: max, max, min, min, -2 overflows each partial direction before cancelling to -2 + -2.
+    const keys = [_]?i64{ 1, 1, null, 1, 1, null, 1, 2 };
+    const values = [_]?i64{ max, max, null, min, min, null, -2, 5 };
+    for ([_]usize{ 1, 2, 3 }) |j| {
+        const s = (try IntFull.State.init(a, null, keys.len, j, 0, 1, {}, full_parts, 0)).?;
+        defer s.deinit();
+        try std.testing.expect(s.locals[0].full_cache.entries.len != 0);
+        for (keys, values, 0..) |k, v, i| try s.locals[i % j].append(k, v, @intCast(i));
+        try s.finish();
+        try std.testing.expectEqual(@as(usize, 3), s.group_count);
+        const ids = try s.window(a, 0, s.group_count);
+        defer a.free(ids);
+        const g = [_]IntFull.Group{ s.groups[ids[0]], s.groups[ids[1]], s.groups[ids[2]] };
+        try std.testing.expectEqual(@as(?i64, 1), g[0].keyValue());
+        try std.testing.expectEqual(@as(i64, 5), g[0].countValue());
+        try std.testing.expectEqual(@as(?i128, -4), g[0].sumValue());
+        try std.testing.expectEqual(@as(?i64, null), g[1].keyValue());
+        try std.testing.expectEqual(@as(u32, 2), g[1].ordinal());
+        try std.testing.expectEqual(@as(i64, 2), g[1].countValue());
+        try std.testing.expectEqual(@as(?i128, null), g[1].sumValue());
+        try std.testing.expectEqual(@as(u32, 7), g[2].ordinal());
+        try std.testing.expectEqual(@as(?i128, 5), g[2].sumValue());
+        try std.testing.expectEqual(@as(u32, 3), s.input_nulls);
+    }
 }
 
 test "owned integer groups overlap packed records safely for every reduction and partition tail" {

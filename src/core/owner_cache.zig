@@ -12,6 +12,14 @@ pub fn capacity(entry_bytes: usize) usize {
     return @as(usize, 1) << @intCast(std.math.log2_int(usize, (bytes / line * line) / entry_bytes));
 }
 
+/// An exact local partial table's slots: half of a worker's L2 share, leaving the rest to the producer's decoded
+/// views and partition tails, rounded down to a power of two. Zero when one entry does not fit.
+pub fn tableCapacity(entry_bytes: usize) usize {
+    const bytes = hw.l2BytesPerWorkerOr(640 << 10) / 2;
+    if (bytes < entry_bytes) return 0;
+    return @as(usize, 1) << @intCast(std.math.log2_int(usize, bytes / entry_bytes));
+}
+
 pub fn trialRows(entries: usize, entry_bytes: usize) usize {
     return entries * @max(2, hw.cacheLineBytes() / entry_bytes *| 2);
 }

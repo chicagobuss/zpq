@@ -202,8 +202,15 @@ What changed underneath:
   compares and `IN` lists, then anchored `LIKE`, then `LIKE '%x%'`); `--explain` lists them in the order they run. A
   later condition's column is decoded only at the rows the earlier ones kept, so a page none of them keeps is never
   decompressed.
-- A filtered GROUP BY reads a dictionary-encoded key as codes when, after the filter, codes for every row cost no more
-  than the surviving rows' values would, and otherwise decodes only the survivors.
+- A filtered GROUP BY reads a dictionary-encoded key as codes whenever the grouping works on codes, or when, after the
+  filter, codes for every row cost no more than the surviving rows' values would; otherwise it decodes only the
+  survivors.
+- A top-k by count over a composite key with a short string (ClickBench Q18's UserID, minute and SearchPhrase) counts
+  its candidate groups exactly during the first pass instead of in a second full pass, and decides whether it still
+  needs that count from every worker's merged counts. The answer is unchanged.
+- An exact full GROUP BY over skewed integer keys sums into a per-worker exact partial table sized from the cache,
+  maps its large merge arrays fresh with huge pages instead of clearing them on one thread, and folds the largest
+  partitions first. The answer is unchanged.
 - `ORDER BY ... LIMIT n` over plain rows ranks by its keys in parallel and reads only the winners' rows, skipping row
   groups that cannot win.
 - Local reads on Linux read only the column chunks a query needs. When most of those ranges are already in the page

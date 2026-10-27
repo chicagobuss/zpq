@@ -5227,8 +5227,8 @@ fn prepareAggregateWithMetas(
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         if (result_cut == null or !result_cut.?.ranking_first)
             try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);
-        // Candidate nomination scans every partial group. With several workers, route those groups directly to
-        // the parallel merge and let each partition keep its own H candidates instead of a serial nomination pass.
+        // COUNT-only ranks go straight to parallel partition heaps. DISTINCT cardinality bounds can discard
+        // expensive losing sets before the payload merge; that merge still runs on the requested workers.
         const first_parallel = n_workers > 1 and args.result_order.keys.len == 0 and
             args.result_order.having == null and args.result_order.hidden.len == 0;
         const first_k = if (args.result_order.limit) |limit|
@@ -5237,7 +5237,8 @@ fn prepareAggregateWithMetas(
             null;
         const candidates = if (first_parallel and first_k != null)
             try firstCandidatesParallel(lists, out_tables, first_k.?, n_workers)
-        else if (n_workers == 1)
+        else if (n_workers == 1 or (result_cut != null and
+            agg_calls[result_cut.?.a_idx].func == .count_distinct))
             try topKCandidates(arena, out_tables, group_outputs.?, agg_calls, args.result_order)
         else
             null;

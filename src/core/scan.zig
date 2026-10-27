@@ -1254,7 +1254,8 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     const cheap_r1 = small and (tiny or repeated or (keys.len == 1 and (in.calls.len == 1 or
         stat.dictionary_bytes <= (stat.hi *| stat.key_bytes) *| 4)));
     // Short string tuples may have sparse repeats even when their string marginal repeats heavily. Keep
-    // payloads and long keys on the existing path; only the runtime sparse-repeat hint can justify this census.
+    // payloads and long keys on the existing path; filtered, only the runtime sparse-repeat hint can justify this
+    // census.
     const short_composite = !small and stat.string_keys and keys.len > 1 and
         stat.key_bytes < 32 and in.calls.len == 1;
     // A short byte key plus total payloads can avoid almost all losing-group state. The encoded average width
@@ -1274,10 +1275,16 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         // often than one key's; counting again after the bail cost more than riding along and being dropped.
         const fixed_composite = bail_census and !short_composite and keys.len > 1 and
             expr_agg.fixedGroupStride(keys) != null;
+        // Unfiltered, a short string composite's count pass reads every row the census would, and its cells, spread
+        // by every combination the marginals make, bail like a fixed-width composite's: the census rides along and
+        // each worker still drops it once its own cells separate the cut. Filtered, the bet waits for the count.
+        const unfiltered_short = bail_census and short_composite and in.args.filter == null;
         plan.dispatch.keys_unique = looks_unique;
         plan.dispatch.census_allowed = bail_census;
-        plan.dispatch.census_fused = looks_unique or fixed_composite or (bail_census and short_payload);
-        plan.dispatch.census_cell_repeat_gate = bail_census and (short_composite or !bounded_census);
+        plan.dispatch.census_fused = looks_unique or fixed_composite or unfiltered_short or
+            (bail_census and short_payload);
+        plan.dispatch.census_cell_repeat_gate = bail_census and !unfiltered_short and
+            (short_composite or !bounded_census);
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
@@ -18878,14 +18885,23 @@ test "planAggregate: census bail cost bets preserve R1 and gate key types" {
     try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
     try testing.expect(!plan.dispatch.census_allowed);
 
-    // Short string composites can have a sparse repeat tail even when the marginal NDV is unknown.
+    // Short string composites can have a sparse repeat tail even when the marginal NDV is unknown. Unfiltered
+    // (ClickBench q18's shape), the census rides the count pass, whose cells bail on so spread a key, with no hint.
     const short_composite = [_]expr_ast.Expr{ string_key[0], keys[1] };
     in.keys = &short_composite;
     in.ndv_stat.?.key_bytes = 24;
     plan = planAggregate(in);
     try testing.expectEqual(.sketch, plan.dispatch.strategy);
+    try testing.expect(plan.dispatch.census_allowed and plan.dispatch.census_fused);
+    try testing.expect(!plan.dispatch.keys_unique and !plan.dispatch.census_cell_repeat_gate);
+    try testing.expect(plan.reasons.contains(.census_fused) and plan.reasons.contains(.census_short_string_composite));
+    // Filtered, the count pass decides whether a census is worth a second pass, behind the repeat hint.
+    in.args.filter = "s > 0";
+    plan = planAggregate(in);
+    try testing.expectEqual(.sketch, plan.dispatch.strategy);
     try testing.expect(plan.dispatch.census_allowed and plan.dispatch.census_cell_repeat_gate);
     try testing.expect(!plan.dispatch.keys_unique and !plan.dispatch.census_fused);
+    in.args.filter = null;
     in.args.sketch_topk.?.census = false;
     try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy);
     in.args.sketch_topk.?.census = true;

@@ -55,15 +55,22 @@ for name, h in json.load(open(sys.argv[1]))["hosts"].items():
 fi
 [[ " ${hosts[*]} " == *" $me "* ]] || hosts+=("$me")
 
+# A target build compiles its steps at once, each capped at compile_gb: an aarch64 ReleaseSafe zpq-check peaks at
+# 6.8 GB and its ReleaseFast zpq at 6.0. So a builder holds a target build to compile_gb once per step.
+steps="check-runner:ReleaseSafe cli:ReleaseFast"
+[[ $full == 0 ]] || steps="$steps test-bin:Debug"
+compile_gb=10
+target_gb=$((compile_gb * $(wc -w <<< "$steps")))
 # Liveness and load from the o11y feed; a builder must be idle (live, half its cores free, a quarter of its memory).
 curl -s -m 10 "$o11y" > "$W/o11y.json" || echo '{"hosts": []}' > "$W/o11y.json"
-load() {  # host: "offline", "busy", or "idle N" with N the target builds its free memory holds (8 GB each)
+load() {  # host: "offline", "busy", or "idle N" with N the target builds its free memory holds (target_gb each)
   "$py" -c 'import json, sys
 h = {x["host"]: x for x in json.load(open(sys.argv[1])).get("hosts", [])}.get(sys.argv[2])
+need = int(sys.argv[3]) << 30
 free = (h or {}).get("mem_total", 0) * ((h or {}).get("mem_avail_pct") or 0) / 100
 print("offline" if not h or h.get("state") != "live" else
-      "idle %d" % (free // (8 << 30)) if h["load1"] < 0.5 * h["cores"] and free >= 8 << 30 else "busy")' \
-    "$W/o11y.json" "${O11Y_NAME[$1]:-$1}"
+      "idle %d" % (free // need) if h["load1"] < 0.5 * h["cores"] and free >= need else "busy")' \
+    "$W/o11y.json" "${O11Y_NAME[$1]:-$1}" "$target_gb"
 }
 probe() {  # host: why it must not be used, or nothing
   if [[ $1 == "$me" ]]; then sh tools/check/fleet-host.sh timing "$1"
@@ -104,8 +111,6 @@ done
 
 # The source as committed goes to each builder once; then every build there starts.
 mkdir -p "$W/src" && git archive HEAD | tar -x -C "$W/src"
-steps="check-runner:ReleaseSafe cli:ReleaseFast"
-[[ $full == 0 ]] || steps="$steps test-bin:Debug"
 src=.cache/zpq-fleet/src
 # Here the fleet tree lives on /mnt/fast (build caches stay off the internal disk) under the builders' common path.
 if mountpoint -q /mnt/fast && [[ ! -e $HOME/.cache/zpq-fleet ]]; then
@@ -118,10 +123,10 @@ sync_src() {
 build() {  # target builder bundle-dir
   local t=$1 b=$2 dst=$3 out=.cache/zpq-fleet/out/$t
   if [[ $b == "$me" ]]; then
-    (cd "$HOME/$src" && nice -n 10 sh tools/check/fleet-build.sh "$t" "$zig_version" "$HOME/$out" $steps)
+    (cd "$HOME/$src" && nice -n 10 sh tools/check/fleet-build.sh "$t" "$zig_version" "$HOME/$out" "$compile_gb" $steps)
     mkdir -p "$dst" && for s in "$HOME/$out"/*/; do cp -r "$s". "$dst/"; done
   else
-    ssh "$b" "cd $src && sh tools/check/fleet-build.sh $t $zig_version \$HOME/$out $steps"
+    ssh "$b" "cd $src && sh tools/check/fleet-build.sh $t $zig_version \$HOME/$out $compile_gb $steps"
     mkdir -p "$dst" && for s in $steps; do rsync -a "$b:$out/${s%%:*}/" "$dst/" 2>/dev/null || true; done
   fi
   [[ -x $dst/bin/zpq && -x $dst/bin/zpq-check ]]

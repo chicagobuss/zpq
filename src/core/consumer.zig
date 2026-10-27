@@ -4571,6 +4571,8 @@ fn scanRGForAggImpl(
     var length_of = try ra.alloc(bool, in.read.len);
     @memset(length_of, false);
     var filtered = false;
+    var survivors: usize = 0;
+    var whole: []bool = &.{};
     for ([_]bool{ false, true }) |late| for (in.read, 0..) |needed, ci| {
         if (late and dec.payload == null) break;
         if (!needed or ci >= in.rg.columns.items.len) continue;
@@ -4585,7 +4587,20 @@ fn scanRGForAggImpl(
             try filter_eval.evaluate(in.filter.?, &first, &sel, lookup, ra);
             filtered = true;
             dec.gate = &sel;
+            survivors = sel.count();
         }
+        if (late and keep == null and flatGroupKey(target, ci)) if (in.rg.columns.items[ci].meta_data) |cm| {
+            if (@import("filter/membership.zig").dictionaryCoversChunk(&cm) and
+                keyCodesCheaper(cm, batch_rows, survivors))
+            {
+                if (whole.len == 0) {
+                    whole = try ra.alloc(bool, in.read.len);
+                    @memset(whole, false);
+                    dec.whole = whole;
+                }
+                whole[ci] = true;
+            }
+        };
         lookup[ci] = batch_cols.items.len;
         const col = dec.column(ra, ci, &sel_pre) catch |err| {
             // Values that expand past the budget read whole (a footer can understate them by any factor) may still
@@ -5243,9 +5258,9 @@ const CallBatch = struct { batch: filter_eval.Batch, lookup: []?usize };
 
 /// The columns of `in.read` a row group needs before its filter has run: the filter's own. With no filter, the
 /// group keys too. A flat key of a hash group under a filter is payload (`payloadColumns`), decoded only at the
-/// survivors, unless its dictionary covers the chunk: its codes are cheaper than the survivors' values. A nested key
-/// has no row gate, so it stays here. A record owner stays here too: its packed path needs
-/// the whole dictionary and applies the survivor mask at the sink, which a row gate would replace with defaults.
+/// survivors (or, when its dictionary covers the chunk, as codes for every row: `keyCodesCheaper`). A nested key has
+/// no row gate, so it stays here. A record owner stays here too: its packed path needs the whole dictionary and
+/// applies the survivor mask at the sink, which a row gate would replace with defaults.
 fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool {
     const n = in.read.len;
     const base = try a.alloc(bool, n);
@@ -5269,9 +5284,6 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
                 if (!is_key or base[ci] or ci >= in.rg.columns.items.len) continue;
                 const cm = in.rg.columns.items[ci].meta_data orelse continue;
                 if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) base[ci] = true;
-                // A key the dictionary covers decodes to its codes before the filter; gated, it would materialize
-                // every survivor's value for the fold to code again.
-                if (@import("filter/membership.zig").dictionaryCoversChunk(&cm)) base[ci] = true;
             }
         },
         .scalar => {},
@@ -5464,6 +5476,25 @@ fn streamWindowRows(in: AggRowGroup, target: AggTarget, num_rows: usize) usize {
 }
 
 /// The fold reads `ci` after the filter: a group key, an aggregate argument, or a per-aggregate FILTER.
+fn flatGroupKey(target: AggTarget, ci: usize) bool {
+    if (target != .grouped) return false;
+    for (target.grouped.keys) |k| if (k == .col_ref and k.col_ref.col_idx == ci) return true;
+    return false;
+}
+
+/// Whether a filtered group's dictionary-covered key costs less as its codes for every row than as values at the
+/// filter's survivors, by what each materializes: a four-byte code a row, against a survivor's value (a string's
+/// slice, which the fold codes again, or the physical width).
+fn keyCodesCheaper(cm: schema.ColumnMetaData, rows: usize, survivors: usize) bool {
+    const value_bytes: usize = switch (cm.type) {
+        .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY => @sizeOf([]const u8),
+        .INT96 => 12,
+        .INT64, .DOUBLE => 8,
+        else => 4,
+    };
+    return rows *| @sizeOf(u32) <= survivors *| value_bytes;
+}
+
 fn columnFeedsFold(target: AggTarget, ci: usize) bool {
     switch (target) {
         .scalar => |s| for (s.calls) |call| {
@@ -5532,6 +5563,8 @@ const ChunkDecoder = struct {
     /// `payloadColumns`, gated by `gate` (the filter's survivors, in batch rows) once the filter has run.
     payload: ?[]const bool = null,
     gate: ?*const filter_selection.SelectionVector = null,
+    /// Payload columns decoded for every row after all, ungated (`keyCodesCheaper`).
+    whole: ?[]const bool = null,
     /// The pre-filter pass may decode a PLAIN `<> ''` / `= ''` column as lengths. A later pass (`refill`) reads
     /// the bytes the fold still needs, and only on the rows the filter kept.
     allow_lengths: bool = true,
@@ -5567,7 +5600,7 @@ const ChunkDecoder = struct {
         // dictionary codes; one filters, keys or aggregates read decodes to codes they evaluate once per entry.
         const uses = self.uses;
         var decode_options = column_mod.chunkOptions(self.decode_options, in.meta, cm);
-        if (self.payload) |p| if (p[ci]) {
+        if (self.payload) |p| if (p[ci] and !(if (self.whole) |w| w[ci] else false)) {
             std.debug.assert(self.gate != null);
             decode_options.row_gate = self.gate;
         };
@@ -8427,6 +8460,32 @@ test "a required row gate skips an unread page and defaults the unselected slots
     for (clean.values, skipped.values, 0..) |want, got, i| {
         try testing.expectEqual(if (i < page_rows) 0 else want, got);
     }
+}
+
+test "a filtered group's dictionary key decodes as codes only where they materialize less than its survivors" {
+    var cm: schema.ColumnMetaData = .{
+        .type = .BYTE_ARRAY,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = 1000,
+        .total_uncompressed_size = 0,
+        .total_compressed_size = 0,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = null,
+    };
+    // A string survivor is a slice the fold codes again: codes win once a quarter of the rows survive.
+    try std.testing.expect(keyCodesCheaper(cm, 1000, 985));
+    try std.testing.expect(keyCodesCheaper(cm, 1000, 250));
+    try std.testing.expect(!keyCodesCheaper(cm, 1000, 249));
+    // An integer survivor costs its width: four-byte codes for every row win only when every row survives.
+    cm.type = .INT32;
+    try std.testing.expect(keyCodesCheaper(cm, 1000, 1000));
+    try std.testing.expect(!keyCodesCheaper(cm, 1000, 999));
+    cm.type = .INT64;
+    try std.testing.expect(keyCodesCheaper(cm, 1000, 500));
+    try std.testing.expect(!keyCodesCheaper(cm, 1000, 130));
 }
 
 test "PLAIN byte-array lengths record emptiness without the payloads" {

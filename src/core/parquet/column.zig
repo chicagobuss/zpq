@@ -336,6 +336,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
             };
         }
 
+        /// Compressed data pages replace `scratch.page` and stay valid only until the next page. The dictionary
+        /// page stays in `scratch.dict`. A caller that compares or hashes a page before `nextPage` never holds
+        /// the chunk's pages at once. Uncompressed pages remain views of the chunk. No scratch, no change.
+        pub fn recycleDataPages(self: *Self) void {
+            self.pages.scratch = self.scratch;
+        }
+
         /// Decode up to `dest.len` values into `dest`. Returns the
         /// number written. Zero means the chunk is fully consumed.
         ///
@@ -2907,4 +2914,166 @@ test "flat level runs validate eagerly and remain encoded until the consumer win
         try testing.expectError(error.DefLevelsMismatch, reader.installDefLevels(&.{ 2, 3 }, 2));
         try testing.expectError(error.LevelOutOfRange, reader.installDefLevels(&.{ 4, 3 }, 2));
     }
+}
+
+fn appendSnappyPage(
+    arena: std.mem.Allocator,
+    chunk: *std.ArrayList(u8),
+    header: schema.PageHeader,
+    raw: []const u8,
+) !void {
+    const compressed = try @import("compression.zig").compress(arena, raw, .SNAPPY);
+    var h = header;
+    h.uncompressed_page_size = @intCast(raw.len);
+    h.compressed_page_size = @intCast(compressed.len);
+    var w = thrift.Writer.init(arena);
+    try h.write(&w);
+    try chunk.appendSlice(arena, w.bytes());
+    try chunk.appendSlice(arena, compressed);
+}
+
+fn plainByteBody(arena: std.mem.Allocator, values: []const []const u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    var len: [4]u8 = undefined;
+    for (values) |v| {
+        std.mem.writeInt(u32, &len, @intCast(v.len), .little);
+        try body.appendSlice(arena, &len);
+        try body.appendSlice(arena, v);
+    }
+    return body.items;
+}
+
+// Page-at-a-time byte arrays: a reused scratch page, a dictionary that outlives the plain page that follows it,
+// and the same values a reader that keeps every page would return. Covers an empty string, a null, PLAIN after a
+// dictionary page, and a V2 page.
+test "recycled BYTE_ARRAY pages reuse one buffer and match a retained decode" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var chunk: std.ArrayList(u8) = .empty;
+    const dict_raw = try plainByteBody(arena, &.{ "da", "" });
+    try appendSnappyPage(arena, &chunk, .{
+        .type = .DICTIONARY_PAGE,
+        .uncompressed_page_size = 0,
+        .compressed_page_size = 0,
+        .crc = null,
+        .data_page_header = null,
+        .dictionary_page_header = .{ .num_values = 2, .encoding = .PLAIN, .is_sorted = null },
+        .data_page_header_v2 = null,
+    }, dict_raw);
+    // Two RLE-dictionary rows, both the empty entry, then a PLAIN page. Bit width 1, one RLE run of 2 × index 1.
+    try appendSnappyPage(arena, &chunk, .{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = 0,
+        .compressed_page_size = 0,
+        .crc = null,
+        .data_page_header = .{
+            .num_values = 2,
+            .encoding = .RLE_DICTIONARY,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    }, &.{ 1, 2 << 1, 1 });
+    const plain_raw = try plainByteBody(arena, &.{ "plain", "" });
+    const plain_header = schema.PageHeader{
+        .type = .DATA_PAGE,
+        .uncompressed_page_size = 0,
+        .compressed_page_size = 0,
+        .crc = null,
+        .data_page_header = .{
+            .num_values = 2,
+            .encoding = .PLAIN,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = null,
+    };
+    try appendSnappyPage(arena, &chunk, plain_header, plain_raw);
+    // Smaller than the previous page, so it must reuse that buffer rather than keep both.
+    var tail_header = plain_header;
+    tail_header.data_page_header = .{
+        .num_values = 1,
+        .encoding = .PLAIN,
+        .definition_level_encoding = .RLE,
+        .repetition_level_encoding = .RLE,
+    };
+    const tail_raw = try plainByteBody(arena, &.{"z"});
+    try appendSnappyPage(arena, &chunk, tail_header, tail_raw);
+
+    const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    var kept = ColumnChunkReader([]const u8).init(chunk.items, .SNAPPY, levels, arena);
+    var whole: [5][]const u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), try kept.decode(&whole));
+
+    var scratch = DecodeScratch.init(testing.allocator);
+    defer scratch.deinit();
+    var streamed = ColumnChunkReader([]const u8).initWithOptions(chunk.items, .SNAPPY, levels, arena, .{}, &scratch);
+    streamed.recycleDataPages();
+    var copied: [5][]const u8 = undefined;
+    var at: usize = 0;
+    var prev: ?[*]u8 = null;
+    var reused = false;
+    while (try streamed.nextPage()) {
+        const n = streamed.pageValuesLeft();
+        var page: [2][]const u8 = undefined;
+        try testing.expectEqual(n, try streamed.decode(page[0..n]));
+        for (page[0..n]) |s| {
+            copied[at] = try arena.dupe(u8, s);
+            at += 1;
+        }
+        try testing.expect(scratch.page.len > 0);
+        try testing.expect(scratch.page.len < plain_raw.len + tail_raw.len + dict_raw.len);
+        if (prev) |p| reused = reused or p == scratch.page.ptr;
+        prev = scratch.page.ptr;
+    }
+    try testing.expect(reused);
+    try testing.expectEqual(@as(usize, 5), at);
+    try testing.expect(scratch.dict.ptr != scratch.page.ptr);
+    try testing.expectEqualStrings("da", streamed.dictionary.?[0]);
+    try testing.expectEqual(@as(usize, 0), streamed.dictionary.?[1].len);
+    for (whole, copied) |w, c| try testing.expectEqualStrings(w, c);
+
+    // V2, optional: a present string, a null, and an empty string. Def levels are one bit-packed group.
+    const present = [_]u8{ (1 << 1) | 1, 0b101 };
+    var v2_body: std.ArrayList(u8) = .empty;
+    try v2_body.appendSlice(arena, &present);
+    try v2_body.appendSlice(arena, try plainByteBody(arena, &.{ "a", "" }));
+    const v2 = schema.PageHeader{
+        .type = .DATA_PAGE_V2,
+        .uncompressed_page_size = @intCast(v2_body.items.len),
+        .compressed_page_size = @intCast(v2_body.items.len),
+        .crc = null,
+        .data_page_header = null,
+        .dictionary_page_header = null,
+        .data_page_header_v2 = .{
+            .num_values = 3,
+            .num_nulls = 1,
+            .num_rows = 3,
+            .encoding = .PLAIN,
+            .definition_levels_byte_length = present.len,
+            .repetition_levels_byte_length = 0,
+            .is_compressed = false,
+        },
+    };
+    var vw = thrift.Writer.init(arena);
+    try v2.write(&vw);
+    const v2_chunk = try std.mem.concat(arena, u8, &.{ vw.bytes(), v2_body.items });
+    var v2_reader = ColumnChunkReader([]const u8).init(
+        v2_chunk,
+        .UNCOMPRESSED,
+        .{ .max_def = 1, .max_rep = 0 },
+        arena,
+    );
+    var v2_vals: [3][]const u8 = undefined;
+    var v2_def: [3]u32 = undefined;
+    try testing.expect(try v2_reader.nextPage());
+    try testing.expectEqual(@as(usize, 3), try v2_reader.decodeWithLevels(&v2_vals, &v2_def));
+    try testing.expectEqualStrings("a", v2_vals[0]);
+    try testing.expect(v2_def[1] < 1);
+    try testing.expectEqual(@as(usize, 0), v2_vals[2].len);
+    try testing.expect(v2_def[2] >= 1);
 }

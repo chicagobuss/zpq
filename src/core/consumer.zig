@@ -1123,10 +1123,11 @@ pub const SliceReader = struct {
             },
             .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => blk: {
                 const Reader = column_mod.ColumnChunkReader([]const u8);
-                // The dictionary is the slot's chunk store. Page-local decoder memory stays on the page arena,
-                // which resets between pages. The shared bookkeeping arena would grow a node per column and keep it.
+                // The dictionary is the slot's chunk store. Decoder temps stay on the page arena, which resets
+                // between pages. Compressed data pages replace one scratch buffer instead of accumulating there.
                 const pages_alloc = if (slot) |s| s.pages.allocator() else a;
-                var r = Reader.initWithOptions(chunk, cm.codec, levels, pages_alloc, decode_options, null);
+                var r = Reader.initWithOptions(chunk, cm.codec, levels, pages_alloc, decode_options, scratch);
+                r.recycleDataPages();
                 if (slot) |s| {
                     r.dictionary_arena = s.dictionary.allocator();
                     r.pages.dictionary_arena = s.dictionary.allocator();
@@ -4482,9 +4483,23 @@ fn scanRGForAggImpl(
         const fits_share = full <= b.share();
         const discovering = target == .grouped and target.grouped.table.discovery != null;
         const force_cache = ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target));
-        const whole = !force_cache and fits_share and admitWhole(ws, full);
+        // A filter-only or hash-only string is hashed or compared per page. Decoding the chunk whole faults the
+        // decompressed bytes into the row-group region and holds them until the scan releases every region.
+        const stream_rows = streamWindowRows(in, target, num_rows);
+        const stream = stream_rows != std.math.maxInt(usize);
+        const whole = !stream and !force_cache and fits_share and admitWhole(ws, full);
         if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
-        if (!whole) if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full)) |kept|
+        if (!whole) if (try scanRGSliced(
+            gpa,
+            in,
+            decode_options,
+            target,
+            ws,
+            b,
+            handled_via_stats,
+            full,
+            stream_rows,
+        )) |kept|
             return kept;
         if (!whole) {
             if (target == .grouped and target.grouped.records != null) return error.ExceededMemoryBudget;
@@ -4566,7 +4581,17 @@ fn scanRGForAggImpl(
             }
             // No record has been emitted: release the failed whole-decode payload before rereading it in slices.
             if (target == .grouped) if (target.grouped.records) |records| records.rewindRetained();
-            if (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full_estimate)) |kept|
+            if (try scanRGSliced(
+                gpa,
+                in,
+                decode_options,
+                target,
+                ws,
+                b,
+                handled_via_stats,
+                full_estimate,
+                streamWindowRows(in, target, num_rows),
+            )) |kept|
                 return kept;
             return err;
         };
@@ -4842,6 +4867,7 @@ fn filterSurvivors(
     payload: []const bool,
     num_rows: usize,
     ws: AggWorkspace,
+    stream_rows: usize,
 ) !?filter_selection.SelectionVector {
     const pool = try poolOn(&ws.scratch.slice, side);
     var n_readers: usize = 0;
@@ -4866,8 +4892,9 @@ fn filterSurvivors(
     }
     const slice = pool.valueArena();
     defer _ = slice.reset(.retain_capacity);
-    // A memory granule over the filter's own columns; it never changes which rows survive.
-    const step: usize = 1 << 16;
+    // A memory granule over the filter's own columns; it never changes which rows survive. A streamed string
+    // keeps that granule inside one worker's L2, so the copied page is reused instead of the whole chunk.
+    const step: usize = @min(@as(usize, 1 << 16), stream_rows);
     var done: usize = 0;
     while (done < num_rows) : (done += step) {
         _ = slice.reset(.retain_capacity);
@@ -4912,7 +4939,9 @@ fn openSlicedPayload(
         // reads; a column shared by the filter and an aggregate still needs its value lane here.
         if (payload != null and ci < in.consumed.len and !in.consumed[ci]) continue;
         var options = decode_options;
-        options.any_dictionary = target.codedKey(ci);
+        // A streamed string is compared or hashed from its bytes. Codes would take the dictionary fast path on a
+        // pure-dictionary window and the value path on the next, which is not how the whole chunk folds.
+        options.any_dictionary = target.codedKey(ci) and !streamByteArray(in, target, ci);
         options.decimal_exact_only = target.exactInputs();
         if (payload) |p| if (p[ci]) if (survivors) |sv| {
             options.row_gate = sv;
@@ -4940,6 +4969,7 @@ fn scanRGSliced(
     budget: *DecodeBudget,
     handled: []const bool,
     full: usize,
+    stream_rows: usize,
 ) !?u64 {
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
@@ -4962,7 +4992,16 @@ fn scanRGSliced(
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
     const payload = try payloadColumns(pages.allocator(), in, target);
     var survivors: filter_selection.SelectionVector = undefined;
-    if (payload) |p| survivors = (try filterSurvivors(pages.allocator(), side, in, decode_options, p, num_rows, ws)) orelse
+    if (payload) |p| survivors = (try filterSurvivors(
+        pages.allocator(),
+        side,
+        in,
+        decode_options,
+        p,
+        num_rows,
+        ws,
+        stream_rows,
+    )) orelse
         return null;
     // The filter pass has released its readers. The same slots decode the payload.
     try openSlicedPayload(
@@ -4988,7 +5027,7 @@ fn scanRGSliced(
         ws.decode_batch_rows
     else
         std.math.maxInt(usize);
-    const slice_rows = sliceRows(@min(@min(budget.share(), room) / per_row, forced), num_rows);
+    const slice_rows = sliceRows(@min(@min(budget.share(), room) / per_row, @min(forced, stream_rows)), num_rows);
     const reserved = @min(budget.limit, slice_rows * per_row);
     try budget.acquire(reserved);
     defer budget.release(reserved);
@@ -5287,6 +5326,91 @@ fn filterMentions(f: filter_ast.Filter, ci: usize) bool {
         } else false,
         inline else => |l| l.col_idx == ci,
     };
+}
+
+/// PLAIN and dictionary data pages only. Delta byte arrays expand into the arena, so they stay on the
+/// whole-chunk decode.
+fn reusableByteEncodings(encodings: []const schema.Encoding) bool {
+    var saw = false;
+    for (encodings) |e| switch (e) {
+        .PLAIN, .RLE_DICTIONARY, .PLAIN_DICTIONARY => saw = true,
+        .RLE, .BIT_PACKED => {},
+        else => return false,
+    };
+    return saw;
+}
+
+fn bareColumn(e: expr_ast.Expr, ci: usize) bool {
+    return e == .col_ref and e.col_ref.col_idx == ci;
+}
+
+/// The column is hashed and not kept as a value: a bare GROUP BY key, or `count(DISTINCT col)`, and neither
+/// a record projection nor any other aggregate.
+fn hashOnlyByteArray(target: AggTarget, ci: usize) bool {
+    switch (target) {
+        .scalar => |s| {
+            var saw = false;
+            for (s.calls) |call| {
+                if (call.where) |w| if (filterMentions(w, ci)) return false;
+                if (call.arg) |arg| {
+                    if (exprMentions(arg, ci)) {
+                        if (call.func != .count_distinct or !bareColumn(arg, ci)) return false;
+                        saw = true;
+                    }
+                }
+            }
+            return saw;
+        },
+        .grouped => |g| {
+            if (g.records != null) return false;
+            var saw = false;
+            for (g.keys) |k| {
+                if (exprMentions(k, ci)) {
+                    if (!bareColumn(k, ci)) return false;
+                    saw = true;
+                }
+            }
+            for (g.calls) |call| {
+                if (call.where) |w| if (filterMentions(w, ci)) return false;
+                if (call.arg) |arg| {
+                    if (exprMentions(arg, ci)) {
+                        if (call.func != .count_distinct or !bareColumn(arg, ci)) return false;
+                        saw = true;
+                    }
+                }
+            }
+            return saw;
+        },
+    }
+}
+
+/// Filter-only or hash-only flat BYTE_ARRAY: the scan reads it a cache-sized window at a time instead of
+/// decompressing the chunk into the row-group region.
+fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
+    if (ci >= in.read.len or !in.read[ci] or ci >= in.rg.columns.items.len) return false;
+    const cm = in.rg.columns.items[ci].meta_data orelse return false;
+    if (cm.type != .BYTE_ARRAY) return false;
+    if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return false;
+    if (!reusableByteEncodings(cm.encodings.items)) return false;
+    const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
+    if (filtered and !columnFeedsFold(target, ci)) return true;
+    return hashOnlyByteArray(target, ci);
+}
+
+/// Rows of the widest streamed string that fit in one worker's L2. `maxInt` when nothing streams, so the
+/// caller keeps the window it already chose. At least one float-sum block: a shorter window would split a block.
+fn streamWindowRows(in: AggRowGroup, target: AggTarget, num_rows: usize) usize {
+    var per: usize = 0;
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or !streamByteArray(in, target, ci)) continue;
+        const cm = in.rg.columns.items[ci].meta_data orelse continue;
+        const n: usize = @intCast(@max(cm.num_values, 1));
+        const bytes: usize = @intCast(@max(cm.total_uncompressed_size, 1));
+        per = @max(per, @max(1, bytes / n));
+    }
+    if (per == 0) return std.math.maxInt(usize);
+    const cache = @import("hw.zig").l2BytesPerWorkerOr(1 << 20);
+    return @max(64, @min(num_rows, cache / per));
 }
 
 /// The fold reads `ci` after the filter: a group key, an aggregate argument, or a per-aggregate FILTER.
@@ -11257,4 +11381,102 @@ test "grouped key dictionaries keep later-key codes with and without dense lanes
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Trial.run, .{ capture.bytes.items, &meta });
+}
+
+test "filter-only and hash-only strings stream a cache-sized window, other strings do not" {
+    const hw = @import("hw.zig");
+    defer hw.test_cpu = null;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .max_sharing = 1 } };
+    var enc_plain = [_]schema.Encoding{ .PLAIN, .RLE, .RLE_DICTIONARY };
+    var enc_delta = [_]schema.Encoding{ .PLAIN, .DELTA_BYTE_ARRAY };
+    var path = [_][]const u8{"k"};
+    var columns = [1]schema.ColumnChunk{.{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .{ .items = &enc_plain, .capacity = enc_plain.len, .pointer_stability = .{} },
+            .path_in_schema = .{ .items = &path, .capacity = 1, .pointer_stability = .{} },
+            .codec = .SNAPPY,
+            .num_values = 100_000,
+            .total_uncompressed_size = 130 * 100_000,
+            .total_compressed_size = 40 * 1000,
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    }};
+    const group = schema.RowGroup{
+        .columns = .{ .items = &columns, .capacity = 1, .pointer_stability = .{} },
+        .total_byte_size = 40 * 1000,
+        .num_rows = 1000,
+    };
+    var elements = [_]schema.SchemaElement{ fl_test_elem, fl_test_elem };
+    elements[0].name = "schema";
+    elements[0].type = null;
+    elements[0].num_children = 1;
+    elements[1].name = "k";
+    elements[1].type = .BYTE_ARRAY;
+    elements[1].repetition_type = .REQUIRED;
+    var groups = [_]schema.RowGroup{group};
+    const meta = schema.FileMetaData{
+        .version = 1,
+        .schema = .{ .items = &elements, .capacity = 2, .pointer_stability = .{} },
+        .num_rows = 1000,
+        .row_groups = .{ .items = &groups, .capacity = 1, .pointer_stability = .{} },
+        .created_by = null,
+    };
+    const filter: filter_ast.Filter = .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "x" } };
+    const in = AggRowGroup{
+        .rg = &groups[0],
+        .meta = &meta,
+        .src = .{ .bytes = &.{}, .byte_origin = 0 },
+        .filter = filter,
+        .read = &.{true},
+        .consumed = &.{false},
+    };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const scalar_filter: AggTarget = .{ .scalar = .{ .calls = &.{}, .accumulators = &.{} } };
+    try std.testing.expect(streamByteArray(in, scalar_filter, 0));
+    const rows = streamWindowRows(in, scalar_filter, 100_000);
+    // 130 bytes of string per row into 1 MiB of L2. The window is that many rows, not the chunk.
+    try std.testing.expectEqual(@as(usize, (1 << 20) / 130), rows);
+
+    const distinct: expr_agg.AggCall = .{
+        .func = .count_distinct,
+        .arg = key,
+        .where = null,
+        .alias = "d",
+        .result = .i64,
+    };
+    var no_filter = in;
+    no_filter.filter = null;
+    no_filter.consumed = &.{true};
+    const scalar_distinct: AggTarget = .{ .scalar = .{ .calls = &.{distinct}, .accumulators = &.{} } };
+    try std.testing.expect(streamByteArray(no_filter, scalar_distinct, 0));
+
+    var table: expr_agg.GroupTable = undefined;
+    const grouped: AggTarget = .{ .grouped = .{
+        .calls = &.{},
+        .keys = &.{key},
+        .table = &table,
+        .pos_base = 0,
+    } };
+    try std.testing.expect(streamByteArray(no_filter, grouped, 0));
+
+    const min_call: expr_agg.AggCall = .{
+        .func = .min,
+        .arg = key,
+        .where = null,
+        .alias = "m",
+        .result = .bytes,
+    };
+    const scalar_min: AggTarget = .{ .scalar = .{ .calls = &.{min_call}, .accumulators = &.{} } };
+    try std.testing.expect(!streamByteArray(no_filter, scalar_min, 0));
+
+    var delta = columns[0].meta_data.?;
+    delta.encodings = .{ .items = &enc_delta, .capacity = enc_delta.len, .pointer_stability = .{} };
+    columns[0].meta_data = delta;
+    try std.testing.expect(!streamByteArray(in, scalar_filter, 0));
+    try std.testing.expectEqual(std.math.maxInt(usize), streamWindowRows(in, scalar_filter, 100_000));
 }

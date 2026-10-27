@@ -6952,7 +6952,13 @@ fn pairLocalSetWork(
     const stat = try ndv.collect(gpa, arena, files, metas, keys, workers, args.max_memory, false);
     const entries = std.math.cast(usize, stat.entries orelse return null) orelse return null;
     const key_bytes: usize = 1 + if (keys[0].col_ref.physical_type == .INT32) @as(usize, 4) else 8;
-    const set_bytes = expr_agg.GroupTable.variableEntryBytes(key_bytes, calls.len) +| @sizeOf(expr_agg.DistinctSet);
+    const key_table_bytes = expr_agg.GroupTable.variableEntryBytes(key_bytes, calls.len);
+    // A cache-resident local group index also permits effective pair-cache coalescing. Its joint value NDV is
+    // unknown: comparing worst-case owner rows with just the set objects would systematically underprice sets.
+    // Keep the existing pair trial in that case; only price a table that exceeds its active workers' L2 shares here.
+    const l2 = @import("hw.zig").l2BytesPerWorkerOr(640 << 10);
+    if (entries *| key_table_bytes <= workers *| l2) return null;
+    const set_bytes = key_table_bytes +| @sizeOf(expr_agg.DistinctSet);
     // Read the key/value and table pointers, then visit the local distinct values in the final set merge.
     return entries *| set_bytes +| rows *| (key_bytes + @sizeOf(u64) * 2 + @sizeOf(usize) * 2);
 }
@@ -7020,6 +7026,25 @@ fn pairAnswerBits(
         0,
         args.byte_top_partitions,
     ) orelse return null;
+    if (top and args.plain_rules and args.distinct_pairs == .auto and args.integer_records_min_rows != 0) {
+        // Ask the existing admission, including its compression/range, schema, top-H and memory checks. This
+        // prices a real alternative, not a raw integer plan that cannot execute this query.
+        var legacy_args = args;
+        if (try inlineIntegerAnswer(gpa, arena, &legacy_args, metas, plan, work, calls, keys, outputs, workers, timings, .{ .refined = null }, true)) |legacy| {
+            if (legacy.layout == .integer_distinct_top_h) {
+                const O = owner_groups.IntSumTop;
+                // One key-owner reduction sorts its complete (key,value) records and counts directly into H.
+                // The packed route materializes pair groups and then reduces them by group a second time.
+                const legacy_work = rows *| (@sizeOf(O.Record) + @sizeOf(O.Group) + @sizeOf(u64)) +|
+                    workers *| cut.?.k *| @sizeOf(O.Group);
+                const pair_work = pq.work +| gq.work +| workers *| cut.?.k *| @sizeOf(G.Group);
+                if (legacy_work <= pair_work) {
+                    if (!explain_only) if (args.taken) |taken| taken.insert(.plain_rule);
+                    return null;
+                }
+            }
+        }
+    }
     if (try pairLocalSetWork(gpa, arena, args, metas, plan, work, calls, keys, distinct, rows, workers)) |sets| {
         if (sets <= pq.work +| gq.work) {
             if (!explain_only) if (args.taken) |taken| taken.insert(.plain_rule);
@@ -26452,6 +26477,10 @@ test "raw payload owner multisets preserve NULLs AVG ties readers and poisoned-r
 }
 
 test "distinct admission prices both wide pair reductions against covered local sets" {
+    const hw = @import("hw.zig");
+    const saved_cpu = hw.test_cpu;
+    defer hw.test_cpu = saved_cpu;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 128 } };
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -26486,6 +26515,10 @@ test "distinct admission prices both wide pair reductions against covered local 
     };
     const ex = try explainAggregate(gpa, a, args);
     try testing.expect(ex.record_path == null or ex.record_path.?.layout != .pair_distinct);
+    // A small local group table must retain the cache's opportunity to coalesce pairs.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20 } };
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+    hw.test_cpu = .{ .l2 = .{ .bytes = 128 } };
     // A budget retry disables plain cost rules and must recover the available exact owner.
     args.plain_rules = false;
     try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
@@ -26547,6 +26580,57 @@ test "distinct admission refuses declared dictionary fallback before retaining a
     var want = try runMultiAggregate(gpa, a, args);
     defer want.deinit(gpa);
     try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    args.distinct_pairs = .on;
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+}
+
+test "distinct admission compares wide pair work with the admitted integer DISTINCT top cut" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [2048]i64 = undefined;
+    var x: [2048]i64 = undefined;
+    for (&k, &x, 0..) |*key, *value, i| {
+        key.* = @bitCast(std.hash.Wyhash.hash(0, std.mem.asBytes(&i)));
+        value.* = @intCast(i % 127);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i64 = .{ .values = &k } }, .parquet_type = .INT64, .nullable = false },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = &x } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 16;
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "integer-distinct-cost", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(DISTINCT x) AS d",
+        .group_by = "k",
+        .integer_records = false,
+        .integer_records_min_rows = 1,
+        .max_memory = 256 << 20,
+        .min_bytes_per_worker = 1,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 7, .offset = 2 },
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    args.integer_records = true;
+    for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+        args.parallelism = j;
+        args.decode_batch_rows = window;
+        const ex = try explainAggregate(gpa, a, args);
+        try testing.expectEqual(.integer_distinct_top_h, ex.record_path.?.layout);
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    };
     args.distinct_pairs = .on;
     try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
 }

@@ -637,6 +637,8 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
 ### Platforms
 
 - CLI release builds: Linux x86_64 and arm64 (static musl), macOS arm64 and x86_64 (macOS 15 or later).
+- Linux x86_64 builds target x86-64-v3 (AVX2); the -compat archive runs on any x86-64. On a CPU without a v3
+  feature the default build names it and the compat archive, and exits 3, instead of dying with SIGILL.
 - Lambda: `zpq-lambda` for `provided.al2023`, arm64 and x86_64. The Lambda build has no SQL; a SQL request answers
   `SqlNotCompiledIn`.
 - libzpq: Linux x86_64 and arm64 (glibc 2.28 or later, or musl) and macOS arm64 and x86_64; the macOS libraries are

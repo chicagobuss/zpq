@@ -78,6 +78,7 @@ pub const profile = @import("profile.zig");
 pub const profile_summary = @import("profile_summary.zig");
 pub const output_publication = @import("output_publication.zig");
 pub const local_fs = @import("local_fs.zig");
+pub const cpu_level = @import("cpu_level.zig");
 
 pub const io = struct {
     pub const strategy = @import("io/strategy.zig");

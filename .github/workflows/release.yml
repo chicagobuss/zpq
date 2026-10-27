@@ -55,6 +55,13 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist --tag "$TAG"
 
+      # x86_64 Linux ships two archives: x86-64-v3 (the default, checked at startup) and -compat (baseline CPU).
+      - name: Run the compat archive's binary
+        if: matrix.target == 'x86_64-linux-musl'
+        run: |
+          mkdir -p compat && tar -xzf dist/*-x86_64-linux-musl-compat.tar.gz -C compat
+          compat/bin/zpq --version
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

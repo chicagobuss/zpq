@@ -94,6 +94,7 @@ fn emitError(err: anyerror) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    zpq.cpu_level.require();
     const gpa = init.gpa;
     local_fs.raiseOpenFileLimit();
     zpq.core.memory.fixHeapThreshold();

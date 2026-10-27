@@ -15707,6 +15707,8 @@ fn sameAccBits(a: expr_agg.Accumulator, b: expr_agg.Accumulator) bool {
         .max_f => |v| F.f(v, b.max_f),
         .min_bytes => |v| F.s(v, b.min_bytes),
         .max_bytes => |v| F.s(v, b.max_bytes),
+        .min_arena => |v| std.meta.eql(v, b.min_arena),
+        .max_arena => |v| std.meta.eql(v, b.max_arena),
         .avg => |v| F.f(v.sum, b.avg.sum) and v.count == b.avg.count and v.isum == b.avg.isum,
         .sum_d => |v| v.lo == b.sum_d.lo and v.hi == b.sum_d.hi and v.n == b.sum_d.n,
         .avg_d => |v| v.lo == b.avg_d.lo and v.hi == b.avg_d.hi and v.n == b.avg_d.n,

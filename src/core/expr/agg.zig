@@ -4866,6 +4866,7 @@ pub const KeyArena = struct {
     const Block = struct { bytes: []u8, start: u32 };
     blocks: std.ArrayList(Block) = .empty,
     chunks: std.ArrayList([*]u8) = .empty,
+    data_bytes: usize = 0,
     block: usize = 0,
     used: usize = 0,
     /// A tiny query ceiling can bootstrap below one chunk without changing the logical 64 KiB offset geometry.
@@ -4916,9 +4917,7 @@ pub const KeyArena = struct {
     }
 
     pub fn held(self: *const KeyArena) usize {
-        var bytes = self.blocks.capacity * @sizeOf(Block) + self.chunks.capacity * @sizeOf([*]u8);
-        for (self.blocks.items) |b| bytes += b.bytes.len;
-        return bytes;
+        return self.data_bytes + self.blocks.capacity * @sizeOf(Block) + self.chunks.capacity * @sizeOf([*]u8);
     }
 
     pub fn projected(self: *const KeyArena, len: usize) !usize {
@@ -4946,6 +4945,7 @@ pub const KeyArena = struct {
             if (self.chunks.items.len + nc > self.chunks.capacity)
                 try self.chunks.ensureTotalCapacityPrecise(a, @max(self.chunks.items.len + nc, self.chunks.capacity * 2));
             const bytes = try a.alloc(u8, p.capacity);
+            self.data_bytes += bytes.len;
             self.blocks.appendAssumeCapacity(.{ .bytes = bytes, .start = @intCast(self.chunks.items.len * chunk_size) });
             for (0..nc) |i| self.chunks.appendAssumeCapacity(bytes.ptr + i * chunk_size);
         }
@@ -6172,6 +6172,9 @@ test "STRGROUP stable arena records cover empty embedded-zero and multi-chunk va
         if (n > 0) try std.testing.expectEqual(@as(u8, 17), bytes[n - 1]);
     }
     const blocks = arena.blocks.items.len;
+    var data_bytes: usize = 0;
+    for (arena.blocks.items) |block| data_bytes += block.bytes.len;
+    try std.testing.expectEqual(data_bytes, arena.data_bytes);
     const held = arena.held();
     arena.reset();
     try std.testing.expectEqualStrings("reuse", arena.get(try arena.put(a, "reuse")));

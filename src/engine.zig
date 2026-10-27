@@ -524,7 +524,32 @@ pub const AggregateExplanation = struct {
     max_memory: usize,
     sketch: ?scan.SketchTopK,
     result: ResultExplanation = .{},
+    /// The top-level AND's children in the order they run (`filter_ast.rankConjuncts`); one for a lone predicate.
+    conjuncts: []const Conjunct = &.{},
 };
+
+pub const Conjunct = struct { column: []const u8, cost: filter_ast.Cost };
+
+/// `filter`'s conjuncts as the plan runs them, each with the column it tests (a composite: its first leaf's).
+fn explainConjuncts(arena: std.mem.Allocator, filter: ?[]const u8, meta: *const schema.FileMetaData) ![]const Conjunct {
+    const text = filter orelse return &.{};
+    const f = try filter_parser.parse(arena, text, meta, null);
+    const children: []const filter_ast.Filter = switch (f) {
+        .and_filter => |c| if (c.in_set == null and !c.null_member) c.children else &.{f},
+        else => &.{f},
+    };
+    const out = try arena.alloc(Conjunct, children.len);
+    for (children, out) |child, *o| {
+        var cols: std.ArrayList(usize) = .empty;
+        try child.collectColumns(&cols, arena);
+        const name = if (cols.items.len == 0) "" else blk: {
+            const path = (try metadata.leafPathSegments(arena, meta, cols.items[0])) orelse break :blk "";
+            break :blk try std.mem.join(arena, ".", path);
+        };
+        o.* = .{ .column = name, .cost = filter_ast.cost(child) };
+    }
+    return out;
+}
 
 /// The result program's part of a plan: HAVING, hidden ORDER BY/HAVING columns, and whether the strategies may cut by
 /// the LIMIT (`masked` under HAVING, `none` without one).
@@ -782,6 +807,10 @@ fn executeAggregateOver(
             .max_memory = args.max_memory,
             .sketch = scan_args.sketch_topk,
             .result = .of(args.result_order),
+            .conjuncts = blk: {
+                const ms = metas orelse break :blk &.{};
+                break :blk if (ms.len == 0) &.{} else try explainConjuncts(arena, args.filter, &ms[0]);
+            },
         };
     }
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
@@ -6836,6 +6865,14 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
         if (stat.estimate) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");
         try writer.writeAll("}");
     } else try writer.writeAll("null");
+    try writer.writeAll(",\"conjuncts\":[");
+    for (explanation.conjuncts, 0..) |c, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"column\":\"");
+        try writeJsonString(writer, c.column);
+        try writer.print("\",\"cost\":\"{s}\"}}", .{@tagName(c.cost)});
+    }
+    try writer.writeByte(']');
     try writeExplainFacts(writer, a);
     try writer.writeAll(",\"plain_bytes_estimate\":");
     if (a.plan.plain_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");

@@ -2969,3 +2969,27 @@ test "regression: a `%` or arithmetic where a predicate wants a column is named,
     try testing.expectError(error.UnknownColumn, parse(a, "nope = 1", &meta, null));
     try testing.expectError(error.UnknownColumn, parse(a, "\"no % pe\" = 1", &meta, null));
 }
+
+test "an AND runs its conjuncts cheapest first, keeping written order within a class" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    // q21's shape: the LIKE `%x%` as written first, the empty-string test last.
+    const f = try parse(a, "status LIKE '%google%' AND status LIKE 'go%' AND status = 'x' AND id IS NOT NULL " ++
+        "AND status <> '' AND id IN (1, 2) AND score > 1", &meta, null);
+    const kids = f.and_filter.children;
+    try testing.expectEqual(@as(usize, 7), kids.len);
+    try testing.expect(kids[0] == .null_check);
+    try testing.expectEqualStrings("", kids[1].string.value);
+    try testing.expect(kids[2] == .double);
+    try testing.expectEqualStrings("x", kids[3].string.value);
+    try testing.expect(kids[4].or_filter.in_set != null);
+    try testing.expectEqual(ast.LikeKind.prefix, kids[5].like.kind);
+    try testing.expectEqual(ast.LikeKind.contains, kids[6].like.kind);
+    // An OR keeps its written order; inside it, an AND is ranked.
+    const o = try parse(a, "status LIKE '%a%' OR (status LIKE '%b%' AND id = 1)", &meta, null);
+    try testing.expect(o.or_filter.children[0] == .like);
+    try testing.expect(o.or_filter.children[1].and_filter.children[0] == .int32);
+}

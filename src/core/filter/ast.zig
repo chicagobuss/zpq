@@ -418,8 +418,50 @@ pub fn join(arena: std.mem.Allocator, conjunction: bool, operands: []const Filte
         };
         if (same) |c| try flat.appendSlice(arena, c.children) else try flat.append(arena, o);
     }
+    if (conjunction) rankConjuncts(flat.items);
     const c: Composite = .{ .children = try flat.toOwnedSlice(arena) };
     return if (conjunction) .{ .and_filter = c } else .{ .or_filter = c };
+}
+
+/// What testing a predicate costs per row, cheapest first: the order an AND runs its children in.
+pub const Cost = enum(u8) {
+    /// A definition level, a PLAIN length (`= ''`, `<> ''`) or a fixed-width compare.
+    fixed,
+    /// A string compare, or an IN list (one probe, or one lookup per dictionary entry).
+    string,
+    /// LIKE anchored at one end: one bounded compare.
+    like_anchored,
+    /// LIKE `%x%` or a general pattern: a search through each string.
+    like_search,
+};
+
+/// `f`'s cost class. A composite costs what its dearest child does.
+pub fn cost(f: Filter) Cost {
+    return switch (f) {
+        .int32, .int64, .uint64, .float, .double, .decimal, .boolean, .null_check => .fixed,
+        .string => |l| if (l.value.len == 0 and (l.op == .Eq or l.op == .NotEq)) .fixed else .string,
+        .like => |m| switch (m.kind) {
+            .exact, .prefix, .suffix => .like_anchored,
+            .contains, .general => .like_search,
+        },
+        .and_filter, .or_filter => |c| if (c.in_set != null) .string else blk: {
+            var dearest: Cost = .fixed;
+            for (c.children) |child| dearest = @fromBackingInt(@intCast(@max(@backingInt(dearest), @backingInt(cost(child)))));
+            break :blk dearest;
+        },
+    };
+}
+
+/// Order an AND's children cheapest first, so each dearer test runs on what the cheaper ones left: `SearchPhrase <>
+/// ''` before `URL LIKE '%google%'`. AND only clears bits and evaluates every child, so the answer is the same in any
+/// order. No leaf fails on its values, only on how its column was decoded (a DECIMAL's missing exact view, a lane the
+/// binder ruled out); the sort is stable, so the DECIMAL leaves, one class, keep their order and so their first error.
+pub fn rankConjuncts(children: []Filter) void {
+    std.sort.insertion(Filter, children, {}, struct {
+        fn lt(_: void, a: Filter, b: Filter) bool {
+            return @backingInt(cost(a)) < @backingInt(cost(b));
+        }
+    }.lt);
 }
 
 // ============================================================

@@ -533,6 +533,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             // The full answer: every group, contiguous per partition, and their first-appearance order.
             groups: []Group = &.{},
             winners: []u32 = &.{},
+            /// The full answer's winner map came from page_allocator (zero-filled), not `gpa`.
+            winners_fresh: bool = false,
             bitmap: []u64 = &.{},
             prefix: []u32 = &.{},
             starts: []usize = &.{},
@@ -757,7 +759,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 a.free(s.heaps);
                 a.free(s.blocks);
                 a.free(s.groups);
-                a.free(s.winners);
+                if (s.winners_fresh) std.heap.page_allocator.free(s.winners) else a.free(s.winners);
                 a.free(s.bitmap);
                 a.free(s.prefix);
                 a.free(s.starts);
@@ -1157,10 +1159,16 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         }
                     }.larger);
                     s.groups = try s.gpa.alloc(Group, s.rows);
-                    // The order pass reads every winner slot: advise the map for huge pages.
-                    var dense: HugePageAdvisor = .{ .child = s.gpa };
-                    s.winners = try dense.allocator().alloc(u32, s.rows);
-                    @memset(s.winners, 0);
+                    // The order pass reads every winner slot: advise the map for huge pages. It is mapped afresh
+                    // (page_allocator's anonymous mmap or committed Windows pages read as zero), so no serial clear.
+                    // rawAlloc, unlike alloc, does not fill safe builds' new memory with `undefined`.
+                    if (s.rows != 0) {
+                        var dense: HugePageAdvisor = .{ .child = std.heap.page_allocator };
+                        const raw = dense.allocator().rawAlloc(s.rows * @sizeOf(u32), .of(u32), @returnAddress()) orelse
+                            return error.OutOfMemory;
+                        s.winners = @as([*]u32, @ptrCast(@alignCast(raw)))[0..s.rows];
+                        s.winners_fresh = true;
+                    }
                     s.partition_ns = @intCast(now() - start);
                     start = now();
                 }

@@ -4908,11 +4908,14 @@ fn prepareAggregateWithMetas(
         args.max_memory,
         n_workers + if (part_on) partagg.n_parts else @as(usize, 0),
     );
+    const distinct_wide_parts = try arena.alloc(bool, agg_calls.len);
+    for (agg_calls, distinct_wide_parts) |call, *wide| wide.* = call.func == .count_distinct and
+        scalarDistinctWideParts(call.arg.?, metas, work_items.items);
     for (work_items.items) |item| {
         for (item.accumulators, 0..) |*acc, ai| {
             if (acc.* == .distinct) if (acc.distinct.heap()) |ds| {
                 if (group_by_keys == null and n_workers > 1) {
-                    if (agg_calls[item.agg_start + ai].arg.?.typeOf() == .str)
+                    if (distinct_wide_parts[item.agg_start + ai])
                         try ds.initStringPartitions(gpa, group_budget)
                     else
                         try ds.initPartitions(gpa, group_budget);
@@ -5350,12 +5353,12 @@ fn prepareAggregateWithMetas(
     var accumulators = try arena.alloc(expr_agg.Accumulator, agg_calls.len);
     for (agg_calls, accumulators) |call, *acc| acc.* = expr_agg.Accumulator.init(call);
     errdefer freeOwnedAccumulatorStrings(gpa, accumulators);
-    for (agg_calls, accumulators) |call, *acc| if (call.func == .count_distinct) {
+    for (agg_calls, accumulators, 0..) |call, *acc, ci| if (call.func == .count_distinct) {
         const ds = try gpa.create(expr_agg.DistinctSet);
         ds.* = .{};
         acc.* = .{ .distinct = .fromSet(ds) };
         if (group_by_keys == null and n_workers > 1) {
-            if (call.arg.?.typeOf() == .str)
+            if (distinct_wide_parts[ci])
                 try ds.initStringPartitions(gpa, group_budget)
             else
                 try ds.initPartitions(gpa, group_budget);
@@ -6684,6 +6687,40 @@ fn inlineByteAnswer(
         .part_agg = true,
         .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
     };
+}
+
+/// Sparse numeric images cannot promote to the bitmap: spreading their merge over the wide fanout is useful.
+/// A compact footer range retains the numeric fanout that makes bitmap promotion profitable. This prices traffic
+/// only: no value is skipped, and a later value outside the hint still joins the exact set.
+fn scalarDistinctWideParts(arg: expr_ast.Expr, metas: []const schema.FileMetaData, work: []const WorkItem) bool {
+    if (arg.typeOf() != .i64) return true;
+    if (arg != .col_ref) return false;
+    const c = arg.col_ref;
+    const width: usize = switch (c.physical_type) {
+        .INT32 => 4,
+        .INT64 => 8,
+        else => return true,
+    };
+    var lo: i128 = std.math.maxInt(i128);
+    var hi: i128 = std.math.minInt(i128);
+    for (work) |item| {
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        if (rg.num_rows == 0) continue;
+        const b = @import("parquet/statistics.zig").chunkStats(rg, c.col_idx, meta, .corroborated).bounds orelse return false;
+        if (b.min.len != width or b.max.len != width) return false;
+        const low: i128 = if (width == 4)
+            if (c.unsigned_32) std.mem.readInt(u32, b.min[0..4], .little) else std.mem.readInt(i32, b.min[0..4], .little)
+        else if (c.unsigned_64) std.mem.readInt(u64, b.min[0..8], .little) else std.mem.readInt(i64, b.min[0..8], .little);
+        const high: i128 = if (width == 4)
+            if (c.unsigned_32) std.mem.readInt(u32, b.max[0..4], .little) else std.mem.readInt(i32, b.max[0..4], .little)
+        else if (c.unsigned_64) std.mem.readInt(u64, b.max[0..8], .little) else std.mem.readInt(i64, b.max[0..8], .little);
+        lo = @min(lo, low);
+        hi = @max(hi, high);
+    }
+    if (lo > hi) return false;
+    const bytes = (@as(u128, @intCast(hi - lo)) + 64) / 64 * @sizeOf(u64);
+    return bytes > @import("hw.zig").l2BytesPerWorkerOr(256 << 10);
 }
 
 /// A footer-range cost hint shared by scalar and grouped distinct admission; it never supplies an answer.
@@ -26631,6 +26668,54 @@ test "distinct admission compares wide pair work with the admitted integer DISTI
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
     };
-    args.distinct_pairs = .on;
+    // A memory retry disables the cost rule while retaining the same checked raw identity. Forced .on instead
+    // uses unrestricted physical widths, which need not fit this 65+65-bit pair.
+    args.plain_rules = false;
     try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+}
+
+test "distinct admission scalar fanout prices sparse numeric ranges without changing identities" {
+    const gpa = testing.allocator;
+    const hw = @import("hw.zig");
+    const saved = hw.test_cpu;
+    defer hw.test_cpu = saved;
+    hw.test_cpu = .{ .l2 = .{ .bytes = 256 << 10 } };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sparse: [2048]i32 = undefined;
+    var compact: [2048]i64 = undefined;
+    for (&sparse, &compact, 0..) |*s, *c, i| {
+        s.* = @intCast((i % 1000) * 1000000);
+        c.* = @intCast(i % 127);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "s", .col = .{ .i32 = .{ .values = &sparse } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "c", .col = .{ .i64 = .{ .values = &compact } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, sparse.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 4);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 4;
+    const work = [_]WorkItem{.{ .file = 0, .rg = 0, .agg_start = 0, .agg_len = 0, .columns = .{ .read = &.{}, .consumed = &.{}, .preserve = &.{} }, .accumulators = &.{} }};
+    const s: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const c: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    try testing.expect(scalarDistinctWideParts(s, &.{meta}, &work));
+    try testing.expect(!scalarDistinctWideParts(c, &.{meta}, &work));
+    // With enough cache even the wide image may use the bitmap-friendly topology.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 30 } };
+    try testing.expect(!scalarDistinctWideParts(s, &.{meta}, &work));
+    for ([_][]const u8{ "s", "c" }) |column| {
+        const args: MultiAggArgs = .{ .inputs = &.{.{ .name = "scalar-fanout", .bytes = bytes.buffer.items }}, .metas = &.{meta}, .aggregate = try std.fmt.allocPrint(a, "count(DISTINCT {s}) AS d", .{column}), .parallelism = 4, .min_bytes_per_worker = 1, .integer_records = false, .max_memory = 64 << 20 };
+        hw.test_cpu = .{ .l2 = .{ .bytes = 256 << 10 } };
+        var wide = try runMultiAggregate(gpa, a, args);
+        defer wide.deinit(gpa);
+        hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 30 } };
+        var narrow = try runMultiAggregate(gpa, a, args);
+        defer narrow.deinit(gpa);
+        try testing.expectEqualDeep(wide.output.aggs, narrow.output.aggs);
+    }
 }

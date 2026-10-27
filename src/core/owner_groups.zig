@@ -12,6 +12,7 @@ const Selection = @import("filter/selection.zig").SelectionVector;
 const memory = @import("memory.zig");
 const spawn = @import("spawn.zig");
 const hw = @import("hw.zig");
+const HugePageAdvisor = @import("huge_pages.zig").HugePageAdvisor;
 const now = @import("../clock.zig").monoNs;
 pub const Lane = @import("owner_lanes.zig").Lane;
 pub const PackedLayout = @import("owner_lanes.zig").Layout;
@@ -736,7 +737,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     for (s.locals, 0..) |*l, i|
                         l.count_cache.entries = s.count_caches[i * cache_entries ..][0..cache_entries];
                 }
-                s.blocks = try a.alloc(Block, blockCount(rows, workers, parts));
+                // The full answer's blocks are claimed densely front to back: advise them for huge pages.
+                var dense: HugePageAdvisor = .{ .child = a };
+                s.blocks = try (if (kind == .full) dense.allocator() else a).alloc(Block, blockCount(rows, workers, parts));
                 for (s.locals) |*l| {
                     l.records = try Records.Frontier.init(a, parts);
                 }
@@ -1154,7 +1157,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         }
                     }.larger);
                     s.groups = try s.gpa.alloc(Group, s.rows);
-                    s.winners = try s.gpa.alloc(u32, s.rows);
+                    // The order pass reads every winner slot: advise the map for huge pages.
+                    var dense: HugePageAdvisor = .{ .child = s.gpa };
+                    s.winners = try dense.allocator().alloc(u32, s.rows);
                     @memset(s.winners, 0);
                     s.partition_ns = @intCast(now() - start);
                     start = now();

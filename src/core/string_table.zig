@@ -350,6 +350,10 @@ test "shared strings return all occupied ledger credit after mid-insert refusal"
 }
 
 fn failingSetup(a: std.mem.Allocator) !void {
+    // FailingAllocator's byte counters are not atomic. Keep two-worker setup coverage but retire on this thread;
+    // the ordinary allocator tests exercise parallel retirement.
+    spawn.injectFailureAfter(0);
+    defer spawn.resetFailure();
     var ledger: memory.SharedBudget = .{ .limit = 4 << 20 };
     defer testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic)) catch unreachable;
     var state = (try State.init(a, &ledger, &.{}, 0, true, 2)).?;

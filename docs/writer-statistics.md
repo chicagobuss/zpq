@@ -53,11 +53,6 @@ not an artifact produced by an historical writer. The generator is
 not expose a `created_by` override, so the Compact Thrift footer is rewritten.
 Core tests rewrite its writer strings, check pruning/count/min fallback and the
 CDH/equal-extrema cases, and compare against `--scan-all` under tight budgets.
-Modern-writer parity is also checked on valid generated data by
-`tools/writer_statistics_check.py CANDIDATE BASE [POLARS_PYTHON]`. It tests actual
-Arrow, DuckDB and zpq outputs, optional Polars output, and the checked-in Spark
-INT96 fixture, in addition to rewritten writer strings. Every generated output
-is read strictly with PyArrow; query answers compare with base bytes and DuckDB.
 
 Copied pages keep their encoded bodies and CRCs. Affected header statistics are
 removed with bounded stack scratch, without decompressing or buffering the page.

@@ -8,7 +8,7 @@
 //! scan, output — lives here.
 //!
 //! The architecture comes from the comparables synthesis in
-//! `docs/measurements/comparables.md`: a per-file `scan.Input`
+//! Tracker `zpq/measurements/comparables.md`: a per-file `scan.Input`
 //! abstraction at the engine level (Polars' `DynByteSource`) and a
 //! storage-shaped helper underneath that materializes Inputs from any
 //! backend (`local` mmap, `s3` parallel range-fetch). Single-file vs
@@ -1056,7 +1056,7 @@ const PAR1: [4]u8 = .{ 'P', 'A', 'R', '1' };
 //
 // Idiom: this is the same std.Io concurrency the S3 paths already use, applied
 // to CPU work — replacing raw std.Thread.spawn + buffer-all. (See the
-// probe_io_concurrency / probe_backpressure spikes for why async + async_limit,
+// probe_io_concurrency / probe_backpressure spikes at e76a1e3 for why async + async_limit,
 // not concurrent, and why a sliding window rather than byte credits.)
 
 /// A Sink that appends into an in-memory buffer (offsets relative to 0).
@@ -13402,7 +13402,7 @@ test "summary row counters: every input row, the rows read, and the rows the fil
 }
 
 test "a page that fails to decode is named by file, row group, column and page, on every query kind" {
-    // The torture case dict_index_oob_rle_500: an RLE_DICTIONARY index of 500 into a 12-entry dictionary, in data page
+    // The crafted case dict_index_oob_rle_500: an RLE_DICTIONARY index of 500 into a 12-entry dictionary, in data page
     // 1 (page 0 the dictionary) of `z`; its sibling is valid, so the failure is in the second input.
     const bad = "ci/fixtures/parquet/dict_index_oob.parquet";
     const good = "ci/fixtures/parquet/dict_index_ok.parquet";

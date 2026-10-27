@@ -312,9 +312,6 @@ curl -s localhost:8099/query -d '{"inputs": ["data.parquet"], "aggregate": "coun
   Lambda. Every filter × projection and filter × select writes the same file, byte for byte, and every
   filter × aggregate gives the same `"agg"` text.
 
-`tests/libzpq/overhead.sh` compares a query through a warm context with the CLI, which starts a process per query,
-in perf counters.
-
 `tests/libzpq/sql_differential.py` compares SQL NDJSON bytes at `-j1/3/16`, mixes 1,000 queries in one context
 with RSS checks, compares CLI error messages, and overlaps successful and failed SQL on 16 caller threads.
 Set `ZPQ_CLICKBENCH` to the sub1 parquet path and `ZPQ_CLICKBENCH_QUERIES` to the ClickBench queries.sql to

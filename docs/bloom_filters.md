@@ -128,7 +128,6 @@ reader can normalize them to a different byte representation of the same instant
 - `membership.zig` pins the binder's `stored` decision to hand-computed PLAIN bytes for each type, fuzzes values of
   every type through the writer and back through the reader's keys, and covers the S3 planning choices against a
   simulated remote.
-- `tools/bloom/check.py` (CI, via `tools/cli_smoke.sh`) checks with an independent Python SBBF that every value of
-  pyarrow- and zpq-written chunks tests present, and that zpq's lookups match pyarrow's counts.
-- `tools/bloom/interop.py` checks that DuckDB and Hardwood read zpq-written filters and prune with them, and that zpq's
-  lookups on files they and pyarrow wrote match DuckDB and `--scan-all`.
+- `tools/check/cases/bloom.json` (zpq-check) checks against the spec's hashing alone that every value of pyarrow- and
+  zpq-written chunks tests present, which chunks carry filters (automatic, opted out, explicit), that zpq's lookups
+  match DuckDB's counts with filters and under `--scan-all`, and that filters prune.

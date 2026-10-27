@@ -1,0 +1,87 @@
+{
+  "fixtures": [{"name": "main", "copy": "COPY (SELECT\n        (i - 2000)::INTEGER AS id,\n        (CASE WHEN i % 11 = 0 THEN NULL ELSE (i - 2000) * 1.5 END)::DOUBLE AS amt,\n        CAST(i AS DECIMAL(18,2)) AS price,\n        (CASE WHEN i % 13 = 0 THEN '' ELSE 'n' || i END) AS name,\n        (CASE WHEN i % 7 = 0 THEN NULL ELSE 'v' || i END) AS nname,\n        (DATE '2020-01-01' + i::INTEGER) AS d,\n        (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 3 = 0) END) AS flag,\n        (CASE WHEN i % 17 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + to_milliseconds(i) END)::TIMESTAMP_MS AS ts\n      FROM range(1, 4000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)"}],
+  "schema": ["id", "amt", "price", "name", "nname", "d", "flag", "ts"],
+  "matrices": [
+    {
+      "vars": {
+        "f": {
+          "none": {},
+          "id_gt": {"filter": "id > 500", "where": "id > 500"},
+          "amt_lt": {"filter": "amt < 100.5", "where": "amt < 100.5"},
+          "price_gt": {"filter": "price > 100.50", "where": "price > 100.50"},
+          "name_like": {"filter": "name LIKE 'n1%'", "where": "name LIKE 'n1%'"},
+          "nname_isnull": {"filter": "nname IS NULL", "where": "nname IS NULL"},
+          "nname_notnull": {"filter": "nname IS NOT NULL", "where": "nname IS NOT NULL"},
+          "flag_true": {"filter": "flag = true", "where": "flag = true"},
+          "flag_upper": {"filter": "flag = TRUE OR flag = False", "where": "flag = TRUE OR flag = False"},
+          "id_in": {"filter": "id IN (1, 5, 999)", "where": "id IN (1, 5, 999)"},
+          "id_between": {"filter": "id BETWEEN 100 AND 200", "where": "id BETWEEN 100 AND 200"},
+          "price_between": {"filter": "price BETWEEN 100.5 AND 200", "where": "price BETWEEN 100.5 AND 200"},
+          "date_between": {"filter": "d BETWEEN '2020-06-01' AND '2020-07-01'", "where": "d BETWEEN DATE '2020-06-01' AND DATE '2020-07-01'"},
+          "and": {"filter": "id > 500 AND name LIKE 'n9%'", "where": "id > 500 AND name LIKE 'n9%'"},
+          "or": {"filter": "id < 100 OR id > 1900", "where": "id < 100 OR id > 1900"},
+          "date_ge": {"filter": "d >= '2020-06-01'", "where": "d >= DATE '2020-06-01'"},
+          "not_in": {"filter": "id NOT IN (1,2,3)", "where": "id NOT IN (1,2,3)"},
+          "ts_ge_sub_ms": {"filter": "ts >= '2020-01-01 00:00:00.0995'", "where": "ts >= TIMESTAMP '2020-01-01 00:00:00.0995'"},
+          "ts_lt_sub_ms": {"filter": "ts < '2020-01-01 00:00:00.0995'", "where": "ts < TIMESTAMP '2020-01-01 00:00:00.0995'"},
+          "ts_eq_sub_ms": {"filter": "ts = '2020-01-01 00:00:00.0995'", "where": "ts = TIMESTAMP '2020-01-01 00:00:00.0995'"},
+          "ts_ne_sub_ms": {"filter": "ts != '2020-01-01 00:00:00.0995'", "where": "ts != TIMESTAMP '2020-01-01 00:00:00.0995'"},
+          "ts_between_sub_ms": {"filter": "ts BETWEEN '2020-01-01 00:00:00.0995' AND '2020-01-01 00:00:00.2005'", "where": "ts BETWEEN TIMESTAMP '2020-01-01 00:00:00.0995' AND TIMESTAMP '2020-01-01 00:00:00.2005'"},
+          "notnull_and_like": {"filter": "nname IS NOT NULL AND name LIKE 'n5%'", "where": "nname IS NOT NULL AND name LIKE 'n5%'"},
+          "id_neg": {"filter": "id < 0", "where": "id < 0"},
+          "amt_isnull": {"filter": "amt IS NULL", "where": "amt IS NULL"},
+          "flag_isnull": {"filter": "flag IS NULL", "where": "flag IS NULL"},
+          "empty_name": {"filter": "name = ''", "where": "name = ''"},
+          "in_null_str": {"filter": "name IN ('n5', NULL, 'n7')", "where": "name IN ('n5', NULL, 'n7')"},
+          "not_in_null_str": {"filter": "name NOT IN ('n5', NULL)", "where": "name NOT IN ('n5', NULL)"},
+          "in_null_num": {"filter": "id IN (1, NULL, 5)", "where": "id IN (1, NULL, 5)"},
+          "not_in_null_num": {"filter": "id NOT IN (1, null)", "where": "id NOT IN (1, null)"},
+          "not_group_in_null": {"filter": "NOT (id IN (1, NULL)) OR id = 7", "where": "NOT (id IN (1, NULL)) OR id = 7"},
+          "not_not_in_null": {"filter": "NOT (id NOT IN (1, NULL))", "where": "NOT (id NOT IN (1, NULL))"},
+          "paren_not": {"filter": "NOT (id > 500 AND nname IS NULL) AND (amt < 0 OR name LIKE 'n1%')", "where": "NOT (id > 500 AND nname IS NULL) AND (amt < 0 OR name LIKE 'n1%')"},
+          "quoted_kw": {"filter": "name = 'n1 OR id > 0' OR (id = 7 AND name != 'x) AND (y')", "where": "name = 'n1 OR id > 0' OR (id = 7 AND name != 'x) AND (y')"}
+        },
+        "p": {
+          "all": {},
+          "id_name": {"columns": ["id", "name"]},
+          "name_id": {"columns": ["name", "id"]},
+          "nname_only": {"columns": ["nname"]},
+          "price_d": {"columns": ["price", "d"]},
+          "flag_amt": {"columns": ["flag", "amt"]}
+        }
+      },
+      "cells": {"none": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "id_gt": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "amt_lt": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "price_gt": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "name_like": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "nname_isnull": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "nname_notnull": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "flag_true": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "flag_upper": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "id_in": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "id_between": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "price_between": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "date_between": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "and": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "or": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "date_ge": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "not_in": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "ts_ge_sub_ms": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "ts_lt_sub_ms": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "ts_eq_sub_ms": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "ts_ne_sub_ms": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "ts_between_sub_ms": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "notnull_and_like": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "id_neg": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "amt_isnull": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "flag_isnull": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "empty_name": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "in_null_str": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "not_in_null_str": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "in_null_num": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "not_in_null_num": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "not_group_in_null": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "not_not_in_null": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "paren_not": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"], "quoted_kw": ["all", "id_name", "name_id", "nname_only", "price_d", "flag_amt"]},
+      "case": {"emit": "copy", "query": {"filter": "${filter}", "columns": "${columns}", "select": "${select}"}, "oracle": {"compare": "except", "where": "${where}", "duck_select": "${duck_select}"}, "id": "${f}/${p}"}
+    },
+    {
+      "vars": {
+        "f": {
+          "none": {},
+          "id_gt": {"filter": "id > 500", "where": "id > 500"}
+        },
+        "s": {
+          "id_plus1": {"select": "id + 1 AS x", "duck_select": "id + 1 AS x"},
+          "concat": {"select": "name || '_z' AS x", "duck_select": "name || '_z' AS x"},
+          "coalesce": {"select": "coalesce(nname, 'NA') AS x", "duck_select": "coalesce(nname, 'NA') AS x"},
+          "strlen": {"select": "strlen(nname) AS x", "duck_select": "strlen(nname) AS x"},
+          "case_str": {"select": "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x", "duck_select": "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x"},
+          "case_dead_div": {"select": "CASE WHEN id = 0 THEN -1 ELSE 100 / id END AS x", "duck_select": "CASE WHEN id = 0 THEN -1 ELSE 100 // id END AS x"},
+          "case_bare_bool": {"select": "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x", "duck_select": "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x"},
+          "case_dec": {"select": "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x", "duck_select": "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x"},
+          "amt_x2": {"select": "amt * 2 AS x", "duck_select": "amt * 2 AS x"},
+          "amt_id": {"select": "amt + id AS x", "duck_select": "amt + id AS x"},
+          "int_null": {"select": "id + CASE WHEN amt IS NOT NULL THEN 1 END AS x", "duck_select": "id + CASE WHEN amt IS NOT NULL THEN 1 END AS x"},
+          "dec_null": {"select": "price * CASE WHEN amt IS NOT NULL THEN 2 END AS x", "duck_select": "price * CASE WHEN amt IS NOT NULL THEN 2 END AS x"},
+          "str_null": {"select": "nname || '_z' AS x", "duck_select": "nname || '_z' AS x"},
+          "null_div": {"select": "id / CASE WHEN id = 0 THEN NULL ELSE id END AS x", "duck_select": "id // CASE WHEN id = 0 THEN NULL ELSE id END AS x"},
+          "coal_arith": {"select": "coalesce(amt * 2, id, 0) AS x", "duck_select": "coalesce(amt * 2, id, 0) AS x"},
+          "coal_dec": {"select": "coalesce(price * CASE WHEN amt IS NOT NULL THEN 2 END, price + 1) AS x", "duck_select": "coalesce(price * CASE WHEN amt IS NOT NULL THEN 2 END, price + 1) AS x"},
+          "coal_str": {"select": "coalesce(nname || '_z', name, 'NA') AS x", "duck_select": "coalesce(nname || '_z', name, 'NA') AS x"},
+          "coal_lazy": {"select": "coalesce(id + 1, 100 / (id - id)) AS x", "duck_select": "id + 1 AS x"}
+        }
+      },
+      "cells": {"none": ["id_plus1", "concat", "coalesce", "strlen", "case_str", "case_dead_div", "case_bare_bool", "case_dec", "amt_x2", "amt_id", "int_null", "dec_null", "str_null", "null_div", "coal_arith", "coal_dec", "coal_str", "coal_lazy"], "id_gt": ["id_plus1", "concat", "coalesce", "strlen", "case_str", "case_dead_div", "case_bare_bool", "case_dec", "amt_x2", "amt_id", "int_null", "dec_null", "str_null", "null_div", "coal_arith", "coal_dec", "coal_str", "coal_lazy"]},
+      "case": {"emit": "copy", "query": {"filter": "${filter}", "columns": "${columns}", "select": "${select}"}, "oracle": {"compare": "except", "where": "${where}", "duck_select": "${duck_select}"}, "id": "select:${s}/${f}"}
+    }
+  ]
+}

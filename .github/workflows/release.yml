@@ -68,25 +68,16 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          python3 - <<'PY_SMOKE'
-          import hashlib, os, subprocess, sys
-          from pathlib import Path
-          sys.path.insert(0, "tools/verify")
-          import revision
-          target = os.environ["TARGET"]
-          dest = (Path("dist") / target / "bin").resolve()
-          names = ["zpq"]
-          if target.endswith("linux-musl"):
-              sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-              subprocess.run(["zig", "build", "lambda", "-j8", "-Doptimize=ReleaseFast", "-Dcpu=baseline",
-                              "-Dstrip=true", f"-Dtarget={target}", f"-Drevision={sha}",
-                              "--prefix", str(dest.parent)], check=True)
-              revision.integration(Path.cwd(), dest, target, False)
-              names += ["zpq-lambda", "zpq-integration"]
-          with (dest / "SHA256SUMS").open("w") as out:
-              for name in names:
-                  out.write(hashlib.sha256((dest / name).read_bytes()).hexdigest() + "  " + name + "\n")
-          PY_SMOKE
+          dest=dist/$TARGET
+          names=zpq
+          if [[ $TARGET == *-linux-musl ]]; then
+            zig build lambda -j8 -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dtarget=$TARGET \
+              -Drevision=$(git rev-parse HEAD) --prefix $dest
+            zig build integration-bin -j8 -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dtarget=$TARGET \
+              -Dintegration-runtime=release/$TARGET/bin --prefix $dest
+            names="zpq zpq-lambda zpq-integration"
+          fi
+          (cd $dest/bin && sha256sum $names > SHA256SUMS)
 
       - name: Upload native smoke bundle
         if: matrix.target != 'x86_64-macos'
@@ -111,13 +102,10 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-linux-musl
-            deferred: x86_64-macos
           - runner: ubuntu-24.04-arm
             target: aarch64-linux-musl
-            deferred: ''
           - runner: macos-14
             target: aarch64-macos
-            deferred: ''
     steps:
       - uses: actions/checkout@v4
         with:
@@ -141,10 +129,19 @@ jobs:
           fi
           chmod +x zpq*
 
+      - name: Install Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      # The shipped CLI through the release cases, and on Linux the shipped Lambda through the fake runtime.
       - name: Run the shipped release artifacts
-        run: >-
-          tools/release_smoke.sh --run-only --accept-deferred x86_64-macos
-          release ${{ matrix.target }} ${{ matrix.deferred }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          zig build check-runner -Doptimize=ReleaseSafe -j8
+          zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq release/$TARGET/bin/zpq --no-cache
+          if [[ $TARGET == *-linux-musl ]]; then release/$TARGET/bin/zpq-integration; fi
 
   release:
     name: Create Release

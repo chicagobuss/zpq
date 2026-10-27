@@ -1,0 +1,18 @@
+{
+  "fixtures": [{"recipe": "private_decode", "files": ["reducing_head"]}],
+  "matrices": [
+    {
+      "vars": {
+        "budget": {
+          "4GB": {"most": 1},
+          "2GB": {"most": 5}
+        },
+        "jobs": {
+          "4": {},
+          "16": {}
+        }
+      },
+      "case": {"id": "private-decode:${budget}:j${jobs}", "fixture": "reducing_head", "cli": ["query", "--query", "SELECT k,f,count(*) c FROM '{path}' GROUP BY k,f ORDER BY c DESC,k,f LIMIT 3", "-j", "${jobs}", "--max-memory", "${budget}", "--profile", "{out.trace.json}"], "oracle": {"compare": "exact_ordered", "sql": "SELECT k,f,count(*) c FROM '{path}' GROUP BY k,f ORDER BY c DESC,k,f LIMIT 3", "max_scans": "${most}"}}
+    }
+  ]
+}

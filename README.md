@@ -121,15 +121,8 @@ started an upload zpq never hears of. Give the output bucket a lifecycle rule wi
 
 ## Performance
 
-Numbers and trade-offs are dated and contextualised as they're captured. Harnesses:
-
-* `benchmarks/storage_compare.py` — workstation-direct comparison of zpq / duckdb / polars across local files, S3, and
-  R2.
-* `benchmarks/run_selectivity.sh` — Lambda S3-to-S3 sweep across selectivity levels (zpq vs Python lambda running polars
-  + duckdb).
-* `benchmarks/run_coldstart.sh` — cold-start comparison; the latest cold-start figures are in
-  [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
-* `benchmarks/regression/runner.py` — golden-output regression net.
+The latest cold-start figures, with their method, are in
+[`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
 
 <!-- 0.5.0 release figures go here once the release benchmark run is reviewed. -->
 
@@ -449,8 +442,8 @@ R2 and checks them against the sha256 digests in `vendor/boring_tls/prebuilt.sha
 
 ```bash
 just build           # ReleaseFast — both binaries
-just test            # unit tests (fixture-dependent ones report as
-                     # skipped unless the parquet-testing corpus is present)
+just check           # the commit gate: fixtures, unit tests, every case against DuckDB
+just full            # the full gate (tools/check/README.md)
 just test-integration  # Lambda integration tests
 just lambda-build    # static musl Lambda zips (ReleaseFast), both archs
 just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
@@ -552,23 +545,12 @@ src/
     local_reader.zig     Gated local reads: pread / io_uring into a windowed buffer
     sigv4.zig            SigV4 signer
 
-probes/probe_lambda_caps/   Empirical Lambda capability prober
-benchmarks/                 Selectivity / cold-start / partition sweeps
 tools/serverless/aws.sh     Lambda lifecycle (build, deploy, invoke)
 docs/                       Demos, capability findings, measurements, validation notes
 vendor/boring_tls/          Vendored prebuilt-only BoringSSL bindings
 ```
 
-## Lambda capability probe
-
-`probe_lambda_caps` enumerates what AWS Lambda actually allows (seccomp filter, kernel version, allowed setsockopt, CPU
-affinity at each memory tier, `/tmp` throughput). Re-run any time AWS announces a runtime change — seccomp is not API
-contract.
-
-```bash
-just probe-local         # JSON to stdout from your workstation
-just probe-lambda        # deploy + invoke in AWS, prints JSON
-```
+## Lambda capabilities
 
 Findings driving the architecture are in [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md).
 

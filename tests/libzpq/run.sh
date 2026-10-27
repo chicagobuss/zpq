@@ -23,13 +23,10 @@ ${CC:-gcc} -O1 -g -fsanitize=address -fno-omit-frame-pointer -o "$out/test_abi_a
 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:use_sigaltstack=0 "$out/test_abi_asan" $((LOOP / 10)) "$CYCLES"
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/test_python.py
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/write_publication.py
-"$PY" tools/bloom/defaults.py zig-out/bin/zpq "$lib/libzpq.so"
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/finalize_failure.py
-if [[ $(uname -s) == Linux ]] && command -v strace >/dev/null; then
-  ZPQ_LIB="$lib/libzpq.so" "$PY" tools/write_sync_check.py zig-out/bin/zpq
-fi
+# Opening and closing libzpq leaves a host's SIGPIPE disposition as it was, and a closed peer kills nothing.
+"$PY" tests/libzpq/sigpipe.py "$lib/libzpq.so" x
 # The differential corpus needs DuckDB and pyarrow (tests/libzpq/corpus.py), as the repository's own gate does.
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/differential.py
 
 ZPQ_LIB="$lib/libzpq.so" "$PY" tests/libzpq/sql_differential.py
-ZPQ_LIB="$lib/libzpq.so" "$PY" tests/format_correctness.py zig-out/bin/zpq

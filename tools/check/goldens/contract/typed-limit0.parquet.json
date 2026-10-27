@@ -1,0 +1,1 @@
+{"names": ["wide", "d", "big", "h"], "types": ["int64", "decimal128(12, 2)", "decimal128(38, 9)", "double"], "nullable": [true, true, true, true], "rows": [], "row_groups": [], "column_orders": [1, 1, 1, 1], "stats_kept": true, "pushed": []}

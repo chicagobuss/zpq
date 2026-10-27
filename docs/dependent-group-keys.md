@@ -38,7 +38,3 @@ integer interval proof additionally ensures that delaying evaluation cannot
 change checked-error precedence. This proof needs no allocator; compacted query
 bindings live in the query arena and are covered by allocation-failure tests.
 
-`tools/group_dependency_check.py CANDIDATE BASE` compares values, float bits,
-checked failures, decode-error choices and Parquet bytes under both forced paths,
-V1/V2 pages, nullable signed/unsigned inputs, workers 1 through 16, budgets and
-forced decode windows. Strict PyArrow and DuckDB reads validate output files.

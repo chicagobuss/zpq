@@ -1331,6 +1331,83 @@ test "exact windows fail as the whole batch does, leaving the table as it leaves
     try std.testing.expect(tables[1].accumulators.items[0].sum_d.n != 0);
 }
 
+test "a failed windowed pass gives its scratch back to a worker's region before the whole batch reruns" {
+    const old = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old;
+    expr_eval.forced_batch_rows = 64;
+    var region = huge_pages.Region.init(std.testing.allocator, 4 * huge_pages.huge_page_size);
+    defer region.deinit();
+    if (region.buf.len == 0) return error.SkipZigTest;
+    var worker = @import("../row_group_arena.zig").RowGroupArena.initOn(&region);
+    defer worker.deinit();
+    var fixture = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fixture.deinit();
+    const fa = fixture.allocator();
+    const n = 4096;
+    const vals = try fa.alloc(i64, n);
+    const wide = try fa.alloc(i128, n);
+    const shadow = try fa.alloc(f64, n);
+    const comp = try fa.alloc(u32, n);
+    for (vals, wide, shadow, comp, 0..) |*v, *w, *f, *c, r| {
+        v.* = @intCast(r);
+        // Doubled, the last window's value overflows 38 digits, after every other window has folded.
+        w.* = if (r == n - 1) 9 * std.math.pow(i128, 10, 37) else @intCast(r);
+        f.* = 0;
+        c.* = @intCast(r % 3);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = vals, .unscaled = .{ .i64 = vals } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = wide } } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1 };
+    const d38: expr_ast.Dec = .{ .precision = 38, .scale = 0 };
+    var c0: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 0 },
+    } };
+    var c1: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 1,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = d38,
+    } };
+    const product: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &c0,
+        .right = &c0,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = .{ .precision = 36, .scale = 0 },
+    } };
+    const twice: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c1,
+        .right = &c1,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = d38,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = product, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .sum, .arg = twice, .result = .dec, .where = null, .alias = "b" },
+    };
+    const ra = worker.allocator();
+    var plan: expr_eval.ExactPlan = .{};
+    var roots: [calls.len]?usize = undefined;
+    for (calls, &roots) |call, *root| root.* = (try plan.add(ra, &batch, &lookup, call.arg.?)).?;
+    const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+    @memset(partials, null);
+    const sel = try Sel.init(ra, n);
+    const mark = region.end;
+    foldExactWindows(ra, &plan, &calls, &roots, partials, 3, comp, &batch, &lookup, &sel);
+    for (partials) |p| try std.testing.expect(p == null);
+    // All the pass keeps is the block its sums would have been published in, two roots over three composites.
+    try std.testing.expect(region.end - mark <= 2 * 3 * @sizeOf(agg.DecSum) + @alignOf(agg.DecSum));
+}
+
 test "fused float sums match call-major row order" {
     try testFusedFloatSums(std.testing.allocator);
 }

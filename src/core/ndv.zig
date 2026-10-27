@@ -560,7 +560,9 @@ pub fn retainIdentity(
     return null;
 }
 
-const P = agg.NUM_PARTS;
+// The planner's small retained-domain budget must not scale with the scalar DISTINCT merge fanout. Each
+// partition presizes an identity map, so sharing that fanout can spend the whole allowance before retaining a value.
+const P = 16;
 const Partition = struct {
     lock: std.atomic.Value(bool) align(64) = .init(false),
     set: agg.DistinctSet = .{},

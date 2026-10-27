@@ -5243,7 +5243,8 @@ const CallBatch = struct { batch: filter_eval.Batch, lookup: []?usize };
 
 /// The columns of `in.read` a row group needs before its filter has run: the filter's own. With no filter, the
 /// group keys too. A flat key of a hash group under a filter is payload (`payloadColumns`), decoded only at the
-/// survivors. A nested key has no row gate, so it stays here. A record owner stays here too: its packed path needs
+/// survivors, unless its dictionary covers the chunk: its codes are cheaper than the survivors' values. A nested key
+/// has no row gate, so it stays here. A record owner stays here too: its packed path needs
 /// the whole dictionary and applies the survivor mask at the sink, which a row gate would replace with defaults.
 fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool {
     const n = in.read.len;
@@ -5268,6 +5269,9 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
                 if (!is_key or base[ci] or ci >= in.rg.columns.items.len) continue;
                 const cm = in.rg.columns.items[ci].meta_data orelse continue;
                 if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) base[ci] = true;
+                // A key the dictionary covers decodes to its codes before the filter; gated, it would materialize
+                // every survivor's value for the fold to code again.
+                if (@import("filter/membership.zig").dictionaryCoversChunk(&cm)) base[ci] = true;
             }
         },
         .scalar => {},

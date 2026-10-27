@@ -50,6 +50,7 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
         pub const Bound = struct {
             columns: [n]eval.Batch.Column,
             unsigned32: [n]bool,
+            reuse: [n]u8 = @splat(255),
             rows: usize,
 
             pub inline fn record(b: *const Bound, key: Bits, row: usize, input_ordinal: u64) !Record {
@@ -63,7 +64,10 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
                         const ni = col.nullInfo();
                         if (ni.def_levels != null and ni.def_levels.?[row] < ni.max_def) {
                             r.argument_nulls |= bit(i);
-                        } else r.values[i] = if (kind == .present_count) 1 else try signedAt(col, b.unsigned32[i], row);
+                        } else r.values[i] = if (kind == .present_count) 1 else value: {
+                            inline for (0..i) |j| if (b.reuse[i] == j) break :value r.values[j];
+                            break :value try signedAt(col, b.unsigned32[i], row);
+                        };
                     }
                 }
                 return r;
@@ -89,6 +93,15 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
                 }
                 b.columns[i] = col;
                 b.unsigned32[i] = col_ref.unsigned_32;
+                // SUM/MIN/MAX over the same source read one original row value. Coalescing happens afterwards.
+                if (kind != .present_count) inline for (0..i) |j| {
+                    if (kinds[j] != .present_count and program.args[j].col.col_idx == col_ref.col_idx and
+                        program.args[j].col.unsigned_32 == col_ref.unsigned_32)
+                    {
+                        b.reuse[i] = @intCast(j);
+                        break;
+                    }
+                };
             }
             return b;
         }

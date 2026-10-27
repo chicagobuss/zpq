@@ -7504,7 +7504,8 @@ fn selectedCountBits(
     const names_credit = outputNamesBytes(outputs);
     const per_row = @sizeOf([]const AggValue) +| outputs.len *| @sizeOf(AggValue) +| key_bytes;
     const output_credit = names_credit +| k *| per_row;
-    const scratch_credit = workers *| (keys.len *| @sizeOf(key_pack.Plan.Binding) +|
+    const pack_rows = owner_groups.batchRows(null);
+    const scratch_credit = workers *| pack_rows *| @sizeOf(Bits) +| workers *| (keys.len *| @sizeOf(key_pack.Plan.Binding) +|
         @sizeOf(S) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
         work.len *| (@sizeOf(S.Source) +| @sizeOf(u32)) +| identity.retainedBytes() +| domain_credit +|
         k *| @sizeOf(MergedSlot) +| keys.len *| @sizeOf(KeyType) +| outputs.len *| @sizeOf(GroupColType);
@@ -7556,6 +7557,7 @@ fn selectedCountBits(
             .program = program,
             .sources = sources,
             .bindings = try scratch.alloc(key_pack.Plan.Binding, keys.len),
+            .pack_buffer = try scratch.alloc(Bits, pack_rows),
             .refused = &refused,
         };
         sink.* = .{ .selected = .{ .ctx = adapter, .startFn = S.startErased, .batchFn = S.batchErased } };

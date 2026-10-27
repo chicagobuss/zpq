@@ -18,6 +18,7 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
         program: Program,
         sources: []const Source,
         bindings: []key_plan.Plan.Binding,
+        pack_buffer: []Bits = &.{},
         item: ?usize = null,
         input_base: u64 = 0,
         refused: ?*std.atomic.Value(bool) = null,
@@ -57,7 +58,22 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
                 }
             };
             var callback: Callback = .{ .local = s.local, .payload = &payload };
-            try keys.forEachSelected(Bits, &callback, Callback.append);
+            if (s.pack_buffer.len == 0) {
+                try keys.forEachSelected(Bits, &callback, Callback.append);
+            } else {
+                var offset: usize = 0;
+                while (offset < source.batch.num_rows) {
+                    const n = @min(s.pack_buffer.len, source.batch.num_rows - offset);
+                    const images = s.pack_buffer[0..n];
+                    try keys.packWindow(Bits, offset, images);
+                    for (images, 0..) |key, i| {
+                        const row = offset + i;
+                        if (source.selected) |selected| if (!selected.isActive(row)) continue;
+                        try callback.append(row, key, try source.ordinal(row));
+                    }
+                    offset += n;
+                }
+            }
         }
     };
 }
@@ -111,7 +127,9 @@ fn selectedTrial(a: std.mem.Allocator, workers: usize) !void {
         .input_rows = &.{ 99, 66, 7, 3, 2 },
     };
     var binding: [1]key_plan.Plan.Binding = undefined;
+    var images: [2]u128 = undefined;
     var sink: S = .{
+        .pack_buffer = &images,
         .local = &owner.locals[workers - 1],
         .identity = &identity,
         .program = program,

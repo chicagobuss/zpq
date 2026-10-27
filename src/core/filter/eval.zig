@@ -1383,3 +1383,72 @@ test "row windows preserve coded and exact views and reject short buffers" {
     try std.testing.expectError(error.BadColumn, coded.sliceRows(1, 2));
     try std.testing.expectError(error.BadColumn, plain.sliceRows(2, 2));
 }
+
+test "an AND ranked cheapest first selects what its written order selects, and fails with the same first error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng: std.Random.DefaultPrng = .init(0xc0471);
+    const r = prng.random();
+    const n = 1000;
+    const ints = try a.alloc(i32, n);
+    const int_dl = try a.alloc(u32, n);
+    const phrases = try a.alloc([]const u8, n);
+    const phrase_dl = try a.alloc(u32, n);
+    const urls = try a.alloc([]const u8, n);
+    const words = [_][]const u8{ "", "", "", "google", "a google b", "http://x/", "goo", "ab" };
+    for (0..n) |i| {
+        ints[i] = r.intRangeAtMost(i32, -3, 3);
+        int_dl[i] = @intFromBool(r.uintLessThan(u8, 5) != 0);
+        phrases[i] = words[r.uintLessThan(usize, words.len)];
+        phrase_dl[i] = @intFromBool(r.uintLessThan(u8, 6) != 0);
+        urls[i] = words[r.uintLessThan(usize, words.len)];
+    }
+    const f64_view = try a.alloc(f64, n);
+    @memset(f64_view, 0);
+    const cols = [_]Batch.Column{
+        .{ .i32 = .{ .values = ints, .def_levels = int_dl, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = phrases, .def_levels = phrase_dl, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = urls } },
+        // A DECIMAL decoded without its exact integers: its leaf fails on evaluation.
+        .{ .f64 = .{ .values = f64_view } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1, 2, 3 };
+    const contains: ast.Filter = .{ .like = .{ .col_idx = 2, .kind = .contains, .operand = "google", .negate = false } };
+    const prefix: ast.Filter = .{ .like = .{ .col_idx = 2, .kind = .prefix, .operand = "a", .negate = true } };
+    const nonempty: ast.Filter = .{ .string = .{ .col_idx = 1, .op = .NotEq, .value = "" } };
+    const word: ast.Filter = .{ .string = .{ .col_idx = 1, .op = .NotEq, .value = "goo" } };
+    const small: ast.Filter = .{ .int32 = .{ .col_idx = 0, .op = .LtEq, .value = 2 } };
+    const never: ast.Filter = .{ .int32 = .{ .col_idx = 0, .op = .Gt, .value = std.math.maxInt(i32) } };
+    const present: ast.Filter = .{ .null_check = .{ .col_idx = 1, .is_not = true } };
+    const cases = [_][]const ast.Filter{
+        &.{ contains, nonempty, small, prefix, word, present },
+        &.{ prefix, contains, word },
+        &.{ contains, never, nonempty },
+        &.{ present, contains },
+    };
+    for (cases) |written| {
+        const ranked = try ast.join(a, true, written);
+        // Cheapest first; the join kept every child.
+        for (ranked.and_filter.children[1..], ranked.and_filter.children[0 .. written.len - 1]) |later, earlier|
+            try testing.expect(@backingInt(ast.cost(earlier)) <= @backingInt(ast.cost(later)));
+        var want = try selection.SelectionVector.init(a, n);
+        try evaluate(.{ .and_filter = .{ .children = written } }, &batch, &want, &lookup, a);
+        var got = try selection.SelectionVector.init(a, n);
+        try evaluate(ranked, &batch, &got, &lookup, a);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
+    }
+    // Two leaves that fail, in one cost class: the first written is the one that reports, ranked or not.
+    const mismatch: ast.Filter = .{ .int32 = .{ .col_idx = 1, .op = .Eq, .value = 1 } };
+    const bare: ast.Filter = .{ .decimal = .{ .col_idx = 3, .op = .Eq, .value = 1 } };
+    for ([_][]const ast.Filter{ &.{ contains, mismatch, bare }, &.{ contains, bare, mismatch } }, [_]anyerror{
+        error.TypeMismatch,
+        error.DecimalUnavailable,
+    }) |written, err| {
+        var sv = try selection.SelectionVector.init(a, n);
+        try testing.expectError(err, evaluate(.{ .and_filter = .{ .children = written } }, &batch, &sv, &lookup, a));
+        sv = try selection.SelectionVector.init(a, n);
+        try testing.expectError(err, evaluate(try ast.join(a, true, written), &batch, &sv, &lookup, a));
+    }
+}

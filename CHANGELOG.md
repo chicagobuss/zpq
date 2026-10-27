@@ -193,8 +193,11 @@ What changed underneath:
   memory budget, instead of one shared table.
 - Long string GROUP BY keys and scalar `count(DISTINCT)` share one query-wide string table: each key is hashed once
   and stored once.
-- A top-N GROUP BY that also sums or averages integer columns, with or without a filter, keeps compact per-group
-  records instead of falling back to general accumulators; a group seen once takes 24 bytes.
+- A top-N GROUP BY with a payload column appends groups to their owners in batches, and stores a group seen only once
+  in a compact 24-byte record.
+- A filtered GROUP BY that ranks by count and also sums or averages integer columns (ClickBench Q30) stays on the
+  packed per-group records the count-only query uses, instead of falling back to a general group table. Keys without a
+  complete dictionary, and several SUM or AVG columns at once, are now admitted.
 - A top-level AND runs its conditions cheapest first (null and length tests and fixed-width compares, then string
   compares and `IN` lists, then anchored `LIKE`, then `LIKE '%x%'`); `--explain` lists them in the order they run. A
   later condition's column is decoded only at the rows the earlier ones kept, so a page none of them keeps is never

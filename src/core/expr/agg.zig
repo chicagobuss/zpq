@@ -4906,8 +4906,13 @@ pub const KeyArena = struct {
             if (at <= cap and need <= cap - at) return .{ .block = b, .used = at, .need = need, .capacity = 0 };
             at = 0;
         }
-        const cap = if (self.blocks.items.len == 0 and need <= self.bootstrap)
-            self.bootstrap
+        // A small per-table credit starts below one physical chunk and grows geometrically. References still
+        // use one logical 64 KiB chunk id per short block; large-query arenas stay at the ordinary chunk size.
+        const cap = if (need <= chunk_size)
+            @min(chunk_size, @max(
+                if (self.blocks.items.len == 0) self.bootstrap else self.blocks.items[self.blocks.items.len - 1].bytes.len * 2,
+                std.math.ceilPowerOfTwoAssert(usize, need),
+            ))
         else
             std.mem.alignForward(usize, need, chunk_size);
         const logical = std.mem.alignForward(usize, cap, chunk_size);
@@ -5241,8 +5246,8 @@ pub const GroupTable = struct {
             self.allocated_bytes += @sizeOf(KeyArena);
         }
         if (self.strings.?.blocks.items.len == 0) {
-            const limit = if (self.shared) |b| b.limit else self.max_memory_bytes;
-            self.strings.?.bootstrap = @min(KeyArena.chunk_size, if (limit < 4) 1 else @as(usize, 1) << @intCast(std.math.log2_int(usize, limit / 4)));
+            const credit = if (self.shared) |b| @min(b.block, b.limit / 4) else self.max_memory_bytes / 4;
+            self.strings.?.bootstrap = @min(KeyArena.chunk_size, if (credit == 0) 1 else @as(usize, 1) << @intCast(std.math.log2_int(usize, credit)));
         }
         const grow = self.slots.len == 0 or (n + 1) * 4 > self.slots.len * 3;
         const cap = if (grow) @max(self.slots.len * 2, 16) else self.slots.len;

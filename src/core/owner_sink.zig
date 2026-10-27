@@ -60,13 +60,14 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
             };
             var callback: Callback = .{ .local = s.local, .payload = &payload };
             if (s.pack_buffer.len == 0) {
-                try keys.forEachSelected(Bits, &callback, Callback.append);
+                keys.forEachSelected(Bits, &callback, Callback.append) catch |err|
+                    return s.identityError(err);
             } else {
                 var offset: usize = 0;
                 while (offset < source.batch.num_rows) {
                     const n = @min(s.pack_buffer.len, source.batch.num_rows - offset);
                     const images = s.pack_buffer[0..n];
-                    try keys.packWindow(Bits, offset, images);
+                    keys.packWindow(Bits, offset, images) catch |err| return s.identityError(err);
                     if (contiguous and try s.local.appendWindow(images, try source.ordinal(offset), offset, &payload)) {
                         offset += n;
                         continue;
@@ -79,6 +80,14 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
                     offset += n;
                 }
             }
+        }
+
+        fn identityError(s: *Self, err: anyerror) anyerror {
+            if (err == error.BadKey or err == error.KeyTooWide) {
+                if (s.refused) |flag| flag.store(true, .monotonic);
+                return error.ExceededMemoryBudget;
+            }
+            return err;
         }
 
         fn fullySelected(source: SelectedBatch) bool {

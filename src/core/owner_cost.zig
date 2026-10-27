@@ -103,3 +103,11 @@ test "owner shared storage charge includes both worst-case scatters and never di
     const large_wide = quote(u64, kinds, u32, 30_000_000, 30_000_000, 16, 0, null).?;
     try std.testing.expect(large.records < large_wide.records);
 }
+
+test "owner payload multisets charge every repeated sum and present lane" {
+    const one = quote(u64, &.{.sum}, u32, 1 << 20, 1 << 20, 4, 4096, 64).?;
+    const repeated = quote(u64, &.{ .sum, .sum, .present_count }, u32, 1 << 20, 1 << 20, 4, 4096, 64).?;
+    try std.testing.expect(repeated.records > one.records);
+    try std.testing.expect(repeated.finish > one.finish);
+    try std.testing.expect(repeated.peak > one.peak);
+}

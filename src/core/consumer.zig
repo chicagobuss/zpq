@@ -5411,6 +5411,11 @@ fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
     if (!reusableByteEncodings(cm.encodings.items)) return false;
     const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
     if (filtered and !columnFeedsFold(target, ci)) return true;
+    // DISTINCT sets and string winners reuse a whole batch's prepared values. Streaming a key forces their
+    // payloads into repeated decoder/fold setup too; ordinary memory admission still slices a batch that cannot fit.
+    if (target == .grouped) for (target.grouped.calls) |call| {
+        if (call.func == .count_distinct or call.result == .bytes) return false;
+    };
     // A complete dictionary already keeps hashed keys compact. Forcing it into string windows discards the
     // coded fold (including dense lanes) and repeatedly allocates expanded values. Mixed/PLAIN chunks still stream.
     if (target.codedKey(ci) and cacheDictionary(in, ci) != null) return false;
@@ -11494,6 +11499,21 @@ test "filter-only and hash-only strings stream a cache-sized window, other strin
         .pos_base = 0,
     } };
     try std.testing.expect(streamByteArray(no_filter, grouped, 0));
+    var other = key;
+    other.col_ref.col_idx = 1;
+    for ([_]@FieldType(expr_agg.AggCall, "func"){ .count_distinct, .min, .max }) |func| {
+        var with_payload = grouped;
+        const call: expr_agg.AggCall = .{
+            .func = func,
+            .arg = other,
+            .where = null,
+            .alias = "payload",
+            .result = if (func == .count_distinct) .i64 else .bytes,
+        };
+        with_payload.grouped.calls = &.{call};
+        try std.testing.expect(hashOnlyByteArray(with_payload, 0));
+        try std.testing.expect(!streamByteArray(no_filter, with_payload, 0));
+    }
 
     const min_call: expr_agg.AggCall = .{
         .func = .min,

@@ -715,6 +715,7 @@ const Worker = struct {
             var left: usize = P;
             var pi: usize = i % P;
             while (left > 0) : (pi = (pi + 1) % P) {
+                if (s.failed.load(.monotonic)) return;
                 if (done[pi]) continue;
                 const p = &s.parts[pi];
                 if (p.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
@@ -734,7 +735,13 @@ const Worker = struct {
                     (if (p.string_key)
                         retainBytes(s, p, @intCast(pi), strs, entries, packed_ids)
                     else
-                        retainRun(s, p, @intCast(pi), ints, entries, packed_ids)))) try p.migrate(s.gpa);
+                        retainRun(s, p, @intCast(pi), ints, entries, packed_ids))))
+                {
+                    // A strict union has no usable result after retention declines. Do not migrate this
+                    // partition into another exact set, or make sibling workers finish their dictionaries.
+                    if (s.failed.load(.monotonic)) return;
+                    try p.migrate(s.gpa);
+                }
                 if (!p.mapped) for (entries) |j| {
                     if (ints.len > 0) try p.set.insertU64(s.gpa, ints[j]) else try p.set.insertBytes(s.gpa, strs[j]);
                 };

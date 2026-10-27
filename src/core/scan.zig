@@ -2258,6 +2258,20 @@ fn releaseRegions(workers: []Worker) void {
     for (workers) |*w| retireRegions(w);
 }
 
+/// Multipass scans keep their regions until the certificate is final. Retire the remaining pairs in parallel
+/// only at that barrier; returning pages after an intermediate pass would fault them back in on the next pass.
+fn releaseRegionsParallel(workers: []Worker) void {
+    if (workers.len > 1) _ = spawn_util.runTree(Worker, workers, .{ .stack_size = WORKER_STACK_SIZE }, struct {
+        fn run(w: *Worker) void {
+            const span = profile.Span.begin(profile.threadOf(w.profiler, .scan));
+            retireRegions(w);
+            span.end(.worker_release, profile.args(.{w.index}));
+        }
+    }.run);
+    // Partial spawn failure leaves unrun contexts. Already retired pairs are NULL and cost no syscall.
+    releaseRegions(workers);
+}
+
 /// Hand the worker's region pair back for the next pass or query (`huge_pages.retirePair`).
 fn retireRegions(w: *Worker) void {
     if (w.region) |arena| {
@@ -5156,7 +5170,7 @@ fn prepareAggregateWithMetas(
     } else false;
     // The last pass is done: nothing decodes into the regions again, so the merge does not hold them. Under a ledger
     // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
-    if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegions(workers);
+    if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegionsParallel(workers);
     private_decode.release();
     cache_hints.deinit();
     if (firstWorkerFailure(workers, args.failure_probe)) |failure| {
@@ -8299,7 +8313,7 @@ fn runRecordWorkers(
     }
     const t0 = nowMonoNs();
     runWorkers(workers);
-    releaseRegions(workers);
+    releaseRegionsParallel(workers);
     if (firstWorkerFailure(workers, args.failure_probe)) |failure| {
         const e = failure.err;
         // Only an effectively parallel attempt can benefit from the deterministic serial retry.
@@ -25499,4 +25513,28 @@ test "grouped string MIN MAX winners refuse at the live ledger without leaking" 
             try testing.expectEqual(@as(i128, 8), row[3].i);
         }
     };
+}
+
+test "final multipass region retirement releases every charge after partial spawn refusal" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 0, 1, 2, 3, 4 }) |allowed| {
+        var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        var workers: [4]Worker = undefined;
+        for (&workers) |*w| {
+            var pair = huge_pages.takePair(gpa, WORKER_REGION_RESERVE);
+            pair.arena.budget = &budget;
+            pair.scratch.budget = &budget;
+            const pages = try pair.arena.allocator().alloc(u8, 4 << 20);
+            @memset(pages, 7);
+            w.* = .{ .gpa = gpa, .inputs = &.{}, .metas = &.{}, .work = &.{}, .cursor = undefined, .agg_calls = &.{}, .plan = undefined, .decode_options = .{}, .region = pair.arena, .scratch_region = pair.scratch };
+        }
+        try testing.expect(budget.used.load(.monotonic) > 0);
+        spawn_util.injectFailureAfter(allowed);
+        defer spawn_util.resetFailure();
+        releaseRegionsParallel(&workers);
+        for (workers) |w| {
+            try testing.expect(w.region == null and w.scratch_region == null);
+        }
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
 }

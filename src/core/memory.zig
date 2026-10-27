@@ -82,7 +82,13 @@ test "the C heap calls are glibc's alone, and run where the target has them" {
 /// budget nor the advice changes. Debug and safe builds keep Init's leak-checking allocator; glibc's heap stays where
 /// it is (it has `trimHeap`).
 pub fn processAllocator(init_gpa: std.mem.Allocator) std.mem.Allocator {
-    return if (comptime use_mimalloc) mimalloc else init_gpa;
+    if (comptime !use_mimalloc) return init_gpa;
+    // Upstream's defaults keep freed pages for a second and back its arenas with transparent huge pages: on sub-second
+    // queries that holds their freed buffers and every partly used 2 MiB region resident, well above a glibc build's
+    // peak. Purged at once and without THP, peaks match glibc's at little cost. `MIMALLOC_*` still overrides them.
+    mi_option_set_default(mi_option_purge_delay, 0);
+    mi_option_set_default(mi_option_allow_thp, 0);
+    return mimalloc;
 }
 
 /// build.zig links mimalloc (`usesMimalloc`) for exactly the builds `ownHeap` names, libzpq's aside.
@@ -103,6 +109,10 @@ extern fn mi_malloc_aligned(size: usize, alignment: usize) ?*anyopaque;
 extern fn mi_realloc_aligned(p: ?*anyopaque, size: usize, alignment: usize) ?*anyopaque;
 extern fn mi_usable_size(p: ?*const anyopaque) usize;
 extern fn mi_free(p: ?*anyopaque) void;
+extern fn mi_option_set_default(option: c_int, value: c_long) void;
+// `mi_option_t` values in vendor/mimalloc/include/mimalloc.h (3.6.0).
+const mi_option_purge_delay: c_int = 15;
+const mi_option_allow_thp: c_int = 43;
 
 fn miAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
     return @ptrCast(mi_malloc_aligned(len, alignment.toByteUnits()));

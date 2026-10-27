@@ -585,6 +585,8 @@ const CoreDeps = struct {
     /// `sql = true`; an unreferenced library step is never compiled.
     liteparser: *std.Build.Step.Compile,
     liteparser_c: *std.Build.Module,
+    /// mimalloc, the process allocator of a musl release build (`mimallocLibrary`); null elsewhere.
+    mimalloc: ?*std.Build.Step.Compile,
     /// `build_options.enable_profile` for every module instance.
     profile: bool = true,
     /// `build_options.version`: build.zig.zon's, plus `-Dprerelease`'s suffix.
@@ -654,6 +656,7 @@ const CoreDeps = struct {
                 .root_module = liteparser_mod,
             }),
             .liteparser_c = liteparserCModule(b, target, optimize),
+            .mimalloc = if (!shared and usesMimalloc(target, optimize)) mimallocLibrary(b, target, optimize) else null,
         };
     }
 };
@@ -688,6 +691,7 @@ fn addCoreModule(
     opts.addOption(bool, "enable_sql", options.sql);
     opts.addOption(bool, "enable_profile", deps.profile);
     opts.addOption([]const u8, "version", deps.version);
+    opts.addOption(bool, "use_mimalloc", deps.mimalloc != null);
     const opts_mod = opts.createModule();
 
     // Frame pointers on: makes `perf record --call-graph=fp` produce clean
@@ -717,6 +721,7 @@ fn addCoreModule(
     zpq_mod.linkLibrary(deps.zstd);
     zpq_mod.linkLibrary(deps.libdeflate);
     zpq_mod.linkLibrary(deps.lz4);
+    if (deps.mimalloc) |lib| zpq_mod.linkLibrary(lib);
     if (options.sql) {
         zpq_mod.linkLibrary(deps.liteparser);
         zpq_mod.addIncludePath(b.path("vendor/liteparser"));
@@ -827,6 +832,36 @@ fn archiveFlags(shared: bool) []const []const u8 {
 /// libzstd from `vendor/zstd/lib`: the sources, macros and headers the allyourcodebase/zstd package built before it
 /// was vendored (compression and decompression, legacy frames from v0.5, no dictionary builder, the x86-64 Huffman
 /// decoder in assembly).
+/// A release build over musl takes mimalloc as its process allocator (`core.memory.processAllocator`): musl's malloc
+/// and Zig's `smp_allocator` both map and unmap pages as allocation-heavy folds grow, and every `munmap` stalls the
+/// other threads. glibc, macOS, Debug/ReleaseSafe and libzpq keep their heaps; the C codecs keep musl's malloc, since
+/// mimalloc is built without `MI_MALLOC_OVERRIDE`.
+fn usesMimalloc(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) bool {
+    return target.result.os.tag == .linux and target.result.abi.isMusl() and
+        (optimize == .fast or optimize == .small);
+}
+
+/// mimalloc (vendor/mimalloc, microsoft/mimalloc, vendor/README.md) as upstream builds it: one translation unit.
+fn mimallocLibrary(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "mimalloc",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    lib.root_module.addCSourceFiles(.{ .root = b.path("vendor/mimalloc/src"), .files = &.{"static.c"}, .flags = &.{
+        "-DNDEBUG",
+        "-DMI_STATIC_LIB",
+        "-fno-builtin-malloc",
+        "-ftls-model=initial-exec",
+    } });
+    lib.root_module.addIncludePath(b.path("vendor/mimalloc/include"));
+    return lib;
+}
+
 fn zstdLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,

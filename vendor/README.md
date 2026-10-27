@@ -92,3 +92,17 @@ the Hadoop and frame containers the deprecated LZ4 codec appears in. No local ch
 To check the tree against the release: clone `lz4/lz4` at `v1.10.0` and compare its `lib/lz4.c`, `lib/lz4.h` and
 `lib/LICENSE` with `vendor/lz4`.
 
+
+## mimalloc (`vendor/mimalloc`, microsoft/mimalloc 3.6.0)
+
+`LICENSE`, `include/` and `src/` from the v3.6.0 tag, unmodified: the release tarball
+`https://github.com/microsoft/mimalloc/archive/refs/tags/v3.6.0.tar.gz`, sha256
+`c663101ba193b5b823c8541c1b719ab67e3ebf9976e425a02359a5cad5e52990`. zpq builds `src/static.c`, upstream's single
+translation unit (`mimallocLibrary` in `build.zig`), for musl release builds only (`usesMimalloc`), where it is the
+process allocator (`core.memory.processAllocator`). It is built without `MI_MALLOC_OVERRIDE`, so `malloc` stays
+musl's for the C libraries, and with upstream's option defaults: freed pages are kept for reuse and purged
+(`MADV_DONTNEED`) after `purge_delay`, 1 s; arenas reserve address space 1 GiB at a time and commit it as touched.
+mimalloc reads `MIMALLOC_*` environment variables at start, as upstream does. No local changes.
+
+To check the tree against the release: unpack the tarball above (checking its sha256) and compare its `LICENSE`,
+`include` and `src` with `vendor/mimalloc`.

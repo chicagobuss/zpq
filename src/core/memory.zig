@@ -75,15 +75,49 @@ test "the C heap calls are glibc's alone, and run where the target has them" {
 }
 
 /// The general-purpose allocator of a process zpq owns (the CLI, the Lambda), given the one `std.process.Init` chose.
-/// A release build over musl's malloc takes Zig's `smp_allocator` instead: musl's allocator is slow under the
-/// allocation-heavy folds (COUNT DISTINCT) on every thread at once. `Charged` counts bytes whatever its child, and
-/// huge-page regions take `page_allocator` directly, so neither the budget nor the advice changes. Debug and safe
-/// builds keep Init's leak-checking allocator; glibc's heap stays where it is (it has `trimHeap`).
+/// A release build over musl takes mimalloc (linked by build.zig's `usesMimalloc`) instead of musl's malloc: musl's
+/// allocator and Zig's `smp_allocator` both map and unmap pages as allocation-heavy folds (COUNT DISTINCT) grow, and
+/// each `munmap` stalls every other thread; mimalloc keeps freed pages for reuse and purges them after a delay.
+/// `Charged` counts bytes whatever its child, and huge-page regions take `page_allocator` directly, so neither the
+/// budget nor the advice changes. Debug and safe builds keep Init's leak-checking allocator; glibc's heap stays where
+/// it is (it has `trimHeap`).
 pub fn processAllocator(init_gpa: std.mem.Allocator) std.mem.Allocator {
-    return if (comptime ownHeap(builtin.mode, builtin.abi, builtin.link_libc, builtin.single_threaded))
-        std.heap.smp_allocator
-    else
-        init_gpa;
+    return if (comptime use_mimalloc) mimalloc else init_gpa;
+}
+
+/// build.zig links mimalloc (`usesMimalloc`) for exactly the builds `ownHeap` names, libzpq's aside.
+const use_mimalloc = @import("build_options").use_mimalloc;
+comptime {
+    if (use_mimalloc) std.debug.assert(ownHeap(builtin.mode, builtin.abi, builtin.link_libc, builtin.single_threaded));
+}
+
+/// mimalloc's aligned API as a Zig allocator: thread-safe, and a block's in-place growth is mimalloc's usable size.
+const mimalloc: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
+    .alloc = miAlloc,
+    .resize = miResize,
+    .remap = miRemap,
+    .free = miFree,
+} };
+
+extern fn mi_malloc_aligned(size: usize, alignment: usize) ?*anyopaque;
+extern fn mi_realloc_aligned(p: ?*anyopaque, size: usize, alignment: usize) ?*anyopaque;
+extern fn mi_usable_size(p: ?*const anyopaque) usize;
+extern fn mi_free(p: ?*anyopaque) void;
+
+fn miAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    return @ptrCast(mi_malloc_aligned(len, alignment.toByteUnits()));
+}
+
+fn miResize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+    return new_len <= mi_usable_size(memory.ptr);
+}
+
+fn miRemap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+    return @ptrCast(mi_realloc_aligned(memory.ptr, new_len, alignment.toByteUnits()));
+}
+
+fn miFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+    mi_free(memory.ptr);
 }
 
 fn ownHeap(mode: @TypeOf(builtin.mode), abi: std.Target.Abi, link_libc: bool, single_threaded: bool) bool {

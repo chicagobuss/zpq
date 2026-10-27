@@ -100,6 +100,7 @@ test {
     // Keep these as direct imports: tools/check_test_modules.py uses this block
     // as the manifest of modules whose tests the library test artifact roots.
     _ = @import("core/selected_batch.zig");
+    _ = @import("core/string_table.zig");
     _ = @import("core/schema.zig");
     _ = @import("core/thrift.zig");
     _ = @import("core/consumer.zig");

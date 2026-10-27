@@ -35,6 +35,7 @@ const expr_agg = @import("expr/agg.zig");
 const group_dependencies = @import("expr/group_dependencies.zig");
 const core_memory = @import("memory.zig");
 const partagg = @import("partagg.zig");
+const string_table = @import("string_table.zig");
 const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const key_pack = @import("expr/key_pack.zig");
@@ -117,6 +118,7 @@ fn allRescannable(inputs: []const Input) bool {
 /// charge the same way. Each is armed only over rescannable inputs, and a scan it took that the budget refused runs
 /// again without it (`runMultiAggregate`): a budget the established path fits never fails the query.
 pub const FastPath = enum {
+    shared_strings,
     integer_records,
     msd_records,
     dense,
@@ -236,6 +238,8 @@ pub const MultiAggArgs = struct {
     auto_decode_batches: bool = false,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
+    /// Query-wide raw string identity; disabled after a rescannable budget refusal.
+    shared_strings: bool = true,
     /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
     /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
     typed_answer: bool = false,
@@ -1371,6 +1375,7 @@ pub const AggregateExplanation = struct {
     dense: bool = false,
 
     pub fn strategyName(self: AggregateExplanation) []const u8 {
+        if (self.record_path) |r| if (r.layout == .shared_string_table) return "shared_string_table";
         return if (self.dense) "dense" else @tagName(self.plan.dispatch.strategy);
     }
 };
@@ -1389,6 +1394,7 @@ pub const RecordAdmission = struct {
         integer_distinct,
         byte_distinct,
         pair_distinct,
+        shared_string_table,
     },
     reservation: usize,
 };
@@ -3973,6 +3979,10 @@ fn narrowed(
     // A finished windowed source may already have discarded its pages. No budget retry can read it again.
     if (!allRescannable(attempt.inputs)) return null;
     var next = attempt;
+    if (taken.contains(.shared_strings)) {
+        next.shared_strings = false;
+        return next;
+    }
     if (taken.contains(.msd_records)) {
         // Retained pages and decoder scratch have been released. Admission required complete rescannability,
         // so a bounded-decoder or unsupported-page refusal can enter the established chain from its start.
@@ -4283,6 +4293,37 @@ fn prepareAggregateWithMetas(
     const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / @max(1, args.min_bytes_per_worker))));
     const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
+
+    var string_record_path: ?RecordAdmission = null;
+    if (explain) {
+        string_record_path = try inlineSharedStrings(
+            gpa,
+            arena,
+            args,
+            metas,
+            &plan,
+            work_items.items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            true,
+        );
+    } else if (try inlineSharedStrings(
+        gpa,
+        arena,
+        args,
+        metas,
+        &plan,
+        work_items.items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return result;
 
     if (!explain) if (try inlineDistinctAnswer(
         gpa,
@@ -4711,7 +4752,7 @@ fn prepareAggregateWithMetas(
     else
         null;
     if (explain) {
-        const record_path = pair_record_path orelse selected_record_path orelse packed_record_path orelse
+        const record_path = string_record_path orelse pair_record_path orelse selected_record_path orelse packed_record_path orelse
             try inlineDistinctAnswer(
                 gpa,
                 arena,
@@ -7301,6 +7342,223 @@ fn ownerIdentity(
         coded.deinit(gpa);
     };
     return best;
+}
+
+fn inlineSharedStrings(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    workers: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    const order = args.result_order;
+    if (!args.shared_strings or !allRescannable(args.inputs) or !args.plain_rules or
+        order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
+        order.hidden.len != 0) return null;
+    const scalar = keys_opt == null;
+    const key = if (keys_opt) |keys| blk: {
+        if (keys.len != 1) return null;
+        for (calls) |call| {
+            if (call.where != null or call.func == .count_distinct or call.state or call.offset != 0) return null;
+            if (call.arg) |arg| {
+                if (arg != .col_ref or arg.col_ref.expr_type != .i64 or arg.isBoolean()) return null;
+            } else if (call.func != .count) return null;
+        }
+        for (outputs_opt.?) |out| if (out.derived != null) return null;
+        break :blk keys[0];
+    } else blk: {
+        if (calls.len != 1 or calls[0].func != .count_distinct or calls[0].where != null or calls[0].state)
+            return null;
+        break :blk calls[0].arg orelse return null;
+    };
+    if (key != .col_ref or key.col_ref.expr_type != .str or key.col_ref.physical_type != .BYTE_ARRAY)
+        return null;
+    // Complete dictionaries already avoid row-wise byte hashing. Route wide PLAIN/fallback bytes directly;
+    // short keys keep their existing fixed/coded owner. Encoded width is a cost hint, never an identity bound.
+    var coded = true;
+    var key_bytes: u128 = 0;
+    var key_rows: u128 = 0;
+    for (work) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        const cm = rg.columns.items[key.col_ref.col_idx].meta_data orelse return null;
+        coded = coded and ndv.fullCoverage(&cm);
+        key_bytes += @intCast(@max(0, cm.total_uncompressed_size));
+        key_rows += @intCast(@max(0, rg.num_rows));
+    }
+    if (coded or key_bytes < key_rows * (2 * @sizeOf([]const u8))) return null;
+    // Packed record scans use an original flat ordinal. Width refusal leaves the established string route intact.
+    const rows = RecordOrdinals.rows(metas) orelse return null;
+    if (rows >= @as(usize, 1) << 31) return null;
+    const folded_calls: []const expr_agg.AggCall = if (scalar) &.{} else calls;
+    const worker_credit = workers * (@sizeOf(Worker) + @sizeOf(expr_agg.GroupTable));
+    const setup = worker_credit + work.len * @sizeOf(u32) + workers * @sizeOf(consumer.RecordSink) +
+        (if (outputs_opt) |outs| outs.len * @sizeOf(GroupColType) else 0);
+    const quote = setup +| string_table.State.setupBytes(workers, args.max_memory);
+    if (quote > args.max_memory / 4 or
+        (args.ledger != null and quote > args.ledger.?.available())) return null;
+    if (explain_only) return .{ .layout = .shared_string_table, .reservation = quote };
+    var own_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const ledger = args.ledger orelse &own_ledger;
+    _ = ledger.drawExact(setup) orelse return null;
+    var held: usize = 0;
+    defer ledger.release(setup - held);
+    var state = (try string_table.State.init(
+        gpa,
+        ledger,
+        folded_calls,
+        key.col_ref.col_idx,
+        scalar,
+        workers,
+    )) orelse return null;
+    defer state.deinit();
+    state.bind();
+    const starts = try arena.alloc(u32, work.len);
+    if (!RecordOrdinals.fill(metas, work, starts)) return null;
+    const sinks = try arena.alloc(consumer.RecordSink, workers);
+    for (sinks, state.locals) |*sink, *local| sink.* = .{ .selected = .{
+        .ctx = local,
+        .startFn = string_table.Sink.startErased,
+        .batchFn = string_table.Sink.batchErased,
+    } };
+    const previous_block = ledger.block;
+    ledger.block = expr_agg.SharedBudget.blockFor(args.max_memory, workers + state.parts.len);
+    defer ledger.block = previous_block;
+    if (args.taken) |taken| taken.insert(.shared_strings);
+    const run = try runRecordWorkers(
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work,
+        calls,
+        &.{key},
+        sinks,
+        starts,
+        outputs_opt orelse &.{},
+        timings,
+    );
+    const prof = profile.threadOf(args.profiler, .main);
+    const begin = nowMonoNs();
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    var answer_charge: usize = 0;
+    defer ledger.release(answer_charge);
+    if (scalar) {
+        answer_charge = @sizeOf(AggOutputItem) + calls[0].alias.len;
+        _ = ledger.drawExact(answer_charge) orelse {
+            answer_charge = 0;
+            return error.ExceededMemoryBudget;
+        };
+        const items = try gpa.alloc(AggOutputItem, 1);
+        items[0] = .{ .alias = "", .value = .{ .i = state.count() } };
+        output.aggs = items;
+        items[0].alias = try gpa.dupe(u8, calls[0].alias);
+        const accs = try arena.alloc(expr_agg.Accumulator, 1);
+        accs[0] = .{ .count = @intCast(state.count()) };
+        const finished = try countedCalls(arena, calls, 0);
+        const sources = try arena.alloc(?schema.SchemaElement, 1);
+        sources[0] = null;
+        for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+        if (args.ledger != null) {
+            held = worker_credit;
+            answer_charge = 0;
+        }
+        var result = pairResult(args, plan, run, output, .{
+            .accumulators = accs,
+            .agg_calls = finished,
+            .agg_sources = sources,
+        });
+        result.distinct_pairs = false;
+        profile.record(prof, .merge, begin, nowMonoNs(), profile.args(.{}));
+        return result;
+    }
+    const outputs = outputs_opt.?;
+    var merge_charge: core_memory.Charged = .{ .child = gpa, .budget = ledger };
+    const lists = merge_charge.allocator();
+    var slots: std.ArrayList(MergedSlot) = .empty;
+    defer slots.deinit(lists);
+    var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
+    defer accs.deinit(lists);
+    try fillFromPartitions(
+        gpa,
+        lists,
+        arena,
+        state.parts,
+        calls,
+        outputs,
+        order,
+        args.unordered,
+        null,
+        workers,
+        &slots,
+        &accs,
+    );
+    if (!args.unordered) try sortSlotsByFirst(lists, slots.items, workers);
+    const key_types = [_]KeyType{.string};
+    const types = try arena.alloc(GroupColType, outputs.len);
+    for (outputs, types) |out, *ty| ty.* = .{
+        .lane = if (out.source == .key) .string else if (calls[out.source.agg].func == .avg) .f64 else .i64,
+        .nullable = out.source == .key or calls[out.source.agg].func != .count,
+        .source = if (out.source == .key)
+            leafSchemaElem(&metas[0], key.col_ref.col_idx)
+        else
+            passThroughSource(calls[out.source.agg], &metas[0]),
+    };
+    const tables = try lists.alloc(*expr_agg.GroupTable, state.parts.len);
+    defer lists.free(tables);
+    for (tables, state.parts) |*out, *part| out.* = &part.table;
+    output.arena_credit = try output.takeTableArenas(gpa, tables, ledger);
+    output.arena_ledger = args.ledger;
+    const source: RowSource = .{
+        .slots = slots.items,
+        .outputs = outputs,
+        .calls = calls,
+        .key_types = &key_types,
+        .key_exprs = &.{key},
+        .accs = accs.items,
+        .folded = true,
+        .fixed_keys = false,
+        .borrowed_strings = output.borrowed_strings,
+    };
+    answer_charge = answerBytesParallel(slots.items, types, &.{}, args.typed_answer, workers) +|
+        outputNamesBytes(outputs);
+    _ = ledger.drawExact(answer_charge) orelse {
+        answer_charge = 0;
+        return error.ExceededMemoryBudget;
+    };
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    for (outputs, names) |out, *name| name.* = try gpa.dupe(u8, out.name);
+    if (args.typed_answer) {
+        output.typed = .{ .rows = 0, .columns = &.{} };
+        try buildGroupColumns(gpa, &output.typed.?, source, types, workers);
+    } else {
+        const out_rows = try gpa.alloc([]const AggValue, slots.items.len);
+        @memset(out_rows, &.{});
+        output.group_rows = out_rows;
+        try buildGroupRows(gpa, &output.slab, source, out_rows, workers);
+    }
+    if (args.ledger != null) {
+        held = worker_credit + outputs.len * @sizeOf(GroupColType);
+        answer_charge = 0;
+    }
+    var result = pairResult(args, plan, run, output, .{
+        .accumulators = &.{},
+        .agg_calls = calls,
+        .group_col_types = types,
+    });
+    result.distinct_pairs = false;
+    profile.record(prof, .merge, begin, nowMonoNs(), profile.args(.{}));
+    return result;
 }
 
 fn inlineSelectedCount(
@@ -25852,4 +26110,93 @@ test "scalar long string DISTINCT keeps NULL empty and windowed answers across t
         defer got.deinit(gpa);
         try testing.expectEqual(@as(i128, 33), got.output.aggs[0].value.i);
     };
+}
+
+test "shared string scan preserves full grouped and scalar answers NULLs original order and both readers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: [512][]const u8 = undefined;
+    var key_defs: [512]u32 = undefined;
+    var values: [512]i64 = undefined;
+    var defs: [512]u32 = undefined;
+    const big = try a.alloc(u8, 70001);
+    @memset(big, 'x');
+    for (&text, &key_defs, &values, &defs, 0..) |*key, *kd, *value, *d, i| {
+        key.* = switch (i % 128) {
+            0 => "",
+            1 => big,
+            2 => "a\x00b",
+            else => try std.fmt.allocPrint(a, "a wide plain key for the shared string table {d}", .{i % 128}),
+        };
+        kd.* = @intFromBool(i % 19 != 0);
+        value.* = @as(i64, @intCast(i % 13)) - 6;
+        d.* = @intFromBool(i % 7 != 0);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = &text, .def_levels = &key_defs, .max_def = 1 } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1 } } },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &columns, text.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const groups = try a.alloc(schema.RowGroup, 16);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    for ([_]bool{ false, true }) |scalar| for ([_]?[]const u8{ null, "v >= -4", "k <> ''" }) |filter| {
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "shared-string", .bytes = bytes.buffer.items }},
+            .metas = &.{meta},
+            .aggregate = if (scalar) "count(DISTINCT k) AS d" else "count(*) AS c,sum(v) AS s,avg(v) AS av,min(v) AS lo,max(v) AS hi,count(v) AS n",
+            .group_by = if (scalar) null else "k",
+            .filter = filter,
+            .max_memory = 256 << 20,
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .shared_strings = false,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        for ([_]bool{ false, true }) |encoded| for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+            args.shared_strings = true;
+            args.encoded = encoded;
+            args.parallelism = j;
+            args.decode_batch_rows = window;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            const ex = try explainAggregate(gpa, a, args);
+            try testing.expectEqual(.shared_string_table, ex.record_path.?.layout);
+            try testing.expectEqualStrings("shared_string_table", ex.strategyName());
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.shared_strings));
+            if (scalar) {
+                try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
+            } else {
+                try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+                try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+            }
+        };
+    };
+    // A setup decline leaves the same occupied ledger, even when the canonical decoder also cannot fit.
+    var ledger: core_memory.SharedBudget = .{ .limit = 16 << 20 };
+    const held = ledger.drawExact(ledger.limit - 1).?;
+    defer ledger.release(held);
+    var taken: std.EnumSet(FastPath) = .{};
+    const tight: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "shared-string", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(DISTINCT k) AS d",
+        .max_memory = ledger.limit,
+        .ledger = &ledger,
+        .parallelism = 1,
+        .taken = &taken,
+    };
+    try testing.expectError(error.ExceededMemoryBudget, prepareAggregate(gpa, a, tight, false));
+    try testing.expect(!taken.contains(.shared_strings));
+    try testing.expect((try explainAggregate(gpa, a, tight)).record_path == null);
+    try testing.expectEqual(held, ledger.used.load(.monotonic));
 }

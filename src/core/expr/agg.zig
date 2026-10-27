@@ -4994,7 +4994,12 @@ pub const KeyArena = struct {
     }
 
     pub fn put(self: *KeyArena, a: std.mem.Allocator, value: []const u8) !u32 {
-        const p = try self.place(value.len);
+        return self.putParts(a, &.{}, value);
+    }
+
+    fn putParts(self: *KeyArena, a: std.mem.Allocator, prefix: []const u8, value: []const u8) !u32 {
+        const len = std.math.add(usize, prefix.len, value.len) catch return error.ExceededMemoryBudget;
+        const p = try self.place(len);
         if (p.capacity != 0) {
             if (self.blocks.items.len == self.blocks.capacity)
                 try self.blocks.ensureTotalCapacityPrecise(a, @max(1, self.blocks.capacity * 2));
@@ -5008,9 +5013,10 @@ pub const KeyArena = struct {
         }
         const b = self.blocks.items[p.block];
         var hdr: [5]u8 = undefined;
-        const hn = try header(value.len, &hdr);
+        const hn = try header(len, &hdr);
         @memcpy(b.bytes[p.used..][0..hn], hdr[0..hn]);
-        @memcpy(b.bytes[p.used + hn ..][0..value.len], value);
+        @memcpy(b.bytes[p.used + hn ..][0..prefix.len], prefix);
+        @memcpy(b.bytes[p.used + hn + prefix.len ..][0..value.len], value);
         self.block = p.block;
         self.used = p.used + p.need;
         return @intCast(@as(usize, b.start) + p.used);
@@ -5279,7 +5285,34 @@ pub const GroupTable = struct {
         }
         if (self.sketch) |s| if (try s.route(s.keyHash(key), pos, key)) |id| return id;
         const hash = std.hash.Wyhash.hash(0, key);
-        const probe = self.probeVariable(key, hash);
+        return self.insertVariable(false, key, true, agg_calls, pos, hash);
+    }
+
+    /// A direct string table hashes unframed bytes once. Its arena still stores the canonical key frame, so all
+    /// output consumers remain shared. Only a new global key writes that frame and copies its bytes.
+    pub fn getOrInsertStringHashed(
+        self: *GroupTable,
+        key: ?[]const u8,
+        agg_calls: []const AggCall,
+        pos: u64,
+        hash: u64,
+    ) !u32 {
+        std.debug.assert(self.fixed_stride == 0 and self.sketch == null and self.discovery == null);
+        return self.insertVariable(true, key orelse &.{}, key != null, agg_calls, pos, hash);
+    }
+
+    fn insertVariable(
+        self: *GroupTable,
+        comptime raw_string: bool,
+        key: []const u8,
+        present: bool,
+        agg_calls: []const AggCall,
+        pos: u64,
+        hash: u64,
+    ) !u32 {
+        if (self.strings) |strings| strings.owner = self;
+        const key_len = if (raw_string) (if (present) key.len +| 5 else 1) else key.len;
+        const probe = if (raw_string) self.probeString(key, present, hash) else self.probeVariable(key, hash);
         if (probe.id) |id| {
             self.first.items[id] = @min(self.first.items[id], pos);
             return id;
@@ -5310,10 +5343,25 @@ pub const GroupTable = struct {
             std.ArrayList(Accumulator).growCapacity(cells)
         else
             self.accumulators.capacity;
-        const projected = @sizeOf(KeyArena) + try self.strings.?.projected(key.len) + cap * @sizeOf(FixedSlot) +
+        const projected = @sizeOf(KeyArena) + try self.strings.?.projected(key_len) + cap * @sizeOf(FixedSlot) +
             refs_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) +
             (if (self.compact.stride != 0) self.compact.projected(n + 1) else 0) + self.set_objects;
         try self.admit(projected -| self.allocated_bytes);
+        // Direct shared tables also fund the transient old/new metadata overlap before a grow. The arena's
+        // append-only chunks already include every live byte in projected(), and never replace a key buffer.
+        var overlap: usize = if (grow) self.slots.len * @sizeOf(FixedSlot) else 0;
+        if (refs_cap > self.refs.capacity) overlap = @max(overlap, self.refs.capacity * @sizeOf(u32));
+        if (first_cap > self.first.capacity) overlap = @max(overlap, self.first.capacity * @sizeOf(u64));
+        if (acc_cap > self.accumulators.capacity)
+            overlap = @max(overlap, self.accumulators.capacity * @sizeOf(Accumulator));
+        if (self.compact.stride != 0 and self.compact.projected(n + 1) > self.compact.held())
+            overlap = @max(overlap, self.compact.held());
+        const extra = if (raw_string and self.shared != null and overlap != 0)
+            self.shared.?.drawExact(overlap) orelse return error.ExceededMemoryBudget
+        else
+            0;
+        defer if (extra != 0) self.shared.?.release(extra);
+        if (raw_string and self.shared == null) try self.admit((projected -| self.allocated_bytes) + overlap);
         // Failed allocation can leave already-grown buffers live, but never publishes a partial key/id.
         defer self.allocated_bytes = self.variableHeld();
         if (grow) {
@@ -5331,7 +5379,15 @@ pub const GroupTable = struct {
         try self.first.ensureTotalCapacity(self.allocator, n + 1);
         if (self.compact.stride != 0) try self.compact.reserve(self.allocator, n + 1);
         try self.accumulators.ensureTotalCapacity(self.allocator, cells);
-        const ref = try self.strings.?.put(self.allocator, key);
+        const ref = if (raw_string) blk: {
+            var frame: [5]u8 = @splat(0);
+            if (present) {
+                frame[0] = 1;
+                std.mem.writeInt(u32, frame[1..5], std.math.cast(u32, key.len) orelse
+                    return error.ExceededMemoryBudget, .little);
+            }
+            break :blk try self.strings.?.putParts(self.allocator, frame[0..if (present) 5 else 1], key);
+        } else try self.strings.?.put(self.allocator, key);
         if (self.compact.stride == 0) for (agg_calls) |call| {
             self.accumulators.appendAssumeCapacity(if (call.func == .count_distinct)
                 .{ .distinct = self.freshDistinct() }
@@ -5351,6 +5407,23 @@ pub const GroupTable = struct {
         if (self.compact.stride != 0) self.compact.append();
         self.discovered(pos);
         return id;
+    }
+
+    fn probeString(self: *const GroupTable, key: []const u8, present: bool, full_hash: u64) FixedProbe {
+        if (self.slots.len == 0) return .{ .id = null, .slot = 0 };
+        const hash: u32 = @truncate(full_hash);
+        const mask = self.slots.len - 1;
+        var i = @as(usize, hash) & mask;
+        while (true) : (i = (i + 1) & mask) {
+            const slot = self.slots[i];
+            if (slot.id == empty_id) return .{ .id = null, .slot = i };
+            if (slot.hash != hash) continue;
+            const stored = self.keyAt(slot.id);
+            if (present) {
+                if (stored.len == key.len +| 5 and stored[0] == 1 and keyEql(stored[5..], key))
+                    return .{ .id = slot.id, .slot = i };
+            } else if (stored.len == 1 and stored[0] == 0) return .{ .id = slot.id, .slot = i };
+        }
     }
 
     fn stringReserve(ctx: *anyopaque, n: usize) Error!void {
@@ -8046,4 +8119,32 @@ fn cachedDistinctTrial(a: std.mem.Allocator) !void {
 test "cached string DISTINCT grows and merges exact bytes through allocation refusals" {
     try cachedDistinctTrial(testing.allocator);
     try testing.checkAllAllocationFailures(testing.allocator, cachedDistinctTrial, .{});
+}
+
+test "shared string identity frames NULL empty embedded zero and large keys once through stored hash growth" {
+    const a = testing.allocator;
+    var table = GroupTable.init(a, 32 << 20);
+    defer table.deinit();
+    const big = try a.alloc(u8, 70001);
+    defer a.free(big);
+    @memset(big, 'x');
+    const keys = [_]?[]const u8{ null, "", "a\x00b", "\x00", big };
+    for (0..500) |i| {
+        var bytes: [64]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&bytes, "key-{d}", .{i});
+        _ = try table.getOrInsertStringHashed(raw, &.{}, 900 + i, 7);
+    }
+    for (keys, 0..) |key, i| {
+        const id = try table.getOrInsertStringHashed(key, &.{}, 800 + i, 7);
+        try testing.expectEqual(@as(u32, @intCast(500 + i)), id);
+        try testing.expectEqual(id, try table.getOrInsertStringHashed(key, &.{}, i, 7));
+        try testing.expectEqual(@as(u64, @intCast(i)), table.first.items[id]);
+        const frame = table.keyAt(id);
+        if (key) |raw| {
+            try testing.expectEqual(@as(u8, 1), frame[0]);
+            try testing.expectEqualStrings(raw, frame[5..]);
+            try testing.expectEqual(raw.len, std.mem.readInt(u32, frame[1..5], .little));
+        } else try testing.expectEqualSlices(u8, &.{0}, frame);
+    }
+    try testing.expectEqual(@as(usize, 505), table.groupCount());
 }

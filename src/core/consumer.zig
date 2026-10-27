@@ -4574,7 +4574,11 @@ fn scanRGForAggImpl(
     for ([_]bool{ false, true }) |late| for (in.read, 0..) |needed, ci| {
         if (late and dec.payload == null) break;
         if (!needed or ci >= in.rg.columns.items.len) continue;
-        if (stage_plan) |sp| if (!sp.base[ci]) continue;
+        if (stage_plan) |sp| if (!sp.base[ci]) {
+            // A flat hash-group key is payload: one gated decode after the filter, including on a staged plan.
+            const pay = late and if (dec.payload) |p| p[ci] else false;
+            if (!pay) continue;
+        };
         if (dec.payload) |p| if (p[ci] != late) continue;
         if (late and !filtered) {
             const first: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = batch_rows, .expr_batch_rows = ws.expr_batch_rows };
@@ -5197,8 +5201,9 @@ fn scanRGSliced(
     return matched;
 }
 
-/// A staged row group's decode: the columns the outer filter and GROUP BY keys read (`base`), decoded first; then
-/// each aggregate's own (`calls[i]`, less `base`), decoded for it alone and dropped after.
+/// A staged row group's decode: the columns the outer filter reads (`base`), decoded first; then each aggregate's
+/// own (`calls[i]`, less `base`), decoded for it alone and dropped after. A flat hash-group key is payload, gated
+/// by the filter's survivors, on this plan as on the others.
 const StagePlan = struct {
     base: []bool,
     calls: [][]bool,
@@ -5236,7 +5241,10 @@ const StagePlan = struct {
 
 const CallBatch = struct { batch: filter_eval.Batch, lookup: []?usize };
 
-/// The columns of `in.read` a row group needs before its filter has run: the filter's own, and the group keys.
+/// The columns of `in.read` a row group needs before its filter has run: the filter's own. With no filter, the
+/// group keys too. A flat key of a hash group under a filter is payload (`payloadColumns`), decoded only at the
+/// survivors. A nested key has no row gate, so it stays here. A record owner stays here too: its packed path needs
+/// the whole dictionary and applies the survivor mask at the sink, which a row gate would replace with defaults.
 fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool {
     const n = in.read.len;
     const base = try a.alloc(bool, n);
@@ -5249,18 +5257,31 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
         };
     }
     switch (target) {
-        .grouped => |g| for (g.keys) |k| k.collectColumns(base),
+        .grouped => |g| if (in.filter == null or g.records != null) {
+            for (g.keys) |k| k.collectColumns(base);
+        } else {
+            const key_cols = try a.alloc(bool, n);
+            defer a.free(key_cols);
+            @memset(key_cols, false);
+            for (g.keys) |k| k.collectColumns(key_cols);
+            for (key_cols, 0..) |is_key, ci| {
+                if (!is_key or base[ci] or ci >= in.rg.columns.items.len) continue;
+                const cm = in.rg.columns.items[ci].meta_data orelse continue;
+                if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) base[ci] = true;
+            }
+        },
         .scalar => {},
     }
     for (base, in.read) |*b, r| b.* = b.* and r;
     return base;
 }
 
-/// Payload columns: what a filtered row group reads past `baseColumns`, flat. Every decode path (whole, compact,
-/// staged, sliced) decodes them after the filter, gated by its survivors (`DecodeOptions.row_gate`), so which of their
-/// pages decode depends on the input and the query alone. An owner query (`records`) is included: its payload is
-/// still not read for rows the filter dropped. Null when there is no filter — nothing has selected rows yet — or
-/// when every read column is already in the pre-filter set.
+/// Payload columns: what a filtered row group reads past `baseColumns`, flat. That is an aggregate's columns and a
+/// flat hash-group key, including the columns of a key expression. Every decode path (whole, compact, staged, sliced)
+/// decodes them after the filter, gated by its survivors (`DecodeOptions.row_gate`), so which of their pages decode
+/// depends on the input and the query alone. An owner query (`records`) is included: its payload is still not read
+/// for rows the filter dropped. Null when there is no filter — nothing has selected rows yet — or when every read
+/// column is already in the pre-filter set.
 fn payloadColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !?[]const bool {
     if (in.filter == null) return null;
     const base = try baseColumns(a, in, target);
@@ -5639,7 +5660,7 @@ const ChunkDecoder = struct {
         try cols.appendSlice(a, batch.cols);
         const lk = try a.dupe(?usize, lookup);
         for (plan.calls[i], 0..) |needed, ci| {
-            if (!needed) continue;
+            if (!needed or (ci < lk.len and lk[ci] != null)) continue;
             var col = try self.column(a, ci, sel);
             // The grouped row fold reads values, not codes.
             if (values) col = try agg_coded.materialize(a, col);

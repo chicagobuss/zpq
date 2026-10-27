@@ -5472,7 +5472,10 @@ fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
     if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return false;
     if (!reusableByteEncodings(cm.encodings.items)) return false;
     const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
-    if (filtered and !columnFeedsFold(target, ci)) return true;
+    // A filter-only string its dictionary covers is compared once per dictionary entry from its codes, a few bytes a
+    // row: streaming it reads every value instead, and saves no faulted string bytes.
+    if (filtered and !columnFeedsFold(target, ci))
+        return !@import("filter/membership.zig").dictionaryCoversChunk(&cm);
     // DISTINCT sets and string winners reuse a whole batch's prepared values. Streaming a key forces their
     // payloads into repeated decoder/fold setup too; ordinary memory admission still slices a batch that cannot fit.
     if (target == .grouped) for (target.grouped.calls) |call| {
@@ -11754,6 +11757,13 @@ test "filter-only and hash-only strings stream a cache-sized window, other strin
     const rows = streamWindowRows(in, scalar_filter, 100_000);
     // 130 bytes of string per row into 1 MiB of L2. The window is that many rows, not the chunk.
     try std.testing.expectEqual(@as(usize, (1 << 20) / 130), rows);
+    // Regression (9bcb030 on reads-sf1 B6_string_eq, 2x slower): a filter-only string whose dictionary covers the
+    // chunk keeps the whole-chunk coded decode, its predicate evaluated per dictionary entry.
+    var enc_dict = [_]schema.Encoding{ .PLAIN_DICTIONARY, .RLE };
+    columns[0].meta_data.?.encodings = .{ .items = &enc_dict, .capacity = enc_dict.len, .pointer_stability = .{} };
+    try std.testing.expect(!streamByteArray(in, scalar_filter, 0));
+    try std.testing.expectEqual(std.math.maxInt(usize), streamWindowRows(in, scalar_filter, 100_000));
+    columns[0].meta_data.?.encodings = .{ .items = &enc_plain, .capacity = enc_plain.len, .pointer_stability = .{} };
 
     const distinct: expr_agg.AggCall = .{
         .func = .count_distinct,

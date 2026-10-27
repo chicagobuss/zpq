@@ -4909,10 +4909,13 @@ fn prepareAggregateWithMetas(
         n_workers + if (part_on) partagg.n_parts else @as(usize, 0),
     );
     for (work_items.items) |item| {
-        for (item.accumulators) |*acc| {
+        for (item.accumulators, 0..) |*acc, ai| {
             if (acc.* == .distinct) if (acc.distinct.heap()) |ds| {
                 if (group_by_keys == null and n_workers > 1) {
-                    try ds.initPartitions(gpa, group_budget);
+                    if (agg_calls[item.agg_start + ai].arg.?.typeOf() == .str)
+                        try ds.initStringPartitions(gpa, group_budget)
+                    else
+                        try ds.initPartitions(gpa, group_budget);
                 } else {
                     ds.shared = group_budget;
                 }
@@ -5352,7 +5355,10 @@ fn prepareAggregateWithMetas(
         ds.* = .{};
         acc.* = .{ .distinct = .fromSet(ds) };
         if (group_by_keys == null and n_workers > 1) {
-            try ds.initPartitions(gpa, group_budget);
+            if (call.arg.?.typeOf() == .str)
+                try ds.initStringPartitions(gpa, group_budget)
+            else
+                try ds.initPartitions(gpa, group_budget);
         } else {
             ds.shared = group_budget;
         }
@@ -5685,7 +5691,7 @@ fn prepareAggregateWithMetas(
             const dst_acc = &accumulators[ci];
             const dst_ds = dst_acc.distinct.heap() orelse continue;
             if (dst_ds.parts) |dst_parts| {
-                const n_threads = @min(n_workers, expr_agg.NUM_PARTS);
+                const n_threads = @min(n_workers, dst_parts.len);
                 const tasks = try arena.alloc(DistinctMergeTask, n_threads);
                 var cursor = std.atomic.Value(usize).init(0);
                 for (tasks) |*task| task.* = .{
@@ -6771,6 +6777,17 @@ fn inlinePairAnswer(
     var raw = if (automatic_single) try pairRawIdentity(gpa, arena, metas, axes, args.scan_all) else null;
     errdefer if (raw) |*p| p.deinit(gpa);
     if (automatic_single and raw == null) return null;
+    // The retained dictionary identity cannot bind a chunk containing non-dictionary data. Decline known
+    // fallback before building its union; missing encoding_stats remain speculative, and forced owners replay.
+    if (raw == null and args.distinct_pairs == .auto) for (axes) |axis| for (work) |item| {
+        const cm = metas[item.file].row_groups.items[item.rg].columns.items[axis.col_ref.col_idx].meta_data.?;
+        if (cm.encoding_stats) |stats| for (stats.items) |e| {
+            if (e.count <= 0 or (e.page_type != @backingInt(schema.PageType.DATA_PAGE) and
+                e.page_type != @backingInt(schema.PageType.DATA_PAGE_V2))) continue;
+            if (e.encoding != @backingInt(schema.Encoding.PLAIN_DICTIONARY) and
+                e.encoding != @backingInt(schema.Encoding.RLE_DICTIONARY)) return null;
+        };
+    };
     if (raw == null and args.encoded and args.ndv_union)
         domain = try ndv.retainIdentity(gpa, arena, files, metas, axes, workers, args.max_memory, input_rows + 1);
     var identity = if (raw) |p| p else (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
@@ -6904,6 +6921,42 @@ fn pairRawIdentity(gpa: std.mem.Allocator, arena: std.mem.Allocator, metas: []co
     return key_pack.Plan.initFields(gpa, axes, null, fields);
 }
 
+/// A covered local key dictionary bounds the number of per-RG sets. A compact argument range makes the
+/// existing sets/bitmaps a credible alternative; unknown or wide domains keep the pair owner's admission.
+fn pairLocalSetWork(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    distinct: usize,
+    rows: usize,
+    workers: usize,
+) !?usize {
+    if (!args.plain_rules or args.distinct_pairs != .auto or args.integer_records_min_rows == 0 or args.scan_all or
+        !args.ndv_union or keys.len != 1 or plan.query.filter != null) return null;
+    const arg = calls[distinct].arg.?.col_ref;
+    if (arg.physical_type != .INT64 or arg.unsigned_64) return null;
+    var range: IntegerRangeHint = .{};
+    for (work) |item| range.include(&metas[item.file].row_groups.items[item.rg], &metas[item.file], arg.col_idx);
+    if (!range.small(rows)) return null;
+    const files = try arena.alloc(ndv.File, args.inputs.len);
+    for (args.inputs, files) |input, *file| file.* = .{
+        .bytes = input.plan_bytes orelse input.bytes,
+        .local = !std.mem.startsWith(u8, input.name, "s3://"),
+    };
+    // Headers only: neither decompress nor build another union to decide whether to avoid this owner.
+    const stat = try ndv.collect(gpa, arena, files, metas, keys, workers, args.max_memory, false);
+    const entries = std.math.cast(usize, stat.entries orelse return null) orelse return null;
+    const key_bytes: usize = 1 + if (keys[0].col_ref.physical_type == .INT32) @as(usize, 4) else 8;
+    const set_bytes = expr_agg.GroupTable.variableEntryBytes(key_bytes, calls.len) +| @sizeOf(expr_agg.DistinctSet);
+    // Read the key/value and table pointers, then visit the local distinct values in the final set merge.
+    return entries *| set_bytes +| rows *| (key_bytes + @sizeOf(u64) * 2 + @sizeOf(usize) * 2);
+}
+
 fn pairAnswerBits(
     comptime Bits: type,
     comptime top: bool,
@@ -6967,6 +7020,12 @@ fn pairAnswerBits(
         0,
         args.byte_top_partitions,
     ) orelse return null;
+    if (try pairLocalSetWork(gpa, arena, args, metas, plan, work, calls, keys, distinct, rows, workers)) |sets| {
+        if (sets <= pq.work +| gq.work) {
+            if (!explain_only) if (args.taken) |taken| taken.insert(.plain_rule);
+            return null;
+        }
+    }
     const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);
     const domain_bytes = if (identity.domain) |d| d.bytes else 0;
     const pack_rows = owner_groups.batchRows(null);
@@ -13093,7 +13152,7 @@ test "DistinctMergeTask: partitioned distinct sets merge and handle allocation f
             try src2.initPartitions(gpa, null);
             for ([_]u64{ 2, 3, 4, 200, 400 }) |v| try src2.insertU64(gpa, v);
 
-            for (0..expr_agg.NUM_PARTS) |p| {
+            for (0..dst.parts.?.len) |p| {
                 try mergeDistinctPart(&dst.parts.?[p], &src1.parts.?[p], gpa);
                 try mergeDistinctPart(&dst.parts.?[p], &src2.parts.?[p], gpa);
             }
@@ -26390,4 +26449,104 @@ test "raw payload owner multisets preserve NULLs AVG ties readers and poisoned-r
         const explanation = try explainAggregate(gpa, a, args);
         try testing.expect(explanation.record_path == null);
     };
+}
+
+test "distinct admission prices both wide pair reductions against covered local sets" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [4096]i64 = undefined;
+    var x: [4096]i64 = undefined;
+    for (&k, &x, 0..) |*key, *value, i| {
+        key.* = (1 << 40) + @as(i64, @intCast(i / 64));
+        value.* = @intCast(i % 127);
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i64 = .{ .values = &k } }, .parquet_type = .INT64, .nullable = false },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = &x } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 16;
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "pair-cost", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(DISTINCT x) AS d",
+        .group_by = "k",
+        .max_memory = 256 << 20,
+        .parallelism = 4,
+        .min_bytes_per_worker = 1,
+        .integer_records_min_rows = 1,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    const ex = try explainAggregate(gpa, a, args);
+    try testing.expect(ex.record_path == null or ex.record_path.?.layout != .pair_distinct);
+    // A budget retry disables plain cost rules and must recover the available exact owner.
+    args.plain_rules = false;
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+    args.plain_rules = true;
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    args.distinct_pairs = .on;
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    try got.output.applyResultOrder(gpa, args.result_order);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+}
+
+test "distinct admission refuses declared dictionary fallback before retaining a composite identity" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [2048]i32 = undefined;
+    var x: [2048]i64 = undefined;
+    var names: [2048][]const u8 = undefined;
+    for (&k, &x, &names, 0..) |*key, *value, *name, i| {
+        key.* = @intCast(i % 7);
+        value.* = @intCast(i % 61);
+        name.* = if (i % 3 == 0) "" else "phone";
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i32 = .{ .values = &k } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "s", .col = .{ .string = .{ .values = &names } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = &x } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "declared-fallback", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(DISTINCT x) AS d",
+        .group_by = "k,s",
+        .filter = "s != ''",
+        .max_memory = 64 << 20,
+        .parallelism = 1,
+        .integer_records_min_rows = 0,
+    };
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+    const stats = try a.dupe(schema.PageEncodingStats, &.{
+        .{ .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+        .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.RLE_DICTIONARY), .count = 1 },
+        .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+    });
+    meta.row_groups.items[0].columns.items[2].meta_data.?.encoding_stats = std.ArrayListUnmanaged(schema.PageEncodingStats).fromOwnedSlice(stats);
+    const ex = try explainAggregate(gpa, a, args);
+    try testing.expect(ex.record_path == null or ex.record_path.?.layout != .pair_distinct);
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    args.distinct_pairs = .off;
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    args.distinct_pairs = .on;
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
 }

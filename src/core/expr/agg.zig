@@ -81,6 +81,8 @@ pub const AggCall = struct {
     /// `avg_state(x)`: an avg that answers its mergeable sum and count instead of the mean. It folds exactly as
     /// `avg(x)` does (same `func` and `result`); only what it answers differs.
     state: bool = false,
+    /// `min`/`max` of `make_date(col)`, folded over `col` itself (`arg`): the answer is the DATE those days are.
+    as_date: bool = false,
 };
 
 /// How an aggregate folds, and what it emits in the final 1-row parquet:

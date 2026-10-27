@@ -8270,8 +8270,23 @@ fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
     if (arg != .col_ref) return if (arg.isBoolean()) boolean_answer else null;
+    if (call.as_date) return date_answer;
     return leafSchemaElem(meta, arg.col_ref.col_idx);
 }
+
+/// The type `min`/`max` of `make_date(col)` answers as (`AggCall.as_date`), whatever integer type `col` has.
+const date_answer: schema.SchemaElement = .{
+    .type = .INT32,
+    .type_length = null,
+    .repetition_type = .OPTIONAL,
+    .name = "",
+    .num_children = null,
+    .scale = null,
+    .precision = null,
+    .field_id = null,
+    .converted_type = .DATE,
+    .logical_type = .{ .DATE = .{} },
+};
 
 /// The type a computed BOOLEAN answer column (a key, min or max of a BOOLEAN expression) passes through as, as a bare
 /// BOOLEAN column's does: printed true/false and written BOOLEAN, though its lane holds 0/1.

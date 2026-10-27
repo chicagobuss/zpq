@@ -1012,6 +1012,17 @@ fn parseAggCall(
         default_name = null;
     }
 
+    // `make_date` over a column it takes is the identity on that column's values, each of them an INTEGER, and it
+    // keeps their order. So `min`/`max` of it fold the column itself, through its encoded and statistics paths, and
+    // answer as a DATE.
+    var as_date = false;
+    if (func == .min or func == .max) if (arg) |a| if (a == .call and a.call.func == .make_date and
+        a.call.args[0].* == .col_ref)
+    {
+        arg = a.call.args[0].*;
+        as_date = true;
+    };
+
     // 6. Resolve result shape from func + arg type.
     const result = try agg.resolveResult(func, arg);
     const shifted = if (func != .sum) null else if (arg) |a| sumOffset(a) else null;
@@ -1025,6 +1036,7 @@ fn parseAggCall(
         .result = result,
         .offset = if (shifted) |s| s.offset else 0,
         .state = state,
+        .as_date = as_date,
     };
 }
 
@@ -1762,4 +1774,23 @@ test "parse: regexp_replace compiles its constant pattern, replacement and optio
     try testing.expectError(error.TypeMismatch, parseExprOnly(a, "regexp_replace(s, s, 'b')", &file, null));
     try testing.expectError(error.WrongArity, parseExprOnly(a, "regexp_replace(s, 'a')", &file, null));
     try testing.expectError(error.InvalidRegex, parseExprOnly(a, "regexp_replace(s, 'a', '\\2')", &file, null));
+}
+
+test "parse: min/max of make_date(col) fold the column itself and answer as a DATE" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "i", "b" }, &.{ .INT32, .INT64 });
+    const calls = try parseAggList(a, "MIN(make_date(i)), max(make_date(i)) AS hi, count(make_date(i))", &file, null);
+    for (calls[0..2]) |c| {
+        try testing.expect(c.as_date);
+        try testing.expect(c.arg.? == .col_ref);
+        try testing.expectEqual(@as(usize, 0), c.arg.?.col_ref.col_idx);
+    }
+    // Only min and max pass a value through; count still counts the expression's values.
+    try testing.expect(!calls[2].as_date);
+    try testing.expect(calls[2].arg.? == .call);
+    // An expression under make_date is no column to fold.
+    const shifted = try parseAggList(a, "min(make_date(i + 1))", &file, null);
+    try testing.expect(!shifted[0].as_date and shifted[0].arg.? == .call);
 }

@@ -1,14 +1,14 @@
 #!/bin/sh
 # A builder's side of tools/check/fleet.sh: in the synced source tree, one target's bundle from a warm Zig cache.
 #
-#   fleet-build.sh TARGET ZIG_VERSION OUT STEP:OPTIMIZE...
+#   fleet-build.sh TARGET ZIG_VERSION OUT COMPILE_GB STEP:OPTIMIZE...
 #
 # Every builder uses the pinned Zig and caches at the same paths under ~/.cache/zpq-fleet (the Zig is fetched once):
 # the toolchain's path is in the binary, so two builders agree byte for byte only from the same paths. The caches
 # stay between pushes, so a push rebuilds only what changed.
 set -eu
-t=$1 v=$2 out=$3
-shift 3
+t=$1 v=$2 out=$3 gb=$4
+shift 4
 base=$HOME/.cache/zpq-fleet
 mkdir -p "$base"
 z=$base/zig-$v/zig
@@ -27,11 +27,12 @@ if [ -n "$old" ] && tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null | grep -q "fl
 fi
 mkdir -p "$(dirname "$out")" && echo $$ > "$out.pid"
 rm -rf "$out" && mkdir -p "$out"
-# Each compile is capped where the user manager allows: a runaway build fails alone, the host never OOMs.
+# Each compile is capped where the user manager allows, at fleet.sh's compile_gb (which its placement budgets for):
+# a runaway build fails alone, the host never OOMs.
 cap=""
 [ -n "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "/run/user/$(id -u)" ] || export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 if command -v systemd-run >/dev/null && systemd-run --user --scope --quiet true 2>/dev/null; then
-  cap="systemd-run --user --scope --quiet -p MemoryMax=6G -p MemorySwapMax=0"
+  cap="systemd-run --user --scope --quiet -p MemoryMax=${gb}G -p MemorySwapMax=0"
 fi
 pids=""
 for s in "$@"; do

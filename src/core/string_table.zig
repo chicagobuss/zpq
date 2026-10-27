@@ -210,6 +210,8 @@ pub const Sink = struct {
                     const part = &self.state.parts[p];
                     partagg.PartAgg.lock(part);
                     defer partagg.PartAgg.unlock(part);
+                    for (rows) |r| part.table.prefetchStringSlot(self.hashes[r]);
+                    for (rows) |r| part.table.prefetchStringKey(self.hashes[r]);
                     for (rows) |r| {
                         const ordinal = view.input_base + if (view.input_rows) |input| input[off + r] else off + r;
                         self.ids[r] = try part.table.getOrInsertStringHashed(

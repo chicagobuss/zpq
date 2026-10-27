@@ -5431,6 +5431,28 @@ pub const GroupTable = struct {
         return id;
     }
 
+    /// Owning partition lock required: slots/views can grow until publication. Separate passes overlap the
+    /// slot -> group view -> arena dependency across rows without treating a hash as identity.
+    pub fn prefetchStringSlot(self: *const GroupTable, hash: u64) void {
+        if (self.slots.len == 0) return;
+        const at = @as(usize, @as(u32, @truncate(hash))) & (self.slots.len - 1);
+        @prefetch(&self.slots[at], .{ .rw = .read, .locality = 2 });
+    }
+
+    pub fn prefetchStringKey(self: *const GroupTable, hash: u64) void {
+        if (self.slots.len == 0 or self.string_views.items.len == 0) return;
+        const at = @as(usize, @as(u32, @truncate(hash))) & (self.slots.len - 1);
+        const slot = self.slots[at];
+        if (slot.id == empty_id or slot.hash != @as(u32, @truncate(hash))) return;
+        const view = &self.string_views.items[slot.id];
+        @prefetch(view, .{ .rw = .read, .locality = 2 });
+        const bytes = view.bytes;
+        if (bytes.len != 0) {
+            @prefetch(bytes.ptr, .{ .rw = .read, .locality = 2 });
+            @prefetch(bytes.ptr + bytes.len - 1, .{ .rw = .read, .locality = 2 });
+        }
+    }
+
     fn probeString(self: *const GroupTable, key: []const u8, present: bool, full_hash: u64) FixedProbe {
         if (self.slots.len == 0) return .{ .id = null, .slot = 0 };
         const hash: u32 = @truncate(full_hash);

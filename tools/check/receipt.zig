@@ -214,7 +214,8 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
     const out = try oracle_mod.capture(gpa, io, full.items);
     defer gpa.free(out.stdout);
     defer gpa.free(out.stderr);
-    const seconds = @as(f64, @floatFromInt(started.untilNow(io, .awake).toNanoseconds())) / 1e9;
+    const ns: i64 = @intCast(started.untilNow(io, .awake).toNanoseconds());
+    const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
     const log = try std.mem.concat(arena, u8, &.{ out.stdout, out.stderr });
     // `timeout` exits 124 when it signalled the stage, 137 when it had to kill it.
     const timed_out = !out.signaled and (out.code == 124 or out.code == 137);

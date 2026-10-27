@@ -167,11 +167,22 @@ fn specialOf(text: []const u8) ?Special {
     return null;
 }
 
+/// The f64 nearest `n`, rounded as an exact conversion rounds. LLVM lowers no conversion of an integer wider than 128
+/// bits to a float on aarch64, so a wide value is shifted into 120 bits first, with a sticky low bit standing for the
+/// bits shifted out: an f64 keeps 53, so the rounding is the exact value's.
+pub fn bigToFloat(n: Big) f64 {
+    if (std.math.cast(i128, n)) |x| return @floatFromInt(x);
+    const shift: u16 = @intCast(@bitSizeOf(Big) - @clz(@abs(n)) - 120);
+    var top: i128 = @intCast(n >> @intCast(shift));
+    if ((n & ((@as(Big, 1) << @intCast(shift)) - 1)) != 0) top |= 1;
+    return std.math.ldexp(@as(f64, @floatFromInt(top)), shift);
+}
+
 /// A float under the policy: non-finite values are their tokens, integral ones below 2^53 are integers.
 pub fn fromFloat(f: f64) Val {
     if (std.math.isNan(f)) return .{ .special = .nan };
     if (std.math.isInf(f)) return .{ .special = if (f > 0) .pos_inf else .neg_inf };
-    if (@floor(f) == f and @abs(f) < 9007199254740992.0) return .{ .int = @intFromFloat(f) };
+    if (@floor(f) == f and @abs(f) < 9007199254740992.0) return .{ .int = @as(i64, @intFromFloat(f)) };
     return .{ .float = f };
 }
 
@@ -259,7 +270,7 @@ pub fn laneOf(type_name: []const u8) Lane {
 
 fn toFloat(v: Val) ?f64 {
     return switch (v) {
-        .int => |n| @floatFromInt(n),
+        .int => |n| bigToFloat(n),
         .dec => |d| decToFloat(d),
         .float => |f| f,
         else => null,
@@ -820,4 +831,24 @@ test "nested values compare structurally and by exact number" {
     try testing.expect(list == .nested and same(list, try fromOracle(try parse(a, "[0,null,3]"), "BIGINT[]")));
     try testing.expect(!same(list, try fromOracle(try parse(a, "[0,null,4]"), "BIGINT[]")));
     _ = zv;
+}
+
+test "a wide integer converts to the f64 an exact conversion gives, ties and sticky bits included" {
+    const two = @as(Big, 1);
+    const cases = [_]Big{
+        0,                -7,
+        (two << 127) - 1, -(two << 127),
+        (two << 200) + 1, (two << 200) + (two << 147), // a tie, rounded to even
+        (two << 200) + (two << 147) + 1, // above the tie: up
+        -((two << 300) + (two << 247) + 3),
+        (two << 510) - 1,
+    };
+    for (cases) |n| {
+        if (@import("builtin").cpu.arch == .x86_64) {
+            try testing.expectEqual(@as(f64, @floatFromInt(n)), bigToFloat(n));
+        }
+    }
+    try testing.expectEqual(std.math.ldexp(@as(f64, 1), 200), bigToFloat((two << 200) + (two << 147)));
+    const up = std.math.ldexp(@as(f64, 1), 200) + std.math.ldexp(@as(f64, 1), 148);
+    try testing.expectEqual(up, bigToFloat((two << 200) + (two << 147) + 1));
 }

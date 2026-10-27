@@ -1135,9 +1135,9 @@ fn modeAvgExact(in: Inputs, spec: Spec) !Reason {
             if (compare.jsonEqual(row.get("g").?, g)) break row;
         } else return fail(in, "avg g missing", .{});
         // The exact sum is wider than f64. The check is the float of that sum, which is what zpq prints.
-        const sv: f64 = @floatFromInt(try std.fmt.parseInt(compare.Big, try jsonText(d.get("sv").?), 10));
+        const sv = compare.bigToFloat(try std.fmt.parseInt(compare.Big, try jsonText(d.get("sv").?), 10));
         const nv = try std.fmt.parseInt(i64, try jsonText(d.get("nv").?), 10);
-        const sw: f64 = @floatFromInt(try std.fmt.parseInt(compare.Big, try jsonText(d.get("sw").?), 10));
+        const sw = compare.bigToFloat(try std.fmt.parseInt(compare.Big, try jsonText(d.get("sw").?), 10));
         const nw = try std.fmt.parseInt(i64, try jsonText(d.get("nw").?), 10);
         const a = try floatOfJson(row.get("a").?);
         const b = try floatOfJson(row.get("b").?);
@@ -1415,7 +1415,7 @@ fn isNumber(v: Val) bool {
 
 fn atWidth(v: Val, width: u8) u64 {
     const f: f64 = switch (v) {
-        .int => |n| @floatFromInt(n),
+        .int => |n| compare.bigToFloat(n),
         .dec => |d| blk: {
             var buf: [200]u8 = undefined;
             break :blk std.fmt.parseFloat(f64, compare.decText(&buf, d)) catch unreachable;
@@ -1763,7 +1763,7 @@ fn goldenRow(in: Inputs, spec: Spec, raw: std.json.ObjectMap) ![]const Val {
 fn inexactVal(v: Val) !Val {
     return switch (v) {
         .float => |f| compare.roundFloat(f),
-        .int => |n| compare.roundFloat(@floatFromInt(n)),
+        .int => |n| compare.roundFloat(compare.bigToFloat(n)),
         else => v,
     };
 }

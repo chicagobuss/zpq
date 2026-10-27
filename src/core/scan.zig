@@ -4587,7 +4587,11 @@ fn prepareAggregateWithMetas(
     var scan_plan = planAggregate(plan_inputs);
     var selected_record_path: ?RecordAdmission = null;
     // Keep the accepted dense choice. Sparse typed identities otherwise have one shared record/finish quote.
-    if (plan_inputs.dense_bytes == null or !dense_profitable) {
+    const payload_top = if (agg_plan.OwnerProgram.init(agg_calls)) |p|
+        p.len != 0 and p.distinct_arg == null and args.result_order.limit != null
+    else
+        false;
+    if (plan_inputs.dense_bytes == null or !dense_profitable or payload_top) {
         if (explain) {
             selected_record_path = try inlineSelectedCount(
                 gpa,
@@ -5553,8 +5557,7 @@ fn prepareAggregateWithMetas(
         const winner_copies = row_src.winnerStringBytes();
         if (args.ledger != null or winner_copies != 0) {
             const bytes = (if (args.ledger != null)
-                answerBytesParallel(slots.items, col_types,
-                    if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
+                answerBytesParallel(slots.items, col_types, if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
                     row_src.denseStringBytes()
             else
                 0) +| winner_copies;
@@ -7271,7 +7274,16 @@ fn inlineSelectedCount(
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
     const program = agg_plan.OwnerProgram.init(calls) orelse return null;
-    if (program.len != 0 or program.distinct_arg != null or calls.len == 0) return null;
+    if (program.distinct_arg != null or calls.len == 0) return null;
+    // Payload lanes use one typed slot per kind. Repeated kinds over different columns keep the general path.
+    if (program.len != 0) {
+        if (keys.len < 2 or domain == null) return null;
+        var previous: ?owner_groups.Lane = null;
+        for (program.args[0..program.len]) |arg| {
+            if (previous == arg.kind) return null;
+            previous = arg.kind;
+        }
+    }
     for (outputs) |out| if (out.derived != null) return null;
     // Preserve P1's nullable INT64 sidecar and 16-byte producer while extending physical INT32 and tuples.
     if (keys.len == 1 and keys[0] == .col_ref and keys[0].col_ref.physical_type == .INT64 and
@@ -7279,6 +7291,8 @@ fn inlineSelectedCount(
     const order = args.result_order;
     if (order.keys.len != 1 or order.having != null or order.hidden.len != 0) return null;
     if (order.keys[0].column >= outputs.len or outputs[order.keys[0].column].source != .agg) return null;
+    const rank_call = calls[outputs[order.keys[0].column].source.agg];
+    if (rank_call.func != .count or rank_call.arg != null) return null;
     const limit = order.limit orelse return null;
     const k = std.math.cast(usize, limit +| order.offset) orelse return null;
     if (limit == 0 or k == 0 or k > 1024 or work.len == 0) return null;
@@ -7298,9 +7312,51 @@ fn inlineSelectedCount(
     var identity = (try ownerIdentity(gpa, keys, domain)) orelse return null;
     defer identity.deinit(gpa);
     const workers = @min(requested_workers, owner_groups.max_workers);
+    if (program.len != 0) {
+        if (!identity.fitsBits(u64)) return null;
+        inline for (1..16) |mask| {
+            const kinds = comptime blk: {
+                var values: [@popCount(@as(u4, mask))]owner_groups.Lane = undefined;
+                var at: usize = 0;
+                for (std.enums.values(owner_groups.Lane), 0..) |kind, bit| {
+                    if (mask & (@as(usize, 1) << bit) != 0) {
+                        values[at] = kind;
+                        at += 1;
+                    }
+                }
+                break :blk values;
+            };
+            if (program.matches(&kinds)) return selectedCountBits(
+                u64,
+                &kinds,
+                gpa,
+                arena,
+                args,
+                metas,
+                plan,
+                work,
+                calls,
+                keys,
+                outputs,
+                &identity,
+                if (domain) |d| d.bytes else 0,
+                program,
+                stat,
+                pass_share,
+                input_rows,
+                rows,
+                workers,
+                k,
+                timings,
+                explain_only,
+            );
+        }
+        return null;
+    }
     switch (identity.kind()) {
         .dense_u32, .packed_u64 => return selectedCountBits(
             u64,
+            &.{},
             gpa,
             arena,
             args,
@@ -7324,6 +7380,7 @@ fn inlineSelectedCount(
         ),
         .packed_u128 => return selectedCountBits(
             u128,
+            &.{},
             gpa,
             arena,
             args,
@@ -7351,6 +7408,7 @@ fn inlineSelectedCount(
 
 fn selectedCountBits(
     comptime Bits: type,
+    comptime kinds: []const owner_groups.Lane,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     args: MultiAggArgs,
@@ -7372,8 +7430,8 @@ fn selectedCountBits(
     timings: Timings,
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
-    const O = owner_groups.Packed(Bits, &.{}, u32);
-    const S = owner_groups.SelectedOwner(Bits, &.{}, u32);
+    const O = owner_groups.Packed(Bits, kinds, u32);
+    const S = owner_groups.SelectedOwner(Bits, kinds, u32);
     const T = @import("owner_result.zig").Top(O.Group, bool, struct {
         fn worse(desc: bool, x: O.Group, y: O.Group) std.math.Order {
             if (x.weight != y.weight) return if (desc)
@@ -7404,7 +7462,7 @@ fn selectedCountBits(
     const selected: usize = @intFromFloat(@ceil(@as(f64, @floatFromInt(rows)) * std.math.clamp(pass_share, 0, 1)));
     const q = @import("owner_cost.zig").quote(
         Bits,
-        &.{},
+        kinds,
         u32,
         rows,
         selected,
@@ -7480,20 +7538,22 @@ fn selectedCountBits(
     for (groups, slots, 0..) |g, *slot, i| slot.* = .{ .key = &.{}, .first = g.first, .idx = i };
     const View = struct {
         groups: []const O.Group,
+        program: agg_plan.OwnerProgram,
+        calls: []const expr_agg.AggCall,
         fn key(ctx: *const anyopaque, i: usize) u128 {
             const v: *const @This() = @ptrCast(@alignCast(ctx));
             return v.groups[i].key;
         }
-        fn integer(ctx: *const anyopaque, i: usize, _: usize) anyerror!?i128 {
+        fn integer(ctx: *const anyopaque, i: usize, ai: usize) anyerror!?i128 {
             const v: *const @This() = @ptrCast(@alignCast(ctx));
-            return v.groups[i].weight;
+            return v.program.integer(v.groups[i], v.calls[ai], null);
         }
-        fn value(ctx: *const anyopaque, _: std.mem.Allocator, i: usize, _: usize) anyerror!AggValue {
+        fn value(ctx: *const anyopaque, a: std.mem.Allocator, i: usize, ai: usize) anyerror!AggValue {
             const v: *const @This() = @ptrCast(@alignCast(ctx));
-            return .{ .i = v.groups[i].weight };
+            return materializeOne(a, v.calls[ai], try v.program.accumulator(v.groups[i], v.calls[ai]));
         }
     };
-    const view: View = .{ .groups = groups };
+    const view: View = .{ .groups = groups, .program = program, .calls = calls };
     const key_types = try scratch.alloc(KeyType, keys.len);
     for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
     const row_source: RowSource = .{
@@ -7517,9 +7577,12 @@ fn selectedCountBits(
     for (outputs, names, types) |out, *name, *ty| {
         name.* = try gpa.dupe(u8, out.name);
         ty.* = .{
-            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else .i64,
-            .nullable = out.source == .key,
-            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
+            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else if (out.source == .agg and calls[out.source.agg].func == .avg) .f64 else .i64,
+            .nullable = out.source == .key or calls[out.source.agg].func != .count,
+            .source = if (out.source == .key)
+                leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx)
+            else
+                passThroughSource(calls[out.source.agg], &metas[0]),
         };
     }
     const out_rows = try gpa.alloc([]const AggValue, groups.len);
@@ -25536,5 +25599,69 @@ test "final multipass region retirement releases every charge after partial spaw
             try testing.expect(w.region == null and w.scratch_region == null);
         }
         try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+}
+
+test "packed payload top H preserves integer SUM AVG MIN MAX NULL ties and filtered windows" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [2048]i32 = undefined;
+    var text: [2048][]const u8 = undefined;
+    var value: [2048]i64 = undefined;
+    var defs: [2048]u32 = undefined;
+    for (&k, &text, &value, &defs, 0..) |*ki, *t, *v, *d, i| {
+        ki.* = @intCast(i % 17);
+        t.* = if (i % 2 == 0) "first" else "second";
+        v.* = @as(i64, @intCast(i % 19)) - 9;
+        d.* = @intFromBool(i % 17 != 0);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i32 = .{ .values = &k } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "t", .col = .{ .string = .{ .values = &text } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+        .{ .name = "v", .col = .{ .i64 = .{ .values = &value, .def_levels = &defs, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
+    };
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= @intCast(rgs.len);
+    for ([_]?[]const u8{ null, "k < 12" }) |filter| {
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "packed-payload", .bytes = sink.buffer.items }},
+            .metas = &.{meta},
+            .aggregate = "count(*) AS c,sum(v) AS s,avg(v) AS a,min(v) AS lo,max(v) AS hi",
+            .group_by = "k,t",
+            .filter = filter,
+            .max_memory = 256 << 20,
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .integer_records_min_rows = 0,
+            .integer_records = false,
+            .dense = true,
+            .plain_rules = false,
+            .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 9, .offset = 2 },
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+            args.parallelism = j;
+            args.decode_batch_rows = window;
+            args.integer_records = true;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            const ex = try explainAggregate(gpa, a, args);
+            try testing.expectEqual(.packed_count_top_h, ex.record_path.?.layout);
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.integer_records));
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+        };
     }
 }

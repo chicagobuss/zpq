@@ -2038,7 +2038,7 @@ fn ownedWinnerBytes(accs: []const expr_agg.Accumulator) usize {
     var n: usize = 0;
     for (accs) |acc| switch (acc) {
         .min_bytes, .max_bytes => |s| if (s) |v| {
-            n += v.len;
+            n += expr_agg.winnerBytes(v.len);
         },
         else => {},
     };
@@ -2187,7 +2187,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
-        expr_agg.winner_charge = if (table == null) w.winners else null;
+        expr_agg.winner_charge = w.winners;
         if (w.records) |records| switch (records.*) {
             .selected => |arm| arm.start(w.record_starts[idx], idx),
             else => records.start(w.record_starts[idx], idx),
@@ -5058,8 +5058,9 @@ fn prepareAggregateWithMetas(
         .ahead = n_workers,
     } else null;
 
-    var winners: WinnerCharge = .{ .ledger = if (group_by_keys == null) args.ledger else null };
+    var winners: WinnerCharge = .{ .ledger = if (group_by_keys == null) args.ledger else group_budget };
     errdefer winners.settle(0);
+    defer if (group_by_keys != null and !leave_tables) winners.settle(0);
     var work_cursor = std.atomic.Value(usize).init(0);
     for (workers, 0..) |*w, wi| {
         w.* = .{
@@ -5535,9 +5536,14 @@ fn prepareAggregateWithMetas(
         // The answer is drawn from the ledger before it is built, beside the tables and merge it is built from, and
         // stays drawn while the query holds it (the engine's ledger outlives it). Refused, it is the merge's refusal:
         // on one worker the tables it reads are one.
-        if (args.ledger != null) {
-            const bytes = answerBytesParallel(slots.items, col_types, if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
-                row_src.denseStringBytes();
+        const winner_copies = row_src.winnerStringBytes();
+        if (args.ledger != null or winner_copies != 0) {
+            const bytes = (if (args.ledger != null)
+                answerBytesParallel(slots.items, col_types,
+                    if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
+                    row_src.denseStringBytes()
+            else
+                0) +| winner_copies;
             answer_charge += group_budget.drawExact(bytes) orelse {
                 if (args.taken) |taken| taken.insert(.merge_memory);
                 return error.ExceededMemoryBudget;
@@ -8583,6 +8589,30 @@ const RowSource = struct {
     owner: ?OwnerRows = null,
     identity: ?*const key_pack.Plan = null,
     borrowed_strings: []const BorrowedSpan = &.{},
+
+    /// Each emitted string aggregate owns a fresh copy beside the still-live source winner.
+    fn winnerStringBytes(s: *const RowSource) usize {
+        var bytes: usize = 0;
+        if (s.dense != null or s.owner != null) return 0;
+        var strings = false;
+        for (s.outputs) |out| if (out.source == .agg and s.calls[out.source.agg].result == .bytes) {
+            strings = true;
+        };
+        if (!strings) return 0;
+        for (s.slots) |slot| {
+            const row = s.integerRow(slot);
+            for (s.outputs) |out| if (out.source == .agg and s.calls[out.source.agg].result == .bytes) {
+                const acc = row.accs[out.source.agg];
+                const value = switch (acc) {
+                    .min_bytes, .max_bytes => |v| v,
+                    .min_arena, .max_arena => if (s.borrowed_strings.len == 0) acc.stringValue() else null,
+                    else => null,
+                };
+                if (value) |v| bytes +|= expr_agg.winnerBytes(v.len);
+            };
+        }
+        return bytes;
+    }
 
     fn denseStringBytes(s: *const RowSource) usize {
         const domain = if (s.dense) |d| d.domain else if (s.owner != null)
@@ -25408,4 +25438,65 @@ test "STRGROUP returned output detaches a query-local arena ledger exactly once"
     output.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 32), budget.used.load(.monotonic));
     budget.release(32);
+}
+
+test "grouped string MIN MAX winners refuse at the live ledger without leaking" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var keys: [128]i32 = undefined;
+    var values: [128][]const u8 = undefined;
+    var words: [8][]const u8 = undefined;
+    for (&words, 0..) |*word, i| {
+        const bytes = try a.alloc(u8, 65536);
+        @memset(bytes, @as(u8, @intCast('a' + i)));
+        word.* = bytes;
+    }
+    for (&keys, &values, 0..) |*key, *value, i| {
+        key.* = @intCast(i % 16);
+        value.* = words[7 - i / 16];
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i32 = .{ .values = &keys } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "s", .col = .{ .string = .{ .values = &values } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, keys.len, .SNAPPY, .{}, .{});
+    for ([_]bool{ false, true }) |encoded| for ([_]usize{ 1, 4 }) |j| {
+        var ledger: core_memory.SharedBudget = .{ .limit = 512 << 10 };
+        var live: LivePeak = .{ .child = gpa };
+        const args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "grouped-winner-ledger", .bytes = bytes.buffer.items }},
+            .aggregate = "min(s) AS lo,max(s) AS hi,count(*) AS c",
+            .group_by = "k",
+            .scan_all = true,
+            .max_memory = ledger.limit,
+            .ledger = &ledger,
+            .decode_limit = ledger.limit / 2,
+            .parallelism = j,
+            .encoded = encoded,
+            .min_bytes_per_worker = 1,
+            .dense = false,
+            .integer_records = false,
+        };
+        try testing.expectError(error.ExceededMemoryBudget, runMultiAggregate(live.allocator(), a, args));
+        try testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), live.live.load(.monotonic));
+        // Old grouped winners were outside the ledger, and could grow past this bound before admission noticed.
+        try testing.expect(live.peak.load(.monotonic) < 1 << 20);
+        var roomy: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        var wide = args;
+        wide.ledger = &roomy;
+        wide.max_memory = roomy.limit;
+        wide.decode_limit = roomy.limit / 2;
+        var got = try runMultiAggregate(gpa, a, wide);
+        defer got.deinit(gpa);
+        try testing.expectEqual(@as(usize, 16), got.output.group_rows.?.len);
+        for (got.output.group_rows.?) |row| {
+            try testing.expectEqualStrings(words[0], row[1].s);
+            try testing.expectEqualStrings(words[7], row[2].s);
+            try testing.expectEqual(@as(i128, 8), row[3].i);
+        }
+    };
 }

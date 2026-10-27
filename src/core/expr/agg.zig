@@ -5868,7 +5868,7 @@ pub const DistinctPairs = struct {
     }
 };
 
-/// What a scalar query's string min/max winners hold, drawn from the query's ledger: each work item keeps an owned
+/// What a query's string min/max winners hold, drawn from the query's ledger: each work item keeps an owned
 /// copy of its winner until the merge, and a value can be any size. A copy is drawn before it is made and given back
 /// when the value it replaces is freed; the merge frees losers uncounted, so `settle` sets what the survivors hold.
 pub const WinnerCharge = struct {
@@ -5894,22 +5894,27 @@ pub const WinnerCharge = struct {
     }
 };
 
-/// The scan worker's winner charge while it folds a scalar query's row group; null elsewhere (grouped folds, merges).
+/// The scan worker's winner charge while it folds a row group; null during merges.
 /// A thread-local for the reason `distinct_pairs` is one: the folds that copy winners see only the accumulator.
 pub threadlocal var winner_charge: ?*WinnerCharge = null;
 
 /// `cand` as `slot`'s owned winner in place of the one it held. Drawn before the copy, so the copy and the value it
 /// replaces are both charged while both are live; a refusal or a failed copy leaves the slot holding live bytes.
+pub fn winnerBytes(len: usize) usize {
+    if (len == 0) return 0;
+    return std.mem.alignForward(usize, len, 16) +| 16;
+}
+
 pub fn persistWinner(persist: std.mem.Allocator, slot: *?[]const u8, cand: []const u8) Error!void {
     const charge = winner_charge;
-    if (charge) |c| try c.adjust(0, cand.len);
+    if (charge) |c| try c.adjust(0, winnerBytes(cand.len));
     const owned = persist.dupe(u8, cand) catch |err| {
-        if (charge) |c| c.adjust(cand.len, 0) catch unreachable;
+        if (charge) |c| c.adjust(winnerBytes(cand.len), 0) catch unreachable;
         return err;
     };
     if (slot.*) |cur| {
         persist.free(cur);
-        if (charge) |c| c.adjust(cur.len, 0) catch unreachable;
+        if (charge) |c| c.adjust(winnerBytes(cur.len), 0) catch unreachable;
     }
     slot.* = owned;
 }
@@ -6150,14 +6155,12 @@ fn foldMinMaxBytesGroupedOne(
     }
     const m_ptr = if (is_min) &state.min_bytes else &state.max_bytes;
     if (m_ptr.* == null) {
-        m_ptr.* = try persist.dupe(u8, sv);
+        try persistWinner(persist, m_ptr, sv);
     } else {
         const ord = std.mem.order(u8, sv, m_ptr.*.?);
         const condition = if (is_min) (ord == .lt) else (ord == .gt);
         if (condition) {
-            const owned = try persist.dupe(u8, sv);
-            persist.free(m_ptr.*.?);
-            m_ptr.* = owned;
+            try persistWinner(persist, m_ptr, sv);
         }
     }
 }
@@ -7935,4 +7938,36 @@ test "STRGROUP whole-table quote includes first chunks large records and actual 
         }
         try testing.expect(table.allocated_bytes <= GroupTable.variableTableBytes(groups, width, calls.len));
     };
+}
+
+test "grouped string winner replacement funds both live copies before allocating" {
+    const a = testing.allocator;
+    const old = try a.alloc(u8, 1 << 20);
+    defer a.free(old);
+    const next = try a.alloc(u8, 1 << 20);
+    defer a.free(next);
+    for ([_]bool{ false, true }) |is_min| {
+        @memset(old, if (is_min) 'z' else 'a');
+        @memset(next, if (is_min) 'a' else 'z');
+        const values = [_][]const u8{ old, next };
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = &values } };
+        var ledger: SharedBudget = .{ .limit = 3 << 19 };
+        var charge: WinnerCharge = .{ .ledger = &ledger };
+        var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
+        winner_charge = &charge;
+        defer winner_charge = null;
+        defer {
+            const value = if (is_min) state.min_bytes else state.max_bytes;
+            if (value) |bytes| a.free(bytes);
+            charge.settle(0);
+            std.debug.assert(ledger.used.load(.monotonic) == 0);
+        }
+        try foldMinMaxBytesGroupedOne(a, is_min, &state, col, 0);
+        const before = ledger.used.load(.monotonic);
+        try testing.expectEqual(winnerBytes(old.len), before);
+        try testing.expectError(error.ExceededMemoryBudget, foldMinMaxBytesGroupedOne(a, is_min, &state, col, 1));
+        try testing.expectEqual(before, ledger.used.load(.monotonic));
+        try testing.expectEqualStrings(old, (if (is_min) state.min_bytes else state.max_bytes).?);
+        try testing.expect(ledger.peak.load(.monotonic) <= ledger.limit);
+    }
 }

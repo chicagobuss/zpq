@@ -50,6 +50,7 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
                 return error.ExceededMemoryBudget;
             };
             const payload = try L.bind(s.program, source.batch, lookup);
+            const contiguous = source.input_rows == null and fullySelected(source);
             const Callback = struct {
                 local: *O.Local,
                 payload: *const L.Bound,
@@ -66,6 +67,10 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
                     const n = @min(s.pack_buffer.len, source.batch.num_rows - offset);
                     const images = s.pack_buffer[0..n];
                     try keys.packWindow(Bits, offset, images);
+                    if (contiguous and try s.local.appendWindow(images, try source.ordinal(offset), offset, &payload)) {
+                        offset += n;
+                        continue;
+                    }
                     for (images, 0..) |key, i| {
                         const row = offset + i;
                         if (source.selected) |selected| if (!selected.isActive(row)) continue;
@@ -74,6 +79,16 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
                     offset += n;
                 }
             }
+        }
+
+        fn fullySelected(source: SelectedBatch) bool {
+            const sel = source.selected orelse return true;
+            const words = sel.len / 64;
+            for (sel.mask[0..words]) |word| if (word != std.math.maxInt(u64)) return false;
+            const tail: u6 = @intCast(sel.len % 64);
+            if (tail == 0) return true;
+            const mask = (@as(u64, 1) << tail) - 1;
+            return sel.mask[words] & mask == mask;
         }
     };
 }
@@ -219,4 +234,60 @@ test "owner sink late dictionary decline requests whole-attempt replay without a
     columns[0] = .{ .i32 = .{ .values = &.{9} } };
     try std.testing.expectError(error.ExceededMemoryBudget, sink.batch(.{ .batch = &view, .input_base = 1 }, &.{0}));
     try std.testing.expectEqual(@as(usize, 1), owner.locals[0].accepted);
+}
+
+test "owner sink dirty tail cannot balance a rejected poison row into an all-selected window" {
+    const a = std.testing.allocator;
+    const ast = @import("expr/ast.zig");
+    const O = @import("owner_packed.zig").Owner(u64, &.{.sum}, u32);
+    const S = Packed(u64, &.{.sum}, u32);
+    const key: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]@import("expr/agg.zig").AggCall{
+        .{ .func = .sum, .alias = "s", .result = .i64, .where = null, .arg = arg },
+    };
+    var identity = (try key_plan.Plan.init(a, &.{key}, null)).?;
+    defer identity.deinit(a);
+    var ledger: @import("memory.zig").SharedBudget = .{ .limit = 32 << 20 };
+    {
+        const state = (try O.State.init(a, &ledger, 5, 5, 1, 64)).?;
+        defer state.deinit();
+        const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 5, .cols = &.{
+            .{ .i32 = .{ .values = &.{ 1, 2, 1, 3, 3 } } },
+            .{ .i64 = .{ .values = &.{}, .codes = &.{ 0, 999, 1, 0, 1 }, .dict = &.{ -7, 11 } } },
+        } };
+        var mask = [_]u64{0b11_1101};
+        const sel: @import("filter/selection.zig").SelectionVector = .{ .allocator = a, .len = 5, .mask = &mask };
+        const source: SelectedBatch = .{ .batch = &batch, .selected = &sel };
+        try std.testing.expectEqual(batch.num_rows, sel.count());
+        try std.testing.expect(!S.fullySelected(source));
+        var binding: [1]key_plan.Plan.Binding = undefined;
+        var images: [3]u64 = undefined;
+        var sink: S = .{
+            .pack_buffer = &images,
+            .local = &state.locals[0],
+            .identity = &identity,
+            .program = Program.init(&calls).?,
+            .sources = &.{.{ .file = 0, .rg = 0 }},
+            .bindings = &binding,
+        };
+        sink.start(0, 0);
+        try sink.batch(source, &.{ 0, 1 });
+        try std.testing.expectEqual(@as(usize, 4), state.locals[0].accepted);
+        const Receiver = struct {
+            rows: usize = 0,
+            sum: i128 = 0,
+            fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+                for (groups) |g| {
+                    r.rows += g.weight;
+                    r.sum += g.integer(0).?;
+                }
+            }
+        };
+        var receiver = [_]Receiver{.{}};
+        try state.finish(&receiver, Receiver.receive);
+        try std.testing.expectEqual(@as(usize, 4), receiver[0].rows);
+        try std.testing.expectEqual(@as(i128, 8), receiver[0].sum);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }

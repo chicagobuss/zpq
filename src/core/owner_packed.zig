@@ -42,6 +42,53 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                 try L.validate(r);
                 if (L.ordinal(r) >= l.state.input_rows or r.weight > l.state.weight_rows -| l.accepted)
                     return error.BadPartial;
+                try l.appendOwned(r);
+                l.accepted += @intCast(r.weight);
+            }
+
+            /// False leaves the owner untouched for its existing row fallback. Errors invalidate this private
+            /// attempt, as an append/scatter failure already does; no partial window can publish an answer.
+            pub fn appendWindow(l: *Local, images: anytype, first: u64, off: usize, payload: anytype) !bool {
+                if (images.len == 0) return true;
+                if (first >= l.state.input_rows or images.len > l.state.input_rows - @as(usize, @intCast(first)) or
+                    images.len > l.state.weight_rows -| l.accepted) return error.BadPartial;
+                const window = (try payload.requiredWindow(off, images.len)) orelse return false;
+                switch (window) {
+                    inline else => |values, tag| {
+                        if (l.bypass)
+                            try l.appendWindowRows(true, tag, values, images, first)
+                        else
+                            try l.appendWindowRows(false, tag, values, images, first);
+                    },
+                }
+                l.accepted += images.len;
+                return true;
+            }
+
+            inline fn appendWindowRows(
+                l: *Local,
+                comptime direct: bool,
+                comptime tag: anytype,
+                values: anytype,
+                images: anytype,
+                first: u64,
+            ) !void {
+                for (images, 0..) |key, i| {
+                    // The window proved the entire ordinal span, code range and all-present payload before mutation.
+                    const r = checked: {
+                        @setRuntimeSafety(false);
+                        const value = switch (tag) {
+                            .count_only => 0,
+                            .plain => values[i],
+                            .coded => values.dict[values.codes[i]],
+                        };
+                        break :checked L.requiredRecord(key, @intCast(first + i), value);
+                    };
+                    if (direct) try emit(l, r) else try l.appendOwned(r);
+                }
+            }
+
+            inline fn appendOwned(l: *Local, r: Record) !void {
                 if (!l.bypass and l.hot.entries.len != 0) {
                     const trial = l.seen < l.state.trial_rows;
                     if (trial) l.seen += 1;
@@ -57,7 +104,6 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                         l.bypass = true;
                     }
                 } else try emit(l, r);
-                l.accepted += @intCast(r.weight);
             }
 
             inline fn emit(l: *Local, r: Record) !void {
@@ -356,4 +402,175 @@ test "wide payload cache retains a useful trial below the bare COUNT hit thresho
     try std.testing.expectEqual(n / 4, local.hits);
     try std.testing.expect(local.hits < local.hot.entries.len);
     try std.testing.expect(!local.bypass);
+}
+
+test "owner window append keeps row records, cache trials and exact wide results for plain and coded payloads" {
+    const a = std.testing.allocator;
+    const ast = @import("expr/ast.zig");
+    const Call = @import("expr/agg.zig").AggCall;
+    const Program = @import("agg_plan.zig").OwnerProgram;
+    const Lane = lanes.Lane;
+    const kinds = &.{ Lane.sum, Lane.min, Lane.max, Lane.present_count };
+    const L = lanes.Layout(u64, kinds, u32);
+    const O = Owner(u64, kinds, u32);
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]Call{
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .min, .alias = "lo", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .max, .alias = "hi", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .count, .alias = "n", .result = .i64, .arg = arg, .where = null },
+    };
+    const program = Program.init(&calls).?;
+    const count = 4096;
+    var keys: [count]u64 = undefined;
+    var values: [count]i64 = undefined;
+    var codes: [count]u32 = undefined;
+    const dict = [_]i64{ std.math.minInt(i64), 11, std.math.maxInt(i64) };
+    var levels: [count]u32 = @splat(1);
+    for (0..count) |i| {
+        keys[i] = std.math.maxInt(u64) - i % 17;
+        codes[i] = @intCast(i % dict.len);
+        values[i] = dict[codes[i]];
+    }
+    const Receiver = struct {
+        groups: [17]?O.Group = @splat(null),
+        fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+            for (groups) |g| {
+                const id: usize = @intCast(std.math.maxInt(u64) - g.key);
+                try std.testing.expect(r.groups[id] == null);
+                r.groups[id] = g;
+            }
+        }
+    };
+    for ([_]usize{ 1, 4 }) |workers| for ([_]bool{ false, true }) |coded| {
+        for ([_]bool{ false, true }) |direct| {
+            var budget: memory.SharedBudget = .{ .limit = 128 << 20 };
+            {
+                const old = (try O.State.init(a, &budget, 1000 + count, count, workers, 64)).?;
+                defer old.deinit();
+                const bulk = (try O.State.init(a, &budget, 1000 + count, count, workers, 64)).?;
+                defer bulk.deinit();
+                for (old.locals, bulk.locals) |*x, *y| {
+                    x.bypass = direct;
+                    y.bypass = direct;
+                }
+                const batch: @import("filter/eval.zig").Batch = .{ .num_rows = count, .cols = &.{.{ .i64 = .{
+                    .values = if (coded) &.{} else &values,
+                    .codes = if (coded) &codes else null,
+                    .dict = if (coded) &dict else &.{},
+                    .def_levels = &levels,
+                    .max_def = 1,
+                } }} };
+                const payload = try L.bind(program, &batch, &.{0});
+                var off: usize = 0;
+                while (off < count) {
+                    const n = @min(count - off, ([_]usize{ 17, 1, 64, 3 })[off % 4]);
+                    const wi = off / 64 % workers;
+                    for (off..off + n) |i| try old.locals[wi].append(try payload.record(keys[i], i, 1000 + i));
+                    try std.testing.expect(try bulk.locals[wi].appendWindow(
+                        keys[off..][0..n],
+                        1000 + off,
+                        off,
+                        &payload,
+                    ));
+                    off += n;
+                }
+                for (old.locals, bulk.locals) |x, y| {
+                    try std.testing.expectEqual(x.accepted, y.accepted);
+                    try std.testing.expectEqual(x.bypass, y.bypass);
+                    try std.testing.expectEqual(x.seen, y.seen);
+                    try std.testing.expectEqual(x.hits, y.hits);
+                }
+                const x = try a.alloc(Receiver, workers);
+                defer a.free(x);
+                const y = try a.alloc(Receiver, workers);
+                defer a.free(y);
+                @memset(x, .{});
+                @memset(y, .{});
+                try old.finish(x, Receiver.receive);
+                try bulk.finish(y, Receiver.receive);
+                for (0..17) |key| {
+                    var want: ?O.Group = null;
+                    var got: ?O.Group = null;
+                    for (x) |r| if (r.groups[key]) |g| {
+                        want = g;
+                    };
+                    for (y) |r| if (r.groups[key]) |g| {
+                        got = g;
+                    };
+                    try std.testing.expect(want != null and got != null);
+                    try std.testing.expectEqualDeep(want, got);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        }
+    };
+}
+
+test "owner window validates entire code, ordinal and weight spans before mutating and declines NULL poison" {
+    const a = std.testing.allocator;
+    const ast = @import("expr/ast.zig");
+    const L = lanes.Layout(u64, &.{.sum}, u32);
+    const O = Owner(u64, &.{.sum}, u32);
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]@import("expr/agg.zig").AggCall{
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = arg, .where = null },
+    };
+    const p = @import("agg_plan.zig").OwnerProgram.init(&calls).?;
+    var levels = [_]u32{ 1, 1, 1 };
+    const cols = [_]@import("filter/eval.zig").Batch.Column{.{ .i64 = .{
+        .values = &.{},
+        .codes = &.{ 0, 0, 999 },
+        .dict = &.{7},
+        .def_levels = &levels,
+        .max_def = 1,
+    } }};
+    const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 3, .cols = &cols };
+    const payload = try L.bind(p, &batch, &.{0});
+    var ledger: memory.SharedBudget = .{ .limit = 32 << 20 };
+    {
+        const s = (try O.State.init(a, &ledger, 3, 3, 1, 64)).?;
+        defer s.deinit();
+        const keys = [_]u64{ 9, 9, 9 };
+        try std.testing.expectError(error.BadPartial, s.locals[0].appendWindow(&keys, 1, 0, &payload));
+        try std.testing.expectError(error.BadColumn, s.locals[0].appendWindow(&keys, 0, 0, &payload));
+        try std.testing.expectEqual(@as(usize, 0), s.locals[0].accepted);
+        try std.testing.expectEqual(@as(u32, 0), s.cursor.load(.monotonic));
+        levels[2] = 0;
+        try std.testing.expect(!try s.locals[0].appendWindow(&keys, 0, 0, &payload));
+        try std.testing.expectEqual(@as(usize, 0), s.locals[0].accepted);
+        for (keys, 0..) |key, i| try s.locals[0].append(try payload.record(key, i, i));
+        try std.testing.expectEqual(@as(usize, 3), s.locals[0].accepted);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "owner window count-only program needs no values and retains contiguous first ordinals" {
+    const a = std.testing.allocator;
+    const L = lanes.Layout(u64, &.{}, u32);
+    const O = Owner(u64, &.{}, u32);
+    var ledger: memory.SharedBudget = .{ .limit = 32 << 20 };
+    {
+        const s = (try O.State.init(a, &ledger, 68, 4, 1, 64)).?;
+        defer s.deinit();
+        const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 4, .cols = &.{} };
+        const p: @import("agg_plan.zig").OwnerProgram = .{};
+        const payload = try L.bind(p, &batch, &.{});
+        const keys = [_]u64{ 1, 2, 1, 2 };
+        try std.testing.expect(try s.locals[0].appendWindow(&keys, 64, 0, &payload));
+        const Receiver = struct {
+            rows: usize = 0,
+            fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+                for (groups) |g| {
+                    try std.testing.expectEqual(@as(u32, 2), g.weight);
+                    try std.testing.expectEqual(@as(u32, @intCast(63 + g.key)), g.first);
+                    r.rows += g.weight;
+                }
+            }
+        };
+        var receiver = [_]Receiver{.{}};
+        try s.finish(&receiver, Receiver.receive);
+        try std.testing.expectEqual(@as(usize, 4), receiver[0].rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }

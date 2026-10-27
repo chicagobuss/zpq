@@ -4618,6 +4618,11 @@ pub const Census = struct {
     /// (`cellsSeparate`) sets `dropped`, and every census stops (`off`) and frees what it holds, as the cells will
     /// do. Null for a census counting alone.
     dropped: ?*std.atomic.Value(bool) = null,
+    /// Every worker's cells as each checks, judged once `quorum` have (`judge`): a worker's slice of clustered rows,
+    /// its cells still sparse, can separate a cut the whole input's cells do not. Null judges a worker's own cells.
+    merged: ?*MergedCells = null,
+    /// This worker's slot in `merged`.
+    worker: usize = 0,
     cut_k: usize = 0,
     admit_n: usize = 0,
     /// Ranking by count(DISTINCT): the judgment is whether the census is worth finishing, not whether the cells can
@@ -4635,6 +4640,14 @@ pub const Census = struct {
     admitted: ?*const FingerprintSet = null,
     prefix_item: u64 = 0,
     prefix_row: u64 = 0,
+
+    pub const MergedCells = struct {
+        /// A copy of each worker's cells as it checks, by worker; summed by the worker completing the quorum.
+        slots: [][]u32,
+        /// Workers whose cells must be in before the merged ones judge the cut; zero never judges.
+        quorum: usize,
+        contributed: std.atomic.Value(usize) = .init(0),
+    };
 
     pub fn fingerprint(self: *const Census, hash: u64) u64 {
         return (hash >> 16) & (0xff_00_0000_0000 | (self.fp_mask & std.math.maxInt(u32)));
@@ -4702,6 +4715,18 @@ pub const Census = struct {
             var held: u64 = 0;
             for (ranked[0..self.admit_n]) |c| held += c;
             if (held *| 4 <= self.recorded) return;
+        } else if (self.merged) |m| {
+            @memcpy(m.slots[self.worker], cells);
+            // The worker completing the quorum judges, on slots every contributor has finished writing.
+            if (m.contributed.fetchAdd(1, .acq_rel) + 1 != m.quorum) return;
+            const sum = try self.gpa.alloc(u32, cells.len);
+            defer self.gpa.free(sum);
+            @memset(sum, 0);
+            for (m.slots) |cells_in| if (cells_in.len != 0) for (sum, cells_in) |*o, c| {
+                o.* +|= c;
+            };
+            fullestCells(sum, ranked);
+            if (!cellsSeparate(ranked, self.cut_k, self.admit_n)) return;
         } else if (!cellsSeparate(ranked, self.cut_k, self.admit_n)) return;
         self.dropped.?.store(true, .monotonic);
         self.stop();
@@ -8192,4 +8217,58 @@ test "shared string identity frames NULL empty embedded zero and large keys once
         } else try testing.expectEqualSlices(u8, &.{0}, frame);
     }
     try testing.expectEqual(@as(usize, 505), table.groupCount());
+}
+
+test "a riding census drops on every worker's merged cells, not on one worker's slice" {
+    const a = testing.allocator;
+    const n_cells = 64;
+    const admit_n = 8;
+    const k = 2;
+    var item_rows = [_]u64{0};
+    for ([_]bool{ false, true }) |second_separates| {
+        var dropped: std.atomic.Value(bool) = .init(false);
+        var slot_cells: [2][n_cells]u32 = undefined;
+        var slots = [_][]u32{ &slot_cells[0], &slot_cells[1] };
+        var merged: Census.MergedCells = .{ .slots = &slots, .quorum = 2 };
+        var censuses: [2]Census = undefined;
+        for (&censuses, 0..) |*c, wi| c.* = .{
+            .worker = wi,
+            .gpa = a,
+            .item_rows = &item_rows,
+            .dropped = &dropped,
+            .merged = &merged,
+            .cut_k = k,
+            .admit_n = admit_n,
+        };
+        defer for (&censuses) |*c| c.deinit();
+        // The first worker's slice holds two hot cells over a sparse floor: its own cells separate the cut.
+        var first: [n_cells]u32 = @splat(1);
+        first[0] = 40;
+        first[1] = 40;
+        try std.testing.expect(cellsSeparate(blk: {
+            var r: [admit_n + 1]u32 = undefined;
+            fullestCells(&first, &r);
+            break :blk &r;
+        }, k, admit_n));
+        try censuses[0].judge(&first);
+        // Alone it decides nothing: the quorum is two.
+        try std.testing.expect(!dropped.load(.monotonic) and !censuses[0].off);
+        // The second worker's slice is either as decisive, or a dense floor that buries the hot cells once merged.
+        var second: [n_cells]u32 = @splat(if (second_separates) 1 else 60);
+        if (second_separates) {
+            second[0] = 40;
+            second[1] = 40;
+        }
+        try censuses[1].judge(&second);
+        try std.testing.expectEqual(second_separates, dropped.load(.monotonic));
+    }
+    // Without merged cells a worker still judges its own.
+    var dropped: std.atomic.Value(bool) = .init(false);
+    var alone: Census = .{ .gpa = a, .item_rows = &item_rows, .dropped = &dropped, .cut_k = k, .admit_n = admit_n };
+    defer alone.deinit();
+    var own: [n_cells]u32 = @splat(1);
+    own[0] = 40;
+    own[1] = 40;
+    try alone.judge(&own);
+    try std.testing.expect(dropped.load(.monotonic));
 }

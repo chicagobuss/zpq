@@ -6777,6 +6777,17 @@ fn inlinePairAnswer(
     var raw = if (automatic_single) try pairRawIdentity(gpa, arena, metas, axes, args.scan_all) else null;
     errdefer if (raw) |*p| p.deinit(gpa);
     if (automatic_single and raw == null) return null;
+    // The retained dictionary identity cannot bind a chunk containing non-dictionary data. Decline known
+    // fallback before building its union; missing encoding_stats remain speculative, and forced owners replay.
+    if (raw == null and args.distinct_pairs == .auto) for (axes) |axis| for (work) |item| {
+        const cm = metas[item.file].row_groups.items[item.rg].columns.items[axis.col_ref.col_idx].meta_data.?;
+        if (cm.encoding_stats) |stats| for (stats.items) |e| {
+            if (e.count <= 0 or (e.page_type != @backingInt(schema.PageType.DATA_PAGE) and
+                e.page_type != @backingInt(schema.PageType.DATA_PAGE_V2))) continue;
+            if (e.encoding != @backingInt(schema.Encoding.PLAIN_DICTIONARY) and
+                e.encoding != @backingInt(schema.Encoding.RLE_DICTIONARY)) return null;
+        };
+    };
     if (raw == null and args.encoded and args.ndv_union)
         domain = try ndv.retainIdentity(gpa, arena, files, metas, axes, workers, args.max_memory, input_rows + 1);
     var identity = if (raw) |p| p else (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
@@ -26488,4 +26499,54 @@ test "distinct admission prices both wide pair reductions against covered local 
     defer got.deinit(gpa);
     try got.output.applyResultOrder(gpa, args.result_order);
     try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+}
+
+test "distinct admission refuses declared dictionary fallback before retaining a composite identity" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [2048]i32 = undefined;
+    var x: [2048]i64 = undefined;
+    var names: [2048][]const u8 = undefined;
+    for (&k, &x, &names, 0..) |*key, *value, *name, i| {
+        key.* = @intCast(i % 7);
+        value.* = @intCast(i % 61);
+        name.* = if (i % 3 == 0) "" else "phone";
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i32 = .{ .values = &k } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "s", .col = .{ .string = .{ .values = &names } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = &x } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "declared-fallback", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(DISTINCT x) AS d",
+        .group_by = "k,s",
+        .filter = "s != ''",
+        .max_memory = 64 << 20,
+        .parallelism = 1,
+        .integer_records_min_rows = 0,
+    };
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
+    const stats = try a.dupe(schema.PageEncodingStats, &.{
+        .{ .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+        .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.RLE_DICTIONARY), .count = 1 },
+        .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+    });
+    meta.row_groups.items[0].columns.items[2].meta_data.?.encoding_stats = std.ArrayListUnmanaged(schema.PageEncodingStats).fromOwnedSlice(stats);
+    const ex = try explainAggregate(gpa, a, args);
+    try testing.expect(ex.record_path == null or ex.record_path.?.layout != .pair_distinct);
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    args.distinct_pairs = .off;
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    args.distinct_pairs = .on;
+    try testing.expectEqual(.pair_distinct, (try explainAggregate(gpa, a, args)).record_path.?.layout);
 }

@@ -27,6 +27,9 @@ SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
                    for n in ("getting-started.md", "output-format.md", "binary-output.md",
                              "writer-statistics.md", "decode-errors.md", "hardware-execution.md",
                              "execution_knobs.md", "byte_topk.md")}}
+# Each target's archives as (name suffix, -Dcpu). Linux x86_64 ships x86-64-v3 (AVX2), which the binary checks at
+# startup, and a baseline "-compat" archive for older CPUs; .deb and .rpm come from the unsuffixed archive.
+VARIANTS = {"x86_64-linux-musl": (("", "x86_64_v3"), ("-compat", "baseline"))}
 PACKAGE_ARCHES = {"x86_64-linux-musl": ("amd64", "x86_64"), "aarch64-linux-musl": ("arm64", "aarch64")}
 
 
@@ -120,13 +123,16 @@ def main():
         ["zig", "version"], text=True, timeout=10).strip(),
         "tls_manifest_sha256": sha(ROOT / "vendor/boring_tls/prebuilt.sha256"),
         "artifacts": {}}
+    builds = []
     for target in args.targets.split(","):
         if target not in TARGETS:
             raise SystemExit("unsupported release target: " + target)
-        prefix = out / target
+        builds += [(target, suffix, cpu) for suffix, cpu in VARIANTS.get(target, (("", "baseline"),))]
+    for target, suffix, cpu in builds:
+        prefix = out / (target + suffix)
         if not args.skip_build:
             subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + target,
-                            "-Dcpu=baseline", "-Dstrip=true", "-Drevision=" + revision, "--prefix", str(prefix)]
+                            "-Dcpu=" + cpu, "-Dstrip=true", "-Drevision=" + revision, "--prefix", str(prefix)]
                            + (["-Dprerelease=" + prerelease] if prerelease else []),
                            cwd=ROOT, check=True, timeout=1200)
         binary = prefix / "bin/zpq"
@@ -137,9 +143,9 @@ def main():
             if version_output != f"zpq {version} ({revision})\n":
                 raise SystemExit(f"binary --version {version_output.strip()!r} differs from manifest {version}")
         files = {"bin/zpq": binary, **SHARED_FILES}
-        name = f"zpq-{version}-{revision[:12]}-{target}.tar.gz"
+        name = f"zpq-{version}-{revision[:12]}-{target}{suffix}.tar.gz"
         artifact = out / name
-        metadata = {**{k: v for k, v in manifest.items() if k != "artifacts"}, "target": target,
+        metadata = {**{k: v for k, v in manifest.items() if k != "artifacts"}, "target": target, "cpu": cpu,
                     "binary_sha256": sha(binary), "files": {name: sha(p) for name, p in files.items()}}
         with artifact.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz:
             with tarfile.open(fileobj=gz, mode="w") as tar:
@@ -150,11 +156,12 @@ def main():
                     entry.size, entry.mtime = len(body), epoch
                     entry.mode = 0o755 if filename == "bin/zpq" else 0o644
                     tar.addfile(entry, io.BytesIO(body))
-        manifest["artifacts"][target] = {"file": name, "sha256": sha(artifact), "binary_sha256": sha(binary)}
+        manifest["artifacts"][target + suffix] = {"file": name, "sha256": sha(artifact), "binary_sha256": sha(binary),
+                                                  "cpu": cpu}
         (out / (name + ".sha256")).write_text(sha(artifact) + "  " + name + "\n")
         (out / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        print(target, name, manifest["artifacts"][target]["sha256"], flush=True)
-        if args.packages and target in PACKAGE_ARCHES:
+        print(target + suffix, name, manifest["artifacts"][target + suffix]["sha256"], flush=True)
+        if args.packages and target in PACKAGE_ARCHES and not suffix:
             write_packages(out, target, content, version, epoch)
 
 

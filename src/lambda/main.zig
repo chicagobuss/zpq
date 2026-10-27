@@ -64,6 +64,7 @@ const COALESCE_GAP: u64 = 64 * 1024;
 const TARGET_COLUMN: []const u8 = "int8";
 
 pub fn main(init: std.process.Init) !void {
+    zpq.cpu_level.require();
     const allocator = init.gpa;
     const env = init.minimal.environ;
     const io = init.io;

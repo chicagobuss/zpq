@@ -454,7 +454,8 @@ just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases ship the CLI for Linux
 and macOS, each x86_64 and arm64, as `zpq-<version>-<revision>-<target>.tar.gz` (plus a `.sha256` and `release.json`)
 on the GitHub Release and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or
-`releases/v<version>/`). An archive holds the binary, the man page, completions, `tiny.parquet` and the guides under
+`releases/v<version>/`). Linux x86_64 builds target x86-64-v3 (AVX2); the -compat archive runs on any x86-64.
+An archive holds the binary, the man page, completions, `tiny.parquet` and the guides under
 `share/doc/zpq/`. `python3 tools/package_release.py --tag v0.5.0-rc2` builds a release candidate: the tag's suffix
 goes into `zpq --version`, the binary's `created_by`, the archive names and `release.json` (`zig build
 -Dprerelease=rc2` does the same for a local build). A final tag (`v0.5.0`) builds exactly as without `--tag`.

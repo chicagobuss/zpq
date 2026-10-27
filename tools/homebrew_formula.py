@@ -40,6 +40,7 @@ class Zpq < Formula
 '''
     text += fields("aarch64-macos", "    ") + "  end\n\n  on_linux do\n    on_arm do\n"
     text += fields("aarch64-linux-musl", "      ") + "    end\n    on_intel do\n"
+    # Linux x86_64 takes the default x86-64-v3 archive; the -compat archive is for CPUs without AVX2.
     text += fields("x86_64-linux-musl", "      ") + '''    end
   end
 

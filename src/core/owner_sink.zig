@@ -291,3 +291,92 @@ test "owner sink dirty tail cannot balance a rejected poison row into an all-sel
     }
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }
+
+test "owner sink shared storage keeps NULL keys, NULL singles, weighted NULLs and original ordinals" {
+    const a = std.testing.allocator;
+    const ast = @import("expr/ast.zig");
+    const kinds = &.{ lanes.Lane.sum, lanes.Lane.min, lanes.Lane.max, lanes.Lane.present_count };
+    const O = @import("owner_packed.zig").Owner(u64, kinds, u32);
+    const S = Packed(u64, kinds, u32);
+    const key: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const arg: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]@import("expr/agg.zig").AggCall{
+        .{ .func = .sum, .alias = "s", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .min, .alias = "lo", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .max, .alias = "hi", .result = .i64, .arg = arg, .where = null },
+        .{ .func = .count, .alias = "n", .result = .i64, .arg = arg, .where = null },
+    };
+    const program = Program.init(&calls).?;
+    try std.testing.expect(program.commonColumn());
+    var different = program;
+    different.args[1].col.col_idx = 0;
+    try std.testing.expect(!different.commonColumn());
+    var identity = (try key_plan.Plan.init(a, &.{key}, null)).?;
+    defer identity.deinit(a);
+    const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 7, .cols = &.{
+        .{ .i32 = .{
+            .values = &.{ 0, 999, 0, 1, 1, 8, 7 },
+            .def_levels = &.{ 1, 0, 1, 1, 1, 1, 1 },
+            .max_def = 1,
+        } },
+        .{ .i64 = .{
+            .values = &.{},
+            .codes = &.{ 0, 1, 999, 999, 999, 2, 999 },
+            .dict = &.{ -7, 9, 11 },
+            .def_levels = &.{ 1, 1, 0, 0, 0, 1, 0 },
+            .max_def = 1,
+        } },
+    } };
+    const Receiver = struct {
+        groups: [5]O.Group = undefined,
+        len: usize = 0,
+        fn receive(r: *@This(), _: usize, groups: []const O.Group) !void {
+            for (groups) |g| {
+                try std.testing.expect(r.len < r.groups.len);
+                r.groups[r.len] = g;
+                r.len += 1;
+            }
+        }
+    };
+    var ledger: @import("memory.zig").SharedBudget = .{ .limit = 64 << 20 };
+    {
+        const old = (try O.State.init(a, &ledger, 1007, 7, 1, 64)).?;
+        defer old.deinit();
+        const mixed = (try O.State.initStorage(a, &ledger, 1007, 7, 1, 64, true)).?;
+        defer mixed.deinit();
+        var bindings: [2][1]key_plan.Plan.Binding = undefined;
+        var images: [2][3]u64 = undefined;
+        for ([_]*O.State{ old, mixed }, 0..) |state, i| {
+            var sink: S = .{
+                .pack_buffer = &images[i],
+                .local = &state.locals[0],
+                .identity = &identity,
+                .program = program,
+                .sources = &.{.{ .file = 0, .rg = 0 }},
+                .bindings = &bindings[i],
+            };
+            sink.start(1000, 0);
+            try sink.batch(.{ .batch = &batch, .input_base = 1000 }, &.{ 0, 1 });
+        }
+        var x = [_]Receiver{.{}};
+        var y = [_]Receiver{.{}};
+        try old.finish(&x, Receiver.receive);
+        try mixed.finish(&y, Receiver.receive);
+        try std.testing.expectEqual(@as(usize, 5), y[0].len);
+        var rows: u64 = 0;
+        var sum: i128 = 0;
+        for (x[0].groups[0..x[0].len]) |want| {
+            var found = false;
+            for (y[0].groups[0..y[0].len]) |got| if (got.key == want.key) {
+                try std.testing.expectEqualDeep(want, got);
+                rows += got.weight;
+                sum += got.integer(0) orelse 0;
+                found = true;
+            };
+            try std.testing.expect(found);
+        }
+        try std.testing.expectEqual(@as(u64, 7), rows);
+        try std.testing.expectEqual(@as(i128, 13), sum);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}

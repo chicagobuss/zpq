@@ -98,6 +98,15 @@ pub const OwnerProgram = struct {
         return true;
     }
 
+    pub fn commonColumn(p: OwnerProgram) bool {
+        if (p.len == 0 or p.distinct_arg != null) return false;
+        const first = p.args[0].col;
+        for (p.args[1..p.len]) |arg| if (arg.col.col_idx != first.col_idx or
+            arg.col.physical_type != first.physical_type or arg.col.unsigned_32 != first.unsigned_32 or
+            arg.col.unsigned_64 != first.unsigned_64) return false;
+        return true;
+    }
+
     pub fn projection(p: OwnerProgram, call: expr_agg.AggCall) ?Projection {
         if (call.arg == null) return if (call.func == .count) .weight else null;
         if (call.arg.? != .col_ref) return null;

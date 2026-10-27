@@ -4,6 +4,9 @@ const eval = @import("filter/eval.zig");
 
 pub const Lane = enum { sum, min, max, present_count };
 
+/// A single original value, with its shared-argument NULL tag in the proved spare ordinal bit.
+pub const SharedRecord = extern struct { key: u64, ordinal: u32, weight: u32 = 1, value: i64 };
+
 const Wide = extern struct { value: i128 align(8) = 0 };
 
 /// The full key remains authoritative. This multiply-fold is shared by cache, scatter and owner probe.
@@ -35,6 +38,7 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
     const Values = @Tuple(&value_types);
     return struct {
         const Self = @This();
+        pub const sharedEligible = Bits == u64 and Ordinal == u32 and n != 0;
         pub const Record = if (n == 0) extern struct {
             key: Bits align(8),
             ordinal: Ordinal,
@@ -120,6 +124,40 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
                 r.values[i] = if (kind == .present_count) 1 else value;
             };
             return r;
+        }
+
+        pub fn compressSingleton(r: Record) error{BadPartial}!SharedRecord {
+            if (!sharedEligible) return error.BadPartial;
+            try validate(r);
+            if (r.weight != 1 or r.ordinal >= @as(u32, 1) << 31 or
+                (r.argument_nulls != 0 and r.argument_nulls != mask)) return error.BadPartial;
+            const absent = r.argument_nulls != 0;
+            var value: i64 = 0;
+            if (!absent) {
+                inline for (kinds, 0..) |kind, i| if (kind != .present_count) {
+                    value = r.values[i];
+                    break;
+                };
+                inline for (kinds, 0..) |kind, i| {
+                    if (r.values[i] != (if (kind == .present_count) @as(i64, 1) else value))
+                        return error.BadPartial;
+                }
+            }
+            return .{
+                .key = r.key,
+                .ordinal = r.ordinal | (@as(u32, @intFromBool(absent)) << 31),
+                .value = value,
+            };
+        }
+
+        pub fn expandSingleton(r: SharedRecord) error{BadPartial}!Record {
+            if (!sharedEligible or r.weight != 1) return error.BadPartial;
+            var wide = requiredRecord(r.key, r.ordinal & 0x7fff_ffff, r.value);
+            if (r.ordinal >> 31 != 0) {
+                wide.argument_nulls = mask;
+                @memset(&wide.values, 0);
+            }
+            return wide;
         }
 
         /// Borrow payloads once per callback. COUNT(col) needs only definition levels, including an empty values
@@ -342,6 +380,35 @@ pub fn Layout(comptime Bits: type, comptime kinds: []const Lane, comptime Ordina
 }
 
 const testing = std.testing;
+
+test "owner shared singleton is 24 bytes and keeps NULL, full keys, extrema and spare ordinal proof" {
+    const L = Layout(u64, &.{ .sum, .min, .max, .present_count }, u32);
+    try testing.expectEqual(@as(usize, 24), @sizeOf(SharedRecord));
+    for ([_]u64{ 0, std.math.maxInt(u64) }) |key| {
+        for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |value| {
+            const r = L.requiredRecord(key, (1 << 31) - 1, value);
+            try testing.expectEqualDeep(r, try L.expandSingleton(try L.compressSingleton(r)));
+            var absent = r;
+            absent.argument_nulls = 15;
+            @memset(&absent.values, 0);
+            try testing.expectEqualDeep(absent, try L.expandSingleton(try L.compressSingleton(absent)));
+        }
+    }
+    var bad = L.requiredRecord(7, 0, 4);
+    bad.values[1] = -4;
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    bad = L.requiredRecord(7, 0, 4);
+    bad.argument_nulls = 1;
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    bad = L.requiredRecord(7, 1 << 31, 4);
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    bad = L.requiredRecord(7, 0, 4);
+    bad.weight = 2;
+    try testing.expectError(error.BadPartial, L.compressSingleton(bad));
+    var small: SharedRecord = .{ .key = 7, .ordinal = 0, .value = 4 };
+    small.weight = 2;
+    try testing.expectError(error.BadPartial, L.expandSingleton(small));
+}
 
 test "owner lanes retain the compact COUNT record and omit unused group lanes" {
     const C = Layout(u64, &.{}, u32);

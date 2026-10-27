@@ -7779,7 +7779,7 @@ fn selectedCountBits(
         k *| @sizeOf(MergedSlot) +| keys.len *| @sizeOf(KeyType) +| outputs.len *| @sizeOf(GroupColType);
     const result_credit = T.bytes(workers, k) +| scratch_credit +| output_credit;
     const selected: usize = @intFromFloat(@ceil(@as(f64, @floatFromInt(rows)) * std.math.clamp(pass_share, 0, 1)));
-    const q = @import("owner_cost.zig").quote(
+    var q = @import("owner_cost.zig").quote(
         Bits,
         kinds,
         u32,
@@ -7789,10 +7789,25 @@ fn selectedCountBits(
         result_credit,
         args.byte_top_partitions,
     ) orelse return null;
+    var compact = false;
+    if (program.commonColumn()) if (@import("owner_cost.zig").quoteStorage(
+        Bits,
+        kinds,
+        u32,
+        rows,
+        selected,
+        workers,
+        result_credit,
+        args.byte_top_partitions,
+        true,
+    )) |small| if (small.peak < q.peak) {
+        q = small;
+        compact = true;
+    };
     if (q.peak > args.max_memory) return null;
     if (stat) |s| if (args.plain_rules and s.confidence == .upper_bound and
         q.work > selectedGroupBytes(s, calls.len, workers, pass_share)) return null;
-    if (explain_only) return .{ .layout = .packed_count_top_h, .reservation = q.peak };
+    if (explain_only) return .{ .layout = .packed_count_top_h, .reservation = q.peak, .partitions = q.parts };
     var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const ledger = args.ledger orelse &private_ledger;
     const extra_credit = scratch_credit +| output_credit;
@@ -7800,7 +7815,8 @@ fn selectedCountBits(
     _ = ledger.drawExact(extra_credit) orelse return null;
     var held: usize = 0;
     defer ledger.release(extra_credit - held);
-    const state = (try O.State.init(gpa, ledger, input_rows, rows, workers, q.parts)) orelse return null;
+    const state = (try O.State.initStorage(gpa, ledger, input_rows, rows, workers, q.parts, compact)) orelse
+        return null;
     var leave_records = false;
     defer if (!leave_records) state.deinit();
     var top = T.init(gpa, ledger, workers, k, args.result_order.keys[0].descending) catch |err| {

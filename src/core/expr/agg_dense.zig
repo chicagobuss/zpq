@@ -391,7 +391,7 @@ pub fn tableBytes(ids: usize, stride: usize, n_calls: usize) usize {
 /// Variable-key tables use the same per-entry charge as ordinary insertion, including capacity slack.
 pub fn domainTableBytes(d: *const Domain, ids: usize, stride: usize, n_calls: usize) usize {
     if (stride != 0) return tableBytes(ids, stride, n_calls);
-    return ids *| agg.GroupTable.variableEntryBytes(d.maxKeyBytes(), n_calls);
+    return agg.GroupTable.variableTableBytes(ids, d.maxKeyBytes(), n_calls);
 }
 
 /// The reservation includes the retained domain, every worker lane, the merge table and ranking scratch.

@@ -953,6 +953,8 @@ fn executeAggregateOver(
         try sink.write_fn(sink.ctx, answer);
         releaseStreamAnswer(&answer.output);
     };
+    // The returned arenas live with AggResult; this invocation's ledger is stack-local.
+    answer.output.detachArenaLedger();
     return answer;
 }
 

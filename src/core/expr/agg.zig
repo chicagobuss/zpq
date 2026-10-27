@@ -5530,6 +5530,23 @@ pub const GroupTable = struct {
             (@sizeOf(Accumulator) *| calls *| 3 / 2);
     }
 
+    /// Whole variable-table quote, including the first arena chunk and worst-case chunk packing.
+    pub fn variableTableBytes(groups: usize, key_len: usize, calls: usize) usize {
+        if (groups == 0) return 0;
+        if (groups >= empty_id or key_len >= std.math.maxInt(u32)) return std.math.maxInt(usize);
+        const record = key_len + 5;
+        const per_block = @max(1, KeyArena.chunk_size / record);
+        const blocks = if (record > KeyArena.chunk_size) groups else (groups + per_block - 1) / per_block;
+        const block_bytes = std.mem.alignForward(usize, record, KeyArena.chunk_size);
+        const data = blocks *| block_bytes;
+        const chunks = data / KeyArena.chunk_size;
+        const slots = std.math.ceilPowerOfTwo(usize, @max(16, groups * 4 / 3 + 1)) catch return std.math.maxInt(usize);
+        const rows = std.ArrayList(u32).growCapacity(groups);
+        const cells = std.ArrayList(Accumulator).growCapacity(groups * calls);
+        return @sizeOf(KeyArena) +| data +| 2 *| (blocks *| @sizeOf(KeyArena.Block) +| chunks *| @sizeOf([*]u8)) +|
+            slots *| @sizeOf(FixedSlot) +| rows *| (@sizeOf(u32) + @sizeOf(u64)) +| cells *| @sizeOf(Accumulator);
+    }
+
     inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
         if (self.compact.stride == 0) return variableEntryBytes(key_len, calls);
         return variableEntryBytes(key_len, 0) + self.compact.projected(self.groupCount() + 1) - self.compact.held();
@@ -6799,9 +6816,10 @@ test "a table charges each group's count(DISTINCT) set object, fixed-width keys 
         _ = try fixed.getOrInsertFixed(&image, &calls, i);
         _ = try fixed_without.getOrInsertFixed(&image, calls[1..], i);
     }
-    // String-key accounting is per entry, so the only extra is the distinct accumulator's room: no set object yet.
-    const extra = @sizeOf(Accumulator) * 3 / 2;
-    try std.testing.expectEqual(without.allocated_bytes + n * extra, plain.allocated_bytes);
+    // Variable tables quote actual array capacities; no distinct-set object exists before a spill.
+    const without_cells = without.accumulators.capacity * @sizeOf(Accumulator);
+    const plain_cells = plain.accumulators.capacity * @sizeOf(Accumulator);
+    try std.testing.expectEqual(without.allocated_bytes - without_cells + plain_cells, plain.allocated_bytes);
     for ([_]*const GroupTable{ &plain, &fixed }) |t| {
         for (t.accumulators.items) |acc| {
             if (acc == .distinct) try std.testing.expect(acc.distinct.heap() == null);
@@ -7895,4 +7913,21 @@ test "M1 parallel DISTINCT source charges and releases preserve the private ceil
     for (tasks) |t| if (t.err) |e| return e;
     try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
     try std.testing.expectEqual(@as(usize, 0), table.set_objects);
+}
+
+test "STRGROUP whole-table quote includes first chunks large records and actual capacities" {
+    const a = testing.allocator;
+    const calls = [_]AggCall{.{ .func = .count, .result = .i64, .arg = null, .where = null, .alias = "c" }};
+    for ([_]usize{ 0, 127, 33000, 70000 }) |width| for ([_]usize{ 1, 33, 300 }) |groups| {
+        var table = GroupTable.init(a, 256 << 20);
+        defer table.deinit();
+        const key = try a.alloc(u8, width);
+        defer a.free(key);
+        @memset(key, 'x');
+        for (0..groups) |i| {
+            if (width >= 4) std.mem.writeInt(u32, key[0..4], @intCast(i), .little);
+            _ = try table.getOrInsert(key, &calls, i);
+        }
+        try testing.expect(table.allocated_bytes <= GroupTable.variableTableBytes(groups, width, calls.len));
+    };
 }

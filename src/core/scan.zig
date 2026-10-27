@@ -406,6 +406,8 @@ pub const AggOutput = struct {
     byte_stream: ?ByteStream = null,
     string_arenas: []*expr_agg.KeyArena = &.{},
     borrowed_strings: []BorrowedSpan = &.{},
+    arena_ledger: ?*core_memory.SharedBudget = null,
+    arena_credit: usize = 0,
 
     pub fn rowCount(self: AggOutput) usize {
         if (self.group_rows) |rows| return rows.len;
@@ -439,7 +441,15 @@ pub const AggOutput = struct {
         }
         gpa.free(self.string_arenas);
         gpa.free(self.borrowed_strings);
+        self.detachArenaLedger();
         self.* = .{};
+    }
+
+    /// A returned engine result outlives its query-local ledger. Its arenas remain owned by the result.
+    pub fn detachArenaLedger(self: *AggOutput) void {
+        if (self.arena_ledger) |budget| budget.release(self.arena_credit);
+        self.arena_ledger = null;
+        self.arena_credit = 0;
     }
 
     /// Free what row `row` owns: its values' strings, and the row itself unless it lies in `slab`.
@@ -5507,12 +5517,16 @@ fn prepareAggregateWithMetas(
             .dense = dense_direct,
             .identity = if (dense_identity) |*identity| identity else null,
         };
-        if (dense_direct == null) {
+        // A small cut owns its few surviving strings instead of retaining every source arena.
+        if (dense_direct == null and order.keys.len == 0 and order.limit == null and order.offset == 0 and
+            order.having == null and order.hidden.len == 0)
+        {
             const source_tables = try arena.alloc(*expr_agg.GroupTable, if (spilled) part_state.?.parts.len else out_tables.len);
             if (spilled) {
                 for (part_state.?.parts, source_tables) |*p, *dest| dest.* = &p.table;
             } else for (out_tables, source_tables) |*gt, *dest| dest.* = gt;
-            answer_charge += try output.takeTableArenas(gpa, source_tables, group_budget);
+            output.arena_credit = try output.takeTableArenas(gpa, source_tables, group_budget);
+            output.arena_ledger = args.ledger;
             row_src.borrowed_strings = output.borrowed_strings;
         }
         const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0 and order.having == null and
@@ -18470,7 +18484,7 @@ test "result cut SUM: complete signed ranks, NULLs, ties, offsets and owned payl
                 t.accumulators.items[id * 2].sum_i = if (g == 39)
                     null
                 else if (ti == 0) 1000 else @as(i128, @intCast(g % 9)) - 1004;
-                t.accumulators.items[id * 2 + 1].min_bytes = try gpa.dupe(u8, if (ti == 0) "z" else "a");
+                t.accumulators.items[id * 2 + 1] = .{ .min_bytes = try gpa.dupe(u8, if (ti == 0) "z" else "a") };
                 try refs.append(gpa, .{ .table = @intCast(ti), .group = id });
             };
             var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -25382,4 +25396,16 @@ test "STRGROUP grouped strings survive local partition and typed output ownershi
             };
         }
     };
+}
+
+test "STRGROUP returned output detaches a query-local arena ledger exactly once" {
+    var budget: core_memory.SharedBudget = .{ .limit = 1024 };
+    _ = budget.drawExact(128).?;
+    var output: AggOutput = .{ .arena_ledger = &budget, .arena_credit = 128 };
+    output.detachArenaLedger();
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    _ = budget.drawExact(32).?;
+    output.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 32), budget.used.load(.monotonic));
+    budget.release(32);
 }

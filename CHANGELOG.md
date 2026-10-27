@@ -7,24 +7,13 @@ answers that 0.4.1 got incorrect without an error, and turns `--max-memory` into
 (libzpq) with a Python binding, `zpq inspect`, a much larger SQL surface, Bloom filters, profiling, and Homebrew,
 shell-completion and man-page packaging.
 
-Grouped Parquet answers now use fixed 131,072-row row groups and 20,000-row pages, matching the normal writer.
-Large aggregate files therefore have different bytes from earlier releases. Decoded values and row order are
-preserved, and output bytes remain deterministic across worker counts and memory budgets.
+Parquet answers to an aggregate or GROUP BY are written like any other zpq output: row groups of 131,072 rows and
+pages of 20,000 rows. A large answer file therefore has different bytes than in earlier releases, with the same
+values in the same order, and its bytes still never depend on `-j` or the memory budget.
 
-Unfiltered top-count queries grouped by a byte-string column and a signed INT32 column can use exact cached radix
-grouping over prepaid retained decoder pages. Bounded top-k selection preserves NULL values, full key bytes,
-first-appearance ties and deterministic output across worker counts and memory budgets. Unsupported encodings or
-insufficient reserved capacity retain the existing aggregation path.
-Common prefixes are derived from decoded keys and verified over all non-NULL values. Output keys are funded at
-admission; retained allocation failures decline, and later decoder or encoding refusals retry the established path.
-
-`--unordered` also admits the exact integer and short-string inline aggregation paths. Relaxing GROUP BY order
-no longer disables these paths; they retain their deterministic first-appearance output and top-k tie breaks.
-
-Unfiltered SUM top-k queries over short byte-string keys can pack each verified key and its length into one
-integer identity. Complete owner partitions retain bounded candidate heaps, avoiding an all-group merge and
-copying key bytes only for the final answer. Exact signed sums, NULLs and first-appearance ties are preserved;
-cache-sized execution windows and partitions do not affect output bytes.
+Top-count and top-sum GROUP BY queries over string and integer keys run on new, faster exact paths, with or without
+`--unordered`. Their answers do not change: NULL groups, full key bytes and first-appearance ties are kept, and the
+output is the same at every `-j`, memory budget and cache size.
 
 ### What to do
 
@@ -97,6 +86,8 @@ cache-sized execution windows and partitions do not affect output bytes.
   high-cardinality keys.
 - **libzpq**: the engine as a C library with a Python binding (`python/zpq.py`) and an HTTP service. SQL through it is
   EXPERIMENTAL.
+- **All 43 ClickBench queries run**, with `make_date`, `epoch_ms`, `date_trunc`, `date_part`/`EXTRACT` and
+  `regexp_replace`.
 - **SQL**: `ORDER BY`, `LIMIT`/`OFFSET`, `HAVING`, `count(DISTINCT ...)`, `CASE`, `strlen`, GROUP BY by expression,
   position or alias, BOOLEAN columns as predicates, and parenthesized filters with `NOT`.
 - **`zpq inspect`** reports footer metadata without decoding data pages.
@@ -106,43 +97,35 @@ cache-sized execution windows and partitions do not affect output bytes.
 
 ### Performance
 
-**How these were measured.** Cold, as a user meets a file the first time. Every query starts a fresh process of each
-engine. Before each of 3 repetitions, the input's pages are evicted from the page cache and the eviction is verified.
-A case's time is the median of its repetitions whose answer matched pinned truth and whose environment check passed.
-Times include process start and the cold reads.
+**How these were measured.** Every query starts a fresh process of each engine, in two lanes: cold, as a user
+meets a file the first time (before each of 3 repetitions the input's pages are evicted from the page cache and the
+eviction is verified), and hot-fresh (the input already in the page cache, in a new process). A case's time is the
+median of its repetitions whose answer matched pinned truth and whose environment check passed. Times include process
+start. An engine's error counts as a loss for that engine.
 
 | | |
 |---|---|
-| Run | `scorecard-v7-073dbf2`, zpq 0.5.0 build 073dbf2 |
-| Machine | [redacted], Linux 7.0; every engine pinned to the same 8 cores (16 threads) and capped at 32 GiB |
-| Engines | DuckDB 2.0.0-alpha (v2.0.0-alpha46057, b15358c371; CLI), DuckDB 1.5.5 (Python), Polars 2.0.0, DataFusion CLI 55.2.0 |
-| Coverage | 6,799 of 6,960 cells finished; 92 have no valid timing because the environment check rejected them, not because an engine failed |
-
-The run has no zpq 0.4.1 lane. The comparison with 0.4.1 further down is from an earlier scorecard.
+| Run | {{TBD}}, zpq 0.5.0 build {{TBD}} |
+| Machine | {{TBD}} |
+| Engines | {{TBD}} |
+| Coverage | {{TBD}} |
 
 - **ClickBench, 100M rows (one 14.8 GB file).**
-  - zpq runs 34 of the 43 queries. It refuses the other 9 before reading data: date literals against hits'
-    unannotated day column, `extract`/`DATE_TRUNC`, and `REGEXP_REPLACE` are not 0.5.0 SQL.
-  - Of the 34, zpq is the fastest of the five engines on 24, at a geometric mean of 0.72× the fastest other engine's
-    time.
-  - All 34 are within 3× of the fastest other engine, and one is over 2× (Q35: 938 ms against 439 ms for DuckDB 2.0).
-  - Against DuckDB 2.0 alone, zpq is faster on 27 of 34, at a geometric mean of 0.52× its time.
+  - zpq runs all 43 queries. The 9 that 0.5.0's earlier builds refused now answer: date literals compared with hits'
+    unannotated integer day column, `extract`/`date_part`, `date_trunc`, `make_date`, `epoch_ms` and
+    `regexp_replace`.
+  - zpq is the fastest engine on {{TBD}} of 43, at a geometric mean of {{TBD}}× the fastest other engine's time.
+  - Against DuckDB 2.0 alone, zpq is faster on {{TBD}} of 43, at a geometric mean of {{TBD}}× its time.
 
 - **26 synthetic datasets × 15 query shapes, 390 cases.**
-  - zpq is fastest on 248 of 390, at a geometric mean of 0.88× the fastest other engine.
-  - None is over 5× behind (the worst is 3.82×); 35 are over 2× and 10 over 3×.
-  - The cases that trail most are full GROUP BY and top-by-sum over near-unique keys. For example, a full GROUP BY on
-    sstr10m takes 2.95 s against 771 ms for DuckDB 2.0.
-  - Against the previous cold scorecard of the same method (v5, build 94ed895): over 3× behind went from 15 to 10,
-    over 2× from 42 to 35, fastest from 237 to 248, and the geomean from 0.92 to 0.88.
+  - zpq is fastest on {{TBD}} of 390, at a geometric mean of {{TBD}}× the fastest other engine.
+  - {{TBD}} are over 1.5× behind; the worst is {{TBD}}×.
 
-- **Local reads** (TPC-H SF1 lineitem in snappy and zstd, and a 2.1M-row synthetic table): fastest on 14 of 14, at a
-  geometric mean of 0.47× the fastest other engine.
-- **Writes** (outputs to tmpfs for every engine): fastest on 8 of 8, at a geometric mean of 0.47×. For example, a
-  full zstd rewrite of the 2.1M-row table takes 164 ms, against 337 ms for Polars 2.0.
-- **DuckDB's votes test** (228M rows, local file): 134 ms, against 219 ms for DuckDB 2.0.
-- **PDS-H Q1 and Q6** (SF1 to SF30): fastest on 4 of 8, at a geometric mean of 0.92×. Q6 leads; Q1 trails by at
-  most 1.4×.
+- **Local reads** (TPC-H SF1 lineitem in snappy and zstd, and a 2.1M-row synthetic table): fastest on {{TBD}} of 14,
+  at a geometric mean of {{TBD}}× the fastest other engine.
+- **Writes** (outputs to tmpfs for every engine): fastest on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
+- **DuckDB's votes test** (228M rows, local file): {{TBD}} ms, against {{TBD}} ms for DuckDB 2.0.
+- **PDS-H Q1 and Q6** (SF1 to SF30): fastest on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
 
 **Against zpq 0.4.1: writes and peak memory.** These come from the earlier scorecard `scorecard-v2-a88915d3b494`:
 0.5.0 build a88915d (from before the memory work) against the released 0.4.1, on the same machine in the same session.
@@ -197,8 +180,11 @@ What changed underneath:
   memory budget, instead of one shared table.
 - `ORDER BY ... LIMIT n` over plain rows ranks by its keys in parallel and reads only the winners' rows, skipping row
   groups that cannot win.
-- Local reads on Linux can bypass the page cache (io_uring with `O_DIRECT`, or `pread`) for cold files, reading only
-  the column chunks a query needs.
+- Local reads on Linux read only the column chunks a query needs. When most of those ranges are already in the page
+  cache, zpq maps the file. When they are cold and the largest row group fits the reader, it reads them with
+  `O_DIRECT` io_uring, which leaves the page cache alone; if the file system refuses `O_DIRECT`, that file is read
+  through the page cache instead. Otherwise it reads through the page cache with io_uring or `pread`. `--explain`
+  names the choice, and `--profile-summary` reports what each file used.
 - GZIP pages inflate with libdeflate; LZ4_RAW pages are written with liblz4; zstd's literal Huffman coding uses
   AVX-512 where the CPU has it, writing the same bytes.
 - Writes filter first, then decode and encode one column at a time. They re-encode dictionary columns from their codes
@@ -569,6 +555,19 @@ DECIMAL and FLOAT16 over FIXED_LEN_BYTE_ARRAY are numbers. `-o` Parquet output i
   - with `-o`, a SELECT of bare columns in the file's order keeps a STRUCT, LIST or MAP whole, as `--columns` does.
 - DECIMAL literals and exact DECIMAL arithmetic (see Behaviour changes).
 - `--explain` prints the aggregate plan as JSON without reading data pages.
+- Date and time functions over DATE, TIMESTAMP and integer columns (UTC, no time zones):
+  - `make_date(days)` reads an integer count of days as a DATE; in a filter it still prunes by the column's
+    statistics;
+  - `epoch_ms(ms)` reads integer milliseconds since the epoch as a TIMESTAMP;
+  - `date_trunc(part, x)` and `date_part(part, x)` (also `datepart`), with `EXTRACT(part FROM x)` read as
+    `date_part`. Parts: `microsecond`, `millisecond`, `second`, `minute`, `hour`, `day`, `dow`, `isodow`, `doy`,
+    `week` (ISO), `month`, `quarter`, `year`. Another part is refused (`unsupported part for date_trunc/date_part`).
+  - A value outside the type's range is an error, raised only for rows that are present and wanted.
+- A DATE column compared with an untyped date-time literal (`d = '2013-07-01 12:00:00'`) compares as that day: the
+  literal's time of day is dropped. Typed literals (`TIMESTAMP '...'`) are still refused.
+- `regexp_replace(s, pattern, replacement [, options])` with RE2 syntax, on an engine whose time is linear in the
+  text. Options: `g` (every match), `i`/`c` (case), `s`/`m`/`n`/`p` (whether `.` matches a newline), `l` (literal
+  pattern). `\p` classes, `\C`, `\Q..\E`, backreferences and case-insensitive non-ASCII text are refused.
 
 Not supported: `%` (refused as `operator % is not supported`), the simple `CASE x WHEN` form, joins.
 
@@ -632,6 +631,8 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
 - `--compress-priority size|speed`.
 - Explicit local reads on Linux (`ZPQ_IO_PROFILE`, `ZPQ_IO_WINDOW_MIB`, `ZPQ_IO_THREADS`).
 - The summary reports `total_us` beside `total_ms`.
+- `--cache` (libzpq `"cache": true`) reads local inputs through the page cache, never `O_DIRECT`, so the next query on
+  the file runs warm.
 
 ### Platforms
 

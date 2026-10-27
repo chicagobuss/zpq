@@ -2,6 +2,7 @@
 complete -c zpq -n '__fish_use_subcommand' -a 'conform help inspect query schema version'
 complete -c zpq -l aggregate
 complete -c zpq -l bloom-filter
+complete -c zpq -l cache
 complete -c zpq -l codec
 complete -c zpq -l column-order
 complete -c zpq -l columns

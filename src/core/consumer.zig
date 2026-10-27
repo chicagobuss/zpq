@@ -5411,6 +5411,9 @@ fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
     if (!reusableByteEncodings(cm.encodings.items)) return false;
     const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
     if (filtered and !columnFeedsFold(target, ci)) return true;
+    // A complete dictionary already keeps hashed keys compact. Forcing it into string windows discards the
+    // coded fold (including dense lanes) and repeatedly allocates expanded values. Mixed/PLAIN chunks still stream.
+    if (target.codedKey(ci) and cacheDictionary(in, ci) != null) return false;
     return hashOnlyByteArray(target, ci);
 }
 
@@ -11287,6 +11290,17 @@ test "grouped key dictionaries keep later-key codes with and without dense lanes
     target.grouped.dense = null;
     try testing.expect(target.codedKey(0));
     try testing.expect(target.codedKey(1));
+    const in: AggRowGroup = .{
+        .rg = rg,
+        .meta = &meta,
+        .src = src,
+        .filter = null,
+        .read = &.{ true, true },
+        .consumed = &.{ true, true },
+    };
+    try testing.expect(cacheDictionary(in, 1) != null);
+    try testing.expect(!streamByteArray(in, target, 1));
+    try testing.expectEqual(std.math.maxInt(usize), streamWindowRows(in, target, ints.len));
     const cm = rg.columns.items[1].meta_data.?;
     const start: usize = @intCast(cm.dictionary_page_offset.?);
     const chunk = capture.bytes.items[start..][0..@intCast(cm.total_compressed_size)];

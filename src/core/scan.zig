@@ -6538,6 +6538,9 @@ fn inlinePairAnswer(
     const di = distinct orelse return null;
     const keys = keys_opt orelse &.{};
     const outputs = outputs_opt orelse &.{};
+    // Single-key sets/sketches avoid a speculative pair scan/replay and a second grouping scatter. Keep that
+    // established route automatic; composite identities amortize packing, and .on still exercises single-key owners.
+    if (args.distinct_pairs == .auto and keys.len == 1) return null;
     for (outputs) |out| if (out.derived != null) return null;
     const input_rows = RecordOrdinals.rows(metas) orelse return null;
     if (input_rows >= @as(usize, 1) << 31) return null;
@@ -24907,6 +24910,17 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
             args.parallelism = j;
             args.decode_batch_rows = window;
             args.taken = &taken;
+            if (c.group != null and (std.mem.eql(u8, c.group.?, "k") or std.mem.eql(u8, c.group.?, "s"))) {
+                args.distinct_pairs = .auto;
+                try testing.expect((try explainAggregate(gpa, a, args)).record_path == null);
+                var automatic = try runMultiAggregate(gpa, a, args);
+                defer automatic.deinit(gpa);
+                try automatic.output.applyResultOrder(gpa, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows, automatic.output.group_rows);
+                try testing.expectEqualDeep(want.output.aggs, automatic.output.aggs);
+                args.distinct_pairs = .on;
+                taken = .{};
+            }
             const explanation = try explainAggregate(gpa, a, args);
             try testing.expectEqual(.pair_distinct, explanation.record_path.?.layout);
             var got = try prepareAggregate(gpa, a, args, false);
@@ -25072,4 +25086,80 @@ test "M1 finish partitions full and top-H states including preparation cleanup t
             try testing.expectEqualStrings("best", accs.items[slot.idx + 1].min_bytes.?);
         }
     };
+}
+
+test "R11 partition COUNT cut builds only limit plus offset when no partition reaches the cut" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var keys: [4096][]const u8 = undefined;
+    var values: [4096][]const u8 = undefined;
+    for (&keys, &values, 0..) |*k, *v, i| {
+        k.* = try std.fmt.allocPrint(a, "source-with-a-long-shared-prefix-and-independent-group-{d}", .{i % 128});
+        v.* = try std.fmt.allocPrint(a, "destination-with-another-long-shared-prefix-{d}", .{i % 8});
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .string = .{ .values = &keys } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+        .{ .name = "v", .col = .{ .string = .{ .values = &values } }, .parquet_type = .BYTE_ARRAY, .nullable = false },
+    };
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, keys.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const groups = try a.alloc(schema.RowGroup, 16);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "partition-cut", .bytes = sink.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k,v",
+        .max_memory = 256 << 20,
+        .min_bytes_per_worker = 1,
+        .integer_records = false,
+        .byte_records = false,
+        .msd_records = false,
+        .dense = false,
+        .plain_rules = false,
+        .private_runs = false,
+        .ndv_union = false,
+        .partition_cost = false,
+        .spill = false,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try testing.expectEqual(@as(usize, 128), want.output.group_rows.?.len);
+    const order: expr_ast.ResultOrder = .{
+        .keys = &.{.{ .column = 2, .descending = true }},
+        .offset = 12,
+        .limit = 5,
+    };
+    try want.output.applyResultOrder(gpa, order);
+    args.result_order = order;
+    args.spill = true;
+    args.spill_groups = 64;
+    args.spill_rows = 128;
+    var image: std.ArrayList(u8) = .empty;
+    const key_cols = [_]@import("filter/eval.zig").Batch.Column{
+        .{ .string = .{ .values = &keys } },
+        .{ .string = .{ .values = &values } },
+    };
+    var in_partition: [32]usize = @splat(0);
+    for (0..128) |row| {
+        try expr_agg.serializeRowKey(&image, a, &key_cols, row);
+        in_partition[std.hash.Wyhash.hash(0, image.items) >> 59] += 1;
+    }
+    for (in_partition) |n| try testing.expect(n < 17);
+    for ([_]usize{ 1, 16 }) |workers| {
+        args.parallelism = workers;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(got.part_agg);
+        // Complete partitions together contain 128 groups, but each is below 17. The global cut must run before
+        // building either string output, not merely when the engine later applies LIMIT/OFFSET.
+        try testing.expectEqual(@as(usize, 17), got.output.group_rows.?.len);
+        try got.output.applyResultOrder(gpa, order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    }
 }

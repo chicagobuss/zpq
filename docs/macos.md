@@ -16,11 +16,11 @@ The binaries declare macOS 15.0 as their minimum (Zig 0.17's default).
 tools/check/fleet.sh --host granted-mbp          # or --release, which includes the Mac
 ```
 
-The fleet script builds the `aarch64-macos` bundle on Linux: the Debug unit-test executables (`zig build test-bin`),
-`zpq-check` and the ReleaseFast `zpq`, the unit tests' fixtures and the case files with the fixtures this host's run
-made. It fails if `llvm-objdump` finds a raw `svc`/`syscall` instruction in any of them: macOS code reaches the kernel
-through libSystem, so one would be a Linux syscall that survived. On the Mac it runs the unit-test executables from the
-bundle root under `zpq-check stage` (no skip is allowed) and every case answers-only; the Mac's answers manifest must
-equal the Linux reference's, case for case (`zpq-check manifest-diff`). Receipts come back to `zig-out/receipts`.
+The fleet script cross-builds the `aarch64-macos` bundle on a Linux builder: `zpq-check` and the ReleaseFast `zpq`
+(with `--full`, the Debug unit-test executables too). It fails if `llvm-objdump` finds a raw `svc`/`syscall`
+instruction in any of them: macOS code reaches the kernel through libSystem, so one would be a Linux syscall that
+survived. On the Mac every case runs answers-only and the answers manifest must equal the Linux reference's, case for
+case (`zpq-check manifest-diff`); with `--full` the unit-test executables run under `zpq-check stage` too. A Mac has
+no GNU `timeout`, which the runner bounds each CLI point with: the host script supplies `gtimeout` or a Perl alarm.
 
 CI's macos-14 runner runs the shipped Apple silicon CLI through `tools/check/cases/release.json`.

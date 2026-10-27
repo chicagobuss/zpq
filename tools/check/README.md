@@ -93,7 +93,7 @@ The gates are build.zig steps; CI and the justfile call them.
 | edit | `zig build check -Dtier=edit [-Dtest-filter=X]` | core unit tests (ReleaseSafe) |
 | commit | `zig build check -Dtier=commit` | fixtures, core unit tests, the runner's self-test, the bench's rules, every commit-tier case file against the cached oracle |
 | full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-tests, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, libzpq |
-| fleet | `tools/check/fleet.sh` | the full tier's shards (tools/check/shards.json) over the fleet, plus the architecture check |
+| fleet | `tools/check/fleet.sh [--full]` | each push's architecture check over the fleet; with `--full`, also the full tier's shards (tools/check/shards.json) |
 
 Each stage runs through `zpq-check stage` under its timeout (a hang fails the stage, its process group killed) and
 leaves `zig-out/receipts/NAME.log` and `NAME.json`: the SHA and whether the tree was clean, the host, compiler and
@@ -106,10 +106,17 @@ bench`, `nested`) before anything runs. Contracts skip only by a named need (`--
 Every test root imports the `tests.gen.zig` build.zig writes beside it, listing the files under it that declare tests,
 so no test file goes unrooted.
 
-The architecture check runs every case answers-only (`--answers-only --reuse-fixtures --manifest`) on each fleet host
-from a shipped bundle, and `zpq-check manifest-diff` requires the host's answers to equal this host's, case for case.
-Placement: granted-mbp runs only with `--host` or `--release`, and a host that is timing (an active `zpq-*` unit, a
-held `/mnt/fast/zpq-out/timing.lock` or bench lock `~/.cache/zpq-bench.lock`, a running full gate) is skipped.
+The architecture check is pipelined. Every target builds at once on its first two idle builders (by the fleet o11y
+feed, and only as many builds as a builder's free memory holds), each from a warm cache under `~/.cache/zpq-fleet`
+with the pinned Zig at the same path everywhere (`fleet-build.sh`). The first bundle done is used; the two builds'
+symbol-stripped hashes are recorded (identical code and data, the reproducibility check), and a host still building
+a target another builder delivered stops to run its check. This host runs the x86_64 baseline bundle's answers, the
+reference, and makes the fixtures; then each host (`fleet-host.sh`) runs every case file answers-only in parallel
+(slowest first, as many at once as its memory cap allows), and `zpq-check manifest-diff` requires its answers to equal
+the reference's, case for case. Placement: granted-mbp runs only with `--host` or `--release`; a host in a timing
+window (its `zpq-HOST-*` units, a bench or timing unit, a held `/mnt/fast/zpq-out/timing.lock` or
+`~/.cache/zpq-bench.lock`, a running full gate) or offline is skipped and reported as skipped, never as failed.
+`zig-out/receipts/fleet.json` keeps the placement, phase times and hashes.
 
 The release tier is the GitHub native matrix: each runner builds the CLI as it ships and runs `cases/release.json`
 through it, and on Linux the shipped Lambda through the fake runtime (`zig build integration-bin`).

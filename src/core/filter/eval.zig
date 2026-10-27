@@ -424,8 +424,12 @@ pub const Batch = struct {
                     // that carries rows must cover the requested window; retaining a short buffer misindexes it.
                     if (c.hist == null and (lo > c.rowCount() or n > c.rowCount() - lo)) return error.BadColumn;
                     if (c.codes) |cs| o.codes = try rowWindow(u32, cs, lo, n);
-                    if (c.values.len != 0 or (c.codes == null and c.levels_only_rows == 0 and c.hist == null))
+                    // A string whose bytes were not copied carries only its lengths.
+                    const lengths_only = c.values.len == 0 and c.byte_lengths != null;
+                    if (c.values.len != 0 or
+                        (!lengths_only and c.codes == null and c.levels_only_rows == 0 and c.hist == null))
                         o.values = try rowWindow(@TypeOf(c.values[0]), c.values, lo, n);
+                    if (c.byte_lengths) |bl| o.byte_lengths = try rowWindow(u32, bl, lo, n);
                     if (c.def_levels) |dl| o.def_levels = try rowWindow(u32, dl, lo, n);
                     if (c.rep_levels) |rl| o.rep_levels = try rowWindow(u32, rl, lo, n);
                     if (c.unscaled) |u| o.unscaled = switch (u) {
@@ -1207,6 +1211,35 @@ test "an empty compare reads PLAIN lengths and does not need the bytes" {
     try testing.expect(sv.isActive(1));
     try testing.expect(!sv.isActive(2));
     try testing.expect(sv.isActive(3));
+}
+
+test "a window of a lengths-only string answers its empty compare as the same rows of the whole column do" {
+    var lengths: [130]u32 = undefined;
+    var defs: [130]u32 = undefined;
+    for (&lengths, &defs, 0..) |*l, *d, r| {
+        d.* = @intFromBool(r % 5 != 0);
+        l.* = if (d.* == 0) 0 else @intCast(r % 3);
+    }
+    const col: Batch.Column = .{ .string = .{
+        .values = &.{},
+        .byte_lengths = &lengths,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const lookup = [_]?usize{0};
+    const nonempty: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .NotEq, .value = "" } };
+    var whole = try selection.SelectionVector.init(testing.allocator, lengths.len);
+    defer whole.deinit();
+    try evaluate(nonempty, &.{ .cols = &.{col}, .num_rows = lengths.len }, &whole, &lookup, testing.allocator);
+    const lo = 64;
+    const n = lengths.len - lo;
+    const win = try col.sliceRows(lo, n);
+    try testing.expectEqual(n, win.string.byte_lengths.?.len);
+    var part = try selection.SelectionVector.init(testing.allocator, n);
+    defer part.deinit();
+    try evaluate(nonempty, &.{ .cols = &.{win}, .num_rows = n }, &part, &lookup, testing.allocator);
+    for (0..n) |r| try testing.expectEqual(whole.isActive(lo + r), part.isActive(r));
 }
 
 test "leaf kernels select exactly what a row-by-row compare does: every op, nulls, NaN, ±0, unsigned, ragged tails" {

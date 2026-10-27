@@ -4573,7 +4573,15 @@ fn scanRGForAggImpl(
     var filtered = false;
     var survivors: usize = 0;
     var whole: []bool = &.{};
-    for ([_]bool{ false, true }) |late| for (in.read, 0..) |needed, ci| {
+    var gated = if (!staged and keep == null and stage_plan == null)
+        try GatedFilter.init(ra, in, target, dec.page_indexes)
+    else
+        null;
+    if (gated) |*g| dec.filter_gated = g.deferred;
+    const all_columns = try ra.alloc(usize, in.read.len);
+    for (all_columns, 0..) |*c, i| c.* = i;
+    for ([_]bool{ false, true }) |late| for (if (!late and gated != null) gated.?.order else all_columns) |ci| {
+        const needed = in.read[ci];
         if (late and dec.payload == null) break;
         if (!needed or ci >= in.rg.columns.items.len) continue;
         if (stage_plan) |sp| if (!sp.base[ci]) {
@@ -4582,9 +4590,21 @@ fn scanRGForAggImpl(
             if (!pay) continue;
         };
         if (dec.payload) |p| if (p[ci] != late) continue;
+        if (!late) if (gated) |*g| if (g.deferred[ci]) {
+            const now: filter_eval.Batch = .{
+                .cols = batch_cols.items,
+                .num_rows = batch_rows,
+                .expr_batch_rows = ws.expr_batch_rows,
+            };
+            try g.evaluate(&now, &sel, lookup, ra, false);
+            dec.gate = &sel;
+        };
         if (late and !filtered) {
             const first: filter_eval.Batch = .{ .cols = batch_cols.items, .num_rows = batch_rows, .expr_batch_rows = ws.expr_batch_rows };
-            try filter_eval.evaluate(in.filter.?, &first, &sel, lookup, ra);
+            if (gated) |*g|
+                try g.evaluate(&first, &sel, lookup, ra, true)
+            else
+                try filter_eval.evaluate(in.filter.?, &first, &sel, lookup, ra);
             filtered = true;
             dec.gate = &sel;
             survivors = sel.count();
@@ -4647,7 +4667,12 @@ fn scanRGForAggImpl(
         .num_rows = batch_rows,
         .expr_batch_rows = ws.expr_batch_rows,
     };
-    if (in.filter) |f| if (!filtered) try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+    if (in.filter) |f| if (!filtered) {
+        if (gated) |*g|
+            try g.evaluate(&batch, &sel, lookup, ra, true)
+        else
+            try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
+    };
     // A staged plan's call columns decode below, after the filter: payload among them is gated the same way.
     // Length-only predicate columns refill here when the fold or an owner still reads the bytes, and only the
     // rows the filter kept. `codePlainKeys` has to see those bytes, not the empty length-only placeholders.
@@ -5476,6 +5501,102 @@ fn streamWindowRows(in: AggRowGroup, target: AggTarget, num_rows: usize) usize {
 }
 
 /// The fold reads `ci` after the filter: a group key, an aggregate argument, or a per-aggregate FILTER.
+/// A top-level AND's filter columns decoded one conjunct at a time: a column only its single-column leaves read
+/// decodes after the other base columns, at the survivors of every conjunct whose columns are decoded by then
+/// (`DecodeOptions.row_gate`), so a page none of them keeps is never decompressed. Conjuncts evaluate in the plan's
+/// order as their columns arrive; AND only clears bits, so the answer is the whole filter's. Which pages skip
+/// depends on the input and the query alone. A chunk its dictionary covers keeps its coded evaluation, and a
+/// length-only, page-indexed, staged, compacted or record-owned decode keeps the established whole-column path.
+const GatedFilter = struct {
+    children: []const filter_ast.Filter,
+    /// Base columns in decode order: the others in column order, then the deferred by the first conjunct naming them.
+    order: []usize,
+    deferred: []bool,
+    done: []bool,
+
+    fn init(
+        a: std.mem.Allocator,
+        in: AggRowGroup,
+        target: AggTarget,
+        page_indexes: []const ?PageIndex,
+    ) !?GatedFilter {
+        const filter = in.filter orelse return null;
+        if (filter != .and_filter) return null;
+        const c = filter.and_filter;
+        if (c.in_set != null or c.null_member or c.children.len < 2) return null;
+        if (target == .grouped and target.grouped.records != null) return null;
+        const n = in.read.len;
+        const deferred = try a.alloc(bool, n);
+        @memset(deferred, false);
+        const first = try a.alloc(usize, n);
+        @memset(first, std.math.maxInt(usize));
+        const marks = try a.alloc(bool, n);
+        for (c.children, 0..) |child, k| {
+            @memset(marks, false);
+            filter_ast.markColumns(child, marks);
+            for (marks, 0..) |m, ci| if (m and first[ci] == std.math.maxInt(usize)) {
+                first[ci] = k;
+            };
+        }
+        var any = false;
+        for (0..n) |ci| {
+            if (first[ci] == std.math.maxInt(usize) or !in.read[ci] or ci >= in.rg.columns.items.len) continue;
+            if (first[ci] == 0 or page_indexes[ci] != null) continue;
+            const cm = in.rg.columns.items[ci].meta_data orelse continue;
+            if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) continue;
+            if (@import("filter/membership.zig").dictionaryCoversChunk(&cm)) continue;
+            if (emptinessWant(filter, ci)) |want| if (want != .absent) continue;
+            const leaves_only = for (c.children) |child| {
+                @memset(marks, false);
+                filter_ast.markColumns(child, marks);
+                if (marks[ci] and filter_ast.leafColumn(child) != ci) break false;
+            } else true;
+            if (!leaves_only) continue;
+            deferred[ci] = true;
+            any = true;
+        }
+        if (!any) return null;
+        const order = try a.alloc(usize, n);
+        var len: usize = 0;
+        for (0..n) |ci| if (!deferred[ci]) {
+            order[len] = ci;
+            len += 1;
+        };
+        for (c.children, 0..) |_, k| for (0..n) |ci| if (deferred[ci] and first[ci] == k) {
+            order[len] = ci;
+            len += 1;
+        };
+        std.debug.assert(len == n);
+        const done = try a.alloc(bool, c.children.len);
+        @memset(done, false);
+        return .{ .children = c.children, .order = order, .deferred = deferred, .done = done };
+    }
+
+    /// Evaluate, in order, every conjunct not yet evaluated whose columns are all decoded; with `all`, the rest too,
+    /// failing as the whole filter would on a column that never decoded.
+    fn evaluate(
+        g: *GatedFilter,
+        batch: *const filter_eval.Batch,
+        sel: *filter_selection.SelectionVector,
+        lookup: []const ?usize,
+        a: std.mem.Allocator,
+        all: bool,
+    ) !void {
+        const marks = try a.alloc(bool, lookup.len);
+        for (g.children, g.done) |child, *done| {
+            if (done.*) continue;
+            @memset(marks, false);
+            filter_ast.markColumns(child, marks);
+            const ready = for (marks, lookup) |m, pos| {
+                if (m and pos == null) break false;
+            } else true;
+            if (!ready and !all) continue;
+            try filter_eval.evaluate(child, batch, sel, lookup, a);
+            done.* = true;
+        }
+    }
+};
+
 fn flatGroupKey(target: AggTarget, ci: usize) bool {
     if (target != .grouped) return false;
     for (target.grouped.keys) |k| if (k == .col_ref and k.col_ref.col_idx == ci) return true;
@@ -5565,6 +5686,8 @@ const ChunkDecoder = struct {
     gate: ?*const filter_selection.SelectionVector = null,
     /// Payload columns decoded for every row after all, ungated (`keyCodesCheaper`).
     whole: ?[]const bool = null,
+    /// Filter columns decoded at the survivors of the conjuncts already evaluated (`GatedFilter`).
+    filter_gated: ?[]const bool = null,
     /// The pre-filter pass may decode a PLAIN `<> ''` / `= ''` column as lengths. A later pass (`refill`) reads
     /// the bytes the fold still needs, and only on the rows the filter kept.
     allow_lengths: bool = true,
@@ -5607,6 +5730,10 @@ const ChunkDecoder = struct {
         if (self.refill) {
             if (self.gate) |g| decode_options.row_gate = g;
         }
+        if (self.filter_gated) |fg| if (fg[ci]) {
+            std.debug.assert(self.gate != null);
+            decode_options.row_gate = self.gate;
+        };
         decode_options.any_dictionary = self.target.codedKey(ci);
         decode_options.decimal_exact_only = self.target.exactInputs();
         const pruned_pages = if (prune_info) |p|

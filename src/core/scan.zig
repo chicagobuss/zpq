@@ -6867,7 +6867,8 @@ fn pairAnswerBits(
     var held: usize = 0;
     defer ledger.release(scratch - held);
     const pairs = (try P.Pairs.State.init(gpa, ledger, input_rows, rows, workers, pq.parts)) orelse return null;
-    defer pairs.deinit();
+    var leave_records = false;
+    defer if (!leave_records) pairs.deinit();
     const groups = (try G.State.initWeighted(
         gpa,
         ledger,
@@ -6877,7 +6878,7 @@ fn pairAnswerBits(
         workers,
         gq.parts,
     )) orelse return null;
-    defer groups.deinit();
+    defer if (!leave_records) groups.deinit();
     const result = if (top)
         T.init(gpa, ledger, workers, cut.?.k, cut.?.a_idx == distinct)
     else
@@ -7058,6 +7059,9 @@ fn pairAnswerBits(
         held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
         output_charge = 0; // retain the successful output credit in the query's enclosing ledger
     }
+    // Keep the records and their full charge until process exit, as the ordinary table path does. A top-H
+    // answer owns its copied keys and never reads these states again; all failure paths still deinitialize them.
+    leave_records = top and args.leave_regions and !std.debug.runtime_safety;
     return pairResult(args, plan, run, output, .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types });
 }
 
@@ -7482,7 +7486,8 @@ fn selectedCountBits(
     var held: usize = 0;
     defer ledger.release(extra_credit - held);
     const state = (try O.State.init(gpa, ledger, input_rows, rows, workers, q.parts)) orelse return null;
-    defer state.deinit();
+    var leave_records = false;
+    defer if (!leave_records) state.deinit();
     var top = T.init(gpa, ledger, workers, k, args.result_order.keys[0].descending) catch |err| {
         if (err == error.ExceededMemoryBudget) return null;
         return err;
@@ -7593,6 +7598,9 @@ fn selectedCountBits(
     // arena credit beside output schema/rows; the temporary bindings, sources and finish views are gone.
     if (args.ledger != null) held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
         outputs.len *| @sizeOf(GroupColType) +| names_credit +| groups.len *| per_row;
+    // As for leave_tables, a successful tiny answer in an exiting process leaves consumed records to exit.
+    // Their full ledger credit stays held beside encoding; refusals and reusable/library contexts free normally.
+    leave_records = kinds.len != 0 and args.leave_regions and !std.debug.runtime_safety;
     var bytes_in: u64 = 0;
     for (args.inputs) |in| bytes_in += if (in.logical_size != 0) in.logical_size else in.bytes.len;
     return .{

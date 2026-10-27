@@ -47,7 +47,12 @@ pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHas
                     if (trial) l.seen += 1;
                     const hit = try l.hot.push(r, l, emit);
                     if (trial and hit) l.hits += 1;
-                    if (trial and l.seen == l.state.trial_rows and l.hits < l.hot.entries.len) {
+                    // Wide lane records save more scatter/fold traffic per hit than a bare COUNT partial.
+                    const count_bytes = @sizeOf(lanes.Layout(u64, &.{}, u32).Record);
+                    const saved_bytes = if (@hasField(Record, "values")) @sizeOf(Record) else count_bytes;
+                    if (trial and l.seen == l.state.trial_rows and
+                        l.hits *| saved_bytes < l.hot.entries.len *| count_bytes)
+                    {
                         try l.hot.flush(l, emit);
                         l.bypass = true;
                     }
@@ -332,4 +337,23 @@ test "packed owner exact finish funding refuses before publishing and releases e
     try std.testing.expectEqual(s.charged, ledger.used.load(.monotonic));
     s.deinit();
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "wide payload cache retains a useful trial below the bare COUNT hit threshold" {
+    const a = std.testing.allocator;
+    const O = Owner(u64, &.{ .sum, .min, .max, .present_count }, u32);
+    var ledger: memory.SharedBudget = .{ .limit = 64 << 20 };
+    const state = (try O.State.init(a, &ledger, 65536, 65536, 1, 64)).?;
+    defer state.deinit();
+    const local = &state.locals[0];
+    const n = state.trial_rows;
+    for (0..n) |i| try local.append(.{
+        .key = @intCast(if (i % 4 == 3) i - 1 else i),
+        .ordinal = @intCast(i),
+        .weight = 1,
+        .values = .{ 7, 7, 7, 1 },
+    });
+    try std.testing.expectEqual(n / 4, local.hits);
+    try std.testing.expect(local.hits < local.hot.entries.len);
+    try std.testing.expect(!local.bypass);
 }

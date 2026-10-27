@@ -1254,7 +1254,8 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     const cheap_r1 = small and (tiny or repeated or (keys.len == 1 and (in.calls.len == 1 or
         stat.dictionary_bytes <= (stat.hi *| stat.key_bytes) *| 4)));
     // Short string tuples may have sparse repeats even when their string marginal repeats heavily. Keep
-    // payloads and long keys on the existing path; only the runtime sparse-repeat hint can justify this census.
+    // payloads and long keys on the existing path; filtered, only the runtime sparse-repeat hint can justify this
+    // census.
     const short_composite = !small and stat.string_keys and keys.len > 1 and
         stat.key_bytes < 32 and in.calls.len == 1;
     // A short byte key plus total payloads can avoid almost all losing-group state. The encoded average width
@@ -1274,10 +1275,16 @@ fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         // often than one key's; counting again after the bail cost more than riding along and being dropped.
         const fixed_composite = bail_census and !short_composite and keys.len > 1 and
             expr_agg.fixedGroupStride(keys) != null;
+        // Unfiltered, a short string composite's count pass reads every row the census would, and its cells, spread
+        // by every combination the marginals make, bail like a fixed-width composite's: the census rides along and
+        // each worker still drops it once its own cells separate the cut. Filtered, the bet waits for the count.
+        const unfiltered_short = bail_census and short_composite and in.args.filter == null;
         plan.dispatch.keys_unique = looks_unique;
         plan.dispatch.census_allowed = bail_census;
-        plan.dispatch.census_fused = looks_unique or fixed_composite or (bail_census and short_payload);
-        plan.dispatch.census_cell_repeat_gate = bail_census and (short_composite or !bounded_census);
+        plan.dispatch.census_fused = looks_unique or fixed_composite or unfiltered_short or
+            (bail_census and short_payload);
+        plan.dispatch.census_cell_repeat_gate = bail_census and !unfiltered_short and
+            (short_composite or !bounded_census);
         plan.reasons.remove(.keys_look_unique);
         plan.reasons.remove(.census_fused);
         plan.reasons.remove(.census_on_sketch_bail);
@@ -2600,21 +2607,43 @@ fn certifiedTopK(
     // cells too even to bound anything need no second count pass. It fills the cells too, and stops early wherever a
     // worker's own cells already separate the cut, as the cells will then do without it.
     var dropped: std.atomic.Value(bool) = .init(false);
+    // A census riding the count pass drops on the merged cells of every worker with `check_after` rows to judge.
+    // Each worker judges at its share of what one worker's cells once judged alone, so the merged cells hold as many
+    // rows, drawn from every worker's slice rather than one.
+    var merged: expr_agg.Census.MergedCells = .{ .slots = &.{}, .quorum = 0 };
+    var merged_check: u64 = cfg.census_check_rows;
+    if (decision.census_allowed and decision.census_fused and !decision.distinct_census) {
+        var rows: u64 = 0;
+        for (workers[0].work) |item| if (item.agg_start == 0) {
+            rows +|= @intCast(@max(0, workers[0].metas[item.file].row_groups.items[item.rg].num_rows));
+        };
+        merged.quorum = workers.len;
+        merged_check = @max(1, cfg.census_check_rows / workers.len);
+        // Workers that cannot all reach their check never complete the quorum: judge on fewer.
+        if (rows / merged_check < workers.len) merged.quorum = @intCast(rows / merged_check);
+        merged.slots = try arena.alloc([]u32, workers.len);
+        for (merged.slots) |*slot| {
+            slot.* = try arena.alloc(u32, n_cells);
+            @memset(slot.*, 0);
+        }
+    }
     const censuses: []expr_agg.Census = if (decision.census_allowed) blk: {
         const item_rows = try arena.alloc(u64, workers[0].work.len);
         @memset(item_rows, 0);
         const cs = try arena.alloc(expr_agg.Census, workers.len);
-        for (cs) |*c| c.* = .{
+        for (cs, 0..) |*c, wi| c.* = .{
+            .worker = wi,
             .gpa = gpa,
             .item_rows = item_rows,
             .dropped = &dropped,
+            .merged = if (merged.slots.len != 0) &merged else null,
             .cut_k = k,
             .admit_n = admit_n,
             .distinct = decision.distinct_census,
             .check_after = if (decision.distinct_census)
                 @min(cfg.census_check_rows, expr_agg.Census.distinct_check_rows)
             else
-                cfg.census_check_rows,
+                merged_check,
             .fp_mask = censusMask(cfg),
         };
         break :blk cs;
@@ -18887,14 +18916,23 @@ test "planAggregate: census bail cost bets preserve R1 and gate key types" {
     try testing.expectEqual(.plain_hash, plan.dispatch.strategy);
     try testing.expect(!plan.dispatch.census_allowed);
 
-    // Short string composites can have a sparse repeat tail even when the marginal NDV is unknown.
+    // Short string composites can have a sparse repeat tail even when the marginal NDV is unknown. Unfiltered
+    // (ClickBench q18's shape), the census rides the count pass, whose cells bail on so spread a key, with no hint.
     const short_composite = [_]expr_ast.Expr{ string_key[0], keys[1] };
     in.keys = &short_composite;
     in.ndv_stat.?.key_bytes = 24;
     plan = planAggregate(in);
     try testing.expectEqual(.sketch, plan.dispatch.strategy);
+    try testing.expect(plan.dispatch.census_allowed and plan.dispatch.census_fused);
+    try testing.expect(!plan.dispatch.keys_unique and !plan.dispatch.census_cell_repeat_gate);
+    try testing.expect(plan.reasons.contains(.census_fused) and plan.reasons.contains(.census_short_string_composite));
+    // Filtered, the count pass decides whether a census is worth a second pass, behind the repeat hint.
+    in.args.filter = "s > 0";
+    plan = planAggregate(in);
+    try testing.expectEqual(.sketch, plan.dispatch.strategy);
     try testing.expect(plan.dispatch.census_allowed and plan.dispatch.census_cell_repeat_gate);
     try testing.expect(!plan.dispatch.keys_unique and !plan.dispatch.census_fused);
+    in.args.filter = null;
     in.args.sketch_topk.?.census = false;
     try testing.expectEqual(.plain_hash, planAggregate(in).dispatch.strategy);
     in.args.sketch_topk.?.census = true;

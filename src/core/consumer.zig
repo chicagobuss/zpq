@@ -1175,6 +1175,9 @@ pub const SliceReader = struct {
             // Both stores are this row group's. The next group must not inherit them on top of its own page.
             _ = self.pages.reset(.free_all);
             if (self.dict_store) |d| _ = d.reset(.free_all);
+            // The data page and its dictionary stay in the slot scratch for the next row group. Level buffers
+            // used to die with the page arena; on the scratch they would keep that charge until the pool died.
+            self.releaseLevelScratch();
         } else {
             self.scratch.deinit();
             self.pages.deinit();
@@ -1186,6 +1189,20 @@ pub const SliceReader = struct {
                 else => {},
             }
         }
+    }
+
+    /// Level buffers of a retained byte-array reader. Its recycled page and dictionary stay, so the next row group
+    /// reuses those two. Fixed-width slots keep their levels too; a byte-array page arena used to free these.
+    fn releaseLevelScratch(self: *SliceReader) void {
+        switch (self.raw.*) {
+            .bytes => {},
+            else => return,
+        }
+        const s = self.scratch;
+        s.gpa.free(s.def_levels);
+        s.gpa.free(s.rep_levels);
+        s.def_levels = &.{};
+        s.rep_levels = &.{};
     }
 
     /// Whether leaf `ci` has a sliced form (what `init` returns non-null for).

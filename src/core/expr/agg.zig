@@ -5049,10 +5049,15 @@ pub const KeyArena = struct {
 };
 
 pub const GroupTable = struct {
+    const StringView = struct { bytes: []const u8, first: u64 };
+
     compact: @import("agg_state.zig").State = .{},
     // 16-aligned: a private distinct acc stores this pointer with bit 3 set (`DistinctAcc.table_flag`).
     allocator: std.mem.Allocator align(16),
     refs: std.ArrayList(u32) = .empty,
+    // Stable arena views remove refs -> chunk -> varint dependencies from repeated direct-string probes.
+    // First stays beside the view; the canonical first array is written only when a smaller ordinal arrives.
+    string_views: std.ArrayList(StringView) = .empty,
     strings: ?*KeyArena = null,
     slots: []FixedSlot = &.{},
     /// Where each group first appeared, `first_position` of the row that created it (see `getOrInsert`): the ordered
@@ -5160,6 +5165,7 @@ pub const GroupTable = struct {
     /// Requires that deinitRange has released every group exactly once.
     pub fn deinitStorage(self: *GroupTable) void {
         self.refs.deinit(self.allocator);
+        self.string_views.deinit(self.allocator);
         if (self.strings) |strings| {
             strings.deinit(self.allocator);
             self.allocator.destroy(strings);
@@ -5201,6 +5207,7 @@ pub const GroupTable = struct {
     /// Key bytes of group `g`. For a fixed-width table this is the inline image, stable until the next insert that
     /// grows `fixed_keys`.
     pub fn keyAt(self: *const GroupTable, g: usize) []const u8 {
+        if (self.string_views.items.len != 0) return self.string_views.items[g].bytes;
         if (self.fixed_stride == 0) return self.strings.?.get(self.refs.items[g]);
         const s: usize = self.fixed_stride;
         return self.fixed_keys[g * s ..][0..s];
@@ -5314,7 +5321,13 @@ pub const GroupTable = struct {
         const key_len = if (raw_string) (if (present) key.len +| 5 else 1) else key.len;
         const probe = if (raw_string) self.probeString(key, present, hash) else self.probeVariable(key, hash);
         if (probe.id) |id| {
-            self.first.items[id] = @min(self.first.items[id], pos);
+            if (raw_string) {
+                const view = &self.string_views.items[id];
+                if (pos < view.first) {
+                    view.first = pos;
+                    self.first.items[id] = pos;
+                }
+            } else self.first.items[id] = @min(self.first.items[id], pos);
             return id;
         }
         const n = self.groupCount();
@@ -5338,13 +5351,18 @@ pub const GroupTable = struct {
         const cap = if (grow) @max(self.slots.len * 2, 16) else self.slots.len;
         const refs_cap = if (n + 1 > self.refs.capacity) std.ArrayList(u32).growCapacity(n + 1) else self.refs.capacity;
         const first_cap = if (n + 1 > self.first.capacity) std.ArrayList(u64).growCapacity(n + 1) else self.first.capacity;
+        const views_cap = if (raw_string and n + 1 > self.string_views.capacity)
+            std.ArrayList(StringView).growCapacity(n + 1)
+        else
+            self.string_views.capacity;
         const cells = self.accumulators.items.len + if (self.compact.stride == 0) agg_calls.len else 0;
         const acc_cap = if (cells > self.accumulators.capacity)
             std.ArrayList(Accumulator).growCapacity(cells)
         else
             self.accumulators.capacity;
         const projected = @sizeOf(KeyArena) + try self.strings.?.projected(key_len) + cap * @sizeOf(FixedSlot) +
-            refs_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) +
+            refs_cap * @sizeOf(u32) + first_cap * @sizeOf(u64) + views_cap * @sizeOf(StringView) +
+            acc_cap * @sizeOf(Accumulator) +
             (if (self.compact.stride != 0) self.compact.projected(n + 1) else 0) + self.set_objects;
         try self.admit(projected -| self.allocated_bytes);
         // Direct shared tables also fund the transient old/new metadata overlap before a grow. The arena's
@@ -5352,6 +5370,8 @@ pub const GroupTable = struct {
         var overlap: usize = if (grow) self.slots.len * @sizeOf(FixedSlot) else 0;
         if (refs_cap > self.refs.capacity) overlap = @max(overlap, self.refs.capacity * @sizeOf(u32));
         if (first_cap > self.first.capacity) overlap = @max(overlap, self.first.capacity * @sizeOf(u64));
+        if (views_cap > self.string_views.capacity)
+            overlap = @max(overlap, self.string_views.capacity * @sizeOf(StringView));
         if (acc_cap > self.accumulators.capacity)
             overlap = @max(overlap, self.accumulators.capacity * @sizeOf(Accumulator));
         if (self.compact.stride != 0 and self.compact.projected(n + 1) > self.compact.held())
@@ -5377,6 +5397,7 @@ pub const GroupTable = struct {
         }
         try self.refs.ensureTotalCapacity(self.allocator, n + 1);
         try self.first.ensureTotalCapacity(self.allocator, n + 1);
+        if (raw_string) try self.string_views.ensureTotalCapacity(self.allocator, n + 1);
         if (self.compact.stride != 0) try self.compact.reserve(self.allocator, n + 1);
         try self.accumulators.ensureTotalCapacity(self.allocator, cells);
         const ref = if (raw_string) blk: {
@@ -5404,6 +5425,7 @@ pub const GroupTable = struct {
         self.slots[at] = .{ .hash = @truncate(hash), .id = id };
         self.refs.appendAssumeCapacity(ref);
         self.first.appendAssumeCapacity(pos);
+        if (raw_string) self.string_views.appendAssumeCapacity(.{ .bytes = self.strings.?.get(ref), .first = pos });
         if (self.compact.stride != 0) self.compact.append();
         self.discovered(pos);
         return id;
@@ -5418,7 +5440,7 @@ pub const GroupTable = struct {
             const slot = self.slots[i];
             if (slot.id == empty_id) return .{ .id = null, .slot = i };
             if (slot.hash != hash) continue;
-            const stored = self.keyAt(slot.id);
+            const stored = self.string_views.items[slot.id].bytes;
             if (present) {
                 if (stored.len == key.len +| 5 and stored[0] == 1 and keyEql(stored[5..], key))
                     return .{ .id = slot.id, .slot = i };
@@ -5439,7 +5461,8 @@ pub const GroupTable = struct {
     fn variableHeld(self: *const GroupTable) usize {
         return (if (self.strings) |strings| strings.held() + @sizeOf(KeyArena) else 0) + self.slots.len * @sizeOf(FixedSlot) +
             self.refs.capacity * @sizeOf(u32) + self.first.capacity * @sizeOf(u64) +
-            self.accumulators.capacity * @sizeOf(Accumulator) + self.compact.held() + self.set_objects;
+            self.string_views.capacity * @sizeOf(StringView) + self.accumulators.capacity * @sizeOf(Accumulator) +
+            self.compact.held() + self.set_objects;
     }
 
     fn probeVariable(self: *const GroupTable, key: []const u8, full_hash: u64) FixedProbe {

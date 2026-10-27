@@ -7436,10 +7436,15 @@ fn inlineSharedStrings(
     ledger.block = expr_agg.SharedBudget.blockFor(args.max_memory, workers + state.parts.len);
     defer ledger.block = previous_block;
     if (args.taken) |taken| taken.insert(.shared_strings);
+    var decoded = args;
+    // Record callbacks bypass automatic expression slicing. Bound their producer to the same cache-sized window
+    // as the sink, rather than retaining a whole RG's decompressed string pages beside the shared identity.
+    if (decoded.auto_decode_batches and decoded.decode_batch_rows == 0 and decoded.expr_batch_rows != 0)
+        decoded.decode_batch_rows = string_table.batchRows();
     const run = try runRecordWorkers(
         gpa,
         arena,
-        args,
+        decoded,
         metas,
         plan,
         work,

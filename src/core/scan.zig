@@ -6664,9 +6664,9 @@ fn inlinePairAnswer(
     const di = distinct orelse return null;
     const keys = keys_opt orelse &.{};
     const outputs = outputs_opt orelse &.{};
-    // Single-key sets/sketches avoid a speculative pair scan/replay and a second grouping scatter. Keep that
-    // established route automatic; composite identities amortize packing, and .on still exercises single-key owners.
-    if (args.distinct_pairs == .auto and keys.len == 1) return null;
+    // Single-key owners use a checked raw certificate, so dictionary fallback pages cannot force a replay.
+    // String identities keep the existing sets/sketch choice; forced owners still exercise retained dictionaries.
+    const automatic_single = args.distinct_pairs == .auto and keys.len == 1;
     for (outputs) |out| if (out.derived != null) return null;
     const input_rows = RecordOrdinals.rows(metas) orelse return null;
     if (input_rows >= @as(usize, 1) << 31) return null;
@@ -6696,9 +6696,13 @@ fn inlinePairAnswer(
     const workers = @min(requested, owner_groups.max_workers);
     var domain: ?agg_dense.Domain = null;
     defer if (domain) |*d| d.deinit(gpa);
-    if (args.encoded and args.ndv_union)
+    var raw = if (automatic_single) try pairRawIdentity(gpa, arena, metas, axes, args.scan_all) else null;
+    errdefer if (raw) |*p| p.deinit(gpa);
+    if (automatic_single and raw == null) return null;
+    if (raw == null and args.encoded and args.ndv_union)
         domain = try ndv.retainIdentity(gpa, arena, files, metas, axes, workers, args.max_memory, input_rows + 1);
-    var identity = (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
+    var identity = if (raw) |p| p else (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
+    raw = null;
     defer identity.deinit(gpa);
     const top = if (keys_opt != null) countCut(outputs, calls, args.result_order) else null;
     if (identity.fitsBits(u64)) {
@@ -6789,6 +6793,45 @@ fn inlinePairAnswer(
     );
 }
 
+fn pairRawIdentity(gpa: std.mem.Allocator, arena: std.mem.Allocator, metas: []const schema.FileMetaData, axes: []const expr_ast.Expr, scan_all: bool) !?key_pack.Plan {
+    const fields = try arena.alloc(key_pack.RawField, axes.len);
+    for (axes, fields) |axis, *field| {
+        if (axis != .col_ref) return null;
+        const key = axis.col_ref;
+        if (key.physical_type != .INT32 and key.physical_type != .INT64) return null;
+        field.* = .{ .bits = if (key.physical_type == .INT32) 32 else 64, .signed = !key.unsigned_32 and !key.unsigned_64 };
+        if (scan_all) continue;
+        var lo: i128 = std.math.maxInt(i128);
+        var hi: i128 = std.math.minInt(i128);
+        const complete = complete: for (metas) |*meta| {
+            for (meta.row_groups.items) |*rg| {
+                if (rg.num_rows == 0) continue;
+                const bounds = @import("parquet/statistics.zig").chunkStats(rg, key.col_idx, meta, .corroborated).bounds orelse break :complete false;
+                const width: usize = if (key.physical_type == .INT32) 4 else 8;
+                if (bounds.min.len != width or bounds.max.len != width) break :complete false;
+                const low: i128 = if (width == 4)
+                    if (key.unsigned_32) std.mem.readInt(u32, bounds.min[0..4], .little) else std.mem.readInt(i32, bounds.min[0..4], .little)
+                else if (key.unsigned_64) std.mem.readInt(u64, bounds.min[0..8], .little) else std.mem.readInt(i64, bounds.min[0..8], .little);
+                const high: i128 = if (width == 4)
+                    if (key.unsigned_32) std.mem.readInt(u32, bounds.max[0..4], .little) else std.mem.readInt(i32, bounds.max[0..4], .little)
+                else if (key.unsigned_64) std.mem.readInt(u64, bounds.max[0..8], .little) else std.mem.readInt(i64, bounds.max[0..8], .little);
+                lo = @min(lo, low);
+                hi = @max(hi, high);
+            }
+        } else true;
+        if (!complete or lo > hi) continue;
+        var bits: u7 = 1;
+        while (bits < field.bits) : (bits += 1) {
+            const candidate: key_pack.RawField = .{ .bits = bits, .signed = field.signed };
+            _ = candidate.encode(lo) catch continue;
+            _ = candidate.encode(hi) catch continue;
+            field.bits = bits;
+            break;
+        }
+    }
+    return key_pack.Plan.initFields(gpa, axes, null, fields);
+}
+
 fn pairAnswerBits(
     comptime Bits: type,
     comptime top: bool,
@@ -6854,7 +6897,8 @@ fn pairAnswerBits(
     ) orelse return null;
     const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);
     const domain_bytes = if (identity.domain) |d| d.bytes else 0;
-    const scratch = domain_bytes +| identity.retainedBytes() +|
+    const pack_rows = owner_groups.batchRows(null);
+    const scratch = domain_bytes +| identity.retainedBytes() +| workers *| pack_rows *| @sizeOf(Bits) +|
         workers *| (identity.keys.len *| @sizeOf(key_pack.Plan.Binding) +| @sizeOf(P.Sink) +|
             @sizeOf(P.Reducer) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
         work.len *| (@sizeOf(P.Sink.Source) +| @sizeOf(u32));
@@ -6907,6 +6951,7 @@ fn pairAnswerBits(
             .prefix = prefix,
             .sources = sources,
             .bindings = try a.alloc(key_pack.Plan.Binding, identity.keys.len),
+            .pack_buffer = try a.alloc(Bits, pack_rows),
             .refused = &refused,
         };
         sink.* = .{ .selected = .{ .ctx = s, .startFn = P.Sink.startErased, .batchFn = P.Sink.batchErased } };
@@ -25166,7 +25211,10 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
             args.taken = &taken;
             if (c.group != null and (std.mem.eql(u8, c.group.?, "k") or std.mem.eql(u8, c.group.?, "s"))) {
                 args.distinct_pairs = .auto;
-                try testing.expect((try explainAggregate(gpa, a, args)).record_path == null);
+                const auto_path = (try explainAggregate(gpa, a, args)).record_path;
+                if (std.mem.eql(u8, c.group.?, "k")) {
+                    try testing.expectEqual(.pair_distinct, auto_path.?.layout);
+                } else try testing.expect(auto_path == null);
                 var automatic = try runMultiAggregate(gpa, a, args);
                 defer automatic.deinit(gpa);
                 try automatic.output.applyResultOrder(gpa, args.result_order);
@@ -25671,5 +25719,86 @@ test "packed payload top H preserves integer SUM AVG MIN MAX NULL ties and filte
             try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
             try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
         };
+    }
+}
+
+test "raw DISTINCT batch owners preserve NULLs and replay speculative footer range violations" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var k: [2048]i64 = undefined;
+    var x: [2048]i64 = undefined;
+    var kd: [2048]u32 = undefined;
+    var xd: [2048]u32 = undefined;
+    for (&k, &x, &kd, &xd, 0..) |*key, *value, *dk, *dx, i| {
+        key.* = (1 << 40) + @as(i64, @intCast(i % 33));
+        value.* = @intCast(i % 95);
+        dk.* = @intFromBool(i % 17 != 0);
+        dx.* = @intFromBool(i % 11 != 0);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i64 = .{ .values = &k, .def_levels = &kd, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = &x, .def_levels = &xd, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
+    };
+    var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 16);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= @intCast(rgs.len);
+    for ([_][]const u8{ "count(DISTINCT x) AS d", "count(DISTINCT x) AS d,count(*) AS c" }) |calls| {
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "raw-distinct", .bytes = sink.buffer.items }},
+            .metas = &.{meta},
+            .aggregate = calls,
+            .group_by = "k",
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .max_memory = 512 << 20,
+            .integer_records = false,
+            .integer_records_min_rows = 0,
+            .distinct_pairs = .off,
+            .ndv_union = false,
+            .trust_stats = false,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        for ([_]bool{ false, true }) |poison| {
+            var footer = meta;
+            const groups = try a.dupe(schema.RowGroup, meta.row_groups.items);
+            footer.row_groups.items = groups;
+            var zero: [8]u8 = @splat(0);
+            if (poison) for (groups) |*rg| {
+                rg.columns.items = try a.dupe(schema.ColumnChunk, rg.columns.items);
+                var st = &rg.columns.items[0].meta_data.?.statistics.?;
+                st.min_value = &zero;
+                st.max_value = &zero;
+                st.min = &zero;
+                st.max = &zero;
+            };
+            args.metas = &.{footer};
+            args.integer_records = true;
+            args.distinct_pairs = .auto;
+            for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+                args.parallelism = j;
+                args.decode_batch_rows = window;
+                var taken: std.EnumSet(FastPath) = .{};
+                args.taken = &taken;
+                const ex = try explainAggregate(gpa, a, args);
+                try testing.expectEqual(.pair_distinct, ex.record_path.?.layout);
+                if (poison) {
+                    try testing.expectError(error.ExceededMemoryBudget, prepareAggregate(gpa, a, args, false));
+                    try testing.expect(taken.contains(.integer_records));
+                }
+                var got = try runMultiAggregate(gpa, a, args);
+                defer got.deinit(gpa);
+                try got.output.applyResultOrder(gpa, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            };
+        }
     }
 }

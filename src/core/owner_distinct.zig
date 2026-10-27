@@ -46,6 +46,7 @@ pub fn Pipeline(comptime Bits: type) type {
             prefix: Prefix,
             sources: []const Source,
             bindings: []Plan.Binding,
+            pack_buffer: []Bits = &.{},
             item: ?usize = null,
             input_base: u64 = 0,
             refused: *std.atomic.Value(bool),
@@ -88,7 +89,26 @@ pub fn Pipeline(comptime Bits: type) type {
                     }
                 };
                 var callback: Callback = .{ .sink = s, .nulls = bound.bindings[bound.bindings.len - 1].col };
-                try bound.forEachSelected(Bits, &callback, Callback.append);
+                if (s.pack_buffer.len == 0) {
+                    try bound.forEachSelected(Bits, &callback, Callback.append);
+                } else {
+                    var start: usize = 0;
+                    while (start < source.batch.num_rows) {
+                        const n = @min(s.pack_buffer.len, source.batch.num_rows - start);
+                        const images = s.pack_buffer[0..n];
+                        bound.packWindow(Bits, start, images) catch |err| {
+                            if (err != error.BadKey and err != error.KeyTooWide) return err;
+                            s.refused.store(true, .monotonic);
+                            return error.ExceededMemoryBudget;
+                        };
+                        for (images, 0..) |pair, i| {
+                            const row = start + i;
+                            if (source.selected) |selected| if (!selected.isActive(row)) continue;
+                            try callback.append(row, pair, try source.ordinal(row));
+                        }
+                        start += n;
+                    }
+                }
             }
         };
 

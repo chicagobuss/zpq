@@ -22,10 +22,16 @@ pub const Plan = struct {
     domain: ?*const dense.Domain,
 
     pub fn init(gpa: std.mem.Allocator, keys: []const ast.Expr, domain: ?*const dense.Domain) !?Plan {
+        return initFields(gpa, keys, domain, null);
+    }
+
+    /// Narrow fields are speculative geometry, never NDV evidence. Every decoded value is range-checked.
+    pub fn initFields(gpa: std.mem.Allocator, keys: []const ast.Expr, domain: ?*const dense.Domain, proposed: ?[]const arithmetic.RawField) !?Plan {
+        if (proposed) |fields| if (fields.len != keys.len) return null;
         if (keys.len == 0) return null;
         var raw = true;
         var raw_bits: usize = 0;
-        for (keys) |key| {
+        for (keys, 0..) |key, ki| {
             if (key != .col_ref) return null;
             const ref = key.col_ref;
             if (ref.expr_type == .str and (ref.physical_type == .BYTE_ARRAY or
@@ -34,7 +40,10 @@ pub const Plan = struct {
                 raw = false;
             } else if (ref.expr_type != .i64 or (ref.physical_type != .INT32 and ref.physical_type != .INT64))
                 return null;
-            raw_bits +|= if (ref.physical_type == .INT32) @as(usize, 33) else 65;
+            const physical: usize = if (ref.physical_type == .INT32) 32 else 64;
+            const bits: usize = if (proposed) |fields| fields[ki].bits else physical;
+            if (bits == 0 or bits > physical) return null;
+            raw_bits +|= bits + 1;
         }
         if (!raw and domain == null) return null;
         if (domain) |d| if (d.axes.len != keys.len) return null;
@@ -52,10 +61,9 @@ pub const Plan = struct {
         for (keys, refs) |key, *ref| ref.* = key.col_ref;
         const fields = try gpa.alloc(arithmetic.RawField, if (raw) keys.len else 0);
         errdefer gpa.free(fields);
-        for (fields, refs[0..fields.len]) |*field, ref| field.* = .{
-            .bits = if (ref.physical_type == .INT32) 32 else 64,
-            .signed = !ref.unsigned_32 and !ref.unsigned_64,
-        };
+        for (fields, refs[0..fields.len], 0..) |*field, ref, ki| {
+            field.* = .{ .bits = if (proposed) |narrow| narrow[ki].bits else if (ref.physical_type == .INT32) @as(u7, 32) else 64, .signed = !ref.unsigned_32 and !ref.unsigned_64 };
+        }
         const radices = try gpa.alloc(u64, if (domain != null) keys.len else 0);
         errdefer gpa.free(radices);
         if (domain) |d| for (radices, d.axes) |*radix, *axis| {
@@ -239,6 +247,77 @@ pub const Plan = struct {
                     const bits = if (dictionary) try b.dictionaryAs(Bits, row) else try b.rawAs(Bits, row);
                     try consume(context, row, bits, try b.source.ordinal(row));
                 }
+            }
+        }
+
+        pub fn packWindow(b: Bound, comptime Bits: type, start: usize, output: []Bits) !void {
+            if (!b.plan.fitsBits(Bits) or start > b.source.batch.num_rows or
+                output.len > b.source.batch.num_rows - start) return error.BadColumn;
+            @memset(output, 0);
+            var stride: Bits = 1;
+            var shift: usize = 0;
+            for (b.bindings, 0..) |binding, axis| {
+                const ni = binding.col.nullInfo();
+                if (b.plan.encoding.source == .dictionary) {
+                    const codes = binding.col.codes() orelse return error.BadColumn;
+                    if (ni.def_levels != null) {
+                        try b.packDictionary(Bits, start, output, binding, codes, stride, true);
+                    } else try b.packDictionary(Bits, start, output, binding, codes, stride, false);
+                    if (axis + 1 < b.bindings.len) stride *= @intCast(b.plan.radices[axis]);
+                } else {
+                    const key = b.plan.keys[axis];
+                    const field = b.plan.fields[axis];
+                    switch (binding.col) {
+                        inline .i32, .i64 => |c| {
+                            if (c.codes != null) {
+                                if (ni.def_levels != null)
+                                    try b.packRawColumn(Bits, start, output, c, key, field, shift, true, true)
+                                else
+                                    try b.packRawColumn(Bits, start, output, c, key, field, shift, true, false);
+                            } else if (ni.def_levels != null)
+                                try b.packRawColumn(Bits, start, output, c, key, field, shift, false, true)
+                            else
+                                try b.packRawColumn(Bits, start, output, c, key, field, shift, false, false);
+                        },
+                        else => return error.BadColumn,
+                    }
+                    shift += field.bits + 1;
+                }
+            }
+        }
+
+        inline fn active(b: Bound, row: usize) bool {
+            return if (b.source.selected) |selected| selected.isActive(row) else true;
+        }
+
+        fn packDictionary(b: Bound, comptime Bits: type, start: usize, output: []Bits, binding: Binding, codes: []const u32, stride: Bits, comptime nullable: bool) !void {
+            const ni = binding.col.nullInfo();
+            for (output, 0..) |*bits, i| {
+                const row = start + i;
+                if (!b.active(row)) continue;
+                const null_value = nullable and ni.def_levels.?[row] < ni.max_def;
+                const code = if (null_value) binding.translation.len - 1 else codes[row];
+                if (!null_value and code >= binding.translation.len - 1) return error.BadColumn;
+                bits.* += @as(Bits, @intCast(binding.translation[code])) * stride;
+            }
+        }
+
+        fn packRawColumn(b: Bound, comptime Bits: type, start: usize, output: []Bits, c: anytype, key: ast.ColRef, field: arithmetic.RawField, shift: usize, comptime coded: bool, comptime nullable: bool) !void {
+            const values = if (coded) c.dict else c.values;
+            for (output, 0..) |*bits, i| {
+                const row = start + i;
+                if (!b.active(row)) continue;
+                const value: ?i128 = if (nullable and c.def_levels.?[row] < c.max_def) null else value: {
+                    const at = if (coded) c.codes.?[row] else row;
+                    if (at >= values.len) return error.BadColumn;
+                    const v = values[at];
+                    if (@TypeOf(v) == i64 and key.unsigned_32 and
+                        (v < 0 or v > std.math.maxInt(u32))) return error.BadColumn;
+                    break :value if (key.unsigned_32)
+                        @as(u32, @truncate(@as(u64, @bitCast(@as(i64, v)))))
+                    else if (key.unsigned_64) @as(u64, @bitCast(@as(i64, v))) else v;
+                };
+                bits.* |= try field.encodeAs(Bits, value) << @as(std.math.Log2Int(Bits), @intCast(shift));
             }
         }
 
@@ -733,4 +812,38 @@ test "key plan dictionary products wider than u64 bind and unpack without machin
     try testing.expectEqual(@as(u128, 37252902984619140624), nulls.packed_u128);
     try plan.unpack(nulls, &output);
     for (output) |value| try testing.expectEqualDeep(dense.Domain.KeyValue.null_val, value);
+}
+
+test "key plan columnar windows match scalar raw packing and reject selected range violations" {
+    const a = testing.allocator;
+    const keys = [_]ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } },
+    };
+    var plan = (try Plan.initFields(a, &keys, null, &.{
+        .{ .bits = 8, .signed = true }, .{ .bits = 4, .signed = true },
+    })).?;
+    defer plan.deinit(a);
+    var values = [_]i64{ -127, 999, 7, 999, 0 };
+    const cols = [_]eval.Batch.Column{
+        .{ .i64 = .{ .values = &values, .def_levels = &.{ 1, 1, 1, 0, 1 }, .max_def = 1 } },
+        .{ .i64 = .{ .values = &.{}, .dict = &.{ -2, 3 }, .codes = &.{ 0, 999, 1, 999, 0 }, .def_levels = &.{ 1, 1, 1, 0, 1 }, .max_def = 1 } },
+    };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = 5 };
+    var mask = [_]u64{0b11101};
+    const selection: @import("../filter/selection.zig").SelectionVector = .{
+        .allocator = a,
+        .len = 5,
+        .mask = &mask,
+    };
+    var bindings: [2]Plan.Binding = undefined;
+    const bound = (try plan.bindInto(&bindings, .{ .batch = &batch, .selected = &selection }, &.{ 0, 1 }, 0, 0)).?;
+    var images: [5]u64 = undefined;
+    try bound.packWindow(u64, 0, &images);
+    for ([_]usize{ 0, 2, 3, 4 }) |i| try testing.expectEqual(try bound.packAs(u64, i), images[i]);
+    var tail: [3]u64 = undefined;
+    try bound.packWindow(u64, 2, &tail);
+    try testing.expectEqualSlices(u64, images[2..], &tail);
+    values[4] = 128;
+    try testing.expectError(error.BadKey, bound.packWindow(u64, 0, &images));
 }

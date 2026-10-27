@@ -536,6 +536,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             prefix: []u32 = &.{},
             starts: []usize = &.{},
             counts: []usize = &.{},
+            /// The full answer's fold claims partitions largest first, so the hottest owner starts at time zero.
+            fold_order: []u32 = &.{},
             partition_ns: u64 = 0,
             order_ns: u64 = 0,
             // Top-H: each worker's best groups among the partitions it completed.
@@ -757,6 +759,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 a.free(s.prefix);
                 a.free(s.starts);
                 a.free(s.counts);
+                a.free(s.fold_order);
                 if (s.ledger) |l| l.release(s.charged);
                 a.destroy(s);
             }
@@ -784,8 +787,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         .fold => t.s.parts,
                     };
                     while (true) {
-                        const p = t.cursor.fetchAdd(1, .monotonic);
-                        if (p >= end) return;
+                        const claim = t.cursor.fetchAdd(1, .monotonic);
+                        if (claim >= end) return;
+                        const p = if (t.pass == .fold and t.s.fold_order.len != 0) t.s.fold_order[claim] else claim;
                         (switch (t.pass) {
                             .fold => if (kind == .full) t.foldFull(p) else if (kind == .sum_top and codec == .int64)
                                 if (t.s.distinct_top) t.foldDistinct(p) else t.foldTop(p)
@@ -1140,6 +1144,15 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         for (s.locals) |l| at += l.records.histogram[p];
                     }
                     s.starts[s.parts] = at;
+                    s.fold_order = try s.gpa.alloc(u32, s.parts);
+                    for (s.fold_order, 0..) |*o, p| o.* = @intCast(p);
+                    std.mem.sort(u32, s.fold_order, s.starts, struct {
+                        fn larger(starts: []const usize, x: u32, y: u32) bool {
+                            const nx = starts[x + 1] - starts[x];
+                            const ny = starts[y + 1] - starts[y];
+                            return if (nx != ny) nx > ny else x < y;
+                        }
+                    }.larger);
                     s.groups = try s.gpa.alloc(Group, s.rows);
                     s.winners = try s.gpa.alloc(u32, s.rows);
                     @memset(s.winners, 0);

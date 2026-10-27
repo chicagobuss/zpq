@@ -99,4 +99,7 @@ test "owner shared storage charge includes both worst-case scatters and never di
     try std.testing.expectEqual(full.peak, sparse.peak);
     try std.testing.expect(full.records < wide.records and full.work < wide.work);
     try std.testing.expectEqual(null, quoteStorage(u128, kinds, u32, 4096, 4096, 1, 0, 64, true));
+    const large = quoteStorage(u64, kinds, u32, 30_000_000, 30_000_000, 16, 0, null, true).?;
+    const large_wide = quote(u64, kinds, u32, 30_000_000, 30_000_000, 16, 0, null).?;
+    try std.testing.expect(large.records < large_wide.records);
 }

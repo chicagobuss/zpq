@@ -16,7 +16,9 @@ pub fn Owner(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime O
 /// DISTINCT pairs specialize the identity policy and partition hash, retaining this same producer/fold machinery.
 pub fn Framework(comptime L: type, comptime Ordinal: type, comptime partitionHash: anytype) type {
     const Scatter = records.Writer(L.Record, Ordinal);
-    const Small = records.Writer(lanes.SharedRecord, Ordinal);
+    // Equal row capacity also shrinks each reserved producer/partition tail; equal byte-size blocks would
+    // erase the payload saving at high partition counts before any input was decoded.
+    const Small = records.WriterRows(lanes.SharedRecord, Ordinal, Scatter.block_rows);
     const small_eligible = if (@hasDecl(L, "sharedEligible")) L.sharedEligible else false;
     const Cache = cache.Local(L.CachePolicy);
     const Fold = @import("owner_fold.zig").Table(L);

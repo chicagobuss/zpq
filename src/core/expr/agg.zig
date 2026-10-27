@@ -195,11 +195,12 @@ fn fit38(v: i192) expr_eval.Error!i128 {
 }
 
 pub const NUM_PARTS: usize = 64;
+pub const NUMERIC_PARTS: usize = 16;
 
 /// A value's partition, from the middle of its hash: each partition's map takes its fingerprint from the top bits and
 /// its slot from the low ones, and fixing either inside a partition would make its probes collide more.
-inline fn partOf(h: u64) usize {
-    return @intCast((h >> 32) % NUM_PARTS);
+inline fn partOf(h: u64, parts: usize) usize {
+    return @intCast((h >> 32) & (parts - 1));
 }
 
 pub const INLINE_CAP: usize = 2;
@@ -279,13 +280,19 @@ pub const DistinctSet = struct {
     string_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn initPartitions(self: *DistinctSet, allocator: std.mem.Allocator, budget: ?*SharedBudget) !void {
-        const p = try allocator.alloc(DistinctSet, NUM_PARTS);
-        for (p) |*part| {
-            part.* = .{ .shared = budget };
-        }
+        return self.initPartitionCount(allocator, budget, NUMERIC_PARTS);
+    }
+
+    pub fn initStringPartitions(self: *DistinctSet, allocator: std.mem.Allocator, budget: ?*SharedBudget) !void {
+        return self.initPartitionCount(allocator, budget, NUM_PARTS);
+    }
+
+    fn initPartitionCount(self: *DistinctSet, allocator: std.mem.Allocator, budget: ?*SharedBudget, n: usize) !void {
+        const p = try allocator.alloc(DistinctSet, n);
+        for (p) |*part| part.* = .{ .shared = budget };
         self.parts = p;
         self.shared = budget;
-        try self.charge(NUM_PARTS * @sizeOf(DistinctSet));
+        try self.charge(n * @sizeOf(DistinctSet));
     }
 
     /// Count `bytes` this set holds outside its values (the set object itself, a partition array) against its budget.
@@ -425,7 +432,7 @@ pub const DistinctSet = struct {
     fn reserveFor(self: *DistinctSet, allocator: std.mem.Allocator, kind: ValKind, extra: usize) !void {
         if (extra <= INLINE_CAP) return;
         if (self.parts) |parts| {
-            const share = extra / NUM_PARTS + extra / (4 * NUM_PARTS) + 16;
+            const share = extra / parts.len + extra / (4 * parts.len) + 16;
             for (parts) |*p| try p.reserveFor(allocator, kind, share);
             return;
         }
@@ -460,7 +467,7 @@ pub const DistinctSet = struct {
     pub fn insertU64(self: *DistinctSet, allocator: std.mem.Allocator, v: u64) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
-            const p = partOf(h);
+            const p = partOf(h, parts.len);
             return parts[p].insertU64(allocator, v);
         }
         switch (self.val_set) {
@@ -616,7 +623,7 @@ pub const DistinctSet = struct {
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
         if (self.parts) |parts| {
             const h = std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
-            const p = partOf(h);
+            const p = partOf(h, parts.len);
             return parts[p].insertI128(allocator, v);
         }
         switch (self.val_set) {
@@ -685,7 +692,7 @@ pub const DistinctSet = struct {
     }
 
     fn insertBytesHashed(self: *DistinctSet, allocator: std.mem.Allocator, v: []const u8, h: u64) !void {
-        if (self.parts) |parts| return parts[partOf(h)].insertBytesHashed(allocator, v, h);
+        if (self.parts) |parts| return parts[partOf(h, parts.len)].insertBytesHashed(allocator, v, h);
         switch (self.val_set) {
             .none => {
                 const entry_size = 48 + v.len;
@@ -793,9 +800,9 @@ pub const DistinctSet = struct {
         if (other.mapKind()) |kind| try self.reserveFor(allocator, kind, other.count());
         if (self.parts) |parts| {
             if (other.parts) |oparts| {
-                for (parts, oparts) |*p, op| {
-                    try p.merge(&op, allocator);
-                }
+                if (parts.len == oparts.len) {
+                    for (parts, oparts) |*p, op| try p.merge(&op, allocator);
+                } else for (oparts) |*op| try self.merge(op, allocator);
                 return;
             }
             if (other.val_set != .none) {
@@ -7761,7 +7768,7 @@ test "regression: a count(DISTINCT) merge sizes its tables for the result, so no
         var counting = std.testing.FailingAllocator.init(gpa, .{});
         try dest.merge(&other, counting.allocator());
         try std.testing.expectEqual(@as(usize, n) + before - (own + 1) / 2, dest.count());
-        const tables: usize = if (dest_shape == .partitioned) NUM_PARTS else 1;
+        const tables: usize = if (dest_shape == .partitioned) NUMERIC_PARTS else 1;
         std.testing.expect(counting.allocations <= tables) catch |err| {
             std.debug.print("{s} {s} other_parted={}: {d} allocations\n", .{ @typeName(T), @tagName(dest_shape), other_parted, counting.allocations });
             return err;
@@ -8271,4 +8278,37 @@ test "a riding census drops on every worker's merged cells, not on one worker's 
     own[1] = 40;
     try alone.judge(&own);
     try std.testing.expect(dropped.load(.monotonic));
+}
+
+test "distinct admission numeric fanout preserves bitmap promotion" {
+    const a = testing.allocator;
+    var budget: SharedBudget = .{ .limit = 64 << 20 };
+    {
+        var set: DistinctSet = .{};
+        defer set.deinit(a);
+        try set.initPartitions(a, &budget);
+        try testing.expectEqual(@as(usize, 16), set.parts.?.len);
+        for (0..65536) |i| try set.insertU64(a, (i * 97) % 100000);
+        try testing.expectEqual(@as(usize, 65536), set.count());
+        for (set.parts.?) |part| try testing.expect(part.val_set == .bitmap);
+    }
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "distinct admission string fanout stays wide and merges across fanouts" {
+    const a = testing.allocator;
+    var narrow: DistinctSet = .{};
+    defer narrow.deinit(a);
+    try narrow.initPartitions(a, null);
+    var wide: DistinctSet = .{};
+    defer wide.deinit(a);
+    try wide.initStringPartitions(a, null);
+    try testing.expectEqual(@as(usize, 64), wide.parts.?.len);
+    try narrow.insertBytes(a, "");
+    try wide.insertBytes(a, "long shared string");
+    try wide.insertBytes(a, "");
+    try narrow.merge(&wide, a);
+    try testing.expectEqual(@as(usize, 2), narrow.count());
+    try wide.merge(&narrow, a);
+    try testing.expectEqual(@as(usize, 2), wide.count());
 }

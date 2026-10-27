@@ -4909,10 +4909,13 @@ fn prepareAggregateWithMetas(
         n_workers + if (part_on) partagg.n_parts else @as(usize, 0),
     );
     for (work_items.items) |item| {
-        for (item.accumulators) |*acc| {
+        for (item.accumulators, 0..) |*acc, ai| {
             if (acc.* == .distinct) if (acc.distinct.heap()) |ds| {
                 if (group_by_keys == null and n_workers > 1) {
-                    try ds.initPartitions(gpa, group_budget);
+                    if (agg_calls[item.agg_start + ai].arg.?.typeOf() == .str)
+                        try ds.initStringPartitions(gpa, group_budget)
+                    else
+                        try ds.initPartitions(gpa, group_budget);
                 } else {
                     ds.shared = group_budget;
                 }
@@ -5352,7 +5355,10 @@ fn prepareAggregateWithMetas(
         ds.* = .{};
         acc.* = .{ .distinct = .fromSet(ds) };
         if (group_by_keys == null and n_workers > 1) {
-            try ds.initPartitions(gpa, group_budget);
+            if (call.arg.?.typeOf() == .str)
+                try ds.initStringPartitions(gpa, group_budget)
+            else
+                try ds.initPartitions(gpa, group_budget);
         } else {
             ds.shared = group_budget;
         }
@@ -5685,7 +5691,7 @@ fn prepareAggregateWithMetas(
             const dst_acc = &accumulators[ci];
             const dst_ds = dst_acc.distinct.heap() orelse continue;
             if (dst_ds.parts) |dst_parts| {
-                const n_threads = @min(n_workers, expr_agg.NUM_PARTS);
+                const n_threads = @min(n_workers, dst_parts.len);
                 const tasks = try arena.alloc(DistinctMergeTask, n_threads);
                 var cursor = std.atomic.Value(usize).init(0);
                 for (tasks) |*task| task.* = .{
@@ -13135,7 +13141,7 @@ test "DistinctMergeTask: partitioned distinct sets merge and handle allocation f
             try src2.initPartitions(gpa, null);
             for ([_]u64{ 2, 3, 4, 200, 400 }) |v| try src2.insertU64(gpa, v);
 
-            for (0..expr_agg.NUM_PARTS) |p| {
+            for (0..dst.parts.?.len) |p| {
                 try mergeDistinctPart(&dst.parts.?[p], &src1.parts.?[p], gpa);
                 try mergeDistinctPart(&dst.parts.?[p], &src2.parts.?[p], gpa);
             }

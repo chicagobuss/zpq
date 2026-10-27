@@ -21,6 +21,23 @@ pub const Counts = struct {
 
 pub const Artifact = struct { name: []const u8, sha256: []const u8 };
 
+/// CPU features a unit test can need to test anything at all.
+pub const CpuFeature = enum {
+    /// AVX-512 F, BW, VL, VBMI and VBMI2, with the OS saving ZMM state: vendor/zstd/zpq/huf4x_avx512.c's own check.
+    avx512vbmi2,
+};
+
+/// Unit tests that skip on a CPU without a feature, by name prefix, declared here rather than by the run or the test.
+/// The verdict accepts such a skip only when the receipt records its host lacking the feature, and reports it apart
+/// from the passes; the same skip on a host with the feature, or one whose features went unrecorded, fails.
+pub const hardware_skips = [_]struct { prefix: []const u8, needs: CpuFeature }{
+    .{ .prefix = "core.parquet.compression.test.the AVX-512 Huffman encoder writes ", .needs = .avx512vbmi2 },
+    .{
+        .prefix = "core.parquet.compression.test.zstd frames are the same bytes with the AVX-512 ",
+        .needs = .avx512vbmi2,
+    },
+};
+
 pub const Header = struct {
     sha: []const u8,
     tree_clean: bool,
@@ -31,6 +48,9 @@ pub const Header = struct {
     artifacts: []const Artifact,
     cases_sha256: []const u8,
     fixtures: []const u8,
+    /// The `CpuFeature`s this host lacks, read at run time (a fleet bundle targets a baseline CPU, so `builtin.cpu`
+    /// is not the host's); null when unread, which accepts no hardware skip.
+    cpu_lacks: ?[]const CpuFeature = null,
 };
 
 pub const Receipt = struct {
@@ -108,30 +128,58 @@ fn scan(line: []const u8, prefix: []const u8, suffix: []const u8) ?u64 {
 /// Null when the receipt is evidence of a pass for `sha`, else why not. A receipt is never trusted on its own word:
 /// the log must still hash to what it recorded, and the counts are judged again here.
 pub fn judge(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, sha: []const u8) !?[]const u8 {
+    return (try assess(arena, io, dir, name, sha)).why;
+}
+
+/// `why` as `judge`; `note` names a pass's hardware skips, which a tier reports apart from its passes.
+pub const Assessment = struct { why: ?[]const u8 = null, note: ?[]const u8 = null };
+
+pub fn assess(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, sha: []const u8) !Assessment {
     const path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ dir, name });
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch return "no receipt";
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch return .{ .why = "no receipt" };
     const r = std.json.parseFromSliceLeaky(Receipt, arena, text, .{ .ignore_unknown_fields = true }) catch
-        return "unreadable receipt";
-    if (r.version != 1) return "unknown receipt version";
-    if (!std.mem.eql(u8, r.stage, name)) return "receipt for another stage";
-    if (!std.mem.eql(u8, r.header.sha, sha)) return try std.fmt.allocPrint(arena, "receipt is for {s}", .{r.header.sha});
-    if (!r.header.tree_clean) return "unofficial: run from a dirty tree";
+        return .{ .why = "unreadable receipt" };
+    if (r.version != 1) return .{ .why = "unknown receipt version" };
+    if (!std.mem.eql(u8, r.stage, name)) return .{ .why = "receipt for another stage" };
+    if (!std.mem.eql(u8, r.header.sha, sha)) return .{ .why = try std.fmt.allocPrint(arena, "receipt is for {s}", .{r.header.sha}) };
+    if (!r.header.tree_clean) return .{ .why = "unofficial: run from a dirty tree" };
     const log_path = try std.fmt.allocPrint(arena, "{s}/{s}.log", .{ dir, name });
-    const log_sha = oracle_mod.fileSha(arena, io, log_path) catch return "no log";
-    if (!std.mem.eql(u8, &log_sha, r.log_sha256)) return "log differs from the one the receipt hashed";
-    if (r.timed_out) return try std.fmt.allocPrint(arena, "timed out after {d:.0}s", .{r.seconds});
-    if (r.rc != 0) return try std.fmt.allocPrint(arena, "exit {d}", .{r.rc});
+    const log_sha = oracle_mod.fileSha(arena, io, log_path) catch return .{ .why = "no log" };
+    if (!std.mem.eql(u8, &log_sha, r.log_sha256)) return .{ .why = "log differs from the one the receipt hashed" };
+    if (r.timed_out) return .{ .why = try std.fmt.allocPrint(arena, "timed out after {d:.0}s", .{r.seconds}) };
+    if (r.rc != 0) return .{ .why = try std.fmt.allocPrint(arena, "exit {d}", .{r.rc}) };
     const c = r.counts;
-    if (c.total == 0) return "ran nothing";
-    if (c.failed != 0 or c.passed + c.skipped != c.total) return try std.fmt.allocPrint(arena, "{d} of {d} failed", .{ c.total - c.passed, c.total });
-    if (c.skipped != c.skips.len) return try std.fmt.allocPrint(arena, "{d} skipped, {d} by name", .{ c.skipped, c.skips.len });
+    if (c.total == 0) return .{ .why = "ran nothing" };
+    if (c.failed != 0 or c.passed + c.skipped != c.total) return .{ .why = try std.fmt.allocPrint(arena, "{d} of {d} failed", .{ c.total - c.passed, c.total }) };
+    if (c.skipped != c.skips.len) return .{ .why = try std.fmt.allocPrint(arena, "{d} skipped, {d} by name", .{ c.skipped, c.skips.len }) };
+    var by_hardware: usize = 0;
+    var lacking = std.EnumSet(CpuFeature).empty;
     for (c.skips) |skip| {
+        // Hardware first, so a run's --allow-skip cannot excuse a hardware skip on a host that has the feature.
+        if (for (hardware_skips) |h| {
+            if (std.mem.startsWith(u8, skip, h.prefix)) break h.needs;
+        } else null) |need| {
+            const lacks = r.header.cpu_lacks orelse
+                return .{ .why = try std.fmt.allocPrint(arena, "{s} skipped; the host's CPU is unrecorded", .{skip}) };
+            if (std.mem.indexOfScalar(CpuFeature, lacks, need) == null)
+                return .{ .why = try std.fmt.allocPrint(arena, "{s} skipped on a host with {t}", .{ skip, need }) };
+            by_hardware += 1;
+            lacking.insert(need);
+            continue;
+        }
         const allowed = for (r.allowed_skips) |prefix| {
             if (std.mem.startsWith(u8, skip, prefix)) break true;
         } else false;
-        if (!allowed) return try std.fmt.allocPrint(arena, "{d} skipped (first not allowed: {s})", .{ c.skipped, skip });
+        if (!allowed) return .{ .why = try std.fmt.allocPrint(arena, "{d} skipped (first not allowed: {s})", .{
+            c.skipped, skip,
+        }) };
     }
-    return null;
+    if (by_hardware == 0) return .{};
+    var note: std.ArrayList(u8) = .empty;
+    try note.print(arena, "{d} skipped on {s}, which lacks", .{ by_hardware, r.header.host });
+    var it = lacking.iterator();
+    while (it.next()) |f| try note.print(arena, " {t}", .{f});
+    return .{ .note = note.items };
 }
 
 /// `zpq-check verdict --dir DIR --expect a,b,c [--sha SHA]`: every expected stage judged; exit 1 on any failure.
@@ -148,15 +196,22 @@ pub fn verdictMain(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
     }
     const want = sha orelse (try gitHead(arena, io)) orelse return error.NoSha;
     var failed: usize = 0;
+    var noted: usize = 0;
     var n: usize = 0;
     var it = std.mem.tokenizeScalar(u8, expect orelse return error.BadArgs, ',');
     while (it.next()) |name| : (n += 1) {
-        if (try judge(arena, io, dir orelse return error.BadArgs, name, want)) |why| {
+        const v = try assess(arena, io, dir orelse return error.BadArgs, name, want);
+        if (v.why) |why| {
             failed += 1;
             std.debug.print("FAIL {s}: {s}\n", .{ name, why });
+        } else if (v.note) |note| {
+            noted += 1;
+            std.debug.print("PASS {s} (hardware: {s})\n", .{ name, note });
         } else std.debug.print("PASS {s}\n", .{name});
     }
-    std.debug.print("verdict: {s} ({d} stages, {d} failed) for {s}\n", .{ if (failed == 0 and n != 0) "pass" else "fail", n, failed, want });
+    const hw = if (noted == 0) "" else try std.fmt.allocPrint(arena, ", {d} with hardware skips", .{noted});
+    const result = if (failed == 0 and n != 0) "pass" else "fail";
+    std.debug.print("verdict: {s} ({d} stages, {d} failed{s}) for {s}\n", .{ result, n, failed, hw, want });
     return if (failed == 0 and n != 0) 0 else 1;
 }
 
@@ -245,8 +300,9 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
     };
     const json_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ out_dir, stage_name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = try std.json.Stringify.valueAlloc(arena, receipt, .{ .whitespace = .indent_2 }) });
-    const verdict = try judge(arena, io, out_dir, stage_name, receipt.header.sha);
-    std.debug.print("{s}: {s} ({d:.0}s; {s})\n", .{ stage_name, if (verdict == null) "pass" else "FAIL", seconds, verdict orelse "ok" });
+    const v = try assess(arena, io, out_dir, stage_name, receipt.header.sha);
+    const verdict = v.why;
+    std.debug.print("{s}: {s} ({d:.0}s; {s})\n", .{ stage_name, if (verdict == null) "pass" else "FAIL", seconds, verdict orelse v.note orelse "ok" });
     if (verdict != null) std.debug.print("{s}\n", .{log[log.len -| 3000..]});
     return 0;
 }
@@ -316,6 +372,22 @@ fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, arti
             run(arena, io, &.{ "git", "-C", "data/parquet-testing", "rev-parse", "HEAD" }) orelse "absent",
             run(arena, io, &.{ "sh", "-c", "cd data && ls -l --time-style=+ *.parquet 2>/dev/null | awk '{print $6\"=\"$5}' | tr '\\n' ' '" }) orelse "",
         }),
+        .cpu_lacks = cpuLacks(arena, io),
+    };
+}
+
+fn cpuLacks(arena: Allocator, io: std.Io) ?[]const CpuFeature {
+    const host = std.zig.system.resolveTargetQuery(io, .{}) catch return null;
+    var lacks: std.ArrayList(CpuFeature) = .empty;
+    for (std.enums.values(CpuFeature)) |f| if (!cpuHas(host.cpu, f)) lacks.append(arena, f) catch return null;
+    return lacks.items;
+}
+
+fn cpuHas(cpu: std.Target.Cpu, f: CpuFeature) bool {
+    return switch (f) {
+        .avx512vbmi2 => cpu.arch == .x86_64 and std.Target.x86.featureSetHasAll(cpu.features, .{
+            .avx512f, .avx512bw, .avx512vl, .avx512vbmi, .avx512vbmi2,
+        }),
     };
 }
 
@@ -379,6 +451,28 @@ test "a receipt passes only as evidence of a clean, complete, skip-free run of t
     platform.allowed_skips = &.{"io.uring."};
     try writeReceipt(io, a, dir, platform, "All 3 tests passed.\n");
     try testing.expect(try judge(a, io, dir, "s", sha) != null);
+    // A hardware skip passes, reported, only where the receipt records the host lacking the feature it needs.
+    const huf = hardware_skips[0].prefix ++ "zstd's bytes";
+    var hw = good;
+    hw.counts = .{ .total = 3, .passed = 2, .skipped = 1, .skips = &.{huf} };
+    hw.header.cpu_lacks = &.{.avx512vbmi2};
+    try writeReceipt(io, a, dir, hw, "All 3 tests passed.\n");
+    const noted = try assess(a, io, dir, "s", sha);
+    try testing.expect(noted.why == null);
+    try testing.expectEqualStrings("1 skipped on h, which lacks avx512vbmi2", noted.note.?);
+    try testing.expect((try assess(a, io, dir, "s", sha)).note != null);
+    for ([_]?[]const CpuFeature{ &.{}, null }) |lacks| {
+        hw.header.cpu_lacks = lacks;
+        hw.allowed_skips = &.{"core.parquet."}; // a run's own allowance does not excuse it on a capable host
+        try writeReceipt(io, a, dir, hw, "All 3 tests passed.\n");
+        try testing.expect(try judge(a, io, dir, "s", sha) != null);
+    }
+    hw.header.cpu_lacks = &.{.avx512vbmi2};
+    hw.allowed_skips = &.{};
+    hw.counts.skips = &.{"core.parquet.compression.test.needs data/x.parquet"};
+    try writeReceipt(io, a, dir, hw, "All 3 tests passed.\n");
+    try testing.expect(try judge(a, io, dir, "s", sha) != null);
+    try testing.expect((try assess(a, io, dir, "s", sha)).note == null);
     // A log altered after its receipt was written, or no log at all, is not the evidence the receipt names.
     try writeReceipt(io, a, dir, good, "All 3 tests passed.\n");
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/s.log", .{dir}), .data = "All 4 tests passed.\n" });

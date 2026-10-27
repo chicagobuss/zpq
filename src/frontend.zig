@@ -297,6 +297,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{},
         ),
         error.DivisionByZero => diagnosticPrint("zpq query: division by zero\n", .{}),
+        error.LengthsOnlyColumn => diagnosticPrint(
+            "zpq query: a string function read a column decoded to its lengths only; this is a zpq\n" ++
+                "fault, not the query's: please report it with the query (LengthsOnlyColumn)\n",
+            .{},
+        ),
         error.UnbalancedParentheses => diagnosticPrint("zpq query: unbalanced parentheses in filter\n", .{}),
         error.UnsupportedCase => diagnosticPrint(
             "zpq query: only searched CASE (CASE WHEN cond THEN v ... END) is supported, with\n" ++

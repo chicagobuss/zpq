@@ -52,6 +52,9 @@ pub const Error = error{
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.
     NestedFilterNotSupported,
+    /// A string function reached a column decoded to its byte lengths alone (`ColumnT.byte_lengths`). The decoder
+    /// refills every column an aggregate reads before it evaluates, so this is an engine fault, not a query's.
+    LengthsOnlyColumn,
 } || std.mem.Allocator.Error || calendar.Error || regex.Error;
 
 const Batch = filter_eval.Batch;
@@ -1292,7 +1295,7 @@ fn evalRegexpReplace(
     };
     if (s.max_rep > 0) return error.NestedNotSupported;
     // A column decoded to lengths alone (for `= ''`) has no texts to replace.
-    if (s.codes == null and s.values.len != s.rowCount()) return error.BadColumn;
+    if (s.codes == null and s.values.len != s.rowCount()) return error.LengthsOnlyColumn;
     const replace = c.replace.?;
     var scratch: regex.Scratch = .init(arena);
     var bytes: std.ArrayList(u8) = .empty;
@@ -2948,4 +2951,17 @@ test "regexp_replace replaces a coded column once per entry, and keeps NULL and 
     try std.testing.expectEqualStrings("nope", via_codes.string.values[0]);
     try std.testing.expectEqualStrings("c.ru", via_codes.string.values[1]);
     try std.testing.expectEqual(@as(?[]const u32, null), via_codes.string.codes);
+    // Lengths alone carry no texts: an engine fault named as one, never an answer over empty strings.
+    const lens = [_]u32{ 17, 0, 8, 17 };
+    const lengths_only: Batch.Column = .{ .string = .{
+        .values = &.{},
+        .byte_lengths = &lens,
+        .def_levels = &def,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    try std.testing.expectError(
+        error.LengthsOnlyColumn,
+        evalExpr(a, &.{ .cols = &.{lengths_only}, .num_rows = 4 }, &lookup, call),
+    );
 }

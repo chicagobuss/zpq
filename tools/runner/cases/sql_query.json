@@ -129,6 +129,16 @@
     },
     {
       "kind": "sql_ordered",
+      "id": "lengths:regexp-key",
+      "sql": "SELECT regexp_replace(name, '^n(\\d)\\d*$', 'k\\1') AS h, count(*) AS c FROM '{path}' WHERE name <> '' GROUP BY h ORDER BY h"
+    },
+    {
+      "kind": "sql_ordered",
+      "id": "lengths:regexp-arg",
+      "sql": "SELECT count(*) AS c, min(regexp_replace(name, '^n', 'k')) AS m, max(regexp_replace(name, '^n', 'k')) AS x FROM '{path}' WHERE name <> ''"
+    },
+    {
+      "kind": "sql_ordered",
       "id": "spill:spill_full:g8",
       "sql": "SELECT name, count(*) AS c, sum(id) AS s, min(nname) AS mn FROM '{path}' GROUP BY name ORDER BY name",
       "jobs": [

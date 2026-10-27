@@ -70,6 +70,10 @@ output is the same at every `-j`, memory budget and cache size.
     ones. Chunks are split into data pages of at most 1 MiB or 20,000 rows, with a page index. The bytes written depend
     only on the input and the options, never on `-j` or the machine's memory; an explicit `--max-memory` caps row
     groups at a sixteenth of it. Plain copies keep their input's row groups.
+11. **On an older x86-64 CPU, take the `-compat` archive.** The default Linux x86_64 archive (and the `.deb`, `.rpm`
+    and Homebrew packages built from it) targets x86-64-v3, which needs AVX2. On a CPU without one of its features it
+    prints `zpq: this CPU lacks <feature>, which this x86-64-v3 build needs; use the x86_64-linux-musl-compat
+    archive, which runs on any x86-64` and exits 3 before doing any work.
 
 ### Highlights
 
@@ -82,8 +86,10 @@ output is the same at every `-j`, memory budget and cache size.
 - **A memory ceiling that holds.** `--max-memory` is one budget per query that tables, decoding, read-ahead, Top-N, the
   merge, the answer and write buffers all draw from; a query that does not fit is retried on narrower paths and
   otherwise refused, never killed.
-- **Faster GROUP BY**, from compact group state, cached group lookups and private partition runs for
-  high-cardinality keys.
+- **Faster GROUP BY**, from compact group state, cached group lookups, private partition runs for high-cardinality
+  keys, one shared table for long string keys, and parallel finishes.
+- **Filters that decode less**: an AND runs its cheapest conditions first, and a later condition's column is decoded
+  only where the earlier ones kept rows.
 - **libzpq**: the engine as a C library with a Python binding (`python/zpq.py`) and an HTTP service. SQL through it is
   EXPERIMENTAL.
 - **All 43 ClickBench queries run**, with `make_date`, `epoch_ms`, `date_trunc`, `date_part`/`EXTRACT` and
@@ -97,35 +103,42 @@ output is the same at every `-j`, memory budget and cache size.
 
 ### Performance
 
-**How these were measured.** Every query starts a fresh process of each engine, in two lanes: cold, as a user
-meets a file the first time (before each of 3 repetitions the input's pages are evicted from the page cache and the
-eviction is verified), and hot-fresh (the input already in the page cache, in a new process). A case's time is the
+**How these were measured.** zpq 0.5.0 (`v0.5.0-rc4`, build {{TBD}}; on Linux x86_64 the shipped x86-64-v3 musl
+binary) against DuckDB 2.0 and Polars 2.0. Every query starts a fresh process of each engine, in two lanes: cold, as a
+user meets a file the first time (before each of 3 repetitions the input's pages are evicted from the page cache and
+the eviction is verified), and hot-fresh (the input already in the page cache, in a new process). A case's time is the
 median of its repetitions whose answer matched pinned truth and whose environment check passed. Times include process
-start. An engine's error counts as a loss for that engine.
+start. An engine's error counts as a loss for that engine. Every cell is on the site's scorecard.
 
 | | |
 |---|---|
-| Run | {{TBD}}, zpq 0.5.0 build {{TBD}} |
-| Machine | {{TBD}} |
-| Engines | {{TBD}} |
-| Coverage | {{TBD}} |
+| Judging machine | {{TBD}} |
+| Also run on | {{TBD}} |
+| Engines | zpq 0.5.0 ({{TBD}}), DuckDB {{TBD}}, Polars {{TBD}} |
+| Cells | {{TBD}} per lane: ClickBench 43, synthetic 390, local reads 14, writes 8, votes 1, PDS-H 8 |
+
+**On the judging machine:**
+
+| Lane | Faster than DuckDB 2.0 | Faster than Polars 2.0 | Behind the faster rival | Behind by more than 1.2× | Geometric mean vs the faster rival |
+|---|---|---|---|---|---|
+| Cold | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}× |
+| Hot-fresh | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}× |
 
 - **ClickBench, 100M rows (one 14.8 GB file).**
   - zpq runs all 43 queries. The 9 that 0.5.0's earlier builds refused now answer: date literals compared with hits'
     unannotated integer day column, `extract`/`date_part`, `date_trunc`, `make_date`, `epoch_ms` and
     `regexp_replace`.
-  - zpq is the fastest engine on {{TBD}} of 43, at a geometric mean of {{TBD}}× the fastest other engine's time.
-  - Against DuckDB 2.0 alone, zpq is faster on {{TBD}} of 43, at a geometric mean of {{TBD}}× its time.
+  - Cold, zpq is faster than both rivals on {{TBD}} of 43, at a geometric mean of {{TBD}}× the faster rival's time.
+- **26 synthetic datasets × 15 query shapes, 390 cases.** Cold, zpq is faster than both rivals on {{TBD}} of 390, at a
+  geometric mean of {{TBD}}×; {{TBD}} are more than 1.5× behind, the worst {{TBD}}×.
+- **Local reads** (TPC-H SF1 lineitem in snappy and zstd, and a 2.1M-row synthetic table): faster on {{TBD}} of 14,
+  at a geometric mean of {{TBD}}×.
+- **Writes** (outputs to tmpfs for every engine): faster on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
+- **DuckDB's votes test** (228M rows, local file): {{TBD}} ms, against {{TBD}} ms for the faster rival.
+- **PDS-H Q1 and Q6** (SF1 to SF30): faster on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
+- **Other machines** (cold, faster than DuckDB 2.0 / Polars 2.0): {{TBD}}.
 
-- **26 synthetic datasets × 15 query shapes, 390 cases.**
-  - zpq is fastest on {{TBD}} of 390, at a geometric mean of {{TBD}}× the fastest other engine.
-  - {{TBD}} are over 1.5× behind; the worst is {{TBD}}×.
-
-- **Local reads** (TPC-H SF1 lineitem in snappy and zstd, and a 2.1M-row synthetic table): fastest on {{TBD}} of 14,
-  at a geometric mean of {{TBD}}× the fastest other engine.
-- **Writes** (outputs to tmpfs for every engine): fastest on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
-- **DuckDB's votes test** (228M rows, local file): {{TBD}} ms, against {{TBD}} ms for DuckDB 2.0.
-- **PDS-H Q1 and Q6** (SF1 to SF30): fastest on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
+The cells still more than 1.5× behind, and why, are listed as the known gaps on the site's status page.
 
 **Against zpq 0.4.1: writes and peak memory.** These come from the earlier scorecard `scorecard-v2-a88915d3b494`:
 0.5.0 build a88915d (from before the memory work) against the released 0.4.1, on the same machine in the same session.
@@ -178,6 +191,16 @@ What changed underneath:
 - GROUP BY state is stored at the width each reduction needs, and group lookups cache their hashes. A count over
   long, near-unique composite keys can move each worker's groups to private partition runs, funded from the query's
   memory budget, instead of one shared table.
+- Long string GROUP BY keys and scalar `count(DISTINCT)` share one query-wide string table: each key is hashed once
+  and stored once.
+- A top-N GROUP BY that also sums or averages integer columns, with or without a filter, keeps compact per-group
+  records instead of falling back to general accumulators; a group seen once takes 24 bytes.
+- A top-level AND runs its conditions cheapest first (null and length tests and fixed-width compares, then string
+  compares and `IN` lists, then anchored `LIKE`, then `LIKE '%x%'`); `--explain` lists them in the order they run. A
+  later condition's column is decoded only at the rows the earlier ones kept, so a page none of them keeps is never
+  decompressed.
+- A filtered GROUP BY reads a dictionary-encoded key as codes when, after the filter, codes for every row cost no more
+  than the surviving rows' values would, and otherwise decodes only the survivors.
 - `ORDER BY ... LIMIT n` over plain rows ranks by its keys in parallel and reads only the winners' rows, skipping row
   groups that cannot win.
 - Local reads on Linux read only the column chunks a query needs. When most of those ranges are already in the page

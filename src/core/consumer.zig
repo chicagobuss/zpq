@@ -9989,13 +9989,14 @@ test "retained delta pages reset under the decode ledger, including optional lev
     var budget: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
     var charged: core_memory.Charged = .{ .child = testing.allocator, .budget = &budget };
     var pool = SliceScratch.init(charged.allocator());
-    defer pool.deinit();
+    var pool_live = true;
+    defer if (pool_live) pool.deinit();
     try pool.reserve(1);
-    const overhead = budget.used.load(.monotonic);
     const src: RGSrc = .{ .bytes = enc.bytes, .byte_origin = 0 };
     const rg = &file_meta.row_groups.items[0];
     var reader = (try SliceReader.initPooled(arena, testing.allocator, rg, &file_meta, src, 0, .{}, &pool)).?;
-    errdefer reader.deinit();
+    var reader_live = true;
+    defer if (reader_live) reader.deinit();
     const first: usize = @intCast(enc.pages[0].rows);
     var at: usize = 0;
     var after_one: usize = 0;
@@ -10022,7 +10023,11 @@ test "retained delta pages reset under the decode ledger, including optional lev
     try testing.expect(reader.dict_store.?.queryCapacity() < core_memory.lean_decode / 8);
     try testing.expect(budget.used.load(.monotonic) <= core_memory.lean_decode);
     reader.deinit();
-    try testing.expect(budget.used.load(.monotonic) <= overhead);
+    reader_live = false;
+    // Reader teardown returns its scratch to the pool; the pool owns that retained charge.
+    pool.deinit();
+    pool_live = false;
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
 test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {

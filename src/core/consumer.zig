@@ -4611,7 +4611,7 @@ fn scanRGForAggImpl(
         }
         if (late and keep == null and flatGroupKey(target, ci)) if (in.rg.columns.items[ci].meta_data) |cm| {
             if (@import("filter/membership.zig").dictionaryCoversChunk(&cm) and
-                keyCodesCheaper(cm, batch_rows, survivors))
+                (foldWantsCodes(target, ci, in.rg) or keyCodesCheaper(cm, batch_rows, survivors)))
             {
                 if (whole.len == 0) {
                     whole = try ra.alloc(bool, in.read.len);
@@ -5596,6 +5596,24 @@ const GatedFilter = struct {
         }
     }
 };
+
+/// Whether a group key's codes feed a fold that groups by them: dense lanes, a record owner keeping the original
+/// dictionary, or the coded fold, which needs every key coded, so every flat key's chunk must be one its dictionary
+/// covers. Survivor values would send every row through key serialization and hashing instead, which costs far more
+/// than the codes `keyCodesCheaper` weighs. Keys bound for hash grouping anyway are left to that rule.
+fn foldWantsCodes(target: AggTarget, ci: usize, rg: *const schema.RowGroup) bool {
+    if (target != .grouped) return false;
+    if (!target.codedKey(ci)) return target.grouped.dense != null;
+    if (target.grouped.dense != null or target.grouped.records != null) return true;
+    for (target.grouped.keys) |k| {
+        if (k != .col_ref) return false;
+        const kc = k.col_ref.col_idx;
+        if (kc >= rg.columns.items.len) return false;
+        const km = rg.columns.items[kc].meta_data orelse return false;
+        if (!@import("filter/membership.zig").dictionaryCoversChunk(&km)) return false;
+    }
+    return true;
+}
 
 fn flatGroupKey(target: AggTarget, ci: usize) bool {
     if (target != .grouped) return false;
@@ -8587,6 +8605,49 @@ test "a required row gate skips an unread page and defaults the unselected slots
     for (clean.values, skipped.values, 0..) |want, got, i| {
         try testing.expectEqual(if (i < page_rows) 0 else want, got);
     }
+}
+
+test "regression: a filtered group's dictionary keys stay codes for a fold that groups by them" {
+    var dict_only = [_]schema.Encoding{.PLAIN_DICTIONARY};
+    var fell_back = [_]schema.Encoding{ .PLAIN_DICTIONARY, .PLAIN };
+    var path = [_][]const u8{"k"};
+    const chunk = struct {
+        fn of(encs: []schema.Encoding, p: *[1][]const u8) schema.ColumnChunk {
+            return .{ .file_path = null, .file_offset = 0, .meta_data = .{
+                .type = .INT32,
+                .encodings = .{ .items = encs, .capacity = encs.len, .pointer_stability = .{} },
+                .path_in_schema = .{ .items = p, .capacity = 1, .pointer_stability = .{} },
+                .codec = .UNCOMPRESSED,
+                .num_values = 1000,
+                .total_uncompressed_size = 0,
+                .total_compressed_size = 0,
+                .data_page_offset = 0,
+                .index_page_offset = null,
+                .dictionary_page_offset = 0,
+            } };
+        }
+    }.of;
+    var columns = [_]schema.ColumnChunk{ chunk(&dict_only, &path), chunk(&dict_only, &path) };
+    var rg: schema.RowGroup = .{
+        .columns = .{ .items = &columns, .capacity = 2, .pointer_stability = .{} },
+        .total_byte_size = 0,
+        .num_rows = 1000,
+    };
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64 } },
+    };
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var table = expr_agg.GroupTable.init(std.testing.allocator, 0);
+    defer table.deinit();
+    const target: AggTarget = .{ .grouped = .{ .calls = &calls, .keys = &keys, .table = &table, .pos_base = 0 } };
+    // ad5220d decoded a 30%-selected INT32 key as survivor values (four-byte codes for every row weighed more), and
+    // the coded fold, given values, sent every row through key serialization and hashing: 4-9x slower.
+    try std.testing.expect(!keyCodesCheaper(columns[0].meta_data.?, 1000, 300));
+    try std.testing.expect(foldWantsCodes(target, 0, &rg));
+    // One key its dictionary does not cover leaves the composite uncoded: that key's peer goes to the byte rule.
+    columns[1] = chunk(&fell_back, &path);
+    try std.testing.expect(!foldWantsCodes(target, 0, &rg));
 }
 
 test "a filtered group's dictionary key decodes as codes only where they materialize less than its survivors" {

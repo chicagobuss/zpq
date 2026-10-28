@@ -1,4 +1,7 @@
 const std = @import("std");
+// Known exception: the facade owns writable thread-local state until the later contract pass.
+const agg_threadlocals = @import("../agg.zig");
+const Error = @import("types.zig").Error;
 const testing = std.testing;
 const SharedBudget = @import("../../memory.zig").SharedBudget;
 const DistinctSet = @import("distinct.zig").DistinctSet;
@@ -272,5 +275,53 @@ test "round 4: copy merge keeps an installed destination budget" {
     try testing.expect(dst.distinct.budgetPtr() == &dst_budget);
     try testing.expectEqual(@as(usize, 0), dst.distinct.count());
     try testing.expectEqual(@as(usize, 0), dst_budget.used.load(.monotonic));
+}
+
+
+/// What a query's string min/max winners hold, drawn from the query's ledger: each work item keeps an owned
+/// copy of its winner until the merge, and a value can be any size. A copy is drawn before it is made and given back
+/// when the value it replaces is freed; the merge frees losers uncounted, so `settle` sets what the survivors hold.
+pub const WinnerCharge = struct {
+    ledger: ?*SharedBudget,
+    held: std.atomic.Value(usize) = .init(0),
+
+    pub fn adjust(self: *WinnerCharge, before: usize, after: usize) error{ExceededMemoryBudget}!void {
+        const l = self.ledger orelse return;
+        if (after > before) {
+            if (l.drawExact(after - before) == null) return error.ExceededMemoryBudget;
+            _ = self.held.fetchAdd(after - before, .monotonic);
+        } else if (before > after) {
+            l.release(before - after);
+            _ = self.held.fetchSub(before - after, .monotonic);
+        }
+    }
+
+    /// The merge has freed the losers: what is drawn is what `keep` bytes of winners hold.
+    pub fn settle(self: *WinnerCharge, keep: usize) void {
+        const l = self.ledger orelse return;
+        const held = self.held.swap(keep, .monotonic);
+        if (held > keep) l.release(held - keep) else l.force(keep - held);
+    }
+};
+
+/// `cand` as `slot`'s owned winner in place of the one it held. Drawn before the copy, so the copy and the value it
+/// replaces are both charged while both are live; a refusal or a failed copy leaves the slot holding live bytes.
+pub fn winnerBytes(len: usize) usize {
+    if (len == 0) return 0;
+    return std.mem.alignForward(usize, len, 16) +| 16;
+}
+
+pub fn persistWinner(persist: std.mem.Allocator, slot: *?[]const u8, cand: []const u8) Error!void {
+    const charge = agg_threadlocals.winner_charge;
+    if (charge) |c| try c.adjust(0, winnerBytes(cand.len));
+    const owned = persist.dupe(u8, cand) catch |err| {
+        if (charge) |c| c.adjust(winnerBytes(cand.len), 0) catch unreachable;
+        return err;
+    };
+    if (slot.*) |cur| {
+        persist.free(cur);
+        if (charge) |c| c.adjust(winnerBytes(cur.len), 0) catch unreachable;
+    }
+    slot.* = owned;
 }
 

@@ -2392,56 +2392,14 @@ pub const DistinctPairs = struct {
     }
 };
 
-/// What a query's string min/max winners hold, drawn from the query's ledger: each work item keeps an owned
-/// copy of its winner until the merge, and a value can be any size. A copy is drawn before it is made and given back
-/// when the value it replaces is freed; the merge frees losers uncounted, so `settle` sets what the survivors hold.
-pub const WinnerCharge = struct {
-    ledger: ?*SharedBudget,
-    held: std.atomic.Value(usize) = .init(0),
-
-    pub fn adjust(self: *WinnerCharge, before: usize, after: usize) error{ExceededMemoryBudget}!void {
-        const l = self.ledger orelse return;
-        if (after > before) {
-            if (l.drawExact(after - before) == null) return error.ExceededMemoryBudget;
-            _ = self.held.fetchAdd(after - before, .monotonic);
-        } else if (before > after) {
-            l.release(before - after);
-            _ = self.held.fetchSub(before - after, .monotonic);
-        }
-    }
-
-    /// The merge has freed the losers: what is drawn is what `keep` bytes of winners hold.
-    pub fn settle(self: *WinnerCharge, keep: usize) void {
-        const l = self.ledger orelse return;
-        const held = self.held.swap(keep, .monotonic);
-        if (held > keep) l.release(held - keep) else l.force(keep - held);
-    }
-};
+pub const WinnerCharge = accumulator_mod.WinnerCharge;
 
 /// The scan worker's winner charge while it folds a row group; null during merges.
 /// A thread-local for the reason `distinct_pairs` is one: the folds that copy winners see only the accumulator.
 pub threadlocal var winner_charge: ?*WinnerCharge = null;
 
-/// `cand` as `slot`'s owned winner in place of the one it held. Drawn before the copy, so the copy and the value it
-/// replaces are both charged while both are live; a refusal or a failed copy leaves the slot holding live bytes.
-pub fn winnerBytes(len: usize) usize {
-    if (len == 0) return 0;
-    return std.mem.alignForward(usize, len, 16) +| 16;
-}
-
-pub fn persistWinner(persist: std.mem.Allocator, slot: *?[]const u8, cand: []const u8) Error!void {
-    const charge = winner_charge;
-    if (charge) |c| try c.adjust(0, winnerBytes(cand.len));
-    const owned = persist.dupe(u8, cand) catch |err| {
-        if (charge) |c| c.adjust(winnerBytes(cand.len), 0) catch unreachable;
-        return err;
-    };
-    if (slot.*) |cur| {
-        persist.free(cur);
-        if (charge) |c| c.adjust(winnerBytes(cur.len), 0) catch unreachable;
-    }
-    slot.* = owned;
-}
+pub const winnerBytes = accumulator_mod.winnerBytes;
+pub const persistWinner = accumulator_mod.persistWinner;
 
 /// The worker's pair sink while it scans. A thread-local, not a parameter: every grouped count(DISTINCT) fold, coded
 /// or not, reaches `foldDistinctU64` with only the table's accumulators, which identify the table the sink serves.

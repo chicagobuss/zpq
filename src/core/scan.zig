@@ -185,6 +185,11 @@ const sortSlotsByFirst = slot_sort.sortSlotsByFirst;
 pub const pair_fold = @import("scan/pair_fold.zig");
 const drainDistinctPairs = pair_fold.drainDistinctPairs;
 const foldDistinctPairs = pair_fold.foldDistinctPairs;
+pub const scan_phase = @import("scan/phase.zig");
+const restoreCounts = scan_phase.restoreCounts;
+const clearWorkerErrors = scan_phase.clearWorkerErrors;
+const runPhase = scan_phase.runPhase;
+const phaseFailure = scan_phase.phaseFailure;
 pub const scan_types = @import("scan/types.zig");
 const BoundAggregate = scan_types.BoundAggregate;
 pub const MultiAggArgs = scan_types.MultiAggArgs;
@@ -1564,45 +1569,6 @@ fn firstAppearanceCut(
     if (cfg.trace) std.debug.print("first: bounded_keys={d} threshold={d} count_ms={d}\n", .{
         n, threshold.load(.monotonic), @divTrunc(nowMonoNs() - t0, 1_000_000),
     });
-}
-
-/// Puts back the row and row-group counts a discarded pass added.
-fn restoreCounts(workers: []Worker, saved: []const Worker) void {
-    for (workers, saved) |*w, s| {
-        w.rows_in = s.rows_in;
-        w.rows_scanned = s.rows_scanned;
-        w.rows_matched = s.rows_matched;
-        w.rgs_in = s.rgs_in;
-        w.rgs_pruned = s.rgs_pruned;
-        w.rgs_full_match = s.rgs_full_match;
-    }
-}
-
-/// One pass of `workers` over every work item, from a fresh cursor.
-/// Clears an optional phase's expected failures and partial decode evidence before its exact retry.
-/// Other failures still propagate. `runPhase` chooses refusals canonically before deciding to retry.
-fn clearWorkerErrors(workers: []Worker, expected: anyerror) !void {
-    const exact_retry = expected == error.ExceededMemoryBudget or expected == error.CensusAbandoned;
-    for (workers) |*w| if (w.err) |we| if (we == expected or
-        (exact_retry and consumer.isDecodeError(we)))
-    {
-        // The optional census scans exactly from the start next. Its partial projection cannot make a payload
-        // error final while an earlier refused/abandoned unit may conceal another error. Trial memory is never
-        // the query's refusal: discard the trial and let the established scan decide what fits.
-        w.err = null;
-    };
-    if (firstWorkerFailure(workers, null)) |failure| return failure.err;
-}
-
-fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize)) !void {
-    cursor.store(0, .monotonic);
-    runWorkers(workers);
-    if (phaseFailure(workers)) |err| return err;
-}
-
-fn phaseFailure(workers: []const Worker) ?anyerror {
-    for (workers) |w| if (w.err) |err| if (err == error.CensusAbandoned) return err;
-    return if (firstWorkerFailure(workers, null)) |failure| failure.err else null;
 }
 
 /// The k-th largest total of the COUNT at `a_idx` over every key of `tables`, 0 with fewer than `k` keys.
@@ -14408,23 +14374,7 @@ test "regression: counts pairs folded merge in place or under a count cut, as th
     };
 }
 
-test "clearWorkerErrors: a phase's expected failure is cleared on every worker, any other is returned" {
-    var ws: [3]Worker = undefined;
-    for (&ws) |*w| {
-        w.err = null;
-        w.failure_work = null;
-        w.failure = null;
-    }
-    // The census trial's budget on one worker, a corrupt page on a later one: the page's error is the query's.
-    ws[0].err = error.ExceededMemoryBudget;
-    ws[2].err = error.CorruptPage;
-    try testing.expectError(error.CorruptPage, clearWorkerErrors(&ws, error.ExceededMemoryBudget));
-    try testing.expectEqual(@as(?anyerror, null), ws[0].err);
-    ws[2].err = error.ExceededMemoryBudget;
-    ws[1].err = error.ExceededMemoryBudget;
-    try clearWorkerErrors(&ws, error.ExceededMemoryBudget);
-    for (ws) |w| try testing.expectEqual(@as(?anyerror, null), w.err);
-}
+
 
 test "regression: count(DISTINCT) pairs pay by the values the sets took, a filter's dropped rows left out" {
     const path = "ci/fixtures/parquet/census_dictionary_review.parquet";

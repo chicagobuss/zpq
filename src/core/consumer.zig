@@ -5002,7 +5002,8 @@ fn openSlicedPayload(
         var options = decode_options;
         // A streamed string is compared or hashed from its bytes. Codes would take the dictionary fast path on a
         // pure-dictionary window and the value path on the next, which is not how the whole chunk folds.
-        options.any_dictionary = target.codedKey(ci) and !streamByteArray(in, target, ci);
+        options.any_dictionary = (target.codedKey(ci) and !streamByteArray(in, target, ci)) or
+            (decode_options.encoded and scalarByteDistinct(in, target) == ci);
         options.decimal_exact_only = target.exactInputs();
         if (payload) |p| if (p[ci]) if (survivors) |sv| {
             options.row_gate = sv;
@@ -5016,6 +5017,261 @@ fn openSlicedPayload(
         lookup[ci] = readers.items.len;
         try readers.append(pages, r);
     }
+}
+
+/// The streamed scalar string DISTINCT can keep its source codes through the fold. Other calls retain their
+/// established decode and expression/error ordering.
+fn scalarByteDistinct(in: AggRowGroup, target: AggTarget) ?usize {
+    if (in.filter != null or target != .scalar or target.scalar.calls.len != 1) return null;
+    const call = target.scalar.calls[0];
+    if (call.func != .count_distinct or call.where != null) return null;
+    const arg = call.arg orelse return null;
+    if (arg != .col_ref or arg.col_ref.physical_type != .BYTE_ARRAY or arg.col_ref.expr_type != .str) return null;
+    const ci = arg.col_ref.col_idx;
+    return if (streamByteArray(in, target, ci)) ci else null;
+}
+
+/// One dictionary's observed codes, retained until its row group ends. The accumulator owns exact copies of the
+/// strings; the bitmap is only a cache and can be refused without changing the answer.
+threadlocal var test_scalar_distinct_inserts: usize = 0;
+const ScalarDistinctSeen = struct {
+    dict: ?[*]const []const u8 = null,
+    dict_len: usize = 0,
+    words: []u64 = &.{},
+    disabled: bool = false,
+
+    fn deinit(self: *ScalarDistinctSeen, allocator: std.mem.Allocator) void {
+        if (self.words.len != 0) allocator.free(self.words);
+        self.* = .{};
+    }
+
+    fn fold(
+        self: *ScalarDistinctSeen,
+        scratch: std.mem.Allocator,
+        persist: std.mem.Allocator,
+        acc: *expr_agg.DistinctAcc,
+        col: filter_eval.ColumnT([]const u8),
+        sel: *const filter_selection.SelectionVector,
+    ) !void {
+        const codes = col.codes.?;
+        if (!self.disabled and (self.dict == null or self.dict.? != col.dict.ptr or self.dict_len != col.dict.len)) {
+            if (self.words.len != 0) scratch.free(self.words);
+            self.words = &.{};
+            self.dict = null;
+            const n = col.dict.len / 64 + @intFromBool(col.dict.len % 64 != 0);
+            self.words = scratch.alloc(u64, n) catch blk: {
+                self.disabled = true;
+                break :blk &.{};
+            };
+            if (!self.disabled) {
+                @memset(self.words, 0);
+                self.dict = col.dict.ptr;
+                self.dict_len = col.dict.len;
+            }
+        }
+        for (codes, 0..) |code, row| {
+            if (!sel.isActive(row)) continue;
+            if (col.def_levels) |def| if (def[row] < col.max_def) continue;
+            const word = @as(usize, code) / 64;
+            const mask = @as(u64, 1) << @truncate(code % 64);
+            if (!self.disabled and self.words[word] & mask != 0) continue;
+            // Publish the bit only after the exact table has accepted the string.
+            acc.insertBytes(persist, col.dict[code]) catch |err| {
+                if (self.disabled or (err != error.ExceededMemoryBudget and err != error.OutOfMemory)) return err;
+                // The optional bitmap may be the only thing keeping the exact table from growing.
+                self.deinit(scratch);
+                self.disabled = true;
+                try acc.insertBytes(persist, col.dict[code]);
+            };
+            if (!self.disabled) {
+                self.words[word] |= mask;
+                if (builtin.is_test) test_scalar_distinct_inserts += 1;
+            }
+        }
+    }
+};
+
+test "scalar dictionary distinct caches observed codes and falls back on memory refusal" {
+    const t = std.testing;
+    const a = t.allocator;
+    const dict = [_][]const u8{ "", "same", "same", "unused", "later" };
+    const codes = [_]u32{ 0, 1, 0, 2, 3, 4, 4, 1 };
+    const defs = [_]u32{ 1, 1, 0, 1, 0, 1, 1, 1 };
+    const col: filter_eval.ColumnT([]const u8) = .{
+        .values = &.{}, .codes = &codes, .dict = &dict, .def_levels = &defs, .max_def = 1, .has_nulls = true,
+    };
+    var sel = try filter_selection.SelectionVector.init(a, codes.len);
+    defer sel.deinit();
+    for ([_]bool{ false, true }) |refuse| {
+        var budget: core_memory.SharedBudget = .{ .limit = if (refuse) 1 else 4096 };
+        var charged: core_memory.Charged = .{ .child = a, .budget = &budget };
+        var seen: ScalarDistinctSeen = .{};
+        var acc: expr_agg.DistinctAcc = .{};
+        try seen.fold(charged.allocator(), a, &acc, col, &sel);
+        try seen.fold(charged.allocator(), a, &acc, col, &sel);
+        try t.expectEqual(refuse, seen.disabled);
+        try t.expectEqual(@as(usize, 3), acc.count());
+        if (!refuse) try t.expectEqual(@as(u64, 0b10111), seen.words[0]);
+        acc.deinit(a);
+        seen.deinit(charged.allocator());
+        try t.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+    // Refusal by the exact table must not publish a seen bit or leak either reservation.
+    var table_budget: core_memory.SharedBudget = .{ .limit = 1 };
+    var seen: ScalarDistinctSeen = .{};
+    defer seen.deinit(a);
+    var acc = expr_agg.DistinctAcc.initEmpty(&table_budget);
+    defer acc.deinit(a);
+    try t.expectError(error.ExceededMemoryBudget, seen.fold(a, a, &acc, col, &sel));
+    try t.expect(seen.disabled and seen.words.len == 0);
+    try t.expectEqual(@as(usize, 0), table_budget.used.load(.monotonic));
+
+    // The bitmap fits, but an empty string's exact entry fits only after the bitmap is returned.
+    var tight: core_memory.SharedBudget = .{ .limit = @sizeOf(expr_agg.DistinctSet) + 48 };
+    var tight_scratch: core_memory.Charged = .{ .child = a, .budget = &tight };
+    var tight_seen: ScalarDistinctSeen = .{};
+    var tight_acc = expr_agg.DistinctAcc.initEmpty(&tight);
+    var one = try filter_selection.SelectionVector.init(a, 1);
+    defer one.deinit();
+    var first = col;
+    first.codes = codes[0..1];
+    first.def_levels = defs[0..1];
+    try tight_seen.fold(tight_scratch.allocator(), a, &tight_acc, first, &one);
+    try t.expect(tight_seen.disabled and tight_seen.words.len == 0);
+    try t.expectEqual(@as(usize, 1), tight_acc.count());
+    tight_acc.deinit(a);
+    tight_seen.deinit(tight_scratch.allocator());
+    try t.expectEqual(@as(usize, 0), tight.used.load(.monotonic));
+}
+
+test "scalar dictionary distinct reads mixed pages with nullable and unused entries" {
+    const t = std.testing;
+    const a = t.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const Fixture = struct {
+        fn page(out: *std.ArrayList(u8), alloc: std.mem.Allocator, body: []const u8, count: i32, dict: bool, enc: schema.Encoding) !void {
+            var w = thrift.Writer.init(alloc);
+            try (schema.PageHeader{
+                .type = if (dict) .DICTIONARY_PAGE else .DATA_PAGE,
+                .uncompressed_page_size = @intCast(body.len),
+                .compressed_page_size = @intCast(body.len),
+                .crc = null,
+                .data_page_header_v2 = null,
+                .data_page_header = if (dict) null else .{
+                    .num_values = count, .encoding = enc, .definition_level_encoding = .RLE,
+                    .repetition_level_encoding = .RLE,
+                },
+                .dictionary_page_header = if (dict) .{ .num_values = count, .encoding = .PLAIN, .is_sorted = null } else null,
+            }).write(&w);
+            try out.appendSlice(alloc, w.bytes());
+            try out.appendSlice(alloc, body);
+        }
+        fn bytes(out: *std.ArrayList(u8), alloc: std.mem.Allocator, value: []const u8) !void {
+            var size: [4]u8 = undefined;
+            std.mem.writeInt(u32, &size, @intCast(value.len), .little);
+            try out.appendSlice(alloc, &size);
+            try out.appendSlice(alloc, value);
+        }
+        fn levels(out: *std.ArrayList(u8), alloc: std.mem.Allocator, defs: []const u32) !void {
+            const encoded = try @import("parquet/encoding/hybrid_rle.zig").encode(alloc, defs, 1);
+            var size: [4]u8 = undefined;
+            std.mem.writeInt(u32, &size, @intCast(encoded.len), .little);
+            try out.appendSlice(alloc, &size);
+            try out.appendSlice(alloc, encoded);
+        }
+    };
+    var chunk: std.ArrayList(u8) = .empty;
+    var dictionary: std.ArrayList(u8) = .empty;
+    try Fixture.bytes(&dictionary, ar, "");
+    try Fixture.bytes(&dictionary, ar, "alpha");
+    for (0..128) |i| try Fixture.bytes(&dictionary, ar, try std.fmt.allocPrint(ar, "unused-{d}", .{i}));
+    try Fixture.page(&chunk, ar, dictionary.items, 130, true, .PLAIN);
+    var defs: [128]u32 = undefined;
+    var codes: std.ArrayList(u32) = .empty;
+    for (&defs, 0..) |*d, i| {
+        d.* = @intFromBool(i % 7 != 0);
+        if (d.* != 0) try codes.append(ar, @intCast(i % 2));
+    }
+    var coded: std.ArrayList(u8) = .empty;
+    try Fixture.levels(&coded, ar, &defs);
+    try coded.append(ar, 8);
+    try coded.appendSlice(ar, try @import("parquet/encoding/hybrid_rle.zig").encode(ar, codes.items, 8));
+    try Fixture.page(&chunk, ar, coded.items, 128, false, .RLE_DICTIONARY);
+    var plain_defs: [64]u32 = undefined;
+    for (&plain_defs, 0..) |*d, i| d.* = @intFromBool(i % 9 != 0);
+    var plain: std.ArrayList(u8) = .empty;
+    try Fixture.levels(&plain, ar, &plain_defs);
+    for (plain_defs, 0..) |d, i| if (d != 0) {
+        try Fixture.bytes(&plain, ar, if (i % 2 == 0) "plain" else "alpha");
+    };
+    try Fixture.page(&chunk, ar, plain.items, 64, false, .PLAIN);
+    var other_body: std.ArrayList(u8) = .empty;
+    try Fixture.levels(&other_body, ar, &plain_defs);
+    for (plain_defs, 0..) |d, i| if (d != 0) {
+        try Fixture.bytes(&other_body, ar, if (i % 2 == 0) "new" else "alpha");
+    };
+    var plain_chunk: std.ArrayList(u8) = .empty;
+    try Fixture.page(&plain_chunk, ar, other_body.items, 64, false, .PLAIN);
+
+    const file = try metadata.readFileSlice("ci/fixtures/parquet/census_dictionary_review.parquet", a);
+    defer a.free(file);
+    var meta = try metadata.open(a, file);
+    defer meta.deinit(a);
+    var rg = meta.row_groups.items[0];
+    rg.columns.items = try ar.dupe(schema.ColumnChunk, rg.columns.items);
+    rg.num_rows = 192;
+    const cm = &rg.columns.items[2].meta_data.?;
+    cm.codec = .UNCOMPRESSED;
+    cm.dictionary_page_offset = 0;
+    cm.data_page_offset = 0;
+    cm.total_compressed_size = @intCast(chunk.items.len);
+    cm.total_uncompressed_size = @intCast(chunk.items.len);
+    cm.num_values = 192;
+    const input: AggRowGroup = .{
+        .rg = &rg, .meta = &meta, .src = .{ .bytes = chunk.items, .byte_origin = 0 },
+        .filter = null, .read = &.{ false, false, true, false }, .consumed = &.{ false, false, true, false },
+    };
+    var plain_rg = rg;
+    plain_rg.columns.items = try ar.dupe(schema.ColumnChunk, rg.columns.items);
+    plain_rg.num_rows = 64;
+    const plain_cm = &plain_rg.columns.items[2].meta_data.?;
+    plain_cm.dictionary_page_offset = null;
+    plain_cm.total_compressed_size = @intCast(plain_chunk.items.len);
+    plain_cm.total_uncompressed_size = @intCast(plain_chunk.items.len);
+    plain_cm.num_values = 64;
+    var plain_input = input;
+    plain_input.rg = &plain_rg;
+    plain_input.src.bytes = plain_chunk.items;
+    const call = [_]expr_agg.AggCall{.{
+        .func = .count_distinct, .arg = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+        .where = null, .alias = "d", .result = .i64,
+    }};
+    for ([_]bool{ false, true }) |encoded| for ([_]usize{ 64, 128, 192 }) |window| {
+        test_scalar_distinct_inserts = 0;
+        var acc = [_]expr_agg.Accumulator{.{ .distinct = .{} }};
+        defer acc[0].distinct.deinit(a);
+        const target: AggTarget = .{ .scalar = .{ .calls = &call, .accumulators = &acc } };
+        try t.expectEqual(@as(?usize, 2), scalarByteDistinct(input, target));
+        var scratch = DecodeScratch.init(a);
+        defer scratch.deinit();
+        var region = RowGroupArena.init(a);
+        defer region.deinit();
+        var timings: Timings = .{};
+        var budget: DecodeBudget = .{ .limit = 1 << 20 };
+        const ws: AggWorkspace = .{
+            .scratch = &scratch, .rg_arena = &region, .timings = &timings, .budget = &budget,
+            .decode_batch_rows = window,
+        };
+        const count = try scanRGSliced(a, input, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 8192, window);
+        try t.expectEqual(@as(?u64, 192), count);
+        try t.expectEqual(@as(usize, 3), acc[0].distinct.count());
+        const next = try scanRGSliced(a, plain_input, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 4096, window);
+        try t.expectEqual(@as(?u64, 64), next);
+        try t.expectEqual(@as(usize, 4), acc[0].distinct.count());
+        try t.expectEqual(@as(usize, if (encoded) 2 else 0), test_scalar_distinct_inserts);
+    };
 }
 
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
@@ -5035,6 +5291,11 @@ fn scanRGSliced(
     const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
+    // Bitmap admission is optional; its refusal must not mark the decoder's allocator as refused.
+    const seen_alloc = ws.planning_charged orelse side;
+    const distinct_ci = if (decode_options.encoded) scalarByteDistinct(in, target) else null;
+    var distinct_seen: ScalarDistinctSeen = .{};
+    defer distinct_seen.deinit(seen_alloc);
     const pool = try poolOn(&ws.scratch.slice, side);
     // One eighth of the ledger this pool draws from. The next group can use the other seven eighths.
     const carry = core_memory.retainedCarry(if (ws.ledger) |l| l.limit else decode_options.expand_limit);
@@ -5112,7 +5373,26 @@ fn scanRGSliced(
     var took: ?usize = null;
     var matched: u64 = 0;
     while (done < num_rows) {
-        const n = @min(rows_now, num_rows - done);
+        var n = @min(rows_now, num_rows - done);
+        if (distinct_ci) |ci| {
+            const at = lookup[ci] orelse return error.BadColumn;
+            const reader = &readers.items[at];
+            const raw = &reader.raw.bytes;
+            if (raw.options.any_dictionary) {
+                enterChunk(reader.site.rg, reader.site.column);
+                raw.options.fast_levels = true;
+                // Keep a dictionary/PLAIN transition out of one window: otherwise the decoder has to expand the
+                // window's dictionary prefix and the already-seen entries are hashed again as individual values.
+                while (raw.pageValuesLeft() == 0) {
+                    reader.resetPages();
+                    raw.releaseExpansion();
+                    reader.armBytePage(raw);
+                    if (!try raw.nextPage()) return error.ShortDecode;
+                    try reader.holdDictionary(raw);
+                }
+                n = @min(n, raw.pageValuesLeft());
+            }
+        }
         defer done += n;
         if (on_region) ws.rg_arena.nextRowGroup() else _ = slice.reset(.retain_capacity);
         defer if (ws.ledger) |l| {
@@ -5141,6 +5421,20 @@ fn scanRGSliced(
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
         switch (target) {
             .scalar => |s| {
+                if (distinct_ci) |ci| if (!handled[0]) {
+                    const at = lookup[ci] orelse return error.BadColumn;
+                    const col = cols[at];
+                    if (col == .string) {
+                        if (col.string.codes != null) {
+                            try distinct_seen.fold(seen_alloc, gpa, &s.accumulators[0].distinct, col.string, &sel);
+                            if (distinct_seen.disabled) readers.items[at].raw.bytes.options.any_dictionary = false;
+                            continue;
+                        }
+                        // A PLAIN page may follow a dictionary page within this chunk. The normal fold handles it
+                        // exactly and subsequent pages can remain in the value lane.
+                        readers.items[at].raw.bytes.options.any_dictionary = false;
+                    }
+                };
                 if (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target) and
                     try foldScalarCache(sa, gpa, s.calls, s.accumulators, handled, window.batch, lookup, &sel))
                     continue;

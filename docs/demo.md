@@ -1,6 +1,6 @@
 # Demo: 80 M rows, 6 milliseconds
 
-A reproducible demo of ZPQ on the
+A reproducible demo of zpq on the
 [NYC Taxi yellow trip-data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
 public dataset (24 monthly Parquet files, 1.3 GB, 79.5 M rows). Two
 shapes: local CLI against on-disk files, and AWS Lambda against
@@ -36,7 +36,7 @@ no AWS SDK, no system OpenSSL, no event-loop dependency — built by
 
 ## Why these numbers exist
 
-ZPQ does the absolute minimum work required to satisfy a query:
+zpq does the absolute minimum work required to satisfy a query:
 
 * `count(*)` answers from row-group `num_rows` in the footer — never
   decode a value page. **6 ms across 80 M rows** is the floor for any
@@ -88,7 +88,7 @@ zpq query '/tmp/nyc-taxi/*.parquet' --aggregate "count(*)"
 ```
 
 `decode_ms: 0`. The footer says how many rows are in each row group;
-ZPQ adds them up. Real wall time including process spawn is ~6 ms.
+zpq adds them up. Real wall time including process spawn is ~6 ms.
 
 ### Full decode aggregate
 
@@ -191,7 +191,7 @@ just lambda-invoke "$FN" \
 ```
 
 Returns `count: 2964624` in ~620 ms — most of which is TLS
-handshake + tail GET to R2; ZPQ's internal time is ~1 ms.
+handshake + tail GET to R2; zpq's internal time is ~1 ms.
 
 ### 24-file fan-out (per-file)
 
@@ -286,7 +286,7 @@ What zpq is for:
   registration. Same UX as `duckdb -c "SELECT * FROM 'data/*.parquet'"`.
 * **The data doesn't have to be in S3.** Cloudflare R2, MinIO,
   GCS-compat — same code, same speed envelope, no migration to AWS.
-* **Writes stream S3-to-S3.** ZPQ Lambda filters, projects and
+* **Writes stream S3-to-S3.** zpq Lambda filters, projects and
   re-encodes straight into a multipart upload; multi-file compaction
   is the iceberg-maintenance shape it was designed for.
 

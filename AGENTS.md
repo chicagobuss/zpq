@@ -1,6 +1,6 @@
 # AGENTS.md — Working norms for this repo
 
-Short, durable instructions for AI coding agents working on ZPQ.
+Short, durable instructions for AI coding agents working on zpq.
 
 ## Ground every non-trivial decision in three things
 
@@ -29,7 +29,7 @@ primitive, new wire-format support, allocator restructure, parallelism model) it
 
 ## Don't trust correctness without verifying it
 
-Wire-format engines are easy to get *almost right* in a way that passes lenient readers and fails strict ones. ZPQ
+Wire-format engines are easy to get *almost right* in a way that passes lenient readers and fails strict ones. zpq
 shipped a broken `IntType.bitWidth` encoding for months because Polars was lenient about it; pyarrow and DuckDB both
 rejected the output.
 
@@ -93,7 +93,7 @@ When picking a perf target, the flamegraph is the verdict.
 
 - The Tier 1 "grumpy elitism" mindset is real: skepticism over optimism, honesty over salesmanship, narrow primitive
   over bloated framework. When critiquing our own work, go ruthless — it's how we find what's actually broken.
-- ZPQ is a **sharp narrow primitive** ("taco bell programming"). Filter + project + S3-to-S3 passthrough on parquet. We
+- zpq is a **sharp narrow primitive** ("taco bell programming"). Filter + project + S3-to-S3 passthrough on parquet. We
   don't compete with DuckDB on joins/aggs; we don't compete with Polars on dataframe ergonomics. We compete on
   cold-start, warm-pool throughput, and binary size *for our specific workload*.
 

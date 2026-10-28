@@ -1,4 +1,4 @@
-# ZPQ
+# zpq
 
 An agentically-engineered Apache Parquet engine in Zig, built for serverless compute against object storage. It does
 the least work a query needs for an exact answer: statistics and footers first, and only the pages that matter.
@@ -392,11 +392,11 @@ prune data using corroborated statistics. The metadata shortcuts have separate t
   See the [validation contract](docs/output-format.md#validation-and-skipped-data).
 
 Floats compare in total order, as they sort: NaN equals NaN and lies above every number, so `x > 5` and `NOT (x < 5)`
-keep NaN rows. Float bounds leave NaN out, so a chunk whose max is below 5 can still hold rows passing `x > 5`. ZPQ
+keep NaN rows. Float bounds leave NaN out, so a chunk whose max is below 5 can still hold rows passing `x > 5`. zpq
 prunes such a chunk only when NaN is proven absent: by a `nan_count` of zero in the chunk's statistics or its page
 index (a file declaring IEEE_754_TOTAL_ORDER must write one), or by the NaN probe, which reads the float chunk alone and
 tests its values (its dictionary, when every page is coded) before any row group is planned. A missing count means NaN
-may be present. ZPQ writes `nan_count` for every float chunk it encodes; a chunk it byte-copies keeps its source's
+may be present. zpq writes `nan_count` for every float chunk it encodes; a chunk it byte-copies keeps its source's
 statistics, count or no count. The probe runs for row output, writes and S3 reads; aggregates over local files use it
 only for uncompressed chunks, where it costs less than the scan it replaces.
 
@@ -424,7 +424,7 @@ Projection/write paths still require `--fast-levels`.
 
 Statistics cannot prune an `=` or `IN` on a column whose values span its whole range in every row group, such as an
 ID, a UUID or a trace key. Two structures can: a column chunk's split-block Bloom filter, and the dictionary of a chunk
-whose every data page is dictionary-encoded. ZPQ reads both, for the row groups statistics keep and the literals they
+whose every data page is dictionary-encoded. zpq reads both, for the row groups statistics keep and the literals they
 leave open, and skips a row group that neither could contain. Neither has false negatives, so a skipped row group never
 held a match; `--scan-all` turns both off along with statistics.
 
@@ -448,7 +448,7 @@ copies; a column dropped or re-encoded loses its filter unless `--bloom-filter` 
 
 CI ([`.github/workflows/verify.yml`](.github/workflows/verify.yml)) runs unit tests, Lambda integration tests, CLI
 cross-implementation smoke, and the `apache/parquet-testing` conformance corpus on every code change. The smoke path
-validates ZPQ-written Parquet with pyarrow; the workflow also identity-checks the Lambda deploy artifact to catch the
+validates zpq-written Parquet with pyarrow; the workflow also identity-checks the Lambda deploy artifact to catch the
 "packaged an incorrect binary" class of bug.
 
 ## Build

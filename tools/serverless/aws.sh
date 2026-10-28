@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/serverless/aws.sh
-# Helper script for AWS Lambda operations with ZPQ.
+# Helper script for AWS Lambda operations with zpq.
 # Requires: AWS CLI configured, .env with credentials (optional)
 
 set -euo pipefail
@@ -377,7 +377,7 @@ delete() {
 # --- Help ---
 usage() {
     cat <<EOF
-ZPQ AWS Lambda Helper
+zpq AWS Lambda Helper
 
 Usage: $0 <command> [args...]
 

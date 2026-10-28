@@ -1,6 +1,6 @@
 # Bloom filters and dictionaries
 
-How ZPQ uses split-block Bloom filters (SBBF, parquet-format `BloomFilter.md`) and dictionary pages to skip row groups
+How zpq uses split-block Bloom filters (SBBF, parquet-format `BloomFilter.md`) and dictionary pages to skip row groups
 on equality, and how it writes filters. Code: `src/core/parquet/bloom.zig` (format, probe, builder),
 `src/core/filter/membership.zig` (what to probe and how to read it), `src/core/filter/prune.zig` (where the answer is
 used).

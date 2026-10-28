@@ -170,7 +170,7 @@ Max Memory Used: 78 MB  Init Duration: 4.13 ms
 nothing to load. The full `zpq-lambda` binary, at about 10 MB zipped, measured 18–35 ms (median per scenario) on
 2026-10-05; see [Cold starts are the design point](#cold-starts-are-the-design-point).
 
-## Implications for ZPQ v2 architecture
+## Implications for zpq v2 architecture
 
 These findings should drive the current architecture, not be appended to it:
 

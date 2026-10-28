@@ -1,6 +1,6 @@
 # Third Party Notices
 
-This file contains licensing and notice information for third-party software used by ZPQ.
+This file contains licensing and notice information for third-party software used by zpq.
 
 ---
 

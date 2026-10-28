@@ -157,10 +157,10 @@ class Answers(unittest.TestCase):
 class Replay(unittest.TestCase):
     def test_old_runs_are_quarantined_not_scored(self):
         with tempfile.TemporaryDirectory() as d:
-            old = Path(d, "granite-abc-cold")
+            old = Path(d, "host-abc-cold")
             old.mkdir()
             cases = [{"suite": "s", "dataset": "d", "query_id": str(i)} for i in range(2)]
-            Path(d, "granite-abc-cold.config.json").write_text(json.dumps(
+            Path(d, "host-abc-cold.config.json").write_text(json.dumps(
                 {"reps": 3, "cases": cases, "engines": {"zpq": {}}, "candidates": {"zpq": {"revision": "f" * 40}}}))
             rows = [{"type": "attempt", "suite": "s", "dataset": "d", "query_id": str(i), "engine": e, "rep": k,
                      "status": "ok", "validation": "ok", "wall_ns": (2000 if (i, k) == (1, 2) else 30) * MS}

@@ -1,4 +1,4 @@
-"""Rescore a scorecard-v1 run (tools/verify's harness, e.g. granite's cold lanes) under this bench's rules.
+"""Rescore a scorecard-v1 run (the earlier tools/verify harness's records) under this bench's rules.
 
 A replay cannot re-run anything, so a disturbed case is quarantined at once (max_round 0). Old records carry no
 PSI, so every wall-time signature counts as a stall and the lane is at best UNCERTIFIED. Only the latest attempt

@@ -6,7 +6,7 @@ votes (`suites.py`, 464 cases), with the previous zpq build as a same-host contr
 
 ```sh
 zig build check-runner -Doptimize=ReleaseSafe          # zig-out/bin/zpq-check
-python -m bench run --host granite --lane cold --binary zig-out/bin/zpq --prev ~/bench/zpq-fair/zpq-90e9cdf
+python -m bench run --host HOST --lane cold --binary zig-out/bin/zpq --prev PATH/TO/PREVIOUS/zpq
 python -m bench score ~/bench/runs/RUN...             # re-score; writes RUN/score.json
 python -m bench replay OLD_RUN --out DIR              # an old scorecard-v1 run under these rules
 ```
@@ -40,7 +40,7 @@ most twice; if still disturbed it is quarantined: no median, listed with its evi
 
 `score.py`: a case's engine median needs every rep checked. Ship bar: zpq beats each rival on a majority of cases,
 at most 20% behind the best rival, none over 1.5x. The denominator is every planned case; a zpq error, timeout or
-wrong answer is a failed cell (behind and over 1.5x); a rival's failure counts as zpq beating it; quarantined cases
+incorrect answer is a failed cell (behind and over 1.5x); a rival's failure counts as zpq beating it; quarantined cases
 are neither. The lane is INCOMPLETE when a cell has no result or more than 2% of cases are quarantined, UNCERTIFIED
 without PSI (or for `--smoke`), else COMPLETE (exit 0, 2, 3). The control's geomean is reported, never scored.
 
@@ -54,7 +54,8 @@ judged again. `--resume RUN` continues a run whose pins are unchanged.
 
 zpq has no views, so its ClickBench SQL is the query in DuckDB's fair form: create.sql's view and macro written in
 place (`EventDate` as `make_date(EventDate)`, `toDateTime(t)` as `epoch_ms(t * 1000)`); DuckDB and the oracle read
-through the view itself. Polars answers keep `EventTime` as epoch seconds only when it is still a timestamp (ClickBench q18 groups on a
-derived minute of that name). Writes use each shape's codec; zstd at level 3 where the engine takes a level.
+through the view itself. Polars answers keep `EventTime` as epoch seconds only when it is still a timestamp
+(ClickBench q18 groups on a derived minute of that name). Writes use each shape's codec; zstd at level 3 where the
+engine takes a level.
 
 `python -m unittest discover -s bench/tests` checks the rules (the `bench-self` stage of the commit tier).

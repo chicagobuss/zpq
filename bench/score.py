@@ -1,9 +1,9 @@
 """A lane's score: per case and engine the median of its checked reps, the ship bar, the control, the verdict.
 
-Ship bar (the lead's rule): zpq beats DuckDB 2.0 and Polars 2.0 each on a majority of cases, at most 20% of cases
+Ship bar (the 0.5.0 release rule): zpq beats DuckDB 2.0 and Polars 2.0 each on a majority of cases, at most 20% of cases
 behind the best rival, and none more than 1.5x behind. The denominator is every planned case:
 
-- a zpq failure (error, timeout, wrong answer) is behind and over 1.5x: a failed cell, never a skipped one;
+- a zpq failure (error, timeout, incorrect answer) is behind and over 1.5x: a failed cell, never a skipped one;
 - a rival's failure counts as zpq beating that rival, when zpq succeeded;
 - a quarantined case is neither a win nor behind, and stays in the denominator.
 

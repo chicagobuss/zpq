@@ -206,6 +206,10 @@ pub fn handleStaged(
     legacy: ?Legacy,
     staged: ?*zpq.output_publication.OutputPublication,
 ) ![]u8 {
+    return handleWithColumns(io, allocator, env, body, pool, legacy, staged, null);
+}
+
+pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.process.Environ, body: []const u8, pool: *PersistentPool, legacy: ?Legacy, staged: ?*zpq.output_publication.OutputPublication, columns: ?engine.ColumnarSink) ![]u8 {
     if (body.len == 0) {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"empty_body\"}}", .{});
     }
@@ -284,7 +288,7 @@ pub fn handleStaged(
         // The profile's buffers come out of the query's budget, sized to it (`profile.Options.forBudget`).
         const prof_opts = zpq.profile.Options.forBudget(budget);
         // A query that aggregates or writes holds its whole budget while it runs, where a gate is set.
-        const runs = req.sql != null or req.aggregate != null or req.group_by != null or req.output_url != null;
+        const runs = columns != null or req.sql != null or req.aggregate != null or req.group_by != null or req.output_url != null;
         const gate: ?Admission = if (runs) pool.admission else null;
         if (gate) |g| g.acquireFn(g.ctx, budget, req.budget_wait_ms) catch |err| switch (err) {
             // The caller's handle is going away: no response, the ABI reports it.
@@ -339,6 +343,8 @@ pub fn handleStaged(
             .row_groups = req.row_groups,
         };
         qa.profiler = profiler;
+        qa.columnar_sink = columns;
+        if (columns != null and qa.output != null) return rejectResponse(allocator, "bad_request", "ArrowOutputUrlConflict", "field", "output_url");
 
         // An answer returned inline is built whole, beside the query. On Lambda it can be no larger than the 6 MB a
         // response may be (a larger one was posted and refused, with no reason given). Elsewhere the floor of 1 GiB
@@ -346,7 +352,7 @@ pub fn handleStaged(
         // set for the scan, not the answer.
         const on_lambda = zpq.core.system.onLambda(env);
         const default_cap = if (on_lambda) lambda_result_cap else @max(budget, default_result_floor);
-        const result_cap: ResultCap = .{ .bytes = req.max_result_bytes orelse default_cap, .lambda = on_lambda };
+        const result_cap: ResultCap = .{ .bytes = if (columns != null) std.math.maxInt(usize) / 3 else req.max_result_bytes orelse default_cap, .lambda = on_lambda };
         if (req.sql) |sql| {
             const response = try runSql(io, allocator, env, pool, qa, sql, result_cap);
             const p = profiler orelse return response;
@@ -363,6 +369,11 @@ pub fn handleStaged(
             const response = try runWrite(io, allocator, env, pool, qa, staged);
             const p = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
+        }
+        if (columns != null) {
+            var registry = persistentPoolAdapter(pool);
+            _ = engine.runPrintSink(.{ .gpa = allocator, .env = env, .io = io, .pool_registry = &registry, .meta_cache = pool.metaCache(), .worker_io = pool.worker_io }, qa, .jsonl, null, -1, 0, null) catch |err| return engineError(allocator, err, &zpq.core.diag.Diag{});
+            return allocator.dupe(u8, "{}");
         }
         const f = legacy orelse return rejectResponse(
             allocator,
@@ -566,6 +577,15 @@ fn executeSql(
         .meta_cache = pool.metaCache(),
         .worker_io = pool.worker_io,
     };
+    if (qa.columnar_sink != null) {
+        if (qa.aggregate != null or qa.group_by != null) {
+            var result = try engine.runQuery(ctx, qa);
+            defer result.deinit(allocator);
+        } else {
+            _ = try engine.runPrintSink(ctx, qa, .jsonl, if (pq.result_order.limit) |n| @intCast(n) else null, -1, @intCast(pq.result_order.offset), null);
+        }
+        return allocator.dupe(u8, "{}");
+    }
     var out: std.Io.Writer.Allocating = .init(result_memory);
     defer out.deinit();
     try out.writer.writeAll("{\"ok\":true,\"ndjson\":\"");
@@ -853,6 +873,11 @@ fn runAggregate(
     var args = qa;
     args.diag = &diag;
 
+    if (qa.columnar_sink != null) {
+        var result = engine.runQuery(.{ .gpa = allocator, .env = env, .io = io, .pool_registry = &registry, .meta_cache = pool.metaCache(), .worker_io = pool.worker_io }, args) catch |err| return engineError(allocator, err, &diag);
+        defer result.deinit(allocator);
+        return allocator.dupe(u8, "{}");
+    }
     var capped: Capped = .{ .parent = allocator, .cap = result_cap.memory() };
     var aw: std.Io.Writer.Allocating = .init(capped.allocator());
     defer aw.deinit();

@@ -20,6 +20,7 @@ mkdir -p "$TMPDIR"
 "$SCRIPT_DIR/build.sh"
 
 "$SPARK_DIR/bin/spark-submit" \
+  --jars "${ZPQ_ARROW_C_DATA_JAR:?set ZPQ_ARROW_C_DATA_JAR}" \
   --master "local[16]" \
   --driver-memory 8g \
   --conf "spark.driver.extraJavaOptions=--enable-native-access=ALL-UNNAMED -Djava.io.tmpdir=$TMPDIR" \

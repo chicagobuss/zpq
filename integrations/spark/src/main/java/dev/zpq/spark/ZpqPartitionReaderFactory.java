@@ -42,6 +42,17 @@ public final class ZpqPartitionReaderFactory implements PartitionReaderFactory {
     }
 
     @Override
+    public boolean supportColumnarReads(InputPartition partition) {
+        return !readSchema.isEmpty() && "arrow".equalsIgnoreCase(options.getOrDefault("rowMode", "arrow"));
+    }
+
+    @Override
+    public PartitionReader<org.apache.spark.sql.vectorized.ColumnarBatch> createColumnarReader(InputPartition partition) {
+        return new ZpqArrowReader((ZpqInputPartition) partition, readSchema, options,
+            zpqFilter, hasPushedAggregation, zpqGroupBy, zpqAggregate);
+    }
+
+    @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
         return new ZpqPartitionReader(
             (ZpqInputPartition) partition,

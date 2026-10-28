@@ -260,6 +260,43 @@ pub const Error = error{
     RowGroupOutOfRange,
 } || std.mem.Allocator.Error;
 
+/// Typed synchronous handoff. Columns borrow the query; a sink must own anything it retains.
+pub const ColumnarSink = struct {
+    ctx: *anyopaque,
+    schema_fn: *const fn (*anyopaque, []const expr_agg.OutputCol) anyerror!void,
+    batch_fn: *const fn (*anyopaque, []const expr_agg.OutputCol, usize, usize) anyerror!void,
+};
+
+test "Arrow columnar handoff applies the same row cut as text output" {
+    const Capture = struct {
+        schemas: usize = 0,
+        rows: usize = 0,
+        fn schemaFn(ptr: *anyopaque, cols: []const expr_agg.OutputCol) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.schemas += 1;
+            try std.testing.expectEqual(@as(usize, 1), cols.len);
+            try std.testing.expectEqualStrings("id", cols[0].name);
+        }
+        fn batchFn(ptr: *anyopaque, cols: []const expr_agg.OutputCol, lo: usize, hi: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), cols.len);
+            try std.testing.expect(hi > lo);
+            self.rows += hi - lo;
+        }
+    };
+    const ctx: Context = .{ .gpa = std.testing.allocator, .env = .empty, .io = std.testing.io };
+    var capture: Capture = .{};
+    var args: QueryArgs = .{ .inputs = &.{"ci/fixtures/parquet/nullable_mix.parquet"}, .columns = &.{"id"}, .parallelism = 1 };
+    var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text.deinit();
+    const want = try runPrintSink(ctx, args, .jsonl, 3, -1, 1, &text.writer);
+    args.columnar_sink = .{ .ctx = &capture, .schema_fn = Capture.schemaFn, .batch_fn = Capture.batchFn };
+    const got = try runPrintSink(ctx, args, .jsonl, 3, -1, 1, null);
+    try std.testing.expectEqual(@as(usize, 1), capture.schemas);
+    try std.testing.expectEqual(want.rows, capture.rows);
+    try std.testing.expectEqual(want.rows, got.rows);
+}
+
 pub const QueryArgs = struct {
     /// Force eligible GROUP BY queries through shared partitions.
     partagg: bool = false,
@@ -279,6 +316,7 @@ pub const QueryArgs = struct {
         ctx: *anyopaque,
         write_fn: *const fn (*anyopaque, AggResult) anyerror!void,
     } = null,
+    columnar_sink: ?ColumnarSink = null,
     empty_scalar: bool = false,
     quiet_diagnostics: bool = false,
     filter: ?[]const u8 = null,
@@ -955,6 +993,11 @@ fn executeAggregateOver(
         profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
     }
 
+    if (args.columnar_sink) |cs| {
+        try exportAggregateColumns(ctx.gpa, arena, cs, r, n_aggs, args.empty_scalar);
+        releaseStreamAnswer(&r.output);
+    }
+
     // Text used to print only after runQuery returned: preserve its input/error check before the first byte.
     try opened.intact();
     if (args.output == null) if (args.text_output) |text| {
@@ -991,6 +1034,63 @@ fn executeAggregateOver(
     // The returned arenas live with AggResult; this invocation's ledger is stack-local.
     answer.output.detachArenaLedger();
     return answer;
+}
+
+fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: ColumnarSink, r: anytype, n_aggs: usize, empty: bool) !void {
+    const out = r.output;
+    if (out.integer_stream) |stream| {
+        var lo: usize = 0;
+        while (true) {
+            var window = std.heap.ArenaAllocator.init(gpa);
+            defer window.deinit();
+            const hi = @min(stream.state.group_count, lo + consumer.answer_rg_rows);
+            const a = try stream.window(window.allocator(), r.state.group_col_types.?, lo, hi, 1);
+            const cols = try typedColumns(window.allocator(), out.group_cols.?, r.state.group_col_types.?, a);
+            if (lo == 0) try cs.schema_fn(cs.ctx, cols.items);
+            if (hi > lo) try cs.batch_fn(cs.ctx, cols.items, 0, hi - lo);
+            lo = hi;
+            if (lo == stream.state.group_count) return;
+        }
+    }
+    if (out.byte_stream) |stream| {
+        var lo: usize = 0;
+        while (true) {
+            var window = std.heap.ArenaAllocator.init(gpa);
+            defer window.deinit();
+            const hi = @min(stream.state.group_count, lo + consumer.answer_rg_rows);
+            const a = try stream.window(window.allocator(), lo, hi, 1);
+            for (r.state.group_col_types.?, a.columns) |ty, *col| if (ty.source) |src| {
+                col.* = try retypeOutputCol(window.allocator(), col.*, src);
+            };
+            if (lo == 0) try cs.schema_fn(cs.ctx, a.columns);
+            if (hi > lo) try cs.batch_fn(cs.ctx, a.columns, 0, hi - lo);
+            lo = hi;
+            if (lo == stream.state.group_count) return;
+        }
+    }
+    var cols: std.ArrayList(expr_agg.OutputCol) = .empty;
+    var rows: usize = 0;
+    if (out.typed) |typed| {
+        cols = try typedColumns(arena, out.group_cols.?, r.state.group_col_types.?, typed);
+        rows = typed.rows;
+    } else if (out.group_rows) |group_rows| {
+        cols = try groupedColumns(arena, out.group_cols.?, r.state.group_col_types.?, group_rows);
+        rows = group_rows.len;
+    } else {
+        for (r.state.agg_calls[0..n_aggs], 0..) |call, i| {
+            for (try expr_agg.finalize(arena, call, r.state.accumulators[i])) |col| {
+                try cols.append(arena, if (r.state.agg_sources[i]) |src| try retypeOutputCol(arena, col, src) else col);
+            }
+        }
+        rows = if (empty or out.no_row) 0 else 1;
+    }
+    try cs.schema_fn(cs.ctx, cols.items);
+    var lo: usize = 0;
+    while (lo < rows) {
+        const hi = @min(rows, lo + consumer.answer_rg_rows);
+        try cs.batch_fn(cs.ctx, cols.items, lo, hi);
+        lo = hi;
+    }
 }
 
 fn releaseStreamAnswer(answer: *scan.AggOutput) void {
@@ -5822,17 +5922,7 @@ fn writeOneRowParquet(
 
 /// Write GROUP BY results as parquet: one row per group, columns in `cols` order, values exactly as the JSON output
 /// reports them. avg_state splits into `<name>__sum` / `<name>__count` as in the 1-row output.
-fn writeGroupedParquet(
-    arena: std.mem.Allocator,
-    out_path: []const u8,
-    cols: []const []const u8,
-    types: []const scan.GroupColType,
-    rows: []const []const scan.AggValue,
-    codec: schema.CompressionCodec,
-    zstd: compression.ZstdPlan,
-    encode: consumer.AggEncode,
-    output_fd: ?local_fs.fd_t,
-) !u64 {
+fn groupedColumns(arena: std.mem.Allocator, cols: []const []const u8, types: []const scan.GroupColType, rows: []const []const scan.AggValue) !std.ArrayList(expr_agg.OutputCol) {
     var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (cols, types, 0..) |name, ty, ci| switch (ty.lane) {
         inline .i64, .f64, .string => |lane| {
@@ -5865,6 +5955,21 @@ fn writeGroupedParquet(
         },
     };
 
+    return outs;
+}
+
+fn writeGroupedParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    cols: []const []const u8,
+    types: []const scan.GroupColType,
+    rows: []const []const scan.AggValue,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+) !u64 {
+    const outs = try groupedColumns(arena, cols, types, rows);
     const fd = output_fd orelse try createFile(out_path);
     var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
@@ -5880,17 +5985,7 @@ fn writeGroupedParquet(
 
 /// `writeGroupedParquet` for an answer built as typed columns (`scan.TypedAnswer`): the same columns, names, types and
 /// file, with no row of values in between.
-fn writeTypedParquet(
-    arena: std.mem.Allocator,
-    out_path: []const u8,
-    cols: []const []const u8,
-    types: []const scan.GroupColType,
-    answer: scan.TypedAnswer,
-    codec: schema.CompressionCodec,
-    zstd: compression.ZstdPlan,
-    encode: consumer.AggEncode,
-    output_fd: ?local_fs.fd_t,
-) !u64 {
+fn typedColumns(arena: std.mem.Allocator, cols: []const []const u8, types: []const scan.GroupColType, answer: scan.TypedAnswer) !std.ArrayList(expr_agg.OutputCol) {
     var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (cols, types, answer.columns) |name, ty, col| switch (col) {
         inline .i64, .f64, .string => |l, tag| {
@@ -5916,6 +6011,21 @@ fn writeTypedParquet(
             try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
         },
     };
+    return outs;
+}
+
+fn writeTypedParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    cols: []const []const u8,
+    types: []const scan.GroupColType,
+    answer: scan.TypedAnswer,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+) !u64 {
+    const outs = try typedColumns(arena, cols, types, answer);
     const fd = output_fd orelse try createFile(out_path);
     var fd_open = output_fd == null;
     defer if (fd_open) local_fs.close(fd);
@@ -6695,6 +6805,7 @@ pub const StdoutWriter = struct {
     json_array: bool = false,
     skip_remaining: usize = 0,
     parquet: ?*ParquetPrint = null,
+    columnar: ?ColumnarSink = null,
     /// Names the column of a value that cannot be printed (`TextKind`).
     diag: ?*Diag = null,
 
@@ -8910,6 +9021,23 @@ fn printRowGroupSliced(
     return true;
 }
 
+fn aggregatorColumns(arena: std.mem.Allocator, agg: *consumer.OutputAggregator, names: []const []const u8) ![]expr_agg.OutputCol {
+    const cols = try arena.alloc(expr_agg.OutputCol, names.len);
+    for (cols, names, agg.cols, agg.schema_elems) |*out, name, buf, elem| {
+        out.* = .{
+            .name = name,
+            .col = consumer.bufRows(buf, 0, agg.num_rows),
+            .parquet_type = elem.type.?,
+            .type_length = elem.type_length,
+            .nullable = elem.repetition_type == .OPTIONAL,
+            .logical_type = elem.logical_type,
+            .converted_type = elem.converted_type,
+            .dec = if (decimal_mod.kindFromSchema(&elem)) |d| .{ .precision = @intCast(d.precision), .scale = @intCast(d.scale) } else null,
+        };
+    }
+    return cols;
+}
+
 fn flushAggregator(
     agg: *consumer.OutputAggregator,
     names: []const []const u8,
@@ -8921,6 +9049,16 @@ fn flushAggregator(
     if (agg.num_rows > 0 and writer.output_started_ns == 0) writer.output_started_ns = nowMonoNs();
     if (writer.parquet) |pq| {
         try pq.append(agg, limit, total_printed, &writer.skip_remaining);
+        return;
+    }
+    if (writer.columnar) |cs| {
+        const lo = @min(writer.skip_remaining, agg.num_rows);
+        writer.skip_remaining -= lo;
+        const hi = lo + @min(agg.num_rows - lo, if (limit) |n| n -| total_printed.* else agg.num_rows);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer scratch.deinit();
+        if (hi > lo) try cs.batch_fn(cs.ctx, try aggregatorColumns(scratch.allocator(), agg, names), lo, hi);
+        total_printed.* += hi - lo;
         return;
     }
     if (agg.num_rows == 0) return;
@@ -9256,6 +9394,13 @@ fn runPrintSinkOver(
         .computed => {},
     };
 
+    if (args.columnar_sink != null) for (output_specs) |spec| switch (spec) {
+        .passthrough => |pt| if (metadata.leafSchemaElement(meta0, pt.ci)) |elem| {
+            if (decimal_mod.kindFromSchema(&elem)) |d| if (d.precision > 38) return error.UnsupportedDecimalPrecision;
+        },
+        .computed => {},
+    };
+
     var agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
 
     var parquet: ParquetPrint = .{
@@ -9280,6 +9425,7 @@ fn runPrintSinkOver(
         .fd = fd,
         .sink = sink,
         .json_array = format == .json,
+        .columnar = args.columnar_sink,
         .skip_remaining = offset,
         .parquet = if (format == .parquet) &parquet else null,
         .output_started_ns = output_started_ns,
@@ -9288,6 +9434,7 @@ fn runPrintSinkOver(
     defer stdout_writer.flush() catch {};
 
     const names = try proj.names(arena);
+    if (args.columnar_sink) |cs| try cs.schema_fn(cs.ctx, try aggregatorColumns(arena, &agg, names));
     if (args.decimal_columns) |dc| for (output_specs, names) |spec, name| {
         const decimal = switch (spec) {
             .passthrough => |pt| if (metadata.leafSchemaElement(meta0, pt.ci)) |elem|

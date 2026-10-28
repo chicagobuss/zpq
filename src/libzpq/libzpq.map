@@ -4,6 +4,7 @@ LIBZPQ_1 {
   global:
     zpq_open;
     zpq_run;
+    zpq_run_arrow;
     zpq_free;
     zpq_shutdown;
     zpq_close;

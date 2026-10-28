@@ -11,6 +11,7 @@ const zpq = @import("zpq");
 const service = @import("service");
 const Budget = @import("budget.zig").Budget;
 const c = std.c;
+const arrow = @import("arrow.zig");
 
 /// malloc and free, so a host's leak checker (ASan, valgrind) sees every allocation.
 const gpa = std.heap.c_allocator;
@@ -261,6 +262,68 @@ export fn zpq_run(
     out_json.?.* = buf[0..response.len :0].ptr;
     if (out_len) |l| l.* = response.len;
     return @backingInt(Status.ok);
+}
+
+/// The request selects Arrow by this entry point. The producer holds context admission until it finishes.
+export fn zpq_run_arrow(ctx: ?*Ctx, request_json: ?[*]const u8, len: usize, out_stream: ?*arrow.Stream, out_error: ?*?[*:0]u8) c_int {
+    if (out_error) |out| out.* = null;
+    if (out_stream) |out| out.* = .{};
+    const self = ctx orelse return fail(out_error, .einval, "NullContext");
+    const out = out_stream orelse return fail(out_error, .einval, "NullStream");
+    if (len > std.math.maxInt(isize)) return fail(out_error, .einval, "BadLength");
+    const req = request_json orelse if (len == 0) "" else return fail(out_error, .einval, "NullRequest");
+    if (!self.enter()) return fail(out_error, .eclosed, "Closed");
+    const state = gpa.create(arrow.State) catch {
+        self.leave();
+        return @backingInt(Status.enomem);
+    };
+    const body = gpa.dupe(u8, req[0..len]) catch {
+        gpa.destroy(state);
+        self.leave();
+        return @backingInt(Status.enomem);
+    };
+    var cap = @max(self.budget.ceiling, 1 << 30);
+    if (std.json.parseFromSlice(std.json.Value, gpa, body, .{})) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("max_memory")) |v| {
+                const budget: usize = switch (v) {
+                    .integer => |n| std.math.cast(usize, n) orelse 0,
+                    .string => |s| zpq.core.system.parseSizeString(s) catch 0,
+                    else => 0,
+                };
+                cap = @max(budget, 1 << 30);
+            }
+            if (parsed.value.object.get("max_result_bytes")) |v| if (v == .integer and v.integer >= 0) {
+                cap = @intCast(v.integer);
+            };
+        }
+    } else |_| {}
+    state.* = .{ .context = self, .body = body, .producer = arrowProducer, .charge = .{ .cap = cap } };
+    state.thread = zpq.core.spawn.spawn(.{ .stack_size = request_stack_size }, arrowProducer, .{state}) catch {
+        gpa.free(body);
+        gpa.destroy(state);
+        self.leave();
+        return fail(out_error, .einternal, "ThreadSpawnFailed");
+    };
+    out.* = state.stream();
+    return @backingInt(Status.ok);
+}
+
+fn arrowProducer(state: *arrow.State) void {
+    const ctx: *Ctx = @ptrCast(@alignCast(state.context));
+    defer ctx.leave();
+    const response = service.handleWithColumns(ctx.threaded.io(), gpa, processEnviron(), state.body, &ctx.pool, null, null, state.sink()) catch |err| {
+        state.finish(@errorName(err), err == error.OutOfMemory);
+        return;
+    };
+    defer gpa.free(response);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, response, .{}) catch |err| {
+        state.finish(@errorName(err), err == error.OutOfMemory);
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value == .object and parsed.value.object.contains("error")) state.finish(response, false) else state.finish(null, false);
 }
 
 /// The stack a request runs on: the CLI's main-thread default, which the parser depth caps (`MAX_GROUP_DEPTH`,

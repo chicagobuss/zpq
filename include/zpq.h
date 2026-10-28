@@ -37,6 +37,39 @@
 #define ZPQ_H
 
 #include <stddef.h>
+#include <stdint.h>
+
+/* Arrow's stable C structures (Apache-2.0), with their canonical guards. */
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+struct ArrowSchema {
+    const char *format, *name, *metadata;
+    int64_t flags, n_children;
+    struct ArrowSchema **children, *dictionary;
+    void (*release)(struct ArrowSchema *);
+    void *private_data;
+};
+struct ArrowArray {
+    int64_t length, null_count, offset, n_buffers, n_children;
+    const void **buffers;
+    struct ArrowArray **children, *dictionary;
+    void (*release)(struct ArrowArray *);
+    void *private_data;
+};
+#endif
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+struct ArrowArrayStream {
+    int (*get_schema)(struct ArrowArrayStream *, struct ArrowSchema *);
+    int (*get_next)(struct ArrowArrayStream *, struct ArrowArray *);
+    const char *(*get_last_error)(struct ArrowArrayStream *);
+    void (*release)(struct ArrowArrayStream *);
+    void *private_data;
+};
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +119,22 @@ int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error);
  * against a query's budget but not every allocation, so a query can use more than it declared (docs/libzpq.md).
  */
 int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json, size_t *out_len);
+
+/*
+ * Arrow C stream result, additive in LIBZPQ_1. This function selects Arrow; request_json uses the existing SQL or
+ * structured projection/filter/aggregate request. output_url and unsupported nested/logical types are refused.
+ * ZPQ_OK means *out_stream owns a live stream. Query failures (including before its first batch) are reported by
+ * get_schema/get_next as errno codes, with get_last_error's UTF-8 message. EOF is 0 with out.release == NULL.
+ * Call failures use zpq_status and an optional zpq_free-owned *out_error. Failure clears out_stream.
+ * Serialize callbacks on a stream. Separate streams may run concurrently. Release the stream before zpq_close;
+ * release cancels further production and joins its producer. Each schema/batch is owned independently, survives
+ * stream/context release and is freed by its own release callback, on any thread. Keep libzpq loaded until then.
+ * max_result_bytes caps cumulative Arrow buffer bytes, excluding schemas/structures, before handing out a batch.
+ * Its default is max(request budget, 1 GiB). Earlier batches remain valid on error. Retained arrays are caller-held
+ * memory; the bounded producer queue is separate from them. max_memory retains the existing query-budget meaning.
+ */
+int zpq_run_arrow(zpq_ctx *ctx, const char *request_json, size_t len,
+                  struct ArrowArrayStream *out_stream, char **out_error);
 
 /* Free a response or message from zpq_open or zpq_run. NULL is a no-op. Any thread. */
 void zpq_free(char *json);

@@ -17,7 +17,7 @@ find "$SCRIPT_DIR/src/main/java" -name "*.java" > "$OUT_DIR/build/sources.txt"
 
 TMPDIR="$OUT_DIR/tmp" "$JDK_HOME/bin/javac" \
   --release 25 \
-  -cp "$SPARK_HOME/jars/*" \
+  -cp "$SPARK_HOME/jars/*:${ZPQ_ARROW_C_DATA_JAR:?set ZPQ_ARROW_C_DATA_JAR to arrow-c-data-19.0.0.jar}" \
   -d "$CLASSES_DIR" \
   @"$OUT_DIR/build/sources.txt"
 

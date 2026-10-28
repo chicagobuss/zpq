@@ -314,6 +314,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
     const python = b.option([]const u8, "python", "Python with PyArrow (readback, contracts)") orelse
         ".venv/bin/python";
+    const oracle_cache = b.option([]const u8, "oracle-cache", "Override the correctness oracle's writable cache directory");
     const clickbench = b.option([]const u8, "clickbench", "ClickBench partitions (sub1/, sub16/)") orelse
         b.fmt("{s}/bench/zpq-fair/data/clickbench", .{home});
 
@@ -395,6 +396,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         r.addArtifactArg(runner);
         for (c.files) |f| r.addArgs(&.{ "--cases", f });
         r.addArgs(&.{ "--duckdb", duckdb, "--python", python, "--work", b.fmt("zig-out/check-work-{s}", .{c.name}) });
+        if (oracle_cache) |path| r.addArgs(&.{ "--cache", path });
         if (c.fresh) r.addArg("--no-cache");
         if (c.data) |d| r.addArgs(&.{ "--data", d });
         r.addArg("--zpq");

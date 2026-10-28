@@ -85,3 +85,23 @@ spark-submit --master "local[16]" \
   --class dev.zpq.spark.ZpqBenchSuite \
   zig-out/spark/zpq-spark.jar single zpq CB_Q20
 ```
+# Arrow C Data batches
+
+The default result mode on `exp/arrow-cdata` is `rowMode=arrow`. The data source imports libzpq's Arrow C stream
+using Arrow Java 19.0.0's `Data.importArrayStream`, wraps the vectors as Spark `ColumnarBatch` objects, and splits
+row scans by row group. It keeps each imported batch alive until the next pull or reader close. Spark's unsigned
+Parquet widening and `binaryAsString` policy are applied by column accessors. Empty-schema count scans keep their
+metadata count path. `rowMode=ndjson` selects the earlier row reader; `rowMode=parquet` selects its staging path.
+
+Supply the Apache Maven artifact `org.apache.arrow:arrow-c-data:19.0.0` (matching Spark 4.2.1's Arrow jars) using
+`ZPQ_ARROW_C_DATA_JAR=/assigned/output/arrow-c-data-19.0.0.jar` when building and `spark-submit --jars` when running.
+Its jar includes the JNI C Data shim. `java.io.tmpdir` must point at the assigned output directory for native
+extraction and Spark scratch. Keep the probe's shared JDK, Spark installation, and input data read-only; set
+`ZPQ_SPARK_OUT_DIR`, `JAVA_HOME`, and `SPARK_HOME` to select separate output and runtime locations.
+
+Run the existing correctness suite with `check_correctness.sh`, setting `ZPQ_SPARK_OUT_DIR` to assigned output,
+`ZPQ_SPARK_JDK_DIR` and `ZPQ_SPARK_HOME` to the shared runtimes, and passing ClickBench and decimal/date inputs.
+`dev.zpq.spark.ZpqArrowBench` takes the ClickBench directory and compares warm Parquet, NDJSON, and Arrow medians
+of three for the original pushed queries and the unpushed 169K/4M-row cases. Timing is informal and should record
+desktop load and the native build mode.
+

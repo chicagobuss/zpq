@@ -30,6 +30,7 @@ public final class ZpqNative {
     private final Arena libArena;
     private final MethodHandle zpqOpen;
     private final MethodHandle zpqRun;
+    private final MethodHandle zpqRunArrow;
     private final MethodHandle zpqFree;
     private final MethodHandle zpqShutdown;
     private final MethodHandle zpqClose;
@@ -62,6 +63,10 @@ public final class ZpqNative {
                     ValueLayout.ADDRESS
                 )
             );
+            this.zpqRunArrow = linker.downcallHandle(
+                lib.find("zpq_run_arrow").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
             this.zpqFree = linker.downcallHandle(
                 lib.find("zpq_free").orElseThrow(),
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)
@@ -203,6 +208,43 @@ public final class ZpqNative {
                     stateLock.notifyAll();
                 }
             }
+        }
+    }
+
+    public final class ArrowCall implements AutoCloseable {
+        public final org.apache.arrow.vector.ipc.ArrowReader reader;
+        private boolean closed;
+        private ArrowCall(org.apache.arrow.vector.ipc.ArrowReader reader) { this.reader = reader; }
+        @Override public void close() throws java.io.IOException {
+            if (closed) return;
+            closed = true;
+            try { reader.close(); } finally { leaveArrow(); }
+        }
+    }
+
+    private void leaveArrow() {
+        synchronized (stateLock) { inflight--; stateLock.notifyAll(); }
+    }
+
+    public ArrowCall openArrow(String request, org.apache.arrow.memory.BufferAllocator allocator) {
+        synchronized (stateLock) {
+            if (closing) throw new IllegalStateException("zpq context is closed");
+            inflight++;
+        }
+        org.apache.arrow.c.ArrowArrayStream stream = null;
+        try (Arena callArena = Arena.ofConfined()) {
+            stream = org.apache.arrow.c.ArrowArrayStream.allocateNew(allocator);
+            byte[] bytes = request.getBytes(StandardCharsets.UTF_8);
+            MemorySegment req = callArena.allocateFrom(ValueLayout.JAVA_BYTE, bytes);
+            MemorySegment error = callArena.allocate(ValueLayout.ADDRESS);
+            int rc = (int) zpqRunArrow.invokeExact(ctx, req, (long) bytes.length,
+                MemorySegment.ofAddress(stream.memoryAddress()), error);
+            if (rc != ZPQ_OK) throw new IllegalStateException("zpq_run_arrow: " + readAndFreeString(error.get(ValueLayout.ADDRESS, 0)));
+            return new ArrowCall(org.apache.arrow.c.Data.importArrayStream(allocator, stream));
+        } catch (Throwable t) {
+            if (stream != null) { stream.release(); stream.close(); }
+            leaveArrow();
+            throw new RuntimeException("Arrow stream import failed", t);
         }
     }
 

@@ -214,6 +214,14 @@ class Zpq:
             raise TypeError("sql must be a string")
         return self.run({**options, "sql": sql})["ndjson"]
 
+    def arrow(self, request):
+        """Return an optional PyArrow stream reader. Close/read it before closing this context."""
+        try:
+            from .zpq_arrow import open_reader
+        except ImportError:
+            from zpq_arrow import open_reader
+        return open_reader(self, request)
+
     def query(self, sql, decimal=True, **options):
         """EXPERIMENTAL in 0.5.0: thin CLI SQL pass-through returning a list of row dicts.
 

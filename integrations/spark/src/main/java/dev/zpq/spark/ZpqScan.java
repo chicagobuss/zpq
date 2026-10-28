@@ -68,11 +68,11 @@ public final class ZpqScan implements Scan, Batch {
     @Override
     public InputPartition[] planInputPartitions() {
         int maxSplits = Integer.parseInt(options.getOrDefault("maxSplits", "16"));
-        String rowMode = options.getOrDefault("rowMode", "ndjson");
+        String rowMode = options.getOrDefault("rowMode", "arrow");
 
         // Structured requests (aggregates, empty-schema count scans, or parquet output_url scans)
         // split across row-group ranges using the row_groups request field (as in fanout.py).
-        if (hasPushedAggregation || readSchema.isEmpty() || "parquet".equalsIgnoreCase(rowMode)) {
+        if (hasPushedAggregation || readSchema.isEmpty() || "parquet".equalsIgnoreCase(rowMode) || "arrow".equalsIgnoreCase(rowMode)) {
             List<ZpqPaths.RowGroupSlice> slices = ZpqPaths.splitRowGroups(files, maxSplits);
             int perSplitParallelism = Math.max(1, 16 / Math.max(1, slices.size()));
             InputPartition[] parts = new InputPartition[slices.size()];

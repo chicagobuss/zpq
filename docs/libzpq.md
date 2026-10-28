@@ -329,3 +329,66 @@ large Parquet writes also start writeback in roughly 64 MiB ranges while later o
 is encoded. This hint does not wait for completion; the final data sync remains the fence.
 This applies to local files; S3 and standard output do not use this option. The parent
 directory is not synced, so this option does not guarantee rename survival after power loss.
+# Arrow C stream results (experimental, 0.5.1 probe)
+
+`zpq_run_arrow(ctx, request, len, &stream, &error)` selects a columnar answer instead of JSON. It is an additive
+symbol in `LIBZPQ_1`; ABI version 1's existing functions and status codes retain their meanings. The request uses
+the existing SQL or structured `inputs`/`columns`/`select`/`filter`/`aggregate`/`group_by` fields. `output_url` conflicts
+with Arrow. The engine's projection, predicates, ordering, limits, and aggregate implementations are shared with
+the JSON path. Neither Arrow C++ nor Arrow Java is linked into libzpq.
+
+The public header contains the canonical [Arrow C Data](https://arrow.apache.org/docs/format/CDataInterface.html)
+and [C Stream](https://arrow.apache.org/docs/format/CStreamInterface.html) structures and guards. The caller owns
+the base stream structure. A successful call returns a live stream; query errors are delivered through its
+callbacks, including errors before the first batch. Call-level errors use `zpq_status` and an optional
+`zpq_free`-owned diagnostic. Stream callbacks use platform errno values and `get_last_error`, with EOF represented
+by success and a null array release callback. Failure after a batch leaves that batch valid.
+
+Serialize all callbacks on one stream. Separate streams run concurrently on libzpq threads with 8 MiB stacks.
+Release each stream before closing its context. Early release cancels production and joins the producer; active
+I/O still obeys the normal S3 timeouts. Schemas and batches have independent storage and release callbacks and may
+outlive the stream and context. They can be moved, and their release callbacks may run on another thread. Keep the
+library loaded until the last callback has run. Never pass an Arrow structure to `zpq_free`.
+
+`max_result_bytes` caps the cumulative sizes of exported validity, offset, and value buffers, excluding schema and
+structure bookkeeping. The default remains max(query memory budget, 1 GiB). A batch that would exceed the cap
+fails before it is handed out. Retaining batches holds caller-owned memory; the producer has one pending batch
+slot, with batches of at most 65,536 rows. `max_memory` keeps its existing declared query-budget meaning.
+
+| Source/result type | Arrow type |
+|---|---|
+| signed/unsigned annotated integers | same width and signedness |
+| unannotated INT32 / INT64 | int32 / int64 |
+| FLOAT / DOUBLE | float32 / float64 |
+| BOOLEAN | bool, bit packed |
+| STRING / ENUM / JSON | UTF-8 |
+| other byte strings | binary |
+| DECIMAL(p,s), p ≤ 38 | decimal128(p,s), exact |
+| DATE | date32 |
+| TIMESTAMP millis / micros / nanos | timestamp with that unit; UTC when adjustedToUTC, otherwise no zone |
+| legacy INT96 | timestamp(ns, UTC), refused when outside Arrow's int64 range |
+| TIME millis / micros / nanos | time32(ms) / time64(us) / time64(ns) |
+| unsupported nested or logical type, DECIMAL past 38 digits | explicit error |
+
+Nulls use validity bitmaps. FLOAT16 follows the engine's existing widening to float64. Aggregate result types use
+the same typed columns as Parquet output (including integer overflow refusal and avg_state's separate sum/count
+columns). No borrowed query-arena buffer escapes: this probe copies numeric values, packs booleans/validity, and
+flattens strings into offsets and data. It does not claim zero-copy from the engine. Arrow Java imports those owned
+buffers without serializing rows. A future transfer path must detach the owning engine allocation first.
+
+With optional PyArrow installed, `python/zpq_arrow.py` imports the stream with
+`pa.RecordBatchReader._import_from_c`. The Python wrapper keeps the context call alive until reader close/EOF:
+
+```python
+with zpq.Zpq(max_memory="2GB") as z:
+    with z.arrow({"sql": "SELECT * FROM 'input.parquet'"}) as reader:
+        table = reader.read_all()
+```
+
+`python/check_arrow.py --out ASSIGNED_SCRATCH --clickbench CLICKBENCH_DIRECTORY` checks typed PyArrow results and
+NDJSON values at the schema's numeric width, plus retention and refusal behavior. `src/libzpq/test_arrow.c` exercises
+early release, partial reads, moved structures, independent result lifetimes, and a mid-stream result-cap error;
+compile it against the built library with `gcc -fsanitize=address`, and run it with the generated
+`ASSIGNED_SCRATCH/all_types.parquet`. Use `ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:use_sigaltstack=0`, following
+the existing C ABI test's signal-stack convention.
+

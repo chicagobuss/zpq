@@ -35,6 +35,18 @@ pub const Column = struct {
     dictionary_offset: ?i64 = null,
 };
 
+pub fn supported(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, read: []const bool) bool {
+    for (read, 0..) |needed, ci| {
+        if (!needed) continue;
+        if (ci >= rg.columns.items.len) return false;
+        const cm = rg.columns.items[ci].meta_data orelse return false;
+        // Optional nested structs can have one value per row too; only flat leaves have independent row seeks.
+        if (cm.path_in_schema.items.len != 1 or meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0 or
+            cm.num_values != rg.num_rows) return false;
+    }
+    return true;
+}
+
 pub const Group = struct {
     columns: []?Column,
     ranges: []const Range,
@@ -50,7 +62,7 @@ pub const Group = struct {
         read: []const bool,
         parts: usize,
     ) !?Group {
-        if (parts < 2 or rg.num_rows <= 0) return null;
+        if (parts < 2 or rg.num_rows <= 0 or !supported(rg, meta, read)) return null;
         const columns = try a.alloc(?Column, rg.columns.items.len);
         @memset(columns, null);
         var widest: usize = 0;
@@ -59,9 +71,6 @@ pub const Group = struct {
             if (!needed) continue;
             if (ci >= columns.len) return null;
             const cm = rg.columns.items[ci].meta_data orelse return null;
-            // One leaf per row is insufficient for nested optional structs: keep their established semantics too.
-            if (cm.path_in_schema.items.len != 1 or meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0 or
-                cm.num_values != rg.num_rows) return null;
             columns[ci] = try locate(a, bytes, cm, @intCast(rg.num_rows));
             const chunk_width: u64 = @intCast(cm.total_compressed_size);
             if (chunk_width > width) {
@@ -121,6 +130,29 @@ pub const Group = struct {
         return .{ .columns = columns, .ranges = ranges.items, .unfinished = unfinished };
     }
 };
+
+/// Queue every admitted group before walking the first one. Kernel forced read-ahead caps each request;
+/// cache-sized windows cover the rest of a large chunk instead of leaving its later headers to fault serially.
+pub fn adviseGroup(bytes: []const u8, rg: *const schema.RowGroup, read: []const bool) !void {
+    for (read, 0..) |needed, ci| {
+        if (!needed or ci >= rg.columns.items.len) continue;
+        const cm = rg.columns.items[ci].meta_data orelse continue;
+        adviseChunk(try chunkBytes(bytes, cm));
+    }
+}
+
+fn adviseChunk(bytes: []const u8) void {
+    if (@import("builtin").os.tag != .linux or bytes.len == 0) return;
+    const page_size = std.heap.pageSize();
+    const lo = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr), page_size);
+    const hi = std.mem.alignForward(usize, @intFromPtr(bytes.ptr) + bytes.len, page_size);
+    // Advisory only: unsupported mappings or read-ahead refusals keep the ordinary fault/decode path.
+    const block = std.mem.alignForward(usize, @import("hw.zig").l2BytesPerWorkerOr(page_size), page_size);
+    var at = lo;
+    while (at < hi) : (at += @min(block, hi - at)) {
+        _ = std.os.linux.madvise(@ptrFromInt(at), @min(block, hi - at), std.os.linux.MADV.WILLNEED);
+    }
+}
 
 fn columnWidth(se: ?schema.SchemaElement) usize {
     return if (se) |s| std.math.cast(usize, s.type_length orelse 0) orelse 0 else 0;

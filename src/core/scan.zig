@@ -828,6 +828,7 @@ fn splitRowGroups(
         const decision = plan.decide(rg, &metas[item.file]);
         if (decision == .skip or rg.num_rows == 0) continue;
         if (!args.inputs[item.file].rescannable() or rg.num_rows < 0 or rg.num_rows > std.math.maxInt(u32)) return null;
+        if (!row_subgroups.supported(rg, &metas[item.file], item.columns.forRowGroup(decision))) return null;
         // The indexed filter path compacts survivors and can leave rejected page bodies unread. Keep that
         // contract rather than replacing it with ranges that would decode those pages again.
         if (decision == .filter) for (rg.columns.items, 0..) |col, ci| {
@@ -840,6 +841,15 @@ fn splitRowGroups(
     if (alive == 0 or alive >= workers) return null;
     const target = @min(workers *| 2, bytes / @max(1, args.min_bytes_per_worker));
     if (target <= alive) return null;
+    // A cold header walk must not serialize the chunk reads ahead of the worker pool. Both the walk and
+    // mapped decoders reuse these file-backed pages; no extra input buffer is retained by this hint.
+    for (work) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        const decision = plan.decide(rg, &metas[item.file]);
+        if (decision == .skip or rg.num_rows == 0) continue;
+        const source = args.inputs[item.file].plan_bytes orelse args.inputs[item.file].bytes;
+        try row_subgroups.adviseGroup(source, rg, item.columns.forRowGroup(decision));
+    }
     var split: std.ArrayList(WorkItem) = .empty;
     var changed = false;
     for (work, 0..) |item, wi| {

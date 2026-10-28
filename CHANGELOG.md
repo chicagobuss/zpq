@@ -50,7 +50,7 @@ output is the same at every `-j`, memory budget and cache size.
 7. **Invalid queries exit 2, not 1.** Read, decode and write failures stay 1; a closed stdout pipe is 141. An
    aggregate or a GROUP BY key over a list's elements (a repeated leaf) is now refused while planning, exit 2, with a
    sentence naming the column (`aggregate argument column `l.list.element` is repeated`), as a filter on one already
-   was; rc1 decoded the column first and exited 1 with a bare `UnsupportedAggType` or a GROUP BY message.
+   was.
 8. **BREAKING for summary readers: `rows_kept` is gone.** It meant rows in the row groups read for an aggregate, but
    rows written for a write, so a filtered aggregate reported every row of the row groups it read as kept. The
    `--summary=json` line, and the Lambda's and libzpq's responses, now carry `rows_in` (every input row),
@@ -61,9 +61,8 @@ output is the same at every `-j`, memory budget and cache size.
 9. **BREAKING for summary readers: `phase` is now `wall_ms` and `worker_ms`.** `wall_ms` holds wall-clock phases
    (`open`, `parse`, `scan`, `footer`; a Lambda write adds `mp_await`, `mp_complete`), which run one after another.
    `worker_ms` holds each scan step summed over every worker (`decode`, `filter`, `fold` for aggregates, `encode` for
-   writes, `sink`), so with N workers one can reach N times `wall_ms.scan`: a `decode_ms` many times `total_ms` in
-   rc1 was many workers decoding at once, not a slow decode. `wall_ms.scan` is now measured for writes and row output
-   too. The field names lost their `_ms` suffix inside the objects. `docs/output-format.md` defines every field.
+   writes, `sink`), so with N workers one can reach N times `wall_ms.scan`. `wall_ms.scan` is now measured for
+   writes and row output too. The field names lost their `_ms` suffix inside the objects. `docs/output-format.md` defines every field.
 10. **Expect a different layout in files zpq re-encodes** (any filter, `--select` or computed column). Output row
     groups no longer follow the input's: they hold up to 131,072 rows or 64 MiB of uncompressed values
     (`--row-group-size`, `--row-group-bytes`), so a selective filter over many small row groups writes a few large
@@ -101,6 +100,56 @@ output is the same at every `-j`, memory budget and cache size.
 - **Bloom filters** read, written and used to prune `=` and `IN`.
 - **Profiling** with `--profile` (a Perfetto trace) and `--profile-summary`.
 
+### Platforms
+
+- CLI release builds: Linux x86_64 and arm64 (static musl), macOS arm64 and x86_64 (macOS 15 or later).
+- Linux x86_64 builds target x86-64-v3 (AVX2); the -compat archive runs on any x86-64. On a CPU without a v3
+  feature the default build names it and the compat archive, and exits 3, instead of dying with SIGILL.
+- Lambda: `zpq-lambda` for `provided.al2023`, arm64 and x86_64. The Lambda build has no SQL; a SQL request answers
+  `SqlNotCompiledIn`.
+- libzpq: Linux x86_64 and arm64 (glibc 2.28 or later, or musl) and macOS arm64 and x86_64; the macOS libraries are
+  cross-built and not run. Windows is not built.
+- snappy's NEON paths are enabled on arm64.
+- Release binaries are stripped, which makes them much smaller, and they carry no paths from the machine that built
+  them. A build is reproducible: the same commit and flags give the same bytes, whatever directory they were built
+  in. The Lambda zip is written the same way every time.
+  - The x86_64 Linux CLI is 8.1 MB.
+  - The Lambda bootstraps are 6.0 MB (arm64) and 7.3 MB (x86_64), against 44.8 and 47.2 MB unstripped.
+  - Local builds keep their symbols unless built with `-Dstrip=true`.
+- macOS: the macOS build carries no Linux-only system calls, and its fetch workers wait through libSystem.
+- Building from source requires Zig 0.17.0 exactly.
+
+### Known limits
+
+- **`--max-memory` can be exceeded in high-cardinality GROUP BY and `count(DISTINCT)`.** Hash-table growth and buffer
+  replacement there can go past the budget by up to about 2x near the limit. The answer stays exact, or the query
+  refuses cleanly. For a hard ceiling, run zpq under a cgroup `memory.max` or `ulimit -v`. A fix is planned for 0.5.1.
+- **Near a `--max-memory` limit with several workers, the same query can answer or refuse.** Whether it answers or
+  refuses with `ExceededMemoryBudget` can depend on how row groups land on workers. It is never an incorrect answer.
+- **SQL shapes still refused:**
+  - `coalesce` over BOOLEAN columns (`type mismatch in expression`, exit 1, after a CSV header);
+  - `TRUE`/`FALSE` literals inside expressions, and comparisons as values (`SELECT x > 5`);
+  - a quoted alias used as a GROUP BY key;
+  - a fractional literal against an integer column (`x > 1.5`).
+- A DOUBLE that holds an integral value prints without a fraction (`1`), so a JSON reader may take it as an integer.
+- JSON prints DATE, TIME and TIMESTAMP (INT96 included) as their stored integers (days, or the column's unit since
+  midnight or the epoch; INT96 as nanoseconds), where CSV prints ISO text.
+- **`--max-memory` does not yet cover** the following:
+  - grouped string `min`/`max` winners inside group tables;
+  - the candidate and count structures of top-N GROUP BY plans;
+  - the S3 fetch window, which has its own share of the budget;
+  - the plain row-printing path;
+  - the row-to-column copy of an ordered GROUP BY answer written to Parquet;
+  - the recompressing byte copy.
+
+  Fixed-width group tables are charged a little below what they hold at their peak, so a few large GROUP BYs answer
+  slightly over the budget. libzpq leaves its host's C heap settings alone, so freed blocks can stay resident in a
+  libzpq host.
+- A high-cardinality GROUP BY just inside a cgroup's default budget can take many times longer than with headroom.
+  It retries narrower paths before the one that fits.
+- A filtered or limited Parquet write refuses nested leaves and INT96 (`INT96 re-encoding is not supported yet`); a
+  plain copy keeps both.
+
 ### Performance
 
 **How these were measured.** zpq 0.5.0 (`v0.5.0-rc4`, build {{TBD}}; on Linux x86_64 the shipped x86-64-v3 musl
@@ -125,9 +174,8 @@ start. An engine's error counts as a loss for that engine. Every cell is on the 
 | Hot-fresh | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}× |
 
 - **ClickBench, 100M rows (one 14.8 GB file).**
-  - zpq runs all 43 queries. The 9 that 0.5.0's earlier builds refused now answer: date literals compared with hits'
-    unannotated integer day column, `extract`/`date_part`, `date_trunc`, `make_date`, `epoch_ms` and
-    `regexp_replace`.
+  - zpq runs all 43 queries, with date literals compared with hits' unannotated integer day column,
+    `extract`/`date_part`, `date_trunc`, `make_date`, `epoch_ms` and `regexp_replace`.
   - Cold, zpq is faster than both rivals on {{TBD}} of 43, at a geometric mean of {{TBD}}× the faster rival's time.
 - **26 synthetic datasets × 15 query shapes, 390 cases.** Cold, zpq is faster than both rivals on {{TBD}} of 390, at a
   geometric mean of {{TBD}}×; {{TBD}} are more than 1.5× behind, the worst {{TBD}}×.
@@ -140,8 +188,8 @@ start. An engine's error counts as a loss for that engine. Every cell is on the 
 
 The cells still more than 1.5× behind, and why, are listed as the known gaps on the site's status page.
 
-**Against zpq 0.4.1: writes and peak memory.** These come from the earlier scorecard `scorecard-v2-a88915d3b494`:
-0.5.0 build a88915d (from before the memory work) against the released 0.4.1, on the same machine in the same session.
+**Against zpq 0.4.1: writes and peak memory.** An earlier 0.5.0 build (from before the memory work) against the
+released 0.4.1, on the same machine in the same session.
 Each run was a fresh process, median of 3, with zstd level 3 output.
 - Across eight rewrite jobs, 0.5.0 takes 0.33× 0.4.1's time (geometric mean). The range is 0.89× for a full zstd
   rewrite of the 2.1M-row table to 0.13× for a gzip-to-zstd rewrite of NYC taxi.
@@ -168,15 +216,12 @@ Results:
 - **arm64 (Graviton):** zpq is faster than DataFusion in 11 of 11 scenarios, Polars in 10 of 11 and DuckDB in 11 of
   11. The loss is the full scan of the 174.8 MB file (B1): 777 ms against Polars' 729 ms.
 - **x86_64:** zpq is faster than all three in 11 of 11 scenarios.
-- **Against an earlier 0.5.0 build** (d2f4fa1, 2026-10-09, same session): zpq is at or below it on 9 of 11 scenarios
-  on each architecture.
-- **Init:** median 30.8 ms on arm64 and 40.3 ms on x86_64, up from 23.0 and 26.0 ms for d2f4fa1. Most of the
-  difference is the S3 pre-connect, which now runs during Init. DataFusion's Init is 149.8 ms, Polars' 74.5 ms and
-  DuckDB's 218.7 ms on arm64.
-- **B1, the trade-off:** zpq now holds much less memory there. On arm64 it takes 777 ms at a 114 MB peak, against
-  670 ms at 269 MB for d2f4fa1. On x86_64, 771 ms at 129 MB against 722 ms at 271 MB.
+- **Init:** median 30.8 ms on arm64 and 40.3 ms on x86_64, which includes the S3 pre-connect. DataFusion's Init is
+  149.8 ms, Polars' 74.5 ms and DuckDB's 218.7 ms on arm64.
+- **B1, the trade-off:** zpq holds a bounded window there: on arm64 777 ms at a 114 MB peak, on x86_64 771 ms at
+  129 MB.
 
-From an earlier build (de39261, AWS run B): Bloom-filter point lookups were 2.2–4.6× faster than zpq 0.4.0.
+On an earlier 0.5.0 build, Bloom-filter point lookups on Lambda were 2.2–4.6× faster than zpq 0.4.0.
 
 What changed underneath:
 
@@ -267,40 +312,22 @@ writes), and a float `sum` over no rows answering 0 instead of NULL on the dicti
 ### Behaviour changes
 
 **Contracts**
-- Known parquet-cpp/parquet-mr writer-version defects suppress affected chunk/page statistics for pruning and
-  metadata answers, including under `--trust-stats`; eligible equal extrema retain their exception.
-  Unknown applications remain modern; malformed known versions are treated as 0.0.0. Pre-1.8 parquet-mr
-  binary statistics are declined conservatively, including CDH backports. Copy/recompression strips affected
-  page-header statistics as well as footer/index statistics before writer relabeling. See [writer statistics](docs/writer-statistics.md).
-- Query validation covers answer-relevant data: corruption confined to unprojected columns, unread COUNT-pass
-  arguments or items excluded by exact decoded sketch/census/admit proofs may go undetected. Filtered scans
-  decode payload columns after the filter: a payload page whose rows the filter rejects is not decoded, so its
-  corruption is not reported. The pages skipped depend only on the input and the query, never on workers,
-  budget or decode path; their headers are still checked, and decoded pages keep the canonical error order. Multipass proofs
-  reject gated inputs. Existing footer/page-statistics corroboration is not value verification: internally
-  consistent false bounds may change the default answer; `--scan-all` ignores statistics.
-- Error-only full-projection replay includes input omitted by census/sketch count and admit passes; prepaid stream-probe funding makes evidence independent of concurrent ledger usage, and remaining worker failures use canonical order. Resource-limited probes retain the documented best-confirmed-error fallback.
-- Aggregate decode failures have one canonical order: input and row-group order first, then the failing page's
-  first row, then input-column order in the result projection. A computed output's leaves keep schema order;
-  columns read only by filters follow projected columns. Checks within a page retain their existing order.
-  Whole-row-group, memory-sliced and cache-window execution report the same error at every worker count and
-  memory budget. Sliced readers also enforce the chunk's value count, so an oversized REQUIRED page cannot
-  escape validation when a slice stops at the footer's row count. This fixes the earlier tight-budget change in
-  reported row group, column or page. Competing columns are checked only after a decode failure; valid input does
-  not pay for these checks.
-- Decode-error probes are bounded and charged to the query ledger, release the failed scan's storage first, and
-  retain only one column dictionary and page at a time. If a unit cannot be probed within the budget, reporting
-  keeps the minimum confirmed decode failure (or the original diagnostic if none is reproduced), never an OOM
-  from probing. A memory-refused attempt leaves no decode diagnostic that could mask an exact retry's failure.
-- Worker failures are selected in input/row-group order, including memory refusals that require replay. An earlier
-  or unlocated refusal cannot be suppressed by a later decode error from a lower-index worker, so scheduling no
-  longer decides whether replay exposes the canonical corruption error.
+- Statistics from writer versions with known statistics bugs (parquet-cpp and parquet-mr releases, including pre-1.8
+  parquet-mr binary statistics and CDH backports) are not used for pruning or metadata answers, even under
+  `--trust-stats`. A copy or recompression strips those statistics from the footer, page index and page headers. See
+  [writer statistics](docs/writer-statistics.md).
+- A query validates the data its answer depends on. Corruption in columns it does not read, or in pages a filter
+  proves it does not need, may go unreported; which pages are skipped depends only on the input and the query, never
+  on `-j` or the memory budget, and skipped pages' headers are still checked. Statistics are checked for consistency,
+  not against the values: consistent but false bounds can change the default answer, and `--scan-all` ignores them.
+- A decode failure is reported the same way at every `-j` and memory budget: the first failure in input, row-group,
+  row and column order. Checking for that costs nothing on valid input, and the extra decoding it needs is charged to
+  the query's memory budget; if the budget cannot cover it, the earliest failure confirmed is reported.
 
 **Errors**
 - A page or column chunk that fails to decode names where, on every query kind and at every `-j`:
   `cannot decode input file data/b.parquet` / `row group 0, column `z`, page 1:` / `the page's encoded data is
-  invalid (UnexpectedPage)`. rc1 printed only the error's name (`UnexpectedPage`, `DictionaryMissing`,
-  `ShortDecode`, ...), so over a glob the corrupt file could not be told. The error's name stays last and is still the
+  invalid (UnexpectedPage)`. The error's name stays last and is still the
   `code` of `--summary=json`'s error line. Pages count from 0 in the column chunk, a dictionary page included.
 
 **Output**
@@ -384,7 +411,7 @@ the same file, DuckDB 1.5.5 and DataFusion drop the NaN rows when they prune.
 A FLOAT literal outside the 32-bit range compares exactly against a FLOAT column (`f > 3.5e38` matches `+inf`). A
 literal inside the range is first rounded to 32 bits, as a cast would be, so `f = 0.1` matches the stored 32-bit 0.1.
 
-**Python (libzpq), for anyone on a 0.5.0 preview build.** `Zpq.query()` rows and `Zpq.run()`'s `agg` give DECIMAL
+**Python (libzpq).** `Zpq.query()` rows and `Zpq.run()`'s `agg` give DECIMAL
 columns as `decimal.Decimal`, every digit and the scale kept, a scale-0 DECIMAL included. Other numbers are as JSON
 reads them. Pass `decimal=False` to get floats. SQL and structured-aggregate responses carry `"decimal": [names]`, so a
 client of the C ABI can do the same.
@@ -429,8 +456,8 @@ client of the C ABI can do the same.
   was one row group per batch read.
 - The written bytes depend only on the input and the options: the same file at every `-j`, on every machine, at any
   default budget. An explicit `--max-memory` (or a request's `max_memory`) caps re-encoded row groups at a sixteenth
-  of it, so the file may depend on that value, never on `-j`. In 0.4.1 and the 0.5.0 release candidate, a row group
-  too big for its worker was written one output row group per slice, sliced by `-j` and by the machine's memory.
+  of it, so the file may depend on that value, never on `-j`. In 0.4.1, a row group too big for its worker was
+  written one output row group per slice, sliced by `-j` and by the machine's memory.
 - Every re-encoded column chunk is split into data pages that close at 1 MiB of PLAIN values or 20,000 rows (the
   pyarrow and parquet-mr defaults), and gets a page index: per page, its offset and first row (OffsetIndex) and its
   bounds, null count, NaN count and boundary order (ColumnIndex), written after the row groups column by column.
@@ -637,10 +664,10 @@ Not supported: `%` (refused as `operator % is not supported`), the simple `CASE 
   - A file that fails is reported in place, and the command exits 1.
 - Bash, zsh and fish completions and a man page are in `packaging/`, generated from the CLI's help text. The man page
   is regenerated for the release, including `--trust-stats` and missing NaN counts.
-- `zpq --version` prints the version and build revision. A release candidate carries its tag:
-  `zpq 0.5.0-rc2 (<rev>)`, and the same version is in the `created_by` of files it writes, its archive names and
-  `release.json`. 0.5.0-rc1 said `0.5.0` in each. `tools/package_release.py --tag v0.5.0-rc2` (or
-  `zig build -Dprerelease=rc2`) builds one, and refuses a tag that does not name `build.zig.zon`'s version.
+- `zpq --version` prints the version and build revision. A pre-release build carries its tag
+  (`zpq 0.5.0-rc2 (<rev>)`), and the same version is in the `created_by` of files it writes, its archive names and
+  `release.json`. `tools/package_release.py --tag v0.5.0-rc2` (or `zig build -Dprerelease=rc2`) builds one, and
+  refuses a tag that does not name `build.zig.zon`'s version.
 - Release archives are self-contained. Beside the binary, man page, completions and `share/zpq/tiny.parquet`, they
   ship `share/doc/zpq/`: `getting-started.md` (a filtered read, a GROUP BY with `avg`, and a computed Parquet write,
   each with its exact output against `tiny.parquet`), `output-format.md` and `binary-output.md`. Help names these
@@ -666,56 +693,6 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
 - The summary reports `total_us` beside `total_ms`.
 - `--cache` (libzpq `"cache": true`) reads local inputs through the page cache, never `O_DIRECT`, so the next query on
   the file runs warm.
-
-### Platforms
-
-- CLI release builds: Linux x86_64 and arm64 (static musl), macOS arm64 and x86_64 (macOS 15 or later).
-- Linux x86_64 builds target x86-64-v3 (AVX2); the -compat archive runs on any x86-64. On a CPU without a v3
-  feature the default build names it and the compat archive, and exits 3, instead of dying with SIGILL.
-- Lambda: `zpq-lambda` for `provided.al2023`, arm64 and x86_64. The Lambda build has no SQL; a SQL request answers
-  `SqlNotCompiledIn`.
-- libzpq: Linux x86_64 and arm64 (glibc 2.28 or later, or musl) and macOS arm64 and x86_64; the macOS libraries are
-  cross-built and not run. Windows is not built.
-- snappy's NEON paths are enabled on arm64.
-- Release binaries are stripped, which makes them much smaller, and they carry no paths from the machine that built
-  them. A build is reproducible: the same commit and flags give the same bytes, whatever directory they were built
-  in. The Lambda zip is written the same way every time.
-  - The x86_64 Linux CLI is 8.1 MB.
-  - The Lambda bootstraps are 6.0 MB (arm64) and 7.3 MB (x86_64), against 44.8 and 47.2 MB unstripped.
-  - Local builds keep their symbols unless built with `-Dstrip=true`.
-- macOS: the macOS build carries no Linux-only system calls, and its fetch workers wait through libSystem.
-- Building from source requires Zig 0.17.0 exactly.
-
-### Known limits
-
-- **`--max-memory` can be exceeded in high-cardinality GROUP BY and `count(DISTINCT)`.** Hash-table growth and buffer
-  replacement there can go past the budget by up to about 2x near the limit. The answer stays exact, or the query
-  refuses cleanly. For a hard ceiling, run zpq under a cgroup `memory.max` or `ulimit -v`. A fix is planned for 0.5.1.
-- **Near a `--max-memory` limit with several workers, the same query can answer or refuse.** Whether it answers or
-  refuses with `ExceededMemoryBudget` can depend on how row groups land on workers. It is never an incorrect answer.
-- **SQL shapes still refused:**
-  - `coalesce` over BOOLEAN columns (`type mismatch in expression`, exit 1, after a CSV header);
-  - `TRUE`/`FALSE` literals inside expressions, and comparisons as values (`SELECT x > 5`);
-  - a quoted alias used as a GROUP BY key;
-  - a fractional literal against an integer column (`x > 1.5`).
-- A DOUBLE that holds an integral value prints without a fraction (`1`), so a JSON reader may take it as an integer.
-- JSON prints DATE, TIME and TIMESTAMP (INT96 included) as their stored integers (days, or the column's unit since
-  midnight or the epoch; INT96 as nanoseconds), where CSV prints ISO text.
-- **`--max-memory` does not yet cover** the following:
-  - grouped string `min`/`max` winners inside group tables;
-  - first-keys, census and sketch structures;
-  - the S3 fetch window, which has its own share of the budget;
-  - the plain row-printing path;
-  - the row-to-column copy of an ordered GROUP BY answer written to Parquet;
-  - the recompressing byte copy.
-
-  Fixed-width group tables are charged a little below what they hold at their peak, so a few large GROUP BYs answer
-  slightly over the budget. libzpq leaves its host's C heap settings alone, so freed blocks can stay resident in a
-  libzpq host.
-- A high-cardinality GROUP BY just inside a cgroup's default budget can take many times longer than with headroom.
-  It retries narrower paths before the one that fits.
-- A filtered or limited Parquet write refuses nested leaves and INT96 (`INT96 re-encoding is not supported yet`); a
-  plain copy keeps both.
 
 ## 0.4.1
 

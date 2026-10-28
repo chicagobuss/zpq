@@ -4,8 +4,23 @@
 # a fixture missing then fails the tier as a skip, so this step is what makes "missing" impossible, not optional.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-PY=$(command -v "${PYTHON:-$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)}")
+# The tiers' Python (build.zig's -Dpython, default .venv/bin/python) is made here, the first stage, so a fresh
+# worktree works: the default venv is created from tools/check/requirements.txt when absent. Anything else that is
+# missing stops the tier with what to do, never an empty log.
+want=${PYTHON:-$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)}
+if [[ $want == .venv/bin/python && ! -x .venv/bin/python ]]; then
+  echo "fixtures: no .venv; creating it from tools/check/requirements.txt"
+  if command -v uv >/dev/null; then
+    uv venv -q .venv && uv pip install -q -p .venv/bin/python -r tools/check/requirements.txt
+  else
+    python3 -m venv .venv && .venv/bin/python -m pip install -q -r tools/check/requirements.txt
+  fi || { echo "fixtures: could not create .venv (needs uv, or python3 with venv and pip, and the package index);" \
+           "make it by hand or pass -Dpython=PATH" >&2; exit 1; }
+fi
+PY=$(command -v "$want") || { echo "fixtures: python '$want' does not exist (build.zig -Dpython)" >&2; exit 1; }
 [[ $PY == /* ]] || PY=$PWD/$PY  # recipes run from tools/; a venv's python must keep its own path, not its target
+"$PY" -c 'import duckdb, numpy, pyarrow' 2>/dev/null ||
+  { echo "fixtures: $PY lacks duckdb, numpy or pyarrow; install tools/check/requirements.txt into it" >&2; exit 1; }
 pin=$(cat tools/check/corpus.pin)
 corpus=data/parquet-testing
 mkdir -p data

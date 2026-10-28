@@ -655,3 +655,36 @@ pub fn decodeDecimalI128(
     );
 }
 
+
+pub fn codedOrValues(
+    comptime T: type,
+    comptime tag: std.meta.Tag(filter_eval.Batch.Column),
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    levels: schema.Levels,
+    n_leaves: usize,
+    decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
+) !?filter_eval.Batch.Column {
+    const r = (try decodeCodes(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse return null;
+    return switch (r) {
+        .codes => |c| @unionInit(filter_eval.Batch.Column, @tagName(tag), codedCol(T, c, c.dict, levels)),
+        .values => |v| @unionInit(filter_eval.Batch.Column, @tagName(tag), valuesCol(T, v, levels)),
+    };
+}
+
+pub fn decodeCodes(
+    comptime T: type,
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    n_leaves: usize,
+    decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
+) !?column_mod.ColumnChunkReader(T).CodedOrValues {
+    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, ra, decode_options, scratch);
+    return reader.readAllCodes(n_leaves);
+}
+

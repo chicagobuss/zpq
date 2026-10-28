@@ -4936,23 +4936,7 @@ fn decodeAggColumnCoded(
     };
 }
 
-fn codedOrValues(
-    comptime T: type,
-    comptime tag: std.meta.Tag(filter_eval.Batch.Column),
-    ra: std.mem.Allocator,
-    chunk: []const u8,
-    cm: schema.ColumnMetaData,
-    levels: schema.Levels,
-    n_leaves: usize,
-    decode_options: DecodeOptions,
-    scratch: ?*DecodeScratch,
-) !?filter_eval.Batch.Column {
-    const r = (try decodeCodes(T, ra, chunk, cm.codec, levels, n_leaves, decode_options, scratch)) orelse return null;
-    return switch (r) {
-        .codes => |c| @unionInit(filter_eval.Batch.Column, @tagName(tag), codedCol(T, c, c.dict, levels)),
-        .values => |v| @unionInit(filter_eval.Batch.Column, @tagName(tag), valuesCol(T, v, levels)),
-    };
-}
+const codedOrValues = consumer_column.codedOrValues;
 
 /// `decodeAggColumnCoded` folded straight into a code histogram, or null when the chunk doesn't qualify (the caller
 /// then decodes it afresh). Decimal and unsigned-INT32 dictionaries convert once per entry. `firsts` (a GROUP BY key,
@@ -5160,19 +5144,7 @@ const codedCol = consumer_column.codedCol;
 
 const valuesCol = consumer_column.valuesCol;
 
-fn decodeCodes(
-    comptime T: type,
-    ra: std.mem.Allocator,
-    chunk: []const u8,
-    codec: schema.CompressionCodec,
-    levels: schema.Levels,
-    n_leaves: usize,
-    decode_options: DecodeOptions,
-    scratch: ?*DecodeScratch,
-) !?column_mod.ColumnChunkReader(T).CodedOrValues {
-    var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, ra, decode_options, scratch);
-    return reader.readAllCodes(n_leaves);
-}
+const decodeCodes = consumer_column.decodeCodes;
 
 /// Fold every call statistics can answer for this row group into its accumulator and mark it in `handled`. Returns
 /// whether any call still needs the row group decoded.

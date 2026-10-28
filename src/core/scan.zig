@@ -191,6 +191,8 @@ pub const MultiAggArgs = struct {
     filter: ?[]const u8 = null,
     aggregate: []const u8,
     group_by: ?[]const u8 = null,
+    /// Internal child execution reuses already bound expressions instead of round-tripping SQL text.
+    bound_aggregate: ?*const BoundAggregate = null,
     max_memory: usize = 512 * 1024 * 1024,
     /// The query's ledger (`memory.zig`): its limit is `max_memory`, and the scan's tables, decode memory, merge and
     /// answer draw from it, beside whatever else the query holds. Null: a budget of `max_memory` the scan's tables
@@ -4184,25 +4186,27 @@ fn prepareAggregateWithMetas(
 
     // 2. Parse aggregate + filter against meta0 (column indexes resolved
     //    against file 0; valid for all files because schemas match).
-    const agg_calls: []expr_agg.AggCall = if (args.group_by != null and args.aggregate.len == 0)
+    const agg_calls: []expr_agg.AggCall = if (args.bound_aggregate) |bound|
+        try arena.dupe(expr_agg.AggCall, bound.calls)
+    else if (args.group_by != null and args.aggregate.len == 0)
         &.{}
     else
         try expr_parser.parseAggList(arena, args.aggregate, meta0, args.diag);
     if (agg_calls.len == 0 and args.group_by == null) return error.EmptyAggregate;
 
-    var filter_opt: ?filter_ast.Filter = null;
-    if (args.filter) |expr_str| {
+    var filter_opt: ?filter_ast.Filter = if (args.bound_aggregate) |bound| bound.filter else null;
+    if (args.bound_aggregate == null) if (args.filter) |expr_str| {
         if (expr_str.len > 0) {
             filter_opt = try filter_parser.parse(arena, expr_str, meta0, args.diag);
             // `--trust-stats`: leaves trust plausible statistics; a float chunk with no NaN count prunes as NaN-free.
             if (args.trust_stats) filter_opt = try filter_ast.trustStats(arena, filter_opt.?);
         }
-    }
-    const group_by_items = if (args.group_by) |gb_str|
+    };
+    const group_by_items = if (args.bound_aggregate != null) null else if (args.group_by) |gb_str|
         try expr_parser.parseGroupByOf(arena, gb_str, meta0, args.diag, args.select_cols orelse &.{})
     else
         null;
-    var group_by_keys: ?[]const expr_ast.Expr = if (group_by_items) |items| blk: {
+    var group_by_keys: ?[]const expr_ast.Expr = if (args.bound_aggregate) |bound| bound.keys else if (group_by_items) |items| blk: {
         const exprs = try arena.alloc(expr_ast.Expr, items.len);
         for (items, 0..) |item, i| exprs[i] = item.expr;
         break :blk exprs;
@@ -4210,10 +4214,10 @@ fn prepareAggregateWithMetas(
     try refuseRepeated(arena, meta0, agg_calls, group_by_keys, args.diag);
     var key_names = try KeyNames.init(arena, meta0, group_by_items orelse &.{});
     key_names.sql = sqlBound(args.select_cols);
-    try nameUnaliasedAggs(arena, agg_calls, &key_names);
+    if (args.bound_aggregate == null) try nameUnaliasedAggs(arena, agg_calls, &key_names);
     const agg_sources = try arena.alloc(?schema.SchemaElement, agg_calls.len);
     for (agg_calls, agg_sources) |call, *src| src.* = passThroughSource(call, meta0);
-    var group_outputs: ?[]const BoundOutputColumn = if (group_by_items != null)
+    var group_outputs: ?[]const BoundOutputColumn = if (args.bound_aggregate) |bound| bound.outputs else if (group_by_items != null)
         try bindGroupOutputs(arena, &key_names, agg_calls, meta0, args)
     else blk: {
         try checkAggAliases(agg_calls, args.diag);
@@ -4236,7 +4240,7 @@ fn prepareAggregateWithMetas(
     if (args.profiler) |p| p.setColumnsFromMeta(meta0);
     const plan_span = profile.Span.begin(prof);
 
-    if (!explain) if (try countRankedDistinct(gpa, arena, args, metas, agg_calls, group_by_keys, group_outputs)) |r|
+    if (!explain) if (try countRankedDistinct(gpa, arena, args, metas, agg_calls, group_by_keys, group_outputs, filter_opt)) |r|
         return r;
 
     // 3. What the query reads, and which columns statistics answer outright. The S3 planner makes the same plan
@@ -5842,14 +5846,16 @@ const RankedPhase = struct {
     }
 };
 
-fn rankedColumn(a: std.mem.Allocator, meta: *const schema.FileMetaData, col: expr_ast.ColRef) !?[]const u8 {
-    if (col.expr_type != .i64 or col.unsigned_32 or col.unsigned_64 or
-        (col.physical_type != .INT32 and col.physical_type != .INT64)) return null;
-    const name = try leafLabel(a, meta, col.col_idx);
-    if (name.len == 0) return null;
-    // Nested/escaped identifiers retain their established binder; only a flat resolved identifier is rebuilt.
-    for (name) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_') return null;
-    return try std.fmt.allocPrint(a, "\"{s}\"", .{name});
+const BoundAggregate = struct {
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    filter: ?filter_ast.Filter,
+};
+
+fn rankedColumn(col: expr_ast.ColRef) bool {
+    return col.expr_type == .i64 and !col.unsigned_32 and !col.unsigned_64 and
+        (col.physical_type == .INT32 or col.physical_type == .INT64);
 }
 
 fn sameRankedKey(a: AggValue, b: AggValue) bool {
@@ -5868,12 +5874,13 @@ fn countRankedDistinct(
     calls: []const expr_agg.AggCall,
     keys_opt: ?[]const expr_ast.Expr,
     outputs_opt: ?[]const BoundOutputColumn,
+    filter: ?filter_ast.Filter,
 ) anyerror!?MultiAggResult {
     if (args.count_ranked_distinct == .off or args.scan_all or args.unordered or !args.dense or
         !args.ndv_union or !allRescannable(args.inputs)) return null;
     const keys = keys_opt orelse return null;
     const outputs = outputs_opt orelse return null;
-    if (keys.len != 1 or keys[0] != .col_ref or args.result_order.having != null or
+    if (keys.len != 1 or keys[0] != .col_ref or !rankedColumn(keys[0].col_ref) or args.result_order.having != null or
         args.result_order.hidden.len != 0) return null;
     for (outputs) |out| if (out.derived != null) return null;
     const cut = countCut(outputs, calls, args.result_order) orelse return null;
@@ -5891,8 +5898,7 @@ fn countRankedDistinct(
             .sum, .avg => payload = true,
             else => return null,
         }
-        if (call.arg) |arg| if (arg != .col_ref or arg.col_ref.expr_type != .i64 or
-            arg.col_ref.unsigned_32 or arg.col_ref.unsigned_64) return null;
+        if (call.arg) |arg| if (arg != .col_ref or !rankedColumn(arg.col_ref)) return null;
     }
     const di = distinct orelse return null;
     if (!payload) return null;
@@ -5902,7 +5908,7 @@ fn countRankedDistinct(
     var phase: RankedPhase = undefined;
     phase.init(gpa, ledger, args.max_memory);
     defer phase.deinit();
-    return countRankedAttempt(gpa, arena, args, metas, calls, keys, outputs, cut, di, ledger, &phase) catch |e| {
+    return countRankedAttempt(gpa, arena, args, metas, calls, keys, outputs, filter, cut, di, ledger, &phase) catch |e| {
         return switch (e) {
             error.OutOfMemory, error.ExceededMemoryBudget, error.CountRankedDistinctDeclined => error.CountRankedDistinctDeclined,
             else => e,
@@ -5918,24 +5924,26 @@ fn countRankedAttempt(
     calls: []const expr_agg.AggCall,
     keys: []const expr_ast.Expr,
     outputs: []const BoundOutputColumn,
+    filter: ?filter_ast.Filter,
     cut: CountCut,
     di: usize,
     ledger: *core_memory.SharedBudget,
     phase: *RankedPhase,
 ) anyerror!?MultiAggResult {
     const a = phase.arena.allocator();
-    const key_name = (try rankedColumn(a, &metas[0], keys[0].col_ref)) orelse return null;
-    const distinct_name = (try rankedColumn(a, &metas[0], calls[di].arg.?.col_ref)) orelse return null;
-    var ordinary: std.ArrayList(u8) = .empty;
+    const ordinary = try a.alloc(expr_agg.AggCall, calls.len - 1);
+    const ordinary_outputs = try a.alloc(BoundOutputColumn, calls.len);
+    ordinary_outputs[0] = .{ .source = .{ .key = 0 }, .name = "__ranked_key" };
+    var oi: usize = 0;
     for (calls, 0..) |call, ai| {
         if (ai == di) continue;
-        if (ordinary.items.len != 0) try ordinary.appendSlice(a, ",");
-        const name = if (call.arg) |arg|
-            (try rankedColumn(a, &metas[0], arg.col_ref)) orelse return null
-        else
-            "*";
-        try ordinary.appendSlice(a, try std.fmt.allocPrint(a, "{s}({s})", .{ @tagName(call.func), name }));
+        ordinary[oi] = call;
+        ordinary[oi].alias = try std.fmt.allocPrint(a, "__ranked_agg_{d}", .{oi});
+        ordinary[oi].default_name = null;
+        ordinary_outputs[oi + 1] = .{ .source = .{ .agg = oi }, .name = ordinary[oi].alias };
+        oi += 1;
     }
+    const ordinary_bound: BoundAggregate = .{ .calls = ordinary, .keys = keys, .outputs = ordinary_outputs, .filter = filter };
     var first = args;
     first.inputs = try a.dupe(Input, args.inputs);
     for (@constCast(first.inputs)) |*input| {
@@ -5949,8 +5957,7 @@ fn countRankedAttempt(
     first.start_reads = null;
     first.dict_probe = null;
     first.count_ranked_distinct = .off;
-    first.aggregate = ordinary.items;
-    first.group_by = key_name;
+    first.bound_aggregate = &ordinary_bound;
     first.select_cols = null;
     first.column_order = null;
     first.sketch_topk = null;
@@ -5973,29 +5980,42 @@ fn countRankedAttempt(
     const original = try a.dupe([]const AggValue, counted.output.group_rows orelse return error.CountRankedDistinctDeclined);
     try counted.output.applyResultOrder(phase.charged.allocator(), first.result_order);
     const retained = counted.output.group_rows.?;
-    var predicate: std.ArrayList(u8) = .empty;
-    for (retained) |row| {
-        if (predicate.items.len != 0) try predicate.appendSlice(a, " OR ");
-        try predicate.appendSlice(a, switch (row[0]) {
-            .i => |v| try std.fmt.allocPrint(a, "{s} = {d}", .{ key_name, v }),
-            .null_val => try std.fmt.allocPrint(a, "{s} IS NULL", .{key_name}),
+    const predicates = try a.alloc(filter_ast.Filter, retained.len);
+    const key = keys[0].col_ref;
+    for (retained, predicates) |row, *predicate| {
+        predicate.* = switch (row[0]) {
+            .i => |v| if (key.physical_type == .INT32)
+                .{ .int32 = .{ .col_idx = key.col_idx, .op = .Eq, .value = std.math.cast(i32, v) orelse return error.CountRankedDistinctDeclined, .stored = true } }
+            else
+                .{ .int64 = .{ .col_idx = key.col_idx, .op = .Eq, .value = std.math.cast(i64, v) orelse return error.CountRankedDistinctDeclined, .stored = true } },
+            .null_val => .{ .null_check = .{ .col_idx = key.col_idx, .is_not = false } },
             else => return error.CountRankedDistinctDeclined,
-        });
+        };
     }
+    const winners_filter: filter_ast.Filter = .{ .or_filter = .{ .children = predicates } };
+    const retained_filter: filter_ast.Filter = if (filter) |f|
+        .{ .and_filter = .{ .children = try a.dupe(filter_ast.Filter, &.{ f, winners_filter }) } }
+    else
+        winners_filter;
     var second_phase: RankedPhase = undefined;
     second_phase.init(gpa, ledger, args.max_memory);
     defer second_phase.deinit();
     var second = first;
-    second.aggregate = try std.fmt.allocPrint(a, "count(DISTINCT {s})", .{distinct_name});
+    const distinct_bound: BoundAggregate = .{
+        .calls = calls[di..][0..1],
+        .keys = keys,
+        .outputs = &.{ .{ .source = .{ .key = 0 }, .name = "__ranked_key" }, .{ .source = .{ .agg = 0 }, .name = "__ranked_distinct" } },
+        .filter = retained_filter,
+    };
+    second.bound_aggregate = &distinct_bound;
     second.result_order = .{};
-    second.filter = if (predicate.items.len == 0) "1 = 0" else if (args.filter) |filter|
-        try std.fmt.allocPrint(a, "({s}) AND ({s})", .{ filter, predicate.items })
-    else
-        try std.fmt.allocPrint(a, "({s})", .{predicate.items});
     second.ledger = &second_phase.budget;
-    var reduced = try runMultiAggregate(second_phase.charged.allocator(), second_phase.arena.allocator(), second);
-    defer reduced.deinit(second_phase.charged.allocator());
-    const distinct_rows = reduced.output.group_rows orelse return error.CountRankedDistinctDeclined;
+    var reduced: ?MultiAggResult = null;
+    defer if (reduced) |*r| r.deinit(second_phase.charged.allocator());
+    const distinct_rows = if (retained.len == 0) &.{} else blk: {
+        reduced = try runMultiAggregate(second_phase.charged.allocator(), second_phase.arena.allocator(), second);
+        break :blk reduced.?.output.group_rows orelse return error.CountRankedDistinctDeclined;
+    };
     if (distinct_rows.len != retained.len) return error.CountRankedDistinctDeclined;
 
     const bytes = retained.len *| (outputs.len *| @sizeOf(AggValue) +| @sizeOf([]const AggValue)) +|
@@ -6039,7 +6059,7 @@ fn countRankedAttempt(
     result.state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types };
     result.count_ranked_distinct = true;
     result.dense_aggregate = false;
-    result.timings.decode_wall_ns +|= reduced.timings.decode_wall_ns;
+    if (reduced) |r| result.timings.decode_wall_ns +|= r.timings.decode_wall_ns;
     if (args.ledger) |parent| {
         result.output.arena_ledger = parent;
         result.output.arena_credit = bytes;
@@ -27507,7 +27527,13 @@ test "distinct admission scalar fanout prices sparse numeric ranges without chan
     }
 }
 
-fn rankedFixture(a: std.mem.Allocator) !struct { bytes: []const u8, meta: schema.FileMetaData } {
+const RankedFixture = struct { bytes: []const u8, meta: schema.FileMetaData };
+
+fn rankedFixture(a: std.mem.Allocator) !RankedFixture {
+    return rankedFixtureColumns(a, .{ "k", "x", "y" }, false);
+}
+
+fn rankedFixtureColumns(a: std.mem.Allocator, names: [3][]const u8, even_y: bool) !RankedFixture {
     const k = try a.alloc(i32, 2048);
     const x = try a.alloc(i64, k.len);
     const y = try a.alloc(i32, k.len);
@@ -27516,14 +27542,14 @@ fn rankedFixture(a: std.mem.Allocator) !struct { bytes: []const u8, meta: schema
     for (k, x, y, kd, xd, 0..) |*key, *value, *payload, *dk, *dx, i| {
         key.* = @as(i32, @intCast(i % 13)) - 6;
         value.* = @as(i64, @intCast(i % 67)) - 33;
-        payload.* = @as(i32, @intCast(i % 37)) - 18;
+        payload.* = if (even_y) @as(i32, @intCast(2 * (i % 2))) else @as(i32, @intCast(i % 37)) - 18;
         dk.* = @intFromBool(i % 13 != 0);
         dx.* = @intFromBool(i % 13 != 1 and i % 7 != 0);
     }
     const columns = [_]expr_agg.OutputCol{
-        .{ .name = "k", .col = .{ .i32 = .{ .values = k, .def_levels = kd, .max_def = 1 } }, .parquet_type = .INT32, .nullable = true },
-        .{ .name = "x", .col = .{ .i64 = .{ .values = x, .def_levels = xd, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
-        .{ .name = "y", .col = .{ .i32 = .{ .values = y } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = names[0], .col = .{ .i32 = .{ .values = k, .def_levels = kd, .max_def = 1 } }, .parquet_type = .INT32, .nullable = true },
+        .{ .name = names[1], .col = .{ .i64 = .{ .values = x, .def_levels = xd, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
+        .{ .name = names[2], .col = .{ .i32 = .{ .values = y } }, .parquet_type = .INT32, .nullable = false },
     };
     var sink: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
     _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, @intCast(k.len), .SNAPPY, .{}, .{});
@@ -27533,6 +27559,120 @@ fn rankedFixture(a: std.mem.Allocator) !struct { bytes: []const u8, meta: schema
     meta.row_groups.items = rgs;
     meta.num_rows *= @intCast(rgs.len);
     return .{ .bytes = sink.buffer.items, .meta = meta };
+}
+
+test "count-ranked DISTINCT keeps repeated aggregate aliases and bound quoted identifiers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |quoted| {
+        const fixture = try rankedFixtureColumns(a, if (quoted) .{ "group key", "user x", "select" } else .{ "k", "x", "y" }, false);
+        const sql = if (quoted)
+            "SELECT \"group key\" AS g,sum(\"select\") AS a,sum(\"select\") AS b,count(*) AS c,count(DISTINCT \"user x\") AS d FROM 'ranked' GROUP BY \"group key\" ORDER BY c DESC LIMIT 5"
+        else
+            "SELECT k,sum(y) AS a,sum(y) AS b,count(*) AS c,count(DISTINCT x) AS d FROM 'ranked' GROUP BY k ORDER BY c DESC LIMIT 5";
+        const q = try @import("expr/sql_parser.zig").parseSqlQuery(a, sql);
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "ranked", .bytes = fixture.bytes }},
+            .metas = &.{fixture.meta},
+            .aggregate = q.aggregate_str.?,
+            .group_by = q.group_by_str,
+            .select_cols = q.select_cols,
+            .result_order = q.result_order,
+            .parallelism = 4,
+            .min_bytes_per_worker = 1,
+            .max_memory = 128 << 20,
+            .count_ranked_distinct = .off,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        args.count_ranked_distinct = .on;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(got.count_ranked_distinct);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+        try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+    }
+}
+
+test "count-ranked DISTINCT returns an empty filtered result without rebuilding a false predicate" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try rankedFixtureColumns(a, .{ "k", "x", "y" }, true);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-empty", .bytes = fixture.bytes }},
+        .metas = &.{fixture.meta},
+        .aggregate = "sum(y) AS a,count(*) AS c,count(DISTINCT x) AS d",
+        .group_by = "k",
+        .filter = "y = 1",
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 5 },
+        .parallelism = 4,
+        .min_bytes_per_worker = 1,
+        .max_memory = 128 << 20,
+        .count_ranked_distinct = .off,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    args.count_ranked_distinct = .on;
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    try got.output.applyResultOrder(gpa, args.result_order);
+    try testing.expect(got.count_ranked_distinct);
+    try testing.expectEqual(@as(usize, 0), got.output.group_rows.?.len);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+    try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+}
+
+test "count-ranked DISTINCT keeps expression HAVING and alternate alias ordering on exact fallback" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try rankedFixture(a);
+    const queries = [_][]const u8{
+        "SELECT k,sum(CAST(y AS BIGINT)) AS s,count(*) AS c,count(DISTINCT x) AS d FROM 'ranked' GROUP BY k ORDER BY c DESC LIMIT 5",
+        "SELECT k,sum(y+1) AS s,count(*) AS c,count(DISTINCT x) AS d FROM 'ranked' GROUP BY k ORDER BY c DESC LIMIT 5",
+        "SELECT k,sum(y) AS s,count(*) AS c,count(DISTINCT x+1) AS d FROM 'ranked' GROUP BY k ORDER BY c DESC LIMIT 5",
+        "SELECT k,sum(y) AS s,count(*) AS c,count(DISTINCT x) AS d FROM 'ranked' GROUP BY k HAVING s > 0 ORDER BY c DESC LIMIT 5",
+        "SELECT k,sum(y) AS s,count(*) AS c,count(DISTINCT x) AS d FROM 'ranked' GROUP BY k ORDER BY s DESC LIMIT 5",
+    };
+    for (queries) |sql| {
+        const q = try @import("expr/sql_parser.zig").parseSqlQuery(a, sql);
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "ranked", .bytes = fixture.bytes }},
+            .metas = &.{fixture.meta},
+            .aggregate = q.aggregate_str.?,
+            .group_by = q.group_by_str,
+            .select_cols = q.select_cols,
+            .result_order = q.result_order,
+            .parallelism = 4,
+            .min_bytes_per_worker = 1,
+            .max_memory = 128 << 20,
+            .count_ranked_distinct = .off,
+        };
+        var want = runMultiAggregate(gpa, a, args) catch |e| {
+            args.count_ranked_distinct = .on;
+            try testing.expectError(e, runMultiAggregate(gpa, a, args));
+            continue;
+        };
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        args.count_ranked_distinct = .on;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(!got.count_ranked_distinct);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+        try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+    }
 }
 
 test "count-ranked DISTINCT preserves NULLs exact sums averages ties and forced controls" {

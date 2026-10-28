@@ -1152,7 +1152,6 @@ test "an UploadPart whose body the server stops reading is sent again on a new c
     fake.stall = "PUT /bkt/out.parquet?partNumber=1&";
     fake.stall_at = .request_body;
     fake.expire_virtual_deadline = true;
-    tls.resetDeadlineHit();
     tls.armTestClock();
     defer tls.disarmTestClock();
     const part = stallPartSize();
@@ -1160,16 +1159,28 @@ test "an UploadPart whose body the server stops reading is sent again on a new c
     defer testing.allocator.free(payload);
 
     const started = nowMonoNs();
-    const uploaded = writeThroughSinkWith(&fake, "out.parquet", payload, stall_clock_timeouts, part);
+    // Only the stalled part may own a deadline when the shared clock moves. The second part still runs, after it.
+    const uploaded = writeToPort(fake.port, "out.parquet", payload, stall_clock_timeouts, .{
+        .target_part_size = part,
+        .max_bytes_in_flight = part,
+    });
     const elapsed_ms = @divTrunc(nowMonoNs() -| started, std.time.ns_per_ms);
     // The stall must expire on the virtual idle deadline. That cause is the check. Wall time is only a hang
     // backstop: a loaded machine can spend seconds here, and the 120 s socket backstop is a different error.
     try testing.expectEqual(tls.DeadlineCause.virtual, tls.deadlineHit() orelse return error.TestExpectedEqual);
+    try testing.expectEqual(tls.DeadlineWait.write, tls.deadlineHitWait() orelse return error.TestExpectedEqual);
     try testing.expect(tls.deadlineHitRealMs() <= 30_000);
     try testing.expect(elapsed_ms <= 30_000);
     try uploaded;
     try testing.expectEqual(@as(u32, 1), fake.stalled);
-    try testing.expect(fake.object("out.parquet") != null);
+    const obj = fake.object("out.parquet") orelse return error.TestUnexpectedResult;
+    var part_md5s: [32]u8 = undefined;
+    std.crypto.hash.Md5.hash(payload[0..part], part_md5s[0..16], .{});
+    std.crypto.hash.Md5.hash(payload[part..], part_md5s[16..32], .{});
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(&part_md5s, &digest, .{});
+    var etag_buf: [34]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&etag_buf, "{x}-2", .{&digest}), obj.etag);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
 }
 
@@ -1185,7 +1196,10 @@ test "an UploadPart whose answer never comes is sent again, and the upload holds
     const payload = try bigPayload(6 << 20);
     defer testing.allocator.free(payload);
 
-    try writeThroughSinkWith(&fake, "out.parquet", payload, stall_clock_timeouts, 6 << 20);
+    try writeToPort(fake.port, "out.parquet", payload, stall_clock_timeouts, .{
+        .target_part_size = 6 << 20,
+        .max_bytes_in_flight = 6 << 20,
+    });
     try testing.expectEqual(@as(u32, 1), fake.stalled);
     const obj = fake.object("out.parquet") orelse return error.TestUnexpectedResult;
     // The ETag of a two-part upload: the part sent twice counted once.

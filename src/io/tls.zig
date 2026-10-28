@@ -567,12 +567,12 @@ fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, de
                 const real_start = monoMs();
                 while (true) {
                     if (clk() >= virtual_deadline) {
-                        noteDeadline(.virtual, real_start);
+                        noteDeadline(.virtual, real_start, .connect);
                         return error.ConnectTimeout;
                     }
                     // A hang backstop, distinct from the virtual deadline, so a stalled test cannot pass by it.
                     if (monoMs() - real_start > 120_000) {
-                        noteDeadline(.backstop, real_start);
+                        noteDeadline(.backstop, real_start, .connect);
                         return error.ConnectTimeout;
                     }
                     const pr = posix.system.poll(&pfd, 1, 20);
@@ -617,6 +617,7 @@ pub const SockTimeouts = struct {
 const test_clock = struct {
     var on: std.atomic.Value(bool) = .init(false);
     var ms: std.atomic.Value(u64) = .init(0);
+    var expire_wait: std.atomic.Value(bool) = .init(false);
     /// One test arms the clock at a time. A second waits, so two UploadPart tests cannot move each other's deadlines.
     var held: std.atomic.Value(bool) = .init(false);
 };
@@ -628,10 +629,12 @@ fn waitTestClock() void {
     }
 }
 
-/// Freeze deadline time at the current wall clock. `testClockMs` then stands still until `advanceTestClock`.
+/// Freeze deadline time at the current wall clock until a test advances it or expires a blocked socket wait.
 pub fn armTestClock() void {
     waitTestClock();
     test_clock.ms.store(monoMs(), .release);
+    test_clock.expire_wait.store(false, .release);
+    resetDeadlineHit();
     test_clock.on.store(true, .release);
 }
 
@@ -650,14 +653,27 @@ pub fn testClockMs() u64 {
     return test_clock.ms.load(.acquire);
 }
 
+/// The fake peer has stopped making progress. Only one request may be in flight: its next blocked wait consumes
+/// this once, on the client thread, so neither a partial write nor a retry races a server thread's clock tick.
+pub fn expireNextTestWait() void {
+    if (test_clock.on.load(.acquire)) test_clock.expire_wait.store(true, .release);
+}
+
+fn expireBlockedTestWait(clock_ms: *const fn () u64, deadline: u64) void {
+    if (clock_ms != &testClockMs) return;
+    if (test_clock.expire_wait.swap(false, .acq_rel)) advanceTestClock(deadline -| testClockMs());
+}
+
 /// Why a test clock's read or write gave up. `virtual` is the idle deadline on the injected clock. `backstop` is the
 /// wall-clock limit that only exists so a stuck socket cannot hang the test; a stall test must not pass that way.
 pub const DeadlineCause = enum { virtual, backstop };
+pub const DeadlineWait = enum { connect, read, write };
 
 const deadline_hit = struct {
     var ready = std.atomic.Value(bool).init(false);
     var cause: DeadlineCause = .virtual;
     var real_ms: u64 = 0;
+    var wait: DeadlineWait = .read;
 };
 
 pub fn resetDeadlineHit() void {
@@ -673,10 +689,16 @@ pub fn deadlineHitRealMs() u64 {
     return deadline_hit.real_ms;
 }
 
-fn noteDeadline(cause: DeadlineCause, real_start: u64) void {
+pub fn deadlineHitWait() ?DeadlineWait {
+    if (!deadline_hit.ready.load(.acquire)) return null;
+    return deadline_hit.wait;
+}
+
+fn noteDeadline(cause: DeadlineCause, real_start: u64, wait: DeadlineWait) void {
     if (deadline_hit.ready.load(.acquire)) return;
     deadline_hit.cause = cause;
     deadline_hit.real_ms = monoMs() -| real_start;
+    deadline_hit.wait = wait;
     deadline_hit.ready.store(true, .release);
 }
 
@@ -744,11 +766,11 @@ fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: 
         var off: usize = 0;
         while (off < buf.len) {
             if (nowMs(clock_ms) >= deadline) {
-                noteDeadline(.virtual, real_start);
+                noteDeadline(.virtual, real_start, .write);
                 return error.WouldBlock;
             }
             if (monoMs() - real_start > 120_000) {
-                noteDeadline(.backstop, real_start);
+                noteDeadline(.backstop, real_start, .write);
                 return error.Backstop;
             }
             var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
@@ -758,11 +780,18 @@ fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: 
                 .INTR => continue,
                 else => return error.SendFailed,
             }
-            if (pr == 0) continue;
+            if (pr == 0) {
+                expireBlockedTestWait(clock_ms.?, deadline);
+                continue;
+            }
             const r = sendNoSignal(fd, buf[off..]);
             switch (posix.errno(r)) {
                 .SUCCESS => {},
-                .INTR, .AGAIN => continue,
+                .INTR => continue,
+                .AGAIN => {
+                    expireBlockedTestWait(clock_ms.?, deadline);
+                    continue;
+                },
                 else => return error.SendFailed,
             }
             const n: usize = @intCast(r);
@@ -823,11 +852,11 @@ fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadErr
         const real_start = monoMs();
         while (true) {
             if (clock_ms() >= deadline) {
-                noteDeadline(.virtual, real_start);
+                noteDeadline(.virtual, real_start, .read);
                 return error.WouldBlock;
             }
             if (monoMs() - real_start > 120_000) {
-                noteDeadline(.backstop, real_start);
+                noteDeadline(.backstop, real_start, .read);
                 return error.Backstop;
             }
             var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
@@ -837,7 +866,10 @@ fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadErr
                 .INTR => continue,
                 else => return error.ReadFailed,
             }
-            if (pr == 0) continue;
+            if (pr == 0) {
+                expireBlockedTestWait(clock_ms, deadline);
+                continue;
+            }
             const r = posix.system.read(fd, buf.ptr, buf.len);
             switch (posix.errno(r)) {
                 .SUCCESS => return @intCast(r),

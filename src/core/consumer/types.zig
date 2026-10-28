@@ -1,4 +1,5 @@
 const std = @import("std");
+const expr_ast = @import("../expr/ast.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
@@ -229,5 +230,109 @@ test "a selected window keeps original indexes and rejects a gather past the win
     try std.testing.expectError(error.BadColumn, selectedWindow(&batch, null, 40, &.{ 1, 4 }, 4));
     const slice = try selectedWindow(&batch, null, 40, null, 2);
     try std.testing.expectEqual(@as(u64, 40), try slice.ordinal(0));
+}
+
+
+/// The output leaf for a computed column. Shared by the row buffers (whose printing reads it) and the footer.
+pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
+    const expr_type = c.expr.typeOf();
+    // A computed column that can be NULL (`strlen` of a nullable column) must say so, or its NULLs misdescribe it.
+    const repetition: schema.FieldRepetitionType = if (c.expr.mayBeNull() and c.expr != .col_ref) .OPTIONAL else .REQUIRED;
+    if (expr_type == .dec) {
+        var elem: schema.SchemaElement = .{
+            .type = null,
+            .type_length = null,
+            .repetition_type = repetition,
+            .name = c.alias,
+            .num_children = 0,
+            .converted_type = null,
+            .logical_type = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+        decimalElem(&elem, c.expr.decSpec().?);
+        return elem;
+    }
+    if (c.source) |src| if (c.expr == .col_ref and !schema.isFloat16(src) and (src.type == .BYTE_ARRAY or
+        src.type == .FIXED_LEN_BYTE_ARRAY or src.type == .INT64 or src.type == .DOUBLE or src.type == .BOOLEAN))
+    {
+        var renamed = src;
+        renamed.name = c.alias;
+        renamed.num_children = 0;
+        return renamed;
+    };
+    // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
+    // are printed and written as the unsigned values they are.
+    const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;
+    return .{
+        // A BOOLEAN expression's 0/1 lane is written and printed as the BOOLEAN SQL types it.
+        .type = if (c.expr.isBoolean()) .BOOLEAN else expr_type.toParquet(),
+        .type_length = null,
+        .repetition_type = repetition,
+        .name = c.alias,
+        .num_children = 0,
+        .converted_type = if (expr_type == .str) .UTF8 else if (unsigned_64) .UINT_64 else null,
+        .logical_type = if (expr_type == .str)
+            .{ .STRING = .{} }
+        else if (unsigned_64)
+            .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } }
+        else
+            null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+}
+
+/// One output column. `passthrough` re-encodes a kept input column;
+/// `computed` evaluates an expression against the (post-filter) decoded
+/// batch and encodes the result as a new flat leaf.
+pub const OutputCol = union(enum) {
+    passthrough: Passthrough,
+    computed: Computed,
+
+    /// A kept input leaf, written as it is. With `name` (a SELECT alias, or a nested leaf's dotted label) it is the
+    /// same leaf renamed and flat: its type, annotation and NULLs unchanged, its definition levels mapped to 0/1.
+    pub const Passthrough = struct {
+        ci: usize,
+        name: ?[]const u8 = null,
+    };
+
+    pub const Computed = struct {
+        expr: expr_ast.Expr,
+        /// Output column name. The caller's footer-build step uses
+        /// the same string as the leaf SchemaElement's name.
+        alias: []const u8,
+        /// A renamed reference retains its source annotation when the value lane is unchanged.
+        source: ?schema.SchemaElement = null,
+    };
+};
+
+/// Type `elem` as DECIMAL(`d`) at the physical width its precision takes.
+pub fn decimalElem(elem: *schema.SchemaElement, d: expr_ast.Dec) void {
+    elem.type = d.physical();
+    elem.type_length = if (d.physical() == .FIXED_LEN_BYTE_ARRAY) 16 else null;
+    elem.converted_type = .DECIMAL;
+    elem.logical_type_raw = &.{};
+    elem.logical_type = .{ .DECIMAL = .{ .scale = d.scale, .precision = d.precision } };
+    elem.scale = d.scale;
+    elem.precision = d.precision;
+}
+
+test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 reference" {
+    const ref: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .i64,
+        .unsigned_64 = true,
+    } };
+    const elem = computedSchemaElem(.{ .expr = ref, .alias = "b" });
+    try std.testing.expect(schema.isUnsignedInt64(elem));
+    try std.testing.expectEqualStrings("b", elem.name);
+
+    var signed = ref;
+    signed.col_ref.unsigned_64 = false;
+    try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
 }
 

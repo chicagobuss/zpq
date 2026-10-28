@@ -367,6 +367,8 @@ const ColSource = scan_types.ColSource;
 const BoundOutputColumn = scan_types.BoundOutputColumn;
 pub const WORKER_STACK_SIZE = scan_types.WORKER_STACK_SIZE;
 const row_block = scan_types.row_block;
+pub const integer_stream = @import("scan/integer_stream.zig");
+pub const IntegerStream = integer_stream.IntegerStream;
 pub const typed_answer = @import("scan/typed_answer.zig");
 pub const TypedAnswer = typed_answer.TypedAnswer;
 pub const output_values = @import("scan/output_values.zig");
@@ -17906,21 +17908,6 @@ test "inline record decode refusals retry serially without disabling the layout"
     try testing.expect(!wide.integer_records and !wide.byte_records);
 }
 
-fn integerWindowAllocTrial(a: std.mem.Allocator, stream: IntegerStream, types: []const GroupColType) !void {
-    var answer = try stream.window(a, types, 0, stream.state.group_count, 1);
-    defer answer.deinit(a);
-    try testing.expectEqualSlices(i64, &.{ 0, 1, 2 }, answer.columns[0].i64.values);
-    try testing.expectEqualSlices(i64, &.{ 2, 2, 1 }, answer.columns[1].i64.values);
-    try testing.expectEqualSlices(i64, &.{ 3, 5, 0 }, answer.columns[2].i64.values);
-    try testing.expectEqual(@as(usize, 0), answer.columns[1].i64.defs.len);
-    if (stream.state.input_nulls == 0) {
-        for (answer.columns) |col| try testing.expectEqual(@as(usize, 0), col.i64.defs.len);
-    } else {
-        try testing.expectEqualSlices(u32, &.{ 0, 1, 1 }, answer.columns[0].i64.defs);
-        try testing.expectEqualSlices(u32, &.{ 1, 1, 0 }, answer.columns[2].i64.defs);
-    }
-}
-
 fn byteWindowAllocTrial(a: std.mem.Allocator, stream: ByteStream) !void {
     var w = try stream.window(a, 0, @min(stream.state.group_count, 137), 1);
     defer w.deinit(a);
@@ -18062,44 +18049,6 @@ test "inline integer SUM cut matches the established partition cut across worker
                 if (x == .i) try testing.expectEqual(x.i, y.i);
             };
         };
-    }
-}
-
-test "inline integer stream windows free every partial typed allocation" {
-    for ([_]bool{ false, true }) |nulls| {
-        const state = (try owner_groups.IntFull.State.init(testing.allocator, null, 5, 1, 0, 1, {}, owner_groups.full_parts, 0)).?;
-        defer state.deinit();
-        const k = [_]i64{ 0, 1, 2, 1, 0 };
-        const v = [_]i64{ 0, 7, 0, -2, 3 };
-        const kd = [_]u32{ 0, 1, 1, 1, 0 };
-        const vd = [_]u32{ 0, 1, 0, 1, 1 };
-        try state.locals[0].batch(.{ .num_rows = 5, .cols = &.{
-            .{ .i64 = .{
-                .values = &k,
-                .def_levels = if (nulls) &kd else null,
-                .max_def = @intFromBool(nulls),
-                .has_nulls = nulls,
-            } },
-            .{ .i64 = .{
-                .values = &v,
-                .def_levels = if (nulls) &vd else null,
-                .max_def = @intFromBool(nulls),
-                .has_nulls = nulls,
-            } },
-        } }, &.{ 0, 1 }, 0);
-        try state.finish();
-        const outputs = [_]BoundOutputColumn{
-            .{ .source = .{ .key = 0 }, .name = "k" },
-            .{ .source = .{ .agg = 0 }, .name = "c" },
-            .{ .source = .{ .agg = 1 }, .name = "s" },
-        };
-        const types = [_]GroupColType{
-            .{ .lane = .i64, .nullable = true },
-            .{ .lane = .i64, .nullable = false },
-            .{ .lane = .i64, .nullable = true },
-        };
-        const stream: IntegerStream = .{ .state = state, .outputs = &outputs, .count_call = 0 };
-        try testing.checkAllAllocationFailures(testing.allocator, integerWindowAllocTrial, .{ stream, &types });
     }
 }
 

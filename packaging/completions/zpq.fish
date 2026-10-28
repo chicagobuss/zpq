@@ -20,6 +20,7 @@ complete -c zpq -l max-memory
 complete -c zpq -l no-bloom-filters
 complete -c zpq -l no-fsync
 complete -c zpq -l output
+complete -c zpq -l parquet-version
 complete -c zpq -l profile
 complete -c zpq -l profile-summary
 complete -c zpq -l query

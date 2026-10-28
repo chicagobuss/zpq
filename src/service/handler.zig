@@ -242,6 +242,12 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             return rejectResponse(allocator, "bad_json", "BadOutputCodec", "output_codec", s);
         } else null;
 
+        const parquet_version: schema.ParquetVersion = if (req.parquet_version) |s|
+            std.meta.stringToEnum(schema.ParquetVersion, s) orelse
+                return rejectResponse(allocator, "bad_json", "BadParquetVersion", "parquet_version", s)
+        else
+            .v2;
+
         // How hard zstd works on the output, as the CLI's --compress-priority. Absent: size (level 3).
         const compress_priority: engine.CompressPriority = if (req.compress_priority) |s|
             std.meta.stringToEnum(engine.CompressPriority, s) orelse
@@ -328,6 +334,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             .select = req.select,
             .aggregate = req.aggregate,
             .codec = output_codec,
+            .parquet_version = parquet_version,
             .compress_priority = compress_priority,
             .scan_all = req.scan_all,
             .trust_stats = req.trust_stats,
@@ -1351,4 +1358,16 @@ test "sink error details retain the service WriteFailed reason" {
         defer std.testing.allocator.free(response);
         try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"WriteFailed\"}", response);
     }
+}
+
+test "parquet version rejects an unknown profile" {
+    const a = std.testing.allocator;
+    var pool: PersistentPool = .sized(256 << 20);
+    defer pool.deinit();
+    const response = try handle(std.testing.io, a, .empty,
+        \\{"inputs":["x.parquet"],"output_url":"o.parquet","parquet_version":"v3"}
+    , &pool, null);
+    defer a.free(response);
+    try expectStringField(response, "reason", "BadParquetVersion");
+    try expectStringField(response, "parquet_version", "v3");
 }

@@ -175,6 +175,7 @@ pub const ColumnInput = struct {
     codec: schema.CompressionCodec = .SNAPPY,
     /// How zstd pages are compressed, when `codec` is ZSTD.
     zstd: compression.ZstdPlan = .{},
+    parquet_version: schema.ParquetVersion = .v2,
     /// Build a split-block Bloom filter of the chunk at this false-positive probability.
     bloom_fpp: ?f64 = null,
     /// Automatically filter dictionary chunks; an explicit probability takes precedence.
@@ -384,7 +385,7 @@ pub const Plan = struct {
         try path_list.appendSlice(arena, self.in.path_in_schema);
         const has_dict = self.dict_page.len > 0;
         if (has_dict) {
-            try encodings.appendSlice(arena, &.{ .RLE, .PLAIN, .PLAIN_DICTIONARY });
+            try encodings.appendSlice(arena, &.{ .RLE, .PLAIN, self.values_encoding });
         } else {
             try encodings.appendSlice(arena, &.{ .RLE, self.values_encoding });
         }
@@ -645,12 +646,13 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     // equivalent on random data (per-block overhead is small and bit-packing adapts to actual delta range). Strings
     // the dictionary declined take DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY (`stringsEncoding`), decided over the
     // whole chunk so every page has the same one. Everything else is PLAIN.
-    const values_encoding: schema.Encoding = if (src_max_rep == 0 and (in.values == .i32 or in.values == .i64))
+    const selected_encoding: schema.Encoding = if (src_max_rep == 0 and (in.values == .i32 or in.values == .i64))
         .DELTA_BINARY_PACKED
     else if (src_max_rep == 0 and in.values == .string)
         stringsEncoding(in.values.string.values, src_def_levels, src_max_def, fixed) orelse .PLAIN
     else
         .PLAIN;
+    const values_encoding: schema.Encoding = if (in.parquet_version == .v1) .PLAIN else selected_encoding;
 
     const nested = src_max_rep > 0;
     const ends: []const usize = if (nested) blk: {
@@ -1290,7 +1292,7 @@ fn planDictionary(
         .stats = stats,
         .dict_page = try std.mem.concat(arena, u8, &.{ dict_header, dict_compressed }),
         .dict_page_uncompressed = dict_header.len + dict_plain.len,
-        .values_encoding = .PLAIN_DICTIONARY,
+        .values_encoding = if (in.parquet_version == .v1) .PLAIN_DICTIONARY else .RLE_DICTIONARY,
         .num_values = num_values,
         .def_levels = def_levels,
         .max_def = max_def,
@@ -2138,6 +2140,12 @@ fn cutMax(arena: std.mem.Allocator, v: []const u8, cut: BoundCut) std.mem.Alloca
     return out;
 }
 
+// Equal 16-byte keys prove the first 16 bytes equal when both values are that long.
+fn lessThanTiedPrefix(a: []const u8, b: []const u8) bool {
+    if (a.len >= 16 and b.len >= 16) return std.mem.lessThan(u8, a[16..], b[16..]);
+    return std.mem.lessThan(u8, a, b);
+}
+
 fn statsBytes(
     arena: std.mem.Allocator,
     values: []const []const u8,
@@ -2170,11 +2178,11 @@ fn statsBytes(
         // A first byte strictly between the bounds' first bytes makes v neither (most values, once bounds settle).
         if (v.len > 0 and lo.len > 0 and hi.len > 0 and v[0] > lo[0] and v[0] < hi[0]) continue;
         const k = prefix16(v);
-        if (k < lo_key or (k == lo_key and std.mem.lessThan(u8, v, lo))) {
+        if (k < lo_key or (k == lo_key and lessThanTiedPrefix(v, lo))) {
             lo = v;
             lo_key = k;
         }
-        if (k > hi_key or (k == hi_key and std.mem.lessThan(u8, hi, v))) {
+        if (k > hi_key or (k == hi_key and lessThanTiedPrefix(hi, v))) {
             hi = v;
             hi_key = k;
         }
@@ -3259,7 +3267,7 @@ test "a chunk is cut into pages at the page target, decodes whole, and pages bui
         .{
             .values = .{ .i64 = .{ .values = low, .def_levels = defs, .max_def = 1 } },
             .t = .INT64,
-            .want = .PLAIN_DICTIONARY,
+            .want = .RLE_DICTIONARY,
         },
         .{ .values = .{ .f64 = .{ .values = floats } }, .t = .DOUBLE, .want = .PLAIN },
         .{
@@ -3872,4 +3880,73 @@ test "ordered page segments retain whole-chunk metadata and Bloom and stop at a 
 
 test "ordered page segments release every partial plan, page, index and Bloom allocation" {
     try testing.checkAllAllocationFailures(testing.allocator, segmentFinishTrial, .{});
+}
+
+test "parquet version selects value encodings and dictionary metadata" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var low: [128]i64 = undefined;
+    var high: [128]i64 = undefined;
+    for (0..low.len) |i| {
+        low[i] = @intCast(i % 4);
+        high[i] = @intCast(i);
+    }
+    const elem: schema.SchemaElement = .{
+        .type = .INT64,
+        .type_length = null,
+        .name = "v",
+        .repetition_type = .REQUIRED,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    for ([_]schema.ParquetVersion{ .v1, .v2 }) |version| {
+        const dict = try encodeColumn(a, .{
+            .values = .{ .i64 = .{ .values = &low } },
+            .schema_elem = &elem,
+            .path_in_schema = &.{"v"},
+            .codec = .UNCOMPRESSED,
+            .parquet_version = version,
+        });
+        const pages = try testPages(a, dict.bytes);
+        try testing.expectEqual(schema.Encoding.PLAIN, pages[0].header.dictionary_page_header.?.encoding);
+        const expected_dict: schema.Encoding = if (version == .v1) .PLAIN_DICTIONARY else .RLE_DICTIONARY;
+        try testing.expectEqual(expected_dict, pages[1].header.data_page_header.?.encoding);
+        try testing.expectEqual(expected_dict, dict.meta.encodings.items[2]);
+        try testing.expectEqual(@as(i32, @backingInt(expected_dict)), dict.meta.encoding_stats.?.getLast().encoding);
+        const plain = try encodeColumn(a, .{
+            .values = .{ .i64 = .{ .values = &high } },
+            .schema_elem = &elem,
+            .path_in_schema = &.{"v"},
+            .codec = .UNCOMPRESSED,
+            .parquet_version = version,
+        });
+        const high_pages = try testPages(a, plain.bytes);
+        try testing.expectEqual(if (version == .v1) schema.Encoding.PLAIN else .DELTA_BINARY_PACKED, high_pages[0].header.data_page_header.?.encoding);
+        try testing.expectEqual(if (version == .v1) @as(i32, 1) else 2, version.footer());
+    }
+}
+
+test "parquet version statistics retain byte ordering on tied prefixes" {
+    const a = testing.allocator;
+    const pairs = [_][2][]const u8{
+        .{ "same-sixteen-byte-a", "same-sixteen-byte-z" },
+        .{ "1234567890123456", "1234567890123456\x00" },
+        .{ "abc", "abc\x00" },
+        .{ "", "\x00" },
+        .{ "1234567890123456\x00a", "1234567890123456\x00b" },
+    };
+    for (pairs) |pair| {
+        try testing.expectEqual(prefix16(pair[0]), prefix16(pair[1]));
+        try testing.expectEqual(std.mem.lessThan(u8, pair[0], pair[1]), lessThanTiedPrefix(pair[0], pair[1]));
+        try testing.expectEqual(std.mem.lessThan(u8, pair[1], pair[0]), lessThanTiedPrefix(pair[1], pair[0]));
+        const values = [_][]const u8{ pair[1], pair[0] };
+        const st = statsBytes(a, &values, null, 0, .bytes).?;
+        defer a.free(st.min_value.?);
+        defer a.free(st.max_value.?);
+        try testing.expectEqualStrings(pair[0], st.min_value.?);
+        try testing.expectEqualStrings(pair[1], st.max_value.?);
+    }
 }

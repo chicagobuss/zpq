@@ -73,7 +73,9 @@ kept (`"83332533333.00"` is `Decimal('83332533333.00')`, not `83332533333.0`), i
 as before. `run()` continues to return the response envelope, including for SQL.
 
 SQL excludes the structured fields `inputs`, `s3_url`, `filter`, `columns`, `select`, `aggregate`, `group_by`,
-`column_order`, `output_url`, `output_codec`, `compress_priority`, and `bloom_filters` (null counts as absent).
+`column_order`, `output_url`, `output_codec`, `parquet_version`, `compress_priority`, and `bloom_filters` (null counts as absent).
+`parquet_version` is `"v1"` or `"v2"` (default); it selects the value-encoding profile for newly encoded
+pages and the footer version. Copies preserve the input chunk's encodings; v1 is not a strict Parquet 1.0 file.
 Automatic dictionary Bloom filters default on; `"bloom_filters_enabled": false` opts out.
 Explicit `bloom_filters` specifications still apply, and copied source filters are preserved.
 `parallelism` is a nonnegative integer (0 chooses automatically). Common options remain available: `max_memory`,

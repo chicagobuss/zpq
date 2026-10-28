@@ -119,6 +119,7 @@ pub const QueryArgs = struct {
     /// Requested output codec. Null when none was asked for: re-encoded
     /// output is then SNAPPY and byte copies keep each chunk's own codec.
     codec: ?schema.CompressionCodec = null,
+    parquet_version: schema.ParquetVersion = .v2,
     /// How hard zstd works on the output (`--compress-priority`, the Lambda's "compress_priority").
     compress_priority: CompressPriority = .size,
     parallelism: usize = 0,

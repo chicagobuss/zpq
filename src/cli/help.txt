@@ -7,7 +7,7 @@ usage:
             [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
             [--row-group-size ROWS] [--row-group-bytes SIZE]
             [--threads N | -j N]
-            [--compress-priority size|speed]
+            [--compress-priority size|speed] [--parquet-version v1|v2]
             [--scan-all] [--trust-stats] [--fast-levels] [--unordered] [--cache]
             [--max-memory SIZE] [--bloom-filter COL[:FPP] ...]
             [--no-bloom-filters]
@@ -16,7 +16,7 @@ usage:
   zpq query --query "<sql query>" [--output <out.parquet>]
             [--codec snappy|zstd|gzip|lz4|lz4_raw|uncompressed]
             [--threads N | -j N]
-            [--compress-priority size|speed]
+            [--compress-priority size|speed] [--parquet-version v1|v2]
             [--scan-all] [--trust-stats] [--cache] [--max-memory SIZE]
             [--explain] [--profile TRACE.json] [--profile-summary[=text|json]]
             [--format ndjson|json|csv|parquet] [--limit N] [--summary=json]
@@ -81,6 +81,13 @@ usage:
                  -j or memory. Data pages close at 1 MiB or 20,000
                  rows, and each gets a page index entry. A plain copy
                  keeps its input's row groups.
+  --parquet-version v1|v2
+                 Value-encoding profile for new pages; default v2. v1
+                 uses PLAIN/PLAIN_DICTIONARY and a version 1 footer; it
+                 is DuckDB-V1-like, not a strict Parquet 1.0 file. v2
+                 uses DELTA where selected and RLE_DICTIONARY, with a
+                 version 2 footer. Newly encoded pages use V1 headers.
+                 Untouched copies retain their input pages and encodings.
   --compress-priority
                  how hard zstd works. `size` (default): level 3 for
                  every page. `speed`: each page stored raw, as

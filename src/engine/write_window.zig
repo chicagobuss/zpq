@@ -874,6 +874,7 @@ const EncodeState = struct {
             .path_in_schema = w.out_paths[i],
             .codec = w.codec,
             .zstd = w.zstd,
+            .parquet_version = w.parquet_version,
             .bloom_fpp = if (i < w.bloom_outputs.len) w.bloom_outputs[i] else null,
             .dictionary_bloom = w.dictionary_bloom,
         };
@@ -994,6 +995,7 @@ pub const WinCtx = struct {
     kept_set: ?[]const bool, // for byte-copy passthrough jobs
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan = .{},
+    parquet_version: schema.ParquetVersion = .v2,
     decode_options: consumer.DecodeOptions,
     /// Where output row groups are cut (`RowGroupTarget`).
     rg_target: RowGroupTarget = .{},

@@ -496,6 +496,7 @@ fn flushAggregator(
 
 // The limited row sink shares decode/encode with printing, but keeps only footer metadata between slices.
 const ParquetPrint = struct {
+    parquet_version: schema.ParquetVersion = .v2,
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     fd_sink: FdSink,
@@ -604,7 +605,7 @@ const ParquetPrint = struct {
             &timings,
             1,
             true,
-            .{ .dictionary_bloom = self.dictionary_bloom },
+            .{ .dictionary_bloom = self.dictionary_bloom, .parquet_version = self.parquet_version },
         );
         if (out.rg) |rg| try self.rgs.append(self.arena, rg);
     }
@@ -621,7 +622,7 @@ const ParquetPrint = struct {
         try fastpath.placeFilters(&out, self.rgs.items);
         self.out_offset = out.offset;
         const meta: schema.FileMetaData = .{
-            .version = 2,
+            .version = self.parquet_version.footer(),
             .schema = self.schema_items,
             .num_rows = @intCast(rows),
             .row_groups = self.rgs,
@@ -799,6 +800,7 @@ fn runPrintSinkOver(
     var agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
 
     var parquet: ParquetPrint = .{
+        .parquet_version = args.parquet_version,
         .arena = arena,
         .gpa = ctx.gpa,
         .fd_sink = .{ .fd = fd },

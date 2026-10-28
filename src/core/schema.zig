@@ -13,6 +13,19 @@ fn safeListReserve(comptime T: type, declared: usize, remaining: usize) usize {
     return @min(declared, remaining / @max(1, @sizeOf(T)));
 }
 
+/// Writer value-encoding profile; copied chunks retain their source encodings.
+pub const ParquetVersion = enum {
+    v1,
+    v2,
+
+    pub fn footer(self: ParquetVersion) i32 {
+        return switch (self) {
+            .v1 => 1,
+            .v2 => 2,
+        };
+    }
+};
+
 pub const Type = enum(i32) {
     BOOLEAN = 0,
     INT32 = 1,

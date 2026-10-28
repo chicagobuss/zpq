@@ -2169,6 +2169,7 @@ fn encodeAggColumn(
         .zstd = zstd,
         .bloom_fpp = bloom_write.at(i),
         .dictionary_bloom = bloom_write.dictionary_bloom,
+        .parquet_version = bloom_write.parquet_version,
     });
     if (span.t != null) {
         const em = e.meta;
@@ -2493,6 +2494,7 @@ fn aggEncodeWorker(ctx: *AggEncodeCtx) void {
             .zstd = ctx.zstd,
             .bloom_fpp = ctx.bloom_write.at(i),
             .dictionary_bloom = ctx.bloom_write.dictionary_bloom,
+            .parquet_version = ctx.bloom_write.parquet_version,
         }) catch |err| {
             ctx.err = err;
             return;
@@ -2694,6 +2696,7 @@ fn encodeAggOutputCol(
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
     dictionary_bloom: bool,
+    parquet_version: schema.ParquetVersion,
 ) !encoder.EncodedColumn {
     const path_buf = try arena.alloc([]const u8, 1);
     path_buf[0] = out_col.name;
@@ -2705,6 +2708,7 @@ fn encodeAggOutputCol(
         .zstd = zstd,
         .distinct = out_col.distinct,
         .dictionary_bloom = dictionary_bloom,
+        .parquet_version = parquet_version,
     });
 }
 
@@ -2712,6 +2716,7 @@ fn encodeAggOutputCol(
 /// the columns in flight at once charged at most `budget` bytes (`aggEncodeCharge`). The default encodes them one at
 /// a time, as every column of a small answer is.
 pub const AggEncode = struct {
+    parquet_version: schema.ParquetVersion = .v2,
     dictionary_bloom: bool = true,
     workers: usize = 1,
     budget: u64 = 0,
@@ -2771,6 +2776,7 @@ const AggColumnWave = struct {
         zstd: compression.ZstdPlan,
         cursor: *std.atomic.Value(usize),
         dictionary_bloom: bool,
+        parquet_version: schema.ParquetVersion,
 
         /// Claim columns until none remain: one a failed spawn left unclaimed is taken by a thread that did start.
         fn run(t: *Task) void {
@@ -2785,6 +2791,7 @@ const AggColumnWave = struct {
                     t.codec,
                     t.zstd,
                     t.dictionary_bloom,
+                    t.parquet_version,
                 );
             }
         }
@@ -2809,6 +2816,7 @@ const AggColumnWave = struct {
         codec: schema.CompressionCodec,
         zstd: compression.ZstdPlan,
         dictionary_bloom: bool,
+        parquet_version: schema.ParquetVersion,
     ) void {
         std.debug.assert(cols.len <= w.arenas.len);
         var cursor = std.atomic.Value(usize).init(0);
@@ -2821,6 +2829,7 @@ const AggColumnWave = struct {
             .zstd = zstd,
             .cursor = &cursor,
             .dictionary_bloom = dictionary_bloom,
+            .parquet_version = parquet_version,
         };
         if (!spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run)) Task.run(&tasks[0]);
     }
@@ -2864,7 +2873,7 @@ pub fn writeAggregateRows(
         answer_rg_rows,
         codec,
         zstd,
-        if (together) encode else .{ .ledger = encode.ledger, .dictionary_bloom = encode.dictionary_bloom },
+        if (together) encode else .{ .ledger = encode.ledger, .dictionary_bloom = encode.dictionary_bloom, .parquet_version = encode.parquet_version },
     );
 }
 
@@ -2893,6 +2902,7 @@ pub const AggregateFile = struct {
     sink: streaming.Sink,
     off: u64 = 4,
     rows: i64 = 0,
+    parquet_version: schema.ParquetVersion = .v2,
     groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty,
     cached_wave: ?AggColumnWave = null,
     cached_width: usize = 0,
@@ -2962,7 +2972,7 @@ pub const AggregateFile = struct {
 
     /// `cols` supplies names and types only, and may have empty value slices.
     pub fn finish(f: *AggregateFile, cols: []const expr_agg.OutputCol) !u64 {
-        return aggregateFooter(f.arena, f.sink, cols, f.rows, f.groups, f.off);
+        return aggregateFooter(f.arena, f.sink, cols, f.rows, f.groups, f.off, f.parquet_version);
     }
 };
 
@@ -2976,6 +2986,7 @@ fn appendAggregateRows(
     options: AggEncode,
 ) !void {
     const arena = file.arena;
+    file.parquet_version = options.parquet_version;
     const sink = file.sink;
     var off = file.off;
     var encode = options;
@@ -3050,7 +3061,7 @@ fn appendAggregateRows(
                     }
                     charged -= aggEncodeCharge(units[wave_hi - 1]);
                 };
-                if (wave_hi - i > 1) w.run(units[i..wave_hi], codec, zstd, encode.dictionary_bloom);
+                if (wave_hi - i > 1) w.run(units[i..wave_hi], codec, zstd, encode.dictionary_bloom, encode.parquet_version);
             }
             if (wave_hi - i == 1) if (encode.ledger) |l| {
                 drawn = l.drawExact(aggEncodeCharge(out_col)) orelse return error.ExceededMemoryBudget;
@@ -3064,7 +3075,7 @@ fn appendAggregateRows(
         const enc = if (in_wave)
             try wave.?.results[i - wave_lo]
         else
-            try encodeAggOutputCol(alone.allocator(), out_col, &leaf_elem, codec, zstd, encode.dictionary_bloom);
+            try encodeAggOutputCol(alone.allocator(), out_col, &leaf_elem, codec, zstd, encode.dictionary_bloom, encode.parquet_version);
         const col_start: i64 = @intCast(off);
         var em = try ownColumnMeta(arena, enc.meta);
         em.data_page_offset += col_start;
@@ -3117,6 +3128,7 @@ fn aggregateFooter(
     num_rows: i64,
     new_row_groups: std.ArrayListUnmanaged(schema.RowGroup),
     start: u64,
+    parquet_version: schema.ParquetVersion,
 ) !u64 {
     var out: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(start) };
     try fastpath.placeFilters(&out, new_row_groups.items);
@@ -3137,7 +3149,7 @@ fn aggregateFooter(
     for (output_cols) |out_col| try new_schema.append(arena, aggLeafElem(out_col));
 
     const new_meta: schema.FileMetaData = .{
-        .version = 1,
+        .version = parquet_version.footer(),
         .schema = new_schema,
         .num_rows = num_rows,
         .created_by = schema.ZPQ_CREATED_BY,
@@ -7310,6 +7322,7 @@ fn carryChunk(
 /// by output column for `encodeAggregator`, by source leaf for `copyRG`, where a copied chunk that carries no filter
 /// of its own is decoded (through `meta`, on `scratch`) to build one.
 pub const BloomWrite = struct {
+    parquet_version: schema.ParquetVersion = .v2,
     dictionary_bloom: bool = true,
     fpp: []const ?f64 = &.{},
     meta: ?*const schema.FileMetaData = null,

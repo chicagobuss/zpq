@@ -22,6 +22,7 @@ _arguments '*:file:_files' \
   '--no-bloom-filters[zpq option]' \
   '--no-fsync[zpq option]' \
   '--output[zpq option]' \
+  '--parquet-version[zpq option]' \
   '--profile[zpq option]' \
   '--profile-summary[zpq option]' \
   '--query[zpq option]' \

@@ -52,10 +52,10 @@ fn wantsJsonSummary(args: std.process.Args) bool {
         if (std.mem.eql(u8, a, "--summary=json")) return true;
         // Values are opaque, even when their text happens to spell a flag.
         const values = [_][]const u8{
-            "--output",         "-o",                "--filter", "-f",      "--columns",  "-c",                  "--select",     "-s",
-            "--aggregate",      "-a",                "--query",  "-q",      "--codec",    "--compress-priority", "--threads",    "-j",
-            "-g",               "--bloom-filter",    "--format", "--limit", "--group-by", "--column-order",      "--max-memory", "--profile",
-            "--row-group-size", "--row-group-bytes",
+            "--output",         "-o",                "--filter",          "-f",      "--columns",  "-c",                  "--select",     "-s",
+            "--aggregate",      "-a",                "--query",           "-q",      "--codec",    "--compress-priority", "--threads",    "-j",
+            "-g",               "--bloom-filter",    "--format",          "--limit", "--group-by", "--column-order",      "--max-memory", "--profile",
+            "--row-group-size", "--row-group-bytes", "--parquet-version",
         };
         for (values) |flag| if (std.mem.eql(u8, a, flag)) {
             _ = it.next();
@@ -220,6 +220,7 @@ fn runQuery(
     var query: ?[]const u8 = null;
     var fsync = zpq.output_publication.default_fsync;
     var codec: ?schema.CompressionCodec = null;
+    var parquet_version: schema.ParquetVersion = .v2;
     var compress_priority: engine.CompressPriority = .size;
     var parallelism: usize = 0;
     var scan_all: bool = false;
@@ -303,6 +304,15 @@ fn runQuery(
                 diagnosticPrint("zpq query: invalid codec: {s}\n", .{v});
                 return error.BadArgs;
             }
+        } else if (std.mem.eql(u8, tok, "--parquet-version")) {
+            const v = iter.next() orelse {
+                diagnosticPrint("zpq query: --parquet-version requires a value\n", .{});
+                return error.BadArgs;
+            };
+            parquet_version = std.meta.stringToEnum(schema.ParquetVersion, v) orelse {
+                diagnosticPrint("zpq query: invalid parquet version: {s} (v1 or v2)\n", .{v});
+                return error.BadArgs;
+            };
         } else if (std.mem.eql(u8, tok, "--compress-priority")) {
             const v = iter.next() orelse {
                 diagnosticPrint("zpq query: --compress-priority requires a value\n", .{});
@@ -620,6 +630,7 @@ fn runQuery(
         .select = select,
         .aggregate = aggregate,
         .codec = codec,
+        .parquet_version = parquet_version,
         .compress_priority = compress_priority,
         .parallelism = parallelism,
         .scan_all = scan_all,

@@ -579,6 +579,7 @@ fn executeAggregateOver(
         // re-encode's output in flight takes, drawn from the ledger beside the answer, within the slack a GROUP BY's
         // merge and answer have past its limit.
         const encode: consumer.AggEncode = .{
+            .parquet_version = args.parquet_version,
             .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
             .budget = args.max_memory / 4,
             .ledger = &ledger,
@@ -608,7 +609,7 @@ fn executeAggregateOver(
         else if (r.output.group_rows) |rows|
             try writeGroupedParquet(arena, out_path, names.?, st.group_col_types.?, rows, codec, zstd, encode, fd)
         else
-            try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, args.output_fd, args.empty_scalar or r.output.no_row);
+            try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, encode, args.output_fd, args.empty_scalar or r.output.no_row);
         releaseStreamAnswer(&r.output);
         const t_footer_end = nowMonoNs();
         t.footer_ns += @intCast(t_footer_end - t_footer);

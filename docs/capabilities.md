@@ -105,6 +105,13 @@ digits stops the query with an error rather than wrapping or rounding, but only 
 compare a DECIMAL column with a literal exactly, at the column's scale. Arithmetic over a NULL is NULL, for every type,
 as in SQL: `x * 2` is NULL where `x` is, aggregates skip it, and a NULL row raises no overflow or division by zero.
 
+**Parquet version.** `--parquet-version v1|v2` chooses a value-encoding profile; v2 is the default.
+v2 writes a version 2 footer, V1 data pages, PLAIN dictionary pages and RLE_DICTIONARY dictionary data pages;
+it uses DELTA encodings where selected. v1 writes a version 1 footer and V1 data pages, with PLAIN or
+PLAIN_DICTIONARY values and no DELTA or RLE_DICTIONARY. v1 is DuckDB-V1-like, not a strict Parquet 1.0 file:
+codecs, logical annotations and optional metadata are independent. Untouched copied chunks keep their input
+pages and encodings, regardless of the requested footer version. JSON requests use `"parquet_version": "v1"` or `"v2"`.
+
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
 arrays; DELTA_BINARY_PACKED for INT32 / INT64; for other strings DELTA_BYTE_ARRAY where values share long prefixes and

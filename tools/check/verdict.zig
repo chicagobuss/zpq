@@ -1897,7 +1897,7 @@ fn modePageIndex(in: Inputs, _: Spec) !Reason {
 /// The written file's footer as PyArrow and a raw walk read it (readback.py's `row_groups`) holds `holds`.
 fn modeFooter(in: Inputs, spec: Spec) !Reason {
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(in.arena, &.{ in.python, "tools/check/readback.py", in.path });
+    try argv.appendSlice(in.arena, &.{ in.python, "tools/check/readback.py", in.path, "--versioned" });
     const out = try oracle_mod.capture(in.gpa, in.io, argv.items);
     defer in.gpa.free(out.stderr);
     defer in.gpa.free(out.stdout);

@@ -1,0 +1,249 @@
+{
+  "fixtures": [
+    {
+      "name": "main",
+      "copy": "COPY (SELECT (i % 4)::BIGINT AS lo, i::BIGINT AS hi, CASE WHEN i % 7 = 0 THEN NULL ELSE 's' || (i % 4)::VARCHAR END AS s FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"
+    }
+  ],
+  "cases": [
+    {
+      "id": "parquet-version:v1:readers",
+      "cli": [
+        "query",
+        "{path}",
+        "--select",
+        "lo,hi,s",
+        "--parquet-version",
+        "v1",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "written_as",
+        "sql": "SELECT lo,hi,s FROM '{path}'"
+      }
+    },
+    {
+      "id": "parquet-version:v2:readers",
+      "cli": [
+        "query",
+        "{path}",
+        "--select",
+        "lo,hi,s",
+        "--parquet-version",
+        "v2",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "written_as",
+        "sql": "SELECT lo,hi,s FROM '{path}'"
+      }
+    },
+    {
+      "id": "parquet-version:v1:encodings",
+      "cli": [
+        "query",
+        "{path}",
+        "--select",
+        "lo,hi,s",
+        "--parquet-version",
+        "v1",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "footer",
+        "holds": {
+          "row_groups": [
+            {
+              "columns": [
+                {
+                  "path": "lo",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN",
+                    "PLAIN_DICTIONARY"
+                  ]
+                },
+                {
+                  "path": "hi",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN"
+                  ]
+                },
+                {
+                  "path": "s",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN",
+                    "PLAIN_DICTIONARY"
+                  ]
+                }
+              ]
+            }
+          ],
+          "format_version": "1.0"
+        }
+      }
+    },
+    {
+      "id": "parquet-version:v2:encodings",
+      "cli": [
+        "query",
+        "{path}",
+        "--select",
+        "lo,hi,s",
+        "--parquet-version",
+        "v2",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "footer",
+        "holds": {
+          "row_groups": [
+            {
+              "columns": [
+                {
+                  "path": "lo",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN",
+                    "RLE_DICTIONARY"
+                  ]
+                },
+                {
+                  "path": "hi",
+                  "encodings": [
+                    "RLE",
+                    "DELTA_BINARY_PACKED"
+                  ]
+                },
+                {
+                  "path": "s",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN",
+                    "RLE_DICTIONARY"
+                  ]
+                }
+              ]
+            }
+          ],
+          "format_version": "2.6"
+        }
+      }
+    },
+    {
+      "id": "parquet-version:invalid",
+      "cli": [
+        "query",
+        "{path}",
+        "--parquet-version",
+        "v3",
+        "-o",
+        "{out}"
+      ],
+      "refuse": {
+        "error": "exit 2",
+        "no_output": true
+      }
+    },
+    {
+      "id": "parquet-version:v1:scalar-footer",
+      "cli": [
+        "query",
+        "{path}",
+        "--aggregate",
+        "count(*) AS n",
+        "--parquet-version",
+        "v1",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "footer",
+        "holds": {
+          "format_version": "1.0",
+          "rows": [
+            [
+              1000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "id": "parquet-version:v2:scalar-footer",
+      "cli": [
+        "query",
+        "{path}",
+        "--aggregate",
+        "count(*) AS n",
+        "--parquet-version",
+        "v2",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "footer",
+        "holds": {
+          "format_version": "2.6",
+          "rows": [
+            [
+              1000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "id": "parquet-version:default:encodings",
+      "cli": [
+        "query",
+        "{path}",
+        "--select",
+        "lo,hi,s",
+        "-o",
+        "{out}"
+      ],
+      "oracle": {
+        "compare": "footer",
+        "holds": {
+          "row_groups": [
+            {
+              "columns": [
+                {
+                  "path": "lo",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN",
+                    "RLE_DICTIONARY"
+                  ]
+                },
+                {
+                  "path": "hi",
+                  "encodings": [
+                    "RLE",
+                    "DELTA_BINARY_PACKED"
+                  ]
+                },
+                {
+                  "path": "s",
+                  "encodings": [
+                    "RLE",
+                    "PLAIN",
+                    "RLE_DICTIONARY"
+                  ]
+                }
+              ]
+            }
+          ],
+          "format_version": "2.6"
+        }
+      }
+    }
+  ]
+}

@@ -25,6 +25,7 @@ const Wire = struct {
     output_url: ?std.json.Value = null,
     fsync: ?std.json.Value = null,
     output_codec: ?std.json.Value = null,
+    parquet_version: ?std.json.Value = null,
     compress_priority: ?std.json.Value = null,
     select: ?std.json.Value = null,
     aggregate: ?std.json.Value = null,
@@ -59,6 +60,8 @@ pub const Request = struct {
     /// Sync local output before publication; absent/null uses the shared default.
     fsync: ?bool = null,
     output_codec: ?[]const u8 = null,
+    /// `parquet_version`: "v1" or "v2"; absent uses v2.
+    parquet_version: ?[]const u8 = null,
     /// `compress_priority`: "size" or "speed", as the CLI's `--compress-priority` takes them.
     compress_priority: ?[]const u8 = null,
     select: ?[]const u8 = null,
@@ -117,6 +120,7 @@ pub const Request = struct {
                 "column_order",
                 "output_url",
                 "output_codec",
+                "parquet_version",
                 "compress_priority",
                 "bloom_filters",
                 "row_group_size",
@@ -153,6 +157,7 @@ pub const Request = struct {
             else => return f.bad("fsync"),
         } else null;
         req.output_codec = try f.string("output_codec");
+        req.parquet_version = try f.string("parquet_version");
         req.compress_priority = try f.string("compress_priority");
         req.select = try f.string("select");
         req.aggregate = try f.string("aggregate");
@@ -570,4 +575,17 @@ test "automatic Bloom filters accept both polarities and default on for absent o
         &bad,
     ));
     try std.testing.expectEqualStrings("bloom_filters_enabled", bad);
+}
+
+test "parquet version request parses values and rejects wrong types" {
+    var bad: []const u8 = "";
+    var req = try Request.parse(std.testing.allocator,
+        \\{"inputs":["a.parquet"],"parquet_version":"v1"}
+    , &bad);
+    defer req.deinit();
+    try std.testing.expectEqualStrings("v1", req.parquet_version.?);
+    try std.testing.expectError(error.BadFieldType, Request.parse(std.testing.allocator,
+        \\{"inputs":["a.parquet"],"parquet_version":1}
+    , &bad));
+    try std.testing.expectEqualStrings("parquet_version", bad);
 }

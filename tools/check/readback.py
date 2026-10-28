@@ -399,7 +399,8 @@ def main():
             print(f"pyarrow rejected {path}: {e}", file=sys.stderr)
             sys.exit(1)
     filters = []
-    rest = sys.argv[2:]
+    report_version = sys.argv[2:] == ["--versioned"]
+    rest = [] if report_version else sys.argv[2:]
     while rest:
         if rest[0] != "--filter" or len(rest) < 4:
             raise SystemExit("usage: readback.py FILE [--filter COL OP VALUE]...")
@@ -449,7 +450,7 @@ def main():
         if value.startswith("$pow2:"):
             value = 2 ** int(value[6:])
         pushed.append(pq.read_table(path, filters=[(col, op, scalar(value, typ))]).num_rows)
-    print(json.dumps({
+    result = {
         "names": names,
         "types": [str(f.type) for f in table.schema],
         "nullable": [f.nullable for f in table.schema],
@@ -458,7 +459,10 @@ def main():
         "column_orders": column_orders(path),
         "stats_kept": kept,
         "pushed": pushed,
-    }))
+    }
+    if report_version:
+        result["format_version"] = md.format_version
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":

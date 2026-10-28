@@ -912,6 +912,7 @@ test "M1 DISTINCT writes identical canonical Parquet with sixteen actual produce
                         result.state.agg_sources,
                         .SNAPPY,
                         .{},
+                        .{},
                         null,
                         false,
                     );

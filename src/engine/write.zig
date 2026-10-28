@@ -566,6 +566,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
                 .kept_set = kept_set,
                 .codec = args.codec orelse .SNAPPY,
                 .zstd = zstd,
+                .parquet_version = args.parquet_version,
                 .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
                 .bloom_outputs = blooms.outputs,
                 .bloom_leaves = blooms.leaves,
@@ -656,7 +657,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // reads differently); a pure byte copy or recompression stays its source's.
     if (need_encoder) for (new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
     const new_meta: schema.FileMetaData = .{
-        .version = meta0.version,
+        .version = args.parquet_version.footer(),
         .schema = new_schema_items,
         .num_rows = rows_kept,
         .created_by = if (need_encoder) schema.ZPQ_CREATED_BY else meta0.created_by,
@@ -933,6 +934,7 @@ pub fn writeOneRowParquet(
     sources: []const ?schema.SchemaElement,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
     output_fd: ?local_fs.fd_t,
     empty: bool,
 ) !u64 {
@@ -954,7 +956,7 @@ pub fn writeOneRowParquet(
             if (col.def_levels) |levels| col.def_levels = levels[0..0];
         },
     };
-    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, if (empty) 0 else 1, codec, zstd, .{});
+    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, if (empty) 0 else 1, codec, zstd, encode);
     if (fd_open) {
         fd_open = false;
         try local_fs.closeChecked(fd);

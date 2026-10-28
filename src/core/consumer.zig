@@ -578,49 +578,13 @@ pub fn appendSliceRows(
     return surviving;
 }
 
-/// A named passthrough's leaf as the flat column it is written as: present (`def == max_def`) or NULL, at one level.
-/// A nested leaf counts its parents' levels too, which a flat leaf has none of. Others pass through as they are.
-fn namedLevels(scratch: std.mem.Allocator, pt: OutputCol.Passthrough, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
-    if (pt.name == null) return col;
-    return switch (col) {
-        inline else => |c, tag| @unionInit(filter_eval.Batch.Column, @tagName(tag), try flatLevels(@TypeOf(c.values[0]), scratch, c)),
-    };
-}
-
-fn flatLevels(comptime T: type, scratch: std.mem.Allocator, c: filter_eval.ColumnT(T)) !filter_eval.ColumnT(T) {
-    if (c.max_def <= 1 or c.max_rep > 0) return c;
-    var out = c;
-    out.max_def = 1;
-    if (c.def_levels) |dl| {
-        const flat = try scratch.alloc(u32, dl.len);
-        for (dl, flat) |d, *f| f.* = @intFromBool(d == c.max_def);
-        out.def_levels = flat;
-    }
-    return out;
-}
+const namedLevels = output.namedLevels;
+const flatLevels = output.flatLevels;
 
 pub const renameLeaf = types.renameLeaf;
 
-/// `col`, a computed output's values, in the BOOLEAN lane when its buffer `buf` is one: expressions evaluate a
-/// BOOLEAN as 0/1 in the integer lane.
-fn booleanLane(scratch: std.mem.Allocator, buf: OutputAggregator.ColumnBuf, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
-    if (buf != .boolean or col != .i64) return col;
-    const c = col.i64;
-    const values = try scratch.alloc(bool, c.values.len);
-    for (c.values, values) |v, *o| o.* = v != 0;
-    return .{ .boolean = .{ .values = values, .def_levels = c.def_levels, .max_def = c.max_def, .has_nulls = c.has_nulls } };
-}
-
-/// `col`, a passthrough output's rows as `SliceReader.next` reads them, in the lane of the output buffer `buf`, as
-/// `appendSliceRows` would write it: a DECIMAL written losslessly as its exact integers.
-pub fn outputLane(
-    buf: OutputAggregator.ColumnBuf,
-    col: filter_eval.Batch.Column,
-    scratch: std.mem.Allocator,
-) !filter_eval.Batch.Column {
-    if (buf == .i128 and col == .f64) return .{ .i128 = try expr_eval.unscaledView(scratch, col) };
-    return col;
-}
+const booleanLane = output.booleanLane;
+pub const outputLane = output.outputLane;
 
 /// The dictionary of flat BYTE_ARRAY chunk `ci`, on `a`, when every one of its data pages is dictionary-encoded, so
 /// that each of its values is an entry; null otherwise. Reads no data page's body.
@@ -8867,47 +8831,6 @@ test "partition window scratch keeps materialized dictionaries live across reset
 
 test "partition window scratch returns every charge on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPartitionWindowScratch, .{ 32, false });
-}
-
-test "regression: a renamed passthrough is its leaf renamed and flat, NULL where it is NULL at any depth" {
-    const testing = std.testing;
-    var elem: schema.SchemaElement = .{
-        .type = .INT32,
-        .type_length = null,
-        .repetition_type = .REQUIRED,
-        .name = "a",
-        .num_children = null,
-        .scale = null,
-        .precision = null,
-        .field_id = null,
-        .converted_type = .DATE,
-        .logical_type = .{ .DATE = .{} },
-    };
-    // A REQUIRED field under an OPTIONAL struct can be NULL: flat, it is OPTIONAL.
-    renameLeaf(&elem, "k", 1);
-    try testing.expectEqualStrings("k", elem.name);
-    try testing.expectEqual(schema.FieldRepetitionType.OPTIONAL, elem.repetition_type.?);
-    try testing.expectEqual(schema.Type.INT32, elem.type.?);
-    try testing.expect(elem.logical_type.? == .DATE);
-    renameLeaf(&elem, "k", 0);
-    try testing.expectEqual(schema.FieldRepetitionType.REQUIRED, elem.repetition_type.?);
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // Levels of an OPTIONAL leaf in an OPTIONAL struct: 0 struct NULL, 1 leaf NULL, 2 present.
-    const vals = [_]i32{ 0, 0, 7, 9 };
-    const defs = [_]u32{ 0, 1, 2, 2 };
-    const col: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &defs, .max_def = 2, .has_nulls = true } };
-    const named = try namedLevels(a, .{ .ci = 0, .name = "k" }, col);
-    try testing.expectEqual(@as(u32, 1), named.i32.max_def);
-    try testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1 }, named.i32.def_levels.?);
-    try testing.expectEqualSlices(i32, &vals, named.i32.values);
-    // Unnamed, or already flat, the column is untouched.
-    try testing.expectEqual(@as(u32, 2), (try namedLevels(a, .{ .ci = 0 }, col)).i32.max_def);
-    const flat_defs = [_]u32{ 0, 1, 1, 1 };
-    const flat: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &flat_defs, .max_def = 1, .has_nulls = true } };
-    try testing.expectEqual(flat.i32.def_levels.?.ptr, (try namedLevels(a, .{ .ci = 0, .name = "k" }, flat)).i32.def_levels.?.ptr);
 }
 
 test "Survivors: computed outputs evaluate over the kept rows only, with their levels, codes and exact values" {

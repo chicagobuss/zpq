@@ -59,3 +59,70 @@ through the view itself. Polars answers keep `EventTime` as epoch seconds only w
 engine takes a level.
 
 `python -m unittest discover -s bench/tests` checks the rules (the `bench-self` stage of the commit tier).
+
+## Requests and saved-run exports
+
+Prepare an offline request packet, optionally with a metadata-only input dependency plan:
+
+```sh
+python -m bench request request.json --out packet.json
+python -m bench request request.json --catalog catalog.json --inventory host.json --out packet.json
+python -m bench export request.json --out export-directory
+```
+
+These commands do not run engines, judge answers, change source records or access the network. The exporter reads
+native `header.json` + `planned.json` + `journal.jsonl`, or legacy `manifest.jsonl` + `results.jsonl`. Legacy manifests
+must contain their locked configuration. An unsupported source schema refuses. The existing scorer determines native
+quarantine and pending reruns; the exporter preserves every planned case, including failures and missing engines.
+
+A request is ordinary JSON:
+
+```json
+{
+  "schema": "zpq-bench-request/v1",
+  "id": "candidate-comparison",
+  "requester": "operator",
+  "runner": null,
+  "host": "benchmark-host",
+  "purpose": "Compare the candidate and baseline on the selected cases",
+  "candidate": {"sha": null, "binary_sha256": null},
+  "baseline": {"sha": null, "binary_sha256": null},
+  "targets": ["study/card10/q09_grp_cd"],
+  "controls": [],
+  "lanes": ["cold"],
+  "expected_engines": ["zpq", "base"],
+  "correctness_receipt": null,
+  "corpus_manifest_sha256": null,
+  "query_set_sha256": null,
+  "runs": [{"id": "main", "path": "/path/to/saved-run", "lane": "cold"}]
+}
+```
+
+Supply full source SHA and binary SHA-256 values when available; null keeps missing evidence explicit. A correctness
+receipt supplies `path`, `sha256`, `source_sha` and `tree_clean: true`. Packet completeness records supplied fields;
+it does not validate the receipt's contents or approve scheduling. A requester and the execution runner are separate
+identities. The source binary/source pins are checked against the packet wherever the source format records them.
+
+When several saved runs plan the same case and lane, choose the complete case cohort explicitly:
+`"selection": {"cold": {"study/card10/q09_grp_cd": "confirmation"}}`. The choice applies to every engine; the exporter
+never selects the fastest attempts or mixes engines from different confirmation cohorts. Warmups, excluded attempts
+and replaced cohorts remain in `attempts.jsonl`. Missing requested cases remain pending. Optional `stored_summaries`
+lists legacy composite JSON files; their rival medians retain their source run, lane and metric field and are labeled
+stored. They do not replace an existing measured outcome or certify a missing measurement.
+
+The export directory contains `request.json`, `report.json`, complete `cells.jsonl`, audit `attempts.jsonl`,
+`tracker.json` (a document bundle) and `export.json` (file digests). The bundle has one request and report document,
+plus bounded per-lane JSONL documents. Publish it using the document store's existing client: compare existing content,
+create missing documents, and update changed ones with its normal version/lease checks. Retrying an identical export
+is a no-op; conflicting output refuses before any file is replaced. No export timestamp enters deterministic content.
+
+`byte_identical` concerns candidate/base raw output bytes only when every selected output has a raw digest. Canonical
+answer hashes and semantic comparer acceptance do not prove raw equality. `oracle_byte_identical`, method compliance
+and release decisions stay unknown unless separate evidence establishes them. Historical source contracts are preserved
+in the report; export does not recertify a run under a newer method.
+
+The input planner accepts a `zpq-corpus-catalog/v1` with `objects` (`sha256`, `bytes`, `source_paths`) and
+`case_dependencies` (`case`, `objects`), plus a host inventory with `host` and `inputs` entries containing `files`
+(`path`, `bytes`). Shared objects are counted once. A matching local size means verification is required, not a trusted
+copy. Missing/wrong-size bytes are reported separately. This command neither hashes large datasets nor fetches or
+releases them; preparation and verification must finish before timing/cache conditioning.

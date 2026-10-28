@@ -20,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from bench import engines, env, lane, replay, score, suites
+from bench import engines, env, export, lane, replay, requests, score, suites
 
 ROOT = engines.ROOT
 EXIT = {"COMPLETE": 0, "INCOMPLETE": 2, "UNCERTIFIED": 3}
@@ -163,7 +163,24 @@ def main():
     x = sub.add_parser("replay")
     x.add_argument("old")
     x.add_argument("--out", required=True)
+    for name in ("request", "export"):
+        command = sub.add_parser(name, help="prepare an offline request" if name == "request" else "export saved runs")
+        command.add_argument("request")
+        command.add_argument("--out", required=True)
+        if name == "request":
+            command.add_argument("--catalog")
+            command.add_argument("--inventory")
     a = p.parse_args()
+    if a.command in ("request", "export"):
+        try:
+            if a.command == "request":
+                requests.write_packet(a.out, requests.packet(a.request, a.catalog, a.inventory))
+            else:
+                result = export.export(a.request, a.out)
+                print(json.dumps(result["coverage"], sort_keys=True))
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            p.exit(1, f"bench {a.command}: {error}\n")
+        return
     if a.command == "run":
         sys.exit(run(a))
     if a.command == "score":

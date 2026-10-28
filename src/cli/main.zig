@@ -896,6 +896,7 @@ const expandGlob = zpq.frontend.expandGlob;
 /// compares against pyarrow.
 fn runConform(gpa: std.mem.Allocator, path: []const u8) !bool {
     const file_bytes = readFile(gpa, path) catch |err| {
+        diagnosticPrint("zpq conform: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
         try jsonFatal(gpa, "open_failed", err);
         return false;
     };
@@ -906,6 +907,7 @@ fn runConform(gpa: std.mem.Allocator, path: []const u8) !bool {
     const arena = arena_state.allocator();
 
     const meta = metadata.open(arena, file_bytes) catch |err| {
+        diagnosticPrint("zpq conform: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
         try jsonFatal(gpa, "metadata_open_failed", err);
         return false;
     };
@@ -1046,6 +1048,7 @@ fn jsonFatal(gpa: std.mem.Allocator, kind: []const u8, err: anyerror) !void {
     try w.writeAll("\",\"message\":\"");
     try writeJsonString(&w, zpq.frontend.failureMessage(err));
     try w.writeAll("\"}\n");
+    try w.flush();
 }
 
 fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
@@ -1250,6 +1253,7 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         defer file_arena.deinit();
         const report = @import("inspect.zig").inspect(file_arena.allocator(), init.minimal.environ, path, detail) catch |err| {
             failures += 1;
+            diagnosticPrint("zpq inspect: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
             if (json) {
                 try ws.writeAll(try std.json.Stringify.valueAlloc(file_arena.allocator(), .{
                     .path = path,

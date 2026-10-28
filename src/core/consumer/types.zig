@@ -336,3 +336,12 @@ test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 refe
     try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
 }
 
+
+/// `elem`, a kept leaf's schema element, as the flat leaf `name` that a renamed passthrough writes: the same type and
+/// annotation, OPTIONAL exactly when the leaf can be NULL at its depth (`max_def`), whatever its own repetition says.
+pub fn renameLeaf(elem: *schema.SchemaElement, name: []const u8, max_def: i32) void {
+    elem.name = name;
+    elem.num_children = 0;
+    elem.repetition_type = if (max_def > 0) .OPTIONAL else .REQUIRED;
+}
+

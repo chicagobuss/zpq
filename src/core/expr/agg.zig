@@ -241,8 +241,8 @@ const DistinctBytes = struct {
         s.map.putAssumeCapacity(.{ .bytes = bytes, .hash = hash }, {});
     }
     const Result = struct { key_ptr: *[]const u8, found_existing: bool };
-    fn getHashed(s: *DistinctBytes, a: std.mem.Allocator, bytes: []const u8, hash: u64) !Result {
-        const got = try s.map.getOrPut(a, .{ .bytes = bytes, .hash = hash });
+    fn getHashedAssumeCapacity(s: *DistinctBytes, bytes: []const u8, hash: u64) Result {
+        const got = s.map.getOrPutAssumeCapacity(.{ .bytes = bytes, .hash = hash });
         return .{ .key_ptr = &got.key_ptr.bytes, .found_existing = got.found_existing };
     }
     fn removeHashed(s: *DistinctBytes, bytes: []const u8, hash: u64) void {
@@ -261,6 +261,7 @@ const DistinctBytes = struct {
 };
 
 pub const DistinctSet = struct {
+    const u64_entry_bytes: usize = 16;
     val_set: union(enum) {
         none,
         inline_u64: InlineU64,
@@ -272,6 +273,8 @@ pub const DistinctSet = struct {
         bytes: DistinctBytes,
     } = .none,
     allocated_bytes: usize = 0,
+    /// Capacity not already covered by the per-value estimate, including a table preallocated for a merge.
+    map_extra: usize = 0,
     max_memory_bytes: usize = 0,
     shared: ?*SharedBudget = null,
     /// Charged against this table's private ceiling instead of `shared`. The table must outlive the set.
@@ -317,14 +320,16 @@ pub const DistinctSet = struct {
         if (self.parts) |parts| for (parts) |*p| p.detach();
         if (self.shared) |budget| budget.release(self.max_memory_bytes);
         self.shared = null;
-        self.max_memory_bytes = 0;
         self.releasePrivate();
+        self.max_memory_bytes = 0;
     }
 
     fn releasePrivate(self: *DistinctSet) void {
         if (self.private_table) |t| {
+            t.releasePrivateBytes(self.max_memory_bytes);
             t.releaseSpilledSet();
             self.private_table = null;
+            self.max_memory_bytes = 0;
         }
     }
 
@@ -375,10 +380,29 @@ pub const DistinctSet = struct {
             return;
         }
         const budget = self.shared orelse return;
+        self.refreshMapExtra();
         const slack = self.max_memory_bytes - self.allocated_bytes;
         if (slack == 0) return;
         self.max_memory_bytes = self.allocated_bytes;
         budget.release(slack);
+    }
+
+    /// A numeric merge source is about to be consumed and freed, so it no longer needs speculative per-value
+    /// reservation for future growth. Keep its actual live map or bitmap, plus non-value charges, funded.
+    pub fn releaseConsumedNumericSurplus(self: *DistinctSet) void {
+        if (self.shared == null or self.parts != null) return;
+        const physical, const identity = switch (self.val_set) {
+            .u64 => |s| .{ mapBytes(u64, s.capacity()), @as(usize, s.count()) * u64_entry_bytes + self.map_extra },
+            .i128 => |s| .{ mapBytes(i128, s.capacity()), @as(usize, s.count()) * 32 + self.map_extra },
+            .bitmap => |b| .{ b.words.len * @sizeOf(u64), b.count * u64_entry_bytes },
+            else => return,
+        };
+        const other = self.allocated_bytes -| identity;
+        const held = other + physical;
+        if (held >= self.allocated_bytes) return;
+        self.allocated_bytes = held;
+        self.map_extra = 0; // This source is read-only until deinit.
+        self.releaseSlack();
     }
 
     /// Drawn in proportion to the set, never a block: a set per group is a holder too many to each strand a block's
@@ -389,7 +413,16 @@ pub const DistinctSet = struct {
 
     pub fn drawMore(self: *DistinctSet, need: usize) error{ExceededMemoryBudget}!void {
         if (self.allocated_bytes + need <= self.max_memory_bytes) return;
-        const budget = self.shared orelse return;
+        self.refreshMapExtra();
+        if (self.allocated_bytes + need <= self.max_memory_bytes) return;
+        const budget = self.shared orelse {
+            if (self.private_table) |t| {
+                const deficit = self.allocated_bytes + need - self.max_memory_bytes;
+                try t.chargePrivateBytes(deficit);
+                self.max_memory_bytes += deficit;
+            }
+            return;
+        };
         if (budget.tight()) self.releaseSlack();
         const deficit = (self.allocated_bytes + need) - self.max_memory_bytes;
         const ahead = if (budget.tight()) deficit else @max(deficit, self.allocated_bytes / 8, draw_floor);
@@ -421,6 +454,92 @@ pub const DistinctSet = struct {
     const ValSet = @FieldType(DistinctSet, "val_set");
     const ValKind = std.meta.Tag(ValSet);
 
+    fn mapBytes(comptime K: type, cap: usize) usize {
+        if (cap == 0) return 0;
+        const Header = struct { values: [*]void, keys: [*]K, capacity: u32 };
+        const key_start = std.mem.alignForward(usize, @sizeOf(Header) + cap, @alignOf(K));
+        return std.mem.alignForward(usize, key_start + cap * @sizeOf(K), @max(@alignOf(Header), @alignOf(K)));
+    }
+
+    fn growthCapacity(capacity: u32, available: u32, additional: u32) !u32 {
+        if (additional <= available) return capacity;
+        const pct = std.hash_map.default_max_load_percentage;
+        const load = @as(u64, capacity) * pct / 100 - available;
+        const want = (load + additional) * 100 / pct + 1;
+        const want32 = std.math.cast(u32, want) orelse return error.ExceededMemoryBudget;
+        const next = std.math.ceilPowerOfTwo(u32, want32) catch return error.ExceededMemoryBudget;
+        return @max(next, 8);
+    }
+
+    fn growthBytes(comptime K: type, capacity: u32, available: u32, additional: u32) !usize {
+        const next = try growthCapacity(capacity, available, additional);
+        return if (next == capacity) 0 else mapBytes(K, next);
+    }
+
+    fn settleMap(self: *DistinctSet, comptime K: type, cap: usize, count_: usize, entry_size: usize) void {
+        const extra = mapBytes(K, cap) -| (count_ * entry_size);
+        self.allocated_bytes = self.allocated_bytes - self.map_extra + extra;
+        self.map_extra = extra;
+    }
+
+    fn refreshMapExtra(self: *DistinctSet) void {
+        if (self.map_extra == 0) return;
+        // A getOrPut may have inserted one not-yet-charged entry. Keep one entry's credit until the next draw so
+        // this remains safe both before and after the caller records that value.
+        const required = switch (self.val_set) {
+            .u64 => |s| mapBytes(u64, s.capacity()) -| ((@as(usize, s.count()) -| 1) * u64_entry_bytes),
+            .i128 => |s| mapBytes(i128, s.capacity()) -| ((@as(usize, s.count()) -| 1) * 32),
+            .bytes => |s| mapBytes(DistinctBytes.Key, s.map.capacity()) -| ((@as(usize, s.count()) -| 1) * 48),
+            else => return,
+        };
+        if (required >= self.map_extra) return;
+        self.allocated_bytes -= self.map_extra - required;
+        self.map_extra = required;
+    }
+
+    /// std's unmanaged map stores metadata and keys in one allocation. When copying both tables cannot fit, grow
+    /// a page-backed allocation without copying it, move its key region within the mapping, then rehash in place.
+    fn remapMap(
+        self: *DistinctSet,
+        comptime K: type,
+        map: anytype,
+        allocator: std.mem.Allocator,
+        additional: u32,
+        entry_bytes: usize,
+        new_value_bytes: usize,
+        ctx: anytype,
+    ) !bool {
+        const old_cap = map.capacity();
+        if (old_cap == 0) return false;
+        const new_cap = try growthCapacity(old_cap, map.available, additional);
+        if (new_cap == old_cap) return true;
+        const Header = struct { values: [*]void, keys: [*]K, capacity: u32 };
+        const new_extra = mapBytes(K, new_cap) -| (@as(usize, map.count()) * entry_bytes);
+        try self.drawMore(new_value_bytes + (new_extra -| self.map_extra));
+        const meta_addr = @intFromPtr(map.metadata.?);
+        const base: [*]align(@max(@alignOf(Header), @alignOf(K))) u8 = @ptrFromInt(meta_addr - @sizeOf(Header));
+        const old_keys = std.mem.alignForward(usize, @sizeOf(Header) + old_cap, @alignOf(K));
+        const old_header: *const Header = @ptrCast(@alignCast(base));
+        // This path follows the pinned Zig stdlib's map layout. Decline safely if a future layout changes.
+        if (old_header.capacity != old_cap or @intFromPtr(old_header.keys) != @intFromPtr(base) + old_keys) return false;
+        const old_mem = base[0..mapBytes(K, old_cap)];
+        const map_allocator = core_memory.distinctMapAllocator(allocator, self.shared);
+        const mem = core_memory.remapWithoutCopy(map_allocator, old_mem, mapBytes(K, new_cap)) orelse return false;
+        const new_keys = std.mem.alignForward(usize, @sizeOf(Header) + new_cap, @alignOf(K));
+        const key_bytes = @as(usize, old_cap) * @sizeOf(K);
+        std.mem.copyBackwards(u8, mem[new_keys..][0..key_bytes], mem[old_keys..][0..key_bytes]);
+        @memset(mem[@sizeOf(Header) + old_cap ..][0 .. new_cap - old_cap], 0);
+        const hdr: *Header = @ptrCast(@alignCast(mem.ptr));
+        hdr.keys = @ptrCast(@alignCast(mem.ptr + new_keys));
+        hdr.values = @ptrCast(mem.ptr + new_keys + @as(usize, new_cap) * @sizeOf(K));
+        hdr.capacity = new_cap;
+        map.metadata = @ptrCast(mem.ptr + @sizeOf(Header));
+        map.available = @intCast((@as(usize, new_cap) * std.hash_map.default_max_load_percentage) / 100 - map.count());
+        map.rehash(ctx);
+        self.settleMap(K, new_cap, map.count(), entry_bytes);
+        return true;
+    }
+
     /// The kind of table this set (or its partitions) keeps its values in, once past the inline few; null while none.
     fn mapKind(self: *const DistinctSet) ?ValKind {
         if (self.parts) |parts| {
@@ -447,22 +566,46 @@ pub const DistinctSet = struct {
         const n = std.math.cast(u32, extra) orelse return;
         switch (kind) {
             inline .u64, .i128, .bytes => |map_tag| {
+                const K = switch (map_tag) {
+                    .u64 => u64,
+                    .i128 => i128,
+                    else => DistinctBytes.Key,
+                };
+                const entry_size: usize = switch (map_tag) {
+                    .u64 => u64_entry_bytes,
+                    .i128 => 32,
+                    else => 48,
+                };
                 const inline_tag: ValKind = switch (map_tag) {
                     .u64 => .inline_u64,
                     .i128 => .inline_i128,
                     else => .inline_bytes,
                 };
                 switch (self.val_set) {
-                    map_tag => |*m| try m.ensureUnusedCapacity(allocator, n),
+                    map_tag => |*m| {
+                        const cap = if (map_tag == .bytes) m.map.capacity() else m.capacity();
+                        const available = if (map_tag == .bytes) m.map.available else m.available;
+                        self.drawMore(try growthBytes(K, cap, available, n)) catch |err| {
+                            const raw_map = if (map_tag == .bytes) &m.map else m;
+                            const ctx = if (map_tag == .bytes) DistinctBytes.Context{} else std.hash_map.AutoContext(K){};
+                            if (!try self.remapMap(K, raw_map, allocator, n, entry_size, 0, ctx)) return err;
+                        };
+                        try m.ensureUnusedCapacity(core_memory.distinctMapAllocator(allocator, self.shared), n);
+                        const new_cap = if (map_tag == .bytes) m.map.capacity() else m.capacity();
+                        self.settleMap(K, new_cap, m.count(), entry_size);
+                    },
                     .none, inline_tag => {
                         var map: @FieldType(ValSet, @tagName(map_tag)) = .empty;
                         const held = switch (self.val_set) {
                             inline_tag => |inl| inl.vals[0..inl.len],
                             else => &.{},
                         };
-                        try map.ensureTotalCapacity(allocator, @intCast(held.len + n));
+                        try self.drawMore(try growthBytes(K, 0, 0, @intCast(held.len + n)));
+                        try map.ensureTotalCapacity(core_memory.distinctMapAllocator(allocator, self.shared), @intCast(held.len + n));
                         for (held) |v| map.putAssumeCapacity(v, {});
                         self.val_set = @unionInit(ValSet, @tagName(map_tag), map);
+                        const new_cap = if (map_tag == .bytes) map.map.capacity() else map.capacity();
+                        self.settleMap(K, new_cap, held.len, entry_size);
                     },
                     // Another kind: insertion reports it.
                     else => {},
@@ -480,7 +623,7 @@ pub const DistinctSet = struct {
         }
         switch (self.val_set) {
             .none => {
-                const entry_size = 24;
+                const entry_size = u64_entry_bytes;
                 try self.drawMore(entry_size);
                 var s: InlineU64 = .{ .len = 1, .vals = undefined };
                 s.vals[0] = v;
@@ -491,7 +634,7 @@ pub const DistinctSet = struct {
                 for (s.vals[0..s.len]) |existing| {
                     if (existing == v) return;
                 }
-                const entry_size = 24;
+                const entry_size = u64_entry_bytes;
                 try self.drawMore(entry_size);
                 if (s.len < INLINE_CAP) {
                     s.vals[s.len] = v;
@@ -500,22 +643,29 @@ pub const DistinctSet = struct {
                     return;
                 }
                 var map: std.AutoHashMapUnmanaged(u64, void) = .empty;
-                try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
+                try self.drawMore(entry_size + try growthBytes(u64, 0, 0, INLINE_CAP + 1));
+                try map.ensureTotalCapacity(core_memory.distinctMapAllocator(allocator, self.shared), INLINE_CAP + 1);
                 for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
                 map.putAssumeCapacity(v, {});
                 self.allocated_bytes += entry_size;
                 self.val_set = .{ .u64 = map };
+                self.settleMap(u64, map.capacity(), map.count(), u64_entry_bytes);
             },
             .bitmap => try self.insertBitmap(allocator, v),
             .u64 => |*s| {
                 if (s.available == 0) {
+                    @branchHint(.cold);
                     if (s.contains(v)) return;
                     if (try self.bitmapFromMap(allocator, v)) return;
-                    try self.drawMore(24);
+                    self.drawMore(u64_entry_bytes + try growthBytes(u64, s.capacity(), s.available, 1)) catch |err| {
+                        if (!try self.remapMap(u64, s, allocator, 1, u64_entry_bytes, u64_entry_bytes, std.hash_map.AutoContext(u64){})) return err;
+                    };
+                    try s.ensureUnusedCapacity(core_memory.distinctMapAllocator(allocator, self.shared), 1);
+                    self.settleMap(u64, s.capacity(), s.count(), u64_entry_bytes);
                 }
-                const gop = try s.getOrPut(allocator, v);
+                const gop = s.getOrPutAssumeCapacity(v);
                 if (gop.found_existing) return;
-                const entry_size = 24;
+                const entry_size = u64_entry_bytes;
                 self.drawMore(entry_size) catch |err| {
                     _ = s.remove(v);
                     return err;
@@ -577,16 +727,20 @@ pub const DistinctSet = struct {
         }
         const shape = bitmapShape(lo, hi, old.count() + 1) orelse return false;
         // Retain the established per-identity reservation: a late wide value can always return to the map
-        // under the same budget, without replaying an input window. Bits use at most a third of that credit.
-        try self.drawMore(24);
+        // under the same budget, without replaying an input window. Bits use at most half of that credit.
+        const physical = mapBytes(u64, old.capacity()) + shape.words * @sizeOf(u64);
+        const covered = @as(usize, old.count()) * u64_entry_bytes + self.map_extra;
+        try self.drawMore(u64_entry_bytes + (physical -| covered));
         const words = try allocator.alloc(u64, shape.words);
         @memset(words, 0);
         var bits: U64Bitmap = .{ .base = shape.base, .words = words, .count = 0 };
         it = old.keyIterator();
         while (it.next()) |key| bits.insert(key.*);
         bits.insert(v);
-        self.allocated_bytes += 24;
+        self.allocated_bytes += u64_entry_bytes;
         old.deinit(allocator);
+        self.allocated_bytes -= self.map_extra;
+        self.map_extra = 0;
         self.val_set = .{ .bitmap = bits };
         return true;
     }
@@ -597,6 +751,8 @@ pub const DistinctSet = struct {
         const old = self.val_set.bitmap;
         if (lo >= old.base and hi <= old.last()) return true;
         const shape = bitmapShape(@min(lo, old.base), @max(hi, old.last()), old.count +| extra) orelse return false;
+        const physical = (old.words.len + shape.words) * @sizeOf(u64);
+        try self.drawMore(physical -| (old.count * u64_entry_bytes));
         const words = try allocator.alloc(u64, shape.words);
         @memset(words, 0);
         const start: usize = @intCast((old.base - shape.base) / 64);
@@ -612,21 +768,25 @@ pub const DistinctSet = struct {
             const offset: usize = @intCast(v - old.base);
             if (old.words[offset / 64] & (@as(u64, 1) << @as(u6, @truncate(offset))) != 0) return;
         }
-        try self.drawMore(24);
+        try self.drawMore(u64_entry_bytes);
         if (try self.bitmapRange(allocator, v, v, 1)) {
             self.val_set.bitmap.insert(v);
-            self.allocated_bytes += 24;
+            self.allocated_bytes += u64_entry_bytes;
             return;
         }
         var map: std.AutoHashMapUnmanaged(u64, void) = .empty;
         errdefer map.deinit(allocator);
-        try map.ensureTotalCapacity(allocator, std.math.cast(u32, old.count + 1) orelse return error.OutOfMemory);
+        const target = std.math.cast(u32, old.count + 1) orelse return error.OutOfMemory;
+        const physical = old.words.len * @sizeOf(u64) + try growthBytes(u64, 0, 0, target);
+        try self.drawMore(u64_entry_bytes + (physical -| (old.count * u64_entry_bytes)));
+        try map.ensureTotalCapacity(core_memory.distinctMapAllocator(allocator, self.shared), target);
         var it = old.iterator();
         while (it.next()) |bit| map.putAssumeCapacity(old.base + bit, {});
         map.putAssumeCapacity(v, {});
         self.val_set = .{ .u64 = map };
-        self.allocated_bytes += 24;
+        self.allocated_bytes += u64_entry_bytes;
         allocator.free(old.words);
+        self.settleMap(u64, map.capacity(), map.count(), u64_entry_bytes);
     }
 
     pub fn insertI128(self: *DistinctSet, allocator: std.mem.Allocator, v: i128) !void {
@@ -657,18 +817,25 @@ pub const DistinctSet = struct {
                     return;
                 }
                 var map: std.AutoHashMapUnmanaged(i128, void) = .empty;
-                try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
+                try self.drawMore(entry_size + try growthBytes(i128, 0, 0, INLINE_CAP + 1));
+                try map.ensureTotalCapacity(core_memory.distinctMapAllocator(allocator, self.shared), INLINE_CAP + 1);
                 for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
                 map.putAssumeCapacity(v, {});
                 self.allocated_bytes += entry_size;
                 self.val_set = .{ .i128 = map };
+                self.settleMap(i128, map.capacity(), map.count(), 32);
             },
             .i128 => |*s| {
                 if (s.available == 0) {
+                    @branchHint(.cold);
                     if (s.contains(v)) return;
-                    try self.drawMore(32);
+                    self.drawMore(32 + try growthBytes(i128, s.capacity(), s.available, 1)) catch |err| {
+                        if (!try self.remapMap(i128, s, allocator, 1, 32, 32, std.hash_map.AutoContext(i128){})) return err;
+                    };
+                    try s.ensureUnusedCapacity(core_memory.distinctMapAllocator(allocator, self.shared), 1);
+                    self.settleMap(i128, s.capacity(), s.count(), 32);
                 }
-                const gop = try s.getOrPut(allocator, v);
+                const gop = s.getOrPutAssumeCapacity(v);
                 if (gop.found_existing) return;
                 const entry_size = 32;
                 self.drawMore(entry_size) catch |err| {
@@ -732,18 +899,25 @@ pub const DistinctSet = struct {
                     return;
                 }
                 var map: DistinctBytes = .empty;
-                try map.ensureTotalCapacity(allocator, INLINE_CAP + 1);
+                try self.drawMore(entry_size + try growthBytes(DistinctBytes.Key, 0, 0, INLINE_CAP + 1));
+                try map.ensureTotalCapacity(core_memory.distinctMapAllocator(allocator, self.shared), INLINE_CAP + 1);
                 for (s.vals[0..s.len]) |val| map.putAssumeCapacity(val, {});
                 map.putHashed(owned, h);
                 self.allocated_bytes += entry_size;
                 self.val_set = .{ .bytes = map };
+                self.settleMap(DistinctBytes.Key, map.map.capacity(), map.count(), 48);
             },
             .bytes => |*s| {
                 if (s.map.available == 0) {
+                    @branchHint(.cold);
                     if (s.map.contains(.{ .bytes = v, .hash = h })) return;
-                    try self.drawMore(48 + v.len);
+                    self.drawMore(48 + v.len + try growthBytes(DistinctBytes.Key, s.map.capacity(), s.map.available, 1)) catch |err| {
+                        if (!try self.remapMap(DistinctBytes.Key, &s.map, allocator, 1, 48, 48 + v.len, DistinctBytes.Context{})) return err;
+                    };
+                    try s.ensureUnusedCapacity(core_memory.distinctMapAllocator(allocator, self.shared), 1);
+                    self.settleMap(DistinctBytes.Key, s.map.capacity(), s.count(), 48);
                 }
-                const gop = try s.getHashed(allocator, v, h);
+                const gop = s.getHashedAssumeCapacity(v, h);
                 if (gop.found_existing) return;
                 const entry_size = 48 + v.len;
                 self.drawMore(entry_size) catch |err| {
@@ -782,10 +956,10 @@ pub const DistinctSet = struct {
         if (self.parts == null and other.parts == null and other.val_set == .bitmap) {
             const src = other.val_set.bitmap;
             if (self.val_set == .none) {
-                try self.drawMore(src.count * 24);
+                try self.drawMore(src.count * u64_entry_bytes);
                 const words = try allocator.dupe(u64, src.words);
                 self.val_set = .{ .bitmap = .{ .base = src.base, .words = words, .count = src.count } };
-                self.allocated_bytes += src.count * 24;
+                self.allocated_bytes += src.count * u64_entry_bytes;
                 return;
             }
             if (self.val_set == .bitmap) {
@@ -796,7 +970,7 @@ pub const DistinctSet = struct {
                     if (base >= old.base and base <= old.last())
                         novel -= @popCount(word & old.words[@intCast((base - old.base) / 64)]);
                 }
-                try self.drawMore(novel * 24);
+                try self.drawMore(novel * u64_entry_bytes);
                 if (try self.bitmapRange(allocator, src.base, src.last(), novel)) {
                     const dst = &self.val_set.bitmap;
                     const start: usize = @intCast((src.base - dst.base) / 64);
@@ -804,7 +978,7 @@ pub const DistinctSet = struct {
                         dst.count += @popCount(bits & ~word.*);
                         word.* |= bits;
                     }
-                    self.allocated_bytes += novel * 24;
+                    self.allocated_bytes += novel * u64_entry_bytes;
                     return;
                 }
             }
@@ -4978,7 +5152,11 @@ pub const KeyArena = struct {
     settleFn: ?*const fn (*anyopaque) void = null,
 
     pub fn append(self: *KeyArena, value: []const u8) !u32 {
-        if (self.reserveFn) |reserve| try reserve(self.owner.?, (try self.projected(value.len)) - self.held());
+        if (self.reserveFn) |reserve| {
+            const growth = (try self.projected(value.len)) - self.held();
+            try reserve(self.owner.?, std.math.add(usize, growth, try self.projectedOverlap(value.len)) catch
+                return error.ExceededMemoryBudget);
+        }
         defer if (self.settleFn) |settle| settle(self.owner.?);
         return self.put(self.allocator, value);
     }
@@ -5042,6 +5220,21 @@ pub const KeyArena = struct {
                 0);
     }
 
+    fn projectedOverlap(self: *const KeyArena, len: usize) !usize {
+        const p = try self.place(len);
+        if (p.capacity == 0) return 0;
+        const nc = (p.capacity + chunk_size - 1) / chunk_size;
+        const blocks = if (self.blocks.items.len == self.blocks.capacity)
+            self.blocks.capacity * @sizeOf(Block)
+        else
+            0;
+        const chunks = if (self.chunks.items.len + nc > self.chunks.capacity)
+            self.chunks.capacity * @sizeOf([*]u8)
+        else
+            0;
+        return @max(blocks, chunks);
+    }
+
     pub fn put(self: *KeyArena, a: std.mem.Allocator, value: []const u8) !u32 {
         return self.putParts(a, &.{}, value);
     }
@@ -5101,6 +5294,8 @@ pub const GroupTable = struct {
     const StringView = struct { bytes: []const u8, first: u64 };
 
     compact: @import("agg_state.zig").State = .{},
+    // Backing arrays can be page-backed independently of their accumulator payloads.
+    buffer_allocator: ?std.mem.Allocator = null,
     // 16-aligned: a private distinct acc stores this pointer with bit 3 set (`DistinctAcc.table_flag`).
     allocator: std.mem.Allocator align(16),
     refs: std.ArrayList(u32) = .empty,
@@ -5163,7 +5358,10 @@ pub const GroupTable = struct {
     /// Object charge for a spilled set on a private ceiling, checked against the live `max_memory_bytes`. The set
     /// releases it. A shared budget charges the set instead, so this is not a second bill.
     fn chargeSpilledSet(self: *GroupTable) error{ExceededMemoryBudget}!void {
-        const n = @sizeOf(DistinctSet);
+        return self.chargePrivateBytes(@sizeOf(DistinctSet));
+    }
+
+    fn chargePrivateBytes(self: *GroupTable, n: usize) error{ExceededMemoryBudget}!void {
         var before = @atomicLoad(usize, &self.allocated_bytes, .monotonic);
         while (true) {
             const after = std.math.add(usize, before, n) catch return error.ExceededMemoryBudget;
@@ -5174,7 +5372,10 @@ pub const GroupTable = struct {
     }
 
     fn releaseSpilledSet(self: *GroupTable) void {
-        const n = @sizeOf(DistinctSet);
+        return self.releasePrivateBytes(@sizeOf(DistinctSet));
+    }
+
+    fn releasePrivateBytes(self: *GroupTable, n: usize) void {
         // Disjoint merge/cleanup partitions can grow or release sets charged to the same source table. Scanning
         // and table growth have joined; only the atomic set-object charges/releases overlap in that phase.
         const objects = @atomicRmw(usize, &self.set_objects, .Sub, n, .monotonic);
@@ -5225,8 +5426,8 @@ pub const GroupTable = struct {
             self.allocator.destroy(strings);
         }
         self.first.deinit(self.allocator);
-        self.accumulators.deinit(self.allocator);
-        self.compact.words.deinit(self.allocator);
+        self.accumulators.deinit(self.buffer_allocator orelse self.allocator);
+        self.compact.words.deinit(self.buffer_allocator orelse self.allocator);
         if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
         const first_slots = self.firstSlots();
         for (0..self.fixed_extra_count) |i| {
@@ -5425,6 +5626,14 @@ pub const GroupTable = struct {
             acc_cap * @sizeOf(Accumulator) +
             (if (self.compact.stride != 0) self.compact.projected(n + 1) else 0) + self.set_objects;
         try self.admit(projected -| self.allocated_bytes);
+        // A successful remap or later grow may survive a subsequent allocation failure.
+        defer self.allocated_bytes = self.variableHeld();
+        tryRemapList(u32, self.allocator, &self.refs, refs_cap);
+        tryRemapList(u64, self.allocator, &self.first, first_cap);
+        if (raw_string) tryRemapList(StringView, self.allocator, &self.string_views, views_cap);
+        tryRemapList(Accumulator, self.bufferAllocator(), &self.accumulators, acc_cap);
+        if (self.compact.stride != 0)
+            tryRemapList(u64, self.bufferAllocator(), &self.compact.words, self.compact.projected(n + 1) / @sizeOf(u64));
         // Direct shared tables also fund the transient old/new metadata overlap before a grow. The arena's
         // append-only chunks already include every live byte in projected(), and never replace a key buffer.
         var overlap: usize = 0;
@@ -5436,20 +5645,15 @@ pub const GroupTable = struct {
             overlap = @max(overlap, self.accumulators.capacity * @sizeOf(Accumulator));
         if (self.compact.stride != 0 and self.compact.projected(n + 1) > self.compact.held())
             overlap = @max(overlap, self.compact.held());
-        const extra = if (raw_string and self.shared != null and overlap != 0)
-            self.shared.?.drawExact(overlap) orelse return error.ExceededMemoryBudget
-        else
-            0;
-        defer if (extra != 0) self.shared.?.release(extra);
-        if (raw_string and self.shared == null) try self.admit((projected -| self.allocated_bytes) + overlap);
-        // Failed allocation can leave already-grown buffers live, but never publishes a partial key/id.
-        defer self.allocated_bytes = self.variableHeld();
+        overlap = @max(overlap, try self.strings.?.projectedOverlap(key_len));
         if (grow) try self.growFixedSlots(cap, projected);
+        const extra = try self.reserveOverlap(projected, overlap);
+        defer if (extra != 0) self.shared.?.release(extra);
         try self.refs.ensureTotalCapacity(self.allocator, n + 1);
         try self.first.ensureTotalCapacity(self.allocator, n + 1);
         if (raw_string) try self.string_views.ensureTotalCapacity(self.allocator, n + 1);
-        if (self.compact.stride != 0) try self.compact.reserve(self.allocator, n + 1);
-        try self.accumulators.ensureTotalCapacity(self.allocator, cells);
+        if (self.compact.stride != 0) try self.compact.reserve(self.bufferAllocator(), n + 1);
+        try self.accumulators.ensureTotalCapacity(self.bufferAllocator(), cells);
         const ref = if (raw_string) blk: {
             var frame: [5]u8 = @splat(0);
             if (present) {
@@ -5597,21 +5801,44 @@ pub const GroupTable = struct {
             std.ArrayList(u64).growCapacity(first_need);
         // `set_objects` is already in `allocated_bytes`. Leave it out and the reset to `fixedHeld` steps past the
         // ceiling this admit just accepted.
+        const compact_cap = if (self.compact.stride != 0) self.compact.projected(groups_now + 1) else 0;
         const projected = key_cap + slot_cap * @sizeOf(FixedSlot) +
             first_cap * @sizeOf(u64) + acc_cap * @sizeOf(Accumulator) +
-            (if (self.compact.stride != 0) self.compact.projected(groups_now + 1) else 0) + self.set_objects;
+            compact_cap + self.set_objects;
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
 
-        if (grow_slots) try self.growFixedSlots(slot_cap, projected);
-        if (key_cap != self.fixed_keys.len) {
-            const grown = try self.allocator.alloc(u8, key_cap);
-            @memcpy(grown[0..self.fixed_keys.len], self.fixed_keys);
-            if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
-            self.fixed_keys = grown;
+        if (grow_slots) {
+            @branchHint(.cold);
+            try self.growFixedSlots(slot_cap, projected);
         }
-        if (self.compact.stride != 0) try self.compact.reserve(self.allocator, groups_now + 1);
-        try self.accumulators.ensureTotalCapacity(self.allocator, acc_need);
-        try self.first.ensureTotalCapacity(self.allocator, first_need);
+        if (key_cap > self.fixed_keys.len or acc_cap > self.accumulators.capacity or
+            first_cap > self.first.capacity or compact_cap > self.compact.held())
+        {
+            @branchHint(.cold);
+            if (key_cap > self.fixed_keys.len) if (core_memory.remapWithoutCopy(self.allocator, self.fixed_keys, key_cap)) |keys| {
+                self.fixed_keys = keys;
+            };
+            tryRemapList(Accumulator, self.bufferAllocator(), &self.accumulators, acc_cap);
+            tryRemapList(u64, self.allocator, &self.first, first_cap);
+            if (self.compact.stride != 0)
+                tryRemapList(u64, self.bufferAllocator(), &self.compact.words, compact_cap / @sizeOf(u64));
+            var overlap: usize = if (key_cap != self.fixed_keys.len) self.fixed_keys.len else 0;
+            if (acc_cap > self.accumulators.capacity)
+                overlap = @max(overlap, self.accumulators.capacity * @sizeOf(Accumulator));
+            if (first_cap > self.first.capacity) overlap = @max(overlap, self.first.capacity * @sizeOf(u64));
+            if (compact_cap > self.compact.held()) overlap = @max(overlap, self.compact.held());
+            const extra = try self.reserveOverlap(projected, overlap);
+            defer if (extra != 0) self.shared.?.release(extra);
+            if (key_cap != self.fixed_keys.len) {
+                const grown = try self.allocator.alloc(u8, key_cap);
+                @memcpy(grown[0..self.fixed_keys.len], self.fixed_keys);
+                if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
+                self.fixed_keys = grown;
+            }
+            if (self.compact.stride != 0) try self.compact.reserve(self.bufferAllocator(), groups_now + 1);
+            try self.accumulators.ensureTotalCapacity(self.bufferAllocator(), acc_need);
+            try self.first.ensureTotalCapacity(self.allocator, first_need);
+        }
 
         // The group's state first, its count(DISTINCT) sets charged to the shared budget as the byte table's are: a
         // failure here leaves the table as it was.
@@ -5661,15 +5888,32 @@ pub const GroupTable = struct {
         errdefer self.allocated_bytes = self.fixedHeld();
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
         try self.growFixedSlots(slot_cap, projected);
+        if (key_cap > self.fixed_keys.len) if (core_memory.remapWithoutCopy(self.allocator, self.fixed_keys, key_cap)) |keys| {
+            self.fixed_keys = keys;
+        };
+        tryRemapList(u64, self.allocator, &self.first, groups);
+        if (self.compact.stride != 0)
+            tryRemapList(u64, self.bufferAllocator(), &self.compact.words, self.compact.projected(groups) / @sizeOf(u64))
+        else
+            tryRemapList(Accumulator, self.bufferAllocator(), &self.accumulators, groups * n_calls);
+        var overlap: usize = if (key_cap > self.fixed_keys.len) self.fixed_keys.len else 0;
+        if (groups > self.first.capacity) overlap = @max(overlap, self.first.capacity * @sizeOf(u64));
+        if (self.compact.stride != 0) {
+            if (self.compact.projected(groups) > self.compact.held()) overlap = @max(overlap, self.compact.held());
+        } else if (groups * n_calls > self.accumulators.capacity) {
+            overlap = @max(overlap, self.accumulators.capacity * @sizeOf(Accumulator));
+        }
+        const extra = try self.reserveOverlap(projected, overlap);
+        defer if (extra != 0) self.shared.?.release(extra);
         if (key_cap > self.fixed_keys.len) {
             const keys = try self.allocator.alloc(u8, key_cap);
             if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
             self.fixed_keys = keys;
         }
         if (self.compact.stride != 0)
-            try self.compact.reserve(self.allocator, groups)
+            try self.compact.reserve(self.bufferAllocator(), groups)
         else
-            try self.accumulators.ensureTotalCapacityPrecise(self.allocator, groups * n_calls);
+            try self.accumulators.ensureTotalCapacityPrecise(self.bufferAllocator(), groups * n_calls);
         try self.first.ensureTotalCapacityPrecise(self.allocator, groups);
         self.allocated_bytes = self.fixedHeld();
     }
@@ -5728,6 +5972,30 @@ pub const GroupTable = struct {
             self.clearFixedSlots();
             return;
         }
+        // Keep the common lookup path contiguous when the ledger can fund both tables. If that overlap does not
+        // fit, retain the old slots and grow in segments instead, preserving the final-capacity fit behavior.
+        if (!force_bits and self.fixed_extra_count == 0) {
+            const old = self.firstSlots();
+            const overlap = old.len * @sizeOf(FixedSlot);
+            const slack = self.max_memory_bytes -| @max(projected, self.allocated_bytes);
+            const need = overlap -| slack;
+            const credit: ?usize = if (need == 0) 0 else if (self.shared) |b| b.drawExact(need) else null;
+            if (credit) |held| {
+                defer if (held != 0) self.shared.?.release(held);
+                const next = try self.allocator.alloc(FixedSlot, target);
+                @memset(next, .{ .hash = 0, .id = empty_id });
+                for (old) |entry| if (entry.id != empty_id) {
+                    var at = @as(usize, entry.hash) & (target - 1);
+                    while (next[at].id != empty_id) at = (at + 1) & (target - 1);
+                    next[at] = entry;
+                };
+                self.allocator.free(old);
+                if (self.fixed_stride == 0) self.slots = next else self.fixed_slots = next;
+                self.fixed_capacity = target;
+                self.fixed_base_shift = @intCast(std.math.log2_int(usize, target));
+                return;
+            }
+        }
         while (self.fixedSlotCount() < target) {
             const old = self.fixedSlotCount();
             if (self.fixed_extra_count == self.fixed_extra.len) return error.ExceededMemoryBudget;
@@ -5774,8 +6042,7 @@ pub const GroupTable = struct {
                         if (fixedUnmigrated(dest.*, at, old, bits)) {
                             const displaced = dest.*;
                             dest.* = entry;
-                            if (!needs_bits) dest.id |= migrated else
-                                bits[at / 8] &= ~(@as(u8, 1) << @intCast(at % 8));
+                            if (!needs_bits) dest.id |= migrated else bits[at / 8] &= ~(@as(u8, 1) << @intCast(at % 8));
                             entry = displaced;
                             break;
                         }
@@ -5806,6 +6073,18 @@ pub const GroupTable = struct {
         const hash: u32 = @truncate(full_hash);
         var i = @as(usize, hash) & mask;
         var n: usize = 0;
+        if (self.fixed_extra_count == 0) {
+            @branchHint(.likely);
+            const slots = self.fixed_slots;
+            while (n < count) : (n += 1) {
+                const slot = slots[i];
+                if (slot.id == empty_id) return .{ .id = null, .slot = i };
+                if (slot.hash == hash and keyEql(self.fixed_keys[@as(usize, slot.id) * stride ..][0..stride], key))
+                    return .{ .id = slot.id, .slot = i };
+                i = (i + 1) & mask;
+            }
+            unreachable;
+        }
         while (n < count) : (n += 1) {
             const slot = self.fixedSlot(i).*;
             if (slot.id == empty_id) return .{ .id = null, .slot = i };
@@ -5886,6 +6165,29 @@ pub const GroupTable = struct {
             break :blk budget.draw(entry_size) orelse return error.ExceededMemoryBudget;
         };
         self.max_memory_bytes += got;
+    }
+
+    fn reserveOverlap(self: *GroupTable, projected: usize, overlap: usize) error{ExceededMemoryBudget}!usize {
+        const slack = self.max_memory_bytes -| @max(projected, self.allocated_bytes);
+        const need = overlap -| slack;
+        if (need == 0) return 0;
+        const budget = self.shared orelse return error.ExceededMemoryBudget;
+        return budget.drawExact(need) orelse error.ExceededMemoryBudget;
+    }
+
+    fn bufferAllocator(self: *GroupTable) std.mem.Allocator {
+        if (self.buffer_allocator) |a| return a;
+        const limit = if (self.shared) |b| b.limit else self.max_memory_bytes;
+        const a = core_memory.groupAllocatorForBudget(self.allocator, limit);
+        self.buffer_allocator = a;
+        return a;
+    }
+
+    fn tryRemapList(comptime T: type, allocator: std.mem.Allocator, list: *std.ArrayList(T), cap: usize) void {
+        if (cap <= list.capacity) return;
+        const resized = core_memory.remapWithoutCopy(allocator, list.allocatedSlice(), cap) orelse return;
+        list.items.ptr = resized.ptr;
+        list.capacity = resized.len;
     }
 };
 
@@ -6646,7 +6948,7 @@ test "distinct hash growth refuses before replacing a full map" {
         }
         const capacity = set.val_set.u64.capacity();
         set.releaseSlack();
-        budget.limit = budget.used.load(.monotonic);
+        budget.limit = budget.used.load(.monotonic) + DistinctSet.u64_entry_bytes;
         try set.insertU64(a, 1 << 40);
         try std.testing.expectError(error.ExceededMemoryBudget, set.insertU64(a, (i + 2) * (1 << 40)));
         try std.testing.expectEqual(capacity, set.val_set.u64.capacity());
@@ -6662,7 +6964,7 @@ test "distinct hash growth refuses before replacing a full map" {
         }
         const capacity = set.val_set.i128.capacity();
         set.releaseSlack();
-        budget.limit = budget.used.load(.monotonic);
+        budget.limit = budget.used.load(.monotonic) + 32;
         try set.insertI128(a, @as(i128, 1) << 80);
         try std.testing.expectError(error.ExceededMemoryBudget, set.insertI128(a, (i + 2) * (@as(i128, 1) << 80)));
         try std.testing.expectEqual(capacity, set.val_set.i128.capacity());
@@ -6679,11 +6981,139 @@ test "distinct hash growth refuses before replacing a full map" {
         }
         const capacity = set.val_set.bytes.map.capacity();
         set.releaseSlack();
-        budget.limit = budget.used.load(.monotonic);
-        try set.insertBytes(a, "distinct-0");
         const next = try std.fmt.bufPrint(&buf, "distinct-{d}", .{i + 1});
+        budget.limit = budget.used.load(.monotonic) + 48 + next.len;
+        try set.insertBytes(a, "distinct-0");
         try std.testing.expectError(error.ExceededMemoryBudget, set.insertBytes(a, next));
         try std.testing.expectEqual(capacity, set.val_set.bytes.map.capacity());
+    }
+}
+
+test "distinct overlap and merge preallocation are admitted before allocation" {
+    const a = std.testing.allocator;
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var set: DistinctSet = .{ .shared = &budget };
+    defer set.deinit(a);
+    var i: u64 = 0;
+    while (true) : (i += 1) {
+        try set.insertU64(a, (i + 1) << 40);
+        if (set.val_set == .u64 and set.val_set.u64.available == 0) break;
+    }
+    set.releaseSlack();
+    const capacity = set.val_set.u64.capacity();
+    const count = set.count();
+    budget.limit = budget.used.load(.monotonic) + DistinctSet.u64_entry_bytes;
+    var counting = std.testing.FailingAllocator.init(a, .{});
+    try std.testing.expectError(error.ExceededMemoryBudget, set.insertU64(counting.allocator(), (i + 2) << 40));
+    try std.testing.expectEqual(@as(usize, 0), counting.allocations);
+    try std.testing.expectEqual(capacity, set.val_set.u64.capacity());
+    try std.testing.expectEqual(count, set.count());
+    try std.testing.expectError(error.ExceededMemoryBudget, set.reserveFor(counting.allocator(), .u64, 1000));
+    try std.testing.expectEqual(@as(usize, 0), counting.allocations);
+    budget.limit = 1 << 20;
+    try set.insertU64(a, (i + 2) << 40);
+    try std.testing.expectEqual(count + 1, set.count());
+    try set.reserveFor(a, .u64, 1000);
+    set.releaseSlack();
+    try std.testing.expect(set.allocated_bytes >= DistinctSet.mapBytes(u64, set.val_set.u64.capacity()));
+    try std.testing.expectEqual(set.allocated_bytes, budget.used.load(.monotonic));
+}
+
+test "consumed numeric distinct source releases only nonphysical credit" {
+    inline for (.{ u64, i128 }) |T| {
+        var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+        var set: DistinctSet = .{ .shared = &budget };
+        defer set.deinit(std.testing.allocator);
+        for (0..1000) |i| {
+            if (T == u64)
+                try set.insertU64(std.testing.allocator, (@as(u64, @intCast(i)) + 1) << 40)
+            else
+                try set.insertI128(std.testing.allocator, (@as(i128, @intCast(i)) + 1) << 80);
+        }
+        set.releaseSlack();
+        const before = budget.used.load(.monotonic);
+        const cap = if (T == u64) set.val_set.u64.capacity() else set.val_set.i128.capacity();
+        set.releaseConsumedNumericSurplus();
+        try std.testing.expectEqual(DistinctSet.mapBytes(T, cap), budget.used.load(.monotonic));
+        try std.testing.expect(budget.used.load(.monotonic) <= before);
+        if (T == u64) try std.testing.expect(budget.used.load(.monotonic) < before);
+        try std.testing.expectEqual(@as(usize, 1000), set.count());
+    }
+}
+
+test "distinct hash growth remaps without copy when replacement overlap does not fit" {
+    const a = std.heap.page_allocator;
+    var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };
+    var set: DistinctSet = .{ .shared = &budget };
+    defer set.deinit(a);
+    var i: u64 = 0;
+    while (true) : (i += 1) {
+        try set.insertU64(a, (i + 1) << 40);
+        if (set.val_set == .u64 and set.val_set.u64.capacity() >= 512 and set.val_set.u64.available == 0) break;
+    }
+    set.releaseSlack();
+    const count = set.count();
+    const old_cap = set.val_set.u64.capacity();
+    const next_cap = try DistinctSet.growthCapacity(old_cap, 0, 1);
+    const new_extra = DistinctSet.mapBytes(u64, next_cap) -| count * DistinctSet.u64_entry_bytes;
+    budget.limit = budget.used.load(.monotonic) + DistinctSet.u64_entry_bytes + (new_extra -| set.map_extra);
+    try set.insertU64(a, (i + 2) << 40);
+    try std.testing.expectEqual(count + 1, set.count());
+    try std.testing.expectEqual(next_cap, set.val_set.u64.capacity());
+    for (0..count + 1) |n| try std.testing.expect(set.val_set.u64.contains((@as(u64, @intCast(n)) + 1) << 40));
+    try std.testing.expect(budget.used.load(.monotonic) <= budget.limit);
+
+    set.releaseSlack();
+    const future = try DistinctSet.growthCapacity(set.val_set.u64.capacity(), set.val_set.u64.available, 1000);
+    const reserve_extra = DistinctSet.mapBytes(u64, future) -| set.count() * DistinctSet.u64_entry_bytes;
+    budget.limit = budget.used.load(.monotonic) + (reserve_extra -| set.map_extra);
+    try set.reserveFor(a, .u64, 1000);
+    try std.testing.expectEqual(future, set.val_set.u64.capacity());
+    for (0..count + 1) |n| try std.testing.expect(set.val_set.u64.contains((@as(u64, @intCast(n)) + 1) << 40));
+}
+
+test "distinct wide and string maps retain identities after no-copy growth" {
+    const a = std.heap.page_allocator;
+    {
+        var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };
+        var set: DistinctSet = .{ .shared = &budget };
+        defer set.deinit(a);
+        var i: i128 = 0;
+        while (true) : (i += 1) {
+            try set.insertI128(a, (i + 1) * (@as(i128, 1) << 80));
+            if (set.val_set == .i128 and set.val_set.i128.capacity() >= 512 and set.val_set.i128.available == 0) break;
+        }
+        set.releaseSlack();
+        const count = set.count();
+        const next = try DistinctSet.growthCapacity(set.val_set.i128.capacity(), 0, 1);
+        const extra = DistinctSet.mapBytes(i128, next) -| count * 32;
+        budget.limit = budget.used.load(.monotonic) + 32 + (extra -| set.map_extra);
+        try set.insertI128(a, (i + 2) * (@as(i128, 1) << 80));
+        try std.testing.expectEqual(next, set.val_set.i128.capacity());
+        for (0..count + 1) |n| try std.testing.expect(set.val_set.i128.contains((@as(i128, @intCast(n)) + 1) * (@as(i128, 1) << 80)));
+    }
+    {
+        var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };
+        var set: DistinctSet = .{ .shared = &budget };
+        defer set.deinit(a);
+        var text: [32]u8 = undefined;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            try set.insertBytes(a, try std.fmt.bufPrint(&text, "key-{d}", .{i}));
+            if (set.val_set == .bytes and set.val_set.bytes.map.capacity() >= 512 and set.val_set.bytes.map.available == 0) break;
+        }
+        set.releaseSlack();
+        const count = set.count();
+        const next = try DistinctSet.growthCapacity(set.val_set.bytes.map.capacity(), 0, 1);
+        const extra = DistinctSet.mapBytes(DistinctBytes.Key, next) -| count * 48;
+        const key = try std.fmt.bufPrint(&text, "key-{d}", .{i + 1});
+        budget.limit = budget.used.load(.monotonic) + 48 + key.len + (extra -| set.map_extra);
+        try set.insertBytes(a, key);
+        try std.testing.expectEqual(next, set.val_set.bytes.map.capacity());
+        for (0..count + 1) |n| {
+            const value = try std.fmt.bufPrint(&text, "key-{d}", .{n});
+            try std.testing.expect(set.val_set.bytes.map.contains(.{ .bytes = value, .hash = std.hash.Wyhash.hash(0, value) }));
+        }
     }
 }
 
@@ -6767,6 +7197,7 @@ test "fixed hash growth is ledger funded and refusal preserves its keys" {
     counter.observing = true;
     try table.growFixedSlots(32, projected);
     counter.observing = false;
+    try std.testing.expectEqual(@as(u8, 1), table.fixed_extra_count);
     table.allocated_bytes = table.fixedHeld();
     try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
     budget.limit = 1 << 20;
@@ -6780,6 +7211,86 @@ test "fixed hash growth is ledger funded and refusal preserves its keys" {
     }
     table.deinit();
     table_live = false;
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "fixed hash growth uses funded contiguous replacement when headroom permits" {
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.shared = &budget;
+    table.fixed_stride = 9;
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var key: [9]u8 = @splat(0);
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixed(&key, &calls, i);
+    }
+    table.releaseSlack();
+    const projected = table.fixedHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    try table.admit(projected - table.allocated_bytes);
+    try table.growFixedSlots(32, projected);
+    table.allocated_bytes = table.fixedHeld();
+    try std.testing.expectEqual(@as(u8, 0), table.fixed_extra_count);
+    try std.testing.expectEqual(@as(usize, 32), table.firstSlots().len);
+    try std.testing.expect(budget.peak.load(.monotonic) >= projected + 16 * @sizeOf(GroupTable.FixedSlot));
+    try std.testing.expectEqual(projected, budget.used.load(.monotonic));
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findFixed(&key, hashFixed(&key)));
+    }
+}
+
+test "group buffer overlap is funded before replacement" {
+    const Counter = struct {
+        budget: *SharedBudget,
+        live: usize = 0,
+        unpaid: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = std.testing.allocator.rawAlloc(n, alignment, ra) orelse return null;
+            self.live += n;
+            self.unpaid = @max(self.unpaid, self.live -| self.budget.used.load(.monotonic));
+            return p;
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+            self.live -= bytes.len;
+        }
+    };
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var counter: Counter = .{ .budget = &budget };
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    {
+        var table = GroupTable.init(counter.allocator(), 0);
+        table.shared = &budget;
+        table.fixed_stride = 9;
+        defer table.deinit();
+        var key: [9]u8 = @splat(0);
+        for (0..500) |i| {
+            std.mem.writeInt(u64, key[1..9], i, .little);
+            _ = try table.getOrInsertFixed(&key, &calls, i);
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    {
+        var table = GroupTable.init(counter.allocator(), 0);
+        table.shared = &budget;
+        defer table.deinit();
+        var key: [32]u8 = undefined;
+        for (0..500) |i| {
+            const value = try std.fmt.bufPrint(&key, "variable-{d}", .{i});
+            _ = try table.getOrInsert(value, &calls, i);
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+    }
     try std.testing.expectEqual(@as(usize, 0), counter.live);
     try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
@@ -7531,7 +8042,9 @@ test "round 4: a spilled object stays inside a private ceiling after the next in
             try t.getOrInsertFixed(&image, &calls, 0);
         const before = t.allocated_bytes;
         for (0..4) |v| try t.accumulators.items[gid].distinct.insertU64(a, v);
-        try testing.expectEqual(before + @sizeOf(DistinctSet), t.allocated_bytes);
+        const set_credit = t.accumulators.items[gid].distinct.heap().?.max_memory_bytes;
+        try testing.expect(set_credit > 0);
+        try testing.expectEqual(before + @sizeOf(DistinctSet) + set_credit, t.allocated_bytes);
         image[0] = 2;
         _ = if (stride == 0)
             try t.getOrInsert("b", &calls, 1)
@@ -7540,7 +8053,7 @@ test "round 4: a spilled object stays inside a private ceiling after the next in
         try testing.expect(t.allocated_bytes >= before + @sizeOf(DistinctSet));
         const held = t.allocated_bytes;
         t.accumulators.items[gid].distinct.deinit(a);
-        try testing.expectEqual(held - @sizeOf(DistinctSet), t.allocated_bytes);
+        try testing.expectEqual(held - @sizeOf(DistinctSet) - set_credit, t.allocated_bytes);
     }
 }
 
@@ -7746,6 +8259,29 @@ test "regression: sumBlocksGatheredF64 sums gathered values in their rows' block
 }
 
 fn compactAllocationTrial(gpa: std.mem.Allocator, fixed: bool) !void {
+    // Keep the allocation-failure sweep deterministic: whether an address can grow in place varies across runs.
+    // Disabling remap here forces every replacement through the allocating fallback, so every such allocation is
+    // still injected and checked; separate tests exercise the page-backed no-copy path.
+    const NoRemap = struct {
+        child: std.mem.Allocator,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(n, alignment, ra);
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(bytes, alignment, ra);
+        }
+    };
+    var stable: NoRemap = .{ .child = gpa };
     const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const calls = [_]AggCall{
         .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
@@ -7755,7 +8291,7 @@ fn compactAllocationTrial(gpa: std.mem.Allocator, fixed: bool) !void {
         .{ .func = .max, .arg = arg, .where = null, .alias = "hi", .result = .i64 },
     };
     var budget: SharedBudget = .{ .limit = 1 << 20 };
-    var table = GroupTable.init(gpa, 0);
+    var table = GroupTable.init(stable.allocator(), 0);
     table.shared = &budget;
     table.fixed_stride = if (fixed) 9 else 0;
     table.compact.configure(&calls);

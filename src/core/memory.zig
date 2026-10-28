@@ -126,7 +126,7 @@ const SplitHeap = struct {
     fn ownerIsLarge(self: *SplitHeap, memory: []u8) bool {
         // Group tables and their DISTINCT accumulators can transfer allocations between the two process heaps.
         if (comptime use_mimalloc) {
-            if (memory.len >= group_heap_threshold and memory.len < process_heap_threshold)
+            if (memory.len >= tight_distinct_threshold and memory.len < relaxed_distinct_threshold)
                 return !mi_is_in_heap_region(memory.ptr);
         }
         return memory.len >= self.threshold;
@@ -162,14 +162,149 @@ const SplitHeap = struct {
 
 const group_heap_threshold = 16 * 1024;
 const process_heap_threshold = 32 * 1024;
+const tight_distinct_threshold = 8 * 1024;
+const relaxed_distinct_threshold = 1024 * 1024;
 var split_process_heap: SplitHeap = .{ .small = mimalloc, .threshold = process_heap_threshold };
 var split_group_heap: SplitHeap = .{ .small = mimalloc, .threshold = group_heap_threshold };
+var split_tight_distinct_heap: SplitHeap = .{ .small = mimalloc, .threshold = tight_distinct_threshold };
+var split_distinct_heap: SplitHeap = .{ .small = mimalloc, .threshold = relaxed_distinct_threshold };
+var split_c_group_heap: SplitHeap = .{
+    .small = if (builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator,
+    .threshold = group_heap_threshold,
+};
+// Used only to identify SafeAllocator's vtable; each real allocator retains its own backing and lifetime.
+var safe_allocator_probe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+
+const DistinctHeapRoute = enum { tight, process, relaxed };
+
+fn distinctHeapRoute(limit: usize, tight: bool) DistinctHeapRoute {
+    if (limit <= 512 * 1024 * 1024) return .tight;
+    return if (tight) .process else .relaxed;
+}
 
 /// Tables use a lower mapping threshold without changing the process allocator used by scalar DISTINCT.
 pub fn groupAllocator(parent: std.mem.Allocator) std.mem.Allocator {
     if (comptime !use_mimalloc) return parent;
     const process = split_process_heap.allocator();
     return if (parent.vtable == process.vtable and parent.ptr == process.ptr) split_group_heap.allocator() else parent;
+}
+
+/// Tight native-libc GROUP BY tables need page-backed large buffers so growing them can avoid a second copy.
+/// Leave the normal native path alone when the query budget has ample headroom.
+pub fn groupAllocatorForBudget(parent: std.mem.Allocator, limit: usize) std.mem.Allocator {
+    if (comptime !use_mimalloc and builtin.link_libc) {
+        if (limit <= 512 * 1024 * 1024 and parent.vtable == std.heap.c_allocator.vtable)
+            return split_c_group_heap.allocator();
+    }
+    return groupAllocator(parent);
+}
+
+/// A scalar DISTINCT map can reuse small heap pages while the query has ample budget. Near the limit it switches to
+/// promptly released mappings. Cross-owner frees use mimalloc ownership, so a map may grow across the switch.
+pub fn distinctMapAllocator(parent: std.mem.Allocator, budget: ?*SharedBudget) std.mem.Allocator {
+    if (comptime !use_mimalloc) return parent;
+    const b = budget orelse return parent;
+    const process = split_process_heap.allocator();
+    if (parent.vtable != process.vtable or parent.ptr != process.ptr) return parent;
+    // A small budget can become tight before even one map grows again; start with page-backed maps so the no-copy
+    // fallback can resize them at that point.
+    return switch (distinctHeapRoute(b.limit, b.tight())) {
+        .tight => split_tight_distinct_heap.allocator(),
+        .process => parent,
+        .relaxed => split_distinct_heap.allocator(),
+    };
+}
+
+test "DISTINCT heap routing keeps small or tight budgets page-backed" {
+    try std.testing.expectEqual(DistinctHeapRoute.tight, distinctHeapRoute(128 << 20, false));
+    try std.testing.expectEqual(DistinctHeapRoute.tight, distinctHeapRoute(512 << 20, true));
+    try std.testing.expectEqual(DistinctHeapRoute.process, distinctHeapRoute(2 << 30, true));
+    try std.testing.expectEqual(DistinctHeapRoute.relaxed, distinctHeapRoute(2 << 30, false));
+}
+
+/// Resize without a simultaneous copy. A generic remap may allocate and copy internally, so only use moving
+/// remap for allocators whose backing is known to be page mappings; resize itself cannot move the allocation.
+pub fn remapWithoutCopy(a: std.mem.Allocator, old: anytype, new_len: usize) ?@TypeOf(old) {
+    if (old.len == 0) return null;
+    if (a.resize(old, new_len)) return old.ptr[0..new_len];
+    const page = std.heap.page_allocator;
+    if (a.vtable == page.vtable) return a.remap(old, new_len);
+    // Zig's SMP allocator either retains a small block in its size class or remaps a large page allocation;
+    // unlike a general-purpose allocator, its remap never performs an allocating copy.
+    if (a.vtable == std.heap.smp_allocator.vtable) return a.remap(old, new_len);
+    if (new_len >= old.len and a.vtable == safe_allocator_probe.allocator().vtable) {
+        const safe: *std.heap.SafeAllocator = @ptrCast(@alignCast(a.ptr));
+        // For growth SafeAllocator either grows a bucket in place or delegates to its backing allocator.
+        if (safe.backing.vtable == page.vtable) return a.remap(old, new_len);
+    }
+    if (comptime !use_mimalloc and builtin.link_libc) {
+        const native_group = split_c_group_heap.allocator();
+        if (a.vtable == native_group.vtable and a.ptr == native_group.ptr and old.len * @sizeOf(@TypeOf(old[0])) >= group_heap_threshold)
+            return a.remap(old, new_len);
+    }
+    if (comptime use_mimalloc) {
+        const group = split_group_heap.allocator();
+        const process = split_process_heap.allocator();
+        const tight_distinct = split_tight_distinct_heap.allocator();
+        if (a.vtable == group.vtable and
+            (a.ptr == group.ptr or a.ptr == process.ptr or a.ptr == tight_distinct.ptr))
+        {
+            const heap: *SplitHeap = @ptrCast(@alignCast(a.ptr));
+            const bytes = std.math.mul(usize, new_len, @sizeOf(@TypeOf(old[0]))) catch return null;
+            if (heap.ownerIsLarge(std.mem.sliceAsBytes(old)) and bytes >= heap.threshold)
+                return a.remap(old, new_len);
+        }
+    }
+    if (comptime builtin.is_test) {
+        // The Zig test runner initializes this allocator with page_allocator as its backing allocator.
+        const testing = std.testing.allocator;
+        if (a.ptr == testing.ptr and a.vtable == testing.vtable) return a.remap(old, new_len);
+    }
+    return null;
+}
+
+test "no-copy remap supports page-backed SMP allocations" {
+    const a = std.heap.smp_allocator;
+    const old = try a.alloc(u8, 96 << 10);
+    @memset(old, 0xa5);
+    const grown = remapWithoutCopy(a, old, 192 << 10) orelse {
+        a.free(old);
+        return error.OutOfMemory;
+    };
+    defer a.free(grown);
+    try std.testing.expectEqual(@as(usize, 192 << 10), grown.len);
+    for (grown[0 .. 96 << 10]) |b| try std.testing.expectEqual(@as(u8, 0xa5), b);
+}
+
+test "no-copy remap supports page-backed safe allocations" {
+    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.testing.expect(safe.deinit() == 0) catch @panic("safe allocator leaked");
+    const a = safe.allocator();
+    const old = try a.alloc(u8, 96 << 10);
+    @memset(old, 0xa5);
+    const grown = remapWithoutCopy(a, old, 192 << 10) orelse {
+        a.free(old);
+        return error.OutOfMemory;
+    };
+    defer a.free(grown);
+    for (grown[0 .. 96 << 10]) |b| try std.testing.expectEqual(@as(u8, 0xa5), b);
+}
+
+test "tight native group heap remaps large buffers without copying" {
+    if (comptime use_mimalloc or !builtin.link_libc) return error.SkipZigTest;
+    const c = std.heap.c_allocator;
+    const tight = groupAllocatorForBudget(c, 3500 * 1024);
+    const ample = groupAllocatorForBudget(c, 2 << 30);
+    try std.testing.expect(ample.vtable == c.vtable);
+    try std.testing.expect(tight.vtable != c.vtable);
+    const old = try tight.alloc(u64, 96 << 10);
+    @memset(old, 0x12345678);
+    const grown = remapWithoutCopy(tight, old, 192 << 10) orelse {
+        tight.free(old);
+        return error.OutOfMemory;
+    };
+    defer tight.free(grown);
+    for (grown[0 .. 96 << 10]) |v| try std.testing.expectEqual(@as(u64, 0x12345678), v);
 }
 
 test "split heap preserves data and ownership across its size threshold" {

@@ -6049,7 +6049,9 @@ fn prepareAggregateWithMetas(
             const dst_acc = &accumulators[ci];
             const dst_ds = dst_acc.distinct.heap() orelse continue;
             if (dst_ds.parts) |dst_parts| {
-                const n_threads = @min(n_workers, dst_parts.len);
+                // Under pressure, finish and release one source partition at a time instead of growing several
+                // destination maps concurrently against the last shared credit.
+                const n_threads = if (group_budget.tight()) 1 else @min(n_workers, dst_parts.len);
                 const tasks = try arena.alloc(DistinctMergeTask, n_threads);
                 var cursor = std.atomic.Value(usize).init(0);
                 for (tasks) |*task| task.* = .{
@@ -12491,6 +12493,7 @@ fn mergeDistinctPart(
         src.deinit(allocator);
         src.* = .{ .shared = dst.shared };
     }
+    src.releaseConsumedNumericSurplus();
     return dst.merge(src, allocator);
 }
 
@@ -14143,6 +14146,27 @@ test "DistinctMergeTask: partitioned distinct sets merge and handle allocation f
             try testing.expectEqual(@as(usize, 8), dst.count());
         }
     }.run, .{});
+}
+
+test "DistinctMergeTask: a tight budget funds live source and destination without overlap" {
+    const a = std.heap.page_allocator;
+    var budget: expr_agg.SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var dst: expr_agg.DistinctSet = .{ .shared = &budget };
+    var src: expr_agg.DistinctSet = .{ .shared = &budget };
+    defer dst.deinit(a);
+    defer src.deinit(a);
+    for (0..1000) |i| {
+        try dst.insertU64(a, (@as(u64, @intCast(i)) + 1) << 40);
+        try src.insertU64(a, (@as(u64, @intCast(i)) + 1001) << 40);
+    }
+    dst.releaseSlack();
+    src.releaseSlack();
+    budget.limit = (54 << 10) + 256;
+    try mergeDistinctPart(&dst, &src, a);
+    try testing.expectEqual(@as(usize, 2000), dst.count());
+    try testing.expectEqual(@as(usize, 0), src.count());
+    for (0..2000) |i| try testing.expect(dst.val_set.u64.contains((@as(u64, @intCast(i)) + 1) << 40));
+    try testing.expect(budget.used.load(.monotonic) <= budget.limit);
 }
 
 test "runMultiAggregate: a COUNT-descending cut merges only groups that can make it, and answers the same" {

@@ -12,3 +12,16 @@ pub fn loadFixture(path: []const u8) !?[]u8 {
     };
 }
 
+
+pub const full_match_fixture = "ci/fixtures/parquet/full_match.parquet";
+
+pub fn loadFullMatchFixture() !?[]u8 {
+    return metadata.readFileSlice(full_match_fixture, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{full_match_fixture});
+            return null;
+        }
+        return err;
+    };
+}
+

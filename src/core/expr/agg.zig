@@ -60,8 +60,8 @@ pub const InlineBytes = distinct.InlineBytes;
 const partOf = distinct.partOf;
 const DistinctBytes = distinct.DistinctBytes;
 
-pub const DistinctSet = group_state.DistinctSet;
-pub const DistinctAcc = group_state.DistinctAcc;
+pub const DistinctSet = distinct.DistinctSet;
+pub const DistinctAcc = distinct.DistinctAcc;
 pub const Accumulator = group_state.Accumulator;
 
 /// A destination still being scanned must copy borrowed winners before its source arena can be reset.
@@ -4531,103 +4531,6 @@ test "a table charges each group's count(DISTINCT) set object, fixed-width keys 
             if (acc == .distinct) try std.testing.expect(acc.distinct.heap() == null);
         }
     }
-}
-
-test "inline distinct matches a set, spills at the fourth value, and charges that object" {
-    const a = testing.allocator;
-    var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
-    var acc = DistinctAcc.initEmpty(&budget);
-    defer acc.deinit(a);
-    const used0 = budget.used.load(.monotonic);
-    try acc.insertU64(a, 10);
-    try acc.insertU64(a, 10);
-    try acc.insertU64(a, 20);
-    try acc.insertU64(a, 30);
-    try std.testing.expect(acc.heap() == null);
-    try std.testing.expectEqual(@as(usize, 3), acc.count());
-    try std.testing.expectEqual(used0, budget.used.load(.monotonic));
-
-    try acc.insertU64(a, 40);
-    try std.testing.expect(acc.heap() != null);
-    try std.testing.expectEqual(@as(usize, 4), acc.count());
-    try std.testing.expect(acc.heap().?.shared == &budget);
-    try std.testing.expect(budget.used.load(.monotonic) >= used0 + @sizeOf(DistinctSet));
-    try std.testing.expect(acc.heap().?.allocated_bytes >= @sizeOf(DistinctSet));
-
-    // Same values through a set: the count agrees, duplicates included.
-    var set = DistinctSet{};
-    defer set.deinit(a);
-    for ([_]u64{ 10, 10, 20, 30, 40, 40 }) |v| try set.insertU64(a, v);
-    try std.testing.expectEqual(set.count(), acc.count());
-}
-
-test "inline distinct merge stays exact below and above the spill" {
-    const a = testing.allocator;
-    var dst = DistinctAcc.initEmpty(null);
-    defer dst.deinit(a);
-    var src = DistinctAcc.initEmpty(null);
-    defer src.deinit(a);
-    try dst.insertU64(a, 1);
-    try dst.insertU64(a, 2);
-    try src.insertU64(a, 2);
-    try src.insertU64(a, 3);
-    try dst.takeFrom(&src, a);
-    try std.testing.expect(dst.heap() == null);
-    try std.testing.expectEqual(@as(usize, 3), dst.count());
-    try std.testing.expectEqual(@as(usize, 0), src.count());
-
-    var more = DistinctAcc.initEmpty(null);
-    defer more.deinit(a);
-    try more.insertU64(a, 4);
-    try dst.takeFrom(&more, a);
-    try std.testing.expect(dst.heap() != null);
-    try std.testing.expectEqual(@as(usize, 4), dst.count());
-}
-
-test "inline distinct: allocation failure while spilling leaves no leak" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn run(gpa: std.mem.Allocator) !void {
-            var acc = DistinctAcc.initEmpty(null);
-            defer acc.deinit(gpa);
-            for (0..6) |i| try acc.insertU64(gpa, i);
-            try testing.expectEqual(@as(usize, 6), acc.count());
-            var bytes = DistinctAcc.initEmpty(null);
-            defer bytes.deinit(gpa);
-            const vals = [_][]const u8{ "a", "b", "a" };
-            for (vals) |v| try bytes.insertBytes(gpa, v);
-            try testing.expectEqual(@as(usize, 2), bytes.count());
-        }
-    }.run, .{});
-}
-
-test "inline distinct: a budget that fits three values refuses the spill" {
-    const a = testing.allocator;
-    // Three inline values draw nothing. The spill needs the set object; a ceiling under that fails and keeps the three.
-    var budget = SharedBudget{ .limit = @sizeOf(DistinctSet) / 2, .block = 1 };
-    var acc = DistinctAcc.initEmpty(&budget);
-    defer acc.deinit(a);
-    try acc.insertU64(a, 1);
-    try acc.insertU64(a, 2);
-    try acc.insertU64(a, 3);
-    try std.testing.expectError(error.ExceededMemoryBudget, acc.insertU64(a, 4));
-    try std.testing.expect(acc.heap() == null);
-    try std.testing.expectEqual(@as(usize, 3), acc.count());
-    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
-}
-
-test "inline distinct canonicalizes float nan and zero like DistinctSet" {
-    const a = testing.allocator;
-    var acc = DistinctAcc.initEmpty(null);
-    defer acc.deinit(a);
-    var set = DistinctSet{};
-    defer set.deinit(a);
-    const vals = [_]f64{ 1.0, -0.0, 0.0, std.math.nan(f64), -std.math.nan(f64), 1.0 };
-    for (vals) |v| {
-        try acc.insertF64(a, v);
-        try set.insertF64(a, v);
-    }
-    try std.testing.expectEqual(set.count(), acc.count());
-    try std.testing.expect(acc.heap() == null);
 }
 
 test "round 4: detach clears an inline budget" {

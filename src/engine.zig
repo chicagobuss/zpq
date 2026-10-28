@@ -6715,9 +6715,7 @@ pub const StdoutWriter = struct {
     }
 
     pub fn print(self: *StdoutWriter, comptime fmt: []const u8, args: anytype) !void {
-        var tmp: [512]u8 = undefined;
-        const out = try std.fmt.bufPrint(&tmp, fmt, args);
-        try self.writeAll(out);
+        try printThrough(self, fmt, args);
     }
 
     pub fn flush(self: *StdoutWriter) !void {
@@ -6728,6 +6726,32 @@ pub const StdoutWriter = struct {
         self.bytes_written += pending.len;
     }
 };
+
+/// Formats into a stack buffer and hands the bytes to `w.writeAll`. Text longer than the buffer, such as a long string
+/// statistic on a `zpq inspect` line, is formatted on the heap instead of failing with NoSpaceLeft.
+fn printThrough(w: anytype, comptime fmt: []const u8, args: anytype) !void {
+    var tmp: [512]u8 = undefined;
+    const out = std.fmt.bufPrint(&tmp, fmt, args) catch |err| switch (err) {
+        error.NoSpaceLeft => {
+            const long = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
+            defer std.heap.page_allocator.free(long);
+            return w.writeAll(long);
+        },
+    };
+    try w.writeAll(out);
+}
+
+test "StdoutWriter.print writes a line longer than its stack buffer" {
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    var w: StdoutWriter = .{ .sink = &sink.writer };
+    const long: [2000]u8 = @splat('x');
+    try w.print("min={s} ({s})\n", .{ &long, "exact" });
+    try w.flush();
+    const got = sink.written();
+    try std.testing.expectEqual(long.len + "min= (exact)\n".len, got.len);
+    try std.testing.expect(std.mem.startsWith(u8, got, "min=xxx") and std.mem.endsWith(u8, got, "x (exact)\n"));
+}
 
 /// Marks the leaves row output cannot print: under a LIST or MAP, or repeated without one (a legacy REPEATED field or
 /// group), whose values are a list per row, not one each.
@@ -7299,8 +7323,7 @@ fn CsvQuoting(comptime W: type) type {
         }
 
         pub fn print(self: @This(), comptime fmt: []const u8, args: anytype) !void {
-            var tmp: [512]u8 = undefined;
-            try self.writeAll(try std.fmt.bufPrint(&tmp, fmt, args));
+            try printThrough(self, fmt, args);
         }
     };
 }

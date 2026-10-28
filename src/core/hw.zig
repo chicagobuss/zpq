@@ -138,10 +138,7 @@ fn discover() void {
         var buf: [4096]u8 = undefined;
         const possible = readFile("/sys/devices/system/cpu/online", &buf);
         const cpus = if (possible) |text| parseCpuList(text) else null;
-        if (cpus) |set| {
-            var it = set.iterator(.{});
-            while (it.next()) |cpu| readSysfs(cpu, &detected[cpu]);
-        }
+        if (cpus) |set| scanSysfs(set, &detected, id, true);
     }
     // Sizes are independent of the host, so tests can run a different cache budget on the same machine. Sharing
     // remains the actual topology; a test_cpu fixture can replace that too without process-global mutation.
@@ -184,6 +181,46 @@ fn readFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
     defer _ = std.posix.system.close(fd);
     const n = std.posix.read(fd, buf) catch return null;
     return if (n == buf.len) null else std.mem.trim(u8, buf[0..n], " \t\r\n");
+}
+
+/// Fill `out` for every CPU in `online` from sysfs, over whatever CPUID already put in `out[seeded]`. With `share`, a
+/// CPU that an earlier one's L1d, L2 and L3 (where it has one) all list as a sharer takes that CPU's record: it sits
+/// behind those same caches, so sysfs would describe them identically. That is an SMT sibling, and it halves the
+/// files a process opens (about 4 us each, serial, before the first query plans). The CPUID-seeded CPU lends no
+/// record, and keeps what `readSysfs` would have kept of its own: its sizes and CPUID sharing counts.
+fn scanSysfs(online: CpuSet, out: []Cpu, seeded: usize, share: bool) void {
+    var donors: CpuSet = .empty;
+    var it = online.iterator(.{});
+    next: while (it.next()) |cpu| {
+        if (cpu >= out.len) continue;
+        if (share) {
+            var prior = donors.iterator(.{});
+            while (prior.next()) |d| if (sharesAll(&out[d], cpu)) {
+                const own = out[cpu];
+                out[cpu] = out[d];
+                inline for (comptime std.meta.tags(Level)) |level| {
+                    const mine = own.cache(level);
+                    const got: *Cache = switch (level) {
+                        .l1d => &out[cpu].l1d,
+                        .l2 => &out[cpu].l2,
+                        .l3 => &out[cpu].l3,
+                    };
+                    if (mine.bytes != 0) got.bytes = mine.bytes;
+                    got.max_sharing = mine.max_sharing;
+                }
+                continue :next;
+            };
+        }
+        readSysfs(cpu, &out[cpu]);
+        if (cpu != seeded) donors.set(cpu);
+    }
+}
+
+/// Whether `cpu` shares every cache `owner` has: L1d and L2 always, L3 where `owner` has one.
+fn sharesAll(owner: *const Cpu, cpu: usize) bool {
+    if (!owner.l1d.cpus.isSet(cpu) or !owner.l2.cpus.isSet(cpu)) return false;
+    const no_l3 = owner.l3.bytes == 0 and owner.l3.cpus.count() == 0;
+    return no_l3 or owner.l3.cpus.isSet(cpu);
 }
 
 fn readSysfs(cpu: usize, out: *Cpu) void {
@@ -332,4 +369,31 @@ test "hardware active-worker L3 hints use a stable affinity minimum, including u
     try std.testing.expectEqual(@as(usize, 2 << 20), l3BytesPerActiveWorker(16));
     test_cpu = .{};
     try std.testing.expectEqual(@as(usize, 0), l3BytesPerActiveWorker(4));
+}
+
+test "hardware discovery that shares a sibling's record finds what reading every CPU finds" {
+    if (builtin.os.tag != .linux) return;
+    var buf: [4096]u8 = undefined;
+    const online = parseCpuList(readFile("/sys/devices/system/cpu/online", &buf) orelse return) orelse return;
+    const full = try std.testing.allocator.alloc(Cpu, cpu_capacity);
+    defer std.testing.allocator.free(full);
+    const shared = try std.testing.allocator.alloc(Cpu, cpu_capacity);
+    defer std.testing.allocator.free(shared);
+    // Seed as discovery does, on the executing CPU and on another online one, so both roles of the seeded CPU are
+    // covered: the first online CPU is a donor candidate, a later one a recipient.
+    var seeds = online.iterator(.{});
+    var tried: usize = 0;
+    while (seeds.next()) |seed| : (tried += 1) {
+        if (tried == 3) break;
+        @memset(full, .{});
+        @memset(shared, .{});
+        full[seed] = fromCpuid();
+        shared[seed] = full[seed];
+        scanSysfs(online, full, seed, false);
+        scanSysfs(online, shared, seed, true);
+        for (full, shared, 0..) |want, got, cpu| std.testing.expect(std.meta.eql(want, got)) catch |err| {
+            std.debug.print("cpu {d} (seed {d}) differs\n", .{ cpu, seed });
+            return err;
+        };
+    }
 }

@@ -1163,6 +1163,34 @@ pub const SliceReader = struct {
     }
 
     /// Payloads remain owned by the admitted aggregate after this reader's scratch is reset.
+    /// Dictionaries belong to the shared plan; each reader starts at its own containing page.
+    pub fn seekSubgroup(self: *SliceReader, a: std.mem.Allocator, subgroup: RowSubgroup) !void {
+        const col = subgroup.group.columns[self.site.column] orelse return error.BadColumn;
+        var pi: usize = 0;
+        while (pi + 1 < col.locations.len and col.locations[pi + 1].first_row_index <= subgroup.rows.lo) pi += 1;
+        const loc = col.locations[pi];
+        const first: usize = @intCast(loc.first_row_index);
+        self.left = @as(usize, @intCast(self.site.rg.num_rows)) - first;
+        switch (self.raw.*) {
+            inline else => |*r| {
+                const T = @TypeOf(r.*).Value;
+                r.dictionary = if (col.dictionary) |d| d.get(T) else null;
+                r.value_budget = self.left;
+                r.pages.ordinal = @intCast(pi + @intFromBool(col.dictionary != null));
+                // A shared dictionary's backing never becomes page-local or scratch-local storage.
+                if (T == []const u8) {
+                    self.dict_held = true;
+                    r.arena = self.pages.allocator();
+                    r.pages.arena = self.pages.allocator();
+                    self.armBytePage(r);
+                }
+                if (!try r.seekAndInstallPage(loc.offset, col.chunk_offset)) return error.ShortDecode;
+            },
+        }
+        try self.skip(a, subgroup.rows.lo - first);
+        self.left = subgroup.rows.hi - subgroup.rows.lo;
+    }
+
     pub fn retainPayloads(self: *SliceReader, owner: *retained_pages.Chunk) void {
         switch (self.raw.*) {
             .bytes => |*r| r.pages.retained = owner,
@@ -3164,7 +3192,10 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
 }
 
 /// One row group as `scanRGForAgg` reads it. Everything is borrowed.
+pub const RowSubgroup = struct { group: *const @import("row_subgroups.zig").Group, rows: RowRange };
+
 pub const AggRowGroup = struct {
+    subgroup: ?RowSubgroup = null,
     rg: *const schema.RowGroup,
     /// Input file and row-group index, for profile spans only.
     file_index: usize = 0,
@@ -4456,7 +4487,7 @@ fn scanRGForAggImpl(
     const handled_via_stats = try gpa.alloc(bool, calls.len);
     defer gpa.free(handled_via_stats);
     @memset(handled_via_stats, false);
-    const any_decode_required = switch (target) {
+    const any_decode_required = if (in.subgroup != null) true else switch (target) {
         // A chunk statistic describes every group at once, so it answers none of them.
         .grouped => true,
         .scalar => |s| try foldFromStats(s.calls, s.accumulators, in, stats, handled_via_stats, ws.timings),
@@ -4483,6 +4514,14 @@ fn scanRGForAggImpl(
     var plan_arena = std.heap.ArenaAllocator.init(side);
     defer plan_arena.deinit();
     var full_estimate: usize = 0;
+    if (in.subgroup) |subgroup| {
+        var fallback: DecodeBudget = .{ .limit = decode_options.expand_limit };
+        const b = ws.budget orelse &fallback;
+        const per_row = @max(1, decodeEstimate(in, in.read, calls, true) / @max(1, num_rows));
+        const rows = subgroup.rows.hi - subgroup.rows.lo;
+        dropRegion(ws);
+        return (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, per_row *| rows, streamWindowRows(in, target, rows))) orelse error.NestedNotSupported;
+    }
     const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
         const ordinary = decodeEstimate(in, in.read, calls, target == .grouped);
         const full = if (target == .grouped and target.grouped.records != null)
@@ -5009,6 +5048,7 @@ fn openSlicedPayload(
             options.row_gate = sv;
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
+        if (in.subgroup) |subgroup| try r.seekSubgroup(pages, subgroup);
         if (levels_only[ci]) r.levelsOnly();
         if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
             r.retainPayloads(owner);
@@ -5098,7 +5138,12 @@ test "scalar dictionary distinct caches observed codes and falls back on memory 
     const codes = [_]u32{ 0, 1, 0, 2, 3, 4, 4, 1 };
     const defs = [_]u32{ 1, 1, 0, 1, 0, 1, 1, 1 };
     const col: filter_eval.ColumnT([]const u8) = .{
-        .values = &.{}, .codes = &codes, .dict = &dict, .def_levels = &defs, .max_def = 1, .has_nulls = true,
+        .values = &.{},
+        .codes = &codes,
+        .dict = &dict,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
     };
     var sel = try filter_selection.SelectionVector.init(a, codes.len);
     defer sel.deinit();
@@ -5160,7 +5205,9 @@ test "scalar dictionary distinct reads mixed pages with nullable and unused entr
                 .crc = null,
                 .data_page_header_v2 = null,
                 .data_page_header = if (dict) null else .{
-                    .num_values = count, .encoding = enc, .definition_level_encoding = .RLE,
+                    .num_values = count,
+                    .encoding = enc,
+                    .definition_level_encoding = .RLE,
                     .repetition_level_encoding = .RLE,
                 },
                 .dictionary_page_header = if (dict) .{ .num_values = count, .encoding = .PLAIN, .is_sorted = null } else null,
@@ -5230,8 +5277,12 @@ test "scalar dictionary distinct reads mixed pages with nullable and unused entr
     cm.total_uncompressed_size = @intCast(chunk.items.len);
     cm.num_values = 192;
     const input: AggRowGroup = .{
-        .rg = &rg, .meta = &meta, .src = .{ .bytes = chunk.items, .byte_origin = 0 },
-        .filter = null, .read = &.{ false, false, true, false }, .consumed = &.{ false, false, true, false },
+        .rg = &rg,
+        .meta = &meta,
+        .src = .{ .bytes = chunk.items, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{ false, false, true, false },
+        .consumed = &.{ false, false, true, false },
     };
     var plain_rg = rg;
     plain_rg.columns.items = try ar.dupe(schema.ColumnChunk, rg.columns.items);
@@ -5245,8 +5296,11 @@ test "scalar dictionary distinct reads mixed pages with nullable and unused entr
     plain_input.rg = &plain_rg;
     plain_input.src.bytes = plain_chunk.items;
     const call = [_]expr_agg.AggCall{.{
-        .func = .count_distinct, .arg = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
-        .where = null, .alias = "d", .result = .i64,
+        .func = .count_distinct,
+        .arg = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+        .where = null,
+        .alias = "d",
+        .result = .i64,
     }};
     for ([_]bool{ false, true }) |encoded| for ([_]usize{ 64, 128, 192 }) |window| {
         test_scalar_distinct_inserts = 0;
@@ -5261,7 +5315,10 @@ test "scalar dictionary distinct reads mixed pages with nullable and unused entr
         var timings: Timings = .{};
         var budget: DecodeBudget = .{ .limit = 1 << 20 };
         const ws: AggWorkspace = .{
-            .scratch = &scratch, .rg_arena = &region, .timings = &timings, .budget = &budget,
+            .scratch = &scratch,
+            .rg_arena = &region,
+            .timings = &timings,
+            .budget = &budget,
             .decode_batch_rows = window,
         };
         const count = try scanRGSliced(a, input, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 8192, window);
@@ -5288,7 +5345,7 @@ fn scanRGSliced(
     full: usize,
     stream_rows: usize,
 ) !?u64 {
-    const num_rows: usize = @intCast(@max(0, in.rg.num_rows));
+    const num_rows: usize = if (in.subgroup) |subgroup| subgroup.rows.hi - subgroup.rows.lo else @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
     // Bitmap admission is optional; its refusal must not mark the decoder's allocator as refused.
@@ -5312,7 +5369,7 @@ fn scanRGSliced(
     for (levels_only, 0..) |*l, ci| l.* = decode_options.encoded and target == .scalar and ci < uses.levels.len and
         uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
-    const payload = try payloadColumns(pages.allocator(), in, target);
+    const payload = if (in.subgroup != null) null else try payloadColumns(pages.allocator(), in, target);
     var survivors: filter_selection.SelectionVector = undefined;
     if (payload) |p| survivors = (try filterSurvivors(
         pages.allocator(),
@@ -7924,7 +7981,44 @@ pub const PruningInfo = struct {
 };
 
 /// Rows `lo..hi` of a row group.
-pub const RowRange = struct { lo: usize, hi: usize };
+pub const RowRange = @import("row_subgroups.zig").Range;
+
+test "row subgroups seek misaligned columns and share dictionary backing across reader lifetimes" {
+    const t = std.testing;
+    const subgroups = @import("row_subgroups.zig");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try subgroups.testFixture(a);
+    const rg = &fixture.meta.row_groups.items[0];
+    const group = (try subgroups.Group.init(a, fixture.bytes, rg, &fixture.meta, &.{ true, true, true }, 8)).?;
+    const src: RGSrc = .{ .bytes = fixture.bytes, .byte_origin = 0 };
+    for (0..3) |ci| {
+        var whole = (try SliceReader.init(a, t.allocator, rg, &fixture.meta, src, ci, .{})).?;
+        defer whole.deinit();
+        const expected = try whole.next(a, 4096);
+        for (group.ranges) |range| {
+            var r = (try SliceReader.init(a, t.allocator, rg, &fixture.meta, src, ci, .{})).?;
+            defer r.deinit();
+            try r.seekSubgroup(a, .{ .group = &group, .rows = range });
+            if (ci == 1) try t.expect(r.raw.bytes.dictionary.?.ptr == group.columns[ci].?.dictionary.?.bytes.ptr);
+            const got = try r.next(a, range.hi - range.lo);
+            switch (expected) {
+                inline .i64, .string => |want, tag| {
+                    const actual = @field(got, @tagName(tag));
+                    try t.expectEqual(range.hi - range.lo, actual.values.len);
+                    for (actual.values, 0..) |value, i| {
+                        const def = if (want.def_levels) |d| d[range.lo + i] else want.max_def;
+                        try t.expectEqual(def, if (actual.def_levels) |d| d[i] else actual.max_def);
+                        if (def < want.max_def) continue;
+                        if (tag == .string) try t.expectEqualStrings(want.values[range.lo + i], value) else try t.expectEqual(want.values[range.lo + i], value);
+                    }
+                },
+                else => unreachable,
+            }
+        }
+    }
+}
 
 /// Test-only: off compares compact decoding with whole columns; the count shows a test reached it.
 pub var compact_rows_in_tests = true;

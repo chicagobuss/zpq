@@ -43,6 +43,7 @@ const owner_groups = @import("owner_groups.zig");
 const grouped_bitmap = @import("grouped_distinct_bitmap.zig");
 const msd_groups = @import("msd_groups.zig");
 const column_mod = @import("parquet/column.zig");
+const row_subgroups = @import("row_subgroups.zig");
 pub const NdvStat = ndv.Stat;
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
@@ -798,6 +799,8 @@ pub const GroupColType = struct {
 /// One unit of parallel work: a single row group within one input file,
 /// optionally restricted to a subset of the query's aggregates/columns.
 const WorkItem = struct {
+    subgroup: ?consumer.RowSubgroup = null,
+    position: ?u64 = null,
     file: usize,
     rg: usize,
     agg_start: usize,
@@ -806,6 +809,172 @@ const WorkItem = struct {
     columns: agg_plan.Columns,
     accumulators: []expr_agg.Accumulator,
 };
+
+/// Optional scheduling plan for too few surviving groups. Byte weight bounds both task count and plan overhead;
+/// a stable flat chunk supplies independent seeks, while one-shot streams and ordered reductions keep their path.
+fn splitRowGroups(
+    a: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    workers: usize,
+) !?[]WorkItem {
+    if (workers < 2) return null;
+    var alive: usize = 0;
+    var bytes: u64 = 0;
+    for (work) |item| {
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        const decision = plan.decide(rg, &metas[item.file]);
+        if (decision == .skip or rg.num_rows == 0) continue;
+        if (!args.inputs[item.file].rescannable() or rg.num_rows < 0 or rg.num_rows > std.math.maxInt(u32)) return null;
+        // The indexed filter path compacts survivors and can leave rejected page bodies unread. Keep that
+        // contract rather than replacing it with ranges that would decode those pages again.
+        if (decision == .filter) for (rg.columns.items, 0..) |col, ci| {
+            const read = item.columns.forRowGroup(decision);
+            if (ci < read.len and read[ci] and col.column_index_offset != null) return null;
+        };
+        alive += 1;
+        bytes +|= subgroupBytes(rg, item.columns.forRowGroup(decision));
+    }
+    if (alive == 0 or alive >= workers) return null;
+    const target = @min(workers *| 2, bytes / @max(1, args.min_bytes_per_worker));
+    if (target <= alive) return null;
+    var split: std.ArrayList(WorkItem) = .empty;
+    var changed = false;
+    for (work, 0..) |item, wi| {
+        var original = item;
+        original.position = expr_agg.firstPosition(wi, 0);
+        const rg = &metas[item.file].row_groups.items[item.rg];
+        const decision = plan.decide(rg, &metas[item.file]);
+        if (decision == .skip or rg.num_rows == 0) {
+            try split.append(a, original);
+            continue;
+        }
+        const read = item.columns.forRowGroup(decision);
+        const weight = subgroupBytes(rg, read);
+        const parts: usize = @intCast(@max(1, (target *| weight +| bytes - 1) / bytes));
+        const source = args.inputs[item.file].plan_bytes orelse args.inputs[item.file].bytes;
+        const group = if (try row_subgroups.Group.init(a, source, rg, &metas[item.file], read, parts)) |g| blk: {
+            const ptr = try a.create(row_subgroups.Group);
+            ptr.* = g;
+            break :blk ptr;
+        } else {
+            try split.append(a, original);
+            continue;
+        };
+        changed = true;
+        for (group.ranges) |range| {
+            var part = original;
+            part.subgroup = .{ .group = group, .rows = range };
+            part.position = expr_agg.firstPosition(wi, range.lo);
+            try split.append(a, part);
+        }
+    }
+    return if (changed) split.items else null;
+}
+
+fn subgroupBytes(rg: *const schema.RowGroup, read: []const bool) u64 {
+    var bytes: u64 = 0;
+    for (rg.columns.items, 0..) |col, ci| {
+        if (ci < read.len and read[ci]) if (col.meta_data) |cm| {
+            bytes +|= @max(@as(u64, @intCast(@max(0, cm.total_uncompressed_size))), @as(u64, @intCast(@max(0, rg.num_rows))) *| 4);
+        };
+    }
+    return bytes;
+}
+
+test "row subgroups preserve grouped counts, first ordinals, ties and LIMIT OFFSET under pool failures" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try row_subgroups.testFixture(a);
+    const inputs = [_]Input{.{ .name = "subgroups", .bytes = fixture.bytes }};
+    var args: MultiAggArgs = .{
+        .inputs = &inputs,
+        .metas = (&fixture.meta)[0..1],
+        .aggregate = "count(*) AS c",
+        .group_by = "k,s",
+        .filter = "v >= 10 AND v < 4000",
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .max_memory = 64 << 20,
+        .dense = false,
+        .ndv_policy = false,
+        .shared_strings = false,
+        .integer_records = false,
+        .byte_records = false,
+        .msd_records = false,
+        .plain_rules = false,
+        .spill = false,
+        .sketch_topk = null,
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 13, .offset = 37 },
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    args.parallelism = 8;
+    const explanation = try explainAggregate(gpa, a, args);
+    try testing.expect(explanation.workers > 1);
+    try testing.expect(explanation.work_items > fixture.meta.row_groups.items.len);
+    for ([_]?usize{ null, 0, 1 }) |fail_after| {
+        if (fail_after) |k| spawn_util.injectFailureAfter(k);
+        defer spawn_util.resetFailure();
+        args.parallelism = 8;
+        row_subgroups.test_ranges.store(0, .monotonic);
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(row_subgroups.test_ranges.load(.monotonic) > 1);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqual(want.rows_in, got.rows_in);
+        try testing.expectEqual(want.rows_scanned, got.rows_scanned);
+        try testing.expectEqual(want.rows_matched, got.rows_matched);
+        try testing.expectEqual(want.row_groups_in, got.row_groups_in);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    }
+    // The producer poisons its chunks at done(): an early release corrupts another range's next page.
+    var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, fixture.bytes), .meta = &fixture.meta };
+    const streamed = [_]Input{window.input(fixture.bytes)};
+    args.inputs = &streamed;
+    row_subgroups.test_ranges.store(0, .monotonic);
+    var streamed_result = try runMultiAggregate(gpa, a, args);
+    defer streamed_result.deinit(gpa);
+    try streamed_result.output.applyResultOrder(gpa, args.result_order);
+    const ranges = row_subgroups.test_ranges.load(.monotonic);
+    try testing.expect(ranges > 1);
+    try testing.expectEqual(ranges, window.waits.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), window.releases.load(.monotonic));
+    try testing.expectEqualDeep(want.output.group_rows, streamed_result.output.group_rows);
+    args.inputs = &inputs;
+    const indexed = try a.dupe(schema.RowGroup, fixture.meta.row_groups.items);
+    indexed[0].columns.items = try a.dupe(schema.ColumnChunk, indexed[0].columns.items);
+    indexed[0].columns.items[2].column_index_offset = 0;
+    var indexed_meta = fixture.meta;
+    indexed_meta.row_groups.items = indexed;
+    args.metas = (&indexed_meta)[0..1];
+    const indexed_plan = try explainAggregate(gpa, a, args);
+    try testing.expectEqual(@as(usize, 1), indexed_plan.work_items);
+    args.metas = (&fixture.meta)[0..1];
+    const profiler = try profile.Profiler.create(gpa, .{ .sample_interval_ns = 0 }, .{});
+    defer profiler.destroy();
+    args.profiler = profiler;
+    var profiled = try runMultiAggregate(gpa, a, args);
+    defer profiled.deinit(gpa);
+    profiler.finish();
+    var scans: usize = 0;
+    var range_plans: usize = 0;
+    var thread = profiler.head.load(.acquire);
+    while (thread) |t| : (thread = t.next) {
+        var events: profile.EventIterator = .{ .t = t };
+        while (events.next()) |batch| for (batch) |event| {
+            scans += @intFromBool(event.kind == .plan);
+            range_plans += @intFromBool(event.kind == .plan_ranges);
+        };
+    }
+    try testing.expectEqual(@as(usize, 1), scans);
+    try testing.expectEqual(@as(usize, 1), range_plans);
+}
 
 const RecordOrdinals = struct {
     fn rows(metas: []const schema.FileMetaData) ?usize {
@@ -2158,14 +2327,19 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         errdefer w.failure_work = idx;
         items.* += 1;
         const item = w.work[idx];
+        if (@import("builtin").is_test and item.subgroup != null) _ = row_subgroups.test_ranges.fetchAdd(1, .monotonic);
         const gate = w.inputs[item.file].gate;
-        defer if (gate) |g| if (w.failed_gate == null) g.done(g.ctx, item.rg, w.items_per_rg);
+        defer if (gate) |g| if (w.failed_gate == null) {
+            // The producer owns compressed bytes until every range has finished; its contract counts RG items.
+            const last = if (item.subgroup) |s| s.group.unfinished.fetchSub(1, .acq_rel) == 1 else true;
+            if (last) g.done(g.ctx, item.rg, w.items_per_rg);
+        };
         const meta = &w.metas[item.file];
         const rg = &meta.row_groups.items[item.rg];
         // File bytes are shared read-only across workers (one mmap / one
         // in-memory buffer); concurrent ranged reads are safe.
         const rg_src: consumer.RGSrc = .{ .bytes = w.inputs[item.file].bytes, .byte_origin = 0 };
-        if (item.agg_start == 0) {
+        if (item.agg_start == 0 and (item.subgroup == null or item.subgroup.?.rows.lo == 0)) {
             w.rgs_in += 1;
             w.rows_in +|= rg.num_rows;
         }
@@ -2184,13 +2358,13 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
                 if (item.agg_start == 0) w.rgs_pruned += 1;
                 continue;
             },
-            .full_match => if (item.agg_start == 0) {
+            .full_match => if (item.agg_start == 0 and (item.subgroup == null or item.subgroup.?.rows.lo == 0)) {
                 w.rgs_full_match += 1;
             },
             .filter => {},
         }
         if (item.agg_start == 0) {
-            w.rows_scanned +|= rg.num_rows;
+            w.rows_scanned +|= if (item.subgroup) |s| @intCast(s.rows.hi - s.rows.lo) else rg.num_rows;
         }
         if (gate) |g| try g.wait(g.ctx, item.rg);
         const sub_agg_calls = w.agg_calls[item.agg_start .. item.agg_start + item.agg_len];
@@ -2207,7 +2381,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
                 .calls = sub_agg_calls,
                 .keys = w.group_by_keys.?,
                 .table = gt,
-                .pos_base = expr_agg.firstPosition(idx, 0),
+                .pos_base = item.position orelse expr_agg.firstPosition(idx, 0),
                 .part = w.part,
                 .local = if (w.part != null) &w.local else null,
                 .dense = w.dense,
@@ -2222,6 +2396,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
         };
         defer expr_agg.winner_charge = null;
         const matched = consumer.scanRGForAgg(w.gpa, .{
+            .subgroup = item.subgroup,
             .rg = rg,
             .file_index = item.file,
             .rg_index = item.rg,
@@ -4349,7 +4524,7 @@ fn prepareAggregateWithMetas(
         }
     }
     const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / @max(1, args.min_bytes_per_worker))));
-    const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
+    var n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
     var string_record_path: ?RecordAdmission = null;
@@ -4865,6 +5040,23 @@ fn prepareAggregateWithMetas(
                 true,
             ) orelse
             try inlineByteAnswer(gpa, arena, args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true);
+        var explained_items = work_items.items.len;
+        // The ordinary owner must quote the same independent ranges it will actually schedule. Inline owners
+        // have already quoted their own work layout and do not use this row-subgroup plan.
+        if (record_path == null and group_by_keys != null and !orderSensitive(agg_calls) and
+            !decision.use_blocks and domain == null and
+            (decision.strategy == .plain_hash or decision.strategy == .partitioned_hash))
+        {
+            var quote_budget: core_memory.SharedBudget = .{ .limit = args.max_memory };
+            var quote_charge: core_memory.Charged = .{ .child = gpa, .budget = args.ledger orelse &quote_budget };
+            var quote_arena = std.heap.ArenaAllocator.init(quote_charge.allocator());
+            defer quote_arena.deinit();
+            if (splitRowGroups(quote_arena.allocator(), args, metas, &plan, work_items.items, @min(requested, by_bytes)) catch null) |split| {
+                explained_items = split.len;
+                n_workers = @min(@min(requested, by_bytes), split.len);
+                scan_plan.dispatch.tables = n_workers;
+            }
+        }
         const names = try arena.alloc([]const u8, plan.columns.read.len);
         const labels = try metadata.leafLabels(arena, meta0);
         for (labels.names, names, 0..) |label, *name, i| {
@@ -4885,7 +5077,7 @@ fn prepareAggregateWithMetas(
                 => @min(n_workers, owner_groups.max_workers),
                 else => n_workers,
             } else n_workers,
-            .work_items = work_items.items.len,
+            .work_items = explained_items,
             .record_path = record_path,
             .dense = record_path == null and decision.strategy == .plain_hash and
                 if (plan_inputs.dense_bytes) |bytes|
@@ -4903,6 +5095,23 @@ fn prepareAggregateWithMetas(
         try p.reserveStream(group_budget, streamProbeBytes(args.inputs, metas, &plan));
     };
     defer if (args.failure_probe) |p| p.releaseStream();
+    // Header walks and dictionary backing are charged to the plan, and released only after every range joins.
+    // Optional-plan refusal never poisons worker decode allocators or changes the established fallback.
+    var subgroup_charge: core_memory.Charged = .{ .child = gpa, .budget = group_budget };
+    var subgroup_arena = std.heap.ArenaAllocator.init(subgroup_charge.allocator());
+    defer subgroup_arena.deinit();
+    var worker_work = work_items.items;
+    if (group_by_keys != null and !orderSensitive(agg_calls) and !decision.use_blocks and domain == null and
+        (decision.strategy == .plain_hash or decision.strategy == .partitioned_hash))
+    {
+        const split_span = profile.Span.begin(prof);
+        if (splitRowGroups(subgroup_arena.allocator(), args, metas, &plan, work_items.items, @min(requested, by_bytes)) catch null) |split| {
+            worker_work = split;
+            n_workers = @min(@min(requested, by_bytes), worker_work.len);
+        } else _ = subgroup_arena.reset(.free_all);
+        // `plan` is the scan-count marker. Bill this work to planning without inventing another scan or I/O job.
+        split_span.end(.plan_ranges, profile.args(.{}));
+    }
     // Shared optional header memo: charged separately so a declined hint cannot poison decoder flags.
     var hint_charge: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = group_budget };
     var cache_hints: consumer.CacheHints = .{ .allocator = hint_charge.allocator() };
@@ -4959,7 +5168,7 @@ fn prepareAggregateWithMetas(
     // in, doesn't depend on the number of workers or their timing (see `BlockMerge`).
     var block_bounds: ?[]usize = null;
     const use_blocks = decision.use_blocks;
-    const n_tables = decision.tables;
+    const n_tables = if (worker_work.ptr != work_items.items.ptr) n_workers else decision.tables;
     if (use_blocks) {
         const bounds = try arena.alloc(usize, n_tables + 1);
         for (bounds, 0..) |*b, i| b.* = i * work_items.items.len / n_tables;
@@ -5190,7 +5399,7 @@ fn prepareAggregateWithMetas(
             .gpa = gpa,
             .inputs = args.inputs,
             .metas = metas,
-            .work = work_items.items,
+            .work = worker_work,
             .cursor = &work_cursor,
             .agg_calls = agg_calls,
             .plan = &plan,

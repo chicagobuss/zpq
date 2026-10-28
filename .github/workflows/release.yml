@@ -1,9 +1,8 @@
 name: Release
 
 # Tag-driven release. Builds the CLI for 4 platforms, packages each as
-# a tar.gz with sha256, uploads to R2 (public, CDN-fronted) and
-# attaches to a GitHub Release. Native smoke jobs run the build job's
-# artifacts before publication.
+# a tar.gz with sha256 and attaches to a GitHub Release, then mirrors
+# it to R2. Native smoke jobs run the artifacts before publication.
 #
 # Lambda binaries are NOT shipped here. They're author-deployed via
 # `just lambda-deploy`; `tools/serverless/aws.sh build` is what
@@ -18,6 +17,11 @@ on:
         description: "Tag to release (e.g., v0.4.0)"
         required: true
         type: string
+      dry_run:
+        description: "Build, smoke and stage without publishing"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -47,8 +51,7 @@ jobs:
             | tar -xz -C $HOME/zig-bin
           echo "$HOME/zig-bin" >> $GITHUB_PATH
 
-      # anyzig downloads the pinned Zig on its first call; do that here, so the packager's short `zig version`
-      # timeout never covers a download.
+      # anyzig downloads the pinned Zig on its first call; fetch it before packaging.
       - name: Fetch the pinned Zig
         run: zig version
 
@@ -89,7 +92,6 @@ jobs:
             dist/release.json
 
       - name: Prepare shipped native smoke bundle
-        if: matrix.target != 'x86_64-macos'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -105,7 +107,6 @@ jobs:
           (cd $dest/bin && sha256sum $names > SHA256SUMS)
 
       - name: Upload native smoke bundle
-        if: matrix.target != 'x86_64-macos'
         uses: actions/upload-artifact@v4
         with:
           name: smoke-${{ matrix.target }}
@@ -131,6 +132,8 @@ jobs:
             target: aarch64-linux-musl
           - runner: macos-14
             target: aarch64-macos
+          - runner: macos-15-intel
+            target: x86_64-macos
     steps:
       - uses: actions/checkout@v4
         with:
@@ -155,9 +158,21 @@ jobs:
           chmod +x zpq*
 
       - name: Install Zig 0.17.0
+        if: matrix.target != 'x86_64-macos'
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+
+      # CLI cases use GNU timeout, which is not in the macOS default PATH.
+      - name: Install GNU timeout on macOS
+        if: matrix.target == 'aarch64-macos'
+        run: |
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Run the Intel macOS binary
+        if: matrix.target == 'x86_64-macos'
+        run: release/x86_64-macos/bin/zpq --version
 
       - name: Download x86_64 release archives for CPU startup smoke
         if: matrix.target == 'x86_64-linux-musl'
@@ -178,10 +193,12 @@ jobs:
 
       # The shipped CLI through the release cases, and on Linux the shipped Lambda through the fake runtime.
       - name: Run the shipped release artifacts
+        if: matrix.target != 'x86_64-macos'
         env:
           TARGET: ${{ matrix.target }}
         run: |
           zig build check-runner -Doptimize=ReleaseSafe -j8
+          python3 tools/check/test_runner_paths.py zig-out/bin/zpq-check
           zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq release/$TARGET/bin/zpq --no-cache
           if [[ $TARGET == *-linux-musl ]]; then release/$TARGET/bin/zpq-integration; fi
 
@@ -236,6 +253,7 @@ jobs:
           PY_NOTES
 
       - name: Create GitHub Release
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
@@ -245,6 +263,7 @@ jobs:
 
       # R2 mirrors the GitHub Release; a failed upload (say, rotated credentials) must not block the release.
       - name: Upload to R2 (public mirror)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
         continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

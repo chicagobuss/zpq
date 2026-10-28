@@ -340,13 +340,16 @@ pub fn captureEnv(
     argv: []const []const u8,
     env: ?*const std.process.Environ.Map,
 ) !Captured {
-    var child = try std.process.spawn(io, .{
+    var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .environ_map = env,
-    });
+    }) catch |err| {
+        if (err == error.FileNotFound) std.debug.print("cannot start {s}: FileNotFound\n", .{argv[0]});
+        return err;
+    };
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
     multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });

@@ -240,6 +240,10 @@ pub fn main(init: std.process.Init) !void {
         } else return error.BadArgs;
     }
     if (case_files.items.len == 0 and !self_test) return error.BadArgs;
+    // Anchor the binary to the invocation cwd without changing how symlinks and `..` resolve.
+    if (!std.fs.path.isAbsolute(zpq_bin)) {
+        zpq_bin = try std.fs.path.join(arena, &.{ try std.process.currentPathAlloc(io, arena), zpq_bin });
+    }
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.BadArgs);
     if (duckdb.len == 0) duckdb = try std.fmt.allocPrint(arena, "{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
     if (no_cache) cache = null else if (cache == null) cache =

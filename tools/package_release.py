@@ -12,6 +12,7 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import time
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,11 +90,23 @@ def write_packages(out, target, content, version, epoch):
             print(target, name, sha(out / name), flush=True)
 
 
+def positive_seconds(value):
+    try:
+        seconds = int(value)
+        if seconds <= 0:
+            raise ValueError
+        return seconds
+    except ValueError:
+        raise argparse.ArgumentTypeError("timeout must be a positive number of seconds")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="zig-out/release")
     parser.add_argument("--targets", default=",".join(TARGETS[:3]))
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--build-timeout", type=positive_seconds, default=os.environ.get("ZPQ_RELEASE_BUILD_TIMEOUT", "3600"),
+                        help="seconds per build (default: 3600; or ZPQ_RELEASE_BUILD_TIMEOUT)")
     parser.add_argument("--check-docs", action="store_true", help="only check the archive's doc references")
     parser.add_argument("--tag", help="release tag, v<version> or v<version>-<prerelease>; a prerelease suffix is "
                         "built into the binary's and the manifest's version (e.g. v0.5.0-rc2)")
@@ -121,7 +134,7 @@ def main():
             raise SystemExit(f"tag {args.tag} does not name build.zig.zon's version {base_version}")
         version, prerelease = args.tag[1:], tag[1]
     manifest = {"version": version, "revision": revision, "zig": subprocess.check_output(
-        ["zig", "version"], text=True, timeout=10).strip(),
+        ["zig", "version"], text=True, timeout=300).strip(),
         "tls_manifest_sha256": sha(ROOT / "vendor/boring_tls/prebuilt.sha256"),
         "artifacts": {}}
     builds = []
@@ -132,10 +145,14 @@ def main():
     for target, suffix, cpu in builds:
         prefix = out / (target + suffix)
         if not args.skip_build:
-            subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + target,
-                            "-Dcpu=" + cpu, "-Dstrip=true", "-Drevision=" + revision, "--prefix", str(prefix)]
-                           + (["-Dprerelease=" + prerelease] if prerelease else []),
-                           cwd=ROOT, check=True, timeout=1200)
+            started = time.monotonic()
+            try:
+                subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + target,
+                                "-Dcpu=" + cpu, "-Dstrip=true", "-Drevision=" + revision, "--prefix", str(prefix)]
+                               + (["-Dprerelease=" + prerelease] if prerelease else []),
+                               cwd=ROOT, check=True, timeout=args.build_timeout)
+            finally:
+                print(f"{target + suffix} build elapsed: {time.monotonic() - started:.1f}s", flush=True)
         binary = prefix / "bin/zpq"
         if revision.encode() not in binary.read_bytes():
             raise SystemExit("binary lacks its manifest revision; refusing to package stale output")

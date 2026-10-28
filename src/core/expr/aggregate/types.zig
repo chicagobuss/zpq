@@ -3,6 +3,7 @@ const testing = std.testing;
 const expr_ast = @import("../ast.zig");
 const expr_eval = @import("../eval.zig");
 const filter_ast = @import("../../filter/ast.zig");
+const filter_eval = @import("../../filter/eval.zig");
 
 pub const AggFunc = enum {
     count,
@@ -217,4 +218,17 @@ test "DecSum.meanAt rounds half away from zero at up to 4 more digits, past 192-
         if (shift == 0) try testing.expectEqual(@as(?i128, want), try d.mean());
     }
 }
+
+
+pub const Error = error{
+    BadAggArg,
+    UnsupportedAggType,
+    EmptyAggregate,
+    DivideByZero,
+    ExceededMemoryBudget,
+    /// An integer aggregate result (i128 internally) exceeds the i64 range of
+    /// the 1-row result *parquet* column. The JSON output path has no such
+    /// limit; this only affects `--aggregate -o out.parquet`.
+    AggIntTooWide,
+} || std.mem.Allocator.Error || expr_eval.Error || filter_eval.Error;
 

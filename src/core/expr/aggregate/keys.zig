@@ -1,4 +1,5 @@
 const std = @import("std");
+const Error = @import("types.zig").Error;
 const expr_ast = @import("../ast.zig");
 const filter_eval = @import("../../filter/eval.zig");
 const splitMix64 = @import("census.zig").splitMix64;
@@ -195,5 +196,192 @@ pub fn hashFixed(bytes: []const u8) u64 {
         h ^= splitMix64(std.mem.readInt(u64, &tail, .little));
     }
     return h;
+}
+
+
+/// Stable 32-bit references into append-only 64 KiB chunks. Records never straddle separately allocated blocks.
+/// Reset reuses blocks; handing the arena to an answer preserves every borrowed key until that answer is dropped.
+pub const KeyArena = struct {
+    pub const chunk_size = 1 << 16;
+    const Block = struct { bytes: []u8, start: u32 };
+    blocks: std.ArrayList(Block) = .empty,
+    chunks: std.ArrayList([*]u8) = .empty,
+    data_bytes: usize = 0,
+    block: usize = 0,
+    used: usize = 0,
+    /// A tiny query ceiling can bootstrap below one chunk without changing the logical 64 KiB offset geometry.
+    bootstrap: usize = chunk_size,
+    allocator: std.mem.Allocator = undefined,
+    owner: ?*anyopaque = null,
+    reserveFn: ?*const fn (*anyopaque, usize) Error!void = null,
+    settleFn: ?*const fn (*anyopaque) void = null,
+
+    pub fn append(self: *KeyArena, value: []const u8) !u32 {
+        if (self.reserveFn) |reserve| {
+            const growth = (try self.projected(value.len)) - self.held();
+            try reserve(self.owner.?, std.math.add(usize, growth, try self.projectedOverlap(value.len)) catch
+                return error.ExceededMemoryBudget);
+        }
+        defer if (self.settleFn) |settle| settle(self.owner.?);
+        return self.put(self.allocator, value);
+    }
+
+    fn header(len: usize, out: *[5]u8) !usize {
+        var n = std.math.cast(u32, len) orelse return error.ExceededMemoryBudget;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            out[i] = @as(u8, @truncate(n)) & 0x7f;
+            n >>= 7;
+            if (n == 0) return i + 1;
+            out[i] |= 0x80;
+        }
+    }
+
+    const Place = struct { block: usize, used: usize, need: usize, capacity: usize };
+    fn place(self: *const KeyArena, len: usize) !Place {
+        var hdr: [5]u8 = undefined;
+        const need = len + try header(len, &hdr);
+        var b = self.block;
+        var at = self.used;
+        while (b < self.blocks.items.len) : (b += 1) {
+            const cap = self.blocks.items[b].bytes.len;
+            if (need <= chunk_size and at / chunk_size != (at + need - 1) / chunk_size)
+                at = std.mem.alignForward(usize, at, chunk_size);
+            if (at <= cap and need <= cap - at) return .{ .block = b, .used = at, .need = need, .capacity = 0 };
+            at = 0;
+        }
+        // A small per-table credit starts below one physical chunk and grows geometrically. References still
+        // use one logical 64 KiB chunk id per short block; large-query arenas stay at the ordinary chunk size.
+        const cap = if (need <= chunk_size)
+            @min(chunk_size, @max(
+                if (self.blocks.items.len == 0) self.bootstrap else self.blocks.items[self.blocks.items.len - 1].bytes.len * 2,
+                std.math.ceilPowerOfTwoAssert(usize, need),
+            ))
+        else
+            std.mem.alignForward(usize, need, chunk_size);
+        const logical = std.mem.alignForward(usize, cap, chunk_size);
+        if (@as(u64, self.chunks.items.len) * chunk_size + logical > @as(u64, 1) << 32)
+            return error.ExceededMemoryBudget;
+        return .{ .block = b, .used = 0, .need = need, .capacity = cap };
+    }
+
+    pub fn held(self: *const KeyArena) usize {
+        return self.data_bytes + self.blocks.capacity * @sizeOf(Block) + self.chunks.capacity * @sizeOf([*]u8);
+    }
+
+    pub fn projected(self: *const KeyArena, len: usize) !usize {
+        const p = try self.place(len);
+        if (p.capacity == 0) return self.held();
+        const blocks = self.blocks.items.len + 1;
+        const chunks = self.chunks.items.len + (p.capacity + chunk_size - 1) / chunk_size;
+        return self.held() + p.capacity +
+            (if (blocks > self.blocks.capacity)
+                (@max(blocks, self.blocks.capacity * 2) - self.blocks.capacity) * @sizeOf(Block)
+            else
+                0) +
+            (if (chunks > self.chunks.capacity)
+                (@max(chunks, self.chunks.capacity * 2) - self.chunks.capacity) * @sizeOf([*]u8)
+            else
+                0);
+    }
+
+    fn projectedOverlap(self: *const KeyArena, len: usize) !usize {
+        const p = try self.place(len);
+        if (p.capacity == 0) return 0;
+        const nc = (p.capacity + chunk_size - 1) / chunk_size;
+        const blocks = if (self.blocks.items.len == self.blocks.capacity)
+            self.blocks.capacity * @sizeOf(Block)
+        else
+            0;
+        const chunks = if (self.chunks.items.len + nc > self.chunks.capacity)
+            self.chunks.capacity * @sizeOf([*]u8)
+        else
+            0;
+        return @max(blocks, chunks);
+    }
+
+    pub fn put(self: *KeyArena, a: std.mem.Allocator, value: []const u8) !u32 {
+        return self.putParts(a, &.{}, value);
+    }
+
+    fn putParts(self: *KeyArena, a: std.mem.Allocator, prefix: []const u8, value: []const u8) !u32 {
+        const len = std.math.add(usize, prefix.len, value.len) catch return error.ExceededMemoryBudget;
+        const p = try self.place(len);
+        if (p.capacity != 0) {
+            if (self.blocks.items.len == self.blocks.capacity)
+                try self.blocks.ensureTotalCapacityPrecise(a, @max(1, self.blocks.capacity * 2));
+            const nc = (p.capacity + chunk_size - 1) / chunk_size;
+            if (self.chunks.items.len + nc > self.chunks.capacity)
+                try self.chunks.ensureTotalCapacityPrecise(a, @max(self.chunks.items.len + nc, self.chunks.capacity * 2));
+            const bytes = try a.alloc(u8, p.capacity);
+            self.data_bytes += bytes.len;
+            self.blocks.appendAssumeCapacity(.{ .bytes = bytes, .start = @intCast(self.chunks.items.len * chunk_size) });
+            for (0..nc) |i| self.chunks.appendAssumeCapacity(bytes.ptr + i * chunk_size);
+        }
+        const b = self.blocks.items[p.block];
+        var hdr: [5]u8 = undefined;
+        const hn = try header(len, &hdr);
+        @memcpy(b.bytes[p.used..][0..hn], hdr[0..hn]);
+        @memcpy(b.bytes[p.used + hn ..][0..prefix.len], prefix);
+        @memcpy(b.bytes[p.used + hn + prefix.len ..][0..value.len], value);
+        self.block = p.block;
+        self.used = p.used + p.need;
+        return @intCast(@as(usize, b.start) + p.used);
+    }
+
+    pub fn get(self: *const KeyArena, ref: u32) []const u8 {
+        const p = self.chunks.items[ref >> 16] + (ref & (chunk_size - 1));
+        var len: u32 = 0;
+        var shift: u5 = 0;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const b = p[i];
+            len |= @as(u32, b & 0x7f) << shift;
+            if (b < 0x80) return p[i + 1 ..][0..len];
+            shift += 7;
+        }
+    }
+
+    pub fn reset(self: *KeyArena) void {
+        self.block = 0;
+        self.used = 0;
+    }
+
+    pub fn deinit(self: *KeyArena, a: std.mem.Allocator) void {
+        for (self.blocks.items) |b| a.free(b.bytes);
+        self.blocks.deinit(a);
+        self.chunks.deinit(a);
+        self.* = .{};
+    }
+};
+
+test "STRGROUP stable arena records cover empty embedded-zero and multi-chunk values" {
+    const a = std.testing.allocator;
+    var arena: KeyArena = .{};
+    defer arena.deinit(a);
+    var refs: [7]u32 = undefined;
+    const sizes = [_]usize{ 0, 1, 127, 65530, 65536, 131073, 3 };
+    for (sizes, &refs) |n, *ref| {
+        const bytes = try a.alloc(u8, n);
+        defer a.free(bytes);
+        @memset(bytes, 0);
+        if (n > 0) bytes[n - 1] = 17;
+        ref.* = try arena.put(a, bytes);
+        try std.testing.expectEqualStrings(bytes, arena.get(ref.*));
+    }
+    for (sizes, refs) |n, ref| {
+        const bytes = arena.get(ref);
+        try std.testing.expectEqual(n, bytes.len);
+        if (n > 0) try std.testing.expectEqual(@as(u8, 17), bytes[n - 1]);
+    }
+    const blocks = arena.blocks.items.len;
+    var data_bytes: usize = 0;
+    for (arena.blocks.items) |block| data_bytes += block.bytes.len;
+    try std.testing.expectEqual(data_bytes, arena.data_bytes);
+    const held = arena.held();
+    arena.reset();
+    try std.testing.expectEqualStrings("reuse", arena.get(try arena.put(a, "reuse")));
+    try std.testing.expectEqual(blocks, arena.blocks.items.len);
+    try std.testing.expectEqual(held, arena.held());
 }
 

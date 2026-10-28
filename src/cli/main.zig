@@ -95,7 +95,7 @@ fn emitError(err: anyerror) !void {
 
 pub fn main(init: std.process.Init) !void {
     zpq.cpu_level.require();
-    const gpa = init.gpa;
+    const gpa = zpq.core.memory.processAllocator(init.gpa);
     local_fs.raiseOpenFileLimit();
     zpq.core.memory.fixHeapThreshold();
     machine_diagnostics = wantsJsonSummary(init.minimal.args);
@@ -183,7 +183,7 @@ fn runQuery(
     diag: *Diag,
     arena: std.mem.Allocator,
 ) !void {
-    const gpa = init.gpa;
+    const gpa = zpq.core.memory.processAllocator(init.gpa);
     const env = init.minimal.environ;
     const io = init.io;
     var inputs_raw: std.ArrayList([]const u8) = .empty;
@@ -1120,7 +1120,7 @@ fn printLogicalOrConverted(ws: *StdoutWriter, leaf: schema_tree.PrimitiveNode) !
 }
 
 fn runSchema(init: std.process.Init, path: []const u8) !void {
-    const gpa = init.gpa;
+    const gpa = zpq.core.memory.processAllocator(init.gpa);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1180,7 +1180,7 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
 }
 
 fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
-    var arena_state = std.heap.ArenaAllocator.init(init.gpa);
+    var arena_state = std.heap.ArenaAllocator.init(zpq.core.memory.processAllocator(init.gpa));
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var paths: std.ArrayList([]const u8) = .empty;
@@ -1214,7 +1214,7 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var failures: usize = 0;
     for (paths.items, 0..) |path, i| {
         if (json and i != 0) try ws.writeByte(',');
-        var file_arena = std.heap.ArenaAllocator.init(init.gpa);
+        var file_arena = std.heap.ArenaAllocator.init(zpq.core.memory.processAllocator(init.gpa));
         defer file_arena.deinit();
         const report = @import("inspect.zig").inspect(file_arena.allocator(), init.minimal.environ, path, detail) catch |err| {
             failures += 1;

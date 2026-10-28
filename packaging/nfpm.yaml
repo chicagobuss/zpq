@@ -146,3 +146,14 @@ contents:
     file_info:
       mode: 0644
     packager: rpm
+  - src: THIRD_PARTY_NOTICES.md
+    dst: /usr/share/licenses/zpq/THIRD_PARTY_NOTICES.md
+    type: license
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: THIRD_PARTY_NOTICES.md
+    dst: /usr/share/doc/zpq/THIRD_PARTY_NOTICES.md
+    file_info:
+      mode: 0644
+    packager: deb

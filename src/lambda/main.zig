@@ -65,7 +65,7 @@ const TARGET_COLUMN: []const u8 = "int8";
 
 pub fn main(init: std.process.Init) !void {
     zpq.cpu_level.require();
-    const allocator = init.gpa;
+    const allocator = zpq.core.memory.processAllocator(init.gpa);
     const env = init.minimal.environ;
     const io = init.io;
     zpq.local_fs.raiseOpenFileLimit();

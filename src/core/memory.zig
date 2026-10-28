@@ -74,6 +74,77 @@ test "the C heap calls are glibc's alone, and run where the target has them" {
     trimHeap();
 }
 
+/// The general-purpose allocator of a process zpq owns (the CLI, the Lambda), given the one `std.process.Init` chose.
+/// A release build over musl takes mimalloc (linked by build.zig's `usesMimalloc`) instead of musl's malloc: musl's
+/// allocator and Zig's `smp_allocator` both map and unmap pages as allocation-heavy folds (COUNT DISTINCT) grow, and
+/// each `munmap` stalls every other thread; mimalloc keeps freed pages for reuse and purges them after a delay.
+/// `Charged` counts bytes whatever its child, and huge-page regions take `page_allocator` directly, so neither the
+/// budget nor the advice changes. Debug and safe builds keep Init's leak-checking allocator; glibc's heap stays where
+/// it is (it has `trimHeap`).
+pub fn processAllocator(init_gpa: std.mem.Allocator) std.mem.Allocator {
+    if (comptime !use_mimalloc) return init_gpa;
+    // Upstream's defaults keep freed pages for a second and back its arenas with transparent huge pages: on sub-second
+    // queries that holds their freed buffers and every partly used 2 MiB region resident, well above a glibc build's
+    // peak. Purged at once and without THP, peaks match glibc's at little cost. `MIMALLOC_*` still overrides them.
+    mi_option_set_default(mi_option_purge_delay, 0);
+    mi_option_set_default(mi_option_allow_thp, 0);
+    return mimalloc;
+}
+
+/// build.zig links mimalloc (`usesMimalloc`) for exactly the builds `ownHeap` names, libzpq's aside.
+const use_mimalloc = @import("build_options").use_mimalloc;
+comptime {
+    if (use_mimalloc) std.debug.assert(ownHeap(builtin.mode, builtin.abi, builtin.link_libc, builtin.single_threaded));
+}
+
+/// mimalloc's aligned API as a Zig allocator: thread-safe, and a block's in-place growth is mimalloc's usable size.
+const mimalloc: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
+    .alloc = miAlloc,
+    .resize = miResize,
+    .remap = miRemap,
+    .free = miFree,
+} };
+
+extern fn mi_malloc_aligned(size: usize, alignment: usize) ?*anyopaque;
+extern fn mi_realloc_aligned(p: ?*anyopaque, size: usize, alignment: usize) ?*anyopaque;
+extern fn mi_usable_size(p: ?*const anyopaque) usize;
+extern fn mi_free(p: ?*anyopaque) void;
+extern fn mi_option_set_default(option: c_int, value: c_long) void;
+// `mi_option_t` values in vendor/mimalloc/include/mimalloc.h (3.6.0).
+const mi_option_purge_delay: c_int = 15;
+const mi_option_allow_thp: c_int = 43;
+
+fn miAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+    return @ptrCast(mi_malloc_aligned(len, alignment.toByteUnits()));
+}
+
+fn miResize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+    return new_len <= mi_usable_size(memory.ptr);
+}
+
+fn miRemap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+    return @ptrCast(mi_realloc_aligned(memory.ptr, new_len, alignment.toByteUnits()));
+}
+
+fn miFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+    mi_free(memory.ptr);
+}
+
+fn ownHeap(mode: @TypeOf(builtin.mode), abi: std.Target.Abi, link_libc: bool, single_threaded: bool) bool {
+    return (mode == .fast or mode == .small) and link_libc and abi.isMusl() and !single_threaded;
+}
+
+test "a release build over musl's malloc takes its own heap; leak checks and glibc's heap stay" {
+    try std.testing.expect(ownHeap(.fast, .musl, true, false));
+    try std.testing.expect(ownHeap(.small, .musl, true, false));
+    try std.testing.expect(!ownHeap(.safe, .musl, true, false));
+    try std.testing.expect(!ownHeap(.debug, .musl, true, false));
+    try std.testing.expect(!ownHeap(.fast, .gnu, true, false));
+    try std.testing.expect(!ownHeap(.fast, .none, true, false));
+    try std.testing.expect(!ownHeap(.fast, .musl, true, true));
+    try std.testing.expect(processAllocator(std.testing.allocator).vtable == std.testing.allocator.vtable);
+}
+
 /// One `max_memory` shared by every group table filling in parallel, so required headroom stops scaling with `-j`
 /// (see `scan.zig`). Usage never exceeds `limit`, but admission near it is approximate — tables draw in blocks and can
 /// sit on part of one — because exact per-entry accounting would put a contended atomic on every insertion. Stranded

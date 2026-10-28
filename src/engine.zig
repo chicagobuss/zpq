@@ -752,6 +752,7 @@ fn executeAggregateOver(
         .typed_answer = args.typed_answer and args.output != null,
         .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
+        .sorted_count_stream = !envDisables(ctx.env, "ZPQ_SORTED_COUNT_STREAM"),
         .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
         .msd_cache_rows = if (ctx.env.getPosix("ZPQ_MSD_CACHE_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null

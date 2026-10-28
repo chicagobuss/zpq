@@ -56,6 +56,7 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_DECODE_BATCH_ROWS` | Unset selects cache-sized decode for admitted float trees; `0`, invalid or overflowing values keep ordinary memory admission; positive values force the window path with a row cap |
 | `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` always expands levels |
 | `ZPQ_INTEGER_RECORDS` | Eligible integer inline aggregation; `0` selects the general executor |
+| `ZPQ_SORTED_COUNT_STREAM` | Ordered COUNT top-K streaming; `0` retains the materialized run owner |
 | `ZPQ_BYTE_RECORDS` | Eligible short-key inline aggregation; `0` selects the general executor |
 | `ZPQ_BYTE_TOP_PARTITIONS` | Short-key SUM top-H partitions; unset costs L2 fold scratch and L3 producer buffers, `0` keeps 2048, positive values force a power of two in 64–16384 |
 | `ZPQ_BYTE_TOP_BATCH_ROWS` | Short-key SUM top-H decode rows; unset uses shared cache headroom, `0` keeps ordinary decode admission, positive values force a power of two in 64–16384 |

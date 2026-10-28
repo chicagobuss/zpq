@@ -303,6 +303,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             /// Key and value NULL bits seen (the full answer's column nullability).
             nulls: u32 = 0,
             run_item: usize = 0,
+            worker: usize = 0,
             run_stopped: bool = false,
             count_cache: CountCache = .{},
             full_cache: FullCache = .{},
@@ -362,6 +363,10 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             fn appendRun(l: *Local, key: ?Key, value: ?i64, ordinal: u32) void {
                 if (l.run_stopped) return;
                 const s = l.state;
+                if (comptime kind == .count_top) if (s.boundaries.len != 0) {
+                    l.appendCountRun(key, ordinal);
+                    return;
+                };
                 const run = &s.runs[l.run_item];
                 if (value == null) l.nulls |= 2;
                 run.rows += 1;
@@ -399,6 +404,34 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 s.winners[ordinal] = id + 1;
                 if (run.groups == 0) run.first = id;
                 run.last = id;
+                run.groups += 1;
+            }
+
+            // A source's first and last runs may continue in other sources and cannot enter a heap yet.
+            fn appendCountRun(l: *Local, key: ?Key, ordinal: u32) void {
+                const s = l.state;
+                const run = &s.runs[l.run_item];
+                const edge = &s.boundaries[l.run_item];
+                run.rows += 1;
+                const k = key orelse {
+                    l.run_stopped = true;
+                    s.run_declined.store(true, .monotonic);
+                    return;
+                };
+                if (run.groups != 0) {
+                    const prev = edge.last.keyValue().?;
+                    if (k < prev) {
+                        l.run_stopped = true;
+                        s.run_declined.store(true, .monotonic);
+                        return;
+                    }
+                    if (k == prev) {
+                        edge.last.count += 1;
+                        return;
+                    }
+                    if (run.groups == 1) edge.first = edge.last else s.keep(&s.heaps[l.worker], edge.last);
+                }
+                edge.last = .{ .key = @bitCast(k), .count = 1, .first = ordinal };
                 run.groups += 1;
             }
 
@@ -636,10 +669,12 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             // Decoded run partials occupy disjoint source-ordinal ranges of the existing group/winner arrays.
             runs: []Run = &.{},
             run_declined: std.atomic.Value(bool) = .init(false),
+            boundaries: []Boundary = &.{},
             count_caches: []CountEntry = &.{},
             full_caches: []FullEntry = &.{},
             cache_trial_rows: u32 = 0,
             const Run = struct { rows: usize = 0, groups: usize = 0, first: u32 = 0, last: u32 = 0 };
+            const Boundary = struct { first: Group = .{ .key = 0, .count = 0, .first = 0 }, last: Group = .{ .key = 0, .count = 0, .first = 0 } };
 
             fn blockCount(rows: usize, workers: usize, parts: usize) usize {
                 return Records.blockCount(rows, workers, parts);
@@ -652,6 +687,13 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
 
             pub fn runReservation(rows: usize, workers: usize, parts: usize, k: usize, output_credit: usize) usize {
                 return reservationMode(rows, workers, parts, k, output_credit, true);
+            }
+
+            /// Only worker heaps and per-source seam descriptors survive the scan.
+            pub fn streamReservation(workers: usize, items: usize, k: usize, output_credit: usize) usize {
+                return @sizeOf(State) +| (8 << 20) +| output_credit +|
+                    workers *| (stack_size + @sizeOf(Local) + @sizeOf(Heap) +| k *| @sizeOf(Group)) +|
+                    items *| (@sizeOf(Run) + @sizeOf(Boundary));
             }
 
             fn reservationMode(
@@ -686,7 +728,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 parts: usize,
                 output_credit: usize,
             ) !?*State {
-                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, 0);
+                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, 0, false);
             }
 
             /// Scalar COUNT DISTINCT finishes complete owner partitions with no retained top-H groups.
@@ -711,6 +753,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     parts,
                     output_credit,
                     0,
+                    false,
                 );
             }
 
@@ -760,7 +803,23 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 // The ordinary per-row quote also covers one run descriptor per row. Empty-source-heavy inputs
                 // beyond that bound keep the record producer, rather than retaining unquoted descriptors.
                 if (items > rows) return null;
-                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, items);
+                return initMode(a, ledger, rows, workers, key_col, value_col, cut, parts, output_credit, items, false);
+            }
+
+            pub fn initStreamRuns(
+                a: std.mem.Allocator,
+                ledger: ?*memory.SharedBudget,
+                rows: usize,
+                workers: usize,
+                key_col: usize,
+                cut: Cut,
+                parts: usize,
+                items: usize,
+                output_credit: usize,
+            ) !?*State {
+                comptime std.debug.assert(codec == .int64 and kind == .count_top);
+                if (items == 0 or items > rows) return null;
+                return initMode(a, ledger, rows, workers, key_col, 0, cut, parts, output_credit, items, true);
             }
 
             fn initMode(
@@ -774,12 +833,13 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 parts: usize,
                 output_credit: usize,
                 run_items: usize,
+                streaming: bool,
             ) !?*State {
                 if (!admitsRows(codec, rows) or workers == 0 or workers > max_workers or parts < 64 or parts > 16384 or
                     !std.math.isPowerOfTwo(parts)) return null;
                 const k: usize = if (kind == .full) 0 else cut.k;
                 if (kind != .full and (k > 1024 or (kind != .count_top and k == 0))) return null;
-                const charge = reservationMode(rows, workers, parts, k, output_credit, run_items != 0);
+                const charge = if (streaming) streamReservation(workers, run_items, k, output_credit) else reservationMode(rows, workers, parts, k, output_credit, run_items != 0);
                 if (ledger) |l| _ = l.drawExact(charge) orelse return null;
                 const s = a.create(State) catch |e| {
                     if (ledger) |l| l.release(charge);
@@ -799,7 +859,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 };
                 errdefer s.deinit();
                 s.locals = try a.alloc(Local, workers);
-                for (s.locals) |*l| l.* = .{ .state = s };
+                for (s.locals, 0..) |*l, i| l.* = .{ .state = s, .worker = i };
                 if (kind != .full) {
                     s.heaps = try a.alloc(Heap, workers);
                     for (s.heaps) |*h| h.* = .initContext(cut.descending);
@@ -812,6 +872,11 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 if (run_items != 0) {
                     s.runs = try a.alloc(Run, run_items);
                     @memset(s.runs, .{});
+                    if (streaming) {
+                        s.boundaries = try a.alloc(Boundary, run_items);
+                        @memset(s.boundaries, .{});
+                        return s;
+                    }
                     s.groups = try a.alloc(Group, rows);
                     s.winners = try a.alloc(u32, rows);
                     @memset(s.winners, 0);
@@ -856,6 +921,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 a.free(s.full_caches);
                 a.free(s.locals);
                 a.free(s.runs);
+                a.free(s.boundaries);
                 for (s.heaps) |*h| h.deinit(a);
                 a.free(s.heaps);
                 a.free(s.blocks);
@@ -1167,6 +1233,35 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 }
             }
 
+            fn finishStreamRuns(s: *State, selected_rows: usize) !void {
+                if (s.run_declined.load(.monotonic)) return error.RunOrderDeclined;
+                var rows: usize = 0;
+                var pending: ?Group = null;
+                for (s.runs, s.boundaries) |run, edge| {
+                    rows += run.rows;
+                    s.group_count += run.groups;
+                    if (run.groups == 0) continue;
+                    const first = if (run.groups == 1) edge.last else edge.first;
+                    if (pending) |*p| {
+                        if (p.keyValue().? > first.keyValue().?) return error.RunOrderDeclined;
+                        if (p.key == first.key) {
+                            p.count += first.count;
+                            s.group_count -= 1;
+                        } else {
+                            s.keep(&s.heaps[0], p.*);
+                            pending = first;
+                        }
+                    } else pending = first;
+                    if (run.groups > 1) {
+                        s.keep(&s.heaps[0], pending.?);
+                        pending = edge.last;
+                    }
+                }
+                if (rows != selected_rows) return error.BadRowCount;
+                if (pending) |g| s.keep(&s.heaps[0], g);
+                s.combineTop();
+            }
+
             fn finishRuns(s: *State, selected_rows: usize) !void {
                 if (s.run_declined.load(.monotonic)) return error.RunOrderDeclined;
                 var rows: usize = 0;
@@ -1224,7 +1319,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 if (selected_rows > s.rows) return error.BadRowCount;
                 if (comptime codec == .int64) if (s.runs.len != 0) {
                     const begin = now();
-                    try s.finishRuns(selected_rows);
+                    if (comptime kind == .count_top) {
+                        if (s.boundaries.len != 0) try s.finishStreamRuns(selected_rows) else try s.finishRuns(selected_rows);
+                    } else try s.finishRuns(selected_rows);
                     s.fold_ns = @intCast(now() - begin);
                     return;
                 };
@@ -2359,4 +2456,57 @@ test "hot integer COUNT scratch grows from exact groups preserving NULL ties and
     hw.test_cpu = .{ .l1d = .{ .bytes = 256, .line_bytes = 64 }, .l2 = .{ .bytes = 128 } };
     try countScratchGrowthTrial(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, countScratchGrowthTrial, .{});
+}
+
+fn streamingCountTrial(a: std.mem.Allocator, workers: usize, descending: bool, divisor: usize) !void {
+    const rows = 4096;
+    const items = 17;
+    const cut: Cut = .{ .k = 10, .descending = descending };
+    var budget: memory.SharedBudget = .{ .limit = 1 << 30 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    const streaming = (try IntCountTop.State.initStreamRuns(a, &budget, rows, workers, 0, cut, 64, items, 0)).?;
+    defer streaming.deinit();
+    const materialized = (try IntCountTop.State.initRuns(a, &budget, rows, workers, 0, 0, cut, 64, items, 0)).?;
+    defer materialized.deinit();
+    try std.testing.expectEqual(@as(usize, 0), streaming.groups.len);
+    try std.testing.expectEqual(@as(usize, 0), streaming.winners.len);
+    try std.testing.expectEqual(items, streaming.boundaries.len);
+    // Work arrives out of source order and is spread over different worker heaps.
+    var item: usize = items;
+    while (item != 0) {
+        item -= 1;
+        const lo = rows * item / items;
+        const hi = rows * (item + 1) / items;
+        const w = item % workers;
+        streaming.locals[w].start(@intCast(lo), item);
+        materialized.locals[w].start(@intCast(lo), item);
+        for (lo..hi) |row| {
+            const key: i64 = @intCast(row / divisor);
+            try streaming.locals[w].append(key, {}, @intCast(row));
+            try materialized.locals[w].append(key, {}, @intCast(row));
+        }
+    }
+    try streaming.finish();
+    try materialized.finish();
+    try std.testing.expectEqual(materialized.group_count, streaming.group_count);
+    try std.testing.expectEqualDeep(materialized.top(), streaming.top());
+}
+
+test "streaming COUNT top-H reconciles source seams and first-ordinal ties at one and four workers" {
+    for ([_]usize{ 1, 4 }) |j| for ([_]bool{ false, true }) |descending|
+        for ([_]usize{ 3, 241, 1024 }) |divisor|
+            try streamingCountTrial(std.testing.allocator, j, descending, divisor);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, streamingCountTrial, .{ 1, true, 3 });
+}
+
+test "streaming COUNT top-H declines NULL and partially ordered sources before publishing" {
+    for ([_][4]?i64{ .{ 1, null, 2, 3 }, .{ 1, 0, 2, 3 }, .{ 1, 2, 1, 3 } }) |keys| {
+        const s = (try IntCountTop.State.initStreamRuns(std.testing.allocator, null, keys.len, 2, 0, .{ .k = 2, .descending = true }, 64, 2, 0)).?;
+        defer s.deinit();
+        for (0..2) |item| {
+            s.locals[item].start(@intCast(item * 2), item);
+            for (item * 2..item * 2 + 2) |row| try s.locals[item].append(keys[row], {}, @intCast(row));
+        }
+        try std.testing.expectError(error.RunOrderDeclined, s.finish());
+    }
 }

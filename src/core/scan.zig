@@ -249,6 +249,8 @@ pub const MultiAggArgs = struct {
     record_answer: bool = false,
     /// Exact inline records for integer COUNT/SUM answers, SUM/DISTINCT cuts, and scalar distinct, when prepaid.
     integer_records: bool = true,
+    /// Stream ordered COUNT top-H runs; false retains the materialized run owner.
+    sorted_count_stream: bool = true,
     /// Tests lower the cost threshold; ordinary execution keeps small answers on the established path.
     integer_records_min_rows: usize = 1 << 20,
     /// Exact retained-page radix grouping for a bounded string/INT32 COUNT cut.
@@ -8738,7 +8740,7 @@ fn inlineIntegerAnswer(
     }
     if (distinct and args.integer_records_min_rows != 0 and key_range.small(rows)) return null;
     if (rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows)) return null;
-    const quote = integerQuote(rows, n_workers, cut, owner_args, count_top, ordered_count, outputNamesBytes(outputs));
+    const quote = integerQuote(rows, n_workers, cut, owner_args, count_top, ordered_count, work.len, outputNamesBytes(outputs));
     if (quote > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
@@ -8938,6 +8940,7 @@ fn integerQuote(
     args: MultiAggArgs,
     count_top: bool,
     ordered: bool,
+    items: usize,
     names_credit: usize,
 ) usize {
     const c = cut orelse return owner_groups.IntFull.State.reservation(
@@ -8951,7 +8954,9 @@ fn integerQuote(
         inline else => |kind| {
             const Owner = owner_groups.Owner(kind, .int64);
             const parts = Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
-            return if (ordered)
+            return if (ordered and kind == .count_top and args.sorted_count_stream)
+                Owner.State.streamReservation(n_workers, items, c.k, names_credit)
+            else if (ordered)
                 Owner.State.runReservation(rows, n_workers, parts, c.k, names_credit)
             else
                 Owner.State.reservation(rows, n_workers, parts, c.k, names_credit);
@@ -8999,6 +9004,8 @@ fn runIntegerOwner(
             parts,
             names_credit,
         )
+    else if (ordered and kind == .count_top and args.sorted_count_stream)
+        try Owner.State.initStreamRuns(gpa, args.ledger, rows, n_workers, key_col, cut, parts, work.len, names_credit)
     else if (ordered)
         try Owner.State.initRuns(
             gpa,
@@ -17763,7 +17770,7 @@ test "inline records decline released remote windows and retry only through a re
             .reservation = if (bytes_key)
                 owner_groups.Full.State.reservation(n, 1, owner_groups.full_parts, 0, 0)
             else
-                integerQuote(n, 1, null, args, false, false, names_credit),
+                integerQuote(n, 1, null, args, false, false, 0, names_credit),
         };
         try testing.expectEqual(expected, explanation.record_path.?);
     }

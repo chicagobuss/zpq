@@ -42,4 +42,5 @@ _arguments '*:file:_files' \
   '-h[zpq option]' \
   '-j[zpq option]' \
   '-o[zpq option]' \
+  '-q[zpq option]' \
   '-s[zpq option]'

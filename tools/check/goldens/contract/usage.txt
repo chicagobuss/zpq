@@ -142,8 +142,9 @@ usage:
                  --max-memory caps re-encoded row groups at a sixteenth
                  of it, so they may depend on its value.
   --cache        read through the page cache so the next query runs warm.
-  --explain      print an aggregate plan as JSON using only file footers;
+  --explain      print an aggregate plan as JSON from file metadata;
                  accepts SQL or --aggregate / --group-by, then exits.
+                 Local dictionaries may refine the plan; S3 uses footers.
   --profile      write a Chrome Trace Event JSON trace of the query
                  (open it at https://ui.perfetto.dev): per-thread spans
                  for every phase, in-flight counters, RSS.
@@ -154,7 +155,7 @@ usage:
 
 
   Aliases: -a --aggregate, -f --filter, -c --columns, -o --output.
-           -g --group-by, -s --select, -j --threads.
+           -g --group-by, -s --select, -j --threads, -q --query.
   Global: --help / -h, --version / -V.
   Inputs: quote basename * globs; directory wildcards are unsupported.
   schema takes one local path or s3:// URL; query/inspect accept globs.

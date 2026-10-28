@@ -208,12 +208,15 @@ reserves its budget before it starts: its request's `max_memory`, else the whole
 - A wait longer than `budget_wait_ms` (the request's, else the context's) ends with
   `{"error":"budget","reason":"WaitTimeout",...}`.
 
-**What a budget limits.** The engine sizes some structures against a query's budget: GROUP BY state (past the budget
-the query fails with `ExceededMemoryBudget`), and how much it reads ahead and buffers. It does not hold every
-allocation to it: decoding a row group, for one, takes what that row group needs. A query can therefore use more than
-it declared, however small the declaration. As a rule of thumb, a scan's own working memory is tens of MiB per worker
-(a query has as many workers as the CPUs the process may run on), and some file layouts take over 100 MiB with a
-single worker. Declare budgets with that headroom, and keep the ceiling well inside what the host can spare.
+**What a budget limits.** Queries use the CLI's working-memory budget: decoded row groups, GROUP BY tables,
+read-ahead, merge and answer buffers, and encoded output draw from one ledger. A query that does not fit retries
+narrower paths and otherwise returns an error; a flat row group can be decoded in slices. Fixed slack for thread
+stacks, initial decode buffers, codec state and the final retry remains outside it, as listed under `--max-memory`
+in `zpq --help`.
+
+In 0.5.0, growth and replacement of a high-cardinality GROUP BY or `count(DISTINCT)` hash table can also exceed the
+budget by up to about 2x near its limit. The answer stays exact or the query refuses. Leave headroom in the host;
+use a cgroup `memory.max` for a hard ceiling. The context's reservation ceiling is not a process memory limit.
 
 Outside the ceiling altogether:
 - the footer cache, and warm Bloom filters up to a sixteenth of the ceiling (at most 256 MiB), both held by the

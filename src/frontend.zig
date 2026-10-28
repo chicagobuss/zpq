@@ -14,6 +14,75 @@ pub fn withoutCommand(message: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, message, prefix)) message[prefix.len..] else message;
 }
 
+pub fn failureMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "file not found; check the path and spelling",
+        error.NotAFile, error.IsDir => "the path is a directory; give a Parquet file",
+        error.AccessDenied, error.PermissionDenied => "permission denied; check file and directory permissions",
+        error.OpenFailed => "cannot open the file; check its path and read permissions",
+        error.EmptyFile => "the file is empty; give a complete Parquet file",
+        error.TooSmall, error.ShortRead, error.TruncatedPage, error.UnexpectedEndOfStream => "the file is truncated or too short for Parquet; obtain a complete copy",
+        error.BadMagic, error.NotParquet => "not a valid Parquet file; check the format or download a complete copy",
+        error.EncryptedFile, error.EncryptedMetadataUnsupported => "encrypted Parquet is unsupported; decrypt the file with another reader first",
+        error.BadMetadata,
+        error.FooterTooLarge,
+        error.InvalidRange,
+        error.BadColumnChunkRange,
+        error.NegativeRowCount,
+        error.RowCountTooLarge,
+        error.BadSchemaElement,
+        error.EmptySchema,
+        error.TruncatedFlat,
+        error.DuplicatePath,
+        error.ColumnChunkCountMismatch,
+        error.ColumnChunkRowCountMismatch,
+        error.ColumnChunkTypeMismatch,
+        error.ColumnChunkPathMismatch,
+        => "the Parquet footer or schema is invalid; obtain a complete, valid copy",
+        error.SchemaTooDeep => "the Parquet schema nests too deeply; rewrite it with fewer nesting levels",
+        error.NoCredentials => "S3 credentials are missing; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,\n" ++
+            "  or S3_NO_SIGN_REQUEST=1 for a public bucket",
+        error.NoRegion => "the S3 region is missing; set AWS_REGION (or S3_REGION)",
+        error.BadRangeResponse => "S3 did not return the requested byte range; check the endpoint and access",
+        error.OutOfMemory => "not enough memory; reduce workers with -j 1 or use a host with more memory",
+        error.NoSpaceLeft => "output storage is full; free space or choose another output path",
+        error.PathTooLong, error.NameTooLong => "the path is too long; use a shorter file or directory name",
+        error.ExternalColumnChunk => "column data is in another file; rewrite it as a self-contained Parquet file",
+        else => "the operation failed; check the input, permissions and available storage,\n" ++
+            "  then report the command if the failure persists",
+    };
+}
+
+test "frontend: first-five-minutes failures explain recovery without bare error names" {
+    const Capture = struct {
+        var bytes: [2048]u8 = undefined;
+        var len: usize = 0;
+        fn write(message: []const u8) void {
+            const n = @min(message.len, bytes.len - len);
+            @memcpy(bytes[len..][0..n], message[0..n]);
+            len += n;
+        }
+    };
+    const saved = diagnostic_fn;
+    diagnostic_fn = Capture.write;
+    defer diagnostic_fn = saved;
+    Capture.len = 0;
+    queryError(error.TruncatedPage, &.{});
+    const truncated = Capture.bytes[0..Capture.len];
+    try std.testing.expect(std.mem.indexOf(u8, truncated, "complete copy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, truncated, "TruncatedPage") == null);
+    Capture.len = 0;
+    queryError(error.NoCredentials, &.{});
+    const credentials = Capture.bytes[0..Capture.len];
+    try std.testing.expect(std.mem.indexOf(u8, credentials, "AWS_ACCESS_KEY_ID") != null);
+    try std.testing.expect(std.mem.indexOf(u8, credentials, "S3_NO_SIGN_REQUEST=1") != null);
+    Capture.len = 0;
+    queryError(error.NoSpaceLeft, &.{});
+    const full = Capture.bytes[0..Capture.len];
+    try std.testing.expect(std.mem.indexOf(u8, full, "free space") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "NoSpaceLeft") == null);
+}
+
 fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
     const report = diagnostic_fn orelse return std.debug.print(fmt, args);
     var buf: [16 * 1024]u8 = undefined;
@@ -136,7 +205,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.CrossBucketNotSupported => diagnosticPrint("zpq query: cross-bucket queries are not supported\n", .{}),
         error.BadInputUrl => diagnosticPrint("zpq query: invalid input S3 URL\n", .{}),
         error.BadOutputUrl => diagnosticPrint("zpq query: invalid output S3 URL\n", .{}),
-        error.NoCredentials => diagnosticPrint("zpq query: missing AWS credentials for S3 query\n", .{}),
+        error.NoCredentials => diagnosticPrint("zpq query: {s}\n", .{failureMessage(err)}),
         error.NoRegion => diagnosticPrint("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
         error.BadResponse => diagnosticPrint("zpq query: bad S3 HTTP response\n", .{}),
         error.TailTooSmall => diagnosticPrint("zpq query: file footer metadata tail too small\n", .{}),
@@ -276,6 +345,9 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "than Parquet can describe (a page holds at most 2 GiB)\n",
             .{},
         ),
+        error.TruncatedPage => diagnosticPrint("zpq query: {s}\n", .{failureMessage(err)}),
+        error.NoSpaceLeft, error.OutOfMemory => diagnosticPrint("zpq query: {s}\n", .{failureMessage(err)}),
+        error.SqlParseError => diagnosticPrint("zpq query: invalid SQL; check the syntax shown above\n", .{}),
         error.RowGroupTooLarge => diagnosticPrint(
             "zpq query: a row group needs more memory to decode than --max-memory\n" ++
                 "allows, even one aggregate or slice of rows at a time; raise\n" ++

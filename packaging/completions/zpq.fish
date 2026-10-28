@@ -40,4 +40,5 @@ complete -c zpq -s g
 complete -c zpq -s h
 complete -c zpq -s j
 complete -c zpq -s o
+complete -c zpq -s q
 complete -c zpq -s s

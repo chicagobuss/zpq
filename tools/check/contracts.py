@@ -386,12 +386,13 @@ def a_full_device_fails_and_a_closed_pipe_exits_quietly(root, clean, corrupt, di
                  [clean, "--select", "k, v * 2 AS w", "-o", "-", "--format", "parquet"]):
         with open("/dev/full", "wb", buffering=0) as full:
             p = run(*args, code=1, stdout=full)
-        assert b"NoSpaceLeft" in p.stderr if args[0] == small else p.stderr, (args, p.stderr)
-    for args in ([small, "--aggregate", "count(*)"], [clean, "--select", "k, v"]):
+        assert b"storage is full" in p.stderr if args[0] == small else p.stderr, (args, p.stderr)
+    for cmd, args in (("query", [small, "--aggregate", "count(*)"]), ("query", [clean, "--select", "k, v"]),
+                      ("schema", [small]), ("inspect", [small]), ("conform", [small]), ("--help", [])):
         read_fd, write_fd = os.pipe()
         os.close(read_fd)
         try:
-            p = run(*args, code=141, stdout=write_fd)
+            p = run(*args, cmd=cmd, code=141, stdout=write_fd)
         finally:
             os.close(write_fd)
         assert not p.stderr, p.stderr

@@ -1,0 +1,211 @@
+{
+  "fixtures": [
+    {
+      "name": "main",
+      "path": "packaging/fixtures/tiny.parquet"
+    },
+    {
+      "name": "text",
+      "path": "README.md"
+    },
+    {
+      "name": "bad_dict",
+      "path": "data/parquet-testing/data/nation.dict-malformed.parquet"
+    }
+  ],
+  "cases": [
+    {
+      "id": "f5m:aliases:group",
+      "cli": [
+        "query",
+        "{path}",
+        "-g",
+        "group",
+        "-a",
+        "count(*) AS n",
+        "--summary=json"
+      ],
+      "same_as": [
+        "query",
+        "{path}",
+        "--group-by",
+        "group",
+        "--aggregate",
+        "count(*) AS n",
+        "--summary=json"
+      ],
+      "oracle": {
+        "compare": "summary",
+        "row_count": 2,
+        "codec": null
+      }
+    },
+    {
+      "id": "f5m:aliases:sql",
+      "cli": [
+        "query",
+        "-q",
+        "SELECT count(*) AS n FROM '{path}'",
+        "--summary=json"
+      ],
+      "same_as": [
+        "query",
+        "--query",
+        "SELECT count(*) AS n FROM '{path}'",
+        "--summary=json"
+      ],
+      "oracle": {
+        "compare": "summary",
+        "row_count": 1,
+        "codec": null
+      }
+    },
+    {
+      "id": "f5m:missing-schema",
+      "cli": [
+        "schema",
+        "{path}.missing"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "file not found; check"
+      }
+    },
+    {
+      "id": "f5m:directory-schema",
+      "cli": [
+        "schema",
+        "."
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "directory; give a Parquet file"
+      }
+    },
+    {
+      "id": "f5m:invalid-schema",
+      "cli": [
+        "schema",
+        "{fixture:text}"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "not a valid Parquet file; check"
+      }
+    },
+    {
+      "id": "f5m:missing-inspect",
+      "cli": [
+        "inspect",
+        "{path}.missing"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "file not found; check"
+      }
+    },
+    {
+      "id": "f5m:invalid-inspect",
+      "cli": [
+        "inspect",
+        "{fixture:text}"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "not a valid Parquet file; check"
+      }
+    },
+    {
+      "id": "f5m:bad-format",
+      "cli": [
+        "inspect",
+        "{path}",
+        "--format",
+        "csv"
+      ],
+      "refuse": {
+        "error": "exit 2",
+        "diag": "--format requires json"
+      }
+    },
+    {
+      "id": "f5m:unknown-inspect",
+      "cli": [
+        "inspect",
+        "{path}",
+        "--no-such-option"
+      ],
+      "refuse": {
+        "error": "exit 2",
+        "diag": "unrecognized option"
+      }
+    },
+    {
+      "id": "f5m:no-inspect",
+      "cli": [
+        "inspect"
+      ],
+      "refuse": {
+        "error": "exit 2",
+        "diag": "give one or more Parquet paths"
+      }
+    },
+    {
+      "id": "f5m:missing-conform",
+      "cli": [
+        "conform",
+        "{path}.missing"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "cannot open the file; check"
+      }
+    },
+    {
+      "id": "f5m:invalid-conform",
+      "cli": [
+        "conform",
+        "{fixture:text}"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "not a valid Parquet file; check"
+      }
+    },
+    {
+      "id": "f5m:no-conform",
+      "cli": [
+        "conform"
+      ],
+      "refuse": {
+        "error": "exit 2",
+        "diag": "give one local Parquet path"
+      }
+    },
+    {
+      "id": "f5m:extra-conform",
+      "cli": [
+        "conform",
+        "{path}",
+        "{path}"
+      ],
+      "refuse": {
+        "error": "exit 2",
+        "diag": "use one local path"
+      }
+    },
+    {
+      "id": "f5m:invalid-copy",
+      "cli": [
+        "query",
+        "{fixture:bad_dict}",
+        "-o",
+        "{out}"
+      ],
+      "refuse": {
+        "error": "exit 1",
+        "diag": "truncated or too short"
+      }
+    }
+  ]
+}

@@ -6,7 +6,7 @@ _zpq() {
     --codec) COMPREPLY=($(compgen -W 'snappy zstd gzip lz4 lz4_raw uncompressed' -- "$cur")); return ;;
   esac
   if [[ "$cur" == -* || $COMP_CWORD == 1 ]]; then
-    COMPREPLY=($(compgen -W 'conform help inspect query schema version --aggregate --bloom-filter --cache --codec --column-order --columns --compress-priority --detail --explain --fast-levels --filter --format --fsync --group-by --help --limit --max-memory --no-bloom-filters --no-fsync --output --profile --profile-summary --query --row-group-bytes --row-group-size --scan-all --select --summary=json --threads --trust-stats --unordered --version -V -a -c -f -g -h -j -o -s' -- "$cur"))
+    COMPREPLY=($(compgen -W 'conform help inspect query schema version --aggregate --bloom-filter --cache --codec --column-order --columns --compress-priority --detail --explain --fast-levels --filter --format --fsync --group-by --help --limit --max-memory --no-bloom-filters --no-fsync --output --profile --profile-summary --query --row-group-bytes --row-group-size --scan-all --select --summary=json --threads --trust-stats --unordered --version -V -a -c -f -g -h -j -o -q -s' -- "$cur"))
   else
     COMPREPLY=(); while IFS= read -r item; do COMPREPLY+=("$item"); done < <(compgen -f -- "$cur")
   fi

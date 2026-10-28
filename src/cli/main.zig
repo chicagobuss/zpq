@@ -52,10 +52,10 @@ fn wantsJsonSummary(args: std.process.Args) bool {
         if (std.mem.eql(u8, a, "--summary=json")) return true;
         // Values are opaque, even when their text happens to spell a flag.
         const values = [_][]const u8{
-            "--output",          "-o",       "--filter", "-f",         "--columns",      "-c",                  "--select",  "-s",
-            "--aggregate",       "-a",       "--query",  "-q",         "--codec",        "--compress-priority", "--threads", "-j",
-            "--bloom-filter",    "--format", "--limit",  "--group-by", "--column-order", "--max-memory",        "--profile", "--row-group-size",
-            "--row-group-bytes",
+            "--output",         "-o",                "--filter", "-f",      "--columns",  "-c",                  "--select",     "-s",
+            "--aggregate",      "-a",                "--query",  "-q",      "--codec",    "--compress-priority", "--threads",    "-j",
+            "-g",               "--bloom-filter",    "--format", "--limit", "--group-by", "--column-order",      "--max-memory", "--profile",
+            "--row-group-size", "--row-group-bytes",
         };
         for (values) |flag| if (std.mem.eql(u8, a, flag)) {
             _ = it.next();
@@ -93,7 +93,15 @@ fn emitError(err: anyerror) !void {
     try w.flush();
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    runMain(init) catch |err| {
+        if (err == error.BrokenPipe) std.process.exit(141);
+        std.debug.print("zpq: {s}\n", .{zpq.frontend.failureMessage(err)});
+        std.process.exit(1);
+    };
+}
+
+fn runMain(init: std.process.Init) !void {
     zpq.cpu_level.require();
     const gpa = zpq.core.memory.processAllocator(init.gpa);
     local_fs.raiseOpenFileLimit();
@@ -141,16 +149,31 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, cmd, "conform")) {
         const path = iter.next() orelse {
-            diagnosticPrint("conform: missing path\n", .{});
-            std.process.exit(1);
+            diagnosticPrint("zpq conform: give one local Parquet path; see `zpq --help`\n", .{});
+            std.process.exit(2);
         };
-        try runConform(gpa, path);
+        if (std.mem.eql(u8, path, "--help") or std.mem.eql(u8, path, "-h")) {
+            var ws: StdoutWriter = .{};
+            try ws.writeAll(usage_text);
+            try ws.flush();
+            return;
+        }
+        if (iter.next() != null or std.mem.startsWith(u8, path, "-")) {
+            diagnosticPrint("zpq conform: use one local path; see `zpq --help`\n", .{});
+            std.process.exit(2);
+        }
+        if (!try runConform(gpa, path)) std.process.exit(1);
         return;
     }
     if (std.mem.eql(u8, cmd, "inspect")) {
         runInspect(init, &iter) catch |err| {
             if (err == error.BrokenPipe) std.process.exit(141);
-            diagnosticPrint("zpq inspect: {s}; use `zpq --help` for usage\n", .{@errorName(err)});
+            if (err != error.InspectionFailed and err != error.BadArgs) {
+                diagnosticPrint("zpq inspect: {s}\n", .{if (err == error.NoInputs)
+                    "give one or more Parquet paths; see `zpq --help`"
+                else
+                    zpq.frontend.failureMessage(err)});
+            }
             std.process.exit(if (err == error.BadArgs or err == error.NoInputs) @as(u8, 2) else @as(u8, 1));
         };
         return;
@@ -173,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
         try runSchema(init, path);
         return;
     }
-    diagnosticPrint("unknown subcommand: {s}\n", .{cmd});
+    diagnosticPrint("unknown subcommand: {s}; use `zpq --help` for commands\n", .{cmd});
     std.process.exit(2);
 }
 
@@ -351,7 +374,7 @@ fn runQuery(
                 diagnosticPrint("zpq query: invalid limit value: {s}\n", .{v});
                 return error.BadArgs;
             };
-        } else if (std.mem.eql(u8, tok, "--group-by")) {
+        } else if (std.mem.eql(u8, tok, "--group-by") or std.mem.eql(u8, tok, "-g")) {
             group_by = iter.next() orelse {
                 diagnosticPrint("zpq query: --group-by requires a value\n", .{});
                 return error.BadArgs;
@@ -871,10 +894,10 @@ const expandGlob = zpq.frontend.expandGlob;
 /// we saw — schema leaves, row count, and a per-column-chunk decode
 /// status (ok/error). Output goes to stdout. Caller (Python harness)
 /// compares against pyarrow.
-fn runConform(gpa: std.mem.Allocator, path: []const u8) !void {
+fn runConform(gpa: std.mem.Allocator, path: []const u8) !bool {
     const file_bytes = readFile(gpa, path) catch |err| {
-        try jsonFatal(gpa, "open_failed", @errorName(err));
-        return;
+        try jsonFatal(gpa, "open_failed", err);
+        return false;
     };
     defer gpa.free(file_bytes);
 
@@ -883,8 +906,8 @@ fn runConform(gpa: std.mem.Allocator, path: []const u8) !void {
     const arena = arena_state.allocator();
 
     const meta = metadata.open(arena, file_bytes) catch |err| {
-        try jsonFatal(gpa, "metadata_open_failed", @errorName(err));
-        return;
+        try jsonFatal(gpa, "metadata_open_failed", err);
+        return false;
     };
 
     var w: StdoutWriter = .{};
@@ -951,6 +974,8 @@ fn runConform(gpa: std.mem.Allocator, path: []const u8) !void {
         }
     }
     try w.writeAll("]}\n");
+    try w.flush();
+    return true;
 }
 
 fn tryDecodeColumn(
@@ -1010,14 +1035,16 @@ fn decodeOne(
     return "ok";
 }
 
-fn jsonFatal(gpa: std.mem.Allocator, kind: []const u8, reason: []const u8) !void {
+fn jsonFatal(gpa: std.mem.Allocator, kind: []const u8, err: anyerror) !void {
     var w: StdoutWriter = .{};
     defer w.flush() catch {};
     _ = gpa;
     try w.writeAll("{\"error\":\"");
     try writeJsonString(&w, kind);
     try w.writeAll("\",\"reason\":\"");
-    try writeJsonString(&w, reason);
+    try writeJsonString(&w, @errorName(err));
+    try w.writeAll("\",\"message\":\"");
+    try writeJsonString(&w, zpq.frontend.failureMessage(err));
     try w.writeAll("\"}\n");
 }
 
@@ -1135,18 +1162,18 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
             .env = init.minimal.environ,
             .io = init.io,
         }, path, arena) catch |err| {
-            diagnosticPrint("zpq schema: failed to fetch S3 schema for {s}: {s}\n", .{ path, @errorName(err) });
+            diagnosticPrint("zpq schema: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
             std.process.exit(1);
         };
     } else {
-        const bytes = readFile(gpa, path) catch |err| {
-            diagnosticPrint("zpq schema: failed to open input file {s}: {s}\n", .{ path, @errorName(err) });
+        const bytes = local_fs.readFile(gpa, path) catch |err| {
+            diagnosticPrint("zpq schema: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
             std.process.exit(1);
         };
         file_bytes = bytes;
 
         meta = metadata.open(arena, bytes) catch |err| {
-            diagnosticPrint("zpq schema: input file {s} is not a valid Parquet file ({s})\n", .{ path, @errorName(err) });
+            diagnosticPrint("zpq schema: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
             std.process.exit(1);
         };
     }
@@ -1164,7 +1191,7 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
     try ws.print("rows: {d}, row_groups: {d}, codec: {s}\n", .{ meta.num_rows, meta.row_groups.items.len, codec_name });
 
     const tree = schema_tree.SchemaTree.build(arena, meta.schema.items) catch |err| {
-        diagnosticPrint("zpq schema: schema tree build failed: {s}\n", .{@errorName(err)});
+        diagnosticPrint("zpq schema: {s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
         std.process.exit(1);
     };
 
@@ -1177,6 +1204,7 @@ fn runSchema(init: std.process.Init, path: []const u8) !void {
         try printLogicalOrConverted(&ws, leaf);
         try ws.writeAll("\n");
     }
+    try ws.flush();
 }
 
 fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
@@ -1188,7 +1216,10 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
     var detail = false;
     while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--format")) {
-            if (!std.mem.eql(u8, iter.next() orelse return error.BadArgs, "json")) return error.BadArgs;
+            if (!std.mem.eql(u8, iter.next() orelse "", "json")) {
+                diagnosticPrint("zpq inspect: --format requires json; omit it for text\n", .{});
+                return error.BadArgs;
+            }
             json = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             var help: StdoutWriter = .{};
@@ -1198,6 +1229,7 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
         } else if (std.mem.eql(u8, arg, "--detail")) {
             detail = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
+            diagnosticPrint("zpq inspect: unrecognized option: {s}; see `zpq --help`\n", .{arg});
             return error.BadArgs;
         } else {
             const expanded = try expandGlob(arena, init.io, arg, init.minimal.environ);
@@ -1223,8 +1255,9 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
                     .path = path,
                     .status = "error",
                     .cause = @errorName(err),
+                    .message = zpq.frontend.failureMessage(err),
                 }, .{}));
-            } else try ws.print("{s}: {s} (check the path, credentials or Parquet footer)\n", .{ path, @errorName(err) });
+            } else try ws.print("{s}: {s}\n", .{ path, zpq.frontend.failureMessage(err) });
             continue;
         };
         if (json) {

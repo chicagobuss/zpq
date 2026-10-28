@@ -77,18 +77,11 @@ zpq query '/tmp/nyc-taxi/*.parquet' --aggregate "count(*)"
 ```
 
 ```json
-{
-  "ok": true,
-  "files_in": 24,
-  "rows_in": 79479946,
-  "agg": {"count": 79479946},
-  "total_ms": 2,
-  "phase": {"decode_ms": 0}
-}
+{"count":79479946}
 ```
 
-`decode_ms: 0`. The footer says how many rows are in each row group;
-zpq adds them up. Real wall time including process spawn is ~6 ms.
+The footer says how many rows are in each row group; zpq adds them up without decoding pages.
+The answer alone is on stdout. Add `--summary=json` for timings and input counters on stderr.
 
 ### Full decode aggregate
 
@@ -98,21 +91,11 @@ zpq query '/tmp/nyc-taxi/*.parquet' \
 ```
 
 ```json
-{
-  "ok": true,
-  "files_in": 24,
-  "rows_in": 79479946,
-  "bytes_in": 1328745331,
-  "agg": {
-    "count": 79479946,
-    "max_tip": 4174,
-    "total_fare": 1541180984.31
-  },
-  "total_ms": 254
-}
+{"count":79479946,"max_tip":4174,"total_fare":1541180984.3100002}
 ```
 
-The 69 row groups across the 24 files are shared out over one worker
+Floating-point sums can differ in their last digits between engines. The row groups across the 24 files
+are shared out over one worker
 per CPU (`-j` overrides). Each worker decodes value pages into its own
 accumulators; the main thread merges them at the end.
 

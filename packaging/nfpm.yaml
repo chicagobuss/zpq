@@ -130,6 +130,61 @@ contents:
     file_info:
       mode: 0644
     packager: rpm
+  - src: share/doc/zpq/writer-statistics.md
+    dst: /usr/share/doc/zpq/writer-statistics.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/writer-statistics.md
+    dst: /usr/share/doc/zpq/writer-statistics.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/doc/zpq/decode-errors.md
+    dst: /usr/share/doc/zpq/decode-errors.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/decode-errors.md
+    dst: /usr/share/doc/zpq/decode-errors.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/doc/zpq/hardware-execution.md
+    dst: /usr/share/doc/zpq/hardware-execution.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/hardware-execution.md
+    dst: /usr/share/doc/zpq/hardware-execution.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/doc/zpq/execution_knobs.md
+    dst: /usr/share/doc/zpq/execution_knobs.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/execution_knobs.md
+    dst: /usr/share/doc/zpq/execution_knobs.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
+  - src: share/doc/zpq/byte_topk.md
+    dst: /usr/share/doc/zpq/byte_topk.md
+    file_info:
+      mode: 0644
+    packager: deb
+  - src: share/doc/zpq/byte_topk.md
+    dst: /usr/share/doc/zpq/byte_topk.md
+    type: doc
+    file_info:
+      mode: 0644
+    packager: rpm
   - src: LICENSE
     dst: /usr/share/doc/zpq/copyright
     file_info:

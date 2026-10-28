@@ -47,13 +47,24 @@ jobs:
             | tar -xz -C $HOME/zig-bin
           echo "$HOME/zig-bin" >> $GITHUB_PATH
 
+      # .deb and .rpm come from the Linux tarballs' own bytes (tools/package_release.py --packages).
+      - name: Install nfpm (pinned)
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          mkdir -p $HOME/nfpm-bin
+          curl -fsSLo nfpm.tar.gz https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz
+          echo "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750  nfpm.tar.gz" | sha256sum -c -
+          tar -xzf nfpm.tar.gz -C $HOME/nfpm-bin nfpm
+          echo "$HOME/nfpm-bin" >> $GITHUB_PATH
+
       # The build downloads the target's pinned BoringSSL prebuilts and
       # checks them against vendor/boring_tls/prebuilt.sha256.
       # The tag must name build.zig.zon's version; a suffix (v0.5.0-rc2) is built into --version and release.json.
       - name: Build and package CLI with revision and TLS provenance
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
-        run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist --tag "$TAG"
+          PACKAGES: ${{ endsWith(matrix.target, '-linux-musl') && '--packages' || '' }}
+        run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist --tag "$TAG" $PACKAGES
 
       # x86_64 Linux ships two archives: x86-64-v3 (the default, checked at startup) and -compat (baseline CPU).
       - name: Run the compat archive's binary
@@ -68,6 +79,8 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             dist/*.tar.gz*
+            dist/*.deb*
+            dist/*.rpm*
             dist/release.json
 
       - name: Prepare shipped native smoke bundle
@@ -171,7 +184,8 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release/ \;
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.rpm" -o -name "*.sha256" \) \
+            -exec cp {} release/ \;
           python3 - <<'PY_MERGE'
           import json
           from pathlib import Path
@@ -189,6 +203,15 @@ jobs:
           python3 tools/homebrew_formula.py release/release.json --out release/zpq.rb \
             --base-url "https://github.com/chicagobuss/zpq/releases/download/${TAG}"
           ls -la release/
+          # The release body is the tag's CHANGELOG section, kept outside release/ so it isn't uploaded as an asset.
+          python3 - <<'PY_NOTES'
+          import os, re
+          version = os.environ["TAG"].removeprefix("v").split("-")[0]  # v0.5.0-rc3 uses the 0.5.0 section
+          text = open("CHANGELOG.md").read()
+          m = re.search(r"^## " + re.escape(version) + r"\b.*?\n(.*?)(?=^## )", text, re.S | re.M)
+          assert m, f"CHANGELOG.md has no section for {version}"
+          open("RELEASE_NOTES.md", "w").write(m.group(1).strip() + "\n")
+          PY_NOTES
 
       - name: Upload to R2 (public)
         env:
@@ -209,5 +232,5 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: release/*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true

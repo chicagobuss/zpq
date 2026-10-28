@@ -144,7 +144,9 @@ def main():
             if version_output != f"zpq {version} ({revision})\n":
                 raise SystemExit(f"binary --version {version_output.strip()!r} differs from manifest {version}")
         files = {"bin/zpq": binary, **SHARED_FILES}
-        name = f"zpq-{version}-{revision[:12]}-{target}{suffix}.tar.gz"
+        # No version or revision in the name, so .../releases/latest/download/<name> works for every release; both
+        # are in MANIFEST.json, release.json and `zpq --version`.
+        name = f"zpq-{target}{suffix}.tar.gz"
         artifact = out / name
         metadata = {**{k: v for k, v in manifest.items() if k != "artifacts"}, "target": target, "cpu": cpu,
                     "binary_sha256": sha(binary), "files": {name: sha(p) for name, p in files.items()}}

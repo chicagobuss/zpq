@@ -3,6 +3,7 @@ const testing = std.testing;
 const filter_eval = @import("../../filter/eval.zig");
 const SharedBudget = @import("../../memory.zig").SharedBudget;
 const DecSum = @import("types.zig").DecSum;
+const AggCall = @import("types.zig").AggCall;
 const GroupTable = @import("group_table.zig").GroupTable;
 const isRowNull = @import("keys.zig").isRowNull;
 const keyEql = @import("../../bytes.zig").keyEql;
@@ -1315,4 +1316,130 @@ fn distinctBitmapTrial(a: std.mem.Allocator) !void {
         }
         try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     }
+}
+test "round 4: detach clears an inline budget" {
+    const a = testing.allocator;
+    var budget = SharedBudget{ .limit = 4096, .block = 1 };
+    var acc = DistinctAcc.initEmpty(&budget);
+    defer acc.deinit(a);
+    try acc.insertU64(a, 1);
+    acc.detach();
+    // The count stays. A later spill must not draw on the budget this call just gave up.
+    try testing.expect(acc.budgetPtr() == null);
+    try testing.expectEqual(@as(usize, 1), acc.count());
+    try acc.insertU64(a, 2);
+    try acc.insertU64(a, 3);
+    try acc.insertU64(a, 4);
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "round 4: private table ceiling includes a spilled object" {
+    const a = testing.allocator;
+    const calls = [_]AggCall{
+        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "d", .result = .i64 },
+    };
+    for ([_]u8{ 0, 9 }) |stride| {
+        var t = GroupTable.init(a, 1 << 20);
+        t.fixed_stride = stride;
+        defer t.deinit();
+        var image: [9]u8 = @splat(0);
+        image[0] = 1;
+        const gid = if (stride == 0)
+            try t.getOrInsert("a", &calls, 0)
+        else
+            try t.getOrInsertFixed(&image, &calls, 0);
+        // Clamped after the group exists, so the spill itself has to see the live ceiling.
+        t.max_memory_bytes = t.allocated_bytes;
+        const slot = &t.accumulators.items[gid].distinct;
+        for (0..3) |v| try slot.insertU64(a, v);
+        try testing.expectError(error.ExceededMemoryBudget, slot.insertU64(a, 3));
+        try testing.expect(slot.heap() == null);
+        try testing.expectEqual(@as(usize, 3), slot.count());
+        try testing.expectEqual(t.max_memory_bytes, t.allocated_bytes);
+    }
+}
+
+test "round 4: a spilled object stays inside a private ceiling after the next insert" {
+    const a = testing.allocator;
+    const calls = [_]AggCall{
+        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "d", .result = .i64 },
+    };
+    for ([_]u8{ 0, 9 }) |stride| {
+        var t = GroupTable.init(a, 1 << 20);
+        t.fixed_stride = stride;
+        defer t.deinit();
+        var image: [9]u8 = @splat(0);
+        image[0] = 1;
+        const gid = if (stride == 0)
+            try t.getOrInsert("a", &calls, 0)
+        else
+            try t.getOrInsertFixed(&image, &calls, 0);
+        const before = t.allocated_bytes;
+        for (0..4) |v| try t.accumulators.items[gid].distinct.insertU64(a, v);
+        const set_credit = t.accumulators.items[gid].distinct.heap().?.max_memory_bytes;
+        try testing.expect(set_credit > 0);
+        try testing.expectEqual(before + @sizeOf(DistinctSet) + set_credit, t.allocated_bytes);
+        image[0] = 2;
+        _ = if (stride == 0)
+            try t.getOrInsert("b", &calls, 1)
+        else
+            try t.getOrInsertFixed(&image, &calls, 1);
+        try testing.expect(t.allocated_bytes >= before + @sizeOf(DistinctSet));
+        const held = t.allocated_bytes;
+        t.accumulators.items[gid].distinct.deinit(a);
+        try testing.expectEqual(held - @sizeOf(DistinctSet) - set_credit, t.allocated_bytes);
+    }
+}
+
+test "round 4: shared budget still owns the spilled object, not the table" {
+    const a = testing.allocator;
+    const calls = [_]AggCall{
+        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "d", .result = .i64 },
+    };
+    var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
+    for ([_]u8{ 0, 9 }) |stride| {
+        var t = GroupTable.init(a, 0);
+        t.fixed_stride = stride;
+        t.shared = &budget;
+        defer t.deinit();
+        var image: [9]u8 = @splat(0);
+        image[0] = 1;
+        const gid = if (stride == 0)
+            try t.getOrInsert("a", &calls, 0)
+        else
+            try t.getOrInsertFixed(&image, &calls, 0);
+        const table_before = t.allocated_bytes;
+        const used_before = budget.used.load(.monotonic);
+        for (0..4) |v| try t.accumulators.items[gid].distinct.insertU64(a, v);
+        try testing.expectEqual(table_before, t.allocated_bytes);
+        try testing.expect(budget.used.load(.monotonic) >= used_before + @sizeOf(DistinctSet));
+    }
+}
+
+test "round 4: owned merges preserve reservations on allocation failure" {
+    const Helper = struct {
+        fn run(a: std.mem.Allocator, dn: usize, sn: usize) !void {
+            var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
+            defer testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic)) catch
+                @panic("reservation leaked");
+            var src = DistinctAcc.initEmpty(&budget);
+            defer src.deinit(a);
+            var dst = DistinctAcc.initEmpty(&budget);
+            defer dst.deinit(a);
+            for (0..dn) |v| try dst.insertU64(a, v);
+            for (2..2 + sn) |v| try src.insertU64(a, v);
+            try dst.takeFrom(&src, a);
+            const overlap = if (dn > 2) @min(dn - 2, sn) else 0;
+            try testing.expectEqual(dn + sn - overlap, dst.count());
+            try testing.expectEqual(@as(usize, 0), src.count());
+            const reserved = if (dst.heap()) |d| d.max_memory_bytes else 0;
+            try testing.expectEqual(reserved, budget.used.load(.monotonic));
+        }
+    };
+    // A failed grow for a duplicate can legitimately return the existing hash-map entry.
+    for (0..8) |dn| for (0..8) |sn| for (0..16) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        Helper.run(failing.allocator(), dn, sn) catch |err| if (err != error.OutOfMemory) return err;
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    };
 }

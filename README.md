@@ -192,7 +192,11 @@ locally alike, so a scan larger than memory completes:
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
 
-It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default
+It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. In 0.5.0,
+hash-table growth and buffer replacement in a high-cardinality GROUP BY or `count(DISTINCT)` can also go past it, by up
+to about 2x near the limit; the answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq under a
+cgroup `memory.max` or `ulimit -v`. Scans, filters, printed rows, writes, S3 streaming and low- to
+medium-cardinality aggregation stay within the budget. Its default
 (`src/core/system.zig`) is three quarters of the memory size on Lambda; on Linux, 80% of available memory, but no more
 than three quarters of a cgroup v2 `memory.max`; on macOS, half of physical memory; and 512 MiB where none of these
 can be read. Give it as bytes, or as a number (fractions allowed) followed by `K`, `M`, `G` or `T`, with or without a

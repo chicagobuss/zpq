@@ -688,6 +688,11 @@ musl). It installs the binary, completions, man page and a test fixture. It is n
 
 ### Known limits
 
+- **`--max-memory` can be exceeded in high-cardinality GROUP BY and `count(DISTINCT)`.** Hash-table growth and buffer
+  replacement there can go past the budget by up to about 2x near the limit. The answer stays exact, or the query
+  refuses cleanly. For a hard ceiling, run zpq under a cgroup `memory.max` or `ulimit -v`. A fix is planned for 0.5.1.
+- **Near a `--max-memory` limit with several workers, the same query can answer or refuse.** Whether it answers or
+  refuses with `ExceededMemoryBudget` can depend on how row groups land on workers. It is never an incorrect answer.
 - **SQL shapes still refused:**
   - `coalesce` over BOOLEAN columns (`type mismatch in expression`, exit 1, after a CSV header);
   - `TRUE`/`FALSE` literals inside expressions, and comparisons as values (`SELECT x > 5`);

@@ -1,14 +1,10 @@
-# zpq task runner. Stay slim: only recipes that work against the current
-# source tree. Don't ship recipes that fail when invoked; they're noise in
-# `just --list`.
+# zpq task runner. Every recipe here must work on the current tree.
 
-# Ensure we use Zig 0.17.0 release. If it's not on the PATH but is installed
-# under ~/.zvm/0.17.0, add that directory to PATH.
+# Zig 0.17.0: prefer ~/.zvm/0.17.0 (where `just bootstrap` installs it) when present.
 export PATH := `[ -d ~/.zvm/0.17.0 ] && echo "$HOME/.zvm/0.17.0:$PATH" || echo "$PATH"`
 
-# Python for tooling (conformance / regression / smoke): zpq's in-project uv
-# .venv if present (it has pyarrow — system python3 is 3.14, no wheel), else
-# system python3. Set up with: uv venv --python 3.12 && uv pip install pyarrow
+# Python for the tooling: the project .venv if present, else python3. The fixtures stage creates .venv from
+# tools/check/requirements.txt on first use.
 python := `[ -x .venv/bin/python ] && echo .venv/bin/python || echo python3`
 
 # List available recipes
@@ -17,31 +13,26 @@ default:
 
 # === Build ===
 
-# Build (ReleaseFast) — produces zpq + zpq-lambda.
+# ReleaseFast zpq and zpq-lambda.
 build:
     zig build -Doptimize=ReleaseFast
 
-# Build with debug symbols.
+# Debug build.
 build-debug:
     zig build
 
-# Build the lean-core CLI — no SQL frontend (`-Dsql=false`), so liteparser
-# and its C dep are excluded. "Build the binary you want." The Lambda binary
-# never includes SQL regardless; this is the minimal *CLI*. CI builds this
-# variant too, so the lean path can't bit-rot.
+# The CLI without the SQL frontend (`-Dsql=false`, no liteparser). CI builds it so the lean path keeps working.
 build-minimal:
     zig build -Dsql=false -Doptimize=ReleaseFast cli
 
-# The shipped CLI as it ships (ReleaseFast, stripped) through the release cases; CI runs this on each native runner.
+# The CLI as it ships (ReleaseFast, stripped) through the release cases; CI runs it on each native runner.
 release-smoke:
     zig build -Doptimize=ReleaseFast -Dstrip=true --prefix zig-out/release cli
     zig build check-runner -Doptimize=ReleaseSafe
     zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq zig-out/release/bin/zpq --no-cache
 
-# The Lambda deploy zips (musl static, ReleaseFast) for both archs, built by
-# tools/serverless/aws.sh. ReleaseFast, not ReleaseSmall: on Lambda the small
-# build started no faster and ran up to 2x slower cold, and the ~10 MB zip is
-# far inside the 50 MB direct-upload limit.
+# Lambda deploy zips (static musl, ReleaseFast) for arm64 and x86_64. ReleaseSmall started no faster on Lambda
+# and ran up to 2x slower cold; the ~10 MB zip is well under the 50 MB upload limit.
 lambda-build:
     ./tools/serverless/aws.sh build arm64
     ./tools/serverless/aws.sh build x86_64
@@ -49,8 +40,7 @@ lambda-build:
 
 # === Setup ===
 
-# One-shot dev-env bootstrap on a fresh machine: install the pinned Zig
-# under ~/.zvm if it's missing, then warm the build.
+# Fresh Linux x86_64 machine: install Zig 0.17.0 under ~/.zvm if missing, then build once.
 bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -75,19 +65,23 @@ bootstrap:
 #   fleet   `just fleet`     the full tier's shards over the fleet (tools/check/fleet.sh), one verdict
 # Each stage leaves a log and a receipt in zig-out/receipts; a tier passes only on clean receipts for HEAD.
 
-# The unit tests in Debug. Pass a filter substring to narrow, e.g. `just test decimal`.
+# Unit tests in Debug; `just test decimal` narrows by substring.
 test *args="":
     zig build test --summary all -- {{args}}
 
+# Edit tier: core unit tests in ReleaseSafe; `just test-core decimal` narrows.
 test-core filter="":
     zig build check -Dtier=edit {{ if filter != "" { "-Dtest-filter=" + filter } else { "" } }}
 
+# Commit tier: run before every commit.
 check:
     zig build check -Dtier=commit
 
+# Full tier: run before a release.
 full:
     zig build check -Dtier=full
 
+# The architecture check (and with --full, the full tier) across the hosts in your fleet inventory.
 fleet *args:
     tools/check/fleet.sh {{args}}
 
@@ -95,7 +89,7 @@ fleet *args:
 fixtures:
     tools/check/fixtures.sh
 
-# Lambda integration tests — spawns the binary against an in-process fake.
+# Lambda integration tests: the binary against an in-process fake runtime.
 test-integration:
     zig build test-integration --summary all
 
@@ -109,47 +103,34 @@ libzpq:
 corpus:
     zig build check -Dtier=full -Dshard=corpus
 
-# Idle-gap work (no gate waits on it): the encoded/materialized A/B aggregate fuzz against the same binary, then
-# coverage-guided fuzzing. Commit any crasher as a fixture with a case.
+# Encoded-vs-materialized aggregate A/B fuzz (no gate runs it). Commit any crasher as a fixture with a case.
 idle seed="1234" queries="600":
     zig build -Doptimize=ReleaseSafe cli
     {{python}} tools/agg_ab_fuzz.py --zpq zig-out/bin/zpq --seed {{seed}} --queries {{queries}}
 
-# Coverage-guided fuzzing on the pinned Zig toolchain; the fuzz-lite seeds also run in `test`.
+# Coverage-guided fuzzing; the seed corpus also runs in `test`.
 fuzz filter="fuzz:":
     zig build fuzz -Dtest-filter={{filter}} --fuzz
 
 # === Lambda lifecycle ===
 
-# Deploy a Lambda function (function-name + arch). Loads .env for AWS creds.
+# Deploy `zpq-lambda` as function FN (arch arm64 or x86_64). AWS credentials come from .env.
 lambda-deploy fn arch="arm64":
     @./tools/serverless/aws.sh deploy {{fn}} zig-out/lambda/zpq-lambda-{{arch}}.zip {{arch}}
 
-# Invoke a Lambda function with a JSON payload.
+# Invoke function FN with a JSON payload.
 lambda-invoke fn payload="{}":
     @./tools/serverless/aws.sh invoke {{fn}} '{{payload}}'
 
-# Tail the most recent CloudWatch log stream for a function.
+# Show the latest CloudWatch log stream for function FN.
 lambda-logs fn:
     @./tools/serverless/aws.sh logs {{fn}}
 
 # === Profiling ===
 
-# Record a perf trace of `zpq <args>` and render a flamegraph SVG.
-# Open prof/flame-<ts>.svg in a browser to drill into hotspots.
-#
-# Args are forwarded to zpq verbatim with quoting preserved. Examples:
+# perf-record `zpq <args>` (frame-pointer stacks) and write prof/flame-<ts>.svg. Needs perf and
+# references/FlameGraph. Aim for runs over 500 ms; loop or glob shorter ones. Example:
 #   just flamegraph query data/benchmark_100mb.parquet --aggregate 'sum(int64_sorted) AS s'
-#   just flamegraph query 's3://my-bucket/path/*.parquet' --filter 'cost > 100'
-#
-# Stack quality: build.zig sets `omit_frame_pointer = false` for both
-# zpq modules (regression suite shows zero measurable cost), so
-# `--call-graph=fp` walks frame pointers in O(1) instead of DWARF
-# unwinding. Cleaner stacks, lower record overhead. Sub-100ms runs
-# are still too short to sample usefully; aim for queries that take
-# >500ms (multi-RG aggregates, multi-file globs).
-#
-# Requires: perf + references/FlameGraph (cloned).
 [positional-arguments]
 flamegraph *args:
     #!/usr/bin/env bash
@@ -166,12 +147,8 @@ flamegraph *args:
         > "prof/flame-$ts.svg"
     echo "wrote prof/flame-$ts.svg ($(wc -c < prof/flame-$ts.svg) bytes)"
 
-# Stack-sample a long-running zpq via eBPF (no perf overhead, lower
-# kernel cost). Use this for queries that take >1s — for quick runs
-# `just flamegraph` is simpler. PID is auto-discovered from the
-# zpq process; pass --duration to control sample window.
-#
-# Requires: bpfcc-tools (profile-bpfcc) + sudo.
+# Sample a running zpq with eBPF for DURATION seconds (default 5) and write prof/flame-bpf-<ts>.svg. For runs over
+# a second; start zpq first. Needs bpfcc-tools (profile-bpfcc) and sudo.
 flamegraph-bpf duration="5":
     @mkdir -p prof
     @ts=$(date +%Y%m%d-%H%M%S); \
@@ -184,17 +161,16 @@ flamegraph-bpf duration="5":
 
 # === Maintenance ===
 
-# Wipe build outputs.
+# Remove build outputs.
 clean:
     rm -rf zig-out .zig-cache
 
-# Fill vendor/boring_tls/prebuilt/ with verified BoringSSL prebuilts so later
-# builds need no network (a normal build fetches them into .zig-cache itself).
+# Fetch the verified BoringSSL prebuilts into vendor/boring_tls/prebuilt/ for offline builds.
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
 
-# OS-level contracts (publication, permissions, pipes, S3 uploads, sync and write faults); full tier's `os` shard. The
-# loop-device and device-mapper contracts skip by name: on a dedicated host with passwordless sudo, add --privileged.
+# OS contracts (publication, permissions, pipes, S3 uploads, sync and write faults): the full tier's `os` shard.
+# Loop-device and device-mapper contracts skip unless run with --privileged on a host with passwordless sudo.
 contracts:
     zig build -Doptimize=ReleaseFast
     zig build libzpq -Doptimize=ReleaseFast

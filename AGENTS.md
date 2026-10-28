@@ -6,8 +6,8 @@ Instructions for coding agents working on zpq.
 
 - Grumpy elitism: skepticism over optimism, honesty over salesmanship. Critique our own work ruthlessly.
 - Taco bell programming: zpq is one small Unix tool that does one job well and pipes into the next. The job is
-  Parquet: query, filter, aggregate and rewrite it, locally or on S3, and emit NDJSON, CSV or Parquet. No joins (yet), no
-  dataframe API (yet).
+  Parquet: query, filter, aggregate and rewrite it, locally or on S3, and emit NDJSON, CSV or Parquet. No joins
+  (yet), no dataframe API (yet).
 
 ## Before you build something
 

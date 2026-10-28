@@ -9613,28 +9613,32 @@ pub const TypedAnswer = struct {
         out.* = .{ .rows = n, .columns = try gpa.alloc(TypedColumn, types.len) };
         // Each column is valid (empty) until allocated, so a failure leaves `deinit` something to free.
         for (out.columns) |*c| c.* = .{ .i64 = .{ .values = &.{}, .defs = &.{} } };
-        for (types, out.columns) |ty, *col| col.* = switch (ty.lane) {
-            .i64 => .{ .i64 = try lane(gpa, i64, n) },
-            .f64 => .{ .f64 = try lane(gpa, f64, n) },
-            .string => .{ .string = try lane(gpa, []const u8, n) },
-            .dec => .{ .dec = try lane(gpa, i128, n) },
-            .avg => blk: {
-                const sum = try lane(gpa, f64, n);
-                const count = gpa.alloc(i64, n) catch |e| {
-                    freeLane(gpa, f64, sum);
-                    return e;
-                };
-                break :blk .{ .avg = .{ .sum = sum, .count = count } };
-            },
-            .avg_dec => blk: {
-                const sum = try lane(gpa, i128, n);
-                const count = gpa.alloc(i64, n) catch |e| {
-                    freeLane(gpa, i128, sum);
-                    return e;
-                };
-                break :blk .{ .avg_dec = .{ .sum = sum, .count = count } };
-            },
-        };
+        for (types, out.columns) |ty, *col| {
+            // Do not publish the union tag until its fallible payload is complete: the caller may deinit on error.
+            const ready: TypedColumn = switch (ty.lane) {
+                .i64 => .{ .i64 = try lane(gpa, i64, n) },
+                .f64 => .{ .f64 = try lane(gpa, f64, n) },
+                .string => .{ .string = try lane(gpa, []const u8, n) },
+                .dec => .{ .dec = try lane(gpa, i128, n) },
+                .avg => blk: {
+                    const sum = try lane(gpa, f64, n);
+                    const count = gpa.alloc(i64, n) catch |e| {
+                        freeLane(gpa, f64, sum);
+                        return e;
+                    };
+                    break :blk .{ .avg = .{ .sum = sum, .count = count } };
+                },
+                .avg_dec => blk: {
+                    const sum = try lane(gpa, i128, n);
+                    const count = gpa.alloc(i64, n) catch |e| {
+                        freeLane(gpa, i128, sum);
+                        return e;
+                    };
+                    break :blk .{ .avg_dec = .{ .sum = sum, .count = count } };
+                },
+            };
+            col.* = ready;
+        }
         out.clearAll(n_workers);
     }
 
@@ -16704,6 +16708,32 @@ test "TypedAnswer.init: every cell NULL and zero at every -j, and when spawns fa
                 for (a.count) |c| try testing.expectEqual(@as(i64, 0), c);
             },
         };
+    }
+}
+
+test "TypedAnswer.init preserves empty column on lane allocation failure" {
+    const lanes = [_]@FieldType(GroupColType, "lane"){ .i64, .f64, .string, .dec, .avg, .avg_dec };
+    for (lanes) |lane_kind| {
+        const types = [_]GroupColType{
+            .{ .lane = .i64, .nullable = true },
+            .{ .lane = lane_kind, .nullable = true },
+        };
+        // The array and the first column consume three allocations. Fail each allocation of the second lane,
+        // including the count allocation for AVG, while the caller owns the partially initialized answer.
+        const lane_allocations: usize = if (lane_kind == .avg or lane_kind == .avg_dec) 3 else 2;
+        for (3..3 + lane_allocations) |fail_index| {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+            const a = failing.allocator();
+            var out: TypedAnswer = .{ .rows = 0, .columns = &.{} };
+            defer out.deinit(a);
+            try testing.expectError(error.OutOfMemory, TypedAnswer.init(a, &types, 3, &out, 1));
+            try testing.expect(failing.has_induced_failure);
+            try testing.expectEqual(@as(usize, 2), out.columns.len);
+            try testing.expect(out.columns[0] == .i64);
+            try testing.expect(out.columns[1] == .i64);
+            try testing.expectEqual(@as(usize, 0), out.columns[1].i64.values.len);
+            try testing.expectEqual(@as(usize, 0), out.columns[1].i64.defs.len);
+        }
     }
 }
 

@@ -228,22 +228,26 @@ def a_file_size_limit_fails_the_write_at_every_point(root, clean, corrupt, disti
                           mode=0o640)
 
 
+def library_size_limit_child(lib, clean, dst):
+    # forkserver/spawn imports this module afresh: pass the library path instead of inheriting a loaded binding.
+    global LIB
+    LIB = lib
+    zpq = library()
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (10000, 10000))
+    with zpq.Zpq() as z:
+        try:
+            z.run({"inputs": [str(clean)], "output_url": str(dst), "output_codec": "uncompressed"})
+        except zpq.ZpqError as e:
+            sys.exit(0 if e.response.get("reason") == "WriteFailed" else 3)
+        sys.exit(2)
+
+
 @contract
 def library_keeps_no_partial_file_under_a_size_limit(root, clean, corrupt, distinct, small):
     zpq = library()
     dst = root / "lib.parquet"
-
-    def child():
-        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (10000, 10000))
-        with zpq.Zpq() as z:
-            try:
-                z.run({"inputs": [str(clean)], "output_url": str(dst), "output_codec": "uncompressed"})
-            except zpq.ZpqError as e:
-                sys.exit(0 if e.response.get("reason") == "WriteFailed" else 3)
-            sys.exit(2)
-
-    proc = multiprocessing.Process(target=child)
+    proc = multiprocessing.Process(target=library_size_limit_child, args=(LIB, clean, dst))
     proc.start()
     proc.join(timeout=20)
     assert proc.exitcode == 0 and not dst.exists(), proc.exitcode

@@ -15878,6 +15878,30 @@ test "GROUP BY hash merge: same groups, counts and string mins at every -j" {
     }
 }
 
+fn setMergeTestString(allocator: std.mem.Allocator, acc: *expr_agg.Accumulator, value: []const u8) !void {
+    // A union initializer writes its tag before evaluating the payload. Keep the arena variant valid on OOM.
+    const owned = try allocator.dupe(u8, value);
+    acc.* = .{ .min_bytes = owned };
+}
+
+test "hash merge of worker tables: owned-string setup preserves arena state on refusal" {
+    var arena: expr_agg.KeyArena = .{};
+    // A nonempty payload makes the old tag/payload mismatch visible without relying on allocator fill or layout.
+    var acc: expr_agg.Accumulator = .{ .min_arena = .{
+        .store = &arena,
+        .ref = 0xaaaaaaaa,
+        .key = 0xbbbbbbbb,
+        .skip = 5,
+    } };
+    const before = acc;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, setMergeTestString(failing.allocator(), &acc, "winner"));
+    try testing.expect(sameAccBits(before, acc));
+    try setMergeTestString(testing.allocator, &acc, "winner");
+    defer freeOwnedAccumulatorStrings(testing.allocator, (&acc)[0..1]);
+    try testing.expectEqualStrings("winner", acc.min_bytes.?);
+}
+
 fn mergeOverlapAndFree(allocator: std.mem.Allocator) !void {
     const calls = [_]expr_agg.AggCall{
         .{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null },
@@ -15889,16 +15913,16 @@ fn mergeOverlapAndFree(allocator: std.mem.Allocator) !void {
     defer b.deinit();
     _ = try a.getOrInsert("alpha", &calls, 10);
     a.accumulators.items[0].count = 2;
-    a.accumulators.items[1] = .{ .min_bytes = try allocator.dupe(u8, "mango") };
+    try setMergeTestString(allocator, &a.accumulators.items[1], "mango");
     _ = try a.getOrInsert("beta", &calls, 40);
     a.accumulators.items[2].count = 1;
-    a.accumulators.items[3] = .{ .min_bytes = try allocator.dupe(u8, "pear") };
+    try setMergeTestString(allocator, &a.accumulators.items[3], "pear");
     _ = try b.getOrInsert("alpha", &calls, 3);
     b.accumulators.items[0].count = 5;
-    b.accumulators.items[1] = .{ .min_bytes = try allocator.dupe(u8, "apple") };
+    try setMergeTestString(allocator, &b.accumulators.items[1], "apple");
     _ = try b.getOrInsert("gamma", &calls, 20);
     b.accumulators.items[2].count = 7;
-    b.accumulators.items[3] = .{ .min_bytes = try allocator.dupe(u8, "fig") };
+    try setMergeTestString(allocator, &b.accumulators.items[3], "fig");
 
     const tables = [_]expr_agg.GroupTable{ a, b };
     const refs = [_]MergeGroupRef{
@@ -16553,7 +16577,8 @@ const RowFixture = struct {
             keys[i][0] = 1;
             std.mem.writeInt(u32, keys[i][1..5], @intCast(name.len), .little);
             @memcpy(keys[i][5..], name);
-            accs[i * calls.len + 1] = .{ .min_bytes = try std.fmt.allocPrint(gpa, "m{d}", .{i}) };
+            const min = try std.fmt.allocPrint(gpa, "m{d}", .{i});
+            accs[i * calls.len + 1] = .{ .min_bytes = min };
             slots[i] = .{ .key = keys[i], .first = i, .idx = i };
         }
         return f;
@@ -19142,7 +19167,7 @@ test "result cut SUM: complete signed ranks, NULLs, ties, offsets and owned payl
                 t.accumulators.items[id * 2].sum_i = if (g == 39)
                     null
                 else if (ti == 0) 1000 else @as(i128, @intCast(g % 9)) - 1004;
-                t.accumulators.items[id * 2 + 1] = .{ .min_bytes = try gpa.dupe(u8, if (ti == 0) "z" else "a") };
+                try setMergeTestString(gpa, &t.accumulators.items[id * 2 + 1], if (ti == 0) "z" else "a");
                 try refs.append(gpa, .{ .table = @intCast(ti), .group = id });
             };
             var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -25854,7 +25879,7 @@ test "M1 finish partitions full and top-H states including preparation cleanup t
             const id = try t.getOrInsert(bytes, &calls, i * 5 + 2 - ti);
             const at = @as(usize, id) * calls.len;
             t.accumulators.items[at] = .{ .count = i % 7 + 1 };
-            t.accumulators.items[at + 1] = .{ .min_bytes = try a.dupe(u8, if (ti == 1) "best" else "other") };
+            try setMergeTestString(a, &t.accumulators.items[at + 1], if (ti == 1) "best" else "other");
         };
         const refs = try a.alloc(MergeGroupRef, n * tables.len);
         defer a.free(refs);

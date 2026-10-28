@@ -1,6 +1,6 @@
 """The fleet's builder probe (tools/check/fleet.sh): a host's state from the o11y feed.
 
-    fleet_load.py O11Y_JSON HOST TARGET_GB   prints "offline", "busy", or "idle N" (N target builds its free memory holds)
+    fleet_load.py O11Y_JSON HOST TARGET_GB   "offline", "busy", or "idle N" (N target builds its free memory holds)
     fleet_load.py --self-test
 
 A host the feed omits, or reports as anything but live, is offline; so is one whose load or memory fields are null,

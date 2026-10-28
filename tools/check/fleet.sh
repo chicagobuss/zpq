@@ -63,8 +63,9 @@ compile_gb=10
 target_gb=$((compile_gb * $(wc -w <<< "$steps")))
 # Liveness and load from the o11y feed; a builder must be idle (live, half its cores free, a quarter of its memory).
 curl -s -m 10 "$o11y" > "$W/o11y.json" || echo '{"hosts": []}' > "$W/o11y.json"
-"$py" tools/check/fleet_load.py --self-test >/dev/null || { echo "fleet: the builder probe fails its self-test" >&2; exit 2; }
-load() {  # host: "offline", "busy", or "idle N" with N the target builds its free memory holds (tools/check/fleet_load.py)
+"$py" tools/check/fleet_load.py --self-test >/dev/null ||
+  { echo "fleet: the builder probe fails its self-test" >&2; exit 2; }
+load() {  # host: "offline", "busy", or "idle N", N the target builds its free memory holds (tools/check/fleet_load.py)
   "$py" tools/check/fleet_load.py "$W/o11y.json" "${O11Y_NAME[$1]:-$1}" "$target_gb"
 }
 probe() {  # host: why it must not be used, or nothing

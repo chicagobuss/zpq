@@ -1,0 +1,175 @@
+{
+  "schema": 1,
+  "harness_revision": "2d8b10997e80d71f489e608ccdcbdcaf7d04a5e4",
+  "cases": [
+    {
+      "id": "card100k.q02_topc_w30",
+      "file": "card100k.parquet",
+      "sql": "SELECT k, count(*) AS c FROM {T} WHERE f < 300 GROUP BY k ORDER BY c DESC LIMIT 10",
+      "kind": "top",
+      "keys": [
+        "k"
+      ],
+      "output": "rows",
+      "codec": "snappy",
+      "source": "study_queries.py:q02_topc_w30"
+    },
+    {
+      "id": "card100k.q07_cd_x",
+      "file": "card100k.parquet",
+      "sql": "SELECT count(DISTINCT x) AS d FROM {T}",
+      "kind": "one",
+      "keys": [
+        "k"
+      ],
+      "output": "rows",
+      "codec": "snappy",
+      "source": "study_queries.py:q07_cd_x"
+    },
+    {
+      "id": "card100k.q09_grp_cd",
+      "file": "card100k.parquet",
+      "sql": "SELECT k, count(DISTINCT x) AS d FROM {T} GROUP BY k ORDER BY d DESC LIMIT 10",
+      "kind": "top",
+      "keys": [
+        "k"
+      ],
+      "output": "rows",
+      "codec": "snappy",
+      "source": "study_queries.py:q09_grp_cd"
+    },
+    {
+      "id": "card100k.q13_point",
+      "file": "card100k.parquet",
+      "sql": "SELECT count(*) AS c, sum(v) AS s FROM {T} WHERE k = 95328840299087",
+      "kind": "one",
+      "keys": [
+        "k"
+      ],
+      "output": "rows",
+      "codec": "snappy",
+      "source": "study_queries.py:q13_point"
+    },
+    {
+      "id": "lstr100k.q01_topc",
+      "file": "lstr100k.parquet",
+      "sql": "SELECT k, count(*) AS c FROM {T} GROUP BY k ORDER BY c DESC LIMIT 10",
+      "kind": "top",
+      "keys": [
+        "k"
+      ],
+      "output": "rows",
+      "codec": "snappy",
+      "source": "study_queries.py:q01_topc"
+    },
+    {
+      "id": "lstr100k.q06_grp_full",
+      "file": "lstr100k.parquet",
+      "sql": "SELECT k, count(*) AS c, sum(v) AS s FROM {T} GROUP BY k",
+      "kind": "full",
+      "keys": [
+        "k"
+      ],
+      "output": "parquet",
+      "codec": "snappy",
+      "source": "study_queries.py:q06_grp_full"
+    },
+    {
+      "id": "comp100k.q15_comp_kf",
+      "file": "comp100k.parquet",
+      "sql": "SELECT a, b, f, count(*) AS c FROM {T} GROUP BY a, b, f ORDER BY c DESC LIMIT 10",
+      "kind": "top",
+      "keys": [
+        "a",
+        "b",
+        "f"
+      ],
+      "output": "rows",
+      "codec": "snappy",
+      "source": "study_queries.py:q15_comp_kf"
+    },
+    {
+      "id": "comp100k.q06_grp_full",
+      "file": "comp100k.parquet",
+      "sql": "SELECT a, b, count(*) AS c, sum(v) AS s FROM {T} GROUP BY a, b",
+      "kind": "full",
+      "keys": [
+        "a",
+        "b"
+      ],
+      "output": "parquet",
+      "codec": "snappy",
+      "source": "study_queries.py:q06_grp_full"
+    },
+    {
+      "id": "pdsh.q1",
+      "file": "lineitem.parquet",
+      "sql": "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty,\n          sum(l_extendedprice) as sum_base_price,\n          sum(l_extendedprice * (1 - l_discount)) as sum_disc_price,\n          sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge,\n          avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price,\n          avg(l_discount) as avg_disc, count(*) as count_order\n          from {T} where l_shipdate <= '1998-09-02'\n          group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus",
+      "kind": "full",
+      "output": "rows",
+      "pdsh": "1",
+      "source": "local.py:pdsh_cases",
+      "tolerance": 0.0001
+    },
+    {
+      "id": "pdsh.q6",
+      "file": "lineitem.parquet",
+      "sql": "SELECT sum(l_extendedprice * l_discount) AS revenue FROM {T} WHERE l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24",
+      "kind": "one",
+      "output": "rows",
+      "pdsh": "6",
+      "source": "local.py:pdsh_cases",
+      "tolerance": 0.0001
+    },
+    {
+      "id": "reads.LS4_keyrange",
+      "file": "lineitem.parquet",
+      "sql": "SELECT count(*) AS \"a0\", sum(\"l_extendedprice\") AS \"a1\" FROM {T} WHERE \"l_orderkey\" < 600000",
+      "kind": "one",
+      "output": "rows",
+      "source": "read_shapes.py:LS4_keyrange"
+    },
+    {
+      "id": "writes.WL1_rewrite_zstd",
+      "file": "lineitem.parquet",
+      "sql": "SELECT * FROM {T}",
+      "kind": "full",
+      "output": "parquet",
+      "codec": "zstd",
+      "source": "local.py:writes",
+      "zpq_args": []
+    },
+    {
+      "id": "writes.WL2_q6_rewrite",
+      "file": "lineitem.parquet",
+      "sql": "SELECT * FROM {T} WHERE \"l_shipdate\" >= DATE '1994-01-01' AND \"l_shipdate\" < DATE '1995-01-01' AND \"l_discount\" >= 0.05 AND \"l_discount\" <= 0.07 AND \"l_quantity\" < 24",
+      "kind": "full",
+      "output": "parquet",
+      "codec": "zstd",
+      "source": "local.py:writes",
+      "zpq_args": [
+        "--filter",
+        "l_shipdate >= '1994-01-01' AND l_shipdate < '1995-01-01' AND l_discount >= 0.05 AND l_discount <= 0.07 AND l_quantity < 24"
+      ]
+    },
+    {
+      "id": "clickbench.q04",
+      "file": "clickbench.parquet",
+      "sql": "SELECT COUNT(DISTINCT UserID) FROM {T}",
+      "kind": "one",
+      "output": "rows",
+      "polars_expr": "hits.select(pl.col('UserID').n_unique()).collect().item()",
+      "source": "ClickBench/duckdb-parquet/queries.sql:5"
+    },
+    {
+      "id": "clickbench.q12",
+      "file": "clickbench.parquet",
+      "sql": "SELECT SearchPhrase, COUNT(*) AS c FROM {T} WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
+      "kind": "top",
+      "output": "rows",
+      "polars_expr": "hits.filter(pl.col('SearchPhrase') != '').group_by('SearchPhrase').agg(pl.len().alias('count')).sort('count', descending=True).head(10).collect()",
+      "source": "ClickBench/duckdb-parquet/queries.sql:13",
+      "blob_keys": true
+    }
+  ]
+}

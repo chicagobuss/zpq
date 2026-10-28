@@ -1,5 +1,143 @@
 # bench
 
+## Quick integration checks
+
+Use a same-host candidate/base mini-matrix for integration pushes, in idle gaps.
+The default budget is 90 seconds; **both builds share a hard maximum of 120 seconds per host**.
+A flagged cell gets a short targeted check. A full release matrix runs once, after content and
+architecture checks are settled, with release-owner approval; obtain approval before starting
+an estimate longer than an hour.
+
+~~~sh
+python -m bench quick --config /configured/fleet.json --host HOST \
+  --candidate /configured/bin/candidate --base /configured/bin/base \
+  --out /configured/results/new-run --budget-seconds 90
+~~~
+
+The command checks configured full source/binary hashes and matching target/CPU/optimization/
+strip/toolchain pins; it does not build engines. For remote HOST, the CLI binary paths identify
+local files to stage. Keep the inventory and host paths outside the repository:
+
+~~~json
+{
+  "data": "/configured/mini-inputs",
+  "manifest_sha256": "FULL_64_HEX_MANIFEST_DIGEST",
+  "budget_seconds": 90,
+  "reps": 3,
+  "noise_pct": 0,
+  "candidate": {
+    "path": "/configured/bin/candidate",
+    "sha": "FULL_40_HEX_SOURCE_SHA",
+    "sha256": "FULL_64_HEX_BINARY_DIGEST",
+    "target": "x86_64-linux-musl",
+    "cpu": "baseline",
+    "optimize": "ReleaseFast",
+    "strip": true,
+    "toolchain": "0.17.0"
+  },
+  "base": {
+    "path": "/configured/bin/base",
+    "sha": "FULL_40_HEX_BASE_SHA",
+    "sha256": "FULL_64_HEX_BASE_BINARY_DIGEST",
+    "target": "x86_64-linux-musl",
+    "cpu": "baseline",
+    "optimize": "ReleaseFast",
+    "strip": true,
+    "toolchain": "0.17.0"
+  },
+  "hosts": {
+    "HOST": {
+      "enabled": true,
+      "root": "/configured/quick-cache",
+      "lock": "/configured/shared-host-timing.lock",
+      "memory_max": "8G",
+      "nice": 10
+    }
+  }
+}
+~~~
+
+Replace the digest placeholders. Per-host candidate/base objects override top-level builds for
+other targets. Roots and the existing timing-lock parent must exist. Use the same lock as other
+benchmarks on that host. Output directories must be fresh. Linux uses a user systemd scope;
+optional cpus and threads apply to both engines. Linux idle admission defaults to at most 0.5
+busy cores plus counter-skew allowance. Native foreign CPU is also checked. On other platforms,
+configure idle_command as an argv array returning JSON with quiet: true. macOS keeps the fixed
+small-input policy and does not claim a systemd memory cap. No services are stopped.
+
+Prepare the existing 15-query, approximately 44 MiB catalog once:
+
+~~~sh
+bash bench/arch_prepare.sh --duckdb CLI --study STUDY --lineitem INPUT \
+  --clickbench INPUT --out /configured/mini-inputs
+~~~
+
+This preserves the original query definitions and pins every file's size and SHA-256.
+Small/prefix inputs have their own identities. The optional only list selects case IDs before
+admission; selected and unrequested catalog cases remain in the request. A sealed request-specific
+manifest can retain native zpq_args, environment, SQL, expected outcomes and source-input pins.
+
+SSH/rsync setup and collection are recorded separately from host execution. Input objects are
+keyed by full digest and hard-linked into manifest views; only absent objects transfer. Binaries
+use content-addressed paths. Existing incorrect bytes fail verification. Transfers take the same
+host lock so they cannot overlap another timing window. Remote evidence is retained for explicit
+cleanup decisions.
+
+The deadline starts before admission and covers input/binary verification, all answer checks,
+warming, optional rivals and timed work. The outer watchdog terminates only its own child sessions
+and retains an incomplete record. Teardown/collection cannot add query time. Hash agreement for
+all first answers precedes performance sampling. Processes are fresh; each hot sample reads its
+input first. The first pass has uncontrolled file cache; these quick checks do not claim verified
+OS-cold or mincore-certified residency. Build order alternates by repetition. Sampling ends on the
+fixed target or deadline, never on a favorable ratio. Partial pairs have no selected half or median.
+
+Written Parquet outputs need complete DuckDB value/multiplicity comparison and PyArrow readback
+inside the budget. Configure a duckdb object with path and sha256, and an existing pyarrow_python
+executable, globally or per host. JSON-only A/B uses the standard library; measured runs install
+no readers or packages. Existing validators can instead supply parquet_validators argv arrays
+keyed by duckdb and pyarrow; {output}, {input} and {sql} substitute individual arguments without
+a shell. Their exit status must represent full validation. Missing readers cannot yield green.
+
+Raw byte identity stays literal. A Parquet format change requires an explicit per-case
+parquet_byte_difference explanation and both value validators. Refusals use expected.all or
+per-engine expected native_exit, stdout_sha256, stderr_sha256 and outcome: refusal. Unexpected
+transitions fail. An engines: ["candidate"] case can compare retained outcomes without passing an
+unsupported budget flag to the base. Refusal latency has no speed ratio; candidate-only outcome
+coverage does not itself establish a performance merge gate.
+
+The optional reference path names another host's hashes.json. It binds source revisions, input
+manifest and query digests, then checks each build's exact output identity. Binary hashes remain
+target-specific. A first host establishes a reference and leaves other architectures unmeasured.
+No scheduler or fleet geometric mean is inferred.
+
+report.json uses zpq-bench-result/v1 with result_kind: quick-ab. request.json, cells.jsonl,
+immutable attempts.jsonl, final selection.json and hashes.json retain pins, exclusions and complete
+denominators. Medians need all fixed reps. Positive median changes are flagged by default; any
+noise_pct allowance is declared before execution and recorded, not inferred as significance.
+Exit 0 means the requested host work completed within that allowance, 2 means deferred/incomplete,
+and 3 means an answer failure or performance flag. Release disposition remains separate.
+
+The command python -m bench arch aliases the same A/B backend. The portable standalone arch.zig
+runner retains optional DuckDB 2.0.0 / Polars 2.0.0 checks and the corrected exact-number comparator.
+Set rivals: true with already provisioned arch_runner and duckdb path/SHA-256 objects; optional
+polars_python enables that retained adapter. This mode needs the full mini catalog and a baseline
+CPU/ReleaseFast/stripped build. It uses only time left after A/B, with missing rival reps incomplete.
+
+Named tooling checks:
+
+~~~sh
+python -m unittest bench.tests.test_quick bench.tests.test_export
+zig test bench/arch.zig -lc -O ReleaseSafe
+zig fmt --check bench/arch.zig
+bash -n bench/arch_prepare.sh bench/arch_remote.sh
+~~~
+
+The standalone runner cross-builds with zig build-exe, -lc, -O ReleaseSafe, -mcpu baseline and
+-target x86_64-linux-musl, aarch64-linux-musl or aarch64-macos. Configure build/test cache and
+temporary directories explicitly.
+
+## Full scorecard
+
 The scorecard: zpq against DuckDB 2.0 and Polars 2.0 on ClickBench, the study matrix, PDS-H, read shapes, writes and
 votes (`suites.py`, 464 cases), with the previous zpq build as a same-host control. Every answer is judged by
 `zpq-check compare`, the comparer the correctness gates use, against DuckDB 2.0; only judged answers are timed.

@@ -132,6 +132,9 @@ def show(run_dirs):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("quick", "arch"):
+        from bench import quick
+        sys.exit(quick.main(sys.argv[2:]))
     p = argparse.ArgumentParser(prog="bench", description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
     r = sub.add_parser("run")

@@ -13872,3 +13872,242 @@ test "M1 first-H finishes materialize only the original first keys at j1 and six
         } else expected = encoded;
     };
 }
+
+// Opt-in: ZPQ_OOM_SWEEP=1 zig build test-core -Doptimize=Debug -Dtest-filter="oom sweep".
+// The ordinary tiers run these declarations without the expensive allocation sweep.
+const OomSweep = struct {
+    const Case = enum { filtered, jsonl, csv, group1, group4, distinct, topk, decimal, parquet, strings, explain };
+    const input = "ci/fixtures/parquet/column_order.parquet";
+    const decimal_input = "ci/fixtures/parquet/decimal_exact.parquet";
+    const env_lines = [_:null]?[*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_DENSE=0" };
+    const env: std.process.Environ = .{ .block = .{ .slice = &env_lines } };
+
+    // FailingAllocator's counters are not atomic; the engine may call the supplied allocator on worker threads.
+    // Refusing resize/remap also keeps arena growth from depending on the backing allocator's placement.
+    const Locked = struct {
+        child: std.mem.Allocator,
+        lock: std.Io.Mutex = .init,
+        fn allocator(s: *Locked) std.mem.Allocator {
+            return .{ .ptr = s, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const s: *Locked = @ptrCast(@alignCast(ctx));
+            s.lock.lockUncancelable(std.testing.io);
+            defer s.lock.unlock(std.testing.io);
+            return s.child.rawAlloc(n, alignment, ra);
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const s: *Locked = @ptrCast(@alignCast(ctx));
+            s.lock.lockUncancelable(std.testing.io);
+            defer s.lock.unlock(std.testing.io);
+            s.child.rawFree(bytes, alignment, ra);
+        }
+    };
+
+    fn execute(a: std.mem.Allocator, case: Case, output: *std.Io.Writer, path: []const u8) !void {
+        const ctx: Context = .{ .gpa = a, .env = env, .io = std.testing.io };
+        var args: QueryArgs = .{ .inputs = &.{input}, .parallelism = 1, .cache = true };
+        switch (case) {
+            .filtered => {
+                args.aggregate = "count(*) AS n";
+                args.filter = "i > 2";
+            },
+            .jsonl, .csv => {
+                args.select = "s, i";
+                args.filter = "i > 2";
+                _ = try runPrintSink(ctx, args, if (case == .jsonl) .jsonl else .csv, null, 1, 0, output);
+                return;
+            },
+            .group1 => {
+                args.group_by = "s";
+                args.aggregate = "count(*) AS n, sum(i) AS total";
+            },
+            .group4 => {
+                const wide = "ci/fixtures/parquet/census_widefilter.parquet";
+                args.inputs = &.{ wide, wide, wide, wide };
+                args.group_by = "k";
+                args.aggregate = "sum(strlen(p)) AS total";
+                args.parallelism = 4;
+            },
+            .distinct => args.aggregate = "count(DISTINCT s) AS n",
+            .topk => {
+                args.group_by = "s";
+                args.aggregate = "sum(i) AS total";
+                args.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 };
+            },
+            .decimal => {
+                args.inputs = &.{decimal_input};
+                args.aggregate = "sum(d9) AS total, avg(d9) AS mean";
+            },
+            .parquet => {
+                args.output = path;
+                args.filter = "i > 2";
+                args.fsync = false;
+            },
+            .strings => {
+                args.inputs = &.{"ci/fixtures/parquet/full_match.parquet"};
+                args.group_by = "s";
+                args.aggregate = "count(*) AS n";
+            },
+            .explain => {
+                args.group_by = "s";
+                args.aggregate = "count(*) AS n";
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const explanation = try explainAggregate(ctx, arena.allocator(), args);
+                try writeAggregateExplanationJson(output, explanation);
+                return;
+            },
+        }
+        if (case != .parquet) args.text_output = .{ .format = .json, .sink = output };
+        var result = try runQuery(ctx, args);
+        defer result.deinit(a);
+        if (case == .parquet) {
+            const bytes = try local_fs.readFile(std.testing.allocator, path);
+            defer std.testing.allocator.free(bytes);
+            try output.writeAll(bytes);
+        }
+    }
+
+    fn checkBaseline(case: Case, bytes: []const u8) !void {
+        const expected: ?[]const u8 = switch (case) {
+            .filtered => "[{\"n\":4}]\n",
+            .jsonl => "{\"s\":\"c\",\"i\":3}\n{\"s\":\"x\",\"i\":101}\n{\"s\":\"Y\",\"i\":102}\n{\"s\":\"z\",\"i\":103}\n",
+            .csv => "s,i\nc,3\nx,101\nY,102\nz,103\n",
+            .distinct => "[{\"n\":6}]\n",
+            .topk => "[{\"s\":\"z\",\"total\":103},{\"s\":\"Y\",\"total\":102},{\"s\":\"x\",\"total\":101}]\n",
+            .decimal => "[{\"total\":-151.50,\"mean\":-0.505000}]\n",
+            else => null,
+        };
+        if (expected) |want| return std.testing.expectEqualStrings(want, bytes);
+        switch (case) {
+            .group1, .group4, .strings => {
+                const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+                defer parsed.deinit();
+                const rows: usize = switch (case) {
+                    .group1 => 6,
+                    .group4 => 12000,
+                    .strings => 1600,
+                    else => unreachable,
+                };
+                try std.testing.expectEqual(rows, parsed.value.array.items.len);
+            },
+            .parquet => {
+                try std.testing.expect(bytes.len >= 8);
+                try std.testing.expectEqualStrings("PAR1", bytes[0..4]);
+                try std.testing.expectEqualStrings("PAR1", bytes[bytes.len - 4 ..]);
+            },
+            .explain => {
+                const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("mmap", parsed.value.object.get("io").?.string);
+            },
+            else => unreachable,
+        }
+    }
+
+    fn sweep(case: Case) !void {
+        if (std.c.getenv("ZPQ_OOM_SWEEP") == null) return;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/answer.parquet", .{tmp.sub_path});
+        if (case == .group4) {
+            const wide = "ci/fixtures/parquet/census_widefilter.parquet";
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const explanation = try explainAggregate(.{ .gpa = std.testing.allocator, .env = env, .io = std.testing.io }, arena.allocator(), .{
+                .inputs = &.{ wide, wide, wide, wide },
+                .parallelism = 4,
+                .cache = true,
+                .group_by = "k",
+                .aggregate = "sum(strlen(p)) AS total",
+            });
+            try std.testing.expectEqual(@as(usize, 4), explanation.aggregate.workers);
+        }
+        var baseline: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer baseline.deinit();
+        var measuring = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var locked: Locked = .{ .child = measuring.allocator() };
+        try execute(locked.allocator(), case, &baseline.writer, path);
+        local_fs.removeFile(path);
+        try checkBaseline(case, baseline.written());
+        try std.testing.expectEqual(measuring.allocated_bytes, measuring.freed_bytes);
+        const total = measuring.alloc_index;
+        std.debug.print("oom sweep {s}: {d} allocations\n", .{ @tagName(case), total });
+        var unreached: usize = 0;
+        for (0..total) |i| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+            var guarded: Locked = .{ .child = failing.allocator() };
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            std.debug.print("oom sweep {s}: fail {d}/{d}\n", .{ @tagName(case), i, total });
+            const result = execute(guarded.allocator(), case, &out.writer, path);
+            if (result) |_| {
+                try std.testing.expectEqualStrings(baseline.written(), out.written());
+                if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
+                unreached += 1;
+            } else |_| {
+                if (!failing.has_induced_failure) return error.UnexpectedFailure;
+                if (case == .parquet) {
+                    if (std.Io.Dir.cwd().access(std.testing.io, path, .{})) |_| {
+                        return error.PartialParquetOutput;
+                    } else |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    }
+                } else if (!std.mem.startsWith(u8, baseline.written(), out.written())) {
+                    return error.IncorrectPartialOutput;
+                }
+            }
+            local_fs.removeFile(path);
+            if (failing.allocated_bytes != failing.freed_bytes) {
+                std.debug.print("oom sweep {s} fail {d}: allocated {d}, freed {d}\n", .{
+                    @tagName(case), i, failing.allocated_bytes, failing.freed_bytes,
+                });
+                return error.MemoryLeakDetected;
+            }
+        }
+        std.debug.print("oom sweep {s}: {d} points, {d} not reached\n", .{ @tagName(case), total, unreached });
+        if (unreached != 0) return error.NondeterministicMemoryUsage;
+    }
+};
+
+test "oom sweep filtered read" {
+    try OomSweep.sweep(.filtered);
+}
+test "oom sweep projection NDJSON" {
+    try OomSweep.sweep(.jsonl);
+}
+test "oom sweep projection CSV" {
+    try OomSweep.sweep(.csv);
+}
+test "oom sweep group one worker" {
+    try OomSweep.sweep(.group1);
+}
+test "oom sweep group four workers" {
+    try OomSweep.sweep(.group4);
+}
+test "oom sweep count distinct" {
+    try OomSweep.sweep(.distinct);
+}
+test "oom sweep top k" {
+    try OomSweep.sweep(.topk);
+}
+test "oom sweep decimal sum and average" {
+    try OomSweep.sweep(.decimal);
+}
+test "oom sweep parquet write" {
+    try OomSweep.sweep(.parquet);
+}
+test "oom sweep string groups" {
+    try OomSweep.sweep(.strings);
+}
+test "oom sweep explain" {
+    try OomSweep.sweep(.explain);
+}

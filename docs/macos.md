@@ -13,7 +13,7 @@ The binaries declare macOS 15.0 as their minimum (Zig 0.17's default).
 ## Checking on a Mac
 
 ```bash
-tools/check/fleet.sh --host granted-mbp          # or --release, which includes the Mac
+tools/check/fleet.sh --host MAC          # or --release, which includes hosts the inventory marks manual
 ```
 
 The fleet script cross-builds the `aarch64-macos` bundle on a Linux builder: `zpq-check` and the ReleaseFast `zpq`

@@ -106,15 +106,17 @@ bench`, `nested`) before anything runs. Contracts skip only by a named need (`--
 Every test root imports the `tests.gen.zig` build.zig writes beside it, listing the files under it that declare tests,
 so no test file goes unrooted.
 
-The architecture check is pipelined. Every target builds at once on its first two idle builders (by the fleet o11y
+The architecture check is pipelined over the hosts an inventory names (`ZPQ_FLEET`, default
+`~/.config/zpq/fleet.json`; `fleet.example.json` shows every key: hosts, each target's builders, the o11y feed and
+the timing locks). Every target builds at once on its first two idle builders (by the fleet o11y
 feed, and only as many builds as a builder's free memory holds), each from a warm cache under `~/.cache/zpq-fleet`
 with the pinned Zig at the same path everywhere (`fleet-build.sh`). The first bundle done is used; the two builds'
 symbol-stripped hashes are recorded (identical code and data, the reproducibility check), and a host still building
 a target another builder delivered stops to run its check. This host runs the x86_64 baseline bundle's answers, the
 reference, and makes the fixtures; then each host (`fleet-host.sh`) runs every case file answers-only in parallel
 (slowest first, as many at once as its memory cap allows), and `zpq-check manifest-diff` requires its answers to equal
-the reference's, case for case. Placement: granted-mbp runs only with `--host` or `--release`; a host in a timing
-window (its `zpq-HOST-*` units, a bench or timing unit, a held `/mnt/fast/zpq-out/timing.lock` or
+the reference's, case for case. Placement: a host marked `manual` runs only with `--host` or `--release`; a host in a
+timing window (its `zpq-HOST-*` units, a bench or timing unit, a held inventory timing lock or
 `~/.cache/zpq-bench.lock`, a running full gate) or offline is skipped and reported as skipped, never as failed.
 `zig-out/receipts/fleet.json` keeps the placement, phase times and hashes.
 

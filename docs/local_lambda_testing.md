@@ -83,8 +83,8 @@ Don't use for TDD — fake (#1) is much faster and integrates with `zig build`.
 
 ## 3. Native architecture checks
 
-`tools/check/fleet.sh --host oci-zt` cross-builds the ARM64 bundle (unit tests, runner, CLI), runs it natively on
-oci-zt with no remote compiler, and requires its answers to every case to equal this host's
+`tools/check/fleet.sh --host ARM_HOST` cross-builds the ARM64 bundle (unit tests, runner, CLI), runs it natively on
+that aarch64 Linux host with no remote compiler, and requires its answers to every case to equal this host's
 ([tools/check/README.md](../tools/check/README.md)). CI's ARM runner runs the shipped ARM64 CLI through the release
 cases and the shipped Lambda through the fake runtime.
 

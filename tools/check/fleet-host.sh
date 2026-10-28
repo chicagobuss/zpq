@@ -1,18 +1,20 @@
 #!/bin/sh
 # A fleet host's side of tools/check/fleet.sh (POSIX sh: Linux and macOS hosts).
 #
-#   fleet-host.sh timing HOST         why HOST must not be used now, or nothing
+#   fleet-host.sh timing HOST LOCK... why HOST must not be used now, or nothing
 #   fleet-host.sh check PAR NICE MEM  in a shipped check directory: every case file answers-only into out/
 set -u
 case $1 in
 timing)
+  host=$2
+  shift 2
   # A timing window: this host's own timing units (zpq-HOST-*), a bench or timing unit, a held timing lock, a full gate.
   if command -v systemctl >/dev/null; then
     systemctl --user list-units --state=active --no-legend --plain 'zpq-*' 2>/dev/null | while read -r unit _; do
-      case $unit in "zpq-$2-"*|zpq-bench*|zpq-timing*) echo "timing unit $unit"; break ;; esac
+      case $unit in "zpq-$host-"*|zpq-bench*|zpq-timing*) echo "timing unit $unit"; break ;; esac
     done
   fi
-  for lock in "$HOME/.cache/zpq-bench.lock" /mnt/fast/zpq-out/timing.lock; do
+  for lock in "$HOME/.cache/zpq-bench.lock" "$@"; do
     if [ -e "$lock" ] && command -v flock >/dev/null && ! flock -n "$lock" true; then echo "timing lock $lock"; fi
   done
   if pgrep -f '[v]erify.py full|[D]tier=full' >/dev/null; then echo "a full gate is running"; fi

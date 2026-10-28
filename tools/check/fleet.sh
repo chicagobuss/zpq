@@ -3,19 +3,21 @@
 #
 #   tools/check/fleet.sh [--host H]... [--release] [--full] [--inventory FILE]
 #
-# Every target builds at once on its first two idle builders (BUILDERS; idle by the fleet o11y feed), each from a
+# The inventory (ZPQ_FLEET, default ~/.config/zpq/fleet.json; tools/check/fleet.example.json shows every key) names
+# the hosts, each target's builders, the o11y feed and the timing locks. This repo names no machines.
+#
+# Every target builds at once on its first two idle builders (idle by the fleet o11y feed), each from a
 # warm Zig cache kept on that builder (tools/check/fleet-build.sh). The first bundle done is the one hosts get; the
 # two builds' hashes are recorded, a free reproducibility check. This host is the reference: it
 # runs the x86_64 baseline bundle's answers and makes the fixtures. Every other host starts the moment its target's
 # bundle and the fixtures exist, all hosts at once (tools/check/fleet-host.sh), and its answers manifest must equal
 # the reference's, case for case. A host in a timing window (its zpq-HOST-* units, a bench or timing unit, a held
-# timing lock, a running full gate) or offline is skipped and reported as skipped, never as failed. granted-mbp runs
-# only when named with --host or under --release. Receipts and fleet.json (placement, phase times, binary hashes)
-# land in zig-out/receipts.
+# timing lock, a running full gate) or offline is skipped and reported as skipped, never as failed. A host marked
+# "manual" runs only when named with --host or under --release. Receipts and fleet.json (placement, phase times,
+# binary hashes) land in zig-out/receipts.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-inventory=${ZPQ_FLEET:-/mnt/fast/zpq-out/arch-matrix/fleet.json}
-o11y=${ZPQ_FLEET_O11Y:-http://10.244.143.106:8788/v1/fleet}
+inventory=${ZPQ_FLEET:-${XDG_CONFIG_HOME:-$HOME/.config}/zpq/fleet.json}
 hosts=() release=0 full=0
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -40,17 +42,29 @@ t0=$(date +%s)
 trap 'jobs -p | xargs -r kill 2>/dev/null; pkill -P $$ 2>/dev/null || true' EXIT
 phase() { local t=$(($(date +%s) - t0)); echo "$t $*" >> "$W/phases"; echo "fleet: +${t}s $*"; }
 
-declare -A BUILDERS=([x86_64-linux-musl]="seriousbusiness $me granite" [aarch64-macos]="seriousbusiness $me"
-                     [aarch64-linux-musl]="oci-zt seriousbusiness $me")
-declare -A O11Y_NAME=([oci-zt]=oci-arm)
+[[ -r $inventory ]] ||
+  { echo "fleet: no inventory at $inventory (set ZPQ_FLEET; see tools/check/fleet.example.json)" >&2; exit 2; }
 field() {  # host key default: one inventory value
   "$py" -c 'import json, sys
 print(json.load(open(sys.argv[1]))["hosts"].get(sys.argv[2], {}).get(sys.argv[3], sys.argv[4]))' "$inventory" "$@"
 }
+top() {  # key default: a top-level inventory value, a list printed space-separated
+  "$py" -c 'import json, sys
+v = json.load(open(sys.argv[1])).get(sys.argv[2], sys.argv[3])
+print(" ".join(v) if isinstance(v, list) else v)' "$inventory" "$@"
+}
+o11y=${ZPQ_FLEET_O11Y:-$(top o11y "")}
+timing_locks=$(top timing_locks "")
+# Each target's builders, in preference order; this host is always the last resort.
+declare -A BUILDERS
+for t in x86_64-linux-musl aarch64-macos aarch64-linux-musl; do
+  BUILDERS[$t]="$("$py" -c 'import json, sys
+print(" ".join(json.load(open(sys.argv[1])).get("builders", {}).get(sys.argv[2], [])))' "$inventory" "$t") $me"
+done
 if [[ ${#hosts[@]} -eq 0 ]]; then
   mapfile -t hosts < <("$py" -c 'import json, sys
 for name, h in json.load(open(sys.argv[1]))["hosts"].items():
-    if h.get("enabled", True) and (sys.argv[2] == "1" or name != "granted-mbp"):
+    if h.get("enabled", True) and (sys.argv[2] == "1" or not h.get("manual", False)):
         print(name)' "$inventory" "$release")
 fi
 [[ " ${hosts[*]} " == *" $me "* ]] || hosts+=("$me")
@@ -62,16 +76,16 @@ steps="check-runner:ReleaseSafe cli:ReleaseFast"
 compile_gb=10
 target_gb=$((compile_gb * $(wc -w <<< "$steps")))
 # Liveness and load from the o11y feed; a builder must be idle (live, half its cores free, a quarter of its memory).
-curl -s -m 10 "$o11y" > "$W/o11y.json" || echo '{"hosts": []}' > "$W/o11y.json"
+[[ -n $o11y ]] && curl -s -m 10 "$o11y" > "$W/o11y.json" || echo '{"hosts": []}' > "$W/o11y.json"
 "$py" tools/check/fleet_load.py --self-test >/dev/null ||
   { echo "fleet: the builder probe fails its self-test" >&2; exit 2; }
 load() {  # host: "offline", "busy", or "idle N", N the target builds its free memory holds (tools/check/fleet_load.py)
-  "$py" tools/check/fleet_load.py "$W/o11y.json" "${O11Y_NAME[$1]:-$1}" "$target_gb"
+  "$py" tools/check/fleet_load.py "$W/o11y.json" "$(field "$1" o11y_name "$1")" "$target_gb"
 }
 probe() {  # host: why it must not be used, or nothing
-  if [[ $1 == "$me" ]]; then sh tools/check/fleet-host.sh timing "$1"
-  else ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" sh -s -- timing "$1" < tools/check/fleet-host.sh 2>/dev/null ||
-    echo "unreachable"; fi
+  if [[ $1 == "$me" ]]; then sh tools/check/fleet-host.sh timing "$1" $timing_locks
+  else ssh -o BatchMode=yes -o ConnectTimeout=10 "$1" sh -s -- timing "$1" $timing_locks \
+    < tools/check/fleet-host.sh 2>/dev/null || echo "unreachable"; fi
 }
 declare -A skip state target_of
 for h in "${hosts[@]}"; do state[$h]=$(load "$h"); ( probe "$h" | head -1 > "$W/log/probe-$h" ) & done
@@ -108,9 +122,11 @@ done
 # The source as committed goes to each builder once; then every build there starts.
 mkdir -p "$W/src" && git archive HEAD | tar -x -C "$W/src"
 src=.cache/zpq-fleet/src
-# Here the fleet tree lives on /mnt/fast (build caches stay off the internal disk) under the builders' common path.
-if mountpoint -q /mnt/fast && [[ ! -e $HOME/.cache/zpq-fleet ]]; then
-  mkdir -p /mnt/fast/zpq-fleet && ln -s /mnt/fast/zpq-fleet "$HOME/.cache/zpq-fleet"
+# The inventory's fleet_dir, if any, holds this host's fleet tree (say, off the disk timed runs use), linked in under
+# the builders' common path.
+fleet_dir=$(top fleet_dir "")
+if [[ -n $fleet_dir && ! -e $HOME/.cache/zpq-fleet ]]; then
+  mkdir -p "$fleet_dir" && ln -s "$fleet_dir" "$HOME/.cache/zpq-fleet"
 fi
 sync_src() {
   if [[ $1 == "$me" ]]; then mkdir -p "$HOME/$src" && rsync -a --delete --checksum "$W/src/" "$HOME/$src/"

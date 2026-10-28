@@ -33,6 +33,7 @@ release-smoke:
 
 # Lambda deploy zips (static musl, ReleaseFast) for arm64 and x86_64. ReleaseSmall started no faster on Lambda
 # and ran up to 2x slower cold; the ~10 MB zip is well under the 50 MB upload limit.
+[doc("Lambda deploy zips (static musl, ReleaseFast) for arm64 and x86_64.")]
 lambda-build:
     ./tools/serverless/aws.sh build arm64
     ./tools/serverless/aws.sh build x86_64
@@ -96,6 +97,7 @@ test-integration:
 # libzpq, the C ABI: its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close cycles), the
 # Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte for byte.
 # Needs gcc (the sanitizer runtime) and duckdb+pyarrow in the .venv. Part of the full tier.
+[doc("libzpq, the C ABI: C test plain and under ASan/LSan, the Python binding, and the differential corpus.")]
 libzpq:
     PYTHON={{python}} OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
@@ -131,6 +133,7 @@ lambda-logs fn:
 # perf-record `zpq <args>` (frame-pointer stacks) and write prof/flame-<ts>.svg. Needs perf and
 # references/FlameGraph. Aim for runs over 500 ms; loop or glob shorter ones. Example:
 #   just flamegraph query data/benchmark_100mb.parquet --aggregate 'sum(int64_sorted) AS s'
+[doc("perf-record `zpq <args>` and write prof/flame-<ts>.svg.")]
 [positional-arguments]
 flamegraph *args:
     #!/usr/bin/env bash
@@ -149,6 +152,7 @@ flamegraph *args:
 
 # Sample a running zpq with eBPF for DURATION seconds (default 5) and write prof/flame-bpf-<ts>.svg. For runs over
 # a second; start zpq first. Needs bpfcc-tools (profile-bpfcc) and sudo.
+[doc("Sample a running zpq with eBPF for DURATION seconds and write prof/flame-bpf-<ts>.svg.")]
 flamegraph-bpf duration="5":
     @mkdir -p prof
     @ts=$(date +%Y%m%d-%H%M%S); \
@@ -171,6 +175,7 @@ fetch-deps:
 
 # OS contracts (publication, permissions, pipes, S3 uploads, sync and write faults): the full tier's `os` shard.
 # Loop-device and device-mapper contracts skip unless run with --privileged on a host with passwordless sudo.
+[doc("OS contracts: the full tier's `os` shard (--privileged for loop-device and device-mapper ones).")]
 contracts:
     zig build -Doptimize=ReleaseFast
     zig build libzpq -Doptimize=ReleaseFast

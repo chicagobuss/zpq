@@ -152,7 +152,7 @@ output is the same at every `-j`, memory budget and cache size.
 
 ### Performance
 
-**How these were measured.** zpq 0.5.0 (build {{TBD}}; on Linux x86_64 the shipped x86-64-v3 musl
+**How these were measured.** zpq 0.5.0 (build 8323391; on Linux x86_64 the shipped x86-64-v3 musl
 binary) against DuckDB 2.0 and Polars 2.0. Every query starts a fresh process of each engine, in two lanes: cold, as a
 user meets a file the first time (before each of 3 repetitions the input's pages are evicted from the page cache and
 the eviction is verified), and hot-fresh (the input already in the page cache, in a new process). A case's time is the
@@ -161,32 +161,34 @@ start. An engine's error counts as a loss for that engine. Every cell is on the 
 
 | | |
 |---|---|
-| Judging machine | {{TBD}} |
-| Also run on | {{TBD}} |
-| Engines | zpq 0.5.0 ({{TBD}}), DuckDB {{TBD}}, Polars {{TBD}} |
-| Cells | {{TBD}} per lane: ClickBench 43, synthetic 390, local reads 14, writes 8, votes 1, PDS-H 8 |
+| Judging machine | AMD Ryzen 9 9950X (16 cores, 32 threads), dual-channel DDR5 |
+| Also run on | an Intel Core i7-13700HX and an Intel Core i5-11500B, on subsets of the queries (indicative) |
+| Engines | zpq 0.5.0 (build 83233913f190), DuckDB v2.0.0 (Cyanoptera) d54cbbe3df, Polars 2.0.0 |
+| Cells | 464 per lane: ClickBench 43, synthetic 390, local reads 14, writes 8, votes 1, PDS-H 8 |
 
 **On the judging machine:**
 
 | Lane | Faster than DuckDB 2.0 | Faster than Polars 2.0 | Behind the faster rival | Behind by more than 1.2× | Geometric mean vs the faster rival |
 |---|---|---|---|---|---|
-| Cold | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}× |
-| Hot-fresh | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}% | {{TBD}}× |
+| Cold | 94.4% | 98.9% | 5.6% | 0.9% | 0.564× |
+| Hot-fresh | 95.0% | 98.5% | 5.4% | 1.3% | 0.484× |
 
 - **ClickBench, 100M rows (one 14.8 GB file).**
   - zpq runs all 43 queries, with date literals compared with hits' unannotated integer day column,
     `extract`/`date_part`, `date_trunc`, `make_date`, `epoch_ms` and `regexp_replace`.
-  - Cold, zpq is faster than both rivals on {{TBD}} of 43, at a geometric mean of {{TBD}}× the faster rival's time.
-- **26 synthetic datasets × 15 query shapes, 390 cases.** Cold, zpq is faster than both rivals on {{TBD}} of 390, at a
-  geometric mean of {{TBD}}×; {{TBD}} are more than 1.5× behind, the worst {{TBD}}×.
-- **Local reads** (TPC-H SF1 lineitem in snappy and zstd, and a 2.1M-row synthetic table): faster on {{TBD}} of 14,
-  at a geometric mean of {{TBD}}×.
-- **Writes** (outputs to tmpfs for every engine): faster on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
-- **DuckDB's votes test** (228M rows, local file): {{TBD}} ms, against {{TBD}} ms for the faster rival.
-- **PDS-H Q1 and Q6** (SF1 to SF30): faster on {{TBD}} of 8, at a geometric mean of {{TBD}}×.
-- **Other machines** (cold, faster than DuckDB 2.0 / Polars 2.0): {{TBD}}.
+  - Cold, zpq is faster than both rivals on 35 of 43, at a geometric mean of 0.598× the faster rival's time.
+- **26 synthetic datasets × 15 query shapes, 390 cases.** Cold, zpq is faster than both rivals on 374 of 390, at a
+  geometric mean of 0.567×; 0 are more than 1.5× behind, the worst 1.41×.
+- **Local reads** (TPC-H SF1 lineitem in snappy and zstd, and a 2.1M-row synthetic table): faster on 14 of 14,
+  at a geometric mean of 0.342×.
+- **Writes** (outputs to tmpfs for every engine): faster on 8 of 8, at a geometric mean of 0.527×.
+- **DuckDB's votes test** (228M rows, local file): 94 ms, against 130 ms for the faster rival.
+- **PDS-H Q1 and Q6** (SF1 to SF30): faster on 6 of 8, at a geometric mean of 0.771×.
+- **Other machines** (cold, faster than DuckDB 2.0 / Polars 2.0): on an Intel Core i7-13700HX (457 of the 464
+  queries), 423 of 457 / 448 of 455; on an Intel Core i5-11500B (150 of the 464 queries), 130 of 150 / 136 of 144.
 
-The cells still more than 1.5× behind, and why, are listed as the known gaps on the site's status page.
+Every query, and the machines above, are on the site's Numbers page (https://zpq.chicagobuss.dev/numbers.html); the
+known limits are under "Known limits" above.
 
 **Against zpq 0.4.1: writes and peak memory.** An earlier 0.5.0 build (from before the memory work) against the
 released 0.4.1, on the same machine in the same session.

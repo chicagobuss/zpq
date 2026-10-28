@@ -4728,17 +4728,7 @@ const ChunkDecoder = struct {
     }
 };
 
-/// `column_chunk` span arguments for chunk `ci` of a row group.
-fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profile.Args {
-    return profile.args(.{
-        file,
-        rg,
-        ci,
-        profile.chunkTypes(cm.codec, profile.chunkEncoding(cm.encodings.items), cm.type),
-        cm.total_compressed_size,
-        cm.total_uncompressed_size,
-    });
-}
+const chunkArgs = types.chunkArgs;
 
 /// Which columns a coded decode serves (`code`) and which still need materialized values (`value`).
 /// Rows per slice of a row group read `fit` rows at a time: a multiple of 64, so every slice starts on a block of
@@ -5732,15 +5722,7 @@ fn dictionaryBloom(
     return null;
 }
 
-/// The bytes of `range`, a span of the source file, in `src`. An S3 input holds only the chunks its plan fetched, so
-/// one outside them is MissingChunkBytes.
-fn sourceBytes(src: RGSrc, range: fastpath.ByteRange) ![]const u8 {
-    const origin: usize = @intCast(src.byte_origin);
-    if (range.start < origin) return error.MissingChunkBytes;
-    const off = range.start - origin;
-    if (off > src.bytes.len or range.len > src.bytes.len - off) return error.MissingChunkBytes;
-    return src.bytes[off..][0..range.len];
-}
+const sourceBytes = types.sourceBytes;
 
 fn offsetDelta(new_start: usize, src_start: usize) i64 {
     return @as(i64, @intCast(new_start)) - @as(i64, @intCast(src_start));

@@ -1,4 +1,5 @@
 const std = @import("std");
+const fastpath = @import("../writer/fastpath.zig");
 const expr_ast = @import("../expr/ast.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
@@ -343,5 +344,28 @@ pub fn renameLeaf(elem: *schema.SchemaElement, name: []const u8, max_def: i32) v
     elem.name = name;
     elem.num_children = 0;
     elem.repetition_type = if (max_def > 0) .OPTIONAL else .REQUIRED;
+}
+
+
+/// `column_chunk` span arguments for chunk `ci` of a row group.
+pub fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profile.Args {
+    return profile.args(.{
+        file,
+        rg,
+        ci,
+        profile.chunkTypes(cm.codec, profile.chunkEncoding(cm.encodings.items), cm.type),
+        cm.total_compressed_size,
+        cm.total_uncompressed_size,
+    });
+}
+
+/// The bytes of `range`, a span of the source file, in `src`. An S3 input holds only the chunks its plan fetched, so
+/// one outside them is MissingChunkBytes.
+pub fn sourceBytes(src: RGSrc, range: fastpath.ByteRange) ![]const u8 {
+    const origin: usize = @intCast(src.byte_origin);
+    if (range.start < origin) return error.MissingChunkBytes;
+    const off = range.start - origin;
+    if (off > src.bytes.len or range.len > src.bytes.len - off) return error.MissingChunkBytes;
+    return src.bytes[off..][0..range.len];
 }
 

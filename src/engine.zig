@@ -12064,6 +12064,7 @@ test "Lambda default fetch window streams a large projection and fetches a small
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008",
     };
     const env: std.process.Environ = .{ .block = .{ .slice = &env_lines } };
+
     const ctx: Context = .{ .gpa = gpa, .env = env, .io = std.testing.io };
     for ([_][]const u8{ "sum(x * x) AS s", "sum(x * x) AS s, sum(y * y) AS t" }, 0..) |aggregate, i| {
         var query_arena = std.heap.ArenaAllocator.init(gpa);
@@ -14030,12 +14031,25 @@ const OomSweep = struct {
     const env_lines = [_:null]?[*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_DENSE=0" };
     const env: std.process.Environ = .{ .block = .{ .slice = &env_lines } };
 
+    const Point = struct { caller: usize, worker: bool };
+
+    fn recordPoint(points: *std.ArrayList(Point), point: Point) !void {
+        for (points.items) |p| if (std.meta.eql(p, point)) return;
+        try points.append(std.testing.allocator, point);
+    }
+
     // FailingAllocator's counters are not atomic; the engine may call the supplied allocator on worker threads.
     // Refusing resize/remap also keeps arena growth from depending on the backing allocator's placement.
     const Locked = struct {
         child: std.mem.Allocator,
         lock: std.Io.Mutex = .init,
+        coordinator: std.Thread.Id = undefined,
+        points: ?*std.ArrayList(Point) = null,
+        threads: ?*std.ArrayList(std.Thread.Id) = null,
+        target: ?Point = null,
+        failing: ?*std.testing.FailingAllocator = null,
         fn allocator(s: *Locked) std.mem.Allocator {
+            s.coordinator = std.Thread.getCurrentId();
             return .{ .ptr = s, .vtable = &.{
                 .alloc = alloc,
                 .resize = std.mem.Allocator.noResize,
@@ -14047,6 +14061,20 @@ const OomSweep = struct {
             const s: *Locked = @ptrCast(@alignCast(ctx));
             s.lock.lockUncancelable(std.testing.io);
             defer s.lock.unlock(std.testing.io);
+            const thread = std.Thread.getCurrentId();
+            const point: Point = .{ .caller = ra, .worker = thread != s.coordinator };
+            if (s.points) |points| recordPoint(points, point) catch return null;
+            if (s.threads) |threads| if (point.worker) {
+                const known = for (threads.items) |id| {
+                    if (id == thread) break true;
+                } else false;
+                if (!known) threads.append(std.testing.allocator, thread) catch return null;
+            };
+            if (s.target) |target| if (std.meta.eql(target, point)) {
+                // Fail from this observed site onward, including allocations on peer workers during unwind.
+                s.failing.?.fail_index = s.failing.?.alloc_index;
+                s.target = null;
+            };
             return s.child.rawAlloc(n, alignment, ra);
         }
         fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
@@ -14182,10 +14210,19 @@ const OomSweep = struct {
         defer baseline.deinit();
         var measuring = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         var locked: Locked = .{ .child = measuring.allocator() };
+        var points: std.ArrayList(Point) = .empty;
+        defer points.deinit(std.testing.allocator);
+        var threads: std.ArrayList(std.Thread.Id) = .empty;
+        defer threads.deinit(std.testing.allocator);
+        if (case == .group4) {
+            locked.points = &points;
+            locked.threads = &threads;
+        }
         try execute(locked.allocator(), case, &baseline.writer, path);
         local_fs.removeFile(path);
         try checkBaseline(case, baseline.written());
         try std.testing.expectEqual(measuring.allocated_bytes, measuring.freed_bytes);
+        if (case == .group4) try std.testing.expect(threads.items.len >= 4);
         const total = measuring.alloc_index;
         std.debug.print("oom sweep {s}: {d} allocations\n", .{ @tagName(case), total });
         var unreached: usize = 0;
@@ -14196,33 +14233,73 @@ const OomSweep = struct {
             defer out.deinit();
             std.debug.print("oom sweep {s}: fail {d}/{d}\n", .{ @tagName(case), i, total });
             const result = execute(guarded.allocator(), case, &out.writer, path);
-            if (result) |_| {
-                try std.testing.expectEqualStrings(baseline.written(), out.written());
-                if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
+            try checkAttempt(case, baseline.written(), out.written(), path, &failing, result);
+            if (!failing.has_induced_failure) {
+                // A different work distribution may need fewer arena blocks. This ordinal did not exist in this
+                // execution: it must have succeeded identically, and cannot have allocated past the target.
+                try std.testing.expect(failing.alloc_index <= i);
                 unreached += 1;
-            } else |_| {
-                if (!failing.has_induced_failure) return error.UnexpectedFailure;
-                if (case == .parquet) {
-                    if (std.Io.Dir.cwd().access(std.testing.io, path, .{})) |_| {
-                        return error.PartialParquetOutput;
-                    } else |err| switch (err) {
-                        error.FileNotFound => {},
-                        else => return err,
-                    }
-                } else if (!std.mem.startsWith(u8, baseline.written(), out.written())) {
-                    return error.IncorrectPartialOutput;
-                }
-            }
-            local_fs.removeFile(path);
-            if (failing.allocated_bytes != failing.freed_bytes) {
-                std.debug.print("oom sweep {s} fail {d}: allocated {d}, freed {d}\n", .{
-                    @tagName(case), i, failing.allocated_bytes, failing.freed_bytes,
-                });
-                return error.MemoryLeakDetected;
             }
         }
-        std.debug.print("oom sweep {s}: {d} points, {d} not reached\n", .{ @tagName(case), total, unreached });
-        if (unreached != 0) return error.NondeterministicMemoryUsage;
+        std.debug.print("oom sweep {s}: {d} ordinal attempts, {d} absent in their execution\n", .{
+            @tagName(case), total, unreached,
+        });
+        if (case != .group4) {
+            if (unreached != 0) return error.NondeterministicMemoryUsage;
+            return;
+        }
+        // Keep the ordinal attempts above, but also fail every observed allocation site on coordinator and worker
+        // paths. A site is independent of which worker wins a work item or how many arena blocks it needs.
+        var worker_points: usize = 0;
+        for (points.items, 0..) |point, i| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var guarded: Locked = .{ .child = failing.allocator(), .target = point, .failing = &failing };
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            std.debug.print("oom sweep group4: site {d}/{d}, worker={any}\n", .{ i, points.items.len, point.worker });
+            const result = execute(guarded.allocator(), case, &out.writer, path);
+            try checkAttempt(case, baseline.written(), out.written(), path, &failing, result);
+            // Unlike a global ordinal, each measured site must actually have been failed: no vacuous coverage.
+            try std.testing.expect(failing.has_induced_failure);
+            if (point.worker) worker_points += 1;
+        }
+        try std.testing.expect(worker_points > 0);
+        std.debug.print("oom sweep group4: {d}/{d} sites injected ({d} worker), {d} allocating worker threads\n", .{
+            points.items.len, points.items.len, worker_points, threads.items.len,
+        });
+    }
+
+    fn checkAttempt(
+        case: Case,
+        baseline: []const u8,
+        out: []const u8,
+        path: []const u8,
+        failing: *const std.testing.FailingAllocator,
+        result: anyerror!void,
+    ) !void {
+        defer local_fs.removeFile(path);
+        if (result) |_| {
+            try std.testing.expectEqualStrings(baseline, out);
+            if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
+        } else |_| {
+            if (!failing.has_induced_failure) return error.UnexpectedFailure;
+            if (case == .parquet) {
+                if (std.Io.Dir.cwd().access(std.testing.io, path, .{})) |_| {
+                    return error.PartialParquetOutput;
+                } else |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                }
+            } else if (!std.mem.startsWith(u8, baseline, out)) {
+                return error.IncorrectPartialOutput;
+            }
+        }
+        if (failing.allocated_bytes != failing.freed_bytes) {
+            std.debug.print("oom sweep {s}: allocated {d}, freed {d}\n", .{
+                @tagName(case), failing.allocated_bytes, failing.freed_bytes,
+            });
+            return error.MemoryLeakDetected;
+        }
     }
 };
 

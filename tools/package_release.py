@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos", "x86_64-macos")
 # Everything but the binary, by archive path. The guides are the ones help and the man page name.
 SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
+                "THIRD_PARTY_NOTICES.md": ROOT / "THIRD_PARTY_NOTICES.md",
                 "share/man/man1/zpq.1": ROOT / "packaging/man/zpq.1",
                 "share/bash-completion/completions/zpq": ROOT / "packaging/completions/zpq.bash",
                 "share/zsh/site-functions/_zpq": ROOT / "packaging/completions/_zpq",

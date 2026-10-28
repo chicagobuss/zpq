@@ -137,7 +137,7 @@ This product includes cryptographic software written by Eric Young
 ## 5. Facebook ZSTD
 
 - **Home page**: https://github.com/facebook/zstd
-- **Version**: 1.5.7, vendored in `vendor/zstd` (local changes listed in `vendor/README.md`)
+- **Version**: 1.5.7, vendored in `vendor/zstd` (local changes listed in the notes in zpq's source tree, `vendor/`)
 - **License**: BSD-3-Clause OR GPL-2.0
 - **Copyright**: Copyright (c) 2016-present, Yann Collet, Facebook, Inc.
 
@@ -175,7 +175,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## 6. libdeflate
 
 - **Home page**: https://github.com/ebiggers/libdeflate
-- **Version**: 1.26, vendored in `vendor/libdeflate` (unmodified; see `vendor/README.md`)
+- **Version**: 1.26, vendored in `vendor/libdeflate` (unmodified; see the notes in zpq's source tree, `vendor/`)
 - **License**: MIT
 - **Copyright**: Copyright 2016 Eric Biggers; Copyright 2024 Google LLC
 
@@ -211,7 +211,7 @@ SOFTWARE.
 ## 7. LZ4
 
 - **Home page**: https://github.com/lz4/lz4
-- **Version**: 1.10.0, vendored in `vendor/lz4` (`lz4.c`, `lz4.h`; unmodified, see `vendor/README.md`)
+- **Version**: 1.10.0, vendored in `vendor/lz4` (`lz4.c`, `lz4.h`; unmodified, see the notes in zpq's source tree, `vendor/`)
 - **License**: BSD-2-Clause
 - **Copyright**: Copyright (c) 2011-2020, Yann Collet
 
@@ -249,7 +249,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## 8. mimalloc
 
 - **Home page**: https://github.com/microsoft/mimalloc
-- **Version**: 3.6.0, vendored in `vendor/mimalloc` (unmodified; see `vendor/README.md`); linked into the Linux
+- **Version**: 3.6.0, vendored in `vendor/mimalloc` (unmodified; see the notes in zpq's source tree, `vendor/`); linked into the Linux
   musl release binaries only
 - **License**: MIT
 - **Copyright**: Copyright (c) 2018-2025 Microsoft Corporation, Daan Leijen

@@ -444,98 +444,7 @@ fn gatherRows(
     }
 }
 
-/// Decode column `ci` of a row group into the batch lane the write path keeps it in.
-fn decodeWriteColumn(
-    ra: std.mem.Allocator,
-    rg: *const schema.RowGroup,
-    meta: *const schema.FileMetaData,
-    src: RGSrc,
-    ci: usize,
-    decode_options_in: DecodeOptions,
-    prof: ?*profile.Thread,
-) !filter_eval.Batch.Column {
-    enterChunk(rg, ci);
-    const num_rows: usize = @intCast(rg.num_rows);
-    const chunk_span = profile.Span.begin(prof);
-    const col = &rg.columns.items[ci];
-    const cm = col.meta_data orelse return error.ColumnMetaMissing;
-    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
-    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-    const len: usize = @intCast(cm.total_compressed_size);
-    // Programmer invariant: the chunk's absolute start is at or past
-    // this byte window's origin, so the subtraction below can't
-    // underflow. A malformed file is caught by the bounds error on
-    // the next line; this guards our own RGSrc/byte_origin math.
-    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
-    const buf_off = start - @as(usize, @intCast(src.byte_origin));
-    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
-    const chunk = src.bytes[buf_off .. buf_off + len];
-
-    const levels = meta.getColumnLevels(cm.path_in_schema.items);
-    const n_leaves: usize = @intCast(cm.num_values);
-
-    // DECIMAL columns, whatever their backing: the f64 view, with the exact unscaled values beside it that filters,
-    // expressions and aggregates read (`decodeColumnExact`).
-    const schema_elem = meta.getColumnSchema(cm.path_in_schema.items);
-    const dec_kind: ?decimal_mod.Kind = if (schema_elem) |se| decimal_mod.exactKind(&se) else null;
-
-    const decoded: filter_eval.Batch.Column = if (dec_kind) |k| .{
-        .f64 = try decimal_mod.decodeColumnExact(ra, chunk, cm.codec, levels, n_leaves, k, decode_options, null),
-    } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
-        // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
-        .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, decode_options),
-    } else switch (cm.type) {
-        .INT32 => .{
-            .i32 = try decodeColumnTWithOptions(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .INT64 => .{
-            .i64 = try decodeColumnTWithOptions(i64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .FLOAT => .{
-            .f32 = try decodeColumnTWithOptions(f32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .DOUBLE => .{
-            .f64 = try decodeColumnTWithOptions(f64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .BYTE_ARRAY => .{
-            .string = try decodeColumnTWithOptions(
-                []const u8,
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                decode_options,
-            ),
-        },
-        .BOOLEAN => .{
-            .boolean = try decodeColumnTWithOptions(bool, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
-        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            decode_options.page_bytes_limit,
-        ) },
-        // FIXED_LEN_BYTE_ARRAY (non-decimal — decimal handled above): raw
-        // fixed-width bytes (UUID / Float16 / fixed binary).
-        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnWithOptions(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            flbaWidth(schema_elem),
-            decode_options,
-        ) },
-    };
-    try checkRowShape(decoded, num_rows);
-    if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
-    return decoded;
-}
+const decodeWriteColumn = consumer_column.decodeWriteColumn;
 
 /// Append a slice's surviving rows to `agg` (on `agg.arena`): `batch` holds every fetched column of the slice
 /// (`lookup` by leaf), `sel` its filtered rows. The sliced counterpart of `ProjectedRG.projectColumn` over every
@@ -586,34 +495,7 @@ pub const renameLeaf = types.renameLeaf;
 const booleanLane = output.booleanLane;
 pub const outputLane = output.outputLane;
 
-/// The dictionary of flat BYTE_ARRAY chunk `ci`, on `a`, when every one of its data pages is dictionary-encoded, so
-/// that each of its values is an entry; null otherwise. Reads no data page's body.
-pub fn chunkDictionary(
-    a: std.mem.Allocator,
-    rg: *const schema.RowGroup,
-    meta: *const schema.FileMetaData,
-    src: RGSrc,
-    ci: usize,
-) !?[]const []const u8 {
-    const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
-    if (cm.type != .BYTE_ARRAY) return null;
-    const levels = meta.getColumnLevels(cm.path_in_schema.items);
-    if (levels.max_rep > 0) return null;
-    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-    const len: usize = @intCast(cm.total_compressed_size);
-    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
-    const buf_off = start - @as(usize, @intCast(src.byte_origin));
-    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
-    var r = column_mod.ColumnChunkReader([]const u8).initWithOptions(
-        src.bytes[buf_off..][0..len],
-        cm.codec,
-        levels,
-        a,
-        column_mod.chunkOptions(.{}, meta, cm),
-        null,
-    );
-    return r.dictionaryOfEveryPage();
-}
+pub const chunkDictionary = consumer_column.chunkDictionary;
 
 pub const slice_reader = @import("consumer/slice_reader.zig");
 pub const SliceReader = slice_reader.SliceReader;
@@ -623,42 +505,7 @@ const decodeDecimalI128 = consumer_column.decodeDecimalI128;
 
 const appendSelected = output.appendSelected;
 
-/// `decodeWriteColumn`, but a dictionary-encoded chunk of a type the write path keeps unconverted decodes to codes
-/// (see `ColumnChunkReader.readAllCodes`); anything else decodes as values.
-fn decodeWriteColumnMaybeCoded(
-    ra: std.mem.Allocator,
-    rg: *const schema.RowGroup,
-    meta: *const schema.FileMetaData,
-    src: RGSrc,
-    ci: usize,
-    decode_options_in: DecodeOptions,
-    prof: ?*profile.Thread,
-) !filter_eval.Batch.Column {
-    enterChunk(rg, ci);
-    const cm = rg.columns.items[ci].meta_data orelse return error.ColumnMetaMissing;
-    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
-    const levels = meta.getColumnLevels(cm.path_in_schema.items);
-    const se = meta.getColumnSchema(cm.path_in_schema.items);
-    const converted = if (se) |e| decimal_mod.exactKind(&e) != null or schema.isFloat16(e) else false;
-    if (!decode_options.encoded or converted or levels.max_rep > 0)
-        return decodeWriteColumn(ra, rg, meta, src, ci, decode_options, prof);
-    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-    const chunk = try sourceBytes(src, .{ .start = start, .len = @intCast(cm.total_compressed_size) });
-    const n_leaves: usize = @intCast(cm.num_values);
-    const chunk_span = profile.Span.begin(prof);
-    const coded: ?filter_eval.Batch.Column = switch (cm.type) {
-        .INT32 => try codedOrValues(i32, .i32, ra, chunk, cm, levels, n_leaves, decode_options, null),
-        .INT64 => try codedOrValues(i64, .i64, ra, chunk, cm, levels, n_leaves, decode_options, null),
-        .FLOAT => try codedOrValues(f32, .f32, ra, chunk, cm, levels, n_leaves, decode_options, null),
-        .DOUBLE => try codedOrValues(f64, .f64, ra, chunk, cm, levels, n_leaves, decode_options, null),
-        .BYTE_ARRAY => try codedOrValues([]const u8, .string, ra, chunk, cm, levels, n_leaves, decode_options, null),
-        else => null,
-    };
-    const col = coded orelse return decodeWriteColumn(ra, rg, meta, src, ci, decode_options, prof);
-    try checkRowShape(col, @intCast(rg.num_rows));
-    if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
-    return col;
-}
+const decodeWriteColumnMaybeCoded = consumer_column.decodeWriteColumnMaybeCoded;
 
 const appendIntoBuf = output.appendIntoBuf;
 const appendTyped = output.appendTyped;
@@ -8299,40 +8146,6 @@ test "retained delta pages reset under the decode ledger, including optional lev
     pool.deinit();
     pool_live = false;
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
-}
-
-test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {
-    const testing = std.testing;
-    for ([_][]const u8{ "ci/fixtures/parquet/topn_gather_a.parquet", "ci/fixtures/parquet/topn_gather_b.parquet" }) |path| {
-        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
-            if (err == error.FileNotFound) return error.SkipZigTest;
-            return err;
-        };
-        defer testing.allocator.free(bytes);
-        var meta = try metadata.open(testing.allocator, bytes);
-        defer meta.deinit(testing.allocator);
-        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena_state.deinit();
-        const a = arena_state.allocator();
-        const src: RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
-        for (meta.row_groups.items) |*rg| {
-            // `s` outgrows its dictionary page and turns PLAIN; `c` stays coded; `id` is not a string.
-            try testing.expect(try chunkDictionary(a, rg, &meta, src, 2) == null);
-            try testing.expect(try chunkDictionary(a, rg, &meta, src, 0) == null);
-            const dict = (try chunkDictionary(a, rg, &meta, src, 7)).?;
-            // Eight values (those ending 0 or 5 fall on the rows holding '') and the empty string; NULL is no entry.
-            try testing.expectEqual(@as(usize, 9), dict.len);
-            var whole = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 7, .{})).?;
-            defer whole.deinit();
-            const col = (try whole.next(a, @intCast(rg.num_rows))).string;
-            for (col.values, 0..) |v, i| {
-                if (col.def_levels.?[i] < col.max_def) continue;
-                for (dict) |d| {
-                    if (std.mem.eql(u8, d, v)) break;
-                } else return error.TestValueNotInDictionary;
-            }
-        }
-    }
 }
 
 /// Columns of each lane and encoding an answer writes: near-unique integers (DELTA), repeating ones (dictionary),

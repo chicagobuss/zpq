@@ -1,10 +1,130 @@
 const std = @import("std");
+const ndv = @import("../ndv.zig");
 const schema = @import("../schema.zig");
 const consumer = @import("../consumer.zig");
 const agg_plan = @import("../agg_plan.zig");
 const expr_agg = @import("../expr/agg.zig");
 const expr_ast = @import("../expr/ast.zig");
 const testing = std.testing;
+
+pub const Error = error{
+    NoInputs,
+    /// A serialized group key did not match the framing the writer used.
+    BadGroupKey,
+    SchemaMismatch,
+    EmptyAggregate,
+    AggSumOverflow,
+    GroupKeyAliasRequired,
+    UnknownColumn,
+    ExceededMemoryBudget,
+    /// Two output columns (aggregate aliases, GROUP BY keys, or one of each) share a name.
+    DuplicateOutputColumn,
+    /// An output column name refers to both a GROUP BY key and an aggregate.
+    AmbiguousOutputColumn,
+    /// A SQL result column outside an aggregate is no GROUP BY key.
+    ColumnMustBeGrouped,
+    /// A HAVING literal its result column cannot compare with (a string against a number, or the reverse).
+    HavingTypeMismatch,
+} || std.mem.Allocator.Error;
+
+/// One file's contribution to a multi-file scan. Bytes can come from
+/// mmap (CLI), an S3 range-fetch into a buffer (Lambda / S3-source CLI),
+/// or a literal slice (tests). The orchestrator does not care.
+pub const Input = struct {
+    /// Display name used in error messages. Path or URL.
+    name: []const u8,
+    bytes: []const u8,
+    /// Logical source size. S3 inputs may compact fetched ranges into
+    /// `bytes`; keep reporting the object size in query results.
+    logical_size: u64 = 0,
+    /// Set while `bytes` are still being read in (`io/local_reader.zig`): a worker waits on it before touching a row
+    /// group, and reports each finished work item so a done row group's pages can go back.
+    gate: ?RowGroupGate = null,
+    /// The whole file as mapped, while `bytes` are read in behind `gate`: what a planning read made before any gate
+    /// opens takes (the NDV union's dictionaries, which read buffers the reader had not filled, so the plan hung on
+    /// I/O progress and read mode), and what a scan run again after a fast path's refusal reads, the reader's window
+    /// having moved on. Null without a gate, and for S3 inputs.
+    plan_bytes: ?[]const u8 = null,
+    /// Beside a gate: the dictionary bytes `MultiAggArgs.dict_probe` asked for are read into `bytes` ahead of every row
+    /// group, and planning reads them there once this says they are in, so a reader's input plans from the same
+    /// dictionaries a mapped one does.
+    dict_wait: ?ndv.Wait = null,
+
+    /// A local file read in behind gates (`io/local_reader.zig`), its mapping beside it; not an S3 input's window.
+    pub fn readerBacked(self: Input) bool {
+        return self.gate != null and self.plan_bytes != null and !std.mem.startsWith(u8, self.name, "s3://");
+    }
+
+    /// Readable again from the start, as a scan run again after a refusal must read it (`runMultiAggregate`).
+    pub fn rescannable(self: Input) bool {
+        return self.gate == null or self.plan_bytes != null;
+    }
+};
+
+pub fn allRescannable(inputs: []const Input) bool {
+    for (inputs) |in| if (!in.rescannable()) return false;
+    return true;
+}
+
+/// A fast path that charges its peak to the query's budget where the established path it stands in for does not
+/// charge the same way. Each is armed only over rescannable inputs, and a scan it took that the budget refused runs
+/// again without it (`runMultiAggregate`): a budget the established path fits never fails the query.
+pub const FastPath = enum {
+    grouped_distinct_bitmap,
+    shared_strings,
+    integer_records,
+    msd_records,
+    dense,
+    spill,
+    pairs,
+    partitioned,
+    private_runs,
+    /// A plain grouping the cost rules chose over a bounded cut (`fewEntries`, `selective_share`) from facts that
+    /// cannot bound its table: its refusal runs the cut instead.
+    plain_rule,
+    /// Not fast paths but what the scan held: tables filled by several workers off a shared cursor, whose peak depends
+    /// on which worker claimed which row groups (a table past a power of two doubles), so whether the budget refuses
+    /// them depends on timing; and whether shared partitions, one copy of each group, could answer instead.
+    worker_tables,
+    partitions_fit,
+    /// What the refusal says of one worker: several workers' tables held copies of the same keys, the merge refused,
+    /// or on one worker the query plans a cut (`oneWorkerCuts`), so one worker may fit the budget they did not.
+    /// Without it a single table must hold what they held and the rows they had not reached, and the scan on one
+    /// worker is not run (it would refuse, many times slower).
+    one_table_may_fit,
+    /// The workers' decode memory came out of the query's ledger beside the rest: one worker, decoding one row group
+    /// at a time, holds the least of it.
+    decode_memory,
+    /// The merge of several workers' tables was refused its maps and lists: one worker's table needs none.
+    merge_memory,
+};
+
+pub const RowGroupGate = struct {
+    ctx: *anyopaque,
+    wait: *const fn (ctx: *anyopaque, rg: usize) anyerror!void,
+    /// One of the row group's `items` work items is finished, read or skipped.
+    done: *const fn (ctx: *anyopaque, rg: usize, items: usize) void,
+};
+
+/// Asks for the bytes planning reads from input `file` (`ndv.probeRanges`) to be read first: the reader reads them ahead
+/// of every row group (`Input.dict_wait`); a mapped file is advised to read them in at once rather than fault them one
+/// by one. Called for every probe range before `ReadStart`.
+pub const DictProbe = struct {
+    ctx: *anyopaque,
+    add: *const fn (ctx: *anyopaque, file: usize, rg: usize, start: u64, end: u64) anyerror!void,
+};
+
+/// Starts the reads the scan's gates wait on (`Input.gate`). Called once every `DictProbe` range is asked for and before
+/// planning reads any of them: planning never reads a reader's input through its mapping, so its reads queue behind
+/// nothing but the probes. Idempotent; a scan given none reads as its inputs are.
+pub const ReadStart = struct {
+    ctx: *anyopaque,
+    start: *const fn (ctx: *anyopaque) anyerror!void,
+    /// Stops the reads and gives their buffers back before a scan runs again over the mappings (`runMultiAggregate`).
+    abandon: ?*const fn (ctx: *anyopaque) void = null,
+    /// Planning has read every probe it will: what was probed only for planning can go back.
+    planned: ?*const fn (ctx: *anyopaque) void = null,
+};
 
 pub const BorrowedSpan = struct {
     lo: usize,

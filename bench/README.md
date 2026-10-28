@@ -2,11 +2,17 @@
 
 ## Quick integration checks
 
-Use a same-host candidate/base mini-matrix for integration pushes, in idle gaps.
+Use a same-host candidate/base mini-matrix for specifically requested integration checks.
 The default budget is 90 seconds; **both builds share a hard maximum of 120 seconds per host**.
-A flagged cell gets a short targeted check. A full release matrix runs once, after content and
-architecture checks are settled, with release-owner approval; obtain approval before starting
-an estimate longer than an hour.
+The coordinator reports within **15 minutes of the request**, measured or incomplete, including
+builds, setup, placement and collection. The per-host budget does not reset that turnaround clock.
+Pin both builds to the same configured CPUs and threads and interleave their samples. Drain owned
+builds at a natural boundary; record work on other cores as context. Do not wait indefinitely for
+a quiet machine. This implementation still defers on its configured strict busy-before gate;
+a deferred report needs a coordinator decision, not automatic polling or a longer campaign.
+A flagged cell gets only a requested short targeted check. No formal or quiet-window run starts
+before the release owner declares the release ready and obtains release approval. The full matrix
+runs once, after content and architecture checks settle; obtain approval before an estimate over an hour.
 
 ~~~sh
 python -m bench quick --config /configured/fleet.json --host HOST \

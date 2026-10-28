@@ -1,14 +1,13 @@
 # ZPQ
 
-An agentically-engineered Apache Parquet engine in Zig, optimized for serverless compute against object storage.  The
-core philosophy is to do only the minimum work necessary to get the requested task finished to the desired accuracy
-level.  Vendored prebuilt crypto, and native S3/SigV4 for further minimization of lambda execution time.
+An agentically-engineered Apache Parquet engine in Zig, built for serverless compute against object storage. It does
+the least work a query needs for an exact answer: statistics and footers first, and only the pages that matter.
 
 Workloads it's intended for:
 
-* Iceberg / Delta table maintenance — one Lambda per file, filter and rewrite in place.
-* Billing / cost roll-ups — answer from row-group statistics when possible, decode bytes only when necessary.
-* Log summarization — Parquet queries without the Athena round-trip; one-line CLI output for ad-hoc work.
+* Iceberg / Delta table maintenance: one Lambda per file, filter and rewrite in place.
+* Billing and cost roll-ups: answer from row-group statistics when possible, decode pages only when necessary.
+* Log summarization: Parquet queries without the Athena round-trip, and one-line CLI output for ad-hoc work.
 
 Two binaries from one sans-IO core: a workstation CLI (`zpq`) and an AWS Lambda bootstrap (`zpq-lambda`). Native SigV4,
 vendored prebuilt BoringSSL, in-tree event loop. No AWS SDK, no system OpenSSL.
@@ -69,7 +68,7 @@ before `compinit`, or copy `zpq.fish` into fish's completions directory. For exa
 
 ## On AWS Lambda: built for cold starts
 
-`zpq-lambda` is a static binary for the `provided.al2023` runtime, and its cold start is the point. On 2026-10-05 in
+`zpq-lambda` is a static binary for the `provided.al2023` runtime, built for fast cold starts. On 2026-10-05 in
 us-west-2, with every function at 3008 MB, zpq 0.4.0's median Lambda `Init Duration` was 18–22 ms on arm64 and
 26–35 ms on x86_64 across eleven scenarios (three forced cold starts each). DuckDB 1.5.6 in a Python 3.12 container
 image, same region and memory, measured 448–832 ms, and its cold Init + Duration was 2.4× to 5.6× zpq's (x86_64 against
@@ -167,7 +166,7 @@ passes neither `p` nor `NOT p`. DATE / TIME / TIMESTAMP columns take quoted lite
 (`'2024-01-01'`, `'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is
 not rounded to it.
 
-**Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
+**Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
 `coalesce(a, b, ...)` over any expressions, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
@@ -181,7 +180,7 @@ column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys wit
 without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks. Plain
 rows take `ORDER BY` columns with a `LIMIT`, keeping the first rows by those keys, ties by input position.
 As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet;
-avg_state's pair becomes `{"sum": null, "count": 0}`) while `count` is 0. Earlier versions reported 0 or `""`.
+avg_state's pair becomes `{"sum": null, "count": 0}`) while `count` is 0.
 `avg(x)` is the mean, one value in every format: DOUBLE for integer and floating `x` (the sum, its integers summed
 exactly, divided once by the count), DECIMAL for a DECIMAL `x` (below). `avg_state(x)` is the same average as mergeable
 state for fan-out: `{"sum": .., "count": ..}` in JSON and NDJSON, `<name>__sum` and `<name>__count` columns in CSV and
@@ -227,19 +226,12 @@ an exponent (`1e9`) or a `MiB` spelling is refused (exit 2).
 
 Diagnostic path and cache layout overrides are documented in [execution overrides](docs/execution_knobs.md).
 
-Add `--explain` to an aggregate query to print one JSON plan and exit before allocating scan workers or GROUP BY tables.
-It accepts SQL `--query` and the `--aggregate` / `--group-by` flags. It reports the strategy, reasons, column passes,
-conditional fallbacks and NDV upper bounds without reading data pages. Local planning can read dictionary headers and,
-when footer coverage and byte budgets allow it, dictionary pages to tighten those bounds. S3 explain reads only footers.
-`ZPQ_NDV_UNION=0` disables the optional union probe. `ZPQ_PARTAGG=1` forces eligible plain GROUP BY through shared tables;
-the planner also chooses them for large string keys or worker-copy pressure supported by a lower bound or a
-single-key dictionary-union cost estimate. Composite upper bounds only prove smallness. Prefix LIMIT plans retain
-`first_keys` precedence and skip the union probe. Memory estimates remain estimates;
-execution enforces the GROUP BY budget. COUNT cuts may permit an unfused census after a sketch bail for fixed-width
-keys. Tiny bounds and cheap clustered/skewed R1 scans keep plain grouping. Unknown or high NDV also needs a
-cell-dispersion cost hint: sparse repeats, or moderate effective cardinality for a single key. These hints never prove
-uniqueness; census admission remains certified, with an exact plain fallback. Short string composites with only COUNT
-may also try this gate; single-string and payload cuts keep their existing plans. Explain reports the conditional gate.
+Add `--explain` to an aggregate query to print its plan as one JSON object and exit before scanning. It accepts SQL
+`--query` and the `--aggregate` / `--group-by` flags, and reports the chosen grouping strategy, the reasons for it,
+the column passes, conditional fallbacks and upper bounds on the number of distinct keys, without reading data
+pages. Locally it may read dictionary pages to tighten those bounds; over S3 it reads only footers. Every strategy
+is exact, and memory estimates stay estimates: execution enforces the budget. `ZPQ_NDV_UNION=0` turns off the
+optional dictionary-union probe, and `ZPQ_PARTAGG=1` forces an eligible plain GROUP BY through shared tables.
 
 **DECIMAL is exact.** DECIMAL columns, and numeric literals with a decimal point (`0.05` is DECIMAL(3,2), as in SQL),
 compute in scaled 128-bit integers, never through a double. Result types follow Trino's (Athena's) rules: `a + b` /
@@ -264,8 +256,8 @@ as in SQL: `x * 2` is NULL where `x` is, aggregates skip it, and a NULL row rais
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
 arrays; DELTA_BINARY_PACKED for INT32 / INT64; for other strings DELTA_BYTE_ARRAY where values share long prefixes and
 DELTA_LENGTH_BYTE_ARRAY otherwise (PLAIN for FIXED_LEN_BYTE_ARRAY, which DELTA_LENGTH_BYTE_ARRAY does not allow).
-DECIMAL columns re-encode losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never
-a lossy detour through DOUBLE). Direct projection copies preserve page indexes; re-encoded chunks get their own.
+DECIMAL columns re-encode losslessly: INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer, never
+a DOUBLE. Direct projection copies preserve page indexes; re-encoded chunks get their own.
 
 **Output layout.** A write that re-encodes (a filter, `--select` or a computed column) cuts its row groups from the
 rows it writes, in order, not from the input's row groups: one closes once it holds `--row-group-size` rows (default
@@ -315,7 +307,7 @@ bits.
 cache reads just the column chunks it needs, row group by row group, with io_uring (`O_DIRECT`) or `pread`, in a
 bounded window; see [Local reads](docs/local_io.md).
 
-**Stream** S3-to-S3 with byte-bounded in-flight memory independent of total file size — multipart upload as the encoder
+**Stream** S3-to-S3 with in-flight memory bounded independently of file size: multipart upload as the encoder
 produces bytes, a sliding row-group window for re-encode backpressure, and parallel fetch across files.
 
 ```bash
@@ -356,8 +348,8 @@ overrides that default. `-o -` selects stdout and defaults to NDJSON; explicit P
 `-o`. Binary stdout refuses a terminal. Limited Parquet row output rejects nested leaves and INT96; unlimited
 passthrough preserves both. A limited Parquet write of FLOAT16 widens to DOUBLE, as filtered writes do.
 Parquet aggregate output rejects integer sums outside int64; text output retains exact i128 sums.
-Existing S3 write support is unchanged; text formats, aggregate writes and limited Parquet S3 writes
-are unsupported. `--explain` still prints one aggregate plan JSON object without executing or writing an answer,
+An S3 `-o` takes Parquet copies and filtered writes only: text formats, aggregate writes and limited Parquet writes
+to S3 are unsupported. `--explain` still prints one aggregate plan JSON object without executing or writing an answer,
 even when `-o` is supplied.
 
 `--limit N` caps final result rows for every format and destination, after grouping and ordering. SQL LIMIT has the
@@ -387,9 +379,9 @@ bracket, and Parquet may lack its footer. Check exit status, including `set -o p
 
 ## Statistics: trust is opt-in
 
-Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate — but
-real-world writers ship inaccurate ones (we have a `parquet-mr 1.8.2` file in the test corpus whose recorded `min` is
-`2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently incorrect answer**.
+Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate, but
+real-world writers ship inaccurate ones: a `parquet-mr 1.8.2` file in the test corpus records a `min` of `2.00` for a
+column that contains `1.00`. A reader that trusts those statistics returns an incorrect answer without an error.
 
 By default, `min / max / sum` decode their values instead of taking the answer from statistics. Filters can still
 prune data using corroborated statistics. The metadata shortcuts have separate trust boundaries:
@@ -408,8 +400,8 @@ may be present. ZPQ writes `nan_count` for every float chunk it encodes; a chunk
 statistics, count or no count. The probe runs for row output, writes and S3 reads; aggregates over local files use it
 only for uncompressed chunks, where it costs less than the scan it replaces.
 
-If you know your writer's statistics are trustworthy, opt into the stats fast-path — `min / max / sum` answered from
-metadata in microseconds, without touching a data page:
+If you know your writer's statistics are accurate, `--trust-stats` answers `min / max / sum` from metadata in
+microseconds, without reading a data page:
 
 ```bash
 zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
@@ -418,9 +410,9 @@ zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
 `--trust-stats` also reads a float chunk's missing `nan_count` as zero, so `>` and `>=` prune on its bounds as if it
 held no NaN; a NaN row in such a chunk is then lost.
 
-`--trust-stats` is a scalpel: it trades correctness-on-bad-files for speed, and it's your call per query. `--scan-all`
-is the opposite extreme — no statistics at all, so row-group pruning is off too and every filter is evaluated on decoded
-values (`count(*)` still comes from the row counts).
+`--trust-stats` trades correctness on files with bad statistics for speed, per query. `--scan-all` uses no
+statistics at all: row-group pruning is off and every filter is evaluated on decoded values (`count(*)` still comes
+from the row counts).
 
 For supported flat OPTIONAL primitive columns that contain no nulls, `--fast-levels` can skip materializing definition
 levels. The check reads the encoded level stream rather than trusting writer statistics, and falls back to the normal
@@ -461,7 +453,7 @@ validates ZPQ-written Parquet with pyarrow; the workflow also identity-checks th
 
 ## Build
 
-Requires **Zig 0.17.0** (release, not master) — pinned in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
+Requires Zig 0.17.0 (the release, not master), pinned in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
 the pinned toolchain to `~/.zvm/0.17.0` and warms the build. The first build fetches prebuilt BoringSSL artifacts from
 R2 and checks them against the sha256 digests in `vendor/boring_tls/prebuilt.sha256`; `just fetch-deps` stores them in
 `vendor/boring_tls/prebuilt/` for offline builds. No source builds. No system OpenSSL.
@@ -496,7 +488,7 @@ python3 tools/homebrew_formula.py /absolute/path/to/releases/release.json \
 
 ## Use as a library
 
-The engine is consumable as a Zig module — the same sans-IO core the binaries use, minus the SQL frontend and its C
+The engine is consumable as a Zig module: the same sans-IO core the binaries use, minus the SQL frontend and its C
 parser (libzstd is still built from C, and BoringSSL is linked from the pinned prebuilts):
 
 ```zig
@@ -529,19 +521,8 @@ The Lambda takes `"profile": true` (summary in the response) and `"profile_url":
 Off, profiling costs a branch per span site; see [docs/profiling.md](docs/profiling.md) for what each span means,
 how the wall shares are computed, the measured cost, and a walkthrough.
 
-Frame pointers are on by default (cost measured in the noise), which means flamegraphs are a one-liner.
-
-```bash
-just flamegraph query data/benchmark_100mb.parquet \
-  --aggregate 'sum(int64_sorted) AS s, count(*) AS n'
-# wrote prof/flame-<ts>.svg
-```
-
-Sub-100 ms runs are too short to sample meaningfully — wrap in a 50× shell loop or use a multi-file glob to get hundreds
-of samples. Open the SVG in a browser to drill into hotspots.
-
-`just flamegraph-bpf <secs>` attaches via `profile-bpfcc` for long-running processes (eBPF-based, lower overhead, needs
-sudo).
+Frame pointers are on in both binaries, so `perf record --call-graph=fp` gives usable stacks; `just flamegraph <zpq
+args>` writes a flamegraph SVG (the contributor notes in `AGENTS.md` cover it and `just flamegraph-bpf`).
 
 ## Layout
 

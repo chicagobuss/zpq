@@ -215,7 +215,12 @@ class Zpq:
         return self.run({**options, "sql": sql})["ndjson"]
 
     def arrow(self, request):
-        """Return an optional PyArrow stream reader. Close/read it before closing this context."""
+        """Return a PyArrow record batch reader for a SQL or structured request.
+
+        PyArrow is optional and required for this method. Close the reader or exhaust it
+        before closing the context; batches already returned remain valid afterwards.
+        Query errors can surface while reading, including after earlier batches.
+        """
         try:
             from .zpq_arrow import open_reader
         except ImportError:

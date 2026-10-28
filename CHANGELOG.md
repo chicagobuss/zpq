@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased (0.5.1)
+
+- Add experimental Arrow C Data stream results to libzpq, with a PyArrow reader and Spark columnar integration.
+  Streams preserve typed values and independently owned batches; unsupported nested results are refused.
+
 ## 0.5.0 (2026-10-28)
 
 **Read "What to do" first if you script zpq or rely on its answers.** 0.5.0 changes what `zpq query` prints, fixes

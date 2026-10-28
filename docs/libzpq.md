@@ -66,7 +66,7 @@ with zpq.Zpq(max_memory="1GB") as z:
     exact_cli_text = z.query_raw("SELECT count(*) AS n FROM 'data.parquet'")
 ```
 
-`query()` returns a list of row dicts; `query_raw()` returns exact NDJSON. The binding has no Arrow export path.
+`query()` returns a list of row dicts; `query_raw()` returns exact NDJSON. For columnar results, see Arrow below.
 Exact by default: the values of the DECIMAL columns the response names come back as `decimal.Decimal`, every digit
 kept (`"83332533333.00"` is `Decimal('83332533333.00')`, not `83332533333.0`), in `query()` rows and in `run()`'s
 `agg`; other numbers are int or float as Python's JSON decoder reads them. `decimal=False` gives floats throughout,
@@ -329,7 +329,7 @@ large Parquet writes also start writeback in roughly 64 MiB ranges while later o
 is encoded. This hint does not wait for completion; the final data sync remains the fence.
 This applies to local files; S3 and standard output do not use this option. The parent
 directory is not synced, so this option does not guarantee rename survival after power loss.
-# Arrow C stream results (experimental, 0.5.1 probe)
+## Arrow C stream results (experimental)
 
 `zpq_run_arrow(ctx, request, len, &stream, &error)` selects a columnar answer instead of JSON. It is an additive
 symbol in `LIBZPQ_1`; ABI version 1's existing functions and status codes retain their meanings. The request uses

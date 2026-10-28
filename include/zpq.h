@@ -125,10 +125,13 @@ int zpq_run(zpq_ctx *ctx, const char *request_json, size_t len, char **out_json,
  * structured projection/filter/aggregate request. output_url and unsupported nested/logical types are refused.
  * ZPQ_OK means *out_stream owns a live stream. Query failures (including before its first batch) are reported by
  * get_schema/get_next as errno codes, with get_last_error's UTF-8 message. EOF is 0 with out.release == NULL.
- * Call failures use zpq_status and an optional zpq_free-owned *out_error. Failure clears out_stream.
- * Serialize callbacks on a stream. Separate streams may run concurrently. Release the stream before zpq_close;
- * release cancels further production and joins its producer. Each schema/batch is owned independently, survives
- * stream/context release and is freed by its own release callback, on any thread. Keep libzpq loaded until then.
+ * Call failures use zpq_status and an optional zpq_free-owned *out_error. Failure clears out_stream. Stream errors
+ * are sticky; get_last_error returns a NUL-terminated message valid until the next stream callback.
+ * The caller allocates the stream and calls its release callback exactly once on success. Serialize callbacks on
+ * one stream; separate streams may run concurrently. Each producer borrows ctx on a libzpq-owned thread. Release
+ * the stream before zpq_close; early release cancels production and joins its producer. Each returned schema/batch
+ * owns independent storage, can be moved, survives stream/context release and is freed by its own release callback,
+ * on any thread. Release callbacks do not free the caller's base structure. Keep libzpq loaded until all releases.
  * max_result_bytes caps cumulative Arrow buffer bytes, excluding schemas/structures, before handing out a batch.
  * Its default is max(request budget, 1 GiB). Earlier batches remain valid on error. Retained arrays are caller-held
  * memory; the bounded producer queue is separate from them. max_memory retains the existing query-budget meaning.

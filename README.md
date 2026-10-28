@@ -1,16 +1,18 @@
 # zpq
 
-An agentically-engineered Apache Parquet engine in Zig, built for serverless compute against object storage. It does
-the least work a query needs for an exact answer: statistics and footers first, and only the pages that matter.
+**zpq** is a fast Parquet processing tool. It plays nicely with other tools on the command line, runs well in
+serverless environments like AWS Lambda, and embeds as a library inside other tools.
+
+It is an agentically-engineered engine in Zig that does the least work a query needs for an exact answer: statistics
+and footers first, and only the pages that matter. One sans-IO core builds a workstation CLI (`zpq`), an AWS Lambda
+bootstrap (`zpq-lambda`) and a C library ([libzpq](docs/libzpq.md)), each self-contained: native S3 and SigV4,
+vendored prebuilt BoringSSL and an in-tree event loop, with no AWS SDK and no system OpenSSL.
 
 Workloads it's intended for:
 
 * Iceberg / Delta table maintenance: one Lambda per file, filter and rewrite in place.
 * Billing and cost roll-ups: answer from row-group statistics when possible, decode pages only when necessary.
 * Log summarization: Parquet queries without the Athena round-trip, and one-line CLI output for ad-hoc work.
-
-Two binaries from one sans-IO core: a workstation CLI (`zpq`) and an AWS Lambda bootstrap (`zpq-lambda`). Native SigV4,
-vendored prebuilt BoringSSL, in-tree event loop. No AWS SDK, no system OpenSSL.
 
 ## First five minutes
 

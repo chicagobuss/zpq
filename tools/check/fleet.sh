@@ -63,14 +63,10 @@ compile_gb=10
 target_gb=$((compile_gb * $(wc -w <<< "$steps")))
 # Liveness and load from the o11y feed; a builder must be idle (live, half its cores free, a quarter of its memory).
 curl -s -m 10 "$o11y" > "$W/o11y.json" || echo '{"hosts": []}' > "$W/o11y.json"
-load() {  # host: "offline", "busy", or "idle N" with N the target builds its free memory holds (target_gb each)
-  "$py" -c 'import json, sys
-h = {x["host"]: x for x in json.load(open(sys.argv[1])).get("hosts", [])}.get(sys.argv[2])
-need = int(sys.argv[3]) << 30
-free = (h or {}).get("mem_total", 0) * ((h or {}).get("mem_avail_pct") or 0) / 100
-print("offline" if not h or h.get("state") != "live" else
-      "idle %d" % (free // need) if h["load1"] < 0.5 * h["cores"] and free >= need else "busy")' \
-    "$W/o11y.json" "${O11Y_NAME[$1]:-$1}" "$target_gb"
+"$py" tools/check/fleet_load.py --self-test >/dev/null ||
+  { echo "fleet: the builder probe fails its self-test" >&2; exit 2; }
+load() {  # host: "offline", "busy", or "idle N", N the target builds its free memory holds (tools/check/fleet_load.py)
+  "$py" tools/check/fleet_load.py "$W/o11y.json" "${O11Y_NAME[$1]:-$1}" "$target_gb"
 }
 probe() {  # host: why it must not be used, or nothing
   if [[ $1 == "$me" ]]; then sh tools/check/fleet-host.sh timing "$1"

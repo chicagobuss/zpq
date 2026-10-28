@@ -98,6 +98,7 @@ pub fn ownerIdentity(
     return best;
 }
 
+/// min/max of a bare column returns one of that column's values, so its output can carry the column's type.
 pub fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;

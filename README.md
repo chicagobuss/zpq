@@ -367,7 +367,7 @@ bracket, and Parquet may lack its footer. Check exit status, including `set -o p
 
 Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate — but
 real-world writers ship inaccurate ones (we have a `parquet-mr 1.8.2` file in the test corpus whose recorded `min` is
-`2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently wrong answer**.
+`2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently incorrect answer**.
 
 By default, `min / max / sum` decode their values instead of taking the answer from statistics. Filters can still
 prune data using corroborated statistics. The metadata shortcuts have separate trust boundaries:
@@ -435,7 +435,7 @@ copies; a column dropped or re-encoded loses its filter unless `--bloom-filter` 
 CI ([`.github/workflows/verify.yml`](.github/workflows/verify.yml)) runs unit tests, Lambda integration tests, CLI
 cross-implementation smoke, and the `apache/parquet-testing` conformance corpus on every code change. The smoke path
 validates ZPQ-written Parquet with pyarrow; the workflow also identity-checks the Lambda deploy artifact to catch the
-"packaged the wrong binary" class of bug.
+"packaged an incorrect binary" class of bug.
 
 ## Build
 

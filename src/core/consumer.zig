@@ -657,136 +657,7 @@ pub const SliceReader = slice_reader.SliceReader;
 const decimalKind = consumer_column.decimalKind;
 const decodeDecimalI128 = consumer_column.decodeDecimalI128;
 
-/// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
-/// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die
-/// with the row group.
-///
-/// A coded column (`codes` + `dict`) keeps its codes when `keep_codes` lets the buffer take them: the buffer is still
-/// empty, so every code indexes this one dictionary, which is copied into `arena`. Otherwise its values are gathered
-/// first, on `scratch`.
-fn appendSelected(
-    buf: *OutputAggregator.ColumnBuf,
-    src_in: filter_eval.Batch.Column,
-    sel: *const filter_selection.SelectionVector,
-    surviving: usize,
-    arena: std.mem.Allocator,
-    keep_codes: bool,
-    scratch: std.mem.Allocator,
-) !void {
-    var src = src_in;
-    if (src.codes() != null) {
-        const fresh = switch (buf.*) {
-            inline else => |*tb| tb.values.items.len == 0 and !tb.coded,
-        };
-        // Codes only when the dictionary, copied with them, is no bigger than the rows: a selective filter over a
-        // chunk of mostly distinct values would otherwise copy its whole dictionary for a few rows.
-        const dict_len = switch (src) {
-            inline else => |c| c.dict.len,
-        };
-        if (keep_codes and fresh and dict_len <= surviving) return appendSelectedCodes(buf, src, sel, surviving, arena);
-        src = try agg_coded.materialize(scratch, src);
-    }
-    switch (buf.*) {
-        inline else => |*tb| if (tb.coded) try materializeBuf(tb, arena),
-    }
-    switch (src) {
-        inline else => |c, tag| {
-            const T = @TypeOf(c.values[0]);
-            const tb = &@field(buf.*, @tagName(tag));
-            const before = tb.values.items.len;
-            // Exact sizing: the aggregator usually holds one row group, and ArrayList growth would leave half again
-            // as much unused (and, being arena memory, never reclaimed).
-            try tb.values.ensureTotalCapacityPrecise(arena, tb.values.items.len + surviving);
-            const out = tb.values.addManyAsSliceAssumeCapacity(surviving);
-            encoder.compactByMask(T, c.values, sel.mask, out);
-            if (T == []const u8) {
-                var total: usize = 0;
-                for (out) |v| total += v.len;
-                const block = try arena.alloc(u8, total);
-                var pos: usize = 0;
-                for (out) |*v| {
-                    @memcpy(block[pos..][0..v.len], v.*);
-                    v.* = block[pos..][0..v.len];
-                    pos += v.len;
-                }
-            }
-            // Levels stay one per row however the batches come: a computed column is NULL-free in one row group (no
-            // levels, the vector kernels' result) and NULL in the next, so a batch without levels appends present
-            // rows to a buffer that has them, and a buffer gaining levels first gives its earlier rows theirs.
-            const max_def = @max(c.max_def, tb.max_def);
-            if (max_def == 0) return;
-            if (tb.max_def == 0) {
-                try tb.def_levels.ensureTotalCapacityPrecise(arena, before);
-                @memset(tb.def_levels.addManyAsSliceAssumeCapacity(before), max_def);
-            } else if (tb.max_def != max_def) for (tb.def_levels.items) |*d| {
-                if (d.* == tb.max_def) d.* = max_def;
-            };
-            tb.max_def = max_def;
-            try tb.def_levels.ensureTotalCapacityPrecise(arena, tb.def_levels.items.len + surviving);
-            const dl_out = tb.def_levels.addManyAsSliceAssumeCapacity(surviving);
-            if (c.def_levels) |dl| {
-                encoder.compactByMask(u32, dl, sel.mask, dl_out);
-                // A flat column is present at its own max; carry it to the buffer's.
-                if (c.max_def != max_def) for (dl_out) |*d| {
-                    if (d.* == c.max_def) d.* = max_def;
-                };
-            } else @memset(dl_out, max_def);
-        },
-    }
-}
-
-fn appendSelectedCodes(
-    buf: *OutputAggregator.ColumnBuf,
-    src: filter_eval.Batch.Column,
-    sel: *const filter_selection.SelectionVector,
-    surviving: usize,
-    arena: std.mem.Allocator,
-) !void {
-    switch (src) {
-        inline else => |c, tag| {
-            const T = @TypeOf(c.dict[0]);
-            const tb = &@field(buf.*, @tagName(tag));
-            try tb.codes.ensureTotalCapacityPrecise(arena, surviving);
-            encoder.compactByMask(u32, c.codes.?, sel.mask, tb.codes.addManyAsSliceAssumeCapacity(surviving));
-            if (T == []const u8) {
-                // The entries point into the source's decoded dictionary page, which dies with the row group.
-                var total: usize = 0;
-                for (c.dict) |v| total += v.len;
-                const block = try arena.alloc(u8, total);
-                const dict = try arena.alloc([]const u8, c.dict.len);
-                var pos: usize = 0;
-                for (dict, c.dict) |*d, v| {
-                    @memcpy(block[pos..][0..v.len], v);
-                    d.* = block[pos..][0..v.len];
-                    pos += v.len;
-                }
-                tb.dict = dict;
-            } else tb.dict = try arena.dupe(T, c.dict);
-            tb.coded = true;
-            if (c.max_def == 0) return;
-            tb.max_def = c.max_def;
-            try tb.def_levels.ensureTotalCapacityPrecise(arena, surviving);
-            const dl_out = tb.def_levels.addManyAsSliceAssumeCapacity(surviving);
-            if (c.def_levels) |dl| {
-                encoder.compactByMask(u32, dl, sel.mask, dl_out);
-            } else @memset(dl_out, c.max_def);
-        },
-    }
-}
-
-/// Turn a coded buffer back into values, for an append it cannot keep codes for.
-fn materializeBuf(tb: anytype, arena: std.mem.Allocator) !void {
-    const T = @TypeOf(tb.dict[0]);
-    try tb.values.ensureTotalCapacityPrecise(arena, tb.codes.items.len);
-    const vals = tb.values.addManyAsSliceAssumeCapacity(tb.codes.items.len);
-    for (vals, tb.codes.items, 0..) |*v, k, r| {
-        const present = tb.max_def == 0 or tb.def_levels.items[r] == tb.max_def;
-        v.* = if (present) tb.dict[k] else std.mem.zeroes(T);
-    }
-    tb.codes.clearRetainingCapacity();
-    tb.coded = false;
-    tb.dict = &.{};
-}
+const appendSelected = output.appendSelected;
 
 /// `decodeWriteColumn`, but a dictionary-encoded chunk of a type the write path keeps unconverted decodes to codes
 /// (see `ColumnChunkReader.readAllCodes`); anything else decodes as values.
@@ -825,50 +696,8 @@ fn decodeWriteColumnMaybeCoded(
     return col;
 }
 
-fn appendIntoBuf(
-    buf: *OutputAggregator.ColumnBuf,
-    src: filter_eval.Batch.Column,
-    dupe_arena: std.mem.Allocator,
-) !void {
-    switch (src) {
-        .i32 => |c| try appendTyped(i32, &buf.i32, c.values, c.def_levels, c.max_def, dupe_arena),
-        .i64 => |c| try appendTyped(i64, &buf.i64, c.values, c.def_levels, c.max_def, dupe_arena),
-        .f32 => |c| try appendTyped(f32, &buf.f32, c.values, c.def_levels, c.max_def, dupe_arena),
-        .f64 => |c| try appendTyped(f64, &buf.f64, c.values, c.def_levels, c.max_def, dupe_arena),
-        .boolean => |c| try appendTyped(bool, &buf.boolean, c.values, c.def_levels, c.max_def, dupe_arena),
-        .i128 => |c| try appendTyped(i128, &buf.i128, c.values, c.def_levels, c.max_def, dupe_arena),
-        .string => |c| {
-            // Dupe slice bytes into agg arena so they outlive the source RG.
-            const duped = try dupe_arena.alloc([]const u8, c.values.len);
-            for (c.values, 0..) |v, i| duped[i] = try dupe_arena.dupe(u8, v);
-            try appendTyped([]const u8, &buf.string, duped, c.def_levels, c.max_def, dupe_arena);
-        },
-    }
-}
-
-fn appendTyped(
-    comptime T: type,
-    tb: anytype,
-    values: []const T,
-    def_levels: ?[]const u32,
-    max_def: u32,
-    arena: std.mem.Allocator,
-) !void {
-    try tb.values.appendSlice(arena, values);
-    if (max_def > 0) {
-        tb.max_def = max_def;
-        const dl = def_levels orelse {
-            // Source was REQUIRED-as-dense but agg's max_def says optional.
-            // Emit max_def for every row (all present).
-            const n = values.len;
-            const ones = try arena.alloc(u32, n);
-            @memset(ones, max_def);
-            try tb.def_levels.appendSlice(arena, ones);
-            return;
-        };
-        try tb.def_levels.appendSlice(arena, dl);
-    }
-}
+const appendIntoBuf = output.appendIntoBuf;
+const appendTyped = output.appendTyped;
 
 /// Encode the aggregator's accumulated rows as ONE output row group,
 /// write to sink, and return RGOut. Caller should `resetAggregator()`
@@ -1175,17 +1004,7 @@ pub const RGEncoder = struct {
 
 pub const bufRows = output.bufRows;
 
-/// Append the rows `sel` keeps of `src` to `buf`, copying them onto `arena` (`appendSelected`, never keeping codes).
-pub fn appendRows(
-    buf: *OutputAggregator.ColumnBuf,
-    src: filter_eval.Batch.Column,
-    sel: *const filter_selection.SelectionVector,
-    surviving: usize,
-    arena: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-) !void {
-    return appendSelected(buf, src, sel, surviving, arena, false, scratch);
-}
+pub const appendRows = output.appendRows;
 
 pub const BufRange = output.BufRange;
 pub const joinRows = output.joinRows;
@@ -9089,35 +8908,6 @@ test "regression: a renamed passthrough is its leaf renamed and flat, NULL where
     const flat_defs = [_]u32{ 0, 1, 1, 1 };
     const flat: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &flat_defs, .max_def = 1, .has_nulls = true } };
     try testing.expectEqual(flat.i32.def_levels.?.ptr, (try namedLevels(a, .{ .ci = 0, .name = "k" }, flat)).i32.def_levels.?.ptr);
-}
-
-test "appendSelected keeps one level per row when a column's batches come with and without levels" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const vals = [_]i64{ 7, 8 };
-    const defs = [_]u32{ 1, 0 };
-    // A computed column NULL in one row group (levels) and NULL-free in the next (none), in both orders.
-    const with: filter_eval.Batch.Column = .{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
-    const without: filter_eval.Batch.Column = .{ .i64 = .{ .values = &vals } };
-    var sel = try filter_selection.SelectionVector.init(a, 2);
-    const Case = struct { first: filter_eval.Batch.Column, second: filter_eval.Batch.Column, want: [4]u32 };
-    for ([_]Case{
-        .{ .first = with, .second = without, .want = .{ 1, 0, 1, 1 } },
-        .{ .first = without, .second = with, .want = .{ 1, 1, 1, 0 } },
-    }) |c| {
-        var buf: OutputAggregator.ColumnBuf = .{ .i64 = .{} };
-        try appendSelected(&buf, c.first, &sel, 2, a, false, a);
-        try appendSelected(&buf, c.second, &sel, 2, a, false, a);
-        try std.testing.expectEqual(@as(usize, 4), buf.i64.values.items.len);
-        try std.testing.expectEqualSlices(u32, &c.want, buf.i64.def_levels.items);
-        try std.testing.expectEqual(@as(u32, 1), buf.i64.max_def);
-    }
-    // NULL-free batches alone carry no levels.
-    var plain: OutputAggregator.ColumnBuf = .{ .i64 = .{} };
-    try appendSelected(&plain, without, &sel, 2, a, false, a);
-    try appendSelected(&plain, without, &sel, 2, a, false, a);
-    try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
 }
 
 test "Survivors: computed outputs evaluate over the kept rows only, with their levels, codes and exact values" {

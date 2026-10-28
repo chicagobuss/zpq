@@ -213,7 +213,17 @@ jobs:
           open("RELEASE_NOTES.md", "w").write(m.group(1).strip() + "\n")
           PY_NOTES
 
-      - name: Upload to R2 (public)
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/*
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+
+      # R2 mirrors the GitHub Release; a failed upload (say, rotated credentials) must not block the release.
+      - name: Upload to R2 (public mirror)
+        continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -226,11 +236,3 @@ jobs:
             aws s3 cp "$file" "s3://zpq/releases/${TAG}/${name}" --endpoint-url "$R2_ENDPOINT"
             aws s3 cp "$file" "s3://zpq/releases/latest/${name}" --endpoint-url "$R2_ENDPOINT"
           done
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          files: release/*
-          body_path: RELEASE_NOTES.md
-          fail_on_unmatched_files: true

@@ -436,7 +436,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         }
         // The C ABI plain and under ASan, the Python binding and the CLI/libzpq/Lambda byte parity; it builds its own.
         if (add(b, &stages, wanted, runner, dir, tier_name, "libzpq", "plain", 3600)) |r| {
-            r.addArgs(&.{ "--", "bash", "tests/libzpq/run.sh" });
+            r.addArgs(&.{ "--", "bash", "src/libzpq/check.sh" });
             r.setEnvironmentVariable("ZIG", b.graph.zig_exe);
             r.setEnvironmentVariable("OPTIMIZE", "ReleaseFast");
             r.setEnvironmentVariable("PYTHON", python);

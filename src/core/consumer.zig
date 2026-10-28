@@ -5183,11 +5183,21 @@ test "scalar dictionary distinct caches observed codes and falls back on memory 
     try t.expect(seen.disabled and seen.words.len == 0);
     try t.expectEqual(@as(usize, 0), table_budget.used.load(.monotonic));
 
-    // The bitmap fits, but an empty string's exact entry fits only after the bitmap is returned.
-    var tight: core_memory.SharedBudget = .{ .limit = @sizeOf(expr_agg.DistinctSet) + 48 };
+    // Measure the exact set and arena charge for an empty string; the bitmap must be returned to make it fit.
+    var quote_budget: core_memory.SharedBudget = .{ .limit = 4096 };
+    var quote = expr_agg.DistinctAcc.initEmpty(&quote_budget);
+    defer quote.deinit(a);
+    try quote.insertBytes(a, "");
+    quote.heap().?.releaseSlack();
+    const exact = quote_budget.used.load(.monotonic);
+    quote.deinit(a);
+    try t.expectEqual(@as(usize, 0), quote_budget.used.load(.monotonic));
+    var tight: core_memory.SharedBudget = .{ .limit = exact };
     var tight_scratch: core_memory.Charged = .{ .child = a, .budget = &tight };
     var tight_seen: ScalarDistinctSeen = .{};
     var tight_acc = expr_agg.DistinctAcc.initEmpty(&tight);
+    defer tight_seen.deinit(tight_scratch.allocator());
+    defer tight_acc.deinit(a);
     var one = try filter_selection.SelectionVector.init(a, 1);
     defer one.deinit();
     var first = col;

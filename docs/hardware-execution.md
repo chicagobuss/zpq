@@ -51,16 +51,18 @@ accept decimal bytes or uppercase `K` / `M` binary suffixes:
 | `ZPQ_HW_L1D_BYTES` | Replace discovered L1 data sizes, in bytes |
 | `ZPQ_HW_L2_BYTES` | Replace discovered L2 sizes, in bytes |
 | `ZPQ_HW_L3_BYTES` | Replace discovered L3 sizes, in bytes |
-| `ZPQ_GROUP_KEY_FD` | Fault-free dependent integer GROUP BY keys; `0` forces legacy grouping |
-| `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` selects the legacy full-row-group evaluator |
+| `ZPQ_GROUP_KEY_FD` | Fault-free dependent integer GROUP BY keys; `0` groups by every key |
+| `ZPQ_EXPR_BATCH_ROWS` | Force computed DOUBLE batches; `0` evaluates a whole row group at once |
 | `ZPQ_DECODE_BATCH_ROWS` | Unset selects cache-sized decode for admitted float trees; `0`, invalid or overflowing values keep ordinary memory admission; positive values force the window path with a row cap |
-| `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` keeps legacy expansion |
-| `ZPQ_INTEGER_RECORDS` | Eligible integer inline aggregation; `0` selects the established executor |
-| `ZPQ_BYTE_RECORDS` | Eligible short-key inline aggregation; `0` selects the established executor |
+| `ZPQ_LEVEL_RUNS` | Aggregate level runs: unset chooses run-dominated pages, `1` forces streaming, `0` always expands levels |
+| `ZPQ_INTEGER_RECORDS` | Eligible integer inline aggregation; `0` selects the general executor |
+| `ZPQ_BYTE_RECORDS` | Eligible short-key inline aggregation; `0` selects the general executor |
 | `ZPQ_BYTE_TOP_PARTITIONS` | Short-key SUM top-H partitions; unset costs L2 fold scratch and L3 producer buffers, `0` keeps 2048, positive values force a power of two in 64–16384 |
 | `ZPQ_BYTE_TOP_BATCH_ROWS` | Short-key SUM top-H decode rows; unset uses shared cache headroom, `0` keeps ordinary decode admission, positive values force a power of two in 64–16384 |
-| `ZPQ_MSD_RECORDS` | Eligible retained-page COUNT top-k; `0` selects the established executor |
+| `ZPQ_MSD_RECORDS` | Eligible retained-page COUNT top-k; `0` selects the general executor |
 | `ZPQ_MSD_CACHE_ROWS` | Retained-group scratch rows; unset uses shared L2, `0` keeps 4096, positive values force a bounded power of two |
+| `ZPQ_PARTAGG` | `1` forces an eligible plain GROUP BY through shared tables |
+| `ZPQ_NDV_UNION` | `0` turns off the planner's dictionary-union probe |
 
 A positive `ZPQ_DECODE_BATCH_ROWS` caps windows at that many rows, rounded down
 to a multiple of 64 with a minimum of 64. Ledger admission and its measured
@@ -72,7 +74,7 @@ decimal integer. `ZPQ_EXPR_BATCH_ROWS=0` also disables automatic cache decode.
 Sharing sets remain real under size overrides. Zero means unknown, letting a
 caller test its conservative fallback. Invalid values leave discovery intact.
 Execution-specific `ZPQ_*` forced knobs belong in this table as they land;
-zero selects the legacy executor. Cache choices may change evaluation batches
+zero selects the general executor. Cache choices may change evaluation batches
 or partition counts, never result bytes, checked-error precedence, row-group
 boundaries, page sizes, float summation blocks or merge order. A cache size
 must never reach any choice that changes bytes or float bits.

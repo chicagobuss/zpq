@@ -1,24 +1,19 @@
 # Execution overrides
 
-These diagnostic environment variables preserve query semantics. Admission still checks the query shape, types,
-ownership and memory budget; forcing a layout never bypasses those checks. Leave them unset in ordinary use.
+These environment variables are for diagnosis and testing. They choose among execution paths that give the same
+answer; they never change query semantics or bypass the checks on query shape, types and memory budget. Leave them
+unset in ordinary use. The [hardware execution catalog](hardware-execution.md) lists every override.
 
-The shared [hardware execution catalog](hardware-execution.md) lists all execution and hardware overrides.
-The [packed byte-key SUM path](byte_topk.md) costs owner partitions and producer windows against the shared L2
-budget and L3 share per active worker. Its independent partition/window overrides are listed in that catalog as well.
-Eligible inline paths are enabled by default. For retained grouping, an unset scratch override uses the per-worker
-L2 budget; zero selects the legacy 4096-record window. A positive override rounds down to a power of two after
-clamping to 16–16384 records.
+Eligible fast paths are on by default. For the path switches (`ZPQ_INTEGER_RECORDS`, `ZPQ_BYTE_RECORDS`,
+`ZPQ_MSD_RECORDS`), only the literal `0` turns a path off; zpq then uses its general executor.
 
-For the three path switches, only the literal `0` disables the path. For the scratch override, malformed values use
-the default. The selected scratch size is prepaid and appears as `cache_rows` on the `msd_fold` profile event.
+`ZPQ_MSD_CACHE_ROWS` sets the scratch size, in records, of the retained-page COUNT top-k path. Unset, it is sized from
+the smallest per-worker L2 cache over the process's CPUs (640 KiB when the cache size cannot be read): a 512 KiB
+budget gives 2048 records and 640 KiB gives 4096. `0` selects a fixed 4096. A positive value is clamped to
+16–16384 and rounded down to a power of two; a malformed value uses the default. The size chosen is reserved from the
+memory budget and reported as `cache_rows` on the `msd_fold` profile event.
 
-Retained grouping uses `hw.l2BytesPerWorkerOr(640 << 10)`, which supplies the minimum per-worker L2 budget over the
-process affinity mask and uses a 640 KiB fallback when discovery is unavailable. Detection stays in the shared module.
-Sizing subtracts local metadata and one radix frame, leaves half the remainder for input and nested frames, then fits
-two record arrays. A 512 KiB worker budget chooses 2048 records; 640 KiB chooses 4096. Initial partition counts remain
-fixed pending a separate change to their ownership arrays and reservation proofs.
+The [packed byte-key SUM path](byte_topk.md) sizes its partitions and decode windows from the shared L2 and L3 caches;
+its overrides are in the catalog too.
 
-Scratch size changes only where exact refinement copies a bucket into bounded arrays. It changes neither identity
-nor first-input ordinals, output ordering or output encoding. The path counts integers; floating-point reductions
-remain on their existing execution path and retain their summation rules.
+None of these settings changes group identity, output order, output bytes or floating-point summation order.

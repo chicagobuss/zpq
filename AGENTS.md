@@ -108,8 +108,8 @@ When picking a perf target, the flamegraph is the verdict.
 - Line width is **120 columns** for Zig, Python, and shell. Enforced by convention only — `zig fmt` does not wrap lines
   and will not reflow or complain, so it is on you and on review.
 - The 120 limit governs *source*. Human-facing output — `--help` text, error and diagnostic messages — wraps at **80**
-  so it renders in a default terminal. `usage_text` in `src/cli/main.zig` is deliberately narrow for this reason; do
-  not widen it to match the source limit.
+  so it renders in a default terminal. `src/cli/help.txt` (embedded as `usage_text`) is deliberately narrow for this
+  reason; do not widen it to match the source limit.
 - Machine-readable output is exempt from both limits. Never insert line breaks into the JSON status/summary format
   strings — a break there corrupts the output.
 - Comments carry the *why*, not the *what*. If a comment restates what the next line plainly does, delete it. Keep the

@@ -183,6 +183,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.builtin.Optimize) Artifac
     cli_version.addOption([]const u8, "revision", cfg.revision);
     cli_zpq.root.addImport("cli_version", cli_version.createModule());
     const cli = b.addExecutable(.{ .name = "zpq", .root_module = cli_zpq.root });
+    addCpuStart(b, cli, target);
 
     // The correctness runner: JSON cases, in-process zpq, the DuckDB CLI as the oracle.
     const check_module = b.createModule(.{
@@ -196,6 +197,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.builtin.Optimize) Artifac
 
     const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, cfg.sql, cfg.strip);
     const lambda = b.addExecutable(.{ .name = "zpq-lambda", .root_module = lambda_zpq.root });
+    addCpuStart(b, lambda, target);
 
     // libzpq: the JSON handler behind a C ABI (include/zpq.h).
     var libzpq_deps = CoreDeps.init(b, target, optimize, cfg.fetch_prebuilt, true);
@@ -733,6 +735,28 @@ fn addCoreModule(
         zpq_mod.addImport("liteparser_c", deps.liteparser_c);
     }
     return .{ .zpq = zpq_mod, .build_options = opts_mod };
+}
+
+// libc's initialization calls compiler-rt before constructors or Zig's main. Check at ELF entry, while only
+// baseline instructions and raw syscalls are safe; the engine, allocator and compiler-rt keep their target CPU.
+fn addCpuStart(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
+    if (target.result.cpu.arch != .x86_64 or target.result.os.tag != .linux or !target.result.abi.isMusl()) return;
+    if (!std.Target.x86.featureSetHasAll(target.result.cpu.features, .{
+        .avx, .avx2, .bmi, .bmi2, .fma, .f16c, .lzcnt, .movbe,
+    })) return;
+
+    var query = target.query;
+    query.cpu_model = .baseline;
+    query.cpu_features_add = .empty;
+    query.cpu_features_sub = .empty;
+    const module = b.createModule(.{
+        .target = b.resolveTargetQuery(query),
+        .optimize = .ReleaseFast,
+        .stack_protector = false,
+    });
+    module.addCSourceFile(.{ .file = b.path("src/cpu_start.c"), .flags = &.{ "-ffreestanding", "-fno-builtin" } });
+    exe.root_module.addObject(b.addObject(.{ .name = "cpu-start", .root_module = module }));
+    exe.entry = .{ .symbol_name = "zpq_cpu_start" };
 }
 
 const Binary = enum { cli, lambda };

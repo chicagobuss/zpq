@@ -154,6 +154,23 @@ jobs:
         with:
           version: 0.17.0
 
+      - name: Download x86_64 release archives for CPU startup smoke
+        if: matrix.target == 'x86_64-linux-musl'
+        uses: actions/download-artifact@v4
+        with:
+          name: zpq-linux-x86_64
+          path: cpu-release
+
+      - name: Check shipped x86_64 startup on CPUs without AVX2
+        if: matrix.target == 'x86_64-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          mkdir -p cpu-release/default cpu-release/compat
+          tar -xzf cpu-release/*-x86_64-linux-musl.tar.gz -C cpu-release/default
+          tar -xzf cpu-release/*-x86_64-linux-musl-compat.tar.gz -C cpu-release/compat
+          python3 tools/check/cpu_start.py --default cpu-release/default/bin/zpq --compat cpu-release/compat/bin/zpq
+
       # The shipped CLI through the release cases, and on Linux the shipped Lambda through the fake runtime.
       - name: Run the shipped release artifacts
         env:

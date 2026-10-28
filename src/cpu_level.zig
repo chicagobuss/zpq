@@ -1,7 +1,8 @@
 //! The x86-64-v3 release build's startup check: on a CPU without one of the level's features the binary would die
 //! with SIGILL somewhere in its first query, so it says which feature is missing and where the compat build is, and
 //! exits 3. Compiled in only where the target CPU assumes the features; a baseline build checks nothing.
-//! Code before `main` (Zig's and musl's start-up) can already use them; the check runs first thing in `main`.
+//! The x86_64 Linux musl build also checks at ELF entry (cpu_start.c), before libc can use compiler-rt's v3 code.
+//! This check runs first thing in `main`, including the test hook used on hosts that support every feature.
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -62,37 +62,10 @@ const DistinctBytes = distinct.DistinctBytes;
 
 pub const DistinctSet = distinct.DistinctSet;
 pub const DistinctAcc = distinct.DistinctAcc;
-pub const Accumulator = group_state.Accumulator;
+pub const accumulator_mod = @import("aggregate/accumulator.zig");
+pub const Accumulator = accumulator_mod.Accumulator;
 
-/// A destination still being scanned must copy borrowed winners before its source arena can be reset.
-pub fn mergePersistent(
-    dst: *Accumulator,
-    src: *Accumulator,
-    allocator: std.mem.Allocator,
-    merge: anytype,
-) !void {
-    switch (dst.*) {
-        .min_arena, .max_arena => |*value| {
-            if (src.stringValue()) |bytes| try value.consider(bytes, dst.* == .min_arena);
-            switch (src.*) {
-                .min_bytes, .max_bytes => |b| if (b) |owned| allocator.free(owned),
-                else => {},
-            }
-            if (src.* == .min_arena) src.min_arena.ref = null;
-            if (src.* == .max_arena) src.max_arena.ref = null;
-            if (src.* == .min_bytes) src.min_bytes = null;
-            if (src.* == .max_bytes) src.max_bytes = null;
-        },
-        else => {
-            // Fixed-key destinations keep their established owned-string payload.
-            if (src.* == .min_arena or src.* == .max_arena) {
-                const bytes = if (src.stringValue()) |b| try allocator.dupe(u8, b) else null;
-                src.* = if (src.* == .min_arena) .{ .min_bytes = bytes } else .{ .max_bytes = bytes };
-            }
-            try merge(dst, src, allocator);
-        },
-    }
-}
+pub const mergePersistent = accumulator_mod.mergePersistent;
 
 pub const AvgState = types.AvgState;
 pub const ResolveError = types.ResolveError;
@@ -198,7 +171,7 @@ pub fn statsCoverageComplete(
 
 /// `a + b` for counts a footer claims: each file's is bounded (`metadata.max_row_count`), their sum across files is
 /// not. Past i64, the type count() answers in, it is an error rather than a count that cannot be written.
-const addRowCount = group_state.addRowCount;
+const addRowCount = accumulator_mod.addRowCount;
 
 /// Update one accumulator from a row group's metadata WITHOUT
 /// decoding. Returns true on success, false if the column's stats
@@ -4547,35 +4520,6 @@ test "round 4: detach clears an inline budget" {
     try acc.insertU64(a, 3);
     try acc.insertU64(a, 4);
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
-}
-
-test "round 4: copy merge into an empty accumulator keeps the source budget" {
-    const a = testing.allocator;
-    var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
-    var src: Accumulator = .{ .distinct = .initEmpty(&budget) };
-    defer src.distinct.deinit(a);
-    var dst: Accumulator = .{ .distinct = .{} };
-    defer dst.distinct.deinit(a);
-    for (0..4) |v| try src.distinct.insertU64(a, v);
-    budget.limit = budget.used.load(.monotonic);
-    try testing.expectError(error.ExceededMemoryBudget, dst.merge(src, a));
-    try testing.expectEqual(@as(usize, 4), src.distinct.count());
-    try testing.expectEqual(budget.limit, budget.used.load(.monotonic));
-}
-
-test "round 4: copy merge keeps an installed destination budget" {
-    const a = testing.allocator;
-    var src_budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
-    var dst_budget = SharedBudget{ .limit = @sizeOf(DistinctSet) / 2, .block = 1 };
-    var src: Accumulator = .{ .distinct = .initEmpty(&src_budget) };
-    defer src.distinct.deinit(a);
-    var dst: Accumulator = .{ .distinct = .initEmpty(&dst_budget) };
-    defer dst.distinct.deinit(a);
-    for (0..4) |v| try src.distinct.insertU64(a, v);
-    try testing.expectError(error.ExceededMemoryBudget, dst.merge(src, a));
-    try testing.expect(dst.distinct.budgetPtr() == &dst_budget);
-    try testing.expectEqual(@as(usize, 0), dst.distinct.count());
-    try testing.expectEqual(@as(usize, 0), dst_budget.used.load(.monotonic));
 }
 
 test "round 4: private table ceiling includes a spilled object" {

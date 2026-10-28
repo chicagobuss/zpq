@@ -1,4 +1,9 @@
 const std = @import("std");
+const filter_ast = @import("../filter/ast.zig");
+const filter_eval = @import("../filter/eval.zig");
+const filter_selection = @import("../filter/selection.zig");
+const expr_agg = @import("../expr/agg.zig");
+const SelectedBatch = @import("../selected_batch.zig").SelectedBatch;
 const profile = @import("../../profile.zig");
 const schema = @import("../schema.zig");
 const page_mod = @import("../parquet/page.zig");
@@ -155,5 +160,74 @@ pub fn rebaseRowGroupOffsets(rg: *schema.RowGroup, base: i64) void {
             if (md.index_page_offset) |ip| md.index_page_offset = ip + base;
         }
     }
+}
+
+
+/// One row group as `scanRGForAgg` reads it. Everything is borrowed.
+pub const RowSubgroup = struct { group: *const @import("../row_subgroups.zig").Group, rows: @import("column.zig").RowRange };
+
+pub const AggRowGroup = struct {
+    subgroup: ?RowSubgroup = null,
+    rg: *const schema.RowGroup,
+    /// Input file and row-group index, for profile spans only.
+    file_index: usize = 0,
+    rg_index: usize = 0,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    /// The outer filter; null when there is none or statistics prove every row passes it.
+    filter: ?filter_ast.Filter,
+    /// Projected input-column ranks for decode-error ties; null keeps read-mask order.
+    error_order: ?[]const usize = null,
+    error_ranks: ?struct {
+        ctx: *const anyopaque,
+        make: *const fn (*const anyopaque, std.mem.Allocator, usize) anyerror![]const usize,
+    } = null,
+    /// The full query projection when workers split a row group by aggregate calls.
+    error_read: ?[]const bool = null,
+    error_calls: ?[]const expr_agg.AggCall = null,
+    /// Columns to decode (`agg_plan.Columns.forRowGroup`).
+    read: []const bool,
+    /// Columns whose values an aggregate argument, a per-aggregate FILTER or a GROUP BY key consumes
+    /// (`agg_plan.Columns.consumed`); any other column in `read` only the outer filter reads.
+    consumed: []const bool,
+    /// Columns that must decode their stored values (`agg_plan.Columns.preserve`). Null preserves every column.
+    preserve: ?[]const bool = null,
+    /// Original global row of this row group's first row, including pruned rows. Zero until the scan sets the
+    /// file prefix. A slice adds its own offset; this is not the packed first-position tag.
+    row_base: u64 = 0,
+};
+
+/// Borrowed owner view of one decoded window. `input_rows` are indexes into that window. The shared adapter
+/// checks lengths and ordinal arithmetic; a gather index past `window_rows` is rejected here. A window that
+/// does not fit in `u32` cannot be gathered.
+pub fn selectedWindow(
+    batch: *const filter_eval.Batch,
+    selected: ?*const filter_selection.SelectionVector,
+    input_base: u64,
+    input_rows: ?[]const u32,
+    window_rows: usize,
+) error{BadColumn}!SelectedBatch {
+    if (input_rows) |rows| {
+        if (window_rows > std.math.maxInt(u32)) return error.BadColumn;
+        const limit: u32 = @intCast(window_rows);
+        for (rows) |row| if (row >= limit) return error.BadColumn;
+    }
+    const view: SelectedBatch = .{
+        .batch = batch,
+        .selected = selected,
+        .input_base = input_base,
+        .input_rows = input_rows,
+    };
+    try view.validate();
+    return view;
+}
+
+test "a selected window keeps original indexes and rejects a gather past the window" {
+    const batch: filter_eval.Batch = .{ .cols = &.{}, .num_rows = 2 };
+    const open = try selectedWindow(&batch, null, 40, &.{ 1, 3 }, 4);
+    try std.testing.expectEqual(@as(u64, 43), try open.ordinal(1));
+    try std.testing.expectError(error.BadColumn, selectedWindow(&batch, null, 40, &.{ 1, 4 }, 4));
+    const slice = try selectedWindow(&batch, null, 40, null, 2);
+    try std.testing.expectEqual(@as(u64, 40), try slice.ordinal(0));
 }
 

@@ -18,7 +18,7 @@ the CLI flags of the same name.
 | `compress_priority` | string | As `--compress-priority`: `size` or `speed`; anything else is `bad_json`/`BadCompressPriority`. Absent: `size`. |
 | `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats` (which also reads a float chunk's missing NaN count as zero when pruning, and trusts plausible statistics, never impossible ones). |
 | `ordered` | boolean | `false` is `--unordered`. Absent or `null`: ordered. |
-| `max_memory` | positive number, or size string (`"512MB"`) | As `--max-memory`, which bounds the S3 fetch window (a quarter of it, 64 MiB to 1 GiB) and decoded row groups (half of it; see the README). Defaults to three quarters of the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |
+| `max_memory` | positive number, or size string (`"512MB"`) | As `--max-memory`, which bounds the S3 fetch window (a quarter of it, 64 MiB to 1 GiB) and decoded row groups (half of it; see [capabilities.md](capabilities.md)). Defaults to three quarters of the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |
 | `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
 | `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
 | `fsync` | bool | Sync local output data before rename, on by default; `false` opts out. No effect on S3 output. |

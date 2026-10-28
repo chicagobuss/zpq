@@ -361,6 +361,11 @@ fn addTiers(b: *std.Build, cfg: Config) void {
             r.addArg("--");
             r.addArtifactArg(debug.integration_tests);
         }
+        // The fan-out coordinator against the same zpq-lambda behind a fake runtime, checked against DuckDB.
+        if (add(b, &stages, wanted, runner, dir, tier_name, "fanout-self", "plain", 300)) |r| {
+            r.addArgs(&.{ "--", python, "tools/serverless/test_fanout.py", "--duckdb", duckdb, "--lambda" });
+            r.addArtifactArg(debug.lambda);
+        }
     }
     if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "check-self", "plain", 900)) |r| {
         r.addArg("--");

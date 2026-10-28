@@ -3,7 +3,7 @@
   "shards": {
     "units-core": {"stages": ["units-core"], "minutes": 25},
     "units": {"stages": ["units-lambda", "units-cli", "units-service", "units-libzpq"], "minutes": 3},
-    "cases": {"stages": ["integration", "check-self", "bench-self", "cases-fresh"], "minutes": 9},
+    "cases": {"stages": ["integration", "check-self", "bench-self", "fanout-self", "cases-fresh"], "minutes": 9},
     "corpus": {"stages": ["corpus", "canonical"], "minutes": 2},
     "clickbench": {"stages": ["clickbench"], "minutes": 4, "needs": ["clickbench"]},
     "os": {"stages": ["contracts", "path-parity"], "minutes": 4},

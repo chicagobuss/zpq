@@ -336,6 +336,7 @@ pub fn handleStaged(
             .column_order = req.column_order,
             .bloom_filters = bloom_filters,
             .bloom_filters_enabled = req.bloom_filters_enabled,
+            .row_groups = req.row_groups,
         };
         qa.profiler = profiler;
 

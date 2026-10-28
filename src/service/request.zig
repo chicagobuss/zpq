@@ -43,6 +43,7 @@ const Wire = struct {
     bloom_filters_enabled: ?std.json.Value = null,
     row_group_size: ?std.json.Value = null,
     row_group_bytes: ?std.json.Value = null,
+    row_groups: ?std.json.Value = null,
 };
 
 pub const Request = struct {
@@ -87,6 +88,10 @@ pub const Request = struct {
     /// `--row-group-size` and `--row-group-bytes`; null for the defaults.
     row_group_size: ?usize = null,
     row_group_bytes: ?MaxMemory = null,
+    /// `row_groups`: one entry per input, `[start, end]` (row groups `start` up to but not including `end`) or null for
+    /// every row group. Lets a coordinator split one file across workers; the engine checks each range against the
+    /// input's footer.
+    row_groups: ?[]const ?[2]u32 = null,
 
     pub const MaxMemory = union(enum) { bytes: usize, text: []const u8 };
 
@@ -116,6 +121,7 @@ pub const Request = struct {
                 "bloom_filters",
                 "row_group_size",
                 "row_group_bytes",
+                "row_groups",
             }) |name| {
                 if (@field(parsed.value, name)) |v| if (v != .null) {
                     bad_field.* = name;
@@ -191,6 +197,29 @@ pub const Request = struct {
             .integer => |n| if (n > 0) .{ .bytes = @intCast(n) } else return f.bad("row_group_bytes"),
             .string => |s| .{ .text = s },
             else => return f.bad("row_group_bytes"),
+        };
+        if (parsed.value.row_groups) |v| switch (v) {
+            .null => {},
+            .array => |list| {
+                if (list.items.len != req.inputs.len) return f.bad("row_groups");
+                const out = try arena.alloc(?[2]u32, list.items.len);
+                for (list.items, out) |item, *o| o.* = switch (item) {
+                    .null => null,
+                    .array => |pair| range: {
+                        if (pair.items.len != 2) return f.bad("row_groups");
+                        var r: [2]u32 = undefined;
+                        for (pair.items, &r) |x, *y| y.* = switch (x) {
+                            .integer => |n| std.math.cast(u32, n) orelse return f.bad("row_groups"),
+                            else => return f.bad("row_groups"),
+                        };
+                        if (r[0] > r[1]) return f.bad("row_groups");
+                        break :range r;
+                    },
+                    else => return f.bad("row_groups"),
+                };
+                req.row_groups = out;
+            },
+            else => return f.bad("row_groups"),
         };
         if (parsed.value.max_result_bytes) |v| req.max_result_bytes = switch (v) {
             .null => null,
@@ -357,12 +386,39 @@ test "malformed requests are errors, wrong-typed fields named" {
         .{ .body = "{\"inputs\":[\"a\"],\"profile_url\":7}", .err = error.BadFieldType, .field = "profile_url" },
         .{ .body = "{\"inputs\":[\"a\"],\"max_memory\":-1}", .err = error.BadFieldType, .field = "max_memory" },
         .{ .body = "{\"inputs\":[\"a\"],\"max_memory\":[]}", .err = error.BadFieldType, .field = "max_memory" },
+        .{
+            .body = "{\"inputs\":[\"a\"],\"row_groups\":[[0,1],[1,2]]}",
+            .err = error.BadFieldType,
+            .field = "row_groups",
+        },
+        .{ .body = "{\"inputs\":[\"a\"],\"row_groups\":[[2,1]]}", .err = error.BadFieldType, .field = "row_groups" },
+        .{ .body = "{\"inputs\":[\"a\"],\"row_groups\":[[0]]}", .err = error.BadFieldType, .field = "row_groups" },
+        .{ .body = "{\"inputs\":[\"a\"],\"row_groups\":[[0,1.5]]}", .err = error.BadFieldType, .field = "row_groups" },
+        .{ .body = "{\"inputs\":[\"a\"],\"row_groups\":[[-1,1]]}", .err = error.BadFieldType, .field = "row_groups" },
+        .{ .body = "{\"inputs\":[\"a\"],\"row_groups\":[0,1]}", .err = error.BadFieldType, .field = "row_groups" },
+        .{ .body = "{\"inputs\":[\"a\"],\"row_groups\":{}}", .err = error.BadFieldType, .field = "row_groups" },
     };
     for (cases) |c| {
         var bad: []const u8 = "";
         try testing.expectError(c.err, Request.parse(testing.allocator, c.body, &bad));
         try testing.expectEqualStrings(c.field, bad);
     }
+}
+
+test "request row_groups: one [start, end] range or null per input" {
+    var bad: []const u8 = "";
+    const body = "{\"inputs\":[\"a\",\"b\",\"c\"],\"row_groups\":[[0,3],null,[4,4]]}";
+    var r = try Request.parse(testing.allocator, body, &bad);
+    defer r.deinit();
+    const rg = r.row_groups.?;
+    try testing.expectEqual(@as(usize, 3), rg.len);
+    try testing.expectEqual([2]u32{ 0, 3 }, rg[0].?);
+    try testing.expect(rg[1] == null);
+    try testing.expectEqual([2]u32{ 4, 4 }, rg[2].?);
+
+    var n = try Request.parse(testing.allocator, "{\"inputs\":[\"a\"],\"row_groups\":null}", &bad);
+    defer n.deinit();
+    try testing.expect(n.row_groups == null);
 }
 
 /// Tracks the peak of live bytes allocated through it.

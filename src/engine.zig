@@ -257,6 +257,8 @@ pub const Error = error{
     BloomFilterUnsupportedColumn,
     /// `--bloom-filter` on a query that writes no rows (an aggregate).
     BloomFilterNeedsRows,
+    /// A `row_groups` range past its input's row groups, or not one range (or null) per input.
+    RowGroupOutOfRange,
 } || std.mem.Allocator.Error;
 
 pub const QueryArgs = struct {
@@ -342,6 +344,9 @@ pub const QueryArgs = struct {
     /// has; one without is decoded to build one.
     bloom_filters: []const BloomSpec = &.{},
     bloom_filters_enabled: bool = true,
+    /// Per input, parallel to `inputs`: read only row groups `start` up to but not including `end` of its footer; null
+    /// (or a null slice) reads every row group. A coordinator splits one file across workers with it.
+    row_groups: ?[]const ?[2]u32 = null,
 };
 
 pub const CompressPriority = compression.CompressPriority;
@@ -678,8 +683,9 @@ fn executeAggregateOver(
     // `auto` to weigh the bytes this query will read (a warm slice of a cold file still maps).
     const plan_io = choose_io and io_policy.profile != .mmap;
     var probed = opened.membership;
+    // A `row_groups` range lives in the footers parsed here; the scan's own parse would read every row group.
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
-        steer_metas != null)
+        steer_metas != null or args.row_groups != null)
     blk: {
         const m = steer_metas orelse try materializeMetas(arena, opened, args.diag, prof);
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
@@ -3886,6 +3892,8 @@ const OpenedInputs = struct {
     inputs: []const scan.Input,
     metas: []schema.FileMetaData,
     meta_ready: []bool,
+    /// `QueryArgs.row_groups`, applied to each footer as it is parsed (`restrictRowGroups`).
+    row_groups: ?[]const ?[2]u32 = null,
     has_preparsed_meta: bool = false,
     /// Per-input mmap state — set for local files so we can munmap on
     /// deinit. Null for s3 inputs (their bytes live in the arena).
@@ -3994,8 +4002,31 @@ fn materializeMetas(
                 else => error.NotParquet,
             };
         };
+        if (opened.row_groups) |ranges| try restrictRowGroups(arena, &metas[i], ranges[i], diag, in.name);
     }
     return metas;
+}
+
+/// Keep row groups `range[0]` up to but not including `range[1]` of a footer, and the row count they hold. A range
+/// past the footer's row groups is refused, naming the input, rather than clamped.
+fn restrictRowGroups(
+    arena: std.mem.Allocator,
+    meta: *schema.FileMetaData,
+    range: ?[2]u32,
+    diag: ?*Diag,
+    name: []const u8,
+) !void {
+    const r = range orelse return;
+    const all = meta.row_groups.items;
+    if (r[0] > r[1] or r[1] > all.len) {
+        Diag.setInput(diag, name, error.RowGroupOutOfRange);
+        return error.RowGroupOutOfRange;
+    }
+    const kept = try arena.dupe(schema.RowGroup, all[r[0]..r[1]]);
+    var rows: i64 = 0;
+    for (kept) |rg| rows +|= rg.num_rows;
+    meta.row_groups = .fromOwnedSlice(kept);
+    meta.num_rows = rows;
 }
 
 pub fn fetchS3Schema(
@@ -4042,6 +4073,7 @@ fn openInputs(
     const paths = args.inputs;
     const prof = profile.threadOf(args.profiler, .main);
     if (args.profiler) |p| p.setFiles(paths);
+    if (args.row_groups) |ranges| if (ranges.len != paths.len) return error.RowGroupOutOfRange;
     var inputs = try arena.alloc(scan.Input, paths.len);
     var metas = try arena.alloc(schema.FileMetaData, paths.len);
     var meta_ready = try arena.alloc(bool, paths.len);
@@ -4160,6 +4192,10 @@ fn openInputs(
             for (s3_buffers.items) |b| ctx.gpa.free(b);
         };
 
+        // A worker's row groups, before anything plans or fetches from the footers.
+        if (args.row_groups) |ranges| for (s3_indices.items, specs) |idx, *sp| {
+            try restrictRowGroups(arena, &sp.meta, ranges[idx], args.diag, paths[idx]);
+        };
         const metas_for_plan = try arena.alloc(schema.FileMetaData, specs.len);
         for (specs, metas_for_plan) |sp, *m| m.* = sp.meta;
 
@@ -4264,6 +4300,8 @@ fn openInputs(
                 // Copy borrowed footer strings into the arena, then release both responses.
                 const copy = try arena.dupe(u8, sp.footer_region[0 .. sp.footer_region.len - 8]);
                 metas[idx] = try metadata.openFooter(arena, copy);
+                if (args.row_groups) |ranges|
+                    try restrictRowGroups(arena, &metas[idx], ranges[idx], args.diag, paths[idx]);
                 meta_ready[idx] = true;
                 releaseChargedTail(sp, ctx.gpa, &account);
                 ctx.gpa.free(sp.footer_region);
@@ -4575,6 +4613,7 @@ fn openInputs(
         .metas = metas,
         .meta_ready = meta_ready,
         .has_preparsed_meta = s3_indices.items.len > 0,
+        .row_groups = args.row_groups,
         .mmaps = mmaps,
         .owned_pools = try owned_pools.toOwnedSlice(arena),
         .s3_buffers = try s3_buffers.toOwnedSlice(arena),

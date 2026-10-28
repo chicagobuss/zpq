@@ -26,12 +26,24 @@ the CLI flags of the same name.
 | `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
 | `row_group_size` | positive integer | As `--row-group-size`: rows per re-encoded output row group (default 131072). |
 | `row_group_bytes` | positive number, or size string | As `--row-group-bytes`: uncompressed bytes per re-encoded output row group (default 64MB). A `max_memory` the request names caps it at a sixteenth of that. |
+| `row_groups` | array, one per input, of `[start, end]` or `null` | Read only row groups `start` up to but not including `end` of that input; `null` reads every row group. See below. |
 
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them
 without building them, so they cost no memory. With `aggregate` or `group_by` the response is the aggregate JSON;
 otherwise with `output_url` it is the write summary. A request with neither gets the older single-file diagnostic
 answer for its first input.
+
+### Splitting a file across workers
+
+`row_groups` lets a coordinator give each worker a contiguous slice of an input's row groups, numbered from 0 in
+footer order, for example `{"inputs":["s3://b/f.parquet"],"row_groups":[[8,16]],"aggregate":"..."}`. The array has
+one entry per input; `[k, k]` is an empty slice (the aggregates of no rows: counts 0, the rest `null`). The ranges
+are checked twice: one that is not a pair of non-negative integers with `start <= end`, or an array whose length is
+not the number of inputs, is `bad_json`/`BadFieldType` naming `row_groups`; an `end` past the input's row groups is
+`engine`/`RowGroupOutOfRange` naming the input. The field cannot be combined with `sql`. Statistics pruning,
+Bloom filters and the response's `rows_in`/`row_groups_in` all see only the slice. `tools/serverless/fanout.py`
+splits inputs this way and merges the answers.
 
 ## Responses
 

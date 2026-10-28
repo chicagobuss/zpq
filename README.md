@@ -87,6 +87,28 @@ more than 4 s are closed rather than reused (they do not survive a frozen sandbo
 is retried at once on a new one. See [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md) and the request and
 response format in [`docs/lambda_requests.md`](docs/lambda_requests.md).
 
+### Fanning one query out: `tools/serverless/fanout.py`
+
+One large file, or many, can be split across workers by row group. `tools/serverless/fanout.py` is a small
+coordinator (stdlib plus boto3) that reads each input's row-group count from its footer, cuts the row groups into N
+contiguous runs, invokes N `zpq-lambda` workers in parallel with the request's `row_groups` field, and merges their
+answers:
+
+```sh
+python3 tools/serverless/fanout.py --function zpq-worker --workers 32 \
+  --input s3://bucket/lineitem.parquet --filter "l_shipdate <= '1998-09-02'" \
+  --aggregate "sum(l_quantity) AS qty, avg(l_discount) AS disc, count(*) AS n" \
+  --group-by "l_returnflag, l_linestatus" --order-by "l_returnflag, l_linestatus"
+```
+
+COUNT, SUM, MIN, MAX and AVG merge, with or without GROUP BY (AVG is asked of each worker as `avg_state` and divided
+once at the end, and decimal sums stay exact); ORDER BY and LIMIT apply after the merge. COUNT(DISTINCT), percentiles
+and other holistic aggregates, window functions and expressions over aggregates are refused before any worker runs.
+The same file is a coordinator Lambda: `fanout.handler` takes `{"function", "workers", "request", "order_by",
+"limit"}` and, optionally, `row_group_counts` to skip reading the footers. `tools/serverless/test_fanout.py` runs it
+against real `zpq-lambda` processes behind a fake Lambda runtime and checks the merged answers against one invocation
+and against DuckDB.
+
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible
 stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads; like

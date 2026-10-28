@@ -853,6 +853,49 @@ test "lambda names the input file a query could not read, and why" {
     });
 }
 
+test "lambda row_groups ranges split one file into answers that add up" {
+    // full_match.parquet: 8 row groups of 200 rows; n is NULL in 2 of every 5 rows (DuckDB: rows 0..599 hold 320
+    // non-null n summing to 288000, min 3, max 1797).
+    const a = std.testing.allocator;
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambda(a, endpoint);
+    defer killChild(&child);
+
+    const f = "\"inputs\":[\"" ++ S3_FIXTURE ++ "\"]";
+    const agg = "\"aggregate\":\"count(*) AS c, count(n) AS cn, sum(n) AS sn, min(n) AS mn, max(n) AS xn\"";
+    const whole = try invoke(&server, a, "{" ++ f ++ "," ++ agg ++ "}");
+    defer a.free(whole);
+    const all = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[0,8]]," ++ agg ++ "}");
+    defer a.free(all);
+    const head = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[0,3]]," ++ agg ++ "}");
+    defer a.free(head);
+    const empty = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[3,3]]," ++ agg ++ "}");
+    defer a.free(empty);
+    const past = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[6,9]]," ++ agg ++ "}");
+    defer a.free(past);
+    const backwards = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[3,2]]," ++ agg ++ "}");
+    defer a.free(backwards);
+    const short = try invoke(&server, a, "{\"inputs\":[\"" ++ S3_FIXTURE ++ "\",\"" ++ S3_FIXTURE ++
+        "\"],\"row_groups\":[[0,1]]," ++ agg ++ "}");
+    defer a.free(short);
+
+    const checks = [_]struct { got: []const u8, want: []const u8 }{
+        .{ .got = all, .want = aggMember(whole) orelse "<no agg>" },
+        .{ .got = head, .want = "\"agg\":{\"c\":600,\"cn\":320,\"sn\":288000,\"mn\":3,\"xn\":1797}" },
+        .{ .got = empty, .want = "\"agg\":{\"c\":0,\"cn\":0,\"sn\":null,\"mn\":null,\"xn\":null}" },
+        .{ .got = past, .want = "\"reason\":\"RowGroupOutOfRange\",\"input\":\"" ++ S3_FIXTURE ++ "\"" },
+        .{ .got = backwards, .want = "\"field\":\"row_groups\"" },
+        .{ .got = short, .want = "\"field\":\"row_groups\"" },
+    };
+    for (checks, 0..) |c, i| if (std.mem.indexOf(u8, c.got, c.want) == null) {
+        std.debug.print("[lambda row_groups] case {d}: {s}\n  want {s}\n", .{ i, c.got, c.want });
+        return error.TestUnexpectedResult;
+    };
+}
+
 const S3_AGG = "\"aggregate\":\"count(*) AS c, sum(x) AS sx, min(s) AS ms, max(n) AS mn, sum(u) AS su\"";
 const S3_FIXTURE = "ci/fixtures/parquet/full_match.parquet";
 

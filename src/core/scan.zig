@@ -8314,6 +8314,48 @@ const IntegerCountBounds = union(enum) {
     }
 };
 
+/// Whether a raw integer owner should take a count or full answer, from the summed footer dictionaries (`guess`).
+/// Summed dictionaries can repeat the same small domain in every RG. A reduction hint defers the decision until the
+/// union is known; only a complete union replaces the summed footer estimate. An unfiltered count cut always asks:
+/// many small row groups each holding most of a small domain sum to more than a quarter of the rows, and the owner
+/// would then displace the dense lanes the union admits.
+const IntegerGate = enum { owner, coded, ask_union };
+
+fn integerCountGate(
+    guess: u64,
+    rows: usize,
+    unfiltered_top: bool,
+    union_allowed: bool,
+    bounds: IntegerCountBounds,
+) IntegerGate {
+    const refine = union_allowed and (guess < rows / 4 or unfiltered_top);
+    if (unfiltered_top and bounds == .pending and refine and guess > agg_dense.max_ids) return .ask_union;
+    const prefer_coded = if (unfiltered_top)
+        (if (refine) bounds.guess(guess) else guess) <= agg_dense.max_ids
+    else
+        guess < rows / 4;
+    return if (prefer_coded) .coded else .owner;
+}
+
+test "regression: an unfiltered integer count cut over a repeated small domain asks the union before an owner" {
+    // rg64k_100k: 458 row groups of 64K rows each hold most of 100K keys. Their dictionaries sum past a quarter of
+    // the rows and past the dense limit, so the owner took the cut from the dense lanes (6d46d1e2, 1.5x slower).
+    const rows: usize = 30_000_000;
+    const summed: u64 = 22_000_000;
+    var asked = false;
+    try testing.expectEqual(.ask_union, integerCountGate(summed, rows, true, true, .{ .pending = &asked }));
+    const small: NdvStat = .{ .rows = rows, .hi = 100_000, .union_complete = true };
+    try testing.expectEqual(.coded, integerCountGate(summed, rows, true, true, .{ .refined = small }));
+    // A union as wide as the footer says keeps the owner; so does a union not complete.
+    const wide: NdvStat = .{ .rows = rows, .hi = 10_000_000, .union_complete = true };
+    try testing.expectEqual(.owner, integerCountGate(summed, rows, true, true, .{ .refined = wide }));
+    const partial: NdvStat = .{ .rows = rows, .hi = 100_000, .union_complete = false };
+    try testing.expectEqual(.owner, integerCountGate(summed, rows, true, true, .{ .refined = partial }));
+    // Filtered, the footer's reduction hint alone decides, as before.
+    try testing.expectEqual(.owner, integerCountGate(summed, rows, false, true, .{ .refined = small }));
+    try testing.expectEqual(.coded, integerCountGate(1000, rows, false, true, .{ .refined = null }));
+}
+
 fn inlineIntegerAnswer(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -8417,20 +8459,15 @@ fn inlineIntegerAnswer(
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) {
         if (ndv.footerEntries(metas, keys)) |guess| {
-            // Summed dictionaries can repeat the same small domain in every RG. A reduction hint defers the
-            // decision until the union is known; only a complete union replaces the summed footer estimate.
-            const refine = args.ndv_policy and args.ndv_union and guess < rows / 4;
-            if (count_top and !ordered_count and args.filter == null and bounds == .pending and
-                refine and guess > agg_dense.max_ids)
-            {
-                bounds.pending.* = true;
-                return null;
+            const unfiltered_top = count_top and !ordered_count and args.filter == null;
+            switch (integerCountGate(guess, rows, unfiltered_top, args.ndv_policy and args.ndv_union, bounds)) {
+                .owner => {},
+                .coded => return null,
+                .ask_union => {
+                    bounds.pending.* = true;
+                    return null;
+                },
             }
-            const prefer_coded = if (count_top and !ordered_count and args.filter == null)
-                (if (refine) bounds.guess(guess) else guess) <= agg_dense.max_ids
-            else
-                guess < rows / 4;
-            if (prefer_coded) return null;
         } else if (count_top and !ordered_count) {
             var survivors: f64 = 0;
             var range: IntegerRangeHint = .{};

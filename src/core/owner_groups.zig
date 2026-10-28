@@ -310,6 +310,9 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
             cache_seen: u32 = 0,
             cache_hits: u32 = 0,
             cache_disabled: bool = false,
+            /// A full-answer cache whose trial found too few hits stays off for the worker's remaining items: re-armed
+            /// per row group, many small row groups each spent half their rows in a cache that does not reduce records.
+            full_bypass: bool = false,
 
             fn emitCount(l: *Local, entry: CountEntry) error{ExceededMemoryBudget}!void {
                 const kn = entry.first & null_key != 0;
@@ -432,7 +435,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     }
                     return;
                 };
-                if (cached_full) if (!l.cache_disabled and l.full_cache.entries.len != 0) {
+                if (cached_full) if (!l.cache_disabled and !l.full_bypass and l.full_cache.entries.len != 0) {
                     // Column nullability is recorded per row: a partial's value-NULL bit means only all-NULL.
                     l.nulls |= @intFromBool(key == null) | @as(u32, @intFromBool(value == null)) << 1;
                     const probe = l.cache_seen < l.state.cache_trial_rows;
@@ -449,6 +452,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     {
                         try l.flushCounts();
                         l.cache_disabled = true;
+                        l.full_bypass = true;
                     }
                     return;
                 };
@@ -1675,6 +1679,28 @@ test "owned integer local partials flush before an i64 overflow and keep exact c
         try std.testing.expectEqual(@as(?i128, 5), g[2].sumValue());
         try std.testing.expectEqual(@as(u32, 3), s.input_nulls);
     }
+}
+
+test "regression: a full-answer cache whose trial fails stays off for the worker's later items" {
+    // rg64k q06 (615ba9f2, 1.1x slower): each 64K-row group re-armed the cache and spent half its rows in a trial
+    // that hit 6% of the time.
+    const a = std.testing.allocator;
+    const rows: usize = 1 << 18;
+    const s = (try IntFull.State.init(a, null, rows, 1, 0, 1, {}, full_parts, 0)).?;
+    defer s.deinit();
+    const l = &s.locals[0];
+    try std.testing.expect(l.full_cache.entries.len != 0);
+    const trial = s.cache_trial_rows;
+    var row: u32 = 0;
+    l.start(0, 0);
+    // Every key new: no partial absorbs another, so the trial gives up on the cache.
+    while (row < trial) : (row += 1) try l.append(@as(i64, row), 1, row);
+    try std.testing.expect(l.full_bypass);
+    l.start(row, 1);
+    try std.testing.expect(l.full_bypass);
+    while (row < rows) : (row += 1) try l.append(@as(i64, row % 7), 1, row);
+    try s.finish();
+    try std.testing.expectEqual(@as(usize, trial), s.group_count);
 }
 
 test "owned integer groups overlap packed records safely for every reduction and partition tail" {

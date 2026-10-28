@@ -70,6 +70,9 @@ pub fn shortSampleMayFit(
 }
 
 /// Only a cost probe. Its read failure or an oversized header declines before decoded rows are consumed.
+/// Sparse numeric images cannot promote to the bitmap: spreading their merge over the wide fanout is useful.
+/// A compact footer range retains the numeric fanout that makes bitmap promotion profitable. This prices traffic
+/// only: no value is skipped, and a later value outside the hint still joins the exact set.
 pub fn scalarDistinctWideParts(arg: expr_ast.Expr, metas: []const schema.FileMetaData, work: []const WorkItem) bool {
     if (arg.typeOf() != .i64) return true;
     if (arg != .col_ref) return false;

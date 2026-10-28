@@ -112,6 +112,7 @@ const mimalloc: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
 // Larger transient buffers use their own mappings so a freed growth buffer cannot stay in a partly occupied heap page.
 const SplitHeap = struct {
     small: std.mem.Allocator,
+    large: std.mem.Allocator = std.heap.page_allocator,
     threshold: usize,
 
     fn allocator(self: *SplitHeap) std.mem.Allocator {
@@ -119,16 +120,16 @@ const SplitHeap = struct {
     }
 
     fn child(self: *SplitHeap, len: usize) std.mem.Allocator {
-        return if (len >= self.threshold) std.heap.page_allocator else self.small;
+        return if (len >= self.threshold) self.large else self.small;
     }
 
-    fn owner(self: *SplitHeap, memory: []u8) std.mem.Allocator {
+    fn ownerIsLarge(self: *SplitHeap, memory: []u8) bool {
         // Group tables and their DISTINCT accumulators can transfer allocations between the two process heaps.
         if (comptime use_mimalloc) {
             if (memory.len >= group_heap_threshold and memory.len < process_heap_threshold)
-                return if (mi_is_in_heap_region(memory.ptr)) self.small else std.heap.page_allocator;
+                return !mi_is_in_heap_region(memory.ptr);
         }
-        return self.child(memory.len);
+        return memory.len >= self.threshold;
     }
 
     fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ret: usize) ?[*]u8 {
@@ -138,21 +139,24 @@ const SplitHeap = struct {
 
     fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, len: usize, ret: usize) bool {
         const self: *SplitHeap = @ptrCast(@alignCast(ctx));
-        const old = self.owner(memory);
-        if (old.vtable != self.child(len).vtable) return false;
+        const large = self.ownerIsLarge(memory);
+        if (large != (len >= self.threshold)) return false;
+        const old = if (large) self.large else self.small;
         return old.rawResize(memory, a, len, ret);
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
         const self: *SplitHeap = @ptrCast(@alignCast(ctx));
-        const old = self.owner(memory);
-        if (old.vtable != self.child(len).vtable) return null;
+        const large = self.ownerIsLarge(memory);
+        if (large != (len >= self.threshold)) return null;
+        const old = if (large) self.large else self.small;
         return old.rawRemap(memory, a, len, ret);
     }
 
     fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ret: usize) void {
         const self: *SplitHeap = @ptrCast(@alignCast(ctx));
-        self.owner(memory).rawFree(memory, a, ret);
+        const old = if (self.ownerIsLarge(memory)) self.large else self.small;
+        old.rawFree(memory, a, ret);
     }
 };
 
@@ -180,6 +184,31 @@ test "split heap preserves data and ownership across its size threshold" {
     bytes = try a.realloc(bytes, 100);
     try std.testing.expectEqual(@as(u8, 0xa5), bytes[99]);
     a.free(bytes);
+}
+
+test "split heap retains one owner when replacement allocations fail" {
+    var small = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var large = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var split: SplitHeap = .{
+        .small = small.allocator(),
+        .large = large.allocator(),
+        .threshold = group_heap_threshold,
+    };
+    const a = split.allocator();
+    const first = try a.alloc(u8, group_heap_threshold - 1);
+    @memset(first, 0xa5);
+    try std.testing.expectError(error.OutOfMemory, a.realloc(first, group_heap_threshold + 1));
+    try std.testing.expectEqual(@as(u8, 0xa5), first[0]);
+    large.fail_index = std.math.maxInt(usize);
+    const second = try a.realloc(first, group_heap_threshold + 1);
+    small.fail_index = small.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, a.realloc(second, 100));
+    try std.testing.expectEqual(@as(u8, 0xa5), second[0]);
+    a.free(second);
+    try std.testing.expectEqual(small.allocated_bytes, small.freed_bytes);
+    try std.testing.expectEqual(large.allocated_bytes, large.freed_bytes);
+    try std.testing.expectEqual(small.allocations, small.deallocations);
+    try std.testing.expectEqual(large.allocations, large.deallocations);
 }
 
 extern fn mi_malloc_aligned(size: usize, alignment: usize) ?*anyopaque;

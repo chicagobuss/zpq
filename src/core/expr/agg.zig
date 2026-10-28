@@ -288,11 +288,21 @@ pub const DistinctSet = struct {
     }
 
     fn initPartitionCount(self: *DistinctSet, allocator: std.mem.Allocator, budget: ?*SharedBudget, n: usize) !void {
+        const previous_shared = self.shared;
+        const previous_credit = self.max_memory_bytes;
+        const previous_allocated = self.allocated_bytes;
+        std.debug.assert(previous_credit == 0 and previous_allocated == 0 and self.parts == null);
+        self.shared = budget;
+        errdefer {
+            if (budget) |b| b.release(self.max_memory_bytes - previous_credit);
+            self.max_memory_bytes = previous_credit;
+            self.allocated_bytes = previous_allocated;
+            self.shared = previous_shared;
+        }
+        try self.charge(n * @sizeOf(DistinctSet));
         const p = try allocator.alloc(DistinctSet, n);
         for (p) |*part| part.* = .{ .shared = budget };
         self.parts = p;
-        self.shared = budget;
-        try self.charge(n * @sizeOf(DistinctSet));
     }
 
     /// Count `bytes` this set holds outside its values (the set object itself, a partition array) against its budget.
@@ -331,10 +341,6 @@ pub const DistinctSet = struct {
             allocator.free(parts);
             self.parts = null;
         }
-        self.releasePrivate();
-        if (self.shared) |budget| {
-            budget.release(self.max_memory_bytes);
-        }
         if (self.string_arena) |arena| {
             arena.deinit();
             allocator.destroy(arena);
@@ -358,6 +364,8 @@ pub const DistinctSet = struct {
             .i128 => |*s| s.deinit(allocator),
             .bytes => |*s| s.deinit(allocator),
         }
+        self.releasePrivate();
+        if (self.shared) |budget| budget.release(self.max_memory_bytes);
         self.* = .{};
     }
 
@@ -503,6 +511,7 @@ pub const DistinctSet = struct {
                 if (s.available == 0) {
                     if (s.contains(v)) return;
                     if (try self.bitmapFromMap(allocator, v)) return;
+                    try self.drawMore(24);
                 }
                 const gop = try s.getOrPut(allocator, v);
                 if (gop.found_existing) return;
@@ -655,6 +664,10 @@ pub const DistinctSet = struct {
                 self.val_set = .{ .i128 = map };
             },
             .i128 => |*s| {
+                if (s.available == 0) {
+                    if (s.contains(v)) return;
+                    try self.drawMore(32);
+                }
                 const gop = try s.getOrPut(allocator, v);
                 if (gop.found_existing) return;
                 const entry_size = 32;
@@ -726,6 +739,10 @@ pub const DistinctSet = struct {
                 self.val_set = .{ .bytes = map };
             },
             .bytes => |*s| {
+                if (s.map.available == 0) {
+                    if (s.map.contains(.{ .bytes = v, .hash = h })) return;
+                    try self.drawMore(48 + v.len);
+                }
                 const gop = try s.getHashed(allocator, v, h);
                 if (gop.found_existing) return;
                 const entry_size = 48 + v.len;
@@ -4244,9 +4261,9 @@ pub const GroupKeyResolver = struct {
                 if (packFixedKey(cols, off + i, &images[i])) |len| if (len == table.fixed_stride) {
                     hashes[i] = hashFixed(images[i][0..len]);
                     packed_mask |= @as(u64, 1) << @intCast(i);
-                    if (table.fixed_slots.len >= 1 << 15) {
-                        const slot = @as(usize, @as(u32, @truncate(hashes[i]))) & (table.fixed_slots.len - 1);
-                        @prefetch(&table.fixed_slots[slot], .{ .rw = .read, .locality = 2 });
+                    if (table.fixedSlotCount() >= 1 << 15) {
+                        const slot = @as(usize, @as(u32, @truncate(hashes[i]))) & (table.fixedSlotCount() - 1);
+                        @prefetch(table.fixedSlot(slot), .{ .rw = .read, .locality = 2 });
                     }
                 };
             };
@@ -5107,6 +5124,11 @@ pub const GroupTable = struct {
     fixed_len: u32 = 0,
     fixed_keys: []u8 = &.{},
     fixed_slots: []FixedSlot = &.{},
+    // A doubling adds only the new half. Existing slots and the new half together are the final capacity.
+    fixed_extra: [29]?[*]FixedSlot = @splat(null),
+    fixed_extra_count: u8 = 0,
+    fixed_base_shift: u8 = 0,
+    fixed_capacity: usize = 0,
     /// A certified top-k pass: keys outside the admitted cells get a cell's id (`CountSketch.sinkId`) rather than a
     /// group. The id is the key's alone to take, so callers that memoize ids per key stay correct.
     sketch: ?*CountSketch = null,
@@ -5202,11 +5224,16 @@ pub const GroupTable = struct {
             strings.deinit(self.allocator);
             self.allocator.destroy(strings);
         }
-        self.allocator.free(self.slots);
         self.first.deinit(self.allocator);
         self.accumulators.deinit(self.allocator);
         self.compact.words.deinit(self.allocator);
         if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
+        const first_slots = self.firstSlots();
+        for (0..self.fixed_extra_count) |i| {
+            const len = first_slots.len << @as(std.math.Log2Int(usize), @intCast(i));
+            self.allocator.free(self.fixed_extra[i].?[0..len]);
+        }
+        self.allocator.free(self.slots);
         if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
         // A shared table starts at a zero ceiling, so all of `max_memory_bytes` came from the pool. Given back last:
         // another table may draw it as soon as it is back, while this one's memory is still held.
@@ -5379,8 +5406,9 @@ pub const GroupTable = struct {
             const credit = if (self.shared) |b| @min(b.block, b.limit / 4) else self.max_memory_bytes / 4;
             self.strings.?.bootstrap = @min(KeyArena.chunk_size, if (credit == 0) 1 else @as(usize, 1) << @intCast(std.math.log2_int(usize, credit)));
         }
-        const grow = self.slots.len == 0 or (n + 1) * 4 > self.slots.len * 3;
-        const cap = if (grow) @max(self.slots.len * 2, 16) else self.slots.len;
+        const old_slots = self.fixedSlotCount();
+        const grow = old_slots == 0 or (n + 1) * 4 > old_slots * 3;
+        const cap = if (grow) @max(old_slots * 2, 16) else old_slots;
         const refs_cap = if (n + 1 > self.refs.capacity) std.ArrayList(u32).growCapacity(n + 1) else self.refs.capacity;
         const first_cap = if (n + 1 > self.first.capacity) std.ArrayList(u64).growCapacity(n + 1) else self.first.capacity;
         const views_cap = if (raw_string and n + 1 > self.string_views.capacity)
@@ -5399,7 +5427,7 @@ pub const GroupTable = struct {
         try self.admit(projected -| self.allocated_bytes);
         // Direct shared tables also fund the transient old/new metadata overlap before a grow. The arena's
         // append-only chunks already include every live byte in projected(), and never replace a key buffer.
-        var overlap: usize = if (grow) self.slots.len * @sizeOf(FixedSlot) else 0;
+        var overlap: usize = 0;
         if (refs_cap > self.refs.capacity) overlap = @max(overlap, self.refs.capacity * @sizeOf(u32));
         if (first_cap > self.first.capacity) overlap = @max(overlap, self.first.capacity * @sizeOf(u64));
         if (views_cap > self.string_views.capacity)
@@ -5416,17 +5444,7 @@ pub const GroupTable = struct {
         if (raw_string and self.shared == null) try self.admit((projected -| self.allocated_bytes) + overlap);
         // Failed allocation can leave already-grown buffers live, but never publishes a partial key/id.
         defer self.allocated_bytes = self.variableHeld();
-        if (grow) {
-            const fresh = try self.allocator.alloc(FixedSlot, cap);
-            @memset(fresh, .{ .hash = 0, .id = empty_id });
-            for (self.slots) |slot| if (slot.id != empty_id) {
-                var i = @as(usize, slot.hash) & (cap - 1);
-                while (fresh[i].id != empty_id) i = (i + 1) & (cap - 1);
-                fresh[i] = slot;
-            };
-            self.allocator.free(self.slots);
-            self.slots = fresh;
-        }
+        if (grow) try self.growFixedSlots(cap, projected);
         try self.refs.ensureTotalCapacity(self.allocator, n + 1);
         try self.first.ensureTotalCapacity(self.allocator, n + 1);
         if (raw_string) try self.string_views.ensureTotalCapacity(self.allocator, n + 1);
@@ -5452,9 +5470,9 @@ pub const GroupTable = struct {
                 Accumulator.init(call));
         };
         const id: u32 = @intCast(n);
-        var at = @as(usize, @as(u32, @truncate(hash))) & (self.slots.len - 1);
-        while (self.slots[at].id != empty_id) at = (at + 1) & (self.slots.len - 1);
-        self.slots[at] = .{ .hash = @truncate(hash), .id = id };
+        var at = @as(usize, @as(u32, @truncate(hash))) & (self.fixedSlotCount() - 1);
+        while (self.fixedSlot(at).id != empty_id) at = (at + 1) & (self.fixedSlotCount() - 1);
+        self.fixedSlot(at).* = .{ .hash = @truncate(hash), .id = id };
         self.refs.appendAssumeCapacity(ref);
         self.first.appendAssumeCapacity(pos);
         if (raw_string) self.string_views.appendAssumeCapacity(.{ .bytes = self.strings.?.get(ref), .first = pos });
@@ -5466,15 +5484,15 @@ pub const GroupTable = struct {
     /// Owning partition lock required: slots/views can grow until publication. Separate passes overlap the
     /// slot -> group view -> arena dependency across rows without treating a hash as identity.
     pub fn prefetchStringSlot(self: *const GroupTable, hash: u64) void {
-        if (self.slots.len == 0) return;
-        const at = @as(usize, @as(u32, @truncate(hash))) & (self.slots.len - 1);
-        @prefetch(&self.slots[at], .{ .rw = .read, .locality = 2 });
+        if (self.fixedSlotCount() == 0) return;
+        const at = @as(usize, @as(u32, @truncate(hash))) & (self.fixedSlotCount() - 1);
+        @prefetch(self.fixedSlot(at), .{ .rw = .read, .locality = 2 });
     }
 
     pub fn prefetchStringKey(self: *const GroupTable, hash: u64) void {
-        if (self.slots.len == 0 or self.string_views.items.len == 0) return;
-        const at = @as(usize, @as(u32, @truncate(hash))) & (self.slots.len - 1);
-        const slot = self.slots[at];
+        if (self.fixedSlotCount() == 0 or self.string_views.items.len == 0) return;
+        const at = @as(usize, @as(u32, @truncate(hash))) & (self.fixedSlotCount() - 1);
+        const slot = self.fixedSlot(at).*;
         if (slot.id == empty_id or slot.hash != @as(u32, @truncate(hash))) return;
         const view = &self.string_views.items[slot.id];
         @prefetch(view, .{ .rw = .read, .locality = 2 });
@@ -5486,12 +5504,12 @@ pub const GroupTable = struct {
     }
 
     fn probeString(self: *const GroupTable, key: []const u8, present: bool, full_hash: u64) FixedProbe {
-        if (self.slots.len == 0) return .{ .id = null, .slot = 0 };
+        if (self.fixedSlotCount() == 0) return .{ .id = null, .slot = 0 };
         const hash: u32 = @truncate(full_hash);
-        const mask = self.slots.len - 1;
+        const mask = self.fixedSlotCount() - 1;
         var i = @as(usize, hash) & mask;
         while (true) : (i = (i + 1) & mask) {
-            const slot = self.slots[i];
+            const slot = self.fixedSlot(i).*;
             if (slot.id == empty_id) return .{ .id = null, .slot = i };
             if (slot.hash != hash) continue;
             const stored = self.string_views.items[slot.id].bytes;
@@ -5513,19 +5531,19 @@ pub const GroupTable = struct {
     }
 
     fn variableHeld(self: *const GroupTable) usize {
-        return (if (self.strings) |strings| strings.held() + @sizeOf(KeyArena) else 0) + self.slots.len * @sizeOf(FixedSlot) +
+        return (if (self.strings) |strings| strings.held() + @sizeOf(KeyArena) else 0) + self.fixedSlotCount() * @sizeOf(FixedSlot) +
             self.refs.capacity * @sizeOf(u32) + self.first.capacity * @sizeOf(u64) +
             self.string_views.capacity * @sizeOf(StringView) + self.accumulators.capacity * @sizeOf(Accumulator) +
             self.compact.held() + self.set_objects;
     }
 
     fn probeVariable(self: *const GroupTable, key: []const u8, full_hash: u64) FixedProbe {
-        if (self.slots.len == 0) return .{ .id = null, .slot = 0 };
+        if (self.fixedSlotCount() == 0) return .{ .id = null, .slot = 0 };
         const hash: u32 = @truncate(full_hash);
-        const mask = self.slots.len - 1;
+        const mask = self.fixedSlotCount() - 1;
         var i = @as(usize, hash) & mask;
         while (true) : (i = (i + 1) & mask) {
-            const slot = self.slots[i];
+            const slot = self.fixedSlot(i).*;
             if (slot.id == empty_id) return .{ .id = null, .slot = i };
             if (slot.hash == hash and keyEql(self.keyAt(slot.id), key)) return .{ .id = slot.id, .slot = i };
         }
@@ -5559,8 +5577,9 @@ pub const GroupTable = struct {
 
         const stride: usize = self.fixed_stride;
         const groups_now: usize = self.fixed_len;
-        const grow_slots = self.fixed_slots.len == 0 or (groups_now + 1) * 4 > self.fixed_slots.len * 3;
-        const slot_cap: usize = if (grow_slots) @max(self.fixed_slots.len * 2, 16) else self.fixed_slots.len;
+        const old_slots = self.fixedSlotCount();
+        const grow_slots = old_slots == 0 or (groups_now + 1) * 4 > old_slots * 3;
+        const slot_cap: usize = if (grow_slots) @max(old_slots * 2, 16) else old_slots;
         const key_need = (groups_now + 1) * stride;
         const key_cap: usize = if (key_need > self.fixed_keys.len)
             @max(key_need, self.fixed_keys.len * 2)
@@ -5583,18 +5602,7 @@ pub const GroupTable = struct {
             (if (self.compact.stride != 0) self.compact.projected(groups_now + 1) else 0) + self.set_objects;
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
 
-        if (slot_cap != self.fixed_slots.len) {
-            const grown = try self.allocator.alloc(FixedSlot, slot_cap);
-            @memset(grown, .{ .hash = 0, .id = empty_id });
-            for (self.fixed_slots) |s| {
-                if (s.id == empty_id) continue;
-                var i = s.hash & (slot_cap - 1);
-                while (grown[i].id != empty_id) i = (i + 1) & (slot_cap - 1);
-                grown[i] = s;
-            }
-            if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
-            self.fixed_slots = grown;
-        }
+        if (grow_slots) try self.growFixedSlots(slot_cap, projected);
         if (key_cap != self.fixed_keys.len) {
             const grown = try self.allocator.alloc(u8, key_cap);
             @memcpy(grown[0..self.fixed_keys.len], self.fixed_keys);
@@ -5624,10 +5632,10 @@ pub const GroupTable = struct {
         @memcpy(self.fixed_keys[@as(usize, id) * stride ..][0..stride], key);
         var i = probe.slot;
         if (grow_slots) {
-            i = @as(usize, hash) & (self.fixed_slots.len - 1);
-            while (self.fixed_slots[i].id != empty_id) i = (i + 1) & (self.fixed_slots.len - 1);
+            i = @as(usize, hash) & (self.fixedSlotCount() - 1);
+            while (self.fixedSlot(i).id != empty_id) i = (i + 1) & (self.fixedSlotCount() - 1);
         }
-        self.fixed_slots[i] = .{ .hash = hash, .id = id };
+        self.fixedSlot(i).* = .{ .hash = hash, .id = id };
         if (self.compact.stride != 0) self.compact.append();
         self.first.appendAssumeCapacity(pos);
         self.fixed_len = id + 1;
@@ -5643,7 +5651,7 @@ pub const GroupTable = struct {
         if (self.fixed_len != 0 or groups == 0) return;
         // The load factor `getOrInsertFixed` keeps: more than 3/4 full grows.
         const slot_cap = std.math.ceilPowerOfTwo(usize, @max(16, groups * 4 / 3 + 1)) catch return error.OutOfMemory;
-        if (slot_cap <= self.fixed_slots.len) return;
+        if (slot_cap <= self.fixedSlotCount()) return;
         const key_cap = groups * self.fixed_stride;
         const projected = key_cap + slot_cap * @sizeOf(FixedSlot) + groups * @sizeOf(u64) +
             (if (self.compact.stride == 0)
@@ -5652,10 +5660,7 @@ pub const GroupTable = struct {
                 self.compact.projected(groups)) + self.set_objects;
         errdefer self.allocated_bytes = self.fixedHeld();
         if (projected > self.allocated_bytes) try self.admit(projected - self.allocated_bytes);
-        const slots = try self.allocator.alloc(FixedSlot, slot_cap);
-        @memset(slots, .{ .hash = 0, .id = empty_id });
-        if (self.fixed_slots.len != 0) self.allocator.free(self.fixed_slots);
-        self.fixed_slots = slots;
+        try self.growFixedSlots(slot_cap, projected);
         if (key_cap > self.fixed_keys.len) {
             const keys = try self.allocator.alloc(u8, key_cap);
             if (self.fixed_keys.len != 0) self.allocator.free(self.fixed_keys);
@@ -5670,7 +5675,7 @@ pub const GroupTable = struct {
     }
 
     fn fixedHeld(self: *const GroupTable) usize {
-        return self.fixed_keys.len + self.fixed_slots.len * @sizeOf(FixedSlot) +
+        return self.fixed_keys.len + self.fixedSlotCount() * @sizeOf(FixedSlot) +
             self.first.capacity * @sizeOf(u64) + self.accumulators.capacity * @sizeOf(Accumulator) +
             self.compact.held() + self.set_objects;
     }
@@ -5681,16 +5686,128 @@ pub const GroupTable = struct {
 
     const FixedProbe = struct { id: ?u32, slot: usize };
 
+    inline fn fixedSlotCount(self: *const GroupTable) usize {
+        return self.fixed_capacity;
+    }
+
+    inline fn firstSlots(self: *const GroupTable) []FixedSlot {
+        return if (self.fixed_stride == 0) self.slots else self.fixed_slots;
+    }
+
+    inline fn fixedSlot(self: *const GroupTable, index: usize) *FixedSlot {
+        const first_slots = self.firstSlots();
+        const first = first_slots.len;
+        if (index < first) return &first_slots[index];
+        const half = self.fixed_capacity / 2;
+        if (index >= half) return &self.fixed_extra[self.fixed_extra_count - 1].?[index - half];
+        const high = std.math.log2_int(usize, index);
+        const part = high - self.fixed_base_shift;
+        const base = @as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(high));
+        return &self.fixed_extra[part].?[index - base];
+    }
+
+    fn clearFixedSlots(self: *GroupTable) void {
+        const first_slots = self.firstSlots();
+        @memset(first_slots, .{ .hash = 0, .id = empty_id });
+        for (0..self.fixed_extra_count) |i| {
+            const len = first_slots.len << @as(std.math.Log2Int(usize), @intCast(i));
+            @memset(self.fixed_extra[i].?[0..len], .{ .hash = 0, .id = empty_id });
+        }
+    }
+
+    fn growFixedSlots(self: *GroupTable, target: usize, projected: usize) !void {
+        return self.growFixedSlotsImpl(target, projected, false);
+    }
+
+    fn growFixedSlotsImpl(self: *GroupTable, target: usize, projected: usize, force_bits: bool) !void {
+        if (self.firstSlots().len == 0) {
+            const first = try self.allocator.alloc(FixedSlot, target);
+            if (self.fixed_stride == 0) self.slots = first else self.fixed_slots = first;
+            self.fixed_capacity = target;
+            self.fixed_base_shift = @intCast(std.math.log2_int(usize, target));
+            self.clearFixedSlots();
+            return;
+        }
+        while (self.fixedSlotCount() < target) {
+            const old = self.fixedSlotCount();
+            if (self.fixed_extra_count == self.fixed_extra.len) return error.ExceededMemoryBudget;
+            // For the rare table using the top id bit, keep the migration marks separately and fund them first.
+            const needs_bits = force_bits or self.groupCount() >= 0x80000000;
+            const bit_bytes = if (needs_bits) old / 8 else 0;
+            const slack = self.max_memory_bytes -| @max(projected, self.allocated_bytes);
+            const need = bit_bytes -| slack;
+            const extra_credit = if (need == 0) 0 else if (self.shared) |b|
+                b.drawExact(need) orelse return error.ExceededMemoryBudget
+            else
+                return error.ExceededMemoryBudget;
+            defer if (extra_credit != 0) self.shared.?.release(extra_credit);
+            const bits: []u8 = if (needs_bits) try self.allocator.alloc(u8, bit_bytes) else &.{};
+            defer if (needs_bits) self.allocator.free(bits);
+            if (needs_bits) {
+                @memset(bits, 0);
+                for (0..old) |i| if (self.fixedSlot(i).id != empty_id) {
+                    bits[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+                };
+            }
+            const extra = try self.allocator.alloc(FixedSlot, old);
+            @memset(extra, .{ .hash = 0, .id = empty_id });
+            self.fixed_extra[self.fixed_extra_count] = extra.ptr;
+            self.fixed_extra_count += 1;
+            self.fixed_capacity = old * 2;
+            const mask = self.fixedSlotCount() - 1;
+            const migrated: u32 = 0x80000000;
+            for (0..old) |i| {
+                const source = self.fixedSlot(i);
+                if (!fixedUnmigrated(source.*, i, old, bits)) continue;
+                var entry = source.*;
+                source.* = .{ .hash = 0, .id = empty_id };
+                if (needs_bits) bits[i / 8] &= ~(@as(u8, 1) << @intCast(i % 8));
+                while (true) {
+                    var at = @as(usize, entry.hash) & mask;
+                    while (true) : (at = (at + 1) & mask) {
+                        const dest = self.fixedSlot(at);
+                        if (dest.id == empty_id) {
+                            dest.* = entry;
+                            if (!needs_bits) dest.id |= migrated;
+                            break;
+                        }
+                        if (fixedUnmigrated(dest.*, at, old, bits)) {
+                            const displaced = dest.*;
+                            dest.* = entry;
+                            if (!needs_bits) dest.id |= migrated else
+                                bits[at / 8] &= ~(@as(u8, 1) << @intCast(at % 8));
+                            entry = displaced;
+                            break;
+                        }
+                    }
+                    if (self.fixedSlot(at).id == (if (needs_bits) entry.id else entry.id | migrated)) break;
+                }
+            }
+            if (!needs_bits) for (0..self.fixedSlotCount()) |i| {
+                const slot = self.fixedSlot(i);
+                if (slot.id != empty_id) slot.id &= ~migrated;
+            };
+        }
+    }
+
+    fn fixedUnmigrated(slot: FixedSlot, index: usize, old: usize, bits: []const u8) bool {
+        if (index >= old or slot.id == empty_id) return false;
+        return if (bits.len == 0)
+            slot.id & 0x80000000 == 0
+        else
+            bits[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0;
+    }
+
     inline fn probeFixed(self: *const GroupTable, key: []const u8, full_hash: u64) FixedProbe {
-        const slots = self.fixed_slots;
-        if (slots.len == 0) return .{ .id = null, .slot = 0 };
-        const mask = slots.len - 1;
+        const count = self.fixedSlotCount();
+        if (count == 0) return .{ .id = null, .slot = 0 };
+        const mask = count - 1;
         const stride: usize = self.fixed_stride;
         const hash: u32 = @truncate(full_hash);
         var i = @as(usize, hash) & mask;
         var n: usize = 0;
-        while (n < slots.len) : (n += 1) {
-            const slot = slots[i];
+        while (n < count) : (n += 1) {
+            const slot = self.fixedSlot(i).*;
             if (slot.id == empty_id) return .{ .id = null, .slot = i };
             if (slot.hash == hash and keyEql(self.fixed_keys[@as(usize, slot.id) * stride ..][0..stride], key))
                 return .{ .id = slot.id, .slot = i };
@@ -5711,7 +5828,7 @@ pub const GroupTable = struct {
         self.first.clearRetainingCapacity();
         self.compact.words.clearRetainingCapacity();
         self.fixed_len = 0;
-        @memset(self.fixed_slots, .{ .hash = 0, .id = empty_id });
+        self.clearFixedSlots();
         self.allocated_bytes = self.fixedHeld();
         self.releaseSlack();
     }
@@ -5724,7 +5841,7 @@ pub const GroupTable = struct {
         self.first.clearRetainingCapacity();
         self.compact.words.clearRetainingCapacity();
         if (self.strings) |strings| strings.reset();
-        @memset(self.slots, .{ .hash = 0, .id = empty_id });
+        self.clearFixedSlots();
         self.allocated_bytes = self.variableHeld();
         self.releaseSlack();
     }
@@ -6473,6 +6590,198 @@ test "STRGROUP failed arena inserts and winner allocations preserve ids and ledg
     };
     try Trial.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Trial.run, .{});
+}
+
+test "variable hash growth bitmap migration preserves supplied hashes" {
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.shared = &budget;
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var buf: [24]u8 = undefined;
+    for (0..12) |i| {
+        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        _ = try table.getOrInsertStringHashed(key, &calls, i, 0);
+    }
+    table.releaseSlack();
+    const projected = table.variableHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    budget.limit = projected;
+    try table.admit(projected - table.allocated_bytes);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.growFixedSlotsImpl(32, projected, true));
+    budget.limit += 2;
+    try table.growFixedSlotsImpl(32, projected, true);
+    table.allocated_bytes = table.variableHeld();
+    try std.testing.expectEqual(projected, budget.used.load(.monotonic));
+    for (0..12) |i| {
+        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.probeString(key, true, 0).id);
+    }
+}
+
+test "distinct partition allocation admits first and restores credit on failure" {
+    const a = std.testing.allocator;
+    var budget: SharedBudget = .{ .limit = 1 << 20 };
+    var set: DistinctSet = .{};
+    defer set.deinit(a);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, set.initPartitions(failing.allocator(), &budget));
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try std.testing.expect(set.parts == null and set.shared == null);
+    budget.limit = 1;
+    try std.testing.expectError(error.ExceededMemoryBudget, set.initPartitions(failing.allocator(), &budget));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "distinct hash growth refuses before replacing a full map" {
+    const a = std.testing.allocator;
+    {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        var set: DistinctSet = .{ .shared = &budget };
+        defer set.deinit(a);
+        var i: u64 = 0;
+        while (true) : (i += 1) {
+            try set.insertU64(a, (i + 1) * (1 << 40));
+            if (set.val_set == .u64 and set.val_set.u64.available == 0) break;
+        }
+        const capacity = set.val_set.u64.capacity();
+        set.releaseSlack();
+        budget.limit = budget.used.load(.monotonic);
+        try set.insertU64(a, 1 << 40);
+        try std.testing.expectError(error.ExceededMemoryBudget, set.insertU64(a, (i + 2) * (1 << 40)));
+        try std.testing.expectEqual(capacity, set.val_set.u64.capacity());
+    }
+    {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        var set: DistinctSet = .{ .shared = &budget };
+        defer set.deinit(a);
+        var i: i128 = 0;
+        while (true) : (i += 1) {
+            try set.insertI128(a, (i + 1) * (@as(i128, 1) << 80));
+            if (set.val_set == .i128 and set.val_set.i128.available == 0) break;
+        }
+        const capacity = set.val_set.i128.capacity();
+        set.releaseSlack();
+        budget.limit = budget.used.load(.monotonic);
+        try set.insertI128(a, @as(i128, 1) << 80);
+        try std.testing.expectError(error.ExceededMemoryBudget, set.insertI128(a, (i + 2) * (@as(i128, 1) << 80)));
+        try std.testing.expectEqual(capacity, set.val_set.i128.capacity());
+    }
+    {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        var set: DistinctSet = .{ .shared = &budget };
+        defer set.deinit(a);
+        var buf: [32]u8 = undefined;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            try set.insertBytes(a, try std.fmt.bufPrint(&buf, "distinct-{d}", .{i}));
+            if (set.val_set == .bytes and set.val_set.bytes.map.available == 0) break;
+        }
+        const capacity = set.val_set.bytes.map.capacity();
+        set.releaseSlack();
+        budget.limit = budget.used.load(.monotonic);
+        try set.insertBytes(a, "distinct-0");
+        const next = try std.fmt.bufPrint(&buf, "distinct-{d}", .{i + 1});
+        try std.testing.expectError(error.ExceededMemoryBudget, set.insertBytes(a, next));
+        try std.testing.expectEqual(capacity, set.val_set.bytes.map.capacity());
+    }
+}
+
+test "fixed hash growth bitmap admission and migration preserve supplied hashes" {
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.shared = &budget;
+    table.fixed_stride = 9;
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var key: [9]u8 = @splat(0);
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixedHashed(&key, &calls, i, 0);
+    }
+    table.releaseSlack();
+    const projected = table.fixedHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    budget.limit = projected;
+    try table.admit(projected - table.allocated_bytes);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.growFixedSlotsImpl(32, projected, true));
+    try std.testing.expectEqual(@as(usize, 16), table.fixedSlotCount());
+    budget.limit += 2;
+    try table.growFixedSlotsImpl(32, projected, true);
+    table.allocated_bytes = table.fixedHeld();
+    try std.testing.expectEqual(projected, budget.used.load(.monotonic));
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findFixed(&key, 0));
+    }
+}
+
+test "fixed hash growth is ledger funded and refusal preserves its keys" {
+    const Counter = struct {
+        budget: *SharedBudget,
+        live: usize = 0,
+        unpaid: usize = 0,
+        observing: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = std.testing.allocator.rawAlloc(n, alignment, ra) orelse return null;
+            self.live += n;
+            if (self.observing)
+                self.unpaid = @max(self.unpaid, self.live -| self.budget.used.load(.monotonic));
+            return p;
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+            self.live -= bytes.len;
+        }
+    };
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var counter: Counter = .{ .budget = &budget };
+    var table = GroupTable.init(counter.allocator(), 0);
+    table.shared = &budget;
+    table.fixed_stride = 9;
+    var table_live = true;
+    defer if (table_live) table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var key: [9]u8 = @splat(0);
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixed(&key, &calls, i);
+    }
+    table.releaseSlack();
+    budget.limit = budget.used.load(.monotonic);
+    std.mem.writeInt(u64, key[1..9], 12, .little);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.getOrInsertFixed(&key, &calls, 12));
+    try std.testing.expectEqual(@as(usize, 12), table.groupCount());
+    const projected = table.fixedHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    budget.limit = projected;
+    try table.admit(projected - table.allocated_bytes);
+    counter.observing = true;
+    try table.growFixedSlots(32, projected);
+    counter.observing = false;
+    table.allocated_bytes = table.fixedHeld();
+    try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+    budget.limit = 1 << 20;
+    for (12..500) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixed(&key, &calls, i);
+    }
+    for (0..500) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findFixed(&key, hashFixed(&key)));
+    }
+    table.deinit();
+    table_live = false;
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }
 
 test "GroupTable basic grouping, float normalization, and memory capping" {

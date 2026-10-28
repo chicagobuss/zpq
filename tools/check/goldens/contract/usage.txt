@@ -126,25 +126,28 @@ usage:
                  first appear in the input and the same bits come out
                  at every -j.
   --max-memory SIZE
-                 ceiling on what an aggregate or a write holds at once:
-                 GROUP BY tables, decoded row groups, read-ahead,
-                 merge and answer, encoded output waiting to be
-                 written, all drawn from one budget whatever -j is.
+                 working budget for an aggregate or a write: GROUP BY
+                 tables, decoded row groups, read-ahead, merge and
+                 answer, and encoded output waiting to be written.
                  SIZE is bytes, or a number (fractions allowed) with K,
                  M, G or T, B optional, any case, in powers of 1024:
                  1024, 512MB, 1.5g. No space; MiB and 1e9 are refused.
                  Unset: 80% of available memory on Linux (at most 3/4
                  of a cgroup memory.max), half of RAM on macOS, else
                  512 MiB. Example: --max-memory 2GB.
-                 Outside it, a fixed slack: the binary, thread stacks,
-                 the mapped input, each worker's first 2 MiB and its
-                 codec state (about 0.1 MiB reading; writing, +0.2 MiB
+                 This is a working budget, not an RSS cap. Outside it:
+                 the binary, thread stacks, resident mapped input pages,
+                 each worker's first 2 MiB and its codec state (about
+                 0.1 MiB reading; writing, +0.2 MiB
                  snappy, +0.1 MiB gzip, +1.3 MiB zstd, +3.5 MiB zstd at
                  --compress-priority speed), 16 MiB for a GROUP BY's
                  merge and answer, and 32 MiB for a last retry's or a
                  sliced write's decode. A query that does not fit runs
                  again on narrower paths (one worker, smaller slices)
-                 and else fails with an error, never more memory.
+                 and else fails with an error. Allocator retention and
+                 growth can also exceed the budget. At small limits the
+                 fixed allowances and input pages may exceed 10% of it;
+                 mapped-page residency depends on the input and access.
                  Written bytes never depend on -j; an explicit
                  --max-memory caps re-encoded row groups at a sixteenth
                  of it, so they may depend on its value.

@@ -1,4 +1,7 @@
 const std = @import("std");
+const decimal_mod = @import("../parquet/decimal.zig");
+const invariant = @import("../invariant.zig");
+const enterChunk = @import("types.zig").enterChunk;
 const schema = @import("../schema.zig");
 const filter_eval = @import("../filter/eval.zig");
 const column_mod = @import("../parquet/column.zig");
@@ -605,5 +608,50 @@ pub fn codedCol(comptime T: type, c: anytype, dict: []const T, levels: schema.Le
         .max_def = @intCast(levels.max_def),
         .has_nulls = c.has_nulls,
     };
+}
+
+
+/// Decode one DECIMAL column's chunk to unscaled i128 integers (the
+/// lossless output lane). Re-derives the chunk window the same way the
+/// batch-decode loop does. Caller guarantees the column is an
+/// INT32/INT64-backed decimal.
+/// Leaf `ci`'s DECIMAL kind, or null when it is no decimal.
+pub fn decimalKind(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) ?decimal_mod.Kind {
+    const cm = rg.columns.items[ci].meta_data orelse return null;
+    const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
+    return decimal_mod.exactKind(&se);
+}
+
+pub fn decodeDecimalI128(
+    ra: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    src: RGSrc,
+    kept_ci: usize,
+    decode_options_in: DecodeOptions,
+) !filter_eval.ColumnT(i128) {
+    enterChunk(rg, kept_ci);
+    const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
+    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
+    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
+    const len: usize = @intCast(cm.total_compressed_size);
+    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
+    const buf_off = start - @as(usize, @intCast(src.byte_origin));
+    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
+    const chunk = src.bytes[buf_off .. buf_off + len];
+
+    const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    const n_leaves: usize = @intCast(cm.num_values);
+    const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
+    const kind = decimal_mod.exactKind(&se) orelse return error.SchemaLookupFailed;
+    return decimal_mod.decodeColumnAsI128WithOptions(
+        ra,
+        chunk,
+        cm.codec,
+        levels,
+        n_leaves,
+        kind,
+        decode_options,
+    );
 }
 

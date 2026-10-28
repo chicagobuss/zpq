@@ -654,49 +654,8 @@ pub fn chunkDictionary(
 pub const slice_reader = @import("consumer/slice_reader.zig");
 pub const SliceReader = slice_reader.SliceReader;
 
-/// Decode one DECIMAL column's chunk to unscaled i128 integers (the
-/// lossless output lane). Re-derives the chunk window the same way the
-/// batch-decode loop does. Caller guarantees the column is an
-/// INT32/INT64-backed decimal.
-/// Leaf `ci`'s DECIMAL kind, or null when it is no decimal.
-fn decimalKind(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ci: usize) ?decimal_mod.Kind {
-    const cm = rg.columns.items[ci].meta_data orelse return null;
-    const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
-    return decimal_mod.exactKind(&se);
-}
-
-fn decodeDecimalI128(
-    ra: std.mem.Allocator,
-    rg: *const schema.RowGroup,
-    meta: *const schema.FileMetaData,
-    src: RGSrc,
-    kept_ci: usize,
-    decode_options_in: DecodeOptions,
-) !filter_eval.ColumnT(i128) {
-    enterChunk(rg, kept_ci);
-    const cm = rg.columns.items[kept_ci].meta_data orelse return error.ColumnMetaMissing;
-    const decode_options = column_mod.chunkOptions(decode_options_in, meta, cm);
-    const start: usize = if (cm.dictionary_page_offset) |dp| @intCast(dp) else @intCast(cm.data_page_offset);
-    const len: usize = @intCast(cm.total_compressed_size);
-    invariant.assert(start >= @as(usize, @intCast(src.byte_origin)));
-    const buf_off = start - @as(usize, @intCast(src.byte_origin));
-    if (buf_off + len > src.bytes.len) return error.MissingChunkBytes;
-    const chunk = src.bytes[buf_off .. buf_off + len];
-
-    const levels = meta.getColumnLevels(cm.path_in_schema.items);
-    const n_leaves: usize = @intCast(cm.num_values);
-    const se = meta.getColumnSchema(cm.path_in_schema.items) orelse return error.SchemaLookupFailed;
-    const kind = decimal_mod.exactKind(&se) orelse return error.SchemaLookupFailed;
-    return decimal_mod.decodeColumnAsI128WithOptions(
-        ra,
-        chunk,
-        cm.codec,
-        levels,
-        n_leaves,
-        kind,
-        decode_options,
-    );
-}
+const decimalKind = consumer_column.decimalKind;
+const decodeDecimalI128 = consumer_column.decodeDecimalI128;
 
 /// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
 /// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die

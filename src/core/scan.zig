@@ -48,6 +48,8 @@ pub const NdvStat = ndv.Stat;
 const filter_ast = @import("filter/ast.zig");
 const filter_parser = @import("filter/parser.zig");
 const filter_prune = @import("filter/prune.zig");
+const filter_eval = @import("filter/eval.zig");
+const filter_selection = @import("filter/selection.zig");
 const membership = @import("filter/membership.zig");
 const nanprobe = @import("filter/nanprobe.zig");
 const Diag = @import("diag.zig").Diag;
@@ -823,6 +825,7 @@ fn splitRowGroups(
     if (workers < 2) return null;
     var alive: usize = 0;
     var bytes: u64 = 0;
+    var sample: ?WorkItem = null;
     for (work) |item| {
         const rg = &metas[item.file].row_groups.items[item.rg];
         const decision = plan.decide(rg, &metas[item.file]);
@@ -836,11 +839,24 @@ fn splitRowGroups(
             if (ci < read.len and read[ci] and col.column_index_offset != null) return null;
         };
         alive += 1;
+        if (sample == null) sample = item;
         bytes +|= subgroupBytes(rg, item.columns.forRowGroup(decision));
     }
     if (alive == 0 or alive >= workers) return null;
     const target = @min(workers *| 2, bytes / @max(1, args.min_bytes_per_worker));
     if (target <= alive) return null;
+    if (plan.query.filter) |filter| {
+        const item = sample.?;
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        const source = args.inputs[item.file].plan_bytes orelse args.inputs[item.file].bytes;
+        // Unknown fixed-width selectivity can leave little grouping behind a large decoded-byte estimate.
+        // Costing only: a prefix never bounds rows or skips evaluation; probe refusal retains today's split.
+        const share = subgroupPassShare(a, source, rg, meta, filter, args.min_bytes_per_worker, workers) catch 1;
+        if (@as(f64, @floatFromInt(bytes)) * share <
+            @as(f64, @floatFromInt(@max(1, args.min_bytes_per_worker))) * @as(f64, @floatFromInt(workers)))
+            return null;
+    }
     // A cold header walk must not serialize the chunk reads ahead of the worker pool. Both the walk and
     // mapped decoders reuse these file-backed pages; no extra input buffer is retained by this hint.
     for (work) |item| {
@@ -884,6 +900,60 @@ fn splitRowGroups(
     return if (changed) split.items else null;
 }
 
+fn subgroupProbeLeaves(
+    a: std.mem.Allocator,
+    f: filter_ast.Filter,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    leaves: *std.ArrayList(filter_ast.Filter),
+) !void {
+    if (f == .and_filter) {
+        if (f.and_filter.in_set != null or f.and_filter.null_member) return;
+        for (f.and_filter.children) |child| try subgroupProbeLeaves(a, child, rg, meta, leaves);
+        return;
+    }
+    switch (f) {
+        .int32, .int64, .float, .double, .boolean => {},
+        else => return,
+    }
+    if (filter_prune.pruneRowGroup(rg, f, meta) == .always_match or
+        filter_prune.passFraction(f, rg, meta) != 1) return;
+    try leaves.append(a, f);
+}
+
+fn subgroupPassShare(
+    a: std.mem.Allocator,
+    source: []const u8,
+    rg: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
+    filter: filter_ast.Filter,
+    min_bytes: u64,
+    workers: usize,
+) !f64 {
+    var leaves: std.ArrayList(filter_ast.Filter) = .empty;
+    try subgroupProbeLeaves(a, filter, rg, meta, &leaves);
+    if (leaves.items.len == 0) return 1;
+    const n: usize = @intCast(@min(@as(u64, @intCast(rg.num_rows)), @max(@import("hw.zig").cacheLineBytes(), min_bytes / @max(1, workers) / @sizeOf(i64))));
+    const lookup = try a.alloc(?usize, rg.columns.items.len);
+    @memset(lookup, null);
+    var columns: std.ArrayList(filter_eval.Batch.Column) = .empty;
+    for (leaves.items) |leaf| {
+        const ci = filter_ast.leafColumn(leaf).?;
+        if (ci >= lookup.len) return 1;
+        if (lookup[ci] != null) continue;
+        var reader = (try consumer.SliceReader.init(a, a, rg, meta, .{ .bytes = source, .byte_origin = 0 }, ci, .{ .encoded = false })) orelse return 1;
+        defer reader.deinit();
+        const col = try reader.next(a, n);
+        lookup[ci] = columns.items.len;
+        try columns.append(a, col);
+    }
+    var selected = try filter_selection.SelectionVector.init(a, n);
+    defer selected.deinit();
+    const batch: filter_eval.Batch = .{ .cols = columns.items, .num_rows = n };
+    for (leaves.items) |leaf| try filter_eval.evaluate(leaf, &batch, &selected, lookup, a);
+    return @as(f64, @floatFromInt(selected.count())) / @as(f64, @floatFromInt(n));
+}
+
 fn subgroupBytes(rg: *const schema.RowGroup, read: []const bool) u64 {
     var bytes: u64 = 0;
     for (rg.columns.items, 0..) |col, ci| {
@@ -892,6 +962,40 @@ fn subgroupBytes(rg: *const schema.RowGroup, read: []const bool) u64 {
         };
     }
     return bytes;
+}
+
+test "row subgroups decline sparse unknown predicates before walking payload pages" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try row_subgroups.testFixture(a);
+    var predicate: std.ArrayList(u8) = .empty;
+    for (0..36) |i| try predicate.print(a, "{s}k != {d}", .{ if (i == 0) "" else " AND ", i });
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "sparse", .bytes = fixture.bytes }},
+        .metas = &.{fixture.meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k,s",
+        .filter = predicate.items,
+        .parallelism = 1,
+        .min_bytes_per_worker = 2 << 10,
+        .max_memory = 64 << 20,
+        .dense = false,
+        .ndv_policy = false,
+        .plain_rules = false,
+        .spill = false,
+        .sketch_topk = null,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    args.parallelism = 8;
+    row_subgroups.test_ranges.store(0, .monotonic);
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), row_subgroups.test_ranges.load(.monotonic));
+    try testing.expectEqual(want.rows_matched, got.rows_matched);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
 }
 
 test "row subgroups preserve grouped counts, first ordinals, ties and LIMIT OFFSET under pool failures" {

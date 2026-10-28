@@ -174,7 +174,7 @@ pub const Loop = struct {
         while (self.submissions.pop()) |c| {
             switch (c.op) {
                 .timer => |*t| {
-                    const tfd = linux.syscall2(.timerfd_create, @intFromEnum(linux.CLOCK.MONOTONIC), 0);
+                    const tfd = linux.syscall2(.timerfd_create, @backingInt(linux.CLOCK.MONOTONIC), 0);
                     if (errnoOrFd(tfd)) |fd| {
                         t.fd = fd;
                         c.registered_fd = fd;
@@ -250,9 +250,9 @@ pub const Loop = struct {
                     c.pending_result = .{ .connect = {} };
                 } else {
                     c.pending_result = .{ .connect = switch (err) {
-                        @intFromEnum(linux.E.CONNREFUSED) => error.ConnectionRefused,
-                        @intFromEnum(linux.E.NETUNREACH) => error.NetworkUnreachable,
-                        @intFromEnum(linux.E.TIMEDOUT) => error.TimedOut,
+                        @backingInt(linux.E.CONNREFUSED) => error.ConnectionRefused,
+                        @backingInt(linux.E.NETUNREACH) => error.NetworkUnreachable,
+                        @backingInt(linux.E.TIMEDOUT) => error.TimedOut,
                         else => error.Unexpected,
                     } };
                 }

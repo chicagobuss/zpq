@@ -299,7 +299,6 @@ fn writeZigzagI32(buf: *std.ArrayList(u8), value: i32) !void {
     try writeUVarint(buf, u);
 }
 
-
 test "a delta stream claiming more values than its page holds is rejected before allocating for them" {
     // Header: block 128, 4 miniblocks, 1<<24 values, first value 0; the stream ends there, which bit width 0
     // would make a valid way to claim the whole count.

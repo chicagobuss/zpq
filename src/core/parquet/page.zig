@@ -319,10 +319,22 @@ pub const SliceScratch = struct {
             else => {
                 const slot = &self.slots.items[(pick - 4) / 6];
                 switch ((pick - 4) % 6) {
-                    0 => { slot.scratch.gpa.free(slot.scratch.page); slot.scratch.page = &.{}; },
-                    1 => { slot.scratch.gpa.free(slot.scratch.dict); slot.scratch.dict = &.{}; },
-                    2 => { slot.scratch.gpa.free(slot.scratch.def_levels); slot.scratch.def_levels = &.{}; },
-                    3 => { slot.scratch.gpa.free(slot.scratch.rep_levels); slot.scratch.rep_levels = &.{}; },
+                    0 => {
+                        slot.scratch.gpa.free(slot.scratch.page);
+                        slot.scratch.page = &.{};
+                    },
+                    1 => {
+                        slot.scratch.gpa.free(slot.scratch.dict);
+                        slot.scratch.dict = &.{};
+                    },
+                    2 => {
+                        slot.scratch.gpa.free(slot.scratch.def_levels);
+                        slot.scratch.def_levels = &.{};
+                    },
+                    3 => {
+                        slot.scratch.gpa.free(slot.scratch.rep_levels);
+                        slot.scratch.rep_levels = &.{};
+                    },
                     4 => _ = slot.pages.reset(.{ .retain_with_limit = 0 }),
                     else => _ = slot.dictionary.reset(.{ .retain_with_limit = 0 }),
                 }

@@ -16,7 +16,7 @@ pub const Coalescer = struct {
     /// The input `ranges` slice is not modified, but the returned slice is allocated.
     ///
     /// The input ranges do NOT need to be sorted; this function will sort them internally if needed,
-    /// but since we can't easily clone/sort without allocation, the caller should ideally provide sorted ranges 
+    /// but since we can't easily clone/sort without allocation, the caller should ideally provide sorted ranges
     /// OR we allocate a temp buffer for sorting.
     ///
     /// For this implementation, we assume the caller passes potentially unsorted ranges, so we allocate a copy to sort.
@@ -41,11 +41,11 @@ pub const Coalescer = struct {
 
         for (sorted[1..]) |next| {
             // Check for overlap or proximity
-            // Note: Range is [start, end), so end is exclusive? 
+            // Note: Range is [start, end), so end is exclusive?
             // Standard parquet usage usually implies [start, start + len).
             // Let's assume inclusive start, exclusive end for standard zig slice semantics.
             // But wait, our usage in Executor implies 'end' is exclusive (start + len).
-            
+
             // Gap = next.start - current.end
             // careful with underflow if next starts before current ends (overlap)
             if (next.start <= current.end + gap_threshold) {
@@ -187,7 +187,7 @@ fn coalesceDispatchInner(
     var gaps: std.ArrayList(Gap) = .empty;
     defer gaps.deinit(allocator);
     try gaps.ensureTotalCapacity(allocator, live.items.len);
-    for (live.items[0 .. live.items.len -| 1], 0..) |s, i| {
+    for (live.items[0..live.items.len -| 1], 0..) |s, i| {
         const nxt = live.items[i + 1];
         if (s.object != nxt.object) continue;
         if (window_cap != null and s.group != nxt.group) continue;
@@ -333,22 +333,22 @@ test "a dispatch over pieces whose lengths sum past 2^64 plans them without over
 
 test "coalescer: basic merging" {
     const allocator = std.testing.allocator;
-    
+
     const input = [_]Range{
         .{ .start = 0, .end = 100 },
         .{ .start = 150, .end = 200 }, // Gap 50
         .{ .start = 300, .end = 400 }, // Gap 100
     };
-    
+
     // Gaps:
     // 0..100 -> 150..200 (gap 50)
     // 150..200 -> 300..400 (gap 100)
-    
+
     // Threshold 60: Should merge first two
     // 0..200, 300..400
     const res1 = try Coalescer.coalesce(allocator, &input, 60);
     defer allocator.free(res1);
-    
+
     try std.testing.expectEqual(@as(usize, 2), res1.len);
     try std.testing.expectEqual(@as(u64, 0), res1[0].start);
     try std.testing.expectEqual(@as(u64, 200), res1[0].end);
@@ -358,17 +358,17 @@ test "coalescer: basic merging" {
 
 test "coalescer: unsorted input" {
     const allocator = std.testing.allocator;
-    
+
     const input = [_]Range{
         .{ .start = 300, .end = 400 },
         .{ .start = 0, .end = 100 },
         .{ .start = 150, .end = 200 },
     };
-    
+
     // Threshold 60: Should merge 0..100 and 150..200 -> 0..200
     const res = try Coalescer.coalesce(allocator, &input, 60);
     defer allocator.free(res);
-    
+
     try std.testing.expectEqual(@as(usize, 2), res.len);
     try std.testing.expectEqual(@as(u64, 0), res[0].start);
     try std.testing.expectEqual(@as(u64, 200), res[0].end);
@@ -376,15 +376,15 @@ test "coalescer: unsorted input" {
 
 test "coalescer: large gap" {
     const allocator = std.testing.allocator;
-     const input = [_]Range{
+    const input = [_]Range{
         .{ .start = 0, .end = 100 },
         .{ .start = 200, .end = 300 },
     };
-    
+
     // Threshold 50: No merge
     const res = try Coalescer.coalesce(allocator, &input, 50);
     defer allocator.free(res);
-    
+
     try std.testing.expectEqual(@as(usize, 2), res.len);
 }
 

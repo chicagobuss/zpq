@@ -162,4 +162,3 @@ test "KeyHashMap: allocation failure leaves no leaks" {
         }
     }.run, .{});
 }
-

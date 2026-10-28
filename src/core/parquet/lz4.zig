@@ -298,11 +298,11 @@ test "uncompress with match (overlapping copy)" {
     // Let's just do: lit "ab" + match offset=2 len=4 (=4 from token) +
     // final lit "X".
     const src = [_]u8{
-        0x20,            // token: lit_len=2, match_len_field=0 (=4 final)
-        'a', 'b',        // literals
-        0x02, 0x00,      // offset=2 LE
-        0x10,            // token: lit_len=1, match_len_field=0
-        'X',             // final literal
+        0x20, // token: lit_len=2, match_len_field=0 (=4 final)
+        'a', 'b', // literals
+        0x02, 0x00, // offset=2 LE
+        0x10, // token: lit_len=1, match_len_field=0
+        'X', // final literal
     };
     var out: [16]u8 = undefined;
     const n = try uncompress(&src, &out);

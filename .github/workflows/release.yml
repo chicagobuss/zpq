@@ -47,6 +47,11 @@ jobs:
             | tar -xz -C $HOME/zig-bin
           echo "$HOME/zig-bin" >> $GITHUB_PATH
 
+      # anyzig downloads the pinned Zig on its first call; do that here, so the packager's short `zig version`
+      # timeout never covers a download.
+      - name: Fetch the pinned Zig
+        run: zig version
+
       # .deb and .rpm come from the Linux tarballs' own bytes (tools/package_release.py --packages).
       - name: Install nfpm (pinned)
         if: endsWith(matrix.target, '-linux-musl')

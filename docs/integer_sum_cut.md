@@ -32,5 +32,5 @@ the query ledger after record/scratch teardown, just like the general GROUP BY a
 Kernel tests deliberately put equal final sums in different key/arrival/first orders, with duplicates spread across
 workers and NULL keys/sums. They check hand-known winners at 1, 2, 4, 8 and 16 workers, including H larger than the
 group count, allocation failure and wide winning/losing sums. Scan tests compare with the established partition cut
-and inject spawn failure. The release verification additionally uses a tie-heavy multi-row-group file against rc4,
+and inject spawn failure. The release verification additionally uses a tie-heavy multi-row-group file against the previous build,
 checking JSON bytes, Parquet decoded values/order and invariant candidate bytes across workers and budget fallback.

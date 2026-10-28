@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-10-28)
 
 **Read "What to do" first if you script zpq or rely on its answers.** 0.5.0 changes what `zpq query` prints, fixes
 answers that 0.4.1 got incorrect without an error, and turns `--max-memory` into a real ceiling. It adds a C library
@@ -152,7 +152,7 @@ output is the same at every `-j`, memory budget and cache size.
 
 ### Performance
 
-**How these were measured.** zpq 0.5.0 (`v0.5.0-rc4`, build {{TBD}}; on Linux x86_64 the shipped x86-64-v3 musl
+**How these were measured.** zpq 0.5.0 (build {{TBD}}; on Linux x86_64 the shipped x86-64-v3 musl
 binary) against DuckDB 2.0 and Polars 2.0. Every query starts a fresh process of each engine, in two lanes: cold, as a
 user meets a file the first time (before each of 3 repetitions the input's pages are evicted from the page cache and
 the eviction is verified), and hot-fresh (the input already in the page cache, in a new process). A case's time is the

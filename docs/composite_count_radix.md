@@ -85,7 +85,7 @@ released source bytes; a separate check consumes the parent's remaining credit a
 the admitted path to finish from owned pages and prepaid decoder storage.
 
 External fixtures include keys differing only inside the proposed skipped prefix, ties spanning sixteen actual
-workers, permuted output columns and OFFSET. They compare rc4 values/order and JSON output, require invariant bytes
+workers, permuted output columns and OFFSET. They compare values, order and JSON output with the previous build, require invariant bytes
 across workers and budgets, and fully decode Parquet with PyArrow and DuckDB. Real long-string inputs receive the
 same checks. This path does not change filtered expression evaluation, integer composite grouping, or the frozen
 single-key full-output and SUM top-k kernels.

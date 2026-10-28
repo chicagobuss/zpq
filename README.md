@@ -114,6 +114,11 @@ $ S3_NO_SIGN_REQUEST=1 AWS_REGION=eu-central-1 zpq query \
 ```
 <!-- examples:end -->
 
+<!-- PLACEHOLDER until `--parquet-version` lands on release/0.5.1; check the wording against the final help text. -->
+Files zpq writes use Parquet's version 2 encodings by default (`--parquet-version v2`: the DELTA encodings,
+RLE_DICTIONARY and a version 2 footer). For readers that only understand version 1 files, add
+`--parquet-version v1`.
+
 ## Three ways in
 
 - **The `zpq` CLI**, shown above. `zpq --help` and `man zpq` list every option;
@@ -123,7 +128,10 @@ $ S3_NO_SIGN_REQUEST=1 AWS_REGION=eu-central-1 zpq query \
   reads and writes S3 natively, with no AWS SDK. `tools/serverless/fanout.py` fans one query out across many workers
   by row group ([docs/lambda-and-s3.md](docs/lambda-and-s3.md)).
 - **libzpq**, a C library ([docs/libzpq.md](docs/libzpq.md)), with a Python binding, `python/zpq.py`, that needs no
-  compiled extension. SQL through libzpq is experimental.
+  compiled extension. SQL through libzpq is experimental. libzpq can also return answers as Arrow C Data streams
+  (experimental): `python/zpq_arrow.py` reads them into PyArrow, and a Spark DataSource V2,
+  [`spark.read.format("zpq")`](integrations/spark/README.md), runs Parquet scans and partial aggregates in zpq and
+  takes the rows back as Arrow batches.
 
 ## What zpq isn't
 
@@ -144,7 +152,7 @@ still behind are on the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.
   under a cgroup `memory.max` or `ulimit -v`.
 - No joins and no window functions; some other SQL is refused with exit 2 and a message.
 - JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
-- SQL through libzpq is experimental, and Windows is not built.
+- SQL through libzpq, Arrow results and the Spark data source are experimental; Windows is not built.
 
 The full list is under "Known limits" in [CHANGELOG.md](CHANGELOG.md).
 
@@ -164,7 +172,8 @@ The full list is under "Known limits" in [CHANGELOG.md](CHANGELOG.md).
 - [Bloom filters and dictionaries](docs/bloom-filters-and-dictionaries.md).
 - [zpq on AWS Lambda, and reading S3](docs/lambda-and-s3.md), with the
   [Lambda request format](docs/lambda_requests.md).
-- [libzpq](docs/libzpq.md), and [using zpq as a Zig module](docs/zig-module.md).
+- [libzpq](docs/libzpq.md), with its Arrow C stream results, and [using zpq as a Zig module](docs/zig-module.md).
+- [The Spark DataSource V2](integrations/spark/README.md).
 - [Profiling a query](docs/profiling-quickstart.md).
 - [Source layout](docs/source-layout.md).
 

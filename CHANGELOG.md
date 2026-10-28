@@ -1,9 +1,89 @@
 # Changelog
 
-## Unreleased (0.5.1)
+## 0.5.1 (unreleased)
 
-- Add experimental Arrow C Data stream results to libzpq, with a PyArrow reader and Spark columnar integration.
-  Streams preserve typed values and independently owned batches; unsupported nested results are refused.
+<!-- DRAFT for the 0.5.1 release body. Items marked PLACEHOLDER have not landed on release/0.5.1; fill in or delete
+each one before the tag. Everything else is on release/0.5.1 at 9a8a7b4a. -->
+
+0.5.1 brings Arrow to libzpq: answers come back as Arrow C Data streams, with typed columns, exact DECIMALs and no
+JSON in between, and a Spark DataSource V2 uses them to run Parquet scans and partial aggregates inside zpq. It also
+makes three kinds of query faster, fixes a clean-up bug when memory runs out, and hardens the tests and release
+tooling. **PLACEHOLDER:** `--parquet-version`, with v2 the default; the `--max-memory` accounting work; the
+ClickBench q9 and q39 speed-ups; the internal code cleanup.
+
+### What to do
+
+Nothing changes for existing scripts: `zpq query` prints the same rows, types and errors as 0.5.0, and libzpq's
+existing functions and status codes keep their meanings.
+
+> **PLACEHOLDER (`--parquet-version`, not landed):** files zpq writes now default to `--parquet-version v2` (the
+> DELTA encodings, RLE_DICTIONARY with a PLAIN dictionary page, and a version 2 footer), as DuckDB's writer does.
+> A pipeline whose readers only understand version 1 files adds `--parquet-version v1`. Written files therefore have
+> different bytes than 0.5.0's, with the same values in the same order.
+
+### Highlights
+
+- **Arrow C Data results from libzpq (experimental).** `zpq_run_arrow()` returns an answer as an
+  [Arrow C stream](https://arrow.apache.org/docs/format/CStreamInterface.html) instead of JSON: the same SQL or
+  structured requests, the same projection, filters, ordering, limits and aggregates, with typed columns. DECIMAL up
+  to 38 digits is `decimal128` and exact; DATE, TIMESTAMP, TIME, booleans, strings and binary map to their Arrow
+  types; nested types and DECIMALs wider than 38 digits are refused with an explicit error. Batches are owned by
+  the caller and may outlive the stream and the context. `max_result_bytes` caps the exported buffers. It is an
+  additive symbol in `LIBZPQ_1`, and neither Arrow C++ nor Arrow Java is linked into libzpq. With PyArrow
+  installed, `python/zpq_arrow.py` reads the stream as a `RecordBatchReader`. The full contract and type table are
+  in `docs/libzpq.md`.
+- **A Spark DataSource V2 (experimental).** `spark.read.format("zpq")`, in `integrations/spark/`, runs Parquet
+  scans, filter and column pushdown, and partial `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` and `GROUP BY` aggregates in
+  libzpq through Java's Foreign Function & Memory API, and takes rows back as Arrow batches (`rowMode=arrow`, the
+  default). Its correctness suite runs 15 queries (13 ClickBench queries, plus exact DATE and DECIMAL ones) through
+  both `spark.read.parquet` and the zpq source and compares every cell. It needs Java 22 or later and Spark 4
+  (tested with Spark 4.2.1 and Arrow Java 19.0.0).
+- **PLACEHOLDER: `--parquet-version v1|v2`** for `zpq query -o`, v2 by default (see What to do).
+
+### Performance
+
+Timed against 0.5.0 on the same Zen 5 desktop as 0.5.0's benchmarks, a fresh process per query, cold and
+hot-fresh:
+
+- **Grouped integer `COUNT(DISTINCT)`** uses exact, bounded bitmaps when the groups and values are known from the
+  input's dictionaries: 6.5–7.3× faster on the study's grouped DISTINCT cells (card10 and card1k q09). Anything the
+  bitmap cannot hold exactly falls back to the 0.5.0 path.
+- **Scalar `COUNT(DISTINCT)` over strings** works on dictionary codes and compares only the distinct strings
+  themselves: ClickBench q5 (`COUNT(DISTINCT SearchPhrase)`) is 17–20% faster. Pages that fall back to plain
+  encoding keep the per-value path.
+- **Top-k by `COUNT` over sorted integer keys** streams each worker's runs instead of building a full group table:
+  2.3–2.5× faster on the study's sorted10m q01.
+- **PLACEHOLDER: ClickBench q9 two-stage** (−17.9% cold / −27.9% hot in its timing so far; not landed).
+- **PLACEHOLDER: q39 row subgroups** (q36–q39; formal timing pending; not landed).
+
+Every answer is unchanged: the same rows in the same order at every `-j` and memory budget.
+
+### Fixed
+
+- When an allocation was refused while zpq built an answer's typed columns (by `--max-memory` or by the system),
+  the clean-up after the refusal could free memory the column did not own. Each column is now valid before it is
+  published, so the query refuses cleanly. The same fix covers the merge-state test fixtures.
+
+### Memory
+
+- **PLACEHOLDER: `--max-memory` accounting** (not landed).
+
+### Tests and release tooling
+
+- An opt-in allocation-failure sweep (`ZPQ_OOM_SWEEP=1`) runs representative library queries with an allocator that
+  fails on a schedule, and checks every refusal's clean-up and every answer against stable results.
+- The release smoke test resolves its checkers from the invocation directory and names a failed spawn; macOS runs
+  get GNU `timeout`; the Intel macOS archive is exercised on a native runner; release builds have a configurable
+  timeout; and the workflow can rehearse a release without publishing it.
+- The multipart-upload tests no longer race the fake server's clock: a stalled-upload test passed 50 of 50 runs
+  under load after the fix.
+- The `units-core` fixture crash on one Linux test machine and the OS-contract checks on Python 3.14, the two
+  failures in 0.5.0's release matrix, are fixed.
+
+### Internal
+
+- **PLACEHOLDER: code cleanup** (`scan.zig`, `engine.zig`, `agg.zig` and `consumer.zig` split into smaller modules;
+  no behaviour change). One line here when it lands.
 
 ## 0.5.0 (2026-10-28)
 

@@ -40,6 +40,7 @@ const ndv = @import("ndv.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const key_pack = @import("expr/key_pack.zig");
 const owner_groups = @import("owner_groups.zig");
+const grouped_bitmap = @import("grouped_distinct_bitmap.zig");
 const msd_groups = @import("msd_groups.zig");
 const column_mod = @import("parquet/column.zig");
 pub const NdvStat = ndv.Stat;
@@ -118,6 +119,7 @@ fn allRescannable(inputs: []const Input) bool {
 /// charge the same way. Each is armed only over rescannable inputs, and a scan it took that the budget refused runs
 /// again without it (`runMultiAggregate`): a budget the established path fits never fails the query.
 pub const FastPath = enum {
+    grouped_distinct_bitmap,
     shared_strings,
     integer_records,
     msd_records,
@@ -283,6 +285,8 @@ pub const MultiAggArgs = struct {
     /// Grouped count(DISTINCT) through sorted pairs (`distinctPairsCall`): where they pay (`pairsPay`), always, or
     /// never. The CLI takes `.on` from `ZPQ_DISTINCT_PAIRS=1` and `.off` from `=0`.
     distinct_pairs: enum { auto, on, off } = .auto,
+    /// Exact bounded-domain grouped DISTINCT; forced layouts keep all identity, domain and ledger checks.
+    grouped_distinct_bitmap: grouped_bitmap.Mode = .auto,
     /// Rows a worker reads on sets before judging them (`pairsPayRuntime`) under `.auto`. A verdict that may still
     /// turn is taken again at twice the rows, `pairs_rechecks` times at most.
     pairs_pilot_rows: u64 = 1 << 18,
@@ -759,6 +763,7 @@ pub const MultiAggResult = struct {
     part_agg: bool = false,
     /// Grouped count(DISTINCT) was answered through pairs (`foldDistinctPairs`).
     distinct_pairs: bool = false,
+    grouped_distinct_bitmap: bool = false,
     /// Why the scan ran as it did (`ScanPlan.reasons`), and what its dictionary bound came from.
     reasons: std.EnumSet(Reason) = .{},
     /// How many of each GROUP BY row's leading columns are shown; the rest are hidden ORDER BY inputs
@@ -1401,6 +1406,7 @@ pub const RecordAdmission = struct {
         integer_distinct,
         byte_distinct,
         pair_distinct,
+        grouped_distinct_bitmap,
         shared_string_table,
     },
     reservation: usize,
@@ -4009,6 +4015,10 @@ fn narrowed(
     // A finished windowed source may already have discarded its pages. No budget retry can read it again.
     if (!allRescannable(attempt.inputs)) return null;
     var next = attempt;
+    if (taken.contains(.grouped_distinct_bitmap)) {
+        next.grouped_distinct_bitmap = .off;
+        return next;
+    }
     if (taken.contains(.shared_strings)) {
         next.shared_strings = false;
         return next;
@@ -6749,6 +6759,280 @@ const IntegerRangeHint = struct {
     }
 };
 
+const BitmapSink = struct {
+    const Source = struct { file: usize, rg: usize };
+    state: *grouped_bitmap.State,
+    worker: usize,
+    domain: *const agg_dense.Domain,
+    keys: []const expr_ast.Expr,
+    sources: []const Source,
+    value_column: usize,
+    item: ?usize = null,
+    refused: *std.atomic.Value(bool),
+
+    fn startErased(ctx: *anyopaque, _: u64, item: usize) void {
+        const s: *BitmapSink = @ptrCast(@alignCast(ctx));
+        s.item = item;
+    }
+
+    fn batchErased(ctx: *anyopaque, source: consumer.SelectedBatch, lookup: []const ?usize) anyerror!void {
+        const s: *BitmapSink = @ptrCast(@alignCast(ctx));
+        s.batch(source, lookup) catch |e| {
+            if (e != error.BitmapDomainDeclined) return e;
+            s.refused.store(true, .monotonic);
+            return error.ExceededMemoryBudget;
+        };
+    }
+
+    fn batch(s: *BitmapSink, source: consumer.SelectedBatch, lookup: []const ?usize) !void {
+        try source.validate();
+        const item = s.item orelse return error.BadColumn;
+        if (item >= s.sources.len or s.value_column >= lookup.len) return error.BadColumn;
+        const at = s.sources[item];
+        var bindings: [1]agg_dense.CountAxis = undefined;
+        if (!try s.domain.bind(s.keys, at.file, at.rg, source.batch, lookup, &bindings))
+            return error.BitmapDomainDeclined;
+        const pos = lookup[s.value_column] orelse return error.BadColumn;
+        if (pos >= source.batch.cols.len) return error.BadColumn;
+        const col = switch (source.batch.cols[pos]) {
+            .i64 => |c| c,
+            else => return error.BitmapDomainDeclined,
+        };
+        if (col.levels_only_rows != 0) return error.BitmapDomainDeclined;
+        if (col.max_rep != 0 or col.rowCount() < source.batch.num_rows) return error.BadColumn;
+        if (col.def_levels) |dl| if (dl.len < source.batch.num_rows) return error.BadColumn;
+        for (0..source.batch.num_rows) |row| {
+            if (source.selected) |selected| if (!selected.isActive(row)) continue;
+            const group = try agg_dense.productId(&bindings, row, true);
+            const is_null = if (col.def_levels) |dl| dl[row] < col.max_def else false;
+            const value: ?i64 = if (is_null) null else if (col.codes) |codes| blk: {
+                const code = codes[row];
+                if (code >= col.dict.len) return error.BadColumn;
+                break :blk col.dict[code];
+            } else col.values[row];
+            const index = try s.state.geometry.index(value);
+            const input_row: u64 = if (source.input_rows) |rows| rows[row] else @intCast(row);
+            const ordinal = std.math.cast(u32, try std.math.add(u64, source.input_base, input_row)) orelse
+                return error.BadColumn;
+            try s.state.add(s.worker, @intCast(group), index, ordinal);
+        }
+    }
+};
+
+fn inlineBitmapAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys_opt: ?[]const expr_ast.Expr,
+    outputs_opt: ?[]const BoundOutputColumn,
+    requested: usize,
+    timings: Timings,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    if (args.grouped_distinct_bitmap == .off or !args.integer_records or !args.encoded or !args.ndv_union or
+        args.distinct_pairs != .auto or !allRescannable(args.inputs) or work.len == 0 or calls.len != 1) return null;
+    const call = calls[0];
+    if (call.func != .count_distinct or call.arg == null or call.arg.? != .col_ref or call.where != null or
+        call.state or call.offset != 0 or call.result != .i64) return null;
+    const x = call.arg.?.col_ref;
+    if (x.physical_type != .INT64 or x.expr_type != .i64 or x.unsigned_64) return null;
+    const keys = keys_opt orelse return null;
+    if (keys.len != 1 or keys[0] != .col_ref or keys[0].col_ref.expr_type != .i64) return null;
+    const key = keys[0].col_ref;
+    if (key.physical_type != .INT32 and key.physical_type != .INT64) return null;
+    const outputs = outputs_opt orelse return null;
+    for (outputs) |out| if (out.derived != null) return null;
+    const input_rows = RecordOrdinals.rows(metas) orelse return null;
+    if (input_rows >= @as(usize, 1) << 31) return null;
+    const hw = @import("hw.zig");
+    const l2 = hw.l2BytesPerWorker();
+    if (args.grouped_distinct_bitmap == .auto) {
+        if (l2 == 0) return null;
+        // Reject expensive discovery from footers alone: probing hundreds of cold headers can delay a decline.
+        var dictionary_bytes: u64 = 0;
+        for (metas) |meta| for (meta.row_groups.items) |rg| {
+            if (rg.num_rows == 0) continue;
+            if (key.col_idx >= rg.columns.items.len) return null;
+            const cm = rg.columns.items[key.col_idx].meta_data orelse return null;
+            if (!ndv.fullCoverage(&cm)) return null;
+            const start = cm.dictionary_page_offset orelse return null;
+            if (start < 0 or cm.data_page_offset <= start) return null;
+            dictionary_bytes +|= @intCast(cm.data_page_offset - start);
+            if (dictionary_bytes > l2) return null;
+        };
+    }
+    var rows: usize = 0;
+    var range: IntegerRangeHint = .{};
+    for (work) |item| {
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        const cm = rg.columns.items[x.col_idx].meta_data orelse return null;
+        if (meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+        rows +|= @intCast(rg.num_rows);
+        range.include(rg, meta, x.col_idx);
+    }
+    if (rows == 0 or !range.known or range.lo > range.hi or
+        (args.grouped_distinct_bitmap == .auto and rows < args.integer_records_min_rows)) return null;
+    const workers = @max(1, @min(requested, work.len));
+    const l3 = hw.l3BytesPerActiveWorker(workers) *| workers;
+    const minimum = grouped_bitmap.Geometry.plan(1, range.lo, range.hi, workers, l2, l3, args.grouped_distinct_bitmap) orelse return null;
+    var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const ledger = args.ledger orelse &private_ledger;
+    var charged: core_memory.Charged = .{ .child = gpa, .budget = ledger };
+    var armed = false;
+    return bitmapAnswer(gpa, arena, charged.allocator(), ledger, args, metas, plan, work, calls, keys, outputs, rows, workers, l2, l3, minimum, timings, &armed, explain_only) catch |e| {
+        if (e == error.OutOfMemory and charged.refused.load(.monotonic)) {
+            if (armed) return error.ExceededMemoryBudget;
+            return null;
+        }
+        return e;
+    };
+}
+
+fn bitmapAnswer(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    charged: std.mem.Allocator,
+    ledger: *core_memory.SharedBudget,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    rows: usize,
+    workers: usize,
+    l2: usize,
+    l3: usize,
+    minimum: grouped_bitmap.Geometry,
+    timings: Timings,
+    armed: *bool,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    var temporary = std.heap.ArenaAllocator.init(charged);
+    defer temporary.deinit();
+    const a = temporary.allocator();
+    const files = try a.alloc(ndv.File, args.inputs.len);
+    for (files, args.inputs) |*f, in| f.* = .{
+        .bytes = in.plan_bytes orelse in.bytes,
+        .local = !std.mem.startsWith(u8, in.name, "s3://"),
+    };
+    const row_bytes = minimum.words * @sizeOf(u64);
+    // Header bounds reject expensive identity probes; they are only a cost gate, never group presence evidence.
+    const stat = try ndv.collect(charged, a, files, metas, keys, workers, ledger.available(), false);
+    if (args.grouped_distinct_bitmap == .auto and (stat.entries == null or stat.covered_rows != stat.rows or
+        stat.dictionary_bytes > l2 or stat.lo *| row_bytes > l3 / 2)) return null;
+    const identity_limit = @min(rows + 1, (if (args.grouped_distinct_bitmap == .auto) l3 / 2 else ledger.available()) / row_bytes);
+    var domain = (try ndv.retainIdentity(charged, a, files, metas, keys, workers, ledger.available(), identity_limit)) orelse return null;
+    defer domain.deinit(charged);
+    const geometry = grouped_bitmap.Geometry.plan(domain.ids(), minimum.lo, @intCast(@as(i128, minimum.lo) + minimum.width - 1), workers, l2, l3, args.grouped_distinct_bitmap) orelse return null;
+    const state_bytes = geometry.bytes() orelse return null;
+    if (state_bytes > ledger.available()) return null;
+    if (explain_only) return .{
+        .layout = .grouped_distinct_bitmap,
+        .reservation = state_bytes +| domain.bytes,
+        .partitions = geometry.parts,
+    };
+    var identity = (try key_pack.Plan.init(charged, keys, &domain)) orelse return null;
+    defer identity.deinit(charged);
+    if (identity.encoding.source != .dictionary) return null;
+    var state = try grouped_bitmap.State.init(charged, geometry);
+    defer state.deinit();
+    const starts = try a.alloc(u32, work.len);
+    if (!RecordOrdinals.fill(metas, work, starts)) return error.BadColumn;
+    const sources = try a.alloc(BitmapSink.Source, work.len);
+    for (sources, work) |*s, item| s.* = .{ .file = item.file, .rg = item.rg };
+    const adapters = try a.alloc(BitmapSink, workers);
+    const sinks = try a.alloc(consumer.RecordSink, workers);
+    var refused: std.atomic.Value(bool) = .init(false);
+    for (adapters, sinks, 0..) |*s, *sink, i| {
+        s.* = .{ .state = &state, .worker = i, .domain = &domain, .keys = keys, .sources = sources, .value_column = calls[0].arg.?.col_ref.col_idx, .refused = &refused };
+        sink.* = .{ .selected = .{ .ctx = s, .startFn = BitmapSink.startErased, .batchFn = BitmapSink.batchErased } };
+    }
+    // FailureProbe retains worker diagnostics until prepareAggregate has replayed its canonical error prefix.
+    var worker_credit = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+    _ = ledger.drawExact(worker_credit) orelse return null;
+    defer ledger.release(worker_credit);
+    armed.* = true;
+    if (args.taken) |taken| taken.insert(.grouped_distinct_bitmap);
+    var scan_args = args;
+    scan_args.ledger = ledger;
+    if (scan_args.decode_batch_rows == 0) scan_args.decode_batch_rows = owner_groups.batchRows(null);
+    const run = runRecordWorkers(gpa, arena, scan_args, metas, plan, work, calls, keys, sinks, starts, outputs, timings) catch |e| {
+        if (refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+        return e;
+    };
+    const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
+    state.finish(WORKER_STACK_SIZE);
+    span.end(.merge, profile.args(.{geometry.parts}));
+    var n: usize = 0;
+    for (state.first[0..geometry.groups]) |first| if (first != grouped_bitmap.none) {
+        n += 1;
+    };
+    const slots = try a.alloc(MergedSlot, n);
+    var at: usize = 0;
+    for (state.first[0..geometry.groups], 0..) |first, id| if (first != grouped_bitmap.none) {
+        slots[at] = .{ .key = &.{}, .first = first, .idx = id };
+        at += 1;
+    };
+    if (!args.unordered) try sortSlotsByFirst(a, slots, workers);
+    const View = struct {
+        fn key(_: *const anyopaque, i: usize) u128 {
+            return i;
+        }
+        fn integer(ctx: *const anyopaque, i: usize, _: usize) anyerror!?i128 {
+            const s: *const grouped_bitmap.State = @ptrCast(@alignCast(ctx));
+            return s.counts[i];
+        }
+        fn value(ctx: *const anyopaque, _: std.mem.Allocator, i: usize, call: usize) anyerror!AggValue {
+            return .{ .i = (try integer(ctx, i, call)).? };
+        }
+    };
+    const types = try arena.alloc(GroupColType, outputs.len);
+    const key_types = try a.alloc(KeyType, keys.len);
+    for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
+    for (outputs, types) |out, *ty| ty.* = .{
+        .lane = .i64,
+        .nullable = true,
+        .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
+    };
+    const row_source: RowSource = .{ .slots = slots, .outputs = outputs, .calls = calls, .key_types = key_types, .key_exprs = keys, .accs = &.{}, .folded = false, .fixed_keys = false, .identity = &identity, .owner = .{ .ctx = &state, .key = View.key, .integer = View.integer, .value = View.value } };
+    const typed = args.typed_answer and args.result_order.keys.len == 0 and args.result_order.limit == null and
+        args.result_order.offset == 0 and args.result_order.having == null and args.result_order.hidden.len == 0;
+    var output_charge = answerBytesParallel(slots, types, key_types, typed, workers) +| outputNamesBytes(outputs);
+    _ = ledger.drawExact(output_charge) orelse return error.ExceededMemoryBudget;
+    defer ledger.release(output_charge);
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    for (outputs, names) |out, *name| name.* = try gpa.dupe(u8, out.name);
+    if (typed) {
+        output.typed = .{ .rows = 0, .columns = &.{} };
+        try buildGroupColumns(gpa, &output.typed.?, row_source, types, workers);
+    } else {
+        const out_rows = try gpa.alloc([]const AggValue, n);
+        @memset(out_rows, &.{});
+        output.group_rows = out_rows;
+        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+    }
+    for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+    if (args.ledger != null) {
+        output_charge = 0;
+        worker_credit = 0;
+    }
+    var result = pairResult(args, plan, run, output, .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types });
+    result.distinct_pairs = false;
+    result.grouped_distinct_bitmap = true;
+    return result;
+}
+
 /// A DISTINCT program uses one exact pair identity, plus optional count(*) calls sharing its duplicate weights.
 /// Other aggregates retain the ordinary partition merge; no partial result crosses an identity refusal.
 fn inlinePairAnswer(
@@ -6765,6 +7049,7 @@ fn inlinePairAnswer(
     timings: Timings,
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    if (try inlineBitmapAnswer(gpa, arena, args, metas, plan, work, calls, keys_opt, outputs_opt, requested, timings, explain_only)) |answer| return answer;
     if (!args.integer_records or args.distinct_pairs == .off or !allRescannable(args.inputs) or work.len == 0)
         return null;
     var distinct: ?usize = null;
@@ -18609,6 +18894,156 @@ test "regression: a ranking result cut answers every budget the uncut merge answ
     }
 }
 
+test "grouped DISTINCT bitmap forced layouts match exact fallback with NULLs filters ordering and typed output" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fixture = BitmapTestFixture;
+    const fixture = try Fixture.init(a);
+    for ([_]?[]const u8{ null, "x >= -4", "k >= 2" }) |filter| {
+        for ([_]bool{ false, true }) |typed| {
+            const cut: expr_ast.ResultOrder = if (typed) .{} else .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 8 };
+            var args = fixture.args();
+            args.filter = filter;
+            args.typed_answer = typed;
+            args.result_order = cut;
+            args.grouped_distinct_bitmap = .off;
+            var want = try runMultiAggregate(gpa, a, args);
+            defer want.deinit(gpa);
+            try want.output.applyResultOrder(gpa, cut);
+            for ([_]grouped_bitmap.Mode{ .private, .partitioned, .auto }) |mode| {
+                args.grouped_distinct_bitmap = mode;
+                var got = try runMultiAggregate(gpa, a, args);
+                defer got.deinit(gpa);
+                try testing.expect(got.grouped_distinct_bitmap);
+                try got.output.applyResultOrder(gpa, cut);
+                try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+                try testing.expectEqualDeep(want.output.typed, got.output.typed);
+                try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+                const before = try std.json.Stringify.valueAlloc(a, want.output.group_rows, .{});
+                const after = try std.json.Stringify.valueAlloc(a, got.output.group_rows, .{});
+                try testing.expectEqualStrings(before, after);
+            }
+        }
+    }
+    const args = fixture.args();
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    var null_key = false;
+    var null_values = false;
+    for (got.output.group_rows.?) |row| {
+        if (row[0] == .null_val) null_key = true;
+        if (row[0] == .i and row[0].i == 7) {
+            null_values = true;
+            try testing.expectEqual(@as(i128, 0), row[1].i);
+        }
+    }
+    try testing.expect(null_key and null_values);
+}
+
+const BitmapTestFixture = struct {
+    inputs: []const Input,
+    metas: []schema.FileMetaData,
+
+    fn init(a: std.mem.Allocator) !BitmapTestFixture {
+        const n = 8192;
+        const keys = try a.alloc(i64, n);
+        const key_defs = try a.alloc(u32, n);
+        const values = try a.alloc(i64, n);
+        const defs = try a.alloc(u32, n);
+        for (keys, key_defs, values, defs, 0..) |*key, *kd, *value, *d, i| {
+            key.* = @intCast(i % 8);
+            kd.* = @intFromBool(i % 19 != 0);
+            value.* = @as(i64, @intCast(i % 13)) - 6;
+            d.* = @intFromBool(i % 8 != 7 and i % 11 != 0);
+        }
+        const columns = [_]expr_agg.OutputCol{
+            .{ .name = "k", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = keys, .def_levels = key_defs, .max_def = 1 } } },
+            .{ .name = "x", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = values, .def_levels = defs, .max_def = 1 } } },
+        };
+        var bytes: @import("writer/streaming.zig").MemorySink = .{ .arena = a };
+        _ = try consumer.writeAggregateRows(a, bytes.sink(), &columns, n, .SNAPPY, .{}, .{});
+        const metas = try a.alloc(schema.FileMetaData, 1);
+        metas[0] = try metadata.open(a, bytes.buffer.items);
+        const groups = try a.alloc(schema.RowGroup, 4);
+        @memset(groups, metas[0].row_groups.items[0]);
+        metas[0].row_groups.items = groups;
+        metas[0].num_rows *= @intCast(groups.len);
+        const inputs = try a.alloc(Input, 1);
+        inputs[0] = .{ .name = "bitmap-fixture", .bytes = bytes.buffer.items };
+        return .{ .inputs = inputs, .metas = metas };
+    }
+
+    fn args(f: BitmapTestFixture) MultiAggArgs {
+        return .{ .inputs = f.inputs, .metas = f.metas, .aggregate = "count(DISTINCT x) AS d", .group_by = "k", .parallelism = 4, .min_bytes_per_worker = 1, .integer_records_min_rows = 0, .grouped_distinct_bitmap = .private, .max_memory = 128 << 20 };
+    }
+};
+
+test "grouped DISTINCT bitmap domain violation discards partial state and replays exact fallback" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try BitmapTestFixture.init(a);
+    var args = fixture.args();
+    args.grouped_distinct_bitmap = .off;
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    const zero: [8]u8 = @splat(0);
+    for (fixture.metas[0].row_groups.items) |*rg| {
+        const st = &rg.columns.items[1].meta_data.?.statistics.?;
+        st.min_value = &zero;
+        st.max_value = &zero;
+        st.min = &zero;
+        st.max = &zero;
+    }
+    for ([_]grouped_bitmap.Mode{ .private, .partitioned }) |mode| {
+        args.grouped_distinct_bitmap = mode;
+        var taken: std.EnumSet(FastPath) = .{};
+        args.taken = &taken;
+        var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+        args.ledger = &ledger;
+        try testing.expectError(error.ExceededMemoryBudget, prepareAggregate(gpa, a, args, false));
+        try testing.expect(taken.contains(.grouped_distinct_bitmap));
+        try testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+        args.ledger = null;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(!got.grouped_distinct_bitmap);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    }
+}
+
+test "grouped DISTINCT bitmap memory refusal keeps a budget the exact fallback answers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try BitmapTestFixture.init(a);
+    var args = fixture.args();
+    args.max_memory = 16 << 20;
+    args.grouped_distinct_bitmap = .off;
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(i64, &hi, 1 << 24, .little);
+    for (fixture.metas[0].row_groups.items) |*rg| {
+        const st = &rg.columns.items[1].meta_data.?.statistics.?;
+        st.max_value = &hi;
+        st.max = &hi;
+    }
+    args.grouped_distinct_bitmap = .private;
+    var taken: std.EnumSet(FastPath) = .{};
+    args.taken = &taken;
+    var got = try prepareAggregate(gpa, a, args, false);
+    defer got.deinit(gpa);
+    try testing.expect(!taken.contains(.grouped_distinct_bitmap));
+    try testing.expect(!got.grouped_distinct_bitmap);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+}
+
 test "runMultiAggregate: grouped count(DISTINCT) through pairs answers as through sets" {
     const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -19928,8 +20363,8 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
             var candidates: [std.enums.values(FastPath).len]FastPath = undefined;
             var count: usize = 0;
             for (std.enums.values(FastPath)) |path| {
-                // Independent retained-page and shared-string prefixes are checked below this general-chain walk.
-                if (path == .msd_records or path == .shared_strings) continue;
+                // Independent executor prefixes are checked below this general-chain walk.
+                if (path == .msd_records or path == .shared_strings or path == .grouped_distinct_bitmap) continue;
                 if (path == .integer_records and (!st.a.integer_records or !st.a.typed_answer)) continue;
                 candidates[count] = path;
                 count += 1;
@@ -19987,6 +20422,12 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
     try testing.expectEqual(args.parallelism, msd_declined.parallelism);
     try testing.expectEqual(args.integer_records, msd_declined.integer_records);
     try testing.expectEqual(args.byte_records, msd_declined.byte_records);
+    var bitmap_chain: Chain = .{ .parts_tried = false };
+    const bitmap_declined = narrowed(args, args, S.initMany(&.{ .grouped_distinct_bitmap, .decode_memory }), &bitmap_chain, false).?;
+    try testing.expectEqual(grouped_bitmap.Mode.off, bitmap_declined.grouped_distinct_bitmap);
+    try testing.expectEqual(args.parallelism, bitmap_declined.parallelism);
+    try testing.expectEqual(args.integer_records, bitmap_declined.integer_records);
+    try testing.expect(!bitmap_chain.parts_tried);
     // The cost rules' shared partitions, a fast path's mask, the plain tables, the forced partitions, one worker, and
     // one worker on a small decode budget.
     try testing.expectEqual(@as(usize, 7), try Walk.longest(args, start, 0));
@@ -25742,6 +26183,7 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
     for (cases) |c| {
         var args: MultiAggArgs = .{
             .inputs = &.{.{ .name = "M1-distinct", .bytes = bytes.buffer.items }},
+            .grouped_distinct_bitmap = .off,
             .metas = &.{meta},
             .aggregate = c.agg,
             .group_by = c.group,

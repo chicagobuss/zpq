@@ -1,4 +1,5 @@
 const std = @import("std");
+const schema = @import("../../schema.zig");
 const testing = std.testing;
 const expr_ast = @import("../ast.zig");
 const expr_eval = @import("../eval.zig");
@@ -287,4 +288,28 @@ pub fn avgMean(st: AvgState) ?f64 {
 pub fn avgSum(st: AvgState) ?f64 {
     return if (st.count == 0) null else st.sum + @as(f64, @floatFromInt(st.isum));
 }
+
+
+/// Materialize one agg's accumulator into one or two `Batch.Column`s
+/// for the final 1-row output. Allocates from `arena`. Returns a
+/// slice of `OutputCol` (length 1 for every agg but avg_state, length 2
+/// for its split-output shape).
+pub const OutputCol = struct {
+    name: []const u8,
+    col: filter_eval.Batch.Column,
+    /// Parquet physical type — used by the caller to synthesize a
+    /// SchemaElement for the output leaf.
+    parquet_type: schema.Type,
+    type_length: ?i32 = null,
+    /// OPTIONAL in the output schema. Set by the aggregate kind, not by whether this result happens to be NULL, so
+    /// per-file outputs of one query share a schema and re-aggregate together.
+    nullable: bool,
+    distinct: bool = false,
+    /// Annotations carried from a source column whose values pass through unchanged (see `engine.retypeOutputCol`).
+    logical_type: ?schema.LogicalType = null,
+    logical_type_raw: []const u8 = &.{},
+    converted_type: ?schema.ConvertedType = null,
+    /// An exact DECIMAL output: `col` is `.i128` (unscaled) and the leaf is DECIMAL(precision, scale).
+    dec: ?expr_ast.Dec = null,
+};
 

@@ -358,6 +358,11 @@ fn probesMembership(args: MultiAggArgs) bool {
     return args.metas == null and !args.scan_all;
 }
 
+pub const owned_merge = @import("scan/owned_merge.zig");
+const mergeAccOwned = owned_merge.mergeAccOwned;
+const detachOwned = owned_merge.detachOwned;
+const mergeOwnedAccumulator = owned_merge.mergeOwnedAccumulator;
+const freeOwnedAccumulatorStrings = owned_merge.freeOwnedAccumulatorStrings;
 pub const scan_types = @import("scan/types.zig");
 const BorrowedSpan = scan_types.BorrowedSpan;
 pub const GroupColType = scan_types.GroupColType;
@@ -11692,23 +11697,6 @@ const DistinctMergeTask = struct {
     }
 };
 
-/// Merge an accumulator while transferring ownership of any string winner
-/// out of the source. `Accumulator.merge` intentionally consumes its
-/// source's owned string; clear the source so its owner (a GroupTable, a
-/// work item) cannot free it a second time.
-fn mergeAccOwned(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, allocator: std.mem.Allocator) anyerror!void {
-    return mergeOwnedAccumulator(dst, src, allocator);
-}
-
-fn detachOwned(acc: *expr_agg.Accumulator) void {
-    switch (acc.*) {
-        .min_bytes => acc.* = .{ .min_bytes = null },
-        .max_bytes => acc.* = .{ .max_bytes = null },
-        .distinct => acc.* = .{ .distinct = .{} },
-        else => {},
-    }
-}
-
 /// Move each partition's groups into `slots` / `accs`. Keys stay borrowed from the partition tables.
 fn fillFromPartitions(
     gpa: std.mem.Allocator,
@@ -11804,60 +11792,6 @@ fn fillFromPartitions(
         t.accs = accs.items;
     }
     if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, config, Task.run)) tasks[0].run();
-}
-
-fn mergeOwnedAccumulator(
-    dst: *expr_agg.Accumulator,
-    src: *expr_agg.Accumulator,
-    allocator: std.mem.Allocator,
-) !void {
-    if (src.* == .count and dst.* == .count) {
-        dst.count += src.count;
-        return;
-    }
-    if (src.* == .count and dst.* == .distinct) {
-        const n = dst.distinct.count() + src.count;
-        dst.distinct.deinit(allocator);
-        dst.* = .{ .count = n };
-        return;
-    }
-    if (src.* == .distinct and dst.* == .count) {
-        dst.count += src.distinct.count();
-        src.distinct.deinit(allocator);
-        src.* = .{ .distinct = .{} };
-        return;
-    }
-    if (src.* == .distinct and dst.* == .distinct) {
-        // The larger spilled set is handed over whole and the smaller folded into it.
-        return dst.distinct.takeFrom(&src.distinct, allocator);
-    }
-    const moved = src.*;
-    try dst.merge(moved, allocator);
-    switch (src.*) {
-        .min_bytes => src.* = .{ .min_bytes = null },
-        .max_bytes => src.* = .{ .max_bytes = null },
-        .min_arena => src.min_arena.ref = null,
-        .max_arena => src.max_arena.ref = null,
-        else => {},
-    }
-}
-
-fn freeOwnedAccumulatorStrings(
-    allocator: std.mem.Allocator,
-    accumulators: []expr_agg.Accumulator,
-) void {
-    for (accumulators) |*acc| switch (acc.*) {
-        .min_bytes => |s| if (s) |owned| {
-            allocator.free(owned);
-            acc.min_bytes = null;
-        },
-        .max_bytes => |s| if (s) |owned| {
-            allocator.free(owned);
-            acc.max_bytes = null;
-        },
-        .distinct => |*d| d.deinit(allocator),
-        else => {},
-    };
 }
 
 /// How one group-key column is framed in a serialized composite key.
@@ -13064,43 +12998,6 @@ test "mergeCandidates: a merge that fails part-way leaks none of the sets alread
             try mergeCandidates(gpa, gpa, &tables, &.{ "a", "b" }, &calls, 1, &slots, &accs);
             try testing.expectEqual(@as(usize, 2), slots.items.len);
             for (accs.items) |acc| try testing.expectEqual(@as(usize, 100), acc.distinct.count());
-        }
-    }.run, .{});
-}
-
-test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own every value once, and leak nothing" {
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn set(gpa: std.mem.Allocator, vals: []const u64) !*expr_agg.DistinctSet {
-            const ds = try gpa.create(expr_agg.DistinctSet);
-            ds.* = .{};
-            errdefer {
-                ds.deinit(gpa);
-                gpa.destroy(ds);
-            }
-            for (vals) |v| try ds.insertU64(gpa, v);
-            return ds;
-        }
-        fn run(gpa: std.mem.Allocator) !void {
-            for ([_][2][]const u64{
-                .{ &.{ 1, 2 }, &.{ 2, 3, 4, 5 } }, // theirs larger: handed over
-                .{ &.{ 1, 2, 3, 4 }, &.{ 4, 5 } }, // ours larger
-                .{ &.{}, &.{ 1, 2, 3, 4, 5 } },
-            }) |c| {
-                var dst: expr_agg.Accumulator = .{ .distinct = .{} };
-                defer freeOwnedAccumulatorStrings(gpa, (&dst)[0..1]);
-                if (c[0].len > 0) dst = .{ .distinct = .fromSet(try set(gpa, c[0])) };
-                var src: expr_agg.Accumulator = .{ .distinct = .fromSet(try set(gpa, c[1])) };
-                defer freeOwnedAccumulatorStrings(gpa, (&src)[0..1]);
-                try mergeOwnedAccumulator(&dst, &src, gpa);
-                try testing.expect(src.distinct.heap() == null);
-                try testing.expectEqual(@as(usize, 5), dst.distinct.count());
-            }
-            // Nothing seen on the source side: the destination is untouched.
-            var dst: expr_agg.Accumulator = .{ .distinct = .fromSet(try set(gpa, &.{7})) };
-            defer freeOwnedAccumulatorStrings(gpa, (&dst)[0..1]);
-            var none: expr_agg.Accumulator = .{ .distinct = .{} };
-            try mergeOwnedAccumulator(&dst, &none, gpa);
-            try testing.expectEqual(@as(usize, 1), dst.distinct.count());
         }
     }.run, .{});
 }

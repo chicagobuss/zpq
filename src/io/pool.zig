@@ -7,7 +7,7 @@
 //!   * a small LRU cache of idle TLS connections keyed by `(host, port)`.
 //!
 //! The shape matches `std.http.Client.ConnectionPool` for reuse, but keeps
-//! ZPQ's explicit backpressure. If a scan spawns 200 range tasks, only N
+//! zpq's explicit backpressure. If a scan spawns 200 range tasks, only N
 //! can hold sockets at once. If a warm Lambda reads one bucket and writes
 //! another, both hosts can keep idle connections instead of tearing the
 //! whole pool down.

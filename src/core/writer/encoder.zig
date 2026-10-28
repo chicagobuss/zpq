@@ -1300,8 +1300,8 @@ fn planDictionary(
 
 /// Index width for a `dict_count`-entry dictionary, never below one bit. A 0-bit index page is legal RLE, but
 /// strict readers (pyarrow) reject it ("Invalid number of indices: 0"), so a column filtered down to one distinct
-/// value would be unreadable elsewhere while ZPQ's lenient reader hid it. parquet-mr uses the same minimum. Found by
-/// the differential harness (ZPQ writes, pyarrow reads).
+/// value would be unreadable elsewhere while zpq's lenient reader hid it. parquet-mr uses the same minimum. Found by
+/// the differential harness (zpq writes, pyarrow reads).
 fn dictIndexBitWidth(dict_count: usize) u8 {
     return if (dict_count <= 1) 1 else bitWidthFor(@intCast(dict_count - 1));
 }

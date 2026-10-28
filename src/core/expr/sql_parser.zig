@@ -161,7 +161,7 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
     return info;
 }
 
-/// Reject SELECT clauses ZPQ doesn't implement with a clear, named error
+/// Reject SELECT clauses zpq doesn't implement with a clear, named error
 /// instead of silently ignoring them and returning a confidently wrong
 /// answer. These are outside the bounded streaming SQL surface, not
 /// forbidden forever, so the messages say "not yet".
@@ -725,7 +725,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         };
     }
     // `SELECT *` → no projection list → the engine's zero-copy passthrough
-    // (byte-copy fast path), which is exactly ZPQ's surgical sweet spot.
+    // (byte-copy fast path), which is exactly zpq's surgical sweet spot.
     // A bare star can't be an aggregate, so this only reaches the plain path.
     if (std.mem.eql(u8, std.mem.trim(u8, columns_str, " "), "*")) {
         allocator.free(columns_str);

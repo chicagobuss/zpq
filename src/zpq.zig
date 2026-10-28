@@ -1,4 +1,4 @@
-//! ZPQ — pure sans-IO core surface.
+//! zpq — pure sans-IO core surface.
 //!
 //! Anything I/O-related lives behind the io.* namespace and must satisfy
 //! io.strategy.assertIsIOStrategy. Anything in core.* is pure logic and

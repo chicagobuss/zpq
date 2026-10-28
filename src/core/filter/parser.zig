@@ -563,7 +563,7 @@ fn constantLeaf(comptime T: type, leaf: ast.Leaf(T)) ?bool {
 }
 
 /// Negate a filter subtree: flip leaf operators, De Morgan on composites.
-/// NULL handling matches ZPQ's "nulls don't pass" convention either way
+/// NULL handling matches zpq's "nulls don't pass" convention either way
 /// (both `NOT (x > 5)` and `x <= 5` exclude null rows).
 fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {

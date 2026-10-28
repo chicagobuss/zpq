@@ -17,6 +17,8 @@ export ZPQ_LIB="$LIBZPQ_PATH"
 export TMPDIR="$OUT_DIR/tmp"
 mkdir -p "$TMPDIR"
 
+QUOTING_PATH="$("${ZPQ_SPARK_PYTHON:-python3}" "$SCRIPT_DIR/src/test/prepare_quoting.py" "$OUT_DIR/quoting")"
+
 "$SCRIPT_DIR/build.sh"
 
 "$SPARK_DIR/bin/spark-submit" \
@@ -30,4 +32,5 @@ mkdir -p "$TMPDIR"
   --class dev.zpq.spark.ZpqCorrectnessSuite \
   "$JAR_PATH" \
   "$CLICKBENCH_DIR" \
-  "$DECDATE_DIR"
+  "$DECDATE_DIR" \
+  "$QUOTING_PATH"

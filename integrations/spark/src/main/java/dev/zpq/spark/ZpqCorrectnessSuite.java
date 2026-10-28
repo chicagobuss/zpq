@@ -6,6 +6,10 @@ import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.apache.spark.sql.Column;
+import static org.apache.spark.sql.functions.col;
 import java.math.BigDecimal;
 import java.sql.Date;
 import java.sql.Timestamp;
@@ -28,7 +32,7 @@ public final class ZpqCorrectnessSuite {
 
     private record QuerySpec(String id, String description, String sqlTemplate) {}
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         String clickbenchPath = args.length > 0
             ? args[0]
             : "zig-out/spark/data/clickbench";
@@ -185,12 +189,60 @@ public final class ZpqCorrectnessSuite {
             System.out.printf("Summary: %d/%d passed, %d failed%n", passed, queries.size(), failed);
             System.out.println("================================================================================");
 
+            if (args.length > 2) runQuotingRegressions(spark, args[2]);
+
             if (failed > 0) {
                 System.exit(1);
             }
         } finally {
             spark.stop();
         }
+    }
+
+    private static void runQuotingRegressions(SparkSession spark, String path) throws Exception {
+        Dataset<Row> expected = spark.read().parquet(path);
+        String[] names = expected.columns();
+        Column[] projection = new Column[names.length];
+        for (int i = 0; i < names.length; i++) {
+            // Reverse the projection so positional aliases must still return the requested columns.
+            projection[i] = col("`" + names[names.length - 1 - i].replace("`", "``") + "`");
+        }
+        String originalTmp = System.getProperty("java.io.tmpdir");
+        Path staging = Files.createDirectories(Path.of(originalTmp, "staged 'double\"; 雪 \\ files"));
+        System.setProperty("java.io.tmpdir", staging.toString());
+        int passed = 0;
+        try {
+            for (String mode : List.of("ndjson", "parquet", "arrow")) {
+                Dataset<Row> actual = spark.read().format("zpq").option("rowMode", mode).load(path);
+                assertQuotingRows(mode + "/projection", expected.select(projection), actual.select(projection), 8);
+                assertQuotingRows(mode + "/pushed-filter", expected.filter(col("id").geq(4)).select(projection),
+                    actual.filter(col("id").geq(4)).select(projection), 4);
+                Column quotedName = col("`" + names[1].replace("`", "``") + "`");
+                assertQuotingRows(mode + "/residual-filter", expected.filter(quotedName.geq(104)).select(projection),
+                    actual.filter(quotedName.geq(104)).select(projection), 4);
+                assertQuotingRows(mode + "/empty", expected.filter(col("id").lt(0)).select(projection),
+                    actual.filter(col("id").lt(0)).select(projection), 0);
+                passed += 4;
+            }
+            System.out.printf("Quoting regressions: %d/12 passed, 0 failed%n", passed);
+        } finally {
+            System.setProperty("java.io.tmpdir", originalTmp);
+        }
+        try (var files = Files.list(staging)) {
+            if (files.findAny().isPresent()) throw new AssertionError("staged Parquet files were not removed");
+        }
+    }
+
+    private static void assertQuotingRows(String id, Dataset<Row> expected, Dataset<Row> actual, int rowCount) {
+        List<Row> want = new ArrayList<>(expected.collectAsList());
+        List<Row> got = new ArrayList<>(actual.collectAsList());
+        want.sort(ROW_COMPARATOR);
+        got.sort(ROW_COMPARATOR);
+        String mismatch = compareRowLists(want, got);
+        if (want.size() != rowCount || mismatch != null) {
+            throw new AssertionError(id + ": expected " + rowCount + " rows; " + mismatch);
+        }
+        System.out.printf("[PASS] quoting/%-25s | rows=%d%n", id, got.size());
     }
 
     private static void ensureDecimalDateFixture(SparkSession spark, String clickbenchPath, String decDatePath) {

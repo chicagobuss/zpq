@@ -68,6 +68,12 @@ spark-submit \
 ./integrations/spark/check_correctness.sh
 ```
 
+The script also generates a small Parquet fixture with PyArrow and runs 12 quoting regressions through NDJSON,
+Parquet staging and Arrow readers. They cover embedded quotes, backslashes, semicolons, spaces and Unicode in
+column names and paths, reordered projections, pushed/residual filters, nulls and empty results. Set
+`ZPQ_SPARK_PYTHON` to a Python interpreter with PyArrow installed. The two NDJSON SQL requests quote identifiers
+and path literals separately before JSON encoding; zpq treats backslashes as literal bytes.
+
 ## Benchmark Suite
 
 `dev.zpq.spark.ZpqBenchSuite` runs the Phase 4 informal timings (`local[16]`, median of 3) and the NDJSON-vs-`output_url` handoff measurement:

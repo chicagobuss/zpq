@@ -137,27 +137,36 @@ public final class ZpqPartitionReader implements PartitionReader<InternalRow> {
     }
 
     private String buildSqlScanRequest(String taskMaxMem, boolean cache) {
-        StringBuilder sql = new StringBuilder(256);
-        sql.append("SELECT ");
-        StructField[] fields = readSchema.fields();
-        for (int i = 0; i < fields.length; i++) {
-            if (i > 0) sql.append(", ");
-            sql.append("\"").append(fields[i].name()).append("\" AS _c").append(i);
-        }
-        sql.append(" FROM '").append(part.filePath()).append("'");
-        if (zpqFilter != null && !zpqFilter.isEmpty()) {
-            sql.append(" WHERE ").append(zpqFilter);
-        }
+        String sql = rowScanSql(part.filePath(), zpqFilter);
 
         StringBuilder req = new StringBuilder(sql.length() + 128);
         req.append("{\"sql\":");
-        ZpqJson.appendQuoted(sql.toString(), req);
+        ZpqJson.appendQuoted(sql, req);
         req.append(",\"parallelism\":").append(Math.max(1, part.parallelism()));
         req.append(",\"max_memory\":");
         ZpqJson.appendQuoted(taskMaxMem, req);
         req.append(",\"cache\":").append(cache ? "true" : "false");
         req.append("}");
         return req.toString();
+    }
+
+    private String rowScanSql(String path, String filter) {
+        StringBuilder sql = new StringBuilder("SELECT ");
+        StructField[] fields = readSchema.fields();
+        for (int i = 0; i < fields.length; i++) {
+            if (i > 0) sql.append(", ");
+            sql.append(sqlQuoted(fields[i].name(), '"')).append(" AS _c").append(i);
+        }
+        sql.append(" FROM ").append(sqlQuoted(path, '\''));
+        if (filter != null && !filter.isEmpty()) sql.append(" WHERE ").append(filter);
+        return sql.toString();
+    }
+
+    private static String sqlQuoted(String text, char quote) {
+        if (text.indexOf('\0') >= 0) throw new IllegalArgumentException("SQL names and paths cannot contain NUL");
+        // liteparser and zpq's expression lexer escape quotes by doubling; backslashes are literal bytes.
+        String delimiter = Character.toString(quote);
+        return delimiter + text.replace(delimiter, delimiter + delimiter) + delimiter;
     }
 
     private List<InternalRow> runParquetOutputUrlScan(ZpqNative nativeCtx, String taskMaxMem, boolean cache) {
@@ -206,14 +215,9 @@ public final class ZpqPartitionReader implements PartitionReader<InternalRow> {
             }
 
             // Read back the staged uncompressed Parquet via zpq SQL on the small filtered output
-            StringBuilder sql = new StringBuilder(128);
-            sql.append("SELECT ");
-            for (int i = 0; i < fields.length; i++) {
-                if (i > 0) sql.append(", ");
-                sql.append("\"").append(fields[i].name()).append("\" AS _c").append(i);
-            }
-            sql.append(" FROM '").append(tmpFile.toAbsolutePath()).append("'");
-            String readReq = "{\"sql\":" + ZpqJson.quoteString(sql.toString()) + ",\"parallelism\":1,\"max_memory\":\"256MB\",\"cache\":true}";
+            String sql = rowScanSql(tmpFile.toAbsolutePath().toString(), null);
+            String readReq = "{\"sql\":" + ZpqJson.quoteString(sql)
+                + ",\"parallelism\":1,\"max_memory\":\"256MB\",\"cache\":true}";
             String readResp = nativeCtx.runJson(readReq);
             return ZpqJson.parseSqlNdjsonRows(readResp, readSchema);
         } finally {

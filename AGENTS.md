@@ -93,9 +93,10 @@ When picking a perf target, the flamegraph is the verdict.
 
 - The Tier 1 "grumpy elitism" mindset is real: skepticism over optimism, honesty over salesmanship, narrow primitive
   over bloated framework. When critiquing our own work, go ruthless — it's how we find what's actually broken.
-- zpq is a **sharp narrow primitive** ("taco bell programming"). Filter + project + S3-to-S3 passthrough on parquet. We
-  don't compete with DuckDB on joins/aggs; we don't compete with Polars on dataframe ergonomics. We compete on
-  cold-start, warm-pool throughput, and binary size *for our specific workload*.
+- zpq is a **sharp narrow primitive** ("taco bell programming": the Unix way of small tools that each do one job
+  really well and pipe together on the shell). Its one job is Parquet: query, filter, aggregate and rewrite it,
+  locally or on S3, and hand the result to the next tool as NDJSON, CSV or Parquet. No joins, no dataframe API. We
+  compete on speed, cold start and binary size *for that job*.
 
 ## Code style
 

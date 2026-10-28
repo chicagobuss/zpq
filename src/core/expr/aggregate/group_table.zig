@@ -1,4 +1,5 @@
 const std = @import("std");
+const filter_selection = @import("../../filter/selection.zig");
 const expr_ast = @import("../ast.zig");
 const filter_eval = @import("../../filter/eval.zig");
 const core_memory = @import("../../memory.zig");
@@ -13,6 +14,7 @@ const AvgState = types.AvgState;
 const Error = types.Error;
 const SharedBudget = core_memory.SharedBudget;
 const KeyArena = @import("keys.zig").KeyArena;
+const GroupKeyResolver = @import("keys.zig").GroupKeyResolver;
 const keys_mod = @import("keys.zig");
 const hashFixed = keys_mod.hashFixed;
 const isRowNull = keys_mod.isRowNull;
@@ -1090,6 +1092,122 @@ test "fixed local tables retain charged capacity and discard every old id" {
             try std.testing.expectEqual(capacity, budget.used.load(.monotonic));
             try std.testing.expectEqual(@as(?u32, null), table.findFixed(&last, hashFixed(&last)));
         }
+    }
+}
+
+
+/// The rows of `ids` a sketched table gave a cell instead of a group (`CountSketch.sinkId`) leave `sel`, so no
+/// aggregate folds them; in the count pass each also adds one to its cell.
+pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_selection.SelectionVector) !void {
+    const s = table.sketch orelse return;
+    if (s.census) |c| if (c.admitted == null and !c.off) {
+        // Count pass: every row holds a slot naming its hash, which it records and adds to its cell.
+        defer c.batch.clearRetainingCapacity();
+        // An abandoned count(DISTINCT) census needs nothing more from this pass: stop mid row group.
+        if (c.distinct) if (c.dropped) |d| if (d.load(.monotonic)) return error.CensusAbandoned;
+        for (ids, 0..) |id, r| if (sel.isActive(r)) {
+            // Any worker may abandon it meanwhile; a row group is a million rows, too long to finish first.
+            if (c.distinct and r % 4096 == 0) if (c.dropped.?.load(.monotonic)) return error.CensusAbandoned;
+            const hash = c.batch.items[std.math.maxInt(u32) - id];
+            if (!c.off) {
+                try c.record(hash);
+                if (!c.checked and c.dropped != null and c.recorded >= c.check_after) try c.judge(s.cells);
+            }
+            s.cells[s.cellOf(hash)] +|= 1;
+            sel.set(r, false);
+        };
+        if (c.dropped) |d| if (d.load(.monotonic)) {
+            if (c.distinct) return error.CensusAbandoned;
+            if (!c.off) c.stop();
+        };
+        return;
+    };
+    const hot_lanes = if (s.hot) |hot| hot.counts.len else 0;
+    const floor = CountSketch.sinkId(@intCast(s.cells.len + hot_lanes - 1));
+    for (ids, 0..) |id, r| {
+        if (id < floor or !sel.isActive(r)) continue;
+        if (s.admit == null and (if (s.census) |c| c.off else true)) {
+            const lane = std.math.maxInt(u32) - id;
+            if (lane >= s.cells.len) s.hot.?.add(lane - s.cells.len) else s.cells[lane] +|= 1;
+        }
+        sel.set(r, false);
+    }
+}
+
+
+test "a sketched table counts every row in the count pass and groups only admitted cells in the admit pass" {
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    // Long keys take the unframed path, short ones the framed one; a null key is framed too.
+    const vals = [_][]const u8{
+        "http://example.com/a-long-enough-path", "short",
+        "http://example.com/a-long-enough-path", "http://example.com/another/long/path",
+        "short",                                 "",
+    };
+    const defs = [_]u32{ 1, 1, 1, 1, 1, 0 };
+    const cols = [_]filter_eval.Batch.Column{.{ .string = .{
+        .values = &vals,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const a = std.testing.allocator;
+    for ([_]u8{ 0, 9 }) |fixed| {
+        var cells: [1 << 10]u32 = @splat(0);
+        var sketch: CountSketch = .{ .cells = &cells, .shift = 64 - 10 };
+        var table = GroupTable.init(a, 1 << 20);
+        defer table.deinit();
+        table.sketch = &sketch;
+        var ids: [vals.len]u32 = undefined;
+        var sel = try filter_selection.SelectionVector.init(a, vals.len);
+        defer sel.deinit();
+        if (fixed == 0) {
+            var resolver = GroupKeyResolver.init(&cols);
+            defer resolver.deinit(a);
+            for (&ids, 0..) |*id, r| id.* = try resolver.resolve(a, &table, &cols, r, &calls, r);
+        } else {
+            // A fixed-width table sketches by its own image hash.
+            table.fixed_stride = fixed;
+            for (&ids, 0..) |*id, r| {
+                var image: [9]u8 = @splat(0);
+                image[0] = @intFromBool(r != 5);
+                image[1] = @intCast(vals[r].len);
+                id.* = try table.getOrInsertFixed(&image, &calls, r);
+            }
+        }
+        try sinkSketchRows(&table, &ids, &sel);
+        try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+        try std.testing.expectEqual(@as(usize, 0), sel.count());
+        var total: u64 = 0;
+        for (cells) |c| total += c;
+        try std.testing.expectEqual(@as(u64, vals.len), total);
+        // The same key always lands in the same cell.
+        try std.testing.expectEqual(ids[0], ids[2]);
+        try std.testing.expectEqual(ids[1], ids[4]);
+
+        // Admit only the first key's cell: its rows get one group, every other row is dropped uncounted.
+        var admit: [(1 << 10) / 64]u64 = @splat(0);
+        const cell = std.math.maxInt(u32) - ids[0];
+        admit[cell / 64] |= @as(u64, 1) << @intCast(cell % 64);
+        sketch.admit = &admit;
+        @memset(&cells, 0);
+        var sel2 = try filter_selection.SelectionVector.init(a, vals.len);
+        defer sel2.deinit();
+        if (fixed == 0) {
+            var resolver = GroupKeyResolver.init(&cols);
+            defer resolver.deinit(a);
+            for (&ids, 0..) |*id, r| id.* = try resolver.resolve(a, &table, &cols, r, &calls, r);
+        } else for (&ids, 0..) |*id, r| {
+            var image: [9]u8 = @splat(0);
+            image[0] = @intFromBool(r != 5);
+            image[1] = @intCast(vals[r].len);
+            id.* = try table.getOrInsertFixed(&image, &calls, r);
+        }
+        try sinkSketchRows(&table, &ids, &sel2);
+        try std.testing.expect(table.groupCount() >= 1);
+        try std.testing.expectEqual(@as(u32, 0), ids[0]);
+        try std.testing.expectEqual(@as(u64, 0), table.first.items[0]);
+        for (ids, 0..) |id, r| try std.testing.expectEqual(id < table.groupCount(), sel2.isActive(r));
+        for (cells) |c| try std.testing.expectEqual(@as(u32, 0), c);
     }
 }
 

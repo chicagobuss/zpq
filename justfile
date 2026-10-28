@@ -1,14 +1,10 @@
-# ZPQ task runner. Stay slim: only recipes that work against the current
-# source tree. Don't ship recipes that fail when invoked; they're noise in
-# `just --list`.
+# zpq task runner. Every recipe here must work on the current tree.
 
-# Ensure we use Zig 0.17.0 release. If it's not on the PATH but is installed
-# under ~/.zvm/0.17.0, add that directory to PATH.
+# Zig 0.17.0: prefer ~/.zvm/0.17.0 (where `just bootstrap` installs it) when present.
 export PATH := `[ -d ~/.zvm/0.17.0 ] && echo "$HOME/.zvm/0.17.0:$PATH" || echo "$PATH"`
 
-# Python for tooling (conformance / regression / smoke): zpq's in-project uv
-# .venv if present (it has pyarrow — system python3 is 3.14, no wheel), else
-# system python3. Set up with: uv venv --python 3.12 && uv pip install pyarrow
+# Python for the tooling: the project .venv if present, else python3. The fixtures stage creates .venv from
+# tools/check/requirements.txt on first use.
 python := `[ -x .venv/bin/python ] && echo .venv/bin/python || echo python3`
 
 # List available recipes
@@ -17,33 +13,27 @@ default:
 
 # === Build ===
 
-# Build (ReleaseFast) — produces zpq + zpq-lambda.
+# ReleaseFast zpq and zpq-lambda.
 build:
     zig build -Doptimize=ReleaseFast
 
-# Build with debug symbols.
+# Debug build.
 build-debug:
     zig build
 
-# Build the lean-core CLI — no SQL frontend (`-Dsql=false`), so liteparser
-# and its C dep are excluded. "Build the binary you want." The Lambda binary
-# never includes SQL regardless; this is the minimal *CLI*. CI builds this
-# variant too, so the lean path can't bit-rot.
+# The CLI without the SQL frontend (`-Dsql=false`, no liteparser). CI builds it so the lean path keeps working.
 build-minimal:
     zig build -Dsql=false -Doptimize=ReleaseFast cli
 
-# Verify all release targets compile (CLI + Lambda, x86_64 + arm64).
-cross-check:
-    @echo "[x86_64-linux]"  ; zig build -Dtarget=x86_64-linux  -Doptimize=ReleaseFast
-    @echo "[aarch64-linux]" ; zig build -Dtarget=aarch64-linux -Doptimize=ReleaseFast
-    @echo "[x86_64-macos]"  ; zig build -Dtarget=x86_64-macos  -Doptimize=ReleaseFast
-    @echo "[aarch64-macos]" ; zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
-    @echo "All targets OK."
+# The CLI as it ships (ReleaseFast, stripped) through the release cases; CI runs it on each native runner.
+release-smoke:
+    zig build -Doptimize=ReleaseFast -Dstrip=true --prefix zig-out/release cli
+    zig build check-runner -Doptimize=ReleaseSafe
+    zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq zig-out/release/bin/zpq --no-cache
 
-# The Lambda deploy zips (musl static, ReleaseFast) for both archs, built by
-# tools/serverless/aws.sh. ReleaseFast, not ReleaseSmall: on Lambda the small
-# build started no faster and ran up to 2x slower cold, and the ~10 MB zip is
-# far inside the 50 MB direct-upload limit.
+# Lambda deploy zips (static musl, ReleaseFast) for arm64 and x86_64. ReleaseSmall started no faster on Lambda
+# and ran up to 2x slower cold; the ~10 MB zip is well under the 50 MB upload limit.
+[doc("Lambda deploy zips (static musl, ReleaseFast) for arm64 and x86_64.")]
 lambda-build:
     ./tools/serverless/aws.sh build arm64
     ./tools/serverless/aws.sh build x86_64
@@ -51,8 +41,7 @@ lambda-build:
 
 # === Setup ===
 
-# One-shot dev-env bootstrap on a fresh machine: install the pinned Zig
-# under ~/.zvm if it's missing, then warm the build.
+# Fresh Linux x86_64 machine: install Zig 0.17.0 under ~/.zvm if missing, then build once.
 bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -67,200 +56,84 @@ bootstrap:
     PATH="$HOME/.zvm/$ZV:$PATH" zig build --summary none
     echo "bootstrap done — add ~/.zvm/$ZV to PATH (or alias zig)"
 
-# === Tests (three tiers, fastest first) ===
+# === Tests: the gates are build.zig steps (tools/check/README.md) ===
 #
-#   Tier 1  `just test`      inner loop — pure-Zig, no external deps,
-#                            safety-checked (Debug). Known-output unit tests
-#                            + the fuzz-lite PRNG loop. Seconds. Run as you go.
-#   Tier 2  `just check`     pre-commit / per-PR — Tier 1 + lambda integration
-#                            + cross-impl smoke (ZPQ writes → pyarrow reads).
-#                            Needs pyarrow. ~1 min. Mirrors CI.
-#   Tier 3  `just gauntlet`  occasional / pre-release — fetches the
-#                            apache/parquet-testing corpus into
-#                            data/parquet-testing so the fixture-gated decode
-#                            tests run against real Spark/foreign-writer files
-#                            (cross-impl decode validation), then the full
-#                            suite + conformance + smoke.
-#
-# Cross-impl validation lives in Tiers 2-3 by design (Tier-2 doctrine:
-# "synthetic fixtures lie"). Tier 1 stays dependency-free for speed; it
-# checks our work against hand-known outputs, the gauntlet checks it against
-# the rest of the ecosystem.
+#   edit    `just test-core [filter]` (`zig build check -Dtier=edit`)  core unit tests, ReleaseSafe
+#   commit  `just check`     (`zig build check -Dtier=commit`)  fixtures, core units, the runner's self-test and
+#                            every commit-tier case against the cached DuckDB oracle
+#   full    `just full`      (`zig build check -Dtier=full`)  Debug units, integration, every case uncached, the
+#                            parquet-testing corpus, ClickBench, path parity, OS contracts, libzpq
+#   fleet   `just fleet`     the full tier's shards over the fleet (tools/check/fleet.sh), one verdict
+# Each stage leaves a log and a receipt in zig-out/receipts; a tier passes only on clean receipts for HEAD.
 
-# Tier 1 — inner loop. Pass a filter substring to narrow, e.g. `just test decimal`.
+# Unit tests in Debug; `just test decimal` narrows by substring.
 test *args="":
     zig build test --summary all -- {{args}}
 
-# Tier 2 — run before every commit.
-check: test-modules test test-integration smoke duckdb-smoke differential
+# Edit tier: core unit tests in ReleaseSafe; `just test-core decimal` narrows.
+test-core filter="":
+    zig build check -Dtier=edit {{ if filter != "" { "-Dtest-filter=" + filter } else { "" } }}
 
-# Static guard for Zig's lazy test discovery. Every src file containing a
-# top-level test must be directly rooted by one of the two test artifacts.
-test-modules:
-    python3 tools/check_test_modules.py
+# Commit tier: run before every commit.
+check:
+    zig build check -Dtier=commit
 
-# Tier 3 — the corpus gauntlet. Run on a cadence and before releases.
-# fetch-corpus first so `test` picks up the real decimal/etc. fixtures.
-gauntlet: fetch-corpus test test-integration smoke duckdb-smoke soak (conform "data/parquet-testing") triangulate
-    @echo "gauntlet: all tiers green (corpus-backed cross-impl + soak + conformance + triangulation)."
+# Full tier: run before a release.
+full:
+    zig build check -Dtier=full
 
-# Fetch the same apache/parquet-testing revision used by CI into the gitignored
-# data directory. Pinning keeps the local release gate from changing whenever
-# upstream adds a new format fixture; bump this SHA and CI's together.
-parquet_testing_sha := "1a2a75127be06fc0123f03ebd36c966f7beda27d"
-fetch-corpus:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    corpus=data/parquet-testing
-    if [[ ! -d "$corpus/.git" ]]; then
-      git clone --filter=blob:none --no-checkout https://github.com/apache/parquet-testing "$corpus"
-    fi
-    git -C "$corpus" fetch --quiet --depth 1 origin {{parquet_testing_sha}}
-    git -C "$corpus" checkout --quiet --detach {{parquet_testing_sha}}
+# The architecture check (and with --full, the full tier) across the hosts in your fleet inventory.
+fleet *args:
+    tools/check/fleet.sh {{args}}
 
-# Lambda integration tests — spawns the binary against an in-process fake.
+# apache/parquet-testing at tools/check/corpus.pin, and the generated fixtures (every tier runs this first).
+fixtures:
+    tools/check/fixtures.sh
+
+# Lambda integration tests: the binary against an in-process fake runtime.
 test-integration:
     zig build test-integration --summary all
 
-# CLI smoke + cross-impl validation (ZPQ writes → pyarrow reads). Needs
-# pyarrow on python3's path. Part of Tier 2 (`just check`).
-smoke:
-    zig build -Doptimize=ReleaseFast
-    tools/cli_smoke.sh
+# libzpq, the C ABI: its C test plain and under AddressSanitizer/LeakSanitizer (1,000 open/run/close cycles), the
+# Python binding and service, and the differential corpus through libzpq, the CLI and the Lambda, byte for byte.
+# Needs gcc (the sanitizer runtime) and duckdb+pyarrow in the .venv. Part of the full tier.
+[doc("libzpq, the C ABI: C test plain and under ASan/LSan, the Python binding, and the differential corpus.")]
+libzpq:
+    PYTHON={{python}} OPTIMIZE=ReleaseFast tests/libzpq/run.sh
 
-# Cross-impl decode validation, the other direction: DuckDB writes parquet →
-# ZPQ reads/filters/aggregates, compared against DuckDB's own answer. Catches
-# decode bugs a ZPQ-vs-ZPQ round-trip can't. Needs the duckdb CLI. Tier 2.
-duckdb-smoke:
-    zig build -Doptimize=ReleaseFast
-    tools/duckdb_smoke.sh
+# Every apache/parquet-testing file against its declared outcome (tools/check/cases/corpus.json).
+corpus:
+    zig build check -Dtier=full -Dshard=corpus
 
-# Differential test (adopted from Hardwood): ZPQ vs DuckDB ROW-BY-ROW across a
-# matrix of filter × projection × select × aggregate shapes, on an adversarial
-# multi-row-group fixture. Catches composition bugs aggregate-scalar checks miss
-# (it found the dict-index bit-width-0 write corruption). Needs duckdb+pyarrow in
-# the .venv. Tier 2.
-differential:
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/differential.py
+# Encoded-vs-materialized aggregate A/B fuzz (no gate runs it). Commit any crasher as a fixture with a case.
+idle seed="1234" queries="600":
+    zig build -Doptimize=ReleaseSafe cli
+    {{python}} tools/agg_ab_fuzz.py --zpq zig-out/bin/zpq --seed {{seed}} --queries {{queries}}
 
-# Conformance against apache/parquet-testing (Tier 3). Clones the corpus on
-# first run. Floor of 72 full-passes (was 64; +5: RLE-BOOLEAN, multi-member GZIP, empty datapage,
-# dict-page-offset-zero; +3: the legacy LZ4 files); hard failures always fail.
-conform corpus="/tmp/parquet-testing":
-    @test -d {{corpus}} || git clone --depth 1 https://github.com/apache/parquet-testing {{corpus}}
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/conformance.py --corpus {{corpus}}/data --min-pass 72
-
-# `tools/fetch_hardwood.sh --from-source DIR` builds a JVM launcher from a Hardwood checkout instead.
-# Fetch the pinned Hardwood CLI + test fixtures (triangulation's strict-reader oracle) into tools/hardwood/.
-fetch-hardwood:
-    tools/fetch_hardwood.sh
-
-# Without `just fetch-hardwood` (run once) the harness degrades to ZPQ vs DuckDB.
-# Heavy correctness triangulation (ZPQ vs Hardwood vs DuckDB) (Tier 3).
-triangulate: fetch-corpus
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/triangulate.py
-
-# Edge-case soak checks (Tier 3 only): malformed synthetic streams and
-# external-oracle fixtures that are too narrow for the critical path.
-soak:
-    zig build test-soak --summary all
-    zig build -Doptimize=ReleaseFast
-    {{python}} tools/soak.py
-
-
-# Coverage-guided fuzzing of the parquet decode path (Q0a/Q1). NOTE: blocked
-# on a Zig 0.16.0 bug — its bundled test_runner.zig won't compile in `-ffuzz`
-# mode (passes @errorReturnTrace() to writeStackTrace, wrong StackTrace type).
-# Until a toolchain fix, the fuzz-lite PRNG loop in fuzz_decode.zig runs under
-# `just test` (Tier 1). This is the real-fuzzer entry for when --fuzz works.
+# Coverage-guided fuzzing; the seed corpus also runs in `test`.
 fuzz filter="fuzz:":
-    zig build test --fuzz -- {{filter}}
-
-# === Perf regression ===
-
-# Lock-in regression suite. Runs canonical CLI query shapes, asserts
-# golden outputs + wall/RSS bounds. Pass --lambda to also exercise the
-# deployed function. See benchmarks/regression/README.md.
-bench-regression *args:
-    zig build -Doptimize=ReleaseFast
-    {{python}} benchmarks/regression/runner.py {{args}}
-
-# Re-capture goldens + baseline.json from the current build. Run this
-# after intentional behavior changes; commit the result alongside the
-# code.
-bench-regression-update *args:
-    zig build -Doptimize=ReleaseFast
-    {{python}} benchmarks/regression/runner.py --update-golden --update-baseline {{args}}
-
-# Cross-engine perf comparison over ZPQ's type/operator surface (zpq vs
-# duckdb-cli vs polars-py), best-of-N cold wall-clock. Generates the 5M-row
-# typed fixture if absent. Needs duckdb + the .venv (polars). Results log:
-# docs/measurements/type_perf.md — append a dated block on meaningful runs.
-type-bench runs="5":
-    @test -f data/bench_types.parquet || duckdb -c "COPY (SELECT i::INTEGER AS id, (i*1.5)::DOUBLE AS amt, CAST(i % 100000 AS DECIMAL(18,2)) AS price, ('row'||(i%1000)) AS name, (DATE '2015-01-01' + (i%4000)::INTEGER) AS d, (TIMESTAMP '2015-01-01 00:00:00' + ((i%4000)::INTEGER * INTERVAL 1 HOUR)) AS ts, (i%3=0) AS flag FROM range(5000000) t(i)) TO 'data/bench_types.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-    zig build -Doptimize=ReleaseFast
-    {{python}} benchmarks/type_bench.py -n {{runs}}
-
-# Decode-path microbench. Times consumer.decodeColumnT against every
-# column of data/benchmark_100mb.parquet — strips glob/mmap/aggregate
-# noise so per-(encoding × type × bit_width) decode cost is visible.
-microbench fixture="data/benchmark_100mb.parquet" runs="7" warmup="2":
-    zig build microbench -Doptimize=ReleaseFast
-    @benchmarks/microbench/run.sh {{fixture}} {{runs}} {{warmup}}
+    zig build fuzz -Dtest-filter={{filter}} --fuzz
 
 # === Lambda lifecycle ===
 
-# Deploy a Lambda function (function-name + arch). Loads .env for AWS creds.
+# Deploy `zpq-lambda` as function FN (arch arm64 or x86_64). AWS credentials come from .env.
 lambda-deploy fn arch="arm64":
     @./tools/serverless/aws.sh deploy {{fn}} zig-out/lambda/zpq-lambda-{{arch}}.zip {{arch}}
 
-# Invoke a Lambda function with a JSON payload.
+# Invoke function FN with a JSON payload.
 lambda-invoke fn payload="{}":
     @./tools/serverless/aws.sh invoke {{fn}} '{{payload}}'
 
-# Tail the most recent CloudWatch log stream for a function.
+# Show the latest CloudWatch log stream for function FN.
 lambda-logs fn:
     @./tools/serverless/aws.sh logs {{fn}}
 
-# === Lambda capability probe ===
-
-# Run the Lambda capability probe locally (CLI mode prints JSON to stdout).
-probe-local:
-    zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
-        -femit-bin=zig-out/probe_lambda_caps_native
-    @./zig-out/probe_lambda_caps_native | jq
-
-# Build + invoke the probe in Lambda. Re-run to recheck AWS's seccomp policy.
-probe-lambda arch="arm64":
-    zig build-exe probes/probe_lambda_caps/main.zig -O ReleaseSmall \
-        -target {{arch}}-linux-musl \
-        -femit-bin=zig-out/probe_lambda_caps_{{arch}}
-    @mkdir -p zig-out/lambda_probe
-    @cp zig-out/probe_lambda_caps_{{arch}} zig-out/lambda_probe/bootstrap
-    @cd zig-out/lambda_probe && zip -j -q probe_lambda_caps_{{arch}}.zip bootstrap && rm bootstrap
-    @./tools/serverless/aws.sh deploy zpq-probe-caps-{{arch}} zig-out/lambda_probe/probe_lambda_caps_{{arch}}.zip {{arch}}
-    @./tools/serverless/aws.sh invoke zpq-probe-caps-{{arch}} '{}'
-
 # === Profiling ===
 
-# Record a perf trace of `zpq <args>` and render a flamegraph SVG.
-# Open prof/flame-<ts>.svg in a browser to drill into hotspots.
-#
-# Args are forwarded to zpq verbatim with quoting preserved. Examples:
+# perf-record `zpq <args>` (frame-pointer stacks) and write prof/flame-<ts>.svg. Needs perf and
+# references/FlameGraph. Aim for runs over 500 ms; loop or glob shorter ones. Example:
 #   just flamegraph query data/benchmark_100mb.parquet --aggregate 'sum(int64_sorted) AS s'
-#   just flamegraph query 's3://my-bucket/path/*.parquet' --filter 'cost > 100'
-#
-# Stack quality: build.zig sets `omit_frame_pointer = false` for both
-# zpq modules (regression suite shows zero measurable cost), so
-# `--call-graph=fp` walks frame pointers in O(1) instead of DWARF
-# unwinding. Cleaner stacks, lower record overhead. Sub-100ms runs
-# are still too short to sample usefully; aim for queries that take
-# >500ms (multi-RG aggregates, multi-file globs).
-#
-# Requires: perf + references/FlameGraph (cloned).
+[doc("perf-record `zpq <args>` and write prof/flame-<ts>.svg.")]
 [positional-arguments]
 flamegraph *args:
     #!/usr/bin/env bash
@@ -277,12 +150,9 @@ flamegraph *args:
         > "prof/flame-$ts.svg"
     echo "wrote prof/flame-$ts.svg ($(wc -c < prof/flame-$ts.svg) bytes)"
 
-# Stack-sample a long-running zpq via eBPF (no perf overhead, lower
-# kernel cost). Use this for queries that take >1s — for quick runs
-# `just flamegraph` is simpler. PID is auto-discovered from the
-# zpq process; pass --duration to control sample window.
-#
-# Requires: bpfcc-tools (profile-bpfcc) + sudo.
+# Sample a running zpq with eBPF for DURATION seconds (default 5) and write prof/flame-bpf-<ts>.svg. For runs over
+# a second; start zpq first. Needs bpfcc-tools (profile-bpfcc) and sudo.
+[doc("Sample a running zpq with eBPF for DURATION seconds and write prof/flame-bpf-<ts>.svg.")]
 flamegraph-bpf duration="5":
     @mkdir -p prof
     @ts=$(date +%Y%m%d-%H%M%S); \
@@ -295,11 +165,18 @@ flamegraph-bpf duration="5":
 
 # === Maintenance ===
 
-# Wipe build outputs.
+# Remove build outputs.
 clean:
     rm -rf zig-out .zig-cache
 
-# Fill vendor/boring_tls/prebuilt/ with verified BoringSSL prebuilts so later
-# builds need no network (a normal build fetches them into .zig-cache itself).
+# Fetch the verified BoringSSL prebuilts into vendor/boring_tls/prebuilt/ for offline builds.
 fetch-deps:
     @./tools/r2-fetch-artifacts.sh
+
+# OS contracts (publication, permissions, pipes, S3 uploads, sync and write faults): the full tier's `os` shard.
+# Loop-device and device-mapper contracts skip unless run with --privileged on a host with passwordless sudo.
+[doc("OS contracts: the full tier's `os` shard (--privileged for loop-device and device-mapper ones).")]
+contracts:
+    zig build -Doptimize=ReleaseFast
+    zig build libzpq -Doptimize=ReleaseFast
+    {{python}} tools/check/contracts.py zig-out/bin/zpq --lib zig-out/lib/libzpq.so

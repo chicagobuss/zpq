@@ -23,6 +23,7 @@
 //! follow-up.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const tls = @import("tls.zig");
 const work_cursor = @import("work_cursor.zig");
@@ -32,6 +33,8 @@ const sigv4 = @import("sigv4.zig");
 const pool_mod = @import("pool.zig");
 const multipart_sink = @import("multipart_sink.zig");
 const retry = @import("retry.zig");
+const clock = @import("../clock.zig");
+const profile = @import("../profile.zig");
 
 pub const Pool = pool_mod.Pool;
 pub const PoolCriteria = pool_mod.Criteria;
@@ -50,6 +53,49 @@ pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 /// sub-ranges so we can fan out across the pool. Below it the
 /// per-request TLS handshake amortizes badly across tiny fetches.
 pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
+
+/// Most data ranges in flight on Lambda, where more made its network policer slower: 16 on x86_64, 8 on aarch64.
+/// Every connection's TLS stream costs CPU, and on a 3008 MB (2-vCPU) Graviton sandbox 16 at once took several times
+/// the user CPU of 8 for the same bytes and finished cold scans later; x86_64 finished them sooner at 16. Only that
+/// memory size was measured, so the cap does not follow the vCPU count.
+pub const S3_IN_FLIGHT: usize = if (builtin.cpu.arch == .aarch64) 8 else 16;
+/// Most data ranges in flight anywhere else, and the size of the connection pool. Over a link with a long round trip
+/// (a laptop or a server far from the bucket), each request's first byte is the cost, so throughput follows how many
+/// are in flight: 16 left most of a home link idle.
+pub const S3_IN_FLIGHT_MAX: usize = 64;
+
+/// Data ranges this process keeps in flight: `ZPQ_S3_IN_FLIGHT` when it is a positive integer (at most
+/// `S3_IN_FLIGHT_MAX`), else `S3_IN_FLIGHT` on Lambda and `S3_IN_FLIGHT_MAX` elsewhere.
+pub fn inFlight(env: ?std.process.Environ) usize {
+    const e = env orelse return S3_IN_FLIGHT;
+    if (e.getPosix("ZPQ_S3_IN_FLIGHT")) |v| if (std.fmt.parseInt(usize, v, 10)) |n| {
+        if (n > 0) return @min(n, S3_IN_FLIGHT_MAX);
+    } else |_| {};
+    return if (e.getPosix("AWS_LAMBDA_FUNCTION_NAME") != null) S3_IN_FLIGHT else S3_IN_FLIGHT_MAX;
+}
+/// Data-range requests in flight until this query's first data-range response header, unless `ZPQ_S3_FIRST_WAVE`
+/// says otherwise. Footer, metadata and Bloom requests are not part of that wave and do not raise the cap. After
+/// the header, the cap is `inFlight`. Setting the first cap to that is no slow start.
+pub const S3_FIRST_WAVE: usize = 8;
+
+/// The first-wave cap for this process: `ZPQ_S3_FIRST_WAVE` when it is a positive integer, otherwise
+/// `S3_FIRST_WAVE`. A value above `S3_IN_FLIGHT` is clamped to it, so 16 starts every data request at the full cap.
+/// On aarch64 the first wave is already the full cap.
+pub fn firstWaveCap(env: ?std.process.Environ) usize {
+    const text = if (env) |e| e.getPosix("ZPQ_S3_FIRST_WAVE") else null;
+    return parseFirstWave(text);
+}
+
+fn parseFirstWave(text: ?[]const u8) usize {
+    const raw = text orelse return S3_FIRST_WAVE;
+    const n = std.fmt.parseInt(usize, raw, 10) catch return S3_FIRST_WAVE;
+    if (n == 0) return S3_FIRST_WAVE;
+    return @min(n, S3_IN_FLIGHT);
+}
+/// A data GET longer than this is split.
+pub const S3_RANGE_SPLIT: u64 = 8 << 20;
+/// Assumed bytes per second of one connection, for a coalesce gap once latency has been measured.
+pub const S3_BYTES_PER_S: u64 = 80_000_000;
 /// Target sub-range size when splitting. Kept separate from multipart
 /// write part size; reads and writes have different round-trip and
 /// buffering tradeoffs.
@@ -109,6 +155,12 @@ pub const Credentials = struct {
     /// The host may be a DNS name or an IPv4 address written as a dotted
     /// quad; IPv6 endpoints (`https://[::1]:9000`) are not supported.
     endpoint: ?[]const u8 = null,
+    /// Connection deadlines (`tls.Timeouts`): the defaults, or `ZPQ_S3_*_TIMEOUT_MS` from the environment.
+    timeouts: tls.Timeouts = .{},
+    /// Address AWS path-style on `s3.<region>.amazonaws.com`. Lambda sets this so the connections opened during
+    /// init, before any bucket is known, are the ones the query reuses. The CLI leaves it unset and stays
+    /// virtual-hosted.
+    path_style: bool = false,
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
         // `S3_NO_SIGN_REQUEST` (any value but empty or `0`) asks for anonymous
@@ -122,6 +174,7 @@ pub const Credentials = struct {
                     .secret_key = "",
                     .region = env.getPosix("S3_REGION") orelse env.getPosix("AWS_REGION") orelse return error.NoRegion,
                     .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+                    .timeouts = .fromEnv(env),
                 };
             }
         }
@@ -156,6 +209,7 @@ pub const Credentials = struct {
             .session_token = session_token,
             .region = region,
             .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+            .timeouts = .fromEnv(env),
         };
     }
 
@@ -207,6 +261,7 @@ fn defaultPort(use_tls: bool) u16 {
 /// bucket without dots: AWS's certificate covers `*.s3.<region>.amazonaws.com`, one label, so `my.bucket.s3...` fails
 /// hostname verification and dotted buckets go path-style, as the AWS SDKs send them.
 pub fn virtualHosted(creds: Credentials, bucket: []const u8) bool {
+    if (creds.path_style) return false;
     return creds.endpoint == null and std.mem.indexOfScalar(u8, bucket, '.') == null;
 }
 
@@ -241,11 +296,24 @@ pub fn useTls(creds: Credentials) bool {
     return creds.endpointUseTls();
 }
 
+/// How many connections to open before the first request. `ZPQ_S3_PRECONNECT`, default 4; 0 opens none.
+/// A value that does not parse is the default.
+pub fn preconnectCount(env: std.process.Environ) usize {
+    const v = env.getPosix("ZPQ_S3_PRECONNECT") orelse return 4;
+    return std.fmt.parseInt(usize, v, 10) catch 4;
+}
+
 pub fn poolCriteria(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) !PoolCriteria {
     const host = try hostFor(arena, creds, bucket);
     const connect_host = try connectHostFor(arena, creds, bucket);
     const addrs = try resolveIpv4(arena, connect_host);
-    return .{ .host = host, .addrs = addrs, .port = portFor(creds), .use_tls = useTls(creds) };
+    return .{
+        .host = host,
+        .addrs = addrs,
+        .port = portFor(creds),
+        .use_tls = useTls(creds),
+        .timeouts = creds.timeouts,
+    };
 }
 
 /// A one-off connection to `host`, at the first of `addrs` that accepts.
@@ -255,7 +323,7 @@ pub fn connect(
     addrs: []const tls.Ipv4,
     host: []const u8,
 ) Error!tls.Connection {
-    const peer: tls.Peer = .{ .addrs = addrs, .port = portFor(creds) };
+    const peer: tls.Peer = .{ .addrs = addrs, .port = portFor(creds), .timeouts = creds.timeouts };
     if (useTls(creds)) return try tls.Connection.connect(arena, peer, host);
     return try tls.Connection.connectPlain(arena, peer);
 }
@@ -288,9 +356,30 @@ pub const Url = struct {
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadS3Url;
         if (slash == 0) return error.BadS3Url;
         if (slash + 1 >= rest.len) return error.BadS3Url;
-        return .{ .bucket = rest[0..slash], .key = rest[slash + 1 ..] };
+        const bucket = rest[0..slash];
+        const key = rest[slash + 1 ..];
+        // The bucket goes into the Host header and, path-style, the request line as it is: only the characters a
+        // bucket name may hold (AWS's, plus the uppercase and `_` of legacy and S3-compatible stores) get that far.
+        // The key is percent-encoded on the wire, but a control byte in it is refused all the same.
+        for (bucket) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_')) return error.BadS3Url;
+        }
+        for (key) |ch| if (ch < 0x20 or ch == 0x7f) return error.BadS3Url;
+        return .{ .bucket = bucket, .key = key };
     }
 };
+
+test "an S3 URL with a bucket that could break a header, or a control byte in its key, is refused" {
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt\r\nX-Injected: 1/key"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt evil/key"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt:443/key"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt/a\nb"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt/a\x00b"));
+    try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt/a\x7fb"));
+    const u = try Url.parse("s3://My_legacy.bucket-1/dir/a b+c%.parquet");
+    try std.testing.expectEqualStrings("My_legacy.bucket-1", u.bucket);
+    try std.testing.expectEqualStrings("dir/a b+c%.parquet", u.key);
+}
 
 /// Multi-fetch S3 client over a single keep-alive TLS connection.
 ///
@@ -498,6 +587,8 @@ pub const GetOpts = struct {
     /// in that case. Used by the metadata cache to skip the
     /// data-page-bearing rounds when an object is unchanged.
     if_none_match: ?[]const u8 = null,
+    /// Records the request as an `http_get` span when set.
+    prof: ?*profile.Thread = null,
 };
 
 pub fn getViaPoolWithOpts(
@@ -519,12 +610,68 @@ pub fn getViaPoolWithOpts(
             return buildAndSend(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.opts);
         }
     };
-    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
+    // A suffix range has no start until the object's size is known: its span shows [0, n).
+    const r = opts.range;
+    const is_suffix = r != null and r.?.start == std.math.maxInt(u64);
+    const bytes: u64 = if (r) |rr| (if (is_suffix) rr.end else rr.end - rr.start + 1) else 0;
+    const tag: [2]u64 = if (r) |rr| (if (is_suffix) .{ 0, rr.end } else .{ rr.start, rr.end + 1 }) else .{ 0, 0 };
+    return requestViaPool(io, p, arena, criteria, .{
+        .idempotent = true,
+        .prof = opts.prof,
+        .tag = tag,
+        .bytes = bytes,
+    }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
 pub const RequestOpts = struct {
     /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the request.
     idempotent: bool,
+    /// Records the request, every attempt included, as one span of `kind` when set.
+    prof: ?*profile.Thread = null,
+    kind: profile.Kind = .http_get,
+    /// The span's first two arguments: a GET's byte range, a part upload's number.
+    tag: [2]u64 = .{ 0, 0 },
+    /// Bytes the request is expected to move, for the in-flight gauge; 0 when unknown.
+    bytes: u64 = 0,
+};
+
+/// One request's timing for its profile span: the final attempt's pool wait and connect, time to first byte, and
+/// body transfer.
+const RequestTrace = struct {
+    opts: RequestOpts,
+    start: profile.Span,
+    attempts: u8 = 0,
+    status: u16 = 0,
+    reused: bool = false,
+    body_len: u64 = 0,
+    acquire_ns: i64 = 0,
+    ttfb_ns: i64 = 0,
+    body_ns: i64 = 0,
+
+    fn begin(opts: RequestOpts) RequestTrace {
+        profile.gauge(opts.prof, .requests_in_flight, 1);
+        profile.gauge(opts.prof, .bytes_in_flight, @intCast(opts.bytes));
+        return .{ .opts = opts, .start = profile.Span.begin(opts.prof) };
+    }
+
+    fn end(self: *const RequestTrace) void {
+        const p = self.opts.prof orelse return;
+        p.gauge(.requests_in_flight, -1);
+        p.gauge(.bytes_in_flight, -@as(i64, @intCast(self.opts.bytes)));
+        const clamp = struct {
+            fn f(ns: i64) u64 {
+                return @intCast(std.math.clamp(ns, 0, std.math.maxInt(u32)));
+            }
+        }.f;
+        self.start.end(self.opts.kind, profile.args(.{
+            self.opts.tag[0],
+            self.opts.tag[1],
+            self.body_len,
+            profile.httpFlags(self.status, self.attempts, self.reused),
+            clamp(self.ttfb_ns) | (clamp(self.acquire_ns) << 32),
+            @as(u64, @intCast(@max(0, self.body_ns))),
+        }));
+    }
 };
 
 /// One request over pooled connections under the retry policy: `send(context, arena, conn)` performs one exchange and
@@ -542,17 +689,37 @@ pub fn requestViaPool(
 ) !http.Response {
     var throttled: ?http.Response = null;
     var attempts: retry.Attempts = .{};
+    var trace: RequestTrace = .begin(opts);
+    defer trace.end();
     while (true) {
         var last_err: anyerror = error.RetryableStatus;
         const failure: retry.Failure = blk: {
+            const t_acquire = clock.monoNs();
+            trace.attempts +|= 1;
             const handle = p.acquire(io, criteria, .{ .fresh = attempts.fresh }) catch |err| {
                 last_err = err;
                 break :blk retry.classifyConnect(err);
             };
+            const t_send = clock.monoNs();
+            trace.reused = handle.reused;
             if (send(context, arena, handle.conn)) |resp| {
                 p.release(io, handle);
-                if (!retry.retryableStatus(resp.status)) return resp;
-                throttled = resp;
+                var out = resp;
+                if (out.first_byte_ns != 0) {
+                    const d = out.first_byte_ns - t_send;
+                    if (d > 0) out.ttfb_ns = d;
+                }
+                if (opts.prof != null) {
+                    const t_done = clock.monoNs();
+                    const first = if (out.first_byte_ns != 0) out.first_byte_ns else t_done;
+                    trace.status = out.status;
+                    trace.body_len = out.body.len;
+                    trace.acquire_ns = t_send - t_acquire;
+                    trace.ttfb_ns = first - t_send;
+                    trace.body_ns = t_done - first;
+                }
+                if (!retry.retryableStatus(out.status)) return out;
+                throttled = out;
                 break :blk .transient;
             } else |err| {
                 p.discard(io, handle);
@@ -648,6 +815,64 @@ pub const FetchJob = struct {
     key: []const u8,
     range: Range, // exclusive end (coalescer semantics)
     target: []u8,
+    /// Told, on the fetching thread, each time one of this job's requests has landed its bytes in `target` (a job
+    /// split into several requests reports each), so a reader can start on them before the whole batch is in.
+    landed: ?Landed = null,
+    /// This request overlaps a filter column, so a dispatch sends it before the others.
+    urgent: bool = false,
+};
+
+pub const Landed = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque, bytes: usize) void,
+};
+
+/// The query's first data wave. At most `firstWaveCap` data-range requests are in flight until the first
+/// data-range response header of this query arrives, then at most `DataWave.full` (`inFlight`). The default cap is
+/// `S3_FIRST_WAVE`; `ZPQ_S3_FIRST_WAVE=16` starts at the full cap. Footer, metadata and Bloom requests do not use
+/// a `DataWave`, so they neither take a slot nor open the gate. One query shares one value across its data fetches;
+/// a later batch in that query already sees the raised cap.
+pub const DataWave = struct {
+    cap: std.atomic.Value(usize) = .init(S3_FIRST_WAVE),
+    in_flight: std.atomic.Value(usize) = .init(0),
+    /// The cap once the first header is in (`inFlight`).
+    full: usize = S3_IN_FLIGHT,
+    /// Bumped whenever a slot may have opened (a `release`, the first `noteHeader`). A worker without a slot sleeps
+    /// on it instead of polling: until the first header, the workers past the first wave would otherwise wake every
+    /// 50 µs, and on a 2-vCPU Lambda that CPU was taken from the TLS handshakes whose header they were waiting for.
+    seq: std.atomic.Value(u32) = .init(0),
+
+    /// Wait until fewer than `cap` data-range requests are in flight, then count this one.
+    pub fn acquire(self: *DataWave, io: Io) Io.Cancelable!void {
+        while (true) {
+            // Read `seq` before the slots: a release between the two moves it, and the wait returns at once.
+            const seen = self.seq.load(.acquire);
+            const cap = self.cap.load(.acquire);
+            var cur = self.in_flight.load(.acquire);
+            while (cur < cap) {
+                if (self.in_flight.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire)) |observed| {
+                    cur = observed;
+                    continue;
+                }
+                return;
+            }
+            try io.futexWait(u32, &self.seq.raw, seen);
+        }
+    }
+
+    pub fn release(self: *DataWave, io: Io) void {
+        _ = self.in_flight.fetchSub(1, .release);
+        _ = self.seq.fetchAdd(1, .release);
+        io.futexWake(u32, &self.seq.raw, 1);
+    }
+
+    /// A data-range response header has arrived. Later acquires may use the full cap. Idempotent: only the first wakes
+    /// the waiting workers.
+    pub fn noteHeader(self: *DataWave, io: Io) void {
+        if (self.cap.swap(self.full, .acq_rel) == self.full) return;
+        _ = self.seq.fetchAdd(1, .release);
+        io.futexWake(u32, &self.seq.raw, std.math.maxInt(u32));
+    }
 };
 
 /// Parallel multi-file range fetch using a shared `Pool`. Splits any
@@ -668,6 +893,10 @@ pub fn fetchJobs(
     creds: Credentials,
     jobs: []const FetchJob,
     workers: usize,
+    /// Records each request as a span on the fetching thread when set.
+    profiler: ?*profile.Profiler,
+    /// The query's data wave, or null for a fetch that is not a data range (Bloom, tests, `fetchManyRanges`).
+    wave: ?*DataWave,
 ) !u64 {
     // 1. Pre-process: split big ranges into sub-jobs.
     var split: std.ArrayList(FetchJob) = .empty;
@@ -691,6 +920,8 @@ pub fn fetchJobs(
                         .end = j.range.start + @as(u64, sub_off_end),
                     },
                     .target = j.target[sub_off_start..sub_off_end],
+                    .landed = j.landed,
+                    .urgent = j.urgent,
                 });
             }
         } else {
@@ -734,6 +965,10 @@ pub fn fetchJobs(
             .range = j.range,
             .target = j.target,
             .ok = false,
+            .profiler = profiler,
+            .landed = j.landed,
+            .wave = wave,
+            .io = io,
         };
     }
 
@@ -746,6 +981,8 @@ pub fn fetchJobs(
     // Floor of 1: zero workers with jobs pending would leave every `ctx.ok` false and surface as `RangeFetchFailed`
     // rather than as the bad argument it is.
     const n_workers = @max(1, @min(@min(workers, @TypeOf(p.*).capacity), ctxs.len));
+    // Every worker starts now. A data wave holds each one at `DataWave` until a slot is free, so the first
+    // response header, not a claim count, is what lets the rest go out.
     try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers, io, fetchOneTask);
     try group.await(io);
 
@@ -783,7 +1020,7 @@ pub fn fetchManyRanges(
             .target = into[@intCast(r.start)..@intCast(r.end)],
         });
     }
-    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity);
+    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity, null, null);
 }
 
 const FetchCtx = struct {
@@ -800,10 +1037,18 @@ const FetchCtx = struct {
     /// Pre-sized target buffer; `target.len == range.end - range.start`.
     target: []u8,
     ok: bool,
+    profiler: ?*profile.Profiler = null,
+    landed: ?Landed = null,
+    /// Set for a query's data-range fetches. Null for Bloom and other callers.
+    wave: ?*DataWave = null,
+    /// The fetch's executor, for the wave's wakeups from the header callback.
+    io: Io,
 };
 
 /// Fetch `ctx.range` into `ctx.target`, setting `ctx.ok` on success, retrying as `requestViaPool` does.
 fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
+    if (ctx.wave) |w| try w.acquire(io);
+    defer if (ctx.wave) |w| w.release(io);
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const criteria: PoolCriteria = .{
@@ -811,13 +1056,22 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         .addrs = ctx.addrs,
         .port = ctx.port,
         .use_tls = ctx.use_tls,
+        .timeouts = ctx.creds.timeouts,
     };
-    const resp = requestViaPool(io, ctx.pool, arena_state.allocator(), criteria, .{ .idempotent = true }, ctx, doFetch) catch |err| switch (err) {
+    const opts: RequestOpts = .{
+        .idempotent = true,
+        .prof = profile.threadOf(ctx.profiler, .fetch),
+        .tag = .{ ctx.range.start, ctx.range.end },
+        .bytes = ctx.target.len,
+    };
+    const arena = arena_state.allocator();
+    const resp = requestViaPool(io, ctx.pool, arena, criteria, opts, ctx, doFetch) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return,
     };
     // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
     ctx.ok = (resp.status == 206 or resp.status == 200) and resp.body.len == ctx.target.len;
+    if (ctx.ok) if (ctx.landed) |l| l.f(l.ctx, ctx.target.len);
 }
 
 /// Issue one ranged GET on `conn`, streaming the body into `ctx.target`.
@@ -848,7 +1102,12 @@ fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !htt
         .host = ctx.host,
         .path = path,
         .headers = headers.items,
-    }, ctx.target);
+    }, ctx.target, if (ctx.wave != null) .{ .ctx = ctx, .f = noteDataHeader } else null);
+}
+
+fn noteDataHeader(ctx: *anyopaque) void {
+    const f: *FetchCtx = @ptrCast(@alignCast(ctx));
+    if (f.wave) |w| w.noteHeader(f.io);
 }
 
 /// Parallel multipart upload of `body` to `url`. Thin wrapper around
@@ -1198,6 +1457,11 @@ test "a dotted AWS bucket is addressed path-style, so its host stays inside AWS'
     try testing.expectEqualStrings("logs.s3.us-west-2.amazonaws.com", try hostFor(a, aws, "logs"));
     try testing.expectEqualStrings("/k.parquet", try pathFor(a, aws, "logs", "k.parquet"));
 
+    var path_style = aws;
+    path_style.path_style = true;
+    try testing.expectEqualStrings("s3.us-west-2.amazonaws.com", try hostFor(a, path_style, "logs"));
+    try testing.expectEqualStrings("/logs/k.parquet", try pathFor(a, path_style, "logs", "k.parquet"));
+
     const r2: Credentials = .{
         .access_key = "ak",
         .secret_key = "sk",
@@ -1216,6 +1480,13 @@ fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
         break :blk &final;
     };
     return .{ .block = .{ .slice = slice } };
+}
+
+test "ZPQ_S3_PRECONNECT defaults to 4 and 0 disables it" {
+    try testing.expectEqual(@as(usize, 4), preconnectCount(testEnviron(&.{})));
+    try testing.expectEqual(@as(usize, 0), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=0"})));
+    try testing.expectEqual(@as(usize, 2), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=2"})));
+    try testing.expectEqual(@as(usize, 4), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=no"})));
 }
 
 test "S3_NO_SIGN_REQUEST yields anonymous credentials instead of NoCredentials" {
@@ -1389,7 +1660,7 @@ const ScriptedPool = struct {
     pub fn noteRetry(self: *ScriptedPool, _: Io, failure: retry.Failure) void {
         switch (failure) {
             .stale => self.stale_retries += 1,
-            .transient => self.backoff_retries += 1,
+            .transient, .stalled => self.backoff_retries += 1,
             .fatal => {},
         }
     }
@@ -1457,4 +1728,365 @@ test "requestViaPool retries a dead reused connection at once only for an idempo
     try testing.expectEqual(@as(u16, 200), resp.status);
     try testing.expectEqual(@as(usize, 1), put_pool.stale_retries);
     try testing.expectEqual(@as(usize, 1), put_pool.fresh_requests);
+}
+
+// ------------------------------------------------------------------ stalled connections (tls.Timeouts)
+
+const fake_s3 = @import("fake_s3.zig");
+
+/// Per-connection deadlines short enough for tests; production uses `tls.Timeouts` defaults or the environment.
+const test_timeouts: tls.Timeouts = .{ .connect_ms = 300, .handshake_ms = 300, .first_byte_ms = 200, .idle_ms = 200 };
+
+const stall_payload: [96 * 1024]u8 = blk: {
+    @setEvalBranchQuota(400_000);
+    var b: [96 * 1024]u8 = undefined;
+    for (&b, 0..) |*x, i| x.* = @truncate(i *% 131 +% 17);
+    break :blk b;
+};
+
+/// A ranged GET of `stall_payload` from `fake` through a pool of its own; returns the body (on `arena`).
+fn fakeGet(fake: *fake_s3.FakeS3, arena: std.mem.Allocator, stats: *Pool(4).Stats) ![]const u8 {
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = test_timeouts,
+    };
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    defer stats.* = p.snapshotStats();
+    const url: Url = .{ .bucket = "bkt", .key = "obj" };
+    const resp = try getViaPool(testing.io, &p, arena, creds, url, Range.span(1000, 1000 + 64 * 1024 - 1));
+    if (resp.status != 206) return error.TestUnexpectedResult;
+    return try arena.dupe(u8, resp.body);
+}
+
+test "a ranged GET that stalls before, inside or after its response headers is sent again and gets the exact bytes" {
+    for ([_]fake_s3.FakeS3.StallAt{ .before_headers, .mid_headers, .mid_body }) |at| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        try fake.serveBytes("obj", &stall_payload);
+        fake.stall = "GET /bkt/obj";
+        fake.stall_at = at;
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var stats: Pool(4).Stats = .{};
+        const body = try fakeGet(&fake, arena_state.allocator(), &stats);
+        try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], body);
+        try testing.expectEqual(@as(u32, 1), fake.stalled);
+        // One retry, charged, on a connection opened for it.
+        try testing.expectEqual(@as(u64, 1), stats.timeout_retries);
+        try testing.expectEqual(@as(u64, 0), stats.stale_retries);
+        try testing.expectEqual(@as(u64, 2), stats.opens);
+    }
+}
+
+test "a response that keeps arriving is not cut off by the idle timeout, however slow in all" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", &stall_payload);
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .trickle;
+    fake.trickle_ms = 120; // eight pieces: about 1 s in all, against a 200 ms idle timeout
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var stats: Pool(4).Stats = .{};
+    const t0 = clock.monoNs();
+    const body = try fakeGet(&fake, arena_state.allocator(), &stats);
+    try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], body);
+    try testing.expect(clock.monoNs() - t0 >= 800 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 0), stats.timeout_retries);
+    try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
+}
+
+test "regression: a response that trickles in past its attempt's deadline is cut off and fetched again" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", &stall_payload);
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .trickle;
+    // Eight pieces 120 ms apart, each inside the idle timeout: the attempt went on as long as the server kept it.
+    fake.trickle_ms = 120;
+    var timeouts = test_timeouts;
+    timeouts.request_ms = 300;
+    timeouts.min_rate = 1 << 30;
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = timeouts,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    const url: Url = .{ .bucket = "bkt", .key = "obj" };
+    const range = Range.span(1000, 1000 + 64 * 1024 - 1);
+    const resp = try getViaPool(testing.io, &p, arena_state.allocator(), creds, url, range);
+    try testing.expectEqual(@as(u16, 206), resp.status);
+    try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], resp.body);
+    try testing.expectEqual(@as(u64, 1), p.snapshotStats().timeout_retries);
+}
+
+fn sleepMs(ms: u64) void {
+    clock.sleepNs(ms * std.time.ns_per_ms);
+}
+
+test "ZPQ_S3_FIRST_WAVE selects the cap before the first data header, and 16 is no slow start" {
+    try testing.expectEqual(S3_FIRST_WAVE, parseFirstWave(null));
+    try testing.expectEqual(@as(usize, 8), parseFirstWave("8"));
+    try testing.expectEqual(@as(usize, 4), parseFirstWave("4"));
+    try testing.expectEqual(S3_IN_FLIGHT, parseFirstWave("16"));
+    try testing.expectEqual(S3_IN_FLIGHT, parseFirstWave("32"));
+    try testing.expectEqual(S3_FIRST_WAVE, parseFirstWave("0"));
+    try testing.expectEqual(S3_FIRST_WAVE, parseFirstWave("nope"));
+
+    var open: DataWave = .{ .cap = .init(parseFirstWave("16")) };
+    try testing.expectEqual(S3_IN_FLIGHT, open.cap.load(.acquire));
+    open.noteHeader(testing.io);
+    try testing.expectEqual(S3_IN_FLIGHT, open.cap.load(.acquire));
+
+    var slow: DataWave = .{ .cap = .init(parseFirstWave(null)) };
+    try testing.expectEqual(S3_FIRST_WAVE, slow.cap.load(.acquire));
+    slow.noteHeader(testing.io);
+    try testing.expectEqual(S3_IN_FLIGHT, slow.cap.load(.acquire));
+}
+
+test "a worker without a data-wave slot sleeps until a release or the first header frees one" {
+    const io = testing.io;
+    var wave: DataWave = .{ .cap = .init(1), .full = 3 };
+    try wave.acquire(io); // the first wave's one slot
+    const Waiter = struct {
+        fn run(w: *DataWave, got: *std.atomic.Value(u32)) void {
+            w.acquire(testing.io) catch return;
+            _ = got.fetchAdd(1, .acq_rel);
+        }
+        fn waitFor(got: *std.atomic.Value(u32), n: u32) !void {
+            var spins: usize = 0;
+            while (got.load(.acquire) < n) : (spins += 1) {
+                if (spins > 5_000) return error.TestTimedOut;
+                try testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var got: std.atomic.Value(u32) = .init(0);
+    var threads: [3]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Waiter.run, .{ &wave, &got });
+    defer for (threads) |t| t.join();
+
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectEqual(@as(u32, 0), got.load(.acquire));
+    // Waiting does not move the count a release or a header moves: the waiters are asleep, not polling.
+    try testing.expectEqual(@as(u32, 0), wave.seq.load(.acquire));
+
+    wave.noteHeader(io); // full cap 3, one held: two of the three get in
+    try Waiter.waitFor(&got, 2);
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectEqual(@as(u32, 2), got.load(.acquire));
+    wave.noteHeader(io); // a later header changes nothing and wakes no one
+    try testing.expectEqual(@as(u32, 1), wave.seq.load(.acquire));
+
+    wave.release(io); // the first slot comes back: the last waiter takes it
+    try Waiter.waitFor(&got, 3);
+    try testing.expectEqual(@as(u32, 2), wave.seq.load(.acquire));
+    try testing.expectEqual(@as(usize, 3), wave.in_flight.load(.acquire));
+}
+
+test "the first data header wakes every worker waiting for a data-wave slot" {
+    const io = testing.io;
+    var wave: DataWave = .{ .cap = .init(1), .full = 7 };
+    try wave.acquire(io);
+    const Waiter = struct {
+        fn run(w: *DataWave, got: *std.atomic.Value(u32)) void {
+            w.acquire(testing.io) catch return;
+            _ = got.fetchAdd(1, .acq_rel);
+        }
+    };
+    var got: std.atomic.Value(u32) = .init(0);
+    var threads: [6]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Waiter.run, .{ &wave, &got });
+    defer for (threads) |t| t.join();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectEqual(@as(u32, 0), got.load(.acquire));
+    wave.noteHeader(io);
+    var spins: usize = 0;
+    while (got.load(.acquire) < threads.len) : (spins += 1) {
+        if (spins > 5_000) return error.TestTimedOut;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectEqual(@as(usize, 7), wave.in_flight.load(.acquire));
+}
+
+test "data-wave slots lose no wakeup when releases race acquires" {
+    const io = testing.io;
+    const cap = 2;
+    var wave: DataWave = .{ .cap = .init(cap), .full = cap };
+    const Worker = struct {
+        fn run(w: *DataWave, held: *std.atomic.Value(usize), peak: *std.atomic.Value(usize), done: *std.atomic.Value(u32)) void {
+            for (0..2_000) |_| {
+                w.acquire(testing.io) catch return;
+                const now = held.fetchAdd(1, .acq_rel) + 1;
+                _ = peak.fetchMax(now, .acq_rel);
+                _ = held.fetchSub(1, .acq_rel);
+                w.release(testing.io);
+            }
+            _ = done.fetchAdd(1, .acq_rel);
+        }
+    };
+    var held: std.atomic.Value(usize) = .init(0);
+    var peak: std.atomic.Value(usize) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &wave, &held, &peak, &done });
+    // A lost wakeup leaves a worker asleep with a slot free: the workers would never all finish.
+    var spins: usize = 0;
+    const finished = while (done.load(.acquire) < threads.len) : (spins += 1) {
+        if (spins > 30_000) break false;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    } else true;
+    if (!finished) {
+        // Let any stranded worker out before failing, so the threads can be joined.
+        wave.full = 1 << 20;
+        wave.noteHeader(io);
+    }
+    for (threads) |t| t.join();
+    try testing.expect(finished);
+    try testing.expect(peak.load(.acquire) <= cap);
+    try testing.expectEqual(@as(usize, 0), wave.in_flight.load(.acquire));
+}
+
+test "the first data wave keeps at most 8 data-range requests in flight until the first data-range response header" {
+    // Footer, metadata and Bloom fetches pass a null DataWave. They do not take a slot and do not open this gate.
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    const blob = "0123456789abcdefghij";
+    try fake.serveBytes("obj", blob);
+    fake.hold_gets = true;
+
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = .{ .connect_ms = 2_000, .handshake_ms = 2_000, .first_byte_ms = 5_000, .idle_ms = 5_000 },
+    };
+    var pool: Pool(16) = undefined;
+    try pool.init(testing.allocator);
+    defer pool.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var targets: [20][1]u8 = undefined;
+    var jobs: [20]FetchJob = undefined;
+    for (&jobs, 0..) |*j, i| {
+        const n: u64 = @intCast(i);
+        j.* = .{
+            .bucket = "bkt",
+            .key = "obj",
+            .range = .{ .start = n, .end = n + 1 },
+            .target = &targets[i],
+        };
+    }
+    // A full cap past the first wave, whatever this target's default, so the gate can be seen to open.
+    var wave: DataWave = .{ .full = 16 };
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .limited(16) });
+    defer threaded.deinit();
+
+    const Box = struct {
+        io: Io,
+        pool: *Pool(16),
+        arena: std.mem.Allocator,
+        creds: Credentials,
+        jobs: []FetchJob,
+        wave: *DataWave,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = fetchJobs(self.io, self.pool, testing.allocator, self.arena, self.creds, self.jobs, 16, null, self.wave) catch |e| {
+                self.err = e;
+            };
+        }
+    };
+    var box: Box = .{
+        .io = threaded.io(),
+        .pool = &pool,
+        .arena = arena_state.allocator(),
+        .creds = creds,
+        .jobs = &jobs,
+        .wave = &wave,
+    };
+    const worker = try std.Thread.spawn(.{}, Box.run, .{&box});
+
+    var spins: usize = 0;
+    while (fake.gets_waiting.load(.acquire) < 8) {
+        sleepMs(5);
+        spins += 1;
+        if (spins > 400) return error.TestUnexpectedResult;
+    }
+    sleepMs(50);
+    const before = fake.gets_waiting.load(.acquire);
+    const before_max = fake.max_waiting.load(.acquire);
+    try testing.expectEqual(@as(u32, 8), before);
+    try testing.expectEqual(@as(u32, 8), before_max);
+
+    // Forget the pre-header peak so the post-header peak is only what the open gate allowed.
+    fake.max_waiting.store(0, .release);
+    fake.release_one_get.store(true, .release);
+    spins = 0;
+    while (fake.max_waiting.load(.acquire) <= 8) {
+        sleepMs(5);
+        spins += 1;
+        if (spins > 400) return error.TestUnexpectedResult;
+    }
+    sleepMs(50);
+    const after = fake.gets_waiting.load(.acquire);
+    const after_max = fake.max_waiting.load(.acquire);
+    try testing.expect(after > 8);
+    try testing.expect(after <= 16);
+    try testing.expect(after_max <= 16);
+    try testing.expect(after_max > 8);
+
+    fake.release_gets.store(true, .release);
+    worker.join();
+    if (box.err) |e| return e;
+}
+
+test "a server that always stalls fails the request with the timeout once the retry budget is spent" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", &stall_payload);
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .mid_body;
+    fake.stalls_left = 1000;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var stats: Pool(4).Stats = .{};
+    try testing.expectError(error.ReadTimeout, fakeGet(&fake, arena_state.allocator(), &stats));
+    try testing.expectEqual(@as(u32, retry.max_attempts), fake.stalled);
+    try testing.expectEqual(@as(u64, retry.max_attempts - 1), stats.timeout_retries);
+}
+
+test "S3_IN_FLIGHT is 8 on aarch64 and 16 on x86_64" {
+    try testing.expectEqual(@as(usize, if (builtin.cpu.arch == .aarch64) 8 else 16), S3_IN_FLIGHT);
+    try testing.expect(S3_FIRST_WAVE <= S3_IN_FLIGHT);
+}
+
+test "inFlight: S3_IN_FLIGHT on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLIGHT within it" {
+    try testing.expectEqual(S3_IN_FLIGHT, inFlight(testEnviron(&.{"AWS_LAMBDA_FUNCTION_NAME=f"})));
+    try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"AWS_REGION=us-east-1"})));
+    try testing.expectEqual(@as(usize, 32), inFlight(testEnviron(&.{ "AWS_LAMBDA_FUNCTION_NAME=f", "ZPQ_S3_IN_FLIGHT=32" })));
+    try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=1000"})));
+    try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=0"})));
+    try testing.expectEqual(S3_IN_FLIGHT, inFlight(null));
 }

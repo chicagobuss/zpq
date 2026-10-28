@@ -68,11 +68,14 @@
 #include <arm_acle.h>
 #endif
 
+#include <sys/mman.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -750,21 +753,49 @@ uint32_t CalculateTableSize(uint32_t input_size) {
 }
 }  // namespace
 
+// zpq: a thread's working memory, kept for its later calls and freed when the
+// thread exits. Allocated per call it was up to ~200 KiB, an mmap/munmap pair
+// per page under musl. Nothing carries between calls: GetHashTable clears the
+// table, and the scratch buffers are written before they are read. It is
+// mapped directly, not taken from malloc, so it goes back to the OS when freed
+// whatever the host's malloc does with blocks this size.
+namespace {
+struct ThreadWorkingMemory {
+  char* mem = nullptr;
+  size_t size = 0;
+  void Release() {
+    if (mem != nullptr) munmap(mem, size);
+    mem = nullptr;
+    size = 0;
+  }
+  ~ThreadWorkingMemory() { Release(); }
+};
+thread_local ThreadWorkingMemory thread_working_memory;
+}  // namespace
+
 namespace internal {
 WorkingMemory::WorkingMemory(size_t input_size) {
   const size_t max_fragment_size = std::min(input_size, kBlockSize);
   const size_t table_size = CalculateTableSize(max_fragment_size);
   size_ = table_size * sizeof(*table_) + max_fragment_size +
           MaxCompressedLength(max_fragment_size);
-  mem_ = std::allocator<char>().allocate(size_);
+  ThreadWorkingMemory& kept = thread_working_memory;
+  if (kept.size < size_) {
+    kept.Release();
+    void* p = mmap(nullptr, size_, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // As allocate() did, in a build without exceptions.
+    if (p == MAP_FAILED) std::abort();
+    kept.mem = static_cast<char*>(p);
+    kept.size = size_;
+  }
+  mem_ = kept.mem;
   table_ = reinterpret_cast<uint16_t*>(mem_);
   input_ = mem_ + table_size * sizeof(*table_);
   output_ = input_ + max_fragment_size;
 }
 
-WorkingMemory::~WorkingMemory() {
-  std::allocator<char>().deallocate(mem_, size_);
-}
+WorkingMemory::~WorkingMemory() = default;
 
 uint16_t* WorkingMemory::GetHashTable(size_t fragment_size,
                                       int* table_size) const {

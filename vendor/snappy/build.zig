@@ -14,12 +14,18 @@ const std = @import("std");
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Position-independent code, for a shared library that links this archive (zpq's libzpq); the target's default
+    // otherwise, which on musl is not.
+    const pic = b.option(bool, "pic", "Compile position-independent code");
+    // Hidden, so that shared library exports its own API alone.
+    const hidden = b.option(bool, "hidden-symbols", "Compile with hidden symbol visibility") orelse false;
 
     const lib_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .link_libcpp = true,
+        .pic = pic,
     });
     var flags: std.ArrayListUnmanaged([]const u8) = .empty;
     try flags.appendSlice(b.allocator, &.{
@@ -28,6 +34,7 @@ pub fn build(b: *std.Build) !void {
         "-fno-exceptions",
         "-fno-rtti",
     });
+    if (hidden) try flags.append(b.allocator, "-fvisibility=hidden");
     lib_mod.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{
@@ -53,6 +60,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = optimize,
+        .pic = pic,
     });
     mod.addIncludePath(b.path("."));
     mod.linkLibrary(lib);

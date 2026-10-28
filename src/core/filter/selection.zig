@@ -5,8 +5,8 @@
 //!
 //! Init: all-ones (every row active).
 //! AND a predicate: clear bits for rows where the predicate is false.
-//! OR composition: temp-copy, evaluate left, save, restore, evaluate
-//! right, then bitwise-OR the saved-left into the right.
+//! OR composition: snapshot the entry set, evaluate each operand from
+//! it, and bitwise-OR their results together.
 //!
 //! Why bitmask over a row-index list:
 //!   - O(rows/64) AND/OR via word-level bitops; SIMD-friendly later.
@@ -21,22 +21,68 @@ pub const SelectionVector = struct {
     allocator: std.mem.Allocator,
     len: usize,
     mask: []u64,
+    /// False when `mask` belongs to a retained scratch: `deinit` must not free it.
+    owned: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, len: usize) !SelectionVector {
         const num_words = (len + 63) / 64;
         const mask = try allocator.alloc(u64, num_words);
-        // Initialize as all active.
-        @memset(mask, ~@as(u64, 0));
-        // Clear extra bits in the final word so popcount is correct.
-        const extra = num_words * 64 - len;
-        if (extra > 0) {
-            mask[num_words - 1] &= ~@as(u64, 0) >> @intCast(extra);
-        }
+        paintAll(mask, len);
         return .{ .allocator = allocator, .len = len, .mask = mask };
     }
 
+    /// All rows active, in a mask the caller keeps. `mask` is `(len + 63) / 64` words.
+    pub fn borrowed(mask: []u64, len: usize) SelectionVector {
+        std.debug.assert(mask.len == (len + 63) / 64);
+        paintAll(mask, len);
+        return .{ .allocator = undefined, .len = len, .mask = mask, .owned = false };
+    }
+
+    fn paintAll(mask: []u64, len: usize) void {
+        @memset(mask, ~@as(u64, 0));
+        const extra = mask.len * 64 - len;
+        if (extra > 0) mask[mask.len - 1] &= ~@as(u64, 0) >> @intCast(extra);
+    }
+
+    /// Borrow whole mask words. A partial final word is valid only at the original selection's end.
+    /// Explicit checks also run in ReleaseFast: shifting a window silently changes which rows are selected.
+    pub fn alignedWindow(self: SelectionVector, lo: usize, n: usize) error{UnalignedSelectionWindow}!SelectionVector {
+        if (lo % 64 != 0 or lo > self.len or n > self.len - lo or
+            (n % 64 != 0 and n != self.len - lo) or self.mask.len < (self.len + 63) / 64)
+            return error.UnalignedSelectionWindow;
+        return .{
+            .allocator = self.allocator,
+            .len = n,
+            .mask = self.mask[lo / 64 ..][0 .. (n + 63) / 64],
+            .owned = false,
+        };
+    }
+
+    /// Visits active row indices, clipping padding and borrowed storage to the logical row count.
+    pub fn iterator(self: SelectionVector) Iterator {
+        return .{ .words = self.mask[0..@min(self.mask.len, self.len / 64 + @intFromBool(self.len % 64 != 0))], .len = self.len };
+    }
+
+    pub const Iterator = struct {
+        words: []const u64,
+        len: usize,
+        word: usize = 0,
+        base: usize = 0,
+        bits: std.bit_set.IntegerBitSet(64) = .empty,
+
+        pub fn next(self: *Iterator) ?usize {
+            while (true) {
+                if (self.bits.toggleFirstSet()) |bit| return self.base + bit;
+                if (self.word == self.words.len) return null;
+                self.base = self.word * 64;
+                self.bits.mask = self.words[self.word] & bitsAt(0, @min(64, self.len - self.base));
+                self.word += 1;
+            }
+        }
+    };
+
     pub fn deinit(self: *SelectionVector) void {
-        self.allocator.free(self.mask);
+        if (self.owned) self.allocator.free(self.mask);
         self.* = undefined;
     }
 
@@ -65,6 +111,40 @@ pub const SelectionVector = struct {
     pub fn any(self: SelectionVector) bool {
         for (self.mask) |w| if (w != 0) return true;
         return false;
+    }
+
+    /// Deselect rows `lo..hi`, a word at a time.
+    pub fn clearRange(self: *SelectionVector, lo: usize, hi: usize) void {
+        var at = lo;
+        while (at < hi) {
+            const word = at / 64;
+            const n = @min(hi - at, 64 - at % 64);
+            self.mask[word] &= ~bitsAt(at % 64, n);
+            at += n;
+        }
+    }
+
+    /// Whether any row of `lo..hi` is selected, a word at a time.
+    pub fn anyInRange(self: SelectionVector, lo: usize, hi: usize) bool {
+        var at = lo;
+        while (at < hi) {
+            const word = at / 64;
+            const n = @min(hi - at, 64 - at % 64);
+            if (self.mask[word] & bitsAt(at % 64, n) != 0) return true;
+            at += n;
+        }
+        return false;
+    }
+
+    /// `n` (1..64) set bits from bit `shift` up.
+    inline fn bitsAt(shift: usize, n: usize) u64 {
+        const ones: u64 = if (n == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
+        return ones << @intCast(shift);
+    }
+
+    /// Deselect every row.
+    pub fn clearAll(self: *SelectionVector) void {
+        @memset(self.mask, 0);
     }
 
     /// Replace this bitmask with `mask AND other`.
@@ -164,4 +244,66 @@ test "SelectionVector unionWith" {
     try testing.expect(a.isActive(1));
     try testing.expect(a.isActive(2));
     try testing.expect(!a.isActive(3));
+}
+
+test "borrowed selection windows reject shifted or interior partial words" {
+    var s = try SelectionVector.init(std.testing.allocator, 129);
+    defer s.deinit();
+    s.set(64, false);
+    try std.testing.expect(!(try s.alignedWindow(64, 64)).isActive(0));
+    try std.testing.expectEqual(@as(usize, 1), (try s.alignedWindow(128, 1)).count());
+    try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(1, 64));
+    try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(64, 1));
+    try std.testing.expectError(error.UnalignedSelectionWindow, s.alignedWindow(128, 2));
+}
+
+test "SelectionVector range clears and tests match the per-row reference" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    for (0..200) |_| {
+        const len = r.intRangeAtMost(usize, 1, 300);
+        var fast = try SelectionVector.init(testing.allocator, len);
+        defer fast.deinit();
+        var slow = try SelectionVector.init(testing.allocator, len);
+        defer slow.deinit();
+        for (0..len) |i| if (r.boolean()) {
+            fast.set(i, false);
+            slow.set(i, false);
+        };
+        for (0..8) |_| {
+            const lo = r.uintLessThan(usize, len + 1);
+            const hi = r.intRangeAtMost(usize, lo, len);
+            var want = false;
+            for (lo..hi) |i| want = want or slow.isActive(i);
+            try testing.expectEqual(want, fast.anyInRange(lo, hi));
+            if (r.boolean()) {
+                fast.clearRange(lo, hi);
+                for (lo..hi) |i| slow.set(i, false);
+                try testing.expectEqualSlices(u64, slow.mask, fast.mask);
+            }
+        }
+    }
+}
+
+test "SelectionVector iterator clips dirty padding and extra words" {
+    var mask = [_]u64{ 0, 1 | (@as(u64, 1) << 63), ~@as(u64, 0) };
+    const sel: SelectionVector = .{ .allocator = testing.allocator, .len = 65, .mask = &mask };
+    var it = sel.iterator();
+    try testing.expectEqual(@as(?usize, 64), it.next());
+    try testing.expectEqual(@as(?usize, null), it.next());
+    var empty = sel;
+    empty.len = 0;
+    it = empty.iterator();
+    try testing.expectEqual(@as(?usize, null), it.next());
+}
+
+test "a borrowed selection does not free its words" {
+    const mask = try testing.allocator.alloc(u64, 2);
+    var sel = SelectionVector.borrowed(mask, 100);
+    try testing.expect(sel.isActive(0));
+    try testing.expect(sel.isActive(99));
+    sel.set(3, false);
+    try testing.expect(!sel.isActive(3));
+    sel.deinit();
+    testing.allocator.free(mask);
 }

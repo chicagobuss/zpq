@@ -257,7 +257,7 @@ pub const Writer = struct {
                     break :blk @intCast(value);
                 }
             },
-            .@"enum" => @intCast(@intFromEnum(value)),
+            .@"enum" => @intCast(@backingInt(value)),
             else => @compileError("writeVarInt requires int or enum"),
         };
 
@@ -310,10 +310,10 @@ pub const Writer = struct {
 
         if (delta > 0 and delta <= 15) {
             // Short form: delta in high nibble, type in low nibble
-            try self.writeByte(@as(u8, @intCast(delta)) << 4 | @intFromEnum(field_type));
+            try self.writeByte(@as(u8, @intCast(delta)) << 4 | @backingInt(field_type));
         } else {
             // Long form: 0 in high nibble, type in low nibble, then zigzag field id
-            try self.writeByte(@intFromEnum(field_type));
+            try self.writeByte(@backingInt(field_type));
             try self.writeZigZag(field_id);
         }
         self.last_field_id = field_id;
@@ -354,9 +354,9 @@ pub const Writer = struct {
 
     pub fn writeListBegin(self: *Writer, elem_type: Type, size: usize) !void {
         if (size < 15) {
-            try self.writeByte(@as(u8, @intCast(size)) << 4 | @intFromEnum(elem_type));
+            try self.writeByte(@as(u8, @intCast(size)) << 4 | @backingInt(elem_type));
         } else {
-            try self.writeByte(0xF0 | @intFromEnum(elem_type));
+            try self.writeByte(0xF0 | @backingInt(elem_type));
             try self.writeVarInt(@as(u32, @intCast(size)));
         }
     }

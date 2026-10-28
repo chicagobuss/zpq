@@ -7,22 +7,29 @@
 //!   - BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY: compare lexicographically.
 //!   - FLOAT/DOUBLE bounds containing NaN are unusable. Ordered comparisons with NaN are false, which callers would
 //!     otherwise interpret as permission to prune the page.
+//!   - FLOAT/DOUBLE bounds leave NaN out, and in the total order filters compare in (`ast.floatOp`) a NaN row passes
+//!     `!=`, `>` and `>=` a number. Only a chunk known to hold no NaN prunes on those.
 
 const std = @import("std");
 const ast = @import("ast.zig");
 
 /// True iff a chunk bounded by `[min, max]` could hold a value satisfying `value op needle`. False negatives would
 /// lose rows; false positives only cost a decode, so bounds that do not read as `T` intersect everything.
-pub fn rangeIntersects(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: T) bool {
+/// `nan_free`: the chunk is known to hold no NaN (its nan_count is zero); integers ignore it.
+pub fn rangeIntersects(comptime T: type, op: ast.Operator, min: []const u8, max: []const u8, needle: T, nan_free: bool) bool {
     const min_v = readFixedLE(T, min) orelse return true;
     const max_v = readFixedLE(T, max) orelse return true;
     if (comptime @typeInfo(T) == .float) {
         // Real files sometimes contain NaN statistics despite the spec.
         // Unordered bounds cannot safely prove that a page misses the filter.
         if (std.math.isNan(min_v) or std.math.isNan(max_v)) return true;
-        // Bounds leave NaN out, and NaN != x holds, so `lo == hi == x` does not rule out a match. Only a nan_count
-        // of zero does; callers that have one decide that case themselves.
-        if (op == .NotEq) return true;
+        // A NaN row the bounds leave out may pass where no number in them does.
+        if (!nan_free and ast.floatOp(op, T, std.math.nan(T), needle)) return true;
+        // Every number lies below NaN: it passes `<`, `<=` and `!=` NaN, and no other comparison with it.
+        if (std.math.isNan(needle)) return switch (op) {
+            .Lt, .LtEq, .NotEq => true,
+            .Eq, .Gt, .GtEq => false,
+        };
     }
     return rangeOverlapsValue(T, op, min_v, max_v, needle);
 }
@@ -120,23 +127,23 @@ fn le(comptime T: type, v: T) [@sizeOf(T)]u8 {
 test "rangeIntersects INT64: Eq inside and outside the range" {
     const min = le(i64, 50);
     const max = le(i64, 200);
-    try testing.expect(rangeIntersects(i64, .Eq, &min, &max, 100));
-    try testing.expect(!rangeIntersects(i64, .Eq, &min, &max, 300));
+    try testing.expect(rangeIntersects(i64, .Eq, &min, &max, 100, false));
+    try testing.expect(!rangeIntersects(i64, .Eq, &min, &max, 300, false));
 }
 
 test "rangeIntersects negative INT32 (sign-bit edge)" {
     // Range [-100, 100], filter Eq -50 → should match.
     const min = le(i32, -100);
     const max = le(i32, 100);
-    try testing.expect(rangeIntersects(i32, .Eq, &min, &max, -50));
-    try testing.expect(rangeIntersects(i32, .Lt, &min, &max, -50)); // -100 < -50
-    try testing.expect(rangeIntersects(i32, .Gt, &min, &max, -50)); // 100 > -50
+    try testing.expect(rangeIntersects(i32, .Eq, &min, &max, -50, false));
+    try testing.expect(rangeIntersects(i32, .Lt, &min, &max, -50, false)); // -100 < -50
+    try testing.expect(rangeIntersects(i32, .Gt, &min, &max, -50, false)); // 100 > -50
 }
 
 test "rangeIntersects keeps bounds that do not read as the column type" {
     const short = [_]u8{ 1, 2, 3 };
     const max = le(i64, 0);
-    try testing.expect(rangeIntersects(i64, .Eq, &short, &max, 1_000));
+    try testing.expect(rangeIntersects(i64, .Eq, &short, &max, 1_000, false));
     try testing.expect(!rangeAlwaysMatches(i64, .GtEq, &short, &max, -1_000));
 }
 
@@ -145,34 +152,62 @@ test "rangeIntersects DOUBLE keeps pages with NaN bounds" {
     const real = le(f64, 100.0);
     const ops = [_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq };
     for (ops) |op| {
-        try testing.expect(rangeIntersects(f64, op, &nan, &real, 5.0));
-        try testing.expect(rangeIntersects(f64, op, &real, &nan, 5.0));
-        try testing.expect(rangeIntersects(f64, op, &nan, &nan, 5.0));
+        try testing.expect(rangeIntersects(f64, op, &nan, &real, 5.0, false));
+        try testing.expect(rangeIntersects(f64, op, &real, &nan, 5.0, false));
+        try testing.expect(rangeIntersects(f64, op, &nan, &nan, 5.0, false));
     }
 }
 
 test "rangeIntersects FLOAT keeps pages with NaN bounds" {
     const nan = le(f32, std.math.nan(f32));
     const real = le(f32, 100.0);
-    try testing.expect(rangeIntersects(f32, .Lt, &nan, &real, 5.0));
-    try testing.expect(rangeIntersects(f32, .Gt, &real, &nan, 5.0));
+    try testing.expect(rangeIntersects(f32, .Lt, &nan, &real, 5.0, false));
+    try testing.expect(rangeIntersects(f32, .Gt, &real, &nan, 5.0, false));
 }
 
 test "rangeIntersects float != keeps a constant range equal to the literal: NaN rows sit outside the bounds" {
     const zero = le(f64, 0.0);
-    try testing.expect(rangeIntersects(f64, .NotEq, &zero, &zero, 0.0));
-    try testing.expect(!rangeIntersects(f64, .Lt, &zero, &zero, 0.0));
+    try testing.expect(rangeIntersects(f64, .NotEq, &zero, &zero, 0.0, false));
+    try testing.expect(!rangeIntersects(f64, .Lt, &zero, &zero, 0.0, false));
     // Integers have no NaN: a constant chunk equal to the literal still fails `!=` everywhere.
     const izero = le(i64, 0);
-    try testing.expect(!rangeIntersects(i64, .NotEq, &izero, &izero, 0));
+    try testing.expect(!rangeIntersects(i64, .NotEq, &izero, &izero, 0, false));
+}
+
+test "rangeIntersects float keeps what a NaN row outside the bounds passes, unless the chunk holds no NaN" {
+    inline for (.{ f32, f64 }) |T| {
+        const lo = le(T, 0.0);
+        const hi = le(T, 1.0);
+        const nan = std.math.nan(T);
+        // NaN lies above every number: `> 5` and `>= 5` hold for it, `< -1`, `<= -1` and `= 5` do not.
+        try testing.expect(rangeIntersects(T, .Gt, &lo, &hi, 5.0, false));
+        try testing.expect(rangeIntersects(T, .GtEq, &lo, &hi, 5.0, false));
+        try testing.expect(!rangeIntersects(T, .Gt, &lo, &hi, 5.0, true));
+        try testing.expect(!rangeIntersects(T, .GtEq, &lo, &hi, 5.0, true));
+        try testing.expect(!rangeIntersects(T, .Lt, &lo, &hi, -1.0, false));
+        try testing.expect(!rangeIntersects(T, .LtEq, &lo, &hi, -1.0, false));
+        try testing.expect(!rangeIntersects(T, .Eq, &lo, &hi, 5.0, false));
+        // A NaN literal: NaN rows pass `=`, `>=` and `<=` it, every number `<`, `<=` and `!=` it, nothing `>` it.
+        for ([_]bool{ false, true }) |nan_free| {
+            try testing.expect(rangeIntersects(T, .Lt, &lo, &hi, nan, nan_free));
+            try testing.expect(rangeIntersects(T, .LtEq, &lo, &hi, nan, nan_free));
+            try testing.expect(rangeIntersects(T, .NotEq, &lo, &hi, nan, nan_free));
+            try testing.expect(!rangeIntersects(T, .Gt, &lo, &hi, nan, nan_free));
+            try testing.expectEqual(!nan_free, rangeIntersects(T, .Eq, &lo, &hi, nan, nan_free));
+            try testing.expectEqual(!nan_free, rangeIntersects(T, .GtEq, &lo, &hi, nan, nan_free));
+        }
+        // `!=` on a constant chunk equal to the literal: only its NaN rows could pass.
+        try testing.expect(rangeIntersects(T, .NotEq, &lo, &lo, 0.0, false));
+        try testing.expect(!rangeIntersects(T, .NotEq, &lo, &lo, 0.0, true));
+    }
 }
 
 test "rangeIntersects DOUBLE still prunes real disjoint bounds" {
     const min = le(f64, 10.0);
     const max = le(f64, 100.0);
-    try testing.expect(!rangeIntersects(f64, .Lt, &min, &max, 5.0));
-    try testing.expect(!rangeIntersects(f64, .Eq, &min, &max, 5.0));
-    try testing.expect(rangeIntersects(f64, .Gt, &min, &max, 5.0));
+    try testing.expect(!rangeIntersects(f64, .Lt, &min, &max, 5.0, false));
+    try testing.expect(!rangeIntersects(f64, .Eq, &min, &max, 5.0, false));
+    try testing.expect(rangeIntersects(f64, .Gt, &min, &max, 5.0, false));
 }
 
 test "rangeAlwaysMatches: integers prove a full match, floats never do" {

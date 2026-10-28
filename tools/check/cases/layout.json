@@ -1,0 +1,59 @@
+{
+  "fixtures": [{"recipe": "layout", "files": ["layout_t9", "layout_wide16", "layout_wide32", "layout_wide48", "layout_targets"]}],
+  "matrices": [
+    {
+      "vars": {
+        "budget": {
+          "200MB": {},
+          "400MB": {},
+          "1GB": {}
+        },
+        "codec": {
+          "snappy": {},
+          "gzip": {},
+          "zstd": {},
+          "lz4_raw": {},
+          "uncompressed": {}
+        },
+        "check": {
+          "values": {"oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+          "readers": {"oracle": {"compare": "readers_agree"}}
+        }
+      },
+      "case": {"id": "layout:t9:${budget}:${codec}:${check}", "fixture": "layout_t9", "axes": [{"jobs": 1}, {"jobs": 16}], "cli": ["query", "{path}", "--scan-all", "--filter", "id >= 0", "--max-memory", "${budget}", "--codec", "${codec}", "-o", "{out}"], "oracle": "${oracle}"}
+    },
+    {
+      "vars": {
+        "wide": {
+          "16": {"budget": "64MB"},
+          "32": {"budget": "128MB"},
+          "48": {"budget": "256MB"}
+        },
+        "check": {
+          "values": {"oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+          "readers": {"oracle": {"compare": "readers_agree"}}
+        }
+      },
+      "case": {"id": "layout:wide${wide}:${budget}:${check}", "fixture": "layout_wide${wide}", "axes": [{"jobs": 1}, {"jobs": 16}], "cli": ["query", "{path}", "--scan-all", "--filter", "c0 IS NOT NULL", "--codec", "zstd", "--max-memory", "${budget}", "-o", "{out}"], "oracle": "${oracle}"}
+    },
+    {
+      "vars": {
+        "target": {
+          "rows": {"flags": ["--row-group-size", "100000"], "rgs": {"compare": "footer", "holds": {"row_groups": {"$list": [{"rows": 100000}, {"rows": 100000}, {"rows": 30001}]}}}},
+          "bytes": {"flags": ["--row-group-bytes", "1MB"], "rgs": {"compare": "footer", "holds": {"row_groups": {"$list": [{"rows": 32442}, {"rows": 32412}, {"rows": 32442}, {"rows": 32412}, {"rows": 32442}, {"rows": 32412}, {"rows": 32442}, {"rows": 2997}]}}}},
+          "default": {"flags": [], "rgs": {"compare": "footer", "holds": {"row_groups": {"$list": [{"rows": 131072}, {"rows": 98929}]}}}}
+        },
+        "check": {
+          "values": {"oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+          "readers": {"oracle": {"compare": "readers_agree"}},
+          "row-groups": {"oracle": "${rgs}"},
+          "pages": {"oracle": {"compare": "page_index"}}
+        }
+      },
+      "case": {"id": "layout:targets:${target}:${check}", "fixture": "layout_targets", "jobs": 4, "cli": ["query", "{path}", "--filter", "k >= 0", "--scan-all", "-o", "{out}", "${flags}"], "oracle": "${oracle}"}
+    }
+  ],
+  "cases": [
+    {"id": "layout:t9:row-groups", "fixture": "layout_t9", "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "cli": ["query", "{path}", "--scan-all", "--filter", "id >= 0", "-o", "{out}"], "oracle": {"compare": "footer", "holds": {"row_groups": {"$list": [{"rows": 131072}, {"rows": 64777}, {"rows": 4151}]}}}}
+  ]
+}

@@ -1,0 +1,14 @@
+/* libzpq exports its C ABI (include/zpq.h) and nothing else: BoringSSL, zstd and the rest stay local, so they
+   cannot collide with the host's own copies (a Python process has OpenSSL loaded). */
+LIBZPQ_1 {
+  global:
+    zpq_open;
+    zpq_run;
+    zpq_free;
+    zpq_shutdown;
+    zpq_close;
+    zpq_abi_version;
+    zpq_strerror;
+  local:
+    *;
+};

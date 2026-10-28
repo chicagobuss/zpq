@@ -2,6 +2,15 @@ const std = @import("std");
 const c = @import("liteparser_c");
 const ast = @import("ast.zig");
 
+// CLI machine diagnostics use the same parser messages without mixing prose into JSON stderr.
+pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
+fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
+    if (diagnostic_fn) |report| {
+        var buffer: [2048]u8 = undefined;
+        report(std.fmt.bufPrint(&buffer, fmt, args) catch return);
+    } else std.debug.print(fmt, args);
+}
+
 pub const ParsedQuery = struct {
     table_name: []const u8,
     is_aggregate: bool,
@@ -11,8 +20,17 @@ pub const ParsedQuery = struct {
     group_by_str: ?[]const u8 = null,
     /// The result columns, expression and alias apart, for GROUP BY output binding.
     select_cols: []const ast.SelectColumn = &.{},
+    /// ORDER BY / LIMIT / OFFSET of an aggregate query, applied to its result rows.
+    result_order: ast.ResultOrder = .{},
+    /// Holds `result_order.having`.
+    having_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
+        freeResultOrder(allocator, self.result_order);
+        if (self.having_arena) |ha| {
+            ha.deinit();
+            allocator.destroy(ha);
+        }
         allocator.free(self.table_name);
         if (self.select_str) |s| allocator.free(s);
         if (self.aggregate_str) |a| allocator.free(a);
@@ -21,6 +39,13 @@ pub const ParsedQuery = struct {
         freeSelectCols(allocator, self.select_cols);
     }
 };
+
+fn freeResultOrder(allocator: std.mem.Allocator, order: ast.ResultOrder) void {
+    allocator.free(order.keys);
+    for (order.rows) |k| allocator.free(k.expr);
+    allocator.free(order.rows);
+    freeSelectCols(allocator, order.hidden);
+}
 
 fn freeSelectCols(allocator: std.mem.Allocator, cols: []const ast.SelectColumn) void {
     for (cols) |col| {
@@ -64,17 +89,23 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
     switch (node.kind) {
         c.LP_EXPR_FUNCTION => {
             var is_agg = false;
+            var is_count = false;
             if (node.u.function.name) |nm| {
                 const name = std.mem.span(nm);
-                if (std.ascii.eqlIgnoreCase(name, "sum") or
-                    std.ascii.eqlIgnoreCase(name, "count") or
+                if (std.ascii.eqlIgnoreCase(name, "count")) {
+                    is_agg = true;
+                    is_count = true;
+                } else if (std.ascii.eqlIgnoreCase(name, "sum") or
                     std.ascii.eqlIgnoreCase(name, "avg") or
+                    std.ascii.eqlIgnoreCase(name, "avg_state") or
                     std.ascii.eqlIgnoreCase(name, "min") or
                     std.ascii.eqlIgnoreCase(name, "max")) is_agg = true;
             }
             if (is_agg) info.has_agg = true;
             if (node.u.function.over != null) info.has_window = true; // `f() OVER (...)`
-            if (node.u.function.distinct != 0) info.has_func_distinct = true; // `count(DISTINCT x)`
+            if (node.u.function.distinct != 0) {
+                if (!is_count) info.has_func_distinct = true; // `sum(DISTINCT x)`
+            }
             var child: ExprInfo = .{};
             var i: usize = 0;
             while (i < @as(usize, @intCast(node.u.function.args.count))) : (i += 1) {
@@ -130,34 +161,23 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
     return info;
 }
 
-/// Reject SELECT clauses ZPQ doesn't implement with a clear, named error
+/// Reject SELECT clauses zpq doesn't implement with a clear, named error
 /// instead of silently ignoring them and returning a confidently wrong
 /// answer. These are outside the bounded streaming SQL surface, not
 /// forbidden forever, so the messages say "not yet".
 fn rejectUnsupportedClauses(sel: anytype) !void {
     if (sel.distinct != 0) {
-        std.debug.print("sql: DISTINCT is not supported yet\n", .{});
+        diagnosticPrint("sql: DISTINCT is not supported yet\n", .{});
         return error.DistinctNotSupported;
     }
-    // GROUP BY is supported
-    if (sel.having != null) {
-        std.debug.print("sql: HAVING is not supported yet\n", .{});
-        return error.HavingNotSupported;
-    }
-    if (sel.order_by.count > 0) {
-        std.debug.print("sql: ORDER BY is not supported yet\n", .{});
-        return error.OrderByNotSupported;
-    }
-    if (sel.limit != null) {
-        std.debug.print("sql: LIMIT / OFFSET is not supported yet\n", .{});
-        return error.LimitNotSupported;
-    }
+    // GROUP BY and HAVING are supported.
+    // ORDER BY / LIMIT / OFFSET are resolved against the result columns in `resultOrder`.
     if (sel.window_defs.count > 0) {
-        std.debug.print("sql: window functions are not supported yet\n", .{});
+        diagnosticPrint("sql: window functions are not supported yet\n", .{});
         return error.WindowNotSupported;
     }
     if (sel.with != null) {
-        std.debug.print("sql: WITH / CTE is not supported yet\n", .{});
+        diagnosticPrint("sql: WITH / CTE is not supported yet\n", .{});
         return error.CteNotSupported;
     }
 }
@@ -182,221 +202,142 @@ fn quoteWholePaths(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
-fn isNot(n: *const c.LpNode) bool {
-    return n.kind == c.LP_EXPR_UNARY_OP and n.u.unary.op == c.LP_UOP_NOT and n.u.unary.operand != null;
+/// The grammar reads an unquoted `true` / `false` as a column name, which the unparser then quotes (`"true"`), and
+/// no column of that name exists: make each such reference the boolean literal SQL means. A quoted `"true"` stays a
+/// column.
+fn boolLiterals(root: *c.LpNode) void {
+    const Visit = struct {
+        fn enter(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            if (node.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
+            const ref = &node.*.u.column_ref;
+            if (ref.quoted != 0 or ref.schema != null or ref.table != null or ref.column == null) return 0;
+            const name = std.mem.span(ref.column);
+            const value: [*c]const u8 = if (std.ascii.eqlIgnoreCase(name, "true"))
+                "TRUE"
+            else if (std.ascii.eqlIgnoreCase(name, "false"))
+                "FALSE"
+            else
+                return 0;
+            node.*.kind = c.LP_EXPR_LITERAL_BOOL;
+            node.*.u = .{ .literal = .{ .value = @constCast(value) } };
+            return 0;
+        }
+    };
+    var visitor: c.LpVisitor = .{ .user_data = null, .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(root, &visitor);
 }
 
-fn isBool(n: *const c.LpNode, op: c.LpBinOp) bool {
-    return n.kind == c.LP_EXPR_BINARY_OP and n.u.binary.op == op and n.u.binary.left != null and
-        n.u.binary.right != null;
+/// Refuse a predicate in WHERE, a FILTER or a CASE condition whose value side reads a column (`s = t`,
+/// `s IN ('a', t)`, `x BETWEEN 1 AND y`): the filter grammar compares a column with literals only, and before this a
+/// value-side identifier, a column or a misspelt one, could bind as literal text and match incorrect rows.
+fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
+    const Visit = struct {
+        found: ?*c.LpNode = null,
+
+        fn readsColumn(node: ?*c.LpNode) bool {
+            const n = node orelse return false;
+            const Find = struct {
+                hit: bool = false,
+                fn enter(v: [*c]c.LpVisitor, x: [*c]c.LpNode) callconv(.c) c_int {
+                    if (x.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
+                    const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+                    self.hit = true;
+                    return 2;
+                }
+            };
+            var find: Find = .{};
+            var visitor: c.LpVisitor = .{ .user_data = &find, .enter = Find.enter, .leave = null };
+            c.lp_ast_walk(n, &visitor);
+            return find.hit;
+        }
+
+        fn enter(v: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+            const bad = switch (node.*.kind) {
+                c.LP_EXPR_BINARY_OP => switch (node.*.u.binary.op) {
+                    c.LP_OP_EQ,
+                    c.LP_OP_NE,
+                    c.LP_OP_LT,
+                    c.LP_OP_LE,
+                    c.LP_OP_GT,
+                    c.LP_OP_GE,
+                    c.LP_OP_LIKE,
+                    c.LP_OP_GLOB,
+                    c.LP_OP_IS,
+                    c.LP_OP_ISNOT,
+                    => readsColumn(node.*.u.binary.right) or readsColumn(node.*.u.binary.escape),
+                    else => false,
+                },
+                c.LP_EXPR_BETWEEN => readsColumn(node.*.u.between.low) or readsColumn(node.*.u.between.high),
+                c.LP_EXPR_IN => for (0..@intCast(node.*.u.in.values.count)) |i| {
+                    if (readsColumn(node.*.u.in.values.items[i])) break true;
+                } else false,
+                else => false,
+            };
+            if (!bad) return 0;
+            self.found = node;
+            return 2;
+        }
+    };
+    var state: Visit = .{};
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    if (root.u.select.where) |w| c.lp_ast_walk(w, &visitor);
+    var i: usize = 0;
+    while (state.found == null and i < @as(usize, @intCast(root.u.select.result_columns.count))) : (i += 1) {
+        if (root.u.select.result_columns.items[i]) |rc| c.lp_ast_walk(rc, &visitor);
+    }
+    if (state.found == null) return;
+    diagnosticPrint("sql: a comparison takes a literal on its right, not a column or an expression of one\n", .{});
+    return error.BadValue;
 }
 
-/// Rewrite predicates, in place, into the shape the flat filter grammar reads back exactly. liteparser prints a NOT's
-/// operand without parentheses, so `NOT (a AND b)` unparsed as `NOT a AND b`, which the grammar reads as
-/// `(NOT a) AND b`: a different predicate. So every NOT is pushed to the leaves (De Morgan; `NOT NOT p` is `p`;
-/// `NOT x NOT IN/BETWEEN` drops both NOTs), which keeps three-valued logic: a NULL operand leaves the leaf UNKNOWN
-/// either way. Right-nested `a OR (b OR c)` unparses with parentheses the grammar rejects, so same-operator chains are
-/// re-associated to the left (AND and OR are associative in three-valued logic too) once the children are final.
-/// Pushing NOTs at enter, before the walker reads the node's children, means the NOTs it creates are pushed in turn.
-fn normalizePredicates(root: *c.LpNode, lp_arena: *c.arena_t) error{OutOfMemory}!void {
+/// Push every NOT down to the leaves (De Morgan; `NOT NOT p` is `p`), in place. liteparser prints a NOT's operand
+/// without parentheses, so `NOT (a AND b)` unparsed as `NOT a AND b`, which the filter grammar (as SQL) reads as
+/// `(NOT a) AND b`: a different predicate. With NOT only above leaves, every unparsed predicate (WHERE, aggregate
+/// FILTER) means what it was written as. Rewriting at enter, before the walker reads the node's children, means the
+/// NOTs it creates are visited and pushed further in turn.
+fn pushNotsDown(root: *c.LpNode, lp_arena: *c.arena_t) error{OutOfMemory}!void {
     const Visit = struct {
         failed: bool = false,
-        arena: *c.arena_t,
+        arena: *anyopaque,
 
+        fn isNot(n: *const c.LpNode) bool {
+            return n.kind == c.LP_EXPR_UNARY_OP and n.u.unary.op == c.LP_UOP_NOT and n.u.unary.operand != null;
+        }
         fn enter(visitor: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
             const self: *@This() = @ptrCast(@alignCast(visitor.*.user_data));
-            // The grammar reads `NOT x BETWEEN` but not `x NOT BETWEEN`.
-            if (node.*.kind == c.LP_EXPR_BETWEEN and node.*.u.between.is_not != 0) {
-                const between = c.lp_node_alloc(self.arena, c.LP_EXPR_BETWEEN) orelse {
+            const arena: *c.arena_t = @ptrCast(@alignCast(self.arena));
+            while (isNot(node)) {
+                const operand: *c.LpNode = node.*.u.unary.operand;
+                if (isNot(operand)) {
+                    node.* = operand.u.unary.operand.*;
+                    continue;
+                }
+                if (operand.kind != c.LP_EXPR_BINARY_OP) break;
+                const op = operand.u.binary.op;
+                if (op != c.LP_OP_AND and op != c.LP_OP_OR) break;
+                const left = c.lp_node_alloc(arena, c.LP_EXPR_UNARY_OP) orelse {
                     self.failed = true;
                     return 2;
                 };
-                between.* = node.*;
-                between.*.u.between.is_not = 0;
-                node.*.kind = c.LP_EXPR_UNARY_OP;
-                node.*.u = .{ .unary = .{ .op = c.LP_UOP_NOT, .operand = between } };
-                return 0;
-            }
-            while (true) {
-                if (isNot(node)) {
-                    const operand: *c.LpNode = node.*.u.unary.operand;
-                    if (isNot(operand)) {
-                        node.* = operand.u.unary.operand.*;
-                        continue;
-                    }
-                    if ((operand.kind == c.LP_EXPR_IN and operand.u.in.is_not != 0) or
-                        (operand.kind == c.LP_EXPR_BETWEEN and operand.u.between.is_not != 0))
-                    {
-                        node.* = operand.*;
-                        if (node.*.kind == c.LP_EXPR_IN) node.*.u.in.is_not = 0 else node.*.u.between.is_not = 0;
-                        continue;
-                    }
-                    if (!isBool(operand, c.LP_OP_AND) and !isBool(operand, c.LP_OP_OR)) break;
-                    const op = operand.u.binary.op;
-                    const left = c.lp_node_alloc(self.arena, c.LP_EXPR_UNARY_OP) orelse {
-                        self.failed = true;
-                        return 2;
-                    };
-                    const right = c.lp_node_alloc(self.arena, c.LP_EXPR_UNARY_OP) orelse {
-                        self.failed = true;
-                        return 2;
-                    };
-                    left.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.left };
-                    right.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.right };
-                    node.* = operand.*;
-                    node.*.u.binary.op = if (op == c.LP_OP_AND) c.LP_OP_OR else c.LP_OP_AND;
-                    node.*.u.binary.left = left;
-                    node.*.u.binary.right = right;
-                    continue;
-                }
-                break;
-            }
-            return 0;
-        }
-
-        /// Children are final here. Rotating `a op (b op c)` to `(a op b) op c` reuses the inner node for
-        /// `(a op b)`, whose `b` may itself be an `op` chain, so walk down the left spine.
-        fn leave(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
-            inline for (.{ c.LP_OP_AND, c.LP_OP_OR }) |op| {
-                var n: *c.LpNode = node;
-                while (isBool(n, op)) : (n = n.u.binary.left) {
-                    while (isBool(n.u.binary.right, op)) {
-                        const inner: *c.LpNode = n.u.binary.right;
-                        n.u.binary.right = inner.u.binary.right;
-                        inner.u.binary.right = inner.u.binary.left;
-                        inner.u.binary.left = n.u.binary.left;
-                        n.u.binary.left = inner;
-                    }
-                }
+                const right = c.lp_node_alloc(arena, c.LP_EXPR_UNARY_OP) orelse {
+                    self.failed = true;
+                    return 2;
+                };
+                left.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.left };
+                right.*.u.unary = .{ .op = c.LP_UOP_NOT, .operand = operand.u.binary.right };
+                node.* = operand.*;
+                node.*.u.binary.op = if (op == c.LP_OP_AND) c.LP_OP_OR else c.LP_OP_AND;
+                node.*.u.binary.left = left;
+                node.*.u.binary.right = right;
             }
             return 0;
         }
     };
     var state: Visit = .{ .arena = lp_arena };
-    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = Visit.leave };
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
     c.lp_ast_walk(root, &visitor);
     if (state.failed) return error.OutOfMemory;
-}
-
-/// Whether the filter grammar's raw-substring splitting would cut `s`: it splits on ` OR ` (case-sensitive) and on
-/// ` AND ` / ` BETWEEN ` (case-insensitive) without regard to quoting.
-fn splitsFlatGrammar(s: []const u8) bool {
-    return std.mem.indexOf(u8, s, " OR ") != null or std.ascii.findIgnoreCase(s, " AND ") != null or
-        std.ascii.findIgnoreCase(s, " BETWEEN ") != null;
-}
-
-fn isColumn(n: ?*const c.LpNode) bool {
-    const node = n orelse return false;
-    if (node.kind != c.LP_EXPR_COLUMN_REF) return false;
-    const ref = node.u.column_ref;
-    for ([_][*c]u8{ ref.schema, ref.table, ref.column }) |part| {
-        if (part) |p| if (splitsFlatGrammar(std.mem.span(p))) return false;
-    }
-    return true;
-}
-
-/// A literal the grammar reads back as the same value: a number, optionally signed, or a string it will not cut.
-/// NULL is not one (the grammar reads it as the string `NULL`), nor is anything it would take as a bare string: a
-/// column, a cast, a COLLATE, an expression or a blob.
-fn isLiteral(n: ?*const c.LpNode, in_list: bool) bool {
-    const node = n orelse return false;
-    switch (node.kind) {
-        c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT => return true,
-        c.LP_EXPR_UNARY_OP => {
-            if (node.u.unary.op != c.LP_UOP_MINUS and node.u.unary.op != c.LP_UOP_PLUS) return false;
-            const operand: *const c.LpNode = node.u.unary.operand orelse return false;
-            return operand.kind == c.LP_EXPR_LITERAL_INT or operand.kind == c.LP_EXPR_LITERAL_FLOAT;
-        },
-        c.LP_EXPR_LITERAL_STRING => {
-            const s = std.mem.span(node.u.literal.value orelse return false);
-            // The grammar reads an escaped quote (`''`) as two quotes of data, and splits an IN list on every comma.
-            return !splitsFlatGrammar(s) and std.mem.indexOfScalar(u8, s, '\'') == null and
-                !(in_list and std.mem.indexOfScalar(u8, s, ',') != null);
-        },
-        else => return false,
-    }
-}
-
-/// Whether a normalized leaf is one of the shapes the filter grammar reads back as written: `col op literal`,
-/// `col [NOT] LIKE 'pattern'` (no ESCAPE, which it would read as pattern), `col IS [NOT] NULL`, `col [NOT] IN
-/// (literals)` or `col [NOT] BETWEEN literal AND literal`, under at most the grammar's own leading NOT.
-fn flatLeaf(leaf: *c.LpNode) bool {
-    const n: *c.LpNode = if (isNot(leaf)) leaf.u.unary.operand else leaf;
-    switch (n.kind) {
-        c.LP_EXPR_BINARY_OP => {
-            const b = n.u.binary;
-            if (!isColumn(b.left)) return false;
-            return switch (b.op) {
-                c.LP_OP_EQ, c.LP_OP_NE, c.LP_OP_LT, c.LP_OP_LE, c.LP_OP_GT, c.LP_OP_GE => isLiteral(b.right, false),
-                c.LP_OP_LIKE => b.escape == null and b.right != null and b.right.*.kind == c.LP_EXPR_LITERAL_STRING and
-                    isLiteral(b.right, false),
-                c.LP_OP_IS, c.LP_OP_ISNOT => b.right != null and b.right.*.kind == c.LP_EXPR_LITERAL_NULL,
-                else => false,
-            };
-        },
-        c.LP_EXPR_IN => {
-            const in = n.u.in;
-            if (in.select != null or !isColumn(in.expr) or in.values.count == 0) return false;
-            for (0..@intCast(in.values.count)) |i| if (!isLiteral(in.values.items[i], true)) return false;
-            return true;
-        },
-        c.LP_EXPR_BETWEEN => {
-            const b = n.u.between;
-            return isColumn(b.expr) and isLiteral(b.low, false) and isLiteral(b.high, false);
-        },
-        else => return false,
-    }
-}
-
-/// Refuse a normalized predicate the flat AND/OR grammar cannot hold as written: an OR under an AND (it needs
-/// grouping), or a leaf that is not a shape `flatLeaf` knows reads back as itself. Evaluating either anyway would
-/// answer another query.
-fn checkFlatPredicate(pred: *c.LpNode) error{ GroupingNotSupported, UnsupportedPredicate }!void {
-    var disj: *c.LpNode = pred;
-    while (true) {
-        const term: *c.LpNode = if (isBool(disj, c.LP_OP_OR)) disj.u.binary.right else disj;
-        var conj: *c.LpNode = term;
-        while (true) {
-            const leaf: *c.LpNode = if (isBool(conj, c.LP_OP_AND)) conj.u.binary.right else conj;
-            if (isBool(leaf, c.LP_OP_OR)) {
-                std.debug.print("sql: the filter grammar is a flat OR of ANDs; this predicate needs an OR\n" ++
-                    "  inside an AND (after pushing NOT down). Rewrite it as an OR of ANDs\n", .{});
-                return error.GroupingNotSupported;
-            }
-            if (!flatLeaf(leaf)) {
-                std.debug.print("sql: a WHERE/FILTER condition must be `column op literal`, LIKE (no ESCAPE),\n" ++
-                    "  IS [NOT] NULL, or IN/BETWEEN over literals. NULL, TRUE/FALSE, casts,\n" ++
-                    "  expressions and other columns are not supported as values, nor are\n" ++
-                    "  strings holding a quote, ' AND ', ' OR ' or ' BETWEEN '\n", .{});
-                return error.UnsupportedPredicate;
-            }
-            if (conj == leaf) break;
-            conj = conj.u.binary.left;
-        }
-        if (disj == term) break;
-        disj = disj.u.binary.left;
-    }
-}
-
-/// Check every aggregate FILTER body under `node`: like WHERE, it reaches the flat grammar as unparsed text.
-fn checkAggFilters(node: *c.LpNode) error{ GroupingNotSupported, UnsupportedPredicate }!void {
-    const Visit = struct {
-        err: ?error{ GroupingNotSupported, UnsupportedPredicate } = null,
-        fn enter(visitor: [*c]c.LpVisitor, n: [*c]c.LpNode) callconv(.c) c_int {
-            const self: *@This() = @ptrCast(@alignCast(visitor.*.user_data));
-            if (n.*.kind == c.LP_EXPR_FUNCTION) if (n.*.u.function.filter) |f| {
-                checkFlatPredicate(f) catch |e| {
-                    self.err = e;
-                    return 2;
-                };
-            };
-            return 0;
-        }
-    };
-    var state: Visit = .{};
-    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
-    c.lp_ast_walk(node, &visitor);
-    if (state.err) |e| return e;
 }
 
 fn unparseResultColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocator) ![]const u8 {
@@ -427,8 +368,85 @@ fn selectColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocato
     if (expr_c == null) return error.UnparseError;
     out.expr = try allocator.dupe(u8, std.mem.span(expr_c));
     if (rc.kind == c.LP_RESULT_COLUMN and rc.u.result_column.alias != null) {
-        out.alias = try allocator.dupe(u8, std.mem.span(rc.u.result_column.alias));
+        out.alias = try aliasText(allocator, std.mem.span(rc.u.result_column.alias));
     }
+}
+
+/// The output name an alias spells: the parser keeps a quoted one quoted (`"n m"`, `"a""b"`); the name is its text,
+/// a doubled quote one quote.
+fn aliasText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return allocator.dupe(u8, raw);
+    return std.mem.replaceOwned(u8, allocator, raw[1 .. raw.len - 1], "\"\"", "\"");
+}
+
+/// `sql` with every `EXTRACT(part FROM x)` written `date_part('part', x)`, which is what it means (DuckDB's own
+/// rewrite) and the call form liteparser's grammar has; quoted text is left as it is.
+fn extractAsDatePart(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const word = struct {
+        fn isByte(ch: u8) bool {
+            return std.ascii.isAlphanumeric(ch) or ch == '_';
+        }
+        fn end(src: []const u8, from: usize) usize {
+            var j = from;
+            while (j < src.len and isByte(src[j])) j += 1;
+            return j;
+        }
+        fn skipSpace(src: []const u8, from: usize) usize {
+            var j = from;
+            while (j < src.len and std.ascii.isWhitespace(src[j])) j += 1;
+            return j;
+        }
+    };
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            // A quoted span, its doubled quotes included, copies through whole.
+            var j = i + 1;
+            while (j < sql.len) : (j += 1) if (sql[j] == ch) {
+                if (j + 1 < sql.len and sql[j + 1] == ch) j += 1 else break;
+            };
+            const stop = @min(j + 1, sql.len);
+            try out.appendSlice(allocator, sql[i..stop]);
+            i = stop;
+            continue;
+        }
+        if (!word.isByte(ch)) {
+            try out.append(allocator, ch);
+            i += 1;
+            continue;
+        }
+        const w_end = word.end(sql, i);
+        if (i == 0 or !word.isByte(sql[i - 1])) if (std.ascii.eqlIgnoreCase(sql[i..w_end], "extract")) {
+            const open = word.skipSpace(sql, w_end);
+            if (open < sql.len and sql[open] == '(') {
+                // The part is a word, or one quoted as a string or a name (`EXTRACT('year' FROM d)`).
+                var p_start = word.skipSpace(sql, open + 1);
+                const quote: ?u8 = if (p_start < sql.len and (sql[p_start] == '\'' or sql[p_start] == '"'))
+                    sql[p_start]
+                else
+                    null;
+                if (quote != null) p_start += 1;
+                var p_end = word.end(sql, p_start);
+                if (quote) |q| p_end = if (p_end < sql.len and sql[p_end] == q) p_end + 1 else p_start;
+                const from = word.skipSpace(sql, p_end);
+                const from_end = word.end(sql, from);
+                const part = sql[p_start .. p_end - @intFromBool(quote != null and p_end > p_start)];
+                if (part.len > 0 and from > p_end and std.ascii.eqlIgnoreCase(sql[from..from_end], "from") and
+                    from_end < sql.len and !word.isByte(sql[from_end]))
+                {
+                    try out.print(allocator, "date_part('{s}', ", .{part});
+                    i = word.skipSpace(sql, from_end);
+                    continue;
+                }
+            }
+        };
+        try out.appendSlice(allocator, sql[i..w_end]);
+        i = w_end;
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
 }
 
 pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
@@ -436,7 +454,7 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    const sql_c = try allocator.dupeSentinel(u8, sql, 0);
+    const sql_c = try extractAsDatePart(allocator, sql);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses
@@ -444,11 +462,11 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // anything but exactly one.
     const stmts = c.lp_parse_all(sql_c, lp_arena, &error_msg);
     if (stmts == null or stmts.*.count == 0) {
-        if (error_msg) |msg| std.debug.print("sql parse error: {s}\n", .{std.mem.span(msg)});
+        if (error_msg) |msg| diagnosticPrint("sql parse error: {s}\n", .{std.mem.span(msg)});
         return error.SqlParseError;
     }
     if (stmts.*.count > 1) {
-        std.debug.print("sql: only a single statement is supported (found {d})\n", .{stmts.*.count});
+        diagnosticPrint("sql: only a single statement is supported (found {d})\n", .{stmts.*.count});
         return error.MultipleStatements;
     }
     const root = stmts.*.items[0] orelse return error.SqlParseError;
@@ -456,32 +474,33 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     // Only single-table SELECT. UNION/INSERT/etc. arrive as a non-SELECT
     // root; joins and subqueries arrive as a non-LP_FROM_TABLE `from`.
     if (root.*.kind != c.LP_STMT_SELECT) {
-        std.debug.print("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
+        diagnosticPrint("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
         return error.UnsupportedStatement;
     }
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
+    boolLiterals(root);
     quoteWholePaths(root);
-    try normalizePredicates(root, lp_arena);
+    try pushNotsDown(root, lp_arena);
+    try rejectColumnComparisons(root);
     if (root.*.u.select.where) |w| {
         const wi = analyzeExpr(w);
         if (wi.has_window) {
-            std.debug.print("sql: window functions are not supported yet\n", .{});
+            diagnosticPrint("sql: window functions are not supported yet\n", .{});
             return error.WindowNotSupported;
         }
         if (wi.has_subquery) {
-            std.debug.print("sql: subqueries are not supported yet\n", .{});
+            diagnosticPrint("sql: subqueries are not supported yet\n", .{});
             return error.SubqueryNotSupported;
         }
         if (wi.has_func_distinct) {
-            std.debug.print("sql: DISTINCT inside a function is not supported yet\n", .{});
+            diagnosticPrint("sql: DISTINCT inside a function is not supported yet\n", .{});
             return error.DistinctNotSupported;
         }
         if (wi.has_agg) {
-            std.debug.print("sql: aggregates are not allowed in WHERE\n", .{});
+            diagnosticPrint("sql: aggregates are not allowed in WHERE\n", .{});
             return error.AggregateInWhere;
         }
-        try checkFlatPredicate(w);
     }
 
     // Extract table name from FROM clause
@@ -508,18 +527,17 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         const info = analyzeExpr(rc);
         if (info.has_window) {
-            std.debug.print("sql: window functions (OVER) are not supported yet\n", .{});
+            diagnosticPrint("sql: window functions (OVER) are not supported yet\n", .{});
             return error.WindowNotSupported;
         }
         if (info.has_subquery) {
-            std.debug.print("sql: subqueries are not supported yet\n", .{});
+            diagnosticPrint("sql: subqueries are not supported yet\n", .{});
             return error.SubqueryNotSupported;
         }
         if (info.has_func_distinct) {
-            std.debug.print("sql: DISTINCT inside a function is not supported yet\n", .{});
+            diagnosticPrint("sql: DISTINCT inside a function is not supported yet\n", .{});
             return error.DistinctNotSupported;
         }
-        try checkAggFilters(rc);
         if (info.has_agg) has_agg = true;
         if (info.has_bare_col) has_bare = true;
     }
@@ -528,10 +546,11 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
 
     if (is_aggregate) {
         if (has_bare and !has_group_by) {
-            std.debug.print("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
+            diagnosticPrint("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
             return error.MixedSelectNotSupported;
         }
         if (has_group_by) {
+            try substituteGroupRefs(root.*.u.select);
             try validateGroupBy(allocator, root.*.u.select, lp_arena);
         }
     }
@@ -557,8 +576,45 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         try selectColumn(rc, lp_arena, allocator, &select_cols[col_idx]);
+        if (has_group_by) select_cols[col_idx].role = if (analyzeExpr(rc).has_agg) .agg else .key;
         col_idx += 1;
     }
+    var hidden: std.ArrayList(ast.SelectColumn) = .empty;
+    defer {
+        freeSelectCols(allocator, hidden.items);
+        hidden.deinit(allocator);
+    }
+    const sel = root.*.u.select;
+    var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden);
+    errdefer allocator.free(result_order.keys);
+    var having_arena: ?*std.heap.ArenaAllocator = null;
+    errdefer if (having_arena) |ha| {
+        ha.deinit();
+        allocator.destroy(ha);
+    };
+    if (sel.having) |having| {
+        if (!is_aggregate) {
+            diagnosticPrint("sql: HAVING needs an aggregate or GROUP BY\n", .{});
+            return error.HavingNotSupported;
+        }
+        const ha = try allocator.create(std.heap.ArenaAllocator);
+        ha.* = .init(allocator);
+        having_arena = ha;
+        var ctx: HavingBuilder(@TypeOf(sel)) = .{
+            .allocator = allocator,
+            .arena = ha.allocator(),
+            .sel = sel,
+            .lp_arena = lp_arena,
+            .select_cols = select_cols,
+            .has_group_by = has_group_by,
+            .hidden = &hidden,
+        };
+        const tree = try ha.allocator().create(ast.Having);
+        tree.* = try ctx.build(having, 0);
+        result_order.having = tree;
+    }
+    result_order.hidden = try hidden.toOwnedSlice(allocator);
+    errdefer freeSelectCols(allocator, result_order.hidden);
 
     // Join result columns with ", "
     var joined_cols: std.ArrayList(u8) = .empty;
@@ -623,6 +679,11 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             const col_sql = try unparseResultColumn(rc, lp_arena, allocator);
             try agg_list.append(allocator, col_sql);
         }
+        // Hidden ORDER BY aggregates follow, in order, so they are the calls after the SELECT list's.
+        for (result_order.hidden, 0..) |h, n| if (h.role == .agg) {
+            try agg_list.ensureUnusedCapacity(allocator, 1);
+            agg_list.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s} AS {s}{d}", .{ h.expr, hidden_alias, n }));
+        };
 
         allocator.free(columns_str);
         if (agg_list.items.len == 0) {
@@ -636,6 +697,18 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             }
             aggregate_str = try joined_agg.toOwnedSlice(allocator);
         }
+    } else if (is_aggregate) {
+        // Without GROUP BY every SELECT item is an aggregate; hidden HAVING aggregates follow them.
+        var joined: std.ArrayList(u8) = .empty;
+        errdefer joined.deinit(allocator);
+        try joined.appendSlice(allocator, columns_str);
+        for (result_order.hidden, 0..) |h, n| if (h.role == .agg) {
+            try joined.print(allocator, ", {s} AS {s}{d}", .{ h.expr, hidden_alias, n });
+        };
+        if (joined.items.len != columns_str.len) {
+            aggregate_str = try joined.toOwnedSlice(allocator);
+            allocator.free(columns_str);
+        } else joined.deinit(allocator);
     }
 
     if (is_aggregate) {
@@ -647,10 +720,12 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .filter_str = filter_str,
             .group_by_str = group_by_str,
             .select_cols = select_cols,
+            .result_order = result_order,
+            .having_arena = having_arena,
         };
     }
     // `SELECT *` → no projection list → the engine's zero-copy passthrough
-    // (byte-copy fast path), which is exactly ZPQ's surgical sweet spot.
+    // (byte-copy fast path), which is exactly zpq's surgical sweet spot.
     // A bare star can't be an aggregate, so this only reaches the plain path.
     if (std.mem.eql(u8, std.mem.trim(u8, columns_str, " "), "*")) {
         allocator.free(columns_str);
@@ -661,6 +736,8 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .select_str = null,
             .aggregate_str = null,
             .filter_str = filter_str,
+            .result_order = result_order,
+            .having_arena = having_arena,
         };
     }
     return .{
@@ -670,7 +747,348 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         .aggregate_str = null,
         .filter_str = filter_str,
         .select_cols = select_cols,
+        .result_order = result_order,
+        .having_arena = having_arena,
     };
+}
+
+/// The alias a hidden ORDER BY aggregate's call carries (followed by its position among the hidden terms): never
+/// printed, as its result column is dropped once the rows are ranked.
+pub const hidden_alias = "__zpq_order_";
+
+/// ORDER BY / LIMIT / OFFSET as positions in the SELECT list. Only an aggregate's result rows are ordered: plain rows
+/// stream out as they are read, and an aggregate without GROUP BY is one row, which a LIMIT may keep but not drop.
+/// Under GROUP BY a term no SELECT column gives becomes a hidden result column (`ResultOrder.hidden`): an aggregate,
+/// computed as a call of its own, or an expression of the GROUP BY keys.
+fn resultOrder(
+    allocator: std.mem.Allocator,
+    sel: anytype,
+    lp_arena: *c.arena_t,
+    select_cols: []const ast.SelectColumn,
+    is_aggregate: bool,
+    has_group_by: bool,
+    hidden: *std.ArrayList(ast.SelectColumn),
+) !ast.ResultOrder {
+    const n_terms: usize = @intCast(sel.order_by.count);
+    var order: ast.ResultOrder = .{};
+    if (sel.limit) |lim| {
+        order.limit = try nonNegativeInt(lim.*.u.limit.count orelse return error.LimitNotSupported);
+        if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
+    }
+    if (!is_aggregate) {
+        if (n_terms > 0) order.rows = try rowOrder(allocator, sel, lp_arena, select_cols);
+        return order;
+    }
+
+    const keys = try allocator.alloc(ast.OrderKey, n_terms);
+    errdefer allocator.free(keys);
+    for (keys, 0..) |*key, t| {
+        const term = sel.order_by.items[t] orelse return error.SqlParseError;
+        // The grammar spells NULLS FIRST as LP_SORT_ASC, NULLS LAST as LP_SORT_DESC, neither as LP_SORT_UNDEFINED.
+        if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
+            diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
+            return error.OrderByNotSupported;
+        }
+        const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
+        const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
+            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden);
+        key.* = .{ .column = column, .descending = term.*.u.order_term.direction == c.LP_SORT_DESC };
+    }
+    order.keys = keys;
+    return order;
+}
+
+const Clause = enum { order_by, having };
+
+/// ORDER BY over plain rows: each term an expression of the input row (a column, arithmetic, a function, CASE),
+/// written directly, through a SELECT alias or by position. No aggregate: there are no groups to rank.
+fn rowOrder(
+    allocator: std.mem.Allocator,
+    sel: anytype,
+    lp_arena: *c.arena_t,
+    select_cols: []const ast.SelectColumn,
+) ![]const ast.RowKey {
+    const n_terms: usize = @intCast(sel.order_by.count);
+    const keys = try allocator.alloc(ast.RowKey, n_terms);
+    var made: usize = 0;
+    errdefer {
+        for (keys[0..made]) |k| allocator.free(k.expr);
+        allocator.free(keys);
+    }
+    for (keys) |*key| {
+        const term = sel.order_by.items[made] orelse return error.SqlParseError;
+        if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
+            diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
+            return error.OrderByNotSupported;
+        }
+        var expr: *c.LpNode = term.*.u.order_term.expr orelse return error.SqlParseError;
+        // A position or a SELECT alias stands for that item's expression.
+        if (expr.kind == c.LP_EXPR_LITERAL_INT) {
+            const pos = try nonNegativeInt(expr);
+            if (pos < 1 or pos > select_cols.len) {
+                diagnosticPrint("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
+                return error.OrderByNotSupported;
+            }
+            expr = selectExpr(sel, @intCast(pos - 1)) orelse return error.SqlParseError;
+        } else if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) {
+            const name = std.mem.span(expr.u.column_ref.column);
+            for (select_cols, 0..) |col, idx| if (col.alias) |alias| if (std.ascii.eqlIgnoreCase(alias, name)) {
+                expr = selectExpr(sel, idx) orelse return error.SqlParseError;
+                break;
+            };
+        }
+        const info = analyzeExpr(expr);
+        if (info.has_agg or info.has_window or info.has_subquery) {
+            const text = c.lp_ast_to_sql(expr, lp_arena);
+            diagnosticPrint("sql: ORDER BY {s} over plain rows is not supported\n", .{std.mem.span(text)});
+            return error.OrderByNotSupported;
+        }
+        const text_c = c.lp_ast_to_sql(expr, lp_arena);
+        if (text_c == null) return error.UnparseError;
+        key.* = .{
+            .expr = try allocator.dupe(u8, std.mem.span(text_c)),
+            .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+        };
+        made += 1;
+    }
+    return keys;
+}
+
+/// The expression of SELECT item `i`, `*` excepted.
+fn selectExpr(sel: anytype, i: usize) ?*c.LpNode {
+    if (i >= @as(usize, @intCast(sel.result_columns.count))) return null;
+    const rc = sel.result_columns.items[i] orelse return null;
+    return if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr else rc;
+}
+
+/// Add ORDER BY or HAVING term `expr`, which names no SELECT column, to `hidden` (once: an equal term already there is
+/// reused); its index there. Under GROUP BY such a term is an aggregate or an expression whose columns are all
+/// grouped; without GROUP BY, HAVING may read an aggregate the SELECT list lacks, and ORDER BY nothing.
+fn hiddenTerm(
+    allocator: std.mem.Allocator,
+    sel: anytype,
+    lp_arena: *c.arena_t,
+    expr: *c.LpNode,
+    has_group_by: bool,
+    clause: Clause,
+    hidden: *std.ArrayList(ast.SelectColumn),
+) !usize {
+    const text_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (text_c == null) return error.UnparseError;
+    const text = std.mem.span(text_c);
+    const name = if (clause == .order_by) "ORDER BY" else "HAVING";
+    const info = analyzeExpr(expr);
+    if (!has_group_by and (clause == .order_by or !info.has_agg)) {
+        diagnosticPrint("sql: {s} {s} must name a result column (by position, alias or expression)\n", .{ name, text });
+        return if (clause == .order_by) error.OrderByNotSupported else error.ColumnMustBeGrouped;
+    }
+    if (info.has_window or info.has_subquery or info.has_func_distinct) {
+        diagnosticPrint("sql: {s} {s} is not supported yet\n", .{ name, text });
+        return if (clause == .order_by) error.OrderByNotSupported else error.HavingNotSupported;
+    }
+    if (!info.has_agg and info.has_bare_col and !try groupedExpr(allocator, sel, lp_arena, expr)) {
+        diagnosticPrint("sql: {s} {s} must be in the GROUP BY list or aggregated\n", .{ name, text });
+        return error.ColumnMustBeGrouped;
+    }
+    // Written alike, one slot: `ORDER BY count(*) DESC, count(*)` computes one aggregate.
+    for (hidden.items, 0..) |h, i| if (std.mem.eql(u8, h.expr, text)) return i;
+    try hidden.ensureUnusedCapacity(allocator, 1);
+    hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
+    return hidden.items.len - 1;
+}
+
+/// Lowers a HAVING clause, its NOTs already at the leaves (`pushNotsDown`), to an `ast.Having` over result row
+/// columns: each leaf compares one result (a SELECT column by alias or expression, else a hidden term) with a literal.
+/// Chains build in a loop; only grouping recurses, bounded as the filter grammar bounds it.
+fn HavingBuilder(comptime Sel: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        sel: Sel,
+        lp_arena: *c.arena_t,
+        select_cols: []const ast.SelectColumn,
+        has_group_by: bool,
+        hidden: *std.ArrayList(ast.SelectColumn),
+
+        const Self = @This();
+        const max_depth = @import("../filter/parser.zig").MAX_GROUP_DEPTH;
+
+        fn unsupported(self: *Self, node: *c.LpNode) anyerror {
+            const text = c.lp_ast_to_sql(node, self.lp_arena);
+            if (text == null) return error.UnparseError;
+            diagnosticPrint("sql: HAVING {s} is not supported yet (compare an aggregate or key with a literal)\n", .{
+                std.mem.span(text),
+            });
+            return error.HavingNotSupported;
+        }
+
+        fn build(self: *Self, node: *c.LpNode, depth: u32) anyerror!ast.Having {
+            if (depth > max_depth) return error.FilterTooDeep;
+            switch (node.kind) {
+                c.LP_EXPR_BINARY_OP => {
+                    const op = node.u.binary.op;
+                    if (op == c.LP_OP_AND or op == c.LP_OP_OR) return self.chain(node, op, depth);
+                    const left = node.u.binary.left orelse return self.unsupported(node);
+                    const right = node.u.binary.right orelse return self.unsupported(node);
+                    if (op == c.LP_OP_IS or op == c.LP_OP_ISNOT) {
+                        if (right.*.kind != c.LP_EXPR_LITERAL_NULL) return self.unsupported(node);
+                        return .{ .null_check = .{ .column = try self.term(left), .is_not = op == c.LP_OP_ISNOT } };
+                    }
+                    const cmp: ast.CmpOp = switch (op) {
+                        c.LP_OP_EQ => .eq,
+                        c.LP_OP_NE => .ne,
+                        c.LP_OP_LT => .lt,
+                        c.LP_OP_LE => .le,
+                        c.LP_OP_GT => .gt,
+                        c.LP_OP_GE => .ge,
+                        else => return self.unsupported(node),
+                    };
+                    if (try self.literal(right)) |lit| {
+                        if (try self.literal(left) != null) return self.unsupported(node);
+                        return .{ .cmp = .{ .column = try self.term(left), .op = cmp, .literal = lit } };
+                    }
+                    const lit = try self.literal(left) orelse return self.unsupported(node);
+                    return .{ .cmp = .{ .column = try self.term(right), .op = cmp.flip(), .literal = lit } };
+                },
+                c.LP_EXPR_UNARY_OP => {
+                    if (node.u.unary.op != c.LP_UOP_NOT) return self.unsupported(node);
+                    const inner = try self.build(node.u.unary.operand orelse return self.unsupported(node), depth + 1);
+                    return inner.negated(self.arena);
+                },
+                c.LP_EXPR_BETWEEN => {
+                    const b = node.u.between;
+                    const column = try self.term(b.expr orelse return self.unsupported(node));
+                    const lo = try self.literal(b.low orelse return self.unsupported(node)) orelse return self.unsupported(node);
+                    const hi = try self.literal(b.high orelse return self.unsupported(node)) orelse return self.unsupported(node);
+                    const terms = try self.arena.alloc(ast.Having, 2);
+                    terms[0] = .{ .cmp = .{ .column = column, .op = .ge, .literal = lo } };
+                    terms[1] = .{ .cmp = .{ .column = column, .op = .le, .literal = hi } };
+                    const range: ast.Having = .{ .all = terms };
+                    return if (b.is_not != 0) range.negated(self.arena) else range;
+                },
+                c.LP_EXPR_IN => {
+                    const in = node.u.in;
+                    if (in.select != null or in.values.count == 0) return self.unsupported(node);
+                    const column = try self.term(in.expr orelse return self.unsupported(node));
+                    const terms = try self.arena.alloc(ast.Having, @intCast(in.values.count));
+                    for (terms, 0..) |*t, i| {
+                        const v = in.values.items[i] orelse return self.unsupported(node);
+                        const lit = try self.literal(v) orelse return self.unsupported(node);
+                        t.* = .{ .cmp = .{ .column = column, .op = .eq, .literal = lit } };
+                    }
+                    const list: ast.Having = .{ .any = terms };
+                    return if (in.is_not != 0) list.negated(self.arena) else list;
+                },
+                else => return self.unsupported(node),
+            }
+        }
+
+        /// A chain of one operator, its operands gathered with a stack rather than recursion: left-deep chains of any
+        /// length cost no parse depth.
+        fn chain(self: *Self, node: *c.LpNode, op: anytype, depth: u32) anyerror!ast.Having {
+            var stack: std.ArrayList(*c.LpNode) = .empty;
+            defer stack.deinit(self.allocator);
+            var operands: std.ArrayList(ast.Having) = .empty;
+            try stack.append(self.allocator, node);
+            while (stack.pop()) |n| {
+                if (n.kind == c.LP_EXPR_BINARY_OP and n.u.binary.op == op) {
+                    try stack.append(self.allocator, n.u.binary.right orelse return self.unsupported(n));
+                    try stack.append(self.allocator, n.u.binary.left orelse return self.unsupported(n));
+                    continue;
+                }
+                try operands.append(self.arena, try self.build(n, depth + 1));
+            }
+            return if (op == c.LP_OP_AND) .{ .all = operands.items } else .{ .any = operands.items };
+        }
+
+        /// `node` as a HAVING literal, or null when it is none: a number (a minus sign folded in), a string or NULL.
+        fn literal(self: *Self, node: *c.LpNode) !?ast.HavingLiteral {
+            switch (node.kind) {
+                c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT => {
+                    return .{ .number = try self.arena.dupe(u8, std.mem.span(node.u.literal.value)) };
+                },
+                c.LP_EXPR_LITERAL_STRING => return .{ .string = try self.arena.dupe(u8, std.mem.span(node.u.literal.value)) },
+                c.LP_EXPR_LITERAL_NULL => return .null,
+                c.LP_EXPR_UNARY_OP => {
+                    if (node.u.unary.op != c.LP_UOP_MINUS) return null;
+                    const operand = node.u.unary.operand orelse return null;
+                    if (operand.*.kind != c.LP_EXPR_LITERAL_INT and operand.*.kind != c.LP_EXPR_LITERAL_FLOAT) return null;
+                    const text = std.mem.span(operand.*.u.literal.value);
+                    return .{ .number = try std.fmt.allocPrint(self.arena, "-{s}", .{text}) };
+                },
+                else => return null,
+            }
+        }
+
+        /// The result row column a HAVING operand reads: a SELECT column it names, else a hidden term.
+        fn term(self: *Self, node: *c.LpNode) !usize {
+            // The tested operand names a result; an integer here is a value, never an ORDER BY-style position
+            // (`HAVING 1 IN (2, 3)` kept the groups whose first column was 2 or 3).
+            switch (node.kind) {
+                c.LP_EXPR_LITERAL_INT,
+                c.LP_EXPR_LITERAL_FLOAT,
+                c.LP_EXPR_LITERAL_STRING,
+                c.LP_EXPR_LITERAL_NULL,
+                c.LP_EXPR_LITERAL_BOOL,
+                c.LP_EXPR_LITERAL_BLOB,
+                => {
+                    diagnosticPrint("sql: HAVING tests a literal; it compares a result or key with literals\n", .{});
+                    return error.HavingNotSupported;
+                },
+                else => {},
+            }
+            if (try orderColumn(self.sel, self.lp_arena, self.select_cols, node)) |i| return i;
+            return self.select_cols.len +
+                try hiddenTerm(self.allocator, self.sel, self.lp_arena, node, self.has_group_by, .having, self.hidden);
+        }
+    };
+}
+
+/// The SELECT-list position an ORDER BY term names: a 1-based position, an alias, or an expression written as in the
+/// SELECT list (a column reference matching as GROUP BY matches it). An alias wins over a column of the same name.
+/// Null for an expression no SELECT column gives.
+fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.SelectColumn, expr: *c.LpNode) !?usize {
+    if (expr.kind == c.LP_EXPR_LITERAL_INT) {
+        const pos = try nonNegativeInt(expr);
+        if (pos >= 1 and pos <= select_cols.len) return @intCast(pos - 1);
+        diagnosticPrint("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
+        return error.OrderByNotSupported;
+    }
+    if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.schema == null and expr.u.column_ref.table == null) {
+        const name = std.mem.span(expr.u.column_ref.column);
+        for (select_cols, 0..) |col, idx| {
+            if (col.alias) |alias| if (std.ascii.eqlIgnoreCase(alias, name)) return idx;
+        }
+    }
+    const expr_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (expr_c == null) return error.UnparseError;
+    const text = std.mem.span(expr_c);
+    var idx: usize = 0;
+    for (0..@intCast(sel.result_columns.count)) |i| {
+        const rc = sel.result_columns.items[i] orelse continue;
+        const rc_expr = if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr else rc;
+        if (sameColumnRef(expr, rc_expr) orelse std.mem.eql(u8, text, select_cols[idx].expr)) return idx;
+        idx += 1;
+    }
+    // Spelled with other letter case (`count(*)` for `COUNT(*)`): the one item that matches so, if only one does.
+    var found: ?usize = null;
+    for (select_cols, 0..) |col, i| if (std.ascii.eqlIgnoreCase(text, col.expr)) {
+        if (found != null) {
+            found = null;
+            break;
+        }
+        found = i;
+    };
+    return found;
+}
+
+/// A LIMIT, OFFSET or ORDER BY position, which must be a plain non-negative integer literal.
+fn nonNegativeInt(node: *const c.LpNode) !u64 {
+    if (node.kind == c.LP_EXPR_LITERAL_INT) {
+        if (std.fmt.parseInt(u64, std.mem.span(node.u.literal.value), 10)) |v| return v else |_| {}
+    }
+    diagnosticPrint("sql: LIMIT, OFFSET and ORDER BY positions must be non-negative integer literals\n", .{});
+    return error.LimitNotSupported;
 }
 
 /// Whether two column references name the same segments, ignoring case and quoting (`"r"."v"` is `r.v`): which
@@ -688,60 +1106,73 @@ fn partEql(a: [*c]const u8, b: [*c]const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.span(a), std.mem.span(b));
 }
 
+/// Rewrite each GROUP BY integer constant into the SELECT item at that 1-based position, as DuckDB binds `GROUP BY 1`.
+/// A name a SELECT alias gives binds in the engine, which knows whether a column of the name wins
+/// (`expr_parser.parseGroupByOf`).
+fn substituteGroupRefs(sel: anytype) !void {
+    const n_cols: usize = @intCast(sel.result_columns.count);
+    for (0..@intCast(sel.group_by.count)) |g| {
+        const term = sel.group_by.items[g] orelse continue;
+        if (term.*.kind != c.LP_EXPR_LITERAL_INT) continue;
+        const pos = std.fmt.parseInt(u64, std.mem.span(term.*.u.literal.value), 10) catch 0;
+        if (pos < 1 or pos > n_cols) {
+            diagnosticPrint("sql: GROUP BY position {s} is not in the SELECT list\n", .{std.mem.span(term.*.u.literal.value)});
+            return error.ColumnMustBeGrouped;
+        }
+        const rc = sel.result_columns.items[@intCast(pos - 1)] orelse return error.SqlParseError;
+        const expr = if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr orelse return error.SqlParseError else rc;
+        if (analyzeExpr(expr).has_agg) {
+            diagnosticPrint("sql: GROUP BY cannot refer to an aggregate\n", .{});
+            return error.AggregateInGroupBy;
+        }
+        sel.group_by.items[g] = expr;
+    }
+}
+
+/// Whether `expr` is one of the GROUP BY terms: the same column reference (case and quoting aside, as the engine
+/// binds names) or the same expression text.
+fn groupedExpr(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t, expr: *c.LpNode) !bool {
+    _ = allocator;
+    const expr_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (expr_c == null) return error.UnparseError;
+    const a = stripQuotes(std.mem.trim(u8, std.mem.span(expr_c), " "));
+    for (0..@intCast(sel.group_by.count)) |g| {
+        const gb_node = sel.group_by.items[g] orelse continue;
+        if (try sameTerm(lp_arena, expr, a, gb_node)) return true;
+        // A term naming a SELECT alias may stand for that item's expression (the engine decides; see
+        // `substituteGroupRefs`).
+        if (gb_node.*.kind != c.LP_EXPR_COLUMN_REF or gb_node.*.u.column_ref.table != null) continue;
+        const name = std.mem.span(gb_node.*.u.column_ref.column);
+        for (0..@intCast(sel.result_columns.count)) |i| {
+            const rc = sel.result_columns.items[i] orelse continue;
+            if (rc.*.kind != c.LP_RESULT_COLUMN or rc.*.u.result_column.alias == null) continue;
+            if (!std.ascii.eqlIgnoreCase(std.mem.span(rc.*.u.result_column.alias), name)) continue;
+            if (try sameTerm(lp_arena, expr, a, rc.*.u.result_column.expr orelse continue)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether `expr` (unparsed as `text`, quotes stripped) is the term `other`: the same column reference, case and
+/// quoting aside, or the same expression text.
+fn sameTerm(lp_arena: *c.arena_t, expr: *c.LpNode, text: []const u8, other: *c.LpNode) !bool {
+    if (sameColumnRef(expr, other)) |same| return same;
+    const other_c = c.lp_ast_to_sql(other, lp_arena);
+    if (other_c == null) return error.UnparseError;
+    return std.ascii.eqlIgnoreCase(text, stripQuotes(std.mem.trim(u8, std.mem.span(other_c), " ")));
+}
+
+/// Reject a SELECT item that reads a column outside an aggregate unless it is a GROUP BY term. The engine binds the
+/// items again, structurally against the bound keys; this catches what plainly cannot bind before any file opens.
 fn validateGroupBy(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t) !void {
-    // 1. Unparse and collect all GROUP BY expressions
-    var group_by_list: std.ArrayList([]const u8) = .empty;
-    var group_by_nodes: std.ArrayList(*const c.LpNode) = .empty;
-    defer {
-        for (group_by_list.items) |col| allocator.free(col);
-        group_by_list.deinit(allocator);
-        group_by_nodes.deinit(allocator);
-    }
-    var i: usize = 0;
-    while (i < @as(usize, @intCast(sel.group_by.count))) : (i += 1) {
-        const gb_node = sel.group_by.items[i] orelse continue;
-        const gb_c = c.lp_ast_to_sql(gb_node, lp_arena);
-        if (gb_c == null) return error.UnparseError;
-        const gb_sql = try allocator.dupe(u8, std.mem.span(gb_c));
-        try group_by_list.append(allocator, gb_sql);
-        try group_by_nodes.append(allocator, gb_node);
-    }
-
-    // 2. Validate each SELECT result column
-    i = 0;
-    while (i < @as(usize, @intCast(sel.result_columns.count))) : (i += 1) {
+    for (0..@intCast(sel.result_columns.count)) |i| {
         const rc = sel.result_columns.items[i] orelse continue;
-        const info = analyzeExpr(rc);
-        if (info.has_bare_col) {
-            // Result column contains a bare column. We must unparse the expression
-            // itself (not including the AS alias, which is at the result_column level).
-            const expr_node = rc.*.u.result_column.expr orelse continue;
+        if (!analyzeExpr(rc).has_bare_col) continue;
+        const expr_node = rc.*.u.result_column.expr orelse continue;
+        if (!try groupedExpr(allocator, sel, lp_arena, expr_node)) {
             const expr_c = c.lp_ast_to_sql(expr_node, lp_arena);
-            if (expr_c == null) return error.UnparseError;
-            const expr_sql = std.mem.span(expr_c);
-
-            // Check if this raw expression SQL exists in our group_by list (case-insensitively).
-            var found = false;
-            for (group_by_list.items, group_by_nodes.items) |gb, gb_node| {
-                if (sameColumnRef(expr_node, gb_node)) |same| {
-                    if (same) {
-                        found = true;
-                        break;
-                    }
-                    continue;
-                }
-                const a = stripQuotes(std.mem.trim(u8, expr_sql, " "));
-                const b = stripQuotes(std.mem.trim(u8, gb, " "));
-                if (std.ascii.eqlIgnoreCase(a, b)) {
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                std.debug.print("sql: result column '{s}' must be in the GROUP BY list\n", .{expr_sql});
-                return error.ColumnMustBeGrouped;
-            }
+            diagnosticPrint("sql: result column '{s}' must be in the GROUP BY list\n", .{std.mem.span(expr_c)});
+            return error.ColumnMustBeGrouped;
         }
     }
 }
@@ -777,19 +1208,99 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     try std.testing.expectEqualStrings("sum(x)", q_gb_mixed.select_cols[1].expr);
     try std.testing.expectEqualStrings("s", q_gb_mixed.select_cols[1].alias.?);
 
-    try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x"));
-    try std.testing.expectError(error.LimitNotSupported, parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5"));
+    const sorted = try parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x");
+    defer sorted.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), sorted.result_order.rows.len);
+    const limited = try parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5");
+    defer limited.deinit(a);
+    try std.testing.expectEqual(@as(?u64, 5), limited.result_order.limit);
     try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT x FROM 't'"));
-    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT sum(x) AS s FROM 't' HAVING sum(x) > 1"));
+    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT x FROM 't' HAVING x > 1"));
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't'"));
     try std.testing.expectError(error.UnsupportedStatement, parseSqlQuery(a, "SELECT x FROM 't' UNION SELECT x FROM 'u'"));
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't' GROUP BY z"));
 }
 
+test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" {
+    const a = std.testing.allocator;
+    const Key = ast.OrderKey;
+    const Case = struct { sql: []const u8, keys: []const Key, limit: ?u64 = null, offset: u64 = 0 };
+    const cases = [_]Case{
+        // By alias, DESC; by position; by the expression as written; a column of the same name loses to the alias.
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c DESC LIMIT 10", .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        .{ .sql = "SELECT y, count(*) FROM 't' GROUP BY y ORDER BY 2 DESC, 1", .keys = &.{ .{ .column = 1, .descending = true }, .{ .column = 0, .descending = false } } },
+        .{ .sql = "SELECT y, count(*) FROM 't' GROUP BY y ORDER BY count(*) DESC", .keys = &.{.{ .column = 1, .descending = true }} },
+        // Other letter case still names the one item it can.
+        .{ .sql = "SELECT y, COUNT(*) FROM 't' GROUP BY y ORDER BY count(*) DESC", .keys = &.{.{ .column = 1, .descending = true }} },
+        .{ .sql = "SELECT Y, sum(x) AS y FROM 't' GROUP BY Y ORDER BY y", .keys = &.{.{ .column = 1, .descending = false }} },
+        // A column reference matches as GROUP BY matches it: case and quoting aside.
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY \"Y\" ASC NULLS LAST", .keys = &.{.{ .column = 0, .descending = false }} },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c LIMIT 10 OFFSET 1000", .keys = &.{.{ .column = 1, .descending = false }}, .limit = 10, .offset = 1000 },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT 5", .keys = &.{}, .limit = 5 },
+        // One aggregate row: ordering it is a no-op, and a LIMIT may keep it.
+        .{ .sql = "SELECT count(*) AS c FROM 't' ORDER BY c LIMIT 1", .keys = &.{.{ .column = 0, .descending = false }}, .limit = 1 },
+    };
+    for (cases) |case| {
+        const q = try parseSqlQuery(a, case.sql);
+        defer q.deinit(a);
+        try std.testing.expectEqualSlices(Key, case.keys, q.result_order.keys);
+        try std.testing.expectEqual(case.limit, q.result_order.limit);
+        try std.testing.expectEqual(case.offset, q.result_order.offset);
+    }
+
+    const rejected = [_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY z", .err = error.ColumnMustBeGrouped },
+        .{ .sql = "SELECT count(*) AS c FROM 't' ORDER BY sum(x)", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 3", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 0", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c NULLS FIRST", .err = error.OrderByNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT -1", .err = error.LimitNotSupported },
+        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT c", .err = error.LimitNotSupported },
+    };
+    for (rejected) |case| try std.testing.expectError(case.err, parseSqlQuery(a, case.sql));
+}
+
+test "regression: sql_parser refuses a comparison that reads a column on its value side" {
+    const a = std.testing.allocator;
+    const refused = [_][]const u8{
+        "SELECT id FROM 't' WHERE s = t",
+        "SELECT id FROM 't' WHERE s = x",
+        "SELECT id FROM 't' WHERE s <> \"t\"",
+        "SELECT id FROM 't' WHERE s = -t",
+        "SELECT id FROM 't' WHERE s = upper(t)",
+        "SELECT id FROM 't' WHERE s IN (x, 'z')",
+        "SELECT id FROM 't' WHERE n BETWEEN 1 AND m",
+        "SELECT id FROM 't' WHERE s LIKE t",
+        "SELECT id FROM 't' WHERE NOT (s = t AND n > 1)",
+        "SELECT count(*) FILTER (WHERE s <> t) AS n FROM 't'",
+        "SELECT CASE WHEN s = t THEN 1 ELSE 0 END AS k FROM 't'",
+    };
+    for (refused) |sql| try std.testing.expectError(error.BadValue, parseSqlQuery(a, sql));
+    const kept = [_][]const u8{
+        "SELECT id FROM 't' WHERE s = 'x' AND n > -5 AND flag = true AND d IS NULL",
+        "SELECT id FROM 't' WHERE s IN ('x', 'y') AND n BETWEEN 1 AND 2 AND s LIKE 'a%'",
+    };
+    for (kept) |sql| {
+        var q = try parseSqlQuery(a, sql);
+        q.deinit(a);
+    }
+}
+
+test "regression: a HAVING literal operand is a value, not a SELECT position" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 1 BETWEEN 2 AND 3",
+        "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 1 IN (2, 3)",
+        "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 9 IS NULL",
+    }) |sql| try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, sql));
+    var q = try parseSqlQuery(a, "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING c BETWEEN 2 AND 3");
+    q.deinit(a);
+}
+
 test "sql_parser rejects unsupported aggregate shapes" {
     const a = std.testing.allocator;
-    // count(DISTINCT x) — distinct on the function node (was silently dropped).
-    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT count(DISTINCT x) AS c FROM 't'"));
+    // sum(DISTINCT x) — distinct on non-count functions is not supported.
+    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT sum(DISTINCT x) AS c FROM 't'"));
     // Bare column inside an aggregate column: `sum(a) + b` is implicit GROUP BY.
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT sum(a) + b AS x FROM 't'"));
     // Aggregate in WHERE is illegal.
@@ -798,6 +1309,14 @@ test "sql_parser rejects unsupported aggregate shapes" {
     try std.testing.expectError(error.MultipleStatements, parseSqlQuery(a, "SELECT x FROM 't'; SELECT y FROM 'u'"));
     // Subquery in WHERE.
     try std.testing.expectError(error.SubqueryNotSupported, parseSqlQuery(a, "SELECT x FROM 't' WHERE x IN (SELECT y FROM 'u')"));
+}
+
+test "sql_parser accepts count(DISTINCT x)" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT count(DISTINCT x) AS c FROM 't'");
+    defer q.deinit(a);
+    try std.testing.expect(q.is_aggregate);
+    try std.testing.expectEqualStrings("count(DISTINCT x) AS c", q.aggregate_str.?);
 }
 
 test "sql_parser aggregate select" {
@@ -858,7 +1377,7 @@ test "sql_parser: a grouped column may be spelled with or without quotes in SELE
         "SELECT \"k\", count(*) AS n FROM 't' GROUP BY K",
     }) |sql| {
         const q = parseSqlQuery(a, sql) catch |err| {
-            std.debug.print("{s}: {s}\n", .{ sql, @errorName(err) });
+            diagnosticPrint("{s}: {s}\n", .{ sql, @errorName(err) });
             return err;
         };
         q.deinit(a);
@@ -867,104 +1386,147 @@ test "sql_parser: a grouped column may be spelled with or without quotes in SELE
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, other));
 }
 
-test "sql_parser pushes NOT to the leaves so the flat filter grammar reads the predicate as written" {
-    // liteparser unparses `NOT (a AND b)` as `NOT a AND b`, which the grammar reads as `(NOT a) AND b`.
+test "sql_parser binds GROUP BY aliases and positions to SELECT items, as DuckDB does" {
     const a = std.testing.allocator;
-    const Case = struct { where: []const u8, filter: []const u8 };
+    const Case = struct { sql: []const u8, group_by: []const u8 };
     const cases = [_]Case{
-        .{ .where = "NOT (x > 5 AND y < 3)", .filter = "NOT x > 5 OR NOT y < 3" },
-        .{ .where = "NOT (x > 5 OR y < 3)", .filter = "NOT x > 5 AND NOT y < 3" },
-        .{ .where = "NOT NOT (x > 5 OR y < 3)", .filter = "x > 5 OR y < 3" },
-        .{ .where = "NOT NOT NOT x > 5", .filter = "NOT x > 5" },
-        .{ .where = "z = 1 AND NOT (x > 5 OR y < 3)", .filter = "z = 1 AND NOT x > 5 AND NOT y < 3" },
-        .{ .where = "NOT (x > 5 OR y < 3) AND z = 1", .filter = "NOT x > 5 AND NOT y < 3 AND z = 1" },
-        .{ .where = "NOT (x > 5 AND y < 3) OR z = 1", .filter = "NOT x > 5 OR NOT y < 3 OR z = 1" },
-        .{ .where = "z = 1 OR NOT (x > 5 AND y < 3)", .filter = "z = 1 OR NOT x > 5 OR NOT y < 3" },
-        // De Morgan into an OR of ANDs.
-        .{ .where = "NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))", .filter = "NOT x > 5 AND NOT y < 3 OR NOT z = 1 AND NOT x = 2" },
-        .{ .where = "NOT (x IN (1, 2) AND y = 1)", .filter = "NOT x IN (1, 2) OR NOT y = 1" },
-        .{ .where = "NOT (x NOT IN (1, 2) OR y = 1)", .filter = "x IN (1, 2) AND NOT y = 1" },
-        .{ .where = "NOT (x NOT BETWEEN 1 AND 3)", .filter = "x BETWEEN 1 AND 3" },
-        .{ .where = "x NOT BETWEEN 1 AND 3 OR y = 1", .filter = "NOT x BETWEEN 1 AND 3 OR y = 1" },
-        .{ .where = "NOT (x BETWEEN 1 AND 3 OR y = 1)", .filter = "NOT x BETWEEN 1 AND 3 AND NOT y = 1" },
-        .{ .where = "NOT (s LIKE 'a%' AND s NOT LIKE '%b')", .filter = "NOT s LIKE 'a%' OR s LIKE '%b'" },
-        .{ .where = "NOT (s IS NULL OR s IS NOT NULL)", .filter = "NOT s IS NULL AND NOT s IS NOT NULL" },
-        // Right-nested chains unparse with parentheses the grammar rejects; they are re-associated instead.
-        .{ .where = "x = 1 OR (y = 2 OR z = 3)", .filter = "x = 1 OR y = 2 OR z = 3" },
-        .{ .where = "x = 1 AND (y = 2 AND (z = 3 AND x = 4))", .filter = "x = 1 AND y = 2 AND z = 3 AND x = 4" },
-        .{ .where = "(x = 1 AND y = 2) OR z = 3", .filter = "x = 1 AND y = 2 OR z = 3" },
-        .{ .where = "x BETWEEN 1 AND 2 OR s = 'a or b'", .filter = "x BETWEEN 1 AND 2 OR s = 'a or b'" },
-        // Literal spellings the grammar reads back as the same value.
-        .{ .where = "x > -5 AND y < +2.5e3 AND z IN (-1, 2)", .filter = "x > -5 AND y < +2.5e3 AND z IN (-1, 2)" },
-        .{ .where = "x BETWEEN -1.5 AND 1e2 OR s = ''", .filter = "x BETWEEN -1.5 AND 1e2 OR s = ''" },
-        .{ .where = "d >= '2020-06-01' AND s IS NOT NULL", .filter = "d >= '2020-06-01' AND s IS NOT NULL" },
+        .{ .sql = "SELECT 1, URL, count(*) AS c FROM 't' GROUP BY 1, URL", .group_by = "1, URL" },
+        // An alias binds in the engine, where a column of its name wins.
+        .{ .sql = "SELECT URL AS Dst, count(*) AS c FROM 't' GROUP BY Dst", .group_by = "Dst" },
+        .{ .sql = "SELECT a + 1 AS k, count(*) FROM 't' GROUP BY 1", .group_by = "a + 1" },
+        .{ .sql = "SELECT a - 1, count(*) FROM 't' GROUP BY a - 1", .group_by = "a - 1" },
     };
     for (cases) |case| {
-        errdefer std.debug.print("WHERE {s}\n", .{case.where});
-        const sql = try std.fmt.allocPrint(a, "SELECT count(*) AS c FROM 't' WHERE {s}", .{case.where});
-        defer a.free(sql);
-        const q = try parseSqlQuery(a, sql);
+        const q = try parseSqlQuery(a, case.sql);
+        defer q.deinit(a);
+        try std.testing.expectEqualStrings(case.group_by, q.group_by_str.?);
+        for (q.select_cols) |col| try std.testing.expect(col.role != .named);
+    }
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 3"));
+    try std.testing.expectError(error.AggregateInGroupBy, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 2"));
+}
+
+test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result columns" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k FROM 't' GROUP BY k, g ORDER BY count(*) DESC, g, k LIMIT 3");
+    defer q.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.hidden.len);
+    try std.testing.expectEqualStrings("count(*)", q.result_order.hidden[0].expr);
+    try std.testing.expectEqual(ast.SelectColumn.Role.agg, q.result_order.hidden[0].role);
+    try std.testing.expectEqual(ast.SelectColumn.Role.key, q.result_order.hidden[1].role);
+    try std.testing.expectEqualSlices(ast.OrderKey, &.{
+        .{ .column = 1, .descending = true },
+        .{ .column = 2, .descending = false },
+        .{ .column = 0, .descending = false },
+    }, q.result_order.keys);
+    // The hidden aggregate is a call of its own, after the SELECT list's.
+    try std.testing.expectEqualStrings("count(*) AS " ++ hidden_alias ++ "0", q.aggregate_str.?);
+
+    // A term written twice is one hidden column and one call.
+    const twice = try parseSqlQuery(a, "SELECT b FROM 't' GROUP BY b ORDER BY count(*) DESC, count(*) ASC");
+    defer twice.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), twice.result_order.hidden.len);
+    try std.testing.expectEqualSlices(ast.OrderKey, &.{
+        .{ .column = 1, .descending = true },
+        .{ .column = 1, .descending = false },
+    }, twice.result_order.keys);
+    try std.testing.expectEqualStrings("count(*) AS " ++ hidden_alias ++ "0", twice.aggregate_str.?);
+}
+
+test "sql_parser hands NOT over groups on as the predicate written" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, filter: []const u8 };
+    const cases = [_]Case{
+        .{ .sql = "SELECT x FROM 't' WHERE NOT (a = 1 AND b = 2)", .filter = "NOT a = 1 OR NOT b = 2" },
+        .{ .sql = "SELECT x FROM 't' WHERE NOT ((a = 1 OR b = 2) AND c = 3)", .filter = "NOT a = 1 AND NOT b = 2 OR NOT c = 3" },
+        .{ .sql = "SELECT x FROM 't' WHERE NOT NOT (a = 1 OR b = 2) AND c = 3", .filter = "(a = 1 OR b = 2) AND c = 3" },
+        .{ .sql = "SELECT x FROM 't' WHERE (a = 1 OR b = 2) AND NOT c IN (1, 2)", .filter = "(a = 1 OR b = 2) AND NOT c IN (1, 2)" },
+    };
+    for (cases) |case| {
+        const q = try parseSqlQuery(a, case.sql);
         defer q.deinit(a);
         try std.testing.expectEqualStrings(case.filter, q.filter_str.?);
     }
-    // An aggregate FILTER body reaches the same grammar as text.
-    const q = try parseSqlQuery(a, "SELECT count(*) FILTER (WHERE NOT (x > 5 AND y < 3)) AS c FROM 't'");
-    defer q.deinit(a);
-    try std.testing.expectEqualStrings("count(*) FILTER (WHERE NOT x > 5 OR NOT y < 3) AS c", q.aggregate_str.?);
 }
 
-test "sql_parser refuses predicates the flat filter grammar cannot hold as written" {
+test "sql_parser lowers HAVING to result columns, hidden terms and literals" {
     const a = std.testing.allocator;
-    const Case = struct { where: []const u8, err: anyerror };
-    const g = error.GroupingNotSupported;
-    const u = error.UnsupportedPredicate;
-    const cases = [_]Case{
-        .{ .where = "NOT ((x > 5 AND y < 3) OR z = 1)", .err = g }, // (NOT x > 5 OR NOT y < 3) AND NOT z = 1
-        .{ .where = "x = 1 AND (y = 2 OR z = 3)", .err = g },
-        .{ .where = "(x = 1 OR y = 2) AND z = 3", .err = g },
-        .{ .where = "NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5", .err = g },
-        .{ .where = "NOT (x = 1 AND y = 2) AND z = 3", .err = g },
-        // Literals and names the grammar's raw-substring splitting would cut.
-        .{ .where = "s = 'a OR b = 1'", .err = u },
-        .{ .where = "s = 'rock AND roll'", .err = u },
-        .{ .where = "s = 'x BETWEEN y'", .err = u },
-        .{ .where = "s = 'O''Brien'", .err = u },
-        .{ .where = "s IN ('a,b', 'c')", .err = u },
-        .{ .where = "\"a OR b\" = 1", .err = u },
-        .{ .where = "s LIKE 'a#%' ESCAPE '#'", .err = u },
-        // Values the grammar would read as something else: NULL as the string `NULL`, the rest as bare strings.
-        .{ .where = "s NOT IN ('a', NULL)", .err = u },
-        .{ .where = "NOT (s IN ('a', NULL))", .err = u },
-        .{ .where = "s IN (NULL)", .err = u },
-        .{ .where = "s != NULL", .err = u },
-        .{ .where = "s > NULL", .err = u },
-        .{ .where = "s LIKE NULL", .err = u },
-        .{ .where = "x BETWEEN NULL AND 5", .err = u },
-        .{ .where = "s IS 'a'", .err = u },
-        .{ .where = "b = TRUE", .err = u },
-        .{ .where = "s = t", .err = u },
-        .{ .where = "s = \"t\"", .err = u },
-        .{ .where = "s = 'a' || 'b'", .err = u },
-        .{ .where = "s = 'a' COLLATE NOCASE", .err = u },
-        .{ .where = "s = upper('a')", .err = u },
-        .{ .where = "s = CAST('a' AS TEXT)", .err = u },
-        .{ .where = "s = x'61'", .err = u },
-        .{ .where = "x > 2 + 3", .err = u },
-        .{ .where = "x > - -5", .err = u },
-        .{ .where = "5 < x", .err = u },
-        .{ .where = "x + 1 > 5", .err = u },
-        .{ .where = "s GLOB 'a*'", .err = u },
-    };
-    for (cases) |case| {
-        errdefer std.debug.print("WHERE {s}\n", .{case.where});
-        const sql = try std.fmt.allocPrint(a, "SELECT count(*) AS c FROM 't' WHERE {s}", .{case.where});
-        defer a.free(sql);
-        try std.testing.expectError(case.err, parseSqlQuery(a, sql));
-    }
-    try std.testing.expectError(error.GroupingNotSupported, parseSqlQuery(a,
-        \\SELECT count(*) FILTER (WHERE NOT ((x > 5 AND y < 3) OR z = 1)) AS c FROM 't'
-    ));
-    try std.testing.expectError(error.UnsupportedPredicate, parseSqlQuery(a,
-        \\SELECT count(*) FILTER (WHERE s NOT IN ('a', NULL)) AS c FROM 't'
-    ));
+    const q = try parseSqlQuery(a, "SELECT k, count(*) AS c FROM 't' GROUP BY k HAVING c > 100000 AND NOT (sum(x) BETWEEN -1 AND 2.5 OR k IS NULL) ORDER BY sum(x)");
+    defer q.deinit(a);
+    const h = q.result_order.having.?.*;
+    // NOT (range OR null) pushes down to (outside the range AND not null), which joins the top chain.
+    try std.testing.expectEqual(@as(usize, 3), h.all.len);
+    try std.testing.expectEqual(@as(usize, 1), h.all[0].cmp.column);
+    try std.testing.expectEqual(ast.CmpOp.gt, h.all[0].cmp.op);
+    try std.testing.expectEqualStrings("100000", h.all[0].cmp.literal.number);
+    // The hidden sum(x) is shared with ORDER BY.
+    try std.testing.expectEqual(ast.CmpOp.lt, h.all[1].any[0].cmp.op);
+    try std.testing.expectEqualStrings("-1", h.all[1].any[0].cmp.literal.number);
+    try std.testing.expectEqual(@as(usize, 2), h.all[1].any[0].cmp.column);
+    try std.testing.expect(h.all[2].null_check.is_not);
+    try std.testing.expectEqual(@as(usize, 1), q.result_order.hidden.len);
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.keys[0].column);
+
+    // Without GROUP BY a HAVING aggregate may be hidden; a literal on the left flips.
+    const g = try parseSqlQuery(a, "SELECT count(*) FROM 't' HAVING 5 < sum(x)");
+    defer g.deinit(a);
+    try std.testing.expectEqual(ast.CmpOp.gt, g.result_order.having.?.cmp.op);
+    try std.testing.expectEqual(@as(usize, 1), g.result_order.having.?.cmp.column);
+    try std.testing.expectEqualStrings("count(*), sum(x) AS " ++ hidden_alias ++ "0", g.aggregate_str.?);
+
+    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING count(*) > sum(x)"));
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING z > 1"));
+}
+
+test "sql_parser reads unquoted true and false as boolean literals" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT x FROM 't' WHERE flag = true AND NOT b = False AND \"true\" = 1");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("flag = TRUE AND NOT b = FALSE AND \"true\" = 1", q.filter_str.?);
+}
+
+test "sql_parser binds ORDER BY over plain rows to row expressions" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT SearchPhrase AS p FROM 't' WHERE SearchPhrase <> '' ORDER BY EventTime, p DESC, 1 LIMIT 10 OFFSET 2");
+    defer q.deinit(a);
+    const rows = q.result_order.rows;
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings("EventTime", rows[0].expr);
+    try std.testing.expectEqualStrings("SearchPhrase", rows[1].expr);
+    try std.testing.expect(rows[1].descending);
+    try std.testing.expectEqualStrings("SearchPhrase", rows[2].expr);
+    try std.testing.expectEqual(@as(?u64, 10), q.result_order.limit);
+    try std.testing.expectEqual(@as(u64, 2), q.result_order.offset);
+    // Without a LIMIT every row is sorted; an expression of the row is a key, an aggregate is not.
+    const all = try parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x + 1, strlen(s) DESC");
+    defer all.deinit(a);
+    try std.testing.expectEqualStrings("x + 1", all.result_order.rows[0].expr);
+    try std.testing.expectEqual(@as(?u64, null), all.result_order.limit);
+    try std.testing.expectError(error.OrderByNotSupported, parseSqlQuery(a, "SELECT x FROM 't' ORDER BY count(*) LIMIT 3"));
+}
+
+test "regression: a quoted alias names its text, a doubled quote one quote" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k AS \"a\"\"b\", count(*) AS \"n m\", sum(x) AS s FROM 't' GROUP BY k");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("a\"b", q.select_cols[0].alias.?);
+    try std.testing.expectEqualStrings("n m", q.select_cols[1].alias.?);
+    try std.testing.expectEqualStrings("s", q.select_cols[2].alias.?);
+}
+
+test "sql_parser reads EXTRACT(part FROM x) as date_part('part', x), quoted text left alone" {
+    const a = std.testing.allocator;
+    const got = try extractAsDatePart(a, "SELECT extract(minute FROM epoch_ms(t)) AS m, 'extract(x FROM y)', " ++
+        "\"extract\" FROM f WHERE EXTRACT ( year\nfrom d) = 2013");
+    defer a.free(got);
+    try std.testing.expectEqualStrings("SELECT date_part('minute', epoch_ms(t)) AS m, 'extract(x FROM y)', " ++
+        "\"extract\" FROM f WHERE date_part('year', d) = 2013", got);
+    const quoted = try extractAsDatePart(a, "SELECT EXTRACT('year' FROM d), extract(\"month\" from d), " ++
+        "extract('' FROM d)");
+    defer a.free(quoted);
+    try std.testing.expectEqualStrings("SELECT date_part('year', d), date_part('month', d), " ++
+        "extract('' FROM d)", quoted);
+    const q = try parseSqlQuery(a, "SELECT extract(minute FROM t) AS m, count(*) FROM f GROUP BY m");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("date_part('minute', t)", q.select_cols[0].expr);
 }

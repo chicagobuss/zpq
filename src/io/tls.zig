@@ -11,11 +11,17 @@
 //!
 //! Keeping TLS as a memory-BIO state machine lets the I/O scheduler
 //! change without changing the TLS logic.
+//!
+//! Every network wait has a deadline (`Timeouts`): connecting and the TLS handshake each as a whole, the first byte
+//! of a response after the request went out, and silence while reading or sending. The last two are idle timeouts,
+//! reset by every byte that moves, so a slow transfer that keeps moving is never cut off. A stalled peer that keeps
+//! its connection open would otherwise block a read forever (and with it the whole query).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const boring = @import("boring_tls");
+const clock = @import("../clock.zig");
 
 pub const Error = error{
     DnsFailed,
@@ -33,7 +39,87 @@ pub const Error = error{
     /// was is for the protocol above to judge.
     UncleanClose,
     Closed,
+    /// No TCP connection within `Timeouts.connect_ms`.
+    ConnectTimeout,
+    /// The TLS handshake did not complete within `Timeouts.handshake_ms`.
+    HandshakeTimeout,
+    /// No byte of a response within `Timeouts.first_byte_ms` of sending the request.
+    FirstByteTimeout,
+    /// No further byte of a response for `Timeouts.idle_ms`.
+    ReadTimeout,
+    /// The peer took no byte of what was being sent for `Timeouts.idle_ms`.
+    SendTimeout,
+    /// A request and its response took longer in all than `Timeouts.request_ms`, or than their bytes at
+    /// `Timeouts.min_rate` (`Connection.armDeadline`): a peer trickling a byte inside every idle timeout.
+    RequestTimeout,
+    /// A test clock's wait hit the wall-clock backstop instead of the virtual deadline. Production never returns it.
+    WallClockBackstop,
 } || std.mem.Allocator.Error;
+
+/// How long a connection waits on the network. The defaults, and the environment variables that override them (in
+/// milliseconds, read by `fromEnv`):
+///
+///   connect_ms     5 000   ZPQ_S3_CONNECT_TIMEOUT_MS      TCP connect, per address tried
+///   handshake_ms   5 000   ZPQ_S3_HANDSHAKE_TIMEOUT_MS    the whole TLS handshake
+///   first_byte_ms 10 000   ZPQ_S3_FIRST_BYTE_TIMEOUT_MS   from the request sent to the first byte of its response
+///   idle_ms       10 000   ZPQ_S3_IDLE_TIMEOUT_MS         silence while reading a response or sending a request
+///   request_ms    30 000   ZPQ_S3_REQUEST_TIMEOUT_MS      a request and its response in all, at least; more for a
+///                                                         transfer of more than `request_ms` at `min_rate`
+///   min_rate      64 KiB/s ZPQ_S3_MIN_RATE_KIBS (KiB/s)   the slowest transfer let run; 0 bounds none by size
+///   complete_ms  900 000   ZPQ_S3_COMPLETE_TIMEOUT_MS     CompleteMultipartUpload in all, in place of the above
+///
+/// S3 answers its first byte in tens of milliseconds and moves 8 MiB in about 0.1 s even under Lambda's network
+/// policer, so ten seconds without a byte is a stalled connection, not a slow one; each extra second waited is billed
+/// on Lambda. A timeout fails the attempt; the request layer retries it on a new connection (`retry.classify`).
+pub const Timeouts = struct {
+    connect_ms: u32 = 5_000,
+    handshake_ms: u32 = 5_000,
+    first_byte_ms: u32 = 10_000,
+    idle_ms: u32 = 10_000,
+    request_ms: u32 = 30_000,
+    /// Bytes a second below which a long transfer is cut off: the idle timeout restarts at every byte. 0: no bound
+    /// by size, only the idle timeout, for a link slower than any floor.
+    min_rate: u32 = 64 * 1024,
+    /// CompleteMultipartUpload's whole deadline. S3 may take minutes over a large object, keeping the connection
+    /// alive with whitespace, which resets the idle timeout.
+    complete_ms: u32 = 15 * 60_000,
+    /// Test-only. When set, read and write deadlines use this millisecond clock instead of wall time, and waits
+    /// poll so a test can expire a stalled attempt by advancing the clock. Production leaves it null.
+    clock_ms: ?*const fn () u64 = null,
+
+    /// The defaults, each overridden by its environment variable when that holds a positive integer.
+    pub fn fromEnv(env: std.process.Environ) Timeouts {
+        var t: Timeouts = .{};
+        inline for (.{
+            .{ "connect_ms", "ZPQ_S3_CONNECT_TIMEOUT_MS" },
+            .{ "handshake_ms", "ZPQ_S3_HANDSHAKE_TIMEOUT_MS" },
+            .{ "first_byte_ms", "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS" },
+            .{ "idle_ms", "ZPQ_S3_IDLE_TIMEOUT_MS" },
+            .{ "request_ms", "ZPQ_S3_REQUEST_TIMEOUT_MS" },
+            .{ "complete_ms", "ZPQ_S3_COMPLETE_TIMEOUT_MS" },
+        }) |f| {
+            if (env.getPosix(f[1])) |v| {
+                const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 0;
+                if (n > 0) @field(t, f[0]) = n;
+            }
+        }
+        // KiB a second; 0 is a value here, not unset.
+        if (env.getPosix("ZPQ_S3_MIN_RATE_KIBS")) |v| {
+            if (std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10)) |kib| t.min_rate = kib *| 1024 else |_| {}
+        }
+        return t;
+    }
+};
+
+/// The last moment (`monoMs`) any request may run to, 0 for none: the Lambda sets it a second before its invocation's
+/// deadline, so a query still waiting on S3 then fails, cleans up and says why before the sandbox is stopped. One
+/// invocation runs at a time there; libzpq and the CLI never set it.
+pub var invocation_deadline_ms: std.atomic.Value(u64) = .init(0);
+
+/// Set `invocation_deadline_ms` `ms` from now, or clear it with null.
+pub fn setInvocationDeadline(ms: ?u64) void {
+    invocation_deadline_ms.store(if (ms) |m| monoMs() +| @max(1, m) else 0, .monotonic);
+}
 
 pub const ClientContext = boring.tls_client.ClientContext;
 
@@ -41,12 +127,17 @@ pub const ClientContext = boring.tls_client.ClientContext;
 pub const Ipv4 = [4]u8;
 
 /// Where to connect: a host's IPv4 addresses, tried from `first` on (wrapping) until one accepts the TCP connection.
-/// A refused or unreachable address only costs a failed connect, which is the whole of the fallback: there is no
-/// racing and no timeout of our own.
+/// A refused, unreachable or silent address (`Timeouts.connect_ms`) only costs a failed connect, which is the whole
+/// of the fallback: there is no racing. `deadline_ms`, when set, is one absolute bound over every address and over
+/// both TLS contexts; each stage then waits only `min(its cap, the time left)`.
 pub const Peer = struct {
     addrs: []const Ipv4,
     first: usize = 0,
     port: u16,
+    /// The connection's deadlines, from connecting on.
+    timeouts: Timeouts = .{},
+    /// Absolute millisecond deadline (`monoMs`) for this whole connect. Null: each stage uses only its own cap.
+    deadline_ms: ?u64 = null,
 
     pub fn loopback(port: u16) Peer {
         return .{ .addrs = &.{.{ 127, 0, 0, 1 }}, .port = port };
@@ -117,6 +208,13 @@ pub const Connection = struct {
     /// the next recv() call. processIncoming() clears its internal
     /// buffer on each invocation, so we must own this carry-over.
     pending: std.ArrayList(u8) = .empty,
+    timeouts: Timeouts = .{},
+    /// A request has gone out and no byte of its response has come back: a read waits `first_byte_ms`, not `idle_ms`.
+    awaiting_response: bool = false,
+    /// When the request being sent or answered must be done (`armDeadline`); null between requests.
+    deadline_ms: ?u64 = null,
+    /// The socket's SO_RCVTIMEO and SO_SNDTIMEO as last set, so each is only set again when it changes.
+    sock: SockTimeouts = .{},
 
     /// Open a TCP connection, perform a TLS handshake, return the
     /// connected client. Caller eventually calls deinit().
@@ -145,7 +243,8 @@ pub const Connection = struct {
     }
 
     /// Verify against `preferred`'s context first; a certificate it rejects gets a new connection verified against
-    /// `fallback`, which a certificate both reject fails as usual. `fallback` is only built if it is needed.
+    /// `fallback`, which a certificate both reject fails as usual. `fallback` is only built if it is needed. Both
+    /// attempts share `peer.deadline_ms`, so a fallback does not start its own second.
     fn connectPreferring(
         allocator: std.mem.Allocator,
         preferred: ?*Preference,
@@ -181,39 +280,121 @@ pub const Connection = struct {
         var tls = boring.tls_client.TlsClient.init(allocator, context, serverName(host)) catch |err|
             return handshakeError(err);
         errdefer tls.deinit();
-        handshake(fd, &tls) catch |err| {
+        var opts: SockTimeouts = .{};
+        const budget = stageBudget(peer.timeouts.handshake_ms, peer.deadline_ms, peer.timeouts.clock_ms);
+        if (peer.deadline_ms != null and budget == 0) return error.HandshakeTimeout;
+        handshake(fd, &tls, budget, &opts) catch |err| {
             if (log_rejection and err == error.CertificateRejected) {
                 const reason = boring.tls.c.X509_verify_cert_error_string(boring.tls.c.SSL_get_verify_result(tls.ssl));
                 std.log.warn("TLS: certificate of {s} rejected: {s}", .{ serverName(host), std.mem.span(reason) });
             }
             return err;
         };
-        return .{ .fd = fd, .tls = tls, .allocator = allocator };
+        return .{
+            .fd = fd,
+            .tls = tls,
+            .allocator = allocator,
+            .timeouts = peer.timeouts,
+            .sock = opts,
+        };
     }
 
-    /// Drive the handshake to completion. Each iteration:
+    /// Drive the handshake to completion, within `budget_ms` in all. Each iteration:
     ///   1. ask the TLS client for outgoing bytes (ClientHello / Finished / ...)
     ///   2. write them to the socket
     ///   3. read from the socket, feed back into TLS
     /// Stop when the client reports handshake complete.
-    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient) Error!void {
+    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient, budget_ms: u32, opts: *SockTimeouts) Error!void {
+        // One deadline for the whole stage: every read and write gets only what is left of it.
+        const deadline = monoMs() + budget_ms;
         const initial = tls.startHandshake() catch |err| return handshakeError(err);
-        if (initial.encrypted) |bytes| try writeAll(fd, bytes);
+        if (initial.encrypted) |bytes|
+            writeAllBy(fd, bytes, budget_ms, deadline, opts) catch |err| return handshakeIo(err);
 
         var rx_buf: [16 * 1024]u8 = undefined;
         while (!tls.isHandshakeComplete()) {
-            const n = readSome(fd, &rx_buf) catch return error.HandshakeFailed;
+            const n = readBy(fd, &rx_buf, deadline, opts) catch |err| return if (err == error.WouldBlock)
+                error.HandshakeTimeout
+            else
+                error.HandshakeFailed;
             if (n == 0) return error.HandshakeFailed;
             _ = tls.processIncoming(rx_buf[0..n], null) catch |err| return handshakeError(err);
             // After feeding bytes in, drain any outgoing handshake data.
             const out = tls.processOutgoing(null) catch |err| return handshakeError(err);
-            if (out.encrypted) |bytes| try writeAll(fd, bytes);
+            if (out.encrypted) |bytes|
+                writeAllBy(fd, bytes, budget_ms, deadline, opts) catch |err| return handshakeIo(err);
         }
+    }
+
+    fn handshakeIo(err: WriteError) Error {
+        return if (err == error.WouldBlock) error.HandshakeTimeout else error.SendFailed;
     }
 
     pub fn connectPlain(allocator: std.mem.Allocator, peer: Peer) Error!Connection {
         const fd = try openTcpAny(peer);
-        return .{ .fd = fd, .tls = undefined, .allocator = allocator, .plain = true };
+        return .{ .fd = fd, .tls = undefined, .allocator = allocator, .plain = true, .timeouts = peer.timeouts };
+    }
+
+    /// Use `t` from the next request on: a pooled connection takes the timeouts of the query that reuses it. The
+    /// socket options follow at the next read or write.
+    pub fn setTimeouts(self: *Connection, t: Timeouts) void {
+        self.timeouts = t;
+    }
+
+    /// Bound the request about to be sent, and its response, which together move about `bytes`: they must be done
+    /// within `request_ms`, or the time `bytes` take at `min_rate` if longer. Every other timeout restarts at each
+    /// byte, so a peer trickling one inside each could hold an attempt for ever. Until `disarmDeadline`.
+    pub fn armDeadline(self: *Connection, bytes: usize, total_ms: ?u32) void {
+        const at_rate = if (self.timeouts.min_rate == 0)
+            std.math.maxInt(u64)
+        else
+            (std.math.mul(u64, bytes, std.time.ms_per_s) catch std.math.maxInt(u64)) / self.timeouts.min_rate;
+        const total: u64 = if (total_ms) |t| t else @max(self.timeouts.request_ms, at_rate);
+        var at = nowMs(self.timeouts.clock_ms) +| total;
+        const last = invocation_deadline_ms.load(.monotonic);
+        if (last != 0 and self.timeouts.clock_ms == null) at = @min(at, last);
+        self.deadline_ms = at;
+    }
+
+    pub fn disarmDeadline(self: *Connection) void {
+        self.deadline_ms = null;
+    }
+
+    fn pastDeadline(self: *const Connection) bool {
+        const d = self.deadline_ms orelse return false;
+        return nowMs(self.sock.clock_ms) >= d;
+    }
+
+    /// Read from the socket, waiting at most `first_byte_ms` for a response's first byte, else `idle_ms`, and never
+    /// past `deadline_ms`.
+    fn readSocket(self: *Connection, buf: []u8) Error!usize {
+        self.sock.clock_ms = self.timeouts.clock_ms;
+        if (self.pastDeadline()) return error.RequestTimeout;
+        const wait = if (self.awaiting_response) self.timeouts.first_byte_ms else self.timeouts.idle_ms;
+        var until = nowMs(self.sock.clock_ms) + wait;
+        if (self.deadline_ms) |d| until = @min(until, d);
+        const n = readBy(self.fd, buf, until, &self.sock) catch |err| {
+            if (err == error.WouldBlock and self.pastDeadline()) return error.RequestTimeout;
+            return self.recvError(err);
+        };
+        if (n > 0) self.awaiting_response = false;
+        return n;
+    }
+
+    /// Write all of `buf`, failing with `error.SendTimeout` once `idle_ms` pass with no byte taken, and never past
+    /// `deadline_ms`.
+    fn writeSocket(self: *Connection, buf: []const u8) Error!void {
+        self.sock.clock_ms = self.timeouts.clock_ms;
+        if (self.pastDeadline()) return error.RequestTimeout;
+        writeAllBy(self.fd, buf, self.timeouts.idle_ms, self.deadline_ms, &self.sock) catch |err| {
+            if (err == error.WouldBlock and self.pastDeadline()) return error.RequestTimeout;
+            return sendError(err);
+        };
+    }
+
+    /// A socket read that timed out, named for what it was waiting for.
+    fn readTimeout(self: *const Connection) Error {
+        return if (self.awaiting_response) error.FirstByteTimeout else error.ReadTimeout;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -231,14 +412,17 @@ pub const Connection = struct {
     /// case `consumed == 0` doesn't mean failure — it means "drain the
     /// encrypted bytes to the socket, then I can encrypt more." Only fail
     /// when neither side makes progress.
+    ///
+    /// Sending is what a request does, so afterwards the next read waits for the first byte of its response.
     pub fn send(self: *Connection, plaintext: []const u8) Error!void {
-        if (self.plain) return writeAll(self.fd, plaintext);
+        self.awaiting_response = true;
+        if (self.plain) return self.writeSocket(plaintext);
 
         var off: usize = 0;
         while (off < plaintext.len) {
             const out = self.tls.processOutgoing(plaintext[off..]) catch return error.SendFailed;
             const drained = if (out.encrypted) |bytes| bytes.len else 0;
-            if (drained > 0) try writeAll(self.fd, out.encrypted.?);
+            if (drained > 0) try self.writeSocket(out.encrypted.?);
             if (out.consumed == 0 and drained == 0) return error.SendFailed;
             off += out.consumed;
         }
@@ -248,7 +432,7 @@ pub const Connection = struct {
     /// close_notify; the TCP stream ending without one is `error.UncleanClose`, and data that does not decrypt is
     /// `error.RecvFailed`.
     pub fn recv(self: *Connection, dest: []u8) Error!usize {
-        if (self.plain) return readSome(self.fd, dest) catch |err| return recvError(err);
+        if (self.plain) return self.readSocket(dest);
 
         // Drain anything we previously buffered.
         if (self.pending.items.len > 0) {
@@ -272,11 +456,20 @@ pub const Connection = struct {
                     return self.consumePending(dest);
                 }
             }
-            // No plaintext yet (mid-record); read more.
-            const n = readSome(self.fd, &rx_buf) catch |err| return recvError(err);
+            // No plaintext yet (mid-record); read more. Any byte is progress: the idle timeout applies from here.
+            const n = try self.readSocket(&rx_buf);
             if (n == 0) return error.UncleanClose;
             input = rx_buf[0..n];
         }
+    }
+
+    fn recvError(self: *const Connection, err: ReadError) Error {
+        return switch (err) {
+            error.ConnectionReset => error.ConnectionReset,
+            error.ReadFailed => error.RecvFailed,
+            error.WouldBlock => self.readTimeout(),
+            error.Backstop => error.WallClockBackstop,
+        };
     }
 
     fn consumePending(self: *Connection, dest: []u8) usize {
@@ -308,9 +501,11 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     if (peer.addrs.len == 0) return error.DnsFailed;
     var last: Error = error.ConnectFailed;
     for (0..peer.addrs.len) |k| {
+        const wait = stageBudget(peer.timeouts.connect_ms, peer.deadline_ms, peer.timeouts.clock_ms);
+        if (peer.deadline_ms != null and wait == 0) return if (last == error.ConnectFailed) error.ConnectTimeout else last;
         const addr = peer.addrs[(peer.first +% k) % peer.addrs.len];
-        return openTcp(addr, peer.port) catch |err| switch (err) {
-            error.ConnectFailed => {
+        return openTcp(addr, peer.port, wait, peer.timeouts.clock_ms, peer.deadline_ms) catch |err| switch (err) {
+            error.ConnectFailed, error.ConnectTimeout => {
                 last = err;
                 continue;
             },
@@ -320,7 +515,21 @@ fn openTcpAny(peer: Peer) Error!posix.fd_t {
     return last;
 }
 
-fn openTcp(ip: Ipv4, port: u16) Error!posix.fd_t {
+const send_flags: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+
+/// One write to a socket that cannot raise SIGPIPE: MSG_NOSIGNAL, or SO_NOSIGPIPE set at `openTcp` where there is no
+/// such flag. A peer that reset the connection is `SendFailed`, whatever SIGPIPE disposition the process has: a
+/// libzpq host keeps its own, and one context closing (`std.Io.Threaded` restores the disposition it saved) cannot
+/// leave another's writes to kill the host.
+fn sendNoSignal(fd: posix.fd_t, buf: []const u8) @TypeOf(posix.system.sendto(fd, buf.ptr, buf.len, 0, null, 0)) {
+    return posix.system.sendto(fd, buf.ptr, buf.len, send_flags, null, 0);
+}
+
+/// A connected TCP socket to `ip:port`, in blocking mode, or `error.ConnectTimeout` when the connection is not
+/// established within `timeout_ms`. The connect itself runs non-blocking under `poll`, which bounds it the same way
+/// on Linux and Darwin (Darwin's connect ignores SO_SNDTIMEO). `clock_ms`, when set, is the deadline clock: the
+/// wait polls briefly and gives up when that clock passes, and a wall-clock backstop is a different failure.
+fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, deadline_ms: ?u64) Error!posix.fd_t {
     // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after instead.
     const cloexec_flag = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
     const r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec_flag, posix.IPPROTO.TCP);
@@ -328,6 +537,11 @@ fn openTcp(ip: Ipv4, port: u16) Error!posix.fd_t {
     const fd: posix.fd_t = @intCast(r);
     errdefer closeFd(fd);
     if (builtin.os.tag != .linux) _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    // Darwin has no MSG_NOSIGNAL: the socket itself is told not to raise SIGPIPE (see `sendNoSignal`).
+    if (@hasDecl(posix.SO, "NOSIGPIPE")) {
+        const one: c_int = 1;
+        _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    }
 
     // `posix.sockaddr.in` carries Darwin's leading `len` byte and defaults `family`.
     const addr: posix.sockaddr.in = .{
@@ -335,28 +549,265 @@ fn openTcp(ip: Ipv4, port: u16) Error!posix.fd_t {
         .addr = @bitCast(ip),
     };
 
+    const flags = posix.system.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+    if (posix.errno(flags) != .SUCCESS) return error.SocketFailed;
+    const nonblock: c_int = @intCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    const blocking: c_int = @intCast(flags);
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, blocking | nonblock)) != .SUCCESS) return error.SocketFailed;
+
     const cr = posix.system.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-    if (posix.errno(cr) != .SUCCESS) return error.ConnectFailed;
+    switch (posix.errno(cr)) {
+        .SUCCESS => {},
+        .INPROGRESS, .INTR => {
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            if (clock_ms) |clk| {
+                // The batch deadline, not a fresh timeout: a clock step between the budget and this wait
+                // still stops at the same instant as the other addresses.
+                const virtual_deadline = deadline_ms orelse clk() + timeout_ms;
+                const real_start = monoMs();
+                while (true) {
+                    if (clk() >= virtual_deadline) {
+                        noteDeadline(.virtual, real_start);
+                        return error.ConnectTimeout;
+                    }
+                    // A hang backstop, distinct from the virtual deadline, so a stalled test cannot pass by it.
+                    if (monoMs() - real_start > 120_000) {
+                        noteDeadline(.backstop, real_start);
+                        return error.ConnectTimeout;
+                    }
+                    const pr = posix.system.poll(&pfd, 1, 20);
+                    switch (posix.errno(pr)) {
+                        .SUCCESS => if (pr > 0) break else continue,
+                        .INTR => continue,
+                        else => return error.ConnectFailed,
+                    }
+                }
+            } else {
+                const deadline = monoMs() + timeout_ms;
+                while (true) {
+                    const now = monoMs();
+                    if (now >= deadline) return error.ConnectTimeout;
+                    const pr = posix.system.poll(&pfd, 1, @intCast(@min(deadline - now, std.math.maxInt(i32))));
+                    switch (posix.errno(pr)) {
+                        .SUCCESS => if (pr > 0) break else return error.ConnectTimeout,
+                        .INTR => continue,
+                        else => return error.ConnectFailed,
+                    }
+                }
+            }
+            var so_err: c_int = 0;
+            var len: posix.socklen_t = @sizeOf(c_int);
+            const gr = posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &len);
+            if (posix.errno(gr) != .SUCCESS or so_err != 0) return error.ConnectFailed;
+        },
+        else => return error.ConnectFailed,
+    }
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, blocking)) != .SUCCESS) return error.SocketFailed;
     return fd;
+}
+
+/// A socket's SO_RCVTIMEO and SO_SNDTIMEO as last set, ms (0: never).
+pub const SockTimeouts = struct {
+    rcv_ms: u32 = 0,
+    snd_ms: u32 = 0,
+    /// Copied from `Timeouts.clock_ms` for the wait in progress. Null uses wall time and the socket timeout.
+    clock_ms: ?*const fn () u64 = null,
+};
+
+const test_clock = struct {
+    var on: std.atomic.Value(bool) = .init(false);
+    var ms: std.atomic.Value(u64) = .init(0);
+    /// One test arms the clock at a time. A second waits, so two UploadPart tests cannot move each other's deadlines.
+    var held: std.atomic.Value(bool) = .init(false);
+};
+
+fn waitTestClock() void {
+    while (test_clock.held.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) {
+        var ts: posix.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = posix.system.nanosleep(&ts, &ts);
+    }
+}
+
+/// Freeze deadline time at the current wall clock. `testClockMs` then stands still until `advanceTestClock`.
+pub fn armTestClock() void {
+    waitTestClock();
+    test_clock.ms.store(monoMs(), .release);
+    test_clock.on.store(true, .release);
+}
+
+pub fn disarmTestClock() void {
+    test_clock.on.store(false, .release);
+    test_clock.held.store(false, .release);
+}
+
+/// Move the frozen clock forward. A no-op unless `armTestClock` is in effect, so a stall in some other test cannot
+/// expire a deadline that is still on the wall clock.
+pub fn advanceTestClock(by_ms: u64) void {
+    if (test_clock.on.load(.acquire)) _ = test_clock.ms.fetchAdd(by_ms, .release);
+}
+
+pub fn testClockMs() u64 {
+    return test_clock.ms.load(.acquire);
+}
+
+/// Why a test clock's read or write gave up. `virtual` is the idle deadline on the injected clock. `backstop` is the
+/// wall-clock limit that only exists so a stuck socket cannot hang the test; a stall test must not pass that way.
+pub const DeadlineCause = enum { virtual, backstop };
+
+const deadline_hit = struct {
+    var ready = std.atomic.Value(bool).init(false);
+    var cause: DeadlineCause = .virtual;
+    var real_ms: u64 = 0;
+};
+
+pub fn resetDeadlineHit() void {
+    deadline_hit.ready.store(false, .release);
+}
+
+pub fn deadlineHit() ?DeadlineCause {
+    if (!deadline_hit.ready.load(.acquire)) return null;
+    return deadline_hit.cause;
+}
+
+pub fn deadlineHitRealMs() u64 {
+    return deadline_hit.real_ms;
+}
+
+fn noteDeadline(cause: DeadlineCause, real_start: u64) void {
+    if (deadline_hit.ready.load(.acquire)) return;
+    deadline_hit.cause = cause;
+    deadline_hit.real_ms = monoMs() -| real_start;
+    deadline_hit.ready.store(true, .release);
+}
+
+/// Set SO_RCVTIMEO or SO_SNDTIMEO to `ms` unless it already holds it. A blocking read or write that waits that long
+/// without moving a byte then fails with EAGAIN.
+fn armSockTimeout(fd: posix.fd_t, opt: u32, ms: u32, current: *u32) bool {
+    if (current.* == ms) return true;
+    const tv: posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast(@as(u32, ms % 1000) * 1000) };
+    const r = posix.system.setsockopt(fd, posix.SOL.SOCKET, opt, @ptrCast(&tv), @sizeOf(posix.timeval));
+    if (posix.errno(r) != .SUCCESS) return false;
+    current.* = ms;
+    return true;
+}
+
+/// Milliseconds left until `deadline`, at least 1; null once it has passed.
+fn msLeft(deadline: u64, clock_ms: ?*const fn () u64) ?u32 {
+    const now = nowMs(clock_ms);
+    if (now >= deadline) return null;
+    return @intCast(@min(deadline - now, std.math.maxInt(u32)));
+}
+
+fn monoMs() u64 {
+    return @intCast(@divTrunc(clock.monoNs(), std.time.ns_per_ms));
+}
+
+/// Absolute millisecond deadline `ms` from now, for `Peer.deadline_ms`.
+pub fn deadlineFromNow(ms: u32) u64 {
+    return monoMs() + ms;
+}
+
+/// `cap`, or what is left until `deadline_ms` when that is sooner. Zero means the deadline has already passed.
+/// `clock_ms` is the same clock the deadline was taken on; null is wall time.
+fn stageBudget(cap: u32, deadline_ms: ?u64, clock_ms: ?*const fn () u64) u32 {
+    const deadline = deadline_ms orelse return cap;
+    const now = nowMs(clock_ms);
+    if (now >= deadline) return 0;
+    return @intCast(@min(@as(u64, cap), deadline - now));
+}
+
+fn nowMs(clock_ms: ?*const fn () u64) u64 {
+    if (clock_ms) |f| return f();
+    return monoMs();
 }
 
 fn closeFd(fd: posix.fd_t) void {
     _ = posix.system.close(fd);
 }
 
-fn writeAll(fd: posix.fd_t, buf: []const u8) Error!void {
+const WriteError = error{ SendFailed, WouldBlock, Backstop };
+const ReadError = error{ ReadFailed, ConnectionReset, WouldBlock, Backstop };
+
+/// Write all of `buf`. `error.WouldBlock`: `idle_ms` passed with no byte taken, or `stage` (an absolute deadline,
+/// for the handshake) passed. Every byte taken restarts the idle wait; a signal interrupting a wait does not, since
+/// the socket timeout is set to the time left before each write.
+fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: *SockTimeouts) WriteError!void {
+    const clock_ms = opts.clock_ms;
+    var deadline = nowMs(clock_ms) + idle_ms;
+    if (stage) |d| deadline = @min(deadline, d);
+    // A test clock must not block inside one write for the whole socket timeout: a partial send then restarts the
+    // idle deadline, and the virtual clock is only noticed on the next wake. Wake often, and give up on the virtual
+    // deadline. The wall-clock check is a backstop and a different error, so a test cannot mistake it for the deadline.
+    if (clock_ms != null) {
+        if (!armSockTimeout(fd, posix.SO.SNDTIMEO, 20, &opts.snd_ms)) return error.SendFailed;
+        const real_start = monoMs();
+        var off: usize = 0;
+        while (off < buf.len) {
+            if (nowMs(clock_ms) >= deadline) {
+                noteDeadline(.virtual, real_start);
+                return error.WouldBlock;
+            }
+            if (monoMs() - real_start > 120_000) {
+                noteDeadline(.backstop, real_start);
+                return error.Backstop;
+            }
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const pr = posix.system.poll(&pfd, 1, 20);
+            switch (posix.errno(pr)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.SendFailed,
+            }
+            if (pr == 0) continue;
+            const r = sendNoSignal(fd, buf[off..]);
+            switch (posix.errno(r)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return error.SendFailed,
+            }
+            const n: usize = @intCast(r);
+            if (n == 0) return error.SendFailed;
+            off += n;
+            deadline = nowMs(clock_ms) + idle_ms;
+            if (stage) |d| deadline = @min(deadline, d);
+        }
+        return;
+    }
     var off: usize = 0;
     while (off < buf.len) {
-        const r = posix.system.write(fd, buf[off..].ptr, buf.len - off);
-        if (posix.errno(r) != .SUCCESS) return error.SendFailed;
+        const left = msLeft(deadline, null) orelse return error.WouldBlock;
+        if (!armSockTimeout(fd, posix.SO.SNDTIMEO, left, &opts.snd_ms)) return error.SendFailed;
+        const r = sendNoSignal(fd, buf[off..]);
+        switch (posix.errno(r)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => return error.SendFailed,
+        }
         const n: usize = @intCast(r);
         if (n == 0) return error.SendFailed;
         off += n;
+        deadline = monoMs() + idle_ms;
+        if (stage) |d| deadline = @min(deadline, d);
     }
 }
 
-fn readSome(fd: posix.fd_t, buf: []u8) error{ ReadFailed, ConnectionReset }!usize {
-    const r = posix.system.read(fd, buf.ptr, buf.len);
+fn sendError(err: WriteError) Error {
+    return switch (err) {
+        error.WouldBlock => error.SendTimeout,
+        error.SendFailed => error.SendFailed,
+        error.Backstop => error.WallClockBackstop,
+    };
+}
+
+/// The read for a socket that refused its receive timeout. macOS refuses every socket option once the connection is
+/// shut both ways, as a reset or a close the peer finished leave it, so the timeout fails just when the read would say
+/// why: it is asked without waiting, and a reset is `error.ConnectionReset` (an idle pooled connection S3 dropped is
+/// closed before the response, not a failed read), the end of the stream 0. Elsewhere, and for anything else, the
+/// refusal is a local failure.
+fn readShut(fd: posix.fd_t, buf: []u8) ReadError!usize {
+    if (comptime !builtin.os.tag.isDarwin()) return error.ReadFailed;
+    const r = posix.system.recvfrom(fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, null, null);
     return switch (posix.errno(r)) {
         .SUCCESS => @intCast(r),
         .CONNRESET, .CONNABORTED, .TIMEDOUT => error.ConnectionReset,
@@ -364,11 +815,50 @@ fn readSome(fd: posix.fd_t, buf: []u8) error{ ReadFailed, ConnectionReset }!usiz
     };
 }
 
-fn recvError(err: error{ ReadFailed, ConnectionReset }) Error {
-    return switch (err) {
-        error.ConnectionReset => error.ConnectionReset,
-        error.ReadFailed => error.RecvFailed,
-    };
+/// One read, by `deadline` (absolute, `monoMs`). `error.WouldBlock`: the deadline passed without a byte arriving.
+/// A signal interrupting the wait does not extend it: the socket timeout is set to the time left before each try.
+fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadError!usize {
+    if (opts.clock_ms) |clock_ms| {
+        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, 20, &opts.rcv_ms)) return readShut(fd, buf);
+        const real_start = monoMs();
+        while (true) {
+            if (clock_ms() >= deadline) {
+                noteDeadline(.virtual, real_start);
+                return error.WouldBlock;
+            }
+            if (monoMs() - real_start > 120_000) {
+                noteDeadline(.backstop, real_start);
+                return error.Backstop;
+            }
+            var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+            const pr = posix.system.poll(&pfd, 1, 20);
+            switch (posix.errno(pr)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.ReadFailed,
+            }
+            if (pr == 0) continue;
+            const r = posix.system.read(fd, buf.ptr, buf.len);
+            switch (posix.errno(r)) {
+                .SUCCESS => return @intCast(r),
+                .INTR, .AGAIN => continue,
+                .CONNRESET, .CONNABORTED, .TIMEDOUT => return error.ConnectionReset,
+                else => return error.ReadFailed,
+            }
+        }
+    }
+    while (true) {
+        const left = msLeft(deadline, null) orelse return error.WouldBlock;
+        if (!armSockTimeout(fd, posix.SO.RCVTIMEO, left, &opts.rcv_ms)) return readShut(fd, buf);
+        const r = posix.system.read(fd, buf.ptr, buf.len);
+        return switch (posix.errno(r)) {
+            .SUCCESS => @intCast(r),
+            .INTR => continue,
+            .AGAIN => error.WouldBlock,
+            .CONNRESET, .CONNABORTED, .TIMEDOUT => error.ConnectionReset,
+            else => error.ReadFailed,
+        };
+    }
 }
 
 /// The TLS server name in `host`, a host name or IP literal optionally written as an HTTP authority: `:port`, IPv6
@@ -650,4 +1140,219 @@ test "a handshake that fails before any certificate is a retryable failure, not 
     // Nothing was learnt about the Amazon roots.
     try testing.expect(!pref.abandoned.load(.monotonic));
     try testing.expect(!fallback.ready.load(.monotonic));
+}
+
+test "Timeouts.fromEnv takes positive overrides and keeps the defaults otherwise" {
+    const block = [_:null]?[*:0]const u8{
+        "ZPQ_S3_CONNECT_TIMEOUT_MS=250",
+        "ZPQ_S3_HANDSHAKE_TIMEOUT_MS=0",
+        "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=abc",
+        "ZPQ_S3_IDLE_TIMEOUT_MS= 30000",
+    };
+    const t = Timeouts.fromEnv(.{ .block = .{ .slice = &block } });
+    try testing.expectEqual(@as(u32, 250), t.connect_ms);
+    try testing.expectEqual(@as(u32, 5_000), t.handshake_ms);
+    try testing.expectEqual(@as(u32, 10_000), t.first_byte_ms);
+    try testing.expectEqual(@as(u32, 30_000), t.idle_ms);
+    try testing.expectEqual(Timeouts{}, Timeouts.fromEnv(.empty));
+}
+
+/// Milliseconds since `t0` (from `monoMs`).
+fn sinceMs(t0: u64) u64 {
+    return monoMs() - t0;
+}
+
+const short: Timeouts = .{ .connect_ms = 200, .handshake_ms = 200, .first_byte_ms = 200, .idle_ms = 200 };
+
+test "a TLS handshake the server never answers fails within its timeout, as a retryable connect failure" {
+    var pki = try test_server.Pki.init();
+    defer pki.deinit();
+    var leaf = try pki.issue("mute.test", "DNS:mute.test");
+    defer leaf.deinit();
+    var server: test_server.Server = undefined;
+    try server.startWith(&leaf, 1, .mute);
+    defer server.finish() catch {};
+    var context = try ClientContext.init(.{ .verify_certificate = false });
+    defer context.deinit();
+
+    var peer: Peer = .loopback(server.port);
+    peer.timeouts = short;
+    const t0 = monoMs();
+    const got = Connection.connectWithContext(testing.allocator, &context, peer, "mute.test");
+    try testing.expectError(error.HandshakeTimeout, got);
+    try testing.expect(sinceMs(t0) < 2_000);
+    try testing.expectEqual(retry.Failure.transient, retry.classifyConnect(error.HandshakeTimeout));
+}
+
+test "a TLS response that never starts fails with FirstByteTimeout, and a request on it may not be retried at once" {
+    var pki = try test_server.Pki.init();
+    defer pki.deinit();
+    var leaf = try pki.issue("hold.test", "DNS:hold.test");
+    defer leaf.deinit();
+    var server: test_server.Server = undefined;
+    try server.startWith(&leaf, 1, .hold);
+    defer server.finish() catch {};
+    var context = try ClientContext.init(.{ .verify_certificate = false });
+    defer context.deinit();
+
+    var peer: Peer = .loopback(server.port);
+    peer.timeouts = short;
+    var conn = try Connection.connectWithContext(testing.allocator, &context, peer, "hold.test");
+    defer conn.deinit();
+    try conn.send("GET /k HTTP/1.1\r\nHost: hold.test\r\n\r\n");
+    var buf: [64]u8 = undefined;
+    const t0 = monoMs();
+    try testing.expectError(error.FirstByteTimeout, conn.recv(&buf));
+    try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 2_000);
+    // Charged and backed off on a new connection, whether or not this one came from the pool.
+    const fbt = error.FirstByteTimeout;
+    try testing.expectEqual(retry.Failure.stalled, retry.classify(fbt, .{ .idempotent = true, .reused = true }));
+    try testing.expectEqual(retry.Failure.fatal, retry.classify(fbt, .{ .idempotent = false, .reused = false }));
+}
+
+test "a connect the listener never completes fails within its timeout" {
+    // A listener that never accepts, with the shortest backlog: once its queue is full the kernel drops further SYNs,
+    // so a connect waits on retransmissions with no answer, as an unreachable front end looks. macOS queues every
+    // connection to it, but drops a SYN to a socket that is bound and not listening: there that is the front end.
+    const lfd_r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    if (posix.errno(lfd_r) != .SUCCESS) return error.SkipZigTest;
+    const lfd: posix.fd_t = @intCast(lfd_r);
+    defer closeFd(lfd);
+    var addr: posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+    if (!builtin.os.tag.isDarwin() and posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
+    if (posix.errno(posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
+
+    var peer: Peer = .loopback(std.mem.bigToNative(u16, addr.port));
+    peer.timeouts = short;
+    var opened: [8]?Connection = @splat(null);
+    defer for (&opened) |*o| if (o.*) |*conn| conn.deinit();
+    for (&opened) |*o| {
+        const t0 = monoMs();
+        o.* = Connection.connectPlain(testing.allocator, peer) catch |err| {
+            try testing.expectEqual(error.ConnectTimeout, err);
+            try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 2_000);
+            try testing.expectEqual(retry.Failure.transient, retry.classifyConnect(err));
+            return;
+        };
+    }
+    return error.SkipZigTest; // this kernel queued every connection: nothing to time out here
+}
+
+/// Interrupts one thread with SIGUSR1 every 20 ms, through a handler installed without SA_RESTART, so each of its
+/// blocking reads and writes keeps returning EINTR, as a profiler's or runtime's signals do.
+const Interrupter = struct {
+    target: std.c.pthread_t,
+    stop: std.atomic.Value(bool) = .init(false),
+    sent: std.atomic.Value(u32) = .init(0),
+    old: posix.Sigaction = undefined,
+    thread: std.Thread = undefined,
+
+    fn ignore(_: posix.SIG) callconv(.c) void {}
+
+    fn start(self: *Interrupter) !void {
+        const act: posix.Sigaction = .{ .handler = .{ .handler = ignore }, .mask = posix.sigemptyset(), .flags = 0 };
+        posix.sigaction(.USR1, &act, &self.old);
+        errdefer posix.sigaction(.USR1, &self.old, null);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *Interrupter) void {
+        while (!self.stop.load(.acquire)) {
+            _ = std.c.pthread_kill(self.target, .USR1);
+            _ = self.sent.fetchAdd(1, .monotonic);
+            const ts: posix.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            _ = posix.system.nanosleep(&ts, null);
+        }
+    }
+
+    fn finish(self: *Interrupter) void {
+        self.stop.store(true, .release);
+        self.thread.join();
+        posix.sigaction(.USR1, &self.old, null);
+    }
+};
+
+test "signals interrupting a wait do not extend the handshake, first-byte, idle read or send deadlines" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var irq: Interrupter = .{ .target = std.c.pthread_self() };
+    try irq.start();
+    defer irq.finish();
+
+    {
+        var pki = try test_server.Pki.init();
+        defer pki.deinit();
+        var leaf = try pki.issue("mute.test", "DNS:mute.test");
+        defer leaf.deinit();
+        var server: test_server.Server = undefined;
+        try server.startWith(&leaf, 1, .mute);
+        defer server.finish() catch {};
+        var context = try ClientContext.init(.{ .verify_certificate = false });
+        defer context.deinit();
+        var peer: Peer = .loopback(server.port);
+        peer.timeouts = short;
+        const t0 = monoMs();
+        const got = Connection.connectWithContext(testing.allocator, &context, peer, "mute.test");
+        try testing.expectError(error.HandshakeTimeout, got);
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+    }
+    {
+        var pki = try test_server.Pki.init();
+        defer pki.deinit();
+        var leaf = try pki.issue("hold.test", "DNS:hold.test");
+        defer leaf.deinit();
+        var server: test_server.Server = undefined;
+        try server.startWith(&leaf, 1, .hold);
+        defer server.finish() catch {};
+        var context = try ClientContext.init(.{ .verify_certificate = false });
+        defer context.deinit();
+        var peer: Peer = .loopback(server.port);
+        peer.timeouts = short;
+        var conn = try Connection.connectWithContext(testing.allocator, &context, peer, "hold.test");
+        defer conn.deinit();
+        try conn.send("GET /k HTTP/1.1\r\nHost: hold.test\r\n\r\n");
+        var buf: [64]u8 = undefined;
+        const t0 = monoMs();
+        try testing.expectError(error.FirstByteTimeout, conn.recv(&buf));
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+    }
+    {
+        // A plain connection over a socket pair whose far end neither writes nor reads.
+        var fds: [2]i32 = undefined;
+        if (posix.errno(posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+            return error.SkipZigTest;
+        defer closeFd(fds[1]);
+        var conn: Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
+        defer conn.deinit();
+        conn.setTimeouts(short);
+        var buf: [64]u8 = undefined;
+        var t0 = monoMs();
+        try testing.expectError(error.ReadTimeout, conn.recv(&buf));
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+
+        const big = try testing.allocator.alloc(u8, 8 << 20);
+        defer testing.allocator.free(big);
+        @memset(big, 'x');
+        t0 = monoMs();
+        try testing.expectError(error.SendTimeout, conn.send(big));
+        try testing.expect(sinceMs(t0) >= 150 and sinceMs(t0) < 600);
+    }
+    // At 20 ms apart, each 200 ms wait above was interrupted several times.
+    try testing.expect(irq.sent.load(.monotonic) >= 20);
+}
+
+test "regression: an attempt's deadline never runs past the invocation's" {
+    var conn: Connection = undefined;
+    conn.timeouts = .{};
+    conn.deadline_ms = null;
+    // The Lambda's last second: a request armed now must be done by then, not 30 s on.
+    setInvocationDeadline(100);
+    defer setInvocationDeadline(null);
+    const before = monoMs();
+    conn.armDeadline(0, null);
+    try std.testing.expect(conn.deadline_ms.? <= before + 100 + 5);
+    setInvocationDeadline(null);
+    conn.armDeadline(0, null);
+    try std.testing.expect(conn.deadline_ms.? >= before + conn.timeouts.request_ms);
 }

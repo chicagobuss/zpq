@@ -5,8 +5,8 @@
 //!
 //! No decoding, no re-encoding. The trick that makes this fast: column
 //! chunks within a row group are contiguous in the input file, so a
-//! single `@memcpy` per row group preserves all encoded data and
-//! statistics — we only need to renumber the pointers in the footer.
+//! single `@memcpy` per row group preserves encoded data. Known writer
+//! defects require stripping affected statistics, including page headers.
 //!
 //! Inputs:
 //!   - `input` — full bytes of the source Parquet file.
@@ -22,18 +22,23 @@
 //!     ColumnIndex copies through unchanged and the OffsetIndex page
 //!     locations are rebased by the same shift applied to the chunk data,
 //!     so page-level pruning survives a compaction. It is dropped only
-//!     when the source has none or its index bytes were not fetched (the
+//!     when page-header removal changes the layout, the source has none, or
+//!     its index bytes were not fetched (the
 //!     S3 fast path may hold just the column-chunk + footer ranges).
-//!   - Bloom-filter offsets in the input footer are still **dropped**.
-//!     Downstream readers fall back to row-group-level pruning.
-//!   - The schema, statistics, encodings, and per-row-group metadata are
-//!     all copied through unchanged. Strings (paths, stats min/max) are
+//!   - Bloom filters are **carried forward** too: a copied chunk's rows are
+//!     its source's, so its filter still holds. Each is written after the
+//!     row groups (`placeFilters`), one column's together, with fields 14
+//!     and 15 pointing at it; a dropped column drops its filter.
+//!   - Schema, encodings and unaffected statistics are copied unchanged. Strings (paths, stats min/max) are
 //!     borrowed from `meta` — caller must keep `meta` alive until the
 //!     returned bytes are no longer needed for further mutation.
 
 const std = @import("std");
 const schema = @import("../schema.zig");
+const writer_statistics = @import("../parquet/writer_statistics.zig");
 const thrift = @import("../thrift.zig");
+const bloom = @import("../parquet/bloom.zig");
+const page_header = @import("page_header.zig");
 
 const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
@@ -45,7 +50,11 @@ pub const Error = error{
     BadColumnIndex,
     /// The inputs declare different column orders for a copied leaf; a byte copy cannot be declared truthfully.
     ColumnOrderMismatch,
-} || std.mem.Allocator.Error;
+    /// A footer past the 4-byte length Parquet gives it.
+    TooLarge,
+} || std.mem.Allocator.Error ||
+    @typeInfo(@typeInfo(@TypeOf(schema.PageHeader.read)).@"fn".return_type.?).error_union.error_set ||
+    error{ BadPageHeader, TruncatedPage, Overflow };
 
 /// One input file. `bytes` covers (at minimum) the tail/head/footer
 /// plus the bytes of every kept column-chunk of every surviving row
@@ -106,7 +115,7 @@ const BufferOut = struct {
         try self.bytes.ensureTotalCapacity(self.arena, len);
     }
 
-    fn write(self: *BufferOut, bytes: []const u8) Error!void {
+    pub fn write(self: *BufferOut, bytes: []const u8) Error!void {
         try self.bytes.appendSlice(self.arena, bytes);
     }
 };
@@ -138,12 +147,14 @@ pub fn assemble(
     for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
         if (!keep) continue;
         const new_rg = if (kept_columns) |kc|
-            try copyProjectedRowGroup(arena, out, f.bytes, rg, kc)
+            try copyProjectedRowGroup(arena, out, f.bytes, rg, kc, f.meta)
         else
-            try copyRowGroup(arena, out, f.bytes, rg) orelse continue;
+            try copyRowGroup(arena, out, f.bytes, rg, f.meta) orelse continue;
         try new_row_groups.append(arena, new_rg);
         total_rows += rg.num_rows;
     };
+
+    try placeFilters(out, new_row_groups.items);
 
     // The schema is shared by reference unless projecting, which needs a reduced list.
     const meta0 = files[0].meta;
@@ -151,6 +162,8 @@ pub fn assemble(
         .version = meta0.version,
         .schema = if (kept_columns) |kc| try projectSchema(arena, meta0.schema, kc) else meta0.schema,
         .num_rows = total_rows,
+        // A pure byte copy: every page and statistic is the source writer's, so its name stays (see
+        // `schema.ZPQ_CREATED_BY`).
         .created_by = meta0.created_by,
         .row_groups = new_row_groups,
         .column_orders = column_orders,
@@ -160,7 +173,7 @@ pub fn assemble(
     try new_meta.write(&w);
 
     var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(w.bytes().len), .little);
+    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, w.bytes().len) orelse return error.TooLarge, .little);
     try out.write(w.bytes());
     try out.write(&len_bytes);
     try out.write(&MAGIC);
@@ -204,7 +217,21 @@ fn copyRowGroup(
     out: anytype,
     input: []const u8,
     src: *const schema.RowGroup,
+    meta: *const schema.FileMetaData,
 ) !?schema.RowGroup {
+    const rewrite = for (src.columns.items) |*c| {
+        if (writerPolicy(c, meta) != .trust) break true;
+    } else false;
+    if (rewrite) {
+        var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        errdefer cols.deinit(arena);
+        try cols.ensureTotalCapacity(arena, src.columns.items.len);
+        for (src.columns.items) |*chunk| {
+            const safe = writerSafeChunk(arena, input, chunk, meta);
+            cols.appendAssumeCapacity(try copyPolicyChunk(arena, out, input, &safe, true));
+        }
+        return .{ .columns = cols, .total_byte_size = uncompressedBytes(cols.items), .num_rows = src.num_rows };
+    }
     const range = try rowGroupByteRange(src, input.len) orelse return null;
     const delta = offsetDelta(out.pos(), range.start);
     try out.write(input[range.start .. range.start + range.len]);
@@ -214,7 +241,10 @@ fn copyRowGroup(
     try cols.ensureTotalCapacity(arena, src.columns.items.len);
     // Every chunk in the group moved by the same delta; the rebased
     // indexes follow the group's data.
-    for (src.columns.items) |*chunk| cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, chunk, delta));
+    for (src.columns.items) |*chunk| {
+        const safe = writerSafeChunk(arena, input, chunk, meta);
+        cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &safe, delta));
+    }
     return .{
         .columns = cols,
         .total_byte_size = src.total_byte_size,
@@ -222,32 +252,40 @@ fn copyRowGroup(
     };
 }
 
+/// A row group's `total_byte_size`: the format defines it as the uncompressed bytes of its column data, the sum of
+/// its chunks' `total_uncompressed_size` (what other writers store), not the bytes it occupies in the file.
+pub fn uncompressedBytes(columns: []const schema.ColumnChunk) i64 {
+    var total: i64 = 0;
+    for (columns) |c| if (c.meta_data) |m| {
+        total += m.total_uncompressed_size;
+    };
+    return total;
+}
+
 /// Copy only the kept column chunks of one row group, contiguously,
 /// each followed by its page index. The new RG's `total_byte_size` is
-/// the sum of kept column sizes; `num_rows` is unchanged from the source.
+/// the kept chunks' uncompressed size; `num_rows` is unchanged from the source.
 fn copyProjectedRowGroup(
     arena: std.mem.Allocator,
     out: anytype,
     input: []const u8,
     src_rg: *const schema.RowGroup,
     kept: []const usize,
+    meta: *const schema.FileMetaData,
 ) !schema.RowGroup {
     var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     errdefer new_cols.deinit(arena);
     try new_cols.ensureTotalCapacity(arena, kept.len);
 
-    var rg_total: i64 = 0;
     for (kept) |col_idx| {
-        const range = try projectedChunkRange(src_rg, col_idx, input.len);
-        const delta = offsetDelta(out.pos(), range.start);
-        try out.write(input[range.start .. range.start + range.len]);
-        new_cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &src_rg.columns.items[col_idx], delta));
-        rg_total += @intCast(range.len);
+        if (col_idx >= src_rg.columns.items.len) return error.BadColumnIndex;
+        const safe = writerSafeChunk(arena, input, &src_rg.columns.items[col_idx], meta);
+        new_cols.appendAssumeCapacity(try copyPolicyChunk(arena, out, input, &safe, true));
     }
 
     return .{
         .columns = new_cols,
-        .total_byte_size = rg_total,
+        .total_byte_size = uncompressedBytes(new_cols.items),
         .num_rows = src_rg.num_rows,
     };
 }
@@ -256,10 +294,131 @@ fn offsetDelta(new_start: usize, src_start: usize) i64 {
     return @as(i64, @intCast(new_start)) - @as(i64, @intCast(src_start));
 }
 
+pub fn writerPolicy(src: *const schema.ColumnChunk, file_meta: ?*const schema.FileMetaData) writer_statistics.Policy {
+    const cm = src.meta_data orelse return .trust;
+    const fm = file_meta orelse return cm.writer_stats;
+    return writer_statistics.policy(fm.created_by, cm.type, fm.getColumnSchema(cm.path_in_schema.items));
+}
+
+/// Copy one chunk's payloads verbatim, removing only affected page-header statistics. Offsets and size totals
+/// follow the shorter headers. A changed page layout drops optional indexes; unchanged layouts keep rebased ones.
+/// Streaming the header fields uses bounded stack scratch, independent of a page or statistics record's size.
+pub fn copyPolicyChunk(
+    a: std.mem.Allocator,
+    out: anytype,
+    input: []const u8,
+    src: *const schema.ColumnChunk,
+    emit_index: bool,
+) !schema.ColumnChunk {
+    const cm = src.meta_data orelse return error.InvalidColumnOffsets;
+    const range = chunkRange(&cm, input.len) orelse return error.InvalidColumnOffsets;
+    const start = out.pos();
+    const delta = offsetDelta(start, range.start);
+    if (cm.writer_stats == .trust) {
+        try out.write(input[range.start..][0..range.len]);
+        return if (emit_index) try rebaseChunk(a, out, input, src, delta) else copiedChunk(input, src, delta);
+    }
+    const bytes = input[range.start..][0..range.len];
+    const old_start: i64 = @intCast(range.start);
+    const old_offsets = [_]?i64{ cm.data_page_offset, cm.dictionary_page_offset, cm.index_page_offset };
+    var moved: [3]?i64 = .{ null, null, null };
+    var pos: usize = 0;
+    var header_delta: i64 = 0;
+    var layout_changed = false;
+    while (pos < bytes.len) {
+        const old_page = old_start + @as(i64, @intCast(pos));
+        for (old_offsets, &moved) |old, *at| if (old != null and at.* == null and old.? <= old_page) {
+            at.* = @intCast(out.pos());
+        };
+        var reader = thrift.Reader.init(bytes[pos..]);
+        const h = try schema.PageHeader.read(&reader);
+        if (h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return error.BadPageHeader;
+        const header = bytes[pos..][0..reader.pos];
+        const body_size: usize = @intCast(h.compressed_page_size);
+        if (body_size > bytes.len - pos - header.len) return error.TruncatedPage;
+        const header_start = out.pos();
+        try page_header.write(out, header, null, cm.writer_stats);
+        layout_changed = layout_changed or out.pos() - header_start != header.len;
+        header_delta += @as(i64, @intCast(out.pos() - header_start)) - @as(i64, @intCast(header.len));
+        try out.write(bytes[pos + header.len ..][0..body_size]);
+        pos += header.len + body_size;
+    }
+    // Keep the established relocation semantics for an offset that names no page: the next page, or the end.
+    for (old_offsets, &moved) |old, *at| if (old != null and at.* == null) {
+        at.* = @intCast(out.pos());
+    };
+    var chunk = copiedChunk(input, src, delta);
+    chunk.meta_data.?.data_page_offset = moved[0].?;
+    chunk.meta_data.?.dictionary_page_offset = moved[1];
+    chunk.meta_data.?.index_page_offset = moved[2];
+    chunk.file_offset = moved[0].?;
+    chunk.meta_data.?.total_compressed_size = @intCast(out.pos() - start);
+    const raw = std.math.add(i64, cm.total_uncompressed_size, header_delta) catch return error.InvalidColumnOffsets;
+    if (raw < 0) return error.InvalidColumnOffsets;
+    chunk.meta_data.?.total_uncompressed_size = raw;
+    if (emit_index and !layout_changed) {
+        const idx = try carryPageIndex(a, out, input, src, delta);
+        chunk.offset_index_offset = idx.offset_index_offset;
+        chunk.offset_index_length = idx.offset_index_length;
+        chunk.column_index_offset = idx.column_index_offset;
+        chunk.column_index_length = idx.column_index_length;
+    }
+    return chunk;
+}
+
+/// Copied statistics must stay absent even if a mixed/encoded output changes created_by. Retain raw source
+/// metadata for inspection; clear only the copy. A page-index parse/refusal drops that optional index.
+pub fn writerSafeChunk(
+    a: std.mem.Allocator,
+    input: []const u8,
+    src: *const schema.ColumnChunk,
+    file_meta: ?*const schema.FileMetaData,
+) schema.ColumnChunk {
+    var chunk = src.*;
+    const cm = chunk.meta_data orelse return chunk;
+    const policy = writerPolicy(src, file_meta);
+    chunk.meta_data.?.writer_stats = policy;
+    // Modern writers and signed types unaffected by any rule do no extra allocation or page-index walk.
+    if (policy == .trust) return chunk;
+    if (cm.statistics) |st| {
+        const pair = if (st.min_value != null and st.max_value != null)
+            [2]?[]const u8{ st.min_value, st.max_value }
+        else
+            [2]?[]const u8{ st.min, st.max };
+        if (!policy.accepts(pair[0], pair[1]))
+            chunk.meta_data.?.statistics = null;
+    }
+    const usable_index = keep: {
+        // Binary corruption rejects every possible extrema pair, without reading the index at all.
+        if (policy == .absent) break :keep false;
+        const co = src.column_index_offset orelse return chunk;
+        const cl = src.column_index_length orelse return chunk;
+        const bytes = sliceInBounds(input, co, cl) orelse break :keep false;
+        var r = thrift.Reader.init(bytes);
+        var ci = schema.ColumnIndex.read(a, &r) catch break :keep false;
+        defer ci.null_pages.deinit(a);
+        defer ci.min_values.deinit(a);
+        defer ci.max_values.deinit(a);
+        defer if (ci.null_counts) |*nc| nc.deinit(a);
+        defer if (ci.nan_counts) |*nc| nc.deinit(a);
+        for (0..ci.null_pages.items.len) |i| {
+            const min = if (!ci.null_pages.items[i] and i < ci.min_values.items.len) ci.min_values.items[i] else null;
+            const max = if (!ci.null_pages.items[i] and i < ci.max_values.items.len) ci.max_values.items[i] else null;
+            if (!policy.accepts(min, max)) break :keep false;
+        }
+        break :keep true;
+    };
+    if (!usable_index) {
+        chunk.column_index_offset = null;
+        chunk.column_index_length = null;
+    }
+    return chunk;
+}
+
 /// `src` with every offset shifted by `delta`, the distance its data
-/// moved, and its page index carried forward into `out`. Inner slices
-/// (encodings, paths, stats) are borrowed from the source; bloom-filter
-/// offsets are dropped.
+/// moved, its page index carried forward into `out`, and its Bloom filter
+/// held for `placeFilters`. Inner slices (encodings, paths, stats, the
+/// filter) are borrowed from the source.
 pub fn rebaseChunk(
     arena: std.mem.Allocator,
     out: anytype,
@@ -267,7 +426,7 @@ pub fn rebaseChunk(
     src: *const schema.ColumnChunk,
     delta: i64,
 ) !schema.ColumnChunk {
-    var chunk = shiftChunk(src, delta);
+    var chunk = copiedChunk(input, src, delta);
     const idx = try carryPageIndex(arena, out, input, src, delta);
     chunk.offset_index_offset = idx.offset_index_offset;
     chunk.offset_index_length = idx.offset_index_length;
@@ -277,6 +436,47 @@ pub fn rebaseChunk(
 }
 
 /// `rebaseChunk` without the page index, for output that carries none.
+pub fn copiedChunk(input: []const u8, src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
+    var chunk = shiftChunk(src, delta);
+    chunk.bloom_out = carriedFilter(input, src);
+    return chunk;
+}
+
+/// The Bloom filter (header and bitset) of `src` inside `input`, which an output copying the chunk's rows unchanged
+/// may keep; empty when there is none, it lies outside `input` (an S3 input holds only the ranges it fetched), the
+/// chunk is encrypted, or it reads as no filter.
+pub fn carriedFilter(input: []const u8, src: *const schema.ColumnChunk) []const u8 {
+    if (src.encrypted) return &.{};
+    const cm = src.meta_data orelse return &.{};
+    const off = std.math.cast(usize, cm.bloom_filter_offset orelse return &.{}) orelse return &.{};
+    if (off < 4 or off >= input.len) return &.{};
+    const h = bloom.parseHeader(input[off..]) orelse return &.{};
+    const total = h.len + h.num_bytes;
+    if (total > input.len - off) return &.{};
+    // A length that disagrees with the header leaves no telling which to trust.
+    if (cm.bloom_filter_length) |l| if (l != total) return &.{};
+    return input[off..][0..total];
+}
+
+/// Write the Bloom filter each chunk of `row_groups` carries (`bloom_out`) to `out`, which must be past the last row
+/// group, and point the chunk's fields 14 and 15 at it. Column by column, then row group: an `=` reads one column's
+/// filters, and laid out together they come back in one ranged read rather than one per row group. (The spec places
+/// filters only as "after the row groups"; readers locate each through its own offset.)
+pub fn placeFilters(out: anytype, row_groups: []schema.RowGroup) !void {
+    var cols: usize = 0;
+    for (row_groups) |rg| cols = @max(cols, rg.columns.items.len);
+    for (0..cols) |ci| for (row_groups) |*rg| {
+        if (ci >= rg.columns.items.len) continue;
+        const c = &rg.columns.items[ci];
+        if (c.bloom_out.len == 0) continue;
+        const m = if (c.meta_data) |*m| m else continue;
+        m.bloom_filter_offset = @intCast(out.pos());
+        m.bloom_filter_length = @intCast(c.bloom_out.len);
+        try out.write(c.bloom_out);
+    };
+}
+
+/// `src` moved by `delta`, carrying neither its page index nor its Bloom filter.
 pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
     var chunk = src.*;
     if (chunk.meta_data) |*m| {
@@ -288,7 +488,12 @@ pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk
         // Readers should use the structured offsets, but keeping this
         // consistent costs nothing.
         chunk.file_offset = m.data_page_offset;
+        // The filter is not part of the chunk's bytes; the copy has none until one is placed for it.
+        m.bloom_filter_offset = null;
+        m.bloom_filter_length = null;
     }
+    chunk.absent = &.{};
+    chunk.bloom_out = &.{};
     chunk.offset_index_offset = null;
     chunk.offset_index_length = null;
     chunk.column_index_offset = null;
@@ -638,6 +843,34 @@ test "build with projection emits only kept columns" {
     );
 }
 
+test "a projected byte copy records its kept chunks' uncompressed bytes as total_byte_size" {
+    const fixture_path = "ci/fixtures/parquet/bloom_keys.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var meta = try metadata.open(arena, file_bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    const kept = [_]usize{ 0, 3 };
+    const out_meta = try metadata.open(arena, try build(arena, file_bytes, &meta, survivors, &kept));
+    for (out_meta.row_groups.items, meta.row_groups.items) |rg, src| {
+        var compressed: i64 = 0;
+        var uncompressed: i64 = 0;
+        for (kept) |c| {
+            compressed += src.columns.items[c].meta_data.?.total_compressed_size;
+            uncompressed += src.columns.items[c].meta_data.?.total_uncompressed_size;
+        }
+        try testing.expectEqual(uncompressed, rg.total_byte_size);
+        try testing.expectEqual(uncompressedBytes(rg.columns.items), rg.total_byte_size);
+        try testing.expect(uncompressed != compressed);
+    }
+}
+
 test "buildMulti with N=10 copies of the same file" {
     // Multi-file concatenation must keep every copied chunk's offset
     // relative to the new output, independent of network or Lambda state.
@@ -840,5 +1073,186 @@ test "byte copy refuses chunk ranges outside its input" {
         m.total_compressed_size = bad.len;
         try testing.expectError(error.InvalidColumnOffsets, build(arena, bytes, &broken, survivors, null));
         try testing.expectError(error.InvalidColumnOffsets, build(arena, bytes, &broken, survivors, &.{0}));
+    }
+}
+
+test "byte copies carry each kept chunk's Bloom filter, after the row groups, and readers prune on it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // tools/zpq-gen bloom: `id` and `s` carry filters in every row group; `cat` and `x` none.
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/bloom_keys.parquet", arena) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const meta = try metadata.open(arena, bytes);
+    const survivors = try arena.alloc(bool, meta.row_groups.items.len);
+    @memset(survivors, true);
+    survivors[2] = false;
+
+    for ([_]?[]const usize{ null, &.{ 1, 3 } }) |kept| {
+        const out = try build(arena, bytes, &meta, survivors, kept);
+        const copied = try metadata.open(arena, out);
+        try testing.expectEqual(@as(usize, 7), copied.row_groups.items.len);
+        var last_chunk_end: i64 = 0;
+        var first_filter: i64 = std.math.maxInt(i64);
+        var filters_end: i64 = 0;
+        for (copied.row_groups.items, 0..) |rg, ri| {
+            const src_rg = meta.row_groups.items[if (ri < 2) ri else ri + 1];
+            for (rg.columns.items, 0..) |c, ci| {
+                const m = c.meta_data.?;
+                const chunk_end = (m.dictionary_page_offset orelse m.data_page_offset) + m.total_compressed_size;
+                last_chunk_end = @max(last_chunk_end, chunk_end);
+                const src_ci = if (kept) |k| k[ci] else ci;
+                const src = src_rg.columns.items[src_ci];
+                if (src.meta_data.?.bloom_filter_offset == null) {
+                    try testing.expect(m.bloom_filter_offset == null);
+                    continue;
+                }
+                // One column's filters back to back, row group after row group, the bytes unchanged.
+                const off = m.bloom_filter_offset.?;
+                const len = m.bloom_filter_length.?;
+                if (ri > 0) {
+                    const prev = copied.row_groups.items[ri - 1].columns.items[ci].meta_data.?;
+                    try testing.expectEqual(prev.bloom_filter_offset.? + prev.bloom_filter_length.?, off);
+                }
+                first_filter = @min(first_filter, off);
+                filters_end = @max(filters_end, off + len);
+                const src_off: usize = @intCast(src.meta_data.?.bloom_filter_offset.?);
+                const n: usize = @intCast(len);
+                try testing.expectEqualSlices(u8, bytes[src_off..][0..n], out[@intCast(off)..][0..n]);
+            }
+        }
+        // After every row group, and nothing but filters in between.
+        try testing.expect(first_filter >= last_chunk_end);
+        var total: i64 = 0;
+        for (copied.row_groups.items) |rg| for (rg.columns.items) |c| {
+            total += c.meta_data.?.bloom_filter_length orelse 0;
+        };
+        try testing.expectEqual(total, filters_end - first_filter);
+    }
+
+    // The filters hold in the copy: an absent key prunes every group there as in the source.
+    const out = try build(arena, bytes, &meta, survivors, null);
+    const copied = [_]schema.FileMetaData{try metadata.open(arena, out)};
+    const membership = @import("../filter/membership.zig");
+    const parser = @import("../filter/parser.zig");
+    const prune = @import("../filter/prune.zig");
+    const f = try parser.parse(arena, "id = 1001", &copied[0], null);
+    const mapped: membership.MappedSource = .{ .files = &.{out} };
+    const st = try membership.load(arena, testing.allocator, f, &copied, mapped.source(), .{});
+    try testing.expectEqual(@as(usize, 7), st.row_groups_bloom);
+    for (copied[0].row_groups.items) |*rg| try testing.expectEqual(.skip, prune.pruneRowGroup(rg, f, &copied[0]));
+}
+
+test "carriedFilter: only a filter that reads whole and agrees with the footer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/bloom_keys.parquet", arena) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const meta = try metadata.open(arena, bytes);
+    const good = meta.row_groups.items[0].columns.items[0];
+    const len: usize = @intCast(good.meta_data.?.bloom_filter_length.?);
+    try testing.expectEqual(len, carriedFilter(bytes, &good).len);
+    var c = good;
+    c.encrypted = true;
+    try testing.expectEqual(@as(usize, 0), carriedFilter(bytes, &c).len);
+    c = good;
+    c.meta_data.?.bloom_filter_length = good.meta_data.?.bloom_filter_length.? + 1;
+    try testing.expectEqual(@as(usize, 0), carriedFilter(bytes, &c).len);
+    // Not in this buffer (an S3 input that did not fetch it).
+    try testing.expectEqual(@as(usize, 0), carriedFilter(bytes[0..1000], &good).len);
+    // No length: the header alone locates it.
+    c = good;
+    c.meta_data.?.bloom_filter_length = null;
+    try testing.expectEqual(carriedFilter(bytes, &good).len, carriedFilter(bytes, &c).len);
+}
+
+test "writer statistics: copied chunks cannot regain suppressed statistics under another writer name" {
+    const a = std.testing.allocator;
+    const path = "ci/fixtures/parquet/writer_stats.parquet";
+    const bytes = @import("../parquet/metadata.zig").readFileSlice(path, a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(bytes);
+    var meta = try @import("../parquet/metadata.zig").open(a, bytes);
+    defer meta.deinit(a);
+    const rg = &meta.row_groups.items[0];
+    for (rg.columns.items[0..3]) |*src| {
+        const safe = writerSafeChunk(a, bytes, src, &meta);
+        try std.testing.expect(safe.meta_data.?.statistics == null);
+        try std.testing.expect(safe.column_index_offset == null);
+        try std.testing.expect(src.meta_data.?.statistics != null);
+        try std.testing.expect(src.column_index_offset != null);
+    }
+    // An allowed equal pair keeps its page index; every optional parse allocation can be refused without leaks.
+    meta.created_by = "parquet-cpp version 1.2.9";
+    const src = &rg.columns.items[0];
+    const kept = writerSafeChunk(a, bytes, src, &meta);
+    try std.testing.expectEqual(src.column_index_offset, kept.column_index_offset);
+    for (0..6) |fail_index| {
+        var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const safe = writerSafeChunk(fail.allocator(), bytes, src, &meta);
+        try std.testing.expect(safe.meta_data.?.statistics != null);
+        try std.testing.expect(safe.column_index_offset == null or safe.column_index_offset == src.column_index_offset);
+    }
+}
+
+test "writer page headers: copied V1/V2 chunks preserve payloads and relocate dictionary/data offsets" {
+    const streaming = @import("streaming.zig");
+    for ([_][]const u8{
+        "ci/fixtures/parquet/writer_headers_v1.parquet",
+        "ci/fixtures/parquet/writer_headers_v2.parquet",
+    }) |path| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const bytes = try metadata.readFileSlice(path, a);
+        var meta = try metadata.open(a, bytes);
+        try testing.expectEqual(.absent, meta.row_groups.items[0].columns.items[0].meta_data.?.writer_stats);
+        for ([_]?[]const usize{ null, &.{ 0, 2, 3 } }) |kept| {
+            const output = try build(a, bytes, &meta, &.{true}, kept);
+            var sink: streaming.MemorySink = .{ .arena = a };
+            const files = [_]FileSpec{.{ .bytes = bytes, .meta = &meta, .survivors = &.{true} }};
+            _ = try streaming.build(a, sink.sink(), &files, kept);
+            try testing.expectEqualSlices(u8, output, sink.buffer.items);
+            const copied = try metadata.open(a, output);
+            var raw_total: i64 = 0;
+            for (copied.row_groups.items[0].columns.items, 0..) |column, oi| {
+                const ci = if (kept) |k| k[oi] else oi;
+                const old = meta.row_groups.items[0].columns.items[ci].meta_data.?;
+                const new = column.meta_data.?;
+                if (ci < 3) try testing.expect(new.statistics == null);
+                raw_total += new.total_uncompressed_size;
+                const before = chunkRange(&old, bytes.len).?;
+                const after = chunkRange(&new, output.len).?;
+                var bp = before.start;
+                var ap = after.start;
+                while (bp < before.start + before.len) {
+                    var br = thrift.Reader.init(bytes[bp..]);
+                    const bh = try schema.PageHeader.read(&br);
+                    var ar = thrift.Reader.init(output[ap..]);
+                    const ah = try schema.PageHeader.read(&ar);
+                    try testing.expectEqual(bh.type, ah.type);
+                    try testing.expectEqual(bh.crc, ah.crc);
+                    const n: usize = @intCast(bh.compressed_page_size);
+                    try testing.expectEqualSlices(u8, bytes[bp + br.pos ..][0..n], output[ap + ar.pos ..][0..n]);
+                    if (bh.type == .DICTIONARY_PAGE)
+                        try testing.expectEqual(@as(i64, @intCast(ap)), new.dictionary_page_offset.?);
+                    if (bh.type == .DATA_PAGE or bh.type == .DATA_PAGE_V2)
+                        try testing.expectEqual(@as(i64, @intCast(ap)), new.data_page_offset);
+                    bp += br.pos + n;
+                    ap += ar.pos + n;
+                }
+                try testing.expectEqual(after.start + after.len, ap);
+                const saved_header_bytes = old.total_compressed_size - new.total_compressed_size;
+                try testing.expectEqual(saved_header_bytes, old.total_uncompressed_size - new.total_uncompressed_size);
+            }
+            try testing.expectEqual(raw_total, copied.row_groups.items[0].total_byte_size);
+        }
     }
 }

@@ -28,7 +28,15 @@ pub fn build(b: *std.Build) !void {
         "Fetch the pinned prebuilt libraries when prebuilt/<arch>-<os>/ lacks them",
     ) orelse true;
 
-    // BoringSSL source dep — we only need the public C headers.
+    // Compile BoringSSL from the source dep instead, position-independent, for a shared library (libzpq): the
+    // prebuilt archives are not, and cannot go into one. Slower to build than fetching; nothing else needs it.
+    const source_build = b.option(
+        bool,
+        "source-build",
+        "Compile BoringSSL from source, position-independent (for shared libraries), instead of linking prebuilts",
+    ) orelse false;
+
+    // BoringSSL source dep — the public C headers, and the sources when `source_build`.
     const boringssl_dep = b.dependency("boringssl", .{});
 
     const target_info = target.result;
@@ -39,9 +47,9 @@ pub fn build(b: *std.Build) !void {
     );
     const libs = [_][]const u8{ "libcrypto.a", "libssl.a" };
 
-    const have_locally = probeLocalPrebuilts(b, triple, &libs);
+    const have_locally = !source_build and probeLocalPrebuilts(b, triple, &libs);
     var lib_paths: [libs.len]std.Build.LazyPath = undefined;
-    if (have_locally) {
+    if (source_build) {} else if (have_locally) {
         for (libs, &lib_paths) |lib, *path| path.* = b.path(b.fmt("prebuilt/{s}/{s}", .{ triple, lib }));
     } else {
         if (!fetch_prebuilt) {
@@ -115,8 +123,71 @@ pub fn build(b: *std.Build) !void {
     openssl_c.addIncludePath(boringssl_dep.path("include"));
     boring_tls_mod.addImport("openssl_c", openssl_c.createModule());
 
-    for (lib_paths) |path| boring_tls_mod.addObjectFile(path);
+    if (source_build) {
+        for (try sourceLibraries(b, boringssl_dep, target, optimize)) |lib| boring_tls_mod.linkLibrary(lib);
+    } else {
+        for (lib_paths) |path| boring_tls_mod.addObjectFile(path);
+    }
     boring_tls_mod.linkSystemLibrary("c++", .{});
+}
+
+/// libcrypto and libssl compiled from `dep`'s sources as BoringSSL's own CMake build lists them (gen/sources.json),
+/// position-independent. Every generated assembly file is compiled: each guards itself by architecture and object
+/// format, so those for other targets assemble to nothing.
+fn sourceLibraries(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) ![2]*std.Build.Step.Compile {
+    const json_path = try dep.builder.root.joinString(b.allocator, "gen/sources.json");
+    const json_text = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, json_path, b.allocator, .limited(4 << 20));
+    const parsed = try std.json.parseFromSlice(std.json.Value, b.allocator, json_text, .{});
+    const root = parsed.value.object;
+    const lists = struct {
+        fn of(gpa: std.mem.Allocator, v: std.json.Value, key: []const u8) ![]const []const u8 {
+            const arr = (v.object.get(key) orelse return &.{}).array.items;
+            const out = try gpa.alloc([]const u8, arr.len);
+            for (arr, out) |e, *o| o.* = e.string;
+            return out;
+        }
+    };
+    // _XOPEN_SOURCE alone hides the BSD types (u_int) Darwin's own headers use; _DARWIN_C_SOURCE brings them back.
+    const os_flags: []const []const u8 = if (target.result.os.tag.isDarwin()) &.{"-D_DARWIN_C_SOURCE"} else &.{};
+    // The source build is for a shared library, which should export its own API alone: OPENSSL_EXPORT is empty
+    // without BORINGSSL_SHARED_LIBRARY, so this hides all of BoringSSL's.
+    const flags_c = try std.mem.concat(b.allocator, []const u8, &.{
+        &.{ "-std=c11", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700", "-fvisibility=hidden" },
+        os_flags,
+    });
+    const flags_cc = try std.mem.concat(b.allocator, []const u8, &.{
+        &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700" },
+        &.{"-fvisibility=hidden"},
+        os_flags,
+    });
+    var out: [2]*std.Build.Step.Compile = undefined;
+    for ([_][]const u8{ "crypto", "ssl" }, &out) |name, *lib| {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .pic = true,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        mod.addIncludePath(dep.path("include"));
+        mod.addIncludePath(dep.path(""));
+        const parts: []const []const u8 = if (std.mem.eql(u8, name, "crypto")) &.{ "bcm", "crypto" } else &.{"ssl"};
+        for (parts) |part| {
+            const v = root.get(part) orelse return error.BadSourcesJson;
+            const srcs = try lists.of(b.allocator, v, "srcs");
+            const asms = try lists.of(b.allocator, v, "asm");
+            mod.addCSourceFiles(.{ .root = dep.path(""), .files = srcs, .flags = flags_cc });
+            mod.addCSourceFiles(.{ .root = dep.path(""), .files = asms, .flags = flags_c });
+        }
+        lib.* = b.addLibrary(.{ .name = name, .linkage = .static, .root_module = mod });
+    }
+    out[1].root_module.linkLibrary(out[0]);
+    return out;
 }
 
 /// Whether `prebuilt/<triple>/` holds every lib. The probe runs at configure

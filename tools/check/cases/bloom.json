@@ -1,0 +1,157 @@
+{
+  "fixtures": [{"recipe": "bloom_filters", "files": ["fixed", "fz0", "fz1", "fz2", "fz3", "pyarrow_filters", "auto_plain", "auto_dict", "auto_nested", "auto_int96", "auto_fallback"]}, {"name": "zpq_copy", "zpq": ["query", "{fixture:fixed}", "-o", "{path}", "--bloom-filter", "i8", "--bloom-filter", "i32", "--bloom-filter", "i64", "--bloom-filter", "u16", "--bloom-filter", "u32", "--bloom-filter", "u64", "--bloom-filter", "f32", "--bloom-filter", "f64", "--bloom-filter", "s", "--bloom-filter", "bin", "--bloom-filter", "fsb", "--bloom-filter", "d", "--bloom-filter", "ts_us", "--bloom-filter", "ts_ms", "--bloom-filter", "ts_ns", "--bloom-filter", "t_us", "--bloom-filter", "n_i64", "--bloom-filter", "n_s", "--bloom-filter", "low"]}, {"name": "zpq_reencode", "zpq": ["query", "{fixture:fixed}", "-o", "{path}", "--filter", "f64 > -1e300", "--bloom-filter", "i8:0.05", "--bloom-filter", "i32:0.05", "--bloom-filter", "i64:0.05", "--bloom-filter", "u16:0.05", "--bloom-filter", "u32:0.05", "--bloom-filter", "u64:0.05", "--bloom-filter", "f32:0.05", "--bloom-filter", "f64:0.05", "--bloom-filter", "s:0.05", "--bloom-filter", "bin:0.05", "--bloom-filter", "fsb:0.05", "--bloom-filter", "d:0.05", "--bloom-filter", "ts_us:0.05", "--bloom-filter", "ts_ms:0.05", "--bloom-filter", "ts_ns:0.05", "--bloom-filter", "t_us:0.05", "--bloom-filter", "n_i64:0.05", "--bloom-filter", "n_s:0.05", "--bloom-filter", "low:0.05"]}, {"name": "zpq_carry", "zpq": ["query", "{fixture:pyarrow_filters}", "-o", "{path}", "--columns", "i64,s,fsb,ts_us,low"]}, {"name": "fz0_z", "zpq": ["query", "{fixture:fz0}", "-o", "{path}", "--filter", "f64 > -1e300", "--bloom-filter", "d:0.4", "--bloom-filter", "i64:0.4", "--bloom-filter", "bin:0.4", "--bloom-filter", "f64:0.4"]}, {"name": "fz1_z", "zpq": ["query", "{fixture:fz1}", "-o", "{path}", "--bloom-filter", "i32:0.4", "--bloom-filter", "ts_ns:0.4", "--bloom-filter", "f64:0.4", "--bloom-filter", "u32:0.4"]}, {"name": "fz2_z", "zpq": ["query", "{fixture:fz2}", "-o", "{path}", "--bloom-filter", "ts_ns:0.1", "--bloom-filter", "u32:0.1", "--bloom-filter", "fsb:0.1", "--bloom-filter", "f64:0.1"]}, {"name": "fz3_z", "zpq": ["query", "{fixture:fz3}", "-o", "{path}", "--bloom-filter", "f64:0.1", "--bloom-filter", "i32:0.1", "--bloom-filter", "s:0.1", "--bloom-filter", "fsb:0.1"]}, {"name": "auto_dict_encode", "zpq": ["query", "{fixture:auto_dict}", "-o", "{path}", "--select", "low,i64,f32,f64,s,fixed,high,b"]}, {"name": "auto_dict_copy", "zpq": ["query", "{fixture:auto_dict}", "-o", "{path}"]}, {"name": "auto_dict_recompress", "zpq": ["query", "{fixture:auto_dict}", "-o", "{path}", "--codec", "zstd"]}, {"name": "auto_dict_filtered", "zpq": ["query", "{fixture:auto_dict}", "-o", "{path}", "--filter", "low >= 0"]}, {"name": "auto_dict_limited", "zpq": ["query", "{fixture:auto_dict}", "-o", "{path}", "--limit", "4000"]}, {"name": "auto_plain_encode", "zpq": ["query", "{fixture:auto_plain}", "-o", "{path}", "--select", "low,i64,f32,f64,s,fixed,high,b"]}, {"name": "auto_plain_limited", "zpq": ["query", "{fixture:auto_plain}", "-o", "{path}", "--limit", "4000"]}, {"name": "auto_carried", "zpq": ["query", "{fixture:auto_dict}", "-o", "{path}", "--select", "low,i64,f32,f64,s,fixed,high,b"]}],
+  "matrices": [
+    {
+      "vars": {
+        "file": {
+          "pyarrow_filters": {},
+          "zpq_copy": {},
+          "zpq_reencode": {},
+          "zpq_carry": {},
+          "fz0_z": {},
+          "fz1_z": {},
+          "fz2_z": {},
+          "fz3_z": {}
+        },
+        "col": {
+          "fixed:i8": {"c": "i8", "src": "fixed", "v0": "-81", "v1": "-121", "v2": "126", "v3": "127", "v4": "-126", "mix": "-81, 126, 127"},
+          "fixed:i32": {"c": "i32", "src": "fixed", "v0": "-377779286", "v1": "-367183664", "v2": "-379480130", "v3": "-326865717", "v4": "-323083053", "mix": "-377779286, -379480130, -326865717"},
+          "fixed:i64": {"c": "i64", "src": "fixed", "v0": "-4495605627314538", "v1": "-4497708627329259", "v2": "-4492775507241855", "v3": "-4495530331834869", "v4": "-4500655635220787", "mix": "-4495605627314538, -4492775507241855, -4495530331834869"},
+          "fixed:u16": {"c": "u16", "src": "fixed", "v0": "40292", "v1": "13907", "v2": "37536", "v3": "7956", "v4": "29860", "mix": "40292, 37536, 7956"},
+          "fixed:u32": {"c": "u32", "src": "fixed", "v0": "373468086", "v1": "326975855", "v2": "537962600", "v3": "91455334", "v4": "135439552", "mix": "373468086, 537962600, 91455334"},
+          "fixed:u64": {"c": "u64", "src": "fixed", "v0": "9223372036854803183", "v1": "9223372036854795749", "v2": "874626120175134066", "v3": "5455204491558842874", "v4": "5946719165920932948", "mix": "9223372036854803183, 874626120175134066, 5455204491558842874"},
+          "fixed:f32": {"c": "f32", "src": "fixed", "v0": "-141.5", "v1": "-366.5", "v2": "-141.4375", "v3": "-141.4375", "v4": "-141.4375", "mix": "-141.5, -141.4375, -141.4375"},
+          "fixed:f64": {"c": "f64", "src": "fixed", "v0": "2846.0", "v1": "8979.75", "v2": "2846.0625", "v3": "8979.8125", "v4": "2846.0625", "mix": "2846.0, 2846.0625, 8979.8125"},
+          "fixed:s": {"c": "s", "src": "fixed", "v0": "'k0003931kv77'", "v1": "'k000008587gu'", "v2": "'k0003931kv7~'", "v3": "'k000008587g~'", "v4": "'k0003931kv7~'", "mix": "'k0003931kv77', 'k0003931kv7~', 'k000008587g~'"},
+          "fixed:bin": {"c": "bin", "src": "fixed", "v0": "'b11151'", "v1": "'b5987'", "v2": "'b598~'", "v3": "'b1115~'", "v4": "'b1115~'", "mix": "'b11151', 'b598~', 'b1115~'"},
+          "fixed:fsb": {"c": "fsb", "src": "fixed", "v0": "'000000008095'", "v1": "'000000000781'", "v2": "'00000000809~'", "v3": "'00000000078~'", "v4": "'00000000078~'", "mix": "'000000008095', '00000000809~', '00000000078~'"},
+          "fixed:d": {"c": "d", "src": "fixed", "v0": "'2001-12-18'", "v1": "'2014-12-28'", "v2": "'2056-09-20'", "v3": "'2056-09-20'", "v4": "'2056-09-20'", "mix": "'2001-12-18', '2056-09-20', '2056-09-20'"},
+          "fixed:ts_us": {"c": "ts_us", "src": "fixed", "v0": "'2020-01-01 00:00:54.000162'", "v1": "'2020-01-01 00:26:35.004785'", "v2": "'2020-01-01 00:00:54.000163'", "v3": "'2020-01-01 00:00:54.000163'", "v4": "'2020-01-01 00:00:54.000163'", "mix": "'2020-01-01 00:00:54.000162', '2020-01-01 00:00:54.000163', '2020-01-01 00:00:54.000163'"},
+          "fixed:ts_ms": {"c": "ts_ms", "src": "fixed", "v0": "'2020-01-01 02:03:46.240000'", "v1": "'2020-01-01 01:20:37.146000'", "v2": "'2020-01-01 01:20:37.146001'", "v3": "'2020-01-01 01:20:37.146001'", "v4": "'2020-01-01 01:20:37.146001'", "mix": "'2020-01-01 02:03:46.240000', '2020-01-01 01:20:37.146001', '2020-01-01 01:20:37.146001'"},
+          "fixed:ts_ns": {"c": "ts_ns", "src": "fixed", "v0": "1600004042000028294", "v1": "1600009512000066584", "v2": "1600000186572171513", "v3": "1600008779578110107", "v4": "1600004777082425099", "mix": "1600004042000028294, 1600000186572171513, 1600008779578110107", "key": "epoch_ns(ts_ns)"},
+          "fixed:t_us": {"c": "t_us", "src": "fixed", "v0": "'23:47:32.008411'", "v1": "'23:23:29.029939'", "v2": "'23:47:32.008412'", "v3": "'23:23:29.029940'", "v4": "'23:23:29.029940'", "mix": "'23:47:32.008411', '23:47:32.008412', '23:23:29.029940'"},
+          "fixed:n_i64": {"c": "n_i64", "src": "fixed", "v0": "66027", "v1": "83382", "v2": "144184", "v3": "4052", "v4": "29004", "mix": "66027, 144184, 4052"},
+          "fixed:n_s": {"c": "n_s", "src": "fixed", "v0": "'n6816'", "v1": "'n8388'", "v2": "'n838~'", "v3": "'n681~'", "v4": "'n838~'", "mix": "'n6816', 'n838~', 'n681~'"},
+          "fixed:low": {"c": "low", "src": "fixed", "v0": "'cat13'", "v1": "'cat16'", "v2": "'cat1~'", "v3": "'cat1~'", "v4": "'cat1~'", "mix": "'cat13', 'cat1~', 'cat1~'"},
+          "fz0:d": {"c": "d", "src": "fz0", "v0": "'2003-12-01'", "v1": "'2007-01-12'", "v2": "'2058-09-03'", "v3": "'2058-09-03'", "v4": "'2058-09-03'", "mix": "'2003-12-01', '2058-09-03', '2058-09-03'"},
+          "fz0:i64": {"c": "i64", "src": "fz0", "v0": "-4498813627336994", "v1": "-4500974627352121", "v2": "-4501147291686372", "v3": "-4499799154977609", "v4": "-4499620017118522", "mix": "-4498813627336994, -4501147291686372, -4499799154977609"},
+          "fz0:bin": {"c": "bin", "src": "fz0", "v0": "'b4007'", "v1": "'b4467'", "v2": "'b446~'", "v3": "'b446~'", "v4": "'b446~'", "mix": "'b4007', 'b446~', 'b446~'"},
+          "fz0:f64": {"c": "f64", "src": "fz0", "v0": "-1768.75", "v1": "7262.875", "v2": "-1768.6875", "v3": "7262.9375", "v4": "7262.9375", "mix": "-1768.75, -1768.6875, 7262.9375"},
+          "fz1:i32": {"c": "i32", "src": "fz1", "v0": "-397964817", "v1": "-387511737", "v2": "-393690179", "v3": "-386425839", "v4": "-395052684", "mix": "-397964817, -393690179, -386425839"},
+          "fz1:ts_ns": {"c": "ts_ns", "src": "fz1", "v0": "1600000685000004795", "v1": "1600000746000005222", "v2": "1600001555775820291", "v3": "1600000561229248868", "v4": "1600000631002166866", "mix": "1600000685000004795, 1600001555775820291, 1600000561229248868", "key": "epoch_ns(ts_ns)"},
+          "fz1:f64": {"c": "f64", "src": "fz1", "v0": "7364.625", "v1": "-969.625", "v2": "-969.5625", "v3": "-969.5625", "v4": "7364.6875", "mix": "7364.625, -969.5625, -969.5625"},
+          "fz1:u32": {"c": "u32", "src": "fz1", "v0": "6526015", "v1": "36500677", "v2": "27146318", "v3": "67460680", "v4": "57695168", "mix": "6526015, 27146318, 67460680"},
+          "fz2:ts_ns": {"c": "ts_ns", "src": "fz2", "v0": "1600000720000005040", "v1": "1600000290000002030", "v2": "1600000154923933548", "v3": "1600000652844837435", "v4": "1600000691613815310", "mix": "1600000720000005040, 1600000154923933548, 1600000652844837435", "key": "epoch_ns(ts_ns)"},
+          "fz2:u32": {"c": "u32", "src": "fz2", "v0": "20928255", "v1": "24663836", "v2": "25732187", "v3": "3133265", "v4": "16551413", "mix": "20928255, 25732187, 3133265"},
+          "fz2:fsb": {"c": "fsb", "src": "fz2", "v0": "'000000000657'", "v1": "'000000000451'", "v2": "'00000000065~'", "v3": "'00000000065~'", "v4": "'00000000065~'", "mix": "'000000000657', '00000000065~', '00000000065~'"},
+          "fz2:f64": {"c": "f64", "src": "fz2", "v0": "98.75", "v1": "-2371.0", "v2": "-2370.9375", "v3": "-2370.9375", "v4": "98.8125", "mix": "98.75, -2370.9375, -2370.9375"},
+          "fz3:f64": {"c": "f64", "src": "fz3", "v0": "750.875", "v1": "-575.5", "v2": "-575.4375", "v3": "750.9375", "v4": "-575.4375", "mix": "750.875, -575.4375, 750.9375"},
+          "fz3:i32": {"c": "i32", "src": "fz3", "v0": "-397545110", "v1": "-393641043", "v2": "-384277707", "v3": "-391962188", "v4": "-386480301", "mix": "-397545110, -384277707, -391962188"},
+          "fz3:s": {"c": "s", "src": "fz3", "v0": "'k0001886e2hz'", "v1": "'k0000268g61a'", "v2": "'k0001886e2h~'", "v3": "'k0000268g61~'", "v4": "'k0001886e2h~'", "mix": "'k0001886e2hz', 'k0001886e2h~', 'k0000268g61~'"},
+          "fz3:fsb": {"c": "fsb", "src": "fz3", "v0": "'000000002975'", "v1": "'000000002707'", "v2": "'00000000297~'", "v3": "'00000000297~'", "v4": "'00000000297~'", "mix": "'000000002975', '00000000297~', '00000000297~'"}
+        },
+        "lookup": {
+          "present0": {"zf": "${c} = ${v0}", "df": "${key} = ${v0}"},
+          "present1": {"zf": "${c} = ${v1}", "df": "${key} = ${v1}"},
+          "absent2": {"zf": "${c} = ${v2}", "df": "${key} = ${v2}"},
+          "absent3": {"zf": "${c} = ${v3}", "df": "${key} = ${v3}"},
+          "absent4": {"zf": "${c} = ${v4}", "df": "${key} = ${v4}"},
+          "in": {"zf": "${c} IN (${mix})", "df": "${key} IN (${mix})"},
+          "or-null": {"zf": "${c} = ${v2} OR ${c} IS NULL", "df": "${key} = ${v2} OR ${c} IS NULL"}
+        }
+      },
+      "defaults": {"key": "${c}"},
+      "cells": {"pyarrow_filters": ["fixed:i8", "fixed:i32", "fixed:i64", "fixed:u16", "fixed:u32", "fixed:u64", "fixed:f32", "fixed:f64", "fixed:s", "fixed:bin", "fixed:fsb", "fixed:d", "fixed:ts_us", "fixed:ts_ms", "fixed:ts_ns", "fixed:t_us", "fixed:n_i64", "fixed:n_s", "fixed:low"], "zpq_copy": ["fixed:i8", "fixed:i32", "fixed:i64", "fixed:u16", "fixed:u32", "fixed:u64", "fixed:f32", "fixed:f64", "fixed:s", "fixed:bin", "fixed:fsb", "fixed:d", "fixed:ts_us", "fixed:ts_ms", "fixed:ts_ns", "fixed:t_us", "fixed:n_i64", "fixed:n_s", "fixed:low"], "zpq_reencode": ["fixed:i8", "fixed:i32", "fixed:i64", "fixed:u16", "fixed:u32", "fixed:u64", "fixed:f32", "fixed:f64", "fixed:s", "fixed:bin", "fixed:fsb", "fixed:d", "fixed:ts_us", "fixed:ts_ms", "fixed:ts_ns", "fixed:t_us", "fixed:n_i64", "fixed:n_s", "fixed:low"], "zpq_carry": ["fixed:i64", "fixed:s", "fixed:fsb", "fixed:ts_us", "fixed:low"], "fz0_z": ["fz0:d", "fz0:i64", "fz0:bin", "fz0:f64"], "fz1_z": ["fz1:i32", "fz1:ts_ns", "fz1:f64", "fz1:u32"], "fz2_z": ["fz2:ts_ns", "fz2:u32", "fz2:fsb", "fz2:f64"], "fz3_z": ["fz3:f64", "fz3:i32", "fz3:s", "fz3:fsb"]},
+      "case": {"id": "bloom:${file}:${c}:${lookup}", "fixture": "${file}", "query": {"aggregate": "count(*) AS n", "filter": "${zf}"}, "axes": [{}, {"scan_all": true}], "oracle": {"compare": "agg", "sql": "SELECT count(*) FROM '{fixture:${src}}' WHERE ${df}"}}
+    },
+    {
+      "vars": {
+        "mode": {
+          "encode": {"flags": ["--select", "low,i64,f32,f64,s,fixed,high,b"]},
+          "copy": {"flags": []},
+          "recompress": {"flags": ["--codec", "zstd"]},
+          "filtered": {"flags": ["--filter", "low >= 0"]},
+          "limited": {"flags": ["--limit", "4000"]}
+        },
+        "opt": {
+          "auto": {"opts": [], "rule": "dictionary"},
+          "off": {"opts": ["--no-bloom-filters"], "rule": "names"},
+          "explicit": {"opts": ["--no-bloom-filters", "--bloom-filter", "high:0.001"], "rule": "names", "must": ["high"]}
+        },
+        "src": {
+          "plain": {},
+          "dict": {}
+        },
+        "check": {
+          "filters": {"oracle": {"compare": "bloom", "bloom_on": "${rule}", "names": "${must}"}},
+          "reads": {"oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "types": "${types}"}}
+        }
+      },
+      "defaults": {"types": ["int32", "int64", "float", "double", "string", "fixed_size_binary[5]", "int64", "bool"]},
+      "cells": {"encode": ["auto", "off", "explicit"], "copy": ["auto", "off", "explicit"], "recompress": ["auto", "off", "explicit"], "filtered": ["auto", "off", "explicit"], "limited": ["auto", "off"]},
+      "case": {"id": "bloom:auto:${src}:${mode}:${opt}:${check}", "fixture": "auto_${src}", "cli": ["query", "{path}", "-o", "{out}", "${flags}", "${opts}"], "oracle": "${oracle}"}
+    },
+    {
+      "vars": {
+        "file": {
+          "dict_encode": {"src": "dict"},
+          "dict_copy": {"src": "dict"},
+          "dict_recompress": {"src": "dict"},
+          "dict_filtered": {"src": "dict"},
+          "dict_limited": {"src": "dict"},
+          "plain_encode": {"src": "plain"},
+          "plain_limited": {"src": "plain"}
+        },
+        "look": {
+          "prunes": {"cli": ["query", "{path}", "--filter", "low = 1", "--aggregate", "count(*) AS n", "--summary=json"], "oracle": {"compare": "summary", "pruned": true}},
+          "absent": {"query": {"aggregate": "count(*) AS n", "filter": "low = 1"}, "oracle": {"compare": "agg", "sql": "SELECT count(*) FROM '{fixture:auto_${src}}' WHERE low = 1"}},
+          "present": {"query": {"aggregate": "count(*) AS n", "filter": "low = 2"}, "oracle": {"compare": "agg", "sql": "SELECT count(*) FROM '{fixture:auto_${src}}' WHERE low = 2"}}
+        }
+      },
+      "case": {"id": "bloom:auto:${file}:${look}", "fixture": "auto_${file}", "cli": "${cli}", "query": "${query}", "oracle": "${oracle}"}
+    },
+    {
+      "vars": {
+        "src": {
+          "plain": {},
+          "dict": {}
+        },
+        "opt": {
+          "auto": {"opts": []},
+          "off": {"opts": ["--no-bloom-filters"], "on": "names"}
+        },
+        "check": {
+          "filters": {"oracle": {"compare": "bloom", "bloom_on": "${on}"}},
+          "rows": {"oracle": {"compare": "except", "duck_select": "high, min(low) AS low", "where": "true GROUP BY high", "schema": ["high", "low"]}}
+        }
+      },
+      "case": {"id": "bloom:auto:${src}:aggregate:${opt}:${check}", "fixture": "auto_${src}", "axes": [{"jobs": 1}, {"jobs": 3}], "cli": ["query", "--query", "SELECT high, min(low) AS low FROM '{path}' GROUP BY high", "-o", "{out}", "${opts}"], "oracle": "${oracle}"}
+    }
+  ],
+  "cases": [
+    {"id": "bloom:pyarrow_filters:filters", "fixture": "pyarrow_filters", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom"}},
+    {"id": "bloom:zpq_copy:filters", "fixture": "zpq_copy", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom", "names": ["i8", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "s", "bin", "fsb", "d", "ts_us", "ts_ms", "ts_ns", "t_us", "n_i64", "n_s", "low"]}},
+    {"id": "bloom:zpq_copy:reads-back", "fixture": "fixed", "cli": ["query", "{path}", "-o", "{out}", "--bloom-filter", "i8", "--bloom-filter", "i32", "--bloom-filter", "i64", "--bloom-filter", "u16", "--bloom-filter", "u32", "--bloom-filter", "u64", "--bloom-filter", "f32", "--bloom-filter", "f64", "--bloom-filter", "s", "--bloom-filter", "bin", "--bloom-filter", "fsb", "--bloom-filter", "d", "--bloom-filter", "ts_us", "--bloom-filter", "ts_ms", "--bloom-filter", "ts_ns", "--bloom-filter", "t_us", "--bloom-filter", "n_i64", "--bloom-filter", "n_s", "--bloom-filter", "low"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+    {"id": "bloom:zpq_reencode:filters", "fixture": "zpq_reencode", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom", "names": ["i8", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "s", "bin", "fsb", "d", "ts_us", "ts_ms", "ts_ns", "t_us", "n_i64", "n_s", "low"]}},
+    {"id": "bloom:zpq_reencode:reads-back", "fixture": "fixed", "cli": ["query", "{path}", "-o", "{out}", "--filter", "f64 > -1e300", "--bloom-filter", "i8:0.05", "--bloom-filter", "i32:0.05", "--bloom-filter", "i64:0.05", "--bloom-filter", "u16:0.05", "--bloom-filter", "u32:0.05", "--bloom-filter", "u64:0.05", "--bloom-filter", "f32:0.05", "--bloom-filter", "f64:0.05", "--bloom-filter", "s:0.05", "--bloom-filter", "bin:0.05", "--bloom-filter", "fsb:0.05", "--bloom-filter", "d:0.05", "--bloom-filter", "ts_us:0.05", "--bloom-filter", "ts_ms:0.05", "--bloom-filter", "ts_ns:0.05", "--bloom-filter", "t_us:0.05", "--bloom-filter", "n_i64:0.05", "--bloom-filter", "n_s:0.05", "--bloom-filter", "low:0.05"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+    {"id": "bloom:zpq_carry:filters", "fixture": "zpq_carry", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom"}},
+    {"id": "bloom:pyarrow_filters:prunes", "fixture": "pyarrow_filters", "cli": ["query", "{path}", "--filter", "i64 = -4492775507241855", "--aggregate", "count(*) AS n", "--summary=json"], "oracle": {"compare": "summary", "pruned": true}},
+    {"id": "bloom:zpq_copy:prunes", "fixture": "zpq_copy", "cli": ["query", "{path}", "--filter", "i64 = -4492775507241855", "--aggregate", "count(*) AS n", "--summary=json"], "oracle": {"compare": "summary", "pruned": true}},
+    {"id": "bloom:zpq_reencode:prunes", "fixture": "zpq_reencode", "cli": ["query", "{path}", "--filter", "i64 = -4492775507241855", "--aggregate", "count(*) AS n", "--summary=json"], "oracle": {"compare": "summary", "pruned": true}},
+    {"id": "bloom:zpq_carry:prunes", "fixture": "zpq_carry", "cli": ["query", "{path}", "--filter", "i64 = -4492775507241855", "--aggregate", "count(*) AS n", "--summary=json"], "oracle": {"compare": "summary", "pruned": true}},
+    {"id": "bloom:fz0_z:filters", "fixture": "fz0_z", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom"}},
+    {"id": "bloom:fz1_z:filters", "fixture": "fz1_z", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom"}},
+    {"id": "bloom:fz2_z:filters", "fixture": "fz2_z", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom"}},
+    {"id": "bloom:fz3_z:filters", "fixture": "fz3_z", "query": {"aggregate": "count(*) AS n"}, "oracle": {"compare": "bloom"}},
+    {"id": "bloom:auto:carried:filters", "fixture": "auto_carried", "cli": ["query", "{path}", "-o", "{out}", "--no-bloom-filters"], "oracle": {"compare": "bloom", "bloom_on": "dictionary"}},
+    {"id": "bloom:auto:carried:reads", "fixture": "auto_carried", "cli": ["query", "{path}", "-o", "{out}", "--no-bloom-filters"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "types": ["int32", "int64", "float", "double", "string", "fixed_size_binary[5]", "int64", "bool"]}},
+    {"id": "bloom:auto:nested:filters", "fixture": "auto_nested", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "bloom", "bloom_on": "dictionary", "names": ["xs.list.element"]}},
+    {"id": "bloom:auto:nested:reads", "fixture": "auto_nested", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "types": ["list<element: int64>"]}},
+    {"id": "bloom:auto:int96:auto:filters", "fixture": "auto_int96", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "bloom", "bloom_on": "dictionary", "names": ["t"], "types": ["INT96"]}},
+    {"id": "bloom:auto:int96:auto:reads", "fixture": "auto_int96", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "types": ["timestamp[ns]"]}},
+    {"id": "bloom:auto:int96:off:filters", "fixture": "auto_int96", "cli": ["query", "{path}", "-o", "{out}", "--no-bloom-filters"], "oracle": {"compare": "bloom", "bloom_on": "names", "types": ["INT96"]}},
+    {"id": "bloom:auto:int96:off:reads", "fixture": "auto_int96", "cli": ["query", "{path}", "-o", "{out}", "--no-bloom-filters"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "types": ["timestamp[ns]"]}},
+    {"id": "bloom:auto:fallback:filters", "fixture": "auto_fallback", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "bloom", "bloom_on": "names"}},
+    {"id": "bloom:auto:fallback:reads", "fixture": "auto_fallback", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "types": ["string"]}}
+  ]
+}

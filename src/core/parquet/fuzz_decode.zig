@@ -3,7 +3,7 @@
 //!
 //! Contract under test: parsing *arbitrary* bytes must never crash, read
 //! out of bounds, or overflow — it must either return a fully-formed
-//! structure or a clean error. ZPQ ships ReleaseFast (Zig's runtime safety
+//! structure or a clean error. zpq ships ReleaseFast (Zig's runtime safety
 //! checks OFF), so these targets earn their keep by running under the
 //! safety-checked test build: any OOB / overflow / UB reached on hostile
 //! input surfaces here as a clean trap instead of silent corruption in
@@ -46,8 +46,8 @@ fn tryOpen(arena: std.mem.Allocator, bytes: []const u8) void {
 
 /// Legacy LZ4 page decode: the whole fallback chain plus each container parser on its own, into an `out` the
 /// caller sized (the page header's claim, which an attacker also controls).
-fn tryLz4Legacy(arena: std.mem.Allocator, src: []const u8, out: []u8) void {
-    compression.decompressInto(arena, src, .LZ4, out) catch {};
+fn tryLz4Legacy(src: []const u8, out: []u8) void {
+    compression.decompressInto(src, .LZ4, out) catch {};
     lz4.uncompressHadoop(src, out) catch {};
     _ = lz4.uncompressFrame(src, out) catch {};
 }
@@ -129,7 +129,7 @@ test "fuzz-lite: mutated legacy LZ4 pages decode or fail cleanly" {
     // The unmutated seeds must decode, or the loop below would only ever exercise error paths.
     for (seeds.pages, seeds.sizes) |page, size| {
         const out = try seed_arena.allocator().alloc(u8, size);
-        try compression.decompressInto(seed_arena.allocator(), page, .LZ4, out);
+        try compression.decompressInto(page, .LZ4, out);
     }
 
     var prng = std.Random.DefaultPrng.init(LZ4_SEED);
@@ -181,9 +181,7 @@ test "fuzz-lite: mutated legacy LZ4 pages decode or fail cleanly" {
             else => rand.uintAtMost(usize, out_buf.len),
         };
 
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        tryLz4Legacy(arena.allocator(), buf[0..n], out_buf[0..out_len]);
+        tryLz4Legacy(buf[0..n], out_buf[0..out_len]);
     }
 }
 
@@ -227,9 +225,7 @@ fn fuzzLz4Legacy(buf: *FuzzBuf, smith: *std.testing.Smith) anyerror!void {
     const out_len = std.mem.readInt(u16, buf[0..2], .little);
     const out = try std.testing.allocator.alloc(u8, out_len);
     defer std.testing.allocator.free(out);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    tryLz4Legacy(arena.allocator(), buf[2..n], out);
+    tryLz4Legacy(buf[2..n], out);
 }
 
 test "fuzz: legacy LZ4 page decode tolerates arbitrary bytes" {

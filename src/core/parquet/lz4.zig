@@ -1,5 +1,6 @@
 //! LZ4 for Parquet: the block format (LZ4_RAW, codec 7) plus the two
-//! containers the deprecated LZ4 codec (codec 5) shows up in.
+//! containers the deprecated LZ4 codec (codec 5) shows up in. Decoding only:
+//! LZ4_RAW pages are written by liblz4 (vendor/lz4, compression.zig).
 //!
 //! Codec 5 is ambiguous in the wild (PARQUET-1241): parquet-mr wrote Hadoop's
 //! BlockCompressorStream framing, older parquet-cpp a bare block, older
@@ -241,152 +242,20 @@ fn decodeFrameBody(src: []const u8, s_idx: *usize, dest: []u8, d_start: usize) E
 }
 
 // ============================================================
-// Compression (greedy LZ4 block encoder)
-// ============================================================
-//
-// Standard fast LZ4: a 4-byte rolling hash maps positions; at each spot we
-// probe the table for a ≥4-byte match within 64 KB, extend it greedily, emit
-// the pending literals + match, and continue. End-of-block rules from the
-// reference encoder are honoured so *any* LZ4 decoder (pyarrow/cramjam/arrow)
-// reads our output: the last 5 bytes are always literals (LASTLITERALS) and no
-// match is searched within the last 12 bytes (MFLIMIT).
-
-const MINMATCH: usize = 4;
-const MFLIMIT: usize = 12;
-const LASTLITERALS: usize = 5;
-const HASH_LOG = 16;
-pub const HASH_SIZE: usize = 1 << HASH_LOG;
-
-fn hash4(seq: u32) u32 {
-    return (seq *% 2654435761) >> (32 - HASH_LOG);
-}
-
-fn readU32(buf: []const u8, i: usize) u32 {
-    return std.mem.readInt(u32, buf[i..][0..4], .little);
-}
-
-/// Maximum compressed size for `n` input bytes (reference LZ4_compressBound).
-pub fn compressBound(n: usize) usize {
-    return n + (n / 255) + 16;
-}
-
-/// Compress `src` into `dest` (≥ `compressBound(src.len)`). `table` is a
-/// caller-provided scratch hash table of `HASH_SIZE` entries (kept off the
-/// stack — 256 KB). Returns the number of bytes written.
-pub fn compress(src: []const u8, dest: []u8, table: []u32) Error!usize {
-    @memset(table, 0); // 0 = empty; we store position+1
-    var d_idx: usize = 0;
-    var anchor: usize = 0; // start of the not-yet-emitted literal run
-    var s_idx: usize = 0;
-
-    if (src.len >= MFLIMIT + 1) {
-        const mf_limit = src.len - MFLIMIT; // no match search at/after here
-        const match_limit = src.len - LASTLITERALS; // matches can't cover these
-        s_idx = 1;
-        while (s_idx < mf_limit) {
-            const seq = readU32(src, s_idx);
-            const h = hash4(seq);
-            const cand = table[h];
-            table[h] = @intCast(s_idx + 1);
-            const matched = cand != 0 and blk: {
-                const m = cand - 1;
-                break :blk (s_idx - m) <= 65535 and readU32(src, m) == seq;
-            };
-            if (!matched) {
-                s_idx += 1;
-                continue;
-            }
-            const m = cand - 1;
-            const offset = s_idx - m;
-            // Extend the match forward (stop short of the last 5 literals).
-            var mlen: usize = MINMATCH;
-            while (s_idx + mlen < match_limit and src[m + mlen] == src[s_idx + mlen]) mlen += 1;
-            try emitSequence(dest, &d_idx, src, anchor, s_idx, offset, mlen);
-            s_idx += mlen;
-            anchor = s_idx;
-        }
-    }
-    try emitLastLiterals(dest, &d_idx, src, anchor);
-    return d_idx;
-}
-
-fn emitLen(dest: []u8, d_idx: *usize, extra: usize) void {
-    var rem = extra;
-    while (rem >= 255) : (rem -= 255) {
-        dest[d_idx.*] = 255;
-        d_idx.* += 1;
-    }
-    dest[d_idx.*] = @intCast(rem);
-    d_idx.* += 1;
-}
-
-fn emitSequence(dest: []u8, d_idx: *usize, src: []const u8, anchor: usize, s_idx: usize, offset: usize, mlen: usize) Error!void {
-    const litlen = s_idx - anchor;
-    const ml_field = mlen - MINMATCH;
-    const tok_lit: u8 = if (litlen >= 15) 15 else @intCast(litlen);
-    const tok_ml: u8 = if (ml_field >= 15) 15 else @intCast(ml_field);
-    if (d_idx.* + 1 > dest.len) return error.OutputTooSmall;
-    dest[d_idx.*] = (tok_lit << 4) | tok_ml;
-    d_idx.* += 1;
-    if (litlen >= 15) emitLen(dest, d_idx, litlen - 15);
-    @memcpy(dest[d_idx.*..][0..litlen], src[anchor..][0..litlen]);
-    d_idx.* += litlen;
-    std.mem.writeInt(u16, dest[d_idx.*..][0..2], @intCast(offset), .little);
-    d_idx.* += 2;
-    if (ml_field >= 15) emitLen(dest, d_idx, ml_field - 15);
-}
-
-fn emitLastLiterals(dest: []u8, d_idx: *usize, src: []const u8, anchor: usize) Error!void {
-    const litlen = src.len - anchor;
-    const tok_lit: u8 = if (litlen >= 15) 15 else @intCast(litlen);
-    if (d_idx.* + 1 > dest.len) return error.OutputTooSmall;
-    dest[d_idx.*] = tok_lit << 4;
-    d_idx.* += 1;
-    if (litlen >= 15) emitLen(dest, d_idx, litlen - 15);
-    @memcpy(dest[d_idx.*..][0..litlen], src[anchor..][0..litlen]);
-    d_idx.* += litlen;
-}
-
-// ============================================================
 // Tests
 // ============================================================
 
 const testing = std.testing;
 
-test "compress→uncompress round-trip (literals, matches, RLE, large)" {
-    const table = try testing.allocator.alloc(u32, HASH_SIZE);
-    defer testing.allocator.free(table);
-
-    const cases = [_][]const u8{
-        "",
-        "a",
-        "hello world",
-        "ababababababababababab", // short-offset overlapping matches
-        "the quick brown fox jumps over the quick brown fox jumps over the lazy dog",
-    };
-    for (cases) |input| {
-        const dst = try testing.allocator.alloc(u8, compressBound(input.len));
-        defer testing.allocator.free(dst);
-        const clen = try compress(input, dst, table);
-        const out = try testing.allocator.alloc(u8, input.len);
-        defer testing.allocator.free(out);
-        const n = try uncompress(dst[0..clen], out);
-        try testing.expectEqual(input.len, n);
-        try testing.expectEqualSlices(u8, input, out[0..n]);
-    }
-
-    // Highly compressible: 4 KB of one byte must shrink and round-trip.
-    const big = try testing.allocator.alloc(u8, 4096);
-    defer testing.allocator.free(big);
-    @memset(big, 'Z');
-    const cbig = try testing.allocator.alloc(u8, compressBound(big.len));
-    defer testing.allocator.free(cbig);
-    const cn = try compress(big, cbig, table);
-    try testing.expect(cn < big.len); // actually compressed
-    const obig = try testing.allocator.alloc(u8, big.len);
-    defer testing.allocator.free(obig);
-    const n2 = try uncompress(cbig[0..cn], obig);
-    try testing.expectEqualSlices(u8, big, obig[0..n2]);
+/// `data` as one LZ4 block from liblz4, the reference encoder, for the decoder's tests.
+fn testBlock(data: []const u8) ![]u8 {
+    const c_lz4 = @import("lz4_c");
+    const bound: usize = @intCast(c_lz4.LZ4_compressBound(@intCast(data.len)));
+    const block = try testing.allocator.alloc(u8, bound);
+    errdefer testing.allocator.free(block);
+    const n = c_lz4.LZ4_compress_default(data.ptr, block.ptr, @intCast(data.len), @intCast(bound));
+    if (n <= 0) return error.CompressionFailed;
+    return testing.allocator.realloc(block, @intCast(n));
 }
 
 test "uncompress empty input" {
@@ -429,11 +298,11 @@ test "uncompress with match (overlapping copy)" {
     // Let's just do: lit "ab" + match offset=2 len=4 (=4 from token) +
     // final lit "X".
     const src = [_]u8{
-        0x20,            // token: lit_len=2, match_len_field=0 (=4 final)
-        'a', 'b',        // literals
-        0x02, 0x00,      // offset=2 LE
-        0x10,            // token: lit_len=1, match_len_field=0
-        'X',             // final literal
+        0x20, // token: lit_len=2, match_len_field=0 (=4 final)
+        'a', 'b', // literals
+        0x02, 0x00, // offset=2 LE
+        0x10, // token: lit_len=1, match_len_field=0
+        'X', // final literal
     };
     var out: [16]u8 = undefined;
     const n = try uncompress(&src, &out);
@@ -478,18 +347,15 @@ test "uncompress canned LZ4 block" {
 
 // ----- Legacy codec 5 containers -----
 
-/// Append one Hadoop chunk (`[ulen BE][clen BE][block]`) holding `data`, compressed with our block encoder.
+/// Append one Hadoop chunk (`[ulen BE][clen BE][block]`) holding `data`, compressed by liblz4.
 fn appendHadoopChunk(list: *std.ArrayList(u8), data: []const u8) !void {
-    const table = try testing.allocator.alloc(u32, HASH_SIZE);
-    defer testing.allocator.free(table);
-    const block = try testing.allocator.alloc(u8, compressBound(data.len));
+    const block = try testBlock(data);
     defer testing.allocator.free(block);
-    const clen = try compress(data, block, table);
     var prefix: [8]u8 = undefined;
     std.mem.writeInt(u32, prefix[0..4], @intCast(data.len), .big);
-    std.mem.writeInt(u32, prefix[4..8], @intCast(clen), .big);
+    std.mem.writeInt(u32, prefix[4..8], @intCast(block.len), .big);
     try list.appendSlice(testing.allocator, &prefix);
-    try list.appendSlice(testing.allocator, block[0..clen]);
+    try list.appendSlice(testing.allocator, block);
 }
 
 const hadoop_parts = [_][]const u8{
@@ -575,18 +441,15 @@ test "hadoop: lying lengths are rejected" {
 /// One Hadoop chunk the way BlockCompressorStream writes a single write() larger than its buffer: the total
 /// uncompressed length once, then a `[clen BE][block]` piece per `pieces` entry, each compressed on its own.
 fn appendHadoopMultiPiece(list: *std.ArrayList(u8), ulen: u32, pieces: []const []const u8) !void {
-    const table = try testing.allocator.alloc(u32, HASH_SIZE);
-    defer testing.allocator.free(table);
     var prefix: [4]u8 = undefined;
     std.mem.writeInt(u32, &prefix, ulen, .big);
     try list.appendSlice(testing.allocator, &prefix);
     for (pieces) |p| {
-        const block = try testing.allocator.alloc(u8, compressBound(p.len));
+        const block = try testBlock(p);
         defer testing.allocator.free(block);
-        const clen = try compress(p, block, table);
-        std.mem.writeInt(u32, &prefix, @intCast(clen), .big);
+        std.mem.writeInt(u32, &prefix, @intCast(block.len), .big);
         try list.appendSlice(testing.allocator, &prefix);
-        try list.appendSlice(testing.allocator, block[0..clen]);
+        try list.appendSlice(testing.allocator, block);
     }
 }
 

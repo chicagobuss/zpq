@@ -1,4 +1,4 @@
-//! ZPQ Lambda binary entry point.
+//! zpq Lambda binary entry point.
 //!
 //! Constraints established by docs/lambda_capabilities.md:
 //!   - io_uring is unavailable (AWS seccomp returns ENOSYS).
@@ -7,24 +7,28 @@
 //!   - SO_ZEROCOPY and TCP_FASTOPEN setsockopt allowed.
 //!
 //! Lifecycle (production / S3 path):
-//!   1. Receive `{"s3_url": "...", "filter": "...optional..."}`.
-//!   2. Suffix GET for the last 64 KB to discover file size + footer.
-//!   3. If the footer is bigger than 64 KB, fetch the rest.
-//!   4. Parse FileMetaData. If filter is present, parse it against
+//!   1. Before the first `/next`, open `ZPQ_S3_PRECONNECT` connections (default 4) to the
+//!      regional endpoint and park them. Failures are ignored.
+//!   2. Receive `{"s3_url": "...", "filter": "...optional..."}`.
+//!   3. One suffix GET (`engine.footerProbeFor`) for the file size and footer. An explicit
+//!      `ZPQ_S3_FOOTER_PROBE` cannot exceed the memory budget.
+//!   4. If the footer is bigger than that suffix, fetch the missing prefix. The leading
+//!      PAR1 is checked only when a fetched range already covers offset 0.
+//!   5. Parse FileMetaData. If filter is present, parse it against
 //!      the schema.
-//!   5. For each row group: prune via the filter's stats. For
+//!   6. For each row group: prune via the filter's stats. For
 //!      survivors, range-fetch the int8 column AND any filter
 //!      columns. Coalesce nearby ranges.
-//!   6. Decode each column into typed slices, build a SelectionVector,
+//!   7. Decode each column into typed slices, build a SelectionVector,
 //!      run filter.eval, then aggregate matched int8 values.
-//!   7. Return JSON envelope with row_groups_pruned + matched count
+//!   8. Return JSON envelope with row_groups_pruned + matched count
 //!      + min/max/sum.
 
 const std = @import("std");
 const zpq = @import("zpq");
 const nowMonoNs = zpq.clock.monoNs;
 const runtime = @import("runtime.zig");
-const request = @import("request.zig");
+const service = @import("service");
 // Lambda's per-file fetch+scan helper; distinct from the core
 // multi-file orchestrator at `core.scan` which does the SHARED
 // agg pipeline both the CLI and Lambda call into.
@@ -54,80 +58,18 @@ const filter_eval = zpq.core.filter.eval;
 const partition = zpq.core.filter.partition;
 const schema_tree = zpq.core.parquet.schema_tree;
 
-const TAIL_SIZE: u64 = 64 * 1024;
+pub const std_options: std.Options = .{ .signal_stack_size = zpq.core.spawn.signal_stack_size };
+
 const COALESCE_GAP: u64 = 64 * 1024;
 const TARGET_COLUMN: []const u8 = "int8";
 
-/// Persistent state that lives for the lifetime of one Lambda
-/// container (across invocations): connection pool + metadata cache.
-/// `s3.Pool` keeps a bounded request permit queue plus a host-keyed
-/// idle LRU, so changing input/output buckets no longer tears down
-/// the whole warm pool. Output uploads take permits of their own over
-/// the same connections (`engine.OutputLane`). `meta_cache` caches
-/// parquet footers keyed by (bucket, key) and revalidates with
-/// `If-None-Match`.
-const PersistentPool = struct {
-    const Inner = s3.Pool(POOL_SIZE);
-    /// Capacity tuned for typical Lambda fan-out (up to a few dozen
-    /// distinct files in a single invocation, plus carryover across
-    /// warm calls). Each entry stores a parquet footer (~hundreds of
-    /// bytes to a few KB), so even at the cap the cache is sub-MB.
-    const META_CACHE_CAPACITY: usize = 128;
-
-    inner: Inner = undefined,
-    cache: zpq.io.meta_cache.MetaCache = undefined,
-    initialized: bool = false,
-    output: engine.OutputLane = undefined,
-    output_initialized: bool = false,
-
-    pub fn ensureForBucket(
-        self: *PersistentPool,
-        gpa: std.mem.Allocator,
-        creds: s3.Credentials,
-        bucket: []const u8,
-    ) !*Inner {
-        _ = creds;
-        _ = bucket;
-        if (self.initialized) return &self.inner;
-
-        try self.inner.init(gpa);
-        self.cache.init(gpa, META_CACHE_CAPACITY);
-        self.initialized = true;
-        return &self.inner;
-    }
-
-    pub fn ensureOutput(
-        self: *PersistentPool,
-        gpa: std.mem.Allocator,
-        creds: s3.Credentials,
-        bucket: []const u8,
-    ) !*engine.OutputLane {
-        const inner = try self.ensureForBucket(gpa, creds, bucket);
-        if (!self.output_initialized) {
-            self.output.init(inner);
-            self.output_initialized = true;
-        }
-        return &self.output;
-    }
-
-    pub fn metaCache(self: *PersistentPool) ?*zpq.io.meta_cache.MetaCache {
-        return if (self.initialized) &self.cache else null;
-    }
-
-    /// Zero the connection-pool counters, so `stats` after a query reports that invocation alone.
-    pub fn resetStats(self: *PersistentPool) void {
-        if (self.initialized) self.inner.resetStats();
-    }
-
-    pub fn stats(self: *PersistentPool) Inner.Stats {
-        return if (self.initialized) self.inner.snapshotStats() else .{};
-    }
-};
-
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    zpq.cpu_level.require();
+    const allocator = zpq.core.memory.processAllocator(init.gpa);
     const env = init.minimal.environ;
     const io = init.io;
+    zpq.local_fs.raiseOpenFileLimit();
+    zpq.core.memory.fixHeapThreshold();
 
     var client = runtime.Client.fromEnv(allocator, env) catch |err| {
         std.debug.print("zpq lambda: runtime client init failed: {s}\n", .{@errorName(err)});
@@ -135,7 +77,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
-    var pool: PersistentPool = .{};
+    var pool: service.PersistentPool = .sized(zpq.core.system.discoverAvailableMemory(env));
+    service.preconnectS3(io, allocator, env, &pool);
 
     while (true) {
         var inv = client.nextInvocation() catch |err| {
@@ -146,343 +89,101 @@ pub fn main(init: std.process.Init) !void {
         };
         defer inv.deinit(allocator);
 
-        const response = handle(io, allocator, env, &inv, &pool) catch |err| {
-            client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
+        // A second short of the invocation's deadline: S3 requests stop there, and the caller hears why rather than
+        // nothing when the sandbox is stopped (`Watchdog`).
+        const left_ms: ?u64 = if (inv.deadline_ms) |d| @intCast(@max(0, d - zpq.clock.realtimeMs() - 1000)) else null;
+        zpq.io.tls.setInvocationDeadline(left_ms);
+        defer zpq.io.tls.setInvocationDeadline(null);
+        var watchdog: Watchdog = .{ .client = &client, .request_id = inv.request_id };
+        const watcher: ?std.Thread = if (left_ms) |ms| std.Thread.spawn(.{}, Watchdog.run, .{ &watchdog, ms }) catch
+            null else null;
+        defer if (watcher) |t| watchdog.stop(t);
+
+        const response = service.handle(io, allocator, env, inv.body, &pool, legacy) catch |err| {
+            if (watchdog.claim()) client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
             continue;
         };
         defer allocator.free(response);
+        if (!watchdog.claim()) {
+            std.debug.print("zpq lambda: answered past the deadline; the invocation was failed already\n", .{});
+            continue;
+        }
 
+        // Past the runtime API's limit the caller got AWS's generic payload error and no reason: say why, and how to
+        // get the answer instead. One the runtime refuses, or drops while it is sent, is reported the same way.
+        if (response.len > runtime.MAX_POST_BYTES) {
+            var buf: [256]u8 = undefined;
+            const why = std.fmt.bufPrint(&buf, "the response is {d} bytes, past the {d} a Lambda response may be: " ++
+                "write the answer to output_url", .{ response.len, runtime.MAX_POST_BYTES }) catch "ResultTooLarge";
+            postFailure(&client, inv.request_id, "ResultTooLarge", why);
+            continue;
+        }
         client.postResponse(inv.request_id, response) catch |err| {
             std.debug.print("zpq lambda: postResponse failed: {s}\n", .{@errorName(err)});
+            postFailure(&client, inv.request_id, "ResponseNotPosted", @errorName(err));
         };
     }
 }
 
-fn handle(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    env: std.process.Environ,
-    inv: *const runtime.Invocation,
-    pool: *PersistentPool,
-) ![]u8 {
-    if (inv.body.len == 0) {
-        return std.fmt.allocPrint(allocator, "{{\"error\":\"empty_body\"}}", .{});
-    }
+/// Fails the invocation through /error once its deadline is a second away and the handler has not answered: a query
+/// still computing then was stopped with the sandbox, and the caller was told nothing. Whichever of it and the loop
+/// claims the invocation first posts for it.
+const Watchdog = struct {
+    client: *runtime.Client,
+    request_id: []const u8,
+    /// 0 unanswered, 1 claimed by the loop, 2 by the watchdog.
+    owner: std.atomic.Value(u32) = .init(0),
+    /// Futex word: 1 once the loop is done with the invocation.
+    done: std.atomic.Value(u32) = .init(0),
 
-    const trimmed = std.mem.trim(u8, inv.body, " \r\n\t");
-
-    if (trimmed.len > 0 and trimmed[0] == '{') {
-        // Inputs: either {"inputs": ["s3://...", ...]} (multi-file)
-        // or {"s3_url": "s3://..."} (single-file shorthand).
-        var bad_field: []const u8 = "";
-        var req = request.Request.parse(allocator, trimmed, &bad_field) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            if (err == error.BadFieldType) return rejectResponse(allocator, "bad_json", @errorName(err), "field", bad_field);
-            return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}", .{@errorName(err)});
-        };
-        defer req.deinit();
-
-        // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw" (both LZ4_RAW;
-        // nothing compresses to the deprecated LZ4 codec), or "uncompressed" —
-        // parity with the CLI's --codec. Absent, re-encoded output is snappy and
-        // byte copies keep the source codec. Anything else is treated as snappy
-        // with no error (strict validation can come with the API-versioning work).
-        const output_codec: ?schema.CompressionCodec = if (req.output_codec) |s| blk: {
-            if (std.ascii.eqlIgnoreCase(s, "zstd")) break :blk .ZSTD;
-            if (std.ascii.eqlIgnoreCase(s, "uncompressed")) break :blk .UNCOMPRESSED;
-            if (std.ascii.eqlIgnoreCase(s, "gzip")) break :blk .GZIP;
-            if (std.ascii.eqlIgnoreCase(s, "lz4") or std.ascii.eqlIgnoreCase(s, "lz4_raw")) break :blk .LZ4_RAW;
-            break :blk .SNAPPY;
-        } else null;
-
-        const max_memory: ?usize = if (req.max_memory) |m| switch (m) {
-            .bytes => |n| n,
-            .text => |t| zpq.core.system.parseSizeString(t) catch return std.fmt.allocPrint(
-                allocator,
-                "{{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"max_memory\"}}",
-                .{},
-            ),
-        } else null;
-
-        // Single source of query options: the JSON event maps onto the
-        // SAME `engine.QueryArgs` the CLI's flags populate (src/cli/main.zig).
-        // Convention: CLI `--scan-all` ↔ JSON `"scan_all"` ↔ field `scan_all`.
-        // A new option is one field on QueryArgs + one parse line on each
-        // surface — the handlers below pass `qa` straight through to the
-        // engine, so options like `scan_all` flow without touching them.
-        const qa: engine.QueryArgs = .{
-            .inputs = req.inputs,
-            .filter = req.filter,
-            .output = req.output_url,
-            .columns = req.columns,
-            .select = req.select,
-            .aggregate = req.aggregate,
-            .codec = output_codec,
-            .scan_all = req.scan_all,
-            .trust_stats = req.trust_stats,
-            .max_memory = max_memory orelse zpq.core.system.discoverAvailableMemory(env),
-            .group_by = req.group_by,
-            .column_order = req.column_order,
-        };
-
-        // or group-by wins, then write, then the legacy single-file diagnostics.
-        if (qa.aggregate != null or qa.group_by != null) return try lambdaAggregate(io, allocator, env, pool, qa);
-        if (qa.output != null) return try lambdaWrite(io, allocator, env, pool, qa);
-        if (req.inputs.len > 0)
-            return try handleS3(allocator, env, req.inputs[0], qa.filter);
-        return try aggregateInt8(allocator, inv.body, null);
-    }
-
-    // Raw-byte fallback used by the in-process integration test.
-    return try aggregateInt8(allocator, inv.body, null);
-}
-
-/// The response for a failed query: the error, and the column or input file it is about when `diag` names one.
-fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\"", .{@errorName(err)});
-    if (diag.column.len > 0) {
-        try w.writeAll(",\"column\":");
-        try engine.writeJsonQuoted(w, diag.column.get());
-    }
-    if (diag.input) |input| {
-        try w.writeAll(",\"input\":");
-        try engine.writeJsonQuoted(w, input);
-        if (diag.cause) |cause| try w.print(",\"cause\":\"{s}\"", .{@errorName(cause)});
-    }
-    try w.writeByte('}');
-    return aw.toOwnedSlice();
-}
-
-/// Adapter that lets engine.runQuery use the lambda's PersistentPool
-/// (warm-container connection reuse) without engine knowing about it.
-fn persistentPoolAdapter(pool: *PersistentPool) engine.PoolRegistry {
-    const Wrapper = struct {
-        fn ensure(
-            ctx: *anyopaque,
-            gpa: std.mem.Allocator,
-            creds: s3.Credentials,
-            bucket: []const u8,
-        ) anyerror!*s3.Pool(engine.POOL_SIZE) {
-            const self: *PersistentPool = @ptrCast(@alignCast(ctx));
-            return self.ensureForBucket(gpa, creds, bucket);
+    fn run(self: *Watchdog, ms: u64) void {
+        const until = zpq.clock.monoNs() + @as(i64, @intCast(ms * std.time.ns_per_ms));
+        while (self.done.load(.acquire) == 0) {
+            const left = until - zpq.clock.monoNs();
+            if (left <= 0) break;
+            const ts: std.os.linux.timespec = .{
+                .sec = @intCast(@divTrunc(left, std.time.ns_per_s)),
+                .nsec = @intCast(@mod(left, std.time.ns_per_s)),
+            };
+            _ = std.os.linux.futex_4arg(&self.done.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
         }
-        fn ensureOutput(
-            ctx: *anyopaque,
-            gpa: std.mem.Allocator,
-            creds: s3.Credentials,
-            bucket: []const u8,
-        ) anyerror!*engine.OutputLane {
-            const self: *PersistentPool = @ptrCast(@alignCast(ctx));
-            return self.ensureOutput(gpa, creds, bucket);
-        }
-    };
-    return .{
-        .ctx = @ptrCast(pool),
-        .ensure_for_bucket = Wrapper.ensure,
-        .ensure_output = Wrapper.ensureOutput,
+        if (self.done.load(.acquire) != 0) return;
+        if (self.owner.cmpxchgStrong(0, 2, .acq_rel, .acquire) != null) return;
+        postFailure(self.client, self.request_id, "DeadlineExceeded", "the query did not finish within the " ++
+            "function's timeout: raise the timeout, or narrow the query (a filter, fewer columns, an output_url)");
+    }
+
+    /// Whether the loop may answer the invocation: false once the watchdog has failed it.
+    fn claim(self: *Watchdog) bool {
+        return self.owner.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null or self.owner.load(.acquire) == 1;
+    }
+
+    fn stop(self: *Watchdog, t: std.Thread) void {
+        self.done.store(1, .release);
+        _ = std.os.linux.futex_3arg(&self.done.raw, .{ .cmd = .WAKE, .private = true }, 1);
+        t.join();
+    }
+};
+
+fn postFailure(client: *runtime.Client, request_id: []const u8, error_type: []const u8, message: []const u8) void {
+    client.postError(request_id, error_type, message) catch |err| {
+        std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(err)});
     };
 }
 
-/// Lambda's aggregate handler — one shape for single-file and multi-
-/// file. Same code path as the CLI's `zpq query 's3://...'`, just with
-/// a runtime API JSON envelope instead of stdout.
-fn lambdaAggregate(
-    io: std.Io,
+/// Requests that neither aggregate nor write: the single-file int8 diagnostics, over S3 or (a raw parquet body, for the
+/// in-process integration test) the event itself.
+fn legacy(
     allocator: std.mem.Allocator,
     env: std.process.Environ,
-    pool: *PersistentPool,
-    qa: engine.QueryArgs,
-) ![]u8 {
-    // 1-row S3 output not yet supported (Stage 5b); engine.runQuery
-    // gives aggregate precedence over output, so qa.output is ignored.
-    const t_start = nowMonoNs();
-
-    var registry = persistentPoolAdapter(pool);
-    var diag: Diag = .{};
-    var args = qa;
-    args.diag = &diag;
-
-    pool.resetStats();
-    var result = engine.runQuery(.{
-        .gpa = allocator,
-        .env = env,
-        .io = io,
-        .pool_registry = &registry,
-        .meta_cache = pool.metaCache(),
-    }, args) catch |err| return engineError(allocator, err, &diag);
-    defer result.deinit(allocator);
-    const ar = result.aggregate;
-    const answer = ar.output;
-    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    if (answer.group_rows) |rows| {
-        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":[", .{
-            ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
-            ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
-        });
-        for (rows, 0..) |row_vals, row_idx| {
-            if (row_idx > 0) try w.writeByte(',');
-            try w.writeByte('{');
-            for (answer.group_cols.?, 0..) |col_name, col_idx| {
-                if (col_idx > 0) try w.writeByte(',');
-                try engine.writeJsonQuoted(w, col_name);
-                try w.writeByte(':');
-                try engine.writeAggValueJson(w, row_vals[col_idx]);
-            }
-            try w.writeByte('}');
-        }
-        try w.writeByte(']');
-    } else {
-        try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":{{", .{
-            ar.files_in,              ar.rows_in,          ar.row_groups_in, ar.row_groups_pruned,
-            ar.row_groups_full_match, ar.cols_stat_pruned, ar.bytes_in,
-        });
-        for (answer.aggs, 0..) |item, i| {
-            if (i > 0) try w.writeByte(',');
-            try engine.writeJsonQuoted(w, item.alias);
-            try w.writeByte(':');
-            try engine.writeAggValueJson(w, item.value);
-        }
-        try w.writeByte('}');
-    }
-    try w.print(",\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d}}},", .{
-        total_ms,
-        ar.timings.read_ns / std.time.ns_per_ms,
-        ar.timings.core.decode_ns / std.time.ns_per_ms,
-        ar.timings.core.eval_ns / std.time.ns_per_ms,
-        ar.timings.core.encode_ns / std.time.ns_per_ms,
-    });
-    try writePoolStats(w, pool.stats());
-    try w.writeByte('}');
-    return aw.toOwnedSlice();
-}
-
-/// Lambda's write handler — the iceberg-compaction shape (filter +
-/// project + write S3-to-S3). Same engine path as the CLI's
-/// `zpq query 's3://...' -o 's3://...'`, with the Lambda runtime API
-/// as the envelope.
-fn lambdaWrite(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    env: std.process.Environ,
-    pool: *PersistentPool,
-    qa: engine.QueryArgs,
-) ![]u8 {
-    const t_start = nowMonoNs();
-
-    var registry = persistentPoolAdapter(pool);
-    var diag: Diag = .{};
-    var args = qa;
-    args.diag = &diag;
-
-    pool.resetStats();
-    const result = engine.runQuery(.{
-        .gpa = allocator,
-        .env = env,
-        .io = io,
-        .pool_registry = &registry,
-        .meta_cache = pool.metaCache(),
-    }, args) catch |err| return engineError(allocator, err, &diag);
-    const wr = result.write;
-    const output_url_str = qa.output.?; // dispatch only routes here when set
-    const total_ms = @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms);
-
-    const cache_stats: zpq.io.meta_cache.Stats = if (pool.metaCache()) |c| blk: {
-        const s = c.snapshotStats();
-        // Don't reset — cache stats are cumulative for the warm
-        // container. Inserts/evictions are LRU-state, not per-invoke.
-        break :blk s;
-    } else .{};
-    return writeResponse(allocator, output_url_str, wr, total_ms, pool.stats(), cache_stats);
-}
-
-/// The success response for a write. `output` is the caller's URL or path, so it is escaped like every other string
-/// the response echoes back.
-fn writeResponse(
-    allocator: std.mem.Allocator,
-    output: []const u8,
-    wr: engine.WriteResult,
-    total_ms: i64,
-    stats: s3.Pool(POOL_SIZE).Stats,
-    cache_stats: zpq.io.meta_cache.Stats,
-) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"ok\":true,\"output\":");
-    try engine.writeJsonQuoted(w, output);
-    try w.print(
-        ",\"files_in\":{d},\"rows_in\":{d},\"rows_kept\":{d},\"bytes_in\":{d},\"bytes_out\":{d},\"row_groups_in\":{d},\"row_groups_kept\":{d},\"total_ms\":{d},\"phase\":{{\"read_ms\":{d},\"parse_ms\":{d},\"decode_ms\":{d},\"eval_ms\":{d},\"encode_ms\":{d},\"sink_ms\":{d},\"footer_ms\":{d},\"mp_await_ms\":{d},\"mp_complete_ms\":{d}}},\"meta_cache\":{{\"hits\":{d},\"misses\":{d},\"revalidations\":{d},\"invalidations\":{d},\"inserts\":{d},\"evictions\":{d}}},",
-        .{
-            wr.files_in,
-            wr.rows_in,
-            wr.rows_kept,
-            wr.bytes_in,
-            wr.bytes_out,
-            wr.row_groups_in,
-            wr.row_groups_kept,
-            total_ms,
-            wr.timings.read_ns / std.time.ns_per_ms,
-            wr.timings.parse_ns / std.time.ns_per_ms,
-            wr.timings.core.decode_ns / std.time.ns_per_ms,
-            wr.timings.core.eval_ns / std.time.ns_per_ms,
-            wr.timings.core.encode_ns / std.time.ns_per_ms,
-            wr.timings.core.sink_ns / std.time.ns_per_ms,
-            wr.timings.footer_ns / std.time.ns_per_ms,
-            wr.timings.mp_await_ns / std.time.ns_per_ms,
-            wr.timings.mp_complete_ns / std.time.ns_per_ms,
-            cache_stats.hits,
-            cache_stats.misses,
-            cache_stats.revalidations,
-            cache_stats.invalidations,
-            cache_stats.inserts,
-            cache_stats.evictions,
-        },
-    );
-    try writePoolStats(w, stats);
-    try w.writeByte('}');
-    return aw.toOwnedSlice();
-}
-
-/// The `"pool"` member: this invocation's connection reuse, idle evictions and retries. Cold TLS handshakes against
-/// warm reuse, and stale or backed-off retries, are the first things to read when warm-path latency changes.
-fn writePoolStats(w: *std.Io.Writer, stats: s3.Pool(POOL_SIZE).Stats) !void {
-    try w.print(
-        "\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"idle_evictions\":{d}," ++
-            "\"stale_retries\":{d},\"backoff_retries\":{d},\"max_idle_ms\":{d},\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}}",
-        .{
-            stats.acquires,
-            stats.opens,
-            stats.reuses,
-            stats.discards,
-            stats.idle_evictions,
-            stats.stale_retries,
-            stats.backoff_retries,
-            stats.max_idle_ns / std.time.ns_per_ms,
-            stats.acquire_wait_ns / std.time.ns_per_ms,
-            stats.acquire_lock_ns / std.time.ns_per_ms,
-        },
-    );
-}
-
-/// `{"error":kind,"reason":reason,"<key>":value}`: an early-exit response naming the field or text it rejects. `kind`
-/// and `reason` are fixed names; `value` comes from the request, so it is escaped.
-fn rejectResponse(allocator: std.mem.Allocator, kind: []const u8, reason: []const u8, key: []const u8, value: []const u8) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.print("{{\"error\":\"{s}\",\"reason\":\"{s}\",\"{s}\":", .{ kind, reason, key });
-    try engine.writeJsonQuoted(w, value);
-    try w.writeByte('}');
-    return aw.toOwnedSlice();
+    input: ?[]const u8,
+    filter: ?[]const u8,
+    body: []const u8,
+) anyerror![]u8 {
+    if (input) |url| return handleS3(allocator, env, url, filter);
+    return aggregateInt8(allocator, body, null);
 }
 
 fn handleS3(
@@ -494,9 +195,10 @@ fn handleS3(
     const url = s3.Url.parse(s3_url) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_s3_url\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
-    const creds = s3.Credentials.fromEnv(env) catch |err| {
+    var creds = s3.Credentials.fromEnv(env) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"no_credentials\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
+    creds.path_style = true;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -507,8 +209,10 @@ fn handleS3(
     };
     defer client.deinit();
 
-    // 1. Tail GET to discover total size and pull the footer.
-    const tail_resp = client.get(a, url.key, s3.Range.suffix(TAIL_SIZE)) catch |err| {
+    // 1. One suffix GET for the size and the footer. A footer that does not fit costs one more GET below.
+    // One file. The explicit probe cannot exceed the budget-derived maximum.
+    const probe = engine.footerProbeFor(env, @as(u64, zpq.core.system.discoverAvailableMemory(env)), 1);
+    const tail_resp = client.get(a, url.key, s3.Range.suffix(probe)) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_fetch\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
     if (tail_resp.status != 206 and tail_resp.status != 200) {
@@ -519,6 +223,12 @@ fn handleS3(
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_content_range\",\"reason\":\"{s}\"}}", .{@errorName(err)});
     };
 
+    // The total is the server's word: one smaller than the suffix it sent cannot be.
+    if (tail_resp.body.len > total_size) {
+        const refusal = "{{\"error\":\"bad_content_range\",\"reason\":\"BodyLongerThanTotal\"}}";
+        return std.fmt.allocPrint(allocator, refusal, .{});
+    }
+
     // 2. Allocate sparse file buffer; stamp the tail.
     const file_buf = try allocator.alloc(u8, total_size);
     defer allocator.free(file_buf);
@@ -528,6 +238,7 @@ fn handleS3(
     // 3. Locate the footer and fetch the missing prefix if needed.
     if (tail_resp.body.len < 8) return error.TailTooSmall;
     const tail = tail_resp.body;
+    if (metadata.hasEncryptedFooter(tail)) return error.EncryptedFile;
     if (!std.mem.eql(u8, tail[tail.len - 4 ..], "PAR1")) return error.NotParquet;
     const footer_len: u64 = std.mem.readInt(u32, tail[tail.len - 8 ..][0..4], .little);
     // The length is the file's claim; one longer than the object would underflow the start below.
@@ -536,13 +247,15 @@ fn handleS3(
     if (footer_actual_start < tail_start) {
         const need = try client.get(a, url.key, s3.Range.span(footer_actual_start, tail_start - 1));
         if (need.status != 206) return error.RangeStatus;
+        if (need.body.len != tail_start - footer_actual_start) return error.RangeStatus;
+        // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.
+        if (footer_actual_start == 0 and !metadata.hasLeadingMagic(need.body)) return error.NotParquet;
         @memcpy(file_buf[footer_actual_start..tail_start], need.body);
     }
-    const head = try client.get(a, url.key, s3.Range.span(0, 7));
-    if (head.status != 206) return error.RangeStatus;
-    @memcpy(file_buf[0..head.body.len], head.body);
+    // The suffix included offset 0. Otherwise the leading magic waits for a data range that covers it.
+    if (tail_start == 0 and !metadata.hasLeadingMagic(file_buf)) return error.NotParquet;
 
-    var meta = try metadata.open(a, file_buf);
+    var meta = try metadata.openFooter(a, file_buf[@intCast(footer_actual_start)..@intCast(total_size - 8)]);
     defer meta.deinit(a);
 
     // 4. Parse the filter (if any) against the schema.
@@ -550,7 +263,7 @@ fn handleS3(
     if (filter_str) |fs| {
         if (fs.len > 0) {
             filter = filter_parser.parse(a, fs, &meta, null) catch |err| {
-                return rejectResponse(allocator, "filter_parse", @errorName(err), "expr", fs);
+                return service.rejectResponse(allocator, "filter_parse", @errorName(err), "expr", fs);
             };
         }
     }
@@ -609,6 +322,7 @@ fn handleS3(
             const resp = try client.get(a, url.key, s3.Range.span(r.start, fetch_end_excl - 1));
             if (resp.status != 206) return error.RangeStatus;
             @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
+            if (r.start == 0 and !metadata.hasLeadingMagic(file_buf)) return error.NotParquet;
         }
 
         // Decode each fetch_col into a typed slice. For our demo,
@@ -701,7 +415,7 @@ fn handleS3(
     );
 }
 
-const POOL_SIZE: usize = s3.MAX_PARTS;
+const POOL_SIZE = service.POOL_SIZE;
 
 fn initPool(
     self: *s3.Pool(POOL_SIZE),
@@ -790,65 +504,7 @@ fn aggregateInt8(allocator: std.mem.Allocator, file_bytes: []const u8, _: ?filte
     );
 }
 
-/// Parse `body` as one JSON object and return its string field `key`, failing unless both hold.
-fn expectStringField(body: []const u8, key: []const u8, want: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    const got = parsed.value.object.get(key) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings(want, got.string);
-}
-
-test "the write response escapes the output name" {
-    const a = std.testing.allocator;
-    const wr: engine.WriteResult = .{
-        .codec = .SNAPPY,
-        .files_in = 1,
-        .rows_in = 3,
-        .rows_kept = 2,
-        .bytes_in = 10,
-        .bytes_out = 8,
-        .row_groups_in = 1,
-        .row_groups_kept = 1,
-        .timings = .{},
-    };
-    for ([_][]const u8{ "out.parquet", "s3://b/a \"q\" c:\\d\n.parquet" }) |name| {
-        const body = try writeResponse(a, name, wr, 5, .{}, .{});
-        defer a.free(body);
-        try expectStringField(body, "output", name);
-    }
-}
-
-test "uploads take permits of their own over the warm pool's connections" {
-    const io = std.testing.io;
-    var pool: PersistentPool = .{};
-    var registry = persistentPoolAdapter(&pool);
-    const creds: s3.Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1" };
-    const out = try registry.ensure_output(registry.ctx, std.testing.allocator, creds, "bkt");
-    defer pool.inner.deinit();
-    defer pool.cache.deinit();
-    try std.testing.expectEqual(&pool.inner, out.pool);
-    const in = try registry.ensure_for_bucket(registry.ctx, std.testing.allocator, creds, "bkt");
-    try std.testing.expectEqual(&pool.inner, in);
-    try std.testing.expectEqual(out, try registry.ensure_output(registry.ctx, std.testing.allocator, creds, "bkt"));
-
-    // Reads holding every input permit leave every upload permit free.
-    var permits: [PersistentPool.Inner.capacity]usize = undefined;
-    try std.testing.expectEqual(permits.len, try pool.inner.permits.get(io, &permits, 0));
-    var up: [engine.OutputLane.capacity]usize = undefined;
-    try std.testing.expectEqual(up.len, try out.permits.get(io, &up, 0));
-}
-
-test "a rejected filter echoes its expression escaped" {
-    const a = std.testing.allocator;
-    const expr = "\"a\".\"b\" = 'x\\y'";
-    const body = try rejectResponse(a, "filter_parse", "AmbiguousColumn", "expr", expr);
-    defer a.free(body);
-    try expectStringField(body, "expr", expr);
-    try expectStringField(body, "reason", "AmbiguousColumn");
-}
-
 test {
-    _ = @import("request.zig");
-    _ = @import("runtime.zig");
-    _ = @import("scan.zig");
+    // The test-bearing files under this root, listed by build.zig (tests.gen.zig).
+    _ = @import("tests.gen.zig");
 }

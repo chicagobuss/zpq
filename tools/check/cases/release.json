@@ -1,0 +1,8 @@
+{
+  "fixtures": [{"name": "input", "path": "ci/fixtures/parquet/full_match.parquet"}, {"name": "written", "zpq": ["query", "{fixture:input}", "--filter", "b >= 14", "--columns", "b,s", "-o", "{path}"]}],
+  "cases": [
+    {"id": "release:aggregate", "fixture": "input", "cli": ["query", "{path}", "--aggregate", "count(*) AS n, sum(b) AS s, max(s) AS m"], "oracle": {"compare": "golden", "golden": "release/aggregate.json"}},
+    {"id": "release:sql", "fixture": "input", "cli": ["query", "--query", "SELECT b * 2 AS x FROM '{path}' WHERE b >= 14 ORDER BY x LIMIT 1"], "oracle": {"compare": "golden", "golden": "release/sql.json"}},
+    {"id": "release:write-read-back", "fixture": "written", "cli": ["query", "{path}", "--aggregate", "count(*) AS n, sum(b) AS s"], "oracle": {"compare": "golden", "golden": "release/write-read-back.json"}}
+  ]
+}

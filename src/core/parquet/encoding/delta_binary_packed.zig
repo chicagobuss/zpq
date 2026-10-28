@@ -525,7 +525,110 @@ pub fn encodeDefault(
     allocator: std.mem.Allocator,
     values: []const T,
 ) ![]u8 {
-    return encode(T, allocator, values, DEFAULT_BLOCK_SIZE, DEFAULT_MINI_BLOCKS);
+    return encodeFast(T, allocator, values, DEFAULT_BLOCK_SIZE, DEFAULT_MINI_BLOCKS);
+}
+
+/// The bytes `encode` writes, without its byte-at-a-time appends: the output is sized up front for the widest case,
+/// each block's deltas, minimum and per-miniblock bit widths come from vector passes (a miniblock's width is that of
+/// the OR of its offsets from the minimum, whose top bit is its maximum's), and bits are packed through a 128-bit
+/// accumulator drained 8 bytes at a time.
+pub fn encodeFast(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    values: []const T,
+    block_size: u32,
+    mini_blocks: u32,
+) ![]u8 {
+    comptime std.debug.assert(T == i32 or T == i64);
+    std.debug.assert(block_size > 0 and block_size % mini_blocks == 0 and block_size <= 4096);
+    const U = if (T == i32) u32 else u64;
+    const blocks = if (values.len <= 1) 0 else (values.len - 1 + block_size - 1) / block_size;
+    const cap = 40 + blocks * (10 + mini_blocks + block_size * @sizeOf(T)) + 16;
+    const out = try allocator.alloc(u8, cap);
+    errdefer allocator.free(out);
+    var o: usize = 0;
+    o = putUVarint(out, o, block_size);
+    o = putUVarint(out, o, mini_blocks);
+    o = putUVarint(out, o, values.len);
+    if (values.len == 0) {
+        o = putZigzag(T, out, o, 0);
+        return allocator.realloc(out, o);
+    }
+    o = putZigzag(T, out, o, values[0]);
+
+    const mini_block_size = block_size / mini_blocks;
+    var deltas: [4096]T = undefined;
+    var i: usize = 1;
+    while (i < values.len) {
+        const block_end = @min(i + block_size, values.len);
+        const n = block_end - i;
+        const L = 8;
+        var j: usize = 0;
+        while (j + L <= n) : (j += L) {
+            const cur: @Vector(L, T) = values[i + j ..][0..L].*;
+            const prev: @Vector(L, T) = values[i + j - 1 ..][0..L].*;
+            deltas[j..][0..L].* = cur -% prev;
+        }
+        while (j < n) : (j += 1) deltas[j] = values[i + j] -% values[i + j - 1];
+        var min_d: T = deltas[0];
+        for (deltas[1..n]) |d| min_d = @min(min_d, d);
+        // Padding packs as 0: the offset of min_d from itself.
+        @memset(deltas[n..block_size], min_d);
+        o = putZigzag(T, out, o, min_d);
+
+        const widths_at = o;
+        o += mini_blocks;
+        var mb: u32 = 0;
+        while (mb < mini_blocks) : (mb += 1) {
+            const lo = mb * mini_block_size;
+            var any: U = 0;
+            for (deltas[lo..][0..mini_block_size]) |d| any |= @bitCast(d -% min_d);
+            const bw: u8 = if (any == 0) 0 else @intCast(@bitSizeOf(U) - @clz(any));
+            out[widths_at + mb] = bw;
+            if (bw == 0) continue;
+            var acc: u128 = 0;
+            var bits: u32 = 0;
+            for (deltas[lo..][0..mini_block_size]) |d| {
+                const u: U = @bitCast(d -% min_d);
+                acc |= @as(u128, u) << @intCast(bits);
+                bits += bw;
+                if (bits >= 64) {
+                    std.mem.writeInt(u64, out[o..][0..8], @truncate(acc), .little);
+                    o += 8;
+                    acc >>= 64;
+                    bits -= 64;
+                }
+            }
+            while (bits > 0) {
+                out[o] = @truncate(acc);
+                o += 1;
+                acc >>= 8;
+                bits -|= 8;
+            }
+        }
+        i = block_end;
+    }
+    return allocator.realloc(out, o);
+}
+
+fn putUVarint(out: []u8, o: usize, value: u64) usize {
+    var v = value;
+    var p = o;
+    while (v >= 0x80) : (v >>= 7) {
+        out[p] = @as(u8, @truncate(v & 0x7f)) | 0x80;
+        p += 1;
+    }
+    out[p] = @intCast(v);
+    return p + 1;
+}
+
+fn putZigzag(comptime T: type, out: []u8, o: usize, value: T) usize {
+    const w: u64 = switch (T) {
+        i32 => @as(u32, @bitCast((value << 1) ^ (value >> 31))),
+        i64 => @bitCast((value << 1) ^ (value >> 63)),
+        else => @compileError("unsupported"),
+    };
+    return putUVarint(out, o, w);
 }
 
 fn writeUVarint(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: u64) !void {
@@ -826,4 +929,47 @@ test "header varints: maximum value, overflowing tenth byte, unterminated" {
     const head = [_]u8{ 0x80, 0x01, 0x04 };
     try testing.expectError(error.VarintOverflow, Decoder(i64).init(&(head ++ nine_cont ++ [_]u8{0x02})));
     try testing.expectError(error.UnexpectedEndOfStream, Decoder(i64).init(&(head ++ nine_cont)));
+}
+
+test "encodeFast writes the same bytes as encode" {
+    var prng = std.Random.DefaultPrng.init(0xdb9);
+    const r = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..2000) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const n = r.uintLessThan(usize, if (iter % 20 == 0) 20000 else 600);
+        inline for (.{ i32, i64 }) |T| {
+            const vals = try a.alloc(T, n);
+            const shape = r.uintLessThan(u8, 5);
+            var acc: T = r.int(T);
+            for (vals) |*v| {
+                v.* = switch (shape) {
+                    0 => r.int(T),
+                    1 => blk: {
+                        acc +%= @intCast(r.uintLessThan(u16, 100));
+                        break :blk acc;
+                    },
+                    2 => @intCast(r.uintLessThan(u8, 4)),
+                    3 => if (r.uintLessThan(u8, 10) == 0) std.math.minInt(T) else std.math.maxInt(T),
+                    else => acc,
+                };
+            }
+            for ([_][2]u32{ .{ 128, 4 }, .{ 128, 1 }, .{ 256, 8 }, .{ 32, 1 } }) |bm| {
+                const want = try encode(T, a, vals, bm[0], bm[1]);
+                const got = try encodeFast(T, a, vals, bm[0], bm[1]);
+                try testing.expectEqualSlices(u8, want, got);
+            }
+        }
+    }
+}
+
+test "a malformed i64 miniblock width is rejected before its dispatcher" {
+    var bytes: [310]u8 = @splat(0);
+    // 128-value block, four 32-value miniblocks, 33 values; i64 cannot take width 65.
+    @memcpy(bytes[0..7], &[_]u8{ 0x80, 0x01, 0x04, 0x21, 0, 0, 65 });
+    var decoder = try Decoder(i64).init(&bytes);
+    var out: [33]i64 = undefined;
+    try std.testing.expectError(error.InvalidHeader, decoder.decode(&out));
 }

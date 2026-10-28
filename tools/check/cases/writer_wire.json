@@ -1,0 +1,22 @@
+{
+  "fixtures": [{"script": "tools/check/prepare_wire.py", "files": ["flba", "floats"]}],
+  "cases": [
+    {"id": "wire:flba-reencode:pyarrow", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:pyarrow", "where": "id >= 1"}},
+    {"id": "wire:flba-reencode:duck", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:duck", "where": "id >= 1"}},
+    {"id": "wire:flba-reencode:bytes", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:bytes", "where": "id >= 1"}},
+    {"id": "wire:flba-reencode:encodings", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:encodings", "where": "id >= 1"}},
+    {"id": "wire:floats-reencode:pyarrow", "fixture": "floats", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:pyarrow", "where": "id >= 1"}},
+    {"id": "wire:floats-reencode:duck", "fixture": "floats", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:duck", "where": "id >= 1"}},
+    {"id": "wire:floats-reencode:bytes", "fixture": "floats", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:bytes", "where": "id >= 1"}},
+    {"id": "wire:floats-reencode:encodings", "fixture": "floats", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:encodings", "where": "id >= 1"}},
+    {"id": "wire:floats-reencode:bounds", "fixture": "floats", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:bounds", "where": "id >= 1"}},
+    {"id": "wire:floats-recompress:pyarrow", "fixture": "floats", "query": {"codec": "zstd"}, "emit": "copy", "oracle": {"compare": "wire:pyarrow"}},
+    {"id": "wire:floats-recompress:duck", "fixture": "floats", "query": {"codec": "zstd"}, "emit": "copy", "oracle": {"compare": "wire:duck"}},
+    {"id": "wire:floats-recompress:bytes", "fixture": "floats", "query": {"codec": "zstd"}, "emit": "copy", "oracle": {"compare": "wire:bytes"}},
+    {"id": "wire:floats-recompress:encodings", "fixture": "floats", "query": {"codec": "zstd"}, "emit": "copy", "oracle": {"compare": "wire:encodings"}},
+    {"id": "wire:flba-copy:pyarrow", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:pyarrow"}},
+    {"id": "wire:flba-copy:duck", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:duck"}},
+    {"id": "wire:flba-copy:bytes", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:bytes"}},
+    {"id": "wire:flba-copy:encodings", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:encodings"}}
+  ]
+}

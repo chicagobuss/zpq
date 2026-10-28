@@ -14,6 +14,7 @@ const encoded = @import("encoded.zig");
 const schema = @import("../schema.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const statistics = @import("../parquet/statistics.zig");
+const membership = @import("membership.zig");
 
 pub const Decision = enum {
     keep,
@@ -56,26 +57,55 @@ pub fn pruneRowGroup(
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
     return switch (filter) {
-        .int32 => |leaf| pruneNumeric(i32, rg, leaf.col_idx, leaf.op, leaf.value, .INT32, file_meta),
-        .int64 => |leaf| pruneNumeric(i64, rg, leaf.col_idx, leaf.op, leaf.value, .INT64, file_meta),
-        .uint64 => |leaf| pruneUnsigned(rg, leaf.col_idx, leaf.op, leaf.value, file_meta),
-        .float => |leaf| pruneNumeric(f32, rg, leaf.col_idx, leaf.op, leaf.value, .FLOAT, file_meta),
-        .double => |leaf| pruneNumeric(f64, rg, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, file_meta),
-        .string => |leaf| pruneBytes(rg, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, file_meta),
-        .boolean => |leaf| pruneBoolean(rg, leaf.col_idx, leaf.op, leaf.value, file_meta),
-        .null_check => |nc| pruneNullCheck(rg, nc.col_idx, nc.is_not, file_meta),
+        .int32, .int64, .uint64, .float, .double, .decimal, .string => withMembership(
+            rg,
+            filter,
+            valueStats(rg, filter, file_meta),
+        ),
+        .boolean => |leaf| pruneBoolean(leafStats(rg, leaf, file_meta), leaf.op, leaf.value),
+        .null_check => |nc| pruneNullCheck(rg, nc.col_idx, nc.is_not, file_meta, trustOf(nc.trust_stats)),
         // LIKE: prefix patterns are stat-prunable via min/max (a future
         // win); conservatively keep for now. Correctness is in eval.
         .like => .unknown,
-        .and_filter => |c| Decision.andCombine(
-            pruneRowGroup(rg, c.left.*, file_meta),
-            pruneRowGroup(rg, c.right.*, file_meta),
-        ),
-        .or_filter => |c| Decision.orCombine(
-            pruneRowGroup(rg, c.left.*, file_meta),
-            pruneRowGroup(rg, c.right.*, file_meta),
-        ),
+        .and_filter, .or_filter => |c| blk: {
+            if (c.neverTrue(filter == .and_filter)) break :blk .skip;
+            var d = pruneRowGroup(rg, c.children[0], file_meta);
+            for (c.children[1..]) |child| {
+                const e = pruneRowGroup(rg, child, file_meta);
+                d = if (filter == .and_filter) Decision.andCombine(d, e) else Decision.orCombine(d, e);
+            }
+            break :blk d;
+        },
     };
+}
+
+/// A comparison leaf's decision from statistics alone.
+fn valueStats(rg: *const schema.RowGroup, leaf: ast.Filter, file_meta: ?*const schema.FileMetaData) Decision {
+    return switch (leaf) {
+        .int32 => |l| pruneNumeric(i32, rg, leafStats(rg, l, file_meta), l, .INT32, file_meta),
+        .int64 => |l| pruneNumeric(i64, rg, leafStats(rg, l, file_meta), l, .INT64, file_meta),
+        .uint64 => |l| pruneUnsigned(rg, leafStats(rg, l, file_meta), l.col_idx, l.op, l.value),
+        .float => |l| pruneNumeric(f32, rg, leafStats(rg, l, file_meta), l, .FLOAT, file_meta),
+        .double => |l| pruneNumeric(f64, rg, leafStats(rg, l, file_meta), l, .DOUBLE, file_meta),
+        .decimal => |l| pruneDecimal(rg, leafStats(rg, l, file_meta), l.col_idx, l.op, l.value, file_meta),
+        .string => |l| pruneBytes(rg, leafStats(rg, l, file_meta), l.col_idx, l.op, l.value, file_meta),
+        else => unreachable,
+    };
+}
+
+fn leafStats(rg: *const schema.RowGroup, leaf: anytype, file_meta: ?*const schema.FileMetaData) statistics.ChunkStats {
+    return statistics.chunkStats(rg, leaf.col_idx, file_meta, trustOf(leaf.trust_stats));
+}
+
+fn trustOf(trust_stats: bool) statistics.Trust {
+    return if (trust_stats) .plausible else .corroborated;
+}
+
+/// A leaf's statistics decision, sharpened by membership: a Bloom filter or dictionary can only rule a literal out, so
+/// it turns an open leaf into a skip and never touches one statistics skip or prove fully matching.
+fn withMembership(rg: *const schema.RowGroup, leaf: ast.Filter, stats: Decision) Decision {
+    if (stats != .keep and stats != .unknown) return stats;
+    return if (membership.provenAbsent(rg, leaf)) .skip else stats;
 }
 
 // ------------------------------------------------------------
@@ -118,35 +148,31 @@ const ComparisonProof = struct {
 /// `null_count` present and zero (a null row fails every comparison).
 fn comparisonProof(
     rg: *const schema.RowGroup,
+    st: statistics.ChunkStats,
     col_idx: usize,
     file_meta: ?*const schema.FileMetaData,
 ) ?ComparisonProof {
     const elem = flatLeaf(rg, col_idx, file_meta) orelse return null;
-    if (!statistics.boundsReadable(rg, col_idx, file_meta)) return null;
-    const stats = rg.columns.items[col_idx].meta_data.?.statistics orelse return null;
-    if ((stats.null_count orelse return null) != 0) return null;
-    return .{
-        .elem = elem,
-        .min = stats.min_value orelse return null,
-        .max = stats.max_value orelse return null,
-        .max_exact = stats.is_max_value_exact orelse false,
-    };
+    if ((st.null_count orelse return null) != 0) return null;
+    const b = st.bounds orelse return null;
+    // Vetted bounds are the type-defined pair whenever it is written; without it they are the deprecated pair.
+    const stats = rg.columns.items[col_idx].meta_data.?.statistics.?;
+    if (stats.min_value == null or stats.max_value == null) return null;
+    return .{ .elem = elem, .min = b.min, .max = b.max, .max_exact = stats.is_max_value_exact orelse false };
 }
 
 /// Prune on `IS NULL` / `IS NOT NULL` using the `null_count` stat:
 ///   IS NULL     → skip when null_count == 0; always_match when every row is null
 ///   IS NOT NULL → skip when every row is null; always_match when null_count == 0
-/// Missing null_count → .unknown (eval handles correctness either way).
+/// A null_count `statistics.chunkStats` does not vouch for → .unknown (eval handles correctness either way).
 fn pruneNullCheck(
     rg: *const schema.RowGroup,
     col_idx: usize,
     is_not: bool,
     file_meta: ?*const schema.FileMetaData,
+    trust: statistics.Trust,
 ) Decision {
-    if (col_idx >= rg.columns.items.len) return .unknown;
-    const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
-    const stats = meta.statistics orelse return .unknown;
-    const null_count = stats.null_count orelse return .unknown;
+    const null_count = statistics.chunkStats(rg, col_idx, file_meta, trust).null_count orelse return .unknown;
     const all_null = null_count >= rg.num_rows;
     if (is_not) {
         if (all_null) return .skip;
@@ -161,66 +187,55 @@ fn pruneNullCheck(
 fn pruneNumeric(
     comptime T: type,
     rg: *const schema.RowGroup,
-    col_idx: usize,
-    op: ast.Operator,
-    value: T,
+    st: statistics.ChunkStats,
+    leaf: ast.Leaf(T),
     parquet_type: schema.Type,
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
+    const col_idx = leaf.col_idx;
+    const op = leaf.op;
+    const value = leaf.value;
     if (col_idx >= rg.columns.items.len) return .unknown;
     const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
 
-    // DECIMAL path: if the filter is .double against a column whose
-    // physical type doesn't match DOUBLE, we may be looking at a
-    // DECIMAL column (decoded to f64 by decimal_mod). Look up the
-    // schema and decode stat bytes through the same byte → i128 →
-    // f64-with-scale pipeline to get a comparable f64 min/max.
-    if (parquet_type == .DOUBLE and meta.type != .DOUBLE and T == f64) {
-        if (file_meta) |fm| {
-            if (fm.getColumnSchema(meta.path_in_schema.items)) |elem| {
-                if (decimal_mod.kindFromSchema(&elem)) |kind| {
-                    return pruneDecimal(rg, col_idx, op, value, kind, file_meta);
-                }
-            }
-        }
-    }
-
     // Type-mismatch guard: stats bytes are in the column's physical
     // wire format. If the filter leaf was built with a different
-    // parquet type and we didn't take the DECIMAL branch above, the
-    // encoded comparison would compare incompatible byte formats and
-    // silently produce wrong pruning decisions. Bail to .unknown.
+    // parquet type, the encoded comparison would compare incompatible
+    // byte formats and silently produce wrong pruning decisions.
     if (meta.type != parquet_type) return .unknown;
 
-    const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+    const b = st.bounds orelse return .unknown;
 
-    if (!encoded.rangeIntersects(T, op, b.min, b.max, value)) return .skip;
-    if (comptime @typeInfo(T) == .float) {
-        // `!=` on a constant chunk: the bounds exclude NaN rows, which pass it, so only a nan_count of zero skips.
-        if (op == .NotEq and meta.statistics.?.nan_count == 0) {
-            const lo = encoded.readFixedLE(T, b.min) orelse return .keep;
-            const hi = encoded.readFixedLE(T, b.max) orelse return .keep;
-            if (lo == hi and lo == value) return .skip;
-        }
-    }
+    const nan_free = nanFree(&rg.columns.items[col_idx], leaf.trust_missing_nan_count);
+    if (!encoded.rangeIntersects(T, op, b.min, b.max, value, nan_free)) return .skip;
     // The positive assertion reads only the bounds `comparisonProof` vouches for, never the deprecated pair.
-    if (comparisonProof(rg, col_idx, file_meta)) |p| {
+    if (comparisonProof(rg, st, col_idx, file_meta)) |p| {
         if (statistics.signedIntOrder(p.elem) and encoded.rangeAlwaysMatches(T, op, p.min, p.max, value))
             return .always_match;
     }
     return .keep;
 }
 
+/// Whether a chunk is known to hold no NaN: a nan_count of zero, a NaN probe of its values (`nanprobe.zig`), or,
+/// under `--trust-stats` (`trust_nan`), no count at all. Float bounds leave NaN out, so without one a NaN row may pass a
+/// comparison no bound does (see `encoded.rangeIntersects`).
+fn nanFree(chunk: *const schema.ColumnChunk, trust_nan: bool) bool {
+    if (chunk.nan_free) return true;
+    const stats = (chunk.meta_data orelse return false).statistics orelse return false;
+    const missing: ?i64 = if (trust_nan) 0 else null;
+    return (stats.nan_count orelse missing) == 0;
+}
+
 /// Unsigned columns compare bounds as unsigned. `chunkBounds` never hands back the signed-ordered deprecated pair,
 /// whose bounds are swapped for a chunk spanning 2^31 (or 2^63).
 fn pruneUnsigned(
     rg: *const schema.RowGroup,
+    st: statistics.ChunkStats,
     col_idx: usize,
     op: ast.Operator,
     value: u64,
-    file_meta: ?*const schema.FileMetaData,
 ) Decision {
-    const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+    const b = st.bounds orelse return .unknown;
     return unsignedRangeDecision(rg.columns.items[col_idx].meta_data.?.type, b.min, b.max, op, value);
 }
 
@@ -233,7 +248,8 @@ fn unsignedRangeDecision(
 ) Decision {
     const lo = readUnsignedBound(physical, min) orelse return .unknown;
     const hi = readUnsignedBound(physical, max) orelse return .unknown;
-    if (lo > hi) return .unknown; // corrupt, or written in signed order by a non-conforming writer
+    // Inverted bounds (corrupt, or written in signed order by a non-conforming writer) never get here:
+    // `statistics.chunkStats` and `statistics.pageIndexIsPlausible` refuse them.
     return if (encoded.rangeOverlapsValue(u64, op, lo, hi, value)) .keep else .skip;
 }
 
@@ -245,62 +261,53 @@ fn readUnsignedBound(physical: schema.Type, bytes: []const u8) ?u64 {
     };
 }
 
-/// Pruning for DECIMAL columns: stat min/max bytes are in the
-/// column's physical wire format (INT32/INT64 little-endian, FLBA
-/// big-endian two's-complement), and the filter compares against an
-/// f64 value. Decode the bytes to f64 through decimal_mod and then
-/// do a plain f64 range check.
+/// The DECIMAL kind of `col_idx`'s leaf, from the schema: the stat bytes are in its physical wire format (INT32/INT64
+/// little-endian, FLBA and BYTE_ARRAY big-endian two's complement).
+fn decimalKind(rg: *const schema.RowGroup, col_idx: usize, file_meta: ?*const schema.FileMetaData) ?decimal_mod.Kind {
+    const fm = file_meta orelse return null;
+    if (col_idx >= rg.columns.items.len) return null;
+    const meta = rg.columns.items[col_idx].meta_data orelse return null;
+    const elem = fm.getColumnSchema(meta.path_in_schema.items) orelse return null;
+    return decimal_mod.kindFromSchema(&elem);
+}
+
+/// Pruning for DECIMAL columns, on the exact unscaled bounds the leaf's literal is compared with.
 fn pruneDecimal(
     rg: *const schema.RowGroup,
+    st: statistics.ChunkStats,
     col_idx: usize,
     op: ast.Operator,
-    value: f64,
-    kind: decimal_mod.Kind,
+    value: i128,
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
-    const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
-    const min_f = decimal_mod.statToF64(b.min, kind) orelse return .unknown;
-    const max_f = decimal_mod.statToF64(b.max, kind) orelse return .unknown;
-    if (min_f > max_f) return .unknown; // corrupt stats — be safe
-
-    return switch (op) {
-        .Eq => if (value >= min_f and value <= max_f) .keep else .skip,
-        .NotEq => if (min_f == max_f and min_f == value) .skip else .keep,
-        .Gt => if (max_f > value) .keep else .skip,
-        .GtEq => if (max_f >= value) .keep else .skip,
-        .Lt => if (min_f < value) .keep else .skip,
-        .LtEq => if (min_f <= value) .keep else .skip,
-    };
+    const kind = decimalKind(rg, col_idx, file_meta) orelse return .unknown;
+    const b = st.bounds orelse return .unknown;
+    const lo = decimal_mod.statToI128(b.min, kind) orelse return .unknown;
+    const hi = decimal_mod.statToI128(b.max, kind) orelse return .unknown;
+    return if (encoded.rangeOverlapsValue(i128, op, lo, hi, value)) .keep else .skip;
 }
 
 fn pruneBytes(
     rg: *const schema.RowGroup,
+    st: statistics.ChunkStats,
     col_idx: usize,
     op: ast.Operator,
     value: []const u8,
-    parquet_type: schema.Type,
     file_meta: ?*const schema.FileMetaData,
 ) Decision {
-    _ = parquet_type;
-    const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+    const b = st.bounds orelse return .unknown;
 
     if (!encoded.rangeIntersectsBytes(op, b.min, b.max, value)) return .skip;
     // The evaluator compares strings bytewise, so only bounds in that order prove every row passes.
-    if (comparisonProof(rg, col_idx, file_meta)) |p| {
+    if (comparisonProof(rg, st, col_idx, file_meta)) |p| {
         if (statistics.bytewiseOrder(p.elem) and encoded.rangeAlwaysMatchesBytes(op, p.min, p.max, p.max_exact, value))
             return .always_match;
     }
     return .keep;
 }
 
-fn pruneBoolean(
-    rg: *const schema.RowGroup,
-    col_idx: usize,
-    op: ast.Operator,
-    value: bool,
-    file_meta: ?*const schema.FileMetaData,
-) Decision {
-    const b = statistics.chunkBounds(rg, col_idx, file_meta) orelse return .unknown;
+fn pruneBoolean(st: statistics.ChunkStats, op: ast.Operator, value: bool) Decision {
+    const b = st.bounds orelse return .unknown;
     if (b.min.len != 1 or b.max.len != 1) return .unknown;
 
     const min_b = b.min[0] != 0;
@@ -353,6 +360,63 @@ fn synthRowGroupWithStats(
     return rg;
 }
 
+/// An estimate, never a proof, of the share of row group `rg`'s rows `f` passes: each range comparison on an integer
+/// or float column takes its place between the chunk's bounds, as if values spread evenly; AND multiplies, OR adds
+/// (at most 1). A leaf it cannot place (strings, LIKE, nulls, no bounds) passes everything, so a filter it knows
+/// nothing about looks unselective and changes no plan. Only cost rules read it (`scan.applyCostRules`).
+pub fn passFraction(f: ast.Filter, rg: *const schema.RowGroup, file_meta: ?*const schema.FileMetaData) f64 {
+    return switch (f) {
+        .int32 => |l| leafFraction(i32, rg, l, .INT32, file_meta),
+        .int64 => |l| leafFraction(i64, rg, l, .INT64, file_meta),
+        .float => |l| leafFraction(f32, rg, l, .FLOAT, file_meta),
+        .double => |l| leafFraction(f64, rg, l, .DOUBLE, file_meta),
+        .and_filter => |c| blk: {
+            var p: f64 = 1;
+            for (c.children) |child| p *= passFraction(child, rg, file_meta);
+            break :blk p;
+        },
+        .or_filter => |c| blk: {
+            var p: f64 = 0;
+            for (c.children) |child| p += passFraction(child, rg, file_meta);
+            break :blk @min(1, p);
+        },
+        else => 1,
+    };
+}
+
+fn leafFraction(
+    comptime T: type,
+    rg: *const schema.RowGroup,
+    leaf: ast.Leaf(T),
+    parquet_type: schema.Type,
+    file_meta: ?*const schema.FileMetaData,
+) f64 {
+    if (leaf.col_idx >= rg.columns.items.len) return 1;
+    const meta = rg.columns.items[leaf.col_idx].meta_data orelse return 1;
+    if (meta.type != parquet_type) return 1;
+    const b = statistics.chunkStats(rg, leaf.col_idx, file_meta, .corroborated).bounds orelse return 1;
+    const lo_v = encoded.readFixedLE(T, b.min) orelse return 1;
+    const hi_v = encoded.readFixedLE(T, b.max) orelse return 1;
+    const lo: f64 = if (comptime @typeInfo(T) == .float) lo_v else @floatFromInt(lo_v);
+    const hi: f64 = if (comptime @typeInfo(T) == .float) hi_v else @floatFromInt(hi_v);
+    const v: f64 = if (comptime @typeInfo(T) == .float) leaf.value else @floatFromInt(leaf.value);
+    if (!(lo <= hi) or std.math.isNan(v)) return 1;
+    // Integers hold hi - lo + 1 values; a float range is continuous.
+    const width: f64 = if (comptime @typeInfo(T) == .float) hi - lo else hi - lo + 1;
+    if (width <= 0) return 1;
+    const below = std.math.clamp((v - lo) / width, 0, 1); // share strictly below v, roughly
+    const one: f64 = if (comptime @typeInfo(T) == .float) 0 else 1 / width;
+    return switch (leaf.op) {
+        .Lt => below,
+        .LtEq => @min(1, below + one),
+        .Gt => @max(0, 1 - below - one),
+        .GtEq => 1 - below,
+        // One value of an integer range; a float equality is anyone's guess.
+        .Eq => if (v < lo or v > hi) 0 else if (comptime @typeInfo(T) == .float) 1 else one,
+        .NotEq => 1,
+    };
+}
+
 test "pruneRowGroup keeps when value is in range" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -397,11 +461,10 @@ test "pruneRowGroup AND skips when either child skips" {
     var rg = try synthRowGroupWithStats(a, .INT32, &min_buf, &max_buf);
     defer rg.columns.deinit(a);
 
-    const left = try a.create(ast.Filter);
-    left.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }; // keep
-    const right = try a.create(ast.Filter);
-    right.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 999 } }; // skip
-    const composite: ast.Filter = .{ .and_filter = .{ .left = left, .right = right } };
+    const composite = try ast.join(a, true, &.{
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }, // keep
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 999 } }, // skip
+    });
 
     try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, composite, null));
 }
@@ -418,11 +481,10 @@ test "pruneRowGroup OR skips only when both children skip" {
     var rg = try synthRowGroupWithStats(a, .INT32, &min_buf, &max_buf);
     defer rg.columns.deinit(a);
 
-    const left = try a.create(ast.Filter);
-    left.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = -1 } }; // skip
-    const right = try a.create(ast.Filter);
-    right.* = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }; // keep
-    const composite: ast.Filter = .{ .or_filter = .{ .left = left, .right = right } };
+    const composite = try ast.join(a, false, &.{
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = -1 } }, // skip
+        .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 50 } }, // keep
+    });
 
     try testing.expectEqual(Decision.keep, pruneRowGroup(&rg, composite, null));
 }
@@ -500,15 +562,15 @@ test "pruneRowGroup uses DECIMAL stat decoding when file_meta provided" {
     };
 
     // value > 10.0 → max=24.0 > 10 → keep.
-    const f_keep: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 10.0 } };
+    const f_keep: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = .Gt, .value = 1000 } };
     try testing.expectEqual(Decision.keep, pruneRowGroup(&rg, f_keep, &file_meta));
 
     // value > 100.0 → max=24.0 < 100 → skip.
-    const f_skip: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 100.0 } };
+    const f_skip: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = .Gt, .value = 10000 } };
     try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, f_skip, &file_meta));
 
     // value < 0.5 → min=1.0 >= 0.5 → skip.
-    const f_skip_lt: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = 0.5 } };
+    const f_skip_lt: ast.Filter = .{ .decimal = .{ .col_idx = 0, .op = .Lt, .value = 50 } };
     try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, f_skip_lt, &file_meta));
 
     // Without file_meta, DECIMAL recognition is impossible → degrade
@@ -564,6 +626,116 @@ test "pruneRowGroup unknown when stats absent" {
 
     const filter: ast.Filter = .{ .int32 = .{ .col_idx = 0, .op = .Eq, .value = 42 } };
     try testing.expectEqual(Decision.unknown, pruneRowGroup(&rg, filter, null));
+}
+
+test "regression: a float row group whose NaN rows its bounds leave out is kept for `>`, `>=` and their NOT forms" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.mem.toBytes(@as(f64, 0.0));
+    const hi = std.mem.toBytes(@as(f64, 1.0));
+    const unknown_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    const no_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 });
+    const some_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 3 });
+    const leaf = struct {
+        fn of(op: ast.Operator, v: f64) ast.Filter {
+            return .{ .double = .{ .col_idx = 0, .op = op, .value = v } };
+        }
+    }.of;
+    // `NOT (x < 5)` binds as `x >= 5`: NaN passes it, so only a chunk known to hold none skips.
+    for ([_]ast.Filter{ leaf(.Gt, 5), leaf(.GtEq, 5) }) |f| {
+        try testing.expect(unknown_nan.decide(f) != .skip);
+        try testing.expect(some_nan.decide(f) != .skip);
+        try testing.expectEqual(Decision.skip, no_nan.decide(f));
+    }
+    // NaN fails `<`, `<=` and `=` a number: the bounds alone still skip.
+    for ([_]ast.Filter{ leaf(.Lt, -1), leaf(.LtEq, -1), leaf(.Eq, 5) }) |f| {
+        try testing.expectEqual(Decision.skip, unknown_nan.decide(f));
+    }
+    // A NaN literal: only NaN rows pass `= NaN`; nothing passes `> NaN`.
+    const nan = std.math.nan(f64);
+    try testing.expect(unknown_nan.decide(leaf(.Eq, nan)) != .skip);
+    try testing.expectEqual(Decision.skip, no_nan.decide(leaf(.Eq, nan)));
+    try testing.expectEqual(Decision.skip, unknown_nan.decide(leaf(.Gt, nan)));
+    try testing.expect(no_nan.decide(leaf(.Lt, nan)) != .skip);
+}
+
+test "--trust-stats reads a float chunk's missing NaN count as zero, never a count it has" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.mem.toBytes(@as(f64, 0.0));
+    const hi = std.mem.toBytes(@as(f64, 1.0));
+    const unknown_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    const some_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 3 });
+    // A tree as the binder hands it on: the flag reaches every float leaf, under NOT and inside composites.
+    const plain: ast.Filter = try ast.join(a, true, &.{
+        .{ .double = .{ .col_idx = 0, .op = .GtEq, .value = 5 } },
+        try ast.join(a, false, &.{ .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 7 } }, .{ .int32 = .{ .col_idx = 1, .op = .Eq, .value = 1 } } }),
+    });
+    const trusted = try ast.trustMissingNanCounts(a, plain);
+    try testing.expect(trusted.and_filter.children[0].double.trust_missing_nan_count);
+    try testing.expect(trusted.and_filter.children[1].or_filter.children[0].double.trust_missing_nan_count);
+    try testing.expect(!plain.and_filter.children[0].double.trust_missing_nan_count);
+    try testing.expect(!ast.eql(plain, trusted));
+
+    const gt5 = trusted.and_filter.children[0];
+    try testing.expect(unknown_nan.decide(plain.and_filter.children[0]) != .skip);
+    try testing.expectEqual(Decision.skip, unknown_nan.decide(gt5));
+    // A count the file does give is never overridden.
+    try testing.expect(some_nan.decide(gt5) != .skip);
+    // Pages too: no chunk count, no page count.
+    var ci: schema.ColumnIndex = .{};
+    try ci.null_pages.append(a, false);
+    try ci.min_values.append(a, &lo);
+    try ci.max_values.append(a, &hi);
+    const cis = [_]?schema.ColumnIndex{ci};
+    try testing.expect(prunePage(&unknown_nan.rg, 0, plain.and_filter.children[0], &cis, &unknown_nan.fm, true) != .skip);
+    try testing.expectEqual(Decision.skip, prunePage(&unknown_nan.rg, 0, gt5, &cis, &unknown_nan.fm, true));
+}
+
+test "float pruning reads bounds under IEEE_754_TOTAL_ORDER, and a page index's own NaN counts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lo = std.mem.toBytes(@as(f64, 0.0));
+    const hi = std.mem.toBytes(@as(f64, 1.0));
+    const gt5: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Gt, .value = 5 } };
+    const lt_neg: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = -1 } };
+
+    var fx = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 });
+    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    try orders.append(a, schema.COLUMN_ORDER_IEEE_754_TOTAL);
+    fx.fm.column_orders = orders;
+    try testing.expectEqual(Decision.skip, fx.decide(gt5));
+    try testing.expectEqual(Decision.skip, fx.decide(lt_neg));
+    // An all-NaN chunk under that order has NaN bounds: nothing is pruned on them.
+    const nan = std.mem.toBytes(std.math.nan(f64));
+    var all_nan = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &nan, .max_value = &nan, .null_count = 0, .nan_count = 9 });
+    all_nan.fm.column_orders = orders;
+    try testing.expect(all_nan.decide(lt_neg) != .skip);
+    try testing.expect(all_nan.decide(gt5) != .skip);
+    // The order is for floats alone; on a string column it is no order zpq reads.
+    var str = try ProofFixture.init(a, leafElem(.BYTE_ARRAY), .{ .min_value = "a", .max_value = "c", .null_count = 0 });
+    str.fm.column_orders = orders;
+    try testing.expectEqual(Decision.unknown, str.decide(.{ .string = .{ .col_idx = 0, .op = .Eq, .value = "z" } }));
+
+    // Pages: the chunk's nan_count unknown, the index's count for the page decides.
+    const unknown = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0 });
+    for ([_]?i64{ null, 3, 0 }) |page_nans| {
+        var ci: schema.ColumnIndex = .{};
+        try ci.null_pages.append(a, false);
+        try ci.min_values.append(a, &lo);
+        try ci.max_values.append(a, &hi);
+        if (page_nans) |n| {
+            ci.nan_counts = .empty;
+            try ci.nan_counts.?.append(a, n);
+        }
+        const cis = [_]?schema.ColumnIndex{ci};
+        const d = prunePage(&unknown.rg, 0, gt5, &cis, &unknown.fm, false);
+        if (page_nans == 0) try testing.expectEqual(Decision.skip, d) else try testing.expect(d != .skip);
+        try testing.expectEqual(Decision.skip, prunePage(&unknown.rg, 0, lt_neg, &cis, &unknown.fm, false));
+    }
 }
 
 /// `test_fixtures.StatsColumn`, deciding filters against itself.
@@ -691,19 +863,32 @@ test "full-match proof: IS [NOT] NULL from null_count" {
     const not_null: ast.Filter = .{ .null_check = .{ .col_idx = 0, .is_not = true } };
     const is_null: ast.Filter = .{ .null_check = .{ .col_idx = 0, .is_not = false } };
 
-    const none = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .null_count = 0 });
+    const lo = try le64(a, 1);
+    const none = try ProofFixture.init(a, leafElem(.INT64), .{ .min_value = lo, .max_value = lo, .null_count = 0 });
     try testing.expectEqual(Decision.always_match, none.decide(not_null));
     try testing.expectEqual(Decision.skip, none.decide(is_null));
-    const all = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .null_count = 100 });
+    const all = try ProofFixture.init(a, leafElem(.INT64), .{ .null_count = 100 });
     try testing.expectEqual(Decision.skip, all.decide(not_null));
     try testing.expectEqual(Decision.always_match, all.decide(is_null));
-    const unknown = try ProofFixture.init(a, leafElem(.DOUBLE), .{});
+    const unknown = try ProofFixture.init(a, leafElem(.INT64), .{});
     try testing.expectEqual(Decision.unknown, unknown.decide(not_null));
 
-    // A repeated leaf counts values, not rows.
-    var repeated = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .null_count = 0 });
-    repeated.rg.columns.items[0].meta_data.?.num_values = 250;
-    try testing.expectEqual(Decision.keep, repeated.decide(not_null));
+    // No nulls but no bounds either: uncorroborated, so decoded unless --trust-stats vouches for it.
+    const bare = try ProofFixture.init(a, leafElem(.INT64), .{ .null_count = 0 });
+    try testing.expectEqual(Decision.unknown, bare.decide(not_null));
+    try testing.expectEqual(Decision.unknown, bare.decide(is_null));
+    var trusted_not_null = not_null;
+    trusted_not_null.null_check.trust_stats = true;
+    var trusted_is_null = is_null;
+    trusted_is_null.null_check.trust_stats = true;
+    try testing.expectEqual(Decision.always_match, bare.decide(trusted_not_null));
+    try testing.expectEqual(Decision.skip, bare.decide(trusted_is_null));
+
+    // A flat leaf whose value count is not its row count is refused outright.
+    var miscounted = try ProofFixture.init(a, leafElem(.INT64), .{ .min_value = lo, .max_value = lo, .null_count = 0 });
+    miscounted.rg.columns.items[0].meta_data.?.num_values = 250;
+    try testing.expectEqual(Decision.unknown, miscounted.decide(not_null));
+    try testing.expectEqual(Decision.unknown, miscounted.decide(trusted_not_null));
 }
 
 test "bounds are unreadable under an undeclared column order or an unordered annotation, for chunks and pages" {
@@ -755,28 +940,43 @@ pub fn prunePage(
     file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
 ) Decision {
+    // Callers may supply an index directly; writer suppression also covers null-only predicates.
+    switch (filter) {
+        .and_filter, .or_filter => {},
+        inline else => |leaf| {
+            const col = leaf.col_idx;
+            if (col >= col_indexes.len or col >= rg.columns.items.len) return .unknown;
+            const ci = col_indexes[col] orelse return .unknown;
+            const cm = rg.columns.items[col].meta_data orelse return .unknown;
+            const elem = if (file_meta) |fm| fm.getColumnSchema(cm.path_in_schema.items) else null;
+            const writer = if (file_meta) |fm| fm.created_by else null;
+            if (!statistics.pageWriterUsable(&ci, page_idx, cm, elem, writer)) return .unknown;
+        },
+    }
     switch (filter) {
         .null_check, .like, .and_filter, .or_filter => {},
         inline else => |leaf| if (!statistics.boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,
     }
     return switch (filter) {
-        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, file_meta, trust_stats),
-        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, file_meta, trust_stats),
+        .int32 => |leaf| prunePageNumeric(i32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT32, col_indexes, trust_stats, false),
+        .int64 => |leaf| prunePageNumeric(i64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .INT64, col_indexes, trust_stats, false),
         .uint64 => |leaf| prunePageUnsigned(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
-        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, file_meta, trust_stats),
-        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, file_meta, trust_stats),
+        .float => |leaf| prunePageNumeric(f32, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .FLOAT, col_indexes, trust_stats, leaf.trust_missing_nan_count),
+        .double => |leaf| prunePageNumeric(f64, rg, page_idx, leaf.col_idx, leaf.op, leaf.value, .DOUBLE, col_indexes, trust_stats, leaf.trust_missing_nan_count),
+        .decimal => |leaf| prunePageDecimal(rg, page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes, file_meta, trust_stats),
         .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
         .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
         .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
         .like => .unknown,
-        .and_filter => |c| Decision.andCombine(
-            prunePage(rg, page_idx, c.left.*, col_indexes, file_meta, trust_stats),
-            prunePage(rg, page_idx, c.right.*, col_indexes, file_meta, trust_stats),
-        ),
-        .or_filter => |c| Decision.orCombine(
-            prunePage(rg, page_idx, c.left.*, col_indexes, file_meta, trust_stats),
-            prunePage(rg, page_idx, c.right.*, col_indexes, file_meta, trust_stats),
-        ),
+        .and_filter, .or_filter => |c| blk: {
+            if (c.neverTrue(filter == .and_filter)) break :blk .skip;
+            var d = prunePage(rg, page_idx, c.children[0], col_indexes, file_meta, trust_stats);
+            for (c.children[1..]) |child| {
+                const e = prunePage(rg, page_idx, child, col_indexes, file_meta, trust_stats);
+                d = if (filter == .and_filter) Decision.andCombine(d, e) else Decision.orCombine(d, e);
+            }
+            break :blk d;
+        },
     };
 }
 
@@ -810,24 +1010,14 @@ fn prunePageNumeric(
     value: T,
     parquet_type: schema.Type,
     col_indexes: []const ?schema.ColumnIndex,
-    file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
+    /// `Leaf.trust_missing_nan_count`.
+    trust_nan: bool,
 ) Decision {
     if (col_idx >= col_indexes.len or col_idx >= rg.columns.items.len) return .unknown;
     const ci = col_indexes[col_idx] orelse return .unknown;
     if (page_idx >= ci.null_pages.items.len) return .unknown;
     const meta = rg.columns.items[col_idx].meta_data orelse return .unknown;
-
-    // DECIMAL path
-    if (parquet_type == .DOUBLE and meta.type != .DOUBLE and T == f64) {
-        if (file_meta) |fm| {
-            if (fm.getColumnSchema(meta.path_in_schema.items)) |elem| {
-                if (decimal_mod.kindFromSchema(&elem)) |kind| {
-                    return prunePageDecimal(page_idx, ci, op, value, kind, trust_stats);
-                }
-            }
-        }
-    }
 
     if (meta.type != parquet_type) return .unknown;
 
@@ -838,7 +1028,9 @@ fn prunePageNumeric(
     const min = ci.min_values.items[page_idx];
     const max = ci.max_values.items[page_idx];
 
-    if (!encoded.rangeIntersects(T, op, min, max, value)) return .skip;
+    // The chunk's nan_count covers each of its pages; the index may count each page's own.
+    const page_nan_free = if (ci.nan_counts) |nc| page_idx < nc.items.len and nc.items[page_idx] == 0 else false;
+    if (!encoded.rangeIntersects(T, op, min, max, value, nanFree(&rg.columns.items[col_idx], trust_nan) or page_nan_free)) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {
@@ -873,33 +1065,26 @@ fn prunePageUnsigned(
 }
 
 fn prunePageDecimal(
+    rg: *const schema.RowGroup,
     page_idx: usize,
-    ci: schema.ColumnIndex,
+    col_idx: usize,
     op: ast.Operator,
-    value: f64,
-    kind: decimal_mod.Kind,
+    value: i128,
+    col_indexes: []const ?schema.ColumnIndex,
+    file_meta: ?*const schema.FileMetaData,
     trust_stats: bool,
 ) Decision {
+    if (col_idx >= col_indexes.len) return .unknown;
+    const ci = col_indexes[col_idx] orelse return .unknown;
+    const kind = decimalKind(rg, col_idx, file_meta) orelse return .unknown;
     if (page_idx >= ci.null_pages.items.len) return .unknown;
     if (ci.null_pages.items[page_idx]) return .skip;
 
     if (page_idx >= ci.min_values.items.len or page_idx >= ci.max_values.items.len) return .unknown;
-    const min_bytes = ci.min_values.items[page_idx];
-    const max_bytes = ci.max_values.items[page_idx];
+    const lo = decimal_mod.statToI128(ci.min_values.items[page_idx], kind) orelse return .unknown;
+    const hi = decimal_mod.statToI128(ci.max_values.items[page_idx], kind) orelse return .unknown;
 
-    const min_f = decimal_mod.statToF64(min_bytes, kind) orelse return .unknown;
-    const max_f = decimal_mod.statToF64(max_bytes, kind) orelse return .unknown;
-    if (min_f > max_f) return .unknown; // corrupt stats
-
-    const intersects = switch (op) {
-        .Eq => value >= min_f and value <= max_f,
-        .NotEq => !(min_f == max_f and min_f == value),
-        .Gt => max_f > value,
-        .GtEq => max_f >= value,
-        .Lt => min_f < value,
-        .LtEq => min_f <= value,
-    };
-    if (!intersects) return .skip;
+    if (!encoded.rangeOverlapsValue(i128, op, lo, hi, value)) return .skip;
 
     if (trust_stats) {
         const has_nulls = blk: {
@@ -910,12 +1095,12 @@ fn prunePageDecimal(
         };
         if (!has_nulls) {
             const always = switch (op) {
-                .Eq => min_f == max_f and min_f == value,
-                .NotEq => value < min_f or value > max_f,
-                .Gt => min_f > value,
-                .GtEq => min_f >= value,
-                .Lt => max_f < value,
-                .LtEq => max_f <= value,
+                .Eq => lo == hi and lo == value,
+                .NotEq => value < lo or value > hi,
+                .Gt => lo > value,
+                .GtEq => lo >= value,
+                .Lt => hi < value,
+                .LtEq => hi <= value,
             };
             if (always) return .always_match;
         }
@@ -964,4 +1149,37 @@ fn prunePageBoolean(
 
     const intersects = encoded.rangeIntersectsBytes(if (op == .Eq) .Eq else .NotEq, min, max, &[_]u8{if (value) 1 else 0});
     return if (intersects) .keep else .skip;
+}
+
+test "passFraction places range comparisons between a row group's bounds and knows nothing of other leaves" {
+    const metadata = @import("../parquet/metadata.zig");
+    const a = std.testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/topk_skew.parquet", a);
+    defer a.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const meta = try metadata.open(arena.allocator(), bytes);
+    const rg = &meta.row_groups.items[0];
+    const b = statistics.chunkStats(rg, 1, &meta, .corroborated).bounds orelse return error.SkipZigTest;
+    const lo = encoded.readFixedLE(i64, b.min).?;
+    const hi = encoded.readFixedLE(i64, b.max).?;
+    const leaf = struct {
+        fn f(op: ast.Operator, v: i64) ast.Filter {
+            return .{ .int64 = .{ .col_idx = 1, .op = op, .value = v } };
+        }
+    }.f;
+    const half = lo + @divTrunc(hi - lo, 2);
+    try std.testing.expectEqual(@as(f64, 0), passFraction(leaf(.Lt, lo), rg, &meta));
+    try std.testing.expectEqual(@as(f64, 1), passFraction(leaf(.LtEq, hi), rg, &meta));
+    try std.testing.expectEqual(@as(f64, 1), passFraction(leaf(.GtEq, lo), rg, &meta));
+    const mid = passFraction(leaf(.Lt, half), rg, &meta);
+    try std.testing.expect(mid > 0.3 and mid < 0.7);
+    try std.testing.expectEqual(@as(f64, 0), passFraction(leaf(.Eq, hi + 1), rg, &meta));
+    // A conjunction multiplies; a disjunction adds, at most 1; a leaf it cannot place passes everything.
+    const both: ast.Filter = .{ .and_filter = .{ .children = &.{ leaf(.Lt, half), leaf(.Lt, half) } } };
+    try std.testing.expectApproxEqAbs(mid * mid, passFraction(both, rg, &meta), 1e-12);
+    const either: ast.Filter = .{ .or_filter = .{ .children = &.{ leaf(.GtEq, lo), leaf(.GtEq, lo) } } };
+    try std.testing.expectEqual(@as(f64, 1), passFraction(either, rg, &meta));
+    const str: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "x" } };
+    try std.testing.expectEqual(@as(f64, 1), passFraction(str, rg, &meta));
 }

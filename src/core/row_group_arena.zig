@@ -5,21 +5,101 @@
 //! breaks either must be answered here, not by dropping the reuse.
 
 const std = @import("std");
+const huge_pages = @import("huge_pages.zig");
+const core_memory = @import("memory.zig");
 
 /// Worker-owned and not thread-safe. Everything allocated from `allocator()` lives until the next `nextRowGroup`.
 pub const RowGroupArena = struct {
     arena: std.heap.ArenaAllocator,
+    /// Set by `initOn`: a region of the arena's own that it allocates from directly, rewound at each boundary.
+    region: ?*huge_pages.Region = null,
+    /// On a region, what its span cannot hold (or everything, with no mapping): an arena of its own, on the region's
+    /// ledger, its nodes reused from one row group to the next and freed with what they drew at `deinit`. The
+    /// region's own spills to its child are freed only one by one, which an arena's clients never do. Made on first
+    /// use: it points at `spill_charge`.
+    spill: ?*RowGroupArena = null,
+    spill_charge: core_memory.Charged = undefined,
 
     pub fn init(child: std.mem.Allocator) RowGroupArena {
         return .{ .arena = .init(child) };
     }
 
+    /// The arena as `region` itself, which nothing else may allocate from. A region charged to a ledger charges what
+    /// its blocks span, and an `ArenaAllocator`'s nodes span more than is written: a new node is half again past the
+    /// last, and growing one in place leaves the request that did not fit as a gap. On the region, the blocks are
+    /// what was asked for, the newest grows in place, and the boundary is a rewind that keeps the pages.
+    pub fn initOn(region: *huge_pages.Region) RowGroupArena {
+        return .{ .arena = .init(std.heap.page_allocator), .region = region };
+    }
+
     pub fn deinit(self: *RowGroupArena) void {
+        if (self.region) |r| {
+            self.dropSpill();
+            return r.rewind();
+        }
         self.arena.deinit();
     }
 
     pub fn allocator(self: *RowGroupArena) std.mem.Allocator {
-        return self.arena.allocator();
+        if (self.region == null) return self.arena.allocator();
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn dropSpill(self: *RowGroupArena) void {
+        const s = self.spill orelse return;
+        s.deinit();
+        self.region.?.child.destroy(s);
+        self.spill = null;
+    }
+
+    fn spillArena(self: *RowGroupArena) ?*RowGroupArena {
+        if (self.spill == null) {
+            const r = self.region.?;
+            const child = if (r.budget) |b| child: {
+                self.spill_charge = .{ .child = r.child, .budget = b };
+                break :child self.spill_charge.allocator();
+            } else r.child;
+            const s = r.child.create(RowGroupArena) catch return null;
+            s.* = .init(child);
+            self.spill = s;
+        }
+        return self.spill.?;
+    }
+
+    /// A refusal of the spill arena's draw is the region's, to whoever checks `refused`.
+    fn spillRefused(self: *RowGroupArena) void {
+        if (self.region.?.budget != null and self.spill_charge.refused.load(.monotonic)) self.region.?.refused = true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *RowGroupArena = @ptrCast(@alignCast(ctx));
+        const r = self.region.?;
+        if (r.fitsSpan(len, a)) return r.allocator().rawAlloc(len, a, ret);
+        const s = self.spillArena() orelse return null;
+        return s.allocator().rawAlloc(len, a, ret) orelse {
+            self.spillRefused();
+            return null;
+        };
+    }
+
+    // A block from before a boundary is no longer the newest anywhere: freed it does nothing, resized it only shrinks.
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *RowGroupArena = @ptrCast(@alignCast(ctx));
+        if (self.region.?.owns(memory)) return self.region.?.allocator().rawResize(memory, a, new_len, ret);
+        const s = self.spill orelse return new_len <= memory.len;
+        if (s.allocator().rawResize(memory, a, new_len, ret)) return true;
+        self.spillRefused();
+        return false;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        return if (resize(ctx, memory, a, new_len, ret)) memory.ptr else null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ret: usize) void {
+        const self: *RowGroupArena = @ptrCast(@alignCast(ctx));
+        if (self.region.?.owns(memory)) return self.region.?.allocator().rawFree(memory, a, ret);
+        if (self.spill) |s| s.allocator().rawFree(memory, a, ret);
     }
 
     /// Row-group boundary: make every byte reusable while keeping every node. `reset(.retain_capacity)` instead
@@ -30,6 +110,13 @@ pub const RowGroupArena = struct {
     /// After the boundary, memory from the previous row group may still be freed or resized (a deferred cleanup that
     /// runs late is safe), but its contents are garbage from the first new allocation on.
     pub fn nextRowGroup(self: *RowGroupArena) void {
+        // On a region a block from before is never its newest after the rewind: freeing it does nothing, resizing it
+        // only shrinks (as below for the nodes). What spilled keeps its nodes for the next row group, as below; they
+        // and their charge go at `deinit`, with the region's teardown.
+        if (self.region) |r| {
+            if (self.spill) |sp| sp.nextRowGroup();
+            return r.rewind();
+        }
         const state = &self.arena.state;
         // The used list is newest-first. Reversing it hands the nodes back oldest-first, so the next row group fills
         // them in the order this one did and touches the same pages, not a scatter across every node's tail.
@@ -135,4 +222,142 @@ test "after a row-group boundary, freeing and resizing memory from before it is 
     empty.nextRowGroup();
     try std.testing.expect(empty.arena.state.used_list == null);
     _ = try empty.allocator().alloc(u8, 8);
+}
+
+test "on a region of its own, the arena is charged for what it hands out, not for nodes reserved past it" {
+    const huge = huge_pages.huge_page_size;
+    var budget: @import("memory.zig").SharedBudget = .{ .limit = 64 * huge };
+    var region = huge_pages.Region.init(std.testing.allocator, 256 * huge);
+    defer region.deinit();
+    if (region.buf.len == 0) return error.SkipZigTest;
+    region.budget = &budget;
+    var rga = RowGroupArena.initOn(&region);
+    defer rga.deinit();
+    const a = rga.allocator();
+    // An `ArenaAllocator` here reserved nodes half again past these and left gaps where it grew one in place.
+    var asked: usize = 0;
+    for (0..10) |i| {
+        const n = (i + 1) * huge / 2;
+        @memset(try a.alloc(u8, n), 1);
+        asked += n;
+    }
+    try std.testing.expectEqual(std.mem.alignForward(usize, asked, huge), region.charged);
+    // Refused past the budget, holding nothing more; what fits is still served.
+    const past = a.alloc(u8, 48 * huge);
+    if (past) |_| return error.TestUnexpectedResult else |e| try std.testing.expectEqual(error.OutOfMemory, e);
+    try std.testing.expectEqual(std.mem.alignForward(usize, asked, huge), region.charged);
+    region.refused = false;
+    // The boundary reuses the pages: a repeat charges nothing more.
+    const first = try a.alloc(u8, huge);
+    rga.nextRowGroup();
+    // A block from before the boundary can be freed or shrunk, not grown, before the next allocation.
+    try std.testing.expect(!a.resize(first, 2 * huge));
+    try std.testing.expect(a.resize(first, huge / 2));
+    a.free(first);
+    const charged = region.charged;
+    for (0..10) |i| @memset(try a.alloc(u8, (i + 1) * huge / 2), 2);
+    try std.testing.expectEqual(charged, region.charged);
+}
+
+test "on a region, what its span cannot hold is reused across row groups and freed with its charge at deinit" {
+    const huge = huge_pages.huge_page_size;
+    var budget: core_memory.SharedBudget = .{ .limit = 16 << 20 };
+    var region = huge_pages.Region.init(std.testing.allocator, huge);
+    region.budget = &budget;
+    defer region.deinit();
+    var arena = RowGroupArena.initOn(&region);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Past the reserve: the arena's own spill, not the region's, which would hold it until freed one by one.
+    const block = try a.alloc(u8, 3 << 20);
+    @memset(block, 1);
+    const held = budget.used.load(.monotonic);
+    try std.testing.expect(held >= (3 << 20));
+    arena.nextRowGroup();
+    try std.testing.expectEqual(@as(usize, 0), region.spilled);
+    // Freed late, after the boundary, it does nothing; the next row group reuses its node, drawing nothing more.
+    a.free(block);
+    @memset(try a.alloc(u8, 3 << 20), 2);
+    try std.testing.expectEqual(held, budget.used.load(.monotonic));
+    // Refused past the budget as a draw of the region's.
+    const big = a.alloc(u8, 32 << 20);
+    if (big) |_| return error.TestUnexpectedResult else |e| try std.testing.expectEqual(error.OutOfMemory, e);
+    try std.testing.expect(region.refused);
+    // Gone with the arena, with what it drew: the region holds only its own pages.
+    arena.deinit();
+    arena = RowGroupArena.initOn(&region);
+    try std.testing.expectEqual(region.charged, budget.used.load(.monotonic));
+}
+
+test "on a region with no mapping, everything is the arena's spill, gone at deinit with its charge" {
+    var budget: core_memory.SharedBudget = .{ .limit = 16 << 20 };
+    var region: huge_pages.Region = .{ .child = std.testing.allocator, .budget = &budget };
+    defer region.deinit();
+    var arena = RowGroupArena.initOn(&region);
+    const a = arena.allocator();
+    @memset(try a.alloc(u8, 4096), 1);
+    try std.testing.expect(budget.used.load(.monotonic) >= 4096);
+    arena.deinit();
+    try std.testing.expectEqual(@as(usize, 0), region.spilled);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+/// A paired scratch and row-group arena through scratch growth, an arena spill, a boundary and teardown, on the
+/// mapping (`mapped`) or on a reserve too large to map, where both fall back to their children. Whatever fails, the
+/// ledger ends holding only what was drawn before.
+fn pairUnwindsForTest(child: std.mem.Allocator, mapped: bool) !void {
+    var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+    _ = budget.drawExact(17).?;
+    defer std.debug.assert(budget.used.load(.monotonic) == 17);
+    var pair = huge_pages.Region.initPair(child, if (mapped) huge_pages.huge_page_size else @as(usize, 1) << 62);
+    if (!mapped) {
+        try std.testing.expectEqual(@as(usize, 0), pair.arena.mapping.len);
+        try std.testing.expectEqual(@as(usize, 0), pair.arena.buf.len);
+        try std.testing.expectEqual(@as(usize, 0), pair.scratch.buf.len);
+    }
+    pair.scratch.child = child;
+    pair.scratch.budget = &budget;
+    pair.arena.budget = &budget;
+    defer pair.arena.deinit();
+    defer pair.scratch.deinit();
+    var scratch = @import("parquet/page.zig").DecodeScratch.init(pair.scratch.allocator());
+    defer scratch.deinit();
+    var arena = RowGroupArena.initOn(&pair.arena);
+    defer arena.deinit();
+    @memset(try scratch.ensure(u8, 1, &scratch.page, 4096), 0x5a);
+    @memset(try scratch.ensure(u8, 1, &scratch.page, 2 << 20), 0x5a);
+    @memset(try arena.allocator().alloc(u8, 6 << 20), 1);
+    const held = budget.used.load(.monotonic);
+    arena.nextRowGroup();
+    @memset(try arena.allocator().alloc(u8, 6 << 20), 2);
+    try std.testing.expectEqual(held, budget.used.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0x5a), scratch.page[scratch.page.len - 1]);
+}
+
+test "a worker's region pair unwinds every allocation failure, mapped or not, holding no charge of its own" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pairUnwindsForTest, .{true});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pairUnwindsForTest, .{false});
+}
+
+test "a row-group arena filling its pair's whole span, rewound and trimmed, leaves the live scratch intact" {
+    var pair = huge_pages.Region.initPair(std.testing.allocator, 4 << 20);
+    defer pair.arena.deinit();
+    defer pair.scratch.deinit();
+    if (pair.arena.buf.len == 0) return error.SkipZigTest;
+    var budget: core_memory.SharedBudget = .{ .limit = 32 << 20 };
+    pair.arena.budget = &budget;
+    pair.scratch.budget = &budget;
+    const s = try pair.scratch.allocator().alloc(u8, huge_pages.Region.pair_scratch_span);
+    @memset(s, 0xa5);
+    var arena = RowGroupArena.initOn(&pair.arena);
+    defer arena.deinit();
+    for (0..4) |_| {
+        @memset(try arena.allocator().alloc(u8, pair.arena.buf.len), 0x33);
+        try std.testing.expectEqual(@as(u8, 0xa5), s[0]);
+        try std.testing.expectEqual(@as(u8, 0xa5), s[s.len - 1]);
+        arena.nextRowGroup();
+        pair.arena.trim();
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+        try std.testing.expectEqual(@as(u8, 0xa5), s[s.len - 1]);
+    }
 }

@@ -1,0 +1,77 @@
+{
+  "fixtures": [{"name": "main", "copy": "COPY (SELECT i::INTEGER AS id, (i * 1.5)::DOUBLE AS amt, ('row' || i) AS name, CAST(i AS DECIMAL(12,2)) AS price, (DATE '2020-01-01' + i::INTEGER) AS d, (TIMESTAMP '2020-01-01 00:00:00' + (i::INTEGER * INTERVAL 1 DAY)) AS ts, (i % 3 = 0) AS flag, (CASE WHEN i % 7 = 0 THEN NULL ELSE 'n' || i END) AS nname FROM range(1, 1001) t(i)) TO '{path}' (FORMAT PARQUET)"}, {"name": "struct", "copy": "COPY (SELECT {'key': i::BIGINT, 'name': 'n' || i} AS r, (i + 1000)::BIGINT AS key, i::BIGINT AS amount FROM range(1, 101) t(i)) TO '{path}' (FORMAT PARQUET)"}],
+  "matrices": [
+    {
+      "vars": {
+        "f": {
+          "id_gt_500": {"filter": "id > 500", "where": "id > 500"},
+          "amt_lt_150": {"filter": "amt < 150.0", "where": "amt < 150.0"},
+          "name_eq": {"filter": "name = 'row42'", "where": "name = 'row42'"},
+          "date_ge": {"filter": "d >= '2022-01-01'", "where": "d >= DATE '2022-01-01'"},
+          "ts_lt": {"filter": "ts < '2021-01-01 00:00:00'", "where": "ts < TIMESTAMP '2021-01-01 00:00:00'"},
+          "flag_eq": {"filter": "flag = true", "where": "flag = true"},
+          "flag_gt": {"filter": "flag > false", "where": "flag > false"},
+          "in": {"filter": "id IN (1, 5, 999)", "where": "id IN (1, 5, 999)"},
+          "str_in": {"filter": "name IN ('row1', 'row500')", "where": "name IN ('row1', 'row500')"},
+          "not_in": {"filter": "id NOT IN (1, 2, 3)", "where": "id NOT IN (1, 2, 3)"},
+          "not_gt": {"filter": "NOT id > 990", "where": "NOT id > 990"},
+          "is_null": {"filter": "nname IS NULL", "where": "nname IS NULL"},
+          "not_null": {"filter": "nname IS NOT NULL", "where": "nname IS NOT NULL"},
+          "not_null_and": {"filter": "nname IS NOT NULL AND id > 500", "where": "nname IS NOT NULL AND id > 500"},
+          "like_prefix": {"filter": "name LIKE 'row1%'", "where": "name LIKE 'row1%'"},
+          "like_suffix": {"filter": "name LIKE '%9'", "where": "name LIKE '%9'"},
+          "like_contains": {"filter": "name LIKE '%99%'", "where": "name LIKE '%99%'"},
+          "like_underscore": {"filter": "name LIKE 'row_'", "where": "name LIKE 'row_'"},
+          "like_general": {"filter": "name LIKE 'r%w_0'", "where": "name LIKE 'r%w_0'"},
+          "not_like": {"filter": "name NOT LIKE 'row1%'", "where": "name NOT LIKE 'row1%'"}
+        }
+      },
+      "case": {"id": "foreign:count:${f}", "query": {"aggregate": "count(id) AS c", "filter": "${filter}"}, "oracle": {"compare": "agg", "sql": "SELECT count(id) FROM '{path}' WHERE ${where}"}}
+    },
+    {
+      "vars": {
+        "a": {
+          "count(id)": {"duck": "count(id)"},
+          "min(id)": {"duck": "min(id)"},
+          "max(id)": {"duck": "max(id)"},
+          "sum(id)": {"duck": "sum(id)"},
+          "min(amt)": {"duck": "min(amt)"},
+          "max(amt)": {"duck": "max(amt)"},
+          "sum(amt)": {"duck": "sum(amt)"},
+          "avg(amt)": {"duck": "avg(amt)"},
+          "avg_state(amt)": {"duck": "sum(amt), count(amt)"},
+          "min(price)": {"duck": "min(price)"},
+          "max(price)": {"duck": "max(price)"},
+          "sum(price)": {"duck": "sum(price)"},
+          "min(name)": {"duck": "min(name)"},
+          "max(name)": {"duck": "max(name)"},
+          "min(d)": {"duck": "min(d) - DATE '1970-01-01'"},
+          "max(d)": {"duck": "max(d) - DATE '1970-01-01'"},
+          "min(ts)": {"duck": "epoch_us(min(ts))"},
+          "max(ts)": {"duck": "epoch_us(max(ts))"},
+          "sum(flag)": {"duck": "sum(flag::INTEGER)"},
+          "min(flag)": {"duck": "min(flag)"},
+          "max(flag)": {"duck": "max(flag)"},
+          "avg(price)": {"duck": "sum(price), count(price)", "mean": {"scale": 6}}
+        }
+      },
+      "case": {"id": "foreign:stats-answer:${a}", "query": {"aggregate": "${a} AS r"}, "axes": [{}, {"scan_all": true}], "oracle": {"compare": "agg", "sql": "SELECT ${duck} FROM '{path}'", "mean": "${mean}"}}
+    }
+  ],
+  "cases": [
+    {"id": "foreign:aggregates", "query": {"aggregate": "sum(id) AS sid, min(amt) AS mn, max(amt) AS mx, sum(price) AS sp, count(id) AS c"}, "oracle": {"compare": "agg", "sql": "SELECT sum(id), min(amt), max(amt), sum(price), count(id) FROM '{path}'"}},
+    {"id": "foreign:id_gt_500:sum", "query": {"aggregate": "count(id) AS c, sum(price) AS sp", "filter": "id > 500"}, "oracle": {"compare": "agg", "sql": "SELECT count(id), sum(price) FROM '{path}' WHERE id > 500"}},
+    {"id": "foreign:string-extremes", "query": {"aggregate": "min(name) AS lo, max(name) AS hi"}, "oracle": {"compare": "agg", "sql": "SELECT min(name), max(name) FROM '{path}'"}},
+    {"id": "foreign:bool-aggregates", "query": {"aggregate": "sum(flag) AS s, min(flag) AS mn, max(flag) AS mx, count(flag) AS c"}, "oracle": {"compare": "agg", "sql": "SELECT sum(flag::INTEGER), min(flag), max(flag), count(flag) FROM '{path}'"}},
+    {"id": "foreign:prune-parity", "query": {"aggregate": "count(id) AS c, sum(amt) AS s", "filter": "id < 100"}, "axes": [{}, {"scan_all": true}], "oracle": {"compare": "agg", "sql": "SELECT count(id), sum(amt) FROM '{path}' WHERE id < 100"}},
+    {"id": "foreign:sql:agg-where", "sql": "SELECT count(id) AS c, sum(price) AS sp FROM '{path}' WHERE id > 500", "oracle": {"compare": "agg", "sql": "SELECT count(id), sum(price) FROM '{path}' WHERE id > 500"}},
+    {"id": "foreign:sql:like", "sql": "SELECT count(id) AS c FROM '{path}' WHERE name LIKE 'row1%'", "oracle": {"compare": "agg", "sql": "SELECT count(id) FROM '{path}' WHERE name LIKE 'row1%'"}},
+    {"id": "foreign:sql:not-null", "sql": "SELECT count(id) AS c FROM '{path}' WHERE nname IS NOT NULL", "oracle": {"compare": "agg", "sql": "SELECT count(id) FROM '{path}' WHERE nname IS NOT NULL"}},
+    {"id": "foreign:struct:bare-vs-dotted", "fixture": "struct", "query": {"aggregate": "sum(key) AS s, sum(r.key) AS t", "filter": "key > 1050"}, "oracle": {"compare": "agg", "sql": "SELECT sum(key), sum(r.key) FROM '{path}' WHERE key > 1050"}},
+    {"id": "foreign:struct:dotted-filter", "fixture": "struct", "query": {"aggregate": "count(*) AS n, sum(key) AS s", "filter": "r.key <= 10"}, "oracle": {"compare": "agg", "sql": "SELECT count(*), sum(key) FROM '{path}' WHERE r.key <= 10"}},
+    {"id": "foreign:int96-filter", "input": "data/parquet-testing/data/alltypes_plain.parquet", "query": {"aggregate": "count(timestamp_col) AS c", "filter": "timestamp_col >= '2009-04-01'"}, "oracle": {"compare": "agg", "sql": "SELECT count(timestamp_col) FROM '{path}' WHERE timestamp_col >= TIMESTAMP '2009-04-01'"}},
+    {"id": "foreign:always-match-pages", "input": "data/parquet-testing/data/alltypes_tiny_pages.parquet", "query": {"aggregate": "sum(id) AS s, max(id) AS m", "filter": "id IS NOT NULL"}, "oracle": {"compare": "agg", "sql": "SELECT sum(id), max(id) FROM '{path}' WHERE id IS NOT NULL"}},
+    {"id": "foreign:always-match-pages:trust", "input": "data/parquet-testing/data/alltypes_tiny_pages.parquet", "trust_stats": true, "query": {"aggregate": "sum(id) AS s, max(id) AS m", "filter": "id >= 0"}, "oracle": {"compare": "agg", "sql": "SELECT sum(id), max(id) FROM '{path}' WHERE id >= 0"}},
+    {"id": "foreign:always-match-pages:groups", "input": "data/parquet-testing/data/alltypes_tiny_pages.parquet", "query": {"aggregate": "count(*) AS n", "filter": "id IS NOT NULL", "group_by": "id"}, "oracle": {"compare": "group", "sql": "SELECT id, count(*) AS n FROM '{path}' WHERE id IS NOT NULL GROUP BY id"}}
+  ]
+}

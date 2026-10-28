@@ -1,0 +1,15 @@
+{
+  "fixtures": [{"name": "main", "copy": "COPY (SELECT CAST(d AS DECIMAL(38,2)) AS d FROM (VALUES ('12345678901234567890123456789.01'), ('12345678901234567890123456789.02'), ('-12345678901234567890123456789.00')) t(d)) TO '{path}' (FORMAT PARQUET)"}, {"name": "nullable_flba", "copy": "COPY (SELECT CAST(d AS DECIMAL(20,2)) AS price FROM (VALUES ('100.00'), (NULL), ('200.50'), (NULL), ('50.25')) t(d)) TO '{path}' (FORMAT PARQUET)"}, {"name": "int96_signed", "path": "ci/fixtures/parquet/int96_from_spark.parquet"}, {"name": "alp", "path": "ci/fixtures/parquet/alp_extended.zstd.parquet"}],
+  "schema": ["d"],
+  "cases": [
+    {"id": "precision:write-all", "emit": "copy", "oracle": {"compare": "except"}},
+    {"id": "precision:filter", "query": {"filter": "d > 0"}, "emit": "copy", "oracle": {"compare": "except", "where": "d > 0"}},
+    {"id": "precision:aggregate", "query": {"aggregate": "sum(d) AS s, min(d) AS lo, max(d) AS hi"}, "oracle": {"compare": "agg", "sql": "SELECT sum(d), min(d), max(d) FROM '{path}'"}},
+    {"id": "precision:mean", "query": {"aggregate": "avg(d) AS a"}, "oracle": {"compare": "agg", "sql": "SELECT sum(d), count(d) FROM '{path}'", "mean": {"scale": 2}}},
+    {"id": "precision:group", "query": {"aggregate": "count(*) AS n", "group_by": "d"}, "oracle": {"compare": "group", "sql": "SELECT d, count(*) AS n FROM '{path}' GROUP BY d"}},
+    {"id": "precision:nullable-flba-skips-null-values", "fixture": "nullable_flba", "query": {"aggregate": "sum(price) AS s, count(price) AS c, min(price) AS lo, max(price) AS hi"}, "oracle": {"compare": "agg", "sql": "SELECT sum(price), count(price), min(price), max(price) FROM '{path}'"}},
+    {"id": "precision:int96-signed-day-exact", "fixture": "int96_signed", "sql": "SELECT a FROM '{path}' WHERE a < 0", "emit": "rows", "axes": [{"jobs": 1}, {"jobs": 3}], "oracle": {"compare": "ordered", "sql": "SELECT CAST('-9357363680509551616000' AS HUGEINT) AS a"}},
+    {"id": "precision:alp-supported-count", "fixture": "alp", "sql": "SELECT count(float_plain) AS n FROM '{path}'", "axes": [{"jobs": 1}, {"jobs": 3}], "oracle": {"compare": "ordered", "sql": "SELECT 9024 AS n"}},
+    {"id": "precision:alp-declared-refusal", "fixture": "alp", "sql": "SELECT sum(float_alp_1024) AS s FROM '{path}'", "axes": [{"jobs": 1}, {"jobs": 3}], "refuse": {"error": "UnsupportedEncoding", "diag": "unsupported encoding ALP (id 10)"}}
+  ]
+}

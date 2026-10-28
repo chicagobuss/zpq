@@ -1,8 +1,12 @@
-//! In-process, plain-HTTP, path-style S3 stand-in for unit tests of the write path. Serves CreateMultipartUpload,
-//! UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads, HEAD and single-object PUT from
-//! memory, one thread per connection. `drop` makes it lose the response to one matching request, the way a response
-//! lost on the network looks to the client: the server applies the request (or, with `apply_dropped = false`, does
-//! not) and then resets the connection without sending a byte.
+//! In-process, plain-HTTP, path-style S3 stand-in for unit tests. Serves CreateMultipartUpload, UploadPart,
+//! CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads, HEAD and single-object PUT from memory, and
+//! ranged GETs of objects a test registers with `serveBytes`, one thread per connection. `drop` makes it lose the
+//! response to one matching request, the way a response lost on the network looks to the client: the server applies
+//! the request (or, with `apply_dropped = false`, does not) and then resets the connection without sending a byte.
+//! `stall` makes it go silent on matching requests while keeping the connection open, the way a stuck server or
+//! network path looks: before the response, part-way through its headers or its body, or (for a request with a body)
+//! without reading that body, so the client's send blocks. `fail` makes it refuse matching requests with an error
+//! status and S3 error code, without applying them.
 //!
 //! Test-only: imported from tests, never from the engine.
 
@@ -19,10 +23,19 @@ pub const Upload = struct {
 
 pub const Part = struct { number: u32, md5: [Md5.digest_length]u8 };
 
-pub const Object = struct { key: []u8, etag: []u8, len: usize };
+pub const Object = struct {
+    key: []u8,
+    etag: []u8,
+    len: usize,
+    /// The bytes a GET reads, borrowed from the test (`serveBytes`); null for objects only written.
+    data: ?[]const u8 = null,
+};
 
 pub const FakeS3 = struct {
-    const MAX_CONNS = 64;
+    /// Lifetime accepts. A finished connection keeps its slot until `deinit`. One query opens at most its pool and
+    /// reuses those connections across row-group windows; a test runs many queries on one server. 64 is enough when
+    /// every query opens a couple, and not when an up-front fetch fills the pool.
+    const MAX_CONNS = 256;
 
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t,
@@ -43,6 +56,69 @@ pub const FakeS3 = struct {
     drop: ?[]const u8 = null,
     apply_dropped: bool = true,
     dropped: u32 = 0,
+    /// When set, object GETs past this many are refused (403), as a revoked credential or a deleted object would be.
+    gets_allowed: ?u32 = null,
+    gets: u32 = 0,
+    /// Object byte ranges served by GETs, for metadata-only and range-planning assertions.
+    get_bytes: u64 = 0,
+    lowest_get_offset: ?usize = null,
+    /// Substring of "METHOD target" on whose next `stalls_left` matches the server goes silent (`stall_at`), holding
+    /// the connection open until the client closes it or the server stops.
+    stall: ?[]const u8 = null,
+    stall_at: StallAt = .mid_body,
+    stalls_left: u32 = 1,
+    /// Matching requests let through before the stalls start (the footer read, say, to stall a ranged fetch after it).
+    stall_skip: u32 = 0,
+    /// When set, only a request for an explicit byte range at least this long matches: a column-chunk fetch, not the
+    /// footer read (a suffix range) or a short header read.
+    stall_min_len: usize = 0,
+    stalled: u32 = 0,
+    trickle_ms: u32 = 60,
+    /// Substring of "METHOD target" whose next `fails_left` matches are refused with `fail_status` and `fail_code`,
+    /// unapplied.
+    fail: ?[]const u8 = null,
+    fail_status: u16 = 503,
+    fail_code: []const u8 = "SlowDown",
+    fails_left: u32 = 1,
+    /// When set, a CompleteMultipartUpload answers 200 at once and then a space every `complete_keepalive_every_ms`
+    /// for this long before its result, as S3 does while it assembles a large object.
+    complete_keepalive_ms: u32 = 0,
+    complete_keepalive_every_ms: u32 = 1000,
+    failed: u32 = 0,
+    /// CreateMultipartUpload requests received, whatever became of them.
+    creates: u32 = 0,
+    /// Answer a CreateMultipartUpload 200, having applied it, with a body that carries no UploadId.
+    create_unreadable: bool = false,
+    /// Set by `deinit`: stalled connection threads stop waiting.
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// When set, a data GET is counted in `gets_arrived` and not answered until `release_gets`. `release_one_get`
+    /// lets exactly one of those answers go out, so a test can open the data-wave gate and watch the rest start.
+    /// When set, `holdSilent` keeps advancing `tls`'s test clock until the stalled client hangs up, so a partial
+    /// send that restarts its idle deadline still times out without a wall-clock wait. The jumps stop at the hangup,
+    /// and the retry is not expired.
+    expire_virtual_deadline: bool = false,
+    hold_gets: bool = false,
+    gets_arrived: std.atomic.Value(u32) = .init(0),
+    /// Data GETs currently blocked in `hold_gets`, and the most that were blocked at once.
+    gets_waiting: std.atomic.Value(u32) = .init(0),
+    max_waiting: std.atomic.Value(u32) = .init(0),
+    release_gets: std.atomic.Value(bool) = .init(false),
+    release_one_get: std.atomic.Value(bool) = .init(false),
+
+    pub const StallAt = enum {
+        /// No byte of the response.
+        before_headers,
+        /// Part of the status line.
+        mid_headers,
+        /// The headers and half the body.
+        mid_body,
+        /// The request's head is read but not its body: a large body (an UploadPart) fills the socket buffers and
+        /// the client's send blocks.
+        request_body,
+        /// Not a stall: the whole response, its body in eight pieces `trickle_ms` apart, slower in all than a
+        /// client's idle timeout but never silent for that long.
+        trickle,
+    };
 
     pub fn start(self: *FakeS3, allocator: std.mem.Allocator) !void {
         var stop: [2]posix.fd_t = undefined;
@@ -71,6 +147,7 @@ pub const FakeS3 = struct {
     /// sockets down, which does work everywhere. A thread that still has not stopped after `stop_timeout_ms` is a
     /// panic naming the server, not a test run that never ends; it cannot be abandoned, since it points into `self`.
     pub fn deinit(self: *FakeS3) void {
+        self.stopping.store(true, .release);
         _ = posix.system.write(self.stop[0], "s", 1);
         if (!waitReadable(self.stop[0], stop_timeout_ms))
             std.debug.panic("fake_s3 on port {d}: the accept thread has not stopped {d} ms after deinit()", .{ self.port, stop_timeout_ms });
@@ -116,6 +193,16 @@ pub const FakeS3 = struct {
         return n;
     }
 
+    /// Serve `data` (borrowed; it must outlive the server) as object `key` to GETs.
+    pub fn serveBytes(self: *FakeS3, key: []const u8, data: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+        try self.putObject(key, try std.fmt.allocPrint(self.allocator, "etag-{d}", .{data.len}), data.len);
+        for (self.objects.items) |*o| if (std.mem.eql(u8, o.key, key)) {
+            o.data = data;
+        };
+    }
+
     pub fn object(self: *FakeS3, key: []const u8) ?Object {
         self.lock();
         defer self.unlock();
@@ -157,6 +244,15 @@ pub const FakeS3 = struct {
                 else => return,
             }
             const fd: posix.fd_t = @intCast(rc);
+            if (self.stall != null and self.stall_at == .request_body) {
+                // A small receive buffer, so a body this server does not read soon blocks the client's send.
+                const small: c_int = 16 * 1024;
+                _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&small), @sizeOf(c_int));
+            }
+            // A response goes out in several writes; without this, Nagle holds each later one for the client's delayed
+            // ACK, about 40 ms a request, which a test fetching row group by row group pays hundreds of times.
+            const one: c_int = 1;
+            _ = posix.system.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
             self.conn_fds[self.conns] = fd;
             self.conn_threads[self.conns] = std.Thread.spawn(.{}, serveConn, .{ self, fd }) catch null;
             self.conns += 1;
@@ -173,6 +269,10 @@ pub const FakeS3 = struct {
                 if (!readMore(self.allocator, fd, &buf)) return;
             };
             const body_len = contentLength(buf.items[0..head_end]);
+            if (self.takeStall(buf.items[0..head_end], .request_body)) {
+                self.holdSilent(fd);
+                return;
+            }
             while (buf.items.len < head_end + 4 + body_len) if (!readMore(self.allocator, fd, &buf)) return;
             // Sliced only now: reading the body may have moved `buf`.
             const request = buf.items[0 .. head_end + 4 + body_len];
@@ -190,6 +290,44 @@ pub const FakeS3 = struct {
         }
     }
 
+    /// Whether the request with this head is the next to stall at `at` (and count it).
+    fn takeStall(self: *FakeS3, head: []const u8, at: StallAt) bool {
+        if (self.stall_at != at) return false;
+        const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+        const sp2 = std.mem.lastIndexOfScalar(u8, head[0..line_end], ' ') orelse return false;
+        self.lock();
+        defer self.unlock();
+        const pat = self.stall orelse return false;
+        if (std.mem.indexOf(u8, head[0..sp2], pat) == null) return false;
+        if (self.stall_skip > 0) {
+            self.stall_skip -= 1;
+            return false;
+        }
+        self.stalled += 1;
+        self.stalls_left -|= 1;
+        if (self.stalls_left == 0) self.stall = null;
+        return true;
+    }
+
+    /// Say nothing more on `fd`, without reading from it, until the server stops; the client gives up and closes its
+    /// end in the meantime.
+    fn holdSilent(self: *FakeS3, fd: posix.fd_t) void {
+        if (self.expire_virtual_deadline) {
+            const tls = @import("tls.zig");
+            // A partial write restarts the idle deadline at the frozen clock, so one jump is not enough. Jump by
+            // more than an idle period, a few times, until this connection hangs up. Stop before a retry on a new
+            // connection has armed its own deadline.
+            var jumps: u8 = 0;
+            while (!self.stopping.load(.acquire) and jumps < 6) {
+                if (hungUp(fd)) break;
+                tls.advanceTestClock(60_000);
+                jumps += 1;
+                sleepMs(15);
+            }
+        }
+        while (!self.stopping.load(.acquire)) sleepMs(5);
+    }
+
     /// Apply one request and answer it; false when the connection is to be dropped instead.
     fn handle(self: *FakeS3, fd: posix.fd_t, head: []const u8, body: []const u8) !bool {
         const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
@@ -204,6 +342,29 @@ pub const FakeS3 = struct {
         var locked = true;
         defer if (locked) self.unlock();
         var lose = false;
+        stall_reply = null;
+        if (std.mem.eql(u8, method, "POST") and std.mem.indexOf(u8, target, "?uploads") != null) self.creates += 1;
+        if (self.fail) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
+            self.failed += 1;
+            self.fails_left -|= 1;
+            if (self.fails_left == 0) self.fail = null;
+            var err_buf: [256]u8 = undefined;
+            const err_body = try std.fmt.bufPrint(&err_buf, "<Error><Code>{s}</Code></Error>", .{self.fail_code});
+            return self.reply(fd, false, self.fail_status, "", err_body, null);
+        };
+        const stalls_here = self.stall_at != .request_body and self.stall != null and
+            std.mem.indexOf(u8, desc, self.stall.?) != null and
+            (self.stall_min_len == 0 or (rangeLen(head) orelse 0) >= self.stall_min_len);
+        if (stalls_here) {
+            if (self.stall_skip > 0) {
+                self.stall_skip -= 1;
+            } else {
+                self.stalled += 1;
+                self.stalls_left -|= 1;
+                if (self.stalls_left == 0) self.stall = null;
+                stall_reply = self.stall_at;
+            }
+        }
         if (self.drop) |pat| if (std.mem.indexOf(u8, desc, pat) != null) {
             self.drop = null;
             self.dropped += 1;
@@ -227,12 +388,21 @@ pub const FakeS3 = struct {
         var advertised_len: ?usize = null;
         if (std.mem.eql(u8, method, "POST") and param(query, "uploads") != null) {
             const id = try self.createUpload(key, realtimeS());
-            resp_body = try std.fmt.allocPrint(a, "<InitiateMultipartUploadResult><UploadId>{s}</UploadId></InitiateMultipartUploadResult>", .{id});
+            resp_body = if (self.create_unreadable)
+                "<InitiateMultipartUploadResult/>"
+            else
+                try std.fmt.allocPrint(a, "<InitiateMultipartUploadResult><UploadId>{s}</UploadId>" ++
+                    "</InitiateMultipartUploadResult>", .{id});
         } else if (std.mem.eql(u8, method, "PUT") and param(query, "uploadId") != null) {
             const u = self.findUpload(param(query, "uploadId").?) orelse return self.reply(fd, lose, 404, "", "<Error><Code>NoSuchUpload</Code></Error>", null);
             var md5: [Md5.digest_length]u8 = undefined;
             Md5.hash(body, &md5, .{});
             const number = try std.fmt.parseInt(u32, param(query, "partNumber") orelse "0", 10);
+            // As S3: a part sent again replaces the one with its number.
+            for (u.parts.items, 0..) |p, i| if (p.number == number) {
+                _ = u.parts.orderedRemove(i);
+                break;
+            };
             try u.parts.append(self.allocator, .{ .number = number, .md5 = md5 });
             extra = try std.fmt.allocPrint(a, "ETag: \"{x}\"\r\n", .{md5});
         } else if (std.mem.eql(u8, method, "POST") and param(query, "uploadId") != null) {
@@ -251,6 +421,26 @@ pub const FakeS3 = struct {
             try self.putObject(key, etag, body.len);
             self.removeUpload(id);
             resp_body = try std.fmt.allocPrint(a, "<CompleteMultipartUploadResult><ETag>\"{s}\"</ETag></CompleteMultipartUploadResult>", .{etag});
+            if (self.complete_keepalive_ms > 0) {
+                // As S3 does for a large object: 200 at once, then whitespace while it assembles, then the result.
+                const total = self.complete_keepalive_ms;
+                const every = self.complete_keepalive_every_ms;
+                locked = false;
+                self.unlock();
+                const opening = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n" ++
+                    "Transfer-Encoding: chunked\r\n\r\n";
+                try writeAll(fd, opening);
+                var waited: u32 = 0;
+                while (waited < total) : (waited += every) {
+                    sleepMs(every);
+                    try writeAll(fd, "1\r\n \r\n");
+                }
+                var chunk_buf: [32]u8 = undefined;
+                try writeAll(fd, try std.fmt.bufPrint(&chunk_buf, "{x}\r\n", .{resp_body.len}));
+                try writeAll(fd, resp_body);
+                try writeAll(fd, "\r\n0\r\n\r\n");
+                return true;
+            }
         } else if (std.mem.eql(u8, method, "DELETE") and param(query, "uploadId") != null) {
             self.removeUpload(param(query, "uploadId").?);
             status = 204;
@@ -270,6 +460,42 @@ pub const FakeS3 = struct {
             }
             try out.appendSlice(a, "</ListMultipartUploadsResult>");
             resp_body = out.items;
+        } else if (std.mem.eql(u8, method, "GET")) {
+            var found: ?Object = null;
+            for (self.objects.items) |o| if (std.mem.eql(u8, o.key, key)) {
+                found = o;
+            };
+            const o = found orelse return self.reply(fd, lose, 404, "", "<Error><Code>NoSuchKey</Code></Error>", null);
+            self.gets += 1;
+            if (self.gets_allowed) |n| if (self.gets > n) {
+                return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
+            };
+            const no_key = "<Error><Code>NoSuchKey</Code></Error>";
+            const data = o.data orelse return self.reply(fd, lose, 404, "", no_key, null);
+            var lo: usize = 0;
+            var hi: usize = data.len; // exclusive
+            if (header(head, "Range")) |r| if (std.mem.startsWith(u8, r, "bytes=")) {
+                const spec = r["bytes=".len..];
+                const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return false;
+                if (dash == 0) {
+                    const n = try std.fmt.parseInt(usize, spec[1..], 10);
+                    lo = data.len -| n;
+                } else {
+                    lo = try std.fmt.parseInt(usize, spec[0..dash], 10);
+                    if (dash + 1 < spec.len) {
+                        hi = @min(data.len, try std.fmt.parseInt(usize, spec[dash + 1 ..], 10) + 1);
+                    }
+                }
+                status = 206;
+                extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\nContent-Range: bytes {d}-{d}/{d}\r\n", .{
+                    o.etag, lo, hi -| 1, data.len,
+                });
+            };
+            if (lo > hi) return self.reply(fd, lose, 416, "", "", null);
+            if (status == 200) extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\n", .{o.etag});
+            self.get_bytes += hi - lo;
+            self.lowest_get_offset = @min(self.lowest_get_offset orelse lo, lo);
+            resp_body = data[lo..hi];
         } else if (std.mem.eql(u8, method, "HEAD")) {
             var found: ?Object = null;
             for (self.objects.items) |o| if (std.mem.eql(u8, o.key, key)) {
@@ -286,15 +512,63 @@ pub const FakeS3 = struct {
         } else {
             status = 400;
         }
+        const hold_this = self.hold_gets and std.mem.eql(u8, method, "GET") and param(query, "uploads") == null;
         self.unlock();
         locked = false;
+        if (hold_this) {
+            _ = self.gets_arrived.fetchAdd(1, .release);
+            const waiting = self.gets_waiting.fetchAdd(1, .acq_rel) + 1;
+            var prev = self.max_waiting.load(.acquire);
+            while (waiting > prev) {
+                if (self.max_waiting.cmpxchgWeak(prev, waiting, .acq_rel, .acquire)) |seen| {
+                    prev = seen;
+                    continue;
+                }
+                break;
+            }
+            defer _ = self.gets_waiting.fetchSub(1, .release);
+            while (!self.release_gets.load(.acquire) and !self.stopping.load(.acquire)) {
+                if (self.release_one_get.swap(false, .acq_rel)) break;
+                sleepMs(5);
+            }
+        }
         return self.reply(fd, lose, status, extra, resp_body, advertised_len);
     }
 
-    fn reply(_: *FakeS3, fd: posix.fd_t, lose: bool, status: u16, extra: []const u8, body: []const u8, advertised_len: ?usize) !bool {
+    fn reply(
+        self: *FakeS3,
+        fd: posix.fd_t,
+        lose: bool,
+        status: u16,
+        extra: []const u8,
+        body: []const u8,
+        advertised_len: ?usize,
+    ) !bool {
         if (lose) return false;
         var head_buf: [512]u8 = undefined;
         const head = try std.fmt.bufPrint(&head_buf, "HTTP/1.1 {d} X\r\nContent-Length: {d}\r\n{s}\r\n", .{ status, advertised_len orelse body.len, extra });
+        if (stall_reply) |at| {
+            if (at == .trickle) {
+                try writeAll(fd, head);
+                const step = (body.len + 7) / 8;
+                var off: usize = 0;
+                while (off < body.len) : (off += step) {
+                    sleepMs(self.trickle_ms);
+                    try writeAll(fd, body[off..@min(body.len, off + step)]);
+                }
+                return true;
+            }
+            switch (at) {
+                .before_headers, .request_body, .trickle => {},
+                .mid_headers => try writeAll(fd, head[0 .. head.len / 2]),
+                .mid_body => {
+                    try writeAll(fd, head);
+                    try writeAll(fd, body[0 .. body.len / 2]);
+                },
+            }
+            self.holdSilent(fd);
+            return false;
+        }
         try writeAll(fd, head);
         if (status != 204 and advertised_len == null) try writeAll(fd, body);
         return true;
@@ -325,8 +599,47 @@ pub const FakeS3 = struct {
     }
 };
 
+/// The length a request's `Range: bytes=a-b` asks for; null without one, or for a suffix range (`bytes=-n`).
+fn rangeLen(head: []const u8) ?usize {
+    const r = header(head, "Range") orelse return null;
+    if (!std.mem.startsWith(u8, r, "bytes=")) return null;
+    const spec = r["bytes=".len..];
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    if (dash == 0) return null;
+    const lo = std.fmt.parseInt(usize, spec[0..dash], 10) catch return null;
+    const hi = std.fmt.parseInt(usize, spec[dash + 1 ..], 10) catch return null;
+    return if (hi >= lo) hi - lo + 1 else null;
+}
+
+fn sleepMs(ms: u32) void {
+    var ts: posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = posix.system.nanosleep(&ts, &ts);
+}
+
+/// The stall `handle` picked for the request this connection thread is answering, acted on by `reply`.
+threadlocal var stall_reply: ?FakeS3.StallAt = null;
+
 /// How long `deinit` waits for the accept thread. A test that works never gets near it.
 const stop_timeout_ms = 20_000;
+
+/// Whether the peer has closed `fd`. Data still sitting unread does not count: a stall deliberately leaves the
+/// request body in the buffer.
+fn hungUp(fd: posix.fd_t) bool {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        const n = posix.system.poll(&pfd, 1, 0);
+        switch (posix.errno(n)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    const dead = posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
+    return pfd[0].revents & dead != 0;
+}
 
 /// Whether `fd` becomes readable within `timeout_ms`.
 fn waitReadable(fd: posix.fd_t, timeout_ms: i32) bool {
@@ -360,6 +673,17 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
         if (posix.errno(r) != .SUCCESS or r == 0) return error.WriteFailed;
         off += @intCast(r);
     }
+}
+
+/// The value of header `name` (case-insensitive), trimmed.
+fn header(head: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |l| {
+        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(l[0..colon], name)) return std.mem.trim(u8, l[colon + 1 ..], " ");
+    }
+    return null;
 }
 
 fn contentLength(head: []const u8) usize {

@@ -193,7 +193,8 @@ fn headerLessThan(_: void, lhs: SigV4.Header, rhs: SigV4.Header) bool {
 }
 
 fn fmtIso8601(ts: i64, buf: *[16]u8) ![]const u8 {
-    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    // A clock set before 1970 signs as 1970: S3 refuses the request as skewed, which says what is wrong.
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(ts, 0)) };
     const day = es.getEpochDay();
     const yd = day.calculateYearDay();
     const md = yd.calculateMonthDay();
@@ -225,6 +226,12 @@ fn hmacSha256(key: []const u8, data: []const u8, out: *[32]u8) void {
 // ============================================================
 
 const testing = std.testing;
+
+test "fmtIso8601 signs a clock before 1970 as the epoch, not a negative cast" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("19700101T000000Z", try fmtIso8601(-86_400, &buf));
+    try std.testing.expectEqualStrings("19700101T000000Z", try fmtIso8601(std.math.minInt(i64), &buf));
+}
 
 test "fmtIso8601 formats epoch second correctly" {
     var buf: [16]u8 = undefined;

@@ -1,6 +1,6 @@
 # Demo: 80 M rows, 6 milliseconds
 
-A reproducible demo of ZPQ on the
+A reproducible demo of zpq on the
 [NYC Taxi yellow trip-data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
 public dataset (24 monthly Parquet files, 1.3 GB, 79.5 M rows). Two
 shapes: local CLI against on-disk files, and AWS Lambda against
@@ -36,7 +36,7 @@ no AWS SDK, no system OpenSSL, no event-loop dependency — built by
 
 ## Why these numbers exist
 
-ZPQ does the absolute minimum work required to satisfy a query:
+zpq does the absolute minimum work required to satisfy a query:
 
 * `count(*)` answers from row-group `num_rows` in the footer — never
   decode a value page. **6 ms across 80 M rows** is the floor for any
@@ -77,18 +77,11 @@ zpq query '/tmp/nyc-taxi/*.parquet' --aggregate "count(*)"
 ```
 
 ```json
-{
-  "ok": true,
-  "files_in": 24,
-  "rows_in": 79479946,
-  "agg": {"count": 79479946},
-  "total_ms": 2,
-  "phase": {"decode_ms": 0}
-}
+{"count":79479946}
 ```
 
-`decode_ms: 0`. The footer says how many rows are in each row group;
-ZPQ adds them up. Real wall time including process spawn is ~6 ms.
+The footer says how many rows are in each row group; zpq adds them up without decoding pages.
+The answer alone is on stdout. Add `--summary=json` for timings and input counters on stderr.
 
 ### Full decode aggregate
 
@@ -98,21 +91,11 @@ zpq query '/tmp/nyc-taxi/*.parquet' \
 ```
 
 ```json
-{
-  "ok": true,
-  "files_in": 24,
-  "rows_in": 79479946,
-  "bytes_in": 1328745331,
-  "agg": {
-    "count": 79479946,
-    "max_tip": 4174,
-    "total_fare": 1541180984.31
-  },
-  "total_ms": 254
-}
+{"count":79479946,"max_tip":4174,"total_fare":1541180984.3100002}
 ```
 
-The 69 row groups across the 24 files are shared out over one worker
+Floating-point sums can differ in their last digits between engines. The row groups across the 24 files
+are shared out over one worker
 per CPU (`-j` overrides). Each worker decodes value pages into its own
 accumulators; the main thread merges them at the end.
 
@@ -191,7 +174,7 @@ just lambda-invoke "$FN" \
 ```
 
 Returns `count: 2964624` in ~620 ms — most of which is TLS
-handshake + tail GET to R2; ZPQ's internal time is ~1 ms.
+handshake + tail GET to R2; zpq's internal time is ~1 ms.
 
 ### 24-file fan-out (per-file)
 
@@ -203,15 +186,21 @@ sandboxes, with nothing to keep warm in between.
 mkdir -p /tmp/results
 for f in yellow_tripdata_{2023,2024}-{01..12}.parquet; do
   payload=$(jq -nc --arg u "s3://$BUCKET/demo/nyc-taxi/yellow/$f" \
-    '{s3_url:$u, aggregate:"count(*),max(tip_amount),sum(fare_amount)"}')
+    '{s3_url:$u, aggregate:"count(*) AS n, max(tip_amount) AS max_tip, sum(fare_amount) AS fare, avg_state(tip_amount) AS tip"}')
   aws lambda invoke --function-name "$FN" \
     --payload "$(echo -n "$payload" | base64 -w 0)" \
     --cli-binary-format base64 "/tmp/results/$f.json" \
     --region us-west-2 >/dev/null &
 done
 wait
-jq -s 'map(.agg.sum) | add' /tmp/results/*.json
+jq -s '{n: (map(.agg.n) | add), fare: (map(.agg.fare) | add), max_tip: (map(.agg.max_tip) | max),
+        avg_tip: ((map(.agg.tip.sum) | add) / (map(.agg.tip.count) | add))}' /tmp/results/*.json
 ```
+
+Per-file means do not average into the overall mean, so the average
+tip comes from `avg_state`: each file answers its `{"sum", "count"}`,
+and the overall mean is the sum of the sums over the sum of the counts.
+`avg(tip_amount)` would answer each file's mean as a plain number.
 
 Wall time ~6 s; cost ~$0.01.
 
@@ -280,7 +269,7 @@ What zpq is for:
   registration. Same UX as `duckdb -c "SELECT * FROM 'data/*.parquet'"`.
 * **The data doesn't have to be in S3.** Cloudflare R2, MinIO,
   GCS-compat — same code, same speed envelope, no migration to AWS.
-* **Writes stream S3-to-S3.** ZPQ Lambda filters, projects and
+* **Writes stream S3-to-S3.** zpq Lambda filters, projects and
   re-encodes straight into a multipart upload; multi-file compaction
   is the iceberg-maintenance shape it was designed for.
 

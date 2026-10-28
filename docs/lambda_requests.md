@@ -15,14 +15,35 @@ the CLI flags of the same name.
 | `column_order` | string | As `--column-order`. |
 | `output_url` | string | Write the result here, as `-o`. |
 | `output_codec` | string | `snappy`, `zstd`, `gzip`, `lz4`/`lz4_raw` or `uncompressed`; anything else is snappy. |
-| `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats`. |
-| `max_memory` | non-negative number, or size string (`"512MB"`) | As `--max-memory`. |
+| `compress_priority` | string | As `--compress-priority`: `size` or `speed`; anything else is `bad_json`/`BadCompressPriority`. Absent: `size`. |
+| `scan_all`, `trust_stats` | boolean | As `--scan-all`, `--trust-stats` (which also reads a float chunk's missing NaN count as zero when pruning, and trusts plausible statistics, never impossible ones). |
+| `ordered` | boolean | `false` is `--unordered`. Absent or `null`: ordered. |
+| `max_memory` | positive number, or size string (`"512MB"`) | As `--max-memory`, which bounds the S3 fetch window (a quarter of it, 64 MiB to 1 GiB) and decoded row groups (half of it; see [capabilities.md](capabilities.md)). Defaults to three quarters of the function's memory less the warm Bloom filter cache's share (a sixteenth, at most 256 MiB). |
+| `profile` | boolean | Add a profile summary to the response, as `--profile-summary=json`. |
+| `profile_url` | string | Also upload the full profile trace to this S3 URL, as `--profile`. Implies `profile`. |
+| `fsync` | bool | Sync local output data before rename, on by default; `false` opts out. No effect on S3 output. |
+| `bloom_filters_enabled` | bool | Automatic dictionary filters, on by default; `false` disables creation. Explicit `bloom_filters` still apply. |
+| `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
+| `row_group_size` | positive integer | As `--row-group-size`: rows per re-encoded output row group (default 131072). |
+| `row_group_bytes` | positive number, or size string | As `--row-group-bytes`: uncompressed bytes per re-encoded output row group (default 64MB). A `max_memory` the request names caps it at a sixteenth of that. |
+| `row_groups` | array, one per input, of `[start, end]` or `null` | Read only row groups `start` up to but not including `end` of that input; `null` reads every row group. See below. |
 
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them
 without building them, so they cost no memory. With `aggregate` or `group_by` the response is the aggregate JSON;
 otherwise with `output_url` it is the write summary. A request with neither gets the older single-file diagnostic
 answer for its first input.
+
+### Splitting a file across workers
+
+`row_groups` lets a coordinator give each worker a contiguous slice of an input's row groups, numbered from 0 in
+footer order, for example `{"inputs":["s3://b/f.parquet"],"row_groups":[[8,16]],"aggregate":"..."}`. The array has
+one entry per input; `[k, k]` is an empty slice (the aggregates of no rows: counts 0, the rest `null`). The ranges
+are checked twice: one that is not a pair of non-negative integers with `start <= end`, or an array whose length is
+not the number of inputs, is `bad_json`/`BadFieldType` naming `row_groups`; an `end` past the input's row groups is
+`engine`/`RowGroupOutOfRange` naming the input. The field cannot be combined with `sql`. Statistics pruning,
+Bloom filters and the response's `rows_in`/`row_groups_in` all see only the slice. `tools/serverless/fanout.py`
+splits inputs this way and merges the answers.
 
 ## Responses
 
@@ -34,17 +55,34 @@ Every response is one JSON object. Durations are whole milliseconds; `pool` and 
 |-------|---------|
 | `ok` | `true`. |
 | `files_in`, `rows_in`, `bytes_in` | Inputs read, their rows, and the bytes fetched or mapped. |
+| `rows_scanned`, `rows_matched` | Rows in the row groups read (not pruned), and of those the rows the filter kept, which the aggregates fold. |
 | `row_groups_in`, `row_groups_pruned`, `row_groups_full_match`, `cols_stat_pruned` | Row groups seen, skipped by statistics, known to match the filter whole; columns answered from statistics. |
 | `agg` | The answer: an object of alias → value, or with `group_by` an array of such objects, one per group. |
 | `total_ms` | Time inside the handler. |
-| `phase` | `read_ms`, `decode_ms`, `eval_ms`, `encode_ms`. |
+| `wall_ms` | Wall-clock phases in ms: `open`, `parse`, `scan`, `footer`. |
+| `worker_ms` | Each scan step summed over the workers, in ms: `decode`, `filter`, `fold`, `encode` (0), `sink`. With N workers a step can reach N times `wall_ms.scan`. |
+| `membership` | Bloom filter and dictionary pruning, below. |
 | `pool` | Connection pool counters, below. |
 
-**Write** (`output_url` set, no aggregate): `ok`, `output` (the URL, escaped), `files_in`, `rows_in`, `rows_kept`,
-`bytes_in`, `bytes_out`, `row_groups_in`, `row_groups_kept`, `total_ms`; `phase` with `read_ms`, `parse_ms`,
-`decode_ms`, `eval_ms`, `encode_ms`, `sink_ms`, `footer_ms`, `mp_await_ms`, `mp_complete_ms`; `meta_cache` with the
+**Write** (`output_url` set, no aggregate): `ok`, `output` (the URL, escaped), `files_in`, `rows_in`, `rows_scanned`,
+`rows_matched` (the rows written), `bytes_in`, `bytes_out`, `row_groups_in`, `row_groups_kept`, `total_ms`; `wall_ms`
+with `open`, `parse`, `scan`, `footer`, `mp_await`, `mp_complete`; `worker_ms` with `decode`, `filter`, `fold` (0),
+`encode`, `sink`, summed over the workers; `meta_cache` with the
 container's cumulative footer-cache counters `hits`, `misses`, `revalidations`, `invalidations`, `inserts`,
-`evictions`; and `pool`.
+`evictions`; `membership`; and `pool`.
+
+**`membership`** (both responses), for row groups an `=` or `IN` filter ruled out beyond their statistics (they are
+also counted in `row_groups_pruned`):
+
+| Field | Meaning |
+|-------|---------|
+| `bloom_pruned`, `dict_pruned` | Row groups a Bloom filter, or failing that a fully dictionary-encoded chunk's dictionary, proved free of every literal. |
+| `filters`, `dictionaries` | Filters and dictionaries probed. |
+| `requests`, `bytes` | S3 requests made, and bytes fetched over HTTP, to read them (0 for local files, for filters the warm cache held, and for bytes copied from the retained suffix). |
+| `suffix_bytes` | Bytes of those filters and dictionaries copied from the retained suffix rather than fetched. |
+| `bloom_stopped`, `dict_stopped` | The first eight row groups probed pruned too few to pay for reading the rest of that kind. |
+| `request_kb` | A request's fixed cost, as the KiB a connection moves meanwhile, that the last read plan assumed (S3 only). |
+| `us` | Time spent, in microseconds. |
 
 **`pool`** (both responses), for the sandbox's S3 connection pool during this invocation. On a cold invocation, the
 intended pattern, the pool starts empty: `reuses` counts only connections reused within this invocation,
@@ -60,9 +98,41 @@ cache hits from earlier invocations appear only when Lambda reuses a sandbox, wh
 | `max_idle_ms` | The longest any idle connection had waited when a request looked at it. |
 | `acquire_wait_ms`, `acquire_lock_ms` | Time spent waiting for a connection permit, and holding the pool lock. |
 
-Response changes: the aggregate response gained `row_groups_full_match` and `pool`; in the write response `output` is
-now JSON-escaped, and `pool` moved after `meta_cache` and gained `idle_evictions`, `stale_retries`, `backoff_retries`
-and `max_idle_ms`.
+Response changes: the aggregate and write responses gained `profile` and `profile_trace` when asked for; `phase` is
+replaced by `wall_ms` and `worker_ms` (the CLI summary's, defined in [output-format.md](output-format.md)), whose worker
+steps sum every worker's time; the write response's `rows_kept` is now `rows_matched`, beside the new `rows_scanned`,
+which the aggregate response also gained with `rows_matched`. The aggregate response gained `row_groups_full_match` and
+`pool`; in the write response `output` is now JSON-escaped, and `pool` moved after `meta_cache` and gained
+`idle_evictions`, `stale_retries`, `backoff_retries` and `max_idle_ms`.
+
+**`profile`** (aggregate and write responses, when the request set `profile` or `profile_url`): the profile summary
+described in [profiling.md](profiling.md), as one object: `total_ns`, `idle_ns`, `threads`, `events`, `dropped`,
+`event_cap`; `cpu` (this run's `user_ns`, `sys_ns`, `minor_faults`, `major_faults`; `peak_rss`, this invocation's peak
+resident memory, `start_rss`, the resident memory when it began, and `peak_rss_scope`, how it was measured: `run`,
+`sampled` or `process`, see [profiling.md](profiling.md); `ledger_peak` and `ledger_limit`, the most the query's memory
+ledger held at once and its limit, `--max-memory`, both 0 when no ledger ran); `meta` (`zpq_version`, `build_mode`,
+`target`, `cpu_count`, `parallelism`, `memory_bytes`, `on_lambda`, `lambda_memory_mb`, `start_unix_s`, `query`, the
+request cut to 512 bytes);
+`phases` (per phase: `wall_ns`, `busy_ns`, `share_ns`, `alone_ns`, `spans`); `chunks`, `chunk_ns` and `top_chunks` (the
+ten costliest column chunks: `file`, `rg`, `column`, `codec`, `encoding`, `bytes_in`, `bytes_out`, `ns`,
+`decompress_ns`, `pages`); `io` (`gets`, `puts`, `bytes`, `ttfb_ns`, `body_ns`, `acquire_ns`, `reused`, `retries`,
+`errors`, `ranges`, `merged`, `fetch_jobs`, `mapped_files`, `mapped_bytes`, `peak_in_flight`, `peak_bytes_in_flight`);
+`prune` (`row_groups`, `skipped`, `full_match`, `filtered`, `pages`, `pages_skipped`, `stats_answered`, `skipped_by`:
+filter column → row groups its statistics skipped); `workers` (`count`, `user_ns`, `sys_ns`, `minor_faults`); `engine`
+(`read_ns`, `parse_ns`, `decode_ns`, `decode_wall_ns`, `eval_ns`, `agg_ns`, `encode_ns`: the sums behind `phase`, in
+nanoseconds); and `peak_buffered_bytes`. Times are nanoseconds. The member's size does not grow with the query (names
+are cut to 128 bytes, and only ten chunks and five skip reasons are listed), so it stays a few KB, far under Lambda's 6
+MB response limit; the trace itself never rides in the response.
+
+**`profile_trace`** (when the request set `profile_url`): `{"url": U, "bytes": N, "omitted_events": K}` after uploading
+the Chrome trace to `U` with one PUT over the invocation's connection pool, or `{"url": U, "error": E}` when the upload
+failed (`E` is `BadProfileUrl` for a URL that is not `s3://bucket/key`). The trace is cut at 1/16 of the memory budget
+(1 to 256 MiB); `K` counts the events left out. A failed upload does not fail the query, and neither does a summary that
+cannot be made: `profile` is then `{"error": E}`. The trace holds the full `s3://` path of every input, the column names
+and the request body; see [What a profile contains](profiling.md#what-a-profile-contains).
+
+Profiling a request costs its own time (a few hundred microseconds to start the RSS sampler and summarize, and the
+spans themselves; see [profiling.md](profiling.md)). A request without `profile` pays nothing for it.
 
 ### Multipart writes whose answer is lost
 
@@ -90,7 +160,7 @@ The event used to be read by searching for each field's key anywhere in the body
 - Malformed JSON: syntax errors, truncation, text after the object, unknown escapes (`\q`), unpaired or reversed
   surrogate escapes, invalid UTF-8, raw control characters in strings. `bad_json` with the scanner's reason.
 - A known field given twice. `bad_json`/`DuplicateField`; the first one used to win.
-- A known field of the wrong type. `bad_json`/`BadFieldType`, naming the field:
+- A known field of a type it does not accept. `bad_json`/`BadFieldType`, naming the field:
   - a string field (`s3_url`, `filter`, `select`, `aggregate`, `group_by`, `column_order`, `output_url`,
     `output_codec`) holding anything but a string;
   - `columns` as a comma-separated string, which used to be ignored (every column was written), or an array holding
@@ -98,7 +168,7 @@ The event used to be read by searching for each field's key anywhere in the body
   - `inputs` that is not an array of strings, which used to fall back to `s3_url`;
   - `scan_all` or `trust_stats` holding anything but `true`/`false`, which used to read as false;
   - `max_memory` that is negative, not a number or size string, or a size string that does not parse, which used to
-    be ignored in favour of the detected memory.
+    be ignored in favour of the detected memory; and a `max_memory` of 0, which used to be accepted.
 - A `columns` entry naming no column. `engine`/`UnknownColumn`, naming it; it used to be dropped from the output.
 
 Accepted requests whose meaning changed: string escapes (`\"`, `\\`, `\n`, `\uXXXX`) are decoded rather than passed

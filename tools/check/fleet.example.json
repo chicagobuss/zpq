@@ -1,0 +1,18 @@
+{
+  "about": "tools/check/fleet.sh's inventory: copy to ~/.config/zpq/fleet.json (or point ZPQ_FLEET at it) and name your own hosts. Hosts are ssh names.",
+  "o11y": "http://fleet-o11y.example:8788/v1/fleet",
+  "timing_locks": ["/var/tmp/zpq-timing.lock"],
+  "fleet_dir": "/mnt/scratch/zpq-fleet",
+  "builders": {
+    "x86_64-linux-musl": ["build-x86"],
+    "aarch64-linux-musl": ["arm-box", "build-x86"],
+    "aarch64-macos": ["build-x86"]
+  },
+  "hosts": {
+    "build-x86": {"target": "x86_64-linux-musl", "memory_max": "12G"},
+    "small-x86": {"target": "x86_64-linux-musl", "memory_max": "3G", "threads": 2, "nice": 19},
+    "arm-box": {"target": "aarch64-linux-musl", "memory_max": "8G", "o11y_name": "arm-box-feed-name"},
+    "laptop": {"target": "aarch64-macos", "memory_max": "8G", "manual": true},
+    "retired": {"enabled": false}
+  }
+}

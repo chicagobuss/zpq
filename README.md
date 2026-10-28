@@ -1,236 +1,185 @@
-# ZPQ
+# zpq
 
-An agentically-engineered Apache Parquet engine in Zig, optimized for serverless compute against object storage.  The
-core philosophy is to do only the minimum work necessary to get the requested task finished to the desired accuracy
-level.  Vendored prebuilt crypto, and native S3/SigV4 for further minimization of lambda execution time.
+zpq is a small Unix tool for Parquet. It queries, filters, aggregates and rewrites Parquet files, on your disk or
+straight from S3, and prints NDJSON, CSV or Parquet for the next tool in the pipe. It does the least work a query
+needs for an exact answer: footers and statistics first, and only the pages that matter. DECIMAL stays in exact
+integers, and the same rows come back in the same order at any thread count.
 
-Workloads it's intended for:
+The project site, with every benchmark and example: **[zpq.chicagobuss.dev](https://zpq.chicagobuss.dev)**.
 
-* Iceberg / Delta table maintenance — one Lambda per file, filter and rewrite in place.
-* Billing / cost roll-ups — answer from row-group statistics when possible, decode bytes only when necessary.
-* Log summarization — Parquet queries without the Athena round-trip; one-line CLI output for ad-hoc work.
+## Install
 
-Two binaries from one sans-IO core: a workstation CLI (`zpq`) and an AWS Lambda bootstrap (`zpq-lambda`). Native SigV4,
-vendored prebuilt BoringSSL, in-tree event loop. No AWS SDK, no system OpenSSL.
-
-## On AWS Lambda: built for cold starts
-
-`zpq-lambda` is a static binary for the `provided.al2023` runtime, and its cold start is the point. On 2026-10-05 in
-us-west-2, with every function at 3008 MB, zpq 0.4.0's median Lambda `Init Duration` was 18–22 ms on arm64 and
-26–35 ms on x86_64 across eleven scenarios (three forced cold starts each). DuckDB 1.5.6 in a Python 3.12 container
-image, same region and memory, measured 448–832 ms, and its cold Init + Duration was 2.4× to 5.6× zpq's (x86_64 against
-x86_64) in every scenario. Polars 1.44.2, packaged the same way, measured 478–806 ms. The full tables, inputs and
-method are in [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
-
-So the intended pattern is cold, bursty and wide: one invocation per file, partition or compaction unit, fanned out
-in parallel when the work arrives, with each sandbox free to be thrown away afterwards. Nothing from an earlier
-invocation is needed for a correct answer, and concurrency, not sandbox reuse, is how it scales.
-
-Keeping sandboxes warm is not the intended use: keep-warm pings, provisioned concurrency bought to hide
-initialisation, or designs that count on a sandbox's connections and caches surviving between calls pay for idle
-capacity to save tens of milliseconds. When Lambda reuses a sandbox on its own, zpq handles it: connections idle for
-more than 4 s are closed rather than reused (they do not survive a frozen sandbox), and a reused connection found dead
-is retried at once on a new one. See [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md) and the request and
-response format in [`docs/lambda_requests.md`](docs/lambda_requests.md).
-
-S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
-role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible
-stores such as R2 or MinIO. `S3_NO_SIGN_REQUEST=1` sends requests unsigned, for buckets that allow public reads; like
-signed requests, these need `AWS_REGION` or `S3_REGION`, and zpq reports a missing region as such.
-
-## Performance
-
-Numbers and trade-offs are dated and contextualised as they're captured. Harnesses:
-
-* `benchmarks/storage_compare.py` — workstation-direct comparison of zpq / duckdb / polars across local files, S3, and
-  R2.
-* `benchmarks/run_selectivity.sh` — Lambda S3-to-S3 sweep across selectivity levels (zpq vs Python lambda running polars
-  + duckdb).
-* `benchmarks/run_coldstart.sh` — cold-start comparison; the latest cold-start figures are in
-  [`docs/measurements/lambda_cold_start_2026-10-05.md`](docs/measurements/lambda_cold_start_2026-10-05.md).
-* `benchmarks/regression/runner.py` — golden-output regression net.
-
-## What it can do
-
-**Read** standard Parquet — V1 + V2 data pages; PLAIN / RLE / RLE_DICTIONARY / DELTA_BINARY_PACKED /
-DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED
-codecs, plus the deprecated LZ4 codec in each container writers used for it (parquet-mr's Hadoop framing, a bare LZ4
-block, an LZ4 frame); all physical types including FIXED_LEN_BYTE_ARRAY; flat, struct, and LIST/MAP nested schemas.
-
-**Filter** with `= != < <= > >=`, `AND` / `OR`, `BETWEEN x AND y`, plus row-group stat pruning and Hive-partition
-pruning before any bytes are fetched. DATE / TIME / TIMESTAMP columns take quoted literals (`'2024-01-01'`,
-`'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is not rounded to it.
-
-**Project** by column name (nested-aware — `events` resolves to every `events.list.element.*` leaf).
-
-**Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + 1.0 → f64`), string concat (`||`),
-`coalesce(col, default)`, parens, unary minus.
-
-**Aggregate** with `sum / count / min / max / avg`, conditional `agg(...) FILTER (WHERE ...)`, and `GROUP BY`.
-As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet; avg's
-`{"sum", "count"}` pair becomes `{"sum": null, "count": 0}`) while `count` is 0. Earlier versions reported 0 or `""`.
-`-o out.parquet` writes the result as parquet: one row, or one row per group with the same columns and values as the
-JSON (avg as `<name>__sum` / `<name>__count`).
-`count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
-opt into trusting file statistics — see [Statistics: trust is opt-in](#statistics-trust-is-opt-in). `--max-memory`
-limits accounted GROUP BY entries across worker tables; allocator overhead and materialized result rows are outside the
-entry budget, so leave headroom.
-
-**Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
-to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
-arrays; DELTA_BINARY_PACKED for INT32 / INT64; DELTA_BYTE_ARRAY for high-cardinality strings. DECIMAL columns re-encode
-losslessly (INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer — never a lossy detour through
-DOUBLE). Direct projection copies preserve page indexes; windowed filter/re-encode writes currently omit them and
-readers fall back to row-group pruning.
-
-`--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
-codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names
-the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one
-(for example, inputs written with different codecs).
-
-**Stream** S3-to-S3 with byte-bounded in-flight memory independent of total file size — multipart upload as the encoder
-produces bytes, a sliding row-group window for re-encode backpressure, and parallel fetch across files.
+**Homebrew** (Apple-silicon macOS and Linux):
 
 ```bash
-zpq query data.parquet -o out.parquet \
-  --filter "int8 BETWEEN -10 AND 10" \
-  --select "name, qty * price AS revenue, coalesce(notes, '') AS notes"
+brew install chicagobuss/zpq/zpq
 ```
 
-## Statistics: trust is opt-in
-
-Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate — but
-real-world writers ship inaccurate ones (we have a `parquet-mr 1.8.2` file in the test corpus whose recorded `min` is
-`2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently wrong answer**.
-
-ZPQ's default is **correctness**: `min / max / sum` are computed by decoding the data, so the answer is right regardless
-of what the file claims. Two things are still always fast and always safe, because they can't produce a wrong value:
-
-- **`count(*)`** is answered from the row group's `num_rows` (structural, not a statistic).
-- **Row-group pruning** uses stats only to *skip* groups that provably can't match a filter — it never invents a value,
-  so a bad stat can at worst cost a little extra decoding, never a wrong result.
-
-If you know your writer's statistics are trustworthy, opt into the stats fast-path — `min / max / sum` answered from
-metadata in microseconds, without touching a data page:
+**A static binary** from the [latest release](https://github.com/chicagobuss/zpq/releases/latest). Each archive holds
+`bin/`, `share/` and `MANIFEST.json` with no top folder, so give it one:
 
 ```bash
-zpq query data.parquet --aggregate "min(price), max(price)" --trust-stats
+curl -sSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-x86_64-linux-musl.tar.gz \
+  | (mkdir zpq && tar xz -C zpq)
+export PATH="$PWD/zpq/bin:$PATH"
 ```
 
-`--trust-stats` is a scalpel: it trades correctness-on-bad-files for speed, and it's your call per query. `--scan-all`
-is the opposite extreme — no statistics at all, so row-group pruning is off too and every filter is evaluated on decoded
-values (`count(*)` still comes from the row counts).
+| Platform | Archive |
+|---|---|
+| Linux x86_64 (needs AVX2) | `zpq-x86_64-linux-musl.tar.gz` |
+| Linux x86_64, older CPUs without AVX2 | `zpq-x86_64-linux-musl-compat.tar.gz` |
+| Linux arm64 | `zpq-aarch64-linux-musl.tar.gz` |
+| macOS, Apple silicon | `zpq-aarch64-macos.tar.gz` |
+| macOS, Intel | `zpq-x86_64-macos.tar.gz` |
 
-For supported flat OPTIONAL primitive columns that contain no nulls, `--fast-levels` can skip materializing definition
-levels. The check reads the encoded level stream rather than trusting writer statistics, and falls back to the normal
-decoder unless one RLE run proves that the entire page is present. It is off by default while the path is new.
-
-## Test coverage
-
-CI ([`.github/workflows/verify.yml`](.github/workflows/verify.yml)) runs unit tests, Lambda integration tests, CLI
-cross-implementation smoke, and the `apache/parquet-testing` conformance corpus on every code change. The smoke path
-validates ZPQ-written Parquet with pyarrow; the workflow also identity-checks the Lambda deploy artifact to catch the
-"packaged the wrong binary" class of bug.
-
-## Build
-
-Requires **Zig 0.17.0** (release, not master) — pinned in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
-the pinned toolchain to `~/.zvm/0.17.0` and warms the build. The first build fetches prebuilt BoringSSL artifacts from
-R2 and checks them against the sha256 digests in `vendor/boring_tls/prebuilt.sha256`; `just fetch-deps` stores them in
-`vendor/boring_tls/prebuilt/` for offline builds. No source builds. No system OpenSSL.
+**Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.5.0_amd64.deb`, `zpq_0.5.0_arm64.deb`,
+`zpq-0.5.0-1.x86_64.rpm` and `zpq-0.5.0-1.aarch64.rpm`.
 
 ```bash
-just build           # ReleaseFast — both binaries
-just test            # unit tests (fixture-dependent ones report as
-                     # skipped unless the parquet-testing corpus is present)
+sudo apt install ./zpq_0.5.0_amd64.deb      # or: sudo dnf install ./zpq-0.5.0-1.x86_64.rpm
+```
+
+The default Linux x86_64 build needs AVX2; on older CPUs use the `-compat` build.
+
+**Build it yourself.** All you need is Zig 0.17.0: Zig's bundled clang builds the C codecs, and the first build
+fetches checksum-pinned BoringSSL prebuilts. Cross-compiling is one flag.
+
+```bash
+git clone https://github.com/chicagobuss/zpq && cd zpq
+zig build cli -Doptimize=ReleaseFast                                  # zig-out/bin/zpq
+zig build cli -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl      # a static arm64 Linux binary, from anywhere
+```
+
+## First commands
+
+These run on ClickBench's public
+[`hits_0.parquet`](https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet) (122 MB, one
+million rows of web analytics). The output shown is the real output; more examples, each with its output, are on the
+site's [Examples](https://zpq.chicagobuss.dev/examples.html) page.
+
+<!-- examples:begin -->
+Look inside a file without reading its data pages:
+
+```console
+$ zpq inspect hits_0.parquet | head -12
+hits_0.parquet: Parquet v1, 1000000 rows, 122446530 bytes, 2 row groups
+  created_by: parquet-cpp version 1.5.1-SNAPSHOT; sorting_columns: unsupported
+  row group 0: 450560 rows, 188923477 uncompressed bytes
+    WatchID INT64 SNAPPY: 3883794/3883596 compressed/uncompressed bytes
+      min=4611687214012840539 (unknown) max=9223369186199968220 (unknown); nulls=0
+      index=absent/absent, Bloom=absent, dictionary fallback=present
+      hint: page pruning unavailable: column index absent
+      hint: compression saves no bytes: compressed >= uncompressed
+      hint: dictionary fallback: mixed data encodings in encoding_stats
+    JavaEnable INT32 SNAPPY: 20529/24207 compressed/uncompressed bytes
+      min=0 (unknown) max=1 (unknown); nulls=0
+      index=absent/absent, Bloom=absent, dictionary fallback=absent
+```
+
+Query it with SQL and pipe the rows to `jq`:
+
+```console
+$ zpq query --query "SELECT SearchPhrase, count(*) AS c FROM 'hits_0.parquet' \
+  WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 3" | jq -c .
+{"SearchPhrase":"ведомосквы вместу","c":4943}
+{"SearchPhrase":"ведомосквы вы из","c":2471}
+{"SearchPhrase":"ведомосквиталия страции","c":2026}
+```
+
+Filter and aggregate with flags instead of SQL:
+
+```console
+$ zpq query hits_0.parquet --filter 'IsMobile = 1' \
+  --aggregate 'count(*) AS n, count(DISTINCT UserID) AS users, avg(ResolutionWidth) AS width'
+{"n":35239,"users":5146,"width":846.5504696501035}
+```
+
+Write Parquet with `-o`, then read it back as CSV:
+
+```console
+$ zpq query hits_0.parquet --filter "SearchPhrase <> ''" --select 'UserID, RegionID, SearchPhrase' -o phrases.parquet
+$ zpq query phrases.parquet --limit 3 --format csv
+UserID,RegionID,SearchPhrase
+-9214751021948998350,2,авомосква веб каменисный
+-9214751021948998350,2,авомосква веб каменисный
+-9213728704863893851,103,чагин выпуска на волна 2 сезон 24 резюме онлайн
+```
+
+Read straight from S3. A glob reads all 100 files; `count(*)` comes from their footers alone:
+
+```console
+$ S3_NO_SIGN_REQUEST=1 AWS_REGION=eu-central-1 zpq query \
+  's3://clickhouse-public-datasets/hits_compatible/athena_partitioned/hits_*.parquet' --aggregate 'count(*) AS n'
+{"n":99997497}
+```
+<!-- examples:end -->
+
+## Three ways in
+
+- **The `zpq` CLI**, shown above. `zpq --help` and `man zpq` list every option;
+  [docs/getting-started.md](docs/getting-started.md) walks through more, and
+  [docs/output-format.md](docs/output-format.md) is the output contract.
+- **`zpq-lambda`**, a static AWS Lambda bootstrap for `provided.al2023` that starts cold in tens of milliseconds and
+  reads and writes S3 natively, with no AWS SDK. `tools/serverless/fanout.py` fans one query out across many workers
+  by row group ([docs/lambda-and-s3.md](docs/lambda-and-s3.md)).
+- **libzpq**, a C library ([docs/libzpq.md](docs/libzpq.md)), with a Python binding, `python/zpq.py`, that needs no
+  compiled extension. SQL through libzpq is experimental.
+
+## What zpq isn't
+
+zpq works on one table at a time: there are no joins and no dataframe API yet. Use DuckDB for those, and let zpq do
+the Parquet part: filter and project with zpq, write Parquet or NDJSON, and read that into DuckDB.
+
+## How fast
+
+On 464 benchmark queries (ClickBench, PDS-H and 390 synthetic aggregation cases), run cold with a fresh process for
+every query, zpq is the fastest of zpq, DuckDB 2.0 and Polars 2.0 on 438 of them, and never more than 1.5× behind. Its
+geometric mean is 0.56× the faster rival's time cold, and 0.48× hot. Every query, the method, and the few places zpq is
+still behind are on the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
+
+## Limits
+
+- `--max-memory` is a working budget, not a hard cap: a high-cardinality GROUP BY or `count(DISTINCT)` can go past it
+  by up to about 2× near the limit. The answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq
+  under a cgroup `memory.max` or `ulimit -v`.
+- No joins and no window functions; some other SQL is refused with exit 2 and a message.
+- JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
+- SQL through libzpq is experimental, and Windows is not built.
+
+The full list is under "Known limits" in [CHANGELOG.md](CHANGELOG.md).
+
+## Learn more
+
+- [How it works](https://zpq.chicagobuss.dev/how.html): every optimization, Parquet itself, testing, the write path,
+  Lambda fan-out, the JVM and NaN.
+- [Examples](https://zpq.chicagobuss.dev/examples.html): a guide with real output for each command.
+- [CHANGELOG.md](CHANGELOG.md): everything new in 0.5.0, and what to do when upgrading from 0.4.x.
+
+## Reference
+
+- [What zpq can do](docs/capabilities.md): reading, filtering, computing, aggregating, writing, ordering, local reads
+  and S3 streaming.
+- [CLI output contract](docs/cli-output-contract.md) and the full [output format](docs/output-format.md).
+- [Statistics: trust is opt-in](docs/statistics-trust.md).
+- [Bloom filters and dictionaries](docs/bloom-filters-and-dictionaries.md).
+- [zpq on AWS Lambda, and reading S3](docs/lambda-and-s3.md), with the
+  [Lambda request format](docs/lambda_requests.md).
+- [libzpq](docs/libzpq.md), and [using zpq as a Zig module](docs/zig-module.md).
+- [Profiling a query](docs/profiling-quickstart.md).
+- [Source layout](docs/source-layout.md).
+
+## Build and contribute
+
+```bash
+just build             # ReleaseFast: the CLI and the Lambda bootstrap
+just check             # the commit gate: fixtures, unit tests, every case against DuckDB
+just full              # the full gate (tools/check/README.md)
 just test-integration  # Lambda integration tests
-just lambda-build    # static musl Lambda zips (ReleaseFast), both archs
-just lambda-deploy zpq-filter-s3 x86_64   # push to AWS
 ```
 
-`zpq --version` reports the release the binary was built from.
-
-The CLI is `zig-out/bin/zpq`; the Lambda bootstrap is `zig-out/bin/zpq-lambda`. Tagged releases ship the CLI for Linux
-and macOS, each x86_64 and arm64, as `zpq-<linux|macos>-<x86_64|arm64>.tar.gz` (plus a `.sha256`) on the GitHub Release
-and at `https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/releases/latest/<asset>` (or `releases/v<version>/`).
-
-## Use as a library
-
-The engine is consumable as a Zig module — the same sans-IO core the binaries use, minus the SQL frontend and its C
-parser (libzstd is still built from C, and BoringSSL is linked from the pinned prebuilts):
-
-```zig
-// build.zig.zon
-.zpq = .{ .url = "...", .hash = "..." },
-
-// build.zig
-const zpq = b.dependency("zpq", .{ .target = target, .optimize = optimize })
-    .module("zpq");
-exe.root_module.addImport("zpq", zpq);
-```
-
-`@import("zpq")` exposes `core.*` (schema, thrift, scan, filter, expr, writer) and `io.*` (S3, SigV4, TLS, epoll loop).
-
-## Profiling
-
-Frame pointers are on by default (cost measured in the noise), which means flamegraphs are a one-liner.
-
-```bash
-just flamegraph query data/benchmark_100mb.parquet \
-  --aggregate 'sum(int64_sorted) AS s, count(*) AS n'
-# wrote prof/flame-<ts>.svg
-```
-
-Sub-100 ms runs are too short to sample meaningfully — wrap in a 50× shell loop or use a multi-file glob to get hundreds
-of samples. Open the SVG in a browser to drill into hotspots.
-
-`just flamegraph-bpf <secs>` attaches via `profile-bpfcc` for long-running processes (eBPF-based, lower overhead, needs
-sudo).
-
-## Layout
-
-```
-src/
-  zpq.zig                Public surface — exports core.* + io.*
-  cli/main.zig           zpq binary entry (workstation)
-  lambda/main.zig        zpq-lambda binary entry (AWS Lambda bootstrap)
-  core/
-    schema.zig           Parquet thrift types
-    thrift.zig           In-tree thrift reader/writer
-    consumer.zig         Per-RG scan→consumer protocol (decode+filter+encode)
-    expr/                Typed expression AST + parser + evaluator
-    filter/              Filter AST, parser, prune, partition, eval
-    parquet/             Page/column readers, codecs, encodings
-    writer/              Encoder, fastpath, streaming sink writer
-  io/
-    s3.zig               SigV4 + HTTP/1.1, transport-agnostic
-    multipart_sink.zig   Streaming S3 multipart upload coordinator
-    epoll.zig            In-tree event loop (Lambda-mandatory backend)
-    tls.zig              BoringSSL via memory BIOs
-    http.zig             HTTP/1.1
-    pool.zig             Connection pool
-    coalescer.zig        Range coalescer for byte-range fetches
-    sigv4.zig            SigV4 signer
-
-probes/probe_lambda_caps/   Empirical Lambda capability prober
-benchmarks/                 Selectivity / cold-start / partition sweeps
-tools/serverless/aws.sh     Lambda lifecycle (build, deploy, invoke)
-docs/                       Demos, capability findings, measurements, validation notes
-vendor/boring_tls/          Vendored prebuilt-only BoringSSL bindings
-```
-
-## Lambda capability probe
-
-`probe_lambda_caps` enumerates what AWS Lambda actually allows (seccomp filter, kernel version, allowed setsockopt, CPU
-affinity at each memory tier, `/tmp` throughput). Re-run any time AWS announces a runtime change — seccomp is not API
-contract.
-
-```bash
-just probe-local         # JSON to stdout from your workstation
-just probe-lambda        # deploy + invoke in AWS, prints JSON
-```
-
-Findings driving the architecture are in [`docs/lambda_capabilities.md`](docs/lambda_capabilities.md).
+The check tiers are described in [tools/check/README.md](tools/check/README.md), test coverage in
+[docs/test-coverage.md](docs/test-coverage.md), and toolchain, release archives and packaging in
+[docs/building.md](docs/building.md). Contributors and coding agents start with [AGENTS.md](AGENTS.md).
 
 ## License
 

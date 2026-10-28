@@ -13,6 +13,8 @@ pub const Diag = struct {
     /// The lower-level error behind the one returned: why `input` could not be opened or read as Parquet.
     cause: ?anyerror = null,
     detail: Detail = .none,
+    /// Binding errors can share tags with failures caused by decoded data.
+    execution_started: bool = false,
 
     pub fn setColumn(diag: ?*Diag, name: []const u8) void {
         const d = diag orelse return;
@@ -47,6 +49,13 @@ pub const Text = struct {
         return self.buf[0..self.len];
     }
 
+    /// `s` after what is held, truncated at the buffer's end.
+    pub fn append(self: *Text, s: []const u8) void {
+        const n = @min(s.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..n], s[0..n]);
+        self.len += n;
+    }
+
     pub fn of(s: []const u8) Text {
         var t: Text = .{};
         t.set(s);
@@ -67,4 +76,65 @@ pub const Detail = union(enum) {
     like_non_string: struct { type_name: []const u8 },
     /// A filter compares the FLOAT16 column `Diag.column`.
     float16_filter,
+    /// A filter compares the string column `Diag.column` with something other than a literal.
+    non_literal_value,
+    /// An expression names `Diag.column`, a STRUCT, LIST or MAP, where a value is wanted. `example` is its first leaf's
+    /// path; `repeated` says it is a LIST or MAP, whose rows hold several values each.
+    nested_selected: struct { example: Text, repeated: bool },
+    /// A filter names `Diag.column` alone as a predicate, which only a BOOLEAN column is; `type_name` (static) is its
+    /// physical type.
+    bare_non_boolean: struct { type_name: []const u8 },
+    /// Where this thread last decoded when the query failed: input `input`, row group `row_group` (0 the first), leaf
+    /// `column`, page `page` (0 the first, a dictionary page counted) when known. Set on any failure past the first
+    /// decode, so a frontend reads it only for a decode error (`consumer.isDecodeError`); it leaves `Diag.column` and
+    /// `Diag.input` to the error they describe.
+    decode: struct {
+        input: []const u8,
+        row_group: usize,
+        column: Text,
+        page: ?u32,
+        encoding: ?@import("schema.zig").Encoding = null,
+    },
+    /// The S3 request behind the error failed: which one, at what point, and how.
+    s3_request: S3Failure,
+};
+
+/// A failed S3 request, as reported to the user: the operation, the phase it failed in, and the error or the status
+/// and S3 error code it was answered with.
+pub const S3Failure = struct {
+    op: Op,
+    phase: Phase,
+    /// The error, for the `connect` and `request` phases.
+    err: ?anyerror = null,
+    /// The HTTP status and S3 error code (`<Code>`), for the `response` phase.
+    status: u16 = 0,
+    code: Text = .{},
+    /// Connections tried; only a connect failure is tried again.
+    attempts: u8 = 1,
+
+    pub const Op = enum { CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload, PutObject };
+
+    pub const Phase = enum {
+        /// Resolving the host, connecting, or the TLS handshake: nothing was sent.
+        connect,
+        /// Sending the request or awaiting its answer: the server may have applied it.
+        request,
+        /// S3 answered with an error status.
+        response,
+    };
+
+    /// One line: `CreateMultipartUpload failed while connecting (3 attempts): ConnectTimeout`.
+    pub fn format(self: S3Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s} ", .{@tagName(self.op)});
+        switch (self.phase) {
+            .connect => try w.writeAll("failed while connecting"),
+            .request => try w.writeAll("failed after the request was sent"),
+            .response => {
+                const code = if (self.code.len > 0) self.code.get() else "(no S3 error code)";
+                try w.print("was answered {d} {s}", .{ self.status, code });
+            },
+        }
+        if (self.attempts > 1) try w.print(" ({d} attempts)", .{self.attempts});
+        if (self.err) |e| try w.print(": {s}", .{@errorName(e)});
+    }
 };

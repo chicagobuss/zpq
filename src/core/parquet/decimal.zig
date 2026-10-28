@@ -34,17 +34,39 @@ const hybrid_rle = @import("encoding/hybrid_rle.zig");
 pub const Error = error{
     UnsupportedDecimalEncoding,
     UnsupportedDecimalPhysicalType,
+    UnsupportedDecimalPrecision,
     DecimalByteWidthTooLarge,
     DictionaryMissing,
     ShortDecode,
     UnexpectedPage,
+    /// A second dictionary page in a chunk, or one after a data page: the format allows one, first (as
+    /// `column.Error.UnexpectedDictionaryPage`).
+    UnexpectedDictionaryPage,
     UnsupportedEncoding,
-} || page_mod.Error || std.mem.Allocator.Error;
+    /// A repetition or definition level past the schema's maximum (see `hybrid_rle.decodeLevels`).
+    LevelOutOfRange,
+} || int96.Error || page_mod.Error || std.mem.Allocator.Error;
+
+const int96 = @import("int96.zig");
 
 /// Maximum FLBA byte width we accept. 16 bytes = i128, which covers
 /// precision ≤ 38 (the parquet spec's max). Widths > 16 require i192+
 /// bignum handling; punt with a clear error.
 pub const MAX_FLBA_BYTE_WIDTH: usize = 16;
+
+/// Minimum byte width needed to store a decimal of precision `p` (1 <= p <= 38)
+/// as a big-endian two's complement integer in FIXED_LEN_BYTE_ARRAY.
+pub fn minBytesForPrecision(precision: i32) u8 {
+    std.debug.assert(precision >= 1 and precision <= 38);
+    const table = [38]u8{
+        1,  1,  2,  2,  3,  3,  4,  4,  4,
+        5,  5,  6,  6,  6,  7,  7,  8,  8,
+        9,  9,  9,  10, 10, 11, 11, 11, 12,
+        12, 13, 13, 13, 14, 14, 15, 15, 16,
+        16, 16,
+    };
+    return table[@intCast(precision - 1)];
+}
 
 /// What we learn from inspecting a column's SchemaElement when the
 /// column carries DECIMAL logical type.
@@ -68,6 +90,15 @@ pub const Kind = struct {
 /// Real production data still arrives in legacy form regularly, so we
 /// recognise both. When both are present we prefer the LogicalType
 /// payload (newer writers set both for compat; the LogicalType wins).
+/// `kindFromSchema`, and an INT96 timestamp as the exact integer of nanoseconds it reads as (`int96.int96ToNanos`):
+/// DECIMAL(38, 0), an i128 that no year wraps, printed, compared and aggregated as the DECIMAL lane does. For reading
+/// and typing values only; footer checks, statistics and writers keep INT96 apart (`kindFromSchema`).
+pub fn exactKind(elem: *const schema.SchemaElement) ?Kind {
+    if (kindFromSchema(elem)) |k| return k;
+    if (elem.type == .INT96) return .{ .scale = 0, .precision = 38, .physical = .INT96, .byte_width = 12 };
+    return null;
+}
+
 pub fn kindFromSchema(elem: *const schema.SchemaElement) ?Kind {
     const phys = elem.type orelse return null;
     // A width no decimal can have (precision 38 needs 16 bytes) is not decoded as one.
@@ -142,6 +173,32 @@ pub inline fn applyScaleInt(comptime T: type, raw: T, scale: i32) f64 {
     return applyScaleI128(@intCast(raw), scale);
 }
 
+/// 10^p for p in 0..38, exactly.
+pub fn pow10(p: i32) i128 {
+    std.debug.assert(p >= 0 and p <= 38);
+    return pow10_i128[@intCast(p)];
+}
+
+pub const pow10_i128: [39]i128 = blk: {
+    var t: [39]i128 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
+/// A DECIMAL min/max statistic's exact unscaled value; the same bytes and the same refusals as `statToF64`.
+pub fn statToI128(bytes: []const u8, kind: Kind) ?i128 {
+    if (kind.precision > 38) return null;
+    return switch (kind.physical) {
+        .INT32 => if (bytes.len < 4) null else std.mem.readInt(i32, bytes[0..4], .little),
+        .INT64 => if (bytes.len < 8) null else std.mem.readInt(i64, bytes[0..8], .little),
+        .FIXED_LEN_BYTE_ARRAY => if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH or
+            bytes.len < kind.byte_width) null else flbaToI128(bytes[0..kind.byte_width]),
+        .BYTE_ARRAY => if (bytes.len == 0 or bytes.len > MAX_FLBA_BYTE_WIDTH) null else flbaToI128(bytes),
+        else => null,
+    };
+}
+
 /// A DECIMAL min/max statistic as f64, or null when the bytes cannot be one of `kind`'s values. Statistics hold a
 /// bare value in the physical representation: INT32/INT64 little-endian, FLBA and BYTE_ARRAY big-endian two's
 /// complement (a BYTE_ARRAY bound has no length prefix, unlike a data-page value). Whether the bounds may be read at
@@ -178,7 +235,7 @@ pub fn statToF64(bytes: []const u8, kind: Kind) ?f64 {
 /// differs (the scalar loop did one f64 divide per value; this does 8
 /// per instruction on AVX). scale<=0 / out-of-table scales fall back to
 /// the scalar path.
-fn applyScaleSimd(comptime T: type, raw: []const T, scale: i32, out: []f64) void {
+pub fn applyScaleSimd(comptime T: type, raw: []const T, scale: i32, out: []f64) void {
     if (scale <= 0 or scale >= pow10_f64.len) {
         for (raw, 0..) |v, i| out[i] = applyScaleInt(T, v, scale);
         return;
@@ -260,14 +317,174 @@ pub fn decodeColumnAsF64WithOptions(
     };
 }
 
+/// A DECIMAL column as `decodeColumnAsF64WithOptions` decodes it, plus its exact unscaled integers in `unscaled`
+/// (see `filter_eval.ColumnT.unscaled`). The f64 view converts those same integers the same way, so it is bit for bit
+/// what the f64 decode gives and filters see no change. A nested column gets no exact view: nothing exact reads one.
+/// Consumer-selected exact physical view. Other consumers retain the established scaled/exact pair.
+pub fn decodeAggregateColumn(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+    options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
+) Error!filter_eval.Batch.Column {
+    if (options.decimal_exact_only and levels.max_rep == 0) switch (kind.physical) {
+        inline .INT32, .INT64 => |phys| {
+            const T = if (phys == .INT32) i32 else i64;
+            var reader = column_mod.ColumnChunkReader(T).initWithOptions(chunk, codec, levels, arena, options, scratch);
+            const raw = try readAll(T, &reader, num_leaves);
+            return @unionInit(filter_eval.Batch.Column, @typeName(T), .{
+                .values = raw.values,
+                .def_levels = raw.def_levels,
+                .max_def = @intCast(levels.max_def),
+                .has_nulls = raw.has_nulls,
+                .unscaled = @unionInit(filter_eval.Exact, @typeName(T), raw.values),
+            });
+        },
+        else => {},
+    };
+    return .{ .f64 = try decodeColumnExact(arena, chunk, codec, levels, num_leaves, kind, options, scratch) };
+}
+
+pub fn decodeColumnExact(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    kind: Kind,
+    decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
+) Error!filter_eval.ColumnT(f64) {
+    if (levels.max_rep > 0) {
+        return decodeColumnAsF64WithOptions(arena, chunk, codec, levels, num_leaves, kind, decode_options, scratch);
+    }
+    switch (kind.physical) {
+        inline .INT32, .INT64 => |phys| {
+            const T = if (phys == .INT32) i32 else i64;
+            const Reader = column_mod.ColumnChunkReader(T);
+            var reader = Reader.initWithOptions(chunk, codec, levels, arena, decode_options, scratch);
+            const raw = try readAll(T, &reader, num_leaves);
+            const values = try arena.alloc(f64, num_leaves);
+            applyScaleSimd(T, raw.values, kind.scale, values);
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = @intCast(levels.max_def),
+                .has_nulls = raw.has_nulls,
+                .unscaled = @unionInit(filter_eval.Exact, @typeName(T), raw.values),
+            };
+        },
+        .INT96 => {
+            // 64 bits where every value of the chunk fits, nearly always: the lane INT64 decimals take, which exact
+            // evaluation reads far faster than i128. A chunk holding an instant past 1677-2262 decodes again wider.
+            const limit = decode_options.page_bytes_limit;
+            if (int96.decodeColumnAsI64Nanos(arena, chunk, codec, levels, num_leaves, limit)) |narrow| {
+                const values = try arena.alloc(f64, narrow.values.len);
+                applyScaleSimd(i64, narrow.values, 0, values);
+                return .{
+                    .values = values,
+                    .def_levels = narrow.def_levels,
+                    .max_def = narrow.max_def,
+                    .has_nulls = narrow.has_nulls,
+                    .unscaled = .{ .i64 = narrow.values },
+                };
+            } else |err| if (err != error.Int96OutOfRange) return err;
+            const raw = try int96.decodeColumnAsI128Nanos(arena, chunk, codec, levels, num_leaves, limit);
+            const values = try arena.alloc(f64, raw.values.len);
+            for (raw.values, values) |v, *o| o.* = @floatFromInt(v);
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = raw.max_def,
+                .has_nulls = raw.has_nulls,
+                .unscaled = .{ .i128 = raw.values },
+            };
+        },
+        .FIXED_LEN_BYTE_ARRAY => {
+            const limit = decode_options.page_bytes_limit;
+            const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind, limit);
+            const values = try arena.alloc(f64, raw.values.len);
+            for (raw.values, values) |v, *o| o.* = applyScaleI128(v, kind.scale);
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = raw.max_def,
+                .has_nulls = raw.has_nulls,
+                .unscaled = .{ .i128 = raw.values },
+            };
+        },
+        .BYTE_ARRAY => {
+            var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+                chunk,
+                codec,
+                levels,
+                arena,
+                decode_options,
+                scratch,
+            );
+            const raw = try readAll([]const u8, &reader, num_leaves);
+            const max_def: u32 = @intCast(levels.max_def);
+            const values = try arena.alloc(f64, num_leaves);
+            const unscaled = try arena.alloc(i128, num_leaves);
+            for (raw.values, values, unscaled, 0..) |b, *v, *u, i| {
+                const present = if (raw.def_levels) |dl| dl[i] >= max_def else true;
+                if (!present) {
+                    v.* = 0.0;
+                    u.* = 0;
+                    continue;
+                }
+                if (b.len > MAX_FLBA_BYTE_WIDTH) return error.DecimalByteWidthTooLarge;
+                u.* = flbaToI128(b);
+                v.* = applyScaleI128(u.*, kind.scale);
+            }
+            return .{
+                .values = values,
+                .def_levels = raw.def_levels,
+                .max_def = max_def,
+                .has_nulls = raw.has_nulls,
+                .unscaled = .{ .i128 = unscaled },
+            };
+        },
+        else => return error.UnsupportedDecimalPhysicalType,
+    }
+}
+
+/// `col`, a DECIMAL column's unscaled integers as `decodeColumnAsI128` decodes an INT32/INT64-backed chunk, as the
+/// f64 column `decodeColumnAsF64` decodes from that chunk: the same conversion per value (an exact integer rounded
+/// to f64, then divided by 10^scale), so the same bits, without decoding the chunk a second time.
+pub fn scaledF64FromI128(
+    arena: std.mem.Allocator,
+    col: filter_eval.ColumnT(i128),
+    scale: i32,
+) Error!filter_eval.ColumnT(f64) {
+    // The values came from i32/i64, so they convert through i64: an i128 conversion is a library call per value.
+    const values = try arena.alloc(f64, col.values.len);
+    var i: usize = 0;
+    if (scale > 0 and scale < pow10_f64.len) {
+        const LANES = 8;
+        const divisor: @Vector(LANES, f64) = @splat(pow10_f64[@intCast(scale)]);
+        while (i + LANES <= values.len) : (i += LANES) {
+            var iv: @Vector(LANES, i64) = undefined;
+            inline for (0..LANES) |l| iv[l] = @intCast(col.values[i + l]);
+            const fv: @Vector(LANES, f64) = @floatFromInt(iv);
+            values[i..][0..LANES].* = fv / divisor;
+        }
+    }
+    for (i..values.len) |j| values[j] = applyScaleInt(i64, @intCast(col.values[j]), scale);
+    return .{ .values = values, .def_levels = col.def_levels, .max_def = col.max_def, .has_nulls = col.has_nulls };
+}
+
 const column_mod = @import("column.zig");
 
 /// Decode a DECIMAL column to its **unscaled integers** widened to i128
 /// (no scale applied) — the lossless representation the re-encode path
 /// carries so a filtered/projected decimal survives as DECIMAL, not
 /// DOUBLE. Mirror of `decodeColumnAsF64` minus the scale-apply. Wired
-/// for INT32/INT64 (D1) and FIXED_LEN_BYTE_ARRAY (D2); BYTE_ARRAY-backed
-/// decimals (rare) still route through the f64→DOUBLE path.
+/// for INT32/INT64 (D1), FIXED_LEN_BYTE_ARRAY (D2), and BYTE_ARRAY (C1).
 pub fn decodeColumnAsI128(
     arena: std.mem.Allocator,
     chunk: []const u8,
@@ -288,10 +505,28 @@ pub fn decodeColumnAsI128WithOptions(
     kind: Kind,
     decode_options: column_mod.DecodeOptions,
 ) Error!filter_eval.ColumnT(i128) {
+    if (kind.precision > 38) return error.UnsupportedDecimalPrecision;
     return switch (kind.physical) {
         .INT32 => try decodeIntBackedI128(i32, arena, chunk, codec, levels, num_leaves, decode_options),
         .INT64 => try decodeIntBackedI128(i64, arena, chunk, codec, levels, num_leaves, decode_options),
-        .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind),
+        .FIXED_LEN_BYTE_ARRAY => try decodeFlbaBackedI128(
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            kind,
+            decode_options.page_bytes_limit,
+        ),
+        .BYTE_ARRAY => try decodeByteArrayBackedI128(arena, chunk, codec, levels, num_leaves, decode_options, null),
+        .INT96 => try int96.decodeColumnAsI128Nanos(
+            arena,
+            chunk,
+            codec,
+            levels,
+            num_leaves,
+            decode_options.page_bytes_limit,
+        ),
         else => error.UnsupportedDecimalPhysicalType,
     };
 }
@@ -422,6 +657,44 @@ fn decodeByteArrayBacked(
     };
 }
 
+fn decodeByteArrayBackedI128(
+    arena: std.mem.Allocator,
+    chunk: []const u8,
+    codec: schema.CompressionCodec,
+    levels: schema.Levels,
+    num_leaves: usize,
+    decode_options: column_mod.DecodeOptions,
+    scratch: ?*column_mod.DecodeScratch,
+) Error!filter_eval.ColumnT(i128) {
+    if (levels.max_rep > 0) return error.ShortDecode;
+    var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(
+        chunk,
+        codec,
+        levels,
+        arena,
+        decode_options,
+        scratch,
+    );
+    const raw = try readAll([]const u8, &reader, num_leaves);
+    const max_def: u32 = @intCast(levels.max_def);
+    const values = try arena.alloc(i128, num_leaves);
+    for (raw.values, values, 0..) |b, *v, i| {
+        const present = if (raw.def_levels) |dl| dl[i] >= max_def else true;
+        if (!present) {
+            v.* = 0;
+            continue;
+        }
+        if (b.len > MAX_FLBA_BYTE_WIDTH) return error.DecimalByteWidthTooLarge;
+        v.* = flbaToI128(b);
+    }
+    return .{
+        .values = values,
+        .def_levels = raw.def_levels,
+        .max_def = max_def,
+        .has_nulls = raw.has_nulls,
+    };
+}
+
 // ----- FIXED_LEN_BYTE_ARRAY-backed -----
 //
 // FLBA isn't wired through ColumnChunkReader (the generic-on-T
@@ -439,6 +712,7 @@ fn decodeFlbaBackedI128(
     levels: schema.Levels,
     num_leaves: usize,
     kind: Kind,
+    byte_limit: usize,
 ) Error!filter_eval.ColumnT(i128) {
     if (kind.byte_width == 0 or kind.byte_width > MAX_FLBA_BYTE_WIDTH) {
         return error.DecimalByteWidthTooLarge;
@@ -457,13 +731,17 @@ fn decodeFlbaBackedI128(
     var dict_i128: ?[]const i128 = null;
 
     var pr = page_mod.PageReader.init(chunk, codec, arena);
+    pr.byte_limit = byte_limit;
     var written: usize = 0;
     var has_nulls = false;
+    var data_seen = false;
 
     while (try pr.next()) |pg| {
         switch (pg.header.type) {
             .DICTIONARY_PAGE => {
+                if (dict_i128 != null or data_seen) return error.UnexpectedDictionaryPage;
                 const dh = pg.header.dictionary_page_header orelse return error.UnexpectedPage;
+                if (dh.encoding != .PLAIN and dh.encoding != .PLAIN_DICTIONARY) return error.UnsupportedEncoding;
                 const dict_count: usize = @intCast(dh.num_values);
                 const expected_bytes = dict_count * bw;
                 if (pg.bytes.len < expected_bytes) return error.ShortDecode;
@@ -475,6 +753,7 @@ fn decodeFlbaBackedI128(
                 dict_i128 = dict;
             },
             .DATA_PAGE, .DATA_PAGE_V2 => {
+                data_seen = true;
                 try decodeFlbaDataPage(
                     pg,
                     bw,
@@ -514,7 +793,7 @@ fn decodeFlbaBacked(
     num_leaves: usize,
     kind: Kind,
 ) Error!filter_eval.ColumnT(f64) {
-    const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind);
+    const raw = try decodeFlbaBackedI128(arena, chunk, codec, levels, num_leaves, kind, std.math.maxInt(usize));
     const out = try arena.alloc(f64, raw.values.len);
     for (raw.values, 0..) |v, i| out[i] = applyScaleI128(v, kind.scale);
     return .{
@@ -543,6 +822,7 @@ fn decodeFlbaDataPage(
     var encoding: schema.Encoding = .PLAIN;
     if (pg.header.type == .DATA_PAGE) {
         const dph = pg.header.data_page_header orelse return error.UnexpectedPage;
+        try page_mod.checkV1LevelEncodings(dph, levels);
         page_num_values = @intCast(dph.num_values);
         encoding = dph.encoding;
     } else { // DATA_PAGE_V2
@@ -560,16 +840,16 @@ fn decodeFlbaDataPage(
         // V1: levels are RLE-prefixed at the start of the page bytes.
         if (levels.max_rep > 0) {
             if (values_bytes.len < 4) return error.UnexpectedEndOfChunk;
-            const rep_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-            if (4 + rep_len > values_bytes.len) return error.UnexpectedEndOfChunk;
+            const rep_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+            if (rep_len > values_bytes.len - 4) return error.UnexpectedEndOfChunk;
             const rep_bytes = values_bytes[4 .. 4 + rep_len];
             try decodeLevels(rep_bytes, @intCast(levels.max_rep), page_num_values, rep_levels_buf, written.*);
             values_bytes = values_bytes[4 + rep_len ..];
         }
         if (levels.max_def > 0) {
             if (values_bytes.len < 4) return error.UnexpectedEndOfChunk;
-            const def_len = std.mem.readInt(u32, values_bytes[0..4], .little);
-            if (4 + def_len > values_bytes.len) return error.UnexpectedEndOfChunk;
+            const def_len: usize = std.mem.readInt(u32, values_bytes[0..4], .little);
+            if (def_len > values_bytes.len - 4) return error.UnexpectedEndOfChunk;
             const def_bytes = values_bytes[4 .. 4 + def_len];
             try decodeLevels(def_bytes, @as(u32, @intCast(levels.max_def)), page_num_values, def_levels_buf, written.*);
             values_bytes = values_bytes[4 + def_len ..];
@@ -716,7 +996,7 @@ fn decodeFlbaDataPage(
                 }
             }
         },
-        else => return error.UnsupportedDecimalEncoding,
+        else => return error.UnsupportedEncoding,
     }
 
     written.* += page_num_values;
@@ -729,16 +1009,11 @@ fn decodeLevels(
     out_buf: ?[]u32,
     start: usize,
 ) Error!void {
-    const out = out_buf orelse return; // No buffer = caller doesn't care.
-    const bit_width = bitWidthFor(max);
-    var dec = hybrid_rle.HybridRleDecoder.init(encoded, bit_width);
-    const got = dec.decode(out[start .. start + expected]) catch return error.ShortDecode;
-    if (got != expected) return error.ShortDecode;
-}
-
-fn bitWidthFor(max: u32) u8 {
-    if (max == 0) return 0;
-    return @intCast(32 - @clz(max));
+    const out = out_buf orelse return;
+    hybrid_rle.decodeLevels(encoded, max, out[start .. start + expected]) catch |err| return switch (err) {
+        error.CorruptLevels, error.LevelCountMismatch => error.ShortDecode,
+        error.LevelOutOfRange => error.LevelOutOfRange,
+    };
 }
 
 // ============================================================
@@ -1087,9 +1362,140 @@ test "decodeColumnAsI128 returns exact unscaled integers (int64 fixture)" {
     }
 }
 
+test "decodeColumnAsI128 returns exact unscaled integers (byte_array fixture)" {
+    const fixture_path = "data/parquet-testing/data/byte_array_decimal.parquet";
+    const file_bytes = readFileSlice(fixture_path, testing.allocator) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("skipping: {s} not present\n", .{fixture_path});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    defer testing.allocator.free(file_bytes);
+
+    var meta = try metadata.open(testing.allocator, file_bytes);
+    defer meta.deinit(testing.allocator);
+
+    const col = meta.row_groups.items[0].columns.items[0].meta_data.?;
+    const path: [1][]const u8 = .{"value"};
+    const elem = meta.getColumnSchema(&path) orelse return error.SchemaLookupFailed;
+    const kind = kindFromSchema(&elem) orelse return error.NotRecognisedAsDecimal;
+
+    const chunk_start: usize = if (col.dictionary_page_offset) |dp| @intCast(dp) else @intCast(col.data_page_offset);
+    const chunk = file_bytes[chunk_start .. chunk_start + @as(usize, @intCast(col.total_compressed_size))];
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const levels = meta.getColumnLevels(&path);
+    const column = try decodeColumnAsI128(arena.allocator(), chunk, col.codec, levels, @intCast(col.num_values), kind);
+
+    try testing.expectEqual(@as(usize, 24), column.values.len);
+    for (column.values, 0..) |v, i| {
+        try testing.expectEqual(@as(i128, @intCast((i + 1) * 100)), v);
+    }
+}
+
+test "decodeColumnAsI128 rejects precision > 38" {
+    const kind: Kind = .{
+        .scale = 2,
+        .precision = 39,
+        .physical = .BYTE_ARRAY,
+        .byte_width = 0,
+    };
+    const dummy_chunk = [_]u8{0};
+    const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    try testing.expectError(
+        error.UnsupportedDecimalPrecision,
+        decodeColumnAsI128(testing.allocator, &dummy_chunk, .UNCOMPRESSED, levels, 0, kind),
+    );
+}
+
+test "minBytesForPrecision covers boundaries" {
+    try testing.expectEqual(@as(u8, 1), minBytesForPrecision(1));
+    try testing.expectEqual(@as(u8, 1), minBytesForPrecision(2));
+    try testing.expectEqual(@as(u8, 2), minBytesForPrecision(3));
+    try testing.expectEqual(@as(u8, 2), minBytesForPrecision(4));
+    try testing.expectEqual(@as(u8, 4), minBytesForPrecision(9));
+    try testing.expectEqual(@as(u8, 5), minBytesForPrecision(10));
+    try testing.expectEqual(@as(u8, 8), minBytesForPrecision(18));
+    try testing.expectEqual(@as(u8, 9), minBytesForPrecision(19));
+    try testing.expectEqual(@as(u8, 16), minBytesForPrecision(38));
+}
+
 test "applyScaleI128: out-of-table scale uses the pow fallback without trapping" {
     // pow10_f64 covers scale 0..38; scale >= len hits the std.math.pow path.
     // (Out of spec — precision/scale <= 38 — but must not index out of bounds.)
     const v = applyScaleI128(12345, 40);
     try testing.expect(v > 0 and v < 1e-30);
+}
+
+test "scaledF64FromI128 matches decodeColumnAsF64 bit for bit" {
+    var prng = std.Random.DefaultPrng.init(0xdec);
+    const r = prng.random();
+    inline for (.{ i32, i64 }) |T| {
+        for ([_]i32{ 0, 2, 7, 15 }) |scale| {
+            var raw: [1000]T = undefined;
+            for (&raw) |*v| v.* = r.int(T);
+            var want: [1000]f64 = undefined;
+            applyScaleSimd(T, &raw, scale, &want);
+            var wide: [1000]i128 = undefined;
+            for (raw, &wide) |v, *w| w.* = v;
+            const got = try scaledF64FromI128(testing.allocator, .{ .values = &wide }, scale);
+            defer testing.allocator.free(got.values);
+            for (want, got.values) |a, b| try testing.expectEqual(@as(u64, @bitCast(a)), @as(u64, @bitCast(b)));
+        }
+    }
+}
+
+/// A chunk of uncompressed pages: `true` a PLAIN dictionary page of `n` entries, `false` a V1 data page of `n`
+/// RLE_DICTIONARY indices; each with `body`.
+fn chunkForTest(arena: std.mem.Allocator, pages: []const struct { bool, i32, []const u8 }) ![]const u8 {
+    const thrift = @import("../thrift.zig");
+    var chunk: std.ArrayList(u8) = .empty;
+    for (pages) |pg| {
+        const dictionary, const n, const body = pg;
+        const header = schema.PageHeader{
+            .type = if (dictionary) .DICTIONARY_PAGE else .DATA_PAGE,
+            .uncompressed_page_size = @intCast(body.len),
+            .compressed_page_size = @intCast(body.len),
+            .crc = null,
+            .data_page_header = if (dictionary) null else .{
+                .num_values = n,
+                .encoding = .RLE_DICTIONARY,
+                .definition_level_encoding = .RLE,
+                .repetition_level_encoding = .RLE,
+            },
+            .dictionary_page_header = if (!dictionary)
+                null
+            else
+                .{ .num_values = n, .encoding = .PLAIN, .is_sorted = null },
+            .data_page_header_v2 = null,
+        };
+        var w = thrift.Writer.init(arena);
+        try header.write(&w);
+        try chunk.appendSlice(arena, w.bytes());
+        try chunk.appendSlice(arena, body);
+    }
+    return chunk.items;
+}
+
+test "a second FLBA DECIMAL dictionary page, after data or after the first, is a corrupt chunk" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dict: [8]u8 = @splat(0); // two 4-byte entries
+    const data = [_]u8{ 1, 2 << 1, 0 };
+    const levels: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
+    const kind: Kind = .{ .scale = 2, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 4 };
+    const dict_page = .{ true, 2, @as([]const u8, &dict) };
+    const data_page = .{ false, 2, @as([]const u8, &data) };
+    const back_to_back = try chunkForTest(a, &.{ dict_page, dict_page, data_page });
+    const twice = decodeColumnAsI128(a, back_to_back, .UNCOMPRESSED, levels, 2, kind);
+    try testing.expectError(error.UnexpectedDictionaryPage, twice);
+    const after_data = try chunkForTest(a, &.{ dict_page, data_page, dict_page, data_page });
+    const late = decodeColumnAsI128(a, after_data, .UNCOMPRESSED, levels, 4, kind);
+    try testing.expectError(error.UnexpectedDictionaryPage, late);
+    const good = try chunkForTest(a, &.{ .{ true, 2, &dict }, .{ false, 2, &data } });
+    _ = try decodeColumnAsI128(a, good, .UNCOMPRESSED, levels, 2, kind);
 }

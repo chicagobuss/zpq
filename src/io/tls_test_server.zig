@@ -107,6 +107,8 @@ pub const Behavior = union(enum) {
     hold,
     /// Answer the ClientHello with a fatal handshake_failure alert, before any certificate is sent.
     alert,
+    /// Read what the client sends and answer nothing, until the client closes: a handshake that never completes.
+    mute,
     /// Complete the handshake, read one HTTP request head, send `response`, then end the stream as `end` says.
     respond: struct { response: []const u8, end: End },
 
@@ -295,6 +297,11 @@ const State = struct {
     }
 
     fn serveOne(st: *State, fd: posix.fd_t) void {
+        if (st.behavior == .mute) {
+            var sink: [4096]u8 = undefined;
+            while (st.readable(fd)) if (posix.system.read(fd, &sink, sink.len) <= 0) return;
+            return;
+        }
         if (st.behavior == .alert) {
             var hello: [4096]u8 = undefined;
             if (!st.readable(fd)) return;
@@ -319,7 +326,7 @@ const State = struct {
         defer c.ERR_clear_error();
         var buf: [4096]u8 = undefined;
         switch (st.behavior) {
-            .alert => unreachable,
+            .alert, .mute => unreachable,
             // Hold the connection until the client closes it.
             .hold => while (c.SSL_pending(ssl) > 0 or st.readable(fd)) {
                 if (c.SSL_read(ssl, &buf, buf.len) <= 0) break;

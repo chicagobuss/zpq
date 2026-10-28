@@ -2,8 +2,8 @@ name: Release
 
 # Tag-driven release. Builds the CLI for 4 platforms, packages each as
 # a tar.gz with sha256, uploads to R2 (public, CDN-fronted) and
-# attaches to a GitHub Release. No CI handoff, no artifact reuse —
-# releases are rare and a clean rebuild is worth the simplicity.
+# attaches to a GitHub Release. Native smoke jobs run the build job's
+# artifacts before publication.
 #
 # Lambda binaries are NOT shipped here. They're author-deployed via
 # `just lambda-deploy`; `tools/serverless/aws.sh build` is what
@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g., v0.4.1)"
+        description: "Tag to release (e.g., v0.4.0)"
         required: true
         type: string
 
@@ -27,9 +27,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-linux
+          - target: x86_64-linux-musl
             artifact: zpq-linux-x86_64
-          - target: aarch64-linux
+          - target: aarch64-linux-musl
             artifact: zpq-linux-arm64
           - target: x86_64-macos
             artifact: zpq-macos-x86_64
@@ -47,28 +47,142 @@ jobs:
             | tar -xz -C $HOME/zig-bin
           echo "$HOME/zig-bin" >> $GITHUB_PATH
 
+      # .deb and .rpm come from the Linux tarballs' own bytes (tools/package_release.py --packages).
+      - name: Install nfpm (pinned)
+        if: endsWith(matrix.target, '-linux-musl')
+        run: |
+          mkdir -p $HOME/nfpm-bin
+          curl -fsSLo nfpm.tar.gz https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_x86_64.tar.gz
+          echo "6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750  nfpm.tar.gz" | sha256sum -c -
+          tar -xzf nfpm.tar.gz -C $HOME/nfpm-bin nfpm
+          echo "$HOME/nfpm-bin" >> $GITHUB_PATH
+
       # The build downloads the target's pinned BoringSSL prebuilts and
       # checks them against vendor/boring_tls/prebuilt.sha256.
-      - name: Build CLI
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast cli --summary all
+      # The tag must name build.zig.zon's version; a suffix (v0.5.0-rc2) is built into --version and release.json.
+      - name: Build and package CLI with revision and TLS provenance
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          PACKAGES: ${{ endsWith(matrix.target, '-linux-musl') && '--packages' || '' }}
+        run: python3 tools/package_release.py --targets ${{ matrix.target }} --out dist --tag "$TAG" $PACKAGES
 
-      - name: Package
+      # x86_64 Linux ships two archives: x86-64-v3 (the default, checked at startup) and -compat (baseline CPU).
+      - name: Run the compat archive's binary
+        if: matrix.target == 'x86_64-linux-musl'
         run: |
-          mkdir -p dist
-          cp zig-out/bin/zpq dist/
-          cd dist
-          tar -czvf ${{ matrix.artifact }}.tar.gz zpq
-          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          mkdir -p compat && tar -xzf dist/*-x86_64-linux-musl-compat.tar.gz -C compat
+          compat/bin/zpq --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/*.deb*
+            dist/*.rpm*
+            dist/release.json
+
+      - name: Prepare shipped native smoke bundle
+        if: matrix.target != 'x86_64-macos'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          dest=dist/$TARGET
+          names=zpq
+          if [[ $TARGET == *-linux-musl ]]; then
+            zig build lambda -j8 -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dtarget=$TARGET \
+              -Drevision=$(git rev-parse HEAD) --prefix $dest
+            zig build integration-bin -j8 -Doptimize=ReleaseFast -Dcpu=baseline -Dstrip=true -Dtarget=$TARGET \
+              -Dintegration-runtime=release/$TARGET/bin --prefix $dest
+            names="zpq zpq-lambda zpq-integration"
+          fi
+          (cd $dest/bin && sha256sum $names > SHA256SUMS)
+
+      - name: Upload native smoke bundle
+        if: matrix.target != 'x86_64-macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.target }}/bin/zpq
+            dist/${{ matrix.target }}/bin/zpq-lambda
+            dist/${{ matrix.target }}/bin/zpq-integration
+            dist/${{ matrix.target }}/bin/SHA256SUMS
+
+  # Execute the packaged CLI and the shipped bootstrap/harness on native runners.
+  smoke:
+    needs: build
+    name: Native release smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+          - runner: macos-14
+            target: aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download shipped smoke bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: release/${{ matrix.target }}/bin
+
+      - name: Verify and enable shipped binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "release/$TARGET/bin"
+          if command -v sha256sum >/dev/null; then
+            sha256sum -c SHA256SUMS
+          else
+            shasum -a 256 -c SHA256SUMS
+          fi
+          chmod +x zpq*
+
+      - name: Install Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Download x86_64 release archives for CPU startup smoke
+        if: matrix.target == 'x86_64-linux-musl'
+        uses: actions/download-artifact@v4
+        with:
+          name: zpq-linux-x86_64
+          path: cpu-release
+
+      - name: Check shipped x86_64 startup on CPUs without AVX2
+        if: matrix.target == 'x86_64-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          mkdir -p cpu-release/default cpu-release/compat
+          tar -xzf cpu-release/*-x86_64-linux-musl.tar.gz -C cpu-release/default
+          tar -xzf cpu-release/*-x86_64-linux-musl-compat.tar.gz -C cpu-release/compat
+          python3 tools/check/cpu_start.py --default cpu-release/default/bin/zpq --compat cpu-release/compat/bin/zpq
+
+      # The shipped CLI through the release cases, and on Linux the shipped Lambda through the fake runtime.
+      - name: Run the shipped release artifacts
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          zig build check-runner -Doptimize=ReleaseSafe -j8
+          zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq release/$TARGET/bin/zpq --no-cache
+          if [[ $TARGET == *-linux-musl ]]; then release/$TARGET/bin/zpq-integration; fi
 
   release:
     name: Create Release
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -83,12 +197,50 @@ jobs:
           path: artifacts
 
       - name: Stage release directory
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release/ \;
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.rpm" -o -name "*.sha256" \) \
+            -exec cp {} release/ \;
+          python3 - <<'PY_MERGE'
+          import json
+          from pathlib import Path
+          merged = None
+          for p in sorted(Path("artifacts").rglob("release.json")):
+              part = json.loads(p.read_text())
+              if merged is None:
+                  merged = {**part, "artifacts": {}}
+              for key in ("version", "revision", "zig", "tls_manifest_sha256"):
+                  assert merged[key] == part[key], (key, p)
+              merged["artifacts"].update(part["artifacts"])
+          assert merged is not None
+          Path("release/release.json").write_text(json.dumps(merged, indent=2) + "\n")
+          PY_MERGE
+          python3 tools/homebrew_formula.py release/release.json --out release/zpq.rb \
+            --base-url "https://github.com/chicagobuss/zpq/releases/download/${TAG}"
           ls -la release/
+          # The release body is the tag's CHANGELOG section, kept outside release/ so it isn't uploaded as an asset.
+          python3 - <<'PY_NOTES'
+          import os, re
+          version = os.environ["TAG"].removeprefix("v").split("-")[0]  # v0.5.0-rc3 uses the 0.5.0 section
+          text = open("CHANGELOG.md").read()
+          m = re.search(r"^## " + re.escape(version) + r"\b.*?\n(.*?)(?=^## )", text, re.S | re.M)
+          assert m, f"CHANGELOG.md has no section for {version}"
+          open("RELEASE_NOTES.md", "w").write(m.group(1).strip() + "\n")
+          PY_NOTES
 
-      - name: Upload to R2 (public)
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/*
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+
+      # R2 mirrors the GitHub Release; a failed upload (say, rotated credentials) must not block the release.
+      - name: Upload to R2 (public mirror)
+        continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -101,11 +253,3 @@ jobs:
             aws s3 cp "$file" "s3://zpq/releases/${TAG}/${name}" --endpoint-url "$R2_ENDPOINT"
             aws s3 cp "$file" "s3://zpq/releases/latest/${name}" --endpoint-url "$R2_ENDPOINT"
           done
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          files: release/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true

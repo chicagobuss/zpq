@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 /// Discover available system memory in bytes, returning:
 /// - 75% of AWS Lambda memory if running in a Lambda container.
-/// - 80% of MemAvailable (from /proc/meminfo) or freeram on Linux.
+/// - 80% of MemAvailable (from /proc/meminfo) or freeram on Linux, and no more than 75% of a cgroup v2 memory limit.
 /// - 50% of total physical memory (via sysctl) on macOS.
 /// - 512 MB fallback on other platforms or on failure.
 pub fn discoverAvailableMemory(env: ?std.process.Environ) usize {
@@ -174,10 +174,27 @@ fn getLambdaMemory(env: ?std.process.Environ) ?usize {
     const e = env orelse return null;
     if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {
         if (std.fmt.parseInt(usize, val_str, 10) catch null) |val| {
-            return val * 1024 * 1024 * 3 / 4; // 75% of memory tier
+            // 75% of the memory tier. A size no machine has is ignored, like one that does not parse.
+            const bytes = std.math.mul(usize, val, 1024 * 1024) catch return null;
+            return bytes / 4 * 3;
         }
     }
     return null;
+}
+
+test "a size of 2^64 bytes or more is invalid, not a conversion overflow" {
+    try std.testing.expectError(error.InvalidSize, parseSizeString("16777216TB"));
+    try std.testing.expectError(error.InvalidSize, parseSizeString("18446744073709551616"));
+    try std.testing.expectError(error.InvalidSize, parseSizeString("99999999999999999999999TB"));
+    try std.testing.expectEqual(@as(usize, 16777215) << 40, try parseSizeString("16777215TB"));
+    try std.testing.expectEqual(@as(usize, 3) << 29, try parseSizeString("1.5GB"));
+}
+
+test "a Lambda memory size no machine has is ignored, not an overflow" {
+    var big_env = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=17592186044416"};
+    try std.testing.expectEqual(@as(?usize, null), getLambdaMemory(.{ .block = .{ .slice = &big_env } }));
+    var ok_env = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=1024"};
+    try std.testing.expectEqual(@as(?usize, 768 << 20), getLambdaMemory(.{ .block = .{ .slice = &ok_env } }));
 }
 
 test "window capacity keeps byte budget authoritative over worker count" {
@@ -194,13 +211,41 @@ test "window capacity keeps byte budget authoritative over worker count" {
 }
 
 fn linuxDiscover() usize {
-    if (readLinuxMeminfo()) |mem| {
-        return mem * 8 / 10; // 80% of MemAvailable
+    const host: usize = if (readLinuxMeminfo()) |mem|
+        mem * 8 / 10 // 80% of MemAvailable
+    else if (queryLinuxSysinfo()) |mem|
+        mem * 8 / 10 // 80% of free ram
+    else
+        512 * 1024 * 1024;
+    // A container or `systemd-run -p MemoryMax=` caps the process below what the host has free: budget for the cap,
+    // with the same headroom a Lambda tier gets.
+    const cap = cgroupMemoryLimit() orelse return host;
+    return @min(host, cap * 3 / 4);
+}
+
+/// The tightest cgroup v2 `memory.max` over this process's cgroup and its ancestors, or null when none is set.
+fn cgroupMemoryLimit() ?usize {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [4096]u8 = undefined;
+    const self_cgroup = readSmallFile("/proc/self/cgroup", &buf) orelse return null;
+    var lines = std.mem.tokenizeScalar(u8, self_cgroup, '\n');
+    const rel = while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0::")) break line[3..];
+    } else return null;
+    var best: ?usize = null;
+    var dir = std.mem.trimEnd(u8, rel, "/");
+    while (true) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup{s}/memory.max", .{dir}, 0) catch break;
+        var file_buf: [64]u8 = undefined;
+        if (readSmallFile(path, &file_buf)) |text| {
+            const n = std.fmt.parseInt(usize, std.mem.trim(u8, text, " \n"), 10) catch null;
+            if (n) |v| best = @min(best orelse v, v);
+        }
+        if (dir.len == 0) break;
+        dir = dir[0 .. std.mem.lastIndexOfScalar(u8, dir, '/') orelse 0];
     }
-    if (queryLinuxSysinfo()) |mem| {
-        return mem * 8 / 10; // 80% of free ram
-    }
-    return 512 * 1024 * 1024;
+    return best;
 }
 
 fn readLinuxMeminfo() ?usize {
@@ -301,8 +346,9 @@ pub fn parseSizeString(s: []const u8) !usize {
     }
 
     const result = val_float * multiplier;
-    if (result < 0 or result > @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
-        return error.InvalidSize;
-    }
+    // maxInt(usize) rounds up to 2^bits as an f64, so the bound is exclusive at 2^bits: "16777216TB" (2^64) is past
+    // it, not equal to a representable maximum.
+    const limit = std.math.ldexp(@as(f64, 1), @bitSizeOf(usize));
+    if (!(result >= 0 and result < limit)) return error.InvalidSize;
     return @intFromFloat(result);
 }

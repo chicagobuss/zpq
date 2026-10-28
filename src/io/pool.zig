@@ -7,7 +7,7 @@
 //!   * a small LRU cache of idle TLS connections keyed by `(host, port)`.
 //!
 //! The shape matches `std.http.Client.ConnectionPool` for reuse, but keeps
-//! ZPQ's explicit backpressure. If a scan spawns 200 range tasks, only N
+//! zpq's explicit backpressure. If a scan spawns 200 range tasks, only N
 //! can hold sockets at once. If a warm Lambda reads one bucket and writes
 //! another, both hosts can keep idle connections instead of tearing the
 //! whole pool down.
@@ -46,6 +46,8 @@ pub const Criteria = struct {
     addrs: []const tls.Ipv4,
     port: u16,
     use_tls: bool = true,
+    /// Deadlines for a new connection; a reused one takes them on too (`tls.Connection.setTimeouts`).
+    timeouts: tls.Timeouts = .{},
 };
 
 pub fn Pool(comptime N: usize) type {
@@ -55,6 +57,29 @@ pub fn Pool(comptime N: usize) type {
         /// Permit count, readable from a `*Pool(N)` held as `anytype`. A ceiling for callers sizing worker loops —
         /// extra workers would only park in `acquire` — not a concurrency policy in itself.
         pub const capacity: usize = N;
+
+        /// Handshakes `preconnect` may have in flight. Past this the rest are left for the query.
+        const preconnect_threads_max: usize = 8;
+        /// One absolute deadline from the start of a preconnect batch. Every address attempt and the TLS
+        /// handshake, preferred context and fallback included, share it. Each stage waits `min(its cap, time left)`.
+        const preconnect_deadline_ms: u32 = 1000;
+
+        const PreSlot = struct {
+            pool: *Self,
+            io: Io,
+            host: []u8,
+            addrs: []tls.Ipv4,
+            port: u16,
+            use_tls: bool,
+            timeouts: tls.Timeouts,
+            /// Absolute millisecond deadline for this batch, taken when `preconnect` starts it.
+            deadline_ms: u64,
+
+            fn run(slot: *PreSlot) void {
+                defer _ = slot.pool.preconnect_done.fetchAdd(1, .monotonic);
+                slot.pool.finishPreconnect(slot);
+            }
+        };
 
         pub const Node = struct {
             conn: tls.Connection,
@@ -86,6 +111,8 @@ pub fn Pool(comptime N: usize) type {
             stale_retries: u64 = 0,
             /// Requests retried after a backoff (server errors, throttling, failures on fresh connections).
             backoff_retries: u64 = 0,
+            /// Of those, retries after a connection went silent past a deadline (`tls.Timeouts`).
+            timeout_retries: u64 = 0,
             /// Oldest idle connection `acquire` looked at, reused or evicted.
             max_idle_ns: u64 = 0,
             acquire_wait_ns: u64 = 0,
@@ -101,12 +128,23 @@ pub fn Pool(comptime N: usize) type {
         used: std.DoublyLinkedList = .{},
         free: std.DoublyLinkedList = .{},
         free_len: usize = 0,
-        free_size: usize = 32,
+        /// Idle connections kept: as many as may be in flight, so the next wave reuses them all.
+        free_size: usize = N,
         idle_timeout_ns: i64 = IDLE_TIMEOUT_NS,
         /// Index into `Criteria.addrs` the next new connection starts at; guarded by `mutex`.
         next_addr: usize = 0,
 
         stats: Stats = .{},
+
+        /// Handshakes started by `preconnect` and not yet joined. They are OS threads, not `Io` tasks, so a
+        /// one-CPU runtime still runs all of them at once. `deinit` joins them.
+        preconnect_threads: [preconnect_threads_max]std.Thread = undefined,
+        preconnect_join: usize = 0,
+        preconnect_slots: ?[]PreSlot = null,
+        /// Connections parked by those threads. A caller that returned from `preconnect` reads this later.
+        preconnect_parked: std.atomic.Value(u32) = .init(0),
+        /// Threads that have finished, parked or abandoned.
+        preconnect_done: std.atomic.Value(u32) = .init(0),
 
         /// Pointer-init only: `permits` holds a slice into
         /// `permits_buffer`, so copying this struct after init would
@@ -120,7 +158,7 @@ pub fn Pool(comptime N: usize) type {
                 .used = .{},
                 .free = .{},
                 .free_len = 0,
-                .free_size = 32,
+                .free_size = N,
                 .idle_timeout_ns = IDLE_TIMEOUT_NS,
                 .next_addr = 0,
                 .stats = .{},
@@ -130,6 +168,7 @@ pub fn Pool(comptime N: usize) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.joinPreconnect();
             var node = self.free.first;
             while (node) |n| {
                 const slot: *Node = @alignCast(@fieldParentPtr("pool_node", n));
@@ -202,6 +241,7 @@ pub fn Pool(comptime N: usize) type {
             while (expired.popFirst()) |n| self.destroyNode(@alignCast(@fieldParentPtr("pool_node", n)));
 
             if (reused) |slot| {
+                slot.conn.setTimeouts(criteria.timeouts);
                 return .{ .conn = &slot.conn, .node = slot, .permit = permit, .reused = true };
             }
 
@@ -211,7 +251,12 @@ pub fn Pool(comptime N: usize) type {
             const host_owned = try self.allocator.dupe(u8, criteria.host);
             errdefer self.allocator.free(host_owned);
 
-            const peer: tls.Peer = .{ .addrs = criteria.addrs, .first = first_addr, .port = criteria.port };
+            const peer: tls.Peer = .{
+                .addrs = criteria.addrs,
+                .first = first_addr,
+                .port = criteria.port,
+                .timeouts = criteria.timeouts,
+            };
             const conn = if (criteria.use_tls)
                 try tls.Connection.connect(self.allocator, peer, criteria.host)
             else
@@ -279,6 +324,10 @@ pub fn Pool(comptime N: usize) type {
             switch (failure) {
                 .stale => self.stats.stale_retries += 1,
                 .transient => self.stats.backoff_retries += 1,
+                .stalled => {
+                    self.stats.backoff_retries += 1;
+                    self.stats.timeout_retries += 1;
+                },
                 .fatal => {},
             }
         }
@@ -289,6 +338,115 @@ pub fn Pool(comptime N: usize) type {
 
         pub fn resetStats(self: *Self) void {
             self.stats = .{};
+        }
+
+        /// Start up to `n` handshakes and return. The handshakes are network waits, so they run on their own
+        /// threads, `min(n, N, 8)` of them, not on `Io`'s CPU-sized task pool. A finished one is parked for a
+        /// later `acquire`. The batch has one deadline, `preconnect_deadline_ms` from this call: a socket still
+        /// open then is abandoned and closed, whichever address or TLS context it is on.
+        /// `acquire` never waits for these threads: a socket that is not parked yet is not there, and the caller
+        /// opens its own. A thread that fails to spawn is skipped.
+        ///
+        /// Copies what it needs out of `criteria`. Joins a previous batch first.
+        pub fn preconnect(self: *Self, io: Io, criteria: Criteria, n: usize) void {
+            self.joinPreconnect();
+            const want = @min(n, @min(N, preconnect_threads_max));
+            if (want == 0) return;
+
+            self.preconnect_parked.store(0, .monotonic);
+            self.preconnect_done.store(0, .monotonic);
+            const deadline_ms = if (criteria.timeouts.clock_ms) |clk|
+                clk() + preconnect_deadline_ms
+            else
+                tls.deadlineFromNow(preconnect_deadline_ms);
+            const slots = self.allocator.alloc(PreSlot, want) catch return;
+            var started: usize = 0;
+            for (slots) |*slot| {
+                const host = self.allocator.dupe(u8, criteria.host) catch break;
+                const addrs = self.allocator.dupe(tls.Ipv4, criteria.addrs) catch {
+                    self.allocator.free(host);
+                    break;
+                };
+                slot.* = .{
+                    .pool = self,
+                    .io = io,
+                    .host = host,
+                    .addrs = addrs,
+                    .port = criteria.port,
+                    .use_tls = criteria.use_tls,
+                    .timeouts = criteria.timeouts,
+                    .deadline_ms = deadline_ms,
+                };
+                const thread = std.Thread.spawn(.{}, PreSlot.run, .{slot}) catch {
+                    self.allocator.free(host);
+                    self.allocator.free(addrs);
+                    break;
+                };
+                self.preconnect_threads[started] = thread;
+                started += 1;
+            }
+            self.preconnect_join = started;
+            self.preconnect_slots = slots;
+        }
+
+        /// Join the batch. Each thread stops at the deadline it was given, so this returns within that deadline
+        /// plus the time to close the socket and leave the thread.
+        fn joinPreconnect(self: *Self) void {
+            for (self.preconnect_threads[0..self.preconnect_join]) |thread| thread.join();
+            const slots = self.preconnect_slots orelse {
+                self.preconnect_join = 0;
+                return;
+            };
+            for (slots[0..self.preconnect_join]) |slot| {
+                self.allocator.free(slot.host);
+                self.allocator.free(slot.addrs);
+            }
+            self.allocator.free(slots);
+            self.preconnect_slots = null;
+            self.preconnect_join = 0;
+        }
+
+        fn finishPreconnect(self: *Self, slot: *PreSlot) void {
+            const peer: tls.Peer = .{
+                .addrs = slot.addrs,
+                .port = slot.port,
+                .timeouts = slot.timeouts,
+                .deadline_ms = slot.deadline_ms,
+            };
+            const conn = if (slot.use_tls)
+                tls.Connection.connect(self.allocator, peer, slot.host) catch return
+            else
+                tls.Connection.connectPlain(self.allocator, peer) catch return;
+            self.parkFresh(slot.io, slot.host, slot.port, slot.use_tls, conn);
+        }
+
+        /// Put a connection that is already open onto the idle list. No permit is held while it was opened.
+        fn parkFresh(self: *Self, io: Io, host: []const u8, port: u16, use_tls: bool, conn: tls.Connection) void {
+            const node = self.allocator.create(Node) catch {
+                var c = conn;
+                c.deinit();
+                return;
+            };
+            const host_owned = self.allocator.dupe(u8, host) catch {
+                self.allocator.destroy(node);
+                var c = conn;
+                c.deinit();
+                return;
+            };
+            node.* = .{
+                .conn = conn,
+                .host = host_owned,
+                .port = port,
+                .use_tls = use_tls,
+                .idle_since_ns = clock.bootNs(),
+                .pool_node = .{},
+            };
+            self.mutex.lockUncancelable(io);
+            self.free.append(&node.pool_node);
+            self.free_len += 1;
+            self.stats.opens += 1;
+            self.mutex.unlock(io);
+            _ = self.preconnect_parked.fetchAdd(1, .monotonic);
         }
 
         fn destroyNode(self: *Self, slot: *Node) void {
@@ -446,6 +604,212 @@ const TestListener = struct {
         return .{ .host = "127.0.0.1", .addrs = &.{.{ 127, 0, 0, 1 }}, .port = self.port, .use_tls = false };
     }
 };
+
+test "preconnect parks connections the next acquire reuses, and the idle timeout still drops them" {
+    const io = testing.io;
+    const listener = try TestListener.open();
+    defer listener.close();
+
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+
+    const addrs = [_]tls.Ipv4{.{ 127, 0, 0, 1 }};
+    const criteria: Criteria = .{
+        .host = "127.0.0.1",
+        .addrs = &addrs,
+        .port = listener.port,
+        .use_tls = false,
+        .timeouts = .{ .connect_ms = 500, .handshake_ms = 500 },
+    };
+
+    p.preconnect(io, criteria, 0);
+    try testing.expectEqual(@as(usize, 0), p.free_len);
+
+    p.preconnect(io, criteria, 4);
+    try waitPreconnect(&p, 4);
+    try testing.expectEqual(@as(u32, 4), p.preconnect_parked.load(.monotonic));
+    try testing.expectEqual(@as(usize, 4), p.free_len);
+    try testing.expectEqual(@as(u64, 4), p.snapshotStats().opens);
+
+    const again = try p.acquire(io, criteria, .{});
+    try testing.expect(again.reused);
+    p.release(io, again);
+
+    var node = p.free.first;
+    while (node) |n| {
+        const slot: *Pool(4).Node = @alignCast(@fieldParentPtr("pool_node", n));
+        slot.idle_since_ns -= p.idle_timeout_ns + std.time.ns_per_ms;
+        node = n.next;
+    }
+    const after_idle = try p.acquire(io, criteria, .{});
+    try testing.expect(!after_idle.reused);
+    p.release(io, after_idle);
+    try testing.expect(p.snapshotStats().idle_evictions >= 1);
+
+    // Nothing is listening: the failure is ignored and nothing is parked.
+    const dead = try TestListener.open();
+    const dead_port = dead.port;
+    dead.close();
+    var q: Pool(2) = undefined;
+    try q.init(testing.allocator);
+    defer q.deinit();
+    const refused: Criteria = .{
+        .host = "127.0.0.1",
+        .addrs = &addrs,
+        .port = dead_port,
+        .use_tls = false,
+        .timeouts = .{ .connect_ms = 200, .handshake_ms = 200 },
+    };
+    q.preconnect(io, refused, 2);
+    try waitPreconnect(&q, 2);
+    try testing.expectEqual(@as(u32, 0), q.preconnect_parked.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), q.free_len);
+}
+
+fn waitPreconnect(p: anytype, n: u32) !void {
+    const start = nowMonoNs();
+    while (p.preconnect_done.load(.monotonic) < n) {
+        if (nowMonoNs() - start > 30 * std.time.ns_per_s) return error.TestUnexpectedResult;
+        clock.sleepNs(std.time.ns_per_ms);
+    }
+}
+
+test "preconnect returns without waiting for a stalled handshake" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{
+        .async_limit = .limited(0),
+        .concurrent_limit = .limited(4),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stall = try TestListener.open();
+    var stop = std.atomic.Value(bool).init(false);
+    const held = try std.Thread.spawn(.{}, holdAccepted, .{ stall.fd, &stop });
+
+    const ready = try TestListener.open();
+    defer ready.close();
+
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    // Close the stalled peers before joining the handshake threads, or `deinit` waits out the deadline.
+    defer {
+        stop.store(true, .monotonic);
+        stall.close();
+        held.join();
+        p.deinit();
+    }
+
+    const addrs = [_]tls.Ipv4{.{ 127, 0, 0, 1 }};
+    const stalled: Criteria = .{
+        .host = "127.0.0.1",
+        .addrs = &addrs,
+        .port = stall.port,
+        .use_tls = true,
+        .timeouts = .{ .connect_ms = 5_000, .handshake_ms = 5_000 },
+    };
+
+    var t = nowMonoNs();
+    p.preconnect(io, stalled, 0);
+    const baseline = nowMonoNs() - t;
+    t = nowMonoNs();
+    p.preconnect(io, stalled, 4);
+    const started = nowMonoNs() - t;
+    // Returned without waiting out the 5 s handshake. The bound is a hang backstop, not a latency target.
+    try testing.expect(started < baseline + 2 * std.time.ns_per_s);
+
+    t = nowMonoNs();
+    const h = try p.acquire(io, ready.criteria(), .{});
+    const acquired = nowMonoNs() - t;
+    try testing.expect(acquired < 2 * std.time.ns_per_s);
+    try testing.expect(!h.reused);
+    p.release(io, h);
+}
+
+test "a preconnect across two addresses of a full listen queue stops without hanging" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const lfd_r = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try testing.expect(std.posix.errno(lfd_r) == .SUCCESS);
+    const lfd: std.posix.fd_t = @intCast(lfd_r);
+    defer _ = std.posix.system.close(lfd);
+    var addr: std.posix.sockaddr.in = .{ .port = 0, .addr = 0 };
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    try testing.expect(std.posix.errno(std.posix.system.bind(lfd, @ptrCast(&addr), len)) == .SUCCESS);
+    try testing.expect(std.posix.errno(std.posix.system.listen(lfd, 0)) == .SUCCESS);
+    try testing.expect(std.posix.errno(std.posix.system.getsockname(lfd, @ptrCast(&addr), &len)) == .SUCCESS);
+    const port = std.mem.bigToNative(u16, addr.port);
+    var fills: [8]?tls.Connection = @splat(null);
+    defer for (&fills) |*v| if (v.*) |*c| c.deinit();
+    var full = false;
+    var filler = tls.Peer.loopback(port);
+    filler.timeouts.connect_ms = 100;
+    for (&fills) |*v| {
+        v.* = tls.Connection.connectPlain(testing.allocator, filler) catch |err| {
+            try testing.expectEqual(error.ConnectTimeout, err);
+            full = true;
+            break;
+        };
+    }
+    try testing.expect(full);
+
+    var p: Pool(1) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    const addrs = [_]tls.Ipv4{ .{ 127, 0, 0, 1 }, .{ 127, 0, 0, 2 } };
+    tls.resetDeadlineHit();
+    tls.armTestClock();
+    defer tls.disarmTestClock();
+    const virtual_start = tls.testClockMs();
+    var batch_started = std.atomic.Value(bool).init(false);
+    const Gate = struct {
+        const nap = clock.sleepNs;
+        fn run(pool: *Pool(1), flag: *std.atomic.Value(bool)) void {
+            while (!flag.load(.acquire)) nap(std.time.ns_per_ms);
+            nap(20 * std.time.ns_per_ms);
+            // One second is the whole batch: both addresses and the join. A longer deadline does not finish here.
+            tls.advanceTestClock(1000);
+            var left: u32 = 2000;
+            while (left > 0 and pool.preconnect_done.load(.monotonic) == 0) : (left -= 20) nap(20 * std.time.ns_per_ms);
+            if (pool.preconnect_done.load(.monotonic) == 0) tls.advanceTestClock(120_000);
+        }
+    };
+    const gate = try std.Thread.spawn(.{}, Gate.run, .{ &p, &batch_started });
+    const t0 = nowMonoNs();
+    p.preconnect(testing.io, .{
+        .host = "hold.test",
+        .addrs = &addrs,
+        .port = port,
+        .use_tls = false,
+        .timeouts = .{ .connect_ms = 5000, .clock_ms = &tls.testClockMs },
+    }, 1);
+    batch_started.store(true, .release);
+    p.joinPreconnect();
+    gate.join();
+    const elapsed_ms = @divTrunc(nowMonoNs() - t0, std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 0), p.preconnect_parked.load(.monotonic));
+    // The absolute 1 s deadline stopped every address. Wall time only catches a hang.
+    try testing.expectEqual(@as(u64, 1000), tls.testClockMs() - virtual_start);
+    try testing.expectEqual(tls.DeadlineCause.virtual, tls.deadlineHit() orelse return error.TestExpectedEqual);
+    try testing.expect(tls.deadlineHitRealMs() <= 30_000);
+    try testing.expect(elapsed_ms <= 30_000);
+}
+
+fn holdAccepted(fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
+    var held: [4]std.posix.fd_t = undefined;
+    var n: usize = 0;
+    while (n < held.len and !stop.load(.monotonic)) {
+        var addr: std.posix.sockaddr.in = undefined;
+        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        const rc = std.posix.system.accept(fd, @ptrCast(&addr), &len);
+        if (std.posix.errno(rc) != .SUCCESS) break;
+        held[n] = @intCast(rc);
+        n += 1;
+    }
+    while (!stop.load(.monotonic)) {
+        clock.sleepNs(20 * std.time.ns_per_ms);
+    }
+    for (held[0..n]) |cfd| _ = std.posix.system.close(cfd);
+}
 
 test "acquire reuses a connection idle for less than the timeout and closes one idle for longer" {
     const io = testing.io;

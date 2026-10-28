@@ -35,6 +35,8 @@ const readUleb128 = @import("../../bytes.zig").readUleb128;
 pub const Error = error{
     InvalidBitWidth,
     UnexpectedEndOfStream,
+    /// An RLE run's value does not fit the stream's bit width.
+    CorruptRleValue,
 };
 
 pub const HybridRleDecoder = struct {
@@ -189,6 +191,70 @@ pub const HybridRleDecoder = struct {
         return .{ .value = self.rle_value, .count = n };
     }
 
+    /// A performance hint only: keep run-dominated pages encoded. On mostly packed levels, decoding twice
+    /// (validation then consumption) costs more than copying the expanded page. Malformed hints fall back to
+    /// decodeLevels, which retains the error and its precedence. Sixty-four levels are one selection-mask word.
+    pub fn preferLevelRuns(bytes: []const u8, width: u8, count: usize) bool {
+        if (width == 0 or count == 0) return false;
+        var stream = HybridRleDecoder.init(bytes, width);
+        var left = count;
+        var long_rows: usize = 0;
+        while (left != 0) {
+            if (stream.pos >= bytes.len) return false;
+            stream.readNextRun() catch return false;
+            if (stream.remaining_in_run == 0) return false;
+            const n = @min(left, stream.remaining_in_run);
+            if (stream.in_rle) {
+                if (n >= 64) long_rows += n;
+            } else {
+                const size = (stream.remaining_in_run / 8) *| width;
+                if (size > bytes.len - stream.pos) return false;
+                stream.pos += size;
+            }
+            left -= n;
+        }
+        return long_rows >= count / 2 + count % 2;
+    }
+
+    /// Count present levels without expanding RLE runs. Packed spans use bounded scratch. The whole page
+    /// must be checked before value decoding: corruption/count errors precede an out-of-range level anywhere.
+    pub fn countPresentLevels(self: *HybridRleDecoder, max_level: u32, count: usize) LevelError!usize {
+        if (self.bit_width == 0) return count;
+        var done: usize = 0;
+        var present: usize = 0;
+        var bad_range = false;
+        var packed_buf: [256]u32 = undefined;
+        while (done < count) {
+            if (self.remaining_in_run == 0 and self.bp_carry_count == 0) {
+                if (self.pos >= self.bytes.len) break;
+                self.readNextRun() catch return error.CorruptLevels;
+                // decodeLevels stops at an empty run, even if more bytes follow it.
+                if (self.remaining_in_run == 0) break;
+            }
+            if (self.in_rle and self.bp_carry_count == 0) {
+                const n = @min(count - done, self.remaining_in_run);
+                bad_range = bad_range or self.rle_value > max_level;
+                if (self.rle_value == max_level) present += n;
+                self.remaining_in_run -= n;
+                done += n;
+            } else {
+                const n = @min(count - done, packed_buf.len, self.remaining_in_run + self.bp_carry_count);
+                const got = self.decode(packed_buf[0..n]) catch return error.CorruptLevels;
+                if (got != n) return error.LevelCountMismatch;
+                for (packed_buf[0..n]) |v| {
+                    bad_range = bad_range or v > max_level;
+                    present += @intFromBool(v == max_level);
+                }
+                done += n;
+            }
+        }
+        if (done != count) return error.LevelCountMismatch;
+        if (!self.in_rle and (self.remaining_in_run / 8) *| self.bit_width > self.bytes.len - self.pos)
+            return error.CorruptLevels;
+        if (bad_range) return error.LevelOutOfRange;
+        return present;
+    }
+
     /// Peek the stream's opening run without expanding a single value.
     ///
     /// Returns null when the stream is empty/truncated or opens with a
@@ -245,7 +311,10 @@ pub const HybridRleDecoder = struct {
             v |= @as(u32, self.bytes[self.pos + i]) << @intCast(i * 8);
         }
         self.pos += value_bytes;
-        return v & self.mask;
+        // A run value wider than the bit width is no value of the stream: masked, a dictionary index of 16 at width 4
+        // read as entry 0 and answered with the incorrect value.
+        if (v & ~self.mask != 0) return error.CorruptRleValue;
+        return v;
     }
 
     fn decodeBitPacked(self: *HybridRleDecoder, dest: []u32) Error!void {
@@ -255,7 +324,7 @@ pub const HybridRleDecoder = struct {
         // batch is `inline for`-unrolled so LLVM can vectorize.
         //
         // Code-size cost: 32 specializations × ~40 ops body ≈ ~40 KB
-        // total bloat. Acceptable for ZPQ's hot path; trade-off matches
+        // total bloat. Acceptable for zpq's hot path; trade-off matches
         // arrow-rs's `unpack32` and DuckDB FastPFor's bitpacking — the
         // industry-standard fast-bit-unpacking shape.
         return switch (self.bit_width) {
@@ -327,6 +396,37 @@ pub const HybridRleDecoder = struct {
         self.pos += bytes_needed;
     }
 };
+
+/// Decode `out.len` repetition or definition levels, each checked against `max_level`, the schema's bound: the one
+/// place every reader decodes levels. A level past the bound names no slot; a definition level of 3 under a maximum of
+/// 2 read as a present value, its slot a placeholder.
+pub fn decodeLevels(bytes: []const u8, max_level: u32, out: []u32) LevelError!void {
+    const width: u8 = if (max_level == 0) 0 else @intCast(32 - @clz(max_level));
+    var dec = HybridRleDecoder.init(bytes, width);
+    const got = dec.decode(out) catch return error.CorruptLevels;
+    if (got != out.len) return error.LevelCountMismatch;
+    // A level stream is exactly its runs, every bit-packed group of them written whole. A run claiming groups past the
+    // stream's end is a corrupt header, and the levels read from its start are the next bytes, not levels; a V1 page
+    // has no null count to catch it by.
+    if (!dec.in_rle and (dec.remaining_in_run / 8) *| width > bytes.len - dec.pos) return error.CorruptLevels;
+    if (!levelsWithin(out, max_level)) return error.LevelOutOfRange;
+}
+
+pub const LevelError = error{ CorruptLevels, LevelCountMismatch, LevelOutOfRange };
+
+/// Whether no level exceeds `max`. A bound of 2^k - 1 is every value the bit width can hold, so most columns pay
+/// nothing; the others take one vector max over the page.
+pub fn levelsWithin(levels: []const u32, max: u32) bool {
+    if (max & (max +% 1) == 0) return true;
+    const L = 16;
+    const V = @Vector(L, u32);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + L <= levels.len) : (i += L) acc = @max(acc, @as(V, levels[i..][0..L].*));
+    var m = @reduce(.Max, acc);
+    for (levels[i..]) |l| m = @max(m, l);
+    return m <= max;
+}
 
 /// RLE-encoded BOOLEAN values (encoding == RLE). Boolean data is the
 /// hybrid RLE/bit-packed stream at a fixed bit-width of 1; a `1` bit is
@@ -412,6 +512,135 @@ inline fn unpackFastFixed(
 /// definition levels). One RLE run of count=N, value=1 → ~3 bytes
 /// regardless of N. Worth keeping simple.
 pub fn encode(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
+    std.debug.assert(bit_width <= 32);
+    if (bit_width == 0 or values.len == 0) return &.{};
+    // The same runs as `encodeReference`, in one walk over maximal runs, written straight into a buffer sized for the
+    // worst case (a 1-value RLE run per value: header + value bytes) instead of a byte append per output byte.
+    const value_bytes: usize = (bit_width + 7) / 8;
+    const cap = values.len * (2 + value_bytes) + values.len * bit_width / 8 + 64;
+    const out = try arena.alloc(u8, cap);
+    var o: usize = 0;
+    var i: usize = 0;
+    const n = values.len;
+    while (i < n) {
+        const end = runEnd(values, i);
+        if (end - i >= 8) {
+            o = putRleRun(out, o, values[i], end - i, value_bytes);
+            i = end;
+            continue;
+        }
+        // Bit-pack up to where the next run of 8 or more equal values starts, in whole groups of 8.
+        const j = nextLongRun(values, end);
+        const pack_count = (j - i) / 8 * 8;
+        if (pack_count > 0) {
+            o = putBitPackedRun(out, o, values[i .. i + pack_count], bit_width);
+            i += pack_count;
+        } else {
+            o = putRleRun(out, o, values[i], 1, value_bytes);
+            i += 1;
+        }
+    }
+    // Shrunk to what was written, so callers may free it with its own length (in place on an arena).
+    return arena.realloc(out, o);
+}
+
+/// The first `s >= from` where `values[s..s+8]` are all equal, or `values.len`. Each step compares 64 positions with
+/// their successors into a bit mask (with 16 more for lookahead); a run of 8 starts where 7 consecutive bits are set.
+fn nextLongRun(values: []const u32, from: usize) usize {
+    const n = values.len;
+    var p = from;
+    while (p + 8 <= n) {
+        if (p + 81 > n) {
+            // Too close to the end for a full window: scalar.
+            while (p + 8 <= n) : (p += 1) {
+                if (runEnd(values, p) - p >= 8) return p;
+            }
+            return n;
+        }
+        var m: u128 = 0;
+        inline for (0..5) |c| {
+            const a: @Vector(16, u32) = values[p + c * 16 ..][0..16].*;
+            const b: @Vector(16, u32) = values[p + c * 16 + 1 ..][0..16].*;
+            const eq: u16 = @bitCast(a == b);
+            m |= @as(u128, eq) << (c * 16);
+        }
+        // Bit k: values[p+k] == values[p+k+1]; a run of 8 at p+k needs bits k..k+6.
+        const q = m & (m >> 1) & (m >> 2) & (m >> 3) & (m >> 4) & (m >> 5) & (m >> 6);
+        const lo: u64 = @truncate(q);
+        if (lo != 0) return p + @ctz(lo);
+        p += 64;
+    }
+    return n;
+}
+
+/// End of the maximal run of `values[start]`'s value that starts at `start`: 16 values compared per step.
+fn runEnd(values: []const u32, start: usize) usize {
+    const L = 16;
+    const x = values[start];
+    if (start + 1 >= values.len or values[start + 1] != x) return start + 1;
+    var k = start + 1;
+    const splat: @Vector(L, u32) = @splat(x);
+    while (k + L <= values.len) : (k += L) {
+        const v: @Vector(L, u32) = values[k..][0..L].*;
+        const ne: u16 = @bitCast(v != splat);
+        if (ne != 0) return k + @ctz(ne);
+    }
+    while (k < values.len and values[k] == x) : (k += 1) {}
+    return k;
+}
+
+fn putUleb128(out: []u8, o: usize, value: u64) usize {
+    var v = value;
+    var p = o;
+    while (true) {
+        var b: u8 = @truncate(v & 0x7f);
+        v >>= 7;
+        if (v != 0) b |= 0x80;
+        out[p] = b;
+        p += 1;
+        if (v == 0) return p;
+    }
+}
+
+fn putRleRun(out: []u8, o: usize, value: u32, count: usize, value_bytes: usize) usize {
+    var p = putUleb128(out, o, @as(u64, count) << 1);
+    for (0..value_bytes) |b| {
+        out[p] = @truncate(value >> @intCast(b * 8));
+        p += 1;
+    }
+    return p;
+}
+
+/// `values` (a whole number of groups of 8) bit-packed LSB-first, through a 128-bit accumulator drained 8 bytes at a
+/// time. The buffer's slack covers the 8-byte stores past the last whole byte.
+fn putBitPackedRun(out: []u8, o: usize, values: []const u32, bit_width: u8) usize {
+    const p0 = putUleb128(out, o, (@as(u64, values.len / 8) << 1) | 1);
+    const mask: u64 = if (bit_width == 32) 0xffff_ffff else (@as(u64, 1) << @intCast(bit_width)) - 1;
+    var acc: u128 = 0;
+    var bits: u32 = 0;
+    var p = p0;
+    for (values) |v| {
+        acc |= @as(u128, v & mask) << @intCast(bits);
+        bits += bit_width;
+        if (bits >= 64) {
+            std.mem.writeInt(u64, out[p..][0..8], @truncate(acc), .little);
+            p += 8;
+            acc >>= 64;
+            bits -= 64;
+        }
+    }
+    // Groups of 8 values make whole bytes, so what is left is whole bytes too.
+    const tail = bits / 8;
+    var t: u32 = 0;
+    while (t < tail) : (t += 1) {
+        out[p] = @truncate(acc >> @intCast(t * 8));
+        p += 1;
+    }
+    return p;
+}
+
+/// The encoder `encode` replaced, kept to prove they write the same bytes.
+fn encodeReference(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
     std.debug.assert(bit_width <= 32);
 
     var out: std.ArrayList(u8) = .empty;
@@ -541,7 +770,6 @@ fn writeBitPackedRun(
 
 const testing = std.testing;
 
-
 test "a long bit-packed run ending the stream decodes in one call" {
     // Level decoding asks for a whole page at once. A run this close to the end of the bytes takes the padded
     // slow path, which used to assume at most 1024 bytes (256 values at bw 32) and overran its stack pad.
@@ -611,16 +839,29 @@ test "single RLE run of length 5, bit_width=4" {
     for (out[0..5]) |v| try testing.expectEqual(@as(u32, 7), v);
 }
 
-test "RLE value is masked to bit_width" {
-    // bit_width=3, mask=0b111. If we feed 0xFF, we should get 0x07.
+test "regression: a level run claiming bit-packed groups past its stream is refused, not read short" {
+    var out: [16]u32 = undefined;
+    // Two groups at width 1, as a writer writes them, then one byte flipped to claim 127.
+    const whole = [_]u8{ (2 << 1) | 1, 0b1011_0110, 0b0000_0001 };
+    try decodeLevels(&whole, 1, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0 }, &out);
+    const claims = [_]u8{ 0xff, 0x01, 0b1011_0110, 0b0000_0001 };
+    try std.testing.expectError(error.CorruptLevels, decodeLevels(&claims, 1, &out));
+    // Fewer levels than the run holds, all of it written: still a whole stream.
+    try decodeLevels(&whole, 1, out[0..13]);
+}
+
+test "regression: an RLE run value wider than the bit width is refused, not masked" {
+    // bit_width=3: 0xFF has bits past the width. Masked it read as 7, a dictionary index the run never named.
     // header: count=2, kind=0 → 0x04
     const bytes = [_]u8{ 0x04, 0xff };
     var dec = HybridRleDecoder.init(&bytes, 3);
     var out: [4]u32 = undefined;
-    const n = try dec.decode(&out);
-    try testing.expectEqual(@as(usize, 2), n);
-    try testing.expectEqual(@as(u32, 7), out[0]);
-    try testing.expectEqual(@as(u32, 7), out[1]);
+    try testing.expectError(error.CorruptRleValue, dec.decode(&out));
+    const fits = [_]u8{ 0x04, 0x07 };
+    var ok = HybridRleDecoder.init(&fits, 3);
+    try testing.expectEqual(@as(usize, 2), try ok.decode(&out));
+    try testing.expectEqualSlices(u32, &.{ 7, 7 }, out[0..2]);
 }
 
 test "single bit-packed run, 1 group of 8, bit_width=3" {
@@ -928,4 +1169,114 @@ test "encode bit_width=0 produces empty output" {
     const encoded = try encode(arena, &values, 0);
     defer arena.free(encoded);
     try testing.expectEqual(@as(usize, 0), encoded.len);
+}
+
+test "encode writes the same bytes as the reference encoder on random runs and widths" {
+    var prng = std.Random.DefaultPrng.init(0x81e);
+    const r = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (0..3000) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const bw: u8 = @intCast(1 + r.uintLessThan(u8, 32));
+        const n = r.uintLessThan(usize, if (iter % 10 == 0) 5000 else 200);
+        const vals = try a.alloc(u32, n);
+        const maxv: u64 = (@as(u64, 1) << @intCast(bw)) - 1;
+        var k: usize = 0;
+        while (k < n) {
+            const run = 1 + r.uintLessThan(usize, if (r.boolean()) 3 else 20);
+            const v: u32 = @intCast(r.uintAtMost(u64, @min(maxv, if (r.boolean()) 3 else maxv)));
+            var m: usize = 0;
+            while (m < run and k < n) : (m += 1) {
+                vals[k] = v;
+                k += 1;
+            }
+        }
+        try testing.expectEqualSlices(u8, try encodeReference(a, vals, bw), try encode(a, vals, bw));
+    }
+}
+
+test "regression: decodeLevels refuses a level past its maximum, whatever the bound's width" {
+    var out: [8]u32 = undefined;
+    // One RLE run of eight 3s at width 2: the most a maximum of 2 encodes in, and one past it.
+    const run3 = [_]u8{ 8 << 1, 3 };
+    try std.testing.expectError(error.LevelOutOfRange, decodeLevels(&run3, 2, &out));
+    const run2 = [_]u8{ 8 << 1, 2 };
+    try decodeLevels(&run2, 2, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2, 2, 2, 2, 2, 2, 2 }, &out);
+    // At a bound of 2^k - 1 every value the width holds is in range.
+    try decodeLevels(&run3, 3, &out);
+    try std.testing.expect(levelsWithin(&.{ 0, 1, 5, 2 }, 5) and !levelsWithin(&.{ 0, 6, 1 }, 5));
+    var many: [100]u32 = @splat(4);
+    try std.testing.expect(levelsWithin(&many, 4));
+    many[97] = 5;
+    try std.testing.expect(!levelsWithin(&many, 4) and !levelsWithin(&many, 2));
+    try std.testing.expectError(error.LevelCountMismatch, decodeLevels(&run2, 2, &many));
+}
+
+test "run-counted levels match expanded validation and error precedence" {
+    var prng = std.Random.DefaultPrng.init(0x739d187a);
+    const random = prng.random();
+    var bytes: [32]u8 = undefined;
+    var out: [64]u32 = undefined;
+    for (0..5000) |_| {
+        random.bytes(&bytes);
+        const n = random.uintLessThan(usize, out.len + 1);
+        const len = random.uintLessThan(usize, bytes.len + 1);
+        const max = random.uintLessThan(u32, 16);
+        try compareLevelCount(bytes[0..len], max, out[0..n]);
+    }
+    // Earlier out-of-range values lose to later corruption / short streams; a zero run ends decoding.
+    for ([_][]const u8{ &.{ 2, 3, 2 }, &.{ 2, 3 }, &.{ 5, 0, 0 }, &.{ 0, 0, 2, 1 } }) |encoded|
+        try compareLevelCount(encoded, 2, out[0..2]);
+    // Trailing bytes after the requested RLE prefix remain ignored, matching decodeLevels.
+    try compareLevelCount(&.{ 2, 1, 255 }, 1, out[0..1]);
+}
+
+fn compareLevelCount(bytes: []const u8, max: u32, out: []u32) !void {
+    const width: u8 = if (max == 0) 0 else @intCast(32 - @clz(max));
+    var stream = HybridRleDecoder.init(bytes, width);
+    const expected = decodeLevels(bytes, max, out);
+    const counted = stream.countPresentLevels(max, out.len);
+    if (expected) |_| {
+        var present: usize = 0;
+        for (out) |v| present += @intFromBool(v == max);
+        try std.testing.expectEqual(present, try counted);
+    } else |want_error| {
+        if (counted) |_| {
+            return error.TestExpectedError;
+        } else |got_error| {
+            try std.testing.expectEqual(want_error, got_error);
+        }
+    }
+}
+
+test "run-counted levels keep packed carry across arbitrary consumer windows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var levels: [1543]u32 = undefined;
+    for (&levels, 0..) |*v, i| v.* = if (i < 700) 1 else if (i < 1300) 0 else @intCast(i % 2);
+    const encoded = try encode(a, &levels, 1);
+    for ([_]usize{ 1, 3, 63, 64, 129, 512 }) |size| {
+        var stream = HybridRleDecoder.init(encoded, 1);
+        var off: usize = 0;
+        while (off < levels.len) {
+            const n = @min(size, levels.len - off);
+            var present: usize = 0;
+            for (levels[off..][0..n]) |v| present += v;
+            try std.testing.expectEqual(present, try stream.countPresentLevels(1, n));
+            off += n;
+        }
+    }
+}
+
+test "level run admission is encoded-byte based and leaves packed pages on the legacy path" {
+    try std.testing.expect(HybridRleDecoder.preferLevelRuns(&.{ 128, 1, 1, 128, 1, 0 }, 1, 128));
+    try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 3, 0xff }, 1, 8));
+    try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 5, 0xff }, 1, 8));
+    try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 0, 0, 128, 1, 1 }, 1, 64));
+    // A packed opening followed by a long run also admits: the decision is not restricted to the first header.
+    try std.testing.expect(HybridRleDecoder.preferLevelRuns(&.{ 3, 0xaa, 128, 1, 1 }, 1, 72));
 }

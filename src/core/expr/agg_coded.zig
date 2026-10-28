@@ -1,0 +1,3223 @@
+//! Encoded execution: aggregates folded in the dictionary-code domain.
+//!
+//! A column decoded as codes (`ColumnT.codes` + `dict`) never materializes its values. Aggregates over it
+//! histogram the selected rows' codes, then fold each dictionary entry once, weighted by its count:
+//!   sum = Σ count[k]·dict[k], count = Σ count[k], min/max = extremum over entries with count[k] > 0.
+//! Grouping by coded keys maps each row's tuple of codes to a dense composite index, resolves each composite that
+//! occurs to a group id once (through the same serialized key the row path builds, so groups are identical), and
+//! folds per composite rather than per row.
+//!
+//! Integer results are exact. Float SUM/AVG keep canonical scalar blocks or grouped row order; their values are
+//! never reassociated into histogram-weighted sums.
+
+const std = @import("std");
+const filter_eval = @import("../filter/eval.zig");
+const filter_selection = @import("../filter/selection.zig");
+const expr_ast = @import("ast.zig");
+const expr_eval = @import("eval.zig");
+const agg = @import("agg.zig");
+const DecodeBudget = @import("../consumer.zig").DecodeBudget;
+const huge_pages = @import("../huge_pages.zig");
+
+const Column = filter_eval.Batch.Column;
+const Sel = filter_selection.SelectionVector;
+const Accumulator = agg.Accumulator;
+const AggCall = agg.AggCall;
+const Error = agg.Error;
+const core_bytes = @import("../bytes.zig");
+const keyEql = core_bytes.keyEql;
+const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
+
+/// The coded column a bare col_ref argument names, or null when the call can't take the coded path.
+/// A sum or avg of floats: it folds in the one row order every path shares (`agg.sumBlocksF64`, and the row fold for
+/// groups), never through per-composite partials or a histogram, which round in another order.
+pub fn floatSum(call: AggCall) bool {
+    return (call.func == .sum or call.func == .avg) and call.arg != null and call.arg.?.typeOf() == .f64;
+}
+
+pub fn codedArg(call: AggCall, batch: *const filter_eval.Batch, lookup: []const ?usize) ?Column {
+    const arg = call.arg orelse return null;
+    if (arg != .col_ref) return null;
+    const pos = lookup[arg.col_ref.col_idx] orelse return null;
+    const col = batch.cols[pos];
+    if (col.codes() == null) return null;
+    if (col.nullInfo().max_rep > 0) return null;
+    return col;
+}
+
+/// Count selected rows per code. Four interleaved tables break the store-to-load chain that runs of one code
+/// would otherwise serialize on.
+fn histogram(arena: std.mem.Allocator, codes: []const u32, n_dict: usize, sel: *const Sel) ![]u64 {
+    const h = try arena.alloc(u64, n_dict * 4);
+    defer arena.free(h);
+    @memset(h, 0);
+    const out = try arena.alloc(u64, n_dict);
+    @memset(out, 0);
+    const n = codes.len;
+    var w: usize = 0;
+    while ((w + 1) * 64 <= n) : (w += 1) {
+        const word = sel.mask[w];
+        const base = w * 64;
+        if (word == std.math.maxInt(u64)) {
+            var r: usize = base;
+            while (r < base + 64) : (r += 4) {
+                h[codes[r] * 4 + 0] += 1;
+                h[codes[r + 1] * 4 + 1] += 1;
+                h[codes[r + 2] * 4 + 2] += 1;
+                h[codes[r + 3] * 4 + 3] += 1;
+            }
+        } else if (word != 0) {
+            var bits = word;
+            while (bits != 0) {
+                const i: usize = @ctz(bits);
+                h[codes[base + i] * 4] += 1;
+                bits &= bits - 1;
+            }
+        }
+    }
+    for (w * 64..n) |r| if (sel.isActive(r)) {
+        h[codes[r] * 4] += 1;
+    };
+    for (out, 0..) |*o, k| o.* = h[k * 4] + h[k * 4 + 1] + h[k * 4 + 2] + h[k * 4 + 3];
+    return out;
+}
+
+/// The dictionary widened to the call's lane, as `PreparedAggInput.bindColRef` widens row values.
+fn widenDict(arena: std.mem.Allocator, col: Column, c: expr_ast.ColRef) Error!Column {
+    const d = col.dictColumn();
+    return switch (c.expr_type) {
+        .i64 => .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(arena, d, c) } },
+        .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(arena, d) } },
+        .str => d,
+        .dec => switch (col) {
+            inline .f64, .i32, .i64 => |f, physical_tag| switch (f.dict_unscaled orelse
+                return if (physical_tag == .f64) error.DecimalUnavailable else error.TypeMismatch) {
+                inline else => |vals, tag| @unionInit(Column, @tagName(tag), .{ .values = vals }),
+            },
+            else => error.TypeMismatch,
+        },
+    };
+}
+
+fn selectWithNulls(
+    arena: std.mem.Allocator,
+    call: AggCall,
+    col: Column,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) Error!?Sel {
+    var own: ?Sel = null;
+    if (call.where) |pred| {
+        own = try outer.cloneAlloc(arena);
+        try filter_eval.evaluate(pred, batch, &own.?, lookup, arena);
+    }
+    const has_nulls = switch (col) {
+        inline else => |c| c.has_nulls,
+    };
+    if (has_nulls) {
+        if (own == null) own = try outer.cloneAlloc(arena);
+        agg.intersectPresentMask(&own.?, col);
+    }
+    return own;
+}
+
+/// Scalar `updateOne` for a coded argument. Returns false (nothing folded) when the call doesn't qualify.
+pub fn updateOneCoded(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer_sel: *const Sel,
+) Error!bool {
+    if (call.func == .count) if (call.arg) |arg| if (arg == .col_ref) {
+        const pos = lookup[arg.col_ref.col_idx] orelse return error.BadColumn;
+        const lcol = batch.cols[pos];
+        if (lcol.levelsOnly()) {
+            var own = try selectWithNulls(arena, call, lcol, batch, lookup, outer_sel);
+            defer if (own) |*s| s.deinit();
+            const sel: *const Sel = if (own) |*s| s else outer_sel;
+            state.count += sel.count();
+            return true;
+        }
+    };
+    if (call.arg) |arg| if (arg == .col_ref) {
+        const pos = lookup[arg.col_ref.col_idx] orelse return error.BadColumn;
+        const hcol = batch.cols[pos];
+        // Planned only for unfiltered scalar calls without FILTER, so every present row is selected.
+        if (hcol.hist()) |h| {
+            std.debug.assert(call.where == null);
+            const dict = try widenDict(arena, hcol, arg.col_ref);
+            try foldHist(persist, state, call, dict, h, arg.col_ref.unsigned_64);
+            return true;
+        }
+    };
+    const col = codedArg(call, batch, lookup) orelse return false;
+    const c = call.arg.?.col_ref;
+    var own = try selectWithNulls(arena, call, col, batch, lookup, outer_sel);
+    defer if (own) |*s| s.deinit();
+    const sel: *const Sel = if (own) |*s| s else outer_sel;
+    if (call.func == .count_distinct) {
+        const dict = try widenDict(arena, col, c);
+        try foldDistinctCoded(arena, persist, state, col.codes().?, col.dictLen(), dict, sel);
+        return true;
+    }
+    // A float sum reads its entries row by row, in the order every path sums in: a histogram's count × entry
+    // rounds otherwise.
+    if (floatSum(call)) {
+        if (!sel.any()) return true; // no values: leave a NULL sum NULL, as the row fold does
+        const dict = (try widenDict(arena, col, c)).f64.values;
+        const codes = col.codes().?;
+        switch (state.*) {
+            .sum_f => |*t| t.* = agg.sumBlocksCodedF64(t.* orelse 0, codes, dict, sel),
+            .avg => |*a| {
+                a.sum = agg.sumBlocksCodedF64(a.sum, codes, dict, sel);
+                a.count += sel.count();
+            },
+            else => return error.UnsupportedAggType,
+        }
+        return true;
+    }
+    const hist = try histogram(arena, col.codes().?, col.dictLen(), sel);
+    const dict = try widenDict(arena, col, c);
+    try foldHist(persist, state, call, dict, hist, c.unsigned_64);
+    return true;
+}
+
+inline fn setBit(bs: []u64, code: u32) void {
+    bs[code / 64] |= @as(u64, 1) << @truncate(code % 64);
+}
+
+fn foldDistinctCoded(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    codes: []const u32,
+    n_dict: usize,
+    dict: Column,
+    sel: *const Sel,
+) Error!void {
+    const n_words = (n_dict + 63) / 64;
+    const bitset = try arena.alloc(u64, n_words);
+    @memset(bitset, 0);
+
+    const n = codes.len;
+    var w: usize = 0;
+    while ((w + 1) * 64 <= n) : (w += 1) {
+        const word = sel.mask[w];
+        const base = w * 64;
+        if (word == std.math.maxInt(u64)) {
+            var r: usize = base;
+            while (r < base + 64) : (r += 4) {
+                setBit(bitset, codes[r]);
+                setBit(bitset, codes[r + 1]);
+                setBit(bitset, codes[r + 2]);
+                setBit(bitset, codes[r + 3]);
+            }
+        } else if (word != 0) {
+            var bits = word;
+            while (bits != 0) {
+                const i: usize = @ctz(bits);
+                setBit(bitset, codes[base + i]);
+                bits &= bits - 1;
+            }
+        }
+    }
+    for (w * 64..n) |r| if (sel.isActive(r)) {
+        setBit(bitset, codes[r]);
+    };
+
+    for (0..n_dict) |k| {
+        if ((bitset[k / 64] & (@as(u64, 1) << @truncate(k % 64))) != 0) {
+            try state.distinct.insertColRow(persist, dict, k);
+        }
+    }
+}
+
+/// Fold one histogram over a (widened) dictionary into `state`, matching the row folds' semantics.
+fn foldHist(
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    call: AggCall,
+    dict: Column,
+    hist: []const u64,
+    unsigned_64: bool,
+) Error!void {
+    var total: u64 = 0;
+    for (hist) |h| total += h;
+    switch (call.func) {
+        .count => {
+            state.count += total;
+            return;
+        },
+        .count_distinct => {
+            for (hist, 0..) |h, k| {
+                if (h > 0) try state.distinct.insertColRow(persist, dict, k);
+            }
+            return;
+        },
+        else => {},
+    }
+    if (total == 0) return;
+    switch (state.*) {
+        .sum_i => |*s| {
+            var acc: i128 = 0;
+            for (hist, dict.i64.values) |h, v| {
+                if (h == 0) continue;
+                const x: i128 = if (unsigned_64) @as(u64, @bitCast(v)) else v;
+                acc += x * @as(i128, h);
+            }
+            s.* = (s.* orelse 0) + acc + @as(i128, call.offset) * total;
+        },
+        .sum_f => |*s| {
+            var acc: f64 = 0;
+            for (hist, dict.f64.values) |h, v| {
+                if (h == 0) continue;
+                acc += @as(f64, @floatFromInt(h)) * v;
+            }
+            s.* = (s.* orelse 0) + acc;
+        },
+        .min_i, .max_i => |*m| {
+            const is_min = state.* == .min_i;
+            for (hist, dict.i64.values) |h, v| {
+                if (h == 0) continue;
+                const x: i128 = if (unsigned_64) @as(u64, @bitCast(v)) else v;
+                if (m.* == null or (is_min and x < m.*.?) or (!is_min and x > m.*.?)) m.* = x;
+            }
+        },
+        .min_f, .max_f => |*m| {
+            // `agg.minTotal`/`maxTotal` order, which no fold order changes: each present entry once is enough.
+            const is_min = state.* == .min_f;
+            for (hist, dict.f64.values) |h, v| {
+                if (h == 0) continue;
+                if (is_min) agg.foldExtremeF(true, m, v) else agg.foldExtremeF(false, m, v);
+            }
+        },
+        .min_bytes, .max_bytes, .min_arena, .max_arena => {
+            const is_min = state.* == .min_bytes or state.* == .min_arena;
+            var best: ?[]const u8 = null;
+            for (hist, dict.string.values) |h, v| {
+                if (h == 0) continue;
+                if (best) |b| {
+                    const ord = std.mem.order(u8, v, b);
+                    if ((is_min and ord == .lt) or (!is_min and ord == .gt)) best = v;
+                } else best = v;
+            }
+            const cand = best.?;
+            switch (state.*) {
+                .min_arena, .max_arena => |*value| try value.consider(cand, is_min),
+                .min_bytes, .max_bytes => |*m| {
+                    if (m.*) |cur| {
+                        const ord = std.mem.order(u8, cand, cur);
+                        if (!((is_min and ord == .lt) or (!is_min and ord == .gt))) return;
+                    }
+                    try agg.persistWinner(persist, m, cand);
+                },
+                else => unreachable,
+            }
+        },
+        .avg => |*a| {
+            const vals: []const f64 = switch (dict) {
+                .f64 => |d| d.values,
+                .i64 => |d| blk: {
+                    // Built per call; dictionaries are small.
+                    var sum: i128 = 0;
+                    for (hist, d.values) |h, v| {
+                        if (h == 0) continue;
+                        const x: i128 = if (unsigned_64) @as(u64, @bitCast(v)) else v;
+                        sum += @as(i128, h) * x;
+                    }
+                    a.isum += sum;
+                    a.count += total;
+                    break :blk &.{};
+                },
+                else => return error.UnsupportedAggType,
+            };
+            if (dict == .f64) {
+                var sum: f64 = 0;
+                for (hist, vals) |h, v| {
+                    if (h == 0) continue;
+                    sum += @as(f64, @floatFromInt(h)) * v;
+                }
+                a.sum += sum;
+                a.count += total;
+            }
+        },
+        // Exact DECIMAL over a dictionary (`widenDict` gives its unscaled entries): count × entry, summed wide.
+        .sum_d, .avg_d => |*d| {
+            var acc: i192 = 0;
+            switch (dict) {
+                inline .i32, .i64, .i128 => |dc| for (hist, dc.values) |h, v| {
+                    if (h == 0) continue;
+                    acc += @as(i192, v) * h;
+                },
+                else => return error.UnsupportedAggType,
+            }
+            d.add(acc, total);
+        },
+        .min_d, .max_d => |*m| {
+            const is_min = state.* == .min_d;
+            switch (dict) {
+                inline .i32, .i64, .i128 => |dc| for (hist, dc.values) |h, v| {
+                    if (h == 0) continue;
+                    m.* = if (m.*) |cur| (if (is_min) @min(cur, v) else @max(cur, v)) else v;
+                },
+                else => return error.UnsupportedAggType,
+            }
+        },
+        .count => unreachable,
+        .distinct => unreachable,
+    }
+}
+
+// ------------------------------------------------------------------ grouped
+
+/// Composite spaces up to this group by code at no charge: their scratch is small beside a row group's decode.
+const MAX_COMPOSITE: usize = 1 << 16;
+/// Larger spaces up to this group by code only where it pays and fits: the space is at most twice the row group's
+/// rows (its arrays are walked whole per row group), and the scratch they take is reserved from the decode budget
+/// before any group is touched. Otherwise, and above it, the row path.
+pub const MAX_CHARGED_COMPOSITE: usize = 1 << 20;
+
+/// What grouping by code over `space` composites holds on the row group's arena, kept on the high side: the
+/// composite-to-group map, first rows and their order, then per call a count, partial and seen-count array (a
+/// histogram call its (composite, code) table instead).
+fn chargedScratch(space: usize, calls: []const AggCall) usize {
+    var bytes = space *| 12;
+    for (calls) |_| bytes +|= @max(space *| 32, MAX_HIST *| 8);
+    return bytes;
+}
+/// Per-call (composite × code) histograms above this fall back to the per-row typed fold.
+pub const MAX_HIST: usize = 1 << 20;
+
+/// Distinct values past which a plain string key is left as it is.
+const max_coded_plain = 256;
+/// Distinct values up to which a row's value is matched by comparing it with each, before any hashing.
+const few_plain = 16;
+
+/// Conservative fixed storage for recoding plain string keys: hash slots, dictionary growth and alignment.
+/// Row codes are separate. The cache admission caller also counts key dictionaries and composite scratch.
+pub fn plainKeyScratchBytes(entries: usize) ?usize {
+    if (entries > max_coded_plain) return null;
+    return max_coded_plain * (8 * @sizeOf([]const u8));
+}
+
+/// Give each plain (not dictionary-coded) string GROUP BY key of the batch a dictionary built here, when the batch
+/// holds at most `max_coded_plain` distinct values of it, so `groupedCoded` groups it by code: each distinct key
+/// combination is then resolved once per batch instead of serialized and looked up for every row. Values stay as they
+/// are for everything else that reads the column.
+pub fn codePlainKeys(ra: std.mem.Allocator, keys: []const expr_ast.Expr, cols: []Column, lookup: []const ?usize) !void {
+    for (keys) |k| {
+        if (k != .col_ref) continue;
+        const pos = lookup[k.col_ref.col_idx] orelse continue;
+        const col = &cols[pos];
+        switch (col.*) {
+            .i64 => |*ic| try codeIntRange(i64, ra, ic),
+            .i32 => |*ic| try codeIntRange(i32, ra, ic),
+            else => {},
+        }
+        if (col.* != .string) continue;
+        const sc = &col.string;
+        if (sc.codes != null or sc.max_rep > 0 or sc.values.len == 0) continue;
+        var seen: KeyHashMapUnmanaged(u32) = .empty;
+        try seen.ensureTotalCapacity(ra, max_coded_plain);
+        var dict: std.ArrayList([]const u8) = .empty;
+        const codes = try ra.alloc(u32, sc.values.len);
+        const coded = for (sc.values, codes, 0..) |v, *c, r| {
+            // A null row's slot holds no value; code 0 there, as decoded columns do (the levels mark it).
+            if (sc.def_levels) |dl| if (dl[r] < sc.max_def) {
+                c.* = 0;
+                continue;
+            };
+            // A few distinct values are found faster by comparing them all than by hashing the row's.
+            if (dict.items.len <= few_plain) {
+                if (for (dict.items, 0..) |d, i| {
+                    if (keyEql(d, v)) break i;
+                } else null) |i| {
+                    c.* = @intCast(i);
+                    continue;
+                }
+            }
+            const gop = seen.getOrPutAssumeCapacity(v);
+            if (!gop.found_existing) {
+                if (dict.items.len == max_coded_plain) break false;
+                gop.value_ptr.* = @intCast(dict.items.len);
+                try dict.append(ra, v);
+            }
+            c.* = gop.value_ptr.*;
+        } else true;
+        if (!coded or dict.items.len == 0) continue;
+        sc.codes = codes;
+        sc.dict = dict.items;
+    }
+}
+
+/// Widest value range an integer key is coded over.
+const max_int_range = 4096;
+
+/// Code a plain integer key by its offset from the batch's least value, when the batch's values span fewer than
+/// `max_int_range`: the dictionary is every value of that range, and coding a row is a subtraction, not a lookup.
+fn codeIntRange(comptime T: type, ra: std.mem.Allocator, ic: *filter_eval.ColumnT(T)) !void {
+    if (ic.codes != null or ic.max_rep > 0 or ic.values.len == 0) return;
+    const present = struct {
+        fn at(c: *const filter_eval.ColumnT(T), r: usize) bool {
+            const dl = c.def_levels orelse return true;
+            return dl[r] >= c.max_def;
+        }
+    }.at;
+    var lo: T = std.math.maxInt(T);
+    var hi: T = std.math.minInt(T);
+    for (ic.values, 0..) |v, r| if (present(ic, r)) {
+        lo = @min(lo, v);
+        hi = @max(hi, v);
+    };
+    if (lo > hi) return; // every row null
+    const span = @as(i128, hi) - lo;
+    if (span >= max_int_range) return;
+    const dict = try ra.alloc(T, @intCast(span + 1));
+    for (dict, 0..) |*d, i| d.* = @intCast(@as(i128, lo) + @as(i128, @intCast(i)));
+    const codes = try ra.alloc(u32, ic.values.len);
+    for (ic.values, codes, 0..) |v, *c, r| c.* = if (present(ic, r)) @intCast(@as(i128, v) - lo) else 0;
+    ic.codes = codes;
+    ic.dict = dict;
+}
+
+/// The column of a lone bare GROUP BY key that only counts read (`count(*)`, or `count` of the key itself), which can
+/// then decode straight into a histogram of its codes with each code's first row (`groupedHist`); null otherwise.
+pub fn histGroupKey(calls: []const AggCall, keys: []const expr_ast.Expr) ?usize {
+    if (keys.len != 1 or keys[0] != .col_ref) return null;
+    const key = keys[0].col_ref.col_idx;
+    for (calls) |call| {
+        if (call.func != .count or call.where != null) return null;
+        if (call.arg) |arg| if (arg != .col_ref or arg.col_ref.col_idx != key) return null;
+    }
+    return key;
+}
+
+/// Grouped scan with every GROUP BY key a bare coded column. Fills `group_id_arr` for selected rows and folds every
+/// call. Returns false, having done nothing, when the keys don't qualify.
+pub fn groupedCoded(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    calls: []const AggCall,
+    keys: []const expr_ast.Expr,
+    table: *agg.GroupTable,
+    /// `agg.firstPosition` of row 0.
+    pos_base: u64,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const Sel,
+    /// Charged for a composite space past `MAX_COMPOSITE`; null keeps grouping by code to the free spaces.
+    budget: ?*DecodeBudget,
+    /// The region `ra` allocates from, whose ledger must take that scratch too.
+    region: ?*huge_pages.Region,
+) !bool {
+    if (table.discovery != null) return false;
+    const num_rows = batch.num_rows;
+    if (keys.len == 1 and keys[0] == .col_ref) if (lookup[keys[0].col_ref.col_idx]) |pos| {
+        if (batch.cols[pos].hist() != null) {
+            try groupedHist(ra, calls, keys[0].col_ref, batch.cols[pos], table, pos_base, lookup.len);
+            return true;
+        }
+    };
+    const key_cols = try ra.alloc(Column, keys.len);
+    const strides = try ra.alloc(usize, keys.len);
+    var space: usize = 1;
+    for (keys, 0..) |k, i| {
+        if (k != .col_ref) return false;
+        const pos = lookup[k.col_ref.col_idx] orelse return false;
+        const col = batch.cols[pos];
+        if (col.codes() == null or col.nullInfo().max_rep > 0) return false;
+        key_cols[i] = col;
+        strides[i] = space;
+        space *= col.dictLen() + 1; // + the null slot
+        if (space > MAX_CHARGED_COMPOSITE) return false;
+    }
+    const wide = space > MAX_COMPOSITE;
+    var charged: usize = 0;
+    if (wide) {
+        if (space > 2 * num_rows) return false;
+        const b = budget orelse return false;
+        charged = chargedScratch(space, calls);
+        if (!b.tryAcquire(charged)) return false;
+        if (region) |r| if (!r.admit(r.end +| charged)) {
+            b.release(charged);
+            return false;
+        };
+    }
+    defer if (charged > 0) budget.?.release(charged);
+
+    // Composites that can occur: a key without null rows never fills its null slot.
+    var reachable: usize = 1;
+    for (key_cols) |col| reachable *= col.dictLen() + @intFromBool(col.nullInfo().def_levels != null);
+    // Composite code per selected row. A lone key without nulls is its own codes, so it neither copies them nor
+    // touches a fresh row-sized buffer.
+    const comp: []const u32 = if (keys.len == 1 and key_cols[0].nullInfo().def_levels == null)
+        key_cols[0].codes().?[0..num_rows]
+    else comp: {
+        const out = try ra.alloc(u32, num_rows);
+        @memset(out, 0);
+        for (key_cols, strides) |col, stride| {
+            const codes = col.codes().?;
+            const ni = col.nullInfo();
+            const null_slot: u32 = @intCast(col.dictLen());
+            const st: u32 = @intCast(stride);
+            if (ni.def_levels) |dl| {
+                for (out, codes, dl) |*cp, code, d| cp.* += (if (d < ni.max_def) null_slot else code) * st;
+            } else {
+                for (out, codes) |*cp, code| cp.* += code * st;
+            }
+        }
+        break :comp out;
+    };
+
+    // Resolve each composite that occurs among selected rows, once.
+    const gid_of = try ra.alloc(u32, space);
+    @memset(gid_of, unresolved);
+    // Each key's dictionary plus a trailing null entry, widened exactly as the row path widens key values.
+    const kd_cols = try ra.alloc(Column, keys.len);
+    for (keys, key_cols, 0..) |k, col, i| {
+        kd_cols[i] = try keyDictColumn(ra, col, k.col_ref, lookup.len);
+    }
+    var scratch: std.ArrayList(u8) = .empty;
+    const rows = try ra.alloc(usize, keys.len);
+    // One pass finds each composite's first selected row; only composites that occur get resolved, each at that
+    // row, so a new group's position is where it first appears. Resolved in code order: a group keeps the least
+    // position it is asked for and the answer orders by that, so the order groups are made in decides nothing.
+    const first_row = try compositeFirstRows(ra, comp, space, reachable, sel);
+    for (first_row, 0..) |fr, cp| {
+        if (fr == no_row) continue;
+        var rem: usize = cp;
+        var i: usize = keys.len;
+        while (i > 0) {
+            i -= 1;
+            rows[i] = rem / strides[i];
+            rem %= strides[i];
+        }
+        try serializeKeyAt(&scratch, ra, kd_cols, rows);
+        gid_of[cp] = try table.getOrInsert(scratch.items, calls, pos_base + first_row[cp]);
+    }
+
+    // A sketched table's rows outside its admitted cells take no group (`agg.sinkSketchRows`).
+    var sunk: Sel = undefined;
+    const fold_sel = if (table.sketch != null) blk: {
+        sunk = try sel.cloneAlloc(ra);
+        const ids = try ra.alloc(u32, num_rows);
+        for (ids, comp) |*id, cp| id.* = gid_of[cp];
+        try agg.sinkSketchRows(table, ids, &sunk);
+        if (table.countOnly()) return true;
+        break :blk &sunk;
+    } else sel;
+    if (try foldExactBatch(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
+    if (try foldFloatBatches(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
+    const agg_len = calls.len;
+    const fused = try ra.alloc(bool, calls.len);
+    @memset(fused, false);
+    try fuseBareFloats(ra, table, gid_of, comp, space, calls, batch, lookup, fold_sel, fused);
+    for (calls, 0..) |call, ai| {
+        if (fused[ai]) continue;
+        const accs = table.accumulators.items;
+        // Inlining the large reduction kernel into the scan increases register pressure on dense controls.
+        try @call(.never_inline, foldGroupedCall, .{
+            ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, table,
+        });
+    }
+    return true;
+}
+
+/// `groupedCoded` for a key decoded as a histogram with first rows (`histGroupKey`): each code a row holds becomes its
+/// group, in code order at its first row, as the per-row composites resolve, and takes its count in one add.
+fn groupedHist(
+    ra: std.mem.Allocator,
+    calls: []const AggCall,
+    key: expr_ast.ColRef,
+    col: Column,
+    table: *agg.GroupTable,
+    pos_base: u64,
+    lookup_len: usize,
+) !void {
+    std.debug.assert(histGroupKey(calls, &.{.{ .col_ref = key }}) != null);
+    const hist = col.hist().?;
+    // A key's histogram always carries first rows, and is declined for a chunk with a null row.
+    const first = col.histFirst() orelse return error.UnsupportedAggType;
+    if (first.len != hist.len or col.dictLen() != hist.len) return error.UnsupportedAggType;
+    const kd = [_]Column{try keyDictColumn(ra, col, key, lookup_len)};
+    var scratch: std.ArrayList(u8) = .empty;
+    for (hist, first, 0..) |n, fr, code| {
+        if (n == 0) continue;
+        if (fr == std.math.maxInt(u32)) return error.UnsupportedAggType;
+        try serializeKeyAt(&scratch, ra, &kd, &.{code});
+        const g = try table.getOrInsert(scratch.items, calls, pos_base + fr);
+        if (table.compact.stride != 0) {
+            for (calls, 0..) |_, i| table.compact.addCount(g, i, n);
+        } else {
+            for (table.accumulators.items[g * calls.len ..][0..calls.len]) |*acc| acc.count += n;
+        }
+    }
+}
+
+/// The dictionary of a key column as a group-key column: entries 0..n-1, then a null at n.
+pub fn keyDictColumn(ra: std.mem.Allocator, col: Column, c: expr_ast.ColRef, lookup_len: usize) !Column {
+    const n = col.dictLen();
+    const dl = try ra.alloc(u32, n + 1);
+    @memset(dl[0..n], 1);
+    dl[n] = 0;
+    const ext: Column = switch (col) {
+        inline else => |cc, tag| blk: {
+            const T = @TypeOf(cc.dict[0]);
+            const vals = try ra.alloc(T, n + 1);
+            @memcpy(vals[0..n], cc.dict);
+            vals[n] = std.mem.zeroes(T);
+            var ext_col: @TypeOf(cc) = .{ .values = vals, .def_levels = dl, .max_def = 1, .has_nulls = true };
+            // A DECIMAL key groups on its exact entries: without them every coded INT32/INT64-backed one was refused.
+            if (cc.dict_unscaled) |du| ext_col.unscaled = switch (du) {
+                inline else => |d, dtag| ext: {
+                    const U = @TypeOf(d[0]);
+                    const u = try ra.alloc(U, n + 1);
+                    @memcpy(u[0..n], d);
+                    u[n] = 0;
+                    break :ext @unionInit(filter_eval.Exact, @tagName(dtag), u);
+                },
+            };
+            break :blk @unionInit(Column, @tagName(tag), ext_col);
+        },
+    };
+    const cols = [_]Column{ext};
+    const fake: filter_eval.Batch = .{ .cols = &cols, .num_rows = n + 1 };
+    const lk = try ra.alloc(?usize, lookup_len);
+    @memset(lk, null);
+    lk[c.col_idx] = 0;
+    return expr_eval.evalGroupKeyExpr(ra, &fake, lk, .{ .col_ref = c });
+}
+
+/// `agg.serializeRowKey` with each key column at its own row.
+pub fn serializeKeyAt(
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    cols: []const Column,
+    rows: []const usize,
+) !void {
+    list.clearRetainingCapacity();
+    var one: std.ArrayList(u8) = .empty;
+    defer one.deinit(allocator);
+    for (cols, rows) |col, row| {
+        try agg.serializeRowKey(&one, allocator, &.{col}, row);
+        try list.appendSlice(allocator, one.items);
+    }
+}
+
+const unresolved = std.math.maxInt(u32);
+
+/// Dense numeric lanes borrow only the accumulator array; these folds neither insert keys nor own that storage.
+pub fn foldDenseCalls(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) !void {
+    var view = agg.GroupTable.init(gpa, 0);
+    view.accumulators.items = accs;
+    view.accumulators.capacity = accs.len;
+    const space = gid_of.len;
+    if (try foldExactBatch(ra, gpa, &view, gid_of, comp, space, calls, batch, lookup, outer)) return;
+    if (try foldFloatBatches(ra, gpa, &view, gid_of, comp, space, calls, batch, lookup, outer)) return;
+    for (calls, 0..) |call, ai| {
+        try @call(.never_inline, foldGroupedCall, .{
+            ra, gpa, accs, gid_of, comp, space, ai, calls.len, call, batch, lookup, outer, null,
+        });
+    }
+}
+
+/// Whether a float sum's partials can start from their groups' sums: every composite that occurs is its own group,
+/// and few enough to check. Two composites of one group (a float key's 0.0 and -0.0 entries) would each start from
+/// the same sum and the second write back would drop the first's rows.
+fn seedable(ra: std.mem.Allocator, gid_of: []const u32) !bool {
+    var gids: std.ArrayList(u32) = .empty;
+    defer gids.deinit(ra);
+    for (gid_of) |g| if (g != unresolved) {
+        if (gids.items.len == 4096) return false;
+        try gids.append(ra, g);
+    };
+    if (gids.items.len < 2) return true;
+    std.mem.sortUnstable(u32, gids.items, {}, std.sort.asc(u32));
+    for (gids.items[1..], gids.items[0 .. gids.items.len - 1]) |a, b| if (a == b) return false;
+    return true;
+}
+
+/// Exact roots fold call-major, over the whole batch or, for SUM and AVG alone, in cache-sized windows of it
+/// (`foldExactWindows`). Per-root SUM/count deltas can feed SUM and AVG without copying accumulated state: a group may
+/// already contain contributions from earlier row groups or statistics shortcuts.
+fn foldExactBatch(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    table: *agg.GroupTable,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) !bool {
+    if (table.compact.stride != 0) return false;
+    var computed = false;
+    for (calls) |call| {
+        if (call.where != null or call.offset != 0 or call.func == .count_distinct) return false;
+        if (call.arg) |arg| {
+            if (arg.typeOf() != .dec) return false;
+            computed = computed or arg == .binop;
+        } else if (call.func != .count) return false;
+    }
+    if (!computed) return false;
+    var plan: expr_eval.ExactPlan = .{};
+    const roots = try ra.alloc(?usize, calls.len);
+    for (calls, roots) |call, *root| {
+        root.* = if (call.arg) |arg| (try plan.add(ra, batch, lookup, arg)) orelse return false else null;
+    }
+    const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+    @memset(partials, null);
+    // Composites' selected rows, shared by the roots that sum in interleaved slots.
+    var present: ?[]u64 = null;
+    foldExactWindows(ra, &plan, calls, roots, partials, space, comp, batch, lookup, outer);
+    const restricted = batch.restrictedTo(outer);
+    for (calls, roots, 0..) |call, root, ai| {
+        if (root) |r| {
+            if (call.func == .sum or call.func == .avg) {
+                if (partials[r] == null) {
+                    const v = try plan.evaluate(ra, &restricted, lookup, r);
+                    var acc = try NarrowAcc.init(ra, space, comp.len);
+                    try acc.fold(comp, v, outer);
+                    try acc.finish(ra, &present, comp, outer);
+                    partials[r] = acc.delta;
+                }
+                for (partials[r].?, gid_of) |delta, gid| {
+                    if (delta.n == 0) continue;
+                    const acc = &table.accumulators.items[gid * calls.len + ai];
+                    switch (acc.*) {
+                        .sum_d, .avg_d => |*d| d.add(delta.get(), delta.n),
+                        else => return error.UnsupportedAggType,
+                    }
+                }
+                continue;
+            }
+            const v = try plan.evaluate(ra, &restricted, lookup, r);
+            try foldGroupedValue(
+                ra,
+                gpa,
+                table.accumulators.items,
+                gid_of,
+                comp,
+                space,
+                ai,
+                calls.len,
+                call,
+                batch,
+                lookup,
+                outer,
+                table,
+                v,
+            );
+        } else {
+            try foldGroupedCall(
+                ra,
+                gpa,
+                table.accumulators.items,
+                gid_of,
+                comp,
+                space,
+                ai,
+                calls.len,
+                call,
+                batch,
+                lookup,
+                outer,
+                table,
+            );
+        }
+    }
+    return true;
+}
+
+/// Expressions share their DAG only under the same selection. Fold each group in its original row order, carrying
+/// its sum between batches; the canonical group fold is sequential, unlike the scalar fold's 64-row reductions.
+fn foldFloatBatches(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    table: *agg.GroupTable,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) !bool {
+    if (batch.num_rows == 0) return false;
+    var has_expression = false;
+    for (calls) |call| if (call.arg) |arg| {
+        has_expression = has_expression or arg != .col_ref;
+    };
+    if (!has_expression) return false;
+    // Keep admission and DAG storage independent of the row group's long-lived decode allocations.
+    var planning = std.heap.ArenaAllocator.init(ra);
+    defer planning.deinit();
+    const pa = planning.allocator();
+    var plan: expr_eval.FloatPlan = .{};
+    const roots = try pa.alloc(?usize, calls.len);
+    @memset(roots, null);
+    var computed = false;
+    for (calls, roots) |call, *root| {
+        if (call.where != null or call.func == .count_distinct or call.result == .bytes) return false;
+        if (call.arg) |arg| {
+            if (arg == .col_ref) {
+                const c = arg.col_ref;
+                const p = lookup[c.col_idx] orelse return false;
+                if (c.unsigned_64 or c.expr_type == .dec or batch.cols[p].nullInfo().max_rep != 0) return false;
+            } else {
+                if (arg.typeOf() != .f64) return false;
+                root.* = (try plan.add(pa, batch, lookup, arg)) orelse return false;
+                computed = true;
+            }
+        }
+    }
+    if (!computed) return false;
+    // Admission before any accumulator write. A refusal here used to return after `fuseBareFloats` had already
+    // folded the bare roots, and `groupedCoded` then folded them again. `floatBatchRows` is 0 when batching is
+    // forced off or the worker's L2 share cannot hold one batch: the same answer as the ordinary path, so the
+    // worker count cannot change a sum.
+    const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) + space *| 32;
+    const batch_rows = expr_eval.floatBatchRows(plan.liveBytesPerRow(), fixed, batch.expr_batch_rows);
+    if (batch_rows == 0) return false;
+    const fused = try ra.alloc(bool, calls.len);
+    @memset(fused, false);
+    try fuseBareFloats(ra, table, gid_of, comp, space, calls, batch, lookup, outer, fused);
+    // Bare columns already have dictionary/histogram folds: leave those full-column shortcuts in place.
+    for (calls, roots, 0..) |call, root, ai| if (root == null and !fused[ai]) {
+        try foldGroupedCall(
+            ra,
+            gpa,
+            table.accumulators.items,
+            gid_of,
+            comp,
+            space,
+            ai,
+            calls.len,
+            call,
+            batch,
+            lookup,
+            outer,
+            table,
+        );
+    };
+    const cols = try pa.alloc(Column, batch.cols.len);
+    var scratch = @import("../row_group_arena.zig").RowGroupArena.init(ra);
+    defer scratch.deinit();
+    const share_rows = try seedable(ra, gid_of);
+    var off: usize = 0;
+    while (off < batch.num_rows) {
+        scratch.nextRowGroup();
+        const a = scratch.allocator();
+        const n = @min(batch_rows, batch.num_rows - off);
+        for (batch.cols, cols) |col, *out| out.* = try col.sliceRows(off, n);
+        const sel = try outer.alignedWindow(off, n);
+        const win: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .sel = &sel };
+        const values = try plan.evaluate(a, &win, lookup);
+        const expr_fused = try a.alloc(bool, calls.len);
+        @memset(expr_fused, false);
+        if (share_rows) {
+            const expr_roots = try a.alloc(FloatRoot, calls.len);
+            var nexpr: usize = 0;
+            for (calls, roots, 0..) |call, root, ai| if (root) |r| {
+                const slice = exprFloatValues(call, values[r], table, ai) orelse continue;
+                if (slice.len != n) continue;
+                expr_roots[nexpr] = .{ .ai = ai, .values = slice };
+                nexpr += 1;
+            };
+            if (nexpr >= 2) {
+                try foldFloatPartials(
+                    a,
+                    table.accumulators.items,
+                    gid_of,
+                    comp[off..][0..n],
+                    space,
+                    calls.len,
+                    &sel,
+                    table,
+                    expr_roots[0..nexpr],
+                );
+                for (expr_roots[0..nexpr]) |root| expr_fused[root.ai] = true;
+            }
+        }
+        for (calls, roots, 0..) |call, root, ai| if (root) |r| {
+            if (expr_fused[ai]) continue;
+            try foldGroupedValue(
+                a,
+                gpa,
+                table.accumulators.items,
+                gid_of,
+                comp[off..][0..n],
+                space,
+                ai,
+                calls.len,
+                call,
+                &win,
+                lookup,
+                &sel,
+                table,
+                values[r],
+            );
+        };
+        off += n;
+    }
+    return true;
+}
+
+test "float batches preserve grouped sum bits, NULLs, selections, CSE and allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testFloatBatches, .{});
+}
+
+fn testFloatBatches(a: std.mem.Allocator) !void {
+    const old = expr_eval.forced_batch_rows;
+    expr_eval.forced_batch_rows = 4096;
+    defer expr_eval.forced_batch_rows = old;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n = 32769;
+    const vals = try ra.alloc(f64, n);
+    const defs = try ra.alloc(u32, n);
+    const comp = try ra.alloc(u32, n);
+    for (vals, defs, comp, 0..) |*v, *d, *c, r| {
+        v.* = switch (r % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
+        };
+        d.* = @intFromBool(r % 19 != 0);
+        c.* = @intCast(r % 4);
+    }
+    const cols = [_]Column{.{ .f64 = .{ .values = vals, .def_levels = defs, .max_def = 1, .has_nulls = true } }};
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{0};
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    var sum: expr_ast.Expr = .{ .binop = .{ .op = .add, .left = &x, .right = &one, .result_type = .f64, .depth = 2 } };
+    // A second occurrence has its own AST address but shares its computed result.
+    var same_sum = sum;
+    const product: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &same_sum,
+        .right = &sum,
+        .result_type = .f64,
+        .depth = 3,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = sum, .result = .f64, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = product, .result = .avg_f64, .where = null, .alias = "a" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    var plan: expr_eval.FloatPlan = .{};
+    _ = try plan.add(ra, &batch, &lookup, sum);
+    _ = try plan.add(ra, &batch, &lookup, product);
+    try std.testing.expectEqual(@as(usize, 4), plan.nodes.items.len);
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 7 == 0 or r / 64 == 80) sel.set(r, false);
+    var want = agg.GroupTable.init(a, 1 << 24);
+    defer want.deinit();
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    const keys = [_][]const u8{ "a", "b", "c", "d" };
+    for (keys) |key| {
+        _ = try want.getOrInsert(key, &calls, 0);
+        _ = try got.getOrInsert(key, &calls, 0);
+    }
+    const gids = [_]u32{ 0, 1, 2, 3 };
+    for (calls, 0..) |call, ai| try foldGroupedCall(
+        ra,
+        a,
+        want.accumulators.items,
+        &gids,
+        comp,
+        4,
+        ai,
+        calls.len,
+        call,
+        &batch,
+        &lookup,
+        &sel,
+        &want,
+    );
+    try std.testing.expect(try foldFloatBatches(ra, a, &got, &gids, comp, 4, &calls, &batch, &lookup, &sel));
+    try std.testing.expectEqualDeep(want.accumulators.items, got.accumulators.items);
+}
+
+test "exact batches sum 64-bit DECIMAL lanes in i128 at their extremes, with NULLs, selections and i128 inputs" {
+    const old = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old;
+    // Few composites take interleaved partials; past a quarter of the rows each composite takes one. The whole
+    // batch at once, then windows of one selection word and of several.
+    for ([_]usize{ 5, 9000 }) |space| for ([_]usize{ 0, 64, 4096 }) |rows| {
+        expr_eval.forced_batch_rows = rows;
+        try testExactBatches(std.testing.allocator, space);
+    };
+}
+
+fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    // Not a multiple of 64, so the last selection word is partial.
+    const n = 32769;
+    const max18: i64 = 999_999_999_999_999_999;
+    const wide: i128 = std.math.pow(i128, 10, 37);
+    const big = try ra.alloc(i64, n);
+    const half = try ra.alloc(i64, n);
+    const small = try ra.alloc(i32, n);
+    const huge = try ra.alloc(i128, n);
+    const shadow = try ra.alloc(f64, n);
+    const times = try ra.alloc(i64, n);
+    const defs = try ra.alloc(u32, n);
+    const comp = try ra.alloc(u32, n);
+    for (big, half, small, huge, shadow, times, defs, comp, 0..) |*b, *h, *sm, *hg, *f, *t, *d, *c, r| {
+        // Runs of one sign at DECIMAL(18)'s extremes: any 64-bit running sum would overflow.
+        b.* = if (r % 6 < 3) max18 else -max18 + @as(i64, @intCast(r % 5));
+        h.* = if (r % 2 == 0) @divTrunc(max18, 2) else -@as(i64, @intCast(r));
+        sm.* = if (r % 3 == 0) -999_999_999 else @intCast(r);
+        hg.* = if (r % 4 == 0) -wide else wide - @as(i128, @intCast(r));
+        f.* = 0;
+        // Every third selection word's products leave 64 bits: their windows take the i128 lane, the rest do not.
+        // Those products sum past 2^127, beyond what an i128 partial could carry.
+        t.* = if (r / 64 % 3 != 1) 1 else if (b.* > 0) 100_000_000_000_000_000 else 10;
+        d.* = @intFromBool(r % 19 != 0);
+        // A null row's slot holds garbage the fold must not read as a value.
+        if (d.* == 0) {
+            h.* = std.math.minInt(i64);
+            sm.* = std.math.minInt(i32);
+        }
+        // Half the rows in one composite, so even one slot per composite runs past 64 bits.
+        c.* = if (r % 2 == 0) 0 else @intCast((r * 7 + r / 3) % space);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = big, .unscaled = .{ .i64 = big } } },
+        .{ .i64 = .{
+            .values = half,
+            .unscaled = .{ .i64 = half },
+            .def_levels = defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+        .{ .i32 = .{
+            .values = small,
+            .unscaled = .{ .i32 = small },
+            .def_levels = defs,
+            .max_def = 1,
+            .has_nulls = true,
+        } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = huge } } },
+        .{ .i64 = .{ .values = times, .unscaled = .{ .i64 = times } } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1, 2, 3, 4 };
+    const d18: expr_ast.Dec = .{ .precision = 18, .scale = 2 };
+    var c0: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .dec, .dec = d18 } };
+    var c1: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .dec, .dec = d18 } };
+    const c2: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 2,
+        .physical_type = .INT32,
+        .expr_type = .dec,
+        .dec = .{ .precision = 9, .scale = 2 },
+    } };
+    const c3: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 3,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = .{ .precision = 38, .scale = 2 },
+    } };
+    // DECIMAL(19, 2): past 18 digits, computed in the checked 64-bit lane while its values fit one.
+    const plus: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c1,
+        .right = &c0,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = .{ .precision = 19, .scale = 2 },
+    } };
+    var c4: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 4,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 0 },
+    } };
+    // DECIMAL(36, 2), in the checked 64-bit lane in a window whose products fit, else in i128.
+    const product: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &c0,
+        .right = &c4,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = .{ .precision = 36, .scale = 2 },
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = c0, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .avg, .arg = c1, .result = .avg_dec, .where = null, .alias = "b" },
+        .{ .func = .sum, .arg = plus, .result = .dec, .where = null, .alias = "c" },
+        .{ .func = .avg, .arg = c2, .result = .avg_dec, .where = null, .alias = "d" },
+        .{ .func = .sum, .arg = c3, .result = .dec, .where = null, .alias = "e" },
+        .{ .func = .sum, .arg = c1, .result = .dec, .where = null, .alias = "f" },
+        .{ .func = .sum, .arg = product, .result = .dec, .where = null, .alias = "g" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 7 == 0 or r / 64 == 80) sel.set(r, false);
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    const gids = try ra.alloc(u32, space);
+    var key: [8]u8 = undefined;
+    for (gids, 0..) |*g, cp| {
+        std.mem.writeInt(u64, &key, cp, .little);
+        g.* = try got.getOrInsert(&key, &calls, 0);
+    }
+    try std.testing.expect(try foldExactBatch(ra, a, &got, gids, comp, space, &calls, &batch, &lookup, &sel));
+    // Forced windows fold every root themselves, rather than leaving them to the whole batch.
+    if (expr_eval.forced_batch_rows != 0) {
+        var plan: expr_eval.ExactPlan = .{};
+        const roots = try ra.alloc(?usize, calls.len);
+        for (calls, roots) |call, *root| {
+            root.* = if (call.arg) |arg| (try plan.add(ra, &batch, &lookup, arg)).? else null;
+        }
+        const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+        @memset(partials, null);
+        foldExactWindows(ra, &plan, &calls, roots, partials, space, comp, &batch, &lookup, &sel);
+        for (roots) |root| if (root) |r| try std.testing.expect(partials[r] != null);
+    }
+    // The per-row fold this replaced, at 192 bits, as the oracle.
+    const want_sum = try ra.alloc(i192, space * calls.len);
+    const want_n = try ra.alloc(u64, space * calls.len);
+    @memset(want_sum, 0);
+    @memset(want_n, 0);
+    const want_rows = try ra.alloc(u64, space);
+    @memset(want_rows, 0);
+    for (0..n) |r| {
+        if (!sel.isActive(r)) continue;
+        want_rows[comp[r]] += 1;
+        const present = defs[r] == 1;
+        const row = [_]?i192{
+            big[r],
+            if (present) half[r] else null,
+            if (present) @as(i192, half[r]) + big[r] else null,
+            if (present) small[r] else null,
+            huge[r],
+            if (present) half[r] else null,
+            @as(i192, big[r]) * times[r],
+        };
+        for (row, 0..) |v, ai| if (v) |x| {
+            want_sum[comp[r] * calls.len + ai] += x;
+            want_n[comp[r] * calls.len + ai] += 1;
+        };
+    }
+    var sizable = false;
+    for (gids, 0..) |g, cp| for (calls[0 .. calls.len - 1], 0..) |_, ai| {
+        const d = switch (got.accumulators.items[g * calls.len + ai]) {
+            .sum_d, .avg_d => |d| d,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(want_sum[cp * calls.len + ai], d.get());
+        try std.testing.expectEqual(want_n[cp * calls.len + ai], d.n);
+        if (ai != 4 and @abs(d.get()) > std.math.maxInt(i64)) sizable = true;
+    };
+    for (gids, 0..) |g, cp| {
+        try std.testing.expectEqual(want_rows[cp], got.accumulators.items[g * calls.len + calls.len - 1].count);
+    }
+    // The 64-bit lanes reach sums no 64-bit accumulator holds, and the windowed product one no i128 holds.
+    try std.testing.expect(sizable);
+    try std.testing.expect(for (gids) |g| {
+        if (@abs(got.accumulators.items[g * calls.len + 6].sum_d.get()) > std.math.maxInt(i128)) break true;
+    } else false);
+}
+
+test "exact windows fail as the whole batch does, leaving the table as it leaves it" {
+    const old = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old;
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n = 1000;
+    const vals = try ra.alloc(i64, n);
+    const late = try ra.alloc(i128, n);
+    const early = try ra.alloc(i128, n);
+    const shadow = try ra.alloc(f64, n);
+    const comp = try ra.alloc(u32, n);
+    const near38: i128 = 9 * std.math.pow(i128, 10, 37);
+    for (vals, late, early, shadow, comp, 0..) |*v, *l, *e, *f, *c, r| {
+        v.* = @intCast(r);
+        // Doubled, each overflows 38 digits in one row: the second call's in the first window, the first's in the
+        // last, so windows meet the calls' errors in the opposite order to the whole batch.
+        l.* = if (r == n - 3) near38 else 1;
+        e.* = if (r == 5) near38 else 1;
+        f.* = 0;
+        c.* = @intCast(r % 3);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = vals, .unscaled = .{ .i64 = vals } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = late } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = early } } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    const d38: expr_ast.Dec = .{ .precision = 38, .scale = 0 };
+    const c0: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 0 },
+    } };
+    var c1: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 1,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = d38,
+    } };
+    var c2: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 2,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = d38,
+    } };
+    const twice_late: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c1,
+        .right = &c1,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = d38,
+    } };
+    const twice_early: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c2,
+        .right = &c2,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = d38,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = c0, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .sum, .arg = twice_late, .result = .dec, .where = null, .alias = "b" },
+        .{ .func = .avg, .arg = twice_early, .result = .avg_dec, .where = null, .alias = "c" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    const sel = try Sel.init(ra, n);
+    const gids = [_]u32{ 0, 1, 2 };
+    var tables: [2]agg.GroupTable = undefined;
+    for (&tables, [_]usize{ 0, 64 }) |*table, rows| {
+        expr_eval.forced_batch_rows = rows;
+        table.* = agg.GroupTable.init(a, 1 << 24);
+        for ([_][]const u8{ "a", "b", "c" }) |key| _ = try table.getOrInsert(key, &calls, 0);
+        try std.testing.expectError(
+            error.DecimalOverflow,
+            foldExactBatch(ra, a, table, &gids, comp, 3, &calls, &batch, &lookup, &sel),
+        );
+    }
+    defer for (&tables) |*table| table.deinit();
+    try std.testing.expectEqualDeep(tables[0].accumulators.items, tables[1].accumulators.items);
+    // The whole batch folds the first call before the second fails.
+    try std.testing.expect(tables[1].accumulators.items[0].sum_d.n != 0);
+}
+
+test "a failed windowed pass gives its scratch back to a worker's region before the whole batch reruns" {
+    const old = expr_eval.forced_batch_rows;
+    defer expr_eval.forced_batch_rows = old;
+    expr_eval.forced_batch_rows = 64;
+    var region = huge_pages.Region.init(std.testing.allocator, 4 * huge_pages.huge_page_size);
+    defer region.deinit();
+    if (region.buf.len == 0) return error.SkipZigTest;
+    var worker = @import("../row_group_arena.zig").RowGroupArena.initOn(&region);
+    defer worker.deinit();
+    var fixture = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fixture.deinit();
+    const fa = fixture.allocator();
+    const n = 4096;
+    const vals = try fa.alloc(i64, n);
+    const wide = try fa.alloc(i128, n);
+    const shadow = try fa.alloc(f64, n);
+    const comp = try fa.alloc(u32, n);
+    for (vals, wide, shadow, comp, 0..) |*v, *w, *f, *c, r| {
+        v.* = @intCast(r);
+        // Doubled, the last window's value overflows 38 digits, after every other window has folded.
+        w.* = if (r == n - 1) 9 * std.math.pow(i128, 10, 37) else @intCast(r);
+        f.* = 0;
+        c.* = @intCast(r % 3);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = vals, .unscaled = .{ .i64 = vals } } },
+        .{ .f64 = .{ .values = shadow, .unscaled = .{ .i128 = wide } } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1 };
+    const d38: expr_ast.Dec = .{ .precision = 38, .scale = 0 };
+    var c0: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 0,
+        .physical_type = .INT64,
+        .expr_type = .dec,
+        .dec = .{ .precision = 18, .scale = 0 },
+    } };
+    var c1: expr_ast.Expr = .{ .col_ref = .{
+        .col_idx = 1,
+        .physical_type = .FIXED_LEN_BYTE_ARRAY,
+        .expr_type = .dec,
+        .dec = d38,
+    } };
+    const product: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &c0,
+        .right = &c0,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = .{ .precision = 36, .scale = 0 },
+    } };
+    const twice: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &c1,
+        .right = &c1,
+        .result_type = .dec,
+        .depth = 2,
+        .dec = d38,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = product, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .sum, .arg = twice, .result = .dec, .where = null, .alias = "b" },
+    };
+    const ra = worker.allocator();
+    var plan: expr_eval.ExactPlan = .{};
+    var roots: [calls.len]?usize = undefined;
+    for (calls, &roots) |call, *root| root.* = (try plan.add(ra, &batch, &lookup, call.arg.?)).?;
+    const partials = try ra.alloc(?[]agg.DecSum, plan.nodes.items.len);
+    @memset(partials, null);
+    const sel = try Sel.init(ra, n);
+    const mark = region.end;
+    foldExactWindows(ra, &plan, &calls, &roots, partials, 3, comp, &batch, &lookup, &sel);
+    for (partials) |p| try std.testing.expect(p == null);
+    // All the pass keeps is the block its sums would have been published in, two roots over three composites.
+    try std.testing.expect(region.end - mark <= 2 * 3 * @sizeOf(agg.DecSum) + @alignOf(agg.DecSum));
+}
+
+test "fused float sums match call-major row order" {
+    try testFusedFloatSums(std.testing.allocator);
+}
+
+fn testFusedFloatSums(a: std.mem.Allocator) !void {
+    const old = expr_eval.forced_batch_rows;
+    expr_eval.forced_batch_rows = 4096;
+    defer expr_eval.forced_batch_rows = old;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n = 32769;
+    const xs = try ra.alloc(f64, n);
+    const ys = try ra.alloc(f64, n);
+    const comp = try ra.alloc(u32, n);
+    for (xs, ys, comp, 0..) |*x, *y, *c, r| {
+        x.* = switch (r % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
+        };
+        y.* = switch (r % 5) {
+            0 => 1e16,
+            1 => -1,
+            2 => 1e16,
+            3 => 0.5,
+            else => -1e16,
+        };
+        c.* = @intCast(r % 4);
+    }
+    const cols = [_]Column{
+        .{ .f64 = .{ .values = xs } },
+        .{ .f64 = .{ .values = ys } },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    const lookup = [_]?usize{ 0, 1 };
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var y: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    const sum_xy: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &y,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    const x_plus: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &one,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = x, .result = .f64, .where = null, .alias = "sx" },
+        .{ .func = .sum, .arg = y, .result = .f64, .where = null, .alias = "sy" },
+        .{ .func = .sum, .arg = sum_xy, .result = .f64, .where = null, .alias = "sxy" },
+        .{ .func = .avg, .arg = x_plus, .result = .avg_f64, .where = null, .alias = "ax" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 11 == 0) sel.set(r, false);
+    var want = agg.GroupTable.init(a, 1 << 24);
+    defer want.deinit();
+    var got = agg.GroupTable.init(a, 1 << 24);
+    defer got.deinit();
+    const keys = [_][]const u8{ "a", "b", "c", "d" };
+    for (keys) |key| {
+        _ = try want.getOrInsert(key, &calls, 0);
+        _ = try got.getOrInsert(key, &calls, 0);
+    }
+    const gids = [_]u32{ 0, 1, 2, 3 };
+    for (calls, 0..) |call, ai| try foldGroupedCall(
+        ra,
+        a,
+        want.accumulators.items,
+        &gids,
+        comp,
+        4,
+        ai,
+        calls.len,
+        call,
+        &batch,
+        &lookup,
+        &sel,
+        &want,
+    );
+    fuse_probe.passes = 0;
+    try std.testing.expect(try foldFloatBatches(ra, a, &got, &gids, comp, 4, &calls, &batch, &lookup, &sel));
+    try std.testing.expect(fuse_probe.passes >= 2);
+    try std.testing.expectEqualDeep(want.accumulators.items, got.accumulators.items);
+}
+
+pub fn foldGroupedCall(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    ai: usize,
+    agg_len: usize,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    maybe_table: anytype,
+) !void {
+    return foldGroupedValue(
+        ra,
+        gpa,
+        accs,
+        gid_of,
+        comp,
+        space,
+        ai,
+        agg_len,
+        call,
+        batch,
+        lookup,
+        outer,
+        maybe_table,
+        null,
+    );
+}
+
+// Scalar `+=` in selected-row order. Not `foldFloatPartials` and not `foldGroupedCall`.
+// Sharing stands in for `-j`: L2 is split by `max_sharing`. Forced 0 is batching off, a zero L2 refuses a batch,
+// and forced 64 admits one. Only the admitted path fuses two or more roots.
+test "mixed float roots match a scalar oracle across batch admission" {
+    const hw = @import("../hw.zig");
+    defer hw.test_cpu = null;
+    defer expr_eval.forced_batch_rows = null;
+    const sharing = [_]usize{ 1, 3, 8, 16 };
+    const modes = [_]struct { forced: ?usize, l2: usize, admit: bool }{
+        .{ .forced = 0, .l2 = 1 << 20, .admit = false },
+        .{ .forced = null, .l2 = 0, .admit = false },
+        .{ .forced = 64, .l2 = 1 << 20, .admit = true },
+    };
+    var first: ?[7]u64 = null;
+    var first_count: ?u64 = null;
+    for (sharing) |workers| {
+        for (modes) |mode| {
+            expr_eval.forced_batch_rows = mode.forced;
+            hw.test_cpu = .{ .l2 = .{ .bytes = mode.l2, .max_sharing = workers } };
+            const got = try mixedFloatOracle(std.testing.allocator);
+            try std.testing.expectEqual(got.oracle, got.bits);
+            try std.testing.expectEqual(got.oracle_count, got.count);
+            try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), got.bits[5]);
+            // Bare roots share one pass on every mode. A second pass is the per-batch expression fusion.
+            if (mode.admit) {
+                try std.testing.expect(fuse_probe.passes > 1);
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), fuse_probe.passes);
+            }
+            if (first) |prev| {
+                try std.testing.expectEqual(prev, got.bits);
+                try std.testing.expectEqual(first_count.?, got.count);
+            } else {
+                first = got.bits;
+                first_count = got.count;
+            }
+        }
+    }
+}
+
+fn mixedFloatOracle(a: std.mem.Allocator) !struct { bits: [7]u64, count: u64, oracle: [7]u64, oracle_count: u64 } {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    const n: usize = 192;
+    const nan_a: f64 = @bitCast(@as(u64, 0x7ff0_0000_0000_0001));
+    const nan_b: f64 = @bitCast(@as(u64, 0xfff0_0000_0000_0002));
+    try std.testing.expect(@as(u64, @bitCast(nan_a)) != @as(u64, @bitCast(nan_b)));
+    const keys = [_][]const u8{"g"};
+    const key_codes = try ra.alloc(u32, n);
+    @memset(key_codes, 0);
+    const xs = try ra.alloc(f64, n);
+    const ys = try ra.alloc(f64, n);
+    const zs = try ra.alloc(f64, n);
+    const ws = try ra.alloc(f64, n);
+    for (xs, ys, zs, ws, 0..) |*x, *y, *z, *w, r| {
+        x.* = switch (r % 3) {
+            0 => 1e16,
+            1 => 1,
+            else => -1e16,
+        };
+        y.* = switch (r % 3) {
+            0 => 0.5,
+            1 => -0.25,
+            else => 0.25,
+        };
+        z.* = -0.0;
+        w.* = if (r == 1) nan_a else if (r == 2) nan_b else 0;
+    }
+    const cols = [_]Column{
+        .{ .string = .{ .values = &.{}, .codes = key_codes, .dict = &keys } },
+        .{ .f64 = .{ .values = xs } },
+        .{ .f64 = .{ .values = ys } },
+        .{ .f64 = .{ .values = zs } },
+        .{ .f64 = .{ .values = ws } },
+    };
+    const lookup = [_]?usize{ 0, 1, 2, 3, 4 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    var xref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var yref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const zref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 3, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const wref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 4, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const sum_xy: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &xref,
+        .right = &yref,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    const sum_xmy: expr_ast.Expr = .{ .binop = .{
+        .op = .sub,
+        .left = &xref,
+        .right = &yref,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = xref, .result = .f64, .where = null, .alias = "sx" },
+        .{ .func = .sum, .arg = yref, .result = .f64, .where = null, .alias = "sy" },
+        .{ .func = .avg, .arg = xref, .result = .avg_f64, .where = null, .alias = "ax" },
+        .{ .func = .sum, .arg = sum_xy, .result = .f64, .where = null, .alias = "sxy" },
+        .{ .func = .sum, .arg = sum_xmy, .result = .f64, .where = null, .alias = "sxmy" },
+        .{ .func = .sum, .arg = zref, .result = .f64, .where = null, .alias = "sz" },
+        .{ .func = .sum, .arg = wref, .result = .f64, .where = null, .alias = "sw" },
+    };
+    var table = agg.GroupTable.init(a, 1 << 20);
+    defer table.deinit();
+    const stub_codes = [_]u32{0};
+    const stub_x = [_]f64{0};
+    const stub_cols = [_]Column{
+        .{ .string = .{ .values = &.{}, .codes = &stub_codes, .dict = &keys } },
+        .{ .f64 = .{ .values = &stub_x } },
+        .{ .f64 = .{ .values = &stub_x } },
+        .{ .f64 = .{ .values = &stub_x } },
+        .{ .f64 = .{ .values = &stub_x } },
+    };
+    var stub_sel = try Sel.init(ra, 1);
+    const stub_batch: filter_eval.Batch = .{ .cols = &stub_cols, .num_rows = 1 };
+    try std.testing.expect(try groupedCoded(
+        ra,
+        a,
+        &calls,
+        &.{key},
+        &table,
+        0,
+        &stub_batch,
+        &lookup,
+        &stub_sel,
+        null,
+        null,
+    ));
+    const seed_z: f64 = -0.0;
+    table.accumulators.items[0] = .{ .sum_f = 0 };
+    table.accumulators.items[1] = .{ .sum_f = 0 };
+    table.accumulators.items[2] = .{ .avg = .{ .sum = 0, .count = 0 } };
+    table.accumulators.items[3] = .{ .sum_f = 0 };
+    table.accumulators.items[4] = .{ .sum_f = 0 };
+    table.accumulators.items[5] = .{ .sum_f = seed_z };
+    table.accumulators.items[6] = .{ .sum_f = 0 };
+    if (comptime @import("builtin").is_test) fuse_probe.passes = 0;
+
+    var sel = try Sel.init(ra, n);
+    for (0..n) |r| if (r % 17 == 0) sel.set(r, false);
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    try std.testing.expect(try groupedCoded(
+        ra,
+        a,
+        &calls,
+        &.{key},
+        &table,
+        0,
+        &batch,
+        &lookup,
+        &sel,
+        null,
+        null,
+    ));
+
+    var ox: f64 = 0;
+    var oy: f64 = 0;
+    var oavg: f64 = 0;
+    var ocount: u64 = 0;
+    var oxy: f64 = 0;
+    var oxmy: f64 = 0;
+    var oz: f64 = seed_z;
+    var ow: f64 = 0;
+    for (0..n) |r| if (sel.isActive(r)) {
+        ox += xs[r];
+        oy += ys[r];
+        oavg += xs[r];
+        ocount += 1;
+        oxy += xs[r] + ys[r];
+        oxmy += xs[r] - ys[r];
+        oz += zs[r];
+        ow += ws[r];
+    };
+    const acc = table.accumulators.items;
+    return .{
+        .bits = .{
+            @bitCast(acc[0].sum_f.?),
+            @bitCast(acc[1].sum_f.?),
+            @bitCast(acc[2].avg.sum),
+            @bitCast(acc[3].sum_f.?),
+            @bitCast(acc[4].sum_f.?),
+            @bitCast(acc[5].sum_f.?),
+            @bitCast(acc[6].sum_f.?),
+        },
+        .count = acc[2].avg.count,
+        .oracle = .{
+            @bitCast(ox),
+            @bitCast(oy),
+            @bitCast(oavg),
+            @bitCast(oxy),
+            @bitCast(oxmy),
+            @bitCast(oz),
+            @bitCast(ow),
+        },
+        .oracle_count = ocount,
+    };
+}
+
+const FloatRoot = struct { ai: usize, values: []const f64 };
+
+const fuse_probe = if (@import("builtin").is_test) struct {
+    threadlocal var passes: usize = 0;
+} else struct {};
+
+/// Float SUM/AVG roots that share a selection. One walk visits rows in `forEachActive` order; each root adds
+/// into its own partial, starting from that group's running sum, so the bits match a separate pass per root.
+fn foldFloatPartials(
+    ra: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    agg_len: usize,
+    sel: *const Sel,
+    table: ?*agg.GroupTable,
+    roots: []const FloatRoot,
+) !void {
+    if (comptime @import("builtin").is_test) {
+        if (roots.len >= 2) fuse_probe.passes += 1;
+    }
+    const parts = try ra.alloc([]f64, roots.len);
+    for (roots, parts) |root, *part| {
+        const p = try ra.alloc(f64, space);
+        for (p, gid_of) |*slot, g| {
+            slot.* = if (g == unresolved) 0 else switch (accs[g * agg_len + root.ai]) {
+                .sum_f => |t| t orelse 0,
+                .avg => |a| a.sum,
+                else => 0,
+            };
+        }
+        part.* = p;
+    }
+    const seen = try ra.alloc(u64, space);
+    @memset(seen, 0);
+    forEachActive(sel, comp.len, struct {
+        fn f(ctx: anytype, r: usize) void {
+            const cp = ctx.comp[r];
+            ctx.seen[cp] += 1;
+            for (ctx.roots, ctx.parts) |root, part| part[cp] += root.values[r];
+        }
+    }.f, .{ .comp = comp, .seen = seen, .roots = roots, .parts = parts });
+    for (roots, parts) |root, part| {
+        for (0..space) |cp| {
+            if (seen[cp] == 0) continue;
+            var local: Accumulator = undefined;
+            const st = statePtr(table, accs, gid_of[cp], root.ai, agg_len, &local);
+            switch (st.*) {
+                .sum_f => |*s| s.* = part[cp],
+                .avg => |*a| {
+                    a.sum = part[cp];
+                    a.count += seen[cp];
+                },
+                else => return error.UnsupportedAggType,
+            }
+            if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], root.ai, agg_len, st.*);
+        }
+    }
+}
+
+fn floatFoldSkipped(table: *agg.GroupTable, ai: usize) bool {
+    return table.compact.stride != 0 and table.compact.fields[ai].shared_sum;
+}
+
+fn exprFloatValues(call: AggCall, col: Column, table: *agg.GroupTable, ai: usize) ?[]const f64 {
+    if (!floatSum(call) or call.where != null or floatFoldSkipped(table, ai)) return null;
+    if (col != .f64 or col.f64.has_nulls) return null;
+    return col.f64.values;
+}
+
+fn bareFloatValues(
+    ra: std.mem.Allocator,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    table: *agg.GroupTable,
+    ai: usize,
+) !?[]const f64 {
+    if (!floatSum(call) or call.where != null or floatFoldSkipped(table, ai)) return null;
+    const arg = call.arg orelse return null;
+    if (arg != .col_ref or arg.col_ref.expr_type != .f64) return null;
+    const pos = lookup[arg.col_ref.col_idx] orelse return null;
+    const col = batch.cols[pos];
+    if (col.nullInfo().max_rep > 0) return null;
+    const has_nulls = switch (col) {
+        inline else => |c| c.has_nulls,
+    };
+    if (has_nulls) return null;
+    const raw = try materialize(ra, col);
+    return try expr_eval.widenToF64(ra, raw);
+}
+
+/// Two or more bare float sums share one pass. Fewer than two leaves every call on its own path.
+fn fuseBareFloats(
+    ra: std.mem.Allocator,
+    table: *agg.GroupTable,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    fused: []bool,
+) !void {
+    if (calls.len < 2 or !try seedable(ra, gid_of)) return;
+    const roots = try ra.alloc(FloatRoot, calls.len);
+    var n: usize = 0;
+    for (calls, 0..) |call, ai| {
+        const values = (try bareFloatValues(ra, call, batch, lookup, table, ai)) orelse continue;
+        if (values.len != comp.len) continue;
+        roots[n] = .{ .ai = ai, .values = values };
+        n += 1;
+    }
+    if (n < 2) return;
+    try foldFloatPartials(ra, table.accumulators.items, gid_of, comp, space, calls.len, outer, table, roots[0..n]);
+    for (roots[0..n]) |root| fused[root.ai] = true;
+}
+
+fn foldGroupedValue(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    ai: usize,
+    agg_len: usize,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    maybe_table: anytype,
+    prepared: ?Column,
+) !void {
+    // Dense lanes pass literal null, specializing away record access on the established typed-array path.
+    const table: ?*agg.GroupTable = maybe_table;
+    if (table) |t| if (t.compact.stride != 0 and t.compact.fields[ai].shared_sum) return;
+    // Selection for this call: outer, narrowed by FILTER and the argument's nulls.
+    var own: ?Sel = null;
+    defer if (own) |*s| s.deinit();
+    if (call.where) |pred| {
+        own = try outer.cloneAlloc(ra);
+        try filter_eval.evaluate(pred, batch, &own.?, lookup, ra);
+    }
+    var arg_col: ?Column = null;
+    if (call.arg) |arg| if (arg == .col_ref) {
+        const pos = lookup[arg.col_ref.col_idx] orelse return error.BadColumn;
+        arg_col = batch.cols[pos];
+        if (arg_col.?.nullInfo().max_rep > 0) return error.UnsupportedAggType;
+        const has_nulls = switch (arg_col.?) {
+            inline else => |c| c.has_nulls,
+        };
+        if (has_nulls) {
+            if (own == null) own = try outer.cloneAlloc(ra);
+            agg.intersectPresentMask(&own.?, arg_col.?);
+        }
+    };
+    // A computed argument that may be NULL (`coalesce(a, b)`, `strlen(s)`) narrows the selection by its NULLs, as a
+    // bare column's do, so it is evaluated before any fold reads the selection: counted, a NULL was a row.
+    var computed: ?Column = prepared;
+    if (call.arg) |arg| if (arg != .col_ref and (prepared != null or arg.mayBeNull())) {
+        const restricted = batch.restrictedTo(if (own) |*s| s else outer);
+        const v = prepared orelse try expr_eval.evalExpr(ra, &restricted, lookup, arg);
+        if (switch (v) {
+            inline else => |c| c.has_nulls,
+        }) {
+            if (own == null) own = try outer.cloneAlloc(ra);
+            agg.intersectPresentMask(&own.?, v);
+        }
+        computed = v;
+    };
+    const sel: *const Sel = if (own) |*s| s else outer;
+
+    // count(*) / count(col): rows per composite.
+    if (call.func == .count) {
+        const cnt = try compositeCounts(ra, comp, space, sel);
+        for (cnt, 0..) |n, cp| if (n != 0) {
+            if (table) |t| if (t.compact.stride != 0) {
+                t.compact.addCount(gid_of[cp], ai, n);
+                continue;
+            };
+            accs[gid_of[cp] * agg_len + ai].count += n;
+        };
+        return;
+    }
+
+    const float_sum = floatSum(call);
+    // Ordinary histograms defer to pair sinks. Cache-admitted coded bits can retain exact sets beside an automatic
+    // sink; the final fold drains them if any chunk emits pairs, or keeps the normal union otherwise.
+    const to_pairs = call.func == .count_distinct and if (agg.distinct_pairs) |dp| dp.active else false;
+    const keep_coded_sets = to_pairs and agg.distinct_pairs.?.allow_coded_sets;
+    if (call.func == .count_distinct and (!to_pairs or keep_coded_sets) and
+        call.arg.? == .col_ref and arg_col.?.codes() != null)
+    {
+        const col = arg_col.?;
+        const card = col.dictLen();
+        const words = (card + 63) / 64;
+        const bytes = space *| words *| @sizeOf(u64);
+        if (bytes <= @min(MAX_HIST * 8, @import("../hw.zig").l2BytesPerWorkerOr(256 << 10))) {
+            const bits = try ra.alloc(u64, space * words);
+            @memset(bits, 0);
+            var bad = false;
+            forEachActive(sel, comp.len, struct {
+                fn row(c: anytype, r: usize) void {
+                    const code = c.codes[r];
+                    if (code >= c.card) {
+                        c.bad.* = true;
+                        return;
+                    }
+                    const word = &c.bits[@as(usize, c.comp[r]) * c.words + code / 64];
+                    word.* |= @as(u64, 1) << @as(u6, @truncate(code));
+                }
+            }.row, .{ .bits = bits, .comp = comp, .words = words, .codes = col.codes().?, .card = card, .bad = &bad });
+            if (bad) return error.BadColumn;
+            const dict = try widenDict(ra, col, call.arg.?.col_ref);
+            if (keep_coded_sets) agg.distinct_pairs.?.pending_sets = true;
+            for (0..space) |cp| {
+                for (bits[cp * words ..][0..words], 0..) |word, wi| {
+                    if (word == 0) continue;
+                    var local: Accumulator = undefined;
+                    const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+                    var pending = word;
+                    while (pending != 0) : (pending &= pending - 1)
+                        try st.distinct.insertColRow(gpa, dict, wi * 64 + @ctz(pending));
+                    if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
+                }
+            }
+            return;
+        }
+    }
+    if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
+        !float_sum and !to_pairs)
+    {
+        // (composite, code) histogram, then fold each entry once per group.
+        const col = arg_col.?;
+        const c = call.arg.?.col_ref;
+        const card = col.dictLen();
+        const codes = col.codes().?;
+        const h = try ra.alloc(u64, space * card);
+        @memset(h, 0);
+        forEachActive(sel, comp.len, struct {
+            fn f(ctx: anytype, r: usize) void {
+                ctx.h[@as(usize, ctx.comp[r]) * ctx.card + ctx.codes[r]] += 1;
+            }
+        }.f, .{ .h = h, .comp = comp, .card = card, .codes = codes });
+        const dict = try widenDict(ra, col, c);
+        for (0..space) |cp| {
+            const hist = h[cp * card ..][0..card];
+            var any = false;
+            for (hist) |x| if (x != 0) {
+                any = true;
+                break;
+            };
+            if (!any) continue;
+            var local: Accumulator = undefined;
+            const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+            try foldHist(gpa, st, call, dict, hist, c.unsigned_64);
+            if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
+        }
+        return;
+    }
+
+    // Values argument (flat column or computed expression): typed per-row fold into per-composite partials.
+    var vals_col: Column = undefined;
+    var unsigned_64 = false;
+    switch (call.arg.?) {
+        .col_ref => |c| {
+            const raw = try materialize(ra, arg_col.?);
+            unsigned_64 = c.unsigned_64;
+            vals_col = switch (c.expr_type) {
+                .i64 => .{ .i64 = .{ .values = try expr_eval.widenColRefToI64(ra, raw, c) } },
+                .f64 => .{ .f64 = .{ .values = try expr_eval.widenToF64(ra, raw) } },
+                .str => raw,
+                // Exact, at the decoder's width; INT32-backed widens to the i64 fold below.
+                .dec => switch (try expr_eval.exactColumn(raw)) {
+                    .i32 => |x| .{ .i64 = .{ .values = try expr_eval.widenToI64(ra, .{ .i32 = x }) } },
+                    else => |x| x,
+                },
+            };
+        },
+        else => |e| vals_col = computed orelse try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
+    }
+    // Strings and anything unusual: the row fold, with group ids expanded from composites.
+    const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
+        (!float_sum or try seedable(ra, gid_of));
+    if (!is_numeric_sum_like) {
+        const gids = try ra.alloc(u32, comp.len);
+        for (gids, comp) |*g, cp| g.* = gid_of[cp];
+        try agg.updateOneGroupedValues(ra, gpa, accs, gids, ai, agg_len, call, vals_col, sel, unsigned_64);
+        return;
+    }
+    const seen = try ra.alloc(u64, space);
+    @memset(seen, 0);
+    switch (vals_col) {
+        .f64 => |vc| {
+            if (call.func == .sum or call.func == .avg) {
+                const one = [_]FloatRoot{.{ .ai = ai, .values = vc.values }};
+                try foldFloatPartials(ra, accs, gid_of, comp, space, agg_len, sel, table, &one);
+                return;
+            }
+            const v = vc.values;
+            const is_min = call.func == .min;
+            const part = try ra.alloc(f64, space);
+            switch (call.func) {
+                // Each partial starts from its group's running sum and ends as it, so the rows add in the row fold's
+                // order (`agg.sumBlocksF64`'s grouped form): `seedable` saw one composite to a group.
+                .sum, .avg => for (part, gid_of) |*p, g| {
+                    p.* = if (g == unresolved) 0 else switch (accs[g * agg_len + ai]) {
+                        .sum_f => |t| t orelse 0,
+                        .avg => |a| a.sum,
+                        else => 0,
+                    };
+                },
+                // Each order's identity (`agg.minTotal`/`maxTotal`): NaN for min, -inf for max.
+                .min => @memset(part, std.math.nan(f64)),
+                .max => @memset(part, -std.math.inf(f64)),
+                .count, .count_distinct => unreachable,
+            }
+            switch (call.func) {
+                .sum, .avg => forEachActive(sel, comp.len, struct {
+                    fn f(ctx: anytype, r: usize) void {
+                        const cp = ctx.comp[r];
+                        ctx.seen[cp] += 1;
+                        ctx.part[cp] += ctx.v[r];
+                    }
+                }.f, .{ .comp = comp, .seen = seen, .part = part, .v = v }),
+                .min, .max => {
+                    var r: usize = 0;
+                    while (r < comp.len) : (r += 1) {
+                        if (!sel.isActive(r)) continue;
+                        const cp = comp[r];
+                        seen[cp] += 1;
+                        part[cp] = if (is_min) agg.minTotal(part[cp], v[r]) else agg.maxTotal(part[cp], v[r]);
+                    }
+                },
+                .count, .count_distinct => unreachable,
+            }
+            for (0..space) |cp| {
+                if (seen[cp] == 0) continue;
+                var local: Accumulator = undefined;
+                const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+                switch (st.*) {
+                    .sum_f => |*s| s.* = part[cp],
+                    .avg => |*a| {
+                        a.sum = part[cp];
+                        a.count += seen[cp];
+                    },
+                    .min_f => |*m| agg.foldExtremeF(true, m, part[cp]),
+                    .max_f => |*m| agg.foldExtremeF(false, m, part[cp]),
+                    else => return error.UnsupportedAggType,
+                }
+                if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
+            }
+        },
+        .i64 => |vc| {
+            const v = vc.values;
+            const part = try ra.alloc(i128, space);
+            switch (call.func) {
+                .sum, .avg => @memset(part, 0),
+                .min => @memset(part, std.math.maxInt(i128)),
+                .max => @memset(part, std.math.minInt(i128)),
+                .count, .count_distinct => unreachable,
+            }
+            var r: usize = 0;
+            while (r < comp.len) : (r += 1) {
+                if (!sel.isActive(r)) continue;
+                const cp = comp[r];
+                seen[cp] += 1;
+                const x: i128 = if (unsigned_64) @as(u64, @bitCast(v[r])) else v[r];
+                switch (call.func) {
+                    .sum => part[cp] += x,
+                    .avg => part[cp] += x,
+                    .min => part[cp] = @min(part[cp], x),
+                    .max => part[cp] = @max(part[cp], x),
+                    .count, .count_distinct => unreachable,
+                }
+            }
+            for (0..space) |cp| {
+                if (seen[cp] == 0) continue;
+                var local: Accumulator = undefined;
+                const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+                switch (st.*) {
+                    .sum_i => |*s| s.* = (s.* orelse 0) + part[cp] + @as(i128, call.offset) * seen[cp],
+                    .avg => |*a| {
+                        a.isum += part[cp];
+                        a.count += seen[cp];
+                    },
+                    .min_i => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],
+                    .max_i => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
+                    // An INT32/INT64-backed DECIMAL, folded as the integers it is stored as.
+                    .sum_d, .avg_d => |*d| d.add(part[cp], seen[cp]),
+                    .min_d => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],
+                    .max_d => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
+                    else => return error.UnsupportedAggType,
+                }
+                if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
+            }
+        },
+        // Exact DECIMAL: per-composite wide sums (as `agg.DecSum`), or extremes.
+        .i128 => |vc| {
+            const v = vc.values;
+            const sums = try ra.alloc(i192, space);
+            @memset(sums, 0);
+            const ext = try ra.alloc(i128, space);
+            switch (call.func) {
+                .sum, .avg => {},
+                .min => @memset(ext, std.math.maxInt(i128)),
+                .max => @memset(ext, std.math.minInt(i128)),
+                .count, .count_distinct => unreachable,
+            }
+            var r: usize = 0;
+            while (r < comp.len) : (r += 1) {
+                if (!sel.isActive(r)) continue;
+                const cp = comp[r];
+                seen[cp] += 1;
+                switch (call.func) {
+                    .sum, .avg => sums[cp] += v[r],
+                    .min => ext[cp] = @min(ext[cp], v[r]),
+                    .max => ext[cp] = @max(ext[cp], v[r]),
+                    .count, .count_distinct => unreachable,
+                }
+            }
+            for (0..space) |cp| {
+                if (seen[cp] == 0) continue;
+                var local: Accumulator = undefined;
+                const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
+                switch (st.*) {
+                    .sum_d => |*d| d.add(sums[cp], seen[cp]),
+                    .avg_d => |*d| d.add(sums[cp], seen[cp]),
+                    .min_d => |*m| m.* = if (m.*) |cur| @min(cur, ext[cp]) else ext[cp],
+                    .max_d => |*m| m.* = if (m.*) |cur| @max(cur, ext[cp]) else ext[cp],
+                    else => return error.UnsupportedAggType,
+                }
+                if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
+            }
+        },
+        else => unreachable,
+    }
+}
+
+inline fn statePtr(
+    table: ?*agg.GroupTable,
+    accs: []Accumulator,
+    g: usize,
+    i: usize,
+    n: usize,
+    local: *Accumulator,
+) *Accumulator {
+    if (table) |t| if (t.compact.stride != 0) {
+        local.* = t.readAcc(g, i, n);
+        return local;
+    };
+    return &accs[g * n + i];
+}
+
+pub const no_row = std.math.maxInt(u32);
+
+/// Each composite's first row `sel` keeps, or `no_row`. Stops once all `reachable` composites have one: later rows
+/// cannot be anyone's first.
+pub fn compositeFirstRows(
+    ra: std.mem.Allocator,
+    comp: []const u32,
+    space: usize,
+    reachable: usize,
+    sel: *const Sel,
+) ![]u32 {
+    const first = try ra.alloc(u32, space);
+    @memset(first, no_row);
+    var found: usize = 0;
+    var w: usize = 0;
+    while (w * 64 < comp.len and found < reachable) : (w += 1) {
+        const word = sel.mask[w];
+        const base = w * 64;
+        if (word == std.math.maxInt(u64) and base + 64 <= comp.len) {
+            for (base..base + 64) |r| {
+                const slot = &first[comp[r]];
+                if (slot.* == no_row) {
+                    slot.* = @intCast(r);
+                    found += 1;
+                }
+            }
+        } else {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const r = base + @ctz(bits);
+                const slot = &first[comp[r]];
+                if (slot.* == no_row) {
+                    slot.* = @intCast(r);
+                    found += 1;
+                }
+            }
+        }
+    }
+    return first;
+}
+
+/// `foldExactBatch`'s SUM and AVG roots evaluated in L2-sized windows of rows, sized as `foldFloatBatches` sizes its
+/// own, so each expression lane stays in cache rather than streaming a row group's worth through DRAM. Windows
+/// change which of two failing roots fails first, so any failure clears `partials` and leaves every root to the
+/// whole-batch fold, which reports the error it always did; nothing reaches the table before that.
+fn foldExactWindows(
+    ra: std.mem.Allocator,
+    plan: *expr_eval.ExactPlan,
+    calls: []const AggCall,
+    roots: []const ?usize,
+    partials: []?[]agg.DecSum,
+    space: usize,
+    comp: []const u32,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+) void {
+    // Any other call folds values of its own between the roots' evaluations.
+    for (calls) |call| if (call.arg != null and call.func != .sum and call.func != .avg) return;
+    var distinct: usize = 0;
+    for (roots, 0..) |root, i| if (root) |r| {
+        distinct += @intFromBool(std.mem.indexOfScalar(?usize, roots[0..i], r) == null);
+    };
+    const fixed = (plan.nodes.items.len + batch.cols.len) * @sizeOf(Column) +
+        (distinct + 1) *| space *| NarrowAcc.bytesPerComposite(space, batch.num_rows);
+    const rows = expr_eval.floatBatchRows(exactLiveBytesPerRow(plan), fixed, batch.expr_batch_rows);
+    if (rows == 0 or rows >= batch.num_rows) return;
+    // The finished sums, taken before anything speculative so the windows' own storage stays the newest in `ra`
+    // and goes with them: a failed pass leaves the whole-batch fold no more than this block.
+    const out = ra.alloc(agg.DecSum, distinct *| space) catch return;
+    var speculative = std.heap.ArenaAllocator.init(ra);
+    defer speculative.deinit();
+    // The cached values belong to the windows' scratch.
+    defer for (plan.nodes.items) |*node| {
+        node.value = null;
+    };
+    windowedSums(speculative.allocator(), out, plan, roots, partials, space, comp, batch, lookup, outer, rows) catch
+        @memset(partials, null);
+}
+
+/// Fills `partials` for every root from `sums`, a `DecSum` per composite per distinct root, only once every window has
+/// folded and with nothing left to fail; everything else lives in `sa`.
+fn windowedSums(
+    sa: std.mem.Allocator,
+    sums: []agg.DecSum,
+    plan: *expr_eval.ExactPlan,
+    roots: []const ?usize,
+    partials: []?[]agg.DecSum,
+    space: usize,
+    comp: []const u32,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    rows: usize,
+) !void {
+    const accs = try sa.alloc(?NarrowAcc, plan.nodes.items.len);
+    @memset(accs, null);
+    for (roots) |root| if (root) |r| if (accs[r] == null) {
+        accs[r] = try NarrowAcc.init(sa, space, batch.num_rows);
+    };
+    const cols = try sa.alloc(Column, batch.cols.len);
+    var scratch = @import("../row_group_arena.zig").RowGroupArena.init(sa);
+    defer scratch.deinit();
+    var off: usize = 0;
+    while (off < batch.num_rows) {
+        scratch.nextRowGroup();
+        const a = scratch.allocator();
+        const n = @min(rows, batch.num_rows - off);
+        for (batch.cols, cols) |col, *out| out.* = try col.sliceRows(off, n);
+        const sel = try outer.alignedWindow(off, n);
+        const win: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .sel = &sel };
+        for (plan.nodes.items) |*node| node.value = null;
+        for (accs, 0..) |*acc, r| if (acc.*) |*ac| {
+            try ac.fold(comp[off..][0..n], try plan.evaluate(a, &win, lookup, r), &sel);
+        };
+        off += n;
+    }
+    var present: ?[]u64 = null;
+    for (accs) |*acc| if (acc.*) |*ac| try ac.finish(sa, &present, comp, outer);
+    var next: usize = 0;
+    for (accs, partials) |acc, *p| if (acc) |ac| {
+        const dst = sums[next..][0..space];
+        @memcpy(dst, ac.delta);
+        p.* = dst;
+        next += space;
+    };
+}
+
+/// An exact plan's bytes in flight per row: the composite and selection, then each node's lane and levels, at i128
+/// for an expression whose product may not fit 64 bits.
+fn exactLiveBytesPerRow(plan: *const expr_eval.ExactPlan) usize {
+    var bytes: usize = 8;
+    for (plan.nodes.items) |node| bytes += switch (node.expr) {
+        .literal => 8,
+        .col_ref => 12,
+        else => 20,
+    };
+    return bytes;
+}
+
+/// Interleaved partials per composite in `NarrowAcc`: a run of rows in one composite adds into as many independent
+/// slots, so no add waits on the store of the one before it.
+const sum_lanes = 4;
+
+/// One exact root's sums per composite across a batch's windows, widened into `delta` once by `finish`. A 64-bit (or
+/// narrower) lane sums in i128: fewer than 2^64 values of magnitude at most 2^63 cannot leave it, so there is no
+/// bound to prove, and the 192-bit add runs once per composite rather than per row. Inactive and null rows add zero
+/// rather than branch. An i128 lane, which a checked 64-bit product falls back to, folds row by row as before.
+const NarrowAcc = struct {
+    /// Zeroed `DecSum` per composite.
+    delta: []agg.DecSum,
+    /// `sum_lanes` partial sums per composite, or empty when `delta` takes the sums itself.
+    part: []i128,
+    /// Beside `part`: selected rows per slot the partials did not take, null rows and every row of an i128 window.
+    skipped: []u64,
+    /// Without `part`: whether `delta` holds whole `DecSum`s yet. Until then `lo` carries an i128 sum.
+    widened: bool = false,
+
+    /// Bytes `init` takes per composite: the `DecSum`, then each slot's partial and skipped count.
+    fn bytesPerComposite(space: usize, rows: usize) usize {
+        const slots: usize = if (interleaved(space, rows)) sum_lanes * (@sizeOf(i128) + @sizeOf(u64)) else 0;
+        return @sizeOf(agg.DecSum) + slots;
+    }
+
+    fn interleaved(space: usize, rows: usize) bool {
+        return space <= MAX_COMPOSITE and space * sum_lanes <= rows;
+    }
+
+    /// Interleaved slots only within the free composite spaces, where their scratch stays within row-sized buffers;
+    /// otherwise no scratch past `delta`, so a budgeted space stays within its reservation.
+    fn init(ra: std.mem.Allocator, space: usize, rows: usize) !NarrowAcc {
+        const delta = try ra.alloc(agg.DecSum, space);
+        @memset(delta, .{});
+        if (!interleaved(space, rows)) {
+            return .{ .delta = delta, .part = &.{}, .skipped = &.{} };
+        }
+        const part = try ra.alloc(i128, space * sum_lanes);
+        @memset(part, 0);
+        const skipped = try ra.alloc(u64, space * sum_lanes);
+        @memset(skipped, 0);
+        return .{ .delta = delta, .part = part, .skipped = skipped };
+    }
+
+    fn fold(self: *NarrowAcc, comp: []const u32, v: Column, sel: *const Sel) !void {
+        switch (v) {
+            inline .i32, .i64 => |col| {
+                const V = std.meta.Elem(@TypeOf(col.values));
+                const ctx = .{ .acc = self, .comp = comp, .col = col };
+                if (self.part.len != 0) forEachWordRow(sel, comp.len, struct {
+                    fn f(c: anytype, word: u64, r: usize) void {
+                        const active: u1 = @truncate(word >> @intCast(r % 64));
+                        var keep = active;
+                        if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+                        const slot = @as(usize, c.comp[r]) * sum_lanes + r % sum_lanes;
+                        c.acc.part[slot] += c.col.values[r] & -%@as(V, keep);
+                        if (c.col.def_levels != null) c.acc.skipped[slot] += active & ~keep;
+                    }
+                }.f, ctx) else if (!self.widened) forEachWordRow(sel, comp.len, struct {
+                    fn f(c: anytype, word: u64, r: usize) void {
+                        var keep: u1 = @truncate(word >> @intCast(r % 64));
+                        if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+                        const d = &c.acc.delta[c.comp[r]];
+                        d.lo +%= @bitCast(@as(i128, c.col.values[r] & -%@as(V, keep)));
+                        d.n += keep;
+                    }
+                }.f, ctx) else foldWide(self, comp, col, sel);
+            },
+            .i128 => |col| {
+                if (self.part.len == 0 and !self.widened) self.widen();
+                foldWide(self, comp, col, sel);
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    fn foldWide(self: *NarrowAcc, comp: []const u32, col: anytype, sel: *const Sel) void {
+        forEachWordRow(sel, comp.len, struct {
+            fn f(c: anytype, word: u64, r: usize) void {
+                const active: u1 = @truncate(word >> @intCast(r % 64));
+                var keep = active;
+                if (c.col.def_levels) |dl| keep &= @intFromBool(dl[r] >= c.col.max_def);
+                if (keep == 1) c.acc.delta[c.comp[r]].add(c.col.values[r], 1);
+                if (c.acc.part.len != 0) c.acc.skipped[@as(usize, c.comp[r]) * sum_lanes + r % sum_lanes] += active;
+            }
+        }.f, .{ .acc = self, .comp = comp, .col = col });
+    }
+
+    /// The i128 sums in `lo` as whole `DecSum`s.
+    fn widen(self: *NarrowAcc) void {
+        for (self.delta) |*d| d.hi = if (@as(i128, @bitCast(d.lo)) < 0) -1 else 0;
+        self.widened = true;
+    }
+
+    /// `present`: every composite's selected rows over the whole batch, counted once for every root with slots.
+    fn finish(self: *NarrowAcc, ra: std.mem.Allocator, present: *?[]u64, comp: []const u32, sel: *const Sel) !void {
+        if (self.part.len == 0) {
+            if (!self.widened) self.widen();
+            return;
+        }
+        const counts = present.* orelse counts: {
+            const c = try activeCounts(ra, comp, self.delta.len, sel);
+            present.* = c;
+            break :counts c;
+        };
+        for (self.delta, counts, 0..) |*d, active, cp| {
+            var sum: i128 = 0;
+            var skip: u64 = 0;
+            for (self.part[cp * sum_lanes ..][0..sum_lanes], self.skipped[cp * sum_lanes ..][0..sum_lanes]) |p, k| {
+                sum += p;
+                skip += k;
+            }
+            d.add(sum, active - skip);
+        }
+    }
+};
+
+/// Selected rows per composite, in `sum_lanes` interleaved slots like `NarrowAcc`'s.
+fn activeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u64 {
+    const slots = try ra.alloc(u64, space * sum_lanes);
+    @memset(slots, 0);
+    forEachWordRow(sel, comp.len, struct {
+        fn f(c: anytype, word: u64, r: usize) void {
+            c.slots[@as(usize, c.comp[r]) * sum_lanes + r % sum_lanes] += @as(u1, @truncate(word >> @intCast(r % 64)));
+        }
+    }.f, .{ .slots = slots, .comp = comp });
+    const counts = try ra.alloc(u64, space);
+    for (counts, 0..) |*c, cp| {
+        c.* = 0;
+        for (slots[cp * sum_lanes ..][0..sum_lanes]) |k| c.* += k;
+    }
+    return counts;
+}
+
+/// Calls `f(ctx, word, r)` for every row `r < n` of a word of `sel` with any row active, `word` holding `r`'s bit.
+inline fn forEachWordRow(sel: *const Sel, n: usize, comptime f: anytype, ctx: anytype) void {
+    std.debug.assert(sel.mask.len * 64 >= n);
+    for (sel.mask, 0..) |word, w| {
+        if (word == 0) continue;
+        const base = w * 64;
+        if (base >= n) break;
+        for (base..@min(base + 64, n)) |r| f(ctx, word, r);
+    }
+}
+
+fn compositeCounts(ra: std.mem.Allocator, comp: []const u32, space: usize, sel: *const Sel) ![]u64 {
+    const cnt = try ra.alloc(u64, space);
+    @memset(cnt, 0);
+    forEachActive(sel, comp.len, struct {
+        fn f(ctx: anytype, r: usize) void {
+            ctx.cnt[ctx.comp[r]] += 1;
+        }
+    }.f, .{ .cnt = cnt, .comp = comp });
+    return cnt;
+}
+
+pub inline fn forEachActive(sel: *const Sel, n: usize, comptime f: anytype, ctx: anytype) void {
+    var w: usize = 0;
+    while (w * 64 < n) : (w += 1) {
+        const word = sel.mask[w];
+        if (word == 0) continue;
+        const base = w * 64;
+        if (word == std.math.maxInt(u64) and base + 64 <= n) {
+            for (base..base + 64) |r| f(ctx, r);
+        } else {
+            var bits = word;
+            while (bits != 0) {
+                const i: usize = @ctz(bits);
+                f(ctx, base + i);
+                bits &= bits - 1;
+            }
+        }
+    }
+}
+
+/// The rows `sel` keeps of a flat column, `active` of them, as a column of their own: values (looked up in the
+/// dictionary for a coded column) and levels compacted. Nested columns are not gathered.
+pub fn gatherSelected(ra: std.mem.Allocator, col: Column, sel: *const Sel, active: usize) !Column {
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            if (c.max_rep > 0) return error.UnsupportedAggType;
+            const T = @TypeOf(c.dict[0]);
+            const vals = try ra.alloc(T, active);
+            const dl: ?[]u32 = if (c.def_levels != null) try ra.alloc(u32, active) else null;
+            const Ctx = struct { c: @TypeOf(c), vals: []T, dl: ?[]u32, j: usize = 0 };
+            var ctx: Ctx = .{ .c = c, .vals = vals, .dl = dl };
+            forEachActive(sel, sel.len, struct {
+                fn f(x: *Ctx, r: usize) void {
+                    const present = if (x.c.def_levels) |d| d[r] == x.c.max_def else true;
+                    x.vals[x.j] = if (x.c.codes) |k|
+                        (if (present) x.c.dict[k[r]] else std.mem.zeroes(T))
+                    else
+                        x.c.values[r];
+                    if (x.dl) |d| d[x.j] = x.c.def_levels.?[r];
+                    x.j += 1;
+                }
+            }.f, &ctx);
+            std.debug.assert(ctx.j == active);
+            // A decimal's exact values move with its rows (see `ColumnT.unscaled`), looked up like `values` when coded.
+            const exact = if (c.codes != null) c.dict_unscaled else c.unscaled;
+            const unscaled: ?filter_eval.Exact = if (exact) |u| switch (u) {
+                // At the lane's own width, like `values` above.
+                inline else => |uv, utag| blk2: {
+                    const U = @TypeOf(uv[0]);
+                    const out = try ra.alloc(U, active);
+                    var j: usize = 0;
+                    forEachActive(sel, sel.len, struct {
+                        fn f(x: anytype, r: usize) void {
+                            const present = if (x.c.def_levels) |d| d[r] == x.c.max_def else true;
+                            x.out[x.j.*] = if (x.c.codes) |k| (if (present) x.u[k[r]] else 0) else x.u[r];
+                            x.j.* += 1;
+                        }
+                    }.f, .{ .out = out, .u = uv, .j = &j, .c = c });
+                    break :blk2 @unionInit(filter_eval.Exact, @tagName(utag), out);
+                },
+            } else null;
+            break :blk @unionInit(Column, @tagName(tag), .{
+                .values = vals,
+                .def_levels = dl,
+                .max_def = c.max_def,
+                .has_nulls = c.has_nulls,
+                .unscaled = unscaled,
+            });
+        },
+    };
+}
+
+/// Values for a column that may hold only codes: gathered from the dictionary when they were never materialized.
+pub fn materialize(ra: std.mem.Allocator, col: Column) !Column {
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            if (!c.codesOnly()) break :blk col;
+            const T = @TypeOf(c.dict[0]);
+            const codes = c.codes.?;
+            const vals = try ra.alloc(T, codes.len);
+            const d = c.dict;
+            if (d.len == 0) {
+                @memset(vals, std.mem.zeroes(T));
+            } else for (vals, codes) |*v, k| {
+                v.* = d[k];
+            }
+            if (c.def_levels) |dl| for (vals, dl) |*v, dv| {
+                if (dv < c.max_def) v.* = std.mem.zeroes(T);
+            };
+            var out = c;
+            out.values = vals;
+            if (c.dict_unscaled) |du| {
+                const u = try ra.alloc(i128, codes.len);
+                if (d.len == 0) {
+                    @memset(u, 0);
+                } else for (u, codes) |*o, k| {
+                    o.* = du.at(k);
+                }
+                if (c.def_levels) |dl| for (u, dl) |*o, dv| {
+                    if (dv < c.max_def) o.* = 0;
+                };
+                out.unscaled = .{ .i128 = u };
+            }
+            break :blk @unionInit(Column, @tagName(tag), out);
+        },
+    };
+}
+
+test "aggregates over a coded column match the row folds over its values, histogram form included" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // 300 rows over a 5-entry dictionary with nulls; the selection drops every third row.
+    const dict = [_]i64{ -7, 0, 3, 1_000_000_007, -2 };
+    const n = 300;
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var vals: [n]i64 = undefined;
+    for (0..n) |i| {
+        defs[i] = @intFromBool(i % 11 != 4);
+        codes[i] = if (defs[i] == 1) @intCast((i * 7 + i / 13) % dict.len) else 0;
+        vals[i] = if (defs[i] == 1) dict[codes[i]] else 0;
+    }
+    var sel = try Sel.init(a, n);
+    for (0..n) |i| if (i % 3 == 0) sel.set(i, false);
+    var all = try Sel.init(a, n);
+    _ = &all;
+
+    const coded: Column = .{ .i64 = .{
+        .values = &.{},
+        .codes = &codes,
+        .dict = &dict,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    var hist: [dict.len]u64 = @splat(0);
+    var present: usize = 0;
+    for (codes, defs) |k, d| if (d == 1) {
+        hist[k] += 1;
+        present += 1;
+    };
+    const histogram_col: Column = .{ .i64 = .{
+        .values = &.{},
+        .dict = &dict,
+        .hist = &hist,
+        .levels_only_rows = n,
+        .has_nulls = present != n,
+    } };
+    const plain: Column = .{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
+    const lookup = [_]?usize{0};
+    const ref: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+
+    const Case = struct { func: agg.AggFunc, result: agg.ResultShape };
+    for ([_]Case{
+        .{ .func = .sum, .result = .i64 },
+        .{ .func = .min, .result = .i64 },
+        .{ .func = .max, .result = .i64 },
+        .{ .func = .count, .result = .i64 },
+        .{ .func = .avg, .result = .avg_f64 },
+    }) |c| {
+        const call: AggCall = .{ .func = c.func, .arg = ref, .where = null, .alias = "a", .result = c.result };
+        for ([_]*const Sel{ &sel, &all }) |s| {
+            var want = Accumulator.init(call);
+            const plain_cols = [_]Column{plain};
+            try agg.updateOne(a, a, &want, call, &.{ .cols = &plain_cols, .num_rows = n }, &lookup, s);
+            var got = Accumulator.init(call);
+            const coded_cols = [_]Column{coded};
+            try agg.updateOne(a, a, &got, call, &.{ .cols = &coded_cols, .num_rows = n }, &lookup, s);
+            try testing.expectEqualDeep(want, got);
+        }
+        // The histogram form stands for an unfiltered scan: every row selected.
+        var want = Accumulator.init(call);
+        const plain_cols = [_]Column{plain};
+        try agg.updateOne(a, a, &want, call, &.{ .cols = &plain_cols, .num_rows = n }, &lookup, &all);
+        var got = Accumulator.init(call);
+        const hist_cols = [_]Column{histogram_col};
+        try agg.updateOne(a, a, &got, call, &.{ .cols = &hist_cols, .num_rows = n }, &lookup, &all);
+        try testing.expectEqualDeep(want, got);
+    }
+}
+
+test "regression: aggregates over a coded column that no row reaches stay NULL, as the row folds leave them" {
+    const testing = std.testing;
+    const filter_ast = @import("../filter/ast.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // 4096 rows over 8 entries, every fifth null. Selections: none, only null rows, and some present rows.
+    const n = 4096;
+    const fdict = [_]f64{ 0.5, -1.25, 3, 8, 1e10, -0.0, 7.5, 2 };
+    const idict = [_]i64{ 5, -9, 3, 8, 100, 0, 7, 2 };
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var fvals: [n]f64 = undefined;
+    var ivals: [n]i64 = undefined;
+    for (0..n) |i| {
+        defs[i] = @intFromBool(i % 5 != 2);
+        codes[i] = if (defs[i] == 1) @intCast((i * 3 + i / 7) % fdict.len) else 0;
+        fvals[i] = if (defs[i] == 1) fdict[codes[i]] else 0;
+        ivals[i] = if (defs[i] == 1) idict[codes[i]] else 0;
+    }
+    var none = try Sel.init(a, n);
+    @memset(none.mask, 0);
+    var nulls = try Sel.init(a, n);
+    for (0..n) |i| nulls.set(i, defs[i] == 0);
+    var some = try Sel.init(a, n);
+    for (0..n) |i| some.set(i, i % 3 == 0);
+    const lookup = [_]?usize{0};
+
+    const Lane = struct { coded: Column, plain: Column, ref: expr_ast.Expr, scalar: agg.ResultShape, never: filter_ast.Filter };
+    const lanes = [_]Lane{
+        .{
+            .coded = .{ .f64 = .{ .values = &.{}, .codes = &codes, .dict = &fdict, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .plain = .{ .f64 = .{ .values = &fvals, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .ref = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } },
+            .scalar = .f64,
+            .never = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = -1e300 } },
+        },
+        .{
+            .coded = .{ .i64 = .{ .values = &.{}, .codes = &codes, .dict = &idict, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .plain = .{ .i64 = .{ .values = &ivals, .def_levels = &defs, .max_def = 1, .has_nulls = true } },
+            .ref = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+            .scalar = .i64,
+            .never = .{ .int64 = .{ .col_idx = 0, .op = .Lt, .value = -1_000_000 } },
+        },
+    };
+    for (lanes) |lane| {
+        for ([_]agg.AggFunc{ .sum, .min, .max, .avg, .count }) |func| {
+            const result: agg.ResultShape = switch (func) {
+                .avg => .avg_f64,
+                .count => .i64,
+                else => lane.scalar,
+            };
+            // Plain, and through a FILTER no row passes.
+            for ([_]?filter_ast.Filter{ null, lane.never }) |where| {
+                const call: AggCall = .{ .func = func, .arg = lane.ref, .where = where, .alias = "a", .result = result };
+                for ([_]*const Sel{ &none, &nulls, &some }) |s| {
+                    var want = Accumulator.init(call);
+                    try agg.updateOne(a, a, &want, call, &.{ .cols = &.{lane.plain}, .num_rows = n }, &lookup, s);
+                    var got = Accumulator.init(call);
+                    try agg.updateOne(a, a, &got, call, &.{ .cols = &.{lane.coded}, .num_rows = n }, &lookup, s);
+                    try testing.expectEqualDeep(want, got);
+                }
+            }
+        }
+        // The fuzz repro's shape: a float sum no row reaches is NULL.
+        const call: AggCall = .{ .func = .sum, .arg = lane.ref, .where = null, .alias = "a", .result = lane.scalar };
+        var got = Accumulator.init(call);
+        try agg.updateOne(a, a, &got, call, &.{ .cols = &.{lane.coded}, .num_rows = n }, &lookup, &none);
+        switch (got) {
+            .sum_f => |s| try testing.expectEqual(@as(?f64, null), s),
+            .sum_i => |s| try testing.expectEqual(@as(?i128, null), s),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "gatherSelected keeps the selected rows of a coded or plain column, in order, with their levels" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dict = [_]f64{ 1.5, -2.0, 8.25 };
+    const n = 130;
+    var codes: [n]u32 = undefined;
+    var defs: [n]u32 = undefined;
+    var vals: [n]f64 = undefined;
+    var sel = try Sel.init(a, n);
+    var want: std.ArrayList(f64) = .empty;
+    var want_defs: std.ArrayList(u32) = .empty;
+    for (0..n) |i| {
+        defs[i] = @intFromBool(i % 5 != 2);
+        codes[i] = if (defs[i] == 1) @intCast(i % 3) else 0;
+        vals[i] = if (defs[i] == 1) dict[codes[i]] else 0;
+        const keep = i % 7 == 0 or i == n - 1;
+        sel.set(i, keep);
+        if (keep) {
+            try want.append(a, vals[i]);
+            try want_defs.append(a, defs[i]);
+        }
+    }
+    const active = sel.count();
+    for ([_]Column{
+        .{ .f64 = .{ .values = &.{}, .codes = &codes, .dict = &dict, .def_levels = &defs, .max_def = 1 } },
+        .{ .f64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1 } },
+    }) |col| {
+        const got = try gatherSelected(a, col, &sel, active);
+        try testing.expectEqualSlices(f64, want.items, got.f64.values);
+        try testing.expectEqualSlices(u32, want_defs.items, got.f64.def_levels.?);
+    }
+}
+
+test "regression: grouped coded keys do not invent infinities for all-NaN values" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dict = [_][]const u8{"key"};
+    const codes: [256]u32 = @splat(0);
+    const vals: [256]f64 = @splat(std.math.nan(f64));
+    const cols = [_]Column{
+        .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } },
+        .{ .f64 = .{ .values = &vals } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .min, .arg = arg, .result = .f64, .where = null, .alias = "lo" },
+        .{ .func = .max, .arg = arg, .result = .f64, .where = null, .alias = "hi" },
+    };
+    var table = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer table.deinit();
+    var sel = try Sel.init(a, vals.len);
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vals.len };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null));
+    try testing.expect(std.math.isNan(table.accumulators.items[0].min_f.?));
+    try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
+}
+
+test "regression: grouped float min/max over coded keys and coded values order NaN above every number" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const keys = [_][]const u8{"key"};
+    const key_codes: [256]u32 = @splat(0);
+    // The values are themselves coded: row 0 holds NaN, every later row 1.0. Min skips the NaN; max is NaN.
+    const vdict = [_]f64{ std.math.nan(f64), 1.0 };
+    var vcodes: [256]u32 = @splat(1);
+    vcodes[0] = 0;
+    const cols = [_]Column{
+        .{ .string = .{ .values = &.{}, .codes = &key_codes, .dict = &keys } },
+        .{ .f64 = .{ .values = &.{}, .codes = &vcodes, .dict = &vdict } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .min, .arg = arg, .result = .f64, .where = null, .alias = "lo" },
+        .{ .func = .max, .arg = arg, .result = .f64, .where = null, .alias = "hi" },
+    };
+    var table = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer table.deinit();
+    var sel = try Sel.init(a, vcodes.len);
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = vcodes.len };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, null, null));
+    try testing.expectEqual(@as(f64, 1.0), table.accumulators.items[0].min_f.?);
+    try testing.expect(std.math.isNan(table.accumulators.items[1].max_f.?));
+}
+
+test "codePlainKeys: codes map back to the values, nulls aside, and a key with too many values stays plain" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const vals = [_][]const u8{ "R", "", "A", "R", "N", "A", "long value past a few bytes", "A" };
+    const defs = [_]u32{ 1, 0, 1, 1, 1, 1, 1, 1 }; // row 1 is null
+    var cols = [_]Column{.{ .string = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } }};
+    const lookup = [_]?usize{0};
+    try codePlainKeys(a, &keys, &cols, &lookup);
+    const sc = cols[0].string;
+    for (vals, defs, sc.codes.?) |v, d, c| {
+        if (d == 0) continue;
+        try std.testing.expectEqualStrings(v, sc.dict[c]);
+    }
+    try std.testing.expectEqual(@as(usize, 4), sc.dict.len);
+
+    // max_coded_plain + 1 distinct values: left plain.
+    const many = try a.alloc([]const u8, max_coded_plain + 1);
+    for (many, 0..) |*m, i| m.* = try std.fmt.allocPrint(a, "v{d}", .{i});
+    var wide = [_]Column{.{ .string = .{ .values = many } }};
+    try codePlainKeys(a, &keys, &wide, &lookup);
+    try std.testing.expect(wide[0].string.codes == null);
+}
+
+test "codePlainKeys: a narrow integer key is coded by its offset from the least value, nulls aside" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const keys = [_]expr_ast.Expr{.{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } }};
+    const lookup = [_]?usize{0};
+    const vals = [_]i64{ -3, 7, 99, -3, 12, 7 };
+    const defs = [_]u32{ 1, 1, 0, 1, 1, 1 }; // row 2 (99) is null and must not widen the range
+    var cols = [_]Column{.{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    try codePlainKeys(a, &keys, &cols, &lookup);
+    const ic = cols[0].i64;
+    try std.testing.expectEqual(@as(usize, 16), ic.dict.len); // -3 ..= 12
+    for (vals, defs, ic.codes.?) |v, d, c| if (d == 1) try std.testing.expectEqual(v, ic.dict[c]);
+
+    const wide_vals = [_]i64{ 0, max_int_range };
+    var wide = [_]Column{.{ .i64 = .{ .values = &wide_vals } }};
+    try codePlainKeys(a, &keys, &wide, &lookup);
+    try std.testing.expect(wide[0].i64.codes == null);
+}
+
+test "a composite space past 2^16 groups by code only when its scratch is reserved, float sums in row order" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n_keys = 70_000;
+    const n_rows = 2 * n_keys;
+    const dict = try a.alloc(i64, n_keys);
+    for (dict, 0..) |*d, i| d.* = @intCast(i * 3);
+    const codes = try a.alloc(u32, n_rows);
+    const vals = try a.alloc(f64, n_rows);
+    for (codes, vals, 0..) |*c, *v, i| {
+        c.* = @intCast(i % n_keys);
+        v.* = 0.1 * @as(f64, @floatFromInt(i)) + 1e-9;
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = &.{}, .codes = codes, .dict = dict } },
+        .{ .f64 = .{ .values = vals } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .sum, .arg = arg, .result = .f64, .where = null, .alias = "s" },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n_rows };
+    var sel = try Sel.init(a, n_rows);
+
+    // Refused (no budget, or one too small): nothing is grouped, so the row path can run in its place.
+    for ([_]?usize{ null, 1024 }) |limit| {
+        var table = agg.GroupTable.init(testing.allocator, 1 << 28);
+        defer table.deinit();
+        var budget: DecodeBudget = .{ .limit = limit orelse 0 };
+        try testing.expect(!try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, if (limit != null) &budget else null, null));
+        try testing.expectEqual(@as(usize, 0), table.groupCount());
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+
+    var table = agg.GroupTable.init(testing.allocator, 1 << 28);
+    defer table.deinit();
+    var budget: DecodeBudget = .{ .limit = 1 << 30 };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, &table, 0, &batch, &lookup, &sel, &budget, null));
+    // Released once grouped.
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    try testing.expectEqual(@as(usize, n_keys), table.groupCount());
+    for ([_]usize{ 0, 1, 12_345, n_keys - 1 }) |g| {
+        const accs = table.accumulators.items[g * calls.len ..][0..calls.len];
+        try testing.expectEqual(@as(u64, 2), accs[0].count);
+        // Exactly the two values added in row order, as the row path adds them.
+        try testing.expectEqual(vals[g] + vals[g + n_keys], accs[1].sum_f.?);
+    }
+}
+
+test "compositeFirstRows matches a full scan, stopping early only once every reachable composite is found" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x7f1a);
+    const r = prng.random();
+    for ([_]usize{ 1, 63, 64, 65, 300, 4096 }) |n| for ([_]u32{ 1, 3, 17 }) |space| {
+        const comp = try a.alloc(u32, n);
+        for (comp) |*c| c.* = r.uintLessThan(u32, space);
+        var sel = try Sel.init(a, n);
+        // Whole words kept and dropped, and words kept in part.
+        for (0..n) |i| if ((i / 64) % 3 == 1 or (i % 7 == 0 and (i / 64) % 3 == 2)) sel.set(i, false);
+        const want = try a.alloc(u32, space);
+        @memset(want, no_row);
+        var present: usize = 0;
+        for (comp, 0..) |c, i| if (sel.isActive(i) and want[c] == no_row) {
+            want[c] = @intCast(i);
+            present += 1;
+        };
+        // Exactly the composites present (early stop), all of them (some absent: no stop), and the whole space.
+        for ([_]usize{ present, space, space + 1 }) |reachable| {
+            if (reachable < present) continue;
+            try testing.expectEqualSlices(u32, want, try compositeFirstRows(a, comp, space, reachable, &sel));
+        }
+    };
+}
+
+test "groupedCoded: a lone null-free key groups as when a constant second key is composed with it" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 1000;
+    const dict = [_]i64{ 40, 10, 30, 20 };
+    const one = [_]i64{7};
+    const codes = try a.alloc(u32, n);
+    const zeros = try a.alloc(u32, n);
+    @memset(zeros, 0);
+    const vals = try a.alloc(i64, n);
+    for (codes, vals, 0..) |*c, *v, i| {
+        // Code 3 first appears late, so the early stop must still reach it; code 2 never does.
+        c.* = if (i == 777) 3 else @intCast((i * 7 / 5) % 2);
+        v.* = @intCast(i);
+    }
+    const cols = [_]Column{
+        .{ .i64 = .{ .values = &.{}, .codes = codes, .dict = &dict } },
+        .{ .i64 = .{ .values = &.{}, .codes = zeros, .dict = &one } },
+        .{ .i64 = .{ .values = vals } },
+    };
+    const lookup = [_]?usize{ 0, 1, 2 };
+    const k0: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const k1: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "s" },
+    };
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    var sel = try Sel.init(a, n);
+    for (0..n) |i| if (i % 5 == 0) sel.set(i, false);
+
+    var lone = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer lone.deinit();
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{k0}, &lone, 0, &batch, &lookup, &sel, null, null));
+    var pair = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer pair.deinit();
+    const both = [_]expr_ast.Expr{ k0, k1 };
+    try testing.expect(try groupedCoded(a, testing.allocator, &calls, &both, &pair, 0, &batch, &lookup, &sel, null, null));
+
+    try testing.expectEqual(@as(usize, 3), lone.groupCount());
+    try testing.expectEqual(lone.groupCount(), pair.groupCount());
+    try testing.expectEqualSlices(u64, pair.first.items, lone.first.items);
+    for (0..lone.groupCount()) |g| {
+        const x = lone.accumulators.items[g * calls.len ..][0..calls.len];
+        const y = pair.accumulators.items[g * calls.len ..][0..calls.len];
+        try testing.expectEqual(y[0].count, x[0].count);
+        try testing.expectEqual(y[1].sum_i, x[1].sum_i);
+    }
+}
+
+test "groupedCoded over a key histogram with first rows makes the groups, positions and counts its codes make" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 500;
+    const dict = [_][]const u8{ "d", "a", "c", "b", "never" };
+    const codes = try a.alloc(u32, n);
+    for (codes, 0..) |*c, i| c.* = if (i == 431) 0 else @intCast(1 + (i * 7 / 3) % 3);
+    var hist: [5]u64 = @splat(0);
+    var first: [5]u32 = @splat(std.math.maxInt(u32));
+    for (codes, 0..) |c, i| {
+        hist[c] += 1;
+        if (first[c] == std.math.maxInt(u32)) first[c] = @intCast(i);
+    }
+    const coded = [_]Column{.{ .string = .{ .values = &.{}, .codes = codes, .dict = &dict } }};
+    const histed = [_]Column{.{ .string = .{
+        .values = &.{},
+        .dict = &dict,
+        .hist = &hist,
+        .hist_first = &first,
+        .levels_only_rows = n,
+    } }};
+    const lookup = [_]?usize{0};
+    const key: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .count, .arg = key, .result = .i64, .where = null, .alias = "nk" },
+    };
+    try testing.expectEqual(@as(?usize, 0), histGroupKey(&calls, &.{key}));
+    const sum_call = [_]AggCall{.{ .func = .sum, .arg = key, .result = .i64, .where = null, .alias = "s" }};
+    try testing.expectEqual(@as(?usize, null), histGroupKey(&sum_call, &.{key}));
+    var sel = try Sel.init(a, n);
+    var tables: [2]agg.GroupTable = undefined;
+    for (&tables, [_][]const Column{ &coded, &histed }) |*t, cols| {
+        t.* = agg.GroupTable.init(testing.allocator, 1 << 20);
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n };
+        try testing.expect(try groupedCoded(a, testing.allocator, &calls, &.{key}, t, 7, &batch, &lookup, &sel, null, null));
+    }
+    defer for (&tables) |*t| t.deinit();
+    try testing.expectEqual(@as(usize, 4), tables[1].groupCount());
+    try testing.expectEqual(tables[0].groupCount(), tables[1].groupCount());
+    try testing.expectEqualSlices(u64, tables[0].first.items, tables[1].first.items);
+    for (0..tables[0].groupCount()) |g| {
+        try testing.expectEqualStrings(tables[0].keyAt(g), tables[1].keyAt(g));
+        for (0..calls.len) |ai| try testing.expectEqual(
+            tables[0].accumulators.items[g * calls.len + ai].count,
+            tables[1].accumulators.items[g * calls.len + ai].count,
+        );
+    }
+}
+
+test "distinct coded bitmaps fold only selected present identities across words and free failed allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctCodesTrial, .{false});
+}
+
+test "distinct coded sets coexist with active pairs and drain complete identities with failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctCodesTrial, .{true});
+}
+
+fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+    var dictionary: [129]i64 = undefined;
+    var codes: [129]u32 = undefined;
+    var defs: [129]u32 = undefined;
+    var comp: [129]u32 = undefined;
+    for (&dictionary, &codes, &defs, &comp, 0..) |*v, *c, *d, *cp, i| {
+        v.* = @intCast(i);
+        c.* = @intCast(i);
+        d.* = @intFromBool(i % 11 != 0);
+        cp.* = @intCast(i % 3);
+    }
+    dictionary[1] = -7;
+    dictionary[64] = 63;
+    const call: AggCall = .{
+        .func = .count_distinct,
+        .arg = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+        .result = .i64,
+        .where = null,
+        .alias = "d",
+    };
+    const column: Column = .{ .i64 = .{
+        .values = &.{},
+        .dict = &dictionary,
+        .codes = &codes,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const batch: filter_eval.Batch = .{ .cols = &.{column}, .num_rows = codes.len };
+    for (0..3) |shape| {
+        var table = agg.GroupTable.init(a, 1 << 20);
+        defer table.deinit();
+        var budget: agg.SharedBudget = .{ .limit = 1 << 20 };
+        var pairs: agg.DistinctPairs = .{
+            .gpa = a,
+            .budget = &budget,
+            .table = &table,
+            .agg_idx = 0,
+            .active = active_pairs,
+            .allow_coded_sets = true,
+        };
+        defer pairs.deinit();
+        const old_pairs = agg.distinct_pairs;
+        agg.distinct_pairs = &pairs;
+        defer agg.distinct_pairs = old_pairs;
+        const calls = [_]AggCall{call};
+        for (0..3) |g| {
+            const key = [_]u8{@intCast(g)};
+            _ = try table.getOrInsert(&key, &calls, g);
+        }
+        var selected = try Sel.init(ra, codes.len);
+        var expected: [3][137]bool = @splat(@splat(false));
+        for (0..codes.len) |r| {
+            const keep = shape == 0 or (shape == 1 and r % 5 == 0);
+            selected.set(r, keep);
+            if (keep and defs[r] != 0) expected[comp[r]][@intCast(dictionary[r] + 7)] = true;
+        }
+        try foldGroupedCall(
+            ra,
+            a,
+            table.accumulators.items,
+            &.{ 0, 1, 2 },
+            &comp,
+            3,
+            0,
+            1,
+            call,
+            &batch,
+            &.{0},
+            &selected,
+            &table,
+        );
+        for (expected, 0..) |bits, g| {
+            var n: usize = 0;
+            for (bits) |bit| n += @intFromBool(bit);
+            try testing.expectEqual(n, table.readAcc(g, 0, 1).distinct.count());
+        }
+        codes[128] = 129;
+        selected.set(128, true);
+        if (foldGroupedCall(
+            ra,
+            a,
+            table.accumulators.items,
+            &.{ 0, 1, 2 },
+            &comp,
+            3,
+            0,
+            1,
+            call,
+            &batch,
+            &.{0},
+            &selected,
+            &table,
+        )) return error.TestExpectedError else |e| {
+            if (e == error.OutOfMemory) return e;
+            try testing.expectEqual(error.BadColumn, e);
+        }
+        codes[128] = 128;
+        if (active_pairs) {
+            try testing.expect(pairs.pending_sets);
+            try testing.expectEqual(@as(usize, 0), pairs.charged);
+            var one = try Sel.init(ra, 1);
+            one.set(0, true);
+            try agg.updateOneGroupedValues(
+                ra,
+                a,
+                table.accumulators.items,
+                &.{0},
+                0,
+                1,
+                call,
+                .{ .i64 = .{ .values = &.{5000} } },
+                &one,
+                false,
+            );
+            try testing.expect(pairs.charged != 0);
+            try pairs.drainTable(&table);
+            var found: [3][137]bool = @splat(@splat(false));
+            var found_plain = false;
+            for (pairs.parts) |part| for (part.items) |pair| {
+                const group: usize = @intCast(pair.k0);
+                try testing.expect(group < 3);
+                const v: i64 = @bitCast(pair.x);
+                if (v == 5000) {
+                    try testing.expectEqual(@as(usize, 0), group);
+                    found_plain = true;
+                } else {
+                    try testing.expect(v >= -7 and v <= 128);
+                    found[group][@intCast(v + 7)] = true;
+                }
+            };
+            try testing.expect(found_plain);
+            try testing.expectEqualDeep(expected, found);
+        }
+    }
+}

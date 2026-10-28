@@ -1,21 +1,23 @@
 //! Filter expression parser.
 //!
-//! Grammar:
+//! Grammar (keywords case-insensitive):
 //!
 //!   expr        := disjunction
-//!   disjunction := conjunction ( " OR " conjunction )*
-//!   conjunction := leaf ( " AND " leaf )*
-//!   leaf        := identifier OP value
-//!   OP          := "!=" | "<=" | ">=" | "=" | "<" | ">"
+//!   disjunction := conjunction ( OR conjunction )*
+//!   conjunction := negation ( AND negation )*
+//!   negation    := NOT negation | "(" disjunction ")" | leaf
+//!   leaf        := identifier OP value | identifier [NOT] IN (v, ...) | identifier [NOT] BETWEEN x AND y
+//!                | identifier [NOT] LIKE pattern | identifier IS [NOT] NULL
+//!   OP          := "!=" | "<>" | "<=" | ">=" | "=" | "<" | ">"
 //!
-//! No parens, no NOT, no nested expressions. Matches what the prior
-//! implementation supported; sufficient for the demo + much real-world
-//! usage. Add when needed.
-//!
-//! AND binds tighter than OR — we split on " OR " first, then on " AND ".
+//! Structure is found by scanning, never by plain substring search: quoted spans ('...' and "...", a doubled quote
+//! escaping itself) and parenthesized groups are stepped over, so a keyword or operator inside a string literal, a
+//! quoted identifier or an IN list is never mistaken for one. A chain of any length parses in a loop; only grouping
+//! parentheses recurse, and they nest at most `MAX_GROUP_DEPTH` deep, which bounds every recursive walk of the tree.
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const in_set = @import("in_set.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
@@ -29,10 +31,24 @@ pub const Error = error{
     BadOperator,
     BadValue,
     UnsupportedType,
-    /// Grouping parentheses aren't supported — the grammar is flat
-    /// AND/OR. (Parens are only valid inside an `IN (...)` list.)
-    GroupingNotSupported,
+    /// A parenthesis outside a quoted span without its partner.
+    UnbalancedParentheses,
+    /// Grouping parentheses nest deeper than `MAX_GROUP_DEPTH`.
+    FilterTooDeep,
+    /// A quote opens a string literal or quoted name that never closes.
+    UnterminatedString,
+    /// The column is repeated (in a LIST or MAP, or a legacy REPEATED field): a row holds a list of its values.
+    NestedFilterNotSupported,
+    /// `%`, an operator zpq does not have, where a column was expected (`x % 2 = 1`).
+    ModuloNotSupported,
+    /// Arithmetic where a predicate compares a column (`x + 1 > 5`): the left side must be a column.
+    ExpressionInPredicate,
 } || std.mem.Allocator.Error;
+
+/// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
+/// row selection once per OR level, so this caps the tree height every walker (evaluation, pruning, negation,
+/// membership) recurses through and the selections live at once.
+pub const MAX_GROUP_DEPTH: u32 = 32;
 
 /// Parse a filter expression against the file's schema.
 ///
@@ -46,147 +62,299 @@ pub fn parse(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const trimmed = std.mem.trim(u8, expr, " \t\r\n");
+    const trimmed = trimSpace(expr);
     if (trimmed.len == 0) return error.EmptyExpr;
-    return try parseDisjunction(arena, trimmed, file, diag);
+    return try parseDisjunction(arena, trimmed, file, diag, 0);
 }
 
+fn trimSpace(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\r\n");
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// The index just past the quoted span opening at `src[i]`. A doubled quote inside escapes itself, as SQL writes
+/// `'O''Reilly'`. An unterminated quote is an error: read as an ordinary byte, it would let the rest of a mistyped
+/// literal (`'O\'Reilly' AND ...`) split as structure.
+fn skipQuoted(src: []const u8, i: usize) Error!usize {
+    const q = src[i];
+    var j = i + 1;
+    while (j < src.len) : (j += 1) {
+        if (src[j] != q) continue;
+        if (j + 1 < src.len and src[j + 1] == q) {
+            j += 1;
+            continue;
+        }
+        return j + 1;
+    }
+    return error.UnterminatedString;
+}
+
+/// A word of the outermost level: letters, digits and `_`, with whitespace, a parenthesis or an end on both sides.
+const Word = struct { start: usize, end: usize };
+
+/// Walks the outermost level of `src`, stepping over quoted spans and parenthesized groups.
+const Cursor = struct {
+    src: []const u8,
+    i: usize = 0,
+    depth: u32 = 0,
+
+    fn boundary(self: *const Cursor, at: usize) bool {
+        return at >= self.src.len or isSpace(self.src[at]) or self.src[at] == '(' or self.src[at] == ')';
+    }
+
+    fn nextWord(self: *Cursor) Error!?Word {
+        const src = self.src;
+        while (self.i < src.len) {
+            const c = src[self.i];
+            switch (c) {
+                '\'', '"' => self.i = try skipQuoted(src, self.i),
+                '(' => {
+                    self.depth += 1;
+                    self.i += 1;
+                },
+                ')' => {
+                    if (self.depth == 0) return error.UnbalancedParentheses;
+                    self.depth -= 1;
+                    self.i += 1;
+                },
+                else => {
+                    const starts = self.depth == 0 and isWordByte(c) and (self.i == 0 or self.boundary(self.i - 1));
+                    if (!starts) {
+                        self.i += 1;
+                        continue;
+                    }
+                    const start = self.i;
+                    while (self.i < src.len and isWordByte(src[self.i])) self.i += 1;
+                    if (self.boundary(self.i)) return .{ .start = start, .end = self.i };
+                },
+            }
+        }
+        if (self.depth != 0) return error.UnbalancedParentheses;
+        return null;
+    }
+
+    /// The next outermost-level position of `needle`, compared case-insensitively.
+    fn find(self: *Cursor, needle: []const u8) Error!?usize {
+        const src = self.src;
+        while (self.i < src.len) {
+            const c = src[self.i];
+            if (self.depth == 0 and self.i + needle.len <= src.len and
+                std.ascii.eqlIgnoreCase(src[self.i .. self.i + needle.len], needle))
+            {
+                const at = self.i;
+                self.i += needle.len;
+                return at;
+            }
+            switch (c) {
+                '\'', '"' => self.i = try skipQuoted(src, self.i),
+                '(' => {
+                    self.depth += 1;
+                    self.i += 1;
+                },
+                ')' => {
+                    if (self.depth == 0) return error.UnbalancedParentheses;
+                    self.depth -= 1;
+                    self.i += 1;
+                },
+                else => self.i += 1,
+            }
+        }
+        return null;
+    }
+};
+
+/// The first outermost-level position of `needle` in `src` (case-insensitive), or null.
+fn topLevelIndexOf(src: []const u8, needle: []const u8) Error!?usize {
+    var cur: Cursor = .{ .src = src };
+    return cur.find(needle);
+}
+
+fn isKeyword(src: []const u8, w: Word, kw: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(src[w.start..w.end], kw);
+}
+
+/// Split at every outermost ` OR ` into one flat OR node: a loop, not recursion, so a chain of any length costs no
+/// stack.
 fn parseDisjunction(
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
+    depth: u32,
 ) Error!ast.Filter {
-    if (std.mem.indexOf(u8, expr, " OR ")) |i| {
-        const left = try arena.create(ast.Filter);
-        const right = try arena.create(ast.Filter);
-        left.* = try parseConjunction(arena, std.mem.trim(u8, expr[0..i], " "), file, diag);
-        right.* = try parseDisjunction(arena, std.mem.trim(u8, expr[i + 4 ..], " "), file, diag);
-        return .{ .or_filter = .{ .left = left, .right = right } };
+    var terms: std.ArrayList(ast.Filter) = .empty;
+    var cur: Cursor = .{ .src = expr };
+    var start: usize = 0;
+    while (try cur.nextWord()) |w| {
+        if (!isKeyword(expr, w, "OR")) continue;
+        try terms.append(arena, try parseConjunction(arena, trimSpace(expr[start..w.start]), file, diag, depth));
+        start = w.end;
     }
-    return try parseConjunction(arena, expr, file, diag);
+    try terms.append(arena, try parseConjunction(arena, trimSpace(expr[start..]), file, diag, depth));
+    return ast.join(arena, false, terms.items);
 }
 
+/// Split at every outermost ` AND ` that does not pair with a `BETWEEN`: the next AND after each BETWEEN belongs to
+/// its bounds.
 fn parseConjunction(
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
+    depth: u32,
 ) Error!ast.Filter {
-    // Find a top-level " AND " — one that doesn't pair with a BETWEEN.
-    // For each " BETWEEN " in the expression, the *next* " AND " after
-    // it belongs to the BETWEEN bounds, not to a conjunction. Skip
-    // over them.
-    if (findTopLevelAnd(expr)) |i| {
-        const left = try arena.create(ast.Filter);
-        const right = try arena.create(ast.Filter);
-        left.* = try parseLeaf(arena, std.mem.trim(u8, expr[0..i], " "), file, diag);
-        right.* = try parseConjunction(arena, std.mem.trim(u8, expr[i + 5 ..], " "), file, diag);
-        return .{ .and_filter = .{ .left = left, .right = right } };
-    }
-    return try parseLeaf(arena, expr, file, diag);
-}
-
-/// Find the first ` AND ` token in `expr` that is NOT part of a
-/// `BETWEEN x AND y` clause. Returns its byte index, or null if every
-/// ` AND ` belongs to a BETWEEN (or none exist).
-fn findTopLevelAnd(expr: []const u8) ?usize {
-    // Walk left-to-right tracking a "skip-next-AND" counter that we
-    // bump each time we see a `BETWEEN` keyword. Each subsequent
-    // ` AND ` decrements the counter (consumed by that BETWEEN's
-    // bounds) until it hits zero — then the next ` AND ` is the
-    // top-level conjunction split.
-    var i: usize = 0;
-    var skip: usize = 0;
-    while (i + 5 <= expr.len) {
-        // Check for ` BETWEEN ` (case-insensitive). The leading space
-        // disambiguates from identifiers like `between_threshold`.
-        if (i + " BETWEEN ".len <= expr.len and asciiEqIgnoreCase(expr[i .. i + " BETWEEN ".len], " BETWEEN ")) {
-            skip += 1;
-            i += " BETWEEN ".len;
-            continue;
-        }
-        if (asciiEqIgnoreCase(expr[i .. i + 5], " AND ")) {
-            if (skip > 0) {
-                skip -= 1;
-                i += 5;
+    var terms: std.ArrayList(ast.Filter) = .empty;
+    var cur: Cursor = .{ .src = expr };
+    var start: usize = 0;
+    var bounds_pending: usize = 0;
+    while (try cur.nextWord()) |w| {
+        if (isKeyword(expr, w, "BETWEEN")) {
+            bounds_pending += 1;
+        } else if (isKeyword(expr, w, "AND")) {
+            if (bounds_pending > 0) {
+                bounds_pending -= 1;
                 continue;
             }
-            return i;
+            try terms.append(arena, try parseNegation(arena, trimSpace(expr[start..w.start]), file, diag, depth));
+            start = w.end;
         }
-        i += 1;
     }
-    return null;
+    try terms.append(arena, try parseNegation(arena, trimSpace(expr[start..]), file, diag, depth));
+    // A BETWEEN's two bounds join the chain they sit in.
+    return ast.join(arena, true, terms.items);
 }
 
-fn asciiEqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        const xl = if (x >= 'A' and x <= 'Z') x + 32 else x;
-        const yl = if (y >= 'A' and y <= 'Z') y + 32 else y;
-        if (xl != yl) return false;
+/// A run of leading NOTs, then a parenthesized group or a leaf. The run is counted, not recursed into: only its
+/// parity matters, and `NOT NOT ... x` must not cost a stack frame per NOT. NOT is structural (operator flip on
+/// leaves, De Morgan on composites), never a complement of the rows that passed, so a row whose operand is NULL
+/// (UNKNOWN) fails both `p` and `NOT p`.
+fn parseNegation(
+    arena: std.mem.Allocator,
+    expr: []const u8,
+    file: *const schema.FileMetaData,
+    diag: ?*Diag,
+    depth: u32,
+) Error!ast.Filter {
+    var negated = false;
+    var body = expr;
+    while (body.len > 3 and std.ascii.eqlIgnoreCase(body[0..3], "NOT") and (isSpace(body[3]) or body[3] == '(')) {
+        body = trimSpace(body[3..]);
+        negated = !negated;
     }
-    return true;
+    if (body.len == 0) return error.BadOperator;
+    const inner = if (try groupBody(body)) |group| blk: {
+        if (depth + 1 > MAX_GROUP_DEPTH) return error.FilterTooDeep;
+        break :blk try parseDisjunction(arena, group, file, diag, depth + 1);
+    } else try parseLeafBody(arena, body, file, diag);
+    return if (negated) negateFilter(arena, inner) else inner;
 }
 
-fn caseInsensitiveIndexOf(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (asciiEqIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+/// The inside of `term` when the whole of it is one parenthesized group, else null.
+fn groupBody(term: []const u8) Error!?[]const u8 {
+    if (term[0] != '(') return null;
+    var cur: Cursor = .{ .src = term, .i = 1, .depth = 1 };
+    while (cur.i < term.len) {
+        switch (term[cur.i]) {
+            '\'', '"' => cur.i = try skipQuoted(term, cur.i),
+            '(' => {
+                cur.depth += 1;
+                cur.i += 1;
+            },
+            ')' => {
+                cur.depth -= 1;
+                if (cur.depth == 0) {
+                    if (cur.i + 1 != term.len) return null;
+                    const inner = trimSpace(term[1..cur.i]);
+                    if (inner.len == 0) return error.EmptyExpr;
+                    return inner;
+                }
+                cur.i += 1;
+            },
+            else => cur.i += 1,
+        }
     }
-    return null;
+    return error.UnbalancedParentheses;
 }
 
 /// Resolve a (possibly double-quoted) column name to its leaf index. See
 /// `metadata.resolveColumn` for how bare and dotted names bind.
+/// A repeated column is refused here, before statistics could answer for it without the decode that refuses it.
 fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) Error!usize {
     const ident = metadata.unquoteIdent(name);
-    return metadata.resolveColumn(file, ident) catch |err| {
+    const ci = metadata.resolveColumn(file, ident) catch |err| {
         if (err == error.AmbiguousColumn) Diag.set(diag, ident, .{ .ambiguous_column = .{
             .parser = .filter,
             .hint = metadata.ambiguityHint(file, ident),
         } });
+        // No column by that name: an operator outside quotes says what it is instead.
+        if (err == error.UnknownColumn) if (try operatorOutsideQuotes(name)) |op| {
+            Diag.setColumn(diag, name);
+            return if (op == '%') error.ModuloNotSupported else error.ExpressionInPredicate;
+        };
         return err;
     };
+    var walk: schema.LeafIterator = undefined;
+    if (file.leafAt(ci, &walk)) |leaf| if (leaf.max_rep > 0) {
+        Diag.setColumn(diag, ident);
+        return error.NestedFilterNotSupported;
+    };
+    return ci;
 }
 
-fn parseLeaf(
+/// An arithmetic operator or blank in `name` outside a quoted span, which no unquoted column name holds: `%` if there
+/// is one, else the first.
+fn operatorOutsideQuotes(name: []const u8) Error!?u8 {
+    var first: ?u8 = null;
+    var i: usize = 0;
+    while (i < name.len) : (i += 1) switch (name[i]) {
+        '\'', '"' => i = try skipQuoted(name, i) - 1,
+        '%' => return '%',
+        '+', '-', '*', '/', ' ', '\t' => |c| if (first == null) {
+            first = c;
+        },
+        else => {},
+    };
+    return first;
+}
+
+fn parseLeafBody(
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    // Leading `NOT <leaf>` → negate the parsed leaf (operator-flip on leaves,
-    // De Morgan on composites). `col NOT IN (...)` is handled by the IN path
-    // below (its NOT is mid-expression, not leading).
-    if (expr.len > 4 and asciiEqIgnoreCase(expr[0..4], "NOT ")) {
-        const inner = std.mem.trim(u8, expr[4..], " ");
-        if (inner.len == 0) return error.BadOperator;
-        return negateFilter(arena, try parseLeaf(arena, inner, file, diag));
-    }
     // `col IS NULL` / `col IS NOT NULL` — a def-level predicate, no value.
     // Checked before IN/BETWEEN/comparison since it has no binary operator.
     if (try tryParseNullCheck(expr, file, diag)) |nc| return nc;
 
     // `col LIKE 'pat'` / `col NOT LIKE 'pat'` — SQL wildcard match.
     // " NOT LIKE " must be checked first (it contains " LIKE ").
-    if (caseInsensitiveIndexOf(expr, " NOT LIKE ")) |i| {
-        return parseLike(expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
+    if (try topLevelIndexOf(expr, " NOT LIKE ")) |i| {
+        return parseLike(arena, expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
     }
-    if (caseInsensitiveIndexOf(expr, " LIKE ")) |i| {
-        return parseLike(expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
+    if (try topLevelIndexOf(expr, " LIKE ")) |i| {
+        return parseLike(arena, expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
     }
 
     // `col [NOT] IN (v1, v2, ...)` → OR-of-equalities (or AND-of-inequalities
     // for NOT IN), reusing the typed leaf builder per value.
-    if (findInClause(expr)) |inc| {
+    if (try findInClause(expr)) |inc| {
         return parseInList(arena, expr, inc, file, diag);
     }
     // BETWEEN runs before operator detection — `col BETWEEN x AND y` has no
-    // binary op the comparison-finder would recognize.
-    if (caseInsensitiveIndexOf(expr, " BETWEEN ")) |_| {
-        return parseBetween(arena, expr, file, diag);
+    // binary op the comparison-finder would recognize. `col NOT BETWEEN x AND y` is its negation.
+    if (try topLevelIndexOf(expr, " NOT BETWEEN ")) |i| {
+        return negateFilter(arena, try parseBetween(arena, expr, i, " NOT BETWEEN ".len, file, diag));
+    }
+    if (try topLevelIndexOf(expr, " BETWEEN ")) |i| {
+        return parseBetween(arena, expr, i, " BETWEEN ".len, file, diag);
     }
     return parseComparisonLeaf(arena, expr, file, diag);
 }
@@ -200,19 +368,19 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?
     const null_ = " IS NULL";
     var col_part: []const u8 = undefined;
     var is_not: bool = undefined;
-    if (expr.len >= not_null.len and asciiEqIgnoreCase(expr[expr.len - not_null.len ..], not_null)) {
+    if (expr.len >= not_null.len and std.ascii.eqlIgnoreCase(expr[expr.len - not_null.len ..], not_null)) {
         col_part = expr[0 .. expr.len - not_null.len];
         is_not = true;
-    } else if (expr.len >= null_.len and asciiEqIgnoreCase(expr[expr.len - null_.len ..], null_)) {
+    } else if (expr.len >= null_.len and std.ascii.eqlIgnoreCase(expr[expr.len - null_.len ..], null_)) {
         col_part = expr[0 .. expr.len - null_.len];
         is_not = false;
-    } else if (caseInsensitiveIndexOf(expr, " IS ")) |_| {
+    } else if (try topLevelIndexOf(expr, " IS ")) |_| {
         if (diag) |d| d.detail = .is_operand;
         return error.BadOperator;
     } else {
         return null;
     }
-    const col_name = std.mem.trim(u8, col_part, " ");
+    const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
     const col_idx = try resolveCol(file, col_name, diag);
     return ast.Filter{ .null_check = .{ .col_idx = col_idx, .is_not = is_not } };
@@ -223,15 +391,15 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?
 /// general matcher. LIKE is text-only — non-string columns are a clear
 /// error rather than a confusing type mismatch later.
 fn parseLike(
+    arena: std.mem.Allocator,
     col_part: []const u8,
     pat_part: []const u8,
     negate: bool,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const col_name = std.mem.trim(u8, col_part, " ");
+    const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
-    const pattern = stripStringQuotes(std.mem.trim(u8, pat_part, " "));
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
@@ -239,6 +407,9 @@ fn parseLike(
         Diag.set(diag, col_name, .{ .like_non_string = .{ .type_name = type_name } });
         return error.UnsupportedType;
     }
+    // `s LIKE NULL` is UNKNOWN for every row, as `s = NULL` is: the bare word is the NULL literal, not the text 'NULL'.
+    if (isNullLiteral(trimSpace(pat_part))) return unknown;
+    const pattern = try stringValue(arena, file, col_name, trimSpace(pat_part), diag);
     const c = classifyLike(pattern);
     return ast.Filter{ .like = .{ .col_idx = col_idx, .kind = c.kind, .operand = c.operand, .negate = negate } };
 }
@@ -268,10 +439,10 @@ fn classifyLike(pat: []const u8) struct { kind: ast.LikeKind, operand: []const u
 
 const InClause = struct { col_end: usize, vals_start: usize, negated: bool };
 
-fn findInClause(expr: []const u8) ?InClause {
-    if (caseInsensitiveIndexOf(expr, " NOT IN ")) |i|
+fn findInClause(expr: []const u8) Error!?InClause {
+    if (try topLevelIndexOf(expr, " NOT IN ")) |i|
         return .{ .col_end = i, .vals_start = i + " NOT IN ".len, .negated = true };
-    if (caseInsensitiveIndexOf(expr, " IN ")) |i|
+    if (try topLevelIndexOf(expr, " IN ")) |i|
         return .{ .col_end = i, .vals_start = i + " IN ".len, .negated = false };
     return null;
 }
@@ -283,100 +454,170 @@ fn parseInList(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const col_name = std.mem.trim(u8, expr[0..inc.col_end], " ");
-    var vals = std.mem.trim(u8, expr[inc.vals_start..], " ");
-    if (col_name.len == 0) return error.BadOperator;
-    // Require a parenthesized list. (Commas inside quoted string values
-    // aren't supported — a documented limitation of the simple split.)
-    if (vals.len < 2 or vals[0] != '(' or vals[vals.len - 1] != ')') return error.BadOperator;
-    vals = std.mem.trim(u8, vals[1 .. vals.len - 1], " ");
-    if (vals.len == 0) return error.BadValue; // empty list
+    const col_name = trimSpace(expr[0..inc.col_end]);
+    const list = trimSpace(expr[inc.vals_start..]);
+    if (col_name.len == 0 or list.len == 0) return error.BadOperator;
+    // A parenthesized list, split at its outermost commas: a comma inside a quoted value is part of the value.
+    const vals = (try groupBody(list)) orelse return error.BadOperator;
 
-    const col_idx = try resolveCol(file, col_name, diag);
-    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    const operand = try resolveOperand(file, col_name, diag);
+    const col_idx = operand.col_idx;
 
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
-    var acc: ?ast.Filter = null;
-    var it = std.mem.splitScalar(u8, vals, ',');
-    while (it.next()) |raw| {
-        const v = std.mem.trim(u8, raw, " ");
+    var leaves: std.ArrayList(ast.Filter) = .empty;
+    var null_member = false;
+    var cur: Cursor = .{ .src = vals };
+    var start: usize = 0;
+    while (true) {
+        const comma = try cur.find(",");
+        const v = trimSpace(vals[start .. comma orelse vals.len]);
         if (v.len == 0) return error.BadValue;
-        const leaf = try buildTypedComparison(col_idx, &elem, leaf_op, v, diag);
-        if (acc) |prev| {
-            const l = try arena.create(ast.Filter);
-            const r = try arena.create(ast.Filter);
-            l.* = prev;
-            r.* = leaf;
-            acc = if (inc.negated)
-                .{ .and_filter = .{ .left = l, .right = r } }
-            else
-                .{ .or_filter = .{ .left = l, .right = r } };
-        } else acc = leaf;
+        // The NULL literal is no value to compare with, on a string column as on any other.
+        if (isNullLiteral(v)) null_member = true else {
+            try leaves.append(arena, try buildOperandComparison(arena, file, operand, leaf_op, v, diag));
+        }
+        start = (comma orelse break) + 1;
     }
-    return acc orelse error.BadValue;
+    // One node for the whole list, however long: OR of `= v` (AND of `!= v`), with its set bound beside the leaves.
+    if (leaves.items.len == 1 and !null_member) return leaves.items[0];
+    const c: ast.Composite = .{
+        .children = leaves.items,
+        .in_set = if (leaves.items.len > 1) try bindInSet(arena, col_idx, inc.negated, leaves.items) else null,
+        .null_member = null_member,
+    };
+    return if (inc.negated) .{ .and_filter = c } else .{ .or_filter = c };
+}
+
+fn isNullLiteral(v: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(v, "NULL");
+}
+
+/// `x op NULL`: UNKNOWN for every row, which neither it nor its negation passes.
+const unknown: ast.Filter = .{ .or_filter = .{ .children = &.{}, .null_member = true } };
+
+/// The literals of an IN list bound for one-pass evaluation; null when its leaves are of a type the set doesn't hold
+/// (boolean) or one of them isn't a plain `=` (`!=` for NOT IN) or a constant, which then evaluate leaf by leaf.
+fn bindInSet(
+    arena: std.mem.Allocator,
+    col_idx: usize,
+    negated: bool,
+    leaves: []const ast.Filter,
+) Error!?*const in_set.InSet {
+    const want: ast.Operator = if (negated) .NotEq else .Eq;
+    const probe: in_set.InSet.Probe = switch (leaves[0]) {
+        inline .int32, .int64, .uint64, .float, .double, .string => |_, tag| blk: {
+            const T = @FieldType(@FieldType(ast.Filter, @tagName(tag)), "value");
+            var values: std.ArrayList(T) = .empty;
+            for (leaves) |l| {
+                if (std.meta.activeTag(l) != tag) return null;
+                const leaf = @field(l, @tagName(tag));
+                if (leaf.op == want) {
+                    try values.append(arena, leaf.value);
+                    continue;
+                }
+                // A literal no stored value can equal binds to a constant leaf: one that matches nothing adds no
+                // member to IN, one that matches every present row adds none to NOT IN. Anything else stays leaves.
+                const constant = constantLeaf(T, leaf) orelse return null;
+                if (constant != negated) return null;
+            }
+            if (values.items.len == 0) return null;
+            break :blk switch (tag) {
+                .int32 => .{ .i32 = try .init(arena, values.items) },
+                .int64 => .{ .i64 = try .init(arena, values.items) },
+                .uint64 => .{ .u64 = try .init(arena, values.items) },
+                .float => .{ .f32 = try .init(arena, values.items) },
+                .double => .{ .f64 = try .init(arena, values.items) },
+                .string => .{ .string = try .init(arena, values.items) },
+                else => unreachable,
+            };
+        },
+        else => return null,
+    };
+    const set = try arena.create(in_set.InSet);
+    set.* = .{ .col_idx = col_idx, .negated = negated, .probe = probe };
+    return set;
+}
+
+/// What the binder's constant leaves always answer for a present row: true for `exactLeaf`'s `<= maxInt` and
+/// `buildUnsignedLeaf`'s `>= 0`, false for `> maxInt` and `< 0`; null for any other leaf.
+fn constantLeaf(comptime T: type, leaf: ast.Leaf(T)) ?bool {
+    switch (@typeInfo(T)) {
+        .int => |info| if (info.signedness == .unsigned) {
+            if (leaf.value != 0) return null;
+            return switch (leaf.op) {
+                .GtEq => true,
+                .Lt => false,
+                else => null,
+            };
+        } else {
+            if (leaf.value != std.math.maxInt(T)) return null;
+            return switch (leaf.op) {
+                .LtEq => true,
+                .Gt => false,
+                else => null,
+            };
+        },
+        else => return null,
+    }
 }
 
 /// Negate a filter subtree: flip leaf operators, De Morgan on composites.
-/// NULL handling matches ZPQ's "nulls don't pass" convention either way
+/// NULL handling matches zpq's "nulls don't pass" convention either way
 /// (both `NOT (x > 5)` and `x <= 5` exclude null rows).
 fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {
-        .int32 => |l| .{ .int32 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .int64 => |l| .{ .int64 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .uint64 => |l| .{ .uint64 = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .float => |l| .{ .float = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .double => |l| .{ .double = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .string => |l| .{ .string = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
-        .boolean => |l| .{ .boolean = .{ .col_idx = l.col_idx, .op = l.op.negate(), .value = l.value } },
+        // Negating keeps the value, so a stored literal stays one (`NOT x != 5` is `x = 5`).
+        inline .int32, .int64, .uint64, .float, .double, .decimal, .string, .boolean => |l, tag| blk: {
+            var out = l;
+            out.op = l.op.negate();
+            break :blk @unionInit(ast.Filter, @tagName(tag), out);
+        },
         // NOT (x IS NULL) == x IS NOT NULL, and vice-versa.
         .null_check => |nc| .{ .null_check = .{ .col_idx = nc.col_idx, .is_not = !nc.is_not } },
         // NOT (x LIKE p) == x NOT LIKE p — flip the negate flag.
         .like => |m| .{ .like = .{ .col_idx = m.col_idx, .kind = m.kind, .operand = m.operand, .negate = !m.negate } },
-        .and_filter => |c| blk: {
-            const l = try arena.create(ast.Filter);
-            const r = try arena.create(ast.Filter);
-            l.* = try negateFilter(arena, c.left.*);
-            r.* = try negateFilter(arena, c.right.*);
-            break :blk .{ .or_filter = .{ .left = l, .right = r } };
-        },
-        .or_filter => |c| blk: {
-            const l = try arena.create(ast.Filter);
-            const r = try arena.create(ast.Filter);
-            l.* = try negateFilter(arena, c.left.*);
-            r.* = try negateFilter(arena, c.right.*);
-            break :blk .{ .and_filter = .{ .left = l, .right = r } };
+        // De Morgan, a node at a time: the tree is at most a few levels deep (see `ast.Composite`).
+        .and_filter, .or_filter => |c| blk: {
+            const children = try arena.alloc(ast.Filter, c.children.len);
+            for (c.children, children) |child, *n| n.* = try negateFilter(arena, child);
+            const flipped: ast.Composite = .{
+                .children = children,
+                .in_set = if (c.in_set) |s| try s.negate(arena) else null,
+                .null_member = c.null_member,
+            };
+            break :blk if (f == .and_filter) .{ .or_filter = flipped } else .{ .and_filter = flipped };
         },
     };
 }
 
-/// Parse `col BETWEEN x AND y` into the conjunction `(col >= x AND col <= y)`.
-/// SQL semantics: BETWEEN is inclusive on both sides.
+/// Parse `col BETWEEN x AND y` (the keyword at `between_at`, `kw_len` long) into the conjunction
+/// `(col >= x AND col <= y)`. SQL semantics: BETWEEN is inclusive on both sides.
 fn parseBetween(
     arena: std.mem.Allocator,
     expr: []const u8,
+    between_at: usize,
+    kw_len: usize,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    const between_at = caseInsensitiveIndexOf(expr, " BETWEEN ") orelse return error.BadOperator;
-    const after_between = between_at + " BETWEEN ".len;
-    const and_at = caseInsensitiveIndexOf(expr[after_between..], " AND ") orelse return error.BadOperator;
+    const after_between = between_at + kw_len;
+    const and_at = (try topLevelIndexOf(expr[after_between..], " AND ")) orelse return error.BadOperator;
 
-    const col_name = std.mem.trim(u8, expr[0..between_at], " ");
-    const x_str = std.mem.trim(u8, expr[after_between .. after_between + and_at], " ");
-    const y_str = std.mem.trim(u8, expr[after_between + and_at + " AND ".len ..], " ");
+    const col_name = trimSpace(expr[0..between_at]);
+    const x_str = trimSpace(expr[after_between .. after_between + and_at]);
+    const y_str = trimSpace(expr[after_between + and_at + " AND ".len ..]);
     if (col_name.len == 0 or x_str.len == 0 or y_str.len == 0) return error.BadOperator;
 
-    const col_idx = try resolveCol(file, col_name, diag);
-    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    const operand = try resolveOperand(file, col_name, diag);
 
     // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
-    // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals.
-    const left = try arena.create(ast.Filter);
-    const right = try arena.create(ast.Filter);
-    left.* = try buildTypedComparison(col_idx, &elem, .GtEq, x_str, diag);
-    right.* = try buildTypedComparison(col_idx, &elem, .LtEq, y_str, diag);
-    return .{ .and_filter = .{ .left = left, .right = right } };
+    // bounds into byte-string leaves (silently wrong) and rejected DATE/TIMESTAMP literals. A NULL bound is the
+    // UNKNOWN `x >= NULL` is, so `x NOT BETWEEN NULL AND 5` still keeps the rows past 5.
+    return ast.join(arena, true, &.{
+        if (isNullLiteral(x_str)) unknown else try buildOperandComparison(arena, file, operand, .GtEq, x_str, diag),
+        if (isNullLiteral(y_str)) unknown else try buildOperandComparison(arena, file, operand, .LtEq, y_str, diag),
+    });
 }
 
 fn parseComparisonLeaf(
@@ -385,75 +626,155 @@ fn parseComparisonLeaf(
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    _ = arena;
-    // Stray parens reach here only as grouping attempts — IN-list parens
-    // were consumed upstream. Without this, `(a OR b)` splits into the
-    // fragment `(a` and fails with a misleading UnknownColumn.
-    if (std.mem.indexOfScalar(u8, expr, '(') != null or std.mem.indexOfScalar(u8, expr, ')') != null) {
-        return error.GroupingNotSupported;
-    }
-    // Find the operator. Two-char ops checked first so "<=" doesn't
-    // match the "<" arm.
-    const ops_2c = [_]struct { tok: []const u8, op: ast.Operator }{
-        .{ .tok = "!=", .op = .NotEq },
-        .{ .tok = "<=", .op = .LtEq },
-        .{ .tok = ">=", .op = .GtEq },
-    };
-    const ops_1c = [_]struct { tok: []const u8, op: ast.Operator }{
-        .{ .tok = "=", .op = .Eq },
-        .{ .tok = "<", .op = .Lt },
-        .{ .tok = ">", .op = .Gt },
-    };
+    const found = (try findComparison(expr)) orelse return bareBoolean(arena, expr, file, diag);
+    const op = found.op;
+    const found_at = found.at;
+    const found_len = found.len;
 
-    var found_op: ?ast.Operator = null;
-    var found_at: usize = 0;
-    var found_len: usize = 0;
-    for (ops_2c) |o| {
-        if (std.mem.indexOf(u8, expr, o.tok)) |i| {
-            found_op = o.op;
-            found_at = i;
-            found_len = o.tok.len;
-            break;
-        }
-    }
-    if (found_op == null) {
-        for (ops_1c) |o| {
-            if (std.mem.indexOf(u8, expr, o.tok)) |i| {
-                found_op = o.op;
-                found_at = i;
-                found_len = o.tok.len;
-                break;
-            }
-        }
-    }
-    const op = found_op orelse return error.BadOperator;
-
-    const col_name = std.mem.trim(u8, expr[0..found_at], " ");
-    const val_str = std.mem.trim(u8, expr[found_at + found_len ..], " ");
+    const col_name = trimSpace(expr[0..found_at]);
+    const val_str = trimSpace(expr[found_at + found_len ..]);
     if (col_name.len == 0 or val_str.len == 0) return error.BadOperator;
-
-    const col_idx = try resolveCol(file, col_name, diag);
-    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-    return try buildTypedComparison(col_idx, &elem, op, val_str, diag);
+    if (isNullLiteral(val_str)) {
+        _ = try resolveOperand(file, col_name, diag);
+        return unknown;
+    }
+    return buildOperandComparison(arena, file, try resolveOperand(file, col_name, diag), op, val_str, diag);
 }
 
-/// Build a single typed comparison leaf, honoring DECIMAL columns (decoded
-/// to f64 → the .double lane) and DATE/TIMESTAMP columns (SQL-style literals
+/// A comparison's column side: a column, or `make_date(c)` over an integer column. That is the DATE its integer
+/// counts, the same number, so the leaf compares (and statistics prune) the stored days themselves.
+const Operand = struct { col_idx: usize, elem: schema.SchemaElement, make_date: bool };
+
+fn resolveOperand(file: *const schema.FileMetaData, text: []const u8, diag: ?*Diag) Error!Operand {
+    const open = std.mem.indexOfScalar(u8, text, '(') orelse {
+        const col_idx = try resolveCol(file, text, diag);
+        const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+        return .{ .col_idx = col_idx, .elem = elem, .make_date = false };
+    };
+    // What parentheses are left here are no grouping: `(a + b) = 1` or `f(x) = 1`, which no leaf compares.
+    if (!std.ascii.eqlIgnoreCase(trimSpace(text[0..open]), "make_date")) return error.BadOperator;
+    const arg = (try groupBody(text[open..])) orelse return error.BadOperator;
+    const col_idx = try resolveCol(file, arg, diag);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    if (!integerDays(&elem)) {
+        Diag.setColumn(diag, metadata.unquoteIdent(arg));
+        return error.UnsupportedType;
+    }
+    return .{ .col_idx = col_idx, .elem = elem, .make_date = true };
+}
+
+/// An INT32 column DuckDB's `make_date(INTEGER)` takes: plain, or an integer annotation it casts to INTEGER (signed
+/// up to 32 bits, unsigned up to 16), never a DATE, TIME or DECIMAL.
+pub fn integerDays(elem: *const schema.SchemaElement) bool {
+    if (elem.type != .INT32) return false;
+    const lt = elem.effectiveLogicalType() orelse return true;
+    return lt == .INTEGER and lt.INTEGER.bitWidth <= @as(i8, if (lt.INTEGER.isSigned) 32 else 16);
+}
+
+fn buildOperandComparison(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
+    operand: Operand,
+    op: ast.Operator,
+    val_str: []const u8,
+    diag: ?*Diag,
+) Error!ast.Filter {
+    if (!operand.make_date) return buildTypedComparison(arena, file, operand.col_idx, &operand.elem, op, val_str, diag);
+    // DuckDB casts the literal to the DATE's type, so a time of day is dropped, not compared: `make_date(x) =
+    // '2013-07-01 12:00'` holds on that day.
+    const lit = try parseDateTimeNs(stripStringQuotes(val_str));
+    const lane: Lane = if (schema.isUnsignedInt(operand.elem)) .uint64 else .int32;
+    return markStored(bindExact(operand.col_idx, op, lane, @divFloor(lit.ns, ns_per_day), false));
+}
+
+/// A leaf that is a column's name alone (`b`, `"b"`, `t.b`): SQL's bare BOOLEAN predicate, the same leaf as `b = true`
+/// (a NULL is not true, and under NOT stays out too). A column of another type is no predicate.
+fn bareBoolean(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error!ast.Filter {
+    const lone = if (expr[0] == '"')
+        try skipQuoted(expr, 0) == expr.len
+    else for (expr) |c| {
+        if (!isWordByte(c) and c != '.') break false;
+    } else true;
+    if (!lone or isNullLiteral(expr) or std.ascii.eqlIgnoreCase(expr, "true") or std.ascii.eqlIgnoreCase(expr, "false"))
+        return error.BadOperator;
+    const col_idx = try resolveCol(file, expr, diag);
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    if (elem.type != .BOOLEAN) {
+        Diag.set(diag, metadata.unquoteIdent(expr), .{ .bare_non_boolean = .{ .type_name = @tagName(elem.type orelse .BOOLEAN) } });
+        return error.BadOperator;
+    }
+    return buildTypedComparison(arena, file, col_idx, &elem, .Eq, "true", diag);
+}
+
+const Comparison = struct { op: ast.Operator, at: usize, len: usize };
+
+/// The first outermost-level comparison operator in `expr`, the two-byte ones taking precedence at a position.
+fn findComparison(expr: []const u8) Error!?Comparison {
+    var i: usize = 0;
+    var depth: u32 = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+        switch (c) {
+            '\'', '"' => {
+                i = try skipQuoted(expr, i);
+                continue;
+            },
+            '(' => depth += 1,
+            ')' => {
+                if (depth == 0) return error.UnbalancedParentheses;
+                depth -= 1;
+            },
+            '!', '<', '>', '=' => if (depth == 0) {
+                const next: u8 = if (i + 1 < expr.len) expr[i + 1] else 0;
+                const two: ?ast.Operator = switch (c) {
+                    '!' => if (next == '=') .NotEq else null,
+                    '<' => if (next == '=') .LtEq else if (next == '>') .NotEq else null,
+                    '>' => if (next == '=') .GtEq else null,
+                    else => null,
+                };
+                if (two) |op| return .{ .op = op, .at = i, .len = 2 };
+                const one: ?ast.Operator = switch (c) {
+                    '=' => .Eq,
+                    '<' => .Lt,
+                    '>' => .Gt,
+                    else => null,
+                };
+                if (one) |op| return .{ .op = op, .at = i, .len = 1 };
+            },
+            else => {},
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Build a single typed comparison leaf, honoring DECIMAL columns (the
+/// exact unscaled lane) and DATE/TIMESTAMP columns (SQL-style literals
 /// → stored epoch ints). Shared by the comparison path and the IN-list
 /// expansion so both get identical type handling.
 fn buildTypedComparison(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
     col_idx: usize,
     elem: *const schema.SchemaElement,
     op: ast.Operator,
     val_str: []const u8,
     diag: ?*Diag,
 ) Error!ast.Filter {
-    if (decimal_mod.kindFromSchema(elem) != null) {
-        return buildLeafFilter(col_idx, op, val_str, .DOUBLE);
+    // Every leaf that compares a stored value is marked `stored` here and nowhere else, so what membership pruning
+    // hashes (filter/membership.zig) can never drift from what evaluation compares.
+    // Exact epoch nanoseconds (`decimal.exactKind`), so a literal before 1677 or after 2262 compares as written.
+    if (elem.type == .INT96) return .{ .decimal = try int96Leaf(col_idx, op, val_str) };
+    if (decimal_mod.kindFromSchema(elem)) |k| {
+        // Compared on the unscaled integers: through f64, values past 2^53 matched their neighbours.
+        const lit = try scaledLiteral(val_str, k.scale);
+        return .{ .decimal = ast.exactLeaf(i128, col_idx, op, lit.floor, lit.inexact) };
     }
-    if (schema.isUnsignedInt(elem.*)) return buildUnsignedLeaf(col_idx, op, val_str);
+    if (schema.isUnsignedInt(elem.*)) return markStored(try buildUnsignedLeaf(col_idx, op, val_str));
     if (temporalKind(elem)) |tk| {
-        return buildTemporalLeaf(col_idx, op, val_str, tk);
+        const leaf = try buildTemporalLeaf(col_idx, op, val_str, tk);
+        // INT96 decodes to nanoseconds; every other temporal lane holds the stored ticks.
+        return if (elem.type == .INT96) leaf else markStored(leaf);
     }
     // FLOAT16 is physically FIXED_LEN_BYTE_ARRAY(2); without an IEEE-half →
     // f64 lane in the filter/prune path, a numeric predicate falls through to
@@ -465,8 +786,49 @@ fn buildTypedComparison(
         Diag.set(diag, elem.name, .float16_filter);
         return error.UnsupportedType;
     }
+    // A UUID is stored as its 16 bytes; the literal is its text. Compared as text, it never matched.
+    if (elem.logical_type != null and elem.logical_type.? == .UUID and elem.type == .FIXED_LEN_BYTE_ARRAY) {
+        const bytes = try arena.create([16]u8);
+        bytes.* = parseUuid(stripStringQuotes(val_str)) orelse return error.BadValue;
+        return markStored(.{ .string = .{ .col_idx = col_idx, .op = op, .value = bytes } });
+    }
     const ptype = elem.type orelse return error.UnsupportedType;
-    return buildLeafFilter(col_idx, op, val_str, ptype);
+    if (ptype == .BYTE_ARRAY or ptype == .FIXED_LEN_BYTE_ARRAY) {
+        const value = try stringValue(arena, file, elem.name, val_str, diag);
+        return markStored(.{ .string = .{ .col_idx = col_idx, .op = op, .value = value } });
+    }
+    return markStored(try buildLeafFilter(col_idx, op, val_str, ptype));
+}
+
+/// The 16 bytes of a UUID written as 32 hex digits, either bare or hyphenated 8-4-4-4-12.
+fn parseUuid(text: []const u8) ?[16]u8 {
+    var hex: [32]u8 = undefined;
+    switch (text.len) {
+        32 => @memcpy(&hex, text),
+        36 => {
+            var n: usize = 0;
+            for (text, 0..) |c, i| {
+                const dash = i == 8 or i == 13 or i == 18 or i == 23;
+                if (dash != (c == '-')) return null;
+                if (dash) continue;
+                hex[n] = c;
+                n += 1;
+            }
+        },
+        else => return null,
+    }
+    var out: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, &hex) catch return null;
+    return out;
+}
+
+fn markStored(f: ast.Filter) ast.Filter {
+    var out = f;
+    switch (out) {
+        inline .int32, .int64, .uint64, .float, .double, .string, .boolean => |*l| l.stored = true,
+        else => {},
+    }
+    return out;
 }
 
 /// Unsigned columns compare as u64. They hold only 0..2^64-1, so a literal outside that range has a constant answer
@@ -492,7 +854,8 @@ const TemporalKind = struct {
     ns_per_tick: i128,
     lane: Lane,
 };
-const Lane = enum { int32, int64 };
+/// `.uint64` is the lane an unsigned column's leaves compare in (`buildUnsignedLeaf`).
+const Lane = enum { int32, int64, uint64 };
 
 const ns_per_s: i128 = 1_000_000_000;
 const ns_per_day: i128 = 86_400 * ns_per_s;
@@ -542,43 +905,82 @@ fn buildTemporalLeaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8, 
         .date_time => try parseDateTimeNs(val_str),
         .time_of_day => try parseTimeOfDayNs(val_str),
     };
+    // A DATE takes the literal as a DATE, as DuckDB casts an untyped string to the column's type: its time of day is
+    // dropped, not compared (`d = '2024-01-01 12:00:00'` holds on that day), as for `make_date`.
+    if (tk.ns_per_tick == ns_per_day) return bindExact(col_idx, op, tk.lane, @divFloor(lit.ns, ns_per_day), false);
     const inexact = lit.sub_ns or @mod(lit.ns, tk.ns_per_tick) != 0;
     return bindExact(col_idx, op, tk.lane, @divFloor(lit.ns, tk.ns_per_tick), inexact);
 }
 
+/// An INT96 leaf: a bare integer is nanoseconds since the epoch, as the column reads; anything else a date-time.
+fn int96Leaf(col_idx: usize, op: ast.Operator, val_str_raw: []const u8) Error!ast.Leaf(i128) {
+    const val_str = stripStringQuotes(val_str_raw);
+    if (std.fmt.parseInt(i128, val_str, 10)) |ns| return ast.exactLeaf(i128, col_idx, op, ns, false) else |_| {}
+    const lit = try parseDateTimeNs(val_str);
+    return ast.exactLeaf(i128, col_idx, op, lit.ns, lit.sub_ns);
+}
+
 fn bindExact(col_idx: usize, op: ast.Operator, lane: Lane, floor: i128, inexact: bool) ast.Filter {
     return switch (lane) {
-        .int32 => .{ .int32 = exactLeaf(i32, col_idx, op, floor, inexact) },
-        .int64 => .{ .int64 = exactLeaf(i64, col_idx, op, floor, inexact) },
+        .int32 => .{ .int32 = ast.exactLeaf(i32, col_idx, op, floor, inexact) },
+        .int64 => .{ .int64 = ast.exactLeaf(i64, col_idx, op, floor, inexact) },
+        .uint64 => .{ .uint64 = ast.exactLeaf(u64, col_idx, op, floor, inexact) },
     };
 }
 
-/// `col op v` as an equivalent comparison against a value of the column's type, where `v` is `floor` when exact and
-/// otherwise lies strictly between `floor` and `floor + 1` (or beyond the type's range). Rounding the literal to the
-/// column's unit changed answers (`>= 0.0995` s on a millisecond column matched 0.099 s), and because the rewrite is
-/// equivalent on every non-null value, eval, page/row-group pruning and the full-match proof stay exact unchanged.
-fn exactLeaf(comptime T: type, col_idx: usize, op: ast.Operator, floor: i128, inexact: bool) ast.Leaf(T) {
-    const lo = std.math.minInt(T);
-    const hi = std.math.maxInt(T);
-    // No stored value equals `v`: `=` matches nothing and `!=` every non-null row. `col > maxInt` and
-    // `col <= maxInt` say exactly that while still rejecting nulls, and negate into each other for NOT.
-    const never: ast.Leaf(T) = .{ .col_idx = col_idx, .op = .Gt, .value = hi };
-    const always: ast.Leaf(T) = .{ .col_idx = col_idx, .op = .LtEq, .value = hi };
-    const o: ast.Operator = if (!inexact) op else switch (op) {
-        .Eq => return never,
-        .NotEq => return always,
-        .Gt, .GtEq => .Gt,
-        .Lt, .LtEq => .LtEq,
+/// A decimal literal (`-12.50`, `7`, `1.5e3`) times 10^`scale`: its floor and whether that dropped a fraction. A
+/// magnitude no DECIMAL holds (past 10^40) stands as ±10^40, which compares with every stored value as it would.
+fn scaledLiteral(text: []const u8, scale: i32) Error!struct { floor: i256, inexact: bool } {
+    var s = text;
+    const neg = s.len > 0 and s[0] == '-';
+    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s = s[1..];
+    var exp: i64 = 0;
+    if (std.mem.indexOfAny(u8, s, "eE")) |e| {
+        exp = std.fmt.parseInt(i32, s[e + 1 ..], 10) catch return error.BadValue;
+        s = s[0..e];
+    }
+    const dot = std.mem.indexOfScalar(u8, s, '.');
+    const int_part = if (dot) |d| s[0..d] else s;
+    const frac_part = if (dot) |d| s[d + 1 ..] else "";
+    var mant: i256 = 0;
+    var digits: i64 = 0;
+    var any_digit = false;
+    var frac_digits: i64 = 0;
+    for ([_][]const u8{ int_part, frac_part }, 0..) |part, pi| for (part, 0..) |c, i| {
+        // A `_` between digits separates them, as the integer and float lanes read it.
+        if (c == '_' and i > 0 and i + 1 < part.len and
+            std.ascii.isDigit(part[i - 1]) and std.ascii.isDigit(part[i + 1])) continue;
+        if (c < '0' or c > '9') return error.BadValue;
+        any_digit = true;
+        frac_digits += @intCast(pi);
+        if (mant == 0 and c == '0') continue;
+        digits += 1;
+        if (digits > 76) return error.BadValue;
+        mant = mant * 10 + (c - '0');
     };
-    if (floor > hi) return switch (o) {
-        .Gt, .GtEq, .Eq => never,
-        .Lt, .LtEq, .NotEq => always,
-    };
-    if (floor < lo) return switch (o) {
-        .Lt, .LtEq, .Eq => never,
-        .Gt, .GtEq, .NotEq => always,
-    };
-    return .{ .col_idx = col_idx, .op = o, .value = @intCast(floor) };
+    if (!any_digit) return error.BadValue;
+    if (mant == 0) return .{ .floor = 0, .inexact = false };
+    const shift = exp + scale - frac_digits;
+    const huge = pow10Wide(40);
+    var q: i256 = undefined;
+    var r: i256 = 0;
+    if (shift >= 0) {
+        q = if (digits + shift > 40) huge else mant * pow10Wide(@intCast(shift));
+    } else if (-shift > digits) {
+        q = 0;
+        r = mant;
+    } else {
+        const p = pow10Wide(@intCast(-shift));
+        q = @divTrunc(mant, p);
+        r = @rem(mant, p);
+    }
+    return .{ .floor = if (neg) -q - @intFromBool(r != 0) else q, .inexact = r != 0 };
+}
+
+fn pow10Wide(n: u32) i256 {
+    var p: i256 = 1;
+    for (0..n) |_| p *= 10;
+    return p;
 }
 
 /// A literal as whole nanoseconds; `sub_ns` means a nonzero fraction digit past the ninth put it strictly between
@@ -666,11 +1068,7 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
             .op = op,
             .value = std.fmt.parseInt(i64, val_str, 10) catch return error.BadValue,
         } },
-        .FLOAT => .{ .float = .{
-            .col_idx = col_idx,
-            .op = op,
-            .value = std.fmt.parseFloat(f32, val_str) catch return error.BadValue,
-        } },
+        .FLOAT => .{ .float = try floatLeaf(col_idx, op, val_str) },
         .DOUBLE => .{ .double = .{
             .col_idx = col_idx,
             .op = op,
@@ -681,18 +1079,47 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
             .op = op,
             .value = stripStringQuotes(val_str),
         } },
-        .BOOLEAN => .{ .boolean = .{
-            .col_idx = col_idx,
-            .op = op,
-            .value = if (std.mem.eql(u8, val_str, "true") or std.mem.eql(u8, val_str, "1"))
-                true
-            else if (std.mem.eql(u8, val_str, "false") or std.mem.eql(u8, val_str, "0"))
-                false
-            else
-                return error.BadValue,
-        } },
+        .BOOLEAN => .{
+            .boolean = .{
+                .col_idx = col_idx,
+                .op = op,
+                // Any letter case: SQL prints the literal as TRUE.
+                .value = if (std.ascii.eqlIgnoreCase(val_str, "true") or std.mem.eql(u8, val_str, "1"))
+                    true
+                else if (std.ascii.eqlIgnoreCase(val_str, "false") or std.mem.eql(u8, val_str, "0"))
+                    false
+                else
+                    return error.BadValue,
+            },
+        },
         .INT96 => return error.UnsupportedType,
     };
+}
+
+/// A FLOAT literal binds as the f32 it rounds to, the cast SQL makes of it, unless it is finite and past f32's range.
+/// Rounded, it became an infinity: `f > 3.5e38` missed a stored +inf and `f = 3.5e38` matched it. Such a literal lies
+/// strictly between every finite f32 and the infinity on its side, so each comparison with it is one with a bound
+/// f32 has: past the top, `f < v` is `f <= floatMax` and `f > v` is `f > floatMax` (+inf and NaN, above every
+/// number); `=` matches nothing (`f < -inf`) and `!=` every present row (`f >= -inf`). Each negates into its
+/// complement, so NOT stays exact.
+fn floatLeaf(col_idx: usize, op: ast.Operator, val_str: []const u8) Error!ast.Leaf(f32) {
+    const rounded = std.fmt.parseFloat(f32, val_str) catch return error.BadValue;
+    const wide = std.fmt.parseFloat(f64, val_str) catch return error.BadValue;
+    if (!std.math.isInf(rounded) or std.math.isInf(wide)) return .{ .col_idx = col_idx, .op = op, .value = rounded };
+    const top = std.math.floatMax(f32);
+    const inf = std.math.inf(f32);
+    const bound: struct { op: ast.Operator, value: f32 } = if (wide > 0) switch (op) {
+        .Eq => .{ .op = .Lt, .value = -inf },
+        .NotEq => .{ .op = .GtEq, .value = -inf },
+        .Lt, .LtEq => .{ .op = .LtEq, .value = top },
+        .Gt, .GtEq => .{ .op = .Gt, .value = top },
+    } else switch (op) {
+        .Eq => .{ .op = .Lt, .value = -inf },
+        .NotEq => .{ .op = .GtEq, .value = -inf },
+        .Lt, .LtEq => .{ .op = .Lt, .value = -top },
+        .Gt, .GtEq => .{ .op = .GtEq, .value = -top },
+    };
+    return .{ .col_idx = col_idx, .op = bound.op, .value = bound.value };
 }
 
 /// Strip one matching pair of surrounding quotes from a string literal so
@@ -700,6 +1127,53 @@ fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parque
 /// Bare/unquoted literals pass through unchanged (back-compat with the
 /// original syntax). Without this, quoted string filters silently matched
 /// nothing — found by the duckdb cross-impl smoke, 2026-06-13.
+/// A string literal's value: `stripStringQuotes`, with a doubled quote inside a quoted literal read as one quote, as
+/// SQL writes `'it''s'`. Borrows `s` unless there is a doubled quote to undo.
+fn unquoteLiteral(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
+    const inner = stripStringQuotes(s);
+    if (inner.len == s.len) return s;
+    const q = s[0];
+    const doubled = [2]u8{ q, q };
+    if (std.mem.indexOf(u8, inner, &doubled) == null) return inner;
+    const out = try arena.alloc(u8, inner.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) : (i += 1) {
+        out[n] = inner[i];
+        n += 1;
+        if (inner[i] == q and i + 1 < inner.len and inner[i + 1] == q) i += 1;
+    }
+    return out[0..n];
+}
+
+/// The text a string column `col` is compared with: one quoted literal or, the flag form's back-compat, one bare
+/// word. Anything else (`'a' || 'b'`, `upper('a')`, `'a%' ESCAPE '!'`) is an expression the grammar cannot evaluate,
+/// and a word naming a column (`s = t`, `s = "t"`) is a column comparison: read as text, each matched incorrect rows.
+fn stringValue(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
+    col: []const u8,
+    val_str: []const u8,
+    diag: ?*Diag,
+) Error![]const u8 {
+    const quoted = val_str[0] == '\'' or val_str[0] == '"';
+    const one_token = if (quoted)
+        try skipQuoted(val_str, 0) == val_str.len
+    else for (val_str) |c| {
+        if (isSpace(c) or c == '(' or c == ')' or c == '\'' or c == '"' or c == '|') break false;
+    } else true;
+    if (!one_token or (val_str[0] != '\'' and namesColumn(file, val_str))) {
+        Diag.set(diag, col, .non_literal_value);
+        return error.BadValue;
+    }
+    return unquoteLiteral(arena, val_str);
+}
+
+fn namesColumn(file: *const schema.FileMetaData, word: []const u8) bool {
+    _ = metadata.resolveColumn(file, metadata.unquoteIdent(word)) catch |err| return err == error.AmbiguousColumn;
+    return true;
+}
+
 fn stripStringQuotes(s: []const u8) []const u8 {
     if (s.len >= 2) {
         const q = s[0];
@@ -734,7 +1208,7 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
         .type_length = null,
         .repetition_type = .REQUIRED,
         .name = "root",
-        .num_children = 10,
+        .num_children = 11,
         .scale = null,
         .precision = null,
         .field_id = null,
@@ -822,7 +1296,342 @@ fn synthFileMeta(arena: std.mem.Allocator) !schema.FileMetaData {
         .field_id = null,
         .logical_type = t.lt,
     });
+    try meta.schema.append(arena, .{
+        .type = .FIXED_LEN_BYTE_ARRAY,
+        .type_length = 16,
+        .repetition_type = .OPTIONAL,
+        .name = "uid",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = .{ .UUID = .{} },
+    });
     return meta;
+}
+
+fn filterDepth(f: ast.Filter) usize {
+    return switch (f) {
+        .and_filter, .or_filter => |c| blk: {
+            var d: usize = 0;
+            for (c.children) |child| d = @max(d, filterDepth(child));
+            break :blk 1 + d;
+        },
+        else => 1,
+    };
+}
+
+test "regression: IN and NOT IN lists of thousands are one node, values in order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    for ([_][]const u8{ " IN (", " NOT IN (" }) |kw| {
+        var expr: std.ArrayList(u8) = .empty;
+        try expr.print(a, "id{s}", .{kw});
+        for (0..8000) |i| try expr.print(a, "{s}{d}", .{ if (i == 0) "" else ", ", i });
+        try expr.append(a, ')');
+        const f = try parse(a, expr.items, &meta, null);
+        try testing.expectEqual(@as(usize, 2), filterDepth(f));
+        // Leaves left to right are the list's values.
+        var stack: std.ArrayList(ast.Filter) = .empty;
+        try stack.append(a, f);
+        var next: i32 = 0;
+        while (stack.pop()) |n| switch (n) {
+            .and_filter, .or_filter => |c| {
+                try testing.expect((n == .and_filter) == (kw.len > 5));
+                var k = c.children.len;
+                while (k > 0) : (k -= 1) try stack.append(a, c.children[k - 1]);
+            },
+            else => {
+                try testing.expectEqual(next, n.int32.value);
+                next += 1;
+            },
+        };
+        try testing.expectEqual(@as(i32, 8000), next);
+    }
+}
+
+test "regression: chains of a hundred thousand ANDs, ORs and NOTs parse flat and evaluate" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const n_terms = 100_000;
+
+    const ids = [_]i32{ -3, 0, 7, 99_999, 100_000, 5 };
+    const cols = [_]eval.Batch.Column{.{ .i32 = .{ .values = &ids } }};
+    const lookup = [_]?usize{0};
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+
+    const Case = struct { join: []const u8, depth: usize, want: []const bool };
+    const cases = [_]Case{
+        // id >= 0 AND id >= 1 ... AND id >= 99999: only ids of 99999 and up pass.
+        .{ .join = " AND ", .depth = 2, .want = &.{ false, false, false, true, true, false } },
+        // id = 0 OR id = 1 ... OR id = 99999.
+        .{ .join = " OR ", .depth = 2, .want = &.{ false, true, true, true, false, true } },
+    };
+    for (cases) |case| {
+        var expr: std.ArrayList(u8) = .empty;
+        for (0..n_terms) |i| try expr.print(a, "{s}id {s} {d}", .{
+            if (i == 0) "" else case.join,
+            if (std.mem.eql(u8, case.join, " AND ")) ">=" else "=",
+            i,
+        });
+        const f = try parse(a, expr.items, &meta, null);
+        try testing.expectEqual(case.depth, filterDepth(f));
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| try testing.expectEqual(w, sel.isActive(i));
+    }
+
+    // Alternating AND / OR: OR of two-leaf ANDs, three levels.
+    var mixed: std.ArrayList(u8) = .empty;
+    for (0..n_terms) |i| try mixed.print(a, "{s}id > {d}", .{ if (i == 0) "" else if (i % 2 == 1) " AND " else " OR ", i });
+    try testing.expectEqual(@as(usize, 3), filterDepth(try parse(a, mixed.items, &meta, null)));
+
+    // A run of NOTs is its parity: an even one leaves the leaf as it was, an odd one flips it.
+    for ([_]usize{ n_terms, n_terms + 1 }) |nots| {
+        var expr: std.ArrayList(u8) = .empty;
+        for (0..nots) |_| try expr.appendSlice(a, "NOT ");
+        try expr.appendSlice(a, "id > 5");
+        const f = try parse(a, expr.items, &meta, null);
+        try testing.expectEqual(if (nots % 2 == 0) ast.Operator.Gt else ast.Operator.LtEq, f.int32.op);
+    }
+}
+
+/// `f` with every bound IN set dropped, so it evaluates leaf by leaf.
+fn withoutInSets(a: std.mem.Allocator, f: ast.Filter) !ast.Filter {
+    return switch (f) {
+        inline .and_filter, .or_filter => |c, tag| blk: {
+            const children = try a.alloc(ast.Filter, c.children.len);
+            for (c.children, children) |child, *n| n.* = try withoutInSets(a, child);
+            break :blk @unionInit(ast.Filter, @tagName(tag), .{ .children = children });
+        },
+        else => f,
+    };
+}
+
+test "IN lists bound to a set select exactly what their leaves do: nulls, NaN, -0, NOT IN and NOT (IN)" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const n = 777;
+    var prng = std.Random.DefaultPrng.init(0x15e7);
+    const r = prng.random();
+    const ids = try a.alloc(i32, n);
+    const strs = try a.alloc([]const u8, n);
+    const scores = try a.alloc(f64, n);
+    const tss = try a.alloc(i64, n);
+    const defs = try a.alloc(u32, n);
+    const specials = [_]f64{ 0.0, -0.0, std.math.nan(f64), std.math.inf(f64), 2.5 };
+    for (0..n) |i| {
+        ids[i] = r.intRangeAtMost(i32, -300, 300);
+        strs[i] = try std.fmt.allocPrint(a, "s{d}", .{r.uintLessThan(u32, 400)});
+        scores[i] = if (r.boolean())
+            specials[r.uintLessThan(usize, specials.len)]
+        else
+            @floatFromInt(r.intRangeAtMost(i32, -50, 50));
+        tss[i] = r.intRangeAtMost(i64, -1 << 40, 1 << 40);
+        defs[i] = @intFromBool(r.uintLessThan(u8, 6) != 0);
+    }
+    for ([_]usize{ 0, 4 }) |k| tss[k] = 123456789;
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = ids, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = strs, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .{ .f64 = .{ .values = scores, .def_levels = defs, .max_def = 1, .has_nulls = true } },
+        .{ .i64 = .{ .values = tss } },
+    };
+    var lookup: [11]?usize = @splat(null);
+    lookup[0] = 0;
+    lookup[1] = 1;
+    lookup[2] = 2;
+    lookup[4] = 3;
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = n };
+
+    var exprs: std.ArrayList([]const u8) = .empty;
+    for ([_]usize{ 2, 5, 8, 9, 40, 300, 2000 }) |k| {
+        const heads = [_][]const u8{
+            "id IN (",         "id NOT IN (", "status IN (",
+            "NOT status IN (", "ts IN (",     "ts NOT IN (",
+        };
+        for (heads) |head| {
+            var e: std.ArrayList(u8) = .empty;
+            try e.appendSlice(a, head);
+            for (0..k) |i| {
+                if (i > 0) try e.appendSlice(a, ", ");
+                if (head[0] == 's' or head[4] == 's') {
+                    try e.print(a, "'s{d}'", .{r.uintLessThan(u32, 500)});
+                } else if (head[0] == 't') {
+                    try e.print(a, "{d}", .{if (i == 0) 123456789 else r.intRangeAtMost(i64, -1 << 40, 1 << 40)});
+                } else {
+                    try e.print(a, "{d}", .{r.intRangeAtMost(i32, -400, 400)});
+                }
+            }
+            try e.append(a, ')');
+            try exprs.append(a, e.items);
+        }
+    }
+    try exprs.appendSlice(a, &.{
+        "score IN (0, 2.5, 7)",
+        "score IN (-0.0, nan, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)",
+        "score NOT IN (nan, 0, inf, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
+        "NOT score IN (-0.0, -inf, 2.5)",
+    });
+    for (exprs.items) |expr| {
+        const f = try parse(a, expr, &meta, null);
+        try testing.expect(switch (f) {
+            .and_filter, .or_filter => |c| c.in_set != null,
+            else => false,
+        });
+        var want = try selection.SelectionVector.init(a, n);
+        var got = try selection.SelectionVector.init(a, n);
+        for (0..n) |i| if (i % 5 == 0) {
+            want.set(i, false);
+            got.set(i, false);
+        };
+        try eval.evaluate(try withoutInSets(a, f), &batch, &want, &lookup, a);
+        try eval.evaluate(f, &batch, &got, &lookup, a);
+        if (!std.mem.eql(u64, want.mask, got.mask)) {
+            std.debug.print("IN set disagrees with its leaves on: {s}\n", .{expr[0..@min(expr.len, 120)]});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "IN lists holding literals no stored value can equal bind only their real members" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    // `ts` is TIMESTAMP(MICROS): a nanosecond literal binds to the constant `> maxInt` (`<= maxInt` under NOT IN).
+    // A set that took the constant's value as a member would match the row holding maxInt.
+    const tss = [_]i64{ std.math.maxInt(i64), 2, 3, 5, std.math.minInt(i64), 0 };
+    const cols = [_]eval.Batch.Column{.{ .i64 = .{ .values = &tss } }};
+    var lookup: [11]?usize = @splat(null);
+    lookup[4] = 0;
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = tss.len };
+    const sub_us = "'1970-01-01 00:00:00.000000001'";
+    const cases = [_]struct { expr: []const u8, bound: bool }{
+        .{ .expr = "ts IN (" ++ sub_us ++ ", 1, 2, 3, 4, 5, 6, 7, 8, 9)", .bound = true },
+        .{ .expr = "ts NOT IN (" ++ sub_us ++ ", 1, 2, 3, 4, 5, 6, 7, 8, 9)", .bound = true },
+        .{ .expr = "NOT ts IN (" ++ sub_us ++ ", 1, 2, 3, 4, 5, 6, 7, 8, 9)", .bound = true },
+        .{ .expr = "ts IN (" ++ sub_us ++ ", '1970-01-01 00:00:00.000000002')", .bound = false },
+        .{ .expr = "ts NOT IN (" ++ sub_us ++ ", '1970-01-01 00:00:00.000000002')", .bound = false },
+    };
+    for (cases) |c| {
+        const f = try parse(a, c.expr, &meta, null);
+        const bound = switch (f) {
+            .and_filter, .or_filter => |comp| comp.in_set != null,
+            else => false,
+        };
+        try testing.expectEqual(c.bound, bound);
+        var want = try selection.SelectionVector.init(a, tss.len);
+        var got = try selection.SelectionVector.init(a, tss.len);
+        try eval.evaluate(try withoutInSets(a, f), &batch, &want, &lookup, a);
+        try eval.evaluate(f, &batch, &got, &lookup, a);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
+        // The maxInt row: only NOT IN keeps it.
+        try testing.expectEqual(std.mem.indexOf(u8, c.expr, "NOT") != null, got.isActive(0));
+    }
+}
+
+test "unsigned IN lists compare stored bits on both lanes, out-of-range literals folded" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    const root: schema.SchemaElement = .{
+        .type = null,
+        .type_length = null,
+        .repetition_type = null,
+        .name = "schema",
+        .num_children = 2,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    try items.append(a, root);
+    var u32_elem = root;
+    u32_elem.type = .INT32;
+    u32_elem.name = "u";
+    u32_elem.num_children = null;
+    u32_elem.converted_type = .UINT_32;
+    try items.append(a, u32_elem);
+    var u64_elem = u32_elem;
+    u64_elem.type = .INT64;
+    u64_elem.name = "w";
+    u64_elem.converted_type = null;
+    u64_elem.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = false } };
+    try items.append(a, u64_elem);
+    const fm: schema.FileMetaData = .{ .version = 1, .schema = items, .num_rows = 0, .created_by = null, .row_groups = .empty };
+
+    const u_vals = [_]i32{ @bitCast(@as(u32, 3_000_000_000)), 1, -1, 7, 0, @bitCast(@as(u32, 4_000_000_000)) };
+    const w_vals = [_]i64{ @bitCast(@as(u64, std.math.maxInt(u64))), 1, -1, 7, 0, 99 };
+    const cols = [_]eval.Batch.Column{ .{ .i32 = .{ .values = &u_vals } }, .{ .i64 = .{ .values = &w_vals } } };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = u_vals.len };
+    for ([_][]const u8{
+        "u IN (3000000000, 1, -1, 2, 3, 4, 5, 6, 8, 9, 4294967296)",
+        "u NOT IN (3000000000, 1, -1, 2, 3, 4, 5, 6, 8, 9, 4294967296)",
+        "w IN (18446744073709551615, 1, -1, 2, 3, 4, 5, 6, 8, 9, 18446744073709551616)",
+        "NOT w IN (18446744073709551615, 1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 13)",
+    }) |expr| {
+        const f = try parse(a, expr, &fm, null);
+        try testing.expect(switch (f) {
+            .and_filter, .or_filter => |c| c.in_set != null,
+            else => false,
+        });
+        var want = try selection.SelectionVector.init(a, u_vals.len);
+        var got = try selection.SelectionVector.init(a, u_vals.len);
+        try eval.evaluate(try withoutInSets(a, f), &batch, &want, &lookup, a);
+        try eval.evaluate(f, &batch, &got, &lookup, a);
+        try testing.expectEqualSlices(u64, want.mask, got.mask);
+    }
+}
+
+test "regression: a UUID literal binds to the 16 bytes the column stores" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const want = [16]u8{
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+    };
+    for ([_][]const u8{
+        "uid = '550e8400-e29b-41d4-a716-446655440000'",
+        "uid = '550E8400E29B41D4A716446655440000'",
+        "uid IN ('550e8400-e29b-41d4-a716-446655440000')",
+    }) |expr| {
+        const f = try parse(a, expr, &meta, null);
+        try testing.expectEqualSlices(u8, &want, f.string.value);
+        try testing.expect(f.string.stored);
+    }
+    for ([_][]const u8{
+        "uid = '550e8400-e29b-41d4-a716-44665544000'",
+        "uid = '550e8400e-29b-41d4-a716-446655440000'",
+        "uid = '550e8400-e29b-41d4-a716-44665544000g'",
+        "uid = 'abc'",
+    }) |expr| try testing.expectError(error.BadValue, parse(a, expr, &meta, null));
 }
 
 test "parse simple int equality" {
@@ -866,6 +1675,132 @@ test "parse strips quotes from string literals (sql-style + back-compat)" {
     // Bare/unquoted literal still works (original syntax).
     const bare = try parse(a, "status = active", &meta, null);
     try testing.expectEqualStrings("active", bare.string.value);
+}
+
+test "regression: a string column compares only with one literal, never a column or an expression read as text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const refused = [_][]const u8{
+        "status = id",
+        "status <> \"id\"",
+        "status = 'ab' || 'c'",
+        "status = upper('abc')",
+        "status LIKE 'a%' ESCAPE '!'",
+        "status NOT LIKE 'a%' ESCAPE '!'",
+        "status LIKE id",
+        "status IN ('a', id)",
+        "status BETWEEN 'a' AND score",
+        "status = 'a' 'b'",
+    };
+    for (refused) |text| {
+        var diag: Diag = .{};
+        try testing.expectError(error.BadValue, parse(a, text, &meta, &diag));
+        try testing.expect(diag.detail == .non_literal_value);
+        try testing.expectEqualStrings("status", diag.column.get());
+    }
+    try testing.expectEqualStrings("it's", (try parse(a, "status = 'it''s'", &meta, null)).string.value);
+    try testing.expectEqualStrings("a || b", (try parse(a, "status = 'a || b'", &meta, null)).string.value);
+    try testing.expectEqualStrings("n1", (try parse(a, "status LIKE 'n1%'", &meta, null)).like.operand);
+}
+
+test "regression: DECIMAL literals bind exactly at the column's scale, a fraction it cannot hold by floor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const Case = struct { text: []const u8, op: ast.Operator, value: i128 };
+    const max = std.math.maxInt(i128);
+    const cases = [_]Case{
+        // `dec` is DECIMAL(20,2): unscaled hundredths, exact past 2^53 where f64 is not.
+        .{ .text = "dec = 90071992547409.93", .op = .Eq, .value = 9007199254740993 },
+        .{ .text = "dec > 1.5e1", .op = .Gt, .value = 1500 },
+        .{ .text = "dec <= -0.07", .op = .LtEq, .value = -7 },
+        .{ .text = "dec > 1.005", .op = .Gt, .value = 100 },
+        .{ .text = "dec >= 1.005", .op = .Gt, .value = 100 },
+        .{ .text = "dec < 1.005", .op = .LtEq, .value = 100 },
+        .{ .text = "dec < -1.005", .op = .LtEq, .value = -101 },
+        .{ .text = "dec >= -0.001", .op = .Gt, .value = -1 },
+        .{ .text = "dec >= 25e-3", .op = .Gt, .value = 2 },
+        .{ .text = "dec = 0.000", .op = .Eq, .value = 0 },
+        .{ .text = "dec >= 1_000.2_5", .op = .GtEq, .value = 100025 },
+        // No stored value equals an inexact literal; past every value, the order alone decides.
+        .{ .text = "dec = 1.005", .op = .Gt, .value = max },
+        .{ .text = "dec <> 1.005", .op = .LtEq, .value = max },
+        .{ .text = "dec < 1e50", .op = .LtEq, .value = max },
+        .{ .text = "dec > 1e50", .op = .Gt, .value = max },
+        .{ .text = "dec > -1e50", .op = .LtEq, .value = max },
+        .{ .text = "dec = -1e50", .op = .Gt, .value = max },
+    };
+    for (cases) |c| {
+        const f = try parse(a, c.text, &meta, null);
+        try testing.expectEqual(c.op, f.decimal.op);
+        try testing.expectEqual(c.value, f.decimal.value);
+        try testing.expect(!f.decimal.stored);
+    }
+    const bad = [_][]const u8{ "dec = 1.2.3", "dec = 1e", "dec = abc", "dec = .", "dec = nan", "dec = 1x", "dec = _" };
+    for (bad ++ [_][]const u8{"dec = 1__0"}) |text| {
+        try testing.expectError(error.BadValue, parse(a, text, &meta, null));
+    }
+}
+
+test "make_date(c) compares the DATE an integer column counts, on its stored days" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const ints = [_]struct { name: []const u8, type: schema.Type, lt: ?schema.LogicalType }{
+        .{ .name = "u16", .type = .INT32, .lt = .{ .INTEGER = .{ .bitWidth = 16, .isSigned = false } } },
+        .{ .name = "u32", .type = .INT32, .lt = .{ .INTEGER = .{ .bitWidth = 32, .isSigned = false } } },
+        .{ .name = "big", .type = .INT64, .lt = null },
+    };
+    meta.schema.items[0].num_children.? += ints.len;
+    for (ints) |t| try meta.schema.append(a, .{
+        .type = t.type,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = t.name,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+        .logical_type = t.lt,
+    });
+
+    const signed = try parse(a, "make_date(id) >= '2013-07-01'", &meta, null);
+    try testing.expectEqual(ast.Operator.GtEq, signed.int32.op);
+    try testing.expectEqual(@as(i32, 15887), signed.int32.value);
+    try testing.expect(signed.int32.stored);
+    // An unsigned column compares in its own lane, as `u16 <= 15917` would.
+    const unsigned = try parse(a, "MAKE_DATE( u16 ) <= '2013-07-31'", &meta, null);
+    try testing.expectEqual(ast.Operator.LtEq, unsigned.uint64.op);
+    try testing.expectEqual(@as(u64, 15917), unsigned.uint64.value);
+    // The literal is cast to DATE, as DuckDB casts it: its time of day is dropped, before the epoch too.
+    const noon = try parse(a, "make_date(id) = '2013-07-01 12:00:00'", &meta, null);
+    try testing.expectEqual(ast.Operator.Eq, noon.int32.op);
+    try testing.expectEqual(@as(i32, 15887), noon.int32.value);
+    const before_epoch = try parse(a, "make_date(id) < '1969-12-31T23:00:00'", &meta, null);
+    try testing.expectEqual(@as(i32, -1), before_epoch.int32.value);
+    const between = try parse(a, "make_date(u16) BETWEEN '2013-07-01' AND '2013-07-31'", &meta, null);
+    try testing.expectEqual(@as(usize, 2), between.and_filter.children.len);
+    const in_list = try parse(a, "make_date(u16) IN ('2013-07-01', '2013-07-02')", &meta, null);
+    try testing.expect(in_list.or_filter.in_set != null);
+    try testing.expectEqual(@as(usize, 0), (try parse(a, "make_date(id) = NULL", &meta, null)).or_filter.children.len);
+
+    // DuckDB's make_date takes an INTEGER: no UINTEGER, BIGINT, DATE or string, and no other function binds.
+    for ([_][]const u8{
+        "make_date(u32) = '2013-07-01'", "make_date(big) = '2013-07-01'",
+        "make_date(d) = '2013-07-01'",   "make_date(status) = '2013-07-01'",
+    }) |src|
+        try testing.expectError(error.UnsupportedType, parse(a, src, &meta, null));
+    try testing.expectError(error.BadOperator, parse(a, "abs(id) = 1", &meta, null));
+    try testing.expectError(error.BadValue, parse(a, "make_date(id) = 'July'", &meta, null));
 }
 
 test "parse DATE/TIMESTAMP literals → epoch ints" {
@@ -948,11 +1883,12 @@ test "parse binds temporal literals finer than the column's unit exactly" {
     try expectLeaf(i64, try parse(a, "tsns > '1600-01-01'", &meta, null), .LtEq, max64);
     try expectLeaf(i64, try parse(a, "tsns <= '1600-01-01'", &meta, null), .Gt, max64);
 
-    // DATE vs a timestamp literal compares as a timestamp: noon is after the date's midnight.
-    try expectLeaf(i32, try parse(a, "d >= '2024-01-01 12:00:00'", &meta, null), .Gt, 19723);
-    try expectLeaf(i32, try parse(a, "d < '2024-01-01 12:00:00'", &meta, null), .LtEq, 19723);
-    try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00.000000001'", &meta, null), .Gt, max32);
+    // A DATE casts a date-time literal to DATE, as DuckDB does, dropping the time of day, before the epoch too.
+    try expectLeaf(i32, try parse(a, "d >= '2024-01-01 12:00:00'", &meta, null), .GtEq, 19723);
+    try expectLeaf(i32, try parse(a, "d < '2024-01-01 12:00:00'", &meta, null), .Lt, 19723);
+    try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00.000000001'", &meta, null), .Eq, 19723);
     try expectLeaf(i32, try parse(a, "d = '2024-01-01 00:00:00'", &meta, null), .Eq, 19723);
+    try expectLeaf(i32, try parse(a, "d = '1969-12-31 23:00:00'", &meta, null), .Eq, -1);
 
     // TIME32 (millis, INT32) and TIME64 (nanos, INT64).
     try expectLeaf(i32, try parse(a, "tm >= '00:01:40.0005'", &meta, null), .Gt, 100_000);
@@ -964,14 +1900,14 @@ test "parse binds temporal literals finer than the column's unit exactly" {
 
     // BETWEEN and IN bind each bound/element the same way.
     const btw = try parse(a, "tsms BETWEEN '2024-01-01 00:00:00.0005' AND '2024-01-01 00:00:00.0105'", &meta, null);
-    try expectLeaf(i64, btw.and_filter.left.*, .Gt, ms);
-    try expectLeaf(i64, btw.and_filter.right.*, .LtEq, ms + 10);
+    try expectLeaf(i64, btw.and_filter.children[0], .Gt, ms);
+    try expectLeaf(i64, btw.and_filter.children[1], .LtEq, ms + 10);
     const in = try parse(a, "tsms IN ('2024-01-01 00:00:00.0995', '2024-01-01 00:00:00.100')", &meta, null);
-    try expectLeaf(i64, in.or_filter.left.*, .Gt, max64);
-    try expectLeaf(i64, in.or_filter.right.*, .Eq, ms + 100);
+    try expectLeaf(i64, in.or_filter.children[0], .Gt, max64);
+    try expectLeaf(i64, in.or_filter.children[1], .Eq, ms + 100);
     const nin = try parse(a, "tsms NOT IN ('2024-01-01 00:00:00.0995', '2024-01-01 00:00:00.100')", &meta, null);
-    try expectLeaf(i64, nin.and_filter.left.*, .LtEq, max64);
-    try expectLeaf(i64, nin.and_filter.right.*, .NotEq, ms + 100);
+    try expectLeaf(i64, nin.and_filter.children[0], .LtEq, max64);
+    try expectLeaf(i64, nin.and_filter.children[1], .NotEq, ms + 100);
 
     // Malformed literals fail loudly instead of binding something nearby.
     const bad = [_][]const u8{
@@ -989,24 +1925,25 @@ test "parse IN / NOT IN / NOT" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // id IN (1, 2, 3) → ((id=1 OR id=2) OR id=3)
+    // id IN (1, 2, 3) → (id=1 OR (id=2 OR id=3)), balanced
     const f = try parse(a, "id IN (1, 2, 3)", &meta, null);
     try testing.expect(f == .or_filter);
-    try testing.expectEqual(@as(i32, 1), f.or_filter.left.*.or_filter.left.*.int32.value);
-    try testing.expectEqual(ast.Operator.Eq, f.or_filter.left.*.or_filter.left.*.int32.op);
-    try testing.expectEqual(@as(i32, 3), f.or_filter.right.*.int32.value);
+    try testing.expectEqual(@as(i32, 1), f.or_filter.children[0].int32.value);
+    try testing.expectEqual(ast.Operator.Eq, f.or_filter.children[0].int32.op);
+    try testing.expectEqual(@as(i32, 2), f.or_filter.children[1].int32.value);
+    try testing.expectEqual(@as(i32, 3), f.or_filter.children[2].int32.value);
 
     // id NOT IN (1, 2) → (id!=1 AND id!=2)
     const fni = try parse(a, "id NOT IN (1, 2)", &meta, null);
     try testing.expect(fni == .and_filter);
-    try testing.expectEqual(ast.Operator.NotEq, fni.and_filter.left.*.int32.op);
-    try testing.expectEqual(ast.Operator.NotEq, fni.and_filter.right.*.int32.op);
+    try testing.expectEqual(ast.Operator.NotEq, fni.and_filter.children[0].int32.op);
+    try testing.expectEqual(ast.Operator.NotEq, fni.and_filter.children[1].int32.op);
 
     // string IN with quotes
     const fs = try parse(a, "status IN ('active', 'idle')", &meta, null);
     try testing.expect(fs == .or_filter);
-    try testing.expectEqualStrings("active", fs.or_filter.left.*.string.value);
-    try testing.expectEqualStrings("idle", fs.or_filter.right.*.string.value);
+    try testing.expectEqualStrings("active", fs.or_filter.children[0].string.value);
+    try testing.expectEqualStrings("idle", fs.or_filter.children[1].string.value);
 
     // NOT id > 5 → id <= 5
     const fnot = try parse(a, "NOT id > 5", &meta, null);
@@ -1016,8 +1953,8 @@ test "parse IN / NOT IN / NOT" {
     // NOT score BETWEEN 1 AND 2 → De Morgan → (score < 1 OR score > 2)
     const fb = try parse(a, "NOT score BETWEEN 1 AND 2", &meta, null);
     try testing.expect(fb == .or_filter);
-    try testing.expectEqual(ast.Operator.Lt, fb.or_filter.left.*.double.op);
-    try testing.expectEqual(ast.Operator.Gt, fb.or_filter.right.*.double.op);
+    try testing.expectEqual(ast.Operator.Lt, fb.or_filter.children[0].double.op);
+    try testing.expectEqual(ast.Operator.Gt, fb.or_filter.children[1].double.op);
 }
 
 test "parse double >=" {
@@ -1041,9 +1978,9 @@ test "parse AND composite" {
 
     const f = try parse(a, "id>10 AND status=active", &meta, null);
     try testing.expect(f == .and_filter);
-    try testing.expectEqual(@as(usize, 0), f.and_filter.left.int32.col_idx);
-    try testing.expectEqual(ast.Operator.Gt, f.and_filter.left.int32.op);
-    try testing.expectEqualStrings("active", f.and_filter.right.string.value);
+    try testing.expectEqual(@as(usize, 0), f.and_filter.children[0].int32.col_idx);
+    try testing.expectEqual(ast.Operator.Gt, f.and_filter.children[0].int32.op);
+    try testing.expectEqualStrings("active", f.and_filter.children[1].string.value);
 }
 
 test "parse OR has lower precedence than AND" {
@@ -1057,7 +1994,7 @@ test "parse OR has lower precedence than AND" {
     // In our shape that's an or_filter whose right is an and_filter.
     const f = try parse(a, "status=error OR id>=1000 AND score=1.5", &meta, null);
     try testing.expect(f == .or_filter);
-    try testing.expect(f.or_filter.right.* == .and_filter);
+    try testing.expect(f.or_filter.children[1] == .and_filter);
 }
 
 test "parse rejects unknown column" {
@@ -1077,11 +2014,391 @@ test "parse rejects unsupported syntax with specific errors" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // Grouping parens get a named error (not the old misleading UnknownColumn).
-    try testing.expectError(error.GroupingNotSupported, parse(a, "(id > 1 OR id < 5)", &meta, null));
-    try testing.expectError(error.GroupingNotSupported, parse(a, "id > 1 AND (score < 5 OR id > 9)", &meta, null));
+    try testing.expectError(error.UnbalancedParentheses, parse(a, "(id > 1 OR id < 5", &meta, null));
+    try testing.expectError(error.UnbalancedParentheses, parse(a, "id > 1) OR (id < 5", &meta, null));
+    try testing.expectError(error.EmptyExpr, parse(a, "id > 1 AND ()", &meta, null));
+    // A quote that never closes is an error, never a literal that swallows or splits the rest.
+    try testing.expectError(error.UnterminatedString, parse(a, "status = 'O\\'Reilly' AND id = 1", &meta, null));
+    try testing.expectError(error.UnterminatedString, parse(a, "status = 'abc", &meta, null));
+    try testing.expectError(error.UnterminatedString, parse(a, "\"status = 1", &meta, null));
+    // What parentheses remain inside a leaf are no grouping this grammar has.
+    try testing.expectError(error.BadOperator, parse(a, "(id + 1) = 2", &meta, null));
     // LIKE on a non-string column is a clear error.
     try testing.expectError(error.UnsupportedType, parse(a, "id LIKE '5%'", &meta, null));
+
+    var deep: std.ArrayList(u8) = .empty;
+    for (0..MAX_GROUP_DEPTH) |_| try deep.appendSlice(a, "(");
+    try deep.appendSlice(a, "id > 1");
+    for (0..MAX_GROUP_DEPTH) |_| try deep.appendSlice(a, ")");
+    _ = try parse(a, deep.items, &meta, null);
+    const deeper = try std.fmt.allocPrint(a, "NOT ({s})", .{deep.items});
+    try testing.expectError(error.FilterTooDeep, parse(a, deeper, &meta, null));
+}
+
+test "parse groups with parentheses, quotes and NOT as SQL does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    // `(a OR b) AND c` keeps the OR beneath the AND.
+    const f = try parse(a, "(id = 1 OR id = 2) AND status = 'a'", &meta, null);
+    try testing.expect(f == .and_filter);
+    try testing.expect(f.and_filter.children[0] == .or_filter);
+    // Keywords and operators inside quotes are the value's, and a doubled quote is one quote.
+    const q = try parse(a, "status = 'x OR y AND z' OR status = 'it''s' OR status = 'a<b'", &meta, null);
+    try testing.expectEqual(@as(usize, 3), q.or_filter.children.len);
+    try testing.expectEqualStrings("x OR y AND z", q.or_filter.children[0].string.value);
+    try testing.expectEqualStrings("it's", q.or_filter.children[1].string.value);
+    try testing.expectEqualStrings("a<b", q.or_filter.children[2].string.value);
+    const in_quotes = try parse(a, "status IN ('a,b', 'c) OR (d')", &meta, null);
+    try testing.expectEqualStrings("a,b", in_quotes.or_filter.children[0].string.value);
+    try testing.expectEqualStrings("c) OR (d", in_quotes.or_filter.children[1].string.value);
+    // NOT applies to the group: De Morgan, not to its first leaf.
+    const n = try parse(a, "NOT (id = 1 AND status = 'a')", &meta, null);
+    try testing.expect(n == .or_filter);
+    try testing.expectEqual(ast.Operator.NotEq, n.or_filter.children[0].int32.op);
+    // Lower-case keywords split as upper-case ones do.
+    const lc = try parse(a, "id = 1 or not (id = 2 and id = 3)", &meta, null);
+    try testing.expect(lc == .or_filter);
+    // NOT BETWEEN is the complement of BETWEEN's range.
+    const nb = try parse(a, "id NOT BETWEEN 2 AND 4", &meta, null);
+    try testing.expect(nb == .or_filter);
+    try testing.expectEqual(ast.Operator.Lt, nb.or_filter.children[0].int32.op);
+    try testing.expectEqual(ast.Operator.Gt, nb.or_filter.children[1].int32.op);
+}
+
+/// Three-valued truth of a generated predicate for one row: null is UNKNOWN.
+const Tri = ?bool;
+
+fn triAnd(x: Tri, y: Tri) Tri {
+    if (x == false or y == false) return false;
+    if (x == null or y == null) return null;
+    return true;
+}
+
+fn triOr(x: Tri, y: Tri) Tri {
+    if (x == true or y == true) return true;
+    if (x == null or y == null) return null;
+    return false;
+}
+
+fn triNot(x: Tri) Tri {
+    return if (x) |v| !v else null;
+}
+
+const GenRow = struct { id: ?i32, status: ?[]const u8 };
+
+/// Writes a random predicate over `id` and `status` to `out` and returns its truth for each of `rows`.
+fn genPredicate(
+    a: std.mem.Allocator,
+    rand: std.Random,
+    out: *std.ArrayList(u8),
+    rows: []const GenRow,
+    depth: u32,
+) ![]Tri {
+    const truth = try a.alloc(Tri, rows.len);
+    const kw = struct {
+        fn word(r: std.Random, upper: []const u8, lower: []const u8) []const u8 {
+            return if (r.boolean()) upper else lower;
+        }
+    };
+    const pick = if (depth >= 4) rand.uintLessThan(u8, 9) else rand.uintLessThan(u8, 13);
+    switch (pick) {
+        0...8 => {
+            const v: i32 = rand.uintLessThan(u8, 4);
+            const w: i32 = v + rand.uintLessThan(u8, 3);
+            const strs = [_][]const u8{ "a", "it''s", "x OR y", "b" };
+            const vals = [_][]const u8{ "a", "it's", "x OR y", "b" };
+            const s = rand.uintLessThan(usize, strs.len);
+            switch (pick) {
+                0 => try out.print(a, "id = {d}", .{v}),
+                1 => try out.print(a, "id != {d}", .{v}),
+                2 => try out.print(a, "id < {d}", .{v}),
+                3 => try out.print(a, "id {s} ({d}, {d})", .{ kw.word(rand, "IN", "in"), v, w }),
+                4 => try out.print(a, "id NOT IN ({d}, {d})", .{ v, w }),
+                5 => try out.print(a, "id {s} {d} {s} {d}", .{ kw.word(rand, "BETWEEN", "between"), v, kw.word(rand, "AND", "and"), w }),
+                6 => try out.print(a, "id {s}", .{kw.word(rand, "IS NULL", "IS NOT NULL")}),
+                7 => try out.print(a, "status = '{s}'", .{strs[s]}),
+                8 => try out.print(a, "status LIKE '%{s}%'", .{strs[s][0..1]}),
+                else => unreachable,
+            }
+            const is_null_kw = pick == 6 and std.mem.endsWith(u8, out.items, "IS NULL");
+            for (rows, truth) |row, *t| t.* = switch (pick) {
+                0 => if (row.id) |x| x == v else null,
+                1 => if (row.id) |x| x != v else null,
+                2 => if (row.id) |x| x < v else null,
+                3 => if (row.id) |x| x == v or x == w else null,
+                4 => if (row.id) |x| x != v and x != w else null,
+                5 => if (row.id) |x| x >= v and x <= w else null,
+                6 => if (is_null_kw) row.id == null else row.id != null,
+                7 => if (row.status) |x| std.mem.eql(u8, x, vals[s]) else null,
+                8 => if (row.status) |x| std.mem.indexOf(u8, x, vals[s][0..1]) != null else null,
+                else => unreachable,
+            };
+        },
+        9 => {
+            try out.appendSlice(a, kw.word(rand, "NOT ", "not "));
+            try out.appendSlice(a, "(");
+            const inner = try genPredicate(a, rand, out, rows, depth + 1);
+            try out.appendSlice(a, ")");
+            for (inner, truth) |x, *t| t.* = triNot(x);
+        },
+        else => {
+            const conj = pick != 12;
+            const n = 2 + rand.uintLessThan(usize, 2);
+            try out.appendSlice(a, "(");
+            for (0..n) |k| {
+                if (k > 0) try out.appendSlice(a, if (conj) kw.word(rand, " AND ", " and ") else kw.word(rand, " OR ", " or "));
+                const part = try genPredicate(a, rand, out, rows, depth + 1);
+                for (part, truth) |x, *t| t.* = if (k == 0) x else if (conj) triAnd(t.*, x) else triOr(t.*, x);
+            }
+            try out.appendSlice(a, ")");
+        },
+    }
+    return truth;
+}
+
+test "a NULL in an IN list matches nothing and leaves NOT IN true for no row, under any NOT" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const ids = [_]i32{ 1, 2, 5, 0 };
+    const id_def = [_]u32{ 1, 1, 1, 0 };
+    const strs = [_][]const u8{ "foo", "NULL", "bar", "" };
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = &ids, .def_levels = &id_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    const cases = [_]Case{
+        .{ .filter = "id IN (1, NULL, 5)", .want = .{ true, false, true, false } },
+        .{ .filter = "id NOT IN (1, NULL)", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (id IN (1, NULL))", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (id NOT IN (1, NULL))", .want = .{ true, false, false, false } },
+        .{ .filter = "id IN (NULL) OR id = 2", .want = .{ false, true, false, false } },
+        .{ .filter = "id = NULL OR NOT (id != NULL)", .want = .{ false, false, false, false } },
+        // On a string column, NULL is the NULL literal, never the text 'NULL'.
+        .{ .filter = "status NOT IN ('foo', NULL)", .want = .{ false, false, false, false } },
+        .{ .filter = "status IN ('NULL', null)", .want = .{ false, true, false, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
+}
+
+test "regression: a NULL LIKE pattern or BETWEEN bound is UNKNOWN, never the text 'NULL', under any NOT" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    const ids = [_]i32{ 1, 2, 5, 0 };
+    const id_def = [_]u32{ 1, 1, 1, 0 };
+    const strs = [_][]const u8{ "foo", "NULL", "bar", "" };
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = &ids, .def_levels = &id_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    const cases = [_]Case{
+        .{ .filter = "status LIKE NULL", .want = .{ false, false, false, false } },
+        .{ .filter = "status NOT LIKE null", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (status LIKE NULL)", .want = .{ false, false, false, false } },
+        .{ .filter = "status LIKE NULL OR id = 2", .want = .{ false, true, false, false } },
+        .{ .filter = "status LIKE 'NULL'", .want = .{ false, true, false, false } },
+        .{ .filter = "id BETWEEN NULL AND 2", .want = .{ false, false, false, false } },
+        .{ .filter = "id BETWEEN NULL AND NULL", .want = .{ false, false, false, false } },
+        // x < NULL OR x > 2: the second half still holds for 5.
+        .{ .filter = "id NOT BETWEEN NULL AND 2", .want = .{ false, false, true, false } },
+        .{ .filter = "NOT (id BETWEEN 3 AND NULL)", .want = .{ true, true, false, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
+    // LIKE keeps its type rule for a NULL pattern too.
+    try testing.expectError(error.UnsupportedType, parse(a, "id LIKE NULL", &meta, null));
+}
+
+test "regression: NOT over a float range keeps NaN rows: floats compare in total order, NaN above every number" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    // The fuzz repro's column, then the same values dictionary-coded.
+    const nan = std.math.nan(f64);
+    const vals = [_]f64{ nan, 0.5, 2.0, 0 };
+    const defs = [_]u32{ 1, 1, 1, 0 };
+    const dict = [_]f64{ 2.0, nan, 0.5 };
+    const codes = [_]u32{ 1, 2, 0, 0 };
+    const plain = [_]eval.Batch.Column{.{ .f64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    const coded = [_]eval.Batch.Column{.{ .f64 = .{
+        .values = &.{},
+        .codes = &codes,
+        .dict = &dict,
+        .def_levels = &defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const lookup = [_]?usize{ null, null, 0 };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    const cases = [_]Case{
+        .{ .filter = "NOT (score < 1.0)", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score <= 1.0)", .want = .{ true, false, true, false } },
+        .{ .filter = "score NOT BETWEEN 0 AND 1", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score BETWEEN 0 AND 1)", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score < 1.0 AND score > 0)", .want = .{ true, false, true, false } },
+        .{ .filter = "NOT (score < 1.0 OR score = 5)", .want = .{ true, false, true, false } },
+        .{ .filter = "score > 1.0", .want = .{ true, false, true, false } },
+        .{ .filter = "score >= 1.0", .want = .{ true, false, true, false } },
+        .{ .filter = "score < 1.0", .want = .{ false, true, false, false } },
+        .{ .filter = "NOT (score > 1.0)", .want = .{ false, true, false, false } },
+        .{ .filter = "NOT (score >= 1.0)", .want = .{ false, true, false, false } },
+        .{ .filter = "score != 0.5", .want = .{ true, false, true, false } },
+        // NaN and infinite literals bind through the --filter text: NaN equals NaN and lies above +inf.
+        .{ .filter = "score = nan", .want = .{ true, false, false, false } },
+        .{ .filter = "score != nan", .want = .{ false, true, true, false } },
+        .{ .filter = "score < nan", .want = .{ false, true, true, false } },
+        .{ .filter = "score >= nan", .want = .{ true, false, false, false } },
+        .{ .filter = "score > nan", .want = .{ false, false, false, false } },
+        .{ .filter = "score <= inf", .want = .{ false, true, true, false } },
+        .{ .filter = "score > -inf", .want = .{ true, true, true, false } },
+        .{ .filter = "score IN (nan, 2.0)", .want = .{ true, false, true, false } },
+        .{ .filter = "score NOT IN (nan, 2.0)", .want = .{ false, true, false, false } },
+        .{ .filter = "score NOT IN (0.5)", .want = .{ true, false, true, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        for ([_][]const eval.Batch.Column{ &plain, &coded }) |cols| {
+            var sel = try selection.SelectionVector.init(a, vals.len);
+            try eval.evaluate(f, &.{ .cols = cols, .num_rows = vals.len }, &sel, &lookup, a);
+            for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+                std.debug.print("{s} ({s}): row {d}\n", .{ case.filter, if (cols.ptr == &plain) "plain" else "coded", i });
+                return err;
+            };
+        }
+    }
+}
+
+test "regression: a FLOAT literal past f32's range compares exactly, not as the infinity it rounds to" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    meta.schema.items[3].type = .FLOAT; // score
+    const inf = std.math.inf(f32);
+    const top = std.math.floatMax(f32);
+    const vals = [_]f32{ inf, top, 0.5, -top, -inf, std.math.nan(f32) };
+    const cols = [_]eval.Batch.Column{.{ .f32 = .{ .values = &vals } }};
+    const lookup = [_]?usize{ null, null, 0 };
+    const Case = struct { filter: []const u8, want: [6]bool };
+    const cases = [_]Case{
+        .{ .filter = "score > 3.5e38", .want = .{ true, false, false, false, false, true } },
+        .{ .filter = "score >= 3.5e38", .want = .{ true, false, false, false, false, true } },
+        .{ .filter = "score < 3.5e38", .want = .{ false, true, true, true, true, false } },
+        .{ .filter = "score <= 1e300", .want = .{ false, true, true, true, true, false } },
+        .{ .filter = "score = 3.5e38", .want = .{ false, false, false, false, false, false } },
+        .{ .filter = "score != 3.5e38", .want = .{ true, true, true, true, true, true } },
+        .{ .filter = "NOT (score = 3.5e38)", .want = .{ true, true, true, true, true, true } },
+        .{ .filter = "NOT (score > 3.5e38)", .want = .{ false, true, true, true, true, false } },
+        .{ .filter = "score < -3.5e38", .want = .{ false, false, false, false, true, false } },
+        .{ .filter = "score > -3.5e38", .want = .{ true, true, true, true, false, true } },
+        .{ .filter = "NOT (score <= -3.5e38)", .want = .{ true, true, true, true, false, true } },
+        .{ .filter = "score IN (3.5e38, 0.5)", .want = .{ false, false, true, false, false, false } },
+        // In range, a literal still binds as the f32 it rounds to; an infinite one is the infinity.
+        .{ .filter = "score = 3.4028235e38", .want = .{ false, true, false, false, false, false } },
+        .{ .filter = "score = inf", .want = .{ true, false, false, false, false, false } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, vals.len);
+        try eval.evaluate(f, &.{ .cols = &cols, .num_rows = vals.len }, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
+}
+
+test "fuzz-lite: nested predicates select exactly the rows three-valued logic passes" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    var rows: [64]GenRow = undefined;
+    var prng = std.Random.DefaultPrng.init(0x9a7e);
+    const rand = prng.random();
+    const statuses = [_]?[]const u8{ "a", "it's", "x OR y", "b", "ab", null };
+    for (&rows) |*r| r.* = .{
+        .id = if (rand.uintLessThan(u8, 5) == 0) null else @as(i32, rand.uintLessThan(u8, 6)),
+        .status = statuses[rand.uintLessThan(usize, statuses.len)],
+    };
+    var ids: [rows.len]i32 = undefined;
+    var id_def: [rows.len]u32 = undefined;
+    var strs: [rows.len][]const u8 = undefined;
+    var str_def: [rows.len]u32 = undefined;
+    for (rows, 0..) |r, i| {
+        ids[i] = r.id orelse 0;
+        id_def[i] = if (r.id == null) 0 else 1;
+        strs[i] = r.status orelse "";
+        str_def[i] = if (r.status == null) 0 else 1;
+    }
+    const cols = [_]eval.Batch.Column{
+        .{ .i32 = .{ .values = &ids, .def_levels = &id_def, .max_def = 1, .has_nulls = true } },
+        .{ .string = .{ .values = &strs, .def_levels = &str_def, .max_def = 1, .has_nulls = true } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = rows.len };
+
+    for (0..400) |_| {
+        var text: std.ArrayList(u8) = .empty;
+        const want = try genPredicate(a, rand, &text, &rows, 0);
+        const f = parse(a, text.items, &meta, null) catch |err| {
+            std.debug.print("parse failed: {s}: {s}\n", .{ text.items, @errorName(err) });
+            return err;
+        };
+        var sel = try selection.SelectionVector.init(a, rows.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (want, 0..) |w, i| {
+            if (sel.isActive(i) != (w == true)) {
+                std.debug.print("row {d} {?d} {?s}: {s}\n", .{ i, rows[i].id, rows[i].status, text.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
 
 test "parse LIKE → classified like node (+ NOT LIKE)" {
@@ -1125,6 +2442,31 @@ test "likeGlob backtracking matcher" {
     try testing.expect(!ast.likeGlob("end", "the end x"));
 }
 
+test "regression: LIKE `_` matches one UTF-8 character, not one byte" {
+    try testing.expect(ast.likeGlob("_", "é"));
+    try testing.expect(ast.likeGlob("a_", "aé"));
+    try testing.expect(ast.likeGlob("_b_", "€b😀"));
+    try testing.expect(!ast.likeGlob("__", "é"));
+    try testing.expect(!ast.likeGlob("_", "éa"));
+    try testing.expect(ast.likeGlob("%_", "é") and ast.likeGlob("%__", "éa") and !ast.likeGlob("%__", "é"));
+    try testing.expect(ast.likeGlob("%é_", "xxéé") and !ast.likeGlob("%é__", "xxéé"));
+    // Bytes that are no UTF-8 count one apiece, so binary values still match.
+    try testing.expect(ast.likeGlob("__", "\xff\xfe") and ast.likeGlob("_", "\xc3"));
+    // A lead byte without its continuation bytes is no character either.
+    try testing.expect(ast.likeGlob("__", "\xc3A") and ast.likeGlob("_A", "\xc3A") and !ast.likeGlob("_", "\xc3A"));
+    try testing.expect(ast.likeGlob("___", "\xe2\x82A") and !ast.likeGlob("_", "\xe2\x82\xac\xac"));
+}
+
+test "regression: LIKE wildcards stay wildcards against a `%` or `_` in the value" {
+    try testing.expect(ast.likeGlob("_%", "a%b"));
+    try testing.expect(ast.likeGlob("a%_b", "a%b"));
+    try testing.expect(ast.likeGlob("%%", "%") and ast.likeGlob("%_", "%") and ast.likeGlob("_", "%"));
+    try testing.expect(ast.likeGlob("a_%", "a_") and ast.likeGlob("%_%", "_") and !ast.likeGlob("__", "_"));
+    try testing.expect(ast.likeGlob("x%y%z", "x%%y__z") and !ast.likeGlob("x%y%z", "x%%y__"));
+    try testing.expect(ast.likeGlob("é%_", "é%é") and ast.likeGlob("é%__", "é%é") and !ast.likeGlob("é%___", "é%é"));
+    // ESCAPE, which would make `%` or `_` literal, is refused rather than ignored (see the string-literal test).
+}
+
 test "parse IS NULL / IS NOT NULL → null_check node (+ NOT negation)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1147,7 +2489,7 @@ test "parse IS NULL / IS NOT NULL → null_check node (+ NOT negation)" {
     // case-insensitive; composes inside AND.
     const f_and = try parse(a, "id > 1 AND score is not null", &meta, null);
     try testing.expect(f_and == .and_filter);
-    try testing.expect(f_and.and_filter.right.* == .null_check);
+    try testing.expect(f_and.and_filter.children[1] == .null_check);
 
     // bare `IS <other>` is a clear error, not a silent fallthrough.
     try testing.expectError(error.BadOperator, parse(a, "id IS 5", &meta, null));
@@ -1169,7 +2511,7 @@ test "parse double-quoted identifiers resolve like bare" {
 
     const btw = try parse(a, "\"id\" BETWEEN 10 AND 20", &meta, null);
     try testing.expect(btw == .and_filter);
-    try testing.expectEqual(@as(i32, 10), btw.and_filter.left.int32.value);
+    try testing.expectEqual(@as(i32, 10), btw.and_filter.children[0].int32.value);
 
     // A quoted *unknown* column still errors cleanly (no quote-swallowing bug).
     try testing.expectError(error.UnknownColumn, parse(a, "\"nope\" = 1", &meta, null));
@@ -1184,12 +2526,12 @@ test "parse BETWEEN expands to >= AND <= conjunction" {
 
     const f = try parse(a, "id BETWEEN 10 AND 20", &meta, null);
     try testing.expect(f == .and_filter);
-    try testing.expect(f.and_filter.left.* == .int32);
-    try testing.expect(f.and_filter.right.* == .int32);
-    try testing.expectEqual(ast.Operator.GtEq, f.and_filter.left.int32.op);
-    try testing.expectEqual(@as(i32, 10), f.and_filter.left.int32.value);
-    try testing.expectEqual(ast.Operator.LtEq, f.and_filter.right.int32.op);
-    try testing.expectEqual(@as(i32, 20), f.and_filter.right.int32.value);
+    try testing.expect(f.and_filter.children[0] == .int32);
+    try testing.expect(f.and_filter.children[1] == .int32);
+    try testing.expectEqual(ast.Operator.GtEq, f.and_filter.children[0].int32.op);
+    try testing.expectEqual(@as(i32, 10), f.and_filter.children[0].int32.value);
+    try testing.expectEqual(ast.Operator.LtEq, f.and_filter.children[1].int32.op);
+    try testing.expectEqual(@as(i32, 20), f.and_filter.children[1].int32.value);
 }
 
 test "parse BETWEEN binds its bounds like the comparison operators" {
@@ -1199,19 +2541,19 @@ test "parse BETWEEN binds its bounds like the comparison operators" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // DECIMAL bounds take the f64 lane, not a byte-string compare against the FLBA bytes.
+    // DECIMAL bounds take the exact unscaled lane at the column's scale, not a byte-string compare against the bytes.
     const fd = try parse(a, "dec BETWEEN 1 AND 2.5", &meta, null);
-    try testing.expect(fd.and_filter.left.* == .double and fd.and_filter.right.* == .double);
-    try testing.expectEqual(@as(f64, 1), fd.and_filter.left.double.value);
-    try testing.expectEqual(@as(f64, 2.5), fd.and_filter.right.double.value);
+    try testing.expect(fd.and_filter.children[0] == .decimal and fd.and_filter.children[1] == .decimal);
+    try testing.expectEqual(@as(i128, 100), fd.and_filter.children[0].decimal.value);
+    try testing.expectEqual(@as(i128, 250), fd.and_filter.children[1].decimal.value);
 
     // DATE/TIMESTAMP bounds accept the same SQL literals `>=`/`<=` do.
     const fdt = try parse(a, "d BETWEEN '2024-01-01' AND '2024-01-31'", &meta, null);
-    try testing.expectEqual(@as(i32, 19723), fdt.and_filter.left.int32.value);
-    try testing.expectEqual(@as(i32, 19753), fdt.and_filter.right.int32.value);
+    try testing.expectEqual(@as(i32, 19723), fdt.and_filter.children[0].int32.value);
+    try testing.expectEqual(@as(i32, 19753), fdt.and_filter.children[1].int32.value);
     const fts = try parse(a, "ts BETWEEN '2024-01-01' AND '2024-01-01 00:00:01'", &meta, null);
-    try testing.expectEqual(@as(i64, 1_704_067_200_000_000), fts.and_filter.left.int64.value);
-    try testing.expectEqual(@as(i64, 1_704_067_201_000_000), fts.and_filter.right.int64.value);
+    try testing.expectEqual(@as(i64, 1_704_067_200_000_000), fts.and_filter.children[0].int64.value);
+    try testing.expectEqual(@as(i64, 1_704_067_201_000_000), fts.and_filter.children[1].int64.value);
 }
 
 test "parse BETWEEN composes with outer AND" {
@@ -1221,16 +2563,14 @@ test "parse BETWEEN composes with outer AND" {
     var meta = try synthFileMeta(a);
     defer meta.deinit(a);
 
-    // `score BETWEEN 0.5 AND 0.9 AND id=1` should parse as
-    // `(score >= 0.5 AND score <= 0.9) AND (id=1)`. The BETWEEN's
-    // bound-AND must NOT be the conjunction split point.
+    // `score BETWEEN 0.5 AND 0.9 AND id=1` is `score >= 0.5 AND score <= 0.9 AND id = 1`, one flat AND: the
+    // BETWEEN's bound-AND must NOT be the conjunction split point, and its bounds join the chain.
     const f = try parse(a, "score BETWEEN 0.5 AND 0.9 AND id=1", &meta, null);
     try testing.expect(f == .and_filter);
-    // Left side is the BETWEEN's expansion (and_filter of two doubles).
-    try testing.expect(f.and_filter.left.* == .and_filter);
-    // Right side is the trailing id=1.
-    try testing.expect(f.and_filter.right.* == .int32);
-    try testing.expectEqual(@as(i32, 1), f.and_filter.right.int32.value);
+    try testing.expectEqual(@as(usize, 3), f.and_filter.children.len);
+    try testing.expectEqual(ast.Operator.GtEq, f.and_filter.children[0].double.op);
+    try testing.expectEqual(ast.Operator.LtEq, f.and_filter.children[1].double.op);
+    try testing.expectEqual(@as(i32, 1), f.and_filter.children[2].int32.value);
 }
 
 test "parse BETWEEN is case-insensitive" {
@@ -1316,11 +2656,11 @@ test "parse binds a bare name to the top-level column, not a nested leaf sharing
     const nested = try parse(a, "r.key = 5", &meta, null);
     try testing.expectEqual(@as(usize, 0), nested.int64.col_idx);
     const quoted = try parse(a, "\"r.key\" BETWEEN 1 AND 9", &meta, null);
-    try testing.expectEqual(@as(usize, 0), quoted.and_filter.left.int64.col_idx);
+    try testing.expectEqual(@as(usize, 0), quoted.and_filter.children[0].int64.col_idx);
     const like = try parse(a, "r.name LIKE 'a%'", &meta, null);
     try testing.expectEqual(@as(usize, 1), like.like.col_idx);
     const in_list = try parse(a, "key IN (1005, 1006)", &meta, null);
-    try testing.expectEqual(@as(usize, 2), in_list.or_filter.left.int64.col_idx);
+    try testing.expectEqual(@as(usize, 2), in_list.or_filter.children[0].int64.col_idx);
     const nc = try parse(a, "key IS NOT NULL", &meta, null);
     try testing.expectEqual(@as(usize, 2), nc.null_check.col_idx);
 
@@ -1345,6 +2685,311 @@ test "parse binds a quoted path to the nested leaf a top-level column's dotted n
     try testing.expectEqual(@as(usize, 0), (try parse(a, "\"r\".\"key\" > 1005", &meta, null)).int64.col_idx);
     try testing.expectEqual(@as(usize, 0), (try parse(a, "\"r\".\"key\" IS NULL", &meta, null)).null_check.col_idx);
     const in_list = try parse(a, "\"r\".\"key\" IN (1, 2)", &meta, null);
-    try testing.expectEqual(@as(usize, 0), in_list.or_filter.left.int64.col_idx);
+    try testing.expectEqual(@as(usize, 0), in_list.or_filter.children[0].int64.col_idx);
     try testing.expectEqual(@as(usize, 1), (try parse(a, "\"r\".\"name\" LIKE 'a%'", &meta, null)).like.col_idx);
+}
+
+test "regression: IN sets preserve temporal comparison rewrites" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    meta.schema.items[5].logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .NANOS = .{} } } };
+    const values = [_]i64{ 0, 1, std.math.maxInt(i64), 0 };
+    const defs = [_]u32{ 1, 1, 1, 0 };
+    const columns = [_]eval.Batch.Column{.{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    const batch: eval.Batch = .{ .cols = &columns, .num_rows = values.len };
+    var lookup: [11]?usize = @splat(null);
+    lookup[4] = 0;
+    for ([_][]const u8{
+        "ts IN ('1970-01-01 00:00:00.0000000001', '1970-01-01 00:00:00.0000000002')",
+        "ts NOT IN ('1970-01-01 00:00:00.0000000001', '1970-01-01 00:00:00.0000000002')",
+        "ts IN ('1970-01-01', '1970-01-01 00:00:00.0000000001')",
+    }) |expr| {
+        const filter = try parse(a, expr, &meta, null);
+        var expected = try selection.SelectionVector.init(a, values.len);
+        var actual = try selection.SelectionVector.init(a, values.len);
+        try eval.evaluate(try withoutInSets(a, filter), &batch, &expected, &lookup, a);
+        try eval.evaluate(filter, &batch, &actual, &lookup, a);
+        try testing.expectEqualSlices(u64, expected.mask, actual.mask);
+    }
+}
+
+test "a filter on a legacy repeated field is refused, even where statistics could answer it without decoding" {
+    const a = std.testing.allocator;
+    const bytes = metadata.readFileSlice("ci/fixtures/parquet/format_repeated.parquet", a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(bytes);
+    var meta = try metadata.open(a, bytes);
+    defer meta.deinit(a);
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    for ([_][]const u8{ "Int32_list IS NULL", "Int32_list IS NOT NULL", "Int32_list > 999999" }) |predicate| {
+        var diag: Diag = .{};
+        try std.testing.expectError(error.NestedFilterNotSupported, parse(arena.allocator(), predicate, &meta, &diag));
+        try std.testing.expectEqualStrings("Int32_list", diag.column.get());
+    }
+}
+
+test "regression: a SQL predicate handed on as text selects the rows it was written to" {
+    // The SQL front end pushes NOT to the leaves and unparses the predicate for this grammar. Every case must select,
+    // row for row, what this grammar reads straight from the SQL text and, where given, the flat reading `want`
+    // with NOT at the leaves. The rest must be refused, each with its own error.
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    const sql_parser = @import("../expr/sql_parser.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
+    defer meta.deinit(a);
+    const Col = struct { name: []const u8, type: schema.Type, lt: ?schema.LogicalType = null };
+    const columns = [_]Col{
+        .{ .name = "x", .type = .INT32 },                                .{ .name = "y", .type = .INT32 },
+        .{ .name = "z", .type = .INT32 },                                .{ .name = "s", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } },
+        .{ .name = "t", .type = .BYTE_ARRAY, .lt = .{ .STRING = .{} } }, .{ .name = "b", .type = .BOOLEAN },
+        .{ .name = "d", .type = .INT32, .lt = .{ .DATE = .{} } },        .{ .name = "a OR b", .type = .INT32 },
+    };
+    try meta.schema.append(a, .{ .type = .BOOLEAN, .type_length = null, .repetition_type = .REQUIRED, .name = "root", .num_children = columns.len, .scale = null, .precision = null, .field_id = null });
+    for (columns) |col| try meta.schema.append(a, .{ .type = col.type, .type_length = null, .repetition_type = .OPTIONAL, .name = col.name, .num_children = null, .scale = null, .precision = null, .field_id = null, .logical_type = col.lt });
+
+    // Every combination of x, y and z over a few values and NULL; s cycles through strings holding the grammar's
+    // keywords, a quote and a comma, and NULL; b holds NULLs; d steps across 2020-06-01 (day 18414).
+    const xs = [_]?i32{ null, 1, 2, 3, 4, 5, 6 };
+    const ys = [_]?i32{ null, 1, 2, 3 };
+    const zs = [_]?i32{ null, 1, 3 };
+    const strs = [_]?[]const u8{ "a", "ab", "b", "abb", "a OR b = 1", "", null, "a or b", "O'Brien", "a,b", "c" };
+    const n = xs.len * ys.len * zs.len;
+    var vals: [5][n]i32 = undefined;
+    var defs: [5][n]u32 = undefined;
+    var svals: [n][]const u8 = undefined;
+    var sdefs: [n]u32 = undefined;
+    var bvals: [n]bool = undefined;
+    var bdefs: [n]u32 = undefined;
+    for (0..n) |r| {
+        const ints = [5]?i32{ xs[r % xs.len], ys[(r / xs.len) % ys.len], zs[r / (xs.len * ys.len)], 18410 + @as(i32, @intCast(r % 8)), @intCast(r % 4) };
+        for (ints, 0..) |v, k| {
+            vals[k][r] = v orelse 0;
+            defs[k][r] = @intFromBool(v != null);
+        }
+        svals[r] = strs[r % strs.len] orelse "";
+        sdefs[r] = @intFromBool(strs[r % strs.len] != null);
+        bvals[r] = r % 3 == 0;
+        bdefs[r] = @intFromBool(r % 5 != 0);
+    }
+    var cols: [7]eval.Batch.Column = undefined;
+    for (0..5) |k| cols[k] = .{ .i32 = .{ .values = &vals[k], .def_levels = &defs[k], .max_def = 1, .has_nulls = true } };
+    cols[5] = .{ .string = .{ .values = &svals, .def_levels = &sdefs, .max_def = 1, .has_nulls = true } };
+    cols[6] = .{ .boolean = .{ .values = &bvals, .def_levels = &bdefs, .max_def = 1, .has_nulls = true } };
+    // x y z s t b d "a OR b" → batch columns (t is never evaluated).
+    const lookup = [_]?usize{ 0, 1, 2, 5, null, 6, 3, 4 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = n };
+
+    const Select = struct {
+        fn rows(al: std.mem.Allocator, f: ast.Filter, b: *const eval.Batch, l: []const ?usize) ![n]bool {
+            var sel = try selection.SelectionVector.init(al, n);
+            try eval.evaluate(f, b, &sel, l, al);
+            var out: [n]bool = undefined;
+            for (&out, 0..) |*o, i| o.* = sel.isActive(i);
+            return out;
+        }
+    };
+
+    const Case = struct { where: []const u8, want: ?[]const u8 = null, err: ?anyerror = null };
+    const cases = [_]Case{
+        // NOT over groups and nested chains, `want` the flat reading.
+        .{ .where = "NOT (x > 5 AND y < 3)", .want = "NOT x > 5 OR NOT y < 3" },
+        .{ .where = "NOT (x > 5 OR y < 3)", .want = "NOT x > 5 AND NOT y < 3" },
+        .{ .where = "NOT NOT (x > 5 OR y < 3)", .want = "x > 5 OR y < 3" },
+        .{ .where = "NOT NOT NOT x > 5", .want = "NOT x > 5" },
+        .{ .where = "z = 1 AND NOT (x > 5 OR y < 3)", .want = "z = 1 AND NOT x > 5 AND NOT y < 3" },
+        .{ .where = "NOT (x > 5 OR y < 3) AND z = 1", .want = "NOT x > 5 AND NOT y < 3 AND z = 1" },
+        .{ .where = "NOT (x > 5 AND y < 3) OR z = 1", .want = "NOT x > 5 OR NOT y < 3 OR z = 1" },
+        .{ .where = "z = 1 OR NOT (x > 5 AND y < 3)", .want = "z = 1 OR NOT x > 5 OR NOT y < 3" },
+        .{ .where = "NOT ((x > 5 OR y < 3) AND (z = 1 OR x = 2))", .want = "NOT x > 5 AND NOT y < 3 OR NOT z = 1 AND NOT x = 2" },
+        .{ .where = "NOT (x IN (1, 2) AND y = 1)", .want = "NOT x IN (1, 2) OR NOT y = 1" },
+        .{ .where = "NOT (x NOT IN (1, 2) OR y = 1)", .want = "x IN (1, 2) AND NOT y = 1" },
+        .{ .where = "NOT (x NOT BETWEEN 1 AND 3)", .want = "x BETWEEN 1 AND 3" },
+        .{ .where = "x NOT BETWEEN 1 AND 3 OR y = 1", .want = "NOT x BETWEEN 1 AND 3 OR y = 1" },
+        .{ .where = "NOT (x BETWEEN 1 AND 3 OR y = 1)", .want = "NOT x BETWEEN 1 AND 3 AND NOT y = 1" },
+        .{ .where = "NOT (s LIKE 'a%' AND s NOT LIKE '%b')", .want = "NOT s LIKE 'a%' OR s LIKE '%b'" },
+        .{ .where = "NOT (s IS NULL OR s IS NOT NULL)", .want = "NOT s IS NULL AND NOT s IS NOT NULL" },
+        .{ .where = "x = 1 OR (y = 2 OR z = 3)", .want = "x = 1 OR y = 2 OR z = 3" },
+        .{ .where = "x = 1 AND (y = 2 AND (z = 3 AND x = 4))", .want = "x = 1 AND y = 2 AND z = 3 AND x = 4" },
+        .{ .where = "(x = 1 AND y = 2) OR z = 3", .want = "x = 1 AND y = 2 OR z = 3" },
+        .{ .where = "x BETWEEN 1 AND 2 OR s = 'a or b'", .want = "x BETWEEN 1 AND 2 OR s = 'a or b'" },
+        .{ .where = "x > -5 AND z IN (-1, 2)", .want = "x > -5 AND z IN (-1, 2)" },
+        .{ .where = "x BETWEEN -1 AND 1e0 OR s = ''", .err = error.BadValue }, // an INT32 takes no exponent literal
+        .{ .where = "d >= '2020-06-01' AND s IS NOT NULL", .want = "d >= '2020-06-01' AND s IS NOT NULL" },
+        // A fraction or an exponent against an INT32 column is refused.
+        .{ .where = "x > -5 AND y < +2.5e3 AND z IN (-1, 2)", .err = error.BadValue },
+        .{ .where = "x BETWEEN -1.5 AND 1e2 OR s = ''", .err = error.BadValue },
+        // Groups that are not an OR of ANDs.
+        .{ .where = "NOT ((x > 5 AND y < 3) OR z = 1)" },
+        .{ .where = "x = 1 AND (y = 2 OR z = 3)" },
+        .{ .where = "(x = 1 OR y = 2) AND z = 3" },
+        .{ .where = "NOT (x = 1 OR y = 2) OR NOT (z = 3 AND x = 4) AND y = 5" },
+        .{ .where = "NOT (x = 1 AND y = 2) AND z = 3" },
+        // Literals and names a raw-substring split would cut.
+        .{ .where = "s = 'a OR b = 1'" },
+        .{ .where = "s = 'rock AND roll'" },
+        .{ .where = "s = 'x BETWEEN y'" },
+        .{ .where = "s = 'O''Brien'" },
+        .{ .where = "s IN ('a,b', 'c')" },
+        .{ .where = "\"a OR b\" = 1" },
+        // NULL is the NULL literal, never the text 'NULL'.
+        .{ .where = "s NOT IN ('a', NULL)" },
+        .{ .where = "NOT (s IN ('a', NULL))" },
+        .{ .where = "s IN (NULL)" },
+        .{ .where = "s != NULL" },
+        .{ .where = "s > NULL" },
+        .{ .where = "s LIKE NULL" },
+        .{ .where = "x BETWEEN NULL AND 5" },
+        .{ .where = "b = TRUE" },
+        // Refused, each with its own error.
+        .{ .where = "s LIKE 'a#%' ESCAPE '#'", .err = error.BadValue },
+        .{ .where = "s IS 'a'", .err = error.BadOperator },
+        .{ .where = "s = t", .err = error.BadValue },
+        .{ .where = "s = \"t\"", .err = error.BadValue },
+        .{ .where = "s = 'a' || 'b'", .err = error.BadValue },
+        .{ .where = "s = 'a' COLLATE NOCASE", .err = error.BadValue },
+        .{ .where = "s = upper('a')", .err = error.BadValue },
+        .{ .where = "s = CAST('a' AS TEXT)", .err = error.BadValue },
+        .{ .where = "s = x'61'", .err = error.BadValue },
+        .{ .where = "x > 2 + 3", .err = error.BadValue },
+        .{ .where = "x > - -5", .err = error.BadValue },
+        .{ .where = "5 < x", .err = error.BadValue },
+        .{ .where = "x + 1 > 5", .err = error.ExpressionInPredicate },
+        .{ .where = "x % 2 = 1", .err = error.ModuloNotSupported },
+        .{ .where = "s GLOB 'a*'", .err = error.BadOperator },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("WHERE {s}\n", .{case.where});
+        const sql = try std.fmt.allocPrint(a, "SELECT count(*) AS c FROM 't' WHERE {s}", .{case.where});
+        for ([_]bool{ false, true }) |in_agg| {
+            const text = if (in_agg) try std.fmt.allocPrint(a, "SELECT count(*) FILTER (WHERE {s}) AS c FROM 't'", .{case.where}) else sql;
+            const handed: []const u8 = blk: {
+                const q = sql_parser.parseSqlQuery(testing.allocator, text) catch |err| {
+                    try testing.expectEqual(case.err.?, err);
+                    break :blk "";
+                };
+                defer q.deinit(testing.allocator);
+                const s = if (in_agg) q.aggregate_str.? else q.filter_str.?;
+                const body = if (in_agg) s["count(*) FILTER (WHERE ".len .. s.len - ") AS c".len] else s;
+                break :blk try a.dupe(u8, body);
+            };
+            if (handed.len == 0) continue;
+            const f = parse(a, handed, &meta, null) catch |err| {
+                try testing.expectEqual(case.err orelse return err, err);
+                continue;
+            };
+            try testing.expect(case.err == null);
+            const got = try Select.rows(a, f, &batch, &lookup);
+            const direct = try Select.rows(a, try parse(a, case.where, &meta, null), &batch, &lookup);
+            try testing.expectEqualSlices(bool, &direct, &got);
+            if (case.want) |w| try testing.expectEqualSlices(bool, &(try Select.rows(a, try parse(a, w, &meta, null), &batch, &lookup)), &got);
+        }
+    }
+}
+
+test "regression: a BOOLEAN column alone is the predicate `col = true`, NULL kept out under any NOT" {
+    const eval = @import("eval.zig");
+    const selection = @import("selection.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta: schema.FileMetaData = .{ .version = 1, .schema = .empty, .num_rows = 0, .created_by = null, .row_groups = .empty };
+    defer meta.deinit(a);
+    try meta.schema.append(a, .{ .type = .BOOLEAN, .type_length = null, .repetition_type = .REQUIRED, .name = "root", .num_children = 2, .scale = null, .precision = null, .field_id = null });
+    try meta.schema.append(a, .{ .type = .BOOLEAN, .type_length = null, .repetition_type = .OPTIONAL, .name = "flag", .num_children = null, .scale = null, .precision = null, .field_id = null });
+    try meta.schema.append(a, .{ .type = .INT32, .type_length = null, .repetition_type = .OPTIONAL, .name = "id", .num_children = null, .scale = null, .precision = null, .field_id = null });
+    const flags = [_]bool{ true, false, false, true };
+    const flag_def = [_]u32{ 1, 1, 0, 1 };
+    const ids = [_]i32{ 1, 2, 3, 4 };
+    const cols = [_]eval.Batch.Column{
+        .{ .boolean = .{ .values = &flags, .def_levels = &flag_def, .max_def = 1, .has_nulls = true } },
+        .{ .i32 = .{ .values = &ids } },
+    };
+    const lookup = [_]?usize{ 0, 1 };
+    const batch: eval.Batch = .{ .cols = &cols, .num_rows = ids.len };
+    const Case = struct { filter: []const u8, want: [4]bool };
+    // Rows: flag true, false, NULL, true.
+    const cases = [_]Case{
+        .{ .filter = "flag", .want = .{ true, false, false, true } },
+        .{ .filter = "\"flag\"", .want = .{ true, false, false, true } },
+        .{ .filter = "NOT flag", .want = .{ false, true, false, false } },
+        .{ .filter = "NOT NOT flag", .want = .{ true, false, false, true } },
+        .{ .filter = "flag AND id > 1", .want = .{ false, false, false, true } },
+        .{ .filter = "flag OR id = 3", .want = .{ true, false, true, true } },
+        .{ .filter = "NOT (flag OR id = 2)", .want = .{ false, false, false, false } },
+        .{ .filter = "NOT (flag AND id > 1)", .want = .{ true, true, false, false } },
+        .{ .filter = "(flag) AND NOT (id = 1)", .want = .{ false, false, false, true } },
+        .{ .filter = "flag OR NOT flag", .want = .{ true, true, false, true } },
+    };
+    for (cases) |case| {
+        const f = try parse(a, case.filter, &meta, null);
+        var sel = try selection.SelectionVector.init(a, ids.len);
+        try eval.evaluate(f, &batch, &sel, &lookup, a);
+        for (case.want, 0..) |w, i| testing.expectEqual(w, sel.isActive(i)) catch |err| {
+            std.debug.print("{s}: row {d}\n", .{ case.filter, i });
+            return err;
+        };
+    }
+    // Only a BOOLEAN column alone is a predicate; the refusal says so.
+    var diag: Diag = .{};
+    try testing.expectError(error.BadOperator, parse(a, "id", &meta, &diag));
+    try testing.expect(diag.detail == .bare_non_boolean);
+    try testing.expectEqualStrings("id", diag.column.get());
+    try testing.expectError(error.UnknownColumn, parse(a, "nope AND flag", &meta, null));
+    try testing.expectError(error.BadOperator, parse(a, "TRUE", &meta, null));
+    try testing.expectError(error.BadOperator, parse(a, "flag + 1", &meta, null));
+}
+
+test "regression: a `%` or arithmetic where a predicate wants a column is named, not an unknown column" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    var diag: Diag = .{};
+    try testing.expectError(error.ModuloNotSupported, parse(a, "id % 2 = 1", &meta, &diag));
+    try testing.expectEqualStrings("id % 2", diag.column.get());
+    try testing.expectError(error.ModuloNotSupported, parse(a, "id % 2 IN (1, 3)", &meta, null));
+    try testing.expectError(error.ModuloNotSupported, parse(a, "NOT (id%2 BETWEEN 0 AND 1)", &meta, null));
+    try testing.expectError(error.ExpressionInPredicate, parse(a, "id + 1 > 5", &meta, null));
+    try testing.expectError(error.ExpressionInPredicate, parse(a, "score * 2 IS NULL", &meta, null));
+    // A `%` in a literal is no operator, and a name that matches nothing stays an unknown column.
+    _ = try parse(a, "status LIKE 'a%' AND status != '100%'", &meta, null);
+    try testing.expectError(error.UnknownColumn, parse(a, "nope = 1", &meta, null));
+    try testing.expectError(error.UnknownColumn, parse(a, "\"no % pe\" = 1", &meta, null));
+}
+
+test "an AND runs its conjuncts cheapest first, keeping written order within a class" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+    // q21's shape: the LIKE `%x%` as written first, the empty-string test last.
+    const f = try parse(a, "status LIKE '%google%' AND status LIKE 'go%' AND status = 'x' AND id IS NOT NULL " ++
+        "AND status <> '' AND id IN (1, 2) AND score > 1", &meta, null);
+    const kids = f.and_filter.children;
+    try testing.expectEqual(@as(usize, 7), kids.len);
+    try testing.expect(kids[0] == .null_check);
+    try testing.expectEqualStrings("", kids[1].string.value);
+    try testing.expect(kids[2] == .double);
+    try testing.expectEqualStrings("x", kids[3].string.value);
+    try testing.expect(kids[4].or_filter.in_set != null);
+    try testing.expectEqual(ast.LikeKind.prefix, kids[5].like.kind);
+    try testing.expectEqual(ast.LikeKind.contains, kids[6].like.kind);
+    // An OR keeps its written order; inside it, an AND is ranked.
+    const o = try parse(a, "status LIKE '%a%' OR (status LIKE '%b%' AND id = 1)", &meta, null);
+    try testing.expect(o.or_filter.children[0] == .like);
+    try testing.expect(o.or_filter.children[1].and_filter.children[0] == .int32);
 }

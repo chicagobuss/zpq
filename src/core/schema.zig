@@ -354,6 +354,8 @@ pub const Encoding = enum(i32) {
     DELTA_BYTE_ARRAY = 7,
     RLE_DICTIONARY = 8,
     BYTE_STREAM_SPLIT = 9,
+    ALP = 10,
+    _,
 };
 
 pub const CompressionCodec = enum(i32) {
@@ -392,9 +394,79 @@ pub const SchemaElement = struct {
     num_children: ?i32,
     converted_type: ?ConvertedType = null,
     logical_type: ?LogicalType = null,
+    /// Borrowed complete LogicalType struct, including fields this reader does not interpret.
+    logical_type_raw: []const u8 = &.{},
     scale: ?i32,
     precision: ?i32,
     field_id: ?i32,
+
+    /// parquet.thrift's LogicalType union arms this reader keeps only as `logical_type_raw`.
+    pub const RawLogicalType = enum(i16) { VARIANT = 16, GEOMETRY = 17, GEOGRAPHY = 18, _ };
+
+    /// The logical type this element's values have: its recognized logical type, or the legacy ConvertedType's
+    /// equivalent when it has none, so writers of either generation describe one column alike. INTERVAL and
+    /// MAP_KEY_VALUE have no logical equivalent; an annotation this reader does not interpret stays `.UNKNOWN`.
+    pub fn effectiveLogicalType(self: *const SchemaElement) ?LogicalType {
+        if (self.logical_type) |lt| return lt;
+        const ct = self.converted_type orelse return null;
+        const int = struct {
+            fn of(bits: i8, signed: bool) LogicalType {
+                return .{ .INTEGER = .{ .bitWidth = bits, .isSigned = signed } };
+            }
+        };
+        return switch (ct) {
+            .UTF8 => .{ .STRING = .{} },
+            .MAP => .{ .MAP = .{} },
+            .LIST => .{ .LIST = .{} },
+            .ENUM => .{ .ENUM = .{} },
+            .DECIMAL => .{ .DECIMAL = .{ .scale = self.scale orelse 0, .precision = self.precision orelse 0 } },
+            .DATE => .{ .DATE = .{} },
+            // The format defines the legacy TIME and TIMESTAMP types as UTC-adjusted.
+            .TIME_MILLIS => .{ .TIME = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } },
+            .TIME_MICROS => .{ .TIME = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } },
+            .TIMESTAMP_MILLIS => .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } },
+            .TIMESTAMP_MICROS => .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } },
+            .UINT_8 => int.of(8, false),
+            .UINT_16 => int.of(16, false),
+            .UINT_32 => int.of(32, false),
+            .UINT_64 => int.of(64, false),
+            .INT_8 => int.of(8, true),
+            .INT_16 => int.of(16, true),
+            .INT_32 => int.of(32, true),
+            .INT_64 => int.of(64, true),
+            .JSON => .{ .JSON = .{} },
+            .BSON => .{ .BSON = .{} },
+            .MAP_KEY_VALUE, .INTERVAL => null,
+        };
+    }
+
+    /// Whether `a` and `b` annotate their values alike however each writer spelled it: recognized logical types as
+    /// parsed (Thrift fields may come in any order and either header form), a legacy ConvertedType as its logical
+    /// equivalent. An annotation this reader does not interpret is compared byte for byte, and its legacy fallback
+    /// must be the same too: that fallback is how the values are read and printed (the same arm over UTF8 and over
+    /// plain bytes is text in one file and binary in the other). Beside a recognized type, a legacy annotation either
+    /// file leaves out is implied by it; two that are both present must agree. DECIMAL scale and precision are left
+    /// to the caller, which compares them as resolved (`decimal.kindFromSchema`).
+    pub fn sameAnnotation(a: *const SchemaElement, b: *const SchemaElement) bool {
+        if ((a.converted_type == .INTERVAL) != (b.converted_type == .INTERVAL)) return false;
+        const la = a.effectiveLogicalType() orelse return b.effectiveLogicalType() == null;
+        const lb = b.effectiveLogicalType() orelse return false;
+        if (std.meta.activeTag(la) != std.meta.activeTag(lb)) return false;
+        if (la == .UNKNOWN) {
+            return a.converted_type == b.converted_type and std.mem.eql(u8, a.logical_type_raw, b.logical_type_raw);
+        }
+        if (a.converted_type) |x| if (b.converted_type) |y| if (x != y) return false;
+        return la == .DECIMAL or std.meta.eql(la, lb);
+    }
+
+    /// The union arm `logical_type_raw` holds, when it holds one.
+    pub fn rawLogicalType(self: *const SchemaElement) ?RawLogicalType {
+        if (self.logical_type_raw.len == 0) return null;
+        var reader = thrift.Reader.init(self.logical_type_raw);
+        const field = reader.readFieldBegin() catch return null;
+        if (field.type == .Stop) return null;
+        return @fromBackingInt(@intCast(field.id));
+    }
 
     pub fn read(reader: *thrift.Reader) !SchemaElement {
         const saved_id = reader.last_field_id;
@@ -428,7 +500,12 @@ pub const SchemaElement = struct {
                 7 => elem.scale = try reader.readZigZag(i32),
                 8 => elem.precision = try reader.readZigZag(i32),
                 9 => elem.field_id = try reader.readZigZag(i32),
-                10 => elem.logical_type = try LogicalType.read(reader),
+                10 => {
+                    if (field.type != .Struct) return error.InvalidThriftType;
+                    const start = reader.pos;
+                    elem.logical_type = try LogicalType.read(reader);
+                    elem.logical_type_raw = reader.data[start..reader.pos];
+                },
                 else => try reader.skip(field.type),
             }
         }
@@ -437,16 +514,19 @@ pub const SchemaElement = struct {
 
     pub fn write(self: *const SchemaElement, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
-        if (self.type) |t| try writer.writeFieldI32(1, @intFromEnum(t));
+        if (self.type) |t| try writer.writeFieldI32(1, @backingInt(t));
         if (self.type_length) |v| try writer.writeFieldI32(2, v);
-        if (self.repetition_type) |rt| try writer.writeFieldI32(3, @intFromEnum(rt));
+        if (self.repetition_type) |rt| try writer.writeFieldI32(3, @backingInt(rt));
         try writer.writeFieldString(4, self.name);
         if (self.num_children) |v| try writer.writeFieldI32(5, v);
-        if (self.converted_type) |ct| try writer.writeFieldI32(6, @intFromEnum(ct));
+        if (self.converted_type) |ct| try writer.writeFieldI32(6, @backingInt(ct));
         if (self.scale) |v| try writer.writeFieldI32(7, v);
         if (self.precision) |v| try writer.writeFieldI32(8, v);
         if (self.field_id) |v| try writer.writeFieldI32(9, v);
-        if (self.logical_type) |*lt| {
+        if (self.logical_type_raw.len != 0) {
+            try writer.writeFieldBegin(.Struct, 10);
+            try writer.writeBytes(self.logical_type_raw);
+        } else if (self.logical_type) |*lt| {
             try writer.writeFieldBegin(.Struct, 10);
             try lt.write(writer);
         }
@@ -543,9 +623,9 @@ pub const DataPageHeader = struct {
     pub fn write(self: *const DataPageHeader, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
         try writer.writeFieldI32(1, self.num_values);
-        try writer.writeFieldI32(2, @intFromEnum(self.encoding));
-        try writer.writeFieldI32(3, @intFromEnum(self.definition_level_encoding));
-        try writer.writeFieldI32(4, @intFromEnum(self.repetition_level_encoding));
+        try writer.writeFieldI32(2, @backingInt(self.encoding));
+        try writer.writeFieldI32(3, @backingInt(self.definition_level_encoding));
+        try writer.writeFieldI32(4, @backingInt(self.repetition_level_encoding));
         try writer.writeStructEnd();
     }
 };
@@ -584,7 +664,7 @@ pub const DictionaryPageHeader = struct {
     pub fn write(self: *const DictionaryPageHeader, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
         try writer.writeFieldI32(1, self.num_values);
-        try writer.writeFieldI32(2, @intFromEnum(self.encoding));
+        try writer.writeFieldI32(2, @backingInt(self.encoding));
         if (self.is_sorted) |v| try writer.writeFieldBool(3, v);
         try writer.writeStructEnd();
     }
@@ -647,7 +727,7 @@ pub const DataPageHeaderV2 = struct {
         try writer.writeFieldI32(1, self.num_values);
         try writer.writeFieldI32(2, self.num_nulls);
         try writer.writeFieldI32(3, self.num_rows);
-        try writer.writeFieldI32(4, @intFromEnum(self.encoding));
+        try writer.writeFieldI32(4, @backingInt(self.encoding));
         try writer.writeFieldI32(5, self.definition_levels_byte_length);
         try writer.writeFieldI32(6, self.repetition_levels_byte_length);
         // is_compressed defaults to true; only emit when false.
@@ -701,7 +781,7 @@ pub const PageHeader = struct {
 
     pub fn write(self: *const PageHeader, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
-        try writer.writeFieldI32(1, @intFromEnum(self.type));
+        try writer.writeFieldI32(1, @backingInt(self.type));
         try writer.writeFieldI32(2, self.uncompressed_page_size);
         try writer.writeFieldI32(3, self.compressed_page_size);
         if (self.crc) |v| try writer.writeFieldI32(4, v);
@@ -737,11 +817,13 @@ pub const Statistics = struct {
     distinct_count: ?i64 = null,
     max_value: ?[]const u8 = null,
     min_value: ?[]const u8 = null,
-    /// False means `max_value` is a truncated upper bound rather than a value present in the chunk. Read-only: not
-    /// written back, so byte-copied output loses them, which only makes later readers more conservative.
+    /// False means `max_value` (`min_value`) is a cut bound rather than a value present in the chunk: it prunes but
+    /// answers nothing. Written back, so a chunk copied byte for byte keeps what its writer said, and set by zpq's own
+    /// writer wherever it writes a bound (`encoder.computeStats`).
     is_max_value_exact: ?bool = null,
     is_min_value_exact: ?bool = null,
-    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. Read-only, like the exactness flags.
+    /// NaN values in a FLOAT/DOUBLE chunk, which its bounds leave out. The writer counts its own chunks' NaN, and a
+    /// chunk copied byte for byte keeps its count. Missing means NaN may be present.
     nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
@@ -786,11 +868,51 @@ pub const Statistics = struct {
         if (self.distinct_count) |v| try writer.writeFieldI64(4, v);
         if (self.max_value) |v| try writer.writeFieldString(5, v);
         if (self.min_value) |v| try writer.writeFieldString(6, v);
+        if (self.is_max_value_exact) |v| try writer.writeFieldBool(7, v);
+        if (self.is_min_value_exact) |v| try writer.writeFieldBool(8, v);
+        if (self.nan_count) |v| try writer.writeFieldI64(9, v);
+        try writer.writeStructEnd();
+    }
+};
+
+/// One `PageEncodingStats` entry: how many pages of a type a chunk holds in an encoding. Kept as the raw values, so
+/// a page type or encoding this reader does not know cannot fail the footer.
+pub const PageEncodingStats = struct {
+    page_type: i32,
+    encoding: i32,
+    count: i32,
+
+    fn read(reader: *thrift.Reader) !PageEncodingStats {
+        const saved_id = reader.last_field_id;
+        reader.last_field_id = 0;
+        defer reader.last_field_id = saved_id;
+        var s: PageEncodingStats = .{ .page_type = -1, .encoding = -1, .count = 0 };
+        reader.readStructBegin();
+        while (true) {
+            const field = try reader.readFieldBegin();
+            if (field.type == .Stop) break;
+            switch (field.id) {
+                1 => s.page_type = try reader.readZigZag(i32),
+                2 => s.encoding = try reader.readZigZag(i32),
+                3 => s.count = try reader.readZigZag(i32),
+                else => try reader.skip(field.type),
+            }
+        }
+        return s;
+    }
+
+    fn write(self: *const PageEncodingStats, writer: *thrift.Writer) !void {
+        writer.writeStructBegin();
+        try writer.writeFieldI32(1, self.page_type);
+        try writer.writeFieldI32(2, self.encoding);
+        try writer.writeFieldI32(3, self.count);
         try writer.writeStructEnd();
     }
 };
 
 pub const ColumnMetaData = struct {
+    /// Runtime source-writer policy. Copy/recompression preserves it; newly encoded columns start trusted.
+    writer_stats: @import("parquet/writer_statistics.zig").Policy = .trust,
     type: Type,
     encodings: EncodingList,
     path_in_schema: StringList,
@@ -802,6 +924,13 @@ pub const ColumnMetaData = struct {
     index_page_offset: ?i64,
     dictionary_page_offset: ?i64,
     statistics: ?Statistics = null,
+    /// Field 13: the chunk's pages by type and encoding. It is what tells a dictionary that covers every value from one
+    /// a writer abandoned partway; a byte copy keeps the pages, so it keeps these too.
+    encoding_stats: ?std.ArrayListUnmanaged(PageEncodingStats) = null,
+    /// Fields 14/15: where the chunk's split-block Bloom filter (header and bitset) lies in the file. Older
+    /// parquet-java leaves the length out. A copy that moves the chunk must move or drop these with it.
+    bloom_filter_offset: ?i64 = null,
+    bloom_filter_length: ?i32 = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnMetaData {
         const saved_id = reader.last_field_id;
@@ -823,6 +952,7 @@ pub const ColumnMetaData = struct {
         };
         errdefer meta.encodings.deinit(allocator);
         errdefer meta.path_in_schema.deinit(allocator);
+        errdefer if (meta.encoding_stats) |*es| es.deinit(allocator);
 
         reader.readStructBegin();
         while (true) {
@@ -877,6 +1007,27 @@ pub const ColumnMetaData = struct {
                     meta.dictionary_page_offset = if (dpo >= 4) dpo else null;
                 },
                 12 => meta.statistics = try Statistics.read(reader),
+                13 => {
+                    const header = try reader.readByte();
+                    var size = @as(usize, header >> 4);
+                    if (size == 0xF) size = try reader.readVarInt(usize);
+                    var list: std.ArrayListUnmanaged(PageEncodingStats) = .empty;
+                    errdefer list.deinit(allocator);
+                    try list.ensureTotalCapacityPrecise(
+                        allocator,
+                        safeListReserve(PageEncodingStats, size, reader.remaining()),
+                    );
+                    for (0..size) |_| try list.append(allocator, try PageEncodingStats.read(reader));
+                    if (meta.encoding_stats) |*old| old.deinit(allocator);
+                    meta.encoding_stats = list;
+                },
+                // A malformed location reads as no filter, never as a footer error.
+                14 => if (field.type == .I64) {
+                    meta.bloom_filter_offset = try reader.readZigZag(i64);
+                } else try reader.skip(field.type),
+                15 => if (field.type == .I32) {
+                    meta.bloom_filter_length = try reader.readZigZag(i32);
+                } else try reader.skip(field.type),
                 else => try reader.skip(field.type),
             }
         }
@@ -885,24 +1036,25 @@ pub const ColumnMetaData = struct {
 
     pub fn deinit(self: *ColumnMetaData, allocator: std.mem.Allocator) void {
         self.encodings.deinit(allocator);
+        if (self.encoding_stats) |*es| es.deinit(allocator);
         // Note: strings in path_in_schema are slices into the footer buffer, not owned.
         self.path_in_schema.deinit(allocator);
     }
 
     pub fn write(self: *const ColumnMetaData, writer: *thrift.Writer) !void {
         writer.writeStructBegin();
-        try writer.writeFieldI32(1, @intFromEnum(self.type));
+        try writer.writeFieldI32(1, @backingInt(self.type));
         // Field 2: encodings list
         try writer.writeFieldListBegin(2, .I32, self.encodings.items.len);
         for (self.encodings.items) |enc| {
-            try writer.writeZigZag(@as(i32, @intFromEnum(enc)));
+            try writer.writeZigZag(@as(i32, @backingInt(enc)));
         }
         // Field 3: path_in_schema list
         try writer.writeFieldListBegin(3, .Binary, self.path_in_schema.items.len);
         for (self.path_in_schema.items) |path| {
             try writer.writeString(path);
         }
-        try writer.writeFieldI32(4, @intFromEnum(self.codec));
+        try writer.writeFieldI32(4, @backingInt(self.codec));
         try writer.writeFieldI64(5, self.num_values);
         try writer.writeFieldI64(6, self.total_uncompressed_size);
         try writer.writeFieldI64(7, self.total_compressed_size);
@@ -913,6 +1065,12 @@ pub const ColumnMetaData = struct {
             try writer.writeFieldBegin(.Struct, 12);
             try s.write(writer);
         }
+        if (self.encoding_stats) |es| {
+            try writer.writeFieldListBegin(13, .Struct, es.items.len);
+            for (es.items) |*e| try e.write(writer);
+        }
+        if (self.bloom_filter_offset) |v| try writer.writeFieldI64(14, v);
+        if (self.bloom_filter_length) |v| try writer.writeFieldI32(15, v);
         try writer.writeStructEnd();
     }
 };
@@ -926,6 +1084,19 @@ pub const ColumnChunk = struct {
     offset_index_length: ?i32 = null,
     column_index_offset: ?i64 = null,
     column_index_length: ?i32 = null,
+    /// Fields 8/9 (crypto_metadata, encrypted_column_metadata): the chunk is encrypted. Its Bloom filter is too, and is
+    /// never read.
+    encrypted: bool = false,
+    /// Runtime only, per query, never serialized: the PLAIN bytes of the `=` literals this chunk's Bloom filter or
+    /// dictionary proved absent. Written by `filter/membership.zig` before any row group is planned, read by
+    /// `filter/prune.zig` at `=` leaves, so the S3 planner and the scan workers see the same answer.
+    absent: []const []const u8 = &.{},
+    /// Runtime only, per query, never serialized: `filter/nanprobe.zig` read this FLOAT/DOUBLE chunk and found no NaN.
+    /// Read by `filter/prune.zig` as a NaN count of zero.
+    nan_free: bool = false,
+    /// Runtime only, write side: the Bloom filter (header and bitset) an output chunk carries, copied from its source
+    /// or built for it. `fastpath.placeFilters` writes it after the row groups and points fields 14/15 at it.
+    bloom_out: []const u8 = &.{},
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
         const saved_id = reader.last_field_id;
@@ -946,11 +1117,20 @@ pub const ColumnChunk = struct {
             switch (field.id) {
                 1 => chunk.file_path = try reader.readString(),
                 2 => chunk.file_offset = try reader.readZigZag(i64),
-                3 => chunk.meta_data = try ColumnMetaData.read(allocator, reader),
+                3 => {
+                    // Repeated: the later one wins, and the earlier one is freed rather than leaked.
+                    const m = try ColumnMetaData.read(allocator, reader);
+                    if (chunk.meta_data) |*old| old.deinit(allocator);
+                    chunk.meta_data = m;
+                },
                 4 => chunk.offset_index_offset = try reader.readZigZag(i64),
                 5 => chunk.offset_index_length = try reader.readZigZag(i32),
                 6 => chunk.column_index_offset = try reader.readZigZag(i64),
                 7 => chunk.column_index_length = try reader.readZigZag(i32),
+                8, 9 => {
+                    chunk.encrypted = true;
+                    try reader.skip(field.type);
+                },
                 else => try reader.skip(field.type),
             }
         }
@@ -1082,6 +1262,8 @@ pub const ColumnIndex = struct {
     boundary_order: BoundaryOrder = .UNORDERED,
     /// Optional per-page null counts. Histograms (fields 6-7) skipped.
     null_counts: ?std.ArrayListUnmanaged(i64) = null,
+    /// Optional per-page NaN counts of a FLOAT/DOUBLE column; missing means any page may hold NaN.
+    nan_counts: ?std.ArrayListUnmanaged(i64) = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnIndex {
         const saved_id = reader.last_field_id;
@@ -1094,6 +1276,7 @@ pub const ColumnIndex = struct {
             ci.min_values.deinit(allocator);
             ci.max_values.deinit(allocator);
             if (ci.null_counts) |*nc| nc.deinit(allocator);
+            if (ci.nan_counts) |*nc| nc.deinit(allocator);
         }
 
         reader.readStructBegin();
@@ -1144,23 +1327,24 @@ pub const ColumnIndex = struct {
                 },
                 4 => ci.boundary_order = (std.enums.fromInt(BoundaryOrder, try reader.readZigZag(i32)) orelse .UNORDERED),
                 5 => {
-                    const header = try reader.readByte();
-                    var size = @as(usize, header >> 4);
-                    if (size == 0xF) size = try reader.readVarInt(usize);
-                    var nc: std.ArrayListUnmanaged(i64) = .empty;
-                    try nc.ensureTotalCapacityPrecise(
-                        allocator,
-                        safeListReserve(i64, size, reader.remaining()),
-                    );
-                    var i: usize = 0;
-                    while (i < size) : (i += 1) {
-                        try nc.append(allocator, try reader.readZigZag(i64));
-                    }
-                    ci.null_counts = nc;
+                    if (ci.null_counts) |*old| old.deinit(allocator);
+                    ci.null_counts = null;
+                    ci.null_counts = try readI64List(allocator, reader);
+                },
+                8 => {
+                    if (ci.nan_counts) |*old| old.deinit(allocator);
+                    ci.nan_counts = null;
+                    ci.nan_counts = try readI64List(allocator, reader);
                 },
                 else => try reader.skip(field.type),
             }
         }
+        // NaN counts that are not one per page come from a broken writer: none of them is read as a count, so no zero
+        // among them prunes a page and no copy writes them back.
+        if (ci.nan_counts) |*nc| if (nc.items.len != ci.null_pages.items.len) {
+            nc.deinit(allocator);
+            ci.nan_counts = null;
+        };
         return ci;
     }
 
@@ -1174,14 +1358,30 @@ pub const ColumnIndex = struct {
         for (self.min_values.items) |v| try writer.writeString(v);
         try writer.writeFieldListBegin(3, .Binary, self.max_values.items.len);
         for (self.max_values.items) |v| try writer.writeString(v);
-        try writer.writeFieldI32(4, @intFromEnum(self.boundary_order));
+        try writer.writeFieldI32(4, @backingInt(self.boundary_order));
         if (self.null_counts) |nc| {
             try writer.writeFieldListBegin(5, .I64, nc.items.len);
+            for (nc.items) |v| try writer.writeZigZag(v);
+        }
+        if (self.nan_counts) |nc| {
+            try writer.writeFieldListBegin(8, .I64, nc.items.len);
             for (nc.items) |v| try writer.writeZigZag(v);
         }
         try writer.writeStructEnd();
     }
 };
+
+/// A `list<i64>` field's elements, the list header included.
+fn readI64List(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayListUnmanaged(i64) {
+    const header = try reader.readByte();
+    var size = @as(usize, header >> 4);
+    if (size == 0xF) size = try reader.readVarInt(usize);
+    var list: std.ArrayListUnmanaged(i64) = .empty;
+    errdefer list.deinit(allocator);
+    try list.ensureTotalCapacityPrecise(allocator, safeListReserve(i64, size, reader.remaining()));
+    for (0..size) |_| try list.append(allocator, try reader.readZigZag(i64));
+    return list;
+}
 
 pub const RowGroup = struct {
     columns: std.ArrayListUnmanaged(ColumnChunk),
@@ -1251,6 +1451,35 @@ pub const RowGroup = struct {
 
 /// `ColumnOrder` union member id for TYPE_DEFINED_ORDER, the only order the full-match proof reads stats in.
 pub const COLUMN_ORDER_TYPE_DEFINED: i16 = 1;
+/// The `created_by` of every file whose column data zpq encodes, so readers apply no other writer's statistics
+/// workarounds to it. A pure byte copy, or a recompression that keeps every page's values and every statistic as it
+/// found them, keeps its source's string instead.
+pub const ZPQ_CREATED_BY = "zpq version " ++ @import("build_options").version;
+
+/// Drop a chunk's deprecated `min`/`max` unless they mirror its `min_value`/`max_value`, as zpq's writer always writes
+/// them. For a chunk copied from another writer into a file `ZPQ_CREATED_BY` labels: readers trust or work around the
+/// deprecated pair by `created_by` (some writers ordered it signed for byte arrays), and under zpq's name they would
+/// trust it. `min_value`/`max_value` are ordered by the column order and kept.
+pub fn dropForeignDeprecatedBounds(chunk: *ColumnChunk) void {
+    const cm = &(chunk.meta_data orelse return);
+    const st = &(cm.statistics orelse return);
+    const mirrored = mirrors(st.min, st.min_value) and mirrors(st.max, st.max_value);
+    if (mirrored) return;
+    st.min = null;
+    st.max = null;
+}
+
+fn mirrors(deprecated: ?[]const u8, typed: ?[]const u8) bool {
+    const d = deprecated orelse return true;
+    const t = typed orelse return false;
+    return std.mem.eql(u8, d, t);
+}
+
+/// `ColumnOrder` member id for IEEE_754_TOTAL_ORDER (FLOAT/DOUBLE/FLOAT16): bounds are the least and greatest non-NaN
+/// values, NaN only for a chunk or page of nothing but NaN, and nan_count is mandatory.
+pub const COLUMN_ORDER_IEEE_754_TOTAL: i16 = 2;
+/// Chronological INT96 order: signed i32 Julian day, then signed i64 nanoseconds of day.
+pub const COLUMN_ORDER_INT96_TIMESTAMP: i16 = 3;
 
 pub const FileMetaData = struct {
     version: i32,
@@ -1261,6 +1490,13 @@ pub const FileMetaData = struct {
     /// Per leaf, the `ColumnOrder` union member the writer declared (0 = an empty union). Null when the footer has no
     /// column_orders. Written from `outputColumnOrders`.
     column_orders: ?std.ArrayListUnmanaged(i16) = null,
+    /// Fields 8/9 (encryption_algorithm, footer_signing_key_metadata): a plaintext footer over encrypted columns.
+    encrypted: bool = false,
+    /// Each leaf's element and levels, and the first leaf of each path, from one schema walk at footer open
+    /// (`indexLeaves`), so a chunk resolves its leaf by a hash probe: a walk over every leaf per column per row group
+    /// made row output and re-encoded writes quadratic in the column count. Null on a footer built in memory; lookups
+    /// then walk the schema. Indexed schemas must keep their shape.
+    leaf_index: ?*const LeafIndex = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !FileMetaData {
         const saved_id = reader.last_field_id;
@@ -1313,11 +1549,31 @@ pub const FileMetaData = struct {
                     }
                 },
                 6 => meta.created_by = try reader.readString(),
+                // A repeated field replaces the earlier one only once it has been read whole: freeing the old list
+                // first left it to the errdefer above to free again when the new one failed.
                 7 => if (field.type == .List) {
+                    const orders = try readColumnOrders(allocator, reader);
                     if (meta.column_orders) |*co| co.deinit(allocator);
-                    meta.column_orders = try readColumnOrders(allocator, reader);
+                    meta.column_orders = orders;
                 } else try reader.skip(field.type),
+                8, 9 => {
+                    meta.encrypted = true;
+                    try reader.skip(field.type);
+                },
                 else => try reader.skip(field.type),
+            }
+        }
+        // Modern files need no provenance walk. Older/unknown versions of known writers classify each chunk
+        // through one leaf walk, before the lookup index exists (never a schema walk per chunk on wide files).
+        const writers = @import("parquet/writer_statistics.zig");
+        if (writers.policy(meta.created_by, .BYTE_ARRAY, null) != .trust) {
+            var leaves = LeafIterator.init(meta.schema.items);
+            while (leaves.next()) |leaf| {
+                for (meta.row_groups.items) |*rg| {
+                    if (leaf.index >= rg.columns.items.len) continue;
+                    if (rg.columns.items[leaf.index].meta_data) |*cm|
+                        cm.writer_stats = writers.policy(meta.created_by, cm.type, leaf.element.*);
+                }
             }
         }
         return meta;
@@ -1327,7 +1583,7 @@ pub const FileMetaData = struct {
         const header = try reader.readByte();
         var size = @as(usize, header >> 4);
         if (size == 0xF) size = try reader.readVarInt(usize);
-        if (header & 0x0f != @intFromEnum(thrift.Type.Struct)) return error.InvalidThriftType;
+        if (header & 0x0f != @backingInt(thrift.Type.Struct)) return error.InvalidThriftType;
         var orders: std.ArrayListUnmanaged(i16) = .empty;
         errdefer orders.deinit(allocator);
         try orders.ensureTotalCapacityPrecise(allocator, safeListReserve(i16, size, reader.remaining()));
@@ -1349,6 +1605,7 @@ pub const FileMetaData = struct {
     }
 
     pub fn deinit(self: *FileMetaData, allocator: std.mem.Allocator) void {
+        if (self.leaf_index) |ix| ix.destroy(allocator);
         if (self.column_orders) |*co| co.deinit(allocator);
         self.schema.deinit(allocator);
         for (self.row_groups.items) |*rg| {
@@ -1450,12 +1707,109 @@ pub const FileMetaData = struct {
         return leaf.element.*;
     }
 
+    /// Build `leaf_index` over the current schema.
+    pub fn indexLeaves(self: *FileMetaData, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+        const ix = try allocator.create(LeafIndex);
+        ix.* = .{ .schema_len = self.schema.items.len };
+        errdefer ix.destroy(allocator);
+        var it: LeafIterator = .init(self.schema.items);
+        while (it.next()) |leaf| {
+            const path = try allocator.dupe([]const u8, leaf.path);
+            ix.leaves.append(allocator, .{
+                .element = @intCast(it.pos - 1),
+                .top = @intCast(leaf.top),
+                .max_def = leaf.max_def,
+                .max_rep = leaf.max_rep,
+                .path = path,
+            }) catch |err| {
+                allocator.free(path);
+                return err;
+            };
+            const gop = try ix.first_by_path.getOrPut(allocator, path);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(leaf.index);
+        }
+        self.leaf_index = ix;
+    }
+
+    /// Leaf `index` of the schema walk (the column chunk at that position in every row group), or null past the last.
+    /// Without an index the schema is walked in `scratch`, whose names the leaf's path then borrows: it stays valid
+    /// while `scratch` and the schema do.
+    pub fn leafAt(self: *const FileMetaData, index: usize, scratch: *LeafIterator) ?LeafIterator.Leaf {
+        if (self.leaf_index) |ix| if (ix.schema_len == self.schema.items.len) {
+            if (index >= ix.leaves.items.len) return null;
+            return ix.leaf(self, @intCast(index));
+        };
+        scratch.* = .init(self.schema.items);
+        while (scratch.next()) |leaf| if (leaf.index == index) return leaf;
+        return null;
+    }
+
+    /// The first leaf whose path is `path`. Callers read its element and levels only: without an index its path
+    /// borrows a walk that ends here.
     fn leafAtPath(self: *const FileMetaData, path: []const []const u8) ?LeafIterator.Leaf {
+        if (self.leaf_index) |ix| if (ix.schema_len == self.schema.items.len) {
+            return ix.leaf(self, ix.first_by_path.get(path) orelse return null);
+        };
         var it: LeafIterator = .init(self.schema.items);
         while (it.next()) |leaf| {
             if (pathEql(leaf.path, path)) return leaf;
         }
         return null;
+    }
+};
+
+/// `FileMetaData.leaf_index`: leaf `i` of the schema walk is `leaves[i]`; `first_by_path` maps a path to the first
+/// leaf with it, as the walk would find it.
+pub const LeafIndex = struct {
+    schema_len: usize,
+    leaves: std.ArrayListUnmanaged(Entry) = .empty,
+    first_by_path: PathMap = .empty,
+
+    const PathMap = std.HashMapUnmanaged([]const []const u8, u32, PathContext, std.hash_map.default_max_load_percentage);
+
+    pub const Entry = struct {
+        /// Schema index of the leaf's element.
+        element: u32,
+        top: u32,
+        max_def: u8,
+        max_rep: u8,
+        /// Owned copy of the path; its names borrow the schema.
+        path: []const []const u8,
+    };
+
+    const PathContext = struct {
+        pub fn hash(_: PathContext, path: []const []const u8) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            // Lengths first, so `a.b` and the field `b` of a group `a` hash apart.
+            for (path) |name| {
+                h.update(std.mem.asBytes(&name.len));
+                h.update(name);
+            }
+            return h.final();
+        }
+        pub fn eql(_: PathContext, a: []const []const u8, b: []const []const u8) bool {
+            return pathEql(a, b);
+        }
+    };
+
+    fn leaf(self: *const LeafIndex, file: *const FileMetaData, i: u32) LeafIterator.Leaf {
+        const e = self.leaves.items[i];
+        return .{
+            .index = i,
+            .element = &file.schema.items[e.element],
+            .path = e.path,
+            .top = e.top,
+            .max_def = e.max_def,
+            .max_rep = e.max_rep,
+        };
+    }
+
+    pub fn destroy(self: *const LeafIndex, allocator: std.mem.Allocator) void {
+        var ix = self.*;
+        for (ix.leaves.items) |e| allocator.free(e.path);
+        ix.leaves.deinit(allocator);
+        ix.first_by_path.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -1564,6 +1918,14 @@ pub const Levels = struct {
     max_def: i32,
     max_rep: i32,
 };
+
+test "a footer that repeats column_orders, the second cut short, fails without freeing the first twice" {
+    // Field 7 (column_orders): an empty list of structs; field 7 again (long form: type List, zigzag id 7): a list of
+    // one struct, and then the input ends.
+    const bytes = [_]u8{ 0x79, 0x0C, 0x09, 0x0E, 0x1C };
+    var reader = thrift.Reader.init(&bytes);
+    try std.testing.expect(std.meta.isError(FileMetaData.read(std.testing.allocator, &reader)));
+}
 
 test "logical-type fields a footer leaves out or overflows are rejected, not left undefined" {
     const a = std.testing.allocator;
@@ -1730,6 +2092,7 @@ test "ColumnIndex roundtrip" {
         ci.min_values.deinit(allocator);
         ci.max_values.deinit(allocator);
         if (ci.null_counts) |*nc| nc.deinit(allocator);
+        if (ci.nan_counts) |*nc| nc.deinit(allocator);
     }
     try ci.null_pages.appendSlice(allocator, &[_]bool{ false, true });
     try ci.min_values.appendSlice(allocator, &[_][]const u8{ "\x01\x00\x00\x00", "" });
@@ -1737,6 +2100,9 @@ test "ColumnIndex roundtrip" {
     var nc: std.ArrayListUnmanaged(i64) = .empty;
     try nc.appendSlice(allocator, &[_]i64{ 0, 1000 });
     ci.null_counts = nc;
+    var nans: std.ArrayListUnmanaged(i64) = .empty;
+    try nans.appendSlice(allocator, &[_]i64{ 3, 0 });
+    ci.nan_counts = nans;
 
     var writer = thrift.Writer.init(allocator);
     defer writer.deinit();
@@ -1749,6 +2115,7 @@ test "ColumnIndex roundtrip" {
         decoded.min_values.deinit(allocator);
         decoded.max_values.deinit(allocator);
         if (decoded.null_counts) |*d| d.deinit(allocator);
+        if (decoded.nan_counts) |*d| d.deinit(allocator);
     }
 
     try std.testing.expectEqual(@as(usize, 2), decoded.null_pages.items.len);
@@ -1758,6 +2125,41 @@ test "ColumnIndex roundtrip" {
     try std.testing.expectEqualSlices(u8, "\x01\x00\x00\x00", decoded.min_values.items[0]);
     try std.testing.expect(decoded.null_counts != null);
     try std.testing.expectEqual(@as(i64, 1000), decoded.null_counts.?.items[1]);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 0 }, decoded.nan_counts.?.items);
+
+    // A list longer or shorter than the pages is no list of counts.
+    for ([_][]const i64{ &.{ 0, 0, 0 }, &.{0} }) |bad| {
+        ci.nan_counts.?.clearRetainingCapacity();
+        try ci.nan_counts.?.appendSlice(allocator, bad);
+        var w2 = thrift.Writer.init(allocator);
+        defer w2.deinit();
+        try ci.write(&w2);
+        var r2 = thrift.Reader.init(w2.bytes());
+        var back = try ColumnIndex.read(allocator, &r2);
+        defer {
+            back.null_pages.deinit(allocator);
+            back.min_values.deinit(allocator);
+            back.max_values.deinit(allocator);
+            if (back.null_counts) |*d| d.deinit(allocator);
+            if (back.nan_counts) |*d| d.deinit(allocator);
+        }
+        try std.testing.expect(back.nan_counts == null);
+        try std.testing.expectEqual(@as(usize, 2), back.null_counts.?.items.len);
+    }
+}
+
+test "Statistics write their nan_count, and read it back" {
+    const allocator = std.testing.allocator;
+    for ([_]?i64{ null, 0, 7 }) |nan_count| {
+        const st: Statistics = .{ .null_count = 1, .min_value = "\x00\x00\x00\x00", .max_value = "\x00\x00\x80\x3f", .nan_count = nan_count };
+        var writer = thrift.Writer.init(allocator);
+        defer writer.deinit();
+        try st.write(&writer);
+        var reader = thrift.Reader.init(writer.bytes());
+        const back = try Statistics.read(&reader);
+        try std.testing.expectEqual(nan_count, back.nan_count);
+        try std.testing.expectEqual(@as(?i64, 1), back.null_count);
+    }
 }
 
 test "ColumnChunk write emits page-index pointers" {
@@ -1850,4 +2252,200 @@ test "outputColumnOrders: zpq's own bounds are type-defined, copied bounds keep 
     try std.testing.expect(x.keptLeavesTypeDefined(&.{ true, false, true }));
     try std.testing.expect(!x.keptLeavesTypeDefined(&.{ true, true, true }));
     try std.testing.expect(blank.keptLeavesTypeDefined(&.{ true, true, true }));
+}
+
+test "schema preserves opaque logical annotations without replacing them with NullType" {
+    const a = std.testing.allocator;
+    // Geometry with a CRS, Variant with a version, and a future union arm with an unknown binary field.
+    const payloads = [_][]const u8{
+        &.{ 0x0c, 0x22, 0x18, 0x03, 'c', 'r', 's', 0x00, 0x00 },
+        &.{ 0x0c, 0x20, 0x15, 0x02, 0x00, 0x00 },
+        &.{ 0x0c, 0xc8, 0x01, 0x18, 0x02, 0xff, 0x00, 0x00, 0x00 },
+    };
+    for (payloads) |raw| {
+        const elem: SchemaElement = .{
+            .type = .BYTE_ARRAY,
+            .type_length = null,
+            .repetition_type = .OPTIONAL,
+            .name = "value",
+            .num_children = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+            .logical_type_raw = raw,
+        };
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        try elem.write(&w);
+        var r = thrift.Reader.init(w.bytes());
+        var parsed = try SchemaElement.read(&r);
+        try std.testing.expectEqualSlices(u8, raw, parsed.logical_type_raw);
+        // A renamed projection must retain the inner struct independently of the outer field deltas.
+        parsed.name = "projected";
+        var projected = thrift.Writer.init(a);
+        defer projected.deinit();
+        try parsed.write(&projected);
+        var rr = thrift.Reader.init(projected.bytes());
+        const again = try SchemaElement.read(&rr);
+        try std.testing.expectEqualSlices(u8, raw, again.logical_type_raw);
+    }
+}
+
+test "sameAnnotation: one annotation however written, refusing genuinely different and opaque-but-different ones" {
+    const base: SchemaElement = .{
+        .type = .INT64,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "v",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    var modern = base;
+    modern.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MICROS = .{} } } };
+    var both = modern;
+    both.converted_type = .TIMESTAMP_MICROS;
+    var legacy = base;
+    legacy.converted_type = .TIMESTAMP_MICROS;
+    try std.testing.expect(SchemaElement.sameAnnotation(&modern, &both));
+    try std.testing.expect(SchemaElement.sameAnnotation(&modern, &legacy));
+    try std.testing.expect(SchemaElement.sameAnnotation(&legacy, &both));
+    // The raw bytes of a recognized annotation are the writer's spelling, not its meaning.
+    both.logical_type_raw = &.{ 0x8c, 0x1c, 0x12, 0x00, 0x00 };
+    try std.testing.expect(SchemaElement.sameAnnotation(&modern, &both));
+
+    var local = modern;
+    local.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .MICROS = .{} } } };
+    var millis = modern;
+    millis.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = true, .unit = .{ .MILLIS = .{} } } };
+    var plain = base;
+    try std.testing.expect(!SchemaElement.sameAnnotation(&modern, &local));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&legacy, &local));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&modern, &millis));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&modern, &plain));
+    try std.testing.expect(SchemaElement.sameAnnotation(&plain, &plain));
+
+    var geometry = base;
+    geometry.logical_type = .{ .UNKNOWN = .{} };
+    geometry.logical_type_raw = &.{ 0x0c, 0x22, 0x18, 0x03, 'c', 'r', 's', 0x00, 0x00 };
+    var other_crs = geometry;
+    other_crs.logical_type_raw = &.{ 0x0c, 0x22, 0x18, 0x03, 'x', 'y', 'z', 0x00, 0x00 };
+    try std.testing.expect(SchemaElement.sameAnnotation(&geometry, &geometry));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&geometry, &other_crs));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&geometry, &plain));
+
+    var interval = base;
+    interval.converted_type = .INTERVAL;
+    try std.testing.expect(!SchemaElement.sameAnnotation(&interval, &plain));
+
+    // One future arm over a UTF8 fallback and over none: text in one file, bytes in the other.
+    var future_text = base;
+    future_text.type = .BYTE_ARRAY;
+    future_text.logical_type = .{ .UNKNOWN = .{} };
+    future_text.logical_type_raw = &.{ 0x0c, 0xc8, 0x01, 0x00, 0x00 };
+    future_text.converted_type = .UTF8;
+    var future_bytes = future_text;
+    future_bytes.converted_type = null;
+    try std.testing.expect(SchemaElement.sameAnnotation(&future_text, &future_text));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&future_text, &future_bytes));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&future_bytes, &future_text));
+    // Two legacy annotations, both present, that disagree beside one recognized type.
+    var signed = base;
+    signed.logical_type = .{ .INTEGER = .{ .bitWidth = 64, .isSigned = true } };
+    signed.converted_type = .INT_64;
+    var conflicting = signed;
+    conflicting.converted_type = .UINT_64;
+    var implied = signed;
+    implied.converted_type = null;
+    try std.testing.expect(SchemaElement.sameAnnotation(&signed, &implied));
+    try std.testing.expect(!SchemaElement.sameAnnotation(&signed, &conflicting));
+}
+
+test "dropForeignDeprecatedBounds keeps a mirrored pair and drops one a foreign writer ordered its own way" {
+    var path: StringList = .empty;
+    defer path.deinit(std.testing.allocator);
+    const Case = struct { st: Statistics, keep: bool };
+    const cases = [_]Case{
+        // zpq's own writer: the deprecated pair mirrors the typed one.
+        .{ .st = .{ .min = "a", .max = "z", .min_value = "a", .max_value = "z" }, .keep = true },
+        // An unsigned or DECIMAL chunk zpq wrote: no deprecated pair at all.
+        .{ .st = .{ .min_value = "a", .max_value = "z" }, .keep = true },
+        // A signed-ordered byte-array pair beside the typed one, and a deprecated pair alone.
+        .{ .st = .{ .min = "\x80", .max = "z", .min_value = "a", .max_value = "\x80" }, .keep = false },
+        .{ .st = .{ .min = "a", .max = "z" }, .keep = false },
+    };
+    for (cases) |c| {
+        var chunk: ColumnChunk = .{ .file_path = null, .file_offset = 0, .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = path,
+            .codec = .UNCOMPRESSED,
+            .num_values = 1,
+            .total_uncompressed_size = 0,
+            .total_compressed_size = 0,
+            .data_page_offset = 4,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+            .statistics = c.st,
+        } };
+        dropForeignDeprecatedBounds(&chunk);
+        const st = chunk.meta_data.?.statistics.?;
+        try std.testing.expectEqual(c.keep, st.min != null or c.st.min == null);
+        try std.testing.expectEqual(c.keep, st.max != null or c.st.max == null);
+        // The typed pair is never touched.
+        try std.testing.expectEqual(c.st.min_value, st.min_value);
+        try std.testing.expectEqual(c.st.max_value, st.max_value);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, ZPQ_CREATED_BY, "zpq version "));
+}
+
+test "ALP and unknown encoding ids survive metadata and every page header" {
+    const a = std.testing.allocator;
+    for ([_]i32{ 10, 12345, -17 }) |id| {
+        const encoding = std.enums.fromInt(Encoding, id).?;
+        var w = thrift.Writer.init(a);
+        defer w.deinit();
+        w.writeStructBegin();
+        try w.writeFieldListBegin(2, .I32, 1);
+        try w.writeZigZag(id);
+        try w.writeStructEnd();
+        var r = thrift.Reader.init(w.bytes());
+        var cm = try ColumnMetaData.read(a, &r);
+        defer cm.deinit(a);
+        try std.testing.expectEqual(encoding, cm.encodings.items[0]);
+        var round = thrift.Writer.init(a);
+        defer round.deinit();
+        try cm.write(&round);
+        var rr = thrift.Reader.init(round.bytes());
+        var again = try ColumnMetaData.read(a, &rr);
+        defer again.deinit(a);
+        try std.testing.expectEqual(id, @backingInt(again.encodings.items[0]));
+        const d1 = DataPageHeader{
+            .num_values = 1,
+            .encoding = encoding,
+            .definition_level_encoding = encoding,
+            .repetition_level_encoding = encoding,
+        };
+        var v1 = thrift.Writer.init(a);
+        defer v1.deinit();
+        try d1.write(&v1);
+        var r1 = thrift.Reader.init(v1.bytes());
+        const h1 = try DataPageHeader.read(&r1);
+        try std.testing.expectEqual(encoding, h1.encoding);
+        try std.testing.expectEqual(encoding, h1.definition_level_encoding);
+        try std.testing.expectEqual(encoding, h1.repetition_level_encoding);
+        var dict = thrift.Writer.init(a);
+        defer dict.deinit();
+        try (DictionaryPageHeader{ .num_values = 1, .encoding = encoding, .is_sorted = null }).write(&dict);
+        var rd = thrift.Reader.init(dict.bytes());
+        try std.testing.expectEqual(encoding, (try DictionaryPageHeader.read(&rd)).encoding);
+        var v2 = thrift.Writer.init(a);
+        defer v2.deinit();
+        v2.writeStructBegin();
+        try v2.writeFieldI32(4, id);
+        try v2.writeStructEnd();
+        var r2 = thrift.Reader.init(v2.bytes());
+        try std.testing.expectEqual(encoding, (try DataPageHeaderV2.read(&r2)).encoding);
+    }
 }

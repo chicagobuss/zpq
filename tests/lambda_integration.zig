@@ -20,6 +20,7 @@ const linux = std.os.linux;
 const integration_opts = @import("integration_opts");
 
 const LAMBDA_BIN = integration_opts.lambda_bin;
+const CLI_BIN = integration_opts.cli_bin;
 
 // ============================================================
 // Fake runtime API server
@@ -87,6 +88,7 @@ const Request = struct {
     fn deinit(self: *Request) void {
         sysClose(self.conn);
         self.allocator.free(self.raw);
+        self.* = undefined;
     }
 
     fn replyAndClose(
@@ -96,6 +98,7 @@ const Request = struct {
         extra_headers: []const u8,
         body: []const u8,
     ) !void {
+        defer self.deinit();
         const status_text = switch (status) {
             200 => "OK",
             202 => "Accepted",
@@ -115,9 +118,6 @@ const Request = struct {
             if (n == 0) break;
             off += n;
         }
-        sysClose(self.conn);
-        self.allocator.free(self.raw);
-        self.* = undefined;
     }
 };
 
@@ -362,8 +362,8 @@ fn writeAllFd(fd: linux.fd_t, bytes: []const u8) !void {
 }
 
 /// `path` with `pad` zero bytes spliced in before its footer. Column-chunk offsets are absolute, so they still point at
-/// the unmoved chunks and the file stays valid Parquet; the padding pushes every chunk out of the 64 KiB tail zpq reads
-/// first, so a query also runs the parallel range-fetch stage.
+/// the unmoved chunks and the file stays valid Parquet; the padding pushes every chunk out of the footer suffix zpq
+/// reads first (1 MiB unless `ZPQ_S3_FOOTER_PROBE` is set), so a query also runs the parallel range-fetch stage.
 fn paddedParquet(allocator: std.mem.Allocator, path: []const u8, pad: usize) ![]u8 {
     const raw = try readFileSlice(allocator, path);
     defer allocator.free(raw);
@@ -491,104 +491,39 @@ test "lambda rejects empty body cleanly" {
     try resp.replyAndClose(std.testing.allocator, 202, "", "");
 }
 
-test "lambda decodes int8 column from a real Parquet file" {
-    const fixture_path = "data/benchmark_100mb.parquet";
-    const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
-        if (err == error.FileNotFound) {
-            std.debug.print("skipping: {s} not present\n", .{fixture_path});
-            return error.SkipZigTest;
-        }
-        return err;
-    };
+test "lambda bounds raw events and decodes int8 on cold and warm invocations" {
+    const file_bytes = try readFileSlice(std.testing.allocator, "ci/fixtures/parquet/lambda_int8.parquet");
     defer std.testing.allocator.free(file_bytes);
-
     var server = try FakeServer.start();
     defer server.deinit();
-
-    const endpoint = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "127.0.0.1:{d}",
-        .{server.port},
-    );
+    const endpoint = try std.fmt.allocPrint(std.testing.allocator, "127.0.0.1:{d}", .{server.port});
     defer std.testing.allocator.free(endpoint);
-
     var child = try spawnLambda(std.testing.allocator, endpoint);
     defer killChild(&child);
 
-    var poll = try server.acceptRequest(std.testing.allocator);
-    try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
-    try poll.replyAndClose(
-        std.testing.allocator,
-        200,
-        "Lambda-Runtime-Aws-Request-Id: req-decode\r\n" ++
-            "Content-Type: application/octet-stream\r\n",
-        file_bytes,
-    );
-
-    var resp = try server.acceptRequest(std.testing.allocator);
-    try std.testing.expectEqualStrings("POST", resp.method);
-    try std.testing.expectEqualStrings(
-        "/2018-06-01/runtime/invocation/req-decode/response",
-        resp.path,
-    );
-
-    // Expect the success envelope with all 524288 rows decoded.
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"column\":\"int8\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rows\":524288") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"row_groups\":4") != null);
-    std.debug.print("[lambda decode] response: {s}\n", .{resp.body});
-    try resp.replyAndClose(std.testing.allocator, 202, "", "");
-}
-
-test "lambda handles back-to-back invocations" {
-    const fixture_path = "data/benchmark_100mb.parquet";
-    const file_bytes = readFileSlice(std.testing.allocator, fixture_path) catch |err| {
-        if (err == error.FileNotFound) return error.SkipZigTest;
-        return err;
+    // A runaway event is refused before dispatch; the same process resumes polling.
+    const oversized = try std.testing.allocator.alloc(u8, (32 << 20) + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 0);
+    var rejected = try server.acceptRequest(std.testing.allocator);
+    rejected.replyAndClose(std.testing.allocator, 200, "Lambda-Runtime-Aws-Request-Id: oversized\r\n", oversized) catch |err| {
+        if (err != error.WriteFailed) return err; // The bounded reader may close before the send finishes.
     };
-    defer std.testing.allocator.free(file_bytes);
 
-    var server = try FakeServer.start();
-    defer server.deinit();
-
-    const endpoint = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "127.0.0.1:{d}",
-        .{server.port},
-    );
-    defer std.testing.allocator.free(endpoint);
-
-    var child = try spawnLambda(std.testing.allocator, endpoint);
-    defer killChild(&child);
-
-    const ids = [_][]const u8{ "req-A", "req-B" };
-    for (ids) |id| {
+    for ([_][]const u8{ "cold", "warm" }) |id| {
         var poll = try server.acceptRequest(std.testing.allocator);
         try std.testing.expectEqualStrings("GET", poll.method);
-
-        const headers = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "Lambda-Runtime-Aws-Request-Id: {s}\r\n" ++
-                "Content-Type: application/octet-stream\r\n",
-            .{id},
-        );
+        try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/next", poll.path);
+        const headers = try std.fmt.allocPrint(std.testing.allocator, "Lambda-Runtime-Aws-Request-Id: {s}\r\nContent-Type: application/octet-stream\r\n", .{id});
         defer std.testing.allocator.free(headers);
         try poll.replyAndClose(std.testing.allocator, 200, headers, file_bytes);
-
-        var resp = try server.acceptRequest(std.testing.allocator);
-        try std.testing.expectEqualStrings("POST", resp.method);
-        const expected_path = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "/2018-06-01/runtime/invocation/{s}/response",
-            .{id},
-        );
-        defer std.testing.allocator.free(expected_path);
-        try std.testing.expectEqualStrings(expected_path, resp.path);
-
-        // Each invocation should yield the success envelope.
-        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rows\":524288") != null);
-        try resp.replyAndClose(std.testing.allocator, 202, "", "");
+        var response = try server.acceptRequest(std.testing.allocator);
+        try std.testing.expectEqualStrings("POST", response.method);
+        const path = try std.fmt.allocPrint(std.testing.allocator, "/2018-06-01/runtime/invocation/{s}/response", .{id});
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqualStrings(path, response.path);
+        try std.testing.expectEqualStrings("{\"ok\":true,\"column\":\"int8\",\"rows\":16388,\"min\":-128,\"max\":127,\"sum\":255869,\"row_groups\":4}", response.body);
+        try response.replyAndClose(std.testing.allocator, 202, "", "");
     }
 }
 
@@ -615,11 +550,12 @@ test "lambda aggregate over no rows answers NULL for sum/avg/min/max, 0 for coun
             "Content-Type: application/json\r\n",
         "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"filter\":\"id < 0\"," ++
             "\"aggregate\":\"sum(id) AS s, avg(id) AS a, min(string_col) AS m, max(double_col) AS x, " ++
-            "count(*) AS c, count(id) AS ci\"}",
+            "count(*) AS c, count(id) AS ci, avg_state(id) AS st\"}",
     );
 
     var resp = try server.acceptRequest(std.testing.allocator);
-    const want = "\"agg\":{\"s\":null,\"a\":{\"sum\":null,\"count\":0},\"m\":null,\"x\":null,\"c\":0,\"ci\":0}";
+    const want = "\"agg\":{\"s\":null,\"a\":null,\"m\":null,\"x\":null,\"c\":0,\"ci\":0," ++
+        "\"st\":{\"sum\":null,\"count\":0}}";
     if (std.mem.indexOf(u8, resp.body, want) == null) {
         std.debug.print("[lambda empty agg] response: {s}\n", .{resp.body});
         return error.TestUnexpectedResult;
@@ -633,19 +569,20 @@ test "lambda aggregate JSON escapes strings and spells NaN/Infinity like the CLI
     try expectResponses("lambda json escape", &.{
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"]," ++
-                "\"aggregate\":\"min(s) AS m, sum(x) AS n, max(y) AS i, avg(x) AS a\"}",
+                "\"aggregate\":\"min(s) AS m, sum(x) AS n, max(y) AS i, avg(x) AS a, avg_state(x) AS st\"}",
             .want = "\"agg\":{\"m\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":\"NaN\",\"i\":\"Infinity\"," ++
-                "\"a\":{\"sum\":\"NaN\",\"count\":3}}",
+                "\"a\":\"NaN\",\"st\":{\"sum\":\"NaN\",\"count\":3}}",
         },
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"s\",\"aggregate\":\"sum(x) AS n\"}",
-            .want = "{\"s\":\"b\",\"n\":\"NaN\"},{\"s\":\"c\",\"n\":2},{\"s\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":1}",
+            .want = "{\"s\":\"a \\\"q\\\" c:\\\\d\\nnext\\u0001end\",\"n\":1},{\"s\":\"b\",\"n\":\"NaN\"},{\"s\":\"c\",\"n\":2}",
         },
         .{
-            // Invalid UTF-8 becomes one U+FFFD per offending byte; U+2028 is escaped.
+            // Unannotated bytes (docs/binary-output.md): `ff fe 41 e2 80` and a surrogate are not UTF-8, so base64;
+            // U+2028 is text, escaped.
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"count(*) AS n\"}",
-            .want = "[{\"b\":\"\\u2028\",\"n\":1},{\"b\":\"\u{FFFD}\u{FFFD}\u{FFFD}\",\"n\":1}," ++
-                "{\"b\":\"\u{FFFD}\u{FFFD}A\u{FFFD}\u{FFFD}\",\"n\":1}]",
+            .want = "[{\"b\":{\"base64\":\"//5B4oA=\"},\"n\":1},{\"b\":{\"base64\":\"7aCA\"},\"n\":1}," ++
+                "{\"b\":\"\\u2028\",\"n\":1}]",
         },
     });
 }
@@ -658,12 +595,12 @@ test "lambda labels a nested GROUP BY key by its quoted path when a top-level co
     try expectResponses("lambda dotted twin", &.{
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b, a.b\",\"aggregate\":\"count(*) AS n\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
-                "{" ++ q ++ ":20,\"a.b\":null,\"n\":1}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"a.b\":1,\"n\":1},{" ++ q ++ ":20,\"a.b\":null,\"n\":1}," ++
+                "{" ++ q ++ ":null,\"a.b\":3,\"n\":1}]",
         },
         .{
             .body = "{\"inputs\":[\"" ++ fixture_path ++ "\"],\"group_by\":\"b\",\"aggregate\":\"max(a.b) AS m\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"m\":3},{" ++ q ++ ":10,\"m\":1},{" ++ q ++ ":20,\"m\":null}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"m\":1},{" ++ q ++ ":20,\"m\":null},{" ++ q ++ ":null,\"m\":3}]",
         },
     });
 }
@@ -700,6 +637,37 @@ fn expectResponses(tag: []const u8, events: []const struct { body: []const u8, w
     }
 }
 
+test "lambda returns a bounded profile summary inline when asked" {
+    const esc = "ci/fixtures/parquet/json_escape.parquet";
+    const agg = "{\"inputs\":[\"" ++ esc ++ "\"],\"aggregate\":\"count(*) AS n, sum(x) AS sx\",\"profile\":true";
+    const out = "zig-out/lambda_profile_out.parquet";
+    defer _ = linux.unlink(out);
+    // The request is echoed cut to 512 bytes; put an `é` across that byte. The cut must fall before it.
+    // This process has a region and no keys, so pre-connect skips and those fields follow the cut query.
+    const note = agg ++ ",\"note\":\"";
+    const straddle = note ++ @as([511 - note.len]u8, @splat('a')) ++ "\u{e9}\"}";
+    try expectResponses("lambda profile", &.{
+        .{ .body = straddle, .want = "aaaa\",\"s3_preconnect_ns\":null,\"s3_preconnect_opened\":0},\"phases\":{" },
+        // The event cap is 1/32 of the memory budget, in 72-byte events.
+        .{ .body = agg ++ ",\"max_memory\":\"64MB\"}", .want = "\"dropped\":0,\"event_cap\":29127," },
+        // The answer is untouched; the summary joins it, phases and engine sums included.
+        .{ .body = agg ++ "}", .want = "\"agg\":{\"n\":3," },
+        .{ .body = agg ++ "}", .want = "\"profile\":{\"total_ns\":" },
+        .{ .body = agg ++ "}", .want = "\"engine\":{\"read_ns\":" },
+        .{ .body = agg ++ "}", .want = "\"zpq_version\":" },
+        // A trace URL that is not S3 is reported, not fatal.
+        .{
+            .body = agg ++ ",\"profile_url\":\"nope\"}",
+            .want = "\"profile_trace\":{\"url\":\"nope\",\"error\":\"BadProfileUrl\"}",
+        },
+        .{
+            .body = "{\"inputs\":[\"" ++ esc ++ "\"],\"columns\":[\"s\"],\"output_url\":\"" ++ out ++
+                "\",\"profile\":true}",
+            .want = "\"phases\":{",
+        },
+    });
+}
+
 test "lambda write response escapes an output name holding a quote and a backslash" {
     const esc = "ci/fixtures/parquet/json_escape.parquet";
     const out = "zig-out/lambda \"q\" \\ out.parquet";
@@ -720,14 +688,14 @@ test "lambda decodes JSON escapes in request strings" {
             // Quoted column names: the nested field b of group a, then the top-level column `a.b`.
             .body = "{\"inputs\":[\"" ++ twin ++ "\"],\"group_by\":\"\\\"a\\\".\\\"b\\\", \\\"a.b\\\"\"," ++
                 "\"aggregate\":\"count(*) AS n\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"a.b\":3,\"n\":1},{" ++ q ++ ":10,\"a.b\":1,\"n\":1}," ++
-                "{" ++ q ++ ":20,\"a.b\":null,\"n\":1}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"a.b\":1,\"n\":1},{" ++ q ++ ":20,\"a.b\":null,\"n\":1}," ++
+                "{" ++ q ++ ":null,\"a.b\":3,\"n\":1}]",
         },
         .{
             // \u escapes, and a surrogate pair decoded into one UTF-8 sequence (no row holds it).
             .body = "{\"inputs\":[\"" ++ twin ++ "\"],\"group_by\":\"\\u0062\"," ++
                 "\"aggregate\":\"count(*) AS n\",\"filter\":\"\\\"a.b\\\" IS NOT NULL\"}",
-            .want = "\"agg\":[{" ++ q ++ ":null,\"n\":1},{" ++ q ++ ":10,\"n\":1}]",
+            .want = "\"agg\":[{" ++ q ++ ":10,\"n\":1},{" ++ q ++ ":null,\"n\":1}]",
         },
         .{
             // A string literal holding an escaped quote, a backslash, a newline and a control byte.
@@ -885,6 +853,49 @@ test "lambda names the input file a query could not read, and why" {
     });
 }
 
+test "lambda row_groups ranges split one file into answers that add up" {
+    // full_match.parquet: 8 row groups of 200 rows; n is NULL in 2 of every 5 rows (DuckDB: rows 0..599 hold 320
+    // non-null n summing to 288000, min 3, max 1797).
+    const a = std.testing.allocator;
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambda(a, endpoint);
+    defer killChild(&child);
+
+    const f = "\"inputs\":[\"" ++ S3_FIXTURE ++ "\"]";
+    const agg = "\"aggregate\":\"count(*) AS c, count(n) AS cn, sum(n) AS sn, min(n) AS mn, max(n) AS xn\"";
+    const whole = try invoke(&server, a, "{" ++ f ++ "," ++ agg ++ "}");
+    defer a.free(whole);
+    const all = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[0,8]]," ++ agg ++ "}");
+    defer a.free(all);
+    const head = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[0,3]]," ++ agg ++ "}");
+    defer a.free(head);
+    const empty = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[3,3]]," ++ agg ++ "}");
+    defer a.free(empty);
+    const past = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[6,9]]," ++ agg ++ "}");
+    defer a.free(past);
+    const backwards = try invoke(&server, a, "{" ++ f ++ ",\"row_groups\":[[3,2]]," ++ agg ++ "}");
+    defer a.free(backwards);
+    const short = try invoke(&server, a, "{\"inputs\":[\"" ++ S3_FIXTURE ++ "\",\"" ++ S3_FIXTURE ++
+        "\"],\"row_groups\":[[0,1]]," ++ agg ++ "}");
+    defer a.free(short);
+
+    const checks = [_]struct { got: []const u8, want: []const u8 }{
+        .{ .got = all, .want = aggMember(whole) orelse "<no agg>" },
+        .{ .got = head, .want = "\"agg\":{\"c\":600,\"cn\":320,\"sn\":288000,\"mn\":3,\"xn\":1797}" },
+        .{ .got = empty, .want = "\"agg\":{\"c\":0,\"cn\":0,\"sn\":null,\"mn\":null,\"xn\":null}" },
+        .{ .got = past, .want = "\"reason\":\"RowGroupOutOfRange\",\"input\":\"" ++ S3_FIXTURE ++ "\"" },
+        .{ .got = backwards, .want = "\"field\":\"row_groups\"" },
+        .{ .got = short, .want = "\"field\":\"row_groups\"" },
+    };
+    for (checks, 0..) |c, i| if (std.mem.indexOf(u8, c.got, c.want) == null) {
+        std.debug.print("[lambda row_groups] case {d}: {s}\n  want {s}\n", .{ i, c.got, c.want });
+        return error.TestUnexpectedResult;
+    };
+}
+
 const S3_AGG = "\"aggregate\":\"count(*) AS c, sum(x) AS sx, min(s) AS ms, max(n) AS mn, sum(u) AS su\"";
 const S3_FIXTURE = "ci/fixtures/parquet/full_match.parquet";
 
@@ -927,6 +938,65 @@ test "lambda answers back-to-back S3 queries without running out of read workers
             std.debug.print("[s3 back-to-back] invocation {d}: {s}\n  want {s}\n", .{ i, resp, want });
             return error.TestUnexpectedResult;
         }
+    }
+}
+
+test "an S3 query over an object with a corrupt footer fails and frees all it made" {
+    // The error left openInputs after its connection pool was made, and only a successful return freed it.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    const footer_len = std.mem.readInt(u32, object[object.len - 8 ..][0..4], .little);
+    @memset(object[object.len - 8 - footer_len ..][0..16], 0xff);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+    const res = try runCliOnS3(a, &s3, &.{ "query", "s3://bkt/f.parquet", "--aggregate", "count(*) AS c" });
+    defer a.free(res.stdout);
+    defer a.free(res.stderr);
+    if (res.term == .exited and res.term.exited == 0 or std.mem.indexOf(u8, res.stderr, "leaked") != null) {
+        std.debug.print("[s3 corrupt footer] {any}\nstderr: {s}\n", .{ res.term, res.stderr });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Run the CLI with its `s3://` inputs resolved to `s3`.
+fn runCliOnS3(a: std.mem.Allocator, s3: *const FakeS3, args: []const []const u8) !std.process.RunResult {
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
+    var env_map: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", url);
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(a);
+    try argv.append(a, CLI_BIN);
+    try argv.appendSlice(a, args);
+    return std.process.run(a, std.testing.io, .{ .argv = argv.items, .environ_map = &env_map });
+}
+
+test "an S3 query whose every row group prunes frees all it fetched" {
+    // Nothing is left to fetch past the footer, and the fetched tail used to leak on that path. The CLI's Debug
+    // allocator reports leaks on stderr as it exits.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, S3_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    for ([_][]const u8{ "ts < 0", "ts < 0 OR ts > 1000000" }) |filter| {
+        const res = try runCliOnS3(a, &s3, &.{ "query", "s3://bkt/f.parquet", "--filter", filter, "--aggregate", "count(*) AS c" });
+        defer a.free(res.stdout);
+        defer a.free(res.stderr);
+        if (res.term != .exited or res.term.exited != 0 or std.mem.indexOf(u8, res.stderr, "leaked") != null) {
+            std.debug.print("[s3 all pruned] {s}: {any}\nstdout: {s}\nstderr: {s}\n", .{ filter, res.term, res.stdout, res.stderr });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, res.stdout, "0") != null);
     }
 }
 
@@ -977,6 +1047,75 @@ test "lambda reopens S3 connections the server dropped while it sat idle, withou
         }
     }
     try std.testing.expect(s3.idle_closes.load(.monotonic) > 0);
+}
+
+const BLOOM_FIXTURE = "ci/fixtures/parquet/bloom_keys.parquet";
+
+test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" {
+    // The fixture's statistics prune no equality (tools/zpq-gen bloom); its Bloom filters prune all but the
+    // group holding the key. Filters the 1 MiB suffix already holds are copied from it, so that cold probe makes
+    // no HTTP GET. Filters outside the tail are fetched. By a case's third invocation a cached filter is not read
+    // again; dictionaries are.
+    const a = std.testing.allocator;
+    const object = try paddedParquet(a, BLOOM_FIXTURE, 128 * 1024);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambdaForS3(a, endpoint, &s3);
+    defer killChild(&child);
+
+    // `cat` has no Bloom filter but every chunk is dictionary-encoded: the dictionaries prune it, read afresh each
+    // time (only filters are kept warm).
+    const Case = struct { filter: []const u8, kept: i64, by: []const u8 = "bloom_pruned" };
+    for ([_]Case{
+        .{ .filter = "id = 1000", .kept = 1 },
+        .{ .filter = "id = 1001", .kept = 0 },
+        .{ .filter = "s = 'key-001000'", .kept = 1 },
+        .{ .filter = "id IN (1001, 1003, 1000)", .kept = 1 },
+        .{ .filter = "cat = 'm-3'", .kept = 1, .by = "dict_pruned" },
+    }) |c| {
+        const agg = "\"aggregate\":\"count(*) AS n, sum(x) AS sx\"";
+        const local_body = try std.fmt.allocPrint(
+            a,
+            "{{\"inputs\":[\"" ++ BLOOM_FIXTURE ++ "\"],\"filter\":\"{s}\"," ++ agg ++ "}}",
+            .{c.filter},
+        );
+        defer a.free(local_body);
+        const local = try invoke(&server, a, local_body);
+        defer a.free(local);
+        const want = aggMember(local) orelse return error.TestUnexpectedResult;
+        const s3_body = try std.fmt.allocPrint(
+            a,
+            "{{\"inputs\":[\"s3://bkt/bloom.parquet\"],\"filter\":\"{s}\"," ++ agg ++ "}}",
+            .{c.filter},
+        );
+        defer a.free(s3_body);
+        // The very first invocation builds the warm cache and the next fills it; by a case's third no filter is read.
+        for (0..3) |i| {
+            const resp = try invoke(&server, a, s3_body);
+            defer a.free(resp);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+            defer parsed.deinit();
+            const m = parsed.value.object.get("membership") orelse return error.TestUnexpectedResult;
+            const pruned = m.object.get(c.by).?.integer;
+            const requests = m.object.get("requests").?.integer;
+            const warm = std.mem.eql(u8, c.by, "bloom_pruned");
+            // A suffix-served cold probe has requests == 0, which is the right answer. By the third invocation a
+            // cached Bloom filter is not fetched again; a dictionary is.
+            const warm_ok = if (i < 2) true else (requests == 0) == warm;
+            const ok = std.mem.eql(u8, aggMember(resp) orelse "", want) and pruned == 8 - c.kept and warm_ok;
+            if (!ok) {
+                std.debug.print("[s3 bloom] {s} invocation {d}: {s}\n  want {s}\n", .{ c.filter, i, resp, want });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
 
 fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1035,4 +1174,131 @@ fn sysClose(fd: linux.fd_t) void {
 fn errIs(r: usize) bool {
     const signed: isize = @bitCast(r);
     return signed >= -4095 and signed < 0;
+}
+
+test "lambda profiles an S3 query: requests, coalescing and footer fetches land in the summary" {
+    const a = std.testing.allocator;
+    // Past the 1 MiB footer probe, so each file's chunks are outside the suffix and fetched as ranges.
+    const object = try paddedParquet(a, S3_FIXTURE, 1 << 20);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambdaForS3(a, endpoint, &s3);
+    defer killChild(&child);
+
+    const body = "{\"inputs\":[\"s3://bkt/f0.parquet\",\"s3://bkt/f1.parquet\"]," ++ S3_AGG ++ ",\"profile\":true}";
+    // Cold, then warm: the second revalidates its cached footers.
+    for (0..2) |_| {
+        const resp = try invoke(&server, a, body);
+        defer a.free(resp);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+        defer parsed.deinit();
+        const prof = parsed.value.object.get("profile") orelse {
+            std.debug.print("[s3 profile] no profile member: {s}\n", .{resp});
+            return error.TestUnexpectedResult;
+        };
+        const io = prof.object.get("io").?.object;
+        // One suffix per file plus at least one coalesced column range per file.
+        try std.testing.expect(io.get("gets").?.integer >= 4);
+        try std.testing.expect(io.get("bytes").?.integer > 0);
+        try std.testing.expect(io.get("merged").?.integer >= 2);
+        try std.testing.expect(io.get("ranges").?.integer >= io.get("merged").?.integer);
+        try std.testing.expect(prof.object.get("phases").?.object.get("io") != null);
+        try std.testing.expect(resp.len < 64 * 1024);
+    }
+}
+
+test "lambda profile honors the request memory budget without changing the answer" {
+    const a = std.testing.allocator;
+    var server = try FakeServer.start();
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(a, "127.0.0.1:{d}", .{server.port});
+    defer a.free(endpoint);
+    var child = try spawnLambda(a, endpoint);
+    defer killChild(&child);
+    const resp = try invoke(&server, a, "{\"inputs\":[\"ci/fixtures/parquet/json_escape.parquet\"]," ++
+        "\"aggregate\":\"count(*) AS n\",\"profile\":true,\"max_memory\":1048576}");
+    defer a.free(resp);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("agg").?.object.get("n").?.integer);
+    const prof = parsed.value.object.get("profile").?.object;
+    const cap = prof.get("event_cap").?.integer;
+    try std.testing.expect(cap > 0 and cap < 1024);
+    try std.testing.expect(prof.get("events").?.integer <= cap + 4096);
+}
+
+test "many files keep a count under the loose rss bound in a fresh process" {
+    const a = std.testing.allocator;
+    // Same shape as the unit test: 48 copies, a 1 MiB pad so the suffix is real, 16 MiB budget, two workers.
+    // The child's ru_maxrss is that process's own high-water. The unit binary's VmHWM is not, because it is the
+    // lifetime peak of every test that ran before this one.
+    const object = try paddedParquet(a, "ci/fixtures/parquet/group_order.parquet", 1 << 20);
+    defer a.free(object);
+    var s3: FakeS3 = undefined;
+    try s3.start(object, 0);
+    defer s3.deinit();
+
+    const n_files: usize = 48;
+    const budget: u64 = 16 << 20;
+    var url_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{s3.port});
+    var env_map: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", endpoint);
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, CLI_BIN);
+    try argv.append(arena, "query");
+    for (0..n_files) |i| {
+        try argv.append(arena, try std.fmt.allocPrint(arena, "s3://bkt/p{d}.parquet", .{i}));
+    }
+    try argv.appendSlice(arena, &.{ "--aggregate", "count(*) AS n", "--max-memory", "16MB", "-j", "2" });
+
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = argv.items,
+        .environ_map = &env_map,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .request_resource_usage_statistics = true,
+    });
+    defer child.kill(std.testing.io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(a, std.testing.io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+    while (multi_reader.fill(4096, .none)) |_| {
+        // Drain both pipes until the child closes them.
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+    try multi_reader.checkAnyError();
+    const term = try child.wait(std.testing.io);
+    const stdout = try multi_reader.toOwnedSlice(0);
+    defer a.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    defer a.free(stderr);
+    const exited_ok = if (term == .exited) term.exited == 0 else false;
+    if (!exited_ok or std.mem.indexOf(u8, stdout, "\"n\":576000") == null) {
+        std.debug.print("[rss bound] {any}\nstdout: {s}\nstderr: {s}\n", .{ term, stdout, stderr });
+        return error.TestUnexpectedResult;
+    }
+    const rss = child.resource_usage_statistics.getMaxRss() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rss <= budget + (56 << 20));
 }

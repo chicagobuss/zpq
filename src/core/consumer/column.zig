@@ -585,3 +585,25 @@ test "checkRowShape ties flat and repeated columns to the row count" {
     try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(no_start, 1));
 }
 
+
+pub fn valuesCol(comptime T: type, v: anytype, levels: schema.Levels) filter_eval.ColumnT(T) {
+    return .{
+        .values = v.values,
+        .def_levels = v.def_levels,
+        .max_def = @intCast(levels.max_def),
+        .has_nulls = v.has_nulls,
+    };
+}
+
+
+pub fn codedCol(comptime T: type, c: anytype, dict: []const T, levels: schema.Levels) filter_eval.ColumnT(T) {
+    return .{
+        .values = &.{},
+        .codes = c.codes,
+        .dict = dict,
+        .def_levels = c.def_levels,
+        .max_def = @intCast(levels.max_def),
+        .has_nulls = c.has_nulls,
+    };
+}
+

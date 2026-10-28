@@ -6,7 +6,7 @@ Short, durable instructions for AI coding agents working on ZPQ.
 
 Before writing more than ~50 LoC of new code or making a load-bearing design choice, take five minutes for each of:
 
-1. **Zig 0.16.0 stdlib & language features.** The release reorganised large parts of std (`std.posix`, `std.fs`,
+1. **Zig 0.17.0 stdlib & language features.** The release reorganised large parts of std (`std.posix`, `std.fs`,
    `std.Io`, `std.time`). Read the relevant module before re-implementing. Look for new primitives that match what
    you're about to build — `std.MultiArrayList`, `std.bit_set`, `std.Io.Threaded`, `std.Io.Group`, `std.Io.Queue`, etc.
    — and either use them or have a *specific* reason not to. Don't guess at APIs; inspect the pinned Zig stdlib from

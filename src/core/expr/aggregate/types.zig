@@ -232,3 +232,59 @@ pub const Error = error{
     AggIntTooWide,
 } || std.mem.Allocator.Error || expr_eval.Error || filter_eval.Error;
 
+
+/// avg over a non-DECIMAL argument: integer values summed exactly in `isum`, float values in `sum`. An integer avg
+/// therefore never rounds before its one division, whatever order its partials merge in, so it needs no fixed merge
+/// order (`orderSensitive`). Read the sum through `avgSum`.
+pub const AvgState = struct {
+    sum: f64,
+    count: u64,
+    isum: i128 = 0,
+};
+
+pub const ResolveError = error{ BadAggArg, UnsupportedAggType };
+
+/// Determine the result shape of an agg call from its function and
+/// arg type. Called at parse time so the AST carries the result
+/// shape forward to accumulator init + finalization.
+pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShape {
+    return switch (func) {
+        .count => .i64,
+        .count_distinct => blk: {
+            _ = arg orelse return error.BadAggArg;
+            break :blk .i64;
+        },
+        .avg => if (arg != null and arg.?.typeOf() == .dec) .avg_dec else .avg_f64,
+        .sum => blk: {
+            const e = arg orelse return error.BadAggArg;
+            break :blk switch (e.typeOf()) {
+                .i64 => .i64,
+                .f64 => .f64,
+                .dec => .dec,
+                .str => error.UnsupportedAggType, // sum of strings is meaningless
+            };
+        },
+        .min, .max => blk: {
+            const e = arg orelse return error.BadAggArg;
+            break :blk switch (e.typeOf()) {
+                .i64 => .i64,
+                .f64 => .f64,
+                .dec => .dec,
+                .str => .bytes, // bytewise/unsigned min/max over BYTE_ARRAY
+            };
+        },
+    };
+}
+
+/// avg's answer over a non-DECIMAL argument: the avg_state sum over its count, so a reader dividing the pair gets
+/// every bit of it; NULL over no values.
+pub fn avgMean(st: AvgState) ?f64 {
+    const sum = avgSum(st) orelse return null;
+    return sum / @as(f64, @floatFromInt(st.count));
+}
+
+/// The avg_state pair's sum, NULL when no value was averaged.
+pub fn avgSum(st: AvgState) ?f64 {
+    return if (st.count == 0) null else st.sum + @as(f64, @floatFromInt(st.isum));
+}
+

@@ -210,6 +210,8 @@ const outputNamesBytes = owner_support.outputNamesBytes;
 const ownerIdentity = owner_support.ownerIdentity;
 const passThroughSource = owner_support.passThroughSource;
 const boolean_answer = owner_support.boolean_answer;
+pub const input_rewind = @import("scan/input_rewind.zig");
+const rewindInputs = input_rewind.rewindInputs;
 pub const scan_types = @import("scan/types.zig");
 const BoundAggregate = scan_types.BoundAggregate;
 pub const MultiAggArgs = scan_types.MultiAggArgs;
@@ -576,22 +578,6 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
             attempt = next;
         }
     }
-}
-
-/// A joined attempt may have returned every gated row group's pages. Replays read the stable mappings,
-/// never the reader's ready-but-released window. Allocate the view before abandoning any reader state.
-fn rewindInputs(arena: std.mem.Allocator, args: *MultiAggArgs) !void {
-    if (!allRescannable(args.inputs)) return error.ExceededMemoryBudget;
-    const inputs = try arena.dupe(Input, args.inputs);
-    for (inputs) |*input| if (input.plan_bytes) |b| {
-        input.bytes = b;
-        input.gate = null;
-        input.dict_wait = null;
-    };
-    if (args.start_reads) |s| if (s.abandon) |abandon| abandon(s.ctx);
-    args.inputs = inputs;
-    args.start_reads = null;
-    args.dict_probe = null;
 }
 
 /// Whether several tables hold copies of the same keys: of up to 256 keys spread over each, an eighth or more are in

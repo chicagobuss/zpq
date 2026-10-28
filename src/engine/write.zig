@@ -1,3 +1,5 @@
+const scan = @import("../core/scan.zig");
+const expr_agg = @import("../core/expr/agg.zig");
 const thrift = @import("../core/thrift.zig");
 const huge_pages = @import("../core/huge_pages.zig");
 const decimal_mod = @import("../core/parquet/decimal.zig");
@@ -26,13 +28,13 @@ const s3 = @import("../io/s3.zig");
 const tls = @import("../io/tls.zig");
 const multipart_sink = @import("../io/multipart_sink.zig");
 const Diag = @import("../core/diag.zig").Diag;
-const types = @import("types.zig");
-const Context = types.Context;
-const QueryArgs = types.QueryArgs;
-const WriteResult = types.WriteResult;
-const Timings = types.Timings;
-const POOL_SIZE = types.POOL_SIZE;
-const OutputLane = types.OutputLane;
+const engine_types = @import("types.zig");
+const Context = engine_types.Context;
+const QueryArgs = engine_types.QueryArgs;
+const WriteResult = engine_types.WriteResult;
+const Timings = engine_types.Timings;
+const POOL_SIZE = engine_types.POOL_SIZE;
+const OutputLane = engine_types.OutputLane;
 const projection = @import("projection.zig");
 const ProjectionPlan = projection.ProjectionPlan;
 const planProjection = projection.planProjection;
@@ -913,5 +915,477 @@ test "FdSink segments keep one contiguous writeback range across page and vector
     try FdSink.writeFn(&sink, "footer");
     try std.testing.expectEqual(@as(u64, (128 << 20) + 12), sink.written);
     try std.testing.expectEqual(@as(u64, 128 << 20), sink.writeback_to);
+}
+
+
+// ============================================================
+// 1-row aggregate output (local files)
+// ============================================================
+
+/// Write a 1-row aggregate parquet to a local path. Kept in the engine so
+/// both binaries can call it.
+
+pub fn writeOneRowParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    agg_calls: []const expr_agg.AggCall,
+    accumulators: []const expr_agg.Accumulator,
+    sources: []const ?schema.SchemaElement,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    output_fd: ?local_fs.fd_t,
+    empty: bool,
+) !u64 {
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    errdefer if (output_fd == null) local_fs.removeFile(out_path);
+    var fd_sink: FdSink = .{ .fd = fd };
+    const sink: streaming.Sink = fd_sink.sink();
+
+    var all_outs: std.ArrayList(expr_agg.OutputCol) = .empty;
+    for (agg_calls, 0..) |call, i| {
+        const cols = try expr_agg.finalize(arena, call, accumulators[i]);
+        for (cols) |c| try all_outs.append(arena, if (sources[i]) |src| try retypeOutputCol(arena, c, src) else c);
+    }
+    if (empty) for (all_outs.items) |*out| switch (out.col) {
+        inline else => |*col| {
+            col.values = col.values[0..0];
+            if (col.def_levels) |levels| col.def_levels = levels[0..0];
+        },
+    };
+    const written = try consumer.writeAggregateRows(arena, sink, all_outs.items, if (empty) 0 else 1, codec, zstd, .{});
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
+    return written;
+}
+
+/// Write GROUP BY results as parquet: one row per group, columns in `cols` order, values exactly as the JSON output
+/// reports them. avg_state splits into `<name>__sum` / `<name>__count` as in the 1-row output.
+pub fn groupedColumns(arena: std.mem.Allocator, cols: []const []const u8, types: []const scan.GroupColType, rows: []const []const scan.AggValue) !std.ArrayList(expr_agg.OutputCol) {
+    var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
+    for (cols, types, 0..) |name, ty, ci| switch (ty.lane) {
+        inline .i64, .f64, .string => |lane| {
+            const T, const phys: schema.Type = switch (lane) {
+                .i64 => .{ i64, .INT64 },
+                .f64 => .{ f64, .DOUBLE },
+                .string => .{ []const u8, .BYTE_ARRAY },
+                else => unreachable,
+            };
+            const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
+            const col = try groupedColumn(T, arena, name, ty.nullable, rows, ci, phys, raw_u64);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, col, src) else col);
+        },
+        .avg => {
+            const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
+            const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
+            try outs.append(arena, try groupedColumn(f64, arena, sum_name, true, rows, ci, .DOUBLE, false));
+            try outs.append(arena, try groupedColumn(i64, arena, count_name, false, rows, ci, .INT64, false));
+        },
+        .dec => {
+            // An INT96 source reads as exact nanoseconds on this lane and is written back as a timestamp.
+            const col = try groupedDecColumn(arena, name, rows, ci, ty.dec.?);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, col, src) else col);
+        },
+        .avg_dec => {
+            const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
+            const count_name = try std.fmt.allocPrint(arena, "{s}__count", .{name});
+            try outs.append(arena, try groupedDecColumn(arena, sum_name, rows, ci, ty.dec.?.sum()));
+            try outs.append(arena, try groupedColumn(i64, arena, count_name, false, rows, ci, .INT64, false));
+        },
+    };
+
+    return outs;
+}
+
+pub fn writeGroupedParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    cols: []const []const u8,
+    types: []const scan.GroupColType,
+    rows: []const []const scan.AggValue,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+) !u64 {
+    const outs = try groupedColumns(arena, cols, types, rows);
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    const sink: streaming.Sink = fd_sink.sink();
+    const written = try consumer.writeAggregateRows(arena, sink, outs.items, @intCast(rows.len), codec, zstd, encode);
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
+    return written;
+}
+
+/// `writeGroupedParquet` for an answer built as typed columns (`scan.TypedAnswer`): the same columns, names, types and
+/// file, with no row of values in between.
+pub fn typedColumns(arena: std.mem.Allocator, cols: []const []const u8, types: []const scan.GroupColType, answer: scan.TypedAnswer) !std.ArrayList(expr_agg.OutputCol) {
+    var outs: std.ArrayList(expr_agg.OutputCol) = .empty;
+    for (cols, types, answer.columns) |name, ty, col| switch (col) {
+        inline .i64, .f64, .string => |l, tag| {
+            const phys: schema.Type = switch (tag) {
+                .i64 => .INT64,
+                .f64 => .DOUBLE,
+                .string => .BYTE_ARRAY,
+                else => unreachable,
+            };
+            const out = typedColumn(@FieldType(@TypeOf(l), "values"), name, ty.nullable, l, phys);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, out, src) else out);
+        },
+        .avg => |a| {
+            try outs.append(arena, typedColumn([]f64, try std.fmt.allocPrint(arena, "{s}__sum", .{name}), true, a.sum, .DOUBLE));
+            try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
+        },
+        .dec => |l| {
+            const out = decColumn(name, l, ty.dec.?);
+            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, out, src) else out);
+        },
+        .avg_dec => |a| {
+            try outs.append(arena, decColumn(try std.fmt.allocPrint(arena, "{s}__sum", .{name}), a.sum, ty.dec.?.sum()));
+            try outs.append(arena, countColumn(try std.fmt.allocPrint(arena, "{s}__count", .{name}), a.count));
+        },
+    };
+    return outs;
+}
+
+pub fn writeTypedParquet(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    cols: []const []const u8,
+    types: []const scan.GroupColType,
+    answer: scan.TypedAnswer,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+) !u64 {
+    const outs = try typedColumns(arena, cols, types, answer);
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    const sink: streaming.Sink = fd_sink.sink();
+    const rows: i64 = @intCast(answer.rows);
+    const written = try consumer.writeAggregateRows(arena, sink, outs.items, rows, codec, zstd, encode);
+    if (fd_open) {
+        fd_open = false;
+        try local_fs.closeChecked(fd);
+    }
+    return written;
+}
+
+pub fn writeIntegerStream(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    names: []const []const u8,
+    types: []const scan.GroupColType,
+    stream: scan.IntegerStream,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+    profiler: ?*profile.Profiler,
+) !u64 {
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    var file = try consumer.AggregateFile.init(arena, fd_sink.sink());
+    defer file.deinit();
+    try file.reserveIntegerWorkspace(encode);
+    var window = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer window.deinit();
+    const cols = try arena.alloc(expr_agg.OutputCol, names.len);
+    const total = stream.state.group_count;
+    var lo: usize = 0;
+    while (lo < total or (lo == 0 and total == 0)) {
+        const hi = @min(total, lo + 4 * consumer.answer_rg_rows);
+        const a = window.allocator();
+        const columns_span = profile.Span.begin(profile.threadOf(profiler, .main));
+        const answer = try stream.window(a, types, lo, hi, encode.workers);
+        columns_span.end(.integer_columns, profile.args(.{}));
+        for (names, types, answer.columns, cols) |name, ty, col, *out| {
+            const plain = typedColumn([]i64, name, ty.nullable, col.i64, .INT64);
+            out.* = if (ty.source) |src| try retypeOutputCol(arena, plain, src) else plain;
+            out.distinct = ty.source != null;
+        }
+        try file.append(cols, hi - lo, codec, zstd, encode);
+        lo = hi;
+        if (lo == total) {
+            const written = try file.finish(cols);
+            if (fd_open) {
+                fd_open = false;
+                try local_fs.closeChecked(fd);
+            }
+            return written;
+        }
+        _ = window.reset(.retain_capacity);
+    }
+    unreachable;
+}
+
+pub fn writeByteStream(
+    arena: std.mem.Allocator,
+    out_path: []const u8,
+    types: []const scan.GroupColType,
+    stream: scan.ByteStream,
+    codec: schema.CompressionCodec,
+    zstd: compression.ZstdPlan,
+    encode: consumer.AggEncode,
+    output_fd: ?local_fs.fd_t,
+    profiler: ?*profile.Profiler,
+) !u64 {
+    const fd = output_fd orelse try createFile(out_path);
+    var fd_open = output_fd == null;
+    defer if (fd_open) local_fs.close(fd);
+    var fd_sink: FdSink = .{ .fd = fd };
+    var file = try consumer.AggregateFile.init(arena, fd_sink.sink());
+    defer file.deinit();
+    try file.reserveByteWorkspace(encode);
+    var window = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer window.deinit();
+    const total = stream.state.group_count;
+    var lo: usize = 0;
+    while (lo < total or (lo == 0 and total == 0)) {
+        const hi = @min(total, lo + 4 * consumer.answer_rg_rows);
+        const columns_span = profile.Span.begin(profile.threadOf(profiler, .main));
+        const answer = try stream.window(window.allocator(), lo, hi, encode.workers);
+        columns_span.end(.byte_columns, profile.args(.{}));
+        for (types, answer.columns) |ty, *col| {
+            if (ty.source) |src| col.* = try retypeOutputCol(arena, col.*, src);
+        }
+        try file.append(answer.columns, hi - lo, codec, zstd, encode);
+        lo = hi;
+        if (lo == total) {
+            const written = try file.finish(answer.columns);
+            if (fd_open) {
+                fd_open = false;
+                try local_fs.closeChecked(fd);
+            }
+            return written;
+        }
+        _ = window.reset(.retain_capacity);
+    }
+    unreachable;
+}
+
+fn typedColumn(comptime S: type, name: []const u8, nullable: bool, l: anytype, parquet_type: schema.Type) expr_agg.OutputCol {
+    const T = @typeInfo(S).pointer.child;
+    const col: filter_eval.ColumnT(T) = .{
+        .values = l.values,
+        .def_levels = if (l.nulls) l.defs else null,
+        .max_def = @intFromBool(nullable),
+        .has_nulls = l.nulls,
+    };
+    return .{
+        .name = name,
+        .col = switch (T) {
+            i64 => .{ .i64 = col },
+            f64 => .{ .f64 = col },
+            []const u8 => .{ .string = col },
+            else => unreachable,
+        },
+        .parquet_type = parquet_type,
+        .nullable = nullable,
+    };
+}
+
+fn countColumn(name: []const u8, counts: []const i64) expr_agg.OutputCol {
+    return .{ .name = name, .col = .{ .i64 = .{ .values = counts, .max_def = 0 } }, .parquet_type = .INT64, .nullable = false };
+}
+
+fn decColumn(name: []const u8, l: scan.TypedAnswer.Lane(i128), spec: expr_ast.Dec) expr_agg.OutputCol {
+    return .{
+        .name = name,
+        .col = .{ .i128 = .{
+            .values = l.values,
+            .def_levels = if (l.nulls) l.defs else null,
+            .max_def = 1,
+            .has_nulls = l.nulls,
+        } },
+        .parquet_type = spec.physical(),
+        .nullable = true,
+        .dec = spec,
+    };
+}
+
+/// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a
+/// bare GROUP BY key, min/max of a column), rather than its evaluation lane's plain INT64 / DOUBLE / BYTE_ARRAY: a
+/// DATE comes back a DATE, a string a STRING, an INT8 an INT8. DECIMAL and FLOAT16 stay DOUBLE, the f64 values the
+/// lane holds; INT96 becomes INT64 TIMESTAMP(NANOS), the value zpq decodes it to; fixed-length bytes retain their
+/// width and logical annotation.
+pub fn retypeOutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol, src: schema.SchemaElement) !expr_agg.OutputCol {
+    if (src.type == .INT96) if (out.col == .i128) return int96OutputCol(arena, out);
+    if (decimal_mod.kindFromSchema(&src) != null or schema.isFloat16(src)) return out;
+    var res = out;
+    res.logical_type = src.logical_type;
+    res.logical_type_raw = src.logical_type_raw;
+    res.converted_type = src.converted_type;
+    switch (src.type orelse return out) {
+        .INT64, .DOUBLE, .BYTE_ARRAY => {},
+        .INT96 => {
+            res.logical_type_raw = &.{};
+            res.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .NANOS = .{} } } };
+            res.converted_type = null;
+        },
+        .FIXED_LEN_BYTE_ARRAY => {
+            res.parquet_type = .FIXED_LEN_BYTE_ARRAY;
+            res.type_length = src.type_length;
+        },
+        .INT32 => {
+            const c = out.col.i64;
+            const vals = try arena.alloc(i32, c.values.len);
+            // Low 32 bits: exact for signed values, and the stored form of UINT_32 values above 2^31.
+            for (c.values, vals) |v, *o| o.* = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(v)))));
+            res.col = .{ .i32 = sameNulls(i32, c, vals) };
+            res.parquet_type = .INT32;
+        },
+        .FLOAT => {
+            const c = out.col.f64;
+            const vals = try arena.alloc(f32, c.values.len);
+            for (c.values, vals) |v, *o| o.* = @floatCast(v);
+            res.col = .{ .f32 = sameNulls(f32, c, vals) };
+            res.parquet_type = .FLOAT;
+        },
+        .BOOLEAN => {
+            const c = out.col.i64;
+            const vals = try arena.alloc(bool, c.values.len);
+            for (c.values, vals) |v, *o| o.* = v != 0;
+            res.col = .{ .boolean = sameNulls(bool, c, vals) };
+            res.parquet_type = .BOOLEAN;
+        },
+    }
+    return res;
+}
+
+/// `values` under `src`'s null layout.
+/// An INT96 key or min/max, read as exact nanoseconds, written as INT64 TIMESTAMP(NANOS) as before; one past what
+/// 64 bits of nanoseconds hold has no such column, and is refused rather than wrapped.
+fn int96OutputCol(arena: std.mem.Allocator, out: expr_agg.OutputCol) !expr_agg.OutputCol {
+    const c = out.col.i128;
+    const vals = try arena.alloc(i64, c.values.len);
+    for (c.values, vals, 0..) |v, *o, i| {
+        const present = if (c.def_levels) |dl| dl[i] >= c.max_def else true;
+        o.* = if (present) std.math.cast(i64, v) orelse return error.Int96OutOfRange else 0;
+    }
+    var res = out;
+    res.col = .{ .i64 = sameNulls(i64, c, vals) };
+    res.parquet_type = .INT64;
+    res.dec = null;
+    res.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .NANOS = .{} } } };
+    res.converted_type = null;
+    return res;
+}
+
+fn sameNulls(comptime T: type, src: anytype, values: []const T) filter_eval.ColumnT(T) {
+    return .{ .values = values, .def_levels = src.def_levels, .max_def = src.max_def, .has_nulls = src.has_nulls };
+}
+
+/// Column `ci` of every grouped row as a `T` lane. For an avg_state column, `T == f64` takes the pair's sum and
+/// `T == i64` its count.
+fn groupedColumn(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    name: []const u8,
+    nullable: bool,
+    rows: []const []const scan.AggValue,
+    ci: usize,
+    parquet_type: schema.Type,
+    /// Values are unsigned 64-bit: store values of 2^63 and up as their raw bits (the column is annotated unsigned).
+    raw_u64: bool,
+) !expr_agg.OutputCol {
+    const values = try arena.alloc(T, rows.len);
+    const defs = try arena.alloc(u32, rows.len);
+    var has_nulls = false;
+    for (rows, values, defs) |row, *v, *d| {
+        const cell: ?T = switch (row[ci]) {
+            .null_val => null,
+            .i => |x| if (T != i64)
+                return error.TypeMismatch
+            else if (raw_u64 and x >= 0 and x <= std.math.maxInt(u64))
+                expr_agg.u64Lane(x)
+            else
+                std.math.cast(i64, x) orelse return error.AggIntTooWide,
+            .f => |x| if (T == f64) x else return error.TypeMismatch,
+            .s => |x| if (T == []const u8) x else return error.TypeMismatch,
+            .avg => |p| switch (T) {
+                f64 => p.sum,
+                i64 => p.count,
+                else => return error.TypeMismatch,
+            },
+            .avg_dec => |p| if (T == i64) p.count else return error.TypeMismatch,
+            .dec => return error.TypeMismatch,
+        };
+        v.* = cell orelse std.mem.zeroes(T);
+        d.* = @intFromBool(cell != null);
+        if (cell == null) has_nulls = true;
+    }
+    if (has_nulls and !nullable) return error.UnexpectedNull;
+    const col: filter_eval.ColumnT(T) = .{
+        .values = values,
+        .def_levels = if (has_nulls) defs else null,
+        .max_def = @intFromBool(nullable),
+        .has_nulls = has_nulls,
+    };
+    return .{
+        .name = name,
+        .col = switch (T) {
+            i64 => .{ .i64 = col },
+            f64 => .{ .f64 = col },
+            []const u8 => .{ .string = col },
+            else => unreachable,
+        },
+        .parquet_type = parquet_type,
+        .nullable = nullable,
+    };
+}
+
+/// Column `ci` of every grouped row as an exact DECIMAL(`spec`) column: a `dec` value, or an avg_state's exact sum.
+fn groupedDecColumn(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    rows: []const []const scan.AggValue,
+    ci: usize,
+    spec: expr_ast.Dec,
+) !expr_agg.OutputCol {
+    const values = try arena.alloc(i128, rows.len);
+    const defs = try arena.alloc(u32, rows.len);
+    var has_nulls = false;
+    for (rows, values, defs) |row, *v, *d| {
+        const cell: ?i128 = switch (row[ci]) {
+            .null_val => null,
+            .dec => |x| x.v,
+            // The `__sum` column is DECIMAL(38, s): a wider exact sum cannot be stored, and is not rounded to fit.
+            .avg_dec => |p| blk: {
+                const x = p.sum orelse break :blk null;
+                if (@abs(x) >= @as(u192, @intCast(spec.bound()))) return error.DecimalOverflow;
+                break :blk @as(i128, @intCast(x));
+            },
+            else => return error.TypeMismatch,
+        };
+        v.* = cell orelse 0;
+        d.* = @intFromBool(cell != null);
+        if (cell == null) has_nulls = true;
+    }
+    return .{
+        .name = name,
+        .col = .{ .i128 = .{
+            .values = values,
+            .def_levels = if (has_nulls) defs else null,
+            .max_def = 1,
+            .has_nulls = has_nulls,
+        } },
+        .parquet_type = spec.physical(),
+        .nullable = true,
+        .dec = spec,
+    };
 }
 

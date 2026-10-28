@@ -37,8 +37,9 @@ class Zpq < Formula
 
   on_macos do
     depends_on arch: :arm64
+    on_arm do
 '''
-    text += fields("aarch64-macos", "    ") + "  end\n\n  on_linux do\n    on_arm do\n"
+    text += fields("aarch64-macos", "      ") + "    end\n  end\n\n  on_linux do\n    on_arm do\n"
     text += fields("aarch64-linux-musl", "      ") + "    end\n    on_intel do\n"
     # Linux x86_64 takes the default x86-64-v3 archive; the -compat archive is for CPUs without AVX2.
     text += fields("x86_64-linux-musl", "      ") + '''    end
@@ -58,13 +59,14 @@ class Zpq < Formula
   test do
     file = pkgshare/"tiny.parquet"
     filtered = JSON.parse(shell_output("#{bin}/zpq query #{file} --filter 'id = 2' --columns id,value"))
-    assert_equal({"id" => 2, "value" => 20}, filtered)
+    assert_equal({ "id" => 2, "value" => 20 }, filtered)
     groups = shell_output("#{bin}/zpq query #{file} --group-by group --aggregate 'sum(value) AS total'")
-    assert_equal [{"group" => "a", "total" => 30}, {"group" => "b", "total" => 30}],
+    assert_equal [{ "group" => "a", "total" => 30 }, { "group" => "b", "total" => 30 }],
                  groups.lines.map { |line| JSON.parse(line) }
   end
 end
 '''
+    # Target-only asset names have no release version for Homebrew to infer.
     text = text.replace('version "0.5.0"', f'version "{m["version"]}"')
     path = Path(a.out)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 const std = @import("std");
 const zon = @import("build.zig.zon");
 
-/// ZPQ build system.
+/// zpq build system.
 ///
 /// Produces two binaries from one source tree:
 ///   - `zpq`        : CLI binary. Includes the SQL frontend unless
@@ -16,7 +16,7 @@ const zon = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const builtin = @import("builtin");
     if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17 or builtin.zig_version.patch != 0 or builtin.zig_version.pre != null) {
-        @compileError(std.fmt.comptimePrint("Unsupported Zig version: {}. ZPQ requires exactly the 0.17.0 release version to prevent standard library drift.", .{builtin.zig_version}));
+        @compileError(std.fmt.comptimePrint("Unsupported Zig version: {}. zpq requires exactly the 0.17.0 release version to prevent standard library drift.", .{builtin.zig_version}));
     }
 
     const target = b.standardTargetOptions(.{});

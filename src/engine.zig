@@ -1,4 +1,4 @@
-//! ZPQ's one query entry point.
+//! zpq's one query entry point.
 //!
 //! Both binaries (the CLI and the Lambda) are thin shells over
 //! `runQuery(ctx, args) -> QueryResult`. Their job is purely:

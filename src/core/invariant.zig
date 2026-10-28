@@ -4,7 +4,7 @@
 //! ReleaseFast everywhere (so `std.debug.assert` is stripped from the
 //! binary strangers actually run):
 //!
-//!   * `assert(cond)` — a *programmer* invariant: false only when ZPQ
+//!   * `assert(cond)` — a *programmer* invariant: false only when zpq
 //!     violated its own internal contract. Wraps `std.debug.assert`,
 //!     so it fires under Debug / ReleaseSafe (unit tests, the decode
 //!     fuzzer, CI) and is **stripped under ReleaseFast**. Use freely on

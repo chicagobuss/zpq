@@ -324,7 +324,7 @@ pub const HybridRleDecoder = struct {
         // batch is `inline for`-unrolled so LLVM can vectorize.
         //
         // Code-size cost: 32 specializations × ~40 ops body ≈ ~40 KB
-        // total bloat. Acceptable for ZPQ's hot path; trade-off matches
+        // total bloat. Acceptable for zpq's hot path; trade-off matches
         // arrow-rs's `unpack32` and DuckDB FastPFor's bitpacking — the
         // industry-standard fast-bit-unpacking shape.
         return switch (self.bit_width) {

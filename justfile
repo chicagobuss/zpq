@@ -1,4 +1,4 @@
-# ZPQ task runner. Stay slim: only recipes that work against the current
+# zpq task runner. Stay slim: only recipes that work against the current
 # source tree. Don't ship recipes that fail when invoked; they're noise in
 # `just --list`.
 

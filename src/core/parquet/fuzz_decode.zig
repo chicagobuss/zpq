@@ -3,7 +3,7 @@
 //!
 //! Contract under test: parsing *arbitrary* bytes must never crash, read
 //! out of bounds, or overflow — it must either return a fully-formed
-//! structure or a clean error. ZPQ ships ReleaseFast (Zig's runtime safety
+//! structure or a clean error. zpq ships ReleaseFast (Zig's runtime safety
 //! checks OFF), so these targets earn their keep by running under the
 //! safety-checked test build: any OOB / overflow / UB reached on hostile
 //! input surfaces here as a clean trap instead of silent corruption in

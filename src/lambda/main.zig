@@ -1,4 +1,4 @@
-//! ZPQ Lambda binary entry point.
+//! zpq Lambda binary entry point.
 //!
 //! Constraints established by docs/lambda_capabilities.md:
 //!   - io_uring is unavailable (AWS seccomp returns ENOSYS).

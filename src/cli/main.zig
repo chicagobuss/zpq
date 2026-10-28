@@ -1,4 +1,4 @@
-//! ZPQ CLI binary entry point.
+//! zpq CLI binary entry point.
 //!
 //! Subcommands:
 //!   zpq query <input.parquet> [--output <out.parquet>]
@@ -13,7 +13,7 @@
 //!       --aggregate is mutually exclusive with --select / --columns.
 //!       --summary=json opts into typed diagnostics on stderr.
 //!
-//!   zpq conform <file.parquet>   — emit a JSON report of what ZPQ
+//!   zpq conform <file.parquet>   — emit a JSON report of what zpq
 //!                                  sees in this file. Used by the
 //!                                  conformance runner against the
 //!                                  apache/parquet-testing corpus.
@@ -867,7 +867,7 @@ fn splitCsv(arena: std.mem.Allocator, csv: []const u8) ![]const []const u8 {
 /// `data/*.parquet` → all matching files in `data/`, sorted.
 const expandGlob = zpq.frontend.expandGlob;
 
-/// Open a parquet file via ZPQ and emit a JSON report describing what
+/// Open a parquet file via zpq and emit a JSON report describing what
 /// we saw — schema leaves, row count, and a per-column-chunk decode
 /// status (ok/error). Output goes to stdout. Caller (Python harness)
 /// compares against pyarrow.

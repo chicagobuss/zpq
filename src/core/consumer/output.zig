@@ -1,4 +1,5 @@
 const std = @import("std");
+const filter_eval = @import("../filter/eval.zig");
 const schema = @import("../schema.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const types = @import("types.zig");
@@ -422,5 +423,99 @@ test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
     const agg = try initOutputAggregator(arena, &file_meta, &specs);
     try testing.expect(agg.cols[0] == .f64);
     try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
+}
+
+
+/// Rows `lo..hi` of an output buffer as the column the encoder takes: its values, or its codes into the dictionary
+/// they index, and its levels; an exact DECIMAL as its unscaled integers (the encoder narrows them to the schema's
+/// width).
+pub fn bufRows(buf: OutputAggregator.ColumnBuf, lo: usize, hi: usize) filter_eval.Batch.Column {
+    return switch (buf) {
+        inline else => |b, tag| @unionInit(filter_eval.Batch.Column, @tagName(tag), .{
+            .values = if (b.coded) &.{} else b.values.items[lo..hi],
+            .def_levels = if (b.max_def > 0) b.def_levels.items[lo..hi] else null,
+            .max_def = b.max_def,
+            .has_nulls = b.max_def > 0,
+            .codes = if (b.coded) b.codes.items[lo..hi] else null,
+            .dict = b.dict,
+        }),
+    };
+}
+
+/// Rows `lo..hi` of one output buffer.
+pub const BufRange = struct {
+    buf: *const OutputAggregator.ColumnBuf,
+    lo: usize,
+    hi: usize,
+};
+
+/// The rows of `ranges`, in order, as one column (`bufRows` of each, joined on `arena`). Ranges of buffers coded by
+/// one dictionary stay codes; otherwise values, a coded range's taken from its dictionary. Levels run at the deepest
+/// range's `max_def`, a range without levels present throughout. Which of these a column comes out as never changes
+/// its encoding: coded and plain columns, with or without all-present levels, encode to the same bytes.
+pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval.Batch.Column {
+    std.debug.assert(ranges.len > 0);
+    if (ranges.len == 1) return bufRows(ranges[0].buf.*, ranges[0].lo, ranges[0].hi);
+    switch (ranges[0].buf.*) {
+        inline else => |first, tag| {
+            const TB = @TypeOf(first);
+            const T = @typeInfo(@TypeOf(first.dict)).pointer.child;
+            var total: usize = 0;
+            var max_def: u32 = 0;
+            var one_dict = first.coded;
+            for (ranges) |r| {
+                const b = @field(r.buf.*, @tagName(tag));
+                total += r.hi - r.lo;
+                max_def = @max(max_def, b.max_def);
+                one_dict = one_dict and b.coded and b.dict.ptr == first.dict.ptr and b.dict.len == first.dict.len;
+            }
+            var out: filter_eval.ColumnT(T) = .{ .values = &.{}, .max_def = max_def, .has_nulls = max_def > 0 };
+            if (one_dict) {
+                const codes = try arena.alloc(u32, total);
+                var pos: usize = 0;
+                for (ranges) |r| {
+                    const b: *const TB = &@field(r.buf.*, @tagName(tag));
+                    @memcpy(codes[pos..][0 .. r.hi - r.lo], b.codes.items[r.lo..r.hi]);
+                    pos += r.hi - r.lo;
+                }
+                out.codes = codes;
+                out.dict = first.dict;
+            } else {
+                const values = try arena.alloc(T, total);
+                var pos: usize = 0;
+                for (ranges) |r| {
+                    const b: *const TB = &@field(r.buf.*, @tagName(tag));
+                    const dst = values[pos..][0 .. r.hi - r.lo];
+                    if (b.coded) {
+                        for (dst, b.codes.items[r.lo..r.hi], r.lo..) |*v, k, row| {
+                            const present = b.max_def == 0 or b.def_levels.items[row] == b.max_def;
+                            v.* = if (present) b.dict[k] else std.mem.zeroes(T);
+                        }
+                    } else @memcpy(dst, b.values.items[r.lo..r.hi]);
+                    pos += r.hi - r.lo;
+                }
+                out.values = values;
+            }
+            if (max_def > 0) {
+                const levels = try arena.alloc(u32, total);
+                var pos: usize = 0;
+                for (ranges) |r| {
+                    const b: *const TB = &@field(r.buf.*, @tagName(tag));
+                    const dst = levels[pos..][0 .. r.hi - r.lo];
+                    if (b.max_def == 0) {
+                        @memset(dst, max_def);
+                    } else {
+                        @memcpy(dst, b.def_levels.items[r.lo..r.hi]);
+                        if (b.max_def != max_def) for (dst) |*d| {
+                            if (d.* == b.max_def) d.* = max_def;
+                        };
+                    }
+                    pos += r.hi - r.lo;
+                }
+                out.def_levels = levels;
+            }
+            return @unionInit(filter_eval.Batch.Column, @tagName(tag), out);
+        },
+    }
 }
 

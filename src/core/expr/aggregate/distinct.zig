@@ -1263,3 +1263,56 @@ test "inline distinct canonicalizes float nan and zero like DistinctSet" {
 }
 
 
+test "distinct bitmaps preserve complete identities across ranges, partitions and late wide values with failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctBitmapTrial, .{});
+}
+
+fn distinctBitmapTrial(a: std.mem.Allocator) !void {
+    const hw = @import("../../hw.zig");
+    hw.test_cpu = .{ .l2 = .{ .bytes = 64 << 10, .max_sharing = 1 } };
+    defer hw.test_cpu = null;
+    for ([_]bool{ false, true }) |partitioned| {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        {
+            var left: DistinctSet = .{ .shared = &budget };
+            defer left.deinit(a);
+            var right: DistinctSet = .{ .shared = &budget };
+            defer right.deinit(a);
+            if (partitioned) {
+                try left.initPartitions(a, &budget);
+                try right.initPartitions(a, &budget);
+            }
+            // Different aligned bases and overlap. OR must preserve identity, never add cardinalities.
+            for (128..384) |v| try left.insertU64(a, v);
+            for (0..256) |v| try right.insertU64(a, v);
+            if (!partitioned) {
+                try testing.expect(left.val_set == .bitmap);
+                try testing.expect(right.val_set == .bitmap);
+            }
+            try left.merge(&right, a);
+            try testing.expectEqual(@as(usize, 384), left.count());
+            try left.merge(&right, a);
+            try testing.expectEqual(@as(usize, 384), left.count());
+            // A late sparse value migrates the whole set without another input pass.
+            try left.insertU64(a, @as(u64, 1) << 48);
+            try testing.expectEqual(@as(usize, 385), left.count());
+            if (!partitioned) try testing.expect(left.val_set == .u64);
+            for (0..384) |v| try left.insertU64(a, v);
+            try testing.expectEqual(@as(usize, 385), left.count());
+            var empty: DistinctSet = .{ .shared = &budget };
+            defer empty.deinit(a);
+            try empty.merge(&right, a);
+            try empty.merge(&left, a);
+            try testing.expectEqual(@as(usize, 385), empty.count());
+            var negative: DistinctSet = .{ .shared = &budget };
+            defer negative.deinit(a);
+            for (0..128) |i| try negative.insertU64(a, std.math.maxInt(u64) - i);
+            try testing.expect(negative.val_set == .bitmap);
+            try testing.expectEqual(std.math.maxInt(u64), negative.val_set.bitmap.last());
+            try negative.merge(&right, a);
+            try testing.expectEqual(@as(usize, 384), negative.count());
+            try testing.expect(negative.val_set == .u64);
+        }
+        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+}

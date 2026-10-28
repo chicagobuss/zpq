@@ -4557,66 +4557,6 @@ test "compact states refuse float tuples and only share identical integer inputs
     try std.testing.expectEqual(@as(usize, 0), state.stride);
 }
 
-test "compact fixed slots compare complete keys under projected-hash collisions and growth" {
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(GroupTable.FixedSlot));
-    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
-    var table = GroupTable.init(std.testing.allocator, 1 << 20);
-    table.fixed_stride = 9;
-    defer table.deinit();
-    for (0..256) |g| {
-        var key: [9]u8 = @splat(0);
-        key[0] = 1;
-        std.mem.writeInt(u64, key[1..9], g, .little);
-        const id = try table.getOrInsertFixedHashed(&key, &calls, 1000 + g, @as(u64, g) << 32);
-        try std.testing.expectEqual(@as(u32, @intCast(g)), id);
-    }
-    for (0..256) |g| {
-        var key: [9]u8 = @splat(0);
-        key[0] = 1;
-        std.mem.writeInt(u64, key[1..9], g, .little);
-        try std.testing.expectEqual(@as(?u32, @intCast(g)), table.findFixed(&key, @as(u64, g) << 32));
-        const id = try table.getOrInsertFixedHashed(&key, &calls, g, 0);
-        try std.testing.expectEqual(@as(u32, @intCast(g)), id);
-        try std.testing.expectEqual(@as(u64, g), table.first.items[id]);
-    }
-}
-
-test "fixed local tables retain charged capacity and discard every old id" {
-    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
-    const calls = [_]AggCall{
-        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
-        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
-    };
-    for ([_]bool{ false, true }) |compact| {
-        var budget: SharedBudget = .{ .limit = 1 << 20 };
-        var table = GroupTable.init(std.testing.allocator, 0);
-        table.shared = &budget;
-        table.fixed_stride = 9;
-        if (compact) table.compact.configure(&calls);
-        defer table.deinit();
-        var capacity: usize = 0;
-        for (0..4) |epoch| {
-            var last: [9]u8 = @splat(0);
-            for (0..64) |g| {
-                last[0] = 1;
-                std.mem.writeInt(u64, last[1..9], epoch * 64 + g, .little);
-                const id = try table.getOrInsertFixed(&last, &calls, epoch * 64 + g);
-                try std.testing.expectEqual(@as(u32, @intCast(g)), id);
-                try std.testing.expectEqual(@as(u64, 0), table.readAcc(id, 0, calls.len).count);
-                try std.testing.expectEqual(@as(?i128, null), table.readAcc(id, 1, calls.len).sum_i);
-                table.writeAcc(id, 0, calls.len, .{ .count = 1 });
-                table.writeAcc(id, 1, calls.len, .{ .sum_i = @intCast(g) });
-            }
-            if (epoch == 0) capacity = table.allocated_bytes;
-            table.clearFixedRetainingCapacity();
-            try std.testing.expectEqual(@as(usize, 0), table.groupCount());
-            try std.testing.expectEqual(capacity, table.allocated_bytes);
-            try std.testing.expectEqual(capacity, budget.used.load(.monotonic));
-            try std.testing.expectEqual(@as(?u32, null), table.findFixed(&last, hashFixed(&last)));
-        }
-    }
-}
-
 test "batched fixed lookups preserve sparse selections nulls NaNs and signed zeros" {
     const n = 129;
     var values: [n]f64 = undefined;
@@ -4892,60 +4832,6 @@ test "bounded first discovery keeps at most H exact keys and only lowers the sha
         try std.testing.expectEqual(@as(usize, 3), early.groupCount());
         try std.testing.expectEqual(@as(usize, 3), late.groupCount());
         try std.testing.expectEqual(@as(u64, 3), threshold.load(.monotonic));
-    }
-}
-
-test "distinct bitmaps preserve complete identities across ranges, partitions and late wide values with failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctBitmapTrial, .{});
-}
-
-fn distinctBitmapTrial(a: std.mem.Allocator) !void {
-    const hw = @import("../hw.zig");
-    hw.test_cpu = .{ .l2 = .{ .bytes = 64 << 10, .max_sharing = 1 } };
-    defer hw.test_cpu = null;
-    for ([_]bool{ false, true }) |partitioned| {
-        var budget: SharedBudget = .{ .limit = 1 << 20 };
-        {
-            var left: DistinctSet = .{ .shared = &budget };
-            defer left.deinit(a);
-            var right: DistinctSet = .{ .shared = &budget };
-            defer right.deinit(a);
-            if (partitioned) {
-                try left.initPartitions(a, &budget);
-                try right.initPartitions(a, &budget);
-            }
-            // Different aligned bases and overlap. OR must preserve identity, never add cardinalities.
-            for (128..384) |v| try left.insertU64(a, v);
-            for (0..256) |v| try right.insertU64(a, v);
-            if (!partitioned) {
-                try testing.expect(left.val_set == .bitmap);
-                try testing.expect(right.val_set == .bitmap);
-            }
-            try left.merge(&right, a);
-            try testing.expectEqual(@as(usize, 384), left.count());
-            try left.merge(&right, a);
-            try testing.expectEqual(@as(usize, 384), left.count());
-            // A late sparse value migrates the whole set without another input pass.
-            try left.insertU64(a, @as(u64, 1) << 48);
-            try testing.expectEqual(@as(usize, 385), left.count());
-            if (!partitioned) try testing.expect(left.val_set == .u64);
-            for (0..384) |v| try left.insertU64(a, v);
-            try testing.expectEqual(@as(usize, 385), left.count());
-            var empty: DistinctSet = .{ .shared = &budget };
-            defer empty.deinit(a);
-            try empty.merge(&right, a);
-            try empty.merge(&left, a);
-            try testing.expectEqual(@as(usize, 385), empty.count());
-            var negative: DistinctSet = .{ .shared = &budget };
-            defer negative.deinit(a);
-            for (0..128) |i| try negative.insertU64(a, std.math.maxInt(u64) - i);
-            try testing.expect(negative.val_set == .bitmap);
-            try testing.expectEqual(std.math.maxInt(u64), negative.val_set.bitmap.last());
-            try negative.merge(&right, a);
-            try testing.expectEqual(@as(usize, 384), negative.count());
-            try testing.expect(negative.val_set == .u64);
-        }
-        try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     }
 }
 

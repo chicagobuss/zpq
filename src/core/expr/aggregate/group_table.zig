@@ -1,4 +1,5 @@
 const std = @import("std");
+const expr_ast = @import("../ast.zig");
 const filter_eval = @import("../../filter/eval.zig");
 const core_memory = @import("../../memory.zig");
 const core_bytes = @import("../../bytes.zig");
@@ -1029,5 +1030,66 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     var small_gt = GroupTable.init(allocator, 10);
     defer small_gt.deinit();
     try std.testing.expectError(error.ExceededMemoryBudget, small_gt.getOrInsert("too_large_key_that_exceeds_budget", agg_calls, 0));
+}
+
+
+test "compact fixed slots compare complete keys under projected-hash collisions and growth" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(GroupTable.FixedSlot));
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var table = GroupTable.init(std.testing.allocator, 1 << 20);
+    table.fixed_stride = 9;
+    defer table.deinit();
+    for (0..256) |g| {
+        var key: [9]u8 = @splat(0);
+        key[0] = 1;
+        std.mem.writeInt(u64, key[1..9], g, .little);
+        const id = try table.getOrInsertFixedHashed(&key, &calls, 1000 + g, @as(u64, g) << 32);
+        try std.testing.expectEqual(@as(u32, @intCast(g)), id);
+    }
+    for (0..256) |g| {
+        var key: [9]u8 = @splat(0);
+        key[0] = 1;
+        std.mem.writeInt(u64, key[1..9], g, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(g)), table.findFixed(&key, @as(u64, g) << 32));
+        const id = try table.getOrInsertFixedHashed(&key, &calls, g, 0);
+        try std.testing.expectEqual(@as(u32, @intCast(g)), id);
+        try std.testing.expectEqual(@as(u64, g), table.first.items[id]);
+    }
+}
+
+test "fixed local tables retain charged capacity and discard every old id" {
+    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const calls = [_]AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .sum, .arg = arg, .where = null, .alias = "s", .result = .i64 },
+    };
+    for ([_]bool{ false, true }) |compact| {
+        var budget: SharedBudget = .{ .limit = 1 << 20 };
+        var table = GroupTable.init(std.testing.allocator, 0);
+        table.shared = &budget;
+        table.fixed_stride = 9;
+        if (compact) table.compact.configure(&calls);
+        defer table.deinit();
+        var capacity: usize = 0;
+        for (0..4) |epoch| {
+            var last: [9]u8 = @splat(0);
+            for (0..64) |g| {
+                last[0] = 1;
+                std.mem.writeInt(u64, last[1..9], epoch * 64 + g, .little);
+                const id = try table.getOrInsertFixed(&last, &calls, epoch * 64 + g);
+                try std.testing.expectEqual(@as(u32, @intCast(g)), id);
+                try std.testing.expectEqual(@as(u64, 0), table.readAcc(id, 0, calls.len).count);
+                try std.testing.expectEqual(@as(?i128, null), table.readAcc(id, 1, calls.len).sum_i);
+                table.writeAcc(id, 0, calls.len, .{ .count = 1 });
+                table.writeAcc(id, 1, calls.len, .{ .sum_i = @intCast(g) });
+            }
+            if (epoch == 0) capacity = table.allocated_bytes;
+            table.clearFixedRetainingCapacity();
+            try std.testing.expectEqual(@as(usize, 0), table.groupCount());
+            try std.testing.expectEqual(capacity, table.allocated_bytes);
+            try std.testing.expectEqual(capacity, budget.used.load(.monotonic));
+            try std.testing.expectEqual(@as(?u32, null), table.findFixed(&last, hashFixed(&last)));
+        }
+    }
 }
 

@@ -59,180 +59,6 @@ const keyEql = core_bytes.keyEql;
 const KeyHashMap = core_bytes.KeyHashMap;
 const KeyHashMapUnmanaged = core_bytes.KeyHashMapUnmanaged;
 
-pub const MultiAggArgs = struct {
-    /// Internal error handoff; prepareAggregate owns it until all scan state has been released.
-    failure_probe: ?*FailureProbe = null,
-    inputs: []const Input,
-    /// See `ReadStart`.
-    start_reads: ?ReadStart = null,
-    /// See `DictProbe`.
-    dict_probe: ?DictProbe = null,
-    /// Tests: the reader's probe cap in place of `ndv.probeCap`.
-    probe_cap: ?u64 = null,
-    /// Optional metadata parsed by the I/O layer. When null, metadata is
-    /// parsed from each Input.bytes as before.
-    metas: ?[]const schema.FileMetaData = null,
-    filter: ?[]const u8 = null,
-    aggregate: []const u8,
-    group_by: ?[]const u8 = null,
-    /// Internal child execution reuses already bound expressions instead of round-tripping SQL text.
-    bound_aggregate: ?*const BoundAggregate = null,
-    max_memory: usize = 512 * 1024 * 1024,
-    /// The query's ledger (`memory.zig`): its limit is `max_memory`, and the scan's tables, decode memory, merge and
-    /// answer draw from it, beside whatever else the query holds. Null: a budget of `max_memory` the scan's tables
-    /// draw from alone, as tests that size a budget to their groups expect.
-    ledger: ?*expr_agg.SharedBudget = null,
-    /// The allocator the merge's own maps and lists come from, drawing from `ledger` (`runMultiAggregate` makes one
-    /// per scan, and turns its refusal into the query's). Null: `gpa`, uncharged.
-    merge_memory: ?*core_memory.Charged = null,
-    /// Whether the workers' decode memory is drawn from `ledger`. A refusal chain's last scan draws it instead from a
-    /// ledger of its own of `memory.lean_decode` bytes (`narrowed`), which the ceiling's slack holds, so the tables
-    /// have all of the query's.
-    charge_decode: bool = true,
-    /// What the workers' decoded row groups may take together (`consumer.DecodeBudget`); null leaves decode unbounded.
-    decode_limit: ?usize = null,
-    /// The GROUP BY output columns as a select list writes them (SQL).
-    select_cols: ?[]const expr_ast.SelectColumn = null,
-    /// The cut the caller applies to the GROUP BY rows (`AggOutput.applyResultOrder`): a COUNT-descending cut lets the
-    /// merge skip groups that cannot make it. The rows still arrive uncut, in their usual order.
-    result_order: expr_ast.ResultOrder = .{},
-    /// Comma-separated output column names. Only used with GROUP BY when
-    /// `select_cols` is unset (e.g. CLI `--column-order`). Reorders the
-    /// default key-then-aggregate layout.
-    column_order: ?[]const u8 = null,
-    /// 0 = use cpu_count. 1 = serial. Row-group granularity: work is the
-    /// flat list of all row groups across all inputs, distributed across
-    /// `min(this, total_row_groups)` workers — so one big file uses all cores.
-    parallelism: usize = 0,
-    /// Leave each worker's decode region mapped after the scan, for the process exit to release (see the engine's
-    /// `Context.exit_after`): unmapping them otherwise delays the answer.
-    leave_regions: bool = false,
-    /// `--scan-all`: disable every stats shortcut — no row-group pruning,
-    /// no stats-driven column drop, no aggregate stat short-circuit. Forces
-    /// a full page/byte decode. The paranoid / untrusted-writer-stats path.
-    scan_all: bool = false,
-    /// `--trust-stats`: answer min/max/sum from file statistics (the fast
-    /// path) instead of decoding. Off by default — file stats can be wrong.
-    /// `count(*)` is always answered from num_rows regardless.
-    trust_stats: bool = false,
-    fast_levels: bool = false,
-    level_runs: ?bool = null,
-    /// Query-local computed DOUBLE batch override; 0 keeps the legacy evaluator.
-    expr_batch_rows: ?usize = null,
-    /// Drop fault-free integer expressions fixed by retained bare GROUP BY keys; false forces legacy grouping.
-    dependent_keys: bool = true,
-    /// Forced flat decode windows; zero keeps ordinary memory admission.
-    decode_batch_rows: usize = 0,
-    auto_decode_batches: bool = false,
-    /// See `consumer.DecodeOptions.encoded`.
-    encoded: bool = true,
-    /// Query-wide raw string identity; disabled after a rescannable budget refusal.
-    shared_strings: bool = true,
-    /// Build a GROUP BY answer the result program would leave as it is (no ORDER BY, LIMIT, OFFSET, HAVING or hidden
-    /// column) as typed columns for a Parquet write (`AggOutput.typed`), never as rows.
-    typed_answer: bool = false,
-    /// A synchronous text consumer can drain full owners without narrowing their exact SUMs to Parquet lanes.
-    record_answer: bool = false,
-    /// Exact inline records for integer COUNT/SUM answers, SUM/DISTINCT cuts, and scalar distinct, when prepaid.
-    integer_records: bool = true,
-    /// Stream ordered COUNT top-H runs; false retains the materialized run owner.
-    sorted_count_stream: bool = true,
-    /// Tests lower the cost threshold; ordinary execution keeps small answers on the established path.
-    integer_records_min_rows: usize = 1 << 20,
-    /// Exact retained-page radix grouping for a bounded string/INT32 COUNT cut.
-    msd_records: bool = true,
-    msd_records_min_rows: usize = 1 << 20,
-    /// Scratch-window override: null uses the per-worker cache budget, zero retains the legacy layout.
-    msd_cache_rows: ?usize = null,
-    /// Fixed decoder credit determined from the prefetched first-page headers.
-    msd_working_bytes: ?usize = null,
-    byte_records: bool = false,
-    byte_records_min_rows: usize = 1 << 20,
-    /// Zero retains the established partition count or ordinary decode admission, respectively.
-    byte_top_partitions: ?usize = null,
-    byte_top_batch_rows: ?usize = null,
-    /// `--unordered`: GROUP BY output in no particular order, with floating-point aggregates summed in whatever order
-    /// workers finish. Ordered (the default) lists groups where they first appear in the input and gives the same bits
-    /// at every `-j`; see `group_blocks_max`.
-    unordered: bool = false,
-    /// Workers are sized so each gets at least this many bytes to decode; tests lower it to run several workers on
-    /// small fixtures.
-    min_bytes_per_worker: u64 = 2 * 1024 * 1024,
-    /// Receives what a failure was about; see `diag.zig`.
-    diag: ?*Diag = null,
-    /// Records the scan's spans when set; see `profile.zig`.
-    profiler: ?*profile.Profiler = null,
-    /// Answer a COUNT-descending cut from a count pass and an admit pass where a count sketch certifies it; see
-    /// `certifiedTopK`. Null runs the plain scan.
-    sketch_topk: ?SketchTopK = null,
-    /// Plain GROUP BY through shared partition tables (`partagg.zig`). The CLI sets this from `ZPQ_PARTAGG=1`.
-    /// A count cut, sketch, census, or first-keys cut ignores it and keeps the per-worker tables.
-    partagg: bool = false,
-    /// Admitted private runs for poorly reducing long composite count keys; a refusal retries shared partitions.
-    private_runs: bool = true,
-    /// Grouped count(DISTINCT) through sorted pairs (`distinctPairsCall`): where they pay (`pairsPay`), always, or
-    /// never. The CLI takes `.on` from `ZPQ_DISTINCT_PAIRS=1` and `.off` from `=0`.
-    distinct_pairs: enum { auto, on, off } = .auto,
-    /// Exact bounded-domain grouped DISTINCT; forced layouts keep all identity, domain and ledger checks.
-    grouped_distinct_bitmap: grouped_bitmap.Mode = .auto,
-    /// Separate exact ordinary aggregates from DISTINCT under an ordinary COUNT-ranked cut.
-    count_ranked_distinct: enum { auto, on, off } = .auto,
-    /// Rows a worker reads on sets before judging them (`pairsPayRuntime`) under `.auto`. A verdict that may still
-    /// turn is taken again at twice the rows, `pairs_rechecks` times at most.
-    pairs_pilot_rows: u64 = 1 << 18,
-    pairs_rechecks: u8 = 3,
-    /// Disable profitability rules when exercising the legacy cut executors.
-    ndv_policy: bool = true,
-    /// Budgeted exact dictionary union; coverage and input cost are gated from footers.
-    ndv_union: bool = true,
-    /// Keep a lone integer key's union as an exact domain and fold by its ids (`agg_dense`) where the plan allows.
-    dense: bool = true,
-    /// The fast paths the scan armed, so a budget refusal can run again without them (`FastPath`).
-    taken: ?*std.EnumSet(FastPath) = null,
-    /// Let the cost rules move a plain GROUP BY to partitioned tables (worker-copy pressure, long strings).
-    partition_cost: bool = true,
-    /// Let the cost rules group plainly in place of a first-keys or count cut (`FastPath.plain_rule`).
-    plain_rules: bool = true,
-    /// Tests: local-table cap and the row window that decides whether pre-aggregation is paying off. Zero keeps
-    /// `partagg.local_cap` and `partagg.probe_rows`.
-    part_cap: usize = 0,
-    part_probe: u64 = 0,
-    /// A plain GROUP BY worker whose table holds `spill_groups` groups or more at fewer than `spill_rows` rows a
-    /// group moves to the partition runs (`partagg.zig`) for the rest of its scan. The CLI clears this from
-    /// `ZPQ_SPILL=0`.
-    spill: bool = true,
-    spill_groups: usize = 1 << 18,
-    spill_rows: u64 = 4,
-};
-
-/// Tuning of `certifiedTopK`.
-pub const SketchTopK = struct {
-    /// Hot-state producer; tests can force the identity-bound producer instead.
-    hot: bool = true,
-    hot_outcome: ?*HotOutcome = null,
-    /// Cells admitted per row of the cut (`offset + limit`).
-    admit_per_row: usize = 16,
-    /// log2 of the cells per worker: 2^18 four-byte cells fit a core's L2.
-    cell_bits: u6 = 18,
-    /// Report each decision on stderr.
-    trace: bool = false,
-    /// Tests: false never trusts the bound, so the scan falls back after the admit pass.
-    certify: bool = true,
-    /// Tests: where the scan went.
-    outcome: ?*Outcome = null,
-    /// When the cells bail, try a census of key fingerprints (`identityBoundPlan`) before the plain scan.
-    census: bool = true,
-    /// Tests: whether the census rides along the cell count pass, in place of `keysLookUnique`.
-    fuse_census: ?bool = null,
-    /// Tests: rows a worker records before its cells judge whether a riding census is needed.
-    census_check_rows: u64 = expr_agg.Census.check_rows,
-    /// Tests: identity bits below the owner partition (at most 32), fewer to force collisions.
-    census_fp_bits: u6 = 40,
-
-    pub const Outcome = enum { ineligible, bailed, certified, fell_back, census, census_short };
-    pub const HotOutcome = enum { declined, certified, residual };
-};
-
 /// Whether `runMultiAggregate` probes Bloom filters itself: only for footers it parses from the whole file (every
 /// input mapped), never for `metas` the caller passes, which the caller has probed through its own reader.
 fn probesMembership(args: MultiAggArgs) bool {
@@ -279,6 +105,9 @@ const MergeIndex = merge_index.MergeIndex;
 pub const scan_materialize = @import("scan/materialize.zig");
 pub const materializeOne = scan_materialize.materializeOne;
 pub const scan_types = @import("scan/types.zig");
+const BoundAggregate = scan_types.BoundAggregate;
+pub const MultiAggArgs = scan_types.MultiAggArgs;
+pub const SketchTopK = scan_types.SketchTopK;
 pub const Error = scan_types.Error;
 pub const Input = scan_types.Input;
 const allRescannable = scan_types.allRescannable;
@@ -4814,12 +4643,7 @@ const RankedPhase = struct {
     }
 };
 
-const BoundAggregate = struct {
-    calls: []const expr_agg.AggCall,
-    keys: []const expr_ast.Expr,
-    outputs: []const BoundOutputColumn,
-    filter: ?filter_ast.Filter,
-};
+
 
 fn rankedColumn(col: expr_ast.ColRef) bool {
     return col.expr_type == .i64 and !col.unsigned_32 and !col.unsigned_64 and

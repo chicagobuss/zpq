@@ -43,9 +43,13 @@ fn hasGlibcHeap(os: std.Target.Os.Tag, abi: std.Target.Abi, link_libc: bool) boo
 extern "c" fn malloc_trim(pad: usize) c_int;
 extern "c" fn mallopt(param: c_int, value: c_int) c_int;
 
-/// Hand the C heap's free memory back to the OS (glibc's `malloc_trim`; a no-op where there is none). Freed blocks
-/// otherwise stay resident in its per-thread arenas: memory the ledger has back is not memory the process gave up.
+/// Reclaim freed heap pages between retries before the ledger lends their credit to the next attempt.
 pub fn trimHeap() void {
+    if (comptime use_mimalloc) {
+        mi_collect(true);
+        mi_arenas_purge();
+        return;
+    }
     if (comptime !glibc_heap) return;
     _ = malloc_trim(0);
 }
@@ -88,7 +92,7 @@ pub fn processAllocator(init_gpa: std.mem.Allocator) std.mem.Allocator {
     // peak. Purged at once and without THP, peaks match glibc's at little cost. `MIMALLOC_*` still overrides them.
     mi_option_set_default(mi_option_purge_delay, 0);
     mi_option_set_default(mi_option_allow_thp, 0);
-    return mimalloc;
+    return split_process_heap.allocator();
 }
 
 /// build.zig links mimalloc (`usesMimalloc`) for exactly the builds `ownHeap` names, libzpq's aside.
@@ -105,10 +109,86 @@ const mimalloc: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
     .free = miFree,
 } };
 
+// Larger transient buffers use their own mappings so a freed growth buffer cannot stay in a partly occupied heap page.
+const SplitHeap = struct {
+    small: std.mem.Allocator,
+    threshold: usize,
+
+    fn allocator(self: *SplitHeap) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn child(self: *SplitHeap, len: usize) std.mem.Allocator {
+        return if (len >= self.threshold) std.heap.page_allocator else self.small;
+    }
+
+    fn owner(self: *SplitHeap, memory: []u8) std.mem.Allocator {
+        // Group tables and their DISTINCT accumulators can transfer allocations between the two process heaps.
+        if (comptime use_mimalloc) {
+            if (memory.len >= group_heap_threshold and memory.len < process_heap_threshold)
+                return if (mi_is_in_heap_region(memory.ptr)) self.small else std.heap.page_allocator;
+        }
+        return self.child(memory.len);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *SplitHeap = @ptrCast(@alignCast(ctx));
+        return self.child(len).rawAlloc(len, a, ret);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, len: usize, ret: usize) bool {
+        const self: *SplitHeap = @ptrCast(@alignCast(ctx));
+        const old = self.owner(memory);
+        if (old.vtable != self.child(len).vtable) return false;
+        return old.rawResize(memory, a, len, ret);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+        const self: *SplitHeap = @ptrCast(@alignCast(ctx));
+        const old = self.owner(memory);
+        if (old.vtable != self.child(len).vtable) return null;
+        return old.rawRemap(memory, a, len, ret);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ret: usize) void {
+        const self: *SplitHeap = @ptrCast(@alignCast(ctx));
+        self.owner(memory).rawFree(memory, a, ret);
+    }
+};
+
+const group_heap_threshold = 16 * 1024;
+const process_heap_threshold = 32 * 1024;
+var split_process_heap: SplitHeap = .{ .small = mimalloc, .threshold = process_heap_threshold };
+var split_group_heap: SplitHeap = .{ .small = mimalloc, .threshold = group_heap_threshold };
+
+/// Tables use a lower mapping threshold without changing the process allocator used by scalar DISTINCT.
+pub fn groupAllocator(parent: std.mem.Allocator) std.mem.Allocator {
+    if (comptime !use_mimalloc) return parent;
+    const process = split_process_heap.allocator();
+    return if (parent.vtable == process.vtable and parent.ptr == process.ptr) split_group_heap.allocator() else parent;
+}
+
+test "split heap preserves data and ownership across its size threshold" {
+    const threshold = group_heap_threshold;
+    var split: SplitHeap = .{ .small = std.testing.allocator, .threshold = threshold };
+    const a = split.allocator();
+    var bytes = try a.alloc(u8, threshold - 1);
+    @memset(bytes, 0xa5);
+    bytes = try a.realloc(bytes, threshold + 1);
+    try std.testing.expectEqual(@as(u8, 0xa5), bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0xa5), bytes[threshold - 2]);
+    bytes = try a.realloc(bytes, 100);
+    try std.testing.expectEqual(@as(u8, 0xa5), bytes[99]);
+    a.free(bytes);
+}
+
 extern fn mi_malloc_aligned(size: usize, alignment: usize) ?*anyopaque;
 extern fn mi_realloc_aligned(p: ?*anyopaque, size: usize, alignment: usize) ?*anyopaque;
 extern fn mi_usable_size(p: ?*const anyopaque) usize;
 extern fn mi_free(p: ?*anyopaque) void;
+extern fn mi_is_in_heap_region(p: ?*const anyopaque) bool;
+extern fn mi_collect(force: bool) void;
+extern fn mi_arenas_purge() void;
 extern fn mi_option_set_default(option: c_int, value: c_long) void;
 // `mi_option_t` values in vendor/mimalloc/include/mimalloc.h (3.6.0).
 const mi_option_purge_delay: c_int = 15;

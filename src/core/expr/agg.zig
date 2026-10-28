@@ -5162,7 +5162,7 @@ pub const GroupTable = struct {
 
     pub fn init(allocator: std.mem.Allocator, max_memory_bytes: usize) GroupTable {
         return .{
-            .allocator = allocator,
+            .allocator = core_memory.groupAllocator(allocator),
             .accumulators = .empty,
             .allocated_bytes = 0,
             .max_memory_bytes = max_memory_bytes,

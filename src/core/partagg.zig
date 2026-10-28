@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const expr_agg = @import("expr/agg.zig");
+const core_memory = @import("memory.zig");
 const spawn_util = @import("spawn.zig");
 const blocking = @import("blocking.zig");
 
@@ -170,7 +171,7 @@ pub const PartAgg = struct {
     spill_rows: u64 = 4,
 
     pub fn init(
-        gpa: std.mem.Allocator,
+        input_gpa: std.mem.Allocator,
         budget: *expr_agg.SharedBudget,
         calls: []const expr_agg.AggCall,
         stride: u8,
@@ -180,6 +181,7 @@ pub const PartAgg = struct {
         n_workers: usize,
         shared: bool,
     ) !PartAgg {
+        const gpa = core_memory.groupAllocator(input_gpa);
         const bits: u6 = if (shared) shared_part_bits else partBits(budget.limit);
         const parts = try gpa.alloc(Part, @as(usize, 1) << bits);
         errdefer gpa.free(parts);

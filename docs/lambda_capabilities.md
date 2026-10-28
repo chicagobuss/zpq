@@ -175,7 +175,7 @@ nothing to load. The full `zpq-lambda` binary, at about 10 MB zipped, measured 1
 These findings should drive the current architecture, not be appended to it:
 
 1. **Compile-time backend selection is mandatory.** The Lambda build must not link the io_uring code path at all.
-   Smaller binary, faster cold start, no risk of accidental ENOSYS panic if a runtime auto-detect ever guesses wrong.
+   Smaller binary, faster cold start, no risk of accidental ENOSYS panic if a runtime auto-detect ever guesses incorrectly.
    When the io_uring backend lands (it doesn't exist yet), a per-binary build option, as `enable_sql` is, must exclude
    it from the Lambda binary's import graph.
 2. **Treat io_uring as a workstation-only optimization.** Hot-path performance reasoning should stay grounded in

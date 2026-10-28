@@ -148,7 +148,7 @@ The event used to be read by searching for each field's key anywhere in the body
 - Malformed JSON: syntax errors, truncation, text after the object, unknown escapes (`\q`), unpaired or reversed
   surrogate escapes, invalid UTF-8, raw control characters in strings. `bad_json` with the scanner's reason.
 - A known field given twice. `bad_json`/`DuplicateField`; the first one used to win.
-- A known field of the wrong type. `bad_json`/`BadFieldType`, naming the field:
+- A known field of a type it does not accept. `bad_json`/`BadFieldType`, naming the field:
   - a string field (`s3_url`, `filter`, `select`, `aggregate`, `group_by`, `column_order`, `output_url`,
     `output_codec`) holding anything but a string;
   - `columns` as a comma-separated string, which used to be ignored (every column was written), or an array holding

@@ -154,7 +154,7 @@ keeps the input type.
 `avg_state(x)` is the same average, kept as state that you can merge. Its `sum` is a DOUBLE for integer and float `x`,
 and DECIMAL(38, s) for DECIMAL `x`. Its `count` is the number of non-null values. Over no values it is
 `{"sum":null,"count":0}`. To get the overall mean across files or Lambda invocations, divide the sum of the `sum`s by
-the sum of the `count`s. Averaging per-file means gives the wrong answer. In CSV, `avg_state` is the two columns
+the sum of the `count`s. Averaging per-file means gives an incorrect answer. In CSV, `avg_state` is the two columns
 `<name>__sum` and `<name>__count`.
 
 ```

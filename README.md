@@ -192,7 +192,11 @@ locally alike, so a scan larger than memory completes:
   codec that expands, such as `--codec uncompressed`, or one written in slices) goes straight to the output in its
   turn, a page or a slice at a time; S3 uploads keep at most an eighth of it in flight.
 
-It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. Its default
+It is a working budget, not a hard cap: the binary, page buffers and output in flight come on top. In 0.5.0,
+hash-table growth and buffer replacement in a high-cardinality GROUP BY or `count(DISTINCT)` can also go past it, by up
+to about 2x near the limit; the answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq under a
+cgroup `memory.max` or `ulimit -v`. Scans, filters, printed rows, writes, S3 streaming and low- to
+medium-cardinality aggregation stay within the budget. Its default
 (`src/core/system.zig`) is three quarters of the memory size on Lambda; on Linux, 80% of available memory, but no more
 than three quarters of a cgroup v2 `memory.max`; on macOS, half of physical memory; and 512 MiB where none of these
 can be read. Give it as bytes, or as a number (fractions allowed) followed by `K`, `M`, `G` or `T`, with or without a
@@ -363,7 +367,7 @@ bracket, and Parquet may lack its footer. Check exit status, including `set -o p
 
 Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate — but
 real-world writers ship inaccurate ones (we have a `parquet-mr 1.8.2` file in the test corpus whose recorded `min` is
-`2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently wrong answer**.
+`2.00` when the column actually contains `1.00`). A reader that trusts those stats returns a **silently incorrect answer**.
 
 By default, `min / max / sum` decode their values instead of taking the answer from statistics. Filters can still
 prune data using corroborated statistics. The metadata shortcuts have separate trust boundaries:
@@ -431,7 +435,7 @@ copies; a column dropped or re-encoded loses its filter unless `--bloom-filter` 
 CI ([`.github/workflows/verify.yml`](.github/workflows/verify.yml)) runs unit tests, Lambda integration tests, CLI
 cross-implementation smoke, and the `apache/parquet-testing` conformance corpus on every code change. The smoke path
 validates ZPQ-written Parquet with pyarrow; the workflow also identity-checks the Lambda deploy artifact to catch the
-"packaged the wrong binary" class of bug.
+"packaged an incorrect binary" class of bug.
 
 ## Build
 

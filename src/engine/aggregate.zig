@@ -207,6 +207,10 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
 }
 
 
+// ============================================================
+// Aggregate path
+// ============================================================
+
 /// `filter`'s conjuncts as the plan runs them, each with the column it tests (a composite: its first leaf's).
 fn explainConjuncts(arena: std.mem.Allocator, filter: ?[]const u8, meta: *const schema.FileMetaData) ![]const Conjunct {
     const text = filter orelse return &.{};
@@ -790,6 +794,9 @@ test "released group metadata never emits a scalar phantom row" {
 }
 
 
+// ============================================================
+// Compile-time API check.
+// ============================================================
 test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;

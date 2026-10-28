@@ -812,6 +812,10 @@ fn checkUtf8(v: scan.AggValue, name: []const u8, diag: ?*Diag) !void {
 }
 
 
+// ============================================================
+// Print path - CSV / JSONL streaming row output
+// ============================================================
+
 /// Shared row framing and value formatting for materialized and owner answers, on every text target.
 pub fn writeAggregateText(
     writer: anytype,

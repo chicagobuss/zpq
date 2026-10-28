@@ -22,6 +22,25 @@ const RowGroupTarget = types.RowGroupTarget;
 const Context = types.Context;
 const QueryArgs = types.QueryArgs;
 
+// ============================================================
+// Write path — projection / select / filter, output to local or s3
+// ============================================================
+
+// ── Windowed parallel re-encode (Io.Group.async + sliding window) ─────
+// Producers decode+filter+encode whole row groups concurrently, bounded by a
+// CPU budget; a single in-order writer drains their buffers to the
+// sink, rebasing each row group's file offsets. A sliding window (an
+// Io.Semaphore of W permits) caps how many encoded row groups may be in flight
+// at once, so peak memory = W × rg_bytes regardless of total output size. W is
+// sized from the environment by the caller: generously from the owned memory
+// tier on Lambda, a small polite multiple of the worker count elsewhere.
+//
+// Idiom: this is the same std.Io concurrency the S3 paths already use, applied
+// to CPU work — replacing raw std.Thread.spawn + buffer-all. (See the
+// probe_io_concurrency / probe_backpressure spikes at e76a1e3 for why async + async_limit,
+// not concurrent, and why a sliding window rather than byte credits.)
+
+/// A Sink that appends into an in-memory buffer (offsets relative to 0).
 const BufSink = struct {
     buf: *std.ArrayListUnmanaged(u8),
     gpa: std.mem.Allocator,

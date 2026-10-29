@@ -214,7 +214,7 @@ pub fn decodeHeld(w: *const Worker) bool {
 }
 
 /// `err`, or `error.ExceededMemoryBudget` when it is the out-of-memory a refused draw from the ledger raised.
-pub fn workerRefusal(w: *const Worker, err: anyerror) anyerror {
+pub fn workerRefusal(w: *const Worker, err: anytype) (@TypeOf(err) || error{ExceededMemoryBudget}) {
     if (err != error.OutOfMemory) return err;
     if (w.region) |r| if (r.refused) return error.ExceededMemoryBudget;
     if (w.scratch_region) |r| if (r.refused) return error.ExceededMemoryBudget;
@@ -544,4 +544,3 @@ test "exiting final-pass workers retire charged regions before join and preserve
         try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
     }
 }
-

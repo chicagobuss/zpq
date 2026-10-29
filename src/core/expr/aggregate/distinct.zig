@@ -5,7 +5,7 @@ const filter_eval = @import("../../filter/eval.zig");
 const SharedBudget = @import("../../memory.zig").SharedBudget;
 const DecSum = @import("types.zig").DecSum;
 const AggCall = @import("types.zig").AggCall;
-const GroupTable = @import("group_table.zig").GroupTable;
+const Ceiling = @import("ceiling.zig").Ceiling;
 const isRowNull = @import("contracts.zig").isRowNull;
 const keyEql = @import("../../bytes.zig").keyEql;
 
@@ -136,8 +136,8 @@ pub const DistinctSet = struct {
     map_extra: usize = 0,
     max_memory_bytes: usize = 0,
     shared: ?*SharedBudget = null,
-    /// Charged against this table's private ceiling instead of `shared`. The table must outlive the set.
-    private_table: ?*GroupTable = null,
+    /// Charged against this private ceiling instead of `shared`. The table that owns it must outlive the set.
+    private: ?*Ceiling = null,
     parts: ?[]DistinctSet = null,
     string_arena: ?*StringArena = null,
 
@@ -184,10 +184,10 @@ pub const DistinctSet = struct {
     }
 
     fn releasePrivate(self: *DistinctSet) void {
-        if (self.private_table) |t| {
-            t.releasePrivateBytes(self.max_memory_bytes);
-            t.releaseSpilledSet();
-            self.private_table = null;
+        if (self.private) |c| {
+            c.release(self.max_memory_bytes);
+            c.release(@sizeOf(DistinctSet));
+            self.private = null;
             self.max_memory_bytes = 0;
         }
     }
@@ -277,9 +277,9 @@ pub const DistinctSet = struct {
         self.refreshMapExtra();
         if (self.allocated_bytes + need <= self.max_memory_bytes) return;
         const budget = self.shared orelse {
-            if (self.private_table) |t| {
+            if (self.private) |c| {
                 const deficit = self.allocated_bytes + need - self.max_memory_bytes;
-                try t.chargePrivateBytes(deficit);
+                try c.charge(deficit);
                 self.max_memory_bytes += deficit;
             }
             return;
@@ -939,33 +939,33 @@ pub const DistinctSet = struct {
 /// Grouped count(DISTINCT) held in the accumulator itself.
 ///
 /// `raw[1..]` stores up to `cap` u64 values. `raw[0]` is a pointer with a 3-bit tag in the low bits (0..cap inline,
-/// `heap_mark` spilled). Bit 3 is free on an inline acc because `SharedBudget` and `GroupTable` are 16-aligned:
-/// clear means the shared budget, set means the private group table. A spilled `DistinctSet` is only 8-aligned, so
+/// `heap_mark` spilled). Bit 3 is free on an inline acc because `SharedBudget` and `Ceiling` are 16-aligned:
+/// clear means the shared budget, set means the private ceiling. A spilled `DistinctSet` is only 8-aligned, so
 /// there bit 3 is a real address bit and the tag alone means heap. 32 bytes is the payload `DecSum` already forces.
 /// One to three u64s cost no heap object. The fourth, or any i128 or byte value, spills. A shared budget is charged
-/// on the set; a private table is charged on the table at spill, so a ceiling tightened after the group exists
+/// on the set; a private ceiling is charged on its table at spill, so a ceiling tightened after the group exists
 /// still applies.
 pub const DistinctAcc = struct {
     raw: [4]u64 = .{ 0, 0, 0, 0 },
 
     pub const cap: u8 = 3;
     const heap_mark: u64 = 7;
-    /// Bit 3. Not a tag value: the low 3 bits stay the count, and this bit says the pointer is a `GroupTable`.
-    const table_flag: u64 = 8;
+    /// Bit 3. Not a tag value: the low 3 bits stay the count, and this bit says the pointer is a `Ceiling`.
+    const ceiling_flag: u64 = 8;
 
     comptime {
         if (@sizeOf(DistinctAcc) > @sizeOf(DecSum)) @compileError("DistinctAcc grew past the accumulator payload");
         if (@alignOf(DistinctSet) < 8 or @alignOf(SharedBudget) < 16) @compileError("tag bits need aligned pointees");
-        if (table_flag & 7 != 0) @compileError("table flag collides with the tag");
+        if (ceiling_flag & 7 != 0) @compileError("ceiling flag collides with the tag");
     }
 
     pub fn initEmpty(budget: ?*SharedBudget) DistinctAcc {
         return .{ .raw = .{ @intFromPtr(budget), 0, 0, 0 } };
     }
 
-    /// Inline acc whose spill charges `table`'s private ceiling. `table` must not move while this acc is live.
-    pub fn initPrivate(table: *GroupTable) DistinctAcc {
-        return .{ .raw = .{ @intFromPtr(table) | table_flag, 0, 0, 0 } };
+    /// Inline acc whose spill charges `ceiling`. The table embedding it must not move while this acc is live.
+    pub fn initPrivate(ceiling: *Ceiling) DistinctAcc {
+        return .{ .raw = .{ @intFromPtr(ceiling) | ceiling_flag, 0, 0, 0 } };
     }
 
     pub fn fromSet(ds: *DistinctSet) DistinctAcc {
@@ -982,29 +982,29 @@ pub const DistinctAcc = struct {
     }
 
     /// Budget stashed while the values are inline; a spilled set keeps it on the set. Null when the pointer is a
-    /// private table (that is not a `SharedBudget`).
+    /// private ceiling (that is not a `SharedBudget`).
     pub fn budgetPtr(self: DistinctAcc) ?*SharedBudget {
         if ((self.raw[0] & 7) == heap_mark) return if (self.heap()) |ds| ds.shared else null;
-        if ((self.raw[0] & table_flag) != 0) return null;
+        if ((self.raw[0] & ceiling_flag) != 0) return null;
         const p = self.raw[0] & ~@as(u64, 7);
         if (p == 0) return null;
         return @ptrFromInt(p);
     }
 
-    fn tablePtr(self: DistinctAcc) ?*GroupTable {
-        if ((self.raw[0] & 7) == heap_mark or (self.raw[0] & table_flag) == 0) return null;
+    fn ceilingPtr(self: DistinctAcc) ?*Ceiling {
+        if ((self.raw[0] & 7) == heap_mark or (self.raw[0] & ceiling_flag) == 0) return null;
         return @ptrFromInt(self.raw[0] & ~@as(u64, 15));
     }
 
-    /// A 16-aligned budget pointer has bit 3 clear, so this also drops a private-table pointer.
+    /// A 16-aligned budget pointer has bit 3 clear, so this also drops a private-ceiling pointer.
     fn setBudget(self: *DistinctAcc, budget: ?*SharedBudget) void {
         self.raw[0] = @intFromPtr(budget) | (self.raw[0] & 7);
     }
 
-    /// Pointer bits to copy onto an empty dest: the inline budget or table, or the spilled set's, never the set.
+    /// Pointer bits to copy onto an empty dest: the inline budget or ceiling, or the spilled set's, never the set.
     fn chargeWord(self: DistinctAcc) u64 {
         if (self.heap()) |ds| {
-            if (ds.private_table) |t| return @intFromPtr(t) | table_flag;
+            if (ds.private) |c| return @intFromPtr(c) | ceiling_flag;
             return @intFromPtr(ds.shared);
         }
         return self.raw[0] & ~@as(u64, 7);
@@ -1100,9 +1100,9 @@ pub const DistinctAcc = struct {
         errdefer ds.deinit(allocator);
         // The object is memory the group now holds, charged when it spills rather than for every group. A shared
         // budget lives on the set. A private ceiling has nothing to draw on, so the table counts the object itself.
-        if (self.tablePtr()) |t| {
-            try t.chargeSpilledSet();
-            ds.private_table = t;
+        if (self.ceilingPtr()) |c| {
+            try c.charge(@sizeOf(DistinctSet));
+            ds.private = c;
         } else {
             try ds.charge(@sizeOf(DistinctSet));
         }
@@ -1114,7 +1114,7 @@ pub const DistinctAcc = struct {
 
     /// Copy `src`'s values in. `src` keeps whatever it owns.
     pub fn mergeFrom(self: *DistinctAcc, src: DistinctAcc, allocator: std.mem.Allocator) !void {
-        // An empty dest has nothing to charge the copy to. Take the source's budget or private table, and leave a
+        // An empty dest has nothing to charge the copy to. Take the source's budget or private ceiling, and leave a
         // dest that already has one alone — otherwise a full source budget would let the copy through unpaid.
         if (self.tag() == 0 and (self.raw[0] & ~@as(u64, 7)) == 0) self.raw[0] |= src.chargeWord();
         if (src.heap()) |ss| {
@@ -1131,7 +1131,7 @@ pub const DistinctAcc = struct {
     pub fn takeFrom(self: *DistinctAcc, src: *DistinctAcc, allocator: std.mem.Allocator) !void {
         if (src.tag() == 0) return;
         if (self.tag() == 0) {
-            // `budgetPtr` is null for a private table, so keep the raw charge word. A heap src carries its own.
+            // `budgetPtr` is null for a private ceiling, so keep the raw charge word. A heap src carries its own.
             const kept = self.raw[0] & ~@as(u64, 7);
             self.* = src.*;
             src.* = .{};
@@ -1332,89 +1332,6 @@ test "round 4: detach clears an inline budget" {
     try acc.insertU64(a, 3);
     try acc.insertU64(a, 4);
     try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
-}
-
-test "round 4: private table ceiling includes a spilled object" {
-    const a = testing.allocator;
-    const calls = [_]AggCall{
-        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "d", .result = .i64 },
-    };
-    for ([_]u8{ 0, 9 }) |stride| {
-        var t = GroupTable.init(a, 1 << 20);
-        t.fixed_stride = stride;
-        defer t.deinit();
-        var image: [9]u8 = @splat(0);
-        image[0] = 1;
-        const gid = if (stride == 0)
-            try t.getOrInsert("a", &calls, 0)
-        else
-            try t.getOrInsertFixed(&image, &calls, 0);
-        // Clamped after the group exists, so the spill itself has to see the live ceiling.
-        t.max_memory_bytes = t.allocated_bytes;
-        const slot = &t.accumulators.items[gid].distinct;
-        for (0..3) |v| try slot.insertU64(a, v);
-        try testing.expectError(error.ExceededMemoryBudget, slot.insertU64(a, 3));
-        try testing.expect(slot.heap() == null);
-        try testing.expectEqual(@as(usize, 3), slot.count());
-        try testing.expectEqual(t.max_memory_bytes, t.allocated_bytes);
-    }
-}
-
-test "round 4: a spilled object stays inside a private ceiling after the next insert" {
-    const a = testing.allocator;
-    const calls = [_]AggCall{
-        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "d", .result = .i64 },
-    };
-    for ([_]u8{ 0, 9 }) |stride| {
-        var t = GroupTable.init(a, 1 << 20);
-        t.fixed_stride = stride;
-        defer t.deinit();
-        var image: [9]u8 = @splat(0);
-        image[0] = 1;
-        const gid = if (stride == 0)
-            try t.getOrInsert("a", &calls, 0)
-        else
-            try t.getOrInsertFixed(&image, &calls, 0);
-        const before = t.allocated_bytes;
-        for (0..4) |v| try t.accumulators.items[gid].distinct.insertU64(a, v);
-        const set_credit = t.accumulators.items[gid].distinct.heap().?.max_memory_bytes;
-        try testing.expect(set_credit > 0);
-        try testing.expectEqual(before + @sizeOf(DistinctSet) + set_credit, t.allocated_bytes);
-        image[0] = 2;
-        _ = if (stride == 0)
-            try t.getOrInsert("b", &calls, 1)
-        else
-            try t.getOrInsertFixed(&image, &calls, 1);
-        try testing.expect(t.allocated_bytes >= before + @sizeOf(DistinctSet));
-        const held = t.allocated_bytes;
-        t.accumulators.items[gid].distinct.deinit(a);
-        try testing.expectEqual(held - @sizeOf(DistinctSet) - set_credit, t.allocated_bytes);
-    }
-}
-
-test "round 4: shared budget still owns the spilled object, not the table" {
-    const a = testing.allocator;
-    const calls = [_]AggCall{
-        .{ .func = .count_distinct, .arg = null, .where = null, .alias = "d", .result = .i64 },
-    };
-    var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
-    for ([_]u8{ 0, 9 }) |stride| {
-        var t = GroupTable.init(a, 0);
-        t.fixed_stride = stride;
-        t.shared = &budget;
-        defer t.deinit();
-        var image: [9]u8 = @splat(0);
-        image[0] = 1;
-        const gid = if (stride == 0)
-            try t.getOrInsert("a", &calls, 0)
-        else
-            try t.getOrInsertFixed(&image, &calls, 0);
-        const table_before = t.allocated_bytes;
-        const used_before = budget.used.load(.monotonic);
-        for (0..4) |v| try t.accumulators.items[gid].distinct.insertU64(a, v);
-        try testing.expectEqual(table_before, t.allocated_bytes);
-        try testing.expect(budget.used.load(.monotonic) >= used_before + @sizeOf(DistinctSet));
-    }
 }
 
 test "round 4: owned merges preserve reservations on allocation failure" {

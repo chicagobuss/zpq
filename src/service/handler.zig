@@ -227,6 +227,19 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_json\",\"reason\":\"{s}\"}}", .{@errorName(err)});
         };
         defer req.deinit();
+        if (req.operation == .capabilities)
+            return std.json.Stringify.valueAlloc(allocator, .{
+                .structured_plan_versions = .{request.plan_version},
+                .prepare_aggregate_version = request.plan_version,
+            }, .{});
+
+        const decoded_plan: ?engine.fanout_plan.Query = if (req.plan) |value|
+            engine.fanout_plan.decode(req.parsed.arena.allocator(), value) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return rejectResponse(allocator, "bad_json", if (err == error.PlanTooDeep) "PlanTooDeep" else "BadFieldType", "field", "plan");
+            }
+        else
+            null;
 
         // Output codec: "snappy", "zstd", "gzip", "lz4"/"lz4_raw" (both LZ4_RAW;
         // nothing compresses to the deprecated LZ4 codec), or "uncompressed" —
@@ -326,6 +339,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
 
         var qa: engine.QueryArgs = .{
             .inputs = req.inputs,
+            .plan_source = if (decoded_plan) |*plan| engine.syntax_plan.source(plan) else null,
             .parallelism = req.parallelism,
             .filter = req.filter,
             .output = req.output_url,
@@ -360,6 +374,25 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
         const on_lambda = zpq.core.system.onLambda(env);
         const default_cap = if (on_lambda) lambda_result_cap else @max(budget, default_result_floor);
         const result_cap: ResultCap = .{ .bytes = if (columns != null) std.math.maxInt(usize) / 3 else req.max_result_bytes orelse default_cap, .lambda = on_lambda };
+        if (req.operation == .prepare_aggregate) {
+            var arena_state = std.heap.ArenaAllocator.init(allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var inputs: std.ArrayList([]const u8) = .empty;
+            for (qa.inputs) |pattern| try inputs.appendSlice(arena, try zpq.frontend.expandGlob(arena, io, pattern, env));
+            qa.inputs = inputs.items;
+            var registry = persistentPoolAdapter(pool);
+            var diag: Diag = .{};
+            qa.diag = &diag;
+            return engine.fanout_plan.prepare(.{
+                .gpa = allocator,
+                .env = env,
+                .io = io,
+                .pool_registry = &registry,
+                .meta_cache = pool.metaCache(),
+                .worker_io = pool.worker_io,
+            }, qa, result_cap.bytes, request.plan_version) catch |err| return engineError(allocator, err, &diag);
+        }
         if (req.sql) |sql| {
             const response = try runSql(io, allocator, env, pool, qa, sql, result_cap);
             const p = profiler orelse return response;
@@ -367,7 +400,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
         }
 
         // or group-by wins, then write, then the legacy single-file diagnostics.
-        if (qa.aggregate != null or qa.group_by != null) {
+        if (qa.kind() != .rows) {
             const response = try runAggregate(io, allocator, env, pool, qa, result_cap);
             const p = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
@@ -586,7 +619,7 @@ fn executeSql(
         .worker_io = pool.worker_io,
     };
     if (qa.columnar_sink != null) {
-        if (qa.aggregate != null or qa.group_by != null) {
+        if (qa.kind() != .rows) {
             var result = try engine.runQuery(ctx, qa);
             defer result.deinit(allocator);
         } else {
@@ -602,7 +635,7 @@ fn executeSql(
     var rows: JsonQuoting = .init(&out.writer, &quote_buf);
     var decimal: engine.DecimalColumns = .{ .gpa = allocator };
     defer decimal.deinit();
-    if (qa.aggregate != null or qa.group_by != null) {
+    if (qa.kind() != .rows) {
         qa.text_output = .{ .format = .jsonl, .sink = &rows.writer };
         var result = try engine.runQuery(ctx, qa);
         defer result.deinit(allocator);

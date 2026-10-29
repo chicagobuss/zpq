@@ -159,9 +159,9 @@ class Fanout(unittest.TestCase):
                 req["filter"] = flt
             one, _ = self.rt.invoke(req)
             self.assertIn("agg", one, one)
-            names = [n for _, n in fanout.parse_group_by(group)]
+            names = {None: [], "b": ["b"], "b AS bucket": ["bucket"], "k": ["k"], "k AS key": ["key"]}[group]
             where = f" WHERE {flt}" if flt else ""
-            groups = f" GROUP BY {', '.join(e for e, _ in fanout.parse_group_by(group))}" if group else ""
+            groups = " GROUP BY ALL" if group else ""
             files = ", ".join(f"'{f}'" for f in inputs)
             ref = duckdb(f"SELECT {', '.join(filter(None, [group, agg]))} FROM read_parquet([{files}]){where}{groups}")
             for workers in (1, 3, 8, 64):
@@ -180,8 +180,9 @@ class Fanout(unittest.TestCase):
                         self.assertTrue(same(got["agg"], ref[0]), (got["agg"], ref[0]))
 
     def test_an_empty_range_merges_as_no_rows(self):
-        aggs = fanout.parse_aggregate(UNGROUPED_AGG)
-        base = {"inputs": [FULL], "aggregate": ", ".join(f"{w} AS _a{j}" for j, (_, w, _) in enumerate(aggs))}
+        prepared = fanout.prepare(self.rt.invoke, {"inputs": [FULL], "aggregate": UNGROUPED_AGG})
+        aggs = [(a["function"], None, a["name"]) for a in prepared["aggregates"]]
+        base = {"inputs": [FULL], "plan_version": 1, "plan": prepared["plan"]}
         empty, _ = self.rt.invoke(dict(base, row_groups=[[5, 5]]))
         whole, _ = self.rt.invoke(base)
         self.assertEqual(empty["agg"]["_a0"], 0)
@@ -199,24 +200,85 @@ class Fanout(unittest.TestCase):
         self.assertEqual([r["k"] for r in got["agg"]], [r["k"] for r in ref])
         self.assertTrue(all(same(g, d) for g, d in zip(got["agg"], ref)))
 
+    def test_quoted_names_and_filter_literals_are_data_in_partial_requests(self):
+        requests = []
+
+        def invoke(payload):
+            requests.append(payload)
+            return self.rt.invoke(payload)
+
+        req = {"inputs": [FULL], "aggregate":
+               "count(*) FILTER (WHERE s != 'O''Reilly)') AS \"count value\", avg(x) AS \"average value\"",
+               "group_by": "b AS \"group name\""}
+        one, _ = self.rt.invoke(req)
+        got = fanout.run(invoke, req, 3)
+        self.assertTrue(same(keyed(got["agg"], ["group name"]), keyed(one["agg"], ["group name"])))
+        partials = [p for p in requests if p.get("operation") not in ("capabilities", "prepare_aggregate")]
+        self.assertEqual(len(partials), got["workers"])
+        self.assertTrue(all(p["plan_version"] == 1 and "plan" in p for p in partials))
+        self.assertTrue(all(not any(k in p for k in ("aggregate", "group_by", "filter", "sql")) for p in partials))
+
+    def test_worker_rejects_version_conflicts_and_deep_plans_before_input_io(self):
+        for payload, reason in [
+            ({"inputs": ["missing.parquet"], "plan_version": 2, "plan": {}}, "UnsupportedPlanVersion"),
+            ({"inputs": ["missing.parquet"], "plan": {}}, "UnsupportedPlanVersion"),
+            ({"inputs": ["missing.parquet"], "plan_version": 1, "plan": {}, "aggregate": "count(*)"},
+             "ConflictingPlanFields"),
+        ]:
+            response, _ = self.rt.invoke(payload)
+            self.assertEqual(response.get("reason"), reason, response)
+        deep = None
+        for _ in range(512):
+            deep = [deep]
+        response, _ = self.rt.invoke({"inputs": ["missing.parquet"], "plan_version": 1, "plan": deep})
+        self.assertEqual(response.get("reason"), "PlanTooDeep", response)
+
     def test_a_range_past_the_footer_fails_the_query(self):
         with self.assertRaisesRegex(fanout.WorkerFailed, "RowGroupOutOfRange"):
             fanout.run(self.rt.invoke, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4, counts=[9])
 
 
 class Refusals(unittest.TestCase):
-    def test_unmergeable_shapes_are_refused_before_any_worker_runs(self):
-        def never(_):
-            raise AssertionError("a worker ran")
-        for agg, why in [("count(DISTINCT s) AS d", "DISTINCT"), ("median(x) AS m", "median"),
-                         ("percentile_cont(0.5) WITHIN GROUP (ORDER BY x)", "percentile_cont"),
-                         ("quantile(x, 0.9) AS q", "quantile"), ("sum(x) OVER (PARTITION BY b) AS w", "window"),
-                         ("sum(x) / count(*) AS r", "expression"), ("x AS y", "single aggregate")]:
-            with self.subTest(agg=agg):
-                with self.assertRaisesRegex(fanout.Refused, why):
-                    fanout.run(never, {"inputs": [FULL], "aggregate": agg}, 4, counts=[8])
-        with self.assertRaisesRegex(fanout.Refused, "sql"):
-            fanout.run(never, {"inputs": [FULL], "sql": "SELECT 1"}, 4)
+    def test_unmergeable_shapes_are_refused_before_execution(self):
+        rt = FakeRuntime(processes=1)
+        requests = []
+
+        def invoke(payload):
+            requests.append(payload)
+            return rt.invoke(payload)
+
+        try:
+            for agg in ["count(DISTINCT s) AS d", "median(x) AS m", "quantile(x, 0.9) AS q",
+                        "sum(x) OVER (PARTITION BY b) AS w", "sum(x) / count(*) AS r", "x AS y"]:
+                with self.subTest(agg=agg), self.assertRaises(fanout.Refused):
+                    fanout.run(invoke, {"inputs": [FULL], "aggregate": agg}, 4, counts=[8])
+            self.assertTrue(all(p.get("operation") in ("capabilities", "prepare_aggregate") for p in requests))
+        finally:
+            rt.close()
+
+    def test_old_worker_cannot_acknowledge_unknown_fields(self):
+        requests = []
+
+        def old_worker(payload):
+            requests.append(payload)
+            return {"error": "bad_json", "reason": "MissingField"}, {}
+
+        with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
+            fanout.run(old_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
+        self.assertEqual(requests, [{"operation": "capabilities"}])
+
+    def test_capability_versions_require_integers(self):
+        for capability in [{"prepare_aggregate_version": True, "structured_plan_versions": [1]},
+                           {"prepare_aggregate_version": 1, "structured_plan_versions": [True]}]:
+            requests = []
+
+            def invoke(payload):
+                requests.append(payload)
+                return capability, {}
+
+            with self.assertRaises(fanout.Refused):
+                fanout.run(invoke, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
+            self.assertEqual(requests, [{"operation": "capabilities"}])
 
     def test_split_is_contiguous_and_even(self):
         self.assertEqual(fanout.split([8], 3), [[(0, 0, 2)], [(0, 2, 5)], [(0, 5, 8)]])

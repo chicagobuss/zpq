@@ -291,6 +291,53 @@ test "syntax: SQL hands the engine owned nodes and separate aliases and output s
     }
 }
 
+test "syntax: native fanout preparation and structured workers share exact aggregate semantics" {
+    const a = std.testing.allocator;
+    const ctx: types.Context = .{ .gpa = a, .env = .empty, .io = std.testing.io };
+    const prepared = try @import("fanout_plan.zig").prepare(ctx, .{
+        .inputs = &.{fixture},
+        .parallelism = 1,
+        .aggregate = "sum(n) AS \"a b\", avg(x) AS a, count(*) AS c",
+        .group_by = "b AS k",
+        .filter = "s != 'O''Reilly'",
+    }, 1 << 20, 1);
+    defer a.free(prepared);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, prepared, .{});
+    defer parsed.deinit();
+    const value = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 8), value.get("row_group_counts").?.array.items[0].integer);
+    try std.testing.expectEqualStrings("a b", value.get("aggregates").?.array.items[0].object.get("name").?.string);
+    const payload = try std.json.Stringify.valueAlloc(a, .{
+        .plan_version = 1,
+        .plan = value.get("plan").?,
+        .inputs = &.{fixture},
+        .row_groups = &.{[2]u32{ 0, 8 }},
+    }, .{});
+    defer a.free(payload);
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    const worker_value = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer worker_value.deinit();
+    const query = try @import("fanout_plan.zig").decode(state.allocator(), worker_value.value.object.get("plan").?);
+    var result = try aggregate.runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .parallelism = 1,
+        .row_groups = &.{[2]u32{ 0, 8 }},
+        .plan_source = @import("syntax_plan.zig").source(&query),
+    });
+    defer result.deinit(a);
+    var buf: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try @import("text.zig").writeAggregateJsonValue(&writer, result.aggregate.output, result.aggregate.text_kinds, result.aggregate.output.rowCount());
+    const answer = try std.json.parseFromSlice(std.json.Value, a, writer.buffered(), .{});
+    defer answer.deinit();
+    const rows = answer.value.array.items;
+    try std.testing.expect(rows.len > 0);
+    try std.testing.expect(rows[0].object.contains("_g0"));
+    try std.testing.expect(rows[0].object.get("_a1").?.object.contains("sum"));
+    try std.testing.expect(rows[0].object.get("_a1").?.object.contains("count"));
+}
+
 test "syntax: SQL result storage survives releasing the frontend syntax owner" {
     const sql = @import("../core/expr/sql_parser.zig");
     if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
@@ -330,6 +377,20 @@ test "syntax: SQL flat predicate chains retain their length without consuming gr
     var got = try aggregate.runQuery(ctx, .{ .inputs = &.{fixture}, .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?), .parallelism = 1 });
     defer got.deinit(a);
     try std.testing.expectEqual(expected.aggregate.output.aggs[0].value.i, got.aggregate.output.aggs[0].value.i);
+}
+
+test "syntax: deeply nested worker JSON refuses before typed recursive decoding" {
+    const a = std.testing.allocator;
+    var json: std.Io.Writer.Allocating = .init(a);
+    defer json.deinit();
+    for (0..1024) |_| try json.writer.writeByte('[');
+    try json.writer.writeAll("null");
+    for (0..1024) |_| try json.writer.writeByte(']');
+    const value = try std.json.parseFromSlice(std.json.Value, a, json.written(), .{});
+    defer value.deinit();
+    var state = std.heap.ArenaAllocator.init(a);
+    defer state.deinit();
+    try std.testing.expectError(error.PlanTooDeep, @import("fanout_plan.zig").decode(state.allocator(), value.value));
 }
 
 test "syntax: unsupported SQL modifiers and casts retain refusal instead of dropping clauses" {

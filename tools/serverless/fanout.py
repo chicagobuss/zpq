@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Fan one zpq aggregate out over N zpq-lambda workers and merge their answers.
 
-The coordinator reads each input's row-group count from its footer (a `count(*)` request per input, answered from
-the footer), cuts the row groups of all inputs into N contiguous runs, sends each run to a worker as a request with
-`row_groups` (docs/lambda_requests.md), and merges the partial answers: COUNT and SUM add, MIN and MAX fold, AVG is
-asked of the workers as `avg_state` and divided after the merge. With `group_by` the merge is per group. ORDER BY and
+The coordinator negotiates structured-plan v1 support, then asks the native frontend to prepare the original
+aggregate request and read input row-group counts. It cuts those row groups into N contiguous runs and forwards
+the prepared syntax and `row_groups` (docs/lambda_requests.md). COUNT and SUM add, MIN and MAX fold, and explicit
+AVG partial states are divided after the merge. With `group_by` the merge is per group. ORDER BY and
 LIMIT apply to the merged rows, never to a worker's. Anything whose parts cannot be merged (COUNT(DISTINCT),
-percentiles and other holistic aggregates, window functions, expressions over aggregates) is refused before any
-worker runs.
+percentiles and other holistic aggregates, window functions, expressions over aggregates) is refused during native preparation, before any partial-query execution.
 
     fanout.py --function zpq-worker --workers 32 --input s3://b/lineitem/ --aggregate "sum(x) AS s" ...
 
@@ -23,6 +22,7 @@ import re
 import sys
 import time
 
+PLAN_VERSION = 1
 MERGEABLE = ("count", "sum", "min", "max", "avg")
 REPORT_RE = re.compile(r"Duration: ([\d.]+) ms\s+Billed Duration: (\d+) ms\s+Memory Size: (\d+) MB\s+"
                        r"Max Memory Used: (\d+) MB(?:\s+Init Duration: ([\d.]+) ms)?")
@@ -36,7 +36,7 @@ class WorkerFailed(RuntimeError):
     """A worker answered an error; the merged answer would be incomplete."""
 
 
-# ---- Parsing the request's aggregate and group_by lists ----
+# ---- Coordinator output-order option (never sent to a worker as SQL) ----
 
 def split_top(text):
     """Split at commas outside parentheses and quotes."""
@@ -55,48 +55,6 @@ def split_top(text):
             start = i + 1
     parts.append(text[start:].strip())
     return [p for p in parts if p]
-
-
-ALIAS_RE = re.compile(r'^(.*?)\s+AS\s+("[^"]+"|\w+)\s*$', re.I | re.S)
-
-
-def split_alias(item):
-    m = ALIAS_RE.match(item)
-    return (m.group(1).strip(), m.group(2).strip('"')) if m else (item.strip(), None)
-
-
-def parse_aggregate(text):
-    """[(kind, worker expression, output name)] for each item of an `aggregate` list, or Refused."""
-    out = []
-    for item in split_top(text):
-        expr, alias = split_alias(item)
-        m = re.match(r"(\w+)\s*\(", expr)
-        if not m:
-            raise Refused(f"{item!r}: not a single aggregate call; only {', '.join(MERGEABLE)} merge")
-        fn = m.group(1).lower()
-        depth, end = 0, None
-        for i in range(m.end() - 1, len(expr)):
-            depth += {"(": 1, ")": -1}.get(expr[i], 0)
-            if depth == 0:
-                end = i
-                break
-        args, rest = expr[m.end():end].strip(), expr[end + 1:].strip()
-        if re.match(r"OVER\b", rest, re.I):
-            raise Refused(f"{item!r}: window functions do not merge across workers")
-        if rest and not re.match(r"FILTER\s*\(\s*WHERE\b.*\)$", rest, re.I | re.S):
-            raise Refused(f"{item!r}: an expression over an aggregate does not merge; ask for the aggregate alone")
-        if re.match(r"DISTINCT\b", args, re.I):
-            raise Refused(f"{item!r}: {fn}(DISTINCT ...) does not merge across workers (one value may sit in two)")
-        if fn not in MERGEABLE:
-            raise Refused(f"{item!r}: {fn} does not merge across workers; only {', '.join(MERGEABLE)} do")
-        worker = f"avg_state({args}){(' ' + rest) if rest else ''}" if fn == "avg" else expr
-        out.append((fn, worker, alias or expr))
-    return out
-
-
-def parse_group_by(text):
-    """[(expression, output name)] for each item of a `group_by` list."""
-    return [(e, a or e) for e, a in map(split_alias, split_top(text or ""))]
 
 
 # ---- Splitting row groups over workers ----
@@ -216,32 +174,42 @@ def scatter(invoke, payloads):
     return out, (time.perf_counter() - t0) * 1000
 
 
-def row_group_counts(invoke, inputs, base):
-    probe = {k: v for k, v in base.items() if k not in ("filter", "group_by", "aggregate")}
-    out, _ = scatter(invoke, [dict(probe, inputs=[u], aggregate="count(*) AS n") for u in inputs])
-    return [resp["row_groups_in"] for resp, _ in out]
+def prepare(invoke, request):
+    """Require an exact native capability acknowledgement before sending inputs for preparation or execution."""
+    cap, _ = invoke({"operation": "capabilities"})
+    if (not isinstance(cap, dict) or type(cap.get("prepare_aggregate_version")) is not int
+            or cap["prepare_aggregate_version"] != PLAN_VERSION or not isinstance(cap.get("structured_plan_versions"), list)
+            or not any(type(v) is int and v == PLAN_VERSION for v in cap["structured_plan_versions"])):
+        raise Refused("worker lacks structured aggregate plan v1; update the worker before using this coordinator")
+    prepared, _ = invoke(dict(request, operation="prepare_aggregate", plan_version=PLAN_VERSION))
+    if not isinstance(prepared, dict) or prepared.get("plan_version") != PLAN_VERSION or "plan" not in prepared:
+        raise Refused(f"native aggregate preparation refused: {dumps(prepared)[:600]}")
+    return prepared
 
 
 def run(invoke, request, workers, order_by=None, limit=None, counts=None):
     """Answer `request` (a worker request with `inputs` and `aggregate`, optionally `group_by` and `filter`) over
-    `workers` workers. `counts` (row groups per input) skips reading the footers."""
+    `workers` workers. Optional `counts` overrides scheduling counts; native preparation still validates footers."""
     t0 = time.perf_counter()
     if request.get("sql") or request.get("row_groups"):
         raise Refused("the coordinator takes `aggregate`/`group_by` requests, not `sql` or `row_groups`")
-    aggs = parse_aggregate(request.get("aggregate") or "")
-    if not aggs:
+    if not isinstance(request.get("aggregate"), str) or not request["aggregate"].strip():
         raise Refused("nothing to merge: the request has no `aggregate`")
-    group = parse_group_by(request.get("group_by"))
-    inputs = request["inputs"]
+    prepared = prepare(invoke, request)
+    aggs = [(a["function"], None, a["name"]) for a in prepared["aggregates"]]
+    if any(fn not in MERGEABLE for fn, _, _ in aggs):
+        raise Refused("native preparation returned an unsupported merge operation")
+    group = [(None, name) for name in prepared["groups"]]
+    inputs = prepared["inputs"]
     if counts is None:
-        counts = row_group_counts(invoke, inputs, request)
+        counts = prepared["row_group_counts"]
     elif len(counts) != len(inputs):
         raise ValueError(f"{len(counts)} row-group counts for {len(inputs)} inputs")
     footer_ms = (time.perf_counter() - t0) * 1000
 
-    base = dict(request, aggregate=", ".join(f"{w} AS _a{j}" for j, (_, w, _) in enumerate(aggs)))
-    if group:
-        base["group_by"] = ", ".join(f"{e} AS _g{j}" for j, (e, _) in enumerate(group))
+    base = {k: v for k, v in request.items() if k not in
+            ("aggregate", "group_by", "filter", "sql", "operation", "plan_version", "plan")}
+    base.update(inputs=inputs, plan_version=PLAN_VERSION, plan=prepared["plan"])
     runs = split(counts, workers)
     payloads = [dict(base, inputs=[inputs[i] for i, _, _ in r], row_groups=[[s, e] for _, s, e in r]) for r in runs]
     if not payloads:  # no row groups anywhere: one worker answers the empty table

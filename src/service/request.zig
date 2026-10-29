@@ -5,17 +5,25 @@
 
 const std = @import("std");
 
+pub const plan_version = 1;
+pub const Operation = enum { query, capabilities, prepare_aggregate };
+
 pub const Error = error{
     /// A known field holds the wrong JSON type; `Request.parse` names it.
     BadFieldType,
     /// None of `inputs`, `s3_url` or `sql`.
     MissingField,
     ConflictingSqlFields,
+    UnsupportedPlanVersion,
+    ConflictingPlanFields,
 } || std.json.ParseError(std.json.Scanner) || std.mem.Allocator.Error;
 
 /// The fields the handler reads, each kept as a JSON value until checked so a wrong type can be named. JSON null
 /// parses as absent.
 const Wire = struct {
+    operation: ?std.json.Value = null,
+    plan_version: ?std.json.Value = null,
+    plan: ?std.json.Value = null,
     sql: ?std.json.Value = null,
     parallelism: ?std.json.Value = null,
     inputs: ?std.json.Value = null,
@@ -48,6 +56,8 @@ const Wire = struct {
 };
 
 pub const Request = struct {
+    operation: Operation = .query,
+    plan: ?std.json.Value = null,
     parsed: std.json.Parsed(Wire),
     sql: ?[]const u8 = null,
     parallelism: usize = 0,
@@ -107,6 +117,18 @@ pub const Request = struct {
         const f: Fields = .{ .wire = &parsed.value, .bad_field = bad_field };
 
         var req: Request = .{ .parsed = parsed, .inputs = &.{} };
+        if (try f.string("operation")) |op|
+            req.operation = std.meta.stringToEnum(Operation, op) orelse return f.bad("operation");
+        if (parsed.value.plan_version) |v| {
+            if (v != .integer or v.integer != plan_version) return error.UnsupportedPlanVersion;
+        } else if (req.operation == .prepare_aggregate or parsed.value.plan != null) return error.UnsupportedPlanVersion;
+        if (parsed.value.plan) |v| if (v != .null) {
+            inline for (.{ "sql", "filter", "select", "aggregate", "group_by", "columns", "column_order" }) |name| {
+                if (@field(parsed.value, name)) |field| if (field != .null) return error.ConflictingPlanFields;
+            }
+            if (req.operation != .query) return error.ConflictingPlanFields;
+            req.plan = v;
+        };
         req.sql = try f.string("sql");
         if (req.sql != null) {
             inline for (.{
@@ -145,7 +167,7 @@ pub const Request = struct {
             const one = try arena.alloc([]const u8, 1);
             one[0] = url;
             req.inputs = one;
-        } else if (req.sql == null) return error.MissingField;
+        } else if (req.sql == null and req.operation != .capabilities) return error.MissingField;
         if (try f.strings(arena, "columns", true)) |cols| {
             if (cols.len > 0) req.columns = cols;
         }
@@ -236,6 +258,12 @@ pub const Request = struct {
             .integer => |n| if (n >= 0) @intCast(n) else return f.bad("budget_wait_ms"),
             else => return f.bad("budget_wait_ms"),
         };
+        if (req.operation == .capabilities) {
+            if (req.inputs.len != 0 or req.sql != null or req.aggregate != null or req.group_by != null or
+                req.filter != null or req.output_url != null or req.plan != null) return error.ConflictingPlanFields;
+        }
+        if (req.operation == .prepare_aggregate and (req.sql != null or req.select != null or req.columns != null or
+            req.column_order != null or req.output_url != null or req.row_groups != null)) return error.ConflictingPlanFields;
         return req;
     }
 
@@ -588,4 +616,17 @@ test "parquet version request parses values and rejects wrong types" {
         \\{"inputs":["a.parquet"],"parquet_version":1}
     , &bad));
     try std.testing.expectEqualStrings("parquet_version", bad);
+}
+
+test "syntax: worker negotiation and plan version fail closed" {
+    const a = std.testing.allocator;
+    var field: []const u8 = "";
+    var capabilities = try Request.parse(a, "{\"operation\":\"capabilities\"}", &field);
+    defer capabilities.deinit();
+    try std.testing.expectEqual(Operation.capabilities, capabilities.operation);
+    try std.testing.expectEqual(@as(usize, 0), capabilities.inputs.len);
+    try std.testing.expectError(error.UnsupportedPlanVersion, Request.parse(a, "{\"inputs\":[\"x\"],\"plan_version\":2,\"plan\":{}}", &field));
+    try std.testing.expectError(error.UnsupportedPlanVersion, Request.parse(a, "{\"inputs\":[\"x\"],\"plan\":{}}", &field));
+    try std.testing.expectError(error.ConflictingPlanFields, Request.parse(a, "{\"inputs\":[\"x\"],\"plan_version\":1,\"plan\":{},\"aggregate\":\"count(*)\"}", &field));
+    try std.testing.expectError(error.ConflictingPlanFields, Request.parse(a, "{\"operation\":\"capabilities\",\"inputs\":[\"x\"]}", &field));
 }

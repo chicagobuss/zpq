@@ -22,6 +22,7 @@ const metadata = @import("../core/parquet/metadata.zig");
 const statistics = @import("../core/parquet/statistics.zig");
 const consumer = @import("../core/consumer.zig");
 const scan = @import("../core/scan.zig");
+const top_n = @import("../core/scan/top_n.zig");
 const core_memory = @import("../core/memory.zig");
 const filter_ast = @import("../core/filter/ast.zig");
 
@@ -255,24 +256,28 @@ pub const TopRows = struct {
             // that improves on every row (descending, for an ascending key) holds one copy per kept row, not per row.
             var cells: []SortCell = &.{};
             var caps: []usize = &.{};
-            if (self.heap.count() == self.h) {
-                const top = self.heap.peek().?;
-                if (!before(self.keys, scratch, pos, top.cells, top.pos)) continue;
-                const out = self.heap.pop().?;
-                cells = out.cells;
-                const fresh_caps = out.caps.len != cells.len;
-                caps = if (fresh_caps) try sa.alloc(usize, cells.len) else out.caps;
-                for (scratch, cells, caps) |c, *d, *cap| {
-                    if (fresh_caps) cap.* = if (d.* == .str) d.str.len else 0;
-                    d.* = try reuseCell(sa, d.*, cap, c);
-                }
-            } else {
-                cells = try sa.alloc(SortCell, self.keys.len);
-                caps = try sa.alloc(usize, self.keys.len);
-                for (scratch, cells, caps) |c, *d, *cap| {
-                    d.* = try ownCell(sa, c);
-                    cap.* = if (c == .str) c.str.len else 0;
-                }
+            const relation: std.math.Order = if (self.heap.count() == self.h and
+                before(self.keys, scratch, pos, self.heap.peek().?.cells, self.heap.peek().?.pos)) .gt else .eq;
+            switch (top_n.admission(self.h, self.heap.count(), relation)) {
+                .skip => continue,
+                .replace => {
+                    const out = self.heap.pop().?;
+                    cells = out.cells;
+                    const fresh_caps = out.caps.len != cells.len;
+                    caps = if (fresh_caps) try sa.alloc(usize, cells.len) else out.caps;
+                    for (scratch, cells, caps) |c, *d, *cap| {
+                        if (fresh_caps) cap.* = if (d.* == .str) d.str.len else 0;
+                        d.* = try reuseCell(sa, d.*, cap, c);
+                    }
+                },
+                .append => {
+                    cells = try sa.alloc(SortCell, self.keys.len);
+                    caps = try sa.alloc(usize, self.keys.len);
+                    for (scratch, cells, caps) |c, *d, *cap| {
+                        d.* = try ownCell(sa, c);
+                        cap.* = if (c == .str) c.str.len else 0;
+                    }
+                },
             }
             try self.heap.push(self.mem.allocator(), .{ .cells = cells, .pos = pos, .row = pending, .caps = caps });
             admitted = true;
@@ -913,10 +918,12 @@ const RankWorker = struct {
                 for (s.keys, keyed.cols, scratch) |k, buf, *cell| cell.* = sortCell(buf, at, k.unsigned);
                 if (w.cut) |c| if (sortsAfter(s.keys[0], scratch[0], c)) continue;
                 const pos: RowPos = .{ .file = item.file, .rg = item.rg, .ord = @intCast(wi * 64 + @ctz(bits)) };
-                if (w.heap.count() == s.h) {
-                    const top = w.heap.peek().?;
-                    if (!TopRows.before(s.keys, scratch, pos, top.cells, top.pos)) continue;
-                    w.free(w.heap.pop().?);
+                const relation: std.math.Order = if (s.h != 0 and w.heap.count() == s.h and
+                    TopRows.before(s.keys, scratch, pos, w.heap.peek().?.cells, w.heap.peek().?.pos)) .gt else .eq;
+                switch (top_n.admission(s.h, w.heap.count(), relation)) {
+                    .skip => continue,
+                    .replace => w.free(w.heap.pop().?),
+                    .append => {},
                 }
                 try w.admit(scratch, pos);
             }

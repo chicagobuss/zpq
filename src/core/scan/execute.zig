@@ -632,6 +632,156 @@ fn buildWorkPhase(
     };
 }
 
+const EarlyOwnerPhase = struct {
+    answer: ?MultiAggResult = null,
+    string_path: ?RecordAdmission = null,
+    pair_path: ?RecordAdmission = null,
+    integer_needs_union: bool = false,
+};
+
+fn tryEarlyOwners(
+    comptime explain: bool,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: *MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work_items: []const WorkItem,
+    agg_calls: []const expr_agg.AggCall,
+    group_by_keys: ?[]const expr_ast.Expr,
+    group_outputs: ?[]const BoundOutputColumn,
+    n_workers: usize,
+    t: Timings,
+) !EarlyOwnerPhase {
+    var string_record_path: ?RecordAdmission = null;
+    if (explain) {
+        string_record_path = try inlineSharedStrings(
+            gpa,
+            arena,
+            args.*,
+            metas,
+            plan,
+            work_items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            true,
+        );
+    } else if (try inlineSharedStrings(
+        gpa,
+        arena,
+        args.*,
+        metas,
+        plan,
+        work_items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return .{ .answer = result };
+
+    if (!explain) if (try inlineDistinctAnswer(
+        gpa,
+        arena,
+        args.*,
+        metas,
+        plan,
+        work_items,
+        agg_calls,
+        n_workers,
+        t,
+        false,
+    )) |result| return .{ .answer = result };
+
+    var pair_record_path: ?RecordAdmission = null;
+    if (explain) {
+        pair_record_path = try inlinePairAnswer(
+            gpa,
+            arena,
+            args.*,
+            metas,
+            plan,
+            work_items,
+            agg_calls,
+            group_by_keys,
+            group_outputs,
+            n_workers,
+            t,
+            true,
+        );
+    } else if (try inlinePairAnswer(
+        gpa,
+        arena,
+        args.*,
+        metas,
+        plan,
+        work_items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return .{ .answer = result };
+
+    var integer_needs_union = false;
+    if (!explain) if (try inlineIntegerAnswer(
+        gpa,
+        arena,
+        args,
+        metas,
+        plan,
+        work_items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        .{ .pending = &integer_needs_union },
+        false,
+    )) |result| return .{ .answer = result };
+
+    if (!explain) if (try inlineByteTopAnswer(
+        gpa,
+        arena,
+        args.*,
+        metas,
+        plan,
+        work_items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return .{ .answer = result };
+
+    if (!explain) if (try inlineByteAnswer(
+        gpa,
+        arena,
+        args.*,
+        metas,
+        plan,
+        work_items,
+        agg_calls,
+        group_by_keys,
+        group_outputs,
+        n_workers,
+        t,
+        false,
+    )) |result| return .{ .answer = result };
+
+    return .{
+        .string_path = string_record_path,
+        .pair_path = pair_record_path,
+        .integer_needs_union = integer_needs_union,
+    };
+}
+
 fn prepareAggregateWithMetas(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -694,127 +844,11 @@ fn prepareAggregateWithMetas(
     var n_workers = work_phase.workers;
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
-    var string_record_path: ?RecordAdmission = null;
-    if (explain) {
-        string_record_path = try inlineSharedStrings(
-            gpa,
-            arena,
-            args,
-            metas,
-            &plan,
-            work_items.items,
-            agg_calls,
-            group_by_keys,
-            group_outputs,
-            n_workers,
-            t,
-            true,
-        );
-    } else if (try inlineSharedStrings(
-        gpa,
-        arena,
-        args,
-        metas,
-        &plan,
-        work_items.items,
-        agg_calls,
-        group_by_keys,
-        group_outputs,
-        n_workers,
-        t,
-        false,
-    )) |result| return result;
-
-    if (!explain) if (try inlineDistinctAnswer(
-        gpa,
-        arena,
-        args,
-        metas,
-        &plan,
-        work_items.items,
-        agg_calls,
-        n_workers,
-        t,
-        false,
-    )) |result| return result;
-
-    var pair_record_path: ?RecordAdmission = null;
-    if (explain) {
-        pair_record_path = try inlinePairAnswer(
-            gpa,
-            arena,
-            args,
-            metas,
-            &plan,
-            work_items.items,
-            agg_calls,
-            group_by_keys,
-            group_outputs,
-            n_workers,
-            t,
-            true,
-        );
-    } else if (try inlinePairAnswer(
-        gpa,
-        arena,
-        args,
-        metas,
-        &plan,
-        work_items.items,
-        agg_calls,
-        group_by_keys,
-        group_outputs,
-        n_workers,
-        t,
-        false,
-    )) |result| return result;
-
-    var integer_needs_union = false;
-    if (!explain) if (try inlineIntegerAnswer(
-        gpa,
-        arena,
-        &args,
-        metas,
-        &plan,
-        work_items.items,
-        agg_calls,
-        group_by_keys,
-        group_outputs,
-        n_workers,
-        t,
-        .{ .pending = &integer_needs_union },
-        false,
-    )) |result| return result;
-
-    if (!explain) if (try inlineByteTopAnswer(
-        gpa,
-        arena,
-        args,
-        metas,
-        &plan,
-        work_items.items,
-        agg_calls,
-        group_by_keys,
-        group_outputs,
-        n_workers,
-        t,
-        false,
-    )) |result| return result;
-
-    if (!explain) if (try inlineByteAnswer(
-        gpa,
-        arena,
-        args,
-        metas,
-        &plan,
-        work_items.items,
-        agg_calls,
-        group_by_keys,
-        group_outputs,
-        n_workers,
-        t,
-        false,
-    )) |result| return result;
+    const early = try tryEarlyOwners(explain, gpa, arena, &args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t);
+    if (!explain) if (early.answer) |result| return result;
+    const string_record_path = early.string_path;
+    const pair_record_path = early.pair_path;
+    const integer_needs_union = early.integer_needs_union;
 
     var plan_inputs: PlanInputs = .{
         .args = args,

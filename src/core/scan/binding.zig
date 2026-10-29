@@ -253,24 +253,31 @@ pub const CutShape = enum { none, count, count_distinct, first_keys };
 pub fn cutShape(arena: std.mem.Allocator, meta: *const schema.FileMetaData, args: MultiAggArgs) CutShape {
     const order = args.result_order;
     const limit = order.limit orelse return .none;
-    const gb = args.group_by orelse return .none;
+    if (args.bound_aggregate) |bound| {
+        if (bound.keys == null) return .none;
+    } else if (args.group_by == null) return .none;
     if (order.keys.len == 0) return if (order.offset +| limit > 0) .first_keys else .none;
     if (!order.keys[0].descending) return .none;
-    return countFirst(arena, meta, args, gb) catch .none;
+    return countFirst(arena, meta, args) catch .none;
 }
 
-fn countFirst(arena: std.mem.Allocator, meta: *const schema.FileMetaData, args: MultiAggArgs, gb: []const u8) !CutShape {
+fn countFirst(arena: std.mem.Allocator, meta: *const schema.FileMetaData, args: MultiAggArgs) !CutShape {
+    if (args.bound_aggregate) |bound| return firstAggregateCut(bound.calls, bound.outputs orelse return .none, args);
     const calls: []expr_agg.AggCall = if (args.aggregate.len == 0)
         &.{}
     else
         try expr_parser.parseAggList(arena, args.aggregate, meta, null);
-    const items = try expr_parser.parseGroupByOf(arena, gb, meta, null, args.select_cols orelse &.{});
+    const items = try expr_parser.parseGroupByOf(arena, args.group_by.?, meta, null, args.select_cols orelse &.{});
     var keys = try KeyNames.init(arena, meta, items);
     keys.sql = sqlBound(args.select_cols);
     try nameUnaliasedAggs(arena, calls, &keys);
     var quiet = args;
     quiet.diag = null;
     const outputs = try bindGroupOutputs(arena, &keys, calls, meta, quiet);
+    return firstAggregateCut(calls, outputs, args);
+}
+
+fn firstAggregateCut(calls: []const expr_agg.AggCall, outputs: []const BoundOutputColumn, args: MultiAggArgs) CutShape {
     const first = args.result_order.keys[0].column;
     if (first >= outputs.len) return .none;
     return switch (outputs[first].source) {
@@ -515,3 +522,31 @@ test "dependent group keys: allocation failures and original projection ranks" {
     try testing.checkAllAllocationFailures(testing.allocator, Check.run, .{ &keys, &outputs });
 }
 
+test "bound plans steer the read cut without aggregate or group SQL" {
+    const bytes = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
+    defer testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const meta = try metadata.open(a, bytes);
+    const calls = try expr_parser.parseAggList(a, "count(*) AS n", &meta, null);
+    var bound: scan_types.BoundAggregate = .{
+        .calls = calls,
+        .keys = &.{},
+        .outputs = &.{.{ .source = .{ .agg = 0 }, .name = "n" }},
+        .filter = null,
+    };
+    var args: MultiAggArgs = .{
+        .inputs = &.{},
+        .aggregate = "this must never be parsed",
+        .bound_aggregate = &bound,
+        .result_order = .{ .keys = &.{.{ .column = 0, .descending = true }}, .limit = 2 },
+    };
+    try testing.expectEqual(CutShape.count, cutShape(a, &meta, args));
+    bound.keys = null;
+    try testing.expectEqual(CutShape.none, cutShape(a, &meta, args));
+    args.result_order.keys = &.{};
+    try testing.expectEqual(CutShape.none, cutShape(a, &meta, args));
+    bound.keys = &.{};
+    try testing.expectEqual(CutShape.first_keys, cutShape(a, &meta, args));
+}

@@ -464,7 +464,8 @@ fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *cons
         &.{}
     else
         try expr_parser.parseAggList(arena, args.aggregate, meta0, args.diag);
-    if (agg_calls.len == 0 and args.group_by == null) return error.EmptyAggregate;
+    const grouped = if (args.bound_aggregate) |bound| bound.keys != null else args.group_by != null;
+    if (agg_calls.len == 0 and !grouped) return error.EmptyAggregate;
 
     var filter_opt: ?filter_ast.Filter = if (args.bound_aggregate) |bound| bound.filter else null;
     if (args.bound_aggregate == null) if (args.filter) |expr_str| {
@@ -1055,7 +1056,7 @@ fn prepareAggregateWithMetas(
             ).total;
             // Uniform bounds can hide skew. Before replacing dense by survivor-sized state, require a proven
             // share or count a sample. A budget retry disables this cost rule and can restore the lanes.
-            if (args.plain_rules and args.filter != null and passShare(plan_inputs) <= selective_share and
+            if (args.plain_rules and filter_opt != null and passShare(plan_inputs) <= selective_share and
                 denseLimit(args, agg_calls, group_outputs) != null and
                 quote > selectedGroupBytes(ndv_stat.?, agg_calls.len, n_workers, passShare(plan_inputs)))
             {
@@ -2725,4 +2726,38 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
         .census_fused = distinct_count != null or (census_allowed and (args.sketch_topk.?.fuse_census orelse keys_unique)),
         .distinct_census = distinct_count != null,
     };
+}
+
+test "bound plans preserve scalar absence and grouped output without query text" {
+    const a = std.testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", a);
+    defer a.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const meta = try metadata.open(ar, bytes);
+    const calls = try expr_parser.parseAggList(ar, "count(*) AS n", &meta, null);
+    var bound: BoundAggregate = .{ .calls = calls, .filter = null };
+    const args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "bound", .bytes = bytes }},
+        .aggregate = "this must never be parsed",
+        .bound_aggregate = &bound,
+        .parallelism = 1,
+    };
+    var scalar = try runMultiAggregate(a, ar, args);
+    defer scalar.deinit(a);
+    try std.testing.expectEqual(meta.num_rows, scalar.output.aggs[0].value.i);
+    try std.testing.expectEqual(@as(?[]const []const AggValue, null), scalar.output.group_rows);
+    const items = try expr_parser.parseGroupByOf(ar, "b", &meta, null, &.{});
+    bound.keys = &.{items[0].expr};
+    bound.outputs = &.{
+        .{ .source = .{ .key = 0 }, .name = "b" },
+        .{ .source = .{ .agg = 0 }, .name = "n" },
+    };
+    var grouped = try runMultiAggregate(a, ar, args);
+    defer grouped.deinit(a);
+    try std.testing.expect(grouped.output.group_rows != null);
+    var count: i128 = 0;
+    for (grouped.output.group_rows.?) |row| count += row[1].i;
+    try std.testing.expectEqual(@as(i128, meta.num_rows), count);
 }

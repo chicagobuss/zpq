@@ -377,10 +377,10 @@ test "owner original ordinals include pruned and empty row groups across files b
     try testing.expectEqual(null, RecordOrdinals.rows(&metas));
 }
 
-
 pub const BoundAggregate = struct {
     calls: []const expr_agg.AggCall,
-    keys: []const expr_ast.Expr,
-    outputs: []const BoundOutputColumn,
+    /// Absent for scalar aggregation; an empty grouped key list is a different plan.
+    keys: ?[]const expr_ast.Expr = null,
+    outputs: ?[]const BoundOutputColumn = null,
     filter: ?filter_ast.Filter,
 };

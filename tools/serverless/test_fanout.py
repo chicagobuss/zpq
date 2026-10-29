@@ -227,6 +227,11 @@ class Fanout(unittest.TestCase):
         ]:
             response, _ = self.rt.invoke(payload)
             self.assertEqual(response.get("reason"), reason, response)
+        legacy, _ = self.rt.invoke({"inputs": [FULL], "aggregate": "count(*) AS n"})
+        null_fields, _ = self.rt.invoke({"inputs": [FULL], "aggregate": "count(*) AS n",
+                                        "operation": None, "plan": None, "plan_version": None})
+        self.assertEqual(legacy.get("agg"), null_fields.get("agg"), null_fields)
+        self.assertIn("agg", null_fields)
         deep = None
         for _ in range(512):
             deep = [deep]

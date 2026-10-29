@@ -119,9 +119,11 @@ pub const Request = struct {
         var req: Request = .{ .parsed = parsed, .inputs = &.{} };
         if (try f.string("operation")) |op|
             req.operation = std.meta.stringToEnum(Operation, op) orelse return f.bad("operation");
-        if (parsed.value.plan_version) |v| {
+        const has_plan = if (parsed.value.plan) |v| v != .null else false;
+        const version = if (parsed.value.plan_version) |v| (if (v == .null) null else v) else null;
+        if (version) |v| {
             if (v != .integer or v.integer != plan_version) return error.UnsupportedPlanVersion;
-        } else if (req.operation == .prepare_aggregate or parsed.value.plan != null) return error.UnsupportedPlanVersion;
+        } else if (req.operation == .prepare_aggregate or has_plan) return error.UnsupportedPlanVersion;
         if (parsed.value.plan) |v| if (v != .null) {
             inline for (.{ "sql", "filter", "select", "aggregate", "group_by", "columns", "column_order" }) |name| {
                 if (@field(parsed.value, name)) |field| if (field != .null) return error.ConflictingPlanFields;

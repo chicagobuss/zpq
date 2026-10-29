@@ -782,6 +782,129 @@ fn tryEarlyOwners(
     };
 }
 
+const ProbePhase = struct {
+    ndv_stat: ?NdvStat,
+    facts: PlanFacts,
+    planning_released: bool,
+};
+
+fn probeAggregateInputs(
+    comptime explain: bool,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    agg_calls: []const expr_agg.AggCall,
+    group_by_keys: ?[]const expr_ast.Expr,
+    n_workers: usize,
+    plan_inputs: *const PlanInputs,
+    msd_probe: ?u64,
+    domain: *?agg_dense.Domain,
+) !ProbePhase {
+    var planning_released = false;
+    var ndv_stat: ?NdvStat = null;
+    var probe_facts: PlanFacts = .{};
+    var planning_why: ?@FieldType(Planning, "why") = null;
+    if (args.ndv_policy) if (group_by_keys) |keys| {
+        // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
+        const first = planAggregate(plan_inputs.*).dispatch.strategy;
+        const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
+        // A reader's union is read before its scan can start: only where some choice can turn on it (a cut the bound
+        // can drop, the dense fold's domain, count(DISTINCT) pairs). Mapped inputs union as they always have.
+        const union_matters = first == .sketch or want or for (agg_calls) |c| {
+            if (c.func == .count_distinct) break true;
+        } else false;
+        // A global group bound refines nothing for prefix discovery, unless the footers say the codes may resolve few
+        // entries in all: the cost rules may then group plainly (`fewEntries`), and the union decides it.
+        const guess = ndv.footerEntries(metas, keys) orelse std.math.maxInt(u64);
+        const prefix = first == .first_keys and guess > few_entries;
+        const allow_union = args.ndv_union and !prefix and (!plan_inputs.readers or union_matters);
+        planning_why = if (!args.ndv_union)
+            .union_disabled
+        else if (prefix) .prefix_cut else if (!allow_union) .reader_no_choice else null;
+        // Beside a reader the union may be read for the fold alone: then not where the fold would decline it.
+        const fold_only = plan_inputs.readers and first != .sketch and for (agg_calls) |c| {
+            if (c.func == .count_distinct) break false;
+        } else true;
+        const fold: ndv.FoldOnly = if (fold_only) n_workers else null;
+        const ranges = try ndv.probeRanges(arena, metas, keys, args.max_memory, true, allow_union, want, fold);
+        // A reader holds what it probes beside its window, page by page as it reads it: past the cap its inputs plan
+        // from their footers, as they did with no probe. A mapped input reads its dictionaries as it always has.
+        const page = std.heap.pageSize();
+        var probe_bytes: u64 = msd_probe orelse 0;
+        for (ranges) |r| if (args.inputs[r.file].readerBacked()) {
+            probe_bytes +|= std.mem.alignForward(u64, r.end, page) - std.mem.alignBackward(u64, r.start, page);
+        };
+        const probe_ok = probe_bytes <= args.probe_cap orelse ndv.probeCap(args.max_memory);
+        if (plan_inputs.readers) {
+            probe_facts.probe_ranges = ranges.len;
+            probe_facts.probe_bytes = probe_bytes;
+            probe_facts.probe_capped = !probe_ok;
+        }
+        const files = try arena.alloc(ndv.File, args.inputs.len);
+        // Dictionaries are read from a mapped file, or from a reader's buffer once its probe of them is in. Explain
+        // reads a reader's input through its mapping, as the probe would read it. Without either (S3, a probe past
+        // its cap, or a reader no probe was asked of) an input plans from its footer.
+        for (args.inputs, files) |input, *file| {
+            const waits = input.readerBacked() and input.dict_wait != null;
+            const probed = input.readerBacked() and probe_ok and (waits or explain);
+            const bytes = if (waits) input.bytes else input.plan_bytes orelse input.bytes;
+            file.* = .{
+                .bytes = bytes,
+                .local = !std.mem.startsWith(u8, input.name, "s3://") and (input.gate == null or probed) and
+                    (input.logical_size == 0 or input.logical_size == bytes.len),
+                .probed = probed,
+                .wait = if (probed and waits) input.dict_wait else null,
+            };
+        }
+        if (!explain) if (args.dict_probe) |dp| for (ranges) |r| {
+            const in = args.inputs[r.file];
+            if (in.gate == null or (in.readerBacked() and probe_ok)) try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
+        };
+        // The reader reads the probes first, then streams row groups into its window while the dictionaries union.
+        if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
+        ndv_stat = try ndv.collectRetaining(
+            gpa,
+            arena,
+            files,
+            metas,
+            keys,
+            n_workers,
+            args.max_memory,
+            true,
+            allow_union,
+            if (want) domain else null,
+            // A prefix plan reads the union only for `fewEntries`: none past its entries, and none past its values.
+            .{ .fold_only = fold_only, .limit = if (first == .first_keys) few_union else null },
+        );
+        if (!explain) if (args.start_reads) |s| if (s.planned) |planned| {
+            planned(s.ctx);
+            planning_released = true;
+        };
+        const st = ndv_stat.?;
+        probe_facts.planning = .{
+            .source = switch (st.source) {
+                .unknown => .footers,
+                .dictionary_headers => .dictionary_headers,
+                .dictionary_union => .dictionary_union,
+            },
+            .why = if (st.union_complete)
+                (if (plan_inputs.readers) .reader_probe else .mapped)
+            else if (planning_why) |w|
+                w
+            else if (plan_inputs.readers and !probe_ok)
+                .probe_capped
+            else if (st.fold_declined)
+                .fold_declines
+            else if (st.union_budget_exceeded)
+                .union_budget
+            else if (st.union_attempted) .union_incomplete else .no_dictionaries,
+        };
+    };
+    if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
+    return .{ .ndv_stat = ndv_stat, .facts = probe_facts, .planning_released = planning_released };
+}
+
 fn prepareAggregateWithMetas(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -866,110 +989,13 @@ fn prepareAggregateWithMetas(
     };
     const msd_candidate = (try inlineMsdAnswer(gpa, arena, args, metas, &plan, work_items.items, agg_calls, group_by_keys, group_outputs, n_workers, t, true)) != null;
     const msd_probe = if (msd_candidate) try msdProbeHeaders(args, metas, work_items.items, group_by_keys.?, explain) else null;
-    var planning_released = false;
-    var ndv_stat: ?NdvStat = null;
-    var probe_facts: PlanFacts = .{};
-    var planning_why: ?@FieldType(Planning, "why") = null;
-    // Freed once the dense tables are built, or as soon as the plan cannot use it.
+    // The retained domain belongs to the outer execution phase, including failures during probing.
     var domain: ?agg_dense.Domain = null;
     defer if (domain) |*d| d.deinit(gpa);
-    if (args.ndv_policy) if (group_by_keys) |keys| {
-        // Prefix discovery takes precedence; refining a global group bound cannot improve that decision.
-        const first = planAggregate(plan_inputs).dispatch.strategy;
-        const want = args.dense and agg_dense.shapeOk(agg_calls, keys);
-        // A reader's union is read before its scan can start: only where some choice can turn on it (a cut the bound
-        // can drop, the dense fold's domain, count(DISTINCT) pairs). Mapped inputs union as they always have.
-        const union_matters = first == .sketch or want or for (agg_calls) |c| {
-            if (c.func == .count_distinct) break true;
-        } else false;
-        // A global group bound refines nothing for prefix discovery, unless the footers say the codes may resolve few
-        // entries in all: the cost rules may then group plainly (`fewEntries`), and the union decides it.
-        const guess = ndv.footerEntries(metas, keys) orelse std.math.maxInt(u64);
-        const prefix = first == .first_keys and guess > few_entries;
-        const allow_union = args.ndv_union and !prefix and (!plan_inputs.readers or union_matters);
-        planning_why = if (!args.ndv_union)
-            .union_disabled
-        else if (prefix) .prefix_cut else if (!allow_union) .reader_no_choice else null;
-        // Beside a reader the union may be read for the fold alone: then not where the fold would decline it.
-        const fold_only = plan_inputs.readers and first != .sketch and for (agg_calls) |c| {
-            if (c.func == .count_distinct) break false;
-        } else true;
-        const fold: ndv.FoldOnly = if (fold_only) n_workers else null;
-        const ranges = try ndv.probeRanges(arena, metas, keys, args.max_memory, true, allow_union, want, fold);
-        // A reader holds what it probes beside its window, page by page as it reads it: past the cap its inputs plan
-        // from their footers, as they did with no probe. A mapped input reads its dictionaries as it always has.
-        const page = std.heap.pageSize();
-        var probe_bytes: u64 = msd_probe orelse 0;
-        for (ranges) |r| if (args.inputs[r.file].readerBacked()) {
-            probe_bytes +|= std.mem.alignForward(u64, r.end, page) - std.mem.alignBackward(u64, r.start, page);
-        };
-        const probe_ok = probe_bytes <= args.probe_cap orelse ndv.probeCap(args.max_memory);
-        if (plan_inputs.readers) {
-            probe_facts.probe_ranges = ranges.len;
-            probe_facts.probe_bytes = probe_bytes;
-            probe_facts.probe_capped = !probe_ok;
-        }
-        const files = try arena.alloc(ndv.File, args.inputs.len);
-        // Dictionaries are read from a mapped file, or from a reader's buffer once its probe of them is in. Explain
-        // reads a reader's input through its mapping, as the probe would read it. Without either (S3, a probe past
-        // its cap, or a reader no probe was asked of) an input plans from its footer.
-        for (args.inputs, files) |input, *file| {
-            const waits = input.readerBacked() and input.dict_wait != null;
-            const probed = input.readerBacked() and probe_ok and (waits or explain);
-            const bytes = if (waits) input.bytes else input.plan_bytes orelse input.bytes;
-            file.* = .{
-                .bytes = bytes,
-                .local = !std.mem.startsWith(u8, input.name, "s3://") and (input.gate == null or probed) and
-                    (input.logical_size == 0 or input.logical_size == bytes.len),
-                .probed = probed,
-                .wait = if (probed and waits) input.dict_wait else null,
-            };
-        }
-        if (!explain) if (args.dict_probe) |dp| for (ranges) |r| {
-            const in = args.inputs[r.file];
-            if (in.gate == null or (in.readerBacked() and probe_ok)) try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
-        };
-        // The reader reads the probes first, then streams row groups into its window while the dictionaries union.
-        if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
-        ndv_stat = try ndv.collectRetaining(
-            gpa,
-            arena,
-            files,
-            metas,
-            keys,
-            n_workers,
-            args.max_memory,
-            true,
-            allow_union,
-            if (want) &domain else null,
-            // A prefix plan reads the union only for `fewEntries`: none past its entries, and none past its values.
-            .{ .fold_only = fold_only, .limit = if (first == .first_keys) few_union else null },
-        );
-        if (!explain) if (args.start_reads) |s| if (s.planned) |planned| {
-            planned(s.ctx);
-            planning_released = true;
-        };
-        const st = ndv_stat.?;
-        probe_facts.planning = .{
-            .source = switch (st.source) {
-                .unknown => .footers,
-                .dictionary_headers => .dictionary_headers,
-                .dictionary_union => .dictionary_union,
-            },
-            .why = if (st.union_complete)
-                (if (plan_inputs.readers) .reader_probe else .mapped)
-            else if (planning_why) |w|
-                w
-            else if (plan_inputs.readers and !probe_ok)
-                .probe_capped
-            else if (st.fold_declined)
-                .fold_declines
-            else if (st.union_budget_exceeded)
-                .union_budget
-            else if (st.union_attempted) .union_incomplete else .no_dictionaries,
-        };
-    };
-    if (!explain) if (args.start_reads) |s| try s.start(s.ctx);
+    const probe = try probeAggregateInputs(explain, gpa, arena, args, metas, agg_calls, group_by_keys, n_workers, &plan_inputs, msd_probe, &domain);
+    const ndv_stat = probe.ndv_stat;
+    const probe_facts = probe.facts;
+    const planning_released = probe.planning_released;
     plan_inputs.ndv_stat = ndv_stat;
     if (!explain and integer_needs_union) {
         const bounds: IntegerCountBounds = .{ .refined = ndv_stat };

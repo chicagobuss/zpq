@@ -9,6 +9,7 @@ const expr_agg = @import("../expr/agg.zig");
 const ndv = @import("../ndv.zig");
 const agg_dense = @import("../expr/agg_dense.zig");
 const owner_groups = @import("../owner_groups.zig");
+const integer_radix = @import("../integer_radix.zig");
 const NdvStat = ndv.Stat;
 const filter_prune = @import("../filter/prune.zig");
 const plan_types = @import("plan_types.zig");
@@ -190,7 +191,18 @@ pub fn inlineIntegerAnswer(
     }
     if (distinct and args.integer_records_min_rows != 0 and key_range.small(rows)) return null;
     if (rows < args.integer_records_min_rows or !owner_groups.admitsRows(.int64, rows)) return null;
-    const quote = integerQuote(rows, n_workers, cut, owner_args, count_top, ordered_count, work.len, outputNamesBytes(outputs));
+    const radix_sum = !full and !count_top and !distinct and !orderedIntegerHint(metas, work, key.col_idx) and
+        integer_radix.admits(rows, n_workers, ndv.footerEntries(metas, keys));
+    if (radix_sum and owner_args.decode_batch_rows == 0)
+        owner_args.decode_batch_rows = owner_groups.batchRows(null);
+    const radix_parts = if (radix_sum)
+        integer_radix.partitionCount(rows, n_workers, owner_args.decode_batch_rows, args.byte_top_partitions)
+    else
+        2048;
+    const quote = if (radix_sum)
+        integer_radix.State.reservation(rows, n_workers, radix_parts, cut.?.k, outputNamesBytes(outputs))
+    else
+        integerQuote(rows, n_workers, cut, owner_args, count_top, ordered_count, work.len, outputNamesBytes(outputs));
     if (quote > args.max_memory) return null;
     // A small stored-dictionary estimate favors the established coded fold. Compression can make this estimate low:
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
@@ -230,10 +242,12 @@ pub fn inlineIntegerAnswer(
             .integer_count_top_h
         else if (cut != null) .integer_sum_top_h else .integer_group_stream,
         .reservation = quote,
+        .partitions = radix_parts,
     };
     if (cut) |c| {
         if (distinct) return runIntegerOwner(
             .sum_top,
+            false,
             gpa,
             arena,
             &owner_args,
@@ -255,6 +269,7 @@ pub fn inlineIntegerAnswer(
         );
         if (count_top) return runIntegerOwner(
             .count_top,
+            false,
             gpa,
             arena,
             args,
@@ -276,6 +291,7 @@ pub fn inlineIntegerAnswer(
         );
         if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
             .sum_top,
+            false,
             gpa,
             arena,
             args,
@@ -295,30 +311,35 @@ pub fn inlineIntegerAnswer(
             c,
             true,
         )) |answer| return answer;
-        return try runIntegerOwner(
-            .sum_top,
-            gpa,
-            arena,
-            args,
-            metas,
-            plan,
-            work,
-            calls,
-            keys,
-            outputs,
-            n_workers,
-            timings,
-            rows,
-            key.col_idx,
-            value.?,
-            count,
-            starts,
-            c,
-            false,
-        );
+        inline for (.{ true, false }) |radix| {
+            if (radix == radix_sum) return try runIntegerOwner(
+                .sum_top,
+                radix,
+                gpa,
+                arena,
+                if (radix) &owner_args else args,
+                metas,
+                plan,
+                work,
+                calls,
+                keys,
+                outputs,
+                n_workers,
+                timings,
+                rows,
+                key.col_idx,
+                value.?,
+                count,
+                starts,
+                c,
+                false,
+            );
+        }
+        unreachable;
     }
     if (orderedIntegerHint(metas, work, key.col_idx)) if (try runIntegerOwner(
         .full,
+        false,
         gpa,
         arena,
         args,
@@ -340,6 +361,7 @@ pub fn inlineIntegerAnswer(
     )) |answer| return answer;
     return try runIntegerOwner(
         .full,
+        false,
         gpa,
         arena,
         args,
@@ -416,6 +438,7 @@ pub fn integerQuote(
 
 fn runIntegerOwner(
     comptime kind: owner_groups.Kind,
+    comptime radix: bool,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     args: *MultiAggArgs,
@@ -435,14 +458,16 @@ fn runIntegerOwner(
     cut: if (kind == .full) void else owner_groups.Cut,
     ordered: bool,
 ) !?MultiAggResult {
-    const Owner = owner_groups.Owner(kind, .int64);
+    const Owner = if (radix) integer_radix else owner_groups.Owner(kind, .int64);
     const parts = if (kind == .full)
         owner_groups.full_parts
     else
         Owner.partitionCount(rows, n_workers, args.decode_batch_rows, args.byte_top_partitions);
     const distinct = kind == .sum_top and calls.len == 1 and calls[0].func == .count_distinct;
     const names_credit = outputNamesBytes(outputs);
-    const state = (if (kind == .sum_top and distinct)
+    const state = (if (radix)
+        try Owner.State.init(gpa, args.ledger, rows, n_workers, key_col, value_col, cut, parts, names_credit)
+    else if (kind == .sum_top and distinct)
         try Owner.State.initDistinctTop(
             gpa,
             args.ledger,
@@ -486,7 +511,11 @@ fn runIntegerOwner(
     errdefer if (state_live) state.deinit();
     if (args.taken) |taken| taken.insert(.integer_records);
     const sinks = try arena.alloc(consumer.RecordSink, n_workers);
-    for (sinks, state.locals) |*sink, *local| sink.* = switch (kind) {
+    for (sinks, state.locals) |*sink, *local| sink.* = if (radix) .{ .selected = .{
+        .ctx = local,
+        .startFn = integer_radix.Local.startErased,
+        .batchFn = integer_radix.Local.batchErased,
+    } } else switch (kind) {
         .full => .{ .integer = local },
         .sum_top => .{ .integer_top = local },
         .count_top => .{ .integer_count_top = .{ .local = local } },
@@ -514,6 +543,7 @@ fn runIntegerOwner(
         state_live = false;
         if (kind == .count_top) return runIntegerOwner(
             kind,
+            false,
             gpa,
             arena,
             args,

@@ -566,7 +566,7 @@ pub const Charged = struct {
     }
 
     /// `err`, or `error.ExceededMemoryBudget` when it is the out-of-memory this allocator's refusal raised.
-    pub fn refusal(self: *const Charged, err: anyerror) anyerror {
+    pub fn refusal(self: *const Charged, err: anytype) (@TypeOf(err) || error{ExceededMemoryBudget}) {
         return if (err == error.OutOfMemory and self.refused.load(.monotonic)) error.ExceededMemoryBudget else err;
     }
 

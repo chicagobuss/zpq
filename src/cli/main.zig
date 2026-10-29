@@ -200,6 +200,248 @@ fn runMain(init: std.process.Init) !void {
     std.process.exit(2);
 }
 
+const QueryOptions = struct {
+    inputs_raw: std.ArrayList([]const u8) = .empty,
+    output: ?[]const u8 = null,
+    filter: ?[]const u8 = null,
+    columns_csv: ?[]const u8 = null,
+    select: ?[]const u8 = null,
+    aggregate: ?[]const u8 = null,
+    explain: bool = false,
+    query: ?[]const u8 = null,
+    fsync: bool = zpq.output_publication.default_fsync,
+    codec: ?schema.CompressionCodec = null,
+    parquet_version: schema.ParquetVersion = .v2,
+    compress_priority: engine.CompressPriority = .size,
+    parallelism: usize = 0,
+    scan_all: bool = false,
+    trust_stats: bool = false,
+    cache: bool = false,
+    fast_levels: bool = false,
+    unordered: bool = false,
+    format: ?engine.PrintFormat = null,
+    summary: bool = false,
+    limit: ?usize = null,
+    max_memory: ?usize = null,
+    row_group: engine.RowGroupTarget = .{},
+    group_by: ?[]const u8 = null,
+    select_cols: ?[]const zpq.core.expr.ast.SelectColumn = null,
+    result_order: zpq.core.expr.ast.ResultOrder = .{},
+    column_order: ?[]const u8 = null,
+    profile_out: ProfileOut = .{},
+    bloom_filters_enabled: bool = true,
+    bloom_filters: std.ArrayList(engine.BloomSpec) = .empty,
+
+    fn deinit(self: *QueryOptions, gpa: std.mem.Allocator) void {
+        self.bloom_filters.deinit(gpa);
+        self.inputs_raw.deinit(gpa);
+    }
+
+    fn parse(self: *QueryOptions, gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !bool {
+        while (iter.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
+                var ws: StdoutWriter = .{};
+                defer ws.flush() catch {};
+                try ws.writeAll(usage_text);
+                try ws.flush();
+                return false;
+            } else if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
+                self.output = iter.next() orelse {
+                    diagnosticPrint("zpq query: --output requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--filter") or std.mem.eql(u8, tok, "-f")) {
+                self.filter = iter.next() orelse {
+                    diagnosticPrint("zpq query: --filter requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--columns") or std.mem.eql(u8, tok, "-c")) {
+                self.columns_csv = iter.next() orelse {
+                    diagnosticPrint("zpq query: --columns requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--select") or std.mem.eql(u8, tok, "-s")) {
+                self.select = iter.next() orelse {
+                    diagnosticPrint("zpq query: --select requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--explain")) {
+                self.explain = true;
+            } else if (std.mem.eql(u8, tok, "--aggregate") or std.mem.eql(u8, tok, "-a")) {
+                self.aggregate = iter.next() orelse {
+                    diagnosticPrint("zpq query: --aggregate requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--query") or std.mem.eql(u8, tok, "-q")) {
+                self.query = iter.next() orelse {
+                    diagnosticPrint("zpq query: --query requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--fsync")) {
+                self.fsync = true;
+            } else if (std.mem.eql(u8, tok, "--no-fsync")) {
+                self.fsync = false;
+            } else if (std.mem.eql(u8, tok, "--codec")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --codec requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                if (std.ascii.eqlIgnoreCase(v, "zstd")) {
+                    self.codec = .ZSTD;
+                } else if (std.ascii.eqlIgnoreCase(v, "uncompressed")) {
+                    self.codec = .UNCOMPRESSED;
+                } else if (std.ascii.eqlIgnoreCase(v, "gzip")) {
+                    self.codec = .GZIP;
+                } else if (std.ascii.eqlIgnoreCase(v, "lz4") or std.ascii.eqlIgnoreCase(v, "lz4_raw")) {
+                    self.codec = .LZ4_RAW;
+                } else if (std.ascii.eqlIgnoreCase(v, "snappy")) {
+                    self.codec = .SNAPPY;
+                } else {
+                    diagnosticPrint("zpq query: invalid codec: {s}\n", .{v});
+                    return error.BadArgs;
+                }
+            } else if (std.mem.eql(u8, tok, "--parquet-version")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --parquet-version requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                self.parquet_version = std.meta.stringToEnum(schema.ParquetVersion, v) orelse {
+                    diagnosticPrint("zpq query: invalid parquet version: {s} (v1 or v2)\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--compress-priority")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --compress-priority requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                self.compress_priority = std.meta.stringToEnum(engine.CompressPriority, v) orelse {
+                    diagnosticPrint("zpq query: invalid compress priority: {s} (size or speed)\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--threads") or std.mem.eql(u8, tok, "-j")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --threads requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                self.parallelism = std.fmt.parseInt(usize, v, 10) catch {
+                    diagnosticPrint("zpq query: invalid threads value: {s}\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--no-bloom-filters")) {
+                self.bloom_filters_enabled = false;
+            } else if (std.mem.eql(u8, tok, "--bloom-filter")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --bloom-filter requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                try self.bloom_filters.append(gpa, engine.BloomSpec.parse(v) catch {
+                    diagnosticPrint("zpq query: invalid --bloom-filter: {s} (want COL or COL:FPP, 0 < FPP < 1)\n", .{v});
+                    return error.BadArgs;
+                });
+            } else if (std.mem.eql(u8, tok, "--scan-all")) {
+                self.scan_all = true; // valueless: disable all stats shortcuts, decode everything
+            } else if (std.mem.eql(u8, tok, "--cache")) {
+                self.cache = true;
+            } else if (std.mem.eql(u8, tok, "--trust-stats")) {
+                self.trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
+            } else if (std.mem.eql(u8, tok, "--fast-levels")) {
+                self.fast_levels = true; // valueless: skip def levels on provably no-null pages
+            } else if (std.mem.eql(u8, tok, "--unordered")) {
+                self.unordered = true; // valueless: GROUP BY order and float bits may vary
+            } else if (std.mem.eql(u8, tok, "--format")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --format requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                if (std.ascii.eqlIgnoreCase(v, "csv")) {
+                    self.format = .csv;
+                } else if (std.ascii.eqlIgnoreCase(v, "jsonl") or std.ascii.eqlIgnoreCase(v, "ndjson")) {
+                    self.format = .jsonl;
+                } else if (std.ascii.eqlIgnoreCase(v, "json")) {
+                    self.format = .json;
+                } else if (std.ascii.eqlIgnoreCase(v, "parquet")) {
+                    self.format = .parquet;
+                } else {
+                    diagnosticPrint("zpq query: invalid format: {s}\n", .{v});
+                    return error.BadArgs;
+                }
+            } else if (std.mem.eql(u8, tok, "--summary=json")) {
+                self.summary = true;
+            } else if (std.mem.eql(u8, tok, "--limit")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --limit requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                if (self.limit != null) {
+                    diagnosticPrint("zpq query: duplicate --limit\n", .{});
+                    return error.BadArgs;
+                }
+                self.limit = std.fmt.parseInt(usize, v, 10) catch {
+                    diagnosticPrint("zpq query: invalid limit value: {s}\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--group-by") or std.mem.eql(u8, tok, "-g")) {
+                self.group_by = iter.next() orelse {
+                    diagnosticPrint("zpq query: --group-by requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--column-order")) {
+                self.column_order = iter.next() orelse {
+                    diagnosticPrint("zpq query: --column-order requires a value\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--max-memory")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --max-memory requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                self.max_memory = zpq.core.system.parseSizeString(v) catch {
+                    diagnosticPrint("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--row-group-size")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --row-group-size requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                self.row_group.rows = std.fmt.parseInt(usize, v, 10) catch 0;
+                if (self.row_group.rows == 0) {
+                    diagnosticPrint("zpq query: invalid --row-group-size: {s} (a positive number of rows)\n", .{v});
+                    return error.BadArgs;
+                }
+            } else if (std.mem.eql(u8, tok, "--row-group-bytes")) {
+                const v = iter.next() orelse {
+                    diagnosticPrint("zpq query: --row-group-bytes requires a value\n", .{});
+                    return error.BadArgs;
+                };
+                self.row_group.bytes = zpq.core.system.parseSizeString(v) catch 0;
+                if (self.row_group.bytes == 0) {
+                    diagnosticPrint("zpq query: invalid --row-group-bytes: {s} (examples: 64MB, 1GB)\n", .{v});
+                    return error.BadArgs;
+                }
+            } else if (std.mem.eql(u8, tok, "--profile")) {
+                self.profile_out.trace_path = iter.next() orelse {
+                    diagnosticPrint("zpq query: --profile requires a path\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--profile-summary") or std.mem.startsWith(u8, tok, "--profile-summary=")) {
+                const v = if (tok.len > "--profile-summary".len) tok["--profile-summary=".len..] else "text";
+                self.profile_out.summary = std.meta.stringToEnum(ProfileOut.Format, v) orelse {
+                    diagnosticPrint("zpq query: invalid --profile-summary format: {s} (supported: text, json)\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.startsWith(u8, tok, "-")) {
+                diagnosticPrint("zpq query: unrecognized option: {s}\n", .{tok});
+                return error.BadArgs;
+            } else {
+                try self.inputs_raw.append(gpa, tok);
+            }
+        }
+
+        return true;
+    }
+};
+
 fn runQuery(
     init: std.process.Init,
     iter: *std.process.Args.Iterator,
@@ -209,238 +451,39 @@ fn runQuery(
     const gpa = zpq.core.memory.processAllocator(init.gpa);
     const env = init.minimal.environ;
     const io = init.io;
-    var inputs_raw: std.ArrayList([]const u8) = .empty;
-    defer inputs_raw.deinit(gpa);
-    var output: ?[]const u8 = null;
-    var filter: ?[]const u8 = null;
-    var columns_csv: ?[]const u8 = null;
-    var select: ?[]const u8 = null;
-    var aggregate: ?[]const u8 = null;
-    var explain: bool = false;
-    var query: ?[]const u8 = null;
-    var fsync = zpq.output_publication.default_fsync;
-    var codec: ?schema.CompressionCodec = null;
-    var parquet_version: schema.ParquetVersion = .v2;
-    var compress_priority: engine.CompressPriority = .size;
-    var parallelism: usize = 0;
-    var scan_all: bool = false;
-    var trust_stats: bool = false;
-    var cache: bool = false;
-    var fast_levels: bool = false;
-    var unordered: bool = false;
-    var format: ?engine.PrintFormat = null;
-    var summary = false;
-    var limit: ?usize = null;
-    var max_memory: ?usize = null;
-    var row_group: engine.RowGroupTarget = .{};
-    var group_by: ?[]const u8 = null;
-    var select_cols: ?[]const zpq.core.expr.ast.SelectColumn = null;
-    var result_order: zpq.core.expr.ast.ResultOrder = .{};
-    var column_order: ?[]const u8 = null;
-    var profile_out: ProfileOut = .{};
-    var bloom_filters_enabled = true;
-    var bloom_filters: std.ArrayList(engine.BloomSpec) = .empty;
-    defer bloom_filters.deinit(gpa);
-
-    while (iter.next()) |tok| {
-        if (std.mem.eql(u8, tok, "--help") or std.mem.eql(u8, tok, "-h")) {
-            var ws: StdoutWriter = .{};
-            defer ws.flush() catch {};
-            try ws.writeAll(usage_text);
-            try ws.flush();
-            return;
-        } else if (std.mem.eql(u8, tok, "--output") or std.mem.eql(u8, tok, "-o")) {
-            output = iter.next() orelse {
-                diagnosticPrint("zpq query: --output requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--filter") or std.mem.eql(u8, tok, "-f")) {
-            filter = iter.next() orelse {
-                diagnosticPrint("zpq query: --filter requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--columns") or std.mem.eql(u8, tok, "-c")) {
-            columns_csv = iter.next() orelse {
-                diagnosticPrint("zpq query: --columns requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--select") or std.mem.eql(u8, tok, "-s")) {
-            select = iter.next() orelse {
-                diagnosticPrint("zpq query: --select requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--explain")) {
-            explain = true;
-        } else if (std.mem.eql(u8, tok, "--aggregate") or std.mem.eql(u8, tok, "-a")) {
-            aggregate = iter.next() orelse {
-                diagnosticPrint("zpq query: --aggregate requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--query") or std.mem.eql(u8, tok, "-q")) {
-            query = iter.next() orelse {
-                diagnosticPrint("zpq query: --query requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--fsync")) {
-            fsync = true;
-        } else if (std.mem.eql(u8, tok, "--no-fsync")) {
-            fsync = false;
-        } else if (std.mem.eql(u8, tok, "--codec")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --codec requires a value\n", .{});
-                return error.BadArgs;
-            };
-            if (std.ascii.eqlIgnoreCase(v, "zstd")) {
-                codec = .ZSTD;
-            } else if (std.ascii.eqlIgnoreCase(v, "uncompressed")) {
-                codec = .UNCOMPRESSED;
-            } else if (std.ascii.eqlIgnoreCase(v, "gzip")) {
-                codec = .GZIP;
-            } else if (std.ascii.eqlIgnoreCase(v, "lz4") or std.ascii.eqlIgnoreCase(v, "lz4_raw")) {
-                codec = .LZ4_RAW;
-            } else if (std.ascii.eqlIgnoreCase(v, "snappy")) {
-                codec = .SNAPPY;
-            } else {
-                diagnosticPrint("zpq query: invalid codec: {s}\n", .{v});
-                return error.BadArgs;
-            }
-        } else if (std.mem.eql(u8, tok, "--parquet-version")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --parquet-version requires a value\n", .{});
-                return error.BadArgs;
-            };
-            parquet_version = std.meta.stringToEnum(schema.ParquetVersion, v) orelse {
-                diagnosticPrint("zpq query: invalid parquet version: {s} (v1 or v2)\n", .{v});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--compress-priority")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --compress-priority requires a value\n", .{});
-                return error.BadArgs;
-            };
-            compress_priority = std.meta.stringToEnum(engine.CompressPriority, v) orelse {
-                diagnosticPrint("zpq query: invalid compress priority: {s} (size or speed)\n", .{v});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--threads") or std.mem.eql(u8, tok, "-j")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --threads requires a value\n", .{});
-                return error.BadArgs;
-            };
-            parallelism = std.fmt.parseInt(usize, v, 10) catch {
-                diagnosticPrint("zpq query: invalid threads value: {s}\n", .{v});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--no-bloom-filters")) {
-            bloom_filters_enabled = false;
-        } else if (std.mem.eql(u8, tok, "--bloom-filter")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --bloom-filter requires a value\n", .{});
-                return error.BadArgs;
-            };
-            try bloom_filters.append(gpa, engine.BloomSpec.parse(v) catch {
-                diagnosticPrint("zpq query: invalid --bloom-filter: {s} (want COL or COL:FPP, 0 < FPP < 1)\n", .{v});
-                return error.BadArgs;
-            });
-        } else if (std.mem.eql(u8, tok, "--scan-all")) {
-            scan_all = true; // valueless: disable all stats shortcuts, decode everything
-        } else if (std.mem.eql(u8, tok, "--cache")) {
-            cache = true;
-        } else if (std.mem.eql(u8, tok, "--trust-stats")) {
-            trust_stats = true; // valueless: opt in to stats-as-answer for min/max/sum
-        } else if (std.mem.eql(u8, tok, "--fast-levels")) {
-            fast_levels = true; // valueless: skip def levels on provably no-null pages
-        } else if (std.mem.eql(u8, tok, "--unordered")) {
-            unordered = true; // valueless: GROUP BY order and float bits may vary
-        } else if (std.mem.eql(u8, tok, "--format")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --format requires a value\n", .{});
-                return error.BadArgs;
-            };
-            if (std.ascii.eqlIgnoreCase(v, "csv")) {
-                format = .csv;
-            } else if (std.ascii.eqlIgnoreCase(v, "jsonl") or std.ascii.eqlIgnoreCase(v, "ndjson")) {
-                format = .jsonl;
-            } else if (std.ascii.eqlIgnoreCase(v, "json")) {
-                format = .json;
-            } else if (std.ascii.eqlIgnoreCase(v, "parquet")) {
-                format = .parquet;
-            } else {
-                diagnosticPrint("zpq query: invalid format: {s}\n", .{v});
-                return error.BadArgs;
-            }
-        } else if (std.mem.eql(u8, tok, "--summary=json")) {
-            summary = true;
-        } else if (std.mem.eql(u8, tok, "--limit")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --limit requires a value\n", .{});
-                return error.BadArgs;
-            };
-            if (limit != null) {
-                diagnosticPrint("zpq query: duplicate --limit\n", .{});
-                return error.BadArgs;
-            }
-            limit = std.fmt.parseInt(usize, v, 10) catch {
-                diagnosticPrint("zpq query: invalid limit value: {s}\n", .{v});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--group-by") or std.mem.eql(u8, tok, "-g")) {
-            group_by = iter.next() orelse {
-                diagnosticPrint("zpq query: --group-by requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--column-order")) {
-            column_order = iter.next() orelse {
-                diagnosticPrint("zpq query: --column-order requires a value\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--max-memory")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --max-memory requires a value\n", .{});
-                return error.BadArgs;
-            };
-            max_memory = zpq.core.system.parseSizeString(v) catch {
-                diagnosticPrint("zpq query: invalid max-memory value: {s} (examples: 500MB, 1.5GB, 1024)\n", .{v});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--row-group-size")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --row-group-size requires a value\n", .{});
-                return error.BadArgs;
-            };
-            row_group.rows = std.fmt.parseInt(usize, v, 10) catch 0;
-            if (row_group.rows == 0) {
-                diagnosticPrint("zpq query: invalid --row-group-size: {s} (a positive number of rows)\n", .{v});
-                return error.BadArgs;
-            }
-        } else if (std.mem.eql(u8, tok, "--row-group-bytes")) {
-            const v = iter.next() orelse {
-                diagnosticPrint("zpq query: --row-group-bytes requires a value\n", .{});
-                return error.BadArgs;
-            };
-            row_group.bytes = zpq.core.system.parseSizeString(v) catch 0;
-            if (row_group.bytes == 0) {
-                diagnosticPrint("zpq query: invalid --row-group-bytes: {s} (examples: 64MB, 1GB)\n", .{v});
-                return error.BadArgs;
-            }
-        } else if (std.mem.eql(u8, tok, "--profile")) {
-            profile_out.trace_path = iter.next() orelse {
-                diagnosticPrint("zpq query: --profile requires a path\n", .{});
-                return error.BadArgs;
-            };
-        } else if (std.mem.eql(u8, tok, "--profile-summary") or std.mem.startsWith(u8, tok, "--profile-summary=")) {
-            const v = if (tok.len > "--profile-summary".len) tok["--profile-summary=".len..] else "text";
-            profile_out.summary = std.meta.stringToEnum(ProfileOut.Format, v) orelse {
-                diagnosticPrint("zpq query: invalid --profile-summary format: {s} (supported: text, json)\n", .{v});
-                return error.BadArgs;
-            };
-        } else if (std.mem.startsWith(u8, tok, "-")) {
-            diagnosticPrint("zpq query: unrecognized option: {s}\n", .{tok});
-            return error.BadArgs;
-        } else {
-            try inputs_raw.append(gpa, tok);
-        }
-    }
+    var options: QueryOptions = .{};
+    defer options.deinit(gpa);
+    if (!try options.parse(gpa, iter)) return;
+    const inputs_raw = options.inputs_raw;
+    const output = options.output;
+    var filter = options.filter;
+    const columns_csv = options.columns_csv;
+    var select = options.select;
+    var aggregate = options.aggregate;
+    const explain = options.explain;
+    const query = options.query;
+    const fsync = options.fsync;
+    const codec = options.codec;
+    const parquet_version = options.parquet_version;
+    const compress_priority = options.compress_priority;
+    const parallelism = options.parallelism;
+    const scan_all = options.scan_all;
+    const trust_stats = options.trust_stats;
+    const cache = options.cache;
+    const fast_levels = options.fast_levels;
+    const unordered = options.unordered;
+    const format = options.format;
+    const summary = options.summary;
+    var limit = options.limit;
+    const max_memory = options.max_memory;
+    const row_group = options.row_group;
+    var group_by = options.group_by;
+    var select_cols = options.select_cols;
+    var result_order = options.result_order;
+    const column_order = options.column_order;
+    var profile_out = options.profile_out;
+    const bloom_filters_enabled = options.bloom_filters_enabled;
+    const bloom_filters = options.bloom_filters;
 
     if (query != null) {
         if (inputs_raw.items.len > 0) {

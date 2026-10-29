@@ -311,7 +311,7 @@ pub fn bindSyntax(arena: std.mem.Allocator, node: syntax.Expr, file: *const sche
 }
 
 fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema.FileMetaData, diag: ?*Diag, depth: u32) Error!ast.Expr {
-    if (depth >= MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
     return switch (node) {
         .column => |name| bindColumn(arena, file, name, diag),
         .number => |n| bindSyntaxNumber(n.token, n.floating),
@@ -1973,6 +1973,10 @@ test "syntax: structured binding keeps type and depth refusals" {
     const a = arena.allocator();
     const file = try fakeFile(a, &.{ "x", "s" }, &.{ .INT32, .BYTE_ARRAY });
     try testing.expectError(error.BadNumber, bindSyntax(a, .{ .number = .{ .token = "-9223372036854775808", .floating = false } }, &file, null));
+    var boundary: syntax.Expr = .{ .number = .{ .token = "1", .floating = false } };
+    for (0..MAX_EXPR_DEPTH) |_| boundary = try unaryNode(a, boundary);
+    // Literal negations fold, so the grammar's permitted unary depth need not produce a deep evaluation tree.
+    _ = try bindSyntax(a, boundary, &file, null);
     const bad = try parseSelectSyntax(a, "s + 1");
     try testing.expectError(error.TypeMismatch, bindSyntax(a, bad[0].expr, &file, null));
     var deep: syntax.Expr = .{ .column = "x" };

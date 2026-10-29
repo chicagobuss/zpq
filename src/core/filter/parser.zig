@@ -543,39 +543,26 @@ fn parseInList(
     // A parenthesized list, split at its outermost commas: a comma inside a quoted value is part of the value.
     const vals = (try groupBody(list)) orelse return error.BadOperator;
 
-    if (!bound) {
-        var values: std.ArrayList([]const u8) = .empty;
-        var cursor: Cursor = .{ .src = vals };
-        var from: usize = 0;
-        while (true) {
-            const comma = try cursor.find(",");
-            const value = trimSpace(vals[from .. comma orelse vals.len]);
-            if (value.len == 0) return error.BadValue;
-            try values.append(arena, value);
-            from = (comma orelse break) + 1;
-        }
-        return .{ .in_list = .{ .operand = try parseOperandSyntax(col_name), .values = values.items, .negate = inc.negated } };
-    }
-    const operand = try resolveOperand(file, col_name, diag);
-    const col_idx = operand.col_idx;
-
-    // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
-    const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
-    var leaves: std.ArrayList(FilterNode(bound)) = .empty;
+    const operand = if (bound) try resolveOperand(file, col_name, diag) else try parseOperandSyntax(col_name);
+    const Item = if (bound) ast.Filter else []const u8;
+    var items: std.ArrayList(Item) = .empty;
     var null_member = false;
     var cur: Cursor = .{ .src = vals };
     var start: usize = 0;
     while (true) {
         const comma = try cur.find(",");
-        const v = trimSpace(vals[start .. comma orelse vals.len]);
-        if (v.len == 0) return error.BadValue;
-        // The NULL literal is no value to compare with, on a string column as on any other.
-        if (isNullLiteral(v)) null_member = true else {
-            try leaves.append(arena, try buildOperandComparison(arena, file, operand, leaf_op, v, diag));
-        }
+        const value = trimSpace(vals[start .. comma orelse vals.len]);
+        if (value.len == 0) return error.BadValue;
+        if (bound) {
+            if (isNullLiteral(value)) null_member = true else {
+                const op: ast.Operator = if (inc.negated) .NotEq else .Eq;
+                try items.append(arena, try buildOperandComparison(arena, file, operand, op, value, diag));
+            }
+        } else try items.append(arena, value);
         start = (comma orelse break) + 1;
     }
-    return bindIn(arena, col_idx, inc.negated, leaves.items, null_member);
+    if (bound) return bindIn(arena, operand.col_idx, inc.negated, items.items, null_member);
+    return .{ .in_list = .{ .operand = operand, .values = items.items, .negate = inc.negated } };
 }
 
 fn isNullLiteral(v: []const u8) bool {

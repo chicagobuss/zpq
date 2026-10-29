@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_prune = @import("../filter/prune.zig");
@@ -14,8 +13,6 @@ const column = @import("column.zig");
 const originSlice = column.originSlice;
 const PruningInfo = column.PruningInfo;
 const RowRange = column.RowRange;
-// Known exception: these writable globals move to a lower contract in the later pass.
-const consumer_root = @import("../consumer.zig");
 
 const ConjunctiveLeaf = struct {
     filter: filter_ast.Filter,
@@ -229,8 +226,9 @@ pub fn compactRows(
     page_indexes: []const ?PageIndex,
     sel: *const filter_selection.SelectionVector,
     target: AggTarget,
+    control: ?*@import("workspace.zig").CompactionControl,
 ) !?[]const RowRange {
-    if (in.filter == null or (builtin.is_test and !consumer_root.compact_rows_in_tests)) return null;
+    if (in.filter == null or (control != null and !control.?.enabled)) return null;
     if (target == .grouped and target.grouped.records != null) return null;
     const kept = sel.count();
     if (kept * 2 > sel.len) return null;
@@ -251,7 +249,7 @@ pub fn compactRows(
         while (at < sel.len and sel.isActive(at)) at += 1;
         if (at > lo) try ranges.append(ra, .{ .lo = lo, .hi = at });
     }
-    if (builtin.is_test) _ = consumer_root.compacted_row_groups.fetchAdd(1, .monotonic);
+    if (control) |c| _ = c.row_groups.fetchAdd(1, .monotonic);
     return ranges.items;
 }
 

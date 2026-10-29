@@ -78,6 +78,7 @@ const statPresentCount = scalar_mod.statPresentCount;
 
 pub const scalar_mod = @import("aggregate/scalar.zig");
 pub const updateOne = scalar_mod.updateOne;
+pub const updateOneWithCharge = scalar_mod.updateOneWithCharge;
 pub const updateSharedInteger = scalar_mod.updateSharedInteger;
 pub const minTotal = scalar_mod.minTotal;
 pub const maxTotal = scalar_mod.maxTotal;
@@ -143,7 +144,10 @@ pub const grouped_mod = @import("aggregate/grouped.zig");
 pub const firstPosition = grouped_mod.firstPosition;
 pub const updateOneGrouped = grouped_mod.updateOneGrouped;
 pub const updateTableGrouped = grouped_mod.updateTableGrouped;
+pub const updateTableGroupedWithContext = grouped_mod.updateTableGroupedWithContext;
+pub const FoldContext = grouped_mod.FoldContext;
 pub const updateOneGroupedValues = grouped_mod.updateOneGroupedValues;
+pub const updateOneGroupedValuesWithContext = grouped_mod.updateOneGroupedValuesWithContext;
 pub const GroupedPreps = grouped_mod.GroupedPreps;
 pub const prepareGrouped = grouped_mod.prepareGrouped;
 pub const DistinctPairs = grouped_mod.DistinctPairs;
@@ -151,15 +155,7 @@ const foldMinMaxBytesGroupedOne = grouped_mod.foldMinMaxBytesGroupedOne;
 
 pub const WinnerCharge = accumulator_mod.WinnerCharge;
 
-/// The scan worker's winner charge while it folds a row group; null during merges.
-/// A thread-local for the reason `distinct_pairs` is one: the folds that copy winners see only the accumulator.
-pub threadlocal var winner_charge: ?*WinnerCharge = null;
-
 pub const winnerBytes = accumulator_mod.winnerBytes;
 pub const persistWinner = accumulator_mod.persistWinner;
-
-/// The worker's pair sink while it scans. A thread-local, not a parameter: every grouped count(DISTINCT) fold, coded
-/// or not, reaches `foldDistinctU64` with only the table's accumulators, which identify the table the sink serves.
-pub threadlocal var distinct_pairs: ?*DistinctPairs = null;
 
 

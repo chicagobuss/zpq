@@ -1640,6 +1640,7 @@ fn prepareAggregateWithMetas(
             .decode_batch_rows = args.decode_batch_rows,
             .auto_decode_batches = args.auto_decode_batches,
             .cache_hints = &cache_hints,
+            .compaction = args.compaction,
             .scan_workers = n_workers,
             .retire_after_run = args.leave_regions and (args.ledger != null or private_decode.held > 0) and
                 switch (decision.strategy) {

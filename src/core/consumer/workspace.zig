@@ -9,6 +9,12 @@ const Timings = @import("types.zig").Timings;
 const AggRowGroup = @import("types.zig").AggRowGroup;
 const DecodeBudget = @import("budget.zig").DecodeBudget;
 
+/// Per-query control for comparing compact decoding with whole-column decoding in tests.
+pub const CompactionControl = struct {
+    enabled: bool = true,
+    row_groups: std.atomic.Value(usize) = .init(0),
+};
+
 /// A scan worker's state, reused from one row group to the next.
 pub const AggWorkspace = struct {
     /// The scan coordinator revalidates after all workers and their arenas have unwound.
@@ -16,6 +22,8 @@ pub const AggWorkspace = struct {
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,
     cache_hints: ?*CacheHints = null,
+    compaction: ?*CompactionControl = null,
+    fold_context: expr_agg.FoldContext = .{},
     scan_workers: usize = 1,
     expr_batch_rows: ?usize = null,
     scratch: *DecodeScratch,

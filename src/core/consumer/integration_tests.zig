@@ -183,8 +183,6 @@ const decodeWithReaderPruned = consumer_column.decodeWithReaderPruned;
 const decodeFloat16ColumnAsF64Pruned = consumer_column.decodeFloat16ColumnAsF64Pruned;
 const decodeU32ColumnAsI64Pruned = consumer_column.decodeU32ColumnAsI64Pruned;
 const decodeFloat16ColumnAsF64 = consumer_column.decodeFloat16ColumnAsF64;
-// Known exception: these writable globals move to a lower contract in the later pass.
-const consumer_root = @import("../consumer.zig");
 
 fn pageForTest(arena: std.mem.Allocator, header: schema.PageHeader, body: []const u8) ![]u8 {
     var w = thrift.Writer.init(arena);
@@ -896,9 +894,6 @@ fn compactionAlignsNextPage(
 
 test "compaction fills a kept required page with no SQL survivors and aligns the next page" {
     const testing = std.testing;
-    const prior = consumer_root.compact_rows_in_tests;
-    defer consumer_root.compact_rows_in_tests = prior;
-    consumer_root.compact_rows_in_tests = true;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

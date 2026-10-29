@@ -1731,8 +1731,7 @@ test "unaliased aggregates keep the function name unless it clashes, then take t
 }
 
 test "page-pruned row groups decode just their kept rows, with the answers of whole columns" {
-    const prior_compact = consumer.compact_rows_in_tests;
-    defer consumer.compact_rows_in_tests = prior_compact;
+    var compaction: consumer.CompactionControl = .{};
     // Tiny pages with a page index, dictionary and plain encoded, nullable columns of every common type.
     const files = [_][]const u8{
         "data/parquet-testing/data/alltypes_tiny_pages.parquet",
@@ -1770,15 +1769,16 @@ test "page-pruned row groups decode just their kept rows, with the answers of wh
                 .group_by = shape.group,
                 .parallelism = j,
                 .min_bytes_per_worker = 1,
+                .compaction = &compaction,
             };
-            consumer.compact_rows_in_tests = false;
+            compaction.enabled = false;
             var want = try runMultiAggregate(testing.allocator, a, args);
             defer want.deinit(testing.allocator);
-            consumer.compact_rows_in_tests = true;
-            const before = consumer.compacted_row_groups.load(.monotonic);
+            compaction.enabled = true;
+            const before = compaction.row_groups.load(.monotonic);
             var got = try runMultiAggregate(testing.allocator, a, args);
             defer got.deinit(testing.allocator);
-            testing.expectEqual(f.compacts, consumer.compacted_row_groups.load(.monotonic) > before) catch |e| {
+            testing.expectEqual(f.compacts, compaction.row_groups.load(.monotonic) > before) catch |e| {
                 std.debug.print("compaction: {s} {s}\n", .{ fixture, f.sql });
                 return e;
             };
@@ -1796,8 +1796,7 @@ test "page-pruned row groups decode just their kept rows, with the answers of wh
 }
 
 test "page-pruned DECIMAL and INT96 columns decode whole and answer as with compaction off" {
-    const prior_compact = consumer.compact_rows_in_tests;
-    defer consumer.compact_rows_in_tests = prior_compact;
+    var compaction: consumer.CompactionControl = .{};
     // INT32/INT64/FLBA-backed DECIMAL(9/18/38) and INT96, required and optional, behind a page index: their exact
     // decoders read whole chunks, so a row group reading them decodes whole columns rather than compacting.
     const fixture = "ci/fixtures/parquet/decimal_int96_page_index.parquet";
@@ -1825,15 +1824,16 @@ test "page-pruned DECIMAL and INT96 columns decode whole and answer as with comp
                 .aggregate = shape.agg,
                 .parallelism = j,
                 .min_bytes_per_worker = 1,
+                .compaction = &compaction,
             };
-            consumer.compact_rows_in_tests = false;
+            compaction.enabled = false;
             var want = try runMultiAggregate(testing.allocator, a, args);
             defer want.deinit(testing.allocator);
-            consumer.compact_rows_in_tests = true;
-            const before = consumer.compacted_row_groups.load(.monotonic);
+            compaction.enabled = true;
+            const before = compaction.row_groups.load(.monotonic);
             var got = try runMultiAggregate(testing.allocator, a, args);
             defer got.deinit(testing.allocator);
-            if (shape.compacts) |c| try testing.expectEqual(c, consumer.compacted_row_groups.load(.monotonic) > before);
+            if (shape.compacts) |c| try testing.expectEqual(c, compaction.row_groups.load(.monotonic) > before);
             try testing.expectEqualDeep(want.output.aggs, got.output.aggs);
         };
 }

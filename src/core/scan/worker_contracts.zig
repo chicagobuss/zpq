@@ -157,6 +157,7 @@ pub const Worker = struct {
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,
     cache_hints: ?*consumer.CacheHints = null,
+    compaction: ?*consumer.CompactionControl = null,
     error_outputs: ?[]const BoundOutputColumn = null,
     /// Original bindings, before dependent-key removal, including keys absent from SELECT.
     error_group_keys: ?[]const expr_ast.Expr = null,

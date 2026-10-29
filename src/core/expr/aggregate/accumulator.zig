@@ -1,6 +1,4 @@
 const std = @import("std");
-// Known exception: the facade owns writable thread-local state until the later contract pass.
-const agg_threadlocals = @import("../agg.zig");
 const Error = @import("types.zig").Error;
 const testing = std.testing;
 const SharedBudget = @import("../../memory.zig").SharedBudget;
@@ -312,15 +310,22 @@ pub fn winnerBytes(len: usize) usize {
 }
 
 pub fn considerWinner(persist: std.mem.Allocator, is_min: bool, slot: *?[]const u8, cand: []const u8) Error!void {
+    return considerWinnerWithCharge(persist, is_min, slot, cand, null);
+}
+
+pub fn considerWinnerWithCharge(persist: std.mem.Allocator, is_min: bool, slot: *?[]const u8, cand: []const u8, charge: ?*WinnerCharge) Error!void {
     if (slot.*) |cur| {
         const order = std.mem.order(u8, cand, cur);
         if (if (is_min) order != .lt else order != .gt) return;
     }
-    try persistWinner(persist, slot, cand);
+    try persistWinnerWithCharge(persist, slot, cand, charge);
 }
 
 pub fn persistWinner(persist: std.mem.Allocator, slot: *?[]const u8, cand: []const u8) Error!void {
-    const charge = agg_threadlocals.winner_charge;
+    return persistWinnerWithCharge(persist, slot, cand, null);
+}
+
+pub fn persistWinnerWithCharge(persist: std.mem.Allocator, slot: *?[]const u8, cand: []const u8, charge: ?*WinnerCharge) Error!void {
     if (charge) |c| try c.adjust(0, winnerBytes(cand.len));
     const owned = persist.dupe(u8, cand) catch |err| {
         if (charge) |c| c.adjust(winnerBytes(cand.len), 0) catch unreachable;

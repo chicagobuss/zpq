@@ -316,11 +316,9 @@ pub fn releasePool() bool {
 }
 
 /// The thread-local state a freshly spawned thread starts with. A pooled thread resets it before every job, so no
-/// job observes what an earlier region on the same thread left (a decode failure site, a borrowed charge).
+/// job observes what an earlier region on the same thread left (a decode failure site, a forced batch size).
 fn freshThreadState() void {
     @import("consumer.zig").setDecodeFailure(null);
-    @import("expr/agg.zig").distinct_pairs = null;
-    @import("expr/agg.zig").winner_charge = null;
     @import("expr/eval.zig").forced_batch_rows = null;
 }
 
@@ -383,8 +381,10 @@ test "pooled regions reuse threads, nest, give every context its own thread and 
         arrived: *std.atomic.Value(u32),
         total: u32,
         nested: bool = false,
+        /// Held true until the nested region has finished, so its threads cannot be the ones its siblings free.
+        holding: ?*std.atomic.Value(bool) = null,
         runs: usize = 0,
-        saw_pairs: bool = false,
+        saw_stale: bool = false,
         fn run(c: *@This()) void {
             c.runs += 1;
             // Every context waits for all of them: queueing one behind another on a thread would never finish.
@@ -395,13 +395,15 @@ test "pooled regions reuse threads, nest, give every context its own thread and 
                 var inner: [3]@This() = @splat(.{ .arrived = &inner_arrived, .total = 3 });
                 std.debug.assert(runTree(@This(), &inner, .{}, run));
                 for (inner) |i| std.debug.assert(i.runs == 1);
-            }
-            c.saw_pairs = @import("expr/agg.zig").distinct_pairs != null;
-            @import("expr/agg.zig").distinct_pairs = @ptrFromInt(64);
+                c.holding.?.store(false, .release);
+            } else if (c.holding) |h| while (h.load(.acquire)) std.atomic.spinLoopHint();
+            c.saw_stale = @import("expr/eval.zig").forced_batch_rows != null;
+            @import("expr/eval.zig").forced_batch_rows = 64;
         }
     };
     var arrived: std.atomic.Value(u32) = .init(0);
-    var first: [8]Ctx = @splat(.{ .arrived = &arrived, .total = 8 });
+    var holding: std.atomic.Value(bool) = .init(true);
+    var first: [8]Ctx = @splat(.{ .arrived = &arrived, .total = 8, .holding = &holding });
     first[3].nested = true;
     try std.testing.expect(runTree(Ctx, &first, .{}, Ctx.run));
     for (first) |c| try std.testing.expectEqual(@as(usize, 1), c.runs);
@@ -414,7 +416,7 @@ test "pooled regions reuse threads, nest, give every context its own thread and 
     try std.testing.expectEqual(threads, Pool.threadCount());
     for (again) |c| {
         try std.testing.expectEqual(@as(usize, 1), c.runs);
-        try std.testing.expect(!c.saw_pairs);
+        try std.testing.expect(!c.saw_stale);
     }
     // A stack past the pool's still runs, on a tree of fresh threads.
     arrived.store(0, .monotonic);

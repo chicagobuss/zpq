@@ -124,13 +124,14 @@ fn foldGroupedBatch(
     sel: *filter_selection.SelectionVector,
     ids: []u32,
     pos: u64,
+    ctx: expr_agg.FoldContext,
 ) !void {
     const kept = sel.count();
     if (table.sketch == null and kept != 0 and kept != sel.len and sel.len <= std.math.maxInt(u32)) {
         if (try gatherUnder(arena, batch.cols, key_cols, sel, kept)) |g| {
             try resolver.resolveBatch(arena, table, g.key_cols, calls, pos, &g.sel, ids, g.ordinals);
             if (!table.countOnly()) for (calls, 0..) |_, i| {
-                try expr_agg.updateTableGrouped(arena, gpa, table, ids, i, calls, &g.batch, lookup, &g.sel);
+                try expr_agg.updateTableGroupedWithContext(arena, gpa, table, ids, i, calls, &g.batch, lookup, &g.sel, ctx);
             };
             return;
         }
@@ -138,7 +139,7 @@ fn foldGroupedBatch(
     try resolver.resolveBatch(arena, table, key_cols, calls, pos, sel, ids, null);
     try expr_agg.sinkSketchRows(table, ids, sel);
     if (!table.countOnly()) for (calls, 0..) |_, i| {
-        try expr_agg.updateTableGrouped(arena, gpa, table, ids, i, calls, batch, lookup, sel);
+        try expr_agg.updateTableGroupedWithContext(arena, gpa, table, ids, i, calls, batch, lookup, sel, ctx);
     };
 }
 
@@ -284,6 +285,7 @@ fn scatterGrouped(
     pos: u64,
     off: usize,
     n: usize,
+    ctx: expr_agg.FoldContext,
 ) !void {
     if (!prepared_values.*) {
         for (lookup, 0..) |at, ci| if (at) |p| if (ci < consumed.len and consumed[ci]) {
@@ -331,7 +333,7 @@ fn scatterGrouped(
             partagg.PartAgg.lock(pt);
             defer partagg.PartAgg.unlock(pt);
             for (order[lo..hi]) |r| ids[r] = try insertRow(ra, &scratch, &pt.table, key_cols, r, g.calls, pos);
-            try preps.fold(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls, if (pt.table.compact.stride != 0) &pt.table.compact else null);
+            try preps.foldWithContext(gpa, pt.table.accumulators.items, ids, order[lo..hi], g.calls, if (pt.table.compact.stride != 0) &pt.table.compact else null, ctx);
         }
         return;
     }
@@ -345,7 +347,7 @@ fn scatterGrouped(
             const key = try storedRowKey(ra, &scratch, g.table, key_cols, r, &image);
             ids[r] = @intCast(try part.append(run, key, pos + r));
         }
-        try preps.fold(gpa, run.accs.items, ids, order[lo..hi], g.calls, if (run.compact.stride != 0) &run.compact else null);
+        try preps.foldWithContext(gpa, run.accs.items, ids, order[lo..hi], g.calls, if (run.compact.stride != 0) &run.compact else null, ctx);
     }
 }
 
@@ -382,6 +384,7 @@ fn foldGroupedWindows(
     budget: ?*DecodeBudget,
     /// The region `ra` allocates from, if it does.
     region: ?*huge_pages.Region,
+    ctx: expr_agg.FoldContext,
 ) !void {
     const g = switch (target) {
         .grouped => |grouped| grouped,
@@ -393,7 +396,7 @@ fn foldGroupedWindows(
     // resolve again nearly every code of a large dictionary.
     if (local.armed and encoded and sel.len > 0) {
         const whole: filter_eval.Batch = .{ .cols = cols, .num_rows = sel.len, .expr_batch_rows = expr_batch_rows };
-        if (try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &whole, lookup, sel, budget, region)) {
+        if (try agg_coded.groupedCodedWithContext(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &whole, lookup, sel, budget, region, ctx)) {
             try part.pump(local, g.table, @intCast(sel.count()));
             return;
         }
@@ -415,7 +418,7 @@ fn foldGroupedWindows(
         const pos = g.pos_base + @as(u64, @intCast(off));
         // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its partition.
         if (local.abandoned) {
-            try scatterGrouped(wa, ra, gpa, g, part, local, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n);
+            try scatterGrouped(wa, ra, gpa, g, part, local, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n, ctx);
             off += n;
             continue;
         }
@@ -423,7 +426,7 @@ fn foldGroupedWindows(
             const win_cols = try wa.alloc(filter_eval.Batch.Column, cols.len);
             for (cols, win_cols) |c, *o| o.* = sliceColumn(c, off, n);
             const win: filter_eval.Batch = .{ .cols = win_cols, .num_rows = n, .expr_batch_rows = expr_batch_rows };
-            if (try agg_coded.groupedCoded(wa, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget, region)) {
+            if (try agg_coded.groupedCodedWithContext(wa, gpa, g.calls, g.keys, g.table, pos, &win, lookup, &win_sel, budget, region, ctx)) {
                 try part.pump(local, g.table, @intCast(win_sel.count()));
                 off += n;
                 continue;
@@ -445,7 +448,7 @@ fn foldGroupedWindows(
         @memset(ids, 0);
         var resolver = expr_agg.GroupKeyResolver.init(key_cols);
         defer resolver.deinit(wa);
-        try foldGroupedBatch(wa, gpa, &resolver, g.table, g.calls, key_cols, &win, lookup, &win_sel, ids, pos);
+        try foldGroupedBatch(wa, gpa, &resolver, g.table, g.calls, key_cols, &win, lookup, &win_sel, ids, pos, ctx);
         try part.pump(local, g.table, @intCast(win_sel.count()));
         off += n;
     }
@@ -852,7 +855,7 @@ fn scanRGForAggImpl(
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     const filter_pages = try pruneFilterPages(ra, in, page_indexes, stats, &sel);
     // Page pruning left few rows: decode just those, and let them stand for the row group from here on.
-    const keep = if (staged) null else try compactRows(ra, in, page_indexes, &sel, target);
+    const keep = if (staged) null else try compactRows(ra, in, page_indexes, &sel, target, ws.compaction);
     const batch_rows = if (keep != null) sel.count() else num_rows;
 
     const t_decode_start = nowMonoNs();
@@ -1031,6 +1034,7 @@ fn scanRGForAggImpl(
             .gpa = gpa,
             .side = side,
             .scalar = scalar,
+            .winner_charge = ws.fold_context.winner_charge,
             .handled = handled_via_stats,
             .batch = &batch,
             .lookup = lookup,
@@ -1052,6 +1056,7 @@ const WholeScalar = struct {
     gpa: std.mem.Allocator,
     side: std.mem.Allocator,
     scalar: @FieldType(AggTarget, "scalar"),
+    winner_charge: ?*expr_agg.WinnerCharge,
     handled: []const bool,
     batch: *const filter_eval.Batch,
     lookup: []?usize,
@@ -1097,7 +1102,7 @@ fn foldWholeScalar(c: WholeScalar) !void {
             CallBatch{ .batch = batch, .lookup = lookup };
         // `ca` is per-RG (or per-call) scratch; `gpa` is the persist allocator for owned results (string
         // min/max winner) that outlive both and the cross-worker merge.
-        try expr_agg.updateOne(ca, gpa, acc, call, &cb.batch, cb.lookup, sel);
+        try expr_agg.updateOneWithCharge(ca, gpa, acc, call, &cb.batch, cb.lookup, sel, c.winner_charge);
     }
 }
 
@@ -1166,6 +1171,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
             ws.expr_batch_rows,
             ws.budget,
             ws.region,
+            ws.fold_context,
         );
         const t_agg_end = nowMonoNs();
         ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
@@ -1185,7 +1191,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
             sel,
         ) else false;
     if (dense or (!staged and decode_options.encoded and
-        try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, sel, ws.budget, ws.region)))
+        try agg_coded.groupedCodedWithContext(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, sel, ws.budget, ws.region, ws.fold_context)))
     {
         const t_agg_end = nowMonoNs();
         ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
@@ -1223,7 +1229,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
             gathered.ordinals,
         );
         if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-            try expr_agg.updateTableGrouped(
+            try expr_agg.updateTableGroupedWithContext(
                 ra,
                 gpa,
                 g.table,
@@ -1233,13 +1239,14 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
                 &gathered.batch,
                 lookup,
                 &gathered.sel,
+                ws.fold_context,
             );
         };
     } else {
         try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, sel, group_id_arr, null);
         try expr_agg.sinkSketchRows(g.table, group_id_arr, sel);
         if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-            try expr_agg.updateTableGrouped(ra, gpa, g.table, group_id_arr, i, g.calls, &batch, lookup, sel);
+            try expr_agg.updateTableGroupedWithContext(ra, gpa, g.table, group_id_arr, i, g.calls, &batch, lookup, sel, ws.fold_context);
         };
     } else {
         try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, sel, group_id_arr, null);
@@ -1253,7 +1260,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
                 try dec.withCallColumns(ca, sp, i, &batch, lookup, sel_pre, true)
             else
                 CallBatch{ .batch = batch, .lookup = lookup };
-            try expr_agg.updateTableGrouped(
+            try expr_agg.updateTableGroupedWithContext(
                 ca,
                 gpa,
                 g.table,
@@ -1263,6 +1270,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
                 &cb.batch,
                 cb.lookup,
                 sel,
+                ws.fold_context,
             );
         };
     }
@@ -1823,7 +1831,7 @@ fn scanRGSliced(
                     continue;
                 for (s.calls, s.accumulators, handled) |call, *acc, h| {
                     if (h) continue;
-                    try expr_agg.updateOne(sa, gpa, acc, call, window.batch, lookup, &sel);
+                    try expr_agg.updateOneWithCharge(sa, gpa, acc, call, window.batch, lookup, &sel, ws.fold_context.winner_charge);
                 }
             },
             .grouped => |g| {
@@ -1848,6 +1856,7 @@ fn scanRGSliced(
                         ws.expr_batch_rows,
                         ws.budget,
                         null,
+                        ws.fold_context,
                     );
                     continue;
                 }
@@ -1868,7 +1877,7 @@ fn scanRGSliced(
                     cacheExpressionsSafe(target))
                 {
                     try agg_coded.codePlainKeys(sa, g.keys, cols, lookup);
-                    if (try agg_coded.groupedCoded(
+                    if (try agg_coded.groupedCodedWithContext(
                         sa,
                         gpa,
                         g.calls,
@@ -1880,6 +1889,7 @@ fn scanRGSliced(
                         &sel,
                         ws.budget,
                         null,
+                        ws.fold_context,
                     )) continue;
                 }
                 // A refused dictionary product may leave one key coded and another PLAIN. The ordinary key
@@ -1905,6 +1915,7 @@ fn scanRGSliced(
                     &sel,
                     ids,
                     g.pos_base + done,
+                    ws.fold_context,
                 );
             },
         }
@@ -2059,6 +2070,7 @@ fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !voi
         null,
         null,
         null,
+        .{},
     );
     try part.flush(&local, &table);
     try part.foldRuns(1);

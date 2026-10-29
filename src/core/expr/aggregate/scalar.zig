@@ -4,7 +4,6 @@ const expr_eval = @import("../eval.zig");
 const agg_coded = @import("../agg_coded.zig");
 const SharedBudget = @import("../../memory.zig").SharedBudget;
 const DistinctSet = @import("distinct.zig").DistinctSet;
-const considerWinner = @import("accumulator.zig").considerWinner;
 const filter_eval = @import("../../filter/eval.zig");
 const types = @import("types.zig");
 const OutputCol = types.OutputCol;
@@ -893,7 +892,23 @@ pub fn updateOne(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
-    if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel)) return;
+    return updateOneWithCharge(arena, persist, state, call, batch, column_lookup, outer_sel, null);
+}
+
+pub fn updateOneWithCharge(
+    arena: std.mem.Allocator,
+    /// Long-lived allocator for owned results that must outlive `arena`
+    /// (the per-RG scratch) and the cross-worker merge — currently just
+    /// the string min/max winner. Pass the query/worker `gpa`.
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    column_lookup: []const ?usize,
+    outer_sel: *const filter_selection.SelectionVector,
+    charge: ?*@import("accumulator.zig").WinnerCharge,
+) Error!void {
+    if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel, charge)) return;
     var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, true);
     defer input.deinit(arena);
     const sel = input.selection();
@@ -905,11 +920,11 @@ pub fn updateOne(
         .count_distinct => try foldDistinct(persist, state, values.?, sel),
         .sum => try foldSum(state, values.?, sel, u64_col, call.offset, if (input.gathered_from) |*g| g else null),
         .min => if (call.result == .bytes)
-            try foldMinMaxBytes(persist, true, state, values.?, sel)
+            try foldMinMaxBytesWithCharge(persist, true, state, values.?, sel, charge)
         else
             foldMin(state, values.?, sel, u64_col),
         .max => if (call.result == .bytes)
-            try foldMinMaxBytes(persist, false, state, values.?, sel)
+            try foldMinMaxBytesWithCharge(persist, false, state, values.?, sel, charge)
         else
             foldMax(state, values.?, sel, u64_col),
         .avg => try foldAvg(state, values.?, sel, u64_col, if (input.gathered_from) |*g| g else null),
@@ -1064,6 +1079,17 @@ pub fn foldMinMaxBytes(
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
 ) Error!void {
+    return foldMinMaxBytesWithCharge(persist, is_min, state, col, sel, null);
+}
+
+pub fn foldMinMaxBytesWithCharge(
+    persist: std.mem.Allocator,
+    comptime is_min: bool,
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    charge: ?*@import("accumulator.zig").WinnerCharge,
+) Error!void {
     const vals = col.string.values;
     const def_levels = col.string.def_levels;
     const max_def = col.string.max_def;
@@ -1094,7 +1120,7 @@ pub fn foldMinMaxBytes(
         .min_bytes, .max_bytes => |*s| s,
         else => unreachable,
     };
-    try considerWinner(persist, is_min, slot, cand);
+    try @import("accumulator.zig").considerWinnerWithCharge(persist, is_min, slot, cand, charge);
 }
 
 /// The first 16 bytes of `s` as a big-endian integer, zero-padded: a strictly lesser prefix means a strictly lesser

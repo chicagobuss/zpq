@@ -131,6 +131,7 @@ pub fn updateOneCoded(
     batch: *const filter_eval.Batch,
     lookup: []const ?usize,
     outer_sel: *const Sel,
+    charge: ?*agg.WinnerCharge,
 ) Error!bool {
     if (call.func == .count) if (call.arg) |arg| if (arg == .col_ref) {
         const pos = lookup[arg.col_ref.col_idx] orelse return error.BadColumn;
@@ -150,7 +151,7 @@ pub fn updateOneCoded(
         if (hcol.hist()) |h| {
             std.debug.assert(call.where == null);
             const dict = try widenDict(arena, hcol, arg.col_ref);
-            try foldHist(persist, state, call, dict, h, arg.col_ref.unsigned_64);
+            try foldHist(persist, state, call, dict, h, arg.col_ref.unsigned_64, charge);
             return true;
         }
     };
@@ -182,7 +183,7 @@ pub fn updateOneCoded(
     }
     const hist = try histogram(arena, col.codes().?, col.dictLen(), sel);
     const dict = try widenDict(arena, col, c);
-    try foldHist(persist, state, call, dict, hist, c.unsigned_64);
+    try foldHist(persist, state, call, dict, hist, c.unsigned_64, charge);
     return true;
 }
 
@@ -244,6 +245,7 @@ fn foldHist(
     dict: Column,
     hist: []const u64,
     unsigned_64: bool,
+    charge: ?*agg.WinnerCharge,
 ) Error!void {
     var total: u64 = 0;
     for (hist) |h| total += h;
@@ -313,7 +315,7 @@ fn foldHist(
                         const ord = std.mem.order(u8, cand, cur);
                         if (!((is_min and ord == .lt) or (!is_min and ord == .gt))) return;
                     }
-                    try agg.persistWinner(persist, m, cand);
+                    try @import("aggregate/accumulator.zig").persistWinnerWithCharge(persist, m, cand, charge);
                 },
                 else => unreachable,
             }
@@ -514,6 +516,26 @@ pub fn groupedCoded(
     /// The region `ra` allocates from, whose ledger must take that scratch too.
     region: ?*huge_pages.Region,
 ) !bool {
+    return groupedCodedWithContext(ra, gpa, calls, keys, table, pos_base, batch, lookup, sel, budget, region, .{});
+}
+
+pub fn groupedCodedWithContext(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    calls: []const AggCall,
+    keys: []const expr_ast.Expr,
+    table: *agg.GroupTable,
+    /// `agg.firstPosition` of row 0.
+    pos_base: u64,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const Sel,
+    /// Charged for a composite space past `MAX_COMPOSITE`; null keeps grouping by code to the free spaces.
+    budget: ?*DecodeBudget,
+    /// The region `ra` allocates from, whose ledger must take that scratch too.
+    region: ?*huge_pages.Region,
+    ctx: agg.FoldContext,
+) !bool {
     if (table.discovery != null) return false;
     const num_rows = batch.num_rows;
     if (keys.len == 1 and keys[0] == .col_ref) if (lookup[keys[0].col_ref.col_idx]) |pos| {
@@ -620,8 +642,8 @@ pub fn groupedCoded(
         if (fused[ai]) continue;
         const accs = table.accumulators.items;
         // Inlining the large reduction kernel into the scan increases register pressure on dense controls.
-        try @call(.never_inline, foldGroupedCall, .{
-            ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, table,
+        try @call(.never_inline, foldGroupedCallWithContext, .{
+            ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, fold_sel, table, ctx,
         });
     }
     return true;
@@ -722,6 +744,21 @@ pub fn foldDenseCalls(
     lookup: []const ?usize,
     outer: *const Sel,
 ) !void {
+    return foldDenseCallsWithContext(ra, gpa, accs, gid_of, comp, calls, batch, lookup, outer, .{});
+}
+
+pub fn foldDenseCallsWithContext(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    ctx: agg.FoldContext,
+) !void {
     var view = agg.GroupTable.init(gpa, 0);
     view.accumulators.items = accs;
     view.accumulators.capacity = accs.len;
@@ -729,8 +766,8 @@ pub fn foldDenseCalls(
     if (try foldExactBatch(ra, gpa, &view, gid_of, comp, space, calls, batch, lookup, outer)) return;
     if (try foldFloatBatches(ra, gpa, &view, gid_of, comp, space, calls, batch, lookup, outer)) return;
     for (calls, 0..) |call, ai| {
-        try @call(.never_inline, foldGroupedCall, .{
-            ra, gpa, accs, gid_of, comp, space, ai, calls.len, call, batch, lookup, outer, null,
+        try @call(.never_inline, foldGroupedCallWithContext, .{
+            ra, gpa, accs, gid_of, comp, space, ai, calls.len, call, batch, lookup, outer, null, ctx,
         });
     }
 }
@@ -823,6 +860,7 @@ fn foldExactBatch(
                 outer,
                 table,
                 v,
+                .{},
             );
         } else {
             try foldGroupedCall(
@@ -972,6 +1010,7 @@ fn foldFloatBatches(
                 &sel,
                 table,
                 values[r],
+                .{},
             );
         };
         off += n;
@@ -1516,6 +1555,25 @@ pub fn foldGroupedCall(
     outer: *const Sel,
     maybe_table: anytype,
 ) !void {
+    return foldGroupedCallWithContext(ra, gpa, accs, gid_of, comp, space, ai, agg_len, call, batch, lookup, outer, maybe_table, .{});
+}
+
+pub fn foldGroupedCallWithContext(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    ai: usize,
+    agg_len: usize,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const Sel,
+    maybe_table: anytype,
+    ctx: agg.FoldContext,
+) !void {
     return foldGroupedValue(
         ra,
         gpa,
@@ -1531,6 +1589,7 @@ pub fn foldGroupedCall(
         outer,
         maybe_table,
         null,
+        ctx,
     );
 }
 
@@ -1870,6 +1929,7 @@ fn foldGroupedValue(
     outer: *const Sel,
     maybe_table: anytype,
     prepared: ?Column,
+    fold_ctx: agg.FoldContext,
 ) !void {
     // Dense lanes pass literal null, specializing away record access on the established typed-array path.
     const table: ?*agg.GroupTable = maybe_table;
@@ -1926,8 +1986,8 @@ fn foldGroupedValue(
     const float_sum = floatSum(call);
     // Ordinary histograms defer to pair sinks. Cache-admitted coded bits can retain exact sets beside an automatic
     // sink; the final fold drains them if any chunk emits pairs, or keeps the normal union otherwise.
-    const to_pairs = call.func == .count_distinct and if (agg.distinct_pairs) |dp| dp.active else false;
-    const keep_coded_sets = to_pairs and agg.distinct_pairs.?.allow_coded_sets;
+    const to_pairs = call.func == .count_distinct and if (fold_ctx.distinct_pairs) |dp| dp.active else false;
+    const keep_coded_sets = to_pairs and fold_ctx.distinct_pairs.?.allow_coded_sets;
     if (call.func == .count_distinct and (!to_pairs or keep_coded_sets) and
         call.arg.? == .col_ref and arg_col.?.codes() != null)
     {
@@ -1952,7 +2012,7 @@ fn foldGroupedValue(
             }.row, .{ .bits = bits, .comp = comp, .words = words, .codes = col.codes().?, .card = card, .bad = &bad });
             if (bad) return error.BadColumn;
             const dict = try widenDict(ra, col, call.arg.?.col_ref);
-            if (keep_coded_sets) agg.distinct_pairs.?.pending_sets = true;
+            if (keep_coded_sets) fold_ctx.distinct_pairs.?.pending_sets = true;
             for (0..space) |cp| {
                 for (bits[cp * words ..][0..words], 0..) |word, wi| {
                     if (word == 0) continue;
@@ -1993,7 +2053,7 @@ fn foldGroupedValue(
             if (!any) continue;
             var local: Accumulator = undefined;
             const st = statePtr(table, accs, gid_of[cp], ai, agg_len, &local);
-            try foldHist(gpa, st, call, dict, hist, c.unsigned_64);
+            try foldHist(gpa, st, call, dict, hist, c.unsigned_64, fold_ctx.winner_charge);
             if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
         }
         return;
@@ -2025,7 +2085,7 @@ fn foldGroupedValue(
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
         for (gids, comp) |*g, cp| g.* = gid_of[cp];
-        try agg.updateOneGroupedValues(ra, gpa, accs, gids, ai, agg_len, call, vals_col, sel, unsigned_64);
+        try agg.updateOneGroupedValuesWithContext(ra, gpa, accs, gids, ai, agg_len, call, vals_col, sel, unsigned_64, fold_ctx);
         return;
     }
     return foldGroupedNumeric(ra, accs, gid_of, comp, space, ai, agg_len, call, sel, table, vals_col, unsigned_64);
@@ -3145,9 +3205,6 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
             .allow_coded_sets = true,
         };
         defer pairs.deinit();
-        const old_pairs = agg.distinct_pairs;
-        agg.distinct_pairs = &pairs;
-        defer agg.distinct_pairs = old_pairs;
         const calls = [_]AggCall{call};
         for (0..3) |g| {
             const key = [_]u8{@intCast(g)};
@@ -3160,7 +3217,7 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
             selected.set(r, keep);
             if (keep and defs[r] != 0) expected[comp[r]][@intCast(dictionary[r] + 7)] = true;
         }
-        try foldGroupedCall(
+        try foldGroupedCallWithContext(
             ra,
             a,
             table.accumulators.items,
@@ -3174,6 +3231,7 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
             &.{0},
             &selected,
             &table,
+            .{ .distinct_pairs = &pairs },
         );
         for (expected, 0..) |bits, g| {
             var n: usize = 0;
@@ -3182,7 +3240,7 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
         }
         codes[128] = 129;
         selected.set(128, true);
-        if (foldGroupedCall(
+        if (foldGroupedCallWithContext(
             ra,
             a,
             table.accumulators.items,
@@ -3196,6 +3254,7 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
             &.{0},
             &selected,
             &table,
+            .{ .distinct_pairs = &pairs },
         )) return error.TestExpectedError else |e| {
             if (e == error.OutOfMemory) return e;
             try testing.expectEqual(error.BadColumn, e);
@@ -3206,7 +3265,7 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
             try testing.expectEqual(@as(usize, 0), pairs.charged);
             var one = try Sel.init(ra, 1);
             one.set(0, true);
-            try agg.updateOneGroupedValues(
+            try agg.updateOneGroupedValuesWithContext(
                 ra,
                 a,
                 table.accumulators.items,
@@ -3217,6 +3276,7 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
                 .{ .i64 = .{ .values = &.{5000} } },
                 &one,
                 false,
+                .{ .distinct_pairs = &pairs },
             );
             try testing.expect(pairs.charged != 0);
             try pairs.drainTable(&table);

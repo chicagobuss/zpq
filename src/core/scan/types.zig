@@ -159,6 +159,7 @@ pub const MultiAggArgs = struct {
     /// Forced flat decode windows; zero keeps ordinary memory admission.
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,
+    compaction: ?*consumer.CompactionControl = null,
     /// See `consumer.DecodeOptions.encoded`.
     encoded: bool = true,
     /// Query-wide raw string identity; disabled after a rescannable budget refusal.

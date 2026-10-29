@@ -144,6 +144,7 @@ pub const AggTarget = target_module.AggTarget;
 
 const workspace_module = @import("consumer/workspace.zig");
 pub const AggWorkspace = workspace_module.AggWorkspace;
+pub const CompactionControl = workspace_module.CompactionControl;
 const admitWhole = workspace_module.admitWhole;
 const dropRegion = workspace_module.dropRegion;
 const refusedDraw = workspace_module.refusedDraw;
@@ -222,10 +223,6 @@ const decodeWithReaderPruned = consumer_column.decodeWithReaderPruned;
 const decodeFloat16ColumnAsF64Pruned = consumer_column.decodeFloat16ColumnAsF64Pruned;
 const decodeU32ColumnAsI64Pruned = consumer_column.decodeU32ColumnAsI64Pruned;
 const decodeFloat16ColumnAsF64 = consumer_column.decodeFloat16ColumnAsF64;
-
-/// Test-only: off compares compact decoding with whole columns; the count shows a test reached it.
-pub var compact_rows_in_tests = true;
-pub var compacted_row_groups: std.atomic.Value(usize) = .init(0);
 
 // ============================================================
 // Compile-time API check. End-to-end behavior is exercised through

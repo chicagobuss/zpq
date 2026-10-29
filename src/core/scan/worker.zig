@@ -143,8 +143,6 @@ fn workerRun(w: *Worker) void {
         span.end(.scan_worker, profile.args(.{ w.index, items, u.user_ns, u.sys_ns, u.minor_faults, u.major_faults }));
     };
     w.timings.prof = prof;
-    expr_agg.distinct_pairs = w.pairs;
-    defer expr_agg.distinct_pairs = null;
     consumer.setDecodeFailure(null);
     w.failure_work = null;
     resetAttemptFlags(w);
@@ -353,12 +351,10 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             } }
         else
             .{ .scalar = .{ .calls = sub_agg_calls, .accumulators = item.accumulators } };
-        expr_agg.winner_charge = w.winners;
         if (w.records) |records| switch (records.*) {
             .selected => |arm| arm.start(w.record_starts[idx], idx),
             else => records.start(w.record_starts[idx], idx),
         };
-        defer expr_agg.winner_charge = null;
         const matched = consumer.scanRGForAgg(w.gpa, .{
             .subgroup = item.subgroup,
             .rg = rg,
@@ -387,6 +383,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .decode_batch_rows = w.decode_batch_rows,
             .auto_decode_batches = w.auto_decode_batches,
             .cache_hints = w.cache_hints,
+            .compaction = w.compaction,
+            .fold_context = .{ .winner_charge = w.winners, .distinct_pairs = w.pairs },
             .scan_workers = w.scan_workers,
             .defer_decode_errors = w.failure_probe != null,
         }) catch |err| {

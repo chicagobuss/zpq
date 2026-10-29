@@ -9,7 +9,6 @@ const types = @import("types.zig");
 const AggCall = types.AggCall;
 const Error = types.Error;
 const Accumulator = @import("accumulator.zig").Accumulator;
-const considerWinner = @import("accumulator.zig").considerWinner;
 const GroupTable = @import("group_table.zig").GroupTable;
 const DistinctSet = @import("distinct.zig").DistinctSet;
 const scalar = @import("scalar.zig");
@@ -18,8 +17,11 @@ const exactAt = scalar.exactAt;
 const foldExtremeF = scalar.foldExtremeF;
 const isRowNull = @import("contracts.zig").isRowNull;
 const splitMix64 = @import("census.zig").splitMix64;
-// Known exception: the facade owns writable thread-local state until the later contract pass.
-const agg_threadlocals = @import("../agg.zig");
+
+pub const FoldContext = struct {
+    winner_charge: ?*@import("accumulator.zig").WinnerCharge = null,
+    distinct_pairs: ?*DistinctPairs = null,
+};
 
 /// A row's place in the input, for first-appearance group order: its row group's ordinal across all inputs (files
 /// in order, then their row groups) above the row's index within the row group.
@@ -41,9 +43,25 @@ pub fn updateOneGrouped(
     column_lookup: []const ?usize,
     outer_sel: *const filter_selection.SelectionVector,
 ) Error!void {
+    return updateOneGroupedWithContext(arena, persist, accs, group_id_arr, agg_idx, agg_len, call, batch, column_lookup, outer_sel, .{});
+}
+
+pub fn updateOneGroupedWithContext(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    accs: []Accumulator,
+    group_id_arr: []const u32,
+    agg_idx: usize,
+    agg_len: usize,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    column_lookup: []const ?usize,
+    outer_sel: *const filter_selection.SelectionVector,
+    ctx: FoldContext,
+) Error!void {
     var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, false);
     defer input.deinit(arena);
-    try updateOneGroupedValues(
+    try updateOneGroupedValuesWithContext(
         arena,
         persist,
         accs,
@@ -54,6 +72,7 @@ pub fn updateOneGrouped(
         input.values,
         input.selection(),
         input.unsigned_64,
+        ctx,
     );
 }
 
@@ -68,7 +87,22 @@ pub fn updateTableGrouped(
     lookup: []const ?usize,
     outer: *const filter_selection.SelectionVector,
 ) Error!void {
-    if (table.compact.stride == 0) return updateOneGrouped(
+    return updateTableGroupedWithContext(arena, persist, table, ids, i, calls, batch, lookup, outer, .{});
+}
+
+pub fn updateTableGroupedWithContext(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    table: *GroupTable,
+    ids: []const u32,
+    i: usize,
+    calls: []const AggCall,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    outer: *const filter_selection.SelectionVector,
+    ctx: FoldContext,
+) Error!void {
+    if (table.compact.stride == 0) return updateOneGroupedWithContext(
         arena,
         persist,
         table.accumulators.items,
@@ -79,6 +113,7 @@ pub fn updateTableGrouped(
         batch,
         lookup,
         outer,
+        ctx,
     );
     if (table.compact.fields[i].shared_sum) return;
     var input: PreparedAggInput = try .init(arena, calls[i], batch, lookup, outer, false);
@@ -99,15 +134,31 @@ pub fn updateOneGroupedValues(
     sel: *const filter_selection.SelectionVector,
     u64_col: bool,
 ) Error!void {
+    return updateOneGroupedValuesWithContext(arena, persist, accs, group_id_arr, agg_idx, agg_len, call, values, sel, u64_col, .{});
+}
+
+pub fn updateOneGroupedValuesWithContext(
+    arena: std.mem.Allocator,
+    persist: std.mem.Allocator,
+    accs: []Accumulator,
+    group_id_arr: []const u32,
+    agg_idx: usize,
+    agg_len: usize,
+    call: AggCall,
+    values: ?filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    u64_col: bool,
+    ctx: FoldContext,
+) Error!void {
     _ = arena;
     if (call.func == .count_distinct) {
-        return foldDistinctGrouped(persist, accs, group_id_arr, agg_idx, agg_len, values.?, sel);
+        return foldDistinctGrouped(persist, accs, group_id_arr, agg_idx, agg_len, values.?, sel, ctx);
     }
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (sel.isActive(r)) {
             const state = &accs[group_id_arr[r] * agg_len + agg_idx];
-            try applyGrouped(persist, state, call, values, r, u64_col);
+            try applyGrouped(persist, state, call, values, r, u64_col, ctx);
         }
     }
 }
@@ -119,6 +170,7 @@ fn applyGrouped(
     values: ?filter_eval.Batch.Column,
     r: usize,
     u64_col: bool,
+    ctx: FoldContext,
 ) !void {
     switch (call.func) {
         .count => state.count += 1,
@@ -127,11 +179,11 @@ fn applyGrouped(
         .count_distinct => return error.UnsupportedAggType,
         .sum => try foldSumGroupedOne(state, values.?, r, u64_col, call.offset),
         .min => if (call.result == .bytes)
-            try foldMinMaxBytesGroupedOne(persist, true, state, values.?, r)
+            try foldMinMaxBytesGroupedOneWithCharge(persist, true, state, values.?, r, ctx.winner_charge)
         else
             foldMinGroupedOne(state, values.?, r, u64_col),
         .max => if (call.result == .bytes)
-            try foldMinMaxBytesGroupedOne(persist, false, state, values.?, r)
+            try foldMinMaxBytesGroupedOneWithCharge(persist, false, state, values.?, r, ctx.winner_charge)
         else
             foldMaxGroupedOne(state, values.?, r, u64_col),
         .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
@@ -159,6 +211,19 @@ pub const GroupedPreps = struct {
         calls: []const AggCall,
         compact: ?*const @import("../agg_state.zig").State,
     ) !void {
+        return self.foldWithContext(persist, accs, group_id_arr, rows, calls, compact, .{});
+    }
+
+    pub fn foldWithContext(
+        self: *const GroupedPreps,
+        persist: std.mem.Allocator,
+        accs: []Accumulator,
+        group_id_arr: []const u32,
+        rows: []const u32,
+        calls: []const AggCall,
+        compact: ?*const @import("../agg_state.zig").State,
+        ctx: FoldContext,
+    ) !void {
         for (calls, self.mem, 0..) |call, prep, i| {
             const sel = prep.selection();
             if (compact) |c| {
@@ -168,7 +233,7 @@ pub const GroupedPreps = struct {
             for (rows) |r| {
                 if (!sel.isActive(r)) continue;
                 const state = &accs[group_id_arr[r] * calls.len + i];
-                try applyGrouped(persist, state, call, prep.values, r, prep.unsigned_64);
+                try applyGrouped(persist, state, call, prep.values, r, prep.unsigned_64, ctx);
             }
         }
     }
@@ -328,6 +393,7 @@ fn foldDistinctGrouped(
     agg_len: usize,
     col: filter_eval.Batch.Column,
     sel: *const filter_selection.SelectionVector,
+    ctx: FoldContext,
 ) Error!void {
     switch (col) {
         .i64 => |c| try foldDistinctU64(
@@ -340,6 +406,7 @@ fn foldDistinctGrouped(
             c.def_levels,
             c.max_def,
             sel,
+            ctx,
             struct {
                 fn bit(v: i64) u64 {
                     return @bitCast(v);
@@ -356,6 +423,7 @@ fn foldDistinctGrouped(
             c.def_levels,
             c.max_def,
             sel,
+            ctx,
             struct {
                 fn bit(v: i32) u64 {
                     return @as(u64, @bitCast(@as(i64, v)));
@@ -372,6 +440,7 @@ fn foldDistinctGrouped(
             c.def_levels,
             c.max_def,
             sel,
+            ctx,
             struct {
                 fn bit(v: f64) u64 {
                     var f = v;
@@ -390,6 +459,7 @@ fn foldDistinctGrouped(
             c.def_levels,
             c.max_def,
             sel,
+            ctx,
             struct {
                 fn bit(v: f32) u64 {
                     var f: f64 = v;
@@ -408,6 +478,7 @@ fn foldDistinctGrouped(
             c.def_levels,
             c.max_def,
             sel,
+            ctx,
             struct {
                 fn bit(v: bool) u64 {
                     return if (v) 1 else 0;
@@ -416,7 +487,7 @@ fn foldDistinctGrouped(
         ),
         .string, .i128 => {
             // The plan sends only fixed-width numeric values to a pair sink; a set here would be counted twice.
-            if (agg_threadlocals.distinct_pairs) |dp| if (dp.active and dp.table.accumulators.items.ptr == accs.ptr)
+            if (ctx.distinct_pairs) |dp| if (dp.active and dp.table.accumulators.items.ptr == accs.ptr)
                 return error.UnsupportedAggType;
             var r: usize = 0;
             while (r < sel.len) : (r += 1) {
@@ -437,9 +508,10 @@ fn foldDistinctU64(
     def_levels: ?[]const u32,
     max_def: u32,
     sel: *const filter_selection.SelectionVector,
+    ctx: FoldContext,
     comptime bit: fn (@typeInfo(@TypeOf(values)).pointer.child) u64,
 ) Error!void {
-    if (agg_threadlocals.distinct_pairs) |dp| if (dp.active and dp.table.accumulators.items.ptr == accs.ptr) {
+    if (ctx.distinct_pairs) |dp| if (dp.active and dp.table.accumulators.items.ptr == accs.ptr) {
         if (agg_idx != dp.agg_idx) return error.UnsupportedAggType;
         var r: usize = 0;
         while (r < sel.len) : (r += 1) {
@@ -450,7 +522,7 @@ fn foldDistinctU64(
         return;
     };
     var fed: u64 = 0;
-    defer if (agg_threadlocals.distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr and dp.agg_idx == agg_idx) {
+    defer if (ctx.distinct_pairs) |dp| if (dp.table.accumulators.items.ptr == accs.ptr and dp.agg_idx == agg_idx) {
         dp.seen += fed;
     };
     var r: usize = 0;
@@ -544,13 +616,24 @@ pub fn foldMinMaxBytesGroupedOne(
     col: filter_eval.Batch.Column,
     r: usize,
 ) !void {
+    return foldMinMaxBytesGroupedOneWithCharge(persist, is_min, state, col, r, null);
+}
+
+pub fn foldMinMaxBytesGroupedOneWithCharge(
+    persist: std.mem.Allocator,
+    is_min: bool,
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    r: usize,
+    charge: ?*@import("accumulator.zig").WinnerCharge,
+) !void {
     const sv = col.string.values[r];
     switch (state.*) {
         .min_arena, .max_arena => |*value| return value.consider(sv, is_min),
         else => {},
     }
     const m_ptr = if (is_min) &state.min_bytes else &state.max_bytes;
-    try considerWinner(persist, is_min, m_ptr, sv);
+    try @import("accumulator.zig").considerWinnerWithCharge(persist, is_min, m_ptr, sv, charge);
 }
 
 fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) !void {
@@ -639,18 +722,16 @@ test "grouped string winner replacement funds both live copies before allocating
         var ledger: SharedBudget = .{ .limit = 3 << 19 };
         var charge: WinnerCharge = .{ .ledger = &ledger };
         var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
-        agg_threadlocals.winner_charge = &charge;
-        defer agg_threadlocals.winner_charge = null;
         defer {
             const value = if (is_min) state.min_bytes else state.max_bytes;
             if (value) |bytes| a.free(bytes);
             charge.settle(0);
             std.debug.assert(ledger.used.load(.monotonic) == 0);
         }
-        try foldMinMaxBytesGroupedOne(a, is_min, &state, col, 0);
+        try foldMinMaxBytesGroupedOneWithCharge(a, is_min, &state, col, 0, &charge);
         const before = ledger.used.load(.monotonic);
         try testing.expectEqual(winnerBytes(old.len), before);
-        try testing.expectError(error.ExceededMemoryBudget, foldMinMaxBytesGroupedOne(a, is_min, &state, col, 1));
+        try testing.expectError(error.ExceededMemoryBudget, foldMinMaxBytesGroupedOneWithCharge(a, is_min, &state, col, 1, &charge));
         try testing.expectEqual(before, ledger.used.load(.monotonic));
         try testing.expectEqualStrings(old, (if (is_min) state.min_bytes else state.max_bytes).?);
         try testing.expect(ledger.peak.load(.monotonic) <= ledger.limit);

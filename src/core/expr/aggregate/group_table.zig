@@ -2235,8 +2235,33 @@ test "shared integer duplicate counts decline levels-only and short value lanes 
 
 test "M1 parallel DISTINCT source charges and releases preserve the private ceiling" {
     const a = std.testing.allocator;
-    var table = GroupTable.init(a, 8 * @sizeOf(DistinctSet));
+    // Each spilled set owns value and map-capacity credit as well as its object. Measure the reservation including
+    // growth, then fund exactly eight such sets: object-only credit can legitimately refuse eight concurrent workers.
+    var table = GroupTable.init(a, 1 << 20);
     defer table.deinit();
+    var sample = table.freshDistinct();
+    for (0..4) |i| try sample.insertU64(a, i);
+    const per_set = table.allocated_bytes;
+    try std.testing.expect(per_set > @sizeOf(DistinctSet));
+    sample.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    table.max_memory_bytes = 8 * per_set;
+
+    // Fill the ceiling with eight simultaneously live sets and verify an extra byte cannot be charged.
+    var live: [8]DistinctAcc = undefined;
+    var initialized: usize = 0;
+    defer for (live[0..initialized]) |*set| set.deinit(a);
+    for (&live) |*set| {
+        set.* = table.freshDistinct();
+        initialized += 1;
+        for (0..4) |i| try set.insertU64(a, i);
+    }
+    try std.testing.expectEqual(table.max_memory_bytes, table.allocated_bytes);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.chargePrivateBytes(1));
+    for (&live) |*set| set.deinit(a);
+    initialized = 0;
+    try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), table.set_objects);
     const Task = struct {
         table: *GroupTable,
         allocator: std.mem.Allocator,

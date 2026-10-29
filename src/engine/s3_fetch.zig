@@ -37,7 +37,6 @@ test "S3 fetch window caps only the Lambda default and preserves explicit overri
     try std.testing.expectEqual(@as(u64, 512 << 20), s3FetchWindow(null, 2 << 30));
 }
 
-
 /// Bytes of the object tail one suffix GET asks for. The footer, a page index and a Bloom run written at the end of
 /// the file usually fit, so cold open is one round trip. `ZPQ_S3_FOOTER_PROBE` overrides it, in bytes, but never
 /// above the budget-derived maximum from `footerProbeFor`: `--max-memory` wins, and a larger override is clamped
@@ -69,7 +68,6 @@ pub fn footerProbeFor(env: std.process.Environ, budget: u64, concurrent: usize) 
     }
     return requested;
 }
-
 
 /// In-flight footer responses and retained suffixes, against one resident budget. A charge that does not fit is
 /// refused: the caller drops the suffix and fetches those ranges later.
@@ -113,7 +111,6 @@ pub const ByteAccount = struct {
     }
 };
 
-
 /// Where a footer suffix of `body_len` bytes starts in an object of `total` bytes. The total is the server's word
 /// (Content-Range); one smaller than the suffix it came with is a bad response.
 pub fn suffixStart(total: u64, body_len: usize) error{BadResponse}!u64 {
@@ -133,7 +130,6 @@ test "a footer suffix whose Content-Range total is smaller than its body is a ba
     try std.testing.expectEqual(@as(u64, 0), try suffixStart(100, 100));
     try std.testing.expectEqual(@as(u64, 900), try suffixStart(1000, 100));
 }
-
 
 test "footer probe defaults to 1 MiB and ZPQ_S3_FOOTER_PROBE overrides it" {
     try std.testing.expectEqual(FOOTER_PROBE_DEFAULT, footerProbeBytes(.empty));
@@ -156,7 +152,6 @@ test "footer probe defaults to 1 MiB and ZPQ_S3_FOOTER_PROBE overrides it" {
     const over = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=16777216"};
     try std.testing.expectEqual(@as(u64, 512 << 10), footerProbeFor(.{ .block = .{ .slice = &over } }, 8 << 20, 8));
 }
-
 
 const nowMonoNs = @import("../clock.zig").monoNs;
 const s3 = @import("../io/s3.zig");
@@ -191,19 +186,16 @@ pub const FetchWindow = struct {
     footer_only: bool = false,
 };
 
-
 /// Footer and metadata worker loops. One worker holds one permit. A worker sleeping in retry backoff still holds
 /// its slot, so live concurrency can dip below this while a host throttles. Data fetches pass `s3.inFlight`;
 /// `s3.DataWave` holds the first of those at `s3.firstWaveCap` (`ZPQ_S3_FIRST_WAVE`, default `S3_FIRST_WAVE`) until
 /// a data-range response header arrives.
 pub const READ_CONCURRENCY: usize = s3.S3_FIRST_WAVE;
 
-
 pub const PAR1: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
-
 /// What the S3 planner fetches from each row group.
-const RangePlan = union(enum) {
+pub const RangePlan = union(enum) {
     /// Aggregates and GROUP BY: the very plan the scan workers follow, made from the same footers, so a chunk left
     /// unfetched is one no worker reads.
     aggregate: agg_plan.Plan,
@@ -265,7 +257,6 @@ const RangePlan = union(enum) {
 };
 
 /// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
-
 /// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
 pub fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.FileMetaData) !RangePlan {
     const meta0 = &metas[0];
@@ -367,7 +358,6 @@ pub fn orderFilterFirst(arena: std.mem.Allocator, jobs: []s3.FetchJob, filters: 
         n += 1;
     }
 }
-
 
 /// Per-s3-file state during the meta-fetch + range-fetch dance.
 /// `file_buf` is a compact packed buffer containing only fetched ranges.
@@ -1012,7 +1002,6 @@ fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
     };
 }
 
-
 test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
     // The CLI passes `--group-by` alone as an empty aggregate list. The scan accepts that; the S3 planner used to
     // parse the empty list itself and fail with EmptyAggregate, so the same query answered locally and errored on S3.
@@ -1033,7 +1022,6 @@ test "S3 range plan: GROUP BY with no aggregates plans like the scan" {
     try std.testing.expectEqual(@as(?[]const bool, null), plan.rowGroupColumns(&rgs[0], &metas[0]));
     try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false, false }, plan.rowGroupColumns(&rgs[7], &metas[0]).?);
 }
-
 
 test "S3 Bloom reads keep the Lambda calibration in-region and measure a distant link" {
     var m: S3Membership = .{ .ctx = undefined, .creds = undefined, .pool = undefined, .specs = &.{} };
@@ -1075,4 +1063,3 @@ test "regression: releaseTail keeps aliased warm footer ownership and clears col
     try std.testing.expectEqual(@as(u8, 42), footer[0]);
     cold.releaseTail(a);
 }
-

@@ -9,7 +9,7 @@ const filter_ast = @import("../core/filter/ast.zig");
 const filter_parser = @import("../core/filter/parser.zig");
 const Diag = @import("../core/diag.zig").Diag;
 const QueryArgs = @import("types.zig").QueryArgs;
-const RowSortKey = @import("rank.zig").RowSortKey;
+const RowSortKey = @import("types.zig").RowSortKey;
 
 /// Set `set[i]` for each leaf a `--columns` name selects. A name that selects nothing is `UnknownColumn`, named
 /// through `diag`, as in --select and --filter: dropping it wrote a file short of that column, or of every column.
@@ -116,7 +116,6 @@ fn outputColumnNames(
     };
     return names;
 }
-
 
 fn sameName(name: []const u8) []const u8 {
     return name;
@@ -260,7 +259,6 @@ pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const s
     };
 }
 
-
 /// The query's filter bound against `meta`. Under `--trust-stats` its leaves trust plausible statistics, and a
 /// FLOAT/DOUBLE chunk without a NaN count prunes as if it had none (`ast.trustStats`); every row-group and page
 /// decision reads that from the leaves.
@@ -268,4 +266,3 @@ pub fn bindFilter(arena: std.mem.Allocator, text: []const u8, meta: *const schem
     const f = try filter_parser.parse(arena, text, meta, args.diag);
     return if (args.trust_stats) filter_ast.trustStats(arena, f) else f;
 }
-

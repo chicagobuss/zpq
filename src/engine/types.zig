@@ -15,7 +15,7 @@ const filter_ast = @import("../core/filter/ast.zig");
 const membership = @import("../core/filter/membership.zig");
 const ResultProgram = @import("../core/result_program.zig").ResultProgram;
 const Diag = @import("../core/diag.zig").Diag;
-const text_format = @import("text.zig");
+const text_format = @import("text_types.zig");
 const TextKind = text_format.TextKind;
 const AnswerType = text_format.AnswerType;
 const DecimalColumns = text_format.DecimalColumns;
@@ -23,12 +23,10 @@ const DecimalColumns = text_format.DecimalColumns;
 /// S3 pool permits. Data fetches may use all of them; footer fetches stay at `READ_CONCURRENCY`.
 pub const POOL_SIZE: usize = s3.S3_IN_FLIGHT_MAX;
 
-
 /// Permits for an S3 output's part uploads, apart from the input reads' so neither waits for the other, over the same
 /// pool so uploads reuse the connections reads leave idle. As many as uploads had while they shared the read permits.
 pub const OUTPUT_POOL_SIZE: usize = s3.MAX_PARTS;
 pub const OutputLane = pool_mod.Lane(s3.Pool(POOL_SIZE), OUTPUT_POOL_SIZE);
-
 
 pub const Error = error{
     NoInputs,
@@ -76,7 +74,6 @@ pub const ColumnarSink = struct {
     schema_fn: *const fn (*anyopaque, []const expr_agg.OutputCol) anyerror!void,
     batch_fn: *const fn (*anyopaque, []const expr_agg.OutputCol, usize, usize) anyerror!void,
 };
-
 
 pub const QueryArgs = struct {
     /// Force eligible GROUP BY queries through shared partitions.
@@ -315,7 +312,6 @@ pub const Timings = struct {
     mp_await_ns: u64 = 0,
 };
 
-
 pub const AggregateExplanation = struct {
     aggregate: scan.AggregateExplanation,
     io_mode: enum { mmap, pread, uring, s3_buffered, s3_windowed },
@@ -330,7 +326,6 @@ pub const AggregateExplanation = struct {
 };
 
 pub const Conjunct = struct { column: []const u8, cost: filter_ast.Cost };
-
 
 /// The result program's part of a plan: HAVING, hidden ORDER BY/HAVING columns, and whether the strategies may cut by
 /// the LIMIT (`masked` under HAVING, `none` without one).
@@ -349,7 +344,6 @@ pub const ResultExplanation = struct {
         };
     }
 };
-
 
 /// What output row groups are cut at: a row group is closed once it holds `rows` rows or its rows' PLAIN values take
 /// `bytes` bytes (`consumer.plainBits`), whichever comes first. Both come from the query's options alone, so the
@@ -373,9 +367,7 @@ pub const RowGroupTarget = struct {
 pub const default_row_group_rows: usize = consumer.answer_rg_rows;
 pub const default_row_group_bytes: u64 = 64 << 20;
 
-
 pub const PrintFormat = enum { csv, jsonl, json, parquet };
-
 
 test "BloomSpec.parse: a column, optionally with a probability" {
     try std.testing.expectEqualDeep(BloomSpec{ .column = "id" }, try BloomSpec.parse("id"));
@@ -387,3 +379,11 @@ test "BloomSpec.parse: a column, optionally with a probability" {
     }
 }
 
+/// A plain-row ORDER BY key bound to its input column (`expr_ast.RowKey`).
+pub const RowSortKey = struct {
+    /// The key as an output column of the row: a passthrough leaf, or an expression computed like a written column.
+    spec: consumer.OutputCol,
+    descending: bool,
+    /// An unsigned integer column: its lane holds raw bits, compared as unsigned.
+    unsigned: bool,
+};

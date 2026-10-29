@@ -25,14 +25,7 @@ const scan = @import("../core/scan.zig");
 const core_memory = @import("../core/memory.zig");
 const filter_ast = @import("../core/filter/ast.zig");
 
-/// A plain-row ORDER BY key bound to its input column (`expr_ast.RowKey`).
-pub const RowSortKey = struct {
-    /// The key as an output column of the row: a passthrough leaf, or an expression computed like a written column.
-    spec: consumer.OutputCol,
-    descending: bool,
-    /// An unsigned integer column: its lane holds raw bits, compared as unsigned.
-    unsigned: bool,
-};
+pub const RowSortKey = engine_types.RowSortKey;
 
 /// One sort key value of a row. NULL sorts last in either direction.
 pub const SortCell = union(enum) {
@@ -636,7 +629,6 @@ test "RankedRG.sooner reads unbounded row groups first in input order, then the 
     }
 }
 
-
 test "allPassthrough keeps a computed output or key off the bound-first Top-N" {
     const testing = std.testing;
     const bare = [_]consumer.OutputCol{ .{ .passthrough = .{ .ci = 0 } }, .{ .passthrough = .{ .ci = 3 } } };
@@ -646,7 +638,6 @@ test "allPassthrough keeps a computed output or key off the bound-first Top-N" {
     try testing.expect(!allPassthrough(&.{ bare[0], computed }, &.{key}));
     try testing.expect(!allPassthrough(&bare, &.{ key, .{ .spec = computed, .descending = true, .unsigned = false } }));
 }
-
 
 test "the serial Top-N keeps one key copy per kept row when every row evicts the last, within its budget" {
     // 100000 descending values in one row group: under ORDER BY k LIMIT 1 each row improves on the one kept. Its key
@@ -703,7 +694,6 @@ test "an evicted key's string block is reused up to its size, not its last key's
     try std.testing.expect(cell.str.ptr != block);
     try std.testing.expectEqual(@as(usize, 27), cap);
 }
-
 
 /// The most rows the parallel plain-row Top-N keeps (OFFSET + LIMIT); past it, or without a LIMIT, `TopRows` runs.
 /// Every worker holds a heap of that many keys, so it bounds the heaps as well as the gather.
@@ -1482,7 +1472,6 @@ fn gatherInto(
     profile.record(prof, .project, t_gather, nowMonoNs(), profile.args(.{ winners.len, specs.len }));
 }
 
-
 test "dictionaryKey takes a bare string first key, judged by the filter only when it reads that column alone" {
     std.Io.Dir.cwd().access(std.testing.io, topn_gather_inputs[0], .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -1509,4 +1498,3 @@ pub const topn_gather_inputs = [_][]const u8{
     "ci/fixtures/parquet/topn_gather_a.parquet",
     "ci/fixtures/parquet/topn_gather_b.parquet",
 };
-

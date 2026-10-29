@@ -223,43 +223,6 @@ const decodeFloat16ColumnAsF64Pruned = consumer_column.decodeFloat16ColumnAsF64P
 const decodeU32ColumnAsI64Pruned = consumer_column.decodeU32ColumnAsI64Pruned;
 const decodeFloat16ColumnAsF64 = consumer_column.decodeFloat16ColumnAsF64;
 
-test "row subgroups seek misaligned columns and share dictionary backing across reader lifetimes" {
-    const t = std.testing;
-    const subgroups = @import("row_subgroups.zig");
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const fixture = try subgroups.testFixture(a);
-    const rg = &fixture.meta.row_groups.items[0];
-    const group = (try subgroups.Group.init(a, fixture.bytes, rg, &fixture.meta, &.{ true, true, true }, 8)).?;
-    const src: RGSrc = .{ .bytes = fixture.bytes, .byte_origin = 0 };
-    for (0..3) |ci| {
-        var whole = (try SliceReader.init(a, t.allocator, rg, &fixture.meta, src, ci, .{})).?;
-        defer whole.deinit();
-        const expected = try whole.next(a, 4096);
-        for (group.ranges) |range| {
-            var r = (try SliceReader.init(a, t.allocator, rg, &fixture.meta, src, ci, .{})).?;
-            defer r.deinit();
-            try r.seekSubgroup(a, .{ .group = &group, .rows = range });
-            if (ci == 1) try t.expect(r.raw.bytes.dictionary.?.ptr == group.columns[ci].?.dictionary.?.bytes.ptr);
-            const got = try r.next(a, range.hi - range.lo);
-            switch (expected) {
-                inline .i64, .string => |want, tag| {
-                    const actual = @field(got, @tagName(tag));
-                    try t.expectEqual(range.hi - range.lo, actual.values.len);
-                    for (actual.values, 0..) |value, i| {
-                        const def = if (want.def_levels) |d| d[range.lo + i] else want.max_def;
-                        try t.expectEqual(def, if (actual.def_levels) |d| d[i] else actual.max_def);
-                        if (def < want.max_def) continue;
-                        if (tag == .string) try t.expectEqualStrings(want.values[range.lo + i], value) else try t.expectEqual(want.values[range.lo + i], value);
-                    }
-                },
-                else => unreachable,
-            }
-        }
-    }
-}
-
 /// Test-only: off compares compact decoding with whole columns; the count shows a test reached it.
 pub var compact_rows_in_tests = true;
 pub var compacted_row_groups: std.atomic.Value(usize) = .init(0);

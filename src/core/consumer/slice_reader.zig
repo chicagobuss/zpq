@@ -19,6 +19,7 @@ const SliceScratch = @import("../parquet/page.zig").SliceScratch;
 const flbaWidth = @import("column.zig").flbaWidth;
 const valuesCol = @import("column.zig").valuesCol;
 const codedCol = @import("column.zig").codedCol;
+const chunkDictionary = @import("column.zig").chunkDictionary;
 
 /// One flat column chunk decoded a slice of rows at a time, into the lane `decodeWriteColumn` gives the whole chunk:
 /// for a row group too big to hold decoded at once. Each reader keeps its own page buffers, so the memory held is a
@@ -767,3 +768,36 @@ test "row subgroups seek misaligned columns and share dictionary backing across 
     }
 }
 
+test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {
+    const testing = std.testing;
+    for ([_][]const u8{ "ci/fixtures/parquet/topn_gather_a.parquet", "ci/fixtures/parquet/topn_gather_b.parquet" }) |path| {
+        const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
+            if (err == error.FileNotFound) return error.SkipZigTest;
+            return err;
+        };
+        defer testing.allocator.free(bytes);
+        var meta = try metadata.open(testing.allocator, bytes);
+        defer meta.deinit(testing.allocator);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const src: types.RGSrc = .{ .bytes = bytes, .byte_origin = 0 };
+        for (meta.row_groups.items) |*rg| {
+            // `s` outgrows its dictionary page and turns PLAIN; `c` stays coded; `id` is not a string.
+            try testing.expect(try chunkDictionary(a, rg, &meta, src, 2) == null);
+            try testing.expect(try chunkDictionary(a, rg, &meta, src, 0) == null);
+            const dict = (try chunkDictionary(a, rg, &meta, src, 7)).?;
+            // Eight values (those ending 0 or 5 fall on the rows holding '') and the empty string; NULL is no entry.
+            try testing.expectEqual(@as(usize, 9), dict.len);
+            var whole = (try SliceReader.init(a, testing.allocator, rg, &meta, src, 7, .{})).?;
+            defer whole.deinit();
+            const col = (try whole.next(a, @intCast(rg.num_rows))).string;
+            for (col.values, 0..) |v, i| {
+                if (col.def_levels.?[i] < col.max_def) continue;
+                for (dict) |d| {
+                    if (std.mem.eql(u8, d, v)) break;
+                } else return error.TestValueNotInDictionary;
+            }
+        }
+    }
+}

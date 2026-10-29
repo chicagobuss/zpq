@@ -63,6 +63,7 @@ pub const Timings = struct {
 /// to the thread that reports the error (`decodeFailure`, `setDecodeFailure`); `resolveDecodeFailure` turns it into
 /// the file, row group, column path and page of the message.
 const decode_order = @import("../decode_order.zig");
+const row_subgroups = @import("../row_subgroups.zig");
 pub const DecodeSite = decode_order.Site;
 threadlocal var decode_site: ?DecodeSite = null;
 
@@ -166,7 +167,7 @@ pub fn rebaseRowGroupOffsets(rg: *schema.RowGroup, base: i64) void {
 
 
 /// One row group as `scanRGForAgg` reads it. Everything is borrowed.
-pub const RowSubgroup = struct { group: *const @import("../row_subgroups.zig").Group, rows: @import("column.zig").RowRange };
+pub const RowSubgroup = struct { group: *const row_subgroups.Group, rows: row_subgroups.Range };
 
 pub const AggRowGroup = struct {
     subgroup: ?RowSubgroup = null,

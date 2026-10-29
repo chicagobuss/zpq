@@ -75,6 +75,74 @@ def inside(root, relative):
     return path
 
 
+class InputHashes:
+    """Host-local content verdicts survive runs; native outputs never use this cache."""
+
+    def __init__(self, root):
+        self.root = absolute(root) / "input-hashes"
+        self.host = socket.gethostname()
+        self.evidence = []
+
+    def identity(self, path):
+        path = absolute(path)
+        st = path.stat()
+        return {"path": str(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "inode": st.st_ino}
+
+    def verify(self, path, expected, check=lambda: None):
+        check()
+        started = time.monotonic()
+        identity = self.identity(path)
+        key = hashlib.sha256(encode([self.host, identity["path"]])).hexdigest()
+        entry_path = self.root / (key + ".json")
+        try:
+            entry = read(entry_path)
+        except (FileNotFoundError, ValueError):
+            entry = None
+        hit = bool(isinstance(entry, dict) and entry.get("schema") == "zpq-input-hash/v1" and
+               entry.get("host") == self.host and entry.get("identity") == identity and
+               isinstance(entry.get("verified_at"), str) and full_hash(entry.get("sha256")))
+        if not hit:
+            observed = digest(path, check)
+            check()
+            if self.identity(path) != identity:
+                raise Mismatch("input changed during checksum: " + str(path))
+            entry = {"schema": "zpq-input-hash/v1", "host": self.host, "identity": identity,
+                     "sha256": observed, "verified_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+            self.root.mkdir(parents=True, exist_ok=True)
+            # Independent coordinators can verify the same source for different hosts.
+            temporary = self.root / (key + "." + uuid.uuid4().hex + ".partial")
+            try:
+                temporary.write_bytes(encode(entry))
+                temporary.replace(entry_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        check()
+        if self.identity(path) != identity:
+            raise Mismatch("input changed during checksum lookup: " + str(path))
+        row = {**entry, "cache_hit": hit, "expected_sha256": expected,
+               "seconds": time.monotonic() - started, "cache_path": str(entry_path)}
+        self.evidence.append(row)
+        if entry["sha256"] != expected:
+            raise Mismatch("input checksum differs: " + str(path))
+        return row
+
+
+def verify_inputs(cfg, host, data, manifest, check=lambda: None, evidence=None):
+    cache = InputHashes(host["root"])
+    if evidence is not None:
+        cache.evidence = evidence
+    for name in sorted({c["file"] for c in manifest_cases(manifest, cfg.get("only"))}):
+        pin, path = manifest["files"][name], inside(data, name)
+        if not full_hash(pin["sha256"]) or path.stat().st_size != pin["bytes"]:
+            raise Mismatch("input size/pin differs: " + name)
+        # Manifest views are hard links: verify the stable object path, not a fresh alias per request.
+        source = absolute(cfg.get("input_objects", {}).get(name, str(path)))
+        if not path.samefile(source):
+            raise Mismatch("input object/view differs: " + name)
+        cache.verify(source, pin["sha256"], check)
+    return cache.evidence
+
+
 def load(config, host, candidate=None, base=None):
     cfg = read(config)
     h = cfg["hosts"][host]
@@ -412,6 +480,7 @@ def result(run, request, cases, state, reason, hash_complete, started):
                "binary_sha256": request["candidate"]["sha256"],
                "baseline_binary_sha256": request["baseline"]["sha256"],
                "corpus_manifest_sha256": request["corpus_manifest_sha256"],
+               "input_verification": request.get("input_verification", []),
                "query_set_sha256": request["query_set_sha256"],
                "budget_seconds": request["budget_seconds"], "wall_seconds": time.monotonic() - started,
                "start_utc": request["start_utc"],
@@ -522,14 +591,8 @@ def worker(config_path, host_name, out, deadline):
             idle(run, host)
             if digest(manifest_path, run.check) != cfg["manifest_sha256"]:
                 raise Mismatch("manifest checksum differs")
-            files = {c["file"] for c in cases}
-            for name in sorted(files):
-                pin = manifest["files"][name]
-                path = inside(data, name)
-                if not full_hash(pin["sha256"]) or path.stat().st_size != pin["bytes"]:
-                    raise Mismatch("input size/pin differs: " + name)
-                if digest(path, run.check) != pin["sha256"]:
-                    raise Mismatch("input checksum differs: " + name)
+            request["input_verification"] = []
+            verify_inputs(cfg, host, data, manifest, run.check, request["input_verification"])
             for name, pin in host["builds"].items():
                 if digest(pin["path"], run.check) != pin["sha256"]:
                     raise Mismatch("binary checksum differs: " + name)
@@ -672,10 +735,10 @@ os.execvp(sys.argv[2],sys.argv[2:])
 """
 
 
-def remote(argv, host, lock):
+def remote(argv, host, lock, timeout=30):
     argv = ["python3", "-c", LOCK_EXEC, lock, *argv]
     return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, shlex.join(argv)],
-                          check=True, capture_output=True, timeout=30)
+                          check=True, capture_output=True, timeout=timeout)
 
 
 def transfer(sources, target, host, lock):
@@ -683,6 +746,26 @@ def transfer(sources, target, host, lock):
     launcher = shlex.join(["python3", "-c", LOCK_EXEC, lock, "rsync"])
     subprocess.run(["rsync", "-a", "--checksum", "--protect-args", "--rsync-path", launcher,
                     *map(str, sources), host + ":" + str(target)], check=True, timeout=120)
+
+
+def remote_input(package, root, path, expected, host, lock, remaining):
+    code = """import sys,pathlib,json,time,signal
+sys.path.insert(0,sys.argv[1])
+from bench.quick import InputHashes,BudgetExpired
+deadline=time.monotonic()+float(sys.argv[5])
+def check(*_):
+    if time.monotonic()>=deadline: raise BudgetExpired()
+def expire(*_): raise BudgetExpired()
+signal.signal(signal.SIGALRM,expire)
+signal.setitimer(signal.ITIMER_REAL,float(sys.argv[5]))
+p=pathlib.Path(sys.argv[3])
+print(json.dumps(InputHashes(sys.argv[2]).verify(p,sys.argv[4],check) if p.exists() else None))
+"""
+    if remaining <= 0:
+        raise BudgetExpired()
+    reply = remote(["python3", "-c", code, str(package), str(root), str(path), expected, str(remaining)],
+                   host, lock, timeout=remaining + 5)
+    return json.loads(reply.stdout)
 
 
 def fleet(config_path, host_name, out, candidate=None, base=None, budget_seconds=None):
@@ -695,16 +778,32 @@ def fleet(config_path, host_name, out, candidate=None, base=None, budget_seconds
     out.mkdir(parents=True, exist_ok=False)
     cfg["hosts"][host_name].update(candidate=host["builds"]["candidate"], base=host["builds"]["base"])
     effective = out / "config.json"
+    start = time.monotonic()
+    setup_deadline = start + 900
+    def setup_check():
+        if time.monotonic() >= setup_deadline:
+            raise BudgetExpired("input setup deadline exhausted")
     if host_name in (socket.gethostname(), socket.gethostname().split(".")[0], "localhost"):
         save(effective, cfg)
+        with timing_lock(host["lock"]):
+            if digest(manifest_path, setup_check) != cfg["manifest_sha256"]:
+                raise Mismatch("manifest checksum differs before preparation")
+            evidence = verify_inputs(cfg, host, data, read(manifest_path), setup_check)
+        save(out / "setup.json", {"seconds": time.monotonic() - start, "input_verification": evidence,
+                                  "measured_budget_seconds": cfg["budget_seconds"]})
         return supervise(effective, host_name, out)
     # Only cached setup is performed here; the host worker owns the single measured deadline.
-    start = time.monotonic()
     root = absolute(host["root"])
     run_root = root / ("quick-" + uuid.uuid4().hex)
     save(effective, cfg)
     lock = host["lock"]
     remote(["mkdir", "-p", str(run_root), str(root / "inputs"), str(root / "binaries")], host_name, lock)
+    package = out / "package" / "bench"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_bytes(b"")
+    for name in ("quick.py", "env.py", "arch_remote.sh", "arch_polars.py"):
+        (package / name).write_bytes(Path(__file__).with_name(name).read_bytes())
+    transfer([str(package.parent) + "/"], str(run_root) + "/", host_name, lock)
     manifest = read(manifest_path)
     if digest(manifest_path) != cfg["manifest_sha256"]:
         raise Mismatch("manifest checksum differs before transfer")
@@ -713,20 +812,24 @@ def fleet(config_path, host_name, out, candidate=None, base=None, budget_seconds
     destination_data = root / "inputs" / cfg["manifest_sha256"]
     objects = root / "inputs" / "objects"
     remote(["mkdir", "-p", str(destination_data), str(objects)], host_name, lock)
+    local_hashes = InputHashes(out.parent)
+    remote_evidence = []
+    cfg["input_objects"] = {}
     for path in inputs:
         rel = path.relative_to(data)
-        sha = digest(path)
-        if sha != manifest["files"][str(rel)]["sha256"]:
-            raise Mismatch("local input checksum differs before transfer")
+        sha = manifest["files"][str(rel)]["sha256"]
+        if not full_hash(sha) or path.stat().st_size != manifest["files"][str(rel)]["bytes"]:
+            raise Mismatch("local input size/pin differs before transfer")
+        local_hashes.verify(path, sha, setup_check)
         target = objects / sha
-        probe = remote(["python3", "-c",
-                        "import pathlib,hashlib,sys;p=pathlib.Path(sys.argv[1]);"
-                        "print(hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else '')", str(target)],
-                       host_name, lock).stdout.decode().strip()
-        if probe and probe != sha:
-            raise Mismatch("cached input checksum differs; evidence retained")
-        if probe != sha:
+        probe = remote_input(run_root, root, target, sha, host_name, lock, setup_deadline - time.monotonic())
+        if probe is None:
             transfer([path], target, host_name, lock)
+            probe = remote_input(run_root, root, target, sha, host_name, lock, setup_deadline - time.monotonic())
+            if probe is None:
+                raise Mismatch("transferred input missing")
+        remote_evidence.append(probe)
+        cfg["input_objects"][str(rel)] = str(target)
         remote(["python3", "-c", "import pathlib,os,sys;p=pathlib.Path(sys.argv[2]);"
                 "p.parent.mkdir(parents=True,exist_ok=True);"
                 "os.link(sys.argv[1],p) if not p.exists() else None",
@@ -745,14 +848,10 @@ def fleet(config_path, host_name, out, candidate=None, base=None, budget_seconds
         transfer([absolute(cfg["reference"])], run_root / "reference.json", host_name, lock)
         cfg["reference"] = str(run_root / "reference.json")
     save(effective, cfg)
-    package = out / "package" / "bench"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_bytes(b"")
-    # env contains the existing Linux idle probe; no extra package/runtime is installed.
-    for name in ("quick.py", "env.py", "arch_remote.sh", "arch_polars.py"):
-        (package / name).write_bytes(Path(__file__).with_name(name).read_bytes())
-    transfer([str(package.parent) + "/", effective], str(run_root) + "/", host_name, lock)
+    transfer([effective], str(run_root) + "/", host_name, lock)
     save(out / "setup.json", {"seconds": time.monotonic() - start, "measured_budget_seconds": cfg["budget_seconds"],
+                              "local_input_verification": local_hashes.evidence,
+                              "input_verification": remote_evidence,
                               "host": host_name, "remote_root": str(run_root), "evidence_deleted": False})
     command = ["python3", "-m", "bench.quick", "--supervise", str(run_root / "config.json"),
                host_name, str(run_root)]
@@ -779,14 +878,19 @@ def main(argv=None):
     parser.add_argument("--out", required=True)
     parser.add_argument("--budget-seconds", type=float)
     args = parser.parse_args(argv)
+    started = time.monotonic()
     try:
         return fleet(args.config, args.host, args.out, args.candidate, args.base, args.budget_seconds)
-    except (ValueError, KeyError, OSError, subprocess.SubprocessError, Mismatch) as error:
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError, Mismatch, BudgetExpired) as error:
         out = Path(args.out)
         effective = out / "config.json"
         if effective.is_file():
             cfg = read(effective)
-            reason = "setup deferred: host timing lock held" if getattr(error, "returncode", None) == 75 else str(error)
+            reason = ("setup deferred: host timing lock held" if getattr(error, "returncode", None) == 75 else
+                      str(error) or type(error).__name__)
+            if not (out / "setup.json").exists():
+                save(out / "setup.json", {"state": "failed", "seconds": time.monotonic() - started,
+                                          "reason": reason, "measured_budget_seconds": cfg["budget_seconds"]})
             recover(effective, args.host, out, time.monotonic() + cfg["budget_seconds"], reason)
             if getattr(error, "returncode", None) == 75:
                 report = read(out / "report.json")

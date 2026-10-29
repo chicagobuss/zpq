@@ -89,7 +89,16 @@ use content-addressed paths. Existing incorrect bytes fail verification. Transfe
 host lock so they cannot overlap another timing window. Remote evidence is retained for explicit
 cleanup decisions.
 
-The deadline starts before admission and covers input/binary verification, all answer checks,
+Input SHA-256 verdicts persist per host under the configured root's input-hashes directory.
+The key is absolute path, byte size, nanosecond mtime and inode; a changed key, missing record or
+invalid record requires a full hash. The observed digest must still match the request's expected
+digest on every lookup. Remote manifest views must be hard links to the verified object, so a new
+manifest does not reread the same object. Binaries and native outputs retain full hash checks.
+Initial input hashing is setup work, counted in setup.json and the 15-minute turnaround. Cached
+lookups occur again inside the worker budget before any query. Reports distinguish cache hits from
+full hashes and retain the original verification time; a cache hit is not a new full-file read.
+
+The deadline starts before admission and covers current input verdict lookup/binary verification, all answer checks,
 warming, optional rivals and timed work. The outer watchdog terminates only its own child sessions
 and retains an incomplete record. Teardown/collection cannot add query time. Hash agreement for
 all first answers precedes performance sampling. Processes are fresh; each hot sample reads its

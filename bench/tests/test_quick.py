@@ -95,6 +95,133 @@ class Quick(unittest.TestCase):
         self.assertIn("input checksum", report["reason"])
         self.assertFalse((self.root / "candidate.count").exists())
 
+    def test_input_verdict_is_reused_across_workers_without_reading_input(self):
+        self.assertEqual(self.run_worker()[0], 0)
+        initial = quick.read(self.out / "report.json")["input_verification"][0]
+        self.out = self.root / "second-out"
+        self.out.mkdir()
+        original = quick.digest
+        def guarded(path, check=lambda: None):
+            self.assertNotEqual(Path(path), self.data / "input", "cached input was read again")
+            return original(path, check)
+        with patch("bench.quick.digest", side_effect=guarded):
+            code, report = self.run_worker()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["selected_timings"], 2)
+        self.assertTrue(report["input_verification"][0]["cache_hit"])
+        self.assertFalse(initial["cache_hit"])
+        self.assertEqual(initial["verified_at"], report["input_verification"][0]["verified_at"])
+
+    def test_each_input_identity_change_requires_a_new_digest(self):
+        for field in ("path", "size", "mtime", "inode"):
+            with self.subTest(field=field):
+                source = self.root / field
+                source.write_bytes(b"input")
+                cache = quick.InputHashes(self.root / (field + "-cache"))
+                before = source.stat()
+                with patch("bench.quick.digest", wraps=quick.digest) as hashing:
+                    cache.verify(source, hashlib.sha256(b"input").hexdigest())
+                    if field == "path":
+                        alias = source.with_suffix(".alias")
+                        os.link(source, alias)
+                        source = alias
+                    elif field == "size":
+                        source.write_bytes(b"input extra")
+                        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    elif field == "mtime":
+                        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+                    else:
+                        replacement = source.with_suffix(".new")
+                        replacement.write_bytes(b"input")
+                        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+                        replacement.replace(source)
+                        self.assertNotEqual(before.st_ino, source.stat().st_ino)
+                    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+                    self.assertFalse(cache.verify(source, expected)["cache_hit"])
+                    self.assertTrue(cache.verify(source, expected)["cache_hit"])
+                    self.assertEqual(hashing.call_count, 2)
+
+    def test_cached_digest_cannot_clear_a_different_expected_pin(self):
+        cache = quick.InputHashes(self.root)
+        source = self.data / "input"
+        cache.verify(source, self.manifest["files"]["input"]["sha256"])
+        with patch("bench.quick.digest", side_effect=AssertionError("input was read again")):
+            with self.assertRaises(quick.Mismatch):
+                cache.verify(source, "0" * 64)
+
+    def test_corrupt_or_other_host_cache_is_rehashed(self):
+        for corrupt in (b"{unfinished", b"[]", b"other-host"):
+            with self.subTest(corrupt=corrupt):
+                cache = quick.InputHashes(self.root)
+                row = cache.verify(self.data / "input", self.manifest["files"]["input"]["sha256"])
+                path = Path(row["cache_path"])
+                if corrupt == b"other-host":
+                    entry = quick.read(path)
+                    entry["host"] = "different-host"
+                    quick.save(path, entry)
+                else:
+                    path.write_bytes(corrupt)
+                self.assertFalse(cache.verify(self.data / "input", row["sha256"])["cache_hit"])
+
+    def test_changing_or_interrupted_hash_never_creates_a_verdict(self):
+        cache = quick.InputHashes(self.root)
+        source = self.data / "input"
+        before = source.stat()
+        def mutate(path, check):
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+            return self.manifest["files"]["input"]["sha256"]
+        with patch("bench.quick.digest", side_effect=mutate):
+            with self.assertRaises(quick.Mismatch):
+                cache.verify(source, "0" * 64)
+        with patch("bench.quick.digest", side_effect=quick.BudgetExpired):
+            with self.assertRaises(quick.BudgetExpired):
+                cache.verify(source, "0" * 64)
+        self.assertFalse(cache.root.exists())
+
+    def test_local_setup_seals_only_requested_files_then_worker_produces_pairs(self):
+        self.manifest["cases"].append({**self.case, "id": "unused", "file": "missing"})
+        self.manifest["files"]["missing"] = {"bytes": 100, "sha256": "0" * 64}
+        self.cfg["only"] = ["one"]
+        self.cfg["hosts"]["localhost"] = self.cfg["hosts"]["local"]
+        self.write_config()
+        out = self.root / "fleet-out"
+        def worker(config, host, result):
+            return quick.worker(config, host, result, time.monotonic() + 5)
+        with patch("bench.quick.supervise", side_effect=worker):
+            self.assertEqual(quick.fleet(self.config, "localhost", out), 0)
+        setup, report = quick.read(out / "setup.json"), quick.read(out / "report.json")
+        self.assertFalse(setup["input_verification"][0]["cache_hit"])
+        self.assertTrue(report["input_verification"][0]["cache_hit"])
+        self.assertEqual(report["selected_timings"], 2)
+        self.assertEqual(report["unrequested_cases"], ["unused"])
+
+    def test_remote_probe_reuses_verdict_and_worker_reuses_object_across_views(self):
+        source = self.root / "object"
+        source.write_bytes(b"sealed input")
+        def local_probe(argv, host, lock, timeout):
+            return subprocess.run(argv, check=True, capture_output=True, timeout=timeout)
+        expected = self.manifest["files"]["input"]["sha256"]
+        with patch("bench.quick.remote", side_effect=local_probe):
+            first = quick.remote_input(Path.cwd(), self.root, source, expected, "remote", "lock", 5)
+            second = quick.remote_input(Path.cwd(), self.root, source, expected, "remote", "lock", 5)
+        self.assertFalse(first["cache_hit"])
+        self.assertTrue(second["cache_hit"])
+        self.cfg["input_objects"] = {"input": str(source)}
+        code, report = self.run_worker()
+        self.assertEqual(code, 3)
+        self.assertIn("object/view differs", report["reason"])
+        self.assertEqual(report["attempts"], 0)
+        (self.data / "input").unlink()
+        os.link(source, self.data / "input")
+        original = quick.digest
+        def guarded(path, check=lambda: None):
+            self.assertNotEqual(Path(path), source)
+            return original(path, check)
+        with patch("bench.quick.digest", side_effect=guarded):
+            code, report = self.run_worker()
+        self.assertEqual(code, 0)
+        self.assertTrue(report["input_verification"][0]["cache_hit"])
+
     def test_binary_checksum_rejection_precedes_native_query(self):
         self.cfg["hosts"]["local"]["candidate"]["sha256"] = "0" * 64
         code, report = self.run_worker()

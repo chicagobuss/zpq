@@ -548,6 +548,197 @@ fn pairLocalSetWork(
     return entries *| set_bytes +| rows *| (key_bytes + @sizeOf(u64) * 2 + @sizeOf(usize) * 2);
 }
 
+const PairQuote = struct {
+    pairs: @import("../owner_cost.zig").Quote,
+    groups: @import("../owner_cost.zig").Quote,
+    group_records: usize,
+};
+
+fn quotePairStages(
+    comptime Bits: type,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    work: []const WorkItem,
+    identity: *const key_pack.Plan,
+    rows: usize,
+    workers: usize,
+) ?PairQuote {
+    const cost = @import("../owner_cost.zig");
+    const pq = cost.quote(Bits, &.{}, u32, rows, rows, workers, 0, args.byte_top_partitions) orelse return null;
+    var null_rows: usize = 0;
+    for (work) |item| {
+        const rg = metas[item.file].row_groups.items[item.rg];
+        const cm = rg.columns.items[identity.keys[identity.keys.len - 1].col_idx].meta_data.?;
+        const n = if (cm.statistics) |st| st.null_count orelse rg.num_rows else rg.num_rows;
+        if (n < 0 or n > rg.num_rows) return null;
+        null_rows +|= @intCast(n);
+    }
+    var pair_bound: usize = rows;
+    if (identity.encoding.source == .dictionary) {
+        var product: u128 = 1;
+        for (identity.radices) |r| product = std.math.mul(u128, product, r) catch rows;
+        pair_bound = @intCast(@min(rows, product));
+    }
+    // A NULL presence row or one completed pair is the only possible second-stage contribution. Its duplicate
+    // weight still uses the original row bound. Global DISTINCT therefore reserves by values, never rows twice.
+    // Footer NULL counts are speculative: the weighted owner requests whole-attempt replay if physical records
+    // exceed this quote, even when scatter tail capacity happened to accommodate them.
+    const group_records = @min(rows, pair_bound +| null_rows);
+    const gq = cost.quote(
+        Bits,
+        &.{.present_count},
+        u32,
+        group_records,
+        group_records,
+        workers,
+        0,
+        args.byte_top_partitions,
+    ) orelse return null;
+    return .{ .pairs = pq, .groups = gq, .group_records = group_records };
+}
+
+const PairFinish = struct {
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    a: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    identity: *const key_pack.Plan,
+    distinct: usize,
+    workers: usize,
+    slots: []MergedSlot,
+    n: usize,
+    ledger: *core_memory.SharedBudget,
+    run: record_workers.RecordRun,
+    names_credit: usize,
+};
+
+fn finishPairOutput(
+    comptime top: bool,
+    context: PairFinish,
+    view: anytype,
+    output: *AggOutput,
+    output_charge: *usize,
+    held: *usize,
+    leave_records: *bool,
+) !MultiAggResult {
+    const View = @TypeOf(view.*);
+    const gpa = context.gpa;
+    const arena = context.arena;
+    const a = context.a;
+    const args = context.args;
+    const metas = context.metas;
+    const plan = context.plan;
+    const work = context.work;
+    const calls = context.calls;
+    const keys = context.keys;
+    const outputs = context.outputs;
+    const identity = context.identity;
+    const distinct = context.distinct;
+    const workers = context.workers;
+    const slots = context.slots;
+    const n = context.n;
+    const ledger = context.ledger;
+    const run = context.run;
+    const names_credit = context.names_credit;
+    if (args.group_by == null) {
+        output_charge.* = calls.len *| @sizeOf(AggOutputItem);
+        for (calls) |c| output_charge.* +|= c.alias.len;
+        _ = ledger.drawExact(output_charge.*) orelse {
+            output_charge.* = 0;
+            return error.ExceededMemoryBudget;
+        };
+        const items = try gpa.alloc(AggOutputItem, calls.len);
+        @memset(items, .{ .alias = "", .value = .null_val });
+        output.aggs = items;
+        const accs = try arena.alloc(expr_agg.Accumulator, calls.len);
+        for (items, calls, accs, 0..) |*item, call, *acc, ci| {
+            const count: u64 = if (n == 0) 0 else @intCast((try View.integer(view, slots[0].idx, ci)).?);
+            item.* = .{ .alias = try gpa.dupe(u8, call.alias), .value = .{ .i = count } };
+            acc.* = .{ .count = count };
+        }
+        for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+        // The retained scalar output is released by the enclosing query ledger with its output.
+        const finished = try countedCalls(arena, calls, distinct);
+        const sources_out = try arena.alloc(?schema.SchemaElement, calls.len);
+        @memset(sources_out, null);
+        if (args.ledger != null) {
+            held.* = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+            output_charge.* = 0;
+        }
+        return pairResult(args, plan, run, output.*, .{
+            .accumulators = accs,
+            .agg_calls = finished,
+            .agg_sources = sources_out,
+        });
+    }
+    const types = try arena.alloc(GroupColType, outputs.len);
+    const key_types = try a.alloc(KeyType, keys.len);
+    for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
+    var key_bytes: usize = 0;
+    for (outputs, types) |out, *ty| {
+        ty.* = .{
+            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else .i64,
+            .nullable = out.source == .key or calls[out.source.agg].func != .count,
+            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
+        };
+        if (out.source == .key) if (identity.domain) |d| switch (d.axes[out.source.key].values) {
+            .bytes => |values| {
+                var widest: usize = 0;
+                for (values) |v| widest = @max(widest, v.len);
+                key_bytes +|= widest;
+            },
+            else => {},
+        };
+    }
+    const row_source: RowSource = .{
+        .slots = slots,
+        .outputs = outputs,
+        .calls = calls,
+        .key_types = key_types,
+        .key_exprs = keys,
+        .accs = &.{},
+        .folded = false,
+        .fixed_keys = false,
+        .identity = identity,
+        .owner = .{ .ctx = view, .key = View.key, .integer = View.integer, .value = View.value },
+    };
+    const typed = args.typed_answer and args.result_order.keys.len == 0 and args.result_order.limit == null and
+        args.result_order.offset == 0 and args.result_order.having == null and args.result_order.hidden.len == 0;
+    output_charge.* = answerBytesParallel(slots, types, key_types, typed, workers) +| names_credit +| n *| key_bytes;
+    _ = ledger.drawExact(output_charge.*) orelse {
+        output_charge.* = 0;
+        return error.ExceededMemoryBudget;
+    };
+    const names = try gpa.alloc([]const u8, outputs.len);
+    @memset(names, "");
+    output.group_cols = names;
+    for (outputs, names) |out, *name| name.* = try gpa.dupe(u8, out.name);
+    if (typed) {
+        output.typed = .{ .rows = 0, .columns = &.{} };
+        try buildGroupColumns(gpa, &output.typed.?, row_source, types, workers);
+    } else {
+        const out_rows = try gpa.alloc([]const AggValue, n);
+        @memset(out_rows, &.{});
+        output.group_rows = out_rows;
+        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+    }
+    for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+    if (args.ledger != null) {
+        held.* = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+        output_charge.* = 0; // retain the successful output credit in the query's enclosing ledger
+    }
+    // Keep the records and their full charge until process exit, as the ordinary table path does. A top-H
+    // answer owns its copied keys and never reads these states again; all failure paths still deinitialize them.
+    leave_records.* = top and args.leave_regions and !std.debug.runtime_safety;
+    return pairResult(args, plan, run, output.*, .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types });
+}
+
 fn pairAnswerBits(
     comptime Bits: type,
     comptime top: bool,
@@ -580,37 +771,10 @@ fn pairAnswerBits(
         }
     }.worse);
     const prefix = try P.Prefix.init(identity);
-    const cost = @import("../owner_cost.zig");
-    const pq = cost.quote(Bits, &.{}, u32, rows, rows, workers, 0, args.byte_top_partitions) orelse return null;
-    var null_rows: usize = 0;
-    for (work) |item| {
-        const rg = metas[item.file].row_groups.items[item.rg];
-        const cm = rg.columns.items[identity.keys[identity.keys.len - 1].col_idx].meta_data.?;
-        const n = if (cm.statistics) |st| st.null_count orelse rg.num_rows else rg.num_rows;
-        if (n < 0 or n > rg.num_rows) return null;
-        null_rows +|= @intCast(n);
-    }
-    var pair_bound: usize = rows;
-    if (identity.encoding.source == .dictionary) {
-        var product: u128 = 1;
-        for (identity.radices) |r| product = std.math.mul(u128, product, r) catch rows;
-        pair_bound = @intCast(@min(rows, product));
-    }
-    // A NULL presence row or one completed pair is the only possible second-stage contribution. Its duplicate
-    // weight still uses the original row bound. Global DISTINCT therefore reserves by values, never rows twice.
-    // Footer NULL counts are speculative: the weighted owner requests whole-attempt replay if physical records
-    // exceed this quote, even when scatter tail capacity happened to accommodate them.
-    const group_records = @min(rows, pair_bound +| null_rows);
-    const gq = cost.quote(
-        Bits,
-        &.{.present_count},
-        u32,
-        group_records,
-        group_records,
-        workers,
-        0,
-        args.byte_top_partitions,
-    ) orelse return null;
+    const quote = quotePairStages(Bits, args, metas, work, identity, rows, workers) orelse return null;
+    const pq = quote.pairs;
+    const gq = quote.groups;
+    const group_records = quote.group_records;
     if (top and args.plain_rules and args.distinct_pairs == .auto and args.integer_records_min_rows != 0) {
         // Ask the existing admission, including its compression/range, schema, top-H and memory checks. This
         // prices a real alternative, not a raw integer plan that cannot execute this query.
@@ -758,97 +922,26 @@ fn pairAnswerBits(
     const names_credit = outputNamesBytes(outputs);
     var output_charge: usize = 0;
     defer ledger.release(output_charge);
-    if (args.group_by == null) {
-        output_charge = calls.len *| @sizeOf(AggOutputItem);
-        for (calls) |c| output_charge +|= c.alias.len;
-        _ = ledger.drawExact(output_charge) orelse {
-            output_charge = 0;
-            return error.ExceededMemoryBudget;
-        };
-        const items = try gpa.alloc(AggOutputItem, calls.len);
-        @memset(items, .{ .alias = "", .value = .null_val });
-        output.aggs = items;
-        const accs = try arena.alloc(expr_agg.Accumulator, calls.len);
-        for (items, calls, accs, 0..) |*item, call, *acc, ci| {
-            const count: u64 = if (n == 0) 0 else @intCast((try View.integer(&view, slots[0].idx, ci)).?);
-            item.* = .{ .alias = try gpa.dupe(u8, call.alias), .value = .{ .i = count } };
-            acc.* = .{ .count = count };
-        }
-        for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
-        // The retained scalar output is released by the enclosing query ledger with its output.
-        const finished = try countedCalls(arena, calls, distinct);
-        const sources_out = try arena.alloc(?schema.SchemaElement, calls.len);
-        @memset(sources_out, null);
-        if (args.ledger != null) {
-            held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
-            output_charge = 0;
-        }
-        return pairResult(args, plan, run, output, .{
-            .accumulators = accs,
-            .agg_calls = finished,
-            .agg_sources = sources_out,
-        });
-    }
-    const types = try arena.alloc(GroupColType, outputs.len);
-    const key_types = try a.alloc(KeyType, keys.len);
-    for (keys, key_types) |key, *ty| ty.* = keyTypeFromExpr(key);
-    var key_bytes: usize = 0;
-    for (outputs, types) |out, *ty| {
-        ty.* = .{
-            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else .i64,
-            .nullable = out.source == .key or calls[out.source.agg].func != .count,
-            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
-        };
-        if (out.source == .key) if (identity.domain) |d| switch (d.axes[out.source.key].values) {
-            .bytes => |values| {
-                var widest: usize = 0;
-                for (values) |v| widest = @max(widest, v.len);
-                key_bytes +|= widest;
-            },
-            else => {},
-        };
-    }
-    const row_source: RowSource = .{
-        .slots = slots,
-        .outputs = outputs,
+    return try finishPairOutput(top, .{
+        .gpa = gpa,
+        .arena = arena,
+        .a = a,
+        .args = args,
+        .metas = metas,
+        .plan = plan,
+        .work = work,
         .calls = calls,
-        .key_types = key_types,
-        .key_exprs = keys,
-        .accs = &.{},
-        .folded = false,
-        .fixed_keys = false,
+        .keys = keys,
+        .outputs = outputs,
         .identity = identity,
-        .owner = .{ .ctx = &view, .key = View.key, .integer = View.integer, .value = View.value },
-    };
-    const typed = args.typed_answer and args.result_order.keys.len == 0 and args.result_order.limit == null and
-        args.result_order.offset == 0 and args.result_order.having == null and args.result_order.hidden.len == 0;
-    output_charge = answerBytesParallel(slots, types, key_types, typed, workers) +| names_credit +| n *| key_bytes;
-    _ = ledger.drawExact(output_charge) orelse {
-        output_charge = 0;
-        return error.ExceededMemoryBudget;
-    };
-    const names = try gpa.alloc([]const u8, outputs.len);
-    @memset(names, "");
-    output.group_cols = names;
-    for (outputs, names) |out, *name| name.* = try gpa.dupe(u8, out.name);
-    if (typed) {
-        output.typed = .{ .rows = 0, .columns = &.{} };
-        try buildGroupColumns(gpa, &output.typed.?, row_source, types, workers);
-    } else {
-        const out_rows = try gpa.alloc([]const AggValue, n);
-        @memset(out_rows, &.{});
-        output.group_rows = out_rows;
-        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
-    }
-    for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
-    if (args.ledger != null) {
-        held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
-        output_charge = 0; // retain the successful output credit in the query's enclosing ledger
-    }
-    // Keep the records and their full charge until process exit, as the ordinary table path does. A top-H
-    // answer owns its copied keys and never reads these states again; all failure paths still deinitialize them.
-    leave_records = top and args.leave_regions and !std.debug.runtime_safety;
-    return pairResult(args, plan, run, output, .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types });
+        .distinct = distinct,
+        .workers = workers,
+        .slots = slots,
+        .n = n,
+        .ledger = ledger,
+        .run = run,
+        .names_credit = names_credit,
+    }, &view, &output, &output_charge, &held, &leave_records);
 }
 
 pub fn countedCalls(arena: std.mem.Allocator, calls: []const expr_agg.AggCall, i: usize) ![]const expr_agg.AggCall {
@@ -857,4 +950,3 @@ pub fn countedCalls(arena: std.mem.Allocator, calls: []const expr_agg.AggCall, i
     out[i].func = .count;
     return out;
 }
-

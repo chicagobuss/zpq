@@ -5,7 +5,7 @@ const std = @import("std");
 /// allowing the compiler to fully inline S3/File reads.
 ///
 /// Any Reader type `T` must implement:
-///   pub fn readAt(self: *T, offset: u64, dest: []u8) anyerror!usize
+///   pub fn readAt(self: *T, offset: u64, dest: []u8) Error!usize
 ///   pub fn size(self: *const T) u64
 pub fn assertIsIOStrategy(comptime T: type) void {
     if (!@hasDecl(T, "readAt")) {
@@ -24,7 +24,7 @@ pub const MemoryReader = struct {
         return .{ .data = data };
     }
 
-    pub fn readAt(self: *MemoryReader, offset: u64, dest: []u8) anyerror!usize {
+    pub fn readAt(self: *MemoryReader, offset: u64, dest: []u8) error{}!usize {
         if (offset >= self.data.len) return 0;
         const available = self.data.len - offset;
         const to_copy = @min(available, dest.len);

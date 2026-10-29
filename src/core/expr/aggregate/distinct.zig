@@ -1,3 +1,4 @@
+const core_memory = @import("../../memory.zig");
 const std = @import("std");
 const testing = std.testing;
 const filter_eval = @import("../../filter/eval.zig");
@@ -567,7 +568,7 @@ pub const DistinctSet = struct {
     fn bitmapShape(lo: u64, hi: u64, entries: usize) ?struct { base: u64, words: usize } {
         const base = lo & ~@as(u64, 63);
         const need = (hi - base) / 64 + 1;
-        const room = @min(@import("../hw.zig").l2BytesPerWorkerOr(256 << 10), entries *| 8) / 8;
+        const room = @min(@import("../../hw.zig").l2BytesPerWorkerOr(256 << 10), entries *| 8) / 8;
         if (need > room) return null;
         const n: usize = @intCast(need);
         const rounded = std.math.ceilPowerOfTwo(usize, n) catch n;

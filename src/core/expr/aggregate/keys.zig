@@ -206,7 +206,7 @@ pub fn hashFixed(bytes: []const u8) u64 {
 /// Reset reuses blocks; handing the arena to an answer preserves every borrowed key until that answer is dropped.
 pub const KeyArena = struct {
     pub const chunk_size = 1 << 16;
-    const Block = struct { bytes: []u8, start: u32 };
+    pub const Block = struct { bytes: []u8, start: u32 };
     blocks: std.ArrayList(Block) = .empty,
     chunks: std.ArrayList([*]u8) = .empty,
     data_bytes: usize = 0,
@@ -288,7 +288,7 @@ pub const KeyArena = struct {
                 0);
     }
 
-    fn projectedOverlap(self: *const KeyArena, len: usize) !usize {
+    pub fn projectedOverlap(self: *const KeyArena, len: usize) !usize {
         const p = try self.place(len);
         if (p.capacity == 0) return 0;
         const nc = (p.capacity + chunk_size - 1) / chunk_size;
@@ -307,7 +307,7 @@ pub const KeyArena = struct {
         return self.putParts(a, &.{}, value);
     }
 
-    fn putParts(self: *KeyArena, a: std.mem.Allocator, prefix: []const u8, value: []const u8) !u32 {
+    pub fn putParts(self: *KeyArena, a: std.mem.Allocator, prefix: []const u8, value: []const u8) !u32 {
         const len = std.math.add(usize, prefix.len, value.len) catch return error.ExceededMemoryBudget;
         const p = try self.place(len);
         if (p.capacity != 0) {

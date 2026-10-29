@@ -1,3 +1,4 @@
+const RowSubgroup = @import("types.zig").RowSubgroup;
 const std = @import("std");
 const metadata = @import("../parquet/metadata.zig");
 const schema = @import("../schema.zig");

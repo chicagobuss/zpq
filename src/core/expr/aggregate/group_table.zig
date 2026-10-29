@@ -90,7 +90,7 @@ const CachedKeyCtx = struct {
 pub const GroupTable = struct {
     const StringView = struct { bytes: []const u8, first: u64 };
 
-    compact: @import("agg_state.zig").State = .{},
+    compact: @import("../agg_state.zig").State = .{},
     // Backing arrays can be page-backed independently of their accumulator payloads.
     buffer_allocator: ?std.mem.Allocator = null,
     // 16-aligned: a private distinct acc stores this pointer with bit 3 set (`DistinctAcc.table_flag`).
@@ -555,7 +555,7 @@ pub const GroupTable = struct {
         return self.getOrInsertFixedHashed(key, agg_calls, pos, hashFixed(key));
     }
 
-    fn getOrInsertFixedHashed(
+    pub fn getOrInsertFixedHashed(
         self: *GroupTable,
         key: []const u8,
         agg_calls: []const AggCall,
@@ -727,7 +727,7 @@ pub const GroupTable = struct {
 
     const FixedProbe = struct { id: ?u32, slot: usize };
 
-    inline fn fixedSlotCount(self: *const GroupTable) usize {
+    pub inline fn fixedSlotCount(self: *const GroupTable) usize {
         return self.fixed_capacity;
     }
 
@@ -735,7 +735,7 @@ pub const GroupTable = struct {
         return if (self.fixed_stride == 0) self.slots else self.fixed_slots;
     }
 
-    inline fn fixedSlot(self: *const GroupTable, index: usize) *FixedSlot {
+    pub inline fn fixedSlot(self: *const GroupTable, index: usize) *FixedSlot {
         const first_slots = self.firstSlots();
         const first = first_slots.len;
         if (index < first) return &first_slots[index];

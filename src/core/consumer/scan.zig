@@ -1,3 +1,4 @@
+const SelectedBatch = @import("../selected_batch.zig").SelectedBatch;
 const RowGroupArena = @import("../row_group_arena.zig").RowGroupArena;
 const DecodeScratch = @import("../parquet/column.zig").DecodeScratch;
 const builtin = @import("builtin");
@@ -75,7 +76,7 @@ const mark = scan_plan.mark;
 
 /// `.selected` with a partial mask gathers every column into ascending window indexes and emits those rows.
 /// A column that cannot be gathered (nested, histogram, levels-only) keeps the mask and `input_rows` null.
-pub fn emitRecords(
+fn emitRecords(
     arena: std.mem.Allocator,
     records: *const RecordSink,
     batch: *const filter_eval.Batch,
@@ -368,7 +369,7 @@ fn storedRowKey(
 
 /// Fold `cols` through the worker's local table in windows, flushing into `g.part` when the local table fills or
 /// stops reducing. One window is what `groupedCoded` or the row path already know how to fold.
-pub fn foldGroupedWindows(
+fn foldGroupedWindows(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
     target: AggTarget,
@@ -706,7 +707,7 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
 
 /// Share computed scalar inputs too, then use the ordinary typed folds over their prepared values. Synthesizing a
 /// borrowed DOUBLE column keeps NULL masks and canonical 64-row reductions in updateOne; no partial sum is merged.
-pub fn foldScalarCache(
+fn foldScalarCache(
     a: std.mem.Allocator,
     persist: std.mem.Allocator,
     calls: []const expr_agg.AggCall,
@@ -1839,5 +1840,245 @@ fn foldFromStats(
         }
     }
     return any_decode_required;
+}
+
+
+test "a partial record batch gathers ascending original rows" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const values = [_]i32{ 1, 2, 3, 4 };
+    const cols = [_]filter_eval.Batch.Column{.{ .i32 = .{ .values = &values } }};
+    const rows: filter_eval.Batch = .{ .cols = &cols, .num_rows = values.len };
+    var sel = try filter_selection.SelectionVector.init(testing.allocator, values.len);
+    defer sel.deinit();
+    sel.set(0, false);
+    sel.set(2, false);
+    const Capture = struct {
+        n: usize = 0,
+        ords: [2]u64 = undefined,
+        vals: [2]i32 = undefined,
+        fn start(_: *anyopaque, _: u64, _: usize) void {}
+        fn batch(ctx: *anyopaque, view: SelectedBatch, _: []const ?usize) !void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            for (0..view.batch.num_rows) |i| {
+                c.ords[c.n] = try view.ordinal(i);
+                c.vals[c.n] = view.batch.cols[0].i32.values[i];
+                c.n += 1;
+            }
+        }
+    };
+    var cap: Capture = .{};
+    var arm: RecordSink = .{ .selected = .{
+        .ctx = @ptrCast(&cap),
+        .startFn = Capture.start,
+        .batchFn = Capture.batch,
+    } };
+    try emitRecords(arena, &arm, &rows, &sel, 50, 7, &.{});
+    try testing.expectEqual(@as(u64, 51), cap.ords[0]);
+    try testing.expectEqual(@as(u64, 53), cap.ords[1]);
+    try testing.expectEqual(@as(i32, 2), cap.vals[0]);
+    try testing.expectEqual(@as(i32, 4), cap.vals[1]);
+}
+
+
+fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !void {
+    const strings = try a.alloc([]const u8, n);
+    defer a.free(strings);
+    const text = try a.alloc([96]u8, n);
+    defer a.free(text);
+    for (strings, text, 0..) |*s, *buf, i| {
+        s.* = try std.fmt.bufPrint(buf, "a distinct long key whose bytes must outlive grouping window {d:0>8}", .{i});
+    }
+    const ints = try a.alloc(i64, n);
+    defer a.free(ints);
+    for (ints, 0..) |*v, i| v.* = @intCast(i);
+    const codes = try a.alloc(u32, n);
+    defer a.free(codes);
+    for (codes, 0..) |*code, i| code.* = @intCast(i);
+    var cols = [_]filter_eval.Batch.Column{
+        .{ .string = .{
+            .values = if (coded) &.{} else strings,
+            .dict = if (coded) strings else &.{},
+            .codes = if (coded) codes else null,
+            .max_def = 0,
+        } },
+        .{ .i64 = .{ .values = ints, .max_def = 0 } },
+    };
+    const keys = [_]expr_ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } },
+    };
+    const calls = [_]expr_agg.AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    const Merge = struct {
+        fn count(dst: *expr_agg.Accumulator, src: *expr_agg.Accumulator, _: std.mem.Allocator) !void {
+            dst.count += src.count;
+        }
+    };
+    var budget: expr_agg.SharedBudget = .{ .limit = 64 << 20 };
+    defer std.debug.assert(budget.used.load(.monotonic) == 0);
+    var part = try partagg.PartAgg.init(a, &budget, &calls, 0, Merge.count, 4, 4, 1, true);
+    defer part.deinit();
+    part.compact = true;
+    try std.testing.expect(try part.admitPrivate(n, 100));
+    var table = expr_agg.GroupTable.init(a, 0);
+    table.shared = &budget;
+    table.compact.configure(&calls);
+    defer table.deinit();
+    var local: partagg.Local = .{ .runs = &part.runs[0] };
+    var sel = try filter_selection.SelectionVector.init(a, n);
+    defer sel.deinit();
+    var scratch_budget: expr_agg.SharedBudget = .{ .limit = 512 << 10 };
+    var charged: @import("../memory.zig").Charged = .{ .child = a, .budget = &scratch_budget };
+    var arena = RowGroupArena.init(charged.allocator());
+    defer arena.deinit();
+    const target: AggTarget = .{ .grouped = .{
+        .calls = &calls,
+        .keys = &keys,
+        .table = &table,
+        .pos_base = 0,
+        .part = &part,
+        .local = &local,
+    } };
+    try foldGroupedWindows(
+        arena.allocator(),
+        a,
+        target,
+        &cols,
+        &.{ 0, 1 },
+        &sel,
+        &.{ coded, false },
+        coded,
+        null,
+        null,
+        null,
+    );
+    try part.flush(&local, &table);
+    try part.foldRuns(1);
+    var groups: usize = 0;
+    for (part.parts) |*p| {
+        groups += p.table.groupCount();
+        for (0..p.table.groupCount()) |g| {
+            var tmp: [16]expr_agg.Accumulator = undefined;
+            try std.testing.expectEqual(@as(u64, 1), p.table.readGroup(g, 1, &tmp)[0].count);
+            const k = p.table.keyAt(g);
+            const id = std.mem.readInt(i64, k[k.len - 8 ..][0..8], .little);
+            try std.testing.expectEqual(@as(u64, @intCast(id)), p.table.first.items[g]);
+            const len = std.mem.readInt(u32, k[1..5], .little);
+            try std.testing.expectEqualStrings(strings[@intCast(id)], k[5..][0..len]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, n), groups);
+}
+
+test "partition windows reuse charged scratch instead of retaining a row group's windows" {
+    try checkPartitionWindowScratch(std.testing.allocator, 32_768, false);
+}
+
+test "partition window scratch keeps materialized dictionaries live across resets" {
+    try checkPartitionWindowScratch(std.testing.allocator, 8192, true);
+}
+
+test "partition window scratch returns every charge on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPartitionWindowScratch, .{ 32, false });
+}
+
+
+test "scalar cache DAG shares nullable inputs without changing canonical sum blocks, including allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testScalarCache, .{});
+}
+
+fn testScalarCache(backing: std.mem.Allocator) !void {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 193;
+    const values = try a.alloc(f64, n);
+    const defs = try a.alloc(u32, n);
+    for (values, defs, 0..) |*v, *d, i| {
+        v.* = switch (i % 6) {
+            0 => 1e16,
+            1 => 1,
+            2 => -1e16,
+            3 => 0.1,
+            4 => -0.0,
+            else => std.math.nan(f64),
+        };
+        d.* = @intFromBool(i % 17 != 0);
+    }
+    var x: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var one: expr_ast.Expr = .{ .literal = .{ .i64 = 1 } };
+    var base: expr_ast.Expr = .{ .binop = .{
+        .op = .add,
+        .left = &x,
+        .right = &one,
+        .result_type = .f64,
+        .depth = 2,
+    } };
+    var repeated = base;
+    const square: expr_ast.Expr = .{ .binop = .{
+        .op = .mul,
+        .left = &base,
+        .right = &repeated,
+        .result_type = .f64,
+        .depth = 3,
+    } };
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .sum, .arg = base, .result = .f64, .where = null, .alias = "s" },
+        .{ .func = .sum, .arg = square, .result = .f64, .where = null, .alias = "ss" },
+        .{ .func = .avg, .arg = base, .result = .avg_f64, .where = null, .alias = "a" },
+        .{ .func = .count, .arg = base, .result = .i64, .where = null, .alias = "n" },
+        .{ .func = .min, .arg = base, .result = .f64, .where = null, .alias = "lo" },
+    };
+    const cols = [_]filter_eval.Batch.Column{.{ .f64 = .{
+        .values = values,
+        .def_levels = defs,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const batch: filter_eval.Batch = .{ .cols = &cols, .num_rows = n };
+    for ([_]bool{ false, true }) |empty| {
+        var sel = try filter_selection.SelectionVector.init(a, n);
+        for (0..n) |i| sel.set(i, !empty and i % 3 != 1);
+        var want: [calls.len]expr_agg.Accumulator = undefined;
+        var got: [calls.len]expr_agg.Accumulator = undefined;
+        for (calls, &want, &got) |call, *w, *g| {
+            w.* = .init(call);
+            g.* = .init(call);
+            try expr_agg.updateOne(a, a, w, call, &batch, &.{0}, &sel);
+        }
+        var off: usize = 0;
+        while (off < n) : (off += 64) {
+            const count = @min(64, n - off);
+            const col = try cols[0].sliceRows(off, count);
+            const part: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = count };
+            const mask = try sel.alignedWindow(off, count);
+            try testing.expect(try foldScalarCache(
+                a,
+                a,
+                &calls,
+                &got,
+                &@as([calls.len]bool, @splat(false)),
+                &part,
+                &.{0},
+                &mask,
+            ));
+        }
+        for (want, got) |w, g| switch (w) {
+            .sum_f, .min_f => |expected| {
+                const actual = if (g == .sum_f) g.sum_f else g.min_f;
+                try testing.expectEqual(expected != null, actual != null);
+                if (expected) |v| try testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(actual.?)));
+            },
+            .avg => |avg| {
+                try testing.expectEqual(avg.count, g.avg.count);
+                try testing.expectEqual(@as(u64, @bitCast(avg.sum)), @as(u64, @bitCast(g.avg.sum)));
+            },
+            .count => |count| try testing.expectEqual(count, g.count),
+            else => unreachable,
+        };
+    }
 }
 

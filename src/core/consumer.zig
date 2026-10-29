@@ -154,11 +154,8 @@ pub const RecordSink = target_module.RecordSink;
 pub const scan_module = @import("consumer/scan.zig");
 pub const scanRGForAgg = scan_module.scanRGForAgg;
 pub const probeDecodeFailure = scan_module.probeDecodeFailure;
-const emitRecords = scan_module.emitRecords;
-const foldGroupedWindows = scan_module.foldGroupedWindows;
 pub const canonicalDecodeFailure = scan_module.canonicalDecodeFailure;
 const automaticCacheRows = scan_module.automaticCacheRows;
-const foldScalarCache = scan_module.foldScalarCache;
 
 pub const AggTarget = target_module.AggTarget;
 

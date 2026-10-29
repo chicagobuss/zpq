@@ -1106,6 +1106,8 @@ fn aggregateFooter(
 }
 
 
+/// Columns of each lane and encoding an answer writes: near-unique integers (DELTA), repeating ones (dictionary),
+/// floats and strings with NULLs, and a DECIMAL whose value at `bad_row`, when set, its INT32 cannot hold.
 fn aggAnswerCols(a: std.mem.Allocator, n: usize, bad_row: ?usize) ![]expr_agg.OutputCol {
     const uniq = try a.alloc(i64, n);
     const reps = try a.alloc(i64, n);

@@ -82,7 +82,7 @@ pub fn Packed(comptime Bits: type, comptime kinds: []const lanes.Lane, comptime 
             }
         }
 
-        fn identityError(s: *Self, err: anyerror) anyerror {
+        fn identityError(s: *Self, err: anytype) (@TypeOf(err) || error{ExceededMemoryBudget}) {
             if (err == error.BadKey or err == error.KeyTooWide) {
                 if (s.refused) |flag| flag.store(true, .monotonic);
                 return error.ExceededMemoryBudget;

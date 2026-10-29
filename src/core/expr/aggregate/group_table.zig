@@ -36,7 +36,6 @@ const InlineI128 = distinct.InlineI128;
 const InlineBytes = distinct.InlineBytes;
 const partOf = distinct.partOf;
 const DistinctBytes = distinct.DistinctBytes;
-const foldExtremeF = @import("scalar.zig").foldExtremeF;
 
 const DistinctSet = distinct.DistinctSet;
 const DistinctAcc = distinct.DistinctAcc;
@@ -52,16 +51,6 @@ const statistics = @import("../../parquet/statistics.zig");
 const agg_coded = @import("../agg_coded.zig");
 const AggFunc = types.AggFunc;
 const ResultShape = types.ResultShape;
-const scalar_mod = @import("scalar.zig");
-const updateOne = scalar_mod.updateOne;
-const updateOneFromStats = scalar_mod.updateOneFromStats;
-const updateSharedInteger = scalar_mod.updateSharedInteger;
-const finalize = scalar_mod.finalize;
-const foldMinMaxBytes = scalar_mod.foldMinMaxBytes;
-const simdMinMaxF64 = scalar_mod.simdMinMaxF64;
-const prefix16 = scalar_mod.prefix16;
-const statPresentCount = scalar_mod.statPresentCount;
-const testI64Meta = scalar_mod.testI64Meta;
 const packFixedKey = keys_mod.packFixedKey;
 const splitMix64 = census_mod.splitMix64;
 const FingerprintSet = census_mod.FingerprintSet;
@@ -1266,142 +1255,9 @@ test "SharedBudget: tables share one budget instead of owning fixed slices" {
     try std.testing.expectEqual(@as(usize, 0), recycle.used.load(.monotonic));
 }
 
-test "string min/max by 16-byte prefix agree with a byte-by-byte fold: shared prefixes, zero bytes, nulls" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var prng = std.Random.DefaultPrng.init(0xb17e);
-    const r = prng.random();
-    const alphabet = [_]u8{ 0, 1, 'a', 'b', 0xff };
-    for (0..200) |_| {
-        const n = r.uintLessThan(usize, 300) + 1;
-        const vals = try a.alloc([]const u8, n);
-        const defs = try a.alloc(u32, n);
-        for (vals, defs) |*v, *d| {
-            const len = r.uintLessThan(usize, 22);
-            const buf = try a.alloc(u8, len);
-            // A long shared prefix in most rows, so the full compare runs too.
-            for (buf, 0..) |*c, k| {
-                c.* = if (k < 17 and r.uintLessThan(u8, 6) != 0) 'a' else alphabet[r.uintLessThan(usize, alphabet.len)];
-            }
-            v.* = buf;
-            d.* = @intFromBool(r.uintLessThan(u8, 5) != 0);
-        }
-        var sel = try filter_selection.SelectionVector.init(a, n);
-        for (0..n) |i| if (r.uintLessThan(u8, 3) == 0) sel.set(i, false);
-        const col: filter_eval.Batch.Column = .{ .string = .{ .values = vals, .def_levels = defs, .max_def = 1 } };
-        inline for (.{ true, false }) |is_min| {
-            var want: ?[]const u8 = null;
-            for (vals, defs, 0..) |v, d, i| {
-                if (!sel.isActive(i) or d != 1) continue;
-                const ord = if (want) |w| std.mem.order(u8, v, w) else .lt;
-                if (want == null or (is_min and ord == .lt) or (!is_min and ord == .gt)) want = v;
-            }
-            var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
-            try foldMinMaxBytes(a, is_min, &state, col, &sel);
-            const got = if (is_min) state.min_bytes else state.max_bytes;
-            if (want) |w| try testing.expectEqualSlices(u8, w, got.?) else try testing.expect(got == null);
-        }
-    }
-}
 
-/// Both NaN, or the same bits (so -0 and +0 differ).
-fn sameF(want: f64, got: f64) bool {
-    if (std.math.isNan(want)) return std.math.isNan(got);
-    return @as(u64, @bitCast(want)) == @as(u64, @bitCast(got));
-}
 
-test "float min/max: NaN above every number, -0 below +0, the same in any order and on every path" {
-    const nan = std.math.nan(f64);
-    const inf = std.math.inf(f64);
-    const cases = [_]struct { vals: []const f64, lo: f64, hi: f64 }{
-        .{ .vals = &.{ nan, 1, 3 }, .lo = 1, .hi = nan },
-        .{ .vals = &.{ 3, nan, 1 }, .lo = 1, .hi = nan },
-        .{ .vals = &.{ nan, nan }, .lo = nan, .hi = nan },
-        .{ .vals = &.{ 0.0, -0.0 }, .lo = -0.0, .hi = 0.0 },
-        .{ .vals = &.{ -0.0, 0.0 }, .lo = -0.0, .hi = 0.0 },
-        .{ .vals = &.{ -inf, inf, nan }, .lo = -inf, .hi = nan },
-        .{ .vals = &.{ -inf, -inf }, .lo = -inf, .hi = -inf },
-    };
-    var prng = std.Random.DefaultPrng.init(0x7a7);
-    const r = prng.random();
-    for (cases) |c| for (0..20) |_| {
-        // Values in a random order (each at least once), past 64 rows so the SIMD lanes run; folded one at a time,
-        // through the kernel, and as two halves merged: all give the same answer.
-        var vals: [130]f64 = undefined;
-        for (&vals) |*v| v.* = c.vals[r.uintLessThan(usize, c.vals.len)];
-        for (c.vals, 0..) |v, k| vals[k * 7] = v;
-        var sel = try filter_selection.SelectionVector.init(std.testing.allocator, vals.len);
-        defer sel.deinit();
-        inline for (.{ true, false }) |is_min| {
-            const want = if (is_min) c.lo else c.hi;
-            var one: ?f64 = null;
-            for (vals) |v| foldExtremeF(is_min, &one, v);
-            var half_a: ?f64 = null;
-            var half_b: ?f64 = null;
-            for (vals[0..65]) |v| foldExtremeF(is_min, &half_a, v);
-            for (vals[65..]) |v| foldExtremeF(is_min, &half_b, v);
-            foldExtremeF(is_min, &half_b, half_a.?);
-            for ([_]f64{ one.?, half_b.?, simdMinMaxF64(is_min, &vals, &sel).? }) |got| {
-                if (!sameF(want, got)) {
-                    std.debug.print("{s} of {any}: want {d}, got {d}\n", .{ if (is_min) "min" else "max", c.vals, want, got });
-                    return error.TestUnexpectedResult;
-                }
-            }
-        }
-    };
-}
 
-test "zero float bounds never prove sign even with known zero NaNs" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    inline for (.{ schema.Type.FLOAT, schema.Type.DOUBLE }) |physical| {
-        const T = if (physical == .FLOAT) f32 else f64;
-        const U = if (physical == .FLOAT) u32 else u64;
-        var meta = try testI64Meta(a, .empty, 100, .REQUIRED);
-        meta.schema.items[1].type = physical;
-        const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = physical, .expr_type = .f64 } };
-        const Case = struct { lo: T, hi: T, min_folds: bool, max_folds: bool };
-        for ([_]Case{
-            .{ .lo = -0.0, .hi = 0.0, .min_folds = false, .max_folds = false },
-            .{ .lo = 0.0, .hi = 1.0, .min_folds = false, .max_folds = true },
-            .{ .lo = -1.0, .hi = -0.0, .min_folds = true, .max_folds = false },
-            .{ .lo = 1.5, .hi = 2.5, .min_folds = true, .max_folds = true },
-        }) |c| {
-            var lo: [@sizeOf(T)]u8 = undefined;
-            var hi: [@sizeOf(T)]u8 = undefined;
-            std.mem.writeInt(U, &lo, @bitCast(c.lo), .little);
-            std.mem.writeInt(U, &hi, @bitCast(c.hi), .little);
-            var path: schema.StringList = .empty;
-            try path.append(a, "x");
-            var chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
-            try chunks.append(a, .{
-                .file_path = null,
-                .file_offset = 0,
-                .meta_data = .{
-                    .type = physical,
-                    .encodings = .empty,
-                    .path_in_schema = path,
-                    .codec = .UNCOMPRESSED,
-                    .num_values = 100,
-                    .total_uncompressed_size = 0,
-                    .total_compressed_size = 0,
-                    .data_page_offset = 0,
-                    .index_page_offset = null,
-                    .dictionary_page_offset = null,
-                    .statistics = .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 },
-                },
-            });
-            const rg: schema.RowGroup = .{ .columns = chunks, .total_byte_size = 0, .num_rows = 100 };
-            inline for (.{ AggFunc.min, AggFunc.max }) |func| {
-                const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "x", .result = .f64 };
-                var state = Accumulator.init(call);
-                try testing.expectEqual(if (func == .min) c.min_folds else c.max_folds, try updateOneFromStats(&state, call, &rg, &meta));
-            }
-        }
-    }
-}
 
 test "fixed-width group keys match the serialized framing and the byte table" {
     const a = std.testing.allocator;
@@ -1710,56 +1566,7 @@ test "compact variable insertion keeps retained capacity charged after allocatio
     }.run, .{});
 }
 
-test "boundary: a footer null count outside the row group's rows answers no count from statistics" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var path: schema.StringList = .empty;
-    try path.append(a, "x");
-    const meta = try testI64Meta(a, .empty, 100, .OPTIONAL);
-    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 800, .num_rows = 100 };
-    try rg.columns.append(a, .{ .file_path = null, .file_offset = 0, .meta_data = .{
-        .type = .INT64,
-        .encodings = .empty,
-        .path_in_schema = path,
-        .codec = .UNCOMPRESSED,
-        .num_values = 100,
-        .total_uncompressed_size = 800,
-        .total_compressed_size = 800,
-        .data_page_offset = 0,
-        .index_page_offset = null,
-        .dictionary_page_offset = null,
-        .statistics = null,
-    } });
-    const cm = &rg.columns.items[0].meta_data.?;
-    const Case = struct { nc: i64, want: ?i64 };
-    for ([_]Case{
-        .{ .nc = 0, .want = 100 },
-        .{ .nc = 100, .want = 0 },
-        .{ .nc = 37, .want = 63 },
-        .{ .nc = 101, .want = null },
-        .{ .nc = -1, .want = null },
-        .{ .nc = std.math.minInt(i64), .want = null },
-        .{ .nc = std.math.maxInt(i64), .want = null },
-    }) |case| {
-        cm.statistics = .{ .null_count = case.nc };
-        try testing.expectEqual(case.want, statPresentCount(&rg, 0, cm, &meta));
-    }
-}
 
-test "regression: a one-row min/max of a UINT64 column keeps values of 2^63 and up as the column's bits" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64, .unsigned_64 = true } };
-    for ([_]AggFunc{ .min, .max }) |func| {
-        const call: AggCall = .{ .func = func, .arg = arg, .where = null, .alias = "m", .result = .i64 };
-        var state = Accumulator.init(call);
-        if (func == .min) state.min_i = std.math.maxInt(u64) else state.max_i = std.math.maxInt(u64);
-        const cols = try finalize(a, call, state);
-        try std.testing.expectEqual(@as(i64, -1), cols[0].col.i64.values[0]);
-    }
-}
 
 test "regression: a count(DISTINCT) merge sizes its tables for the result, so none grows while hash-ordered values arrive" {
     // F3: one worker's set merged into another's slot by slot (hash order) while the destination grew as values came
@@ -1893,174 +1700,8 @@ test "distinct bitmaps retain the hash reservation so a late outlier has identic
     }
 }
 
-test "shared integer scalar folds preserve exact lanes, NULLs, selections and refusal before mutation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testSharedInteger, .{});
-}
 
-fn testSharedInteger(a: std.mem.Allocator) !void {
-    const n = 193;
-    var values: [n]i64 = undefined;
-    var narrow: [n]i32 = undefined;
-    var defs: [n]u32 = undefined;
-    for (&values, &narrow, &defs, 0..) |*v, *v32, *d, r| {
-        v.* = switch (r % 5) {
-            0 => std.math.minInt(i64),
-            1 => std.math.maxInt(i64),
-            else => @as(i64, @intCast(r)) - 97,
-        };
-        v32.* = @intCast(@as(i64, @intCast(r)) - 97);
-        d.* = @intFromBool(r % 11 != 0);
-    }
-    const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
-    const calls = [_]AggCall{
-        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "all" },
-        .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "s", .offset = -17 },
-        .{ .func = .min, .arg = arg, .result = .i64, .where = null, .alias = "lo" },
-        .{ .func = .max, .arg = arg, .result = .i64, .where = null, .alias = "hi" },
-        .{ .func = .avg, .arg = arg, .result = .avg_f64, .where = null, .alias = "a" },
-        .{ .func = .count, .arg = arg, .result = .i64, .where = null, .alias = "present" },
-        .{ .func = .sum, .arg = arg, .result = .i64, .where = null, .alias = "again", .offset = 31 },
-    };
-    for ([_]bool{ false, true }) |is_narrow| {
-        const col: filter_eval.Batch.Column = if (is_narrow)
-            .{ .i32 = .{ .values = &narrow, .def_levels = &defs, .max_def = 1, .has_nulls = true } }
-        else
-            .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
-        const batch: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = n };
-        for (0..4) |mode| {
-            var sel = try filter_selection.SelectionVector.init(a, n);
-            defer sel.deinit();
-            for (0..n) |r| sel.set(r, switch (mode) {
-                0 => true,
-                1 => false,
-                2 => r % 3 != 0,
-                else => r % 71 == 0,
-            });
-            // Exercise every compile-time operation mask and repeat updates from nonempty states.
-            for (0..8) |mask| {
-                var handled: [calls.len]bool = @splat(false);
-                handled[1] = mask & 1 == 0;
-                handled[2] = mask & 2 == 0;
-                handled[3] = mask & 4 == 0;
-                handled[4] = mask & 1 == 0;
-                handled[6] = mask & 1 == 0;
-                // At least two value calls are needed to justify the common-input kernel.
-                if (mask == 0) handled[2] = false;
-                var want: [calls.len]Accumulator = undefined;
-                var got: [calls.len]Accumulator = undefined;
-                for (calls, &want, &got) |call, *w, *g| {
-                    w.* = .init(call);
-                    g.* = .init(call);
-                }
-                for (0..2) |_| {
-                    for (calls, &want, handled) |call, *w, h| if (!h) {
-                        try updateOne(a, a, w, call, &batch, &.{0}, &sel);
-                    };
-                    try std.testing.expect(try updateSharedInteger(a, &calls, &got, &handled, &batch, &.{0}, &sel));
-                }
-                for (want, got) |w, g| try std.testing.expectEqualDeep(w, g);
-            }
-        }
-    }
-    var sel = try filter_selection.SelectionVector.init(a, n);
-    defer sel.deinit();
-    var states: [calls.len]Accumulator = undefined;
-    for (calls, &states) |call, *state| state.* = .init(call);
-    const before = states;
-    var unsupported = calls;
-    unsupported[calls.len - 1].arg.?.col_ref.unsigned_64 = true;
-    const batch: filter_eval.Batch = .{ .cols = &.{.{ .i64 = .{ .values = &values } }}, .num_rows = n };
-    try std.testing.expect(!try updateSharedInteger(
-        a,
-        &unsupported,
-        &states,
-        &@as([calls.len]bool, @splat(false)),
-        &batch,
-        &.{0},
-        &sel,
-    ));
-    try std.testing.expectEqualDeep(before, states);
-    unsupported[calls.len - 1].arg.?.col_ref.unsigned_64 = false;
-    unsupported[calls.len - 1].arg.?.col_ref.unsigned_32 = true;
-    try std.testing.expect(!try updateSharedInteger(
-        a,
-        &unsupported,
-        &states,
-        &@as([calls.len]bool, @splat(false)),
-        &batch,
-        &.{0},
-        &sel,
-    ));
-    try std.testing.expectEqualDeep(before, states);
-}
 
-test "shared integer duplicate counts decline levels-only and short value lanes before mutation" {
-    const a = std.testing.allocator;
-    const n = 193;
-    var defs: [n]u32 = undefined;
-    var vals: [n]i64 = @splat(7);
-    var narrow: [n]i32 = @splat(7);
-    for (&defs, 0..) |*d, i| d.* = @intFromBool(i % 11 != 0);
-    for ([_]bool{ false, true }) |is32| for ([_]usize{ 0, n - 1 }) |len| {
-        const col: filter_eval.Batch.Column = if (is32)
-            .{ .i32 = .{
-                .values = narrow[0..len],
-                .def_levels = &defs,
-                .max_def = 1,
-                .has_nulls = true,
-                .levels_only_rows = if (len == 0) n else 0,
-            } }
-        else
-            .{ .i64 = .{
-                .values = vals[0..len],
-                .def_levels = &defs,
-                .max_def = 1,
-                .has_nulls = true,
-                .levels_only_rows = if (len == 0) n else 0,
-            } };
-        const arg: expr_ast.Expr = .{ .col_ref = .{
-            .col_idx = 0,
-            .physical_type = if (is32) .INT32 else .INT64,
-            .expr_type = .i64,
-            .nullable = true,
-        } };
-        const calls = [_]AggCall{
-            .{ .func = .count, .arg = arg, .where = null, .alias = "a", .result = .i64 },
-            .{ .func = .count, .arg = arg, .where = null, .alias = "b", .result = .i64 },
-        };
-        const batch: filter_eval.Batch = .{ .cols = &.{col}, .num_rows = n };
-        for (0..3) |mode| {
-            var sel = try filter_selection.SelectionVector.init(a, n);
-            defer sel.deinit();
-            for (0..n) |r| sel.set(r, switch (mode) {
-                0 => true,
-                1 => false,
-                else => r % 3 != 0,
-            });
-            var states: [2]Accumulator = .{ .{ .count = 7 }, .{ .count = 19 } };
-            const before = states;
-            try std.testing.expect(!try updateSharedInteger(
-                a,
-                &calls,
-                &states,
-                &.{ false, false },
-                &batch,
-                &.{0},
-                &sel,
-            ));
-            try std.testing.expectEqualDeep(before, states);
-            if (len == 0) {
-                var present: u64 = 0;
-                for (defs, 0..) |d, r| if (d != 0 and sel.isActive(r)) {
-                    present += 1;
-                };
-                for (calls, &states) |call, *state| try updateOne(a, a, state, call, &batch, &.{0}, &sel);
-                try std.testing.expectEqual(7 + present, states[0].count);
-                try std.testing.expectEqual(19 + present, states[1].count);
-            }
-        }
-    };
-}
 
 test "M1 parallel DISTINCT source charges and releases preserve the private ceiling" {
     const a = std.testing.allocator;

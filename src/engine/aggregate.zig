@@ -535,7 +535,8 @@ fn executeAggregateOver(
     return answer;
 }
 
-fn aggregateScanArgs(
+// Keep this setup in its caller, as before extraction, so the scan's options need no outlined argument handoff.
+inline fn aggregateScanArgs(
     ctx: Context,
     args: QueryArgs,
     agg_str: []const u8,

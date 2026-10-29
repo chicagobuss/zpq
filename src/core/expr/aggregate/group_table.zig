@@ -1704,6 +1704,29 @@ test "a table charges each group's count(DISTINCT) set object, fixed-width keys 
 }
 
 fn compactAllocationTrial(gpa: std.mem.Allocator, fixed: bool) !void {
+    // Keep the allocation-failure sweep deterministic: whether an address can grow in place varies across runs.
+    // Disabling remap here forces every replacement through the allocating fallback, so every such allocation is
+    // still injected and checked; separate tests exercise the page-backed no-copy path.
+    const NoRemap = struct {
+        child: std.mem.Allocator,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(n, alignment, ra);
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(bytes, alignment, ra);
+        }
+    };
+    var stable: NoRemap = .{ .child = gpa };
     const arg: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const calls = [_]AggCall{
         .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
@@ -1713,7 +1736,7 @@ fn compactAllocationTrial(gpa: std.mem.Allocator, fixed: bool) !void {
         .{ .func = .max, .arg = arg, .where = null, .alias = "hi", .result = .i64 },
     };
     var budget: SharedBudget = .{ .limit = 1 << 20 };
-    var table = GroupTable.init(gpa, 0);
+    var table = GroupTable.init(stable.allocator(), 0);
     table.shared = &budget;
     table.fixed_stride = if (fixed) 9 else 0;
     table.compact.configure(&calls);

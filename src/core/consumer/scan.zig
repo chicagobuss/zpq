@@ -1026,37 +1026,79 @@ fn scanRGForAggImpl(
                 .prof = prof,
             })) return selected;
         },
-        .scalar => |s| scalar: {
-            // Update only the aggs that weren't handled via stats. The agg's
-            // own per-WHERE predicate (if any) is composed inside updateOne.
-            if (!staged and try expr_agg.updateSharedInteger(
-                ra,
-                s.calls,
-                s.accumulators,
-                handled_via_stats,
-                &batch,
-                lookup,
-                &sel,
-            )) break :scalar;
-            for (s.calls, s.accumulators, handled_via_stats, 0..) |call, *acc, handled, i| {
-                if (handled) continue;
-                var call_arena = std.heap.ArenaAllocator.init(side);
-                defer call_arena.deinit();
-                const ca = if (staged) call_arena.allocator() else ra;
-                const cb = if (stage_plan) |sp|
-                    try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, false)
-                else
-                    CallBatch{ .batch = batch, .lookup = lookup };
-                // `ca` is per-RG (or per-call) scratch; `gpa` is the persist allocator for owned results (string
-                // min/max winner) that outlive both and the cross-worker merge.
-                try expr_agg.updateOne(ca, gpa, acc, call, &cb.batch, cb.lookup, &sel);
-            }
-        },
+        .scalar => |scalar| try foldWholeScalar(.{
+            .ra = ra,
+            .gpa = gpa,
+            .side = side,
+            .scalar = scalar,
+            .handled = handled_via_stats,
+            .batch = &batch,
+            .lookup = lookup,
+            .sel = &sel,
+            .sel_pre = &sel_pre,
+            .stage_plan = stage_plan,
+            .dec = &dec,
+            .staged = staged,
+        }),
     }
     const t_agg_end = nowMonoNs();
     ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
     profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
     return selected;
+}
+
+const WholeScalar = struct {
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    side: std.mem.Allocator,
+    scalar: @FieldType(AggTarget, "scalar"),
+    handled: []const bool,
+    batch: *const filter_eval.Batch,
+    lookup: []?usize,
+    sel: *filter_selection.SelectionVector,
+    sel_pre: *const filter_selection.SelectionVector,
+    stage_plan: ?StagePlan,
+    dec: *ChunkDecoder,
+    staged: bool,
+};
+
+fn foldWholeScalar(c: WholeScalar) !void {
+    const ra = c.ra;
+    const gpa = c.gpa;
+    const side = c.side;
+    const s = c.scalar;
+    const handled_via_stats = c.handled;
+    const batch = c.batch.*;
+    const lookup = c.lookup;
+    const sel = c.sel;
+    const sel_pre = c.sel_pre;
+    const stage_plan = c.stage_plan;
+    const dec = c.dec;
+    const staged = c.staged;
+    // Update only the aggs that weren't handled via stats. The agg's
+    // own per-WHERE predicate (if any) is composed inside updateOne.
+    if (!staged and try expr_agg.updateSharedInteger(
+        ra,
+        s.calls,
+        s.accumulators,
+        handled_via_stats,
+        &batch,
+        lookup,
+        sel,
+    )) return;
+    for (s.calls, s.accumulators, handled_via_stats, 0..) |call, *acc, handled, i| {
+        if (handled) continue;
+        var call_arena = std.heap.ArenaAllocator.init(side);
+        defer call_arena.deinit();
+        const ca = if (staged) call_arena.allocator() else ra;
+        const cb = if (stage_plan) |sp|
+            try dec.withCallColumns(ca, sp, i, &batch, lookup, sel_pre, false)
+        else
+            CallBatch{ .batch = batch, .lookup = lookup };
+        // `ca` is per-RG (or per-call) scratch; `gpa` is the persist allocator for owned results (string
+        // min/max winner) that outlive both and the cross-worker merge.
+        try expr_agg.updateOne(ca, gpa, acc, call, &cb.batch, cb.lookup, sel);
+    }
 }
 
 const WholeGrouped = struct {

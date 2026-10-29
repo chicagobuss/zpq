@@ -24,24 +24,11 @@ const builtin = @import("builtin");
 const owner_groups = @import("owner_groups.zig");
 const msd_groups = @import("msd_groups.zig");
 const retained_pages = @import("retained_pages.zig");
-const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 
-/// Zig's 16 MiB default made thread setup/teardown dominate short queries. Duplicated rather than imported from
-/// scan.zig, which imports this module.
-const WORKER_STACK_SIZE: usize = 1 << 20;
-const spawn_util = @import("spawn.zig");
 const blocking = @import("blocking.zig");
 const schema = @import("schema.zig");
-const filter_ast = @import("filter/ast.zig");
-const filter_eval = @import("filter/eval.zig");
 pub const SelectedBatch = @import("selected_batch.zig").SelectedBatch;
-const filter_selection = @import("filter/selection.zig");
-const filter_prune = @import("filter/prune.zig");
-const expr_ast = @import("expr/ast.zig");
-const expr_eval = @import("expr/eval.zig");
-const expr_agg = @import("expr/agg.zig");
-const core_memory = @import("memory.zig");
 const agg_plan = @import("agg_plan.zig");
 const encoder = @import("writer/encoder.zig");
 const streaming = @import("writer/streaming.zig");
@@ -52,14 +39,10 @@ const column_mod = @import("parquet/column.zig");
 const page_mod = @import("parquet/page.zig");
 const Diag = @import("diag.zig").Diag;
 const Text = @import("diag.zig").Text;
-const decimal_mod = @import("parquet/decimal.zig");
 const compression = @import("parquet/compression.zig");
 const invariant = @import("invariant.zig");
-const int96_mod = @import("parquet/int96.zig");
 const metadata = @import("parquet/metadata.zig");
 const statistics = @import("parquet/statistics.zig");
-const header_writer = @import("writer/page_header.zig");
-const WriterStatsPolicy = @import("parquet/writer_statistics.zig").Policy;
 const agg_coded = @import("expr/agg_coded.zig");
 const agg_dense = @import("expr/agg_dense.zig");
 const partagg = @import("partagg.zig");
@@ -70,7 +53,7 @@ pub const DecodeScratch = column_mod.DecodeScratch;
 pub const SliceScratch = page_mod.SliceScratch;
 pub const RowGroupArena = @import("row_group_arena.zig").RowGroupArena;
 
-pub const types = @import("consumer/types.zig");
+const types = @import("consumer/types.zig");
 pub const Error = types.Error;
 pub const RGSrc = types.RGSrc;
 pub const Timings = types.Timings;
@@ -84,7 +67,7 @@ pub const RGOut = types.RGOut;
 pub const rebaseRowGroupOffsets = types.rebaseRowGroupOffsets;
 const decode_order = @import("decode_order.zig");
 
-pub const output = @import("consumer/output.zig");
+const output = @import("consumer/output.zig");
 pub const OutputAggregator = output.OutputAggregator;
 pub const initOutputAggregator = output.initOutputAggregator;
 pub const resetAggregator = output.resetAggregator;
@@ -109,7 +92,7 @@ pub const outputLane = output.outputLane;
 
 pub const chunkDictionary = consumer_column.chunkDictionary;
 
-pub const slice_reader = @import("consumer/slice_reader.zig");
+const slice_reader = @import("consumer/slice_reader.zig");
 pub const SliceReader = slice_reader.SliceReader;
 
 const decimalKind = consumer_column.decimalKind;
@@ -122,7 +105,7 @@ const decodeWriteColumnMaybeCoded = consumer_column.decodeWriteColumnMaybeCoded;
 const appendIntoBuf = output.appendIntoBuf;
 const appendTyped = output.appendTyped;
 
-pub const encode_module = @import("consumer/encode.zig");
+const encode_module = @import("consumer/encode.zig");
 pub const encodeAggregator = encode_module.encodeAggregator;
 pub const RGEncoder = encode_module.RGEncoder;
 pub const plainBits = encode_module.plainBits;
@@ -145,13 +128,13 @@ pub const RowSubgroup = types.RowSubgroup;
 pub const AggRowGroup = types.AggRowGroup;
 pub const selectedWindow = types.selectedWindow;
 
-pub const target_module = @import("consumer/target.zig");
+const target_module = @import("consumer/target.zig");
 pub const PackedCount = target_module.PackedCount;
 pub const IntegerCountSink = target_module.IntegerCountSink;
 pub const SelectedRecords = target_module.SelectedRecords;
 pub const RecordSink = target_module.RecordSink;
 
-pub const scan_module = @import("consumer/scan.zig");
+const scan_module = @import("consumer/scan.zig");
 pub const scanRGForAgg = scan_module.scanRGForAgg;
 pub const probeDecodeFailure = scan_module.probeDecodeFailure;
 pub const canonicalDecodeFailure = scan_module.canonicalDecodeFailure;
@@ -159,13 +142,13 @@ const automaticCacheRows = scan_module.automaticCacheRows;
 
 pub const AggTarget = target_module.AggTarget;
 
-pub const workspace_module = @import("consumer/workspace.zig");
+const workspace_module = @import("consumer/workspace.zig");
 pub const AggWorkspace = workspace_module.AggWorkspace;
 const admitWhole = workspace_module.admitWhole;
 const dropRegion = workspace_module.dropRegion;
 const refusedDraw = workspace_module.refusedDraw;
 
-pub const budget_module = @import("consumer/budget.zig");
+const budget_module = @import("consumer/budget.zig");
 pub const DecodeBudget = budget_module.DecodeBudget;
 pub const decodeEstimate = budget_module.decodeEstimate;
 
@@ -173,8 +156,7 @@ pub const CacheHints = workspace_module.CacheHints;
 pub const cacheHintsWanted = workspace_module.cacheHintsWanted;
 const cacheDictionary = workspace_module.cacheDictionary;
 
-
-pub const pool_module = @import("consumer/pool.zig");
+const pool_module = @import("consumer/pool.zig");
 pub const poolOn = pool_module.poolOn;
 pub const releaseSlicePool = pool_module.releaseSlicePool;
 
@@ -212,7 +194,7 @@ const pruneFilterPages = pruning.pruneFilterPages;
 const pagePruning = pruning.pagePruning;
 const compactRows = pruning.compactRows;
 
-pub const copy_module = @import("consumer/copy.zig");
+const copy_module = @import("consumer/copy.zig");
 pub const copyRG = copy_module.copyRG;
 pub const BloomWrite = copy_module.BloomWrite;
 pub const Recompress = copy_module.Recompress;
@@ -223,8 +205,7 @@ const PageMove = copy_module.PageMove;
 const recompressChunk = copy_module.recompressChunk;
 const sourceBytes = types.sourceBytes;
 
-
-pub const consumer_column = @import("consumer/column.zig");
+const consumer_column = @import("consumer/column.zig");
 pub const checkRowShape = consumer_column.checkRowShape;
 pub const PruningInfo = consumer_column.PruningInfo;
 pub const RowRange = consumer_column.RowRange;

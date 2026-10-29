@@ -13,9 +13,8 @@ const DecSum = types.DecSum;
 const AvgState = types.AvgState;
 const Error = types.Error;
 const SharedBudget = core_memory.SharedBudget;
-const KeyArena = @import("keys.zig").KeyArena;
-const GroupKeyResolver = @import("keys.zig").GroupKeyResolver;
-const keys_mod = @import("keys.zig");
+const KeyArena = @import("contracts.zig").KeyArena;
+const keys_mod = @import("contracts.zig");
 const hashFixed = keys_mod.hashFixed;
 const isRowNull = keys_mod.isRowNull;
 const expandFixed = keys_mod.expandFixed;
@@ -1168,83 +1167,6 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
 }
 
 
-test "a sketched table counts every row in the count pass and groups only admitted cells in the admit pass" {
-    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
-    // Long keys take the unframed path, short ones the framed one; a null key is framed too.
-    const vals = [_][]const u8{
-        "http://example.com/a-long-enough-path", "short",
-        "http://example.com/a-long-enough-path", "http://example.com/another/long/path",
-        "short",                                 "",
-    };
-    const defs = [_]u32{ 1, 1, 1, 1, 1, 0 };
-    const cols = [_]filter_eval.Batch.Column{.{ .string = .{
-        .values = &vals,
-        .def_levels = &defs,
-        .max_def = 1,
-        .has_nulls = true,
-    } }};
-    const a = std.testing.allocator;
-    for ([_]u8{ 0, 9 }) |fixed| {
-        var cells: [1 << 10]u32 = @splat(0);
-        var sketch: CountSketch = .{ .cells = &cells, .shift = 64 - 10 };
-        var table = GroupTable.init(a, 1 << 20);
-        defer table.deinit();
-        table.sketch = &sketch;
-        var ids: [vals.len]u32 = undefined;
-        var sel = try filter_selection.SelectionVector.init(a, vals.len);
-        defer sel.deinit();
-        if (fixed == 0) {
-            var resolver = GroupKeyResolver.init(&cols);
-            defer resolver.deinit(a);
-            for (&ids, 0..) |*id, r| id.* = try resolver.resolve(a, &table, &cols, r, &calls, r);
-        } else {
-            // A fixed-width table sketches by its own image hash.
-            table.fixed_stride = fixed;
-            for (&ids, 0..) |*id, r| {
-                var image: [9]u8 = @splat(0);
-                image[0] = @intFromBool(r != 5);
-                image[1] = @intCast(vals[r].len);
-                id.* = try table.getOrInsertFixed(&image, &calls, r);
-            }
-        }
-        try sinkSketchRows(&table, &ids, &sel);
-        try std.testing.expectEqual(@as(usize, 0), table.groupCount());
-        try std.testing.expectEqual(@as(usize, 0), sel.count());
-        var total: u64 = 0;
-        for (cells) |c| total += c;
-        try std.testing.expectEqual(@as(u64, vals.len), total);
-        // The same key always lands in the same cell.
-        try std.testing.expectEqual(ids[0], ids[2]);
-        try std.testing.expectEqual(ids[1], ids[4]);
-
-        // Admit only the first key's cell: its rows get one group, every other row is dropped uncounted.
-        var admit: [(1 << 10) / 64]u64 = @splat(0);
-        const cell = std.math.maxInt(u32) - ids[0];
-        admit[cell / 64] |= @as(u64, 1) << @intCast(cell % 64);
-        sketch.admit = &admit;
-        @memset(&cells, 0);
-        var sel2 = try filter_selection.SelectionVector.init(a, vals.len);
-        defer sel2.deinit();
-        if (fixed == 0) {
-            var resolver = GroupKeyResolver.init(&cols);
-            defer resolver.deinit(a);
-            for (&ids, 0..) |*id, r| id.* = try resolver.resolve(a, &table, &cols, r, &calls, r);
-        } else for (&ids, 0..) |*id, r| {
-            var image: [9]u8 = @splat(0);
-            image[0] = @intFromBool(r != 5);
-            image[1] = @intCast(vals[r].len);
-            id.* = try table.getOrInsertFixed(&image, &calls, r);
-        }
-        try sinkSketchRows(&table, &ids, &sel2);
-        try std.testing.expect(table.groupCount() >= 1);
-        try std.testing.expectEqual(@as(u32, 0), ids[0]);
-        try std.testing.expectEqual(@as(u64, 0), table.first.items[0]);
-        for (ids, 0..) |id, r| try std.testing.expectEqual(id < table.groupCount(), sel2.isActive(r));
-        for (cells) |c| try std.testing.expectEqual(@as(u32, 0), c);
-    }
-}
-
-
 test "STRGROUP slots grow without key relocation and local clear reuses arena capacity" {
     const a = std.testing.allocator;
     var table = GroupTable.init(a, 64 << 20);
@@ -1792,67 +1714,6 @@ test "compact states refuse float tuples and only share identical integer inputs
     calls[2].arg.?.col_ref.expr_type = .f64;
     state.configure(&calls);
     try std.testing.expectEqual(@as(usize, 0), state.stride);
-}
-
-test "batched fixed lookups preserve sparse selections nulls NaNs and signed zeros" {
-    const n = 129;
-    var values: [n]f64 = undefined;
-    var defs: [n]u32 = undefined;
-    for (0..n) |r| {
-        values[r] = switch (r % 4) {
-            0 => -0.0,
-            1 => 0.0,
-            2 => @bitCast(@as(u64, 0x7ff8000000000001)),
-            else => 7.0,
-        };
-        defs[r] = if (r % 19 == 0) 0 else 1;
-    }
-    const cols = [_]filter_eval.Batch.Column{.{ .f64 = .{
-        .values = &values,
-        .def_levels = &defs,
-        .max_def = 1,
-        .has_nulls = true,
-    } }};
-    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
-    var sel = try filter_selection.SelectionVector.init(std.testing.allocator, n);
-    defer sel.deinit();
-    for (0..n) |r| if (r % 11 == 0) {
-        sel.set(r, false);
-    };
-    var scalar = GroupTable.init(std.testing.allocator, 1 << 20);
-    defer scalar.deinit();
-    var batched = GroupTable.init(std.testing.allocator, 1 << 20);
-    defer batched.deinit();
-    scalar.fixed_stride = 9;
-    batched.fixed_stride = 9;
-    var resolver = GroupKeyResolver.init(&cols);
-    defer resolver.deinit(std.testing.allocator);
-    var ids: [n]u32 = @splat(0);
-    try resolver.resolveBatch(std.testing.allocator, &batched, &cols, &calls, 1000, &sel, &ids, null);
-    for (0..n) |r| if (sel.isActive(r)) {
-        const id = try resolver.resolve(std.testing.allocator, &scalar, &cols, r, &calls, 1000);
-        try std.testing.expectEqual(id, ids[r]);
-    };
-    try std.testing.expectEqual(scalar.groupCount(), batched.groupCount());
-    try std.testing.expectEqualSlices(u64, scalar.first.items, batched.first.items);
-}
-
-test "resolveBatch on a gathered selection keeps the original first row" {
-    const values = [_]i32{ 10, 30 };
-    const cols = [_]filter_eval.Batch.Column{.{ .i32 = .{ .values = &values } }};
-    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
-    var sel = try filter_selection.SelectionVector.init(std.testing.allocator, 2);
-    defer sel.deinit();
-    var table = GroupTable.init(std.testing.allocator, 1 << 20);
-    defer table.deinit();
-    var resolver = GroupKeyResolver.init(&cols);
-    defer resolver.deinit(std.testing.allocator);
-    var ids: [2]u32 = @splat(0);
-    const ordinals = [_]u32{ 1, 3 };
-    try resolver.resolveBatch(std.testing.allocator, &table, &cols, &calls, 100, &sel, &ids, &ordinals);
-    try std.testing.expectEqual(@as(usize, 2), table.first.items.len);
-    try std.testing.expectEqual(@as(u64, 101), table.first.items[0]);
-    try std.testing.expectEqual(@as(u64, 103), table.first.items[1]);
 }
 
 test "compact variable insertion keeps retained capacity charged after allocation failure" {

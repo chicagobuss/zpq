@@ -16,7 +16,7 @@ const scalar = @import("scalar.zig");
 const PreparedAggInput = scalar.PreparedAggInput;
 const exactAt = scalar.exactAt;
 const foldExtremeF = scalar.foldExtremeF;
-const isRowNull = @import("keys.zig").isRowNull;
+const isRowNull = @import("contracts.zig").isRowNull;
 const splitMix64 = @import("census.zig").splitMix64;
 // Known exception: the facade owns writable thread-local state until the later contract pass.
 const agg_threadlocals = @import("../agg.zig");

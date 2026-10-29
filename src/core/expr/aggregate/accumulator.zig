@@ -10,7 +10,7 @@ const AggCall = types.AggCall;
 const DecSum = types.DecSum;
 const AvgState = types.AvgState;
 const DistinctAcc = @import("distinct.zig").DistinctAcc;
-const KeyArena = @import("keys.zig").KeyArena;
+const KeyArena = @import("contracts.zig").KeyArena;
 const keyEql = @import("../../bytes.zig").keyEql;
 const foldExtremeF = @import("contracts.zig").foldExtremeF;
 

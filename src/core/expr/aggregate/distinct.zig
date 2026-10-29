@@ -6,7 +6,7 @@ const SharedBudget = @import("../../memory.zig").SharedBudget;
 const DecSum = @import("types.zig").DecSum;
 const AggCall = @import("types.zig").AggCall;
 const GroupTable = @import("group_table.zig").GroupTable;
-const isRowNull = @import("keys.zig").isRowNull;
+const isRowNull = @import("contracts.zig").isRowNull;
 const keyEql = @import("../../bytes.zig").keyEql;
 
 pub const NUM_PARTS: usize = 64;

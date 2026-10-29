@@ -96,156 +96,8 @@ pub fn noSqlMatches(table_name: []const u8) void {
 pub fn queryError(err: anyerror, diag: *const Diag) void {
     if (diag.detail == .decode and zpq.core.consumer.isDecodeError(err)) return decodeError(err, diag);
     printDetail(diag);
+    if (querySetupError(err, diag)) return;
     switch (err) {
-        error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
-        error.NoInputs => diagnosticPrint("zpq query: no input files specified\n", .{}),
-        error.Unsigned64OutOfRange => diagnosticPrint(
-            "zpq query: an unsigned 64-bit value of 2^63 or more cannot be used in\n" ++
-                "  integer arithmetic; mix in a float (e.g. `col * 1.0`) to compute in DOUBLE\n",
-            .{},
-        ),
-        error.DuplicateOutputColumn => diagnosticPrint(
-            "zpq query: output column `{s}` is defined more than once;\n" ++
-                "  give each output column (aggregate, GROUP BY key or select item) a distinct name\n",
-            .{diag.column.get()},
-        ),
-        error.AmbiguousOutputColumn => diagnosticPrint(
-            "zpq query: output column `{s}` names both a GROUP BY key\n" ++
-                "  and an aggregate; rename the aggregate alias\n",
-            .{diag.column.get()},
-        ),
-        error.EmptyAggregate => diagnosticPrint("zpq query: empty aggregate expression\n", .{}),
-        error.EmptyColumnList => diagnosticPrint("zpq query: --columns names no column\n", .{}),
-        error.AggregateMutexWithSelect => diagnosticPrint(
-            "zpq query: aggregate functions are mutually exclusive with --select / --columns\n",
-            .{},
-        ),
-        error.MissingOutputOrAggregate => diagnosticPrint("zpq query: missing --output or --aggregate\n", .{}),
-        error.SchemaMismatch => diagnosticPrint("zpq query: schema mismatch across inputs\n", .{}),
-        error.InvalidUtf8 => diagnosticPrint(
-            "zpq query: column `{s}` holds a STRING value that is not valid UTF-8;\n" ++
-                "  the file is invalid (a STRING, ENUM or JSON column must be UTF-8)\n",
-            .{diag.column.get()},
-        ),
-        error.InvalidBinaryValue => diagnosticPrint(
-            "zpq query: column `{s}` holds a UUID or INTERVAL value of the wrong width;\n" ++
-                "  the file is invalid (UUID is 16 bytes, INTERVAL 12)\n",
-            .{diag.column.get()},
-        ),
-        error.NestedRowOutputNotSupported => if (diag.column.len > 0) diagnosticPrint(
-            "zpq query: column `{s}` is repeated\n" ++
-                "  (in a LIST or MAP, or a legacy REPEATED field); row output does not\n" ++
-                "  support repeated columns yet\n",
-            .{diag.column.get()},
-        ) else diagnosticPrint(
-            "zpq query: repeated columns (LIST, MAP or legacy REPEATED) are not\n" ++
-                "  supported in row output yet\n",
-            .{},
-        ),
-        error.NestedFilterNotSupported => diagnosticPrint(
-            "zpq query: filter column `{s}` is repeated\n" ++
-                "  (in a LIST or MAP, or a legacy REPEATED field); filtering on list\n" ++
-                "  elements is not supported\n",
-            .{diag.column.get()},
-        ),
-        error.NestedAggregateNotSupported => diagnosticPrint(
-            "zpq query: aggregate argument column `{s}` is repeated\n" ++
-                "  (in a LIST or MAP, or a legacy REPEATED field); aggregating list\n" ++
-                "  elements is not supported\n",
-            .{diag.column.get()},
-        ),
-        error.NestedGroupKeyNotSupported => diagnosticPrint(
-            "zpq query: GROUP BY key column `{s}` is repeated\n" ++
-                "  (in a LIST or MAP, or a legacy REPEATED field); grouping by list\n" ++
-                "  elements is not supported\n",
-            .{diag.column.get()},
-        ),
-        error.UnlabelledColumn => diagnosticPrint(
-            "zpq query: nested column {s} has no output name of its own:\n" ++
-                "  a top-level column is named like it; name it with --select and AS\n",
-            .{diag.column.get()},
-        ),
-        error.NestedReencodeNotSupported => diagnosticPrint(
-            "zpq query: nested re-encoding is not supported yet\n",
-            .{},
-        ),
-        error.INT96ReencodeNotSupported => diagnosticPrint("zpq query: INT96 re-encoding is not supported yet\n", .{}),
-        error.LevelOutOfRange => diagnosticPrint(
-            "zpq query: a page holds a repetition or definition level past its\n" ++
-                "  column's maximum (corrupt file)\n",
-            .{},
-        ),
-        error.IntOutOfRange => diagnosticPrint(
-            "zpq query: a page holds a value past its column's 8- or 16-bit integer\n" ++
-                "  type (corrupt file)\n",
-            .{},
-        ),
-        error.InputChanged => diagnosticPrint(
-            "zpq query: an input file was truncated or rewritten while the query read it\n",
-            .{},
-        ),
-        error.Int96OutOfRange => diagnosticPrint(
-            "zpq query: an INT96 timestamp outside 1677-2262 cannot be written as\n" ++
-                "  64-bit nanoseconds\n",
-            .{},
-        ),
-        error.UnsupportedDecimalPrecision => diagnosticPrint(
-            "zpq query: column `{s}` has unsupported decimal precision (> 38)\n",
-            .{diag.column.get()},
-        ),
-        error.DecimalValueExceedsPrecision => diagnosticPrint(
-            "zpq query: column `{s}` has a decimal value exceeding its declared precision\n",
-            .{diag.column.get()},
-        ),
-        error.UnsupportedLogicalTypeReencode => diagnosticPrint(
-            "zpq query: cannot preserve the logical annotation while changing its physical type\n",
-            .{},
-        ),
-        error.FooterSchemaChunkMismatch => diagnosticPrint("zpq query: footer schema chunk mismatch\n", .{}),
-        error.CrossBucketNotSupported => diagnosticPrint("zpq query: cross-bucket queries are not supported\n", .{}),
-        error.BadInputUrl => diagnosticPrint("zpq query: invalid input S3 URL\n", .{}),
-        error.BadOutputUrl => diagnosticPrint("zpq query: invalid output S3 URL\n", .{}),
-        error.NoCredentials => diagnosticPrint("zpq query: {s}\n", .{failureMessage(err)}),
-        error.NoRegion => diagnosticPrint("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
-        error.BadResponse => diagnosticPrint("zpq query: bad S3 HTTP response\n", .{}),
-        error.TailTooSmall => diagnosticPrint("zpq query: file footer metadata tail too small\n", .{}),
-        error.EncryptedFile => if (diag.input) |in| diagnosticPrint(
-            "zpq query: input file {s}\n" ++
-                "  is encrypted Parquet; zpq does not decrypt, so it neither reads nor\n" ++
-                "  copies encrypted files\n",
-            .{in},
-        ) else diagnosticPrint(
-            "zpq query: an input file is encrypted Parquet; zpq does not decrypt,\n" ++
-                "  so it neither reads nor copies encrypted files\n",
-            .{},
-        ),
-        error.ExternalColumnChunk => if (diag.input) |in| diagnosticPrint(
-            "zpq query: input file {s}\n" ++
-                "  keeps column data in another file (ColumnChunk.file_path); zpq\n" ++
-                "  reads only self-contained files and never follows such a path\n",
-            .{in},
-        ) else diagnosticPrint(
-            "zpq query: an input file keeps column data in another file\n" ++
-                "  (ColumnChunk.file_path); zpq reads only self-contained files\n",
-            .{},
-        ),
-        error.NotParquet, error.BadMagic => if (diag.input) |in| diagnosticPrint(
-            "zpq query: input file {s} is not a valid Parquet file ({s})\n",
-            .{ in, causeName(diag) },
-        ) else diagnosticPrint("zpq query: input file is not a valid Parquet file\n", .{}),
-        error.AggSumOverflow => diagnosticPrint("zpq query: aggregate sum overflowed integer limits\n", .{}),
-        error.OpenFailed => if (diag.input) |in|
-            diagnosticPrint("zpq query: failed to open input file {s} ({s})\n", .{ in, causeName(diag) })
-        else
-            diagnosticPrint("zpq query: failed to open input file\n", .{}),
-        error.EmptyFile => if (diag.input) |in|
-            diagnosticPrint("zpq query: input file {s} is empty\n", .{in})
-        else
-            diagnosticPrint("zpq query: input file is empty\n", .{}),
-        error.PathTooLong => if (diag.input) |in|
-            diagnosticPrint("zpq query: input file path {s} too long\n", .{in})
-        else
-            diagnosticPrint("zpq query: input file path too long\n", .{}),
         error.EmptyExpr => diagnosticPrint("zpq query: empty expression\n", .{}),
         error.UnexpectedChar => diagnosticPrint("zpq query: unexpected character in expression\n", .{}),
         error.ModuloNotSupported => diagnosticPrint("zpq query: operator % is not supported\n", .{}),
@@ -405,6 +257,162 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
 }
 
 /// A column chunk that failed to decode, by where (`Diag.detail.decode`) and why, the error's name last for a script.
+fn querySetupError(err: anyerror, diag: *const Diag) bool {
+    switch (err) {
+        error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
+        error.NoInputs => diagnosticPrint("zpq query: no input files specified\n", .{}),
+        error.Unsigned64OutOfRange => diagnosticPrint(
+            "zpq query: an unsigned 64-bit value of 2^63 or more cannot be used in\n" ++
+                "  integer arithmetic; mix in a float (e.g. `col * 1.0`) to compute in DOUBLE\n",
+            .{},
+        ),
+        error.DuplicateOutputColumn => diagnosticPrint(
+            "zpq query: output column `{s}` is defined more than once;\n" ++
+                "  give each output column (aggregate, GROUP BY key or select item) a distinct name\n",
+            .{diag.column.get()},
+        ),
+        error.AmbiguousOutputColumn => diagnosticPrint(
+            "zpq query: output column `{s}` names both a GROUP BY key\n" ++
+                "  and an aggregate; rename the aggregate alias\n",
+            .{diag.column.get()},
+        ),
+        error.EmptyAggregate => diagnosticPrint("zpq query: empty aggregate expression\n", .{}),
+        error.EmptyColumnList => diagnosticPrint("zpq query: --columns names no column\n", .{}),
+        error.AggregateMutexWithSelect => diagnosticPrint(
+            "zpq query: aggregate functions are mutually exclusive with --select / --columns\n",
+            .{},
+        ),
+        error.MissingOutputOrAggregate => diagnosticPrint("zpq query: missing --output or --aggregate\n", .{}),
+        error.SchemaMismatch => diagnosticPrint("zpq query: schema mismatch across inputs\n", .{}),
+        error.InvalidUtf8 => diagnosticPrint(
+            "zpq query: column `{s}` holds a STRING value that is not valid UTF-8;\n" ++
+                "  the file is invalid (a STRING, ENUM or JSON column must be UTF-8)\n",
+            .{diag.column.get()},
+        ),
+        error.InvalidBinaryValue => diagnosticPrint(
+            "zpq query: column `{s}` holds a UUID or INTERVAL value of the wrong width;\n" ++
+                "  the file is invalid (UUID is 16 bytes, INTERVAL 12)\n",
+            .{diag.column.get()},
+        ),
+        error.NestedRowOutputNotSupported => if (diag.column.len > 0) diagnosticPrint(
+            "zpq query: column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); row output does not\n" ++
+                "  support repeated columns yet\n",
+            .{diag.column.get()},
+        ) else diagnosticPrint(
+            "zpq query: repeated columns (LIST, MAP or legacy REPEATED) are not\n" ++
+                "  supported in row output yet\n",
+            .{},
+        ),
+        error.NestedFilterNotSupported => diagnosticPrint(
+            "zpq query: filter column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); filtering on list\n" ++
+                "  elements is not supported\n",
+            .{diag.column.get()},
+        ),
+        error.NestedAggregateNotSupported => diagnosticPrint(
+            "zpq query: aggregate argument column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); aggregating list\n" ++
+                "  elements is not supported\n",
+            .{diag.column.get()},
+        ),
+        error.NestedGroupKeyNotSupported => diagnosticPrint(
+            "zpq query: GROUP BY key column `{s}` is repeated\n" ++
+                "  (in a LIST or MAP, or a legacy REPEATED field); grouping by list\n" ++
+                "  elements is not supported\n",
+            .{diag.column.get()},
+        ),
+        error.UnlabelledColumn => diagnosticPrint(
+            "zpq query: nested column {s} has no output name of its own:\n" ++
+                "  a top-level column is named like it; name it with --select and AS\n",
+            .{diag.column.get()},
+        ),
+        error.NestedReencodeNotSupported => diagnosticPrint(
+            "zpq query: nested re-encoding is not supported yet\n",
+            .{},
+        ),
+        error.INT96ReencodeNotSupported => diagnosticPrint("zpq query: INT96 re-encoding is not supported yet\n", .{}),
+        error.LevelOutOfRange => diagnosticPrint(
+            "zpq query: a page holds a repetition or definition level past its\n" ++
+                "  column's maximum (corrupt file)\n",
+            .{},
+        ),
+        error.IntOutOfRange => diagnosticPrint(
+            "zpq query: a page holds a value past its column's 8- or 16-bit integer\n" ++
+                "  type (corrupt file)\n",
+            .{},
+        ),
+        error.InputChanged => diagnosticPrint(
+            "zpq query: an input file was truncated or rewritten while the query read it\n",
+            .{},
+        ),
+        error.Int96OutOfRange => diagnosticPrint(
+            "zpq query: an INT96 timestamp outside 1677-2262 cannot be written as\n" ++
+                "  64-bit nanoseconds\n",
+            .{},
+        ),
+        error.UnsupportedDecimalPrecision => diagnosticPrint(
+            "zpq query: column `{s}` has unsupported decimal precision (> 38)\n",
+            .{diag.column.get()},
+        ),
+        error.DecimalValueExceedsPrecision => diagnosticPrint(
+            "zpq query: column `{s}` has a decimal value exceeding its declared precision\n",
+            .{diag.column.get()},
+        ),
+        error.UnsupportedLogicalTypeReencode => diagnosticPrint(
+            "zpq query: cannot preserve the logical annotation while changing its physical type\n",
+            .{},
+        ),
+        error.FooterSchemaChunkMismatch => diagnosticPrint("zpq query: footer schema chunk mismatch\n", .{}),
+        error.CrossBucketNotSupported => diagnosticPrint("zpq query: cross-bucket queries are not supported\n", .{}),
+        error.BadInputUrl => diagnosticPrint("zpq query: invalid input S3 URL\n", .{}),
+        error.BadOutputUrl => diagnosticPrint("zpq query: invalid output S3 URL\n", .{}),
+        error.NoCredentials => diagnosticPrint("zpq query: {s}\n", .{failureMessage(err)}),
+        error.NoRegion => diagnosticPrint("zpq query: no S3 region; set AWS_REGION (or S3_REGION)\n", .{}),
+        error.BadResponse => diagnosticPrint("zpq query: bad S3 HTTP response\n", .{}),
+        error.TailTooSmall => diagnosticPrint("zpq query: file footer metadata tail too small\n", .{}),
+        error.EncryptedFile => if (diag.input) |in| diagnosticPrint(
+            "zpq query: input file {s}\n" ++
+                "  is encrypted Parquet; zpq does not decrypt, so it neither reads nor\n" ++
+                "  copies encrypted files\n",
+            .{in},
+        ) else diagnosticPrint(
+            "zpq query: an input file is encrypted Parquet; zpq does not decrypt,\n" ++
+                "  so it neither reads nor copies encrypted files\n",
+            .{},
+        ),
+        error.ExternalColumnChunk => if (diag.input) |in| diagnosticPrint(
+            "zpq query: input file {s}\n" ++
+                "  keeps column data in another file (ColumnChunk.file_path); zpq\n" ++
+                "  reads only self-contained files and never follows such a path\n",
+            .{in},
+        ) else diagnosticPrint(
+            "zpq query: an input file keeps column data in another file\n" ++
+                "  (ColumnChunk.file_path); zpq reads only self-contained files\n",
+            .{},
+        ),
+        error.NotParquet, error.BadMagic => if (diag.input) |in| diagnosticPrint(
+            "zpq query: input file {s} is not a valid Parquet file ({s})\n",
+            .{ in, causeName(diag) },
+        ) else diagnosticPrint("zpq query: input file is not a valid Parquet file\n", .{}),
+        error.AggSumOverflow => diagnosticPrint("zpq query: aggregate sum overflowed integer limits\n", .{}),
+        error.OpenFailed => if (diag.input) |in|
+            diagnosticPrint("zpq query: failed to open input file {s} ({s})\n", .{ in, causeName(diag) })
+        else
+            diagnosticPrint("zpq query: failed to open input file\n", .{}),
+        error.EmptyFile => if (diag.input) |in|
+            diagnosticPrint("zpq query: input file {s} is empty\n", .{in})
+        else
+            diagnosticPrint("zpq query: input file is empty\n", .{}),
+        error.PathTooLong => if (diag.input) |in|
+            diagnosticPrint("zpq query: input file path {s} too long\n", .{in})
+        else
+            diagnosticPrint("zpq query: input file path too long\n", .{}),
+        else => return false,
+    }
+    return true;
+}
+
 fn decodeError(err: anyerror, diag: *const Diag) void {
     const at = diag.detail.decode;
     var page_buf: [24]u8 = undefined;

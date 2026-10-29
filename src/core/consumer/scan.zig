@@ -174,7 +174,6 @@ fn gatherUnder(
     };
 }
 
-
 /// A window of `sel`, rows `[lo, lo + n)`, as its own selection. Bits past `n` stay clear.
 fn selWindow(
     a: std.mem.Allocator,
@@ -554,7 +553,6 @@ fn floatTreeSafe(e: expr_ast.Expr) bool {
         .call, .case_ => false,
     };
 }
-
 
 fn cacheFilterNodes(f: filter_ast.Filter) usize {
     return switch (f) {
@@ -1005,131 +1003,28 @@ fn scanRGForAggImpl(
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ batch_rows, selected }));
 
     switch (target) {
-        .grouped => |g| {
-            if (g.records) |records| {
-                // Partial selections gather into ascending `input_rows`. A full window stays `row_base + i`.
-                try emitRecords(ra, records, &batch, &sel, in.row_base, 0, lookup);
-                const end = nowMonoNs();
-                ws.timings.encode_ns += @intCast(end - t_eval_end);
-                profile.record(prof, .aggregate, t_eval_end, end, profile.args(.{ selected, calls.len }));
-                return selected;
-            }
-            if (g.part != null and !staged) {
-                try foldGroupedWindows(
-                    ra,
-                    gpa,
-                    target,
-                    batch_cols.items,
-                    lookup,
-                    &sel,
-                    in.consumed,
-                    decode_options.encoded,
-                    ws.expr_batch_rows,
-                    ws.budget,
-                    ws.region,
-                );
-                const t_agg_end = nowMonoNs();
-                ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
-                profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
-                return selected;
-            }
-            const dense = if (g.dense) |d| !staged and decode_options.encoded and
-                try d.foldKeys(
-                    ra,
-                    gpa,
-                    g.keys,
-                    in.file_index,
-                    in.rg_index,
-                    g.pos_base,
-                    &batch,
-                    lookup,
-                    &sel,
-                ) else false;
-            if (dense or (!staged and decode_options.encoded and
-                try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, &sel, ws.budget, ws.region)))
-            {
-                const t_agg_end = nowMonoNs();
-                ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
-                profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
-                return selected;
-            }
-            // The row path reads values: gather any column decoded as codes only, but not one only the outer filter
-            // read, which it has evaluated already.
-            for (lookup, 0..) |at, ci| if (at) |pos| if (ci < in.consumed.len and in.consumed[ci]) {
-                batch_cols.items[pos] = try agg_coded.materialize(ra, batch_cols.items[pos]);
-            };
-            var key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
-            for (g.keys, 0..) |key_expr, idx| {
-                key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch.restrictedTo(&sel), lookup, key_expr);
-            }
-
-            const group_id_arr = try ra.alloc(u32, batch_rows);
-            @memset(group_id_arr, 0);
-
-            // Never cached across row groups: the resolver's memo holds pointers into `ra`.
-            var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
-            defer key_resolver.deinit(ra);
-
-            const sparse = g.table.sketch == null and stage_plan == null and sel.count() != sel.len and
-                sel.len <= std.math.maxInt(u32);
-            if (sparse) if (try gatherUnder(ra, batch.cols, key_cols, &sel, sel.count())) |gathered| {
-                try key_resolver.resolveBatch(
-                    ra,
-                    g.table,
-                    gathered.key_cols,
-                    g.calls,
-                    g.pos_base,
-                    &gathered.sel,
-                    group_id_arr,
-                    gathered.ordinals,
-                );
-                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                    try expr_agg.updateTableGrouped(
-                        ra,
-                        gpa,
-                        g.table,
-                        group_id_arr,
-                        i,
-                        g.calls,
-                        &gathered.batch,
-                        lookup,
-                        &gathered.sel,
-                    );
-                };
-            } else {
-                try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, &sel, group_id_arr, null);
-                try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
-                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                    try expr_agg.updateTableGrouped(ra, gpa, g.table, group_id_arr, i, g.calls, &batch, lookup, &sel);
-                };
-            } else {
-                try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, &sel, group_id_arr, null);
-                try expr_agg.sinkSketchRows(g.table, group_id_arr, &sel);
-                // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
-                if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-                    var call_arena = std.heap.ArenaAllocator.init(side);
-                    defer call_arena.deinit();
-                    const ca = if (staged) call_arena.allocator() else ra;
-                    const cb = if (stage_plan) |sp|
-                        try dec.withCallColumns(ca, sp, i, &batch, lookup, &sel_pre, true)
-                    else
-                        CallBatch{ .batch = batch, .lookup = lookup };
-                    try expr_agg.updateTableGrouped(
-                        ca,
-                        gpa,
-                        g.table,
-                        group_id_arr,
-                        i,
-                        g.calls,
-                        &cb.batch,
-                        cb.lookup,
-                        &sel,
-                    );
-                };
-            }
-            // The windowed path returned above. A staged row group folded whole still has to enter the partitions
-            // before the next row group, or one worker's local table keeps every key it has seen.
-            if (g.part) |p| if (g.local) |local| try p.pump(local, g.table, @intCast(sel.count()));
+        .grouped => {
+            if (try foldWholeGrouped(.{
+                .ra = ra,
+                .gpa = gpa,
+                .side = side,
+                .in = in,
+                .target = target,
+                .ws = ws,
+                .decode_options = decode_options,
+                .staged = staged,
+                .stage_plan = stage_plan,
+                .dec = &dec,
+                .batch_cols = &batch_cols,
+                .batch = &batch,
+                .lookup = lookup,
+                .sel = &sel,
+                .sel_pre = &sel_pre,
+                .batch_rows = batch_rows,
+                .selected = selected,
+                .t_eval_end = t_eval_end,
+                .prof = prof,
+            })) return selected;
         },
         .scalar => |s| scalar: {
             // Update only the aggs that weren't handled via stats. The agg's
@@ -1162,6 +1057,177 @@ fn scanRGForAggImpl(
     ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
     profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
     return selected;
+}
+
+const WholeGrouped = struct {
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    side: std.mem.Allocator,
+    in: AggRowGroup,
+    target: AggTarget,
+    ws: AggWorkspace,
+    decode_options: DecodeOptions,
+    staged: bool,
+    stage_plan: ?StagePlan,
+    dec: *ChunkDecoder,
+    batch_cols: *std.ArrayList(filter_eval.Batch.Column),
+    batch: *const filter_eval.Batch,
+    lookup: []?usize,
+    sel: *filter_selection.SelectionVector,
+    sel_pre: *const filter_selection.SelectionVector,
+    batch_rows: usize,
+    selected: usize,
+    t_eval_end: i64,
+    prof: ?*profile.Thread,
+};
+
+fn foldWholeGrouped(c: WholeGrouped) !bool {
+    const ra = c.ra;
+    const gpa = c.gpa;
+    const side = c.side;
+    const in = c.in;
+    const target = c.target;
+    const ws = c.ws;
+    const decode_options = c.decode_options;
+    const staged = c.staged;
+    const stage_plan = c.stage_plan;
+    const dec = c.dec;
+    const batch_cols = c.batch_cols;
+    const batch = c.batch.*;
+    const lookup = c.lookup;
+    const sel = c.sel;
+    const sel_pre = c.sel_pre;
+    const batch_rows = c.batch_rows;
+    const selected = c.selected;
+    const t_eval_end = c.t_eval_end;
+    const prof = c.prof;
+    const calls = target.planCalls();
+    const g = target.grouped;
+    if (g.records) |records| {
+        // Partial selections gather into ascending `input_rows`. A full window stays `row_base + i`.
+        try emitRecords(ra, records, &batch, sel, in.row_base, 0, lookup);
+        const end = nowMonoNs();
+        ws.timings.encode_ns += @intCast(end - t_eval_end);
+        profile.record(prof, .aggregate, t_eval_end, end, profile.args(.{ selected, calls.len }));
+        return true;
+    }
+    if (g.part != null and !staged) {
+        try foldGroupedWindows(
+            ra,
+            gpa,
+            target,
+            batch_cols.items,
+            lookup,
+            sel,
+            in.consumed,
+            decode_options.encoded,
+            ws.expr_batch_rows,
+            ws.budget,
+            ws.region,
+        );
+        const t_agg_end = nowMonoNs();
+        ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
+        profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+        return true;
+    }
+    const dense = if (g.dense) |d| !staged and decode_options.encoded and
+        try d.foldKeys(
+            ra,
+            gpa,
+            g.keys,
+            in.file_index,
+            in.rg_index,
+            g.pos_base,
+            &batch,
+            lookup,
+            sel,
+        ) else false;
+    if (dense or (!staged and decode_options.encoded and
+        try agg_coded.groupedCoded(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, sel, ws.budget, ws.region)))
+    {
+        const t_agg_end = nowMonoNs();
+        ws.timings.encode_ns += @intCast(t_agg_end - t_eval_end);
+        profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
+        return true;
+    }
+    // The row path reads values: gather any column decoded as codes only, but not one only the outer filter
+    // read, which it has evaluated already.
+    for (lookup, 0..) |at, ci| if (at) |pos| if (ci < in.consumed.len and in.consumed[ci]) {
+        batch_cols.items[pos] = try agg_coded.materialize(ra, batch_cols.items[pos]);
+    };
+    var key_cols = try ra.alloc(filter_eval.Batch.Column, g.keys.len);
+    for (g.keys, 0..) |key_expr, idx| {
+        key_cols[idx] = try expr_eval.evalGroupKeyExpr(ra, &batch.restrictedTo(sel), lookup, key_expr);
+    }
+
+    const group_id_arr = try ra.alloc(u32, batch_rows);
+    @memset(group_id_arr, 0);
+
+    // Never cached across row groups: the resolver's memo holds pointers into `ra`.
+    var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
+    defer key_resolver.deinit(ra);
+
+    const sparse = g.table.sketch == null and stage_plan == null and sel.count() != sel.len and
+        sel.len <= std.math.maxInt(u32);
+    if (sparse) if (try gatherUnder(ra, batch.cols, key_cols, sel, sel.count())) |gathered| {
+        try key_resolver.resolveBatch(
+            ra,
+            g.table,
+            gathered.key_cols,
+            g.calls,
+            g.pos_base,
+            &gathered.sel,
+            group_id_arr,
+            gathered.ordinals,
+        );
+        if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+            try expr_agg.updateTableGrouped(
+                ra,
+                gpa,
+                g.table,
+                group_id_arr,
+                i,
+                g.calls,
+                &gathered.batch,
+                lookup,
+                &gathered.sel,
+            );
+        };
+    } else {
+        try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, sel, group_id_arr, null);
+        try expr_agg.sinkSketchRows(g.table, group_id_arr, sel);
+        if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+            try expr_agg.updateTableGrouped(ra, gpa, g.table, group_id_arr, i, g.calls, &batch, lookup, sel);
+        };
+    } else {
+        try key_resolver.resolveBatch(ra, g.table, key_cols, g.calls, g.pos_base, sel, group_id_arr, null);
+        try expr_agg.sinkSketchRows(g.table, group_id_arr, sel);
+        // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
+        if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
+            var call_arena = std.heap.ArenaAllocator.init(side);
+            defer call_arena.deinit();
+            const ca = if (staged) call_arena.allocator() else ra;
+            const cb = if (stage_plan) |sp|
+                try dec.withCallColumns(ca, sp, i, &batch, lookup, sel_pre, true)
+            else
+                CallBatch{ .batch = batch, .lookup = lookup };
+            try expr_agg.updateTableGrouped(
+                ca,
+                gpa,
+                g.table,
+                group_id_arr,
+                i,
+                g.calls,
+                &cb.batch,
+                cb.lookup,
+                sel,
+            );
+        };
+    }
+    // The windowed path returned above. A staged row group folded whole still has to enter the partitions
+    // before the next row group, or one worker's local table keeps every key it has seen.
+    if (g.part) |p| if (g.local) |local| try p.pump(local, g.table, @intCast(sel.count()));
+    return false;
 }
 
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.
@@ -1842,7 +1908,6 @@ fn foldFromStats(
     return any_decode_required;
 }
 
-
 test "a partial record batch gathers ascending original rows" {
     const testing = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1881,7 +1946,6 @@ test "a partial record batch gathers ascending original rows" {
     try testing.expectEqual(@as(i32, 2), cap.vals[0]);
     try testing.expectEqual(@as(i32, 4), cap.vals[1]);
 }
-
 
 fn checkPartitionWindowScratch(a: std.mem.Allocator, n: usize, coded: bool) !void {
     const strings = try a.alloc([]const u8, n);
@@ -1984,7 +2048,6 @@ test "partition window scratch returns every charge on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPartitionWindowScratch, .{ 32, false });
 }
 
-
 test "scalar cache DAG shares nullable inputs without changing canonical sum blocks, including allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testScalarCache, .{});
 }
@@ -2081,4 +2144,3 @@ fn testScalarCache(backing: std.mem.Allocator) !void {
         };
     }
 }
-

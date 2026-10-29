@@ -311,6 +311,14 @@ pub fn winnerBytes(len: usize) usize {
     return std.mem.alignForward(usize, len, 16) +| 16;
 }
 
+pub fn considerWinner(persist: std.mem.Allocator, is_min: bool, slot: *?[]const u8, cand: []const u8) Error!void {
+    if (slot.*) |cur| {
+        const order = std.mem.order(u8, cand, cur);
+        if (if (is_min) order != .lt else order != .gt) return;
+    }
+    try persistWinner(persist, slot, cand);
+}
+
 pub fn persistWinner(persist: std.mem.Allocator, slot: *?[]const u8, cand: []const u8) Error!void {
     const charge = agg_threadlocals.winner_charge;
     if (charge) |c| try c.adjust(0, winnerBytes(cand.len));

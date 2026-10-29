@@ -4,7 +4,7 @@ const expr_eval = @import("../eval.zig");
 const agg_coded = @import("../agg_coded.zig");
 const SharedBudget = @import("../../memory.zig").SharedBudget;
 const DistinctSet = @import("distinct.zig").DistinctSet;
-const persistWinner = @import("accumulator.zig").persistWinner;
+const considerWinner = @import("accumulator.zig").considerWinner;
 const filter_eval = @import("../../filter/eval.zig");
 const types = @import("types.zig");
 const OutputCol = types.OutputCol;
@@ -1094,12 +1094,7 @@ pub fn foldMinMaxBytes(
         .min_bytes, .max_bytes => |*s| s,
         else => unreachable,
     };
-    if (slot.*) |cur| {
-        const ord = std.mem.order(u8, cand, cur);
-        const better = (is_min and ord == .lt) or (!is_min and ord == .gt);
-        if (!better) return;
-    }
-    try persistWinner(persist, slot, cand);
+    try considerWinner(persist, is_min, slot, cand);
 }
 
 /// The first 16 bytes of `s` as a big-endian integer, zero-padded: a strictly lesser prefix means a strictly lesser

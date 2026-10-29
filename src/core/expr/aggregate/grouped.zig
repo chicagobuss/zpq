@@ -9,7 +9,7 @@ const types = @import("types.zig");
 const AggCall = types.AggCall;
 const Error = types.Error;
 const Accumulator = @import("accumulator.zig").Accumulator;
-const persistWinner = @import("accumulator.zig").persistWinner;
+const considerWinner = @import("accumulator.zig").considerWinner;
 const GroupTable = @import("group_table.zig").GroupTable;
 const DistinctSet = @import("distinct.zig").DistinctSet;
 const scalar = @import("scalar.zig");
@@ -550,15 +550,7 @@ pub fn foldMinMaxBytesGroupedOne(
         else => {},
     }
     const m_ptr = if (is_min) &state.min_bytes else &state.max_bytes;
-    if (m_ptr.* == null) {
-        try persistWinner(persist, m_ptr, sv);
-    } else {
-        const ord = std.mem.order(u8, sv, m_ptr.*.?);
-        const condition = if (is_min) (ord == .lt) else (ord == .gt);
-        if (condition) {
-            try persistWinner(persist, m_ptr, sv);
-        }
-    }
+    try considerWinner(persist, is_min, m_ptr, sv);
 }
 
 fn foldAvgGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) !void {

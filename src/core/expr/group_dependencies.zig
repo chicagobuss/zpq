@@ -64,7 +64,12 @@ fn range(expr: ast.Expr, keys: []const ast.Expr) ?Range {
 
 /// Evaluate only after `dependency` proved the tree. The resolver reads retained integer key values, never rows.
 /// Arithmetic has the established NULL propagation and checked error kinds even in release builds.
-pub fn evaluate(expr: ast.Expr, reader: anytype) anyerror!?i64 {
+pub fn evaluate(expr: ast.Expr, reader: anytype) (error{
+    BadGroupKey,
+    IntegerOverflowAdd,
+    IntegerOverflowSub,
+    IntegerOverflowMul,
+} || @typeInfo(@TypeOf(reader.column(0))).error_union.error_set)!?i64 {
     return switch (expr) {
         .literal => expr.literal.i64,
         .col_ref => |c| reader.column(c.col_idx),

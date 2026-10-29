@@ -743,6 +743,95 @@ fn foldScalarCache(
     return true;
 }
 
+/// How a row group decodes: whole, staged one aggregate's columns at a time, or in slices of rows.
+const DecodePlan = struct {
+    /// Set when the sliced decode already aggregated the row group: the rows it kept.
+    kept: ?u64 = null,
+    stage_plan: ?StagePlan = null,
+    staged: bool = false,
+    /// What the row group holds on the worker's decode budget while it decodes.
+    reserved: usize = 0,
+    /// The whole-decode estimate, which a restart over slices charges when a column outgrows its footer's.
+    full_estimate: usize = 0,
+};
+
+fn planDecode(
+    gpa: std.mem.Allocator,
+    plan_alloc: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+    handled_via_stats: []const bool,
+) !DecodePlan {
+    const calls = target.planCalls();
+    const num_rows: usize = @intCast(in.rg.num_rows);
+    if (in.subgroup) |subgroup| {
+        var fallback: DecodeBudget = .{ .limit = decode_options.expand_limit };
+        const b = ws.budget orelse &fallback;
+        const per_row = @max(1, decodeEstimate(in, in.read, calls, true) / @max(1, num_rows));
+        const rows = subgroup.rows.hi - subgroup.rows.lo;
+        dropRegion(ws);
+        const kept = try scanRGSliced(
+            gpa,
+            in,
+            decode_options,
+            target,
+            ws,
+            b,
+            handled_via_stats,
+            per_row *| rows,
+            streamWindowRows(in, target, rows),
+        );
+        return .{ .kept = kept orelse return error.NestedNotSupported };
+    }
+    const b = ws.budget orelse return .{};
+    const ordinary = decodeEstimate(in, in.read, calls, target == .grouped);
+    const full = if (target == .grouped and target.grouped.records != null)
+        target.grouped.records.?.decodeReservation(ordinary)
+    else
+        ordinary;
+    if (target == .grouped and target.grouped.table.countOnly()) {
+        const keys_only = decodeEstimate(in, in.read, &.{}, true);
+        std.debug.assert(full == keys_only);
+    }
+    var plan: DecodePlan = .{ .reserved = full, .full_estimate = full };
+    // Too big for this worker's share, or for what the query's ledger has left: a slice of rows at a time when
+    // every column has a sliced form, else one aggregate's columns at a time.
+    const fits_share = full <= b.share();
+    const discovering = target == .grouped and target.grouped.table.discovery != null;
+    const force_cache = ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target));
+    // A filter-only or hash-only string is hashed or compared per page. Decoding the chunk whole faults the
+    // decompressed bytes into the row-group region and holds them until the scan releases every region.
+    const stream_rows = streamWindowRows(in, target, num_rows);
+    const stream = stream_rows != std.math.maxInt(usize);
+    const whole = !stream and !force_cache and fits_share and admitWhole(ws, full);
+    if (whole) return plan;
+    if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
+    if (try scanRGSliced(
+        gpa,
+        in,
+        decode_options,
+        target,
+        ws,
+        b,
+        handled_via_stats,
+        full,
+        stream_rows,
+    )) |kept| {
+        plan.kept = kept;
+        return plan;
+    }
+    if (target == .grouped and target.grouped.records != null) return error.ExceededMemoryBudget;
+    const sp = try StagePlan.init(plan_alloc, in, target, handled_via_stats);
+    if (sp.estimate < full) {
+        plan.staged = true;
+        plan.reserved = sp.estimate;
+        plan.stage_plan = sp;
+    }
+    return plan;
+}
+
 fn scanRGForAggImpl(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -780,69 +869,17 @@ fn scanRGForAggImpl(
     if (ws.region) |r| r.settle();
     const prof = ws.timings.prof;
 
-    var staged = false;
-    var reserved: usize = 0;
     // Staged and sliced decodes live beside the region, on memory drawn from the query's ledger as the region's is.
     const side = ws.charged orelse gpa;
     var plan_arena = std.heap.ArenaAllocator.init(side);
     defer plan_arena.deinit();
-    var full_estimate: usize = 0;
-    if (in.subgroup) |subgroup| {
-        var fallback: DecodeBudget = .{ .limit = decode_options.expand_limit };
-        const b = ws.budget orelse &fallback;
-        const per_row = @max(1, decodeEstimate(in, in.read, calls, true) / @max(1, num_rows));
-        const rows = subgroup.rows.hi - subgroup.rows.lo;
-        dropRegion(ws);
-        return (try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, per_row *| rows, streamWindowRows(in, target, rows))) orelse error.NestedNotSupported;
-    }
-    const stage_plan: ?StagePlan = if (ws.budget) |b| plan: {
-        const ordinary = decodeEstimate(in, in.read, calls, target == .grouped);
-        const full = if (target == .grouped and target.grouped.records != null)
-            target.grouped.records.?.decodeReservation(ordinary)
-        else
-            ordinary;
-        full_estimate = full;
-        if (target == .grouped and target.grouped.table.countOnly()) {
-            const keys_only = decodeEstimate(in, in.read, &.{}, true);
-            std.debug.assert(full == keys_only);
-        }
-        reserved = full;
-        // Too big for this worker's share, or for what the query's ledger has left: a slice of rows at a time when
-        // every column has a sliced form, else one aggregate's columns at a time.
-        const fits_share = full <= b.share();
-        const discovering = target == .grouped and target.grouped.table.discovery != null;
-        const force_cache = ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target));
-        // A filter-only or hash-only string is hashed or compared per page. Decoding the chunk whole faults the
-        // decompressed bytes into the row-group region and holds them until the scan releases every region.
-        const stream_rows = streamWindowRows(in, target, num_rows);
-        const stream = stream_rows != std.math.maxInt(usize);
-        const whole = !stream and !force_cache and fits_share and admitWhole(ws, full);
-        if (!whole) if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
-        if (!whole) if (try scanRGSliced(
-            gpa,
-            in,
-            decode_options,
-            target,
-            ws,
-            b,
-            handled_via_stats,
-            full,
-            stream_rows,
-        )) |kept|
-            return kept;
-        if (!whole) {
-            if (target == .grouped and target.grouped.records != null) return error.ExceededMemoryBudget;
-            const sp = try StagePlan.init(plan_arena.allocator(), in, target, handled_via_stats);
-            if (sp.estimate < full) {
-                staged = true;
-                reserved = sp.estimate;
-                break :plan sp;
-            }
-        }
-        break :plan null;
-    } else null;
-    if (ws.budget) |b| try b.acquire(reserved);
-    var held = reserved;
+    const plan = try planDecode(gpa, plan_arena.allocator(), in, decode_options, target, ws, handled_via_stats);
+    if (plan.kept) |kept| return kept;
+    const staged = plan.staged;
+    const stage_plan = plan.stage_plan;
+    const full_estimate = plan.full_estimate;
+    if (ws.budget) |b| try b.acquire(plan.reserved);
+    var held = plan.reserved;
     defer if (ws.budget) |b| b.release(held);
     // Staged, everything decoded lives on memory of its own, given back with the row group; otherwise on the
     // worker's arena.

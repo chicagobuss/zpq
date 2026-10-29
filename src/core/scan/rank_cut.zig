@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const top_n = @import("top_n.zig");
 const expr_agg = @import("../expr/agg.zig");
 const expr_ast = @import("../expr/ast.zig");
 const BoundOutputColumn = @import("types.zig").BoundOutputColumn;
@@ -92,15 +93,16 @@ fn decimalRank(v: ?i128, call: expr_agg.AggCall) SortKey {
 const RankItem = struct { value: SortKey, first: u64, g: u32 };
 fn worseRank(descending: bool, a: RankItem, b: RankItem) std.math.Order {
     const ord = orderSortKeys(a.value, b.value, descending);
-    return if (ord != .eq) ord.invert() else std.math.order(b.first, a.first);
+    return top_n.worstFirst(ord, std.math.order(a.first, b.first));
 }
 pub const RankHeap = std.PriorityQueue(RankItem, bool, worseRank);
 
 pub fn pushRank(heap: *RankHeap, allocator: std.mem.Allocator, k: usize, item: RankItem) void {
-    if (k == 0) return;
-    if (heap.count() == k) {
-        if (worseRank(heap.context, item, heap.peek().?) != .gt) return;
-        _ = heap.pop();
+    const compared = if (k != 0 and heap.count() == k) worseRank(heap.context, item, heap.peek().?) else .eq;
+    switch (top_n.admission(k, heap.count(), compared)) {
+        .skip => return,
+        .append => {},
+        .replace => _ = heap.pop(),
     }
     heap.push(allocator, item) catch unreachable; // capacity reserved before ranking
 }
@@ -325,4 +327,3 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
     try testing.expectEqual(@as(i128, -3), rounded.dec.v);
     try testing.expectEqual(@as(u8, 4), rounded.dec.spec.scale);
 }
-

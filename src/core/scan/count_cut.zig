@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const top_n = @import("top_n.zig");
 const expr_agg = @import("../expr/agg.zig");
 const expr_ast = @import("../expr/ast.zig");
 const BoundOutputColumn = @import("types.zig").BoundOutputColumn;
@@ -60,8 +61,7 @@ pub fn keepCountTop(
     const Item = struct { c: u64, first: u64, s: u32 };
     const worse = struct {
         fn cmp(_: void, a: Item, b: Item) std.math.Order {
-            if (a.c != b.c) return std.math.order(a.c, b.c);
-            return std.math.order(b.first, a.first);
+            return top_n.worstFirst(std.math.order(b.c, a.c), std.math.order(a.first, b.first));
         }
     }.cmp;
     var heap: std.PriorityQueue(Item, void, worse) = .empty;
@@ -71,10 +71,11 @@ pub fn keepCountTop(
     defer lists.free(kept_accs);
     for (slots.items, 0..) |slot, si| {
         const item: Item = .{ .c = accCount(accs.items[slot.idx + cut.a_idx]), .first = slot.first, .s = @intCast(si) };
-        if (heap.count() == cut.k) {
-            const w = heap.peek().?;
-            if (!(item.c > w.c or (item.c == w.c and item.first < w.first))) continue;
-            _ = heap.pop();
+        const compared = if (heap.count() == cut.k) worse({}, item, heap.peek().?) else .eq;
+        switch (top_n.admission(cut.k, heap.count(), compared)) {
+            .skip => continue,
+            .append => {},
+            .replace => _ = heap.pop(),
         }
         heap.push(lists, item) catch unreachable; // within the capacity reserved above
     }
@@ -119,8 +120,7 @@ pub fn countLimitGroups(
     // front of the queue so a better group can replace it.
     const worse = struct {
         fn cmp(_: void, a: Item, b: Item) std.math.Order {
-            if (a.c != b.c) return std.math.order(a.c, b.c);
-            return std.math.order(b.first, a.first);
+            return top_n.worstFirst(std.math.order(b.c, a.c), std.math.order(a.first, b.first));
         }
     }.cmp;
     var heap: std.PriorityQueue(Item, void, worse) = .empty;
@@ -132,12 +132,11 @@ pub fn countLimitGroups(
             .first = table.first.items[g],
             .g = @intCast(g),
         };
-        if (heap.count() == k) {
-            const worst = heap.peek().?;
-            const better = item.c > worst.c or
-                (item.c == worst.c and item.first < worst.first);
-            if (!better) continue;
-            _ = heap.pop();
+        const compared = if (heap.count() == k) worse({}, item, heap.peek().?) else .eq;
+        switch (top_n.admission(k, heap.count(), compared)) {
+            .skip => continue,
+            .append => {},
+            .replace => _ = heap.pop(),
         }
         heap.push(arena, item) catch unreachable; // within the capacity reserved above
     }
@@ -193,4 +192,3 @@ test "count limit on one table is the stable top, ties included" {
     try testing.expect(earliest[0] and earliest[1] and earliest[2]);
     try testing.expect(try countLimitGroups(arena, &table, &outputs, &calls, .{ .keys = top2.keys }) == null);
 }
-

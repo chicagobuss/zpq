@@ -449,6 +449,56 @@ fn extractAsDatePart(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
     return out.toOwnedSliceSentinel(allocator, 0);
 }
 
+const QueryShape = struct { is_aggregate: bool, has_group_by: bool };
+
+fn classifyQuery(
+    allocator: std.mem.Allocator,
+    root: *c.LpNode,
+    lp_arena: *c.arena_t,
+) !QueryShape {
+    // Classify the result columns. An aggregate query routes to
+    // `--aggregate`; a plain one to `--select`. Mixing the two (e.g.
+    // `SELECT flag, sum(id)`) is implicit GROUP BY — unsupported, and
+    // rejected here instead of misrouting into the agg parser. Inline
+    // window functions are rejected too.
+    var has_agg = false;
+    var has_bare = false;
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
+        const rc = root.*.u.select.result_columns.items[i] orelse continue;
+        const info = analyzeExpr(rc);
+        if (info.has_window) {
+            diagnosticPrint("sql: window functions (OVER) are not supported yet\n", .{});
+            return error.WindowNotSupported;
+        }
+        if (info.has_subquery) {
+            diagnosticPrint("sql: subqueries are not supported yet\n", .{});
+            return error.SubqueryNotSupported;
+        }
+        if (info.has_func_distinct) {
+            diagnosticPrint("sql: DISTINCT inside a function is not supported yet\n", .{});
+            return error.DistinctNotSupported;
+        }
+        if (info.has_agg) has_agg = true;
+        if (info.has_bare_col) has_bare = true;
+    }
+    const has_group_by = root.*.u.select.group_by.count > 0;
+    const is_aggregate = has_agg or has_group_by;
+
+    if (is_aggregate) {
+        if (has_bare and !has_group_by) {
+            diagnosticPrint("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
+            return error.MixedSelectNotSupported;
+        }
+        if (has_group_by) {
+            try substituteGroupRefs(root.*.u.select);
+            try validateGroupBy(allocator, root.*.u.select, lp_arena);
+        }
+    }
+
+    return .{ .is_aggregate = is_aggregate, .has_group_by = has_group_by };
+}
+
 pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp_arena);
@@ -515,45 +565,10 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     const table_name = try allocator.dupe(u8, stripQuotes(table_name_raw));
     errdefer allocator.free(table_name);
 
-    // Classify the result columns. An aggregate query routes to
-    // `--aggregate`; a plain one to `--select`. Mixing the two (e.g.
-    // `SELECT flag, sum(id)`) is implicit GROUP BY — unsupported, and
-    // rejected here instead of misrouting into the agg parser. Inline
-    // window functions are rejected too.
-    var has_agg = false;
-    var has_bare = false;
+    const shape = try classifyQuery(allocator, root, lp_arena);
+    const is_aggregate = shape.is_aggregate;
+    const has_group_by = shape.has_group_by;
     var i: usize = 0;
-    while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
-        const rc = root.*.u.select.result_columns.items[i] orelse continue;
-        const info = analyzeExpr(rc);
-        if (info.has_window) {
-            diagnosticPrint("sql: window functions (OVER) are not supported yet\n", .{});
-            return error.WindowNotSupported;
-        }
-        if (info.has_subquery) {
-            diagnosticPrint("sql: subqueries are not supported yet\n", .{});
-            return error.SubqueryNotSupported;
-        }
-        if (info.has_func_distinct) {
-            diagnosticPrint("sql: DISTINCT inside a function is not supported yet\n", .{});
-            return error.DistinctNotSupported;
-        }
-        if (info.has_agg) has_agg = true;
-        if (info.has_bare_col) has_bare = true;
-    }
-    const has_group_by = root.*.u.select.group_by.count > 0;
-    const is_aggregate = has_agg or has_group_by;
-
-    if (is_aggregate) {
-        if (has_bare and !has_group_by) {
-            diagnosticPrint("sql: mixing aggregates with plain columns requires GROUP BY\n", .{});
-            return error.MixedSelectNotSupported;
-        }
-        if (has_group_by) {
-            try substituteGroupRefs(root.*.u.select);
-            try validateGroupBy(allocator, root.*.u.select, lp_arena);
-        }
-    }
 
     // Unparse result columns
     var columns_list: std.ArrayList([]const u8) = .empty;

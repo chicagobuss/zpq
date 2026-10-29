@@ -1027,8 +1027,16 @@ fn HavingBuilder(comptime Sel: type) type {
 
         const Self = @This();
         const max_depth = @import("../filter/parser.zig").MAX_GROUP_DEPTH;
+        const Error = error{
+            FilterTooDeep,
+            HavingNotSupported,
+            UnparseError,
+            LimitNotSupported,
+            OrderByNotSupported,
+            ColumnMustBeGrouped,
+        } || std.mem.Allocator.Error;
 
-        fn unsupported(self: *Self, node: *c.LpNode) anyerror {
+        fn unsupported(self: *Self, node: *c.LpNode) error{ UnparseError, HavingNotSupported } {
             const text = c.lp_ast_to_sql(node, self.lp_arena);
             if (text == null) return error.UnparseError;
             diagnosticPrint("sql: HAVING {s} is not supported yet (compare an aggregate or key with a literal)\n", .{
@@ -1037,7 +1045,7 @@ fn HavingBuilder(comptime Sel: type) type {
             return error.HavingNotSupported;
         }
 
-        fn build(self: *Self, node: *c.LpNode, depth: u32) anyerror!ast.Having {
+        fn build(self: *Self, node: *c.LpNode, depth: u32) Error!ast.Having {
             if (depth > max_depth) return error.FilterTooDeep;
             switch (node.kind) {
                 c.LP_EXPR_BINARY_OP => {
@@ -1100,7 +1108,7 @@ fn HavingBuilder(comptime Sel: type) type {
 
         /// A chain of one operator, its operands gathered with a stack rather than recursion: left-deep chains of any
         /// length cost no parse depth.
-        fn chain(self: *Self, node: *c.LpNode, op: anytype, depth: u32) anyerror!ast.Having {
+        fn chain(self: *Self, node: *c.LpNode, op: anytype, depth: u32) Error!ast.Having {
             var stack: std.ArrayList(*c.LpNode) = .empty;
             defer stack.deinit(self.allocator);
             var operands: std.ArrayList(ast.Having) = .empty;

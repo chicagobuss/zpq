@@ -596,3 +596,63 @@ test "grouped sum/min over a group with only null values stays NULL" {
     try testing.expectEqual(@as(?i128, 5), accs[3].min_i);
 }
 
+
+test "string min/max folds keep the old winner when copying a new one fails" {
+    const foldMinMaxBytes = scalar.foldMinMaxBytes;
+    // The second batch's winner beats the first; its copy is the allocation that fails. The slot must still hold the
+    // first winner, live, so freeing the accumulator afterwards frees it exactly once.
+    const batches = [2][2][]const u8{ .{ "m", "q" }, .{ "a", "z" } };
+    inline for (.{ true, false }) |grouped| inline for (.{ true, false }) |is_min| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+        const persist = failing.allocator();
+        var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
+        defer if (if (is_min) state.min_bytes else state.max_bytes) |s| persist.free(s);
+        for (batches, 0..) |vals, bi| {
+            const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals } };
+            const folded = if (grouped)
+                foldMinMaxBytesGroupedOne(persist, is_min, &state, col, if (is_min) 0 else 1)
+            else blk: {
+                var sel = try filter_selection.SelectionVector.init(std.testing.allocator, vals.len);
+                defer sel.deinit();
+                break :blk foldMinMaxBytes(persist, is_min, &state, col, &sel);
+            };
+            if (bi == 0) try folded else try std.testing.expectError(error.OutOfMemory, folded);
+        }
+        const kept = (if (is_min) state.min_bytes else state.max_bytes).?;
+        try std.testing.expectEqualStrings(if (is_min) "m" else "q", kept);
+    };
+}
+
+test "grouped string winner replacement funds both live copies before allocating" {
+    const WinnerCharge = @import("accumulator.zig").WinnerCharge;
+    const winnerBytes = @import("accumulator.zig").winnerBytes;
+    const a = testing.allocator;
+    const old = try a.alloc(u8, 1 << 20);
+    defer a.free(old);
+    const next = try a.alloc(u8, 1 << 20);
+    defer a.free(next);
+    for ([_]bool{ false, true }) |is_min| {
+        @memset(old, if (is_min) 'z' else 'a');
+        @memset(next, if (is_min) 'a' else 'z');
+        const values = [_][]const u8{ old, next };
+        const col: filter_eval.Batch.Column = .{ .string = .{ .values = &values } };
+        var ledger: SharedBudget = .{ .limit = 3 << 19 };
+        var charge: WinnerCharge = .{ .ledger = &ledger };
+        var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
+        agg_threadlocals.winner_charge = &charge;
+        defer agg_threadlocals.winner_charge = null;
+        defer {
+            const value = if (is_min) state.min_bytes else state.max_bytes;
+            if (value) |bytes| a.free(bytes);
+            charge.settle(0);
+            std.debug.assert(ledger.used.load(.monotonic) == 0);
+        }
+        try foldMinMaxBytesGroupedOne(a, is_min, &state, col, 0);
+        const before = ledger.used.load(.monotonic);
+        try testing.expectEqual(winnerBytes(old.len), before);
+        try testing.expectError(error.ExceededMemoryBudget, foldMinMaxBytesGroupedOne(a, is_min, &state, col, 1));
+        try testing.expectEqual(before, ledger.used.load(.monotonic));
+        try testing.expectEqualStrings(old, (if (is_min) state.min_bytes else state.max_bytes).?);
+        try testing.expect(ledger.peak.load(.monotonic) <= ledger.limit);
+    }
+}

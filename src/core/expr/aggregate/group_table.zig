@@ -53,7 +53,6 @@ const agg_coded = @import("../agg_coded.zig");
 const AggFunc = types.AggFunc;
 const ResultShape = types.ResultShape;
 const scalar_mod = @import("scalar.zig");
-const grouped_mod = @import("grouped.zig");
 const updateOne = scalar_mod.updateOne;
 const updateOneFromStats = scalar_mod.updateOneFromStats;
 const updateSharedInteger = scalar_mod.updateSharedInteger;
@@ -68,13 +67,6 @@ const splitMix64 = census_mod.splitMix64;
 const FingerprintSet = census_mod.FingerprintSet;
 const fullestCells = census_mod.fullestCells;
 const cellsSeparate = census_mod.cellsSeparate;
-const DistinctPairs = grouped_mod.DistinctPairs;
-const updateOneGrouped = grouped_mod.updateOneGrouped;
-const foldMinMaxBytesGroupedOne = grouped_mod.foldMinMaxBytesGroupedOne;
-const WinnerCharge = @import("accumulator.zig").WinnerCharge;
-const winnerBytes = @import("accumulator.zig").winnerBytes;
-// Known exception: the facade owns writable thread-local state until the later contract pass.
-const agg_threadlocals = @import("../agg.zig");
 
 const CachedKey = struct { bytes: []const u8, hash: u64 };
 const CachedKeyCtx = struct {
@@ -1564,30 +1556,6 @@ test "fixed-width groups charge their count(DISTINCT) sets to the shared budget,
     }.run, .{});
 }
 
-test "string min/max folds keep the old winner when copying a new one fails" {
-    // The second batch's winner beats the first; its copy is the allocation that fails. The slot must still hold the
-    // first winner, live, so freeing the accumulator afterwards frees it exactly once.
-    const batches = [2][2][]const u8{ .{ "m", "q" }, .{ "a", "z" } };
-    inline for (.{ true, false }) |grouped| inline for (.{ true, false }) |is_min| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-        const persist = failing.allocator();
-        var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
-        defer if (if (is_min) state.min_bytes else state.max_bytes) |s| persist.free(s);
-        for (batches, 0..) |vals, bi| {
-            const col: filter_eval.Batch.Column = .{ .string = .{ .values = &vals } };
-            const folded = if (grouped)
-                foldMinMaxBytesGroupedOne(persist, is_min, &state, col, if (is_min) 0 else 1)
-            else blk: {
-                var sel = try filter_selection.SelectionVector.init(std.testing.allocator, vals.len);
-                defer sel.deinit();
-                break :blk foldMinMaxBytes(persist, is_min, &state, col, &sel);
-            };
-            if (bi == 0) try folded else try std.testing.expectError(error.OutOfMemory, folded);
-        }
-        const kept = (if (is_min) state.min_bytes else state.max_bytes).?;
-        try std.testing.expectEqualStrings(if (is_min) "m" else "q", kept);
-    };
-}
 
 test "a table charges each group's count(DISTINCT) set object, fixed-width keys or not" {
     const calls = [_]AggCall{
@@ -2169,37 +2137,6 @@ test "STRGROUP whole-table quote includes first chunks large records and actual 
     };
 }
 
-test "grouped string winner replacement funds both live copies before allocating" {
-    const a = testing.allocator;
-    const old = try a.alloc(u8, 1 << 20);
-    defer a.free(old);
-    const next = try a.alloc(u8, 1 << 20);
-    defer a.free(next);
-    for ([_]bool{ false, true }) |is_min| {
-        @memset(old, if (is_min) 'z' else 'a');
-        @memset(next, if (is_min) 'a' else 'z');
-        const values = [_][]const u8{ old, next };
-        const col: filter_eval.Batch.Column = .{ .string = .{ .values = &values } };
-        var ledger: SharedBudget = .{ .limit = 3 << 19 };
-        var charge: WinnerCharge = .{ .ledger = &ledger };
-        var state: Accumulator = if (is_min) .{ .min_bytes = null } else .{ .max_bytes = null };
-        agg_threadlocals.winner_charge = &charge;
-        defer agg_threadlocals.winner_charge = null;
-        defer {
-            const value = if (is_min) state.min_bytes else state.max_bytes;
-            if (value) |bytes| a.free(bytes);
-            charge.settle(0);
-            std.debug.assert(ledger.used.load(.monotonic) == 0);
-        }
-        try foldMinMaxBytesGroupedOne(a, is_min, &state, col, 0);
-        const before = ledger.used.load(.monotonic);
-        try testing.expectEqual(winnerBytes(old.len), before);
-        try testing.expectError(error.ExceededMemoryBudget, foldMinMaxBytesGroupedOne(a, is_min, &state, col, 1));
-        try testing.expectEqual(before, ledger.used.load(.monotonic));
-        try testing.expectEqualStrings(old, (if (is_min) state.min_bytes else state.max_bytes).?);
-        try testing.expect(ledger.peak.load(.monotonic) <= ledger.limit);
-    }
-}
 
 fn cachedDistinctTrial(a: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(a);

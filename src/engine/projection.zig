@@ -148,11 +148,17 @@ pub const ProjectionPlan = struct {
 
 pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const schema.FileMetaData) !ProjectionPlan {
     const num_leaves = metadata.leafCount(meta0);
+    const bound = if (try args.bound(arena, meta0)) |query| switch (query.*) {
+        .projection => |*p| p,
+        .aggregate => return error.InvalidBoundPlan,
+    } else null;
 
     // --columns resolves to leaf indices; --select is mutually exclusive with it (checked by the callers).
-    var kept_set: ?[]bool = null;
+    var kept_set: ?[]const bool = null;
     var select = args.select;
-    if (args.columns) |cols_list| {
+    if (bound) |p| {
+        kept_set = p.kept_set;
+    } else if (args.columns) |cols_list| {
         const set = try arena.alloc(bool, num_leaves);
         @memset(set, false);
         try markColumns(arena, meta0, cols_list, set, args.diag);
@@ -162,12 +168,12 @@ pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const s
         kept_set = set;
         select = null;
     };
-    const select_items: ?[]expr_ast.SelectItem = if (select) |s|
+    const select_items: ?[]expr_ast.SelectItem = if (bound) |p| p.select_items else if (select) |s|
         try expr_parser.parseSelect(arena, s, meta0, args.diag)
     else
         null;
-    var filter: ?filter_ast.Filter = null;
-    if (args.filter) |fs| if (fs.len > 0) {
+    var filter: ?filter_ast.Filter = if (bound) |p| p.filter else null;
+    if (bound == null) if (args.filter) |fs| if (fs.len > 0) {
         filter = try bindFilter(arena, fs, meta0, args);
     };
 
@@ -220,25 +226,20 @@ pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const s
             if (ci < num_leaves) fetch[ci] = true;
         }
     }
-    const row_keys = try arena.alloc(RowSortKey, args.result_order.rows.len);
-    for (args.result_order.rows, row_keys, 0..) |rk, *key, k| {
-        const e = try expr_parser.parseExprOnly(arena, rk.expr, meta0, args.diag);
-        e.collectColumns(fetch);
-        if (e == .col_ref) {
-            const ci = e.col_ref.col_idx;
-            const path = (try metadata.leafPathSegments(arena, meta0, ci)) orelse return error.UnknownColumn;
-            if (meta0.getColumnLevels(path).max_rep > 0) {
-                Diag.setColumn(args.diag, rk.expr);
-                return error.NestedRowOutputNotSupported;
-            }
-            const elem = metadata.leafSchemaElement(meta0, ci) orelse return error.UnknownColumn;
-            key.* = .{ .spec = .{ .passthrough = .{ .ci = ci } }, .descending = rk.descending, .unsigned = schema.isUnsignedInt(elem) };
-        } else {
-            // Computed as a written column would be; its lane is signed (arithmetic refuses UINT64 operands).
-            const alias = try std.fmt.allocPrint(arena, "__order_{d}", .{k});
-            key.* = .{ .spec = .{ .computed = .{ .expr = e, .alias = alias } }, .descending = rk.descending, .unsigned = false };
+    const row_keys: []const RowSortKey = if (bound) |p| p.row_keys else blk: {
+        const keys = try arena.alloc(RowSortKey, args.result_order.rows.len);
+        for (args.result_order.rows, keys, 0..) |rk, *key, k| {
+            const e = try expr_parser.parseExprOnly(arena, rk.expr, meta0, args.diag);
+            key.* = try rowSortKey(arena, meta0, e, rk.descending, k, rk.expr, args.diag);
         }
-    }
+        break :blk keys;
+    };
+    for (row_keys) |key| switch (key.spec) {
+        .passthrough => |p| if (p.ci < fetch.len) {
+            fetch[p.ci] = true;
+        },
+        .computed => |c| c.expr.collectColumns(fetch),
+    };
     // A --select names its outputs, so two may clash, as aggregate and GROUP BY outputs may; a plain copy keeps the
     // source's own names and is not checked.
     if (select_items != null) {
@@ -257,6 +258,30 @@ pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const s
         .labels = labels,
         .row_keys = row_keys,
     };
+}
+
+/// The row-order consumer accepts the same bound expression from SQL or the fragment boundary.
+pub fn rowSortKey(
+    arena: std.mem.Allocator,
+    meta: *const schema.FileMetaData,
+    e: expr_ast.Expr,
+    descending: bool,
+    ordinal: usize,
+    display: []const u8,
+    diag: ?*Diag,
+) !RowSortKey {
+    if (e == .col_ref) {
+        const ci = e.col_ref.col_idx;
+        const path = (try metadata.leafPathSegments(arena, meta, ci)) orelse return error.UnknownColumn;
+        if (meta.getColumnLevels(path).max_rep > 0) {
+            Diag.setColumn(diag, display);
+            return error.NestedRowOutputNotSupported;
+        }
+        const elem = metadata.leafSchemaElement(meta, ci) orelse return error.UnknownColumn;
+        return .{ .spec = .{ .passthrough = .{ .ci = ci } }, .descending = descending, .unsigned = schema.isUnsignedInt(elem) };
+    }
+    const alias = try std.fmt.allocPrint(arena, "__order_{d}", .{ordinal});
+    return .{ .spec = .{ .computed = .{ .expr = e, .alias = alias } }, .descending = descending, .unsigned = false };
 }
 
 /// The query's filter bound against `meta`. Under `--trust-stats` its leaves trust plausible statistics, and a

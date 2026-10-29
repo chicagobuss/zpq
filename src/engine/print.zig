@@ -675,13 +675,15 @@ pub fn runPrintTo(
 /// Text output may target memory in an embedding process; no stdout redirection or temporary files.
 pub fn runPrintSink(
     ctx: Context,
-    args: QueryArgs,
+    initial_args: QueryArgs,
     format: PrintFormat,
     limit: ?usize,
     fd: local_fs.fd_t,
     offset: usize,
     sink: ?*std.Io.Writer,
 ) !PrintResult {
+    var cache: engine_types.bound_plan.Cache = .{};
+    const args = initial_args.withPlanCache(&cache);
     var changed = false;
     return runPrintSinkOver(ctx, args, format, limit, fd, offset, sink, &changed) catch |err|
         if (changed) error.InputChanged else err;

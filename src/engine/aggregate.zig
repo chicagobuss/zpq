@@ -191,10 +191,10 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
     const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
     defer span.end(.query, profile.args(.{}));
     if (args.inputs.len == 0) return error.NoInputs;
-    if ((args.aggregate != null or args.group_by != null) and (args.select != null or args.columns != null)) {
+    if (args.kind() != .rows and (args.select != null or args.columns != null)) {
         return error.AggregateMutexWithSelect;
     }
-    if (args.aggregate != null or args.group_by != null) {
+    if (args.kind() != .rows) {
         if (args.bloom_filters.len > 0) return error.BloomFilterNeedsRows;
         const agg_str = args.aggregate orelse "";
         return .{ .aggregate = try runAggregate(ctx, args, agg_str) };
@@ -212,9 +212,8 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
 // ============================================================
 
 /// `filter`'s conjuncts as the plan runs them, each with the column it tests (a composite: its first leaf's).
-fn explainConjuncts(arena: std.mem.Allocator, filter: ?[]const u8, meta: *const schema.FileMetaData) ![]const Conjunct {
-    const text = filter orelse return &.{};
-    const f = try filter_parser.parse(arena, text, meta, null);
+fn explainConjuncts(arena: std.mem.Allocator, filter: ?filter_ast.Filter, meta: *const schema.FileMetaData) ![]const Conjunct {
+    const f = filter orelse return &.{};
     const children: []const filter_ast.Filter = switch (f) {
         .and_filter => |c| if (c.in_set == null and !c.null_member) c.children else &.{f},
         else => &.{f},
@@ -235,7 +234,7 @@ fn explainConjuncts(arena: std.mem.Allocator, filter: ?[]const u8, meta: *const 
 /// Planning shares the execution path, with caller-owned arena storage and metadata-only input opening.
 pub fn explainAggregate(ctx: Context, arena: std.mem.Allocator, args: QueryArgs) !AggregateExplanation {
     if (args.inputs.len == 0) return error.NoInputs;
-    if (args.aggregate == null and args.group_by == null) return error.MissingOutputOrAggregate;
+    if (args.kind() == .rows) return error.MissingOutputOrAggregate;
     if (args.select != null or args.columns != null) return error.AggregateMutuallyExclusive;
     return executeAggregate(ctx, arena, args, args.aggregate orelse "", true);
 }
@@ -249,10 +248,12 @@ fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
 fn executeAggregate(
     ctx: Context,
     arena: std.mem.Allocator,
-    args: QueryArgs,
+    initial_args: QueryArgs,
     agg_str: []const u8,
     comptime explain: bool,
 ) !if (explain) AggregateExplanation else AggResult {
+    var cache: engine_types.bound_plan.Cache = .{};
+    const args = initial_args.withPlanCache(&cache);
     if (args.text_output != null and args.aggregate_sink != null) return error.ConflictingAggregateSinks;
     var changed = false;
     return executeAggregateOver(ctx, arena, args, agg_str, explain, &changed) catch |err|
@@ -309,7 +310,7 @@ fn executeAggregateOver(
     cut_args.result_order = ResultProgram.cutOrder(args.result_order);
     // The footers, parsed once here when the cut shape needs one, serve the scan below as well.
     var steer_metas: ?[]const schema.FileMetaData = null;
-    if (io_policy.profile == .auto and args.group_by != null and cut_args.result_order.limit != null and
+    if (io_policy.profile == .auto and args.kind() == .grouped and cut_args.result_order.limit != null and
         !empty_result and allLocal(opened))
         if (sketchFromEnv(ctx.env)) |cfg| steer: {
             // A footer that does not parse is reported where the scan parses it; it steers nothing here.
@@ -322,6 +323,7 @@ fn executeAggregateOver(
                 .group_by = args.group_by,
                 .select_cols = args.select_cols,
                 .result_order = cut_args.result_order,
+                .bound_aggregate = try args.boundAggregate(arena, &meta0),
             };
             probe_args.column_order = args.column_order;
             switch (scan.cutShape(arena, &meta0, probe_args)) {
@@ -343,10 +345,10 @@ fn executeAggregateOver(
     var probed = opened.membership;
     // A `row_groups` range lives in the footers parsed here; the scan's own parse would read every row group.
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
-        steer_metas != null or args.row_groups != null)
+        steer_metas != null or args.row_groups != null or args.plan_source != null)
     blk: {
         const m = steer_metas orelse try materializeMetas(arena, opened, args.diag, prof);
-        const filter: ?filter_ast.Filter = if (args.filter) |fs|
+        const filter: ?filter_ast.Filter = if (try args.boundAggregate(arena, &m[0])) |bound| bound.filter else if (args.filter) |fs|
             (if (fs.len > 0) try bindFilter(arena, fs, &m[0], args) else null)
         else
             null;
@@ -376,6 +378,7 @@ fn executeAggregateOver(
         choice.reason,
     }));
     var scan_args = aggregateScanArgs(ctx, args, agg_str, opened.inputs, metas, cut_args.result_order, &ledger);
+    if (args.plan_source != null) scan_args.bound_aggregate = try args.boundAggregate(arena, &metas.?[0]);
     if (explain) {
         if (io_mode != .mmap) {
             // As `planLocalReader` hands the scan its inputs: gated, with the mapped file beside them.
@@ -400,7 +403,12 @@ fn executeAggregateOver(
             .result = .of(args.result_order),
             .conjuncts = blk: {
                 const ms = metas orelse break :blk &.{};
-                break :blk if (ms.len == 0) &.{} else try explainConjuncts(arena, args.filter, &ms[0]);
+                if (ms.len == 0) break :blk &.{};
+                const filter = if (scan_args.bound_aggregate) |bound| bound.filter else if (args.filter) |text|
+                    try filter_parser.parse(arena, text, &ms[0], null)
+                else
+                    null;
+                break :blk try explainConjuncts(arena, filter, &ms[0]);
             },
         };
     }
@@ -445,7 +453,7 @@ fn executeAggregateOver(
     }
     scan_args.inputs = scan_inputs;
     var probe_sink: DictProbeSink = .{ .inputs = scan_inputs, .mmaps = opened.mmaps };
-    if (args.group_by != null and allLocal(opened)) {
+    if (args.kind() == .grouped and allLocal(opened)) {
         probe_sink.cold = try arena.alloc(DictProbeSink.Cold, scan_inputs.len);
         @memset(probe_sink.cold, @fromBackingInt(@intCast(0)));
         scan_args.dict_probe = .{ .ctx = &probe_sink, .add = DictProbeSink.add };

@@ -453,19 +453,24 @@ const RemoteInputs = struct {
 
         // Bloom filters first: what they prove lands on the footers' chunks, so the plan below and the scan workers
         // after it prune the same row groups.
-        if (!self.fetch_window.footer_only and !self.args.scan_all) if (self.args.filter) |fs| if (fs.len > 0) {
-            const f = try bindFilter(self.arena, fs, &metas_for_plan[0], self.args);
-            // Bloom holds its own copies of what it probes. Cap them at the bytes the query can keep, not at the
-            // fetch window's 64 MiB floor when that floor is above `--max-memory`.
-            var src: S3Membership = .init(read_ctx, creds, pool, specs, @min(self.fetch_window.limit, account.limit));
-            src.profiler = self.args.profiler;
-            self.membership_stats.* = try membership.load(self.arena, self.ctx.gpa, f, metas_for_plan, src.source(), .{});
-            // Reads only the float chunks it probes, never the row group's other columns.
-            _ = try nanprobe.load(self.ctx.gpa, f, metas_for_plan, src.source(), .{ .batch_bytes = @min(self.fetch_window.limit, account.limit) });
-        };
+        if (!self.fetch_window.footer_only and !self.args.scan_all) {
+            const bound = try self.args.bound(self.arena, &metas_for_plan[0]);
+            const filter = if (bound) |query| query.filter() else if (self.args.filter) |fs|
+                (if (fs.len > 0) try bindFilter(self.arena, fs, &metas_for_plan[0], self.args) else null)
+            else
+                null;
+            if (filter) |f| {
+                // Bloom holds its own copies of what it probes. Cap them at the bytes the query can keep, not at the
+                // fetch window's 64 MiB floor when that floor is above `--max-memory`.
+                var src: S3Membership = .init(read_ctx, creds, pool, specs, @min(self.fetch_window.limit, account.limit));
+                src.profiler = self.args.profiler;
+                self.membership_stats.* = try membership.load(self.arena, self.ctx.gpa, f, metas_for_plan, src.source(), .{});
+                // Reads only the float chunks it probes, never the row group's other columns.
+                _ = try nanprobe.load(self.ctx.gpa, f, metas_for_plan, src.source(), .{ .batch_bytes = @min(self.fetch_window.limit, account.limit) });
+            }
+        }
 
-        // What each row group needs fetched. (Yes, this re-parses arg strings that scan and runWrite will parse again
-        // — microseconds, not worth plumbing the parsed AST through.)
+        // Bound frontend requests share their binding with fetch planning and execution.
         const plan_span = profile.Span.begin(self.prof);
         var n_ranges: usize = 0;
         var n_merged: usize = 0;

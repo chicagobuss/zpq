@@ -16,6 +16,7 @@ const membership = @import("../core/filter/membership.zig");
 const ResultProgram = @import("../core/result_program.zig").ResultProgram;
 const Diag = @import("../core/diag.zig").Diag;
 const text_format = @import("text_types.zig");
+pub const bound_plan = @import("bound_plan.zig");
 const TextKind = text_format.TextKind;
 const AnswerType = text_format.AnswerType;
 const DecimalColumns = text_format.DecimalColumns;
@@ -76,6 +77,10 @@ pub const ColumnarSink = struct {
 };
 
 pub const QueryArgs = struct {
+    /// Immutable frontend syntax. Every engine invocation owns its own metadata-bound cache.
+    plan_source: ?bound_plan.Source = null,
+    /// Internal synchronous handoff; callers supply plan_source, never a cache retained across invocations.
+    plan_cache: ?*bound_plan.Cache = null,
     /// Force eligible GROUP BY queries through shared partitions.
     partagg: bool = false,
     inputs: []const []const u8, // raw paths/URLs (pre-glob — caller globs)
@@ -163,6 +168,32 @@ pub const QueryArgs = struct {
     /// Per input, parallel to `inputs`: read only row groups `start` up to but not including `end` of its footer; null
     /// (or a null slice) reads every row group. A coordinator splits one file across workers with it.
     row_groups: ?[]const ?[2]u32 = null,
+
+    pub fn kind(self: QueryArgs) bound_plan.Kind {
+        if (self.plan_source) |source| return source.kind;
+        return if (self.group_by != null) .grouped else if (self.aggregate != null) .scalar else .rows;
+    }
+
+    pub inline fn withPlanCache(self: QueryArgs, cache: *bound_plan.Cache) QueryArgs {
+        var args = self;
+        if (args.plan_source != null) args.plan_cache = cache;
+        return args;
+    }
+
+    pub fn bound(self: QueryArgs, arena: std.mem.Allocator, meta: *const schema.FileMetaData) !?*const bound_plan.Query {
+        const source = self.plan_source orelse return null;
+        const cache = self.plan_cache orelse return error.InvalidBoundPlan;
+        return try cache.get(source, arena, meta, self.diag, .{
+            .trust_stats = self.trust_stats,
+            .nested_output = self.output != null,
+        });
+    }
+
+    pub fn boundAggregate(self: QueryArgs, arena: std.mem.Allocator, meta: *const schema.FileMetaData) !?*const bound_plan.Aggregate {
+        const query = (try self.bound(arena, meta)) orelse return null;
+        if (query.* != .aggregate) return error.InvalidBoundPlan;
+        return &query.aggregate;
+    }
 };
 
 pub const CompressPriority = compression.CompressPriority;
@@ -380,10 +411,4 @@ test "BloomSpec.parse: a column, optionally with a probability" {
 }
 
 /// A plain-row ORDER BY key bound to its input column (`expr_ast.RowKey`).
-pub const RowSortKey = struct {
-    /// The key as an output column of the row: a passthrough leaf, or an expression computed like a written column.
-    spec: consumer.OutputCol,
-    descending: bool,
-    /// An unsigned integer column: its lane holds raw bits, compared as unsigned.
-    unsigned: bool,
-};
+pub const RowSortKey = bound_plan.RowSortKey;

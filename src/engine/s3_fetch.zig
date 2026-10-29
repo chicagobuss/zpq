@@ -260,7 +260,12 @@ pub const RangePlan = union(enum) {
 /// Plan the S3 fetch from whatever args are set. `metas` are the S3 inputs' footers, parsed against the same schema.
 pub fn planRanges(arena: std.mem.Allocator, args: QueryArgs, metas: []const schema.FileMetaData) !RangePlan {
     const meta0 = &metas[0];
-    if (args.aggregate != null or args.group_by != null) {
+    if (args.kind() != .rows) {
+        if (try args.boundAggregate(arena, meta0)) |bound| return .{ .aggregate = try .init(arena, .{
+            .filter = bound.filter,
+            .calls = bound.calls,
+            .group_keys = bound.keys,
+        }, metas, .fromFlags(args.scan_all, args.trust_stats)) };
         const filter: ?filter_ast.Filter = if (args.filter) |fs|
             (if (fs.len > 0) try bindFilter(arena, fs, meta0, args) else null)
         else

@@ -132,7 +132,9 @@ fn writtenCodec(rgs: []const schema.RowGroup, none_written: schema.CompressionCo
     return seen orelse none_written;
 }
 
-pub fn runWrite(ctx: Context, args: QueryArgs, out_path: []const u8) !WriteResult {
+pub fn runWrite(ctx: Context, initial_args: QueryArgs, out_path: []const u8) !WriteResult {
+    var cache: engine_types.bound_plan.Cache = .{};
+    const args = initial_args.withPlanCache(&cache);
     var changed = false;
     return runWriteOver(ctx, args, out_path, &changed) catch |err| if (changed) error.InputChanged else err;
 }

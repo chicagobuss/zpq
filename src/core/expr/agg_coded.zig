@@ -2028,6 +2028,23 @@ fn foldGroupedValue(
         try agg.updateOneGroupedValues(ra, gpa, accs, gids, ai, agg_len, call, vals_col, sel, unsigned_64);
         return;
     }
+    return foldGroupedNumeric(ra, accs, gid_of, comp, space, ai, agg_len, call, sel, table, vals_col, unsigned_64);
+
+}
+fn foldGroupedNumeric(
+    ra: std.mem.Allocator,
+    accs: []Accumulator,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    ai: usize,
+    agg_len: usize,
+    call: AggCall,
+    sel: *const Sel,
+    table: ?*agg.GroupTable,
+    vals_col: Column,
+    unsigned_64: bool,
+) !void {
     const seen = try ra.alloc(u64, space);
     @memset(seen, 0);
     switch (vals_col) {
@@ -2176,6 +2193,7 @@ fn foldGroupedValue(
         else => unreachable,
     }
 }
+
 
 inline fn statePtr(
     table: ?*agg.GroupTable,

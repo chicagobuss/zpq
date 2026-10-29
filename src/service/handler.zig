@@ -558,7 +558,7 @@ fn executeSql(
     sql: []const u8,
     diag: *Diag,
 ) ![]u8 {
-    const pq = try zpq.core.expr.sql_parser.parseSqlQuery(arena, sql);
+    const pq = try zpq.core.expr.sql_parser.parseSqlPlan(arena, sql);
     const inputs = try zpq.frontend.expandGlob(arena, io, pq.table_name, env);
     if (inputs.len == 0) {
         zpq.frontend.noSqlMatches(pq.table_name);
@@ -566,6 +566,7 @@ fn executeSql(
     }
     var qa = options;
     qa.inputs = inputs;
+    qa.plan_source = engine.syntax_plan.source(pq.syntax.?);
     qa.filter = pq.filter_str;
     qa.select = pq.select_str;
     qa.aggregate = pq.aggregate_str;

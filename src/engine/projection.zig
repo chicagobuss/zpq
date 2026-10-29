@@ -17,7 +17,7 @@ const RowSortKey = @import("types.zig").RowSortKey;
 /// The leaves of a SQL SELECT list that is bare columns alone, at least one of them a STRUCT, LIST or MAP, in the
 /// file's order: the projection `--columns` would make of it, which keeps groups whole. Null for any other list
 /// (an alias, an expression, a leaf out of order, a list of leaves alone), which the expression path takes.
-fn nestedProjection(
+pub fn nestedProjection(
     arena: std.mem.Allocator,
     meta: *const schema.FileMetaData,
     select_cols: ?[]const expr_ast.SelectColumn,

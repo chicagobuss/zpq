@@ -139,8 +139,16 @@ test "bound frontend: S3 range planning and read cuts share one checked binding"
     var changed = meta;
     changed.schema.items = try ar.dupe(schema.SchemaElement, meta.schema.items);
     changed.schema.items[1].name = "different_column";
-    try std.testing.expectError(error.SchemaMismatch, args.bound(ar, &changed));
-    try std.testing.expectEqual(@as(usize, 1), count);
+    changed.leaf_index = null;
+    _ = try args.bound(ar, &changed);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectError(error.SchemaMismatch, scan.explainAggregate(a, ar, .{
+        .inputs = &.{ .{ .bytes = bytes, .name = fixture }, .{ .bytes = bytes, .name = fixture } },
+        .metas = &.{ meta, changed },
+        .aggregate = "invalid aggregate",
+        .bound_aggregate = bound,
+        .parallelism = 1,
+    }));
 }
 
 test "bound frontend: result names outlive frontend storage and allocation failures release query state" {
@@ -228,4 +236,113 @@ test "bound frontend: compatible physical drift binds a new view without reusing
     try std.testing.expectEqual(second, try cache.get(frontend.source(), ar, &changed, null, options));
     try std.testing.expectEqual(first, try cache.get(frontend.source(), ar, &meta, null, options));
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "syntax: SQL hands the engine owned nodes and separate aliases and output slots" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const a = std.testing.allocator;
+    const ctx: types.Context = .{ .gpa = a, .env = .empty, .io = std.testing.io };
+    for ([_][]const u8{
+        "SELECT sum(x) AS \"a a\", sum(x) AS \"b b\" FROM 'ci/fixtures/parquet/full_match.parquet'",
+        "SELECT b AS flag, count(*) AS n FROM 'ci/fixtures/parquet/full_match.parquet' GROUP BY b HAVING sum(x) > 0 ORDER BY count(*) DESC LIMIT 2",
+        "SELECT x AS value FROM 'ci/fixtures/parquet/full_match.parquet' WHERE NOT (x IN (1, NULL)) ORDER BY value DESC LIMIT 3",
+        "SELECT b AS k, count(*) AS n FROM 'ci/fixtures/parquet/full_match.parquet' GROUP BY k ORDER BY n DESC",
+        "SELECT b AS k, count(*) AS c, sum(n) AS a, sum(n) AS b, count(DISTINCT s) AS d FROM 'ci/fixtures/parquet/full_match.parquet' WHERE b < 0 GROUP BY b ORDER BY c DESC LIMIT 2",
+        "SELECT CASE WHEN b > 0 THEN b ELSE NULL END AS k, count(n) AS n FROM 'ci/fixtures/parquet/full_match.parquet' GROUP BY 1 ORDER BY k",
+        "SELECT count(*) AS n FROM 'ci/fixtures/parquet/full_match.parquet' HAVING sum(n) < 0",
+    }) |text| {
+        const original = try sql.parseSqlQuery(a, text);
+        defer original.deinit(a);
+        const parsed = try sql.parseSqlPlan(a, text);
+        defer parsed.deinit(a);
+        var want_bytes: [4096]u8 = undefined;
+        var got_bytes: [4096]u8 = undefined;
+        var want = std.Io.Writer.fixed(&want_bytes);
+        var got = std.Io.Writer.fixed(&got_bytes);
+        const args: types.QueryArgs = .{
+            .inputs = &.{fixture},
+            .aggregate = original.aggregate_str,
+            .group_by = original.group_by_str,
+            .filter = original.filter_str,
+            .select = original.select_str,
+            .select_cols = original.select_cols,
+            .result_order = original.result_order,
+            .parallelism = 1,
+        };
+        var bound = args;
+        bound.plan_source = @import("syntax_plan.zig").source(parsed.syntax.?);
+        bound.aggregate = if (original.is_aggregate) "poisoned aggregate" else null;
+        bound.group_by = if (original.group_by_str != null) "poisoned keys" else null;
+        bound.filter = "poisoned predicate";
+        bound.select = if (original.is_aggregate) null else "poisoned projection";
+        if (original.is_aggregate) {
+            var expected = try aggregate.runQuery(ctx, args);
+            defer expected.deinit(a);
+            var actual = try aggregate.runQuery(ctx, bound);
+            defer actual.deinit(a);
+            try @import("text.zig").writeAggregateJsonValue(&want, expected.aggregate.output, expected.aggregate.text_kinds, expected.aggregate.output.rowCount());
+            try @import("text.zig").writeAggregateJsonValue(&got, actual.aggregate.output, actual.aggregate.text_kinds, actual.aggregate.output.rowCount());
+        } else {
+            _ = try printing.runPrintSink(ctx, args, .jsonl, 3, 1, 1, &want);
+            _ = try printing.runPrintSink(ctx, bound, .jsonl, 3, 1, 1, &got);
+        }
+        try std.testing.expectEqualStrings(want.buffered(), got.buffered());
+    }
+}
+
+test "syntax: SQL result storage survives releasing the frontend syntax owner" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const a = std.testing.allocator;
+    var result: types.QueryResult = undefined;
+    {
+        const parsed = try sql.parseSqlPlan(a, "SELECT b AS key, min(s) AS value FROM 'ci/fixtures/parquet/full_match.parquet' GROUP BY b");
+        defer parsed.deinit(a);
+        result = try aggregate.runQuery(.{ .gpa = a, .io = std.testing.io, .env = .empty }, .{
+            .inputs = &.{fixture},
+            .parallelism = 1,
+            .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?),
+        });
+    }
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("key", result.aggregate.output.group_cols.?[0]);
+    try std.testing.expectEqualStrings("value", result.aggregate.output.group_cols.?[1]);
+    var bytes: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try @import("text.zig").writeAggregateJsonValue(&writer, result.aggregate.output, result.aggregate.text_kinds, result.aggregate.output.rowCount());
+    try std.testing.expect(writer.buffered().len > 0);
+}
+
+test "syntax: SQL flat predicate chains retain their length without consuming grouping depth" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const a = std.testing.allocator;
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    try text.writer.writeAll("SELECT count(*) AS n FROM 'ci/fixtures/parquet/full_match.parquet' WHERE b >= 0");
+    for (0..128) |_| try text.writer.writeAll(" AND b >= 0");
+    const parsed = try sql.parseSqlPlan(a, text.written());
+    defer parsed.deinit(a);
+    const ctx: types.Context = .{ .gpa = a, .io = std.testing.io, .env = .empty };
+    var expected = try aggregate.runQuery(ctx, .{ .inputs = &.{fixture}, .aggregate = "count(*) AS n", .filter = "b >= 0", .parallelism = 1 });
+    defer expected.deinit(a);
+    var got = try aggregate.runQuery(ctx, .{ .inputs = &.{fixture}, .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?), .parallelism = 1 });
+    defer got.deinit(a);
+    try std.testing.expectEqual(expected.aggregate.output.aggs[0].value.i, got.aggregate.output.aggs[0].value.i);
+}
+
+test "syntax: unsupported SQL modifiers and casts retain refusal instead of dropping clauses" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.TrailingTokens, sql.parseSqlPlan(a, "SELECT strlen(s) FILTER (WHERE b > 0) AS n FROM 'ci/fixtures/parquet/full_match.parquet'"));
+    try std.testing.expectError(error.ExpectedRParen, sql.parseSqlPlan(a, "SELECT sum(n ORDER BY n) AS n FROM 'ci/fixtures/parquet/full_match.parquet'"));
+    const parsed = try sql.parseSqlPlan(a, "SELECT sum(CAST(b AS BIGINT)) AS n FROM 'ci/fixtures/parquet/full_match.parquet'");
+    defer parsed.deinit(a);
+    try std.testing.expectError(error.UnknownFunction, aggregate.runQuery(.{ .gpa = a, .io = std.testing.io, .env = .empty }, .{
+        .inputs = &.{fixture},
+        .parallelism = 1,
+        .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?),
+    }));
 }

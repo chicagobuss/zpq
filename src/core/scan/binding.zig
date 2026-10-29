@@ -321,7 +321,7 @@ fn bindSqlOutputs(
                 break :blk .{ .agg = next_agg - 1 };
             },
             .key, .named => blk: {
-                const e = try expr_parser.parseExprOnly(arena, spec.expr, keys.meta, args.diag);
+                const e = spec.bound_expr orelse try expr_parser.parseExprOnly(arena, spec.expr, keys.meta, args.diag);
                 for (keys.items, 0..) |item, k| if (item.expr.eql(e)) break :blk .{ .key = k };
                 Diag.setColumn(args.diag, exprName(spec));
                 return error.ColumnMustBeGrouped;

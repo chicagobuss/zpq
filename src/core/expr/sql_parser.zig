@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("liteparser_c");
 const ast = @import("ast.zig");
+const syntax = @import("syntax.zig");
+const Lower = @import("sql_lower.zig").Lower;
 
 // CLI machine diagnostics use the same parser messages without mixing prose into JSON stderr.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
@@ -12,6 +14,8 @@ fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const ParsedQuery = struct {
+    syntax: ?*const syntax.Query = null,
+    syntax_arena: ?*std.heap.ArenaAllocator = null,
     table_name: []const u8,
     is_aggregate: bool,
     select_str: ?[]const u8,
@@ -26,6 +30,10 @@ pub const ParsedQuery = struct {
     having_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: ParsedQuery, allocator: std.mem.Allocator) void {
+        if (self.syntax_arena) |owner| {
+            owner.deinit();
+            allocator.destroy(owner);
+        }
         freeResultOrder(allocator, self.result_order);
         if (self.having_arena) |ha| {
             ha.deinit();
@@ -47,11 +55,15 @@ fn freeResultOrder(allocator: std.mem.Allocator, order: ast.ResultOrder) void {
     freeSelectCols(allocator, order.hidden);
 }
 
-fn freeSelectCols(allocator: std.mem.Allocator, cols: []const ast.SelectColumn) void {
+fn freeSelectItems(allocator: std.mem.Allocator, cols: []const ast.SelectColumn) void {
     for (cols) |col| {
         allocator.free(col.expr);
         if (col.alias) |a| allocator.free(a);
     }
+}
+
+fn freeSelectCols(allocator: std.mem.Allocator, cols: []const ast.SelectColumn) void {
+    freeSelectItems(allocator, cols);
     allocator.free(cols);
 }
 
@@ -283,7 +295,7 @@ fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
     var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
     if (root.u.select.where) |w| c.lp_ast_walk(w, &visitor);
     var i: usize = 0;
-    while (state.found == null and i < @as(usize, @intCast(root.u.select.result_columns.count))) : (i += 1) {
+    while (state.found == null and i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         if (root.u.select.result_columns.items[i]) |rc| c.lp_ast_walk(rc, &visitor);
     }
     if (state.found == null) return;
@@ -500,6 +512,15 @@ fn classifyQuery(
 }
 
 pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
+    return parseSql(false, allocator, sql);
+}
+
+/// Production SQL carries owned syntax to the schema binder; legacy fragment strings remain a compatibility API.
+pub fn parseSqlPlan(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
+    return parseSql(true, allocator, sql);
+}
+
+fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp_arena);
 
@@ -565,6 +586,14 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     const table_name = try allocator.dupe(u8, stripQuotes(table_name_raw));
     errdefer allocator.free(table_name);
 
+    const syntax_owner: ?*std.heap.ArenaAllocator = if (structured) try allocator.create(std.heap.ArenaAllocator) else null;
+    if (syntax_owner) |owner| owner.* = .init(allocator);
+    errdefer if (syntax_owner) |owner| {
+        owner.deinit();
+        allocator.destroy(owner);
+    };
+    var lower: Lower = .{ .arena = if (syntax_owner) |owner| owner.allocator() else undefined, .lp_arena = lp_arena };
+    const lowering = if (structured) &lower else null;
     const shape = try classifyQuery(allocator, root, lp_arena);
     const is_aggregate = shape.is_aggregate;
     const has_group_by = shape.has_group_by;
@@ -577,13 +606,13 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
         columns_list.deinit(allocator);
     }
     i = 0;
-    while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
+    while (!structured and i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         const col_sql = try unparseResultColumn(rc, lp_arena, allocator);
         try columns_list.append(allocator, col_sql);
     }
 
-    const select_cols = try allocator.alloc(ast.SelectColumn, columns_list.items.len);
+    const select_cols = try allocator.alloc(ast.SelectColumn, @intCast(root.*.u.select.result_columns.count));
     @memset(select_cols, .{ .expr = "" });
     errdefer freeSelectCols(allocator, select_cols);
     i = 0;
@@ -596,12 +625,12 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     }
     var hidden: std.ArrayList(ast.SelectColumn) = .empty;
     defer {
-        freeSelectCols(allocator, hidden.items);
+        freeSelectItems(allocator, hidden.items);
         hidden.deinit(allocator);
     }
     const sel = root.*.u.select;
-    var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden);
-    errdefer allocator.free(result_order.keys);
+    var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden, lowering);
+    errdefer freeResultOrder(allocator, result_order);
     var having_arena: ?*std.heap.ArenaAllocator = null;
     errdefer if (having_arena) |ha| {
         ha.deinit();
@@ -623,13 +652,31 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
             .select_cols = select_cols,
             .has_group_by = has_group_by,
             .hidden = &hidden,
+            .lower = lowering,
         };
         const tree = try ha.allocator().create(ast.Having);
         tree.* = try ctx.build(having, 0);
         result_order.having = tree;
     }
     result_order.hidden = try hidden.toOwnedSlice(allocator);
-    errdefer freeSelectCols(allocator, result_order.hidden);
+
+    if (structured) {
+        const owned = try lower.arena.create(syntax.Query);
+        owned.* = try lowerQuery(&lower, root, select_cols, result_order, is_aggregate, has_group_by);
+        return .{
+            .syntax = owned,
+            .syntax_arena = syntax_owner,
+            .table_name = table_name,
+            .is_aggregate = is_aggregate,
+            .select_str = null,
+            .aggregate_str = if (is_aggregate) "" else null,
+            .filter_str = null,
+            .group_by_str = if (has_group_by) "" else null,
+            .select_cols = select_cols,
+            .result_order = result_order,
+            .having_arena = having_arena,
+        };
+    }
 
     // Join result columns with ", "
     var joined_cols: std.ArrayList(u8) = .empty;
@@ -767,6 +814,49 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
     };
 }
 
+fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColumn, order: ast.ResultOrder, aggregate: bool, grouped: bool) !syntax.Query {
+    const a = lower.arena;
+    const sel = root.u.select;
+    const columns = try a.alloc(syntax.Column, cols.len);
+    var calls: std.ArrayList(syntax.Aggregate) = .empty;
+    var selected: std.ArrayList(syntax.SelectItem) = .empty;
+    var star = false;
+    for (cols, columns, 0..) |col, *out, i| {
+        const node = selectExpr(sel, i) orelse return error.SqlParseError;
+        out.* = .{ .display = try a.dupe(u8, col.expr), .alias = if (col.alias) |alias| try a.dupe(u8, alias) else null, .role = col.role };
+        if (aggregate and (!grouped or col.role == .agg)) {
+            try calls.append(a, try lower.aggregate(node, col.alias, col.expr));
+        } else if (node.kind == c.LP_EXPR_STAR) {
+            star = true;
+        } else {
+            out.expr = try lower.expression(node, 0);
+            if (!aggregate) try selected.append(a, .{ .expr = out.expr.?, .alias = out.alias });
+        }
+    }
+    const hidden = try a.alloc(syntax.Column, order.hidden.len);
+    for (order.hidden, hidden, lower.hidden.items, 0..) |col, *out, node, i| {
+        out.* = .{ .display = try a.dupe(u8, col.expr), .role = col.role };
+        if (col.role == .agg) {
+            const alias = try std.fmt.allocPrint(a, "{s}{d}", .{ hidden_alias, i });
+            try calls.append(a, try lower.aggregate(node, alias, col.expr));
+        } else out.expr = try lower.expression(node, 0);
+    }
+    const keys = if (grouped) try a.alloc(syntax.SelectItem, @intCast(sel.group_by.count)) else null;
+    if (keys) |items| for (items, 0..) |*out, i| {
+        out.* = .{ .expr = try lower.expression(sel.group_by.items[i] orelse return error.SqlParseError, 0) };
+    };
+    return .{
+        .aggregate = aggregate,
+        .calls = calls.items,
+        .keys = keys,
+        .filter = if (sel.where) |node| try lower.predicate(node, 0) else null,
+        .select = if (aggregate or star) null else selected.items,
+        .columns = if (star) &.{} else columns,
+        .hidden = hidden,
+        .row_keys = lower.rows.items,
+    };
+}
+
 /// The alias a hidden ORDER BY aggregate's call carries (followed by its position among the hidden terms): never
 /// printed, as its result column is dropped once the rows are ranked.
 pub const hidden_alias = "__zpq_order_";
@@ -783,6 +873,7 @@ fn resultOrder(
     is_aggregate: bool,
     has_group_by: bool,
     hidden: *std.ArrayList(ast.SelectColumn),
+    lower: ?*Lower,
 ) !ast.ResultOrder {
     const n_terms: usize = @intCast(sel.order_by.count);
     var order: ast.ResultOrder = .{};
@@ -791,7 +882,7 @@ fn resultOrder(
         if (lim.*.u.limit.offset) |off| order.offset = try nonNegativeInt(off);
     }
     if (!is_aggregate) {
-        if (n_terms > 0) order.rows = try rowOrder(allocator, sel, lp_arena, select_cols);
+        if (n_terms > 0) order.rows = try rowOrder(allocator, sel, lp_arena, select_cols, lower);
         return order;
     }
 
@@ -806,7 +897,7 @@ fn resultOrder(
         }
         const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
         const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
-            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden);
+            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower);
         key.* = .{ .column = column, .descending = term.*.u.order_term.direction == c.LP_SORT_DESC };
     }
     order.keys = keys;
@@ -822,6 +913,7 @@ fn rowOrder(
     sel: anytype,
     lp_arena: *c.arena_t,
     select_cols: []const ast.SelectColumn,
+    lower: ?*Lower,
 ) ![]const ast.RowKey {
     const n_terms: usize = @intCast(sel.order_by.count);
     const keys = try allocator.alloc(ast.RowKey, n_terms);
@@ -860,6 +952,11 @@ fn rowOrder(
         }
         const text_c = c.lp_ast_to_sql(expr, lp_arena);
         if (text_c == null) return error.UnparseError;
+        if (lower) |l| try l.rows.append(l.arena, .{
+            .expr = try l.expression(expr, 0),
+            .display = try l.arena.dupe(u8, std.mem.span(text_c)),
+            .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+        });
         key.* = .{
             .expr = try allocator.dupe(u8, std.mem.span(text_c)),
             .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
@@ -887,6 +984,7 @@ fn hiddenTerm(
     has_group_by: bool,
     clause: Clause,
     hidden: *std.ArrayList(ast.SelectColumn),
+    lower: ?*Lower,
 ) !usize {
     const text_c = c.lp_ast_to_sql(expr, lp_arena);
     if (text_c == null) return error.UnparseError;
@@ -909,6 +1007,7 @@ fn hiddenTerm(
     for (hidden.items, 0..) |h, i| if (std.mem.eql(u8, h.expr, text)) return i;
     try hidden.ensureUnusedCapacity(allocator, 1);
     hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
+    if (lower) |l| try l.hidden.append(l.arena, expr);
     return hidden.items.len - 1;
 }
 
@@ -924,6 +1023,7 @@ fn HavingBuilder(comptime Sel: type) type {
         select_cols: []const ast.SelectColumn,
         has_group_by: bool,
         hidden: *std.ArrayList(ast.SelectColumn),
+        lower: ?*Lower,
 
         const Self = @This();
         const max_depth = @import("../filter/parser.zig").MAX_GROUP_DEPTH;
@@ -1054,7 +1154,7 @@ fn HavingBuilder(comptime Sel: type) type {
             }
             if (try orderColumn(self.sel, self.lp_arena, self.select_cols, node)) |i| return i;
             return self.select_cols.len +
-                try hiddenTerm(self.allocator, self.sel, self.lp_arena, node, self.has_group_by, .having, self.hidden);
+                try hiddenTerm(self.allocator, self.sel, self.lp_arena, node, self.has_group_by, .having, self.hidden, self.lower);
         }
     };
 }
@@ -1544,4 +1644,27 @@ test "sql_parser reads EXTRACT(part FROM x) as date_part('part', x), quoted text
     const q = try parseSqlQuery(a, "SELECT extract(minute FROM t) AS m, count(*) FROM f GROUP BY m");
     defer q.deinit(a);
     try std.testing.expectEqualStrings("date_part('minute', t)", q.select_cols[0].expr);
+}
+
+test "syntax: owned SQL releases partial nodes and result-order storage on allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const parsed = try parseSqlPlan(a, "SELECT b AS k, count(*) AS n FROM 't.parquet' WHERE b > 0 GROUP BY b HAVING sum(n) > 1 ORDER BY n DESC LIMIT 2");
+            defer parsed.deinit(a);
+            try std.testing.expect(parsed.syntax != null);
+            try std.testing.expectEqual(@as(usize, 2), parsed.syntax.?.calls.len);
+        }
+    };
+    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try Check.run(baseline.allocator());
+    try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
+    for (0..baseline.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        try std.testing.expectError(error.OutOfMemory, Check.run(failing.allocator()));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }

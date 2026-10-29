@@ -99,15 +99,12 @@ pub const Cache = struct {
             self.schema_items = meta.schema.items;
         }
         if (sameBinding(self.schema_items, meta.schema.items)) return &self.query.?;
-        const mode: metadata.SchemaMatch = if (source.kind == .rows) .exact else .values;
-        if (metadata.schemaMismatch(self.schema_items, meta.schema.items, mode) != null)
-            return error.SchemaMismatch;
         var entry = self.extra;
         while (entry) |e| : (entry = e.next) {
             if (sameBinding(e.schema_items, meta.schema.items)) return &e.query;
         }
-        // Mixed local/S3 inputs may have compatible values but different physical types or label spelling.
-        // Bind the immutable syntax once for that schema; never reuse an INT32 proof for an INT64 column.
+        // Bind each distinct schema as the legacy per-input planner did; never reuse an INT32 proof for INT64.
+        // Consumers retain their schema validation and diagnostics, including errors from binding a missing column.
         const query = try bind(source, arena, meta, diag, options);
         const e = try arena.create(Entry);
         e.* = .{ .query = query, .schema_items = meta.schema.items, .next = self.extra };

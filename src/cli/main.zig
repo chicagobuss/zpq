@@ -478,6 +478,7 @@ fn runQuery(
     const max_memory = options.max_memory;
     const row_group = options.row_group;
     var group_by = options.group_by;
+    var plan_source: ?engine.types.bound_plan.Source = null;
     var select_cols = options.select_cols;
     var result_order = options.result_order;
     const column_order = options.column_order;
@@ -531,7 +532,8 @@ fn runQuery(
         if (comptime build_options.enable_sql) {
             if (machine_diagnostics) zpq.core.expr.sql_parser.diagnostic_fn = captureSqlDiagnostic;
             defer zpq.core.expr.sql_parser.diagnostic_fn = null;
-            const pq = try zpq.core.expr.sql_parser.parseSqlQuery(arena, q_str);
+            const pq = try zpq.core.expr.sql_parser.parseSqlPlan(arena, q_str);
+            plan_source = engine.syntax_plan.source(pq.syntax.?);
             filter = pq.filter_str;
             select = pq.select_str;
             aggregate = pq.aggregate_str;
@@ -630,6 +632,7 @@ fn runQuery(
         }
         const explanation = try engine.explainAggregate(.{ .gpa = gpa, .env = env, .io = io }, arena, .{
             .inputs = inputs,
+            .plan_source = plan_source,
             .output = if (fmt == .parquet) engine_output orelse "-" else null,
             .typed_answer = fmt == .parquet,
             .text_output = if (fmt != .parquet) .{ .format = fmt } else null,
@@ -659,6 +662,7 @@ fn runQuery(
 
     const query_args: engine.QueryArgs = .{
         .inputs = inputs,
+        .plan_source = plan_source,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet) (if (to_stdout) 1 else publication.fd) else null,
         .typed_answer = fmt == .parquet,

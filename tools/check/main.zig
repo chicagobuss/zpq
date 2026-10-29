@@ -1110,12 +1110,13 @@ fn execute(
     const mem = try memoryOf(c);
     std.Io.Dir.cwd().deleteFile(run.io, out_path) catch {};
     if (c.sql) |sql| {
-        const pq = try zpq.core.expr.sql_parser.parseSqlQuery(gpa, sql);
+        const pq = try zpq.core.expr.sql_parser.parseSqlPlan(gpa, sql);
         defer pq.deinit(gpa);
         if (c.emit == .values) return valuesOf(gpa, arena, ctx, pq, jobs, diag);
         const inputs = try expandInputs(arena, ctx, pq.table_name);
         var args: engine.QueryArgs = .{
             .inputs = inputs,
+            .plan_source = engine.syntax_plan.source(pq.syntax.?),
             .aggregate = pq.aggregate_str,
             .filter = pq.filter_str,
             .group_by = pq.group_by_str,
@@ -1262,6 +1263,7 @@ fn valuesOf(
 ) ![]const u8 {
     var result = try forcing.runQuery(ctx, .{
         .inputs = &.{pq.table_name},
+        .plan_source = engine.syntax_plan.source(pq.syntax.?),
         .aggregate = pq.aggregate_str,
         .filter = pq.filter_str,
         .group_by = pq.group_by_str,
@@ -1346,7 +1348,7 @@ fn runParity(
         const points = try pointsOf(arena, file, c);
         if (points[0].jobs) |j| at.jobs = j;
     }
-    const parsed = try zpq.core.expr.sql_parser.parseSqlQuery(run.gpa, c.sql.?);
+    const parsed = try zpq.core.expr.sql_parser.parseSqlPlan(run.gpa, c.sql.?);
     const aggregate = parsed.aggregate_str != null or parsed.group_by_str != null;
     parsed.deinit(run.gpa);
     var bound: std.ArrayList(forcing.Binding) = .empty;

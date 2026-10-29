@@ -213,7 +213,6 @@ test "Arrow columnar handoff applies the same row cut as text output" {
     try std.testing.expectEqual(want.rows, got.rows);
 }
 
-
 pub const StdoutWriter = struct {
     fd: local_fs.fd_t = 1,
     sink: ?*std.Io.Writer = null,
@@ -290,7 +289,6 @@ fn checkNestedListMap(node: schema_tree.Node, is_nested: bool, list_map_cols: []
         },
     }
 }
-
 
 const SlicedPrint = struct {
     names: []const []const u8,
@@ -736,7 +734,6 @@ fn runPrintSinkOver(
 
     var proj = try planProjection(arena, args, meta0);
     const filter_opt = proj.filter;
-    const fetch_arr = proj.fetch;
     const output_specs = proj.output_specs;
     if (limit != 0) _ = try loadLocalMembership(arena, opened, metas, filter_opt, args.scan_all, true);
     parse_span.end(.parse_query, profile.args(.{}));
@@ -854,164 +851,13 @@ fn runPrintSinkOver(
 
     if (args.diag) |diag| diag.execution_started = true;
     const t_scan = nowMonoNs();
-    var total_printed: usize = 0;
-    var rgs_in: usize = 0;
-    var rgs_pruned: usize = 0;
-
     var t: Timings = .{};
     t.core.prof = prof;
 
-    if (proj.row_keys.len > 0) {
-        // Without a LIMIT every row is kept and sorted, within half the memory budget (as decoded rows are).
-        const keep = if (limit) |l| offset +| l else std.math.maxInt(usize);
-        // With a LIMIT, row groups go most promising first, and one whose statistics cannot beat the heap's last row
-        // is passed over. Ties keep their input positions (`RowPos`), so the order read changes no answer. Only over
-        // bare columns: a computed output or key can fail on a row (`100 / id`), and passing over its group would
-        // answer where reading in order raises the error. Filter leaves compare a column with a literal and never fail.
-        const bounded = limit != null and !args.scan_all and allPassthrough(output_specs, proj.row_keys);
-        const items = if (limit != 0) try rankRowGroups(arena, opened.inputs, metas, proj.row_keys[0], bounded) else try arena.alloc(RankedRG, 0);
-        for (items) |item| {
-            const meta_i = &metas[item.file];
-            const rg = &meta_i.row_groups.items[item.rg];
-            // Every ranked row group is visited, by the gather workers or the loop below, and pruned by the same
-            // footer-only decision, so they are counted here once.
-            rgs_in += 1;
-            if (filter_opt) |f| if (!args.scan_all) {
-                if (filter_prune.pruneRowGroup(rg, f, meta_i) == .skip) rgs_pruned += 1;
-            };
-        }
-        var gathered = if (gatherEligible(ctx.env, opened.inputs, meta0, limit, keep, output_specs, proj.row_keys))
-            try rankAndGather(ctx, arena, args, opened.inputs, metas, filter_opt, fetch_arr, output_specs, proj.row_keys, keep, items, &t)
-        else
-            null;
-        defer if (gathered) |*g| g.deinit();
-        var ranked = if (gathered) |g| g.out else ranked: {
-            const top_limit = topnLimit(ctx, args, opened.inputs);
-            var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, top_limit);
-            defer top.deinit();
-            for (items) |item| {
-                const in = opened.inputs[item.file];
-                const meta_i = &metas[item.file];
-                const rg_i: usize = item.rg;
-                const src_rg = &meta_i.row_groups.items[rg_i];
-                if (filter_opt) |f| if (!args.scan_all) {
-                    if (filter_prune.pruneRowGroup(src_rg, f, meta_i) == .skip) {
-                        skipRowGroup(in, rg_i);
-                        continue;
-                    }
-                };
-                if (item.best) |best| if (top.cutsOff(best)) {
-                    skipRowGroup(in, rg_i);
-                    continue;
-                };
-                if (in.gate) |g| try g.wait(g.ctx, rg_i);
-                defer skipRowGroup(in, rg_i);
-                try top.offer(src_rg, meta_i, .{ .bytes = in.bytes, .byte_origin = 0 }, filter_opt, fetch_arr, .{
-                    .file = item.file,
-                    .rg = item.rg,
-                }, &t.core, .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory });
-            }
-            break :ranked try top.ranked(arena);
-        };
-        const print_span = profile.Span.begin(prof);
-        try flushAggregator(&ranked, names, &stdout_writer, is_jsonl, limit, &total_printed);
-        print_span.end(.sink_write, profile.args(.{ranked.num_rows}));
-    } else {
-        var print_scratch: ?*consumer.SliceScratch = null;
-        defer consumer.releaseSlicePool(&print_scratch);
-        for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
-            const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
-            const meta_const = meta_i;
-            for (meta_const.row_groups.items, 0..) |*src_rg, rg_i| {
-                if (limit) |lim| {
-                    if (total_printed >= lim) break;
-                }
-
-                rgs_in += 1;
-
-                const rg_span = profile.Span.begin(prof);
-                var skipped = false;
-                defer {
-                    const decision: u8 = if (skipped) 0 else 2;
-                    rg_span.end(.row_group, profile.args(.{ file_i, rg_i, decision, src_rg.num_rows }));
-                }
-                if (filter_opt) |f| if (!args.scan_all) {
-                    if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
-                        skipped = true;
-                        rgs_pruned += 1;
-                        skipRowGroup(in, rg_i);
-                        continue;
-                    }
-                };
-                if (in.gate) |g| try g.wait(g.ctx, rg_i);
-                defer skipRowGroup(in, rg_i);
-
-                // A row group too big to hold decoded prints a slice of rows at a time.
-                const sliced: SlicedPrint = .{
-                    .names = names,
-                    .writer = &stdout_writer,
-                    .is_jsonl = is_jsonl,
-                    .limit = limit,
-                    .total_printed = &total_printed,
-                    .budget = args.max_memory / 2,
-                    .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
-                    .counts = &t.core,
-                    .scratch = &print_scratch,
-                };
-                const printed = try printRowGroupSliced(
-                    ctx.gpa,
-                    &agg,
-                    src_rg,
-                    &meta_const,
-                    rg_src,
-                    filter_opt,
-                    fetch_arr,
-                    output_specs,
-                    sliced,
-                );
-                if (printed) continue;
-
-                const matched = consumer.appendProjectedRGWithOptions(
-                    &agg,
-                    ctx.gpa,
-                    src_rg,
-                    &meta_const,
-                    rg_src,
-                    filter_opt,
-                    fetch_arr,
-                    output_specs,
-                    &t.core,
-                    .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
-                ) catch |err| {
-                    // Values that expand past the budget held whole may still print a slice of rows at a time.
-                    if (err != error.DecodeExceededBudget) return err;
-                    consumer.resetAggregator(&agg);
-                    var streamed = sliced;
-                    streamed.force = true;
-                    const ok = try printRowGroupSliced(
-                        ctx.gpa,
-                        &agg,
-                        src_rg,
-                        &meta_const,
-                        rg_src,
-                        filter_opt,
-                        fetch_arr,
-                        output_specs,
-                        streamed,
-                    );
-                    if (!ok) return err;
-                    continue;
-                };
-                t.core.rows_scanned += @intCast(src_rg.num_rows);
-                t.core.rows_matched += matched;
-
-                const print_span = profile.Span.begin(prof);
-                try flushAggregator(&agg, names, &stdout_writer, is_jsonl, limit, &total_printed);
-                print_span.end(.sink_write, profile.args(.{agg.num_rows}));
-                consumer.resetAggregator(&agg);
-            }
-        }
-    }
+    const counts = try printRows(ctx, arena, args, opened, metas, proj, &agg, names, &stdout_writer, format, limit, offset, &t);
+    const total_printed = counts.rows;
+    const rgs_in = counts.groups;
+    const rgs_pruned = counts.pruned;
 
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
     const finish_start = nowMonoNs();
@@ -1029,7 +875,6 @@ fn runPrintSinkOver(
     };
     return .{ .rows_in = all_rows, .rows_scanned = t.core.rows_scanned, .rows_matched = t.core.rows_matched, .row_groups_in = rgs_in, .row_groups_pruned = rgs_pruned, .rows = total_printed, .bytes_out = if (format == .parquet) parquet.out_offset else stdout_writer.bytes_written, .output_ns = stdout_writer.output_ns, .membership = opened.membership, .timings = t };
 }
-
 
 test "limited Parquet row sink restores borrowed buffers on every allocation failure" {
     const Test = struct {
@@ -1080,7 +925,6 @@ test "limited Parquet row sink restores borrowed buffers on every allocation fai
     defer local_fs.close(fd);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Test.run, .{fd});
 }
-
 
 test "in-process text sink flushes across buffer boundaries and allocation failures" {
     const Check = struct {
@@ -1172,3 +1016,183 @@ test "CSV: temporal text, bytes under the JSON rules, quoting, NULL and the empt
     , w.buffered());
 }
 
+const PrintCounts = struct { rows: usize, groups: usize, pruned: usize };
+
+fn printRows(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    opened: OpenedInputs,
+    metas: []const schema.FileMetaData,
+    proj: engine_projection.ProjectionPlan,
+    agg: *consumer.OutputAggregator,
+    names: []const []const u8,
+    stdout_writer: *StdoutWriter,
+    format: PrintFormat,
+    limit: ?usize,
+    offset: usize,
+    t: *Timings,
+) !PrintCounts {
+    const prof = profile.threadOf(args.profiler, .main);
+    const output_specs = proj.output_specs;
+    const filter_opt = proj.filter;
+    const fetch_arr = proj.fetch;
+    const meta0 = &metas[0];
+    const is_jsonl = format != .csv;
+    var total_printed: usize = 0;
+    var rgs_in: usize = 0;
+    var rgs_pruned: usize = 0;
+    if (proj.row_keys.len > 0) {
+        // Without a LIMIT every row is kept and sorted, within half the memory budget (as decoded rows are).
+        const keep = if (limit) |l| offset +| l else std.math.maxInt(usize);
+        // With a LIMIT, row groups go most promising first, and one whose statistics cannot beat the heap's last row
+        // is passed over. Ties keep their input positions (`RowPos`), so the order read changes no answer. Only over
+        // bare columns: a computed output or key can fail on a row (`100 / id`), and passing over its group would
+        // answer where reading in order raises the error. Filter leaves compare a column with a literal and never fail.
+        const bounded = limit != null and !args.scan_all and allPassthrough(output_specs, proj.row_keys);
+        const items = if (limit != 0) try rankRowGroups(arena, opened.inputs, metas, proj.row_keys[0], bounded) else try arena.alloc(RankedRG, 0);
+        for (items) |item| {
+            const meta_i = &metas[item.file];
+            const rg = &meta_i.row_groups.items[item.rg];
+            // Every ranked row group is visited, by the gather workers or the loop below, and pruned by the same
+            // footer-only decision, so they are counted here once.
+            rgs_in += 1;
+            if (filter_opt) |f| if (!args.scan_all) {
+                if (filter_prune.pruneRowGroup(rg, f, meta_i) == .skip) rgs_pruned += 1;
+            };
+        }
+        var gathered = if (gatherEligible(ctx.env, opened.inputs, meta0, limit, keep, output_specs, proj.row_keys))
+            try rankAndGather(ctx, arena, args, opened.inputs, metas, filter_opt, fetch_arr, output_specs, proj.row_keys, keep, items, t)
+        else
+            null;
+        defer if (gathered) |*g| g.deinit();
+        var ranked = if (gathered) |g| g.out else ranked: {
+            const top_limit = topnLimit(ctx, args, opened.inputs);
+            var top: TopRows = try .init(ctx.gpa, meta0, output_specs, proj.row_keys, keep, top_limit);
+            defer top.deinit();
+            for (items) |item| {
+                const in = opened.inputs[item.file];
+                const meta_i = &metas[item.file];
+                const rg_i: usize = item.rg;
+                const src_rg = &meta_i.row_groups.items[rg_i];
+                if (filter_opt) |f| if (!args.scan_all) {
+                    if (filter_prune.pruneRowGroup(src_rg, f, meta_i) == .skip) {
+                        skipRowGroup(in, rg_i);
+                        continue;
+                    }
+                };
+                if (item.best) |best| if (top.cutsOff(best)) {
+                    skipRowGroup(in, rg_i);
+                    continue;
+                };
+                if (in.gate) |g| try g.wait(g.ctx, rg_i);
+                defer skipRowGroup(in, rg_i);
+                try top.offer(src_rg, meta_i, .{ .bytes = in.bytes, .byte_origin = 0 }, filter_opt, fetch_arr, .{
+                    .file = item.file,
+                    .rg = item.rg,
+                }, &t.core, .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory });
+            }
+            break :ranked try top.ranked(arena);
+        };
+        const print_span = profile.Span.begin(prof);
+        try flushAggregator(&ranked, names, stdout_writer, is_jsonl, limit, &total_printed);
+        print_span.end(.sink_write, profile.args(.{ranked.num_rows}));
+    } else {
+        var print_scratch: ?*consumer.SliceScratch = null;
+        defer consumer.releaseSlicePool(&print_scratch);
+        for (opened.inputs, metas, 0..) |in, meta_i, file_i| {
+            const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
+            const meta_const = meta_i;
+            for (meta_const.row_groups.items, 0..) |*src_rg, rg_i| {
+                if (limit) |lim| {
+                    if (total_printed >= lim) break;
+                }
+
+                rgs_in += 1;
+
+                const rg_span = profile.Span.begin(prof);
+                var skipped = false;
+                defer {
+                    const decision: u8 = if (skipped) 0 else 2;
+                    rg_span.end(.row_group, profile.args(.{ file_i, rg_i, decision, src_rg.num_rows }));
+                }
+                if (filter_opt) |f| if (!args.scan_all) {
+                    if (filter_prune.pruneRowGroup(src_rg, f, &meta_const) == .skip) {
+                        skipped = true;
+                        rgs_pruned += 1;
+                        skipRowGroup(in, rg_i);
+                        continue;
+                    }
+                };
+                if (in.gate) |g| try g.wait(g.ctx, rg_i);
+                defer skipRowGroup(in, rg_i);
+
+                // A row group too big to hold decoded prints a slice of rows at a time.
+                const sliced: SlicedPrint = .{
+                    .names = names,
+                    .writer = stdout_writer,
+                    .is_jsonl = is_jsonl,
+                    .limit = limit,
+                    .total_printed = &total_printed,
+                    .budget = args.max_memory / 2,
+                    .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+                    .counts = &t.core,
+                    .scratch = &print_scratch,
+                };
+                const printed = try printRowGroupSliced(
+                    ctx.gpa,
+                    agg,
+                    src_rg,
+                    &meta_const,
+                    rg_src,
+                    filter_opt,
+                    fetch_arr,
+                    output_specs,
+                    sliced,
+                );
+                if (printed) continue;
+
+                const matched = consumer.appendProjectedRGWithOptions(
+                    agg,
+                    ctx.gpa,
+                    src_rg,
+                    &meta_const,
+                    rg_src,
+                    filter_opt,
+                    fetch_arr,
+                    output_specs,
+                    &t.core,
+                    .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+                ) catch |err| {
+                    // Values that expand past the budget held whole may still print a slice of rows at a time.
+                    if (err != error.DecodeExceededBudget) return err;
+                    consumer.resetAggregator(agg);
+                    var streamed = sliced;
+                    streamed.force = true;
+                    const ok = try printRowGroupSliced(
+                        ctx.gpa,
+                        agg,
+                        src_rg,
+                        &meta_const,
+                        rg_src,
+                        filter_opt,
+                        fetch_arr,
+                        output_specs,
+                        streamed,
+                    );
+                    if (!ok) return err;
+                    continue;
+                };
+                t.core.rows_scanned += @intCast(src_rg.num_rows);
+                t.core.rows_matched += matched;
+
+                const print_span = profile.Span.begin(prof);
+                try flushAggregator(agg, names, stdout_writer, is_jsonl, limit, &total_printed);
+                print_span.end(.sink_write, profile.args(.{agg.num_rows}));
+                consumer.resetAggregator(agg);
+            }
+        }
+    }
+
+    return .{ .rows = total_printed, .groups = rgs_in, .pruned = rgs_pruned };
+}

@@ -712,7 +712,7 @@ fn recompressRowGroupPages(
     return done;
 }
 
-fn reportRecompressError(err: anyerror, m: schema.ColumnMetaData, to: schema.CompressionCodec) anyerror {
+fn reportRecompressError(err: anytype, m: schema.ColumnMetaData, to: schema.CompressionCodec) @TypeOf(err) {
     if (err == error.UnsupportedCodec) {
         const msg = "zpq: cannot recompress column `{s}` to {s}: its pages use {s}, which zpq cannot decompress\n";
         std.debug.print(msg, .{
@@ -859,4 +859,3 @@ fn copyChunkRecompressed(
     try out.write(oi_w.bytes());
     return chunk;
 }
-

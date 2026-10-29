@@ -83,6 +83,7 @@ pub const updateSharedInteger = scalar_mod.updateSharedInteger;
 pub const minTotal = scalar_mod.minTotal;
 pub const maxTotal = scalar_mod.maxTotal;
 pub const foldExtremeF = scalar_mod.foldExtremeF;
+pub const foldExtremeI = scalar_mod.foldExtremeI;
 pub const prefix16 = scalar_mod.prefix16;
 pub const intersectPresentMask = scalar_mod.intersectPresentMask;
 pub const sumBlocksF64 = scalar_mod.sumBlocksF64;

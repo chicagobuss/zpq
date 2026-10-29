@@ -15,6 +15,7 @@ const scalar = @import("scalar.zig");
 const PreparedAggInput = scalar.PreparedAggInput;
 const exactAt = scalar.exactAt;
 const foldExtremeF = scalar.foldExtremeF;
+const foldExtremeI = scalar.foldExtremeI;
 const isRowNull = @import("contracts.zig").isRowNull;
 const splitMix64 = @import("census.zig").splitMix64;
 
@@ -534,24 +535,37 @@ fn foldDistinctU64(
     }
 }
 
+/// Row `r` of an integer lane as an unscaled i128 (a UInt64 column keeps its bits in the i64 lane); null for any
+/// other lane.
+inline fn intAt(col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) ?i128 {
+    return switch (col) {
+        .i32 => |c| c.values[r],
+        .i64 => |c| if (unsigned_64) @as(u64, @bitCast(c.values[r])) else c.values[r],
+        else => null,
+    };
+}
+
+/// Row `r` of a float lane widened to f64; null for any other lane.
+inline fn floatAt(col: filter_eval.Batch.Column, r: usize) ?f64 {
+    return switch (col) {
+        .f32 => |c| c.values[r],
+        .f64 => |c| c.values[r],
+        else => null,
+    };
+}
+
+// The per-row folds below stay apart from scalar.zig's batch folds (foldSum, foldMin, foldMax, foldAvg). A scalar fold
+// reduces a whole selection with the SIMD and 64-row-block kernels; a group folds one row into the slot its id
+// names. Integer results agree, but a float sum or average does not: the block order and the row-at-a-time order
+// round differently, and each is part of the answer its path has always given. What does match is shared: the lane
+// widening (`intAt`, `floatAt`, `exactAt`) and the min/max slot update (`foldExtremeI`, `foldExtremeF`).
 fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool, offset: i64) Error!void {
     switch (state.*) {
         .sum_i => |*s| {
-            const v = switch (col) {
-                .i32 => |c| @as(i128, c.values[r]),
-                .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
-                else => return error.UnsupportedAggType,
-            };
+            const v = intAt(col, r, unsigned_64) orelse return error.UnsupportedAggType;
             s.* = (s.* orelse 0) + v + offset;
         },
-        .sum_f => |*s| {
-            const v = switch (col) {
-                .f32 => |c| @as(f64, c.values[r]),
-                .f64 => |c| c.values[r],
-                else => return error.UnsupportedAggType,
-            };
-            s.* = (s.* orelse 0) + v;
-        },
+        .sum_f => |*s| s.* = (s.* orelse 0) + (floatAt(col, r) orelse return error.UnsupportedAggType),
         .sum_d => |*d| d.add(exactAt(col, r), 1),
         else => return error.UnsupportedAggType,
     }
@@ -559,52 +573,18 @@ fn foldSumGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usiz
 
 fn foldMinGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) void {
     switch (state.*) {
-        .min_i => |*m| {
-            const v = switch (col) {
-                .i32 => |c| @as(i128, c.values[r]),
-                .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
-                else => unreachable,
-            };
-            if (m.* == null or v < m.*.?) m.* = v;
-        },
-        .min_f => |*m| {
-            const v = switch (col) {
-                .f32 => |c| @as(f64, c.values[r]),
-                .f64 => |c| c.values[r],
-                else => unreachable,
-            };
-            foldExtremeF(true, m, v);
-        },
-        .min_d => |*m| {
-            const v = exactAt(col, r);
-            if (m.* == null or v < m.*.?) m.* = v;
-        },
+        .min_i => |*m| foldExtremeI(true, m, intAt(col, r, unsigned_64) orelse unreachable),
+        .min_f => |*m| foldExtremeF(true, m, floatAt(col, r) orelse unreachable),
+        .min_d => |*m| foldExtremeI(true, m, exactAt(col, r)),
         else => unreachable,
     }
 }
 
 fn foldMaxGroupedOne(state: *Accumulator, col: filter_eval.Batch.Column, r: usize, unsigned_64: bool) void {
     switch (state.*) {
-        .max_i => |*m| {
-            const v = switch (col) {
-                .i32 => |c| @as(i128, c.values[r]),
-                .i64 => |c| if (unsigned_64) @as(i128, @intCast(@as(u64, @bitCast(c.values[r])))) else @as(i128, c.values[r]),
-                else => unreachable,
-            };
-            if (m.* == null or v > m.*.?) m.* = v;
-        },
-        .max_f => |*m| {
-            const v = switch (col) {
-                .f32 => |c| @as(f64, c.values[r]),
-                .f64 => |c| c.values[r],
-                else => unreachable,
-            };
-            foldExtremeF(false, m, v);
-        },
-        .max_d => |*m| {
-            const v = exactAt(col, r);
-            if (m.* == null or v > m.*.?) m.* = v;
-        },
+        .max_i => |*m| foldExtremeI(false, m, intAt(col, r, unsigned_64) orelse unreachable),
+        .max_f => |*m| foldExtremeF(false, m, floatAt(col, r) orelse unreachable),
+        .max_d => |*m| foldExtremeI(false, m, exactAt(col, r)),
         else => unreachable,
     }
 }

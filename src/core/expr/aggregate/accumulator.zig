@@ -11,6 +11,7 @@ const DistinctAcc = @import("distinct.zig").DistinctAcc;
 const KeyArena = @import("contracts.zig").KeyArena;
 const keyEql = @import("../../bytes.zig").keyEql;
 const foldExtremeF = @import("contracts.zig").foldExtremeF;
+const foldExtremeI = @import("contracts.zig").foldExtremeI;
 
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right
@@ -155,13 +156,9 @@ pub const Accumulator = union(enum) {
             .sum_f => |*s| if (src.sum_f) |sv| {
                 s.* = (s.* orelse 0) + sv;
             },
-            .min_i => |*m| if (src.min_i) |sv| {
-                if (m.* == null or sv < m.*.?) m.* = sv;
-            },
+            .min_i => |*m| if (src.min_i) |sv| foldExtremeI(true, m, sv),
             .min_f => |*m| if (src.min_f) |sv| foldExtremeF(true, m, sv),
-            .max_i => |*m| if (src.max_i) |sv| {
-                if (m.* == null or sv > m.*.?) m.* = sv;
-            },
+            .max_i => |*m| if (src.max_i) |sv| foldExtremeI(false, m, sv),
             .max_f => |*m| if (src.max_f) |sv| foldExtremeF(false, m, sv),
             // Pointer copy: both src and the merged dst hold slices dup'd
             // into the shared persist allocator. We free the loser to prevent leaks.
@@ -199,12 +196,8 @@ pub const Accumulator = union(enum) {
             },
             .sum_d => |*d| d.add(src.sum_d.get(), src.sum_d.n),
             .avg_d => |*d| d.add(src.avg_d.get(), src.avg_d.n),
-            .min_d => |*m| if (src.min_d) |sv| {
-                if (m.* == null or sv < m.*.?) m.* = sv;
-            },
-            .max_d => |*m| if (src.max_d) |sv| {
-                if (m.* == null or sv > m.*.?) m.* = sv;
-            },
+            .min_d => |*m| if (src.min_d) |sv| foldExtremeI(true, m, sv),
+            .max_d => |*m| if (src.max_d) |sv| foldExtremeI(false, m, sv),
         }
     }
 };

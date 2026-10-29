@@ -286,7 +286,7 @@ fn foldHist(
             for (hist, dict.i64.values) |h, v| {
                 if (h == 0) continue;
                 const x: i128 = if (unsigned_64) @as(u64, @bitCast(v)) else v;
-                if (m.* == null or (is_min and x < m.*.?) or (!is_min and x > m.*.?)) m.* = x;
+                if (is_min) agg.foldExtremeI(true, m, x) else agg.foldExtremeI(false, m, x);
             }
         },
         .min_f, .max_f => |*m| {
@@ -364,7 +364,7 @@ fn foldHist(
             switch (dict) {
                 inline .i32, .i64, .i128 => |dc| for (hist, dc.values) |h, v| {
                     if (h == 0) continue;
-                    m.* = if (m.*) |cur| (if (is_min) @min(cur, v) else @max(cur, v)) else v;
+                    if (is_min) agg.foldExtremeI(true, m, v) else agg.foldExtremeI(false, m, v);
                 },
                 else => return error.UnsupportedAggType,
             }
@@ -2201,12 +2201,12 @@ fn foldGroupedNumeric(
                         a.isum += part[cp];
                         a.count += seen[cp];
                     },
-                    .min_i => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],
-                    .max_i => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
+                    .min_i => |*m| agg.foldExtremeI(true, m, part[cp]),
+                    .max_i => |*m| agg.foldExtremeI(false, m, part[cp]),
                     // An INT32/INT64-backed DECIMAL, folded as the integers it is stored as.
                     .sum_d, .avg_d => |*d| d.add(part[cp], seen[cp]),
-                    .min_d => |*m| m.* = if (m.*) |cur| @min(cur, part[cp]) else part[cp],
-                    .max_d => |*m| m.* = if (m.*) |cur| @max(cur, part[cp]) else part[cp],
+                    .min_d => |*m| agg.foldExtremeI(true, m, part[cp]),
+                    .max_d => |*m| agg.foldExtremeI(false, m, part[cp]),
                     else => return error.UnsupportedAggType,
                 }
                 if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);
@@ -2243,8 +2243,8 @@ fn foldGroupedNumeric(
                 switch (st.*) {
                     .sum_d => |*d| d.add(sums[cp], seen[cp]),
                     .avg_d => |*d| d.add(sums[cp], seen[cp]),
-                    .min_d => |*m| m.* = if (m.*) |cur| @min(cur, ext[cp]) else ext[cp],
-                    .max_d => |*m| m.* = if (m.*) |cur| @max(cur, ext[cp]) else ext[cp],
+                    .min_d => |*m| agg.foldExtremeI(true, m, ext[cp]),
+                    .max_d => |*m| agg.foldExtremeI(false, m, ext[cp]),
                     else => return error.UnsupportedAggType,
                 }
                 if (table) |t| if (t.compact.stride != 0) t.writeAcc(gid_of[cp], ai, agg_len, st.*);

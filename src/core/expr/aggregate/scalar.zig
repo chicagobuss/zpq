@@ -242,6 +242,7 @@ const contracts = @import("contracts.zig");
 pub const minTotal = contracts.minTotal;
 pub const maxTotal = contracts.maxTotal;
 pub const foldExtremeF = contracts.foldExtremeF;
+pub const foldExtremeI = contracts.foldExtremeI;
 
 /// Whether this agg can be answered from row-group statistics
 /// alone, given whether the outer query has a `--filter`.
@@ -580,8 +581,8 @@ fn foldDecimalStatBytes(
         else => error.UnsupportedAggType,
     };
     switch (state.*) {
-        .min_d => |*m| m.* = if (m.*) |cur| @min(cur, v) else v,
-        .max_d => |*m| m.* = if (m.*) |cur| @max(cur, v) else v,
+        .min_d => |*m| foldExtremeI(true, m, v),
+        .max_d => |*m| foldExtremeI(false, m, v),
         else => return error.UnsupportedAggType,
     }
     _ = call;
@@ -608,10 +609,7 @@ fn foldStatBytes(
                 },
                 else => return error.UnsupportedAggType,
             };
-            slot.* = if (slot.*) |current|
-                (if (call.func == .min) @min(current, v) else @max(current, v))
-            else
-                v;
+            if (call.func == .min) foldExtremeI(true, slot, v) else foldExtremeI(false, slot, v);
         },
         .min_f, .max_f => |*slot| {
             const v: f64 = switch (parquet_type) {
@@ -1654,12 +1652,10 @@ fn foldMin(
             const v_opt: ?i128 = if (unsigned_64)
                 minMaxU64(true, col.i64.values, sel)
             else if (simdMinMaxI64(true, col.i64.values, sel)) |v| @as(i128, v) else null;
-            if (v_opt) |v| s.* = if (s.*) |current| @min(current, v) else v;
+            if (v_opt) |v| foldExtremeI(true, s, v);
         },
         .min_f => |*s| if (simdMinMaxF64(true, col.f64.values, sel)) |v| foldExtremeF(true, s, v),
-        .min_d => |*s| if (extremeExact(true, col, sel)) |v| {
-            s.* = if (s.*) |cur| @min(cur, v) else v;
-        },
+        .min_d => |*s| if (extremeExact(true, col, sel)) |v| foldExtremeI(true, s, v),
         else => unreachable,
     }
 }
@@ -1675,12 +1671,10 @@ fn foldMax(
             const v_opt: ?i128 = if (unsigned_64)
                 minMaxU64(false, col.i64.values, sel)
             else if (simdMinMaxI64(false, col.i64.values, sel)) |v| @as(i128, v) else null;
-            if (v_opt) |v| s.* = if (s.*) |current| @max(current, v) else v;
+            if (v_opt) |v| foldExtremeI(false, s, v);
         },
         .max_f => |*s| if (simdMinMaxF64(false, col.f64.values, sel)) |v| foldExtremeF(false, s, v),
-        .max_d => |*s| if (extremeExact(false, col, sel)) |v| {
-            s.* = if (s.*) |cur| @max(cur, v) else v;
-        },
+        .max_d => |*s| if (extremeExact(false, col, sel)) |v| foldExtremeI(false, s, v),
         else => unreachable,
     }
 }

@@ -28,6 +28,14 @@ pub inline fn foldExtremeF(comptime is_min: bool, slot: *?f64, v: f64) void {
     slot.* = if (slot.*) |cur| (if (is_min) minTotal(cur, v) else maxTotal(cur, v)) else v;
 }
 
+/// Fold `v` into an integer or exact-decimal min (`is_min`) or max accumulator slot. An empty slot (no value yet, so
+/// NULL) takes it. Integers have no NaN or zero-sign cases, so the order values arrive in cannot change the result.
+pub inline fn foldExtremeI(comptime is_min: bool, slot: *?i128, v: i128) void {
+    if (slot.*) |cur| {
+        if (if (is_min) v < cur else v > cur) slot.* = v;
+    } else slot.* = v;
+}
+
 
 
 pub fn isRowNull(col: filter_eval.Batch.Column, r: usize) bool {

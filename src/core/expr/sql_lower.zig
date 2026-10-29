@@ -98,6 +98,8 @@ pub const Lower = struct {
     }
 
     fn operand(self: *Lower, node: *const c.LpNode) !syntax.Operand {
+        if (node.kind == c.LP_EXPR_BINARY_OP and node.u.binary.op == c.LP_OP_MOD)
+            return error.ModuloNotSupported;
         if (node.kind == c.LP_EXPR_COLUMN_REF) return .{ .column = try self.name(node) };
         if (node.kind == c.LP_EXPR_FUNCTION) {
             const f = node.u.function;
@@ -112,7 +114,7 @@ pub const Lower = struct {
         switch (node.kind) {
             c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_NULL, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_BOOL => {},
             c.LP_EXPR_UNARY_OP => {
-                if (node.u.unary.op != c.LP_UOP_MINUS) return error.BadValue;
+                if (node.u.unary.op != c.LP_UOP_MINUS and node.u.unary.op != c.LP_UOP_PLUS) return error.BadValue;
                 const value: *const c.LpNode = node.u.unary.operand orelse return error.BadValue;
                 if (value.kind != c.LP_EXPR_LITERAL_INT and value.kind != c.LP_EXPR_LITERAL_FLOAT) return error.BadValue;
             },

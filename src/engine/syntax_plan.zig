@@ -83,6 +83,8 @@ fn bind(raw: *const anyopaque, arena: std.mem.Allocator, meta: *const schema.Fil
         });
         return .{ .aggregate = .{ .calls = calls, .keys = keys, .outputs = outputs, .filter = filter } };
     }
+    var names = try scan.scan_binding.KeyNames.init(arena, meta, &.{});
+    try scan.scan_binding.nameUnaliasedAggs(arena, calls, &names);
     try scan.scan_binding.checkAggAliases(calls, diag);
     return .{ .aggregate = .{ .calls = calls, .filter = filter } };
 }

@@ -245,6 +245,8 @@ test "syntax: SQL hands the engine owned nodes and separate aliases and output s
     const ctx: types.Context = .{ .gpa = a, .env = .empty, .io = std.testing.io };
     for ([_][]const u8{
         "SELECT sum(x) AS \"a a\", sum(x) AS \"b b\" FROM 'ci/fixtures/parquet/full_match.parquet'",
+        "SELECT sum(n), sum(x) FROM 'ci/fixtures/parquet/full_match.parquet'",
+        "SELECT count(*) AS c FROM 'ci/fixtures/parquet/full_match.parquet' WHERE x < +2.5e3 AND x > -1.5E2",
         "SELECT b AS flag, count(*) AS n FROM 'ci/fixtures/parquet/full_match.parquet' GROUP BY b HAVING sum(x) > 0 ORDER BY count(*) DESC LIMIT 2",
         "SELECT x AS value FROM 'ci/fixtures/parquet/full_match.parquet' WHERE NOT (x IN (1, NULL)) ORDER BY value DESC LIMIT 3",
         "SELECT b AS k, count(*) AS n FROM 'ci/fixtures/parquet/full_match.parquet' GROUP BY k ORDER BY n DESC",
@@ -399,6 +401,7 @@ test "syntax: unsupported SQL modifiers and casts retain refusal instead of drop
     const a = std.testing.allocator;
     try std.testing.expectError(error.TrailingTokens, sql.parseSqlPlan(a, "SELECT strlen(s) FILTER (WHERE b > 0) AS n FROM 'ci/fixtures/parquet/full_match.parquet'"));
     try std.testing.expectError(error.ExpectedRParen, sql.parseSqlPlan(a, "SELECT sum(n ORDER BY n) AS n FROM 'ci/fixtures/parquet/full_match.parquet'"));
+    try std.testing.expectError(error.ModuloNotSupported, sql.parseSqlPlan(a, "SELECT count(*) AS c FROM 'ci/fixtures/parquet/full_match.parquet' WHERE b % 2 = 1"));
     const parsed = try sql.parseSqlPlan(a, "SELECT sum(CAST(b AS BIGINT)) AS n FROM 'ci/fixtures/parquet/full_match.parquet'");
     defer parsed.deinit(a);
     try std.testing.expectError(error.UnknownFunction, aggregate.runQuery(.{ .gpa = a, .io = std.testing.io, .env = .empty }, .{

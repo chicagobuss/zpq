@@ -615,6 +615,8 @@ pub const Having = union(enum) {
 /// apart means no layer has to find it again in the text.
 pub const SelectColumn = struct {
     expr: []const u8,
+    /// Present when a frontend already bound this output expression; text remains a display name.
+    bound_expr: ?Expr = null,
     alias: ?[]const u8 = null,
     /// How a GROUP BY output binds. SQL knows which items aggregate: one does not bind by name but takes the next
     /// aggregate call, in order; any other must equal a GROUP BY key, compared as bound expressions (column, operator,

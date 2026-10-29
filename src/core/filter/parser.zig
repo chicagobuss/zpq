@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const syntax = @import("../expr/syntax.zig");
 const in_set = @import("in_set.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
@@ -64,7 +65,80 @@ pub fn parse(
 ) Error!ast.Filter {
     const trimmed = trimSpace(expr);
     if (trimmed.len == 0) return error.EmptyExpr;
-    return try parseDisjunction(arena, trimmed, file, diag, 0);
+    return try parseDisjunction(true, arena, trimmed, file, diag, 0);
+}
+
+fn FilterNode(comptime bound: bool) type {
+    return if (bound) ast.Filter else syntax.Predicate;
+}
+
+fn joinSyntax(comptime bound: bool, arena: std.mem.Allocator, conjunction: bool, terms: []const FilterNode(bound)) Error!FilterNode(bound) {
+    if (bound) return ast.join(arena, conjunction, terms);
+    if (terms.len == 1) return terms[0];
+    return if (conjunction) .{ .and_ = terms } else .{ .or_ = terms };
+}
+
+fn negateSyntax(arena: std.mem.Allocator, inner: syntax.Predicate) Error!syntax.Predicate {
+    const out = try arena.create(syntax.Predicate);
+    out.* = inner;
+    return .{ .not_ = out };
+}
+
+fn parseOperandSyntax(text: []const u8) Error!syntax.Operand {
+    const open = std.mem.indexOfScalar(u8, text, '(') orelse return .{ .column = text };
+    if (!std.ascii.eqlIgnoreCase(trimSpace(text[0..open]), "make_date")) return error.BadOperator;
+    const arg = (try groupBody(text[open..])) orelse return error.BadOperator;
+    return .{ .column = arg, .make_date = true };
+}
+
+pub fn parseSyntax(arena: std.mem.Allocator, expr: []const u8) Error!syntax.Predicate {
+    const trimmed = trimSpace(expr);
+    if (trimmed.len == 0) return error.EmptyExpr;
+    return parseDisjunction(false, arena, trimmed, undefined, null, 0);
+}
+
+pub fn bindSyntax(arena: std.mem.Allocator, node: syntax.Predicate, file: *const schema.FileMetaData, diag: ?*Diag) Error!ast.Filter {
+    return bindSyntaxAt(arena, node, file, diag, 0);
+}
+
+fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Predicate, file: *const schema.FileMetaData, diag: ?*Diag, depth: u32) Error!ast.Filter {
+    // Each source grouping level can produce AND, OR and NOT wrappers.
+    if (depth > MAX_GROUP_DEPTH * 3) return error.FilterTooDeep;
+    return switch (node) {
+        .and_, .or_ => |terms| blk: {
+            if (terms.len == 0) return error.BadOperator;
+            const children = try arena.alloc(ast.Filter, terms.len);
+            for (terms, children) |term, *out| out.* = try bindSyntaxAt(arena, term, file, diag, depth + 1);
+            break :blk ast.join(arena, node == .and_, children);
+        },
+        .not_ => |inner| negateFilter(arena, try bindSyntaxAt(arena, inner.*, file, diag, depth + 1)),
+        .comparison => |c| blk: {
+            const operand = try bindOperand(file, c.operand.column, c.operand.make_date, diag);
+            break :blk if (isNullLiteral(c.value)) unknown else buildOperandComparison(arena, file, operand, c.op, c.value, diag);
+        },
+        .null_check => |n| .{ .null_check = .{ .col_idx = try resolveCol(file, n.column, diag), .is_not = n.is_not } },
+        .like => |l| parseLike(true, arena, l.column, l.pattern, l.negate, file, diag),
+        .boolean => |name| bareBoolean(true, arena, name, file, diag),
+        .in_list => |list| blk: {
+            if (list.values.len == 0) return error.BadValue;
+            const operand = try bindOperand(file, list.operand.column, list.operand.make_date, diag);
+            var leaves: std.ArrayList(ast.Filter) = .empty;
+            var has_null = false;
+            for (list.values) |value| {
+                if (value.len == 0) return error.BadValue;
+                if (isNullLiteral(value)) has_null = true else try leaves.append(arena, try buildOperandComparison(arena, file, operand, if (list.negate) .NotEq else .Eq, value, diag));
+            }
+            break :blk bindIn(arena, operand.col_idx, list.negate, leaves.items, has_null);
+        },
+        .between => |b| blk: {
+            const operand = try bindOperand(file, b.operand.column, b.operand.make_date, diag);
+            const inner = try ast.join(arena, true, &.{
+                if (isNullLiteral(b.low)) unknown else try buildOperandComparison(arena, file, operand, .GtEq, b.low, diag),
+                if (isNullLiteral(b.high)) unknown else try buildOperandComparison(arena, file, operand, .LtEq, b.high, diag),
+            });
+            break :blk if (b.negate) negateFilter(arena, inner) else inner;
+        },
+    };
 }
 
 fn trimSpace(s: []const u8) []const u8 {
@@ -183,34 +257,36 @@ fn isKeyword(src: []const u8, w: Word, kw: []const u8) bool {
 /// Split at every outermost ` OR ` into one flat OR node: a loop, not recursion, so a chain of any length costs no
 /// stack.
 fn parseDisjunction(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
     depth: u32,
-) Error!ast.Filter {
-    var terms: std.ArrayList(ast.Filter) = .empty;
+) Error!FilterNode(bound) {
+    var terms: std.ArrayList(FilterNode(bound)) = .empty;
     var cur: Cursor = .{ .src = expr };
     var start: usize = 0;
     while (try cur.nextWord()) |w| {
         if (!isKeyword(expr, w, "OR")) continue;
-        try terms.append(arena, try parseConjunction(arena, trimSpace(expr[start..w.start]), file, diag, depth));
+        try terms.append(arena, try parseConjunction(bound, arena, trimSpace(expr[start..w.start]), file, diag, depth));
         start = w.end;
     }
-    try terms.append(arena, try parseConjunction(arena, trimSpace(expr[start..]), file, diag, depth));
-    return ast.join(arena, false, terms.items);
+    try terms.append(arena, try parseConjunction(bound, arena, trimSpace(expr[start..]), file, diag, depth));
+    return joinSyntax(bound, arena, false, terms.items);
 }
 
 /// Split at every outermost ` AND ` that does not pair with a `BETWEEN`: the next AND after each BETWEEN belongs to
 /// its bounds.
 fn parseConjunction(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
     depth: u32,
-) Error!ast.Filter {
-    var terms: std.ArrayList(ast.Filter) = .empty;
+) Error!FilterNode(bound) {
+    var terms: std.ArrayList(FilterNode(bound)) = .empty;
     var cur: Cursor = .{ .src = expr };
     var start: usize = 0;
     var bounds_pending: usize = 0;
@@ -222,13 +298,13 @@ fn parseConjunction(
                 bounds_pending -= 1;
                 continue;
             }
-            try terms.append(arena, try parseNegation(arena, trimSpace(expr[start..w.start]), file, diag, depth));
+            try terms.append(arena, try parseNegation(bound, arena, trimSpace(expr[start..w.start]), file, diag, depth));
             start = w.end;
         }
     }
-    try terms.append(arena, try parseNegation(arena, trimSpace(expr[start..]), file, diag, depth));
+    try terms.append(arena, try parseNegation(bound, arena, trimSpace(expr[start..]), file, diag, depth));
     // A BETWEEN's two bounds join the chain they sit in.
-    return ast.join(arena, true, terms.items);
+    return joinSyntax(bound, arena, true, terms.items);
 }
 
 /// A run of leading NOTs, then a parenthesized group or a leaf. The run is counted, not recursed into: only its
@@ -236,12 +312,13 @@ fn parseConjunction(
 /// leaves, De Morgan on composites), never a complement of the rows that passed, so a row whose operand is NULL
 /// (UNKNOWN) fails both `p` and `NOT p`.
 fn parseNegation(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
     depth: u32,
-) Error!ast.Filter {
+) Error!FilterNode(bound) {
     var negated = false;
     var body = expr;
     while (body.len > 3 and std.ascii.eqlIgnoreCase(body[0..3], "NOT") and (isSpace(body[3]) or body[3] == '(')) {
@@ -251,9 +328,9 @@ fn parseNegation(
     if (body.len == 0) return error.BadOperator;
     const inner = if (try groupBody(body)) |group| blk: {
         if (depth + 1 > MAX_GROUP_DEPTH) return error.FilterTooDeep;
-        break :blk try parseDisjunction(arena, group, file, diag, depth + 1);
-    } else try parseLeafBody(arena, body, file, diag);
-    return if (negated) negateFilter(arena, inner) else inner;
+        break :blk try parseDisjunction(bound, arena, group, file, diag, depth + 1);
+    } else try parseLeafBody(bound, arena, body, file, diag);
+    return if (!negated) inner else if (bound) negateFilter(arena, inner) else negateSyntax(arena, inner);
 }
 
 /// The inside of `term` when the whole of it is one parenthesized group, else null.
@@ -286,7 +363,7 @@ fn groupBody(term: []const u8) Error!?[]const u8 {
 /// Resolve a (possibly double-quoted) column name to its leaf index. See
 /// `metadata.resolveColumn` for how bare and dotted names bind.
 /// A repeated column is refused here, before statistics could answer for it without the decode that refuses it.
-fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) Error!usize {
+pub fn resolveCol(file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) Error!usize {
     const ident = metadata.unquoteIdent(name);
     const ci = metadata.resolveColumn(file, ident) catch |err| {
         if (err == error.AmbiguousColumn) Diag.set(diag, ident, .{ .ambiguous_column = .{
@@ -325,45 +402,47 @@ fn operatorOutsideQuotes(name: []const u8) Error!?u8 {
 }
 
 fn parseLeafBody(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error!ast.Filter {
+) Error!FilterNode(bound) {
     // `col IS NULL` / `col IS NOT NULL` — a def-level predicate, no value.
     // Checked before IN/BETWEEN/comparison since it has no binary operator.
-    if (try tryParseNullCheck(expr, file, diag)) |nc| return nc;
+    if (try tryParseNullCheck(bound, expr, file, diag)) |nc| return nc;
 
     // `col LIKE 'pat'` / `col NOT LIKE 'pat'` — SQL wildcard match.
     // " NOT LIKE " must be checked first (it contains " LIKE ").
     if (try topLevelIndexOf(expr, " NOT LIKE ")) |i| {
-        return parseLike(arena, expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
+        return parseLike(bound, arena, expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
     }
     if (try topLevelIndexOf(expr, " LIKE ")) |i| {
-        return parseLike(arena, expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
+        return parseLike(bound, arena, expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
     }
 
     // `col [NOT] IN (v1, v2, ...)` → OR-of-equalities (or AND-of-inequalities
     // for NOT IN), reusing the typed leaf builder per value.
     if (try findInClause(expr)) |inc| {
-        return parseInList(arena, expr, inc, file, diag);
+        return parseInList(bound, arena, expr, inc, file, diag);
     }
     // BETWEEN runs before operator detection — `col BETWEEN x AND y` has no
     // binary op the comparison-finder would recognize. `col NOT BETWEEN x AND y` is its negation.
     if (try topLevelIndexOf(expr, " NOT BETWEEN ")) |i| {
-        return negateFilter(arena, try parseBetween(arena, expr, i, " NOT BETWEEN ".len, file, diag));
+        const inner = try parseBetween(bound, arena, expr, i, " NOT BETWEEN ".len, file, diag);
+        return if (bound) negateFilter(arena, inner) else negateSyntax(arena, inner);
     }
     if (try topLevelIndexOf(expr, " BETWEEN ")) |i| {
-        return parseBetween(arena, expr, i, " BETWEEN ".len, file, diag);
+        return parseBetween(bound, arena, expr, i, " BETWEEN ".len, file, diag);
     }
-    return parseComparisonLeaf(arena, expr, file, diag);
+    return parseComparisonLeaf(bound, arena, expr, file, diag);
 }
 
 /// Recognise a trailing ` IS NULL` / ` IS NOT NULL` (case-insensitive).
 /// Returns null when the expression isn't a null check (so the caller
 /// falls through to the comparison path). A lone ` IS ` that isn't one
 /// of the two valid forms is a clear error, not a silent fallthrough.
-fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error!?ast.Filter {
+fn tryParseNullCheck(comptime bound: bool, expr: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error!?FilterNode(bound) {
     const not_null = " IS NOT NULL";
     const null_ = " IS NULL";
     var col_part: []const u8 = undefined;
@@ -382,6 +461,7 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?
     }
     const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
+    if (!bound) return .{ .null_check = .{ .column = col_name, .is_not = is_not } };
     const col_idx = try resolveCol(file, col_name, diag);
     return ast.Filter{ .null_check = .{ .col_idx = col_idx, .is_not = is_not } };
 }
@@ -391,15 +471,17 @@ fn tryParseNullCheck(expr: []const u8, file: *const schema.FileMetaData, diag: ?
 /// general matcher. LIKE is text-only — non-string columns are a clear
 /// error rather than a confusing type mismatch later.
 fn parseLike(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     col_part: []const u8,
     pat_part: []const u8,
     negate: bool,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error!ast.Filter {
+) Error!FilterNode(bound) {
     const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
+    if (!bound) return .{ .like = .{ .column = col_name, .pattern = trimSpace(pat_part), .negate = negate } };
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
@@ -448,24 +530,38 @@ fn findInClause(expr: []const u8) Error!?InClause {
 }
 
 fn parseInList(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     inc: InClause,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error!ast.Filter {
+) Error!FilterNode(bound) {
     const col_name = trimSpace(expr[0..inc.col_end]);
     const list = trimSpace(expr[inc.vals_start..]);
     if (col_name.len == 0 or list.len == 0) return error.BadOperator;
     // A parenthesized list, split at its outermost commas: a comma inside a quoted value is part of the value.
     const vals = (try groupBody(list)) orelse return error.BadOperator;
 
+    if (!bound) {
+        var values: std.ArrayList([]const u8) = .empty;
+        var cursor: Cursor = .{ .src = vals };
+        var from: usize = 0;
+        while (true) {
+            const comma = try cursor.find(",");
+            const value = trimSpace(vals[from .. comma orelse vals.len]);
+            if (value.len == 0) return error.BadValue;
+            try values.append(arena, value);
+            from = (comma orelse break) + 1;
+        }
+        return .{ .in_list = .{ .operand = try parseOperandSyntax(col_name), .values = values.items, .negate = inc.negated } };
+    }
     const operand = try resolveOperand(file, col_name, diag);
     const col_idx = operand.col_idx;
 
     // IN → OR of `= v`; NOT IN → AND of `!= v` (De Morgan).
     const leaf_op: ast.Operator = if (inc.negated) .NotEq else .Eq;
-    var leaves: std.ArrayList(ast.Filter) = .empty;
+    var leaves: std.ArrayList(FilterNode(bound)) = .empty;
     var null_member = false;
     var cur: Cursor = .{ .src = vals };
     var start: usize = 0;
@@ -479,14 +575,7 @@ fn parseInList(
         }
         start = (comma orelse break) + 1;
     }
-    // One node for the whole list, however long: OR of `= v` (AND of `!= v`), with its set bound beside the leaves.
-    if (leaves.items.len == 1 and !null_member) return leaves.items[0];
-    const c: ast.Composite = .{
-        .children = leaves.items,
-        .in_set = if (leaves.items.len > 1) try bindInSet(arena, col_idx, inc.negated, leaves.items) else null,
-        .null_member = null_member,
-    };
-    return if (inc.negated) .{ .and_filter = c } else .{ .or_filter = c };
+    return bindIn(arena, col_idx, inc.negated, leaves.items, null_member);
 }
 
 fn isNullLiteral(v: []const u8) bool {
@@ -494,11 +583,22 @@ fn isNullLiteral(v: []const u8) bool {
 }
 
 /// `x op NULL`: UNKNOWN for every row, which neither it nor its negation passes.
-const unknown: ast.Filter = .{ .or_filter = .{ .children = &.{}, .null_member = true } };
+pub const unknown: ast.Filter = .{ .or_filter = .{ .children = &.{}, .null_member = true } };
 
 /// The literals of an IN list bound for one-pass evaluation; null when its leaves are of a type the set doesn't hold
 /// (boolean) or one of them isn't a plain `=` (`!=` for NOT IN) or a constant, which then evaluate leaf by leaf.
-fn bindInSet(
+pub fn bindIn(arena: std.mem.Allocator, col_idx: usize, negated: bool, leaves: []const ast.Filter, null_member: bool) Error!ast.Filter {
+    // One node for the whole list, however long: OR of `= v` (AND of `!= v`), with its set bound beside the leaves.
+    if (leaves.len == 1 and !null_member) return leaves[0];
+    const c: ast.Composite = .{
+        .children = leaves,
+        .in_set = if (leaves.len > 1) try bindInSet(arena, col_idx, negated, leaves) else null,
+        .null_member = null_member,
+    };
+    return if (negated) .{ .and_filter = c } else .{ .or_filter = c };
+}
+
+pub fn bindInSet(
     arena: std.mem.Allocator,
     col_idx: usize,
     negated: bool,
@@ -565,7 +665,7 @@ fn constantLeaf(comptime T: type, leaf: ast.Leaf(T)) ?bool {
 /// Negate a filter subtree: flip leaf operators, De Morgan on composites.
 /// NULL handling matches zpq's "nulls don't pass" convention either way
 /// (both `NOT (x > 5)` and `x <= 5` exclude null rows).
-fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
+pub fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
     return switch (f) {
         // Negating keeps the value, so a stored literal stays one (`NOT x != 5` is `x = 5`).
         inline .int32, .int64, .uint64, .float, .double, .decimal, .string, .boolean => |l, tag| blk: {
@@ -594,13 +694,14 @@ fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
 /// Parse `col BETWEEN x AND y` (the keyword at `between_at`, `kw_len` long) into the conjunction
 /// `(col >= x AND col <= y)`. SQL semantics: BETWEEN is inclusive on both sides.
 fn parseBetween(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     between_at: usize,
     kw_len: usize,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error!ast.Filter {
+) Error!FilterNode(bound) {
     const after_between = between_at + kw_len;
     const and_at = (try topLevelIndexOf(expr[after_between..], " AND ")) orelse return error.BadOperator;
 
@@ -609,6 +710,7 @@ fn parseBetween(
     const y_str = trimSpace(expr[after_between + and_at + " AND ".len ..]);
     if (col_name.len == 0 or x_str.len == 0 or y_str.len == 0) return error.BadOperator;
 
+    if (!bound) return .{ .between = .{ .operand = try parseOperandSyntax(col_name), .low = x_str, .high = y_str, .negate = false } };
     const operand = try resolveOperand(file, col_name, diag);
 
     // Bounds bind exactly like `>=`/`<=` would. Binding on the bare physical type instead turned DECIMAL(FLBA)
@@ -621,12 +723,13 @@ fn parseBetween(
 }
 
 fn parseComparisonLeaf(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     expr: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error!ast.Filter {
-    const found = (try findComparison(expr)) orelse return bareBoolean(arena, expr, file, diag);
+) Error!FilterNode(bound) {
+    const found = (try findComparison(expr)) orelse return bareBoolean(bound, arena, expr, file, diag);
     const op = found.op;
     const found_at = found.at;
     const found_len = found.len;
@@ -634,6 +737,7 @@ fn parseComparisonLeaf(
     const col_name = trimSpace(expr[0..found_at]);
     const val_str = trimSpace(expr[found_at + found_len ..]);
     if (col_name.len == 0 or val_str.len == 0) return error.BadOperator;
+    if (!bound) return .{ .comparison = .{ .operand = try parseOperandSyntax(col_name), .op = op, .value = val_str } };
     if (isNullLiteral(val_str)) {
         _ = try resolveOperand(file, col_name, diag);
         return unknown;
@@ -643,24 +747,22 @@ fn parseComparisonLeaf(
 
 /// A comparison's column side: a column, or `make_date(c)` over an integer column. That is the DATE its integer
 /// counts, the same number, so the leaf compares (and statistics prune) the stored days themselves.
-const Operand = struct { col_idx: usize, elem: schema.SchemaElement, make_date: bool };
+pub const Operand = struct { col_idx: usize, elem: schema.SchemaElement, make_date: bool };
 
-fn resolveOperand(file: *const schema.FileMetaData, text: []const u8, diag: ?*Diag) Error!Operand {
-    const open = std.mem.indexOfScalar(u8, text, '(') orelse {
-        const col_idx = try resolveCol(file, text, diag);
-        const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-        return .{ .col_idx = col_idx, .elem = elem, .make_date = false };
-    };
-    // What parentheses are left here are no grouping: `(a + b) = 1` or `f(x) = 1`, which no leaf compares.
-    if (!std.ascii.eqlIgnoreCase(trimSpace(text[0..open]), "make_date")) return error.BadOperator;
-    const arg = (try groupBody(text[open..])) orelse return error.BadOperator;
-    const col_idx = try resolveCol(file, arg, diag);
+pub fn resolveOperand(file: *const schema.FileMetaData, text: []const u8, diag: ?*Diag) Error!Operand {
+    const operand = try parseOperandSyntax(text);
+    return bindOperand(file, operand.column, operand.make_date, diag);
+}
+
+/// Bind a structured column operand through the same repeated/type guards as fragment predicates.
+pub fn bindOperand(file: *const schema.FileMetaData, name: []const u8, make_date: bool, diag: ?*Diag) Error!Operand {
+    const col_idx = try resolveCol(file, name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-    if (!integerDays(&elem)) {
-        Diag.setColumn(diag, metadata.unquoteIdent(arg));
+    if (make_date and !integerDays(&elem)) {
+        Diag.setColumn(diag, metadata.unquoteIdent(name));
         return error.UnsupportedType;
     }
-    return .{ .col_idx = col_idx, .elem = elem, .make_date = true };
+    return .{ .col_idx = col_idx, .elem = elem, .make_date = make_date };
 }
 
 /// An INT32 column DuckDB's `make_date(INTEGER)` takes: plain, or an integer annotation it casts to INTEGER (signed
@@ -671,7 +773,7 @@ pub fn integerDays(elem: *const schema.SchemaElement) bool {
     return lt == .INTEGER and lt.INTEGER.bitWidth <= @as(i8, if (lt.INTEGER.isSigned) 32 else 16);
 }
 
-fn buildOperandComparison(
+pub fn buildOperandComparison(
     arena: std.mem.Allocator,
     file: *const schema.FileMetaData,
     operand: Operand,
@@ -689,7 +791,8 @@ fn buildOperandComparison(
 
 /// A leaf that is a column's name alone (`b`, `"b"`, `t.b`): SQL's bare BOOLEAN predicate, the same leaf as `b = true`
 /// (a NULL is not true, and under NOT stays out too). A column of another type is no predicate.
-fn bareBoolean(arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error!ast.Filter {
+fn bareBoolean(comptime bound: bool, arena: std.mem.Allocator, expr: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error!FilterNode(bound) {
+    if (expr.len == 0) return error.BadOperator;
     const lone = if (expr[0] == '"')
         try skipQuoted(expr, 0) == expr.len
     else for (expr) |c| {
@@ -697,6 +800,7 @@ fn bareBoolean(arena: std.mem.Allocator, expr: []const u8, file: *const schema.F
     } else true;
     if (!lone or isNullLiteral(expr) or std.ascii.eqlIgnoreCase(expr, "true") or std.ascii.eqlIgnoreCase(expr, "false"))
         return error.BadOperator;
+    if (!bound) return .{ .boolean = expr };
     const col_idx = try resolveCol(file, expr, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BOOLEAN) {
@@ -2992,4 +3096,31 @@ test "an AND runs its conjuncts cheapest first, keeping written order within a c
     const o = try parse(a, "status LIKE '%a%' OR (status LIKE '%b%' AND id = 1)", &meta, null);
     try testing.expect(o.or_filter.children[0] == .like);
     try testing.expect(o.or_filter.children[1].and_filter.children[0] == .int32);
+}
+
+test "syntax: structured predicates retain literal conversion and three-valued logic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const meta = try metadata.open(a, bytes);
+    for ([_][]const u8{
+        "x > 0",                 "x IS NULL",                    "s LIKE 'O%'", "x BETWEEN NULL AND 2", "NOT (x IN (1, NULL) OR x = 4)",
+        "x NOT IN (1, 2, NULL)", "make_date(b) >= '1970-01-01'",
+    }) |text| {
+        const direct = parse(a, text, &meta, null) catch |err| {
+            std.debug.print("direct predicate {s}: {s}\n", .{ text, @errorName(err) });
+            return err;
+        };
+        const node = parseSyntax(a, text) catch |err| {
+            std.debug.print("syntax predicate {s}: {s}\n", .{ text, @errorName(err) });
+            return err;
+        };
+        const got = bindSyntax(a, node, &meta, null) catch |err| {
+            std.debug.print("bound predicate {s}: {s}\n", .{ text, @errorName(err) });
+            return err;
+        };
+        try std.testing.expect(ast.eql(direct, got));
+    }
 }

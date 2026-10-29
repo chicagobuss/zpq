@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const syntax = @import("syntax.zig");
 const agg = @import("agg.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
@@ -254,20 +255,127 @@ fn aliasName(arena: std.mem.Allocator, text: []const u8) Error![]const u8 {
     return std.mem.replaceOwned(u8, arena, text[1 .. text.len - 1], "\"\"", "\"");
 }
 
-pub fn parseSelect(
+fn ExprNode(comptime bound: bool) type {
+    return if (bound) ast.Expr else syntax.Expr;
+}
+fn AggNode(comptime bound: bool) type {
+    return if (bound) agg.AggCall else syntax.Aggregate;
+}
+fn SelectNode(comptime bound: bool) type {
+    return if (bound) ast.SelectItem else syntax.SelectItem;
+}
+fn PredicateNode(comptime bound: bool) type {
+    return if (bound) filter_ast.Filter else syntax.Predicate;
+}
+
+fn syntaxArgs(arena: std.mem.Allocator, args: []const *syntax.Expr) Error![]const *const syntax.Expr {
+    const out = try arena.alloc(*const syntax.Expr, args.len);
+    for (out, args) |*o, a| o.* = a;
+    return out;
+}
+
+fn binaryNode(comptime bound: bool, arena: std.mem.Allocator, op: ast.Op, left: ExprNode(bound), right: ExprNode(bound)) Error!ExprNode(bound) {
+    if (bound) return makeBinop(arena, op, left, right);
+    const l = try arena.create(syntax.Expr);
+    l.* = left;
+    const r = try arena.create(syntax.Expr);
+    r.* = right;
+    return .{ .binary = .{ .op = op, .left = l, .right = r } };
+}
+
+fn unaryNode(arena: std.mem.Allocator, inner: syntax.Expr) Error!syntax.Expr {
+    const p = try arena.create(syntax.Expr);
+    p.* = inner;
+    return .{ .negate = p };
+}
+
+pub fn parseSelect(arena: std.mem.Allocator, src: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error![]ast.SelectItem {
+    return parseSelectOf(true, arena, src, file, diag);
+}
+
+pub fn parseSelectSyntax(arena: std.mem.Allocator, src: []const u8) Error![]syntax.SelectItem {
+    return parseSelectOf(false, arena, src, undefined, null);
+}
+
+pub fn parseAggList(arena: std.mem.Allocator, src: []const u8, file: *const schema.FileMetaData, diag: ?*Diag) Error![]agg.AggCall {
+    return parseAggListOf(true, arena, src, file, diag);
+}
+
+pub fn parseAggSyntax(arena: std.mem.Allocator, src: []const u8) Error![]syntax.Aggregate {
+    return parseAggListOf(false, arena, src, undefined, null);
+}
+
+/// The syntax tree's depth is checked even when it arrived over a structured request.
+pub fn bindSyntax(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema.FileMetaData, diag: ?*Diag) Error!ast.Expr {
+    return bindSyntaxAt(arena, node, file, diag, 0);
+}
+
+fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema.FileMetaData, diag: ?*Diag, depth: u32) Error!ast.Expr {
+    if (depth >= MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+    return switch (node) {
+        .column => |name| bindColumn(arena, file, name, diag),
+        .number => |n| bindSyntaxNumber(n.token, n.floating),
+        .string => |value| .{ .literal = .{ .str = value } },
+        .negate => |inner| negate(arena, try bindSyntaxAt(arena, inner.*, file, diag, depth + 1)),
+        .binary => |b| makeBinop(arena, b.op, try bindSyntaxAt(arena, b.left.*, file, diag, depth + 1), try bindSyntaxAt(arena, b.right.*, file, diag, depth + 1)),
+        .call => |c| blk: {
+            const func = resolveFunc(c.name) orelse return error.UnknownFunction;
+            const args = try arena.alloc(*ast.Expr, c.args.len);
+            for (c.args, args) |arg, *out| {
+                out.* = try arena.create(ast.Expr);
+                out.*.* = try bindSyntaxAt(arena, arg.*, file, diag, depth + 1);
+            }
+            break :blk bindCall(arena, file, func, args);
+        },
+        .case_ => |c| blk: {
+            const whens = try arena.alloc(ast.Case.When, c.whens.len);
+            for (c.whens, whens) |w, *out| out.* = .{ .cond = try filter_parser.bindSyntax(arena, w.cond, file, diag), .then = try bindNullableSyntax(arena, w.then, file, diag, depth + 1) };
+            break :blk bindCase(whens, try bindNullableSyntax(arena, c.else_, file, diag, depth + 1));
+        },
+    };
+}
+
+fn bindSyntaxNumber(token: []const u8, floating: bool) Error!ast.Expr {
+    // Wire values are literal tokens, not an alternate route for signs, expressions or unsupported exponents.
+    var lex: Lexer = .{ .src = token };
+    const number = try lex.next();
+    if (number.kind != (if (floating) TokenKind.number_float else .number_int)) return error.BadNumber;
+    if ((try lex.next()).kind != .eof) return error.TrailingTokens;
+    return bindNumber(number.text, floating);
+}
+
+fn bindNullableSyntax(arena: std.mem.Allocator, node: ?*const syntax.Expr, file: *const schema.FileMetaData, diag: ?*Diag, depth: u32) Error!?*ast.Expr {
+    const n = node orelse return null;
+    const out = try arena.create(ast.Expr);
+    out.* = try bindSyntaxAt(arena, n.*, file, diag, depth);
+    return out;
+}
+
+pub fn bindAggSyntax(arena: std.mem.Allocator, node: syntax.Aggregate, file: *const schema.FileMetaData, diag: ?*Diag) Error!agg.AggCall {
+    const arg = if (node.arg) |arg| try bindSyntax(arena, arg, file, diag) else null;
+    const where = if (node.where) |f| try filter_parser.bindSyntax(arena, f, file, diag) else null;
+    if (arg == null and node.func != .count) return error.StarOnlyValidInCount;
+    if (node.state and node.func != .avg) return error.BadAggArg;
+    return bindAggregate(node.func, arg, where, node.alias, node.default_name, node.state);
+}
+
+fn parseSelectOf(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     src: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error![]ast.SelectItem {
+) Error![]SelectNode(bound) {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyExpr;
 
-    var items: std.ArrayList(ast.SelectItem) = .empty;
+    var items: std.ArrayList(SelectNode(bound)) = .empty;
     var lex: Lexer = .{ .src = trimmed, .diag = diag };
 
     while (true) {
-        const e = try parseExpr(arena, &lex, file);
+        const item_start = lex.pos;
+        const e = try parseExpr(bound, arena, &lex, file);
+        const expr_end = lex.pos;
         var alias: ?[]const u8 = null;
         const after = try lex.peek();
         if (after.kind == .ident and asciiEqIgnoreCase(after.text, "AS")) {
@@ -276,7 +384,9 @@ pub fn parseSelect(
             if (id.kind != .ident) return error.ExpectedIdentifier;
             alias = try aliasName(arena, id.text);
         }
-        try items.append(arena, .{ .expr = e, .alias = alias });
+        var item: SelectNode(bound) = .{ .expr = e, .alias = alias };
+        if (!bound) item.display = std.mem.trim(u8, lex.src[item_start..expr_end], " \t\r\n");
+        try items.append(arena, item);
 
         const sep = try lex.next();
         switch (sep.kind) {
@@ -314,7 +424,7 @@ pub fn parseGroupByOf(
     var lex: Lexer = .{ .src = trimmed, .diag = diag };
 
     while (true) {
-        const e = if (try aliasKey(arena, &lex, file, select)) |aliased| aliased else try parseExpr(arena, &lex, file);
+        const e = if (try aliasKey(arena, &lex, file, select)) |aliased| aliased else try parseExpr(true, arena, &lex, file);
         var alias: ?[]const u8 = null;
         const after = try lex.peek();
         if (after.kind == .ident and asciiEqIgnoreCase(after.text, "AS")) {
@@ -352,7 +462,7 @@ fn aliasKey(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaD
         if (!asciiEqIgnoreCase(alias, tok.text)) continue;
         if (item.role == .agg) return error.AggregateInGroupBy;
         _ = try lex.next();
-        return try parseExprOnly(arena, item.expr, file, lex.diag);
+        return item.bound_expr orelse try parseExprOnly(arena, item.expr, file, lex.diag);
     }
     return null;
 }
@@ -368,14 +478,14 @@ pub fn parseExprOnly(
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyExpr;
     var lex: Lexer = .{ .src = trimmed, .diag = diag };
-    const e = try parseExpr(arena, &lex, file);
+    const e = try parseExpr(true, arena, &lex, file);
     const tail = try lex.next();
     if (tail.kind != .eof) return error.TrailingTokens;
     return e;
 }
 
-fn parseExpr(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ast.Expr {
-    var left = try parseTerm(arena, lex, file);
+fn parseExpr(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ExprNode(bound) {
+    var left = try parseTerm(bound, arena, lex, file);
     while (true) {
         const tk = try lex.peek();
         const op: ast.Op = switch (tk.kind) {
@@ -388,13 +498,13 @@ fn parseExpr(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMeta
             else => return left,
         };
         _ = try lex.next();
-        const right = try parseTerm(arena, lex, file);
-        left = try makeBinop(arena, op, left, right);
+        const right = try parseTerm(bound, arena, lex, file);
+        left = try binaryNode(bound, arena, op, left, right);
     }
 }
 
-fn parseTerm(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ast.Expr {
-    var left = try parseFactor(arena, lex, file);
+fn parseTerm(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ExprNode(bound) {
+    var left = try parseFactor(bound, arena, lex, file);
     while (true) {
         const tk = try lex.peek();
         const op: ast.Op = switch (tk.kind) {
@@ -403,12 +513,12 @@ fn parseTerm(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMeta
             else => return left,
         };
         _ = try lex.next();
-        const right = try parseFactor(arena, lex, file);
-        left = try makeBinop(arena, op, left, right);
+        const right = try parseFactor(bound, arena, lex, file);
+        left = try binaryNode(bound, arena, op, left, right);
     }
 }
 
-fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ast.Expr {
+fn parseFactor(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ExprNode(bound) {
     const tk = try lex.next();
     switch (tk.kind) {
         .minus => {
@@ -420,50 +530,14 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             // stack before any node exists to measure.
             lex.depth += 1;
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-            const inner = try parseFactor(arena, lex, file);
+            const inner = try parseFactor(bound, arena, lex, file);
             lex.depth -= 1;
-            switch (inner) {
-                .literal => |lit| switch (lit) {
-                    .i64 => |v| return .{ .literal = .{ .i64 = -v } },
-                    .f64 => |v| return .{ .literal = .{ .f64 = -v } },
-                    .dec => |d| return .{ .literal = .{
-                        .dec = .{ .unscaled = -d.unscaled, .spec = d.spec, .f = -d.f },
-                    } },
-                    .str => return error.TypeMismatch,
-                },
-                else => {
-                    try rejectUnsigned64Operand(inner);
-                    const lp = try arena.create(ast.Expr);
-                    lp.* = .{ .literal = .{ .i64 = 0 } };
-                    const rp = try arena.create(ast.Expr);
-                    rp.* = inner;
-                    const result_type = ast.Type.promote(.i64, inner.typeOf()) orelse return error.TypeMismatch;
-                    if (result_type == .str) return error.TypeMismatch;
-                    const depth = 1 + inner.depth();
-                    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-                    // Negation can't grow a value, so a DECIMAL keeps its operand's type (as SQL engines type `-x`).
-                    return .{ .binop = .{
-                        .op = .sub,
-                        .left = lp,
-                        .right = rp,
-                        .result_type = result_type,
-                        .depth = depth,
-                        .dec = if (result_type == .dec) inner.decSpec() else null,
-                    } };
-                },
-            }
+            return if (bound) negate(arena, inner) else unaryNode(arena, inner);
         },
-        .number_int => {
-            const v = std.fmt.parseInt(i64, tk.text, 10) catch return error.BadNumber;
-            return .{ .literal = .{ .i64 = v } };
-        },
-        .number_float => {
-            const v = std.fmt.parseFloat(f64, tk.text) catch return error.BadNumber;
-            if (decimalLiteral(tk.text, v)) |d| return .{ .literal = .{ .dec = d } };
-            return .{ .literal = .{ .f64 = v } };
-        },
+        .number_int => return if (bound) bindNumber(tk.text, false) else .{ .number = .{ .token = tk.text, .floating = false } },
+        .number_float => return if (bound) bindNumber(tk.text, true) else .{ .number = .{ .token = tk.text, .floating = true } },
         .string => {
-            return .{ .literal = .{ .str = tk.text } };
+            return if (bound) .{ .literal = .{ .str = tk.text } } else .{ .string = tk.text };
         },
         .ident => {
             // IDENT followed by `(` is a function call; otherwise it's
@@ -472,74 +546,15 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
             const after = try lex.peek();
             if (after.kind == .lparen) {
                 _ = try lex.next(); // consume '('
-                return parseCall(arena, lex, file, tk.text);
+                return parseCall(bound, arena, lex, file, tk.text);
             }
-            if (asciiEqIgnoreCase(tk.text, "CASE")) return parseCase(arena, lex, file);
-            const col_idx = metadata.resolveColumn(file, tk.text) catch |err| {
-                if (err == error.AmbiguousColumn) Diag.set(lex.diag, tk.text, .{ .ambiguous_column = .{
-                    .parser = .expression,
-                    .hint = metadata.ambiguityHint(file, tk.text),
-                } });
-                // A group by that name: say so, and name a leaf to select instead.
-                if (err == error.UnknownColumn) {
-                    const leaves = metadata.resolveProjection(arena, file, tk.text) catch &.{};
-                    if (leaves.len > 0) {
-                        const path = (try metadata.leafPathSegments(arena, file, leaves[0])) orelse return err;
-                        const example = try std.mem.join(arena, ".", path);
-                        Diag.set(lex.diag, tk.text, .{ .nested_selected = .{
-                            .example = .of(example),
-                            .repeated = file.getColumnLevels(path).max_rep > 0,
-                        } });
-                        return error.NestedColumnSelected;
-                    }
-                }
-                return err;
-            };
-            const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
-            const phys = elem.type orelse return error.UnsupportedColumnType;
-            // DECIMAL columns are exact: expressions and aggregates read the unscaled integers the consumer decodes
-            // beside the f64 view (see core/parquet/decimal.zig `decodeColumnExact`).
-            var dec: ?ast.Dec = null;
-            if (decimal_mod.exactKind(&elem)) |k| {
-                if (!ast.Dec.valid(k.precision, k.scale)) return error.InvalidDecimalType;
-                dec = .{ .precision = @intCast(k.precision), .scale = @intCast(k.scale) };
-            }
-            const expr_type: ast.Type = if (dec != null) .dec else if (schema.isFloat16(elem)) .f64 else switch (phys) {
-                .INT32, .INT64 => .i64,
-                .FLOAT, .DOUBLE => .f64,
-                .BYTE_ARRAY => .str,
-                // BOOLEAN aggregates/expressions treat the column as 0/1
-                // (false/true), matching SQL: count(flag), sum(flag)=#true,
-                // min/max(flag)=0/1. Widened to i64 in colRefForAgg.
-                .BOOLEAN => .i64,
-                // INT96 decodes to i64 epoch-nanoseconds (legacy timestamp).
-                .INT96 => .i64,
-                // FIXED_LEN_BYTE_ARRAY (non-decimal) decodes to raw bytes,
-                // same runtime lane as BYTE_ARRAY.
-                .FIXED_LEN_BYTE_ARRAY => .str,
-            };
-            return .{
-                .col_ref = .{
-                    .col_idx = col_idx,
-                    .physical_type = phys,
-                    .expr_type = expr_type,
-                    // INT64-physical unsigned: the agg fold reads the i64 lane as u64 (≤32-bit unsigned already
-                    // zero-extends at decode).
-                    .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
-                    .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
-                    .dec = dec,
-                    .temporal = columnTemporal(&elem),
-                    .nullable = blk: {
-                        const path = (try metadata.leafPathSegments(arena, file, col_idx)) orelse break :blk true;
-                        break :blk file.getColumnLevels(path).max_def > 0;
-                    },
-                },
-            };
+            if (asciiEqIgnoreCase(tk.text, "CASE")) return parseCase(bound, arena, lex, file);
+            return if (bound) bindColumn(arena, file, tk.text, lex.diag) else .{ .column = tk.text };
         },
         .lparen => {
             lex.depth += 1;
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-            const inner = try parseExpr(arena, lex, file);
+            const inner = try parseExpr(bound, arena, lex, file);
             lex.depth -= 1;
             const close = try lex.next();
             if (close.kind != .rparen) return error.ExpectedRParen;
@@ -554,26 +569,27 @@ fn parseFactor(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMe
 /// has already been consumed. Resolves the function by name
 /// (case-insensitive) and validates arity + arg types.
 fn parseCall(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     lex: *Lexer,
     file: *const schema.FileMetaData,
     name: []const u8,
-) Error!ast.Expr {
+) Error!ExprNode(bound) {
     const func = resolveFunc(name) orelse return error.UnknownFunction;
 
-    var args: std.ArrayList(*ast.Expr) = .empty;
+    var args: std.ArrayList(*ExprNode(bound)) = .empty;
     // Empty arg list: `func()`.
     const first = try lex.peek();
     if (first.kind == .rparen) {
         _ = try lex.next();
     } else {
         while (true) {
-            const arg = try arena.create(ast.Expr);
+            const arg = try arena.create(ExprNode(bound));
             lex.depth += 1;
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-            arg.* = try parseExpr(arena, lex, file);
+            arg.* = try parseExpr(bound, arena, lex, file);
             lex.depth -= 1;
-            try rejectUnsigned64Operand(arg.*);
+            if (bound) try rejectUnsigned64Operand(arg.*);
             try args.append(arena, arg);
             const sep = try lex.next();
             switch (sep.kind) {
@@ -584,44 +600,7 @@ fn parseCall(
         }
     }
 
-    const result_type = try resolveCallType(func, args.items, file);
-    var dec: ?ast.Dec = null;
-    if (result_type == .dec) {
-        dec = args.items[0].decSpec().?;
-        for (args.items[1..]) |a| dec = ast.Dec.common(dec.?, a.decSpec().?);
-    }
-    var deepest: u32 = 0;
-    for (args.items) |a| deepest = @max(deepest, a.depth());
-    const depth = 1 + deepest;
-    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-    return .{
-        .call = .{
-            .func = func,
-            .args = args.items,
-            .result_type = result_type,
-            .depth = depth,
-            .dec = dec,
-            .temporal = switch (func) {
-                .make_date => .date,
-                .epoch_ms, .date_trunc => .ts_us,
-                // Values of one unit keep it; mixed ones are no time zpq could name.
-                .coalesce => for (args.items[1..]) |a| {
-                    if (a.temporal() != args.items[0].temporal()) break null;
-                } else args.items[0].temporal(),
-                .strlen, .date_part, .regexp_replace => null,
-            },
-            .part = switch (func) {
-                .date_trunc, .date_part => ast.DatePart.parse(args.items[0].literal.str) orelse unreachable,
-                else => null,
-            },
-            .replace = if (func == .regexp_replace) blk: {
-                const r = try arena.create(regex.Replace);
-                const a = args.items;
-                r.* = try .compile(arena, a[1].literal.str, a[2].literal.str, if (a.len > 3) a[3].literal.str else "");
-                break :blk r;
-            } else null,
-        },
-    };
+    return if (bound) bindCall(arena, file, func, args.items) else .{ .call = .{ .name = name, .args = try syntaxArgs(arena, args.items) } };
 }
 
 /// The unit a DATE or TIMESTAMP column's integers count; INT96 decodes to nanoseconds.
@@ -662,72 +641,42 @@ fn integerArgument(e: ast.Expr, file: *const schema.FileMetaData) bool {
 /// A searched `CASE WHEN cond THEN value ... [ELSE value] END`, `CASE` already read. Each condition is a predicate
 /// in the filter grammar, bound by the filter parser (its text runs to the THEN that closes it); each value an
 /// expression or NULL. The result type is the branches' common one.
-fn parseCase(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ast.Expr {
+fn parseCase(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!ExprNode(bound) {
     lex.depth += 1;
     defer lex.depth -= 1;
     if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-    var whens: std.ArrayList(ast.Case.When) = .empty;
+    var whens: std.ArrayList(if (bound) ast.Case.When else syntax.Expr.When) = .empty;
     var first = try lex.next();
     if (first.kind != .ident or !asciiEqIgnoreCase(first.text, "WHEN")) return error.UnsupportedCase;
-    var else_: ?*ast.Expr = null;
+    var else_: ?*ExprNode(bound) = null;
     while (true) {
         const cond_start = lex.pos;
         const then_at = (try findThen(lex.src, cond_start)) orelse return error.UnsupportedCase;
-        const cond = try filter_parser.parse(arena, lex.src[cond_start..then_at], file, lex.diag);
+        const cond = if (bound) try filter_parser.parse(arena, lex.src[cond_start..then_at], file, lex.diag) else try filter_parser.parseSyntax(arena, lex.src[cond_start..then_at]);
         lex.pos = then_at + "THEN".len;
-        try whens.append(arena, .{ .cond = cond, .then = try caseValue(arena, lex, file) });
+        try whens.append(arena, .{ .cond = cond, .then = try caseValue(bound, arena, lex, file) });
         first = try lex.next();
         if (first.kind != .ident) return error.UnsupportedCase;
         if (asciiEqIgnoreCase(first.text, "WHEN")) continue;
         if (asciiEqIgnoreCase(first.text, "ELSE")) {
-            else_ = try caseValue(arena, lex, file);
+            else_ = try caseValue(bound, arena, lex, file);
             first = try lex.next();
         }
         if (first.kind != .ident or !asciiEqIgnoreCase(first.text, "END")) return error.UnsupportedCase;
         break;
     }
-    // The common type of the non-NULL branches: strings with strings, numbers promoted; a DECIMAL result holds every
-    // branch's digits (`Dec.common`), integers widened as SQL widens them.
-    var result: ?ast.Type = null;
-    var dec: ?ast.Dec = null;
-    var deepest: u32 = 0;
-    const Branches = struct {
-        whens: []const ast.Case.When,
-        else_: ?*ast.Expr,
-        fn at(self: @This(), i: usize) ?*ast.Expr {
-            return if (i < self.whens.len) self.whens[i].then else self.else_;
-        }
-    };
-    const branches: Branches = .{ .whens = whens.items, .else_ = else_ };
-    for (0..whens.items.len + 1) |i| {
-        const v = branches.at(i) orelse continue;
-        deepest = @max(deepest, v.depth());
-        try rejectUnsigned64Operand(v.*);
-        const t = v.typeOf();
-        result = if (result) |r| ast.Type.promote(r, t) orelse return error.UnsupportedCase else t;
-        if (v.decSpec()) |spec| dec = if (dec) |d| ast.Dec.common(d, spec) else spec;
-    }
-    const result_type = result orelse return error.UnsupportedCase;
-    const depth = 1 + deepest;
-    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-    return .{ .case_ = .{
-        .whens = whens.items,
-        .else_ = else_,
-        .result_type = result_type,
-        .depth = depth,
-        .dec = if (result_type == .dec) dec else null,
-    } };
+    return if (bound) bindCase(whens.items, else_) else .{ .case_ = .{ .whens = whens.items, .else_ = else_ } };
 }
 
 /// A CASE branch value: NULL (null), or an expression.
-fn caseValue(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!?*ast.Expr {
+fn caseValue(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaData) Error!?*ExprNode(bound) {
     const tk = try lex.peek();
     if (tk.kind == .ident and asciiEqIgnoreCase(tk.text, "NULL")) {
         _ = try lex.next();
         return null;
     }
-    const v = try arena.create(ast.Expr);
-    v.* = try parseExpr(arena, lex, file);
+    const v = try arena.create(ExprNode(bound));
+    v.* = try parseExpr(bound, arena, lex, file);
     return v;
 }
 
@@ -765,7 +714,7 @@ fn findThen(src: []const u8, from: usize) Error!?usize {
     return null;
 }
 
-fn resolveFunc(name: []const u8) ?ast.Func {
+pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "coalesce")) return .coalesce;
     if (asciiEqIgnoreCase(name, "strlen")) return .strlen;
     if (asciiEqIgnoreCase(name, "make_date")) return .make_date;
@@ -828,7 +777,7 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
     }
 }
 
-fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
+pub fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
     try rejectUnsigned64Operand(l);
     try rejectUnsigned64Operand(r);
     var result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
@@ -898,18 +847,19 @@ fn asciiEqIgnoreCase(a: []const u8, b: []const u8) bool {
 // ============================================================
 
 /// Parse a comma-separated list of aggregate calls.
-pub fn parseAggList(
+fn parseAggListOf(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     src: []const u8,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
-) Error![]agg.AggCall {
+) Error![]AggNode(bound) {
     const trimmed = std.mem.trim(u8, src, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyAggregate;
     var lex: Lexer = .{ .src = trimmed, .diag = diag };
-    var items: std.ArrayList(agg.AggCall) = .empty;
+    var items: std.ArrayList(AggNode(bound)) = .empty;
     while (true) {
-        const call = try parseAggCall(arena, &lex, file);
+        const call = try parseAggCall(bound, arena, &lex, file);
         try items.append(arena, call);
         const sep = try lex.next();
         switch (sep.kind) {
@@ -922,10 +872,11 @@ pub fn parseAggList(
 }
 
 fn parseAggCall(
+    comptime bound: bool,
     arena: std.mem.Allocator,
     lex: *Lexer,
     file: *const schema.FileMetaData,
-) Error!agg.AggCall {
+) Error!AggNode(bound) {
     // 1. Function name (sum, count, min, max, avg, avg_state).
     const name_tok = try lex.next();
     if (name_tok.kind != .ident) return error.ExpectedAggFunc;
@@ -938,7 +889,7 @@ fn parseAggCall(
     if (lp.kind != .lparen) return error.ExpectedLParen;
 
     // 3. Argument: `*` only valid for count; otherwise a regular expression.
-    var arg: ?ast.Expr = null;
+    var arg: ?ExprNode(bound) = null;
     const peek = try lex.peek();
     if (peek.kind == .star) {
         if (func != .count) return error.StarOnlyValidInCount;
@@ -950,7 +901,7 @@ fn parseAggCall(
         }
         lex.depth += 1;
         if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
-        arg = try parseExpr(arena, lex, file);
+        arg = try parseExpr(bound, arena, lex, file);
         lex.depth -= 1;
     }
 
@@ -961,7 +912,7 @@ fn parseAggCall(
     //    `filter` parser (same syntax as `--filter`). We delimit the
     //    body by paren-depth scanning over the source string, then
     //    strip the leading WHERE keyword.
-    var where: ?filter_ast.Filter = null;
+    var where: ?PredicateNode(bound) = null;
     const after_call = try lex.peek();
     if (after_call.kind == .ident and asciiEqIgnoreCase(after_call.text, "FILTER")) {
         _ = try lex.next();
@@ -996,7 +947,7 @@ fn parseAggCall(
 
         if (body.len < 6 or !asciiEqIgnoreCase(body[0..5], "WHERE")) return error.ExpectedWhere;
         const pred_str = std.mem.trim(u8, body[5..], " \t\r\n");
-        where = try filter_parser.parse(arena, pred_str, file, lex.diag);
+        where = if (bound) try filter_parser.parse(arena, pred_str, file, lex.diag) else try filter_parser.parseSyntax(arena, pred_str);
     }
 
     // 5. Optional AS alias. Default = function name (sum / count / ...), with the call's text kept for when that
@@ -1012,6 +963,216 @@ fn parseAggCall(
         default_name = null;
     }
 
+    return if (bound) bindAggregate(func, arg, where, alias, default_name, state) else .{ .func = func, .arg = arg, .where = where, .alias = alias, .default_name = default_name, .state = state };
+}
+
+/// `sum(x + c)`, `sum(c + x)` or `sum(x - c)` as `x` and `c`, for `sum(x) + c·count(x)`: one pass over `x` instead of
+/// a column of `x + c` per call. Only where `x + c` cannot overflow a row's 64 bits, so no query that errors today
+/// answers: `x` a column of at most 32 bits, `|c|` at most 2^62.
+fn sumOffset(arg: ast.Expr) ?struct { col: *ast.Expr, offset: i64 } {
+    if (arg != .binop) return null;
+    const b = arg.binop;
+    if (b.op != .add and b.op != .sub) return null;
+    const col, const lit = if (b.left.* == .col_ref) .{ b.left, b.right.* } else if (b.op == .add) .{ b.right, b.left.* } else return null;
+    if (col.* != .col_ref or col.col_ref.physical_type != .INT32 or col.col_ref.expr_type != .i64) return null;
+    if (lit != .literal or lit.literal != .i64) return null;
+    const c = lit.literal.i64;
+    if (@abs(c) > 1 << 62) return null;
+    return .{ .col = col, .offset = if (b.op == .add) c else -c };
+}
+
+pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
+    if (asciiEqIgnoreCase(name, "count")) return .count;
+    if (asciiEqIgnoreCase(name, "count_distinct")) return .count_distinct;
+    if (asciiEqIgnoreCase(name, "sum")) return .sum;
+    if (asciiEqIgnoreCase(name, "min")) return .min;
+    if (asciiEqIgnoreCase(name, "max")) return .max;
+    if (asciiEqIgnoreCase(name, "avg")) return .avg;
+    return null;
+}
+
+/// Shared semantic builders: SQL and structured syntax bind without recreating fragment text.
+pub fn bindColumn(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, diag: ?*Diag) Error!ast.Expr {
+    const col_idx = metadata.resolveColumn(file, name) catch |err| {
+        if (err == error.AmbiguousColumn) Diag.set(diag, name, .{ .ambiguous_column = .{
+            .parser = .expression,
+            .hint = metadata.ambiguityHint(file, name),
+        } });
+        // A group by that name: say so, and name a leaf to select instead.
+        if (err == error.UnknownColumn) {
+            const leaves = metadata.resolveProjection(arena, file, name) catch &.{};
+            if (leaves.len > 0) {
+                const path = (try metadata.leafPathSegments(arena, file, leaves[0])) orelse return err;
+                const example = try std.mem.join(arena, ".", path);
+                Diag.set(diag, name, .{ .nested_selected = .{
+                    .example = .of(example),
+                    .repeated = file.getColumnLevels(path).max_rep > 0,
+                } });
+                return error.NestedColumnSelected;
+            }
+        }
+        return err;
+    };
+    const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
+    const phys = elem.type orelse return error.UnsupportedColumnType;
+    // DECIMAL columns are exact: expressions and aggregates read the unscaled integers the consumer decodes
+    // beside the f64 view (see core/parquet/decimal.zig `decodeColumnExact`).
+    var dec: ?ast.Dec = null;
+    if (decimal_mod.exactKind(&elem)) |k| {
+        if (!ast.Dec.valid(k.precision, k.scale)) return error.InvalidDecimalType;
+        dec = .{ .precision = @intCast(k.precision), .scale = @intCast(k.scale) };
+    }
+    const expr_type: ast.Type = if (dec != null) .dec else if (schema.isFloat16(elem)) .f64 else switch (phys) {
+        .INT32, .INT64 => .i64,
+        .FLOAT, .DOUBLE => .f64,
+        .BYTE_ARRAY => .str,
+        // BOOLEAN aggregates/expressions treat the column as 0/1
+        // (false/true), matching SQL: count(flag), sum(flag)=#true,
+        // min/max(flag)=0/1. Widened to i64 in colRefForAgg.
+        .BOOLEAN => .i64,
+        // INT96 decodes to i64 epoch-nanoseconds (legacy timestamp).
+        .INT96 => .i64,
+        // FIXED_LEN_BYTE_ARRAY (non-decimal) decodes to raw bytes,
+        // same runtime lane as BYTE_ARRAY.
+        .FIXED_LEN_BYTE_ARRAY => .str,
+    };
+    return .{
+        .col_ref = .{
+            .col_idx = col_idx,
+            .physical_type = phys,
+            .expr_type = expr_type,
+            // INT64-physical unsigned: the agg fold reads the i64 lane as u64 (≤32-bit unsigned already
+            // zero-extends at decode).
+            .unsigned_64 = phys == .INT64 and schema.isUnsignedInt64(elem),
+            .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
+            .dec = dec,
+            .temporal = columnTemporal(&elem),
+            .nullable = blk: {
+                const path = (try metadata.leafPathSegments(arena, file, col_idx)) orelse break :blk true;
+                break :blk file.getColumnLevels(path).max_def > 0;
+            },
+        },
+    };
+}
+
+pub fn negate(arena: std.mem.Allocator, inner: ast.Expr) Error!ast.Expr {
+    switch (inner) {
+        .literal => |lit| switch (lit) {
+            .i64 => |v| return .{ .literal = .{ .i64 = -v } },
+            .f64 => |v| return .{ .literal = .{ .f64 = -v } },
+            .dec => |d| return .{ .literal = .{
+                .dec = .{ .unscaled = -d.unscaled, .spec = d.spec, .f = -d.f },
+            } },
+            .str => return error.TypeMismatch,
+        },
+        else => {
+            try rejectUnsigned64Operand(inner);
+            const lp = try arena.create(ast.Expr);
+            lp.* = .{ .literal = .{ .i64 = 0 } };
+            const rp = try arena.create(ast.Expr);
+            rp.* = inner;
+            const result_type = ast.Type.promote(.i64, inner.typeOf()) orelse return error.TypeMismatch;
+            if (result_type == .str) return error.TypeMismatch;
+            const depth = 1 + inner.depth();
+            if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+            // Negation can't grow a value, so a DECIMAL keeps its operand's type (as SQL engines type `-x`).
+            return .{ .binop = .{
+                .op = .sub,
+                .left = lp,
+                .right = rp,
+                .result_type = result_type,
+                .depth = depth,
+                .dec = if (result_type == .dec) inner.decSpec() else null,
+            } };
+        },
+    }
+}
+
+pub fn bindNumber(text: []const u8, floating: bool) Error!ast.Expr {
+    if (!floating) return .{ .literal = .{ .i64 = std.fmt.parseInt(i64, text, 10) catch return error.BadNumber } };
+    const value = std.fmt.parseFloat(f64, text) catch return error.BadNumber;
+    if (decimalLiteral(text, value)) |d| return .{ .literal = .{ .dec = d } };
+    return .{ .literal = .{ .f64 = value } };
+}
+
+pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func: ast.Func, args: []const *ast.Expr) Error!ast.Expr {
+    for (args) |arg| try rejectUnsigned64Operand(arg.*);
+    const result_type = try resolveCallType(func, args, file);
+    var dec: ?ast.Dec = null;
+    if (result_type == .dec) {
+        dec = args[0].decSpec().?;
+        for (args[1..]) |a| dec = ast.Dec.common(dec.?, a.decSpec().?);
+    }
+    var deepest: u32 = 0;
+    for (args) |a| deepest = @max(deepest, a.depth());
+    const depth = 1 + deepest;
+    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+    return .{
+        .call = .{
+            .func = func,
+            .args = args,
+            .result_type = result_type,
+            .depth = depth,
+            .dec = dec,
+            .temporal = switch (func) {
+                .make_date => .date,
+                .epoch_ms, .date_trunc => .ts_us,
+                // Values of one unit keep it; mixed ones are no time zpq could name.
+                .coalesce => for (args[1..]) |a| {
+                    if (a.temporal() != args[0].temporal()) break null;
+                } else args[0].temporal(),
+                .strlen, .date_part, .regexp_replace => null,
+            },
+            .part = switch (func) {
+                .date_trunc, .date_part => ast.DatePart.parse(args[0].literal.str) orelse unreachable,
+                else => null,
+            },
+            .replace = if (func == .regexp_replace) blk: {
+                const r = try arena.create(regex.Replace);
+                const a = args;
+                r.* = try .compile(arena, a[1].literal.str, a[2].literal.str, if (a.len > 3) a[3].literal.str else "");
+                break :blk r;
+            } else null,
+        },
+    };
+}
+
+pub fn bindCase(whens: []const ast.Case.When, else_: ?*ast.Expr) Error!ast.Expr {
+    // The common type of the non-NULL branches: strings with strings, numbers promoted; a DECIMAL result holds every
+    // branch's digits (`Dec.common`), integers widened as SQL widens them.
+    var result: ?ast.Type = null;
+    var dec: ?ast.Dec = null;
+    var deepest: u32 = 0;
+    const Branches = struct {
+        whens: []const ast.Case.When,
+        else_: ?*ast.Expr,
+        fn at(self: @This(), i: usize) ?*ast.Expr {
+            return if (i < self.whens.len) self.whens[i].then else self.else_;
+        }
+    };
+    const branches: Branches = .{ .whens = whens, .else_ = else_ };
+    for (0..whens.len + 1) |i| {
+        const v = branches.at(i) orelse continue;
+        deepest = @max(deepest, v.depth());
+        try rejectUnsigned64Operand(v.*);
+        const t = v.typeOf();
+        result = if (result) |r| ast.Type.promote(r, t) orelse return error.UnsupportedCase else t;
+        if (v.decSpec()) |spec| dec = if (dec) |d| ast.Dec.common(d, spec) else spec;
+    }
+    const result_type = result orelse return error.UnsupportedCase;
+    const depth = 1 + deepest;
+    if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+    return .{ .case_ = .{
+        .whens = whens,
+        .else_ = else_,
+        .result_type = result_type,
+        .depth = depth,
+        .dec = if (result_type == .dec) dec else null,
+    } };
+}
+
+pub fn bindAggregate(func: agg.AggFunc, original_arg: ?ast.Expr, where: ?filter_ast.Filter, alias: []const u8, default_name: ?[]const u8, state: bool) Error!agg.AggCall {
+    var arg = original_arg;
     // `make_date` over a column it takes is the identity on that column's values, each of them an INTEGER, and it
     // keeps their order. So `min`/`max` of it fold the column itself, through its encoded and statistics paths, and
     // answer as a DATE.
@@ -1038,31 +1199,6 @@ fn parseAggCall(
         .state = state,
         .as_date = as_date,
     };
-}
-
-/// `sum(x + c)`, `sum(c + x)` or `sum(x - c)` as `x` and `c`, for `sum(x) + c·count(x)`: one pass over `x` instead of
-/// a column of `x + c` per call. Only where `x + c` cannot overflow a row's 64 bits, so no query that errors today
-/// answers: `x` a column of at most 32 bits, `|c|` at most 2^62.
-fn sumOffset(arg: ast.Expr) ?struct { col: *ast.Expr, offset: i64 } {
-    if (arg != .binop) return null;
-    const b = arg.binop;
-    if (b.op != .add and b.op != .sub) return null;
-    const col, const lit = if (b.left.* == .col_ref) .{ b.left, b.right.* } else if (b.op == .add) .{ b.right, b.left.* } else return null;
-    if (col.* != .col_ref or col.col_ref.physical_type != .INT32 or col.col_ref.expr_type != .i64) return null;
-    if (lit != .literal or lit.literal != .i64) return null;
-    const c = lit.literal.i64;
-    if (@abs(c) > 1 << 62) return null;
-    return .{ .col = col, .offset = if (b.op == .add) c else -c };
-}
-
-fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
-    if (asciiEqIgnoreCase(name, "count")) return .count;
-    if (asciiEqIgnoreCase(name, "count_distinct")) return .count_distinct;
-    if (asciiEqIgnoreCase(name, "sum")) return .sum;
-    if (asciiEqIgnoreCase(name, "min")) return .min;
-    if (asciiEqIgnoreCase(name, "max")) return .max;
-    if (asciiEqIgnoreCase(name, "avg")) return .avg;
-    return null;
 }
 
 // ============================================================
@@ -1793,4 +1929,53 @@ test "parse: min/max of make_date(col) fold the column itself and answer as a DA
     // An expression under make_date is no column to fold.
     const shifted = try parseAggList(a, "min(make_date(i + 1))", &file, null);
     try testing.expect(!shifted[0].as_date and shifted[0].arg.? == .call);
+}
+
+test "syntax: original fragment grammar and shared expression semantics agree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "x", "s" }, &.{ .INT32, .BYTE_ARRAY });
+    for ([_][]const u8{
+        "x + 2 * 3 AS n",                                  "-x AS n",       "coalesce(x, 0) AS n", "strlen(s) AS n",
+        "CASE WHEN x IN (1, NULL) THEN x ELSE 0 END AS n", "s || 'q' AS n",
+    }) |text| {
+        const direct = try parseSelect(a, text, &file, null);
+        const unbound = try parseSelectSyntax(a, text);
+        try testing.expectEqual(direct.len, unbound.len);
+        const got = try bindSyntax(a, unbound[0].expr, &file, null);
+        try testing.expect(direct[0].expr.eql(got));
+        try testing.expectEqualStrings(direct[0].alias.?, unbound[0].alias.?);
+    }
+    for ([_][]const u8{
+        "sum(x + 2) AS a, sum(x + 2) AS b",                      "avg_state(x) AS a",
+        "count(DISTINCT x) FILTER (WHERE s = 'O''Reilly') AS a", "min(make_date(x)) AS d",
+    }) |text| {
+        const direct = try parseAggList(a, text, &file, null);
+        const unbound = try parseAggSyntax(a, text);
+        for (direct, unbound) |want, node| {
+            const got = try bindAggSyntax(a, node, &file, null);
+            try testing.expectEqual(want.func, got.func);
+            try testing.expectEqual(want.result, got.result);
+            try testing.expectEqual(want.offset, got.offset);
+            try testing.expectEqual(want.as_date, got.as_date);
+            try testing.expectEqual(want.state, got.state);
+            try testing.expectEqualStrings(want.alias, got.alias);
+            if (want.arg) |arg| try testing.expect(arg.eql(got.arg.?));
+            if (want.where) |f| try testing.expect(filter_ast.eql(f, got.where.?));
+        }
+    }
+}
+
+test "syntax: structured binding keeps type and depth refusals" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "x", "s" }, &.{ .INT32, .BYTE_ARRAY });
+    try testing.expectError(error.BadNumber, bindSyntax(a, .{ .number = .{ .token = "-9223372036854775808", .floating = false } }, &file, null));
+    const bad = try parseSelectSyntax(a, "s + 1");
+    try testing.expectError(error.TypeMismatch, bindSyntax(a, bad[0].expr, &file, null));
+    var deep: syntax.Expr = .{ .column = "x" };
+    for (0..MAX_EXPR_DEPTH + 1) |_| deep = try unaryNode(a, deep);
+    try testing.expectError(error.ExpressionTooDeep, bindSyntax(a, deep, &file, null));
 }

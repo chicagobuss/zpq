@@ -2430,3 +2430,221 @@ test "distinct admission string fanout stays wide and merges across fanouts" {
     try wide.merge(&narrow, a);
     try testing.expectEqual(@as(usize, 2), wide.count());
 }
+
+test "variable hash growth bitmap migration preserves supplied hashes" {
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.shared = &budget;
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var buf: [24]u8 = undefined;
+    for (0..12) |i| {
+        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        _ = try table.getOrInsertStringHashed(key, &calls, i, 0);
+    }
+    table.releaseSlack();
+    const projected = table.variableHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    budget.limit = projected;
+    try table.admit(projected - table.allocated_bytes);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.growFixedSlotsImpl(32, projected, true));
+    budget.limit += 2;
+    try table.growFixedSlotsImpl(32, projected, true);
+    table.allocated_bytes = table.variableHeld();
+    try std.testing.expectEqual(projected, budget.used.load(.monotonic));
+    for (0..12) |i| {
+        const key = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.probeString(key, true, 0).id);
+    }
+}
+
+test "fixed hash growth bitmap admission and migration preserve supplied hashes" {
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.shared = &budget;
+    table.fixed_stride = 9;
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var key: [9]u8 = @splat(0);
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixedHashed(&key, &calls, i, 0);
+    }
+    table.releaseSlack();
+    const projected = table.fixedHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    budget.limit = projected;
+    try table.admit(projected - table.allocated_bytes);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.growFixedSlotsImpl(32, projected, true));
+    try std.testing.expectEqual(@as(usize, 16), table.fixedSlotCount());
+    budget.limit += 2;
+    try table.growFixedSlotsImpl(32, projected, true);
+    table.allocated_bytes = table.fixedHeld();
+    try std.testing.expectEqual(projected, budget.used.load(.monotonic));
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findFixed(&key, 0));
+    }
+}
+
+test "fixed hash growth is ledger funded and refusal preserves its keys" {
+    const Counter = struct {
+        budget: *SharedBudget,
+        live: usize = 0,
+        unpaid: usize = 0,
+        observing: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = std.testing.allocator.rawAlloc(n, alignment, ra) orelse return null;
+            self.live += n;
+            if (self.observing)
+                self.unpaid = @max(self.unpaid, self.live -| self.budget.used.load(.monotonic));
+            return p;
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+            self.live -= bytes.len;
+        }
+    };
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var counter: Counter = .{ .budget = &budget };
+    var table = GroupTable.init(counter.allocator(), 0);
+    table.shared = &budget;
+    table.fixed_stride = 9;
+    var table_live = true;
+    defer if (table_live) table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var key: [9]u8 = @splat(0);
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixed(&key, &calls, i);
+    }
+    table.releaseSlack();
+    budget.limit = budget.used.load(.monotonic);
+    std.mem.writeInt(u64, key[1..9], 12, .little);
+    try std.testing.expectError(error.ExceededMemoryBudget, table.getOrInsertFixed(&key, &calls, 12));
+    try std.testing.expectEqual(@as(usize, 12), table.groupCount());
+    const projected = table.fixedHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    budget.limit = projected;
+    try table.admit(projected - table.allocated_bytes);
+    counter.observing = true;
+    try table.growFixedSlots(32, projected);
+    counter.observing = false;
+    try std.testing.expectEqual(@as(u8, 1), table.fixed_extra_count);
+    table.allocated_bytes = table.fixedHeld();
+    try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+    budget.limit = 1 << 20;
+    for (12..500) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixed(&key, &calls, i);
+    }
+    for (0..500) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findFixed(&key, hashFixed(&key)));
+    }
+    table.deinit();
+    table_live = false;
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}
+
+test "fixed hash growth uses funded contiguous replacement when headroom permits" {
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var table = GroupTable.init(std.testing.allocator, 0);
+    table.shared = &budget;
+    table.fixed_stride = 9;
+    defer table.deinit();
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    var key: [9]u8 = @splat(0);
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        _ = try table.getOrInsertFixed(&key, &calls, i);
+    }
+    table.releaseSlack();
+    const projected = table.fixedHeld() + 16 * @sizeOf(GroupTable.FixedSlot);
+    try table.admit(projected - table.allocated_bytes);
+    try table.growFixedSlots(32, projected);
+    table.allocated_bytes = table.fixedHeld();
+    try std.testing.expectEqual(@as(u8, 0), table.fixed_extra_count);
+    try std.testing.expectEqual(@as(usize, 32), table.firstSlots().len);
+    try std.testing.expect(budget.peak.load(.monotonic) >= projected + 16 * @sizeOf(GroupTable.FixedSlot));
+    try std.testing.expectEqual(projected, budget.used.load(.monotonic));
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[1..9], i, .little);
+        try std.testing.expectEqual(@as(?u32, @intCast(i)), table.findFixed(&key, hashFixed(&key)));
+    }
+}
+
+test "group buffer overlap is funded before replacement" {
+    const Counter = struct {
+        budget: *SharedBudget,
+        live: usize = 0,
+        unpaid: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = std.testing.allocator.rawAlloc(n, alignment, ra) orelse return null;
+            self.live += n;
+            self.unpaid = @max(self.unpaid, self.live -| self.budget.used.load(.monotonic));
+            return p;
+        }
+        fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+            self.live -= bytes.len;
+        }
+    };
+    var budget: SharedBudget = .{ .limit = 1 << 20, .block = 1 };
+    var counter: Counter = .{ .budget = &budget };
+    const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
+    {
+        var table = GroupTable.init(counter.allocator(), 0);
+        table.shared = &budget;
+        table.fixed_stride = 9;
+        defer table.deinit();
+        var key: [9]u8 = @splat(0);
+        for (0..500) |i| {
+            std.mem.writeInt(u64, key[1..9], i, .little);
+            _ = try table.getOrInsertFixed(&key, &calls, i);
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    {
+        var table = GroupTable.init(counter.allocator(), 0);
+        table.shared = &budget;
+        defer table.deinit();
+        var key: [32]u8 = undefined;
+        for (0..500) |i| {
+            const value = try std.fmt.bufPrint(&key, "variable-{d}", .{i});
+            _ = try table.getOrInsert(value, &calls, i);
+        }
+        try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    {
+        const key = try std.testing.allocator.alloc(u8, 1 << 20);
+        defer std.testing.allocator.free(key);
+        @memset(key, 'g');
+        budget.limit = 1_153_433;
+        var table = GroupTable.init(counter.allocator(), 0);
+        table.shared = &budget;
+        defer table.deinit();
+        _ = try table.getOrInsert(key, &calls, 0);
+        try std.testing.expectEqual(@as(usize, 0), counter.unpaid);
+        try std.testing.expect(counter.live <= budget.used.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+}

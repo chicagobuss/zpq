@@ -12,7 +12,7 @@ const AvgState = types.AvgState;
 const DistinctAcc = @import("distinct.zig").DistinctAcc;
 const KeyArena = @import("keys.zig").KeyArena;
 const keyEql = @import("../../bytes.zig").keyEql;
-const foldExtremeF = @import("scalar.zig").foldExtremeF;
+const foldExtremeF = @import("contracts.zig").foldExtremeF;
 
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right

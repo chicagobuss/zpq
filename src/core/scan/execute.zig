@@ -423,18 +423,17 @@ pub fn prepareAggregate(
     };
 }
 
-fn prepareAggregateWithMetas(
-    gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
-    initial_args: MultiAggArgs,
-    comptime explain: bool,
-    metas: []const schema.FileMetaData,
-    t_parse: i64,
-) !if (explain) AggregateExplanation else MultiAggResult {
-    var args = initial_args;
-    var t: Timings = .{};
-    const prof = profile.threadOf(args.profiler, .main);
+const BoundQueryPhase = struct {
+    calls: []expr_agg.AggCall,
+    filter: ?filter_ast.Filter,
+    keys: ?[]const expr_ast.Expr,
+    outputs: ?[]const BoundOutputColumn,
+    error_keys: ?[]const expr_ast.Expr,
+    error_outputs: ?[]const BoundOutputColumn,
+    sources: []?schema.SchemaElement,
+};
 
+fn validateAggregateSchemas(args: MultiAggArgs, metas: []const schema.FileMetaData) !void {
     // Validate schemas match the first file's: same number of leaves
     // and same names *case-insensitively*. Real-world datasets drift on
     // capitalization (NYC Taxi flips `Airport_fee` ↔ `airport_fee`
@@ -454,7 +453,9 @@ fn prepareAggregateWithMetas(
         } });
         return error.SchemaMismatch;
     }
+}
 
+fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *const schema.FileMetaData) !BoundQueryPhase {
     // 2. Parse aggregate + filter against meta0 (column indexes resolved
     //    against file 0; valid for all files because schemas match).
     const agg_calls: []expr_agg.AggCall = if (args.bound_aggregate) |bound|
@@ -502,6 +503,39 @@ fn prepareAggregateWithMetas(
         group_by_keys = dependencies.keys;
         group_outputs = dependencies.outputs;
     };
+    return .{
+        .calls = agg_calls,
+        .filter = filter_opt,
+        .keys = group_by_keys,
+        .outputs = group_outputs,
+        .error_keys = error_group_keys,
+        .error_outputs = error_outputs,
+        .sources = agg_sources,
+    };
+}
+
+fn prepareAggregateWithMetas(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    initial_args: MultiAggArgs,
+    comptime explain: bool,
+    metas: []const schema.FileMetaData,
+    t_parse: i64,
+) !if (explain) AggregateExplanation else MultiAggResult {
+    var args = initial_args;
+    var t: Timings = .{};
+    const prof = profile.threadOf(args.profiler, .main);
+
+    try validateAggregateSchemas(args, metas);
+    const meta0 = &metas[0];
+    const bound = try bindAggregateQuery(arena, args, meta0);
+    const agg_calls = bound.calls;
+    const filter_opt = bound.filter;
+    const group_by_keys = bound.keys;
+    const group_outputs = bound.outputs;
+    const error_group_keys = bound.error_keys;
+    const error_outputs = bound.error_outputs;
+    const agg_sources = bound.sources;
     if (!explain) if (args.diag) |diag| {
         diag.execution_started = true;
     };
@@ -2153,8 +2187,6 @@ const RankedPhase = struct {
     }
 };
 
-
-
 fn rankedColumn(col: expr_ast.ColRef) bool {
     return col.expr_type == .i64 and !col.unsigned_32 and !col.unsigned_64 and
         (col.physical_type == .INT32 or col.physical_type == .INT64);
@@ -2393,7 +2425,6 @@ pub fn refuseRepeated(
     }
 }
 
-
 /// Optional scheduling plan for too few surviving groups. Byte weight bounds both task count and plan overhead;
 /// a stable flat chunk supplies independent seeks, while one-shot streams and ordered reductions keep their path.
 fn splitRowGroups(
@@ -2597,4 +2628,3 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
         .distinct_census = distinct_count != null,
     };
 }
-

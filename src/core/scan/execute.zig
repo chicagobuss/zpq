@@ -514,58 +514,25 @@ fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *cons
     };
 }
 
-fn prepareAggregateWithMetas(
+const WorkPhase = struct {
+    items: std.ArrayList(WorkItem),
+    total_rgs: usize,
+    requested: usize,
+    chunks_per_rg: usize,
+    by_bytes: usize,
+    workers: usize,
+};
+
+fn buildWorkPhase(
+    comptime explain: bool,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
-    initial_args: MultiAggArgs,
-    comptime explain: bool,
+    args: MultiAggArgs,
     metas: []const schema.FileMetaData,
-    t_parse: i64,
-) !if (explain) AggregateExplanation else MultiAggResult {
-    var args = initial_args;
-    var t: Timings = .{};
-    const prof = profile.threadOf(args.profiler, .main);
-
-    try validateAggregateSchemas(args, metas);
-    const meta0 = &metas[0];
-    const bound = try bindAggregateQuery(arena, args, meta0);
-    const agg_calls = bound.calls;
-    const filter_opt = bound.filter;
-    const group_by_keys = bound.keys;
-    const group_outputs = bound.outputs;
-    const error_group_keys = bound.error_keys;
-    const error_outputs = bound.error_outputs;
-    const agg_sources = bound.sources;
-    if (!explain) if (args.diag) |diag| {
-        diag.execution_started = true;
-    };
-    const t_parse_end = nowMonoNs();
-    t.parse_ns = @intCast(t_parse_end - t_parse);
-    profile.record(prof, .parse_query, t_parse, t_parse_end, profile.args(.{}));
-    if (args.profiler) |p| p.setColumnsFromMeta(meta0);
-    const plan_span = profile.Span.begin(prof);
-
-    if (!explain) if (try countRankedDistinct(gpa, arena, args, metas, agg_calls, group_by_keys, group_outputs, filter_opt)) |r|
-        return r;
-
-    // 3. What the query reads, and which columns statistics answer outright. The S3 planner makes the same plan
-    //    from the same footers, so every column read here was fetched.
-    const plan: agg_plan.Plan = try .init(arena, .{
-        .filter = filter_opt,
-        .calls = agg_calls,
-        .group_keys = group_by_keys,
-    }, metas, .fromFlags(args.scan_all, args.trust_stats));
-
-    // 3b. Bloom filters, before any worker decides a row group: every decision then reads the same footers.
-    var membership_stats: membership.Stats = .{};
-    if (!explain) if (filter_opt) |f| if (probesMembership(args)) {
-        const files = try arena.alloc([]const u8, args.inputs.len);
-        for (args.inputs, files) |in, *b| b.* = in.bytes;
-        const mapped: membership.MappedSource = .{ .files = files };
-        membership_stats = try membership.load(arena, gpa, f, metas, mapped.source(), .{ .threads = args.parallelism });
-        _ = try nanprobe.load(gpa, f, metas, mapped.source(), .{ .threads = args.parallelism, .compressed = false });
-    };
-
+    plan: agg_plan.Plan,
+    agg_calls: []const expr_agg.AggCall,
+    group_by_keys: ?[]const expr_ast.Expr,
+) !WorkPhase {
     // 4. Build the flat row-group work list. If we have fewer row groups
     //    than the requested parallelism (e.g. wide scans on few large row groups),
     //    we split each row group's aggregates into chunks (horizontal scaling/sub-RG).
@@ -654,7 +621,77 @@ fn prepareAggregateWithMetas(
         }
     }
     const by_bytes = @max(@as(usize, 1), @as(usize, @intCast(fetch_bytes / @max(1, args.min_bytes_per_worker))));
-    var n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
+    const n_workers = @max(@as(usize, 1), @min(@min(requested, work_items.items.len), by_bytes));
+    return .{
+        .items = work_items,
+        .total_rgs = total_rgs,
+        .requested = requested,
+        .chunks_per_rg = chunks_per_rg,
+        .by_bytes = by_bytes,
+        .workers = n_workers,
+    };
+}
+
+fn prepareAggregateWithMetas(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    initial_args: MultiAggArgs,
+    comptime explain: bool,
+    metas: []const schema.FileMetaData,
+    t_parse: i64,
+) !if (explain) AggregateExplanation else MultiAggResult {
+    var args = initial_args;
+    var t: Timings = .{};
+    const prof = profile.threadOf(args.profiler, .main);
+
+    try validateAggregateSchemas(args, metas);
+    const meta0 = &metas[0];
+    const bound = try bindAggregateQuery(arena, args, meta0);
+    const agg_calls = bound.calls;
+    const filter_opt = bound.filter;
+    const group_by_keys = bound.keys;
+    const group_outputs = bound.outputs;
+    const error_group_keys = bound.error_keys;
+    const error_outputs = bound.error_outputs;
+    const agg_sources = bound.sources;
+    if (!explain) if (args.diag) |diag| {
+        diag.execution_started = true;
+    };
+    const t_parse_end = nowMonoNs();
+    t.parse_ns = @intCast(t_parse_end - t_parse);
+    profile.record(prof, .parse_query, t_parse, t_parse_end, profile.args(.{}));
+    if (args.profiler) |p| p.setColumnsFromMeta(meta0);
+    const plan_span = profile.Span.begin(prof);
+
+    if (!explain) if (try countRankedDistinct(gpa, arena, args, metas, agg_calls, group_by_keys, group_outputs, filter_opt)) |r|
+        return r;
+
+    // 3. What the query reads, and which columns statistics answer outright. The S3 planner makes the same plan
+    //    from the same footers, so every column read here was fetched.
+    const plan: agg_plan.Plan = try .init(arena, .{
+        .filter = filter_opt,
+        .calls = agg_calls,
+        .group_keys = group_by_keys,
+    }, metas, .fromFlags(args.scan_all, args.trust_stats));
+
+    // 3b. Bloom filters, before any worker decides a row group: every decision then reads the same footers.
+    var membership_stats: membership.Stats = .{};
+    if (!explain) if (filter_opt) |f| if (probesMembership(args)) {
+        const files = try arena.alloc([]const u8, args.inputs.len);
+        for (args.inputs, files) |in, *b| b.* = in.bytes;
+        const mapped: membership.MappedSource = .{ .files = files };
+        membership_stats = try membership.load(arena, gpa, f, metas, mapped.source(), .{ .threads = args.parallelism });
+        _ = try nanprobe.load(gpa, f, metas, mapped.source(), .{ .threads = args.parallelism, .compressed = false });
+    };
+
+    const work_phase = try buildWorkPhase(explain, gpa, arena, args, metas, plan, agg_calls, group_by_keys);
+    const work_items = work_phase.items;
+    errdefer for (work_items.items) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
+    const total_rgs = work_phase.total_rgs;
+    const requested = work_phase.requested;
+    const chunks_per_rg = work_phase.chunks_per_rg;
+    const by_bytes = work_phase.by_bytes;
+    var n_workers = work_phase.workers;
     plan_span.end(.plan, profile.args(.{ work_items.items.len, n_workers, total_rgs }));
 
     var string_record_path: ?RecordAdmission = null;

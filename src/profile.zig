@@ -16,7 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const clock = @import("clock.zig");
-const engine = @import("engine.zig");
+const json_string = @import("engine/json_string.zig");
 const schema = @import("core/schema.zig");
 const system = @import("core/system.zig");
 
@@ -947,12 +947,12 @@ pub fn enumName(comptime E: type, v: u64) []const u8 {
     return std.enums.tagName(E, e) orelse "?";
 }
 
-/// `s` as a quoted JSON string under the Lambda's JSON policy (`engine.writeJsonString`): escapes, and every byte
+/// `s` as a quoted JSON string under the Lambda's JSON policy: escapes, and every byte
 /// that does not start valid UTF-8 written as U+FFFD. Names and the request echo are arbitrary bytes; the output
 /// must still parse.
 pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
-    try engine.writeJsonString(w, s);
+    try json_string.writeJsonString(w, s);
     try w.writeByte('"');
 }
 

@@ -290,7 +290,6 @@ const valuesCol = consumer_column.valuesCol;
 
 const decodeCodes = consumer_column.decodeCodes;
 
-
 /// Decode one column chunk into the batch lane its physical and logical type select.
 pub fn decodeAggColumn(
     ra: std.mem.Allocator,
@@ -328,104 +327,8 @@ pub fn decodeAggColumn(
             scratch,
         ),
     };
-    return switch (cm.type) {
-        .INT32 => if (schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?))
-            .{ .i64 = try decodeU32ColumnAsI64Pruned(
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                prune_info,
-                decode_options,
-                scratch,
-            ) }
-        else
-            .{ .i32 = try decodeColumnTPruned(
-                i32,
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                prune_info,
-                decode_options,
-                scratch,
-            ) },
-        .INT64 => .{ .i64 = try decodeColumnTPruned(
-            i64,
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            prune_info,
-            decode_options,
-            scratch,
-        ) },
-        .FLOAT => .{ .f32 = try decodeColumnTPruned(
-            f32,
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            prune_info,
-            decode_options,
-            scratch,
-        ) },
-        .DOUBLE => .{ .f64 = try decodeColumnTPruned(
-            f64,
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            prune_info,
-            decode_options,
-            scratch,
-        ) },
-        .BYTE_ARRAY => .{ .string = try decodeColumnTPruned(
-            []const u8,
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            prune_info,
-            decode_options,
-            scratch,
-        ) },
-        .BOOLEAN => .{ .boolean = try decodeColumnTPruned(
-            bool,
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            prune_info,
-            decode_options,
-            scratch,
-        ) },
-        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            decode_options.page_bytes_limit,
-        ) },
-        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            flbaWidth(schema_elem),
-            prune_info,
-            decode_options,
-            scratch,
-        ) },
+    if (cm.type == .INT32 and schema_elem != null and schema.isUnsignedIntTo32(schema_elem.?)) return .{
+        .i64 = try decodeU32ColumnAsI64Pruned(ra, chunk, cm.codec, levels, n_leaves, prune_info, decode_options, scratch),
     };
+    return consumer_column.decodePhysical(ra, chunk, cm, schema_elem, levels, n_leaves, prune_info, decode_options, scratch);
 }
-

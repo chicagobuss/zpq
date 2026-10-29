@@ -594,7 +594,6 @@ test "checkRowShape ties flat and repeated columns to the row count" {
     try testing.expectError(error.ColumnRowCountMismatch, checkRowShape(no_start, 1));
 }
 
-
 pub fn valuesCol(comptime T: type, v: anytype, levels: schema.Levels) filter_eval.ColumnT(T) {
     return .{
         .values = v.values,
@@ -603,7 +602,6 @@ pub fn valuesCol(comptime T: type, v: anytype, levels: schema.Levels) filter_eva
         .has_nulls = v.has_nulls,
     };
 }
-
 
 pub fn codedCol(comptime T: type, c: anytype, dict: []const T, levels: schema.Levels) filter_eval.ColumnT(T) {
     return .{
@@ -615,7 +613,6 @@ pub fn codedCol(comptime T: type, c: anytype, dict: []const T, levels: schema.Le
         .has_nulls = c.has_nulls,
     };
 }
-
 
 /// Decode one DECIMAL column's chunk to unscaled i128 integers (the
 /// lossless output lane). Re-derives the chunk window the same way the
@@ -661,7 +658,6 @@ pub fn decodeDecimalI128(
     );
 }
 
-
 pub fn codedOrValues(
     comptime T: type,
     comptime tag: std.meta.Tag(filter_eval.Batch.Column),
@@ -694,6 +690,96 @@ pub fn decodeCodes(
     return reader.readAllCodes(n_leaves);
 }
 
+/// Decode a physical lane shared by output and aggregate consumers; logical conversions stay with their callers.
+pub fn decodePhysical(
+    ra: std.mem.Allocator,
+    chunk: []const u8,
+    cm: schema.ColumnMetaData,
+    schema_elem: ?schema.SchemaElement,
+    levels: schema.Levels,
+    n_leaves: usize,
+    prune_info: ?PruningInfo,
+    decode_options: DecodeOptions,
+    scratch: ?*DecodeScratch,
+) !filter_eval.Batch.Column {
+    return switch (cm.type) {
+        .INT32 => .{ .i32 = try decodeColumnTPruned(i32, ra, chunk, cm.codec, levels, n_leaves, prune_info, decode_options, scratch) },
+        .INT64 => .{ .i64 = try decodeColumnTPruned(
+            i64,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .FLOAT => .{ .f32 = try decodeColumnTPruned(
+            f32,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .DOUBLE => .{ .f64 = try decodeColumnTPruned(
+            f64,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .BYTE_ARRAY => .{ .string = try decodeColumnTPruned(
+            []const u8,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .BOOLEAN => .{ .boolean = try decodeColumnTPruned(
+            bool,
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            decode_options.page_bytes_limit,
+        ) },
+        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnPruned(
+            ra,
+            chunk,
+            cm.codec,
+            levels,
+            n_leaves,
+            flbaWidth(schema_elem),
+            prune_info,
+            decode_options,
+            scratch,
+        ) },
+    };
+}
 
 /// Decode column `ci` of a row group into the batch lane the write path keeps it in.
 pub fn decodeWriteColumn(
@@ -735,54 +821,7 @@ pub fn decodeWriteColumn(
     } else if (schema_elem != null and schema.isFloat16(schema_elem.?)) .{
         // FLOAT16 (FLBA(2), IEEE half) → f64 lane for numeric agg/filter.
         .f64 = try decodeFloat16ColumnAsF64(ra, chunk, cm.codec, levels, n_leaves, decode_options),
-    } else switch (cm.type) {
-        .INT32 => .{
-            .i32 = try decodeColumnTWithOptions(i32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .INT64 => .{
-            .i64 = try decodeColumnTWithOptions(i64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .FLOAT => .{
-            .f32 = try decodeColumnTWithOptions(f32, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .DOUBLE => .{
-            .f64 = try decodeColumnTWithOptions(f64, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        .BYTE_ARRAY => .{
-            .string = try decodeColumnTWithOptions(
-                []const u8,
-                ra,
-                chunk,
-                cm.codec,
-                levels,
-                n_leaves,
-                decode_options,
-            ),
-        },
-        .BOOLEAN => .{
-            .boolean = try decodeColumnTWithOptions(bool, ra, chunk, cm.codec, levels, n_leaves, decode_options),
-        },
-        // INT96 (legacy Spark/Impala timestamp) → i64 epoch-nanoseconds.
-        .INT96 => .{ .i64 = try int96_mod.decodeColumnAsI64Nanos(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            decode_options.page_bytes_limit,
-        ) },
-        // FIXED_LEN_BYTE_ARRAY (non-decimal — decimal handled above): raw
-        // fixed-width bytes (UUID / Float16 / fixed binary).
-        .FIXED_LEN_BYTE_ARRAY => .{ .string = try decodeFlbaColumnWithOptions(
-            ra,
-            chunk,
-            cm.codec,
-            levels,
-            n_leaves,
-            flbaWidth(schema_elem),
-            decode_options,
-        ) },
-    };
+    } else try decodePhysical(ra, chunk, cm, schema_elem, levels, n_leaves, null, decode_options, null);
     try checkRowShape(decoded, num_rows);
     if (chunk_span.t != null) chunk_span.end(.column_chunk, chunkArgs(0, 0, ci, cm));
     return decoded;
@@ -887,4 +926,3 @@ test "chunkDictionary gives a string chunk's dictionary only when every data pag
         }
     }
 }
-

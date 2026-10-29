@@ -266,16 +266,6 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     try sink.write(&PAR1);
     out_offset += PAR1.len;
 
-    var rows_in: i64 = 0;
-    var rows_pruned: i64 = 0;
-    var rows_kept: i64 = 0;
-    var rgs_in: usize = 0;
-    var rgs_pruned: usize = 0;
-    var rg_kept: usize = 0;
-    var bytes_in: u64 = 0;
-    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
-    // Footers of inputs with row groups byte-copied into the output: their bounds decide the declared column orders.
-    var copied_from: std.ArrayListUnmanaged(*const schema.FileMetaData) = .empty;
     // `--select` always re-encodes: the byte-copy fastpath copies every column
     // chunk in leaf order with `kept_set == null`, but a select builds the
     // footer schema from only the selected/reordered columns — so a pure
@@ -333,278 +323,35 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // footer write further down still references, so they are freed at function
     // scope, AFTER the footer is built. (The bulk encoded bytes are freed
     // earlier, by the windowed writer.)
-    var win_slots: []Slot = &.{};
-    defer for (win_slots) |*s| s.meta_arena.deinit();
-    var page_indexes: page_index.Deferred = .{};
+    const kept_opt: ?[]const bool = if (kept_set != null) kept_arr else null;
+    var rows: WriteRows = .{
+        .ctx = ctx,
+        .arena = arena,
+        .args = args,
+        .opened = opened,
+        .metas = metas,
+        .meta0 = meta0,
+        .prof = prof,
+        .kept_opt = kept_opt,
+        .kept_set = kept_set,
+        .kept_arr = kept_arr,
+        .fetch_arr = fetch_arr,
+        .filter_opt = filter_opt,
+        .output_specs = output_specs,
+        .select_items = select_items,
+        .num_leaves = num_leaves,
+        .need_encoder = need_encoder,
+        .zstd = zstd,
+        .blooms = blooms,
+        .sink = sink,
+        .out_offset = out_offset,
+        .t = &t,
+    };
+    defer rows.deinit();
 
     if (args.diag) |diag| diag.execution_started = true;
     const t_scan = nowMonoNs();
-    const kept_opt: ?[]const bool = if (kept_set != null) kept_arr else null;
-    if (!need_encoder and args.codec != null and anyChunkNeedsRecompress(metas, kept_opt, args.codec.?)) {
-        // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
-        // behind a byte window, as the re-encode path below does.
-        var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
-        for (opened.inputs, metas, 0..) |in, *meta_p, ii| {
-            bytes_in += in.bytes.len;
-            for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
-                rgs_in += 1;
-                rows_in += src_rg.num_rows;
-                try jobs.append(arena, .{
-                    .bytes = in.bytes,
-                    .meta = meta_p,
-                    .rg = src_rg,
-                    .file_index = ii,
-                    .rg_index = rgs_in - 1,
-                    .gate = in.gate,
-                    .file_rg = ri,
-                });
-            }
-        }
-        for (metas) |*m| try copied_from.append(arena, m);
-        if (jobs.items.len > 0) {
-            const sizing = writeWindow(ctx, args, jobs.items);
-            const window = sizing.window;
-            const slots = try arena.alloc(RecompressSlot, jobs.items.len);
-            for (slots) |*sl| sl.* = .{ .arena = std.heap.ArenaAllocator.init(ctx.gpa) };
-            defer for (slots) |*sl| sl.arena.deinit();
-            var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
-            var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
-            var rw = RecompressCtx{
-                .worker_io = ctx.worker_io,
-                .win_unit = sizing.unit,
-                .win_units = sizing.units,
-                .gpa = ctx.gpa,
-                .jobs = jobs.items,
-                .kept = kept_opt,
-                .codec = args.codec.?,
-                .zstd = zstd,
-                .bloom_leaves = blooms.leaves,
-                .dictionary_bloom = args.bloom_filters_enabled,
-                .slots = slots,
-                .window = &window_sem,
-                .completions = &completions_sem,
-                .sink = sink,
-                .out_offset = out_offset,
-                .new_row_groups = &new_row_groups,
-                .arena = arena,
-                .profiler = args.profiler,
-            };
-            const effective = sizing.workers;
-            // The output in flight is a quarter of the budget, shared by the row groups recompressing at once.
-            rw.share = args.max_memory / 4 / @max(1, effective);
-            rw.page_workers = @max(1, sizing.budget / @max(1, effective));
-            const re_span = profile.Span.begin(prof);
-            defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective, window }));
-            try runWindowed(RecompressCtx, &rw, jobs.items.len, effective);
-            out_offset = rw.out_offset;
-            rows_kept += rw.rows_kept;
-            rg_kept += rw.rgs_kept;
-            t.core.sink_ns += rw.core.sink_ns;
-            t.core.encode_ns += rw.core.encode_ns;
-        }
-    } else if (!need_encoder) {
-        // Byte-copy fastpath: copy kept column chunks verbatim (serial;
-        // memcpy-bound and already faster than every other engine). A chunk
-        // stored in another codec than the one requested is recompressed.
-        const recompress: ?consumer.Recompress = if (args.codec) |c|
-            .{ .codec = c, .zstd = zstd, .scratch = ctx.gpa }
-        else
-            null;
-        for (opened.inputs, metas) |in, meta_i| {
-            bytes_in += in.bytes.len;
-            const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
-            const meta_const = meta_i;
-            for (meta_const.row_groups.items, 0..) |*src_rg, ri| {
-                rgs_in += 1;
-                rows_in += src_rg.num_rows;
-                const rg_span = profile.Span.begin(prof);
-                defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
-                if (in.gate) |g| try g.wait(g.ctx, ri);
-                defer skipRowGroup(in, ri);
-                const bloom_write: consumer.BloomWrite = .{
-                    .fpp = blooms.leaves,
-                    .meta = &meta_i,
-                    .scratch = ctx.gpa,
-                    .dictionary_bloom = args.bloom_filters_enabled,
-                };
-                const out = try consumer.copyRG(
-                    arena,
-                    src_rg,
-                    rg_src,
-                    if (kept_set != null) kept_arr else null,
-                    sink,
-                    &out_offset,
-                    &t.core,
-                    true,
-                    recompress,
-                    bloom_write,
-                );
-                if (out.rg) |new_rg| try new_row_groups.append(arena, new_rg);
-                rows_kept += out.surviving_rows;
-                if (out.surviving_rows > 0) rg_kept += 1;
-            }
-        }
-        for (metas) |*m| try copied_from.append(arena, m);
-    } else {
-        // Windowed re-encode: one path for all environments. Concurrency is
-        // bounded by the CPU budget (quota- and Lambda-aware); in-flight
-        // memory is bounded by a sliding window (W row groups). No env gate —
-        // the two knobs below size themselves from the environment.
-
-        // Byte-copy passthrough eligibility: a fully-passing row group
-        // (Decision.always_match) can be copied verbatim instead of
-        // decoded/filtered/re-encoded — but only for a plain filter over
-        // passthrough columns. A reordering `--select` or a DECIMAL output
-        // (which the footer coerces on re-encode) would make a byte-copied RG
-        // disagree with the footer, so exclude those.
-        var has_widened_output = false;
-        if (select_items == null and filter_opt != null) {
-            for (0..num_leaves) |ci| {
-                if (!kept_arr[ci]) continue;
-                const e = metadata.leafSchemaElement(meta0, ci) orelse continue;
-                if (decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e)) {
-                    has_widened_output = true;
-                    break;
-                }
-            }
-        }
-        const bytecopy_ok = select_items == null and filter_opt != null and !has_widened_output;
-
-        // 1. Collect surviving row groups (serial, cheap stats-only pruning).
-        var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
-        for (opened.inputs, 0..) |in, ii| {
-            bytes_in += in.bytes.len;
-            const meta_p = &metas[ii];
-            for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
-                rgs_in += 1;
-                rows_in += src_rg.num_rows;
-                var passthrough = false;
-                if (filter_opt) |f| if (!args.scan_all) {
-                    const d = filter_prune.pruneRowGroup(src_rg, f, meta_p);
-                    if (d == .skip) {
-                        rgs_pruned += 1;
-                        rows_pruned += src_rg.num_rows;
-                        skipRowGroup(in, ri);
-                        continue;
-                    }
-                    // Byte-copy preserves the source codec, so it may only stand
-                    // in for a re-encode when the requested --codec already
-                    // matches every kept column (else re-encode to honor it).
-                    // ...and only when its bounds are in the TYPE_DEFINED_ORDER the re-encoded row groups declare.
-                    if (bytecopy_ok and d == .always_match and
-                        keptColumnsUseCodec(src_rg, kept_arr, args.codec orelse .SNAPPY) and
-                        meta_p.keptLeavesTypeDefined(kept_arr))
-                        passthrough = true;
-                };
-                if (passthrough and (copied_from.items.len == 0 or copied_from.getLast() != meta_p))
-                    try copied_from.append(arena, meta_p);
-                try jobs.append(arena, .{
-                    .bytes = in.bytes,
-                    .meta = meta_p,
-                    .rg = src_rg,
-                    .passthrough = passthrough,
-                    .file_index = ii,
-                    .rg_index = rgs_in - 1,
-                    .gate = in.gate,
-                    .file_rg = ri,
-                });
-            }
-        }
-
-        if (jobs.items.len > 0) {
-            // 2. Size the two knobs from the environment.
-            const sizing = writeWindow(ctx, args, jobs.items);
-            const window = sizing.window;
-            const effective_async_budget = sizing.workers;
-
-            // 3. Slots hold per-RG results; their meta arenas live to the footer.
-            const slots = try arena.alloc(Slot, jobs.items.len);
-            for (slots) |*s| s.* = .{ .meta_arena = std.heap.ArenaAllocator.init(ctx.gpa) };
-            win_slots = slots;
-
-            // The write's ledger: the producers' decode and encode memory, the row groups waiting for the writer and
-            // its slices hold no more than the budget together, past each producer's first huge page.
-            var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
-            defer if (args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
-            var memory: core_memory.Charged = .{ .child = ctx.gpa, .budget = &ledger };
-            var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &ledger };
-            var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
-            var lean: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &lean_ledger };
-            const regions = try arena.alloc(WorkRegions, @max(effective_async_budget, 1) + sizing.budget + 1);
-            for (regions) |*r| {
-                r.* = .init(ctx.gpa);
-                r.rows.budget = &ledger;
-                r.work.budget = &ledger;
-                r.rows.allowance = huge_pages.huge_page_size;
-            }
-            defer for (regions) |*r| r.deinit();
-            var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
-            var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
-            const early_arr = try arena.alloc(bool, fetch_arr.len);
-            @memset(early_arr, false);
-            if (filter_opt) |f| filter_ast.markColumns(f, early_arr);
-            for (output_specs) |spec| if (spec == .computed) spec.computed.expr.collectColumns(early_arr);
-            // Every piece's aggregator has these leaves; the row groups cut from them are written under them.
-            const out_agg = try consumer.initOutputAggregator(arena, meta0, output_specs);
-            var w = WinCtx{
-                .worker_io = ctx.worker_io,
-                .rg_target = args.row_group.under(args.max_memory_explicit),
-                .early_arr = early_arr,
-                .out_elems = out_agg.schema_elems,
-                .out_paths = out_agg.paths,
-                .page_indexes = &page_indexes,
-                .memory = &memory,
-                .slicing = &slicing,
-                .lean = &lean,
-                .win_unit = sizing.unit,
-                .win_units = sizing.units,
-                .gpa = ctx.gpa,
-                .jobs = jobs.items,
-                .filter = filter_opt,
-                .fetch_arr = fetch_arr,
-                .output_specs = output_specs,
-                .kept_set = kept_set,
-                .codec = args.codec orelse .SNAPPY,
-                .zstd = zstd,
-                .parquet_version = args.parquet_version,
-                .decode_options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
-                .bloom_outputs = blooms.outputs,
-                .bloom_leaves = blooms.leaves,
-                .dictionary_bloom = args.bloom_filters_enabled,
-                .slots = slots,
-                .regions = regions,
-                .window = &window_sem,
-                .completions = &completions_sem,
-                .sink = sink,
-                .out_offset = out_offset,
-                .new_row_groups = &new_row_groups,
-                .arena = arena,
-                .profiler = args.profiler,
-                .diag = args.diag,
-                // Leave room for the executor beside whole producer pieces; wide input need not take the serial
-                // slice path merely because few input groups are available. Output boundaries remain unchanged.
-                .decode_share = args.max_memory / 2 / @max(1, effective_async_budget),
-            };
-            // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
-            w.cpu_budget = sizing.budget;
-            w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
-            defer w.piece_pool.deinit();
-            defer consumer.releaseSlicePool(&w.slice_pool);
-            w.piece_pages.child = w.outAlloc();
-            w.slicing_pages.child = slicing.allocator();
-            w.lean_pages.child = lean.allocator();
-            const re_span = profile.Span.begin(prof);
-            defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
-            try runWindowedReencode(&w, effective_async_budget);
-            out_offset = w.out_offset;
-            rows_kept += w.rows_kept;
-            rg_kept += w.rgs_kept;
-            t.core.sink_ns += w.sink_ns;
-            t.core.decode_ns += w.core.decode_ns;
-            t.core.eval_ns += w.core.eval_ns;
-            t.core.encode_ns += w.core.encode_ns;
-        }
-    }
+    try rows.run();
 
     if (args.codec == .ZSTD) {
         var pages: [4]u64 = undefined;
@@ -618,71 +365,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // 6. Page indexes of the re-encoded chunks and Bloom filters after the row groups, then the footer.
     const t_footer = nowMonoNs();
     t.decode_wall_ns = @intCast(t_footer - t_scan);
-    const footer_span = profile.Span.begin(prof);
-    {
-        var so: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(out_offset) };
-        try page_indexes.write(arena, &so, new_row_groups.items);
-        try fastpath.placeFilters(&so, new_row_groups.items);
-        out_offset = so.offset;
-    }
-    var new_schema_items = meta0.schema;
-    if (select_items != null) {
-        // Build a flat schema for --select. Each output_spec produces
-        // one leaf in the output. (Lifted from cli/query.zig.)
-        new_schema_items = try buildSelectSchema(arena, meta0, output_specs);
-    } else if (kept_set) |_| {
-        const kept_u32 = try arena.alloc(u32, kept_in_order.items.len);
-        for (kept_in_order.items, 0..) |idx, i| kept_u32[i] = @intCast(idx);
-        const projected = try tree0.projectSubset(arena, kept_u32);
-        new_schema_items = try projected.writeFlatThrift(arena);
-    }
-
-    // When re-encoding, BYTE_ARRAY-backed decimals are emitted as FIXED_LEN_BYTE_ARRAY
-    // of the minimal width for their precision. Align the footer schema leaves so the
-    // schema agrees with the on-disk column chunks. Byte-copy passthrough
-    // (need_encoder=false) preserves the original BYTE_ARRAY encoding untouched.
-    if (need_encoder) {
-        coerceByteArrayDecimalLeavesToFlba(&new_schema_items);
-        coerceFloat16LeavesToDouble(&new_schema_items);
-    }
-
-    // Output structural invariant — ALWAYS ON, even under ReleaseFast.
-    // Every row group must carry exactly one column chunk per footer
-    // leaf. If the footer leaf count and emitted chunks disagree, strict
-    // readers reject the file. This guard must survive ReleaseFast, so it
-    // is an error instead of a debug assert.
-    const footer_leaves = invariant.footerLeafCount(new_schema_items.items);
-    const kept_map: ?[]const usize = if (select_items == null and kept_set != null) kept_in_order.items else null;
-    // Encoded column data makes the file zpq's (row groups copied beside it keep only bounds no writer quirk
-    // reads differently); a pure byte copy or recompression stays its source's.
-    if (need_encoder) for (new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
-    const new_meta: schema.FileMetaData = .{
-        .version = args.parquet_version.footer(),
-        .schema = new_schema_items,
-        .num_rows = rows_kept,
-        .created_by = if (need_encoder) schema.ZPQ_CREATED_BY else meta0.created_by,
-        .row_groups = new_row_groups,
-        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, footer_leaves, kept_map, copied_from.items),
-    };
-
-    for (new_row_groups.items) |rg_chk| {
-        if (rg_chk.columns.items.len != footer_leaves) return error.FooterSchemaChunkMismatch;
-    }
-
-    var w: thrift.Writer = .init(arena);
-    defer w.deinit();
-    try new_meta.write(&w);
-    const footer_bytes = w.bytes();
-    try sink.write(footer_bytes);
-    out_offset += footer_bytes.len;
-    var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
-    try sink.write(&len_bytes);
-    out_offset += len_bytes.len;
-    try sink.write(&PAR1);
-    out_offset += PAR1.len;
-    t.footer_ns += @intCast(nowMonoNs() - t_footer);
-    footer_span.end(.footer_write, profile.args(.{footer_bytes.len + 8}));
+    try rows.writeFooter(tree0, kept_in_order.items, t_footer);
 
     // Publish only after the sink has reported completion, and only what was read of inputs that stayed whole.
     try opened.intact();
@@ -699,20 +382,401 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     }
 
     return .{
-        .codec = writtenCodec(new_row_groups.items, args.codec orelse .SNAPPY),
+        .codec = writtenCodec(rows.new_row_groups.items, args.codec orelse .SNAPPY),
         .files_in = opened.inputs.len,
-        .rows_in = rows_in,
-        .rows_scanned = rows_in - rows_pruned,
-        .rows_matched = rows_kept,
-        .bytes_in = bytes_in,
-        .bytes_out = out_offset,
-        .row_groups_in = rgs_in,
-        .row_groups_kept = rg_kept,
-        .row_groups_pruned = rgs_pruned,
+        .rows_in = rows.rows_in,
+        .rows_scanned = rows.rows_in - rows.rows_pruned,
+        .rows_matched = rows.rows_kept,
+        .bytes_in = rows.bytes_in,
+        .bytes_out = rows.out_offset,
+        .row_groups_in = rows.rgs_in,
+        .row_groups_kept = rows.rg_kept,
+        .row_groups_pruned = rows.rgs_pruned,
         .membership = probed,
         .timings = t,
     };
 }
+
+/// Row-group output and its footer share the slot arenas until the footer has been written.
+const WriteRows = struct {
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    opened: input.OpenedInputs,
+    metas: []const schema.FileMetaData,
+    meta0: *const schema.FileMetaData,
+    prof: ?*profile.Thread,
+    kept_opt: ?[]const bool,
+    kept_set: ?[]const bool,
+    kept_arr: []const bool,
+    fetch_arr: []const bool,
+    filter_opt: ?filter_ast.Filter,
+    output_specs: []const consumer.OutputCol,
+    select_items: ?[]expr_ast.SelectItem,
+    num_leaves: usize,
+    need_encoder: bool,
+    zstd: compression.ZstdPlan,
+    blooms: BloomPlan,
+    sink: streaming.Sink,
+    out_offset: u64,
+    t: *Timings,
+    rows_in: i64 = 0,
+    rows_pruned: i64 = 0,
+    rows_kept: i64 = 0,
+    rgs_in: usize = 0,
+    rgs_pruned: usize = 0,
+    rg_kept: usize = 0,
+    bytes_in: u64 = 0,
+    new_row_groups: std.ArrayList(schema.RowGroup) = .empty,
+    copied_from: std.ArrayList(*const schema.FileMetaData) = .empty,
+    win_slots: []Slot = &.{},
+    page_indexes: page_index.Deferred = .{},
+
+    fn deinit(self: *WriteRows) void {
+        for (self.win_slots) |*slot| slot.meta_arena.deinit();
+    }
+
+    fn run(self: *WriteRows) !void {
+        if (!self.need_encoder and self.args.codec != null and anyChunkNeedsRecompress(self.metas, self.kept_opt, self.args.codec.?)) {
+            // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
+            // behind a byte window, as the re-encode path below does.
+            var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
+            for (self.opened.inputs, self.metas, 0..) |in, *meta_p, ii| {
+                self.bytes_in += in.bytes.len;
+                for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
+                    self.rgs_in += 1;
+                    self.rows_in += src_rg.num_rows;
+                    try jobs.append(self.arena, .{
+                        .bytes = in.bytes,
+                        .meta = meta_p,
+                        .rg = src_rg,
+                        .file_index = ii,
+                        .rg_index = self.rgs_in - 1,
+                        .gate = in.gate,
+                        .file_rg = ri,
+                    });
+                }
+            }
+            for (self.metas) |*m| try self.copied_from.append(self.arena, m);
+            if (jobs.items.len > 0) {
+                const sizing = writeWindow(self.ctx, self.args, jobs.items);
+                const window = sizing.window;
+                const slots = try self.arena.alloc(RecompressSlot, jobs.items.len);
+                for (slots) |*sl| sl.* = .{ .arena = std.heap.ArenaAllocator.init(self.ctx.gpa) };
+                defer for (slots) |*sl| sl.arena.deinit();
+                var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
+                var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+                var rw = RecompressCtx{
+                    .worker_io = self.ctx.worker_io,
+                    .win_unit = sizing.unit,
+                    .win_units = sizing.units,
+                    .gpa = self.ctx.gpa,
+                    .jobs = jobs.items,
+                    .kept = self.kept_opt,
+                    .codec = self.args.codec.?,
+                    .zstd = self.zstd,
+                    .bloom_leaves = self.blooms.leaves,
+                    .dictionary_bloom = self.args.bloom_filters_enabled,
+                    .slots = slots,
+                    .window = &window_sem,
+                    .completions = &completions_sem,
+                    .sink = self.sink,
+                    .out_offset = self.out_offset,
+                    .new_row_groups = &self.new_row_groups,
+                    .arena = self.arena,
+                    .profiler = self.args.profiler,
+                };
+                const effective = sizing.workers;
+                // The output in flight is a quarter of the budget, shared by the row groups recompressing at once.
+                rw.share = self.args.max_memory / 4 / @max(1, effective);
+                rw.page_workers = @max(1, sizing.budget / @max(1, effective));
+                const re_span = profile.Span.begin(self.prof);
+                defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective, window }));
+                try runWindowed(RecompressCtx, &rw, jobs.items.len, effective);
+                self.out_offset = rw.out_offset;
+                self.rows_kept += rw.rows_kept;
+                self.rg_kept += rw.rgs_kept;
+                self.t.core.sink_ns += rw.core.sink_ns;
+                self.t.core.encode_ns += rw.core.encode_ns;
+            }
+        } else if (!self.need_encoder) {
+            // Byte-copy fastpath: copy kept column chunks verbatim (serial;
+            // memcpy-bound and already faster than every other engine). A chunk
+            // stored in another codec than the one requested is recompressed.
+            const recompress: ?consumer.Recompress = if (self.args.codec) |c|
+                .{ .codec = c, .zstd = self.zstd, .scratch = self.ctx.gpa }
+            else
+                null;
+            for (self.opened.inputs, self.metas) |in, meta_i| {
+                self.bytes_in += in.bytes.len;
+                const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
+                const meta_const = meta_i;
+                for (meta_const.row_groups.items, 0..) |*src_rg, ri| {
+                    self.rgs_in += 1;
+                    self.rows_in += src_rg.num_rows;
+                    const rg_span = profile.Span.begin(self.prof);
+                    defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
+                    if (in.gate) |g| try g.wait(g.ctx, ri);
+                    defer skipRowGroup(in, ri);
+                    const bloom_write: consumer.BloomWrite = .{
+                        .fpp = self.blooms.leaves,
+                        .meta = &meta_i,
+                        .scratch = self.ctx.gpa,
+                        .dictionary_bloom = self.args.bloom_filters_enabled,
+                    };
+                    const out = try consumer.copyRG(
+                        self.arena,
+                        src_rg,
+                        rg_src,
+                        if (self.kept_set != null) self.kept_arr else null,
+                        self.sink,
+                        &self.out_offset,
+                        &self.t.core,
+                        true,
+                        recompress,
+                        bloom_write,
+                    );
+                    if (out.rg) |new_rg| try self.new_row_groups.append(self.arena, new_rg);
+                    self.rows_kept += out.surviving_rows;
+                    if (out.surviving_rows > 0) self.rg_kept += 1;
+                }
+            }
+            for (self.metas) |*m| try self.copied_from.append(self.arena, m);
+        } else {
+            // Windowed re-encode: one path for all environments. Concurrency is
+            // bounded by the CPU budget (quota- and Lambda-aware); in-flight
+            // memory is bounded by a sliding window (W row groups). No env gate —
+            // the two knobs below size themselves from the environment.
+
+            // Byte-copy passthrough eligibility: a fully-passing row group
+            // (Decision.always_match) can be copied verbatim instead of
+            // decoded/filtered/re-encoded — but only for a plain filter over
+            // passthrough columns. A reordering `--select` or a DECIMAL output
+            // (which the footer coerces on re-encode) would make a byte-copied RG
+            // disagree with the footer, so exclude those.
+            var has_widened_output = false;
+            if (self.select_items == null and self.filter_opt != null) {
+                for (0..self.num_leaves) |ci| {
+                    if (!self.kept_arr[ci]) continue;
+                    const e = metadata.leafSchemaElement(self.meta0, ci) orelse continue;
+                    if (decimal_mod.kindFromSchema(&e) != null or schema.isFloat16(e)) {
+                        has_widened_output = true;
+                        break;
+                    }
+                }
+            }
+            const bytecopy_ok = self.select_items == null and self.filter_opt != null and !has_widened_output;
+
+            // 1. Collect surviving row groups (serial, cheap stats-only pruning).
+            var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
+            for (self.opened.inputs, 0..) |in, ii| {
+                self.bytes_in += in.bytes.len;
+                const meta_p = &self.metas[ii];
+                for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
+                    self.rgs_in += 1;
+                    self.rows_in += src_rg.num_rows;
+                    var passthrough = false;
+                    if (self.filter_opt) |f| if (!self.args.scan_all) {
+                        const d = filter_prune.pruneRowGroup(src_rg, f, meta_p);
+                        if (d == .skip) {
+                            self.rgs_pruned += 1;
+                            self.rows_pruned += src_rg.num_rows;
+                            skipRowGroup(in, ri);
+                            continue;
+                        }
+                        // Byte-copy preserves the source codec, so it may only stand
+                        // in for a re-encode when the requested --codec already
+                        // matches every kept column (else re-encode to honor it).
+                        // ...and only when its bounds are in the TYPE_DEFINED_ORDER the re-encoded row groups declare.
+                        if (bytecopy_ok and d == .always_match and
+                            keptColumnsUseCodec(src_rg, self.kept_arr, self.args.codec orelse .SNAPPY) and
+                            meta_p.keptLeavesTypeDefined(self.kept_arr))
+                            passthrough = true;
+                    };
+                    if (passthrough and (self.copied_from.items.len == 0 or self.copied_from.getLast() != meta_p))
+                        try self.copied_from.append(self.arena, meta_p);
+                    try jobs.append(self.arena, .{
+                        .bytes = in.bytes,
+                        .meta = meta_p,
+                        .rg = src_rg,
+                        .passthrough = passthrough,
+                        .file_index = ii,
+                        .rg_index = self.rgs_in - 1,
+                        .gate = in.gate,
+                        .file_rg = ri,
+                    });
+                }
+            }
+
+            if (jobs.items.len > 0) {
+                // 2. Size the two knobs from the environment.
+                const sizing = writeWindow(self.ctx, self.args, jobs.items);
+                const window = sizing.window;
+                const effective_async_budget = sizing.workers;
+
+                // 3. Slots hold per-RG results; their meta arenas live to the footer.
+                const slots = try self.arena.alloc(Slot, jobs.items.len);
+                for (slots) |*s| s.* = .{ .meta_arena = std.heap.ArenaAllocator.init(self.ctx.gpa) };
+                self.win_slots = slots;
+
+                // The write's ledger: the producers' decode and encode memory, the row groups waiting for the writer and
+                // its slices hold no more than the budget together, past each producer's first huge page.
+                var ledger: core_memory.SharedBudget = .{ .limit = self.args.max_memory };
+                defer if (self.args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), self.args.max_memory);
+                var memory: core_memory.Charged = .{ .child = self.ctx.gpa, .budget = &ledger };
+                var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &ledger };
+                var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
+                var lean: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &lean_ledger };
+                const regions = try self.arena.alloc(WorkRegions, @max(effective_async_budget, 1) + sizing.budget + 1);
+                for (regions) |*r| {
+                    r.* = .init(self.ctx.gpa);
+                    r.rows.budget = &ledger;
+                    r.work.budget = &ledger;
+                    r.rows.allowance = huge_pages.huge_page_size;
+                }
+                defer for (regions) |*r| r.deinit();
+                var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
+                var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+                const early_arr = try self.arena.alloc(bool, self.fetch_arr.len);
+                @memset(early_arr, false);
+                if (self.filter_opt) |f| filter_ast.markColumns(f, early_arr);
+                for (self.output_specs) |spec| if (spec == .computed) spec.computed.expr.collectColumns(early_arr);
+                // Every piece's aggregator has these leaves; the row groups cut from them are written under them.
+                const out_agg = try consumer.initOutputAggregator(self.arena, self.meta0, self.output_specs);
+                var w = WinCtx{
+                    .worker_io = self.ctx.worker_io,
+                    .rg_target = self.args.row_group.under(self.args.max_memory_explicit),
+                    .early_arr = early_arr,
+                    .out_elems = out_agg.schema_elems,
+                    .out_paths = out_agg.paths,
+                    .page_indexes = &self.page_indexes,
+                    .memory = &memory,
+                    .slicing = &slicing,
+                    .lean = &lean,
+                    .win_unit = sizing.unit,
+                    .win_units = sizing.units,
+                    .gpa = self.ctx.gpa,
+                    .jobs = jobs.items,
+                    .filter = self.filter_opt,
+                    .fetch_arr = self.fetch_arr,
+                    .output_specs = self.output_specs,
+                    .kept_set = self.kept_set,
+                    .codec = self.args.codec orelse .SNAPPY,
+                    .zstd = self.zstd,
+                    .parquet_version = self.args.parquet_version,
+                    .decode_options = .{ .fast_levels = self.args.fast_levels, .expand_limit = self.args.max_memory },
+                    .bloom_outputs = self.blooms.outputs,
+                    .bloom_leaves = self.blooms.leaves,
+                    .dictionary_bloom = self.args.bloom_filters_enabled,
+                    .slots = slots,
+                    .regions = regions,
+                    .window = &window_sem,
+                    .completions = &completions_sem,
+                    .sink = self.sink,
+                    .out_offset = self.out_offset,
+                    .new_row_groups = &self.new_row_groups,
+                    .arena = self.arena,
+                    .profiler = self.args.profiler,
+                    .diag = self.args.diag,
+                    // Leave room for the executor beside whole producer pieces; wide input need not take the serial
+                    // slice path merely because few input groups are available. Output boundaries remain unchanged.
+                    .decode_share = self.args.max_memory / 2 / @max(1, effective_async_budget),
+                };
+                // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
+                w.cpu_budget = sizing.budget;
+                w.piece_pool = .{ .gpa = self.ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
+                defer w.piece_pool.deinit();
+                defer consumer.releaseSlicePool(&w.slice_pool);
+                w.piece_pages.child = w.outAlloc();
+                w.slicing_pages.child = slicing.allocator();
+                w.lean_pages.child = lean.allocator();
+                const re_span = profile.Span.begin(self.prof);
+                defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
+                try runWindowedReencode(&w, effective_async_budget);
+                self.out_offset = w.out_offset;
+                self.rows_kept += w.rows_kept;
+                self.rg_kept += w.rgs_kept;
+                self.t.core.sink_ns += w.sink_ns;
+                self.t.core.decode_ns += w.core.decode_ns;
+                self.t.core.eval_ns += w.core.eval_ns;
+                self.t.core.encode_ns += w.core.encode_ns;
+            }
+        }
+    }
+
+    fn writeFooter(
+        self: *WriteRows,
+        tree0: schema_tree.SchemaTree,
+        kept_in_order: []const usize,
+        t_footer: i64,
+    ) !void {
+        const footer_span = profile.Span.begin(self.prof);
+        {
+            var so: streaming.SinkOut = .{ .sink = self.sink, .offset = @intCast(self.out_offset) };
+            try self.page_indexes.write(self.arena, &so, self.new_row_groups.items);
+            try fastpath.placeFilters(&so, self.new_row_groups.items);
+            self.out_offset = so.offset;
+        }
+        var new_schema_items = self.meta0.schema;
+        if (self.select_items != null) {
+            // Build a flat schema for --select. Each output_spec produces
+            // one leaf in the output. (Lifted from cli/query.zig.)
+            new_schema_items = try buildSelectSchema(self.arena, self.meta0, self.output_specs);
+        } else if (self.kept_set) |_| {
+            const kept_u32 = try self.arena.alloc(u32, kept_in_order.len);
+            for (kept_in_order, 0..) |idx, i| kept_u32[i] = @intCast(idx);
+            const projected = try tree0.projectSubset(self.arena, kept_u32);
+            new_schema_items = try projected.writeFlatThrift(self.arena);
+        }
+
+        // When re-encoding, BYTE_ARRAY-backed decimals are emitted as FIXED_LEN_BYTE_ARRAY
+        // of the minimal width for their precision. Align the footer schema leaves so the
+        // schema agrees with the on-disk column chunks. Byte-copy passthrough
+        // (need_encoder=false) preserves the original BYTE_ARRAY encoding untouched.
+        if (self.need_encoder) {
+            coerceByteArrayDecimalLeavesToFlba(&new_schema_items);
+            coerceFloat16LeavesToDouble(&new_schema_items);
+        }
+
+        // Output structural invariant — ALWAYS ON, even under ReleaseFast.
+        // Every row group must carry exactly one column chunk per footer
+        // leaf. If the footer leaf count and emitted chunks disagree, strict
+        // readers reject the file. This guard must survive ReleaseFast, so it
+        // is an error instead of a debug assert.
+        const footer_leaves = invariant.footerLeafCount(new_schema_items.items);
+        const kept_map: ?[]const usize = if (self.select_items == null and self.kept_set != null) kept_in_order else null;
+        // Encoded column data makes the file zpq's (row groups copied beside it keep only bounds no writer quirk
+        // reads differently); a pure byte copy or recompression stays its source's.
+        if (self.need_encoder) for (self.new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
+        const new_meta: schema.FileMetaData = .{
+            .version = self.args.parquet_version.footer(),
+            .schema = new_schema_items,
+            .num_rows = self.rows_kept,
+            .created_by = if (self.need_encoder) schema.ZPQ_CREATED_BY else self.meta0.created_by,
+            .row_groups = self.new_row_groups,
+            .column_orders = try schema.FileMetaData.outputColumnOrders(self.arena, footer_leaves, kept_map, self.copied_from.items),
+        };
+
+        for (self.new_row_groups.items) |rg_chk| {
+            if (rg_chk.columns.items.len != footer_leaves) return error.FooterSchemaChunkMismatch;
+        }
+
+        var w: thrift.Writer = .init(self.arena);
+        defer w.deinit();
+        try new_meta.write(&w);
+        const footer_bytes = w.bytes();
+        try self.sink.write(footer_bytes);
+        self.out_offset += footer_bytes.len;
+        var len_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_bytes, std.math.cast(u32, footer_bytes.len) orelse return error.TooLarge, .little);
+        try self.sink.write(&len_bytes);
+        self.out_offset += len_bytes.len;
+        try self.sink.write(&PAR1);
+        self.out_offset += PAR1.len;
+        self.t.footer_ns += @intCast(nowMonoNs() - t_footer);
+        footer_span.end(.footer_write, profile.args(.{footer_bytes.len + 8}));
+    }
+};
 
 /// Build a flat output schema for --select mode. One leaf per
 /// output_spec; passthrough columns copy the source leaf (preserving
@@ -799,7 +863,6 @@ pub fn buildSelectSchema(
     return out;
 }
 
-
 pub const FdSink = struct {
     fd: local_fs.fd_t,
     written: u64 = 0,
@@ -859,7 +922,6 @@ pub fn createFile(path: []const u8) !local_fs.fd_t {
     };
 }
 
-
 test "re-encoded FLOAT16 footer widens to DOUBLE" {
     const testing = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -899,7 +961,6 @@ test "re-encoded FLOAT16 footer widens to DOUBLE" {
     try testing.expectEqual(@as(?i32, 16), items.items[1].type_length);
 }
 
-
 test "FdSink segments keep one contiguous writeback range across page and vector boundaries" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
@@ -918,14 +979,12 @@ test "FdSink segments keep one contiguous writeback range across page and vector
     try std.testing.expectEqual(@as(u64, 128 << 20), sink.writeback_to);
 }
 
-
 // ============================================================
 // 1-row aggregate output (local files)
 // ============================================================
 
 /// Write a 1-row aggregate parquet to a local path. Kept in the engine so
 /// both binaries can call it.
-
 pub fn writeOneRowParquet(
     arena: std.mem.Allocator,
     out_path: []const u8,
@@ -1390,4 +1449,3 @@ fn groupedDecColumn(
         .dec = spec,
     };
 }
-

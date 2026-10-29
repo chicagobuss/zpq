@@ -20,7 +20,7 @@ pub fn restoreCounts(workers: []Worker, saved: []const Worker) void {
 /// One pass of `workers` over every work item, from a fresh cursor.
 /// Clears an optional phase's expected failures and partial decode evidence before its exact retry.
 /// Other failures still propagate. `runPhase` chooses refusals canonically before deciding to retry.
-pub fn clearWorkerErrors(workers: []Worker, expected: anyerror) !void {
+pub fn clearWorkerErrors(workers: []Worker, expected: error{ ExceededMemoryBudget, CensusAbandoned }) !void {
     const exact_retry = expected == error.ExceededMemoryBudget or expected == error.CensusAbandoned;
     for (workers) |*w| if (w.err) |we| if (we == expected or
         (exact_retry and consumer.isDecodeError(we)))
@@ -39,6 +39,7 @@ pub fn runPhase(workers: []Worker, cursor: *std.atomic.Value(usize)) !void {
     if (phaseFailure(workers)) |err| return err;
 }
 
+// Worker failures cross thread boundaries and retain their original error values.
 pub fn phaseFailure(workers: []const Worker) ?anyerror {
     for (workers) |w| if (w.err) |err| if (err == error.CensusAbandoned) return err;
     return if (firstWorkerFailure(workers, null)) |failure| failure.err else null;

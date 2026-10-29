@@ -201,11 +201,13 @@ class Run:
             with Path(stdout).open("wb") as out, Path(stderr).open("wb") as err:
                 self.child = subprocess.Popen(argv, stdout=out, stderr=err, env=env, start_new_session=True)
                 save(self.out / "active.json", {"pid": self.child.pid})
-                self.child.wait(timeout=max(0.001, self.deadline - time.monotonic()))
-                rc = self.child.returncode
-            return rc, time.monotonic_ns() - start
-        except subprocess.TimeoutExpired:
-            raise BudgetExpired() from None
+                # Popen.wait(timeout) backs off to 50 ms sleeps, which rounds every timing up to
+                # its next poll; poll at spawn.py's 0.5 ms instead.
+                while (rc := self.child.poll()) is None:
+                    self.check()
+                    time.sleep(0.0005)
+                elapsed = time.monotonic_ns() - start
+            return rc, elapsed
         finally:
             self.drain()
 

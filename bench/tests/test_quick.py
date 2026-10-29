@@ -385,6 +385,15 @@ class Quick(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("duckdb rejected", report["reason"])
 
+    def test_command_timing_is_not_rounded_to_wait_backoff(self):
+        # Popen.wait(timeout) polls at 0.5, 1, 2 ... 32 ms, so an 18 ms child used to read 31.5 ms.
+        run = quick.Run(self.out, time.monotonic() + 5)
+        best = min(run.command([sys.executable, "-c", "import time; time.sleep(0.018)"],
+                               self.out / "o", self.out / "e")[1] for _ in range(3))
+        startup = min(run.command([sys.executable, "-c", "pass"], self.out / "o", self.out / "e")[1]
+                      for _ in range(3))
+        self.assertLess(best - startup, 27_000_000)
+
     def test_nested_native_process_group_is_drained_at_deadline(self):
         run = quick.Run(self.out, time.monotonic() + 0.3)
         pid = self.root / "child.pid"

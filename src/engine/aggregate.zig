@@ -1,3 +1,4 @@
+const expr_ast = @import("../core/expr/ast.zig");
 const engine_text = @import("text.zig");
 const engine_types = @import("types.zig");
 const engine_s3_rebase = @import("s3_rebase.zig");
@@ -206,7 +207,6 @@ pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
     return error.MissingOutputOrAggregate;
 }
 
-
 // ============================================================
 // Aggregate path
 // ============================================================
@@ -231,7 +231,6 @@ fn explainConjuncts(arena: std.mem.Allocator, filter: ?[]const u8, meta: *const 
     }
     return out;
 }
-
 
 /// Planning shares the execution path, with caller-owned arena storage and metadata-only input opening.
 pub fn explainAggregate(ctx: Context, arena: std.mem.Allocator, args: QueryArgs) !AggregateExplanation {
@@ -376,81 +375,7 @@ fn executeAggregateOver(
         @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
         choice.reason,
     }));
-    const decode_rows_env = ctx.env.getPosix("ZPQ_DECODE_BATCH_ROWS");
-    var scan_args: scan.MultiAggArgs = .{
-        .inputs = opened.inputs,
-        .metas = metas,
-        .filter = args.filter,
-        .aggregate = agg_str,
-        .group_by = args.group_by,
-        .parallelism = args.parallelism,
-        .scan_all = args.scan_all,
-        .trust_stats = args.trust_stats,
-        // Aggregate consumers need presence, not an expanded level array when the encoded run proves every row
-        // present. The forced legacy path is for cross-checks; dictionary consumers already make this proof.
-        .fast_levels = args.fast_levels or !envDisables(ctx.env, "ZPQ_LEVEL_RUNS"),
-        .level_runs = blk: {
-            const v = ctx.env.getPosix("ZPQ_LEVEL_RUNS") orelse break :blk null;
-            if (std.mem.eql(u8, v, "0")) break :blk false;
-            break :blk if (std.mem.eql(u8, v, "1")) true else null;
-        },
-        .decode_batch_rows = if (decode_rows_env) |v|
-            std.fmt.parseInt(usize, v, 10) catch 0
-        else
-            0,
-        .auto_decode_batches = decode_rows_env == null,
-        .dependent_keys = !envDisables(ctx.env, "ZPQ_GROUP_KEY_FD"),
-        .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
-            std.fmt.parseInt(usize, v, 10) catch null
-        else
-            null,
-        .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
-        .leave_regions = ctx.exit_after,
-        .unordered = args.unordered,
-        .select_cols = args.select_cols,
-        .result_order = cut_args.result_order,
-        .typed_answer = args.typed_answer and args.output != null,
-        .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null,
-        .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
-        .sorted_count_stream = !envDisables(ctx.env, "ZPQ_SORTED_COUNT_STREAM"),
-        .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
-        .msd_cache_rows = if (ctx.env.getPosix("ZPQ_MSD_CACHE_ROWS")) |v|
-            std.fmt.parseInt(usize, v, 10) catch null
-        else
-            null,
-        .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
-        .byte_top_partitions = if (ctx.env.getPosix("ZPQ_BYTE_TOP_PARTITIONS")) |v|
-            std.fmt.parseInt(usize, v, 10) catch null
-        else
-            null,
-        .byte_top_batch_rows = if (ctx.env.getPosix("ZPQ_BYTE_TOP_BATCH_ROWS")) |v|
-            std.fmt.parseInt(usize, v, 10) catch null
-        else
-            null,
-        .column_order = args.column_order,
-        .max_memory = args.max_memory,
-        .ledger = &ledger,
-        // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
-        .decode_limit = args.max_memory / 2,
-        .diag = args.diag,
-        .profiler = args.profiler,
-        .sketch_topk = sketchFromEnv(ctx.env),
-        .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
-        .spill = !envDisables(ctx.env, "ZPQ_SPILL"),
-        // Tests: a small threshold makes a small input move to the runs.
-        .spill_groups = if (ctx.env.getPosix("ZPQ_SPILL_GROUPS")) |v|
-            std.fmt.parseInt(usize, v, 10) catch 1 << 18
-        else
-            1 << 18,
-        .distinct_pairs = if (envFlag(ctx.env, "ZPQ_DISTINCT_PAIRS"))
-            .on
-        else if (envDisables(ctx.env, "ZPQ_DISTINCT_PAIRS")) .off else .auto,
-        .ndv_union = !envDisables(ctx.env, "ZPQ_NDV_UNION"),
-        .dense = !envDisables(ctx.env, "ZPQ_DENSE"),
-    };
-    if (args.quiet_diagnostics) if (scan_args.sketch_topk) |*cfg| {
-        cfg.trace = false;
-    };
+    var scan_args = aggregateScanArgs(ctx, args, agg_str, opened.inputs, metas, cut_args.result_order, &ledger);
     if (explain) {
         if (io_mode != .mmap) {
             // As `planLocalReader` hands the scan its inputs: gated, with the mapped file beside them.
@@ -565,56 +490,7 @@ fn executeAggregateOver(
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.
-    var bytes_out: u64 = 0;
-    if (args.output) |out_path| {
-        if (std.mem.startsWith(u8, out_path, "s3://")) {
-            return error.BadOutputUrl;
-        }
-        const t_footer = nowMonoNs();
-        t.output_started_ns = t_footer;
-        const st = r.state;
-        const codec = args.codec orelse .SNAPPY;
-        const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
-        // A big answer's columns encode on the query's workers, with a quarter of its budget for those in flight, as a
-        // re-encode's output in flight takes, drawn from the ledger beside the answer, within the slack a GROUP BY's
-        // merge and answer have past its limit.
-        const encode: consumer.AggEncode = .{
-            .parquet_version = args.parquet_version,
-            .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
-            .budget = args.max_memory / 4,
-            .ledger = &ledger,
-            .dictionary_bloom = args.bloom_filters_enabled,
-        };
-        ledger.limit += core_memory.finalize_allowance;
-        defer ledger.limit -= core_memory.finalize_allowance;
-        const names = r.output.group_cols;
-        const fd = args.output_fd;
-        bytes_out = if (r.output.integer_stream) |stream|
-            try writeIntegerStream(
-                arena,
-                out_path,
-                names.?,
-                st.group_col_types.?,
-                stream,
-                codec,
-                zstd,
-                encode,
-                fd,
-                args.profiler,
-            )
-        else if (r.output.byte_stream) |stream|
-            try writeByteStream(arena, out_path, st.group_col_types.?, stream, codec, zstd, encode, fd, args.profiler)
-        else if (r.output.typed) |typed|
-            try writeTypedParquet(arena, out_path, names.?, st.group_col_types.?, typed, codec, zstd, encode, fd)
-        else if (r.output.group_rows) |rows|
-            try writeGroupedParquet(arena, out_path, names.?, st.group_col_types.?, rows, codec, zstd, encode, fd)
-        else
-            try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, encode, args.output_fd, args.empty_scalar or r.output.no_row);
-        releaseStreamAnswer(&r.output);
-        const t_footer_end = nowMonoNs();
-        t.footer_ns += @intCast(t_footer_end - t_footer);
-        profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
-    }
+    var bytes_out = try writeAggregateParquet(ctx, arena, args, &r, n_aggs, &ledger, &t);
 
     if (args.columnar_sink) |cs| {
         try exportAggregateColumns(ctx.gpa, arena, cs, r, n_aggs, args.empty_scalar);
@@ -657,6 +533,156 @@ fn executeAggregateOver(
     // The returned arenas live with AggResult; this invocation's ledger is stack-local.
     answer.output.detachArenaLedger();
     return answer;
+}
+
+fn aggregateScanArgs(
+    ctx: Context,
+    args: QueryArgs,
+    agg_str: []const u8,
+    inputs: []const scan.Input,
+    metas: ?[]const schema.FileMetaData,
+    order: expr_ast.ResultOrder,
+    ledger: *core_memory.SharedBudget,
+) scan.MultiAggArgs {
+    const decode_rows_env = ctx.env.getPosix("ZPQ_DECODE_BATCH_ROWS");
+    var scan_args: scan.MultiAggArgs = .{
+        .inputs = inputs,
+        .metas = metas,
+        .filter = args.filter,
+        .aggregate = agg_str,
+        .group_by = args.group_by,
+        .parallelism = args.parallelism,
+        .scan_all = args.scan_all,
+        .trust_stats = args.trust_stats,
+        // Aggregate consumers need presence, not an expanded level array when the encoded run proves every row
+        // present. The forced legacy path is for cross-checks; dictionary consumers already make this proof.
+        .fast_levels = args.fast_levels or !envDisables(ctx.env, "ZPQ_LEVEL_RUNS"),
+        .level_runs = blk: {
+            const v = ctx.env.getPosix("ZPQ_LEVEL_RUNS") orelse break :blk null;
+            if (std.mem.eql(u8, v, "0")) break :blk false;
+            break :blk if (std.mem.eql(u8, v, "1")) true else null;
+        },
+        .decode_batch_rows = if (decode_rows_env) |v|
+            std.fmt.parseInt(usize, v, 10) catch 0
+        else
+            0,
+        .auto_decode_batches = decode_rows_env == null,
+        .dependent_keys = !envDisables(ctx.env, "ZPQ_GROUP_KEY_FD"),
+        .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
+        .encoded = args.encoded and !envDisables(ctx.env, "ZPQ_ENCODED"),
+        .leave_regions = ctx.exit_after,
+        .unordered = args.unordered,
+        .select_cols = args.select_cols,
+        .result_order = order,
+        .typed_answer = args.typed_answer and args.output != null,
+        .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null,
+        .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
+        .sorted_count_stream = !envDisables(ctx.env, "ZPQ_SORTED_COUNT_STREAM"),
+        .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
+        .msd_cache_rows = if (ctx.env.getPosix("ZPQ_MSD_CACHE_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
+        .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
+        .byte_top_partitions = if (ctx.env.getPosix("ZPQ_BYTE_TOP_PARTITIONS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
+        .byte_top_batch_rows = if (ctx.env.getPosix("ZPQ_BYTE_TOP_BATCH_ROWS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch null
+        else
+            null,
+        .column_order = args.column_order,
+        .max_memory = args.max_memory,
+        .ledger = ledger,
+        // Half the budget for decoded row groups: the S3 fetch window takes a quarter, GROUP BY tables the rest.
+        .decode_limit = args.max_memory / 2,
+        .diag = args.diag,
+        .profiler = args.profiler,
+        .sketch_topk = sketchFromEnv(ctx.env),
+        .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
+        .spill = !envDisables(ctx.env, "ZPQ_SPILL"),
+        // Tests: a small threshold makes a small input move to the runs.
+        .spill_groups = if (ctx.env.getPosix("ZPQ_SPILL_GROUPS")) |v|
+            std.fmt.parseInt(usize, v, 10) catch 1 << 18
+        else
+            1 << 18,
+        .distinct_pairs = if (envFlag(ctx.env, "ZPQ_DISTINCT_PAIRS"))
+            .on
+        else if (envDisables(ctx.env, "ZPQ_DISTINCT_PAIRS")) .off else .auto,
+        .ndv_union = !envDisables(ctx.env, "ZPQ_NDV_UNION"),
+        .dense = !envDisables(ctx.env, "ZPQ_DENSE"),
+    };
+    if (args.quiet_diagnostics) if (scan_args.sketch_topk) |*cfg| {
+        cfg.trace = false;
+    };
+    return scan_args;
+}
+
+fn writeAggregateParquet(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    r: *scan.MultiAggResult,
+    n_aggs: usize,
+    ledger: *core_memory.SharedBudget,
+    t: *Timings,
+) !u64 {
+    const prof = profile.threadOf(args.profiler, .main);
+    var bytes_out: u64 = 0;
+    if (args.output) |out_path| {
+        if (std.mem.startsWith(u8, out_path, "s3://")) {
+            return error.BadOutputUrl;
+        }
+        const t_footer = nowMonoNs();
+        t.output_started_ns = t_footer;
+        const st = r.state;
+        const codec = args.codec orelse .SNAPPY;
+        const zstd: compression.ZstdPlan = .{ .lambda = args.compress_priority.lambda() };
+        // A big answer's columns encode on the query's workers, with a quarter of its budget for those in flight, as a
+        // re-encode's output in flight takes, drawn from the ledger beside the answer, within the slack a GROUP BY's
+        // merge and answer have past its limit.
+        const encode: consumer.AggEncode = .{
+            .parquet_version = args.parquet_version,
+            .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
+            .budget = args.max_memory / 4,
+            .ledger = ledger,
+            .dictionary_bloom = args.bloom_filters_enabled,
+        };
+        ledger.limit += core_memory.finalize_allowance;
+        defer ledger.limit -= core_memory.finalize_allowance;
+        const names = r.output.group_cols;
+        const fd = args.output_fd;
+        bytes_out = if (r.output.integer_stream) |stream|
+            try writeIntegerStream(
+                arena,
+                out_path,
+                names.?,
+                st.group_col_types.?,
+                stream,
+                codec,
+                zstd,
+                encode,
+                fd,
+                args.profiler,
+            )
+        else if (r.output.byte_stream) |stream|
+            try writeByteStream(arena, out_path, st.group_col_types.?, stream, codec, zstd, encode, fd, args.profiler)
+        else if (r.output.typed) |typed|
+            try writeTypedParquet(arena, out_path, names.?, st.group_col_types.?, typed, codec, zstd, encode, fd)
+        else if (r.output.group_rows) |rows|
+            try writeGroupedParquet(arena, out_path, names.?, st.group_col_types.?, rows, codec, zstd, encode, fd)
+        else
+            try writeOneRowParquet(arena, out_path, st.agg_calls[0..n_aggs], st.accumulators[0..n_aggs], st.agg_sources[0..n_aggs], codec, zstd, encode, args.output_fd, args.empty_scalar or r.output.no_row);
+        releaseStreamAnswer(&r.output);
+        const t_footer_end = nowMonoNs();
+        t.footer_ns += @intCast(t_footer_end - t_footer);
+        profile.record(prof, .footer_write, t_footer, t_footer_end, profile.args(.{bytes_out}));
+    }
+    return bytes_out;
 }
 
 fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: ColumnarSink, r: anytype, n_aggs: usize, empty: bool) !void {
@@ -715,7 +741,6 @@ fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: 
         lo = hi;
     }
 }
-
 
 test "aggregate consumers conflict before input opening or output in every build mode" {
     const a = std.testing.allocator;
@@ -794,7 +819,6 @@ test "released group metadata never emits a scalar phantom row" {
     }
 }
 
-
 // ============================================================
 // Compile-time API check.
 // ============================================================
@@ -802,4 +826,3 @@ test "engine: API is well-typed" {
     _ = runQuery;
     _ = runPrint;
 }
-

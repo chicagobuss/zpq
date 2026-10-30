@@ -19,6 +19,10 @@ faster, the largest source files are split into small modules, and two bugs are 
   a query that fit under a small budget in 0.5.0 by not counting them may now refuse, with exit 1 and a message. Give
   it a larger budget, or leave `--max-memory` unset.
 
+- **`make_date(x)` is a DATE wherever it leaves**, as `min`/`max(make_date(col))` already was: Arrow `date32`,
+  Parquet `-o` INT32 DATE, and CSV ISO text (`2024-01-02` where it printed `19724`). JSON still prints the stored
+  days.
+
 Nothing else changes for scripts: `zpq query` prints the same rows, types and errors as 0.5.0 (every row output on
 the benchmark matrix is byte-identical), and libzpq's existing functions and status codes keep their meanings.
 
@@ -31,8 +35,12 @@ the benchmark matrix is byte-identical), and libzpq's existing functions and sta
   types; nested types and DECIMALs wider than 38 digits are refused with an explicit error. Batches are owned by
   the caller and may outlive the stream and the context. `max_result_bytes` caps the exported buffers. It is an
   additive symbol in `LIBZPQ_1`, and neither Arrow C++ nor Arrow Java is linked into libzpq. With PyArrow
-  installed, `python/zpq_arrow.py` reads the stream as a `RecordBatchReader`. The full contract and type table are
-  in `docs/libzpq.md`.
+  installed, `python/zpq_arrow.py` reads the stream as a `RecordBatchReader`; the reader speaks the Arrow
+  PyCapsule stream protocol, so `duckdb.register("t", reader)`, DataFusion and `pl.DataFrame(reader)` take it
+  directly. A computed string (`regexp_replace`, `||`, CASE, coalesce, a text cast) is `utf8` as a GROUP BY key or
+  `min`/`max` too, not only as a row. The full contract and type table are in `docs/libzpq.md`.
+- **`CAST(s AS VARCHAR)`** (also `TEXT`, `STRING` and `VARCHAR(n)`) of a string. A cast of a number or date to text
+  is refused (`type mismatch in expression`); a cast to another type is still `unknown scalar function`.
 - **A Spark DataSource V2 (experimental).** `spark.read.format("zpq")`, in `integrations/spark/`, runs Parquet
   scans, filter and column pushdown, and partial `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` and `GROUP BY` aggregates in
   libzpq through Java's Foreign Function & Memory API, and takes rows back as Arrow batches (`rowMode=arrow`, the

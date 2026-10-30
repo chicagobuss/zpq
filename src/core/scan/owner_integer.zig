@@ -159,7 +159,7 @@ pub fn inlineIntegerAnswer(
     }
     const count_top = !full and count != null and !distinct;
     if ((full and count == null) or (!count_top and value == null)) return null;
-    if (args.filter != null and !count_top) return null;
+    if (args.filtered() and !count_top) return null;
     const ordered_count = count_top and orderedIntegerHint(metas, work, key.col_idx);
     // Raw integer identities need no retained dictionary union. The cost gates below leave small domains on
     // their coded folds, while wide count cuts avoid a sketch and its certification rescan.
@@ -208,7 +208,7 @@ pub fn inlineIntegerAnswer(
     // it is only a cost decision, never a proof about key identity, bounds, or which rows must be evaluated.
     if (args.integer_records_min_rows != 0) {
         if (ndv.footerEntries(metas, keys)) |guess| {
-            const unfiltered_top = count_top and !ordered_count and args.filter == null;
+            const unfiltered_top = count_top and !ordered_count and !args.filtered();
             switch (integerCountGate(guess, rows, unfiltered_top, args.ndv_policy and args.ndv_union, bounds)) {
                 .owner => {},
                 .coded => return null,

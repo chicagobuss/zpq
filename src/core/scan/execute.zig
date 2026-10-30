@@ -464,7 +464,7 @@ fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *cons
         &.{}
     else
         try expr_parser.parseAggList(arena, args.aggregate, meta0, args.diag);
-    const grouped = if (args.bound_aggregate) |bound| bound.keys != null else args.group_by != null;
+    const grouped = args.grouped();
     if (agg_calls.len == 0 and !grouped) return error.EmptyAggregate;
 
     var filter_opt: ?filter_ast.Filter = if (args.bound_aggregate) |bound| bound.filter else null;

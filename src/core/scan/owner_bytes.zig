@@ -315,7 +315,7 @@ pub fn inlineByteTopAnswer(
     const key = keys[0].col_ref;
     if (key.physical_type != .BYTE_ARRAY or key.expr_type != .str) return null;
     const call = calls[0];
-    if (args.filter != null and call.func != .count) return null;
+    if (args.filtered() and call.func != .count) return null;
     if (call.where != null or call.offset != 0 or call.state or call.result != .i64) return null;
     // COUNT(*) has no value lane; SUM needs one signed INT64 column.
     var value_col: usize = 0;
@@ -553,7 +553,7 @@ pub fn inlineByteAnswer(
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const order = args.result_order;
     if (!args.byte_records or !allRescannable(args.inputs) or !(args.typed_answer or args.record_answer) or
-        args.filter != null or
+        args.filtered() or
         order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
         order.hidden.len != 0 or calls.len != 2) return null;
     const keys = keys_opt orelse return null;

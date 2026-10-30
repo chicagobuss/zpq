@@ -507,6 +507,24 @@ fn denseDictionaryFile(a: std.mem.Allocator, entries: []const i64, codes: []cons
     return file.items;
 }
 
+/// A million rows of keys `k` and values `f` (`i % 1000`) whose every row group's dictionary holds all 40K keys, past a
+/// quarter of its rows: the footer's word that a filtered integer COUNT wants the integer owner, where an unfiltered
+/// cut stays on coded lanes. Written under `.zig-cache/tmp/<sub_path>`.
+fn denseCountFixture(a: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
+    const rows: usize = 1 << 20;
+    const entries = try a.alloc(i64, 40_000);
+    for (entries, 0..) |*e, j| e.* = @intCast(j * 7919);
+    const codes = try a.alloc(u16, rows);
+    const f = try a.alloc(i64, rows);
+    for (codes, f, 0..) |*c, *v, i| {
+        c.* = @intCast(i * 7 % entries.len);
+        v.* = @intCast(i % 1000);
+    }
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/dense.parquet", .{sub_path});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = try denseDictionaryFile(a, entries, codes, f) });
+    return path;
+}
+
 test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its text fragments chose" {
     const sql = @import("../core/expr/sql_parser.zig");
     if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
@@ -514,23 +532,11 @@ test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its t
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const fa = arena_state.allocator();
-    // Every row group's dictionary holds all 40K keys, past a quarter of its rows: the footer's word that a filtered
-    // cut wants the integer owner, where an unfiltered one stays on coded lanes. Owned syntax once handed on no WHERE
-    // (8c4e96aa), so the scan costed this filtered cut as unfiltered: 4.6x slower over 458 such row groups.
-    const rows: usize = 1 << 20;
-    const entries = try fa.alloc(i64, 40_000);
-    for (entries, 0..) |*e, j| e.* = @intCast(j * 7919);
-    const codes = try fa.alloc(u16, rows);
-    const f = try fa.alloc(i64, rows);
-    for (codes, f, 0..) |*c, *v, i| {
-        c.* = @intCast(i * 7 % entries.len);
-        v.* = @intCast(i % 1000);
-    }
-    const bytes = try denseDictionaryFile(fa, entries, codes, f);
+    // Owned syntax once handed on no WHERE (8c4e96aa), so the scan costed this filtered cut as unfiltered: 4.6x slower
+    // over 458 row groups like these.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(fa, ".zig-cache/tmp/{s}/dense.parquet", .{tmp.sub_path});
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+    const path = try denseCountFixture(fa, &tmp.sub_path);
     const text = try std.fmt.allocPrint(fa, "SELECT k, count(*) AS c FROM '{s}' WHERE f < 10 GROUP BY k ORDER BY c DESC LIMIT 10", .{path});
     const original = try sql.parseSqlQuery(a, text);
     defer original.deinit(a);
@@ -562,4 +568,87 @@ test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its t
     try std.testing.expectEqual(.integer_count_top_h, want.record_path.?.layout);
     try std.testing.expectEqualStrings(want.strategyName(), got.strategyName());
     try std.testing.expectEqualDeep(want.record_path, got.record_path);
+}
+
+
+test "regression: a structured fanout plan of a filtered integer COUNT plans as its text fragments do" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const fa = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try denseCountFixture(fa, &tmp.sub_path);
+    const lines = [_:null]?[*:0]const u8{"ZPQ_IO_PROFILE=mmap"};
+    const ctx: types.Context = .{ .gpa = a, .io = std.testing.io, .env = .{ .block = .{ .slice = &lines } } };
+    const fanout = @import("fanout_plan.zig");
+    // A worker request carries the decoded plan and no text fragments (`service/handler.zig`), answering into a sink.
+    // Its plan once had no WHERE for the scan: a filtered full answer took the integer stream the fragments refuse, and
+    // a cut lost the integer COUNT owner.
+    var rows: std.Io.Writer.Allocating = .init(fa);
+    const top: @import("../core/expr/ast.zig").ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
+    for ([_][]const u8{ "count(*) AS c, sum(f) AS s", "count(*) AS c" }) |calls| {
+        const fragments: types.QueryArgs = .{
+            .inputs = &.{path},
+            .aggregate = calls,
+            .group_by = "k",
+            .filter = "f < 10",
+            .parallelism = 4,
+            .max_memory = 4 << 30,
+            .text_output = .{ .format = .jsonl, .sink = &rows.writer },
+        };
+        const prepared = try fanout.prepare(ctx, fragments, 1 << 20, 1);
+        defer a.free(prepared);
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, fa, prepared, .{});
+        const query = try fanout.decode(fa, value.object.get("plan").?);
+        var worker: types.QueryArgs = .{
+            .inputs = &.{path},
+            .plan_source = @import("syntax_plan.zig").source(&query),
+            .parallelism = 4,
+            .max_memory = 4 << 30,
+            .text_output = .{ .format = .jsonl, .sink = &rows.writer },
+        };
+        var cut = fragments;
+        if (std.mem.eql(u8, calls, "count(*) AS c")) {
+            // An embedding caller may cut the decoded plan itself; the COUNT top-H keeps the fragments' owner.
+            cut.result_order = top;
+            worker.result_order = top;
+        }
+        const want = (try aggregate.explainAggregate(ctx, fa, cut)).aggregate;
+        const got = (try aggregate.explainAggregate(ctx, fa, worker)).aggregate;
+        if (cut.result_order.limit != null) try std.testing.expectEqual(.integer_count_top_h, want.record_path.?.layout);
+        try std.testing.expectEqualStrings(want.strategyName(), got.strategyName());
+        // The plan names its outputs `_g0` and `_a0`, so its quote differs by their bytes alone.
+        try std.testing.expectEqual(want.record_path == null, got.record_path == null);
+        if (want.record_path) |admitted| {
+            try std.testing.expectEqual(admitted.layout, got.record_path.?.layout);
+            try std.testing.expectEqual(admitted.partitions, got.record_path.?.partitions);
+        }
+    }
+}
+
+test "regression: a structured plan without text fragments answers a grouped DISTINCT per group" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const fa = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try denseCountFixture(fa, &tmp.sub_path);
+    const text = try std.fmt.allocPrint(fa, "SELECT k, count(DISTINCT f) AS d FROM '{s}' GROUP BY k", .{path});
+    const parsed = try sql.parseSqlPlan(a, text);
+    defer parsed.deinit(a);
+    // The pair owner, forced, built a scalar answer when no GROUP BY fragment came with the plan: one row.
+    const lines = [_:null]?[*:0]const u8{"ZPQ_DISTINCT_PAIRS=1"};
+    const ctx: types.Context = .{ .gpa = a, .io = std.testing.io, .env = .{ .block = .{ .slice = &lines } } };
+    var got = try aggregate.runQuery(ctx, .{
+        .inputs = &.{path},
+        .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?),
+        .parallelism = 4,
+        .max_memory = 4 << 30,
+    });
+    defer got.deinit(a);
+    try std.testing.expectEqual(@as(usize, 40_000), got.aggregate.output.rowCount());
 }

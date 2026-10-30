@@ -239,6 +239,19 @@ pub const MultiAggArgs = struct {
     spill: bool = true,
     spill_groups: usize = 1 << 18,
     spill_rows: u64 = 4,
+
+    // A bound plan owns its clauses; its text fragments may be absent (a structured fanout plan) or mere markers.
+    /// Whether the query has a WHERE, which owners and cost rules weigh.
+    pub fn filtered(self: *const MultiAggArgs) bool {
+        if (self.bound_aggregate) |bound| return bound.filter != null;
+        return self.filter != null;
+    }
+
+    /// Whether the query has a GROUP BY: a scalar-only owner must never answer a grouped plan.
+    pub fn grouped(self: *const MultiAggArgs) bool {
+        if (self.bound_aggregate) |bound| return bound.keys != null;
+        return self.group_by != null;
+    }
 };
 
 /// Tuning of `certifiedTopK`.

@@ -646,7 +646,7 @@ fn finishPairOutput(
     const ledger = context.ledger;
     const run = context.run;
     const names_credit = context.names_credit;
-    if (args.group_by == null) {
+    if (!args.grouped()) {
         output_charge.* = calls.len *| @sizeOf(AggOutputItem);
         for (calls) |c| output_charge.* +|= c.alias.len;
         _ = ledger.drawExact(output_charge.*) orelse {

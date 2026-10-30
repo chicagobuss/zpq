@@ -119,7 +119,7 @@ pub fn inlineDistinctAnswer(
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const order = args.result_order;
-    if (args.group_by != null or args.filter != null or !allRescannable(args.inputs) or calls.len != 1 or
+    if (args.grouped() or args.filtered() or !allRescannable(args.inputs) or calls.len != 1 or
         n_workers > 64 or
         order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
         order.hidden.len != 0) return null;

@@ -329,7 +329,7 @@ pub fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
     // A short byte key plus total payloads can avoid almost all losing-group state. The encoded average width
     // is a cost hint, bounded by the packed key's 15 bytes plus its length word; complete keys still decide equality.
     const short_payload = stat.string_keys and keys.len == 1 and keys[0] == .col_ref and
-        keys[0].col_ref.expr_type == .str and in.calls.len > 1 and in.args.filter == null and
+        keys[0].col_ref.expr_type == .str and in.calls.len > 1 and !in.args.filtered() and
         stat.key_bytes <= 15 + @sizeOf(u32);
     const bail_census = plan.dispatch.strategy == .sketch and plan.dispatch.census_allowed and
         (expr_agg.fixedGroupStride(keys) != null or short_composite or short_payload) and !tiny and !cheap_r1;
@@ -346,7 +346,7 @@ pub fn applyCostRules(in: PlanInputs, stat: NdvStat, plan: *ScanPlan) void {
         // Unfiltered, a short string composite's count pass reads every row the census would, and its cells, spread
         // by every combination the marginals make, bail like a fixed-width composite's: the census rides along and
         // each worker still drops it once its own cells separate the cut. Filtered, the bet waits for the count.
-        const unfiltered_short = bail_census and short_composite and in.args.filter == null;
+        const unfiltered_short = bail_census and short_composite and !in.args.filtered();
         plan.dispatch.keys_unique = looks_unique;
         plan.dispatch.census_allowed = bail_census;
         plan.dispatch.census_fused = looks_unique or fixed_composite or unfiltered_short or

@@ -6,6 +6,7 @@ const local_fs = @import("../local_fs.zig");
 const meta_cache_mod = @import("../io/meta_cache.zig");
 const local_reader = @import("../io/local_reader.zig");
 const schema = @import("../core/schema.zig");
+const core_memory = @import("../core/memory.zig");
 const compression = @import("../core/parquet/compression.zig");
 const consumer = @import("../core/consumer.zig");
 const scan = @import("../core/scan.zig");
@@ -240,6 +241,14 @@ pub const Context = struct {
     /// kernel tears it down at exit regardless. The CLI drops the input mappings' pages in parallel once the answer is
     /// out (`local_fs.releaseLeft`). Never for a process that runs another query (the Lambda).
     exit_after: bool = false,
+
+    /// The context one query runs in, for every entry point and query kind alike: only a `--max-memory` the caller
+    /// set pays for promptly released buffer mappings (`memory.queryAllocator`).
+    pub fn forQuery(self: Context, args: *const QueryArgs) Context {
+        var ctx = self;
+        ctx.gpa = core_memory.queryAllocator(self.gpa, args.max_memory_explicit != null);
+        return ctx;
+    }
 };
 
 /// Vtable so both lambda's `PersistentPool` and an inline-CLI

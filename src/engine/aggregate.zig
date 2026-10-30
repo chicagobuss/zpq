@@ -187,7 +187,8 @@ const pageIndexTestChunk = engine_s3_rebase.pageIndexTestChunk;
 const profile_summary = @import("../profile_summary.zig");
 const fake_s3 = @import("../io/fake_s3.zig");
 
-pub fn runQuery(ctx: Context, args: QueryArgs) !QueryResult {
+pub fn runQuery(caller_ctx: Context, args: QueryArgs) !QueryResult {
+    const ctx = caller_ctx.forQuery(&args);
     const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
     defer span.end(.query, profile.args(.{}));
     if (args.inputs.len == 0) return error.NoInputs;
@@ -232,17 +233,15 @@ fn explainConjuncts(arena: std.mem.Allocator, filter: ?filter_ast.Filter, meta: 
 }
 
 /// Planning shares the execution path, with caller-owned arena storage and metadata-only input opening.
-pub fn explainAggregate(ctx: Context, arena: std.mem.Allocator, args: QueryArgs) !AggregateExplanation {
+pub fn explainAggregate(caller_ctx: Context, arena: std.mem.Allocator, args: QueryArgs) !AggregateExplanation {
+    const ctx = caller_ctx.forQuery(&args);
     if (args.inputs.len == 0) return error.NoInputs;
     if (args.kind() == .rows) return error.MissingOutputOrAggregate;
     if (args.select != null or args.columns != null) return error.AggregateMutuallyExclusive;
     return executeAggregate(ctx, arena, args, args.aggregate orelse "", true);
 }
 
-fn runAggregate(process_ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
-    // Only a `--max-memory` the caller set pays for promptly released buffer mappings.
-    var ctx = process_ctx;
-    ctx.gpa = core_memory.queryAllocator(ctx.gpa, args.max_memory_explicit != null);
+fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     return executeAggregate(ctx, arena_state.allocator(), args, agg_str, false);

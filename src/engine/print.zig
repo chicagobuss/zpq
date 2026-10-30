@@ -674,7 +674,7 @@ pub fn runPrintTo(
 
 /// Text output may target memory in an embedding process; no stdout redirection or temporary files.
 pub fn runPrintSink(
-    ctx: Context,
+    caller_ctx: Context,
     initial_args: QueryArgs,
     format: PrintFormat,
     limit: ?usize,
@@ -682,6 +682,7 @@ pub fn runPrintSink(
     offset: usize,
     sink: ?*std.Io.Writer,
 ) !PrintResult {
+    const ctx = caller_ctx.forQuery(&initial_args);
     var cache: engine_types.bound_plan.Cache = .{};
     const args = initial_args.withPlanCache(&cache);
     var changed = false;

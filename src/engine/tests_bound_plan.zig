@@ -410,3 +410,156 @@ test "syntax: unsupported SQL modifiers and casts retain refusal instead of drop
         .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?),
     }));
 }
+
+
+/// `writeAggregateRows`' file of the keys `entries[codes]` and `f`, each row group's key chunk then replaced by one
+/// uncompressed PLAIN dictionary page of every entry and one data page bit-packing its codes. The writer keeps its own
+/// dictionaries to a tenth of a chunk; other writers' are often far denser, and footer cost gates weigh exactly that.
+fn denseDictionaryFile(a: std.mem.Allocator, entries: []const i64, codes: []const u16, f: []const i64) ![]const u8 {
+    const keys = try a.alloc(i64, codes.len);
+    for (keys, codes) |*k, c| k.* = entries[c];
+    const columns = [_]@import("../core/expr/agg.zig").OutputCol{
+        .{ .name = "k", .col = .{ .i64 = .{ .values = keys } }, .parquet_type = .INT64, .nullable = false },
+        .{ .name = "f", .col = .{ .i64 = .{ .values = f } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var sink: @import("../core/writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try @import("../core/consumer.zig").writeAggregateRows(a, sink.sink(), &columns, @intCast(codes.len), .SNAPPY, .{}, .{});
+    const src = sink.buffer.items;
+    var meta = try metadata.open(a, src);
+    const footer_len = std.mem.readInt(u32, src[src.len - 8 ..][0..4], .little);
+    var file: std.ArrayList(u8) = .empty;
+    try file.appendSlice(a, src[0 .. src.len - 8 - footer_len]);
+    const thrift = @import("../core/thrift.zig");
+    var row: usize = 0;
+    for (meta.row_groups.items) |*rg| {
+        const n: usize = @intCast(rg.num_rows);
+        std.debug.assert(n % 8 == 0);
+        var dict: std.ArrayList(u8) = .empty;
+        for (entries) |e| try dict.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(i64, e)));
+        // Bit width 16, then one bit-packed run of n/8 groups: at width 16 each code is two little-endian bytes.
+        var data: std.ArrayList(u8) = .empty;
+        try data.append(a, 16);
+        var run: usize = ((n / 8) << 1) | 1;
+        while (run >= 0x80) : (run >>= 7) try data.append(a, @as(u8, @truncate(run)) | 0x80);
+        try data.append(a, @intCast(run));
+        for (codes[row..][0..n]) |c| try data.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u16, c)));
+        row += n;
+        const start = file.items.len;
+        var dict_header = thrift.Writer.init(a);
+        const dict_page: schema.PageHeader = .{
+            .type = .DICTIONARY_PAGE,
+            .uncompressed_page_size = @intCast(dict.items.len),
+            .compressed_page_size = @intCast(dict.items.len),
+            .crc = null,
+            .data_page_header = null,
+            .dictionary_page_header = .{ .num_values = @intCast(entries.len), .encoding = .PLAIN, .is_sorted = null },
+            .data_page_header_v2 = null,
+        };
+        try dict_page.write(&dict_header);
+        try file.appendSlice(a, dict_header.bytes());
+        try file.appendSlice(a, dict.items);
+        const data_start = file.items.len;
+        var data_header = thrift.Writer.init(a);
+        const data_page: schema.PageHeader = .{
+            .type = .DATA_PAGE,
+            .uncompressed_page_size = @intCast(data.items.len),
+            .compressed_page_size = @intCast(data.items.len),
+            .crc = null,
+            .data_page_header = .{
+                .num_values = @intCast(n),
+                .encoding = .RLE_DICTIONARY,
+                .definition_level_encoding = .RLE,
+                .repetition_level_encoding = .RLE,
+            },
+            .dictionary_page_header = null,
+            .data_page_header_v2 = null,
+        };
+        try data_page.write(&data_header);
+        try file.appendSlice(a, data_header.bytes());
+        try file.appendSlice(a, data.items);
+        // A fresh chunk: the writer's page index and Bloom filter describe the replaced pages.
+        const chunk = &rg.columns.items[0];
+        const kept = chunk.meta_data;
+        chunk.* = .{ .file_path = null, .file_offset = @intCast(start), .meta_data = kept };
+        const cm = &chunk.meta_data.?;
+        cm.encodings = .empty;
+        try cm.encodings.appendSlice(a, &.{ .PLAIN, .RLE, .RLE_DICTIONARY });
+        cm.encoding_stats = std.ArrayListUnmanaged(schema.PageEncodingStats).fromOwnedSlice(try a.dupe(schema.PageEncodingStats, &.{
+            .{ .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+            .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.RLE_DICTIONARY), .count = 1 },
+        }));
+        cm.codec = .UNCOMPRESSED;
+        cm.num_values = @intCast(n);
+        cm.dictionary_page_offset = @intCast(start);
+        cm.data_page_offset = @intCast(data_start);
+        cm.index_page_offset = null;
+        cm.total_compressed_size = @intCast(file.items.len - start);
+        cm.total_uncompressed_size = cm.total_compressed_size;
+        cm.statistics = null;
+        cm.bloom_filter_offset = null;
+        cm.bloom_filter_length = null;
+    }
+    var footer = thrift.Writer.init(a);
+    try meta.write(&footer);
+    try file.appendSlice(a, footer.bytes());
+    try file.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(footer.bytes().len))));
+    try file.appendSlice(a, "PAR1");
+    return file.items;
+}
+
+test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its text fragments chose" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const fa = arena_state.allocator();
+    // Every row group's dictionary holds all 40K keys, past a quarter of its rows: the footer's word that a filtered
+    // cut wants the integer owner, where an unfiltered one stays on coded lanes. Owned syntax once handed on no WHERE
+    // (8c4e96aa), so the scan costed this filtered cut as unfiltered: 4.6x slower over 458 such row groups.
+    const rows: usize = 1 << 20;
+    const entries = try fa.alloc(i64, 40_000);
+    for (entries, 0..) |*e, j| e.* = @intCast(j * 7919);
+    const codes = try fa.alloc(u16, rows);
+    const f = try fa.alloc(i64, rows);
+    for (codes, f, 0..) |*c, *v, i| {
+        c.* = @intCast(i * 7 % entries.len);
+        v.* = @intCast(i % 1000);
+    }
+    const bytes = try denseDictionaryFile(fa, entries, codes, f);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(fa, ".zig-cache/tmp/{s}/dense.parquet", .{tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+    const text = try std.fmt.allocPrint(fa, "SELECT k, count(*) AS c FROM '{s}' WHERE f < 10 GROUP BY k ORDER BY c DESC LIMIT 10", .{path});
+    const original = try sql.parseSqlQuery(a, text);
+    defer original.deinit(a);
+    const parsed = try sql.parseSqlPlan(a, text);
+    defer parsed.deinit(a);
+    const lines = [_:null]?[*:0]const u8{"ZPQ_IO_PROFILE=mmap"};
+    const ctx: types.Context = .{ .gpa = a, .io = std.testing.io, .env = .{ .block = .{ .slice = &lines } } };
+    // Both as the CLI hands them on: the fragments alone, and the owned syntax beside what `parseSqlPlan` returns.
+    const fragments: types.QueryArgs = .{
+        .inputs = &.{path},
+        .aggregate = original.aggregate_str,
+        .group_by = original.group_by_str,
+        .filter = original.filter_str,
+        .select_cols = original.select_cols,
+        .result_order = original.result_order,
+        .parallelism = 4,
+        .max_memory = 4 << 30,
+    };
+    var owned = fragments;
+    owned.plan_source = @import("syntax_plan.zig").source(parsed.syntax.?);
+    owned.aggregate = parsed.aggregate_str;
+    owned.group_by = parsed.group_by_str;
+    owned.filter = parsed.filter_str;
+    owned.select_cols = parsed.select_cols;
+    owned.result_order = parsed.result_order;
+    const want = (try aggregate.explainAggregate(ctx, fa, fragments)).aggregate;
+    const got = (try aggregate.explainAggregate(ctx, fa, owned)).aggregate;
+    try std.testing.expect(want.record_path != null);
+    try std.testing.expectEqual(.integer_count_top_h, want.record_path.?.layout);
+    try std.testing.expectEqualStrings(want.strategyName(), got.strategyName());
+    try std.testing.expectEqualDeep(want.record_path, got.record_path);
+}

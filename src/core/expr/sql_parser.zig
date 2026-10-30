@@ -669,8 +669,9 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
             .table_name = table_name,
             .is_aggregate = is_aggregate,
             .select_str = null,
+            // Empty fragments say which clauses the owned syntax holds: planners cost a filtered query by its presence.
             .aggregate_str = if (is_aggregate) "" else null,
-            .filter_str = null,
+            .filter_str = if (owned.filter != null) "" else null,
             .group_by_str = if (has_group_by) "" else null,
             .select_cols = select_cols,
             .result_order = result_order,

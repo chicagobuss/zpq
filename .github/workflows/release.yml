@@ -7,6 +7,8 @@ name: Release
 # The same file runs as a Forgejo pre-flight (tools/release/preflight.sh): a dry run of an exact commit, before the
 # tag exists. Steps that differ between the two forges are paired on github.server_url, so on GitHub every step
 # that runs is the one that ran before; Forgejo never publishes.
+# On Forgejo the build and release jobs take the pre-flight's own Linux label; Forgejo evaluates runs-on without
+# the github context, so there the test is false.
 #
 # Lambda binaries are NOT shipped here. They're author-deployed via
 # `just lambda-deploy`; `tools/serverless/aws.sh build` is what
@@ -35,7 +37,7 @@ on:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'preflight-ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -258,7 +260,7 @@ jobs:
   release:
     name: Create Release
     needs: [build, smoke]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'preflight-ubuntu-latest' }}
     permissions:
       contents: write
     steps:

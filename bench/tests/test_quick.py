@@ -403,9 +403,12 @@ class Quick(unittest.TestCase):
         with self.assertRaises(quick.BudgetExpired):
             run.command([sys.executable, "-c", command, str(pid)], self.out / "o", self.out / "e")
         if Path("/proc").exists() and pid.exists():
-            child = Path("/proc") / pid.read_text() / "stat"
-            if child.exists():
-                self.assertEqual(child.read_text().split()[2], "Z")
+            # Killed, the nested child is a zombie, dying or already reaped; any other state means it still runs.
+            try:
+                state = (Path("/proc") / pid.read_text() / "stat").read_text().split()[2]
+            except (FileNotFoundError, ProcessLookupError):  # reaped between the open and the read
+                state = None
+            self.assertIn(state, ("Z", "X", None))
         self.assertFalse((self.out / "active.json").exists())
 
     def test_partial_counts_and_flags_are_deterministic(self):

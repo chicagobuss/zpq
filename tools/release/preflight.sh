@@ -107,16 +107,23 @@ stop_systemd='unit=$1
 systemctl --user stop "$unit" 2>/dev/null || true
 systemctl --user reset-failed "$unit" 2>/dev/null || true'
 # The runner leads its own process group (perl setpgrp, then exec, so the pid file names the group), and a stop
-# reaches the host jobs it started; GNU timeout is the outer bound if this script never gets to stop it.
+# reaches the host jobs it started; GNU timeout is the outer bound if this script never gets to stop it. It runs in
+# the foreground of an ssh session this script holds open for the run: macOS denies local-network connections to a
+# process whose ssh session has ended, so a detached runner cannot reach the forge.
 start_pidfile='set -eu
 dir=$1 cache=$2 secs=$3 path=$4
 cd "$dir"
 if [ -s runner.pid ] && kill -0 -- "-$(cat runner.pid)" 2>/dev/null; then echo "a runner is already running (group $(cat runner.pid))" >&2; exit 1; fi
 export PATH="$path:$PATH" XDG_CACHE_HOME="$cache"
 timeout --version 2>/dev/null | grep -q GNU || { echo "no GNU timeout on $path:\$PATH" >&2; exit 1; }
-nohup perl -e "setpgrp(0, 0); exec @ARGV or die" timeout -k 60 "$secs" \
-  "$dir/bin/forgejo-runner" --config "$dir/config.yml" daemon >runner.log 2>&1 </dev/null &
-echo $! >runner.pid'
+: >runner.log
+echo $$ >runner.pid
+exec perl -e "setpgrp(0, 0); exec @ARGV or die" timeout -k 60 "$secs" \
+  "$dir/bin/forgejo-runner" --config "$dir/config.yml" daemon >runner.log 2>&1 </dev/null'
+# A pidfile runner is up once it has declared itself to the forge.
+declared='dir=$1
+for _ in $(seq 30); do grep -q "declared successfully" "$dir/runner.log" 2>/dev/null && exit 0; sleep 1; done
+tail -3 "$dir/runner.log" >&2; exit 1'
 stop_pidfile='dir=$1
 cd "$dir" 2>/dev/null && [ -s runner.pid ] || exit 0
 pg=$(cat runner.pid)
@@ -130,12 +137,16 @@ if command -v systemctl >/dev/null; then systemctl --user is-active -q "$unit" &
 pgrep -fl "$dir/bin/forgejo-runner" || true
 if [ -r "$dir/.runner" ] && command -v docker >/dev/null; then docker ps --format "{{.Names}}" | grep "^FORGEJO-ACTIONS-TASK-" || true; fi'
 
-started=() run= done=false
+started=() R_session=() run= done=false
 stop_runners() {
   local i out
   for i in "${started[@]}"; do
     if [[ ${R_start[i]} == systemd ]]; then remote "$i" bash -s -- "$unit" <<<"$stop_systemd" || true
     else remote "$i" bash -s -- "${R_dir[i]}" <<<"$stop_pidfile" || true; fi
+    if [[ -n ${R_session[i]:-} ]]; then  # The held session ends with its runner; give it 10 s, then end it.
+      for _ in {1..10}; do kill -0 "${R_session[i]}" 2>/dev/null || break; sleep 1; done
+      kill "${R_session[i]}" 2>/dev/null; wait "${R_session[i]}" 2>/dev/null
+    fi
   done
   for i in "${started[@]}"; do
     out=$(remote "$i" bash -s -- "${R_dir[i]}" "$unit" <<<"$leftovers" 2>&1) || out="could not check: $out"
@@ -178,7 +189,12 @@ for i in "${!R_name[@]}"; do
   if [[ ${R_start[i]} == systemd ]]; then
     remote "$i" bash -s -- "${R_dir[i]}" "${R_cache[i]}" "$secs" "$unit" <<<"$start_systemd"
   else
-    remote "$i" bash -s -- "${R_dir[i]}" "${R_cache[i]}" "$secs" "${R_path[i]}" <<<"$start_pidfile"
+    remote "$i" bash -s -- "${R_dir[i]}" "${R_cache[i]}" "$secs" "${R_path[i]}" <<<"$start_pidfile" \
+      >"$work/session-$i.log" 2>&1 &
+    R_session[i]=$!
+    sleep 2
+    remote "$i" bash -s -- "${R_dir[i]}" <<<"$declared" ||
+      { echo "preflight: ${R_name[i]} did not start: $(cat "$work/session-$i.log")" >&2; exit 1; }
   fi
   echo "started ${R_name[i]}"
 done

@@ -388,6 +388,12 @@ with zpq.Zpq(max_memory="2GB") as z:
         table = reader.read_all()
 ```
 
+The reader also speaks the [Arrow PyCapsule stream protocol](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html)
+(`__arrow_c_stream__`), so a consumer takes it as it is: `duckdb.register("t", reader)`,
+`pa.RecordBatchReader.from_stream(reader)`, DataFusion's `from_arrow(reader)`, Polars' `pl.DataFrame(reader)`. The
+consumer reads the batches not yet read, and its EOF or release ends the context call, as `close()` does. Polars'
+`pl.from_arrow` reads any stream that is not a PyArrow object as one Series of structs.
+
 `python/check_arrow.py --out ASSIGNED_SCRATCH --clickbench CLICKBENCH_DIRECTORY` checks typed PyArrow results and
 NDJSON values at the schema's numeric width, plus retention and refusal behavior. `src/libzpq/test_arrow.c` exercises
 early release, partial reads, moved structures, independent result lifetimes, and a mid-stream result-cap error;

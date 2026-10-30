@@ -36,6 +36,24 @@ class ArrowReader:
         finally:
             self.close()
 
+    def __arrow_c_stream__(self, requested_schema=None):
+        """The Arrow PyCapsule stream protocol, so DuckDB, Polars and DataFusion read this reader directly. The consumer
+        takes the batches not yet read; its EOF or release ends the context call, as close() does."""
+        import pyarrow as pa
+        return pa.RecordBatchReader.from_batches(self.schema, self._handoff()).__arrow_c_stream__(requested_schema)
+
+    def _handoff(self):
+        # Started at once, so its finally runs even when the consumer releases the stream before reading it.
+        def batches():
+            try:
+                yield
+                yield from self._reader
+            finally:
+                self.close()
+        it = batches()
+        next(it)
+        return it
+
     def close(self):
         owner, self._owner = self._owner, None
         if owner is not None:

@@ -535,6 +535,35 @@ def test_arrow_types(z):
             check(r.get("reason") == reason, f"refused cast {r}: {sql}")
 
 
+def test_arrow_consumers(z):
+    """A reader hands itself to any Arrow PyCapsule stream consumer (PyArrow here, and DuckDB when installed); the
+    consumer's EOF or release ends the context call."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "t.parquet")
+        pq.write_table(pa.table({"k": pa.array([3, 1, 2], pa.int64()), "s": ["c", "a", "b"]}), src)
+        sql = f"SELECT k, s FROM '{src}' ORDER BY k"
+        got = pa.RecordBatchReader.from_stream(z.arrow({"sql": sql})).read_all()
+        check(got.column("k").to_pylist() == [1, 2, 3], f"PyArrow from the stream {got}")
+        try:
+            import duckdb
+        except ImportError:
+            duckdb = None
+        if duckdb is not None:
+            con = duckdb.connect()
+            con.register("t", z.arrow({"sql": sql}))
+            rows = con.execute("SELECT s, k FROM t ORDER BY k").fetchall()
+            check(rows == [("a", 1), ("b", 2), ("c", 3)], f"DuckDB registers the reader {rows}")
+            con.close()
+        r = z.arrow({"sql": sql})
+        capsule = r.__arrow_c_stream__()
+        del capsule  # released unread
+        with z._cond:
+            check(z._inflight == 0, f"a released stream ends the call: {z._inflight} in flight")
+        r.close()
+
+
 def test_options_and_budget():
     for bad in ({"max_memory": "lots"}, {"budget_wait_ms": -1}):
         try:
@@ -567,6 +596,7 @@ def main():
         test_bloom_options(z)
         test_binary_text(z)
         test_arrow_types(z)
+        test_arrow_consumers(z)
     test_close_drains()
     test_close_ends_waiters()
     test_service_shutdown()

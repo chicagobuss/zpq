@@ -34,7 +34,7 @@ A `libzpq`-backed Apache Spark DataSource V2 (`org.apache.spark.sql.connector.ca
 ./integrations/spark/build.sh
 ```
 
-By default `build.sh` reads `ZPQ_SPARK_OUT_DIR` (default `zig-out/spark`), compiles against `$ZPQ_SPARK_HOME/jars/*`, and writes `$ZPQ_SPARK_OUT_DIR/zpq-spark.jar`.
+By default `build.sh` reads `ZPQ_SPARK_OUT_DIR` (default `zig-out/spark` in the repo), compiles against `$ZPQ_SPARK_HOME/jars/*`, and writes `$ZPQ_SPARK_OUT_DIR/zpq-spark.jar`.
 
 ## Usage
 

@@ -144,7 +144,6 @@ public final class ZpqNative {
             configured,
             System.getProperty("zpq.lib"),
             System.getenv("ZPQ_LIB"),
-            "zig-out/lib/libzpq.so",
             "zig-out/lib/libzpq.so"
         };
         for (String c : candidates) {

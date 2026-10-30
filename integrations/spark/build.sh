@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="${ZPQ_SPARK_OUT_DIR:-$HOME/code/zpq-out/spark}"
+OUT_DIR="${ZPQ_SPARK_OUT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)/zig-out/spark}"
 JDK_HOME="${JAVA_HOME:-$OUT_DIR/jdk-25}"
 SPARK_HOME="${SPARK_HOME:-$OUT_DIR/spark-4.2.1}"
 CLASSES_DIR="$OUT_DIR/build/classes"

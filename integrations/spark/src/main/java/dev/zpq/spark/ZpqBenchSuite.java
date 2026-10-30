@@ -80,7 +80,9 @@ public final class ZpqBenchSuite {
 
     public static void main(String[] args) {
         String mode = args.length > 0 ? args[0] : "warm";
-        String dataPath = "zig-out/spark/data/clickbench";
+        // The ClickBench inputs, under the same output directory build.sh uses.
+        String outDir = System.getenv().getOrDefault("ZPQ_SPARK_OUT_DIR", "zig-out/spark");
+        String dataPath = outDir + "/data/clickbench";
 
         SparkSession spark = SparkSession.builder()
             .master("local[16]")

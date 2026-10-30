@@ -170,7 +170,7 @@ public final class ZpqPartitionReader implements PartitionReader<InternalRow> {
     }
 
     private List<InternalRow> runParquetOutputUrlScan(ZpqNative nativeCtx, String taskMaxMem, boolean cache) {
-        String tmpDir = System.getProperty("java.io.tmpdir", "zig-out/spark/tmp");
+        String tmpDir = System.getProperty("java.io.tmpdir");
         Path tmpFile = Path.of(tmpDir, "zpq-split-" + UUID.randomUUID() + ".parquet");
         try {
             StringBuilder sb = new StringBuilder(256);

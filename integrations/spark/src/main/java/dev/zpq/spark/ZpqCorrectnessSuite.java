@@ -33,12 +33,10 @@ public final class ZpqCorrectnessSuite {
     private record QuerySpec(String id, String description, String sqlTemplate) {}
 
     public static void main(String[] args) throws Exception {
-        String clickbenchPath = args.length > 0
-            ? args[0]
-            : "zig-out/spark/data/clickbench";
-        String decDatePath = args.length > 1
-            ? args[1]
-            : "zig-out/spark/data/decimal_dates";
+        // Defaults sit under the same output directory build.sh and check_correctness.sh use.
+        String outDir = System.getenv().getOrDefault("ZPQ_SPARK_OUT_DIR", "zig-out/spark");
+        String clickbenchPath = args.length > 0 ? args[0] : outDir + "/data/clickbench";
+        String decDatePath = args.length > 1 ? args[1] : outDir + "/data/decimal_dates";
 
         SparkSession spark = SparkSession.builder()
             .master("local[16]")

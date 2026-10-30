@@ -72,7 +72,7 @@ web_login() {  # The run and job views (and cancel) are web-only on Forgejo 9; t
   t=$(web "$base/user/login" | grep -oP 'name="_csrf" value="\K[^"]+')
   web -o /dev/null --data-urlencode "_csrf=$t" --data-urlencode "user_name=$user" \
     --data-urlencode "password@$work/pw" "$base/user/login"
-  csrf=$(web "$base/$repo/actions" | grep -oP "csrfToken: '\K[^']+") || { echo "preflight: web login failed" >&2; exit 1; }
+  csrf=$(web "$base/$repo/actions" | grep -oP "csrfToken: '\K[^']+") || { echo "preflight: web login failed" >&2; return 1; }
 }
 view() { web -X POST -H "X-Csrf-Token: $csrf" -H 'Content-Type: application/json' -d '{"logCursors":[]}' \
   "$base/$repo/actions/runs/$1/jobs/0"; }
@@ -145,9 +145,14 @@ stop_runners() {
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
-  if [[ -n $run && $done != true ]]; then
-    web -o /dev/null -X POST -H "X-Csrf-Token: $csrf" "$base/$repo/actions/runs/$run/cancel" &&
-      echo "cancelled run $run" || echo "preflight: could not cancel run $run" >&2
+  set +e  # Nothing here may cut the stops short.
+  if [[ -n $run && $done != true ]]; then  # Forgejo 9 can 500 on a cancel that races a job's pickup; retry.
+    local n=0
+    until web -o /dev/null -X POST -H "X-Csrf-Token: $csrf" "$base/$repo/actions/runs/$run/cancel" 2>/dev/null; do
+      ((++n < 3)) || break
+      sleep 3; web_login
+    done
+    ((n < 3)) && echo "cancelled run $run" || echo "preflight: could not cancel run $run" >&2
   fi
   stop_runners
   rm -rf "$work"
@@ -194,10 +199,10 @@ view "$run" | python3 -c 'import json, sys; c = json.load(sys.stdin)["state"]["r
 echo "run $base/$repo/actions/runs/$run"
 
 # Poll until the run is done: print each job's status as it changes, then the table.
-report() { python3 - "$work/last" "$base" "$repo" "$run" "$1" <<'PY'
+report_py=$(cat <<'PY'
 import json, sys
-last_path, base, repo, run, final = sys.argv[1:]
-r = json.load(sys.stdin)["state"]["run"]
+view, last_path, base, repo, run, final = sys.argv[1:]
+r = json.load(open(view))["state"]["run"]
 try:
     last = json.load(open(last_path))
 except FileNotFoundError:
@@ -214,10 +219,11 @@ else:
         print(f"{j['name']:<{w}}  {j['status']:<9} {j['duration']:>8}  {base}/{repo}/actions/runs/{run}/jobs/{n}")
 open(last_path + ".status", "w").write(r["status"] + (" done" if r["done"] else ""))
 PY
-}
+)
+report() { python3 -c "$report_py" "$work/view.json" "$work/last" "$base" "$repo" "$run" "$1"; }
 while :; do
-  if ! json=$(view "$run"); then web_login; json=$(view "$run"); fi
-  report 0 <<<"$json"
+  view "$run" >"$work/view.json" || { web_login; view "$run" >"$work/view.json"; }
+  report 0
   [[ $(<"$work/last.status") == *" done" ]] && { done=true; break; }
   (($(date +%s) - start < secs)) || { echo "preflight: run $run passed ${timeout_min} min" >&2; exit 1; }
   sleep 20
@@ -225,6 +231,6 @@ done
 wall=$(($(date +%s) - start))
 status=$(<"$work/last.status")
 echo
-report 1 <<<"$json"
+report 1
 echo "run $run: ${status% done} in $((wall / 60))m$((wall % 60))s wall ($base/$repo/actions/runs/$run)"
 [[ $status == "success done" ]]

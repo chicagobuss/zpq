@@ -87,7 +87,7 @@ const flatLevels = output.flatLevels;
 
 pub const renameLeaf = types.renameLeaf;
 
-const booleanLane = output.booleanLane;
+const computedLane = output.computedLane;
 pub const outputLane = output.outputLane;
 
 pub const chunkDictionary = consumer_column.chunkDictionary;

@@ -264,6 +264,20 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
         renamed.num_children = 0;
         return renamed;
     };
+    // `make_date`'s days are a DATE, as a DATE column's are: INT32, so they are written and exported as one (their
+    // i64 lane narrowed on the way into the buffer, `output.computedLane`).
+    if (c.expr == .call and c.expr.temporal() == .date) return .{
+        .type = .INT32,
+        .type_length = null,
+        .repetition_type = repetition,
+        .name = c.alias,
+        .num_children = 0,
+        .converted_type = .DATE,
+        .logical_type = .{ .DATE = .{} },
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
     // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
     // are printed and written as the unsigned values they are.
     const unsigned_64 = c.expr == .col_ref and c.expr.col_ref.unsigned_64;

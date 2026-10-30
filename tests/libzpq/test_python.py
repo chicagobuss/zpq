@@ -491,6 +491,50 @@ def test_binary_text(z):
             check(r.get("reason") == "InvalidUtf8" and r.get("column") == "bad", f"invalid UTF-8 {r}")
 
 
+def test_arrow_types(z):
+    """A computed string answer is Arrow utf8 however it leaves (row, GROUP BY key, min/max), and a make_date one
+    date32, its JSON still the stored days DATE columns print."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "t.parquet")
+        pq.write_table(pa.table({"s": pa.array(["http://www.a.com/x", "https://b.org/y", None, "h\u00e9"]),
+                                 "b": pa.array([b"http://c.net/z", b"x", None, b"y"]),
+                                 "i": pa.array([0, 1, None, 19724], pa.int32())}), src)
+
+        def arrow_type(sql):
+            with z.arrow({"sql": sql}) as r:
+                return r.read_all().schema.field(0).type
+
+        domain = "regexp_replace(s, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1')"
+        for e in (domain, "s || 'x'", "CASE WHEN i > 0 THEN s ELSE 'z' END", "coalesce(b, '')",
+                  "CAST(s AS VARCHAR)", "CAST(b AS TEXT)", "CAST(s AS STRING)"):
+            for sql in (f"SELECT {e} AS v FROM '{src}'", f"SELECT {e} AS v, count(*) AS n FROM '{src}' GROUP BY v",
+                        f"SELECT min({e}) AS v, max({e}) AS w FROM '{src}'",
+                        f"SELECT max({e}) AS v, i FROM '{src}' GROUP BY i"):
+                got = arrow_type(sql)
+                check(got == pa.string(), f"computed string as Arrow {got}: {sql}")
+        check(arrow_type(f"SELECT b AS v, count(*) AS n FROM '{src}' GROUP BY v") == pa.binary(),
+              "a bytes key passes through as binary")
+        for sql in (f"SELECT make_date(i) AS v FROM '{src}'",
+                    f"SELECT make_date(i) AS v, count(*) AS n FROM '{src}' GROUP BY v",
+                    f"SELECT min(make_date(i + 1)) AS v FROM '{src}'",
+                    f"SELECT min(make_date(i)) AS v FROM '{src}'"):
+            got = arrow_type(sql)
+            check(got == pa.date32(), f"make_date as Arrow {got}: {sql}")
+        with z.arrow({"sql": f"SELECT make_date(i) AS v FROM '{src}'"}) as r:
+            days = r.read_all().column(0).cast(pa.int32()).to_pylist()
+        check(days == [0, 1, None, 19724], f"make_date days {days}")
+        rows = z.query_raw(f"SELECT make_date(i) AS v, i FROM '{src}' WHERE i > 0")
+        check(rows == '{"v":1,"i":1}\n{"v":19724,"i":19724}\n', f"make_date JSON prints the days {rows!r}")
+        keys = z.query_raw(f"SELECT make_date(i) AS v, count(*) AS n FROM '{src}' WHERE i > 0 GROUP BY v ORDER BY v")
+        check(keys == '{"v":1,"n":1}\n{"v":19724,"n":1}\n', f"make_date key JSON prints the days {keys!r}")
+        for sql, reason in ((f"SELECT CAST(i AS VARCHAR) AS v FROM '{src}'", "TypeMismatch"),
+                            (f"SELECT CAST(s AS BIGINT) AS v FROM '{src}'", "UnknownFunction")):
+            r = z.run({"sql": sql}, check=False)
+            check(r.get("reason") == reason, f"refused cast {r}: {sql}")
+
+
 def test_options_and_budget():
     for bad in ({"max_memory": "lots"}, {"budget_wait_ms": -1}):
         try:
@@ -522,6 +566,7 @@ def main():
         test_bad_lengths(z)
         test_bloom_options(z)
         test_binary_text(z)
+        test_arrow_types(z)
     test_close_drains()
     test_close_ends_waiters()
     test_service_shutdown()

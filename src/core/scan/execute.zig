@@ -122,6 +122,7 @@ const firstAppearanceCut = scan_census.firstAppearanceCut;
 const owner_support = @import("owner_support.zig");
 const passThroughSource = owner_support.passThroughSource;
 const boolean_answer = owner_support.boolean_answer;
+const date_answer = owner_support.date_answer;
 const input_rewind = @import("input_rewind.zig");
 const rewindInputs = input_rewind.rewindInputs;
 const owner_integer = @import("owner_integer.zig");
@@ -1968,7 +1969,7 @@ fn prepareAggregateWithMetas(
                 .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
                 .source = if (out.derived != null) null else if (keys[k_idx] == .col_ref)
                     leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx)
-                else if (keys[k_idx].isBoolean()) boolean_answer else null,
+                else if (keys[k_idx].isBoolean()) boolean_answer else if (keys[k_idx].temporal() == .date) date_answer else null,
             },
             .agg => |a_idx| .{
                 .nullable = agg_calls[a_idx].func != .count,

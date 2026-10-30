@@ -102,12 +102,13 @@ pub fn ownerIdentity(
 pub fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
-    if (arg != .col_ref) return if (arg.isBoolean()) boolean_answer else null;
+    if (arg != .col_ref) return if (arg.isBoolean()) boolean_answer else if (arg.temporal() == .date) date_answer else null;
     if (call.as_date) return date_answer;
     return leafSchemaElem(meta, arg.col_ref.col_idx);
 }
 
-/// The type `min`/`max` of `make_date(col)` answers as (`AggCall.as_date`), whatever integer type `col` has.
+/// The type `min`/`max` of `make_date(col)` answers as (`AggCall.as_date`), whatever integer type `col` has, and a
+/// computed DATE answer column (a key, min or max of `make_date(x)`): printed as its days, written and exported DATE.
 pub const date_answer: schema.SchemaElement = .{
     .type = .INT32,
     .type_length = null,

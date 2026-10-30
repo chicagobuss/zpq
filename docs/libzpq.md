@@ -364,9 +364,10 @@ slot, with batches of at most 65,536 rows. `max_memory` keeps its existing decla
 | FLOAT / DOUBLE | float32 / float64 |
 | BOOLEAN | bool, bit packed |
 | STRING / ENUM / JSON | UTF-8 |
+| a computed string (`regexp_replace`, `\|\|`, CASE, `CAST(x AS VARCHAR)`), as a row, key or min/max | UTF-8 |
 | other byte strings | binary |
 | DECIMAL(p,s), p ≤ 38 | decimal128(p,s), exact |
-| DATE | date32 |
+| DATE, `make_date(x)` | date32 |
 | TIMESTAMP millis / micros / nanos | timestamp with that unit; UTC when adjustedToUTC, otherwise no zone |
 | legacy INT96 | timestamp(ns, UTC), refused when outside Arrow's int64 range |
 | TIME millis / micros / nanos | time32(ms) / time64(us) / time64(ns) |

@@ -775,14 +775,25 @@ pub fn flatLevels(comptime T: type, scratch: std.mem.Allocator, c: filter_eval.C
     return out;
 }
 
-/// `col`, a computed output's values, in the BOOLEAN lane when its buffer `buf` is one: expressions evaluate a
-/// BOOLEAN as 0/1 in the integer lane.
-pub fn booleanLane(scratch: std.mem.Allocator, buf: OutputAggregator.ColumnBuf, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
-    if (buf != .boolean or col != .i64) return col;
+/// `col`, a computed output's values, in the lane of its buffer `buf`: expressions evaluate a BOOLEAN as 0/1 and a
+/// DATE as its days, both in the integer lane.
+pub fn computedLane(scratch: std.mem.Allocator, buf: OutputAggregator.ColumnBuf, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
+    if (col != .i64) return col;
     const c = col.i64;
-    const values = try scratch.alloc(bool, c.values.len);
-    for (c.values, values) |v, *o| o.* = v != 0;
-    return .{ .boolean = .{ .values = values, .def_levels = c.def_levels, .max_def = c.max_def, .has_nulls = c.has_nulls } };
+    switch (buf) {
+        .boolean => {
+            const values = try scratch.alloc(bool, c.values.len);
+            for (c.values, values) |v, *o| o.* = v != 0;
+            return .{ .boolean = .{ .values = values, .def_levels = c.def_levels, .max_def = c.max_def, .has_nulls = c.has_nulls } };
+        },
+        .i32 => {
+            // Days `make_date` range-checked to INTEGER; a NULL row's slot holds no value to check.
+            const values = try scratch.alloc(i32, c.values.len);
+            for (c.values, values) |v, *o| o.* = @truncate(v);
+            return .{ .i32 = .{ .values = values, .def_levels = c.def_levels, .max_def = c.max_def, .has_nulls = c.has_nulls } };
+        },
+        else => return col,
+    }
 }
 
 /// `col`, a passthrough output's rows as `SliceReader.next` reads them, in the lane of the output buffer `buf`, as
@@ -1086,7 +1097,7 @@ pub const ProjectedRG = struct {
             } else return error.MissingDecodedColumn,
             .computed => |c| {
                 const s = try self.survivors();
-                const col = try booleanLane(ra, agg.cols[i], try expr_eval.evalExpr(ra, &s.batch, self.lookup, c.expr));
+                const col = try computedLane(ra, agg.cols[i], try expr_eval.evalExpr(ra, &s.batch, self.lookup, c.expr));
                 try appendSelected(&agg.cols[i], col, s.sel, self.surviving, agg.arena, false, late.allocator());
                 return;
             },
@@ -1219,7 +1230,7 @@ pub fn appendSliceRows(
                     survived = try Survivors.init(scratch, batch, lookup, refs, sel, surviving);
                 }
                 rows = survived.?.sel;
-                break :blk try booleanLane(scratch, agg.cols[i], try expr_eval.evalExpr(scratch, &survived.?.batch, lookup, c.expr));
+                break :blk try computedLane(scratch, agg.cols[i], try expr_eval.evalExpr(scratch, &survived.?.batch, lookup, c.expr));
             },
         };
         // A DECIMAL written losslessly buffers its exact integers.

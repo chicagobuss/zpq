@@ -71,7 +71,7 @@ const appendSliceRows = output.appendSliceRows;
 const namedLevels = output.namedLevels;
 const flatLevels = output.flatLevels;
 const renameLeaf = types.renameLeaf;
-const booleanLane = output.booleanLane;
+const computedLane = output.computedLane;
 const outputLane = output.outputLane;
 const chunkDictionary = consumer_column.chunkDictionary;
 const slice_reader = @import("slice_reader.zig");
@@ -1132,11 +1132,11 @@ test "regression: a BOOLEAN expression is a BOOLEAN output leaf and buffer, its 
     const vals = [_]i64{ 1, 0, 0 };
     const defs = [_]u32{ 1, 1, 0 };
     const col: filter_eval.Batch.Column = .{ .i64 = .{ .values = &vals, .def_levels = &defs, .max_def = 1, .has_nulls = true } };
-    const lane = try booleanLane(arena.allocator(), .{ .boolean = .{} }, col);
+    const lane = try computedLane(arena.allocator(), .{ .boolean = .{} }, col);
     try testing.expectEqualSlices(bool, &.{ true, false, false }, lane.boolean.values);
     try testing.expectEqualSlices(u32, &defs, lane.boolean.def_levels.?);
     // Any other buffer takes the lane as it is.
-    try testing.expect((try booleanLane(arena.allocator(), .{ .i64 = .{} }, col)) == .i64);
+    try testing.expect((try computedLane(arena.allocator(), .{ .i64 = .{} }, col)) == .i64);
 }
 
 test "recompressChunk: a codec round trip gives back the chunk byte for byte" {

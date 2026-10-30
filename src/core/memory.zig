@@ -114,6 +114,9 @@ const SplitHeap = struct {
     small: std.mem.Allocator,
     large: std.mem.Allocator = std.heap.page_allocator,
     threshold: usize,
+    /// A block that grows to at least this many bytes moves to a mapping, and grows on by remapping rather than by
+    /// a copy; a fresh one stays on the heap below `threshold`. Null: `threshold`.
+    growth: ?usize = null,
 
     fn allocator(self: *SplitHeap) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -125,10 +128,17 @@ const SplitHeap = struct {
 
     fn ownerIsLarge(self: *SplitHeap, memory: []u8) bool {
         // Blocks move between heaps of different thresholds: group tables and their DISTINCT accumulators, and an
-        // unbudgeted query's buffers freed by the process heap after it. mimalloc's page map knows its own blocks;
-        // a mapping is never smaller than the lowest threshold.
+        // unbudgeted query's buffers freed by the process heap after it. An unbudgeted query's heap blocks have any
+        // size, and a mapping is never smaller than the lowest threshold. mimalloc's page map knows its own blocks.
         if (comptime use_mimalloc) return memory.len >= tight_distinct_threshold and !mi_is_in_heap_region(memory.ptr);
         return memory.len >= self.threshold;
+    }
+
+    /// Whether a block of `old_len` bytes (a mapping when `large`) resized to `len` belongs on a mapping.
+    fn mapped(self: *const SplitHeap, large: bool, old_len: usize, len: usize) bool {
+        if (len >= self.threshold) return true;
+        const floor = self.growth orelse return false;
+        return len >= floor and (large or len > old_len);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ret: usize) ?[*]u8 {
@@ -139,7 +149,7 @@ const SplitHeap = struct {
     fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, len: usize, ret: usize) bool {
         const self: *SplitHeap = @ptrCast(@alignCast(ctx));
         const large = self.ownerIsLarge(memory);
-        if (large != (len >= self.threshold)) return false;
+        if (large != self.mapped(large, memory.len, len)) return false;
         const old = if (large) self.large else self.small;
         return old.rawResize(memory, a, len, ret);
     }
@@ -147,9 +157,15 @@ const SplitHeap = struct {
     fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
         const self: *SplitHeap = @ptrCast(@alignCast(ctx));
         const large = self.ownerIsLarge(memory);
-        if (large != (len >= self.threshold)) return null;
-        const old = if (large) self.large else self.small;
-        return old.rawRemap(memory, a, len, ret);
+        const to_large = self.mapped(large, memory.len, len);
+        if (large == to_large) return (if (large) self.large else self.small).rawRemap(memory, a, len, ret);
+        // The caller's fresh allocation would stay on the heap below `threshold`: a block growing past `growth`
+        // moves to its mapping here, the one copy it pays.
+        if (!to_large or len >= self.threshold) return null;
+        const moved = self.large.rawAlloc(len, a, ret) orelse return null;
+        @memcpy(moved[0..memory.len], memory);
+        self.small.rawFree(memory, a, ret);
+        return moved;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ret: usize) void {
@@ -167,7 +183,13 @@ var split_process_heap: SplitHeap = .{ .small = mimalloc, .threshold = process_h
 var split_group_heap: SplitHeap = .{ .small = mimalloc, .threshold = group_heap_threshold };
 var split_tight_distinct_heap: SplitHeap = .{ .small = mimalloc, .threshold = tight_distinct_threshold };
 var split_distinct_heap: SplitHeap = .{ .small = mimalloc, .threshold = relaxed_distinct_threshold };
-var split_unbudgeted_heap: SplitHeap = .{ .small = mimalloc, .threshold = std.math.maxInt(usize) };
+// An unbudgeted query's fresh buffers reuse heap pages, however large: it allocates and frees thousands. One that grows
+// past the group threshold (a table's lists) is mapped, to grow without copies.
+var split_unbudgeted_heap: SplitHeap = .{
+    .small = mimalloc,
+    .threshold = std.math.maxInt(usize),
+    .growth = group_heap_threshold,
+};
 var split_c_group_heap: SplitHeap = .{
     .small = if (builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator,
     .threshold = group_heap_threshold,
@@ -183,8 +205,8 @@ fn distinctHeapRoute(limit: usize, tight: bool) DistinctHeapRoute {
 }
 
 /// The heap a query's buffers come from, given whether the caller set `--max-memory`. Only a configured budget pays
-/// for promptly released mappings (the process heap, and `groupAllocator` and `distinctMapAllocator` under it). An
-/// unbudgeted query keeps every buffer on the general heap, and those two leave it there.
+/// for promptly released mappings of fresh buffers (the process heap, and `groupAllocator` and `distinctMapAllocator`
+/// under it). An unbudgeted query keeps those on the general heap, and those two leave it there.
 pub fn queryAllocator(parent: std.mem.Allocator, budgeted: bool) std.mem.Allocator {
     if (comptime !use_mimalloc) return parent;
     return queryHeap(&split_process_heap, &split_unbudgeted_heap, parent, budgeted);
@@ -196,36 +218,48 @@ fn queryHeap(process: *SplitHeap, unbudgeted: *SplitHeap, parent: std.mem.Alloca
     return unbudgeted.allocator();
 }
 
-test "an unbudgeted query's aggregation buffers stay off the mapped path" {
-    // Mappings fail here: a buffer that took them would be refused.
-    var mapped = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+test "an unbudgeted query keeps fresh buffers on the heap and maps the ones that grow" {
+    var heap = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var mapped = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var process: SplitHeap = .{
-        .small = std.testing.allocator,
+        .small = heap.allocator(),
         .large = mapped.allocator(),
         .threshold = process_heap_threshold,
     };
     var unbudgeted: SplitHeap = .{
-        .small = std.testing.allocator,
+        .small = heap.allocator(),
         .large = mapped.allocator(),
         .threshold = std.math.maxInt(usize),
+        .growth = group_heap_threshold,
     };
+    // A budget keeps the process heap; another parent (a test's, a ledger's `Charged`) is the caller's either way.
     const budgeted = queryHeap(&process, &unbudgeted, process.allocator(), true);
     try std.testing.expect(budgeted.ptr == @as(*anyopaque, &process));
-    try std.testing.expectError(error.OutOfMemory, budgeted.alloc(u8, process_heap_threshold));
-    // Another parent (a test's, a ledger's `Charged`) is the caller's choice either way.
     const other = queryHeap(&process, &unbudgeted, std.testing.allocator, false);
     try std.testing.expect(other.ptr == std.testing.allocator.ptr and other.vtable == std.testing.allocator.vtable);
-    // A group table's slots and a DISTINCT map grow by doubling well past every mapping threshold.
     const a = queryHeap(&process, &unbudgeted, process.allocator(), false);
-    var slots = try a.alloc(u64, 64);
-    defer a.free(slots);
-    @memset(slots, 7);
-    while (slots.len * @sizeOf(u64) < 4 * relaxed_distinct_threshold) {
-        slots = try a.realloc(slots, slots.len * 2);
-        try std.testing.expectEqual(@as(u64, 7), slots[0]);
-        @memset(slots[slots.len / 2 ..], 7);
-    }
+    try std.testing.expect(a.ptr == @as(*anyopaque, &unbudgeted));
+    // Per-batch buffers, allocated and freed, stay on the heap however large; the budgeted process heap maps them.
+    a.free(try a.alloc(u8, process_heap_threshold));
+    a.free(try a.alloc(u8, 2 * relaxed_distinct_threshold));
     try std.testing.expectEqual(@as(usize, 0), mapped.allocations);
+    try std.testing.expect(process.child(process_heap_threshold).ptr == mapped.allocator().ptr);
+    // A list that grows past the group threshold moves to a mapping once, the one copy it pays.
+    var list = try a.alloc(u64, group_heap_threshold / 16);
+    @memset(list, 7);
+    list = try a.realloc(list, group_heap_threshold / 4);
+    try std.testing.expectEqual(@as(usize, 1), mapped.allocations);
+    try std.testing.expectEqual(@as(usize, 3), heap.deallocations);
+    try std.testing.expectEqual(@as(u64, 7), list[group_heap_threshold / 16 - 1]);
+    // From there it grows by remapping, and goes back to the heap only below the group threshold.
+    try std.testing.expect(unbudgeted.mapped(true, group_heap_threshold * 2, group_heap_threshold * 3));
+    try std.testing.expect(!unbudgeted.mapped(true, group_heap_threshold * 2, group_heap_threshold / 2));
+    try std.testing.expect(!unbudgeted.mapped(false, group_heap_threshold * 2, group_heap_threshold * 3 / 2));
+    // The budgeted heaps keep one threshold for fresh and growing blocks alike.
+    try std.testing.expect(!process.mapped(false, group_heap_threshold, process_heap_threshold - 1));
+    try std.testing.expect(process.mapped(false, group_heap_threshold, process_heap_threshold));
+    // Its owner, which a length cannot tell without mimalloc's page map.
+    mapped.allocator().free(list);
 }
 
 /// Tables use a lower mapping threshold without changing the process allocator used by scalar DISTINCT.
@@ -292,12 +326,14 @@ pub fn remapWithoutCopy(a: std.mem.Allocator, old: anytype, new_len: usize) ?@Ty
         const group = split_group_heap.allocator();
         const process = split_process_heap.allocator();
         const tight_distinct = split_tight_distinct_heap.allocator();
+        const unbudgeted = split_unbudgeted_heap.allocator();
         if (a.vtable == group.vtable and
-            (a.ptr == group.ptr or a.ptr == process.ptr or a.ptr == tight_distinct.ptr))
+            (a.ptr == group.ptr or a.ptr == process.ptr or a.ptr == tight_distinct.ptr or a.ptr == unbudgeted.ptr))
         {
             const heap: *SplitHeap = @ptrCast(@alignCast(a.ptr));
             const bytes = std.math.mul(usize, new_len, @sizeOf(@TypeOf(old[0]))) catch return null;
-            if (heap.ownerIsLarge(std.mem.sliceAsBytes(old)) and bytes >= heap.threshold)
+            const old_bytes = std.mem.sliceAsBytes(old);
+            if (heap.ownerIsLarge(old_bytes) and heap.mapped(true, old_bytes.len, bytes))
                 return a.remap(old, new_len);
         }
     }

@@ -1272,7 +1272,24 @@ fn evalCall(
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
         .make_date, .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c),
+        .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
     }
+}
+
+/// `CAST(s AS VARCHAR)`: the argument's texts as they are, a bare column read as decoded, codes and all.
+fn evalCastText(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!Batch.Column {
+    const col = if (arg == .col_ref)
+        batch.cols[column_lookup[arg.col_ref.col_idx] orelse return error.BadColumn]
+    else
+        try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const s = switch (col) {
+        .string => |s| s,
+        else => return error.TypeMismatch,
+    };
+    if (s.max_rep > 0) return error.NestedNotSupported;
+    // A column decoded to lengths alone (for `= ''`) has no texts to pass on.
+    if (s.codes == null and s.values.len != s.rowCount()) return error.LengthsOnlyColumn;
+    return col;
 }
 
 /// `regexp_replace` over a string column: a dictionary-coded column is replaced once per entry and read back by code,
@@ -1388,7 +1405,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

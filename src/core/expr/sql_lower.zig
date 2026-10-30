@@ -87,9 +87,19 @@ pub const Lower = struct {
                 };
                 break :blk .{ .case_ = .{ .whens = whens, .else_ = try self.nullable(cs.else_expr, depth + 1) } };
             },
-            c.LP_EXPR_CAST => .{ .call = .{ .name = "CAST", .args = &.{} } },
+            c.LP_EXPR_CAST => if (textType(node.u.cast.type_name)) .{
+                .cast_text = try self.ptr(node.u.cast.expr orelse return error.SqlParseError, depth + 1),
+            } else .{ .call = .{ .name = "CAST", .args = &.{} } },
             else => error.UnexpectedChar,
         };
+    }
+
+    /// DuckDB's names for its one string type that a cast takes; a length (`VARCHAR(10)`) DuckDB ignores, so zpq does.
+    fn textType(type_name: ?[*:0]const u8) bool {
+        const t = std.mem.span(type_name orelse return false);
+        const base = std.mem.trim(u8, t[0 .. std.mem.indexOfScalar(u8, t, '(') orelse t.len], " ");
+        for ([_][]const u8{ "VARCHAR", "TEXT", "STRING" }) |n| if (std.ascii.eqlIgnoreCase(base, n)) return true;
+        return false;
     }
 
     fn nullable(self: *Lower, node: ?*c.LpNode, depth: u32) !?*const syntax.Expr {

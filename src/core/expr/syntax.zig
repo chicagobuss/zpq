@@ -11,6 +11,8 @@ pub const Expr = union(enum) {
     binary: struct { op: ast.Op, left: *const Expr, right: *const Expr },
     call: struct { name: []const u8, args: []const *const Expr },
     case_: struct { whens: []const When, else_: ?*const Expr },
+    /// `CAST(x AS VARCHAR)`, `TEXT` or `STRING`; a cast to any other type is no function zpq has.
+    cast_text: *const Expr,
     pub const When = struct { cond: Predicate, then: ?*const Expr };
 };
 

@@ -234,6 +234,8 @@ pub const Func = enum {
     date_part,
     /// `regexp_replace(s, 'pattern', 'replacement'[, 'options'])`, in RE2's dialect as DuckDB's (`regex.zig`).
     regexp_replace,
+    /// `CAST(s AS VARCHAR)` (or TEXT, STRING) of a string: the same values, typed as text wherever they leave.
+    cast_text,
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -456,7 +458,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;

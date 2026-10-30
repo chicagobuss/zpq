@@ -327,6 +327,12 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema
             }
             break :blk bindCall(arena, file, func, args);
         },
+        .cast_text => |inner| blk: {
+            const args = try arena.alloc(*ast.Expr, 1);
+            args[0] = try arena.create(ast.Expr);
+            args[0].* = try bindSyntaxAt(arena, inner.*, file, diag, depth + 1);
+            break :blk bindCall(arena, file, .cast_text, args);
+        },
         .case_ => |c| blk: {
             const whens = try arena.alloc(ast.Case.When, c.whens.len);
             for (c.whens, whens) |w, *out| out.* = .{ .cond = try filter_parser.bindSyntax(arena, w.cond, file, diag), .then = try bindNullableSyntax(arena, w.then, file, diag, depth + 1) };
@@ -774,6 +780,12 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             for (args[1..]) |a| if (a.* != .literal or a.literal != .str) return error.TypeMismatch;
             return .str;
         },
+        // Only text casts to text: zpq has no number, date or bytes-escaping spelling to match DuckDB's.
+        .cast_text => {
+            if (args.len != 1) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            return .str;
+        },
     }
 }
 
@@ -1121,7 +1133,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .coalesce => for (args[1..]) |a| {
                     if (a.temporal() != args[0].temporal()) break null;
                 } else args[0].temporal(),
-                .strlen, .date_part, .regexp_replace => null,
+                .strlen, .date_part, .regexp_replace, .cast_text => null,
             },
             .part = switch (func) {
                 .date_trunc, .date_part => ast.DatePart.parse(args[0].literal.str) orelse unreachable,

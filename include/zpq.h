@@ -5,7 +5,7 @@
  * "aggregate" / "group_by", or an "output_url" to write to, with "filter", "select", "columns", "max_memory" and the
  * rest as the Lambda reads them. Or use {"sql":"SELECT ...", "parallelism":3}: SQL excludes structured query
  * fields and returns {"ok":true,"ndjson":"..."}, containing the CLI's exact NDJSON rows. SQL request/response
- * shapes are EXPERIMENTAL in 0.5.0, with no stability guarantee. See docs/libzpq.md.
+ * shapes are EXPERIMENTAL in 0.5.1, with no stability guarantee. See docs/libzpq.md.
  * Structured requests keep the Lambda response. Query failures return an {"error": ...} document.
  * An answer returned in the response (SQL rows, GROUP BY rows) is at most the request's "max_result_bytes" bytes,
  * the larger of the query's budget and 1 GiB by default. Past it the response is {"error":"result_too_large", ...}

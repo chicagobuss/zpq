@@ -47,7 +47,7 @@ with zpq.Zpq(max_memory="4GB") as z:
     print(r["agg"])
 ```
 
-## SQL (EXPERIMENTAL in 0.5.0)
+## SQL (EXPERIMENTAL in 0.5.1)
 
 The SQL request and response shapes are **EXPERIMENTAL** in 0.5.0 and have no stability guarantee. This is a thin
 pass-through to the CLI frontend; Parquet I/O remains the engine's focus.

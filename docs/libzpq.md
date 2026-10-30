@@ -374,7 +374,7 @@ slot, with batches of at most 65,536 rows. `max_memory` keeps its existing decla
 
 Nulls use validity bitmaps. FLOAT16 follows the engine's existing widening to float64. Aggregate result types use
 the same typed columns as Parquet output (including integer overflow refusal and avg_state's separate sum/count
-columns). No borrowed query-arena buffer escapes: this probe copies numeric values, packs booleans/validity, and
+columns). No borrowed query-arena buffer escapes: this path copies numeric values, packs booleans/validity, and
 flattens strings into offsets and data. It does not claim zero-copy from the engine. Arrow Java imports those owned
 buffers without serializing rows. A future transfer path must detach the owning engine allocation first.
 

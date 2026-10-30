@@ -114,10 +114,9 @@ $ S3_NO_SIGN_REQUEST=1 AWS_REGION=eu-central-1 zpq query \
 ```
 <!-- examples:end -->
 
-<!-- PLACEHOLDER until `--parquet-version` lands on release/0.5.1; check the wording against the final help text. -->
-Files zpq writes use Parquet's version 2 encodings by default (`--parquet-version v2`: the DELTA encodings,
-RLE_DICTIONARY and a version 2 footer). For readers that only understand version 1 files, add
-`--parquet-version v1`.
+Files zpq writes use Parquet's version 2 encodings by default (`--parquet-version v2`: DELTA where it fits and
+RLE_DICTIONARY, with a version 2 footer). For readers that only understand version 1 files, add
+`--parquet-version v1` (PLAIN / PLAIN_DICTIONARY and a version 1 footer).
 
 ## Three ways in
 
@@ -140,16 +139,17 @@ the Parquet part: filter and project with zpq, write Parquet or NDJSON, and read
 
 ## How fast
 
-On 464 benchmark queries (ClickBench, PDS-H and 390 synthetic aggregation cases), run cold with a fresh process for
-every query, zpq is the fastest of zpq, DuckDB 2.0 and Polars 2.0 on 438 of them, and never more than 1.5× behind. Its
-geometric mean is 0.56× the faster rival's time cold, and 0.48× hot. Every query, the method, and the few places zpq is
-still behind are on the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
+On 464 benchmark queries (ClickBench, PDS-H and 390 synthetic aggregation cases), run hot with a fresh process for
+every query, zpq 0.5.1 is faster than DuckDB 2.0 on 446 of them and faster than Polars 2.1 on 459, the fastest of the
+three on 442, and never more than 1.5× behind. Every query, the method, and the few places zpq is still behind are on
+the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
 
 ## Limits
 
-- `--max-memory` is a working budget, not a hard cap: a high-cardinality GROUP BY or `count(DISTINCT)` can go past it
-  by up to about 2× near the limit. The answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq
-  under a cgroup `memory.max` or `ulimit -v`.
+- `--max-memory` is a working budget, not a hard cap: it counts aggregation, DISTINCT and string memory, but not the
+  binary, thread stacks or mapped input pages, so a query can go somewhat past it (a 256 MiB budget peaked at about
+  284 MiB in testing). The answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq under a
+  cgroup `memory.max` or `ulimit -v`.
 - No joins and no window functions; some other SQL is refused with exit 2 and a message.
 - JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
 - SQL through libzpq, Arrow results and the Spark data source are experimental; Windows is not built.

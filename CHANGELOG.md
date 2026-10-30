@@ -2,24 +2,25 @@
 
 ## 0.5.1 (unreleased)
 
-<!-- DRAFT for the 0.5.1 release body. Items marked PLACEHOLDER have not landed on release/0.5.1; fill in or delete
-each one before the tag. Everything else is on release/0.5.1 at 9a8a7b4a. -->
-
 0.5.1 brings Arrow to libzpq: answers come back as Arrow C Data streams, with typed columns, exact DECIMALs and no
-JSON in between, and a Spark DataSource V2 uses them to run Parquet scans and partial aggregates inside zpq. It also
-makes three kinds of query faster, fixes a clean-up bug when memory runs out, and hardens the tests and release
-tooling. **PLACEHOLDER:** `--parquet-version`, with v2 the default; the `--max-memory` accounting work; the
-ClickBench q9 and q39 speed-ups; the internal code cleanup.
+JSON in between, and a Spark DataSource V2 uses them to run Parquet scans and partial aggregates inside zpq. Files
+zpq writes now default to Parquet's version 2 encodings, with `--parquet-version v1` for older readers.
+`--max-memory` now counts the memory that aggregation, DISTINCT and strings actually use. Six kinds of query are
+faster, the largest source files are split into small modules, and two bugs are fixed.
 
 ### What to do
 
-Nothing changes for existing scripts: `zpq query` prints the same rows, types and errors as 0.5.0, and libzpq's
-existing functions and status codes keep their meanings.
+- **Written Parquet files change bytes.** `zpq query -o` now writes `--parquet-version v2` by default: the DELTA
+  encodings where they fit and RLE_DICTIONARY, with a version 2 footer. The values and their order are unchanged,
+  and DuckDB, PyArrow and Polars read every v1 and v2 output the same way. A pipeline whose readers only understand
+  version 1 files adds `--parquet-version v1` (PLAIN / PLAIN_DICTIONARY and a version 1 footer). Row groups and
+  pages copied untouched from the input keep their own encodings either way.
+- **`--max-memory` budgets are tighter.** A budget now covers aggregation state, DISTINCT sets and string arenas, so
+  a query that fit under a small budget in 0.5.0 by not counting them may now refuse, with exit 2 and a message. Give
+  it a larger budget, or leave `--max-memory` unset.
 
-> **PLACEHOLDER (`--parquet-version`, not landed):** files zpq writes now default to `--parquet-version v2` (the
-> DELTA encodings, RLE_DICTIONARY with a PLAIN dictionary page, and a version 2 footer), as DuckDB's writer does.
-> A pipeline whose readers only understand version 1 files adds `--parquet-version v1`. Written files therefore have
-> different bytes than 0.5.0's, with the same values in the same order.
+Nothing else changes for scripts: `zpq query` prints the same rows, types and errors as 0.5.0 (every row output on
+the benchmark matrix is byte-identical), and libzpq's existing functions and status codes keep their meanings.
 
 ### Highlights
 
@@ -35,55 +36,83 @@ existing functions and status codes keep their meanings.
 - **A Spark DataSource V2 (experimental).** `spark.read.format("zpq")`, in `integrations/spark/`, runs Parquet
   scans, filter and column pushdown, and partial `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` and `GROUP BY` aggregates in
   libzpq through Java's Foreign Function & Memory API, and takes rows back as Arrow batches (`rowMode=arrow`, the
-  default). Its correctness suite runs 15 queries (13 ClickBench queries, plus exact DATE and DECIMAL ones) through
-  both `spark.read.parquet` and the zpq source and compares every cell. It needs Java 22 or later and Spark 4
-  (tested with Spark 4.2.1 and Arrow Java 19.0.0).
-- **PLACEHOLDER: `--parquet-version v1|v2`** for `zpq query -o`, v2 by default (see What to do).
+  default). Column names and paths are escaped in the SQL it builds. Its correctness suite runs 15 queries (13
+  ClickBench queries, plus exact DATE and DECIMAL ones) through both `spark.read.parquet` and the zpq source and
+  compares every cell. It needs Java 22 or later and Spark 4 (tested with Spark 4.2.1 and Arrow Java 19.0.0).
+- **`--parquet-version v1|v2`**, v2 by default (see What to do). JSON requests to libzpq and the Lambda take
+  `"parquet_version": "v1"` or `"v2"`. Writes are as fast as 0.5.0's on the benchmark machine.
 
 ### Performance
 
-Timed against 0.5.0 on the same Zen 5 desktop as 0.5.0's benchmarks, a fresh process per query, cold and
-hot-fresh:
+Measured against 0.5.0 on the same Zen 5 desktop as 0.5.0's benchmarks, a fresh process for every query:
 
+- **ClickBench q9** (the top 10 regions by count, each with `COUNT(DISTINCT UserID)`) ranks the regions by count
+  first, then counts distinct users for the 10 winners only: 18.6% faster cold, 27.5% faster hot.
+- **High-cardinality integer `GROUP BY … SUM` top-k** pre-aggregates each worker's rows into radix partitions before
+  the merge: 32–40% faster on the study's zipf11 and nullszipf q14.
+- **ClickBench q39 and its neighbours** split large row groups into subgroups that several workers read ahead in
+  parallel: q39 is 48% faster cold and 62% faster hot, and q36 and q37 gained 43–52% in a smaller run. Small or
+  highly filtered work stays in one piece, so q38 is unchanged.
 - **Grouped integer `COUNT(DISTINCT)`** uses exact, bounded bitmaps when the groups and values are known from the
-  input's dictionaries: 6.5–7.3× faster on the study's grouped DISTINCT cells (card10 and card1k q09). Anything the
-  bitmap cannot hold exactly falls back to the 0.5.0 path.
-- **Scalar `COUNT(DISTINCT)` over strings** works on dictionary codes and compares only the distinct strings
-  themselves: ClickBench q5 (`COUNT(DISTINCT SearchPhrase)`) is 17–20% faster. Pages that fall back to plain
-  encoding keep the per-value path.
+  input's dictionaries: 6.5–7.3× faster on the study's grouped DISTINCT cells (card10 and card1k q09).
+- **Scalar `COUNT(DISTINCT)` over strings** works on dictionary codes and compares only the distinct strings:
+  ClickBench q5 (`COUNT(DISTINCT SearchPhrase)`) is 17–20% faster.
 - **Top-k by `COUNT` over sorted integer keys** streams each worker's runs instead of building a full group table:
   2.3–2.5× faster on the study's sorted10m q01.
-- **PLACEHOLDER: ClickBench q9 two-stage** (−17.9% cold / −27.9% hot in its timing so far; not landed).
-- **PLACEHOLDER: q39 row subgroups** (q36–q39; formal timing pending; not landed).
 
-Every answer is unchanged: the same rows in the same order at every `-j` and memory budget.
+Across all 464 benchmark queries, hot-fresh, 0.5.1 is 1.6% faster than 0.5.0 by geometric mean (measured on the
+release candidate; the 48 queries its last fixes could touch were re-timed on the release build). Against the other
+engines, hot-fresh, zpq is faster than DuckDB 2.0.0 on 446 of the 464 queries and faster than Polars 2.1.0 on 459,
+and it is never more than 1.5× behind the faster of the two. Every answer is unchanged: the same rows in the same
+order at every `-j` and memory budget.
+
+### Memory: `--max-memory`
+
+`--max-memory` now charges aggregation state, DISTINCT sets (including the capacity of their string arenas) and
+string storage against the budget, where 0.5.0 left them out. In the accounting work's test, a query with a 256 MiB
+budget that peaked at 574 MiB now peaks at about 284 MiB, or refuses cleanly. It is still a working budget, not a
+hard cap: the binary, thread stacks and mapped input pages sit outside it, so for a hard ceiling run zpq under a
+cgroup `memory.max` or `ulimit -v`. Honouring a budget costs time: queries with an explicit budget are 5.7–8% slower
+on the benchmark cells, and queries without `--max-memory` are as fast as before or faster.
 
 ### Fixed
 
+- **A grouped `COUNT(DISTINCT)` could answer one row for many groups.** For a structured request (libzpq, the
+  Lambda or the fan-out coordinator), the planner decided "is this grouped, is it filtered" from SQL text, which
+  structured requests do not have. One case built a
+  single-row answer for a query with 40,000 groups. The planner now reads these from the bound query plan. SQL
+  through the CLI was not affected.
 - When an allocation was refused while zpq built an answer's typed columns (by `--max-memory` or by the system),
   the clean-up after the refusal could free memory the column did not own. Each column is now valid before it is
-  published, so the query refuses cleanly. The same fix covers the merge-state test fixtures.
-
-### Memory
-
-- **PLACEHOLDER: `--max-memory` accounting** (not landed).
+  published, so the query refuses cleanly.
 
 ### Tests and release tooling
 
+- Flaky tests fixed: the benchmark tool's deadline test (now 20 of 20 under load, from 3 failures in 15), the
+  multipart-upload tests' race with the fake server's clock (50 of 50 under load), and the allocation-failure
+  sweep's four-worker determinism check (20 consecutive green sweeps).
 - An opt-in allocation-failure sweep (`ZPQ_OOM_SWEEP=1`) runs representative library queries with an allocator that
   fails on a schedule, and checks every refusal's clean-up and every answer against stable results.
-- The release smoke test resolves its checkers from the invocation directory and names a failed spawn; macOS runs
-  get GNU `timeout`; the Intel macOS archive is exercised on a native runner; release builds have a configurable
-  timeout; and the workflow can rehearse a release without publishing it.
-- The multipart-upload tests no longer race the fake server's clock: a stalled-upload test passed 50 of 50 runs
-  under load after the fix.
-- The `units-core` fixture crash on one Linux test machine and the OS-contract checks on Python 3.14, the two
-  failures in 0.5.0's release matrix, are fixed.
+- The release workflow resolves its checkers from the invocation directory and names a failed spawn, gives macOS
+  runs GNU `timeout`, exercises the Intel macOS archive on a native runner, has a configurable build timeout, and
+  can rehearse a release without publishing it.
+- The two failures in 0.5.0's release matrix are fixed: the `units-core` fixture crash on one Linux test machine,
+  and the OS-contract checks on Python 3.14.
 
 ### Internal
 
-- **PLACEHOLDER: code cleanup** (`scan.zig`, `engine.zig`, `agg.zig` and `consumer.zig` split into smaller modules;
-  no behaviour change). One line here when it lands.
+- The four largest source files are split into directories of small modules: `src/core/scan/` (from 26,800 lines),
+  `src/engine/` (13,900), `src/core/consumer/` (11,800) and `src/core/expr/aggregate/` (8,300); each old file is now
+  a root of 85–240 lines. No behaviour changes.
+
+### Known
+
+Three small queries are slower than in 0.5.0, each by under 3 ms (fastest of five runs each); they are kept for
+0.5.2:
+
+- the study's sorted100k q03, cold: about +10% (21.8 → 24.1 ms);
+- the study's clust100k q05, hot: about +9% (6.8 → 7.5 ms);
+- PDS-H SF1 (publisher) q1, hot: about +6% (26.7 → 28.4 ms).
 
 ## 0.5.0 (2026-10-28)
 

@@ -16,7 +16,7 @@ faster, the largest source files are split into small modules, and two bugs are 
   version 1 files adds `--parquet-version v1` (PLAIN / PLAIN_DICTIONARY and a version 1 footer). Row groups and
   pages copied untouched from the input keep their own encodings either way.
 - **`--max-memory` budgets are tighter.** A budget now covers aggregation state, DISTINCT sets and string arenas, so
-  a query that fit under a small budget in 0.5.0 by not counting them may now refuse, with exit 2 and a message. Give
+  a query that fit under a small budget in 0.5.0 by not counting them may now refuse, with exit 1 and a message. Give
   it a larger budget, or leave `--max-memory` unset.
 
 Nothing else changes for scripts: `zpq query` prints the same rows, types and errors as 0.5.0 (every row output on

@@ -95,6 +95,9 @@ const Case = struct {
     refuse: ?Refuse = null,
     /// Byte parity only, with the reason there is no independent oracle.
     same: ?[]const u8 = null,
+    /// Why hosts may answer differently, such as answer or refusal at a budget edge that page size and allocator
+    /// granularity decide: the case keeps its own checks but stays out of the cross-host answers manifest.
+    host_dependent: ?[]const u8 = null,
     /// Refusals of these kinds are acceptable answers (identical at every point).
     safe: ?[]const []const u8 = null,
     /// Also write the typed answer at the first point (at `jobs` if given, with no point forcing) and check it with
@@ -399,6 +402,7 @@ fn checkExpectation(c: Case) !void {
         return if (n == 0) error.NoExpectation else error.ConflictingExpectations;
     }
     if (c.same) |note| if (std.mem.trim(u8, note, " ").len == 0) return error.EmptyExpectation;
+    if (c.host_dependent) |why| if (std.mem.trim(u8, why, " ").len == 0) return error.EmptyExpectation;
     if (c.safe) |kinds| if (kinds.len == 0) return error.EmptyExpectation;
 }
 
@@ -922,6 +926,7 @@ fn writesOut(c: Case) bool {
 /// Outputs a host shapes by design, left out of the answers manifest: an explanation sizes the plan from the host's
 /// caches and cores, and a profile trace records time.
 fn hostDependent(c: Case) bool {
+    if (c.host_dependent != null) return true;
     const args = c.cli orelse return false;
     for (args) |arg| if (std.mem.eql(u8, arg, "--explain") or std.mem.eql(u8, arg, "--profile")) return true;
     return false;

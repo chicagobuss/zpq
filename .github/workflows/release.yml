@@ -4,6 +4,10 @@ name: Release
 # a tar.gz with sha256 and attaches to a GitHub Release, then mirrors
 # it to R2. Native smoke jobs run the artifacts before publication.
 #
+# The same file runs as a Forgejo pre-flight (tools/release/preflight.sh): a dry run of an exact commit, before the
+# tag exists. Steps that differ between the two forges are paired on github.server_url, so on GitHub every step
+# that runs is the one that ran before; Forgejo never publishes.
+#
 # Lambda binaries are NOT shipped here. They're author-deployed via
 # `just lambda-deploy`; `tools/serverless/aws.sh build` is what
 # produces the artifact that hits AWS.
@@ -22,6 +26,11 @@ on:
         required: false
         type: boolean
         default: false
+      ref:
+        description: "Commit to build in place of the tag (a pre-flight dry run, before tagging)"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   build:
@@ -42,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
 
       - name: Install Zig (anyzig pins to build.zig.zon)
         run: |
@@ -82,7 +91,19 @@ jobs:
           compat/bin/zpq --version
 
       - name: Upload artifact
+        if: github.server_url == 'https://github.com'
         uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.tar.gz*
+            dist/*.deb*
+            dist/*.rpm*
+            dist/release.json
+
+      - name: Upload artifact (Forgejo)
+        if: github.server_url != 'https://github.com'
+        uses: christopherhx/gitea-upload-artifact@81f940d004763f986ba3582c007fd842dd5cb0d7 # v4
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -107,7 +128,19 @@ jobs:
           (cd $dest/bin && sha256sum $names > SHA256SUMS)
 
       - name: Upload native smoke bundle
+        if: github.server_url == 'https://github.com'
         uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.target }}/bin/zpq
+            dist/${{ matrix.target }}/bin/zpq-lambda
+            dist/${{ matrix.target }}/bin/zpq-integration
+            dist/${{ matrix.target }}/bin/SHA256SUMS
+
+      - name: Upload native smoke bundle (Forgejo)
+        if: github.server_url != 'https://github.com'
+        uses: christopherhx/gitea-upload-artifact@81f940d004763f986ba3582c007fd842dd5cb0d7 # v4
         with:
           name: smoke-${{ matrix.target }}
           path: |
@@ -137,10 +170,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
 
       - name: Download shipped smoke bundle
+        if: github.server_url == 'https://github.com'
         uses: actions/download-artifact@v4
+        with:
+          name: smoke-${{ matrix.target }}
+          path: release/${{ matrix.target }}/bin
+
+      - name: Download shipped smoke bundle (Forgejo)
+        if: github.server_url != 'https://github.com'
+        uses: christopherhx/gitea-download-artifact@75635f32b4c1c41c4b3d64e8f85210112ed4c9c7 # v4
         with:
           name: smoke-${{ matrix.target }}
           path: release/${{ matrix.target }}/bin
@@ -165,18 +206,30 @@ jobs:
 
       # CLI cases use GNU timeout, which is not in the macOS default PATH.
       - name: Install GNU timeout on macOS
-        if: matrix.target == 'aarch64-macos'
+        if: matrix.target == 'aarch64-macos' && github.server_url == 'https://github.com'
         run: |
           brew list coreutils >/dev/null 2>&1 || brew install coreutils
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # A pre-flight Mac is a person's machine, so the job installs nothing: its runner puts GNU timeout on PATH.
+      - name: Check GNU timeout on macOS (Forgejo)
+        if: matrix.target == 'aarch64-macos' && github.server_url != 'https://github.com'
+        run: timeout --version | grep -q GNU || { echo "the runner's PATH has no GNU timeout" >&2; exit 1; }
 
       - name: Run the Intel macOS binary
         if: matrix.target == 'x86_64-macos'
         run: release/x86_64-macos/bin/zpq --version
 
       - name: Download x86_64 release archives for CPU startup smoke
-        if: matrix.target == 'x86_64-linux-musl'
+        if: matrix.target == 'x86_64-linux-musl' && github.server_url == 'https://github.com'
         uses: actions/download-artifact@v4
+        with:
+          name: zpq-linux-x86_64
+          path: cpu-release
+
+      - name: Download x86_64 release archives for CPU startup smoke (Forgejo)
+        if: matrix.target == 'x86_64-linux-musl' && github.server_url != 'https://github.com'
+        uses: christopherhx/gitea-download-artifact@75635f32b4c1c41c4b3d64e8f85210112ed4c9c7 # v4
         with:
           name: zpq-linux-x86_64
           path: cpu-release
@@ -211,10 +264,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || inputs.tag || github.ref }}
 
       - name: Download all artifacts
+        if: github.server_url == 'https://github.com'
         uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Download all artifacts (Forgejo)
+        if: github.server_url != 'https://github.com'
+        uses: christopherhx/gitea-download-artifact@75635f32b4c1c41c4b3d64e8f85210112ed4c9c7 # v4
         with:
           path: artifacts
 
@@ -253,7 +313,7 @@ jobs:
           PY_NOTES
 
       - name: Create GitHub Release
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        if: ${{ github.server_url == 'https://github.com' && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true) }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
@@ -263,7 +323,7 @@ jobs:
 
       # R2 mirrors the GitHub Release; a failed upload (say, rotated credentials) must not block the release.
       - name: Upload to R2 (public mirror)
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        if: ${{ github.server_url == 'https://github.com' && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true) }}
         continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

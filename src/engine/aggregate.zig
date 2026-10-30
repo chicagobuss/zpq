@@ -239,7 +239,10 @@ pub fn explainAggregate(ctx: Context, arena: std.mem.Allocator, args: QueryArgs)
     return executeAggregate(ctx, arena, args, args.aggregate orelse "", true);
 }
 
-fn runAggregate(ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
+fn runAggregate(process_ctx: Context, args: QueryArgs, agg_str: []const u8) !AggResult {
+    // Only a `--max-memory` the caller set pays for promptly released buffer mappings.
+    var ctx = process_ctx;
+    ctx.gpa = core_memory.queryAllocator(ctx.gpa, args.max_memory_explicit != null);
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     return executeAggregate(ctx, arena_state.allocator(), args, agg_str, false);

@@ -124,11 +124,10 @@ const SplitHeap = struct {
     }
 
     fn ownerIsLarge(self: *SplitHeap, memory: []u8) bool {
-        // Group tables and their DISTINCT accumulators can transfer allocations between the two process heaps.
-        if (comptime use_mimalloc) {
-            if (memory.len >= tight_distinct_threshold and memory.len < relaxed_distinct_threshold)
-                return !mi_is_in_heap_region(memory.ptr);
-        }
+        // Blocks move between heaps of different thresholds: group tables and their DISTINCT accumulators, and an
+        // unbudgeted query's buffers freed by the process heap after it. mimalloc's page map knows its own blocks;
+        // a mapping is never smaller than the lowest threshold.
+        if (comptime use_mimalloc) return memory.len >= tight_distinct_threshold and !mi_is_in_heap_region(memory.ptr);
         return memory.len >= self.threshold;
     }
 
@@ -168,6 +167,7 @@ var split_process_heap: SplitHeap = .{ .small = mimalloc, .threshold = process_h
 var split_group_heap: SplitHeap = .{ .small = mimalloc, .threshold = group_heap_threshold };
 var split_tight_distinct_heap: SplitHeap = .{ .small = mimalloc, .threshold = tight_distinct_threshold };
 var split_distinct_heap: SplitHeap = .{ .small = mimalloc, .threshold = relaxed_distinct_threshold };
+var split_unbudgeted_heap: SplitHeap = .{ .small = mimalloc, .threshold = std.math.maxInt(usize) };
 var split_c_group_heap: SplitHeap = .{
     .small = if (builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator,
     .threshold = group_heap_threshold,
@@ -180,6 +180,52 @@ const DistinctHeapRoute = enum { tight, process, relaxed };
 fn distinctHeapRoute(limit: usize, tight: bool) DistinctHeapRoute {
     if (limit <= 512 * 1024 * 1024) return .tight;
     return if (tight) .process else .relaxed;
+}
+
+/// The heap a query's buffers come from, given whether the caller set `--max-memory`. Only a configured budget pays
+/// for promptly released mappings (the process heap, and `groupAllocator` and `distinctMapAllocator` under it). An
+/// unbudgeted query keeps every buffer on the general heap, and those two leave it there.
+pub fn queryAllocator(parent: std.mem.Allocator, budgeted: bool) std.mem.Allocator {
+    if (comptime !use_mimalloc) return parent;
+    return queryHeap(&split_process_heap, &split_unbudgeted_heap, parent, budgeted);
+}
+
+fn queryHeap(process: *SplitHeap, unbudgeted: *SplitHeap, parent: std.mem.Allocator, budgeted: bool) std.mem.Allocator {
+    const p = process.allocator();
+    if (budgeted or parent.vtable != p.vtable or parent.ptr != p.ptr) return parent;
+    return unbudgeted.allocator();
+}
+
+test "an unbudgeted query's aggregation buffers stay off the mapped path" {
+    // Mappings fail here: a buffer that took them would be refused.
+    var mapped = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var process: SplitHeap = .{
+        .small = std.testing.allocator,
+        .large = mapped.allocator(),
+        .threshold = process_heap_threshold,
+    };
+    var unbudgeted: SplitHeap = .{
+        .small = std.testing.allocator,
+        .large = mapped.allocator(),
+        .threshold = std.math.maxInt(usize),
+    };
+    const budgeted = queryHeap(&process, &unbudgeted, process.allocator(), true);
+    try std.testing.expect(budgeted.ptr == @as(*anyopaque, &process));
+    try std.testing.expectError(error.OutOfMemory, budgeted.alloc(u8, process_heap_threshold));
+    // Another parent (a test's, a ledger's `Charged`) is the caller's choice either way.
+    const other = queryHeap(&process, &unbudgeted, std.testing.allocator, false);
+    try std.testing.expect(other.ptr == std.testing.allocator.ptr and other.vtable == std.testing.allocator.vtable);
+    // A group table's slots and a DISTINCT map grow by doubling well past every mapping threshold.
+    const a = queryHeap(&process, &unbudgeted, process.allocator(), false);
+    var slots = try a.alloc(u64, 64);
+    defer a.free(slots);
+    @memset(slots, 7);
+    while (slots.len * @sizeOf(u64) < 4 * relaxed_distinct_threshold) {
+        slots = try a.realloc(slots, slots.len * 2);
+        try std.testing.expectEqual(@as(u64, 7), slots[0]);
+        @memset(slots[slots.len / 2 ..], 7);
+    }
+    try std.testing.expectEqual(@as(usize, 0), mapped.allocations);
 }
 
 /// Tables use a lower mapping threshold without changing the process allocator used by scalar DISTINCT.

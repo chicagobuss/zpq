@@ -66,8 +66,11 @@ class Zpq < Formula
   end
 end
 '''
-    # Target-only asset names have no release version for Homebrew to infer.
-    text = text.replace('version "0.5.0"', f'version "{m["version"]}"')
+    # Homebrew infers the version from a URL carrying it (GitHub's .../download/vX.Y.Z/...), and `brew audit --strict`
+    # rejects an explicit `version` that repeats it. Target-only asset names under some other base carry no version,
+    # so the line stays only when the base URL lacks it.
+    explicit = f'  version "{m["version"]}"\n'
+    text = text.replace('  version "0.5.0"\n', "" if f'v{m["version"]}/' in base_url.rstrip("/") + "/" else explicit)
     path = Path(a.out)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
+  capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
+  added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan
+  from one footer, and checks every footer while the workers run (a mismatch still refuses the query). TPC-H Q6 over
+  32 workers went from 749 to 541 ms warm on 0.5.1's own workers. No binary changed.
+
 ## 0.5.1 (2026-10-31)
 
 0.5.1 brings Arrow to libzpq: answers come back as Arrow C Data streams, with typed columns, exact DECIMALs and no
@@ -80,8 +88,9 @@ Measured against 0.5.0 on the same Zen 5 desktop as 0.5.0's benchmarks, a fresh 
 
 Across all 464 benchmark queries, hot-fresh, 0.5.1 is 1.6% faster than 0.5.0 by geometric mean (measured on the
 release candidate; the 48 queries its last fixes could touch were re-timed on the release build). Against the other
-engines, hot-fresh, zpq is faster than DuckDB 2.0.0 on 446 of the 464 queries and faster than Polars 2.1.0 on 459,
-and it is never more than 1.5× behind the faster of the two. Every answer is unchanged: the same rows in the same
+engines, hot-fresh, zpq is faster than DuckDB 2.0.0 on 446 of the 464 queries and faster than Polars 2.1.0 on 456
+of the 461 it answered correctly (its answers to 3 were incorrect), and it is never more than 1.5× behind the faster
+of the two. Every answer is unchanged: the same rows in the same
 order at every `-j` and memory budget.
 
 ### Memory: `--max-memory`

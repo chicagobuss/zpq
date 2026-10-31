@@ -1092,6 +1092,61 @@ test "regression: an INT96 past what 64-bit nanoseconds hold reads, compares and
     try std.testing.expect(key.logical_type.? == .TIMESTAMP);
 }
 
+test "regression: aggregate output writes a computed string key or min/max as STRING, a column's with its own type" {
+    const escape = "ci/fixtures/parquet/json_escape.parquet"; // s: STRING, b: unannotated bytes
+    std.Io.Dir.cwd().access(std.testing.io, escape, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var obuf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&obuf, ".zig-cache/tmp/{s}/answer.parquet", .{tmp.sub_path});
+    const Want = enum { text, bytes };
+    const Leaf = struct { []const u8, Want };
+    // Grouped (as rows, and as the CLI's typed answer) and one-row answers: the computed strings `k` and `m` were
+    // written as unannotated bytes, which DuckDB reads as BLOB.
+    for ([_]struct { ?[]const u8, []const u8, bool, []const Leaf }{
+        .{ "s || '!' AS k, s, b", "count(*) AS n, max(s || '?') AS m, min(b) AS lo", false, &.{
+            .{ "k", .text }, .{ "s", .text }, .{ "b", .bytes }, .{ "m", .text }, .{ "lo", .bytes },
+        } },
+        .{ "s || '!' AS k, b", "count(*) AS n, max(s || '?') AS m", true, &.{
+            .{ "k", .text }, .{ "b", .bytes }, .{ "m", .text },
+        } },
+        .{ null, "max(s || '?') AS m, min(b) AS lo, min(s) AS ls", false, &.{
+            .{ "m", .text }, .{ "lo", .bytes }, .{ "ls", .text },
+        } },
+    }) |w| {
+        var r = try runQuery(ctx, .{
+            .inputs = &.{escape},
+            .group_by = w[0],
+            .aggregate = w[1],
+            .typed_answer = w[2],
+            .output = out,
+        });
+        r.deinit(gpa);
+        const bytes = try metadata.readFileSlice(out, gpa);
+        defer gpa.free(bytes);
+        var meta = try metadata.open(gpa, bytes);
+        defer meta.deinit(gpa);
+        for (w[3]) |leaf| {
+            const elem = for (meta.schema.items[1..]) |e| {
+                if (std.mem.eql(u8, e.name, leaf[0])) break e;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(schema.Type.BYTE_ARRAY, elem.type.?);
+            switch (leaf[1]) {
+                .text => {
+                    try std.testing.expect(elem.logical_type != null and elem.logical_type.? == .STRING);
+                    try std.testing.expect(elem.converted_type == .UTF8);
+                },
+                .bytes => {
+                    try std.testing.expect(elem.logical_type == null);
+                    try std.testing.expect(elem.converted_type == null);
+                },
+            }
+        }
+    }
+}
+
 test "regression: inputs whose schema roots alone are named apart read together" {
     const dir = "ci/fixtures/parquet/";
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "int96_pyarrow_root.parquet", .{}) catch return error.SkipZigTest;

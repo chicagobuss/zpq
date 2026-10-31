@@ -34,4 +34,5 @@ object is that object's JSON text, in a quoted field: `"{""base64"":""/wA=""}"`.
 A STRING, ENUM or JSON value that is not valid UTF-8 makes the file invalid. zpq fails with an error naming the column
 (exit 1) rather than print a replacement; streamed rows before it may already be on stdout, as with any read error.
 A UUID that is not 16 bytes or an INTERVAL that is not 12 is refused the same way. Parquet output (`-o`) writes the
-bytes and annotation unchanged and is not affected.
+bytes and annotation of a value that passes a column through unchanged and is not affected; a computed string, as a
+row, a GROUP BY key or a min/max, is written as STRING, as it prints.

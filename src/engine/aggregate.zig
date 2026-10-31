@@ -139,7 +139,7 @@ const typedColumns = engine_write.typedColumns;
 const writeTypedParquet = engine_write.writeTypedParquet;
 const writeIntegerStream = engine_write.writeIntegerStream;
 const writeByteStream = engine_write.writeByteStream;
-const retypeOutputCol = engine_write.retypeOutputCol;
+const answerColumn = engine_write.answerColumn;
 const releaseStreamAnswer = engine_text.releaseStreamAnswer;
 const answerTypes = engine_text.answerTypes;
 const answerTextKinds = engine_text.answerTextKinds;
@@ -696,23 +696,6 @@ fn writeAggregateParquet(
     return bytes_out;
 }
 
-/// A string answer no column passes through (a computed key, a min/max of a computed string) is text, as the row path
-/// types a computed string (`consumer.computedSchemaElem`), so Arrow exports it as utf8, not binary. Only the Arrow
-/// export marks it: text and Parquet answers keep their own forms (docs/binary-output.md).
-fn markComputedText(types: []const scan.GroupColType, cols: []expr_agg.OutputCol) void {
-    var at: usize = 0;
-    for (types) |ty| {
-        if (ty.lane == .string and ty.source == null) textCol(&cols[at]);
-        at += if (ty.lane == .avg or ty.lane == .avg_dec) 2 else 1;
-    }
-}
-
-fn textCol(col: *expr_agg.OutputCol) void {
-    if (col.parquet_type != .BYTE_ARRAY or col.logical_type != null or col.converted_type != null) return;
-    col.logical_type = .{ .STRING = .{} };
-    col.converted_type = .UTF8;
-}
-
 fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: ColumnarSink, r: anytype, n_aggs: usize, empty: bool) !void {
     const out = r.output;
     if (out.integer_stream) |stream| {
@@ -723,7 +706,6 @@ fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: 
             const hi = @min(stream.state.group_count, lo + consumer.answer_rg_rows);
             const a = try stream.window(window.allocator(), r.state.group_col_types.?, lo, hi, 1);
             const cols = try typedColumns(window.allocator(), out.group_cols.?, r.state.group_col_types.?, a);
-            markComputedText(r.state.group_col_types.?, cols.items);
             if (lo == 0) try cs.schema_fn(cs.ctx, cols.items);
             if (hi > lo) try cs.batch_fn(cs.ctx, cols.items, 0, hi - lo);
             lo = hi;
@@ -737,10 +719,9 @@ fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: 
             defer window.deinit();
             const hi = @min(stream.state.group_count, lo + consumer.answer_rg_rows);
             const a = try stream.window(window.allocator(), lo, hi, 1);
-            for (r.state.group_col_types.?, a.columns) |ty, *col| if (ty.source) |src| {
-                col.* = try retypeOutputCol(window.allocator(), col.*, src);
-            };
-            markComputedText(r.state.group_col_types.?, a.columns);
+            for (r.state.group_col_types.?, a.columns) |ty, *col| {
+                col.* = try answerColumn(window.allocator(), col.*, ty.source);
+            }
             if (lo == 0) try cs.schema_fn(cs.ctx, a.columns);
             if (hi > lo) try cs.batch_fn(cs.ctx, a.columns, 0, hi - lo);
             lo = hi;
@@ -751,18 +732,14 @@ fn exportAggregateColumns(gpa: std.mem.Allocator, arena: std.mem.Allocator, cs: 
     var rows: usize = 0;
     if (out.typed) |typed| {
         cols = try typedColumns(arena, out.group_cols.?, r.state.group_col_types.?, typed);
-        markComputedText(r.state.group_col_types.?, cols.items);
         rows = typed.rows;
     } else if (out.group_rows) |group_rows| {
         cols = try groupedColumns(arena, out.group_cols.?, r.state.group_col_types.?, group_rows);
-        markComputedText(r.state.group_col_types.?, cols.items);
         rows = group_rows.len;
     } else {
         for (r.state.agg_calls[0..n_aggs], 0..) |call, i| {
             for (try expr_agg.finalize(arena, call, r.state.accumulators[i])) |col| {
-                var typed = col;
-                if (r.state.agg_sources[i]) |src| typed = try retypeOutputCol(arena, col, src) else textCol(&typed);
-                try cols.append(arena, typed);
+                try cols.append(arena, try answerColumn(arena, col, r.state.agg_sources[i]));
             }
         }
         rows = if (empty or out.no_row) 0 else 1;

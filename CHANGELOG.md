@@ -39,6 +39,10 @@ the benchmark matrix is byte-identical), and libzpq's existing functions and sta
   PyCapsule stream protocol, so `duckdb.register("t", reader)`, DataFusion and `pl.DataFrame(reader)` take it
   directly. A computed string (`regexp_replace`, `||`, CASE, coalesce, a text cast) is `utf8` as a GROUP BY key or
   `min`/`max` too, not only as a row. The full contract and type table are in `docs/libzpq.md`.
+- **Aggregate `-o` writes a computed string as STRING.** A GROUP BY key or `min`/`max` that the query computes
+  (`regexp_replace`, `||`, CASE, coalesce, a text cast) was written as unannotated bytes, which DuckDB reads as BLOB
+  and PyArrow and Polars as binary; it is now STRING (UTF8), as the same expression written as a row already was. A
+  key or `min`/`max` of a column keeps that column's type.
 - **`CAST(s AS VARCHAR)`** (also `TEXT`, `STRING` and `VARCHAR(n)`) of a string. A cast of a number or date to text
   is refused (`type mismatch in expression`); a cast to another type is still `unknown scalar function`.
 - **A Spark DataSource V2 (experimental).** `spark.read.format("zpq")`, in `integrations/spark/`, runs Parquet

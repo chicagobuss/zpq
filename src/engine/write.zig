@@ -1009,7 +1009,7 @@ pub fn writeOneRowParquet(
     var all_outs: std.ArrayList(expr_agg.OutputCol) = .empty;
     for (agg_calls, 0..) |call, i| {
         const cols = try expr_agg.finalize(arena, call, accumulators[i]);
-        for (cols) |c| try all_outs.append(arena, if (sources[i]) |src| try retypeOutputCol(arena, c, src) else c);
+        for (cols) |c| try all_outs.append(arena, try answerColumn(arena, c, sources[i]));
     }
     if (empty) for (all_outs.items) |*out| switch (out.col) {
         inline else => |*col| {
@@ -1039,7 +1039,7 @@ pub fn groupedColumns(arena: std.mem.Allocator, cols: []const []const u8, types:
             };
             const raw_u64 = if (ty.source) |src| schema.isUnsignedInt64(src) else false;
             const col = try groupedColumn(T, arena, name, ty.nullable, rows, ci, phys, raw_u64);
-            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, col, src) else col);
+            try outs.append(arena, try answerColumn(arena, col, ty.source));
         },
         .avg => {
             const sum_name = try std.fmt.allocPrint(arena, "{s}__sum", .{name});
@@ -1101,7 +1101,7 @@ pub fn typedColumns(arena: std.mem.Allocator, cols: []const []const u8, types: [
                 else => unreachable,
             };
             const out = typedColumn(@FieldType(@TypeOf(l), "values"), name, ty.nullable, l, phys);
-            try outs.append(arena, if (ty.source) |src| try retypeOutputCol(arena, out, src) else out);
+            try outs.append(arena, try answerColumn(arena, out, ty.source));
         },
         .avg => |a| {
             try outs.append(arena, typedColumn([]f64, try std.fmt.allocPrint(arena, "{s}__sum", .{name}), true, a.sum, .DOUBLE));
@@ -1222,9 +1222,7 @@ pub fn writeByteStream(
         const columns_span = profile.Span.begin(profile.threadOf(profiler, .main));
         const answer = try stream.window(window.allocator(), lo, hi, encode.workers);
         columns_span.end(.byte_columns, profile.args(.{}));
-        for (types, answer.columns) |ty, *col| {
-            if (ty.source) |src| col.* = try retypeOutputCol(arena, col.*, src);
-        }
+        for (types, answer.columns) |ty, *col| col.* = try answerColumn(arena, col.*, ty.source);
         try file.append(answer.columns, hi - lo, codec, zstd, encode);
         lo = hi;
         if (lo == total) {
@@ -1278,6 +1276,22 @@ fn decColumn(name: []const u8, l: scan.TypedAnswer.Lane(i128), spec: expr_ast.De
         .nullable = true,
         .dec = spec,
     };
+}
+
+/// An aggregate answer column's type: that of the column its values pass through unchanged (`retypeOutputCol`), or,
+/// with none, STRING / UTF8 for a computed string (a key or min/max of `regexp_replace`, `||`, CASE, a text cast), as
+/// the row path types one (`consumer.computedSchemaElem`). Parquet output and the Arrow export share it; text answers
+/// print by their own rules (docs/binary-output.md).
+pub fn answerColumn(arena: std.mem.Allocator, col: expr_agg.OutputCol, src: ?schema.SchemaElement) !expr_agg.OutputCol {
+    if (src) |elem| return retypeOutputCol(arena, col, elem);
+    var res = col;
+    if (res.col == .string and res.parquet_type == .BYTE_ARRAY and res.dec == null and res.logical_type == null and
+        res.converted_type == null)
+    {
+        res.logical_type = .{ .STRING = .{} };
+        res.converted_type = .UTF8;
+    }
+    return res;
 }
 
 /// Give an aggregate output column the parquet type of the source column its values pass through from unchanged (a

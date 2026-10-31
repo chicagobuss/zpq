@@ -1017,6 +1017,104 @@ test "a windowed S3 fetch that fails mid-scan fails the query rather than hangin
     try std.testing.expectError(error.RangeFetchFailed, fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, 1, &.{"ZPQ_S3_FOOTER_PROBE=16384"}));
 }
 
+test "a windowed row print waits for a row group left to its writer, and fails with its fetch, at every parallelism" {
+    // One row group too big for a producer's share beside 1-row ones: producers leave it to the writer before its bytes
+    // are in. Its ranges come slowly, or are refused; the writer waits on its gate as -j1 does, and a refused fetch
+    // fails the print with that error rather than decoding a buffer never filled.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const full = "ci/fixtures/parquet/full_match.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, full, .{}) catch return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var big_buf: [96]u8 = undefined;
+    var small_buf: [96]u8 = undefined;
+    const big_path = try std.fmt.bufPrint(&big_buf, ".zig-cache/tmp/{s}/big.parquet", .{tmp.sub_path});
+    const small_path = try std.fmt.bufPrint(&small_buf, ".zig-cache/tmp/{s}/small.parquet", .{tmp.sub_path});
+    const local: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // A select re-encodes the big one into one row group, uncompressed so its column chunks are ranges of their own.
+    {
+        var r = try runQuery(local, .{
+            .inputs = &.{full},
+            .output = big_path,
+            .select = "ts, b, s, x, n, u",
+            .codec = .UNCOMPRESSED,
+            .row_group = .{ .rows = 1600 },
+        });
+        r.deinit(gpa);
+        const one: engine_types.RowGroupTarget = .{ .rows = 1 };
+        var s = try runQuery(local, .{
+            .inputs = &.{full},
+            .output = small_path,
+            .filter = "ts < 12",
+            .row_group = one,
+        });
+        s.deinit(gpa);
+    }
+    const big = try metadata.readFileSlice(big_path, gpa);
+    defer gpa.free(big);
+    const small = try metadata.readFileSlice(small_path, gpa);
+    defer gpa.free(small);
+    // The footer probe takes each small file whole and leaves the big one's column chunks to ranged GETs.
+    try std.testing.expect(small.len * 2 < big.len);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const urls = [_][]const u8{ "s3://bkt/t/a.parquet", "s3://bkt/t/big.parquet", "s3://bkt/t/b.parquet" };
+    for ([_]bool{ false, true }) |refuse| {
+        var first: ?[]u8 = null;
+        defer if (first) |f| gpa.free(f);
+        var first_err: ?anyerror = null;
+        for ([_]usize{ 1, 2, 3, 16 }) |j| {
+            var fake: fake_s3.FakeS3 = undefined;
+            try fake.start(gpa);
+            defer fake.deinit();
+            try fake.serveBytes("t/a.parquet", small);
+            try fake.serveBytes("t/big.parquet", big);
+            try fake.serveBytes("t/b.parquet", small);
+            if (refuse) {
+                // The three footer reads and no more: the big row group's ranges are refused.
+                fake.gets_allowed = 3;
+            } else {
+                fake.stall = "GET /bkt/t/big.parquet";
+                fake.stall_at = .trickle;
+                fake.stall_min_len = 1024; // a column chunk, not the footer's suffix
+            }
+            var lines: std.ArrayList(?[*:0]const u8) = .empty;
+            const endpoint = try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0);
+            try lines.append(a, endpoint);
+            try lines.appendSlice(a, &.{ "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" });
+            try lines.append(a, "ZPQ_S3_WINDOW_KIB=1");
+            try lines.append(a, try std.fmt.allocPrintSentinel(a, "ZPQ_S3_FOOTER_PROBE={d}", .{small.len}, 0));
+            const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
+            @memcpy(block, lines.items);
+            const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = block } }, .io = std.testing.io };
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            const args: QueryArgs = .{ .inputs = &urls, .parallelism = j, .max_memory = 256 << 10 };
+            const err: ?anyerror = if (runPrintSink(ctx, args, .jsonl, null, 1, 0, &out.writer)) |_| null else |e| e;
+            if (!refuse) try std.testing.expectEqual(@as(u32, 1), fake.stalled);
+            if (first) |f| {
+                std.testing.expectEqual(first_err, err) catch |e| {
+                    std.debug.print("refuse {} at -j{d}\n", .{ refuse, j });
+                    return e;
+                };
+                try std.testing.expectEqualStrings(f, out.written());
+            } else {
+                first = try gpa.dupe(u8, out.written());
+                first_err = err;
+            }
+        }
+        if (refuse) {
+            try std.testing.expectEqual(@as(?anyerror, error.RangeFetchFailed), first_err);
+        } else {
+            try std.testing.expectEqual(@as(?anyerror, null), first_err);
+            try std.testing.expectEqual(@as(usize, 1624), std.mem.count(u8, first.?, "\n"));
+        }
+    }
+}
+
 test "every S3 write path writes the same bytes through a window as with everything fetched up front" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -1145,4 +1243,3 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
     try std.testing.expectEqualStrings("aggregate", pass.get("kind").?.string);
     try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
 }
-

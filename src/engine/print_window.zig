@@ -384,7 +384,11 @@ fn printWriter(w: *PrintCtx) void {
         // Nothing prints past a failure.
         if (w.first_err == null) {
             if (slot.deferred) {
-                printDeferred(w, job) catch |e| fail(w, e, consumer.decodeFailure());
+                // Its producer passed it on before waiting for its bytes (a gate already waited on, by one refused
+                // memory, returns at once). A failed fetch fails here, before any of them is read.
+                if (job.arrive()) |_| {
+                    printDeferred(w, job) catch |e| fail(w, e, consumer.decodeFailure());
+                } else |e| fail(w, e, null);
             } else if (slot.arena != null or slot.text != null) {
                 w.counts.rows_scanned += @intCast(job.rg.num_rows);
                 w.counts.rows_matched += slot.matched;
@@ -411,7 +415,7 @@ fn printWriter(w: *PrintCtx) void {
     }
 }
 
-/// A row group no producer took, printed as the serial loop prints it.
+/// A row group no producer took, its bytes in, printed as the serial loop prints it.
 fn printDeferred(w: *PrintCtx, job: RGJob) !void {
     const t = w.template;
     try engine_print.printRowGroup(w.gpa, t, job.rg, job.meta, src(job), w.filter, w.fetch_arr, w.output_specs, w.out);

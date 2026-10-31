@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Fan one zpq aggregate out over N zpq-lambda workers and merge their answers.
 
-The coordinator negotiates structured-plan v1 support (once per worker function and coordinator process), then
-asks the native frontend to prepare the original aggregate request and read input row-group counts; when the caller
-supplies the counts, preparation opens only the first input's footer. It cuts those row groups into N contiguous runs and forwards
+The coordinator negotiates structured-plan v1 support (on every query, or once per coordinator process for a
+published worker version), then asks the native frontend to prepare the original aggregate request and read input
+row-group counts. When the caller supplies the counts, the plan comes from the first input's footer and the full
+preparation, which validates every footer, runs alongside the scatter. It cuts those row groups into N contiguous runs and forwards
 the prepared syntax and `row_groups` (docs/lambda_requests.md). COUNT and SUM add, MIN and MAX fold, and explicit
 AVG partial states are divided after the merge. With `group_by` the merge is per group. ORDER BY and
 LIMIT apply to the merged rows, never to a worker's. Anything whose parts cannot be merged (COUNT(DISTINCT),
@@ -141,16 +142,36 @@ def order(rows, order_by, limit):
 
 # ---- Invoking workers ----
 
-def lambda_invoker(function, region=None, pool=256):
-    """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`. `invoke.capability_key` names the
-    function (with any version or alias qualifier it carries) for the capability cache."""
-    import boto3
-    from botocore.config import Config
-    lam = boto3.client("lambda", region_name=region, config=Config(
-        read_timeout=900, connect_timeout=10, retries={"total_max_attempts": 1}, max_pool_connections=pool))
+def pinned_version(function, region=None):
+    """(account or None, region, name, version) when `function` names an immutable published version (`name:7`,
+    or a function ARN ending in `:7`), else None: an alias, `$LATEST` or an unqualified name can change code
+    between two calls."""
+    head, sep, tail = function.rpartition(":function:")
+    account = None
+    if sep:  # arn:aws:lambda:REGION:ACCOUNT:function:NAME[:QUALIFIER], or ACCOUNT:function:NAME[:QUALIFIER]
+        parts = head.split(":")
+        account = parts[-1] if parts[-1].isdigit() else None
+        if len(parts) >= 5:
+            region = parts[3] or region
+        function = tail
+    name, _, qualifier = function.partition(":")
+    if not qualifier.isdigit():
+        return None
+    return account, region, name, qualifier
+
+
+def lambda_invoker(function, region=None, pool=256, client=None):
+    """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`, every call to exactly `function`
+    (qualifier included). When that is a published version, `invoke.capability_key` is its identity for the
+    capability cache; otherwise it is None and every query negotiates. `client` reuses a Lambda client."""
+    if client is None:
+        import boto3
+        from botocore.config import Config
+        client = boto3.client("lambda", region_name=region, config=Config(
+            read_timeout=900, connect_timeout=10, retries={"total_max_attempts": 1}, max_pool_connections=pool))
 
     def invoke(payload):
-        r = lam.invoke(FunctionName=function, Payload=json.dumps(payload).encode(), LogType="Tail")
+        r = client.invoke(FunctionName=function, Payload=json.dumps(payload).encode(), LogType="Tail")
         resp = loads(r["Payload"].read())
         stats = {"function_error": r.get("FunctionError")}
         m = REPORT_RE.search(base64.b64decode(r.get("LogResult", "")).decode(errors="replace"))
@@ -158,7 +179,8 @@ def lambda_invoker(function, region=None, pool=256):
             stats.update(duration_ms=float(m.group(1)), billed_ms=int(m.group(2)), memory_mb=int(m.group(3)),
                          max_memory_mb=int(m.group(4)), init_ms=float(m.group(5)) if m.group(5) else None)
         return resp, stats
-    invoke.capability_key = ("lambda", lam.meta.region_name, function)
+    pinned = pinned_version(function, region or client.meta.region_name)
+    invoke.capability_key = ("lambda",) + pinned if pinned else None
     return invoke
 
 
@@ -177,8 +199,9 @@ def scatter(invoke, payloads):
     return out, (time.perf_counter() - t0) * 1000
 
 
-# Capability acknowledgements by `invoke.capability_key`, for this process: a warm coordinator asks once per
-# worker function. An invoker without a key (a test double, a custom transport) is asked every time.
+# Capability acknowledgements by `invoke.capability_key`, for this process. lambda_invoker sets a key only for a
+# published (immutable) version, so a warm coordinator asks such a worker once; an alias, `$LATEST`, an unqualified
+# name or an invoker without a key is asked on every query, before any input is sent.
 CAPABILITIES = {}
 
 
@@ -196,43 +219,38 @@ def negotiate(invoke):
         CAPABILITIES[key] = True
 
 
-def prepare(invoke, request, counts=None):
-    """The native preparation of `request`. With `counts` (the caller's row-group counts, one per input) and no
-    `*` pattern among the inputs, only the first input's footer is opened: the plan is schema-independent syntax
-    that every worker binds against its own footer, so the other footers would only re-derive the supplied counts.
-    The answer then carries the request's inputs and no counts."""
-    key = getattr(invoke, "capability_key", None)
-    cached = key is not None and key in CAPABILITIES
-    negotiate(invoke)
-    inputs = request.get("inputs") or []
-    one = counts is not None and inputs and not any("*" in u for u in inputs)
-    prepared, _ = invoke(dict(request, operation="prepare_aggregate", plan_version=PLAN_VERSION,
-                              **({"inputs": inputs[:1]} if one else {})))
+def prepare(invoke, request, inputs=None):
+    """The native preparation of `request` (over `inputs` instead of its own, when given). Requires negotiation."""
+    payload = dict(request, operation="prepare_aggregate", plan_version=PLAN_VERSION)
+    if inputs is not None:
+        payload["inputs"] = inputs
+    prepared, _ = invoke(payload)
     if not isinstance(prepared, dict) or prepared.get("plan_version") != PLAN_VERSION or "plan" not in prepared:
-        if cached:  # the function's code may have changed since it acknowledged v1: negotiate again, once
-            CAPABILITIES.pop(key, None)
-            return prepare(invoke, request, counts)
         raise Refused(f"native aggregate preparation refused: {dumps(prepared)[:600]}")
-    if one:
-        prepared = dict(prepared, inputs=list(inputs), row_group_counts=None)
     return prepared
 
 
 def run(invoke, request, workers, order_by=None, limit=None, counts=None):
     """Answer `request` (a worker request with `inputs` and `aggregate`, optionally `group_by` and `filter`) over
-    `workers` workers. Optional `counts` (one per input) are trusted for scheduling, and preparation then binds the
-    plan from the first footer only; a range past a footer still fails that worker (RowGroupOutOfRange)."""
+    `workers` workers. Optional `counts` (one per input) are trusted for scheduling. With them and no `*` pattern
+    among the inputs, the plan comes from a preparation of the first input alone, and the full preparation of every
+    input (every footer, its schema checks included) runs concurrently with the scatter: the query answers only if
+    both succeed, and a refusal from the full preparation refuses it and discards the partial answers."""
     t0 = time.perf_counter()
     if request.get("sql") or request.get("row_groups"):
         raise Refused("the coordinator takes `aggregate`/`group_by` requests, not `sql` or `row_groups`")
     if not isinstance(request.get("aggregate"), str) or not request["aggregate"].strip():
         raise Refused("nothing to merge: the request has no `aggregate`")
-    prepared = prepare(invoke, request, counts)
+    negotiate(invoke)
+    inputs = list(request.get("inputs") or [])
+    early = counts is not None and inputs and not any("*" in u for u in inputs)
+    prepared = prepare(invoke, request, inputs[:1] if early else None)
     aggs = [(a["function"], None, a["name"]) for a in prepared["aggregates"]]
     if any(fn not in MERGEABLE for fn, _, _ in aggs):
         raise Refused("native preparation returned an unsupported merge operation")
     group = [(None, name) for name in prepared["groups"]]
-    inputs = prepared["inputs"]
+    if not early:
+        inputs = prepared["inputs"]
     if counts is None:
         counts = prepared["row_group_counts"]
     elif len(counts) != len(inputs):
@@ -246,13 +264,24 @@ def run(invoke, request, workers, order_by=None, limit=None, counts=None):
     payloads = [dict(base, inputs=[inputs[i] for i, _, _ in r], row_groups=[[s, e] for _, s, e in r]) for r in runs]
     if not payloads:  # no row groups anywhere: one worker answers the empty table
         payloads = [base]
-    out, scatter_ms = scatter(invoke, payloads)
+    check_ms = None
+    if early:
+        with cf.ThreadPoolExecutor(2) as ex:
+            full = ex.submit(lambda: (prepare(invoke, request), time.perf_counter()))
+            partial = ex.submit(scatter, invoke, payloads)
+            whole, done = full.result()  # a refusal here wins over the scatter's outcome
+            check_ms = (done - t0) * 1000 - footer_ms
+            out, scatter_ms = partial.result()
+        if any(whole.get(k) != prepared.get(k) for k in ("plan", "aggregates", "groups")):
+            raise Refused("the full preparation planned the query differently from the first input's")
+    else:
+        out, scatter_ms = scatter(invoke, payloads)
     merged = merge([resp["agg"] for resp, _ in out], aggs, group)
     rows = order(merged, order_by, limit) if group else merged
     stats = [dict(s, total_ms=resp.get("total_ms"), rows_in=resp.get("rows_in"), bytes_in=resp.get("bytes_in"))
              for resp, s in out]
     return {"agg": rows, "workers": len(payloads), "footer_ms": footer_ms, "scatter_ms": scatter_ms,
-            "e2e_ms": (time.perf_counter() - t0) * 1000, "worker_stats": stats}
+            "check_ms": check_ms, "e2e_ms": (time.perf_counter() - t0) * 1000, "worker_stats": stats}
 
 
 # ---- Output ----

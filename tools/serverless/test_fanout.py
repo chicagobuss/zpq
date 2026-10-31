@@ -7,6 +7,7 @@ the whole query and against DuckDB.
 Run from the repository root (the fixtures are cwd-relative)."""
 import argparse
 import http.server
+import io
 import itertools
 import json
 import math
@@ -14,7 +15,9 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -91,6 +94,21 @@ class FakeRuntime:
             p.wait()
         self.server.shutdown()
         self.server.server_close()
+
+
+class FakeLambdaClient:
+    """boto3's Lambda client as lambda_invoker uses it: records every (FunctionName, operation) and answers from
+    the fake runtime."""
+
+    def __init__(self, rt, region="us-west-2"):
+        self.rt, self.calls = rt, []
+        self.meta = types.SimpleNamespace(region_name=region)
+
+    def invoke(self, FunctionName, Payload, LogType):  # noqa: N803 (boto3's names)
+        payload = json.loads(Payload)
+        self.calls.append((FunctionName, payload.get("operation")))
+        resp, _ = self.rt.invoke(payload)
+        return {"Payload": io.BytesIO(fanout.dumps(resp).encode()), "LogResult": ""}
 
 
 def duckdb(sql):
@@ -186,7 +204,7 @@ class Fanout(unittest.TestCase):
                         self.assertTrue(same(got["agg"], one["agg"]), (got["agg"], one["agg"]))
                         self.assertTrue(same(got["agg"], ref[0]), (got["agg"], ref[0]))
 
-    def test_supplied_counts_open_one_footer_and_answer_the_same(self):
+    def test_supplied_counts_plan_from_one_footer_check_every_footer_and_answer_the_same(self):
         prepared = []
 
         def invoke(payload):
@@ -200,7 +218,7 @@ class Fanout(unittest.TestCase):
                 with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers):
                     prepared.clear()
                     got = fanout.run(invoke, req, workers, counts=[ROW_GROUPS[f] for f in inputs])
-                    self.assertEqual(prepared, [inputs[:1]])
+                    self.assertEqual(prepared, [inputs[:1], inputs])  # the plan first, then the full check
                     want = fanout.run(self.rt.invoke, req, workers)
                     self.assertEqual(got["workers"], want["workers"])
                     if group:
@@ -235,9 +253,46 @@ class Fanout(unittest.TestCase):
         req = {"inputs": [FULL], "aggregate": "count(*) AS c, sum(n) AS sn, avg(x) AS ax"}
         answers = [fanout.run(invoke, req, 4, counts=[8])["agg"] for _ in range(3)]
         self.assertEqual(operations.count("capabilities"), 1)
-        self.assertEqual(operations.count("prepare_aggregate"), 3)
+        self.assertEqual(operations.count("prepare_aggregate"), 6)  # per query: the first footer, then every footer
         self.assertTrue(all(same(a, answers[0]) for a in answers))
         self.assertTrue(same(answers[0], fanout.run(self.rt.invoke, req, 4)["agg"]))
+
+    def test_mixed_input_schemas_are_refused_with_supplied_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dec, big = os.path.join(tmp, "dec.parquet"), os.path.join(tmp, "big.parquet")
+            duckdb(f"COPY (SELECT 1.00::DECIMAL(15,2) AS x) TO '{dec}' (FORMAT parquet)")
+            duckdb(f"COPY (SELECT 1::BIGINT AS x) TO '{big}' (FORMAT parquet)")
+            req = {"inputs": [dec, big], "aggregate": "count(*) AS c", "group_by": "x"}
+            with self.assertRaisesRegex(fanout.Refused, "SchemaMismatch"):  # the released path: every footer first
+                fanout.run(self.rt.invoke, req, 2)
+            for counts in ([1, 1], [1, 0]):  # each worker binding one file alone; the mismatched input unscanned
+                with self.subTest(counts=counts), self.assertRaisesRegex(fanout.Refused, "SchemaMismatch"):
+                    fanout.run(self.rt.invoke, req, 2, counts=counts)
+
+    def test_only_a_published_version_caches_the_capability_answer(self):
+        req = {"inputs": [FULL], "aggregate": "count(*) AS c"}
+        arn = "arn:aws:lambda:us-west-2:123456789012:function:zpq-w"
+        for function, key in [("zpq-w", None), ("zpq-w:live", None), ("zpq-w:$LATEST", None), (arn + ":prod", None),
+                              ("zpq-w:7", ("lambda", None, "us-west-2", "zpq-w", "7")),
+                              (arn + ":8", ("lambda", "123456789012", "us-west-2", "zpq-w", "8"))]:
+            with self.subTest(function=function):
+                client = FakeLambdaClient(self.rt)
+                invoke = fanout.lambda_invoker(function, client=client)
+                self.assertEqual(invoke.capability_key, key)
+                fanout.CAPABILITIES.pop(key, None)
+                for _ in range(3):
+                    self.assertEqual(fanout.run(invoke, req, 2, counts=[8])["agg"]["c"], 1600)
+                self.assertEqual(sum(op == "capabilities" for _, op in client.calls), 3 if key is None else 1)
+
+    def test_a_pinned_version_keeps_preparation_and_partials_on_it(self):
+        client = FakeLambdaClient(self.rt)
+        invoke = fanout.lambda_invoker("zpq-w:7", client=client)
+        fanout.CAPABILITIES.pop(invoke.capability_key, None)
+        got = fanout.run(invoke, {"inputs": [FULL, FULL], "aggregate": "count(*) AS c"}, 4, counts=[8, 8])
+        self.assertEqual(got["agg"]["c"], 3200)
+        self.assertEqual({f for f, _ in client.calls}, {"zpq-w:7"})
+        ops = [op for _, op in client.calls]
+        self.assertEqual((ops.count("capabilities"), ops.count("prepare_aggregate"), ops.count(None)), (1, 2, 4))
 
     def test_an_empty_range_merges_as_no_rows(self):
         prepared = fanout.prepare(self.rt.invoke, {"inputs": [FULL], "aggregate": UNGROUPED_AGG})
@@ -331,20 +386,6 @@ class Refusals(unittest.TestCase):
         with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
             fanout.run(old_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
         self.assertEqual(requests, [{"operation": "capabilities"}])
-
-    def test_a_stale_cached_capability_is_negotiated_again(self):
-        requests = []
-
-        def replaced_worker(payload):  # acknowledged v1 earlier; its code has since been replaced by an older one
-            requests.append(payload)
-            return {"error": "bad_json", "reason": "MissingField"}, {}
-
-        replaced_worker.capability_key = ("test", "replaced-function")
-        fanout.CAPABILITIES[replaced_worker.capability_key] = True
-        with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
-            fanout.run(replaced_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4, counts=[8])
-        self.assertEqual([p.get("operation") for p in requests], ["prepare_aggregate", "capabilities"])
-        self.assertNotIn(replaced_worker.capability_key, fanout.CAPABILITIES)
 
     def test_capability_versions_require_integers(self):
         for capability in [{"prepare_aggregate_version": True, "structured_plan_versions": [1]},

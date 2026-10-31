@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fan one zpq aggregate out over N zpq-lambda workers and merge their answers.
 
-The coordinator negotiates structured-plan v1 support, then asks the native frontend to prepare the original
-aggregate request and read input row-group counts. It cuts those row groups into N contiguous runs and forwards
+The coordinator negotiates structured-plan v1 support (once per worker function and coordinator process), then
+asks the native frontend to prepare the original aggregate request and read input row-group counts; when the caller
+supplies the counts, preparation opens only the first input's footer. It cuts those row groups into N contiguous runs and forwards
 the prepared syntax and `row_groups` (docs/lambda_requests.md). COUNT and SUM add, MIN and MAX fold, and explicit
 AVG partial states are divided after the merge. With `group_by` the merge is per group. ORDER BY and
 LIMIT apply to the merged rows, never to a worker's. Anything whose parts cannot be merged (COUNT(DISTINCT),
@@ -141,7 +142,8 @@ def order(rows, order_by, limit):
 # ---- Invoking workers ----
 
 def lambda_invoker(function, region=None, pool=256):
-    """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`."""
+    """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`. `invoke.capability_key` names the
+    function (with any version or alias qualifier it carries) for the capability cache."""
     import boto3
     from botocore.config import Config
     lam = boto3.client("lambda", region_name=region, config=Config(
@@ -156,6 +158,7 @@ def lambda_invoker(function, region=None, pool=256):
             stats.update(duration_ms=float(m.group(1)), billed_ms=int(m.group(2)), memory_mb=int(m.group(3)),
                          max_memory_mb=int(m.group(4)), init_ms=float(m.group(5)) if m.group(5) else None)
         return resp, stats
+    invoke.capability_key = ("lambda", lam.meta.region_name, function)
     return invoke
 
 
@@ -174,28 +177,57 @@ def scatter(invoke, payloads):
     return out, (time.perf_counter() - t0) * 1000
 
 
-def prepare(invoke, request):
+# Capability acknowledgements by `invoke.capability_key`, for this process: a warm coordinator asks once per
+# worker function. An invoker without a key (a test double, a custom transport) is asked every time.
+CAPABILITIES = {}
+
+
+def negotiate(invoke):
     """Require an exact native capability acknowledgement before sending inputs for preparation or execution."""
+    key = getattr(invoke, "capability_key", None)
+    if key is not None and key in CAPABILITIES:
+        return
     cap, _ = invoke({"operation": "capabilities"})
     if (not isinstance(cap, dict) or type(cap.get("prepare_aggregate_version")) is not int
             or cap["prepare_aggregate_version"] != PLAN_VERSION or not isinstance(cap.get("structured_plan_versions"), list)
             or not any(type(v) is int and v == PLAN_VERSION for v in cap["structured_plan_versions"])):
         raise Refused("worker lacks structured aggregate plan v1; update the worker before using this coordinator")
-    prepared, _ = invoke(dict(request, operation="prepare_aggregate", plan_version=PLAN_VERSION))
+    if key is not None:
+        CAPABILITIES[key] = True
+
+
+def prepare(invoke, request, counts=None):
+    """The native preparation of `request`. With `counts` (the caller's row-group counts, one per input) and no
+    `*` pattern among the inputs, only the first input's footer is opened: the plan is schema-independent syntax
+    that every worker binds against its own footer, so the other footers would only re-derive the supplied counts.
+    The answer then carries the request's inputs and no counts."""
+    key = getattr(invoke, "capability_key", None)
+    cached = key is not None and key in CAPABILITIES
+    negotiate(invoke)
+    inputs = request.get("inputs") or []
+    one = counts is not None and inputs and not any("*" in u for u in inputs)
+    prepared, _ = invoke(dict(request, operation="prepare_aggregate", plan_version=PLAN_VERSION,
+                              **({"inputs": inputs[:1]} if one else {})))
     if not isinstance(prepared, dict) or prepared.get("plan_version") != PLAN_VERSION or "plan" not in prepared:
+        if cached:  # the function's code may have changed since it acknowledged v1: negotiate again, once
+            CAPABILITIES.pop(key, None)
+            return prepare(invoke, request, counts)
         raise Refused(f"native aggregate preparation refused: {dumps(prepared)[:600]}")
+    if one:
+        prepared = dict(prepared, inputs=list(inputs), row_group_counts=None)
     return prepared
 
 
 def run(invoke, request, workers, order_by=None, limit=None, counts=None):
     """Answer `request` (a worker request with `inputs` and `aggregate`, optionally `group_by` and `filter`) over
-    `workers` workers. Optional `counts` overrides scheduling counts; native preparation still validates footers."""
+    `workers` workers. Optional `counts` (one per input) are trusted for scheduling, and preparation then binds the
+    plan from the first footer only; a range past a footer still fails that worker (RowGroupOutOfRange)."""
     t0 = time.perf_counter()
     if request.get("sql") or request.get("row_groups"):
         raise Refused("the coordinator takes `aggregate`/`group_by` requests, not `sql` or `row_groups`")
     if not isinstance(request.get("aggregate"), str) or not request["aggregate"].strip():
         raise Refused("nothing to merge: the request has no `aggregate`")
-    prepared = prepare(invoke, request)
+    prepared = prepare(invoke, request, counts)
     aggs = [(a["function"], None, a["name"]) for a in prepared["aggregates"]]
     if any(fn not in MERGEABLE for fn, _, _ in aggs):
         raise Refused("native preparation returned an unsupported merge operation")

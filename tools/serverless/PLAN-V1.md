@@ -29,6 +29,11 @@ the wire. Expression and predicate depths are bounded during binding; JSON
 nesting is checked before recursive typed decoding. Unsupported versions and
 mixed plan/text fields refuse instead of silently falling back.
 
-Legacy text requests remain supported. The optional coordinator `counts` argument
-can override scheduling counts for diagnostics, but native preparation still
-validates the footers. Query output ordering and LIMIT apply after merging.
+Legacy text requests remain supported. The coordinator caches a function's
+acknowledgement for the life of its process (keyed by the function name and any
+qualifier); a preparation that answers without a v1 plan drops the entry and
+negotiates again. The optional coordinator `counts` argument is trusted for
+scheduling, and preparation then opens only the first input's footer (without a
+`*` pattern among the inputs): the plan is schema-independent and each worker binds
+it against its own footer, and a range past a footer still fails that worker.
+Query output ordering and LIMIT apply after merging.

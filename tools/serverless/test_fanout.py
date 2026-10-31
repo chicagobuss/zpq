@@ -139,6 +139,17 @@ CASES = [
     ([GROUPS], "count(*) AS c, sum(i) AS si, min(x) AS mx, max(i) AS xi, avg(x) AS ax", "k", None),
     ([GROUPS, GROUPS], "count(*) AS c, sum(x) AS sx, avg(i) AS ai", "k AS key", "i > 5000"),
 ]
+GROUP_NAMES = {None: [], "b": ["b"], "b AS bucket": ["bucket"], "k": ["k"], "k AS key": ["key"]}
+ROW_GROUPS = {FULL: 8, GROUPS: 24}
+
+
+def request(inputs, agg, group, flt):
+    req = {"inputs": inputs, "aggregate": agg}
+    if group:
+        req["group_by"] = group
+    if flt:
+        req["filter"] = flt
+    return req
 
 
 class Fanout(unittest.TestCase):
@@ -152,14 +163,10 @@ class Fanout(unittest.TestCase):
 
     def test_merged_matches_one_invocation_and_duckdb(self):
         for inputs, agg, group, flt in CASES:
-            req = {"inputs": inputs, "aggregate": agg}
-            if group:
-                req["group_by"] = group
-            if flt:
-                req["filter"] = flt
+            req = request(inputs, agg, group, flt)
             one, _ = self.rt.invoke(req)
             self.assertIn("agg", one, one)
-            names = {None: [], "b": ["b"], "b AS bucket": ["bucket"], "k": ["k"], "k AS key": ["key"]}[group]
+            names = GROUP_NAMES[group]
             where = f" WHERE {flt}" if flt else ""
             groups = " GROUP BY ALL" if group else ""
             files = ", ".join(f"'{f}'" for f in inputs)
@@ -178,6 +185,59 @@ class Fanout(unittest.TestCase):
                     else:
                         self.assertTrue(same(got["agg"], one["agg"]), (got["agg"], one["agg"]))
                         self.assertTrue(same(got["agg"], ref[0]), (got["agg"], ref[0]))
+
+    def test_supplied_counts_open_one_footer_and_answer_the_same(self):
+        prepared = []
+
+        def invoke(payload):
+            if payload.get("operation") == "prepare_aggregate":
+                prepared.append(payload["inputs"])  # each input of a preparation is one footer opened
+            return self.rt.invoke(payload)
+
+        for inputs, agg, group, flt in CASES:
+            req = request(inputs, agg, group, flt)
+            for workers in (1, 3, 8):
+                with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers):
+                    prepared.clear()
+                    got = fanout.run(invoke, req, workers, counts=[ROW_GROUPS[f] for f in inputs])
+                    self.assertEqual(prepared, [inputs[:1]])
+                    want = fanout.run(self.rt.invoke, req, workers)
+                    self.assertEqual(got["workers"], want["workers"])
+                    if group:
+                        g, w = keyed(got["agg"], GROUP_NAMES[group]), keyed(want["agg"], GROUP_NAMES[group])
+                        self.assertEqual(g.keys(), w.keys())
+                        self.assertTrue(all(same(g[k], w[k]) for k in g), (g, w))
+                    else:
+                        self.assertTrue(same(got["agg"], want["agg"]), (got["agg"], want["agg"]))
+
+    def test_a_glob_input_is_prepared_whole_even_with_counts(self):
+        prepared = []
+
+        def invoke(payload):
+            if payload.get("operation") == "prepare_aggregate":
+                prepared.append(payload["inputs"])
+            return self.rt.invoke(payload)
+
+        pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+        got = fanout.run(invoke, {"inputs": [pattern], "aggregate": "count(*) AS c"}, 2, counts=[8])
+        self.assertEqual(prepared, [[pattern]])
+        self.assertEqual(got["agg"]["c"], 1600)
+
+    def test_the_capability_answer_is_cached_across_invocations(self):
+        operations = []
+
+        def invoke(payload):
+            operations.append(payload.get("operation"))
+            return self.rt.invoke(payload)
+
+        invoke.capability_key = ("test", "cached-function")
+        fanout.CAPABILITIES.pop(invoke.capability_key, None)
+        req = {"inputs": [FULL], "aggregate": "count(*) AS c, sum(n) AS sn, avg(x) AS ax"}
+        answers = [fanout.run(invoke, req, 4, counts=[8])["agg"] for _ in range(3)]
+        self.assertEqual(operations.count("capabilities"), 1)
+        self.assertEqual(operations.count("prepare_aggregate"), 3)
+        self.assertTrue(all(same(a, answers[0]) for a in answers))
+        self.assertTrue(same(answers[0], fanout.run(self.rt.invoke, req, 4)["agg"]))
 
     def test_an_empty_range_merges_as_no_rows(self):
         prepared = fanout.prepare(self.rt.invoke, {"inputs": [FULL], "aggregate": UNGROUPED_AGG})
@@ -271,6 +331,20 @@ class Refusals(unittest.TestCase):
         with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
             fanout.run(old_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
         self.assertEqual(requests, [{"operation": "capabilities"}])
+
+    def test_a_stale_cached_capability_is_negotiated_again(self):
+        requests = []
+
+        def replaced_worker(payload):  # acknowledged v1 earlier; its code has since been replaced by an older one
+            requests.append(payload)
+            return {"error": "bad_json", "reason": "MissingField"}, {}
+
+        replaced_worker.capability_key = ("test", "replaced-function")
+        fanout.CAPABILITIES[replaced_worker.capability_key] = True
+        with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
+            fanout.run(replaced_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4, counts=[8])
+        self.assertEqual([p.get("operation") for p in requests], ["prepare_aggregate", "capabilities"])
+        self.assertNotIn(replaced_worker.capability_key, fanout.CAPABILITIES)
 
     def test_capability_versions_require_integers(self):
         for capability in [{"prepare_aggregate_version": True, "structured_plan_versions": [1]},

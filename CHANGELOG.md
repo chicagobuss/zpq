@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1 (unreleased)
+## 0.5.1 (2026-10-31)
 
 0.5.1 brings Arrow to libzpq: answers come back as Arrow C Data streams, with typed columns, exact DECIMALs and no
 JSON in between, and a Spark DataSource V2 uses them to run Parquet scans and partial aggregates inside zpq. Files

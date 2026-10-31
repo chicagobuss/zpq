@@ -54,6 +54,12 @@ the benchmark matrix is byte-identical), and libzpq's existing functions and sta
 
 Measured against 0.5.0 on the same Zen 5 desktop as 0.5.0's benchmarks, a fresh process for every query:
 
+- **Queries that print rows use every core.** 0.5.0 decoded, filtered and printed row output on one thread. Row
+  groups now decode, filter and format in parallel and print in input order, so the bytes are the same at every `-j`.
+  On ClickBench, `SELECT SearchPhrase, URL … WHERE URL LIKE '%google%'` went from 4.0 s to 0.68 s (−83%), and a
+  2.1 GB `WHERE SearchPhrase <> ''` from 8.8 s to 1.3 s (−86%). It covers NDJSON, JSON, CSV, libzpq JSON and Arrow
+  results. Without `--max-memory` each worker keeps its decode buffers, so peak memory on that LIKE query roughly
+  doubles (2.9 to 5.9 GiB, including the mapped file); with a budget, the workers share half of it.
 - **ClickBench q9** (the top 10 regions by count, each with `COUNT(DISTINCT UserID)`) ranks the regions by count
   first, then counts distinct users for the 10 winners only: 18.6% faster cold, 27.5% faster hot.
 - **High-cardinality integer `GROUP BY … SUM` top-k** pre-aggregates each worker's rows into radix partitions before

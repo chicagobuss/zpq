@@ -33,6 +33,7 @@ pub const write_window = @import("engine/write_window.zig");
 pub const write = @import("engine/write.zig");
 pub const rank = @import("engine/rank.zig");
 pub const print = @import("engine/print.zig");
+pub const print_window = @import("engine/print_window.zig");
 pub const aggregate = @import("engine/aggregate.zig");
 
 pub const fetchS3Schema = input.fetchS3Schema;

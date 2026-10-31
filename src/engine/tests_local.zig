@@ -255,6 +255,105 @@ test "windowed re-encode writes the same bytes at every parallelism" {
     }
 }
 
+test "a row query prints the same bytes at every parallelism, in every text format, failing where -j1 fails" {
+    const full = "ci/fixtures/parquet/full_match.parquet"; // 8 row groups
+    const tiny = "ci/fixtures/parquet/many_tiny.parquet"; // 512 row groups, ZSTD, a FLBA decimal
+    const mix = "ci/fixtures/parquet/nullable_mix.parquet"; // 2 row groups, NULLs in most columns
+    const escape = "ci/fixtures/parquet/json_escape.parquet"; // 1 row group, uncompressed
+    for ([_][]const u8{ full, tiny, mix, escape }) |f| std.Io.Dir.cwd().access(std.testing.io, f, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+
+    // One 1600-row row group beside 1-row ones: a budget that runs producers over the small ones leaves the big one to
+    // the writer, which prints it a slice at a time, as -j1 does.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var big_buf: [96]u8 = undefined;
+    var small_buf: [96]u8 = undefined;
+    const big = try std.fmt.bufPrint(&big_buf, ".zig-cache/tmp/{s}/big.parquet", .{tmp.sub_path});
+    const small = try std.fmt.bufPrint(&small_buf, ".zig-cache/tmp/{s}/small.parquet", .{tmp.sub_path});
+    for ([_]struct { []const u8, ?[]const u8, usize }{ .{ big, null, 1600 }, .{ small, "ts < 12", 1 } }) |w| {
+        var r = try runQuery(ctx, .{ .inputs = &.{full}, .output = w[0], .filter = w[1], .row_group = .{ .rows = w[2] } });
+        r.deinit(gpa);
+    }
+    // A STRING value that is not UTF-8 fails as it prints, after the bytes before it: the first `next` is a value
+    // of the uncompressed column `s`, its first byte made one no UTF-8 has.
+    var bad_buf: [96]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&bad_buf, ".zig-cache/tmp/{s}/bad_utf8.parquet", .{tmp.sub_path});
+    {
+        const bytes = try metadata.readFileSlice(escape, gpa);
+        defer gpa.free(bytes);
+        bytes[std.mem.indexOf(u8, bytes, "next").?] = 0xff;
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = bad, .data = bytes });
+    }
+
+    const Case = struct {
+        inputs: []const []const u8,
+        select: ?[]const u8 = null,
+        filter: ?[]const u8 = null,
+        offset: usize = 0,
+        max_memory: usize = 512 << 20,
+        err: ?anyerror = null,
+    };
+    const skewed: []const []const u8 = &.{ small, big, small };
+    const cases = [_]Case{
+        .{ .inputs = &.{full}, .filter = "s LIKE '%1%'" },
+        .{ .inputs = &.{ full, full }, .select = "ts * 2 AS t2, s, x", .filter = "x > 0" },
+        .{ .inputs = &.{full}, .offset = 333 },
+        .{ .inputs = &.{tiny}, .filter = "g != 1" },
+        .{ .inputs = &.{ mix, mix, mix } },
+        // Row groups the producers' half of a small budget cannot all hold at once.
+        .{ .inputs = &.{ full, full }, .filter = "b = 0", .max_memory = 96 << 10 },
+        .{ .inputs = skewed, .max_memory = 256 << 10 },
+        .{ .inputs = skewed, .filter = "x > 0", .max_memory = 512 << 10 },
+        .{ .inputs = skewed, .max_memory = 1 << 20 },
+        // Row 1000 (row group 5) divides by zero: the rows before its row group print, then its error.
+        .{ .inputs = &.{full}, .select = "ts, 100 / (ts - 1000) AS q", .err = error.DivisionByZero },
+        .{ .inputs = &.{ escape, escape, bad, escape }, .err = error.InvalidUtf8 },
+    };
+    for (cases) |c| for ([_]PrintFormat{ .jsonl, .json, .csv }) |format| {
+        var first: ?[]u8 = null;
+        defer if (first) |b| gpa.free(b);
+        var first_rows: usize = 0;
+        var first_column: Diag = .{};
+        for ([_]usize{ 1, 2, 3, 16 }) |j| {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            var diag: Diag = .{};
+            const args: QueryArgs = .{
+                .inputs = c.inputs,
+                .select = c.select,
+                .filter = c.filter,
+                .parallelism = j,
+                .max_memory = c.max_memory,
+                .diag = &diag,
+            };
+            const rows = if (runPrintSink(ctx, args, format, null, 1, c.offset, &out.writer)) |p| rows: {
+                try std.testing.expect(c.err == null);
+                break :rows p.rows;
+            } else |e| rows: {
+                const want: ?anyerror = e;
+                if (c.err != want) std.debug.print("case of {d} inputs {t} at -j{d}: {t}\n", .{ c.inputs.len, format, j, e });
+                try std.testing.expectEqual(c.err, want);
+                break :rows 0;
+            };
+            if (first) |b| {
+                std.testing.expectEqualStrings(b, out.written()) catch |e| {
+                    std.debug.print("case of {d} inputs {t} at -j{d}\n", .{ c.inputs.len, format, j });
+                    return e;
+                };
+                try std.testing.expectEqual(first_rows, rows);
+                try std.testing.expectEqualStrings(first_column.column.get(), diag.column.get());
+            } else {
+                first = try gpa.dupe(u8, out.written());
+                first_rows = rows;
+                first_column = diag;
+            }
+        }
+        try std.testing.expect(first.?.len > 0);
+    };
+}
+
 test "a recompressing copy writes the same bytes at every parallelism and reads back the same answer" {
     const fixture = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
@@ -1386,4 +1485,3 @@ test "every write path records a row group's uncompressed bytes as its total_byt
         }
     }
 }
-

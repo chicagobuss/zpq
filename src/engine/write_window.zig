@@ -98,12 +98,12 @@ pub const RGJob = struct {
     file_rg: usize = 0,
 
     /// Wait until the row group's bytes are in, when they are still being fetched.
-    fn arrive(self: RGJob) !void {
+    pub fn arrive(self: RGJob) !void {
         if (self.gate) |g| try g.wait(g.ctx, self.file_rg);
     }
 
     /// The row group's bytes are no longer needed: the fetch window may have them back.
-    fn leave(self: RGJob) void {
+    pub fn leave(self: RGJob) void {
         if (self.gate) |g| g.done(g.ctx, self.file_rg, 1);
     }
 };

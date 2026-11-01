@@ -1025,8 +1025,7 @@ fn runCli(
     };
     std.Io.Dir.cwd().deleteFile(run.io, target) catch {};
     var argv: std.ArrayList([]const u8) = .empty;
-    const timeout = try std.fmt.allocPrint(arena, "{d}", .{c.timeout_s});
-    try argv.appendSlice(arena, &.{ "timeout", "--kill-after=5", timeout, run.zpq });
+    try argv.append(arena, run.zpq);
     for (args) |a| {
         var arg = try replace(arena, a, "{path}", fixture);
         if (std.mem.indexOf(u8, arg, "{out")) |at| {
@@ -1047,7 +1046,7 @@ fn runCli(
         const at = std.mem.indexOfScalar(u8, entry, '=').?;
         try env.put(entry[0..at], entry[at + 1 ..]);
     }
-    const out = try oracle_mod.captureEnv(run.gpa, run.io, argv.items, &env);
+    const out = try oracle_mod.captureTimed(run.gpa, run.io, argv.items, &env, c.timeout_s);
     defer run.gpa.free(out.stdout);
     defer run.gpa.free(out.stderr);
     if (out.code == 0 and !out.signaled) {
@@ -1064,7 +1063,7 @@ fn runCli(
     const line = if (std.mem.lastIndexOfScalar(u8, diag, '\n')) |at| diag[at + 1 ..] else diag;
     const kind: []const u8 = if (out.signaled or out.code >= 128)
         "signal"
-    else if (out.code == 124)
+    else if (out.code == oracle_mod.timed_out_code)
         "timeout"
     else if (jsonCode(arena, diag)) |code| code else named: {
         const fallback = try std.fmt.allocPrint(arena, "exit {d}", .{out.code});

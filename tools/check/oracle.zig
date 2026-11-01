@@ -340,12 +340,30 @@ pub fn captureEnv(
     argv: []const []const u8,
     env: ?*const std.process.Environ.Map,
 ) !Captured {
+    return captureTimed(gpa, io, argv, env, null);
+}
+
+/// Exit code of a child stopped at its deadline, the same code coreutils `timeout` uses, so callers read it the same way.
+pub const timed_out_code: u8 = 124;
+
+/// `captureEnv` with a deadline: a child still running after `timeout_s` seconds is killed with its process group (SIGKILL,
+/// so every pipe writer is gone and the reads drain normally) and reported as exit `timed_out_code`. No external `timeout`
+/// command (macOS has none).
+pub fn captureTimed(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    env: ?*const std.process.Environ.Map,
+    timeout_s: ?u64,
+) !Captured {
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .environ_map = env,
+        // A timed child leads its own process group, so the deadline kills it with everything it started (as `timeout` does).
+        .pgid = if (timeout_s != null) 0 else null,
     }) catch |err| {
         if (err == error.FileNotFound) std.debug.print("cannot start {s}: FileNotFound\n", .{argv[0]});
         return err;
@@ -354,17 +372,30 @@ pub fn captureEnv(
     var multi_reader: std.Io.File.MultiReader = undefined;
     multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer multi_reader.deinit();
-    while (multi_reader.fill(4096, .none)) |_| {} else |err| {
-        if (err != error.EndOfStream) return err;
+    const deadline: std.Io.Timeout = if (timeout_s) |s|
+        (std.Io.Timeout{ .duration = .{ .raw = .fromSeconds(@intCast(s)), .clock = .awake } }).toDeadline(io)
+    else
+        .none;
+    var timed_out = false;
+    while (true) {
+        multi_reader.fill(4096, if (timed_out) .none else deadline) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => {
+                timed_out = true;
+                std.posix.kill(-child.id.?, .KILL) catch {};
+                continue;
+            },
+            else => return err,
+        };
     }
     const term = try child.wait(io);
-    const code: u8 = switch (term) {
+    const code: u8 = if (timed_out) timed_out_code else switch (term) {
         .exited => |c| c,
         else => 255,
     };
     return .{
         .code = code,
-        .signaled = term != .exited,
+        .signaled = !timed_out and term != .exited,
         .stdout = try multi_reader.toOwnedSlice(0),
         .stderr = try multi_reader.toOwnedSlice(1),
     };
@@ -557,4 +588,27 @@ test "DuckDB runs without an init file, in a pinned environment that the key nam
     try testing.expect(std.mem.indexOf(u8, log, "TZ=UTC LC_ALL=C HOME=\n") != null);
     const k = (try o.keyMaterial(a, "SELECT 1 AS a")).?;
     try testing.expect(std.mem.indexOf(u8, k, "-no-init") != null and std.mem.indexOf(u8, k, "TZ=UTC") != null);
+}
+
+test "a child past its deadline is killed and reported as a timeout, with no external timeout command" {
+    const io = testing.io;
+    const started = std.Io.Clock.awake.now(io);
+    const out = try captureTimed(testing.allocator, io, &.{ "sh", "-c", "echo before; sleep 30" }, null, 1);
+    defer testing.allocator.free(out.stdout);
+    defer testing.allocator.free(out.stderr);
+    const ns: i64 = @intCast(started.untilNow(io, .awake).toNanoseconds());
+    try testing.expectEqual(timed_out_code, out.code);
+    try testing.expect(!out.signaled);
+    try testing.expectEqualStrings("before\n", out.stdout);
+    try testing.expect(ns < 10 * std.time.ns_per_s);
+}
+
+test "a child that finishes before its deadline keeps its own exit code" {
+    const io = testing.io;
+    const out = try captureTimed(testing.allocator, io, &.{ "sh", "-c", "echo ok; exit 3" }, null, 30);
+    defer testing.allocator.free(out.stdout);
+    defer testing.allocator.free(out.stderr);
+    try testing.expectEqual(@as(u8, 3), out.code);
+    try testing.expect(!out.signaled);
+    try testing.expectEqualStrings("ok\n", out.stdout);
 }

@@ -51,7 +51,8 @@ jobs:
     # itself is ~5 min on the runner; the rest is setup + downstream
     # checks. Real headroom matters more than aspirational tightness.
     # 25 since libzpq joined: its BoringSSL is compiled from source (position-independent), a few minutes cold.
-    timeout-minutes: 25
+    # 120 while the commit tier plus the full-tier shards are measured on this 4-core runner (they outgrew 25 at 0.5.0).
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -194,7 +195,7 @@ jobs:
             target: x86_64-linux-musl
           - runner: ubuntu-24.04-arm
             target: aarch64-linux-musl
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-macos
     steps:
       - uses: actions/checkout@v4

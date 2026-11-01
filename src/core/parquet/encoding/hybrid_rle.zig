@@ -687,7 +687,21 @@ inline fn unpackFastFixed(
 /// smaller. Writing them as one-value runs instead made width-1 definition levels at 10% nulls 2.2x Arrow's size and
 /// 2x slower to read. Output is what `HybridRleDecoder.decode(.., bit_width)` roundtrips.
 pub fn encode(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
-    std.debug.assert(bit_width <= 32);
+    return encodeRuns(arena, values, bit_width, max_run_groups);
+}
+
+/// The most groups of 8 one bit-packed run may hold: a run represents at most 2^31-1 values, its padding included
+/// (parquet-format 2.14.0, RLE/bit-packing hybrid, rule 3).
+const max_run_groups: usize = std.math.maxInt(i32) / 8;
+
+/// `encode`, with bit-packed runs split at `max_groups` groups, so tests can reach the limit with small inputs.
+fn encodeRuns(
+    arena: std.mem.Allocator,
+    values: []const u32,
+    bit_width: u8,
+    max_groups: usize,
+) std.mem.Allocator.Error![]u8 {
+    std.debug.assert(bit_width <= 32 and max_groups > 0);
     if (bit_width == 0 or values.len == 0) return &.{};
     // Written straight into a buffer sized for the worst case (an RLE run per value: header + value bytes, plus a
     // padded group) instead of a byte append per output byte.
@@ -710,11 +724,11 @@ pub fn encode(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.
         const rest = values[i + groups * 8 .. j];
         if (rest.len > 0 and bit_width + @intFromBool(groups == 0) < shortRunsBytes(rest, value_bytes)) {
             const take = @min(n - i, (groups + 1) * 8);
-            o = putBitPackedRun(out, o, values[i..][0..take], groups + 1, bit_width);
+            o = putBitPackedRuns(out, o, values[i..][0..take], groups + 1, bit_width, max_groups);
             i += take;
             continue;
         }
-        if (groups > 0) o = putBitPackedRun(out, o, values[i..][0 .. groups * 8], groups, bit_width);
+        if (groups > 0) o = putBitPackedRuns(out, o, values[i..][0 .. groups * 8], groups, bit_width, max_groups);
         var k = i + groups * 8;
         while (k < j) {
             const e = @min(runEnd(values, k), j);
@@ -823,6 +837,18 @@ fn putRleRun(out: []u8, o: usize, value: u32, count: usize, value_bytes: usize) 
 /// `values` bit-packed LSB-first as `groups` groups of 8, zero-padded past its end (at most the last group), through
 /// a 128-bit accumulator drained 8 bytes at a time. The buffer's slack covers the 8-byte stores past the last whole
 /// byte.
+/// `putBitPackedRun` as runs of at most `max_groups` groups. Only the last group may be padded, so it ends the last run.
+fn putBitPackedRuns(out: []u8, o: usize, values: []const u32, groups: usize, bit_width: u8, max_groups: usize) usize {
+    var p = o;
+    var rest = values;
+    var left = groups;
+    while (left > max_groups) : (left -= max_groups) {
+        p = putBitPackedRun(out, p, rest[0 .. max_groups * 8], max_groups, bit_width);
+        rest = rest[max_groups * 8 ..];
+    }
+    return putBitPackedRun(out, p, rest, left, bit_width);
+}
+
 fn putBitPackedRun(out: []u8, o: usize, values: []const u32, groups: usize, bit_width: u8) usize {
     std.debug.assert(values.len <= groups * 8 and values.len + 8 > groups * 8);
     const p0 = putUleb128(out, o, (@as(u64, groups) << 1) | 1);
@@ -1297,6 +1323,50 @@ test "encode roundtrips random runs at every width with spec-valid runs, padding
         }
         try testing.expect(covered >= n);
     }
+}
+
+test "regression: encode splits bit-packed runs at the format's run-length limit, padding included" {
+    // The limit: the most whole groups whose values, padding included, stay within 2^31-1.
+    try testing.expect(max_run_groups * 8 <= std.math.maxInt(i32) and (max_run_groups + 1) * 8 > std.math.maxInt(i32));
+    var prng = std.Random.DefaultPrng.init(0x3172);
+    const r = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for (1..6) |max_groups| for (0..400) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const bw: u8 = @intCast(1 + r.uintLessThan(u8, 32));
+        // Lengths at the limit and around it (the review's 2^31-1 alternating levels, scaled down), then random.
+        const n = if (iter < 20) max_groups * 8 - 1 + iter else r.uintLessThan(usize, 300);
+        const vals = try a.alloc(u32, n);
+        const maxv: u32 = @intCast((@as(u64, 1) << @intCast(bw)) - 1);
+        // Alternating values, so long stretches pack, now and then a run long enough for RLE.
+        var k: usize = 0;
+        while (k < n) {
+            const run: usize = if (iter >= 20 and r.uintLessThan(u8, 8) == 0) 30 else 1;
+            for (0..@min(run, n - k)) |_| {
+                vals[k] = if (k % 2 == 0) 0 else maxv;
+                k += 1;
+            }
+        }
+        const bytes = try encodeRuns(a, vals, bw, max_groups);
+        const out = try a.alloc(u32, n);
+        var dec = HybridRleDecoder.init(bytes, bw);
+        try testing.expectEqual(n, try dec.decode(out));
+        try testing.expectEqualSlices(u32, vals, out);
+        var walk = HybridRleDecoder.init(bytes, bw);
+        var covered: usize = 0;
+        while (walk.pos < bytes.len) {
+            try walk.readNextRun();
+            if (!walk.in_rle) {
+                try testing.expect(walk.remaining_in_run <= max_groups * 8);
+                walk.pos += walk.remaining_in_run / 8 * bw;
+            }
+            covered += walk.remaining_in_run;
+            if (covered > n) try testing.expect(!walk.in_rle and covered - n < 8 and walk.pos == bytes.len);
+        }
+        try testing.expect(covered >= n);
+    };
 }
 
 test "encode packs width-1 levels with scattered nulls tighter than one-value runs did" {

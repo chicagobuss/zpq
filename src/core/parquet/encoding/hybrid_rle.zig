@@ -679,45 +679,78 @@ inline fn unpackFastFixed(
 
 /// Encode `values` using the RLE/bit-packed-hybrid scheme.
 ///
-/// Strategy: scan once to find runs. Emit RLE for runs ≥ 8 (the
-/// breakeven where RLE is shorter than bit-packing) and bit-packed
-/// otherwise. Output is what `HybridRleDecoder.decode(.., bit_width)`
-/// roundtrips.
-///
-/// Common case for OPTIONAL primitives: every value is 1 (all-present
-/// definition levels). One RLE run of count=N, value=1 → ~3 bytes
-/// regardless of N. Worth keeping simple.
+/// A run of equal values is an RLE run once its header and value cost fewer bytes than packing it would
+/// (`rleMinRun`), or when it is 8 or more and ends the stream, so an all-present page of levels stays the one RLE
+/// run the readers' O(1) check looks for. Everything between RLE runs is bit-packed in whole groups of 8. The fewer
+/// than 8 values left before the next RLE run either complete one more group, taking that run's first values (or
+/// zero padding at the stream's end, the one place the format allows it), or go out as short RLE runs, whichever is
+/// smaller. Writing them as one-value runs instead made width-1 definition levels at 10% nulls 2.2x Arrow's size and
+/// 2x slower to read. Output is what `HybridRleDecoder.decode(.., bit_width)` roundtrips.
 pub fn encode(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
     std.debug.assert(bit_width <= 32);
     if (bit_width == 0 or values.len == 0) return &.{};
-    // The same runs as `encodeReference`, in one walk over maximal runs, written straight into a buffer sized for the
-    // worst case (a 1-value RLE run per value: header + value bytes) instead of a byte append per output byte.
+    // Written straight into a buffer sized for the worst case (an RLE run per value: header + value bytes, plus a
+    // padded group) instead of a byte append per output byte.
     const value_bytes: usize = (bit_width + 7) / 8;
-    const cap = values.len * (2 + value_bytes) + values.len * bit_width / 8 + 64;
+    const cap = values.len * (2 + value_bytes) + values.len * bit_width / 8 + bit_width + 64;
     const out = try arena.alloc(u8, cap);
+    const min_run = rleMinRun(bit_width);
     var o: usize = 0;
     var i: usize = 0;
     const n = values.len;
     while (i < n) {
         const end = runEnd(values, i);
-        if (end - i >= 8) {
+        if (end - i >= min_run or (end == n and end - i >= 8)) {
             o = putRleRun(out, o, values[i], end - i, value_bytes);
             i = end;
             continue;
         }
-        // Bit-pack up to where the next run of 8 or more equal values starts, in whole groups of 8.
-        const j = nextLongRun(values, end);
-        const pack_count = (j - i) / 8 * 8;
-        if (pack_count > 0) {
-            o = putBitPackedRun(out, o, values[i .. i + pack_count], bit_width);
-            i += pack_count;
-        } else {
-            o = putRleRun(out, o, values[i], 1, value_bytes);
-            i += 1;
+        const j = nextRleRun(values, end, min_run);
+        const groups = (j - i) / 8;
+        const rest = values[i + groups * 8 .. j];
+        if (rest.len > 0 and bit_width + @intFromBool(groups == 0) < shortRunsBytes(rest, value_bytes)) {
+            const take = @min(n - i, (groups + 1) * 8);
+            o = putBitPackedRun(out, o, values[i..][0..take], groups + 1, bit_width);
+            i += take;
+            continue;
         }
+        if (groups > 0) o = putBitPackedRun(out, o, values[i..][0 .. groups * 8], groups, bit_width);
+        var k = i + groups * 8;
+        while (k < j) {
+            const e = @min(runEnd(values, k), j);
+            o = putRleRun(out, o, values[k], e - k, value_bytes);
+            k = e;
+        }
+        i = j;
     }
     // Shrunk to what was written, so callers may free it with its own length (in place on an arena).
     return arena.realloc(out, o);
+}
+
+/// The shortest run worth an RLE run between packed values: its header and value, plus the header of the packed
+/// run resuming after it, against its values packed. Width 1 takes 25 values; width 4 and wider, the format's 8.
+fn rleMinRun(bit_width: u8) usize {
+    const value_bytes: usize = (bit_width + 7) / 8;
+    return @max(8, 8 * (2 + value_bytes) / bit_width + 1);
+}
+
+/// Bytes `values` (fewer than 8) take as RLE runs, one per run of equal values.
+fn shortRunsBytes(values: []const u32, value_bytes: usize) usize {
+    var runs: usize = 1;
+    for (values[1..], values[0 .. values.len - 1]) |b, a| runs += @intFromBool(a != b);
+    return runs * (1 + value_bytes);
+}
+
+/// The first run start `s >= from` (`values[from - 1]` differing from `values[from]`, or `from` 0) that `encode`
+/// writes as an RLE run, or `values.len`.
+fn nextRleRun(values: []const u32, from: usize, min_run: usize) usize {
+    var s = nextLongRun(values, from);
+    while (s < values.len) {
+        const e = runEnd(values, s);
+        if (e - s >= min_run or e == values.len) return s;
+        s = nextLongRun(values, e);
+    }
+    return values.len;
 }
 
 /// The first `s >= from` where `values[s..s+8]` are all equal, or `values.len`. Each step compares 64 positions with
@@ -787,10 +820,12 @@ fn putRleRun(out: []u8, o: usize, value: u32, count: usize, value_bytes: usize) 
     return p;
 }
 
-/// `values` (a whole number of groups of 8) bit-packed LSB-first, through a 128-bit accumulator drained 8 bytes at a
-/// time. The buffer's slack covers the 8-byte stores past the last whole byte.
-fn putBitPackedRun(out: []u8, o: usize, values: []const u32, bit_width: u8) usize {
-    const p0 = putUleb128(out, o, (@as(u64, values.len / 8) << 1) | 1);
+/// `values` bit-packed LSB-first as `groups` groups of 8, zero-padded past its end (at most the last group), through
+/// a 128-bit accumulator drained 8 bytes at a time. The buffer's slack covers the 8-byte stores past the last whole
+/// byte.
+fn putBitPackedRun(out: []u8, o: usize, values: []const u32, groups: usize, bit_width: u8) usize {
+    std.debug.assert(values.len <= groups * 8 and values.len + 8 > groups * 8);
+    const p0 = putUleb128(out, o, (@as(u64, groups) << 1) | 1);
     const mask: u64 = if (bit_width == 32) 0xffff_ffff else (@as(u64, 1) << @intCast(bit_width)) - 1;
     var acc: u128 = 0;
     var bits: u32 = 0;
@@ -805,139 +840,13 @@ fn putBitPackedRun(out: []u8, o: usize, values: []const u32, bit_width: u8) usiz
             bits -= 64;
         }
     }
-    // Groups of 8 values make whole bytes, so what is left is whole bytes too.
-    const tail = bits / 8;
-    var t: u32 = 0;
-    while (t < tail) : (t += 1) {
-        out[p] = @truncate(acc >> @intCast(t * 8));
-        p += 1;
+    // The rest of the last group: what the accumulator holds, then zeros. A group is `bit_width` whole bytes.
+    const end = p0 + groups * bit_width;
+    while (p < end) : (p += 1) {
+        out[p] = @truncate(acc);
+        acc >>= 8;
     }
     return p;
-}
-
-/// The encoder `encode` replaced, kept to prove they write the same bytes.
-fn encodeReference(arena: std.mem.Allocator, values: []const u32, bit_width: u8) std.mem.Allocator.Error![]u8 {
-    std.debug.assert(bit_width <= 32);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(arena);
-
-    if (bit_width == 0) {
-        // bit_width=0 means every value is implicitly zero; the stream
-        // need not encode anything. Decoders short-circuit on this.
-        return out.toOwnedSlice(arena);
-    }
-    if (values.len == 0) return out.toOwnedSlice(arena);
-
-    // Walk values, emit one run at a time. The wire format requires
-    // bit-packed runs to be whole groups of 8 — partial groups can't
-    // be padded (the decoder can't tell padding from real values). So
-    // the rule is: RLE for ≥8 same-value, else bit-pack in multiples
-    // of 8, else emit any leftover trailing values as 1-element RLE
-    // runs.
-    var i: usize = 0;
-    while (i < values.len) {
-        const run_len = sameValueRun(values, i);
-
-        if (run_len >= 8) {
-            try writeRleRun(arena, &out, values[i], run_len, bit_width);
-            i += run_len;
-            continue;
-        }
-
-        // Find how many values we can bit-pack starting at i: walk
-        // until we hit an RLE-eligible (≥8 same) stretch or end of
-        // input. Then round down to a multiple of 8.
-        var j = i;
-        while (j < values.len) {
-            if (sameValueRun(values, j) >= 8) break;
-            j += 1;
-        }
-        const pack_total = j - i;
-        const pack_groups = pack_total / 8;
-        const pack_count = pack_groups * 8;
-
-        if (pack_count > 0) {
-            try writeBitPackedRun(arena, &out, values[i .. i + pack_count], bit_width);
-            i += pack_count;
-        } else {
-            // No full group available and no RLE-eligible run starts
-            // here. Emit values[i] as a single-element RLE run and
-            // advance one. Costs ULEB128(2)=1 byte + ceil(bw/8) bytes.
-            try writeRleRun(arena, &out, values[i], 1, bit_width);
-            i += 1;
-        }
-    }
-
-    return out.toOwnedSlice(arena);
-}
-
-/// How many consecutive `values[start..]` equal `values[start]`.
-fn sameValueRun(values: []const u32, start: usize) usize {
-    var k = start + 1;
-    while (k < values.len and values[k] == values[start]) : (k += 1) {}
-    return k - start;
-}
-
-fn writeUleb128(arena: std.mem.Allocator, out: *std.ArrayList(u8), value: u64) std.mem.Allocator.Error!void {
-    var v = value;
-    while (true) {
-        var b: u8 = @truncate(v & 0x7f);
-        v >>= 7;
-        if (v != 0) b |= 0x80;
-        try out.append(arena, b);
-        if (v == 0) break;
-    }
-}
-
-fn writeRleRun(
-    arena: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    value: u32,
-    count: usize,
-    bit_width: u8,
-) std.mem.Allocator.Error!void {
-    // header: (count << 1) | 0
-    try writeUleb128(arena, out, @as(u64, @intCast(count)) << 1);
-    // value: ceil(bit_width/8) bytes, little-endian
-    const value_bytes = (bit_width + 7) / 8;
-    var i: u8 = 0;
-    while (i < value_bytes) : (i += 1) {
-        try out.append(arena, @as(u8, @truncate(value >> @intCast(i * 8))));
-    }
-}
-
-fn writeBitPackedRun(
-    arena: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    values: []const u32,
-    bit_width: u8,
-) std.mem.Allocator.Error!void {
-    // Round up to whole groups of 8 with zero padding for trailing values.
-    const groups = (values.len + 7) / 8;
-    // header: (groups << 1) | 1
-    try writeUleb128(arena, out, (@as(u64, @intCast(groups)) << 1) | 1);
-
-    // Bit-pack: LSB-first within each byte, little-endian across bytes
-    // within a group. We just stream `bit_width` bits per value into a
-    // 64-bit accumulator, draining bytes as they fill.
-    var bit_buf: u64 = 0;
-    var bits_in_buf: u8 = 0;
-    const mask: u32 = if (bit_width == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(bit_width)) - 1;
-    for (0..groups * 8) |idx| {
-        const v: u32 = if (idx < values.len) values[idx] & mask else 0;
-        bit_buf |= @as(u64, v) << @intCast(bits_in_buf);
-        bits_in_buf += bit_width;
-        while (bits_in_buf >= 8) {
-            try out.append(arena, @as(u8, @truncate(bit_buf & 0xff)));
-            bit_buf >>= 8;
-            bits_in_buf -= 8;
-        }
-    }
-    // Flush any trailing bits (final byte's high bits are zero).
-    if (bits_in_buf > 0) {
-        try out.append(arena, @as(u8, @truncate(bit_buf & 0xff)));
-    }
 }
 
 // ============================================================
@@ -1347,7 +1256,7 @@ test "encode bit_width=0 produces empty output" {
     try testing.expectEqual(@as(usize, 0), encoded.len);
 }
 
-test "encode writes the same bytes as the reference encoder on random runs and widths" {
+test "encode roundtrips random runs at every width with spec-valid runs, padding only the last group" {
     var prng = std.Random.DefaultPrng.init(0x81e);
     const r = prng.random();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1361,7 +1270,7 @@ test "encode writes the same bytes as the reference encoder on random runs and w
         const maxv: u64 = (@as(u64, 1) << @intCast(bw)) - 1;
         var k: usize = 0;
         while (k < n) {
-            const run = 1 + r.uintLessThan(usize, if (r.boolean()) 3 else 20);
+            const run = 1 + r.uintLessThan(usize, if (r.boolean()) 3 else 40);
             const v: u32 = @intCast(r.uintAtMost(u64, @min(maxv, if (r.boolean()) 3 else maxv)));
             var m: usize = 0;
             while (m < run and k < n) : (m += 1) {
@@ -1369,7 +1278,42 @@ test "encode writes the same bytes as the reference encoder on random runs and w
                 k += 1;
             }
         }
-        try testing.expectEqualSlices(u8, try encodeReference(a, vals, bw), try encode(a, vals, bw));
+        const bytes = try encode(a, vals, bw);
+        const out = try a.alloc(u32, n);
+        var dec = HybridRleDecoder.init(bytes, bw);
+        try testing.expectEqual(n, try dec.decode(out));
+        try testing.expectEqualSlices(u32, vals, out);
+        // The runs cover exactly the values, bar a last bit-packed group's padding; each run ends in its bytes.
+        var walk = HybridRleDecoder.init(bytes, bw);
+        var covered: usize = 0;
+        while (walk.pos < bytes.len) {
+            try testing.expect(covered < n);
+            try walk.readNextRun();
+            try testing.expect(walk.remaining_in_run > 0);
+            covered += walk.remaining_in_run;
+            if (!walk.in_rle) walk.pos += walk.remaining_in_run / 8 * bw;
+            try testing.expect(walk.pos <= bytes.len);
+            if (covered > n) try testing.expect(!walk.in_rle and covered - n < 8 and walk.pos == bytes.len);
+        }
+        try testing.expect(covered >= n);
+    }
+}
+
+test "encode packs width-1 levels with scattered nulls tighter than one-value runs did" {
+    var prng = std.Random.DefaultPrng.init(0x10);
+    const r = prng.random();
+    const levels = try testing.allocator.alloc(u32, 20_000);
+    defer testing.allocator.free(levels);
+    for ([_]f64{ 0.01, 0.1, 0.5, 0.9, 0.99 }) |p_null| {
+        for (levels) |*l| l.* = @intFromBool(r.float(f64) >= p_null);
+        const bytes = try encode(testing.allocator, levels, 1);
+        defer testing.allocator.free(bytes);
+        // One-value runs for the leftovers took 0.33 bytes a level at 10% and 90% nulls; Arrow's writer takes 0.15.
+        try testing.expect(bytes.len * 100 < levels.len * 14);
+        const out = try testing.allocator.alloc(u32, levels.len);
+        defer testing.allocator.free(out);
+        try decodeLevels(bytes, 1, out);
+        try testing.expectEqualSlices(u32, levels, out);
     }
 }
 

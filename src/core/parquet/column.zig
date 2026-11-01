@@ -25,6 +25,7 @@
 //! max_def == 0 (REQUIRED columns only) so callers can't silently alias nulls.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nowNs = @import("../../clock.zig").monoNs;
 const schema = @import("../schema.zig");
 const page_mod = @import("page.zig");
@@ -129,7 +130,8 @@ pub const DecodeOptions = struct {
     /// proves every value present. Kept on each reader so concurrent queries
     /// can choose independently without process-global mutable state.
     fast_levels: bool = false,
-    /// null chooses run-dominated flat pages from encoded headers; true/false force streaming/legacy expansion.
+    /// null: a flat page at max_def 1 decodes its levels to validity bits, and a deeper flat page stays encoded when
+    /// run-dominated. true/false force the encoded stream/the expanded levels for every flat page, to compare against.
     level_runs: ?bool = null,
     /// Let an aggregate scan work on dictionary-encoded columns as codes (filters once per dictionary entry,
     /// histogram aggregates, level-only counts) instead of materialising values. Off only to compare against.
@@ -213,6 +215,174 @@ fn defStreamAllPresent(def_bytes: []const u8, bit_width: u8, max_def: u32, num_v
     return run.value == max_def and run.count >= num_values;
 }
 
+/// Present values spread to their slots, back to front so a packed value is read before its slot or any below it is
+/// written: the `num_present` values sit at the front of `values`, and a slot whose level is below `max_def` takes
+/// `default`. No branch on the level, since a column with real nulls mispredicts any; reading `values[read]` at a null
+/// slot is harmless (read <= i there) and discarded.
+fn scatterByLevels(
+    comptime T: type,
+    values: []T,
+    levels: []const u32,
+    max_def: u32,
+    num_present: usize,
+    default: T,
+) void {
+    var read: usize = num_present;
+    var i: usize = values.len;
+    while (i > 0) {
+        i -= 1;
+        const present = levels[i] == max_def;
+        read -= @intFromBool(present);
+        const v = values[@min(read, values.len - 1)];
+        values[i] = if (present) v else default;
+    }
+}
+
+/// `scatterByLevels` driven by validity bits (`hybrid_rle.defToBitmap`), slot i at bit `off + i`. A bitmap word of 64
+/// present slots is one copy and one of 64 nulls one fill, so per-slot work is left to mixed words only. Those take
+/// the target's step, fixed at compile time since zpq has no runtime dispatch: AVX2 fills a 256-bit register of slots
+/// per step (`Avx2Expand`); every other target (the baseline `-compat` build, Lambda, aarch64) loops per slot.
+fn ValidityExpand(comptime T: type) type {
+    return struct {
+        const Step = if (has_avx2 and (@sizeOf(T) == 4 or @sizeOf(T) == 8 or @sizeOf(T) == 16)) Avx2Expand(T) else void;
+
+        const Span = struct { bits: u64, all: u64, take: usize };
+
+        /// The bitmap word holding slot `i`, shifted down to it, and `take`, the slots up to its end or `len`.
+        inline fn span(words: []const u64, off: usize, i: usize, len: usize) Span {
+            const bit = off + i;
+            const take = @min(64 - bit % 64, len - i);
+            const all: u64 = if (take == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(take)) - 1;
+            return .{ .bits = (words[bit / 64] >> @intCast(bit % 64)) & all, .all = all, .take = take };
+        }
+
+        /// `dest`'s slots from the present values `src` (as many as the bits set), front to back.
+        fn from(dest: []T, src: []align(1) const T, words: []const u64, off: usize, default: T) void {
+            var read: usize = 0;
+            var i: usize = 0;
+            while (i < dest.len) {
+                const s = span(words, off, i, dest.len);
+                const d = dest[i..][0..s.take];
+                if (s.bits == s.all) {
+                    @memcpy(d, src[read..][0..s.take]);
+                    read += s.take;
+                } else if (s.bits == 0) {
+                    @memset(d, default);
+                } else {
+                    var j: usize = 0;
+                    if (Step != void) {
+                        while (j + Step.E <= s.take and read + Step.E <= src.len) : (j += Step.E) {
+                            const m = (s.bits >> @intCast(j)) & Step.mask;
+                            Step.store(d.ptr + j, src.ptr + read, m, default);
+                            read += @popCount(m);
+                        }
+                    }
+                    while (j < s.take) : (j += 1) {
+                        const present = (s.bits >> @intCast(j)) & 1 != 0;
+                        // Past the last present value `read` is src.len; a mixed word has one, so src.len >= 1.
+                        const v = src[@min(read, src.len - 1)];
+                        d[j] = if (present) v else default;
+                        read += @intFromBool(present);
+                    }
+                }
+                i += s.take;
+            }
+        }
+
+        /// In place: the `num_present` values sit at the front of `values`. Spans walk down from the top, so a value
+        /// is read before any slot at or below its position is written.
+        fn inPlace(values: []T, words: []const u64, off: usize, num_present: usize, default: T) void {
+            var read: usize = num_present;
+            var i: usize = values.len;
+            while (i > 0) {
+                // The span ending at slot i: down to its word's start or slot 0.
+                const end_bit = off + i;
+                const lo = (end_bit - 1) / 64 * 64 -| off;
+                const s = span(words, off, lo, i);
+                const d = values[lo..i];
+                if (s.bits == s.all) {
+                    read -= s.take;
+                    std.mem.copyBackwards(T, d, values[read..][0..s.take]);
+                } else if (s.bits == 0) {
+                    @memset(d, default);
+                } else {
+                    var j: usize = s.take;
+                    if (Step != void) {
+                        // The ragged top first, so the register steps end on the span's first slot.
+                        while (j % Step.E != 0) {
+                            j -= 1;
+                            const present = (s.bits >> @intCast(j)) & 1 != 0;
+                            read -= @intFromBool(present);
+                            const v = values[read];
+                            d[j] = if (present) v else default;
+                        }
+                        while (j > 0) {
+                            j -= Step.E;
+                            const m = (s.bits >> @intCast(j)) & Step.mask;
+                            read -= @popCount(m);
+                            // read + E <= lo + j + E: the load stays in `values` and precedes the store.
+                            Step.store(d.ptr + j, values.ptr + read, m, default);
+                        }
+                    }
+                    while (j > 0) {
+                        j -= 1;
+                        const present = (s.bits >> @intCast(j)) & 1 != 0;
+                        read -= @intFromBool(present);
+                        // read <= lo + j: in `values` whether or not the slot is present.
+                        const v = values[read];
+                        d[j] = if (present) v else default;
+                    }
+                }
+                i = lo;
+            }
+        }
+    };
+}
+
+const has_avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+
+/// One AVX2 expand step: the `E` slots of a 256-bit register at `dst` from the next `popcount(m)` values at `src`,
+/// through `vpermd` with dword indices from a comptime table of every mask. A null slot's indices carry the sign bit,
+/// which `vpermd` ignores and the select turns into `default`. Kept on vectors: routing lanes through byte arrays made
+/// LLVM emit a scalar shift chain per lane (measured at 15 ns a value).
+fn Avx2Expand(comptime T: type) type {
+    return struct {
+        const E = 32 / @sizeOf(T);
+        const mask: u64 = (1 << E) - 1;
+        const Dwords = @Vector(8, u32);
+        const table: [1 << E]Dwords = blk: {
+            @setEvalBranchQuota(100_000);
+            const D = @sizeOf(T) / 4;
+            var t: [1 << E]Dwords = undefined;
+            for (0..1 << E) |m| {
+                var lanes: [8]u32 = @splat(1 << 31);
+                var next: u32 = 0;
+                for (0..E) |e| if ((m >> e) & 1 != 0) {
+                    for (0..D) |k| lanes[e * D + k] = next * D + k;
+                    next += 1;
+                };
+                t[m] = lanes;
+            }
+            break :blk t;
+        };
+
+        /// `src` has `E` values readable.
+        inline fn store(dst: [*]T, src: [*]align(1) const T, m: u64, default: T) void {
+            const idx = table[@intCast(m)];
+            const raw: Dwords = @as(*align(1) const Dwords, @ptrCast(src)).*;
+            const moved = asm ("vpermd %[s], %[i], %[d]"
+                : [d] "=x" (-> Dwords),
+                : [s] "x" (raw),
+                  [i] "x" (idx),
+            );
+            const fill: [E]T = @splat(default);
+            const dv: Dwords = @as(*align(1) const Dwords, @ptrCast(&fill)).*;
+            const null_slot = @as(@Vector(8, i32), @bitCast(idx)) < @as(@Vector(8, i32), @splat(0));
+            @as(*align(1) Dwords, @ptrCast(dst)).* = @select(u32, null_slot, dv, moved);
+        }
+    };
+}
+
 /// BYTE_STREAM_SPLIT un-split. The encoded buffer holds `width` contiguous
 /// byte-planes of N bytes each (N = encoded.len / width); value `i` is
 /// reassembled from `encoded[0*N+i], encoded[1*N+i], … encoded[(width-1)*N+i]`.
@@ -275,6 +445,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
         current_def_levels: ?[]u32 = null,
         /// Flat fast-level readers retain the validated encoded stream, expanding only a caller's row window.
         current_def_stream: ?hybrid_rle.HybridRleDecoder = null,
+        /// A flat max_def-1 page's levels as validity bits (`hybrid_rle.defToBitmap`), bit i for leaf i.
+        current_def_bits: ?[]const u64 = null,
+        /// The page's nulls, with `current_def_stream` or `current_def_bits`.
         current_def_nulls: usize = 0,
         current_rep_levels: ?[]u32 = null,
         current_def_pos: usize = 0,
@@ -659,23 +832,23 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 const src = def_out.?;
                 try self.readDefLevels(src);
                 var num_present: usize = 0;
-                for (src) |dv| num_present += @intFromBool(dv == max_def);
+                if (self.current_def_bits) |bits| {
+                    num_present = hybrid_rle.countBits(bits, self.current_def_pos, out.len);
+                } else for (src) |dv| {
+                    num_present += @intFromBool(dv == max_def);
+                }
                 if (num_present > 0) {
                     const got = idx.decode(out[0..num_present]) catch return error.UnexpectedPage;
                     if (got != num_present) return error.UnexpectedPage;
                     try self.checkCodes(out[0..num_present]);
                 }
+                // A null leaf's code is 0 (the levels say it is null; 0 is also a real index).
                 if (num_present != out.len) {
                     self.has_nulls = true;
-                    var read: usize = num_present;
-                    var i: usize = out.len;
-                    while (i > 0) {
-                        i -= 1;
-                        if (src[i] == max_def) {
-                            read -= 1;
-                            out[i] = out[read];
-                        } else out[i] = 0;
-                    }
+                    if (self.current_def_bits) |bits|
+                        ValidityExpand(u32).inPlace(out, bits, self.current_def_pos, num_present, 0)
+                    else
+                        scatterByLevels(u32, out, src, max_def, num_present, 0);
                 }
             }
             self.current_def_pos += out.len;
@@ -1080,6 +1253,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.pending_expansion = 0;
             self.current_def_levels = null;
             self.current_def_stream = null;
+            self.current_def_bits = null;
             self.current_def_nulls = 0;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
@@ -1129,6 +1303,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 if (got != values.len) return error.UnexpectedPage;
                 return;
             }
+            if (self.current_def_bits) |bits| return self.decodeBitsSlice(values, def_levels_out, rep_levels_out, bits);
 
             try self.readDefLevels(def_levels_out);
             const src = def_levels_out;
@@ -1168,23 +1343,53 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 const got = try self.decodePackedFromCurrentPage(values[0..num_present]);
                 if (got != num_present) return error.UnexpectedPage;
             }
-
-            // Scatter from the packed front into the correct slots,
-            // walking back-to-front so a packed value is never
-            // overwritten before its scatter destination has been read.
-            // No branch on the level: the read index steps by the present bit and a select picks the value, since a
-            // column with real nulls mispredicts any branch on them. Reading `values[read]` at a null slot is harmless:
-            // read <= i there, and the read is discarded.
-            var read: usize = num_present;
-            var i: usize = values.len;
-            while (i > 0) {
-                i -= 1;
-                const present = src[i] == max_def;
-                read -= @intFromBool(present);
-                const v = values[@min(read, values.len - 1)];
-                values[i] = if (present) v else defaultValue();
-            }
+            scatterByLevels(T, values, src, max_def, num_present, defaultValue());
         }
+
+        /// `decodePageSlice` on a validity-bit page. A slice without nulls decodes as today's all-present path does.
+        /// PLAIN fixed-width values expand straight from the page bytes; every other decoder fills the front of
+        /// `values`, which then spreads in place.
+        fn decodeBitsSlice(
+            self: *Self,
+            values: []T,
+            def_levels_out: []u32,
+            rep_levels_out: ?[]u32,
+            bits: []const u64,
+        ) Error!void {
+            const off = self.current_def_pos;
+            hybrid_rle.bitsToLevels(def_levels_out, bits, off);
+            if (rep_levels_out) |rl_out| @memset(rl_out, 0);
+            const num_present = hybrid_rle.countBits(bits, off, values.len);
+            if (num_present == values.len) {
+                const got = try self.decodePackedFromCurrentPage(values);
+                if (got != values.len) return error.UnexpectedPage;
+                return;
+            }
+            self.has_nulls = true;
+            const Expand = ValidityExpand(T);
+            if (comptime plain_is_le_bytes) {
+                if (self.active == .plain) {
+                    const dec = &self.active.plain;
+                    const need = num_present * @sizeOf(T);
+                    if (need > dec.bytes.len - dec.pos) return error.UnexpectedPage;
+                    const src = std.mem.bytesAsSlice(T, dec.bytes[dec.pos..][0..need]);
+                    Expand.from(values, src, bits, off, defaultValue());
+                    dec.pos += need;
+                    // A null slot is 0, which every narrow integer annotation allows.
+                    if (T == i32) try self.checkIntRange(values);
+                    return;
+                }
+            }
+            if (num_present > 0) {
+                const got = try self.decodePackedFromCurrentPage(values[0..num_present]);
+                if (got != num_present) return error.UnexpectedPage;
+            }
+            Expand.inPlace(values, bits, off, num_present, defaultValue());
+        }
+
+        /// PLAIN fixed-width values are their little-endian bytes, so a little-endian target can read them in place.
+        const plain_is_le_bytes = (T == i32 or T == i64 or T == f32 or T == f64) and
+            builtin.cpu.arch.endian() == .little;
 
         /// PLAIN fixed-width slots the row gate kept, in place. Unselected slots stay the type default and their
         /// bytes are not copied. False when the page is not a partial PLAIN fixed-width gate, so the caller decodes
@@ -1447,6 +1652,15 @@ pub fn ColumnChunkReader(comptime T: type) type {
             return s.ensure(u32, @alignOf(u32), if (which == .def) &s.def_levels else &s.rep_levels, n);
         }
 
+        /// Page-lifetime validity words, in the def-level buffer a bitmap page has no other use for. That buffer is
+        /// u32-aligned, so a spare u32 lets the words start on 8 bytes.
+        fn bitsBuffer(self: *Self, words: usize) Error![]u64 {
+            if (self.scratch == null) return self.arena.alloc(u64, words);
+            const raw = try self.levelBuffer(.def, 2 * words + 1);
+            const at = std.mem.alignForward(usize, @intFromPtr(raw.ptr), @alignOf(u64));
+            return @as([*]u64, @ptrFromInt(at))[0..words];
+        }
+
         /// Chunk-lifetime dictionary buffer. Scratch only for fixed-width T, whose decoded values are copies;
         /// byte-array dictionary entries are handed out as-is and must live in the arena.
         fn dictBuffer(self: *Self, n: usize) Error![]T {
@@ -1595,6 +1809,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.pending_expansion = 0;
             self.current_def_levels = null;
             self.current_def_stream = null;
+            self.current_def_bits = null;
             self.current_def_nulls = 0;
             self.current_rep_levels = null;
             self.current_def_all_present = false;
@@ -1617,7 +1832,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         /// The installed page's levels below max_def.
         fn pageNulls(self: *const Self) usize {
-            if (self.current_def_stream != null) return self.current_def_nulls;
+            if (self.current_def_stream != null or self.current_def_bits != null) return self.current_def_nulls;
             const levels = self.current_def_levels orelse return 0;
             const max_def: u32 = @intCast(self.levels.max_def);
             const L = 16;
@@ -1637,11 +1852,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
         }
 
         fn hasDefLevels(self: *const Self) bool {
-            return self.current_def_levels != null or self.current_def_stream != null;
+            return self.current_def_levels != null or self.current_def_stream != null or self.current_def_bits != null;
         }
 
         fn readDefLevels(self: *Self, out: []u32) Error!void {
-            if (self.current_def_stream) |*stream| {
+            if (self.current_def_bits) |bits| {
+                hybrid_rle.bitsToLevels(out, bits, self.current_def_pos);
+            } else if (self.current_def_stream) |*stream| {
                 const got = stream.decode(out) catch return error.UnexpectedPage;
                 if (got != out.len) return error.DefLevelsMismatch;
             } else {
@@ -1651,6 +1868,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         fn countDefPresent(self: *Self, n: usize) Error!usize {
             const max_def: u32 = @intCast(self.levels.max_def);
+            if (self.current_def_bits) |bits| return hybrid_rle.countBits(bits, self.current_def_pos, n);
             if (self.current_def_stream) |*stream| {
                 return stream.countPresentLevels(max_def, n) catch |err| return levelError(err);
             }
@@ -1663,6 +1881,17 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const bit_width = bitWidthFor(@intCast(self.levels.max_def));
             if (self.canSkipDefLevels(def_bytes, bit_width, num_values)) {
                 self.current_def_all_present = true;
+                return;
+            }
+            if (self.levels.max_def == 1 and self.levels.max_rep == 0 and self.options.level_runs == null) {
+                const bits = try self.bitsBuffer(hybrid_rle.bitmapWords(num_values));
+                const present = hybrid_rle.defToBitmap(def_bytes, num_values, bits) catch |err| return levelError(err);
+                self.current_def_nulls = num_values - present;
+                if (present == num_values and self.options.fast_levels) {
+                    self.current_def_all_present = true;
+                } else {
+                    self.current_def_bits = bits;
+                }
                 return;
             }
             if (self.options.fast_levels and self.levels.max_rep == 0 and
@@ -2860,25 +3089,28 @@ test "regression: a histogram past 2^32 leaves counts untracked and is declined 
     try testing.expect(try tracked.readAllHistogram(n, true) == null);
 }
 
-test "flat level runs validate eagerly and remain encoded until the consumer window" {
+test "flat levels validate eagerly and are read by the consumer window, as bits, runs or levels" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var levels: [1543]u32 = undefined;
     for (&levels, 0..) |*v, i| v.* = if (i < 700) 1 else if (i < 1300) 0 else @intCast(i % 2);
     const encoded = try hybrid_rle.encode(a, &levels, 1);
-    for ([_]bool{ false, true }) |fast| {
+    const Path = enum { bits, runs, levels };
+    for ([_]bool{ false, true }) |fast| for ([_]?bool{ null, true, false }) |level_runs| {
         var reader = ColumnChunkReader(i32).initWithOptions(
             &.{},
             .UNCOMPRESSED,
             .{ .max_def = 1, .max_rep = 0 },
             a,
-            .{ .fast_levels = fast },
+            .{ .fast_levels = fast, .level_runs = level_runs },
             null,
         );
         try reader.installDefLevels(encoded, levels.len);
-        try testing.expectEqual(fast, reader.current_def_stream != null);
-        try testing.expectEqual(!fast, reader.current_def_levels != null);
+        const want: Path = if (level_runs == null) .bits else if (level_runs.? and fast) .runs else .levels;
+        try testing.expectEqual(want == .bits, reader.current_def_bits != null);
+        try testing.expectEqual(want == .runs, reader.current_def_stream != null);
+        try testing.expectEqual(want == .levels, reader.current_def_levels != null);
         var nulls: usize = 0;
         for (levels) |v| nulls += @intFromBool(v == 0);
         try testing.expectEqual(nulls, reader.pageNulls());
@@ -2899,7 +3131,7 @@ test "flat level runs validate eagerly and remain encoded until the consumer win
         }
         reader.resetPageState();
         try testing.expect(!reader.hasDefLevels());
-    }
+    };
     // The first level is outside max_def, but the truncated next RLE run wins before any value is decoded.
     for ([_]bool{ false, true }) |fast| {
         var reader = ColumnChunkReader(i32).initWithOptions(
@@ -3076,4 +3308,384 @@ test "recycled BYTE_ARRAY pages reuse one buffer and match a retained decode" {
     try testing.expect(v2_def[1] < 1);
     try testing.expectEqual(@as(usize, 0), v2_vals[2].len);
     try testing.expect(v2_def[2] >= 1);
+}
+
+test "validity-bit expand matches the level scatter for every value width, at any bit offset" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const strs = [_][]const u8{ "a", "bb", "ccc", "dddd" };
+    inline for (.{ i32, i64, f64, u32, bool, []const u8 }) |T| {
+        for (0..400) |iter| {
+            const n = rnd.uintLessThan(usize, 700);
+            const off = rnd.uintLessThan(usize, 130);
+            const levels = try testing.allocator.alloc(u32, n);
+            defer testing.allocator.free(levels);
+            const words = try testing.allocator.alloc(u64, hybrid_rle.bitmapWords(off + n));
+            defer testing.allocator.free(words);
+            // Bits outside the slots are noise the kernels must not read.
+            for (words) |*w| w.* = rnd.int(u64);
+            // All-present, all-null and clustered spans exercise the whole-word copy and fill.
+            const p: f64 = switch (iter % 4) {
+                0 => 0,
+                1 => 1,
+                else => rnd.float(f64),
+            };
+            var np: usize = 0;
+            for (levels, 0..) |*l, i| {
+                l.* = @intFromBool(if (iter % 4 == 3) (i / 97) % 2 == 0 else rnd.float(f64) >= p);
+                np += l.*;
+                const bit: u64 = @as(u64, 1) << @intCast((off + i) % 64);
+                if (l.* == 1) words[(off + i) / 64] |= bit else words[(off + i) / 64] &= ~bit;
+            }
+            const src = try testing.allocator.alloc(T, np);
+            defer testing.allocator.free(src);
+            for (src, 0..) |*s, k| s.* = switch (T) {
+                []const u8 => strs[k % 4],
+                bool => k % 3 != 0,
+                f64 => @as(f64, @floatFromInt(k)) * 1.5 + 1,
+                else => @intCast(k * 3 + 1),
+            };
+            const default: T = switch (T) {
+                []const u8 => "",
+                bool => false,
+                else => 0,
+            };
+            const want = try testing.allocator.alloc(T, n);
+            defer testing.allocator.free(want);
+            const fwd = try testing.allocator.alloc(T, n);
+            defer testing.allocator.free(fwd);
+            const back = try testing.allocator.alloc(T, n);
+            defer testing.allocator.free(back);
+            @memcpy(want[0..np], src);
+            @memcpy(back[0..np], src);
+            scatterByLevels(T, want, levels, 1, np, default);
+            ValidityExpand(T).from(fwd, src, words, off, default);
+            ValidityExpand(T).inPlace(back, words, off, np, default);
+            for (want, fwd, back) |w, f, b| {
+                if (T == []const u8) {
+                    try testing.expectEqualStrings(w, f);
+                    try testing.expectEqualStrings(w, b);
+                } else {
+                    try testing.expectEqual(w, f);
+                    try testing.expectEqual(w, b);
+                }
+            }
+        }
+    }
+}
+
+/// One uncompressed data page of a flat optional column, V1 or V2: `def` is its level stream as written, `values` its
+/// encoded values (PLAIN, or RLE_DICTIONARY with the bit-width byte).
+fn optionalPageForTest(
+    arena: std.mem.Allocator,
+    chunk: *std.ArrayList(u8),
+    v2: bool,
+    encoding: schema.Encoding,
+    n: usize,
+    nulls: usize,
+    def: []const u8,
+    values: []const u8,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    if (!v2) try body.appendSlice(arena, &std.mem.toBytes(@as(u32, @intCast(def.len))));
+    try body.appendSlice(arena, def);
+    try body.appendSlice(arena, values);
+    const header = schema.PageHeader{
+        .type = if (v2) .DATA_PAGE_V2 else .DATA_PAGE,
+        .uncompressed_page_size = @intCast(body.items.len),
+        .compressed_page_size = @intCast(body.items.len),
+        .crc = null,
+        .data_page_header = if (v2) null else .{
+            .num_values = @intCast(n),
+            .encoding = encoding,
+            .definition_level_encoding = .RLE,
+            .repetition_level_encoding = .RLE,
+        },
+        .dictionary_page_header = null,
+        .data_page_header_v2 = if (!v2) null else .{
+            .num_values = @intCast(n),
+            .num_nulls = @intCast(nulls),
+            .num_rows = @intCast(n),
+            .encoding = encoding,
+            .definition_levels_byte_length = @intCast(def.len),
+            .repetition_levels_byte_length = 0,
+            .is_compressed = false,
+        },
+    };
+    var w = thrift.Writer.init(arena);
+    try header.write(&w);
+    try chunk.appendSlice(arena, w.bytes());
+    try chunk.appendSlice(arena, body.items);
+}
+
+/// A flat optional chunk of random pages (V1 and V2; empty, one-value, all-null, clustered and scattered nulls), its
+/// leaves' levels and values as written. With `corrupt`, one page's level stream is damaged.
+fn OptionalChunkForTest(comptime T: type) type {
+    return struct { bytes: []u8, levels: []u32, values: []T, n: usize };
+}
+
+fn optionalChunkForTest(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    rnd: std.Random,
+    dictionary: bool,
+    corrupt: bool,
+) !OptionalChunkForTest(T) {
+    const dict_len = 1 + rnd.uintLessThan(u32, 40);
+    const strs = [_][]const u8{ "", "x", "yy", "zzz", "wwww", "a long one" };
+    const valueOf = struct {
+        fn f(k: usize) T {
+            return switch (T) {
+                []const u8 => strs[k % strs.len],
+                f64 => @as(f64, @floatFromInt(k)) * 0.25 - 3,
+                else => @intCast(@as(i64, @intCast(k)) * 7 - 20),
+            };
+        }
+    }.f;
+    const plainBytes = struct {
+        fn f(a: std.mem.Allocator, out: *std.ArrayList(u8), v: T) !void {
+            if (T == []const u8) {
+                try out.appendSlice(a, &std.mem.toBytes(@as(u32, @intCast(v.len))));
+                try out.appendSlice(a, v);
+            } else try out.appendSlice(a, &std.mem.toBytes(v));
+        }
+    }.f;
+    var chunk: std.ArrayList(u8) = .empty;
+    if (dictionary) {
+        var entries: std.ArrayList(u8) = .empty;
+        for (0..dict_len) |k| try plainBytes(arena, &entries, valueOf(k));
+        const header = schema.PageHeader{
+            .type = .DICTIONARY_PAGE,
+            .uncompressed_page_size = @intCast(entries.items.len),
+            .compressed_page_size = @intCast(entries.items.len),
+            .crc = null,
+            .data_page_header = null,
+            .dictionary_page_header = .{ .num_values = @intCast(dict_len), .encoding = .PLAIN, .is_sorted = null },
+            .data_page_header_v2 = null,
+        };
+        var w = thrift.Writer.init(arena);
+        try header.write(&w);
+        try chunk.appendSlice(arena, w.bytes());
+        try chunk.appendSlice(arena, entries.items);
+    }
+    var levels: std.ArrayList(u32) = .empty;
+    var values: std.ArrayList(T) = .empty;
+    const pages = 1 + rnd.uintLessThan(usize, 6);
+    const bad_page = rnd.uintLessThan(usize, pages);
+    for (0..pages) |pi| {
+        const shape = rnd.uintLessThan(u8, 8);
+        const n: usize = switch (shape) {
+            0 => 0,
+            1 => 1,
+            else => rnd.uintLessThan(usize, 900),
+        };
+        const v2 = rnd.boolean();
+        const page_levels = try arena.alloc(u32, n);
+        const p_null = rnd.float(f64);
+        var cur: u32 = 1;
+        for (page_levels) |*l| l.* = switch (shape) {
+            2 => 0,
+            3 => 1,
+            4 => blk: {
+                if (rnd.float(f64) < 0.03) cur ^= 1;
+                break :blk cur;
+            },
+            else => @intFromBool(rnd.float(f64) >= p_null),
+        };
+        var codes: std.ArrayList(u32) = .empty;
+        var plain_values: std.ArrayList(u8) = .empty;
+        var nulls: usize = 0;
+        for (page_levels) |l| {
+            try levels.append(arena, l);
+            if (l == 0) {
+                nulls += 1;
+                try values.append(arena, if (T == []const u8) "" else 0);
+                continue;
+            }
+            const k = rnd.uintLessThan(usize, if (dictionary) dict_len else 1000);
+            try values.append(arena, valueOf(k));
+            if (dictionary) try codes.append(arena, @intCast(k)) else try plainBytes(arena, &plain_values, valueOf(k));
+        }
+        var def = try arena.dupe(u8, try hybrid_rle.encode(arena, page_levels, 1));
+        // A V2 page must carry level bytes: an empty page's stream is one empty run.
+        if (v2 and def.len == 0) def = try arena.dupe(u8, &.{ 0, 0 });
+        if (corrupt and pi == bad_page) switch (rnd.uintLessThan(u8, 3)) {
+            0 => def = def[0 .. def.len - @min(def.len, 1 + rnd.uintLessThan(usize, 3))],
+            1 => if (def.len > 0) {
+                def[rnd.uintLessThan(usize, def.len)] = rnd.int(u8);
+            },
+            else => def = try std.mem.concat(arena, u8, &.{ &.{ 0, 1 }, def }),
+        };
+        if (dictionary) {
+            const bw: u8 = @intCast(@max(1, 32 - @clz(dict_len - 1)));
+            try plain_values.append(arena, bw);
+            try plain_values.appendSlice(arena, try hybrid_rle.encode(arena, codes.items, bw));
+        }
+        const encoding: schema.Encoding = if (dictionary) .RLE_DICTIONARY else .PLAIN;
+        try optionalPageForTest(arena, &chunk, v2, encoding, n, nulls, def, plain_values.items);
+    }
+    return .{ .bytes = chunk.items, .levels = levels.items, .values = values.items, .n = levels.items.len };
+}
+
+fn expectSameLeaves(comptime T: type, want: []const T, got: []const T) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        if (T == []const u8) try testing.expectEqualStrings(w, g) else try testing.expectEqual(w, g);
+    }
+}
+
+/// Null levels mean every leaf present (level 1), however a reader proved it.
+fn expectSameLevels(want: ?[]const u32, got: ?[]const u32) !void {
+    if (want != null and got != null) return testing.expectEqualSlices(u32, want.?, got.?);
+    for (want orelse got orelse return) |l| try testing.expectEqual(@as(u32, 1), l);
+}
+
+/// Every flat read path, on a reader that keeps a max_def-1 page's levels as bits and on one forced to expand them:
+/// the same leaves, levels and errors. The expanded reader is the oracle; a valid chunk is also checked as written.
+fn expectBitsReadAsLevels(comptime T: type, arena: std.mem.Allocator, rnd: std.Random, dictionary: bool) !void {
+    const corrupt = rnd.uintLessThan(u8, 3) == 0;
+    const chunk = try optionalChunkForTest(T, arena, rnd, dictionary, corrupt);
+    const levels: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+    const Reader = ColumnChunkReader(T);
+    const Pair = struct {
+        bits: Reader,
+        expanded: Reader,
+        fn init(bytes: []const u8, a: std.mem.Allocator, fast: bool) @This() {
+            const o: DecodeOptions = .{ .fast_levels = fast, .any_dictionary = true };
+            var expand = o;
+            expand.level_runs = false;
+            return .{
+                .bits = Reader.initWithOptions(bytes, .UNCOMPRESSED, levels, a, o, null),
+                .expanded = Reader.initWithOptions(bytes, .UNCOMPRESSED, levels, a, expand, null),
+            };
+        }
+    };
+    const n = chunk.n;
+
+    // readAll, fast levels on and off.
+    for ([_]bool{ true, false }) |fast| {
+        var p = Pair.init(chunk.bytes, arena, fast);
+        const want = p.expanded.readAll(n);
+        const got = p.bits.readAll(n);
+        if (want) |w| {
+            const g = try got;
+            try expectSameLeaves(T, w.values, g.values);
+            try expectSameLevels(w.def_levels, g.def_levels);
+            try testing.expectEqual(w.has_nulls, g.has_nulls);
+            // A damaged stream can still be a valid one (a packed bit flipped); only an intact one is as written.
+            if (!corrupt) {
+                try expectSameLeaves(T, chunk.values, g.values);
+                if (g.def_levels) |d| try testing.expectEqualSlices(u32, chunk.levels, d);
+            }
+        } else |err| {
+            try testing.expect(corrupt);
+            try testing.expectError(err, got);
+        }
+    }
+
+    // Windows of any size, so a page is read from every bit offset.
+    {
+        var p = Pair.init(chunk.bytes, arena, true);
+        p.bits.value_budget = n;
+        p.expanded.value_budget = n;
+        const wv = try arena.alloc(T, n);
+        const gv = try arena.alloc(T, n);
+        const wd = try arena.alloc(u32, n);
+        const gd = try arena.alloc(u32, n);
+        var done: usize = 0;
+        while (done < n) {
+            const take = @min(n - done, 1 + rnd.uintLessThan(usize, 150));
+            const want = p.expanded.decodeWithLevels(wv[done..][0..take], wd[done..][0..take]);
+            const got = p.bits.decodeWithLevels(gv[done..][0..take], gd[done..][0..take]);
+            if (want) |w| {
+                try testing.expectEqual(w, try got);
+                if (w == 0) break;
+                try expectSameLeaves(T, wv[done..][0..w], gv[done..][0..w]);
+                try testing.expectEqualSlices(u32, wd[done..][0..w], gd[done..][0..w]);
+                done += w;
+            } else |err| {
+                try testing.expectError(err, got);
+                break;
+            }
+        }
+    }
+
+    // Levels only, whole chunk and a slice at a time.
+    {
+        var p = Pair.init(chunk.bytes, arena, true);
+        const want = p.expanded.readAllLevels(n);
+        const got = p.bits.readAllLevels(n);
+        if (want) |w| {
+            try expectSameLevels(w.?.def_levels, (try got).?.def_levels);
+        } else |err| try testing.expectError(err, got);
+        var q = Pair.init(chunk.bytes, arena, true);
+        const wd = try arena.alloc(u32, n);
+        const gd = try arena.alloc(u32, n);
+        var done: usize = 0;
+        while (done < n) {
+            const take = @min(n - done, 1 + rnd.uintLessThan(usize, 300));
+            const w = q.expanded.readLevels(wd[done..][0..take]);
+            const g = q.bits.readLevels(gd[done..][0..take]);
+            if (w) |k| {
+                try testing.expectEqual(k, try g);
+                if (k == 0) break;
+                try testing.expectEqualSlices(u32, wd[done..][0..k], gd[done..][0..k]);
+                done += k;
+            } else |err| {
+                try testing.expectError(err, g);
+                break;
+            }
+        }
+    }
+
+    if (!dictionary) return;
+    // Dictionary codes, and their histogram.
+    {
+        var p = Pair.init(chunk.bytes, arena, true);
+        const want = p.expanded.readAllCodes(n);
+        const got = p.bits.readAllCodes(n);
+        if (want) |w_opt| {
+            const g_opt = try got;
+            try testing.expectEqual(w_opt == null, g_opt == null);
+            if (w_opt) |w| switch (w) {
+                .codes => |wc| {
+                    const gc = g_opt.?.codes;
+                    try testing.expectEqualSlices(u32, wc.codes, gc.codes);
+                    try expectSameLevels(wc.def_levels, gc.def_levels);
+                    try testing.expectEqual(wc.has_nulls, gc.has_nulls);
+                },
+                .values => |wl| {
+                    const gl = g_opt.?.values;
+                    try expectSameLeaves(T, wl.values, gl.values);
+                    try expectSameLevels(wl.def_levels, gl.def_levels);
+                },
+            };
+        } else |err| try testing.expectError(err, got);
+    }
+    {
+        var p = Pair.init(chunk.bytes, arena, true);
+        const want = p.expanded.readAllHistogram(n, false);
+        const got = p.bits.readAllHistogram(n, false);
+        if (want) |w_opt| {
+            const g_opt = try got;
+            try testing.expectEqual(w_opt == null, g_opt == null);
+            if (w_opt) |w| {
+                try testing.expectEqualSlices(u64, w.hist.hist, g_opt.?.hist.hist);
+                try testing.expectEqual(w.hist.num_present, g_opt.?.hist.num_present);
+            }
+        } else |err| try testing.expectError(err, got);
+    }
+}
+
+test "max_def-1 pages read the same as bits as expanded, V1 and V2, values, codes and levels alone" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0xb175);
+    const rnd = prng.random();
+    for (0..150) |_| {
+        inline for (.{ i32, i64, f64, []const u8 }) |T| for ([_]bool{ false, true }) |dictionary| {
+            _ = arena_state.reset(.retain_capacity);
+            try expectBitsReadAsLevels(T, arena_state.allocator(), rnd, dictionary);
+        };
+    }
 }

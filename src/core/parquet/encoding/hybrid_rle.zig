@@ -428,6 +428,182 @@ pub fn levelsWithin(levels: []const u32, max: u32) bool {
     return m <= max;
 }
 
+// ============================================================
+// Width-1 definition levels as validity bitmaps
+// ============================================================
+//
+// A flat optional column (max definition level 1) has one bit of level per leaf, so its levels are a validity bitmap:
+// `[]u64` words, LSB-first, bit i set when leaf i is present.
+
+/// Words a bitmap of `n` validity bits takes.
+pub fn bitmapWords(n: usize) usize {
+    return n / 64 + @intFromBool(n % 64 != 0);
+}
+
+/// `n` max-level-1 definition levels from `bytes` as validity bits from bit 0 of `words` (`bitmapWords(n)` long), and
+/// how many are present. RLE runs fill whole words, and bit-packed runs copy 64 levels a load into a destination
+/// aligned first, so no level is ever widened to a u32. The errors, and their precedence, are those of
+/// `decodeLevels(bytes, 1, out[0..n])`; a differential test holds the two together. `LevelOutOfRange` can't arise at
+/// width 1: an RLE value past 1 is corrupt, and every packed bit is a level.
+pub fn defToBitmap(bytes: []const u8, n: usize, words: []u64) LevelError!usize {
+    var bw: BitWriter = .{ .words = words };
+    var pos: usize = 0;
+    var done: usize = 0;
+    var present: usize = 0;
+    while (done < n) {
+        // An empty run ends the stream as it does `decode`'s.
+        const run = try nextLevelRun(bytes, &pos) orelse return error.LevelCountMismatch;
+        const take = @min(n - done, run.count);
+        if (run.rle) {
+            bw.fill(run.value == 1, take);
+            if (run.value == 1) present += take;
+        } else {
+            const take_bytes = take / 8 + @intFromBool(take % 8 != 0);
+            if (take_bytes > bytes.len - pos) return error.CorruptLevels;
+            present += bw.copy(bytes[pos..], take);
+            // A run cut short by `n` is the last: its unread groups must still be in the stream (`decodeLevels`).
+            const unread_groups = run.count / 8 - take_bytes;
+            if (take < run.count and unread_groups > bytes.len - pos - take_bytes) return error.CorruptLevels;
+            pos += take_bytes;
+        }
+        done += take;
+    }
+    bw.finish();
+    return present;
+}
+
+/// One run header of a width-1 level stream, with `HybridRleDecoder.readNextRun`'s errors: a bad varint, a missing or
+/// out-of-width RLE value, and a group count past the address space are corrupt. Null for an empty run, or at the
+/// stream's end.
+fn nextLevelRun(bytes: []const u8, pos: *usize) LevelError!?struct { rle: bool, value: u1, count: usize } {
+    if (pos.* >= bytes.len) return null;
+    const header = readUleb128(bytes[pos.*..]) catch return error.CorruptLevels;
+    pos.* += header.len;
+    const count = std.math.cast(usize, header.value >> 1) orelse return error.CorruptLevels;
+    if (header.value & 1 == 0) {
+        if (pos.* >= bytes.len) return error.CorruptLevels;
+        const value = bytes[pos.*];
+        pos.* += 1;
+        if (value > 1) return error.CorruptLevels;
+        return if (count == 0) null else .{ .rle = true, .value = @intCast(value), .count = count };
+    }
+    const values = std.math.mul(usize, count, 8) catch return error.CorruptLevels;
+    return if (count == 0) null else .{ .rle = false, .value = 0, .count = values };
+}
+
+/// Appends bits to a bitmap in whole-word stores: `acc` holds the `nbits` low bits of word `w` not yet stored.
+const BitWriter = struct {
+    words: []u64,
+    w: usize = 0,
+    acc: u64 = 0,
+    nbits: u32 = 0,
+
+    /// Append `k` (1..64) bits; `x` has none above them.
+    inline fn put(self: *BitWriter, x: u64, k: u32) void {
+        self.acc |= x << @intCast(self.nbits);
+        const t = self.nbits + k;
+        if (t < 64) {
+            self.nbits = t;
+            return;
+        }
+        self.words[self.w] = self.acc;
+        self.w += 1;
+        self.acc = if (self.nbits == 0) 0 else x >> @intCast(64 - self.nbits);
+        self.nbits = t - 64;
+    }
+
+    /// `len` copies of one bit: up to the word boundary, then whole words, then the rest held.
+    fn fill(self: *BitWriter, one: bool, len: usize) void {
+        const ones: u64 = if (one) ~@as(u64, 0) else 0;
+        var left = len;
+        if (left == 0) return;
+        if (self.nbits != 0) {
+            const t: u32 = @intCast(@min(left, 64 - self.nbits));
+            self.put(ones >> @intCast(64 - t), t);
+            left -= t;
+            if (left == 0) return;
+        }
+        @memset(self.words[self.w..][0 .. left / 64], ones);
+        self.w += left / 64;
+        const r: u32 = @intCast(left % 64);
+        if (r != 0) {
+            self.acc = ones >> @intCast(64 - r);
+            self.nbits = r;
+        }
+    }
+
+    /// `n` bits from byte-aligned `src` (at least `n / 8` bytes, rounded up), and their popcount from the same loads.
+    fn copy(self: *BitWriter, src: []const u8, n: usize) usize {
+        var pop: usize = 0;
+        const whole = n / 64;
+        const dst = self.words[self.w..][0..whole];
+        if (self.nbits == 0) {
+            for (dst, 0..) |*d, j| {
+                d.* = std.mem.readInt(u64, src[j * 8 ..][0..8], .little);
+                pop += @popCount(d.*);
+            }
+        } else {
+            // The destination is mid-word: each source word lands across two, one shift apart.
+            const s: u6 = @intCast(self.nbits);
+            const rs: u6 = @intCast(64 - self.nbits);
+            for (dst, 0..) |*d, j| {
+                const x = std.mem.readInt(u64, src[j * 8 ..][0..8], .little);
+                d.* = self.acc | (x << s);
+                self.acc = x >> rs;
+                pop += @popCount(x);
+            }
+        }
+        self.w += whole;
+        const r: u32 = @intCast(n % 64);
+        if (r != 0) {
+            var buf: [8]u8 = @splat(0);
+            const tail = src[whole * 8 ..][0 .. r / 8 + @intFromBool(r % 8 != 0)];
+            @memcpy(buf[0..tail.len], tail);
+            const x = std.mem.readInt(u64, &buf, .little) & ((@as(u64, 1) << @intCast(r)) - 1);
+            pop += @popCount(x);
+            self.put(x, r);
+        }
+        return pop;
+    }
+
+    fn finish(self: *BitWriter) void {
+        if (self.nbits != 0) self.words[self.w] = self.acc;
+    }
+};
+
+/// Bits set in `[off, off + n)` of `words`.
+pub fn countBits(words: []const u64, off: usize, n: usize) usize {
+    if (n == 0) return 0;
+    const first = off / 64;
+    const last = (off + n - 1) / 64;
+    const lo = ~@as(u64, 0) << @intCast(off % 64);
+    const hi = ~@as(u64, 0) >> @intCast(63 - (off + n - 1) % 64);
+    if (first == last) return @popCount(words[first] & lo & hi);
+    var count: usize = @popCount(words[first] & lo);
+    count += @popCount(words[last] & hi);
+    for (words[first + 1 .. last]) |w| count += @popCount(w);
+    return count;
+}
+
+/// Bits `[off, off + out.len)` of `words` as levels 0 and 1, for callers holding the `[]u32` level contract.
+pub fn bitsToLevels(out: []u32, words: []const u64, off: usize) void {
+    const ones: @Vector(16, u32) = @splat(1);
+    const zeros: @Vector(16, u32) = @splat(0);
+    var i: usize = 0;
+    while (i < out.len) {
+        const bit = off + i;
+        const take = @min(64 - bit % 64, out.len - i);
+        const w = words[bit / 64] >> @intCast(bit % 64);
+        var j: usize = 0;
+        while (j + 16 <= take) : (j += 16) {
+            const m: @Vector(16, bool) = @bitCast(@as(u16, @truncate(w >> @intCast(j))));
+            out[i + j ..][0..16].* = @select(u32, m, ones, zeros);
+        }
+        while (j < take) : (j += 1) out[i + j] = @intCast((w >> @intCast(j)) & 1);
+        i += take;
+    }
+}
+
 /// RLE-encoded BOOLEAN values (encoding == RLE). Boolean data is the
 /// hybrid RLE/bit-packed stream at a fixed bit-width of 1; a `1` bit is
 /// `true`. The 4-byte little-endian length prefix that precedes the
@@ -1279,4 +1455,90 @@ test "level run admission is encoded-byte based and leaves packed pages on the l
     try std.testing.expect(!HybridRleDecoder.preferLevelRuns(&.{ 0, 0, 128, 1, 1 }, 1, 64));
     // A packed opening followed by a long run also admits: the decision is not restricted to the first header.
     try std.testing.expect(HybridRleDecoder.preferLevelRuns(&.{ 3, 0xaa, 128, 1, 1 }, 1, 72));
+}
+
+/// A width-1 level stream of `n` levels or so: written by `encode` from random levels, or random runs (RLE and
+/// bit-packed, of any length) that `encode` would never write.
+fn randomLevelStreamForTest(a: std.mem.Allocator, rnd: std.Random, n: usize) ![]u8 {
+    if (rnd.boolean()) {
+        const levels = try a.alloc(u32, n);
+        const p_null = rnd.float(f64);
+        const clustered = rnd.boolean();
+        var cur: u32 = 1;
+        for (levels) |*l| {
+            if (clustered) {
+                if (rnd.float(f64) < 0.02) cur ^= 1;
+                l.* = cur;
+            } else l.* = @intFromBool(rnd.float(f64) >= p_null);
+        }
+        return encode(a, levels, 1);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var covered: usize = 0;
+    var header: [10]u8 = undefined;
+    while (covered < n) {
+        if (rnd.boolean()) {
+            const count = 1 + rnd.uintLessThan(usize, 300);
+            try out.appendSlice(a, header[0..putUleb128(&header, 0, @as(u64, count) << 1)]);
+            try out.append(a, rnd.uintLessThan(u8, 2));
+            covered += count;
+        } else {
+            const groups = 1 + rnd.uintLessThan(usize, 40);
+            try out.appendSlice(a, header[0..putUleb128(&header, 0, (@as(u64, groups) << 1) | 1)]);
+            for (0..groups) |_| try out.append(a, rnd.int(u8));
+            covered += groups * 8;
+        }
+    }
+    return out.items;
+}
+
+test "defToBitmap matches decodeLevels on random and corrupted streams, errors in order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0x1e7e1);
+    const rnd = prng.random();
+    for (0..4000) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        const n = rnd.uintLessThan(usize, 3000);
+        var stream = try a.dupe(u8, try randomLevelStreamForTest(a, rnd, n));
+        // A third of the cases damage the stream: truncated, a byte changed, an empty run spliced in, or more levels
+        // asked for than it holds.
+        var want = n;
+        switch (rnd.uintLessThan(u8, 12)) {
+            0 => if (stream.len > 0) {
+                stream = stream[0..rnd.uintLessThan(usize, stream.len)];
+            },
+            1 => if (stream.len > 0) {
+                stream[rnd.uintLessThan(usize, stream.len)] = rnd.int(u8);
+            },
+            2 => {
+                const at = rnd.uintLessThan(usize, stream.len + 1);
+                const empty: []const u8 = if (rnd.boolean()) &.{ 0, 1 } else &.{1};
+                stream = try std.mem.concat(a, u8, &.{ stream[0..at], empty, stream[at..] });
+            },
+            3 => want = n + 1 + rnd.uintLessThan(usize, 20),
+            else => {},
+        }
+        const levels = try a.alloc(u32, want);
+        const expected = decodeLevels(stream, 1, levels);
+        const words = try a.alloc(u64, bitmapWords(want));
+        const got = defToBitmap(stream, want, words);
+        if (expected) |_| {
+            var present: usize = 0;
+            for (levels) |l| present += l;
+            try testing.expectEqual(present, try got);
+            // Any window, at any bit offset, reads back as the levels.
+            for (0..4) |_| {
+                const off = rnd.uintAtMost(usize, want);
+                const len = rnd.uintAtMost(usize, want - off);
+                var window_present: usize = 0;
+                for (levels[off..][0..len]) |l| window_present += l;
+                try testing.expectEqual(window_present, countBits(words, off, len));
+                const back = try a.alloc(u32, len);
+                bitsToLevels(back, words, off);
+                try testing.expectEqualSlices(u32, levels[off..][0..len], back);
+            }
+        } else |err| try testing.expectError(err, got);
+    }
 }

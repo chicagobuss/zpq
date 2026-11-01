@@ -216,35 +216,53 @@ fn fixed(comptime T: type, a: std.mem.Allocator, col: Col, lo: usize, hi: usize,
 }
 
 /// Rows `lo..hi` of `col` as an Arrow validity bitmap (LSB-first, a bit set for a present row), built 64 rows a word
-/// in one pass over the levels, and the nulls among them by popcount. No words when the column has no levels.
+/// in one pass over the levels, and the nulls among them by popcount. No words, and nothing charged, when no row is
+/// null. The bitmap is charged before it is allocated, so a result over its limit is ResultTooLarge, never a failed
+/// allocation; the words before the first null are all present.
 fn validity(
     a: std.mem.Allocator,
     col: @FieldType(Col, "col"),
     lo: usize,
     hi: usize,
+    charge: *Charge,
 ) !struct { words: ?[]u64, nulls: usize } {
     const levels: []const u32, const max_def: u32 = switch (col) {
         inline else => |v| .{ v.def_levels orelse return .{ .words = null, .nulls = 0 }, v.max_def },
     };
     const rows = levels[lo..hi];
-    const words = try a.alloc(u64, rows.len / 64 + @intFromBool(rows.len % 64 != 0));
-    const L = 16;
-    const top: @Vector(L, u32) = @splat(max_def);
-    var present: usize = 0;
-    for (words, 0..) |*w, k| {
-        const span = rows[k * 64 ..][0..@min(64, rows.len - k * 64)];
-        var bits: u64 = 0;
-        var j: usize = 0;
-        // A level below max_def is a null, as `isRowNull` reads it.
-        while (j + L <= span.len) : (j += L) {
-            const m: u16 = @bitCast(@as(@Vector(L, u32), span[j..][0..L].*) >= top);
-            bits |= @as(u64, m) << @intCast(j);
-        }
-        while (j < span.len) : (j += 1) bits |= @as(u64, @intFromBool(span[j] >= max_def)) << @intCast(j);
-        w.* = bits;
-        present += @popCount(bits);
+    const n_words = rows.len / 64 + @intFromBool(rows.len % 64 != 0);
+    var first: usize = 0;
+    while (first < n_words and @popCount(presentBits(rows, first, max_def)) == wordRows(rows, first)) first += 1;
+    if (first == n_words) return .{ .words = null, .nulls = 0 };
+    // Charged as the (n + 7) / 8 bytes Arrow reads, as before the bits came a word at a time.
+    try charge.add((rows.len + 7) / 8);
+    const words = try a.alloc(u64, n_words);
+    @memset(words[0..first], ~@as(u64, 0));
+    var present = first * 64;
+    for (words[first..], first..) |*w, k| {
+        w.* = presentBits(rows, k, max_def);
+        present += @popCount(w.*);
     }
     return .{ .words = words, .nulls = rows.len - present };
+}
+
+fn wordRows(rows: []const u32, k: usize) usize {
+    return @min(64, rows.len - k * 64);
+}
+
+/// Word `k` of the validity bitmap of `rows`. A level below max_def is a null, as `isRowNull` reads it.
+fn presentBits(rows: []const u32, k: usize, max_def: u32) u64 {
+    const L = 16;
+    const top: @Vector(L, u32) = @splat(max_def);
+    const span = rows[k * 64 ..][0..wordRows(rows, k)];
+    var bits: u64 = 0;
+    var j: usize = 0;
+    while (j + L <= span.len) : (j += L) {
+        const m: u16 = @bitCast(@as(@Vector(L, u32), span[j..][0..L].*) >= top);
+        bits |= @as(u64, m) << @intCast(j);
+    }
+    while (j < span.len) : (j += 1) bits |= @as(u64, @intFromBool(span[j] >= max_def)) << @intCast(j);
+    return bits;
 }
 
 pub fn makeArray(cols: []const Col, lo: usize, hi: usize, charge: *Charge) !Array {
@@ -271,13 +289,9 @@ pub fn makeArray(cols: []const Col, lo: usize, hi: usize, charge: *Charge) !Arra
         @memset(buffers, null);
         child.n_buffers = @intCast(buffers.len);
         child.buffers = buffers.ptr;
-        const valid = try validity(ca, col.col, lo, hi);
+        const valid = try validity(ca, col.col, lo, hi, charge);
         child.null_count = @intCast(valid.nulls);
-        if (valid.nulls > 0) {
-            // Charged as the (n + 7) / 8 bytes Arrow reads, as before the bits came a word at a time.
-            try charge.add((n + 7) / 8);
-            buffers[0] = valid.words.?.ptr;
-        } else if (valid.words) |w| ca.free(w);
+        if (valid.words) |w| buffers[0] = w.ptr;
         if (strings) {
             const v = switch (col.col) {
                 .string => |v| v,
@@ -461,23 +475,54 @@ test "Arrow validity bits are the rows isRowNull reads present, at any row windo
         const n = rnd.uintLessThan(usize, 700);
         const max_def: u32 = 1 + rnd.uintLessThan(u32, 3);
         const levels = try a.alloc(u32, n);
-        // Every row present a quarter of the time: the words are then given back.
+        // Every row present a quarter of the time: then no words are allocated.
         for (levels) |*l| l.* = if (iter % 4 == 0) max_def else rnd.uintAtMost(u32, max_def);
         const values = try a.alloc(i64, n);
         @memset(values, 0);
         const col: @FieldType(Col, "col") = .{ .i64 = .{ .values = values, .def_levels = levels, .max_def = max_def } };
         const lo = rnd.uintAtMost(usize, n);
         const hi = lo + rnd.uintAtMost(usize, n - lo);
-        const got = try validity(a, col, lo, hi);
+        var charge: Charge = .{ .cap = std.math.maxInt(usize) };
+        const got = try validity(a, col, lo, hi, &charge);
         var nulls: usize = 0;
+        for (lo..hi) |row| nulls += @intFromBool(zpq.core.expr.agg.isRowNull(col, row));
+        try std.testing.expectEqual(nulls, got.nulls);
+        // Every row present: no words, and nothing charged.
+        if (nulls == 0) {
+            try std.testing.expect(got.words == null and charge.bytes == 0);
+            continue;
+        }
+        try std.testing.expectEqual((hi - lo + 7) / 8, charge.bytes);
         for (lo..hi, 0..) |row, i| {
             const is_null = zpq.core.expr.agg.isRowNull(col, row);
-            nulls += @intFromBool(is_null);
             try std.testing.expectEqual(!is_null, (got.words.?[i / 64] >> @intCast(i % 64)) & 1 != 0);
         }
-        try std.testing.expectEqual(nulls, got.nulls);
     }
+    var charge: Charge = .{ .cap = 0 };
     const none: @FieldType(Col, "col") = .{ .i64 = .{ .values = &.{ 1, 2, 3 }, .max_def = 1 } };
-    const got = try validity(std.testing.allocator, none, 0, 3);
+    const got = try validity(std.testing.allocator, none, 0, 3, &charge);
     try std.testing.expect(got.words == null and got.nulls == 0);
+}
+
+test "regression: a refused Arrow validity charge reports ResultTooLarge, not a failed allocation" {
+    const n = 65536;
+    const levels = try std.testing.allocator.alloc(u32, n);
+    defer std.testing.allocator.free(levels);
+    const values = try std.testing.allocator.alloc(i64, n);
+    defer std.testing.allocator.free(values);
+    @memset(values, 1);
+    const col: @FieldType(Col, "col") = .{ .i64 = .{ .values = values, .def_levels = levels, .max_def = 1 } };
+    // A null in the first, a middle and the last word.
+    for ([_]usize{ 0, n / 2 + 5, n - 1 }) |at| {
+        @memset(levels, 1);
+        levels[at] = 0;
+        // Nothing of the result allowance left, and every allocation fails.
+        var charge: Charge = .{ .cap = 0 };
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(error.ResultTooLarge, validity(failing.allocator(), col, 0, n, &charge));
+        // A column without nulls neither allocates nor charges.
+        @memset(levels, 1);
+        const got = try validity(failing.allocator(), col, 0, n, &charge);
+        try std.testing.expect(got.words == null and got.nulls == 0);
+    }
 }

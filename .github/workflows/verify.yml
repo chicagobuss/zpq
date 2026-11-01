@@ -184,8 +184,8 @@ jobs:
   full-tier:
     name: Full tier (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # About 20 minutes is the commit tier's measure on this runner; a shard gets more only if it measures over 30.
-    timeout-minutes: 45
+    # 45 per shard; a shard gets more only if it measures over 30: units-core took 30.2 minutes (2026-11-01), so 60.
+    timeout-minutes: ${{ matrix.shard == 'units-core' && 60 || 45 }}
     strategy:
       fail-fast: false
       matrix:

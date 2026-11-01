@@ -1368,10 +1368,13 @@ pub fn ColumnChunkReader(comptime T: type) type {
             self.has_nulls = true;
             const Expand = ValidityExpand(T);
             if (comptime plain_is_le_bytes) {
-                if (self.active == .plain) {
+                // A short payload goes through the packed decoder, so a narrow integer out of range in the bytes
+                // there is reported before the missing values are.
+                if (self.active == .plain and
+                    num_present * @sizeOf(T) <= self.active.plain.bytes.len - self.active.plain.pos)
+                {
                     const dec = &self.active.plain;
                     const need = num_present * @sizeOf(T);
-                    if (need > dec.bytes.len - dec.pos) return error.UnexpectedPage;
                     const src = std.mem.bytesAsSlice(T, dec.bytes[dec.pos..][0..need]);
                     Expand.from(values, src, bits, off, defaultValue());
                     dec.pos += need;
@@ -3687,5 +3690,21 @@ test "max_def-1 pages read the same as bits as expanded, V1 and V2, values, code
             _ = arena_state.reset(.retain_capacity);
             try expectBitsReadAsLevels(T, arena_state.allocator(), rnd, dictionary);
         };
+    }
+}
+
+test "regression: a short PLAIN payload on a bitmap page reports an out-of-range narrow integer first, V1 and V2" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]bool{ false, true }) |v2| {
+        var chunk: std.ArrayList(u8) = .empty;
+        // One packed group whose first three levels are 1, 0, 1; one INT32 (128, past INT_8) of the two promised.
+        try optionalPageForTest(arena, &chunk, v2, .PLAIN, 3, 1, &.{ 3, 5 }, &.{ 128, 0, 0, 0 });
+        var reader = ColumnChunkReader(i32).initWithOptions(chunk.items, .UNCOMPRESSED, .{ .max_def = 1, .max_rep = 0 }, arena, .{
+            .fast_levels = true,
+            .int_range = .{ .min = -128, .max = 127 },
+        }, null);
+        try testing.expectError(error.IntOutOfRange, reader.readAll(3));
     }
 }

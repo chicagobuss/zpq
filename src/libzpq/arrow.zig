@@ -215,6 +215,38 @@ fn fixed(comptime T: type, a: std.mem.Allocator, col: Col, lo: usize, hi: usize,
     return vals.ptr;
 }
 
+/// Rows `lo..hi` of `col` as an Arrow validity bitmap (LSB-first, a bit set for a present row), built 64 rows a word
+/// in one pass over the levels, and the nulls among them by popcount. No words when the column has no levels.
+fn validity(
+    a: std.mem.Allocator,
+    col: @FieldType(Col, "col"),
+    lo: usize,
+    hi: usize,
+) !struct { words: ?[]u64, nulls: usize } {
+    const levels: []const u32, const max_def: u32 = switch (col) {
+        inline else => |v| .{ v.def_levels orelse return .{ .words = null, .nulls = 0 }, v.max_def },
+    };
+    const rows = levels[lo..hi];
+    const words = try a.alloc(u64, rows.len / 64 + @intFromBool(rows.len % 64 != 0));
+    const L = 16;
+    const top: @Vector(L, u32) = @splat(max_def);
+    var present: usize = 0;
+    for (words, 0..) |*w, k| {
+        const span = rows[k * 64 ..][0..@min(64, rows.len - k * 64)];
+        var bits: u64 = 0;
+        var j: usize = 0;
+        // A level below max_def is a null, as `isRowNull` reads it.
+        while (j + L <= span.len) : (j += L) {
+            const m: u16 = @bitCast(@as(@Vector(L, u32), span[j..][0..L].*) >= top);
+            bits |= @as(u64, m) << @intCast(j);
+        }
+        while (j < span.len) : (j += 1) bits |= @as(u64, @intFromBool(span[j] >= max_def)) << @intCast(j);
+        w.* = bits;
+        present += @popCount(bits);
+    }
+    return .{ .words = words, .nulls = rows.len - present };
+}
+
 pub fn makeArray(cols: []const Col, lo: usize, hi: usize, charge: *Charge) !Array {
     const own = try Storage.create();
     var out: Array = .{ .length = @intCast(hi - lo), .n_buffers = 1, .release = releaseArray, .private_data = own };
@@ -239,18 +271,13 @@ pub fn makeArray(cols: []const Col, lo: usize, hi: usize, charge: *Charge) !Arra
         @memset(buffers, null);
         child.n_buffers = @intCast(buffers.len);
         child.buffers = buffers.ptr;
-        for (lo..hi) |row| if (zpq.core.expr.agg.isRowNull(col.col, row)) {
-            child.null_count += 1;
-        };
-        if (child.null_count > 0) {
+        const valid = try validity(ca, col.col, lo, hi);
+        child.null_count = @intCast(valid.nulls);
+        if (valid.nulls > 0) {
+            // Charged as the (n + 7) / 8 bytes Arrow reads, as before the bits came a word at a time.
             try charge.add((n + 7) / 8);
-            const valid = try ca.alloc(u8, (n + 7) / 8);
-            @memset(valid, 0);
-            for (lo..hi, 0..) |row, i| if (!zpq.core.expr.agg.isRowNull(col.col, row)) {
-                valid[i / 8] |= @as(u8, 1) << @intCast(i % 8);
-            };
-            buffers[0] = valid.ptr;
-        }
+            buffers[0] = valid.words.?.ptr;
+        } else if (valid.words) |w| ca.free(w);
         if (strings) {
             const v = switch (col.col) {
                 .string => |v| v,
@@ -422,3 +449,35 @@ pub const State = struct {
         s.private_data = null;
     }
 };
+
+test "Arrow validity bits are the rows isRowNull reads present, at any row window" {
+    var prng = std.Random.DefaultPrng.init(0xa770);
+    const rnd = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    for (0..400) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        const n = rnd.uintLessThan(usize, 700);
+        const max_def: u32 = 1 + rnd.uintLessThan(u32, 3);
+        const levels = try a.alloc(u32, n);
+        // Every row present a quarter of the time: the words are then given back.
+        for (levels) |*l| l.* = if (iter % 4 == 0) max_def else rnd.uintAtMost(u32, max_def);
+        const values = try a.alloc(i64, n);
+        @memset(values, 0);
+        const col: @FieldType(Col, "col") = .{ .i64 = .{ .values = values, .def_levels = levels, .max_def = max_def } };
+        const lo = rnd.uintAtMost(usize, n);
+        const hi = lo + rnd.uintAtMost(usize, n - lo);
+        const got = try validity(a, col, lo, hi);
+        var nulls: usize = 0;
+        for (lo..hi, 0..) |row, i| {
+            const is_null = zpq.core.expr.agg.isRowNull(col, row);
+            nulls += @intFromBool(is_null);
+            try std.testing.expectEqual(!is_null, (got.words.?[i / 64] >> @intCast(i % 64)) & 1 != 0);
+        }
+        try std.testing.expectEqual(nulls, got.nulls);
+    }
+    const none: @FieldType(Col, "col") = .{ .i64 = .{ .values = &.{ 1, 2, 3 }, .max_def = 1 } };
+    const got = try validity(std.testing.allocator, none, 0, 3);
+    try std.testing.expect(got.words == null and got.nulls == 0);
+}

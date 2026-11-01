@@ -7,6 +7,15 @@
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan
   from one footer, and checks every footer while the workers run (a mismatch still refuses the query). TPC-H Q6 over
   32 workers went from 749 to 541 ms warm on 0.5.1's own workers. No binary changed.
+- **Nullable columns decode faster.** For a nullable column that isn't nested, zpq now decodes the definition levels
+  straight into a validity bitmap and places the values from it (an AVX2 lookup table in the default x86_64 build,
+  a portable word-at-a-time kernel in `-compat`, Lambda and aarch64), where it used to expand one 32-bit level per
+  value. Reading a page with nulls is 4.7–5.6× faster in the default build and about 1.5× faster in `-compat`;
+  pages without nulls take the same path as before. Whole queries over nullable data are flat to 6% faster; the
+  Arrow C stream export of nullable columns is about 14% faster.
+- **Smaller definition levels in written files.** zpq wrote the few values left over before a run as one-value runs;
+  it now packs them, so a re-encoded nullable file's definition levels are 63% smaller and PyArrow reads it about 6%
+  faster. Written bytes change; the values don't.
 
 ## 0.5.1 (2026-10-31)
 

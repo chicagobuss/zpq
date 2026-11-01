@@ -262,18 +262,15 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
     const out_dir = dir orelse return error.BadArgs;
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
 
-    var full: std.ArrayList([]const u8) = .empty;
-    try full.appendSlice(arena, &.{ "timeout", "--kill-after=30", try std.fmt.allocPrint(arena, "{d}", .{timeout_s}) });
-    try full.appendSlice(arena, argv);
     const started = std.Io.Clock.awake.now(io);
-    const out = try oracle_mod.capture(gpa, io, full.items);
+    const out = try oracle_mod.captureTimed(gpa, io, argv, null, timeout_s);
     defer gpa.free(out.stdout);
     defer gpa.free(out.stderr);
     const ns: i64 = @intCast(started.untilNow(io, .awake).toNanoseconds());
     const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
     const log = try std.mem.concat(arena, u8, &.{ out.stdout, out.stderr });
-    // `timeout` exits 124 when it signalled the stage, 137 when it had to kill it.
-    const timed_out = !out.signaled and (out.code == 124 or out.code == 137);
+    // The stage was killed at its deadline (oracle.captureTimed reports that as exit 124, as coreutils `timeout` did).
+    const timed_out = !out.signaled and out.code == oracle_mod.timed_out_code;
     const log_path = try std.fmt.allocPrint(arena, "{s}/{s}.log", .{ out_dir, stage_name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log_path, .data = log });
 

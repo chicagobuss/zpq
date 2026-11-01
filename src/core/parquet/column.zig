@@ -241,10 +241,17 @@ fn scatterByLevels(
 /// `scatterByLevels` driven by validity bits (`hybrid_rle.defToBitmap`), slot i at bit `off + i`. A bitmap word of 64
 /// present slots is one copy and one of 64 nulls one fill, so per-slot work is left to mixed words only. Those take
 /// the target's step, fixed at compile time since zpq has no runtime dispatch: AVX2 fills a 256-bit register of slots
-/// per step (`Avx2Expand`); every other target (the baseline `-compat` build, Lambda, aarch64) loops per slot.
+/// per step (`Avx2Expand`), and aarch64 a pair of NEON registers of 4- or 8-byte slots (`NeonExpand`; 16-byte slices
+/// keep the loop, a NEON step for them measured slower on Apple M5 at 50% nulls). Every other target (the baseline
+/// `-compat` build) loops per slot.
 fn ValidityExpand(comptime T: type) type {
     return struct {
-        const Step = if (has_avx2 and (@sizeOf(T) == 4 or @sizeOf(T) == 8 or @sizeOf(T) == 16)) Avx2Expand(T) else void;
+        const Step = if (has_avx2 and (@sizeOf(T) == 4 or @sizeOf(T) == 8 or @sizeOf(T) == 16))
+            Avx2Expand(T)
+        else if (has_neon and (@sizeOf(T) == 4 or @sizeOf(T) == 8))
+            NeonExpand(T)
+        else
+            void;
 
         const Span = struct { bits: u64, all: u64, take: usize };
 
@@ -340,6 +347,8 @@ fn ValidityExpand(comptime T: type) type {
 }
 
 const has_avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+/// Advanced SIMD is part of every ARMv8-A core, so every aarch64 build takes the NEON step.
+const has_neon = builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon);
 
 /// One AVX2 expand step: the `E` slots of a 256-bit register at `dst` from the next `popcount(m)` values at `src`,
 /// through `vpermd` with dword indices from a comptime table of every mask. A null slot's indices carry the sign bit,
@@ -379,6 +388,56 @@ fn Avx2Expand(comptime T: type) type {
             const dv: Dwords = @as(*align(1) const Dwords, @ptrCast(&fill)).*;
             const null_slot = @as(@Vector(8, i32), @bitCast(idx)) < @as(@Vector(8, i32), @splat(0));
             @as(*align(1) Dwords, @ptrCast(dst)).* = @select(u32, null_slot, dv, moved);
+        }
+    };
+}
+
+/// One NEON expand step: the `E` slots of two 128-bit registers at `dst` from the next `popcount(m)` values at `src`.
+/// NEON has no expand instruction, so `tbx` gathers the 32 source bytes by byte indices from a comptime table of every
+/// mask (8 KB for 4-byte values, 512 B for 8-byte). A null slot's indices are 0xFF, out of range, where `tbx` keeps
+/// the destination byte: the destination starts as the default fill, so no select follows.
+fn NeonExpand(comptime T: type) type {
+    return struct {
+        const E = 32 / @sizeOf(T);
+        const mask: u64 = (1 << E) - 1;
+        const Bytes = @Vector(16, u8);
+        const Pair = [2]Bytes;
+        const table: [1 << E]Pair = blk: {
+            @setEvalBranchQuota(200_000);
+            const S = @sizeOf(T);
+            var t: [1 << E]Pair = undefined;
+            for (0..1 << E) |m| {
+                var b: [32]u8 = @splat(0xFF);
+                var next: u8 = 0;
+                for (0..E) |e| if ((m >> e) & 1 != 0) {
+                    for (0..S) |k| b[e * S + k] = next * S + k;
+                    next += 1;
+                };
+                t[m] = .{ b[0..16].*, b[16..32].* };
+            }
+            break :blk t;
+        };
+
+        /// `src` has `E` values readable; both source registers are loaded before the store, which may overlap them.
+        inline fn store(dst: [*]T, src: [*]align(1) const T, m: u64, default: T) void {
+            const idx = &table[@intCast(m)];
+            const fill: [E]T = @splat(default);
+            const f: *align(1) const Pair = @ptrCast(&fill);
+            const s: Pair = @as(*align(1) const Pair, @ptrCast(src)).*;
+            const d: *align(1) Pair = @ptrCast(dst);
+            d.* = .{ tbx2(f[0], s, idx[0]), tbx2(f[1], s, idx[1]) };
+        }
+
+        /// The two-register table form names consecutive registers, hence the fixed pair.
+        inline fn tbx2(acc: Bytes, t: Pair, i: Bytes) Bytes {
+            var d = acc;
+            asm ("tbx %[d].16b, {v28.16b, v29.16b}, %[i].16b"
+                : [d] "+w" (d),
+                : [t0] "{v28}" (t[0]),
+                  [t1] "{v29}" (t[1]),
+                  [i] "w" (i),
+            );
+            return d;
         }
     };
 }
@@ -3311,6 +3370,19 @@ test "recycled BYTE_ARRAY pages reuse one buffer and match a retained decode" {
     try testing.expect(v2_def[1] < 1);
     try testing.expectEqual(@as(usize, 0), v2_vals[2].len);
     try testing.expect(v2_def[2] >= 1);
+}
+
+test "validity expand takes the target's step: AVX2, NEON for 4- and 8-byte slots, else the per-slot loop" {
+    inline for (.{ i32, f32, u32, i64, f64, []const u8, bool }) |T| {
+        const S = @sizeOf(T);
+        const want: type = if (has_avx2 and (S == 4 or S == 8 or S == 16))
+            Avx2Expand(T)
+        else if (builtin.cpu.arch == .aarch64 and (S == 4 or S == 8))
+            NeonExpand(T)
+        else
+            void;
+        try testing.expect(ValidityExpand(T).Step == want);
+    }
 }
 
 test "validity-bit expand matches the level scatter for every value width, at any bit offset" {

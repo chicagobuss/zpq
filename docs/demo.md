@@ -50,7 +50,7 @@ zpq does the absolute minimum work required to satisfy a query:
 * Per-row-group decode → encode pipelines stream straight into a
   multipart S3 upload. Memory ceiling is one row group, not one file.
 * Talks to any S3-compatible store. Custom endpoints (Cloudflare R2,
-  MinIO) use path-style URLs; AWS S3 uses virtual-hosted URLs, or
+  RustFS) use path-style URLs; AWS S3 uses virtual-hosted URLs, or
   path-style for bucket names containing dots. Same code path, no SDK
   switch.
 
@@ -265,9 +265,9 @@ What zpq is for:
   its own invocation, fired when the work arrives; there is nothing to
   keep warm.
 * **No catalog required.** Drop a Parquet file anywhere — local
-  disk, R2, MinIO, S3 — and query it. No Glue, no DDL, no partition
+  disk, R2, RustFS, S3 — and query it. No Glue, no DDL, no partition
   registration. Same UX as `duckdb -c "SELECT * FROM 'data/*.parquet'"`.
-* **The data doesn't have to be in S3.** Cloudflare R2, MinIO,
+* **The data doesn't have to be in S3.** Cloudflare R2, RustFS,
   GCS-compat — same code, same speed envelope, no migration to AWS.
 * **Writes stream S3-to-S3.** zpq Lambda filters, projects and
   re-encodes straight into a multipart upload; multi-file compaction

@@ -179,7 +179,7 @@ pub const Credentials = struct {
             }
         }
         // `S3_*`-prefixed vars override `AWS_*`. This lets a Lambda
-        // function target a non-AWS S3-compatible endpoint (R2, MinIO,
+        // function target a non-AWS S3-compatible endpoint (R2, RustFS,
         // GCS in compat mode) without colliding with Lambda's
         // reserved `AWS_*` env vars (which the runtime injects from
         // the execution role and refuses to let us override at deploy
@@ -215,7 +215,7 @@ pub const Credentials = struct {
 
     /// Strip protocol, optional port, and trailing slash from an endpoint URL,
     /// returning just the DNS hostname. Doesn't allocate; result is a slice into
-    /// the input. `http://minio:9000/` -> `minio`.
+    /// the input. `http://rustfs:9000/` -> `rustfs`.
     pub fn endpointHost(self: Credentials) ?[]const u8 {
         var h = self.endpointAuthority() orelse return null;
         if (h.len > 0 and h[0] == '[') {

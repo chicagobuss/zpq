@@ -894,7 +894,7 @@ fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadErr
 }
 
 /// The TLS server name in `host`, a host name or IP literal optionally written as an HTTP authority: `:port`, IPv6
-/// brackets and a trailing dot are dropped (`minio.local:9000` -> `minio.local`, `[::1]:9000` -> `::1`).
+/// brackets and a trailing dot are dropped (`store.local:9000` -> `store.local`, `[::1]:9000` -> `::1`).
 pub fn serverName(host: []const u8) []const u8 {
     var h = host;
     if (h.len > 0 and h[0] == '[') {
@@ -920,8 +920,8 @@ const retry = @import("retry.zig");
 
 test "serverName drops the port, IPv6 brackets and a trailing dot" {
     try testing.expectEqualStrings("s3.us-east-1.amazonaws.com", serverName("s3.us-east-1.amazonaws.com"));
-    try testing.expectEqualStrings("minio.local", serverName("minio.local:9000"));
-    try testing.expectEqualStrings("minio.local", serverName("minio.local.:9000"));
+    try testing.expectEqualStrings("store.local", serverName("store.local:9000"));
+    try testing.expectEqualStrings("store.local", serverName("store.local.:9000"));
     try testing.expectEqualStrings("10.0.0.5", serverName("10.0.0.5:9000"));
     try testing.expectEqualStrings("::1", serverName("[::1]:9000"));
     try testing.expectEqualStrings("::1", serverName("[::1]"));

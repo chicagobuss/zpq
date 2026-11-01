@@ -3693,6 +3693,75 @@ test "max_def-1 pages read the same as bits as expanded, V1 and V2, values, code
     }
 }
 
+test "levels-only reads match decodeLevels on clustered and random pages, V1 and V2, whole and in windows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0x1e7e15);
+    const rnd = prng.random();
+    for (0..200) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        var chunk: std.ArrayList(u8) = .empty;
+        var want: std.ArrayList(u32) = .empty;
+        const pages = 1 + rnd.uintLessThan(usize, 4);
+        for (0..pages) |_| {
+            const n = rnd.uintLessThan(usize, 6000);
+            const page_levels = try a.alloc(u32, n);
+            // Clustered: runs of up to many bitmap words, as a sorted or appended null stretch writes them.
+            const clustered = rnd.boolean();
+            const p_null = rnd.float(f64);
+            var cur: u32 = rnd.uintLessThan(u32, 2);
+            var left: usize = 0;
+            for (page_levels) |*l| {
+                if (clustered) {
+                    if (left == 0) {
+                        cur ^= 1;
+                        left = 1 + rnd.uintLessThan(usize, 2500);
+                    }
+                    left -= 1;
+                    l.* = cur;
+                } else l.* = @intFromBool(rnd.float(f64) >= p_null);
+            }
+            const v2 = rnd.boolean();
+            var def = try hybrid_rle.encode(a, page_levels, 1);
+            if (v2 and def.len == 0) def = try a.dupe(u8, &.{ 0, 0 });
+            // The oracle: the page's stream through decodeLevels.
+            const decoded = try a.alloc(u32, n);
+            try hybrid_rle.decodeLevels(def, 1, decoded);
+            try want.appendSlice(a, decoded);
+            var plain_values: std.ArrayList(u8) = .empty;
+            var nulls: usize = 0;
+            for (decoded, 0..) |l, k| {
+                if (l == 0) nulls += 1 else try plain_values.appendSlice(a, &std.mem.toBytes(@as(i64, @intCast(k))));
+            }
+            try optionalPageForTest(a, &chunk, v2, .PLAIN, n, nulls, def, plain_values.items);
+        }
+        const n = want.items.len;
+        const levels: schema.Levels = .{ .max_def = 1, .max_rep = 0 };
+        var scratch = DecodeScratch.init(testing.allocator);
+        defer scratch.deinit();
+        const scratch_opt: ?*DecodeScratch = if (iter % 2 == 0) &scratch else null;
+        {
+            var r = ColumnChunkReader(i64).initWithOptions(chunk.items, .UNCOMPRESSED, levels, a, .{}, scratch_opt);
+            const got = (try r.readAllLevels(n)).?;
+            try expectSameLevels(want.items, got.def_levels);
+        }
+        {
+            var r = ColumnChunkReader(i64).initWithOptions(chunk.items, .UNCOMPRESSED, levels, a, .{}, scratch_opt);
+            const got = try a.alloc(u32, n);
+            @memset(got, 7);
+            var done: usize = 0;
+            while (done < n) {
+                const take = @min(n - done, 1 + rnd.uintLessThan(usize, 3000));
+                const k = try r.readLevels(got[done..][0..take]);
+                try testing.expectEqual(take, k);
+                done += k;
+            }
+            try testing.expectEqualSlices(u32, want.items, got);
+        }
+    }
+}
+
 test "regression: a short PLAIN payload on a bitmap page reports an out-of-range narrow integer first, V1 and V2" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

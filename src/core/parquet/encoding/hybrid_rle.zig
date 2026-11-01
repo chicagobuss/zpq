@@ -585,7 +585,10 @@ pub fn countBits(words: []const u64, off: usize, n: usize) usize {
     return count;
 }
 
-/// Bits `[off, off + out.len)` of `words` as levels 0 and 1, for callers holding the `[]u32` level contract.
+/// Bits `[off, off + out.len)` of `words` as levels 0 and 1, for callers holding the `[]u32` level contract. A span of
+/// all-present or all-null words is a fill, as the run stream writes an RLE run, so a page of long runs costs no more
+/// as bits than as runs: each further word of the same bit is checked and stored in one pass, 64 levels in register
+/// stores (`@memset` came out as one 4-byte store a level on aarch64, 0.35 ns a level against the runs' 0.09).
 pub fn bitsToLevels(out: []u32, words: []const u64, off: usize) void {
     const ones: @Vector(16, u32) = @splat(1);
     const zeros: @Vector(16, u32) = @splat(0);
@@ -593,7 +596,19 @@ pub fn bitsToLevels(out: []u32, words: []const u64, off: usize) void {
     while (i < out.len) {
         const bit = off + i;
         const take = @min(64 - bit % 64, out.len - i);
-        const w = words[bit / 64] >> @intCast(bit % 64);
+        const all: u64 = if (take == 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(take)) - 1;
+        const w = (words[bit / 64] >> @intCast(bit % 64)) & all;
+        if (w == 0 or w == all) {
+            const same: u64 = if (w == 0) 0 else ~@as(u64, 0);
+            const fill = if (w == 0) zeros else ones;
+            @memset(out[i..][0..take], @intFromBool(w != 0));
+            i += take;
+            // The span now ends on a word boundary.
+            while (out.len - i >= 64 and words[(off + i) / 64] == same) : (i += 64) {
+                inline for (0..4) |k| out[i + 16 * k ..][0..16].* = fill;
+            }
+            continue;
+        }
         var j: usize = 0;
         while (j + 16 <= take) : (j += 16) {
             const m: @Vector(16, bool) = @bitCast(@as(u16, @truncate(w >> @intCast(j))));
@@ -1504,6 +1519,46 @@ fn randomLevelStreamForTest(a: std.mem.Allocator, rnd: std.Random, n: usize) ![]
         }
     }
     return out.items;
+}
+
+test "bitsToLevels reads long runs as decodeLevels does, from any bit offset, across whole-word fills" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var prng = std.Random.DefaultPrng.init(0xf111);
+    const rnd = prng.random();
+    for (0..600) |iter| {
+        _ = arena_state.reset(.retain_capacity);
+        const a = arena_state.allocator();
+        const n = rnd.uintLessThan(usize, 8000);
+        // Runs up to many words long, between short runs and scattered stretches, so fills start and end mid-word.
+        const levels = try a.alloc(u32, n);
+        var i: usize = 0;
+        while (i < n) {
+            const len = @min(n - i, switch (rnd.uintLessThan(u8, 4)) {
+                0 => 1 + rnd.uintLessThan(usize, 8),
+                1 => 1 + rnd.uintLessThan(usize, 200),
+                else => 1 + rnd.uintLessThan(usize, 3000),
+            });
+            const scattered = iter % 5 == 0 and rnd.uintLessThan(u8, 4) == 0;
+            const v: u32 = rnd.uintLessThan(u32, 2);
+            for (levels[i..][0..len]) |*l| l.* = if (scattered) rnd.uintLessThan(u32, 2) else v;
+            i += len;
+        }
+        const stream = try encode(a, levels, 1);
+        const expected = try a.alloc(u32, n);
+        try decodeLevels(stream, 1, expected);
+        try testing.expectEqualSlices(u32, levels, expected);
+        const words = try a.alloc(u64, bitmapWords(n));
+        _ = try defToBitmap(stream, n, words);
+        for (0..6) |_| {
+            const off = rnd.uintAtMost(usize, n);
+            const len = rnd.uintAtMost(usize, n - off);
+            const back = try a.alloc(u32, len);
+            @memset(back, 7);
+            bitsToLevels(back, words, off);
+            try testing.expectEqualSlices(u32, expected[off..][0..len], back);
+        }
+    }
 }
 
 test "defToBitmap matches decodeLevels on random and corrupted streams, errors in order" {

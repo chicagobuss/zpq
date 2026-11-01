@@ -51,9 +51,10 @@ jobs:
     # itself is ~5 min on the runner; the rest is setup + downstream
     # checks. Real headroom matters more than aspirational tightness.
     # 25 since libzpq joined: its BoringSSL is compiled from source (position-independent), a few minutes cold.
-    # 45 since 0.5.1: the commit tier takes about 20 minutes on the 4-core hosted runner, plus about 10 of setup and
-    # builds. The full-tier shards run in their own jobs (full-tier, below), not here.
-    timeout-minutes: 45
+    # 60 since 0.5.1: with the fixtures in place the commit tier takes about 29 minutes on the 4-core hosted runner (its
+    # cases stage alone about 10), plus about 10 of setup and builds; 38 in all, measured. The full-tier shards run in
+    # their own jobs (full-tier, below), not here.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

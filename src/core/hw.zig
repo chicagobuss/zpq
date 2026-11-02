@@ -245,19 +245,35 @@ const Sysctl = struct {
     }
 };
 
-/// The cache record macOS describes, over what CPUID found. A hybrid Apple chip reports each performance level;
-/// level 0 is its fastest cores, where the scheduler puts compute-bound threads first, and its L2 is shared by
-/// `cpusperl2` of them. Otherwise, and on Intel Macs, `hw.cacheconfig` gives the sharing. Apple cores run one
-/// thread each, so an unreported L1d sharing is one CPU.
+/// The cache record macOS describes, over what CPUID found. A hybrid Apple chip reports each performance level,
+/// whose L2 is shared by `cpusperl2` of its cores. Darwin maps no CPU to a level and has no affinity, so any worker
+/// may run on any level: each cache is the smallest per-worker share across levels, as the affinity minimum is
+/// elsewhere. Otherwise, and on Intel Macs, `hw.cacheconfig` gives the sharing. Apple cores run one thread each, so
+/// an unreported L1d sharing is one CPU.
 fn fromSysctl(sysctl: anytype, seed: Cpu) Cpu {
     var out = seed;
     const line = sysctl.int("hw.cachelinesize") orelse 0;
-    if (sysctl.int("hw.perflevel0.l2cachesize")) |l2| {
-        if (sysctl.int("hw.perflevel0.l1dcachesize")) |l1d| out.l1d = .{ .bytes = l1d, .max_sharing = 1 };
-        out.l2 = .{ .bytes = l2, .max_sharing = sysctl.int("hw.perflevel0.cpusperl2") orelse 1 };
+    var l1d: Cache = .{};
+    var l2: Cache = .{};
+    for (0..sysctl.int("hw.nperflevels") orelse 0) |level| {
+        var name: [64]u8 = undefined;
+        const prefix = "hw.perflevel{d}.{s}";
+        const size = std.fmt.bufPrintSentinel(&name, prefix, .{ level, "l2cachesize" }, 0) catch break;
+        const bytes = sysctl.int(size) orelse continue;
+        const sharing = std.fmt.bufPrintSentinel(&name, prefix, .{ level, "cpusperl2" }, 0) catch break;
+        const level_l2: Cache = .{ .bytes = bytes, .max_sharing = sysctl.int(sharing) orelse 1 };
+        if (l2.bytes == 0 or level_l2.bytesPerWorker() < l2.bytesPerWorker()) l2 = level_l2;
+        const l1d_size = std.fmt.bufPrintSentinel(&name, prefix, .{ level, "l1dcachesize" }, 0) catch break;
+        if (sysctl.int(l1d_size)) |b| if (l1d.bytes == 0 or b < l1d.bytes) {
+            l1d = .{ .bytes = b, .max_sharing = 1 };
+        };
+    }
+    if (l2.bytes != 0) {
+        if (l1d.bytes != 0) out.l1d = l1d;
+        out.l2 = l2;
     } else {
-        if (sysctl.int("hw.l1dcachesize")) |l1d| out.l1d = .{ .bytes = l1d, .max_sharing = sysctl.sharing(1) orelse 1 };
-        if (sysctl.int("hw.l2cachesize")) |l2| out.l2 = .{ .bytes = l2, .max_sharing = sysctl.sharing(2) orelse 1 };
+        if (sysctl.int("hw.l1dcachesize")) |bytes| out.l1d = .{ .bytes = bytes, .max_sharing = sysctl.sharing(1) orelse 1 };
+        if (sysctl.int("hw.l2cachesize")) |bytes| out.l2 = .{ .bytes = bytes, .max_sharing = sysctl.sharing(2) orelse 1 };
     }
     if (sysctl.int("hw.l3cachesize")) |l3| {
         if (l3 != 0) out.l3 = .{ .bytes = l3, .max_sharing = sysctl.sharing(3) orelse 1 };
@@ -507,23 +523,27 @@ const SysctlFixture = struct {
     }
 };
 
-test "hardware macOS sysctl takes the Apple performance level and falls back to the whole-machine names" {
-    // Apple M5 Pro: six "Super" cores share a 16 MiB L2; the whole-machine names describe the other cluster.
+test "hardware macOS sysctl takes the smallest Apple performance level and falls back to the whole-machine names" {
+    // Apple M5 Pro: six "Super" cores share a 16 MiB L2, and two clusters of six "Performance" cores 8 MiB each.
     const m5: SysctlFixture = .{ .ints = &.{
         .{ "hw.cachelinesize", 128 },
         .{ "hw.l1dcachesize", 64 << 10 },
         .{ "hw.l2cachesize", 8 << 20 },
+        .{ "hw.nperflevels", 2 },
         .{ "hw.perflevel0.l1dcachesize", 128 << 10 },
         .{ "hw.perflevel0.l2cachesize", 16 << 20 },
         .{ "hw.perflevel0.cpusperl2", 6 },
+        .{ "hw.perflevel1.l1dcachesize", 64 << 10 },
+        .{ "hw.perflevel1.l2cachesize", 8 << 20 },
+        .{ "hw.perflevel1.cpusperl2", 6 },
     }, .config = &.{ 18, 1, 6 } };
     const apple = fromSysctl(m5, .{});
-    try std.testing.expectEqual(@as(usize, 128 << 10), apple.l1d.bytesPerWorker());
-    try std.testing.expectEqual(@as(usize, (16 << 20) / 6), apple.l2.bytesPerWorker());
+    try std.testing.expectEqual(@as(usize, 64 << 10), apple.l1d.bytesPerWorker());
+    try std.testing.expectEqual(@as(usize, (8 << 20) / 6), apple.l2.bytesPerWorker());
     try std.testing.expectEqual(@as(usize, 128), apple.l1d.line_bytes);
     try std.testing.expectEqual(@as(usize, 0), apple.l3.bytes);
     const cpus = [_]Cpu{ apple, apple };
-    try std.testing.expectEqual(@as(usize, (16 << 20) / 6), affinityMinimum(&cpus, parseCpuList("0-1").?));
+    try std.testing.expectEqual(@as(usize, (8 << 20) / 6), affinityMinimum(&cpus, parseCpuList("0-1").?));
 
     // An Intel Mac (i7-7700HQ): no performance levels; two SMT threads share L1d and L2, eight the L3.
     const intel: SysctlFixture = .{ .ints = &.{

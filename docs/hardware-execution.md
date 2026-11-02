@@ -18,8 +18,9 @@ supplies the other logical CPUs and concrete sharing sets, including separate
 L3 domains. On aarch64 Linux, a sysfs without `coherency_line_size` (as in
 some VMs) takes the line from `CTR_EL0.DminLine`. macOS has no affinity, so
 every logical CPU is allowed and all get the record sysctl describes: on Apple
-Silicon, performance level 0 (`hw.perflevel0.l1dcachesize`, `l2cachesize`
-shared by `cpusperl2` cores); elsewhere, including Intel Macs,
+Silicon, the smallest per-worker share across performance levels
+(`hw.perflevelN.l1dcachesize`, `l2cachesize` shared by `cpusperl2` cores), the
+affinity minimum for a scheduler that may place a worker on any level; elsewhere, including Intel Macs,
 `hw.l1dcachesize`/`l2cachesize`/`l3cachesize` shared as `hw.cacheconfig`
 says, with `hw.cachelinesize` for the line. Missing data stays unknown (zero
 bytes / an empty set); consumers must use a conservative path. Linux CPU IDs

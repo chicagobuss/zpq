@@ -24,6 +24,11 @@
   10–22% faster on an M5 Pro; Linux is unchanged.
 - **`EXPLAIN` no longer calls local files "remote input" off Linux.**
 - **The Mac archives run on macOS 11.0 and later.** They used to declare the build runner's macOS 15.0.
+- **`REGEXP_REPLACE` and selective `HAVING` are faster.** Anchored patterns made of literals, optional literals, one
+  character-class run and a final `.*$` (the URL-host shape) now compile to a linear matcher instead of the general
+  regex engine; other patterns run as before. A GROUP BY with a selective `HAVING` now drops the failing groups
+  before building their rows, where it used to build every group's row first. ClickBench Q28 is 25–29% faster on a
+  Ryzen 9 9950X, ahead of Polars 2.1.0 (1.73 s against 1.81 s at 16 threads); the rest of ClickBench is unchanged.
 
 ## 0.5.1 (2026-10-31)
 

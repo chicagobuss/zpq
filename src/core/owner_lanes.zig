@@ -549,3 +549,49 @@ test "owner lanes bind unsigned coded payloads with NULL poison and share numeri
     try testing.expectEqual(@as(?i128, 2), g.integer(3));
     try testing.expectEqual(@as(u64, 1), g.first);
 }
+
+/// Exact raw pair images have no payload or ordinal; a later tie pass supplies source order.
+pub fn PairImage(comptime words: usize) type {
+    std.debug.assert(words == 2 or words == 3);
+    return struct {
+        pub const Record = extern struct {
+            image: [words]u32,
+            pub inline fn fromBits(value: u128) @This() {
+                var r: @This() = undefined;
+                inline for (0..words) |i| r.image[i] = @truncate(value >> (i * 32));
+                return r;
+            }
+            pub inline fn bits(r: @This()) u128 {
+                var value: u128 = 0;
+                inline for (0..words) |i| value |= @as(u128, r.image[i]) << (i * 32);
+                return value;
+            }
+            pub fn init(r: @This()) !@This() {
+                return r;
+            }
+            pub fn add(_: *@This(), _: @This()) !void {}
+        };
+        pub const Group = Record;
+        pub inline fn hashRecord(r: Record) u64 {
+            return hashBits(r.bits());
+        }
+        pub inline fn hashGroup(r: Group) u64 {
+            return hashRecord(r);
+        }
+        pub inline fn same(a: Record, b: Group) bool {
+            return std.mem.eql(u32, &a.image, &b.image);
+        }
+    };
+}
+
+test "compact pair images keep exact 64 and 96 bit identities without ordinal padding" {
+    inline for (.{ 2, 3 }) |words| {
+        const L = PairImage(words);
+        try testing.expectEqual(@as(usize, words * 4), @sizeOf(L.Record));
+        const bits: u128 = (@as(u128, 1) << (words * 32)) - 1;
+        const r = L.Record.fromBits(bits);
+        try testing.expectEqual(bits, r.bits());
+        try testing.expect(L.same(r, try L.Group.init(r)));
+        try testing.expect(!L.same(r, L.Record.fromBits(bits - 1)));
+    }
+}

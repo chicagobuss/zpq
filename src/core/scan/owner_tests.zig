@@ -1350,8 +1350,9 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
     @memset(rgs, meta.row_groups.items[0]);
     meta.row_groups.items = rgs;
     meta.num_rows *= 16;
-    const Case = struct { group: ?[]const u8, agg: []const u8, filter: ?[]const u8 = null, top: bool = false };
+    const Case = struct { group: ?[]const u8, agg: []const u8, filter: ?[]const u8 = null, top: bool = false, rank: usize = 2 };
     const cases = [_]Case{
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d", .top = true, .rank = 1 },
         .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c" },
         .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n" },
         .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a", .top = true },
@@ -1379,7 +1380,7 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
             .dense = false,
             .distinct_pairs = .off,
             .plain_rules = false,
-            .result_order = if (c.top) .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 3 } else .{},
+            .result_order = if (c.top) .{ .keys = &.{.{ .column = c.rank, .descending = true }}, .limit = 3 } else .{},
         };
         var want = try runMultiAggregate(gpa, a, args);
         defer want.deinit(gpa);

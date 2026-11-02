@@ -810,6 +810,15 @@ fn pairAnswerBits(
             return null;
         }
     }
+    if (top and calls.len == 1 and keys.len == 1 and cut.?.a_idx == distinct and
+        args.result_order.having == null and args.result_order.hidden.len == 0)
+    {
+        if (@import("../owner_distinct.zig").CompactGeometry.plan(identity)) |geometry| {
+            const reservation = pq.records +| gq.records +| @max(pq.finish, gq.finish);
+            if (geometry.bits <= 64) return compactPairAnswer(2, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, reservation, explain_only);
+            return compactPairAnswer(3, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, reservation, explain_only);
+        }
+    }
     const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);
     const domain_bytes = if (identity.domain) |d| d.bytes else 0;
     const pack_rows = owner_groups.batchRows(null);
@@ -1003,6 +1012,7 @@ const PairCompanions = struct {
     calls: []expr_agg.AggCall,
     states: []expr_agg.Accumulator,
     workers: usize,
+    firsts: []std.atomic.Value(u32) = &.{},
 
     fn init(a: std.mem.Allocator, batch_allocator: std.mem.Allocator, identity: *const key_pack.Plan, keys: []const u128, calls: []const expr_agg.AggCall, workers: usize) !PairCompanions {
         var group_identity = identity.*;
@@ -1046,6 +1056,11 @@ const PairCompanions = struct {
                 if (source.selected) |selection| if (!selection.isActive(row)) continue;
                 const key = try bound.packAs(u128, row);
                 const id = s.pass.index.get(key) orelse continue;
+                if (s.pass.firsts.len != 0) {
+                    const first = std.math.cast(u32, try source.ordinal(row)) orelse return error.BadColumn;
+                    _ = s.pass.firsts[id].fetchMin(first, .monotonic);
+                    continue;
+                }
                 for (s.pass.calls, s.states[id * s.pass.calls.len ..][0..s.pass.calls.len]) |call, *state| {
                     if (call.arg == null) {
                         state.count += 1;
@@ -1103,3 +1118,171 @@ const PairCompanions = struct {
         retained = args.ledger != null;
     }
 };
+
+fn compactPairAnswer(
+    comptime words: usize,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    identity: *const key_pack.Plan,
+    rows: usize,
+    input_rows: usize,
+    workers: usize,
+    cut: CountCut,
+    geometry: @import("../owner_distinct.zig").CompactGeometry,
+    parts: usize,
+    timings: Timings,
+    reservation: usize,
+    comptime explain_only: bool,
+) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
+    if (explain_only) return .{ .layout = .pair_distinct, .reservation = reservation, .partitions = parts };
+    const O = @import("../owner_distinct.zig").Compact(words);
+    const G = O.Groups;
+    const F = @import("../owner_result.zig").Full(G.Group);
+    const T = @import("../owner_result.zig").Top(G.Group, void, struct {
+        fn worse(_: void, a: G.Group, b: G.Group) std.math.Order {
+            return std.math.order(a.integer(0).?, b.integer(0).?);
+        }
+    }.worse);
+    var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    const ledger = args.ledger orelse &private_ledger;
+    var charged: core_memory.Charged = .{ .child = gpa, .budget = ledger };
+    return compactPairRun(O, F, T, gpa, arena, charged.allocator(), ledger, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut, geometry, parts, timings) catch |e| {
+        if (e == error.OutOfMemory and charged.refused.load(.monotonic)) return error.ExceededMemoryBudget;
+        return e;
+    };
+}
+
+fn compactPairRun(
+    comptime O: type,
+    comptime F: type,
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    charged: std.mem.Allocator,
+    ledger: *core_memory.SharedBudget,
+    args: MultiAggArgs,
+    metas: []const schema.FileMetaData,
+    plan: *const agg_plan.Plan,
+    work: []const WorkItem,
+    calls: []const expr_agg.AggCall,
+    keys: []const expr_ast.Expr,
+    outputs: []const BoundOutputColumn,
+    identity: *const key_pack.Plan,
+    rows: usize,
+    input_rows: usize,
+    workers: usize,
+    cut: CountCut,
+    geometry: @import("../owner_distinct.zig").CompactGeometry,
+    parts: usize,
+    timings: Timings,
+) !?MultiAggResult {
+    const state = try O.init(charged, ledger, rows, workers, parts);
+    defer state.deinit();
+    const groups = (try O.Groups.State.init(gpa, ledger, input_rows, rows, workers, parts)) orelse return null;
+    defer groups.deinit();
+    const full = try F.init(gpa, ledger, workers, parts);
+    defer full.deinit();
+    var top = try T.init(gpa, ledger, workers, cut.k, {});
+    defer top.deinit();
+    var temporary = std.heap.ArenaAllocator.init(charged);
+    defer temporary.deinit();
+    const a = temporary.allocator();
+    const starts = try a.alloc(u32, work.len);
+    if (!RecordOrdinals.fill(metas, work, starts)) return error.BadColumn;
+    const sources = try a.alloc(@import("../owner_distinct.zig").Pipeline(u128).Sink.Source, work.len);
+    for (sources, work) |*source, item| source.* = .{ .file = item.file, .rg = item.rg };
+    const adapters = try a.alloc(O.Sink, workers);
+    const sinks = try a.alloc(consumer.RecordSink, workers);
+    const reducers = try a.alloc(O.Reducer, workers);
+    var refused: std.atomic.Value(bool) = .init(false);
+    for (adapters, sinks, reducers, state.locals, groups.locals) |*s, *sink, *r, *local, *gl| {
+        s.* = .{ .local = local, .identity = identity, .sources = sources, .images = try a.alloc(u128, owner_groups.batchRows(null)), .input_rows = input_rows, .refused = &refused };
+        sink.* = .{ .selected = .{ .ctx = s, .startFn = O.Sink.start, .batchFn = O.Sink.batch } };
+        r.* = .{ .local = gl, .geometry = geometry };
+    }
+    const credit = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+    _ = ledger.drawExact(credit) orelse return null;
+    var held: usize = 0;
+    defer ledger.release(credit - held);
+    if (args.taken) |taken| taken.insert(.integer_records);
+    const run = runRecordWorkers(gpa, arena, args, metas, plan, work, calls, keys, sinks, starts, outputs, timings) catch |e| {
+        if (refused.load(.monotonic)) if (args.taken) |taken| taken.remove(.decode_memory);
+        return e;
+    };
+    const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
+    try state.finish(reducers);
+    const Receiver = struct {
+        full: *F.Receiver,
+        top: *T.Receiver,
+        fn receive(r: *@This(), p: usize, complete: []const O.Groups.Group) !void {
+            try r.full.receive(p, complete);
+            try r.top.receive(p, complete);
+        }
+    };
+    const receivers = try a.alloc(Receiver, workers);
+    for (receivers, full.receivers, top.receivers) |*r, *f, *t| r.* = .{ .full = f, .top = t };
+    try groups.finish(receivers, Receiver.receive);
+    const best = top.finish();
+    const floor: i128 = if (best.len < cut.k) 0 else best[best.len - 1].integer(0).?;
+    var candidates: std.ArrayList(O.Groups.Group) = .empty;
+    const l2 = @import("../hw.zig").l2BytesPerWorkerOr(640 << 10);
+    const cap = @max(cut.k, l2 / @sizeOf(O.Groups.Group));
+    for (full.pieces) |piece| for (piece.groups) |g| if (g.integer(0).? >= floor) {
+        // A huge boundary tie privately replays the ordinal-carrying route rather than retaining all groups.
+        if (candidates.items.len == cap) return error.ExceededMemoryBudget;
+        try candidates.append(a, g);
+    };
+    std.mem.sortUnstable(O.Groups.Group, candidates.items, {}, struct {
+        fn less(_: void, x: O.Groups.Group, y: O.Groups.Group) bool {
+            return x.integer(0).? > y.integer(0).?;
+        }
+    }.less);
+    span.end(.merge, profile.args(.{parts}));
+    var tied: std.ArrayList(u128) = .empty;
+    for (candidates.items, 0..) |g, i| {
+        const count = g.integer(0).?;
+        if ((i > 0 and candidates.items[i - 1].integer(0).? == count) or
+            (i + 1 < candidates.items.len and candidates.items[i + 1].integer(0).? == count))
+            try tied.append(a, g.key);
+    }
+    if (tied.items.len != 0) {
+        var pass = try PairCompanions.init(a, charged, identity, tied.items, calls, workers);
+        pass.firsts = try a.alloc(std.atomic.Value(u32), tied.items.len);
+        for (pass.firsts) |*first| first.* = .init(std.math.maxInt(u32));
+        try pass.run(gpa, arena, args, metas, plan, work, keys, starts, outputs, run.timings, ledger);
+        for (candidates.items) |*g| if (pass.index.get(g.key)) |i| {
+            g.first = pass.firsts[i].load(.monotonic);
+        };
+    }
+    const slots = try a.alloc(MergedSlot, candidates.items.len);
+    for (candidates.items, slots, 0..) |g, *slot, i| slot.* = .{ .key = &.{}, .first = g.first, .idx = i };
+    if (!args.unordered) try sortSlotsByFirst(a, slots, workers);
+    const View = struct {
+        groups: []const O.Groups.Group,
+        fn key(ctx: *const anyopaque, i: usize) u128 {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return v.groups[i].key;
+        }
+        fn integer(ctx: *const anyopaque, i: usize, _: usize) anyerror!?i128 {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            return v.groups[i].integer(0);
+        }
+        fn value(ctx: *const anyopaque, _: std.mem.Allocator, i: usize, call: usize) anyerror!AggValue {
+            return .{ .i = (try integer(ctx, i, call)).? };
+        }
+    };
+    const view: View = .{ .groups = candidates.items };
+    var output: AggOutput = .{};
+    errdefer output.deinit(gpa);
+    var output_charge: usize = 0;
+    defer ledger.release(output_charge);
+    var leave = false;
+    return try finishPairOutput(true, .{ .gpa = gpa, .arena = arena, .a = a, .args = args, .metas = metas, .plan = plan, .work = work, .calls = calls, .keys = keys, .outputs = outputs, .identity = identity, .distinct = 0, .workers = workers, .slots = slots, .n = slots.len, .ledger = ledger, .run = run, .names_credit = outputNamesBytes(outputs) }, &view, &output, &output_charge, &held, &leave);
+}

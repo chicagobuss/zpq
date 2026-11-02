@@ -214,3 +214,246 @@ test "owner DISTINCT empty argument axis preserves the full 2^64 group-prefix do
     for ([_]u64{ 0, 1, 1 << 32, std.math.maxInt(u64) }) |id|
         try std.testing.expectEqual(id, prefix.group(id));
 }
+
+/// The range certificate is checked by KeyPlan on every produced batch, including PLAIN fallback pages.
+pub const CompactGeometry = struct {
+    group_bits: u7,
+    value_null: u7,
+    bits: usize,
+    pub fn plan(identity: *const Plan) ?CompactGeometry {
+        if (identity.encoding.source != .raw or identity.fields.len != 2) return null;
+        const g: usize = @as(usize, identity.fields[0].bits) + 1;
+        const v: usize = @as(usize, identity.fields[1].bits) + 1;
+        if (g > 64 or v > 64 or @min(g, v) > 32 or g + v > 96) return null;
+        return .{ .group_bits = @intCast(g), .value_null = @intCast(g + v - 1), .bits = g + v };
+    }
+    pub inline fn group(s: CompactGeometry, image: u128) u64 {
+        return @truncate(image & ((@as(u128, 1) << s.group_bits) - 1));
+    }
+    pub inline fn present(s: CompactGeometry, image: u128) bool {
+        return image & (@as(u128, 1) << s.value_null) == 0;
+    }
+};
+
+/// The two physical image widths share the scatter, exact fold and group-count reduction.
+pub fn Compact(comptime words: usize) type {
+    const L = @import("owner_lanes.zig").PairImage(words);
+    const records = @import("owner_records.zig");
+    const W = records.Writer(L.Record, u32);
+    const Fold = @import("owner_fold.zig").Table(L);
+    return struct {
+        const Self = @This();
+        pub const Groups = owners.Owner(u64, &.{.present_count}, u32);
+        pub const Local = struct {
+            state: *Self,
+            frontier: W.Frontier = .{},
+            accepted: usize = 0,
+            pub fn append(l: *Local, image: u128) !void {
+                if (l.accepted >= l.state.rows) return error.BadPartial;
+                const r = L.Record.fromBits(image);
+                const p: usize = @intCast(L.hashRecord(r) >> l.state.shift);
+                try W.append(&l.frontier, l.state.blocks, &l.state.cursor, p, r);
+                l.accepted += 1;
+            }
+        };
+        a: std.mem.Allocator,
+        ledger: *@import("memory.zig").SharedBudget,
+        rows: usize,
+        parts: usize,
+        shift: u6,
+        locals: []Local = &.{},
+        blocks: []W.Block = &.{},
+        cursor: std.atomic.Value(u32) = .init(0),
+
+        pub fn bytes(rows: usize, workers: usize, parts: usize) usize {
+            return W.blockCount(rows, workers, parts) *| @sizeOf(W.Block) +|
+                W.frontierBytes(workers, parts) +| workers *| @sizeOf(Local) +| @sizeOf(Self);
+        }
+        pub fn init(a: std.mem.Allocator, ledger: *@import("memory.zig").SharedBudget, rows: usize, workers: usize, parts: usize) !*Self {
+            const s = try a.create(Self);
+            s.* = .{ .a = a, .ledger = ledger, .rows = rows, .parts = parts, .shift = @intCast(@as(usize, 64) - std.math.log2_int(usize, parts)) };
+            errdefer s.deinit();
+            s.locals = try a.alloc(Local, workers);
+            for (s.locals) |*l| l.* = .{ .state = s };
+            for (s.locals) |*l| l.frontier = try W.Frontier.init(a, parts);
+            s.blocks = try a.alloc(W.Block, W.blockCount(rows, workers, parts));
+            return s;
+        }
+        pub fn deinit(s: *Self) void {
+            for (s.locals) |l| l.frontier.deinit(s.a);
+            s.a.free(s.locals);
+            s.a.free(s.blocks);
+            s.a.destroy(s);
+        }
+        pub const Reducer = struct {
+            local: *Groups.Local,
+            geometry: CompactGeometry,
+            fn receive(r: *Reducer, pairs: []const L.Group) !void {
+                for (pairs) |pair| try r.local.append(.{
+                    .key = r.geometry.group(pair.bits()),
+                    .ordinal = 0,
+                    .weight = 1,
+                    .values = .{@intFromBool(r.geometry.present(pair.bits()))},
+                });
+            }
+        };
+        pub fn finish(s: *Self, reducers: []Reducer) !void {
+            const stacks = reducers.len *| (1 << 20);
+            _ = s.ledger.drawExact(stacks) orelse return error.ExceededMemoryBudget;
+            defer s.ledger.release(stacks);
+            const Task = struct {
+                state: *Self,
+                cursor: *std.atomic.Value(usize),
+                reducer: *Reducer,
+                err: ?anyerror = null,
+                fn run(t: *@This()) void {
+                    var table: Fold = .{};
+                    defer table.deinit(t.state.a);
+                    while (true) {
+                        const p = t.cursor.fetchAdd(1, .monotonic);
+                        if (p >= t.state.parts) return;
+                        t.fold(&table, p) catch |e| {
+                            t.err = e;
+                            return;
+                        };
+                    }
+                }
+                fn fold(t: *@This(), table: *Fold, p: usize) !void {
+                    var n: usize = 0;
+                    for (t.state.locals) |l| n += l.frontier.histogram[p];
+                    if (n == 0) return;
+                    const l2 = @import("hw.zig").l2BytesPerWorkerOr(640 << 10);
+                    try table.reset(t.state.a, n, @max(1, l2 / (@sizeOf(L.Group) + 8)));
+                    for (t.state.locals) |l| {
+                        var id = l.frontier.heads[p];
+                        while (id != records.none) {
+                            const b = &t.state.blocks[id];
+                            if (b.next != records.none) @prefetch(&t.state.blocks[b.next], .{ .rw = .read, .locality = 1 });
+                            for (b.rows[0..b.len]) |r| try table.append(t.state.a, r);
+                            id = b.next;
+                        }
+                    }
+                    try t.reducer.receive(table.items());
+                }
+            };
+            var cursor: std.atomic.Value(usize) = .init(0);
+            var tasks: [64]Task = undefined;
+            for (tasks[0..reducers.len], reducers) |*t, *r| t.* = .{ .state = s, .cursor = &cursor, .reducer = r };
+            if (reducers.len == 1 or !@import("spawn.zig").runTree(Task, tasks[0..reducers.len], .{ .stack_size = 1 << 20 }, Task.run))
+                tasks[0].run();
+            for (tasks[0..reducers.len]) |t| if (t.err) |e| return e;
+        }
+        pub const Sink = struct {
+            local: *Local,
+            identity: *const Plan,
+            sources: []const Pipeline(u128).Sink.Source,
+            bindings: [2]Plan.Binding = undefined,
+            images: []u128,
+            item: usize = 0,
+            input_rows: usize,
+            refused: *std.atomic.Value(bool),
+            pub fn start(ctx: *anyopaque, _: u64, item: usize) void {
+                const s: *Sink = @ptrCast(@alignCast(ctx));
+                s.item = item;
+            }
+            pub fn batch(ctx: *anyopaque, source: SelectedBatch, lookup: []const ?usize) anyerror!void {
+                const s: *Sink = @ptrCast(@alignCast(ctx));
+                s.produce(source, lookup) catch |e| {
+                    if (e != error.BadKey and e != error.KeyTooWide) return e;
+                    s.refused.store(true, .monotonic);
+                    return error.ExceededMemoryBudget;
+                };
+            }
+            fn produce(s: *Sink, source: SelectedBatch, lookup: []const ?usize) !void {
+                const at = s.sources[s.item];
+                const bound = (try s.identity.bindInto(&s.bindings, source, lookup, at.file, at.rg)) orelse
+                    return error.ExceededMemoryBudget;
+                var start_row: usize = 0;
+                while (start_row < source.batch.num_rows) {
+                    const n = @min(s.images.len, source.batch.num_rows - start_row);
+                    const images = s.images[0..n];
+                    try bound.packWindow(u128, start_row, images);
+                    for (images, 0..) |image, i| {
+                        const row = start_row + i;
+                        if (source.selected) |selected| if (!selected.isActive(row)) continue;
+                        if (try source.ordinal(row) >= s.input_rows) return error.BadColumn;
+                        try s.local.append(image);
+                    }
+                    start_row += n;
+                }
+            }
+        };
+    };
+}
+
+test "compact DISTINCT owners match weighted owners on random uniform skew empty and NULL data" {
+    const a = std.testing.allocator;
+    inline for (.{ 2, 3 }) |words| for (0..5) |mode| for ([_]usize{ 1, 4 }) |workers| {
+        var budget: @import("memory.zig").SharedBudget = .{ .limit = 512 << 20 };
+        defer std.debug.assert(budget.used.load(.monotonic) == 0);
+        var charge: @import("memory.zig").Charged = .{ .child = a, .budget = &budget };
+        const C = Compact(words);
+        const P = Pipeline(u128);
+        const n: usize = if (mode == 2) 0 else 4096;
+        const geometry: CompactGeometry = .{ .group_bits = if (words == 2) 12 else 49, .value_null = if (words == 2) 24 else 66, .bits = if (words == 2) 25 else 67 };
+        const compact = try C.init(charge.allocator(), &budget, n, workers, 64);
+        defer compact.deinit();
+        const groups = (try C.Groups.State.init(a, &budget, n, n, workers, 64)).?;
+        defer groups.deinit();
+        const pairs = (try P.Pairs.State.init(a, &budget, n, n, workers, 64)).?;
+        defer pairs.deinit();
+        const reference = (try P.Groups.State.init(a, &budget, n, n, workers, 64)).?;
+        defer reference.deinit();
+        const mask = (@as(u128, 1) << geometry.group_bits) - 1;
+        const prefix: P.Prefix = .{ .mask = mask };
+        for (0..n) |i| {
+            const random = @import("expr/aggregate/census.zig").splitMix64(i + 91);
+            const g: u128 = if (mode == 3 or i % 19 == 0) @as(u128, 1) << (geometry.group_bits - 1) else if (mode == 0 and i % 4 != 0) 7 else random % 127;
+            const absent = mode == 4 or i % 11 == 0;
+            const v: u128 = if (absent) @as(u128, 1) << geometry.value_null else @as(u128, (random >> 32) % 73) << geometry.group_bits;
+            const image = g | v;
+            try compact.locals[i % workers].append(image);
+            if (absent) try reference.locals[i % workers].append(.{
+                .key = g,
+                .ordinal = @intCast(i),
+                .weight = 1,
+                .values = .{0},
+            }) else try pairs.locals[i % workers].append(.{ .key = image, .ordinal = @intCast(i), .weight = 1 });
+        }
+        var compact_reducers: [4]C.Reducer = undefined;
+        var reference_reducers: [4]P.Reducer = undefined;
+        for (compact_reducers[0..workers], groups.locals) |*r, *local| r.* = .{ .local = local, .geometry = geometry };
+        for (reference_reducers[0..workers], reference.locals) |*r, *local| r.* = .{ .local = local, .prefix = prefix };
+        try compact.finish(compact_reducers[0..workers]);
+        try pairs.finish(reference_reducers[0..workers], P.Reducer.receive);
+        const F = @import("owner_result.zig").Full(C.Groups.Group);
+        const R = @import("owner_result.zig").Full(P.Groups.Group);
+        const actual = try F.init(a, &budget, workers, 64);
+        defer actual.deinit();
+        const expected = try R.init(a, &budget, workers, 64);
+        defer expected.deinit();
+        try groups.finish(actual.receivers, F.Receiver.receive);
+        try reference.finish(expected.receivers, R.Receiver.receive);
+        try std.testing.expectEqual(expected.count(), actual.count());
+        for (actual.pieces) |piece| for (piece.groups) |g| {
+            var found = false;
+            for (expected.pieces) |rp| for (rp.groups) |want| if (want.key == g.key) {
+                try std.testing.expectEqual(want.integer(0), g.integer(0));
+                found = true;
+            };
+            try std.testing.expect(found);
+        };
+    };
+}
+
+test "compact DISTINCT geometry declines a range whose two axes just exceed 32 bits" {
+    const ast = @import("expr/ast.zig");
+    const key: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    var plan = (try Plan.initFields(std.testing.allocator, &.{ key, key }, null, &.{
+        .{ .bits = 32, .signed = true }, .{ .bits = 32, .signed = true },
+    })).?;
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(null, CompactGeometry.plan(&plan));
+    plan.fields[0].bits = 31;
+    try std.testing.expect(CompactGeometry.plan(&plan) != null);
+}

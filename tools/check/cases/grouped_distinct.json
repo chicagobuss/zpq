@@ -1,0 +1,125 @@
+{
+  "fixtures": [
+    {
+      "name": "uniform",
+      "copy": "COPY (SELECT 140737488355328+(CAST(hash(i+17)%100003 AS BIGINT)) AS k, CASE WHEN i%19=0 THEN NULL ELSE CAST(hash(i+29)%100000 AS BIGINT) END AS x,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)"
+    },
+    {
+      "name": "zipf",
+      "copy": "COPY (SELECT 140737488355328+(CASE WHEN i%5<>0 THEN i%13 ELSE CAST(hash(i+17)%100003 AS BIGINT) END) AS k, CASE WHEN i%19=0 THEN NULL ELSE CAST(hash(i+29)%100000 AS BIGINT) END AS x,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)"
+    },
+    {
+      "name": "nullszipf",
+      "copy": "COPY (SELECT CASE WHEN i%10=0 THEN NULL ELSE 140737488355328+(CASE WHEN i%5<>0 THEN i%13 ELSE CAST(hash(i+17)%100003 AS BIGINT) END) END AS k, CASE WHEN i%19=0 THEN NULL ELSE CAST(hash(i+29)%100000 AS BIGINT) END AS x,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)"
+    },
+    {
+      "name": "fallback",
+      "copy": "COPY (SELECT 140737488355328+(CAST(hash(i+17)%100003 AS BIGINT)) AS k, CASE WHEN i%19=0 THEN NULL ELSE 140737488355328+CAST(hash(i+29)%100000 AS BIGINT) END AS x,i AS rid FROM range(1048592) t(i)) TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 65536)"
+    }
+  ],
+  "axes": {
+    "owners": [
+      {
+        "jobs": 1,
+        "force": {
+          "ZPQ_INTEGER_RECORDS": "0",
+          "ZPQ_DISTINCT_PAIRS": "0"
+        }
+      },
+      {
+        "jobs": 1
+      },
+      {
+        "jobs": 4
+      },
+      {
+        "jobs": 4,
+        "force": {
+          "ZPQ_DECODE_BATCH_ROWS": "4096"
+        }
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "grouped-distinct:uniform:plain",
+      "fixture": "uniform",
+      "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:uniform:companions",
+      "fixture": "uniform",
+      "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:zipf:plain",
+      "fixture": "zipf",
+      "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:zipf:companions",
+      "fixture": "zipf",
+      "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:nullszipf:plain",
+      "fixture": "nullszipf",
+      "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:nullszipf:companions",
+      "fixture": "nullszipf",
+      "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:fallback:plain",
+      "fixture": "fallback",
+      "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    },
+    {
+      "id": "grouped-distinct:fallback:companions",
+      "fixture": "fallback",
+      "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC LIMIT 10 OFFSET 2",
+      "axes": "owners",
+      "oracle": {
+        "compare": "ordered",
+        "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
+      }
+    }
+  ]
+}

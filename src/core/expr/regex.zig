@@ -418,8 +418,28 @@ pub const Scratch = struct {
 
     fn tailFacts(s: *Scratch, text: []const u8) TailFacts {
         if (s.tail) |t| if (t.ptr == text.ptr and t.len == text.len) return t.facts;
+        // ASCII proves both UTF-8 validity and newline position in one vector pass. Only the suffix starting at
+        // the first non-ASCII byte needs code-point decoding and the general last-newline scan.
+        const width = std.simd.suggestVectorLength(u8) orelse 1;
+        const V = @Vector(width, u8);
+        var ascii_end: usize = 0;
+        var last_nl: ?usize = null;
+        while (ascii_end + width <= text.len) {
+            const v: V = text[ascii_end..][0..width].*;
+            if (@reduce(.Or, v) >= 0x80) break;
+            if (std.simd.lastTrue(v == @as(V, @splat('\n')))) |at| last_nl = ascii_end + at;
+            ascii_end += width;
+        }
+        while (ascii_end < text.len and text[ascii_end] < 0x80) : (ascii_end += 1) {
+            if (text[ascii_end] == '\n') last_nl = ascii_end;
+        }
+        if (ascii_end == text.len) {
+            const facts: TailFacts = .{ .no_nl_from = if (last_nl) |nl| nl + 1 else 0, .valid_from = 0 };
+            s.tail = .{ .ptr = text.ptr, .len = text.len, .facts = facts };
+            return facts;
+        }
         var valid_from: usize = 0;
-        var i: usize = 0;
+        var i: usize = ascii_end;
         while (i < text.len) {
             const d = decode(text, i);
             i += d.len;
@@ -1564,5 +1584,31 @@ test "linear regexp: long strings agree with the Pike VM and preserve fallback b
         try expectLinearParity(rep, try std.mem.concat(a, u8, &.{ text, "\n" }));
         text[0] = 0xff;
         try expectLinearParity(rep, text);
+    }
+}
+
+test "regexp tailFacts: vector ASCII scan agrees with scalar UTF-8 and newline facts" {
+    var random = std.Random.DefaultPrng.init(0xfa1928);
+    const rng = random.random();
+    var scratch = Scratch.init(testing.allocator);
+    defer scratch.deinit();
+    var text: [257]u8 = undefined;
+    for (0..3000) |trial| {
+        const len = trial % text.len;
+        rng.bytes(text[0..len]);
+        if (trial % 2 == 0) for (text[0..len]) |*b| {
+            b.* &= 0x7f;
+        };
+        var expected: Scratch.TailFacts = .{ .no_nl_from = 0, .valid_from = 0 };
+        var i: usize = 0;
+        while (i < len) {
+            const d = decode(text[0..len], i);
+            if (text[i] == '\n') expected.no_nl_from = i + 1;
+            i += d.len;
+            if (d.cp == invalid_cp) expected.valid_from = i;
+        }
+        scratch.tail = null;
+        try testing.expectEqualDeep(expected, scratch.tailFacts(text[0..len]));
+        try testing.expectEqualDeep(expected, scratch.tailFacts(text[0..len]));
     }
 }

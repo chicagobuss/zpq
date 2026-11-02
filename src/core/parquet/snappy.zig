@@ -458,7 +458,6 @@ test "snappy compress repetitive" {
 
 test "snappy compress sparse-bool-like pattern roundtrip" {
     // Mirrors the bool_sparse output: mostly-zero bit-packed bytes.
-    // This is what fails when read by pyarrow against our /tmp/snappy_out.
     const allocator = std.testing.allocator;
 
     // Build a 3266-byte payload that looks like our def-prefix + values:

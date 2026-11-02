@@ -115,7 +115,7 @@ and dictionaries) in the unit and Lambda integration tests."""
 
 
 def census(out_dir):
-    """the near-unique GROUP BY fixture for the census top-k tests in src/core/scan.zig."""
+    """the near-unique GROUP BY fixture for the census top-k tests in src/core/scan/."""
     ROWS_PER_GROUP = 1000
     GROUPS = 8
     OUT = out_dir / "census_topk.parquet"
@@ -190,7 +190,7 @@ def count_certificate(out_dir):
 
 
 def decimal_exact(out_dir):
-    """the fixture for the exact-DECIMAL tests in src/core/scan.zig."""
+    """the fixture for the exact-DECIMAL tests in src/core/scan/."""
     D = decimal.Decimal
     ROWS_PER_GROUP = 100
     GROUPS = 3
@@ -234,7 +234,7 @@ def dotted_twin(out_dir):
 
 
 def full_match(out_dir):
-    """the fixture for the full-match (filter-only column skip) tests in src/core/scan.zig."""
+    """the fixture for the full-match (filter-only column skip) tests in src/core/scan/."""
     ROWS_PER_GROUP = 200
     GROUPS = 8
     OUT = out_dir / "full_match.parquet"
@@ -274,7 +274,7 @@ def json_escape(out_dir):
 
 
 def list_int64(out_dir):
-    """the LIST fixture for the repeated-leaf refusal tests in src/core/scan.zig."""
+    """the LIST fixture for the repeated-leaf refusal tests in src/core/scan/."""
     OUT = out_dir / "list_int64.parquet"
     t = pa.table({"id": pa.array(range(6), pa.int64()),
                   "l": pa.array([[1, 2], [], None, [None], [3], [4, 5, 6]], pa.list_(pa.int64()))})
@@ -282,7 +282,7 @@ def list_int64(out_dir):
 
 
 def many_tiny(out_dir):
-    """the many-tiny-row-groups fixture for the write property test in src/engine.zig."""
+    """the many-tiny-row-groups fixture for the write property test in src/engine/."""
     ROWS_PER_GROUP = 4
     GROUPS = 512
     OUT = out_dir / "many_tiny.parquet"
@@ -298,7 +298,7 @@ def many_tiny(out_dir):
 
 
 def min_fill(out_dir):
-    """the fixture for the page min-fill tests in src/core/scan.zig."""
+    """the fixture for the page min-fill tests in src/core/scan/."""
     ROWS = 1000
     OUT = out_dir / "min_fill_or.parquet"
     i = list(range(ROWS))
@@ -322,7 +322,7 @@ def min_fill(out_dir):
 
 
 def mixed_codec(out_dir):
-    """the mixed-codec fixture for the windowed S3 write tests in src/engine.zig."""
+    """the mixed-codec fixture for the windowed S3 write tests in src/engine/."""
     ROWS_PER_GROUP = 8000
     GROUPS = 6
     OUT = out_dir / "mixed_codec.parquet"
@@ -420,7 +420,7 @@ def nested_key(out_dir):
 
 
 def null_pages(out_dir):
-    """the fixture for the all-null page tests in src/core/scan.zig."""
+    """the fixture for the all-null page tests in src/core/scan/."""
     ROWS = 2000
     OUT = out_dir / "null_pages.parquet"
     def v_of(i: int) -> int | None:
@@ -436,7 +436,7 @@ def null_pages(out_dir):
 
 
 def overflow_rows(out_dir):
-    """the fixture for the 'only a consumed row can overflow' tests in src/engine.zig."""
+    """the fixture for the 'only a consumed row can overflow' tests in src/engine/."""
     ROWS = 1000
     FAULT = 500
     OUT = out_dir / "overflow_rows.parquet"
@@ -519,7 +519,7 @@ def spawn_budget(out_dir):
 
 
 def topk(out_dir):
-    """the skewed GROUP BY fixture for the top-k merge tests in src/core/scan.zig."""
+    """the skewed GROUP BY fixture for the top-k merge tests in src/core/scan/."""
     ROWS_PER_GROUP = 1250
     GROUPS = 16
     OUT = out_dir / "topk_skew.parquet"
@@ -546,7 +546,7 @@ def topk(out_dir):
 
 
 def topn_budget(out_dir):
-    """the fixtures for the parallel plain-row Top-N's memory budget (src/engine.zig), after a review repro."""
+    """the fixtures for the parallel plain-row Top-N's memory budget (src/engine/), after a review repro."""
     DIR = out_dir
     n = 80
     pq.write_table(pa.table({"id": range(n), "s": ["" if i % 7 == 0 else f"z{i:05d}" for i in range(n)],
@@ -569,7 +569,7 @@ kept-key memory under its budget)."""
 
 
 def topn_gather(out_dir):
-    """the fixtures for the parallel plain-row Top-N and its winner gather (src/engine.zig, src/core/consumer.zig)."""
+    """the fixtures for the parallel plain-row Top-N and its winner gather (src/engine/, src/core/consumer/)."""
     ROWS = 3000
     DIR = out_dir
     def table(file: int) -> pa.Table:

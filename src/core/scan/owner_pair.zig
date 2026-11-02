@@ -1035,6 +1035,18 @@ const PairCompanions = struct {
         return c.states[c.index.get(key).? * c.calls.len + call];
     }
 
+    fn prefixMayImprove(c: *const PairCompanions, base: u64) bool {
+        for (c.firsts) |first| if (first.load(.monotonic) > base) return true;
+        return false;
+    }
+
+    fn firstRow(c: *PairCompanions, id: usize, ordinal: u32, contiguous: bool) bool {
+        _ = c.firsts[id].fetchMin(ordinal, .monotonic);
+        if (!contiguous) return false;
+        // Gathered rows may arrive out of source order. Only a contiguous suffix proves no later row is earlier.
+        return !c.prefixMayImprove(ordinal);
+    }
+
     const Sink = struct {
         pass: *PairCompanions,
         states: []expr_agg.Accumulator,
@@ -1046,6 +1058,8 @@ const PairCompanions = struct {
         }
         fn batch(ctx: *anyopaque, source: consumer.SelectedBatch, lookup: []const ?usize) anyerror!void {
             const s: *Sink = @ptrCast(@alignCast(ctx));
+            try source.validate();
+            if (s.pass.firsts.len != 0 and !s.pass.prefixMayImprove(source.input_base)) return;
             var temporary = std.heap.ArenaAllocator.init(s.pass.batch_allocator);
             defer temporary.deinit();
             const a = temporary.allocator();
@@ -1058,7 +1072,7 @@ const PairCompanions = struct {
                 const id = s.pass.index.get(key) orelse continue;
                 if (s.pass.firsts.len != 0) {
                     const first = std.math.cast(u32, try source.ordinal(row)) orelse return error.BadColumn;
-                    _ = s.pass.firsts[id].fetchMin(first, .monotonic);
+                    if (s.pass.firstRow(id, first, source.input_rows == null)) return;
                     continue;
                 }
                 for (s.pass.calls, s.states[id * s.pass.calls.len ..][0..s.pass.calls.len]) |call, *state| {
@@ -1185,7 +1199,9 @@ fn compactPairRun(
 ) !?MultiAggResult {
     const state = try O.init(charged, ledger, rows, workers, parts);
     defer state.deinit();
-    const groups = (try O.Groups.State.init(gpa, ledger, input_rows, rows, workers, parts)) orelse return null;
+    const groups = (try O.Groups.State.init(gpa, ledger, input_rows, rows, workers, parts)) orelse {
+        return null;
+    };
     defer groups.deinit();
     const full = try F.init(gpa, ledger, workers, parts);
     defer full.deinit();
@@ -1244,6 +1260,17 @@ fn compactPairRun(
             return x.integer(0).? > y.integer(0).?;
         }
     }.less);
+    if (std.c.getenv("ZPQ_CD_TRACE")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+        var records: usize = 0;
+        var hits: usize = 0;
+        var bypass: usize = 0;
+        for (state.locals) |local| {
+            for (local.frontier.histogram) |count| records += count;
+            hits += local.hits;
+            bypass += @intFromBool(local.bypass);
+        }
+        std.debug.print("distinct pairs: records={d} trial_hits={d} bypass_workers={d}\n", .{ records, hits, bypass });
+    };
     span.end(.merge, profile.args(.{parts}));
     var tied: std.ArrayList(u128) = .empty;
     for (candidates.items, 0..) |g, i| {
@@ -1253,17 +1280,34 @@ fn compactPairRun(
             try tied.append(a, g.key);
     }
     if (tied.items.len != 0) {
-        var pass = try PairCompanions.init(a, charged, identity, tied.items, calls, workers);
+        var pass = try PairCompanions.init(a, charged, identity, tied.items, calls, 1);
         pass.firsts = try a.alloc(std.atomic.Value(u32), tied.items.len);
         for (pass.firsts) |*first| first.* = .init(std.math.maxInt(u32));
-        try pass.run(gpa, arena, args, metas, plan, work, keys, starts, outputs, run.timings, ledger);
+        const order = try a.alloc(usize, work.len);
+        for (order, 0..) |*item, i| item.* = i;
+        std.mem.sortUnstable(usize, order, starts, struct {
+            fn less(ordinals: []const u32, x: usize, y: usize) bool {
+                return ordinals[x] < ordinals[y];
+            }
+        }.less);
+        // Once every first occurrence is in this source prefix, later work cannot improve an ordinal.
+        for (order) |item| {
+            try pass.run(gpa, arena, args, metas, plan, work[item..][0..1], keys, starts[item..][0..1], outputs, run.timings, ledger);
+            const complete = complete: {
+                for (pass.firsts) |first| if (first.load(.monotonic) == std.math.maxInt(u32)) break :complete false;
+                break :complete true;
+            };
+            if (complete) break;
+        }
+        for (pass.firsts) |first| if (first.load(.monotonic) == std.math.maxInt(u32))
+            return error.ExceededMemoryBudget;
         for (candidates.items) |*g| if (pass.index.get(g.key)) |i| {
             g.first = pass.firsts[i].load(.monotonic);
         };
     }
     const slots = try a.alloc(MergedSlot, candidates.items.len);
     for (candidates.items, slots, 0..) |g, *slot, i| slot.* = .{ .key = &.{}, .first = g.first, .idx = i };
-    if (!args.unordered) try sortSlotsByFirst(a, slots, workers);
+    try sortSlotsByFirst(a, slots, workers);
     const View = struct {
         groups: []const O.Groups.Group,
         fn key(ctx: *const anyopaque, i: usize) u128 {
@@ -1285,4 +1329,20 @@ fn compactPairRun(
     defer ledger.release(output_charge);
     var leave = false;
     return try finishPairOutput(true, .{ .gpa = gpa, .arena = arena, .a = a, .args = args, .metas = metas, .plan = plan, .work = work, .calls = calls, .keys = keys, .outputs = outputs, .identity = identity, .distinct = 0, .workers = workers, .slots = slots, .n = slots.len, .ledger = ledger, .run = run, .names_credit = outputNamesBytes(outputs) }, &view, &output, &output_charge, &held, &leave);
+}
+
+test "compact tied prefix keeps original minima across reordered gathered batches" {
+    var firsts = [_]std.atomic.Value(u32){ .init(std.math.maxInt(u32)), .init(std.math.maxInt(u32)) };
+    var pass: PairCompanions = undefined;
+    pass.firsts = &firsts;
+    try std.testing.expect(!pass.firstRow(0, 9, false));
+    try std.testing.expect(!pass.firstRow(1, 2, false));
+    try std.testing.expect(!pass.firstRow(0, 7, false));
+    try std.testing.expect(!pass.firstRow(1, 0, false));
+    try std.testing.expectEqual(@as(u32, 7), firsts[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), firsts[1].load(.monotonic));
+    try std.testing.expect(pass.prefixMayImprove(0));
+    try std.testing.expect(!pass.prefixMayImprove(8));
+    try std.testing.expect(!pass.firstRow(1, 0, true));
+    try std.testing.expect(pass.firstRow(0, 1, true));
 }

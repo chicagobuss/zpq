@@ -573,7 +573,8 @@ pub fn PairImage(comptime words: usize) type {
         };
         pub const Group = Record;
         pub inline fn hashRecord(r: Record) u64 {
-            return hashBits(r.bits());
+            // Packed value bits may sit above the probe index; avalanche before selecting any slot bits.
+            return @import("expr/aggregate/census.zig").splitMix64(hashBits(r.bits()));
         }
         pub inline fn hashGroup(r: Group) u64 {
             return hashRecord(r);

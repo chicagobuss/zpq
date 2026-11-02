@@ -224,7 +224,7 @@ pub const CompactGeometry = struct {
         if (identity.encoding.source != .raw or identity.fields.len != 2) return null;
         const g: usize = @as(usize, identity.fields[0].bits) + 1;
         const v: usize = @as(usize, identity.fields[1].bits) + 1;
-        if (g > 64 or v > 64 or @min(g, v) > 32 or g + v > 96) return null;
+        if (g > 64 or v > 65 or @min(g, v) > 32 or g + v > 96) return null;
         return .{ .group_bits = @intCast(g), .value_null = @intCast(g + v - 1), .bits = g + v };
     }
     pub inline fn group(s: CompactGeometry, image: u128) u64 {
@@ -248,12 +248,33 @@ pub fn Compact(comptime words: usize) type {
             state: *Self,
             frontier: W.Frontier = .{},
             accepted: usize = 0,
+            recent: []L.Record = &.{},
+            valid: []u64 = &.{},
+            seen: usize = 0,
+            hits: usize = 0,
+            bypass: bool = false,
             pub fn append(l: *Local, image: u128) !void {
                 if (l.accepted >= l.state.rows) return error.BadPartial;
-                const r = L.Record.fromBits(image);
-                const p: usize = @intCast(L.hashRecord(r) >> l.state.shift);
-                try W.append(&l.frontier, l.state.blocks, &l.state.cursor, p, r);
                 l.accepted += 1;
+                const r = L.Record.fromBits(image);
+                const hash = L.hashRecord(r);
+                const p: usize = @intCast(hash >> l.state.shift);
+                if (l.bypass or l.recent.len == 0) return W.append(&l.frontier, l.state.blocks, &l.state.cursor, p, r);
+                const at: usize = @as(usize, @truncate(hash)) & (l.recent.len - 1);
+                const bit = @as(u64, 1) << @as(u6, @intCast(at % 64));
+                const hit = l.valid[at / 64] & bit != 0 and L.same(r, l.recent[at]);
+                if (!hit) {
+                    try W.append(&l.frontier, l.state.blocks, &l.state.cursor, p, r);
+                    // A cache hit can only suppress a pair this worker has already scattered.
+                    l.recent[at] = r;
+                    l.valid[at / 64] |= bit;
+                }
+                if (l.seen < l.recent.len * 4) {
+                    l.seen += 1;
+                    l.hits += @intFromBool(hit);
+                    // Stop paying random lookups when the sample saves little scatter and fold traffic.
+                    if (l.seen == l.recent.len * 4 and l.hits * 3 < l.seen / 3) l.bypass = true;
+                }
             }
         };
         a: std.mem.Allocator,
@@ -276,11 +297,25 @@ pub fn Compact(comptime words: usize) type {
             s.locals = try a.alloc(Local, workers);
             for (s.locals) |*l| l.* = .{ .state = s };
             for (s.locals) |*l| l.frontier = try W.Frontier.init(a, parts);
+            const enabled = if (std.c.getenv("ZPQ_CD_REPEAT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+            if (enabled) {
+                const l2 = @import("hw.zig").l2BytesPerWorkerOr(640 << 10);
+                const slots = std.math.floorPowerOfTwo(usize, @max(1, l2 / (2 * @sizeOf(L.Record))));
+                for (s.locals) |*local| {
+                    local.recent = try a.alloc(L.Record, slots);
+                    local.valid = try a.alloc(u64, (slots + 63) / 64);
+                    @memset(local.valid, 0);
+                }
+            }
             s.blocks = try a.alloc(W.Block, W.blockCount(rows, workers, parts));
             return s;
         }
         pub fn deinit(s: *Self) void {
-            for (s.locals) |l| l.frontier.deinit(s.a);
+            for (s.locals) |l| {
+                l.frontier.deinit(s.a);
+                s.a.free(l.recent);
+                s.a.free(l.valid);
+            }
             s.a.free(s.locals);
             s.a.free(s.blocks);
             s.a.destroy(s);
@@ -456,4 +491,33 @@ test "compact DISTINCT geometry declines a range whose two axes just exceed 32 b
     try std.testing.expectEqual(null, CompactGeometry.plan(&plan));
     plan.fields[0].bits = 31;
     try std.testing.expect(CompactGeometry.plan(&plan) != null);
+}
+
+test "compact pair geometry keeps full i64 extrema and the NULL tag beside a narrow group" {
+    const ast = @import("expr/ast.zig");
+    const a = std.testing.allocator;
+    const axes = [_]ast.Expr{
+        .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } },
+        .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } },
+    };
+    var plan = (try Plan.initFields(a, &axes, null, &.{
+        .{ .bits = 18, .signed = true }, .{ .bits = 64, .signed = true },
+    })).?;
+    defer plan.deinit(a);
+    const geometry = CompactGeometry.plan(&plan).?;
+    try std.testing.expectEqual(@as(usize, 84), geometry.bits);
+    const batch: @import("filter/eval.zig").Batch = .{ .num_rows = 3, .cols = &.{
+        .{ .i64 = .{ .values = &.{ 7, undefined, -1 }, .def_levels = &.{ 1, 0, 1 }, .max_def = 1 } },
+        .{ .i64 = .{ .values = &.{ std.math.minInt(i64), std.math.maxInt(i64), undefined }, .def_levels = &.{ 1, 1, 0 }, .max_def = 1 } },
+    } };
+    var bindings: [2]Plan.Binding = undefined;
+    const bound = (try plan.bindInto(&bindings, .{ .batch = &batch }, &.{ 0, 1 }, 0, 0)).?;
+    var images: [3]u128 = undefined;
+    try bound.packWindow(u128, 0, &images);
+    const R = @import("owner_lanes.zig").PairImage(3).Record;
+    for (images, 0..) |image, row| {
+        try std.testing.expectEqual(image, R.fromBits(image).bits());
+        try std.testing.expectEqual(row != 2, geometry.present(image));
+    }
+    try std.testing.expectEqual(@as(u64, 1) << 18, geometry.group(images[1]));
 }

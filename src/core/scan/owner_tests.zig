@@ -1385,7 +1385,9 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
         var want = try runMultiAggregate(gpa, a, args);
         defer want.deinit(gpa);
         try want.output.applyResultOrder(gpa, args.result_order);
-        for ([_]bool{ false, true }) |raw| for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+        for ([_]bool{ false, true }) |raw| for ([_]usize{ 1, 16 }) |j| for ([_]usize{ 0, 64 }) |window| for ([_]bool{ false, true }) |unordered| {
+            if (unordered and (!c.top or c.rank != 1)) continue;
+            args.unordered = unordered;
             if (raw and (c.group == null or std.mem.indexOf(u8, c.group.?, "s") != null)) continue;
             args.ndv_union = !raw;
             var taken: std.EnumSet(FastPath) = .{};

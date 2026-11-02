@@ -1318,22 +1318,25 @@ fn evalRegexpReplace(
     var bytes: std.ArrayList(u8) = .empty;
     const inputs = if (s.codes != null) s.dict else s.values;
     // Ends in `bytes` of each replaced text, recorded as offsets because the buffer moves as it grows.
-    const ends = try arena.alloc(?[2]usize, inputs.len);
+    const ends = try arena.alloc(regex.Replace.Result, inputs.len);
     // Neighbouring rows often repeat a text (a visit's hits share a Referer), so the last one's answer is kept.
     var last: ?usize = null;
     for (inputs, ends, 0..) |text, *end, i| {
-        end.* = null;
+        end.* = .unchanged;
         if (s.codes == null and (rowIsNull(col, i) or (batch.sel != null and !batch.sel.?.isActive(i)))) continue;
         if (last) |l| if (std.mem.eql(u8, inputs[l], text)) {
             end.* = ends[l];
             continue;
         };
         last = i;
-        const start = bytes.items.len;
-        if (try replace.apply(&scratch, &bytes, text)) end.* = .{ start, bytes.items.len };
+        end.* = try replace.applyBorrowing(&scratch, &bytes, text);
     }
     const mapped = try arena.alloc([]const u8, inputs.len);
-    for (inputs, ends, mapped) |text, end, *m| m.* = if (end) |e| bytes.items[e[0]..e[1]] else text;
+    for (inputs, ends, mapped) |text, end, *m| m.* = switch (end) {
+        .unchanged => text,
+        .borrowed => |view| view,
+        .built => |bounds| bytes.items[bounds[0]..bounds[1]],
+    };
     const values = if (s.codes) |codes| blk: {
         const out = try arena.alloc([]const u8, codes.len);
         for (codes, out) |code, *o| o.* = if (code < mapped.len) mapped[code] else "";

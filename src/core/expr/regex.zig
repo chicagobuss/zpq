@@ -77,6 +77,7 @@ pub const Regex = struct {
     prefix: []const u8,
     /// Every match starts at the text's start.
     anchored: bool,
+    linear: ?@import("regex_linear.zig").Plan = null,
 
     pub const Flags = struct {
         case_insensitive: bool = false,
@@ -96,13 +97,14 @@ pub const Regex = struct {
         try c.emit(.{ .save = 1 });
         try c.emit(.match);
         c.markRests();
-        const re: Regex = .{
+        var re: Regex = .{
             .insts = c.insts.items,
             .classes = c.classes.items,
             .groups = p.groups + 1,
             .prefix = try c.literalPrefix(),
             .anchored = c.insts.items.len > 1 and std.meta.eql(c.insts.items[1], .{ .assert = .begin_text }),
         };
+        re.linear = try @import("regex_linear.zig").Plan.compile(arena, &re);
         return re;
     }
 
@@ -113,6 +115,7 @@ pub const Regex = struct {
         // A search from 0 starts a new text; later ones (a global replace's) continue the same one.
         if (from == 0) s.tail = null;
         if (re.anchored and from != 0) return false;
+        if (from == 0) if (re.linear) |plan| if (plan.find(text, caps)) |matched| return matched;
         if ((text.len + 1) * re.insts.len <= bitstate_max_bits) return re.bitState(s, text, from, caps);
         return re.pike(s, text, from, caps);
     }
@@ -1121,6 +1124,27 @@ pub const Replace = struct {
         return .{ .re = re, .pieces = pieces.items, .global = global };
     }
 
+    pub const Result = union(enum) {
+        unchanged,
+        borrowed: []const u8,
+        built: [2]usize,
+    };
+
+    /// The compiled linear form spans the text. A bare capture replacement can borrow its input until the
+    /// consumer inserts the key; built results use offsets because the shared byte buffer can move.
+    pub fn applyBorrowing(r: *const Replace, s: *Scratch, out: *std.ArrayList(u8), text: []const u8) Error!Result {
+        if (r.re.linear != null and r.pieces.len == 1 and r.pieces[0] == .group) {
+            try s.match.resize(s.gpa, 2 * r.re.groups);
+            const caps = s.match.items;
+            if (!try r.re.find(s, text, 0, caps)) return .unchanged;
+            const group = r.pieces[0].group;
+            return .{ .borrowed = if (caps[2 * group]) |a| text[a..caps[2 * group + 1].?] else "" };
+        }
+        const start = out.items.len;
+        if (!try r.apply(s, out, text)) return .unchanged;
+        return .{ .built = .{ start, out.items.len } };
+    }
+
     /// Append `text` with its matches replaced to `out` and return true; or return false, appending nothing, when
     /// nothing matched (the answer is `text` itself).
     pub fn apply(r: *const Replace, s: *Scratch, out: *std.ArrayList(u8), text: []const u8) Error!bool {
@@ -1406,4 +1430,139 @@ test "the `.*$` shortcut reads each text's tail facts once" {
     const got = try replaced(".*$", "X", "", text);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("\nX", got[got.len - 2 ..]);
+}
+
+fn expectLinearParity(rep: Replace, text: []const u8) !void {
+    var slow = rep;
+    slow.re.linear = null;
+    var scratch = Scratch.init(testing.allocator);
+    defer scratch.deinit();
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(testing.allocator);
+    if (!try slow.apply(&scratch, &expected, text)) try expected.appendSlice(testing.allocator, text);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    const result = try rep.applyBorrowing(&scratch, &out, text);
+    const actual = switch (result) {
+        .unchanged => text,
+        .borrowed => |bytes| bytes,
+        .built => |bounds| out.items[bounds[0]..bounds[1]],
+    };
+    try testing.expectEqualStrings(expected.items, actual);
+    out.clearRetainingCapacity();
+    if (!try rep.apply(&scratch, &out, text)) try out.appendSlice(testing.allocator, text);
+    try testing.expectEqualStrings(expected.items, out.items);
+    const a = try testing.allocator.alloc(?usize, 2 * rep.re.groups);
+    defer testing.allocator.free(a);
+    const b = try testing.allocator.alloc(?usize, a.len);
+    defer testing.allocator.free(b);
+    const matched = try slow.re.find(&scratch, text, 0, a);
+    try testing.expectEqual(matched, try rep.re.find(&scratch, text, 0, b));
+    if (matched) try testing.expectEqualSlices(?usize, a, b);
+}
+
+test "linear regexp: random compiled patterns and strings have VM-identical captures and replacements" {
+    var random = std.Random.DefaultPrng.init(0x1679fa);
+    const rng = random.random();
+    const prefixes = [_][]const u8{ "p:", "asset://", "雪", "" };
+    const options = [_][]const u8{ "a?", "(?:ab)?", "é?", "" };
+    const runs = [_][]const u8{ "([^/]*)", "([^/]+)", "([ab]*)", "([ab]+)" };
+    const texts = [_][]const u8{
+        "",            "p:/",      "p:a/x",    "p:abab/x",
+        "asset://é/雪",
+        "雪ab/雪",
+        "雪é/",
+        "p:a/\n",      "p:\na/",   "p:a/\x80", "\xff/x",
+        "p:\x00/\x00", "no match",
+    };
+    for (0..96) |_| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const prefix = prefixes[rng.uintLessThan(usize, prefixes.len)];
+        const opt = options[rng.uintLessThan(usize, options.len)];
+        const run = runs[rng.uintLessThan(usize, runs.len)];
+        const pattern = try std.fmt.allocPrint(a, "^{s}{s}{s}/(.*)$", .{ prefix, opt, run });
+        for ([_][]const u8{ "\\1", "[\\1]\\2", "\\0", "" }) |replacement| {
+            const rep = try Replace.compile(a, pattern, replacement, if (rng.boolean()) "g" else "");
+            try testing.expect(rep.re.linear != null);
+            for (texts) |text| try expectLinearParity(rep, text);
+            for (0..48) |i| {
+                var body: [128]u8 = undefined;
+                const len = rng.uintLessThan(usize, body.len);
+                if (i % 2 == 0) rng.bytes(body[0..len]) else {
+                    for (body[0..len]) |*byte| byte.* = "aab/\n"[rng.uintLessThan(usize, 5)];
+                }
+                const text = try std.mem.concat(a, u8, &.{ prefix, body[0..len], "/雪" });
+                try expectLinearParity(rep, text);
+            }
+        }
+    }
+}
+
+test "linear regexp: outside programs are rejected and optional backtracking uses the VM" {
+    const outside = [_][]const u8{
+        "a([^/]*)/.*$",          "^a([^/]*?)/.*$", "^a([^/]*)x.*$",     "^(a|b)([^/]*)/.*$",
+        "^a([é]*)/.*$",
+        "^a([^/]*):([^/]*)/.*$", "^a([^/]*)/.*",   "^a([^/]*)/$",       "^a(.)/.*$",
+        "^(?i:a)([^/]*)/.*$",    "^a(?:b)*/.*$",   "(?m)^a([^/]*)/.*$",
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (outside) |pattern| {
+        const rep = try Replace.compile(a, pattern, "\\0", "g");
+        try testing.expect(rep.re.linear == null);
+        for ([_][]const u8{ "ab/雪", "aé/x", "a/a/", "a/\n", "" }) |text|
+            try expectLinearParity(rep, text);
+    }
+    for ([_][]const u8{ q28, "^a?ab([^:]*)\\:.*$", "^()([^/]*)/(.*)$", "^([^\\x00-\\x7f]*)/(.*)$" }) |pattern| {
+        const rep = try Replace.compile(a, pattern, "\\1[\\0]", "g");
+        try testing.expect(rep.re.linear != null);
+        for ([_][]const u8{
+            "http://www./x", "http://www.a/b", "http://a/b\n",
+            "https://é/雪",
+            "ab:tail",       "aab:tail",       "/",
+            "a/雪",
+            "http://a/\xff", "",
+        }) |text| try expectLinearParity(rep, text);
+    }
+}
+
+fn fuzzLinear(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [2048]u8 = undefined;
+    const text = buf[0..smith.slice(&buf)];
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ q28, "^a?ab([^:]*)\\:.*$", "^()([^/]*)/(.*)$", "^([^\\x00-\\x7f]*)/(.*)$", "^é?([ab]*)/.*$" }) |pattern|
+        try expectLinearParity(try Replace.compile(a, pattern, "\\1[\\0]", "g"), text);
+}
+
+test "fuzz: linear regexp agrees with the general engine" {
+    try testing.fuzz({}, fuzzLinear, .{ .corpus = &.{
+        "http://www.a/b", "http://www./x",
+        "http://é/雪",
+        "http://a/b\n",   "http://a/\xff",
+        "aab:tail",       "ab:tail",
+        "",
+    } });
+}
+
+test "linear regexp: long strings agree with the Pike VM and preserve fallback bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "\\1", "\\1[\\2]" }) |replacement| {
+        const rep = try Replace.compile(a, "^([^/]*)/(.*)$", replacement, "g");
+        const n = Regex.bitstate_max_bits / rep.re.insts.len + 1;
+        const text = try a.alloc(u8, n + 4);
+        @memset(text, 'a');
+        text[n] = '/';
+        @memcpy(text[n + 1 ..], "雪");
+        try expectLinearParity(rep, text);
+        try expectLinearParity(rep, try std.mem.concat(a, u8, &.{ text, "\n" }));
+        text[0] = 0xff;
+        try expectLinearParity(rep, text);
+    }
 }

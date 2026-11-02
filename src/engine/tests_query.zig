@@ -1302,3 +1302,84 @@ test "oom sweep string groups" {
 test "oom sweep explain" {
     try OomSweep.sweep(.explain);
 }
+
+test "DISTINCT second passes survive cold auto pread and uring readers on a large file" {
+    if (@import("builtin").os.tag != .linux) return;
+    const gpa = std.testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/distinct-readers.parquet", .{tmp.sub_path}, 0);
+    const fd = try local_fs.createFile(path);
+    defer local_fs.close(fd);
+    const FileSink = struct {
+        fd: local_fs.fd_t,
+        fn write(ctx: *anyopaque, bytes: []const u8) !void {
+            const sink: *@This() = @ptrCast(@alignCast(ctx));
+            try local_fs.writeAll(sink.fd, bytes);
+        }
+    };
+    var sink: FileSink = .{ .fd = fd };
+    var file = try consumer.AggregateFile.init(a, .{ .ctx = &sink, .write_fn = FileSink.write });
+    defer file.deinit();
+    const n = 65536;
+    const k = try a.alloc(i64, n);
+    const v = try a.alloc(i64, n);
+    const x = try a.alloc(i64, n);
+    const defs = try a.alloc(u32, n);
+    const cols = [_]@import("../core/expr/agg.zig").OutputCol{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = k, .def_levels = defs, .max_def = 1 } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = v } } },
+        .{ .name = "x", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = x } } },
+    };
+    for (0..64) |rg| {
+        for (k, v, x, defs, 0..) |*key, *value, *other, *def, i| {
+            const row = rg * n + i;
+            const hash = @import("../core/expr/aggregate/census.zig").splitMix64(row);
+            key.* = if (rg == 63) @intCast(i % 12) else @intCast(1000 + hash % 50000);
+            value.* = @intCast(i % (if (rg == 63) @as(usize, 1000) else 17));
+            other.* = @bitCast(hash);
+            def.* = @intFromBool(row % 997 != 0);
+        }
+        try file.append(&cols, n, .UNCOMPRESSED, .{}, .{ .workers = 1 });
+    }
+    _ = try file.finish(&cols);
+    try std.testing.expect(try local_fs.fileSize(fd) > 32 << 20);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.os.linux.fsync(fd)));
+    const shapes = [_][]const u8{
+        "count(DISTINCT v) AS d",
+        "count(DISTINCT v) AS d,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n",
+        "count(*) AS c,sum(x) AS s,avg(x) AS a,count(DISTINCT v) AS d",
+    };
+    for (shapes) |aggregate| {
+        const args: QueryArgs = .{
+            .inputs = &.{path},
+            .group_by = "k",
+            .aggregate = aggregate,
+            .parallelism = 4,
+            .max_memory = 1 << 30,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        };
+        const old_lines = [_:null]?[*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_INTEGER_RECORDS=0", "ZPQ_DISTINCT_PAIRS=0", "ZPQ_SKETCH_TOPK=0" };
+        var want = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = &old_lines } }, .io = std.testing.io }, args);
+        defer want.deinit(gpa);
+        for ([_][*:0]const u8{ "ZPQ_IO_PROFILE=auto", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" }) |mode| {
+            var trial = std.heap.ArenaAllocator.init(gpa);
+            defer trial.deinit();
+            const lines = [_:null]?[*:0]const u8{ mode, "ZPQ_SKETCH_TOPK=0" };
+            const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
+            // Only this test-owned, synced file is evicted; the benchmark inputs are untouched.
+            try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.os.linux.fadvise(fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED)));
+            const explained = try explainAggregate(ctx, trial.allocator(), args);
+            try std.testing.expect(explained.io_mode != .mmap);
+            try std.testing.expectEqual(.pair_distinct, explained.aggregate.record_path.?.layout);
+            var got = try runQuery(ctx, args);
+            defer got.deinit(gpa);
+            try std.testing.expectEqualDeep(want.aggregate.output.group_rows, got.aggregate.output.group_rows);
+            try std.testing.expectEqualDeep(want.aggregate.output.aggs, got.aggregate.output.aggs);
+        }
+    }
+}

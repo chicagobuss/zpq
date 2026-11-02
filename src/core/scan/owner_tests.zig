@@ -2128,3 +2128,62 @@ test "shared string scan preserves full grouped and scalar answers NULLs origina
     try testing.expect((try explainAggregate(gpa, a, tight)).record_path == null);
     try testing.expectEqual(held, ledger.used.load(.monotonic));
 }
+
+test "DISTINCT second passes read retained mappings after gated pages are released" {
+    const gpa = testing.allocator;
+    const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse
+        return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    const meta = try metadata.open(a, bytes);
+    for ([_][]const u8{
+        "count(DISTINCT k) AS d",
+        "count(DISTINCT k) AS d,sum(f) AS s,avg(f) AS a,min(f) AS lo,max(f) AS hi,count(f) AS n",
+        "count(*) AS c,sum(f) AS s,avg(f) AS a,count(DISTINCT k) AS d",
+    }) |aggregate| for ([_]usize{ 1, 4 }) |workers| {
+        var trial = std.heap.ArenaAllocator.init(gpa);
+        defer trial.deinit();
+        const ta = trial.allocator();
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "retained", .bytes = bytes }},
+            .metas = &.{meta},
+            .group_by = "f",
+            .aggregate = aggregate,
+            .integer_records = false,
+            .distinct_pairs = .off,
+            .grouped_distinct_bitmap = .off,
+            .plain_rules = false,
+            .byte_records = false,
+            .msd_records = false,
+            .dense = false,
+            .integer_records_min_rows = 0,
+            .min_bytes_per_worker = 1,
+            .parallelism = workers,
+            .decode_batch_rows = 64,
+            .max_memory = 512 << 20,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        };
+        var want = try runMultiAggregate(gpa, ta, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        var window: ReleasingScanWindow = .{ .bytes = try ta.dupe(u8, bytes), .meta = &meta };
+        window.completed = try ta.alloc(std.atomic.Value(usize), meta.row_groups.items.len);
+        for (window.completed.?) |*n| n.* = .init(0);
+        const input = window.input(bytes);
+        args.inputs = (&input)[0..1];
+        args.start_reads = .{ .ctx = &window, .start = ReleasingScanWindow.start, .abandon = ReleasingScanWindow.abandon };
+        args.integer_records = true;
+        args.distinct_pairs = .auto;
+        const explanation = try explainAggregate(gpa, ta, args);
+        try testing.expectEqual(.pair_distinct, explanation.record_path.?.layout);
+        var got = try runMultiAggregate(gpa, ta, args);
+        defer got.deinit(gpa);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expect(got.distinct_pairs);
+        try testing.expect(window.releases.load(.monotonic) != 0);
+        try testing.expect(window.abandoned != 0);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    };
+}

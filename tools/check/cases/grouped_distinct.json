@@ -37,6 +37,18 @@
         "force": {
           "ZPQ_DECODE_BATCH_ROWS": "4096"
         }
+      },
+      {
+        "jobs": 4,
+        "force": {
+          "ZPQ_IO_PROFILE": "pread"
+        }
+      },
+      {
+        "jobs": 4,
+        "force": {
+          "ZPQ_IO_PROFILE": "uring"
+        }
       }
     ]
   },

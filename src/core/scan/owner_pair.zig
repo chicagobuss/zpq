@@ -1128,7 +1128,9 @@ const PairCompanions = struct {
             adapter.* = .{ .pass = c, .states = c.states[i * stride ..][0..stride], .sources = work };
             sink.* = .{ .selected = .{ .ctx = adapter, .startFn = Sink.start, .batchFn = Sink.batch } };
         }
-        _ = try runRecordWorkers(gpa, arena, args, metas, plan, work, c.calls, keys, sinks, starts, outputs, timings);
+        var rescan = args;
+        try @import("input_rewind.zig").rewindInputs(c.a, &rescan);
+        _ = try runRecordWorkers(gpa, arena, rescan, metas, plan, work, c.calls, keys, sinks, starts, outputs, timings);
         for (1..c.workers) |w| for (c.states[0..stride], c.states[w * stride ..][0..stride]) |*dst, src|
             try dst.merge(src, c.a);
         retained = args.ledger != null;

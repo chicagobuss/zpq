@@ -3,6 +3,7 @@ name: Release
 # Tag-driven release. Builds the CLI for 4 platforms, packages each as
 # a tar.gz with sha256 and attaches to a GitHub Release, then mirrors
 # it to R2. Native smoke jobs run the artifacts before publication.
+# The Mac archives build for the minimum macOS tools/package_release.py names (MACOS_MINIMUM).
 #
 # The same file runs as a Forgejo pre-flight (tools/release/preflight.sh): a dry run of an exact commit, before the
 # tag exists. Steps that differ between the two forges are paired on github.server_url, so on GitHub every step
@@ -221,6 +222,19 @@ jobs:
       - name: Run the Intel macOS binary
         if: matrix.target == 'x86_64-macos'
         run: release/x86_64-macos/bin/zpq --version
+
+      # tools/package_release.py pins each Mac archive's minimum macOS; unpinned, Zig's default is 15.0.
+      - name: Check the shipped minimum macOS
+        if: endsWith(matrix.target, '-macos')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          want=$(python3 tools/package_release.py --zig-target "$TARGET")
+          want=${want#*-macos.}
+          got=$(otool -l "release/$TARGET/bin/zpq" | awk '$1 == "cmd" { cmd = $2 }
+            (cmd == "LC_BUILD_VERSION" && $1 == "minos") || (cmd == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2; exit }')
+          echo "zpq: minimum macOS $got"
+          [ "$got" = "$want" ] || { echo "zpq's minimum macOS is ${got:-missing}, not $want" >&2; exit 1; }
 
       - name: Download x86_64 release archives for CPU startup smoke
         if: matrix.target == 'x86_64-linux-musl' && github.server_url == 'https://github.com'

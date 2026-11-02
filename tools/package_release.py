@@ -33,6 +33,15 @@ SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
 # startup, and a baseline "-compat" archive for older CPUs; .deb and .rpm come from the unsuffixed archive.
 VARIANTS = {"x86_64-linux-musl": (("", "x86_64_v3"), ("-compat", "baseline"))}
 PACKAGE_ARCHES = {"x86_64-linux-musl": ("amd64", "x86_64"), "aarch64-linux-musl": ("arm64", "aarch64")}
+# The oldest macOS each Mac archive runs on; without one Zig 0.17 targets its default, macOS 15.0. Its libc builds
+# for 11.0 on Apple Silicon and 10.7 on Intel (lib/std/zig/target.zig, available_libcs), but std.Io.Threaded binds
+# preadv and pwritev, which macOS has had only since 11.0: an Intel binary marked older would not load there.
+MACOS_MINIMUM = {"aarch64-macos": "11.0", "x86_64-macos": "11.0"}
+
+
+def zig_target(target):
+    """The -Dtarget a release target builds with: a Mac one carries its minimum macOS."""
+    return target + "." + MACOS_MINIMUM[target] if target in MACOS_MINIMUM else target
 
 
 def sha(path):
@@ -111,7 +120,13 @@ def main():
     parser.add_argument("--tag", help="release tag, v<version> or v<version>-<prerelease>; a prerelease suffix is "
                         "built into the binary's and the manifest's version (e.g. v0.5.0-rc2)")
     parser.add_argument("--packages", action="store_true", help="also write .deb and .rpm for Linux targets (nfpm)")
+    parser.add_argument("--zig-target", metavar="TARGET", help="only print the -Dtarget TARGET builds with")
     args = parser.parse_args()
+    if args.zig_target:
+        if args.zig_target not in TARGETS:
+            raise SystemExit("unsupported release target: " + args.zig_target)
+        print(zig_target(args.zig_target))
+        return
     if missing := dangling_references(SHARED_FILES):
         raise SystemExit("shipped docs reference files the archive lacks:\n  " + "\n  ".join(missing))
     if args.check_docs:
@@ -147,7 +162,7 @@ def main():
         if not args.skip_build:
             started = time.monotonic()
             try:
-                subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + target,
+                subprocess.run(["zig", "build", "cli", "-j8", "-Doptimize=ReleaseFast", "-Dtarget=" + zig_target(target),
                                 "-Dcpu=" + cpu, "-Dstrip=true", "-Drevision=" + revision, "--prefix", str(prefix)]
                                + (["-Dprerelease=" + prerelease] if prerelease else []),
                                cwd=ROOT, check=True, timeout=args.build_timeout)

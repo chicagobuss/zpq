@@ -371,6 +371,13 @@ pub fn inlinePairAnswer(
     const di = distinct orelse return null;
     const keys = keys_opt orelse &.{};
     const outputs = outputs_opt orelse &.{};
+    const candidate_cut = if (keys_opt != null) countCut(outputs, calls, args.result_order) else null;
+    const top = if (candidate_cut) |cut|
+        (if (cut.a_idx == di or calls[cut.a_idx].arg == null) candidate_cut else null)
+    else
+        null;
+    // A full-output companion pass would replicate every group's states in every worker.
+    if (companions and (top == null or top.?.k == 0)) return null;
     if (args.distinct_pairs == .auto and keys.len == 0) return null;
     // Single-key owners use a checked raw certificate, so dictionary fallback pages cannot force a replay.
     // String identities keep the existing sets/sketch choice; forced owners still exercise retained dictionaries.
@@ -425,11 +432,6 @@ pub fn inlinePairAnswer(
     var identity = if (raw) |p| p else (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
     raw = null;
     defer identity.deinit(gpa);
-    const candidate_cut = if (keys_opt != null) countCut(outputs, calls, args.result_order) else null;
-    const top = if (candidate_cut) |cut|
-        (if (cut.a_idx == di or calls[cut.a_idx].arg == null) candidate_cut else null)
-    else
-        null;
     if (identity.fitsBits(u64)) {
         if (top) |cut| if (cut.k > 0) return pairAnswerBits(
             u64,
@@ -816,9 +818,8 @@ fn pairAnswerBits(
         args.result_order.having == null and args.result_order.hidden.len == 0)
     {
         if (@import("../owner_distinct.zig").CompactGeometry.plan(identity)) |geometry| {
-            const reservation = pq.records +| gq.records +| @max(pq.finish, gq.finish);
-            if (geometry.bits <= 64) return compactPairAnswer(2, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, reservation, explain_only);
-            return compactPairAnswer(3, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, reservation, explain_only);
+            if (geometry.bits <= 64) return compactPairAnswer(2, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, explain_only);
+            return compactPairAnswer(3, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, explain_only);
         }
     }
     const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);
@@ -828,7 +829,8 @@ fn pairAnswerBits(
         workers *| (identity.keys.len *| @sizeOf(key_pack.Plan.Binding) +| @sizeOf(P.Sink) +|
             @sizeOf(P.Reducer) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
         work.len *| (@sizeOf(P.Sink.Source) +| @sizeOf(u32));
-    const peak = scratch +| pq.records +| gq.records +| @max(pq.finish, gq.finish) +| result_credit;
+    const companion_bytes = if (needsCompanions(calls)) PairCompanions.bytes(cut.?.k, calls.len, workers, false) else 0;
+    const peak = scratch +| pq.records +| gq.records +| @max(pq.finish, gq.finish) +| result_credit +| companion_bytes;
     if (peak > args.max_memory) return null;
     if (explain_only) return .{ .layout = .pair_distinct, .reservation = peak };
     var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
@@ -926,11 +928,11 @@ fn pairAnswerBits(
     if (needsCompanions(calls)) {
         const group_keys = try ca.alloc(u128, slots.len);
         for (slots, group_keys) |slot, *key| key.* = if (top) top_groups[slot.idx].key else receiver.at(slot.idx).key;
-        companion = PairCompanions.init(ca, companion_charge.allocator(), identity, group_keys, calls, workers) catch |e| {
+        companion = PairCompanions.init(ca, companion_charge.allocator(), identity, group_keys, calls, workers, false) catch |e| {
             if (e == error.OutOfMemory and companion_charge.refused.load(.monotonic)) return error.ExceededMemoryBudget;
             return e;
         };
-        companion.?.run(gpa, arena, args, metas, plan, work, keys, starts, outputs, run.timings, ledger) catch |e| {
+        companion.?.run(gpa, args, metas, plan, work, keys, starts, outputs, run.timings, ledger) catch |e| {
             if (e == error.OutOfMemory and companion_charge.refused.load(.monotonic)) return error.ExceededMemoryBudget;
             return e;
         };
@@ -1016,7 +1018,14 @@ const PairCompanions = struct {
     workers: usize,
     firsts: []std.atomic.Value(u32) = &.{},
 
-    fn init(a: std.mem.Allocator, batch_allocator: std.mem.Allocator, identity: *const key_pack.Plan, keys: []const u128, calls: []const expr_agg.AggCall, workers: usize) !PairCompanions {
+    fn bytes(groups: usize, calls: usize, workers: usize, ordinals: bool) usize {
+        // Hash capacity is a power of two with spare load; four slots per retained key is an upper bound.
+        return @sizeOf(PairCompanions) +| 128 +| groups *| 4 *| (@sizeOf(u128) +| @sizeOf(u32) +| 1) +|
+            calls *| @sizeOf(expr_agg.AggCall) +| (if (ordinals) groups *| @sizeOf(std.atomic.Value(u32)) else workers *| groups *| calls *| @sizeOf(expr_agg.Accumulator)) +|
+            workers *| (@sizeOf(Sink) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+    }
+
+    fn init(a: std.mem.Allocator, batch_allocator: std.mem.Allocator, identity: *const key_pack.Plan, keys: []const u128, calls: []const expr_agg.AggCall, workers: usize, ordinals: bool) !PairCompanions {
         var group_identity = identity.*;
         group_identity.keys = identity.keys[0 .. identity.keys.len - 1];
         if (identity.fields.len != 0) group_identity.fields = identity.fields[0 .. identity.fields.len - 1];
@@ -1028,9 +1037,11 @@ const PairCompanions = struct {
             call.func = .count;
             call.arg = null;
         };
-        const states = try a.alloc(expr_agg.Accumulator, workers * keys.len * calls.len);
+        const states = try a.alloc(expr_agg.Accumulator, if (ordinals) 0 else workers * keys.len * calls.len);
         for (states, 0..) |*state, i| state.* = .init(plain[i % plain.len]);
-        return .{ .a = a, .batch_allocator = batch_allocator, .identity = group_identity, .index = index, .calls = plain, .states = states, .workers = workers };
+        const firsts = try a.alloc(std.atomic.Value(u32), if (ordinals) keys.len else 0);
+        for (firsts) |*first| first.* = .init(std.math.maxInt(u32));
+        return .{ .a = a, .batch_allocator = batch_allocator, .identity = group_identity, .index = index, .calls = plain, .states = states, .workers = workers, .firsts = firsts };
     }
 
     fn accumulator(c: *const PairCompanions, key: u128, call: usize) expr_agg.Accumulator {
@@ -1116,24 +1127,24 @@ const PairCompanions = struct {
         }
     };
 
-    fn run(c: *PairCompanions, gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs, metas: []const schema.FileMetaData, plan: *const agg_plan.Plan, work: []const WorkItem, keys: []const expr_ast.Expr, starts: []const u32, outputs: []const BoundOutputColumn, timings: Timings, ledger: *core_memory.SharedBudget) !void {
-        const credit = c.workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
-        _ = ledger.drawExact(credit) orelse return error.ExceededMemoryBudget;
-        var retained = false;
-        defer if (!retained) ledger.release(credit);
-        const adapters = try c.a.alloc(Sink, c.workers);
-        const sinks = try c.a.alloc(consumer.RecordSink, c.workers);
-        const stride = c.index.count() * c.calls.len;
+    fn run(c: *PairCompanions, gpa: std.mem.Allocator, args: MultiAggArgs, metas: []const schema.FileMetaData, plan: *const agg_plan.Plan, work: []const WorkItem, keys: []const expr_ast.Expr, starts: []const u32, outputs: []const BoundOutputColumn, timings: Timings, ledger: *core_memory.SharedBudget) !void {
+        _ = ledger;
+        // Rescan metadata dies with this pass, including on a later output refusal in the caller.
+        var scratch = std.heap.ArenaAllocator.init(c.batch_allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const adapters = try a.alloc(Sink, c.workers);
+        const sinks = try a.alloc(consumer.RecordSink, c.workers);
+        const stride = if (c.firsts.len == 0) c.index.count() * c.calls.len else 0;
         for (adapters, sinks, 0..) |*adapter, *sink, i| {
             adapter.* = .{ .pass = c, .states = c.states[i * stride ..][0..stride], .sources = work };
             sink.* = .{ .selected = .{ .ctx = adapter, .startFn = Sink.start, .batchFn = Sink.batch } };
         }
         var rescan = args;
-        try @import("input_rewind.zig").rewindInputs(c.a, &rescan);
-        _ = try runRecordWorkers(gpa, arena, rescan, metas, plan, work, c.calls, keys, sinks, starts, outputs, timings);
+        try @import("input_rewind.zig").rewindInputs(a, &rescan);
+        _ = try runRecordWorkers(gpa, a, rescan, metas, plan, work, c.calls, keys, sinks, starts, outputs, timings);
         for (1..c.workers) |w| for (c.states[0..stride], c.states[w * stride ..][0..stride]) |*dst, src|
             try dst.merge(src, c.a);
-        retained = args.ledger != null;
     }
 };
 
@@ -1156,10 +1167,8 @@ fn compactPairAnswer(
     geometry: @import("../owner_distinct.zig").CompactGeometry,
     parts: usize,
     timings: Timings,
-    reservation: usize,
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
-    if (explain_only) return .{ .layout = .pair_distinct, .reservation = reservation, .partitions = parts };
     const O = @import("../owner_distinct.zig").Compact(words);
     const G = O.Groups;
     const F = @import("../owner_result.zig").Full(G.Group);
@@ -1168,6 +1177,22 @@ fn compactPairAnswer(
             return std.math.order(a.integer(0).?, b.integer(0).?);
         }
     }.worse);
+    const group_bound = if (geometry.group_bits >= @bitSizeOf(usize)) rows else @min(rows, @as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(geometry.group_bits)));
+    const candidate_bound = @min(group_bound, @max(cut.k, @import("../hw.zig").l2BytesPerWorkerOr(640 << 10) / @sizeOf(G.Group)));
+    // Count every retained store beside the compact scatter and its worst-case concurrent fold.
+    const retained = F.bytes(workers, parts) +| group_bound *| @sizeOf(G.Group) +|
+        T.bytes(workers, cut.k) +| PairCompanions.bytes(candidate_bound, calls.len, workers, true) +|
+        candidate_bound *| (2 * @sizeOf(G.Group) +| 2 * @sizeOf(u128) +| @sizeOf(MergedSlot) +|
+            @sizeOf([]const AggValue) +| outputs.len *| @sizeOf(AggValue)) +| outputNamesBytes(outputs);
+    const scratch = identity.retainedBytes() +| work.len *| (2 * @sizeOf(u32) +| 3 * @sizeOf(usize)) +|
+        args.inputs.len *| @sizeOf(scan_types.Input) +|
+        workers *| (owner_groups.batchRows(null) *| @sizeOf(u128) +| @sizeOf(O.Sink) +|
+            @sizeOf(O.Reducer) +| @sizeOf(consumer.RecordSink) +| 2 * @sizeOf(usize) +|
+            @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable) +| @sizeOf(WorkItem) +| @sizeOf(u32));
+    const peak = O.bytes(rows, workers, parts) +| G.State.charge(rows, workers, parts) +|
+        O.finishBytes(rows, workers) +| retained +| scratch;
+    if (peak > args.max_memory) return null;
+    if (explain_only) return .{ .layout = .pair_distinct, .reservation = peak, .partitions = parts };
     var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const ledger = args.ledger orelse &private_ledger;
     var charged: core_memory.Charged = .{ .child = gpa, .budget = ledger };
@@ -1284,9 +1309,7 @@ fn compactPairRun(
             try tied.append(a, g.key);
     }
     if (tied.items.len != 0) {
-        var pass = try PairCompanions.init(a, charged, identity, tied.items, calls, 1);
-        pass.firsts = try a.alloc(std.atomic.Value(u32), tied.items.len);
-        for (pass.firsts) |*first| first.* = .init(std.math.maxInt(u32));
+        var pass = try PairCompanions.init(a, charged, identity, tied.items, calls, workers, true);
         const order = try a.alloc(usize, work.len);
         for (order, 0..) |*item, i| item.* = i;
         std.mem.sortUnstable(usize, order, starts, struct {
@@ -1294,9 +1317,18 @@ fn compactPairRun(
                 return ordinals[x] < ordinals[y];
             }
         }.less);
-        // Once every first occurrence is in this source prefix, later work cannot improve an ordinal.
-        for (order) |item| {
-            try pass.run(gpa, arena, args, metas, plan, work[item..][0..1], keys, starts[item..][0..1], outputs, run.timings, ledger);
+        const prefix_work = try a.alloc(WorkItem, workers);
+        const prefix_starts = try a.alloc(u32, workers);
+        // Parallel source prefixes keep the early-stop proof while allowing late ties to use every worker.
+        var at: usize = 0;
+        while (at < order.len) {
+            const width = @min(workers, order.len - at);
+            for (order[at..][0..width], prefix_work[0..width], prefix_starts[0..width]) |item, *w, *start| {
+                w.* = work[item];
+                start.* = starts[item];
+            }
+            try pass.run(gpa, args, metas, plan, prefix_work[0..width], keys, prefix_starts[0..width], outputs, run.timings, ledger);
+            at += width;
             const complete = complete: {
                 for (pass.firsts) |first| if (first.load(.monotonic) == std.math.maxInt(u32)) break :complete false;
                 break :complete true;

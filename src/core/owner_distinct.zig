@@ -286,9 +286,21 @@ pub fn Compact(comptime words: usize) type {
         blocks: []W.Block = &.{},
         cursor: std.atomic.Value(u32) = .init(0),
 
+        fn repeatSlots() usize {
+            const l2 = @import("hw.zig").l2BytesPerWorkerOr(640 << 10);
+            return std.math.floorPowerOfTwo(usize, @max(1, l2 / (2 * @sizeOf(L.Record))));
+        }
+        pub fn repeatBytes(workers: usize) usize {
+            const slots = repeatSlots();
+            return workers *| (slots *| @sizeOf(L.Record) +| ((slots + 63) / 64) *| @sizeOf(u64));
+        }
+        pub fn finishBytes(rows: usize, workers: usize) usize {
+            return rows *| (@max(@sizeOf(L.Group), @sizeOf(Groups.Group)) +| 4 * @sizeOf(u32)) +|
+                workers *| (1 << 20);
+        }
         pub fn bytes(rows: usize, workers: usize, parts: usize) usize {
             return W.blockCount(rows, workers, parts) *| @sizeOf(W.Block) +|
-                W.frontierBytes(workers, parts) +| workers *| @sizeOf(Local) +| @sizeOf(Self);
+                W.frontierBytes(workers, parts) +| workers *| @sizeOf(Local) +| @sizeOf(Self) +| repeatBytes(workers);
         }
         pub fn init(a: std.mem.Allocator, ledger: *@import("memory.zig").SharedBudget, rows: usize, workers: usize, parts: usize) !*Self {
             const s = try a.create(Self);
@@ -299,8 +311,7 @@ pub fn Compact(comptime words: usize) type {
             for (s.locals) |*l| l.frontier = try W.Frontier.init(a, parts);
             const enabled = if (std.c.getenv("ZPQ_CD_REPEAT")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
             if (enabled) {
-                const l2 = @import("hw.zig").l2BytesPerWorkerOr(640 << 10);
-                const slots = std.math.floorPowerOfTwo(usize, @max(1, l2 / (2 * @sizeOf(L.Record))));
+                const slots = repeatSlots();
                 for (s.locals) |*local| {
                     local.recent = try a.alloc(L.Record, slots);
                     local.valid = try a.alloc(u64, (slots + 63) / 64);

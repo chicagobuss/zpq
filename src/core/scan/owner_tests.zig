@@ -1350,11 +1350,11 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
     @memset(rgs, meta.row_groups.items[0]);
     meta.row_groups.items = rgs;
     meta.num_rows *= 16;
-    const Case = struct { group: ?[]const u8, agg: []const u8, filter: ?[]const u8 = null, top: bool = false, rank: usize = 2 };
+    const Case = struct { group: ?[]const u8, agg: []const u8, filter: ?[]const u8 = null, top: bool = false, rank: usize = 2, pair: bool = true };
     const cases = [_]Case{
         .{ .group = "k", .agg = "count(DISTINCT x) AS d", .top = true, .rank = 1 },
         .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c" },
-        .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n" },
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n", .pair = false },
         .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a", .top = true },
         .{ .group = "s", .agg = "count(*) AS c,count(DISTINCT x) AS d", .top = true },
         .{ .group = "k,s", .agg = "count(DISTINCT x) AS d" },
@@ -1396,6 +1396,16 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
             args.parallelism = j;
             args.decode_batch_rows = window;
             args.taken = &taken;
+            if (!c.pair) {
+                const explanation = try explainAggregate(gpa, a, args);
+                try testing.expect(explanation.record_path == null or explanation.record_path.?.layout != .pair_distinct);
+                var legacy = try runMultiAggregate(gpa, a, args);
+                defer legacy.deinit(gpa);
+                try testing.expect(!taken.contains(.integer_records));
+                try legacy.output.applyResultOrder(gpa, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows, legacy.output.group_rows);
+                continue;
+            }
             if (c.group != null and (std.mem.eql(u8, c.group.?, "k") or std.mem.eql(u8, c.group.?, "s"))) {
                 args.distinct_pairs = .auto;
                 const auto_path = (try explainAggregate(gpa, a, args)).record_path;
@@ -2186,4 +2196,108 @@ test "DISTINCT second passes read retained mappings after gated pages are releas
         try testing.expect(window.abandoned != 0);
         try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
     };
+}
+
+test "DISTINCT compact explain covers measured allocations including repeat caches and tie recovery" {
+    const gpa = testing.allocator;
+    const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse
+        return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const meta = try metadata.open(held.allocator(), bytes);
+    for ([_]usize{ 1, 4 }) |workers| {
+        const args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "compact-peak", .bytes = bytes }},
+            .metas = &.{meta},
+            .group_by = "f",
+            .aggregate = "count(DISTINCT k) AS d",
+            .integer_records_min_rows = 0,
+            .min_bytes_per_worker = 1,
+            .parallelism = workers,
+            .grouped_distinct_bitmap = .off,
+            .plain_rules = false,
+            .max_memory = 512 << 20,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        };
+        const explanation = try explainAggregate(gpa, held.allocator(), args);
+        try testing.expectEqual(.pair_distinct, explanation.record_path.?.layout);
+        var peak: LivePeak = .{ .child = gpa };
+        {
+            var trial = std.heap.ArenaAllocator.init(peak.allocator());
+            defer trial.deinit();
+            var got = try prepareAggregate(peak.allocator(), trial.allocator(), args, false);
+            defer got.deinit(peak.allocator());
+            try testing.expect(got.distinct_pairs);
+            try testing.expect(peak.peak.load(.monotonic) <= explanation.record_path.?.reservation);
+        }
+        try testing.expectEqual(@as(usize, 0), peak.live.load(.monotonic));
+    }
+}
+
+test "DISTINCT companion output refusal releases rescan metadata credit" {
+    const gpa = testing.allocator;
+    const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse
+        return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    const meta = try metadata.open(a, bytes);
+    var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, bytes), .meta = &meta };
+    window.completed = try a.alloc(std.atomic.Value(usize), meta.row_groups.items.len);
+    for (window.completed.?) |*n| n.* = .init(0);
+    const alias = "terminal_companion_output_alias_unique";
+    const RefuseOutput = struct {
+        child: std.mem.Allocator,
+        window: *ReleasingScanWindow,
+        hit: bool = false,
+        fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.window.abandoned != 0 and n == alias.len) {
+                self.hit = true;
+                return null;
+            }
+            return self.child.rawAlloc(n, alignment, ret);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, alignment: std.mem.Alignment, n: usize, ret: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(m, alignment, n, ret);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, alignment: std.mem.Alignment, n: usize, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawRemap(m, alignment, n, ret);
+        }
+        fn free(ctx: *anyopaque, m: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(m, alignment, ret);
+        }
+    };
+    var fault: RefuseOutput = .{ .child = gpa, .window = &window };
+    const allocator: std.mem.Allocator = .{ .ptr = &fault, .vtable = &.{
+        .alloc = RefuseOutput.alloc,
+        .resize = RefuseOutput.resize,
+        .remap = RefuseOutput.remap,
+        .free = RefuseOutput.free,
+    } };
+    var budget: core_memory.SharedBudget = .{ .limit = 512 << 20 };
+    const input = window.input(bytes);
+    const args: MultiAggArgs = .{
+        .inputs = (&input)[0..1],
+        .metas = &.{meta},
+        .group_by = "f",
+        .aggregate = "count(DISTINCT k) AS " ++ alias ++ ",sum(f) AS s",
+        .integer_records_min_rows = 0,
+        .min_bytes_per_worker = 1,
+        .parallelism = 4,
+        .grouped_distinct_bitmap = .off,
+        .plain_rules = false,
+        .max_memory = budget.limit,
+        .ledger = &budget,
+        .start_reads = .{ .ctx = &window, .start = ReleasingScanWindow.start, .abandon = ReleasingScanWindow.abandon },
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+    };
+    try testing.expectError(error.OutOfMemory, prepareAggregate(allocator, a, args, false));
+    try testing.expect(fault.hit);
+    try testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
 }

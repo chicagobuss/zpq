@@ -825,10 +825,11 @@ fn pairAnswerBits(
     const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);
     const domain_bytes = if (identity.domain) |d| d.bytes else 0;
     const pack_rows = owner_groups.batchRows(null);
+    const pair_projection_bytes = if (needsCompanions(calls)) work.len *| @sizeOf(WorkItem) +| 3 *| plan.columns.read.len else 0;
     const scratch = domain_bytes +| identity.retainedBytes() +| workers *| pack_rows *| @sizeOf(Bits) +|
         workers *| (identity.keys.len *| @sizeOf(key_pack.Plan.Binding) +| @sizeOf(P.Sink) +|
             @sizeOf(P.Reducer) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
-        work.len *| (@sizeOf(P.Sink.Source) +| @sizeOf(u32));
+        work.len *| (@sizeOf(P.Sink.Source) +| @sizeOf(u32)) +| pair_projection_bytes;
     const companion_bytes = if (needsCompanions(calls)) PairCompanions.bytes(cut.?.k, calls.len, workers, false) +|
         work.len *| @sizeOf(WorkItem) +| 3 *| plan.columns.read.len +| args.inputs.len *| @sizeOf(scan_types.Input) else 0;
     const peak = scratch +| pq.records +| gq.records +| @max(pq.finish, gq.finish) +| result_credit +| companion_bytes;
@@ -889,13 +890,20 @@ fn pairAnswerBits(
     if (args.taken) |taken| taken.insert(.integer_records);
     const pair_keys = try a.alloc(expr_ast.Expr, identity.keys.len);
     for (pair_keys, identity.keys) |*k, ref| k.* = .{ .col_ref = ref };
+    const pair_work = if (needsCompanions(calls)) blk: {
+        // Plain payloads belong to the retained-group pass, so pair production need only decode the distinct call.
+        const columns = try plan.forCalls(a, calls[distinct..][0..1]);
+        const projected = try a.dupe(WorkItem, work);
+        for (projected) |*item| item.columns = columns;
+        break :blk projected;
+    } else work;
     const run = runRecordWorkers(
         gpa,
         arena,
         args,
         metas,
         plan,
-        work,
+        pair_work,
         calls,
         pair_keys,
         sinks,

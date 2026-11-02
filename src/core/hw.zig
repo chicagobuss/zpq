@@ -1,5 +1,6 @@
 //! Process-lifetime cache topology, discovered once. CPUID describes the executing x86 CPU; Linux sysfs fills in
-//! other logical CPUs and the sharing sets, without assuming a uniform topology or changing thread affinity.
+//! other logical CPUs and the sharing sets, without assuming a uniform topology or changing thread affinity. macOS
+//! describes its caches through sysctl, and aarch64 Linux without a sysfs line size through CTR_EL0.
 //! Unknown sizes stay zero and unknown sharing sets stay empty. Execution policy, headroom and forced paths belong
 //! to callers. See docs/hardware-execution.md for the process-wide environment overrides.
 //! Hardware may change performance only: never row-group boundaries, page sizes, float summation blocks, merge
@@ -87,7 +88,8 @@ pub fn l2BytesPerWorker() usize {
     return process_l2;
 }
 
-/// An explicit execution-policy fallback for platforms without cache/affinity discovery, including macOS arm64.
+/// An explicit execution-policy fallback for hosts whose L2 could not be sized, such as a Linux VM whose sysfs
+/// lists caches without a `size`.
 pub fn l2BytesPerWorkerOr(default: usize) usize {
     const bytes = l2BytesPerWorker();
     return if (bytes == 0) default else bytes;
@@ -101,6 +103,15 @@ pub fn l3BytesPerActiveWorker(workers: usize) usize {
     _ = forCpu(0);
     return process_l3 / @max(1, workers);
 }
+
+/// A per-worker L2 share typical of the target architecture, for a policy that needs a size when discovery found
+/// none: a 1.25 MiB L2 shared by two SMT siblings on x86, and the 1 MiB per core of Neoverse servers and Apple
+/// efficiency clusters on aarch64. It is a performance assumption only, like every other value here.
+pub const default_l2_bytes_per_worker: usize = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => 640 << 10,
+    .aarch64, .aarch64_be => 1 << 20,
+    else => 256 << 10,
+};
 
 fn affinityL3Minimum(cpus: []const Cpu, affinity: CpuSet) usize {
     var minimum: usize = std.math.maxInt(usize);
@@ -134,11 +145,25 @@ fn currentId() usize {
 fn discover() void {
     const id = currentId();
     if (id < detected.len) detected[id] = fromCpuid();
+    // The CPUs execution may use. Linux reads its affinity mask below; macOS has none, so every logical CPU.
+    var affinity: ?CpuSet = null;
     if (builtin.os.tag == .linux) {
         var buf: [4096]u8 = undefined;
         const possible = readFile("/sys/devices/system/cpu/online", &buf);
         const cpus = if (possible) |text| parseCpuList(text) else null;
-        if (cpus) |set| scanSysfs(set, &detected, id, true);
+        if (cpus) |set| {
+            scanSysfs(set, &detected, id, true);
+            if (comptime builtin.cpu.arch == .aarch64) fillLineBytes(set, &detected, ctrLineBytes(ctrEl0()));
+        }
+    }
+    if (comptime builtin.os.tag.isDarwin()) {
+        const sysctl: Sysctl = .{};
+        const cpu = fromSysctl(sysctl, detected[id]);
+        const count = @min(cpu_capacity, sysctl.int("hw.logicalcpu") orelse 1);
+        @memset(detected[0..count], cpu);
+        var all: CpuSet = .empty;
+        all.setRangeValue(.{ .start = 0, .end = count }, true);
+        affinity = all;
     }
     // Sizes are independent of the host, so tests can run a different cache budget on the same machine. Sharing
     // remains the actual topology; a test_cpu fixture can replace that too without process-global mutation.
@@ -159,19 +184,89 @@ fn discover() void {
     if (builtin.os.tag == .linux) {
         var mask: std.os.linux.cpu_set_t = undefined;
         // Query the main thread's mask, not an initializing worker's possibly narrower mask.
-        if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0) {
-            const affinity: CpuSet = .{ .masks = mask };
-            process_l1d = std.math.maxInt(usize);
-            var it = affinity.iterator(.{});
-            while (it.next()) |cpu_id| {
-                process_l1d = @min(process_l1d, detected[cpu_id].l1d.bytesPerWorker());
-                process_line = @max(process_line, detected[cpu_id].l1d.line_bytes);
-            }
-            if (process_l1d == std.math.maxInt(usize)) process_l1d = 0;
-            process_l2 = affinityMinimum(&detected, .{ .masks = mask });
-            process_l3 = affinityL3Minimum(&detected, .{ .masks = mask });
-        }
+        if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0)
+            affinity = .{ .masks = mask };
     }
+    if (affinity) |allowed| {
+        process_l1d = std.math.maxInt(usize);
+        var it = allowed.iterator(.{});
+        while (it.next()) |cpu_id| {
+            process_l1d = @min(process_l1d, detected[cpu_id].l1d.bytesPerWorker());
+            process_line = @max(process_line, detected[cpu_id].l1d.line_bytes);
+        }
+        if (process_l1d == std.math.maxInt(usize)) process_l1d = 0;
+        process_l2 = affinityMinimum(&detected, allowed);
+        process_l3 = affinityL3Minimum(&detected, allowed);
+    }
+}
+
+/// Give every CPU in `online` without a discovered L1d line `line` bytes: aarch64 Linux takes it from CTR_EL0
+/// when sysfs has no `coherency_line_size`, as some VMs' do not.
+fn fillLineBytes(online: CpuSet, out: []Cpu, line: usize) void {
+    var it = online.iterator(.{});
+    while (it.next()) |cpu| {
+        if (cpu >= out.len) continue;
+        if (out[cpu].l1d.line_bytes == 0) out[cpu].l1d.line_bytes = line;
+    }
+}
+
+/// The smallest data-cache line in the hierarchy, from CTR_EL0.DminLine: log2 of its length in 4-byte words.
+fn ctrLineBytes(ctr: u64) usize {
+    return @as(usize, 4) << @intCast((ctr >> 16) & 0xf);
+}
+
+fn ctrEl0() u64 {
+    if (comptime builtin.cpu.arch != .aarch64) return 0;
+    // Linux lets EL0 read CTR_EL0, trapping and emulating it where an erratum requires.
+    return asm volatile ("mrs %[ctr], ctr_el0"
+        : [ctr] "=r" (-> u64),
+    );
+}
+
+/// macOS cache sizes by sysctl name. Integer values are 4 or 8 bytes depending on the name.
+const Sysctl = struct {
+    fn int(_: Sysctl, name: [:0]const u8) ?usize {
+        var value: [8]u8 align(8) = @splat(0);
+        var len: usize = value.len;
+        if (std.c.sysctlbyname(name, &value, &len, null, 0) != 0) return null;
+        return switch (len) {
+            4 => std.mem.readInt(u32, value[0..4], builtin.cpu.arch.endian()),
+            8 => std.math.cast(usize, std.mem.readInt(u64, &value, builtin.cpu.arch.endian())),
+            else => null,
+        };
+    }
+
+    /// `hw.cacheconfig`: how many logical CPUs share memory, then each cache level from L1 on.
+    fn sharing(_: Sysctl, level: usize) ?usize {
+        var config: [16]u64 = @splat(0);
+        var len: usize = @sizeOf(@TypeOf(config));
+        if (std.c.sysctlbyname("hw.cacheconfig", &config, &len, null, 0) != 0) return null;
+        return if (level < len / @sizeOf(u64) and config[level] != 0) std.math.cast(usize, config[level]) else null;
+    }
+};
+
+/// The cache record macOS describes, over what CPUID found. A hybrid Apple chip reports each performance level;
+/// level 0 is its fastest cores, where the scheduler puts compute-bound threads first, and its L2 is shared by
+/// `cpusperl2` of them. Otherwise, and on Intel Macs, `hw.cacheconfig` gives the sharing. Apple cores run one
+/// thread each, so an unreported L1d sharing is one CPU.
+fn fromSysctl(sysctl: anytype, seed: Cpu) Cpu {
+    var out = seed;
+    const line = sysctl.int("hw.cachelinesize") orelse 0;
+    if (sysctl.int("hw.perflevel0.l2cachesize")) |l2| {
+        if (sysctl.int("hw.perflevel0.l1dcachesize")) |l1d| out.l1d = .{ .bytes = l1d, .max_sharing = 1 };
+        out.l2 = .{ .bytes = l2, .max_sharing = sysctl.int("hw.perflevel0.cpusperl2") orelse 1 };
+    } else {
+        if (sysctl.int("hw.l1dcachesize")) |l1d| out.l1d = .{ .bytes = l1d, .max_sharing = sysctl.sharing(1) orelse 1 };
+        if (sysctl.int("hw.l2cachesize")) |l2| out.l2 = .{ .bytes = l2, .max_sharing = sysctl.sharing(2) orelse 1 };
+    }
+    if (sysctl.int("hw.l3cachesize")) |l3| {
+        if (l3 != 0) out.l3 = .{ .bytes = l3, .max_sharing = sysctl.sharing(3) orelse 1 };
+    }
+    for ([_]*Cache{ &out.l1d, &out.l2, &out.l3 }, [_]Cache{ seed.l1d, seed.l2, seed.l3 }) |cache, cpuid_cache| {
+        if (cache.bytes == 0) cache.* = cpuid_cache;
+        if (line != 0 and cache.bytes != 0) cache.line_bytes = line;
+    }
+    return out;
 }
 
 fn readFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
@@ -395,5 +490,84 @@ test "hardware discovery that shares a sibling's record finds what reading every
             std.debug.print("cpu {d} (seed {d}) differs\n", .{ cpu, seed });
             return err;
         };
+    }
+}
+
+/// sysctl answers by name, for `fromSysctl`.
+const SysctlFixture = struct {
+    ints: []const struct { []const u8, usize },
+    config: []const usize = &.{},
+
+    fn int(self: SysctlFixture, name: []const u8) ?usize {
+        for (self.ints) |entry| if (std.mem.eql(u8, entry[0], name)) return entry[1];
+        return null;
+    }
+    fn sharing(self: SysctlFixture, level: usize) ?usize {
+        return if (level < self.config.len and self.config[level] != 0) self.config[level] else null;
+    }
+};
+
+test "hardware macOS sysctl takes the Apple performance level and falls back to the whole-machine names" {
+    // Apple M5 Pro: six "Super" cores share a 16 MiB L2; the whole-machine names describe the other cluster.
+    const m5: SysctlFixture = .{ .ints = &.{
+        .{ "hw.cachelinesize", 128 },
+        .{ "hw.l1dcachesize", 64 << 10 },
+        .{ "hw.l2cachesize", 8 << 20 },
+        .{ "hw.perflevel0.l1dcachesize", 128 << 10 },
+        .{ "hw.perflevel0.l2cachesize", 16 << 20 },
+        .{ "hw.perflevel0.cpusperl2", 6 },
+    }, .config = &.{ 18, 1, 6 } };
+    const apple = fromSysctl(m5, .{});
+    try std.testing.expectEqual(@as(usize, 128 << 10), apple.l1d.bytesPerWorker());
+    try std.testing.expectEqual(@as(usize, (16 << 20) / 6), apple.l2.bytesPerWorker());
+    try std.testing.expectEqual(@as(usize, 128), apple.l1d.line_bytes);
+    try std.testing.expectEqual(@as(usize, 0), apple.l3.bytes);
+    const cpus = [_]Cpu{ apple, apple };
+    try std.testing.expectEqual(@as(usize, (16 << 20) / 6), affinityMinimum(&cpus, parseCpuList("0-1").?));
+
+    // An Intel Mac (i7-7700HQ): no performance levels; two SMT threads share L1d and L2, eight the L3.
+    const intel: SysctlFixture = .{ .ints = &.{
+        .{ "hw.cachelinesize", 64 },
+        .{ "hw.l1dcachesize", 32 << 10 },
+        .{ "hw.l2cachesize", 256 << 10 },
+        .{ "hw.l3cachesize", 6 << 20 },
+    }, .config = &.{ 8, 2, 2, 8 } };
+    const x86 = fromSysctl(intel, .{});
+    try std.testing.expectEqual(@as(usize, 16 << 10), x86.l1d.bytesPerWorker());
+    try std.testing.expectEqual(@as(usize, 128 << 10), x86.l2.bytesPerWorker());
+    try std.testing.expectEqual(@as(usize, 6 << 20), x86.l3.bytes);
+    try std.testing.expectEqual(@as(usize, 64), x86.l2.line_bytes);
+
+    // Without hw.cacheconfig a cache is one CPU's; a name sysctl lacks keeps what CPUID found.
+    const sparse: SysctlFixture = .{ .ints = &.{.{ "hw.l2cachesize", 4 << 20 }} };
+    const seed: Cpu = .{ .l1d = .{ .bytes = 48 << 10, .line_bytes = 64, .max_sharing = 2 } };
+    const merged = fromSysctl(sparse, seed);
+    try std.testing.expectEqual(@as(usize, 4 << 20), merged.l2.bytesPerWorker());
+    try std.testing.expect(std.meta.eql(seed.l1d, merged.l1d));
+    try std.testing.expect(std.meta.eql(seed, fromSysctl(SysctlFixture{ .ints = &.{} }, seed)));
+}
+
+test "hardware aarch64 line size comes from CTR_EL0 only where sysfs gave none" {
+    try std.testing.expectEqual(@as(usize, 64), ctrLineBytes(0x8444c004)); // Neoverse N1
+    try std.testing.expectEqual(@as(usize, 128), ctrLineBytes(5 << 16));
+    var cpus = [_]Cpu{ .{ .l1d = .{ .bytes = 64 << 10, .line_bytes = 128 } }, .{}, .{} };
+    fillLineBytes(parseCpuList("0-1").?, &cpus, 64);
+    try std.testing.expectEqual(@as(usize, 128), cpus[0].l1d.line_bytes);
+    try std.testing.expectEqual(@as(usize, 64), cpus[1].l1d.line_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cpus[2].l1d.line_bytes);
+}
+
+test "hardware discovery sizes L2 and the cache line on macOS and finds a line on aarch64 Linux" {
+    const discovered = forCpu(0);
+    if (comptime builtin.os.tag.isDarwin()) {
+        if (std.c.getenv("ZPQ_HW_L2_BYTES") == null) try std.testing.expect(l2BytesPerWorker() != 0);
+        try std.testing.expect(discovered.l2.bytes != 0);
+        try std.testing.expectEqual(Sysctl.int(.{}, "hw.cachelinesize").?, cacheLineBytes());
+    } else if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+        try std.testing.expect(process_line != 0);
+        try std.testing.expect(std.math.isPowerOfTwo(process_line));
+    } else {
+        // x86 sizes come from CPUID and sysfs, which the sibling-sharing test above already reads.
+        return error.SkipZigTest;
     }
 }

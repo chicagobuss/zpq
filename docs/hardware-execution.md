@@ -15,13 +15,20 @@ Unknown remains zero; this hint is also independent of the caller's CPU.
 
 CPUID gives sizes and maximum sharing for the executing x86 CPU. Linux sysfs
 supplies the other logical CPUs and concrete sharing sets, including separate
-L3 domains. Missing data stays unknown (zero bytes / an empty set); consumers
-must use a conservative path. Linux CPU IDs beyond its fixed 1024-bit affinity
-mask are unknown. Discovery does not change affinity and retains no open files.
-CPU hotplug or affinity changes after discovery are outside this snapshot.
-An unknown allowed CPU makes the execution budget zero. Platforms without
-affinity/cache discovery, including macOS arm64, return zero;
-`hw.l2BytesPerWorkerOr(default)` lets each caller supply an explicit fallback.
+L3 domains. On aarch64 Linux, a sysfs without `coherency_line_size` (as in
+some VMs) takes the line from `CTR_EL0.DminLine`. macOS has no affinity, so
+every logical CPU is allowed and all get the record sysctl describes: on Apple
+Silicon, performance level 0 (`hw.perflevel0.l1dcachesize`, `l2cachesize`
+shared by `cpusperl2` cores); elsewhere, including Intel Macs,
+`hw.l1dcachesize`/`l2cachesize`/`l3cachesize` shared as `hw.cacheconfig`
+says, with `hw.cachelinesize` for the line. Missing data stays unknown (zero
+bytes / an empty set); consumers must use a conservative path. Linux CPU IDs
+beyond its fixed 1024-bit affinity mask are unknown. Discovery does not change
+affinity and retains no open files. CPU hotplug or affinity changes after
+discovery are outside this snapshot. An unknown allowed CPU makes the
+execution budget zero, as does a Linux sysfs that lists caches without a
+`size`; `hw.l2BytesPerWorkerOr(default)` lets each caller supply an explicit
+fallback, and `hw.default_l2_bytes_per_worker` is a per-architecture one.
 
 `hw.l1dBytesPerWorker()` uses the same affinity minimum and sharing rule.
 `hw.cacheLineBytes()` returns the widest discovered L1 data-cache line in that

@@ -151,9 +151,8 @@ fn inlineBitmapAnswer(
     const input_rows = RecordOrdinals.rows(metas) orelse return null;
     if (input_rows >= @as(usize, 1) << 31) return null;
     const hw = @import("../hw.zig");
-    const l2 = hw.l2BytesPerWorker();
+    const l2 = hw.l2BytesPerWorkerOr(hw.default_l2_bytes_per_worker);
     if (args.grouped_distinct_bitmap == .auto) {
-        if (l2 == 0) return null;
         // Reject expensive discovery from footers alone: probing hundreds of cold headers can delay a decline.
         var dictionary_bytes: u64 = 0;
         for (metas) |meta| for (meta.row_groups.items) |rg| {
@@ -180,7 +179,10 @@ fn inlineBitmapAnswer(
     if (rows == 0 or !range.known or range.lo > range.hi or
         (args.grouped_distinct_bitmap == .auto and rows < args.integer_records_min_rows)) return null;
     const workers = @max(1, @min(requested, work.len));
-    const l3 = hw.l3BytesPerActiveWorker(workers) *| workers;
+    // Where no L3 is known, the workers' L2 shares together stand for the last level: on Apple Silicon, whose
+    // sysctl reports none, a cluster's shared L2 is that level.
+    const known_l3 = hw.l3BytesPerActiveWorker(workers) *| workers;
+    const l3 = if (known_l3 != 0) known_l3 else l2 *| workers;
     const minimum = grouped_bitmap.Geometry.plan(1, range.lo, range.hi, workers, l2, l3, args.grouped_distinct_bitmap) orelse return null;
     var private_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const ledger = args.ledger orelse &private_ledger;

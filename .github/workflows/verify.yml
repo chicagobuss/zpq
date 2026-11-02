@@ -17,6 +17,7 @@ name: Verify
 #
 # A separate native matrix builds and runs Linux x86, Linux ARM and Apple
 # silicon release artifacts. Intel macOS runtime coverage is deferred by name.
+# The core suite also runs natively on Linux ARM and Apple silicon.
 
 on:
   push:
@@ -231,6 +232,59 @@ jobs:
           name: receipts-${{ matrix.shard }}
           path: zig-out/receipts
 
+  # The core suite natively on the other two release architectures: Linux ARM as the full tier's units-core shard
+  # runs it, and Apple silicon (16 KiB pages, 128-byte lines, no mremap) on the same fixtures. The tier's verdict
+  # allows no skip, and a Mac skips every Linux-only test, so there it fails on failures alone. The Mac builds
+  # ReleaseSafe: in Debug the test allocator captures a stack on every free, which on macOS unwinds by DWARF CFI and
+  # left one test running for over 50 minutes.
+  native-core:
+    name: Core suite (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Create Python test environment
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --no-input -r tools/check/requirements.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Zig global build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-zig-
+
+      - name: Core suite
+        if: runner.os == 'Linux'
+        run: zig build check -Dtier=full -Dshard=units-core -j8
+
+      - name: Core suite (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          tools/check/fixtures.sh
+          zig build test-core -Doptimize=ReleaseSafe -j8
+
+      - name: Keep the receipts
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipts-core-${{ matrix.runner }}
+          path: zig-out/receipts
+
   # Each native job runs its installed CLI and, on Linux, Lambda artifacts.
   release-smoke:
     name: Native release smoke (${{ matrix.target }})
@@ -254,14 +308,26 @@ jobs:
         with:
           version: 0.17.0
 
-      # The shipped CLI, built as it ships, through the release cases on its own platform.
+      # The shipped CLI, built as it ships (a Mac one for its minimum macOS), through the release cases on its own
+      # platform.
       - name: Build and smoke the release artifacts
         run: |
-          zig build -j8 -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dstrip=true -Drevision=$GITHUB_SHA \
-            --prefix zig-out/release cli lambda
+          zig build -j8 -Dtarget=$(python3 tools/package_release.py --zig-target ${{ matrix.target }}) \
+            -Doptimize=ReleaseFast -Dstrip=true -Drevision=$GITHUB_SHA --prefix zig-out/release cli lambda
           zig-out/release/bin/zpq --version | grep -q "$GITHUB_SHA"
           zig build check-runner -Doptimize=ReleaseSafe -j8
           zig-out/bin/zpq-check --cases tools/check/cases/release.json --zpq zig-out/release/bin/zpq --no-cache
+
+      # Unpinned, a Mac build inherits Zig's default minimum (macOS 15.0) and would refuse to start on older ones.
+      - name: Check the minimum macOS
+        if: runner.os == 'macOS'
+        run: |
+          want=$(python3 tools/package_release.py --zig-target ${{ matrix.target }})
+          want=${want#*-macos.}
+          got=$(otool -l zig-out/release/bin/zpq | awk '$1 == "cmd" { cmd = $2 }
+            (cmd == "LC_BUILD_VERSION" && $1 == "minos") || (cmd == "LC_VERSION_MIN_MACOSX" && $1 == "version") { print $2; exit }')
+          echo "zpq: minimum macOS $got"
+          [ "$got" = "$want" ] || { echo "zpq's minimum macOS is ${got:-missing}, not $want" >&2; exit 1; }
 
       - name: Lambda against the fake runtime
         if: runner.os == 'Linux'

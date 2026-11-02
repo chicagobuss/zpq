@@ -17,6 +17,13 @@
 - **Smaller definition levels in written files.** zpq wrote the few values left over before a run as one-value runs;
   it now packs them, so a re-encoded nullable file's definition levels are 63% smaller and PyArrow reads it about 6%
   faster. Written bytes change; the values don't.
+- **zpq sizes its work from the real caches on macOS.** It found no cache sizes on a Mac before (it read them only
+  from Linux sysfs), so cache-sized strategies fell back to guesses. It now asks `sysctl`, taking the smallest
+  per-worker share across Apple Silicon's core types, reads the cache line from the CPU on aarch64 Linux, and uses a
+  per-architecture default wherever a size can't be found. Grouped `COUNT(DISTINCT)` and top-count queries are
+  10–22% faster on an M5 Pro; Linux is unchanged.
+- **`EXPLAIN` no longer calls local files "remote input" off Linux.**
+- **The Mac archives run on macOS 11.0 and later.** They used to declare the build runner's macOS 15.0.
 
 ## 0.5.1 (2026-10-31)
 

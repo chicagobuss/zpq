@@ -829,7 +829,8 @@ fn pairAnswerBits(
         workers *| (identity.keys.len *| @sizeOf(key_pack.Plan.Binding) +| @sizeOf(P.Sink) +|
             @sizeOf(P.Reducer) +| @sizeOf(consumer.RecordSink) +| @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|
         work.len *| (@sizeOf(P.Sink.Source) +| @sizeOf(u32));
-    const companion_bytes = if (needsCompanions(calls)) PairCompanions.bytes(cut.?.k, calls.len, workers, false) else 0;
+    const companion_bytes = if (needsCompanions(calls)) PairCompanions.bytes(cut.?.k, calls.len, workers, false) +|
+        work.len *| @sizeOf(WorkItem) +| 3 *| plan.columns.read.len +| args.inputs.len *| @sizeOf(scan_types.Input) else 0;
     const peak = scratch +| pq.records +| gq.records +| @max(pq.finish, gq.finish) +| result_credit +| companion_bytes;
     if (peak > args.max_memory) return null;
     if (explain_only) return .{ .layout = .pair_distinct, .reservation = peak };
@@ -1142,7 +1143,10 @@ const PairCompanions = struct {
         }
         var rescan = args;
         try @import("input_rewind.zig").rewindInputs(a, &rescan);
-        _ = try runRecordWorkers(gpa, a, rescan, metas, plan, work, c.calls, keys, sinks, starts, outputs, timings);
+        const columns = try plan.forCalls(a, c.calls);
+        const rescan_work = try a.dupe(WorkItem, work);
+        for (rescan_work) |*item| item.columns = columns;
+        _ = try runRecordWorkers(gpa, a, rescan, metas, plan, rescan_work, c.calls, keys, sinks, starts, outputs, timings);
         for (1..c.workers) |w| for (c.states[0..stride], c.states[w * stride ..][0..stride]) |*dst, src|
             try dst.merge(src, c.a);
     }
@@ -1185,10 +1189,10 @@ fn compactPairAnswer(
         candidate_bound *| (2 * @sizeOf(G.Group) +| 2 * @sizeOf(u128) +| @sizeOf(MergedSlot) +|
             @sizeOf([]const AggValue) +| outputs.len *| @sizeOf(AggValue)) +| outputNamesBytes(outputs);
     const scratch = identity.retainedBytes() +| work.len *| (2 * @sizeOf(u32) +| 3 * @sizeOf(usize)) +|
-        args.inputs.len *| @sizeOf(scan_types.Input) +|
+        args.inputs.len *| @sizeOf(scan_types.Input) +| 3 *| plan.columns.read.len +|
         workers *| (owner_groups.batchRows(null) *| @sizeOf(u128) +| @sizeOf(O.Sink) +|
             @sizeOf(O.Reducer) +| @sizeOf(consumer.RecordSink) +| 2 * @sizeOf(usize) +|
-            @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable) +| @sizeOf(WorkItem) +| @sizeOf(u32));
+            @sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable) +| 2 *| @sizeOf(WorkItem) +| @sizeOf(u32));
     const peak = O.bytes(rows, workers, parts) +| G.State.charge(rows, workers, parts) +|
         O.finishBytes(rows, workers) +| retained +| scratch;
     if (peak > args.max_memory) return null;
@@ -1329,11 +1333,7 @@ fn compactPairRun(
             }
             try pass.run(gpa, args, metas, plan, prefix_work[0..width], keys, prefix_starts[0..width], outputs, run.timings, ledger);
             at += width;
-            const complete = complete: {
-                for (pass.firsts) |first| if (first.load(.monotonic) == std.math.maxInt(u32)) break :complete false;
-                break :complete true;
-            };
-            if (complete) break;
+            if (at == order.len or !pass.prefixMayImprove(starts[order[at]])) break;
         }
         for (pass.firsts) |first| if (first.load(.monotonic) == std.math.maxInt(u32))
             return error.ExceededMemoryBudget;

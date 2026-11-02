@@ -230,7 +230,6 @@ fn strictlyAscending(rows: []const u32) bool {
     return true;
 }
 
-
 /// What `scanRGForAgg` folds a row group's surviving rows into. The caller owns the state, which persists across
 /// row groups of one query.
 pub const AggTarget = union(enum) {
@@ -294,7 +293,9 @@ pub const AggTarget = union(enum) {
             if (self.grouped.dense == null) for (self.grouped.calls) |call| {
                 if (call.result == .f64 and (call.func == .min or call.func == .max)) return false;
             };
-            for (self.grouped.keys) |key| if (key == .col_ref and key.col_ref.col_idx == ci) return true;
+            for (self.grouped.keys) |key| if (@import("../expr/agg_coded.zig").codedKeyRef(key)) |source| {
+                if (source.col_idx == ci) return true;
+            };
         }
         return false;
     }
@@ -309,4 +310,3 @@ pub const AggTarget = union(enum) {
         return if (self == .grouped and self.grouped.table.countOnly()) &.{} else self.calls();
     }
 };
-

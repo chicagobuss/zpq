@@ -519,6 +519,75 @@ pub fn groupedCoded(
     return groupedCodedWithContext(ra, gpa, calls, keys, table, pos_base, batch, lookup, sel, budget, region, .{});
 }
 
+/// A key expression whose dictionary mapping preserves the source codes. Other expressions keep the row path.
+pub fn codedKeyRef(key: expr_ast.Expr) ?expr_ast.ColRef {
+    if (key == .col_ref) return key.col_ref;
+    if (key != .call or key.call.func != .regexp_replace) return null;
+    const arg = key.call.args[0].*;
+    return if (arg == .col_ref and arg.col_ref.expr_type == .str) arg.col_ref else null;
+}
+
+/// A single dictionary supplies all keys and values. Weighted folds are exact for counts, byte lengths and
+/// string extrema; arbitrary floating sums and faulting expressions retain their established row order.
+pub fn rewriteSource(calls: []const AggCall, keys: []const expr_ast.Expr) ?expr_ast.ColRef {
+    if (keys.len != 1 or keys[0] != .call) return null;
+    const source = codedKeyRef(keys[0]) orelse return null;
+    for (calls) |call| {
+        if (call.where != null or call.offset != 0 or call.func == .count_distinct) return null;
+        const arg = call.arg orelse {
+            if (call.func != .count) return null;
+            continue;
+        };
+        if (arg == .col_ref and arg.col_ref.col_idx == source.col_idx and arg.col_ref.expr_type == .str) {
+            if (call.func != .count and call.func != .min and call.func != .max) return null;
+        } else if (arg == .call and arg.call.func == .strlen) {
+            const input = arg.call.args[0].*;
+            if (input != .col_ref or input.col_ref.col_idx != source.col_idx or input.col_ref.expr_type != .str)
+                return null;
+        } else return null;
+    }
+    return source;
+}
+
+fn foldRewriteDictionary(
+    ra: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    table: *agg.GroupTable,
+    calls: []const AggCall,
+    keys: []const expr_ast.Expr,
+    gid_of: []const u32,
+    comp: []const u32,
+    space: usize,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const Sel,
+    ctx: agg.FoldContext,
+) !bool {
+    const source = rewriteSource(calls, keys) orelse return false;
+    const col = batch.cols[lookup[source.col_idx] orelse return false];
+    if (col != .string or col.string.codes == null or space != col.string.dict.len + 1) return false;
+    const counts = try compositeCounts(ra, comp, space, sel);
+    for (counts, 0..) |n, code| {
+        if (n == 0) continue;
+        const present = code < col.string.dict.len;
+        const hist = [_]u64{n};
+        const strings = [_][]const u8{if (present) col.string.dict[code] else ""};
+        const lengths = [_]i64{@intCast(strings[0].len)};
+        for (calls, 0..) |call, ai| {
+            if (!present and call.arg != null) continue;
+            var local: Accumulator = undefined;
+            const state = statePtr(table, table.accumulators.items, gid_of[code], ai, calls.len, &local);
+            const values: Column = if (call.arg != null and call.arg.? == .call)
+                .{ .i64 = .{ .values = &lengths } }
+            else
+                .{ .string = .{ .values = &strings } };
+            try foldHist(gpa, state, call, values, &hist, false, ctx.winner_charge);
+            if (table.compact.stride != 0) table.writeAcc(gid_of[code], ai, calls.len, state.*);
+        }
+    }
+    return true;
+}
+
 pub fn groupedCodedWithContext(
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -548,9 +617,10 @@ pub fn groupedCodedWithContext(
     const strides = try ra.alloc(usize, keys.len);
     var space: usize = 1;
     for (keys, 0..) |k, i| {
-        if (k != .col_ref) return false;
-        const pos = lookup[k.col_ref.col_idx] orelse return false;
-        const col = batch.cols[pos];
+        const source = codedKeyRef(k) orelse return false;
+        const pos = lookup[source.col_idx] orelse return false;
+        if (batch.cols[pos].codes() == null) return false;
+        const col = try expr_eval.evalCodedKey(ra, &batch.restrictedTo(sel), lookup, k);
         if (col.codes() == null or col.nullInfo().max_rep > 0) return false;
         key_cols[i] = col;
         strides[i] = space;
@@ -601,7 +671,7 @@ pub fn groupedCodedWithContext(
     // Each key's dictionary plus a trailing null entry, widened exactly as the row path widens key values.
     const kd_cols = try ra.alloc(Column, keys.len);
     for (keys, key_cols, 0..) |k, col, i| {
-        kd_cols[i] = try keyDictColumn(ra, col, k.col_ref, lookup.len);
+        kd_cols[i] = try keyDictColumn(ra, col, codedKeyRef(k).?, lookup.len);
     }
     var scratch: std.ArrayList(u8) = .empty;
     const rows = try ra.alloc(usize, keys.len);
@@ -632,6 +702,8 @@ pub fn groupedCodedWithContext(
         if (table.countOnly()) return true;
         break :blk &sunk;
     } else sel;
+    if (try foldRewriteDictionary(ra, gpa, table, calls, keys, gid_of, comp, space, batch, lookup, fold_sel, ctx))
+        return true;
     if (try foldExactBatch(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     if (try foldFloatBatches(ra, gpa, table, gid_of, comp, space, calls, batch, lookup, fold_sel)) return true;
     const agg_len = calls.len;
@@ -2089,7 +2161,6 @@ fn foldGroupedValue(
         return;
     }
     return foldGroupedNumeric(ra, accs, gid_of, comp, space, ai, agg_len, call, sel, table, vals_col, unsigned_64);
-
 }
 fn foldGroupedNumeric(
     ra: std.mem.Allocator,
@@ -2253,7 +2324,6 @@ fn foldGroupedNumeric(
         else => unreachable,
     }
 }
-
 
 inline fn statePtr(
     table: ?*agg.GroupTable,

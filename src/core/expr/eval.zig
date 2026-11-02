@@ -1271,7 +1271,7 @@ fn evalCall(
         .coalesce => return evalCoalesce(arena, batch, column_lookup, c.args, c.result_type, c.dec),
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
         .make_date, .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
-        .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c),
+        .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
     }
 }
@@ -1292,6 +1292,13 @@ fn evalCastText(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
     return col;
 }
 
+/// Coded grouping consumes this view directly; ordinary expression consumers retain their row value lanes.
+pub fn evalCodedKey(arena: std.mem.Allocator, batch: *const Batch, lookup: []const ?usize, e: ast.Expr) Error!Batch.Column {
+    if (e == .col_ref) return batch.cols[lookup[e.col_ref.col_idx] orelse return error.BadColumn];
+    if (e != .call or e.call.func != .regexp_replace) return error.TypeMismatch;
+    return evalRegexpReplace(arena, batch, lookup, e.call, true);
+}
+
 /// `regexp_replace` over a string column: a dictionary-coded column is replaced once per entry and read back by code,
 /// a plain one row by row, skipping NULL rows and rows the batch does not want. A text without a match is borrowed,
 /// not copied; replaced texts share one buffer.
@@ -1300,6 +1307,7 @@ fn evalRegexpReplace(
     batch: *const Batch,
     column_lookup: []const ?usize,
     c: ast.Call,
+    comptime keep_codes: bool,
 ) Error!Batch.Column {
     const arg = c.args[0].*;
     const col = if (arg == .col_ref)
@@ -1337,6 +1345,14 @@ fn evalRegexpReplace(
         .borrowed => |view| view,
         .built => |bounds| bytes.items[bounds[0]..bounds[1]],
     };
+    if (keep_codes and s.codes != null) return .{ .string = .{
+        .values = &.{},
+        .codes = s.codes,
+        .dict = mapped,
+        .def_levels = s.def_levels,
+        .max_def = s.max_def,
+        .has_nulls = s.has_nulls,
+    } };
     const values = if (s.codes) |codes| blk: {
         const out = try arena.alloc([]const u8, codes.len);
         for (codes, out) |code, *o| o.* = if (code < mapped.len) mapped[code] else "";

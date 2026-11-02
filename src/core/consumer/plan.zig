@@ -708,6 +708,12 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, s
         },
         .scalar => {},
     }
+    if (!staged and target == .grouped) if (agg_coded.rewriteSource(target.grouped.calls, target.grouped.keys)) |source| {
+        if (source.col_idx < n) {
+            u.code[source.col_idx] = true;
+            u.value[source.col_idx] = false;
+        }
+    };
     return u;
 }
 
@@ -780,4 +786,3 @@ fn markExprValues(u: CodeUses, e: expr_ast.Expr) void {
         },
     }
 }
-

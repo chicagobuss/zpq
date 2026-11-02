@@ -755,6 +755,14 @@ const DecodePlan = struct {
     full_estimate: usize = 0,
 };
 
+fn rewriteInput(target: AggTarget) ?usize {
+    if (target != .grouped or target.grouped.records != null or target.grouped.part != null or
+        target.grouped.dense != null) return null;
+    const source = agg_coded.rewriteSource(target.grouped.calls, target.grouped.keys) orelse return null;
+    if (source.physical_type != .BYTE_ARRAY or target.grouped.table.discovery != null) return null;
+    return source.col_idx;
+}
+
 fn planDecode(
     gpa: std.mem.Allocator,
     plan_alloc: std.mem.Allocator,
@@ -805,7 +813,13 @@ fn planDecode(
     // decompressed bytes into the row-group region and holds them until the scan releases every region.
     const stream_rows = streamWindowRows(in, target, num_rows);
     const stream = stream_rows != std.math.maxInt(usize);
-    const whole = !stream and !force_cache and fits_share and admitWhole(ws, full);
+    const keep_dictionary = if (rewriteInput(target)) |ci| blk: {
+        if (ci >= in.rg.columns.items.len) break :blk false;
+        const cm = in.rg.columns.items[ci].meta_data orelse break :blk false;
+        break :blk decode_options.encoded and cm.dictionary_page_offset != null and
+            !@import("../filter/membership.zig").dictionaryCoversChunk(&cm);
+    } else false;
+    const whole = !keep_dictionary and !stream and !force_cache and fits_share and admitWhole(ws, full);
     if (whole) return plan;
     if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
     if (try scanRGSliced(
@@ -1400,7 +1414,7 @@ fn openSlicedPayload(
         var options = decode_options;
         // A streamed string is compared or hashed from its bytes. Codes would take the dictionary fast path on a
         // pure-dictionary window and the value path on the next, which is not how the whole chunk folds.
-        options.any_dictionary = (target.codedKey(ci) and !streamByteArray(in, target, ci)) or
+        options.any_dictionary = rewriteInput(target) == ci or (target.codedKey(ci) and !streamByteArray(in, target, ci)) or
             (decode_options.encoded and scalarByteDistinct(in, target) == ci);
         options.decimal_exact_only = target.exactInputs();
         if (payload) |p| if (p[ci]) if (survivors) |sv| {
@@ -1558,7 +1572,7 @@ test "scalar dictionary distinct caches observed codes and falls back on memory 
     try t.expectEqual(@as(usize, 0), tight.used.load(.monotonic));
 }
 
-test "scalar dictionary distinct reads mixed pages with nullable and unused entries" {
+test "dictionary rewrite grouping and scalar distinct read mixed pages with nullable and unused entries" {
     const t = std.testing;
     const a = t.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1698,6 +1712,73 @@ test "scalar dictionary distinct reads mixed pages with nullable and unused entr
         try t.expectEqual(@as(usize, 4), acc[0].distinct.count());
         try t.expectEqual(@as(usize, if (encoded) 2 else 0), test_scalar_distinct_inserts);
     };
+    const source: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    const args = [_]*const expr_ast.Expr{&source};
+    const length: expr_ast.Expr = .{ .call = .{
+        .func = .strlen,
+        .args = @ptrCast(&args),
+        .result_type = .i64,
+        .depth = 2,
+    } };
+    const replacement = try @import("../expr/regex.zig").Replace.compile(ar, "^()([^/]*).*$", "\\1", "g");
+    const key: expr_ast.Expr = .{ .call = .{
+        .func = .regexp_replace,
+        .args = @ptrCast(&args),
+        .result_type = .str,
+        .depth = 2,
+        .replace = &replacement,
+    } };
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 },
+        .{ .func = .count, .arg = source, .where = null, .alias = "n", .result = .i64 },
+        .{ .func = .sum, .arg = length, .where = null, .alias = "s", .result = .i64 },
+        .{ .func = .avg, .arg = length, .where = null, .alias = "a", .result = .avg_f64 },
+        .{ .func = .min, .arg = source, .where = null, .alias = "lo", .result = .bytes },
+        .{ .func = .max, .arg = source, .where = null, .alias = "hi", .result = .bytes },
+    };
+    const handled: [calls.len]bool = @splat(false);
+    for ([_]usize{ 64, 128, 192 }) |window| {
+        var tables: [2]expr_agg.GroupTable = undefined;
+        for (&tables) |*table| table.* = expr_agg.GroupTable.init(a, 1 << 20);
+        defer for (&tables) |*table| table.deinit();
+        for (&tables, [_]bool{ false, true }) |*table, encoded| {
+            const target: AggTarget = .{ .grouped = .{ .calls = &calls, .keys = &.{key}, .table = table, .pos_base = 0 } };
+            try t.expectEqual(@as(?usize, 2), rewriteInput(target));
+            var scratch = DecodeScratch.init(a);
+            defer scratch.deinit();
+            var region = RowGroupArena.init(a);
+            defer region.deinit();
+            var timings: Timings = .{};
+            var budget: DecodeBudget = .{ .limit = 1 << 20 };
+            const ws: AggWorkspace = .{
+                .scratch = &scratch,
+                .rg_arena = &region,
+                .timings = &timings,
+                .budget = &budget,
+                .decode_batch_rows = window,
+            };
+            const kept = try scanRGSliced(a, input, .{ .encoded = encoded }, target, ws, &budget, &handled, 8192, window);
+            try t.expectEqual(@as(?u64, 192), kept);
+            var shifted = target;
+            shifted.grouped.pos_base = 192;
+            const next = try scanRGSliced(a, plain_input, .{ .encoded = encoded }, shifted, ws, &budget, &handled, 4096, window);
+            try t.expectEqual(@as(?u64, 64), next);
+        }
+        try t.expectEqual(@as(usize, 2), tables[0].groupCount());
+        try t.expectEqual(tables[0].groupCount(), tables[1].groupCount());
+        for (0..tables[0].groupCount()) |g| {
+            const other = try tables[1].getOrInsert(tables[0].keyAt(@intCast(g)), &calls, tables[0].first.items[g]);
+            try t.expectEqual(tables[0].first.items[g], tables[1].first.items[other]);
+            for (calls, 0..) |c, ai| {
+                const x = try @import("../scan/materialize.zig").materializeOne(a, c, tables[0].readAcc(g, ai, calls.len));
+                defer if (x == .s) a.free(x.s);
+                const y = try @import("../scan/materialize.zig").materializeOne(a, c, tables[1].readAcc(other, ai, calls.len));
+                defer if (y == .s) a.free(y.s);
+                try t.expectEqualDeep(x, y);
+            }
+        }
+        try t.expectEqual(@as(usize, 2), tables[1].groupCount());
+    }
 }
 
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
@@ -1720,6 +1801,7 @@ fn scanRGSliced(
     // Bitmap admission is optional; its refusal must not mark the decoder's allocator as refused.
     const seen_alloc = ws.planning_charged orelse side;
     const distinct_ci = if (decode_options.encoded) scalarByteDistinct(in, target) else null;
+    const rewrite_ci = if (decode_options.encoded) rewriteInput(target) else null;
     var distinct_seen: ScalarDistinctSeen = .{};
     defer distinct_seen.deinit(seen_alloc);
     const pool = try poolOn(&ws.scratch.slice, side);
@@ -1800,7 +1882,7 @@ fn scanRGSliced(
     var matched: u64 = 0;
     while (done < num_rows) {
         var n = @min(rows_now, num_rows - done);
-        if (distinct_ci) |ci| {
+        if (distinct_ci orelse rewrite_ci) |ci| {
             const at = lookup[ci] orelse return error.BadColumn;
             const reader = &readers.items[at];
             const raw = &reader.raw.bytes;
@@ -1816,7 +1898,9 @@ fn scanRGSliced(
                     if (!try raw.nextPage()) return error.ShortDecode;
                     try reader.holdDictionary(raw);
                 }
-                n = @min(n, raw.pageValuesLeft());
+                if (rewrite_ci != null and raw.active != .rle_dict) {
+                    raw.options.any_dictionary = false;
+                } else n = @min(n, raw.pageValuesLeft());
             }
         }
         defer done += n;
@@ -1910,8 +1994,8 @@ fn scanRGSliced(
                         &sel,
                     )) continue;
                 };
-                if (!discovering and decode_options.encoded and ws.decode_batch_rows != 0 and
-                    cacheExpressionsSafe(target))
+                if (!discovering and decode_options.encoded and (rewrite_ci != null or
+                    (ws.decode_batch_rows != 0 and cacheExpressionsSafe(target))))
                 {
                     try agg_coded.codePlainKeys(sa, g.keys, cols, lookup);
                     if (try agg_coded.groupedCodedWithContext(

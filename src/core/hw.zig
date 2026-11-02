@@ -577,17 +577,17 @@ test "hardware aarch64 line size comes from CTR_EL0 only where sysfs gave none" 
     try std.testing.expectEqual(@as(usize, 0), cpus[2].l1d.line_bytes);
 }
 
-test "hardware discovery sizes L2 and the cache line on macOS and finds a line on aarch64 Linux" {
+test "hardware discovery finds the cache line on Linux and macOS, and sizes macOS caches" {
+    // Live hardware: what a host must discover. The parsing behind it runs everywhere on fixtures above.
     const discovered = forCpu(0);
     if (comptime builtin.os.tag.isDarwin()) {
         if (std.c.getenv("ZPQ_HW_L2_BYTES") == null) try std.testing.expect(l2BytesPerWorker() != 0);
         try std.testing.expect(discovered.l2.bytes != 0);
         try std.testing.expectEqual(Sysctl.int(.{}, "hw.cachelinesize").?, cacheLineBytes());
-    } else if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+    }
+    // CPUID, sysfs or CTR_EL0 always gives Linux on these architectures a line.
+    if (comptime builtin.os.tag == .linux and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
         try std.testing.expect(process_line != 0);
         try std.testing.expect(std.math.isPowerOfTwo(process_line));
-    } else {
-        // x86 sizes come from CPUID and sysfs, which the sibling-sharing test above already reads.
-        return error.SkipZigTest;
     }
 }

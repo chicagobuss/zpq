@@ -181,5 +181,5 @@ test "writer page headers: equal extrema survive ordering policy and allocation 
             defer alloc.free(result);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{w.bytes()});
+    try std.testing.checkAllAllocationFailures(@import("../memory.zig").testing_fixed_growth.allocator, Check.run, .{w.bytes()});
 }

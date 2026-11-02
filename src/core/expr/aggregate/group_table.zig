@@ -1890,7 +1890,7 @@ fn cachedDistinctTrial(a: std.mem.Allocator) !void {
 
 test "cached string DISTINCT grows and merges exact bytes through allocation refusals" {
     try cachedDistinctTrial(testing.allocator);
-    try testing.checkAllAllocationFailures(testing.allocator, cachedDistinctTrial, .{});
+    try testing.checkAllAllocationFailures(core_memory.testing_fixed_growth.allocator, cachedDistinctTrial, .{});
 }
 
 test "shared string identity frames NULL empty embedded zero and large keys once through stored hash growth" {

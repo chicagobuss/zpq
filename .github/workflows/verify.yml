@@ -51,8 +51,9 @@ jobs:
     # itself is ~5 min on the runner; the rest is setup + downstream
     # checks. Real headroom matters more than aspirational tightness.
     # 25 since libzpq joined: its BoringSSL is compiled from source (position-independent), a few minutes cold.
-    # 120 while the commit tier plus the full-tier shards are measured on this 4-core runner (they outgrew 25 at 0.5.0).
-    timeout-minutes: 120
+    # 45 since 0.5.1: the commit tier takes about 20 minutes on the 4-core hosted runner, plus about 10 of setup and
+    # builds. The full-tier shards run in their own jobs (full-tier, below), not here.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -74,9 +75,11 @@ jobs:
         # but it dropped the conformance oracle below the floor. zpq reads all
         # 10 correctly (WKB as BYTE_ARRAY); a current pyarrow lets the floor
         # (72) count them. Bump deliberately alongside the corpus SHA.
+        # The check runner's own requirements (tools/check/requirements.txt) are the source of truth: its fixtures
+        # stage needs numpy (tools/datagen) as well, and their pyarrow pin satisfies the >=21 above.
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install --quiet --no-input "pyarrow==24.*" duckdb
+          .venv/bin/pip install --quiet --no-input -r tools/check/requirements.txt
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Cache Zig global build cache
@@ -165,21 +168,66 @@ jobs:
           echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  cli.tar.gz" | sha256sum -c -
           tar -xzf cli.tar.gz -C bin-2.0.0 duckdb
 
-      # The commit tier, then every full-tier shard but ClickBench (its 14 GB partitions live on the fleet). Each
-      # writes receipts; each `check` step fails unless its verdict passes for this SHA.
+      # The commit tier. It writes receipts, and the step fails unless its verdict passes for this SHA.
       - name: Commit tier
         run: zig build check -Dtier=commit -j8
-      - name: Full tier (units, integration, uncached cases, corpus, OS contracts, libzpq)
-        run: |
-          for shard in units-core units cases corpus os libzpq; do
-            zig build check -Dtier=full -Dshard=$shard -j8
-          done
 
       - name: Keep the receipts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: receipts
+          name: receipts-commit
+          path: zig-out/receipts
+
+  # Every full-tier shard but ClickBench (its 14 GB partitions live on the fleet), each in its own job, in parallel.
+  # Each does its own build and venv and shares the Zig build cache with the verify job.
+  full-tier:
+    name: Full tier (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # About 20 minutes is the commit tier's measure on this runner; a shard gets more only if it measures over 30.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [units-core, units, cases, corpus, os, libzpq]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Create Python test environment
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --no-input -r tools/check/requirements.txt
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Zig global build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: ${{ runner.os }}-x86_64-zig-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/*/build.zig') }}
+          restore-keys: ${{ runner.os }}-x86_64-zig-
+
+      - name: Install DuckDB 2.0
+        run: |
+          mkdir -p ~/.cache/zpq-duckdb2/bin-2.0.0 && cd ~/.cache/zpq-duckdb2
+          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
+          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  cli.tar.gz" | sha256sum -c -
+          tar -xzf cli.tar.gz -C bin-2.0.0 duckdb
+
+      - name: Full tier shard
+        run: zig build check -Dtier=full -Dshard=${{ matrix.shard }} -j8
+
+      - name: Keep the receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipts-${{ matrix.shard }}
           path: zig-out/receipts
 
   # Each native job runs its installed CLI and, on Linux, Lambda artifacts.

@@ -258,6 +258,92 @@ pub const RowSource = struct {
     }
 };
 
+/// Drop groups before allocating their output cells. Key predicates and output forms whose finalization can
+/// fail stay with ResultProgram, so a discarded group cannot hide an output error.
+pub fn pruneHaving(src: *RowSource, slots: []MergedSlot, having: ?*const expr_ast.Having) usize {
+    const h = having orelse return slots.len;
+    if (src.owner != null or src.dense != null) return slots.len;
+    for (src.outputs) |out| {
+        if (out.derived != null) return slots.len;
+        if (out.source == .agg) {
+            const call = src.calls[out.source.agg];
+            if (call.result == .dec or call.result == .avg_dec or call.state) return slots.len;
+        }
+    }
+    if (!havingFromStates(src, h.*)) return slots.len;
+    // Validate before touching slots. A deferred fold may reject a count even in a rejected group.
+    for (slots) |slot| for (src.outputs) |out| {
+        if (out.source != .agg) continue;
+        const call = src.calls[out.source.agg];
+        if (call.func == .count) {
+            const row = src.integerRow(slot);
+            _ = row.value(out.source.agg, .count) catch return slots.len;
+        }
+    };
+    var n: usize = 0;
+    for (slots) |slot| {
+        if (stateTruth(src, slot, h.*) == true) {
+            slots[n] = slot;
+            n += 1;
+        }
+    }
+    src.slots = slots[0..n];
+    return n;
+}
+
+fn havingFromStates(src: *const RowSource, h: expr_ast.Having) bool {
+    switch (h) {
+        .all, .any => |terms| {
+            for (terms) |t| if (!havingFromStates(src, t)) return false;
+            return true;
+        },
+        .cmp => |c| return stateColumn(src, c.column),
+        .null_check => |c| return stateColumn(src, c.column),
+    }
+}
+
+fn stateColumn(src: *const RowSource, column: usize) bool {
+    if (column >= src.outputs.len) return false;
+    const out = src.outputs[column];
+    return out.source == .agg and src.calls[out.source.agg].result != .bytes;
+}
+
+fn stateValue(src: *const RowSource, slot: MergedSlot, column: usize) AggValue {
+    const ai = src.outputs[column].source.agg;
+    const row = src.integerRow(slot);
+    const acc = if (row.table != null and row.table.?.compact.stride != 0)
+        row.table.?.readAcc(row.group, ai, src.calls.len)
+    else
+        row.accs[ai];
+    // The admitted non-decimal values cannot allocate or fail, and folding only normalizes floating zero/NaN.
+    const state = if (row.folded) foldedAcc(std.heap.page_allocator, src.calls[ai], acc) catch unreachable else acc;
+    return materializeOne(std.heap.page_allocator, src.calls[ai], state) catch unreachable;
+}
+
+fn stateTruth(src: *const RowSource, slot: MergedSlot, h: expr_ast.Having) ?bool {
+    switch (h) {
+        .all, .any => |terms| {
+            var unknown = false;
+            for (terms) |t| {
+                const v = stateTruth(src, slot, t) orelse {
+                    unknown = true;
+                    continue;
+                };
+                if (v == (h == .any)) return v;
+            }
+            return if (unknown) null else h == .all;
+        },
+        .null_check => |c| return (stateValue(src, slot, c.column) == .null_val) != c.is_not,
+        .cmp => |c| {
+            const order = @import("../result_program.zig").compareLiteral(
+                stateValue(src, slot, c.column),
+                c.literal,
+            ) orelse return null;
+            return c.op.holds(order);
+        },
+    }
+}
+
 /// Build `rows[i]` for `src.slots[i]`, on up to `n_workers` threads. `rows` must start empty; on an error each row
 /// holds what was built of it (see `RowSource.buildRow`), so the `AggOutput` owning it frees it whole, and the error
 /// is the one the lowest failing row gave, as a serial build would return.
@@ -962,3 +1048,65 @@ test "buildGroupRows: the error the lowest failing row gives, at every -j" {
     }
 }
 
+test "pruneHaving: state predicates agree with built rows, NULLs, hidden aggregates and tied LIMIT" {
+    const gpa = testing.allocator;
+    const ResultProgram = @import("../result_program.zig").ResultProgram;
+    var f = try RowFixture.init(8);
+    defer f.deinit();
+    f.slots[0].key = &.{0};
+    const calls = [_]expr_agg.AggCall{
+        .{ .func = .count, .result = .i64, .alias = "c", .arg = null, .where = null },
+        .{ .func = .sum, .result = .i64, .alias = "s", .arg = null, .where = null },
+        .{ .func = .avg, .result = .avg_f64, .alias = "a", .arg = null, .where = null },
+    };
+    const outputs = [_]BoundOutputColumn{
+        .{ .source = .{ .key = 0 }, .name = "k" },
+        .{ .source = .{ .agg = 0 }, .name = "c" },
+        .{ .source = .{ .agg = 1 }, .name = "s" },
+        .{ .source = .{ .agg = 2 }, .name = "hidden" },
+    };
+    var accs: [8 * calls.len]expr_agg.Accumulator = undefined;
+    for (0..8) |i| accs[i * calls.len ..][0..calls.len].* = .{
+        .{ .count = i / 2 },
+        .{ .sum_i = if (i % 3 == 0) null else @as(i128, @intCast(i)) - 4 },
+        .{ .avg = .{ .sum = @floatFromInt(i), .count = if (i == 0) 0 else 2, .isum = 0 } },
+    };
+    const terms = [_]expr_ast.Having{
+        .{ .cmp = .{ .column = 1, .op = .ge, .literal = .{ .number = "1" } } },
+        .{ .cmp = .{ .column = 2, .op = .lt, .literal = .{ .number = "0.5" } } },
+        .{ .cmp = .{ .column = 3, .op = .ge, .literal = .{ .number = "1.5" } } },
+        .{ .null_check = .{ .column = 2, .is_not = false } },
+    };
+    const predicates = terms ++ [_]expr_ast.Having{
+        .{ .all = &terms },                                                      .{ .any = &terms },
+        .{ .cmp = .{ .column = 1, .op = .ge, .literal = .{ .number = "0" } } },  .{ .cmp = .{ .column = 1, .op = .lt, .literal = .{ .number = "0" } } },
+        .{ .cmp = .{ .column = 0, .op = .eq, .literal = .{ .string = "g3" } } }, .{ .cmp = .{ .column = 2, .op = .eq, .literal = .null } },
+    };
+    for (predicates) |h| {
+        var answers: [2]AggOutput = .{ .{}, .{} };
+        defer for (&answers) |*out| out.deinit(gpa);
+        for (&answers, 0..) |*out, mode| {
+            const slots = try gpa.dupe(MergedSlot, f.slots);
+            defer gpa.free(slots);
+            var src = f.source();
+            src.slots = slots;
+            src.outputs = &outputs;
+            src.calls = &calls;
+            src.accs = &accs;
+            if (mode == 1) _ = pruneHaving(&src, slots, &h);
+            const rows = try gpa.alloc([]const AggValue, src.slots.len);
+            @memset(rows, &.{});
+            out.group_rows = rows;
+            try buildGroupRows(gpa, &out.slab, src, rows, 3);
+            const cols = try gpa.alloc([]const u8, outputs.len);
+            out.group_cols = cols;
+            for (cols, outputs) |*c, o| c.* = try gpa.dupe(u8, o.name);
+            try (ResultProgram{ .order = .{
+                .having = &h,
+                .keys = &.{.{ .column = 1, .descending = true }},
+                .limit = 2,
+            }, .visible = 3 }).finish(gpa, out, null);
+        }
+        try testing.expectEqualDeep(answers[0].group_rows, answers[1].group_rows);
+    }
+}

@@ -2087,6 +2087,7 @@ fn prepareAggregateWithMetas(
             .dense = dense_direct,
             .identity = if (dense_identity) |*identity| identity else null,
         };
+        slots.items.len = scan_rows.pruneHaving(&row_src, slots.items, order.having);
         // A small cut owns its few surviving strings instead of retaining every source arena.
         if (dense_direct == null and order.keys.len == 0 and order.limit == null and order.offset == 0 and
             order.having == null and order.hidden.len == 0)

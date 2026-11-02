@@ -974,13 +974,6 @@ const EncodeState = struct {
     }
 };
 
-fn valueRows(cols: []const filter_eval.Batch.Column) usize {
-    if (cols.len == 0) return 0;
-    return switch (cols[0]) {
-        inline else => |c| c.rowCount(),
-    };
-}
-
 pub const WinCtx = struct {
     const writer = winWriter;
     const producer = winProducer;
@@ -2329,4 +2322,3 @@ test "windowed dispatch drains a producer failure despite cancellation midway th
         try std.testing.expectEqual(Fake.n, fake.finished);
     }
 }
-

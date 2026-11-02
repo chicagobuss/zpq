@@ -415,19 +415,6 @@ fn handleS3(
     );
 }
 
-const POOL_SIZE = service.POOL_SIZE;
-
-fn initPool(
-    self: *s3.Pool(POOL_SIZE),
-    arena: std.mem.Allocator,
-    creds: s3.Credentials,
-    bucket: []const u8,
-) !void {
-    _ = creds;
-    _ = bucket;
-    try self.init(arena);
-}
-
 fn parseTotalFromContentRange(cr_or_null: ?[]const u8) !u64 {
     const cr = cr_or_null orelse return error.NoContentRange;
     const slash = std.mem.indexOfScalar(u8, cr, '/') orelse return error.BadContentRange;

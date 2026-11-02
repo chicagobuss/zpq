@@ -501,28 +501,6 @@ pub fn decodeFloat16ColumnAsF64(
     };
 }
 
-/// Decode an INT32 column whose values are unsigned, zero-extending each into
-/// an `i64` lane (`u32` → `i64`). See `schema.isUnsignedIntTo32`.
-fn decodeU32ColumnAsI64(
-    arena: std.mem.Allocator,
-    chunk: []const u8,
-    codec: schema.CompressionCodec,
-    levels: schema.Levels,
-    num_leaves: usize,
-    decode_options: DecodeOptions,
-) !filter_eval.ColumnT(i64) {
-    const c32 = try decodeColumnTWithOptions(i32, arena, chunk, codec, levels, num_leaves, decode_options);
-    const out = try arena.alloc(i64, c32.values.len);
-    for (c32.values, 0..) |v, i| out[i] = @as(i64, @as(u32, @bitCast(v)));
-    return .{
-        .values = out,
-        .def_levels = c32.def_levels,
-        .max_def = c32.max_def,
-        .rep_levels = c32.rep_levels,
-        .has_nulls = c32.has_nulls,
-    };
-}
-
 /// FIXED_LEN_BYTE_ARRAY columns decode to raw fixed-width `[]const u8` slices
 /// (no per-value length prefix). `type_length` is the column's fixed byte width
 /// from its SchemaElement. Decimal-FLBA has its own f64 path (decimal.zig); this

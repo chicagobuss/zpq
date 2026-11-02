@@ -1076,8 +1076,6 @@ test "selective composite COUNT keeps its packed owner while wider filters retai
     try testing.expect(wider.dense);
 }
 
-
-
 test "selected owner coded identity replays a late dictionary mismatch after earlier records" {
     try selectedIdentityReplayTrial(false);
 }
@@ -1252,8 +1250,6 @@ test "selected packed COUNT runs the typed owner for INT32 keys with original NU
     try testing.expectEqual(@as(usize, 64), (try explainAggregate(gpa, a, args)).workers);
 }
 
-
-
 test "integer COUNT repeated RG dictionaries stay coded after complete union refinement" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -1357,6 +1353,8 @@ test "M1 finish DISTINCT selected owners match sets for skew NULL groups argumen
     const Case = struct { group: ?[]const u8, agg: []const u8, filter: ?[]const u8 = null, top: bool = false };
     const cases = [_]Case{
         .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c" },
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n" },
+        .{ .group = "k", .agg = "count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a", .top = true },
         .{ .group = "s", .agg = "count(*) AS c,count(DISTINCT x) AS d", .top = true },
         .{ .group = "k,s", .agg = "count(DISTINCT x) AS d" },
         .{ .group = "k", .agg = "count(DISTINCT x) AS d", .filter = "k = 0" },
@@ -2127,4 +2125,3 @@ test "shared string scan preserves full grouped and scalar answers NULLs origina
     try testing.expect((try explainAggregate(gpa, a, tight)).record_path == null);
     try testing.expectEqual(held, ledger.used.load(.monotonic));
 }
-

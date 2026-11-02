@@ -337,8 +337,7 @@ fn bitmapAnswer(
     return result;
 }
 
-/// A DISTINCT program uses one exact pair identity, plus optional count(*) calls sharing its duplicate weights.
-/// Other aggregates retain the ordinary partition merge; no partial result crosses an identity refusal.
+/// Pair counts and plain integer aggregates share group identities, not DISTINCT duplicate weights.
 pub fn inlinePairAnswer(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -357,13 +356,18 @@ pub fn inlinePairAnswer(
     if (!args.integer_records or args.distinct_pairs == .off or !allRescannable(args.inputs) or work.len == 0)
         return null;
     var distinct: ?usize = null;
+    var companions = false;
     for (calls, 0..) |call, i| {
-        if (call.where != null or call.state or call.offset != 0 or call.result != .i64) return null;
+        if (call.where != null or call.state or call.offset != 0) return null;
         if (call.func == .count_distinct) {
-            if (distinct != null or call.arg == null or call.arg.? != .col_ref) return null;
+            if (distinct != null or call.arg == null or call.arg.? != .col_ref or call.result != .i64) return null;
             distinct = i;
-        } else if (call.func != .count or call.arg != null) return null;
+        } else if (call.func != .count or call.arg != null) {
+            companions = true;
+        } else if (call.result != .i64) return null;
     }
+    if (companions and (agg_plan.OwnerProgram.init(calls) == null or !args.grouped() or
+        args.result_order.having != null or args.result_order.hidden.len != 0)) return null;
     const di = distinct orelse return null;
     const keys = keys_opt orelse &.{};
     const outputs = outputs_opt orelse &.{};
@@ -419,7 +423,11 @@ pub fn inlinePairAnswer(
     var identity = if (raw) |p| p else (try key_pack.Plan.init(gpa, axes, if (domain) |*d| d else null)) orelse return null;
     raw = null;
     defer identity.deinit(gpa);
-    const top = if (keys_opt != null) countCut(outputs, calls, args.result_order) else null;
+    const candidate_cut = if (keys_opt != null) countCut(outputs, calls, args.result_order) else null;
+    const top = if (candidate_cut) |cut|
+        (if (cut.a_idx == di or calls[cut.a_idx].arg == null) candidate_cut else null)
+    else
+        null;
     if (identity.fitsBits(u64)) {
         if (top) |cut| if (cut.k > 0) return pairAnswerBits(
             u64,
@@ -685,9 +693,9 @@ fn finishPairOutput(
     var key_bytes: usize = 0;
     for (outputs, types) |out, *ty| {
         ty.* = .{
-            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else .i64,
+            .lane = if (out.source == .key and key_types[out.source.key] == .string) .string else if (out.source == .agg and calls[out.source.agg].func == .avg) .f64 else .i64,
             .nullable = out.source == .key or calls[out.source.agg].func != .count,
-            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else null,
+            .source = if (out.source == .key) leafSchemaElem(&metas[0], keys[out.source.key].col_ref.col_idx) else owner_support.passThroughSource(calls[out.source.agg], &metas[0]),
         };
         if (out.source == .key) if (identity.domain) |d| switch (d.axes[out.source.key].values) {
             .bytes => |values| {
@@ -899,10 +907,29 @@ fn pairAnswerBits(
         }
     }.make);
     if (!args.unordered) try sortSlotsByFirst(a, slots, workers);
+    var companion_charge: core_memory.Charged = .{ .child = gpa, .budget = ledger };
+    var companion_arena = std.heap.ArenaAllocator.init(companion_charge.allocator());
+    defer companion_arena.deinit();
+    const ca = companion_arena.allocator();
+    var companion: ?PairCompanions = null;
+    if (needsCompanions(calls)) {
+        const group_keys = try ca.alloc(u128, slots.len);
+        for (slots, group_keys) |slot, *key| key.* = if (top) top_groups[slot.idx].key else receiver.at(slot.idx).key;
+        companion = PairCompanions.init(ca, companion_charge.allocator(), identity, group_keys, calls, workers) catch |e| {
+            if (e == error.OutOfMemory and companion_charge.refused.load(.monotonic)) return error.ExceededMemoryBudget;
+            return e;
+        };
+        companion.?.run(gpa, arena, args, metas, plan, work, keys, starts, outputs, run.timings, ledger) catch |e| {
+            if (e == error.OutOfMemory and companion_charge.refused.load(.monotonic)) return error.ExceededMemoryBudget;
+            return e;
+        };
+    }
     const View = struct {
         groups: []const G.Group,
         full: ?*F,
         distinct: usize,
+        companion: ?*const PairCompanions,
+        calls: []const expr_agg.AggCall,
         fn at(v: *const @This(), i: usize) *const G.Group {
             return if (v.full) |f| f.at(i) else &v.groups[i];
         }
@@ -912,13 +939,22 @@ fn pairAnswerBits(
         }
         fn integer(ctx: *const anyopaque, i: usize, call: usize) anyerror!?i128 {
             const v: *const @This() = @ptrCast(@alignCast(ctx));
-            return if (call == v.distinct) v.at(i).integer(0) else v.at(i).weight;
+            if (call == v.distinct) return v.at(i).integer(0);
+            if (v.companion) |c| return switch (c.accumulator(v.at(i).key, call)) {
+                .count => |number| number,
+                .sum_i, .min_i, .max_i => |number| number,
+                else => error.BadAggArg,
+            };
+            return v.at(i).weight;
         }
-        fn value(ctx: *const anyopaque, _: std.mem.Allocator, i: usize, call: usize) anyerror!AggValue {
+        fn value(ctx: *const anyopaque, allocator: std.mem.Allocator, i: usize, call: usize) anyerror!AggValue {
+            const v: *const @This() = @ptrCast(@alignCast(ctx));
+            if (call != v.distinct) if (v.companion) |c|
+                return @import("materialize.zig").materializeOne(allocator, v.calls[call], c.accumulator(v.at(i).key, call));
             return .{ .i = (try integer(ctx, i, call)).? };
         }
     };
-    const view: View = .{ .groups = top_groups, .full = if (top) null else receiver, .distinct = distinct };
+    const view: View = .{ .groups = top_groups, .full = if (top) null else receiver, .distinct = distinct, .companion = if (companion) |*c| c else null, .calls = calls };
     var output: AggOutput = .{};
     errdefer output.deinit(gpa);
     const names_credit = outputNamesBytes(outputs);
@@ -952,3 +988,118 @@ pub fn countedCalls(arena: std.mem.Allocator, calls: []const expr_agg.AggCall, i
     out[i].func = .count;
     return out;
 }
+
+fn needsCompanions(calls: []const expr_agg.AggCall) bool {
+    for (calls) |call| if (call.func != .count_distinct and (call.func != .count or call.arg != null)) return true;
+    return false;
+}
+
+/// The count cut is final before this pass: only retained groups need plain payload state.
+const PairCompanions = struct {
+    a: std.mem.Allocator,
+    batch_allocator: std.mem.Allocator,
+    identity: key_pack.Plan,
+    index: std.AutoHashMap(u128, u32),
+    calls: []expr_agg.AggCall,
+    states: []expr_agg.Accumulator,
+    workers: usize,
+
+    fn init(a: std.mem.Allocator, batch_allocator: std.mem.Allocator, identity: *const key_pack.Plan, keys: []const u128, calls: []const expr_agg.AggCall, workers: usize) !PairCompanions {
+        var group_identity = identity.*;
+        group_identity.keys = identity.keys[0 .. identity.keys.len - 1];
+        if (identity.fields.len != 0) group_identity.fields = identity.fields[0 .. identity.fields.len - 1];
+        if (identity.radices.len != 0) group_identity.radices = identity.radices[0 .. identity.radices.len - 1];
+        var index = std.AutoHashMap(u128, u32).init(a);
+        for (keys, 0..) |key, i| try index.put(key, @intCast(i));
+        const plain = try a.dupe(expr_agg.AggCall, calls);
+        for (plain) |*call| if (call.func == .count_distinct) {
+            call.func = .count;
+            call.arg = null;
+        };
+        const states = try a.alloc(expr_agg.Accumulator, workers * keys.len * calls.len);
+        for (states, 0..) |*state, i| state.* = .init(plain[i % plain.len]);
+        return .{ .a = a, .batch_allocator = batch_allocator, .identity = group_identity, .index = index, .calls = plain, .states = states, .workers = workers };
+    }
+
+    fn accumulator(c: *const PairCompanions, key: u128, call: usize) expr_agg.Accumulator {
+        return c.states[c.index.get(key).? * c.calls.len + call];
+    }
+
+    const Sink = struct {
+        pass: *PairCompanions,
+        states: []expr_agg.Accumulator,
+        sources: []const WorkItem,
+        item: usize = 0,
+        fn start(ctx: *anyopaque, _: u64, item: usize) void {
+            const s: *Sink = @ptrCast(@alignCast(ctx));
+            s.item = item;
+        }
+        fn batch(ctx: *anyopaque, source: consumer.SelectedBatch, lookup: []const ?usize) anyerror!void {
+            const s: *Sink = @ptrCast(@alignCast(ctx));
+            var temporary = std.heap.ArenaAllocator.init(s.pass.batch_allocator);
+            defer temporary.deinit();
+            const a = temporary.allocator();
+            const at = s.sources[s.item];
+            const bound = (try s.pass.identity.bind(a, source, lookup, at.file, at.rg)) orelse
+                return error.ExceededMemoryBudget;
+            for (0..source.batch.num_rows) |row| {
+                if (source.selected) |selection| if (!selection.isActive(row)) continue;
+                const key = try bound.packAs(u128, row);
+                const id = s.pass.index.get(key) orelse continue;
+                for (s.pass.calls, s.states[id * s.pass.calls.len ..][0..s.pass.calls.len]) |call, *state| {
+                    if (call.arg == null) {
+                        state.count += 1;
+                        continue;
+                    }
+                    const ref = call.arg.?.col_ref;
+                    const pos = lookup[ref.col_idx] orelse return error.BadColumn;
+                    const col = source.batch.cols[pos];
+                    const ni = col.nullInfo();
+                    if (ni.def_levels) |levels| if (levels[row] < ni.max_def) continue;
+                    if (call.func == .count) {
+                        state.count += 1;
+                        continue;
+                    }
+                    const value: i128 = switch (col) {
+                        inline .i32, .i64 => |lane| value: {
+                            const index = if (lane.codes) |codes| codes[row] else row;
+                            const values = if (lane.codes != null) lane.dict else lane.values;
+                            if (index >= values.len) return error.BadColumn;
+                            const v: i64 = values[index];
+                            break :value if (ref.unsigned_32) @as(u32, @truncate(@as(u64, @bitCast(v)))) else v;
+                        },
+                        else => return error.BadColumn,
+                    };
+                    switch (state.*) {
+                        .sum_i => |*sum| sum.* = (sum.* orelse 0) + value,
+                        .min_i => |*minimum| minimum.* = if (minimum.*) |v| @min(v, value) else value,
+                        .max_i => |*maximum| maximum.* = if (maximum.*) |v| @max(v, value) else value,
+                        .avg => |*avg| {
+                            avg.isum += value;
+                            avg.count += 1;
+                        },
+                        else => return error.BadAggArg,
+                    }
+                }
+            }
+        }
+    };
+
+    fn run(c: *PairCompanions, gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs, metas: []const schema.FileMetaData, plan: *const agg_plan.Plan, work: []const WorkItem, keys: []const expr_ast.Expr, starts: []const u32, outputs: []const BoundOutputColumn, timings: Timings, ledger: *core_memory.SharedBudget) !void {
+        const credit = c.workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable));
+        _ = ledger.drawExact(credit) orelse return error.ExceededMemoryBudget;
+        var retained = false;
+        defer if (!retained) ledger.release(credit);
+        const adapters = try c.a.alloc(Sink, c.workers);
+        const sinks = try c.a.alloc(consumer.RecordSink, c.workers);
+        const stride = c.index.count() * c.calls.len;
+        for (adapters, sinks, 0..) |*adapter, *sink, i| {
+            adapter.* = .{ .pass = c, .states = c.states[i * stride ..][0..stride], .sources = work };
+            sink.* = .{ .selected = .{ .ctx = adapter, .startFn = Sink.start, .batchFn = Sink.batch } };
+        }
+        _ = try runRecordWorkers(gpa, arena, args, metas, plan, work, c.calls, keys, sinks, starts, outputs, timings);
+        for (1..c.workers) |w| for (c.states[0..stride], c.states[w * stride ..][0..stride]) |*dst, src|
+            try dst.merge(src, c.a);
+        retained = args.ledger != null;
+    }
+};

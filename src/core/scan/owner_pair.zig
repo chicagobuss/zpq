@@ -401,12 +401,14 @@ pub fn inlinePairAnswer(
         if (input.logical_size != 0 and input.logical_size != bytes.len) return null;
         file.* = .{ .bytes = bytes, .local = !std.mem.startsWith(u8, input.name, "s3://") };
     }
-    const workers = @min(requested, owner_groups.max_workers);
     var domain: ?agg_dense.Domain = null;
     defer if (domain) |*d| d.deinit(gpa);
     var raw = if (automatic_single) try pairRawIdentity(gpa, arena, metas, axes, args.scan_all) else null;
     errdefer if (raw) |*p| p.deinit(gpa);
     if (automatic_single and raw == null) return null;
+    const use_siblings = if (std.c.getenv("ZPQ_CD_SMT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    const owner_workers = if (use_siblings or raw == null) requested else @import("../hw.zig").independentOwnerWorkers(requested);
+    const workers = @min(owner_workers, owner_groups.max_workers);
     // The retained dictionary identity cannot bind a chunk containing non-dictionary data. Decline known
     // fallback before building its union; missing encoding_stats remain speculative, and forced owners replay.
     if (raw == null and args.distinct_pairs == .auto) for (axes) |axis| for (work) |item| {

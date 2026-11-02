@@ -47,6 +47,7 @@ var process_l1d: usize = 0;
 var process_line: usize = 0;
 var process_l2: usize = 0;
 var process_l3: usize = 0;
+var process_owner_workers: usize = 0;
 const unknown: Cpu = .{};
 
 /// Diagnostics only; execution policies use the stable process-affinity minimum below.
@@ -197,6 +198,7 @@ fn discover() void {
         if (process_l1d == std.math.maxInt(usize)) process_l1d = 0;
         process_l2 = affinityMinimum(&detected, allowed);
         process_l3 = affinityL3Minimum(&detected, allowed);
+        process_owner_workers = affinityOwnerWorkers(&detected, allowed) orelse 0;
     }
 }
 
@@ -590,4 +592,50 @@ test "hardware discovery finds the cache line on Linux and macOS, and sizes macO
         try std.testing.expect(process_line != 0);
         try std.testing.expect(std.math.isPowerOfTwo(process_line));
     }
+}
+
+/// Independent L2 domains whose L1 sharing agrees: shared cluster caches are not SMT cores.
+pub fn independentOwnerWorkers(requested: usize) usize {
+    if (test_cpu != null) return requested;
+    _ = forCpu(0);
+    return if (process_owner_workers == 0) requested else @min(requested, process_owner_workers);
+}
+
+fn affinityOwnerWorkers(cpus: []const Cpu, affinity: CpuSet) ?usize {
+    var remaining = affinity;
+    var count: usize = 0;
+    while (remaining.findFirstSet()) |id| {
+        if (id >= cpus.len) return null;
+        const domain = cpus[id].l2.cpus;
+        if (!domain.isSet(id) or !domain.eql(cpus[id].l1d.cpus)) return null;
+        const active = domain.intersectWith(affinity);
+        var it = active.iterator(.{});
+        while (it.next()) |other| {
+            if (other >= cpus.len or !domain.eql(cpus[other].l2.cpus) or
+                !domain.eql(cpus[other].l1d.cpus)) return null;
+        }
+        remaining = remaining.differenceWith(active);
+        count += 1;
+    }
+    return if (count == 0) null else count;
+}
+
+test "owner workers follow allowed L2 siblings and decline unknown or shared-cluster topology" {
+    var cpus: [4]Cpu = @splat(.{});
+    const first = parseCpuList("0,1").?;
+    const second = parseCpuList("2,3").?;
+    const all = parseCpuList("0-3").?;
+    for (&cpus, 0..) |*cpu, i| {
+        cpu.l1d.cpus = if (i < 2) first else second;
+        cpu.l2.cpus = cpu.l1d.cpus;
+    }
+    try std.testing.expectEqual(@as(?usize, 2), affinityOwnerWorkers(&cpus, all));
+    try std.testing.expectEqual(@as(?usize, 2), affinityOwnerWorkers(&cpus, parseCpuList("0,2,3").?));
+    try std.testing.expectEqual(@as(?usize, 1), affinityOwnerWorkers(&cpus, first));
+    cpus[0].l1d.cpus = .empty;
+    try std.testing.expectEqual(null, affinityOwnerWorkers(&cpus, all));
+    cpus[0].l1d.cpus = first;
+    for (&cpus) |*cpu| cpu.l2.cpus = all;
+    try std.testing.expectEqual(null, affinityOwnerWorkers(&cpus, all));
+    try std.testing.expectEqual(null, affinityOwnerWorkers(&cpus, .empty));
 }

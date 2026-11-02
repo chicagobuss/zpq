@@ -1982,15 +1982,16 @@ test "--cache reads through the page cache and never O_DIRECT" {
     const narrow = cache.choose(0, 0.1);
     try testing.expect(!wide.directRead());
     try testing.expect(!narrow.directRead());
-    try testing.expectEqual(Reason.page_cache, wide.reason);
-    try testing.expectEqual(Reason.page_cache, narrow.reason);
-    try testing.expectEqualStrings("through the page cache (--cache)", wide.reason.phrase());
-    if (builtin.os.tag == .linux and uringAvailable()) {
-        try testing.expectEqual(Mode.uring, wide.mode);
-    } else if (builtin.os.tag == .linux) {
-        try testing.expectEqual(Mode.pread, wide.mode);
+    try testing.expectEqualStrings("through the page cache (--cache)", Reason.page_cache.phrase());
+    if (builtin.os.tag == .linux) {
+        try testing.expectEqual(Reason.page_cache, wide.reason);
+        try testing.expectEqual(Reason.page_cache, narrow.reason);
+        try testing.expectEqual(if (uringAvailable()) Mode.uring else Mode.pread, wide.mode);
+        try testing.expectEqual(Mode.pread, narrow.mode);
+    } else {
+        // Off Linux `auto` always maps, and a mapping reads through the page cache.
+        for ([_]Choice{ wide, narrow }) |choice| try testing.expectEqual(Choice{ .mode = .mmap, .reason = .not_linux }, choice);
     }
-    try testing.expectEqual(Mode.pread, narrow.mode);
     const hot = cache.choose(Policy.warm_resident, 1);
     try testing.expectEqual(Mode.mmap, hot.mode);
     try testing.expectEqual(Reason.cached, hot.reason);

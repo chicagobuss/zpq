@@ -1563,6 +1563,7 @@ test "consumed numeric distinct source releases only nonphysical credit" {
 }
 
 test "distinct hash growth remaps without copy when replacement overlap does not fit" {
+    if (!core_memory.page_growth_without_copy) return error.SkipZigTest;
     const a = std.heap.page_allocator;
     var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };
     var set: DistinctSet = .{ .shared = &budget };
@@ -1594,6 +1595,8 @@ test "distinct hash growth remaps without copy when replacement overlap does not
 }
 
 test "distinct wide and string maps retain identities after no-copy growth" {
+    // Each budget fits only the growth no-copy remap gives, which needs Linux's mremap.
+    if (!core_memory.page_growth_without_copy) return error.SkipZigTest;
     const a = std.heap.page_allocator;
     {
         var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };

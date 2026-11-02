@@ -538,6 +538,12 @@ test "COUNT certificate sample reads real pages across row groups and repeated i
 }
 
 test "hot COUNT certificate matches canonical clustered keys, NULLs, ties, offsets and late cold values" {
+    // Whether a late cold value survives depends on how many keys the hot plan retains in a worker's L2 share: with
+    // a share that holds this fixture's whole domain, every run certifies. The plan is made on this thread, so fix
+    // the share at the policies' default.
+    const hw = @import("../hw.zig");
+    hw.test_cpu = .{ .l2 = .{ .bytes = 640 << 10 } };
+    defer hw.test_cpu = null;
     var certified = false;
     var residual = false;
     for ([_][]const u8{ "plain", "dict" }) |encoding| {

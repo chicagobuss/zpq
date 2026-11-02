@@ -1432,8 +1432,10 @@ test "M1 finish DISTINCT poisoned NULL record bounds replay with and without cou
     const cache_slots = @import("../owner_cache.zig").capacity(@sizeOf(P.Groups.Record));
     // Cycle a domain well beyond the producer cache. NULL presence records cannot be bounded by its NDV:
     // eviction and the low-hit bypass can emit one record per input row, even for the same group.
-    const groups = @max(4096, cache_slots * 8);
-    // The writer requires at least 64 present values and at most 10% distinct integer keys for dictionaries.
+    // The writer requires at least 64 present values and at most 10% distinct integer keys for dictionaries, and
+    // the 64 present values close the file: all of it is one row group, however large the host's cache.
+    const groups: usize = @min(@max(4096, cache_slots * 8), (consumer.answer_rg_rows - 64) / 16);
+    try testing.expect(groups >= cache_slots * 2);
     const rows = groups * 16 + 64;
     const k = try a.alloc(i32, rows);
     const x = try a.alloc(i32, rows);

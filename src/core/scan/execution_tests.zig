@@ -254,6 +254,8 @@ test "partagg: a spawn failure does not change the answer" {
 }
 
 test "runMultiAggregate: skewed work does not let idle workers strand the budget" {
+    // Its budget fits only a table that grows without a copy: off Linux each growth overlaps the old table.
+    if (!@import("../memory.zig").page_growth_without_copy) return error.SkipZigTest;
     // Blocks sized as a fraction of the whole budget rather than of each worker's share let fifteen barely-grouping
     // workers strand most of the pool at -j16. Admission cannot depend on worker count when live state fits the budget.
     const heavy = "ci/fixtures/parquet/spawn_budget_a.parquet";
@@ -956,6 +958,8 @@ test "runMultiAggregate: a census cut frees everything on any allocation failure
 }
 
 test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns fail" {
+    // Its budget fits only a table that grows without a copy: off Linux each growth overlaps the old table.
+    if (!@import("../memory.zig").page_growth_without_copy) return error.SkipZigTest;
     // A spawn failure must not turn a query that fits `max_memory` into ExceededMemoryBudget. Reaching that path
     // needs four things at once:
     //

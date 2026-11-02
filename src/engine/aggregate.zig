@@ -338,7 +338,8 @@ fn executeAggregateOver(
         };
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
-    const all_local = on_linux and allLocal(opened);
+    const local = allLocal(opened);
+    const all_local = on_linux and local;
     // Files mapped when descriptors ran short gave theirs back: read through the mapping unless a mode is asked for.
     const choose_io = all_local and (io_policy.profile != .auto or opened.descriptorsHeld());
     // Anything but the plain mapping needs the footers and the plan here: the explicit modes to read by them, and
@@ -366,8 +367,14 @@ fn executeAggregateOver(
     // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
     // the page cache's, not the query's.
     const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
+    // Off Linux a local file is always mapped: the mode asked for, or the only one there is.
+    const mapped_reason: local_reader.Reason = if (all_local)
+        .mapping
+    else if (!local)
+        .remote
+    else if (io_policy.profile == .mmap) .explicit else .not_linux;
     var choice: local_reader.Choice = if (!choose_io)
-        .{ .mode = .mmap, .reason = if (all_local) .mapping else .remote }
+        .{ .mode = .mmap, .reason = mapped_reason }
     else
         io_policy.choose(resident, coverage);
     choice = choice.withinReader(fits_reader);

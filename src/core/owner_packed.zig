@@ -486,13 +486,16 @@ test "wide payload cache retains a useful trial below the bare COUNT hit thresho
     defer state.deinit();
     const local = &state.locals[0];
     const n = state.trial_rows;
+    // Half as many hits as cache entries, whatever trial length the host's cache line gives: below the one hit per
+    // entry that keeps a bare COUNT cache, above what keeps a wide one.
+    const every = n / (local.hot.entries.len / 2);
     for (0..n) |i| try local.append(.{
-        .key = @intCast(if (i % 4 == 3) i - 1 else i),
+        .key = @intCast(if (i % every == every - 1) i - 1 else i),
         .ordinal = @intCast(i),
         .weight = 1,
         .values = .{ 7, 7, 7, 1 },
     });
-    try std.testing.expectEqual(n / 4, local.hits);
+    try std.testing.expectEqual(n / every, local.hits);
     try std.testing.expect(local.hits < local.hot.entries.len);
     try std.testing.expect(!local.bypass);
 }

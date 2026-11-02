@@ -158,6 +158,9 @@ test "distinct admission prices both wide pair reductions against covered local 
         .min_bytes_per_worker = 1,
         .integer_records_min_rows = 1,
         .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        // This prices the pair owner. Its 64 x 127 matrix suits the grouped bitmap, which an unknown L3 no longer
+        // rules out.
+        .grouped_distinct_bitmap = .off,
     };
     const ex = try explainAggregate(gpa, a, args);
     try testing.expect(ex.record_path == null or ex.record_path.?.layout != .pair_distinct);

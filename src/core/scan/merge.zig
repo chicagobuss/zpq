@@ -1312,6 +1312,8 @@ test "DistinctMergeTask: partitioned distinct sets merge and handle allocation f
 
 
 test "DistinctMergeTask: a tight budget funds live source and destination without overlap" {
+    // "Without overlap" is the destination's page mapping growing in place, which only Linux's mremap does.
+    if (!@import("../memory.zig").page_growth_without_copy) return error.SkipZigTest;
     const a = std.heap.page_allocator;
     var budget: expr_agg.SharedBudget = .{ .limit = 1 << 20, .block = 1 };
     var dst: expr_agg.DistinctSet = .{ .shared = &budget };

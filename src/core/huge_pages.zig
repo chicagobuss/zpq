@@ -766,8 +766,28 @@ test "a pair's scratch block that its child refuses past the span holds no charg
 }
 
 test "THP advice avoids synchronous compaction without enough free huge blocks" {
-    const scarce = "Node 0, zone Normal 1000 0 0 0 0 0 0 0 0 1 1\n";
-    const plenty = "Node 0, zone Normal 0 0 0 0 0 0 0 0 0 4096 0\n";
+    // buddyinfo counts free blocks of 2^order base pages, so the order of a huge page follows the page size: 9 with
+    // 4 KiB pages, 7 with 16 KiB ones.
+    const Buddy = struct {
+        fn line(buf: []u8, orders: [11]u64) ![]const u8 {
+            var w: std.Io.Writer = .fixed(buf);
+            try w.writeAll("Node 0, zone Normal");
+            for (orders) |count| try w.print(" {d}", .{count});
+            try w.writeAll("\n");
+            return w.buffered();
+        }
+    };
+    const huge_order = std.math.log2_int(usize, huge_page_size / std.heap.pageSize());
+    var orders: [11]u64 = @splat(0);
+    orders[0] = 1000;
+    orders[huge_order] = 1;
+    orders[huge_order + 1] = 1;
+    var scarce_buf: [128]u8 = undefined;
+    const scarce = try Buddy.line(&scarce_buf, orders);
+    orders = @splat(0);
+    orders[huge_order] = 4096;
+    var plenty_buf: [128]u8 = undefined;
+    const plenty = try Buddy.line(&plenty_buf, orders);
     for ([_][]const u8{ "always", "madvise", "defer+madvise" }) |mode| {
         try std.testing.expect(!adviceFor(mode, scarce, 4 << 30));
         try std.testing.expect(adviceFor(mode, plenty, 4 << 30));

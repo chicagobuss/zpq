@@ -1995,7 +1995,11 @@ test "persistent encode executor cleans up allocation failures with serial and p
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{ false, false });
+    // Even a serial job encodes on executor threads, and its buffers' sizes follow their schedule. Where a page
+    // mapping grows without a copy (Linux), that leaves the allocation count fixed; elsewhere whether a buffer grows
+    // in place depends on its size, so the serial run takes the parallel cohort's threshold sweep below.
+    if (core_memory.page_growth_without_copy)
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{ false, false });
     try Run.run(std.testing.allocator, true, false);
     // A parallel cohort has scheduling-dependent arena growth, so sweep an atomic failure threshold rather than
     // use FailingAllocator's non-atomic counters and deterministic-allocation-count requirement.
@@ -2024,18 +2028,24 @@ test "persistent encode executor cleans up allocation failures with serial and p
             std.testing.allocator.rawFree(memory, alignment, ra);
         }
     };
-    var count: Fail = .{};
-    try Run.run(count.allocator(), false, true);
-    var failures: usize = 0;
-    for (0..count.calls.load(.monotonic) * 2) |limit| {
-        var fail: Fail = .{ .after = limit };
-        Run.run(fail.allocator(), false, true) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            try std.testing.expect(fail.failed.load(.monotonic));
-            failures += 1;
-        };
+    for ([_]bool{ false, true }) |parallel| {
+        if (!parallel and core_memory.page_growth_without_copy) continue;
+        var count: Fail = .{};
+        try Run.run(count.allocator(), false, parallel);
+        var failures: usize = 0;
+        for (0..count.calls.load(.monotonic) * 2) |limit| {
+            var fail: Fail = .{ .after = limit };
+            Run.run(fail.allocator(), false, parallel) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(fail.failed.load(.monotonic));
+                failures += 1;
+                continue;
+            };
+            // As checkAllAllocationFailures requires: a serial run that completes swallowed no refusal.
+            if (!parallel) try std.testing.expect(!fail.failed.load(.monotonic));
+        }
+        try std.testing.expect(failures > 10);
     }
-    try std.testing.expect(failures > 10);
 }
 
 test "wide carried rows release their original piece without changing values under allocation failures" {

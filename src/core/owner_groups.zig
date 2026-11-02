@@ -1782,12 +1782,18 @@ test "regression: a full-answer cache whose trial fails stays off for the worker
     // rg64k q06 (615ba9f2, 1.1x slower): each 64K-row group re-armed the cache and spent half its rows in a trial
     // that hit 6% of the time.
     const a = std.testing.allocator;
-    const rows: usize = 1 << 18;
+    // The trial's length follows the host's L2 share and cache line; leave as many rows again after it.
+    const trial = blk: {
+        const probe = (try IntFull.State.init(a, null, 1 << 18, 1, 0, 1, {}, full_parts, 0)).?;
+        defer probe.deinit();
+        break :blk probe.cache_trial_rows;
+    };
+    const rows: usize = @max(1 << 18, 2 * @as(usize, trial));
     const s = (try IntFull.State.init(a, null, rows, 1, 0, 1, {}, full_parts, 0)).?;
     defer s.deinit();
     const l = &s.locals[0];
     try std.testing.expect(l.full_cache.entries.len != 0);
-    const trial = s.cache_trial_rows;
+    try std.testing.expectEqual(trial, s.cache_trial_rows);
     var row: u32 = 0;
     l.start(0, 0);
     // Every key new: no partial absorbs another, so the trial gives up on the cache.

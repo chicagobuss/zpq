@@ -74,6 +74,84 @@ const AggValue = output_values.AggValue;
 const testing = std.testing;
 const test_fixtures = @import("../parquet/test_fixtures.zig");
 
+test "COUNT-only composite top-k keeps requested workers outside DISTINCT owners" {
+    const profile = @import("../../profile.zig");
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var users: [256]i64 = undefined;
+    var terms: [256][]const u8 = undefined;
+    var user_defs: [256]u32 = undefined;
+    var term_defs: [256]u32 = undefined;
+    for (&users, &terms, &user_defs, &term_defs, 0..) |*user, *term, *ud, *td, i| {
+        user.* = if (i < 16) 7 else @intCast(i % 17);
+        term.* = if (i < 16) "" else try std.fmt.allocPrint(a, "term-{d}", .{i});
+        ud.* = @intFromBool(i % 37 != 0);
+        td.* = @intFromBool(i % 41 != 0);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "UserID", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &users, .def_levels = &user_defs, .max_def = 1 } } },
+        .{ .name = "SearchPhrase", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = &terms, .def_levels = &term_defs, .max_def = 1 } } },
+    };
+    var sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, users.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const groups = try a.alloc(schema.RowGroup, 64);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "count-composite", .bytes = sink.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "UserID,SearchPhrase",
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .max_memory = 256 << 20,
+        .integer_records_min_rows = 0,
+        .ndv_policy = false,
+        .plain_rules = false,
+        .distinct_pairs = .on,
+        .sketch_topk = .{ .cell_bits = 12, .fuse_census = true },
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 10 },
+    };
+    var old = args;
+    old.integer_records = false;
+    old.distinct_pairs = .off;
+    old.sketch_topk = null;
+    var want = try runMultiAggregate(gpa, a, old);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    for ([_]usize{ 1, 16, 32 }) |workers| {
+        const profiler = try profile.Profiler.create(gpa, .{ .sample_interval_ns = 0 }, .{});
+        defer profiler.destroy();
+        args.profiler = profiler;
+        args.parallelism = workers;
+        const explained = try explainAggregate(gpa, a, args);
+        try testing.expectEqual(workers, explained.workers);
+        try testing.expectEqual(.sketch, explained.plan.dispatch.strategy);
+        if (explained.record_path) |record| try testing.expect(record.layout != .pair_distinct);
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        profiler.finish();
+        try testing.expectEqual(@as(u64, 0), profiler.dropped());
+        var seen: u64 = 0;
+        var thread = profiler.head.load(.acquire);
+        while (thread) |t| : (thread = t.next) {
+            var events: profile.EventIterator = .{ .t = t };
+            while (events.next()) |batch| for (batch) |event| if (event.kind == .scan_worker) {
+                try testing.expect(event.args[0] < workers);
+                seen |= @as(u64, 1) << @as(u6, @intCast(event.args[0]));
+            };
+        }
+        try testing.expectEqual(workers, @as(usize, @popCount(seen)));
+    }
+}
+
 test "integer owners prepay and retain duplicated output names in the query ledger" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

@@ -368,6 +368,7 @@ pub fn inlinePairAnswer(
     }
     if (companions and (agg_plan.OwnerProgram.init(calls) == null or !args.grouped() or
         args.result_order.having != null or args.result_order.hidden.len != 0)) return null;
+    // COUNT-only composites keep their existing route and worker policy.
     const di = distinct orelse return null;
     const keys = keys_opt orelse &.{};
     const outputs = outputs_opt orelse &.{};

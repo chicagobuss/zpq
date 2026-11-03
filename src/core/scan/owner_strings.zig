@@ -269,8 +269,15 @@ pub fn inlineSharedStrings(
         .borrowed_strings = output.borrowed_strings,
     };
     const typed = args.typed_answer and as_is;
-    const copied_keys: []const KeyType = if (cut == null) &.{} else &key_types;
-    answer_charge = answerBytesParallel(slots.items, types, copied_keys, typed, workers) +|
+    // A cut owns its winners' keys, one copy for each output that projects the key (rows.zig materializes each).
+    var key_outputs: usize = 0;
+    for (outputs) |out| key_outputs += @intFromBool(out.source == .key);
+    const key_copy = if (cut == null)
+        0
+    else
+        answerBytesParallel(slots.items, &.{}, &key_types, false, workers) -|
+            slots.items.len *| @sizeOf([]const AggValue);
+    answer_charge = answerBytesParallel(slots.items, types, &.{}, typed, workers) +| key_outputs *| key_copy +|
         outputNamesBytes(outputs);
     _ = ledger.drawExact(answer_charge) orelse {
         answer_charge = 0;

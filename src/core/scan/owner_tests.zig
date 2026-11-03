@@ -2577,6 +2577,52 @@ test "shared string partition rank heaps draw the cut's charged allocator" {
     }
 }
 
+test "shared string top-k charges every projected copy of a winning key" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try rankedStringFile(a, 2048, 1024, 20000, 300);
+    for ([_]usize{ 1, 2, 3 }) |copies| {
+        var ledger: core_memory.SharedBudget = .{ .limit = 1 << 30 };
+        var taken: std.EnumSet(FastPath) = .{};
+        const select: []const []const u8 = switch (copies) {
+            1 => &.{ "k AS a", "count(*) AS c" },
+            2 => &.{ "k AS a", "k AS b", "count(*) AS c" },
+            else => &.{ "k AS a", "count(*) AS c", "k AS b", "k AS z" },
+        };
+        const args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "ranked-copies", .bytes = file.bytes }},
+            .metas = &.{file.meta},
+            .aggregate = "count(*) AS c",
+            .group_by = "k",
+            .select_cols = try integration_support.selectList(a, select),
+            .max_memory = ledger.limit,
+            .ledger = &ledger,
+            .parallelism = 4,
+            .min_bytes_per_worker = 1,
+            .taken = &taken,
+            .result_order = .{ .keys = &.{.{ .column = if (copies == 3) 1 else copies, .descending = true }}, .limit = 10 },
+        };
+        var got = try prepareAggregate(gpa, a, args, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.shared_strings));
+        // NULL and empty keys win too; the long winners carry the bytes, once for each projection.
+        var one_copy: usize = 0;
+        var key_bytes: usize = 0;
+        for (got.output.group_rows.?) |row| {
+            if (row[0] == .s) one_copy += row[0].s.len;
+            for (row) |cell| if (cell == .s) {
+                key_bytes += cell.s.len;
+            };
+        }
+        try testing.expect(one_copy >= 5 * 20000);
+        try testing.expectEqual(copies * one_copy, key_bytes);
+        // The ledger still holds the answer it was charged for: every owned cell and key copy.
+        try testing.expect(ledger.used.load(.monotonic) >= ownedGroupOutputBytes(got.output));
+    }
+}
+
 test "DISTINCT second passes read retained mappings after gated pages are released" {
     const gpa = testing.allocator;
     const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse

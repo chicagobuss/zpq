@@ -89,11 +89,19 @@ def matrix_ids(m):
         yield cid
 
 
+def execution_switches(root):
+    sources = [root / "src/engine.zig", *(root / "src/engine").rglob("*.zig")]
+    switches = set()
+    for source in sources:
+        switches.update(re.findall(r'envDisables\([^\n]*?"(ZPQ_[A-Z0-9_]+)"', source.read_text()))
+    assert switches, "no execution switches found in engine sources"
+    return switches
+
+
 def run(args):
     knobs = json.loads(REGISTRY.read_text())
     names = {k["name"] for k in knobs}
-    engine = (ROOT / "src/engine.zig").read_text()
-    switches = set(re.findall(r'envDisables\([^\n]*?"(ZPQ_[A-Z0-9_]+)"', engine))
+    switches = execution_switches(ROOT)
     assert switches <= names, f"unregistered execution switches: {switches - names}"
     cases = {}
     for path in sorted((ROOT / "tools/check/cases").glob("*.json")):

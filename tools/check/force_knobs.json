@@ -88,6 +88,14 @@
     "evidence": "sketch_off"
   },
   {
+    "name": "ZPQ_SORTED_COUNT_STREAM",
+    "off": "0",
+    "cases": [
+      "group-stream:ki:count-top-desc"
+    ],
+    "evidence": "unavailable"
+  },
+  {
     "name": "ZPQ_SPILL",
     "off": "0",
     "cases": [

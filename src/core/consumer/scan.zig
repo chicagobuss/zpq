@@ -1387,6 +1387,15 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
     return false;
 }
 
+fn filterNames(f: filter_ast.Filter, ci: usize) bool {
+    return switch (f) {
+        .and_filter, .or_filter => |c| for (c.children) |child| {
+            if (filterNames(child, ci)) break true;
+        } else false,
+        inline else => |l| l.col_idx == ci,
+    };
+}
+
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.
 fn filterSurvivors(
     a: std.mem.Allocator,
@@ -1529,10 +1538,18 @@ fn openSlicedPayload(
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
         // The exact tiles read a dictionary DECIMAL through its codes, and every DECIMAL as its exact integers: a
         // scalar target's readers would otherwise scale each value to its f64 view too.
-        if (exact) |x| if (x.readsLeaf(ci)) {
-            r.exact_only = true;
-            if (in.rg.columns.items[ci].meta_data.?.dictionary_page_offset != null) r.exact_codes = true;
-        };
+        if (exact) |x| {
+            const dict = if (in.rg.columns.items[ci].meta_data) |m| m.dictionary_page_offset != null else false;
+            if (x.readsLeaf(ci)) {
+                r.exact_only = true;
+                if (dict) r.exact_codes = true;
+            }
+            // Filter columns are buffered: the predicate reads their codes before the fold. A fold-only dictionary
+            // page unpacks inside the fold when the slice does not cross a page or a null.
+            const in_filter = if (in.filter) |f| filterNames(f, ci) else false;
+            if (decode_options.encoded and dict and !in_filter and (x.readsLeaf(ci) or target.codedKey(ci)))
+                r.allow_stream = true;
+        }
         if (in.subgroup) |subgroup| try r.seekSubgroup(pages, subgroup);
         if (levels_only[ci]) r.levelsOnly();
         if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
@@ -2086,7 +2103,15 @@ fn scanRGSlicedExact(
         const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
         if (exact) |*x| {
-            if (try x.fold(pages.allocator(), sa, cols, lookup, &sel, done) == .abandon) {
+            var any_pull = false;
+            const pulls = try sa.alloc(?exact_tiles.CodePull, cols.len);
+            for (readers.items, pulls) |*rd, *p| {
+                if (rd.stream_left != 0) {
+                    p.* = .{ .ctx = rd, .pull = SliceReader.pullStream, .rows = rd.stream_left };
+                    any_pull = true;
+                } else p.* = null;
+            }
+            if (try x.fold(pages.allocator(), sa, cols, lookup, &sel, done, if (any_pull) pulls else null) == .abandon) {
                 _ = exact_tiles.counters.abandoned.fetchAdd(1, .monotonic);
                 return error.ExactTilesAbandoned;
             }

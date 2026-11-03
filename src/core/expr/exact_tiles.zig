@@ -5,10 +5,12 @@
 //! composite's sum stays inside i64 and inside its DECIMAL precision. A proven tile can raise no error, so it folds
 //! with wrapping 64-bit arithmetic in one pass of L1-sized windows: a dictionary-coded column is read through its
 //! codes, a node over one coded column is evaluated once per dictionary entry, and nothing row-sized is written but
-//! the windows. Sums widen into `DecSum`s once per composite per tile. A tile whose proof fails folds through the
-//! checked wide path (`agg_coded.exactRootSums`). Nothing reaches the group table until the row group ends, so a
-//! tile that would fail, or a shape this path cannot read, leaves the whole row group to the established path, which
-//! raises the error it always did, in the order it always did.
+//! the windows. A column handed over as a `CodePull` is unpacked into the window it is folded in, instead of into a
+//! tile-length code buffer that the fold would then read back. Sums widen into `DecSum`s once per composite per
+//! tile. A tile whose proof fails folds through the checked wide path (`agg_coded.exactRootSums`); a pull is drained
+//! into codes only then, so a proof that fails never unpacks twice. Nothing reaches the group table until the row
+//! group ends, so a tile that would fail, or a shape this path cannot read, leaves the whole row group to the
+//! established path, which raises the error it always did, in the order it always did.
 
 const std = @import("std");
 const filter_eval = @import("../filter/eval.zig");
@@ -24,6 +26,14 @@ const AggCall = agg.AggCall;
 
 /// Forced-path control for tests: the largest bound a tile's sums may prove in place of i64's; 0 fails every tile.
 pub var forced_limit: ?u64 = null;
+
+/// Dictionary codes for one column of a tile, unpacked by the fold a window at a time. `pull` appends the next
+/// `out.len` codes (the page is all-present; nulls stay on the materialized path). `rows` is the tile length.
+pub const CodePull = struct {
+    ctx: *anyopaque,
+    pull: *const fn (*anyopaque, []u32) anyerror!void,
+    rows: usize,
+};
 
 /// Rows per fused window: a node's lane of them is 4 KiB, so a tree's lanes stay in L1.
 const window_rows = 512;
@@ -54,8 +64,9 @@ const Node = struct {
 /// How a tile reads one node's values.
 const Access = union(enum) {
     scalar: i64,
-    /// Per dictionary entry, read through the codes.
-    table: struct { t: []const i64, codes: []const u32 },
+    /// Per dictionary entry, read through the codes. `base` is the row `codes[0]` stands for: 0 for a tile-length
+    /// buffer, the window start when `codes` is only that window.
+    table: struct { t: []const i64, codes: []const u32, base: usize = 0 },
     lane64: []const i64,
     lane32: []const i32,
     /// A node computed per row into window lane `n`.
@@ -244,7 +255,8 @@ pub const ExactTiles = struct {
     pub const Outcome = enum { folded, abandon };
 
     /// Fold one tile: `cols` by `lookup`, rows `sel` keeps, starting at row `base` of the row group. `ra` holds the
-    /// row group's state; `ta` the tile's scratch. `.abandon` leaves the row group to the established path.
+    /// row group's state; `ta` the tile's scratch. `pulls`, when set, is one slot per `cols` entry: a dictionary
+    /// column whose codes are still packed. `.abandon` leaves the row group to the established path.
     pub fn fold(
         self: *ExactTiles,
         ra: std.mem.Allocator,
@@ -253,19 +265,31 @@ pub const ExactTiles = struct {
         lookup: []const ?usize,
         sel: *const Sel,
         base: usize,
+        pulls: ?[]const ?CodePull,
     ) !Outcome {
         const n = sel.len;
         if (n == 0) return .folded;
-        if (!try self.bindKeys(ra, cols, lookup)) return .abandon;
-        // Every column a tree reads: coded with its exact dictionary, or exact values; flat either way.
+        if (!try self.bindKeys(ra, cols, lookup, pulls)) return .abandon;
+        // Every column a tree reads: coded with its exact dictionary, or exact values; flat either way. A pull is a
+        // coded column whose codes are not buffered yet.
         for (self.nodes) |node| if (node.kind == .col) {
-            const col = cols[lookup[node.kind.col] orelse return .abandon];
+            const at = lookup[node.kind.col] orelse return .abandon;
+            const col = cols[at];
             if (col.nullInfo().max_rep != 0 or col.levelsOnly() or col.hist() != null) return .abandon;
-            if (col.codes() != null) {
+            if (col.codes() != null or pulling(pulls, at)) {
                 if (dictExact(col) == null) return .abandon;
             } else if (valuesExact(col) == null) return .abandon;
         };
-        const comp = try self.composites(ta, cols, lookup, n);
+        var used = cols;
+        if (pulls) |ps| if (anyPull(ps)) {
+            if (try self.foldPulled(ta, used, lookup, sel, ps, base)) {
+                _ = counters.proved.fetchAdd(1, .monotonic);
+                return .folded;
+            }
+            // The proof failed before a code was pulled. Drain each stream once and fold the buffered tile.
+            used = try realizePulls(ta, used, ps);
+        };
+        const comp = try self.composites(ta, used, lookup, n);
         // Selected rows per composite, and each composite's first.
         const tile_counts = try ta.alloc(u64, self.space);
         @memset(tile_counts, 0);
@@ -291,17 +315,23 @@ pub const ExactTiles = struct {
         }.f, .{ .cnt = tile_counts, .comp = comp, .first = self.first_row, .base = base });
         for (self.counts, tile_counts) |*c, t| c.* += t;
 
-        if (try self.foldNarrow(ta, cols, lookup, sel, comp, tile_counts, n, sparse)) {
+        if (try self.foldNarrow(ta, used, lookup, sel, comp, tile_counts, n, sparse)) {
             _ = counters.proved.fetchAdd(1, .monotonic);
             return .folded;
         }
         _ = counters.wide.fetchAdd(1, .monotonic);
-        return if (try self.foldWide(ta, cols, lookup, sel, comp)) .folded else .abandon;
+        return if (try self.foldWide(ta, used, lookup, sel, comp)) .folded else .abandon;
     }
 
     /// The tile's composite per row, binding the key dictionaries on the first tile. False when a key is not coded
-    /// or its dictionary differs from the first tile's.
-    fn bindKeys(self: *ExactTiles, ra: std.mem.Allocator, cols: []const Column, lookup: []const ?usize) !bool {
+    /// or its dictionary differs from the first tile's. A pulled key is coded: its dictionary is already installed.
+    fn bindKeys(
+        self: *ExactTiles,
+        ra: std.mem.Allocator,
+        cols: []const Column,
+        lookup: []const ?usize,
+        pulls: ?[]const ?CodePull,
+    ) !bool {
         const first = self.space == 0;
         if (first) {
             self.strides = try ra.alloc(usize, self.keys.len);
@@ -311,8 +341,12 @@ pub const ExactTiles = struct {
         }
         var space: usize = 1;
         for (self.keys, 0..) |k, i| {
-            const col = cols[lookup[k.col_ref.col_idx] orelse return false];
-            if (col.codes() == null or col.nullInfo().max_rep != 0) return false;
+            const at = lookup[k.col_ref.col_idx] orelse return false;
+            const col = cols[at];
+            if (col.nullInfo().max_rep != 0) return false;
+            if (col.codes() == null and !pulling(pulls, at)) return false;
+            // A pulled key is read through the dictionary already installed. An empty one has no code to unpack.
+            if (pulling(pulls, at) and col.dictLen() == 0) return false;
             const id = dictIdentity(col);
             if (first) {
                 self.strides[i] = space;
@@ -355,6 +389,155 @@ pub const ExactTiles = struct {
             }
         }
         return out;
+    }
+
+    /// The proven fold of a tile whose dictionary codes are still packed. False, having pulled nothing and added
+    /// nothing, when the values do not prove the narrow arithmetic. The scan is in order: a sparse selection still
+    /// walks every row, and the mask drops the ones it does not keep.
+    fn foldPulled(
+        self: *ExactTiles,
+        ta: std.mem.Allocator,
+        cols: []const Column,
+        lookup: []const ?usize,
+        sel: *const Sel,
+        pulls: []const ?CodePull,
+        base: usize,
+    ) !bool {
+        const n = sel.len;
+        for (pulls) |p| if (p) |pull| std.debug.assert(pull.rows == n);
+        const win = try ta.alloc([]u32, cols.len);
+        for (pulls, 0..) |p, i| win[i] = if (p != null) try ta.alloc(u32, window_rows) else &.{};
+        const access = try ta.alloc(Access, self.nodes.len);
+        const bound = try ta.alloc(u128, self.nodes.len);
+        const streamed = try ta.alloc(bool, self.nodes.len);
+        @memset(streamed, false);
+        var tmps: usize = 0;
+        for (self.nodes, 0..) |node, i| {
+            switch (node.kind) {
+                .literal => |v| {
+                    access[i] = .{ .scalar = v };
+                    bound[i] = @abs(v);
+                },
+                .col => |ci| {
+                    const at = lookup[ci].?;
+                    if (pulling(pulls, at) or cols[at].codes() != null) {
+                        const t = try self.table(i, cols[at]) orelse return false;
+                        access[i] = .{ .table = .{ .t = t.values, .codes = if (pulling(pulls, at)) win[at] else cols[at].codes().? } };
+                        streamed[i] = pulling(pulls, at);
+                        bound[i] = t.bound;
+                    } else switch (valuesExact(cols[at]).?) {
+                        .i64 => |v| {
+                            access[i] = .{ .lane64 = v[0..n] };
+                            bound[i] = maxAbs(i64, v[0..n], cols[at], sel, false);
+                        },
+                        .i32 => |v| {
+                            access[i] = .{ .lane32 = v[0..n] };
+                            bound[i] = maxAbs(i32, v[0..n], cols[at], sel, false);
+                        },
+                        .i128 => return false,
+                    }
+                },
+                .bin => |b| {
+                    if (node.source == .one) {
+                        const at = lookup[node.source.one].?;
+                        if (pulling(pulls, at) or cols[at].codes() != null) {
+                            const t = try self.table(i, cols[at]) orelse return false;
+                            access[i] = .{ .table = .{ .t = t.values, .codes = if (pulling(pulls, at)) win[at] else cols[at].codes().? } };
+                            streamed[i] = pulling(pulls, at);
+                            bound[i] = t.bound;
+                            if (bound[i] >= node.limit) return false;
+                            continue;
+                        }
+                    }
+                    bound[i] = switch (b.op) {
+                        .add, .sub => sat(sat(bound[b.l], @abs(b.lf), .mul), sat(bound[b.r], @abs(b.rf), .mul), .add),
+                        .mul => sat(bound[b.l], bound[b.r], .mul),
+                        else => unreachable,
+                    };
+                    access[i] = .{ .tmp = tmps };
+                    tmps += 1;
+                },
+            }
+            if (bound[i] >= node.limit) return false;
+        }
+        const limit: u128 = forced_limit orelse i64_max;
+        for (self.root_list) |r| if (sat(bound[r], n, .mul) > limit) return false;
+
+        const lane_buf = try ta.alloc(i64, tmps * window_rows);
+        const R = self.root_list.len;
+        const part = try ta.alloc(i64, R * self.space * lanes);
+        @memset(part, 0);
+        const nulls = try ta.alloc(?[]u64, R);
+        for (self.root_list, nulls) |r, *nl| {
+            nl.* = null;
+            if (!self.hasNullInput(r, cols, lookup)) continue;
+            const c = try ta.alloc(u64, self.space * lanes);
+            @memset(c, 0);
+            nl.* = c;
+        }
+        const comp_win = try ta.alloc(u32, window_rows);
+        const tile_counts = try ta.alloc(u64, self.space);
+        @memset(tile_counts, 0);
+        const valid = try ta.alloc(u1, window_rows);
+        var w0: usize = 0;
+        while (w0 < n) : (w0 += window_rows) {
+            const wn = @min(window_rows, n - w0);
+            for (pulls, win) |p, w| if (p) |pull| try pull.pull(pull.ctx, w[0..wn]);
+            for (streamed, 0..) |on, i| {
+                if (!on) continue;
+                switch (access[i]) {
+                    .table => |*t| t.base = w0,
+                    else => unreachable,
+                }
+            }
+            @memset(comp_win[0..wn], 0);
+            for (self.keys, self.strides) |k, stride| {
+                const at = lookup[k.col_ref.col_idx].?;
+                const st: u32 = @intCast(stride);
+                if (pulling(pulls, at)) {
+                    for (comp_win[0..wn], win[at][0..wn]) |*cp, code| cp.* += code * st;
+                } else {
+                    const col = cols[at];
+                    const codes = col.codes().?;
+                    const ni = col.nullInfo();
+                    const null_slot: u32 = @intCast(col.dictLen());
+                    if (ni.def_levels) |dl| {
+                        for (comp_win[0..wn], codes[w0..][0..wn], dl[w0..][0..wn]) |*cp, code, d| {
+                            cp.* += (if (d < ni.max_def) null_slot else code) * st;
+                        }
+                    } else for (comp_win[0..wn], codes[w0..][0..wn]) |*cp, code| cp.* += code * st;
+                }
+            }
+            for (self.nodes, 0..) |node, i| if (access[i] == .tmp) {
+                const b = node.kind.bin;
+                const out = lane_buf[access[i].tmp * window_rows ..][0..wn];
+                evalLane(b.op, access[b.l], access[b.r], b.lf, b.rf, lane_buf, out, w0);
+            };
+            for (self.root_list, 0..) |r, ri| {
+                const slots = part[ri * self.space * lanes ..][0 .. self.space * lanes];
+                if (nulls[ri]) |cnt| {
+                    @memset(valid[0..wn], 1);
+                    self.maskNulls(r, cols, lookup, valid[0..wn], w0);
+                    foldRoot(true, access[r], lane_buf, slots, cnt, valid, comp_win, w0, sel, w0, wn);
+                } else foldRoot(false, access[r], lane_buf, slots, &.{}, valid, comp_win, w0, sel, w0, wn);
+            }
+            var word = w0 / 64;
+            while (word * 64 < w0 + wn) : (word += 1) {
+                const bits = sel.mask[word];
+                if (bits == 0) continue;
+                const lo = word * 64;
+                for (lo..@min(lo + 64, w0 + wn)) |r| {
+                    const keep: u1 = @truncate(bits >> @intCast(r % 64));
+                    if (keep == 0) continue;
+                    const cp = comp_win[r - w0];
+                    tile_counts[cp] += 1;
+                    if (self.first_row[cp] == no_row) self.first_row[cp] = @intCast(base + r);
+                }
+            }
+        }
+        self.widenTile(part, nulls, tile_counts);
+        for (self.counts, tile_counts) |*c, t| c.* += t;
+        return true;
     }
 
     /// The proven fused fold. False, with nothing added, when the tile's values do not prove it safe.
@@ -467,8 +650,8 @@ pub const ExactTiles = struct {
                 if (nulls[ri]) |cnt| {
                     @memset(valid[0..wn], 1);
                     self.maskNulls(r, cols, lookup, valid[0..wn], w0);
-                    foldRoot(true, access[r], lane_buf, slots, cnt, valid, comp, sel, w0, wn);
-                } else foldRoot(false, access[r], lane_buf, slots, &.{}, valid, comp, sel, w0, wn);
+                    foldRoot(true, access[r], lane_buf, slots, cnt, valid, comp, 0, sel, w0, wn);
+                } else foldRoot(false, access[r], lane_buf, slots, &.{}, valid, comp, 0, sel, w0, wn);
             }
         }
         self.widenTile(part, nulls, tile_counts);
@@ -496,7 +679,7 @@ pub const ExactTiles = struct {
     fn rowValue(self: *const ExactTiles, access: []const Access, i: usize, row: usize) i64 {
         return switch (access[i]) {
             .scalar => |v| v,
-            .table => |t| t.t[t.codes[row]],
+            .table => |t| t.t[t.codes[row - t.base]],
             .lane64 => |v| v[row],
             .lane32 => |v| v[row],
             .tmp => blk: {
@@ -666,6 +849,40 @@ pub const ExactTiles = struct {
     }
 };
 
+fn pulling(pulls: ?[]const ?CodePull, at: usize) bool {
+    const ps = pulls orelse return false;
+    return at < ps.len and ps[at] != null;
+}
+
+fn anyPull(pulls: []const ?CodePull) bool {
+    for (pulls) |p| if (p != null) return true;
+    return false;
+}
+
+/// Unpack every pull into a tile-length code buffer and hand the fold the column it would have decoded up front.
+fn realizePulls(ta: std.mem.Allocator, cols: []const Column, pulls: []const ?CodePull) ![]Column {
+    const out = try ta.alloc(Column, cols.len);
+    for (cols, pulls, out) |c, p, *o| {
+        o.* = c;
+        if (p) |pull| {
+            const codes = try ta.alloc(u32, pull.rows);
+            try pull.pull(pull.ctx, codes);
+            o.* = putCodes(c, codes);
+        }
+    }
+    return out;
+}
+
+fn putCodes(col: Column, codes: []const u32) Column {
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            var o = c;
+            o.codes = codes;
+            break :blk @unionInit(Column, @tagName(tag), o);
+        },
+    };
+}
+
 fn sat(a: u128, b: u128, comptime op: enum { add, mul }) u128 {
     return switch (op) {
         .add => std.math.add(u128, a, b) catch std.math.maxInt(u128),
@@ -755,7 +972,7 @@ fn decodedView(ta: std.mem.Allocator, col: Column) !Column {
 inline fn get(comptime tag: std.meta.Tag(Access), a: anytype, tmp: []const i64, r: usize, w0: usize) i64 {
     return switch (tag) {
         .scalar => a,
-        .table => a.t[a.codes[r]],
+        .table => a.t[a.codes[r - a.base]],
         .lane64 => a[r],
         .lane32 => a[r],
         .tmp => tmp[a * window_rows + (r - w0)],
@@ -793,6 +1010,7 @@ fn foldRoot(
     cnt: []u64,
     valid: []const u1,
     comp: []const u32,
+    comp_base: usize,
     sel: *const Sel,
     w0: usize,
     wn: usize,
@@ -807,7 +1025,7 @@ fn foldRoot(
                 for (lo..@min(lo + 64, w0 + wn)) |r| {
                     var keep: u1 = @truncate(word >> @intCast(r % 64));
                     if (masked) keep &= valid[r - w0];
-                    const slot = @as(usize, comp[r]) * lanes + r % lanes;
+                    const slot = @as(usize, comp[r - comp_base]) * lanes + r % lanes;
                     part[slot] +%= get(tag, av, tmp, r, w0) & -%@as(i64, keep);
                     if (masked) cnt[slot] += keep;
                 }
@@ -994,7 +1212,7 @@ test "tiles fold the established exact sums, proven or forced wide, across nulls
             // The second tile's tax pages fell back from the dictionary to PLAIN.
             if (off == tile) cols[5] = Fx.plain(t_vals[off..][0..len], null);
             const w = try sel.alignedWindow(off, len);
-            try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, cols, &lookup, &w, off));
+            try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, cols, &lookup, &w, off, null));
         }
         if (limit == null) {
             try testing.expectEqual(@as(u64, 3), counters.proved.load(.monotonic));
@@ -1045,7 +1263,7 @@ test "a tile whose sums leave i64 folds wide and exactly, cancellation included;
     for ([_]usize{ 0, 1024 }) |off| {
         const cols = [_]Column{Fx.plain(vals[off..][0..1024], null)};
         const w = try sel.alignedWindow(off, 1024);
-        try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, &cols, &lookup, &w, off));
+        try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, &cols, &lookup, &w, off, null));
     }
     try testing.expectEqual(@as(u64, 0), counters.proved.load(.monotonic));
     try testing.expectEqual(@as(u64, 2), counters.wide.load(.monotonic));
@@ -1058,7 +1276,7 @@ test "a tile whose sums leave i64 folds wide and exactly, cancellation included;
     const calls3 = [_]AggCall{.{ .func = .sum, .arg = prod.*, .result = .dec, .where = null, .alias = "s" }};
     var y = (try ExactTiles.init(a, &calls3, &keys, 1)).?;
     var s64 = try Sel.init(a, 64);
-    try testing.expectEqual(ExactTiles.Outcome.abandon, try y.fold(a, a, &big, &lookup, &s64, 0));
+    try testing.expectEqual(ExactTiles.Outcome.abandon, try y.fold(a, a, &big, &lookup, &s64, 0, null));
     const small = try a.alloc(i64, 64);
     for (small, 0..) |*v, i| v.* = @intCast(i);
     small[5] = vals[0];
@@ -1066,7 +1284,7 @@ test "a tile whose sums leave i64 folds wide and exactly, cancellation included;
     var z = (try ExactTiles.init(a, &calls3, &keys, 1)).?;
     s64.set(5, false);
     counters.reset();
-    try testing.expectEqual(ExactTiles.Outcome.folded, try z.fold(a, a, &mixed, &lookup, &s64, 0));
+    try testing.expectEqual(ExactTiles.Outcome.folded, try z.fold(a, a, &mixed, &lookup, &s64, 0, null));
     try testing.expectEqual(@as(u64, 1), counters.proved.load(.monotonic));
     try testing.expectEqual(@as(i192, 3 * (63 * 64 / 2 - 5)), z.sums[0].get());
 }
@@ -1105,7 +1323,7 @@ test "wide tiles carry a sum past i128 and back: 192-bit partials, the establish
         const len = @min(tile, n - off);
         const cols = [_]Column{ try whole[0].sliceRows(off, len), try whole[1].sliceRows(off, len) };
         const w = try sel.alignedWindow(off, len);
-        try testing.expectEqual(ExactTiles.Outcome.folded, try t.fold(a, a, &cols, &lookup, &w, off));
+        try testing.expectEqual(ExactTiles.Outcome.folded, try t.fold(a, a, &cols, &lookup, &w, off, null));
     }
     try testing.expectEqual(@as(u64, 0), counters.proved.load(.monotonic));
     try testing.expectEqual(@as(u64, (n + tile - 1) / tile), counters.wide.load(.monotonic));
@@ -1188,7 +1406,154 @@ test "an all-NULL coded chunk, with no dictionary entries, folds to no values" {
     };
     var x = (try ExactTiles.init(a, &calls, &.{}, 1)).?;
     var sel = try Sel.init(a, n);
-    try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, &cols, &.{0}, &sel, 0));
+    try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, &cols, &.{0}, &sel, 0, null));
     for (x.sums) |s| try testing.expectEqual(@as(u64, 0), s.n);
     try testing.expectEqual(@as(u64, n), x.counts[0]);
+}
+
+test "packed dictionary codes unpack inside the fold, and a failed proof drains them once onto the wide path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    defer forced_limit = null;
+    const n = 2000;
+    const tile = 1024;
+    const k0_dict = [_][]const u8{ "A", "N", "R" };
+    const k1_dict = [_][]const u8{ "F", "O" };
+    var q_dict: [50]i64 = undefined;
+    for (&q_dict, 0..) |*v, i| v.* = @intCast(100 * (i + 1));
+    var d_dict: [11]i64 = undefined;
+    for (&d_dict, 0..) |*v, i| v.* = @intCast(i);
+    const k0c = try a.alloc(u32, n);
+    const k1c = try a.alloc(u32, n);
+    const qc = try a.alloc(u32, n);
+    const q_plain = try a.alloc(i64, n);
+    const price = try a.alloc(i64, n);
+    const dc = try a.alloc(u32, n);
+    for (0..n) |i| {
+        k0c[i] = @intCast(i % 3);
+        k1c[i] = @intCast(i % 2);
+        qc[i] = @intCast(i % 50);
+        q_plain[i] = q_dict[qc[i]];
+        price[i] = @intCast(1000 + i % 100);
+        dc[i] = @intCast(i % 11);
+    }
+    const Cursor = struct {
+        codes: []const u32,
+        at: usize = 0,
+        fn pull(ctx: *anyopaque, out: []u32) anyerror!void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.at + out.len > s.codes.len) return error.ShortDecode;
+            @memcpy(out, s.codes[s.at..][0..out.len]);
+            s.at += out.len;
+        }
+    };
+    var k0_cur: Cursor = .{ .codes = k0c };
+    var q_cur: Cursor = .{ .codes = qc };
+    const q = try Fx.col(a, 2, Fx.d152);
+    const p = try Fx.col(a, 3, Fx.d152);
+    const d = try Fx.col(a, 4, Fx.d152);
+    const one_d = try Fx.bin(a, .sub, try Fx.int(a, 1), d, .{ .precision = 16, .scale = 2 });
+    const disc = try Fx.bin(a, .mul, p, one_d, .{ .precision = 31, .scale = 4 });
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = q.*, .result = .dec, .where = null, .alias = "sq" },
+        .{ .func = .sum, .arg = disc.*, .result = .dec, .where = null, .alias = "sd" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    const keys = [_]expr_ast.Expr{ Fx.key(0), Fx.key(1) };
+    const lookup = [_]?usize{ 0, 1, 2, 3, 4 };
+    const buffered = [_]Column{
+        Fx.strings(k0c, &k0_dict, null),
+        Fx.strings(k1c, &k1_dict, null),
+        try Fx.coded(a, &q_dict, qc, null),
+        Fx.plain(price, null),
+        try Fx.coded(a, &d_dict, dc, null),
+    };
+    // Packed views share the dictionaries and carry no code buffer: the fold unpacks them.
+    var packed_key = buffered[0];
+    packed_key.string.codes = null;
+    var packed_q = buffered[2];
+    packed_q.f64.codes = null;
+    counters.reset();
+    var x = (try ExactTiles.init(a, &calls, &keys, lookup.len)).?;
+    var sel = try Sel.init(a, n);
+    for (0..n) |i| if (i % 17 == 0) sel.set(i, false);
+    var off: usize = 0;
+    while (off < n) : (off += tile) {
+        const len = @min(tile, n - off);
+        const cols = try a.alloc(Column, buffered.len);
+        cols[0] = packed_key;
+        cols[1] = try buffered[1].sliceRows(off, len);
+        cols[3] = try buffered[3].sliceRows(off, len);
+        cols[4] = try buffered[4].sliceRows(off, len);
+        var pulls = [_]?CodePull{
+            .{ .ctx = &k0_cur, .pull = Cursor.pull, .rows = len },
+            null,
+            .{ .ctx = &q_cur, .pull = Cursor.pull, .rows = len },
+            null,
+            null,
+        };
+        if (off == 0) {
+            cols[2] = packed_q;
+        } else {
+            // Dictionary page ended; the next page is PLAIN values, already decoded.
+            cols[2] = Fx.plain(q_plain[off..][0..len], null);
+            pulls[2] = null;
+        }
+        const w = try sel.alignedWindow(off, len);
+        try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, cols, &lookup, &w, off, &pulls));
+    }
+    try testing.expectEqual(@as(usize, n), k0_cur.at);
+    try testing.expectEqual(@as(usize, tile), q_cur.at);
+    try testing.expectEqual(@as(u64, 2), counters.proved.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), counters.wide.load(.monotonic));
+    const comp = try x.composites(a, &buffered, &lookup, n);
+    const want = try Fx.oracle(a, &x, &buffered, &lookup, comp, &sel);
+    for (want, 0..) |w, ri| for (w, 0..) |s, cp| {
+        const got = x.sums[ri * x.space + cp];
+        try testing.expectEqual(s.n, got.n);
+        try testing.expectEqual(s.get(), got.get());
+    };
+
+    // A bound of 0 fails the proof before any code is pulled, then the drain feeds the wide path once.
+    forced_limit = 0;
+    k0_cur.at = 0;
+    q_cur.at = 0;
+    counters.reset();
+    var y = (try ExactTiles.init(a, &calls, &keys, lookup.len)).?;
+    const cols0 = [_]Column{
+        packed_key,
+        try buffered[1].sliceRows(0, tile),
+        packed_q,
+        try buffered[3].sliceRows(0, tile),
+        try buffered[4].sliceRows(0, tile),
+    };
+    const pulls0 = [_]?CodePull{
+        .{ .ctx = &k0_cur, .pull = Cursor.pull, .rows = tile },
+        null,
+        .{ .ctx = &q_cur, .pull = Cursor.pull, .rows = tile },
+        null,
+        null,
+    };
+    const w0 = try sel.alignedWindow(0, tile);
+    try testing.expectEqual(ExactTiles.Outcome.folded, try y.fold(a, a, &cols0, &lookup, &w0, 0, &pulls0));
+    try testing.expectEqual(@as(u64, 1), counters.wide.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), counters.proved.load(.monotonic));
+    try testing.expectEqual(@as(usize, tile), k0_cur.at);
+    try testing.expectEqual(@as(usize, tile), q_cur.at);
+    const tile_sel = try sel.alignedWindow(0, tile);
+    const oracle_cols = [_]Column{
+        Fx.strings(k0c[0..tile], &k0_dict, null),
+        Fx.strings(k1c[0..tile], &k1_dict, null),
+        try Fx.coded(a, &q_dict, qc[0..tile], null),
+        Fx.plain(price[0..tile], null),
+        try buffered[4].sliceRows(0, tile),
+    };
+    const ycomp = try y.composites(a, &oracle_cols, &lookup, tile);
+    const ywant = try Fx.oracle(a, &y, &oracle_cols, &lookup, ycomp, &tile_sel);
+    for (ywant, 0..) |w, ri| for (w, 0..) |s, cp| {
+        const got = y.sums[ri * y.space + cp];
+        try testing.expectEqual(s.n, got.n);
+        try testing.expectEqual(s.get(), got.get());
+    };
 }

@@ -49,6 +49,11 @@ pub const SliceReader = struct {
     /// A DECIMAL read through its dictionary codes where pages have them (`exact_tiles`), with the exact dictionary
     /// beside its scaled view; the scaled view is built once per dictionary, on `held`.
     exact_codes: bool = false,
+    /// Unpack this column's dictionary codes inside the exact fold, when the slice sits in one all-present
+    /// dictionary page. Filter columns stay buffered: the predicate reads them before the fold does.
+    allow_stream: bool = false,
+    /// Codes `pullStream` still owes the fold. Zero when this slice was buffered.
+    stream_left: usize = 0,
     dec_dict: ?struct { src: usize, len: usize, scaled: []f64 } = null,
     float16: bool,
     int96: bool,
@@ -313,6 +318,7 @@ pub const SliceReader = struct {
         enterChunk(self.site.rg, self.site.column);
         const n = @min(n_want, self.left);
         self.left -= n;
+        self.stream_left = 0;
         if (n != 0 and !self.levels_only and self.dec == null and !self.float16 and !self.int96) {
             switch (self.raw.*) {
                 inline .i32, .i64, .bytes => |*r| if (r.options.any_dictionary and r.options.encoded)
@@ -431,6 +437,35 @@ pub const SliceReader = struct {
         }
     }
 
+    /// The next `out.len` dictionary codes of a slice `armCodeStream` kept packed. The page is all-present, so
+    /// there are no definition levels to expand.
+    pub fn pullStream(ctx: *anyopaque, out: []u32) anyerror!void {
+        const self: *SliceReader = @ptrCast(@alignCast(ctx));
+        if (out.len > self.stream_left) return error.ShortDecode;
+        switch (self.raw.*) {
+            inline .i32, .i64, .bytes => |*r| {
+                if (!try r.readPageCodes(out, null)) return error.UnexpectedPage;
+            },
+            else => return error.UnexpectedPage,
+        }
+        self.stream_left -= out.len;
+    }
+
+    /// True when `n` rows are still on one all-present dictionary page, so the fold can unpack them itself. A page
+    /// boundary, a null, or a PLAIN page stays on `nextCoded`, which already gathers a mixed slice.
+    fn armCodeStream(self: *SliceReader, r: anytype, n: usize) bool {
+        if (!self.allow_stream or n == 0 or !r.options.encoded) return false;
+        r.options.fast_levels = true;
+        if (r.pageValuesLeft() < n or r.active != .rle_dict) return false;
+        const dict = r.dictionary orelse return false;
+        if (dict.len == 0) return false;
+        const present = r.levels.max_def == 0 or r.current_def_all_present or
+            (r.current_def_levels == null and r.current_def_stream == null and r.current_def_bits == null);
+        if (!present) return false;
+        self.stream_left = n;
+        return true;
+    }
+
     fn nextCoded(
         self: *SliceReader,
         comptime T: type,
@@ -439,6 +474,22 @@ pub const SliceReader = struct {
         n: usize,
     ) !filter_eval.Batch.Column {
         r.options.fast_levels = true;
+        // A page is opened only when the decoder is between pages, so the first
+        // slice of a long all-present dictionary page streams too.
+        if (self.allow_stream and r.pageValuesLeft() == 0) {
+            if (T == []const u8) {
+                self.resetPages();
+                r.releaseExpansion();
+                self.armBytePage(r);
+            }
+            if (!try r.nextPage()) return error.ShortDecode;
+            if (T == []const u8) try self.holdDictionary(r);
+        }
+        if (self.armCodeStream(r, n)) {
+            const dict = r.dictionary orelse return error.DictionaryMissing;
+            const col = codedCol(T, .{ .codes = null, .def_levels = null, .has_nulls = false }, dict, self.levels);
+            return @unionInit(filter_eval.Batch.Column, if (T == []const u8) "string" else @typeName(T), col);
+        }
         const codes = try a.alloc(u32, n);
         const max_def: u32 = @intCast(self.levels.max_def);
         const def: ?[]u32 = if (max_def > 0) try a.alloc(u32, n) else null;
@@ -488,6 +539,24 @@ pub const SliceReader = struct {
     fn decimalCoded(self: *SliceReader, comptime T: type, col: filter_eval.Batch.Column, a: std.mem.Allocator) !filter_eval.Batch.Column {
         const k = self.dec.?;
         const c = @field(col, @typeName(T));
+        if (c.codes == null and self.stream_left != 0 and c.dict.len != 0) {
+            const id = @intFromPtr(c.dict.ptr);
+            const scaled = if (self.dec_dict) |d| if (d.src == id and d.len == c.dict.len) d.scaled else null else null;
+            const view = scaled orelse blk: {
+                const d = try self.held.alloc(f64, c.dict.len);
+                decimal_mod.applyScaleSimd(T, c.dict, k.scale, d);
+                self.dec_dict = .{ .src = id, .len = c.dict.len, .scaled = d };
+                break :blk d;
+            };
+            var out: filter_eval.ColumnT(f64) = .{
+                .values = &.{},
+                .dict = view,
+                .max_def = c.max_def,
+                .has_nulls = false,
+            };
+            out.dict_unscaled = @unionInit(filter_eval.Exact, @typeName(T), c.dict);
+            return .{ .f64 = out };
+        }
         if (c.codes == null) {
             if (self.exact_only) {
                 var exact = c;

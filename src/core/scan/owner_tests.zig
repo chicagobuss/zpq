@@ -10,6 +10,8 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_agg = @import("../expr/agg.zig");
 const core_memory = @import("../memory.zig");
 const partagg = @import("../partagg.zig");
+const string_table = @import("../string_table.zig");
+const eval = @import("../filter/eval.zig");
 const ndv = @import("../ndv.zig");
 const agg_dense = @import("../expr/agg_dense.zig");
 const owner_groups = @import("../owner_groups.zig");
@@ -2433,6 +2435,93 @@ test "shared string ranked LIMIT keeps exact winners NULL keys cutoff ties and r
         try testing.expect(ledger.used.load(.monotonic) <= ledger.limit);
     }
     ledger.release(held);
+}
+
+/// Wide PLAIN string keys with NULL and empty keys and nullable INT64 values, in row groups of `rg_rows`.
+fn rankedStringFile(a: std.mem.Allocator, rows: usize, rg_rows: usize, key_bytes: usize, distinct: usize) !struct { bytes: []const u8, meta: schema.FileMetaData } {
+    const text = try a.alloc([]const u8, rows);
+    const key_defs = try a.alloc(u32, rows);
+    const values = try a.alloc(i64, rows);
+    const defs = try a.alloc(u32, rows);
+    const pad = try a.alloc(u8, key_bytes);
+    @memset(pad, 'k');
+    for (text, key_defs, values, defs, 0..) |*key, *kd, *value, *d, i| {
+        key.* = if (i % 67 == 0) "" else try std.fmt.allocPrint(a, "{s}{d}", .{ pad, (i * 7907) % distinct });
+        kd.* = @intFromBool(i % 41 != 0);
+        value.* = @as(i64, @intCast((i * 71) % 61)) - 30;
+        d.* = @intFromBool(i % 7 != 0);
+    }
+    var sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    var file = try consumer.AggregateFile.init(a, sink.sink());
+    defer file.deinit();
+    var columns: [2]expr_agg.OutputCol = undefined;
+    var at: usize = 0;
+    while (at < rows) : (at += rg_rows) {
+        const n = @min(rg_rows, rows - at);
+        columns = .{
+            .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = text[at..][0..n], .def_levels = key_defs[at..][0..n], .max_def = 1 } } },
+            .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = values[at..][0..n], .def_levels = defs[at..][0..n], .max_def = 1 } } },
+        };
+        try file.append(&columns, @intCast(n), .SNAPPY, .{}, .{});
+    }
+    _ = try file.finish(&columns);
+    return .{ .bytes = sink.buffer.items, .meta = try metadata.open(a, sink.buffer.items) };
+}
+
+test "shared string top-k cut refusals replay at every budget the old path answers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The reviewer's shape: small row groups keep the scan inside a few MiB, so a cut past it can still refuse.
+    const file = try rankedStringFile(a, 180000, 2048, 60, 13007);
+    const Shape = struct { aggregate: []const u8, order: expr_ast.ResultOrder };
+    const shapes = [_]Shape{
+        .{ .aggregate = "count(*) AS c,sum(v) AS s", .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 8000 } },
+        .{ .aggregate = "sum(v) AS s", .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 5000 } },
+        .{ .aggregate = "max(v) AS m,count(*) AS c", .order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 6000, .offset = 100 } },
+    };
+    var answered: usize = 0;
+    for (shapes) |shape| for ([_]usize{ 1, 4 }) |j| {
+        var half_mib: usize = 2;
+        while (half_mib <= 24) : (half_mib += 1) {
+            var run_arena = std.heap.ArenaAllocator.init(gpa);
+            defer run_arena.deinit();
+            const ra = run_arena.allocator();
+            var outcomes: [2]?MultiAggResult = .{ null, null };
+            defer for (&outcomes) |*o| if (o.*) |*r| r.deinit(gpa);
+            for ([_]bool{ false, true }, &outcomes) |owner, *outcome| {
+                var ledger: core_memory.SharedBudget = .{ .limit = half_mib << 19 };
+                const args: MultiAggArgs = .{
+                    .inputs = &.{.{ .name = "ranked-budget", .bytes = file.bytes }},
+                    .metas = &.{file.meta},
+                    .aggregate = shape.aggregate,
+                    .group_by = "k",
+                    .max_memory = ledger.limit,
+                    .ledger = &ledger,
+                    .parallelism = j,
+                    .min_bytes_per_worker = 1,
+                    .shared_strings = owner,
+                    .result_order = shape.order,
+                    // As the CLI runs it: half the ledger for decode, bounded batches, a streamed answer.
+                    .decode_limit = ledger.limit / 2,
+                    .auto_decode_batches = true,
+                    .record_answer = true,
+                };
+                // Only a budget refusal may end either run; an out-of-memory escape fails the test here.
+                outcome.* = runMultiAggregate(gpa, ra, args) catch |e| switch (e) {
+                    error.ExceededMemoryBudget => null,
+                    else => return e,
+                };
+                if (outcome.*) |*r| try r.output.applyResultOrder(gpa, shape.order);
+            }
+            const want = outcomes[0] orelse continue;
+            const got = outcomes[1] orelse return error.TestExpectedEqual;
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+            answered += 1;
+        }
+    };
+    try testing.expect(answered > 0);
 }
 
 test "DISTINCT second passes read retained mappings after gated pages are released" {

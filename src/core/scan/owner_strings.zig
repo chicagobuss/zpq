@@ -210,13 +210,15 @@ pub fn inlineSharedStrings(
         return result;
     }
     const outputs = outputs_opt.?;
+    // Every post-scan list draws the query ledger. A denied draw surfaces as OutOfMemory from `lists`; translate it
+    // so the query replays on the old path instead of failing, leaving any other error as it is.
     var merge_charge: core_memory.Charged = .{ .child = gpa, .budget = ledger };
     const lists = merge_charge.allocator();
     var slots: std.ArrayList(MergedSlot) = .empty;
     defer slots.deinit(lists);
     var accs: std.ArrayList(expr_agg.Accumulator) = .empty;
     defer accs.deinit(lists);
-    try fillFromPartitions(
+    fillFromPartitions(
         gpa,
         lists,
         arena,
@@ -229,13 +231,14 @@ pub fn inlineSharedStrings(
         workers,
         &slots,
         &accs,
-    );
+    ) catch |e| return merge_charge.refusal(e);
     if (cut) |c| {
         if (c.ranking_first) {
-            try keepResultTop(gpa, lists, calls, c, &slots, &accs);
-        } else try keepCountTop(gpa, lists, calls, .{ .a_idx = c.a_idx, .k = c.k }, &slots, &accs);
+            keepResultTop(gpa, lists, calls, c, &slots, &accs) catch |e| return merge_charge.refusal(e);
+        } else keepCountTop(gpa, lists, calls, .{ .a_idx = c.a_idx, .k = c.k }, &slots, &accs) catch |e|
+            return merge_charge.refusal(e);
     }
-    if (!args.unordered) try sortSlotsByFirst(lists, slots.items, workers);
+    if (!args.unordered) sortSlotsByFirst(lists, slots.items, workers) catch |e| return merge_charge.refusal(e);
     const key_types = [_]KeyType{.string};
     const types = try arena.alloc(GroupColType, outputs.len);
     for (outputs, types) |out, *ty| ty.* = .{
@@ -248,7 +251,7 @@ pub fn inlineSharedStrings(
     };
     // A cut copies its few winning keys and frees the tables with the state; a full answer borrows them all.
     if (cut == null) {
-        const tables = try lists.alloc(*expr_agg.GroupTable, state.parts.len);
+        const tables = lists.alloc(*expr_agg.GroupTable, state.parts.len) catch |e| return merge_charge.refusal(e);
         defer lists.free(tables);
         for (tables, state.parts) |*out, *part| out.* = &part.table;
         output.arena_credit = try output.takeTableArenas(gpa, tables, ledger);

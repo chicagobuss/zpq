@@ -76,11 +76,14 @@ pub fn inlineSelectedCount(
     const outputs = outputs_opt orelse return null;
     const program = agg_plan.OwnerProgram.init(calls) orelse return null;
     if (program.distinct_arg != null or calls.len == 0) return null;
-    if (program.len != 0 and keys.len < 2) return null;
+    const signed_int64 = keys.len == 1 and keys[0] == .col_ref and keys[0].col_ref.physical_type == .INT64 and
+        !keys[0].col_ref.unsigned_64;
+    // One signed INT64 key with payload lanes takes the checked raw identity below: the integer COUNT owner
+    // declines a second aggregate. Other single keys with payloads keep the general path.
+    if (program.len != 0 and keys.len < 2 and !signed_int64) return null;
     for (outputs) |out| if (out.derived != null) return null;
-    // Preserve P1's nullable INT64 sidecar and 16-byte producer while extending physical INT32 and tuples.
-    if (keys.len == 1 and keys[0] == .col_ref and keys[0].col_ref.physical_type == .INT64 and
-        !keys[0].col_ref.unsigned_64) return null;
+    // Preserve P1's nullable INT64 sidecar and 16-byte producer for bare COUNT while extending INT32 and tuples.
+    if (program.len == 0 and signed_int64) return null;
     const order = args.result_order;
     if (order.keys.len != 1 or order.having != null or order.hidden.len != 0) return null;
     if (order.keys[0].column >= outputs.len or outputs[order.keys[0].column].source != .agg) return null;
@@ -636,4 +639,3 @@ pub fn inlinePackedAnswer(
         .state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types },
     };
 }
-

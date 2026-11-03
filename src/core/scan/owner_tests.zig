@@ -1999,6 +1999,92 @@ test "packed payload top H preserves integer SUM AVG MIN MAX NULL ties and filte
     }
 }
 
+test "single INT64 payload top H matches grouping for sorted skewed uniform NULL keys ties and a tight budget" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 4096;
+    var k: [n]i64 = undefined;
+    var key_defs: [n]u32 = undefined;
+    var value: [n]i64 = undefined;
+    var defs: [n]u32 = undefined;
+    for (0..3) |shape| {
+        for (&k, &key_defs, &value, &defs, 0..) |*ki, *kd, *v, *d, i| {
+            const at: i64 = @intCast(i);
+            ki.* = switch (shape) {
+                // Sorted runs: five long ones, then runs of four that tie across the cutoff.
+                0 => if (i < 100) @divTrunc(at, 20) else @divTrunc(at, 4),
+                // Skewed: a few heavy keys among a wide tail.
+                1 => if (i % 3 == 0) @mod(at, 13) else @mod(at * 2654435761, 200000) - 100000,
+                // Near-uniform: every key ties.
+                else => @mod(at * 40503, 1024),
+            };
+            kd.* = @intFromBool(shape == 0 or i % 11 != 0);
+            v.* = @mod(at * 7919, 2001) - 1000;
+            d.* = @intFromBool(i % 17 != 0);
+        }
+        const columns = [_]expr_agg.OutputCol{
+            .{ .name = "k", .col = .{ .i64 = .{ .values = &k, .def_levels = &key_defs, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
+            .{ .name = "v", .col = .{ .i64 = .{ .values = &value, .def_levels = &defs, .max_def = 1 } }, .parquet_type = .INT64, .nullable = true },
+        };
+        var sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+        _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, k.len, .SNAPPY, .{}, .{});
+        var meta = try metadata.open(a, sink.buffer.items);
+        const rgs = try a.alloc(schema.RowGroup, 8);
+        @memset(rgs, meta.row_groups.items[0]);
+        meta.row_groups.items = rgs;
+        meta.num_rows *= @intCast(rgs.len);
+        for ([_]expr_ast.ResultOrder{
+            .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+            .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 7, .offset = 3 },
+        }) |order| {
+            var args: MultiAggArgs = .{
+                .inputs = &.{.{ .name = "int64-payload", .bytes = sink.buffer.items }},
+                .metas = &.{meta},
+                .aggregate = "count(*) AS c,sum(v) AS s,avg(v) AS a,min(v) AS lo,max(v) AS hi",
+                .group_by = "k",
+                .max_memory = 256 << 20,
+                .parallelism = 1,
+                .min_bytes_per_worker = 1,
+                .integer_records_min_rows = 0,
+                .integer_records = false,
+                .plain_rules = false,
+                .result_order = order,
+            };
+            var want = try runMultiAggregate(gpa, a, args);
+            defer want.deinit(gpa);
+            try want.output.applyResultOrder(gpa, args.result_order);
+            for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+                args.parallelism = j;
+                args.decode_batch_rows = window;
+                args.integer_records = true;
+                var taken: std.EnumSet(FastPath) = .{};
+                args.taken = &taken;
+                const ex = try explainAggregate(gpa, a, args);
+                try testing.expectEqual(.packed_count_top_h, ex.record_path.?.layout);
+                var got = try prepareAggregate(gpa, a, args, false);
+                defer got.deinit(gpa);
+                try testing.expect(taken.contains(.integer_records));
+                try got.output.applyResultOrder(gpa, args.result_order);
+                try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+                try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
+            };
+            // A budget just below the owner's quote declines it before any row is read; grouping answers the same.
+            args.parallelism = 4;
+            args.decode_batch_rows = 0;
+            args.taken = null;
+            args.max_memory = (try explainAggregate(gpa, a, args)).record_path.?.reservation - 1;
+            const ex = try explainAggregate(gpa, a, args);
+            if (ex.record_path) |path| try testing.expect(path.layout != .packed_count_top_h);
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        }
+    }
+}
+
 test "raw DISTINCT batch owners preserve NULLs and replay speculative footer range violations" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

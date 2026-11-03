@@ -35,6 +35,11 @@
   a `LIMIT` now takes the same path. These folds size their workers from the CPU's cache-sharing topology. On a
   Ryzen 9 9950X, ClickBench Q08 is 16–26% faster and a skewed `GROUP BY k` with `count(DISTINCT x)` is 7–29% faster
   depending on thread count; the rest of ClickBench is unchanged.
+- **Exact DECIMAL `SUM` and `AVG` are faster.** zpq now decodes their columns a cache-sized tile at a time, reads
+  dictionary codes where it can, and sums each tile in 64-bit integers when a bound computed from the values it read
+  proves that can't overflow; any tile without that proof takes the full-width path as before, so answers and
+  overflow errors are unchanged. Filters also run a tile at a time. On a Ryzen 9 9950X, TPC-H Q1 on a 60 M-row
+  DECIMAL lineitem is 2.8× faster (174 → 63 ms hot) and Q6 2.2× faster; DOUBLE columns are unchanged.
 
 ## 0.5.1 (2026-10-31)
 

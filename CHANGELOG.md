@@ -40,6 +40,12 @@
   proves that can't overflow; any tile without that proof takes the full-width path as before, so answers and
   overflow errors are unchanged. Filters also run a tile at a time. On a Ryzen 9 9950X, TPC-H Q1 on a 60 M-row
   DECIMAL lineitem is 2.8× faster (174 → 63 ms hot) and Q6 2.2× faster; DOUBLE columns are unchanged.
+- **Top-k over long string keys is faster.** `GROUP BY k ORDER BY count(*)` (or a `SUM`/`MAX` of a column) `LIMIT n`
+  over a long, mostly PLAIN string key now ranks its groups in the shared string table that full `GROUP BY` already
+  uses, instead of a separate cut; dictionary-coded keys and selective filters keep their existing plans. A single
+  ordered `BIGINT` key with `SUM`/`AVG`/`MIN`/`MAX` beside the count now takes the packed top-k path. On a Ryzen 9
+  9950X, top-10 queries over 1 M distinct URL-like keys in 20 M rows are 1.4–2.3× faster, and the ordered-key case
+  1.2–1.5× faster at about 1.4× the peak memory; ClickBench is unchanged.
 
 ## 0.5.1 (2026-10-31)
 

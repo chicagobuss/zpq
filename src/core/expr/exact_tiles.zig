@@ -1031,8 +1031,8 @@ test "a tile whose sums leave i64 folds wide and exactly, cancellation included;
     const n = 2048;
     const d182: expr_ast.Dec = .{ .precision = 18, .scale = 2 };
     const vals = try a.alloc(i64, n);
-    // Row values just under 10^18: any 10 of one sign leave i64, and the tile's sum climbs past i128's reach of
-    // i64 values only through the 192-bit state before the second half cancels it.
+    // Row values just under 10^18: any 10 of one sign leave i64, so every tile folds wide, and the second half
+    // cancels the first. The sum stays near 10^21; the test below takes it past i128.
     for (vals, 0..) |*v, i| v.* = if (i < n / 2) 999_999_999_999_999_999 else -999_999_999_999_999_998;
     const keys = [_]expr_ast.Expr{};
     const p = try Fx.col(a, 0, d182);
@@ -1069,6 +1069,63 @@ test "a tile whose sums leave i64 folds wide and exactly, cancellation included;
     try testing.expectEqual(ExactTiles.Outcome.folded, try z.fold(a, a, &mixed, &lookup, &s64, 0));
     try testing.expectEqual(@as(u64, 1), counters.proved.load(.monotonic));
     try testing.expectEqual(@as(i192, 3 * (63 * 64 / 2 - 5)), z.sums[0].get());
+}
+
+test "wide tiles carry a sum past i128 and back: 192-bit partials, the established fold and the exact answer agree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const half = 100_000;
+    const n = 2 * half;
+    const tile = 1024;
+    const x: i64 = 999_999_999_999_999_999;
+    // 100,000 products of x·x, then 100,000 of -(x - 1)·x: the running sum reaches 10^41, past i128's 1.7·10^38,
+    // inside a tile and across them, before the second half cancels it to 100,000·x.
+    try testing.expect(@as(i192, half) * x * x > std.math.maxInt(i128));
+    const lhs = try a.alloc(i64, n);
+    const rhs = try a.alloc(i64, n);
+    for (lhs, rhs, 0..) |*l, *r, i| {
+        l.* = if (i < half) x else -(x - 1);
+        r.* = x;
+    }
+    const d180: expr_ast.Dec = .{ .precision = 18, .scale = 0 };
+    const prod = try Fx.bin(a, .mul, try Fx.col(a, 0, d180), try Fx.col(a, 1, d180), .{ .precision = 36, .scale = 0 });
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = prod.*, .result = .dec, .where = null, .alias = "s" },
+        .{ .func = .avg, .arg = prod.*, .result = .avg_dec, .where = null, .alias = "m" },
+        .{ .func = .count, .arg = null, .result = .i64, .where = null, .alias = "n" },
+    };
+    const whole = [_]Column{ Fx.plain(lhs, null), Fx.plain(rhs, null) };
+    const lookup = [_]?usize{ 0, 1 };
+    const sel = try Sel.init(a, n);
+    counters.reset();
+    var t = (try ExactTiles.init(a, &calls, &.{}, lookup.len)).?;
+    var off: usize = 0;
+    while (off < n) : (off += tile) {
+        const len = @min(tile, n - off);
+        const cols = [_]Column{ try whole[0].sliceRows(off, len), try whole[1].sliceRows(off, len) };
+        const w = try sel.alignedWindow(off, len);
+        try testing.expectEqual(ExactTiles.Outcome.folded, try t.fold(a, a, &cols, &lookup, &w, off));
+    }
+    try testing.expectEqual(@as(u64, 0), counters.proved.load(.monotonic));
+    try testing.expectEqual(@as(u64, (n + tile - 1) / tile), counters.wide.load(.monotonic));
+
+    // The established whole-batch fold, and the answer computed without either.
+    const comp = try t.composites(a, &whole, &lookup, n);
+    const want = try Fx.oracle(a, &t, &whole, &lookup, comp, &sel);
+    try testing.expectEqual(want[0][0].get(), t.sums[0].get());
+    try testing.expectEqual(want[0][0].n, t.sums[0].n);
+    const exact: i192 = @as(i192, half) * x * x - @as(i192, half) * (x - 1) * x;
+    try testing.expectEqual(@as(i192, 99_999_999_999_999_999_900_000), exact);
+    try testing.expectEqual(exact, t.sums[0].get());
+
+    var accs: [calls.len]agg.Accumulator = undefined;
+    for (&accs, calls) |*acc, call| acc.* = agg.Accumulator.init(call);
+    try t.finish(a, null, &accs, 0);
+    try testing.expectEqual(@as(?i128, 99_999_999_999_999_999_900_000), try accs[0].sum_d.result());
+    // avg over DECIMAL(36,0) is DECIMAL(38,2): 499999999999999999.50.
+    try testing.expectEqual(@as(?i128, 49_999_999_999_999_999_950), try agg.avgDecMean(calls[1], accs[1].avg_d));
+    try testing.expectEqual(@as(u64, n), accs[2].count);
 }
 
 test "other DECIMAL shapes stay on the established path" {

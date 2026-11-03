@@ -32,11 +32,11 @@ export PATH="$PWD/zpq/bin:$PATH"
 | macOS, Apple silicon | `zpq-aarch64-macos.tar.gz` |
 | macOS, Intel | `zpq-x86_64-macos.tar.gz` |
 
-**Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.5.0_amd64.deb`, `zpq_0.5.0_arm64.deb`,
-`zpq-0.5.0-1.x86_64.rpm` and `zpq-0.5.0-1.aarch64.rpm`.
+**Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.5.1_amd64.deb`, `zpq_0.5.1_arm64.deb`,
+`zpq-0.5.1-1.x86_64.rpm` and `zpq-0.5.1-1.aarch64.rpm`.
 
 ```bash
-sudo apt install ./zpq_0.5.0_amd64.deb      # or: sudo dnf install ./zpq-0.5.0-1.x86_64.rpm
+sudo apt install ./zpq_0.5.1_amd64.deb      # or: sudo dnf install ./zpq-0.5.1-1.x86_64.rpm
 ```
 
 The default Linux x86_64 build needs AVX2; on older CPUs use the `-compat` build.
@@ -161,7 +161,7 @@ The full list is under "Known limits" in [CHANGELOG.md](CHANGELOG.md).
 - [How it works](https://zpq.chicagobuss.dev/how.html): every optimization, Parquet itself, testing, the write path,
   Lambda fan-out, the JVM and NaN.
 - [Examples](https://zpq.chicagobuss.dev/examples.html): a guide with real output for each command.
-- [CHANGELOG.md](CHANGELOG.md): everything new in 0.5.0, and what to do when upgrading from 0.4.x.
+- [CHANGELOG.md](CHANGELOG.md): release history and upgrade notes.
 
 ## Reference
 

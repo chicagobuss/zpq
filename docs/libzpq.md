@@ -49,15 +49,14 @@ with zpq.Zpq(max_memory="4GB") as z:
 
 ## SQL (EXPERIMENTAL in 0.5.1)
 
-The SQL request and response shapes are **EXPERIMENTAL** in 0.5.0 and have no stability guarantee. This is a thin
+The SQL request and response shapes are **EXPERIMENTAL** and have no stability guarantee. This is a thin
 pass-through to the CLI frontend; Parquet I/O remains the engine's focus.
 
 `zpq_run` also accepts `{"sql":"SELECT ... FROM 'data.parquet'", "parallelism":3}`. It uses the CLI's SQL
 frontend, binder, planner, path expansion (local and S3 globs), and NDJSON serializers. Successful responses are
 `{"ok":true,"ndjson":"{\"n\":42}\n"}`: the decoded `ndjson` string is byte-identical to the CLI's stdout for
 that SQL and options. Empty results carry an empty string. When the answer has DECIMAL columns, the response also
-names them, `"decimal":["price","total"]`; a structured aggregate's response does the same beside its `agg`. The seven
-C exports and ABI version 1 are unchanged.
+names them, `"decimal":["price","total"]`; a structured aggregate's response does the same beside its `agg`. These requests use ABI version 1.
 
 ```python
 with zpq.Zpq(max_memory="1GB") as z:
@@ -117,11 +116,11 @@ Windows is not built.
 
 - The library carries everything it links: BoringSSL, the codecs and libc++. At run time it needs the system C
   library alone, as in the table. It needs no TLS, codec or C++ library from the system.
-- On Linux it exports the seven `zpq_*` functions and nothing else, under the symbol version `LIBZPQ_1`
+- On Linux it exports the eight `zpq_*` functions and nothing else, under the symbol version `LIBZPQ_1`
   (`src/libzpq/libzpq.map`; `nm -D --defined-only libzpq.so` lists them). Its BoringSSL cannot collide with a host's
   own OpenSSL, such as the one a Python process loads.
 - On macOS, which has no version script, every archive the dylib links is compiled with hidden symbols, so it exports
-  the seven functions too. It adds only what a Mach-O library always carries (`__mh_dylib_header`, `__dso_handle`) and
+  the eight functions too. It adds only what a Mach-O library always carries (`__mh_dylib_header`, `__dso_handle`) and
   libc++'s weak `operator new` and `operator delete`. dyld coalesces weak definitions across a process, so a C++
   host's and libzpq's allocations may bind to either copy; both allocate with `malloc`, so that is harmless. A host
   that replaces `operator new` and `operator delete` will see its replacements used inside libzpq too.
@@ -136,6 +135,7 @@ Windows is not built.
 |---|---|---|---|
 | `int zpq_open(const char *options_json, zpq_ctx **out_ctx, char **out_error)` | a status | `*out_ctx` until `zpq_close`; `*out_error` (free with `zpq_free`) | any thread, any number at once |
 | `int zpq_run(zpq_ctx *, const char *request_json, size_t len, char **out_json, size_t *out_len)` | a status | `*out_json` (free with `zpq_free`) | any number at once on one context |
+| `int zpq_run_arrow(zpq_ctx *, const char *request_json, size_t len, struct ArrowArrayStream *out_stream, char **out_error)` | a status | the stream and optional error (free with `zpq_free`) | separate streams may run concurrently; serialize callbacks on each stream |
 | `void zpq_free(char *)` | | | any thread |
 | `void zpq_shutdown(zpq_ctx *)` | | | any thread, any number of times |
 | `void zpq_close(zpq_ctx *)` | | the context is gone when it returns | once per context, when no other call can start |
@@ -193,7 +193,7 @@ must aggregate (`aggregate` / `group_by`) or write (`output_url`); anything else
 - Neither step cancels a running query: it runs to its end. One stalled on S3 ends only by the S3 timeouts
   (`ZPQ_S3_CONNECT_TIMEOUT_MS`, `ZPQ_S3_HANDSHAKE_TIMEOUT_MS`, `ZPQ_S3_FIRST_BYTE_TIMEOUT_MS`,
   `ZPQ_S3_IDLE_TIMEOUT_MS`: 5, 5, 10 and 10 s by default) over its retries, which can hold `zpq_close` for a minute
-  or more. A host that needs a faster shutdown can lower those timeouts. Cancelling running queries is not in 0.5.0.
+  or more. A host that needs a faster shutdown can lower those timeouts.
 - One context per process is the intended use. Several work, but each sets and restores the SIGPIPE/SIGIO handlers
   (below), so close them in the reverse order they were opened.
 
@@ -216,9 +216,8 @@ narrower paths and otherwise returns an error; a flat row group can be decoded i
 stacks, initial decode buffers, codec state and the final retry remains outside it, as listed under `--max-memory`
 in `zpq --help`.
 
-In 0.5.0, growth and replacement of a high-cardinality GROUP BY or `count(DISTINCT)` hash table can also exceed the
-budget by up to about 2x near its limit. The answer stays exact or the query refuses. Leave headroom in the host;
-use a cgroup `memory.max` for a hard ceiling. The context's reservation ceiling is not a process memory limit.
+Aggregation state, DISTINCT sets and string arenas draw from this budget. Leave headroom in the host; use a cgroup
+`memory.max` for a hard ceiling. The context's reservation ceiling is not a process memory limit.
 
 Outside the ceiling altogether:
 - the footer cache, and warm Bloom filters up to a sixteenth of the ceiling (at most 256 MiB), both held by the
@@ -257,13 +256,13 @@ Outside the ceiling altogether:
   filter parsers are fuzzed. A broken internal invariant still aborts the process with a message, as it would the
   CLI; libzpq never unwinds into the caller. Build it `ReleaseSafe` to keep those checks, `ReleaseFast` for speed.
 
-## Stable and experimental in 0.5.0
+## Stable and experimental in 0.5.1
 
-Stable: the seven functions, their signatures and ownership, the status codes and their meanings, the option names, and
+Stable: the seven non-Arrow functions, their signatures and ownership, the status codes and their meanings, the option names, and
 the request and response schema the Lambda documents. ABI version 1 only grows: new options, request fields and
 status codes may be added.
 
-Experimental: the SQL request and response shapes (no stability guarantee in 0.5.0), the `"pool"` and `"profile"`
+Experimental: the Arrow stream interface, the SQL request and response shapes (no stability guarantee), the `"pool"` and `"profile"`
 members of a response (their fields may change), the Python binding's API, and the HTTP service. The memory ceiling
 bounds declared budgets only, and does not count the context's caches (see Memory).
 
@@ -400,4 +399,3 @@ early release, partial reads, moved structures, independent result lifetimes, an
 compile it against the built library with `gcc -fsanitize=address`, and run it with the generated
 `ASSIGNED_SCRATCH/all_types.parquet`. Use `ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:use_sigaltstack=0`, following
 the existing C ABI test's signal-stack convention.
-

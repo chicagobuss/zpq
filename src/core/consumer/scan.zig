@@ -16,6 +16,7 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_eval = @import("../expr/eval.zig");
 const expr_agg = @import("../expr/agg.zig");
 const agg_coded = @import("../expr/agg_coded.zig");
+const exact_tiles = @import("../expr/exact_tiles.zig");
 const agg_dense = @import("../expr/agg_dense.zig");
 const agg_plan = @import("../agg_plan.zig");
 const partagg = @import("../partagg.zig");
@@ -476,8 +477,8 @@ pub fn scanRGForAgg(
 ) !u64 {
     var execution = ws;
     if (ws.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
-        (target != .grouped or (decode_options.encoded and target.grouped.part == null and
-            target.grouped.records == null)))
+        (target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
+            target.grouped.part == null and target.grouped.records == null)))
         execution.decode_batch_rows = automaticCacheRowsWithHints(ws.planning_charged orelse ws.charged orelse gpa, in, target, ws.scan_workers, ws.cache_hints) catch 0;
     if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
     return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution) catch |err| {
@@ -592,6 +593,7 @@ pub fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTa
 }
 
 fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize, hints: ?*CacheHints) !usize {
+    if (exactTileTarget(in, target)) return exactTileRows(in, target);
     var computed = false;
     for (target.calls()) |call| {
         if (call.where != null or call.func == .count_distinct or call.result == .bytes) return 0;
@@ -706,6 +708,45 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
     return if (cap != 0 and cap < rows) cap else 0;
 }
 
+/// Whether the row group's exact DECIMAL aggregates can fold a decode tile at a time (`exact_tiles`). The table must
+/// be one the tiles can add finished sums to: not recorded, dense, sketched, discovering or compact, and a
+/// partitioned worker's still its local table rather than its runs.
+fn exactTileTarget(in: AggRowGroup, target: AggTarget) bool {
+    if (in.subgroup != null) return false;
+    switch (target) {
+        .scalar => |s| return exact_tiles.admits(s.calls, &.{}),
+        .grouped => |g| {
+            if (!exact_tiles.admits(g.calls, g.keys)) return false;
+            if (g.records != null or g.dense != null) return false;
+            if (g.part != null and (g.local == null or g.local.?.abandoned)) return false;
+            if (g.table.discovery != null or g.table.sketch != null or g.table.compact.stride != 0) return false;
+            return !g.table.countOnly();
+        },
+    }
+}
+
+/// Tile rows for the exact fold: what a row of the columns it decodes takes (a code, a 64-bit value, levels), the
+/// composite and selection, within three quarters of the worker's L2 share. The windows over a tile are L1-sized
+/// and fixed, so they are not per row.
+fn exactTileRows(in: AggRowGroup, target: AggTarget) usize {
+    const l2 = @import("../hw.zig").l2BytesPerWorker();
+    if (l2 == 0) return 0;
+    var per_row: usize = 4 + 1; // composite, selection
+    if (target == .grouped and target.grouped.keys.len > 1) per_row += 4;
+    for (in.read, 0..) |needed, ci| {
+        if (!needed or ci >= in.rg.columns.items.len) continue;
+        const cm = in.rg.columns.items[ci].meta_data orelse return 0;
+        per_row += if (cm.dictionary_page_offset != null) 4 else switch (cm.type) {
+            .INT32, .FLOAT => 4,
+            .BOOLEAN => 1,
+            else => 8,
+        };
+        if (in.meta.getColumnLevels(cm.path_in_schema.items).max_def > 0) per_row += 4;
+    }
+    const rows = std.mem.alignBackward(usize, (l2 - l2 / 4) / per_row, 64);
+    return @max(rows, 1024);
+}
+
 /// Share computed scalar inputs too, then use the ordinary typed folds over their prepared values. Synthesizing a
 /// borrowed DOUBLE column keeps NULL masks and canonical 64-row reductions in updateOne; no partial sum is merged.
 fn foldScalarCache(
@@ -808,7 +849,9 @@ fn planDecode(
     // every column has a sliced form, else one aggregate's columns at a time.
     const fits_share = full <= b.share();
     const discovering = target == .grouped and target.grouped.table.discovery != null;
-    const force_cache = ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target));
+    const exact = ws.decode_batch_rows != 0 and !discovering and !cacheExpressionsSafe(target) and
+        exactTileTarget(in, target);
+    const force_cache = ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target) or exact);
     // A filter-only or hash-only string is hashed or compared per page. Decoding the chunk whole faults the
     // decompressed bytes into the row-group region and holds them until the scan releases every region.
     const stream_rows = streamWindowRows(in, target, num_rows);
@@ -822,7 +865,7 @@ fn planDecode(
     const whole = !keep_dictionary and !stream and !force_cache and fits_share and admitWhole(ws, full);
     if (whole) return plan;
     if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
-    if (try scanRGSliced(
+    const sliced = scanRGSlicedExact(
         gpa,
         in,
         decode_options,
@@ -832,7 +875,18 @@ fn planDecode(
         handled_via_stats,
         full,
         stream_rows,
-    )) |kept| {
+        true,
+    ) catch |err| switch (err) {
+        // The exact tiles left the row group, untouched, to the established path: whole when only the tiles sliced
+        // it, else the established slices, exactly as without them.
+        error.ExactTilesAbandoned => blk: {
+            ws.rg_arena.nextRowGroup();
+            if (exact and !keep_dictionary and !stream and fits_share and admitWhole(ws, full)) return plan;
+            break :blk try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full, stream_rows);
+        },
+        else => return err,
+    };
+    if (sliced) |kept| {
         plan.kept = kept;
         return plan;
     }
@@ -1341,6 +1395,8 @@ fn filterSurvivors(
     num_rows: usize,
     ws: AggWorkspace,
     stream_rows: usize,
+    /// Read dictionary-encoded fixed-width filter columns as codes, as a whole coded chunk is filtered.
+    codes: bool,
 ) !?filter_selection.SelectionVector {
     const pool = try poolOn(&ws.scratch.slice, side);
     var n_readers: usize = 0;
@@ -1358,8 +1414,14 @@ fn filterSurvivors(
     @memset(lookup, null);
     for (in.read, payload, 0..) |needed, late, ci| {
         if (!needed or late or ci >= in.rg.columns.items.len) continue;
-        const r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, decode_options, pool) orelse
+        const cm = in.rg.columns.items[ci].meta_data;
+        const coded = codes and cm != null and cm.?.dictionary_page_offset != null and
+            (cm.?.type == .INT32 or cm.?.type == .INT64);
+        var options = decode_options;
+        if (coded) options.any_dictionary = true;
+        var r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
+        if (coded) r.exact_codes = true;
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
     }
@@ -1378,7 +1440,10 @@ fn filterSurvivors(
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
         var sel = try filter_selection.SelectionVector.init(sa, n);
         try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
-        for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
+        if (done % 64 == 0 and (n % 64 == 0 or done + n == num_rows)) {
+            // Whole words: bits past `n` are clear in `sel` only at the row group's end, past `num_rows`.
+            for (survivors.mask[done / 64 ..][0..sel.mask.len], sel.mask) |*dst, keep| dst.* &= keep;
+        } else for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
     }
     return survivors;
 }
@@ -1396,6 +1461,7 @@ fn openSlicedPayload(
     payload: ?[]const bool,
     survivors: ?*filter_selection.SelectionVector,
     ws: AggWorkspace,
+    exact: ?*const exact_tiles.ExactTiles,
 ) !?void {
     @memset(lookup, null);
     var n_readers: usize = 0;
@@ -1421,6 +1487,10 @@ fn openSlicedPayload(
             options.row_gate = sv;
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
+        // The exact tiles read a dictionary DECIMAL through its codes.
+        if (exact) |x| if (x.readsLeaf(ci) and in.rg.columns.items[ci].meta_data.?.dictionary_page_offset != null) {
+            r.exact_codes = true;
+        };
         if (in.subgroup) |subgroup| try r.seekSubgroup(pages, subgroup);
         if (levels_only[ci]) r.levelsOnly();
         if (target == .grouped) if (target.grouped.records) |records| if (records.retention(ci)) |owner| {
@@ -1795,6 +1865,23 @@ fn scanRGSliced(
     full: usize,
     stream_rows: usize,
 ) !?u64 {
+    return scanRGSlicedExact(gpa, in, decode_options, target, ws, budget, handled, full, stream_rows, false);
+}
+
+/// `scanRGSliced`, folding exact DECIMAL aggregates a tile at a time when `exact_ok` and the target admits it
+/// (`exact_tiles`). `error.ExactTilesAbandoned` when the tiles cannot take the row group; nothing reached the target.
+fn scanRGSlicedExact(
+    gpa: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+    budget: *DecodeBudget,
+    handled: []const bool,
+    full: usize,
+    stream_rows: usize,
+    exact_ok: bool,
+) !?u64 {
     const num_rows: usize = if (in.subgroup) |subgroup| subgroup.rows.hi - subgroup.rows.lo else @intCast(@max(0, in.rg.num_rows));
     if (num_rows == 0) return null;
     const side = ws.charged orelse gpa;
@@ -1819,6 +1906,19 @@ fn scanRGSliced(
     const levels_only = try pages.allocator().alloc(bool, in.read.len);
     for (levels_only, 0..) |*l, ci| l.* = decode_options.encoded and target == .scalar and ci < uses.levels.len and
         uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
+    // Exact DECIMAL folds through tiles whose sums reach the table only once the row group has folded, so their size
+    // cannot change which error wins (`exact_tiles`).
+    var exact: ?exact_tiles.ExactTiles = null;
+    if (exact_ok and exactTileTarget(in, target)) {
+        const no_stats = for (handled) |h| {
+            if (h) break false;
+        } else true;
+        if (no_stats) exact = try exact_tiles.ExactTiles.init(pages.allocator(), target.calls(), switch (target) {
+            .grouped => |g| g.keys,
+            .scalar => &.{},
+        }, in.meta.schema.items.len);
+        if (exact == null) return error.ExactTilesAbandoned;
+    }
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
     const payload = if (in.subgroup != null) null else try payloadColumns(pages.allocator(), in, target);
     var survivors: filter_selection.SelectionVector = undefined;
@@ -1831,6 +1931,7 @@ fn scanRGSliced(
         num_rows,
         ws,
         stream_rows,
+        exact != null,
     )) orelse
         return null;
     // The filter pass has released its readers. The same slots decode the payload.
@@ -1847,13 +1948,14 @@ fn scanRGSliced(
         payload,
         if (payload != null) &survivors else null,
         ws,
+        if (exact) |*x| x else null,
     ) orelse return null;
     const per_row = @max(1, full / num_rows);
     // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
     // answer, only how many rows decode at once.
     const room = if (ws.ledger) |l| l.sliceAvailable() / 2 else std.math.maxInt(usize);
     const discovering = target == .grouped and target.grouped.table.discovery != null;
-    const forced = if (ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target)))
+    const forced = if (ws.decode_batch_rows != 0 and (discovering or cacheExpressionsSafe(target) or exact != null))
         ws.decode_batch_rows
     else
         std.math.maxInt(usize);
@@ -1929,6 +2031,13 @@ fn scanRGSliced(
         matched += if (in.filter != null) sel.count() else n;
         const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
+        if (exact) |*x| {
+            if (try x.fold(pages.allocator(), sa, cols, lookup, &sel, done) == .abandon) {
+                _ = exact_tiles.counters.abandoned.fetchAdd(1, .monotonic);
+                return error.ExactTilesAbandoned;
+            }
+            continue;
+        }
         switch (target) {
             .scalar => |s| {
                 if (distinct_ci) |ci| if (!handled[0]) {
@@ -2042,6 +2151,15 @@ fn scanRGSliced(
         }
         if (discovering and target.grouped.table.discoveryDone(target.grouped.pos_base + done + n)) break;
     }
+    if (exact) |*x| switch (target) {
+        .grouped => |g| {
+            // A partitioned worker's local table flushes as `foldGroupedWindows` flushes it, around the row group.
+            if (g.part) |part| if (part.needsFlush(g.local.?, g.table)) try part.pump(g.local.?, g.table, 0);
+            try x.finish(pages.allocator(), g.table, &.{}, g.pos_base);
+            if (g.part) |part| try part.pump(g.local.?, g.table, matched);
+        },
+        .scalar => |s| try x.finish(pages.allocator(), null, s.accumulators, 0),
+    };
     const t1 = nowMonoNs();
     ws.timings.decode_ns += @intCast(t1 - t0);
     profile.record(prof, .decode, t0, t1, profile.args(.{ in.file_index, in.rg_index, readers.items.len }));

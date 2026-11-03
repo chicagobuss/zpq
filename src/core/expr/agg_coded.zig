@@ -2468,6 +2468,27 @@ fn windowedSums(
     };
 }
 
+/// One exact root's sums per composite over `batch`'s rows `sel` keeps, through the checked lanes and `NarrowAcc`:
+/// the wide path for a tile whose narrow proof failed (`exact_tiles`).
+pub fn exactRootSums(
+    ra: std.mem.Allocator,
+    plan: *expr_eval.ExactPlan,
+    root: usize,
+    space: usize,
+    comp: []const u32,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    sel: *const Sel,
+) ![]agg.DecSum {
+    const restricted = batch.restrictedTo(sel);
+    const v = try plan.evaluate(ra, &restricted, lookup, root);
+    var acc = try NarrowAcc.init(ra, space, comp.len);
+    try acc.fold(comp, v, sel);
+    var present: ?[]u64 = null;
+    try acc.finish(ra, &present, comp, sel);
+    return acc.delta;
+}
+
 /// An exact plan's bytes in flight per row: the composite and selection, then each node's lane and levels, at i128
 /// for an expression whose product may not fit 64 bits.
 fn exactLiveBytesPerRow(plan: *const expr_eval.ExactPlan) usize {

@@ -1,0 +1,24 @@
+{
+  "fixtures": [
+    {"name": "li", "copy": "COPY (SELECT CASE (i % 3) WHEN 0 THEN 'A' WHEN 1 THEN 'N' ELSE 'R' END AS rf, CASE WHEN i % 13 = 4 THEN NULL WHEN (i // 3) % 2 = 0 THEN 'F' ELSE 'O' END AS ls, CASE WHEN i % 23 = 1 THEN NULL ELSE ((i * 31) % 50 + 1)::DECIMAL(15,2) END AS q, CASE WHEN i % 17 = 3 THEN NULL ELSE ((90091 + (i * 7919) % 10404859) / 100.0)::DECIMAL(15,2) END AS p, CASE WHEN i % 19 = 5 THEN NULL ELSE ((i * 5) % 11 / 100.0)::DECIMAL(15,2) END AS d, CASE WHEN i % 29 = 7 THEN NULL ELSE ((i * 3) % 9 / 100.0)::DECIMAL(15,2) END AS t, (i % 1000)::DECIMAL(9,2) AS c, DATE '1992-01-01' + (i % 2526)::INTEGER AS sd FROM range(300000) r(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 100000)"},
+    {"name": "wide", "copy": "COPY (SELECT CASE i % 2 WHEN 0 THEN 'x' ELSE 'y' END AS k, (CASE WHEN i < 150000 THEN 9999999999999999.99 ELSE -9999999999999999.98 END)::DECIMAL(18,2) AS v, (i % 7)::DECIMAL(18,2) AS w, (CASE WHEN i % 1000 = 7 THEN 9999999999999999.99 ELSE i % 100 END)::DECIMAL(18,2) AS s FROM range(300000) r(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 100000)"}
+  ],
+  "axes": {"exact": [
+    {"jobs": 1, "force": {"ZPQ_DENSE": "0"}},
+    {"jobs": 4, "force": {"ZPQ_DENSE": "0"}},
+    {"jobs": 4, "force": {"ZPQ_DENSE": "0", "ZPQ_DECODE_BATCH_ROWS": "1024"}},
+    {"jobs": 4, "force": {"ZPQ_DENSE": "0", "ZPQ_DECODE_BATCH_ROWS": "0"}},
+    {"jobs": 4, "max_memory": "4MB", "force": {"ZPQ_DENSE": "0"}},
+    {"jobs": 4}
+  ]},
+  "cases": [
+    {"axes": "exact", "id": "exact-tiles:q1-sums", "fixture": "li", "sql": "SELECT rf, ls, sum(q) AS sq, sum(p) AS sp, sum(p * (1 - d)) AS sdp, sum(p * (1 - d) * (1 + t)) AS sc, count(*) AS n FROM '{path}' WHERE sd <= '1998-09-02' GROUP BY rf, ls", "oracle": {"compare": "group", "sql": "SELECT rf, ls, sum(q) AS sq, sum(p) AS sp, sum(p * (1 - d)) AS sdp, sum(p * (1 - d) * (1 + t)) AS sc, count(*) AS n FROM '{path}' WHERE sd <= DATE '1998-09-02' GROUP BY rf, ls"}},
+    {"axes": "exact", "id": "exact-tiles:q1-means", "fixture": "li", "sql": "SELECT rf, ls, sum(q) AS sq, sum(p * (1 - d) * (1 + t)) AS sc, avg(q) AS aq, avg(p) AS ap, avg(d) AS ad, count(*) AS n FROM '{path}' WHERE sd <= '1998-09-02' GROUP BY rf, ls ORDER BY rf, ls", "same": "each mean is checked against the established whole-row-group fold (ZPQ_DECODE_BATCH_ROWS=0) at every point; the sums against DuckDB in exact-tiles:q1-sums"},
+    {"axes": "exact", "id": "exact-tiles:int32-mean", "fixture": "li", "sql": "SELECT rf, sum(c * q) AS cq, count(*) AS n FROM '{path}' GROUP BY rf", "oracle": {"compare": "group", "sql": "SELECT rf, sum(c * q) AS cq, count(*) AS n FROM '{path}' GROUP BY rf"}},
+    {"axes": "exact", "id": "exact-tiles:q6", "fixture": "li", "sql": "SELECT sum(p * d) AS revenue FROM '{path}' WHERE sd >= '1994-01-01' AND sd < '1995-01-01' AND d BETWEEN 0.05 AND 0.07 AND q < 24", "oracle": {"compare": "agg", "sql": "SELECT sum(p * d) AS revenue FROM '{path}' WHERE sd >= DATE '1994-01-01' AND sd < DATE '1995-01-01' AND d BETWEEN 0.05 AND 0.07 AND q < 24"}},
+    {"axes": "exact", "id": "exact-tiles:wide-cancels", "fixture": "wide", "sql": "SELECT k, sum(v) AS sv, sum(w) AS sw, count(*) AS n FROM '{path}' GROUP BY k", "oracle": {"compare": "group", "sql": "SELECT k, sum(v) AS sv, sum(w) AS sw, count(*) AS n FROM '{path}' GROUP BY k"}},
+    {"axes": "exact", "id": "exact-tiles:wide-product", "fixture": "wide", "sql": "SELECT k, sum(v * w) AS svw, avg(v) AS av FROM '{path}' GROUP BY k ORDER BY k", "same": "DuckDB multiplies two 18-digit DECIMALs at DECIMAL(18) and overflows; zpq's DECIMAL(36,4) product is checked against its established fold at every point"},
+    {"axes": "exact", "id": "exact-tiles:filtered-before-error", "fixture": "wide", "sql": "SELECT k, sum(s * s * s) AS c, sum(v) AS sv FROM '{path}' WHERE s < 1000 GROUP BY k", "oracle": {"compare": "group", "sql": "SELECT k, sum(CAST(s AS DECIMAL(38,2)) * s * s) AS c, sum(v) AS sv FROM '{path}' WHERE s < 1000 GROUP BY k"}},
+    {"axes": "exact", "id": "exact-tiles:selected-overflow", "fixture": "wide", "sql": "SELECT k, sum(v) AS sv, sum(s * s * s) AS c FROM '{path}' GROUP BY k", "refuse": {"error": "DecimalOverflow", "diag": "a DECIMAL value needs more digits than its type holds"}}
+  ]
+}

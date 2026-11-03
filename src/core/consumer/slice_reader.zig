@@ -46,6 +46,10 @@ pub const SliceReader = struct {
     levels: schema.Levels,
     dec: ?decimal_mod.Kind,
     exact_only: bool = false,
+    /// A DECIMAL read through its dictionary codes where pages have them (`exact_tiles`), with the exact dictionary
+    /// beside its scaled view; the scaled view is built once per dictionary, on `held`.
+    exact_codes: bool = false,
+    dec_dict: ?struct { src: usize, len: usize, scaled: []f64 } = null,
     float16: bool,
     int96: bool,
     left: usize,
@@ -316,6 +320,13 @@ pub const SliceReader = struct {
                 else => {},
             }
         }
+        if (n != 0 and !self.levels_only and self.exact_codes and self.dec != null) {
+            switch (self.raw.*) {
+                inline .i32, .i64 => |*r| if (r.options.encoded)
+                    return self.decimalCoded(@TypeOf(r.*).Value, try self.nextCoded(@TypeOf(r.*).Value, r, a, n), a),
+                else => {},
+            }
+        }
         if (self.levels_only) {
             const max_def: u32 = @intCast(self.levels.max_def);
             const def = try a.alloc(u32, n);
@@ -469,6 +480,40 @@ pub const SliceReader = struct {
         const dict = r.dictionary orelse return error.DictionaryMissing;
         const col = codedCol(T, .{ .codes = codes, .def_levels = def, .has_nulls = r.has_nulls }, dict, self.levels);
         return @unionInit(filter_eval.Batch.Column, if (T == []const u8) "string" else @typeName(T), col);
+    }
+
+    /// `nextCoded`'s column as a DECIMAL: codes keep the scaled dictionary a whole coded chunk carries
+    /// (`decodeAggColumnCoded`) and the exact one beside it; values that fell back from the dictionary mid-slice take
+    /// the lanes `next` gives a DECIMAL page.
+    fn decimalCoded(self: *SliceReader, comptime T: type, col: filter_eval.Batch.Column, a: std.mem.Allocator) !filter_eval.Batch.Column {
+        const k = self.dec.?;
+        const c = @field(col, @typeName(T));
+        if (c.codes == null) {
+            if (self.exact_only) {
+                var exact = c;
+                exact.unscaled = @unionInit(filter_eval.Exact, @typeName(T), c.values);
+                return @unionInit(filter_eval.Batch.Column, @typeName(T), exact);
+            }
+            return .{ .f64 = try exactSlice(T, a, c, k) };
+        }
+        const id = @intFromPtr(c.dict.ptr);
+        const scaled = if (self.dec_dict) |d| if (d.src == id and d.len == c.dict.len) d.scaled else null else null;
+        const view = scaled orelse blk: {
+            const d = try self.held.alloc(f64, c.dict.len);
+            decimal_mod.applyScaleSimd(T, c.dict, k.scale, d);
+            self.dec_dict = .{ .src = id, .len = c.dict.len, .scaled = d };
+            break :blk d;
+        };
+        var out: filter_eval.ColumnT(f64) = .{
+            .values = &.{},
+            .codes = c.codes,
+            .dict = view,
+            .def_levels = c.def_levels,
+            .max_def = c.max_def,
+            .has_nulls = c.has_nulls,
+        };
+        out.dict_unscaled = @unionInit(filter_eval.Exact, @typeName(T), c.dict);
+        return .{ .f64 = out };
     }
 
     fn decodeSome(comptime T: type, r: *column_mod.ColumnChunkReader(T), values: []T, def: ?[]u32) !usize {
@@ -729,7 +774,6 @@ test "SliceReader.skip reads the rows after it as decoding every row would, pass
         }
     }
 }
-
 
 test "row subgroups seek misaligned columns and share dictionary backing across reader lifetimes" {
     const t = std.testing;

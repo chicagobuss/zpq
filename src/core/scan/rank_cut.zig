@@ -177,7 +177,9 @@ fn rankLimitGroups(
     scratch: *CutScratch,
 ) !?[]u32 {
     if (table.groupCount() <= cut.k) return null;
-    const sa = scratch.allocator();
+    // A caller's charged allocator (`memory`) funds the heap beside the ids, so a partition cut running on many
+    // workers draws the query ledger for both; its refusal is the caller's to translate.
+    const sa = cut.memory orelse scratch.allocator();
     var heap = RankHeap.initContext(cut.descending);
     defer heap.deinit(sa);
     const k = @min(cut.k, table.groupCount());

@@ -2524,6 +2524,59 @@ test "shared string top-k cut refusals replay at every budget the old path answe
     try testing.expect(answered > 0);
 }
 
+test "shared string partition rank heaps draw the cut's charged allocator" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const col = expr_ast.Expr{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    for ([_]expr_agg.AggFunc{ .sum, .max }) |func| {
+        const calls = [_]expr_agg.AggCall{.{ .func = func, .alias = "r", .result = .i64, .arg = col, .where = null }};
+        const outputs = [_]scan_types.BoundOutputColumn{ .{ .source = .{ .key = 0 }, .name = "k" }, .{ .source = .{ .agg = 0 }, .name = "r" } };
+        var ledger: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        var state = (try string_table.State.init(gpa, &ledger, &calls, 0, false, 1)).?;
+        defer state.deinit();
+        state.bind();
+        const n = 1 << 15;
+        const keys = try a.alloc([]const u8, n);
+        const values = try a.alloc(i64, n);
+        for (keys, values, 0..) |*key, *value, i| {
+            key.* = try std.fmt.allocPrint(a, "rank-heap-key-{d}", .{i});
+            value.* = @intCast(i % 977);
+        }
+        const batch: eval.Batch = .{
+            .cols = &.{ .{ .string = .{ .values = keys } }, .{ .i64 = .{ .values = values } } },
+            .num_rows = n,
+        };
+        try state.locals[0].batch(.{ .batch = &batch }, &.{ 0, 1 });
+        var part = &state.parts[0];
+        for (state.parts) |*p| if (p.table.groupCount() > part.table.groupCount()) {
+            part = p;
+        };
+        // One group short of the partition, so the cut must rank them all.
+        const k = part.table.groupCount() - 1;
+        try testing.expect(k >= 64);
+        const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = k };
+        // Room for the k ids, not for a heap of k ranked items beside them.
+        const room = k * @sizeOf(u32) + 64;
+        const held = ledger.drawExact(ledger.limit - ledger.used.load(.monotonic) - room).?;
+        var charged: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+        const before = ledger.used.load(.monotonic);
+        if (scan_rank_cut.resultLimitGroups(a, &part.table, &outputs, &calls, order, false, charged.allocator())) |ids| {
+            if (ids) |kept| charged.allocator().free(kept);
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expectEqual(error.ExceededMemoryBudget, charged.refusal(e));
+        try testing.expectEqual(before, ledger.used.load(.monotonic));
+        ledger.release(held);
+        var fits: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+        const ids = (try scan_rank_cut.resultLimitGroups(a, &part.table, &outputs, &calls, order, false, fits.allocator())).?;
+        try testing.expectEqual(k, ids.len);
+        fits.allocator().free(ids);
+        // Both cuts returned every byte they drew.
+        try testing.expectEqual(before - held, ledger.used.load(.monotonic));
+    }
+}
+
 test "DISTINCT second passes read retained mappings after gated pages are released" {
     const gpa = testing.allocator;
     const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse

@@ -2217,6 +2217,134 @@ test "shared string scan preserves full grouped and scalar answers NULLs origina
     try testing.expectEqual(held, ledger.used.load(.monotonic));
 }
 
+test "shared string ranked LIMIT keeps exact winners NULL keys cutoff ties and refusal replay" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: [1024][]const u8 = undefined;
+    var key_defs: [1024]u32 = undefined;
+    var values: [1024]i64 = undefined;
+    var defs: [1024]u32 = undefined;
+    const big = try a.alloc(u8, 70001);
+    @memset(big, 'x');
+    for (&text, &key_defs, &values, &defs, 0..) |*key, *kd, *value, *d, i| {
+        // Groups 3..8 lead by 10-11 rows; the rest tie at one or two across every cutoff. NULL keys form a group.
+        // Half the rows distinct keeps the writer off its dictionary, so chunks are PLAIN as the owner requires.
+        const g = if (i < 64) 3 + i % 6 else i % 512;
+        key.* = switch (g) {
+            0 => "",
+            1 => big,
+            2 => "a\x00b",
+            else => try std.fmt.allocPrint(a, "a wide plain key for the shared string table {d}", .{g}),
+        };
+        kd.* = @intFromBool(i % 23 != 5);
+        value.* = @as(i64, @intCast((i * 7919) % 101)) - 50;
+        d.* = @intFromBool(i % 11 != 0);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = &text, .def_levels = &key_defs, .max_def = 1 } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = true, .col = .{ .i64 = .{ .values = &values, .def_levels = &defs, .max_def = 1 } } },
+    };
+    var bytes: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &columns, text.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const groups = try a.alloc(schema.RowGroup, 8);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    const Shape = struct { aggregate: []const u8, order: expr_ast.ResultOrder };
+    const shapes = [_]Shape{
+        .{ .aggregate = "count(*) AS c", .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 5 } },
+        .{ .aggregate = "count(*) AS c", .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3, .offset = 4 } },
+        .{ .aggregate = "sum(v) AS s", .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 } },
+        .{ .aggregate = "sum(v) AS s", .order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 7 } },
+        .{
+            .aggregate = "count(*) AS c,sum(v) AS s,avg(v) AS av,min(v) AS lo,max(v) AS hi",
+            .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        },
+        .{
+            .aggregate = "count(*) AS c,sum(v) AS s,avg(v) AS av,min(v) AS lo,max(v) AS hi",
+            .order = .{ .keys = &.{.{ .column = 3, .descending = true }}, .limit = 4 },
+        },
+        .{ .aggregate = "count(*) AS c", .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 0 } },
+    };
+    for (shapes) |shape| for ([_]?[]const u8{ null, "v >= -20" }) |filter| {
+        var args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "ranked-string", .bytes = bytes.buffer.items }},
+            .metas = &.{meta},
+            .aggregate = shape.aggregate,
+            .group_by = "k",
+            .filter = filter,
+            .max_memory = 256 << 20,
+            .parallelism = 1,
+            .min_bytes_per_worker = 1,
+            .shared_strings = false,
+            .result_order = shape.order,
+        };
+        var want = try runMultiAggregate(gpa, a, args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+            args.shared_strings = true;
+            args.parallelism = j;
+            args.decode_batch_rows = window;
+            var taken: std.EnumSet(FastPath) = .{};
+            args.taken = &taken;
+            const ex = try explainAggregate(gpa, a, args);
+            try testing.expectEqual(.shared_string_table, ex.record_path.?.layout);
+            var got = try prepareAggregate(gpa, a, args, false);
+            defer got.deinit(gpa);
+            try testing.expect(taken.contains(.shared_strings));
+            try got.output.applyResultOrder(gpa, args.result_order);
+            try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        };
+    };
+    // Orders the cut cannot rank stay on the generic path.
+    var unranked: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-string", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .max_memory = 256 << 20,
+        .parallelism = 1,
+        .result_order = .{ .keys = &.{.{ .column = 0, .descending = false }}, .limit = 3 },
+    };
+    try testing.expect((try explainAggregate(gpa, a, unranked)).record_path == null);
+    unranked.result_order = .{ .keys = &.{.{ .column = 1, .descending = true }} };
+    try testing.expect((try explainAggregate(gpa, a, unranked)).record_path == null);
+    // Under a shared ledger mostly held elsewhere the owner answers exactly or replays on the generic path.
+    var ledger: core_memory.SharedBudget = .{ .limit = 24 << 20 };
+    var taken: std.EnumSet(FastPath) = .{};
+    var tight: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-string", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c,sum(v) AS s",
+        .group_by = "k",
+        .max_memory = ledger.limit,
+        .parallelism = 4,
+        .min_bytes_per_worker = 1,
+        .shared_strings = false,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 6 },
+    };
+    var want = try runMultiAggregate(gpa, a, tight);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, tight.result_order);
+    const held = ledger.drawExact(ledger.limit - (ledger.limit / 4 + (1 << 20))).?;
+    tight.shared_strings = true;
+    tight.ledger = &ledger;
+    tight.taken = &taken;
+    {
+        var got = try prepareAggregate(gpa, a, tight, false);
+        defer got.deinit(gpa);
+        try got.output.applyResultOrder(gpa, tight.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        try testing.expect(ledger.used.load(.monotonic) <= ledger.limit);
+    }
+    ledger.release(held);
+}
+
 test "DISTINCT second passes read retained mappings after gated pages are released" {
     const gpa = testing.allocator;
     const bytes = (try loadFixture("ci/fixtures/parquet/packed_count_indexed.parquet")) orelse

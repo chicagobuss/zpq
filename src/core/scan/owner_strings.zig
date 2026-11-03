@@ -20,6 +20,10 @@ const plan_types = @import("plan_types.zig");
 const RecordAdmission = plan_types.RecordAdmission;
 const scan_count_cut = @import("count_cut.zig");
 const MergedSlot = scan_count_cut.MergedSlot;
+const keepCountTop = scan_count_cut.keepCountTop;
+const rank_cut = @import("rank_cut.zig");
+const resultCut = rank_cut.resultCut;
+const keepResultTop = rank_cut.keepResultTop;
 const scan_result = @import("result.zig");
 const Timings = scan_result.Timings;
 const MultiAggResult = scan_result.MultiAggResult;
@@ -71,10 +75,14 @@ pub fn inlineSharedStrings(
     comptime explain_only: bool,
 ) !if (explain_only) ?RecordAdmission else ?MultiAggResult {
     const order = args.result_order;
-    if (!args.shared_strings or !allRescannable(args.inputs) or !args.plain_rules or
-        order.keys.len != 0 or order.limit != null or order.offset != 0 or order.having != null or
+    if (!args.shared_strings or !allRescannable(args.inputs) or !args.plain_rules or order.having != null or
         order.hidden.len != 0) return null;
     const scalar = keys_opt == null;
+    const as_is = order.keys.len == 0 and order.limit == null and order.offset == 0;
+    // A ranked LIMIT keeps each partition's exact winners, then the global cut; any other order stays on the
+    // generic path, which sorts every group.
+    const cut = if (scalar or as_is) null else resultCut(outputs_opt.?, calls, order, args.unordered);
+    if (!as_is and cut == null) return null;
     const key = if (keys_opt) |keys| blk: {
         if (keys.len != 1) return null;
         for (calls) |call| {
@@ -222,6 +230,11 @@ pub fn inlineSharedStrings(
         &slots,
         &accs,
     );
+    if (cut) |c| {
+        if (c.ranking_first) {
+            try keepResultTop(gpa, lists, calls, c, &slots, &accs);
+        } else try keepCountTop(gpa, lists, calls, .{ .a_idx = c.a_idx, .k = c.k }, &slots, &accs);
+    }
     if (!args.unordered) try sortSlotsByFirst(lists, slots.items, workers);
     const key_types = [_]KeyType{.string};
     const types = try arena.alloc(GroupColType, outputs.len);
@@ -233,11 +246,14 @@ pub fn inlineSharedStrings(
         else
             passThroughSource(calls[out.source.agg], &metas[0]),
     };
-    const tables = try lists.alloc(*expr_agg.GroupTable, state.parts.len);
-    defer lists.free(tables);
-    for (tables, state.parts) |*out, *part| out.* = &part.table;
-    output.arena_credit = try output.takeTableArenas(gpa, tables, ledger);
-    output.arena_ledger = args.ledger;
+    // A cut copies its few winning keys and frees the tables with the state; a full answer borrows them all.
+    if (cut == null) {
+        const tables = try lists.alloc(*expr_agg.GroupTable, state.parts.len);
+        defer lists.free(tables);
+        for (tables, state.parts) |*out, *part| out.* = &part.table;
+        output.arena_credit = try output.takeTableArenas(gpa, tables, ledger);
+        output.arena_ledger = args.ledger;
+    }
     const source: RowSource = .{
         .slots = slots.items,
         .outputs = outputs,
@@ -249,7 +265,9 @@ pub fn inlineSharedStrings(
         .fixed_keys = false,
         .borrowed_strings = output.borrowed_strings,
     };
-    answer_charge = answerBytesParallel(slots.items, types, &.{}, args.typed_answer, workers) +|
+    const typed = args.typed_answer and as_is;
+    const copied_keys: []const KeyType = if (cut == null) &.{} else &key_types;
+    answer_charge = answerBytesParallel(slots.items, types, copied_keys, typed, workers) +|
         outputNamesBytes(outputs);
     _ = ledger.drawExact(answer_charge) orelse {
         answer_charge = 0;
@@ -259,7 +277,7 @@ pub fn inlineSharedStrings(
     @memset(names, "");
     output.group_cols = names;
     for (outputs, names) |out, *name| name.* = try gpa.dupe(u8, out.name);
-    if (args.typed_answer) {
+    if (typed) {
         output.typed = .{ .rows = 0, .columns = &.{} };
         try buildGroupColumns(gpa, &output.typed.?, source, types, workers);
     } else {
@@ -281,4 +299,3 @@ pub fn inlineSharedStrings(
     profile.record(prof, .merge, begin, nowMonoNs(), profile.args(.{}));
     return result;
 }
-

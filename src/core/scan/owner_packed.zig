@@ -79,8 +79,13 @@ pub fn inlineSelectedCount(
     const signed_int64 = keys.len == 1 and keys[0] == .col_ref and keys[0].col_ref.physical_type == .INT64 and
         !keys[0].col_ref.unsigned_64;
     // One signed INT64 key with payload lanes takes the checked raw identity below: the integer COUNT owner
-    // declines a second aggregate. Other single keys with payloads keep the general path.
-    if (program.len != 0 and keys.len < 2 and !signed_int64) return null;
+    // declines a second aggregate. A cost hint, never an identity bound: footers must show the key ordered and
+    // NULL-free across row groups. Skewed keys concentrate rows in a few partitions whose fold does not scale with
+    // workers (nullszipf: 1.5x slower at 32 threads), and the sketch's census keeps them. Other single keys keep the
+    // general path.
+    if (program.len != 0 and keys.len < 2 and
+        !(signed_int64 and @import("owner_integer.zig").orderedIntegerHint(metas, work, keys[0].col_ref.col_idx)))
+        return null;
     for (outputs) |out| if (out.derived != null) return null;
     // Preserve P1's nullable INT64 sidecar and 16-byte producer for bare COUNT while extending INT32 and tuples.
     if (program.len == 0 and signed_int64) return null;

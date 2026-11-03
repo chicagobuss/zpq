@@ -384,7 +384,7 @@ pub fn inlineIntegerAnswer(
 }
 
 /// Footer bounds select an attempt; every decoded key and every source seam must still prove the order.
-fn orderedIntegerHint(metas: []const schema.FileMetaData, work: []const WorkItem, column: usize) bool {
+pub fn orderedIntegerHint(metas: []const schema.FileMetaData, work: []const WorkItem, column: usize) bool {
     const statistics = @import("../parquet/statistics.zig");
     var previous: ?i64 = null;
     for (work) |item| {
@@ -676,4 +676,3 @@ test "integer COUNT domain cost trusts only a complete dictionary union" {
         .union_complete = true,
     } }).guess(summed));
 }
-

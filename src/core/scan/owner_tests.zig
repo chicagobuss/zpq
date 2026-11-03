@@ -1999,7 +1999,7 @@ test "packed payload top H preserves integer SUM AVG MIN MAX NULL ties and filte
     }
 }
 
-test "single INT64 payload top H matches grouping for sorted skewed uniform NULL keys ties and a tight budget" {
+test "single INT64 payload top H owns ordered keys and matches grouping for skewed uniform NULL keys and ties" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2031,7 +2031,8 @@ test "single INT64 payload top H matches grouping for sorted skewed uniform NULL
         var sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
         _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, k.len, .SNAPPY, .{}, .{});
         var meta = try metadata.open(a, sink.buffer.items);
-        const rgs = try a.alloc(schema.RowGroup, 8);
+        // Copies of one row group overlap, so only the single sorted group proves an ordered key to the owner.
+        const rgs = try a.alloc(schema.RowGroup, if (shape == 0) 1 else 8);
         @memset(rgs, meta.row_groups.items[0]);
         meta.row_groups.items = rgs;
         meta.num_rows *= @intCast(rgs.len);
@@ -2062,14 +2063,17 @@ test "single INT64 payload top H matches grouping for sorted skewed uniform NULL
                 var taken: std.EnumSet(FastPath) = .{};
                 args.taken = &taken;
                 const ex = try explainAggregate(gpa, a, args);
-                try testing.expectEqual(.packed_count_top_h, ex.record_path.?.layout);
+                const owned = ex.record_path != null and ex.record_path.?.layout == .packed_count_top_h;
+                // Skewed and NULL keys have no ordered footers and keep the sketch.
+                try testing.expectEqual(shape == 0, owned);
                 var got = try prepareAggregate(gpa, a, args, false);
                 defer got.deinit(gpa);
-                try testing.expect(taken.contains(.integer_records));
+                if (owned) try testing.expect(taken.contains(.integer_records));
                 try got.output.applyResultOrder(gpa, args.result_order);
                 try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
                 try testing.expectEqualDeep(want.state.group_col_types, got.state.group_col_types);
             };
+            if (shape != 0) continue;
             // A budget just below the owner's quote declines it before any row is read; grouping answers the same.
             args.parallelism = 4;
             args.decode_batch_rows = 0;

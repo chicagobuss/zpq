@@ -238,7 +238,6 @@ pub fn mergePersistent(
     }
 }
 
-
 test "round 4: copy merge into an empty accumulator keeps the source budget" {
     const a = testing.allocator;
     var budget = SharedBudget{ .limit = 1 << 20, .block = 1 };
@@ -267,7 +266,6 @@ test "round 4: copy merge keeps an installed destination budget" {
     try testing.expectEqual(@as(usize, 0), dst.distinct.count());
     try testing.expectEqual(@as(usize, 0), dst_budget.used.load(.monotonic));
 }
-
 
 /// What a query's string min/max winners hold, drawn from the query's ledger: each work item keeps an owned
 /// copy of its winner until the merge, and a value can be any size. A copy is drawn before it is made and given back
@@ -302,10 +300,6 @@ pub fn winnerBytes(len: usize) usize {
     return std.mem.alignForward(usize, len, 16) +| 16;
 }
 
-pub fn considerWinner(persist: std.mem.Allocator, is_min: bool, slot: *?[]const u8, cand: []const u8) Error!void {
-    return considerWinnerWithCharge(persist, is_min, slot, cand, null);
-}
-
 pub fn considerWinnerWithCharge(persist: std.mem.Allocator, is_min: bool, slot: *?[]const u8, cand: []const u8, charge: ?*WinnerCharge) Error!void {
     if (slot.*) |cur| {
         const order = std.mem.order(u8, cand, cur);
@@ -330,4 +324,3 @@ pub fn persistWinnerWithCharge(persist: std.mem.Allocator, slot: *?[]const u8, c
     }
     slot.* = owned;
 }
-

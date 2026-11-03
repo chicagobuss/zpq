@@ -33,7 +33,6 @@ const service = @import("service");
 // multi-file orchestrator at `core.scan` which does the SHARED
 // agg pipeline both the CLI and Lambda call into.
 const scan = @import("scan.zig");
-const core_scan = zpq.core.scan;
 const Diag = zpq.core.diag.Diag;
 const engine = zpq.engine;
 

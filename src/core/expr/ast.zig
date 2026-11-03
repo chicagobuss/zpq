@@ -245,16 +245,6 @@ pub const Temporal = enum {
     ts_ms,
     ts_us,
     ts_ns,
-
-    /// Nanoseconds per stored unit.
-    pub fn nsPerTick(self: Temporal) i64 {
-        return switch (self) {
-            .date => 86_400 * std.time.ns_per_s,
-            .ts_ms => std.time.ns_per_ms,
-            .ts_us => std.time.ns_per_us,
-            .ts_ns => 1,
-        };
-    }
 };
 
 /// The parts `date_trunc` and `date_part` take, by DuckDB's names (singular or plural). `date_trunc` takes the ones

@@ -58,16 +58,6 @@ const FingerprintSet = census_mod.FingerprintSet;
 const fullestCells = census_mod.fullestCells;
 const cellsSeparate = census_mod.cellsSeparate;
 
-const CachedKey = struct { bytes: []const u8, hash: u64 };
-const CachedKeyCtx = struct {
-    pub fn hash(_: @This(), key: CachedKey) u64 {
-        return key.hash;
-    }
-    pub fn eql(_: @This(), key: CachedKey, stored: []const u8) bool {
-        return keyEql(key.bytes, stored);
-    }
-};
-
 pub const GroupTable = struct {
     const StringView = struct { bytes: []const u8, first: u64 };
 
@@ -934,11 +924,6 @@ pub const GroupTable = struct {
             slots *| @sizeOf(FixedSlot) +| rows *| (@sizeOf(u32) + @sizeOf(u64)) +| cells *| @sizeOf(Accumulator);
     }
 
-    inline fn variableEntrySize(self: *const GroupTable, key_len: usize, calls: usize) usize {
-        if (self.compact.stride == 0) return variableEntryBytes(key_len, calls);
-        return variableEntryBytes(key_len, 0) + self.compact.projected(self.groupCount() + 1) - self.compact.held();
-    }
-
     fn admit(self: *GroupTable, entry_size: usize) !void {
         if (self.allocated_bytes + entry_size <= self.max_memory_bytes) return;
         const budget = self.shared orelse return error.ExceededMemoryBudget;
@@ -1054,7 +1039,6 @@ test "GroupTable basic grouping, float normalization, and memory capping" {
     try std.testing.expectError(error.ExceededMemoryBudget, small_gt.getOrInsert("too_large_key_that_exceeds_budget", agg_calls, 0));
 }
 
-
 test "compact fixed slots compare complete keys under projected-hash collisions and growth" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(GroupTable.FixedSlot));
     const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
@@ -1115,7 +1099,6 @@ test "fixed local tables retain charged capacity and discard every old id" {
     }
 }
 
-
 /// The rows of `ids` a sketched table gave a cell instead of a group (`CountSketch.sinkId`) leave `sel`, so no
 /// aggregate folds them; in the count pass each also adds one to its cell.
 pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_selection.SelectionVector) !void {
@@ -1153,7 +1136,6 @@ pub fn sinkSketchRows(table: *const GroupTable, ids: []const u32, sel: *filter_s
         sel.set(r, false);
     }
 }
-
 
 test "STRGROUP slots grow without key relocation and local clear reuses arena capacity" {
     const a = std.testing.allocator;
@@ -1261,10 +1243,6 @@ test "SharedBudget: tables share one budget instead of owning fixed slices" {
     }
     try std.testing.expectEqual(@as(usize, 0), recycle.used.load(.monotonic));
 }
-
-
-
-
 
 test "fixed-width group keys match the serialized framing and the byte table" {
     const a = std.testing.allocator;
@@ -1419,7 +1397,6 @@ test "fixed-width groups charge their count(DISTINCT) sets to the shared budget,
     }.run, .{});
 }
 
-
 test "a table charges each group's count(DISTINCT) set object, fixed-width keys or not" {
     const calls = [_]AggCall{
         .{ .func = .count_distinct, .arg = null, .where = null, .alias = "u", .result = .i64 },
@@ -1573,8 +1550,6 @@ test "compact variable insertion keeps retained capacity charged after allocatio
     }.run, .{});
 }
 
-
-
 test "regression: a count(DISTINCT) merge sizes its tables for the result, so none grows while hash-ordered values arrive" {
     // F3: one worker's set merged into another's slot by slot (hash order) while the destination grew as values came
     // took 40 s at -j 3 against 0.4 s presized. A table that grows mid-merge allocates once per doubling; sized
@@ -1706,9 +1681,6 @@ test "distinct bitmaps retain the hash reservation so a late outlier has identic
         try testing.expectEqual(outcomes[0], outcomes[1]);
     }
 }
-
-
-
 
 test "M1 parallel DISTINCT source charges and releases preserve the private ceiling" {
     const a = std.testing.allocator;
@@ -1867,7 +1839,6 @@ test "STRGROUP whole-table quote includes first chunks large records and actual 
         try testing.expect(table.allocated_bytes <= GroupTable.variableTableBytes(groups, width, calls.len));
     };
 }
-
 
 fn cachedDistinctTrial(a: std.mem.Allocator) !void {
     var arena = std.heap.ArenaAllocator.init(a);

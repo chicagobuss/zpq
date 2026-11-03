@@ -46,9 +46,6 @@ pub const AnyPool = pool_mod.AnyPool;
 pub const MAX_PARTS: usize = 8;
 /// S3's hard minimum for a non-final multipart part.
 pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
-/// Below this size, single-PUT is faster than multipart — the
-/// Create+Complete round-trips dominate.
-pub const MULTIPART_THRESHOLD: usize = 32 * 1024 * 1024;
 /// Above this size, fetchManyRanges splits a single range into
 /// sub-ranges so we can fan out across the pool. Below it the
 /// per-request TLS handshake amortizes badly across tiny fetches.

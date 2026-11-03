@@ -347,11 +347,6 @@ pub const Writer = struct {
         try self.writeFieldBegin(if (value) .True else .False, field_id);
     }
 
-    pub fn writeFieldDouble(self: *Writer, field_id: i16, value: f64) !void {
-        try self.writeFieldBegin(.Double, field_id);
-        try self.writeDouble(value);
-    }
-
     pub fn writeListBegin(self: *Writer, elem_type: Type, size: usize) !void {
         if (size < 15) {
             try self.writeByte(@as(u8, @intCast(size)) << 4 | @backingInt(elem_type));

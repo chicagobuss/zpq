@@ -192,13 +192,6 @@ pub const DistinctSet = struct {
         }
     }
 
-    pub fn setSharedBudget(self: *DistinctSet, budget: *SharedBudget) void {
-        self.shared = budget;
-        if (self.parts) |parts| {
-            for (parts) |*p| p.shared = budget;
-        }
-    }
-
     pub fn deinit(self: *DistinctSet, allocator: std.mem.Allocator) void {
         if (self.parts) |parts| {
             for (parts) |*p| p.deinit(allocator);
@@ -1264,7 +1257,6 @@ test "inline distinct canonicalizes float nan and zero like DistinctSet" {
     try std.testing.expect(acc.heap() == null);
 }
 
-
 test "distinct bitmaps preserve complete identities across ranges, partitions and late wide values with failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, distinctBitmapTrial, .{});
 }
@@ -1640,4 +1632,3 @@ test "distinct wide and string maps retain identities after no-copy growth" {
         }
     }
 }
-

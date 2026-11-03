@@ -321,10 +321,6 @@ pub const Plan = struct {
             }
         }
 
-        pub fn dictionaryBits(b: Bound, row: usize) !u128 {
-            return b.dictionaryAs(u128, row);
-        }
-
         fn dictionaryAs(b: Bound, comptime Bits: type, row: usize) !Bits {
             if (row >= b.source.batch.num_rows or b.plan.encoding.source != .dictionary) return error.BadColumn;
             var bits: Bits = 0;

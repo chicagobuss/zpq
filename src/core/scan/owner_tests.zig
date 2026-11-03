@@ -2446,7 +2446,8 @@ fn rankedStringFile(a: std.mem.Allocator, rows: usize, rg_rows: usize, key_bytes
     const pad = try a.alloc(u8, key_bytes);
     @memset(pad, 'k');
     for (text, key_defs, values, defs, 0..) |*key, *kd, *value, *d, i| {
-        key.* = if (i % 67 == 0) "" else try std.fmt.allocPrint(a, "{s}{d}", .{ pad, (i * 7907) % distinct });
+        // The varying part leads, so prefix (delta) encoding keeps each key's full width on the page.
+        key.* = if (i % 67 == 0) "" else try std.fmt.allocPrint(a, "{d}{s}", .{ (i * 7907) % distinct, pad });
         kd.* = @intFromBool(i % 41 != 0);
         value.* = @as(i64, @intCast((i * 71) % 61)) - 30;
         d.* = @intFromBool(i % 7 != 0);
@@ -2482,6 +2483,18 @@ test "shared string top-k cut refusals replay at every budget the old path answe
         .{ .aggregate = "max(v) AS m,count(*) AS c", .order = .{ .keys = &.{.{ .column = 1, .descending = false }}, .limit = 6000, .offset = 100 } },
     };
     var answered: usize = 0;
+    for (shapes) |shape| {
+        const roomy: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "ranked-budget", .bytes = file.bytes }},
+            .metas = &.{file.meta},
+            .aggregate = shape.aggregate,
+            .group_by = "k",
+            .max_memory = 256 << 20,
+            .parallelism = 1,
+            .result_order = shape.order,
+        };
+        try testing.expectEqual(.shared_string_table, (try explainAggregate(gpa, a, roomy)).record_path.?.layout);
+    }
     for (shapes) |shape| for ([_]usize{ 1, 4 }) |j| {
         var half_mib: usize = 2;
         while (half_mib <= 24) : (half_mib += 1) {
@@ -2621,6 +2634,78 @@ test "shared string top-k charges every projected copy of a winning key" {
         // The ledger still holds the answer it was charged for: every owned cell and key copy.
         try testing.expect(ledger.used.load(.monotonic) >= ownedGroupOutputBytes(got.output));
     }
+}
+
+test "shared string top-k leaves coded chunks and selective filters to the established plans" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = try rankedStringFile(a, 8192, 1024, 60, 13007);
+    // The same shape, but the first row group repeats a few keys: wholly dictionary-coded, as ClickBench's URL is
+    // in part. Its later row groups stay PLAIN.
+    const mixed = blk: {
+        const rows = 8192;
+        const text = try a.alloc([]const u8, rows);
+        const values = try a.alloc(i64, rows);
+        for (text, values, 0..) |*key, *value, i| {
+            key.* = try std.fmt.allocPrint(a, "{d} is a wide key repeated in the coded row group", .{if (i < 1024) i % 16 else (i * 7907) % 13007});
+            value.* = @intCast(i % 61);
+        }
+        var sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+        var file = try consumer.AggregateFile.init(a, sink.sink());
+        defer file.deinit();
+        var columns: [2]expr_agg.OutputCol = undefined;
+        var at: usize = 0;
+        while (at < rows) : (at += 1024) {
+            columns = .{
+                .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = false, .col = .{ .string = .{ .values = text[at..][0..1024] } } },
+                .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = values[at..][0..1024] } } },
+            };
+            try file.append(&columns, 1024, .SNAPPY, .{}, .{});
+        }
+        _ = try file.finish(&columns);
+        break :blk .{ .bytes = sink.buffer.items, .meta = try metadata.open(a, sink.buffer.items) };
+    };
+    try testing.expect(ndv.fullCoverage(&mixed.meta.row_groups.items[0].columns.items[0].meta_data.?));
+    try testing.expect(!ndv.fullCoverage(&mixed.meta.row_groups.items[1].columns.items[0].meta_data.?));
+    const Case = struct { bytes: []const u8, meta: schema.FileMetaData, filter: ?[]const u8, limit: ?u64, owned: bool };
+    const cases = [_]Case{
+        .{ .bytes = plain.bytes, .meta = plain.meta, .filter = null, .limit = 10, .owned = true },
+        .{ .bytes = plain.bytes, .meta = plain.meta, .filter = "v >= -20", .limit = 10, .owned = true },
+        // Statistics say about one row in sixty passes.
+        .{ .bytes = plain.bytes, .meta = plain.meta, .filter = "v > 29", .limit = 10, .owned = false },
+        .{ .bytes = mixed.bytes, .meta = mixed.meta, .filter = null, .limit = 10, .owned = false },
+        // A full GROUP BY over the same mixed chunks keeps the owner it had.
+        .{ .bytes = mixed.bytes, .meta = mixed.meta, .filter = null, .limit = null, .owned = true },
+    };
+    for (cases) |c| for ([_]bool{ false, true }) |owner| {
+        const args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "ranked-admission", .bytes = c.bytes }},
+            .metas = &.{c.meta},
+            .aggregate = "count(*) AS c,sum(v) AS s",
+            .group_by = "k",
+            .filter = c.filter,
+            .max_memory = 256 << 20,
+            .parallelism = 4,
+            .min_bytes_per_worker = 1,
+            .shared_strings = owner,
+            .result_order = if (c.limit) |n| .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = n } else .{},
+        };
+        const ex = try explainAggregate(gpa, a, args);
+        const owned = ex.record_path != null and ex.record_path.?.layout == .shared_string_table;
+        try testing.expectEqual(owner and c.owned, owned);
+        if (!owner) continue;
+        var want_args = args;
+        want_args.shared_strings = false;
+        var want = try runMultiAggregate(gpa, a, want_args);
+        defer want.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    };
 }
 
 test "DISTINCT second passes read retained mappings after gated pages are released" {

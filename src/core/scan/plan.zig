@@ -6,6 +6,7 @@ const consumer = @import("../consumer.zig");
 const agg_plan = @import("../agg_plan.zig");
 const expr_agg = @import("../expr/agg.zig");
 const expr_ast = @import("../expr/ast.zig");
+const filter_ast = @import("../filter/ast.zig");
 const filter_prune = @import("../filter/prune.zig");
 const partagg = @import("../partagg.zig");
 const ndv = @import("../ndv.zig");
@@ -158,12 +159,17 @@ pub const selective_share = 0.05;
 /// The share of rows the filter passes, estimated from row-group bounds (`filter_prune.passFraction`); 1 without a
 /// filter or rows. An estimate: it only steers a cost rule between exact strategies.
 pub fn passShare(in: PlanInputs) f64 {
-    const f = in.filter orelse return 1;
+    return filterPassShare(in.filter, in.metas, in.work);
+}
+
+/// `passShare` for an owner that has no `PlanInputs`: the even-spread share of rows the filter passes.
+pub fn filterPassShare(filter: ?filter_ast.Filter, metas: []const schema.FileMetaData, work: []const WorkItem) f64 {
+    const f = filter orelse return 1;
     var rows: f64 = 0;
     var pass: f64 = 0;
-    for (in.work) |item| {
+    for (work) |item| {
         if (item.agg_start != 0) continue;
-        const m = &in.metas[item.file];
+        const m = &metas[item.file];
         const rg = &m.row_groups.items[item.rg];
         const n: f64 = @floatFromInt(@max(0, rg.num_rows));
         rows += n;
@@ -1096,4 +1102,3 @@ test "bounded first discovery declines HAVING before choosing its candidate pref
     args.result_order.having = &having;
     try testing.expect(!firstCutEligible(args, &calls, &keys, false, 1, 1));
 }
-

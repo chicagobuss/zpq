@@ -45,6 +45,7 @@ const passThroughSource = owner_support.passThroughSource;
 const owner_pair = @import("owner_pair.zig");
 const countedCalls = owner_pair.countedCalls;
 const partition_fill = @import("partition_fill.zig");
+const scan_plan_impl = @import("plan.zig");
 const fillFromPartitions = partition_fill.fillFromPartitions;
 const scan_types = @import("types.zig");
 const MultiAggArgs = scan_types.MultiAggArgs;
@@ -103,16 +104,25 @@ pub fn inlineSharedStrings(
     // Complete dictionaries already avoid row-wise byte hashing. Route wide PLAIN/fallback bytes directly;
     // short keys keep their existing fixed/coded owner. Encoded width is a cost hint, never an identity bound.
     var coded = true;
+    var any_coded = false;
     var key_bytes: u128 = 0;
     var key_rows: u128 = 0;
     for (work) |item| {
         const rg = &metas[item.file].row_groups.items[item.rg];
         const cm = rg.columns.items[key.col_ref.col_idx].meta_data orelse return null;
-        coded = coded and ndv.fullCoverage(&cm);
+        const full = ndv.fullCoverage(&cm);
+        coded = coded and full;
+        any_coded = any_coded or full;
         key_bytes += @intCast(@max(0, cm.total_uncompressed_size));
         key_rows += @intCast(@max(0, rg.num_rows));
     }
     if (coded or key_bytes < key_rows * (2 * @sizeOf([]const u8))) return null;
+    // A cut builds every group before ranking. Leave it to the established plans where they skip most of that work,
+    // as the planner decides from the same footers: a row group whose keys are wholly dictionary-coded shows the
+    // repeats its sketch count cut bets on (ClickBench URL: 2.7x slower here), and a filter its statistics say passes
+    // few rows leaves too little grouping to pay for the shared partitions (ClickBench 36-38: 1.4-1.9x).
+    if (cut != null and (any_coded or
+        scan_plan_impl.filterPassShare(plan.query.filter, metas, work) <= scan_plan_impl.selective_share)) return null;
     // Packed record scans use an original flat ordinal. Width refusal leaves the established string route intact.
     const rows = RecordOrdinals.rows(metas) orelse return null;
     if (rows >= @as(usize, 1) << 31) return null;

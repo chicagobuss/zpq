@@ -29,6 +29,12 @@
   regex engine; other patterns run as before. A GROUP BY with a selective `HAVING` now drops the failing groups
   before building their rows, where it used to build every group's row first. ClickBench Q28 is 25–29% faster on a
   Ryzen 9 9950X, ahead of Polars 2.1.0 (1.73 s against 1.81 s at 16 threads); the rest of ClickBench is unchanged.
+- **Grouped `COUNT(DISTINCT)` is faster.** When the group key and the distinct argument are both integers, zpq now
+  folds (group, value) pairs as compact records, admitted only when each batch's values fit and checked as they
+  arrive, and drops exact repeats before scattering them. A `COUNT(DISTINCT)` with `SUM`/`COUNT`/`AVG` beside it and
+  a `LIMIT` now takes the same path. These folds size their workers from the CPU's cache-sharing topology. On a
+  Ryzen 9 9950X, ClickBench Q08 is 16–26% faster and a skewed `GROUP BY k` with `count(DISTINCT x)` is 7–29% faster
+  depending on thread count; the rest of ClickBench is unchanged.
 
 ## 0.5.1 (2026-10-31)
 

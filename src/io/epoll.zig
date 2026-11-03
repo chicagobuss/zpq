@@ -164,7 +164,7 @@ pub const Loop = struct {
                 self.harvest(c);
             }
         }
-        // On error (commonly EINTR), the caller can simply re-run.
+        // On error (commonly EINTR), the caller can re-run.
 
         // Step 4: dispatch newly-completed callbacks.
         self.dispatchCompleted();

@@ -1113,10 +1113,6 @@ fn noteDataHeader(ctx: *anyopaque) void {
 /// dispatches `UploadPart` workers on a long-lived `Io.Group`, and
 /// either calls `CompleteMultipartUpload` or falls back to a single
 /// `PutObject` if the body never exceeded one part.
-///
-/// Kept for backward compatibility while step 4 of B3 migrates the
-/// lambda call sites to construct the sink directly. Once migrated,
-/// this function can be deleted along with the `MIN_PART_SIZE` guard.
 pub fn uploadMultipart(
     io: Io,
     p: anytype, // *Pool(N) shared with the caller when buckets match

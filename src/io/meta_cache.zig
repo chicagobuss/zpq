@@ -159,9 +159,7 @@ pub const MetaCache = struct {
         return entry_ptr;
     }
 
-    /// Note that a previously-cached entry was just successfully
-    /// revalidated by a 304 response. Updates stats only — the entry
-    /// data is unchanged.
+    /// Record a successful 304 revalidation; only the statistics change.
     pub fn noteRevalidated(self: *MetaCache, io: Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);

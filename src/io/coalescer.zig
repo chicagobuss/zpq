@@ -11,15 +11,8 @@ pub const Range = struct {
 };
 
 pub const Coalescer = struct {
-    /// Coalesce a list of ranges into a smaller list of merged ranges.
-    /// Ranges that are within `gap_threshold` bytes of each other are merged.
-    /// The input `ranges` slice is not modified, but the returned slice is allocated.
-    ///
-    /// The input ranges do NOT need to be sorted; this function will sort them internally if needed,
-    /// but since we can't easily clone/sort without allocation, the caller should ideally provide sorted ranges
-    /// OR we allocate a temp buffer for sorting.
-    ///
-    /// For this implementation, we assume the caller passes potentially unsorted ranges, so we allocate a copy to sort.
+    /// Merge ranges separated by at most `gap_threshold` bytes. The input may be unsorted and is not modified;
+    /// nonempty results are allocated.
     pub fn coalesce(allocator: Allocator, ranges: []const Range, gap_threshold: u64) ![]const Range {
         if (ranges.len == 0) return &[_]Range{};
 
@@ -34,22 +27,13 @@ pub const Coalescer = struct {
         }.lessThan);
 
         var merged = std.ArrayList(Range).empty;
-        // We probably won't use more ranges than we started with
         try merged.ensureTotalCapacity(allocator, ranges.len);
 
         var current = sorted[0];
 
         for (sorted[1..]) |next| {
-            // Check for overlap or proximity
-            // Note: Range is [start, end), so end is exclusive?
-            // Standard parquet usage usually implies [start, start + len).
-            // Let's assume inclusive start, exclusive end for standard zig slice semantics.
-            // But wait, our usage in Executor implies 'end' is exclusive (start + len).
-
-            // Gap = next.start - current.end
-            // careful with underflow if next starts before current ends (overlap)
+            // Ranges are [start, end); comparing ends also handles overlaps without subtracting.
             if (next.start <= current.end + gap_threshold) {
-                // Merge
                 if (next.end > current.end) {
                     current.end = next.end;
                 }

@@ -269,7 +269,20 @@ pub const ExactTiles = struct {
         // Selected rows per composite, and each composite's first.
         const tile_counts = try ta.alloc(u64, self.space);
         @memset(tile_counts, 0);
-        forEachWordRow(sel, n, struct {
+        var kept: u64 = 0;
+        for (sel.mask) |word| kept += @popCount(word);
+        // A sparse selection walks only its rows here and in the fold; lanes would compute every row.
+        const sparse = kept * 8 < n;
+        if (sparse) {
+            for (sel.mask, 0..) |word, w| {
+                var bits = word;
+                while (bits != 0) : (bits &= bits - 1) {
+                    const r = w * 64 + @ctz(bits);
+                    tile_counts[comp[r]] += 1;
+                    if (self.first_row[comp[r]] == no_row) self.first_row[comp[r]] = @intCast(base + r);
+                }
+            }
+        } else forEachWordRow(sel, n, struct {
             fn f(c: anytype, word: u64, r: usize) void {
                 const bit: u1 = @truncate(word >> @intCast(r % 64));
                 c.cnt[c.comp[r]] += bit;
@@ -278,7 +291,7 @@ pub const ExactTiles = struct {
         }.f, .{ .cnt = tile_counts, .comp = comp, .first = self.first_row, .base = base });
         for (self.counts, tile_counts) |*c, t| c.* += t;
 
-        if (try self.foldNarrow(ta, cols, lookup, sel, comp, tile_counts, n)) {
+        if (try self.foldNarrow(ta, cols, lookup, sel, comp, tile_counts, n, sparse)) {
             _ = counters.proved.fetchAdd(1, .monotonic);
             return .folded;
         }
@@ -354,6 +367,7 @@ pub const ExactTiles = struct {
         comp: []const u32,
         tile_counts: []const u64,
         n: usize,
+        sparse: bool,
     ) !bool {
         const access = try ta.alloc(Access, self.nodes.len);
         const bound = try ta.alloc(u128, self.nodes.len);
@@ -373,11 +387,11 @@ pub const ExactTiles = struct {
                     } else switch (valuesExact(col).?) {
                         .i64 => |v| {
                             access[i] = .{ .lane64 = v[0..n] };
-                            bound[i] = maxAbs(i64, v[0..n], col, sel);
+                            bound[i] = maxAbs(i64, v[0..n], col, sel, sparse);
                         },
                         .i32 => |v| {
                             access[i] = .{ .lane32 = v[0..n] };
-                            bound[i] = maxAbs(i32, v[0..n], col, sel);
+                            bound[i] = maxAbs(i32, v[0..n], col, sel, sparse);
                         },
                         .i128 => return false,
                     }
@@ -416,10 +430,28 @@ pub const ExactTiles = struct {
         const nulls = try ta.alloc(?[]u64, R);
         for (self.root_list, nulls) |r, *nl| {
             nl.* = null;
-            if (!self.hasNullInput(r, cols, lookup)) continue;
+            // Sparse, every root checks its rows' levels: cheaper than scanning a tile of them.
+            if (!sparse and !self.hasNullInput(r, cols, lookup)) continue;
             const c = try ta.alloc(u64, self.space * lanes);
             @memset(c, 0);
             nl.* = c;
+        }
+        if (sparse) {
+            for (self.root_list, 0..) |r, ri| {
+                const slots = part[ri * self.space * lanes ..][0 .. self.space * lanes];
+                for (sel.mask, 0..) |word, w| {
+                    var bits = word;
+                    while (bits != 0) : (bits &= bits - 1) {
+                        const row = w * 64 + @ctz(bits);
+                        if (!self.rowValid(r, cols, lookup, row)) continue;
+                        const slot = @as(usize, comp[row]) * lanes + row % lanes;
+                        slots[slot] +%= self.rowValue(access, r, row);
+                        nulls[ri].?[slot] += 1;
+                    }
+                }
+            }
+            self.widenTile(part, nulls, tile_counts);
+            return true;
         }
         const valid = try ta.alloc(u1, window_rows);
         var w0: usize = 0;
@@ -439,20 +471,57 @@ pub const ExactTiles = struct {
                 } else foldRoot(false, access[r], lane_buf, slots, &.{}, valid, comp, sel, w0, wn);
             }
         }
+        self.widenTile(part, nulls, tile_counts);
+        return true;
+    }
+
+    /// The tile's interleaved partials into the row group's 192-bit sums.
+    fn widenTile(self: *ExactTiles, part: []const i64, nulls: []const ?[]u64, tile_counts: []const u64) void {
         for (self.root_list, 0..) |_, ri| {
             const slots = part[ri * self.space * lanes ..][0 .. self.space * lanes];
             for (0..self.space) |cp| {
                 var sum: i128 = 0;
-                var kept: u64 = 0;
+                var kept_rows: u64 = 0;
                 for (0..lanes) |l| {
                     sum += slots[cp * lanes + l];
-                    if (nulls[ri]) |cnt| kept += cnt[cp * lanes + l];
+                    if (nulls[ri]) |cnt| kept_rows += cnt[cp * lanes + l];
                 }
-                if (nulls[ri] == null) kept = tile_counts[cp];
-                if (kept != 0) self.sums[ri * self.space + cp].add(sum, kept);
+                if (nulls[ri] == null) kept_rows = tile_counts[cp];
+                if (kept_rows != 0) self.sums[ri * self.space + cp].add(sum, kept_rows);
             }
         }
-        return true;
+    }
+
+    /// Node `i` at one row, wrapping like `evalLane`: computed nodes are evaluated through their children.
+    fn rowValue(self: *const ExactTiles, access: []const Access, i: usize, row: usize) i64 {
+        return switch (access[i]) {
+            .scalar => |v| v,
+            .table => |t| t.t[t.codes[row]],
+            .lane64 => |v| v[row],
+            .lane32 => |v| v[row],
+            .tmp => blk: {
+                const b = self.nodes[i].kind.bin;
+                const x = self.rowValue(access, b.l, row);
+                const y = self.rowValue(access, b.r, row);
+                break :blk switch (b.op) {
+                    .add => (x *% b.lf) +% (y *% b.rf),
+                    .sub => (x *% b.lf) -% (y *% b.rf),
+                    .mul => x *% y,
+                    else => unreachable,
+                };
+            },
+        };
+    }
+
+    fn rowValid(self: *const ExactTiles, i: usize, cols: []const Column, lookup: []const ?usize, row: usize) bool {
+        return switch (self.nodes[i].kind) {
+            .literal => true,
+            .col => |ci| blk: {
+                const ni = cols[lookup[ci].?].nullInfo();
+                break :blk if (ni.def_levels) |dl| dl[row] >= ni.max_def else true;
+            },
+            .bin => |b| self.rowValid(b.l, cols, lookup, row) and self.rowValid(b.r, cols, lookup, row),
+        };
     }
 
     fn hasNullInput(self: *const ExactTiles, r: usize, cols: []const Column, lookup: []const ?usize) bool {
@@ -606,10 +675,21 @@ fn sat(a: u128, b: u128, comptime op: enum { add, mul }) u128 {
 
 /// The largest magnitude among the rows `sel` keeps that are present. Other rows' values are masked out of every
 /// sum, and a gated decode leaves them zero or stale.
-fn maxAbs(comptime T: type, v: []const T, col: Column, sel: *const Sel) u128 {
+fn maxAbs(comptime T: type, v: []const T, col: Column, sel: *const Sel, sparse: bool) u128 {
     const ni = col.nullInfo();
-    const dl: ?[]const u32 = if (ni.def_levels != null and hasNullRows(col)) ni.def_levels.? else null;
     var m: u64 = 0;
+    if (sparse) {
+        for (sel.mask, 0..) |word, w| {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const r = w * 64 + @ctz(bits);
+                if (ni.def_levels) |d| if (d[r] < ni.max_def) continue;
+                m = @max(m, @as(u64, @abs(v[r])));
+            }
+        }
+        return m;
+    }
+    const dl: ?[]const u32 = if (ni.def_levels != null and hasNullRows(col)) ni.def_levels.? else null;
     for (sel.mask, 0..) |word, w| {
         if (word == 0) continue;
         const base = w * 64;
@@ -626,8 +706,10 @@ fn maxAbs(comptime T: type, v: []const T, col: Column, sel: *const Sel) u128 {
 fn hasNullRows(col: Column) bool {
     const ni = col.nullInfo();
     const dl = ni.def_levels orelse return false;
-    for (dl) |d| if (d < ni.max_def) return true;
-    return false;
+    // No early exit, so the scan vectorizes; a tile's levels are in L2.
+    var any: bool = false;
+    for (dl) |d| any = any or d < ni.max_def;
+    return any;
 }
 
 /// A coded column's dictionary identity: the same chunk dictionary keeps one backing for the row group.
@@ -895,10 +977,10 @@ test "tiles fold the established exact sums, proven or forced wide, across nulls
     };
     const keys = [_]expr_ast.Expr{ Fx.key(0), Fx.key(1) };
     try testing.expect(admits(&calls, &keys));
-    var sel = try Sel.init(a, n);
-    for (0..n) |i| if (i % 7 == 0) sel.set(i, false);
-
-    for ([_]?u64{ null, 0 }) |limit| {
+    // Dense, then sparse enough that the tiles walk only the selected rows.
+    for ([_]bool{ false, true }) |sparse| for ([_]?u64{ null, 0 }) |limit| {
+        var sel = try Sel.init(a, n);
+        for (0..n) |i| if (if (sparse) i % 11 != 0 else i % 7 == 0) sel.set(i, false);
         forced_limit = limit;
         counters.reset();
         var x = (try ExactTiles.init(a, &calls, &keys, lookup.len)).?;
@@ -939,7 +1021,7 @@ test "tiles fold the established exact sums, proven or forced wide, across nulls
         var total: u64 = 0;
         for (0..table.groupCount()) |g| total += table.accumulators.items[g * calls.len + 6].count;
         try testing.expectEqual(@as(u64, sel.count()), total);
-    }
+    };
 }
 
 test "a tile whose sums leave i64 folds wide and exactly, cancellation included; a selected overflow abandons" {

@@ -1487,9 +1487,11 @@ fn openSlicedPayload(
             options.row_gate = sv;
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
-        // The exact tiles read a dictionary DECIMAL through its codes.
-        if (exact) |x| if (x.readsLeaf(ci) and in.rg.columns.items[ci].meta_data.?.dictionary_page_offset != null) {
-            r.exact_codes = true;
+        // The exact tiles read a dictionary DECIMAL through its codes, and every DECIMAL as its exact integers: a
+        // scalar target's readers would otherwise scale each value to its f64 view too.
+        if (exact) |x| if (x.readsLeaf(ci)) {
+            r.exact_only = true;
+            if (in.rg.columns.items[ci].meta_data.?.dictionary_page_offset != null) r.exact_codes = true;
         };
         if (in.subgroup) |subgroup| try r.seekSubgroup(pages, subgroup);
         if (levels_only[ci]) r.levelsOnly();
@@ -1930,7 +1932,8 @@ fn scanRGSlicedExact(
         p,
         num_rows,
         ws,
-        stream_rows,
+        // The tiles' filter columns, read as codes, stay in cache a tile at a time as their payload does.
+        if (exact != null and ws.decode_batch_rows != 0) @min(stream_rows, ws.decode_batch_rows) else stream_rows,
         exact != null,
     )) orelse
         return null;

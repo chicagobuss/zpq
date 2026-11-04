@@ -158,6 +158,8 @@ pub const SliceScratch = struct {
     /// `ArenaAllocator.init` allocates no backing.
     values: std.heap.ArenaAllocator,
     scan_values: std.heap.ArenaAllocator,
+    /// A sliced row group's own state (its readers, the tiles' sums), reset when the next group starts.
+    row_group: std.heap.ArenaAllocator,
 
     pub const Slot = struct {
         scratch: DecodeScratch,
@@ -174,7 +176,7 @@ pub const SliceScratch = struct {
                 @memset(std.mem.sliceAsBytes(self.scratch.rep_levels), reuse_poison);
             }
             _ = self.pages.reset(.retain_capacity);
-            _ = self.dictionary.reset(.free_all);
+            _ = self.dictionary.reset(.retain_capacity);
         }
     };
 
@@ -183,6 +185,7 @@ pub const SliceScratch = struct {
             .alloc = alloc,
             .values = .init(alloc),
             .scan_values = .init(alloc),
+            .row_group = .init(alloc),
         };
     }
 
@@ -196,6 +199,7 @@ pub const SliceScratch = struct {
         self.alloc.free(self.survivors);
         self.values.deinit();
         self.scan_values.deinit();
+        self.row_group.deinit();
         self.* = undefined;
     }
 
@@ -253,6 +257,12 @@ pub const SliceScratch = struct {
         return &self.scan_values;
     }
 
+    /// A row group's arena, rewound: its pages stay mapped from one sliced group to the next.
+    pub fn rowGroupArena(self: *SliceScratch) *std.heap.ArenaAllocator {
+        _ = self.row_group.reset(.retain_capacity);
+        return &self.row_group;
+    }
+
     /// Bytes this pool still holds: every slot's decode buffers and page arena, both value arenas, and the
     /// survivor mask. Call only after the row group's readers are gone. A checked-out slot's dictionary and
     /// byte-array slices alias these buffers.
@@ -260,6 +270,7 @@ pub const SliceScratch = struct {
         var n: usize = self.survivors.len * @sizeOf(u64);
         n += self.values.queryCapacity();
         n += self.scan_values.queryCapacity();
+        n += self.row_group.queryCapacity();
         for (self.slots.items) |*slot| {
             n += slot.scratch.page.len;
             n += slot.scratch.dict.len;
@@ -281,8 +292,8 @@ pub const SliceScratch = struct {
     }
 
     fn releaseLargest(self: *SliceScratch) bool {
-        // 1 survivors, 2 value arena, 3 scan arena, then six ids per slot: page, dict, def, rep, page arena,
-        // dictionary arena.
+        // 1 survivors, 2 value arena, 3 scan arena, 4 row-group arena, then six ids per slot: page, dict, def, rep,
+        // page arena, dictionary arena.
         var best: usize = 0;
         var pick: usize = 0;
         const note = struct {
@@ -296,8 +307,9 @@ pub const SliceScratch = struct {
         note(&best, &pick, self.survivors.len * @sizeOf(u64), 1);
         note(&best, &pick, self.values.queryCapacity(), 2);
         note(&best, &pick, self.scan_values.queryCapacity(), 3);
+        note(&best, &pick, self.row_group.queryCapacity(), 4);
         for (self.slots.items, 0..) |*slot, i| {
-            const base = 4 + i * 6;
+            const base = 5 + i * 6;
             const buffers = .{
                 slot.scratch.page.len,
                 slot.scratch.dict.len,
@@ -316,9 +328,10 @@ pub const SliceScratch = struct {
             },
             2 => _ = self.values.reset(.{ .retain_with_limit = 0 }),
             3 => _ = self.scan_values.reset(.{ .retain_with_limit = 0 }),
+            4 => _ = self.row_group.reset(.{ .retain_with_limit = 0 }),
             else => {
-                const slot = &self.slots.items[(pick - 4) / 6];
-                switch ((pick - 4) % 6) {
+                const slot = &self.slots.items[(pick - 5) / 6];
+                switch ((pick - 5) % 6) {
                     0 => {
                         slot.scratch.gpa.free(slot.scratch.page);
                         slot.scratch.page = &.{};

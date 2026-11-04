@@ -864,7 +864,9 @@ fn planDecode(
     } else false;
     const whole = !keep_dictionary and !stream and !force_cache and fits_share and admitWhole(ws, full);
     if (whole) return plan;
-    if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
+    // The region goes back only when it refused the row group. One sliced for cache, which it would have taken
+    // whole, keeps its pages for the next group instead of faulting them in again.
+    if (ws.region) |r| if (!fits_share) r.trim() else if (!admitWhole(ws, full)) dropRegion(ws);
     const sliced = scanRGSlicedExact(
         gpa,
         in,
@@ -1897,8 +1899,7 @@ fn scanRGSlicedExact(
     // One eighth of the ledger this pool draws from. The next group can use the other seven eighths.
     const carry = core_memory.retainedCarry(if (ws.ledger) |l| l.limit else decode_options.expand_limit);
     defer pool.trimAbove(carry);
-    var pages = std.heap.ArenaAllocator.init(side);
-    defer pages.deinit();
+    const pages = pool.rowGroupArena();
     var readers: std.ArrayList(SliceReader) = .empty;
     defer for (readers.items) |*r| r.deinit();
     const lookup = try pages.allocator().alloc(?usize, in.meta.schema.items.len);

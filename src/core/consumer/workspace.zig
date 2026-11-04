@@ -33,9 +33,9 @@ pub const AggWorkspace = struct {
     /// Shared by the query's scan workers; null decodes without a bound (tests, callers that budget elsewhere).
     budget: ?*DecodeBudget = null,
     /// The worker's region under `scratch` and `rg_arena`, which keeps an earlier pass's pages: trimmed before a row
-    /// group decodes sliced or staged on memory of its own, so those pages are not held beside its reservation.
+    /// group decodes sliced on memory of its own, so those pages are not held beside its reservation.
     region: ?*huge_pages.Region = null,
-    /// Where a row group decodes staged or sliced, beside the region: drawn from the query's ledger, as the region is.
+    /// Where a row group decodes sliced, beside the region: drawn from the query's ledger, as the region is.
     /// Null allocates from the scan's `gpa`.
     charged: ?std.mem.Allocator = null,
     /// Optional cost hints use their own refusal flags, while charging the same ledger.

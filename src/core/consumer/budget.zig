@@ -7,8 +7,8 @@ const AggRowGroup = @import("types.zig").AggRowGroup;
 /// The memory a query's scan workers' decoded row groups may take together (`scan.runMultiAggregate` gives it half of
 /// `max_memory`). A worker reserves a row group's estimate (`decodeEstimate`) before decoding it and gives it back
 /// after, so a row group that does not fit beside the others waits for them. One bigger than a worker's share decodes
-/// staged — the filter and keys, then one aggregate's columns at a time on memory handed back after each — and one
-/// that does not fit the whole budget even so is refused before anything is allocated, rather than killed by the OS.
+/// in slices of rows, and one that does not fit the whole budget even so is refused before anything is allocated,
+/// rather than killed by the OS.
 pub const DecodeBudget = struct {
     limit: usize,
     workers: usize = 1,

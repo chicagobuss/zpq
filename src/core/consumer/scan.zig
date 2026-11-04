@@ -57,8 +57,6 @@ const loadPageIndexes = pruning.loadPageIndexes;
 const pruneFilterPages = pruning.pruneFilterPages;
 const compactRows = pruning.compactRows;
 const scan_plan = @import("plan.zig");
-const StagePlan = scan_plan.StagePlan;
-const CallBatch = scan_plan.CallBatch;
 const payloadColumns = scan_plan.payloadColumns;
 const plainValueEncodings = scan_plan.plainValueEncodings;
 const hashOnlyByteArray = scan_plan.hashOnlyByteArray;
@@ -528,7 +526,7 @@ pub fn probeDecodeFailure(
     @memset(only, false);
     if (scalar) {
         const target: AggTarget = .{ .scalar = .{ .calls = calls, .accumulators = &.{} } };
-        const uses = try planCodeUses(pa, check_in, target, false);
+        const uses = try planCodeUses(pa, check_in, target);
         for (only, 0..) |*v, ci| v.* = uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
     }
     return decode_order.probe(SliceReader, isDecodeError, a, check_in, options, only);
@@ -784,12 +782,10 @@ fn foldScalarCache(
     return true;
 }
 
-/// How a row group decodes: whole, staged one aggregate's columns at a time, or in slices of rows.
+/// How a row group decodes: whole, or in slices of rows.
 const DecodePlan = struct {
     /// Set when the sliced decode already aggregated the row group: the rows it kept.
     kept: ?u64 = null,
-    stage_plan: ?StagePlan = null,
-    staged: bool = false,
     /// What the row group holds on the worker's decode budget while it decodes.
     reserved: usize = 0,
     /// The whole-decode estimate, which a restart over slices charges when a column outgrows its footer's.
@@ -806,7 +802,6 @@ fn rewriteInput(target: AggTarget) ?usize {
 
 fn planDecode(
     gpa: std.mem.Allocator,
-    plan_alloc: std.mem.Allocator,
     in: AggRowGroup,
     stats: agg_plan.StatsUse,
     decode_options: DecodeOptions,
@@ -895,13 +890,8 @@ fn planDecode(
         plan.kept = kept;
         return plan;
     }
+    // Only a repeated column declines the sliced decode, and only an empty row group reaches here with none.
     if (target == .grouped and target.grouped.records != null) return error.ExceededMemoryBudget;
-    const sp = try StagePlan.init(plan_alloc, in, target, handled_via_stats);
-    if (sp.estimate < full) {
-        plan.staged = true;
-        plan.reserved = sp.estimate;
-        plan.stage_plan = sp;
-    }
     return plan;
 }
 
@@ -937,41 +927,31 @@ fn scanRGForAggImpl(
     // 2. Decode path for the aggs that couldn't be stat-handled.
     // Rewound, not rebuilt: a fresh arena per row group hands its pages back to the OS and re-faults them every time.
     // The price is that each worker's arena holds its high-water mark (one row group) for the whole scan, which the
-    // decode budget bounds: a row group past a worker's share decodes staged, on memory handed back when it is done.
+    // decode budget bounds: a row group past a worker's share decodes in slices, on memory handed back when it is done.
     ws.rg_arena.nextRowGroup();
     if (ws.region) |r| r.settle();
     const prof = ws.timings.prof;
 
-    // Staged and sliced decodes live beside the region, on memory drawn from the query's ledger as the region's is.
-    const side = ws.charged orelse gpa;
-    var plan_arena = std.heap.ArenaAllocator.init(side);
-    defer plan_arena.deinit();
-    const plan = try planDecode(gpa, plan_arena.allocator(), in, stats, decode_options, target, ws, handled_via_stats);
+    const plan = try planDecode(gpa, in, stats, decode_options, target, ws, handled_via_stats);
     if (plan.kept) |kept| return kept;
-    const staged = plan.staged;
-    const stage_plan = plan.stage_plan;
     const full_estimate = plan.full_estimate;
     if (ws.budget) |b| try b.acquire(plan.reserved);
     var held = plan.reserved;
     defer if (ws.budget) |b| b.release(held);
-    // Staged, everything decoded lives on memory of its own, given back with the row group; otherwise on the
-    // worker's arena.
-    var staged_arena = std.heap.ArenaAllocator.init(side);
-    defer staged_arena.deinit();
-    const ra = if (staged) staged_arena.allocator() else ws.rg_arena.allocator();
+    const ra = ws.rg_arena.allocator();
 
     const prune_span = profile.Span.begin(prof);
     const page_indexes = try loadPageIndexes(ra, in, stats);
     var sel = try filter_selection.SelectionVector.init(ra, num_rows);
     const filter_pages = try pruneFilterPages(ra, in, page_indexes, stats, &sel);
     // Page pruning left few rows: decode just those, and let them stand for the row group from here on.
-    const keep = if (staged) null else try compactRows(ra, in, page_indexes, &sel, target, ws.compaction);
+    const keep = try compactRows(ra, in, page_indexes, &sel, target, ws.compaction);
     const batch_rows = if (keep != null) sel.count() else num_rows;
 
     const t_decode_start = nowMonoNs();
     var dec: ChunkDecoder = .{
         .in = in,
-        .uses = try planCodeUses(ra, in, target, staged),
+        .uses = try planCodeUses(ra, in, target),
         .page_indexes = page_indexes,
         .filter_pages = filter_pages,
         .num_rows = num_rows,
@@ -984,18 +964,18 @@ fn scanRGForAggImpl(
     var batch_cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     var lookup = try ra.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
-    // Pages are pruned by the rows the filter's page statistics leave, as when every column decodes up front.
-    const sel_pre = if (staged) try sel.cloneAlloc(ra) else sel;
+    // Pages are pruned by the rows the filter's page statistics leave, which compaction replaces with its own rows.
+    const sel_pre = sel;
     // Compact columns: every kept row is selected so far.
     if (keep != null) sel = try filter_selection.SelectionVector.init(ra, batch_rows);
-    // Payload columns decode after the filter, gated by its survivors; a staged plan decodes them with its calls.
+    // Payload columns decode after the filter, gated by its survivors.
     dec.payload = try payloadColumns(ra, in, target);
     var length_of = try ra.alloc(bool, in.read.len);
     @memset(length_of, false);
     var filtered = false;
     var survivors: usize = 0;
     var whole: []bool = &.{};
-    // A staged plan's base columns are the filter's, so they take the same gated order; only compacted rows don't.
+    // Compacted rows keep the ungated decode.
     var gated = if (keep == null) try GatedFilter.init(ra, in, target, dec.page_indexes) else null;
     if (gated) |*g| dec.filter_gated = g.deferred;
     const all_columns = try ra.alloc(usize, in.read.len);
@@ -1004,11 +984,6 @@ fn scanRGForAggImpl(
         const needed = in.read[ci];
         if (late and dec.payload == null) break;
         if (!needed or ci >= in.rg.columns.items.len) continue;
-        if (stage_plan) |sp| if (!sp.base[ci]) {
-            // A flat hash-group key is payload: one gated decode after the filter, including on a staged plan.
-            const pay = late and if (dec.payload) |p| p[ci] else false;
-            if (!pay) continue;
-        };
         if (dec.payload) |p| if (p[ci] != late) continue;
         if (!late) if (gated) |*g| if (g.deferred[ci]) {
             const now: filter_eval.Batch = .{
@@ -1048,7 +1023,7 @@ fn scanRGForAggImpl(
             // over; its reservation and what it decoded go back first.
             const b = ws.budget orelse return err;
             const refused = refusedDraw(ws, err);
-            if ((err != error.DecodeExceededBudget and !refused) or staged) return err;
+            if (err != error.DecodeExceededBudget and !refused) return err;
             b.release(held);
             held = 0;
             if (refused) dropRegion(ws) else {
@@ -1094,7 +1069,6 @@ fn scanRGForAggImpl(
         else
             try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     };
-    // A staged plan's call columns decode below, after the filter: payload among them is gated the same way.
     // Length-only predicate columns refill here when the fold or an owner still reads the bytes, and only the
     // rows the filter kept. `codePlainKeys` has to see those bytes, not the empty length-only placeholders.
     if (dec.payload != null or in.filter != null) dec.gate = &sel;
@@ -1107,7 +1081,7 @@ fn scanRGForAggImpl(
         };
         dec.refill = false;
     }
-    if (target == .grouped and target.grouped.records == null and !staged and decode_options.encoded)
+    if (target == .grouped and target.grouped.records == null and decode_options.encoded)
         try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
@@ -1119,19 +1093,14 @@ fn scanRGForAggImpl(
             if (try foldWholeGrouped(.{
                 .ra = ra,
                 .gpa = gpa,
-                .side = side,
                 .in = in,
                 .target = target,
                 .ws = ws,
                 .decode_options = decode_options,
-                .staged = staged,
-                .stage_plan = stage_plan,
-                .dec = &dec,
                 .batch_cols = &batch_cols,
                 .batch = &batch,
                 .lookup = lookup,
                 .sel = &sel,
-                .sel_pre = &sel_pre,
                 .batch_rows = batch_rows,
                 .selected = selected,
                 .t_eval_end = t_eval_end,
@@ -1141,17 +1110,12 @@ fn scanRGForAggImpl(
         .scalar => |scalar| try foldWholeScalar(.{
             .ra = ra,
             .gpa = gpa,
-            .side = side,
             .scalar = scalar,
             .winner_charge = ws.fold_context.winner_charge,
             .handled = handled_via_stats,
             .batch = &batch,
             .lookup = lookup,
             .sel = &sel,
-            .sel_pre = &sel_pre,
-            .stage_plan = stage_plan,
-            .dec = &dec,
-            .staged = staged,
         }),
     }
     const t_agg_end = nowMonoNs();
@@ -1163,35 +1127,25 @@ fn scanRGForAggImpl(
 const WholeScalar = struct {
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    side: std.mem.Allocator,
     scalar: @FieldType(AggTarget, "scalar"),
     winner_charge: ?*expr_agg.WinnerCharge,
     handled: []const bool,
     batch: *const filter_eval.Batch,
     lookup: []?usize,
     sel: *filter_selection.SelectionVector,
-    sel_pre: *const filter_selection.SelectionVector,
-    stage_plan: ?StagePlan,
-    dec: *ChunkDecoder,
-    staged: bool,
 };
 
 fn foldWholeScalar(c: WholeScalar) !void {
     const ra = c.ra;
     const gpa = c.gpa;
-    const side = c.side;
     const s = c.scalar;
     const handled_via_stats = c.handled;
     const batch = c.batch.*;
     const lookup = c.lookup;
     const sel = c.sel;
-    const sel_pre = c.sel_pre;
-    const stage_plan = c.stage_plan;
-    const dec = c.dec;
-    const staged = c.staged;
     // Update only the aggs that weren't handled via stats. The agg's
     // own per-WHERE predicate (if any) is composed inside updateOne.
-    if (!staged and try expr_agg.updateSharedInteger(
+    if (try expr_agg.updateSharedInteger(
         ra,
         s.calls,
         s.accumulators,
@@ -1200,37 +1154,25 @@ fn foldWholeScalar(c: WholeScalar) !void {
         lookup,
         sel,
     )) return;
-    for (s.calls, s.accumulators, handled_via_stats, 0..) |call, *acc, handled, i| {
+    for (s.calls, s.accumulators, handled_via_stats) |call, *acc, handled| {
         if (handled) continue;
-        var call_arena = std.heap.ArenaAllocator.init(side);
-        defer call_arena.deinit();
-        const ca = if (staged) call_arena.allocator() else ra;
-        const cb = if (stage_plan) |sp|
-            try dec.withCallColumns(ca, sp, i, &batch, lookup, sel_pre, false)
-        else
-            CallBatch{ .batch = batch, .lookup = lookup };
-        // `ca` is per-RG (or per-call) scratch; `gpa` is the persist allocator for owned results (string
-        // min/max winner) that outlive both and the cross-worker merge.
-        try expr_agg.updateOneWithCharge(ca, gpa, acc, call, &cb.batch, cb.lookup, sel, c.winner_charge);
+        // `ra` is per-RG scratch; `gpa` is the persist allocator for owned results (string min/max winner) that
+        // outlive it and the cross-worker merge.
+        try expr_agg.updateOneWithCharge(ra, gpa, acc, call, &batch, lookup, sel, c.winner_charge);
     }
 }
 
 const WholeGrouped = struct {
     ra: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    side: std.mem.Allocator,
     in: AggRowGroup,
     target: AggTarget,
     ws: AggWorkspace,
     decode_options: DecodeOptions,
-    staged: bool,
-    stage_plan: ?StagePlan,
-    dec: *ChunkDecoder,
     batch_cols: *std.ArrayList(filter_eval.Batch.Column),
     batch: *const filter_eval.Batch,
     lookup: []?usize,
     sel: *filter_selection.SelectionVector,
-    sel_pre: *const filter_selection.SelectionVector,
     batch_rows: usize,
     selected: usize,
     t_eval_end: i64,
@@ -1240,19 +1182,14 @@ const WholeGrouped = struct {
 fn foldWholeGrouped(c: WholeGrouped) !bool {
     const ra = c.ra;
     const gpa = c.gpa;
-    const side = c.side;
     const in = c.in;
     const target = c.target;
     const ws = c.ws;
     const decode_options = c.decode_options;
-    const staged = c.staged;
-    const stage_plan = c.stage_plan;
-    const dec = c.dec;
     const batch_cols = c.batch_cols;
     const batch = c.batch.*;
     const lookup = c.lookup;
     const sel = c.sel;
-    const sel_pre = c.sel_pre;
     const batch_rows = c.batch_rows;
     const selected = c.selected;
     const t_eval_end = c.t_eval_end;
@@ -1267,7 +1204,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
         profile.record(prof, .aggregate, t_eval_end, end, profile.args(.{ selected, calls.len }));
         return true;
     }
-    if (g.part != null and !staged) {
+    if (g.part != null) {
         try foldGroupedWindows(
             ra,
             gpa,
@@ -1287,7 +1224,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
         profile.record(prof, .aggregate, t_eval_end, t_agg_end, profile.args(.{ selected, calls.len }));
         return true;
     }
-    const dense = if (g.dense) |d| !staged and decode_options.encoded and
+    const dense = if (g.dense) |d| decode_options.encoded and
         try d.foldKeys(
             ra,
             gpa,
@@ -1299,7 +1236,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
             lookup,
             sel,
         ) else false;
-    if (dense or (!staged and decode_options.encoded and
+    if (dense or (decode_options.encoded and
         try agg_coded.groupedCodedWithContext(ra, gpa, g.calls, g.keys, g.table, g.pos_base, &batch, lookup, sel, ws.budget, ws.region, ws.fold_context)))
     {
         const t_agg_end = nowMonoNs();
@@ -1324,7 +1261,7 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
     var key_resolver = expr_agg.GroupKeyResolver.init(key_cols);
     defer key_resolver.deinit(ra);
 
-    const sparse = g.table.sketch == null and stage_plan == null and sel.count() != sel.len and
+    const sparse = g.table.sketch == null and sel.count() != sel.len and
         sel.len <= std.math.maxInt(u32);
     if (sparse) if (try gatherUnder(ra, batch.cols, key_cols, sel, sel.count())) |gathered| {
         try key_resolver.resolveBatch(
@@ -1362,30 +1299,10 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
         try expr_agg.sinkSketchRows(g.table, group_id_arr, sel);
         // A sketch's count pass has read no aggregate's columns, and has no group to fold into.
         if (!g.table.countOnly()) for (g.calls, 0..) |_, i| {
-            var call_arena = std.heap.ArenaAllocator.init(side);
-            defer call_arena.deinit();
-            const ca = if (staged) call_arena.allocator() else ra;
-            const cb = if (stage_plan) |sp|
-                try dec.withCallColumns(ca, sp, i, &batch, lookup, sel_pre, true)
-            else
-                CallBatch{ .batch = batch, .lookup = lookup };
-            try expr_agg.updateTableGroupedWithContext(
-                ca,
-                gpa,
-                g.table,
-                group_id_arr,
-                i,
-                g.calls,
-                &cb.batch,
-                cb.lookup,
-                sel,
-                ws.fold_context,
-            );
+            try expr_agg.updateTableGroupedWithContext(ra, gpa, g.table, group_id_arr, i, g.calls, &batch, lookup, sel, ws.fold_context);
         };
     }
-    // The windowed path returned above. A staged row group folded whole still has to enter the partitions
-    // before the next row group, or one worker's local table keeps every key it has seen.
-    if (g.part) |p| if (g.local) |local| try p.pump(local, g.table, @intCast(sel.count()));
+    // A partitioned table folded in windows and returned above.
     return false;
 }
 
@@ -1972,7 +1889,7 @@ fn scanRGSlicedExact(
     const lookup = try pages.allocator().alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);
     // The columns the whole-chunk path reads as levels only (`decodeLevelsOnly`), read so here too.
-    const uses = try planCodeUses(pages.allocator(), in, target, false);
+    const uses = try planCodeUses(pages.allocator(), in, target);
     const levels_only = try pages.allocator().alloc(bool, in.read.len);
     for (levels_only, 0..) |*l, ci| l.* = decode_options.encoded and target == .scalar and ci < uses.levels.len and
         uses.levels[ci] and !uses.code[ci] and !uses.value[ci];

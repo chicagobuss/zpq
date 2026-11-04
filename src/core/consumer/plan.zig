@@ -34,46 +34,6 @@ const decodeAggColumnCoded = agg_column.decodeAggColumnCoded;
 const decodeAggColumnHist = agg_column.decodeAggColumnHist;
 const decodeLevelsOnly = agg_column.decodeLevelsOnly;
 
-/// A staged row group's decode: the columns the outer filter reads (`base`), decoded first; then each aggregate's
-/// own (`calls[i]`, less `base`), decoded for it alone and dropped after. A flat hash-group key is payload, gated
-/// by the filter's survivors, on this plan as on the others.
-pub const StagePlan = struct {
-    base: []bool,
-    calls: [][]bool,
-    /// The most the plan holds at once: `base` and the largest call's columns.
-    estimate: usize,
-
-    pub fn init(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget, handled: []const bool) !StagePlan {
-        const n = in.read.len;
-        const base = try baseColumns(a, in, target);
-        const calls = target.planCalls();
-        if (target == .grouped and target.grouped.table.countOnly()) {
-            std.debug.assert(calls.len == 0);
-        }
-        const per_call = try a.alloc([]bool, calls.len);
-        var widest: usize = 0;
-        for (calls, per_call, 0..) |call, *cols, i| {
-            cols.* = try a.alloc(bool, n);
-            @memset(cols.*, false);
-            if (i < handled.len and handled[i]) continue;
-            if (call.arg) |arg| arg.collectColumns(cols.*);
-            if (call.where) |w| {
-                var wc: std.ArrayList(usize) = .empty;
-                try w.collectColumns(&wc, a);
-                for (wc.items) |ci| if (ci < n) {
-                    cols.*[ci] = true;
-                };
-            }
-            for (cols.*, in.read, base) |*c, r, b| c.* = c.* and r and !b;
-            widest = @max(widest, decodeEstimate(in, cols.*, calls[i .. i + 1], false));
-        }
-        const base_bytes = decodeEstimate(in, base, &.{}, target == .grouped);
-        return .{ .base = base, .calls = per_call, .estimate = base_bytes + widest };
-    }
-};
-
-pub const CallBatch = struct { batch: filter_eval.Batch, lookup: []?usize };
-
 /// The columns of `in.read` a row group needs before its filter has run: the filter's own. With no filter, the
 /// group keys too. A flat key of a hash group under a filter is payload (`payloadColumns`), decoded only at the
 /// survivors (or, when its dictionary covers the chunk, as codes for every row: `keyCodesCheaper`). A nested key has
@@ -111,7 +71,7 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
 }
 
 /// Payload columns: what a filtered row group reads past `baseColumns`, flat. That is an aggregate's columns and a
-/// flat hash-group key, including the columns of a key expression. Every decode path (whole, compact, staged, sliced)
+/// flat hash-group key, including the columns of a key expression. Every decode path (whole, compact, sliced)
 /// decodes them after the filter, gated by its survivors (`DecodeOptions.row_gate`), so which of their pages decode
 /// depends on the input and the query alone. An owner query (`records`) is included: its payload is still not read
 /// for rows the filter dropped. Null when there is no filter — nothing has selected rows yet — or when every read
@@ -677,31 +637,6 @@ pub const ChunkDecoder = struct {
         }
         return decoded;
     }
-
-    /// `batch` with call `i`'s own columns (`plan.calls[i]`) decoded beside it, on `a`.
-    pub fn withCallColumns(
-        self: *ChunkDecoder,
-        a: std.mem.Allocator,
-        plan: StagePlan,
-        i: usize,
-        batch: *const filter_eval.Batch,
-        lookup: []const ?usize,
-        sel: *const filter_selection.SelectionVector,
-        values: bool,
-    ) !CallBatch {
-        var cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
-        try cols.appendSlice(a, batch.cols);
-        const lk = try a.dupe(?usize, lookup);
-        for (plan.calls[i], 0..) |needed, ci| {
-            if (!needed or (ci < lk.len and lk[ci] != null)) continue;
-            var col = try self.column(a, ci, sel);
-            // The grouped row fold reads values, not codes.
-            if (values) col = try agg_coded.materialize(a, col);
-            lk[ci] = cols.items.len;
-            try cols.append(a, col);
-        }
-        return .{ .batch = .{ .cols = cols.items, .num_rows = batch.num_rows }, .lookup = lk };
-    }
 };
 
 const chunkArgs = types.chunkArgs;
@@ -715,7 +650,7 @@ pub fn sliceRows(fit: usize, num_rows: usize) usize {
 
 const CodeUses = struct { code: []bool, value: []bool, levels: []bool, hist_ok: []bool };
 
-pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, staged: bool) !CodeUses {
+pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !CodeUses {
     const n = in.read.len;
     const u: CodeUses = .{
         .code = try ra.alloc(bool, n),
@@ -730,8 +665,8 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, s
     // read it as a bare argument.
     @memset(u.hist_ok, in.filter == null and target == .scalar);
     // So does a lone GROUP BY key that only counts read, its groups resolved from the histogram
-    // (`agg_coded.groupedCoded`). A staged, windowed, sketched or owned-record fold needs per-row identities.
-    if (in.filter == null and !staged) switch (target) {
+    // (`agg_coded.groupedCoded`). A windowed, sketched or owned-record fold needs per-row identities.
+    if (in.filter == null) switch (target) {
         .grouped => |g| if (g.records == null and g.part == null and g.table.sketch == null and
             g.table.discovery == null)
         {
@@ -763,7 +698,7 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget, s
         },
         .scalar => {},
     }
-    if (!staged and target == .grouped) if (agg_coded.rewriteSource(target.grouped.calls, target.grouped.keys)) |source| {
+    if (target == .grouped) if (agg_coded.rewriteSource(target.grouped.calls, target.grouped.keys)) |source| {
         if (source.col_idx < n) {
             u.code[source.col_idx] = true;
             u.value[source.col_idx] = false;

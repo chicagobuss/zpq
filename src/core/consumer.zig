@@ -163,8 +163,6 @@ pub const releaseSlicePool = pool_module.releaseSlicePool;
 
 
 const scan_plan = @import("consumer/plan.zig");
-const StagePlan = scan_plan.StagePlan;
-const CallBatch = scan_plan.CallBatch;
 const payloadColumns = scan_plan.payloadColumns;
 const plainValueEncodings = scan_plan.plainValueEncodings;
 const hashOnlyByteArray = scan_plan.hashOnlyByteArray;

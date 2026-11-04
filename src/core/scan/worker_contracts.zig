@@ -218,7 +218,7 @@ pub const Worker = struct {
     decode_budget: ?*consumer.DecodeBudget = null,
     /// The query's ledger, which the region and `charged` draw from; null draws nothing.
     ledger: ?*expr_agg.SharedBudget = null,
-    /// Memory a row group decodes on beside the region (staged, sliced), drawn from `ledger`.
+    /// Memory a row group decodes on beside the region (sliced), drawn from `ledger`.
     charged: ?core_memory.Charged = null,
     /// A scalar query's string min/max winners, each copy drawn from the query's ledger before it is made.
     winners: ?*WinnerCharge = null,

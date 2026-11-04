@@ -1961,11 +1961,17 @@ fn scanRGSlicedExact(
         if (exact == null) return error.ExactTilesAbandoned;
     }
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
-    const payload = if (in.subgroup != null) null else try payloadColumns(pages.allocator(), in, target);
+    const found = if (in.subgroup != null) null else try payloadColumns(pages.allocator(), in, target);
     // So are the filter columns the whole decode defers; no page index is read here.
     const no_index = try pages.allocator().alloc(?pruning.PageIndex, in.read.len);
     @memset(no_index, null);
-    var gated = if (payload != null) try GatedFilter.init(pages.allocator(), in, target, no_index) else null;
+    var gated = if (in.subgroup == null) try GatedFilter.init(pages.allocator(), in, target, no_index) else null;
+    // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.
+    const payload: ?[]const bool = found orelse if (gated != null) blk: {
+        const none = try pages.allocator().alloc(bool, in.read.len);
+        @memset(none, false);
+        break :blk none;
+    } else null;
     var survivors: filter_selection.SelectionVector = undefined;
     if (payload) |p| survivors = (try filterSurvivors(
         pages.allocator(),

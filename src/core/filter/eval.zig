@@ -824,6 +824,22 @@ pub fn applyCodeMatch(
         const word = sel.mask[w];
         if (word == 0) continue;
         const base = w * 64;
+        // A later conjunct sees the earlier ones' survivors. Under half of a word still selected, test just those
+        // rows: finding and clearing a set bit costs about two dense rows, so the dense loop wins above half.
+        if (@popCount(word) < 32) {
+            var bits = word;
+            var keep = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                const i: u6 = @intCast(@ctz(bits));
+                const r = base + i;
+                std.debug.assert(r < n);
+                const present = if (def_levels) |dl| dl[r] == max_def else true;
+                const drop: u64 = @intFromBool(match[codes[r]] == 0 or !present);
+                keep &= ~(drop << i);
+            }
+            sel.mask[w] = keep;
+            continue;
+        }
         const end = @min(base + 64, n);
         var bits: u64 = 0;
         if (def_levels) |dl| {

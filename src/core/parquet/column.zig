@@ -1473,19 +1473,27 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const width = @sizeOf(T);
             const need = dest.len * width;
             if (dec.pos + need > dec.bytes.len) return error.UnexpectedPage;
-            for (dest, 0..) |*out, i| {
-                if (!gate.isActive(row0 + i)) {
-                    out.* = defaultValue();
-                    continue;
+            // A gate word at a time, visiting only its set bits: a selective filter keeps few rows of a page.
+            @memset(dest, defaultValue());
+            var i: usize = 0;
+            while (i < dest.len) {
+                const r = row0 + i;
+                const shift: u6 = @intCast(r % 64);
+                const span = @min(64 - @as(usize, shift), dest.len - i);
+                var bits = gate.mask[r / 64] >> shift;
+                if (span < 64) bits &= (@as(u64, 1) << @intCast(span)) - 1;
+                while (bits != 0) : (bits &= bits - 1) {
+                    const j = i + @ctz(bits);
+                    const raw = dec.bytes[dec.pos + j * width ..][0..width];
+                    dest[j] = switch (T) {
+                        i32 => @bitCast(std.mem.readInt(u32, raw[0..4], .little)),
+                        i64 => @bitCast(std.mem.readInt(u64, raw[0..8], .little)),
+                        f32 => @bitCast(std.mem.readInt(u32, raw[0..4], .little)),
+                        f64 => @bitCast(std.mem.readInt(u64, raw[0..8], .little)),
+                        else => unreachable,
+                    };
                 }
-                const raw = dec.bytes[dec.pos + i * width ..][0..width];
-                out.* = switch (T) {
-                    i32 => @bitCast(std.mem.readInt(u32, raw[0..4], .little)),
-                    i64 => @bitCast(std.mem.readInt(u64, raw[0..8], .little)),
-                    f32 => @bitCast(std.mem.readInt(u32, raw[0..4], .little)),
-                    f64 => @bitCast(std.mem.readInt(u64, raw[0..8], .little)),
-                    else => unreachable,
-                };
+                i += span;
             }
             dec.pos += need;
             return true;

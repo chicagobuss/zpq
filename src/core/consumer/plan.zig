@@ -297,14 +297,38 @@ pub fn streamWindowRows(in: AggRowGroup, target: AggTarget, num_rows: usize) usi
 }
 
 /// The fold reads `ci` after the filter: a group key, an aggregate argument, or a per-aggregate FILTER.
-/// A top-level AND's filter columns decoded one conjunct at a time: a column only its single-column leaves read
+/// One AND conjunct of a row group's filter: it reads the rows that survive the conjuncts before it and clears those
+/// it rejects. A predicate over columns is the only kind today. Another kind (a lookup of a key column in a build
+/// structure, keeping the rows with a match) is one more variant, with its own arm in `reads`, `soleColumn` and
+/// `GatedFilter.narrow`; the decode paths reach conjuncts only through `GatedFilter`.
+pub const Conjunct = union(enum) {
+    predicate: filter_ast.Filter,
+
+    /// Mark the columns this conjunct reads.
+    pub fn reads(c: Conjunct, marks: []bool) void {
+        switch (c) {
+            .predicate => |f| filter_ast.markColumns(f, marks),
+        }
+    }
+
+    /// The one column this conjunct reads, when it reads nothing else. A column only such conjuncts read can decode
+    /// after the others, at their survivors.
+    pub fn soleColumn(c: Conjunct) ?usize {
+        return switch (c) {
+            .predicate => |f| filter_ast.leafColumn(f),
+        };
+    }
+};
+
+/// A top-level AND's conjuncts, and the order their columns decode in: a column only `soleColumn` conjuncts read
 /// decodes after the other base columns, at the survivors of every conjunct whose columns are decoded by then
-/// (`DecodeOptions.row_gate`), so a page none of them keeps is never decompressed. Conjuncts evaluate in the plan's
-/// order as their columns arrive; AND only clears bits, so the answer is the whole filter's. Which pages skip
-/// depends on the input and the query alone. A chunk its dictionary covers keeps its coded evaluation, and a
-/// length-only, page-indexed, staged, compacted or record-owned decode keeps the established whole-column path.
+/// (`DecodeOptions.row_gate`), so a page none of them keeps is never decompressed. Conjuncts narrow in the plan's
+/// order as their columns arrive; AND only clears bits, so the answer is the whole filter's. Which pages skip depends
+/// on the input and the query alone, never on scheduling, so the whole-row-group, sliced and tile decodes, which all
+/// follow this plan, read the same pages. A chunk its dictionary covers keeps its coded evaluation, and a
+/// length-only, page-indexed, compacted or record-owned decode keeps the established whole-column path.
 pub const GatedFilter = struct {
-    children: []const filter_ast.Filter,
+    conjuncts: []const Conjunct,
     /// Base columns in decode order: the others in column order, then the deferred by the first conjunct naming them.
     order: []usize,
     deferred: []bool,
@@ -321,17 +345,19 @@ pub const GatedFilter = struct {
         const c = filter.and_filter;
         if (c.in_set != null or c.null_member or c.children.len < 2) return null;
         if (target == .grouped and target.grouped.records != null) return null;
+        const conjuncts = try a.alloc(Conjunct, c.children.len);
+        for (conjuncts, c.children) |*k, child| k.* = .{ .predicate = child };
         const n = in.read.len;
         const deferred = try a.alloc(bool, n);
         @memset(deferred, false);
         const first = try a.alloc(usize, n);
         @memset(first, std.math.maxInt(usize));
         const marks = try a.alloc(bool, n);
-        for (c.children, 0..) |child, k| {
+        for (conjuncts, 0..) |k, i| {
             @memset(marks, false);
-            filter_ast.markColumns(child, marks);
+            k.reads(marks);
             for (marks, 0..) |m, ci| if (m and first[ci] == std.math.maxInt(usize)) {
-                first[ci] = k;
+                first[ci] = i;
             };
         }
         var any = false;
@@ -342,12 +368,12 @@ pub const GatedFilter = struct {
             if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) continue;
             if (@import("../filter/membership.zig").dictionaryCoversChunk(&cm)) continue;
             if (emptinessWant(filter, ci)) |want| if (want != .absent) continue;
-            const leaves_only = for (c.children) |child| {
+            const sole_only = for (conjuncts) |k| {
                 @memset(marks, false);
-                filter_ast.markColumns(child, marks);
-                if (marks[ci] and filter_ast.leafColumn(child) != ci) break false;
+                k.reads(marks);
+                if (marks[ci] and k.soleColumn() != ci) break false;
             } else true;
-            if (!leaves_only) continue;
+            if (!sole_only) continue;
             deferred[ci] = true;
             any = true;
         }
@@ -358,18 +384,54 @@ pub const GatedFilter = struct {
             order[len] = ci;
             len += 1;
         };
-        for (c.children, 0..) |_, k| for (0..n) |ci| if (deferred[ci] and first[ci] == k) {
+        for (conjuncts, 0..) |_, i| for (0..n) |ci| if (deferred[ci] and first[ci] == i) {
             order[len] = ci;
             len += 1;
         };
         std.debug.assert(len == n);
-        const done = try a.alloc(bool, c.children.len);
+        const done = try a.alloc(bool, conjuncts.len);
         @memset(done, false);
-        return .{ .children = c.children, .order = order, .deferred = deferred, .done = done };
+        return .{ .conjuncts = conjuncts, .order = order, .deferred = deferred, .done = done };
     }
 
-    /// Evaluate, in order, every conjunct not yet evaluated whose columns are all decoded; with `all`, the rest too,
-    /// failing as the whole filter would on a column that never decoded.
+    /// Mark in `out` every conjunct not yet narrowed whose columns `lookup` holds; with `all`, the rest too.
+    pub fn ready(g: *const GatedFilter, lookup: []const ?usize, all: bool, out: []bool, a: std.mem.Allocator) !void {
+        const marks = try a.alloc(bool, lookup.len);
+        defer a.free(marks);
+        for (g.conjuncts, g.done, out) |k, done, *o| {
+            o.* = false;
+            if (done) continue;
+            @memset(marks, false);
+            k.reads(marks);
+            o.* = all or for (marks, lookup) |m, pos| {
+                if (m and pos == null) break false;
+            } else true;
+        }
+    }
+
+    /// Narrow `sel` by the conjuncts `which` marks, in order. Predicates in a row narrow as one AND, so leaves on one
+    /// coded column still share a dictionary pass. Fails as the whole filter would on a column that never decoded.
+    pub fn narrow(
+        g: *const GatedFilter,
+        which: []const bool,
+        batch: *const filter_eval.Batch,
+        sel: *filter_selection.SelectionVector,
+        lookup: []const ?usize,
+        a: std.mem.Allocator,
+    ) !void {
+        var run: std.ArrayList(filter_ast.Filter) = .empty;
+        defer run.deinit(a);
+        for (g.conjuncts, which) |k, w| {
+            if (!w) continue;
+            switch (k) {
+                .predicate => |f| try run.append(a, f),
+            }
+        }
+        if (run.items.len == 1) return filter_eval.evaluate(run.items[0], batch, sel, lookup, a);
+        if (run.items.len > 1) return filter_eval.evaluate(.{ .and_filter = .{ .children = run.items } }, batch, sel, lookup, a);
+    }
+
+    /// Narrow by every conjunct not yet narrowed whose columns are all decoded; with `all`, the rest too.
     pub fn evaluate(
         g: *GatedFilter,
         batch: *const filter_eval.Batch,
@@ -378,18 +440,11 @@ pub const GatedFilter = struct {
         a: std.mem.Allocator,
         all: bool,
     ) !void {
-        const marks = try a.alloc(bool, lookup.len);
-        for (g.children, g.done) |child, *done| {
-            if (done.*) continue;
-            @memset(marks, false);
-            filter_ast.markColumns(child, marks);
-            const ready = for (marks, lookup) |m, pos| {
-                if (m and pos == null) break false;
-            } else true;
-            if (!ready and !all) continue;
-            try filter_eval.evaluate(child, batch, sel, lookup, a);
-            done.* = true;
-        }
+        const which = try a.alloc(bool, g.conjuncts.len);
+        defer a.free(which);
+        try g.ready(lookup, all, which, a);
+        try g.narrow(which, batch, sel, lookup, a);
+        for (g.done, which) |*d, w| d.* = d.* or w;
     }
 };
 

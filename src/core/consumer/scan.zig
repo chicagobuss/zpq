@@ -992,10 +992,8 @@ fn scanRGForAggImpl(
     var filtered = false;
     var survivors: usize = 0;
     var whole: []bool = &.{};
-    var gated = if (!staged and keep == null and stage_plan == null)
-        try GatedFilter.init(ra, in, target, dec.page_indexes)
-    else
-        null;
+    // A staged plan's base columns are the filter's, so they take the same gated order; only compacted rows don't.
+    var gated = if (keep == null) try GatedFilter.init(ra, in, target, dec.page_indexes) else null;
     if (gated) |*g| dec.filter_gated = g.deferred;
     const all_columns = try ra.alloc(usize, in.read.len);
     for (all_columns, 0..) |*c, i| c.* = i;
@@ -1467,8 +1465,12 @@ fn filterPhase(
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
     }
-    // Every slice evaluates the conjuncts this phase completes.
-    const before = if (gated) |g| try a.dupe(bool, g.done) else &.{};
+    // The conjuncts this phase completes, narrowed on every slice of it.
+    const which: []bool = if (gated) |g| blk: {
+        const w = try a.alloc(bool, g.conjuncts.len);
+        try g.ready(lookup, false, w, a);
+        break :blk w;
+    } else &.{};
     const slice = pool.valueArena();
     defer _ = slice.reset(.retain_capacity);
     // A memory granule over the filter's own columns; it never changes which rows survive. A streamed string
@@ -1485,12 +1487,15 @@ fn filterPhase(
         // Whole words evaluate in place, at the rows earlier phases kept. Bits past `n` are clear only at the end.
         const in_place = survivors.alignedWindow(done, n) catch null;
         var sel = in_place orelse try filter_selection.SelectionVector.init(sa, n);
-        if (gated) |g| {
-            @memcpy(g.done, before);
-            try g.evaluate(&batch, &sel, lookup, sa, false);
-        } else try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
+        if (gated) |g|
+            try g.narrow(which, &batch, &sel, lookup, sa)
+        else
+            try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
         if (in_place == null) for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
     }
+    if (gated) |g| for (g.done, which) |*d, w| {
+        d.* = d.* or w;
+    };
 }
 
 fn openSlicedPayload(

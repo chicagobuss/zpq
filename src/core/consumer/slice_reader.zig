@@ -883,6 +883,63 @@ test "row subgroups seek misaligned columns and share dictionary backing across 
     }
 }
 
+test "a seeked reader gates from its subgroup's first row: lead-in rows, a skipped first page, a mid-page end" {
+    const t = std.testing;
+    const subgroups = @import("../row_subgroups.zig");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try subgroups.testFixture(a);
+    const rg = &fixture.meta.row_groups.items[0];
+    const group = (try subgroups.Group.init(a, fixture.bytes, rg, &fixture.meta, &.{ true, true, true }, 8)).?;
+    const src: RGSrc = .{ .bytes = fixture.bytes, .byte_origin = 0 };
+    // Column `v` writes 141-row pages: row r is on page r / 141.
+    const ci = 2;
+    const page: usize = 141;
+    var whole = (try SliceReader.init(a, t.allocator, rg, &fixture.meta, src, ci, .{})).?;
+    defer whole.deinit();
+    const want = (try whole.next(a, 4096)).i64;
+    const present = struct {
+        fn at(w: anytype, row: usize) bool {
+            return if (w.def_levels) |d| d[row] == w.max_def else true;
+        }
+    }.at;
+    const Case = struct { lo: usize, hi: usize, keep: []const usize };
+    for ([_]Case{
+        // Starts 50 rows into its first page, which holds selected rows: the 50 lead-in rows read past ungated.
+        .{ .lo = page + 50, .hi = 3 * page, .keep = &.{ 0, 1, 90 } },
+        // The first page holds no selected row of the subgroup: it is skipped, though rows before the subgroup's
+        // start (the lead-in) would be selected were they counted from the page.
+        .{ .lo = page + 50, .hi = 4 * page, .keep = &.{ page - 50 + 3, 2 * page - 50 + 140 } },
+        // Ends mid-page, and starts on a page boundary (no lead-in).
+        .{ .lo = 2 * page, .hi = 3 * page + 20, .keep = &.{ 5, page + 10, page + 19 } },
+    }) |c| {
+        const n = c.hi - c.lo;
+        var gate = try @import("../filter/selection.zig").SelectionVector.init(a, n);
+        gate.clearAll();
+        for (c.keep) |k| gate.set(k, true);
+        var r = (try SliceReader.init(a, t.allocator, rg, &fixture.meta, src, ci, .{ .row_gate = &gate })).?;
+        defer r.deinit();
+        try r.seekSubgroup(a, .{ .group = &group, .rows = .{ .lo = c.lo, .hi = c.hi } });
+        const got = (try r.next(a, n)).i64;
+        try t.expectEqual(n, got.values.len);
+        for (0..n) |i| {
+            const row = c.lo + i;
+            const first = row / page * page;
+            const page_kept = for (c.keep) |k| {
+                if (c.lo + k >= first and c.lo + k < first + page) break true;
+            } else false;
+            if (!page_kept) {
+                // A page the gate selects nothing in is never read: its rows stand as nulls.
+                try t.expect(!present(got, i));
+            } else if (gate.isActive(i)) {
+                try t.expectEqual(present(want, row), present(got, i));
+                if (present(want, row)) try t.expectEqual(want.values[row], got.values[i]);
+            }
+        }
+    }
+}
+
 test "chunkDictionary gives a string chunk's dictionary only when every data page is coded by it" {
     const testing = std.testing;
     for ([_][]const u8{ "ci/fixtures/parquet/topn_gather_a.parquet", "ci/fixtures/parquet/topn_gather_b.parquet" }) |path| {

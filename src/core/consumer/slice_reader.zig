@@ -441,6 +441,7 @@ pub const SliceReader = struct {
     /// there are no definition levels to expand.
     pub fn pullStream(ctx: *anyopaque, out: []u32) anyerror!void {
         const self: *SliceReader = @ptrCast(@alignCast(ctx));
+        enterChunk(self.site.rg, self.site.column);
         if (out.len > self.stream_left) return error.ShortDecode;
         switch (self.raw.*) {
             inline .i32, .i64, .bytes => |*r| {

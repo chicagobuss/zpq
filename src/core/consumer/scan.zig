@@ -808,6 +808,7 @@ fn planDecode(
     gpa: std.mem.Allocator,
     plan_alloc: std.mem.Allocator,
     in: AggRowGroup,
+    stats: agg_plan.StatsUse,
     decode_options: DecodeOptions,
     target: AggTarget,
     ws: AggWorkspace,
@@ -824,6 +825,7 @@ fn planDecode(
         const kept = try scanRGSliced(
             gpa,
             in,
+            stats,
             decode_options,
             target,
             ws,
@@ -870,6 +872,7 @@ fn planDecode(
     const sliced = scanRGSlicedExact(
         gpa,
         in,
+        stats,
         decode_options,
         target,
         ws,
@@ -884,7 +887,7 @@ fn planDecode(
         error.ExactTilesAbandoned => blk: {
             ws.rg_arena.nextRowGroup();
             if (exact and !keep_dictionary and !stream and fits_share and admitWhole(ws, full)) return plan;
-            break :blk try scanRGSliced(gpa, in, decode_options, target, ws, b, handled_via_stats, full, stream_rows);
+            break :blk try scanRGSliced(gpa, in, stats, decode_options, target, ws, b, handled_via_stats, full, stream_rows);
         },
         else => return err,
     };
@@ -943,7 +946,7 @@ fn scanRGForAggImpl(
     const side = ws.charged orelse gpa;
     var plan_arena = std.heap.ArenaAllocator.init(side);
     defer plan_arena.deinit();
-    const plan = try planDecode(gpa, plan_arena.allocator(), in, decode_options, target, ws, handled_via_stats);
+    const plan = try planDecode(gpa, plan_arena.allocator(), in, stats, decode_options, target, ws, handled_via_stats);
     if (plan.kept) |kept| return kept;
     const staged = plan.staged;
     const stage_plan = plan.stage_plan;
@@ -1057,6 +1060,7 @@ fn scanRGForAggImpl(
             if (try scanRGSliced(
                 gpa,
                 in,
+                stats,
                 decode_options,
                 target,
                 ws,
@@ -1839,10 +1843,10 @@ test "dictionary rewrite grouping and scalar distinct read mixed pages with null
             .budget = &budget,
             .decode_batch_rows = window,
         };
-        const count = try scanRGSliced(a, input, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 8192, window);
+        const count = try scanRGSliced(a, input, .ignore, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 8192, window);
         try t.expectEqual(@as(?u64, 192), count);
         try t.expectEqual(@as(usize, 3), acc[0].distinct.count());
-        const next = try scanRGSliced(a, plain_input, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 4096, window);
+        const next = try scanRGSliced(a, plain_input, .ignore, .{ .encoded = encoded }, target, ws, &budget, &.{false}, 4096, window);
         try t.expectEqual(@as(?u64, 64), next);
         try t.expectEqual(@as(usize, 4), acc[0].distinct.count());
         try t.expectEqual(@as(usize, if (encoded) 2 else 0), test_scalar_distinct_inserts);
@@ -1892,11 +1896,11 @@ test "dictionary rewrite grouping and scalar distinct read mixed pages with null
                 .budget = &budget,
                 .decode_batch_rows = window,
             };
-            const kept = try scanRGSliced(a, input, .{ .encoded = encoded }, target, ws, &budget, &handled, 8192, window);
+            const kept = try scanRGSliced(a, input, .ignore, .{ .encoded = encoded }, target, ws, &budget, &handled, 8192, window);
             try t.expectEqual(@as(?u64, 192), kept);
             var shifted = target;
             shifted.grouped.pos_base = 192;
-            const next = try scanRGSliced(a, plain_input, .{ .encoded = encoded }, shifted, ws, &budget, &handled, 4096, window);
+            const next = try scanRGSliced(a, plain_input, .ignore, .{ .encoded = encoded }, shifted, ws, &budget, &handled, 4096, window);
             try t.expectEqual(@as(?u64, 64), next);
         }
         try t.expectEqual(@as(usize, 2), tables[0].groupCount());
@@ -1922,6 +1926,7 @@ test "dictionary rewrite grouping and scalar distinct read mixed pages with null
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
+    stats: agg_plan.StatsUse,
     decode_options: DecodeOptions,
     target: AggTarget,
     ws: AggWorkspace,
@@ -1930,7 +1935,7 @@ fn scanRGSliced(
     full: usize,
     stream_rows: usize,
 ) !?u64 {
-    return scanRGSlicedExact(gpa, in, decode_options, target, ws, budget, handled, full, stream_rows, false);
+    return scanRGSlicedExact(gpa, in, stats, decode_options, target, ws, budget, handled, full, stream_rows, false);
 }
 
 /// `scanRGSliced`, folding exact DECIMAL aggregates a tile at a time when `exact_ok` and the target admits it
@@ -1938,6 +1943,7 @@ fn scanRGSliced(
 fn scanRGSlicedExact(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
+    stats: agg_plan.StatsUse,
     decode_options: DecodeOptions,
     target: AggTarget,
     ws: AggWorkspace,
@@ -1986,10 +1992,10 @@ fn scanRGSlicedExact(
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
     // A row subgroup's survivors count from its first row, and every reader seeks there (`gate_lead`).
     const found = try payloadColumns(pages.allocator(), in, target);
-    // So are the filter columns the whole decode defers; no page index is read here.
-    const no_index = try pages.allocator().alloc(?pruning.PageIndex, in.read.len);
-    @memset(no_index, null);
-    var gated = try GatedFilter.init(pages.allocator(), in, target, no_index);
+    // So are the filter columns the whole decode defers. The page indexes it loads decide which those are: a
+    // page-indexed column is pruned by its own statistics there, not deferred, so it is not deferred here either.
+    const page_indexes = try loadPageIndexes(pages.allocator(), in, stats);
+    var gated = try GatedFilter.init(pages.allocator(), in, target, page_indexes);
     // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.
     const payload: ?[]const bool = found orelse if (gated != null) blk: {
         const none = try pages.allocator().alloc(bool, in.read.len);

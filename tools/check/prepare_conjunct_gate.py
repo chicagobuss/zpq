@@ -4,8 +4,9 @@
 survivors, and never opens the page. Shipdate on that span is 1993-06-01. The page's definition-level length is
 replaced, as in prepare_q6gate.py. Every decode path, sliced or whole, must return the kept rows.
 
-Arguments: the plain file, then the same rows (five times as many) with an offset index and a five-value string
-key, so four or more workers split its one row group into row subgroups for a hash GROUP BY.
+Arguments: the plain file; then the same rows (five times as many) with an offset index and a five-value string
+key, so four or more workers split its one row group into row subgroups for a hash GROUP BY; then the plain file's
+rows with statistics and a column and offset index, whose page-indexed columns every decode path must treat alike.
 """
 import datetime
 import decimal
@@ -76,7 +77,7 @@ def pages(data, meta, rg, ci):
     return out
 
 
-def write(out, indexed):
+def write(out, indexed, stats=False):
     # The indexed file is large enough, and grouped finely enough, for four workers to split its one row group.
     n = 1_000_000 if indexed else 200_000
     D = decimal.Decimal
@@ -111,8 +112,8 @@ def write(out, indexed):
         data_page_size=64 * 1024,
         data_page_version="1.0",
         store_decimal_as_integer=True,
-        write_statistics=False,
-        write_page_index=indexed,
+        write_statistics=stats,
+        write_page_index=indexed or stats,
     )
     orig = out.read_bytes()
     meta = pq.ParquetFile(out).metadata
@@ -124,8 +125,8 @@ def write(out, indexed):
 
 
 def main():
-    for out, indexed in zip(sys.argv[1:], (False, True)):
-        write(pathlib.Path(out), indexed)
+    for out, (indexed, stats) in zip(sys.argv[1:], ((False, False), (True, False), (False, True))):
+        write(pathlib.Path(out), indexed, stats)
 
 
 if __name__ == "__main__":

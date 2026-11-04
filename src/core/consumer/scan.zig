@@ -1838,8 +1838,8 @@ test "dictionary rewrite grouping and scalar distinct read mixed pages with null
 }
 
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
-/// At the end of the group, retained scratch is at most one eighth of the ledger it is charged to, divided among the
-/// workers that share it. A group that still does not fit is refused.
+/// At the end of the group, retained scratch is at most one eighth of the ledger it is charged to. A group that
+/// still does not fit is refused.
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -1880,12 +1880,8 @@ fn scanRGSlicedExact(
     var distinct_seen: ScalarDistinctSeen = .{};
     defer distinct_seen.deinit(seen_alloc);
     const pool = try poolOn(&ws.scratch.slice, side);
-    // One eighth of the ledger this pool draws from, shared by the workers that draw from it, so every worker's
-    // carry together stays within the eighth. The next group can use the other seven eighths.
-    const carry = if (ws.ledger) |l|
-        core_memory.retainedCarry(l.limit) / @max(1, ws.scan_workers)
-    else
-        core_memory.retainedCarry(decode_options.expand_limit);
+    // One eighth of the ledger this pool draws from. The next group can use the other seven eighths.
+    const carry = core_memory.retainedCarry(if (ws.ledger) |l| l.limit else decode_options.expand_limit);
     defer pool.trimAbove(carry);
     const pages = pool.rowGroupArena();
     var readers: std.ArrayList(SliceReader) = .empty;

@@ -535,6 +535,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
         /// `DecodeOptions.row_gate`, kept for a flat column, and the rows its data pages so far hold.
         gate: ?*const selection.SelectionVector = null,
         gate_row: usize = 0,
+        /// Rows a seeked reader passes before the gate's first: a row subgroup starts inside its first page, and the
+        /// gate counts from the subgroup. Those rows are another range's, so the gate never selects them.
+        gate_lead: usize = 0,
 
         pub fn init(
             chunk_bytes: []const u8,
@@ -1461,7 +1464,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
             const gate = self.gate orelse return false;
             if (self.active != .plain or self.options.int_range != null) return false;
             if (self.current_page_num_values == 0 or self.gate_row < self.current_page_num_values) return false;
-            const row0 = self.gate_row - self.current_page_num_values + self.current_def_pos;
+            const at = self.gate_row - self.current_page_num_values + self.current_def_pos;
+            if (at < self.gate_lead) return false;
+            const row0 = at - self.gate_lead;
             if (row0 + dest.len > gate.len) return false;
             var partial = false;
             for (0..dest.len) |i| if (!gate.isActive(row0 + i)) {
@@ -1657,8 +1662,8 @@ pub fn ColumnChunkReader(comptime T: type) type {
                 {
                     // Its header is read and checked like any other; only its body goes unread.
                     const rows = try flatPageRows(p.header);
-                    const lo = @min(self.gate_row, gate.len);
-                    if (!gate.anyInRange(lo, @min(self.gate_row +| rows, gate.len))) {
+                    const lo = @min(self.gate_row -| self.gate_lead, gate.len);
+                    if (!gate.anyInRange(lo, @min((self.gate_row +| rows) -| self.gate_lead, gate.len))) {
                         self.pages.pass(p);
                         self.pages.ordinal +|= 1;
                         if (self.levels.max_def == 0)

@@ -201,6 +201,7 @@ pub const SliceReader = struct {
                 const T = @TypeOf(r.*).Value;
                 r.dictionary = if (col.dictionary) |d| d.get(T) else null;
                 r.value_budget = self.left;
+                r.gate_lead = subgroup.rows.lo - first;
                 r.pages.ordinal = @intCast(pi + @intFromBool(col.dictionary != null));
                 // A shared dictionary's backing never becomes page-local or scratch-local storage.
                 if (T == []const u8) {

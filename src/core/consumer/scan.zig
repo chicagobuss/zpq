@@ -1462,6 +1462,7 @@ fn filterPhase(
         var r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
         if (coded) r.exact_codes = true;
+        if (in.subgroup) |subgroup| try r.seekSubgroup(a, subgroup);
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
     }
@@ -1983,11 +1984,12 @@ fn scanRGSlicedExact(
         if (exact == null) return error.ExactTilesAbandoned;
     }
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
-    const found = if (in.subgroup != null) null else try payloadColumns(pages.allocator(), in, target);
+    // A row subgroup's survivors count from its first row, and every reader seeks there (`gate_lead`).
+    const found = try payloadColumns(pages.allocator(), in, target);
     // So are the filter columns the whole decode defers; no page index is read here.
     const no_index = try pages.allocator().alloc(?pruning.PageIndex, in.read.len);
     @memset(no_index, null);
-    var gated = if (in.subgroup == null) try GatedFilter.init(pages.allocator(), in, target, no_index) else null;
+    var gated = try GatedFilter.init(pages.allocator(), in, target, no_index);
     // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.
     const payload: ?[]const bool = found orelse if (gated != null) blk: {
         const none = try pages.allocator().alloc(bool, in.read.len);

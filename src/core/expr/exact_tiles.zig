@@ -920,10 +920,18 @@ fn maxAbs(comptime T: type, v: []const T, col: Column, sel: *const Sel, sparse: 
     return m;
 }
 
+fn columnHasNulls(col: Column) bool {
+    return switch (col) {
+        inline else => |c| c.has_nulls,
+    };
+}
+
 fn hasNullRows(col: Column) bool {
     const ni = col.nullInfo();
     const dl = ni.def_levels orelse return false;
-    // No early exit, so the scan vectorizes; a tile's levels are in L2.
+    // A slice the decoder marked empty of nulls is empty of them: the levels are present only because the
+    // column is optional. A marked slice is checked, with no early exit so the check vectorizes.
+    if (!columnHasNulls(col)) return false;
     var any: bool = false;
     for (dl) |d| any = any or d < ni.max_def;
     return any;
@@ -1287,6 +1295,51 @@ test "a tile whose sums leave i64 folds wide and exactly, cancellation included;
     try testing.expectEqual(ExactTiles.Outcome.folded, try z.fold(a, a, &mixed, &lookup, &s64, 0, null));
     try testing.expectEqual(@as(u64, 1), counters.proved.load(.monotonic));
     try testing.expectEqual(@as(i192, 3 * (63 * 64 / 2 - 5)), z.sums[0].get());
+}
+
+test "a slice marked free of nulls is summed whole, and a marked null is still dropped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n: usize = 64;
+    const vals = try a.alloc(i64, n);
+    const present = try a.alloc(u32, n);
+    const mixed = try a.alloc(u32, n);
+    for (vals, present, mixed, 0..) |*v, *p, *m, i| {
+        v.* = @intCast(i + 1);
+        p.* = 1;
+        m.* = 1;
+    }
+    mixed[4] = 0;
+    const marked: Column = .{ .i64 = .{
+        .values = vals,
+        .unscaled = .{ .i64 = vals },
+        .def_levels = present,
+        .max_def = 1,
+        .has_nulls = false,
+    } };
+    const with_null: Column = .{ .i64 = .{
+        .values = vals,
+        .unscaled = .{ .i64 = vals },
+        .def_levels = mixed,
+        .max_def = 1,
+        .has_nulls = true,
+    } };
+    const d182: expr_ast.Dec = .{ .precision = 18, .scale = 2 };
+    const calls = [_]AggCall{
+        .{ .func = .sum, .arg = (try Fx.col(a, 0, d182)).*, .result = .dec, .where = null, .alias = "a" },
+        .{ .func = .sum, .arg = (try Fx.col(a, 1, d182)).*, .result = .dec, .where = null, .alias = "b" },
+    };
+    const cols = [_]Column{ marked, with_null };
+    const lookup = [_]?usize{ 0, 1 };
+    const sel = try Sel.init(a, n);
+    var x = (try ExactTiles.init(a, &calls, &.{}, lookup.len)).?;
+    try testing.expectEqual(ExactTiles.Outcome.folded, try x.fold(a, a, &cols, &lookup, &sel, 0, null));
+    // 1+…+64, and the same without 5.
+    try testing.expectEqual(@as(i192, 64 * 65 / 2), x.sums[0].get());
+    try testing.expectEqual(@as(u64, n), x.sums[0].n);
+    try testing.expectEqual(@as(i192, 64 * 65 / 2 - 5), x.sums[1].get());
+    try testing.expectEqual(@as(u64, n - 1), x.sums[1].n);
 }
 
 test "wide tiles carry a sum past i128 and back: 192-bit partials, the established fold and the exact answer agree" {

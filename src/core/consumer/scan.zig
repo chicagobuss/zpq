@@ -1399,34 +1399,67 @@ fn filterSurvivors(
     stream_rows: usize,
     /// Read dictionary-encoded fixed-width filter columns as codes, as a whole coded chunk is filtered.
     codes: bool,
+    gated: ?*GatedFilter,
 ) !?filter_selection.SelectionVector {
     const pool = try poolOn(&ws.scratch.slice, side);
-    var n_readers: usize = 0;
-    for (in.read, payload, 0..) |needed, late, ci| {
-        if (!needed or late or ci >= in.rg.columns.items.len) continue;
-        n_readers += 1;
-    }
-    pool.rewind();
-    try pool.reserve(n_readers);
     const words = try pool.survivorWords(num_rows);
     var survivors = filter_selection.SelectionVector.borrowed(words, num_rows);
-    var readers: std.ArrayList(SliceReader) = .empty;
-    defer for (readers.items) |*r| r.deinit();
     const lookup = try a.alloc(?usize, in.meta.schema.items.len);
-    @memset(lookup, null);
+    // The whole decode's order (`GatedFilter`): every other filter column first, then each deferred one gated by the
+    // survivors of the conjuncts before it, so a page those conjuncts rejected is not read here either.
+    var first: std.ArrayList(usize) = .empty;
     for (in.read, payload, 0..) |needed, late, ci| {
         if (!needed or late or ci >= in.rg.columns.items.len) continue;
+        if (gated) |g| if (g.deferred[ci]) continue;
+        try first.append(a, ci);
+    }
+    if (try filterPhase(a, side, in, decode_options, first.items, &survivors, false, lookup, ws, stream_rows, codes, gated) == null)
+        return null;
+    if (gated) |g| for (g.order) |ci| if (g.deferred[ci]) {
+        if (try filterPhase(a, side, in, decode_options, &.{ci}, &survivors, true, lookup, ws, stream_rows, false, g) == null)
+            return null;
+    };
+    return survivors;
+}
+
+/// Read `columns` a slice at a time and clear from `survivors` the rows the conjuncts they complete reject (the
+/// whole filter, without a gated plan). `gate`: read them at `survivors`, which earlier phases have finished.
+fn filterPhase(
+    a: std.mem.Allocator,
+    side: std.mem.Allocator,
+    in: AggRowGroup,
+    decode_options: DecodeOptions,
+    columns: []const usize,
+    survivors: *filter_selection.SelectionVector,
+    gate: bool,
+    lookup: []?usize,
+    ws: AggWorkspace,
+    stream_rows: usize,
+    codes: bool,
+    gated: ?*GatedFilter,
+) !?void {
+    const num_rows = survivors.len;
+    const pool = try poolOn(&ws.scratch.slice, side);
+    pool.rewind();
+    try pool.reserve(columns.len);
+    @memset(lookup, null);
+    var readers: std.ArrayList(SliceReader) = .empty;
+    defer for (readers.items) |*r| r.deinit();
+    for (columns) |ci| {
         const cm = in.rg.columns.items[ci].meta_data;
         const coded = codes and cm != null and cm.?.dictionary_page_offset != null and
             (cm.?.type == .INT32 or cm.?.type == .INT64);
         var options = decode_options;
         if (coded) options.any_dictionary = true;
+        if (gate) options.row_gate = survivors;
         var r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
         if (coded) r.exact_codes = true;
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
     }
+    // Every slice evaluates the conjuncts this phase completes.
+    const before = if (gated) |g| try a.dupe(bool, g.done) else &.{};
     const slice = pool.valueArena();
     defer _ = slice.reset(.retain_capacity);
     // A memory granule over the filter's own columns; it never changes which rows survive. A streamed string
@@ -1440,14 +1473,15 @@ fn filterSurvivors(
         const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
         for (readers.items, cols) |*r, *c| c.* = try r.next(sa, n);
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = n, .expr_batch_rows = ws.expr_batch_rows };
-        var sel = try filter_selection.SelectionVector.init(sa, n);
-        try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
-        if (done % 64 == 0 and (n % 64 == 0 or done + n == num_rows)) {
-            // Whole words: bits past `n` are clear in `sel` only at the row group's end, past `num_rows`.
-            for (survivors.mask[done / 64 ..][0..sel.mask.len], sel.mask) |*dst, keep| dst.* &= keep;
-        } else for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
+        // Whole words evaluate in place, at the rows earlier phases kept. Bits past `n` are clear only at the end.
+        const in_place = survivors.alignedWindow(done, n) catch null;
+        var sel = in_place orelse try filter_selection.SelectionVector.init(sa, n);
+        if (gated) |g| {
+            @memcpy(g.done, before);
+            try g.evaluate(&batch, &sel, lookup, sa, false);
+        } else try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
+        if (in_place == null) for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
     }
-    return survivors;
 }
 
 fn openSlicedPayload(
@@ -1462,6 +1496,8 @@ fn openSlicedPayload(
     levels_only: []const bool,
     payload: ?[]const bool,
     survivors: ?*filter_selection.SelectionVector,
+    /// Filter columns the first pass read gated (`GatedFilter`): an aggregate reading one is gated too.
+    deferred: ?[]const bool,
     ws: AggWorkspace,
     exact: ?*const exact_tiles.ExactTiles,
 ) !?void {
@@ -1485,7 +1521,9 @@ fn openSlicedPayload(
         options.any_dictionary = rewriteInput(target) == ci or (target.codedKey(ci) and !streamByteArray(in, target, ci)) or
             (decode_options.encoded and scalarByteDistinct(in, target) == ci);
         options.decimal_exact_only = target.exactInputs();
-        if (payload) |p| if (p[ci]) if (survivors) |sv| {
+        const late = if (payload) |p| p[ci] else false;
+        const held = if (deferred) |d| d[ci] else false;
+        if (late or held) if (survivors) |sv| {
             options.row_gate = sv;
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
@@ -1924,6 +1962,10 @@ fn scanRGSlicedExact(
     }
     // Payload columns are gated by the filter's survivors over the whole row group, as when it decodes whole.
     const payload = if (in.subgroup != null) null else try payloadColumns(pages.allocator(), in, target);
+    // So are the filter columns the whole decode defers; no page index is read here.
+    const no_index = try pages.allocator().alloc(?pruning.PageIndex, in.read.len);
+    @memset(no_index, null);
+    var gated = if (payload != null) try GatedFilter.init(pages.allocator(), in, target, no_index) else null;
     var survivors: filter_selection.SelectionVector = undefined;
     if (payload) |p| survivors = (try filterSurvivors(
         pages.allocator(),
@@ -1936,6 +1978,7 @@ fn scanRGSlicedExact(
         // The tiles' filter columns, read as codes, stay in cache a tile at a time as their payload does.
         if (exact != null and ws.decode_batch_rows != 0) @min(stream_rows, ws.decode_batch_rows) else stream_rows,
         exact != null,
+        if (gated) |*g| g else null,
     )) orelse
         return null;
     // The filter pass has released its readers. The same slots decode the payload.
@@ -1951,6 +1994,7 @@ fn scanRGSlicedExact(
         levels_only,
         payload,
         if (payload != null) &survivors else null,
+        if (gated) |g| g.deferred else null,
         ws,
         if (exact) |*x| x else null,
     ) orelse return null;

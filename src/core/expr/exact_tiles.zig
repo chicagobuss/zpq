@@ -931,7 +931,11 @@ fn hasNullRows(col: Column) bool {
     const dl = ni.def_levels orelse return false;
     // A slice the decoder marked empty of nulls is empty of them: the levels are present only because the
     // column is optional. A marked slice is checked, with no early exit so the check vectorizes.
-    if (!columnHasNulls(col)) return false;
+    if (!columnHasNulls(col)) {
+        // Safe builds hold the decoder to its mark: one that forgot to set it would sum null slots as values.
+        if (std.debug.runtime_safety) for (dl) |d| std.debug.assert(d >= ni.max_def);
+        return false;
+    }
     var any: bool = false;
     for (dl) |d| any = any or d < ni.max_def;
     return any;

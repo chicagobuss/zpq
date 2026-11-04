@@ -861,9 +861,9 @@ fn planDecode(
     } else false;
     const whole = !keep_dictionary and !stream and !force_cache and fits_share and admitWhole(ws, full);
     if (whole) return plan;
-    // The region goes back only when it refused the row group. One sliced for cache, which it would have taken
-    // whole, keeps its pages for the next group instead of faulting them in again.
-    if (ws.region) |r| if (!fits_share) r.trim() else if (!admitWhole(ws, full)) dropRegion(ws);
+    // A sliced row group gives the region back: the slices draw beside it, so a region kept across sliced groups
+    // holds every worker's high water at once on top of them.
+    if (ws.region) |r| if (fits_share) dropRegion(ws) else r.trim();
     const sliced = scanRGSlicedExact(
         gpa,
         in,

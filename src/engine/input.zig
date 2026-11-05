@@ -3,6 +3,7 @@ const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
 const local_reader = @import("../io/local_reader.zig");
+const fastpath = @import("../core/writer/fastpath.zig");
 const s3 = @import("../io/s3.zig");
 const s3_window = @import("../io/s3_window.zig");
 const tls = @import("../io/tls.zig");
@@ -966,6 +967,8 @@ pub const LocalPlan = struct {
     total: u64,
     /// The most one row group reads: the reader holds a row group's planned bytes whole.
     largest: u64 = 0,
+    /// False when some byte a write would copy cannot be planned exactly: the query reads through the mapping.
+    exact: bool = true,
 
     pub fn coverage(self: LocalPlan) f64 {
         if (self.total == 0) return 0;
@@ -984,6 +987,7 @@ pub fn planLocalReads(
     var planned: u64 = 0;
     var total: u64 = 0;
     var largest: u64 = 0;
+    var exact = true;
     for (files, metas, opened.mmaps) |*file, *meta, m_opt| {
         const file_size: u64 = if (m_opt) |m| m.bytes.len else 0;
         total += file_size;
@@ -996,6 +1000,9 @@ pub fn planLocalReads(
             var rs: std.ArrayList(local_reader.Range) = .empty;
             var rg_bytes: u64 = 0;
             defer largest = @max(largest, rg_bytes);
+            // A write may copy this row group (`carry`): exactly the bytes the copy reads must be planned, since the
+            // reader's buffer holds zeros everywhere else.
+            const carry = plan.carriedFilters(rg, meta);
             for (cols, 0..) |needed, ci| {
                 if (!needed or ci >= rg.columns.items.len) continue;
                 const chunk = rg.columns.items[ci];
@@ -1012,17 +1019,31 @@ pub fn planLocalReads(
                     try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
                 };
             }
-            // A write that copies a row group keeps its chunks' Bloom filters, read from the input as an S3 fetch
-            // reads them (`appendRgFetchRanges`): unplanned, the reader's buffer holds zeros there and the filter
-            // would be dropped.
-            if (plan.carriedFilters(rg, meta)) |carry| for (carry, 0..) |on, ci| {
+            // The copy keeps its chunks' Bloom filters, read from the input (`fastpath.carriedFilter`), as an S3
+            // fetch reads them (`appendRgFetchRanges`). With a length, the copy reads and checks nothing outside
+            // [offset, offset + length). Without one (the field is optional), the extent is the header's: read here
+            // from the mapping, by the copy's own acceptance. A filter the mapping refuses has no extent to plan,
+            // and a parse over zeros past it could accept what the mapping refuses: then the file is mapped.
+            const mapped: []const u8 = if (m_opt) |m| m.bytes else &.{};
+            if (carry) |on_cols| for (on_cols, 0..) |on, ci| {
                 if (!on or ci >= rg.columns.items.len) continue;
-                const cm = rg.columns.items[ci].meta_data orelse continue;
+                const chunk = &rg.columns.items[ci];
+                const cm = chunk.meta_data orelse continue;
                 const off = cm.bloom_filter_offset orelse continue;
-                const len = cm.bloom_filter_length orelse continue;
-                if (off < 4 or len <= 0) continue;
+                if (off < 4) continue;
                 const start: u64 = @intCast(off);
-                const end = start + @as(u64, @intCast(len));
+                const end: u64 = if (cm.bloom_filter_length) |len| blk: {
+                    if (len <= 0) continue;
+                    break :blk start + @as(u64, @intCast(len));
+                } else blk: {
+                    if (start >= file_size) continue;
+                    const filter = fastpath.carriedFilter(mapped, chunk);
+                    if (filter.len == 0) {
+                        if (!chunk.encrypted) exact = false;
+                        continue;
+                    }
+                    break :blk start + filter.len;
+                };
                 if (end > file_size) continue;
                 try rs.append(arena, .{ .start = start, .end = end });
                 planned +|= end - start;
@@ -1032,7 +1053,7 @@ pub fn planLocalReads(
         }
         file.* = per_rg;
     }
-    return .{ .files = files, .planned = planned, .total = total, .largest = largest };
+    return .{ .files = files, .planned = planned, .total = total, .largest = largest, .exact = exact };
 }
 
 /// Whether a query over `opened` chooses how its local inputs are read (`choose`), and whether that choice needs the
@@ -1085,6 +1106,10 @@ pub fn chooseLocalIo(
     else
         policy.choose(resident, coverage);
     choice = choice.withinReader(fits_reader);
+    // A plan that cannot cover every byte a write copies reads through the mapping, whatever was asked for.
+    if (local_plan) |lp| if (!lp.exact) {
+        choice = .{ .mode = .mmap, .reason = .mapping };
+    };
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         policy.profile,
         choice.mode,

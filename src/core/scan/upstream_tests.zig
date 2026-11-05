@@ -252,6 +252,40 @@ test "count-ranked DISTINCT advises a mapped input's dictionaries before its fir
     try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
 }
 
+test "count-ranked DISTINCT takes sets where its retained groups cannot spread over the workers" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try rankedFixture(a);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-route", .bytes = fixture.bytes }},
+        .metas = &.{fixture.meta},
+        .aggregate = "sum(y) AS a,count(*) AS c,count(DISTINCT x) AS d",
+        .group_by = "k",
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 5 },
+        .min_bytes_per_worker = 1,
+        .max_memory = 128 << 20,
+        .integer_records_min_rows = 1,
+        .count_ranked_distinct = .off,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    args.count_ranked_distinct = .on;
+    // Five retained groups of nearly equal size: one worker, or four, each get a group's share and keep the pass's own
+    // route; sixteen do not, and the pass takes sets.
+    for ([_]usize{ 1, 4, 16 }) |j| {
+        args.parallelism = j;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(got.count_ranked_distinct);
+        if (j == 16) try testing.expect(!got.distinct_pairs);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    }
+}
+
 test "count-ranked DISTINCT returns an empty filtered result without rebuilding a false predicate" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

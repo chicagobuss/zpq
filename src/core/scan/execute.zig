@@ -2450,6 +2450,20 @@ fn countRankedAttempt(
     second.bound_aggregate = &distinct_bound;
     second.result_order = .{};
     second.ledger = &second_phase.budget;
+    // The distinct pass reads only the retained groups, and the first pass counted their rows exactly: pairs keep
+    // their admission where those groups spread over the workers, sets take the pass where they would not.
+    if (second.distinct_pairs == .auto) counted: {
+        const counts = try a.alloc(u64, retained.len);
+        for (retained, counts) |row, *count| count.* = switch (row[rank[0].column]) {
+            .i => |v| std.math.cast(u64, v) orelse break :counted,
+            else => break :counted,
+        };
+        // The pass's workers: those asked for, at most one per row group.
+        var row_groups: usize = 0;
+        for (metas) |m| row_groups += m.row_groups.items.len;
+        const requested = if (args.parallelism == 0) std.Thread.getCpuCount() catch 1 else args.parallelism;
+        if (!pairs_policy.retainedPairsPay(counts, @max(1, @min(requested, row_groups)))) second.distinct_pairs = .off;
+    }
     var reduced: ?MultiAggResult = null;
     defer if (reduced) |*r| r.deinit(second_phase.charged.allocator());
     const distinct_rows = if (retained.len == 0) &.{} else blk: {
@@ -2499,6 +2513,7 @@ fn countRankedAttempt(
     result.state = .{ .accumulators = &.{}, .agg_calls = calls, .group_col_types = types };
     result.count_ranked_distinct = true;
     result.dense_aggregate = false;
+    result.distinct_pairs = if (reduced) |r| r.distinct_pairs else false;
     if (reduced) |r| result.timings.decode_wall_ns +|= r.timings.decode_wall_ns;
     if (args.ledger) |parent| {
         result.output.arena_ledger = parent;

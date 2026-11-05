@@ -48,3 +48,35 @@ pub fn pairsPayRuntime(table: *const expr_agg.GroupTable, agg_idx: usize, rows: 
     return if (10 * values >= 9 * rows) .pay else .never;
 }
 
+
+/// Whether pairs pay for a count(DISTINCT) over the groups a count cut retained, each group's rows counted exactly
+/// by the cut's first pass. Pairs pay by spreading their work over many groups: the sorted pairs partition by group,
+/// and the pair owner's second stage reduces its pairs by group, so a group with more than a worker's share of the
+/// rows, or fewer groups than workers, leaves that one group's pairs as a serial tail. Per-group sets merge one
+/// group's values across workers in parallel (`parallel_distinct`), so they win there.
+pub fn retainedPairsPay(counts: []const u64, workers: usize) bool {
+    var total: u64 = 0;
+    var largest: u64 = 0;
+    for (counts) |c| {
+        total +|= c;
+        largest = @max(largest, c);
+    }
+    return counts.len != 0 and counts.len >= workers and largest *| workers <= total;
+}
+
+test "retained groups keep pairs only where every worker has a group's share to merge" {
+    const testing = @import("std").testing;
+    // Q9: ten groups, one holding 43% of their rows.
+    const q9 = [_]u64{ 18_295_832, 6_687_587, 4_261_812, 3_320_229, 1_843_518, 1_792_369, 1_755_192, 1_542_717, 1_516_690, 1_435_578 };
+    try testing.expect(!retainedPairsPay(&q9, 16));
+    try testing.expect(!retainedPairsPay(&q9, 4));
+    try testing.expect(!retainedPairsPay(&q9, 1 << 10));
+    var even: [64]u64 = @splat(1000);
+    try testing.expect(retainedPairsPay(&even, 16));
+    try testing.expect(retainedPairsPay(&even, 64));
+    try testing.expect(!retainedPairsPay(&even, 65));
+    even[0] = 64_000;
+    try testing.expect(!retainedPairsPay(&even, 16));
+    try testing.expect(retainedPairsPay(&q9, 1));
+    try testing.expect(!retainedPairsPay(&.{}, 1));
+}

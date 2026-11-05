@@ -52,6 +52,17 @@
   can, and a page none of whose rows survive is never opened on any path. Dictionary codes now stream straight into
   exact DECIMAL sums, and a sliced row group keeps its scratch memory for the next one. On a Ryzen 9 9950X, TPC-H Q1
   and Q6 on a 60 M-row DECIMAL lineitem are 1.1–1.2× faster at the same peak memory, also under `--max-memory`.
+- **Writing selected columns of a file that isn't cached is faster.** A write that copies column chunks unchanged used
+  to read an uncached input one page fault at a time on one thread. Writes now plan their reads the way queries do:
+  an uncached input is read in parallel, and a cached one stays memory-mapped. The copy also builds its Bloom
+  filters on worker threads. Output bytes don't change. On a Ryzen 9 9950X, copying three columns of a 175 MB file
+  went from 68 to 17 ms uncached and from 32 to 12 ms cached; other writes are flat to 15% faster uncached.
+- **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
+  each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
+  (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when the groups
+  the cut keeps are too few or too lopsided to spread across the workers, and it reads ahead the dictionaries it
+  plans from. On a Ryzen 9 9950X, ClickBench Q08 is 25–36% faster and Q09 8–23% faster (flat when cached at the
+  default thread count), both at lower peak memory; other `COUNT(DISTINCT)` queries are unchanged.
 
 ## 0.5.1 (2026-10-31)
 

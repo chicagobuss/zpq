@@ -48,12 +48,13 @@ pub fn pairsPayRuntime(table: *const expr_agg.GroupTable, agg_idx: usize, rows: 
     return if (10 * values >= 9 * rows) .pay else .never;
 }
 
-
 /// Whether pairs pay for a count(DISTINCT) over the groups a count cut retained, each group's rows counted exactly
-/// by the cut's first pass. Pairs pay by spreading their work over many groups: the sorted pairs partition by group,
-/// and the pair owner's second stage reduces its pairs by group, so a group with more than a worker's share of the
-/// rows, or fewer groups than workers, leaves that one group's pairs as a serial tail. Per-group sets merge one
-/// group's values across workers in parallel (`parallel_distinct`), so they win there.
+/// by the cut's first pass, on `workers`, the workers the pass plans. Pairs pay by spreading their work over many
+/// groups: the sorted pairs partition by group, and the pair owner's second stage reduces its pairs by group, so a
+/// group holding more than a worker's share of the retained rows is a serial tail of its own. Per-group sets merge
+/// one group's values across workers in parallel (`parallel_distinct`), so they win there. The test is on the
+/// groups' distribution alone; fewer groups than workers can never pass it, since their largest then holds more
+/// than a worker's share.
 pub fn retainedPairsPay(counts: []const u64, workers: usize) bool {
     var total: u64 = 0;
     var largest: u64 = 0;
@@ -61,7 +62,7 @@ pub fn retainedPairsPay(counts: []const u64, workers: usize) bool {
         total +|= c;
         largest = @max(largest, c);
     }
-    return counts.len != 0 and counts.len >= workers and largest *| workers <= total;
+    return total != 0 and largest *| workers <= total;
 }
 
 test "retained groups keep pairs only where every worker has a group's share to merge" {

@@ -2412,7 +2412,8 @@ fn countRankedAttempt(
     first.result_order = .{ .keys = &rank, .limit = cut.k };
     // Explaining the first pass already walks those dictionaries, before its scan would advise them: advise them here.
     if (first.dict_probe) |dp| {
-        const ranges = try ndv.probeRanges(a, metas, keys, first.max_memory, true, first.ndv_union, true, null);
+        const want = first.dense and agg_dense.shapeOk(ordinary, keys);
+        const ranges = try ndv.probeRanges(a, metas, keys, first.max_memory, true, first.ndv_union, want, null);
         for (ranges) |r| try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
     }
     const explanation = try explainAggregate(phase.charged.allocator(), a, first);
@@ -2455,19 +2456,18 @@ fn countRankedAttempt(
     second.bound_aggregate = &distinct_bound;
     second.result_order = .{};
     second.ledger = &second_phase.budget;
-    // The distinct pass reads only the retained groups, and the first pass counted their rows exactly: pairs keep
-    // their admission where those groups spread over the workers, sets take the pass where they would not.
-    if (second.distinct_pairs == .auto) counted: {
+    // The distinct pass reads only the retained groups, and the first pass counted their rows exactly. A grouped
+    // bitmap the pass admits keeps its route: no pair route or set is cheaper. Otherwise pairs keep their admission
+    // where those groups spread over the pass's workers, and sets take the pass where they would not.
+    if (second.distinct_pairs == .auto and retained.len != 0) counted: {
         const counts = try a.alloc(u64, retained.len);
         for (retained, counts) |row, *count| count.* = switch (row[rank[0].column]) {
             .i => |v| std.math.cast(u64, v) orelse break :counted,
             else => break :counted,
         };
-        // The pass's workers: those asked for, at most one per row group.
-        var row_groups: usize = 0;
-        for (metas) |m| row_groups += m.row_groups.items.len;
-        const requested = if (args.parallelism == 0) std.Thread.getCpuCount() catch 1 else args.parallelism;
-        if (!pairs_policy.retainedPairsPay(counts, @max(1, @min(requested, row_groups)))) second.distinct_pairs = .off;
+        const route = try explainAggregate(second_phase.charged.allocator(), second_phase.arena.allocator(), second);
+        if (route.record_path) |path| if (path.layout == .grouped_distinct_bitmap) break :counted;
+        if (!pairs_policy.retainedPairsPay(counts, route.workers)) second.distinct_pairs = .off;
     }
     var reduced: ?MultiAggResult = null;
     defer if (reduced) |*r| r.deinit(second_phase.charged.allocator());
@@ -2519,6 +2519,7 @@ fn countRankedAttempt(
     result.count_ranked_distinct = true;
     result.dense_aggregate = false;
     result.distinct_pairs = if (reduced) |r| r.distinct_pairs else false;
+    result.grouped_distinct_bitmap = if (reduced) |r| r.grouped_distinct_bitmap else false;
     if (reduced) |r| result.timings.decode_wall_ns +|= r.timings.decode_wall_ns;
     if (args.ledger) |parent| {
         result.output.arena_ledger = parent;

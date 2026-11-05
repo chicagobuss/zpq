@@ -286,6 +286,98 @@ test "count-ranked DISTINCT takes sets where its retained groups cannot spread o
     }
 }
 
+test "count-ranked DISTINCT keeps a grouped bitmap its distinct pass admits where sets would replace pairs" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // One group holds a quarter of the rows; values are dense in [0, 1000): the bitmap's shape, and the rule's.
+    const k = try a.alloc(i32, 4096);
+    const x = try a.alloc(i64, k.len);
+    const y = try a.alloc(i32, k.len);
+    for (k, x, y, 0..) |*key, *value, *payload, i| {
+        key.* = if (i % 4 == 0) 0 else @intCast(i % 100);
+        value.* = @intCast((i * 7) % 1000);
+        payload.* = @intCast(i % 37);
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i32 = .{ .values = k } }, .parquet_type = .INT32, .nullable = false },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = x } }, .parquet_type = .INT64, .nullable = false },
+        .{ .name = "y", .col = .{ .i32 = .{ .values = y } }, .parquet_type = .INT32, .nullable = false },
+    };
+    var sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, sink.sink(), &columns, @intCast(k.len), .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, sink.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 32);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= @intCast(rgs.len);
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-bitmap", .bytes = sink.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "sum(y) AS a,count(*) AS c,count(DISTINCT x) AS d",
+        .group_by = "k",
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 10 },
+        .min_bytes_per_worker = 1,
+        .max_memory = 256 << 20,
+        .integer_records_min_rows = 1,
+        .count_ranked_distinct = .off,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    args.count_ranked_distinct = .on;
+    for ([_]usize{ 1, 4, 16 }) |j| {
+        args.parallelism = j;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(got.count_ranked_distinct);
+        try testing.expect(got.grouped_distinct_bitmap);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    }
+}
+
+test "count-ranked DISTINCT gives a gated input's dictionaries no advice: its sink would probe the abandoned reader" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try rankedFixture(a);
+    const Probe = struct {
+        ranges: usize = 0,
+        fn add(ctx: *anyopaque, _: usize, _: usize, _: u64, _: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ranges += 1;
+        }
+    };
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-mapped", .bytes = fixture.bytes }},
+        .metas = &.{fixture.meta},
+        .aggregate = "sum(y) AS a,count(*) AS c,count(DISTINCT x) AS d",
+        .group_by = "k",
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 5 },
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .max_memory = 128 << 20,
+        .count_ranked_distinct = .on,
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    var window: ReleasingScanWindow = .{ .bytes = try a.dupe(u8, fixture.bytes), .meta = &fixture.meta };
+    const gated = [_]Input{window.input(fixture.bytes)};
+    var probe: Probe = .{};
+    args.inputs = &gated;
+    args.dict_probe = .{ .ctx = &probe, .add = Probe.add };
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    try testing.expect(got.count_ranked_distinct);
+    try testing.expectEqual(@as(usize, 0), probe.ranges);
+    try got.output.applyResultOrder(gpa, args.result_order);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+}
+
 test "count-ranked DISTINCT returns an empty filtered result without rebuilding a false predicate" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

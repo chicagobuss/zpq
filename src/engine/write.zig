@@ -478,8 +478,15 @@ const WriteRows = struct {
     copied_from: std.ArrayList(*const schema.FileMetaData) = .empty,
     win_slots: []Slot = &.{},
     page_indexes: page_index.Deferred = .{},
+    /// The byte copy's filter jobs, their pool and the ledger view they draw on: the filters they build are the
+    /// chunks' `bloom_out` until the footer is written, so they live as long as the row groups do.
+    filter_charged: core_memory.Charged = undefined,
+    filter_threaded: ?std.Io.Threaded = null,
+    filters: ?consumer.FilterJobs = null,
 
     fn deinit(self: *WriteRows) void {
+        if (self.filters) |*f| f.deinit();
+        if (self.filter_threaded) |*runtime| runtime.deinit();
         for (self.win_slots) |*slot| slot.meta_arena.deinit();
     }
 
@@ -556,25 +563,22 @@ const WriteRows = struct {
                 null;
             // Filters built on the pool draw their working memory from the write's ledger. One it has no room for is
             // built alone and uncharged, as the inline path builds every filter: a write fits any budget.
-            var charged: core_memory.Charged = .{ .child = self.ctx.gpa, .budget = self.ledger };
+            self.filter_charged = .{ .child = self.ctx.gpa, .budget = self.ledger };
             const budget = if (self.args.parallelism > 0)
                 self.args.parallelism
             else
                 system.discoverAvailableParallelism(self.ctx.env);
             // This thread is one of the budget; with no other, the filters are built inline, as each chunk is copied.
-            var threaded: ?std.Io.Threaded = null;
-            defer if (threaded) |*runtime| runtime.deinit();
             const filter_io: ?std.Io = if (budget <= 1) null else self.ctx.worker_io orelse blk: {
-                threaded = .init(self.ctx.gpa, .{ .async_limit = .limited(budget - 1) });
-                break :blk threaded.?.io();
+                self.filter_threaded = .init(self.ctx.gpa, .{ .async_limit = .limited(budget - 1) });
+                break :blk self.filter_threaded.?.io();
             };
-            var filters: ?consumer.FilterJobs = if (filter_io) |io| .{
+            if (filter_io) |io| self.filters = .{
                 .io = io,
-                .charged = &charged,
+                .charged = &self.filter_charged,
                 .results = self.ctx.gpa,
                 .arena = self.arena,
-            } else null;
-            defer if (filters) |*f| f.deinit();
+            };
             for (self.inputs, self.metas) |in, *meta_i| {
                 self.bytes_in += in.bytes.len;
                 const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
@@ -588,14 +592,14 @@ const WriteRows = struct {
                     const hold = try self.arena.create(consumer.FilterJobs.Hold);
                     hold.* = if (in.gate) |g| .{ .gate_ctx = g.ctx, .done = g.done, .rg = ri } else .{};
                     defer hold.drop();
-                    if (filters) |*f| f.hold = hold;
-                    const first_job = if (filters) |f| f.jobs.items.len else 0;
+                    if (self.filters) |*f| f.hold = hold;
+                    const first_job = if (self.filters) |f| f.jobs.items.len else 0;
                     const bloom_write: consumer.BloomWrite = .{
                         .fpp = self.blooms.leaves,
                         .meta = meta_i,
                         .scratch = self.ctx.gpa,
                         .dictionary_bloom = self.args.bloom_filters_enabled,
-                        .jobs = if (filters) |*f| f else null,
+                        .jobs = if (self.filters) |*f| f else null,
                     };
                     const out = try consumer.copyRG(
                         self.arena,
@@ -611,7 +615,7 @@ const WriteRows = struct {
                     );
                     if (out.rg) |new_rg| {
                         try self.new_row_groups.append(self.arena, new_rg);
-                        if (filters) |f| for (f.jobs.items[first_job..]) |job| {
+                        if (self.filters) |f| for (f.jobs.items[first_job..]) |job| {
                             job.out_rg = self.new_row_groups.items.len - 1;
                         };
                     }
@@ -619,7 +623,7 @@ const WriteRows = struct {
                     if (out.surviving_rows > 0) self.rg_kept += 1;
                 }
             }
-            if (filters) |*f| try f.finish(self.arena, self.new_row_groups.items);
+            if (self.filters) |*f| try f.finish(self.new_row_groups.items);
             for (self.metas) |*m| try self.copied_from.append(self.arena, m);
         } else {
             // Windowed re-encode: one path for all environments. Concurrency is

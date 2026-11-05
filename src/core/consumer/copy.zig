@@ -251,8 +251,8 @@ pub const FilterJobs = struct {
     io: std.Io,
     /// Each job's working memory, drawn from the write's ledger. Thread-safe.
     charged: *core_memory.Charged,
-    /// The filters built, held to the footer as the inline path holds them on its arena; and the working memory of a
-    /// job the ledger has no room for (`run`). Thread-safe.
+    /// The filters built, which the chunks borrow until the footer is written, as the inline path's live on its arena;
+    /// and the working memory of a job the ledger has no room for (`run`). Thread-safe.
     results: std.mem.Allocator,
     /// The job records. Only the copy thread allocates from it.
     arena: std.mem.Allocator,
@@ -362,9 +362,10 @@ pub const FilterJobs = struct {
         self.group.await(self.io) catch {};
     }
 
-    /// Join every job, then give each built filter to its chunk in `row_groups`, copied onto `out_arena` (the footer
-    /// outlives the jobs' memory). The first failed job, in job order, is the error, whichever finished first.
-    pub fn finish(self: *FilterJobs, out_arena: std.mem.Allocator, row_groups: []schema.RowGroup) !void {
+    /// Join every job, then give each built filter to its chunk in `row_groups`. The chunks borrow the jobs' memory:
+    /// `deinit` only after the footer is written. The first failed job, in job order, is the error, whichever finished
+    /// first.
+    pub fn finish(self: *FilterJobs, row_groups: []schema.RowGroup) !void {
         self.join();
         for (self.jobs.items) |job| if (job.err) |err| {
             if (job.site) |site| types.setDecodeFailure(site);
@@ -373,7 +374,7 @@ pub const FilterJobs = struct {
         for (self.jobs.items) |job| {
             const r = job.out_rg orelse continue;
             if (job.filter.len == 0) continue;
-            row_groups[r].columns.items[job.col].bloom_out = try out_arena.dupe(u8, job.filter);
+            row_groups[r].columns.items[job.col].bloom_out = job.filter;
         }
     }
 

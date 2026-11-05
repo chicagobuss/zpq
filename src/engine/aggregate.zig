@@ -121,10 +121,9 @@ const openInputs = engine_input.openInputs;
 const hasGatedInputs = engine_input.hasGatedInputs;
 const metadataGate = engine_input.metadataGate;
 const allLocal = engine_input.allLocal;
-const plannedResidency = engine_input.plannedResidency;
-const LocalPlan = engine_input.LocalPlan;
-const planLocalReads = engine_input.planLocalReads;
-const planLocalReader = engine_input.planLocalReader;
+const localIoNeeds = engine_input.localIoNeeds;
+const chooseLocalIo = engine_input.chooseLocalIo;
+const localReaderInputs = engine_input.localReaderInputs;
 const DictProbeSink = engine_input.DictProbeSink;
 const ReadStarter = engine_input.ReadStarter;
 const bindFilter = engine_projection.bindFilter;
@@ -338,13 +337,7 @@ fn executeAggregateOver(
         };
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
-    const local = allLocal(opened);
-    const all_local = on_linux and local;
-    // Files mapped when descriptors ran short gave theirs back: read through the mapping unless a mode is asked for.
-    const choose_io = all_local and (io_policy.profile != .auto or opened.descriptorsHeld());
-    // Anything but the plain mapping needs the footers and the plan here: the explicit modes to read by them, and
-    // `auto` to weigh the bytes this query will read (a warm slice of a cold file still maps).
-    const plan_io = choose_io and io_policy.profile != .mmap;
+    const plan_io = localIoNeeds(opened, io_policy).plan;
     var probed = opened.membership;
     // A `row_groups` range lives in the footers parsed here; the scan's own parse would read every row group.
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
@@ -358,34 +351,9 @@ fn executeAggregateOver(
         if (!explain and !empty_result) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all, false));
         break :blk m;
     } else null;
-    const local_plan: ?LocalPlan = if (plan_io) try planLocalReads(arena, args, opened, metas.?) else null;
-    const resident: f64 = if (choose_io and io_policy.profile == .auto)
-        plannedResidency(ctx.gpa, opened, local_plan)
-    else
-        0;
-    const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
-    // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
-    // the page cache's, not the query's.
-    const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
-    // Off Linux a local file is always mapped: the mode asked for, or the only one there is.
-    const mapped_reason: local_reader.Reason = if (all_local)
-        .mapping
-    else if (!local)
-        .remote
-    else if (io_policy.profile == .mmap) .explicit else .not_linux;
-    var choice: local_reader.Choice = if (!choose_io)
-        .{ .mode = .mmap, .reason = mapped_reason }
-    else
-        io_policy.choose(resident, coverage);
-    choice = choice.withinReader(fits_reader);
+    const io = try chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, prof);
+    const choice = io.choice;
     const io_mode = choice.mode;
-    profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
-        io_policy.profile,
-        io_mode,
-        @as(u64, @intFromFloat(resident * 1000)),
-        @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
-        choice.reason,
-    }));
     var scan_args = aggregateScanArgs(ctx, args, agg_str, opened.inputs, metas, cut_args.result_order, &ledger);
     if (args.plan_source != null) scan_args.bound_aggregate = try args.boundAggregate(arena, &metas.?[0]);
     if (explain) {
@@ -425,22 +393,7 @@ fn executeAggregateOver(
     var reader: ?*local_reader.Reader = null;
     // Off Linux the reader never exists (`on_linux`), and its teardown's futex and close must not be compiled in.
     defer if (on_linux) if (reader) |rd| rd.destroy();
-    const scan_inputs = if (io_mode == .mmap or empty_result) opened.inputs else try planLocalReader(
-        ctx,
-        arena,
-        opened,
-        local_plan.?,
-        // The reader's buffers count against the budget as the S3 fetch window does: a fixed 1 GiB held reads far
-        // past --max-memory (and N GiB under N libzpq queries).
-        .{
-            .mode = io_mode,
-            .threads = io_policy.threads,
-            .window = io_policy.window orelse s3_window.windowFor(args.max_memory),
-            .ledger = &ledger,
-            .direct = choice.directRead(),
-        },
-        &reader,
-    );
+    const scan_inputs = if (empty_result) opened.inputs else try localReaderInputs(ctx, arena, args, opened, io, &ledger, null, &reader);
     const t_reader = nowMonoNs();
     defer if (reader) |rd| profile.record(prof, .local_read, t_reader, nowMonoNs(), profile.args(.{
         @as(u64, if (io_mode == .uring) 2 else 1),

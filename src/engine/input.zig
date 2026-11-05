@@ -985,7 +985,8 @@ pub fn planLocalReads(
     var total: u64 = 0;
     var largest: u64 = 0;
     for (files, metas, opened.mmaps) |*file, *meta, m_opt| {
-        total += if (m_opt) |m| m.bytes.len else 0;
+        const file_size: u64 = if (m_opt) |m| m.bytes.len else 0;
+        total += file_size;
         const per_rg = try arena.alloc(?[]local_reader.Range, meta.row_groups.items.len);
         for (meta.row_groups.items, per_rg) |*rg, *rgs| {
             const cols = plan.rowGroupColumns(rg, meta) orelse {
@@ -1011,11 +1012,112 @@ pub fn planLocalReads(
                     try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
                 };
             }
+            // A write that copies a row group keeps its chunks' Bloom filters, read from the input as an S3 fetch
+            // reads them (`appendRgFetchRanges`): unplanned, the reader's buffer holds zeros there and the filter
+            // would be dropped.
+            if (plan.carriedFilters(rg, meta)) |carry| for (carry, 0..) |on, ci| {
+                if (!on or ci >= rg.columns.items.len) continue;
+                const cm = rg.columns.items[ci].meta_data orelse continue;
+                const off = cm.bloom_filter_offset orelse continue;
+                const len = cm.bloom_filter_length orelse continue;
+                if (off < 4 or len <= 0) continue;
+                const start: u64 = @intCast(off);
+                const end = start + @as(u64, @intCast(len));
+                if (end > file_size) continue;
+                try rs.append(arena, .{ .start = start, .end = end });
+                planned +|= end - start;
+                rg_bytes +|= end - start;
+            };
             rgs.* = rs.items;
         }
         file.* = per_rg;
     }
     return .{ .files = files, .planned = planned, .total = total, .largest = largest };
+}
+
+/// Whether a query over `opened` chooses how its local inputs are read (`choose`), and whether that choice needs the
+/// footers and a plan (`plan`): the explicit modes read by them, and `auto` weighs the bytes the query will read.
+pub const LocalIoNeeds = struct { choose: bool, plan: bool };
+
+pub fn localIoNeeds(opened: OpenedInputs, policy: local_reader.Policy) LocalIoNeeds {
+    const all_local = @import("builtin").os.tag == .linux and allLocal(opened);
+    // Files mapped when descriptors ran short gave theirs back: read through the mapping unless a mode is asked for.
+    const choose = all_local and (policy.profile != .auto or opened.descriptorsHeld());
+    return .{ .choose = choose, .plan = choose and policy.profile != .mmap };
+}
+
+/// How a query reads its local inputs, and the plan and residency the choice was made from.
+pub const LocalIo = struct {
+    policy: local_reader.Policy,
+    choice: local_reader.Choice,
+    plan: ?LocalPlan = null,
+    resident: f64 = 0,
+    coverage: f64 = 0,
+};
+
+/// The one choice every local read makes, scan or write: plan the reads (`metas` must be given when
+/// `localIoNeeds(...).plan`), weigh their residency, and pick the mapping or the reader (`Policy.choose`).
+pub fn chooseLocalIo(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    opened: OpenedInputs,
+    metas: ?[]const schema.FileMetaData,
+    policy: local_reader.Policy,
+    prof: ?*profile.Thread,
+) !LocalIo {
+    const needs = localIoNeeds(opened, policy);
+    const local_plan: ?LocalPlan = if (needs.plan) try planLocalReads(arena, args, opened, metas.?) else null;
+    const resident: f64 = if (needs.choose and policy.profile == .auto) plannedResidency(gpa, opened, local_plan) else 0;
+    const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
+    // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
+    // the page cache's, not the query's.
+    const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
+    // Off Linux a local file is always mapped: the mode asked for, or the only one there is.
+    const local = allLocal(opened);
+    const mapped_reason: local_reader.Reason = if (local and @import("builtin").os.tag == .linux)
+        .mapping
+    else if (!local)
+        .remote
+    else if (policy.profile == .mmap) .explicit else .not_linux;
+    var choice: local_reader.Choice = if (!needs.choose)
+        .{ .mode = .mmap, .reason = mapped_reason }
+    else
+        policy.choose(resident, coverage);
+    choice = choice.withinReader(fits_reader);
+    profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
+        policy.profile,
+        choice.mode,
+        @as(u64, @intFromFloat(resident * 1000)),
+        @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
+        choice.reason,
+    }));
+    return .{ .policy = policy, .choice = choice, .plan = local_plan, .resident = resident, .coverage = coverage };
+}
+
+/// The inputs a query reads: `opened`'s own when `io` maps them, else the reader's over `io.plan` (`planLocalReader`),
+/// its buffers drawn from `ledger` as the S3 fetch window counts against the budget: a fixed 1 GiB held reads far past
+/// --max-memory (and N GiB under N libzpq queries). `window_cap` bounds the window below that default when the
+/// caller's other draws need the room. The caller starts the reader and destroys it before `opened`.
+pub fn localReaderInputs(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    opened: OpenedInputs,
+    io: LocalIo,
+    ledger: *core_memory.SharedBudget,
+    window_cap: ?u64,
+    out: *?*local_reader.Reader,
+) ![]const scan.Input {
+    if (io.choice.mode == .mmap) return opened.inputs;
+    const default_window = s3_window.windowFor(args.max_memory);
+    return planLocalReader(ctx, arena, opened, io.plan.?, .{
+        .mode = io.choice.mode,
+        .threads = io.policy.threads,
+        .window = io.policy.window orelse if (window_cap) |cap| @min(default_window, cap) else default_window,
+        .ledger = ledger,
+        .direct = io.choice.directRead(),
+    }, out);
 }
 
 /// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:

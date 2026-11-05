@@ -25,6 +25,7 @@ const streaming = @import("../core/writer/streaming.zig");
 const fastpath = @import("../core/writer/fastpath.zig");
 const page_index = @import("../core/writer/page_index.zig");
 const s3 = @import("../io/s3.zig");
+const local_reader = @import("../io/local_reader.zig");
 const tls = @import("../io/tls.zig");
 const multipart_sink = @import("../io/multipart_sink.zig");
 const Diag = @import("../core/diag.zig").Diag;
@@ -196,6 +197,46 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     var kept_in_order: std.ArrayList(usize) = .empty;
     for (kept_arr, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
 
+    // The write's ledger: the local reader's row groups, the producers' decode and encode memory and the row groups
+    // waiting for the writer hold no more than the budget together.
+    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    defer if (args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
+
+    // Local inputs are read as the scan reads them (`input.chooseLocalIo`): a cold planned read goes through the
+    // reader, ahead of every write path below, each of which waits on a row group's gate and gives it back once
+    // it is written; a resident one stays on the mapping. Off Linux there is no reader.
+    const on_linux = @import("builtin").os.tag == .linux;
+    var io_policy = local_reader.Policy.fromEnv(ctx.env);
+    io_policy.cache = args.cache;
+    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, prof);
+    // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
+    var reader: ?*local_reader.Reader = null;
+    defer if (on_linux) if (reader) |rd| rd.destroy();
+    // Never more than a quarter of the budget ahead (a row group larger still reads, alone): the window's floor
+    // suits a scan, but a write's encoders draw on the same ledger and would be refused beside it.
+    const write_inputs = try input.localReaderInputs(ctx, arena, args, opened, io, &ledger, args.max_memory / 4, &reader);
+    const t_reader = nowMonoNs();
+    defer if (on_linux) if (reader) |rd| profile.record(prof, .local_read, t_reader, nowMonoNs(), profile.args(.{
+        @as(u64, if (io.choice.mode == .uring) 2 else 1),
+        rd.stats.bytes.load(.monotonic),
+        rd.threads.items.len,
+        rd.stats.stalls.load(.monotonic),
+        rd.stats.stall_ns.load(.monotonic),
+        rd.stats.window_waits.load(.monotonic),
+    }));
+    if (on_linux) if (reader) |rd| {
+        try rd.start();
+        // A row group the plan pruned holds no range; nothing waits on it.
+        rd.releasePruned();
+        const b = rd.backends();
+        profile.record(prof, .local_backend, t_reader, t_reader, profile.args(.{
+            b.uring_threads,
+            b.pread_threads,
+            b.direct_files,
+            b.buffered_files,
+        }));
+    };
+
     // zstd pages are compressed per the destination's priority; the modes they take are counted for the profile.
     const priority = args.compress_priority;
     var zstd_counts: compression.ZstdModeCounts = .{};
@@ -330,7 +371,8 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
         .ctx = ctx,
         .arena = arena,
         .args = args,
-        .opened = opened,
+        .inputs = write_inputs,
+        .ledger = &ledger,
         .metas = metas,
         .meta0 = meta0,
         .prof = prof,
@@ -404,7 +446,9 @@ const WriteRows = struct {
     ctx: Context,
     arena: std.mem.Allocator,
     args: QueryArgs,
-    opened: input.OpenedInputs,
+    /// What the row groups are read from: the mapping's inputs, or the local reader's, gated per row group.
+    inputs: []const scan.Input,
+    ledger: *core_memory.SharedBudget,
     metas: []const schema.FileMetaData,
     meta0: *const schema.FileMetaData,
     prof: ?*profile.Thread,
@@ -443,7 +487,7 @@ const WriteRows = struct {
             // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
             // behind a byte window, as the re-encode path below does.
             var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
-            for (self.opened.inputs, self.metas, 0..) |in, *meta_p, ii| {
+            for (self.inputs, self.metas, 0..) |in, *meta_p, ii| {
                 self.bytes_in += in.bytes.len;
                 for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
                     self.rgs_in += 1;
@@ -509,7 +553,7 @@ const WriteRows = struct {
                 .{ .codec = c, .zstd = self.zstd, .scratch = self.ctx.gpa }
             else
                 null;
-            for (self.opened.inputs, self.metas) |in, meta_i| {
+            for (self.inputs, self.metas) |in, meta_i| {
                 self.bytes_in += in.bytes.len;
                 const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
                 const meta_const = meta_i;
@@ -571,7 +615,7 @@ const WriteRows = struct {
 
             // 1. Collect surviving row groups (serial, cheap stats-only pruning).
             var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
-            for (self.opened.inputs, 0..) |in, ii| {
+            for (self.inputs, 0..) |in, ii| {
                 self.bytes_in += in.bytes.len;
                 const meta_p = &self.metas[ii];
                 for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
@@ -621,19 +665,17 @@ const WriteRows = struct {
                 for (slots) |*s| s.* = .{ .meta_arena = std.heap.ArenaAllocator.init(self.ctx.gpa) };
                 self.win_slots = slots;
 
-                // The write's ledger: the producers' decode and encode memory, the row groups waiting for the writer and
-                // its slices hold no more than the budget together, past each producer's first huge page.
-                var ledger: core_memory.SharedBudget = .{ .limit = self.args.max_memory };
-                defer if (self.args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), self.args.max_memory);
-                var memory: core_memory.Charged = .{ .child = self.ctx.gpa, .budget = &ledger };
-                var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &ledger };
+                // The write's ledger (`runWriteOver`), past each producer's first huge page.
+                const ledger = self.ledger;
+                var memory: core_memory.Charged = .{ .child = self.ctx.gpa, .budget = ledger };
+                var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = ledger };
                 var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
                 var lean: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &lean_ledger };
                 const regions = try self.arena.alloc(WorkRegions, @max(effective_async_budget, 1) + sizing.budget + 1);
                 for (regions) |*r| {
                     r.* = .init(self.ctx.gpa);
-                    r.rows.budget = &ledger;
-                    r.work.budget = &ledger;
+                    r.rows.budget = ledger;
+                    r.work.budget = ledger;
                     r.rows.allowance = huge_pages.huge_page_size;
                 }
                 defer for (regions) |*r| r.deinit();
@@ -686,7 +728,7 @@ const WriteRows = struct {
                 };
                 // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
                 w.cpu_budget = sizing.budget;
-                w.piece_pool = .{ .gpa = self.ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
+                w.piece_pool = .{ .gpa = self.ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = ledger };
                 defer w.piece_pool.deinit();
                 defer consumer.releaseSlicePool(&w.slice_pool);
                 w.piece_pages.child = w.outAlloc();

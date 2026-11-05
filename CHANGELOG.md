@@ -42,10 +42,12 @@
   DECIMAL lineitem is 2.8× faster (174 → 63 ms hot) and Q6 2.2× faster; DOUBLE columns are unchanged.
 - **Top-k over long string keys is faster.** `GROUP BY k ORDER BY count(*)` (or a `SUM`/`MAX` of a column) `LIMIT n`
   over a long, mostly PLAIN string key now ranks its groups in the shared string table that full `GROUP BY` already
-  uses, instead of a separate cut; dictionary-coded keys and selective filters keep their existing plans. A single
+  uses, instead of a separate cut; dictionary-coded keys and selective filters keep their existing plans. Under a
+  filter, it decodes the keys in windows sized from their width, so the surviving keys stay in cache. A single
   ordered `BIGINT` key with `SUM`/`AVG`/`MIN`/`MAX` beside the count now takes the packed top-k path. On a Ryzen 9
-  9950X, top-10 queries over 1 M distinct URL-like keys in 20 M rows are 1.4–2.3× faster, and the ordered-key case
-  1.2–1.5× faster at about 1.4× the peak memory; ClickBench is unchanged.
+  9950X, top-10 queries over 1 M distinct URL-like keys in 20 M rows are 1.4–2.3× faster (a filter keeping 30% of
+  the rows, about 17% faster), and the ordered-key case 1.2–1.5× faster at about 1.4× the peak memory; ClickBench is
+  unchanged.
 - **Filtered DECIMAL sums are faster, and a corrupt page in rows the filter rejected no longer depends on the decode
   path.** Every decode path (whole row group, sliced, tiled, row subgroups) now evaluates a filter's AND conditions
   through one plan: a later condition is tested only on rows the earlier ones kept, reading dictionary codes where it

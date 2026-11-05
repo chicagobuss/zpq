@@ -2590,6 +2590,123 @@ test "filtered long-string top-k keeps tied cutoff groups by first occurrence at
     }
 }
 
+test "filtered shared-string window sizes PLAIN chunks without dictionary-covered ones" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain_n = 512;
+    const dict_n = 512;
+    const pad = try a.alloc(u8, 72);
+    @memset(pad, 'k');
+    const plain_text = try a.alloc([]const u8, plain_n);
+    const plain_defs = try a.alloc(u32, plain_n);
+    const plain_flags = try a.alloc(i64, plain_n);
+    for (plain_text, plain_defs, plain_flags, 0..) |*key, *kd, *flag, i| {
+        key.* = try std.fmt.allocPrint(a, "{d}-{s}", .{ i, pad });
+        kd.* = 1;
+        flag.* = 1;
+    }
+    const dict_text = try a.alloc([]const u8, dict_n);
+    const dict_defs = try a.alloc(u32, dict_n);
+    const dict_flags = try a.alloc(i64, dict_n);
+    const short = [_][]const u8{ "aa", "bb", "cc", "dd" };
+    for (dict_text, dict_defs, dict_flags, 0..) |*key, *kd, *flag, i| {
+        key.* = short[i % short.len];
+        kd.* = 1;
+        flag.* = 1;
+    }
+    var plain_sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    var dict_sink: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    const plain_cols = [_]expr_agg.OutputCol{
+        .{
+            .name = "k",
+            .parquet_type = .BYTE_ARRAY,
+            .nullable = true,
+            .col = .{ .string = .{ .values = plain_text, .def_levels = plain_defs, .max_def = 1 } },
+        },
+        .{
+            .name = "f",
+            .parquet_type = .INT64,
+            .nullable = false,
+            .col = .{ .i64 = .{ .values = plain_flags, .def_levels = null, .max_def = 0 } },
+        },
+    };
+    const dict_cols = [_]expr_agg.OutputCol{
+        .{
+            .name = "k",
+            .parquet_type = .BYTE_ARRAY,
+            .nullable = true,
+            .col = .{ .string = .{ .values = dict_text, .def_levels = dict_defs, .max_def = 1 } },
+        },
+        .{
+            .name = "f",
+            .parquet_type = .INT64,
+            .nullable = false,
+            .col = .{ .i64 = .{ .values = dict_flags, .def_levels = null, .max_def = 0 } },
+        },
+    };
+    _ = try consumer.writeAggregateRows(a, plain_sink.sink(), &plain_cols, plain_n, .SNAPPY, .{}, .{});
+    _ = try consumer.writeAggregateRows(a, dict_sink.sink(), &dict_cols, dict_n, .SNAPPY, .{}, .{});
+    const plain_meta = try metadata.open(a, plain_sink.buffer.items);
+    const dict_meta = try metadata.open(a, dict_sink.buffer.items);
+    try testing.expectEqual(@as(usize, 1), plain_meta.row_groups.items.len);
+    try testing.expectEqual(@as(usize, 1), dict_meta.row_groups.items.len);
+    const plain_cm = &plain_meta.row_groups.items[0].columns.items[0].meta_data.?;
+    const dict_cm = &dict_meta.row_groups.items[0].columns.items[0].meta_data.?;
+    try testing.expect(!ndv.fullCoverage(plain_cm));
+    try testing.expect(ndv.fullCoverage(dict_cm));
+    const plain_per: usize = @intCast(@max(@as(u128, @intCast(@max(0, plain_cm.total_uncompressed_size))) /
+        @as(u128, @intCast(plain_meta.row_groups.items[0].num_rows)), 1));
+    var all_bytes: u128 = @intCast(@max(0, plain_cm.total_uncompressed_size));
+    all_bytes += @intCast(@max(0, dict_cm.total_uncompressed_size));
+    const all_rows: u128 = @intCast(plain_meta.num_rows + dict_meta.num_rows);
+    const all_per: usize = @intCast(@max(all_bytes / all_rows, 1));
+    var base: MultiAggArgs = .{
+        .inputs = &.{
+            .{ .name = "plain-wide", .bytes = plain_sink.buffer.items },
+            .{ .name = "dict-narrow", .bytes = dict_sink.buffer.items },
+        },
+        .metas = &.{ plain_meta, dict_meta },
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .filter = "f > 0",
+        .max_memory = 256 << 20,
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .shared_strings = false,
+        .auto_decode_batches = true,
+    };
+    var want = try runMultiAggregate(gpa, a, base);
+    defer want.deinit(gpa);
+    const saved_cpu = hw.test_cpu;
+    defer hw.test_cpu = saved_cpu;
+    // 1 MiB per worker keeps both widths inside the clamps and apart, so a diluted average cannot pass.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 1 << 20, .line_bytes = 64, .max_sharing = 1 } };
+    base.shared_strings = true;
+    string_table.test_fit = 0;
+    var taken: std.EnumSet(FastPath) = .{};
+    base.taken = &taken;
+    var got = try prepareAggregate(gpa, a, base, false);
+    defer got.deinit(gpa);
+    const got_fit = string_table.test_fit;
+    const plain_fit = string_table.rowsThatFit(plain_per);
+    const all_fit = string_table.rowsThatFit(all_per);
+    try testing.expect(plain_fit != all_fit);
+    try testing.expectEqual(plain_fit, got_fit);
+    try testing.expect(taken.contains(.shared_strings));
+    const want_rows = want.output.group_rows.?;
+    const got_rows = got.output.group_rows.?;
+    try testing.expectEqual(want_rows.len, got_rows.len);
+    try testing.expectEqual(@as(usize, plain_n + short.len), want_rows.len);
+    var want_n: i128 = 0;
+    var got_n: i128 = 0;
+    for (want_rows) |row| want_n += row[1].i;
+    for (got_rows) |row| got_n += row[1].i;
+    try testing.expectEqual(want_n, got_n);
+    try testing.expectEqual(@as(i128, plain_n + dict_n), want_n);
+}
+
 test "shared string top-k cut refusals replay at every budget the old path answers" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

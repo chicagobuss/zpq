@@ -107,6 +107,10 @@ pub fn inlineSharedStrings(
     var any_coded = false;
     var key_bytes: u128 = 0;
     var key_rows: u128 = 0;
+    // Dictionary-covered chunks store indices, not key copies. A file-wide average that includes them is too small,
+    // and the PLAIN row groups then get a window sized for a narrower key. The width below counts only the rest.
+    var plain_bytes: u128 = 0;
+    var plain_rows: u128 = 0;
     for (work) |item| {
         const rg = &metas[item.file].row_groups.items[item.rg];
         const cm = rg.columns.items[key.col_ref.col_idx].meta_data orelse return null;
@@ -115,6 +119,10 @@ pub fn inlineSharedStrings(
         any_coded = any_coded or full;
         key_bytes += @intCast(@max(0, cm.total_uncompressed_size));
         key_rows += @intCast(@max(0, rg.num_rows));
+        if (!full) {
+            plain_bytes += @intCast(@max(0, cm.total_uncompressed_size));
+            plain_rows += @intCast(@max(0, rg.num_rows));
+        }
     }
     if (coded or key_bytes < key_rows * (2 * @sizeOf([]const u8))) return null;
     // A cut builds every group before ranking. Leave it to the established plans where they skip most of that work,
@@ -171,7 +179,10 @@ pub fn inlineSharedStrings(
     // partition order. `batchRows` is sized for 16-byte slots, so a long key's copies spill out of L2 and that
     // second touch misses; size the filtered window to the footer byte width instead.
     if (decoded.auto_decode_batches and decoded.decode_batch_rows == 0 and decoded.expr_batch_rows != 0) {
-        const per_row: usize = if (key_rows == 0) 16 else std.math.cast(usize, @max(key_bytes / key_rows, 1)) orelse std.math.maxInt(usize);
+        const per_row: usize = if (plain_rows == 0)
+            16
+        else
+            std.math.cast(usize, @max(plain_bytes / plain_rows, 1)) orelse std.math.maxInt(usize);
         decoded.decode_batch_rows = if (plan.query.filter == null)
             string_table.batchRows()
         else

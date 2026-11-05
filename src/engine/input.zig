@@ -1003,14 +1003,27 @@ pub fn planLocalReads(
             // A write may copy this row group (`carry`): exactly the bytes the copy reads must be planned, since the
             // reader's buffer holds zeros everywhere else.
             const carry = plan.carriedFilters(rg, meta);
+            // Every leaf kept, the copy may take the row group's bounding span whole, gaps between chunks included
+            // (`copyRG`, `fastpath.rowGroupByteRange`); a span that does not resolve fails that copy either way.
+            const span: ?fastpath.ByteRange = if (carry != null and allSet(cols, rg.columns.items.len))
+                fastpath.rowGroupByteRange(rg, @intCast(file_size)) catch null
+            else
+                null;
+            if (span) |sp| {
+                try rs.append(arena, .{ .start = sp.start, .end = sp.start + sp.len });
+                planned +|= sp.len;
+                rg_bytes +|= sp.len;
+            }
             for (cols, 0..) |needed, ci| {
                 if (!needed or ci >= rg.columns.items.len) continue;
                 const chunk = rg.columns.items[ci];
                 const cm = chunk.meta_data orelse continue;
-                const start: u64 = @intCast(if (cm.dictionary_page_offset) |dp| @min(dp, cm.data_page_offset) else cm.data_page_offset);
-                try rs.append(arena, .{ .start = start, .end = start + @as(u64, @intCast(cm.total_compressed_size)) });
-                planned +|= @intCast(cm.total_compressed_size);
-                rg_bytes +|= @intCast(cm.total_compressed_size);
+                if (span == null) {
+                    const start: u64 = @intCast(if (cm.dictionary_page_offset) |dp| @min(dp, cm.data_page_offset) else cm.data_page_offset);
+                    try rs.append(arena, .{ .start = start, .end = start + @as(u64, @intCast(cm.total_compressed_size)) });
+                    planned +|= @intCast(cm.total_compressed_size);
+                    rg_bytes +|= @intCast(cm.total_compressed_size);
+                }
                 // The scan reads a needed chunk's page index too.
                 if (chunk.column_index_offset) |o| if (chunk.column_index_length) |l| {
                     try rs.append(arena, .{ .start = @intCast(o), .end = @as(u64, @intCast(o)) + @as(u64, @intCast(l)) });
@@ -1054,6 +1067,13 @@ pub fn planLocalReads(
         file.* = per_rg;
     }
     return .{ .files = files, .planned = planned, .total = total, .largest = largest, .exact = exact };
+}
+
+/// Whether `cols` marks every one of a row group's `n` leaves.
+fn allSet(cols: []const bool, n: usize) bool {
+    if (cols.len < n) return false;
+    for (cols[0..n]) |c| if (!c) return false;
+    return true;
 }
 
 /// Whether a query over `opened` chooses how its local inputs are read (`choose`), and whether that choice needs the

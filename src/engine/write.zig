@@ -26,6 +26,7 @@ const fastpath = @import("../core/writer/fastpath.zig");
 const page_index = @import("../core/writer/page_index.zig");
 const s3 = @import("../io/s3.zig");
 const local_reader = @import("../io/local_reader.zig");
+const system = @import("../core/system.zig");
 const tls = @import("../io/tls.zig");
 const multipart_sink = @import("../io/multipart_sink.zig");
 const Diag = @import("../core/diag.zig").Diag;
@@ -197,8 +198,8 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     var kept_in_order: std.ArrayList(usize) = .empty;
     for (kept_arr, 0..) |b, i| if (b) try kept_in_order.append(arena, i);
 
-    // The write's ledger: the local reader's row groups, the producers' decode and encode memory and the row groups
-    // waiting for the writer hold no more than the budget together.
+    // The write's ledger: the local reader's row groups, the producers' decode and encode memory, the row groups
+    // waiting for the writer and the filters the pool builds hold no more than the budget together.
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     defer if (args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
 
@@ -213,7 +214,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     var reader: ?*local_reader.Reader = null;
     defer if (on_linux) if (reader) |rd| rd.destroy();
     // Never more than a quarter of the budget ahead (a row group larger still reads, alone): the window's floor
-    // suits a scan, but a write's encoders draw on the same ledger and would be refused beside it.
+    // suits a scan, but a write's filters and encoders draw on the same ledger and would be refused beside it.
     const write_inputs = try input.localReaderInputs(ctx, arena, args, opened, io, &ledger, args.max_memory / 4, &reader);
     const t_reader = nowMonoNs();
     defer if (on_linux) if (reader) |rd| profile.record(prof, .local_read, t_reader, nowMonoNs(), profile.args(.{
@@ -361,7 +362,7 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     }
 
     // The re-encode path (need_encoder) fans row groups across the Io pool
-    // below; the byte-copy fastpath stays serial (memcpy-bound). win_slots hold
+    // below; the byte copy writes on one thread, its filters built beside it. win_slots hold
     // the small per-row-group footer metadata (on private arenas) that the
     // footer write further down still references, so they are freed at function
     // scope, AFTER the footer is built. (The bulk encoded bytes are freed
@@ -546,29 +547,55 @@ const WriteRows = struct {
                 self.t.core.encode_ns += rw.core.encode_ns;
             }
         } else if (!self.need_encoder) {
-            // Byte-copy fastpath: copy kept column chunks verbatim (serial;
-            // memcpy-bound and already faster than every other engine). A chunk
-            // stored in another codec than the one requested is recompressed.
+            // Byte copy: kept column chunks verbatim, in order, on this thread; a chunk stored in another codec than
+            // the one requested is recompressed. The Bloom filters it builds (from a chunk's dictionary, or an
+            // explicit --bloom-filter) are the costly part, so they go to the pool (`consumer.FilterJobs`).
             const recompress: ?consumer.Recompress = if (self.args.codec) |c|
                 .{ .codec = c, .zstd = self.zstd, .scratch = self.ctx.gpa }
             else
                 null;
-            for (self.inputs, self.metas) |in, meta_i| {
+            // Filters built on the pool draw their working memory from the write's ledger. One it has no room for is
+            // built alone and uncharged, as the inline path builds every filter: a write fits any budget.
+            var charged: core_memory.Charged = .{ .child = self.ctx.gpa, .budget = self.ledger };
+            const budget = if (self.args.parallelism > 0)
+                self.args.parallelism
+            else
+                system.discoverAvailableParallelism(self.ctx.env);
+            // This thread is one of the budget; with no other, the filters are built inline, as each chunk is copied.
+            var threaded: ?std.Io.Threaded = null;
+            defer if (threaded) |*runtime| runtime.deinit();
+            const filter_io: ?std.Io = if (budget <= 1) null else self.ctx.worker_io orelse blk: {
+                threaded = .init(self.ctx.gpa, .{ .async_limit = .limited(budget - 1) });
+                break :blk threaded.?.io();
+            };
+            var filters: ?consumer.FilterJobs = if (filter_io) |io| .{
+                .io = io,
+                .charged = &charged,
+                .results = self.ctx.gpa,
+                .arena = self.arena,
+            } else null;
+            defer if (filters) |*f| f.deinit();
+            for (self.inputs, self.metas) |in, *meta_i| {
                 self.bytes_in += in.bytes.len;
                 const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
-                const meta_const = meta_i;
-                for (meta_const.row_groups.items, 0..) |*src_rg, ri| {
+                for (meta_i.row_groups.items, 0..) |*src_rg, ri| {
                     self.rgs_in += 1;
                     self.rows_in += src_rg.num_rows;
                     const rg_span = profile.Span.begin(self.prof);
                     defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
                     if (in.gate) |g| try g.wait(g.ctx, ri);
-                    defer skipRowGroup(in, ri);
+                    // Given back once this copy and every filter job reading the row group are done.
+                    const hold = try self.arena.create(consumer.FilterJobs.Hold);
+                    hold.* = if (in.gate) |g| .{ .gate_ctx = g.ctx, .done = g.done, .rg = ri } else .{};
+                    defer hold.drop();
+                    if (filters) |*f| f.hold = hold;
+                    const first_job = if (filters) |f| f.jobs.items.len else 0;
                     const bloom_write: consumer.BloomWrite = .{
                         .fpp = self.blooms.leaves,
-                        .meta = &meta_i,
+                        .meta = meta_i,
                         .scratch = self.ctx.gpa,
                         .dictionary_bloom = self.args.bloom_filters_enabled,
+                        .jobs = if (filters) |*f| f else null,
                     };
                     const out = try consumer.copyRG(
                         self.arena,
@@ -582,11 +609,17 @@ const WriteRows = struct {
                         recompress,
                         bloom_write,
                     );
-                    if (out.rg) |new_rg| try self.new_row_groups.append(self.arena, new_rg);
+                    if (out.rg) |new_rg| {
+                        try self.new_row_groups.append(self.arena, new_rg);
+                        if (filters) |f| for (f.jobs.items[first_job..]) |job| {
+                            job.out_rg = self.new_row_groups.items.len - 1;
+                        };
+                    }
                     self.rows_kept += out.surviving_rows;
                     if (out.surviving_rows > 0) self.rg_kept += 1;
                 }
             }
+            if (filters) |*f| try f.finish(self.arena, self.new_row_groups.items);
             for (self.metas) |*m| try self.copied_from.append(self.arena, m);
         } else {
             // Windowed re-encode: one path for all environments. Concurrency is

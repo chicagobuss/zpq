@@ -25,6 +25,7 @@ const Timings = types.Timings;
 const RGOut = types.RGOut;
 const SliceReader = @import("slice_reader.zig").SliceReader;
 const flbaWidth = @import("column.zig").flbaWidth;
+const core_memory = @import("../memory.zig");
 
 /// Byte-copy one row group into `sink` and return a clone of it whose
 /// chunk offsets (and carried page indexes) point at the new stream
@@ -99,7 +100,7 @@ pub fn copyRG(
                     emit_page_index,
                     if (rc.done) |d| d[ci] else null,
                 );
-                try requestedFilter(out_arena, &written, rg, ci, src, bloom_write);
+                try requestedFilter(out_arena, &written, rg, ci, src, bloom_write, new_cols.items.len);
                 try new_cols.append(out_arena, written);
                 rg_total += written.meta_data.?.total_uncompressed_size;
                 continue;
@@ -107,7 +108,7 @@ pub fn copyRG(
             if (m.writer_stats != .trust) {
                 var timed: TimedCopyOut = .{ .out = &out, .timings = timings };
                 var copied = try fastpath.copyPolicyChunk(out_arena, &timed, src.bytes, src_chunk, emit_page_index);
-                try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
+                try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write, new_cols.items.len);
                 try new_cols.append(out_arena, copied);
                 rg_total += copied.meta_data.?.total_uncompressed_size;
                 continue;
@@ -116,7 +117,7 @@ pub fn copyRG(
             try timedWrite(&out, slice, timings);
             // Carry the page index forward, written right after this chunk's data.
             var copied = try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index);
-            try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
+            try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write, new_cols.items.len);
             try new_cols.append(out_arena, copied);
             rg_total += m.total_uncompressed_size;
         }
@@ -154,7 +155,7 @@ pub fn copyRG(
     for (rg.columns.items, 0..) |*chunk, ci| {
         const safe = fastpath.writerSafeChunk(out_arena, src.bytes, chunk, bloom_write.meta);
         var copied = try carryChunk(out_arena, &out, src, &safe, delta, emit_page_index);
-        try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write);
+        try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write, cols.items.len);
         try cols.append(out_arena, copied);
     }
 
@@ -170,7 +171,9 @@ pub fn copyRG(
 
 /// Give a copied chunk the Bloom filter the write asks of column `ci`, when it carries none from its source: decode
 /// the source chunk and build one from its values. A filter it carries is copied onto `out_arena` too: the filters
-/// are written after the last row group, and a windowed input has released this one's bytes by then.
+/// are written after the last row group, and a windowed input has released this one's bytes by then. With
+/// `bloom_write.jobs`, the filter is built off the copy thread instead (`FilterJobs`), for the chunk at `col` of its
+/// output row group.
 fn requestedFilter(
     out_arena: std.mem.Allocator,
     copied: *schema.ColumnChunk,
@@ -178,6 +181,7 @@ fn requestedFilter(
     ci: usize,
     src: RGSrc,
     bloom_write: BloomWrite,
+    col: usize,
 ) !void {
     if (copied.bloom_out.len > 0) {
         copied.bloom_out = try out_arena.dupe(u8, copied.bloom_out);
@@ -185,20 +189,37 @@ fn requestedFilter(
     }
     const explicit = bloom_write.at(ci);
     if (explicit == null and !bloom_write.dictionary_bloom) return;
-    const meta = bloom_write.meta orelse return;
+    if (bloom_write.meta == null) return;
+    const cm = rg.columns.items[ci].meta_data orelse return;
+    if (explicit == null and cm.dictionary_page_offset == null) return;
+    if (bloom_write.jobs) |jobs| return jobs.spawn(rg, ci, src, bloom_write, col);
     var scratch = std.heap.ArenaAllocator.init(bloom_write.scratch orelse return);
     defer scratch.deinit();
-    const a = scratch.allocator();
+    const filter = try buildFilter(scratch.allocator(), rg, ci, src, bloom_write) orelse return;
+    copied.bloom_out = try out_arena.dupe(u8, filter);
+}
+
+/// The filter `requestedFilter` builds for column `ci` of `rg`, on `a`: from the dictionary, or by decoding the chunk
+/// for an explicit `--bloom-filter`. Null when there is none to build. Reads only the chunk's own bytes.
+fn buildFilter(
+    a: std.mem.Allocator,
+    rg: *const schema.RowGroup,
+    ci: usize,
+    src: RGSrc,
+    bloom_write: BloomWrite,
+) !?[]u8 {
+    const explicit = bloom_write.at(ci);
+    const meta = bloom_write.meta orelse return null;
     const chunk = &rg.columns.items[ci];
-    const cm = chunk.meta_data orelse return;
+    const cm = chunk.meta_data orelse return null;
     const range = fastpath.chunkRange(&cm, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
     const bytes = try sourceBytes(src, range);
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
+    // A decode error names this chunk, whichever thread builds its filter.
+    types.enterChunk(rg, ci);
     if (explicit == null) {
-        if (cm.dictionary_page_offset == null) return;
-        const filter = try dictionaryBloom(a, bytes, cm, levels, meta) orelse return;
-        copied.bloom_out = try out_arena.dupe(u8, filter);
-        return;
+        if (cm.dictionary_page_offset == null) return null;
+        return dictionaryBloom(a, bytes, cm, levels, meta);
     }
     const fpp = explicit.?;
     const n: usize = @intCast(cm.num_values);
@@ -216,11 +237,152 @@ fn requestedFilter(
             n,
             flbaWidth(meta.getColumnSchema(cm.path_in_schema.items)),
         ) },
-        else => return,
+        else => return null,
     };
-    const filter = try encoder.bloomFilter(a, col, cm.type, fpp) orelse return;
-    copied.bloom_out = try out_arena.dupe(u8, filter);
+    return encoder.bloomFilter(a, col, cm.type, fpp);
 }
+
+/// The Bloom filters a serial byte copy builds off its copy thread: one job per chunk, on `io`, while the copy goes on
+/// writing chunks in order. A job reads its source chunk, so its row group is held (`Hold`) until the last of its jobs
+/// is done; the filters are placed only after the last row group (`fastpath.placeFilters`), so `finish` joins them
+/// first and hands each to its chunk. Output bytes do not depend on the schedule: each filter is a function of its
+/// chunk alone, and placement follows the chunks' order.
+pub const FilterJobs = struct {
+    io: std.Io,
+    /// Each job's working memory, drawn from the write's ledger. Thread-safe.
+    charged: *core_memory.Charged,
+    /// The filters built, held to the footer as the inline path holds them on its arena; and the working memory of a
+    /// job the ledger has no room for (`run`). Thread-safe.
+    results: std.mem.Allocator,
+    /// The job records. Only the copy thread allocates from it.
+    arena: std.mem.Allocator,
+    group: std.Io.Group = .init,
+    jobs: std.ArrayListUnmanaged(*Job) = .empty,
+    /// The row group `copyRG` is copying; the caller sets it around each call.
+    hold: ?*Hold = null,
+    joined: bool = false,
+    /// Jobs building right now. A job the ledger refuses retries once none is, one retrier at a time (`retry`), with
+    /// no new job starting meanwhile (`retrying`); refused again, it builds uncharged, still alone. A write fits any
+    /// budget, as the inline path builds every filter uncharged one at a time: the pool adds no overrun past that.
+    building: std.atomic.Value(u32) = .init(0),
+    retrying: std.atomic.Value(bool) = .init(false),
+    retry: std.Io.Mutex = .init,
+
+    /// A row group's bytes stay readable while the copy or any of its filter jobs still needs them; the last to
+    /// finish gives them back through `done` (`scan.RowGroupGate.done`, one work item).
+    pub const Hold = struct {
+        left: std.atomic.Value(u32) = .init(1),
+        gate_ctx: ?*anyopaque = null,
+        done: ?*const fn (ctx: *anyopaque, rg: usize, items: usize) void = null,
+        rg: usize = 0,
+
+        pub fn drop(h: *Hold) void {
+            if (h.left.fetchSub(1, .acq_rel) != 1) return;
+            if (h.done) |d| d(h.gate_ctx.?, h.rg, 1);
+        }
+    };
+
+    pub const Job = struct {
+        rg: *const schema.RowGroup,
+        ci: usize,
+        src: RGSrc,
+        bloom_write: BloomWrite,
+        hold: ?*Hold,
+        /// The chunk's place in the output: column `col` of output row group `out_rg`, which the caller sets once the
+        /// row group is appended (null: it was not).
+        col: usize,
+        out_rg: ?usize = null,
+        filter: []u8 = &.{},
+        err: ?anyerror = null,
+        /// Where a decode error was raised, handed to the copy thread that reports it (`types.decodeFailure`).
+        site: ?types.DecodeSite = null,
+    };
+
+    fn spawn(self: *FilterJobs, rg: *const schema.RowGroup, ci: usize, src: RGSrc, bloom_write: BloomWrite, col: usize) !void {
+        const job = try self.arena.create(Job);
+        var bw = bloom_write;
+        bw.jobs = null;
+        job.* = .{ .rg = rg, .ci = ci, .src = src, .bloom_write = bw, .hold = self.hold, .col = col };
+        try self.jobs.append(self.arena, job);
+        if (self.hold) |h| _ = h.left.fetchAdd(1, .acq_rel);
+        // Runs inline when the pool is full, never parked: a parked job would hold its row group's window share.
+        self.group.async(self.io, run, .{ self, job });
+    }
+
+    fn run(self: *FilterJobs, job: *Job) void {
+        defer if (job.hold) |h| h.drop();
+        while (true) {
+            // Never start beside a retrier: it must find the room its siblings leave, not race new ones for it.
+            if (self.retrying.load(.seq_cst)) {
+                self.retry.lockUncancelable(self.io);
+                self.retry.unlock(self.io);
+            }
+            _ = self.building.fetchAdd(1, .seq_cst);
+            if (self.retrying.load(.seq_cst)) {
+                _ = self.building.fetchSub(1, .seq_cst);
+                continue;
+            }
+            job.err = self.build(job, self.charged.allocator());
+            _ = self.building.fetchSub(1, .seq_cst);
+            break;
+        }
+        if (job.err) |err| if (types.isDecodeError(err)) {
+            job.site = types.decodeFailure();
+        };
+        const first = job.err orelse return;
+        if (first != error.ExceededMemoryBudget) return;
+        self.retry.lockUncancelable(self.io);
+        defer self.retry.unlock(self.io);
+        self.retrying.store(true, .seq_cst);
+        defer self.retrying.store(false, .seq_cst);
+        while (self.building.load(.seq_cst) != 0) std.Thread.yield() catch {};
+        job.err = self.build(job, self.charged.allocator());
+        if (job.err == null) return;
+        if (job.err.? == error.ExceededMemoryBudget) job.err = self.build(job, self.results);
+        if (job.err) |err| if (types.isDecodeError(err)) {
+            job.site = types.decodeFailure();
+        };
+    }
+
+    fn build(self: *FilterJobs, job: *Job, memory: std.mem.Allocator) ?anyerror {
+        var scratch = std.heap.ArenaAllocator.init(memory);
+        defer scratch.deinit();
+        const built = buildFilter(scratch.allocator(), job.rg, job.ci, job.src, job.bloom_write) catch |err| {
+            const refused: anyerror = self.charged.refusal(err);
+            return refused;
+        };
+        const filter = built orelse return null;
+        job.filter = self.results.dupe(u8, filter) catch |err| return err;
+        return null;
+    }
+
+    fn join(self: *FilterJobs) void {
+        if (self.joined) return;
+        self.joined = true;
+        self.group.await(self.io) catch {};
+    }
+
+    /// Join every job, then give each built filter to its chunk in `row_groups`, copied onto `out_arena` (the footer
+    /// outlives the jobs' memory). The first failed job, in job order, is the error, whichever finished first.
+    pub fn finish(self: *FilterJobs, out_arena: std.mem.Allocator, row_groups: []schema.RowGroup) !void {
+        self.join();
+        for (self.jobs.items) |job| if (job.err) |err| {
+            if (job.site) |site| types.setDecodeFailure(site);
+            return err;
+        };
+        for (self.jobs.items) |job| {
+            const r = job.out_rg orelse continue;
+            if (job.filter.len == 0) continue;
+            row_groups[r].columns.items[job.col].bloom_out = try out_arena.dupe(u8, job.filter);
+        }
+    }
+
+    /// Joins any job still running (a failed copy leaves some), then frees what they built.
+    pub fn deinit(self: *FilterJobs) void {
+        self.join();
+        for (self.jobs.items) |job| if (job.filter.len > 0) self.results.free(job.filter);
+    }
+};
 
 /// Verify every data page uses the dictionary before filtering its entries; mixed chunks must never omit values.
 pub fn dictionaryBloom(
@@ -320,6 +482,8 @@ pub const BloomWrite = struct {
     fpp: []const ?f64 = &.{},
     meta: ?*const schema.FileMetaData = null,
     scratch: ?std.mem.Allocator = null,
+    /// `copyRG` builds the filters there, off the copy thread, instead of on `scratch`.
+    jobs: ?*FilterJobs = null,
 
     pub fn at(self: BloomWrite, i: usize) ?f64 {
         return if (i < self.fpp.len) self.fpp[i] else null;

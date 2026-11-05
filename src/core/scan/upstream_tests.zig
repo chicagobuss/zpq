@@ -212,6 +212,46 @@ test "count-ranked DISTINCT keeps repeated aggregate aliases and bound quoted id
     }
 }
 
+test "count-ranked DISTINCT advises a mapped input's dictionaries before its first pass plans from them" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try rankedFixture(a);
+    const Probe = struct {
+        ranges: usize = 0,
+        fn add(ctx: *anyopaque, _: usize, _: usize, start: u64, end: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try testing.expect(start < end);
+            self.ranges += 1;
+        }
+    };
+    var probe: Probe = .{};
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "ranked-advised", .bytes = fixture.bytes }},
+        .metas = &.{fixture.meta},
+        .aggregate = "sum(y) AS a,count(*) AS c,count(DISTINCT x) AS d",
+        .group_by = "k",
+        .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 5 },
+        .parallelism = 4,
+        .min_bytes_per_worker = 1,
+        .max_memory = 128 << 20,
+        .count_ranked_distinct = .on,
+        .dict_probe = .{ .ctx = &probe, .add = Probe.add },
+    };
+    var got = try runMultiAggregate(gpa, a, args);
+    defer got.deinit(gpa);
+    try testing.expect(got.count_ranked_distinct);
+    try testing.expect(probe.ranges > 0);
+    args.count_ranked_distinct = .off;
+    args.dict_probe = null;
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    try got.output.applyResultOrder(gpa, args.result_order);
+    try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+}
+
 test "count-ranked DISTINCT returns an empty filtered result without rebuilding a false predicate" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

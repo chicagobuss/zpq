@@ -2390,7 +2390,12 @@ fn countRankedAttempt(
     }
     first.metas = metas;
     first.start_reads = null;
-    first.dict_probe = null;
+    // The first pass plans from the key's dictionaries, read through the mapping. Cold, a walk with no advice faults
+    // them in one at a time; keep the mapped path's probe sink, which advises them first. A sink beside a gated input
+    // would probe the reader being abandoned below, not this mapping.
+    first.dict_probe = for (args.inputs) |input| {
+        if (input.gate != null or input.dict_wait != null) break null;
+    } else args.dict_probe;
     first.count_ranked_distinct = .off;
     first.bound_aggregate = &ordinary_bound;
     first.select_cols = null;

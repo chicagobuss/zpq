@@ -285,6 +285,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             release_span = .begin(prof);
             break;
         };
+        // Before this item's own decode: the items after it are read while it is.
+        if (w.read_ahead) |ra| ra.claimed(idx, if (table) |gt| if (gt.countOnly()) w.count_columns else null else null);
         if (table) |gt| if (gt.discoveryDone(expr_agg.firstPosition(idx, 0))) continue;
         errdefer w.failure_work = idx;
         items.* += 1;
@@ -448,6 +450,13 @@ fn retireRegions(w: *Worker) void {
 }
 
 pub fn runWorkers(workers: []Worker) void {
+    // Every pass starts from the first work item, its columns those the workers' tables decode (`workerRun`): so
+    // does its read-ahead.
+    if (workers.len > 0) if (workers[0].read_ahead) |ra| {
+        const w = &workers[0];
+        const table: ?*expr_agg.GroupTable = if (w.blocks == null and w.group_tables.len > 0) &w.group_tables[w.index] else null;
+        ra.start(if (table) |gt| if (gt.countOnly()) w.count_columns else null else null);
+    };
     if (workers.len > 1) {
         // Started as a tree, so the last worker is not a millisecond late. Spawn failure never returns early (running
         // threads hold pointers into `arena` and `group_tables`); workers that never start are idle, and with no

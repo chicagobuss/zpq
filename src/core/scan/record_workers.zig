@@ -80,6 +80,8 @@ pub fn runRecordWorkers(
     defer for (tables) |*table| table.deinit();
     var decode_budget: ?consumer.DecodeBudget = if (args.decode_limit) |l| .{ .limit = l, .workers = n } else null;
     var cursor = std.atomic.Value(usize).init(0);
+    // Mapped inputs read ahead of the workers, as the aggregate scan's do (`execute.zig`).
+    var read_ahead_state = try @import("read_ahead.zig").ReadAhead.forScan(arena, args.read_ahead, args.inputs, work, metas, plan, n);
     // An indirect handle keeps the ordinary worker/target layout unchanged; only record paths dispatch the tag.
     for (workers, 0..) |*w, i| w.* = .{
         .gpa = gpa,
@@ -87,6 +89,7 @@ pub fn runRecordWorkers(
         .metas = metas,
         .work = work,
         .cursor = &cursor,
+        .read_ahead = if (read_ahead_state) |*ra| ra else null,
         .agg_calls = calls,
         .plan = plan,
         .decode_options = .{

@@ -355,6 +355,13 @@ fn executeAggregateOver(
     const choice = io.choice;
     const io_mode = choice.mode;
     var scan_args = aggregateScanArgs(ctx, args, agg_str, opened.inputs, metas, cut_args.result_order, &ledger);
+    // Passes over the mapping read their planned chunks ahead of the workers. `ZPQ_IO_ADVISE=off`: they fault them in;
+    // `=always`: they advise resident pages too (coverage of the advice path on resident test inputs).
+    const advise = ctx.env.getPosix("ZPQ_IO_ADVISE") orelse "";
+    if (!std.mem.eql(u8, advise, "off")) if (io.read_ahead) |ra| {
+        scan_args.read_ahead = ra;
+        scan_args.read_ahead.?.force = std.mem.eql(u8, advise, "always");
+    };
     if (args.plan_source != null) scan_args.bound_aggregate = try args.boundAggregate(arena, &metas.?[0]);
     if (explain) {
         if (io_mode != .mmap) {

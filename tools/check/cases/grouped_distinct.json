@@ -132,6 +132,9 @@
         "compare": "ordered",
         "sql": "SELECT k,count(DISTINCT x) AS d,count(*) AS c,sum(x) AS s,avg(x) AS a,min(x) AS lo,max(x) AS hi,count(x) AS n FROM '{path}' GROUP BY k ORDER BY d DESC,min(rid) LIMIT 10 OFFSET 2"
       }
-    }
+    },
+    {"id": "grouped-distinct:zipf:read-ahead:count-ranked", "fixture": "zipf", "sql": "SELECT k,count(*) AS c,sum(x) AS s,avg(x) AS a,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 13", "axes": [{"jobs": 1, "force": {"ZPQ_IO_ADVISE": "off"}}, {"jobs": 1, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 4, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 16, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 16}], "oracle": {"compare": "tied_rows", "sql": "SELECT k,count(*) AS c,sum(x) AS s,avg(x) AS a,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 13", "ranks": [1]}},
+    {"id": "grouped-distinct:zipf:read-ahead:filtered-cut", "fixture": "zipf", "sql": "SELECT k,count(*) AS c,sum(x) AS s FROM '{path}' WHERE x > 50000 GROUP BY k ORDER BY c DESC LIMIT 13", "axes": [{"jobs": 1, "force": {"ZPQ_IO_ADVISE": "off"}}, {"jobs": 1, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 4, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 16, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 16}], "oracle": {"compare": "tied_rows", "sql": "SELECT k,count(*) AS c,sum(x) AS s FROM '{path}' WHERE x > 50000 GROUP BY k ORDER BY c DESC LIMIT 13", "ranks": [1]}},
+    {"id": "grouped-distinct:zipf:read-ahead:budget", "fixture": "zipf", "sql": "SELECT k,count(*) AS c,sum(x) AS s,avg(x) AS a,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 13", "axes": [{"jobs": 1, "force": {"ZPQ_IO_ADVISE": "off"}}, {"jobs": 1, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 4, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 16, "force": {"ZPQ_IO_ADVISE": "always"}}, {"jobs": 16}], "oracle": {"compare": "tied_rows", "sql": "SELECT k,count(*) AS c,sum(x) AS s,avg(x) AS a,count(DISTINCT x) AS d FROM '{path}' GROUP BY k ORDER BY c DESC LIMIT 13", "ranks": [1]}, "max_memory": "32MB"}
   ]
 }

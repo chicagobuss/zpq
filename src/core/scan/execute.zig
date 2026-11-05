@@ -13,6 +13,7 @@ const spawn_util = @import("../spawn.zig");
 const schema = @import("../schema.zig");
 const consumer = @import("../consumer.zig");
 const agg_plan = @import("../agg_plan.zig");
+const read_ahead = @import("read_ahead.zig");
 const metadata = @import("../parquet/metadata.zig");
 const expr_ast = @import("../expr/ast.zig");
 const expr_parser = @import("../expr/parser.zig");
@@ -1623,6 +1624,8 @@ fn prepareAggregateWithMetas(
     errdefer winners.settle(0);
     defer if (group_by_keys != null and !leave_tables) winners.settle(0);
     var work_cursor = std.atomic.Value(usize).init(0);
+    // Mapped inputs read ahead of the workers; gated ones are read ahead by their own reader.
+    var read_ahead_state = try read_ahead.ReadAhead.forScan(arena, args.read_ahead, args.inputs, worker_work, metas, &plan, n_workers);
     for (workers, 0..) |*w, wi| {
         w.* = .{
             .gpa = gpa,
@@ -1630,6 +1633,7 @@ fn prepareAggregateWithMetas(
             .metas = metas,
             .work = worker_work,
             .cursor = &work_cursor,
+            .read_ahead = if (read_ahead_state) |*ra| ra else null,
             .agg_calls = agg_calls,
             .plan = &plan,
             .decode_options = .{

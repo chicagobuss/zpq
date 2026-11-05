@@ -1383,3 +1383,82 @@ test "DISTINCT second passes survive cold auto pread and uring readers on a larg
         }
     }
 }
+
+test "cold mapped passes read ahead of their workers and answer as the faulting mapping, at every -j" {
+    if (@import("builtin").os.tag != .linux) return;
+    const read_ahead = @import("../core/scan/read_ahead.zig");
+    const gpa = std.testing.allocator;
+    var held = std.heap.ArenaAllocator.init(gpa);
+    defer held.deinit();
+    const a = held.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/read-ahead.parquet", .{tmp.sub_path}, 0);
+    const fd = try local_fs.createFile(path);
+    defer local_fs.close(fd);
+    const FileSink = struct {
+        fd: local_fs.fd_t,
+        fn write(ctx: *anyopaque, bytes: []const u8) !void {
+            const sink: *@This() = @ptrCast(@alignCast(ctx));
+            try local_fs.writeAll(sink.fd, bytes);
+        }
+    };
+    var sink: FileSink = .{ .fd = fd };
+    var file = try consumer.AggregateFile.init(a, .{ .ctx = &sink, .write_fn = FileSink.write });
+    defer file.deinit();
+    const n = 16384;
+    const k = try a.alloc(i64, n);
+    const v = try a.alloc(i64, n);
+    const x = try a.alloc(i64, n);
+    const cols = [_]@import("../core/expr/agg.zig").OutputCol{
+        .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = k } } },
+        .{ .name = "v", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = v } } },
+        .{ .name = "x", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = x } } },
+    };
+    for (0..48) |rg| {
+        for (k, v, x, 0..) |*key, *value, *other, i| {
+            const hash = @import("../core/expr/aggregate/census.zig").splitMix64(rg * n + i);
+            key.* = @intCast(hash % 3000);
+            value.* = @intCast(i % 97);
+            other.* = @as(i64, @intCast(hash % 1000)) - 300;
+        }
+        try file.append(&cols, n, .UNCOMPRESSED, .{}, .{ .workers = 1 });
+    }
+    _ = try file.finish(&cols);
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.os.linux.fsync(fd)));
+    const Shape = struct { aggregate: []const u8, filter: ?[]const u8 };
+    const shapes = [_]Shape{
+        // The count-ranked DISTINCT: its first pass re-views the input as the mapping.
+        .{ .aggregate = "count(*) AS c,sum(x) AS s,avg(x) AS a,count(DISTINCT v) AS d", .filter = null },
+        // A filtered count cut, steered to the mapping for its passes.
+        .{ .aggregate = "count(*) AS c,sum(x) AS s", .filter = "x > 0" },
+    };
+    for (shapes) |shape| for ([_]usize{ 1, 4, 16 }) |jobs| {
+        const args: QueryArgs = .{
+            .inputs = &.{path},
+            .group_by = "k",
+            .aggregate = shape.aggregate,
+            .filter = shape.filter,
+            .parallelism = jobs,
+            .max_memory = 1 << 30,
+            .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 },
+        };
+        // Only this test-owned, synced file is evicted; the benchmark inputs are untouched.
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.os.linux.fadvise(fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED)));
+        const off = [_:null]?[*:0]const u8{"ZPQ_IO_ADVISE=off"};
+        var want = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = &off } }, .io = std.testing.io }, args);
+        defer want.deinit(gpa);
+        for ([_][*:0]const u8{ "ZPQ_IO_ADVISE=auto", "ZPQ_IO_ADVISE=always" }) |mode| {
+            try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.os.linux.fadvise(fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED)));
+            read_ahead.test_peak_ahead.store(0, .monotonic);
+            const lines = [_:null]?[*:0]const u8{mode};
+            var got = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io }, args);
+            defer got.deinit(gpa);
+            // Cold, the mapped passes advised what their workers were about to decode.
+            try std.testing.expect(read_ahead.test_peak_ahead.load(.monotonic) > 0);
+            try std.testing.expectEqualDeep(want.aggregate.output.group_rows, got.aggregate.output.group_rows);
+            try std.testing.expectEqualDeep(want.aggregate.output.aggs, got.aggregate.output.aggs);
+        }
+    };
+}

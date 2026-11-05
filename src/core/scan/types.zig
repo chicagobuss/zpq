@@ -102,6 +102,9 @@ pub const MultiAggArgs = struct {
     start_reads: ?ReadStart = null,
     /// See `DictProbe`.
     dict_probe: ?DictProbe = null,
+    /// Local inputs: how far a pass over their mappings reads ahead of its workers (`read_ahead.ReadAhead`). A pass
+    /// over gated inputs (the local reader, an S3 window) has its reads planned already and takes none.
+    read_ahead: ?@import("read_ahead.zig").Config = null,
     /// Tests: the reader's probe cap in place of `ndv.probeCap`.
     probe_cap: ?u64 = null,
     /// Optional metadata parsed by the I/O layer. When null, metadata is

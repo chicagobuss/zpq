@@ -331,3 +331,65 @@ test "distinct admission scalar fanout prices sparse numeric ranges without chan
         try testing.expectEqualDeep(wide.output.aggs, narrow.output.aggs);
     }
 }
+
+test "compact pair owner scatters at the L2-resident fan-out and keeps a forced count" {
+    const hw = @import("../hw.zig");
+    const saved_cpu = hw.test_cpu;
+    defer hw.test_cpu = saved_cpu;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Q8's shape, skewed: half the rows in one group, the rest over six; wide values (no bitmap) that repeat within
+    // and across copies.
+    var k: [2048]i64 = undefined;
+    var x: [2048]i64 = undefined;
+    for (&k, &x, 0..) |*key, *value, i| {
+        key.* = if (i % 2 == 0) 0 else @intCast(1 + i % 6);
+        const v: usize = i % 997;
+        value.* = @bitCast(std.hash.Wyhash.hash(0, std.mem.asBytes(&v)));
+    }
+    const cols = [_]expr_agg.OutputCol{
+        .{ .name = "k", .col = .{ .i64 = .{ .values = &k } }, .parquet_type = .INT64, .nullable = false },
+        .{ .name = "x", .col = .{ .i64 = .{ .values = &x } }, .parquet_type = .INT64, .nullable = false },
+    };
+    var bytes: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &cols, k.len, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const rgs = try a.alloc(schema.RowGroup, 128);
+    @memset(rgs, meta.row_groups.items[0]);
+    meta.row_groups.items = rgs;
+    meta.num_rows *= 128;
+    var args: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "compact-fanout", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(DISTINCT x) AS d",
+        .group_by = "k",
+        .integer_records = false,
+        .integer_records_min_rows = 1,
+        .plain_rules = false,
+        .max_memory = 512 << 20,
+        .min_bytes_per_worker = 1,
+        .result_order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 5 },
+    };
+    var want = try runMultiAggregate(gpa, a, args);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, args.result_order);
+    args.integer_records = true;
+    // A 32 KiB L2 share keeps 64 tail blocks resident; the rows alone would quote more partitions.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 64 << 10, .line_bytes = 64, .max_sharing = 2 } };
+    const capped = (try explainAggregate(gpa, a, args)).record_path.?;
+    try testing.expectEqual(.pair_distinct, capped.layout);
+    try testing.expectEqual(@as(usize, 64), capped.partitions);
+    args.byte_top_partitions = 512;
+    try testing.expectEqual(@as(usize, 512), (try explainAggregate(gpa, a, args)).record_path.?.partitions);
+    for ([_]?usize{ null, 512 }) |forced| for ([_]usize{ 1, 4, 16 }) |j| {
+        args.byte_top_partitions = forced;
+        args.parallelism = j;
+        var got = try runMultiAggregate(gpa, a, args);
+        defer got.deinit(gpa);
+        try testing.expect(got.distinct_pairs);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    };
+}

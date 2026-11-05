@@ -563,6 +563,16 @@ fn pairLocalSetWork(
     return entries *| set_bytes +| rows *| (key_bytes + @sizeOf(u64) * 2 + @sizeOf(usize) * 2);
 }
 
+/// The compact owner's partitions. Its repeat filter thins the records before they reach the scatter, so the rows the
+/// quote sized partitions from overstate what each one folds: the fan-out is the one the workers' L2 keeps resident
+/// (`owner_cost.residentParts`) wherever that is the smaller. A forced count (`byte_top_partitions`) stays as asked.
+fn compactParts(comptime words: usize, args: MultiAggArgs, quoted: usize) usize {
+    if (args.byte_top_partitions != null) return quoted;
+    const Record = @import("../owner_lanes.zig").PairImage(words).Record;
+    const Block = @import("../owner_records.zig").Writer(Record, u32).Block;
+    return @min(quoted, @import("../owner_cost.zig").residentParts(@sizeOf(Block)));
+}
+
 const PairQuote = struct {
     pairs: @import("../owner_cost.zig").Quote,
     groups: @import("../owner_cost.zig").Quote,
@@ -819,8 +829,8 @@ fn pairAnswerBits(
         args.result_order.having == null and args.result_order.hidden.len == 0)
     {
         if (@import("../owner_distinct.zig").CompactGeometry.plan(identity)) |geometry| {
-            if (geometry.bits <= 64) return compactPairAnswer(2, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, explain_only);
-            return compactPairAnswer(3, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, pq.parts, timings, explain_only);
+            if (geometry.bits <= 64) return compactPairAnswer(2, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, compactParts(2, args, pq.parts), timings, explain_only);
+            return compactPairAnswer(3, gpa, arena, args, metas, plan, work, calls, keys, outputs, identity, rows, input_rows, workers, cut.?, geometry, compactParts(3, args, pq.parts), timings, explain_only);
         }
     }
     const result_credit = if (top) T.bytes(workers, cut.?.k) else F.bytes(workers, gq.parts);

@@ -66,6 +66,35 @@ pub fn quoteStorage(
     };
 }
 
+/// The fan-out a scatter keeps resident. Each producer holds one open tail block per partition, and the tails get
+/// half of the worker's L2 share: the other half is what the producer probes beside them (the compact pair owner's
+/// repeat filter is sized to it). Past that, every scattered record misses L2 and the TLB on its partition's tail.
+/// `quote` sizes partitions from the rows so each one's fold fits L2. A producer that thins its records before the
+/// scatter takes the smaller of the two: its partitions fold fewer records than the rows quoted.
+pub fn residentParts(block_bytes: usize) usize {
+    const l2 = hw.l2BytesPerWorkerOr(640 << 10);
+    return std.math.clamp(std.math.floorPowerOfTwo(usize, @max(1, l2 / 2 / @max(1, block_bytes))), 64, 16384);
+}
+
+test "resident scatter fan-out follows the L2 share and stays inside quote's bounds" {
+    const saved = hw.test_cpu;
+    defer hw.test_cpu = saved;
+    var cpu: hw.Cpu = .{};
+    cpu.l2 = .{ .bytes = 1 << 20, .line_bytes = 64, .max_sharing = 2 };
+    hw.test_cpu = cpu;
+    try std.testing.expectEqual(@as(usize, 512), residentParts(512));
+    try std.testing.expectEqual(@as(usize, 1024), residentParts(256));
+    cpu.l2 = .{ .bytes = 1280 << 10, .line_bytes = 64, .max_sharing = 2 };
+    hw.test_cpu = cpu;
+    try std.testing.expectEqual(@as(usize, 512), residentParts(512));
+    cpu.l2 = .{ .bytes = 64 << 10, .line_bytes = 64, .max_sharing = 2 };
+    hw.test_cpu = cpu;
+    try std.testing.expectEqual(@as(usize, 64), residentParts(512));
+    cpu.l2 = .{ .bytes = 1 << 32, .line_bytes = 64, .max_sharing = 1 };
+    hw.test_cpu = cpu;
+    try std.testing.expectEqual(@as(usize, 16384), residentParts(512));
+}
+
 test "owner cost selected work never discounts physical records or exact histogram scratch" {
     const L = lanes.Layout(u128, &.{.sum}, u32);
     const Fold = @import("owner_fold.zig").Table(L);

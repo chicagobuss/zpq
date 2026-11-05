@@ -2410,6 +2410,11 @@ fn countRankedAttempt(
     first.ledger = &phase.budget;
     const rank = [_]expr_ast.OrderKey{.{ .column = 1 + cut.a_idx - @intFromBool(cut.a_idx > di), .descending = true }};
     first.result_order = .{ .keys = &rank, .limit = cut.k };
+    // Explaining the first pass already walks those dictionaries, before its scan would advise them: advise them here.
+    if (first.dict_probe) |dp| {
+        const ranges = try ndv.probeRanges(a, metas, keys, first.max_memory, true, first.ndv_union, true, null);
+        for (ranges) |r| try dp.add(dp.ctx, r.file, r.rg, r.start, r.end);
+    }
     const explanation = try explainAggregate(phase.charged.allocator(), a, first);
     if (!explanation.dense) return null;
     // The mapping is complete before abandoning a streaming reader; any subsequent refusal replays that mapping.

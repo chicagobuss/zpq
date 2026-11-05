@@ -1887,7 +1887,7 @@ fn prepareAggregateWithMetas(
         } else group_tables;
         // An answer cut to its first rows by a COUNT, descending, merges only the groups that could make the cut.
         if (result_cut == null or !result_cut.?.ranking_first)
-            try premergeLargeDistinctSets(gpa, arena, out_tables, agg_calls, n_workers);
+            try premergeLargeDistinctSets(gpa, arena, lists, out_tables, agg_calls, n_workers);
         // COUNT-only ranks go straight to parallel partition heaps. DISTINCT cardinality bounds can discard
         // expensive losing sets before the payload merge; that merge still runs on the requested workers.
         const first_parallel = n_workers > 1 and args.result_order.keys.len == 0 and

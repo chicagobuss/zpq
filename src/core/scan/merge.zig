@@ -876,9 +876,12 @@ pub fn firstCandidates(arena: std.mem.Allocator, tables: []const expr_agg.GroupT
 /// nominees, `tau`, is a floor on the k-th largest total of all. A key whose total reaches `tau` across `m` tables has
 /// at least `tau / m` in one of them, so the keys some table counts that high are all that can make the cut, ties at
 /// the cut included; the rest are never merged or materialized. Typically a few hundred groups of millions survive.
+/// `lists` holds the union count's slices and per-slice maps, as the merge's own lists (`MultiAggArgs.merge_memory`
+/// under a ledger); the sets themselves stay on `gpa`.
 pub fn premergeLargeDistinctSets(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
+    lists: std.mem.Allocator,
     tables: []expr_agg.GroupTable,
     calls: []const expr_agg.AggCall,
     n_workers: usize,
@@ -968,7 +971,7 @@ pub fn premergeLargeDistinctSets(
 
             if (!is_u64 or sources.items.len <= 1) continue;
 
-            const total = try parallelDistinctCountU64(gpa, arena, sources.items, n_workers);
+            const total = try parallelDistinctCountU64(lists, arena, sources.items, n_workers);
 
             var first = true;
             for (tables) |*gt| {

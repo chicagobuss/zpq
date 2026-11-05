@@ -165,3 +165,25 @@ test "parallelDistinctCountU64 counts the exact union of overlapping sets" {
         try testing.expectEqual(@as(u64, 100_000), try parallelDistinctCountU64(a, arena_state.allocator(), &sources, workers));
     }
 }
+
+test "parallelDistinctCountU64 draws its slices and maps from the allocator it is given and gives them back" {
+    const a = testing.allocator;
+    const core_memory = @import("../memory.zig");
+    var sets: [2]expr_agg.DistinctSet = .{ .{}, .{} };
+    defer for (&sets) |*d| d.deinit(a);
+    for (&sets, 0..) |*d, i| for (0..20_000) |v| try d.insertU64(a, (v + i * 10_000) * 7919);
+    const sources = [_]*const expr_agg.DistinctSet{ &sets[0], &sets[1] };
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    // The merge's ledger, as `MultiAggArgs.merge_memory` charges it: room for the union, then far too little.
+    var roomy: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+    var charged: core_memory.Charged = .{ .child = a, .budget = &roomy };
+    try testing.expectEqual(@as(u64, 30_000), try parallelDistinctCountU64(charged.allocator(), arena_state.allocator(), &sources, 4));
+    try testing.expect(charged.drew.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), roomy.used.load(.monotonic));
+    var tight: core_memory.SharedBudget = .{ .limit = 64 << 10 };
+    var refused: core_memory.Charged = .{ .child = a, .budget = &tight };
+    try testing.expectError(error.OutOfMemory, parallelDistinctCountU64(refused.allocator(), arena_state.allocator(), &sources, 4));
+    try testing.expect(refused.refused.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), tight.used.load(.monotonic));
+}

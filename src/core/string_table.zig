@@ -15,6 +15,13 @@ pub fn batchRows() usize {
     return std.math.floorPowerOfTwo(usize, std.math.clamp(rows, 256, 16384));
 }
 
+/// Rows of `per_row`-byte keys whose copies fit in one worker's L2. A filtered scan hashes the survivors in
+/// partition order, so that window has to reside; the dense path streams through `batchRows`.
+pub fn rowsThatFit(per_row: usize) usize {
+    const rows = hw.l2BytesPerWorkerOr(256 << 10) / @max(1, per_row);
+    return std.math.clamp(rows, 64, batchRows());
+}
+
 pub const State = struct {
     gpa: std.mem.Allocator,
     ledger: *memory.SharedBudget,

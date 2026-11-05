@@ -166,10 +166,17 @@ pub fn inlineSharedStrings(
     defer ledger.block = previous_block;
     if (args.taken) |taken| taken.insert(.shared_strings);
     var decoded = args;
-    // Record callbacks bypass automatic expression slicing. Bound their producer to the same cache-sized window
-    // as the sink, rather than retaining a whole RG's decompressed string pages beside the shared identity.
-    if (decoded.auto_decode_batches and decoded.decode_batch_rows == 0 and decoded.expr_batch_rows != 0)
-        decoded.decode_batch_rows = string_table.batchRows();
+    // Record callbacks bypass automatic expression slicing. An unfiltered scan uses the sink's cache window: the
+    // dense hash streams, and that window is the shared table's win. A filter's sink then hashes survivors in
+    // partition order. `batchRows` is sized for 16-byte slots, so a long key's copies spill out of L2 and that
+    // second touch misses; size the filtered window to the footer byte width instead.
+    if (decoded.auto_decode_batches and decoded.decode_batch_rows == 0 and decoded.expr_batch_rows != 0) {
+        const per_row: usize = if (key_rows == 0) 16 else std.math.cast(usize, @max(key_bytes / key_rows, 1)) orelse std.math.maxInt(usize);
+        decoded.decode_batch_rows = if (plan.query.filter == null)
+            string_table.batchRows()
+        else
+            string_table.rowsThatFit(per_row);
+    }
     const run = try runRecordWorkers(
         gpa,
         arena,

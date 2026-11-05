@@ -2469,6 +2469,102 @@ fn rankedStringFile(a: std.mem.Allocator, rows: usize, rg_rows: usize, key_bytes
     return .{ .bytes = sink.buffer.items, .meta = try metadata.open(a, sink.buffer.items) };
 }
 
+test "filtered long-string top-k keeps tied cutoff groups by first occurrence at every thread count" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = 2048;
+    const copies = 8;
+    const text = try a.alloc([]const u8, rows);
+    const key_defs = try a.alloc(u32, rows);
+    const flags = try a.alloc(i64, rows);
+    const pad = try a.alloc(u8, 72);
+    @memset(pad, 'k');
+    const tied = [_][]const u8{ "alpha", "bravo", "charlie", "delta" };
+    // alpha leads. bravo, charlie and delta tie under it; echo is present and loses. Unique keys the filter
+    // drops keep the writer off a dictionary, so the chunks stay PLAIN and wide enough for this owner.
+    for (text, key_defs, flags, 0..) |*key, *kd, *flag, i| {
+        kd.* = 1;
+        if (i < 4) {
+            key.* = try std.fmt.allocPrint(a, "{s}-{s}", .{ tied[i], pad });
+            flag.* = 1;
+        } else if (i == 4) {
+            key.* = try std.fmt.allocPrint(a, "echo-{s}", .{pad});
+            flag.* = 1;
+        } else if (i < 16) {
+            key.* = text[0];
+            flag.* = 1;
+        } else if (i < 22) {
+            key.* = text[1];
+            flag.* = 1;
+        } else if (i < 28) {
+            key.* = text[2];
+            flag.* = 1;
+        } else if (i < 34) {
+            key.* = text[3];
+            flag.* = 1;
+        } else if (i % 2 == 0) {
+            key.* = try std.fmt.allocPrint(a, "{d}-{s}", .{ i, pad });
+            flag.* = 0;
+        } else {
+            key.* = try std.fmt.allocPrint(a, "late-{d}-{s}", .{ i, pad });
+            flag.* = 1;
+        }
+    }
+    const columns = [_]expr_agg.OutputCol{
+        .{ .name = "k", .parquet_type = .BYTE_ARRAY, .nullable = true, .col = .{ .string = .{ .values = text, .def_levels = key_defs, .max_def = 1 } } },
+        .{ .name = "f", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = flags, .def_levels = null, .max_def = 0 } } },
+    };
+    var bytes: @import("../writer/streaming.zig").MemorySink = .{ .arena = a };
+    _ = try consumer.writeAggregateRows(a, bytes.sink(), &columns, rows, .SNAPPY, .{}, .{});
+    var meta = try metadata.open(a, bytes.buffer.items);
+    const groups = try a.alloc(schema.RowGroup, copies);
+    @memset(groups, meta.row_groups.items[0]);
+    meta.row_groups.items = groups;
+    meta.num_rows *= @intCast(groups.len);
+    const order: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 3 };
+    var base: MultiAggArgs = .{
+        .inputs = &.{.{ .name = "filtered-tie", .bytes = bytes.buffer.items }},
+        .metas = &.{meta},
+        .aggregate = "count(*) AS c",
+        .group_by = "k",
+        .filter = "f > 0",
+        .max_memory = 256 << 20,
+        .parallelism = 1,
+        .min_bytes_per_worker = 1,
+        .shared_strings = false,
+        .result_order = order,
+    };
+    var want = try runMultiAggregate(gpa, a, base);
+    defer want.deinit(gpa);
+    try want.output.applyResultOrder(gpa, order);
+    const want_rows = want.output.group_rows.?;
+    try testing.expectEqual(@as(usize, 3), want_rows.len);
+    // 12, then three keys at 7; the cut keeps the two whose first kept row is earlier.
+    try testing.expectEqual(@as(i64, 12 * copies), want_rows[0][1].i);
+    try testing.expectEqual(@as(i64, 7 * copies), want_rows[1][1].i);
+    try testing.expectEqual(@as(i64, 7 * copies), want_rows[2][1].i);
+    try testing.expectEqualStrings(text[0], want_rows[0][0].s);
+    try testing.expectEqualStrings(text[1], want_rows[1][0].s);
+    try testing.expectEqualStrings(text[2], want_rows[2][0].s);
+    for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+        base.shared_strings = true;
+        base.parallelism = j;
+        base.decode_batch_rows = window;
+        var taken: std.EnumSet(FastPath) = .{};
+        base.taken = &taken;
+        const ex = try explainAggregate(gpa, a, base);
+        try testing.expectEqual(.shared_string_table, ex.record_path.?.layout);
+        var got = try prepareAggregate(gpa, a, base, false);
+        defer got.deinit(gpa);
+        try testing.expect(taken.contains(.shared_strings));
+        try got.output.applyResultOrder(gpa, order);
+        try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    };
+}
+
 test "shared string top-k cut refusals replay at every budget the old path answers" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

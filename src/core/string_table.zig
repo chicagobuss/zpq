@@ -19,8 +19,14 @@ pub fn batchRows() usize {
 /// partition order, so that window has to reside; the dense path streams through `batchRows`.
 pub fn rowsThatFit(per_row: usize) usize {
     const rows = hw.l2BytesPerWorkerOr(256 << 10) / @max(1, per_row);
-    return std.math.clamp(rows, 64, batchRows());
+    const fit = std.math.clamp(rows, 64, batchRows());
+    // Tests read this after a filtered owner runs. Production does not.
+    test_fit = fit;
+    return fit;
 }
+
+/// Last window `rowsThatFit` returned on this thread. A filtered-owner test compares it with the footer width.
+pub threadlocal var test_fit: usize = 0;
 
 pub const State = struct {
     gpa: std.mem.Allocator,
@@ -280,6 +286,24 @@ fn stringAt(col: eval.Batch.Column, row: usize) !?[]const u8 {
 }
 
 const testing = std.testing;
+
+test "rowsThatFit clamps a filtered key window between 64 and batchRows" {
+    const saved = hw.test_cpu;
+    defer hw.test_cpu = saved;
+    // 8 KiB shared by two is a 4 KiB share. A huge key hits the floor; a 1-byte key hits the batch ceiling.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 8 << 10, .line_bytes = 64, .max_sharing = 2 } };
+    try std.testing.expectEqual(@as(usize, 64), rowsThatFit(std.math.maxInt(usize)));
+    try std.testing.expectEqual(batchRows(), rowsThatFit(0));
+    try std.testing.expectEqual(batchRows(), rowsThatFit(1));
+    // 64 KiB shared by two is 32 KiB. A 79-byte key fits 414 rows, strictly inside the clamps.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 64 << 10, .line_bytes = 64, .max_sharing = 2 } };
+    const mid = rowsThatFit(79);
+    try std.testing.expectEqual(@as(usize, 414), mid);
+    try std.testing.expect(mid > 64 and mid < batchRows());
+    // A share larger than the batch ceiling clamps a 1-byte key to batchRows.
+    hw.test_cpu = .{ .l2 = .{ .bytes = 64 << 20, .line_bytes = 64, .max_sharing = 1 } };
+    try std.testing.expectEqual(batchRows(), rowsThatFit(1));
+}
 
 test "shared strings keep one global identity across callbacks and gathered NULL empty selected poison" {
     const a = testing.allocator;

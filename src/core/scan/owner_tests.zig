@@ -11,6 +11,7 @@ const expr_agg = @import("../expr/agg.zig");
 const core_memory = @import("../memory.zig");
 const partagg = @import("../partagg.zig");
 const string_table = @import("../string_table.zig");
+const hw = @import("../hw.zig");
 const eval = @import("../filter/eval.zig");
 const ndv = @import("../ndv.zig");
 const agg_dense = @import("../expr/agg_dense.zig");
@@ -2548,21 +2549,45 @@ test "filtered long-string top-k keeps tied cutoff groups by first occurrence at
     try testing.expectEqualStrings(text[0], want_rows[0][0].s);
     try testing.expectEqualStrings(text[1], want_rows[1][0].s);
     try testing.expectEqualStrings(text[2], want_rows[2][0].s);
-    for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
-        base.shared_strings = true;
-        base.parallelism = j;
-        base.decode_batch_rows = window;
-        var taken: std.EnumSet(FastPath) = .{};
-        base.taken = &taken;
-        const ex = try explainAggregate(gpa, a, base);
-        try testing.expectEqual(.shared_string_table, ex.record_path.?.layout);
-        var got = try prepareAggregate(gpa, a, base, false);
-        defer got.deinit(gpa);
-        try testing.expect(taken.contains(.shared_strings));
-        try got.output.applyResultOrder(gpa, order);
-        try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
-        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
-    };
+    var key_bytes: u128 = 0;
+    var key_rows: u128 = 0;
+    for (meta.row_groups.items) |rg| {
+        const cm = rg.columns.items[0].meta_data.?;
+        key_bytes += @intCast(@max(0, cm.total_uncompressed_size));
+        key_rows += @intCast(@max(0, rg.num_rows));
+    }
+    const per_row: usize = @intCast(@max(key_bytes / key_rows, 1));
+    const saved_cpu = hw.test_cpu;
+    defer hw.test_cpu = saved_cpu;
+    // The engine sets this when no decode-window env is forced. The default leaves the owner's block unreached.
+    base.auto_decode_batches = true;
+    // null is this host's L2; 64 KiB and 8 KiB (shared by two) are a mid window and the 64-row floor.
+    for ([_]?usize{ null, 64 << 10, 8 << 10 }) |l2_bytes| {
+        hw.test_cpu = if (l2_bytes) |share|
+            .{ .l2 = .{ .bytes = share, .line_bytes = 64, .max_sharing = 2 } }
+        else
+            null;
+        for ([_]usize{ 1, 4, 16 }) |j| for ([_]usize{ 0, 64 }) |window| {
+            base.shared_strings = true;
+            base.parallelism = j;
+            base.decode_batch_rows = window;
+            string_table.test_fit = 0;
+            var taken: std.EnumSet(FastPath) = .{};
+            base.taken = &taken;
+            const ex = try explainAggregate(gpa, a, base);
+            try testing.expectEqual(.shared_string_table, ex.record_path.?.layout);
+            var got = try prepareAggregate(gpa, a, base, false);
+            defer got.deinit(gpa);
+            // Snapshot before the expectation calls rowsThatFit, which would overwrite the owner's window.
+            const got_fit = string_table.test_fit;
+            const want_fit: usize = if (window == 0) string_table.rowsThatFit(per_row) else 0;
+            try testing.expectEqual(want_fit, got_fit);
+            try testing.expect(taken.contains(.shared_strings));
+            try got.output.applyResultOrder(gpa, order);
+            try testing.expectEqualDeep(want.output.group_cols, got.output.group_cols);
+            try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+        };
+    }
 }
 
 test "shared string top-k cut refusals replay at every budget the old path answers" {

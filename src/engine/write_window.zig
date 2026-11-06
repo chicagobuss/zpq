@@ -48,33 +48,42 @@ const BufSink = struct {
     gpa: std.mem.Allocator,
     /// Input ranges a range copy can take, left out of `buf` for the writer to copy into place (`placeCopy`).
     marks: ?*std.ArrayListUnmanaged(Mark) = null,
-    /// The zeros before the first byte, which the writer pads to instead, and whether any run was aligned: the
-    /// buffer's offsets assume it starts at a multiple of `fastpath.share_block`.
-    lead: usize = 0,
-    aligned: bool = false,
+    /// Bytes the copy spans so far: `buf`, the marks and the gaps.
+    len: usize = 0,
+    /// The first aligned run's gap, left out of `buf`: the writer sizes it at the run's real offset.
+    gap: ?Gap = null,
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *BufSink = @ptrCast(@alignCast(ctx));
         try self.buf.appendSlice(self.gpa, bytes);
+        self.len += bytes.len;
     }
 
     fn padFn(ctx: *anyopaque, n: usize) anyerror!void {
         const self: *BufSink = @ptrCast(@alignCast(ctx));
-        self.aligned = true;
-        const empty = self.buf.items.len == 0 and (self.marks == null or self.marks.?.items.len == 0);
-        if (empty) self.lead += n else try self.buf.appendNTimes(self.gpa, 0, n);
+        if (self.gap == null) {
+            const marks = if (self.marks) |m| m.items.len else 0;
+            self.gap = .{ .at = self.len, .len = n, .lit = self.buf.items.len, .marks = marks };
+        } else try self.buf.appendNTimes(self.gpa, 0, n);
+        self.len += n;
     }
 
     fn copyRangeFn(ctx: *anyopaque, range: streaming.SourceRange) anyerror!usize {
         const self: *BufSink = @ptrCast(@alignCast(ctx));
         const marks = self.marks orelse return 0;
         try marks.append(self.gpa, .{ .at = self.buf.items.len, .offset = range.offset, .len = range.len });
+        self.len += range.len;
         return range.len;
     }
 };
 
 /// Input bytes `[offset, offset + len)` that belong in a byte-copied row group's buffer before its byte `at`.
 const Mark = struct { at: usize, offset: u64, len: usize };
+
+/// Where the first aligned run's gap of a buffered byte copy went: `len` zeros at buffer offset `at`, sized for an
+/// offset 0 at a multiple of `fastpath.share_block`, before `buf[lit]` and mark `marks`. Everything after it keeps its
+/// remainder modulo the block; everything before it is unaligned, as it would be written in place.
+const Gap = struct { at: usize, len: usize, lit: usize, marks: usize };
 
 /// Address space one re-encoded row group reserves for its working memory (committed only as touched; past it, the
 /// general allocator).
@@ -154,11 +163,10 @@ const EncodedRG = struct {
     /// A byte copy's input ranges, interleaved with `bytes` (gpa-owned): the writer copies them from the input,
     /// which it releases after.
     marks: []Mark = &.{},
-    /// Bytes the copy spans: `bytes` and the marks, after `lead` zeros the writer pads to instead. With `aligned`,
-    /// its offsets assume offset 0 is a multiple of `fastpath.share_block`.
+    /// Bytes the copy spans (`bytes`, the marks and its gaps), and its first aligned run's gap, which the writer
+    /// sizes again where the copy lands (`placeCopy`).
     len: usize = 0,
-    lead: usize = 0,
-    aligned: bool = false,
+    gap: ?Gap = null,
     /// A re-encoded row group's kept rows, decoded, for the writer to cut into output row groups.
     piece: ?*Piece = null,
     /// Too big for a producer to decode at once: the writer decodes it a slice at a time in its turn
@@ -357,35 +365,67 @@ fn copyRGToBuffer(
         .rg = out.rg,
         .marks = owned_marks,
         .len = @intCast(local_off),
-        .lead = bufsink.lead,
-        .aligned = bufsink.aligned,
+        .gap = bufsink.gap,
         .surviving = out.surviving_rows,
         .timings = timings,
     };
 }
 
-/// Write byte-copied row group `enc` of `job` at the writer's offset, and return its offsets' base: where the buffer's
-/// offset 0 lands. An aligned copy is padded so its offsets keep their remainder modulo `fastpath.share_block`; its
-/// marks are copied from the input, by range copy when the sink can.
-fn placeCopy(w: *WinCtx, job: RGJob, enc: EncodedRG) !u64 {
+/// Where a buffered byte copy's offsets landed: an offset below `split` at `before` plus it, any other at `after` plus
+/// it (the first aligned run's gap, sized again at its real offset, lies between).
+const Placement = struct {
+    split: usize = std.math.maxInt(usize),
+    before: i64,
+    after: i64,
+
+    fn rebase(p: Placement, rg: *schema.RowGroup) void {
+        for (rg.columns.items) |*col| {
+            const m = col.meta_data orelse continue;
+            const start: usize = @intCast(m.dictionary_page_offset orelse m.data_page_offset);
+            consumer.rebaseColumnOffsets(col, if (start < p.split) p.before else p.after);
+        }
+    }
+};
+
+/// Write byte-copied row group `enc` of `job` at the writer's offset, with the bytes and offsets `copyRG` straight to
+/// the sink there would give: what precedes its first aligned run in place, that run's gap sized at its real offset,
+/// the rest after it. Its marks are copied from the input, by range copy when the sink can.
+fn placeCopy(w: *WinCtx, job: RGJob, enc: EncodedRG) !Placement {
     const block = fastpath.share_block;
     var out: streaming.SinkOut = .{ .sink = w.sink, .offset = @intCast(w.out_offset) };
-    const pad = if (enc.aligned) (enc.lead % block + block - out.offset % block) % block else 0;
+    const start = out.offset;
+    const gap = enc.gap orelse Gap{ .at = enc.len, .len = 0, .lit = enc.bytes.len, .marks = enc.marks.len };
+    try placeSpan(w, job, &out, enc, 0, gap.lit, enc.marks[0..gap.marks]);
+    const pad = if (enc.gap == null) 0 else (gap.at + gap.len + block - out.offset % block) % block;
     try out.pad(pad);
-    const base = out.offset - enc.lead;
-    var lit: usize = 0;
-    for (enc.marks) |m| {
+    try placeSpan(w, job, &out, enc, gap.lit, enc.bytes.len, enc.marks[gap.marks..]);
+    std.debug.assert(out.offset - start == enc.len - gap.len + pad);
+    w.core.copied_bytes += enc.timings.copied_bytes;
+    w.core.pad_bytes += enc.timings.pad_bytes - gap.len + pad;
+    w.out_offset = out.offset;
+    const before: i64 = @intCast(start);
+    if (enc.gap == null) return .{ .before = before, .after = before };
+    return .{ .split = gap.at, .before = before, .after = before + @as(i64, @intCast(pad)) - @as(i64, @intCast(gap.len)) };
+}
+
+/// `enc.bytes[lo..hi]` with `marks` (those in that span) copied from the input in their places.
+fn placeSpan(
+    w: *WinCtx,
+    job: RGJob,
+    out: *streaming.SinkOut,
+    enc: EncodedRG,
+    lo: usize,
+    hi: usize,
+    marks: []const Mark,
+) !void {
+    var lit = lo;
+    for (marks) |m| {
         try out.write(enc.bytes[lit..m.at]);
-        const start: usize = @intCast(m.offset);
-        w.core.kernel_bytes += try out.copyRange(job.fd, m.offset, job.bytes[start..][0..m.len]);
+        const at: usize = @intCast(m.offset);
+        w.core.kernel_bytes += try out.copyRange(job.fd, m.offset, job.bytes[at..][0..m.len]);
         lit = m.at;
     }
-    try out.write(enc.bytes[lit..]);
-    std.debug.assert(out.offset - base == enc.len);
-    w.core.copied_bytes += enc.timings.copied_bytes;
-    w.core.pad_bytes += enc.timings.pad_bytes - enc.lead + pad;
-    w.out_offset = out.offset;
-    return base;
+    try out.write(enc.bytes[lit..hi]);
 }
 
 /// The writer's cutter: takes pieces in input order, holds their rows until an output row group's worth is in, then
@@ -1551,15 +1591,15 @@ fn winWriter(w: *WinCtx) void {
             if (w.first_err == null and enc.surviving > 0) {
                 var rgm = rg;
                 const t0 = nowMonoNs();
-                const base = placeCopy(w, w.jobs[next], enc) catch |e| blk: {
+                const placed = placeCopy(w, w.jobs[next], enc) catch |e| blk: {
                     w.first_err = e;
-                    break :blk 0;
+                    break :blk Placement{ .before = 0, .after = 0 };
                 };
                 const t1 = nowMonoNs();
                 w.sink_ns += @intCast(t1 - t0);
                 profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.len}));
                 if (w.first_err == null) {
-                    consumer.rebaseRowGroupOffsets(&rgm, @intCast(base));
+                    placed.rebase(&rgm);
                     w.rows_kept += enc.surviving;
                     w.rgs_kept += 1;
                     w.new_row_groups.append(w.arena, rgm) catch |e| {
@@ -2466,6 +2506,8 @@ test "a windowed byte copy places the bytes a direct copy writes, its ranges cop
     defer @import("../local_fs.zig").close(fd);
     const meta = try metadata.open(a, bytes);
     const kept_cols = [_]bool{ true, false, true };
+    // `f` holds a whole block only at some offsets: a leading run that is not aligned before one that is.
+    const kept_tail = [_]bool{ false, true, true };
     // A sink that range-copies by reading the descriptor, as a kernel would, counting what it took.
     const Ranged = struct {
         buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -2485,7 +2527,7 @@ test "a windowed byte copy places the bytes a direct copy writes, its ranges cop
             return n;
         }
     };
-    for ([_]?[]const bool{ null, &kept_cols }) |kept| for ([_]bool{ false, true }) |ranged| {
+    for ([_]?[]const bool{ null, &kept_cols, &kept_tail }) |kept| for ([_]bool{ false, true }) |ranged| {
         // Direct: each row group straight to the output, at its absolute offsets.
         var direct: streaming.MemorySink = .{ .arena = a };
         try direct.buffer.appendSlice(a, "PAR1");
@@ -2518,9 +2560,9 @@ test "a windowed byte copy places the bytes a direct copy writes, its ranges cop
             };
             const enc = try copyRGToBuffer(a, a, job, kept, null, &.{}, false);
             try t.expect(enc.marks.len > 0);
-            const base = try placeCopy(&w, job, enc);
+            const where = try placeCopy(&w, job, enc);
             var got = enc.rg.?;
-            consumer.rebaseRowGroupOffsets(&got, @intCast(base));
+            where.rebase(&got);
             for (want.rg.?.columns.items, got.columns.items) |wc, gc|
                 try t.expectEqual(wc.meta_data.?.data_page_offset, gc.meta_data.?.data_page_offset);
         }

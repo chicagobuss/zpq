@@ -170,15 +170,18 @@ pub const RGOut = struct {
 /// `+= out_offset.*` arithmetic `encodeAggregator` does inline when it
 /// writes straight to the sink.
 pub fn rebaseRowGroupOffsets(rg: *schema.RowGroup, base: i64) void {
-    for (rg.columns.items) |*col| {
-        col.file_offset += base;
-        if (col.column_index_offset) |v| col.column_index_offset = v + base;
-        if (col.offset_index_offset) |v| col.offset_index_offset = v + base;
-        if (col.meta_data) |*md| {
-            md.data_page_offset += base;
-            if (md.dictionary_page_offset) |dp| md.dictionary_page_offset = dp + base;
-            if (md.index_page_offset) |ip| md.index_page_offset = ip + base;
-        }
+    for (rg.columns.items) |*col| rebaseColumnOffsets(col, base);
+}
+
+/// One column chunk's share of `rebaseRowGroupOffsets`.
+pub fn rebaseColumnOffsets(col: *schema.ColumnChunk, base: i64) void {
+    col.file_offset += base;
+    if (col.column_index_offset) |v| col.column_index_offset = v + base;
+    if (col.offset_index_offset) |v| col.offset_index_offset = v + base;
+    if (col.meta_data) |*md| {
+        md.data_page_offset += base;
+        if (md.dictionary_page_offset) |dp| md.dictionary_page_offset = dp + base;
+        if (md.index_page_offset) |ip| md.index_page_offset = ip + base;
     }
 }
 

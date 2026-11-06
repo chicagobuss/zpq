@@ -27,6 +27,7 @@ pub const Error = error{
     IntegerOverflowSub,
     IntegerOverflowMul,
     IntegerOverflowRound,
+    IntegerOverflowAbs,
     DecimalOverflow,
     DecimalScaleTooLarge,
     /// The arithmetic reads a value whose SQL type zpq does not resolve (the min or max of an expression or of a FLOAT
@@ -572,6 +573,8 @@ const Compiled = struct {
         neg: *const Compiled,
         arith: struct { op: expr_ast.PostOp, left: *const Compiled, right: *const Compiled },
         round: struct { value: *const Compiled, digits: i32 },
+        abs: *const Compiled,
+        nullif: struct { value: *const Compiled, other: *const Compiled },
     };
 };
 
@@ -698,6 +701,16 @@ fn compile(
             };
             break :blk .{ .ty = ty, .node = .{ .round = .{ .value = v, .digits = r.digits } } };
         },
+        .abs => |inner| blk: {
+            const v = try compile(arena, inner.*, types, facts);
+            break :blk .{ .ty = v.ty, .node = .{ .abs = v } };
+        },
+        // The value's type, as DuckDB's: `other` only decides which rows are NULL.
+        .nullif => |n| blk: {
+            const value = try compile(arena, n.value.*, types, facts);
+            const other = try compile(arena, n.other.*, types, facts);
+            break :blk .{ .ty = value.ty, .node = .{ .nullif = .{ .value = value, .other = other } } };
+        },
     };
     return out;
 }
@@ -785,6 +798,20 @@ fn eval(node: *const Compiled, row: []const scan.AggValue) Error!?Raw {
                 },
             }
         },
+        .abs => |inner| {
+            const v = (try eval(inner, row)) orelse return null;
+            return switch (node.ty) {
+                .float => .{ .f = @abs(v.f) },
+                // DuckDB: "Overflow on abs(-2147483648)" for the minimum of the type.
+                .int => |t| .{ .i = try inType(t, if (v.i < 0) std.math.negate(v.i) catch return error.IntegerOverflowAbs else v.i, error.IntegerOverflowAbs) },
+                .dec => .{ .i = if (v.i < 0) std.math.negate(v.i) catch return error.IntegerOverflowAbs else v.i },
+            };
+        },
+        .nullif => |n| {
+            const v = (try eval(n.value, row)) orelse return null;
+            const other = (try eval(n.other, row)) orelse return v;
+            return if (rawOrder(n.value.ty, v, n.other.ty, other) == .eq) null else v;
+        },
         .round => |r| {
             const v = (try eval(r.value, row)) orelse return null;
             return switch (r.value.ty) {
@@ -858,6 +885,16 @@ fn decimalMeanWide(sum: i192, scale: u8, count: i64) f64 {
     const per: f128 = @floatFromInt(expr_ast.pow10(scale));
     const mean: f128 = wideAsFloat(sum) / per / @as(f128, @floatFromInt(count));
     return @floatCast(mean);
+}
+
+/// How two values of `PostType`s order: exactly when both are integers or DECIMALs (at the larger scale), else as
+/// doubles. NaN orders equal to itself and above every number, as zpq orders floats.
+fn rawOrder(lt: PostType, l: Raw, rt: PostType, r: Raw) std.math.Order {
+    if (lt == .float or rt == .float) return floatOrder(asFloat(lt, l), asFloat(rt, r));
+    const scale = @max(lt.scale(), rt.scale());
+    const x = @as(i256, l.i) * @as(i256, expr_ast.pow10(scale - lt.scale()));
+    const y = @as(i256, r.i) * @as(i256, expr_ast.pow10(scale - rt.scale()));
+    return std.math.order(x, y);
 }
 
 /// `round(x, digits)` of a double as DuckDB computes it: scale, round half away from zero, scale back. A non-finite
@@ -1658,6 +1695,41 @@ test "ROUND keeps a non-finite input whatever the digits, and zeroes only a fini
     try std.testing.expectEqual(@as(f64, 0), roundDouble(123.456, -400));
     try std.testing.expectEqual(@as(f64, 123.456), roundDouble(123.456, 400));
     try std.testing.expectEqual(@as(f64, 1.7e308), roundDouble(1.7e308, -1));
+}
+
+test "abs keeps its type and overflows at the type's minimum; nullif is NULL where the value equals the other" {
+    const kinds = [_]?expr_ast.IntType{ null, .i32, null, .i32, .i32 };
+    const types = [_]scan.GroupColType{
+        .{ .lane = .dec, .dec = .{ .precision = 38, .scale = 2 }, .nullable = true },
+        .{ .lane = .i64, .nullable = true },
+        .{ .lane = .f64, .nullable = true },
+        .{ .lane = .i64, .nullable = true },
+        .{ .lane = .i64, .nullable = true },
+    };
+    const row = [_]scan.AggValue{ dec2(-12345), .{ .i = -7 }, .{ .f = -2.5 }, .null_val, .{ .i = -2147483648 } };
+    const col = struct {
+        fn at(n: usize) expr_ast.PostExpr {
+            return .{ .col = .{ .column = n } };
+        }
+    }.at;
+    const abs_dec = try evalPostInts(.{ .abs = &col(0) }, &types, &kinds, &row);
+    try std.testing.expectEqual(@as(i128, 12345), abs_dec.dec.v);
+    try std.testing.expectEqual(@as(u8, 2), abs_dec.dec.spec.scale);
+    try std.testing.expectEqual(@as(i128, 7), (try evalPostInts(.{ .abs = &col(1) }, &types, &kinds, &row)).i);
+    try std.testing.expectEqual(@as(f64, 2.5), (try evalPostInts(.{ .abs = &col(2) }, &types, &kinds, &row)).f);
+    try std.testing.expect((try evalPostInts(.{ .abs = &col(3) }, &types, &kinds, &row)) == .null_val);
+    // abs(INTEGER minimum) is an overflow in INTEGER, as DuckDB's "Overflow on abs(-2147483648)".
+    try std.testing.expectError(error.IntegerOverflowAbs, evalPostInts(.{ .abs = &col(4) }, &types, &kinds, &row));
+    // nullif compares exactly (a DECIMAL against a decimal literal of another scale, an integer against a literal).
+    const equal = try evalPostInts(.{ .nullif = .{ .value = &col(0), .other = &.{ .neg = &.{ .number = "123.450" } } } }, &types, &kinds, &row);
+    try std.testing.expect(equal == .null_val);
+    const differs = try evalPostInts(.{ .nullif = .{ .value = &col(0), .other = &.{ .number = "123" } } }, &types, &kinds, &row);
+    try std.testing.expectEqual(@as(i128, -12345), differs.dec.v);
+    try std.testing.expect((try evalPostInts(.{ .nullif = .{ .value = &col(1), .other = &.{ .neg = &.{ .number = "7" } } } }, &types, &kinds, &row)) == .null_val);
+    // A NULL other leaves the value; a NULL value stays NULL.
+    const kept = try evalPostInts(.{ .nullif = .{ .value = &col(1), .other = &col(3) } }, &types, &kinds, &row);
+    try std.testing.expectEqual(@as(i128, -7), kept.i);
+    try std.testing.expect((try evalPostInts(.{ .nullif = .{ .value = &col(3), .other = &col(1) } }, &types, &kinds, &row)) == .null_val);
 }
 
 test "finish with computed columns leaves the answer whole when it runs out of memory" {

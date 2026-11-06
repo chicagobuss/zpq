@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`nullif` and `abs` in SQL.** `nullif(col, literal)` and `abs(x)` of an integer, DOUBLE or DECIMAL expression (in a
+  SELECT, inside an aggregate or as a GROUP BY key) and `nullif(x, y)` and `abs(x)` over aggregates
+  (`sum(a) / nullif(sum(b), 0)`) now run and match DuckDB, including its overflow error for the minimum of an integer
+  type. A non-column or non-literal in `nullif`, and `abs` of text, are refused by name.
 - **Expressions over aggregates in SQL.** `sum(a) / sum(b)`, `100 * sum(CASE ...) / sum(...)`, `round(avg(x), 2)`,
   `sum(a) + sum(b)` and their kin now run as a SELECT item, in `HAVING` (`sum(a) > avg(a) * 1000`, also a result
   against another result) and in `ORDER BY` (`ORDER BY sum(a) / count(*) DESC`), with or without GROUP BY. Each is computed

@@ -48,6 +48,8 @@ pub const Error = error{
     IntegerOverflowSub,
     IntegerOverflowMul,
     IntegerOverflowDiv,
+    /// `abs` of the minimum of its integer type (DuckDB: "Overflow on abs(-2147483648)").
+    IntegerOverflowAbs,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.
@@ -1273,7 +1275,72 @@ fn evalCall(
         .make_date, .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
+        .abs => return evalAbs(arena, batch, column_lookup, c),
     }
+}
+
+/// `abs(x)`: the magnitude in the argument's type. A NULL row stays NULL. Only a row the batch wants can fault: an
+/// integer whose magnitude its type cannot hold (the column's SQL type for a bare column, BIGINT otherwise).
+fn evalAbs(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    if (arg.typeOf() == .dec) return evalAbsDecimal(arena, batch, column_lookup, arg);
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const out = try arena.alloc(i64, in.values.len);
+            const t = c.int orelse .i64;
+            for (in.values, out, 0..) |v, *o, i| {
+                o.* = v;
+                if (v >= 0) continue;
+                if (std.math.negate(v)) |m| {
+                    if (t.holds(m)) {
+                        o.* = m;
+                        continue;
+                    }
+                } else |_| {}
+                if (rowIsNull(col, i) or (batch.sel != null and !batch.sel.?.isActive(i))) {
+                    o.* = 0;
+                    continue;
+                }
+                return error.IntegerOverflowAbs;
+            }
+            return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const out = try arena.alloc(f64, in.values.len);
+            for (in.values, out) |v, *o| o.* = @abs(v);
+            return .{ .f64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// `abs` of an exact DECIMAL: its unscaled integers, read as any exact operand is, at their own scale.
+fn evalAbsDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!Batch.Column {
+    const o = try decOperandCached(arena, batch, column_lookup, arg, arg.decSpec().?.scale, null);
+    const n = batch.num_rows;
+    const out = try arena.alloc(i128, n);
+    switch (o.op) {
+        .scalar => |v| @memset(out, @as(i128, @intCast(@abs(v)))),
+        .i64 => |vs| for (vs, out) |v, *r| {
+            r.* = @intCast(@abs(@as(i128, v)));
+        },
+        .i64s => |x| for (x.v, out) |v, *r| {
+            r.* = @intCast(@abs(@as(i128, v) * x.factor));
+        },
+        // |v| < 10^38, so the magnitude fits i128 as the value did.
+        .i128 => |vs| for (vs, out) |v, *r| {
+            r.* = @intCast(@abs(v));
+        },
+    }
+    const def: ?[]u32 = if (o.nulls) |nc| blk: {
+        const d = try arena.alloc(u32, n);
+        for (d, 0..) |*dv, i| dv.* = @intFromBool(!rowIsNull(nc, i));
+        break :blk d;
+    } else null;
+    return .{ .i128 = .{ .values = out, .def_levels = def, .max_def = if (def != null) 1 else 0, .has_nulls = def != null } };
 }
 
 /// `CAST(s AS VARCHAR)`: the argument's texts as they are, a bare column read as decoded, codes and all.
@@ -1424,7 +1491,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

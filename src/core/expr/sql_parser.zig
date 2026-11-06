@@ -1332,10 +1332,18 @@ const PostBuilder = struct {
             const at = try hiddenAgg(self.allocator, self.lp_arena, call_node, self.hidden, self.lower);
             return .{ .col = .{ .column = self.n_select + at, .mean = mean } };
         }
+        const is_abs = std.ascii.eqlIgnoreCase(name, "abs");
+        const is_nullif = std.ascii.eqlIgnoreCase(name, "nullif");
         if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0 or
-            !std.ascii.eqlIgnoreCase(name, "round") or f.args.count < 1 or f.args.count > 2)
+            !(std.ascii.eqlIgnoreCase(name, "round") or is_abs or is_nullif) or f.args.count < 1 or f.args.count > 2 or
+            (is_abs and f.args.count != 1) or (is_nullif and f.args.count != 2))
             return postUnsupported(self.lp_arena, node, "the function in");
         const value = try self.build(f.args.items[0] orelse return postUnsupported(self.lp_arena, node, "the call"), depth + 1);
+        if (is_abs) return .{ .abs = value };
+        if (is_nullif) return .{ .nullif = .{
+            .value = value,
+            .other = try self.build(f.args.items[1] orelse return postUnsupported(self.lp_arena, node, "the call"), depth + 1),
+        } };
         var digits: i32 = 0;
         if (f.args.count == 2) {
             digits = integerLiteral(f.args.items[1] orelse return postUnsupported(self.lp_arena, node, "the call")) orelse
@@ -2212,11 +2220,31 @@ test "sql_parser reads a derived ORDER BY or HAVING term and an AVG as a mean" {
     try std.testing.expectEqualStrings("count(*) AS c, sum(a) AS " ++ hidden_alias ++ "0, sum(b) AS " ++ hidden_alias ++ "1", scalar.aggregate_str.?);
 }
 
+test "sql_parser: abs and nullif over aggregates are post-aggregate expressions; over rows abs is a call, nullif a CASE" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT g, sum(a) / nullif(sum(b), 0) AS r, abs(sum(a)) AS m FROM 't' GROUP BY g");
+    defer q.deinit(a);
+    try std.testing.expectEqual(ast.SelectColumn.Role.derived, q.select_cols[1].role);
+    try std.testing.expect(q.select_cols[1].post.?.binary.right.* == .nullif);
+    try std.testing.expect(q.select_cols[2].post.?.* == .abs);
+    // Over plain rows `nullif` is the CASE the batch evaluator already runs, `abs` a function.
+    const rows = try parseSqlPlan(a, "SELECT nullif(n, 0) AS z, abs(n - 1) AS m, nullif(s, 'x') AS t FROM 't'");
+    defer rows.deinit(a);
+    const items = rows.syntax.?.select.?;
+    try std.testing.expect(items[0].expr == .case_);
+    try std.testing.expect(items[0].expr.case_.whens[0].then == null);
+    try std.testing.expectEqualStrings("abs", items[1].expr.call.name);
+    try std.testing.expect(items[2].expr == .case_);
+    try std.testing.expectError(error.BadValue, parseSqlPlan(a, "SELECT nullif(n, m) AS z FROM 't'"));
+    try std.testing.expectError(error.ExpressionInPredicate, parseSqlPlan(a, "SELECT nullif(n - 1, 0) AS z FROM 't'"));
+    try std.testing.expectError(error.WrongArity, parseSqlPlan(a, "SELECT nullif(n) AS z FROM 't'"));
+}
+
 test "sql_parser names what stays refused in an expression over aggregates" {
     const a = std.testing.allocator;
     for ([_][]const u8{
         "SELECT sum(a) % 2 AS r FROM 't'",
-        "SELECT abs(sum(a)) AS r FROM 't'",
+        "SELECT sqrt(sum(a)) AS r FROM 't'",
         "SELECT sum(a) || 'x' AS r FROM 't'",
         "SELECT round(sum(a), count(*)) AS r FROM 't'",
         "SELECT CASE WHEN sum(a) > 1 THEN 1 ELSE 0 END AS r FROM 't'",

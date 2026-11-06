@@ -78,6 +78,7 @@ pub const Lower = struct {
             c.LP_EXPR_FUNCTION => blk: {
                 const f = node.u.function;
                 const name_ = std.mem.span(f.name);
+                if (try self.sugarCall(f, name_, depth)) |rewritten| break :blk rewritten;
                 if (parser.resolveFunc(name_) != null) {
                     if (f.order_by.count != 0) return error.ExpectedRParen;
                     if (f.filter != null) return error.TrailingTokens;
@@ -110,6 +111,23 @@ pub const Lower = struct {
             } else .{ .call = .{ .name = "CAST", .args = &.{} } },
             else => error.UnexpectedChar,
         };
+    }
+
+    /// A function that is a spelling of a CASE, which the binder, the batch evaluator and every strategy already run:
+    /// `nullif(x, v)` is `CASE WHEN x = v THEN NULL ELSE x END`. Its first argument is a column (the CASE's condition
+    /// compares a column with a literal) and its second a literal; any other form is no function zpq has, and refuses.
+    fn sugarCall(self: *Lower, f: anytype, func: []const u8, depth: u32) Error!?syntax.Expr {
+        if (!std.ascii.eqlIgnoreCase(func, "nullif")) return null;
+        if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0) return error.ExpectedRParen;
+        if (f.args.count != 2) return error.WrongArity;
+        const arg_node: *const c.LpNode = f.args.items[0] orelse return error.SqlParseError;
+        const other: *const c.LpNode = f.args.items[1] orelse return error.SqlParseError;
+        // The column, and the same column as the branch's value.
+        const column = self.operand(arg_node) catch return error.ExpressionInPredicate;
+        const value = try self.ptr(arg_node, depth + 1);
+        const whens = try self.arena.alloc(syntax.Expr.When, 1);
+        whens[0] = .{ .cond = .{ .comparison = .{ .operand = column, .op = .Eq, .value = try self.literal(other) } }, .then = null };
+        return .{ .case_ = .{ .whens = whens, .else_ = value } };
     }
 
     /// DuckDB's names for its one string type that a cast takes; a length (`VARCHAR(10)`) DuckDB ignores, so zpq does.

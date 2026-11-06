@@ -728,6 +728,7 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "date_trunc")) return .date_trunc;
     if (asciiEqIgnoreCase(name, "date_part") or asciiEqIgnoreCase(name, "datepart")) return .date_part;
     if (asciiEqIgnoreCase(name, "regexp_replace")) return .regexp_replace;
+    if (asciiEqIgnoreCase(name, "abs")) return .abs;
     return null;
 }
 
@@ -779,6 +780,13 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             // per row).
             for (args[1..]) |a| if (a.* != .literal or a.literal != .str) return error.TypeMismatch;
             return .str;
+        },
+        // A number's magnitude, in its own type. A date or a boolean is no number here (its SQL abs is another type's).
+        .abs => {
+            if (args.len != 1) return error.WrongArity;
+            const a = args[0];
+            if (a.typeOf() == .str or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
+            return a.typeOf();
         },
         // Only text casts to text: zpq has no number, date or bytes-escaping spelling to match DuckDB's.
         .cast_text => {
@@ -1133,8 +1141,12 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .coalesce => for (args[1..]) |a| {
                     if (a.temporal() != args[0].temporal()) break null;
                 } else args[0].temporal(),
-                .strlen, .date_part, .regexp_replace, .cast_text => null,
+                .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
             },
+            .int = if (func == .abs and args[0].* == .col_ref) blk: {
+                const elem = metadata.leafSchemaElement(file, args[0].col_ref.col_idx) orelse break :blk null;
+                break :blk ast.IntType.ofElement(elem);
+            } else null,
             .part = switch (func) {
                 .date_trunc, .date_part => ast.DatePart.parse(args[0].literal.str) orelse unreachable,
                 else => null,
@@ -1504,7 +1516,20 @@ test "parse: unknown function errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "abs(x)", &file, null));
+    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "sqrt(x)", &file, null));
+}
+
+test "parse: abs keeps its argument's type and refuses text and the wrong arity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "x", "y", "s" }, &.{ .INT64, .DOUBLE, .BYTE_ARRAY });
+    const i = try parseExprOnly(a, "abs(x - 1)", &file, null);
+    try testing.expectEqual(ast.Type.i64, i.typeOf());
+    try testing.expectEqual(ast.Func.abs, i.call.func);
+    try testing.expectEqual(ast.Type.f64, (try parseExprOnly(a, "ABS(y)", &file, null)).typeOf());
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "abs(s)", &file, null));
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "abs(x, y)", &file, null));
 }
 
 test "parse: incomplete trailing operator fails" {

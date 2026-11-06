@@ -236,6 +236,9 @@ pub const Func = enum {
     regexp_replace,
     /// `CAST(s AS VARCHAR)` (or TEXT, STRING) of a string: the same values, typed as text wherever they leave.
     cast_text,
+    /// `abs(x)` of a number, in the argument's own type: an integer whose magnitude its column's SQL type cannot hold
+    /// (`abs(-2147483648)` of an INTEGER) is an overflow error, as DuckDB's.
+    abs,
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -289,6 +292,8 @@ pub const Call = struct {
     part: ?DatePart = null,
     /// `regexp_replace`'s pattern and replacement, compiled from its literal arguments; shared read-only by workers.
     replace: ?*const regex.Replace = null,
+    /// `abs`'s argument column's SQL integer type, when the argument is a bare integer column.
+    int: ?IntType = null,
 };
 
 /// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
@@ -448,7 +453,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
@@ -614,6 +619,9 @@ pub const PostExpr = union(enum) {
     binary: struct { op: PostOp, left: *const PostExpr, right: *const PostExpr },
     /// `round(value)` or `round(value, digits)`; `digits` is an integer literal.
     round: struct { value: *const PostExpr, digits: i32 = 0 },
+    abs: *const PostExpr,
+    /// `nullif(value, other)`: `value`, or NULL where it equals `other` (NULL `other` leaves it).
+    nullif: struct { value: *const PostExpr, other: *const PostExpr },
 };
 
 pub const PostOp = enum { add, sub, mul, div };

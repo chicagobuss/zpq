@@ -38,7 +38,9 @@ the thread, not fixed) is refused (`ConstantTooDeep`).
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
-`coalesce(a, b, ...)` over any expressions, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
+`coalesce(a, b, ...)` over any expressions, `nullif(col, literal)` (NULL where the column equals the literal; a CASE, so
+a column and a literal) and `abs(x)` of an integer, DOUBLE or DECIMAL expression (the magnitude in the argument's type:
+the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, is an overflow error, as DuckDB's), `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
 [ELSE v] END`, parens, unary minus. A CASE evaluates a branch only on the rows that take it, and coalesce an argument
 only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
 `CASE c WHEN v ...` is the searched form `WHEN c = v` for a column and literals. DECIMAL arithmetic is exact (see below).
@@ -48,8 +50,8 @@ only on the rows every earlier one left NULL, so a fault where no row needs the 
 column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals, or with one another (only
 TRUE keeps a group; without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT
 list lacks, or by an expression of the keys (`GROUP BY k ORDER BY k * 2`: one more key, which cannot change the groups).
-A SELECT item, a HAVING comparison or an ORDER BY term may be an expression over aggregates: `+ - * /`, unary minus and
-`round(x [, n])` over aggregate calls and number literals (`sum(a) / sum(b)`, `100 * sum(CASE ...) / sum(...)`,
+A SELECT item, a HAVING comparison or an ORDER BY term may be an expression over aggregates: `+ - * /`, unary minus,
+`round(x [, n])`, `abs(x)` and `nullif(x, y)` over aggregate calls and number literals (`sum(a) / sum(b)`, `100 * sum(CASE ...) / sum(...)`,
 `round(avg(x), 2)`, `HAVING sum(a) > avg(a) * 1000`, `ORDER BY sum(a) / count(*) DESC`). Each is evaluated once per
 group after aggregation, never per input row, and typed as DuckDB types it: `+ - *` stay exact over integers and
 DECIMALs (a DECIMAL result of at most 38 digits, else an error), `/` is DOUBLE (a zero divisor gives an infinity or

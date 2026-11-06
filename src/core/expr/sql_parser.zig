@@ -643,7 +643,8 @@ pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: 
         const pz = try allocator.dupeSentinel(u8, probe_sql, 0);
         const inner = (try sql_join.tables(allocator, pz)) orelse break;
         const r = try resolveJoin(allocator, pz, inner, schemas);
-        try semis.append(allocator, .{ .fk = r.fk, .build = r.build });
+        // A reduced query holds one IN, the one the reduction wrote: no other subquery passes its table count.
+        try semis.append(allocator, .{ .fk = r.fk, .build = r.build, .unique = first.reduced == .probe });
         probe_sql = r.probe_sql;
     }
     var pq = try parseSqlPlan(allocator, probe_sql);
@@ -654,7 +655,7 @@ pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: 
     return pq;
 }
 
-const Resolved = struct { kind: syntax.JoinKind, fk: []const u8, build: syntax.Build, probe_sql: []const u8 };
+const Resolved = struct { kind: syntax.JoinKind, fk: []const u8, build: syntax.Build, probe_sql: []const u8, reduced: ?sql_join.Side };
 
 const Owners = struct {
     metas: []const *const schema.FileMetaData,
@@ -680,11 +681,11 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         if (try sql_join.tables(a, text)) |inner| {
             // The build's own filter is a SEMI join: a third table the binder reduced onto it.
             const nested = try resolveJoin(a, text, inner, schemas);
-            build.semis = try a.dupe(syntax.Semi, &.{.{ .fk = nested.fk, .build = nested.build }});
+            build.semis = try a.dupe(syntax.Semi, &.{.{ .fk = nested.fk, .build = nested.build, .unique = p.reduced == .build }});
             build.filter = (try parseSqlPlan(a, nested.probe_sql)).syntax.?.filter;
         } else build.filter = (try parseSqlPlan(a, text)).syntax.?.filter;
     }
-    return .{ .kind = if (p.kind == .semi) .semi else .inner, .fk = p.fk, .build = build, .probe_sql = p.probe_sql };
+    return .{ .kind = if (p.kind == .semi) .semi else .inner, .fk = p.fk, .build = build, .probe_sql = p.probe_sql, .reduced = p.reduced };
 }
 
 pub fn parseSqlPlan(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {

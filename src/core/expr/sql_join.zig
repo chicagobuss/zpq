@@ -11,9 +11,14 @@ const c = @import("liteparser_c");
 
 pub const Kind = enum { inner, semi };
 
+/// Which side's query holds the `IN (SELECT ...)` a three-table reduction wrote (`reduce`).
+pub const Side = enum { probe, build };
+
 pub const Error = error{
     SqlParseError,
     UnsupportedJoin,
+    SubqueryLimitNotSupported,
+    CorrelatedSubqueryNotSupported,
     JoinKeyNotFound,
     JoinResidualNotSupported,
     AmbiguousJoinColumn,
@@ -33,6 +38,9 @@ pub const Plan = struct {
     build_where: ?[]const u8,
     /// Build columns the probe query reads, in first-reference order (never the key: it reads as the FK).
     build_columns: []const []const u8,
+    /// The side whose query holds the IN a three-table reduction wrote. That IN is an INNER edge: its keys must be
+    /// unique, as any INNER join's are, though no column of its table is read.
+    reduced: ?Side = null,
 };
 
 /// What the caller knows of the tables (from their footers): whether a column name is theirs, and their rows.
@@ -265,8 +273,8 @@ fn create(a: std.mem.Allocator, kind: c_uint) !*c.LpNode {
 /// Three tables become two: a table no result, GROUP BY, ORDER BY or HAVING term reads, joined by one key equality
 /// to another and otherwise read only by its own conjuncts, is a SEMI join of that other table, `x.m IN (SELECT l.k
 /// FROM l WHERE ...)`. Rewrites `sel` in place (its FROM to the two tables left, its WHERE to their conjuncts and the
-/// IN) and returns the two tables' original indices.
-fn reduce(a: std.mem.Allocator, sel: anytype, tables_in: []*c.LpNode, conjuncts: []*c.LpNode, s: Sides, root: *c.LpNode) Error![2]usize {
+/// IN) and returns the two tables' original indices and the IN.
+fn reduce(a: std.mem.Allocator, sel: anytype, tables_in: []*c.LpNode, conjuncts: []*c.LpNode, s: Sides, root: *c.LpNode) Error!struct { left: [2]usize, in: *c.LpNode } {
     var outside: u8 = 0;
     for (try columnRefs(root, a)) |ref| if (try s.at(ref)) |i| {
         outside |= @as(u8, 1) << @intCast(i);
@@ -323,7 +331,7 @@ fn reduce(a: std.mem.Allocator, sel: anytype, tables_in: []*c.LpNode, conjuncts:
         join.u.join.right = tables_in[left[1]];
         sel.from = join;
         sel.where = try andOf(a, kept.items);
-        return left;
+        return .{ .left = left, .in = in };
     }
     return error.UnsupportedJoin;
 }
@@ -364,6 +372,8 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     var paths: [2][]const u8 = undefined;
     var rows: [2]u64 = undefined;
     var map: [2]usize = .{ 0, 1 };
+    var reduced_in: ?*c.LpNode = null;
+    var reduced: ?Side = null;
     if (from.*.kind == c.LP_JOIN_CLAUSE) {
         var list: std.ArrayList(*c.LpNode) = .empty;
         try flattenFrom(from, &list, &conjuncts, a);
@@ -373,7 +383,9 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         for (list.items, all_aliases) |n, *al| al.* = fromTable(n).?.alias;
         if (list.items.len == 3) {
             const all = [_]usize{ 0, 1, 2 };
-            map = try reduce(a, sel, list.items, conjuncts.items, .{ .t = t, .tables = &all, .aliases = all_aliases }, p.root);
+            const r = try reduce(a, sel, list.items, conjuncts.items, .{ .t = t, .tables = &all, .aliases = all_aliases }, p.root);
+            map = r.left;
+            reduced_in = r.in;
             conjuncts.clearRetainingCapacity();
             try flatten(sel.where, &conjuncts, a);
         } else if (list.items.len != 2) return error.UnsupportedJoin;
@@ -407,10 +419,25 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         if (semi) |s| if (n == s.node) {
             const sub = &n.u.in.select.*.u.select;
             if (sub.result_columns.count != 1 or sub.group_by.count != 0 or sub.having != null) return error.UnsupportedJoin;
+            // What else a subquery says changes its rows, so it refuses rather than drop: LIMIT and OFFSET (ORDER BY
+            // alone orders a set IN does not, and DISTINCT is what IN does).
+            if (sub.limit != null) return error.SubqueryLimitNotSupported;
+            if (sub.window_defs.count != 0 or sub.with != null) return error.UnsupportedJoin;
+            const sub_table = fromTable(sub.from orelse return error.UnsupportedJoin) orelse return error.UnsupportedJoin;
             const rc = sub.result_columns.items[0] orelse return error.UnsupportedJoin;
             const e = rc.*.u.result_column.expr orelse return error.UnsupportedJoin;
-            if (e.*.kind != c.LP_EXPR_COLUMN_REF or !t.has(t.ctx, map[build], span(e.*.u.column_ref.column)))
-                return error.JoinKeyNotFound;
+            if (e.*.kind != c.LP_EXPR_COLUMN_REF) return error.JoinKeyNotFound;
+            // Every name the subquery reads is its own table's: a qualifier naming another table, or a name only the
+            // outer table has, is a correlated reference, which this release does not join.
+            var own = try columnRefs(n.u.in.select, a);
+            if (sub.where) |w| own = try std.mem.concat(a, *c.LpNode, &.{ own, try columnRefs(w, a) });
+            for (own) |ref| {
+                const r = ref.*.u.column_ref;
+                if (r.table != null and (sub_table.alias == null or !std.mem.eql(u8, span(r.table), sub_table.alias.?)))
+                    return error.CorrelatedSubqueryNotSupported;
+                if (!t.has(t.ctx, map[build], span(r.column)))
+                    return if (t.has(t.ctx, map[probe], span(r.column))) error.CorrelatedSubqueryNotSupported else error.JoinKeyNotFound;
+            }
             fk = try a.dupe(u8, span(n.u.in.expr.*.u.column_ref.column));
             build_key = try a.dupe(u8, span(e.*.u.column_ref.column));
             try flatten(sub.where, &build_conj, a);
@@ -431,7 +458,9 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
             }
         }
         const side = try sides.only(n, a);
-        if (side != null and side.? == build) try build_conj.append(a, n) else try probe_conj.append(a, n);
+        const on_build = side != null and side.? == build;
+        if (n == reduced_in) reduced = if (on_build) .build else .probe;
+        if (on_build) try build_conj.append(a, n) else try probe_conj.append(a, n);
     }
     if (fk.len == 0) return error.JoinKeyNotFound;
     if (kind == .inner) probe_from = from_tables[probe];
@@ -470,5 +499,6 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         .probe_sql = try toSql(a, p, p.root),
         .build_where = build_where,
         .build_columns = build_cols.items,
+        .reduced = reduced,
     };
 }

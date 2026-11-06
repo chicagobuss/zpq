@@ -196,6 +196,18 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.AmbiguousJoinColumn => diagnosticPrint("zpq query: a column name is in both tables of the join; qualify it\n", .{}),
         error.JoinRowsNotSupported => diagnosticPrint("zpq query: a join must aggregate in this release\n", .{}),
+        error.SubqueryLimitNotSupported => diagnosticPrint(
+            "zpq query: an IN (SELECT ...) with LIMIT or OFFSET is not supported in this release\n",
+            .{},
+        ),
+        error.CorrelatedSubqueryNotSupported => diagnosticPrint(
+            "zpq query: an IN (SELECT ...) that reads the outer query (a correlated subquery) is not supported in this release\n",
+            .{},
+        ),
+        error.JoinKeyTypeMismatch => diagnosticPrint(
+            "zpq query: the join compares {s} with a key of another SQL type; a join's keys must share one\n",
+            .{diag.column.get()},
+        ),
         error.ExceededMemoryBudget => diagnosticPrint(
             "zpq query: the query needs more memory than --max-memory allows\n",
             .{},

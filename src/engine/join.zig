@@ -183,6 +183,11 @@ fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: 
     return try G.init(gpa, j, leaves, calls, outs, meta.row_groups.items.len);
 }
 
+/// A reduced INNER edge keeps the INNER join's unique keys; a SEMI join the query wrote takes duplicates.
+fn semiKind(s: syntax.Semi) lookup.Kind {
+    return if (s.unique) .inner else .semi;
+}
+
 /// Read one build side (its own SEMI joins first) into a lookup, charged to `ledger`.
 fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.Kind, threads: usize, diag: ?*Diag) !*lookup.Join {
     const file = open(arena, b.path) catch |err| {
@@ -193,7 +198,7 @@ fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.K
     meta.* = file.meta;
     var filter: ?filter_ast.Filter = if (b.filter) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
     for (b.semis) |s| {
-        const inner = try build(p, arena, s.build, .semi, threads, diag);
+        const inner = try build(p, arena, s.build, semiKind(s), threads, diag);
         filter = try withLookup(arena, filter, try leafOf(meta, .{ .fk = s.fk, .join = inner }, diag));
     }
     const payload = try arena.alloc(usize, b.columns.len);
@@ -243,7 +248,7 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     const main = try build(p, arena, sj.build, if (sj.kind == .semi) .semi else .inner, threads, args.diag);
     main.main = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);
-    for (sj.semis, semis) |s, *out| out.* = .{ .fk = s.fk, .join = try build(p, arena, s.build, .semi, threads, args.diag) };
+    for (sj.semis, semis) |s, *out| out.* = .{ .fk = s.fk, .join = try build(p, arena, s.build, semiKind(s), threads, args.diag) };
     p.main = .{ .fk = sj.fk, .join = main };
     p.semis = semis;
     return p;

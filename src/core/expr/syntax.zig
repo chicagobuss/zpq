@@ -75,7 +75,9 @@ pub const Build = struct {
     semis: []const Semi = &.{},
 };
 
-pub const Semi = struct { fk: []const u8, build: Build };
+/// `unique`: an INNER edge the frontend reduced to a SEMI join because no column of its table is read. Its keys must
+/// be unique, as any INNER join's are: a duplicate would multiply rows the SEMI join keeps once.
+pub const Semi = struct { fk: []const u8, build: Build, unique: bool = false };
 
 pub const Query = struct {
     /// Null for a single-table query.

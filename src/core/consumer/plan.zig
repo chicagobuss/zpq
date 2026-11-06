@@ -2,6 +2,7 @@ const checkRowShape = @import("column.zig").checkRowShape;
 const isDecodeError = @import("types.zig").isDecodeError;
 const SliceReader = @import("slice_reader.zig").SliceReader;
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
@@ -10,6 +11,7 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_agg = @import("../expr/agg.zig");
 const agg_coded = @import("../expr/agg_coded.zig");
 const column_mod = @import("../parquet/column.zig");
+const page_mod = @import("../parquet/page.zig");
 const invariant = @import("../invariant.zig");
 const profile = @import("../../profile.zig");
 const nowMonoNs = @import("../../clock.zig").monoNs;
@@ -68,6 +70,56 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
     }
     for (base, in.read) |*b, r| b.* = b.* and r;
     return base;
+}
+
+/// For a mapped scan reading ahead (`AggWorkspace.kept`): advise (`MADV_WILLNEED`) the pages of column `ci`'s chunk a
+/// reader gated by `gate` reads, the dictionary and every data page holding a row `gate` keeps, by the reader's own
+/// test (`ColumnChunkReader.advancePage`). Each is advised as the walk reads its header, so its body is read while the
+/// walk and then the decode go on, instead of a fault at a time as the decode reaches it; advice stops short of the OS
+/// page holding the next header, which the walk reads now. A page the gate passes is never advised: its header, which
+/// the reader reads too, is all of it read. Records in `ws.kept` whether the gate kept every data page. Advisory only:
+/// a header the walk cannot read ends it, unrecorded. Not for a row subgroup, whose readers seek by the page index.
+pub fn adviseGated(in: AggRowGroup, ci: usize, gate: *const filter_selection.SelectionVector, ws: AggWorkspace) void {
+    if (builtin.os.tag != .linux) return;
+    const kept = ws.kept orelse return;
+    if (in.subgroup != null or ci >= kept.len or ci >= in.rg.columns.items.len) return;
+    const cm = in.rg.columns.items[ci].meta_data orelse return;
+    if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return;
+    const start = std.math.cast(usize, cm.dictionary_page_offset orelse cm.data_page_offset) orelse return;
+    const len = std.math.cast(usize, cm.total_compressed_size) orelse return;
+    const origin = std.math.cast(usize, in.src.byte_origin) orelse return;
+    if (start < origin or start - origin > in.src.bytes.len or len > in.src.bytes.len - (start - origin)) return;
+    const chunk = in.src.bytes[start - origin ..][0..len];
+    // `peek` and `pass` read headers only and allocate nothing.
+    var walk = page_mod.PageReader.init(chunk, cm.codec, std.heap.page_allocator);
+    const os_page = std.heap.pageSize();
+    var row: usize = 0;
+    var all = true;
+    while (walk.peek() catch return) |p| {
+        const at = walk.pos;
+        const keep = switch (p.header.type) {
+            .DATA_PAGE, .DATA_PAGE_V2 => blk: {
+                const n = if (p.header.data_page_header) |h| h.num_values else if (p.header.data_page_header_v2) |h|
+                    h.num_values
+                else
+                    return;
+                const rows = std.math.cast(usize, n) orelse return;
+                defer row +|= rows;
+                break :blk gate.anyInRange(@min(row, gate.len), @min(row +| rows, gate.len));
+            },
+            .DICTIONARY_PAGE => true,
+            .INDEX_PAGE => false,
+        };
+        walk.pass(p);
+        all = all and keep;
+        if (!keep) continue;
+        const lo = std.mem.alignBackward(usize, @intFromPtr(chunk.ptr) + at, os_page);
+        const end = @intFromPtr(chunk.ptr) + walk.pos;
+        // The chunk's last page has no header after it to read.
+        const hi = if (walk.pos >= chunk.len) std.mem.alignForward(usize, end, os_page) else std.mem.alignBackward(usize, end, os_page);
+        if (hi > lo) _ = std.os.linux.madvise(@ptrFromInt(lo), hi - lo, std.os.linux.MADV.WILLNEED);
+    }
+    kept[ci].store(all, .monotonic);
 }
 
 /// Payload columns: what a filtered row group reads past `baseColumns`, flat. That is an aggregate's columns and a
@@ -563,6 +615,8 @@ pub const ChunkDecoder = struct {
             std.debug.assert(self.gate != null);
             decode_options.row_gate = self.gate;
         };
+        // A compacted decode's gate counts compact positions, not the chunk's rows (`decodeKeptRows`).
+        if (self.keep == null) if (decode_options.row_gate) |g| if (!self.refill) adviseGated(in, ci, g, self.ws);
         decode_options.any_dictionary = self.target.codedKey(ci);
         decode_options.decimal_exact_only = self.target.exactInputs();
         const pruned_pages = if (prune_info) |p|

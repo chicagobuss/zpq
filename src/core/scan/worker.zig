@@ -389,6 +389,8 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .fold_context = .{ .winner_charge = w.winners, .distinct_pairs = w.pairs },
             .scan_workers = w.scan_workers,
             .defer_decode_errors = w.failure_probe != null,
+            .gated = if (w.read_ahead) |ra| ra.gated else null,
+            .kept = if (w.read_ahead) |ra| ra.kept else null,
         }) catch |err| {
             if (consumer.isDecodeError(err)) {
                 w.failed_item = idx;

@@ -9,10 +9,14 @@
 //!
 //! Bounded on every side, from run-time facts only:
 //! - what: the chunks of the columns this pass decodes for each item, nothing between them but the pages a chunk's
-//!   first and last bytes share with its neighbours (advice is page-granular, and a fault there reads the same page);
+//!   first and last bytes share with its neighbours (advice is page-granular, and a fault there reads the same page).
+//!   A column the decode reads behind the filter's gate (`gated`: a payload column, or a filter column read only at
+//!   the survivors of the conjuncts before it) follows what those conjuncts keep: its own reader advises just the
+//!   pages its gate keeps, once that gate is decided (`consumer/plan.zig` `adviseGated`), and here it is advised whole only
+//!   while the latest such reader found its gate keeping every page (`kept`). A gated column whose pages are skipped
+//!   is never advised ahead of the survivors that skip them;
 //! - how far: a few items per worker ahead of the latest claim, paced by the claims (each moves the cursor by about
-//!   one item), and a hard cap on the bytes advised and not yet
-//!   claimed: the caller's window (`Config`), or what the query's ledger has free when it is less, whichever is
+//!   one item), and a hard cap on the bytes advised and not yet claimed: the caller's window (`Config`), or what the query's ledger has free when it is less, whichever is
 //!   smaller each time it advances. The cap holds within an item too: a cursor advises an item block by block and
 //!   stops at the cap mid-chunk, the rest left to the next claim or to demand faults. A cap below one page advises
 //!   nothing. Advice never waits for room: it is optional, and a fault reads what it declined;
@@ -84,6 +88,14 @@ pub const ReadAhead = struct {
     item: usize = 0,
     col: usize = 0,
     offset: usize = 0,
+    /// Per leaf column, whether the latest row group to plan its decode reads it behind the filter's gate
+    /// (`AggWorkspace.gated`, set by the decode): advice here leaves such a column to the gated reader, which advises
+    /// only the pages its gate keeps (`adviseGated`). Empty: no column is.
+    gated: []std.atomic.Value(bool) = &.{},
+    /// Per leaf column, whether the latest gated reader of it found the gate keeping every page of its chunk
+    /// (`AggWorkspace.kept`). A gated column is advised here again while it is, read whole as an ungated one is.
+    /// Until a reader says so, it is not.
+    kept: []std.atomic.Value(bool) = &.{},
     /// Items before `released` are claimed, and their advice no longer counts.
     released: usize = 0,
     /// Page-rounded bytes advised for items not yet claimed: never past the cap.
@@ -138,7 +150,16 @@ pub const ReadAhead = struct {
             if (in.gate != null) return null;
             src.* = in.plan_bytes orelse in.bytes;
         }
-        return init(c, work, metas, plan, sources, workers, ledger, try arena.alloc(u64, work.len));
+        var ra = init(c, work, metas, plan, sources, workers, ledger, try arena.alloc(u64, work.len));
+        var leaves: usize = 0;
+        for (metas) |m| for (m.row_groups.items) |rg| {
+            leaves = @max(leaves, rg.columns.items.len);
+        };
+        ra.gated = try arena.alloc(std.atomic.Value(bool), leaves);
+        @memset(ra.gated, .init(false));
+        ra.kept = try arena.alloc(std.atomic.Value(bool), leaves);
+        @memset(ra.kept, .init(false));
+        return ra;
     }
 
     /// A pass over the work list begins, before its workers start: nothing of it is advised yet, and nothing is
@@ -236,6 +257,8 @@ pub const ReadAhead = struct {
             self.offset = 0;
         }) {
             if (!r[self.col]) continue;
+            if (self.col < self.gated.len and self.gated[self.col].load(.monotonic) and
+                !(self.col < self.kept.len and self.kept[self.col].load(.monotonic))) continue;
             const cm = rg.columns.items[self.col].meta_data orelse continue;
             const at = std.math.cast(usize, cm.dictionary_page_offset orelse cm.data_page_offset) orelse continue;
             const len = std.math.cast(usize, cm.total_compressed_size) orelse continue;
@@ -462,6 +485,38 @@ test "through a file's descriptor: resident pages are left alone, and the rest a
     forced.claimed(0, null);
     try std.testing.expectEqual(@as(u64, 2 * page), forced.advised.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), forced.resident.load(.monotonic));
+}
+
+test "a column read behind the filter's gate is left to its reader until a reader says the gate kept all of it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const bytes = try std.heap.page_allocator.alloc(u8, 8 * page);
+    defer std.heap.page_allocator.free(bytes);
+    @memset(bytes, 1);
+    const sources = [_][]const u8{bytes};
+    var set: Chunks = undefined;
+    try set.init(arena_state.allocator(), 8, 0, page, page);
+    var gated = [_]std.atomic.Value(bool){.init(true)};
+    var kept = [_]std.atomic.Value(bool){.init(false)};
+    var ra = set.readAhead(&sources, 1 << 30, 1, null);
+    ra.gated = &gated;
+    ra.kept = &kept;
+    ra.start();
+    // Gated, and no reader has said its gate kept every page: nothing is advised, though the cursor moves on.
+    ra.claimed(0, null);
+    try std.testing.expectEqual(@as(u64, 0), ra.advised.load(.monotonic));
+    // A reader found its gate keeping every page: the column is advised as an ungated one is.
+    kept[0].store(true, .monotonic);
+    ra.claimed(3, null);
+    try std.testing.expect(ra.advised.load(.monotonic) > 0);
+    // Not gated in the latest row group: advised whatever the readers said.
+    kept[0].store(false, .monotonic);
+    gated[0].store(false, .monotonic);
+    const before = ra.advised.load(.monotonic);
+    ra.claimed(5, null);
+    try std.testing.expect(ra.advised.load(.monotonic) > before);
 }
 
 test "the cap never passes what the query's ledger has free" {

@@ -58,6 +58,7 @@ const pruneFilterPages = pruning.pruneFilterPages;
 const compactRows = pruning.compactRows;
 const scan_plan = @import("plan.zig");
 const payloadColumns = scan_plan.payloadColumns;
+const adviseGated = scan_plan.adviseGated;
 const plainValueEncodings = scan_plan.plainValueEncodings;
 const hashOnlyByteArray = scan_plan.hashOnlyByteArray;
 const streamByteArray = scan_plan.streamByteArray;
@@ -978,6 +979,7 @@ fn scanRGForAggImpl(
     // Compacted rows keep the ungated decode.
     var gated = if (keep == null) try GatedFilter.init(ra, in, target, dec.page_indexes) else null;
     if (gated) |*g| dec.filter_gated = g.deferred;
+    reportGated(ws, in, dec.payload, if (gated) |g| g.deferred else null);
     const all_columns = try ra.alloc(usize, in.read.len);
     for (all_columns, 0..) |*c, i| c.* = i;
     for ([_]bool{ false, true }) |late| for (if (!late and gated != null) gated.?.order else all_columns) |ci| {
@@ -1306,6 +1308,16 @@ fn foldWholeGrouped(c: WholeGrouped) !bool {
     return false;
 }
 
+/// Tell a read-ahead (`AggWorkspace.gated`) which of this row group's columns decode behind the filter's gate: the
+/// `payload`, and the filter columns `deferred`.
+fn reportGated(ws: AggWorkspace, in: AggRowGroup, payload: ?[]const bool, deferred: ?[]const bool) void {
+    const out = ws.gated orelse return;
+    for (in.read, 0..) |needed, ci| if (needed and ci < out.len) {
+        const behind = (if (payload) |p| p[ci] else false) or (if (deferred) |d| d[ci] else false);
+        out[ci].store(behind, .monotonic);
+    };
+}
+
 fn filterNames(f: filter_ast.Filter, ci: usize) bool {
     return switch (f) {
         .and_filter, .or_filter => |c| for (c.children) |child| {
@@ -1379,7 +1391,10 @@ fn filterPhase(
             (cm.?.type == .INT32 or cm.?.type == .INT64);
         var options = decode_options;
         if (coded) options.any_dictionary = true;
-        if (gate) options.row_gate = survivors;
+        if (gate) {
+            options.row_gate = survivors;
+            adviseGated(in, ci, survivors, ws);
+        }
         var r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
         if (coded) r.exact_codes = true;
@@ -1461,6 +1476,7 @@ fn openSlicedPayload(
         const held = if (deferred) |d| d[ci] else false;
         if (late or held) if (survivors) |sv| {
             options.row_gate = sv;
+            adviseGated(in, ci, sv, ws);
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
         // The exact tiles read a dictionary DECIMAL through its codes, and every DECIMAL as its exact integers: a
@@ -1913,6 +1929,7 @@ fn scanRGSlicedExact(
     // page-indexed column is pruned by its own statistics there, not deferred, so it is not deferred here either.
     const page_indexes = try loadPageIndexes(pages.allocator(), in, stats);
     var gated = try GatedFilter.init(pages.allocator(), in, target, page_indexes);
+    reportGated(ws, in, found, if (gated) |g| g.deferred else null);
     // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.
     const payload: ?[]const bool = found orelse if (gated != null) blk: {
         const none = try pages.allocator().alloc(bool, in.read.len);

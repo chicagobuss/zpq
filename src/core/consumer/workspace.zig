@@ -42,6 +42,12 @@ pub const AggWorkspace = struct {
     planning_charged: ?std.mem.Allocator = null,
     /// The ledger `charged` draws from, which a sliced row group sizes its slices to fit.
     ledger: ?*const expr_agg.SharedBudget = null,
+    /// A mapped scan reading ahead (`scan/read_ahead.zig`): per leaf column, whether the latest row group to plan its
+    /// decode reads it behind the filter's gate (a payload column, or a filter column `GatedFilter` defers). The
+    /// read-ahead leaves those to the decode, which advises only the pages the gate keeps (`adviseGated`).
+    gated: ?[]std.atomic.Value(bool) = null,
+    /// Beside `gated`: per leaf column, whether the gate kept every page of the latest gated chunk of it (`adviseGated`).
+    kept: ?[]std.atomic.Value(bool) = null,
 };
 
 /// Whether a row group's whole decode of `bytes` may go on the worker's region: the query's ledger has room now for

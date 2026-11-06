@@ -568,6 +568,56 @@ test "a required row gate skips an unread page and defaults the unselected slots
     }
 }
 
+test "advice for a gated chunk follows its gate: the decode reads the same, and records whether every page was kept" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const levels = schema.Levels{ .max_def = 0, .max_rep = 0 };
+    var values: [48]i32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @intCast(i * 3 + 1);
+    // Three pages of 16 rows.
+    const pages = try encoder.encodeColumn(arena, .{
+        .values = .{ .i32 = .{ .values = &values } },
+        .schema_elem = &req_i32_elem,
+        .path_in_schema = &.{"v"},
+        .codec = .UNCOMPRESSED,
+        .dictionary_bloom = false,
+        .distinct = true,
+        .page_rows = 16,
+    });
+    var chunk = [_]schema.ColumnChunk{.{ .file_path = null, .file_offset = 0, .meta_data = pages.meta }};
+    var groups = [_]schema.RowGroup{.{ .columns = .fromOwnedSlice(&chunk), .total_byte_size = @intCast(pages.bytes.len), .num_rows = values.len }};
+    const meta: schema.FileMetaData = .{ .version = 2, .schema = .empty, .num_rows = values.len, .created_by = null, .row_groups = .fromOwnedSlice(&groups) };
+    const in: AggRowGroup = .{
+        .rg = &groups[0],
+        .meta = &meta,
+        .src = .{ .bytes = pages.bytes, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{true},
+        .consumed = &.{true},
+    };
+    var kept = [_]std.atomic.Value(bool){.init(false)};
+    const ws: AggWorkspace = .{ .scratch = undefined, .rg_arena = undefined, .timings = undefined, .kept = &kept };
+    // Every row survives: every page is kept, and the walk says so.
+    var all = try filter_selection.SelectionVector.init(arena, values.len);
+    const before = try decodeColumnTWithOptions(i32, arena, pages.bytes, .UNCOMPRESSED, levels, values.len, .{ .row_gate = &all });
+    scan_plan.adviseGated(in, 0, &all, ws);
+    try testing.expect(kept[0].load(.monotonic));
+    // No row of the middle page survives: the walk passes it, and says the gate did not keep every page.
+    var holes = try filter_selection.SelectionVector.init(arena, values.len);
+    for (16..32) |i| holes.set(i, false);
+    scan_plan.adviseGated(in, 0, &holes, ws);
+    try testing.expect(!kept[0].load(.monotonic));
+    // Advice changes when pages arrive, never what decodes.
+    const after = try decodeColumnTWithOptions(i32, arena, pages.bytes, .UNCOMPRESSED, levels, values.len, .{ .row_gate = &all });
+    try testing.expectEqualSlices(i32, before.values, after.values);
+    // Without a read-ahead to tell, nothing is walked.
+    kept[0].store(true, .monotonic);
+    scan_plan.adviseGated(in, 0, &holes, .{ .scratch = undefined, .rg_arena = undefined, .timings = undefined });
+    try testing.expect(kept[0].load(.monotonic));
+}
+
 test "regression: a filtered group's dictionary keys stay codes for a fold that groups by them" {
     var dict_only = [_]schema.Encoding{.PLAIN_DICTIONARY};
     var fell_back = [_]schema.Encoding{ .PLAIN_DICTIONARY, .PLAIN };

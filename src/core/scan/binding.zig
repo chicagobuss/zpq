@@ -290,6 +290,13 @@ fn firstAggregateCut(calls: []const expr_agg.AggCall, outputs: []const BoundOutp
     };
 }
 
+/// How many of `select_cols` the scan fills: all but the derived ones, which are computed after it.
+pub fn scanColumns(select_cols: []const expr_ast.SelectColumn) usize {
+    var n: usize = 0;
+    for (select_cols) |col| n += @intFromBool(col.role != .derived);
+    return n;
+}
+
 /// Whether `select_cols` are a SQL select list, which binds by role (`SelectColumn.Role`) rather than by name.
 pub fn sqlBound(select_cols: ?[]const expr_ast.SelectColumn) bool {
     const cols = select_cols orelse return false;
@@ -310,10 +317,21 @@ fn bindSqlOutputs(
 ) ![]const BoundOutputColumn {
     const visible = args.select_cols.?;
     const hidden = args.result_order.hidden;
-    const bound = try arena.alloc(BoundOutputColumn, visible.len + hidden.len);
+    // A derived column is computed from the others once the groups are complete (`ResultProgram`): the scan fills
+    // nothing for it, so it has no slot.
+    var slots: usize = 0;
+    var shown: usize = 0;
+    for (visible) |spec| if (spec.role != .derived) {
+        slots += 1;
+        shown += 1;
+    };
+    for (hidden) |spec| slots += @intFromBool(spec.role != .derived);
+    const bound = try arena.alloc(BoundOutputColumn, slots);
     var next_agg: usize = 0;
-    for (bound, 0..) |*out, i| {
+    var at: usize = 0;
+    for (0..visible.len + hidden.len) |i| {
         const spec = if (i < visible.len) visible[i] else hidden[i - visible.len];
+        if (spec.role == .derived) continue;
         const source: ColSource = switch (spec.role) {
             .agg => blk: {
                 if (next_agg >= agg_calls.len) return error.EmptyAggregate;
@@ -326,14 +344,16 @@ fn bindSqlOutputs(
                 Diag.setColumn(args.diag, exprName(spec));
                 return error.ColumnMustBeGrouped;
             },
+            .derived => unreachable,
         };
         const name: []const u8 = if (i >= visible.len) "" else if (spec.alias != null) aliasName(spec) else switch (source) {
             .key => |k| if (keys.items[k].expr == .col_ref) try keys.label(k) else exprName(spec),
             .agg => exprName(spec),
         };
-        out.* = .{ .source = source, .name = name };
+        bound[at] = .{ .source = source, .name = name };
+        at += 1;
     }
-    try checkDistinctOutputNames(BoundOutputColumn, bound[0..visible.len], boundName, args.diag);
+    try checkDistinctOutputNames(BoundOutputColumn, bound[0..shown], boundName, args.diag);
     return bound;
 }
 

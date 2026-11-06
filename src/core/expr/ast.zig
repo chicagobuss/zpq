@@ -500,6 +500,22 @@ pub const OrderKey = struct {
     nulls_first: bool = false,
 };
 
+/// An expression over the result columns of one group, evaluated once per group after aggregation, never per input
+/// row: arithmetic and `round` over aggregates and literals. Typed as DuckDB types it (`result_program.PostType`).
+pub const PostExpr = union(enum) {
+    /// A result row column, by position in the SELECT list followed by `ResultOrder.hidden`. `mean`: it is an AVG,
+    /// which SQL types DOUBLE, whatever zpq's decimal mean keeps.
+    col: struct { column: usize, mean: bool = false },
+    /// A number literal's text, typed by it (an integer, an exact decimal or a double).
+    number: []const u8,
+    neg: *const PostExpr,
+    binary: struct { op: PostOp, left: *const PostExpr, right: *const PostExpr },
+    /// `round(value)` or `round(value, digits)`; `digits` is an integer literal.
+    round: struct { value: *const PostExpr, digits: i32 = 0 },
+};
+
+pub const PostOp = enum { add, sub, mul, div };
+
 /// ORDER BY / LIMIT / OFFSET applied to an aggregate's finished result rows. Sorting is stable, so ties keep the
 /// order the rows had (first appearance in the input); NULLs sort last in either direction, as in DuckDB, unless a key
 /// says NULLS FIRST.
@@ -510,6 +526,9 @@ pub const ResultOrder = struct {
     /// ORDER BY and HAVING terms no SELECT column gives (SQL `GROUP BY k ORDER BY count(*)` without `count(*)`
     /// selected): result row columns after the SELECT list's, read and then dropped before the answer is shown.
     hidden: []const SelectColumn = &.{},
+    /// Some SELECT column or hidden term is `derived`: the result row (SELECT list, then hidden terms) has columns the
+    /// scan does not produce, so `keys` and `having` index that wider row, which the scan never sees.
+    post: bool = false,
     /// HAVING, over result row columns; rows it does not make TRUE are dropped before ORDER BY ranks them.
     having: ?*const Having = null,
     /// ORDER BY over plain rows (no aggregate), by expressions of the input row, selected or not; `keys` is then
@@ -581,6 +600,8 @@ pub const Having = union(enum) {
     all: []const Having,
     any: []const Having,
     cmp: struct { column: usize, op: CmpOp, literal: HavingLiteral },
+    /// One result column against another (`HAVING sum(a) > avg(a) * 1000`): both are result row columns.
+    cmp_col: struct { left: usize, op: CmpOp, right: usize },
     null_check: struct { column: usize, is_not: bool },
 
     /// The predicate's negation, structurally (De Morgan, leaves flipped), never a complement of the rows it passes.
@@ -592,6 +613,7 @@ pub const Having = union(enum) {
                 break :blk if (self == .all) .{ .any = out } else .{ .all = out };
             },
             .cmp => |c| .{ .cmp = .{ .column = c.column, .op = c.op.negate(), .literal = c.literal } },
+            .cmp_col => |c| .{ .cmp_col = .{ .left = c.left, .op = c.op.negate(), .right = c.right } },
             .null_check => |n| .{ .null_check = .{ .column = n.column, .is_not = !n.is_not } },
         };
     }
@@ -601,6 +623,10 @@ pub const Having = union(enum) {
         switch (self) {
             .all, .any => |terms| for (terms) |t| t.eachColumn(ctx, f),
             .cmp => |c| f(ctx, c.column),
+            .cmp_col => |c| {
+                f(ctx, c.left);
+                f(ctx, c.right);
+            },
             .null_check => |n| f(ctx, n.column),
         }
     }
@@ -618,8 +644,12 @@ pub const SelectColumn = struct {
     /// aggregate call, in order; any other must equal a GROUP BY key, compared as bound expressions (column, operator,
     /// literal), never as text. The flag forms (`--column-order`) bind names.
     role: Role = .named,
+    /// A `derived` column's expression over other result columns.
+    post: ?*const PostExpr = null,
 
-    pub const Role = enum { named, key, agg };
+    /// `derived`: computed from the group's other result columns after aggregation (`sum(a) / sum(b)`), so the scan
+    /// binds nothing for it; the aggregates it reads are hidden columns (`ResultOrder.hidden`).
+    pub const Role = enum { named, key, agg, derived };
 
     /// `name` or `expr AS name`, as a `--column-order` entry spells it. Splits at the last ` AS `.
     pub fn parse(text: []const u8) SelectColumn {

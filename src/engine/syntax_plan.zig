@@ -27,6 +27,7 @@ fn columns(arena: std.mem.Allocator, specs: []const syntax.Column, meta: *const 
         .expr = spec.display,
         .alias = spec.alias,
         .role = spec.role,
+        .post = spec.post,
         .bound_expr = if (spec.expr) |node| try parser.bindSyntax(arena, node, meta, diag) else null,
     };
     return out;
@@ -64,7 +65,7 @@ fn bind(raw: *const anyopaque, arena: std.mem.Allocator, meta: *const schema.Fil
                 if (metadata.resolveColumn(meta, node.column)) |_| {} else |err| if (err == error.UnknownColumn) {
                     for (query.columns) |col| if (col.alias) |alias| {
                         if (!std.ascii.eqlIgnoreCase(alias, metadata.unquoteIdent(node.column))) continue;
-                        if (col.role == .agg) return error.AggregateInGroupBy;
+                        if (col.role == .agg or col.role == .derived) return error.AggregateInGroupBy;
                         node = col.expr orelse return error.EmptyExpr;
                         break;
                     };

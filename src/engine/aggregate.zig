@@ -473,9 +473,16 @@ fn executeAggregateOver(
 
     defer r.state.deinit(ctx.gpa);
     errdefer r.output.deinit(ctx.gpa);
-    // ORDER BY keys index the SELECT list then the hidden terms, which GROUP BY rows follow column for column.
-    if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
-    const program: ResultProgram = .{ .order = args.result_order, .visible = r.visible_cols };
+    // ORDER BY keys index the SELECT list then the hidden terms, which GROUP BY rows follow column for column; with
+    // computed columns they index the wider row `ResultProgram` makes.
+    const post = args.result_order.post;
+    if (!post) if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
+    if (post and r.output.group_rows == null) try scalarAsRows(ctx.gpa, &r);
+    const program: ResultProgram = .{
+        .order = args.result_order,
+        .visible = r.visible_cols,
+        .select = if (post) args.select_cols.? else &.{},
+    };
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);
     errdefer ctx.gpa.free(text_kinds);
@@ -632,6 +639,34 @@ inline fn aggregateScanArgs(
         cfg.trace = false;
     };
     return scan_args;
+}
+
+/// A scalar answer as the one-row GROUP BY answer a result program with computed columns reads: the aggregates'
+/// names, types and values, which that program's rows then share.
+fn scalarAsRows(gpa: std.mem.Allocator, r: *scan.MultiAggResult) !void {
+    const out = &r.output;
+    const aggs = out.aggs;
+    std.debug.assert(aggs.len == r.state.agg_calls.len);
+    const types = try gpa.alloc(scan.GroupColType, aggs.len);
+    errdefer gpa.free(types);
+    for (types, r.state.agg_calls, r.state.agg_sources) |*ty, call, source| ty.* = .ofAgg(call, source);
+    const names = try gpa.alloc([]const u8, aggs.len);
+    errdefer gpa.free(names);
+    const slab = try gpa.alloc(scan.AggValue, aggs.len);
+    errdefer gpa.free(slab);
+    const rows = try gpa.alloc([]const scan.AggValue, 1);
+    for (aggs, names, slab) |item, *name, *cell| {
+        name.* = item.alias;
+        cell.* = item.value;
+    }
+    rows[0] = slab;
+    gpa.free(aggs);
+    out.aggs = &.{};
+    out.group_cols = names;
+    out.group_rows = rows;
+    out.slab = slab;
+    out.owned_types = types;
+    r.state.group_col_types = types;
 }
 
 fn writeAggregateParquet(

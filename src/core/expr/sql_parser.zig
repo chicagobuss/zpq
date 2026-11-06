@@ -852,7 +852,12 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
         try selectColumn(rc, lp_arena, allocator, &select_cols[col_idx]);
-        if (has_group_by) select_cols[col_idx].role = if (analyzeExpr(rc).has_agg) .agg else .key;
+        const has_agg = analyzeExpr(rc).has_agg;
+        // An expression over aggregates is computed after the groups are complete, not by the scan.
+        const derived = has_agg and !isAggregateCall(selectExpr(root.*.u.select, i) orelse return error.SqlParseError);
+        if (derived) {
+            select_cols[col_idx].role = .derived;
+        } else if (has_group_by) select_cols[col_idx].role = if (has_agg) .agg else .key;
         col_idx += 1;
     }
     var hidden: std.ArrayList(ast.SelectColumn) = .empty;
@@ -861,35 +866,47 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         hidden.deinit(allocator);
     }
     const sel = root.*.u.select;
-    var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden, lowering);
-    errdefer freeResultOrder(allocator, result_order);
-    var having_arena: ?*std.heap.ArenaAllocator = null;
-    errdefer if (having_arena) |ha| {
-        ha.deinit();
-        allocator.destroy(ha);
+    var post: PostArena = .{ .allocator = allocator };
+    errdefer post.deinit();
+    // The aggregates a derived column reads come first among the hidden columns.
+    var any_derived = false;
+    for (select_cols, 0..) |*col, idx| if (col.role == .derived) {
+        any_derived = true;
+        var builder: PostBuilder = .{
+            .allocator = allocator,
+            .arena = try post.get(),
+            .lp_arena = lp_arena,
+            .n_select = select_cols.len,
+            .hidden = &hidden,
+            .lower = lowering,
+        };
+        col.post = try builder.build(selectExpr(sel, idx) orelse return error.SqlParseError, 0);
     };
+    var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden, lowering, &post);
+    errdefer freeResultOrder(allocator, result_order);
     if (sel.having) |having| {
         if (!is_aggregate) {
             diagnosticPrint("sql: HAVING needs an aggregate or GROUP BY\n", .{});
             return error.HavingNotSupported;
         }
-        const ha = try allocator.create(std.heap.ArenaAllocator);
-        ha.* = .init(allocator);
-        having_arena = ha;
+        const arena = try post.get();
         var ctx: HavingBuilder(@TypeOf(sel)) = .{
             .allocator = allocator,
-            .arena = ha.allocator(),
+            .arena = arena,
             .sel = sel,
             .lp_arena = lp_arena,
             .select_cols = select_cols,
             .has_group_by = has_group_by,
             .hidden = &hidden,
             .lower = lowering,
+            .post = &post,
         };
-        const tree = try ha.allocator().create(ast.Having);
+        const tree = try arena.create(ast.Having);
         tree.* = try ctx.build(having, 0);
         result_order.having = tree;
     }
+    for (hidden.items) |h| any_derived = any_derived or h.role == .derived;
+    result_order.post = any_derived;
     result_order.hidden = try hidden.toOwnedSlice(allocator);
 
     if (structured) {
@@ -906,7 +923,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
             .group_by_str = if (has_group_by) "" else null,
             .select_cols = select_cols,
             .result_order = result_order,
-            .having_arena = having_arena,
+            .having_arena = post.owner,
         };
     }
 
@@ -969,7 +986,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
             const rc = root.*.u.select.result_columns.items[i] orelse continue;
             const info = analyzeExpr(rc);
-            if (!info.has_agg) continue;
+            if (!info.has_agg or select_cols[i].role == .derived) continue;
             const col_sql = try unparseResultColumn(rc, lp_arena, allocator);
             try agg_list.append(allocator, col_sql);
         }
@@ -992,17 +1009,21 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
             aggregate_str = try joined_agg.toOwnedSlice(allocator);
         }
     } else if (is_aggregate) {
-        // Without GROUP BY every SELECT item is an aggregate; hidden HAVING aggregates follow them.
+        // Without GROUP BY every SELECT item is an aggregate or derived from them; the derived ones are the result
+        // stage's, so the scan gets the aggregates, then the hidden ones that HAVING and derived columns read.
         var joined: std.ArrayList(u8) = .empty;
         errdefer joined.deinit(allocator);
-        try joined.appendSlice(allocator, columns_str);
+        for (columns_list.items, 0..) |col, idx| {
+            if (select_cols[idx].role == .derived) continue;
+            if (joined.items.len > 0) try joined.appendSlice(allocator, ", ");
+            try joined.appendSlice(allocator, col);
+        }
         for (result_order.hidden, 0..) |h, n| if (h.role == .agg) {
-            try joined.print(allocator, ", {s} AS {s}{d}", .{ h.expr, hidden_alias, n });
+            if (joined.items.len > 0) try joined.appendSlice(allocator, ", ");
+            try joined.print(allocator, "{s} AS {s}{d}", .{ h.expr, hidden_alias, n });
         };
-        if (joined.items.len != columns_str.len) {
-            aggregate_str = try joined.toOwnedSlice(allocator);
-            allocator.free(columns_str);
-        } else joined.deinit(allocator);
+        aggregate_str = try joined.toOwnedSlice(allocator);
+        allocator.free(columns_str);
     }
 
     if (is_aggregate) {
@@ -1015,7 +1036,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
             .group_by_str = group_by_str,
             .select_cols = select_cols,
             .result_order = result_order,
-            .having_arena = having_arena,
+            .having_arena = post.owner,
         };
     }
     // `SELECT *` → no projection list → the engine's zero-copy passthrough
@@ -1031,7 +1052,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
             .aggregate_str = null,
             .filter_str = filter_str,
             .result_order = result_order,
-            .having_arena = having_arena,
+            .having_arena = post.owner,
         };
     }
     return .{
@@ -1042,7 +1063,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         .filter_str = filter_str,
         .select_cols = select_cols,
         .result_order = result_order,
-        .having_arena = having_arena,
+        .having_arena = post.owner,
     };
 }
 
@@ -1055,8 +1076,10 @@ fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColu
     var star = false;
     for (cols, columns, 0..) |col, *out, i| {
         const node = selectExpr(sel, i) orelse return error.SqlParseError;
-        out.* = .{ .display = try a.dupe(u8, col.expr), .alias = if (col.alias) |alias| try a.dupe(u8, alias) else null, .role = col.role };
-        if (aggregate and (!grouped or col.role == .agg)) {
+        out.* = .{ .display = try a.dupe(u8, col.expr), .alias = if (col.alias) |alias| try a.dupe(u8, alias) else null, .role = col.role, .post = col.post };
+        if (col.role == .derived) {
+            // Computed from the aggregates it reads, which are hidden columns: the scan has nothing for it.
+        } else if (aggregate and (!grouped or col.role == .agg)) {
             try calls.append(a, try lower.aggregate(node, col.alias, col.expr));
         } else if (node.kind == c.LP_EXPR_STAR) {
             star = true;
@@ -1067,11 +1090,11 @@ fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColu
     }
     const hidden = try a.alloc(syntax.Column, order.hidden.len);
     for (order.hidden, hidden, lower.hidden.items, 0..) |col, *out, node, i| {
-        out.* = .{ .display = try a.dupe(u8, col.expr), .role = col.role };
+        out.* = .{ .display = try a.dupe(u8, col.expr), .role = col.role, .post = col.post };
         if (col.role == .agg) {
             const alias = try std.fmt.allocPrint(a, "{s}{d}", .{ hidden_alias, i });
             try calls.append(a, try lower.aggregate(node, alias, col.expr));
-        } else out.expr = try lower.expression(node, 0);
+        } else if (col.role == .key) out.expr = try lower.expression(node, 0);
     }
     const keys = if (grouped) try a.alloc(syntax.SelectItem, @intCast(sel.group_by.count)) else null;
     if (keys) |items| for (items, 0..) |*out, i| {
@@ -1106,6 +1129,7 @@ fn resultOrder(
     has_group_by: bool,
     hidden: *std.ArrayList(ast.SelectColumn),
     lower: ?*Lower,
+    post: *PostArena,
 ) !ast.ResultOrder {
     const n_terms: usize = @intCast(sel.order_by.count);
     var order: ast.ResultOrder = .{};
@@ -1126,7 +1150,7 @@ fn resultOrder(
         // NULLs sort last by default, in either direction, so only NULLS FIRST changes the order.
         const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
         const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
-            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower);
+            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower, select_cols.len, post);
         key.* = .{
             .column = column,
             .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
@@ -1204,9 +1228,154 @@ fn selectExpr(sel: anytype, i: usize) ?*c.LpNode {
     return if (rc.*.kind == c.LP_RESULT_COLUMN) rc.*.u.result_column.expr else rc;
 }
 
+/// The arena the post-aggregate expressions (and HAVING) of one query are built in; created when the first is needed.
+/// `ParsedQuery.having_arena` takes it over.
+const PostArena = struct {
+    allocator: std.mem.Allocator,
+    owner: ?*std.heap.ArenaAllocator = null,
+
+    fn get(self: *PostArena) !std.mem.Allocator {
+        if (self.owner == null) {
+            const created = try self.allocator.create(std.heap.ArenaAllocator);
+            created.* = .init(self.allocator);
+            self.owner = created;
+        }
+        return self.owner.?.allocator();
+    }
+
+    fn deinit(self: *PostArena) void {
+        if (self.owner) |owner| {
+            owner.deinit();
+            self.allocator.destroy(owner);
+        }
+        self.owner = null;
+    }
+};
+
+/// Whether `node` is itself one aggregate call (`sum(x)`, `count(*)`), which the scan computes as it is: not an
+/// expression over aggregates, which `PostBuilder` turns into a derived column.
+fn isAggregateCall(node: *const c.LpNode) bool {
+    if (node.kind != c.LP_EXPR_FUNCTION) return false;
+    const name = std.mem.span(node.u.function.name orelse return false);
+    return for ([_][]const u8{ "count", "sum", "avg", "avg_state", "min", "max" }) |agg_name| {
+        if (std.ascii.eqlIgnoreCase(name, agg_name)) break true;
+    } else false;
+}
+
+/// The names `unsupported` gives a post-aggregate expression: what stays refused, by name.
+fn postUnsupported(lp_arena: *c.arena_t, node: *c.LpNode, what: []const u8) error{ UnparseError, PostAggNotSupported } {
+    const text = c.lp_ast_to_sql(node, lp_arena);
+    if (text == null) return error.UnparseError;
+    diagnosticPrint("sql: {s} {s} over aggregates is not supported yet\n", .{ what, std.mem.span(text) });
+    return error.PostAggNotSupported;
+}
+
+/// Builds the `ast.PostExpr` of an expression over aggregates, which the result stage evaluates once per group:
+/// arithmetic (`+ - * /`) and `round` over aggregate calls and number literals. Each aggregate call it reads is
+/// added to `hidden` (once, as written), so the scan computes it; the expression names it by result row column.
+const PostBuilder = struct {
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    lp_arena: *c.arena_t,
+    n_select: usize,
+    hidden: *std.ArrayList(ast.SelectColumn),
+    lower: ?*Lower,
+
+    const Error = error{ OutOfMemory, UnparseError, PostAggNotSupported, FilterTooDeep };
+    const max_depth = @import("../filter/parser.zig").MAX_GROUP_DEPTH;
+
+    fn build(self: *PostBuilder, node: *c.LpNode, depth: u32) Error!*const ast.PostExpr {
+        if (depth > max_depth) return error.FilterTooDeep;
+        const out = try self.arena.create(ast.PostExpr);
+        out.* = switch (node.kind) {
+            c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT => .{
+                .number = try self.arena.dupe(u8, std.mem.span(node.u.literal.value)),
+            },
+            c.LP_EXPR_UNARY_OP => blk: {
+                const operand = node.u.unary.operand orelse return postUnsupported(self.lp_arena, node, "the expression");
+                switch (node.u.unary.op) {
+                    c.LP_UOP_MINUS => break :blk .{ .neg = try self.build(operand, depth + 1) },
+                    c.LP_UOP_PLUS => return self.build(operand, depth + 1),
+                    else => return postUnsupported(self.lp_arena, node, "the operator in"),
+                }
+            },
+            c.LP_EXPR_BINARY_OP => blk: {
+                const op: ast.PostOp = switch (node.u.binary.op) {
+                    c.LP_OP_ADD => .add,
+                    c.LP_OP_SUB => .sub,
+                    c.LP_OP_MUL => .mul,
+                    c.LP_OP_DIV => .div,
+                    else => return postUnsupported(self.lp_arena, node, "the operator in"),
+                };
+                const left = node.u.binary.left orelse return postUnsupported(self.lp_arena, node, "the expression");
+                const right = node.u.binary.right orelse return postUnsupported(self.lp_arena, node, "the expression");
+                break :blk .{ .binary = .{
+                    .op = op,
+                    .left = try self.build(left, depth + 1),
+                    .right = try self.build(right, depth + 1),
+                } };
+            },
+            c.LP_EXPR_FUNCTION => try self.call(node, depth),
+            else => return postUnsupported(self.lp_arena, node, "the expression"),
+        };
+        return out;
+    }
+
+    fn call(self: *PostBuilder, node: *c.LpNode, depth: u32) Error!ast.PostExpr {
+        const f = node.u.function;
+        const name = std.mem.span(f.name orelse return postUnsupported(self.lp_arena, node, "the call"));
+        if (isAggregateCall(node)) {
+            const at = try hiddenAgg(self.allocator, self.lp_arena, node, self.hidden, self.lower);
+            return .{ .col = .{ .column = self.n_select + at, .mean = std.ascii.eqlIgnoreCase(name, "avg") } };
+        }
+        if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0 or
+            !std.ascii.eqlIgnoreCase(name, "round") or f.args.count < 1 or f.args.count > 2)
+            return postUnsupported(self.lp_arena, node, "the function in");
+        const value = try self.build(f.args.items[0] orelse return postUnsupported(self.lp_arena, node, "the call"), depth + 1);
+        var digits: i32 = 0;
+        if (f.args.count == 2) {
+            digits = integerLiteral(f.args.items[1] orelse return postUnsupported(self.lp_arena, node, "the call")) orelse
+                return postUnsupported(self.lp_arena, node, "a digit count that is no integer literal in");
+        }
+        return .{ .round = .{ .value = value, .digits = digits } };
+    }
+
+    /// `node` as a small integer literal (a minus sign folded in), or null.
+    fn integerLiteral(node: *c.LpNode) ?i32 {
+        if (node.kind == c.LP_EXPR_UNARY_OP and node.u.unary.op == c.LP_UOP_MINUS) {
+            const operand = node.u.unary.operand orelse return null;
+            const v = integerLiteral(operand) orelse return null;
+            return std.math.negate(v) catch null;
+        }
+        if (node.kind != c.LP_EXPR_LITERAL_INT) return null;
+        const v = std.fmt.parseInt(i32, std.mem.span(node.u.literal.value), 10) catch return null;
+        // DuckDB's own bound on a digit count's useful range; past it a result is the input or zero anyway.
+        return if (v > 1000) null else v;
+    }
+};
+
+/// Add the aggregate call `node` to `hidden` (once: the same call written alike is reused); its index there.
+fn hiddenAgg(
+    allocator: std.mem.Allocator,
+    lp_arena: *c.arena_t,
+    node: *c.LpNode,
+    hidden: *std.ArrayList(ast.SelectColumn),
+    lower: ?*Lower,
+) !usize {
+    const text_c = c.lp_ast_to_sql(node, lp_arena);
+    if (text_c == null) return error.UnparseError;
+    const text = std.mem.span(text_c);
+    for (hidden.items, 0..) |h, i| if (h.role == .agg and std.mem.eql(u8, h.expr, text)) return i;
+    try hidden.ensureUnusedCapacity(allocator, 1);
+    hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = .agg });
+    if (lower) |l| try l.hidden.append(l.arena, node);
+    return hidden.items.len - 1;
+}
+
 /// Add ORDER BY or HAVING term `expr`, which names no SELECT column, to `hidden` (once: an equal term already there is
-/// reused); its index there. Under GROUP BY such a term is an aggregate or an expression whose columns are all
-/// grouped; without GROUP BY, HAVING may read an aggregate the SELECT list lacks, and ORDER BY nothing.
+/// reused); its index there. Under GROUP BY such a term is an aggregate, an expression over aggregates (a derived
+/// column, computed after the groups are complete) or an expression whose columns are all grouped; without GROUP BY,
+/// HAVING may read an aggregate the SELECT list lacks, and ORDER BY nothing.
 fn hiddenTerm(
     allocator: std.mem.Allocator,
     sel: anytype,
@@ -1216,6 +1385,8 @@ fn hiddenTerm(
     clause: Clause,
     hidden: *std.ArrayList(ast.SelectColumn),
     lower: ?*Lower,
+    n_select: usize,
+    post: *PostArena,
 ) !usize {
     const text_c = c.lp_ast_to_sql(expr, lp_arena);
     if (text_c == null) return error.UnparseError;
@@ -1236,10 +1407,32 @@ fn hiddenTerm(
     }
     // Written alike, one slot: `ORDER BY count(*) DESC, count(*)` computes one aggregate.
     for (hidden.items, 0..) |h, i| if (std.mem.eql(u8, h.expr, text)) return i;
+    if (info.has_agg and !isAggregateCall(expr)) {
+        // The aggregates it reads are hidden columns of their own, added first.
+        var builder: PostBuilder = .{
+            .allocator = allocator,
+            .arena = try post.get(),
+            .lp_arena = lp_arena,
+            .n_select = n_select,
+            .hidden = hidden,
+            .lower = lower,
+        };
+        const tree = try builder.build(expr, 0);
+        try hidden.ensureUnusedCapacity(allocator, 1);
+        hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = .derived, .post = tree });
+        if (lower) |l| try l.hidden.append(l.arena, expr);
+        return hidden.items.len - 1;
+    }
     try hidden.ensureUnusedCapacity(allocator, 1);
     hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
     if (lower) |l| try l.hidden.append(l.arena, expr);
     return hidden.items.len - 1;
+}
+
+/// Whether `node` reads a result: an aggregate or a column, not a constant.
+fn isResult(node: *const c.LpNode) bool {
+    const info = analyzeExpr(node);
+    return info.has_agg or info.has_bare_col;
 }
 
 /// Lowers a HAVING clause, its NOTs already at the leaves (`pushNotsDown`), to an `ast.Having` over result row
@@ -1255,6 +1448,7 @@ fn HavingBuilder(comptime Sel: type) type {
         has_group_by: bool,
         hidden: *std.ArrayList(ast.SelectColumn),
         lower: ?*Lower,
+        post: *PostArena,
 
         const Self = @This();
         const max_depth = @import("../filter/parser.zig").MAX_GROUP_DEPTH;
@@ -1265,12 +1459,13 @@ fn HavingBuilder(comptime Sel: type) type {
             LimitNotSupported,
             OrderByNotSupported,
             ColumnMustBeGrouped,
+            PostAggNotSupported,
         } || std.mem.Allocator.Error;
 
         fn unsupported(self: *Self, node: *c.LpNode) error{ UnparseError, HavingNotSupported } {
             const text = c.lp_ast_to_sql(node, self.lp_arena);
             if (text == null) return error.UnparseError;
-            diagnosticPrint("sql: HAVING {s} is not supported yet (compare an aggregate or key with a literal)\n", .{
+            diagnosticPrint("sql: HAVING {s} is not supported yet (compare an aggregate or key with a literal or another)\n", .{
                 std.mem.span(text),
             });
             return error.HavingNotSupported;
@@ -1301,8 +1496,12 @@ fn HavingBuilder(comptime Sel: type) type {
                         if (try self.literal(left) != null) return self.unsupported(node);
                         return .{ .cmp = .{ .column = try self.term(left), .op = cmp, .literal = lit } };
                     }
-                    const lit = try self.literal(left) orelse return self.unsupported(node);
-                    return .{ .cmp = .{ .column = try self.term(right), .op = cmp.flip(), .literal = lit } };
+                    if (try self.literal(left)) |lit| {
+                        return .{ .cmp = .{ .column = try self.term(right), .op = cmp.flip(), .literal = lit } };
+                    }
+                    // Two results compared: each an aggregate or key, or an expression over them.
+                    if (!isResult(left) or !isResult(right)) return self.unsupported(node);
+                    return .{ .cmp_col = .{ .left = try self.term(left), .op = cmp, .right = try self.term(right) } };
                 },
                 c.LP_EXPR_UNARY_OP => {
                     if (node.u.unary.op != c.LP_UOP_NOT) return self.unsupported(node);
@@ -1392,8 +1591,18 @@ fn HavingBuilder(comptime Sel: type) type {
                 else => {},
             }
             if (try orderColumn(self.sel, self.lp_arena, self.select_cols, node)) |i| return i;
-            return self.select_cols.len +
-                try hiddenTerm(self.allocator, self.sel, self.lp_arena, node, self.has_group_by, .having, self.hidden, self.lower);
+            return self.select_cols.len + try hiddenTerm(
+                self.allocator,
+                self.sel,
+                self.lp_arena,
+                node,
+                self.has_group_by,
+                .having,
+                self.hidden,
+                self.lower,
+                self.select_cols.len,
+                self.post,
+            );
         }
     };
 }
@@ -1936,6 +2145,72 @@ test "sql_parser: expressions that differ only in a string literal's case are tw
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, same.group_by_str.?, "CASE"));
 }
 
+test "sql_parser makes an expression over aggregates a derived column that reads hidden aggregates" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k, sum(a) / sum(b) AS r, count(*) AS c FROM 't' GROUP BY k");
+    defer q.deinit(a);
+    try std.testing.expect(q.result_order.post);
+    try std.testing.expectEqual(ast.SelectColumn.Role.key, q.select_cols[0].role);
+    try std.testing.expectEqual(ast.SelectColumn.Role.derived, q.select_cols[1].role);
+    try std.testing.expectEqual(ast.SelectColumn.Role.agg, q.select_cols[2].role);
+    // The scan computes count(*), then the hidden sum(a) and sum(b); `r` reads them by result column.
+    try std.testing.expectEqualStrings("count(*) AS c, sum(a) AS " ++ hidden_alias ++ "0, sum(b) AS " ++ hidden_alias ++ "1", q.aggregate_str.?);
+    const post = q.select_cols[1].post.?.binary;
+    try std.testing.expectEqual(ast.PostOp.div, post.op);
+    try std.testing.expectEqual(@as(usize, 3), post.left.col.column);
+    try std.testing.expectEqual(@as(usize, 4), post.right.col.column);
+
+    // Structured: the derived column has no call of its own, and the hidden ones are the calls after the SELECT list's.
+    const s = try parseSqlPlan(a, "SELECT k, sum(a) / sum(b) AS r, count(*) AS c FROM 't' GROUP BY k");
+    defer s.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), s.syntax.?.calls.len);
+    try std.testing.expectEqual(ast.SelectColumn.Role.derived, s.syntax.?.columns[1].role);
+    try std.testing.expect(s.syntax.?.columns[1].post != null);
+}
+
+test "sql_parser reads a derived ORDER BY or HAVING term and an AVG as a mean" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k, sum(a) AS s FROM 't' GROUP BY k HAVING sum(a) > avg(a) * 1000 ORDER BY sum(a) / count(*) DESC, s");
+    defer q.deinit(a);
+    try std.testing.expect(q.result_order.post);
+    // ORDER BY's term first: its aggregates, then it; HAVING's right side after them. HAVING's `sum(a)` is the
+    // SELECT list's own column.
+    try std.testing.expectEqual(@as(usize, 5), q.result_order.hidden.len);
+    try std.testing.expectEqualStrings("sum(a)", q.result_order.hidden[0].expr);
+    try std.testing.expectEqualStrings("count(*)", q.result_order.hidden[1].expr);
+    try std.testing.expectEqual(ast.SelectColumn.Role.derived, q.result_order.hidden[2].role);
+    try std.testing.expectEqualStrings("avg(a)", q.result_order.hidden[3].expr);
+    try std.testing.expectEqual(ast.SelectColumn.Role.derived, q.result_order.hidden[4].role);
+    try std.testing.expect(q.result_order.hidden[3].role == .agg);
+    // Result columns: k, s, then the hidden ones from 2.
+    try std.testing.expectEqual(@as(usize, 4), q.result_order.keys[0].column);
+    try std.testing.expectEqual(@as(usize, 1), q.result_order.keys[1].column);
+    const cmp = q.result_order.having.?.cmp_col;
+    try std.testing.expectEqual(@as(usize, 1), cmp.left);
+    try std.testing.expectEqual(@as(usize, 6), cmp.right);
+    try std.testing.expect(q.result_order.hidden[4].post.?.binary.left.col.mean);
+
+    // Without GROUP BY: the derived column reads hidden aggregates, whose calls follow the plain ones.
+    const scalar = try parseSqlQuery(a, "SELECT count(*) AS c, 100 * sum(a) / sum(b) AS pct FROM 't'");
+    defer scalar.deinit(a);
+    try std.testing.expect(scalar.result_order.post);
+    try std.testing.expectEqualStrings("count(*) AS c, sum(a) AS " ++ hidden_alias ++ "0, sum(b) AS " ++ hidden_alias ++ "1", scalar.aggregate_str.?);
+}
+
+test "sql_parser names what stays refused in an expression over aggregates" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT sum(a) % 2 AS r FROM 't'",
+        "SELECT abs(sum(a)) AS r FROM 't'",
+        "SELECT sum(a) || 'x' AS r FROM 't'",
+        "SELECT round(sum(a), count(*)) AS r FROM 't'",
+        "SELECT CASE WHEN sum(a) > 1 THEN 1 ELSE 0 END AS r FROM 't'",
+        "SELECT sum(a) + 'x' AS r FROM 't'",
+    }) |sql| try std.testing.expectError(error.PostAggNotSupported, parseSqlQuery(a, sql));
+    // A column beside an aggregate must be a GROUP BY term as a whole, as before.
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT k, sum(a) / k AS r FROM 't' GROUP BY k"));
+}
+
 test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result columns" {
     const a = std.testing.allocator;
     const q = try parseSqlQuery(a, "SELECT k FROM 't' GROUP BY k, g ORDER BY count(*) DESC, g, k LIMIT 3");
@@ -2004,7 +2279,13 @@ test "sql_parser lowers HAVING to result columns, hidden terms and literals" {
     try std.testing.expectEqual(@as(usize, 1), g.result_order.having.?.cmp.column);
     try std.testing.expectEqualStrings("count(*), sum(x) AS " ++ hidden_alias ++ "0", g.aggregate_str.?);
 
-    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING count(*) > sum(x)"));
+    // Two results compare as columns; a constant on one side is neither a literal nor a result.
+    const cols = try parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING count(*) > sum(x)");
+    defer cols.deinit(a);
+    try std.testing.expectEqual(ast.CmpOp.gt, cols.result_order.having.?.cmp_col.op);
+    try std.testing.expectEqual(@as(usize, 1), cols.result_order.having.?.cmp_col.left);
+    try std.testing.expectEqual(@as(usize, 2), cols.result_order.having.?.cmp_col.right);
+    try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING count(*) > 1 + 1"));
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT k, count(*) FROM 't' GROUP BY k HAVING z > 1"));
 }
 

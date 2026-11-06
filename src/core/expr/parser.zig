@@ -466,7 +466,7 @@ fn aliasKey(arena: std.mem.Allocator, lex: *Lexer, file: *const schema.FileMetaD
         const alias = item.alias orelse continue;
         // The alias as decoded: `x` names no alias `" x "`, which differs from it by its spaces.
         if (!asciiEqIgnoreCase(alias, tok.text)) continue;
-        if (item.role == .agg) return error.AggregateInGroupBy;
+        if (item.role == .agg or item.role == .derived) return error.AggregateInGroupBy;
         _ = try lex.next();
         return item.bound_expr orelse try parseExprOnly(arena, item.expr, file, lex.diag);
     }

@@ -821,7 +821,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",
         "RegexTooBig",                 "TypedLiteralColumn",          "BadInterval",                  "IntervalNotSupported",
-        "TemporalOutOfRange",             "ConstantTooDeep",              "IlikePatternNotAscii",
+        "TemporalOutOfRange",             "ConstantTooDeep",              "IlikePatternNotAscii",         "PostAggNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

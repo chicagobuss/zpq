@@ -299,6 +299,8 @@ fn havingFromStates(src: *const RowSource, h: expr_ast.Having) bool {
         },
         .cmp => |c| return stateColumn(src, c.column),
         .null_check => |c| return stateColumn(src, c.column),
+        // Compared from the finished rows (`ResultProgram`), not from accumulator state.
+        .cmp_col => return false,
     }
 }
 
@@ -341,6 +343,7 @@ fn stateTruth(src: *const RowSource, slot: MergedSlot, h: expr_ast.Having) ?bool
             ) orelse return null;
             return c.op.holds(order);
         },
+        .cmp_col => unreachable, // `havingFromStates` admits none
     }
 }
 

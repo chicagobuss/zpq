@@ -45,9 +45,19 @@ only on the rows every earlier one left NULL, so a fault where no row needs the 
 
 **Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and
 `GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a
-column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals (only TRUE keeps a group;
-without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks, or by an
-expression of the keys (`GROUP BY k ORDER BY k * 2`: one more key, which cannot change the groups). `SELECT DISTINCT a, b`
+column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals, or with one another (only
+TRUE keeps a group; without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT
+list lacks, or by an expression of the keys (`GROUP BY k ORDER BY k * 2`: one more key, which cannot change the groups).
+A SELECT item, a HAVING comparison or an ORDER BY term may be an expression over aggregates: `+ - * /`, unary minus and
+`round(x [, n])` over aggregate calls and number literals (`sum(a) / sum(b)`, `100 * sum(CASE ...) / sum(...)`,
+`round(avg(x), 2)`, `HAVING sum(a) > avg(a) * 1000`, `ORDER BY sum(a) / count(*) DESC`). Each is evaluated once per
+group after aggregation, never per input row, and typed as DuckDB types it: `+ - *` stay exact over integers and
+DECIMALs (a DECIMAL result of at most 38 digits, else an error), `/` is DOUBLE (a zero divisor gives an infinity or
+NaN), anything with a DOUBLE is DOUBLE, NULL propagates, `round` goes half away from zero, and an AVG reads as DOUBLE
+(from its rounded DECIMAL mean for a DECIMAL column, so the last digits can differ from DuckDB's). The rest (`%`,
+`||`, other functions, CASE, a string in the expression) is refused by name (`PostAggNotSupported`), and a column beside
+an aggregate in one is refused (`ColumnMustBeGrouped`) as it always was. A HAVING term is evaluated only for the groups
+it keeps, and a SELECT item before the ranking reads it. `SELECT DISTINCT a, b`
 is `GROUP BY a, b` (NULLs one group), `GROUP BY ALL` groups by the SELECT items that are no aggregate (a constant is no key
 of its own: constants alone keep one row per input row, and a constant beside only aggregates is refused by name), and `ORDER BY`
 takes `NULLS FIRST` or `NULLS LAST`, NULLs last by default in either direction as in DuckDB. `DISTINCT` with an aggregate,

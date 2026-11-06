@@ -85,6 +85,7 @@ const checkAggAliases = scan_binding.checkAggAliases;
 const bindGroupOutputs = scan_binding.bindGroupOutputs;
 const checkHavingLanes = scan_binding.checkHavingLanes;
 const sqlBound = scan_binding.sqlBound;
+const scanColumns = scan_binding.scanColumns;
 const leafSchemaElem = scan_binding.leafSchemaElem;
 const scan_plan_impl = @import("plan.zig");
 const partAggSupported = scan_plan_impl.partAggSupported;
@@ -1998,22 +1999,7 @@ fn prepareAggregateWithMetas(
                     leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx)
                 else if (keys[k_idx].isBoolean()) boolean_answer else if (keys[k_idx].temporal() == .date) date_answer else null,
             },
-            .agg => |a_idx| .{
-                .nullable = agg_calls[a_idx].func != .count,
-                .lane = switch (agg_calls[a_idx].result) {
-                    .i64 => .i64,
-                    .f64 => .f64,
-                    .bytes => .string,
-                    .avg_f64 => if (agg_calls[a_idx].state) .avg else .f64,
-                    .dec => .dec,
-                    .avg_dec => if (agg_calls[a_idx].state) .avg_dec else .dec,
-                },
-                .dec = switch (agg_calls[a_idx].result) {
-                    .dec, .avg_dec => expr_agg.resultDec(agg_calls[a_idx]),
-                    else => null,
-                },
-                .source = agg_sources[a_idx],
-            },
+            .agg => |a_idx| GroupColType.ofAgg(agg_calls[a_idx], agg_sources[a_idx]),
         };
         group_col_types = col_types;
 
@@ -2282,7 +2268,7 @@ fn prepareAggregateWithMetas(
         .distinct_pairs = pairs_used,
         .dense_aggregate = dense_merged and dense_verified,
         .reasons = scan_plan.reasons,
-        .visible_cols = if (args.result_order.hidden.len > 0) args.select_cols.?.len else null,
+        .visible_cols = if (args.result_order.hidden.len > 0) scanColumns(args.select_cols.?) else null,
         .state = .{
             .accumulators = accumulators,
             .agg_calls = agg_calls,

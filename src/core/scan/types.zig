@@ -309,6 +309,26 @@ pub const GroupColType = struct {
     nullable: bool,
     /// The column whose values pass through unchanged (a bare key, min/max of a column), to type the output by.
     source: ?schema.SchemaElement = null,
+
+    /// The column an aggregate call fills.
+    pub fn ofAgg(call: expr_agg.AggCall, source: ?schema.SchemaElement) GroupColType {
+        return .{
+            .nullable = call.func != .count,
+            .lane = switch (call.result) {
+                .i64 => .i64,
+                .f64 => .f64,
+                .bytes => .string,
+                .avg_f64 => if (call.state) .avg else .f64,
+                .dec => .dec,
+                .avg_dec => if (call.state) .avg_dec else .dec,
+            },
+            .dec = switch (call.result) {
+                .dec, .avg_dec => expr_agg.resultDec(call),
+                else => null,
+            },
+            .source = source,
+        };
+    }
 };
 
 pub const WorkItem = @import("contracts.zig").WorkItem;

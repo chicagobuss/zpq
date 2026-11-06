@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Expressions over aggregates in SQL.** `sum(a) / sum(b)`, `100 * sum(CASE ...) / sum(...)`, `round(avg(x), 2)`,
+  `sum(a) + sum(b)` and their kin now run as a SELECT item, in `HAVING` (`sum(a) > avg(a) * 1000`, also a result
+  against another result) and in `ORDER BY` (`ORDER BY sum(a) / count(*) DESC`), with or without GROUP BY. Each is computed
+  once per group from the group's aggregates, typed as DuckDB types it (exact `+ - *` over integers and DECIMALs, `/` in
+  DOUBLE, `round` half away from zero) and matches DuckDB. A scan strategy that cuts groups early stands aside for such
+  a query. `%`, `||`, other functions and CASE inside the expression are refused by name.
 - **SELECT sugar in SQL.** `SELECT DISTINCT a, b` (one group per distinct row, NULLs together), `GROUP BY ALL`, `ORDER BY ... NULLS FIRST
   | LAST` (on aggregate results and on plain rows with a `LIMIT`; a row group whose statistics cannot bound its NULLs is
   read), `ORDER BY` an expression of the GROUP BY keys, the simple `CASE c WHEN v THEN ...` over a column and literals, and

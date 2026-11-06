@@ -46,6 +46,8 @@ pub const Column = struct {
     alias: ?[]const u8 = null,
     role: ast.SelectColumn.Role,
     expr: ?Expr = null,
+    /// A `derived` column's expression over other result columns.
+    post: ?*const ast.PostExpr = null,
 };
 
 pub const RowKey = struct { expr: Expr, display: []const u8, descending: bool, nulls_first: bool = false };

@@ -4,6 +4,7 @@ const expr_agg = @import("../expr/agg.zig");
 const expr_ast = @import("../expr/ast.zig");
 const core_memory = @import("../memory.zig");
 const BorrowedSpan = @import("types.zig").BorrowedSpan;
+const GroupColType = @import("types.zig").GroupColType;
 const TypedAnswer = @import("typed_answer.zig").TypedAnswer;
 const IntegerStream = @import("integer_stream.zig").IntegerStream;
 const ByteStream = @import("byte_stream.zig").ByteStream;
@@ -25,6 +26,9 @@ pub const AggOutput = struct {
     /// alone, as tests build them) is its own allocation; `releaseRow` frees a row either way. The strings values own
     /// are always their own allocations.
     slab: []AggValue = &.{},
+    /// The column types of rows widened with computed columns (`ResultProgram.finishPost`), which the scan's own
+    /// types no longer describe. Empty otherwise.
+    owned_types: []GroupColType = &.{},
     /// The GROUP BY answer as typed columns instead of rows (`MultiAggArgs.typed_answer`); `group_rows` is then null.
     typed: ?TypedAnswer = null,
     integer_stream: ?IntegerStream = null,
@@ -53,6 +57,7 @@ pub const AggOutput = struct {
             gpa.free(rows);
         }
         gpa.free(self.slab);
+        gpa.free(self.owned_types);
         if (self.typed) |*t| t.deinit(gpa);
         if (self.integer_stream) |s| s.state.deinit();
         if (self.byte_stream) |s| s.state.deinit();

@@ -291,14 +291,15 @@ def writes():
 # two sides' rows compared as multisets of hashes inside DuckDB, so the judge holds neither gigabyte-sized side), so an
 # engine that writes DOUBLE where zpq writes DECIMAL passes on the numbers; one that changes a value (a quoted "" read
 # as NULL) fails.
-CSV_TRUTH_SETUP = "SET threads=8; SET memory_limit='2GB'; SET preserve_insertion_order=false;"
+# DuckDB's CSV buffers are 16 lines of max_line_size each: these inputs keep its default line limit (2 MB).
+CSV_TRUTH_SETUP = "SET threads=8; SET memory_limit='3GB'; SET preserve_insertion_order=false;"
 CSV_TYPES = json.loads((Path(__file__).parent / "csv_types.json").read_text())
 
 
 def csv_truth(path, columns):
     names = ", ".join(quote(n) for n, _ in columns)
     text = (f"read_csv({quote(path)}, all_varchar=true, header=true, names=[{names}], delim=',', quote='\"', "
-            f"escape='\"', allow_quoted_nulls=false, max_line_size=67108864, strict_mode=true)")
+            f"escape='\"', allow_quoted_nulls=false, strict_mode=true)")
     return "SELECT " + ", ".join(f'CAST("{n}" AS {t}) AS "{n}"' for n, t in columns) + f" FROM {text}"
 
 

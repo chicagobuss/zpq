@@ -176,6 +176,30 @@ class Replay(unittest.TestCase):
 
 
 @unittest.skipUnless(engines.POLARS.is_file(), "no Polars 2 interpreter")
+class CsvSuite(unittest.TestCase):
+    def test_every_engine_writes_parquet_judged_on_values_against_the_texts_exact_reading(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "csv").mkdir()
+            for name in suites.CSV_TYPES:
+                (Path(d) / "csv" / f"{name}.csv").write_text("x\n")
+            old, suites.DATA = suites.DATA, Path(d)
+            try:
+                cases = suites.cases(["csv"])
+            finally:
+                suites.DATA = old
+        self.assertEqual({c["dataset"] for c in cases}, set(suites.CSV_TYPES))
+        for c in cases:
+            self.assertEqual((c["output"], c["truth"]["mode"], c["polars"]["form"]), ("parquet", "written_as", "csv"))
+            self.assertEqual(c["zpq"], ["query", c["inputs"][0]])
+            sql = c["truth"]["sql"]
+            # The text as written: every field VARCHAR, a quoted "" never NULL, then each column's exact type.
+            self.assertIn("all_varchar=true", sql)
+            self.assertIn("allow_quoted_nulls=false", sql)
+            for name, ty in suites.CSV_TYPES[c["dataset"]]:
+                self.assertIn(f'CAST("{name}" AS {ty}) AS "{name}"', sql)
+        self.assertNotIn("csv", suites.SUITES)  # 21 GB of inputs: asked for by name, never a default
+
+
 class PolarsAnswer(unittest.TestCase):
     def test_a_derived_minute_named_event_time_is_not_a_timestamp(self):
         code = ("import sys, polars as pl; sys.path.insert(0, 'bench'); import polars_run as p; "

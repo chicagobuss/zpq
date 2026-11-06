@@ -45,6 +45,8 @@ def plan(pl, req):
         return eval(req["expr"], {"hits": hits, "pl": pl, "date": datetime.date})  # noqa: S307 - pinned query text
     if req["form"] == "pdsh":
         return pdsh(pl, req["inputs"][0], req["query_id"])
+    if req["form"] == "csv":
+        return pl.scan_csv(req["inputs"][0])  # its defaults, as a user's first try takes them
     return pl.SQLContext(t=pl.scan_parquet(req["inputs"])).execute(req["sql"])
 
 

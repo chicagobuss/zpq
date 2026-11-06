@@ -71,9 +71,9 @@ def ranks(sql):
 
 
 def case(suite, dataset, query_id, inputs, zpq, duck_sql, polars, truth_sql=None, setup="", output="rows",
-         codec=None, level=None):
+         codec=None, level=None, mode=None):
     truth_sql = truth_sql or duck_sql
-    mode = "written_sql" if output == "parquet" else "tied_rows"
+    mode = mode or ("written_sql" if output == "parquet" else "tied_rows")
     return {"id": f"{suite}/{dataset}/{query_id}", "suite": suite, "dataset": dataset, "query_id": str(query_id),
             "inputs": [str(p) for p in inputs], "output": output, "codec": codec, "level": level, "zpq": zpq,
             "duckdb": {"setup": setup, "sql": duck_sql}, "polars": polars,
@@ -284,6 +284,32 @@ def writes():
     return out
 
 
+# The CSV inputs (REPORT-opus §11) and the type zpq writes for each column, in order: the truth reads the text as
+# DuckDB's RFC 4180 reader splits it (every field VARCHAR, a quoted "" the empty string, never NULL) and casts it to
+# these. Written files are judged on their values (`written_as`), so an engine that writes DOUBLE where zpq writes
+# DECIMAL passes on the numbers; one that changes a value (a quoted "" read as NULL) fails.
+CSV_TYPES = json.loads((Path(__file__).parent / "csv_types.json").read_text())
+
+
+def csv_truth(path, columns):
+    names = ", ".join(quote(n) for n, _ in columns)
+    text = (f"read_csv({quote(path)}, all_varchar=true, header=true, names=[{names}], delim=',', quote='\"', "
+            f"escape='\"', allow_quoted_nulls=false, max_line_size=67108864, strict_mode=true)")
+    return "SELECT " + ", ".join(f'CAST("{n}" AS {t}) AS "{n}"' for n, t in columns) + f" FROM {text}"
+
+
+def csv():
+    out = []
+    for name, columns in CSV_TYPES.items():
+        path = DATA / "csv" / f"{name}.csv"
+        if not path.is_file():
+            raise FileNotFoundError(2, "missing", str(path))
+        out.append(case("csv", name, "to-parquet", [path], ["query", str(path)], f"FROM read_csv({quote(path)})",
+                        {"form": "csv"}, truth_sql=csv_truth(path, columns), output="parquet", codec="snappy",
+                        mode="written_as"))
+    return out
+
+
 def votes():
     path = FAIR / "data/votes/votes.parquet"
     sql = "SELECT VoteTypeId, count(*) AS n FROM {T} GROUP BY VoteTypeId ORDER BY VoteTypeId"
@@ -293,7 +319,7 @@ def votes():
 
 
 BUILDERS = {"clickbench": clickbench, "study": study, "pdsh": pdsh, "reads-sf1": reads, "writes": writes,
-            "votes-local": votes}
+            "votes-local": votes, "csv": csv}
 
 
 def cases(suites=SUITES, only=None):

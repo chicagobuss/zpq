@@ -351,7 +351,7 @@ fn executeAggregateOver(
         if (!explain and !empty_result) probed.add(try loadLocalMembership(arena, opened, m, filter, args.scan_all, false));
         break :blk m;
     } else null;
-    const io = try chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, prof);
+    const io = try chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, null, prof);
     const choice = io.choice;
     const io_mode = choice.mode;
     var scan_args = aggregateScanArgs(ctx, args, agg_str, opened.inputs, metas, cut_args.result_order, &ledger);

@@ -54,6 +54,9 @@
     }
   ],
   "cases": [
+    {"id": "layout:wide16:64MB:page-cache", "fixture": "layout_wide16", "axes": [{"jobs": 1, "page_cache": "evicted"}, {"jobs": 1, "page_cache": "resident"}, {"jobs": 16, "page_cache": "evicted"}, {"jobs": 16, "page_cache": "resident"}], "cli": ["query", "{path}", "--scan-all", "--filter", "c0 IS NOT NULL", "--codec", "zstd", "--max-memory", "64MB", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'", "why": "A write answers or refuses alike whatever the page cache holds: evicted, the local-I/O choice must not take a reader the budget cannot hold beside the write."}},
+    {"id": "layout:wide32:128MB:page-cache", "fixture": "layout_wide32", "axes": [{"jobs": 1, "page_cache": "evicted"}, {"jobs": 1, "page_cache": "resident"}, {"jobs": 16, "page_cache": "evicted"}, {"jobs": 16, "page_cache": "resident"}], "cli": ["query", "{path}", "--scan-all", "--filter", "c0 IS NOT NULL", "--codec", "zstd", "--max-memory", "128MB", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+    {"id": "layout:wide48:256MB:page-cache", "fixture": "layout_wide48", "axes": [{"jobs": 1, "page_cache": "evicted"}, {"jobs": 1, "page_cache": "resident"}, {"jobs": 16, "page_cache": "evicted"}, {"jobs": 16, "page_cache": "resident"}], "cli": ["query", "{path}", "--scan-all", "--filter", "c0 IS NOT NULL", "--codec", "zstd", "--max-memory", "256MB", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
     {"id": "layout:t9:row-groups", "fixture": "layout_t9", "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "cli": ["query", "{path}", "--scan-all", "--filter", "id >= 0", "-o", "{out}"], "oracle": {"compare": "footer", "holds": {"row_groups": {"$list": [{"rows": 131072}, {"rows": 64777}, {"rows": 4151}]}}}}
   ]
 }

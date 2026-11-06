@@ -209,7 +209,11 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     const on_linux = @import("builtin").os.tag == .linux;
     var io_policy = local_reader.Policy.fromEnv(ctx.env);
     io_policy.cache = args.cache;
-    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, prof);
+    // A row group past the smallest decode share a producer can have is sliced on the writer, which over the reader
+    // would need more of the budget than the mapping gives it: such a write reads through the mapping
+    // (`input.readerFits`).
+    const whole: input.WholeDecode = .{ .cols = fetch_arr, .share = window_mod.producerShareFloor(ctx, args) };
+    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, whole, prof);
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (on_linux) if (reader) |rd| rd.destroy();

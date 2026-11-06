@@ -13,6 +13,7 @@ const meta_cache_mod = @import("../io/meta_cache.zig");
 const schema = @import("../core/schema.zig");
 const metadata = @import("../core/parquet/metadata.zig");
 const scan = @import("../core/scan.zig");
+const consumer = @import("../core/consumer.zig");
 const system = @import("../core/system.zig");
 const huge_pages = @import("../core/huge_pages.zig");
 const core_memory = @import("../core/memory.zig");
@@ -1087,6 +1088,38 @@ pub fn localIoNeeds(opened: OpenedInputs, policy: local_reader.Policy) LocalIoNe
     return .{ .choose = choose, .plan = choose and policy.profile != .mmap };
 }
 
+/// What a caller decodes of each row group whole, and the most one row group's decode may take before the caller slices
+/// it instead (`chooseLocalIo`'s `whole`).
+pub const WholeDecode = struct {
+    cols: []const bool,
+    share: usize,
+};
+
+/// Whether the reader may serve a query's local inputs: no planned row group's bytes past half the query's budget
+/// (the reader holds them on the ledger, where a mapping's pages are the page cache's), and, for a caller that decodes
+/// row groups whole (`whole`), every row group of `metas` within its share by the footer's estimate. A row group past
+/// that share is sliced on the write's writer, which over a gated input slices beside its producers and without the
+/// room past the ledger it has alone (`write_window.projectRGSliced`'s callers): through the reader such a write
+/// needs far more of the budget than the mapping (on granite, 70 MB where 23 MB answers it mapped), and would refuse
+/// cold what it answers hot. Not fitting, the input is mapped, as a resident one is, and the same query answers or
+/// refuses the same way whatever the page cache holds.
+pub fn readerFits(largest: u64, max_memory: u64, metas: []const schema.FileMetaData, whole: ?WholeDecode) bool {
+    if (largest > max_memory / 2) return false;
+    const w = whole orelse return true;
+    for (metas) |*m| for (m.row_groups.items) |*rg| {
+        const est = consumer.decodeEstimate(.{
+            .rg = rg,
+            .meta = m,
+            .src = .{ .bytes = &.{}, .byte_origin = 0 },
+            .filter = null,
+            .read = w.cols,
+            .consumed = w.cols,
+        }, w.cols, &.{}, false);
+        if (est > w.share) return false;
+    };
+    return true;
+}
+
 /// How a query reads its local inputs, and the plan and residency the choice was made from.
 pub const LocalIo = struct {
     policy: local_reader.Policy,
@@ -1105,15 +1138,17 @@ pub fn chooseLocalIo(
     opened: OpenedInputs,
     metas: ?[]const schema.FileMetaData,
     policy: local_reader.Policy,
+    /// A caller that decodes each row group whole up to a share, and slices past it (a write): see `readerFits`.
+    whole: ?WholeDecode,
     prof: ?*profile.Thread,
 ) !LocalIo {
     const needs = localIoNeeds(opened, policy);
     const local_plan: ?LocalPlan = if (needs.plan) try planLocalReads(arena, args, opened, metas.?) else null;
     const resident: f64 = if (needs.choose and policy.profile == .auto) plannedResidency(gpa, opened, local_plan) else 0;
     const coverage: f64 = if (local_plan) |lp| lp.coverage() else 0;
-    // A row group the reader would hold past half the query's ledger is read through the mapping, whose pages are
-    // the page cache's, not the query's.
-    const fits_reader = if (local_plan) |lp| lp.largest <= args.max_memory / 2 else true;
+    // A row group the reader would hold past half the query's ledger, or one a write would slice, is read through the
+    // mapping, whose pages are the page cache's, not the query's (`readerFits`).
+    const fits_reader = if (local_plan) |lp| readerFits(lp.largest, args.max_memory, metas.?, whole) else true;
     // Off Linux a local file is always mapped: the mode asked for, or the only one there is.
     const local = allLocal(opened);
     const mapped_reason: local_reader.Reason = if (local and @import("builtin").os.tag == .linux)

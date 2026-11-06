@@ -1741,6 +1741,13 @@ pub fn writeWindow(ctx: Context, args: QueryArgs, jobs: []const RGJob) WriteWind
     };
 }
 
+/// The least of `max_memory` a producer's decode may take before its row group is sliced on the writer: the share
+/// of the most producers the write can run (`writeWindow`'s CPU budget; the window may run fewer, each with more).
+pub fn producerShareFloor(ctx: Context, args: QueryArgs) usize {
+    const async_budget = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    return args.max_memory / 2 / @max(1, async_budget);
+}
+
 /// Permits the write window's byte budget is cut into.
 const window_units = 1024;
 

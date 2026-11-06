@@ -53,7 +53,67 @@ const Point = struct {
     max_memory: ?[]const u8 = null,
     force: ?std.json.ArrayHashMap([]const u8) = null,
     scan_all: ?bool = null,
+    /// The case's input out of the page cache (synced, `POSIX_FADV_DONTNEED`, `mincore`-verified) or wholly in it
+    /// (read through, verified) before this point runs: a query must answer or refuse alike either way. Linux only;
+    /// elsewhere the point runs as it finds the file.
+    page_cache: ?PageCache = null,
 };
+
+const PageCache = enum { evicted, resident };
+
+/// Put `path` out of the page cache or wholly in it (`Point.page_cache`), and verify it. Eviction is retried a few
+/// times: pages another process holds mapped stay until it lets go.
+fn placeInPageCache(path: []const u8, want: PageCache) !void {
+    if (@import("builtin").os.tag != .linux) return;
+    const linux = std.os.linux;
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    defer _ = linux.close(fd);
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.PageCacheStat;
+    const size: usize = @intCast(st.size);
+    if (size == 0) return;
+    const page = std.heap.pageSize();
+    const pages = (size + page - 1) / page;
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        switch (want) {
+            .evicted => {
+                _ = linux.fdatasync(fd);
+                _ = linux.fadvise(fd, 0, 0, linux.POSIX_FADV.DONTNEED);
+            },
+            .resident => {
+                var buf: [1 << 16]u8 = undefined;
+                var off: usize = 0;
+                while (off < size) {
+                    const n = linux.pread(fd, &buf, buf.len, @intCast(off));
+                    if (linux.errno(n) != .SUCCESS or n == 0) return error.PageCacheRead;
+                    off += n;
+                }
+            },
+        }
+        if (try residentPages(fd, size, pages) == if (want == .evicted) 0 else pages) return;
+    }
+    return error.PageCacheNotPlaced;
+}
+
+fn residentPages(fd: i32, size: usize, pages: usize) !usize {
+    const linux = std.os.linux;
+    const addr = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    if (linux.errno(addr) != .SUCCESS) return error.PageCacheMap;
+    defer _ = linux.munmap(@ptrFromInt(addr), size);
+    var vec: [4096]u8 = undefined;
+    var count: usize = 0;
+    var at: usize = 0;
+    while (at < pages) {
+        const n = @min(vec.len, pages - at);
+        const page = std.heap.pageSize();
+        if (linux.errno(linux.mincore(@ptrFromInt(addr + at * page), @min(n * page, size - at * page), &vec)) != .SUCCESS)
+            return error.PageCacheMincore;
+        for (vec[0..n]) |v| count += v & 1;
+        at += n;
+    }
+    return count;
+}
 
 const Refuse = struct {
     @"error": []const u8,
@@ -989,6 +1049,7 @@ fn executeAt(
             try bound.append(arena, try forcing.bind(run.gpa, run.ctx, name, e.value_ptr.*));
         }
     };
+    if (point.page_cache) |want| try placeInPageCache(fixture, want);
     var at = c;
     if (point.jobs) |j| at.jobs = j;
     if (point.max_memory) |m| at.max_memory = if (m.len == 0) null else m;

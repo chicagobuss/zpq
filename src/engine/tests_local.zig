@@ -224,6 +224,44 @@ test "regression: a BOOLEAN answer column (key, min, max) prints true/false as i
     try std.testing.expectError(error.InvalidBinaryValue, writeBytesJson(&w, "x", .boolean));
 }
 
+test "at a tight budget the local-I/O choice maps a write whose row group it would slice, as a resident input is" {
+    const testing = std.testing;
+    // One row group of 100,000 strings: by the footer, 1 MB of values and 3.4 MB decoded.
+    var chunk = [_]schema.ColumnChunk{.{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = .empty,
+            .codec = .ZSTD,
+            .num_values = 100_000,
+            .total_uncompressed_size = 1_000_000,
+            .total_compressed_size = 300_000,
+            .data_page_offset = 4,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    }};
+    var groups = [_]schema.RowGroup{.{ .columns = .fromOwnedSlice(&chunk), .total_byte_size = 1_000_000, .num_rows = 100_000 }};
+    const metas = [_]schema.FileMetaData{.{ .version = 2, .schema = .empty, .num_rows = 100_000, .created_by = null, .row_groups = .fromOwnedSlice(&groups) }};
+    const cols = [_]bool{true};
+    const budget: u64 = 64 << 20;
+    // A scan holds the row group's 300 KB on the ledger and decodes it in its own budget: the reader fits.
+    try testing.expect(engine_input.readerFits(300_000, budget, &metas, null));
+    // A write whose producers may each decode 8 MB takes it whole: the reader fits.
+    try testing.expect(engine_input.readerFits(300_000, budget, &metas, .{ .cols = &cols, .share = 8 << 20 }));
+    // At 2 MB a producer it is sliced on the writer, which beside the reader has less of the budget than the mapping
+    // gives it: the input is mapped, cold or resident, and the reader's choice becomes the mapping's.
+    try testing.expect(!engine_input.readerFits(300_000, budget, &metas, .{ .cols = &cols, .share = 2 << 20 }));
+    const cold: local_reader.Choice = .{ .mode = .uring, .reason = .cold_direct };
+    const taken = cold.withinReader(engine_input.readerFits(300_000, budget, &metas, .{ .cols = &cols, .share = 2 << 20 }));
+    try testing.expectEqual(local_reader.Mode.mmap, taken.mode);
+    try testing.expectEqual(local_reader.Reason.over_budget, taken.reason);
+    // A row group past half the budget is mapped for any caller.
+    try testing.expect(!engine_input.readerFits(budget / 2 + 1, budget, &metas, null));
+}
+
 test "windowed re-encode writes the same bytes at every parallelism" {
     const fixture = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

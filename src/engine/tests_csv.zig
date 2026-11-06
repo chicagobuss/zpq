@@ -186,3 +186,72 @@ test "csv write: malformed input is refused at its line, byte and column" {
         try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, out, .{}));
     };
 }
+
+/// The report's allocator, with a fault on call `at`: `touch` moves the input's mtime (its bytes unchanged), `fail`
+/// refuses the allocation.
+const ReportHook = struct {
+    base: std.mem.Allocator,
+    path: [:0]const u8,
+    at: usize,
+    mode: enum { touch, fail },
+    calls: usize = 0,
+
+    fn allocator(h: *ReportHook) std.mem.Allocator {
+        return .{ .ptr = h, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.mem.Allocator.noFree } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const h: *ReportHook = @ptrCast(@alignCast(ctx));
+        h.calls += 1;
+        if (h.calls == h.at) switch (h.mode) {
+            .fail => return null,
+            .touch => {
+                const later = [2]std.os.linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+                _ = std.os.linux.utimensat(std.os.linux.AT.FDCWD, h.path.ptr, &later, 0);
+            },
+        };
+        return h.base.rawAlloc(len, alignment, ret);
+    }
+};
+
+test "csv write: a failure after the write leaves no output: an input changed under it, or a report it cannot hold" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const in = try a.dupeSentinel(u8, try tmpPath(&b1, &tmp, "pub.csv"), 0);
+    const out = try tmpPath(&b2, &tmp, "pub.parquet");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const gone = struct {
+        fn check(path: []const u8) !void {
+            try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, path, .{}));
+        }
+    }.check;
+
+    // The reviewer's reproducer: the input's mtime moves after it was planned, its bytes the same.
+    try writeFile(in, "id,v\n1,2\n3,4\n");
+    var hook: ReportHook = .{ .base = a, .path = in, .at = 1, .mode = .touch };
+    var report: csv_write.Report = .{};
+    try testing.expectError(error.InputChanged, csv_write.run(ctx, .{ .inputs = &.{in} }, in, out, .{}, &report, hook.allocator()));
+    try gone(out);
+
+    // Every report allocation refused in turn: each failure leaves nothing behind, and the write that needs no
+    // more of them succeeds.
+    var at: usize = 1;
+    while (true) : (at += 1) {
+        try writeFile(in, "id,v\n1,2\n3,4\n");
+        var fail: ReportHook = .{ .base = a, .path = in, .at = at, .mode = .fail };
+        var r: csv_write.Report = .{};
+        if (csv_write.run(ctx, .{ .inputs = &.{in} }, in, out, .{}, &r, fail.allocator())) |res| {
+            try testing.expectEqual(@as(i64, 2), res.rows_matched);
+            try testing.expect(at > 1);
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            try gone(out);
+        }
+    }
+}

@@ -642,13 +642,18 @@ pub fn run(
     var p = try plan(arena, mapped.bytes, opts, failure);
     const workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
     const chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
+    // Everything the report holds is allocated before the output exists: once it is finished, nothing may fail.
     const widened = try report_alloc.alloc(bool, p.names.len);
     @memset(widened, false);
     report.widened = widened;
+    const types = try report_alloc.alloc(Type, p.names.len);
+    const names = try report_alloc.alloc([]const u8, p.names.len);
+    for (names, p.names) |*d, n| d.* = try report_alloc.dupe(u8, n);
+    report.names = names;
     while (true) {
         var source = try Source.init(arena, &p, chunk);
         report.chunks = source.count;
-        const result = writeOnce(ctx, args, out_path, &source, t_open) catch |e| {
+        const result = writeOnce(ctx, args, path, mapped, out_path, &source, t_open) catch |e| {
             if (source.firstFailure()) |f| failure.* = f.*;
             if (e != error.CsvTypeChanged or opts.strict or args.output_fd != null) return e;
             // Widen to what every value holds, then start again.
@@ -662,12 +667,8 @@ pub fn run(
             if (report.restarts > 2) return e; // the join of the whole file holds every value; a third pass is a bug
             continue;
         };
-        try mapped.intact(path);
-        report.types = try report_alloc.dupe(Type, p.types);
-        report.names = p.names; // on the write's arena: copied below
-        const names = try report_alloc.alloc([]const u8, p.names.len);
-        for (names, p.names) |*d, n| d.* = try report_alloc.dupe(u8, n);
-        report.names = names;
+        @memcpy(types, p.types);
+        report.types = types;
         return result;
     }
 }
@@ -748,7 +749,15 @@ fn resolveBlooms(
     return out;
 }
 
-fn writeOnce(ctx: Context, args: QueryArgs, out_path: []const u8, source: *Source, t_open: i64) !WriteResult {
+fn writeOnce(
+    ctx: Context,
+    args: QueryArgs,
+    path: []const u8,
+    mapped: local_fs.Mapped,
+    out_path: []const u8,
+    source: *Source,
+    t_open: i64,
+) !WriteResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -882,6 +891,9 @@ fn writeOnce(ctx: Context, args: QueryArgs, out_path: []const u8, source: *Sourc
     try so.write(&len);
     try so.write("PAR1");
     t.footer_ns = @intCast(nowMonoNs() - t_footer);
+    // The file read must be the file planned, checked while the output can still be removed (or its upload
+    // aborted): `finish` publishes it, and nothing after it fails.
+    try mapped.intact(path);
     if (try out.finish()) |mp| {
         t.mp_complete_ns = mp.complete_ns;
         t.mp_await_ns = mp.await_ns;

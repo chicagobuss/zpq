@@ -81,6 +81,11 @@ usage:
                  -j or memory. Data pages close at 1 MiB or 20,000
                  rows, and each gets a page index entry. A plain copy
                  keeps its input's row groups.
+  --threads / -j N
+                 Requested CPU parallelism. Re-encoding shares CPU turns
+                 between decode and encode, capped by the affinity's
+                 independent cores and the cgroup CPU quota (rounded up),
+                 for explicit N too.
   --parquet-version v1|v2
                  Value-encoding profile for new pages; default v2. v1
                  uses PLAIN/PLAIN_DICTIONARY and a version 1 footer; it

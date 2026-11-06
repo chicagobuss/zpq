@@ -818,7 +818,7 @@ const WriteRows = struct {
                 w.encode_pages.child = encode_scratch.allocator();
                 const re_span = profile.Span.begin(self.prof);
                 defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
-                try runWindowedReencode(&w, effective_async_budget);
+                try runWindowedReencode(&w, effective_async_budget, self.ctx.env);
                 self.out_offset = w.out_offset;
                 self.rows_kept += w.rows_kept;
                 self.rg_kept += w.rgs_kept;

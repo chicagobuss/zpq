@@ -41,8 +41,10 @@ the thread, not fixed) is refused (`ConstantTooDeep`).
 `coalesce(a, b, ...)` over any expressions, `nullif(col, literal)` (NULL where the column equals the literal; a CASE, so
 a column and a literal) and `abs(x)` of an integer, DOUBLE or DECIMAL expression (the magnitude in the argument's type:
 the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, is an overflow error, as DuckDB's),
-`strlen(s)` (bytes; NULL for NULL), the string functions `length`, `substring`/`substr`, `left`, `right`, `upper`/`lower`,
-`trim`/`ltrim`/`rtrim` (spaces), `replace` and `lpad`/`rpad`, and searched `CASE WHEN cond THEN v ...
+`ifnull(a, b)` (a two-argument `coalesce`), `strlen(s)` (bytes; NULL for NULL), the string functions `length`,
+`substring`/`substr` (also `substring(x FROM a [FOR b])`), `left`, `right`, `upper`/`lower`, `trim`/`ltrim`/`rtrim`
+(spaces), `replace`, `lpad`/`rpad` and `concat(a, b, ...)` (a NULL is the empty text, unlike `||`; the arguments must be
+text), and searched `CASE WHEN cond THEN v ...
 [ELSE v] END`, parens, unary minus. A CASE evaluates a branch only on the rows that take it, and coalesce an argument
 only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
 `CASE c WHEN v ...` is the searched form `WHEN c = v` for a column and literals. DECIMAL arithmetic is exact (see below).
@@ -50,7 +52,7 @@ The string functions count and cut text in characters (UTF-8 code points, as Duc
 character); `upper` and `lower` map one code point to one with DuckDB's own table, so `ß` upper-cases to `ẞ` and
 there is no final-sigma form. Their other arguments are constants (a column there is refused; an empty `lpad`/`rpad`
 pad is an error only where padding is needed, as in DuckDB). Each distinct text is computed once, a dictionary-coded
-column once per entry.
+column once per entry. A DOUBLE column and a DECIMAL default (`coalesce(d, 0.0)`) coalesce to DOUBLE, as in DuckDB.
 
 **Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and
 `GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a

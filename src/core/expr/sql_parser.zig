@@ -568,6 +568,105 @@ fn extractAsDatePart(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
     return out.toOwnedSliceSentinel(allocator, 0);
 }
 
+/// `sql` with the keyword form of `substring` written as the call DuckDB reads it as: `substring(x FROM a FOR b)` is
+/// `substring(x, a, b)`, `substring(x FROM a)` is `substring(x, a)` and `substring(x FOR b)` is `substring(x, 1, b)`.
+/// Only a keyword that sits directly in the call's own parentheses counts (not one in a nested call or subquery) and
+/// quoted text is left as it is. One pass with its own stack, so a deeply nested query costs no recursion.
+fn substringKeywords(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+    const Frame = struct {
+        /// This paren opens a `substring(` call.
+        call: bool,
+        /// A comma or a keyword was already written in it: the call is a plain argument list, or has its FROM.
+        comma: bool = false,
+        from: bool = false,
+        /// A keyword was rewritten, so a comma after it makes a form DuckDB refuses.
+        rewrote: bool = false,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var frames: std.ArrayList(Frame) = .empty;
+    defer frames.deinit(allocator);
+    const isWord = struct {
+        fn at(ch: u8) bool {
+            return std.ascii.isAlphanumeric(ch) or ch == '_';
+        }
+    }.at;
+    var i: usize = 0;
+    var last_word: []const u8 = "";
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            var j = i + 1;
+            while (j < sql.len) : (j += 1) if (sql[j] == ch) {
+                if (j + 1 < sql.len and sql[j + 1] == ch) j += 1 else break;
+            };
+            const stop = @min(j + 1, sql.len);
+            try out.appendSlice(allocator, sql[i..stop]);
+            i = stop;
+            last_word = "";
+            continue;
+        }
+        if (isWord(ch)) {
+            var j = i;
+            while (j < sql.len and isWord(sql[j])) j += 1;
+            const text = sql[i..j];
+            const top: ?*Frame = if (frames.items.len == 0) null else blk: {
+                const innermost = &frames.items[frames.items.len - 1];
+                break :blk if (innermost.call) innermost else null;
+            };
+            if (top) |f| if (!f.comma and std.ascii.eqlIgnoreCase(text, "from") and !f.from) {
+                f.from = true;
+                f.rewrote = true;
+                try out.appendSlice(allocator, ",");
+                i = j;
+                last_word = "";
+                continue;
+            } else if (!f.comma and std.ascii.eqlIgnoreCase(text, "for") and !f.rewrote) {
+                // No FROM before it: the start is 1.
+                f.rewrote = true;
+                try out.appendSlice(allocator, ", 1,");
+                i = j;
+                last_word = "";
+                continue;
+            } else if (!f.comma and std.ascii.eqlIgnoreCase(text, "for") and f.from) {
+                try out.appendSlice(allocator, ",");
+                f.rewrote = true;
+                i = j;
+                last_word = "";
+                continue;
+            };
+            try out.appendSlice(allocator, text);
+            last_word = text;
+            i = j;
+            continue;
+        }
+        switch (ch) {
+            '(' => {
+                try frames.append(allocator, .{ .call = std.ascii.eqlIgnoreCase(last_word, "substring") });
+                last_word = "";
+            },
+            ')' => {
+                _ = frames.pop();
+                last_word = "";
+            },
+            ',' => {
+                if (frames.items.len > 0 and frames.items[frames.items.len - 1].call) {
+                    const f = &frames.items[frames.items.len - 1];
+                    // A comma after a rewritten keyword is a form DuckDB refuses: leave a syntax error behind.
+                    if (f.rewrote) try out.append(allocator, ',');
+                    f.comma = true;
+                }
+                last_word = "";
+            },
+            ' ', '\t', '\n', '\r' => {},
+            else => last_word = "",
+        }
+        try out.append(allocator, ch);
+        i += 1;
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
+}
+
 const QueryShape = struct { is_aggregate: bool, has_group_by: bool };
 
 fn classifyQuery(
@@ -750,7 +849,9 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    const sql_c = try extractAsDatePart(allocator, folded_sql);
+    const extracted = try extractAsDatePart(allocator, folded_sql);
+    defer allocator.free(extracted);
+    const sql_c = try substringKeywords(allocator, extracted);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses
@@ -2383,6 +2484,34 @@ test "sql_parser reads EXTRACT(part FROM x) as date_part('part', x), quoted text
     const q = try parseSqlQuery(a, "SELECT extract(minute FROM t) AS m, count(*) FROM f GROUP BY m");
     defer q.deinit(a);
     try std.testing.expectEqualStrings("date_part('minute', t)", q.select_cols[0].expr);
+}
+
+test "sql_parser reads substring(x FROM a FOR b) as substring(x, a, b), and only that" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "SELECT substring(s FROM 2 FOR 3), SUBSTRING (s From 2), substring(s FOR 4) FROM t", "SELECT substring(s , 2 , 3), SUBSTRING (s , 2), substring(s , 1, 4) FROM t" },
+        .{ "substring(substring(s FROM 1 FOR 5) FROM 2)", "substring(substring(s , 1 , 5) , 2)" },
+        // A keyword in a nested call or subquery belongs to that one.
+        .{ "substring(f(x FROM y) FROM 1)", "substring(f(x FROM y) , 1)" },
+        .{ "substring((SELECT a FROM t) FROM 1)", "substring((SELECT a FROM t) , 1)" },
+        // Plain argument lists, quoted text and other calls are not touched.
+        .{ "substring(s, 2, 3) FROM t", "substring(s, 2, 3) FROM t" },
+        .{ "'substring(a FROM 1)' \"substring\"(a FROM 1)", "'substring(a FROM 1)' \"substring\"(a FROM 1)" },
+        .{ "foo(a FROM b) substringx(a FROM 1)", "foo(a FROM b) substringx(a FROM 1)" },
+        .{ "substring(x, 1 FROM 2)", "substring(x, 1 FROM 2)" },
+        // A comma after a keyword makes no call DuckDB reads: it is left as a syntax error.
+        .{ "substring(x FROM 1, 2)", "substring(x , 1,, 2)" },
+        .{ "substring(s FROM 'a''FOR' FOR 2)", "substring(s , 'a''FOR' , 2)" },
+    };
+    for (cases) |case| {
+        const got = try substringKeywords(a, case[0]);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
+    const q = try parseSqlQuery(a, "SELECT substring(s FROM 2 FOR 3) AS p FROM f GROUP BY p");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("substring(s, 2, 3)", q.select_cols[0].expr);
+    try std.testing.expectError(error.SqlParseError, parseSqlQuery(a, "SELECT substring(s FROM 1, 2) AS p FROM f"));
 }
 
 test "syntax: owned SQL releases partial nodes and result-order storage on allocation failure" {

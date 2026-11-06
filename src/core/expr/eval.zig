@@ -1977,6 +1977,8 @@ fn defaultF64(lit: ast.Literal) Error!f64 {
     return switch (lit) {
         .i64 => |v| @floatFromInt(v),
         .f64 => |v| v,
+        // A DOUBLE column's default `0.0` is a DECIMAL literal, which DuckDB casts to DOUBLE for the result.
+        .dec => |d| d.f,
         else => error.TypeMismatch,
     };
 }
@@ -2731,6 +2733,30 @@ test "regression: coalesce: col + col (f64) is NULL where both are" {
     try testing.expectEqual(1.5, out.f64.values[0]);
     try testing.expectEqual(3.5, out.f64.values[2]);
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1 }, out.f64.def_levels.?);
+}
+
+test "coalesce: a DOUBLE column with a DECIMAL literal default is DOUBLE, as DuckDB types it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const vals = [_]f64{ 2.25, 0, 7 };
+    const dls = [_]u32{ 1, 0, 1 };
+    const cols = [_]Batch.Column{.{ .f64 = .{ .values = &vals, .def_levels = &dls, .max_def = 1 } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+    var col: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    const dec_lit: ast.DecLit = .{ .unscaled = 15, .spec = .{ .precision = 2, .scale = 1 }, .f = 1.5 };
+    var one_and_a_half: ast.Expr = .{ .literal = .{ .dec = dec_lit } };
+    const args = [_]*ast.Expr{ &col, &one_and_a_half };
+    const out = try evalExpr(a, &batch, &lookup, .{ .call = .{
+        .func = .coalesce,
+        .args = &args,
+        .result_type = .f64,
+        .depth = 2,
+    } });
+    try testing.expectEqualSlices(f64, &.{ 2.25, 1.5, 7 }, out.f64.values);
+    try testing.expect(out.f64.def_levels == null);
 }
 
 test "regression: coalesce zero-extends UINT32 operands in the i64 and f64 lanes, with a literal or a column" {

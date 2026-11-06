@@ -117,9 +117,17 @@ pub const Lower = struct {
     /// `nullif(x, v)` is `CASE WHEN x = v THEN NULL ELSE x END`. Its first argument is a column (the CASE's condition
     /// compares a column with a literal) and its second a literal; any other form is no function zpq has, and refuses.
     fn sugarCall(self: *Lower, f: anytype, func: []const u8, depth: u32) Error!?syntax.Expr {
-        if (!std.ascii.eqlIgnoreCase(func, "nullif")) return null;
+        const is_concat = std.ascii.eqlIgnoreCase(func, "concat");
+        const is_ifnull = std.ascii.eqlIgnoreCase(func, "ifnull");
+        if (!is_concat and !is_ifnull and !std.ascii.eqlIgnoreCase(func, "nullif")) return null;
         if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0) return error.ExpectedRParen;
+        if (is_concat) return try self.concatCall(f, depth);
         if (f.args.count != 2) return error.WrongArity;
+        if (is_ifnull) {
+            const args = try self.arena.alloc(*const syntax.Expr, 2);
+            for (args, 0..) |*out, i| out.* = try self.ptr(f.args.items[i] orelse return error.SqlParseError, depth + 1);
+            return .{ .call = .{ .name = "coalesce", .args = args } };
+        }
         const arg_node: *const c.LpNode = f.args.items[0] orelse return error.SqlParseError;
         const other: *const c.LpNode = f.args.items[1] orelse return error.SqlParseError;
         // The column, and the same column as the branch's value.
@@ -128,6 +136,28 @@ pub const Lower = struct {
         const whens = try self.arena.alloc(syntax.Expr.When, 1);
         whens[0] = .{ .cond = .{ .comparison = .{ .operand = column, .op = .Eq, .value = try self.literal(other) } }, .then = null };
         return .{ .case_ = .{ .whens = whens, .else_ = value } };
+    }
+
+    /// `concat(a, b, ...)` joins its arguments and reads a NULL as the empty text (unlike `||`, where it makes the result
+    /// NULL): `coalesce(a, '') || coalesce(b, '') || ...`. DuckDB turns any argument into text; here they must be text.
+    fn concatCall(self: *Lower, f: anytype, depth: u32) Error!syntax.Expr {
+        if (f.args.count == 0) return error.WrongArity;
+        var joined: ?*const syntax.Expr = null;
+        for (0..@intCast(f.args.count)) |i| {
+            const args = try self.arena.alloc(*const syntax.Expr, 2);
+            args[0] = try self.ptr(f.args.items[i] orelse return error.SqlParseError, depth + 1);
+            const empty = try self.arena.create(syntax.Expr);
+            empty.* = .{ .string = "" };
+            args[1] = empty;
+            const part = try self.arena.create(syntax.Expr);
+            part.* = .{ .call = .{ .name = "coalesce", .args = args } };
+            if (joined) |left| {
+                const both = try self.arena.create(syntax.Expr);
+                both.* = .{ .binary = .{ .op = .concat, .left = left, .right = part } };
+                joined = both;
+            } else joined = part;
+        }
+        return joined.?.*;
     }
 
     /// DuckDB's names for its one string type that a cast takes; a length (`VARCHAR(10)`) DuckDB ignores, so zpq does.
@@ -258,7 +288,7 @@ pub const Lower = struct {
                         else => std.math.mul(i128, l.int.v, r.int.v),
                     }) catch return error.BadValue;
                     // The result type is the wider operand's: past it DuckDB raises an overflow error.
-                    const width: Width = @enumFromInt(@max(@intFromEnum(l.int.width), @intFromEnum(r.int.width)));
+                    const width: Width = @fromBackingInt(@intCast(@max(@backingInt(l.int.width), @backingInt(r.int.width))));
                     if (!width.holds(v)) return error.BadValue;
                     break :blk .{ .int = .{ .v = v, .width = width } };
                 }

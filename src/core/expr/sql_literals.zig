@@ -10,17 +10,50 @@ const filters = @import("../filter/parser.zig");
 
 pub const Error = error{ BadValue, BadInterval, IntervalNotSupported, DistinctNotSupported, OutOfMemory };
 
-/// `x ILIKE 'p'` is rewritten `x LIKE 'p' ESCAPE 'zpq:ilike'`: the grammar parses an ESCAPE clause and nothing a user
-/// writes (DuckDB takes one character) is this text, so the lowering reads it as the case-insensitive form.
-pub const ilike_escape = "zpq:ilike";
+/// The two names the rewrite writes for what the grammar has no spelling for: `GROUP BY ALL` becomes a grouping by one
+/// name, and `x ILIKE 'p'` becomes `x LIKE 'p' ESCAPE '<one string>'`. Neither is a fixed spelling: each is chosen not
+/// to occur anywhere in the query's text, so a name the parser finds is the rewrite's, never the user's (a column may
+/// be called `__zpq_group_all`, and an ESCAPE clause the user writes is refused whatever it spells).
+pub const Markers = struct {
+    group: [48]u8 = undefined,
+    group_len: usize = 0,
+    ilike: [48]u8 = undefined,
+    ilike_len: usize = 0,
 
-/// What `GROUP BY ALL` is rewritten to: one name no column has, which the parser swaps for the SELECT's keys.
-pub const group_all_name = "__zpq_group_all";
+    pub fn choose(sql: []const u8) error{BadValue}!Markers {
+        var m: Markers = .{};
+        m.group_len = try pick(&m.group, "__zpq_group_all", sql);
+        m.ilike_len = try pick(&m.ilike, "zpq:ilike", sql);
+        return m;
+    }
+
+    /// `base`, with underscores added until the text holds no such name (identifiers match without regard to case).
+    fn pick(buf: []u8, base: []const u8, sql: []const u8) error{BadValue}!usize {
+        @memcpy(buf[0..base.len], base);
+        var n = base.len;
+        while (std.ascii.findIgnoreCase(sql, buf[0..n]) != null) {
+            if (n == buf.len) return error.BadValue;
+            buf[n] = '_';
+            n += 1;
+        }
+        return n;
+    }
+
+    pub fn groupAll(self: *const Markers) []const u8 {
+        return self.group[0..self.group_len];
+    }
+
+    pub fn ilikeEscape(self: *const Markers) []const u8 {
+        return self.ilike[0..self.ilike_len];
+    }
+};
 
 /// What went wrong, for the message the parser prints; the error value carries the kind.
 pub const Report = struct {
     buf: [200]u8 = undefined,
     len: usize = 0,
+    /// The names `rewrite` chose for what it rewrote, which the parser reads the query's markers by.
+    markers: Markers = .{},
 
     fn set(self: *Report, comptime fmt: []const u8, args: anytype) void {
         const written: []const u8 = std.fmt.bufPrint(&self.buf, fmt, args) catch self.buf[0..];
@@ -543,6 +576,10 @@ fn groupByAllAt(s: []const u8, at: usize) ?usize {
 /// `sql` with the spellings above folded. Quoted text and comments pass through. A `DATE '..'` or `INTERVAL` the fold
 /// cannot take is a named error, never a syntax error from the parser that follows.
 pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) Error![]u8 {
+    report.markers = Markers.choose(sql) catch {
+        report.set("the query spells every name zpq's rewrites use", .{});
+        return error.BadValue;
+    };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var open: std.ArrayList(struct { at: usize, name: ?usize }) = .empty;
@@ -651,14 +688,18 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
             };
             try out.appendSlice(allocator, "like ");
             try out.appendSlice(allocator, sql[lit..stop]);
-            try out.appendSlice(allocator, " escape '" ++ ilike_escape ++ "'");
+            try out.appendSlice(allocator, " escape '");
+            try out.appendSlice(allocator, report.markers.ilikeEscape());
+            try out.append(allocator, '\'');
             atom.have = false;
             i = stop;
             continue;
         }
         if (wordIs(sql, i, "group")) if (groupByAllAt(sql, i)) |stop| {
-            try out.appendSlice(allocator, "group by " ++ group_all_name);
-            atom = .{ .have = true, .start = out.items.len - group_all_name.len, .end = out.items.len };
+            try out.appendSlice(allocator, "group by ");
+            const name = report.markers.groupAll();
+            try out.appendSlice(allocator, name);
+            atom = .{ .have = true, .start = out.items.len - name.len, .end = out.items.len };
             i = stop;
             continue;
         };
@@ -682,11 +723,16 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
     return out.toOwnedSlice(allocator);
 }
 
+/// `{G}` and `{E}` in `want` stand for the GROUP BY ALL name and the ILIKE escape string the rewrite chose.
 fn expectRewrite(sql: []const u8, want: []const u8) !void {
     var report: Report = .{};
     const got = try rewrite(std.testing.allocator, sql, &report);
     defer std.testing.allocator.free(got);
-    try std.testing.expectEqualStrings(want, got);
+    const with_group = try std.mem.replaceOwned(u8, std.testing.allocator, want, "{G}", report.markers.groupAll());
+    defer std.testing.allocator.free(with_group);
+    const expected = try std.mem.replaceOwned(u8, std.testing.allocator, with_group, "{E}", report.markers.ilikeEscape());
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, got);
 }
 
 fn expectRewriteError(sql: []const u8, err: anyerror) !void {
@@ -763,6 +809,23 @@ test "sql_literals: decimal arithmetic proves a product fits before it forms it"
     try std.testing.expect(big.rescale(38) == null);
 }
 
+test "sql_literals: the rewrite's marker names occur nowhere in the query text" {
+    var plain: Report = .{};
+    const a = try rewrite(std.testing.allocator, "SELECT g FROM t GROUP BY ALL", &plain);
+    defer std.testing.allocator.free(a);
+    try std.testing.expectEqualStrings("__zpq_group_all", plain.markers.groupAll());
+    try std.testing.expectEqualStrings("zpq:ilike", plain.markers.ilikeEscape());
+    // A column of that name, in any case, and an ESCAPE string of that spelling, are the user's: the marker moves.
+    var taken: Report = .{};
+    const sql = "SELECT __ZPQ_GROUP_ALL FROM t WHERE s LIKE 'a%' ESCAPE 'zpq:ilike' GROUP BY __zpq_group_all_";
+    const b = try rewrite(std.testing.allocator, sql, &taken);
+    defer std.testing.allocator.free(b);
+    try std.testing.expectEqualStrings(sql, b);
+    try std.testing.expectEqualStrings("__zpq_group_all__", taken.markers.groupAll());
+    try std.testing.expectEqualStrings("zpq:ilike_", taken.markers.ilikeEscape());
+    try expectRewrite("SELECT __zpq_group_all FROM t GROUP BY ALL", "SELECT __zpq_group_all FROM t group by {G}");
+}
+
 test "sql_literals: x::TYPE becomes CAST for the operand just before it" {
     try expectRewrite("SELECT a::INT, t.b::DECIMAL(15, 2) AS c", "SELECT CAST(a AS INT), CAST(t.b AS DECIMAL(15, 2)) AS c");
     try expectRewrite("SELECT abs(a - 1)::BIGINT, (a + 1)::DOUBLE PRECISION", "SELECT CAST(abs(a - 1) AS BIGINT), CAST((a + 1) AS DOUBLE PRECISION)");
@@ -772,10 +835,10 @@ test "sql_literals: x::TYPE becomes CAST for the operand just before it" {
 }
 
 test "sql_literals: GROUP BY ALL, ILIKE and DISTINCT ON" {
-    try expectRewrite("SELECT g, count(*) FROM t GROUP BY ALL", "SELECT g, count(*) FROM t group by " ++ group_all_name);
-    try expectRewrite("select g from t group   by\n all order by g", "select g from t group by " ++ group_all_name ++ " order by g");
+    try expectRewrite("SELECT g, count(*) FROM t GROUP BY ALL", "SELECT g, count(*) FROM t group by {G}");
+    try expectRewrite("select g from t group   by\n all order by g", "select g from t group by {G} order by g");
     try expectRewrite("SELECT g FROM t GROUP BY all_col", "SELECT g FROM t GROUP BY all_col");
-    try expectRewrite("WHERE s ILIKE 'A%' AND t NOT ILIKE 'b_' OR u = 1", "WHERE s like 'A%' escape '" ++ ilike_escape ++ "' AND t NOT like 'b_' escape '" ++ ilike_escape ++ "' OR u = 1");
+    try expectRewrite("WHERE s ILIKE 'A%' AND t NOT ILIKE 'b_' OR u = 1", "WHERE s like 'A%' escape '{E}' AND t NOT like 'b_' escape '{E}' OR u = 1");
     try expectRewrite("WHERE ilike_flag = 1", "WHERE ilike_flag = 1");
     try expectRewriteError("WHERE s ILIKE t", error.BadValue);
     try expectRewriteError("SELECT DISTINCT ON (g) g FROM t", error.DistinctNotSupported);

@@ -48,7 +48,8 @@ only on the rows every earlier one left NULL, so a fault where no row needs the 
 column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals (only TRUE keeps a group;
 without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks, or by an
 expression of the keys (`GROUP BY k ORDER BY k * 2`: one more key, which cannot change the groups). `SELECT DISTINCT a, b`
-is `GROUP BY a, b` (NULLs one group), `GROUP BY ALL` groups by the SELECT items that are no aggregate, and `ORDER BY`
+is `GROUP BY a, b` (NULLs one group), `GROUP BY ALL` groups by the SELECT items that are no aggregate (a constant is no key
+of its own: constants alone keep one row per input row, and a constant beside only aggregates is refused by name), and `ORDER BY`
 takes `NULLS FIRST` or `NULLS LAST`, NULLs last by default in either direction as in DuckDB. `DISTINCT` with an aggregate,
 a GROUP BY or `*`, and `DISTINCT ON`, are refused by name. Plain
 rows take `ORDER BY` columns with a `LIMIT`, keeping the first rows by those keys, ties by input position.

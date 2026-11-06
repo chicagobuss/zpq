@@ -201,6 +201,18 @@ fn distinctAsGroupBy(root: *c.LpNode, lp_arena: *c.arena_t) !void {
     sel.distinct = 0;
 }
 
+/// Whether two unparsed expressions are written alike: names and keywords without regard to case, but the contents
+/// of a string literal byte for byte (`'a'` and `'A'` are two values).
+fn sameExprText(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var in_string = false;
+    for (a, b) |x, y| {
+        if (x == '\'') in_string = !in_string;
+        if (if (in_string) x != y else std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
 /// Add `expr` to GROUP BY once: a column or expression written alike is the same term.
 fn pushGroupTerm(sel: anytype, lp_arena: *c.arena_t, expr: *c.LpNode) !void {
     const text_c = c.lp_ast_to_sql(expr, lp_arena);
@@ -210,21 +222,37 @@ fn pushGroupTerm(sel: anytype, lp_arena: *c.arena_t, expr: *c.LpNode) !void {
         const term = sel.group_by.items[g] orelse continue;
         if (sameColumnRef(expr, term) orelse blk: {
             const other = c.lp_ast_to_sql(term, lp_arena);
-            break :blk other != null and std.ascii.eqlIgnoreCase(text, std.mem.span(other));
+            break :blk other != null and sameExprText(text, std.mem.span(other));
         }) return;
     }
     c.lp_list_push(lp_arena, &sel.group_by, expr);
 }
 
-/// `GROUP BY ALL` groups by every SELECT item that is no aggregate (DuckDB). `sql_literals` spelled it as the one
-/// name `group_all_name`, which this swaps for those items; with none, the aggregates form one group, as with no GROUP BY.
-fn groupByAll(root: *c.LpNode, lp_arena: *c.arena_t) !void {
+/// An expression of literals alone (`1`, `-5`, `2 * 3`, `CAST('x' AS date)`): one value, whatever the rows.
+fn constantOnly(node: *const c.LpNode) bool {
+    return switch (node.kind) {
+        c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_NULL, c.LP_EXPR_LITERAL_BOOL => true,
+        c.LP_EXPR_UNARY_OP => if (node.u.unary.operand) |o| constantOnly(o) else false,
+        c.LP_EXPR_BINARY_OP => (if (node.u.binary.left) |l| constantOnly(l) else false) and
+            (if (node.u.binary.right) |r| constantOnly(r) else false),
+        c.LP_EXPR_CAST => if (node.u.cast.expr) |e| constantOnly(e) else false,
+        else => false,
+    };
+}
+
+/// `GROUP BY ALL` groups by every SELECT item that is no aggregate (DuckDB). `sql_literals` spelled it as the one name
+/// `marker`, chosen not to occur in the query, which this swaps for those items. A constant is no grouping key of its
+/// own: with other keys it joins them (it cannot split a group), and with none the query has no grouping at all, so
+/// the aggregates form one group and a query of constants alone keeps one row per input row, as in DuckDB.
+fn groupByAll(root: *c.LpNode, lp_arena: *c.arena_t, marker: []const u8) !void {
     const sel = &root.*.u.select;
     if (sel.group_by.count != 1) return;
     const term = sel.group_by.items[0] orelse return;
     if (term.*.kind != c.LP_EXPR_COLUMN_REF or term.*.u.column_ref.table != null or term.*.u.column_ref.column == null) return;
-    if (!std.mem.eql(u8, std.mem.span(term.*.u.column_ref.column), literals.group_all_name)) return;
+    if (term.*.u.column_ref.quoted != 0 or !std.mem.eql(u8, std.mem.span(term.*.u.column_ref.column), marker)) return;
     sel.group_by.count = 0;
+    var any_key = false;
+    var any_agg = false;
     var i: usize = 0;
     while (i < @as(usize, @intCast(sel.result_columns.count))) : (i += 1) {
         const expr = selectExpr(sel.*, i) orelse return error.SqlParseError;
@@ -233,8 +261,19 @@ fn groupByAll(root: *c.LpNode, lp_arena: *c.arena_t) !void {
             return error.ColumnMustBeGrouped;
         }
         const info = analyzeExpr(expr);
-        if (info.has_agg or info.has_window or info.has_subquery) continue;
+        if (info.has_agg or info.has_window or info.has_subquery) {
+            any_agg = any_agg or info.has_agg;
+            continue;
+        }
+        any_key = any_key or !constantOnly(expr);
         try pushGroupTerm(sel, lp_arena, expr);
+    }
+    if (any_key or sel.group_by.count == 0) return;
+    // Only constants: no grouping at all.
+    sel.group_by.count = 0;
+    if (any_agg) {
+        diagnosticPrint("sql: GROUP BY ALL with a constant beside an aggregate is not supported yet\n", .{});
+        return error.MixedSelectNotSupported;
     }
 }
 
@@ -620,7 +659,7 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
         return error.UnsupportedStatement;
     }
     try distinctAsGroupBy(root, lp_arena);
-    try groupByAll(root, lp_arena);
+    try groupByAll(root, lp_arena, literal_report.markers.groupAll());
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
     boolLiterals(root);
@@ -665,7 +704,11 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
         owner.deinit();
         allocator.destroy(owner);
     };
-    var lower: Lower = .{ .arena = if (syntax_owner) |owner| owner.allocator() else undefined, .lp_arena = lp_arena };
+    var lower: Lower = .{
+        .arena = if (syntax_owner) |owner| owner.allocator() else undefined,
+        .lp_arena = lp_arena,
+        .ilike_escape = literal_report.markers.ilikeEscape(),
+    };
     const lowering = if (structured) &lower else null;
     const shape = try classifyQuery(allocator, root, lp_arena);
     if (shape.has_group_by) try orderTermsAsKeys(allocator, root, lp_arena);
@@ -1268,7 +1311,7 @@ fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.Sele
     }
     // Spelled with other letter case (`count(*)` for `COUNT(*)`): the one item that matches so, if only one does.
     var found: ?usize = null;
-    for (select_cols, 0..) |col, i| if (std.ascii.eqlIgnoreCase(text, col.expr)) {
+    for (select_cols, 0..) |col, i| if (sameExprText(text, col.expr)) {
         if (found != null) {
             found = null;
             break;
@@ -1368,7 +1411,7 @@ fn orderTermsAsKeys(allocator: std.mem.Allocator, root: *c.LpNode, lp_arena: *c.
         for (0..@intCast(sel.result_columns.count)) |i| {
             const item = selectExpr(sel.*, i) orelse continue;
             const item_c = c.lp_ast_to_sql(item, lp_arena);
-            if (item_c != null and std.ascii.eqlIgnoreCase(std.mem.span(text_c), std.mem.span(item_c))) selected = true;
+            if (item_c != null and sameExprText(std.mem.span(text_c), std.mem.span(item_c))) selected = true;
         }
         if (selected or !try columnsGrouped(allocator, sel.*, lp_arena, expr)) continue;
         try pushGroupTerm(sel, lp_arena, expr);
@@ -1412,7 +1455,7 @@ fn sameTerm(lp_arena: *c.arena_t, expr: *c.LpNode, text: []const u8, other: *c.L
     if (sameColumnRef(expr, other)) |same| return same;
     const other_c = c.lp_ast_to_sql(other, lp_arena);
     if (other_c == null) return error.UnparseError;
-    return std.ascii.eqlIgnoreCase(text, stripQuotes(std.mem.trim(u8, std.mem.span(other_c), " ")));
+    return sameExprText(text, stripQuotes(std.mem.trim(u8, std.mem.span(other_c), " ")));
 }
 
 /// Reject a SELECT item that reads a column outside an aggregate unless it is a GROUP BY term. The engine binds the
@@ -1720,6 +1763,62 @@ test "sql_parser: constant integers keep DuckDB's width, a signed one after its 
         const q = try parseSqlPlan(a, sql);
         q.deinit(a);
     }
+}
+
+test "sql_parser: a column spelled like GROUP BY ALL's marker is a column" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT count(*) AS n FROM 't' GROUP BY __zpq_group_all ORDER BY n");
+    defer q.deinit(a);
+    try std.testing.expectEqualStrings("__zpq_group_all", q.group_by_str.?);
+    // ... in any case, and beside a real GROUP BY ALL.
+    const upper = try parseSqlQuery(a, "SELECT __ZPQ_GROUP_ALL, count(*) AS n FROM 't' GROUP BY ALL");
+    defer upper.deinit(a);
+    try std.testing.expectEqualStrings("__ZPQ_GROUP_ALL", upper.group_by_str.?);
+}
+
+test "sql_parser: GROUP BY ALL keeps constants out of the keys" {
+    const a = std.testing.allocator;
+    // Constants alone: no grouping, so one row per input row, as plain rows are.
+    const one = try parseSqlQuery(a, "SELECT 1 AS one FROM 't' GROUP BY ALL");
+    defer one.deinit(a);
+    try std.testing.expect(!one.is_aggregate and one.group_by_str == null);
+    try std.testing.expectEqualStrings("1 AS one", one.select_str.?);
+    // With a key they join it, binding each SELECT item to a key.
+    const keyed = try parseSqlQuery(a, "SELECT 1 AS one, g, count(*) AS n FROM 't' GROUP BY ALL");
+    defer keyed.deinit(a);
+    try std.testing.expectEqualStrings("1, g", keyed.group_by_str.?);
+    // With only aggregates there is no key, and the constant has no place in the one group: named.
+    try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT 1 AS one, count(*) AS n FROM 't' GROUP BY ALL"));
+    // DISTINCT of a constant is one row, and stays one grouping.
+    const distinct = try parseSqlQuery(a, "SELECT DISTINCT 1 AS one FROM 't'");
+    defer distinct.deinit(a);
+    try std.testing.expectEqualStrings("1", distinct.group_by_str.?);
+}
+
+test "sql_parser: an ESCAPE the user writes is refused, whatever it spells" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT count(*) AS n FROM 't' WHERE s LIKE 'a%' ESCAPE 'zpq:ilike'",
+        "SELECT count(*) AS n FROM 't' WHERE s LIKE 'a%' ESCAPE '\\'",
+        "SELECT count(*) AS n FROM 't' WHERE s NOT LIKE 'a%' ESCAPE 'zpq:ilike_'",
+    }) |sql| try std.testing.expectError(error.BadValue, parseSqlPlan(a, sql));
+    const q = try parseSqlPlan(a, "SELECT count(*) AS n FROM 't' WHERE s ILIKE 'a%' AND t LIKE 'zpq:ilike'");
+    defer q.deinit(a);
+    try std.testing.expect(q.syntax.?.filter.?.and_[0].like.fold);
+    try std.testing.expect(!q.syntax.?.filter.?.and_[1].like.fold);
+}
+
+test "sql_parser: expressions that differ only in a string literal's case are two group keys" {
+    const a = std.testing.allocator;
+    try std.testing.expect(sameExprText("CASE WHEN i = 1 THEN 'a' END", "case when I = 1 then 'a' end"));
+    try std.testing.expect(!sameExprText("CASE WHEN i = 1 THEN 'a' END", "CASE WHEN i = 1 THEN 'A' END"));
+    try std.testing.expect(!sameExprText("x = 'it''s'", "x = 'IT''S'"));
+    const q = try parseSqlQuery(a, "SELECT DISTINCT CASE WHEN i = 1 THEN 'a' ELSE 'a' END AS a, CASE WHEN i = 1 THEN 'a' ELSE 'A' END AS b FROM 't'");
+    defer q.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, q.group_by_str.?, "CASE"));
+    const same = try parseSqlQuery(a, "SELECT DISTINCT CASE WHEN i = 1 THEN 'a' END AS a, case when I = 1 then 'a' end AS b FROM 't'");
+    defer same.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, same.group_by_str.?, "CASE"));
 }
 
 test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result columns" {

@@ -18,6 +18,9 @@ pub const Lower = struct {
     stack: ?stack_guard.Guard = null,
     /// Bytes of stack a fold may use in place of what the thread has (`stack_guard.Guard.within`): for tests.
     stack_limit: ?usize = null,
+    /// The string the rewrite gave the ESCAPE of an ILIKE (`Markers.ilikeEscape`); a user's own ESCAPE is no such
+    /// string, whatever it spells, and is refused.
+    ilike_escape: []const u8 = "",
     hidden: std.ArrayList(*const c.LpNode) = .empty,
     rows: std.ArrayList(syntax.RowKey) = .empty,
 
@@ -331,11 +334,12 @@ pub const Lower = struct {
                     break :blk .{ .null_check = .{ .column = try self.name(left), .is_not = b.op == c.LP_OP_ISNOT } };
                 }
                 if (b.op == c.LP_OP_LIKE) {
-                    // ILIKE reaches here as `LIKE .. ESCAPE 'zpq:ilike'` (`sql_literals`); any other ESCAPE is refused.
+                    // ILIKE reaches here as `LIKE .. ESCAPE '<marker>'` (`sql_literals`); any other ESCAPE is refused.
                     var fold = false;
                     if (b.escape != null) {
                         const esc: *const c.LpNode = b.escape;
-                        if (esc.kind != c.LP_EXPR_LITERAL_STRING or !std.mem.eql(u8, std.mem.span(esc.u.literal.value), lits.ilike_escape))
+                        if (self.ilike_escape.len == 0 or esc.kind != c.LP_EXPR_LITERAL_STRING or
+                            !std.mem.eql(u8, std.mem.span(esc.u.literal.value), self.ilike_escape))
                             return error.BadValue;
                         fold = true;
                     }

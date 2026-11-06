@@ -15,6 +15,7 @@ pub const EncodeScratch = struct {
     /// Idle mappings plus the excess capacity still charged while a job borrows a larger mapping.
     held: usize = 0,
     live: usize = 0,
+    paused: bool = false,
 
     const Node = struct {
         next: ?*Node = null,
@@ -32,6 +33,19 @@ pub const EncodeScratch = struct {
         std.debug.assert(self.live == 0);
         self.dropIdle();
         std.debug.assert(self.held == 0);
+    }
+
+    pub fn trimIdle(self: *EncodeScratch) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.dropIdle();
+    }
+
+    pub fn setPaused(self: *EncodeScratch, paused: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.paused = paused;
+        if (paused) self.dropIdle();
     }
 
     fn dropIdle(self: *EncodeScratch) void {
@@ -87,7 +101,7 @@ pub const EncodeScratch = struct {
             self.live += 1;
             return node.data;
         }
-        if (self.ledger.tight()) self.dropIdle();
+        if (!self.paused and self.ledger.tight()) self.dropIdle();
         const actual_alignment = alignment.max(.of(Node));
         const bytes = (self.child.rawAlloc(size, actual_alignment, ret) orelse return null)[0..size];
         const node: *Node = @ptrCast(@alignCast(bytes.ptr));
@@ -119,7 +133,7 @@ pub const EncodeScratch = struct {
         self.ledger.release(node.extra);
         self.held -= node.extra;
         node.extra = 0;
-        if (!self.ledger.tight() and node.bytes.len <= self.limit - self.held) {
+        if (!self.paused and !self.ledger.tight() and node.bytes.len <= self.limit - self.held) {
             if (self.ledger.drawExact(node.bytes.len) != null) {
                 node.next = self.idle;
                 self.idle = node;
@@ -217,6 +231,60 @@ test "encode scratch window cap includes excess capacity in live blocks" {
     try t.expectEqual(cache.held, ledger.used.load(.monotonic));
     cache.deinit();
     try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "encode scratch pressure trim refunds idle credit without touching a live borrower" {
+    const t = std.testing;
+    const page = std.heap.pageSize();
+    var ledger: memory.SharedBudget = .{ .limit = 16 * page };
+    var cache: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = 8 * page };
+    defer cache.deinit();
+    const a = cache.allocator();
+    const large = try a.alloc(u8, 4 * page);
+    a.free(large);
+    const live = try a.alloc(u8, page);
+    @memset(live, 71);
+    const other = try a.alloc(u8, 3 * page);
+    a.free(other);
+    try t.expect(ledger.drawExact(10 * page) == null);
+    cache.trimIdle();
+    try t.expectEqual(@as(usize, 0), cache.retained);
+    try t.expectEqual(3 * page, cache.held);
+    try t.expect(ledger.drawExact(10 * page) != null);
+    for (live) |byte| try t.expectEqual(@as(u8, 71), byte);
+    ledger.release(10 * page);
+    a.free(live);
+    cache.trimIdle();
+    try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "encode scratch cannot retain against the writer's temporary decoder allowance" {
+    const t = std.testing;
+    const page = std.heap.pageSize();
+    var ledger: memory.SharedBudget = .{ .limit = 16 * page };
+    var cache: EncodeScratch = .{
+        .io = t.io,
+        .child = t.allocator,
+        .ledger = &ledger,
+        .limit = 8 * page,
+    };
+    defer cache.deinit();
+    const a = cache.allocator();
+    const large = try a.alloc(u8, 4 * page);
+    a.free(large);
+    try t.expectEqual(5 * page, cache.retained);
+    cache.setPaused(true);
+    ledger.limit += 4 * page;
+    const borrowed = try a.alloc(u8, 3 * page);
+    try t.expectEqual(@as(usize, 0), cache.held);
+    a.free(borrowed);
+    try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+    ledger.limit -= 4 * page;
+    cache.setPaused(false);
+    const normal = try a.alloc(u8, 3 * page);
+    a.free(normal);
+    try t.expectEqual(4 * page, cache.retained);
+    try t.expectEqual(cache.retained, ledger.used.load(.monotonic));
 }
 
 test "encode scratch arena growth and reset release all idle credit" {

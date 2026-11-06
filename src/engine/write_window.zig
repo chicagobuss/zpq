@@ -8,6 +8,7 @@ const profile = @import("../profile.zig");
 const schema = @import("../core/schema.zig");
 const consumer = @import("../core/consumer.zig");
 const core_memory = @import("../core/memory.zig");
+const EncodeScratch = @import("../core/consumer/encode_scratch.zig").EncodeScratch;
 const huge_pages = @import("../core/huge_pages.zig");
 const system = @import("../core/system.zig");
 const filter_ast = @import("../core/filter/ast.zig");
@@ -303,7 +304,6 @@ fn copyRGToBuffer(
     return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
 }
 
-
 /// The writer's cutter: takes pieces in input order, holds their rows until an output row group's worth is in, then
 /// seals them as an `EncodeJob`. Jobs encode beside one another and beside the producers' reads; the writer writes
 /// them in the order they were sealed, so the file is the one encoding them one at a time would write. A piece may
@@ -574,7 +574,10 @@ const EncodeJob = struct {
         job.reserved = @intCast(job.charge);
         // A row group alone retains the existing lone-column allowance. The reservation now lives through
         // placement, so completed chunks cannot disappear from the ledger between encode waves and sink writes.
-        if (m.budget.drawExact(job.reserved) == null) m.budget.force(job.reserved);
+        if (m.budget.drawExact(job.reserved) == null) {
+            job.w.trimIdle();
+            if (m.budget.drawExact(job.reserved) == null) m.budget.force(job.reserved);
+        }
     }
 
     /// Its memory, claimed by its first ready task: the arena its chunks stay on (a region's `rows`), and what each
@@ -1060,6 +1063,7 @@ pub const WinCtx = struct {
     slicing_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
     lean_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
     encode_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
+    encode_scratch: ?*EncodeScratch = null,
 
     /// What a deferred row group's slices draw from (`slicing`, `lean`): the writer alone has the write's ledger and
     /// the slack's room past it. Beside producers still fetching it has the write's ledger while that holds more than
@@ -1082,6 +1086,7 @@ pub const WinCtx = struct {
     }
 
     fn trimIdle(w: *WinCtx) void {
+        if (w.encode_scratch) |scratch| scratch.trimIdle();
         for (w.regions) |*r| {
             if (r.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) continue;
             r.rows.trim();
@@ -1426,6 +1431,9 @@ fn winWriter(w: *WinCtx) void {
             // Alone, the writer has the slack's room for one decode beside what the write holds; beside producers, it
             // has that room as a ledger of its own.
             const slack = if (turns > 0) core_memory.lean_decode else 0;
+            // The decoder's borrowed room cannot fund encode pages retained past this turn.
+            if (slack > 0) if (w.encode_scratch) |scratch| scratch.setPaused(true);
+            defer if (slack > 0) if (w.encode_scratch) |scratch| scratch.setPaused(false);
             if (w.slicing) |m| m.budget.limit += slack;
             defer if (w.slicing) |m| {
                 m.budget.limit -= slack;
@@ -1826,6 +1834,7 @@ test "a deferred write row group slices on the write's ledger while it has room,
     var main: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &write_ledger };
     var lean: core_memory.Charged = .{ .child = std.testing.allocator, .budget = &lean_ledger };
     var w: WinCtx = undefined;
+    w.encode_scratch = null;
     w.slicing = &main;
     w.lean = &lean;
     // Alone, the writer always has the write's ledger (and the slack's room past it).
@@ -1914,7 +1923,6 @@ test "windowed fan-out runs budget producers at once on pool threads beside a wr
     }
 }
 
-
 test "persistent encode executor cleans up allocation failures with serial and parallel workers" {
     const Run = struct {
         fn run(gpa: std.mem.Allocator, limited: bool, parallel: bool) !void {
@@ -1956,6 +1964,7 @@ test "persistent encode executor cleans up allocation failures with serial and p
             });
             var completions: std.Io.Semaphore = .{};
             var w: WinCtx = undefined;
+            w.encode_scratch = null;
             w.gpa = gpa;
             w.io = std.testing.io;
             w.memory = null;
@@ -2065,6 +2074,7 @@ test "wide carried rows release their original piece without changing values und
             elems[1].type = .BYTE_ARRAY;
             var paths = [_][]const []const u8{ &.{"x"}, &.{"s"} };
             var w: WinCtx = undefined;
+            w.encode_scratch = null;
             w.gpa = gpa;
             w.memory = null;
             w.rg_target = .{};
@@ -2159,6 +2169,7 @@ test "encode reservations cover placement and retained regions become charged pa
     regions[0].rows.budget = &ledger;
     regions[0].work.budget = &ledger;
     var w: WinCtx = undefined;
+    w.encode_scratch = null;
     w.gpa = gpa;
     w.regions = &regions;
     w.memory = &charged;
@@ -2182,6 +2193,29 @@ test "encode reservations cover placement and retained regions become charged pa
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }
 
+test "encode scratch is trimmed before a lone-job reservation forces the ledger" {
+    const t = std.testing;
+    const page = std.heap.pageSize();
+    var ledger: core_memory.SharedBudget = .{ .limit = 8 * page };
+    var charged: core_memory.Charged = .{ .child = t.allocator, .budget = &ledger };
+    var scratch: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = ledger.limit };
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const bytes = try a.alloc(u8, 4 * page);
+    a.free(bytes);
+    try t.expectEqual(5 * page, ledger.used.load(.monotonic));
+    var w: WinCtx = undefined;
+    w.memory = &charged;
+    w.encode_scratch = &scratch;
+    w.regions = &.{};
+    var job: EncodeJob = .{ .w = &w, .rows = 1, .charge = 6 * page };
+    job.reserve();
+    defer ledger.release(job.reserved);
+    try t.expectEqual(6 * page, ledger.used.load(.monotonic));
+    try t.expect(ledger.peak.load(.monotonic) <= ledger.limit);
+    try t.expectEqual(@as(usize, 0), scratch.held);
+}
+
 test "a byte-copy sink error wins over later allocation and producer errors" {
     const gpa = std.testing.allocator;
     var allocations = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
@@ -2198,6 +2232,7 @@ test "a byte-copy sink error wins over later allocation and producer errors" {
     var row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     var window: std.Io.Semaphore = .{};
     var w: WinCtx = undefined;
+    w.encode_scratch = null;
     w.gpa = gpa;
     w.io = std.testing.io;
     w.rg_target = .{};
@@ -2237,6 +2272,7 @@ test "a failed older encode cancels the unstarted job at count and byte bounds u
         try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
             fn run(gpa: std.mem.Allocator, bytes: bool) !void {
                 var w: WinCtx = undefined;
+                w.encode_scratch = null;
                 w.gpa = gpa;
                 w.io = std.testing.io;
                 w.rg_target = .{};
@@ -2277,7 +2313,6 @@ test "a failed older encode cancels the unstarted job at count and byte bounds u
         }.run, .{byte_bound});
     }
 }
-
 
 test "windowed dispatch drains a producer failure despite cancellation midway through its window" {
     const Fake = struct {

@@ -814,6 +814,7 @@ const WriteRows = struct {
                     .limit = @intCast(sizing.unit * sizing.units),
                 };
                 defer encode_scratch.deinit();
+                w.encode_scratch = &encode_scratch;
                 w.encode_pages.child = encode_scratch.allocator();
                 const re_span = profile.Span.begin(self.prof);
                 defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));

@@ -7,11 +7,15 @@ const filters = @import("../filter/parser.zig");
 const filter = @import("../filter/ast.zig");
 const metadata = @import("../parquet/metadata.zig");
 const lits = @import("sql_literals.zig");
-const Error = parser.Error || error{ SqlParseError, UnparseError };
+const stack_guard = @import("../stack_guard.zig");
+const Error = parser.Error || error{ SqlParseError, UnparseError, ConstantTooDeep };
 
 pub const Lower = struct {
     arena: std.mem.Allocator,
     lp_arena: *c.arena_t,
+    /// The stack a constant's fold may use, set where a fold starts (`folded`): a constant tree is as deep as the query
+    /// writes it, and nothing else bounds the recursion over it.
+    stack: ?stack_guard.Guard = null,
     hidden: std.ArrayList(*const c.LpNode) = .empty,
     rows: std.ArrayList(syntax.RowKey) = .empty,
 
@@ -182,7 +186,9 @@ pub const Lower = struct {
         };
     }
 
-    fn constant(self: *Lower, node: *const c.LpNode) error{BadValue}!Const {
+    fn constant(self: *Lower, node: *const c.LpNode) error{ BadValue, ConstantTooDeep }!Const {
+        // Each level of the tree is a frame: refuse by name before the thread's stack runs out, not after.
+        if (!(self.stack orelse return error.BadValue).ok()) return error.ConstantTooDeep;
         return switch (node.kind) {
             c.LP_EXPR_LITERAL_INT => blk: {
                 const token = std.mem.span(node.u.literal.value);
@@ -238,7 +244,7 @@ pub const Lower = struct {
         };
     }
 
-    fn castConstant(self: *Lower, node: *const c.LpNode) error{BadValue}!Const {
+    fn castConstant(self: *Lower, node: *const c.LpNode) error{ BadValue, ConstantTooDeep }!Const {
         const child = try self.constant(node.u.cast.expr orelse return error.BadValue);
         const type_text = std.mem.trim(u8, std.mem.span(node.u.cast.type_name orelse return error.BadValue), " ");
         const open = std.mem.indexOfScalar(u8, type_text, '(');
@@ -278,6 +284,8 @@ pub const Lower = struct {
     }
 
     fn folded(self: *Lower, node: *const c.LpNode) ![]const u8 {
+        self.stack = .start();
+        defer self.stack = null;
         return switch (try self.constant(node)) {
             .int => |i| std.fmt.allocPrint(self.arena, "{d}", .{i.v}),
             .dec => |d| d.format(self.arena),

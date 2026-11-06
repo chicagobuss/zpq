@@ -30,7 +30,8 @@ narrowest of INTEGER, BIGINT and HUGEINT that holds it after its sign (`-2147483
 component fits its field (32-bit months and days, 64-bit microseconds) before any other can cancel it, a TIMESTAMP stays
 within year 294247 (a DATE plus an INTERVAL included), a decimal stays within 38 digits, and a DATE or TIMESTAMP
 literal that does not convert to a column's timestamp type (`TemporalOutOfRange`: TIMESTAMP_NS stops at year 2262)
-compares with nothing.
+compares with nothing, and a constant nested more deeply than the thread's stack allows folding (the budget is read from
+the thread, not fixed) is refused (`ConstantTooDeep`).
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 

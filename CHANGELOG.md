@@ -62,6 +62,10 @@
   tight `--max-memory`, a write whose row groups would not fit its workers' share reads through the mapping, and
   one the parallel reader runs out of memory on is run again mapped, so a write's result never depends on whether
   its input was cached.
+- **Re-encoding writes reuse their scratch memory.** A write that re-encodes rows (a filter, a projection that
+  can't copy chunks, or a codec change) now keeps each worker's encode scratch between jobs, still charged to
+  `--max-memory`, instead of mapping fresh pages for every job. Page faults drop by about a third; rewriting a 60 M-row
+  lineitem is 5–13% faster at 16 threads on a Ryzen 9 9950X. Output bytes don't change.
 - **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
   each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
   (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when one group the

@@ -140,6 +140,10 @@ fn writtenCodec(rgs: []const schema.RowGroup, none_written: schema.CompressionCo
 /// is gone: a path it created is removed as it fails, an S3 upload aborted, and the caller's own unpublished temp
 /// file (`QueryArgs.output_restartable`) truncated here. A descriptor it cannot restart (stdout, a pipe) may already
 /// have passed bytes on, so under an explicit `--max-memory` such a write takes the mapping from the start.
+///
+/// The retry is a fresh run, and owns everything the refused one had: its own plan cache (the first run's binding
+/// lives in that run's arena, freed as it returned), and the caller's diagnostic as it was before the first run (which
+/// its unwinding may have filled with a decode site of its own), so it reports exactly what a mapped run would alone.
 pub fn runWrite(ctx: Context, initial_args: QueryArgs, out_path: []const u8) !WriteResult {
     var cache: engine_types.bound_plan.Cache = .{};
     const args = initial_args.withPlanCache(&cache);
@@ -147,11 +151,15 @@ pub fn runWrite(ctx: Context, initial_args: QueryArgs, out_path: []const u8) !Wr
     const restartable = args.output_fd == null or args.output_restartable;
     var through_reader = false;
     const first: ?local_reader.Reason = if (!restartable and args.max_memory_explicit != null) .unrestartable_output else null;
+    const diag_before: ?Diag = if (args.diag) |d| d.* else null;
     return runWriteOver(ctx, args, out_path, &changed, first, &through_reader) catch |err| {
         if (changed) return error.InputChanged;
         if (err != error.ExceededMemoryBudget or !through_reader or !restartable) return err;
         if (args.output_fd) |fd| try local_fs.truncateToStart(fd);
-        return runWriteOver(ctx, args, out_path, &changed, .retry_mapped, &through_reader) catch |again|
+        if (args.diag) |d| d.* = diag_before.?;
+        var retry_cache: engine_types.bound_plan.Cache = .{};
+        const retry_args = initial_args.withPlanCache(&retry_cache);
+        return runWriteOver(ctx, retry_args, out_path, &changed, .retry_mapped, &through_reader) catch |again|
             if (changed) error.InputChanged else again;
     };
 }

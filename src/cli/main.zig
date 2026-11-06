@@ -52,10 +52,10 @@ fn wantsJsonSummary(args: std.process.Args) bool {
         if (std.mem.eql(u8, a, "--summary=json")) return true;
         // Values are opaque, even when their text happens to spell a flag.
         const values = [_][]const u8{
-            "--output",         "-o",                "--filter",          "-f",      "--columns",  "-c",                  "--select",     "-s",
-            "--aggregate",      "-a",                "--query",           "-q",      "--codec",    "--compress-priority", "--threads",    "-j",
-            "-g",               "--bloom-filter",    "--format",          "--limit", "--group-by", "--column-order",      "--max-memory", "--profile",
-            "--row-group-size", "--row-group-bytes", "--parquet-version",
+            "--output",         "-o",                "--filter",          "-f",             "--columns",       "-c",                  "--select",     "-s",
+            "--aggregate",      "-a",                "--query",           "-q",             "--codec",         "--compress-priority", "--threads",    "-j",
+            "-g",               "--bloom-filter",    "--format",          "--limit",        "--group-by",      "--column-order",      "--max-memory", "--profile",
+            "--row-group-size", "--row-group-bytes", "--parquet-version", "--input-format", "--csv-delimiter", "--csv-null",          "--csv-types",
         };
         for (values) |flag| if (std.mem.eql(u8, a, flag)) {
             _ = it.next();
@@ -231,10 +231,16 @@ const QueryOptions = struct {
     profile_out: ProfileOut = .{},
     bloom_filters_enabled: bool = true,
     bloom_filters: std.ArrayList(engine.BloomSpec) = .empty,
+    input_format: engine.types.InputFormat = .auto,
+    csv: engine.csv_write.Options = .{},
+    csv_nulls: std.ArrayList([]const u8) = .empty,
+    csv_types: std.ArrayList(engine.csv_write.Options.Pinned) = .empty,
 
     fn deinit(self: *QueryOptions, gpa: std.mem.Allocator) void {
         self.bloom_filters.deinit(gpa);
         self.inputs_raw.deinit(gpa);
+        self.csv_nulls.deinit(gpa);
+        self.csv_types.deinit(gpa);
     }
 
     fn parse(self: *QueryOptions, gpa: std.mem.Allocator, iter: *std.process.Args.Iterator) !bool {
@@ -325,6 +331,40 @@ const QueryOptions = struct {
                 };
                 self.parallelism = std.fmt.parseInt(usize, v, 10) catch {
                     diagnosticPrint("zpq query: invalid threads value: {s}\n", .{v});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--input-format")) {
+                const v = iter.next() orelse "";
+                self.input_format = std.meta.stringToEnum(engine.types.InputFormat, v) orelse {
+                    diagnosticPrint("zpq query: --input-format takes parquet or csv\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--csv-delimiter")) {
+                const v = iter.next() orelse "";
+                const tab = std.mem.eql(u8, v, "\\t") or std.ascii.eqlIgnoreCase(v, "tab");
+                const one = v.len == 1 and v[0] != '"' and v[0] != '\n' and v[0] != '\r';
+                self.csv.delimiter = if (tab) '\t' else if (one) v[0] else {
+                    diagnosticPrint("zpq query: --csv-delimiter takes one character (or \\t / tab),\n" ++
+                        "  not a quote or a newline\n", .{});
+                    return error.BadArgs;
+                };
+            } else if (std.mem.eql(u8, tok, "--csv-header")) {
+                self.csv.header = true;
+            } else if (std.mem.eql(u8, tok, "--csv-no-header")) {
+                self.csv.header = false;
+            } else if (std.mem.eql(u8, tok, "--csv-strict")) {
+                self.csv.strict = true;
+            } else if (std.mem.eql(u8, tok, "--csv-null")) {
+                try self.csv_nulls.append(gpa, iter.next() orelse {
+                    diagnosticPrint("zpq query: --csv-null requires a value\n", .{});
+                    return error.BadArgs;
+                });
+            } else if (std.mem.eql(u8, tok, "--csv-types")) {
+                const v = iter.next() orelse "";
+                parseCsvTypes(gpa, v, &self.csv_types) catch {
+                    diagnosticPrint("zpq query: --csv-types takes COL:TYPE[,COL:TYPE...] with TYPE one of\n" ++
+                        "  BIGINT, DOUBLE, DECIMAL(p,s), DATE, TIMESTAMP, TIMESTAMP_NS, TIMESTAMPTZ,\n" ++
+                        "  BOOLEAN, VARCHAR, BLOB\n", .{});
                     return error.BadArgs;
                 };
             } else if (std.mem.eql(u8, tok, "--no-bloom-filters")) {
@@ -485,6 +525,10 @@ fn runQuery(
     var profile_out = options.profile_out;
     const bloom_filters_enabled = options.bloom_filters_enabled;
     const bloom_filters = options.bloom_filters;
+    var csv_opts = options.csv;
+    csv_opts.nulls = options.csv_nulls.items;
+    csv_opts.types = options.csv_types.items;
+    var csv_report: engine.csv_write.Report = .{};
 
     if (query != null) {
         if (inputs_raw.items.len > 0) {
@@ -700,6 +744,10 @@ fn runQuery(
         .column_order = column_order,
         .bloom_filters = bloom_filters.items,
         .bloom_filters_enabled = bloom_filters_enabled,
+        .input_format = options.input_format,
+        .csv = csv_opts,
+        .csv_report = &csv_report,
+        .csv_report_alloc = arena,
         .diag = diag,
         .profiler = profiler,
     };
@@ -723,6 +771,7 @@ fn runQuery(
         rows = @intCast(result.rows_matched);
         output_started_ns = result.timings.output_started_ns;
         stats = .{ .rows_in = result.rows_in, .rows_scanned = result.rows_scanned, .rows_matched = result.rows_matched, .bytes_in = result.bytes_in, .bytes_out = result.bytes_out, .files_in = result.files_in, .row_groups_in = result.row_groups_in, .row_groups_pruned = result.row_groups_pruned, .membership = result.membership, .timings = result.timings, .codec = result.codec };
+        if (csv_report.chunks > 0) stats.csv = &csv_report;
     } else {
         if (!to_stdout and std.mem.startsWith(u8, engine_output.?, "s3://")) {
             diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
@@ -746,6 +795,29 @@ fn runQuery(
     if (summary) try writeSummary(if (to_stdout) null else output, rows, stats, total_ns);
 }
 
+/// `COL:TYPE[,COL:TYPE...]`; a DECIMAL(p,s)'s comma is inside its parentheses.
+fn parseCsvTypes(
+    gpa: std.mem.Allocator,
+    spec: []const u8,
+    out: *std.ArrayList(engine.csv_write.Options.Pinned),
+) !void {
+    var depth: usize = 0;
+    var start: usize = 0;
+    for (spec, 0..) |c, i| {
+        if (c == '(') depth += 1;
+        if (c == ')') depth -|= 1;
+        if ((c == ',' and depth == 0) or i + 1 == spec.len) {
+            const item = std.mem.trim(u8, spec[start..if (c == ',' and depth == 0) i else i + 1], " ");
+            start = i + 1;
+            const colon = std.mem.lastIndexOfScalar(u8, item, ':') orelse return error.BadArgs;
+            const t = zpq.core.csv.types.parseName(std.mem.trim(u8, item[colon + 1 ..], " ")) orelse return error.BadArgs;
+            if (colon == 0) return error.BadArgs;
+            try out.append(gpa, .{ .column = item[0..colon], .type = t });
+        }
+    }
+    if (out.items.len == 0) return error.BadArgs;
+}
+
 const SummaryStats = struct {
     /// An aggregate: its workers' third phase folds rows into aggregates, where a write's or a row output's encodes.
     aggregate: bool = false,
@@ -764,7 +836,34 @@ const SummaryStats = struct {
     timings: engine.Timings = .{},
     codec: ?schema.CompressionCodec = null,
     codec_applicable: bool = false,
+    /// A CSV input's report, when the input was CSV.
+    csv: ?*const engine.csv_write.Report = null,
 };
+
+/// A CSV input's `"csv"` object: how it was read, the restarts its types and its budget took, and the types written.
+fn writeCsvSummary(w: *StdoutWriter, r: *const engine.csv_write.Report) !void {
+    const read: []const u8 = if (r.io) |c| @tagName(c.mode) else "mmap";
+    try w.print("\"csv\":{{\"read\":\"{s}\",\"chunks\":{d},\"restarts\":{d},\"narrowed\":{d},\"widened\":[", .{
+        read, r.chunks, r.restarts, r.narrowed,
+    });
+    var first = true;
+    for (r.widened, 0..) |wd, i| if (wd and i < r.names.len) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeByte('"');
+        try writeJsonString(w, r.names[i]);
+        try w.writeByte('"');
+    };
+    try w.writeAll("],\"types\":{");
+    for (r.names, r.types, 0..) |n, t, i| {
+        if (i > 0) try w.writeByte(',');
+        var buf: [64]u8 = undefined;
+        try w.writeByte('"');
+        try writeJsonString(w, n);
+        try w.print("\":\"{s}\"", .{t.name(&buf)});
+    }
+    try w.writeAll("}},");
+}
 
 fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64) !void {
     var w: StdoutWriter = .{ .fd = 2 };
@@ -779,6 +878,7 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
         s.files_in, s.row_groups_in, s.row_groups_pruned, s.row_groups_full_match, s.cols_stat_pruned,
     });
     if (s.codec) |codec| try w.print("\"{s}\",", .{@tagName(codec)}) else try w.writeAll(if (s.codec_applicable) "\"MIXED\"," else "null,");
+    if (s.csv) |r| try writeCsvSummary(&w, r);
     try engine.writeMembershipJson(&w, s.membership);
     const c = s.timings.core;
     if (c.copied_bytes > 0) {

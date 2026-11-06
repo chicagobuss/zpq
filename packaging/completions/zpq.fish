@@ -7,6 +7,12 @@ complete -c zpq -l codec
 complete -c zpq -l column-order
 complete -c zpq -l columns
 complete -c zpq -l compress-priority
+complete -c zpq -l csv-delimiter
+complete -c zpq -l csv-header
+complete -c zpq -l csv-no-header
+complete -c zpq -l csv-null
+complete -c zpq -l csv-strict
+complete -c zpq -l csv-types
 complete -c zpq -l detail
 complete -c zpq -l explain
 complete -c zpq -l fast-levels
@@ -15,6 +21,7 @@ complete -c zpq -l format
 complete -c zpq -l fsync
 complete -c zpq -l group-by
 complete -c zpq -l help
+complete -c zpq -l input-format
 complete -c zpq -l limit
 complete -c zpq -l max-memory
 complete -c zpq -l no-bloom-filters

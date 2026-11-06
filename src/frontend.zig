@@ -95,6 +95,7 @@ pub fn noSqlMatches(table_name: []const u8) void {
 
 pub fn queryError(err: anyerror, diag: *const Diag) void {
     if (diag.detail == .decode and zpq.core.consumer.isDecodeError(err)) return decodeError(err, diag);
+    if (csvError(err, diag)) return;
     printDetail(diag);
     if (querySetupError(err, diag)) return;
     switch (err) {
@@ -539,6 +540,85 @@ fn decodeCause(err: anyerror) []const u8 {
 }
 
 /// The line a failed query's `Diag.detail` adds before the error's own message.
+/// A CSV input's refusal: where (line, byte, column) and why, and what to do. False for any other error.
+fn csvError(err: anyerror, diag: *const Diag) bool {
+    const path = diag.input orelse "the input";
+    switch (err) {
+        error.CsvMalformed, error.CsvFieldCount, error.CsvTypeChanged, error.CsvPinnedType => {},
+        error.UnknownInputFormat => {
+            diagnosticPrint(
+                "zpq query: {s} is not Parquet (no PAR1 at both ends); a CSV file is read\n" ++
+                    "  when it is named .csv, .tsv or .txt, or with --input-format csv\n",
+                .{path},
+            );
+            return true;
+        },
+        error.CsvQueryNotSupported => {
+            diagnosticPrint(
+                "zpq query: a CSV input is written to Parquet: zpq query data.csv -o data.parquet,\n" ++
+                    "  whole or by column (--columns a,b, or SELECT a, b FROM 'data.csv'); filters,\n" ++
+                    "  expressions, ORDER BY, LIMIT and aggregates read the Parquet it writes\n",
+                .{},
+            );
+            return true;
+        },
+        error.CsvOneInput, error.CsvMixedInputs => {
+            diagnosticPrint("zpq query: give one CSV input per query, and no other input with it\n", .{});
+            return true;
+        },
+        error.CsvRemoteInput => {
+            diagnosticPrint("zpq query: CSV input on S3 is not supported yet; copy it to a local file\n", .{});
+            return true;
+        },
+        error.CsvUtf16 => {
+            diagnosticPrint("zpq query: {s} is UTF-16 or UTF-32 text; zpq reads UTF-8 CSV\n", .{path});
+            return true;
+        },
+        error.CsvEmpty => {
+            diagnosticPrint("zpq query: {s} is empty; a CSV input has at least a header\n", .{path});
+            return true;
+        },
+        else => return false,
+    }
+    const c = switch (diag.detail) {
+        .csv => |c| c,
+        else => return false,
+    };
+    var where_buf: [512]u8 = undefined;
+    const where = if (c.has_column)
+        std.fmt.bufPrint(&where_buf, "{s} line {d}, byte {d}, column `{s}`", .{ path, c.line, c.byte, diag.column.get() })
+    else
+        std.fmt.bufPrint(&where_buf, "{s} line {d}, byte {d}", .{ path, c.line, c.byte });
+    const at = where catch path;
+    switch (err) {
+        error.CsvMalformed => diagnosticPrint(
+            "zpq query: {s}: {s};\n  zpq reads RFC 4180 CSV (a quote inside a field is doubled), and refuses\n" ++
+                "  rather than guess\n",
+            .{ at, c.reason },
+        ),
+        error.CsvFieldCount => diagnosticPrint(
+            "zpq query: {s}: the record has {d} fields where the first has {d}\n",
+            .{ at, c.got, c.expected },
+        ),
+        error.CsvTypeChanged => if (c.strict) diagnosticPrint(
+            "zpq query: {s}: `{s}` is not a {s}, the type the sample gave the column;\n" ++
+                "  without --csv-strict the column widens and the write starts again\n",
+            .{ at, c.value.get(), c.type_name.get() },
+        ) else diagnosticPrint(
+            "zpq query: {s}: `{s}` is not a {s}, the type the sample gave the column;\n" ++
+                "  a write to a pipe cannot widen it and start again: write to a file, or give the\n" ++
+                "  column's type with --csv-types\n",
+            .{ at, c.value.get(), c.type_name.get() },
+        ),
+        error.CsvPinnedType => diagnosticPrint(
+            "zpq query: {s}: `{s}` is not a {s}, the type --csv-types gives the column\n",
+            .{ at, c.value.get(), c.type_name.get() },
+        ),
+        else => unreachable,
+    }
+    return true;
+}
+
 fn printDetail(diag: *const Diag) void {
     const name = diag.column.get();
     switch (diag.detail) {
@@ -572,6 +652,8 @@ fn printDetail(diag: *const Diag) void {
         ),
         // The upload logged it to stderr when it happened.
         .s3_request => {},
+        // Printed with the error itself (`csvError`).
+        .csv => {},
         // `decodeError` prints it whole, for a decode error; any other error's message stands alone.
         .decode => {},
     }

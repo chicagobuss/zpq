@@ -25,6 +25,10 @@ usage:
             [\-\-scan\-all] [\-\-trust\-stats] [\-\-cache] [\-\-max\-memory SIZE]
             [\-\-explain] [\-\-profile TRACE.json] [\-\-profile\-summary[=text|json]]
             [\-\-format ndjson|json|csv|parquet] [\-\-limit N] [\-\-summary=json]
+  zpq query <input.csv> \-o <out.parquet> [\-\-input\-format csv]
+            [\-\-csv\-delimiter C] [\-\-csv\-header | \-\-csv\-no\-header]
+            [\-\-csv\-null STR ...] [\-\-csv\-types COL:TYPE,...] [\-\-csv\-strict]
+            [\-\-codec ...] [\-\-row\-group\-size ROWS] [\-j N] [\-\-max\-memory SIZE]
   zpq schema <file.parquet>
   zpq inspect FILE... [\-\-format json] [\-\-detail]
   zpq conform <file.parquet>
@@ -130,6 +134,25 @@ usage:
                  to run. By default groups come in the order they
                  first appear in the input and the same bits come out
                  at every \-j.
+  CSV input     a file that is not Parquet (PAR1 at both ends) and is named
+                .csv, .tsv or .txt, or any file with \-\-input\-format csv, is
+                written to Parquet: zpq query data.csv \-o data.parquet (or
+                SELECT * FROM 'data.csv' with \-o), whole or by column with
+                \-\-columns a,b or SELECT a, b FROM. RFC 4180: quotes are
+                doubled inside quoted fields; UTF\-8, a BOM is skipped. The
+                delimiter (, tab ; |) and the header are detected. An unquoted
+                empty field is NULL, a quoted one the empty string. Types are
+                exact or VARCHAR: BIGINT, DECIMAL(p,s), DOUBLE (only where 15
+                digits survive), DATE, TIMESTAMP[_NS][TZ], BOOLEAN, else
+                VARCHAR (BLOB when not UTF\-8). A value its sampled type cannot
+                hold widens the column and the write starts again; nothing is
+                rounded or truncated. Malformed input exits 1 with its line,
+                byte and column. \-\-summary=json reports a "csv" object.
+  \-\-csv\-delimiter one character, or \et / tab
+  \-\-csv\-header, \-\-csv\-no\-header   the first record names the columns, or not
+  \-\-csv\-null    an unquoted text that is NULL too (repeatable)
+  \-\-csv\-types   pin columns' types; a value that does not fit is refused
+  \-\-csv\-strict  refuse a value its sampled type cannot hold, at its line
   \-\-max\-memory SIZE
                  working budget for an aggregate or a write: GROUP BY
                  tables, decoded row groups, read\-ahead, merge and

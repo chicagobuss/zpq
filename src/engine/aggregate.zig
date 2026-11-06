@@ -185,6 +185,7 @@ const runPrintTo = engine_print.runPrintTo;
 const runPrintSink = engine_print.runPrintSink;
 const pageIndexTestChunk = engine_s3_rebase.pageIndexTestChunk;
 const profile_summary = @import("../profile_summary.zig");
+const csv_write = @import("csv_write.zig");
 const fake_s3 = @import("../io/fake_s3.zig");
 
 pub fn runQuery(caller_ctx: Context, args: QueryArgs) !QueryResult {
@@ -192,6 +193,9 @@ pub fn runQuery(caller_ctx: Context, args: QueryArgs) !QueryResult {
     const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
     defer span.end(.query, profile.args(.{}));
     if (args.inputs.len == 0) return error.NoInputs;
+    // A CSV input is written to Parquet whole; any other query reads the Parquet it writes.
+    if (try csv_write.queryInput(args)) |path|
+        return .{ .write = try csv_write.writeQuery(ctx, args, path, args.output.?) };
     if (args.kind() != .rows and (args.select != null or args.columns != null)) {
         return error.AggregateMutexWithSelect;
     }

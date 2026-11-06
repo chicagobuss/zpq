@@ -736,6 +736,8 @@ pub fn runPrintSink(
     sink: ?*std.Io.Writer,
 ) !PrintResult {
     const ctx = caller_ctx.forQuery(&initial_args);
+    // Rows are printed from Parquet; a CSV input is written to Parquet first (`csv_write.queryInput` says so).
+    _ = try @import("csv_write.zig").queryInput(initial_args);
     var cache: engine_types.bound_plan.Cache = .{};
     const args = initial_args.withPlanCache(&cache);
     var changed = false;

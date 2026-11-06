@@ -41,6 +41,9 @@ const Context = engine_types.Context;
 const QueryArgs = engine_types.QueryArgs;
 const WriteResult = engine_types.WriteResult;
 pub const Type = csv_types.Type;
+const expr_ast = @import("../core/expr/ast.zig");
+const syntax = @import("../core/expr/syntax.zig");
+const syntax_plan = @import("syntax_plan.zig");
 
 /// What a CSV source is told; every field has a default that sniffs or detects it.
 pub const Options = struct {
@@ -54,6 +57,9 @@ pub const Options = struct {
     types: []const Pinned = &.{},
     /// Refuse a value that does not fit its sampled type instead of widening and starting again.
     strict: bool = false,
+    /// The columns written, by name and in this order; null: every column. The others are framed and counted, never
+    /// typed: a value there can neither widen nor refuse.
+    columns: ?[]const []const u8 = null,
     /// How much of the file the types are sampled from.
     sample_bytes: usize = 4 << 20,
     /// Forced-path control: the chunk size (chunks never change the output's bytes).
@@ -106,9 +112,11 @@ pub const Report = struct {
     /// The types written (on the caller's allocator), for the summary.
     types: []Type = &.{},
     names: []const []const u8 = &.{},
+    /// Every field's name, written or not, for a refusal's column.
+    fields: []const []const u8 = &.{},
 };
 
-pub const Error = error{ CsvMalformed, CsvFieldCount, CsvTypeChanged, CsvPinnedType, CsvUtf16, CsvEmpty };
+pub const Error = error{ CsvMalformed, CsvFieldCount, CsvTypeChanged, CsvPinnedType, CsvUtf16, CsvEmpty, CsvDuplicateColumn };
 
 /// The parse of a file before its chunks run: dialect, header, column names and sampled types.
 pub const Plan = struct {
@@ -118,10 +126,14 @@ pub const Plan = struct {
     head_lines: u64,
     dialect: csv_scan.Dialect,
     header: bool,
+    /// Per written column, in output order: its name, type and whether the type was given.
     names: []const []const u8,
     types: []Type,
     /// Columns whose type was given (`Options.types`): refused, never widened.
     pinned: []const bool,
+    /// Per field of a record: its name, and the written column it fills, or null when it is not written.
+    fields: []const []const u8,
+    slot: []const ?u32,
     mean_record: usize,
     nulls: []const []const u8,
 };
@@ -160,17 +172,18 @@ pub fn plan(a: std.mem.Allocator, bytes: []const u8, opts: Options, failure: *Fa
     var records: usize = 0;
     var record_start = after_first;
     var last_end = after_first;
-    while (try nextField(&s, bytes, failure, col)) |f| {
+    // The sample only infers types: a malformed record ends it, and the parse refuses it where it is, by name.
+    sample: while (s.next() catch null) |f| {
         if (f.last and col == 0 and f.start == f.end and ncols > 1) {
             record_start = s.position();
             continue; // a blank line
         }
-        if (col >= ncols) return fieldCount(failure, bytes, record_start, ncols, col + 1);
-        const t = try decode(a, bytes, f, dialect, &scratch, failure, 0, col);
+        if (col >= ncols) break :sample;
+        const t = csv_scan.decodeField(bytes[f.start..f.end], dialect.quote, &scratch, a) catch break :sample;
         if (!isNull(t, opts.nulls)) sampled[col] = sampled[col].join(classifyText(t.bytes, false));
         col += 1;
         if (f.last) {
-            if (col != ncols) return fieldCount(failure, bytes, record_start, ncols, col);
+            if (col != ncols) break :sample;
             col = 0;
             records += 1;
             last_end = s.position();
@@ -188,24 +201,58 @@ pub fn plan(a: std.mem.Allocator, bytes: []const u8, opts: Options, failure: *Fa
     for (opts.types) |p| {
         const i = for (names, 0..) |n, i| {
             if (std.mem.eql(u8, n, p.column)) break i;
-        } else return error.UnknownColumn;
+        } else return unknownColumn(failure, p.column);
         sampled[i] = p.type;
         pinned[i] = true;
     }
     const data_start = if (header) after_first else bom;
     const counted = last_end - after_first;
+    const slot = try a.alloc(?u32, ncols);
+    var out_names = names;
+    var out_types = sampled;
+    var out_pinned = pinned;
+    if (opts.columns) |cols| {
+        @memset(slot, null);
+        const on = try a.alloc([]const u8, cols.len);
+        out_types = try a.alloc(Type, cols.len);
+        const op = try a.alloc(bool, cols.len);
+        for (cols, 0..) |c, o| {
+            const i = for (names, 0..) |n, i| {
+                if (std.mem.eql(u8, n, c)) break i;
+            } else return unknownColumn(failure, c);
+            if (slot[i] != null) return error.CsvDuplicateColumn;
+            slot[i] = @intCast(o);
+            on[o] = names[i];
+            out_types[o] = sampled[i];
+            op[o] = pinned[i];
+        }
+        out_names = on;
+        out_pinned = op;
+    } else for (slot, 0..) |*o, i| {
+        o.* = @intCast(i);
+    }
     return .{
         .bytes = bytes,
         .data_start = data_start,
         .head_lines = csv_scan.countNewlines(bytes[0..data_start]),
         .dialect = dialect,
         .header = header,
-        .names = names,
-        .types = sampled,
-        .pinned = pinned,
+        .names = out_names,
+        .types = out_types,
+        .pinned = out_pinned,
+        .fields = names,
+        .slot = slot,
         .mean_record = if (records == 0) 64 else @max(1, counted / records),
         .nulls = opts.nulls,
     };
+}
+
+/// A column named (`--columns`, `--csv-types`) that the file does not have; its name is the failure's value.
+fn unknownColumn(failure: *Failure, name: []const u8) error{UnknownColumn} {
+    failure.* = .{};
+    failure.value_len = @min(failure.value.len, name.len);
+    @memcpy(failure.value[0..failure.value_len], name[0..failure.value_len]);
+    return error.UnknownColumn;
 }
 
 fn nextField(s: *csv_scan.Scanner, bytes: []const u8, failure: *Failure, column: usize) !?csv_scan.Field {
@@ -412,12 +459,13 @@ pub const Source = struct {
     pub fn produce(s: *Source, io: std.Io, piece: ?*window_mod.Piece, i: usize) !void {
         const p = s.plan;
         const span = try s.records(io, i);
-        const ncols = p.names.len;
+        const ncols = p.fields.len;
+        const nout = p.names.len;
         const bytes = span.bytes;
         const lo_b = s.bound(i);
         var builder: Builder = undefined;
         const a: std.mem.Allocator = if (piece) |pc| pc.arena.allocator() else std.heap.page_allocator;
-        const seen: []Type = if (s.classify) s.seen[i * ncols ..][0..ncols] else &.{};
+        const seen: []Type = if (s.classify) s.seen[i * nout ..][0..nout] else &.{};
         if (s.classify) @memset(seen, .{});
         if (piece) |pc| try builder.init(pc, s, span.hi - span.lo);
         if (span.lo >= span.hi) {
@@ -458,13 +506,14 @@ pub const Source = struct {
                 }, span.lines, lo_b),
                 else => |oom| return oom,
             };
-            if (s.classify) {
+            // A field not written is framed and decoded (so a malformed one still refuses), and nothing more.
+            if (p.slot[col]) |out| if (s.classify) {
                 if (!isNull(text, p.nulls))
-                    seen[col] = seen[col].join(classifyText(text.bytes, ascii));
-            } else if (!(try builder.add(a, col, text, ascii, p.nulls, own_strings or unescaped(text, &scratch)))) {
-                const t = p.types[col];
+                    seen[out] = seen[out].join(classifyText(text.bytes, ascii));
+            } else if (!(try builder.add(a, out, text, ascii, p.nulls, own_strings or unescaped(text, &scratch)))) {
+                const t = p.types[out];
                 var fl: Failure = .{
-                    .kind = if (p.pinned[col]) .pinned_type else .type_changed,
+                    .kind = if (p.pinned[out]) .pinned_type else .type_changed,
                     .offset = f.start,
                     .column = col,
                     .type = t,
@@ -472,7 +521,7 @@ pub const Source = struct {
                 fl.value_len = @min(fl.value.len, text.bytes.len);
                 @memcpy(fl.value[0..fl.value_len], text.bytes[0..fl.value_len]);
                 return s.fail(i, fl, span.lines, lo_b);
-            }
+            };
             col += 1;
             if (f.last) {
                 if (col != ncols) return s.fail(i, .{
@@ -708,13 +757,19 @@ pub fn run(
     var workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
     var chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
     // Everything the report holds is allocated before the output exists: once it is finished, nothing may fail.
+    // The fields are named first, for a refusal's column.
+    const fields = try report_alloc.alloc([]const u8, p.fields.len);
+    for (fields, p.fields) |*d, n| d.* = try report_alloc.dupe(u8, n);
+    report.fields = fields;
+    const names = try report_alloc.alloc([]const u8, p.names.len);
+    for (names, p.names) |*d, n| d.* = try report_alloc.dupe(u8, n);
+    report.names = names;
     const widened = try report_alloc.alloc(bool, p.names.len);
     @memset(widened, false);
     report.widened = widened;
     const types = try report_alloc.alloc(Type, p.names.len);
-    const names = try report_alloc.alloc([]const u8, p.names.len);
-    for (names, p.names) |*d, n| d.* = try report_alloc.dupe(u8, n);
-    report.names = names;
+    // A path, or the caller's own unpublished file, starts again from empty; a pipe may have passed bytes on.
+    const restartable = args.output_fd == null or args.output_restartable;
     while (true) {
         var source = try Source.init(arena, &p, chunk);
         report.chunks = source.count;
@@ -725,13 +780,15 @@ pub fn run(
             if (source.firstFailure()) |f| failure.* = f.*;
             // Refused its memory: run again on a narrower path, half the workers and their chunks in flight, as a
             // query that does not fit does; one worker that still does not fit fails. The bytes do not change.
-            if (e == error.OutOfMemory and workers > 1 and args.output_fd == null) {
+            if (e == error.OutOfMemory and workers > 1 and restartable) {
+                if (args.output_fd) |fd| try local_fs.truncateToStart(fd);
                 workers = @max(1, workers / 2);
                 chunk = chunkBytes(opts, narrowed, workers, mapped.bytes.len);
                 report.narrowed += 1;
                 continue;
             }
-            if (e != error.CsvTypeChanged or opts.strict or args.output_fd != null) return e;
+            if (e != error.CsvTypeChanged or opts.strict or !restartable) return e;
+            if (args.output_fd) |fd| try local_fs.truncateToStart(fd);
             // Widen to what every value holds, then start again.
             const seen = try classifyFile(ctx, arena, &p, chunk, workers, failure);
             for (p.types, seen, p.pinned, widened) |*t, s, pinned, *wd| if (!pinned) {
@@ -1046,4 +1103,170 @@ fn writeOnce(
         .row_groups_kept = w.rgs_kept,
         .timings = t,
     };
+}
+
+// ---------------------------------------------------------------- the query surface
+
+pub const InputFormat = engine_types.InputFormat;
+
+/// What `path` is: Parquet when `PAR1` both starts and ends it, else CSV when it is named `.csv`, `.tsv` or `.txt`
+/// (any case) or `forced` says so; anything else is refused. An S3 path is Parquet unless forced to CSV.
+pub fn inputFormat(path: []const u8, forced: InputFormat) !InputFormat {
+    if (forced != .auto) return forced;
+    if (std.mem.startsWith(u8, path, "s3://")) return .parquet;
+    const ext = std.fs.path.extension(path);
+    // Named so, it is read as Parquet and refused as Parquet if it is not: no open for the common case.
+    if (std.ascii.eqlIgnoreCase(ext, ".parquet")) return .parquet;
+    if (try hasParquetMagic(path)) return .parquet;
+    for ([_][]const u8{ ".csv", ".tsv", ".txt" }) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return .csv;
+    return error.UnknownInputFormat;
+}
+
+/// `PAR1` at both ends. A file that cannot be opened is left to the Parquet path to report as it does.
+fn hasParquetMagic(path: []const u8) !bool {
+    const fd = local_fs.openRead(path) catch return true;
+    defer local_fs.close(fd);
+    const size = local_fs.fileSize(fd) catch return true;
+    if (size < 8) return size == 0; // an empty file is reported by the Parquet path (or by name as CSV below)
+    var head: [4]u8 = undefined;
+    var tail: [4]u8 = undefined;
+    const linux = std.os.linux;
+    if (linux.pread(fd, &head, 4, 0) != 4 or linux.pread(fd, &tail, 4, @intCast(size - 4)) != 4) return true;
+    return std.mem.eql(u8, &head, "PAR1") and std.mem.eql(u8, &tail, "PAR1");
+}
+
+pub const QueryError = error{ CsvQueryNotSupported, CsvOneInput, CsvMixedInputs };
+
+/// The CSV input of a query, or null when its inputs are Parquet. A CSV input is converted whole to Parquet
+/// (`zpq query data.csv -o data.parquet`): one file, no filter, selection or aggregate.
+pub fn queryInput(args: QueryArgs) !?[]const u8 {
+    if (args.inputs.len == 0) return null;
+    var csv: ?[]const u8 = null;
+    for (args.inputs) |in| {
+        const f = inputFormat(in, args.input_format) catch |e| {
+            Diag.setInput(args.diag, in, null);
+            return e;
+        };
+        if (f == .csv) {
+            if (csv != null) return error.CsvOneInput;
+            csv = in;
+        }
+    }
+    const path = csv orelse return null;
+    if (args.inputs.len > 1) return error.CsvMixedInputs;
+    if (args.output == null or args.aggregate != null or args.group_by != null or args.filter != null or
+        args.column_order != null or args.result_order.keys.len > 0 or args.result_order.rows.len > 0 or
+        args.result_order.limit != null or args.result_order.offset != 0)
+        return error.CsvQueryNotSupported;
+    if (args.columns != null and args.select != null) return error.CsvQueryNotSupported;
+    if (args.plan_source) |ps| {
+        // SQL: the statement's own syntax, as nothing but a list of columns.
+        const q = syntax_plan.syntaxOf(ps) orelse return error.CsvQueryNotSupported;
+        if (q.aggregate or q.filter != null or q.row_keys.len > 0 or q.hidden.len > 0) return error.CsvQueryNotSupported;
+        for (q.select orelse &.{}) |item| _ = itemName(item) orelse return error.CsvQueryNotSupported;
+        return path;
+    }
+    const sel = args.select_cols orelse &.{};
+    if (sel.len == 0 and args.select != null and args.columns == null) return error.CsvQueryNotSupported;
+    for (sel) |c| _ = selectName(c) orelse return error.CsvQueryNotSupported;
+    return path;
+}
+
+/// The columns a CSV query writes: `--columns`, or a SELECT list of plain column names (quoted or not, each named as
+/// itself); null: every column. Anything else in the list is a query over the CSV, which is refused.
+pub fn queryColumns(a: std.mem.Allocator, args: QueryArgs) !?[]const []const u8 {
+    if (args.columns) |cols| {
+        if (args.select != null) return error.CsvQueryNotSupported;
+        return cols;
+    }
+    if (args.plan_source) |ps| {
+        const items = (syntax_plan.syntaxOf(ps) orelse return error.CsvQueryNotSupported).select orelse return null;
+        const out = try a.alloc([]const u8, items.len);
+        for (items, out) |item, *o| o.* = itemName(item) orelse return error.CsvQueryNotSupported;
+        return out;
+    }
+    const sel = args.select_cols orelse &.{};
+    if (sel.len == 0) return if (args.select != null) error.CsvQueryNotSupported else null;
+    const out = try a.alloc([]const u8, sel.len);
+    for (sel, out) |c, *o| o.* = selectName(c) orelse return error.CsvQueryNotSupported;
+    return out;
+}
+
+/// A SELECT item that names one column as itself, and the name; null for an expression or a rename.
+fn selectName(c: expr_ast.SelectColumn) ?[]const u8 {
+    if (c.role != .named) return null;
+    const name = plainName(std.mem.trim(u8, c.expr, " ")) orelse return null;
+    if (c.alias) |al| if (!std.mem.eql(u8, al, name)) return null;
+    return name;
+}
+
+/// A SQL SELECT item that is a column named as itself; null for an expression or a rename.
+fn itemName(item: syntax.SelectItem) ?[]const u8 {
+    const name = switch (item.expr) {
+        .column => |c| plainName(c) orelse return null, // as written: a quoted name keeps its quotes
+        else => return null,
+    };
+    if (item.alias) |al| if (!std.mem.eql(u8, al, name)) return null;
+    return name;
+}
+
+/// `name` or `"name"` (no doubled quotes inside): the column it names; null for any other expression.
+fn plainName(e: []const u8) ?[]const u8 {
+    if (e.len >= 2 and e[0] == '"' and e[e.len - 1] == '"') {
+        const inner = e[1 .. e.len - 1];
+        return if (inner.len == 0 or std.mem.indexOfScalar(u8, inner, '"') != null) null else inner;
+    }
+    if (e.len == 0 or !(std.ascii.isAlphabetic(e[0]) or e[0] == '_')) return null;
+    for (e) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return null;
+    return e;
+}
+
+/// The write a query asks of its CSV input, its report on `args.csv_report` and its refusal on `args.diag`.
+pub fn writeQuery(ctx: Context, args: QueryArgs, path: []const u8, out_path: []const u8) !WriteResult {
+    var local: Report = .{};
+    const report = args.csv_report orelse &local;
+    var scratch = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer scratch.deinit();
+    const alloc = args.csv_report_alloc orelse scratch.allocator();
+    var opts = args.csv;
+    opts.columns = try queryColumns(scratch.allocator(), args);
+    if (args.diag) |d| d.execution_started = true;
+    return run(ctx, args, path, out_path, opts, report, alloc) catch |e| {
+        if (args.diag) |d| describe(d, args, path, e, report);
+        return e;
+    };
+}
+
+/// A refusal's place and reason, for the frontend's message.
+fn describe(d: *Diag, args: QueryArgs, path: []const u8, err: anyerror, report: *const Report) void {
+    const f = &report.failure;
+    d.input = path;
+    const reason: []const u8 = switch (err) {
+        error.CsvMalformed => f.malformed.describe(),
+        error.CsvFieldCount => "field count",
+        error.CsvTypeChanged => "type changed",
+        error.CsvPinnedType => "pinned type",
+        error.UnknownColumn => {
+            d.column.set(f.valueText());
+            return;
+        },
+        else => return,
+    };
+    d.detail = .{ .csv = .{
+        .reason = reason,
+        .line = f.line,
+        .byte = f.offset,
+        .expected = f.expected_fields,
+        .got = f.got_fields,
+        .has_column = f.column != null,
+        .strict = args.csv.strict,
+    } };
+    if (f.column) |c| {
+        var nb: [32]u8 = undefined;
+        // Refused while sampling, before the header named the columns: by position, as `column0` names one.
+        d.column.set(if (c < report.fields.len) report.fields[c] else std.fmt.bufPrint(&nb, "column{d}", .{c}) catch "");
+    }
+    d.detail.csv.value.set(f.valueText());
+    var buf: [64]u8 = undefined;
+    d.detail.csv.type_name.set(f.type.name(&buf));
 }

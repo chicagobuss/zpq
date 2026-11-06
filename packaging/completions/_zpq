@@ -9,6 +9,12 @@ _arguments '*:file:_files' \
   '--column-order[zpq option]' \
   '--columns[zpq option]' \
   '--compress-priority[zpq option]' \
+  '--csv-delimiter[zpq option]' \
+  '--csv-header[zpq option]' \
+  '--csv-no-header[zpq option]' \
+  '--csv-null[zpq option]' \
+  '--csv-strict[zpq option]' \
+  '--csv-types[zpq option]' \
   '--detail[zpq option]' \
   '--explain[zpq option]' \
   '--fast-levels[zpq option]' \
@@ -17,6 +23,7 @@ _arguments '*:file:_files' \
   '--fsync[zpq option]' \
   '--group-by[zpq option]' \
   '--help[zpq option]' \
+  '--input-format[zpq option]' \
   '--limit[zpq option]' \
   '--max-memory[zpq option]' \
   '--no-bloom-filters[zpq option]' \

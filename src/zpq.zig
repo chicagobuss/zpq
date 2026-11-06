@@ -47,6 +47,10 @@ pub const core = struct {
     };
     pub const system = @import("core/system.zig");
     pub const bytes = @import("core/bytes.zig");
+    pub const csv = struct {
+        pub const scan = @import("core/csv/scan.zig");
+        pub const types = @import("core/csv/types.zig");
+    };
     pub const writer = struct {
         pub const fastpath = @import("core/writer/fastpath.zig");
         pub const encoder = @import("core/writer/encoder.zig");

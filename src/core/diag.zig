@@ -97,6 +97,21 @@ pub const Detail = union(enum) {
     },
     /// The S3 request behind the error failed: which one, at what point, and how.
     s3_request: S3Failure,
+    /// A CSV input (`Diag.input`) refused at `line` (from 1, quoted newlines counted) and `byte` (from 0), in
+    /// `Diag.column` when a field is at fault: `reason` (static) says why; a record's field counts, or a value and the
+    /// type it does not fit.
+    csv: struct {
+        reason: []const u8,
+        line: u64,
+        byte: u64,
+        expected: usize = 0,
+        got: usize = 0,
+        value: Text = .{},
+        type_name: Text = .{},
+        has_column: bool = false,
+        /// A type change was refused by `--csv-strict`; otherwise its output could not start again (a pipe).
+        strict: bool = false,
+    },
 };
 
 /// A failed S3 request, as reported to the user: the operation, the phase it failed in, and the error or the status

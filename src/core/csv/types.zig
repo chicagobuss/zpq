@@ -534,6 +534,30 @@ pub fn timestampValue(t: Type, s: []const u8) ?i64 {
     return if (t.nanos) inst.nanosSinceEpoch() else inst.micros();
 }
 
+/// The type a `--csv-types` spec names: BIGINT, DOUBLE, DECIMAL(p,s), DATE, TIMESTAMP, TIMESTAMP_NS, TIMESTAMPTZ,
+/// TIMESTAMPTZ_NS, BOOLEAN, VARCHAR or BLOB (and the usual aliases), any case. Null for anything else.
+pub fn parseName(s: []const u8) ?Type {
+    const eq = std.ascii.eqlIgnoreCase;
+    if (eq(s, "BIGINT") or eq(s, "INT64") or eq(s, "INT8") or eq(s, "LONG")) return .{ .kind = .int64, .int_digits = 19 };
+    if (eq(s, "DOUBLE") or eq(s, "FLOAT8") or eq(s, "FLOAT64")) return .{ .kind = .float64, .sig = 1 };
+    if (eq(s, "DATE")) return .{ .kind = .date };
+    if (eq(s, "TIMESTAMP")) return .{ .kind = .timestamp };
+    if (eq(s, "TIMESTAMP_NS")) return .{ .kind = .timestamp, .nanos = true };
+    if (eq(s, "TIMESTAMPTZ") or eq(s, "TIMESTAMP WITH TIME ZONE")) return .{ .kind = .timestamp, .tz = true };
+    if (eq(s, "TIMESTAMPTZ_NS")) return .{ .kind = .timestamp, .tz = true, .nanos = true };
+    if (eq(s, "BOOLEAN") or eq(s, "BOOL")) return .{ .kind = .boolean };
+    if (eq(s, "VARCHAR") or eq(s, "STRING") or eq(s, "TEXT")) return .{ .kind = .string };
+    if (eq(s, "BLOB") or eq(s, "BINARY") or eq(s, "BYTES")) return .{ .kind = .binary };
+    if (s.len > 9 and eq(s[0..8], "DECIMAL(") and s[s.len - 1] == ')') {
+        var it = std.mem.splitScalar(u8, s[8 .. s.len - 1], ',');
+        const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse return null, " "), 10) catch return null;
+        const sc = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse return null, " "), 10) catch return null;
+        if (it.next() != null or p == 0 or p > max_decimal_digits or sc > p) return null;
+        return .{ .kind = .decimal, .int_digits = p - sc, .scale = sc };
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------- header and names
 
 /// Whether the first record is a header, given the types sampled from the records after it: yes unless every one
@@ -920,6 +944,16 @@ test "csv every value a joined type was built from fits it" {
             return error.TestUnexpectedResult;
         };
     }
+}
+
+test "csv --csv-types names" {
+    try testing.expectEqual(Kind.int64, parseName("bigint").?.kind);
+    const d = parseName("DECIMAL(15, 2)").?;
+    try testing.expectEqual(Kind.decimal, d.kind);
+    try testing.expectEqual(@as(u32, 15), d.precision());
+    try testing.expect(parseName("timestamptz").?.tz);
+    try testing.expectEqual(@as(?Type, null), parseName("DECIMAL(40,2)"));
+    try testing.expectEqual(@as(?Type, null), parseName("INT128"));
 }
 
 test "csv header detection and column names" {

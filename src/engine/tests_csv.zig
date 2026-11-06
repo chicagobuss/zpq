@@ -8,6 +8,8 @@ const metadata = @import("../core/parquet/metadata.zig");
 const schema = @import("../core/schema.zig");
 const local_reader = @import("../io/local_reader.zig");
 
+const Diag = @import("../core/diag.zig").Diag;
+const runQuery = @import("aggregate.zig").runQuery;
 const testing = std.testing;
 const Context = engine_types.Context;
 
@@ -381,4 +383,210 @@ test "csv write: a chunk whose read failed stops the chunks after it, never stra
         }, &f));
         try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, out, .{}));
     };
+}
+
+test "csv query: inputs are told apart by content, then by name, and a CSV is written whole or refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    var b3: [128]u8 = undefined;
+    var b4: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "data.CSV");
+    const bin = try tmpPath(&b2, &tmp, "data.bin");
+    const out = try tmpPath(&b3, &tmp, "data.parquet");
+    const disguised = try tmpPath(&b4, &tmp, "copy.csv");
+    try writeFile(csv, "a,b\n1,x\n2,ab\"c\n");
+    try writeFile(bin, "a,b\n1,x\n");
+    try testing.expectEqual(csv_write.InputFormat.csv, try csv_write.inputFormat(csv, .auto));
+    try testing.expectError(error.UnknownInputFormat, csv_write.inputFormat(bin, .auto));
+    try testing.expectEqual(csv_write.InputFormat.csv, try csv_write.inputFormat(bin, .csv));
+    try testing.expectEqual(csv_write.InputFormat.parquet, try csv_write.inputFormat("s3://b/k.csv", .auto));
+
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    // A refusal names its place: line, byte and the column by its header name.
+    var diag: Diag = .{};
+    try testing.expectError(error.CsvMalformed, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .diag = &diag }));
+    try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
+    try testing.expectEqual(@as(u64, 10), diag.detail.csv.byte);
+    try testing.expectEqualStrings("b", diag.column.get());
+
+    try writeFile(csv, "a,b\n1,x\n2,y\n");
+    var report: csv_write.Report = .{};
+    const r = try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .csv_report = &report, .csv_report_alloc = a });
+    try testing.expectEqual(@as(i64, 2), r.write.rows_matched);
+    try testing.expectEqualStrings("b", report.names[1]);
+    // Anything but a whole conversion reads the Parquet it writes.
+    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .filter = "a > 1" }));
+    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "count(*)" }));
+    // The Parquet it wrote, renamed .csv, is still Parquet: content first.
+    try std.Io.Dir.cwd().copyFile(out, std.Io.Dir.cwd(), disguised, testing.io, .{});
+    try testing.expectEqual(csv_write.InputFormat.parquet, try csv_write.inputFormat(disguised, .auto));
+}
+
+test "csv query: a column projection writes the columns named, in order, and frames the rest without typing them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "p.csv");
+    const out = try tmpPath(&b2, &tmp, "p.parquet");
+    // `c` turns to text late; written without it, nothing widens and nothing restarts.
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "a,b,c\n");
+    for (0..5000) |i| try text.print(a, "{d},x{d},{d}\n", .{ i, i, i });
+    try text.appendSlice(a, "5000,x5000,oops\n");
+    try writeFile(csv, text.items);
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+
+    const sql_cols = [_]@import("../core/expr/ast.zig").SelectColumn{ .{ .expr = "b" }, .{ .expr = "\"a\"" } };
+    for ([_]engine_types.QueryArgs{
+        .{ .inputs = &.{csv}, .output = out, .columns = &.{ "b", "a" } },
+        .{ .inputs = &.{csv}, .output = out, .select = "b, \"a\"", .select_cols = &sql_cols },
+    }) |args| {
+        var report: csv_write.Report = .{};
+        var with = args;
+        with.csv_report = &report;
+        with.csv_report_alloc = a;
+        with.csv = .{ .sample_bytes = 1024 };
+        const r = try runQuery(ctx, with);
+        try testing.expectEqual(@as(i64, 5001), r.write.rows_matched);
+        try testing.expectEqual(@as(usize, 0), report.restarts);
+        const meta = try metadata.open(a, try metadata.readFileSlice(out, a));
+        const leaves = meta.schema.items[1..];
+        try testing.expectEqual(@as(usize, 2), leaves.len);
+        try testing.expectEqualStrings("b", leaves[0].name);
+        try testing.expectEqualStrings("a", leaves[1].name);
+        try testing.expectEqual(schema.Type.INT64, leaves[1].type.?);
+    }
+    // `SELECT *` is the whole file.
+    {
+        var report: csv_write.Report = .{};
+        _ = try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select_cols = &.{}, .csv = .{ .sample_bytes = 1024 }, .csv_report = &report, .csv_report_alloc = a });
+        try testing.expectEqual(@as(usize, 3), report.names.len);
+        try testing.expectEqual(@as(usize, 1), report.restarts);
+    }
+    // An expression, a rename, ORDER BY or LIMIT is a query over the CSV: refused by name.
+    const expr = [_]@import("../core/expr/ast.zig").SelectColumn{.{ .expr = "a + 1" }};
+    const renamed = [_]@import("../core/expr/ast.zig").SelectColumn{.{ .expr = "a", .alias = "z" }};
+    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a + 1", .select_cols = &expr }));
+    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a AS z", .select_cols = &renamed }));
+    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .result_order = .{ .limit = 3 } }));
+    // A column the file does not have is named; one asked for twice is refused.
+    var diag: Diag = .{};
+    try testing.expectError(error.UnknownColumn, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .columns = &.{"nope"}, .diag = &diag }));
+    try testing.expectEqualStrings("nope", diag.column.get());
+    try testing.expectError(error.CsvDuplicateColumn, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .columns = &.{ "a", "a" } }));
+    // A field not written is still framed: a stray quote there is refused, at its own column.
+    try writeFile(csv, "a,b,c\n1,x,1\n2,y,ab\"c\n");
+    diag = .{};
+    try testing.expectError(error.CsvMalformed, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .columns = &.{"a"}, .diag = &diag }));
+    try testing.expectEqualStrings("c", diag.column.get());
+    try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
+}
+
+test "csv query: SQL over a CSV is a column list or a refusal, never a dropped clause" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const syntax_plan = @import("syntax_plan.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "s.csv");
+    const out = try tmpPath(&b2, &tmp, "s.parquet");
+    try writeFile(csv, "a,b,c\n1,x,1.5\n2,y,2.5\n");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const Case = struct { text: []const u8, names: ?[]const []const u8 };
+    for ([_]Case{
+        .{ .text = "SELECT * FROM 's.csv'", .names = &.{ "a", "b", "c" } },
+        .{ .text = "SELECT c, a FROM 's.csv'", .names = &.{ "c", "a" } },
+        .{ .text = "SELECT \"b\" AS b FROM 's.csv'", .names = &.{"b"} },
+        .{ .text = "SELECT * FROM 's.csv' WHERE a > 1", .names = null },
+        .{ .text = "SELECT a FROM 's.csv' ORDER BY a", .names = null },
+        .{ .text = "SELECT a FROM 's.csv' LIMIT 1", .names = null },
+        .{ .text = "SELECT a + 1 AS a FROM 's.csv'", .names = null },
+        .{ .text = "SELECT a AS z FROM 's.csv'", .names = null },
+        .{ .text = "SELECT count(*) FROM 's.csv'", .names = null },
+    }) |case| {
+        const parsed = try sql.parseSqlPlan(testing.allocator, case.text);
+        defer parsed.deinit(testing.allocator);
+        var report: csv_write.Report = .{};
+        const args: engine_types.QueryArgs = .{
+            .inputs = &.{csv},
+            .output = out,
+            .plan_source = syntax_plan.source(parsed.syntax.?),
+            .select_cols = parsed.select_cols,
+            .result_order = parsed.result_order,
+            .csv_report = &report,
+            .csv_report_alloc = a,
+        };
+        const want = case.names orelse {
+            try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, args));
+            continue;
+        };
+        const r = try runQuery(ctx, args);
+        try testing.expectEqual(@as(i64, 2), r.write.rows_matched);
+        try testing.expectEqual(want.len, report.names.len);
+        for (want, report.names) |w, n| try testing.expectEqualStrings(w, n);
+    }
+}
+
+test "csv query: a late value restarts into the caller's own output file, and refuses on one it cannot restart" {
+    const local_fs = @import("../local_fs.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    var b3: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "late.csv");
+    const by_path = try tmpPath(&b2, &tmp, "path.parquet");
+    const by_fd = try tmpPath(&b3, &tmp, "fd.parquet");
+    try writeFile(csv, try sampleCsv(a, 20_000, "n/a"));
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const opts: csv_write.Options = .{ .sample_bytes = 4096, .chunk_bytes = 8 << 10 };
+
+    var report: csv_write.Report = .{};
+    _ = try runQuery(ctx, .{ .inputs = &.{csv}, .output = by_path, .csv = opts, .csv_report = &report, .csv_report_alloc = a });
+    try testing.expectEqual(@as(usize, 1), report.restarts);
+
+    // The CLI's -o: an unpublished file of its own, written through its descriptor.
+    const fd = try local_fs.createFile(by_fd);
+    defer local_fs.close(fd);
+    report = .{};
+    _ = try runQuery(ctx, .{
+        .inputs = &.{csv},
+        .output = by_fd,
+        .output_fd = fd,
+        .output_restartable = true,
+        .csv = opts,
+        .csv_report = &report,
+        .csv_report_alloc = a,
+    });
+    try testing.expectEqual(@as(usize, 1), report.restarts);
+    try testing.expectEqualSlices(u8, try metadata.readFileSlice(by_path, a), try metadata.readFileSlice(by_fd, a));
+
+    // A descriptor it cannot restart (a pipe, stdout) may have passed bytes on: the change is refused where it is.
+    try local_fs.truncateToStart(fd);
+    var diag: Diag = .{};
+    try testing.expectError(error.CsvTypeChanged, runQuery(ctx, .{
+        .inputs = &.{csv},
+        .output = by_fd,
+        .output_fd = fd,
+        .csv = opts,
+        .diag = &diag,
+    }));
+    try testing.expectEqualStrings("amt", diag.column.get());
 }

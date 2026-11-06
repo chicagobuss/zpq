@@ -21,6 +21,11 @@ pub fn source(query: *const syntax.Query) plans.Source {
     };
 }
 
+/// The frontend syntax a source was made from, or null when another frontend made it.
+pub fn syntaxOf(src: plans.Source) ?*const syntax.Query {
+    return if (src.bind_fn == &bind) @ptrCast(@alignCast(src.context)) else null;
+}
+
 fn columns(arena: std.mem.Allocator, specs: []const syntax.Column, meta: *const schema.FileMetaData, diag: ?*Diag) ![]expr.SelectColumn {
     const out = try arena.alloc(expr.SelectColumn, specs.len);
     for (specs, out) |spec, *col| col.* = .{

@@ -16,6 +16,7 @@ const filter_ast = @import("../core/filter/ast.zig");
 const membership = @import("../core/filter/membership.zig");
 const ResultProgram = @import("../core/result_program.zig").ResultProgram;
 const Diag = @import("../core/diag.zig").Diag;
+const csv_write = @import("csv_write.zig");
 const text_format = @import("text_types.zig");
 pub const bound_plan = @import("bound_plan.zig");
 const TextKind = text_format.TextKind;
@@ -172,6 +173,15 @@ pub const QueryArgs = struct {
     /// has; one without is decoded to build one.
     bloom_filters: []const BloomSpec = &.{},
     bloom_filters_enabled: bool = true,
+    /// What the inputs are: by content (`auto`: Parquet when PAR1 starts and ends the file, else CSV when it is named
+    /// .csv, .tsv or .txt), or as given (`--input-format`).
+    input_format: InputFormat = .auto,
+    /// How a CSV input is read (`--csv-*`): the one source-options object.
+    csv: csv_write.Options = .{},
+    /// Receives a CSV write's report (restarts, widened columns, the types written, how it was read), its slices on
+    /// `csv_report_alloc`; null: not reported.
+    csv_report: ?*csv_write.Report = null,
+    csv_report_alloc: ?std.mem.Allocator = null,
     /// Per input, parallel to `inputs`: read only row groups `start` up to but not including `end` of its footer; null
     /// (or a null slice) reads every row group. A coordinator splits one file across workers with it.
     row_groups: ?[]const ?[2]u32 = null,
@@ -204,6 +214,8 @@ pub const QueryArgs = struct {
 };
 
 pub const CompressPriority = compression.CompressPriority;
+
+pub const InputFormat = enum { auto, parquet, csv };
 
 /// One `--bloom-filter col[:fpp]`: a written column and its filter's false-positive probability.
 pub const BloomSpec = struct {

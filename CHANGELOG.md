@@ -61,10 +61,11 @@
   went from 68 to 17 ms uncached and from 32 to 12 ms cached; other writes are flat to 15% faster uncached.
 - **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
   each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
-  (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when the groups
-  the cut keeps are too few or too lopsided to spread across the workers, and it reads ahead the dictionaries it
-  plans from. On a Ryzen 9 9950X, ClickBench Q08 is 25–36% faster and Q09 8–23% faster (flat when cached at the
-  default thread count), both at lower peak memory; other `COUNT(DISTINCT)` queries are unchanged.
+  (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when one group the
+  cut keeps holds more than a worker's share of their rows, keeps the grouped bitmap when the pass qualifies for it,
+  and reads ahead the dictionaries it plans from. On a Ryzen 9 9950X, ClickBench Q08 is 25–36% faster and Q09 8–23%
+  faster (flat when cached at the default thread count), both at lower peak memory, and the same query shape over
+  1,000 groups is 19–60% faster; other `COUNT(DISTINCT)` queries are unchanged.
 
 ## 0.5.1 (2026-10-31)
 

@@ -334,6 +334,8 @@ pub const BuildError = error{ DuplicateBuildKey, JoinKeyType, JoinPayloadType, J
 const Ctx = struct {
     /// One per build row group: its survivors, until the build is laid out.
     arenas: []std.heap.ArenaAllocator,
+    /// What each row group's decode scratch draws from.
+    scratch: std.mem.Allocator,
     bytes: []const u8,
     meta: *const schema.FileMetaData,
     spec: Spec,
@@ -428,7 +430,7 @@ fn codedLocal(comptime T: type, a: std.mem.Allocator, bytes: []const u8, meta: *
 
 fn buildPart(c: *Ctx, rg_index: usize) !void {
     const a = c.arenas[rg_index].allocator();
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var scratch = std.heap.ArenaAllocator.init(c.scratch);
     defer scratch.deinit();
     const sa = scratch.allocator();
     const rg = &c.meta.row_groups.items[rg_index];
@@ -635,7 +637,8 @@ fn lap(what: []const u8, since: i64) i64 {
 }
 
 /// The build lives in `a` (used from this thread only) as long as the query; `gpa` (thread-safe) backs each row
-/// group's survivors until the build is laid out.
+/// group's survivors and decode scratch until the build is laid out. Both draw from the query's ledger as they
+/// allocate (`engine/join.zig`), so a build that does not fit refuses while it builds.
 pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, meta: *const schema.FileMetaData, spec: Spec) !*Join {
     const domain = KeyDomain.of(metadata.leafSchemaElement(meta, spec.key) orelse return error.JoinKeyType) orelse
         return error.JoinKeyType;
@@ -644,7 +647,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     const arenas = try a.alloc(std.heap.ArenaAllocator, parts.len);
     for (arenas) |*ar| ar.* = .init(gpa);
     defer for (arenas) |*ar| ar.deinit();
-    var ctx: Ctx = .{ .arenas = arenas, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
+    var ctx: Ctx = .{ .arenas = arenas, .scratch = gpa, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
     const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
     var t = @import("../../clock.zig").monoNs();
     try parallel(parts.len, spec.threads, &ctx, struct {
@@ -725,7 +728,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     if (trace) t = lap("unify dictionaries", t);
     try parallel(parts.len, spec.threads, FillCodes{ .j = j, .parts = parts, .codes = codes }, FillCodes.run);
     if (trace) _ = lap("codes by slot", t);
-    // What the build holds, now that each payload's code width is known (the budget check above took four bytes).
+    // An estimate, now that each payload's code width is known; the caller measures what `a` holds.
     j.bytes = key_bytes;
     for (payloads) |p| j.bytes += p.codes.bytes() + p.dict.len() * 16;
     return j;

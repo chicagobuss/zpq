@@ -592,6 +592,7 @@ fn executeSql(
     diag: *Diag,
 ) ![]u8 {
     var schemas: engine.join.LocalSchemas = .{ .arena = arena };
+    defer schemas.deinit();
     const parser = zpq.core.expr.sql_parser;
     const pq = (try parser.parseSqlJoinPlan(arena, sql, .{ .ctx = &schemas, .footer = engine.join.LocalSchemas.footer })) orelse
         try parser.parseSqlPlan(arena, sql);

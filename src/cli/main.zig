@@ -534,6 +534,7 @@ fn runQuery(
             defer zpq.core.expr.sql_parser.diagnostic_fn = null;
             // A two-table join binds its column names against both footers; the engine reads the build.
             var schemas: engine.join.LocalSchemas = .{ .arena = arena };
+            defer schemas.deinit();
             const sql = zpq.core.expr.sql_parser;
             const pq = (try sql.parseSqlJoinPlan(arena, q_str, .{ .ctx = &schemas, .footer = engine.join.LocalSchemas.footer })) orelse
                 try sql.parseSqlPlan(arena, q_str);

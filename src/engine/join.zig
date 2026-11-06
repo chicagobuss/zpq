@@ -17,30 +17,40 @@ const plans = @import("bound_plan.zig");
 const types = @import("types.zig");
 
 /// Footers of the local files a join names, for the SQL frontend's binder (`sql_parser.parseSqlJoinPlan`). Each is
-/// read once; the build reads its file again here (`prepare`).
+/// read once; the build reads its file again here (`prepare`). The plan the binder returns borrows nothing of them, so
+/// the caller unmaps them (`deinit`) once it has the plan.
 pub const LocalSchemas = struct {
     arena: std.mem.Allocator,
     seen: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
+    maps: std.ArrayList(local_fs.Mapped) = .empty,
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData {
         const self: *LocalSchemas = @ptrCast(@alignCast(@constCast(raw)));
         if (self.seen.get(path)) |m| return m;
+        try self.maps.ensureUnusedCapacity(self.arena, 1);
         const opened = try open(self.arena, path);
+        self.maps.appendAssumeCapacity(opened.map);
         const m = try self.arena.create(schema.FileMetaData);
         m.* = opened.meta;
         try self.seen.put(self.arena, path, m);
         return m;
     }
+
+    pub fn deinit(self: *LocalSchemas) void {
+        for (self.maps.items) |m| m.unmap();
+        self.maps = .empty;
+        self.seen = .empty;
+    }
 };
 
-const Opened = struct { bytes: []const u8, meta: schema.FileMetaData };
+const Opened = struct { map: local_fs.Mapped, meta: schema.FileMetaData };
 
-/// Builds read local files in this release: a build on S3 refuses, naming it.
+/// Builds read local files in this release: a build on S3 refuses, naming it. The caller owns the mapping.
 fn open(arena: std.mem.Allocator, path: []const u8) !Opened {
     if (std.mem.startsWith(u8, path, "s3://")) return error.JoinNotLocal;
     const m = try local_fs.mapFile(path);
-    // Held for the query: the build decodes from this mapping.
-    return .{ .bytes = m.bytes, .meta = try metadata.open(arena, m.bytes) };
+    errdefer m.unmap();
+    return .{ .map = m, .meta = try metadata.open(arena, m.bytes) };
 }
 
 /// One lookup conjunct of a filter: the FK it reads, by name, and the build it probes.
@@ -51,10 +61,18 @@ pub const Prepared = struct {
     main: Leaf,
     /// SEMI joins of the probe beside it.
     semis: []const Leaf,
-    /// Every build's bytes, charged to the query's ledger; and a group-join's slots once one is admitted.
+    /// What the builds hold (their arenas' capacity) and a group-join's slots once one is admitted, for `--explain`.
     charged: usize = 0,
     ledger: *core_memory.SharedBudget,
     gpa: std.mem.Allocator,
+    /// Every allocation a build or the group-join makes draws from the query's ledger as it is made (`charge`): the
+    /// builds' structures and dictionaries in `store`, their decode scratch beside it, the group-join's slots and
+    /// partials. A build that does not fit refuses while it builds, not after.
+    charge: core_memory.Charged = undefined,
+    store: std.heap.ArenaAllocator = undefined,
+    /// The build files' mappings, held for the query: virtual leaves bind by the payloads' names, which the build
+    /// footers own.
+    maps: std.ArrayList(local_fs.Mapped) = .empty,
     order: expr_ast.ResultOrder,
     inner: plans.Source = undefined,
 
@@ -81,15 +99,13 @@ pub const Prepared = struct {
         a.filter = try withLookup(arena, a.filter, try leafOf(meta, self.main, diag));
         const j = self.main.join;
         if (j.group == null and j.kind == .inner and self.order.having == null and self.order.hidden.len == 0) {
-            if (try groupJoin(self.gpa, j, a.*, meta)) |g| {
-                const need = lookup.GroupJoin.bytesFor(j.n, g.calls);
-                _ = self.ledger.drawExact(need) orelse {
-                    g.deinit();
-                    Diag.setInput(diag, j.build_name, null);
-                    Diag.setColumn(diag, j.key_name);
-                    return error.JoinBuildExceedsBudget;
-                };
-                self.charged += need;
+            const admitted = groupJoin(self.charge.allocator(), j, a.*, meta) catch |err| {
+                Diag.setInput(diag, j.build_name, null);
+                Diag.setColumn(diag, j.key_name);
+                return if (self.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
+            };
+            if (admitted) |g| {
+                self.charged += lookup.GroupJoin.bytesFor(j.n, g.calls);
                 j.group = g;
             }
         }
@@ -107,9 +123,26 @@ pub const Prepared = struct {
         return rows;
     }
 
+    /// A refusal of the join's own allocations, named as the ledger's (`error.ExceededMemoryBudget`).
+    pub fn refusal(self: *const Prepared, err: anytype) @TypeOf(self.charge.refusal(err)) {
+        return self.charge.refusal(err);
+    }
+
+    /// Everything the join holds goes back: a group-join whose rows were not taken (an explained or failed query),
+    /// the builds, their mappings.
     pub fn release(self: *Prepared) void {
-        self.ledger.release(self.charged);
-        self.charged = 0;
+        if (self.main.join.group) |g| {
+            self.main.join.group = null;
+            g.deinit();
+        }
+        self.releaseBuilds();
+    }
+
+    fn releaseBuilds(self: *Prepared) void {
+        self.store.deinit();
+        self.store = .init(self.charge.allocator());
+        for (self.maps.items) |m| m.unmap();
+        self.maps = .empty;
     }
 };
 
@@ -194,12 +227,14 @@ fn semiKind(s: syntax.Semi) lookup.Kind {
     return if (s.unique) .inner else .semi;
 }
 
-/// Read one build side (its own SEMI joins first) into a lookup, charged to `ledger`.
+/// Read one build side (its own SEMI joins first) into a lookup, charged to the ledger as it is built.
 fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.Kind, threads: usize, diag: ?*Diag) !*lookup.Join {
+    try p.maps.ensureUnusedCapacity(arena, 1);
     const file = open(arena, b.path) catch |err| {
         Diag.setInput(diag, b.path, err);
         return err;
     };
+    p.maps.appendAssumeCapacity(file.map);
     const meta = try arena.create(schema.FileMetaData);
     meta.* = file.meta;
     var filter: ?filter_ast.Filter = if (b.filter) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
@@ -216,7 +251,8 @@ fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.K
         Diag.setColumn(diag, b.key);
         return err;
     };
-    const j = lookup.build(arena, p.gpa, file.bytes, meta, .{
+    const before = p.store.queryCapacity();
+    const j = lookup.build(p.store.allocator(), p.charge.allocator(), file.map.bytes, meta, .{
         .kind = kind,
         .build_name = b.path,
         .key_name = b.key,
@@ -228,13 +264,14 @@ fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.K
     }) catch |err| {
         Diag.setInput(diag, b.path, null);
         Diag.setColumn(diag, b.key);
+        return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
+    };
+    // The build read its file whole: one that changed meanwhile refuses, as a scanned input does.
+    file.map.intact(b.path) catch |err| {
+        Diag.setInput(diag, b.path, err);
         return err;
     };
-    _ = p.ledger.drawExact(j.bytes) orelse {
-        Diag.setInput(diag, b.path, null);
-        Diag.setColumn(diag, b.key);
-        return error.JoinBuildExceedsBudget;
-    };
+    j.bytes = p.store.queryCapacity() - before;
     p.charged += j.bytes;
     return j;
 }
@@ -250,7 +287,10 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     const threads = if (args.parallelism == 0) std.Thread.getCpuCount() catch 1 else args.parallelism;
     const p = try arena.create(Prepared);
     p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order };
-    errdefer p.release();
+    p.charge = .{ .child = gpa, .budget = ledger };
+    p.store = .init(p.charge.allocator());
+    // No group-join exists before the probe binds.
+    errdefer p.releaseBuilds();
     const main = try build(p, arena, sj.build, if (sj.kind == .semi) .semi else .inner, threads, args.diag);
     main.main = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);

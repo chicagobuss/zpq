@@ -154,10 +154,12 @@ columns are evaluated only for the rows the filter keeps.
 
 **Copies share blocks.** A copied run of input bytes (a whole row group, or one projected column chunk) is placed at
 the same offset modulo 4 KiB as in its input, after up to 4,095 zero bytes no footer offset points at, whenever the
-run holds at least one whole 4 KiB block; a run that holds none goes where it is. Into a local file, each run is
-copied with `copy_file_range`: a filesystem that shares blocks (btrfs, XFS with reflink, ZFS block cloning) shares
-the run's whole blocks with the input instead of writing them, which takes almost no time and no new space, and
-another copies them in the kernel. A pipe, another filesystem than the input's, or S3 gets the same bytes written.
+run holds at least one whole 4 KiB block; a run that holds none goes where it is. When the output is a local file
+zpq made on the inputs' filesystem and that filesystem shares blocks (btrfs, XFS with reflink, ZFS block cloning, an
+NFS 4.2 or SMB server that clones), which zpq asks it by cloning one block into the still-empty output, each run goes
+by `copy_file_range`: its whole blocks are shared with the input instead of written, in almost no time and no new
+space, and a plain copy maps its inputs rather than reading them ahead. Anywhere else (ext4, another filesystem, a
+pipe, stdout, S3) the runs are read and written as before, the same bytes. `ZPQ_SHARE_BLOCKS=0` turns the sharing off.
 The layout is a fixed 4 KiB whatever the filesystem, so a copy's bytes are the same wherever it is written. Its cost
 is at most 4,095 bytes per run and always fewer than the run's whole blocks; the summary's `byte_copy` reports it.
 

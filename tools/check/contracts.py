@@ -601,6 +601,17 @@ def a_byte_copy_shares_its_input_blocks_on_a_cow_filesystem(root, clean, corrupt
             # The same bytes through plain writes (a pipe), and the same values in every reader.
             piped = run(src, *args, "--format", "parquet", "-o", "-").stdout
             assert piped == out.read_bytes(), args
+            # A filesystem said not to share blocks reads and writes, the same bytes again; a pure copy then keeps
+            # the read policy it would have, not the mapping a shared copy takes (reason 12, `range_copy`).
+            told = d / "told.parquet"
+            p0 = run(src, *args, "-o", told, "--summary=json", "--profile-summary=json",
+                     env={**os.environ, "ZPQ_SHARE_BLOCKS": "0"})
+            assert told.read_bytes() == out.read_bytes(), args
+            lines = [json.loads(x) for x in p0.stderr.decode().splitlines() if x.startswith("{")]
+            assert lines[-1]["byte_copy"]["path"] == "write", lines[-1]
+            io = next(x for x in lines if "io" in x)["io"]
+            assert io.get("io_reason") != 12, io
+            told.unlink()
             assert pq.read_table(out).equals(ref), args
             assert duckdb.sql(f"SELECT count(*), sum(k), sum(hash(s)) FROM '{out}'").fetchall() == \
                 duckdb.sql(f"SELECT count(*), sum(k), sum(hash(s)) FROM '{clean}'").fetchall(), args

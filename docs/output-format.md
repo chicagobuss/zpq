@@ -204,8 +204,8 @@ adds `byte_copy`; other answers have no such field.
 | Field | Counts |
 |---|---|
 | `bytes` | input bytes copied verbatim |
-| `kernel_bytes` | of those, the bytes `copy_file_range` took: shared with the input on a filesystem that shares blocks, else copied in the kernel (nothing in the process can tell which) |
-| `written_bytes` | `bytes - kernel_bytes`: written through the process, as to a pipe, S3 or another filesystem |
+| `kernel_bytes` | of those, the bytes `copy_file_range` took, which it does only where the filesystem shares blocks: shared with the input, but for a run's unaligned head and tail, copied in the kernel |
+| `written_bytes` | `bytes - kernel_bytes`: read and written, as on a filesystem that does not share blocks, a pipe or S3 |
 | `pad_bytes` | zero bytes placed before copied runs to keep them at their input offset modulo 4 KiB |
 | `path` | `range_copy` (every byte by the kernel), `write` (none) or `mixed` |
 

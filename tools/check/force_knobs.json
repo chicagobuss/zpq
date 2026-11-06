@@ -169,5 +169,14 @@
     "evidence": "partitioned",
     "alternate": "1",
     "pair_kind": "enable_partitioned"
+  },
+  {
+    "name": "ZPQ_SHARE_BLOCKS",
+    "off": "0",
+    "cases": [
+      "precision:int96-signed-day-exact"
+    ],
+    "evidence": "unavailable",
+    "note": "only a filesystem that clones changes the path; the CoW contract (ZPQ_TEST_COW_DIR) checks the forced write path's bytes"
   }
 ]

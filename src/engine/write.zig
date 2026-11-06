@@ -33,6 +33,7 @@ const multipart_sink = @import("../io/multipart_sink.zig");
 const Diag = @import("../core/diag.zig").Diag;
 const engine_types = @import("types.zig");
 const Context = engine_types.Context;
+const envDisables = @import("env.zig").envDisables;
 const QueryArgs = engine_types.QueryArgs;
 const WriteResult = engine_types.WriteResult;
 const Timings = engine_types.Timings;
@@ -245,10 +246,18 @@ fn runWriteOver(
     // would need more of the budget than the mapping gives it: such a write reads through the mapping
     // (`input.readerFits`).
     const whole: input.WholeDecode = .{ .cols = fetch_arr, .share = window_mod.producerShareFloor(ctx, args) };
-    const range_copy: ?local_reader.Reason = if (mapped == null and rangeCopies(args, opened, out_path, proj, blooms))
-        .range_copy
-    else
-        null;
+    // A local output is made here, before the read policy, so the filesystem can be asked whether it shares blocks.
+    // Until the sink owns it, a failure removes it.
+    const out_is_s3 = std.mem.startsWith(u8, out_path, "s3://");
+    var made_fd: ?local_fs.fd_t = if (!out_is_s3 and args.output_fd == null) try createFile(out_path) else null;
+    errdefer if (made_fd) |fd| {
+        local_fs.close(fd);
+        local_fs.removeFile(out_path);
+    };
+    // A descriptor the caller handed over is probed only when zpq may empty it (its publication's own staging file).
+    const owned_out: ?local_fs.fd_t = made_fd orelse if (args.output_restartable) args.output_fd else null;
+    const shares = !out_is_s3 and try sharesBlocks(ctx, opened, owned_out);
+    const range_copy: ?local_reader.Reason = if (shares and copiesOnly(args, proj, blooms)) .range_copy else null;
     const io_mapped = mapped orelse range_copy;
     const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, whole, io_mapped, prof);
     through_reader.* = io.choice.mode != .mmap;
@@ -286,8 +295,7 @@ fn runWriteOver(
     const zstd: compression.ZstdPlan = .{ .lambda = priority.lambda(), .counts = &zstd_counts };
 
     // 4. Open output sink: local fd or s3 multipart.
-    const out_is_s3 = std.mem.startsWith(u8, out_path, "s3://");
-    var fd_sink: FdSink = .{ .fd = 0 };
+    var fd_sink: FdSink = .{ .fd = 0, .share = shares };
     var mp_sink: ?multipart_sink.MultipartSink = null;
     var sink: streaming.Sink = undefined;
     var sink_owns_fd = false;
@@ -339,7 +347,8 @@ fn runWriteOver(
             .write_fn = multipart_sink.sinkWriteFn,
         };
     } else {
-        fd_sink.fd = args.output_fd orelse try createFile(out_path);
+        fd_sink.fd = args.output_fd orelse made_fd.?;
+        made_fd = null;
         remove_on_error = args.output_fd == null;
         sink_owns_fd = args.output_fd == null;
         sink = fd_sink.sink();
@@ -415,7 +424,8 @@ fn runWriteOver(
         .arena = arena,
         .args = args,
         .inputs = write_inputs,
-        .input_fds = try inputFds(arena, opened),
+        // Without shared blocks a range copy is no better than the copy loop: the inputs are read and written.
+        .input_fds = if (shares) try inputFds(arena, opened) else &.{},
         .input_local = try inputLocal(arena, opened),
         .ledger = &ledger,
         .metas = metas,
@@ -1019,20 +1029,29 @@ pub fn buildSelectSchema(
     return out;
 }
 
-/// Whether every chunk of this write will be range-copied rather than read: a byte copy (no filter, computed column,
-/// `--select`, codec change or decoded Bloom filter) into a local file on the device of every input. The reader would
-/// only read ahead what the kernel copies; the mapping reads just the footers and indexes.
-fn rangeCopies(args: QueryArgs, opened: input.OpenedInputs, out_path: []const u8, proj: anytype, blooms: anytype) bool {
-    if (proj.filter != null or proj.any_computed or proj.select_items != null or args.codec != null) return false;
-    for (blooms.leaves) |fpp| if (fpp != null) return false;
-    if (std.mem.startsWith(u8, out_path, "s3://")) return false;
-    if (args.output_fd) |fd| if (!local_fs.isRegular(fd)) return false;
-    const out_dev = local_fs.deviceOf(args.output_fd, out_path) orelse return false;
+/// Whether the output can share blocks with the inputs: a local file zpq made (never a caller's descriptor it may not
+/// empty, such as stdout), on the device of every input, whose filesystem clones (`local_fs.sharesBlocks`, probed on
+/// `out_fd`, still empty). `ZPQ_SHARE_BLOCKS=0` says no. Where it does not, byte copies are read and written, as a
+/// range copy there is a serial copy through the page cache.
+fn sharesBlocks(ctx: Context, opened: input.OpenedInputs, out_fd: ?local_fs.fd_t) !bool {
+    if (envDisables(ctx.env, "ZPQ_SHARE_BLOCKS")) return false;
+    const out = out_fd orelse return false;
+    if (!local_fs.isRegular(out) or opened.mmaps.len == 0) return false;
+    const out_dev = local_fs.deviceOf(out, "") orelse return false;
     for (opened.mmaps) |m| {
         const fd = (m orelse return false).fd orelse return false;
         if (local_fs.deviceOf(fd, "") != out_dev) return false;
     }
-    return opened.mmaps.len > 0;
+    return local_fs.sharesBlocks(opened.mmaps[0].?.fd.?, out);
+}
+
+/// Whether every chunk of this write is a byte copy (no filter, computed column, `--select`, codec change or decoded
+/// Bloom filter): where blocks are shared, the reader would only read ahead what the kernel shares unread, and the
+/// mapping reads just the footers and indexes.
+fn copiesOnly(args: QueryArgs, proj: anytype, blooms: anytype) bool {
+    if (proj.filter != null or proj.any_computed or proj.select_items != null or args.codec != null) return false;
+    for (blooms.leaves) |fpp| if (fpp != null) return false;
+    return true;
 }
 
 /// Each input's descriptor, from its mapping: null for S3 input, and for a mapping that gave its descriptor back.
@@ -1054,14 +1073,16 @@ pub const FdSink = struct {
     writeback_to: u64 = 0,
     /// How a range is copied: `local_fs.copyFileRange`, but for tests that force each fallback.
     copy: *const fn (local_fs.fd_t, u64, local_fs.fd_t, usize) local_fs.CopyRangeError!usize = local_fs.copyFileRange,
+    /// The file's filesystem shares blocks with the inputs' (`sharesBlocks`): only then are ranges copied.
+    share: bool = false,
 
-    /// Range copies only into a regular file: a pipe or a terminal takes plain writes.
+    /// Range copies only where blocks are shared, and only into a regular file: a pipe or a terminal is written.
     pub fn sink(self: *FdSink) streaming.Sink {
         return .{
             .ctx = self,
             .write_fn = writeFn,
             .write_segments_fn = writeSegmentsFn,
-            .copy_range_fn = if (local_fs.isRegular(self.fd)) copyRangeFn else null,
+            .copy_range_fn = if (self.share and local_fs.isRegular(self.fd)) copyRangeFn else null,
         };
     }
 
@@ -1239,7 +1260,7 @@ test "FdSink range copies write the input's bytes whether the kernel copies all,
         var out_buf: [256]u8 = undefined;
         const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/tmp/{s}/out{d}", .{ tmp.sub_path, k });
         const fd = try local_fs.createFile(out_path);
-        var fd_sink: FdSink = .{ .fd = fd, .copy = copier };
+        var fd_sink: FdSink = .{ .fd = fd, .copy = copier, .share = true };
         var out: streaming.SinkOut = .{ .sink = fd_sink.sink() };
         try out.write("PAR1");
         // A run with whole blocks inside, at its input offset modulo the block, after zero padding.
@@ -1267,7 +1288,7 @@ test "FdSink takes plain writes into a pipe" {
     try std.testing.expectEqual(@as(usize, 0), std.os.linux.pipe(&fds));
     defer local_fs.close(fds[0]);
     defer local_fs.close(fds[1]);
-    var fd_sink: FdSink = .{ .fd = fds[1] };
+    var fd_sink: FdSink = .{ .fd = fds[1], .share = true };
     try std.testing.expect(fd_sink.sink().copy_range_fn == null);
 }
 

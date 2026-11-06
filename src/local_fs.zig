@@ -154,6 +154,24 @@ pub fn isRegular(fd: fd_t) bool {
     return posix.errno(posix.system.fstat(fd, &st)) == .SUCCESS and posix.S.ISREG(st.mode);
 }
 
+/// Whether the filesystem holding `in_fd` and `out_fd` shares blocks between files (btrfs, XFS with reflink, ZFS
+/// block cloning, an NFS 4.2 or SMB server that clones): clones the input's first block into `out_fd`, which must
+/// be empty and zpq's own, then empties it again. A range copy pays only where this holds; elsewhere it is a serial
+/// copy through the page cache that read-ahead and plain writes beat.
+pub fn sharesBlocks(in_fd: fd_t, out_fd: fd_t) error{TruncateFailed}!bool {
+    if (builtin.os.tag != .linux) return false;
+    const linux = std.os.linux;
+    const size = fileSize(in_fd) catch return false;
+    // linux/fs.h: struct file_clone_range, FICLONERANGE = _IOW(0x94, 13, struct file_clone_range).
+    const Range = extern struct { src_fd: i64, src_offset: u64, src_length: u64, dest_offset: u64 };
+    // A whole block, or the whole of a smaller file, which a clone may take since it ends at end of file.
+    var range: Range = .{ .src_fd = in_fd, .src_offset = 0, .src_length = @min(size, 4096), .dest_offset = 0 };
+    const cloned = linux.errno(linux.ioctl(out_fd, 0x4020940D, @intFromPtr(&range))) == .SUCCESS;
+    // The cloned block must not outlast the probe: a shorter output would end in it.
+    if (cloned and posix.errno(posix.system.ftruncate(out_fd, 0)) != .SUCCESS) return error.TruncateFailed;
+    return cloned;
+}
+
 pub const CopyRangeError = error{ Unsupported, WriteFailed, NoSpaceLeft, InputOutput };
 
 /// Append up to `len` bytes of `in_fd`, read from `in_offset`, at `out_fd`'s file position, in the kernel

@@ -80,6 +80,8 @@ pub const ColumnarSink = struct {
 pub const QueryArgs = struct {
     /// Immutable frontend syntax. Every engine invocation owns its own metadata-bound cache.
     plan_source: ?bound_plan.Source = null,
+    /// The query's join once its builds are read (`engine/join.zig`); set by the engine, never by a caller.
+    join: ?*@import("join.zig").Prepared = null,
     /// Internal synchronous handoff; callers supply plan_source, never a cache retained across invocations.
     plan_cache: ?*bound_plan.Cache = null,
     /// Force eligible GROUP BY queries through shared partitions.

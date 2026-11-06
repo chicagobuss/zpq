@@ -50,7 +50,36 @@ pub const Column = struct {
 
 pub const RowKey = struct { expr: Expr, display: []const u8, descending: bool, nulls_first: bool = false };
 
+/// A two-table N:1 equi-join as the SQL frontend resolved it (`sql_join.zig`), by name: the query's own inputs are the
+/// probe side, and the engine reads each build (`engine/join.zig`). Schema-independent, so it travels with the rest of
+/// the query to a worker.
+pub const Join = struct {
+    kind: JoinKind,
+    /// The probe's foreign key.
+    fk: []const u8,
+    build: Build,
+    /// More SEMI joins of the probe itself: a third table the frontend reduced onto it.
+    semis: []const Semi = &.{},
+};
+
+pub const JoinKind = enum { inner, semi };
+
+pub const Build = struct {
+    path: []const u8,
+    key: []const u8,
+    /// The build columns the query reads, which bind as virtual leaves of the probe.
+    columns: []const []const u8 = &.{},
+    /// The build's own conjuncts.
+    filter: ?Predicate = null,
+    /// SEMI joins of the build: a third table the frontend reduced onto it (q3's customer inside orders).
+    semis: []const Semi = &.{},
+};
+
+pub const Semi = struct { fk: []const u8, build: Build };
+
 pub const Query = struct {
+    /// Null for a single-table query.
+    join: ?Join = null,
     aggregate: bool,
     calls: []const Aggregate = &.{},
     keys: ?[]const SelectItem = null,

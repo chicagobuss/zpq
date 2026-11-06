@@ -173,6 +173,29 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.TrailingTokens => diagnosticPrint("zpq query: trailing tokens after expression\n", .{}),
         error.GroupKeyAliasRequired => diagnosticPrint("zpq query: non-trivial GROUP BY key requires AS alias\n", .{}),
         error.BadGroupKey => diagnosticPrint("zpq query: corrupted GROUP BY key framing\n", .{}),
+        error.DuplicateBuildKey => diagnosticPrint(
+            "zpq query: '{s}' holds a key of {s} twice: this build joins N:1 only\n",
+            .{ diag.input orelse "the build", diag.column.get() },
+        ),
+        error.JoinBuildExceedsBudget => diagnosticPrint(
+            "zpq query: the join's build of '{s}' on {s} does not fit --max-memory\n",
+            .{ diag.input orelse "the build", diag.column.get() },
+        ),
+        error.JoinNotLocal => diagnosticPrint(
+            "zpq query: a join reads local Parquet files in this release, not {s}\n",
+            .{diag.input orelse "S3"},
+        ),
+        error.UnsupportedJoin => diagnosticPrint(
+            "zpq query: joins take two or three tables, comma or INNER JOIN ... ON, or IN (SELECT ...)\n",
+            .{},
+        ),
+        error.JoinKeyNotFound => diagnosticPrint("zpq query: a join needs one key equality between its tables\n", .{}),
+        error.JoinResidualNotSupported => diagnosticPrint(
+            "zpq query: a join condition reads both tables beyond its one key equality\n",
+            .{},
+        ),
+        error.AmbiguousJoinColumn => diagnosticPrint("zpq query: a column name is in both tables of the join; qualify it\n", .{}),
+        error.JoinRowsNotSupported => diagnosticPrint("zpq query: a join must aggregate in this release\n", .{}),
         error.ExceededMemoryBudget => diagnosticPrint(
             "zpq query: the query needs more memory than --max-memory allows\n",
             .{},

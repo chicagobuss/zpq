@@ -1,0 +1,410 @@
+{
+ "fixtures": [
+  {
+   "name": "fact",
+   "copy": "COPY (SELECT i AS id, (CASE WHEN i % 23 = 0 THEN NULL ELSE i % 997 END)::BIGINT AS fk, (i * 1.25)::DOUBLE AS amt, (i % 7)::BIGINT AS q, (i % 997)::BIGINT * 100003 AS sfk FROM range(1, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
+  },
+  {
+   "name": "dim",
+   "copy": "COPY (SELECT k AS pk, 'kind' || (k % 13) AS kind, (k % 5)::BIGINT AS grp, (k * 10)::INTEGER AS w FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"
+  },
+  {
+   "name": "dim_dup",
+   "copy": "COPY (SELECT k % 400 + 1 AS pk, (k % 5)::BIGINT AS grp FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "dim_sparse",
+   "copy": "COPY (SELECT k * 100003 AS spk, (k % 3)::BIGINT AS sgrp FROM range(0, 997, 2) t(k)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "script": "tools/check/prepare_join_gate.py",
+   "files": [
+    "join-gate",
+    "join-gate-clean",
+    "join-gate-dim"
+   ]
+  }
+ ],
+ "cases": [
+  {
+   "id": "join:inner:comma:scalar",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q < 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q < 5"
+   }
+  },
+  {
+   "id": "join:inner:on:case",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(CASE WHEN d.kind LIKE 'kind1%' THEN f.amt ELSE 0 END) AS a, sum(f.amt) AS t FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.q >= 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(CASE WHEN d.kind LIKE 'kind1%' THEN f.amt ELSE 0 END) AS a, sum(f.amt) AS t FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.q >= 2"
+   }
+  },
+  {
+   "id": "join:inner:build-filter",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND grp = 3 AND q <> 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND grp = 3 AND q <> 1"
+   }
+  },
+  {
+   "id": "join:inner:build-only-unmatched",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE pk = fk AND w > 7000"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE pk = fk AND w > 7000"
+   }
+  },
+  {
+   "id": "join:group:dimension-attribute",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT grp, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY grp ORDER BY grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT grp, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY grp ORDER BY grp"
+   }
+  },
+  {
+   "id": "join:group:dimension-string",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n FROM '{fixture:fact}' JOIN '{fixture:dim}' ON fk = pk GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n FROM '{fixture:fact}' JOIN '{fixture:dim}' ON fk = pk GROUP BY kind ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:groupjoin:topk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, kind, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY fk, kind ORDER BY s DESC, fk LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, kind, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY fk, kind ORDER BY s DESC, fk LIMIT 7"
+   }
+  },
+  {
+   "id": "join:groupjoin:all",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(q) AS s, min(amt) AS lo, max(amt) AS hi FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q > 0 GROUP BY fk ORDER BY fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(q) AS s, min(amt) AS lo, max(amt) AS hi FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q > 0 GROUP BY fk ORDER BY fk"
+   }
+  },
+  {
+   "id": "join:groupjoin:build-arg",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(w) AS sw FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY fk ORDER BY sw DESC, fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(w) AS sw FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY fk ORDER BY sw DESC, fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:semi:in",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' WHERE q < 6 AND fk IN (SELECT pk FROM '{fixture:dim}' WHERE grp = 1)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' WHERE q < 6 AND fk IN (SELECT pk FROM '{fixture:dim}' WHERE grp = 1)"
+   }
+  },
+  {
+   "id": "join:semi:duplicate-build-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' WHERE fk IN (SELECT pk FROM '{fixture:dim_dup}' WHERE grp <> 2)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' WHERE fk IN (SELECT pk FROM '{fixture:dim_dup}' WHERE grp <> 2)"
+   }
+  },
+  {
+   "id": "join:inner:sparse-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sgrp, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim_sparse}' WHERE sfk = spk GROUP BY sgrp ORDER BY sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sgrp, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim_sparse}' WHERE sfk = spk GROUP BY sgrp ORDER BY sgrp"
+   }
+  },
+  {
+   "id": "join:refuse:duplicate-build-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}', '{fixture:dim_dup}' WHERE fk = pk"
+   ],
+   "axes": [
+    {}
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "twice: this build joins N:1 only"
+   }
+  },
+  {
+   "id": "join:decode-error:fk-gated",
+   "fixture": "join-gate",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "1024"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "64M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01'"
+   }
+  },
+  {
+   "id": "join:three-table:reduced-semi",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, sum(f.amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp > 1 AND x.spk = f.sfk AND x.sgrp = 1 GROUP BY f.fk ORDER BY s DESC, f.fk LIMIT 9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, sum(f.amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp > 1 AND x.spk = f.sfk AND x.sgrp = 1 GROUP BY f.fk ORDER BY s DESC, f.fk LIMIT 9"
+   }
+  },
+  {
+   "id": "join:three-table:group-by-dimension",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.kind, count(*) AS n, sum(f.amt) AS s FROM '{fixture:dim}' d, '{fixture:fact}' f, '{fixture:dim_sparse}' x WHERE d.pk = f.fk AND f.sfk = x.spk AND x.sgrp <> 2 GROUP BY d.kind ORDER BY d.kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.kind, count(*) AS n, sum(f.amt) AS s FROM '{fixture:dim}' d, '{fixture:fact}' f, '{fixture:dim_sparse}' x WHERE d.pk = f.fk AND f.sfk = x.spk AND x.sgrp <> 2 GROUP BY d.kind ORDER BY d.kind"
+   }
+  }
+ ]
+}

@@ -652,3 +652,39 @@ test "regression: a structured plan without text fragments answers a grouped DIS
     defer got.deinit(a);
     try std.testing.expectEqual(@as(usize, 40_000), got.aggregate.output.rowCount());
 }
+
+test "bound frontend: a resolved join travels with the worker plan" {
+    const syntax = @import("../core/expr/syntax.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const customer: syntax.Build = .{ .path = "customer.parquet", .key = "c_custkey", .filter = .{ .comparison = .{
+        .operand = .{ .column = "c_mktsegment" },
+        .op = .Eq,
+        .value = "'BUILDING'",
+    } } };
+    const query: syntax.Query = .{
+        .aggregate = true,
+        .join = .{
+            .kind = .inner,
+            .fk = "l_orderkey",
+            .build = .{
+                .path = "orders.parquet",
+                .key = "o_orderkey",
+                .columns = &.{ "o_orderdate", "o_shippriority" },
+                .semis = &.{.{ .fk = "o_custkey", .build = customer }},
+            },
+        },
+    };
+    const json = try std.json.Stringify.valueAlloc(a, query, .{});
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const back = try @import("fanout_plan.zig").decode(a, value);
+    const j = back.join.?;
+    try std.testing.expectEqualStrings("l_orderkey", j.fk);
+    try std.testing.expectEqualStrings("orders.parquet", j.build.path);
+    try std.testing.expectEqual(@as(usize, 2), j.build.columns.len);
+    try std.testing.expectEqualStrings("o_custkey", j.build.semis[0].fk);
+    try std.testing.expectEqualStrings("'BUILDING'", j.build.semis[0].build.filter.?.comparison.value);
+    // The bound source carries it to the engine, which reads the builds before anything binds.
+    try std.testing.expect(@import("syntax_plan.zig").source(&back).join != null);
+}

@@ -7,6 +7,7 @@ const filter_ast = @import("../core/filter/ast.zig");
 const consumer = @import("../core/consumer.zig");
 const scan_types = @import("../core/scan/types.zig");
 const Diag = @import("../core/diag.zig").Diag;
+const syntax = @import("../core/expr/syntax.zig");
 
 pub const Kind = enum { rows, scalar, grouped };
 pub const Aggregate = scan_types.BoundAggregate;
@@ -49,6 +50,9 @@ pub const Source = struct {
     kind: Kind,
     // Frontend extensions have their own binding errors; this stored callback preserves them unchanged.
     bind_fn: *const fn (*const anyopaque, std.mem.Allocator, *const schema.FileMetaData, ?*Diag, Options) anyerror!Query,
+    /// The query's join: the engine reads its builds and extends the probe's schema before anything binds
+    /// (`engine/join.zig`).
+    join: ?*const syntax.Join = null,
 };
 
 pub const Cache = struct {

@@ -591,7 +591,10 @@ fn executeSql(
     sql: []const u8,
     diag: *Diag,
 ) ![]u8 {
-    const pq = try zpq.core.expr.sql_parser.parseSqlPlan(arena, sql);
+    var schemas: engine.join.LocalSchemas = .{ .arena = arena };
+    const parser = zpq.core.expr.sql_parser;
+    const pq = (try parser.parseSqlJoinPlan(arena, sql, .{ .ctx = &schemas, .footer = engine.join.LocalSchemas.footer })) orelse
+        try parser.parseSqlPlan(arena, sql);
     const inputs = try zpq.frontend.expandGlob(arena, io, pq.table_name, env);
     if (inputs.len == 0) {
         zpq.frontend.noSqlMatches(pq.table_name);

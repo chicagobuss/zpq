@@ -7,6 +7,7 @@ const engine_rank = @import("rank.zig");
 const engine_write_window = @import("write_window.zig");
 const engine_projection = @import("projection.zig");
 const engine_input = @import("input.zig");
+const engine_join = @import("join.zig");
 const engine_write = @import("write.zig");
 const engine_env = @import("env.zig");
 const engine_print = @import("print.zig");
@@ -265,16 +266,24 @@ fn executeAggregate(
 fn executeAggregateOver(
     ctx: Context,
     arena: std.mem.Allocator,
-    args: QueryArgs,
+    args_in: QueryArgs,
     agg_str: []const u8,
     comptime explain: bool,
     changed: *bool,
 ) !if (explain) AggregateExplanation else AggResult {
-    const empty_result = args.empty_scalar or args.result_order.limit == 0;
+    const empty_result = args_in.empty_scalar or args_in.result_order.limit == 0;
     var t: Timings = .{};
     // The query's ledger: what the scan's tables, decode memory, merge and answer hold together stays under it.
-    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
-    defer if (args.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
+    var ledger: core_memory.SharedBudget = .{ .limit = args_in.max_memory };
+    defer if (args_in.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args_in.max_memory);
+    // A join reads its builds first, on this ledger; the probe binds against footers given the build columns.
+    var args = args_in;
+    const joined = try engine_join.prepare(ctx.gpa, arena, args_in, &ledger);
+    defer if (joined) |j| j.release();
+    if (joined) |j| {
+        args.plan_source = j.source(args_in.plan_source.?);
+        args.join = j;
+    }
 
     // 1. Open all inputs — local mmap or s3 parallel range-fetch.
     //    This step already does column pruning for s3 (parses the
@@ -315,7 +324,7 @@ fn executeAggregateOver(
         !empty_result and allLocal(opened))
         if (sketchFromEnv(ctx.env)) |cfg| steer: {
             // A footer that does not parse is reported where the scan parses it; it steers nothing here.
-            const m = materializeMetas(arena, opened, null, prof) catch break :steer;
+            const m = joinedMetas(arena, opened, args, null, prof) catch break :steer;
             steer_metas = m;
             const meta0 = m[0];
             var probe_args: scan.MultiAggArgs = .{
@@ -343,7 +352,7 @@ fn executeAggregateOver(
     const metas: ?[]const schema.FileMetaData = if (explain or empty_result or opened.has_preparsed_meta or plan_io or
         steer_metas != null or args.row_groups != null or args.plan_source != null)
     blk: {
-        const m = steer_metas orelse try materializeMetas(arena, opened, args.diag, prof);
+        const m = steer_metas orelse try joinedMetas(arena, opened, args, args.diag, prof);
         const filter: ?filter_ast.Filter = if (try args.boundAggregate(arena, &m[0])) |bound| bound.filter else if (args.filter) |fs|
             (if (fs.len > 0) try bindFilter(arena, fs, &m[0], args) else null)
         else
@@ -436,6 +445,14 @@ fn executeAggregateOver(
         scan_args.metas = empty_metas;
     }
     var r = try scan.runMultiAggregate(ctx.gpa, arena, scan_args);
+    if (args.join) |j| if (try j.takeRows(ctx.gpa)) |rows| {
+        // The group-join's answer stands in for the empty one the group tables gave (`GroupJoin.rows`).
+        if (r.output.group_rows) |old| {
+            for (old) |row| r.output.releaseRow(ctx.gpa, row);
+            ctx.gpa.free(old);
+        }
+        r.output.group_rows = rows;
+    };
     // Known once the reader has started, which the scan does once it has planned.
     if (reader) |rd| {
         const b = rd.backends();
@@ -513,6 +530,21 @@ fn executeAggregateOver(
 }
 
 // Keep this setup in its caller, as before extraction, so the scan's options need no outlined argument handoff.
+/// The inputs' footers; under a join, with the build columns appended as virtual leaves (`engine/join.zig`).
+fn joinedMetas(
+    arena: std.mem.Allocator,
+    opened: engine_input.OpenedInputs,
+    args: QueryArgs,
+    diag: ?*Diag,
+    prof: ?*profile.Thread,
+) ![]const schema.FileMetaData {
+    const m = try materializeMetas(arena, opened, diag, prof);
+    const j = args.join orelse return m;
+    const out = try arena.dupe(schema.FileMetaData, m);
+    for (out) |*meta| try j.extend(arena, meta);
+    return out;
+}
+
 inline fn aggregateScanArgs(
     ctx: Context,
     args: QueryArgs,

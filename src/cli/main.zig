@@ -532,7 +532,11 @@ fn runQuery(
         if (comptime build_options.enable_sql) {
             if (machine_diagnostics) zpq.core.expr.sql_parser.diagnostic_fn = captureSqlDiagnostic;
             defer zpq.core.expr.sql_parser.diagnostic_fn = null;
-            const pq = try zpq.core.expr.sql_parser.parseSqlPlan(arena, q_str);
+            // A two-table join binds its column names against both footers; the engine reads the build.
+            var schemas: engine.join.LocalSchemas = .{ .arena = arena };
+            const sql = zpq.core.expr.sql_parser;
+            const pq = (try sql.parseSqlJoinPlan(arena, q_str, .{ .ctx = &schemas, .footer = engine.join.LocalSchemas.footer })) orelse
+                try sql.parseSqlPlan(arena, q_str);
             plan_source = engine.syntax_plan.source(pq.syntax.?);
             filter = pq.filter_str;
             select = pq.select_str;

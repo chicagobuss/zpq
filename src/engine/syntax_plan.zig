@@ -13,7 +13,12 @@ const projection = @import("projection.zig");
 const Diag = @import("../core/diag.zig").Diag;
 
 pub fn source(query: *const syntax.Query) plans.Source {
-    return .{ .context = query, .kind = if (!query.aggregate) .rows else if (query.keys != null) .grouped else .scalar, .bind_fn = bind };
+    return .{
+        .context = query,
+        .kind = if (!query.aggregate) .rows else if (query.keys != null) .grouped else .scalar,
+        .bind_fn = bind,
+        .join = if (query.join) |*j| j else null,
+    };
 }
 
 fn columns(arena: std.mem.Allocator, specs: []const syntax.Column, meta: *const schema.FileMetaData, diag: ?*Diag) ![]expr.SelectColumn {

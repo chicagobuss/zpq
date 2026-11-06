@@ -4,6 +4,9 @@ const ast = @import("ast.zig");
 const syntax = @import("syntax.zig");
 const Lower = @import("sql_lower.zig").Lower;
 const literals = @import("sql_literals.zig");
+const sql_join = @import("sql_join.zig");
+const schema = @import("../schema.zig");
+const metadata = @import("../parquet/metadata.zig");
 
 // CLI machine diagnostics use the same parser messages without mixing prose into JSON stderr.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
@@ -620,6 +623,70 @@ pub fn parseSqlQuery(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery
 }
 
 /// Production SQL carries owned syntax to the schema binder; legacy fragment strings remain a compatibility API.
+/// What the frontend asks of the files a join names: their footers, read however the caller reads files.
+pub const Schemas = struct {
+    ctx: *const anyopaque,
+    footer: *const fn (ctx: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData,
+};
+
+/// A two-table N:1 join (`sql_join.zig`): the probe side's single-table query, with the resolved join on its syntax
+/// (`syntax.Query.join`). Null when `sql` is no join. `allocator` must be an arena: the probe's and every build's
+/// syntax outlive the call. The footers decide only which table owns a column and which side probes.
+pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: Schemas) !?ParsedQuery {
+    const z = try allocator.dupeSentinel(u8, sql, 0);
+    const paths = (try sql_join.tables(allocator, z)) orelse return null;
+    const first = try resolveJoin(allocator, z, paths, schemas);
+    // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself.
+    var probe_sql = first.probe_sql;
+    var semis: std.ArrayList(syntax.Semi) = .empty;
+    while (true) {
+        const pz = try allocator.dupeSentinel(u8, probe_sql, 0);
+        const inner = (try sql_join.tables(allocator, pz)) orelse break;
+        const r = try resolveJoin(allocator, pz, inner, schemas);
+        try semis.append(allocator, .{ .fk = r.fk, .build = r.build });
+        probe_sql = r.probe_sql;
+    }
+    var pq = try parseSqlPlan(allocator, probe_sql);
+    const q = try allocator.create(syntax.Query);
+    q.* = pq.syntax.?.*;
+    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .semis = semis.items };
+    pq.syntax = q;
+    return pq;
+}
+
+const Resolved = struct { kind: syntax.JoinKind, fk: []const u8, build: syntax.Build, probe_sql: []const u8 };
+
+const Owners = struct {
+    metas: []const *const schema.FileMetaData,
+    fn has(raw: *const anyopaque, table: usize, name: []const u8) bool {
+        const self: *const Owners = @ptrCast(@alignCast(raw));
+        _ = metadata.resolveColumn(self.metas[table], name) catch return false;
+        return true;
+    }
+};
+
+fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas) !Resolved {
+    const metas = try a.alloc(*const schema.FileMetaData, paths.len);
+    const rows = try a.alloc(u64, paths.len);
+    for (paths, metas, rows) |path, *m, *r| {
+        m.* = try schemas.footer(schemas.ctx, path);
+        r.* = @intCast(m.*.num_rows);
+    }
+    const owners: Owners = .{ .metas = metas };
+    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners });
+    var build: syntax.Build = .{ .path = p.build_path, .key = p.build_key, .columns = p.build_columns };
+    if (p.build_where) |w| {
+        const text = try std.fmt.allocPrintSentinel(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ p.build_path, w }, 0);
+        if (try sql_join.tables(a, text)) |inner| {
+            // The build's own filter is a SEMI join: a third table the binder reduced onto it.
+            const nested = try resolveJoin(a, text, inner, schemas);
+            build.semis = try a.dupe(syntax.Semi, &.{.{ .fk = nested.fk, .build = nested.build }});
+            build.filter = (try parseSqlPlan(a, nested.probe_sql)).syntax.?.filter;
+        } else build.filter = (try parseSqlPlan(a, text)).syntax.?.filter;
+    }
+    return .{ .kind = if (p.kind == .semi) .semi else .inner, .fk = p.fk, .build = build, .probe_sql = p.probe_sql };
+}
+
 pub fn parseSqlPlan(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
     return parseSql(true, allocator, sql);
 }

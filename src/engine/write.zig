@@ -21,6 +21,7 @@ const expr_ast = @import("../core/expr/ast.zig");
 const membership = @import("../core/filter/membership.zig");
 const nanprobe = @import("../core/filter/nanprobe.zig");
 const encoder = @import("../core/writer/encoder.zig");
+const EncodeScratch = @import("../core/consumer/encode_scratch.zig").EncodeScratch;
 const streaming = @import("../core/writer/streaming.zig");
 const fastpath = @import("../core/writer/fastpath.zig");
 const page_index = @import("../core/writer/page_index.zig");
@@ -807,6 +808,13 @@ const WriteRows = struct {
                 w.piece_pages.child = w.outAlloc();
                 w.slicing_pages.child = slicing.allocator();
                 w.lean_pages.child = lean.allocator();
+                var encode_scratch: EncodeScratch = .{
+                    .io = self.ctx.io,
+                    .ledger = ledger,
+                    .limit = @intCast(sizing.unit * sizing.units),
+                };
+                defer encode_scratch.deinit();
+                w.encode_pages.child = encode_scratch.allocator();
                 const re_span = profile.Span.begin(self.prof);
                 defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
                 try runWindowedReencode(&w, effective_async_budget);

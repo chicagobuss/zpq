@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Typed literals and constant folding in SQL.** `DATE '1998-09-02'`, `TIMESTAMP '..'`, `CAST('..' AS date | timestamp |
+  decimal)`, `'..'::DATE`, `DATE '1998-12-01' - INTERVAL '90' DAY` and constant arithmetic such as `.06 - 0.01` now fold at
+  parse time into the literal a filter already takes, so row-group pruning is as before. TPC-H Q1 and Q6 in standard
+  SQL (DuckDB's text and the specification's) run and match DuckDB. A typed literal against a column of another kind, an
+  INTERVAL anywhere else and a fraction of a whole-number unit are refused by name, never answered.
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan

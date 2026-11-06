@@ -44,6 +44,9 @@ pub const Error = error{
     ModuloNotSupported,
     /// Arithmetic where a predicate compares a column (`x + 1 > 5`): the left side must be a column.
     ExpressionInPredicate,
+    /// A typed DATE, TIMESTAMP or DECIMAL literal against a column of another kind (`DATE '2024-01-01'` against text):
+    /// DuckDB casts the column, not the literal, and zpq has no such cast.
+    TypedLiteralColumn,
 } || std.mem.Allocator.Error;
 
 /// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
@@ -760,6 +763,70 @@ pub fn integerDays(elem: *const schema.SchemaElement) bool {
     return lt == .INTEGER and lt.INTEGER.bitWidth <= @as(i8, if (lt.INTEGER.isSigned) 32 else 16);
 }
 
+/// A literal the SQL front end typed (`DATE '1998-09-02'`, `TIMESTAMP '1998-09-02 10:00:00'`, `DECIMAL '0.06'`): the
+/// kind and the text between its quotes, already canonical (microsecond timestamps, decimals at their scale).
+pub const TypedLiteral = struct { kind: enum { date, timestamp, decimal }, text: []const u8 };
+
+pub fn typedLiteral(val_str: []const u8) ?TypedLiteral {
+    inline for (.{ .{ "DATE ", .date }, .{ "TIMESTAMP ", .timestamp }, .{ "DECIMAL ", .decimal } }) |t| {
+        if (val_str.len > t[0].len + 1 and std.mem.startsWith(u8, val_str, t[0]) and val_str[t[0].len] == '\'' and
+            val_str[val_str.len - 1] == '\'')
+            return .{ .kind = t[1], .text = val_str[t[0].len + 1 .. val_str.len - 1] };
+    }
+    return null;
+}
+
+/// A typed literal compares in its own type, as DuckDB casts the narrower side up: a DATE column against a TIMESTAMP
+/// keeps the time of day (the untyped string would drop it), a DATE literal against a TIMESTAMP column is midnight.
+/// Against a column of no such kind (text, a boolean, a number for a date) there is no cast to make, so it refuses.
+fn buildTypedLiteralComparison(
+    arena: std.mem.Allocator,
+    file: *const schema.FileMetaData,
+    operand: Operand,
+    op: ast.Operator,
+    t: TypedLiteral,
+    diag: ?*Diag,
+) Error!ast.Filter {
+    const elem = &operand.elem;
+    const refuse = struct {
+        fn go(d: ?*Diag, e: *const schema.SchemaElement) Error {
+            Diag.setColumn(d, e.name);
+            return error.TypedLiteralColumn;
+        }
+    }.go;
+    if (operand.make_date) {
+        if (t.kind == .decimal) return refuse(diag, elem);
+        const lit = try parseDateTimeNs(t.text);
+        const lane: Lane = if (schema.isUnsignedInt(elem.*)) .uint64 else .int32;
+        const inexact = lit.sub_ns or @mod(lit.ns, ns_per_day) != 0;
+        return markStored(bindExact(operand.col_idx, op, lane, @divFloor(lit.ns, ns_per_day), inexact));
+    }
+    if (t.kind == .decimal) {
+        const numeric = decimal_mod.kindFromSchema(elem) != null or (temporalKind(elem) == null and !schema.isFloat16(elem.*) and
+            (elem.type == .INT32 or elem.type == .INT64 or elem.type == .FLOAT or elem.type == .DOUBLE));
+        if (!numeric) return refuse(diag, elem);
+        // `n < CAST(24.0 AS DECIMAL(5,1))`: a whole number written with a scale is that integer for an integer column.
+        const whole = if (decimal_mod.kindFromSchema(elem) == null and std.mem.indexOfScalar(u8, t.text, '.') != null)
+            wholeNumberText(t.text)
+        else
+            t.text;
+        return buildTypedComparison(arena, file, operand.col_idx, elem, op, whole, diag);
+    }
+    const tk = temporalKind(elem) orelse return refuse(diag, elem);
+    if (tk.literal != .date_time) return refuse(diag, elem);
+    if (elem.type == .INT96) return .{ .decimal = try int96Leaf(operand.col_idx, op, t.text) };
+    const lit = try parseDateTimeNs(t.text);
+    const inexact = lit.sub_ns or @mod(lit.ns, tk.ns_per_tick) != 0;
+    return markStored(bindExact(operand.col_idx, op, tk.lane, @divFloor(lit.ns, tk.ns_per_tick), inexact));
+}
+
+/// `24.00` as `24`, `-7.0` as `-7`; a value with a nonzero fraction, or no point, is returned as it is.
+fn wholeNumberText(text: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse return text;
+    for (text[dot + 1 ..]) |ch| if (ch != '0') return text;
+    return text[0..dot];
+}
+
 pub fn buildOperandComparison(
     arena: std.mem.Allocator,
     file: *const schema.FileMetaData,
@@ -768,6 +835,7 @@ pub fn buildOperandComparison(
     val_str: []const u8,
     diag: ?*Diag,
 ) Error!ast.Filter {
+    if (typedLiteral(val_str)) |t| return buildTypedLiteralComparison(arena, file, operand, op, t, diag);
     if (!operand.make_date) return buildTypedComparison(arena, file, operand.col_idx, &operand.elem, op, val_str, diag);
     // DuckDB casts the literal to the DATE's type, so a time of day is dropped, not compared: `make_date(x) =
     // '2013-07-01 12:00'` holds on that day.
@@ -1076,12 +1144,12 @@ fn pow10Wide(n: u32) i256 {
 
 /// A literal as whole nanoseconds; `sub_ns` means a nonzero fraction digit past the ninth put it strictly between
 /// `ns` and `ns + 1`.
-const ExactNs = struct { ns: i128, sub_ns: bool };
+pub const ExactNs = struct { ns: i128, sub_ns: bool };
 
 /// Days since 1970-01-01 for a proleptic-Gregorian (y, m, d). Howard
 /// Hinnant's days_from_civil — std has no civil-date conversion, and we
 /// need bit-exact epoch days to match DuckDB/Spark-written DATE columns.
-fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
+pub fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
     const y = y_in - @as(i64, @intFromBool(m <= 2));
     const era = @divFloor(if (y >= 0) y else y - 399, 400);
     const yoe = y - era * 400; // [0, 399]
@@ -1117,7 +1185,7 @@ fn parseDateDays(s: []const u8) Error!i64 {
 }
 
 /// `YYYY-MM-DD[( |T)HH:MM:SS[.fraction]]` → nanoseconds since the epoch; no time part means midnight.
-fn parseDateTimeNs(s: []const u8) Error!ExactNs {
+pub fn parseDateTimeNs(s: []const u8) Error!ExactNs {
     const sep = std.mem.indexOfAny(u8, s, " T");
     const days = try parseDateDays(if (sep) |i| s[0..i] else s);
     const tod: ExactNs = if (sep) |i| try parseTimeOfDayNs(s[i + 1 ..]) else .{ .ns = 0, .sub_ns = false };

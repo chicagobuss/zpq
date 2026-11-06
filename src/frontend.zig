@@ -242,6 +242,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.BadOperator => diagnosticPrint("zpq query: invalid operator in filter\n", .{}),
         error.BadValue => diagnosticPrint("zpq query: invalid value in filter\n", .{}),
+        error.TypedLiteralColumn => diagnosticPrint(
+            "zpq query: a DATE, TIMESTAMP or DECIMAL literal compares with a column of its own kind, and `{s}` is not one\n",
+            .{diag.column.get()},
+        ),
         error.UnsupportedType => diagnosticPrint("zpq query: unsupported type in filter\n", .{}),
         error.BloomFilterUnsupportedColumn => diagnosticPrint(
             "zpq query: --bloom-filter cannot apply to `{s}`: BOOLEAN, INT96, nested\n" ++

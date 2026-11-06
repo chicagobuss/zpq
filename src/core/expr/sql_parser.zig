@@ -3,6 +3,7 @@ const c = @import("liteparser_c");
 const ast = @import("ast.zig");
 const syntax = @import("syntax.zig");
 const Lower = @import("sql_lower.zig").Lower;
+const literals = @import("sql_literals.zig");
 
 // CLI machine diagnostics use the same parser messages without mixing prose into JSON stderr.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
@@ -525,7 +526,13 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    const sql_c = try extractAsDatePart(allocator, sql);
+    var literal_report: literals.Report = .{};
+    const folded_sql = literals.rewrite(allocator, sql, &literal_report) catch |err| {
+        if (literal_report.len > 0) diagnosticPrint("sql: {s}\n", .{literal_report.text()});
+        return err;
+    };
+    defer allocator.free(folded_sql);
+    const sql_c = try extractAsDatePart(allocator, folded_sql);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses

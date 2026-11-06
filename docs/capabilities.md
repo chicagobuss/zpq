@@ -17,7 +17,14 @@ before any bytes are fetched. Keywords and parentheses inside a quoted literal a
 doubled (`'O''Reilly'`), and an unterminated quote is an error. NOT is three-valued: a row whose operand is NULL
 passes neither `p` nor `NOT p`. DATE / TIME / TIMESTAMP columns take quoted literals
 (`'2024-01-01'`, `'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is
-not rounded to it.
+not rounded to it. In SQL a literal may be typed and a constant folded: `DATE '1998-09-02'`, `TIMESTAMP '1998-09-02
+10:00:00'`, `CAST('1998-09-02' AS date)`, `'1998-09-02'::DATE`, `CAST('0.055' AS DECIMAL(15,2))` (0.06: ties round away
+from zero, as in DuckDB), `DATE '1998-12-01' - INTERVAL '90' DAY` (DuckDB adds an interval to a DATE as a TIMESTAMP,
+the months first with the day clamped to the month's length), `.06 - 0.01`, `24 + 1`. A typed literal compares with a
+column of its own kind: DATE and TIMESTAMP with DATE and TIMESTAMP columns (a TIMESTAMP against a DATE keeps its time of
+day, as DuckDB compares them as TIMESTAMPs), DECIMAL with a numeric column. Against any other column it is refused
+(`TypedLiteralColumn`), as is an INTERVAL anywhere but added to or subtracted from a DATE or TIMESTAMP literal, a
+fraction of a whole-number unit, a cast to another type, and `/` or `%` in a constant.
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 

@@ -6,6 +6,7 @@ const parser = @import("parser.zig");
 const filters = @import("../filter/parser.zig");
 const filter = @import("../filter/ast.zig");
 const metadata = @import("../parquet/metadata.zig");
+const lits = @import("sql_literals.zig");
 const Error = parser.Error || error{ SqlParseError, UnparseError };
 
 pub const Lower = struct {
@@ -119,20 +120,149 @@ pub const Lower = struct {
         return error.ExpressionInPredicate;
     }
 
-    /// Only a standalone literal is spelled for the shared exact/temporal value converters; no query is rebuilt.
+    /// Only a standalone literal is spelled for the shared exact/temporal value converters; no query is rebuilt. A
+    /// constant (`CAST('1998-09-02' AS date)`, `0.06 - 0.01`) is folded to the literal it equals first, a typed one
+    /// spelled `DATE '..'` so the filter binder compares it with the column's own kind.
     fn literal(self: *Lower, node: *const c.LpNode) ![]const u8 {
         switch (node.kind) {
             c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_NULL, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_BOOL => {},
             c.LP_EXPR_UNARY_OP => {
                 if (node.u.unary.op != c.LP_UOP_MINUS and node.u.unary.op != c.LP_UOP_PLUS) return error.BadValue;
                 const value: *const c.LpNode = node.u.unary.operand orelse return error.BadValue;
-                if (value.kind != c.LP_EXPR_LITERAL_INT and value.kind != c.LP_EXPR_LITERAL_FLOAT) return error.BadValue;
+                if (value.kind != c.LP_EXPR_LITERAL_INT and value.kind != c.LP_EXPR_LITERAL_FLOAT) return self.folded(node);
             },
+            c.LP_EXPR_BINARY_OP, c.LP_EXPR_CAST => return self.folded(node),
             else => return error.BadValue,
         }
         const value = c.lp_ast_to_sql(@constCast(node), self.lp_arena);
         if (value == null) return error.UnparseError;
         return self.copy(std.mem.span(value));
+    }
+
+    /// A constant tree's value. Integers keep DuckDB's width (INTEGER, BIGINT) so an overflow DuckDB would raise is
+    /// refused here, not folded to a value; a number with a fraction is an exact decimal; `/` is DOUBLE there and `%`
+    /// is no operator here, so both refuse.
+    const Const = union(enum) {
+        int: struct { v: i128, wide: bool },
+        dec: lits.Dec,
+        text: []const u8,
+        date: lits.Moment,
+        timestamp: lits.Moment,
+        /// `CAST(.. AS DECIMAL(p, s))`: the value at its scale.
+        typed_dec: lits.Dec,
+    };
+
+    fn number(c_: Const) ?lits.Dec {
+        return switch (c_) {
+            .int => |i| .{ .mant = i.v, .scale = 0 },
+            .dec => |d| d,
+            else => null,
+        };
+    }
+
+    fn constant(self: *Lower, node: *const c.LpNode) error{BadValue}!Const {
+        return switch (node.kind) {
+            c.LP_EXPR_LITERAL_INT => blk: {
+                const token = std.mem.span(node.u.literal.value);
+                const v = std.fmt.parseInt(i64, token, 10) catch break :blk .{ .dec = lits.Dec.parse(token, false) orelse return error.BadValue };
+                break :blk .{ .int = .{ .v = v, .wide = v > std.math.maxInt(i32) or v < std.math.minInt(i32) } };
+            },
+            c.LP_EXPR_LITERAL_FLOAT => .{ .dec = lits.Dec.parse(std.mem.span(node.u.literal.value), false) orelse return error.BadValue },
+            c.LP_EXPR_LITERAL_STRING => .{ .text = std.mem.span(node.u.literal.value) },
+            c.LP_EXPR_UNARY_OP => blk: {
+                const inner = try self.constant(node.u.unary.operand orelse return error.BadValue);
+                const negate = switch (node.u.unary.op) {
+                    c.LP_UOP_MINUS => true,
+                    c.LP_UOP_PLUS => false,
+                    else => return error.BadValue,
+                };
+                if (!negate) break :blk inner;
+                break :blk switch (inner) {
+                    .int => |i| .{ .int = .{ .v = -i.v, .wide = i.wide } },
+                    .dec => |d| .{ .dec = .{ .mant = -d.mant, .scale = d.scale } },
+                    else => return error.BadValue,
+                };
+            },
+            c.LP_EXPR_BINARY_OP => blk: {
+                const op = node.u.binary.op;
+                if (op != c.LP_OP_ADD and op != c.LP_OP_SUB and op != c.LP_OP_MUL) return error.BadValue;
+                const l = try self.constant(node.u.binary.left orelse return error.BadValue);
+                const r = try self.constant(node.u.binary.right orelse return error.BadValue);
+                if (l == .int and r == .int) {
+                    const v = switch (op) {
+                        c.LP_OP_ADD => l.int.v + r.int.v,
+                        c.LP_OP_SUB => l.int.v - r.int.v,
+                        else => l.int.v * r.int.v,
+                    };
+                    const wide = l.int.wide or r.int.wide;
+                    // The result type is the wider operand's: past it DuckDB raises an overflow error.
+                    if (wide) {
+                        if (v > std.math.maxInt(i64) or v < std.math.minInt(i64)) return error.BadValue;
+                    } else if (v > std.math.maxInt(i32) or v < std.math.minInt(i32)) return error.BadValue;
+                    break :blk .{ .int = .{ .v = v, .wide = wide } };
+                }
+                const a = number(l) orelse return error.BadValue;
+                const b = number(r) orelse return error.BadValue;
+                break :blk .{ .dec = (switch (op) {
+                    c.LP_OP_ADD => a.add(b),
+                    c.LP_OP_SUB => a.sub(b),
+                    else => a.mul(b),
+                }) orelse return error.BadValue };
+            },
+            c.LP_EXPR_CAST => self.castConstant(node),
+            else => error.BadValue,
+        };
+    }
+
+    fn castConstant(self: *Lower, node: *const c.LpNode) error{BadValue}!Const {
+        const child = try self.constant(node.u.cast.expr orelse return error.BadValue);
+        const type_text = std.mem.trim(u8, std.mem.span(node.u.cast.type_name orelse return error.BadValue), " ");
+        const open = std.mem.indexOfScalar(u8, type_text, '(');
+        const base = std.mem.trim(u8, type_text[0 .. open orelse type_text.len], " ");
+        if (std.ascii.eqlIgnoreCase(base, "date") or std.ascii.eqlIgnoreCase(base, "timestamp")) {
+            if (open != null) return error.BadValue;
+            const is_date = std.ascii.eqlIgnoreCase(base, "date");
+            const at: lits.Moment = switch (child) {
+                .text => |t| lits.parseMoment(t, is_date) catch return error.BadValue,
+                .date, .timestamp => |m| .{ .days = m.days, .micros = if (is_date) 0 else m.micros },
+                else => return error.BadValue,
+            };
+            return if (is_date) .{ .date = at } else .{ .timestamp = at };
+        }
+        const is_dec = std.ascii.eqlIgnoreCase(base, "decimal") or std.ascii.eqlIgnoreCase(base, "numeric") or std.ascii.eqlIgnoreCase(base, "dec");
+        if (!is_dec) return error.BadValue;
+        var precision: u32 = 18;
+        var scale: u32 = 3;
+        if (open) |o| {
+            const close = std.mem.indexOfScalar(u8, type_text, ')') orelse return error.BadValue;
+            var it = std.mem.splitScalar(u8, type_text[o + 1 .. close], ',');
+            precision = std.fmt.parseInt(u32, std.mem.trim(u8, it.next() orelse return error.BadValue, " "), 10) catch return error.BadValue;
+            scale = if (it.next()) |sc| std.fmt.parseInt(u32, std.mem.trim(u8, sc, " "), 10) catch return error.BadValue else 0;
+            if (it.next() != null) return error.BadValue;
+        }
+        if (precision < 1 or precision > lits.Dec.max_digits or scale > precision) return error.BadValue;
+        // A string takes an exponent; a bare literal with one is a DOUBLE in DuckDB, and no exact decimal.
+        const source = switch (child) {
+            .text => |t| lits.Dec.parse(t, true) orelse return error.BadValue,
+            else => number(child) orelse return error.BadValue,
+        };
+        const at_scale = source.rescale(scale) orelse return error.BadValue;
+        if (at_scale.digits() > precision) return error.BadValue;
+        return .{ .typed_dec = at_scale };
+    }
+
+    fn folded(self: *Lower, node: *const c.LpNode) ![]const u8 {
+        return switch (try self.constant(node)) {
+            .int => |i| std.fmt.allocPrint(self.arena, "{d}", .{i.v}),
+            .dec => |d| d.format(self.arena),
+            .typed_dec => |d| blk: {
+                const text = try d.format(self.arena);
+                break :blk std.fmt.allocPrint(self.arena, "DECIMAL '{s}'", .{text});
+            },
+            .date => |m| std.fmt.allocPrint(self.arena, "DATE '{s}'", .{try lits.formatDate(self.arena, m.days)}),
+            .timestamp => |m| std.fmt.allocPrint(self.arena, "TIMESTAMP '{s}'", .{try lits.formatTimestamp(self.arena, m)}),
+            .text => error.BadValue,
+        };
     }
 
     pub fn predicate(self: *Lower, node: *const c.LpNode, depth: u32) Error!syntax.Predicate {
@@ -158,7 +288,9 @@ pub const Lower = struct {
                 }
                 if (b.op == c.LP_OP_LIKE) {
                     if (b.escape != null) return error.BadValue;
-                    break :blk .{ .like = .{ .column = try self.name(left), .pattern = try self.literal(right), .negate = false } };
+                    const pattern = try self.literal(right);
+                    if (filters.typedLiteral(pattern) != null) return error.BadValue;
+                    break :blk .{ .like = .{ .column = try self.name(left), .pattern = pattern, .negate = false } };
                 }
                 const op: filter.Operator = switch (b.op) {
                     c.LP_OP_EQ => .Eq,

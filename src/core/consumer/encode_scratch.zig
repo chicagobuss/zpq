@@ -6,13 +6,14 @@ const memory = @import("../memory.zig");
 /// Its limit is the write window's byte credit, not a second allowance outside the query's ledger.
 pub const EncodeScratch = struct {
     io: std.Io,
+    /// Allocation and release can overlap on different workers.
     child: std.mem.Allocator = std.heap.page_allocator,
     ledger: *memory.SharedBudget,
     limit: usize,
     mutex: std.Io.Mutex = .init,
     idle: ?*Node = null,
-    retained: usize = 0,
-    /// Idle mappings plus the excess capacity still charged while a job borrows a larger mapping.
+    retained: usize = 0, // Bytes on the idle list, for observability and bulk retirement.
+    /// Idle mappings, retiring mappings, and excess capacity still charged while a job borrows a larger mapping.
     held: usize = 0,
     live: usize = 0,
     paused: bool = false,
@@ -31,33 +32,53 @@ pub const EncodeScratch = struct {
 
     pub fn deinit(self: *EncodeScratch) void {
         std.debug.assert(self.live == 0);
-        self.dropIdle();
+        self.trimIdle();
         std.debug.assert(self.held == 0);
     }
 
     pub fn trimIdle(self: *EncodeScratch) void {
+        _ = self.trimIdleBytes();
+    }
+
+    pub fn trimIdleBytes(self: *EncodeScratch) usize {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        self.dropIdle();
+        const retired = self.detachIdle();
+        self.mutex.unlock(self.io);
+        self.discard(retired);
+        return retired.bytes;
     }
 
     pub fn setPaused(self: *EncodeScratch, paused: bool) void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         self.paused = paused;
-        if (paused) self.dropIdle();
+        const retired: Retired = if (paused) self.detachIdle() else .{};
+        self.mutex.unlock(self.io);
+        self.discard(retired);
     }
 
-    fn dropIdle(self: *EncodeScratch) void {
-        while (self.idle) |node| {
-            self.idle = node.next;
+    const Retired = struct { head: ?*Node = null, bytes: usize = 0 };
+
+    /// Detaching prevents reuse; credit and window capacity stay held until the physical release completes.
+    fn detachIdle(self: *EncodeScratch) Retired {
+        const retired: Retired = .{ .head = self.idle, .bytes = self.retained };
+        self.idle = null;
+        self.retained = 0;
+        return retired;
+    }
+
+    fn discard(self: *EncodeScratch, retired: Retired) void {
+        if (retired.head == null) return;
+        var cursor = retired.head;
+        while (cursor) |node| {
+            cursor = node.next;
             const bytes = node.bytes;
             const alignment = node.alignment;
-            self.ledger.release(bytes.len);
-            self.held -= bytes.len;
             self.child.rawFree(bytes, alignment, @returnAddress());
         }
-        self.retained = 0;
+        self.ledger.release(retired.bytes);
+        self.mutex.lockUncancelable(self.io);
+        self.held -= retired.bytes;
+        self.mutex.unlock(self.io);
     }
 
     fn offset(alignment: std.mem.Alignment) usize {
@@ -78,7 +99,6 @@ pub const EncodeScratch = struct {
         const self: *EncodeScratch = @ptrCast(@alignCast(ctx));
         const size = allocationSize(len, alignment) orelse return null;
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         var link = &self.idle;
         var best: ?*?*Node = null;
         while (link.*) |node| {
@@ -99,9 +119,12 @@ pub const EncodeScratch = struct {
             self.held -= size;
             node.extra = node.bytes.len - size;
             self.live += 1;
+            self.mutex.unlock(self.io);
             return node.data;
         }
-        if (!self.paused and self.ledger.tight()) self.dropIdle();
+        const retired: Retired = if (!self.paused and self.ledger.tight()) self.detachIdle() else .{};
+        self.mutex.unlock(self.io);
+        self.discard(retired);
         const actual_alignment = alignment.max(.of(Node));
         const bytes = (self.child.rawAlloc(size, actual_alignment, ret) orelse return null)[0..size];
         const node: *Node = @ptrCast(@alignCast(bytes.ptr));
@@ -109,7 +132,9 @@ pub const EncodeScratch = struct {
         node.* = .{ .bytes = bytes, .alignment = actual_alignment, .data = data };
         const header: **Node = @ptrCast(@alignCast(data - @sizeOf(*Node)));
         header.* = node;
+        self.mutex.lockUncancelable(self.io);
         self.live += 1;
+        self.mutex.unlock(self.io);
         return data;
     }
 
@@ -128,25 +153,93 @@ pub const EncodeScratch = struct {
         const self: *EncodeScratch = @ptrCast(@alignCast(ctx));
         const node = owner(bytes.ptr);
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         self.live -= 1;
-        self.ledger.release(node.extra);
-        self.held -= node.extra;
-        node.extra = 0;
-        if (!self.paused and !self.ledger.tight() and node.bytes.len <= self.limit - self.held) {
-            if (self.ledger.drawExact(node.bytes.len) != null) {
+        const extra = node.extra;
+        const added = node.bytes.len - extra;
+        if (!self.paused and !self.ledger.tight() and node.bytes.len <= self.limit - (self.held - extra)) {
+            if (self.ledger.drawExact(added) != null) {
+                node.extra = 0;
                 node.next = self.idle;
                 self.idle = node;
                 self.retained += node.bytes.len;
-                self.held += node.bytes.len;
+                self.held += added;
+                self.mutex.unlock(self.io);
                 return;
             }
         }
         const allocation = node.bytes;
         const alignment = node.alignment;
+        self.mutex.unlock(self.io);
         self.child.rawFree(allocation, alignment, ret);
+        self.ledger.release(extra);
+        self.mutex.lockUncancelable(self.io);
+        self.held -= extra;
+        self.mutex.unlock(self.io);
     }
 };
+
+test "encode scratch releases mappings outside its mutex and keeps retiring capacity charged" {
+    const t = std.testing;
+    const Child = struct {
+        cache: *EncodeScratch = undefined,
+        credit: usize = 0,
+        failed: bool = false,
+
+        fn check(self: *@This()) void {
+            if (!self.cache.mutex.tryLock()) {
+                self.failed = true;
+                return;
+            }
+            defer self.cache.mutex.unlock(self.cache.io);
+            if (self.cache.ledger.used.load(.monotonic) < self.credit or self.cache.held < self.credit)
+                self.failed = true;
+        }
+
+        fn alloc(ptr: *anyopaque, n: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check();
+            return t.allocator.rawAlloc(n, alignment, ret);
+        }
+
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check();
+            t.allocator.rawFree(bytes, alignment, ret);
+        }
+    };
+    var ledger: memory.SharedBudget = .{ .limit = 1 << 20 };
+    var child: Child = .{};
+    var cache: EncodeScratch = .{
+        .io = t.io,
+        .child = .{ .ptr = &child, .vtable = &.{
+            .alloc = Child.alloc,
+            .free = Child.free,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+        } },
+        .ledger = &ledger,
+        .limit = ledger.limit,
+    };
+    child.cache = &cache;
+    defer cache.deinit();
+    const a = cache.allocator();
+    const idle = try a.alloc(u8, 4 * std.heap.pageSize());
+    a.free(idle);
+    child.credit = cache.retained;
+    try t.expectEqual(child.credit, cache.trimIdleBytes());
+    try t.expectEqual(@as(usize, 0), cache.held);
+    child.credit = 0;
+    const large = try a.alloc(u8, 4 * std.heap.pageSize());
+    a.free(large);
+    const borrowed = try a.alloc(u8, std.heap.pageSize());
+    child.credit = cache.held;
+    try t.expect(child.credit > 0);
+    cache.limit = 0;
+    a.free(borrowed);
+    try t.expect(!child.failed);
+    try t.expectEqual(@as(usize, 0), cache.held);
+    try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
 
 test "encode scratch reuses page nodes and charges every retained byte" {
     const t = std.testing;
@@ -327,6 +420,13 @@ test "encode scratch shares returned nodes without sharing live task storage" {
     defer cache.deinit();
     var failed: std.atomic.Value(bool) = .init(false);
     const Worker = struct {
+        fn trim(c: *EncodeScratch) void {
+            for (0..100) |_| {
+                c.setPaused(true);
+                c.setPaused(false);
+            }
+        }
+
         fn run(c: *EncodeScratch, bad: *std.atomic.Value(bool), value: u8) void {
             const a = c.allocator();
             for (0..100) |_| {
@@ -346,6 +446,7 @@ test "encode scratch shares returned nodes without sharing live task storage" {
     var group: std.Io.Group = .init;
     defer group.cancel(t.io);
     for (0..4) |i| try group.concurrent(t.io, Worker.run, .{ &cache, &failed, @as(u8, @intCast(i)) });
+    try group.concurrent(t.io, Worker.trim, .{&cache});
     try group.await(t.io);
     try t.expect(!failed.load(.monotonic));
     try t.expectEqual(@as(usize, 0), cache.live);

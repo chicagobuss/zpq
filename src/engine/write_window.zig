@@ -427,8 +427,15 @@ const Assembler = struct {
     fn start(a: *Assembler, job: *EncodeJob) !void {
         const w = a.w;
         const executor = w.executor.?;
+        var trimmed = false;
         while (a.pending.items.len > 1) {
-            const room = if (w.memory) |m| m.budget.available() >= job.charge else true;
+            var room = if (w.memory) |m| m.budget.available() >= job.charge else true;
+            // Idle encode pages are reclaimable credit, not a reason to drain a runnable group first.
+            if (!room and !trimmed) {
+                trimmed = true;
+                if (w.encode_scratch) |scratch| scratch.trimIdle();
+                room = if (w.memory) |m| m.budget.available() >= job.charge else true;
+            }
             if (executor.admits(a.pending.items.len, a.pending_bytes) and room) break;
             try a.writeFront();
         }
@@ -1084,11 +1091,15 @@ pub const WinCtx = struct {
     /// `err` was a refused draw from the query's ledger, by `regions` or the output: the row group may still be
     /// decoded a slice at a time, in the writer's turn.
     fn refused(w: *WinCtx, regions: *WorkRegions, err: anyerror) bool {
-        if (err != error.OutOfMemory or w.memory == null) return false;
-        const any = regions.rows.refused or regions.work.refused or w.memory.?.refused.load(.monotonic);
+        const any = w.budgetRefused(regions, err);
         regions.rows.refused = false;
         regions.work.refused = false;
         return any;
+    }
+
+    fn budgetRefused(w: *WinCtx, regions: *const WorkRegions, err: anyerror) bool {
+        if (err != error.OutOfMemory or w.memory == null) return false;
+        return regions.rows.refused or regions.work.refused or w.memory.?.refused.load(.monotonic);
     }
 };
 
@@ -1142,6 +1153,22 @@ fn winProducer(w: *WinCtx, i: usize) void {
 fn produceRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions, prof: ?*profile.Thread) !EncodedRG {
     const job = w.jobs[i];
     try job.arrive();
+    return produceReadyRG(w, i, ma, regions, prof) catch |err| {
+        if (w.budgetRefused(regions, err)) if (w.encode_scratch) |scratch| {
+            if (scratch.trimIdleBytes() > 0) {
+                // The failed attempt unwound its piece and arenas. Retry once with reclaimed credit, retaining the
+                // same fetched input until the writer/producer releases it, even when its columns cannot be sliced.
+                _ = w.refused(regions, err);
+                _ = w.slots[i].meta_arena.reset(.free_all);
+                return produceReadyRG(w, i, ma, regions, prof);
+            }
+        };
+        return err;
+    };
+}
+
+fn produceReadyRG(w: *WinCtx, i: usize, ma: std.mem.Allocator, regions: *WorkRegions, prof: ?*profile.Thread) !EncodedRG {
+    const job = w.jobs[i];
     // Fetch waits cannot hold the CPU turn an encode needs to release the fetch window.
     const executor = w.executor.?;
     executor.slots.waitUncancelable(w.io);
@@ -1800,6 +1827,124 @@ test "a byte-copied row group its ledger refuses holds nothing after" {
     try std.testing.expectEqual(@as(usize, 2), refused);
 }
 
+test "encode scratch pressure retries a non-sliceable producer without fetching its input twice" {
+    const t = std.testing;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/format_repeated_group.parquet", t.allocator);
+    defer t.allocator.free(bytes);
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const meta = try metadata.open(arena.allocator(), bytes);
+    const fetch = try arena.allocator().alloc(bool, meta.row_groups.items[0].columns.items.len);
+    @memset(fetch, true);
+    const Gate = struct {
+        arrivals: usize = 0,
+        fn wait(ptr: *anyopaque, _: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.arrivals += 1;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {}
+    };
+    var gate: Gate = .{};
+    const jobs = [_]RGJob{.{
+        .bytes = bytes,
+        .meta = &meta,
+        .rg = &meta.row_groups.items[0],
+        .passthrough = true,
+        .gate = .{ .ctx = &gate, .wait = Gate.wait, .done = Gate.done },
+    }};
+    try t.expect(!slicesWhole(jobs[0], fetch));
+    const expected = try copyRGToBuffer(t.allocator, arena.allocator(), jobs[0], null, null, &.{}, true);
+    defer t.allocator.free(expected.bytes);
+    const capacity = bytes.len * 4 + std.heap.pageSize();
+    var ledger: core_memory.SharedBudget = .{ .limit = capacity * 4 };
+    var memory: core_memory.Charged = .{ .child = t.allocator, .budget = &ledger };
+    var scratch: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = ledger.limit };
+    defer scratch.deinit();
+    const idle = try scratch.allocator().alloc(u8, capacity);
+    scratch.allocator().free(idle);
+    ledger.limit = scratch.retained + 1;
+    var slots = [_]Slot{.{ .meta_arena = .init(t.allocator) }};
+    defer slots[0].meta_arena.deinit();
+    var w: WinCtx = undefined;
+    w.gpa = t.allocator;
+    w.io = t.io;
+    w.jobs = &jobs;
+    w.slots = &slots;
+    w.memory = &memory;
+    w.encode_scratch = &scratch;
+    w.kept_set = null;
+    w.bloom_leaves = &.{};
+    w.dictionary_bloom = true;
+    var executor: EncodeExecutor = .{
+        .w = &w,
+        .queue = undefined,
+        .buffer = &.{},
+        .workers = 1,
+        .slots = .{ .permits = 1 },
+        .byte_limit = 0,
+    };
+    w.executor = &executor;
+    var regions = WorkRegions.init(t.allocator);
+    defer regions.deinit();
+    const out = try produceRG(&w, 0, slots[0].meta_arena.allocator(), &regions, null);
+    defer memory.allocator().free(out.bytes);
+    try t.expect(memory.refused.load(.monotonic));
+    try t.expectEqual(@as(usize, 0), scratch.retained);
+    try t.expectEqual(@as(usize, 1), gate.arrivals);
+    try t.expectEqualSlices(u8, expected.bytes, out.bytes);
+    try t.expect(ledger.peak.load(.monotonic) <= ledger.limit);
+}
+
+test "encode scratch pressure is reclaimed before admission drains an older job" {
+    const t = std.testing;
+    const page = std.heap.pageSize();
+    var ledger: core_memory.SharedBudget = .{ .limit = 16 * page };
+    var memory: core_memory.Charged = .{ .child = t.allocator, .budget = &ledger };
+    var scratch: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = ledger.limit };
+    defer scratch.deinit();
+    const idle = try scratch.allocator().alloc(u8, 4 * page);
+    scratch.allocator().free(idle);
+    var w: WinCtx = undefined;
+    w.gpa = t.allocator;
+    w.io = t.io;
+    w.memory = &memory;
+    w.encode_scratch = &scratch;
+    w.regions = &.{};
+    w.rg_target = .{};
+    w.out_elems = &.{};
+    w.writer_turns = 0;
+    var work: [1]EncodeExecutor.Work = undefined;
+    var executor: EncodeExecutor = .{
+        .w = &w,
+        .queue = .init(&work),
+        .buffer = &work,
+        .workers = 2,
+        .slots = .{ .permits = 2 },
+        .byte_limit = ledger.limit,
+    };
+    w.executor = &executor;
+    var asm_ = Assembler.init(&w);
+    defer asm_.deinit();
+    const older = try EncodeJob.create(&w, 1);
+    older.charge = ledger.limit - scratch.retained - 2 * page + 1;
+    older.reserved = @intCast(older.charge);
+    ledger.force(older.reserved);
+    older.err = error.DiskQuota;
+    older.done.store(true, .release);
+    try asm_.pending.append(t.allocator, older);
+    const next = try EncodeJob.create(&w, 1);
+    // No worker consumes this descriptor: mark it finished so cleanup also works on the regression's error path.
+    next.done.store(true, .release);
+    next.charge = 2 * page;
+    try asm_.pending.append(t.allocator, next);
+    asm_.pending_bytes = older.charge + next.charge;
+    try asm_.start(next);
+    try t.expectEqual(@as(usize, 2), asm_.pending.items.len);
+    try t.expectEqual(@as(usize, 0), scratch.retained);
+    try t.expectEqual(next, (try executor.queue.getOne(t.io)).begin);
+    try t.expect(ledger.peak.load(.monotonic) <= ledger.limit);
+}
+
 test "a deferred write row group slices on the write's ledger while it has room, else beside it on its own" {
     var write_ledger: core_memory.SharedBudget = .{ .limit = 1 << 30 };
     var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
@@ -1997,15 +2142,23 @@ test "shared encode turns clean up allocation failures with serial and parallel 
                 .codec = .UNCOMPRESSED,
             });
             var completions: std.Io.Semaphore = .{};
+            var scratch_ledger: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+            var scratch: EncodeScratch = .{
+                .io = std.testing.io,
+                .child = gpa,
+                .ledger = &scratch_ledger,
+                .limit = 1 << 20,
+            };
+            defer scratch.deinit();
             var w: WinCtx = undefined;
-            w.encode_scratch = null;
+            w.encode_scratch = if (!limited and !parallel) &scratch else null;
             w.gpa = gpa;
             w.io = std.testing.io;
             w.memory = null;
             w.cpu_budget = if (limited or parallel) 4 else 1;
             w.rg_target = .{};
             w.regions = &.{};
-            w.encode_pages = .{ .child = gpa };
+            w.encode_pages = .{ .child = if (w.encode_scratch != null) scratch.allocator() else gpa };
             w.out_elems = &elems;
             w.out_paths = &paths;
             w.codec = .UNCOMPRESSED;

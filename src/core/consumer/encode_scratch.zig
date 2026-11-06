@@ -19,6 +19,7 @@ pub const EncodeScratch = struct {
         bytes: []u8,
         alignment: std.mem.Alignment,
         data: [*]u8,
+        extra: usize = 0,
     };
 
     pub fn allocator(self: *EncodeScratch) std.mem.Allocator {
@@ -61,18 +62,25 @@ pub const EncodeScratch = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var link = &self.idle;
+        var best: ?*?*Node = null;
         while (link.*) |node| {
-            // Exact page counts keep a small job from borrowing a much larger node than its reservation covers.
-            if (node.bytes.len == size and len <= node.bytes.len - (node.data - node.bytes.ptr) and
+            if (node.bytes.len >= size and len <= node.bytes.len - (node.data - node.bytes.ptr) and
                 std.mem.isAligned(@intFromPtr(node.data), alignment.toByteUnits()))
             {
-                link.* = node.next;
-                self.retained -= node.bytes.len;
-                self.ledger.release(node.bytes.len);
-                self.live += 1;
-                return node.data;
+                if (best == null or node.bytes.len < best.?.*.?.bytes.len) best = link;
+                if (node.bytes.len == size) break;
             }
             link = &node.next;
+        }
+        if (best) |found| {
+            const node = found.*.?;
+            found.* = node.next;
+            self.retained -= node.bytes.len;
+            // The job's reservation covers the requested pages. Excess capacity stays charged even while live.
+            self.ledger.release(size);
+            node.extra = node.bytes.len - size;
+            self.live += 1;
+            return node.data;
         }
         if (self.ledger.tight()) self.dropIdle();
         const actual_alignment = alignment.max(.of(Node));
@@ -103,6 +111,8 @@ pub const EncodeScratch = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.live -= 1;
+        self.ledger.release(node.extra);
+        node.extra = 0;
         if (!self.ledger.tight() and node.bytes.len <= self.limit - self.retained) {
             if (self.ledger.drawExact(node.bytes.len) != null) {
                 node.next = self.idle;
@@ -117,7 +127,7 @@ pub const EncodeScratch = struct {
     }
 };
 
-test "encode scratch reuses exact page nodes and charges every retained byte" {
+test "encode scratch reuses page nodes and charges every retained byte" {
     const t = std.testing;
     var ledger: memory.SharedBudget = .{ .limit = 1 << 20 };
     var cache: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = ledger.limit };
@@ -156,6 +166,28 @@ test "encode scratch declines retention outside its window share or available le
     try t.expectEqual(@as(usize, 0), cache.retained);
     try t.expectEqual(ledger.limit, ledger.used.load(.monotonic));
     ledger.release(ledger.limit);
+}
+
+test "encode scratch keeps excess capacity charged while a smaller job borrows it" {
+    const t = std.testing;
+    var ledger: memory.SharedBudget = .{ .limit = 1 << 20 };
+    var cache: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = ledger.limit };
+    defer cache.deinit();
+    const a = cache.allocator();
+    const large = try a.alloc(u8, 32768);
+    const ptr = large.ptr;
+    a.free(large);
+    const backing = cache.retained;
+    const small = try a.alloc(u8, 8192);
+    try t.expectEqual(ptr, small.ptr);
+    try t.expectEqual(backing - EncodeScratch.allocationSize(8192, .@"1").?, ledger.used.load(.monotonic));
+    try t.expectEqual(@as(usize, 0), cache.retained);
+    @memset(small, 71);
+    a.free(small);
+    try t.expectEqual(backing, cache.retained);
+    try t.expectEqual(backing, ledger.used.load(.monotonic));
+    cache.deinit();
+    try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }
 
 test "encode scratch arena growth and reset release all idle credit" {

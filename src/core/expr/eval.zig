@@ -30,6 +30,7 @@ const decimal_mod = @import("../parquet/decimal.zig");
 const selection = @import("../filter/selection.zig");
 const calendar = @import("calendar.zig");
 const regex = @import("regex.zig");
+const case_map = @import("case_map.zig");
 
 pub const Error = error{
     BadColumn,
@@ -1279,7 +1280,7 @@ fn evalCall(
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
         .abs => return evalAbs(arena, batch, column_lookup, c),
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
-        .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => return evalStringFn(arena, batch, column_lookup, c),
+        .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => return evalStringFn(arena, batch, column_lookup, c),
     }
 }
 
@@ -1370,6 +1371,41 @@ fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), c: ast.Cal
                 .left => charRange(text, @intCast(n), 1, if (k >= 0) k else n + k),
                 else => charRange(text, @intCast(n), if (k >= 0) n - k + 1 else -k + 1, n),
             } };
+        },
+        .upper, .lower => {
+            // Code points map one to one, and many texts change nothing: those stay a view of the input.
+            const start = bytes.items.len;
+            var changed = false;
+            var at: usize = 0;
+            while (at < text.len) {
+                const b = text[at];
+                if (b < 0x80) {
+                    const m = if (c.func == .upper) std.ascii.toUpper(b) else std.ascii.toLower(b);
+                    changed = changed or m != b;
+                    try bytes.append(arena, m);
+                    at += 1;
+                    continue;
+                }
+                const n = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                const cp = if (n > 1 and at + n <= text.len) std.unicode.utf8Decode(text[at..][0..n]) catch null else null;
+                const mapped = if (cp) |x| (if (c.func == .upper) case_map.upper(x) else case_map.lower(x)) else null;
+                if (mapped) |m| {
+                    var buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(m), &buf) catch unreachable;
+                    changed = changed or m != cp.?;
+                    try bytes.appendSlice(arena, buf[0..len]);
+                    at += n;
+                } else {
+                    // Bytes that are no UTF-8 code point pass through as they are.
+                    try bytes.append(arena, b);
+                    at += 1;
+                }
+            }
+            if (!changed) {
+                bytes.shrinkRetainingCapacity(start);
+                return .{ .text = text };
+            }
+            return .{ .built = .{ start, bytes.items.len } };
         },
         .trim, .ltrim, .rtrim => {
             var lo: usize = 0;
@@ -1677,7 +1713,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => unreachable,
     }
     return .{ .i64 = .{
         .values = out,
@@ -3311,6 +3347,30 @@ test "substring takes characters as DuckDB does: negative starts from the end, a
     };
     try expectString("", .substring, "", &.{ intArg(1), intArg(3) });
     try expectString("日本", .substring, "日本語", &.{ intArg(1), intArg(2) });
+}
+
+test "upper and lower map code points as DuckDB does, and leave what it leaves" {
+    try expectString("ABC DÉF 日本", .upper, "abc déf 日本", &.{});
+    try expectString("abc déf 日本", .lower, "ABC DÉF 日本", &.{});
+    try expectString("STRAẞE", .upper, "straße", &.{}); // ß -> ẞ, one code point to one
+    try expectString("ß", .lower, "ẞ", &.{});
+    try expectString("i", .lower, "İ", &.{});
+    try expectString("I", .upper, "ı", &.{});
+    try expectString("ασ", .lower, "ΑΣ", &.{}); // no final-sigma form
+    try expectString("Ǆ", .upper, "ǅ", &.{});
+    try expectString("ǰ", .upper, "ǰ", &.{}); // no single upper-case code point
+    try expectString("ﬁ", .upper, "ﬁ", &.{});
+    try expectString("😀X", .upper, "😀x", &.{});
+    try expectString("", .upper, "", &.{});
+    // Bytes that are not UTF-8 pass through, the rest still maps.
+    try expectString("A\xffB", .upper, "a\xffb", &.{});
+    // The mapping table's own spot values (stride-2 pairs, the ends).
+    try std.testing.expectEqual(@as(u32, 0x101), case_map.lower(0x100));
+    try std.testing.expectEqual(@as(u32, 0x100), case_map.upper(0x101));
+    try std.testing.expectEqual(@as(u32, 0x101), case_map.lower(0x101));
+    try std.testing.expectEqual(@as(u32, 0x10428), case_map.lower(0x10400));
+    try std.testing.expectEqual(@as(u32, 0x10FFFF), case_map.lower(0x10FFFF));
+    try std.testing.expectEqual(@as(u32, 0), case_map.upper(0));
 }
 
 test "left, right, trim, replace and the pads match DuckDB's answers" {

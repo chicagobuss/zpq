@@ -249,6 +249,9 @@ pub const Func = enum {
     /// `left(s, n)` / `right(s, n)`: the first / last `n` characters; a negative `n` drops that many from the other end.
     left,
     right,
+    /// `upper(s)` / `lower(s)`: DuckDB's case mapping, one code point to one (`case_map.zig`).
+    upper,
+    lower,
     /// `trim(s)`, `ltrim(s)`, `rtrim(s)`: spaces removed from both ends, the start, the end.
     trim,
     ltrim,
@@ -472,7 +475,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;

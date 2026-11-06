@@ -733,6 +733,8 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "substring") or asciiEqIgnoreCase(name, "substr")) return .substring;
     if (asciiEqIgnoreCase(name, "left")) return .left;
     if (asciiEqIgnoreCase(name, "right")) return .right;
+    if (asciiEqIgnoreCase(name, "upper") or asciiEqIgnoreCase(name, "ucase")) return .upper;
+    if (asciiEqIgnoreCase(name, "lower") or asciiEqIgnoreCase(name, "lcase")) return .lower;
     if (asciiEqIgnoreCase(name, "trim")) return .trim;
     if (asciiEqIgnoreCase(name, "ltrim")) return .ltrim;
     if (asciiEqIgnoreCase(name, "rtrim")) return .rtrim;
@@ -823,7 +825,7 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args[0].typeOf() != .str or !isIntLiteral(args[1].*)) return error.TypeMismatch;
             return .str;
         },
-        .trim, .ltrim, .rtrim => {
+        .upper, .lower, .trim, .ltrim, .rtrim => {
             if (args.len != 1) return error.WrongArity;
             if (args[0].typeOf() != .str) return error.TypeMismatch;
             return .str;
@@ -1192,7 +1194,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                     if (a.temporal() != args[0].temporal()) break null;
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
-                .length, .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
+                .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
             },
             .int = if (func == .abs and args[0].* == .col_ref) blk: {
                 const elem = metadata.leafSchemaElement(file, args[0].col_ref.col_idx) orelse break :blk null;

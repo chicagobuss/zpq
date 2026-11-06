@@ -58,7 +58,10 @@
   to read an uncached input one page fault at a time on one thread. Writes now plan their reads the way queries do:
   an uncached input is read in parallel, and a cached one stays memory-mapped. The copy also builds its Bloom
   filters on worker threads. Output bytes don't change. On a Ryzen 9 9950X, copying three columns of a 175 MB file
-  went from 68 to 17 ms uncached and from 32 to 12 ms cached; other writes are flat to 15% faster uncached.
+  went from 68 to 17 ms uncached and from 32 to 12 ms cached; other writes are flat to 15% faster uncached. Under a
+  tight `--max-memory`, a write whose row groups would not fit its workers' share reads through the mapping, and
+  one the parallel reader runs out of memory on is run again mapped, so a write's result never depends on whether
+  its input was cached.
 - **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
   each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
   (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when one group the

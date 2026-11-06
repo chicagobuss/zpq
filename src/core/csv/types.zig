@@ -218,6 +218,8 @@ pub fn parseDecimal(s: []const u8, scale: u8, max_int: u8) ?i128 {
 /// Exponent, inf or nan text a DOUBLE holds exactly (significant digits <= 15, finite unless spelled inf/nan).
 /// Returns the significant digit count.
 pub fn floatShape(s: []const u8) ?u8 {
+    // A quoted empty field reaches here as a value (it is the empty string, not NULL): no number.
+    if (s.len == 0) return null;
     if (special(s) != null) return 1;
     var i: usize = 0;
     if (s.len > 0 and s[0] == '-') i = 1;
@@ -589,6 +591,14 @@ test "csv doubles: only text a double round-trips, correctly rounded" {
         if (decimalShape(s) == null) continue;
         try testing.expectEqual(std.fmt.parseFloat(f64, s) catch unreachable, parseFloat(s).?);
     }
+}
+
+test "csv review P1-1: a late quoted-empty value does not fit a DOUBLE column; it widens to STRING" {
+    const double: Type = .{ .kind = .float64, .sig = 1 };
+    try testing.expect(!fits(double, "", true));
+    try testing.expectEqual(@as(?f64, null), parseFloat(""));
+    try testing.expectEqual(@as(?u8, null), floatShape(""));
+    try testing.expectEqual(Kind.string, classify("1e5", true).join(classify("", true)).kind);
 }
 
 test "csv dates and timestamps: valid calendar, exact fractions, offsets as instants" {

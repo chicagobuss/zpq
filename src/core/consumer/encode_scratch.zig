@@ -11,10 +11,12 @@ pub const EncodeScratch = struct {
     ledger: *memory.SharedBudget,
     limit: usize,
     mutex: std.Io.Mutex = .init,
+    released: std.Io.Condition = .init,
     idle: ?*Node = null,
     retained: usize = 0, // Bytes on the idle list, for observability and bulk retirement.
     /// Idle mappings, retiring mappings, and excess capacity still charged while a job borrows a larger mapping.
     held: usize = 0,
+    retiring: usize = 0,
     live: usize = 0,
     paused: bool = false,
 
@@ -42,10 +44,15 @@ pub const EncodeScratch = struct {
 
     pub fn trimIdleBytes(self: *EncodeScratch) usize {
         self.mutex.lockUncancelable(self.io);
+        const pending = self.retiring;
         const retired = self.detachIdle();
         self.mutex.unlock(self.io);
         self.discard(retired);
-        return retired.bytes;
+        self.mutex.lockUncancelable(self.io);
+        // A concurrent trim may already own these pages. Pressure must see their returned credit before refusing.
+        while (self.retiring > 0) self.released.waitUncancelable(self.io, &self.mutex);
+        self.mutex.unlock(self.io);
+        return pending + retired.bytes;
     }
 
     pub fn setPaused(self: *EncodeScratch, paused: bool) void {
@@ -63,6 +70,7 @@ pub const EncodeScratch = struct {
         const retired: Retired = .{ .head = self.idle, .bytes = self.retained };
         self.idle = null;
         self.retained = 0;
+        self.retiring += retired.bytes;
         return retired;
     }
 
@@ -78,6 +86,8 @@ pub const EncodeScratch = struct {
         self.ledger.release(retired.bytes);
         self.mutex.lockUncancelable(self.io);
         self.held -= retired.bytes;
+        self.retiring -= retired.bytes;
+        self.released.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
 
@@ -169,14 +179,82 @@ pub const EncodeScratch = struct {
         }
         const allocation = node.bytes;
         const alignment = node.alignment;
+        self.retiring += extra;
         self.mutex.unlock(self.io);
         self.child.rawFree(allocation, alignment, ret);
         self.ledger.release(extra);
         self.mutex.lockUncancelable(self.io);
         self.held -= extra;
+        self.retiring -= extra;
+        if (extra > 0) self.released.broadcast(self.io);
         self.mutex.unlock(self.io);
     }
 };
+
+test "encode scratch pressure waits for credit another trim is retiring" {
+    const t = std.testing;
+    const Child = struct {
+        entered: std.Io.Semaphore = .{},
+        release: std.Io.Semaphore = .{},
+        fn alloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            return t.allocator.rawAlloc(n, alignment, ret);
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.post(t.io);
+            self.release.waitUncancelable(t.io);
+            t.allocator.rawFree(bytes, alignment, ret);
+        }
+    };
+    const Trim = struct {
+        cache: *EncodeScratch,
+        entered: std.Io.Semaphore = .{},
+        done: std.Io.Semaphore = .{},
+        bytes: usize = 0,
+        fn run(self: *@This()) void {
+            self.entered.post(t.io);
+            self.bytes = self.cache.trimIdleBytes();
+            self.done.post(t.io);
+        }
+    };
+    var ledger: memory.SharedBudget = .{ .limit = 1 << 20 };
+    var child: Child = .{};
+    var cache: EncodeScratch = .{
+        .io = t.io,
+        .child = .{ .ptr = &child, .vtable = &.{
+            .alloc = Child.alloc,
+            .free = Child.free,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+        } },
+        .ledger = &ledger,
+        .limit = ledger.limit,
+    };
+    defer cache.deinit();
+    const idle = try cache.allocator().alloc(u8, std.heap.pageSize());
+    cache.allocator().free(idle);
+    const bytes = cache.retained;
+    var first: Trim = .{ .cache = &cache };
+    var second: Trim = .{ .cache = &cache };
+    var group: std.Io.Group = .init;
+    defer group.cancel(t.io);
+    defer child.release.post(t.io);
+    try group.concurrent(t.io, Trim.run, .{&first});
+    child.entered.waitUncancelable(t.io);
+    try t.expectEqual(bytes, ledger.used.load(.monotonic));
+    try group.concurrent(t.io, Trim.run, .{&second});
+    second.entered.waitUncancelable(t.io);
+    const premature = second.done.waitTimeout(t.io, .{ .duration = .{
+        .raw = .fromMilliseconds(1000),
+        .clock = .awake,
+    } });
+    child.release.post(t.io);
+    try group.await(t.io);
+    try t.expectError(error.Timeout, premature);
+    try t.expectEqual(bytes, first.bytes);
+    try t.expectEqual(bytes, second.bytes);
+    try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
 
 test "encode scratch releases mappings outside its mutex and keeps retiring capacity charged" {
     const t = std.testing;

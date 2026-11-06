@@ -204,22 +204,8 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`): at most seven general scans,
     // plus the shared-string prefix, an admitted record scan and its serial decode retry before the general chain,
     // and each arms its paths only over inputs a scan reads again, whole, from the start.
-    var attempt = args;
-    // A join publishes its build columns on the established row-group scan alone: no strategy that decodes its own
-    // way (owned records, shared strings, dense domains, pairs) sees them.
+    var attempt = joinPaths(args);
     const bound_filter = if (args.bound_aggregate) |b| b.filter else null;
-    const joined = join_lookup.inFilter(bound_filter);
-    if (joined) {
-        attempt.shared_strings = false;
-        attempt.integer_records = false;
-        attempt.msd_records = false;
-        attempt.byte_records = false;
-        attempt.private_runs = false;
-        attempt.distinct_pairs = .off;
-        attempt.grouped_distinct_bitmap = .off;
-        attempt.count_ranked_distinct = .off;
-        attempt.dense = false;
-    }
     var chain: Chain = .{ .parts_tried = args.partagg };
     const ledger_before = if (args.ledger) |l| l.used.load(.monotonic) else 0;
     var may_fit = false;
@@ -384,9 +370,28 @@ pub fn narrowed(
     return next;
 }
 
-/// Shares all binding and work sizing with execution, but stops before allocating workers or aggregate tables.
+/// Shares all binding and work sizing with execution, but stops before allocating workers or aggregate tables. A join
+/// is explained on the paths execution would give it (`joinPaths`).
 pub fn explainAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: MultiAggArgs) !AggregateExplanation {
-    return prepareAggregate(gpa, arena, args, true);
+    return prepareAggregate(gpa, arena, joinPaths(args), true);
+}
+
+/// A join publishes its build columns on the established row-group scan alone: no strategy that decodes its own way
+/// (owned records, shared strings, dense domains, pairs) sees them, so a query with a lookup in its filter takes none.
+fn joinPaths(args: MultiAggArgs) MultiAggArgs {
+    var out = args;
+    const bound_filter = if (args.bound_aggregate) |b| b.filter else null;
+    if (!join_lookup.inFilter(bound_filter)) return out;
+    out.shared_strings = false;
+    out.integer_records = false;
+    out.msd_records = false;
+    out.byte_records = false;
+    out.private_runs = false;
+    out.distinct_pairs = .off;
+    out.grouped_distinct_bitmap = .off;
+    out.count_ranked_distinct = .off;
+    out.dense = false;
+    return out;
 }
 
 pub fn prepareAggregate(

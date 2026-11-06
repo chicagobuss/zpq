@@ -935,21 +935,35 @@ pub const GroupJoin = struct {
                     .i => |v| ai.* = v,
                 }
             }
-            // Runs of one slot, in row order: on a key-sorted probe a slot's rows are one run.
+            // Runs of one slot, in row order: on a key-sorted probe a slot's rows are one run. Counted first, so
+            // each list grows once a batch.
+            var runs: usize = 0;
+            var prev: u32 = if (fold.slots.items.len == 0) EMPTY else fold.slots.items[fold.slots.items.len - 1];
             var it = sel.iterator();
+            while (it.next()) |r| {
+                if (at[r] != prev) runs += 1;
+                prev = at[r];
+            }
+            try fold.slots.ensureUnusedCapacity(gpa, runs);
+            try fold.counts.ensureUnusedCapacity(gpa, runs);
+            for (g.calls, fold.f, fold.i) |c, *f, *i| switch (c.lane) {
+                .f64 => if (c.func != .count) try f.ensureUnusedCapacity(gpa, runs),
+                .i64 => if (c.func != .count) try i.ensureUnusedCapacity(gpa, runs),
+            };
+            it = sel.iterator();
             while (it.next()) |r| {
                 const s = at[r];
                 if (s == EMPTY) return error.LookupWithoutMatch;
                 const fresh = fold.slots.items.len == 0 or fold.slots.items[fold.slots.items.len - 1] != s;
                 if (fresh) {
-                    try fold.slots.append(gpa, s);
-                    try fold.counts.append(gpa, 0);
+                    fold.slots.appendAssumeCapacity(s);
+                    fold.counts.appendAssumeCapacity(0);
                 }
                 fold.counts.items[fold.counts.items.len - 1] += 1;
                 for (g.calls, 0..) |c, ci| switch (c.lane) {
                     .f64 => if (c.func != .count) {
                         const v = args_f[ci][r];
-                        if (fresh) try fold.f[ci].append(gpa, v) else {
+                        if (fresh) fold.f[ci].appendAssumeCapacity(v) else {
                             const dst = &fold.f[ci].items[fold.f[ci].items.len - 1];
                             dst.* = switch (c.func) {
                                 .sum => dst.* + v,
@@ -961,7 +975,7 @@ pub const GroupJoin = struct {
                     },
                     .i64 => if (c.func != .count) {
                         const v = if (c.arg != null) args_i[ci][r] else 1;
-                        if (fresh) try fold.i[ci].append(gpa, v) else {
+                        if (fresh) fold.i[ci].appendAssumeCapacity(v) else {
                             const dst = &fold.i[ci].items[fold.i[ci].items.len - 1];
                             dst.* = switch (c.func) {
                                 .sum => std.math.add(i64, dst.*, v) catch return error.GroupJoinOverflow,

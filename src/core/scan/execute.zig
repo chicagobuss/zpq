@@ -1625,7 +1625,7 @@ fn prepareAggregateWithMetas(
     defer if (group_by_keys != null and !leave_tables) winners.settle(0);
     var work_cursor = std.atomic.Value(usize).init(0);
     // Mapped inputs read ahead of the workers; gated ones are read ahead by their own reader.
-    var read_ahead_state = try read_ahead.ReadAhead.forScan(arena, args.read_ahead, args.inputs, worker_work, metas, &plan, n_workers);
+    var read_ahead_state = try read_ahead.ReadAhead.forScan(arena, args.read_ahead, args.inputs, worker_work, metas, &plan, n_workers, args.ledger);
     for (workers, 0..) |*w, wi| {
         w.* = .{
             .gpa = gpa,

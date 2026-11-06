@@ -1136,7 +1136,8 @@ pub const LocalIo = struct {
 
 /// The mapped read-ahead of local inputs (`LocalIo.read_ahead`). Its window is a quarter of the query's budget, within
 /// the reader's own window (`s3_window.windowFor`) and never past a quarter of the host's memory: the pages are the
-/// page cache's, but a window past what the host holds would evict them before the workers reach them.
+/// page cache's, but a window past what the host holds would evict them before the workers reach them. The scan caps
+/// it again by what the query's ledger has free as it advises (`ReadAhead.cap`).
 fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInputs) ?scan_read_ahead.Config {
     if (@import("builtin").os.tag != .linux or !allLocal(opened)) return null;
     const avail: u64 = system.discoverAvailableMemory(null);

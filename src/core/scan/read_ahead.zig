@@ -44,6 +44,7 @@ const agg_plan = @import("../agg_plan.zig");
 const core_memory = @import("../memory.zig");
 const contracts = @import("contracts.zig");
 const WorkItem = contracts.WorkItem;
+const consumer_workspace = @import("../consumer/workspace.zig");
 
 /// What the local-I/O choice hands the scan (`input.chooseLocalIo`).
 pub const Config = struct {
@@ -99,8 +100,9 @@ pub const ReadAhead = struct {
     kept: []std.atomic.Value(bool) = &.{},
     /// Items before `released` are claimed, and their advice no longer counts.
     released: usize = 0,
-    /// Page-rounded bytes advised for items not yet claimed: never past the cap.
-    ahead: u64 = 0,
+    /// Page-rounded bytes advised and not yet decoded, never past the cap: the cursor's for items not yet claimed, and a
+    /// gated column's for a claimed item its worker is decoding (`adviseClaimed`), until that worker's next claim.
+    ahead: std.atomic.Value(u64) = .init(0),
     /// The row group advised last and the item that advised it, so the items a row group was split into advise it
     /// once (and an item the cap stopped before its first block is not taken for one of them on return).
     last: ?struct { file: usize, rg: usize, item: usize } = null,
@@ -170,7 +172,7 @@ pub const ReadAhead = struct {
         self.col = 0;
         self.offset = 0;
         self.released = 0;
-        self.ahead = 0;
+        self.ahead.store(0, .monotonic);
         self.paced = 0;
         self.last = null;
         self.claimed_hi.store(0, .monotonic);
@@ -182,6 +184,74 @@ pub const ReadAhead = struct {
     pub fn claimed(self: *ReadAhead, idx: usize, columns: ?agg_plan.Columns) void {
         _ = self.claimed_hi.fetchMax(idx + 1, .monotonic);
         self.advance(columns);
+    }
+
+    /// Advise `range` of input `file`'s mapping for a claimed item about to decode it: the pages a gated column's gate
+    /// keeps (`consumer/plan.zig` `adviseGated`). The cursor's bounds hold: page-rounded calls of at most a block,
+    /// resident blocks skipped, each block admitted only while the bytes advised and not yet decoded stay within the
+    /// cap (the window, or what the ledger has free), and past it the rest is left to demand faults. Never waits. What
+    /// it admits is added to `held`, the worker's own, which it gives back at its next claim (`releaseHeld`).
+    pub fn adviseClaimed(self: *ReadAhead, file: usize, range: []const u8, held: *u64) void {
+        if (builtin.os.tag != .linux or file >= self.sources.len or range.len == 0) return;
+        const page = std.heap.pageSize();
+        const src = self.sources[file];
+        const src_lo = std.mem.alignBackward(usize, @intFromPtr(src.ptr), page);
+        const src_hi = std.mem.alignForward(usize, @intFromPtr(src.ptr) + src.len, page);
+        var lo = std.mem.alignBackward(usize, @intFromPtr(range.ptr), page);
+        const end = std.mem.alignForward(usize, @intFromPtr(range.ptr) + range.len, page);
+        // Outside the mapping there is nothing of this input to advise.
+        if (lo < src_lo or end > src_hi) return;
+        const fd: i32 = if (file < self.config.fds.len) self.config.fds[file] else -1;
+        while (lo < end) {
+            const limit = self.cap();
+            const step = std.mem.alignBackward(u64, @min(@as(u64, @max(self.config.block, page)), limit), page);
+            if (step == 0) return;
+            const len: usize = @intCast(@min(step, end - lo));
+            const file_off = lo -| @intFromPtr(src.ptr);
+            if (!self.config.force and cached(fd, file_off, lo, len, page)) {
+                _ = self.resident.fetchAdd(len, .monotonic);
+            } else {
+                if (!self.take(len, limit)) return;
+                willNeed(fd, file_off, lo, len);
+                held.* += len;
+                _ = self.advised.fetchAdd(len, .monotonic);
+            }
+            lo += len;
+        }
+    }
+
+    /// `adviseClaimed` for the decode (`AggWorkspace.gate_advice`), counting into the worker's `held`.
+    pub fn gateAdvice(self: *ReadAhead, held: *u64) consumer_workspace.GateAdvice {
+        return .{ .ctx = self, .held = held, .advise = adviseOpaque };
+    }
+
+    fn adviseOpaque(ctx: *anyopaque, file: usize, range: []const u8, held: *u64) void {
+        const self: *ReadAhead = @ptrCast(@alignCast(ctx));
+        self.adviseClaimed(file, range, held);
+    }
+
+    /// Give back what `adviseClaimed` held for a worker's item, once that item's decode is done.
+    pub fn releaseHeld(self: *ReadAhead, held: *u64) void {
+        self.give(held.*);
+        held.* = 0;
+    }
+
+    /// Count `len` more bytes advised and not yet decoded, if that keeps them within `limit`.
+    fn take(self: *ReadAhead, len: u64, limit: u64) bool {
+        var cur = self.ahead.load(.monotonic);
+        while (cur + len <= limit) {
+            cur = self.ahead.cmpxchgWeak(cur, cur + len, .monotonic, .monotonic) orelse {
+                if (builtin.is_test) _ = test_peak_ahead.fetchMax(cur + len, .monotonic);
+                return true;
+            };
+        }
+        return false;
+    }
+
+    fn give(self: *ReadAhead, len: u64) void {
+        if (len == 0) return;
+        var cur = self.ahead.load(.monotonic);
+        while (self.ahead.cmpxchgWeak(cur, cur -| len, .monotonic, .monotonic)) |actual| cur = actual;
     }
 
     /// The most bytes advised and not yet claimed, now: the window, or what the ledger has free when that is less.
@@ -196,7 +266,7 @@ pub const ReadAhead = struct {
         if (self.busy.swap(true, .acquire)) return;
         defer self.busy.store(false, .release);
         const hi = @min(self.claimed_hi.load(.monotonic), self.work.len);
-        while (self.released < hi) : (self.released += 1) self.ahead -|= self.item_bytes[self.released];
+        while (self.released < hi) : (self.released += 1) self.give(self.item_bytes[self.released]);
         const claims = hi -| self.paced;
         self.paced = hi;
         // Never advise what a worker already claimed.
@@ -222,12 +292,10 @@ pub const ReadAhead = struct {
             if (!self.config.force and cached(fd, file_off, lo, len, page)) {
                 _ = self.resident.fetchAdd(len, .monotonic);
             } else {
-                if (self.ahead + len > limit) break;
+                if (!self.take(len, limit)) break;
                 willNeed(fd, file_off, lo, len);
-                self.ahead += len;
                 self.item_bytes[self.item] += len;
                 _ = self.advised.fetchAdd(len, .monotonic);
-                if (builtin.is_test) _ = test_peak_ahead.fetchMax(self.ahead, .monotonic);
             }
             // Past this block: the chunk's next block, or its next chunk.
             const chunk_lo = @intFromPtr(range.ptr) - self.offset;
@@ -418,10 +486,10 @@ test "the cap holds within an oversized item: advice stops mid-chunk" {
         ra.claimed(0, null);
         // Whole pages only, never past the window: one page, or three of the three and a half.
         try std.testing.expectEqual(window / page * page, ra.advised.load(.monotonic));
-        try std.testing.expect(ra.ahead <= window);
+        try std.testing.expect(ra.ahead.load(.monotonic) <= window);
         // A later claim of the advised item gives its advice back; the cap holds again for what follows.
         ra.claimed(1, null);
-        try std.testing.expect(ra.ahead <= window);
+        try std.testing.expect(ra.ahead.load(.monotonic) <= window);
     };
 }
 
@@ -444,7 +512,7 @@ test "a chunk's boundary page counts whole: one byte inside a page advises and c
     // advised and counted whole.
     try std.testing.expectEqual(@as(u64, 2 * page), ra.advised.load(.monotonic));
     try std.testing.expect(set.item_bytes[1] == page and set.item_bytes[2] == page);
-    try std.testing.expectEqual(@as(u64, 2 * page), ra.ahead);
+    try std.testing.expectEqual(@as(u64, 2 * page), ra.ahead.load(.monotonic));
     // A window below one page advises nothing.
     var narrow = set.readAhead(&sources, page - 1, 1, null);
     narrow.start();
@@ -520,6 +588,126 @@ test "a column read behind the filter's gate is left to its reader until a reade
     try std.testing.expect(ra.advised.load(.monotonic) > before);
 }
 
+test "a gated column's kept pages are advised within the window and the ledger, as the cursor's are (review R3)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const thrift = @import("../thrift.zig");
+    const local_fs = @import("../../local_fs.zig");
+    const consumer_plan = @import("../consumer/plan.zig");
+    const consumer_types = @import("../consumer/types.zig");
+    const selection = @import("../filter/selection.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const page = std.heap.pageSize();
+    // The reviewer's chunk: two PLAIN INT32 data pages of 256 OS pages (1 MiB) each, the gate keeping every row of
+    // the first and none of the second.
+    const payload_len = 256 * page;
+    const rows = payload_len / @sizeOf(i32);
+    var header = thrift.Writer.init(a);
+    header.writeStructBegin();
+    try header.writeFieldI32(1, 0);
+    try header.writeFieldI32(2, @intCast(payload_len));
+    try header.writeFieldI32(3, @intCast(payload_len));
+    try header.writeFieldBegin(.Struct, 5);
+    header.writeStructBegin();
+    try header.writeFieldI32(1, @intCast(rows));
+    try header.writeFieldI32(2, 0);
+    try header.writeFieldI32(3, 3);
+    try header.writeFieldI32(4, 3);
+    try header.writeStructEnd();
+    try header.writeStructEnd();
+    const h = header.bytes();
+    const one_len = h.len + payload_len;
+    const body = try a.alloc(u8, 2 * one_len);
+    @memset(body, 0);
+    @memcpy(body[0..h.len], h);
+    @memcpy(body[one_len..][0..h.len], h);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/gated.bin", .{tmp.sub_path});
+    const fd = try local_fs.createFile(path);
+    try local_fs.writeAll(fd, body);
+    local_fs.close(fd);
+    const mapped = try local_fs.mapFile(path);
+    defer mapped.unmap();
+    var chunks = [_]schema.ColumnChunk{.{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .INT32,
+            .encodings = .empty,
+            .path_in_schema = .empty,
+            .codec = .UNCOMPRESSED,
+            .num_values = @intCast(2 * rows),
+            .total_uncompressed_size = @intCast(body.len),
+            .total_compressed_size = @intCast(body.len),
+            .data_page_offset = 0,
+            .dictionary_page_offset = null,
+            .index_page_offset = null,
+        },
+    }};
+    var groups = [_]schema.RowGroup{.{ .columns = .fromOwnedSlice(&chunks), .total_byte_size = @intCast(body.len), .num_rows = @intCast(2 * rows) }};
+    const metas = [_]schema.FileMetaData{.{ .version = 2, .schema = .empty, .num_rows = @intCast(2 * rows), .created_by = null, .row_groups = .fromOwnedSlice(&groups) }};
+    const in: consumer_types.AggRowGroup = .{
+        .rg = &groups[0],
+        .meta = &metas[0],
+        .src = .{ .bytes = mapped.bytes, .byte_origin = 0 },
+        .filter = null,
+        .read = &.{true},
+        .consumed = &.{true},
+    };
+    var gate = try selection.SelectionVector.init(a, 2 * rows);
+    gate.clearRange(rows, 2 * rows);
+    const mask = [_]bool{true};
+    const columns: agg_plan.Columns = .{ .read = &mask, .consumed = &mask, .preserve = &mask };
+    const plan: agg_plan.Plan = .{
+        .query = .{ .filter = null, .calls = &.{}, .group_keys = null },
+        .stats = .ignore,
+        .filter_cols = &mask,
+        .columns = columns,
+        .cols_stat_pruned = 0,
+    };
+    const work = [_]WorkItem{.{ .file = 0, .rg = 0, .agg_start = 0, .agg_len = 0, .columns = columns, .accumulators = &.{} }};
+    const sources = [_][]const u8{mapped.bytes};
+    var item_bytes = [_]u64{0};
+    for ([_]usize{ 1, 4, 16 }) |workers| {
+        // A one-page window and block, and a ledger with nothing free: nothing is advised, and nothing counted.
+        var ledger: core_memory.SharedBudget = .{ .limit = page };
+        _ = ledger.drawExact(page).?;
+        var kept = [_]std.atomic.Value(bool){.init(true)};
+        var gated = [_]std.atomic.Value(bool){.init(true)};
+        var ra: ReadAhead = .init(.{ .window = page, .block = page, .force = true }, &work, &metas, &plan, &sources, workers, &ledger, &item_bytes);
+        ra.gated = &gated;
+        ra.kept = &kept;
+        ra.start();
+        ra.claimed(0, null);
+        var held: u64 = 0;
+        const ws: consumer_workspace.AggWorkspace = .{ .scratch = undefined, .rg_arena = undefined, .timings = undefined, .gated = &gated, .kept = &kept, .gate_advice = ra.gateAdvice(&held) };
+        consumer_plan.adviseGated(in, 0, &gate, ws);
+        try std.testing.expect(!kept[0].load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), ra.advised.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), ra.ahead.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), held);
+        ledger.release(page);
+        // Room in the ledger, a window of three and a half pages: whole pages up to the window and no further,
+        // counted as the cursor's, held for the worker's item until its next claim gives them back.
+        test_peak_ahead.store(0, .monotonic);
+        var wide: core_memory.SharedBudget = .{ .limit = 1 << 30 };
+        var roomy: ReadAhead = .init(.{ .window = 3 * page + page / 2, .block = page, .force = true }, &work, &metas, &plan, &sources, workers, &wide, &item_bytes);
+        roomy.gated = &gated;
+        roomy.kept = &kept;
+        roomy.start();
+        roomy.claimed(0, null);
+        const room: consumer_workspace.AggWorkspace = .{ .scratch = undefined, .rg_arena = undefined, .timings = undefined, .gated = &gated, .kept = &kept, .gate_advice = roomy.gateAdvice(&held) };
+        consumer_plan.adviseGated(in, 0, &gate, room);
+        try std.testing.expectEqual(@as(u64, 3 * page), roomy.advised.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 3 * page), held);
+        try std.testing.expect(test_peak_ahead.load(.monotonic) <= roomy.config.window);
+        roomy.releaseHeld(&held);
+        try std.testing.expectEqual(@as(u64, 0), roomy.ahead.load(.monotonic));
+    }
+}
+
 test "the cap never passes what the query's ledger has free" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
@@ -577,7 +765,7 @@ test "a pass keeps a lookahead of items within the window" {
         for (0..n) |idx| {
             ra.claimed(idx, null);
             try testing.expect(ra.item <= idx + 1 + ra.lookahead);
-            try testing.expect(ra.ahead <= window);
+            try testing.expect(ra.ahead.load(.monotonic) <= window);
         }
         // Hard: never more than the window advised ahead of the claims, page-rounded.
         try testing.expect(test_peak_ahead.load(.monotonic) <= window);

@@ -48,6 +48,8 @@ pub const AggWorkspace = struct {
     gated: ?[]std.atomic.Value(bool) = null,
     /// Beside `gated`: per leaf column, whether the gate kept every page of the latest gated chunk of it (`adviseGated`).
     kept: ?[]std.atomic.Value(bool) = null,
+    /// Beside `gated`: how the pages a gate keeps are advised, within the read-ahead's own bounds.
+    gate_advice: ?GateAdvice = null,
 };
 
 /// Whether a row group's whole decode of `bytes` may go on the worker's region: the query's ledger has room now for
@@ -91,6 +93,15 @@ pub fn refusedDraw(ws: AggWorkspace, err: anyerror) bool {
     return false;
 }
 
+
+/// A mapped scan reading ahead: advice for a claimed item's gated column (`scan/read_ahead.zig`
+/// `ReadAhead.adviseClaimed`), capped, ledger-checked and counted as the read-ahead's own; `held` is the worker's count
+/// of it, given back at its next claim.
+pub const GateAdvice = struct {
+    ctx: *anyopaque,
+    held: *u64,
+    advise: *const fn (ctx: *anyopaque, file: usize, range: []const u8, held: *u64) void,
+};
 
 const CacheDictionary = struct { entries: usize, bytes: usize };
 

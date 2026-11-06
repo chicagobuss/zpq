@@ -261,6 +261,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
     var block_end: usize = 0;
     var block: ?usize = null;
     var table: ?*expr_agg.GroupTable = if (w.blocks == null and w.group_tables.len > 0) &w.group_tables[w.index] else null;
+    // What this worker's item holds of the read-ahead's cap for its gated columns (`ReadAhead.adviseClaimed`).
+    var gated_held: u64 = 0;
+    defer if (w.read_ahead) |ra| ra.releaseHeld(&gated_held);
     while (true) {
         const claimed: ?usize = if (w.blocks) |bounds| claim: {
             while (next == block_end) {
@@ -285,7 +288,9 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             release_span = .begin(prof);
             break;
         };
-        // Before this item's own decode: the items after it are read while it is.
+        // Before this item's own decode: the items after it are read while it is. The last item's gated advice is
+        // decoded by now, and given back first.
+        if (w.read_ahead) |ra| ra.releaseHeld(&gated_held);
         if (w.read_ahead) |ra| ra.claimed(idx, if (table) |gt| if (gt.countOnly()) w.count_columns else null else null);
         if (table) |gt| if (gt.discoveryDone(expr_agg.firstPosition(idx, 0))) continue;
         errdefer w.failure_work = idx;
@@ -391,6 +396,7 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .defer_decode_errors = w.failure_probe != null,
             .gated = if (w.read_ahead) |ra| ra.gated else null,
             .kept = if (w.read_ahead) |ra| ra.kept else null,
+            .gate_advice = if (w.read_ahead) |ra| ra.gateAdvice(&gated_held) else null,
         }) catch |err| {
             if (consumer.isDecodeError(err)) {
                 w.failed_item = idx;

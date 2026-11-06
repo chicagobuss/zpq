@@ -72,13 +72,15 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
     return base;
 }
 
-/// For a mapped scan reading ahead (`AggWorkspace.kept`): advise (`MADV_WILLNEED`) the pages of column `ci`'s chunk a
-/// reader gated by `gate` reads, the dictionary and every data page holding a row `gate` keeps, by the reader's own
-/// test (`ColumnChunkReader.advancePage`). Each is advised as the walk reads its header, so its body is read while the
-/// walk and then the decode go on, instead of a fault at a time as the decode reaches it; advice stops short of the OS
-/// page holding the next header, which the walk reads now. A page the gate passes is never advised: its header, which
-/// the reader reads too, is all of it read. Records in `ws.kept` whether the gate kept every data page. Advisory only:
-/// a header the walk cannot read ends it, unrecorded. Not for a row subgroup, whose readers seek by the page index.
+/// For a mapped scan reading ahead (`AggWorkspace.kept`): advise the pages of column `ci`'s chunk a reader gated by
+/// `gate` reads, the dictionary and every data page holding a row `gate` keeps, by the reader's own test
+/// (`ColumnChunkReader.advancePage`). Each is handed to the read-ahead as the walk reads its header
+/// (`AggWorkspace.gate_advice`), whose bounds hold for it as for its own cursor: calls of a block at most, resident
+/// blocks skipped, and only while the bytes advised and not yet decoded stay within its cap (the window, or what the
+/// ledger has free); past that the pages fault in as the decode reaches them. Advice stops short of the OS page holding
+/// the next header, which the walk reads now. A page the gate passes is never advised: its header, which the reader
+/// reads too, is all of it read. Records in `ws.kept` whether the gate kept every data page. Advisory only: a header
+/// the walk cannot read ends it, unrecorded. Not for a row subgroup, whose readers seek by the page index.
 pub fn adviseGated(in: AggRowGroup, ci: usize, gate: *const filter_selection.SelectionVector, ws: AggWorkspace) void {
     if (builtin.os.tag != .linux) return;
     const kept = ws.kept orelse return;
@@ -117,7 +119,7 @@ pub fn adviseGated(in: AggRowGroup, ci: usize, gate: *const filter_selection.Sel
         const end = @intFromPtr(chunk.ptr) + walk.pos;
         // The chunk's last page has no header after it to read.
         const hi = if (walk.pos >= chunk.len) std.mem.alignForward(usize, end, os_page) else std.mem.alignBackward(usize, end, os_page);
-        if (hi > lo) _ = std.os.linux.madvise(@ptrFromInt(lo), hi - lo, std.os.linux.MADV.WILLNEED);
+        if (hi > lo) if (ws.gate_advice) |ga| ga.advise(ga.ctx, in.file_index, @as([*]const u8, @ptrFromInt(lo))[0 .. hi - lo], ga.held);
     }
     kept[ci].store(all, .monotonic);
 }

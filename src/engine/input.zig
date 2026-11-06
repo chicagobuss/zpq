@@ -1136,13 +1136,14 @@ pub const LocalIo = struct {
 
 /// The mapped read-ahead of local inputs (`LocalIo.read_ahead`). Its window is a quarter of the query's budget, within
 /// the reader's own window (`s3_window.windowFor`) and never past a quarter of the host's memory: the pages are the
-/// page cache's, but a window past what the host holds would evict them before the workers reach them. The scan caps
-/// it again by what the query's ledger has free as it advises (`ReadAhead.cap`).
+/// page cache's, but a window past what the host holds would evict them before the workers reach them. Nor past what
+/// one of the device's hardware queues holds in flight (`deviceQueueBytes`): advice past that waits in the block layer
+/// behind what is queued already, and the faults the workers issue meanwhile wait behind it. The scan caps it again by
+/// what the query's ledger has free as it advises (`ReadAhead.cap`).
 fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInputs) ?scan_read_ahead.Config {
     if (@import("builtin").os.tag != .linux or !allLocal(opened)) return null;
     const avail: u64 = system.discoverAvailableMemory(null);
-    const window = @min(@min(s3_window.windowFor(args.max_memory), args.max_memory / 4), avail / 4);
-    if (window == 0) return null;
+    var window: u64 = @min(@min(s3_window.windowFor(args.max_memory), args.max_memory / 4), avail / 4);
     // One sysfs read per device the files sit on, not per file.
     var block: usize = std.math.maxInt(usize);
     var seen: ?[2]u32 = null;
@@ -1154,7 +1155,9 @@ fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInpu
         if (seen) |d| if (d[0] == dev[0] and d[1] == dev[1]) continue;
         seen = dev;
         block = @min(block, deviceReadAhead(arena, dev));
+        if (deviceQueueBytes(arena, dev)) |q| window = @min(window, q);
     }
+    if (window == 0) return null;
     // Residency and advice through each file's descriptor, where the mapping kept one (`scan_read_ahead.Config.fds`).
     const fds = arena.alloc(i32, opened.mmaps.len) catch return .{ .window = window, .block = block };
     for (opened.mmaps, fds) |m, *fd| fd.* = if (m) |mapped| mapped.fd orelse -1 else -1;
@@ -1176,19 +1179,33 @@ fn deviceOf(arena: std.mem.Allocator, path: []const u8) ?[2]u32 {
 
 /// The read-ahead of block device `dev`, in bytes: the most one `WILLNEED` call reads.
 fn deviceReadAhead(arena: std.mem.Allocator, dev: [2]u32) usize {
+    const kb = deviceQueue(arena, dev, "read_ahead_kb") orelse return default_read_ahead;
+    return kb << 10;
+}
+
+/// What one hardware queue of block device `dev` holds in flight, in bytes: its requests (`nr_requests`) at their
+/// largest (`max_sectors_kb`). Null where sysfs does not say.
+fn deviceQueueBytes(arena: std.mem.Allocator, dev: [2]u32) ?u64 {
+    const requests = deviceQueue(arena, dev, "nr_requests") orelse return null;
+    const kb = deviceQueue(arena, dev, "max_sectors_kb") orelse return null;
+    return std.math.mul(u64, requests, kb << 10) catch null;
+}
+
+/// A positive number from block device `dev`'s sysfs `queue/name`. A partition's queue is its disk's: the parent
+/// directory in sysfs.
+fn deviceQueue(arena: std.mem.Allocator, dev: [2]u32, name: []const u8) ?usize {
     var buf: [32]u8 = undefined;
-    // A partition's queue is its disk's: the parent directory in sysfs.
     for ([_][]const u8{ "queue", "../queue" }) |dir| {
-        const file = std.fmt.allocPrintSentinel(arena, "/sys/dev/block/{d}:{d}/{s}/read_ahead_kb", .{
-            dev[0], dev[1], dir,
-        }, 0) catch return default_read_ahead;
+        const file = std.fmt.allocPrintSentinel(arena, "/sys/dev/block/{d}:{d}/{s}/{s}", .{
+            dev[0], dev[1], dir, name,
+        }, 0) catch return null;
         const fd = std.posix.openat(std.posix.AT.FDCWD, file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch continue;
         defer _ = std.posix.system.close(fd);
         const n = std.posix.read(fd, &buf) catch continue;
-        const kb = std.fmt.parseInt(usize, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
-        if (kb > 0) return kb << 10;
+        const v = std.fmt.parseInt(usize, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
+        if (v > 0) return v;
     }
-    return default_read_ahead;
+    return null;
 }
 
 /// The one choice every local read makes, scan or write: plan the reads (`metas` must be given when

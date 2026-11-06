@@ -16,7 +16,8 @@
 //!   while the latest such reader found its gate keeping every page (`kept`). A gated column whose pages are skipped
 //!   is never advised ahead of the survivors that skip them;
 //! - how far: a few items per worker ahead of the latest claim, paced by the claims (each moves the cursor by about
-//!   one item), and a hard cap on the bytes advised and not yet claimed: the caller's window (`Config`), or what the query's ledger has free when it is less, whichever is
+//!   one item), and a hard cap on the bytes advised and not yet claimed: the caller's window (`Config`: within what
+//!   one of the device's hardware queues holds), or what the query's ledger has free when it is less, whichever is
 //!   smaller each time it advances. The cap holds within an item too: a cursor advises an item block by block and
 //!   stops at the cap mid-chunk, the rest left to the next claim or to demand faults. A cap below one page advises
 //!   nothing. Advice never waits for room: it is optional, and a fault reads what it declined;

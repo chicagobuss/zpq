@@ -254,7 +254,70 @@ pub fn floatShape(s: []const u8) ?u8 {
     if (i == exp_start or i != s.len or sig > max_double_digits) return null;
     const v = std.fmt.parseFloat(f64, s) catch return null;
     if (!std.math.isFinite(v)) return null;
+    // Past the normal range fewer digits survive (a subnormal keeps as few as one), and underflow keeps none.
+    if (!roundTrips(s, v)) return null;
     return @intCast(@max(sig, 1));
+}
+
+/// A number's decimal digits without leading or trailing zeros, and the power of ten of the first of them.
+const Normal = struct {
+    digits: [24]u8 = undefined,
+    len: usize = 0,
+    exp: i64 = 0,
+    /// Too many digits to compare (more than any accepted text has).
+    long: bool = false,
+
+    fn of(text: []const u8) ?Normal {
+        var n: Normal = .{};
+        var i: usize = 0;
+        if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
+        var point: ?i64 = null;
+        var seen: i64 = 0; // mantissa digits read, leading zeros included
+        var first: ?i64 = null; // position of the first nonzero digit among them
+        var trailing: usize = 0;
+        while (i < text.len and text[i] != 'e' and text[i] != 'E') : (i += 1) {
+            const c = text[i];
+            if (c == '.') {
+                point = seen;
+                continue;
+            }
+            if (c < '0' or c > '9') return null;
+            if (first == null and c == '0') {
+                seen += 1;
+                continue;
+            }
+            if (first == null) first = seen;
+            seen += 1;
+            if (n.len == n.digits.len) {
+                n.long = true;
+                continue;
+            }
+            n.digits[n.len] = c;
+            n.len += 1;
+            trailing = if (c == '0') trailing + 1 else 0;
+        }
+        var e: i64 = 0;
+        if (i < text.len) e = std.fmt.parseInt(i64, text[i + 1 ..], 10) catch return null;
+        const f = first orelse return n; // zero: no digits
+        n.len -= trailing;
+        n.exp = e + (point orelse seen) - f - 1;
+        return n;
+    }
+
+    fn eql(a: Normal, b: Normal) bool {
+        return !a.long and !b.long and a.exp == b.exp and std.mem.eql(u8, a.digits[0..a.len], b.digits[0..b.len]);
+    }
+};
+
+/// Whether `v`, the double `text` parses to, still says what `text` says: its shortest round-trip form has the same
+/// digits and power of ten. True for every normal double up to 15 significant digits; false for underflow to zero
+/// and for a subnormal whose digits the double cannot keep.
+fn roundTrips(text: []const u8, v: f64) bool {
+    var buf: [40]u8 = undefined;
+    const shortest = std.fmt.bufPrint(&buf, "{e}", .{@abs(v)}) catch return false;
+    const want = Normal.of(text) orelse return false;
+    const got = Normal.of(shortest) orelse return false;
+    return want.eql(got);
 }
 
 fn special(s: []const u8) ?f64 {
@@ -618,6 +681,21 @@ test "csv review P1-1: a late quoted-empty value does not fit a DOUBLE column; i
     try testing.expectEqual(Kind.string, classify("1e5", true).join(classify("", true)).kind);
 }
 
+test "csv review P1-3: a DOUBLE holds its text's number, or the column is STRING" {
+    // Underflow and a subnormal that cannot keep the text's digits are no doubles.
+    for ([_][]const u8{ "1e-400", "123456789012345e-334", "4.9e-324", "2.225073858507201e-308", "1e309" }) |s| {
+        try testing.expectEqual(Kind.string, classify(s, true).kind);
+        try testing.expect(!fits(.{ .kind = .float64, .sig = 1 }, s, true));
+    }
+    // A subnormal or extreme normal that round-trips stays a double, with its exact value.
+    for ([_][]const u8{ "5e-324", "1e-320", "2.2250738585072e-308", "1e308", "1.79769313486231e308", "-1e-310" }) |s| {
+        try testing.expectEqual(Kind.float64, classify(s, true).kind);
+        try testing.expectEqual(std.fmt.parseFloat(f64, s) catch unreachable, parseFloat(s).?);
+    }
+    try testing.expectEqual(Kind.float64, classify("0e0", true).kind);
+    try testing.expectEqual(Kind.float64, classify("0.000e-5", true).kind);
+}
+
 test "csv dates and timestamps: valid calendar, exact fractions, offsets as instants" {
     try testing.expectEqual(@as(?i32, 0), parseDate("1970-01-01"));
     try testing.expectEqual(@as(?i32, 19723), parseDate("2024-01-01"));
@@ -700,7 +778,7 @@ test "csv property: temporal joins in any order hold every value" {
             t = t.join(classify(p.*, true));
         }
         for (picked) |p| if (!fits(t, p, true)) {
-            std.debug.print("{s} does not fit {s} (nanos {}) built from {any}\n", .{ p, @tagName(t.kind), t.nanos, picked });
+            std.debug.print("{s} does not fit {s} built from {any}\n", .{ p, @tagName(t.kind), picked });
             return error.TestUnexpectedResult;
         };
     }

@@ -50,16 +50,42 @@ def decimals():
         yield s, f"DECIMAL({digits},0)", f"CAST('{s}' AS DECIMAL({digits},0))::VARCHAR"
 
 
+def normal(text):
+    """Digits without leading/trailing zeros and the power of ten of the first: the number a text says."""
+    t = text.lstrip("+-").lower()
+    mant, _, exp = t.partition("e")
+    whole, _, frac = mant.partition(".")
+    digits = (whole + frac).lstrip("0")
+    if not digits:
+        return ("", 0)
+    lead = len(whole + frac) - len((whole + frac).lstrip("0"))
+    return (digits.rstrip("0"), int(exp or 0) + len(whole) - lead - 1)
+
+
+def double_kind(s):
+    """zpq's rule: a finite double whose shortest repr says the same number, with at most 15 significant digits."""
+    v = float(s)
+    if v in (float("inf"), float("-inf")) or len(normal(s)[0]) > 15:
+        return "VARCHAR"
+    return "DOUBLE" if normal(repr(abs(v))) == normal(s) else "VARCHAR"
+
+
 def doubles():
-    for _ in range(600):
+    for _ in range(900):
         sig = rng.randint(1, 15)
         mant = str(rng.randint(10 ** (sig - 1), 10 ** sig - 1))
         if len(mant) > 1 and rng.random() < .5:
             k = rng.randint(1, len(mant) - 1)
             mant = mant[:k] + "." + mant[k:]
-        exp = rng.randint(-300, 300)
+        # Over the whole exponent range: underflow, subnormals, the normal boundary and overflow.
+        exp = rng.choice([rng.randint(-345, 310), rng.randint(-330, -300), rng.randint(300, 310)])
         s = f"{'-' if rng.random() < .3 else ''}{mant}{rng.choice('eE')}{exp}"
-        yield s, "DOUBLE", f"CAST('{s}' AS DOUBLE)"
+        kind = double_kind(s)
+        yield s, kind, f"CAST('{s}' AS DOUBLE)" if kind == "DOUBLE" else "'-'"
+    for s in ("5e-324", "4.9e-324", "1e-400", "2.2250738585072e-308", "2.225073858507201e-308", "1e308",
+              "1.79769313486231e308", "1e309", "123456789012345e-334", "1e-320"):
+        kind = double_kind(s)
+        yield s, kind, f"CAST('{s}' AS DOUBLE)" if kind == "DOUBLE" else "'-'"
     for s in ("NaN", "inf", "-inf", "Infinity", "-0", "-0.0"):
         yield s, "DOUBLE", f"CAST('{s}' AS DOUBLE)"
 
@@ -74,11 +100,22 @@ def dates():
         yield s, "DATE", f"(CAST('{s}' AS DATE) - DATE '1970-01-01')::VARCHAR"
 
 
+NS_MIN = -(1 << 63)
+NS_MAX = (1 << 63) - 1
+
+
+def epoch_ns(y, mo, d, h, mi, sec, frac, offset_min):
+    import datetime
+    days = (datetime.date(y, mo, d) - datetime.date(1970, 1, 1)).days
+    return ((days * 86400 + h * 3600 + mi * 60 + sec - offset_min * 60) * 10**9 + int((frac + "000000000")[:9] or 0))
+
+
 def timestamps():
-    for _ in range(500):
-        y = rng.randint(1678, 2261)
-        base = f"{y:04d}-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}{rng.choice(' T')}" \
-               f"{rng.randint(0, 23):02d}:{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}"
+    for _ in range(700):
+        y = rng.randint(1678, 2261) if rng.random() < .6 else rng.randint(1, 9999)
+        mo, d = rng.randint(1, 12), rng.randint(1, 28)
+        h, mi, sec = rng.randint(0, 23), rng.randint(0, 59), rng.randint(0, 59)
+        base = f"{y:04d}-{mo:02d}-{d:02d}{rng.choice(' T')}{h:02d}:{mi:02d}:{sec:02d}"
         frac_len = rng.choice([0, 0, 1, 3, 6, 9])
         frac = "".join(rng.choice("0123456789") for _ in range(frac_len))
         if frac_len > 6:
@@ -86,6 +123,10 @@ def timestamps():
         s = base + (f".{frac}" if frac_len else "")
         tz = rng.choice(["", "", "Z", "+02:00", "-05:30"])
         nanos = frac_len > 6
+        offset = {"": 0, "Z": 0, "+02:00": 120, "-05:30": -330}[tz]
+        if nanos and not NS_MIN <= epoch_ns(y, mo, d, h, mi, sec, frac, offset) <= NS_MAX:
+            yield s + tz, "VARCHAR", "'-'"  # nanoseconds outside int64 nanoseconds: no timestamp type
+            continue
         if tz:
             if nanos:
                 continue  # DuckDB has no nanosecond TIMESTAMPTZ

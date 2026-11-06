@@ -37,6 +37,28 @@ pub fn orderValues(a: AggValue, b: AggValue, descending: bool) std.math.Order {
     return orderSortKeys(sortKey(a), sortKey(b), descending);
 }
 
+/// `orderValues` under an ORDER BY key: its direction, and NULLS FIRST when it says so.
+pub fn orderByKey(a: AggValue, b: AggValue, key: anytype) std.math.Order {
+    const ord = orderValues(a, b, key.descending);
+    if (!key.nulls_first or (a == .null_val) == (b == .null_val)) return ord;
+    return ord.invert();
+}
+
+test "orderByKey puts NULL last in either direction and first under NULLS FIRST" {
+    const t = std.testing;
+    const one: AggValue = .{ .i = 1 };
+    const two: AggValue = .{ .i = 2 };
+    const nul: AggValue = .null_val;
+    const Key = struct { descending: bool, nulls_first: bool = false };
+    try t.expectEqual(std.math.Order.lt, orderByKey(one, nul, Key{ .descending = false }));
+    try t.expectEqual(std.math.Order.lt, orderByKey(one, nul, Key{ .descending = true }));
+    try t.expectEqual(std.math.Order.gt, orderByKey(one, nul, Key{ .descending = false, .nulls_first = true }));
+    try t.expectEqual(std.math.Order.gt, orderByKey(one, nul, Key{ .descending = true, .nulls_first = true }));
+    try t.expectEqual(std.math.Order.eq, orderByKey(nul, nul, Key{ .descending = false, .nulls_first = true }));
+    try t.expectEqual(std.math.Order.lt, orderByKey(one, two, Key{ .descending = false, .nulls_first = true }));
+    try t.expectEqual(std.math.Order.gt, orderByKey(one, two, Key{ .descending = true, .nulls_first = true }));
+}
+
 pub fn orderSortKeys(a: SortKey, b: SortKey, descending: bool) std.math.Order {
     const a_null = a == .none;
     const b_null = b == .none;

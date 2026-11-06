@@ -135,6 +135,8 @@ pub const LikeMatch = struct {
     kind: LikeKind,
     operand: []const u8,
     negate: bool, // true → NOT LIKE
+    /// ILIKE: `operand` is the whole pattern in ASCII lower case (kind `.general`), matched with the value folded.
+    fold: bool = false,
 };
 
 /// Backtracking `%`/`_` matcher for the general case. `%` matches any run
@@ -169,6 +171,61 @@ pub fn likeGlob(pattern: []const u8, str: []const u8) bool {
     }
     while (p < pattern.len and pattern[p] == '%') p += 1;
     return p == pattern.len;
+}
+
+/// `likeGlob` for ILIKE: `pattern` is ASCII lower case, and each character of `str` is folded as DuckDB's `lower`
+/// folds it before comparing: ASCII letters to lower case, and the two non-ASCII characters whose lower case is an
+/// ASCII letter, KELVIN SIGN (U+212A, `k`) and LATIN CAPITAL I WITH DOT ABOVE (U+0130, `i`). Any other non-ASCII byte
+/// stays itself and so matches no ASCII pattern byte; `%` and `_` count characters as `likeGlob` counts them.
+pub fn likeGlobFold(pattern: []const u8, str: []const u8) bool {
+    var p: usize = 0;
+    var s: usize = 0;
+    var star_p: ?usize = null;
+    var star_s: usize = 0;
+    while (s < str.len) {
+        if (p < pattern.len and pattern[p] == '%') {
+            star_p = p;
+            star_s = s;
+            p += 1;
+        } else if (p < pattern.len and pattern[p] == '_') {
+            p += 1;
+            s += charLen(str, s);
+        } else if (p < pattern.len and foldedLen(str, s, pattern[p]) != 0) {
+            s += foldedLen(str, s, pattern[p]);
+            p += 1;
+        } else if (star_p) |sp| {
+            p = sp + 1;
+            star_s += charLen(str, star_s);
+            s = star_s;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '%') p += 1;
+    return p == pattern.len;
+}
+
+/// The bytes of the character at `str[i]` when it folds to `want`, else 0.
+fn foldedLen(str: []const u8, i: usize, want: u8) usize {
+    const b = str[i];
+    if (b < 0x80) return if (std.ascii.toLower(b) == want) 1 else 0;
+    if (want == 'k' and std.mem.startsWith(u8, str[i..], "\xe2\x84\xaa")) return 3;
+    if (want == 'i' and std.mem.startsWith(u8, str[i..], "\xc4\xb0")) return 2;
+    return 0;
+}
+
+test "likeGlobFold folds ASCII and the two non-ASCII characters DuckDB's lower folds to ASCII" {
+    const t = std.testing;
+    try t.expect(likeGlobFold("alpha", "ALPHA"));
+    try t.expect(likeGlobFold("al%", "ALpha"));
+    try t.expect(likeGlobFold("%ph_", "ALPHA"));
+    try t.expect(!likeGlobFold("alpha", "ALPH"));
+    try t.expect(likeGlobFold("", ""));
+    try t.expect(!likeGlobFold("", "a"));
+    try t.expect(likeGlobFold("k_lvin", "\xe2\x84\xaaELVIN")); // KELVIN SIGN is `k`: one character
+    try t.expect(likeGlobFold("kelvin", "\xe2\x84\xaaelvin"));
+    try t.expect(likeGlobFold("istanbul", "\xc4\xb0STANBUL")); // I WITH DOT ABOVE is `i`
+    try t.expect(!likeGlobFold("i_", "\xc4\xb0")); // and only one character
+    try t.expect(likeGlobFold("_", "\xc3\xa9")); // `_` takes a whole UTF-8 character
+    try t.expect(!likeGlobFold("e", "\xc3\x89")); // other non-ASCII letters keep their bytes
 }
 
 /// Bytes of the UTF-8 character starting at `str[i]`: its lead byte's sequence length when every continuation byte
@@ -226,6 +283,11 @@ test "containsBytes finds exactly what a byte-by-byte search finds" {
         const want = std.mem.indexOf(u8, hay[0..hn], needle[0..nn]) != null;
         try std.testing.expectEqual(want, containsBytes(hay[0..hn], needle[0..nn]));
     }
+}
+
+/// Apply a LIKE leaf to one value (before the NOT flip).
+pub fn leafMatches(m: LikeMatch, value: []const u8) bool {
+    return if (m.fold) likeGlobFold(m.operand, value) else likeMatches(m.kind, m.operand, value);
 }
 
 /// Apply a classified LIKE to one value (before the NOT flip).
@@ -323,7 +385,7 @@ pub fn eql(a: Filter, b: Filter) bool {
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not and
             n.trust_stats == b.null_check.trust_stats,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
-            std.mem.eql(u8, m.operand, b.like.operand),
+            m.fold == b.like.fold and std.mem.eql(u8, m.operand, b.like.operand),
         inline .int32, .int64, .uint64, .decimal, .boolean => |l, tag| blk: {
             const o = @field(b, @tagName(tag));
             break :blk l.col_idx == o.col_idx and l.op == o.op and l.value == o.value and
@@ -440,7 +502,7 @@ pub fn cost(f: Filter) Cost {
     return switch (f) {
         .int32, .int64, .uint64, .float, .double, .decimal, .boolean, .null_check => .fixed,
         .string => |l| if (l.value.len == 0 and (l.op == .Eq or l.op == .NotEq)) .fixed else .string,
-        .like => |m| switch (m.kind) {
+        .like => |m| if (m.fold) .like_search else switch (m.kind) {
             .exact, .prefix, .suffix => .like_anchored,
             .contains, .general => .like_search,
         },

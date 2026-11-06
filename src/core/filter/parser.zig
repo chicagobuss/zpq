@@ -44,6 +44,8 @@ pub const Error = error{
     ModuloNotSupported,
     /// Arithmetic where a predicate compares a column (`x + 1 > 5`): the left side must be a column.
     ExpressionInPredicate,
+    /// ILIKE with a pattern that has a character past ASCII: folding it takes Unicode case mapping zpq has not got.
+    IlikePatternNotAscii,
     /// A typed DATE, TIMESTAMP or DECIMAL literal against a column of another kind (`DATE '2024-01-01'` against text):
     /// DuckDB casts the column, not the literal, and zpq has no such cast.
     TypedLiteralColumn,
@@ -123,7 +125,7 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Predicate, file: *const s
             break :blk if (isNullLiteral(c.value)) unknown else buildOperandComparison(arena, file, operand, c.op, c.value, diag);
         },
         .null_check => |n| .{ .null_check = .{ .col_idx = try resolveCol(file, n.column, diag), .is_not = n.is_not } },
-        .like => |l| parseLike(true, arena, l.column, l.pattern, l.negate, file, diag),
+        .like => |l| parseLike(true, arena, l.column, l.pattern, l.negate, l.fold, file, diag),
         .boolean => |name| bareBoolean(true, arena, name, file, diag),
         .in_list => |list| blk: {
             if (list.values.len == 0) return error.BadValue;
@@ -421,10 +423,10 @@ fn parseLeafBody(
     // `col LIKE 'pat'` / `col NOT LIKE 'pat'` — SQL wildcard match.
     // " NOT LIKE " must be checked first (it contains " LIKE ").
     if (try topLevelIndexOf(expr, " NOT LIKE ")) |i| {
-        return parseLike(bound, arena, expr[0..i], expr[i + " NOT LIKE ".len ..], true, file, diag);
+        return parseLike(bound, arena, expr[0..i], expr[i + " NOT LIKE ".len ..], true, false, file, diag);
     }
     if (try topLevelIndexOf(expr, " LIKE ")) |i| {
-        return parseLike(bound, arena, expr[0..i], expr[i + " LIKE ".len ..], false, file, diag);
+        return parseLike(bound, arena, expr[0..i], expr[i + " LIKE ".len ..], false, false, file, diag);
     }
 
     // `col [NOT] IN (v1, v2, ...)` → OR-of-equalities (or AND-of-inequalities
@@ -482,12 +484,13 @@ fn parseLike(
     col_part: []const u8,
     pat_part: []const u8,
     negate: bool,
+    fold: bool,
     file: *const schema.FileMetaData,
     diag: ?*Diag,
 ) Error!FilterNode(bound) {
     const col_name = trimSpace(col_part);
     if (col_name.len == 0) return error.BadOperator;
-    if (!bound) return .{ .like = .{ .column = col_name, .pattern = trimSpace(pat_part), .negate = negate } };
+    if (!bound) return .{ .like = .{ .column = col_name, .pattern = trimSpace(pat_part), .negate = negate, .fold = fold } };
     const col_idx = try resolveCol(file, col_name, diag);
     const elem = metadata.leafSchemaElement(file, col_idx) orelse return error.UnknownColumn;
     if (elem.type != .BYTE_ARRAY) {
@@ -498,6 +501,18 @@ fn parseLike(
     // `s LIKE NULL` is UNKNOWN for every row, as `s = NULL` is: the bare word is the NULL literal, not the text 'NULL'.
     if (isNullLiteral(trimSpace(pat_part))) return unknown;
     const pattern = try stringValue(arena, file, col_name, trimSpace(pat_part), diag);
+    if (fold) {
+        // ILIKE folds ASCII letters; a pattern with any other character would need Unicode case mapping.
+        const lowered = try arena.alloc(u8, pattern.len);
+        for (pattern, lowered) |ch, *out| {
+            if (ch >= 0x80) {
+                Diag.setColumn(diag, metadata.unquoteIdent(col_name));
+                return error.IlikePatternNotAscii;
+            }
+            out.* = std.ascii.toLower(ch);
+        }
+        return ast.Filter{ .like = .{ .col_idx = col_idx, .kind = .general, .operand = lowered, .negate = negate, .fold = true } };
+    }
     const c = classifyLike(pattern);
     return ast.Filter{ .like = .{ .col_idx = col_idx, .kind = c.kind, .operand = c.operand, .negate = negate } };
 }
@@ -669,7 +684,7 @@ pub fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
         // NOT (x IS NULL) == x IS NOT NULL, and vice-versa.
         .null_check => |nc| .{ .null_check = .{ .col_idx = nc.col_idx, .is_not = !nc.is_not } },
         // NOT (x LIKE p) == x NOT LIKE p — flip the negate flag.
-        .like => |m| .{ .like = .{ .col_idx = m.col_idx, .kind = m.kind, .operand = m.operand, .negate = !m.negate } },
+        .like => |m| .{ .like = .{ .col_idx = m.col_idx, .kind = m.kind, .operand = m.operand, .negate = !m.negate, .fold = m.fold } },
         // De Morgan, a node at a time: the tree is at most a few levels deep (see `ast.Composite`).
         .and_filter, .or_filter => |c| blk: {
             const children = try arena.alloc(ast.Filter, c.children.len);

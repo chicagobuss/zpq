@@ -204,7 +204,7 @@ pub fn evalLike(
             sel.set(i, false);
             continue;
         }
-        const hit = ast.likeMatches(m.kind, m.operand, values[i]);
+        const hit = ast.leafMatches(m, values[i]);
         if (hit == m.negate) sel.set(i, false); // NOT LIKE flips the keep test
     }
 }
@@ -607,7 +607,7 @@ pub fn evaluate(
             if (col.string.codes) |codes| {
                 const match = try arena.alloc(u8, col.string.dict.len);
                 for (col.string.dict, match) |entry, *bit| {
-                    const hit = ast.likeMatches(m.kind, m.operand, entry);
+                    const hit = ast.leafMatches(m, entry);
                     bit.* = @intFromBool(hit != m.negate);
                 }
                 applyCodeMatch(codes, match, col.string.def_levels, col.string.max_def, sel);

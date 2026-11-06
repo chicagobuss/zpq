@@ -10,7 +10,7 @@ const ByteStream = @import("byte_stream.zig").ByteStream;
 const output_values = @import("output_values.zig");
 const AggValue = output_values.AggValue;
 const AggOutputItem = output_values.AggOutputItem;
-const orderValues = output_values.orderValues;
+const orderByKey = output_values.orderByKey;
 
 /// The aggregate answer, owned in the `gpa` passed to `runMultiAggregate`; `deinit` frees all of it, including a
 /// partly built one. Without GROUP BY, `aggs` holds one value per aggregate; with it, `group_rows` holds one row per
@@ -253,7 +253,7 @@ pub const AggOutput = struct {
 
     fn rowLessThan(keys: []const expr_ast.OrderKey, a: []const AggValue, b: []const AggValue) bool {
         for (keys) |key| {
-            const ord = orderValues(a[key.column], b[key.column], key.descending);
+            const ord = orderByKey(a[key.column], b[key.column], key);
             if (ord != .eq) return ord == .lt;
         }
         return false;

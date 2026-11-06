@@ -228,8 +228,9 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.UnbalancedParentheses => diagnosticPrint("zpq query: unbalanced parentheses in filter\n", .{}),
         error.UnsupportedCase => diagnosticPrint(
-            "zpq query: only searched CASE (CASE WHEN cond THEN v ... END) is supported, with\n" ++
-                "branches of one common type (DECIMAL branches of one DECIMAL type)\n",
+            "zpq query: CASE takes the searched form (CASE WHEN cond THEN v ... END) or a column and\n" ++
+                "literals (CASE c WHEN 1 THEN v ... END), with branches of one common type (DECIMAL\n" ++
+                "branches of one DECIMAL type)\n",
             .{},
         ),
         error.HavingTypeMismatch => diagnosticPrint(
@@ -242,6 +243,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.BadOperator => diagnosticPrint("zpq query: invalid operator in filter\n", .{}),
         error.BadValue => diagnosticPrint("zpq query: invalid value in filter\n", .{}),
+        error.IlikePatternNotAscii => diagnosticPrint(
+            "zpq query: ILIKE folds ASCII letters only, and the pattern for `{s}` has another character\n",
+            .{diag.column.get()},
+        ),
         error.TypedLiteralColumn => diagnosticPrint(
             "zpq query: a DATE, TIMESTAMP or DECIMAL literal compares with a column of its own kind, and `{s}` is not one\n",
             .{diag.column.get()},

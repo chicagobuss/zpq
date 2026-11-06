@@ -21,7 +21,11 @@ pub const ResultProgram = struct {
     /// the keys and hidden terms kept for binding. The semantic limit stays with this program.
     pub fn cutOrder(order: expr_ast.ResultOrder) expr_ast.ResultOrder {
         var masked = order;
-        if (order.having != null) {
+        // A NULLS FIRST key ranks NULLs the strategies' cuts (which rank them last) would drop: keep every group.
+        const nulls_first = for (order.keys) |k| {
+            if (k.nulls_first) break true;
+        } else false;
+        if (order.having != null or nulls_first) {
             masked.limit = null;
             masked.offset = 0;
         }

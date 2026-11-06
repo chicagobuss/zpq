@@ -24,7 +24,7 @@ pub const Predicate = union(enum) {
     not_: *const Predicate,
     comparison: struct { operand: Operand, op: filter.Operator, value: []const u8 },
     null_check: struct { column: []const u8, is_not: bool },
-    like: struct { column: []const u8, pattern: []const u8, negate: bool },
+    like: struct { column: []const u8, pattern: []const u8, negate: bool, fold: bool = false },
     in_list: struct { operand: Operand, values: []const []const u8, negate: bool },
     between: struct { operand: Operand, low: []const u8, high: []const u8, negate: bool },
     boolean: []const u8,
@@ -48,7 +48,7 @@ pub const Column = struct {
     expr: ?Expr = null,
 };
 
-pub const RowKey = struct { expr: Expr, display: []const u8, descending: bool };
+pub const RowKey = struct { expr: Expr, display: []const u8, descending: bool, nulls_first: bool = false };
 
 pub const Query = struct {
     aggregate: bool,

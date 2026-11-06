@@ -174,6 +174,70 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
     return info;
 }
 
+/// `SELECT DISTINCT a, b` is `SELECT a, b ... GROUP BY a, b` with no aggregate: the groups are the distinct rows, and
+/// NULLs fall in one group as DISTINCT puts them. With an aggregate, a star, a GROUP BY or a HAVING the rewrite would
+/// be another query, so those stay refused by name.
+fn distinctAsGroupBy(root: *c.LpNode, lp_arena: *c.arena_t) !void {
+    const sel = &root.*.u.select;
+    if (sel.distinct == 0) return;
+    if (sel.group_by.count != 0 or sel.having != null) {
+        diagnosticPrint("sql: DISTINCT with GROUP BY or HAVING is not supported yet\n", .{});
+        return error.DistinctNotSupported;
+    }
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(sel.result_columns.count))) : (i += 1) {
+        const expr = selectExpr(sel.*, i) orelse return error.SqlParseError;
+        if (expr.kind == c.LP_EXPR_STAR) {
+            diagnosticPrint("sql: SELECT DISTINCT * is not supported yet (name the columns)\n", .{});
+            return error.DistinctNotSupported;
+        }
+        const info = analyzeExpr(expr);
+        if (info.has_agg or info.has_window or info.has_subquery) {
+            diagnosticPrint("sql: DISTINCT over an aggregate, window or subquery is not supported yet\n", .{});
+            return error.DistinctNotSupported;
+        }
+        try pushGroupTerm(sel, lp_arena, expr);
+    }
+    sel.distinct = 0;
+}
+
+/// Add `expr` to GROUP BY once: a column or expression written alike is the same term.
+fn pushGroupTerm(sel: anytype, lp_arena: *c.arena_t, expr: *c.LpNode) !void {
+    const text_c = c.lp_ast_to_sql(expr, lp_arena);
+    if (text_c == null) return error.UnparseError;
+    const text = std.mem.span(text_c);
+    for (0..@intCast(sel.group_by.count)) |g| {
+        const term = sel.group_by.items[g] orelse continue;
+        if (sameColumnRef(expr, term) orelse blk: {
+            const other = c.lp_ast_to_sql(term, lp_arena);
+            break :blk other != null and std.ascii.eqlIgnoreCase(text, std.mem.span(other));
+        }) return;
+    }
+    c.lp_list_push(lp_arena, &sel.group_by, expr);
+}
+
+/// `GROUP BY ALL` groups by every SELECT item that is no aggregate (DuckDB). `sql_literals` spelled it as the one
+/// name `group_all_name`, which this swaps for those items; with none, the aggregates form one group, as with no GROUP BY.
+fn groupByAll(root: *c.LpNode, lp_arena: *c.arena_t) !void {
+    const sel = &root.*.u.select;
+    if (sel.group_by.count != 1) return;
+    const term = sel.group_by.items[0] orelse return;
+    if (term.*.kind != c.LP_EXPR_COLUMN_REF or term.*.u.column_ref.table != null or term.*.u.column_ref.column == null) return;
+    if (!std.mem.eql(u8, std.mem.span(term.*.u.column_ref.column), literals.group_all_name)) return;
+    sel.group_by.count = 0;
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(sel.result_columns.count))) : (i += 1) {
+        const expr = selectExpr(sel.*, i) orelse return error.SqlParseError;
+        if (expr.kind == c.LP_EXPR_STAR) {
+            diagnosticPrint("sql: GROUP BY ALL with SELECT * is not supported yet (name the columns)\n", .{});
+            return error.ColumnMustBeGrouped;
+        }
+        const info = analyzeExpr(expr);
+        if (info.has_agg or info.has_window or info.has_subquery) continue;
+        try pushGroupTerm(sel, lp_arena, expr);
+    }
+}
+
 /// Reject SELECT clauses zpq doesn't implement with a clear, named error
 /// instead of silently ignoring them and returning a confidently wrong
 /// answer. These are outside the bounded streaming SQL surface, not
@@ -555,6 +619,8 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
         diagnosticPrint("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
         return error.UnsupportedStatement;
     }
+    try distinctAsGroupBy(root, lp_arena);
+    try groupByAll(root, lp_arena);
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
     boolLiterals(root);
@@ -602,6 +668,7 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
     var lower: Lower = .{ .arena = if (syntax_owner) |owner| owner.allocator() else undefined, .lp_arena = lp_arena };
     const lowering = if (structured) &lower else null;
     const shape = try classifyQuery(allocator, root, lp_arena);
+    if (shape.has_group_by) try orderTermsAsKeys(allocator, root, lp_arena);
     const is_aggregate = shape.is_aggregate;
     const has_group_by = shape.has_group_by;
     var i: usize = 0;
@@ -898,14 +965,15 @@ fn resultOrder(
     for (keys, 0..) |*key, t| {
         const term = sel.order_by.items[t] orelse return error.SqlParseError;
         // The grammar spells NULLS FIRST as LP_SORT_ASC, NULLS LAST as LP_SORT_DESC, neither as LP_SORT_UNDEFINED.
-        if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
-            diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
-            return error.OrderByNotSupported;
-        }
+        // NULLs sort last by default, in either direction, so only NULLS FIRST changes the order.
         const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
         const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
             select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower);
-        key.* = .{ .column = column, .descending = term.*.u.order_term.direction == c.LP_SORT_DESC };
+        key.* = .{
+            .column = column,
+            .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+            .nulls_first = term.*.u.order_term.nulls == c.LP_SORT_ASC,
+        };
     }
     order.keys = keys;
     return order;
@@ -931,10 +999,6 @@ fn rowOrder(
     }
     for (keys) |*key| {
         const term = sel.order_by.items[made] orelse return error.SqlParseError;
-        if (term.*.u.order_term.nulls == c.LP_SORT_ASC) {
-            diagnosticPrint("sql: NULLS FIRST is not supported yet (NULLs sort last)\n", .{});
-            return error.OrderByNotSupported;
-        }
         var expr: *c.LpNode = term.*.u.order_term.expr orelse return error.SqlParseError;
         // A position or a SELECT alias stands for that item's expression.
         if (expr.kind == c.LP_EXPR_LITERAL_INT) {
@@ -963,10 +1027,12 @@ fn rowOrder(
             .expr = try l.expression(expr, 0),
             .display = try l.arena.dupe(u8, std.mem.span(text_c)),
             .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+            .nulls_first = term.*.u.order_term.nulls == c.LP_SORT_ASC,
         });
         key.* = .{
             .expr = try allocator.dupe(u8, std.mem.span(text_c)),
             .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,
+            .nulls_first = term.*.u.order_term.nulls == c.LP_SORT_ASC,
         };
         made += 1;
     }
@@ -1283,6 +1349,63 @@ fn groupedExpr(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t,
     return false;
 }
 
+/// `GROUP BY k ORDER BY k * 2`: the term reads only grouped columns, so it has one value per group, but the engine binds
+/// an ORDER BY term to a result column or a GROUP BY key. Adding the expression to GROUP BY as one more key makes it
+/// the latter and cannot change the groups, as it is a function of the keys already there.
+fn orderTermsAsKeys(allocator: std.mem.Allocator, root: *c.LpNode, lp_arena: *c.arena_t) !void {
+    const sel = &root.*.u.select;
+    for (0..@intCast(sel.order_by.count)) |t| {
+        const term = sel.order_by.items[t] orelse continue;
+        const expr: *c.LpNode = term.*.u.order_term.expr orelse continue;
+        if (expr.kind == c.LP_EXPR_LITERAL_INT or expr.kind == c.LP_EXPR_COLUMN_REF) continue;
+        const info = analyzeExpr(expr);
+        if (info.has_agg or info.has_window or info.has_subquery or !info.has_bare_col) continue;
+        if (try groupedExpr(allocator, sel.*, lp_arena, expr)) continue;
+        // A term a SELECT item already spells is that column, not a new key.
+        const text_c = c.lp_ast_to_sql(expr, lp_arena);
+        if (text_c == null) return error.UnparseError;
+        var selected = false;
+        for (0..@intCast(sel.result_columns.count)) |i| {
+            const item = selectExpr(sel.*, i) orelse continue;
+            const item_c = c.lp_ast_to_sql(item, lp_arena);
+            if (item_c != null and std.ascii.eqlIgnoreCase(std.mem.span(text_c), std.mem.span(item_c))) selected = true;
+        }
+        if (selected or !try columnsGrouped(allocator, sel.*, lp_arena, expr)) continue;
+        try pushGroupTerm(sel, lp_arena, expr);
+    }
+}
+
+/// Whether every column `expr` reads is a GROUP BY term, or sits in a subexpression that is one.
+fn columnsGrouped(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t, expr: *c.LpNode) !bool {
+    const Visit = struct {
+        allocator: std.mem.Allocator,
+        sel: @TypeOf(sel),
+        arena: *c.arena_t,
+        all: bool = true,
+        failed: bool = false,
+
+        fn enter(v: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+            const is_column = node.*.kind == c.LP_EXPR_COLUMN_REF;
+            // A subexpression that is a GROUP BY term (`n - 10` under GROUP BY n - 10) is one value per group, whatever
+            // columns it reads; the columns of anything else must each be a term.
+            const grouped = groupedExpr(self.allocator, self.sel, self.arena, node) catch {
+                self.failed = true;
+                return 2;
+            };
+            if (grouped) return 1;
+            if (!is_column) return 0;
+            self.all = false;
+            return 2;
+        }
+    };
+    var state: Visit = .{ .allocator = allocator, .sel = sel, .arena = lp_arena };
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(expr, &visitor);
+    if (state.failed) return error.UnparseError;
+    return state.all;
+}
+
 /// Whether `expr` (unparsed as `text`, quotes stripped) is the term `other`: the same column reference, case and
 /// quoting aside, or the same expression text.
 fn sameTerm(lp_arena: *c.arena_t, expr: *c.LpNode, text: []const u8, other: *c.LpNode) !bool {
@@ -1344,11 +1467,53 @@ test "sql_parser rejects unsupported clauses instead of silently dropping them" 
     const limited = try parseSqlQuery(a, "SELECT x FROM 't' LIMIT 5");
     defer limited.deinit(a);
     try std.testing.expectEqual(@as(?u64, 5), limited.result_order.limit);
-    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT x FROM 't'"));
+    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT * FROM 't'"));
+    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT count(*) AS c FROM 't'"));
+    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT y, sum(x) AS s FROM 't' GROUP BY y"));
+    try std.testing.expectError(error.DistinctNotSupported, parseSqlQuery(a, "SELECT DISTINCT ON (y) y, x FROM 't'"));
     try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, "SELECT x FROM 't' HAVING x > 1"));
     try std.testing.expectError(error.MixedSelectNotSupported, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't'"));
     try std.testing.expectError(error.UnsupportedStatement, parseSqlQuery(a, "SELECT x FROM 't' UNION SELECT x FROM 'u'"));
     try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT y, sum(x) AS s FROM 't' GROUP BY z"));
+}
+
+test "sql_parser: DISTINCT, GROUP BY ALL and an ORDER BY expression of the keys are GROUP BY" {
+    const a = std.testing.allocator;
+    const distinct = try parseSqlQuery(a, "SELECT DISTINCT x, y + 1 AS z, x FROM 't' ORDER BY z");
+    defer distinct.deinit(a);
+    try std.testing.expect(distinct.is_aggregate);
+    try std.testing.expectEqualStrings("x, y + 1", distinct.group_by_str.?);
+    try std.testing.expectEqual(@as(usize, 3), distinct.select_cols.len);
+    try std.testing.expectEqual(ast.SelectColumn.Role.key, distinct.select_cols[1].role);
+
+    const all = try parseSqlQuery(a, "SELECT g, n - 1 AS m, count(*) AS c FROM 't' GROUP BY ALL");
+    defer all.deinit(a);
+    try std.testing.expectEqualStrings("g, n - 1", all.group_by_str.?);
+    try std.testing.expectEqualStrings("count(*) AS c", all.aggregate_str.?);
+
+    // Only aggregates: one group, as with no GROUP BY at all.
+    const none = try parseSqlQuery(a, "SELECT count(*) AS c FROM 't' GROUP BY ALL");
+    defer none.deinit(a);
+    try std.testing.expect(none.group_by_str == null);
+
+    // `k * 2` reads only a grouped column: one value per group, so it joins the keys.
+    const ordered = try parseSqlQuery(a, "SELECT k, count(*) AS c FROM 't' GROUP BY k ORDER BY k * 2 DESC");
+    defer ordered.deinit(a);
+    try std.testing.expectEqualStrings("k, k * 2", ordered.group_by_str.?);
+    try std.testing.expectError(error.ColumnMustBeGrouped, parseSqlQuery(a, "SELECT k, count(*) AS c FROM 't' GROUP BY k ORDER BY j * 2"));
+}
+
+test "sql_parser: NULLS FIRST reaches the order keys and NULLS LAST is the default" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY y NULLS FIRST, c DESC NULLS LAST");
+    defer q.deinit(a);
+    try std.testing.expectEqualSlices(ast.OrderKey, &.{
+        .{ .column = 0, .descending = false, .nulls_first = true },
+        .{ .column = 1, .descending = true, .nulls_first = false },
+    }, q.result_order.keys);
+    const rows = try parseSqlQuery(a, "SELECT x FROM 't' ORDER BY x DESC NULLS FIRST");
+    defer rows.deinit(a);
+    try std.testing.expect(rows.result_order.rows[0].nulls_first and rows.result_order.rows[0].descending);
 }
 
 test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" {
@@ -1383,7 +1548,6 @@ test "sql_parser resolves ORDER BY / LIMIT / OFFSET against the result columns" 
         .{ .sql = "SELECT count(*) AS c FROM 't' ORDER BY sum(x)", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 3", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY 0", .err = error.OrderByNotSupported },
-        .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y ORDER BY c NULLS FIRST", .err = error.OrderByNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT -1", .err = error.LimitNotSupported },
         .{ .sql = "SELECT y, count(*) AS c FROM 't' GROUP BY y LIMIT c", .err = error.LimitNotSupported },
     };

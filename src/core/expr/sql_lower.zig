@@ -86,12 +86,20 @@ pub const Lower = struct {
             },
             c.LP_EXPR_CASE => blk: {
                 const cs = node.u.case_;
-                if (cs.operand != null or @mod(cs.when_exprs.count, 2) != 0) return error.UnsupportedCase;
+                if (@mod(cs.when_exprs.count, 2) != 0) return error.UnsupportedCase;
                 const whens = try self.arena.alloc(syntax.Expr.When, @intCast(@divExact(cs.when_exprs.count, 2)));
-                for (whens, 0..) |*w, i| w.* = .{
-                    .cond = try self.predicate(cs.when_exprs.items[i * 2] orelse return error.SqlParseError, 0),
-                    .then = try self.nullable(cs.when_exprs.items[i * 2 + 1], depth + 1),
-                };
+                for (whens, 0..) |*w, i| {
+                    const when = cs.when_exprs.items[i * 2] orelse return error.SqlParseError;
+                    w.* = .{
+                        // `CASE x WHEN v` is `CASE WHEN x = v`: a column against a literal, as a predicate is.
+                        .cond = if (cs.operand) |operand_node| .{ .comparison = .{
+                            .operand = self.operand(operand_node) catch return error.UnsupportedCase,
+                            .op = .Eq,
+                            .value = try self.literal(when),
+                        } } else try self.predicate(when, 0),
+                        .then = try self.nullable(cs.when_exprs.items[i * 2 + 1], depth + 1),
+                    };
+                }
                 break :blk .{ .case_ = .{ .whens = whens, .else_ = try self.nullable(cs.else_expr, depth + 1) } };
             },
             c.LP_EXPR_CAST => if (textType(node.u.cast.type_name)) .{
@@ -323,10 +331,17 @@ pub const Lower = struct {
                     break :blk .{ .null_check = .{ .column = try self.name(left), .is_not = b.op == c.LP_OP_ISNOT } };
                 }
                 if (b.op == c.LP_OP_LIKE) {
-                    if (b.escape != null) return error.BadValue;
+                    // ILIKE reaches here as `LIKE .. ESCAPE 'zpq:ilike'` (`sql_literals`); any other ESCAPE is refused.
+                    var fold = false;
+                    if (b.escape != null) {
+                        const esc: *const c.LpNode = b.escape;
+                        if (esc.kind != c.LP_EXPR_LITERAL_STRING or !std.mem.eql(u8, std.mem.span(esc.u.literal.value), lits.ilike_escape))
+                            return error.BadValue;
+                        fold = true;
+                    }
                     const pattern = try self.literal(right);
                     if (filters.typedLiteral(pattern) != null) return error.BadValue;
-                    break :blk .{ .like = .{ .column = try self.name(left), .pattern = pattern, .negate = false } };
+                    break :blk .{ .like = .{ .column = try self.name(left), .pattern = pattern, .negate = false, .fold = fold } };
                 }
                 const op: filter.Operator = switch (b.op) {
                     c.LP_OP_EQ => .Eq,

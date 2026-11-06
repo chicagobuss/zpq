@@ -230,7 +230,7 @@ pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const s
         const keys = try arena.alloc(RowSortKey, args.result_order.rows.len);
         for (args.result_order.rows, keys, 0..) |rk, *key, k| {
             const e = try expr_parser.parseExprOnly(arena, rk.expr, meta0, args.diag);
-            key.* = try rowSortKey(arena, meta0, e, rk.descending, k, rk.expr, args.diag);
+            key.* = try rowSortKey(arena, meta0, e, rk.descending, rk.nulls_first, k, rk.expr, args.diag);
         }
         break :blk keys;
     };
@@ -266,6 +266,7 @@ pub fn rowSortKey(
     meta: *const schema.FileMetaData,
     e: expr_ast.Expr,
     descending: bool,
+    nulls_first: bool,
     ordinal: usize,
     display: []const u8,
     diag: ?*Diag,
@@ -278,10 +279,10 @@ pub fn rowSortKey(
             return error.NestedRowOutputNotSupported;
         }
         const elem = metadata.leafSchemaElement(meta, ci) orelse return error.UnknownColumn;
-        return .{ .spec = .{ .passthrough = .{ .ci = ci } }, .descending = descending, .unsigned = schema.isUnsignedInt(elem) };
+        return .{ .spec = .{ .passthrough = .{ .ci = ci } }, .descending = descending, .unsigned = schema.isUnsignedInt(elem), .nulls_first = nulls_first };
     }
     const alias = try std.fmt.allocPrint(arena, "__order_{d}", .{ordinal});
-    return .{ .spec = .{ .computed = .{ .expr = e, .alias = alias } }, .descending = descending, .unsigned = false };
+    return .{ .spec = .{ .computed = .{ .expr = e, .alias = alias } }, .descending = descending, .unsigned = false, .nulls_first = nulls_first };
 }
 
 /// The query's filter bound against `meta`. Under `--trust-stats` its leaves trust plausible statistics, and a

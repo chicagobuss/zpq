@@ -11,11 +11,13 @@ text when UTF-8, else `{"base64":...}`; UUIDs and INTERVALs in their own forms
 ([docs/binary-output.md](binary-output.md)).
 Encrypted Parquet is refused: zpq does not decrypt.
 
-**Filter** with `= != <> < <= > >=`, `IN` / `NOT IN`, `[NOT] BETWEEN x AND y`, `[NOT] LIKE`, `IS [NOT] NULL`, `AND` /
+**Filter** with `= != <> < <= > >=`, `IN` / `NOT IN`, `[NOT] BETWEEN x AND y`, `[NOT] LIKE`, `[NOT] ILIKE`, `IS [NOT] NULL`, `AND` /
 `OR` / `NOT` and grouping parentheses (nested at most 32 deep), plus row-group stat pruning and Hive-partition pruning
 before any bytes are fetched. Keywords and parentheses inside a quoted literal are the literal's; a quote inside one is
 doubled (`'O''Reilly'`), and an unterminated quote is an error. NOT is three-valued: a row whose operand is NULL
-passes neither `p` nor `NOT p`. DATE / TIME / TIMESTAMP columns take quoted literals
+passes neither `p` nor `NOT p`. `ILIKE` takes a literal ASCII pattern and folds ASCII letters (and the two characters whose lower case is
+`k` and `i`: KELVIN SIGN and I WITH DOT ABOVE) as DuckDB's `lower` does; a pattern with another non-ASCII character is refused
+(`IlikePatternNotAscii`). DATE / TIME / TIMESTAMP columns take quoted literals
 (`'2024-01-01'`, `'2024-01-01 12:00:00.25'`, `'12:00:00'`) compared exactly: a literal finer than the column's unit is
 not rounded to it. In SQL a literal may be typed and a constant folded: `DATE '1998-09-02'`, `TIMESTAMP '1998-09-02
 10:00:00'`, `CAST('1998-09-02' AS date)`, `'1998-09-02'::DATE`, `CAST('0.055' AS DECIMAL(15,2))` (0.06: ties round away
@@ -39,12 +41,16 @@ the thread, not fixed) is refused (`ConstantTooDeep`).
 `coalesce(a, b, ...)` over any expressions, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
 [ELSE v] END`, parens, unary minus. A CASE evaluates a branch only on the rows that take it, and coalesce an argument
 only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
-(`CASE x WHEN ...`) is not supported. DECIMAL arithmetic is exact (see below).
+`CASE c WHEN v ...` is the searched form `WHEN c = v` for a column and literals. DECIMAL arithmetic is exact (see below).
 
 **Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and
 `GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a
 column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals (only TRUE keeps a group;
-without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks. Plain
+without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT list lacks, or by an
+expression of the keys (`GROUP BY k ORDER BY k * 2`: one more key, which cannot change the groups). `SELECT DISTINCT a, b`
+is `GROUP BY a, b` (NULLs one group), `GROUP BY ALL` groups by the SELECT items that are no aggregate, and `ORDER BY`
+takes `NULLS FIRST` or `NULLS LAST`, NULLs last by default in either direction as in DuckDB. `DISTINCT` with an aggregate,
+a GROUP BY or `*`, and `DISTINCT ON`, are refused by name. Plain
 rows take `ORDER BY` columns with a `LIMIT`, keeping the first rows by those keys, ties by input position.
 As in SQL, `sum / min / max / avg` over no non-null values are NULL (JSON `null`, a null cell in `-o` parquet;
 avg_state's pair becomes `{"sum": null, "count": 0}`) while `count` is 0.

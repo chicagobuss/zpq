@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **SELECT sugar in SQL.** `SELECT DISTINCT a, b` (one group per distinct row, NULLs together), `GROUP BY ALL`, `ORDER BY ... NULLS FIRST
+  | LAST` (on aggregate results and on plain rows with a `LIMIT`; a row group whose statistics cannot bound its NULLs is
+  read), `ORDER BY` an expression of the GROUP BY keys, the simple `CASE c WHEN v THEN ...` over a column and literals, and
+  `[NOT] ILIKE` with an ASCII pattern now run and match DuckDB. `DISTINCT` with an aggregate, `*` or a GROUP BY, and
+  `DISTINCT ON`, are refused by name.
 - **Typed literals and constant folding in SQL.** `DATE '1998-09-02'`, `TIMESTAMP '..'`, `CAST('..' AS date | timestamp |
   decimal)`, `'..'::DATE`, `DATE '1998-12-01' - INTERVAL '90' DAY` and constant arithmetic such as `.06 - 0.01` now fold at
   parse time into the literal a filter already takes, so row-group pruning is as before. TPC-H Q1 and Q6 in standard

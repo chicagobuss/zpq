@@ -44,7 +44,7 @@ fn bind(raw: *const anyopaque, arena: std.mem.Allocator, meta: *const schema.Fil
         const filter = if (query.filter) |node| try filters.bindSyntax(arena, node, meta, diag) else null;
         const row_keys = try arena.alloc(plans.RowSortKey, query.row_keys.len);
         for (query.row_keys, row_keys, 0..) |key, *out, n|
-            out.* = try projection.rowSortKey(arena, meta, try parser.bindSyntax(arena, key.expr, meta, diag), key.descending, n, key.display, diag);
+            out.* = try projection.rowSortKey(arena, meta, try parser.bindSyntax(arena, key.expr, meta, diag), key.descending, key.nulls_first, n, key.display, diag);
         return .{ .projection = .{ .select_items = items, .filter = filter, .row_keys = row_keys, .kept_set = kept_set } };
     }
     const calls = try arena.alloc(agg.AggCall, query.calls.len);

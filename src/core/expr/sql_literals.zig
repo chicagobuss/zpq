@@ -8,7 +8,14 @@
 const std = @import("std");
 const filters = @import("../filter/parser.zig");
 
-pub const Error = error{ BadValue, BadInterval, IntervalNotSupported, OutOfMemory };
+pub const Error = error{ BadValue, BadInterval, IntervalNotSupported, DistinctNotSupported, OutOfMemory };
+
+/// `x ILIKE 'p'` is rewritten `x LIKE 'p' ESCAPE 'zpq:ilike'`: the grammar parses an ESCAPE clause and nothing a user
+/// writes (DuckDB takes one character) is this text, so the lowering reads it as the case-insensitive form.
+pub const ilike_escape = "zpq:ilike";
+
+/// What `GROUP BY ALL` is rewritten to: one name no column has, which the parser swaps for the SELECT's keys.
+pub const group_all_name = "__zpq_group_all";
 
 /// What went wrong, for the message the parser prints; the error value carries the kind.
 pub const Report = struct {
@@ -524,6 +531,15 @@ fn typeAt(s: []const u8, from: usize) ?usize {
     return e;
 }
 
+/// The index past `GROUP BY ALL` when it starts at `at`.
+fn groupByAllAt(s: []const u8, at: usize) ?usize {
+    const by = skipSpace(s, wordEnd(s, at));
+    if (!wordIs(s, by, "by")) return null;
+    const all = skipSpace(s, wordEnd(s, by));
+    if (!wordIs(s, all, "all")) return null;
+    return wordEnd(s, all);
+}
+
 /// `sql` with the spellings above folded. Quoted text and comments pass through. A `DATE '..'` or `INTERVAL` the fold
 /// cannot take is a named error, never a syntax error from the parser that follows.
 pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) Error![]u8 {
@@ -626,6 +642,33 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
                 continue;
             }
         }
+        if (wordIs(sql, i, "ilike")) {
+            const lit = skipSpace(sql, end);
+            const lit_end = if (lit < sql.len and sql[lit] == '\'') quotedEnd(sql, lit) else null;
+            const stop = lit_end orelse {
+                report.set("ILIKE takes a string literal pattern", .{});
+                return error.BadValue;
+            };
+            try out.appendSlice(allocator, "like ");
+            try out.appendSlice(allocator, sql[lit..stop]);
+            try out.appendSlice(allocator, " escape '" ++ ilike_escape ++ "'");
+            atom.have = false;
+            i = stop;
+            continue;
+        }
+        if (wordIs(sql, i, "group")) if (groupByAllAt(sql, i)) |stop| {
+            try out.appendSlice(allocator, "group by " ++ group_all_name);
+            atom = .{ .have = true, .start = out.items.len - group_all_name.len, .end = out.items.len };
+            i = stop;
+            continue;
+        };
+        if (wordIs(sql, i, "distinct")) {
+            const next = skipSpace(sql, end);
+            if (wordIs(sql, next, "on") and skipSpace(sql, wordEnd(sql, next)) < sql.len and sql[skipSpace(sql, wordEnd(sql, next))] == '(') {
+                report.set("DISTINCT ON is not supported yet", .{});
+                return error.DistinctNotSupported;
+            }
+        }
         if (wordIs(sql, i, "interval") and (try intervalAt(sql, i, report)) != null) {
             report.set("INTERVAL is supported only added to or subtracted from a DATE or TIMESTAMP literal", .{});
             return error.IntervalNotSupported;
@@ -726,6 +769,17 @@ test "sql_literals: x::TYPE becomes CAST for the operand just before it" {
     try expectRewrite("SELECT 0.5::DECIMAL(3,2), 'x'::VARCHAR, a::INT::BIGINT", "SELECT CAST(0.5 AS DECIMAL(3,2)), CAST('x' AS VARCHAR), CAST(CAST(a AS INT) AS BIGINT)");
     try expectRewrite("SELECT \"a b\"::INT, s.\"c\"::TEXT", "SELECT CAST(\"a b\" AS INT), CAST(s.\"c\" AS TEXT)");
     try expectRewrite("SELECT 1 + a::INT", "SELECT 1 + CAST(a AS INT)");
+}
+
+test "sql_literals: GROUP BY ALL, ILIKE and DISTINCT ON" {
+    try expectRewrite("SELECT g, count(*) FROM t GROUP BY ALL", "SELECT g, count(*) FROM t group by " ++ group_all_name);
+    try expectRewrite("select g from t group   by\n all order by g", "select g from t group by " ++ group_all_name ++ " order by g");
+    try expectRewrite("SELECT g FROM t GROUP BY all_col", "SELECT g FROM t GROUP BY all_col");
+    try expectRewrite("WHERE s ILIKE 'A%' AND t NOT ILIKE 'b_' OR u = 1", "WHERE s like 'A%' escape '" ++ ilike_escape ++ "' AND t NOT like 'b_' escape '" ++ ilike_escape ++ "' OR u = 1");
+    try expectRewrite("WHERE ilike_flag = 1", "WHERE ilike_flag = 1");
+    try expectRewriteError("WHERE s ILIKE t", error.BadValue);
+    try expectRewriteError("SELECT DISTINCT ON (g) g FROM t", error.DistinctNotSupported);
+    try expectRewrite("SELECT DISTINCT onion FROM t", "SELECT DISTINCT onion FROM t");
 }
 
 test "sql_literals: exact decimals add, subtract, multiply and round half away from zero" {

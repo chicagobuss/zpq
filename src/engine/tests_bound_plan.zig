@@ -31,7 +31,7 @@ const Frontend = struct {
             const items = try expr_parser.parseSelect(a, text, meta, diag);
             const e = try expr_parser.parseExprOnly(a, "x", meta, diag);
             const keys = try a.alloc(plans.RowSortKey, 1);
-            keys[0] = try projection.rowSortKey(a, meta, e, false, 0, "x", diag);
+            keys[0] = try projection.rowSortKey(a, meta, e, false, false, 0, "x", diag);
             return .{ .projection = .{ .select_items = items, .filter = f, .row_keys = keys } };
         }
         const calls = try expr_parser.parseAggList(a, text, meta, diag);

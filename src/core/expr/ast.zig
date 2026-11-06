@@ -496,10 +496,13 @@ pub const SelectItem = struct {
 pub const OrderKey = struct {
     column: usize,
     descending: bool,
+    /// NULLS FIRST: the key's NULLs rank before every value (the default puts them last, in either direction).
+    nulls_first: bool = false,
 };
 
 /// ORDER BY / LIMIT / OFFSET applied to an aggregate's finished result rows. Sorting is stable, so ties keep the
-/// order the rows had (first appearance in the input); NULLs sort last in either direction, as in DuckDB.
+/// order the rows had (first appearance in the input); NULLs sort last in either direction, as in DuckDB, unless a key
+/// says NULLS FIRST.
 pub const ResultOrder = struct {
     keys: []const OrderKey = &.{},
     limit: ?u64 = null,
@@ -518,6 +521,7 @@ pub const ResultOrder = struct {
 pub const RowKey = struct {
     expr: []const u8,
     descending: bool,
+    nulls_first: bool = false,
 };
 
 /// A comparison operator of a HAVING leaf.

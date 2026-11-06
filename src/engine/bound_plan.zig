@@ -15,6 +15,7 @@ pub const RowSortKey = struct {
     spec: consumer.OutputCol,
     descending: bool,
     unsigned: bool,
+    nulls_first: bool = false,
 };
 
 pub const Projection = struct {

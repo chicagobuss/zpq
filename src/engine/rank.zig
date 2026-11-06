@@ -178,11 +178,11 @@ pub const TopRows = struct {
         self.gpa.free(self.key_specs);
     }
 
-    /// Whether row (`a_cells`, `a_pos`) sorts before row (`b_cells`, `b_pos`). NULL is last in either direction.
+    /// Whether row (`a_cells`, `a_pos`) sorts before row (`b_cells`, `b_pos`). NULL is last in either direction, first
+    /// under a NULLS FIRST key.
     pub fn before(keys: []const RowSortKey, a_cells: []const SortCell, a_pos: RowPos, b_cells: []const SortCell, b_pos: RowPos) bool {
         for (keys, a_cells, b_cells) |k, a, b| {
-            var ord = a.order(b);
-            if (k.descending and a != .null and b != .null) ord = ord.invert();
+            const ord = cellOrder(k, a, b);
             if (ord != .eq) return ord == .lt;
         }
         return a_pos.order(b_pos) == .lt;
@@ -394,10 +394,20 @@ pub const TopRows = struct {
     }
 };
 
+/// How two values of one ORDER BY key compare: the key's direction between values, and NULL after every value, or
+/// before every value under NULLS FIRST, whichever the direction.
+pub fn cellOrder(key: RowSortKey, a: SortCell, b: SortCell) std.math.Order {
+    var ord = a.order(b);
+    if (key.descending and a != .null and b != .null) ord = ord.invert();
+    if (key.nulls_first and (a == .null) != (b == .null)) ord = ord.invert();
+    return ord;
+}
+
 /// The best first-key value any row of a row group can have, from the column chunk's statistics: its min ascending, its
 /// max descending, NULL when every row is NULL. Null when the statistics prove nothing: a computed key, bounds missing,
 /// in an order zpq does not read, or of a type whose cell is not plainly the bound. Floats descending prove nothing
-/// either: a NaN sorts first there, and writers leave NaN out of the bounds.
+/// either: a NaN sorts first there, and writers leave NaN out of the bounds. Under NULLS FIRST a row group holding a
+/// NULL has NULL for its best, and one whose null count is unknown proves nothing.
 fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, key: RowSortKey) ?SortCell {
     const ci = switch (key.spec) {
         .passthrough => |pt| pt.ci,
@@ -406,6 +416,10 @@ fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ke
     if (ci >= rg.columns.items.len) return null;
     const cm = rg.columns.items[ci].meta_data orelse return null;
     const st = statistics.chunkStats(rg, ci, meta, .corroborated);
+    if (key.nulls_first) {
+        const nulls = st.null_count orelse return null;
+        if (nulls > 0) return .null;
+    }
     const b = st.bounds orelse {
         const nulls = st.null_count orelse return null;
         return if (rg.num_rows > 0 and nulls == rg.num_rows) .null else null;
@@ -461,9 +475,7 @@ pub const RankedRG = struct {
     fn sooner(key: RowSortKey, a: RankedRG, b: RankedRG) bool {
         const x = a.best orelse return b.best != null;
         const y = b.best orelse return false;
-        var ord = x.order(y);
-        if (key.descending and x != .null and y != .null) ord = ord.invert();
-        return ord == .lt;
+        return cellOrder(key, x, y) == .lt;
     }
 };
 
@@ -511,11 +523,31 @@ fn copyRow(dst: *consumer.OutputAggregator, src: *const consumer.OutputAggregato
     dst.num_rows += 1;
 }
 
-/// Whether first key `a` sorts strictly after `b` under `key` (NULL last in either direction).
+/// Whether first key `a` sorts strictly after `b` under `key` (NULL last in either direction, first under NULLS FIRST).
 pub fn sortsAfter(key: RowSortKey, a: SortCell, b: SortCell) bool {
-    var ord = a.order(b);
-    if (key.descending and a != .null and b != .null) ord = ord.invert();
-    return ord == .gt;
+    return cellOrder(key, a, b) == .gt;
+}
+
+test "cellOrder: NULL last in either direction, first under NULLS FIRST" {
+    const t = std.testing;
+    const asc: RowSortKey = .{ .spec = .{ .passthrough = .{ .ci = 0 } }, .descending = false, .unsigned = false };
+    var desc = asc;
+    desc.descending = true;
+    var first = asc;
+    first.nulls_first = true;
+    var desc_first = desc;
+    desc_first.nulls_first = true;
+    const v1: SortCell = .{ .int = 1 };
+    const v2: SortCell = .{ .int = 2 };
+    try t.expectEqual(std.math.Order.lt, cellOrder(asc, v1, .null));
+    try t.expectEqual(std.math.Order.lt, cellOrder(desc, v1, .null));
+    try t.expectEqual(std.math.Order.gt, cellOrder(first, v1, .null));
+    try t.expectEqual(std.math.Order.gt, cellOrder(desc_first, v1, .null));
+    try t.expectEqual(std.math.Order.eq, cellOrder(first, .null, .null));
+    try t.expectEqual(std.math.Order.lt, cellOrder(first, v1, v2));
+    try t.expectEqual(std.math.Order.gt, cellOrder(desc_first, v1, v2));
+    try t.expect(sortsAfter(first, v1, .null));
+    try t.expect(!sortsAfter(first, .null, v1));
 }
 
 test "rowGroupBest reads the first key a row group can reach, and only what its statistics prove" {
@@ -1214,6 +1246,8 @@ fn runAll(comptime Ctx: type, ctxs: []Ctx, comptime func: fn (*Ctx) void) void {
 /// (`RankWorker.dictionaryBest`): BYTE_ARRAY, not DECIMAL (whose lane is numeric), compared as raw bytes as its
 /// `SortCell` is. `filtered` when the filter reads that column alone, so it can judge each dictionary entry.
 fn dictionaryKey(meta: *const schema.FileMetaData, key: RowSortKey, filter: ?filter_ast.Filter) ?DictKey {
+    // Under NULLS FIRST a row group's NULL keys sort before every entry its dictionary holds, so no entry bounds them.
+    if (key.nulls_first) return null;
     const ci = switch (key.spec) {
         .passthrough => |pt| pt.ci,
         .computed => return null,

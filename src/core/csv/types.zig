@@ -42,6 +42,9 @@ pub const Type = struct {
     nanos: bool = false,
     /// TIMESTAMP: values carry offsets and are instants.
     tz: bool = false,
+    /// DATE or TIMESTAMP: some value lies outside what int64 nanoseconds since the epoch hold (1677-09-21 to
+    /// 2262-04-11), so the column can never be TIMESTAMP_NS: one needing nanoseconds is STRING.
+    out_of_ns: bool = false,
 
     pub fn precision(t: Type) u32 {
         return @max(1, @as(u32, t.int_digits) + t.scale);
@@ -62,6 +65,7 @@ pub const Type = struct {
         o.sig = @max(a.sig, b.sig);
         o.nanos = a.nanos or b.nanos;
         o.tz = a.tz or b.tz;
+        o.out_of_ns = a.out_of_ns or b.out_of_ns;
         if (a.kind == b.kind) {
             if (a.kind == .timestamp and a.tz != b.tz) o.kind = .string;
             return o.bounded();
@@ -81,6 +85,8 @@ pub const Type = struct {
 
     fn bounded(t: Type) Type {
         var o = t;
+        // Nanoseconds for one value and a range past them for another: no timestamp unit holds both.
+        if (o.kind == .timestamp and o.nanos and o.out_of_ns) o.kind = .string;
         if (o.kind == .decimal and o.precision() > max_decimal_digits)
             o.kind = if (o.sig <= max_double_digits) .float64 else .string;
         return o;
@@ -340,9 +346,9 @@ pub const Instant = struct {
         return std.math.add(i64, s, t.nanos / 1000) catch null;
     }
 
+    /// In a wider intermediate, as the floor second of the earliest representable instant overflows alone.
     pub fn nanosSinceEpoch(t: Instant) ?i64 {
-        const s = std.math.mul(i64, t.secs, 1_000_000_000) catch return null;
-        return std.math.add(i64, s, t.nanos) catch null;
+        return std.math.cast(i64, @as(i128, t.secs) * 1_000_000_000 + t.nanos);
     }
 };
 
@@ -387,6 +393,12 @@ pub fn parseTimestamp(s: []const u8) ?Instant {
     return .{ .secs = secs, .nanos = nanos, .sub_micro = sub_micro, .tz = tz };
 }
 
+/// Whether midnight of `days` is a nanosecond timestamp.
+fn dateInNanos(days: i32) bool {
+    const inst: Instant = .{ .secs = @as(i64, days) * 86400, .nanos = 0, .sub_micro = false, .tz = false };
+    return inst.nanosSinceEpoch() != null;
+}
+
 pub fn parseBool(s: []const u8) ?bool {
     if (std.ascii.eqlIgnoreCase(s, "true")) return true;
     if (std.ascii.eqlIgnoreCase(s, "false")) return false;
@@ -406,8 +418,13 @@ pub fn classify(s: []const u8, utf8: bool) Type {
         if (decimalShape(s)) |d|
             return .{ .kind = .decimal, .int_digits = d.int_digits, .scale = d.frac_digits, .sig = d.sig };
         if (floatShape(s)) |sig| return .{ .kind = .float64, .sig = sig };
-        if (parseDate(s)) |_| return .{ .kind = .date };
-        if (parseTimestamp(s)) |t| return .{ .kind = .timestamp, .nanos = t.sub_micro, .tz = t.tz };
+        if (parseDate(s)) |days| return .{ .kind = .date, .out_of_ns = !dateInNanos(days) };
+        if (parseTimestamp(s)) |t| {
+            const in_ns = t.nanosSinceEpoch() != null;
+            // Its own digits need nanoseconds it cannot have: no timestamp type holds it.
+            if (t.sub_micro and !in_ns) return .{ .kind = .string };
+            return .{ .kind = .timestamp, .nanos = t.sub_micro, .tz = t.tz, .out_of_ns = !in_ns };
+        }
         return .{ .kind = .string };
     }
     if (floatShape(s)) |sig| return .{ .kind = .float64, .sig = sig };
@@ -622,6 +639,71 @@ test "csv dates and timestamps: valid calendar, exact fractions, offsets as inst
     try testing.expect(timestampValue(local, "9999-12-31 23:59:59") != null);
     try testing.expectEqual(@as(?i64, null), timestampValue(ns_col, "9999-12-31 23:59:59"));
     try testing.expectEqual(@as(?i64, 1704067200000000), timestampValue(local, "2024-01-01"));
+}
+
+test "csv review P1-2: a timestamp type holds every value it was built from, in either order" {
+    // Its own value: nanoseconds past 2262 are no timestamp.
+    const own = "9999-12-31 23:59:59.000000001";
+    try testing.expectEqual(Kind.string, classify(own, true).kind);
+    try testing.expect(fits(classify(own, true), own, true));
+    // Microseconds in 9999 and nanoseconds in 2024: no unit holds both, so STRING, whichever comes first.
+    const old = "9999-12-31 23:59:59";
+    const next = "2024-01-01 00:00:00.000000001";
+    for ([2][2][]const u8{ .{ old, next }, .{ next, old } }) |pair| {
+        const joined = classify(pair[0], true).join(classify(pair[1], true));
+        try testing.expectEqual(Kind.string, joined.kind);
+        try testing.expect(fits(joined, pair[0], true) and fits(joined, pair[1], true));
+    }
+    // A date past the range promotes a nanosecond column to STRING too; inside it, to TIMESTAMP_NS.
+    try testing.expectEqual(Kind.string, classify("0001-01-01", true).join(classify(next, true)).kind);
+    try testing.expectEqual(Kind.timestamp, classify("2000-01-01", true).join(classify(next, true)).kind);
+    // An offset normalizes to UTC before the range is judged: 2262-04-11 23:47:16 at +01:00 is in range.
+    try testing.expect(classify("2262-04-12T00:47:16.854775807+01:00", true).kind == .timestamp);
+    try testing.expect(classify("2262-04-11T23:47:16.854775807-00:01", true).kind == .string);
+}
+
+test "csv review P2-1: the earliest nanosecond timestamp is representable" {
+    const ns_col: Type = .{ .kind = .timestamp, .nanos = true };
+    try testing.expectEqual(@as(?i64, std.math.minInt(i64)), timestampValue(ns_col, "1677-09-21 00:12:43.145224192"));
+    try testing.expectEqual(@as(?i64, std.math.maxInt(i64)), timestampValue(ns_col, "2262-04-11 23:47:16.854775807"));
+    try testing.expectEqual(@as(?i64, null), timestampValue(ns_col, "2262-04-11 23:47:16.854775808"));
+    try testing.expectEqual(@as(?i64, null), timestampValue(ns_col, "1677-09-21 00:12:43.145224191"));
+}
+
+test "csv property: temporal joins in any order hold every value" {
+    const pool = [_][]const u8{
+        "0001-01-01",
+        "9999-12-31",
+        "1677-09-21",
+        "2262-04-11",
+        "2024-02-29",
+        "9999-12-31 23:59:59",
+        "0001-01-01T00:00:00",
+        "2024-01-01 00:00:00.000000001",
+        "2024-01-01 00:00:00.123456",
+        "1677-09-21 00:12:43.145224192",
+        "1677-09-21 00:12:43.145224191",
+        "2262-04-11 23:47:16.854775807",
+        "2262-04-11 23:47:16.854775808",
+        "9999-12-31T23:59:59Z",
+        "2024-01-01T00:00:00.000000001Z",
+        "2262-04-12T00:47:16.854775807+01:00",
+        "1677-09-20T23:12:43.145224192-01:00",
+    };
+    var prng = std.Random.DefaultPrng.init(0x7173);
+    const r = prng.random();
+    for (0..20_000) |_| {
+        var picked: [4][]const u8 = undefined;
+        var t: Type = .{};
+        for (&picked) |*p| {
+            p.* = pool[r.uintLessThan(usize, pool.len)];
+            t = t.join(classify(p.*, true));
+        }
+        for (picked) |p| if (!fits(t, p, true)) {
+            std.debug.print("{s} does not fit {s} (nanos {}) built from {any}\n", .{ p, @tagName(t.kind), t.nanos, picked });
+            return error.TestUnexpectedResult;
+        };
+    }
 }
 
 test "csv the lattice joins to the least exact type" {
